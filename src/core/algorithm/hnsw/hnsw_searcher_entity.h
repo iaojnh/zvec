@@ -13,7 +13,6 @@
 // limitations under the License.
 #pragma once
 
-#include "hnsw_builder_entity.h"
 #include "hnsw_entity.h"
 
 namespace zvec {
