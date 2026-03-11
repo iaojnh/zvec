@@ -13,7 +13,7 @@ option(ENABLE_SAPPHIRERAPIDS "Enable Intel Sapphire Rapids Server CPU microarchi
 option(ENABLE_EMERALDRAPIDS "Enable Intel Emerald Rapids Server CPU microarchitecture" OFF)
 option(ENABLE_GRANITERAPIDS "Enable Intel Granite Rapids Server CPU microarchitecture" OFF)
 
-option(ENABLE_NATIVE "Enable native CPU microarchitecture" ON)
+option(ENABLE_NATIVE "Enable native CPU microarchitecture" OFF)
 
 ## AMD Microarchitectures
 option(ENABLE_ZEN1 "Enable AMD Zen+ Family 17h CPU microarchitecture" OFF)
@@ -74,41 +74,57 @@ macro(add_arch_flag FLAG VAR_NAME OPTION_NAME)
   endif()
 endmacro()
 
-function(_detect_armv8_best)
-  set(_arm_flags
-    "armv8.6-a" "armv8.5-a" "armv8.4-a" "armv8.3-a" "armv8.2-a" "armv8.1-a" "armv8-a" "armv8"
-  )
-  foreach(_ver IN LISTS _arm_flags)
-    check_c_compiler_flag("-march=${_ver}" _COMP_SUPP_${_ver})
-    if(_COMP_SUPP_${_ver})
-      _AppendFlags(CMAKE_C_FLAGS "-march=${_ver}")
-      _AppendFlags(CMAKE_CXX_FLAGS "-march=${_ver}")
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}" PARENT_SCOPE)
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}" PARENT_SCOPE)
-      return()
-    endif()
-  endforeach()
-  message(WARNING "No ARMv8 architecture flag supported by compiler.")
+function(_setup_armv8_march)
+  set(_arch "armv8")
+  check_c_compiler_flag("-march=${_arch}" _COMP_SUPP_${_arch})
+  if(_COMP_SUPP_${_arch})
+    _AppendFlags(CMAKE_C_FLAGS "-march=${_arch}")
+    _AppendFlags(CMAKE_CXX_FLAGS "-march=${_arch}")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}" PARENT_SCOPE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}" PARENT_SCOPE)
+    return()
+  else()
+    message(WARNING "No ARMv8 march flag supported by compiler.")
+  endif()
 endfunction()
 
-function(_detect_x86_best)
+function(_setup_x86_march)
+  set(_arch "x86-64")
+  check_c_compiler_flag("-march=${_arch}" _COMP_SUPP_${_arch})
+  if(_COMP_SUPP_${_arch})
+    _AppendFlags(CMAKE_C_FLAGS "-march=${_arch}")
+    _AppendFlags(CMAKE_CXX_FLAGS "-march=${_arch}")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}" PARENT_SCOPE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}" PARENT_SCOPE)
+    return()
+  else()
+    message(WARNING "No known x86 march flag supported; falling back to generic.")
+  endif()
+endfunction()
+
+function(setup_compiler_march_for_x86 VAR_NAME_SSE VAR_NAME_AVX2 VAR_NAME_AVX512)
+  #sse
+  set(${VAR_NAME_SSE} "-march=corei7" PARENT_SCOPE)
+
+  #avx 2
+  set(${VAR_NAME_AVX2} "-march=core-avx2" PARENT_SCOPE)
+
+  #avx512
   set(_x86_flags
-    "graniterapids" "emeraldrapids" "sapphirerapids"
-    "skylake-avx512" "skylake"
-    "broadwell" "haswell" "sandybridge" "nehalem"
-    "znver3" "znver2" "znver1"
+    "graniterapids" "emeraldrapids" "sapphirerapids" "skylake-avx512" 
   )
   foreach(_arch IN LISTS _x86_flags)
     check_c_compiler_flag("-march=${_arch}" _COMP_SUPP_${_arch})
     if(_COMP_SUPP_${_arch})
-      _AppendFlags(CMAKE_C_FLAGS "-march=${_arch}")
-      _AppendFlags(CMAKE_CXX_FLAGS "-march=${_arch}")
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}" PARENT_SCOPE)
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}" PARENT_SCOPE)
+      set(${VAR_NAME_AVX512} "-march=${_arch}" PARENT_SCOPE)
       return()
     endif()
   endforeach()
-  message(WARNING "No known x86 microarchitecture flag supported; falling back to generic.")
+
+
+  set(${VAR_NAME_AVX512} "-march=core-avx2" PARENT_SCOPE)
+  message(WARNING "No known avx512 microarchitecture flag found. Set up as core-avx2")
+
 endfunction()
 
 if(MSVC)
@@ -206,9 +222,9 @@ else()
   # AUTO DETECT
   # Heuristic: detect host architecture and probe appropriate flags
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-    _detect_armv8_best()
+    _setup_armv8_march()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i686|i386|x64")
-    _detect_x86_best()
+    _setup_x86_march()
   else()
     message(WARNING "Unknown host architecture: ${CMAKE_SYSTEM_PROCESSOR}; no -march= set.")
   endif()

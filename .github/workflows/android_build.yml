@@ -12,6 +12,13 @@ on:
       - '**.md'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build-android:
     # sdkmanager and other Android tools are x86‑only; ARM runners fail with exit code 1
@@ -160,6 +167,10 @@ jobs:
             echo "Device ABI:"
             adb shell getprop ro.product.cpu.abi
             adb shell getprop ro.product.cpu.abilist
+
+            echo "=== CPU ISA / Instruction Set Support ==="
+            echo "--- /proc/cpuinfo flags ---"
+            adb shell 'cat /proc/cpuinfo | grep -E "^(Features|flags)"'
 
             echo "Checking binary sizes:"
             ls -lah examples/c++/build-android-examples-${{ matrix.abi }}/

@@ -124,6 +124,7 @@ sdist.include = [
 [tool.scikit-build.cmake.define]
 BUILD_TOOLS = "OFF"
 BUILD_PYTHON_BINDINGS = "ON"
+#CMAKE_VERBOSE_MAKEFILE = "ON"
 
 # Setuptools config for test pypi
 [tool.setuptools_scm]

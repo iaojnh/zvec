@@ -19,9 +19,7 @@
 #include "cosine_distance_batch.h"
 #include "inner_product_distance_batch.h"
 
-
 namespace zvec::ailego {
-
 
 template <
     template <typename, size_t, size_t, typename = void> class DistanceType,

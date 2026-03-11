@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#pragma once
-
 #include <array>
 #include <ailego/math/inner_product_matrix.h>
 #include <ailego/utility/math_helper.h>
@@ -21,18 +19,6 @@
 #include <zvec/ailego/utility/type_helper.h>
 
 namespace zvec::ailego::DistanceBatch {
-
-template <typename ValueType, size_t BatchSize>
-static void compute_one_to_many_fallback(
-    const ValueType *query, const ValueType **ptrs,
-    std::array<const ValueType *, BatchSize> &prefetch_ptrs, size_t dim,
-    float *sums) {
-  for (size_t j = 0; j < BatchSize; ++j) {
-    sums[j] = 0.0;
-    InnerProductMatrix<ValueType, 1, 1>::Compute(ptrs[j], query, dim, sums + j);
-    ailego_prefetch(&prefetch_ptrs[j]);
-  }
-}
 
 #if defined(__AVX2__)
 
@@ -49,7 +35,7 @@ inline __m128 sum_top_bottom_avx(__m256 v) {
 
 template <typename ValueType, size_t dp_batch>
 static std::enable_if_t<std::is_same_v<ValueType, float>, void>
-compute_one_to_many_avx2_fp32(
+compute_one_to_many_inner_product_avx2_fp32(
     const ValueType *query, const ValueType **ptrs,
     std::array<const ValueType *, dp_batch> &prefetch_ptrs,
     size_t dimensionality, float *results) {
@@ -123,7 +109,21 @@ compute_one_to_many_avx2_fp32(
     results[i] = -res[i];
   }
 }
-#endif
 
+void compute_one_to_many_inner_product_avx2_fp32_1(
+    const float *query, const float **ptrs,
+    std::array<const float *, 1> &prefetch_ptrs, size_t dim, float *sums) {
+  return compute_one_to_many_inner_product_avx2_fp32<float, 1>(
+      query, ptrs, prefetch_ptrs, dim, sums);
+}
+
+void compute_one_to_many_inner_product_avx2_fp32_12(
+    const float *query, const float **ptrs,
+    std::array<const float *, 12> &prefetch_ptrs, size_t dim, float *sums) {
+  return compute_one_to_many_inner_product_avx2_fp32<float, 12>(
+      query, ptrs, prefetch_ptrs, dim, sums);
+}
+
+#endif
 
 }  // namespace zvec::ailego::DistanceBatch

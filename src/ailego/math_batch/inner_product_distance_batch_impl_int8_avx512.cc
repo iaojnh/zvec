@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#pragma once
-
 #include <array>
 #include <ailego/utility/math_helper.h>
 #include <zvec/ailego/internal/platform.h>
@@ -23,8 +21,8 @@ namespace zvec::ailego::DistanceBatch {
 
 #if defined(__AVX512VNNI__)
 
-static void compute_one_to_many_avx512_vnni_int8_query_preprocess(void *query,
-                                                                  size_t dim) {
+void compute_one_to_many_inner_product_avx512_vnni_int8_query_preprocess(
+    void *query, size_t dim) {
   const int8_t *input = reinterpret_cast<const int8_t *>(query);
   uint8_t *output = reinterpret_cast<uint8_t *>(query);
 
@@ -48,10 +46,9 @@ static void compute_one_to_many_avx512_vnni_int8_query_preprocess(void *query,
   }
 }
 
-
 // query is unsigned
 template <size_t dp_batch>
-static void compute_one_to_many_avx512_vnni_int8(
+static void compute_one_to_many_inner_product_avx512_vnni_int8(
     const int8_t *query, const int8_t **ptrs,
     std::array<const int8_t *, dp_batch> &prefetch_ptrs, size_t dimensionality,
     float *results) {
@@ -153,73 +150,22 @@ static void compute_one_to_many_avx512_vnni_int8(
 //     results[i] = static_cast<float>(temp_results[i]);
 //   }
 // }
-#endif
 
-#if defined(__AVX2__)
-
-template <typename ValueType, size_t dp_batch>
-static std::enable_if_t<std::is_same_v<ValueType, int8_t>, void>
-compute_one_to_many_avx2_int8(
+void compute_one_to_many_inner_product_avx512_vnni_int8_1(
     const int8_t *query, const int8_t **ptrs,
-    std::array<const int8_t *, dp_batch> &prefetch_ptrs, size_t dimensionality,
-    float *results) {
-  std::array<__m256i, dp_batch> accs;
-  for (size_t i = 0; i < dp_batch; ++i) {
-    accs[i] = _mm256_setzero_si256();
-  }
-  size_t dim = 0;
-  for (; dim + 32 <= dimensionality; dim += 32) {
-    __m256i q = _mm256_loadu_si256((const __m256i *)(query + dim));
-    std::array<__m256i, dp_batch> data_regs;
-    for (size_t i = 0; i < dp_batch; ++i) {
-      data_regs[i] = _mm256_loadu_si256((const __m256i *)(ptrs[i] + dim));
-    }
-    if (prefetch_ptrs[0]) {
-      for (size_t i = 0; i < dp_batch; ++i) {
-        ailego_prefetch(prefetch_ptrs[i] + dim);
-      }
-    }
-    __m256i q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q));
-    __m256i q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q, 1));
-    std::array<__m256i, dp_batch> data_lo;
-    std::array<__m256i, dp_batch> data_hi;
-    for (size_t i = 0; i < dp_batch; ++i) {
-      data_lo[i] = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(data_regs[i]));
-      data_hi[i] =
-          _mm256_cvtepi8_epi16(_mm256_extracti128_si256(data_regs[i], 1));
-    }
-    std::array<__m256i, dp_batch> prod_lo;
-    std::array<__m256i, dp_batch> prod_hi;
-    for (size_t i = 0; i < dp_batch; ++i) {
-      prod_lo[i] = _mm256_madd_epi16(q_lo, data_lo[i]);
-      prod_hi[i] = _mm256_madd_epi16(q_hi, data_hi[i]);
-    }
-    for (size_t i = 0; i < dp_batch; ++i) {
-      accs[i] =
-          _mm256_add_epi32(accs[i], _mm256_add_epi32(prod_lo[i], prod_hi[i]));
-    }
-  }
-  std::array<int, dp_batch> temp_results;
-  for (size_t i = 0; i < dp_batch; ++i) {
-    __m128i lo = _mm256_castsi256_si128(accs[i]);
-    __m128i hi = _mm256_extracti128_si256(accs[i], 1);
-    __m128i sum128 = _mm_add_epi32(lo, hi);
-    sum128 = _mm_hadd_epi32(sum128, sum128);
-    sum128 = _mm_hadd_epi32(sum128, sum128);
-    temp_results[i] = _mm_cvtsi128_si32(sum128);
-  }
-  for (; dim < dimensionality; ++dim) {
-    int8_t q = query[dim];
-    for (size_t i = 0; i < dp_batch; ++i) {
-      temp_results[i] += q * static_cast<int>(ptrs[i][dim]);
-    }
-  }
-  for (size_t i = 0; i < dp_batch; ++i) {
-    results[i] = static_cast<float>(temp_results[i]);
-  }
+    std::array<const int8_t *, 1> &prefetch_ptrs, size_t dim, float *sums) {
+  return compute_one_to_many_inner_product_avx512_vnni_int8<1>(
+      query, ptrs, prefetch_ptrs, dim, sums);
 }
 
-#endif
+void compute_one_to_many_inner_product_avx512_vnni_int8_12(
+    const int8_t *query, const int8_t **ptrs,
+    std::array<const int8_t *, 12> &prefetch_ptrs, size_t dim, float *sums) {
+  return compute_one_to_many_inner_product_avx512_vnni_int8<12>(
+      query, ptrs, prefetch_ptrs, dim, sums);
+}
 
+
+#endif
 
 }  // namespace zvec::ailego::DistanceBatch
