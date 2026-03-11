@@ -123,7 +123,7 @@ void HnswAlgorithm::select_entry_point(level_t level, node_id_t *entry_point,
     }
 
     std::vector<IndexStorage::MemoryBlock> neighbor_vec_blocks;
-    int ret = entity.get_vector(&neighbors[0], size, neighbor_vec_blocks);
+    int ret = entity.get_vector_new(&neighbors[0], size, neighbor_vec_blocks);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
@@ -232,7 +232,8 @@ void HnswAlgorithm::search_neighbors(level_t level, node_id_t *entry_point,
     }
 
     std::vector<IndexStorage::MemoryBlock> neighbor_vec_blocks;
-    int ret = entity.get_vector(neighbor_ids.data(), size, neighbor_vec_blocks);
+    int ret =
+        entity.get_vector_new(neighbor_ids.data(), size, neighbor_vec_blocks);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
@@ -356,7 +357,7 @@ void HnswAlgorithm::expand_neighbors_by_group(TopkHeap &topk,
 
       std::vector<IndexStorage::MemoryBlock> neighbor_vec_blocks;
       int ret =
-          entity.get_vector(neighbor_ids.data(), size, neighbor_vec_blocks);
+          entity.get_vector_new(neighbor_ids.data(), size, neighbor_vec_blocks);
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_vector())++;
       }

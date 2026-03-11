@@ -63,14 +63,15 @@ class HnswDistCalculator {
         dim_(0),
         compare_cnt_(0) {}
 
-  void update(const HnswStreamerEntityNew *entity, const IndexMetric::Pointer &metric) {
+  void update(const HnswStreamerEntityNew *entity,
+              const IndexMetric::Pointer &metric) {
     entity_ = entity;
     distance_ = metric->distance();
     batch_distance_ = metric->batch_distance();
   }
 
-  void update(const HnswStreamerEntityNew *entity, const IndexMetric::Pointer &metric,
-              uint32_t dim) {
+  void update(const HnswStreamerEntityNew *entity,
+              const IndexMetric::Pointer &metric, uint32_t dim) {
     entity_ = entity;
     distance_ = metric->distance();
     batch_distance_ = metric->batch_distance();
@@ -116,7 +117,7 @@ class HnswDistCalculator {
   inline dist_t dist(node_id_t id) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector(id);
+    const void *feat = entity_->get_vector_new(id);
     if (ailego_unlikely(feat == nullptr)) {
       LOG_ERROR("Get nullptr vector, id=%u", id);
       error_ = true;
@@ -130,8 +131,8 @@ class HnswDistCalculator {
   inline dist_t dist(node_id_t lhs, node_id_t rhs) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector(lhs);
-    const void *query = entity_->get_vector(rhs);
+    const void *feat = entity_->get_vector_new(lhs);
+    const void *query = entity_->get_vector_new(rhs);
     if (ailego_unlikely(feat == nullptr || query == nullptr)) {
       LOG_ERROR("Get nullptr vector");
       error_ = true;
@@ -162,7 +163,7 @@ class HnswDistCalculator {
   inline dist_t batch_dist(node_id_t id) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector(id);
+    const void *feat = entity_->get_vector_new(id);
     if (ailego_unlikely(feat == nullptr)) {
       LOG_ERROR("Get nullptr vector, id=%u", id);
       error_ = true;

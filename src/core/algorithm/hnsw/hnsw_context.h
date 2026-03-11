@@ -114,7 +114,8 @@ class HnswContext : public IndexContext {
   //! Update context, the context may be shared by different searcher/streamer
   int update_context(ContextType type, const IndexMeta &meta,
                      const IndexMetric::Pointer &metric,
-                     const HnswStreamerEntityNew::Pointer &entity, uint32_t magic_num);
+                     const HnswStreamerEntityNew::Pointer &entity,
+                     uint32_t magic_num);
 
   inline const HnswStreamerEntityNew &get_entity() const {
     return *entity_;
@@ -175,7 +176,7 @@ class HnswContext : public IndexContext {
       node_id_t id = topk_heap_[i].first;
       if (fetch_vector_) {
         results_[idx].emplace_back(entity_->get_key(id), score, id,
-                                   entity_->get_vector(id));
+                                   entity_->get_vector_new(id));
       } else {
         results_[idx].emplace_back(entity_->get_key(id), score, id);
       }
@@ -238,7 +239,7 @@ class HnswContext : public IndexContext {
 
         if (fetch_vector_) {
           group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id, entity_->get_vector(id));
+              entity_->get_key(id), score, id, entity_->get_vector_new(id));
         } else {
           group_results_[idx][i].mutable_docs()->emplace_back(
               entity_->get_key(id), score, id);
@@ -501,7 +502,8 @@ class HnswContext : public IndexContext {
   uint32_t topk_{0};
   uint32_t group_topk_{0};
   uint32_t filter_mode_{VisitFilter::ByteMap};
-  float negative_probability_{HnswStreamerEntityNew::kDefaultBFNegativeProbability};
+  float negative_probability_{
+      HnswStreamerEntityNew::kDefaultBFNegativeProbability};
   uint32_t ef_{HnswStreamerEntityNew::kDefaultEf};
   float max_scan_ratio_{HnswStreamerEntityNew::kDefaultScanRatio};
   uint32_t magic_{0U};

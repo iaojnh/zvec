@@ -30,7 +30,7 @@ namespace core {
 
 //! HnswStreamerEntityNew manage vector data, pkey, and node's neighbors
 class HnswStreamerEntityNew {
- public: // override
+ public:  // override
   typedef std::shared_ptr<HnswStreamerEntityNew> Pointer;
 
   //! Cleanup
@@ -47,30 +47,32 @@ class HnswStreamerEntityNew {
   //! Get vector feature data by key
   const void *get_vector(node_id_t id) const;
 
+  const void *get_vector_new(node_id_t id) const;
+
   //! Get vectors feature data by local ids
+  int get_vector(const node_id_t *ids, uint32_t count, const void **vecs) const;
+
+  int get_vector(const node_id_t id, IndexStorage::MemoryBlock &block) const;
+
   int get_vector(const node_id_t *ids, uint32_t count,
-                         const void **vecs) const;
+                 std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
 
-  int get_vector(const node_id_t id,
-                         IndexStorage::MemoryBlock &block) const;
+  int get_vector_new(const node_id_t id,
+                     IndexStorage::MemoryBlock &block) const;
 
-  int get_vector(
-      const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
+  int get_vector_new(const node_id_t *ids, uint32_t count,
+                     std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
 
   //! Get the node id's neighbors on graph level
   //! Note: the neighbors cannot be modified, using the following
   //! method to get WritableNeighbors if want to
-  const Neighbors get_neighbors(level_t level,
-                                        node_id_t id) const;
+  const Neighbors get_neighbors(level_t level, node_id_t id) const;
 
   //! Add vector and key to hnsw entity, and local id will be saved in id
-  int add_vector(level_t level, key_t key, const void *vec,
-                         node_id_t *id);
+  int add_vector(level_t level, key_t key, const void *vec, node_id_t *id);
 
   //! Add vector and id to hnsw entity
-  int add_vector_with_id(level_t level, node_id_t id,
-                                 const void *vec);
+  int add_vector_with_id(level_t level, node_id_t id, const void *vec);
 
   int update_neighbors(
       level_t level, node_id_t id,
@@ -79,7 +81,7 @@ class HnswStreamerEntityNew {
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
   void add_neighbor(level_t level, node_id_t id, uint32_t size,
-                            node_id_t neighbor_id);
+                    node_id_t neighbor_id);
 
   //! Dump index by dumper
   int dump(const IndexDumper::Pointer &dumper);
@@ -91,8 +93,8 @@ class HnswStreamerEntityNew {
     return id == kInvalidNodeId ? nullptr : get_vector(id);
   }
 
-  int get_vector_by_key(
-      const key_t key, IndexStorage::MemoryBlock &block) const {
+  int get_vector_by_key(const key_t key,
+                        IndexStorage::MemoryBlock &block) const {
     auto id = get_id(key);
     if (id != kInvalidNodeId) {
       return get_vector(id, block);
@@ -101,9 +103,8 @@ class HnswStreamerEntityNew {
     }
   }
 
- public: // hnsw entity public
-
-    //! Get max neighbor size of graph level
+ public:  // hnsw entity public
+  //! Get max neighbor size of graph level
   inline size_t neighbor_cnt(level_t level) const {
     return level == 0 ? base_header_.graph.l0_neighbor_count
                       : base_header_.hnsw.upper_neighbor_count;
@@ -291,40 +292,40 @@ class HnswStreamerEntityNew {
       const std::vector<node_id_t> &reorder_mapping,
       const std::vector<node_id_t> &neighbor_mapping) const;
 
-  public:
-    const static std::string kGraphHeaderSegmentId;
-    const static std::string kGraphFeaturesSegmentId;
-    const static std::string kGraphKeysSegmentId;
-    const static std::string kGraphNeighborsSegmentId;
-    const static std::string kGraphOffsetsSegmentId;
-    const static std::string kGraphMappingSegmentId;
-    const static std::string kHnswHeaderSegmentId;
-    const static std::string kHnswNeighborsSegmentId;
-    const static std::string kHnswOffsetsSegmentId;
+ public:
+  const static std::string kGraphHeaderSegmentId;
+  const static std::string kGraphFeaturesSegmentId;
+  const static std::string kGraphKeysSegmentId;
+  const static std::string kGraphNeighborsSegmentId;
+  const static std::string kGraphOffsetsSegmentId;
+  const static std::string kGraphMappingSegmentId;
+  const static std::string kHnswHeaderSegmentId;
+  const static std::string kHnswNeighborsSegmentId;
+  const static std::string kHnswOffsetsSegmentId;
 
-    constexpr static uint32_t kRevision = 0U;
-    constexpr static size_t kMaxGraphLayers = 15;
-    constexpr static uint32_t kDefaultEfConstruction = 500;
-    constexpr static uint32_t kDefaultEf = 500;
-    constexpr static uint32_t kDefaultUpperMaxNeighborCnt = 50;  // M of HNSW
-    constexpr static uint32_t kDefaultL0MaxNeighborCnt = 100;
-    constexpr static uint32_t kMaxNeighborCnt = 65535;
-    constexpr static float kDefaultScanRatio = 0.1f;
-    constexpr static uint32_t kDefaultMinScanLimit = 10000;
-    constexpr static uint32_t kDefaultMaxScanLimit =
-        std::numeric_limits<uint32_t>::max();
-    constexpr static float kDefaultBFNegativeProbability = 0.001f;
-    constexpr static uint32_t kDefaultScalingFactor = 50U;
-    constexpr static uint32_t kDefaultBruteForceThreshold = 1000U;
-    constexpr static uint32_t kDefaultDocsHardLimit = 1 << 30U;  // 1 billion
-    constexpr static float kDefaultDocsSoftLimitRatio = 0.9f;
-    constexpr static size_t kMaxChunkSize = 0xFFFFFFFF;
-    constexpr static size_t kDefaultChunkSize = 2UL * 1024UL * 1024UL;
-    constexpr static size_t kDefaultMaxChunkCnt = 50000UL;
-    constexpr static float kDefaultNeighborPruneMultiplier =
-        1.0f;  // prune_cnt = upper_max_neighbor_cnt * multiplier
-    constexpr static float kDefaultL0MaxNeighborCntMultiplier =
-        2.0f;  // l0_max_neighbor_cnt = upper_max_neighbor_cnt * multiplier
+  constexpr static uint32_t kRevision = 0U;
+  constexpr static size_t kMaxGraphLayers = 15;
+  constexpr static uint32_t kDefaultEfConstruction = 500;
+  constexpr static uint32_t kDefaultEf = 500;
+  constexpr static uint32_t kDefaultUpperMaxNeighborCnt = 50;  // M of HNSW
+  constexpr static uint32_t kDefaultL0MaxNeighborCnt = 100;
+  constexpr static uint32_t kMaxNeighborCnt = 65535;
+  constexpr static float kDefaultScanRatio = 0.1f;
+  constexpr static uint32_t kDefaultMinScanLimit = 10000;
+  constexpr static uint32_t kDefaultMaxScanLimit =
+      std::numeric_limits<uint32_t>::max();
+  constexpr static float kDefaultBFNegativeProbability = 0.001f;
+  constexpr static uint32_t kDefaultScalingFactor = 50U;
+  constexpr static uint32_t kDefaultBruteForceThreshold = 1000U;
+  constexpr static uint32_t kDefaultDocsHardLimit = 1 << 30U;  // 1 billion
+  constexpr static float kDefaultDocsSoftLimitRatio = 0.9f;
+  constexpr static size_t kMaxChunkSize = 0xFFFFFFFF;
+  constexpr static size_t kDefaultChunkSize = 2UL * 1024UL * 1024UL;
+  constexpr static size_t kDefaultMaxChunkCnt = 50000UL;
+  constexpr static float kDefaultNeighborPruneMultiplier =
+      1.0f;  // prune_cnt = upper_max_neighbor_cnt * multiplier
+  constexpr static float kDefaultL0MaxNeighborCntMultiplier =
+      2.0f;  // l0_max_neighbor_cnt = upper_max_neighbor_cnt * multiplier
 
  public:
   //! Constructor
@@ -334,7 +335,7 @@ class HnswStreamerEntityNew {
   ~HnswStreamerEntityNew();
 
   //! Get vector feature data by key
-  
+
 
   //! Init entity
   int init(size_t max_doc_cnt);
@@ -445,16 +446,17 @@ class HnswStreamerEntityNew {
 
   //! Private construct, only be called by clone method
   HnswStreamerEntityNew(IndexStreamer::Stats &stats, const HNSWHeader &hd,
-                     size_t chunk_size, uint32_t node_index_mask_bits,
-                     uint32_t upper_neighbor_mask_bits, bool filter_same_key,
-                     bool get_vector_enabled,
-                     const NIHashMapPointer &upper_neighbor_index,
-                     std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
-                     const HashMapPointer<key_t, node_id_t> &keys_map,
-                     bool use_key_info_map,
-                     std::vector<Chunk::Pointer> &&node_chunks,
-                     std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
-                     const ChunkBroker::Pointer &broker)
+                        size_t chunk_size, uint32_t node_index_mask_bits,
+                        uint32_t upper_neighbor_mask_bits, bool filter_same_key,
+                        bool get_vector_enabled,
+                        const NIHashMapPointer &upper_neighbor_index,
+                        std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
+                        const HashMapPointer<key_t, node_id_t> &keys_map,
+                        bool use_key_info_map,
+                        std::vector<Chunk::Pointer> &&node_chunks,
+                        std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
+                        const ChunkBroker::Pointer &broker,
+                        std::string vector_value)
       : stats_(stats),
         chunk_size_(chunk_size),
         node_index_mask_bits_(node_index_mask_bits),
@@ -470,7 +472,8 @@ class HnswStreamerEntityNew {
         keys_map_(keys_map),
         node_chunks_(std::move(node_chunks)),
         upper_neighbor_chunks_(std::move(upper_neighbor_chunks)),
-        broker_(broker) {
+        broker_(broker),
+        vector_value_(vector_value) {
     *mutable_header() = hd;
 
     neighbor_size_ = neighbors_size();
@@ -739,6 +742,8 @@ class HnswStreamerEntityNew {
   mutable std::vector<Chunk::Pointer> upper_neighbor_chunks_{};
 
   ChunkBroker::Pointer broker_{};  // chunk broker
+
+  std::string vector_value_{};
 };
 
 }  // namespace core
