@@ -718,8 +718,8 @@ int HnswStreamerEntityNew::add_vector_with_id(level_t level, node_id_t id,
 }
 
 void HnswStreamerEntityNew::update_ep_and_level(node_id_t ep, level_t level) {
-  header_.hnsw.entry_point = ep;
-  header_.hnsw.max_level = level;
+  base_header_.hnsw.entry_point = ep;
+  base_header_.hnsw.max_level = level;
   flush_header();
 
   return;

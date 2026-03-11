@@ -105,95 +105,95 @@ class HnswStreamerEntityNew {
 
     //! Get max neighbor size of graph level
   inline size_t neighbor_cnt(level_t level) const {
-    return level == 0 ? header_.graph.l0_neighbor_count
-                      : header_.hnsw.upper_neighbor_count;
+    return level == 0 ? base_header_.graph.l0_neighbor_count
+                      : base_header_.hnsw.upper_neighbor_count;
   }
 
   //! get max neighbor size of graph level 0
   inline size_t l0_neighbor_cnt() const {
-    return header_.graph.l0_neighbor_count;
+    return base_header_.graph.l0_neighbor_count;
   }
 
   //! get min neighbor size of graph
   inline size_t min_neighbor_cnt() const {
-    return header_.graph.min_neighbor_count;
+    return base_header_.graph.min_neighbor_count;
   }
 
   //! get upper neighbor size of graph level other than 0
   inline size_t upper_neighbor_cnt() const {
-    return header_.hnsw.upper_neighbor_count;
+    return base_header_.hnsw.upper_neighbor_count;
   }
 
   //! Get current total doc of the hnsw graph
   inline node_id_t *mutable_doc_cnt() {
-    return &header_.graph.doc_count;
+    return &base_header_.graph.doc_count;
   }
 
   inline node_id_t doc_cnt() const {
-    return header_.graph.doc_count;
+    return base_header_.graph.doc_count;
   }
 
   //! Get hnsw graph scaling params
   inline size_t scaling_factor() const {
-    return header_.hnsw.scaling_factor;
+    return base_header_.hnsw.scaling_factor;
   }
 
   //! Get prune_size
   inline size_t prune_cnt() const {
-    return header_.graph.prune_neighbor_count;
+    return base_header_.graph.prune_neighbor_count;
   }
 
   //! Current entity of top level graph
   inline node_id_t entry_point() const {
-    return header_.hnsw.entry_point;
+    return base_header_.hnsw.entry_point;
   }
 
   //! Current max graph level
   inline level_t cur_max_level() const {
-    return header_.hnsw.max_level;
+    return base_header_.hnsw.max_level;
   }
 
   //! Retrieve index vector size
   size_t vector_size() const {
-    return header_.graph.vector_size;
+    return base_header_.graph.vector_size;
   }
 
   //! Retrieve node size
   size_t node_size() const {
-    return header_.graph.node_size;
+    return base_header_.graph.node_size;
   }
 
   //! Retrieve ef constuction
   size_t ef_construction() const {
-    return header_.graph.ef_construction;
+    return base_header_.graph.ef_construction;
   }
 
   void set_vector_size(size_t size) {
-    header_.graph.vector_size = size;
+    base_header_.graph.vector_size = size;
   }
 
   void set_prune_cnt(size_t v) {
-    header_.graph.prune_neighbor_count = v;
+    base_header_.graph.prune_neighbor_count = v;
   }
 
   void set_scaling_factor(size_t val) {
-    header_.hnsw.scaling_factor = val;
+    base_header_.hnsw.scaling_factor = val;
   }
 
   void set_l0_neighbor_cnt(size_t cnt) {
-    header_.graph.l0_neighbor_count = cnt;
+    base_header_.graph.l0_neighbor_count = cnt;
   }
 
   void set_min_neighbor_cnt(size_t cnt) {
-    header_.graph.min_neighbor_count = cnt;
+    base_header_.graph.min_neighbor_count = cnt;
   }
 
   void set_upper_neighbor_cnt(size_t cnt) {
-    header_.hnsw.upper_neighbor_count = cnt;
+    base_header_.hnsw.upper_neighbor_count = cnt;
   }
 
   void set_ef_construction(size_t ef) {
-    header_.graph.ef_construction = ef;
+    base_header_.graph.ef_construction = ef;
   }
 
   static int CalcAndAddPadding(const IndexDumper::Pointer &dumper,
@@ -201,19 +201,19 @@ class HnswStreamerEntityNew {
 
  protected:
   inline const HNSWHeader &header() const {
-    return header_;
+    return base_header_;
   }
 
   inline HNSWHeader *mutable_header() {
-    return &header_;
+    return &base_header_;
   }
 
   inline size_t header_size() const {
-    return sizeof(header_);
+    return sizeof(base_header_);
   }
 
   void set_node_size(size_t size) {
-    header_.graph.node_size = size;
+    base_header_.graph.node_size = size;
   }
 
   //! Dump all segment by dumper
@@ -707,6 +707,7 @@ class HnswStreamerEntityNew {
 
  private:
   IndexStreamer::Stats &stats_;
+  HNSWHeader base_header_{};
   HNSWHeader header_{};
   std::mutex mutex_{};
   size_t max_index_size_{0UL};
