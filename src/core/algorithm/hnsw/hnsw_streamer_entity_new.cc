@@ -195,6 +195,17 @@ const Neighbors HnswStreamerEntityNew::get_neighbors(level_t level,
   return Neighbors(std::move(neighbor_block));
 }
 
+const Neighbors HnswStreamerEntityNew::get_neighbors_new(level_t level,
+                                                     node_id_t id) const {
+  if (id) {
+    return get_neighbors(level, id);
+  } else {
+    const void *src = neighbors_value_ptr_->data() + id * neighbor_size_;
+    const NeighborsHeader *header = reinterpret_cast<const NeighborsHeader *>(src);
+    return Neighbors(header->neighbor_cnt, header->neighbors);
+  }
+}
+
 //! Get vector data by key
 const void *HnswStreamerEntityNew::get_vector(node_id_t id) const {
   auto loc = get_vector_chunk_loc(id);
@@ -473,6 +484,14 @@ int HnswStreamerEntityNew::open(IndexStorage::Pointer stg,
   for (int i = 0; i < doc_cnt(); i++) {
     vector_value_ptr_->append((const char *)get_vector(i), vector_size());
   }
+
+  neighbors_value_ptr_ = std::make_shared<std::string>();
+  neighbors_value_ptr_->reserve(neighbor_size_ * doc_cnt());
+  for (int i = 0; i < doc_cnt(); i++) {
+    Neighbors neighbor = get_neighbors(0, i);
+    neighbors_value_ptr_->append((const char *)neighbor.neighbor_block.data(), neighbor_size_);
+  }
+
   stats_.set_loaded_count(doc_cnt());
 
   return 0;
@@ -786,7 +805,7 @@ const HnswStreamerEntityNew::Pointer HnswStreamerEntityNew::clone() const {
       upper_neighbor_mask_bits_, filter_same_key_, get_vector_enabled_,
       upper_neighbor_index_, keys_map_lock_, keys_map_, use_key_info_map_,
       std::move(node_chunks), std::move(upper_neighbor_chunks), broker_,
-      vector_value_ptr_);
+      vector_value_ptr_, neighbors_value_ptr_);
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("HnswStreamerEntityNew new failed");
   }

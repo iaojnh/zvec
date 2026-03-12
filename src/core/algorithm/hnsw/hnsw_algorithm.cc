@@ -113,7 +113,7 @@ void HnswAlgorithm::select_entry_point(level_t level, node_id_t *entry_point,
   auto &entity = ctx->get_entity();
   HnswDistCalculator &dc = ctx->dist_calculator();
   while (true) {
-    const Neighbors neighbors = entity.get_neighbors(level, *entry_point);
+    const Neighbors neighbors = entity.get_neighbors_new(level, *entry_point);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
     }
@@ -208,7 +208,7 @@ void HnswAlgorithm::search_neighbors(level_t level, node_id_t *entry_point,
     }
 
     candidates.pop();
-    const Neighbors neighbors = entity.get_neighbors(level, main_node);
+    const Neighbors neighbors = entity.get_neighbors_new(level, main_node);
     ailego_prefetch(neighbors.data);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
@@ -333,7 +333,7 @@ void HnswAlgorithm::expand_neighbors_by_group(TopkHeap &topk,
       node_id_t main_node = top->first;
 
       candidates.pop();
-      const Neighbors neighbors = entity.get_neighbors(0, main_node);
+      const Neighbors neighbors = entity.get_neighbors_new(0, main_node);
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_neighbors())++;
       }
@@ -464,7 +464,7 @@ void HnswAlgorithm::reverse_update_neighbors(HnswDistCalculator &dc,
 
   uint32_t lock_idx = id & kLockMask;
   lock_pool_[lock_idx].lock();
-  const Neighbors neighbors = entity_.get_neighbors(level, id);
+  const Neighbors neighbors = entity_.get_neighbors_new(level, id);
   size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {

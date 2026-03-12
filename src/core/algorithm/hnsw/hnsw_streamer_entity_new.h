@@ -67,6 +67,7 @@ class HnswStreamerEntityNew {
   //! Note: the neighbors cannot be modified, using the following
   //! method to get WritableNeighbors if want to
   const Neighbors get_neighbors(level_t level, node_id_t id) const;
+  const Neighbors get_neighbors_new(level_t level, node_id_t id) const;
 
   //! Add vector and key to hnsw entity, and local id will be saved in id
   int add_vector(level_t level, key_t key, const void *vec, node_id_t *id);
@@ -456,7 +457,8 @@ class HnswStreamerEntityNew {
                         std::vector<Chunk::Pointer> &&node_chunks,
                         std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
                         const ChunkBroker::Pointer &broker,
-                        std::shared_ptr<std::string> vector_value_ptr)
+                        std::shared_ptr<std::string> vector_value_ptr,
+                        std::shared_ptr<std::string> neighbors_value_ptr)
       : stats_(stats),
         chunk_size_(chunk_size),
         node_index_mask_bits_(node_index_mask_bits),
@@ -473,7 +475,8 @@ class HnswStreamerEntityNew {
         node_chunks_(std::move(node_chunks)),
         upper_neighbor_chunks_(std::move(upper_neighbor_chunks)),
         broker_(broker),
-        vector_value_ptr_(vector_value_ptr) {
+        vector_value_ptr_(vector_value_ptr),
+        neighbors_value_ptr_(neighbors_value_ptr) {
     *mutable_header() = hd;
 
     neighbor_size_ = neighbors_size();
@@ -744,6 +747,7 @@ class HnswStreamerEntityNew {
   ChunkBroker::Pointer broker_{};  // chunk broker
 
   std::shared_ptr<std::string> vector_value_ptr_{};
+  std::shared_ptr<std::string> neighbors_value_ptr_{};
 };
 
 }  // namespace core

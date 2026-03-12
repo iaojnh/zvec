@@ -642,7 +642,7 @@ void HnswStreamer::print_debug_info() {
     if (entity_.get_key(id) == kInvalidKey) {
       continue;
     }
-    Neighbors neighbours = entity_.get_neighbors(0, id);
+    Neighbors neighbours = entity_.get_neighbors_new(0, id);
     std::cout << "node: " << id << "; ";
     if (neighbours.size() == 0) std::cout << std::endl;
     for (uint32_t i = 0; i < neighbours.size(); ++i) {
