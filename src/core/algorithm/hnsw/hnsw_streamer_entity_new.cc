@@ -279,10 +279,10 @@ int HnswStreamerEntityNew::get_vector_new(
 int HnswStreamerEntityNew::get_vector_new(
     const node_id_t *ids, uint32_t count,
     std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
-  vec_blocks.resize(count);
+  vec_blocks.reserve(count);
   for (int i = 0; i < count; i++) {
     const void *data = vector_value_ptr_->data() + vector_size() * ids[i];
-    vec_blocks[i].reset((void *)data);
+    vec_blocks.emplace_back((void *)data);
   }
   return 0;
   // return get_vector(ids, count, vec_blocks);
