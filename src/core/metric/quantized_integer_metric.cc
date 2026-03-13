@@ -266,6 +266,10 @@ class QuantizedIntegerMetric : public IndexMetric {
         meta_.data_type() == IndexMeta::DataType::DT_INT8) {
       return CosineMinusInnerProductDistanceBatchWithScoreUnquantized<
           int8_t, 1, 1>::GetQueryPreprocessFunc();
+    } else if (origin_metric_type_ == MetricType::kSquaredEuclidean &&
+               meta_.data_type() == IndexMeta::DataType::DT_INT8) {
+      return SquaredEuclideanDistanceBatchWithScoreUnquantized<
+          int8_t, 1, 1>::GetQueryPreprocessFunc();
     }
 
     return nullptr;
