@@ -196,12 +196,13 @@ const Neighbors HnswStreamerEntityNew::get_neighbors(level_t level,
 }
 
 const Neighbors HnswStreamerEntityNew::get_neighbors_new(level_t level,
-                                                     node_id_t id) const {
+                                                         node_id_t id) const {
   if (id) {
     return get_neighbors(level, id);
   } else {
     const void *src = neighbors_value_ptr_->data() + id * neighbor_size_;
-    const NeighborsHeader *header = reinterpret_cast<const NeighborsHeader *>(src);
+    const NeighborsHeader *header =
+        reinterpret_cast<const NeighborsHeader *>(src);
     return Neighbors(header->neighbor_cnt, header->neighbors);
   }
 }
@@ -489,7 +490,8 @@ int HnswStreamerEntityNew::open(IndexStorage::Pointer stg,
   neighbors_value_ptr_->reserve(neighbor_size_ * doc_cnt());
   for (int i = 0; i < doc_cnt(); i++) {
     Neighbors neighbor = get_neighbors(0, i);
-    neighbors_value_ptr_->append((const char *)neighbor.neighbor_block.data(), neighbor_size_);
+    neighbors_value_ptr_->append((const char *)neighbor.neighbor_block.data(),
+                                 neighbor_size_);
   }
 
   stats_.set_loaded_count(doc_cnt());

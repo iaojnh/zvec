@@ -88,7 +88,8 @@ int HnswStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
     ef_construction_ = HnswStreamerEntityNew::kDefaultEfConstruction;
   }
   if (upper_max_neighbor_cnt_ == 0U) {
-    upper_max_neighbor_cnt_ = HnswStreamerEntityNew::kDefaultUpperMaxNeighborCnt;
+    upper_max_neighbor_cnt_ =
+        HnswStreamerEntityNew::kDefaultUpperMaxNeighborCnt;
   }
   if (upper_max_neighbor_cnt_ > HnswStreamerEntityNew::kMaxNeighborCnt) {
     LOG_ERROR("[%s] must be in range (0,%d)",
@@ -342,7 +343,8 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
   shared_mutex_.lock();
   AILEGO_DEFER([&]() { shared_mutex_.unlock(); });
 
-  meta_.set_searcher("HnswSearcher", HnswStreamerEntityNew::kRevision, ailego::Params());
+  meta_.set_searcher("HnswSearcher", HnswStreamerEntityNew::kRevision,
+                     ailego::Params());
 
   int ret = IndexHelper::SerializeToDumper(meta_, dumper.get());
   if (ret != 0) {
