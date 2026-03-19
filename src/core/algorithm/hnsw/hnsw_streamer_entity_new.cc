@@ -192,7 +192,7 @@ const Neighbors HnswStreamerEntityNew::get_neighbors(level_t level,
     LOG_ERROR("Read neighbor header failed, ret=%zu", size);
     return Neighbors();
   }
-  return Neighbors(std::move(neighbor_block));
+  return Neighbors(neighbor_block);
 }
 
 const Neighbors HnswStreamerEntityNew::get_neighbors_new(level_t level,
