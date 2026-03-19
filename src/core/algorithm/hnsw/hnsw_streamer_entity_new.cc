@@ -145,7 +145,7 @@ int HnswStreamerEntityNew::cleanup() {
 int HnswStreamerEntityNew::update_neighbors(
     level_t level, node_id_t id,
     const std::vector<std::pair<node_id_t, dist_t>> &neighbors) {
-  std::vector<char> buffer(neighbor_size_);
+  std::vector<char> buffer(level == 0 ? neighbor_size_ : upper_neighbor_size_);
   NeighborsHeader *hd = reinterpret_cast<NeighborsHeader *>(buffer.data());
   hd->neighbor_cnt = neighbors.size();
   size_t i = 0;

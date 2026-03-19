@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <iostream>
 #include <ailego/parallel/lock.h>
 #include <sparsehash/dense_hash_map>
 #include <sparsehash/dense_hash_set>
@@ -396,17 +395,13 @@ class HnswStreamerEntityNew {
   }
 
   void print_key_map() const {
-    std::cout << "key map begins" << std::endl;
-
+    LOG_DEBUG("key map begins");
     auto iter = keys_map_->begin();
     while (iter != keys_map_->end()) {
-      std::cout << "key: " << iter->first << ", id: " << iter->second
-                << std::endl;
-      ;
+      LOG_DEBUG("key: %lld, id: %u", (long long)iter->first, iter->second);
       iter++;
     }
-
-    std::cout << "key map ends" << std::endl;
+    LOG_DEBUG("key map ends");
   }
 
   //! Get l0 neighbors size
@@ -709,7 +704,7 @@ class HnswStreamerEntityNew {
  private:
   HnswStreamerEntityNew(const HnswStreamerEntityNew &) = delete;
   HnswStreamerEntityNew &operator=(const HnswStreamerEntityNew &) = delete;
-  static constexpr uint64_t kUpperHashMemoryInflateRatio = 2.0f;
+  static constexpr float kUpperHashMemoryInflateRatio = 2.0f;
 
  private:
   IndexStreamer::Stats &stats_;
