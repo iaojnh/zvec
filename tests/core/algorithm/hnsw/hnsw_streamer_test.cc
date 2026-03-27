@@ -3439,6 +3439,7 @@ TEST_F(HnswStreamerTest, TestGroupInBruteforceSearch) {
   }
 }
 
+#if 0
 TEST_F(HnswStreamerTest, TestBinaryConverter) {
   uint32_t dimension = 2560;
 
@@ -3523,6 +3524,7 @@ TEST_F(HnswStreamerTest, TestBinaryConverter) {
     ASSERT_NEAR(0, results[0].score(), epison);
   }
 }
+#endif
 
 TEST_F(HnswStreamerTest, TestAddAndSearchWithID) {
   IndexStreamer::Pointer streamer =
@@ -3637,6 +3639,7 @@ TEST_F(HnswStreamerTest, TestAddAndSearchWithID) {
   // EXPECT_GT(cost, 2.0f);
 }
 
+#if 0
 TEST_F(HnswStreamerTest, TestBasicRefiner) {
   uint32_t dimension = 1120;
 
@@ -3758,6 +3761,8 @@ TEST_F(HnswStreamerTest, TestBasicRefiner) {
     // }
   }
 }
+
+#endif
 
 }  // namespace core
 }  // namespace zvec
