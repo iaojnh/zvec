@@ -98,12 +98,12 @@ class HnswStreamer : public IndexStreamer {
 
   //! Fetch vector by id
   virtual const void *get_vector_by_id(uint32_t id) const override {
-    return entity_.get_vector_new(id);
+    return entity_.get_vector(id);
   }
 
   virtual int get_vector_by_id(
       const uint32_t id, IndexStorage::MemoryBlock &block) const override {
-    return entity_.get_vector_new(id, block);
+    return entity_.get_vector(id, block);
   }
 
   //! Open index from file path

@@ -176,7 +176,7 @@ class HnswContext : public IndexContext {
       node_id_t id = topk_heap_[i].first;
       if (fetch_vector_) {
         results_[idx].emplace_back(entity_->get_key(id), score, id,
-                                   entity_->get_vector_new(id));
+                                   entity_->get_vector(id));
       } else {
         results_[idx].emplace_back(entity_->get_key(id), score, id);
       }
@@ -239,7 +239,7 @@ class HnswContext : public IndexContext {
 
         if (fetch_vector_) {
           group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id, entity_->get_vector_new(id));
+              entity_->get_key(id), score, id, entity_->get_vector(id));
         } else {
           group_results_[idx][i].mutable_docs()->emplace_back(
               entity_->get_key(id), score, id);

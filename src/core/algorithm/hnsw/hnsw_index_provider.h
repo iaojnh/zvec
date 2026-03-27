@@ -84,7 +84,7 @@ class HnswIndexProvider : public IndexProvider {
     //! NOTICE: the vec feature will be changed after iterating to next, so
     //! the caller need to keep a copy of it before iterator to next vector
     virtual const void *data(void) const override {
-      return entity_->get_vector_new(cur_id_);
+      return entity_->get_vector(cur_id_);
     }
 
     //! Test if the iterator is valid

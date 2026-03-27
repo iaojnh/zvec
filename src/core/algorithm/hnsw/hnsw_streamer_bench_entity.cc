@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "hnsw_streamer_entity.h"
+#include "hnsw_streamer_bench_entity.h"
 #include <ailego/utility/memory_helper.h>
 
 // #define DEBUG_PRINT
@@ -20,22 +20,22 @@
 namespace zvec {
 namespace core {
 
-const std::string HnswStreamerEntity::kGraphHeaderSegmentId = "graph.header";
-const std::string HnswStreamerEntity::kGraphFeaturesSegmentId =
+const std::string HnswStreamerBenchEntity::kGraphHeaderSegmentId = "graph.header";
+const std::string HnswStreamerBenchEntity::kGraphFeaturesSegmentId =
     "graph.features";
-const std::string HnswStreamerEntity::kGraphKeysSegmentId = "graph.keys";
-const std::string HnswStreamerEntity::kGraphNeighborsSegmentId =
+const std::string HnswStreamerBenchEntity::kGraphKeysSegmentId = "graph.keys";
+const std::string HnswStreamerBenchEntity::kGraphNeighborsSegmentId =
     "graph.neighbors";
-const std::string HnswStreamerEntity::kGraphOffsetsSegmentId =
+const std::string HnswStreamerBenchEntity::kGraphOffsetsSegmentId =
     "graph.offsets";
-const std::string HnswStreamerEntity::kGraphMappingSegmentId =
+const std::string HnswStreamerBenchEntity::kGraphMappingSegmentId =
     "graph.mapping";
-const std::string HnswStreamerEntity::kHnswHeaderSegmentId = "hnsw.header";
-const std::string HnswStreamerEntity::kHnswNeighborsSegmentId =
+const std::string HnswStreamerBenchEntity::kHnswHeaderSegmentId = "hnsw.header";
+const std::string HnswStreamerBenchEntity::kHnswNeighborsSegmentId =
     "hnsw.neighbors";
-const std::string HnswStreamerEntity::kHnswOffsetsSegmentId = "hnsw.offsets";
+const std::string HnswStreamerBenchEntity::kHnswOffsetsSegmentId = "hnsw.offsets";
 
-int64_t HnswStreamerEntity::dump_segment(const IndexDumper::Pointer &dumper,
+int64_t HnswStreamerBenchEntity::dump_segment(const IndexDumper::Pointer &dumper,
                                             const std::string &segment_id,
                                             const void *data,
                                             size_t size) const {
@@ -65,7 +65,7 @@ int64_t HnswStreamerEntity::dump_segment(const IndexDumper::Pointer &dumper,
   return len + padding_size;
 }
 
-int64_t HnswStreamerEntity::dump_header(const IndexDumper::Pointer &dumper,
+int64_t HnswStreamerBenchEntity::dump_header(const IndexDumper::Pointer &dumper,
                                            const HNSWHeader &hd) const {
   //! dump basic graph header. header is aligned and does not need padding
   int64_t graph_hd_size =
@@ -85,12 +85,12 @@ int64_t HnswStreamerEntity::dump_header(const IndexDumper::Pointer &dumper,
 }
 
 
-HnswStreamerEntity::HnswStreamerEntity(IndexStreamer::Stats &stats)
+HnswStreamerBenchEntity::HnswStreamerBenchEntity(IndexStreamer::Stats &stats)
     : stats_(stats) {}
 
-HnswStreamerEntity::~HnswStreamerEntity() {}
+HnswStreamerBenchEntity::~HnswStreamerBenchEntity() {}
 
-int HnswStreamerEntity::init(size_t max_doc_cnt) {
+int HnswStreamerBenchEntity::init(size_t max_doc_cnt) {
   if (std::pow(scaling_factor(), kMaxGraphLayers) < max_doc_cnt) {
     LOG_ERROR("scalingFactor=%zu is too small", scaling_factor());
     return IndexError_InvalidArgument;
@@ -102,7 +102,7 @@ int HnswStreamerEntity::init(size_t max_doc_cnt) {
   keys_map_lock_ = std::make_shared<ailego::SharedMutex>();
   keys_map_ = std::make_shared<HashMap<key_t, node_id_t>>();
   if (!keys_map_ || !upper_neighbor_index_ || !broker_ || !keys_map_lock_) {
-    LOG_ERROR("HnswStreamerEntity new object failed");
+    LOG_ERROR("HnswStreamerBenchEntity new object failed");
     return IndexError_NoMemory;
   }
   keys_map_->set_empty_key(kInvalidKey);
@@ -118,7 +118,7 @@ int HnswStreamerEntity::init(size_t max_doc_cnt) {
   return 0;
 }
 
-int HnswStreamerEntity::cleanup() {
+int HnswStreamerBenchEntity::cleanup() {
   std::lock_guard<std::mutex> lock(mutex_);
   mutable_header()->clear();
   chunk_size_ = kDefaultChunkSize;
@@ -142,7 +142,7 @@ int HnswStreamerEntity::cleanup() {
   return 0;
 }
 
-int HnswStreamerEntity::update_neighbors(
+int HnswStreamerBenchEntity::update_neighbors(
     level_t level, node_id_t id,
     const std::vector<std::pair<node_id_t, dist_t>> &neighbors) {
   std::vector<char> buffer(level == 0 ? neighbor_size_ : upper_neighbor_size_);
@@ -165,7 +165,7 @@ int HnswStreamerEntity::update_neighbors(
   return 0;
 }
 
-const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
+const Neighbors HnswStreamerBenchEntity::get_neighbors(level_t level,
                                                      node_id_t id) const {
   Chunk *chunk = nullptr;
   size_t offset = 0UL;
@@ -195,8 +195,20 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
   return Neighbors(neighbor_block);
 }
 
+const Neighbors HnswStreamerBenchEntity::get_neighbors_new(level_t level,
+                                                         node_id_t id) const {
+  if (id) {
+    return get_neighbors(level, id);
+  } else {
+    const void *src = neighbors_value_ptr_->data() + id * neighbor_size_;
+    const NeighborsHeader *header =
+        reinterpret_cast<const NeighborsHeader *>(src);
+    return Neighbors(header->neighbor_cnt, header->neighbors);
+  }
+}
+
 //! Get vector data by key
-const void *HnswStreamerEntity::get_vector(node_id_t id) const {
+const void *HnswStreamerBenchEntity::get_vector(node_id_t id) const {
   auto loc = get_vector_chunk_loc(id);
   const void *vec = nullptr;
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
@@ -214,7 +226,12 @@ const void *HnswStreamerEntity::get_vector(node_id_t id) const {
   return vec;
 }
 
-int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
+const void *HnswStreamerBenchEntity::get_vector_new(node_id_t id) const {
+  return vector_value_ptr_->data() + vector_size() * id;
+  // return get_vector(id);
+}
+
+int HnswStreamerBenchEntity::get_vector(const node_id_t *ids, uint32_t count,
                                       const void **vecs) const {
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
@@ -234,7 +251,7 @@ int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
   return 0;
 }
 
-int HnswStreamerEntity::get_vector(const node_id_t id,
+int HnswStreamerBenchEntity::get_vector(const node_id_t id,
                                       IndexStorage::MemoryBlock &block) const {
   auto loc = get_vector_chunk_loc(id);
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
@@ -252,7 +269,27 @@ int HnswStreamerEntity::get_vector(const node_id_t id,
   return 0;
 }
 
-int HnswStreamerEntity::get_vector(
+int HnswStreamerBenchEntity::get_vector_new(
+    const node_id_t id, IndexStorage::MemoryBlock &block) const {
+  const void *data = vector_value_ptr_->data() + vector_size() * id;
+  block.reset((void *)data);
+  return 0;
+  // return get_vector(id, block);
+}
+
+int HnswStreamerBenchEntity::get_vector_new(
+    const node_id_t *ids, uint32_t count,
+    std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
+  vec_blocks.reserve(count);
+  for (int i = 0; i < count; i++) {
+    const void *data = vector_value_ptr_->data() + vector_size() * ids[i];
+    vec_blocks.emplace_back((void *)data);
+  }
+  return 0;
+  // return get_vector(ids, count, vec_blocks);
+}
+
+int HnswStreamerBenchEntity::get_vector(
     const node_id_t *ids, uint32_t count,
     std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
@@ -275,7 +312,7 @@ int HnswStreamerEntity::get_vector(
   return 0;
 }
 
-key_t HnswStreamerEntity::get_key(node_id_t id) const {
+key_t HnswStreamerBenchEntity::get_key(node_id_t id) const {
   if (use_key_info_map_) {
     auto loc = get_key_chunk_loc(id);
     IndexStorage::MemoryBlock key_block;
@@ -295,7 +332,7 @@ key_t HnswStreamerEntity::get_key(node_id_t id) const {
   }
 }
 
-void HnswStreamerEntity::add_neighbor(level_t level, node_id_t id,
+void HnswStreamerBenchEntity::add_neighbor(level_t level, node_id_t id,
                                          uint32_t size, node_id_t neighbor_id) {
   auto loc = get_neighbor_chunk_loc(level, id);
   size_t offset =
@@ -317,7 +354,7 @@ void HnswStreamerEntity::add_neighbor(level_t level, node_id_t id,
   return;
 }
 
-int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
+int HnswStreamerBenchEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   if (header_chunk->data_size() < header_size()) {
     LOG_ERROR("Invalid header chunk size");
     return IndexError_InvalidFormat;
@@ -362,7 +399,7 @@ int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   return 0;
 }
 
-int HnswStreamerEntity::open(IndexStorage::Pointer stg,
+int HnswStreamerBenchEntity::open(IndexStorage::Pointer stg,
                                 uint64_t max_index_size, bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
   bool huge_page = stg->isHugePage();
@@ -443,12 +480,26 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg,
       }
     }
   }
+  vector_value_ptr_ = std::make_shared<std::string>();
+  vector_value_ptr_->reserve(vector_size() * doc_cnt());
+  for (int i = 0; i < doc_cnt(); i++) {
+    vector_value_ptr_->append((const char *)get_vector(i), vector_size());
+  }
+
+  neighbors_value_ptr_ = std::make_shared<std::string>();
+  neighbors_value_ptr_->reserve(neighbor_size_ * doc_cnt());
+  for (int i = 0; i < doc_cnt(); i++) {
+    Neighbors neighbor = get_neighbors(0, i);
+    neighbors_value_ptr_->append((const char *)neighbor.neighbor_block.data(),
+                                 neighbor_size_);
+  }
+
   stats_.set_loaded_count(doc_cnt());
 
   return 0;
 }
 
-int HnswStreamerEntity::close() {
+int HnswStreamerBenchEntity::close() {
   LOG_DEBUG("close index");
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -463,7 +514,7 @@ int HnswStreamerEntity::close() {
   return broker_->close();
 }
 
-int HnswStreamerEntity::flush(uint64_t checkpoint) {
+int HnswStreamerBenchEntity::flush(uint64_t checkpoint) {
   LOG_INFO("Flush index, curDocs=%u", doc_cnt());
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -476,7 +527,7 @@ int HnswStreamerEntity::flush(uint64_t checkpoint) {
   return 0;
 }
 
-int HnswStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
+int HnswStreamerBenchEntity::dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("Dump index, curDocs=%u", doc_cnt());
 
   //! sort by keys, to support get_vector by key in searcher
@@ -503,7 +554,7 @@ int HnswStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   return 0;
 }
 
-int HnswStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
+int HnswStreamerBenchEntity::check_hnsw_index(const HNSWHeader *hd) const {
   if (l0_neighbor_cnt() != hd->l0_neighbor_cnt() ||
       upper_neighbor_cnt() != hd->upper_neighbor_cnt()) {
     LOG_ERROR("Param neighbor cnt: %zu:%zu mismatch index previous %zu:%zu",
@@ -546,7 +597,7 @@ int HnswStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
   return 0;
 }
 
-int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
+int HnswStreamerBenchEntity::add_vector(level_t level, key_t key, const void *vec,
                                       node_id_t *id) {
   Chunk::Pointer node_chunk;
   size_t chunk_offset = -1UL;
@@ -619,7 +670,7 @@ int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
   return 0;
 }
 
-int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
+int HnswStreamerBenchEntity::add_vector_with_id(level_t level, node_id_t id,
                                               const void *vec) {
   Chunk::Pointer node_chunk;
   size_t chunk_offset = -1UL;
@@ -722,7 +773,7 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
   return 0;
 }
 
-void HnswStreamerEntity::update_ep_and_level(node_id_t ep, level_t level) {
+void HnswStreamerBenchEntity::update_ep_and_level(node_id_t ep, level_t level) {
   base_header_.hnsw.entry_point = ep;
   base_header_.hnsw.max_level = level;
   flush_header();
@@ -730,14 +781,14 @@ void HnswStreamerEntity::update_ep_and_level(node_id_t ep, level_t level) {
   return;
 }
 
-const HnswStreamerEntity::Pointer HnswStreamerEntity::clone() const {
+const HnswStreamerBenchEntity::Pointer HnswStreamerBenchEntity::clone() const {
   std::vector<Chunk::Pointer> node_chunks;
   node_chunks.reserve(node_chunks_.size());
   for (size_t i = 0UL; i < node_chunks_.size(); ++i) {
     node_chunks.emplace_back(node_chunks_[i]->clone());
     if (ailego_unlikely(!node_chunks[i])) {
-      LOG_ERROR("HnswStreamerEntity get chunk failed in clone");
-      return HnswStreamerEntity::Pointer();
+      LOG_ERROR("HnswStreamerBenchEntity get chunk failed in clone");
+      return HnswStreamerBenchEntity::Pointer();
     }
   }
 
@@ -746,23 +797,24 @@ const HnswStreamerEntity::Pointer HnswStreamerEntity::clone() const {
   for (size_t i = 0UL; i < upper_neighbor_chunks_.size(); ++i) {
     upper_neighbor_chunks.emplace_back(upper_neighbor_chunks_[i]->clone());
     if (ailego_unlikely(!upper_neighbor_chunks[i])) {
-      LOG_ERROR("HnswStreamerEntity get chunk failed in clone");
-      return HnswStreamerEntity::Pointer();
+      LOG_ERROR("HnswStreamerBenchEntity get chunk failed in clone");
+      return HnswStreamerBenchEntity::Pointer();
     }
   }
 
-  HnswStreamerEntity *entity = new (std::nothrow) HnswStreamerEntity(
+  HnswStreamerBenchEntity *entity = new (std::nothrow) HnswStreamerBenchEntity(
       stats_, header(), chunk_size_, node_index_mask_bits_,
       upper_neighbor_mask_bits_, filter_same_key_, get_vector_enabled_,
       upper_neighbor_index_, keys_map_lock_, keys_map_, use_key_info_map_,
-      std::move(node_chunks), std::move(upper_neighbor_chunks), broker_);
+      std::move(node_chunks), std::move(upper_neighbor_chunks), broker_,
+      vector_value_ptr_, neighbors_value_ptr_);
   if (ailego_unlikely(!entity)) {
-    LOG_ERROR("HnswStreamerEntity new failed");
+    LOG_ERROR("HnswStreamerBenchEntity new failed");
   }
-  return HnswStreamerEntity::Pointer(entity);
+  return HnswStreamerBenchEntity::Pointer(entity);
 }
 
-int64_t HnswStreamerEntity::dump_mapping_segment(
+int64_t HnswStreamerBenchEntity::dump_mapping_segment(
     const IndexDumper::Pointer &dumper, const key_t *keys) const {
   std::vector<node_id_t> mapping(doc_cnt());
 
@@ -775,7 +827,7 @@ int64_t HnswStreamerEntity::dump_mapping_segment(
   return dump_segment(dumper, kGraphMappingSegmentId, mapping.data(), size);
 }
 
-int64_t HnswStreamerEntity::dump_segments(
+int64_t HnswStreamerBenchEntity::dump_segments(
     const IndexDumper::Pointer &dumper, key_t *keys,
     const std::function<level_t(node_id_t)> &get_level) const {
   HNSWHeader dump_hd(header());
@@ -827,7 +879,7 @@ int64_t HnswStreamerEntity::dump_segments(
   return hd_size + keys_size + vecs_size + neighbors_size + mapping_size;
 }
 
-int64_t HnswStreamerEntity::dump_vectors(
+int64_t HnswStreamerBenchEntity::dump_vectors(
     const IndexDumper::Pointer &dumper,
     const std::vector<node_id_t> &reorder_mapping) const {
   size_t vector_dump_size = vector_size();
@@ -878,7 +930,7 @@ int64_t HnswStreamerEntity::dump_vectors(
   return vecs_size;
 }
 
-int64_t HnswStreamerEntity::dump_graph_neighbors(
+int64_t HnswStreamerBenchEntity::dump_graph_neighbors(
     const IndexDumper::Pointer &dumper,
     const std::vector<node_id_t> &reorder_mapping,
     const std::vector<node_id_t> &neighbor_mapping) const {
@@ -956,7 +1008,7 @@ int64_t HnswStreamerEntity::dump_graph_neighbors(
   return len + offset + padding_size;
 }
 
-int64_t HnswStreamerEntity::dump_upper_neighbors(
+int64_t HnswStreamerBenchEntity::dump_upper_neighbors(
     const IndexDumper::Pointer &dumper,
     const std::function<level_t(node_id_t)> &get_level,
     const std::vector<node_id_t> &reorder_mapping,
@@ -1023,7 +1075,7 @@ int64_t HnswStreamerEntity::dump_upper_neighbors(
   return len + offset + padding_size;
 }
 
-int HnswStreamerEntity::CalcAndAddPadding(const IndexDumper::Pointer &dumper,
+int HnswStreamerBenchEntity::CalcAndAddPadding(const IndexDumper::Pointer &dumper,
                                              size_t data_size,
                                              size_t *padding_size) {
   *padding_size = AlignSize(data_size) - data_size;
