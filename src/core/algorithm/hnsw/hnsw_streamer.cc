@@ -21,6 +21,7 @@
 #include "hnsw_context.h"
 #include "hnsw_dist_calculator.h"
 #include "hnsw_index_provider.h"
+#include "hnsw_streamer_entity_set.h"
 
 namespace zvec {
 namespace core {
