@@ -27,10 +27,10 @@
 namespace zvec {
 namespace core {
 
-//! HnswStreamerEntityNew manage vector data, pkey, and node's neighbors
-class HnswStreamerEntityNew {
+//! HnswStreamerEntity manage vector data, pkey, and node's neighbors
+class HnswStreamerEntity {
  public:  // override
-  typedef std::shared_ptr<HnswStreamerEntityNew> Pointer;
+  typedef std::shared_ptr<HnswStreamerEntity> Pointer;
 
   //! Cleanup
   //! return 0 on success, or errCode in failure
@@ -38,7 +38,7 @@ class HnswStreamerEntityNew {
 
   //! Make a copy of streamer entity, to support thread-safe operation.
   //! The segment in container cannot be read concurrenly
-  const HnswStreamerEntityNew::Pointer clone() const;
+  const HnswStreamerEntity::Pointer clone() const;
 
   //! Get primary key of the node id
   key_t get_key(node_id_t id) const;
@@ -329,10 +329,10 @@ class HnswStreamerEntityNew {
 
  public:
   //! Constructor
-  HnswStreamerEntityNew(IndexStreamer::Stats &stats);
+  HnswStreamerEntity(IndexStreamer::Stats &stats);
 
   //! Destructor
-  ~HnswStreamerEntityNew();
+  ~HnswStreamerEntity();
 
   //! Get vector feature data by key
 
@@ -441,7 +441,7 @@ class HnswStreamerEntityNew {
   using NIHashMapPointer = std::shared_ptr<NIHashMap>;
 
   //! Private construct, only be called by clone method
-  HnswStreamerEntityNew(IndexStreamer::Stats &stats, const HNSWHeader &hd,
+  HnswStreamerEntity(IndexStreamer::Stats &stats, const HNSWHeader &hd,
                         size_t chunk_size, uint32_t node_index_mask_bits,
                         uint32_t upper_neighbor_mask_bits, bool filter_same_key,
                         bool get_vector_enabled,
@@ -702,8 +702,8 @@ class HnswStreamerEntityNew {
   }
 
  private:
-  HnswStreamerEntityNew(const HnswStreamerEntityNew &) = delete;
-  HnswStreamerEntityNew &operator=(const HnswStreamerEntityNew &) = delete;
+  HnswStreamerEntity(const HnswStreamerEntity &) = delete;
+  HnswStreamerEntity &operator=(const HnswStreamerEntity &) = delete;
   static constexpr float kUpperHashMemoryInflateRatio = 2.0f;
 
  private:

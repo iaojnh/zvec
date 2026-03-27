@@ -17,7 +17,7 @@
 #include "utility/sparse_utility.h"
 #include "utility/visit_filter.h"
 #include "hnsw_dist_calculator.h"
-#include "hnsw_streamer_entity_new.h"
+#include "hnsw_streamer_entity.h"
 
 namespace zvec {
 namespace core {
@@ -36,11 +36,11 @@ class HnswContext : public IndexContext {
 
   //! Construct
   HnswContext(size_t dimension, const IndexMetric::Pointer &metric,
-              const HnswStreamerEntityNew::Pointer &entity);
+              const HnswStreamerEntity::Pointer &entity);
 
   //! Construct
   HnswContext(const IndexMetric::Pointer &metric,
-              const HnswStreamerEntityNew::Pointer &entity);
+              const HnswStreamerEntity::Pointer &entity);
 
   //! Destructor
   virtual ~HnswContext();
@@ -114,10 +114,10 @@ class HnswContext : public IndexContext {
   //! Update context, the context may be shared by different searcher/streamer
   int update_context(ContextType type, const IndexMeta &meta,
                      const IndexMetric::Pointer &metric,
-                     const HnswStreamerEntityNew::Pointer &entity,
+                     const HnswStreamerEntity::Pointer &entity,
                      uint32_t magic_num);
 
-  inline const HnswStreamerEntityNew &get_entity() const {
+  inline const HnswStreamerEntity &get_entity() const {
     return *entity_;
   }
 
@@ -493,7 +493,7 @@ class HnswContext : public IndexContext {
   constexpr static uint32_t kInvalidMgic = -1U;
 
  private:
-  HnswStreamerEntityNew::Pointer entity_;
+  HnswStreamerEntity::Pointer entity_;
   HnswDistCalculator dc_;
   IndexMetric::Pointer metric_;
 
@@ -507,9 +507,9 @@ class HnswContext : public IndexContext {
   uint32_t group_topk_{0};
   uint32_t filter_mode_{VisitFilter::ByteMap};
   float negative_probability_{
-      HnswStreamerEntityNew::kDefaultBFNegativeProbability};
-  uint32_t ef_{HnswStreamerEntityNew::kDefaultEf};
-  float max_scan_ratio_{HnswStreamerEntityNew::kDefaultScanRatio};
+      HnswStreamerEntity::kDefaultBFNegativeProbability};
+  uint32_t ef_{HnswStreamerEntity::kDefaultEf};
+  float max_scan_ratio_{HnswStreamerEntity::kDefaultScanRatio};
   uint32_t magic_{0U};
   std::vector<IndexDocumentList> results_{};
   std::vector<IndexGroupDocumentList> group_results_{};

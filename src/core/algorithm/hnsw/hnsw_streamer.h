@@ -16,7 +16,7 @@
 #include <ailego/parallel/lock.h>
 #include <zvec/core/framework/index_framework.h>
 #include "hnsw_algorithm.h"
-#include "hnsw_streamer_entity_new.h"
+#include "hnsw_streamer_entity.h"
 
 namespace zvec {
 namespace core {
@@ -181,7 +181,7 @@ class HnswStreamer : public IndexStreamer {
     }
   };
 
-  HnswStreamerEntityNew entity_;
+  HnswStreamerEntity entity_;
   HnswAlgorithm::UPointer alg_;
   IndexMeta meta_{};
   IndexMetric::Pointer metric_{};
@@ -196,20 +196,20 @@ class HnswStreamer : public IndexStreamer {
   std::mutex mutex_{};
 
   size_t max_index_size_{0UL};
-  size_t chunk_size_{HnswEntity::kDefaultChunkSize};
-  size_t docs_hard_limit_{HnswEntity::kDefaultDocsHardLimit};
+  size_t chunk_size_{HnswStreamerEntity::kDefaultChunkSize};
+  size_t docs_hard_limit_{HnswStreamerEntity::kDefaultDocsHardLimit};
   size_t docs_soft_limit_{0UL};
   uint32_t min_neighbor_cnt_{0u};
-  uint32_t upper_max_neighbor_cnt_{HnswEntity::kDefaultUpperMaxNeighborCnt};
-  uint32_t l0_max_neighbor_cnt_{HnswEntity::kDefaultL0MaxNeighborCnt};
-  uint32_t ef_{HnswEntity::kDefaultEf};
-  uint32_t ef_construction_{HnswEntity::kDefaultEfConstruction};
-  uint32_t scaling_factor_{HnswEntity::kDefaultScalingFactor};
-  size_t bruteforce_threshold_{HnswEntity::kDefaultBruteForceThreshold};
-  size_t max_scan_limit_{HnswEntity::kDefaultMaxScanLimit};
-  size_t min_scan_limit_{HnswEntity::kDefaultMinScanLimit};
-  float bf_negative_prob_{HnswEntity::kDefaultBFNegativeProbability};
-  float max_scan_ratio_{HnswEntity::kDefaultScanRatio};
+  uint32_t upper_max_neighbor_cnt_{HnswStreamerEntity::kDefaultUpperMaxNeighborCnt};
+  uint32_t l0_max_neighbor_cnt_{HnswStreamerEntity::kDefaultL0MaxNeighborCnt};
+  uint32_t ef_{HnswStreamerEntity::kDefaultEf};
+  uint32_t ef_construction_{HnswStreamerEntity::kDefaultEfConstruction};
+  uint32_t scaling_factor_{HnswStreamerEntity::kDefaultScalingFactor};
+  size_t bruteforce_threshold_{HnswStreamerEntity::kDefaultBruteForceThreshold};
+  size_t max_scan_limit_{HnswStreamerEntity::kDefaultMaxScanLimit};
+  size_t min_scan_limit_{HnswStreamerEntity::kDefaultMinScanLimit};
+  float bf_negative_prob_{HnswStreamerEntity::kDefaultBFNegativeProbability};
+  float max_scan_ratio_{HnswStreamerEntity::kDefaultScanRatio};
 
   uint32_t magic_{0U};
   State state_{STATE_INIT};

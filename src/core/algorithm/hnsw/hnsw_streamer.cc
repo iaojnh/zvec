@@ -35,16 +35,16 @@ HnswStreamer::~HnswStreamer() {
 
 int HnswStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
   meta_ = imeta;
-  meta_.set_streamer("HnswStreamer", HnswStreamerEntityNew::kRevision, params);
+  meta_.set_streamer("HnswStreamer", HnswStreamerEntity::kRevision, params);
 
   params.get(PARAM_HNSW_STREAMER_MAX_INDEX_SIZE, &max_index_size_);
 
   params.get(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, &upper_max_neighbor_cnt_);
-  float multiplier = HnswStreamerEntityNew::kDefaultL0MaxNeighborCntMultiplier;
+  float multiplier = HnswStreamerEntity::kDefaultL0MaxNeighborCntMultiplier;
   params.get(PARAM_HNSW_STREAMER_L0_MAX_NEIGHBOR_COUNT_MULTIPLIER, &multiplier);
   l0_max_neighbor_cnt_ = multiplier * upper_max_neighbor_cnt_;
 
-  multiplier = HnswStreamerEntityNew::kDefaultNeighborPruneMultiplier;
+  multiplier = HnswStreamerEntity::kDefaultNeighborPruneMultiplier;
   params.get(PARAM_HNSW_STREAMER_NEIGHBOR_PRUNE_MULTIPLIER, &multiplier);
   size_t prune_cnt = multiplier * upper_max_neighbor_cnt_;
   scaling_factor_ = upper_max_neighbor_cnt_;
@@ -78,31 +78,31 @@ int HnswStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
     return IndexError_InvalidArgument;
   } else if (docs_soft_limit_ == 0UL) {
     docs_soft_limit_ =
-        docs_hard_limit_ * HnswStreamerEntityNew::kDefaultDocsSoftLimitRatio;
+        docs_hard_limit_ * HnswStreamerEntity::kDefaultDocsSoftLimitRatio;
   }
 
   if (ef_ == 0U) {
-    ef_ = HnswStreamerEntityNew::kDefaultEf;
+    ef_ = HnswStreamerEntity::kDefaultEf;
   }
   if (ef_construction_ == 0U) {
-    ef_construction_ = HnswStreamerEntityNew::kDefaultEfConstruction;
+    ef_construction_ = HnswStreamerEntity::kDefaultEfConstruction;
   }
   if (upper_max_neighbor_cnt_ == 0U) {
     upper_max_neighbor_cnt_ =
-        HnswStreamerEntityNew::kDefaultUpperMaxNeighborCnt;
+        HnswStreamerEntity::kDefaultUpperMaxNeighborCnt;
   }
-  if (upper_max_neighbor_cnt_ > HnswStreamerEntityNew::kMaxNeighborCnt) {
+  if (upper_max_neighbor_cnt_ > HnswStreamerEntity::kMaxNeighborCnt) {
     LOG_ERROR("[%s] must be in range (0,%d)",
               PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT.c_str(),
-              HnswStreamerEntityNew::kMaxNeighborCnt);
+              HnswStreamerEntity::kMaxNeighborCnt);
     return IndexError_InvalidArgument;
   }
   if (l0_max_neighbor_cnt_ == 0U) {
-    l0_max_neighbor_cnt_ = HnswStreamerEntityNew::kDefaultL0MaxNeighborCnt;
+    l0_max_neighbor_cnt_ = HnswStreamerEntity::kDefaultL0MaxNeighborCnt;
   }
-  if (l0_max_neighbor_cnt_ > HnswStreamerEntityNew::kMaxNeighborCnt) {
+  if (l0_max_neighbor_cnt_ > HnswStreamerEntity::kMaxNeighborCnt) {
     LOG_ERROR("MaxL0NeighborCnt must be in range (0,%d)",
-              HnswStreamerEntityNew::kMaxNeighborCnt);
+              HnswStreamerEntity::kMaxNeighborCnt);
     return IndexError_InvalidArgument;
   }
   if (min_neighbor_cnt_ > upper_max_neighbor_cnt_) {
@@ -120,7 +120,7 @@ int HnswStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
   }
 
   if (scaling_factor_ == 0U) {
-    scaling_factor_ = HnswStreamerEntityNew::kDefaultScalingFactor;
+    scaling_factor_ = HnswStreamerEntity::kDefaultScalingFactor;
   }
   if (scaling_factor_ < 5 || scaling_factor_ > 1000) {
     LOG_ERROR("[%s] must be in range [5,1000]",
@@ -145,11 +145,11 @@ int HnswStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
     prune_cnt = upper_max_neighbor_cnt_;
   }
   if (chunk_size_ == 0UL) {
-    chunk_size_ = HnswStreamerEntityNew::kDefaultChunkSize;
+    chunk_size_ = HnswStreamerEntity::kDefaultChunkSize;
   }
-  if (chunk_size_ > HnswStreamerEntityNew::kMaxChunkSize) {
+  if (chunk_size_ > HnswStreamerEntity::kMaxChunkSize) {
     LOG_ERROR("[%s] must be < %zu", PARAM_HNSW_STREAMER_CHUNK_SIZE.c_str(),
-              HnswStreamerEntityNew::kMaxChunkSize);
+              HnswStreamerEntity::kMaxChunkSize);
     return IndexError_InvalidArgument;
   }
 
@@ -216,20 +216,20 @@ int HnswStreamer::cleanup(void) {
   }
 
   max_index_size_ = 0UL;
-  docs_hard_limit_ = HnswStreamerEntityNew::kDefaultDocsHardLimit;
+  docs_hard_limit_ = HnswStreamerEntity::kDefaultDocsHardLimit;
   docs_soft_limit_ = 0UL;
-  upper_max_neighbor_cnt_ = HnswStreamerEntityNew::kDefaultUpperMaxNeighborCnt;
-  l0_max_neighbor_cnt_ = HnswStreamerEntityNew::kDefaultL0MaxNeighborCnt;
-  ef_ = HnswStreamerEntityNew::kDefaultEf;
-  ef_construction_ = HnswStreamerEntityNew::kDefaultEfConstruction;
+  upper_max_neighbor_cnt_ = HnswStreamerEntity::kDefaultUpperMaxNeighborCnt;
+  l0_max_neighbor_cnt_ = HnswStreamerEntity::kDefaultL0MaxNeighborCnt;
+  ef_ = HnswStreamerEntity::kDefaultEf;
+  ef_construction_ = HnswStreamerEntity::kDefaultEfConstruction;
   bf_enabled_ = false;
-  scaling_factor_ = HnswStreamerEntityNew::kDefaultScalingFactor;
-  bruteforce_threshold_ = HnswStreamerEntityNew::kDefaultBruteForceThreshold;
-  max_scan_limit_ = HnswStreamerEntityNew::kDefaultMaxScanLimit;
-  min_scan_limit_ = HnswStreamerEntityNew::kDefaultMinScanLimit;
-  chunk_size_ = HnswStreamerEntityNew::kDefaultChunkSize;
-  bf_negative_prob_ = HnswStreamerEntityNew::kDefaultBFNegativeProbability;
-  max_scan_ratio_ = HnswStreamerEntityNew::kDefaultScanRatio;
+  scaling_factor_ = HnswStreamerEntity::kDefaultScalingFactor;
+  bruteforce_threshold_ = HnswStreamerEntity::kDefaultBruteForceThreshold;
+  max_scan_limit_ = HnswStreamerEntity::kDefaultMaxScanLimit;
+  min_scan_limit_ = HnswStreamerEntity::kDefaultMinScanLimit;
+  chunk_size_ = HnswStreamerEntity::kDefaultChunkSize;
+  bf_negative_prob_ = HnswStreamerEntity::kDefaultBFNegativeProbability;
+  max_scan_ratio_ = HnswStreamerEntity::kDefaultScanRatio;
   state_ = STATE_INIT;
   check_crc_enabled_ = false;
   filter_same_key_ = false;
@@ -343,7 +343,7 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
   shared_mutex_.lock();
   AILEGO_DEFER([&]() { shared_mutex_.unlock(); });
 
-  meta_.set_searcher("HnswSearcher", HnswStreamerEntityNew::kRevision,
+  meta_.set_searcher("HnswSearcher", HnswStreamerEntity::kRevision,
                      ailego::Params());
 
   int ret = IndexHelper::SerializeToDumper(meta_, dumper.get());
@@ -360,7 +360,7 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context(void) const {
     return Context::Pointer();
   }
 
-  HnswStreamerEntityNew::Pointer entity = entity_.clone();
+  HnswStreamerEntity::Pointer entity = entity_.clone();
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("CreateContext clone init failed");
     return Context::Pointer();
@@ -403,7 +403,7 @@ IndexProvider::Pointer HnswStreamer::create_provider(void) const {
 
   auto entity = entity_.clone();
   if (ailego_unlikely(!entity)) {
-    LOG_ERROR("Clone HnswStreamerEntityNew failed");
+    LOG_ERROR("Clone HnswStreamerEntity failed");
     return nullptr;
   }
   return Provider::Pointer(
@@ -411,7 +411,7 @@ IndexProvider::Pointer HnswStreamer::create_provider(void) const {
 }
 
 int HnswStreamer::update_context(HnswContext *ctx) const {
-  const HnswStreamerEntityNew::Pointer entity = entity_.clone();
+  const HnswStreamerEntity::Pointer entity = entity_.clone();
   if (!entity) {
     LOG_ERROR("Failed to clone search context entity");
     return IndexError_Runtime;

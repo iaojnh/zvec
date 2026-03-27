@@ -17,7 +17,7 @@
 #include <ailego/parallel/lock.h>
 #include "hnsw_context.h"
 #include "hnsw_dist_calculator.h"
-#include "hnsw_streamer_entity_new.h"
+#include "hnsw_streamer_entity.h"
 
 namespace zvec {
 namespace core {
@@ -29,7 +29,7 @@ class HnswAlgorithm {
 
  public:
   //! Constructor
-  explicit HnswAlgorithm(HnswStreamerEntityNew &entity);
+  explicit HnswAlgorithm(HnswStreamerEntity &entity);
 
   //! Destructor
   ~HnswAlgorithm() = default;
@@ -116,7 +116,7 @@ class HnswAlgorithm {
   static constexpr uint32_t kLockCnt{1U << 8};
   static constexpr uint32_t kLockMask{kLockCnt - 1U};
 
-  HnswStreamerEntityNew &entity_;
+  HnswStreamerEntity &entity_;
   mutable std::mt19937 mt_{};
   std::vector<double> level_probas_{};
 

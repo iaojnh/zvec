@@ -14,7 +14,7 @@
 #pragma once
 
 #include <zvec/core/framework/index_meta.h>
-#include "hnsw_streamer_entity_new.h"
+#include "hnsw_streamer_entity.h"
 
 namespace zvec {
 namespace core {
@@ -33,7 +33,7 @@ class HnswDistCalculator {
 
  public:
   //! Constructor
-  HnswDistCalculator(const HnswStreamerEntityNew *entity,
+  HnswDistCalculator(const HnswStreamerEntity *entity,
                      const IndexMetric::Pointer &metric, uint32_t dim)
       : entity_(entity),
         distance_(metric->distance()),
@@ -43,7 +43,7 @@ class HnswDistCalculator {
         compare_cnt_(0) {}
 
   //! Constructor
-  HnswDistCalculator(const HnswStreamerEntityNew *entity,
+  HnswDistCalculator(const HnswStreamerEntity *entity,
                      const IndexMetric::Pointer &metric, uint32_t dim,
                      const void *query)
       : entity_(entity),
@@ -54,7 +54,7 @@ class HnswDistCalculator {
         compare_cnt_(0) {}
 
   //! Constructor
-  HnswDistCalculator(const HnswStreamerEntityNew *entity,
+  HnswDistCalculator(const HnswStreamerEntity *entity,
                      const IndexMetric::Pointer &metric)
       : entity_(entity),
         distance_(metric->distance()),
@@ -63,14 +63,14 @@ class HnswDistCalculator {
         dim_(0),
         compare_cnt_(0) {}
 
-  void update(const HnswStreamerEntityNew *entity,
+  void update(const HnswStreamerEntity *entity,
               const IndexMetric::Pointer &metric) {
     entity_ = entity;
     distance_ = metric->distance();
     batch_distance_ = metric->batch_distance();
   }
 
-  void update(const HnswStreamerEntityNew *entity,
+  void update(const HnswStreamerEntity *entity,
               const IndexMetric::Pointer &metric, uint32_t dim) {
     entity_ = entity;
     distance_ = metric->distance();
@@ -202,7 +202,7 @@ class HnswDistCalculator {
   HnswDistCalculator &operator=(const HnswDistCalculator &) = delete;
 
  private:
-  const HnswStreamerEntityNew *entity_;
+  const HnswStreamerEntity *entity_;
 
   IndexMetric::MatrixDistance distance_;
   IndexMetric::MatrixBatchDistance batch_distance_;

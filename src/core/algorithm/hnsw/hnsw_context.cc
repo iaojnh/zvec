@@ -19,13 +19,13 @@ namespace zvec {
 namespace core {
 
 HnswContext::HnswContext(size_t dimension, const IndexMetric::Pointer &metric,
-                         const HnswStreamerEntityNew::Pointer &entity)
+                         const HnswStreamerEntity::Pointer &entity)
     : IndexContext(metric),
       entity_(entity),
       dc_(entity_.get(), metric, dimension) {}
 
 HnswContext::HnswContext(const IndexMetric::Pointer &metric,
-                         const HnswStreamerEntityNew::Pointer &entity)
+                         const HnswStreamerEntity::Pointer &entity)
     : IndexContext(metric), entity_(entity), dc_(entity_.get(), metric) {}
 
 HnswContext::~HnswContext() {
@@ -201,7 +201,7 @@ int HnswContext::update(const ailego::Params &params) {
 
 int HnswContext::update_context(ContextType type, const IndexMeta &meta,
                                 const IndexMetric::Pointer &metric,
-                                const HnswStreamerEntityNew::Pointer &entity,
+                                const HnswStreamerEntity::Pointer &entity,
                                 uint32_t magic_num) {
   uint32_t doc_cnt;
 
