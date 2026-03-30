@@ -14,7 +14,7 @@
 #pragma once
 
 #include <zvec/core/framework/index_meta.h>
-#include "hnsw_streamer_entity.h"
+#include "hnsw_streamer_entity_set.h"
 
 namespace zvec {
 namespace core {
@@ -33,9 +33,9 @@ class HnswDistCalculator {
 
  public:
   //! Constructor
-  HnswDistCalculator(const HnswStreamerEntity *entity,
+  HnswDistCalculator(const HnswStreamerEntitySet *entity_set,
                      const IndexMetric::Pointer &metric, uint32_t dim)
-      : entity_(entity),
+      : entity_set_(entity_set),
         distance_(metric->distance()),
         batch_distance_(metric->batch_distance()),
         query_(nullptr),
@@ -43,10 +43,10 @@ class HnswDistCalculator {
         compare_cnt_(0) {}
 
   //! Constructor
-  HnswDistCalculator(const HnswStreamerEntity *entity,
+  HnswDistCalculator(const HnswStreamerEntitySet *entity_set,
                      const IndexMetric::Pointer &metric, uint32_t dim,
                      const void *query)
-      : entity_(entity),
+      : entity_set_(entity_set),
         distance_(metric->distance()),
         batch_distance_(metric->batch_distance()),
         query_(query),
@@ -54,25 +54,25 @@ class HnswDistCalculator {
         compare_cnt_(0) {}
 
   //! Constructor
-  HnswDistCalculator(const HnswStreamerEntity *entity,
+  HnswDistCalculator(const HnswStreamerEntitySet *entity_set,
                      const IndexMetric::Pointer &metric)
-      : entity_(entity),
+      : entity_set_(entity_set),
         distance_(metric->distance()),
         batch_distance_(metric->batch_distance()),
         query_(nullptr),
         dim_(0),
         compare_cnt_(0) {}
 
-  void update(const HnswStreamerEntity *entity,
+  void update(const HnswStreamerEntitySet *entity_set,
               const IndexMetric::Pointer &metric) {
-    entity_ = entity;
+    entity_set_ = entity_set;
     distance_ = metric->distance();
     batch_distance_ = metric->batch_distance();
   }
 
-  void update(const HnswStreamerEntity *entity,
+  void update(const HnswStreamerEntitySet *entity_set,
               const IndexMetric::Pointer &metric, uint32_t dim) {
-    entity_ = entity;
+    entity_set_ = entity_set;
     distance_ = metric->distance();
     batch_distance_ = metric->batch_distance();
     dim_ = dim;
@@ -117,7 +117,7 @@ class HnswDistCalculator {
   inline dist_t dist(node_id_t id) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector(id);
+    const void *feat = entity_set_->get_vector(id);
     if (ailego_unlikely(feat == nullptr)) {
       LOG_ERROR("Get nullptr vector, id=%u", id);
       error_ = true;
@@ -131,8 +131,8 @@ class HnswDistCalculator {
   inline dist_t dist(node_id_t lhs, node_id_t rhs) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector(lhs);
-    const void *query = entity_->get_vector(rhs);
+    const void *feat = entity_set_->get_vector(lhs);
+    const void *query = entity_set_->get_vector(rhs);
     if (ailego_unlikely(feat == nullptr || query == nullptr)) {
       LOG_ERROR("Get nullptr vector");
       error_ = true;
@@ -163,7 +163,7 @@ class HnswDistCalculator {
   inline dist_t batch_dist(node_id_t id) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector(id);
+    const void *feat = entity_set_->get_vector(id);
     if (ailego_unlikely(feat == nullptr)) {
       LOG_ERROR("Get nullptr vector, id=%u", id);
       error_ = true;
@@ -202,7 +202,7 @@ class HnswDistCalculator {
   HnswDistCalculator &operator=(const HnswDistCalculator &) = delete;
 
  private:
-  const HnswStreamerEntity *entity_;
+  const HnswStreamerEntitySet *entity_set_;
 
   IndexMetric::MatrixDistance distance_;
   IndexMetric::MatrixBatchDistance batch_distance_;

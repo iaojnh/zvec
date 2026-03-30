@@ -28,23 +28,27 @@ class HnswStreamerEntitySet {
     kMMapBench = 2,
     kBufferPool = 3,
   };
+  typedef std::shared_ptr<HnswStreamerEntitySet> Pointer;
 
  public:
   HnswStreamerEntitySet(Options opt, IndexStreamer::Stats &stats)
       : options_(opt) {
     switch (opt) {
       case kMMap:
-        normal_entity_ = new HnswStreamerEntity(stats);
+        normal_entity_ = std::make_unique<HnswStreamerEntity>(stats);
         break;
       case kMMapBench:
-        bench_entity_ = new HnswStreamerBenchEntity(stats);
+        bench_entity_ = std::make_unique<HnswStreamerBenchEntity>(stats);
         break;
     }
   }
 
-  ~HnswStreamerEntitySet() {
-    delete normal_entity_;
-    delete bench_entity_;
+  HnswStreamerEntitySet(HnswStreamerEntity::UPointer normal_entity) : options_(kMMap) {
+    normal_entity_ = std::move(normal_entity);
+  }
+
+  HnswStreamerEntitySet(HnswStreamerBenchEntity::UPointer bench_entity) : options_(kMMapBench) {
+    bench_entity_ = std::move(bench_entity);
   }
 
  public:
@@ -54,6 +58,24 @@ class HnswStreamerEntitySet {
         return normal_entity_->cleanup();
       case kMMapBench:
         return bench_entity_->cleanup();
+    }
+  }
+
+  key_t get_key(node_id_t id) const {
+    switch (options_) {
+      case kMMap:
+        return normal_entity_->get_key(id);
+      case kMMapBench:
+        return bench_entity_->get_key(id);
+    }
+  }
+
+  const HnswStreamerEntitySet::Pointer clone() const {
+    switch (options_) {
+      case kMMap:
+        return Pointer(new HnswStreamerEntitySet(normal_entity_->clone_uptr()));
+      case kMMapBench:
+        return Pointer(new HnswStreamerEntitySet(bench_entity_->clone_uptr()));
     }
   }
 
@@ -529,8 +551,8 @@ class HnswStreamerEntitySet {
 
  private:
   Options options_{kUnknown};
-  HnswStreamerEntity *normal_entity_{nullptr};
-  HnswStreamerBenchEntity *bench_entity_{nullptr};
+  std::unique_ptr<HnswStreamerEntity> normal_entity_{nullptr};
+  std::unique_ptr<HnswStreamerBenchEntity> bench_entity_{nullptr};
 };
 
 }  // namespace core

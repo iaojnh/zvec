@@ -31,6 +31,7 @@ namespace core {
 class HnswStreamerEntity {
  public:  // override
   typedef std::shared_ptr<HnswStreamerEntity> Pointer;
+  typedef std::unique_ptr<HnswStreamerEntity> UPointer;
 
   //! Cleanup
   //! return 0 on success, or errCode in failure
@@ -39,6 +40,8 @@ class HnswStreamerEntity {
   //! Make a copy of streamer entity, to support thread-safe operation.
   //! The segment in container cannot be read concurrenly
   const HnswStreamerEntity::Pointer clone() const;
+
+  HnswStreamerEntity::UPointer clone_uptr() const;
 
   //! Get primary key of the node id
   key_t get_key(node_id_t id) const;

@@ -762,6 +762,39 @@ const HnswStreamerEntity::Pointer HnswStreamerEntity::clone() const {
   return HnswStreamerEntity::Pointer(entity);
 }
 
+HnswStreamerEntity::UPointer HnswStreamerEntity::clone_uptr() const {
+  std::vector<Chunk::Pointer> node_chunks;
+  node_chunks.reserve(node_chunks_.size());
+  for (size_t i = 0UL; i < node_chunks_.size(); ++i) {
+    node_chunks.emplace_back(node_chunks_[i]->clone());
+    if (ailego_unlikely(!node_chunks[i])) {
+      LOG_ERROR("HnswStreamerEntity get chunk failed in clone");
+      return HnswStreamerEntity::UPointer();
+    }
+  }
+
+  std::vector<Chunk::Pointer> upper_neighbor_chunks;
+  upper_neighbor_chunks.reserve(upper_neighbor_chunks_.size());
+  for (size_t i = 0UL; i < upper_neighbor_chunks_.size(); ++i) {
+    upper_neighbor_chunks.emplace_back(upper_neighbor_chunks_[i]->clone());
+    if (ailego_unlikely(!upper_neighbor_chunks[i])) {
+      LOG_ERROR("HnswStreamerEntity get chunk failed in clone");
+      return HnswStreamerEntity::UPointer();
+    }
+  }
+
+  HnswStreamerEntity *entity = new (std::nothrow) HnswStreamerEntity(
+      stats_, header(), chunk_size_, node_index_mask_bits_,
+      upper_neighbor_mask_bits_, filter_same_key_, get_vector_enabled_,
+      upper_neighbor_index_, keys_map_lock_, keys_map_, use_key_info_map_,
+      std::move(node_chunks), std::move(upper_neighbor_chunks), broker_);
+  if (ailego_unlikely(!entity)) {
+    LOG_ERROR("HnswStreamerEntity new failed");
+  }
+  return HnswStreamerEntity::UPointer(entity);
+}
+
+
 int64_t HnswStreamerEntity::dump_mapping_segment(
     const IndexDumper::Pointer &dumper, const key_t *keys) const {
   std::vector<node_id_t> mapping(doc_cnt());

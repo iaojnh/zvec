@@ -18,6 +18,7 @@
 #include "hnsw_context.h"
 #include "hnsw_dist_calculator.h"
 #include "hnsw_streamer_entity.h"
+#include "hnsw_streamer_entity_set.h"
 
 namespace zvec {
 namespace core {
@@ -29,7 +30,7 @@ class HnswAlgorithm {
 
  public:
   //! Constructor
-  explicit HnswAlgorithm(HnswStreamerEntity &entity);
+  explicit HnswAlgorithm(HnswStreamerEntitySet &entity_set);
 
   //! Destructor
   ~HnswAlgorithm() = default;
@@ -51,7 +52,7 @@ class HnswAlgorithm {
   int init() {
     level_probas_.clear();
     double level_mult =
-        1 / std::log(static_cast<double>(entity_.scaling_factor()));
+        1 / std::log(static_cast<double>(entity_set_.scaling_factor()));
     for (int level = 0;; level++) {
       // refers faiss get_random_level alg
       double proba =
@@ -116,7 +117,7 @@ class HnswAlgorithm {
   static constexpr uint32_t kLockCnt{1U << 8};
   static constexpr uint32_t kLockMask{kLockCnt - 1U};
 
-  HnswStreamerEntity &entity_;
+  HnswStreamerEntitySet &entity_set_;
   mutable std::mt19937 mt_{};
   std::vector<double> level_probas_{};
 

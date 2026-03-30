@@ -17,6 +17,7 @@
 #include <zvec/core/framework/index_framework.h>
 #include "hnsw_algorithm.h"
 #include "hnsw_streamer_entity.h"
+#include "hnsw_streamer_entity_set.h"
 
 namespace zvec {
 namespace core {
@@ -88,22 +89,22 @@ class HnswStreamer : public IndexStreamer {
 
   //! Fetch vector by key
   virtual const void *get_vector(uint64_t key) const override {
-    return entity_.get_vector_by_key(key);
+    return entity_set_.get_vector_by_key(key);
   }
 
   virtual int get_vector(const uint64_t key,
                          IndexStorage::MemoryBlock &block) const override {
-    return entity_.get_vector_by_key(key, block);
+    return entity_set_.get_vector_by_key(key, block);
   }
 
   //! Fetch vector by id
   virtual const void *get_vector_by_id(uint32_t id) const override {
-    return entity_.get_vector(id);
+    return entity_set_.get_vector(id);
   }
 
   virtual int get_vector_by_id(
       const uint32_t id, IndexStorage::MemoryBlock &block) const override {
-    return entity_.get_vector(id, block);
+    return entity_set_.get_vector(id, block);
   }
 
   //! Open index from file path
@@ -181,7 +182,7 @@ class HnswStreamer : public IndexStreamer {
     }
   };
 
-  HnswStreamerEntity entity_;
+  HnswStreamerEntitySet entity_set_;
   HnswAlgorithm::UPointer alg_;
   IndexMeta meta_{};
   IndexMetric::Pointer metric_{};

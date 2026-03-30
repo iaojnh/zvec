@@ -24,9 +24,9 @@ namespace core {
 class HnswIndexProvider : public IndexProvider {
  public:
   HnswIndexProvider(const IndexMeta &meta,
-                    const HnswStreamerEntity::Pointer &entity,
+                    const HnswStreamerEntitySet::Pointer &entity_set,
                     const std::string &owner)
-      : meta_(meta), entity_(entity), owner_class_(owner) {}
+      : meta_(meta), entity_set_(entity_set), owner_class_(owner) {}
 
   HnswIndexProvider(const HnswIndexProvider &) = delete;
   HnswIndexProvider &operator=(const HnswIndexProvider &) = delete;
@@ -35,12 +35,12 @@ class HnswIndexProvider : public IndexProvider {
   //! Create a new iterator
   IndexProvider::Iterator::Pointer create_iterator() override {
     return HnswIndexProvider::Iterator::Pointer(new (std::nothrow)
-                                                    Iterator(entity_));
+                                                    Iterator(entity_set_));
   }
 
   //! Retrieve count of vectors
   size_t count(void) const override {
-    return entity_->doc_cnt();
+    return entity_set_->doc_cnt();
   }
 
   //! Retrieve dimension of vector
@@ -61,12 +61,12 @@ class HnswIndexProvider : public IndexProvider {
  public:  // provider's unique interface
   //! Retrieve a vector using a primary key
   const void *get_vector(uint64_t key) const override {
-    return entity_->get_vector_by_key(key);
+    return entity_set_->get_vector_by_key(key);
   }
 
   int get_vector(const uint64_t key,
                  IndexStorage::MemoryBlock &block) const override {
-    return entity_->get_vector_by_key(key, block);
+    return entity_set_->get_vector_by_key(key, block);
   }
 
   //! Retrieve the owner class
@@ -77,24 +77,24 @@ class HnswIndexProvider : public IndexProvider {
  private:
   class Iterator : public IndexProvider::Iterator {
    public:
-    Iterator(const HnswStreamerEntity::Pointer &entity)
-        : entity_(entity), cur_id_(0U) {}
+    Iterator(const HnswStreamerEntitySet::Pointer &entity_set)
+        : entity_set_(entity_set), cur_id_(0U) {}
 
     //! Retrieve pointer of data
     //! NOTICE: the vec feature will be changed after iterating to next, so
     //! the caller need to keep a copy of it before iterator to next vector
     virtual const void *data(void) const override {
-      return entity_->get_vector(cur_id_);
+      return entity_set_->get_vector(cur_id_);
     }
 
     //! Test if the iterator is valid
     virtual bool is_valid(void) const override {
-      return cur_id_ < entity_->doc_cnt();
+      return cur_id_ < entity_set_->doc_cnt();
     }
 
     //! Retrieve primary key
     virtual uint64_t key(void) const override {
-      return entity_->get_key(cur_id_);
+      return entity_set_->get_key(cur_id_);
     }
 
     //! Next iterator
@@ -110,8 +110,8 @@ class HnswIndexProvider : public IndexProvider {
 
    private:
     node_id_t get_next_valid_id(node_id_t start_id) {
-      for (node_id_t i = start_id; i < entity_->doc_cnt(); i++) {
-        if (entity_->get_key(i) != kInvalidNodeId) {
+      for (node_id_t i = start_id; i < entity_set_->doc_cnt(); i++) {
+        if (entity_set_->get_key(i) != kInvalidNodeId) {
           cur_id_ = i;
           return i;
         }
@@ -120,13 +120,13 @@ class HnswIndexProvider : public IndexProvider {
     }
 
    private:
-    const HnswStreamerEntity::Pointer entity_;
+    const HnswStreamerEntitySet::Pointer entity_set_;
     node_id_t cur_id_;
   };
 
  private:
   const IndexMeta &meta_;
-  const HnswStreamerEntity::Pointer entity_;
+  const HnswStreamerEntitySet::Pointer entity_set_;
   const std::string owner_class_;
 };
 
