@@ -452,11 +452,9 @@ class HnswStreamerEntitySet {
   int set_index_meta(const IndexMeta &meta) const {
     switch (options_) {
       case kMMap:
-        normal_entity_->set_index_meta(meta);
-        break;
+        return normal_entity_->set_index_meta(meta);
       case kMMapBench:
-        bench_entity_->set_index_meta(meta);
-        break;
+        return bench_entity_->set_index_meta(meta);
     }
   }
 
@@ -464,11 +462,9 @@ class HnswStreamerEntitySet {
   int get_index_meta(IndexMeta *meta) const {
     switch (options_) {
       case kMMap:
-        normal_entity_->get_index_meta(meta);
-        break;
+        return normal_entity_->get_index_meta(meta);
       case kMMapBench:
-        bench_entity_->get_index_meta(meta);
-        break;
+        return bench_entity_->get_index_meta(meta);
     }
   }
 
