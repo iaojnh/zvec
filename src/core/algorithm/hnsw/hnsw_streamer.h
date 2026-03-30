@@ -25,7 +25,7 @@ class HnswStreamer : public IndexStreamer {
  public:
   using ContextPointer = IndexStreamer::Context::Pointer;
 
-  HnswStreamer(void);
+  HnswStreamer(void) = default;
   virtual ~HnswStreamer(void);
 
   HnswStreamer(const HnswStreamer &streamer) = delete;
@@ -88,22 +88,22 @@ class HnswStreamer : public IndexStreamer {
 
   //! Fetch vector by key
   virtual const void *get_vector(uint64_t key) const override {
-    return entity_set_.get_vector_by_key(key);
+    return entity_set_->get_vector_by_key(key);
   }
 
   virtual int get_vector(const uint64_t key,
                          IndexStorage::MemoryBlock &block) const override {
-    return entity_set_.get_vector_by_key(key, block);
+    return entity_set_->get_vector_by_key(key, block);
   }
 
   //! Fetch vector by id
   virtual const void *get_vector_by_id(uint32_t id) const override {
-    return entity_set_.get_vector(id);
+    return entity_set_->get_vector(id);
   }
 
   virtual int get_vector_by_id(
       const uint32_t id, IndexStorage::MemoryBlock &block) const override {
-    return entity_set_.get_vector(id, block);
+    return entity_set_->get_vector(id, block);
   }
 
   //! Open index from file path
@@ -181,8 +181,8 @@ class HnswStreamer : public IndexStreamer {
     }
   };
 
-  HnswStreamerEntitySet entity_set_;
-  HnswAlgorithm::UPointer alg_;
+  HnswStreamerEntitySet::Pointer entity_set_{nullptr};
+  HnswAlgorithm::UPointer alg_{nullptr};
   IndexMeta meta_{};
   IndexMetric::Pointer metric_{};
 

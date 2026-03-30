@@ -53,6 +53,8 @@ static const std::string PARAM_HNSW_SEARCHER_VISIT_BLOOMFILTER_NEGATIVE_PROB(
 static const std::string PARAM_HNSW_SEARCHER_FORCE_PADDING_RESULT_ENABLE(
     "proxima.hnsw.searcher.force_padding_result_enable");
 
+static const std::string PARAM_HNSW_STREAMER_BENCH_MODE(
+    "proxima.hnsw.streamer.bench_mode");
 static const std::string PARAM_HNSW_STREAMER_MAX_SCAN_RATIO(
     "proxima.hnsw.streamer.max_scan_ratio");
 static const std::string PARAM_HNSW_STREAMER_MIN_SCAN_LIMIT(
