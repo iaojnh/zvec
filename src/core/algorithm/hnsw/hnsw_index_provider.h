@@ -16,7 +16,6 @@
 #include <zvec/core/framework/index_provider.h>
 #include <zvec/core/framework/index_searcher.h>
 #include <zvec/core/framework/index_streamer.h>
-#include "hnsw_streamer_entity.h"
 
 namespace zvec {
 namespace core {

@@ -17,7 +17,6 @@
 #include "utility/sparse_utility.h"
 #include "utility/visit_filter.h"
 #include "hnsw_dist_calculator.h"
-#include "hnsw_streamer_entity.h"
 #include "hnsw_streamer_entity_set.h"
 
 namespace zvec {

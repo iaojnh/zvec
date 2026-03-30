@@ -17,7 +17,6 @@
 #include <ailego/parallel/lock.h>
 #include "hnsw_context.h"
 #include "hnsw_dist_calculator.h"
-#include "hnsw_streamer_entity.h"
 #include "hnsw_streamer_entity_set.h"
 
 namespace zvec {

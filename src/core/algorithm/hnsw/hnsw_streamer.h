@@ -16,7 +16,6 @@
 #include <ailego/parallel/lock.h>
 #include <zvec/core/framework/index_framework.h>
 #include "hnsw_algorithm.h"
-#include "hnsw_streamer_entity.h"
 #include "hnsw_streamer_entity_set.h"
 
 namespace zvec {
