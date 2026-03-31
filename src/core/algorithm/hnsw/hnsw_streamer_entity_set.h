@@ -60,6 +60,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->cleanup();
       case kMMapBench:
         return bench_entity_->cleanup();
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -69,6 +71,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_key(id);
       case kMMapBench:
         return bench_entity_->get_key(id);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -78,6 +82,8 @@ class HnswStreamerEntitySet {
         return Pointer(new HnswStreamerEntitySet(normal_entity_->clone_uptr()));
       case kMMapBench:
         return Pointer(new HnswStreamerEntitySet(bench_entity_->clone_uptr()));
+      default:
+        return nullptr;
     }
   }
 
@@ -87,6 +93,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_vector_by_key(key);
       case kMMapBench:
         return bench_entity_->get_vector_by_key(key);
+      default:
+        return nullptr;
     }
   }
 
@@ -96,6 +104,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_vector(id);
       case kMMapBench:
         return bench_entity_->get_vector_new(id);
+      default:
+        return nullptr;
     }
   }
 
@@ -106,6 +116,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_vector(ids, count, vecs);
       case kMMapBench:
         return bench_entity_->get_vector(ids, count, vecs);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -115,6 +127,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_vector(id, block);
       case kMMapBench:
         return bench_entity_->get_vector_new(id, block);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -125,6 +139,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_vector(ids, count, vec_blocks);
       case kMMapBench:
         return bench_entity_->get_vector_new(ids, count, vec_blocks);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -134,6 +150,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_neighbors(level, id);
       case kMMapBench:
         return bench_entity_->get_neighbors_new(level, id);
+      default:
+        return Neighbors();
     }
   }
 
@@ -143,6 +161,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->add_vector(level, key, vec, id);
       case kMMapBench:
         return bench_entity_->add_vector(level, key, vec, id);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -152,6 +172,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->add_vector_with_id(level, id, vec);
       case kMMapBench:
         return bench_entity_->add_vector_with_id(level, id, vec);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -163,6 +185,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->update_neighbors(level, id, neighbors);
       case kMMapBench:
         return bench_entity_->update_neighbors(level, id, neighbors);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -184,6 +208,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->dump(dumper);
       case kMMapBench:
         return bench_entity_->dump(dumper);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -205,6 +231,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_vector_by_key(key, block);
       case kMMapBench:
         return bench_entity_->get_vector_by_key(key, block);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -214,6 +242,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->neighbor_cnt(level);
       case kMMapBench:
         return bench_entity_->neighbor_cnt(level);
+      default:
+        return 0;
     }
   }
 
@@ -223,6 +253,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->l0_neighbor_cnt();
       case kMMapBench:
         return bench_entity_->l0_neighbor_cnt();
+      default:
+        return 0;
     }
   }
 
@@ -232,6 +264,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->min_neighbor_cnt();
       case kMMapBench:
         return bench_entity_->min_neighbor_cnt();
+      default:
+        return 0;
     }
   }
 
@@ -241,6 +275,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->upper_neighbor_cnt();
       case kMMapBench:
         return bench_entity_->upper_neighbor_cnt();
+      default:
+        return 0;
     }
   }
 
@@ -250,6 +286,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->mutable_doc_cnt();
       case kMMapBench:
         return bench_entity_->mutable_doc_cnt();
+      default:
+        return nullptr;
     }
   }
 
@@ -259,6 +297,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->doc_cnt();
       case kMMapBench:
         return bench_entity_->doc_cnt();
+      default:
+        return 0;
     }
   }
 
@@ -268,6 +308,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->scaling_factor();
       case kMMapBench:
         return bench_entity_->scaling_factor();
+      default:
+        return 0;
     }
   }
   inline size_t prune_cnt() const {
@@ -276,6 +318,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->prune_cnt();
       case kMMapBench:
         return bench_entity_->prune_cnt();
+      default:
+        return 0;
     }
   }
 
@@ -285,6 +329,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->entry_point();
       case kMMapBench:
         return bench_entity_->entry_point();
+      default:
+        return 0;
     }
   }
 
@@ -294,6 +340,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->cur_max_level();
       case kMMapBench:
         return bench_entity_->cur_max_level();
+      default:
+        return 0;
     }
   }
 
@@ -303,6 +351,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->vector_size();
       case kMMapBench:
         return bench_entity_->vector_size();
+      default:
+        return 0;
     }
   }
 
@@ -313,6 +363,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->node_size();
       case kMMapBench:
         return bench_entity_->node_size();
+      default:
+        return 0;
     }
   }
 
@@ -323,6 +375,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->ef_construction();
       case kMMapBench:
         return bench_entity_->ef_construction();
+      default:
+        return 0;
     }
   }
 
@@ -409,6 +463,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->init(max_doc_cnt);
       case kMMapBench:
         return bench_entity_->init(max_doc_cnt);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -418,6 +474,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->flush(checkpoint);
       case kMMapBench:
         return bench_entity_->flush(checkpoint);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -427,6 +485,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->open(stg, max_index_size, check_crc);
       case kMMapBench:
         return bench_entity_->open(stg, max_index_size, check_crc);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -436,6 +496,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->close();
       case kMMapBench:
         return bench_entity_->close();
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -457,6 +519,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->set_index_meta(meta);
       case kMMapBench:
         return bench_entity_->set_index_meta(meta);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -467,6 +531,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_index_meta(meta);
       case kMMapBench:
         return bench_entity_->get_index_meta(meta);
+      default:
+        return IndexError_NotImplemented;
     }
   }
 
@@ -513,6 +579,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->get_id(key);
       case kMMapBench:
         return bench_entity_->get_id(key);
+      default:
+        return 0;
     }
   }
 
@@ -534,6 +602,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->neighbors_size();
       case kMMapBench:
         return bench_entity_->neighbors_size();
+      default:
+        return 0;
     }
   }
 
@@ -544,6 +614,8 @@ class HnswStreamerEntitySet {
         return normal_entity_->upper_neighbors_size();
       case kMMapBench:
         return bench_entity_->upper_neighbors_size();
+      default:
+        return 0;
     }
   }
 
