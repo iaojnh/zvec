@@ -26,7 +26,9 @@ HnswContext::HnswContext(size_t dimension, const IndexMetric::Pointer &metric,
 
 HnswContext::HnswContext(const IndexMetric::Pointer &metric,
                          const HnswStreamerEntitySet::Pointer &entity_set)
-    : IndexContext(metric), entity_set_(entity_set), dc_(entity_set_.get(), metric) {}
+    : IndexContext(metric),
+      entity_set_(entity_set),
+      dc_(entity_set_.get(), metric) {}
 
 HnswContext::~HnswContext() {
   visit_filter_.destroy();
@@ -51,8 +53,8 @@ int HnswContext::init(ContextType type) {
       break;
 
     case kSearcherContext:
-      ret = visit_filter_.init(filter_mode_, entity_set_->doc_cnt(), max_scan_num_,
-                               negative_probability_);
+      ret = visit_filter_.init(filter_mode_, entity_set_->doc_cnt(),
+                               max_scan_num_, negative_probability_);
       if (ret != 0) {
         LOG_ERROR("Create filter failed,  mode %d", filter_mode_);
         return ret;
@@ -199,10 +201,9 @@ int HnswContext::update(const ailego::Params &params) {
   }
 }
 
-int HnswContext::update_context(ContextType type, const IndexMeta &meta,
-                                const IndexMetric::Pointer &metric,
-                                const HnswStreamerEntitySet::Pointer &entity_set,
-                                uint32_t magic_num) {
+int HnswContext::update_context(
+    ContextType type, const IndexMeta &meta, const IndexMetric::Pointer &metric,
+    const HnswStreamerEntitySet::Pointer &entity_set, uint32_t magic_num) {
   uint32_t doc_cnt;
 
   if (ailego_unlikely(type != type_)) {

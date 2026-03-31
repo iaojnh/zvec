@@ -116,7 +116,7 @@ class HnswContext : public IndexContext {
                      const IndexMetric::Pointer &metric,
                      const HnswStreamerEntitySet::Pointer &entity_set,
                      uint32_t magic_num);
-                    
+
 
   inline const HnswStreamerEntitySet &get_entity() const {
     return *entity_set_;

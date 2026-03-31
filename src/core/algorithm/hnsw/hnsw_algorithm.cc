@@ -21,7 +21,7 @@ namespace zvec {
 namespace core {
 
 HnswAlgorithm::HnswAlgorithm(HnswStreamerEntitySet &entity_set)
-      : entity_set_(entity_set),
+    : entity_set_(entity_set),
       mt_(std::chrono::system_clock::now().time_since_epoch().count()),
       lock_pool_(kLockCnt) {}
 
@@ -232,8 +232,7 @@ void HnswAlgorithm::search_neighbors(level_t level, node_id_t *entry_point,
     }
 
     std::vector<IndexStorage::MemoryBlock> neighbor_vec_blocks;
-    int ret =
-        entity.get_vector(neighbor_ids.data(), size, neighbor_vec_blocks);
+    int ret = entity.get_vector(neighbor_ids.data(), size, neighbor_vec_blocks);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }

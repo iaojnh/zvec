@@ -436,16 +436,16 @@ class HnswStreamerEntity {
 
   //! Private construct, only be called by clone method
   HnswStreamerEntity(IndexStreamer::Stats &stats, const HNSWHeader &hd,
-                        size_t chunk_size, uint32_t node_index_mask_bits,
-                        uint32_t upper_neighbor_mask_bits, bool filter_same_key,
-                        bool get_vector_enabled,
-                        const NIHashMapPointer &upper_neighbor_index,
-                        std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
-                        const HashMapPointer<key_t, node_id_t> &keys_map,
-                        bool use_key_info_map,
-                        std::vector<Chunk::Pointer> &&node_chunks,
-                        std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
-                        const ChunkBroker::Pointer &broker)
+                     size_t chunk_size, uint32_t node_index_mask_bits,
+                     uint32_t upper_neighbor_mask_bits, bool filter_same_key,
+                     bool get_vector_enabled,
+                     const NIHashMapPointer &upper_neighbor_index,
+                     std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
+                     const HashMapPointer<key_t, node_id_t> &keys_map,
+                     bool use_key_info_map,
+                     std::vector<Chunk::Pointer> &&node_chunks,
+                     std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
+                     const ChunkBroker::Pointer &broker)
       : stats_(stats),
         chunk_size_(chunk_size),
         node_index_mask_bits_(node_index_mask_bits),

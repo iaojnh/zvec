@@ -26,19 +26,16 @@ const std::string HnswStreamerEntity::kGraphFeaturesSegmentId =
 const std::string HnswStreamerEntity::kGraphKeysSegmentId = "graph.keys";
 const std::string HnswStreamerEntity::kGraphNeighborsSegmentId =
     "graph.neighbors";
-const std::string HnswStreamerEntity::kGraphOffsetsSegmentId =
-    "graph.offsets";
-const std::string HnswStreamerEntity::kGraphMappingSegmentId =
-    "graph.mapping";
+const std::string HnswStreamerEntity::kGraphOffsetsSegmentId = "graph.offsets";
+const std::string HnswStreamerEntity::kGraphMappingSegmentId = "graph.mapping";
 const std::string HnswStreamerEntity::kHnswHeaderSegmentId = "hnsw.header";
 const std::string HnswStreamerEntity::kHnswNeighborsSegmentId =
     "hnsw.neighbors";
 const std::string HnswStreamerEntity::kHnswOffsetsSegmentId = "hnsw.offsets";
 
 int64_t HnswStreamerEntity::dump_segment(const IndexDumper::Pointer &dumper,
-                                            const std::string &segment_id,
-                                            const void *data,
-                                            size_t size) const {
+                                         const std::string &segment_id,
+                                         const void *data, size_t size) const {
   size_t len = dumper->write(data, size);
   if (len != size) {
     LOG_ERROR("Dump segment %s data failed, expect: %lu, actual: %lu",
@@ -66,7 +63,7 @@ int64_t HnswStreamerEntity::dump_segment(const IndexDumper::Pointer &dumper,
 }
 
 int64_t HnswStreamerEntity::dump_header(const IndexDumper::Pointer &dumper,
-                                           const HNSWHeader &hd) const {
+                                        const HNSWHeader &hd) const {
   //! dump basic graph header. header is aligned and does not need padding
   int64_t graph_hd_size =
       dump_segment(dumper, kGraphHeaderSegmentId, &hd.graph, hd.graph.size);
@@ -166,7 +163,7 @@ int HnswStreamerEntity::update_neighbors(
 }
 
 const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
-                                                     node_id_t id) const {
+                                                  node_id_t id) const {
   Chunk *chunk = nullptr;
   size_t offset = 0UL;
   size_t neighbor_size = neighbor_size_;
@@ -215,7 +212,7 @@ const void *HnswStreamerEntity::get_vector(node_id_t id) const {
 }
 
 int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
-                                      const void **vecs) const {
+                                   const void **vecs) const {
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
@@ -235,7 +232,7 @@ int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
 }
 
 int HnswStreamerEntity::get_vector(const node_id_t id,
-                                      IndexStorage::MemoryBlock &block) const {
+                                   IndexStorage::MemoryBlock &block) const {
   auto loc = get_vector_chunk_loc(id);
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
   ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
@@ -296,7 +293,7 @@ key_t HnswStreamerEntity::get_key(node_id_t id) const {
 }
 
 void HnswStreamerEntity::add_neighbor(level_t level, node_id_t id,
-                                         uint32_t size, node_id_t neighbor_id) {
+                                      uint32_t size, node_id_t neighbor_id) {
   auto loc = get_neighbor_chunk_loc(level, id);
   size_t offset =
       loc.second + sizeof(NeighborsHeader) + size * sizeof(node_id_t);
@@ -362,8 +359,8 @@ int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   return 0;
 }
 
-int HnswStreamerEntity::open(IndexStorage::Pointer stg,
-                                uint64_t max_index_size, bool check_crc) {
+int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
+                             bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
   bool huge_page = stg->isHugePage();
   LOG_DEBUG("huge_page: %d", (int)huge_page);
@@ -547,7 +544,7 @@ int HnswStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
 }
 
 int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
-                                      node_id_t *id) {
+                                   node_id_t *id) {
   Chunk::Pointer node_chunk;
   // On MSVC, unsigned long is 32-bit, so -1UL is 0xFFFFFFFF not
   // 0xFFFFFFFFFFFFFFFF.
@@ -622,7 +619,7 @@ int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
 }
 
 int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
-                                              const void *vec) {
+                                           const void *vec) {
   Chunk::Pointer node_chunk;
   size_t chunk_offset = static_cast<size_t>(-1);
   key_t key = id;
@@ -1059,8 +1056,8 @@ int64_t HnswStreamerEntity::dump_upper_neighbors(
 }
 
 int HnswStreamerEntity::CalcAndAddPadding(const IndexDumper::Pointer &dumper,
-                                             size_t data_size,
-                                             size_t *padding_size) {
+                                          size_t data_size,
+                                          size_t *padding_size) {
   *padding_size = AlignSize(data_size) - data_size;
   if (*padding_size == 0) {
     return 0;

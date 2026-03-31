@@ -37,9 +37,11 @@ int HnswStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
   int mode = 0;
   params.get(PARAM_HNSW_STREAMER_BENCH_MODE, &mode);
   if (mode) {
-    entity_set_ = std::make_shared<HnswStreamerEntitySet>(HnswStreamerEntitySet::Options::kMMapBench, stats_);
+    entity_set_ = std::make_shared<HnswStreamerEntitySet>(
+        HnswStreamerEntitySet::Options::kMMapBench, stats_);
   } else {
-    entity_set_ = std::make_shared<HnswStreamerEntitySet>(HnswStreamerEntitySet::Options::kMMap, stats_);
+    entity_set_ = std::make_shared<HnswStreamerEntitySet>(
+        HnswStreamerEntitySet::Options::kMMap, stats_);
   }
 
   meta_ = imeta;
@@ -96,8 +98,7 @@ int HnswStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
     ef_construction_ = HnswStreamerEntity::kDefaultEfConstruction;
   }
   if (upper_max_neighbor_cnt_ == 0U) {
-    upper_max_neighbor_cnt_ =
-        HnswStreamerEntity::kDefaultUpperMaxNeighborCnt;
+    upper_max_neighbor_cnt_ = HnswStreamerEntity::kDefaultUpperMaxNeighborCnt;
   }
   if (upper_max_neighbor_cnt_ > HnswStreamerEntity::kMaxNeighborCnt) {
     LOG_ERROR("[%s] must be in range (0,%d)",
@@ -255,7 +256,8 @@ int HnswStreamer::open(IndexStorage::Pointer stg) {
     LOG_ERROR("Open storage failed, init streamer first!");
     return IndexError_NoReady;
   }
-  int ret = entity_set_->open(std::move(stg), max_index_size_, check_crc_enabled_);
+  int ret =
+      entity_set_->open(std::move(stg), max_index_size_, check_crc_enabled_);
   if (ret != 0) {
     return ret;
   }
@@ -403,7 +405,8 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context(void) const {
     LOG_DEBUG("HnswStreamer doc_count[%zu] estimate[%zu]",
               (size_t)entity_set_->doc_cnt(), (size_t)estimate_doc_count);
   }
-  ctx->check_need_adjuct_ctx(std::max(entity_set_->doc_cnt(), estimate_doc_count));
+  ctx->check_need_adjuct_ctx(
+      std::max(entity_set_->doc_cnt(), estimate_doc_count));
 
   return Context::Pointer(ctx);
 }
@@ -720,7 +723,8 @@ int HnswStreamer::search_bf_impl(
           continue;
         }
 
-        if (!ctx->filter().is_valid() || !ctx->filter()(entity_set_->get_key(id))) {
+        if (!ctx->filter().is_valid() ||
+            !ctx->filter()(entity_set_->get_key(id))) {
           dist_t dist = ctx->dist_calculator().batch_dist(id);
 
           std::string group_id = group_by(id);

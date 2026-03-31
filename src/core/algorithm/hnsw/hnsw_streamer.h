@@ -200,7 +200,8 @@ class HnswStreamer : public IndexStreamer {
   size_t docs_hard_limit_{HnswStreamerEntity::kDefaultDocsHardLimit};
   size_t docs_soft_limit_{0UL};
   uint32_t min_neighbor_cnt_{0u};
-  uint32_t upper_max_neighbor_cnt_{HnswStreamerEntity::kDefaultUpperMaxNeighborCnt};
+  uint32_t upper_max_neighbor_cnt_{
+      HnswStreamerEntity::kDefaultUpperMaxNeighborCnt};
   uint32_t l0_max_neighbor_cnt_{HnswStreamerEntity::kDefaultL0MaxNeighborCnt};
   uint32_t ef_{HnswStreamerEntity::kDefaultEf};
   uint32_t ef_construction_{HnswStreamerEntity::kDefaultEfConstruction};

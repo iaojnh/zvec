@@ -43,11 +43,13 @@ class HnswStreamerEntitySet {
     }
   }
 
-  HnswStreamerEntitySet(HnswStreamerEntity::UPointer normal_entity) : options_(kMMap) {
+  HnswStreamerEntitySet(HnswStreamerEntity::UPointer normal_entity)
+      : options_(kMMap) {
     normal_entity_ = std::move(normal_entity);
   }
 
-  HnswStreamerEntitySet(HnswStreamerBenchEntity::UPointer bench_entity) : options_(kMMapBench) {
+  HnswStreamerEntitySet(HnswStreamerBenchEntity::UPointer bench_entity)
+      : options_(kMMapBench) {
     bench_entity_ = std::move(bench_entity);
   }
 

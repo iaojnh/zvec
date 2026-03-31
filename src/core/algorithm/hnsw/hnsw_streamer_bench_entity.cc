@@ -20,7 +20,8 @@
 namespace zvec {
 namespace core {
 
-const std::string HnswStreamerBenchEntity::kGraphHeaderSegmentId = "graph.header";
+const std::string HnswStreamerBenchEntity::kGraphHeaderSegmentId =
+    "graph.header";
 const std::string HnswStreamerBenchEntity::kGraphFeaturesSegmentId =
     "graph.features";
 const std::string HnswStreamerBenchEntity::kGraphKeysSegmentId = "graph.keys";
@@ -33,12 +34,12 @@ const std::string HnswStreamerBenchEntity::kGraphMappingSegmentId =
 const std::string HnswStreamerBenchEntity::kHnswHeaderSegmentId = "hnsw.header";
 const std::string HnswStreamerBenchEntity::kHnswNeighborsSegmentId =
     "hnsw.neighbors";
-const std::string HnswStreamerBenchEntity::kHnswOffsetsSegmentId = "hnsw.offsets";
+const std::string HnswStreamerBenchEntity::kHnswOffsetsSegmentId =
+    "hnsw.offsets";
 
-int64_t HnswStreamerBenchEntity::dump_segment(const IndexDumper::Pointer &dumper,
-                                            const std::string &segment_id,
-                                            const void *data,
-                                            size_t size) const {
+int64_t HnswStreamerBenchEntity::dump_segment(
+    const IndexDumper::Pointer &dumper, const std::string &segment_id,
+    const void *data, size_t size) const {
   size_t len = dumper->write(data, size);
   if (len != size) {
     LOG_ERROR("Dump segment %s data failed, expect: %lu, actual: %lu",
@@ -66,7 +67,7 @@ int64_t HnswStreamerBenchEntity::dump_segment(const IndexDumper::Pointer &dumper
 }
 
 int64_t HnswStreamerBenchEntity::dump_header(const IndexDumper::Pointer &dumper,
-                                           const HNSWHeader &hd) const {
+                                             const HNSWHeader &hd) const {
   //! dump basic graph header. header is aligned and does not need padding
   int64_t graph_hd_size =
       dump_segment(dumper, kGraphHeaderSegmentId, &hd.graph, hd.graph.size);
@@ -166,7 +167,7 @@ int HnswStreamerBenchEntity::update_neighbors(
 }
 
 const Neighbors HnswStreamerBenchEntity::get_neighbors(level_t level,
-                                                     node_id_t id) const {
+                                                       node_id_t id) const {
   Chunk *chunk = nullptr;
   size_t offset = 0UL;
   size_t neighbor_size = neighbor_size_;
@@ -196,7 +197,7 @@ const Neighbors HnswStreamerBenchEntity::get_neighbors(level_t level,
 }
 
 const Neighbors HnswStreamerBenchEntity::get_neighbors_new(level_t level,
-                                                         node_id_t id) const {
+                                                           node_id_t id) const {
   if (id) {
     return get_neighbors(level, id);
   } else {
@@ -232,7 +233,7 @@ const void *HnswStreamerBenchEntity::get_vector_new(node_id_t id) const {
 }
 
 int HnswStreamerBenchEntity::get_vector(const node_id_t *ids, uint32_t count,
-                                      const void **vecs) const {
+                                        const void **vecs) const {
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
@@ -251,8 +252,8 @@ int HnswStreamerBenchEntity::get_vector(const node_id_t *ids, uint32_t count,
   return 0;
 }
 
-int HnswStreamerBenchEntity::get_vector(const node_id_t id,
-                                      IndexStorage::MemoryBlock &block) const {
+int HnswStreamerBenchEntity::get_vector(
+    const node_id_t id, IndexStorage::MemoryBlock &block) const {
   auto loc = get_vector_chunk_loc(id);
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
   ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
@@ -333,7 +334,8 @@ key_t HnswStreamerBenchEntity::get_key(node_id_t id) const {
 }
 
 void HnswStreamerBenchEntity::add_neighbor(level_t level, node_id_t id,
-                                         uint32_t size, node_id_t neighbor_id) {
+                                           uint32_t size,
+                                           node_id_t neighbor_id) {
   auto loc = get_neighbor_chunk_loc(level, id);
   size_t offset =
       loc.second + sizeof(NeighborsHeader) + size * sizeof(node_id_t);
@@ -400,7 +402,7 @@ int HnswStreamerBenchEntity::init_chunks(const Chunk::Pointer &header_chunk) {
 }
 
 int HnswStreamerBenchEntity::open(IndexStorage::Pointer stg,
-                                uint64_t max_index_size, bool check_crc) {
+                                  uint64_t max_index_size, bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
   bool huge_page = stg->isHugePage();
   LOG_DEBUG("huge_page: %d", (int)huge_page);
@@ -597,8 +599,8 @@ int HnswStreamerBenchEntity::check_hnsw_index(const HNSWHeader *hd) const {
   return 0;
 }
 
-int HnswStreamerBenchEntity::add_vector(level_t level, key_t key, const void *vec,
-                                      node_id_t *id) {
+int HnswStreamerBenchEntity::add_vector(level_t level, key_t key,
+                                        const void *vec, node_id_t *id) {
   Chunk::Pointer node_chunk;
   size_t chunk_offset = -1UL;
 
@@ -671,7 +673,7 @@ int HnswStreamerBenchEntity::add_vector(level_t level, key_t key, const void *ve
 }
 
 int HnswStreamerBenchEntity::add_vector_with_id(level_t level, node_id_t id,
-                                              const void *vec) {
+                                                const void *vec) {
   Chunk::Pointer node_chunk;
   size_t chunk_offset = -1UL;
   key_t key = id;
@@ -1109,9 +1111,9 @@ int64_t HnswStreamerBenchEntity::dump_upper_neighbors(
   return len + offset + padding_size;
 }
 
-int HnswStreamerBenchEntity::CalcAndAddPadding(const IndexDumper::Pointer &dumper,
-                                             size_t data_size,
-                                             size_t *padding_size) {
+int HnswStreamerBenchEntity::CalcAndAddPadding(
+    const IndexDumper::Pointer &dumper, size_t data_size,
+    size_t *padding_size) {
   *padding_size = AlignSize(data_size) - data_size;
   if (*padding_size == 0) {
     return 0;
