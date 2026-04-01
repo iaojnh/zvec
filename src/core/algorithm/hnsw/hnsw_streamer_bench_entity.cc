@@ -13,8 +13,8 @@
 // limitations under the License.
 
 #include "hnsw_streamer_bench_entity.h"
-#include <ailego/utility/memory_helper.h>
 #include <stdlib.h>
+#include <ailego/utility/memory_helper.h>
 
 // #define DEBUG_PRINT
 
