@@ -14,6 +14,7 @@
 
 #include "hnsw_streamer_entity.h"
 #include <ailego/utility/memory_helper.h>
+#include <numeric>
 
 // #define DEBUG_PRINT
 
