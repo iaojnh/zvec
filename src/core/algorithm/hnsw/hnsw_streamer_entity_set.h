@@ -40,6 +40,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_ = std::make_unique<HnswStreamerBenchEntity>(stats);
         break;
+      default:
+        break;
     }
   }
 
@@ -199,6 +201,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->add_neighbor(level, id, size, neighbor_id);
         break;
+      default:
+        break;
     }
   }
 
@@ -220,6 +224,8 @@ class HnswStreamerEntitySet {
         break;
       case kMMapBench:
         bench_entity_->update_ep_and_level(ep, level);
+        break;
+      default:
         break;
     }
   }
@@ -388,6 +394,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->set_vector_size(size);
         break;
+      default:
+        break;
     }
   }
 
@@ -398,6 +406,8 @@ class HnswStreamerEntitySet {
         break;
       case kMMapBench:
         bench_entity_->set_prune_cnt(v);
+        break;
+      default:
         break;
     }
   }
@@ -410,6 +420,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->set_scaling_factor(val);
         break;
+      default:
+        break;
     }
   }
 
@@ -420,6 +432,8 @@ class HnswStreamerEntitySet {
         break;
       case kMMapBench:
         bench_entity_->set_l0_neighbor_cnt(cnt);
+        break;
+      default:
         break;
     }
   }
@@ -432,6 +446,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->set_min_neighbor_cnt(cnt);
         break;
+      default:
+        break;
     }
   }
 
@@ -443,6 +459,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->set_upper_neighbor_cnt(cnt);
         break;
+      default:
+        break;
     }
   }
 
@@ -453,6 +471,8 @@ class HnswStreamerEntitySet {
         break;
       case kMMapBench:
         bench_entity_->set_ef_construction(ef);
+        break;
+      default:
         break;
     }
   }
@@ -509,6 +529,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->set_use_key_info_map(use_id_map);
         break;
+      default:
+        break;
     }
   }
 
@@ -545,6 +567,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->set_chunk_size(val);
         break;
+      default:
+        break;
     }
   }
 
@@ -557,6 +581,8 @@ class HnswStreamerEntitySet {
       case kMMapBench:
         bench_entity_->set_filter_same_key(val);
         break;
+      default:
+        break;
     }
   }
 
@@ -568,6 +594,8 @@ class HnswStreamerEntitySet {
         break;
       case kMMapBench:
         bench_entity_->set_get_vector(val);
+        break;
+      default:
         break;
     }
   }
@@ -591,6 +619,8 @@ class HnswStreamerEntitySet {
         break;
       case kMMapBench:
         bench_entity_->print_key_map();
+        break;
+      default:
         break;
     }
   }
