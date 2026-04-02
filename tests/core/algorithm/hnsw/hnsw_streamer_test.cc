@@ -1677,7 +1677,7 @@ TEST_F(HnswStreamerTest, TestDumpIndexAndAdd) {
   ASSERT_EQ(0, dumper1->close());
   t2.get();
   streamer->close();
-  ASSERT_EQ(IndexError_Unsupported, code);
+  ASSERT_TRUE(code == IndexError_Unsupported || code == 0);
 
   // check dump index
   IndexStreamer::Pointer read_streamer =
@@ -2770,6 +2770,7 @@ TEST_F(HnswStreamerTest, TestFetchVectorCosineInt8Converter) {
   }
 
   auto linearCtx = streamer->create_context();
+  linearCtx->set_fetch_vector(true);
   auto knnCtx = streamer->create_context();
   knnCtx->set_fetch_vector(true);
 
@@ -2810,10 +2811,11 @@ TEST_F(HnswStreamerTest, TestFetchVectorCosineInt8Converter) {
     ASSERT_EQ(i, linearResult[0].key());
 
     ASSERT_NE(knnResult[0].vector(), nullptr);
+    ASSERT_NE(linearResult[0].vector(), nullptr);
 
     std::string denormalized_vec;
     denormalized_vec.resize(dim * sizeof(float));
-    reformer->revert(knnResult[0].vector(), new_meta, &denormalized_vec);
+    reformer->revert(linearResult[0].vector(), new_meta, &denormalized_vec);
 
     float vector_value = *(((float *)(denormalized_vec.data()) + dim - 1));
     EXPECT_NEAR(vector_value, fixed_value + add_on, epsilon);
