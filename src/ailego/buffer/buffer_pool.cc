@@ -23,65 +23,6 @@ static ssize_t zvec_pread(int fd, void *buf, size_t count, size_t offset) {
 namespace zvec {
 namespace ailego {
 
-int LRUCache::init(size_t block_size) {
-  block_size_ = block_size;
-  for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    queues_.push_back(ConcurrentQueue(block_size));
-  }
-  return 0;
-}
-
-bool LRUCache::evict_single_block(BlockType &item) {
-  bool found = false;
-  for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    found = queues_[i].try_dequeue(item);
-    if (found) {
-      break;
-    }
-  }
-  return found;
-}
-
-bool LRUCache::add_single_block(const LPMap *lp_map, const BlockType &block,
-                                int block_type) {
-  bool ok = queues_[block_type].enqueue(block);
-  if (!ok) {
-    LOG_ERROR("enqueue failed.");
-    return false;
-  }
-  evict_queue_insertions_.fetch_add(1, std::memory_order_relaxed);
-  if (evict_queue_insertions_ % block_size_ == 0) {
-    this->clear_dead_node(lp_map);
-  }
-  return true;
-}
-
-void LRUCache::clear_dead_node(const LPMap *lp_map) {
-  for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    size_t clear_size = block_size_ * 2;
-    if (queues_[i].size_approx() < clear_size * 4) {
-      continue;
-    }
-    size_t clear_count = 0;
-    ConcurrentQueue tmp(block_size_);
-    BlockType item;
-    while (queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
-      if (!lp_map->isDeadBlock(item)) {
-        if (!tmp.enqueue(item)) {
-          LOG_ERROR("enqueue failed.");
-        }
-      }
-    }
-    while (tmp.try_dequeue(item)) {
-      if (!lp_map->isDeadBlock(item)) {
-        if (!queues_[i].enqueue(item)) {
-          LOG_ERROR("enqueue failed.");
-        }
-      }
-    }
-  }
-}
-
 void LPMap::init(size_t entry_num) {
   if (entries_) {
     delete[] entries_;
@@ -93,7 +34,6 @@ void LPMap::init(size_t entry_num) {
     entries_[i].load_count.store(0);
     entries_[i].buffer = nullptr;
   }
-  cache_.init(entry_num * 4);
 }
 
 char *LPMap::acquire_block(block_id_t block_id, bool lru_mode) {
@@ -125,9 +65,10 @@ void LPMap::release_block(block_id_t block_id) {
   if (entry.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
     std::atomic_thread_fence(std::memory_order_acquire);
     LRUCache::BlockType block;
-    block.first = block_id;
-    block.second = entry.load_count.load();
-    cache_.add_single_block(this, block, 0);
+    block.lp_map = this;
+    block.block.first = block_id;
+    block.block.second = entry.load_count.load();
+    LRUCache::get_instance().add_single_block(block, 0);
   }
 }
 
@@ -171,12 +112,12 @@ char *LPMap::set_block_acquired(block_id_t block_id, char *buffer) {
 void LPMap::recycle(moodycamel::ConcurrentQueue<char *> &free_buffers) {
   LRUCache::BlockType block;
   do {
-    bool ok = cache_.evict_single_block(block);
+    bool ok = LRUCache::get_instance().evict_single_block(block);
     if (!ok) {
       return;
     }
   } while (isDeadBlock(block));
-  char *buffer = evict_block(block.first);
+  char *buffer = evict_block(block.block.first);
   if (buffer) {
     if (!free_buffers.enqueue(buffer)) {
       LOG_ERROR("recycle buffer enqueue failed.");

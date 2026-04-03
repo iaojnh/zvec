@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <zvec/ailego/internal/platform.h>
 #include "concurrentqueue.h"
+#include "lru_cache.h"
 
 #if defined(_MSC_VER)
 #include <io.h>
@@ -28,29 +29,6 @@ namespace ailego {
 
 using block_id_t = size_t;
 using version_t = size_t;
-
-class LPMap;
-
-class LRUCache {
- public:
-  typedef std::pair<block_id_t, version_t> BlockType;
-  typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;
-
-  int init(size_t block_size);
-
-  bool evict_single_block(BlockType &item);
-
-  bool add_single_block(const LPMap *lp_map, const BlockType &block,
-                        int block_type);
-
-  void clear_dead_node(const LPMap *lp_map);
-
- private:
-  constexpr static size_t CATCH_QUEUE_NUM = 3;
-  size_t block_size_{0};
-  std::vector<ConcurrentQueue> queues_;
-  alignas(64) std::atomic<size_t> evict_queue_insertions_{0};
-};
 
 class LPMap {
   struct Entry {
@@ -82,14 +60,13 @@ class LPMap {
   }
 
   inline bool isDeadBlock(LRUCache::BlockType block) const {
-    Entry &entry = entries_[block.first];
-    return block.second != entry.load_count.load();
+    Entry &entry = entries_[block.block.first];
+    return block.block.second != entry.load_count.load();
   }
 
  private:
   size_t entry_num_{0};
   Entry *entries_{nullptr};
-  LRUCache cache_;
 };
 
 class VecBufferPoolHandle;
