@@ -36,12 +36,9 @@ void LPMap::init(size_t entry_num) {
   }
 }
 
-char *LPMap::acquire_block(block_id_t block_id, bool lru_mode) {
+char *LPMap::acquire_block(block_id_t block_id) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
-  if (!lru_mode) {
-    return entry.buffer;
-  }
   while (true) {
     int current_count = entry.ref_count.load(std::memory_order_acquire);
     if (current_count < 0) {
@@ -68,7 +65,7 @@ void LPMap::release_block(block_id_t block_id) {
     block.lp_map = this;
     block.block.first = block_id;
     block.block.second = entry.load_count.load();
-    LRUCache::get_instance().add_single_block(block, 0);
+    LRUCache::get_instance().add_single_block(block, entry.size);
   }
 }
 
@@ -86,9 +83,11 @@ char *LPMap::evict_block(block_id_t block_id) {
   }
 }
 
-char *LPMap::set_block_acquired(block_id_t block_id, char *buffer) {
+char *LPMap::set_block_acquired(block_id_t block_id, char *buffer,
+                                size_t size) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
+  entry.size = size;
   while (true) {
     int current_count = entry.ref_count.load(std::memory_order_relaxed);
     if (current_count >= 0) {
@@ -109,20 +108,14 @@ char *LPMap::set_block_acquired(block_id_t block_id, char *buffer) {
   }
 }
 
-void LPMap::recycle(moodycamel::ConcurrentQueue<char *> &free_buffers) {
+void LPMap::recycle() {
   LRUCache::BlockType block;
-  do {
-    bool ok = LRUCache::get_instance().evict_single_block(block);
-    if (!ok) {
-      return;
-    }
-  } while (isDeadBlock(block));
+  if (!LRUCache::get_instance().evict_block(block)) {
+    return;
+  }
   char *buffer = evict_block(block.block.first);
   if (buffer) {
-    if (!free_buffers.enqueue(buffer)) {
-      LOG_ERROR("recycle buffer enqueue failed.");
-      ailego_free(buffer);
-    }
+    MemoryLimitPool::get_instance().release_buffer(buffer, 0);
   }
 }
 
@@ -149,39 +142,19 @@ VecBufferPool::VecBufferPool(const std::string &filename) {
   file_size_ = st.st_size;
 }
 
-int VecBufferPool::init(size_t pool_capacity, size_t block_size,
+int VecBufferPool::init(size_t /*pool_capacity*/, size_t block_size,
                         size_t segment_count) {
   if (block_size == 0) {
     LOG_ERROR("block_size must not be 0");
     return -1;
   }
-  pool_capacity_ = pool_capacity;
-  size_t buffer_num = pool_capacity_ / block_size + 10;
   size_t block_num = segment_count + 10;
   lp_map_.init(block_num);
   mutex_vec_.reserve(block_num);
   for (int i = 0; i < block_num; i++) {
     mutex_vec_.emplace_back(std::make_unique<std::mutex>());
   }
-  for (size_t i = 0; i < buffer_num; i++) {
-    char *buffer = (char *)ailego_malloc(block_size);
-    if (buffer != nullptr) {
-      if (!free_buffers_.enqueue(buffer)) {
-        LOG_ERROR("recycle buffer enqueue failed.");
-        ailego_free(buffer);
-        return -1;
-      }
-    } else {
-      LOG_ERROR("aligned_alloc %zu(size: %zu) failed", i, block_size);
-      return -1;
-    }
-  }
-  LOG_DEBUG("Buffer pool num: %zu, entry num: %zu", buffer_num,
-            lp_map_.entry_num());
-  no_lru_mode_ = false;
-  if (lp_map_.entry_num() <= buffer_num) {
-    no_lru_mode_ = true;
-  }
+  LOG_DEBUG("entry num: %zu", lp_map_.entry_num());
   return 0;
 }
 
@@ -191,21 +164,23 @@ VecBufferPoolHandle VecBufferPool::get_handle() {
 
 char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
                                     size_t size, int retry) {
-  char *buffer = lp_map_.acquire_block(block_id, !no_lru_mode());
+  char *buffer = lp_map_.acquire_block(block_id);
   if (buffer) {
     return buffer;
   }
   std::lock_guard<std::mutex> lock(*mutex_vec_[block_id]);
-  buffer = lp_map_.acquire_block(block_id, !no_lru_mode());
+  buffer = lp_map_.acquire_block(block_id);
   if (buffer) {
     return buffer;
   }
   {
-    bool found = free_buffers_.try_dequeue(buffer);
-    if (!found && !no_lru_mode_) {
+    bool found =
+        MemoryLimitPool::get_instance().try_acquire_buffer(size, buffer);
+    if (!found) {
       for (int i = 0; i < retry; i++) {
-        lp_map_.recycle(free_buffers_);
-        found = free_buffers_.try_dequeue(buffer);
+        lp_map_.recycle();
+        found =
+            MemoryLimitPool::get_instance().try_acquire_buffer(size, buffer);
         if (found) {
           break;
         }
@@ -224,10 +199,10 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
 #endif
   if (read_bytes != static_cast<ssize_t>(size)) {
     LOG_ERROR("Buffer pool failed to read file at offset: %zu", offset);
-    free_buffers_.enqueue(buffer);
+    MemoryLimitPool::get_instance().release_buffer(buffer, size);
     return nullptr;
   }
-  return lp_map_.set_block_acquired(block_id, buffer);
+  return lp_map_.set_block_acquired(block_id, buffer, size);
 }
 
 int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
@@ -254,15 +229,11 @@ int VecBufferPoolHandle::get_meta(size_t offset, size_t length, char *buffer) {
 }
 
 void VecBufferPoolHandle::release_one(block_id_t block_id) {
-  if (!pool_.no_lru_mode()) {
-    pool_.lp_map_.release_block(block_id);
-  }
+  pool_.lp_map_.release_block(block_id);
 }
 
 void VecBufferPoolHandle::acquire_one(block_id_t block_id) {
-  if (!pool_.no_lru_mode()) {
-    pool_.lp_map_.acquire_block(block_id, true);
-  }
+  pool_.lp_map_.acquire_block(block_id);
 }
 
 }  // namespace ailego

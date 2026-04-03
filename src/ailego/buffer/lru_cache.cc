@@ -23,6 +23,17 @@ bool LRUCache::evict_single_block(BlockType &item) {
   return found;
 }
 
+bool LRUCache::evict_block(BlockType &item) {
+  bool ok = false;
+  do {
+    ok = LRUCache::get_instance().evict_single_block(item);
+    if (!ok) {
+      return false;
+    }
+  } while (item.lp_map->isDeadBlock(item));
+  return ok;
+}
+
 bool LRUCache::add_single_block(const BlockType &block, int block_type) {
   bool ok = queues_[block_type].enqueue(block);
   if (!ok) {

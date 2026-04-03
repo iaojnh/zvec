@@ -35,6 +35,7 @@ class LPMap {
     alignas(64) std::atomic<int> ref_count;
     alignas(64) std::atomic<version_t> load_count;
     char *buffer;
+    size_t size;
   };
 
  public:
@@ -45,15 +46,15 @@ class LPMap {
 
   void init(size_t entry_num);
 
-  char *acquire_block(block_id_t block_id, bool lru_mode);
+  char *acquire_block(block_id_t block_id);
 
   void release_block(block_id_t block_id);
 
   char *evict_block(block_id_t block_id);
 
-  char *set_block_acquired(block_id_t block_id, char *buffer);
+  char *set_block_acquired(block_id_t block_id, char *buffer, size_t size);
 
-  void recycle(moodycamel::ConcurrentQueue<char *> &free_buffers);
+  void recycle();
 
   size_t entry_num() const {
     return entry_num_;
@@ -77,11 +78,6 @@ class VecBufferPool {
 
   VecBufferPool(const std::string &filename);
   ~VecBufferPool() {
-    // Free all buffers in the free list
-    char *buf = nullptr;
-    while (free_buffers_.try_dequeue(buf)) {
-      ailego_free(buf);
-    }
     // Free any buffers still pinned in the map
     for (size_t i = 0; i < lp_map_.entry_num(); ++i) {
       char *b = lp_map_.evict_block(i);
@@ -107,22 +103,16 @@ class VecBufferPool {
     return file_size_;
   }
 
-  bool no_lru_mode() {
-    return no_lru_mode_;
-  }
-
  private:
   int fd_;
   size_t file_size_;
   size_t pool_capacity_;
-  bool no_lru_mode_;
 
  public:
   LPMap lp_map_;
 
  private:
   std::vector<std::unique_ptr<std::mutex>> mutex_vec_;
-  moodycamel::ConcurrentQueue<char *> free_buffers_;
 };
 
 class VecBufferPoolHandle {

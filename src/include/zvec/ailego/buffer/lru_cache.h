@@ -53,6 +53,8 @@ class LRUCache {
 
   bool evict_single_block(BlockType &item);
 
+  bool evict_block(BlockType &item);
+
   bool add_single_block(const BlockType &block, int block_type);
 
   void clear_dead_node(const LPMap *lp_map);
@@ -69,24 +71,51 @@ class LRUCache {
   alignas(64) std::atomic<size_t> evict_queue_insertions_{0};
 };
 
-// class MemoryPool {
-//  public:
-//   int init(size_t pool_size) {
-//     return 0;
-//   }
+class MemoryLimitPool {
+ public:
+  static MemoryLimitPool &get_instance() {
+    static MemoryLimitPool instance;
+    return instance;
+  }
+  MemoryLimitPool(const MemoryLimitPool &) = delete;
+  MemoryLimitPool &operator=(const MemoryLimitPool &) = delete;
+  MemoryLimitPool(MemoryLimitPool &&) = delete;
+  MemoryLimitPool &operator=(MemoryLimitPool &&) = delete;
 
-//   char *acquire_buffer(size_t size) {
-//     return nullptr;
-//   }
+  int init(size_t pool_size) {
+    pool_size_ = pool_size;
+    return 0;
+  }
 
-//   void release_buffer(char *buffer, size_t buffer_size) {
-//     delete[] buffer;
-//   }
+  bool try_acquire_buffer(const size_t buffer_size, char *&buffer) {
+    size_t expected, desired;
+    do {
+      expected = used_size_.load();
+      if (expected >= pool_size_) {
+        return false;
+      }
+      desired = expected + buffer_size;
+    } while (!used_size_.compare_exchange_weak(expected, desired));
+    buffer = (char *)ailego_malloc(buffer_size);
+    return true;
+  }
 
+  void release_buffer(const char *buffer, const size_t buffer_size) {
+    size_t expected, desired;
+    do {
+      expected = used_size_.load();
+      desired = expected - buffer_size;
+    } while (!used_size_.compare_exchange_weak(expected, desired));
+    delete[] buffer;
+  }
 
-//  private:
-//   std::atomic<size_t> pool_size_{0}, used_size_{0};
-// };
+ private:
+  MemoryLimitPool() = default;
+
+ private:
+  size_t pool_size_{0};
+  std::atomic<size_t> used_size_{0};
+};
 
 }  // namespace ailego
 }  // namespace zvec
