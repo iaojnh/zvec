@@ -19,6 +19,7 @@
 #include <zvec/ailego/internal/platform.h>
 #include "buffer_pool.h"
 #include "concurrentqueue.h"
+#include <zvec/core/framework/index_logger.h>
 
 #if defined(_MSC_VER)
 #include <io.h>
@@ -59,6 +60,8 @@ class LRUCache {
 
   void clear_dead_node(const LPMap *lp_map);
 
+  bool recycle();
+
  private:
   LRUCache() {
     init();
@@ -92,6 +95,7 @@ class MemoryLimitPool {
     do {
       expected = used_size_.load();
       if (expected >= pool_size_) {
+        LOG_ERROR("expected: %lu, pool_size: %lu", expected, pool_size_);
         return false;
       }
       desired = expected + buffer_size;
@@ -100,13 +104,17 @@ class MemoryLimitPool {
     return true;
   }
 
-  void release_buffer(const char *buffer, const size_t buffer_size) {
+  void release_buffer(char *buffer, const size_t buffer_size) {
     size_t expected, desired;
     do {
       expected = used_size_.load();
       desired = expected - buffer_size;
     } while (!used_size_.compare_exchange_weak(expected, desired));
-    delete[] buffer;
+    ailego_free(buffer);
+  }
+
+  bool is_full() {
+    return used_size_.load() >= pool_size_;
   }
 
  private:

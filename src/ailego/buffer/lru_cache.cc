@@ -34,6 +34,14 @@ bool LRUCache::evict_block(BlockType &item) {
   return ok;
 }
 
+bool LRUCache::recycle() {
+  BlockType item;
+  while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
+    item.lp_map->evict_block(item.block.first);
+  }
+  return MemoryLimitPool::get_instance().is_full();
+}
+
 bool LRUCache::add_single_block(const BlockType &block, int block_type) {
   bool ok = queues_[block_type].enqueue(block);
   if (!ok) {

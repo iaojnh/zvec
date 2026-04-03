@@ -65,7 +65,7 @@ void LPMap::release_block(block_id_t block_id) {
     block.lp_map = this;
     block.block.first = block_id;
     block.block.second = entry.load_count.load();
-    LRUCache::get_instance().add_single_block(block, entry.size);
+    LRUCache::get_instance().add_single_block(block, 0);
   }
 }
 
@@ -76,6 +76,7 @@ char *LPMap::evict_block(block_id_t block_id) {
   if (entry.ref_count.compare_exchange_strong(
           expected, std::numeric_limits<int>::min())) {
     char *buffer = entry.buffer;
+    MemoryLimitPool::get_instance().release_buffer(buffer, entry.size);
     entry.buffer = nullptr;
     return buffer;
   } else {
@@ -105,17 +106,6 @@ char *LPMap::set_block_acquired(block_id_t block_id, char *buffer,
         return entry.buffer;
       }
     }
-  }
-}
-
-void LPMap::recycle() {
-  LRUCache::BlockType block;
-  if (!LRUCache::get_instance().evict_block(block)) {
-    return;
-  }
-  char *buffer = evict_block(block.block.first);
-  if (buffer) {
-    MemoryLimitPool::get_instance().release_buffer(buffer, 0);
   }
 }
 
@@ -178,7 +168,7 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
         MemoryLimitPool::get_instance().try_acquire_buffer(size, buffer);
     if (!found) {
       for (int i = 0; i < retry; i++) {
-        lp_map_.recycle();
+        LRUCache::get_instance().recycle();
         found =
             MemoryLimitPool::get_instance().try_acquire_buffer(size, buffer);
         if (found) {

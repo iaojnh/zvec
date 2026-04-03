@@ -54,8 +54,6 @@ class LPMap {
 
   char *set_block_acquired(block_id_t block_id, char *buffer, size_t size);
 
-  void recycle();
-
   size_t entry_num() const {
     return entry_num_;
   }
