@@ -76,8 +76,10 @@ char *LPMap::evict_block(block_id_t block_id) {
   if (entry.ref_count.compare_exchange_strong(
           expected, std::numeric_limits<int>::min())) {
     char *buffer = entry.buffer;
-    MemoryLimitPool::get_instance().release_buffer(buffer, entry.size);
-    entry.buffer = nullptr;
+    if (buffer) {
+      MemoryLimitPool::get_instance().release_buffer(buffer, entry.size);
+      entry.buffer = nullptr;
+    }
     return buffer;
   } else {
     return nullptr;

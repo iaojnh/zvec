@@ -47,6 +47,7 @@ void FlatStreamerTest::TearDown(void) {
 }
 
 TEST_F(FlatStreamerTest, TestLinearSearch) {
+  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("FlatStreamer");
   ASSERT_TRUE(write_streamer != nullptr);
@@ -168,6 +169,7 @@ TEST_F(FlatStreamerTest, TestLinearSearch) {
 }
 
 TEST_F(FlatStreamerTest, TestLinearSearchWithLRU) {
+  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   constexpr size_t static dim = 1600;
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("FlatStreamer");

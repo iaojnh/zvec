@@ -87,6 +87,7 @@ class MemoryLimitPool {
 
   int init(size_t pool_size) {
     pool_size_ = pool_size;
+    used_size_ = 0;
     return 0;
   }
 
@@ -95,7 +96,7 @@ class MemoryLimitPool {
     do {
       expected = used_size_.load();
       if (expected >= pool_size_) {
-        LOG_ERROR("expected: %lu, pool_size: %lu", expected, pool_size_);
+        // LOG_ERROR("expected: %lu, pool_size: %lu", expected, pool_size_);
         return false;
       }
       desired = expected + buffer_size;

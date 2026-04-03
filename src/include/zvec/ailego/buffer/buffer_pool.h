@@ -79,7 +79,6 @@ class VecBufferPool {
     // Free any buffers still pinned in the map
     for (size_t i = 0; i < lp_map_.entry_num(); ++i) {
       char *b = lp_map_.evict_block(i);
-      if (b) ailego_free(b);
     }
 #if defined(_MSC_VER)
     _close(fd_);
