@@ -27,6 +27,7 @@
 #include "zvec/core/interface/index_factory.h"
 #include "zvec/core/interface/index_param.h"
 #include "zvec/core/interface/index_param_builders.h"
+#include <zvec/ailego/buffer/lru_cache.h>
 
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic push
@@ -155,6 +156,7 @@ TEST(IndexInterface, General) {
 }
 
 TEST(IndexInterface, BufferGeneral) {
+  zvec::ailego::MemoryLimitPool::get_instance().init(100 * 1024 * 1024);
   constexpr uint32_t kDimension = 64;
   const std::string index_name{"test.index"};
 
@@ -261,7 +263,7 @@ TEST(IndexInterface, BufferGeneral) {
            .with_fetch_vector(true)
            .with_ef_search(20)
            .build());
-  zvec::ailego::BufferManager::Instance().cleanup();
+  // zvec::ailego::BufferManager::Instance().cleanup();
 }
 
 
