@@ -85,38 +85,13 @@ class MemoryLimitPool {
   MemoryLimitPool(MemoryLimitPool &&) = delete;
   MemoryLimitPool &operator=(MemoryLimitPool &&) = delete;
 
-  int init(size_t pool_size) {
-    pool_size_ = pool_size;
-    used_size_ = 0;
-    return 0;
-  }
+  int init(size_t pool_size);
 
-  bool try_acquire_buffer(const size_t buffer_size, char *&buffer) {
-    size_t expected, desired;
-    do {
-      expected = used_size_.load();
-      if (expected >= pool_size_) {
-        // LOG_ERROR("expected: %lu, pool_size: %lu", expected, pool_size_);
-        return false;
-      }
-      desired = expected + buffer_size;
-    } while (!used_size_.compare_exchange_weak(expected, desired));
-    buffer = (char *)ailego_malloc(buffer_size);
-    return true;
-  }
+  bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
 
-  void release_buffer(char *buffer, const size_t buffer_size) {
-    size_t expected, desired;
-    do {
-      expected = used_size_.load();
-      desired = expected - buffer_size;
-    } while (!used_size_.compare_exchange_weak(expected, desired));
-    ailego_free(buffer);
-  }
+  void release_buffer(char *buffer, const size_t buffer_size);
 
-  bool is_full() {
-    return used_size_.load() >= pool_size_;
-  }
+  bool is_full();
 
  private:
   MemoryLimitPool() = default;
