@@ -102,36 +102,19 @@ class ParquetBufferPool {
   using Table = std::unordered_map<ParquetBufferID, ParquetBufferContext,
                                    IDHash, IDEqual>;
 
-  arrow::Status readable_open(
-      std::shared_ptr<arrow::io::RandomAccessFile> &input,
-      const std::string &file_name) {
-    ARROW_ASSIGN_OR_RAISE(input, arrow::io::ReadableFile::Open(file_name));
-    return arrow::Status::OK();
-  }
-  arrow::Status file_open(std::unique_ptr<parquet::arrow::FileReader> &reader,
-                          std::shared_ptr<arrow::io::RandomAccessFile> &input,
-                          arrow::MemoryPool *mem_pool) {
-    ARROW_ASSIGN_OR_RAISE(reader, parquet::arrow::OpenFile(input, mem_pool));
-    return arrow::Status::OK();
-  }
-  bool acquire(ParquetBufferID buffer_id, ParquetBufferContext &context) {
+  arrow::Status acquire(ParquetBufferID buffer_id,
+                        ParquetBufferContext &context) {
     // TODO: file handler and memory pool can be optimized
     arrow::MemoryPool *mem_pool = arrow::default_memory_pool();
 
     // Open file
     std::shared_ptr<arrow::io::RandomAccessFile> input;
     const auto &file_name = buffer_id.filename;
-    if (!readable_open(input, file_name).ok()) {
-      LOG_ERROR("Failed to open parquet file[%s]", file_name.c_str());
-      return false;
-    }
+    ARROW_ASSIGN_OR_RAISE(input, arrow::io::ReadableFile::Open(file_name));
 
     // Open reader
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    if (!file_open(reader, input, mem_pool).ok()) {
-      LOG_ERROR("Failed to open parquet file[%s]", file_name.c_str());
-      return false;
-    }
+    ARROW_ASSIGN_OR_RAISE(reader, parquet::arrow::OpenFile(input, mem_pool));
 
     // Perform read
     int row_group = buffer_id.row_group;
@@ -140,10 +123,11 @@ class ParquetBufferPool {
     if (!s.ok()) {
       LOG_ERROR("Failed to read parquet file[%s]", file_name.c_str());
       context.arrow = nullptr;
-      return false;
+      return s;
     }
 
-    size_t size = 0;
+    context.size = 0;
+    context.arrow_refs.clear();
     // Compute the memory usage and hijack Arrow's buffers with our
     // implementation
     for (auto &array : context.arrow->chunks()) {
@@ -154,7 +138,7 @@ class ParquetBufferPool {
         }
         // Keep references to original buffers to prevent premature deletion
         context.arrow_refs.emplace_back(buffers[buf_idx]);
-        size += buffers[buf_idx]->capacity();
+        context.size += buffers[buf_idx]->capacity();
         // Create hijacked buffer with custom deleter that notifies us when
         // Arrow is finished with the buffer
         std::shared_ptr<arrow::Buffer> hijacked_buffer(
@@ -162,8 +146,8 @@ class ParquetBufferPool {
         buffers[buf_idx] = hijacked_buffer;
       }
     }
-    context.size = size;
-    return true;
+
+    return arrow::Status::OK();
   }
 
   bool acquire_buffer(ParquetBufferID buffer_id,
@@ -196,7 +180,7 @@ class ParquetBufferPool {
           return false;
         }
       }
-      if (acquire(buffer_id, table_[buffer_id])) {
+      if (acquire(buffer_id, table_[buffer_id]).ok()) {
         arrow = set_block_acquired(buffer_id);
         return true;
       } else {
