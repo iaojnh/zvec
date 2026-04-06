@@ -229,6 +229,10 @@ class ParquetBufferPool {
   }
   std::shared_ptr<arrow::ChunkedArray> acquire(ParquetBufferID buffer_id) {
     std::shared_lock<std::shared_mutex> lock(table_mutex_);
+    auto iter = table_.find(buffer_id);
+    if (iter == table_.end()) {
+      return nullptr;
+    }
     ParquetBufferContext &context = table_[buffer_id];
     while (true) {
       int current_count = context.ref_count.load(std::memory_order_acquire);
@@ -248,6 +252,10 @@ class ParquetBufferPool {
 
   void release(ParquetBufferID buffer_id) {
     std::shared_lock<std::shared_mutex> lock(table_mutex_);
+    auto iter = table_.find(buffer_id);
+    if (iter == table_.end()) {
+      return;
+    }
     ParquetBufferContext &context = table_[buffer_id];
     if (context.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
       std::atomic_thread_fence(std::memory_order_acquire);
@@ -259,6 +267,10 @@ class ParquetBufferPool {
 
   void evict(ParquetBufferID buffer_id) {
     std::shared_lock<std::shared_mutex> lock(table_mutex_);
+    auto iter = table_.find(buffer_id);
+    if (iter == table_.end()) {
+      return;
+    }
     ParquetBufferContext &context = table_[buffer_id];
     int expected = 0;
     if (context.ref_count.compare_exchange_strong(
