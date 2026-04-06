@@ -135,7 +135,7 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
         // auto col_chunked_array = buffer_handle.pin_parquet_data();
         auto buffer_id = ailego::ParquetBufferID(file_path_, col_indices_[col_idx], rg_id);
         std::shared_ptr<arrow::ChunkedArray>  col_chunked_array{nullptr};
-        if (ailego::ParquetBufferPool::get_instance().acquire_buffer(buffer_id, col_chunked_array)) {
+        if (!ailego::ParquetBufferPool::get_instance().acquire_buffer(buffer_id, col_chunked_array)) {
           return arrow::Status::Invalid("Failed to acquire parquet buffer");
         }
         if (col_chunked_array) {
