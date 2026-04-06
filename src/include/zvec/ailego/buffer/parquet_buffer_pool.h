@@ -169,7 +169,9 @@ class ParquetBufferPool {
       auto iter = table_.find(buffer_id);
       if (iter != table_.end()) {
         arrow = acquire(buffer_id);
-        return true;
+        if (arrow != nullptr) {
+          return true;
+        }
       }
     }
     {
@@ -207,7 +209,6 @@ class ParquetBufferPool {
 
   std::shared_ptr<arrow::ChunkedArray> set_block_acquired(
       ParquetBufferID buffer_id) {
-    std::shared_lock<std::shared_mutex> lock(table_mutex_);
     ParquetBufferContext &context = table_[buffer_id];
     while (true) {
       int current_count = context.ref_count.load(std::memory_order_relaxed);
@@ -228,7 +229,6 @@ class ParquetBufferPool {
     }
   }
   std::shared_ptr<arrow::ChunkedArray> acquire(ParquetBufferID buffer_id) {
-    std::shared_lock<std::shared_mutex> lock(table_mutex_);
     auto iter = table_.find(buffer_id);
     if (iter == table_.end()) {
       return nullptr;
