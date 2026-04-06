@@ -37,19 +37,24 @@ struct ParquetBufferID {
   std::string filename;
   int column;
   int row_group;
+  uint64_t file_id;
   ParquetBufferID(std::string &filename, int column, int row_group)
-      : filename(filename), column(column), row_group(row_group) {}
+      : filename(filename), column(column), row_group(row_group) {
+    struct stat file_stat;
+    if (stat(filename.c_str(), &file_stat) == 0) {
+      // file_stat.st_ino contains the inode number
+      // file_stat.st_dev contains the device ID
+      // Together they uniquely identify a file
+      file_id = file_stat.st_ino;
+    }
+  }
 };
 
 struct IDHash {
   size_t operator()(const ParquetBufferID &buffer_id) const {
     struct stat file_stat;
-    uint64_t file_id;
-    if (stat(buffer_id.filename.c_str(), &file_stat) == 0) {
-      file_id = file_stat.st_ino;
-    }
     size_t hash = 1;
-    hash = hash ^ (std::hash<uint64_t>{}(file_id));
+    hash = hash ^ (std::hash<uint64_t>{}(buffer_id.file_id));
     hash = hash * 31 + std::hash<int>{}(buffer_id.column);
     hash = hash * 31 + std::hash<int>{}(buffer_id.row_group);
     return hash;
@@ -158,7 +163,6 @@ class ParquetBufferPool {
       }
     }
     context.size = size;
-
     return true;
   }
 
@@ -200,11 +204,6 @@ class ParquetBufferPool {
         return false;
       }
     }
-  }
-
-  bool evict_buffer(ParquetBufferID buffer_id) {
-    std::unique_lock<std::shared_mutex> lock(table_mutex_);
-    return table_.erase(buffer_id);
   }
 
   std::shared_ptr<arrow::ChunkedArray> set_block_acquired(
@@ -266,7 +265,7 @@ class ParquetBufferPool {
   }
 
   void evict(ParquetBufferID buffer_id) {
-    std::shared_lock<std::shared_mutex> lock(table_mutex_);
+    std::unique_lock<std::shared_mutex> lock(table_mutex_);
     auto iter = table_.find(buffer_id);
     if (iter == table_.end()) {
       return;
@@ -276,7 +275,7 @@ class ParquetBufferPool {
     if (context.ref_count.compare_exchange_strong(
             expected, std::numeric_limits<int>::min())) {
       MemoryLimitPool::get_instance().release_parquet(context.size);
-      evict_buffer(buffer_id);
+      table_.erase(buffer_id);
     }
   }
 
