@@ -158,7 +158,7 @@ class ParquetBufferPool {
       }
     }
     context.size = size;
-    
+
     return true;
   }
 
@@ -184,6 +184,10 @@ class ParquetBufferPool {
               break;
             }
           }
+        }
+        if (!found) {
+          LOG_ERROR("Failed to acquire parquet buffer");
+          return false;
         }
       }
       if (acquire(buffer_id, table_[buffer_id])) {
@@ -269,7 +273,7 @@ class ParquetBufferPool {
     static ParquetBufferPool instance;
     return instance;
   }
-  
+
   ParquetBufferPool(const ParquetBufferPool &) = delete;
   ParquetBufferPool &operator=(const ParquetBufferPool &) = delete;
   ParquetBufferPool(ParquetBufferPool &&) = delete;
