@@ -197,14 +197,14 @@ class ParquetBufferPool {
       int current_count = context.ref_count.load(std::memory_order_relaxed);
       if (current_count >= 0) {
         if (context.ref_count.compare_exchange_weak(
-                current_count, current_count + context.arrow_refs.size(),
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
+                current_count, current_count + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
           return context.arrow;
         }
       } else {
         if (context.ref_count.compare_exchange_weak(
-                current_count, context.arrow_refs.size(),
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
+                current_count, 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
           context.load_count.fetch_add(1, std::memory_order_relaxed);
           return context.arrow;
         }
