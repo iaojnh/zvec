@@ -13,13 +13,14 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <zvec/ailego/internal/platform.h>
-#include "buffer_pool.h"
-#include "concurrentqueue.h"
 #include <zvec/core/framework/index_logger.h>
+#include "concurrentqueue.h"
 
 #if defined(_MSC_VER)
 #include <io.h>
@@ -58,7 +59,22 @@ class LRUCache {
 
   bool add_single_block(const BlockType &block, int block_type);
 
-  void clear_dead_node(const LPMap *lp_map);
+  void clear_dead_node();
+
+  bool is_valid(LPMap *lp_map) {
+    std::shared_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
+    return valid_lp_maps_.find(lp_map) != valid_lp_maps_.end();
+  }
+
+  void set_valid(LPMap *lp_map) {
+    std::unique_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
+    valid_lp_maps_.insert(lp_map);
+  }
+
+  void set_invalid(LPMap *lp_map) {
+    std::unique_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
+    valid_lp_maps_.erase(lp_map);
+  }
 
   bool recycle();
 
@@ -72,6 +88,8 @@ class LRUCache {
   size_t block_size_{0};
   std::vector<ConcurrentQueue> queues_;
   alignas(64) std::atomic<size_t> evict_queue_insertions_{0};
+  std::unordered_set<LPMap *> valid_lp_maps_;
+  std::shared_mutex valid_lp_maps_mutex_;
 };
 
 class MemoryLimitPool {
@@ -89,7 +107,11 @@ class MemoryLimitPool {
 
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
 
+  bool try_acquire_parquet(const size_t buffer_size);
+
   void release_buffer(char *buffer, const size_t buffer_size);
+
+  void release_parquet(const size_t buffer_size);
 
   bool is_full();
 

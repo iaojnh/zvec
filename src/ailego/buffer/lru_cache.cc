@@ -30,7 +30,7 @@ bool LRUCache::evict_block(BlockType &item) {
     if (!ok) {
       return false;
     }
-  } while (item.lp_map->isDeadBlock(item));
+  } while (!is_valid(item.lp_map) || item.lp_map->isDeadBlock(item));
   return ok;
 }
 
@@ -50,29 +50,29 @@ bool LRUCache::add_single_block(const BlockType &block, int block_type) {
   }
   evict_queue_insertions_.fetch_add(1, std::memory_order_relaxed);
   if (evict_queue_insertions_ % block_size_ == 0) {
-    this->clear_dead_node(block.lp_map);
+    this->clear_dead_node();
   }
   return true;
 }
 
-void LRUCache::clear_dead_node(const LPMap *lp_map) {
+void LRUCache::clear_dead_node() {
   for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
     size_t clear_size = block_size_ * 2;
     if (queues_[i].size_approx() < clear_size * 4) {
       continue;
     }
     size_t clear_count = 0;
-    ConcurrentQueue tmp(block_size_);
+    ConcurrentQueue tmp;
     BlockType item;
     while (queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
-      if (!lp_map->isDeadBlock(item)) {
+      if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
         if (!tmp.enqueue(item)) {
           LOG_ERROR("enqueue failed.");
         }
       }
     }
     while (tmp.try_dequeue(item)) {
-      if (!lp_map->isDeadBlock(item)) {
+      if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
         if (!queues_[i].enqueue(item)) {
           LOG_ERROR("enqueue failed.");
         }
@@ -87,7 +87,8 @@ int MemoryLimitPool::init(size_t pool_size) {
   return 0;
 }
 
-bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size, char *&buffer) {
+bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
+                                         char *&buffer) {
   size_t expected, desired;
   do {
     expected = used_size_.load();
@@ -101,6 +102,19 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size, char *&buffer
   return true;
 }
 
+bool MemoryLimitPool::try_acquire_parquet(const size_t buffer_size) {
+  size_t expected, desired;
+  do {
+    expected = used_size_.load();
+    if (expected >= pool_size_) {
+      // LOG_ERROR("expected: %lu, pool_size: %lu", expected, pool_size_);
+      return false;
+    }
+    desired = expected + buffer_size;
+  } while (!used_size_.compare_exchange_weak(expected, desired));
+  return true;
+}
+
 void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
   size_t expected, desired;
   do {
@@ -108,6 +122,14 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
     desired = expected - buffer_size;
   } while (!used_size_.compare_exchange_weak(expected, desired));
   ailego_free(buffer);
+}
+
+void MemoryLimitPool::release_parquet(const size_t buffer_size) {
+  size_t expected, desired;
+  do {
+    expected = used_size_.load();
+    desired = expected - buffer_size;
+  } while (!used_size_.compare_exchange_weak(expected, desired));
 }
 
 bool MemoryLimitPool::is_full() {

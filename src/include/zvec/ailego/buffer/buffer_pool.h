@@ -39,9 +39,12 @@ class LPMap {
   };
 
  public:
-  LPMap() : entry_num_(0), entries_(nullptr) {}
+  LPMap() : entry_num_(0), entries_(nullptr) {
+    LRUCache::get_instance().set_valid(this);
+  }
   ~LPMap() {
     delete[] entries_;
+    LRUCache::get_instance().set_invalid(this);
   }
 
   void init(size_t entry_num);

@@ -17,6 +17,7 @@
 #include <arrow/ipc/reader.h>
 #include <parquet/arrow/reader.h>
 #include <zvec/ailego/buffer/buffer_manager.h>
+#include <zvec/ailego/buffer/parquet_buffer_pool.h>
 #include "db/common/constants.h"
 
 
@@ -128,10 +129,12 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
     if (with_cache_) {
       auto &buf_mgr = ailego::BufferManager::Instance();
       for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
-        auto buffer_id = ailego::BufferID::ParquetID(
-            file_path_, col_indices_[col_idx], rg_id);
-        auto buffer_handle = buf_mgr.acquire(buffer_id);
-        auto col_chunked_array = buffer_handle.pin_parquet_data();
+        // auto buffer_id = ailego::BufferID::ParquetID(
+        //     file_path_, col_indices_[col_idx], rg_id);
+        // auto buffer_handle = buf_mgr.acquire(buffer_id);
+        // auto col_chunked_array = buffer_handle.pin_parquet_data();
+        auto buffer_id = ailego::ParquetBufferID(file_path_, col_indices_[col_idx], rg_id);
+        auto col_chunked_array = ailego::ParquetBufferPool::get_instance().acquire(buffer_id);
         if (col_chunked_array) {
           std::shared_ptr<arrow::Array> concat;
           auto concat_result = arrow::Concatenate(col_chunked_array->chunks(),
