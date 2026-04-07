@@ -222,6 +222,8 @@ void ParquetBufferPool::release(ParquetBufferID buffer_id) {
   if (context.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
     std::atomic_thread_fence(std::memory_order_acquire);
     LRUCache::BlockType block;
+    block.parquet_buffer_block.first = buffer_id;
+    block.parquet_buffer_block.second = context.load_count.load();
     // TODO: set block
     LRUCache::get_instance().add_single_block(block, 0);
   }
@@ -240,6 +242,15 @@ void ParquetBufferPool::evict(ParquetBufferID buffer_id) {
     MemoryLimitPool::get_instance().release_parquet(context.size);
     table_.erase(buffer_id);
   }
+}
+
+bool ParquetBufferPool::is_dead_node(LRUCache::BlockType &block) {
+  std::unique_lock<std::shared_mutex> lock(table_mutex_);
+  auto iter = table_.find(block.parquet_buffer_block.first);
+  if (iter == table_.end()) {
+    return true;
+  }
+  return iter->second.load_count.load() != block.parquet_buffer_block.second;
 }
 
 }  // namespace ailego

@@ -33,16 +33,6 @@ using version_t = size_t;
 
 class LRUCache;
 
-struct ParquetBufferID {
-  std::string filename;
-  int column;
-  int row_group;
-  uint64_t file_id;
-  long mtime;
-  ParquetBufferID() {}
-  ParquetBufferID(std::string &filename, int column, int row_group);
-};
-
 struct IDHash {
   size_t operator()(const ParquetBufferID &buffer_id) const {
     size_t hash = std::hash<int>{}(1);
@@ -136,6 +126,8 @@ class ParquetBufferPool {
   void release(ParquetBufferID buffer_id);
 
   void evict(ParquetBufferID buffer_id);
+
+  bool is_dead_node(LRUCache::BlockType &block);
 
   static ParquetBufferPool &get_instance() {
     static ParquetBufferPool instance;

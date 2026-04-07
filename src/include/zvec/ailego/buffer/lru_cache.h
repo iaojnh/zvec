@@ -34,10 +34,21 @@ class LPMap;
 using block_id_t = size_t;
 using version_t = size_t;
 
+struct ParquetBufferID {
+  std::string filename;
+  int column;
+  int row_group;
+  uint64_t file_id;
+  long mtime;
+  ParquetBufferID() {}
+  ParquetBufferID(std::string &filename, int column, int row_group);
+};
+
 class LRUCache {
  public:
   struct BlockType {
     std::pair<block_id_t, version_t> block;
+    std::pair<ParquetBufferID, version_t> parquet_buffer_block;
     LPMap *lp_map;
   };
   typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;

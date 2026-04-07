@@ -1,4 +1,5 @@
 #include <zvec/ailego/buffer/buffer_pool.h>
+#include <zvec/ailego/buffer/parquet_buffer_pool.h>
 #include <zvec/core/framework/index_logger.h>
 
 namespace zvec {
@@ -37,7 +38,11 @@ bool LRUCache::evict_block(BlockType &item) {
 bool LRUCache::recycle() {
   BlockType item;
   while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
-    item.lp_map->evict_block(item.block.first);
+    if (item.lp_map) {
+      item.lp_map->evict_block(item.block.first);
+    } else {
+      ParquetBufferPool::get_instance().evict(item.parquet_buffer_block.first);
+    }
   }
   return MemoryLimitPool::get_instance().is_full();
 }
@@ -65,14 +70,26 @@ void LRUCache::clear_dead_node() {
     ConcurrentQueue tmp;
     BlockType item;
     while (queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
-      if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
+      if (item.lp_map == nullptr) {
+        if (ParquetBufferPool::get_instance().is_dead_node(item)) {
+          if (!tmp.enqueue(item)) {
+            LOG_ERROR("enqueue failed.");
+          }
+        }
+      } else if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
         if (!tmp.enqueue(item)) {
           LOG_ERROR("enqueue failed.");
         }
       }
     }
     while (tmp.try_dequeue(item)) {
-      if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
+      if (item.lp_map == nullptr) {
+        if (ParquetBufferPool::get_instance().is_dead_node(item)) {
+          if (!tmp.enqueue(item)) {
+            LOG_ERROR("enqueue failed.");
+          }
+        }
+      } else if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
         if (!queues_[i].enqueue(item)) {
           LOG_ERROR("enqueue failed.");
         }
