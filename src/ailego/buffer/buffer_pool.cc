@@ -32,6 +32,7 @@ void LPMap::init(size_t entry_num) {
   for (size_t i = 0; i < entry_num_; i++) {
     entries_[i].ref_count.store(std::numeric_limits<int>::min());
     entries_[i].load_count.store(0);
+    entries_[i].in_lru_version.store(0);
     entries_[i].buffer = nullptr;
   }
 }
@@ -53,6 +54,27 @@ char *LPMap::acquire_block(block_id_t block_id) {
       return entry.buffer;
     }
   }
+  if (MemoryLimitPool::get_instance().is_hot_level2()) {
+    for (int i = 0; i < entry_num_; i++) {
+      Entry &entry_hot = entries_[i];
+      while (true) {
+        int current = entry_hot.in_lru_version.load(std::memory_order_relaxed);
+        int expected = entry_hot.load_count.load(std::memory_order_relaxed);
+        if (current == expected) {
+          break;
+        }
+        if (entry_hot.ref_count.compare_exchange_weak(
+                current, expected, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+          LRUCache::BlockType block;
+          block.lp_map = this;
+          block.block.first = i;
+          block.block.second = expected;
+          LRUCache::get_instance().add_single_block(block, 0);
+        }
+      }
+    }
+  }
 }
 
 void LPMap::release_block(block_id_t block_id) {
@@ -61,11 +83,14 @@ void LPMap::release_block(block_id_t block_id) {
 
   if (entry.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
     std::atomic_thread_fence(std::memory_order_acquire);
-    LRUCache::BlockType block;
-    block.lp_map = this;
-    block.block.first = block_id;
-    block.block.second = entry.load_count.load();
-    LRUCache::get_instance().add_single_block(block, 0);
+    if (MemoryLimitPool::get_instance().is_hot_level1()) {
+      LRUCache::BlockType block;
+      block.lp_map = this;
+      block.block.first = block_id;
+      block.block.second = entry.load_count.load();
+      entry.in_lru_version = entry.load_count.load();
+      LRUCache::get_instance().add_single_block(block, 0);
+    }
   }
 }
 

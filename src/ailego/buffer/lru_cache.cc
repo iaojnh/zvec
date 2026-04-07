@@ -8,7 +8,7 @@ namespace ailego {
 int LRUCache::init() {
   block_size_ = 512;
   for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    queues_.push_back(ConcurrentQueue(block_size_ * 20));
+    queues_.push_back(ConcurrentQueue(block_size_ * 200));
   }
   return 0;
 }
@@ -60,31 +60,37 @@ bool LRUCache::add_single_block(const BlockType &block, int block_type) {
     LOG_ERROR("enqueue failed.");
     return false;
   }
-  evict_queue_insertions_.fetch_add(1, std::memory_order_relaxed);
-  if (evict_queue_insertions_ % block_size_ == 0) {
+  static thread_local int evict_queue_insertions = 0;
+  if (evict_queue_insertions++ > block_size_) {
     this->clear_dead_node();
+    evict_queue_insertions = 0;
   }
   return true;
 }
 
 void LRUCache::clear_dead_node() {
   for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    size_t clear_size = block_size_ * 2;
-    if (queues_[i].size_approx() < clear_size * 4) {
+    size_t clear_size = block_size_;
+    if (queues_[i].size_approx() < block_size_) {
       continue;
+    }
+    if (queues_[i].size_approx() > block_size_ * 8) {
+      clear_size *= 2;
     }
     size_t clear_count = 0;
     BlockType item;
+    ConcurrentQueue tmp_queue(block_size_ * 200);
     while (queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
       if (item.lp_map == nullptr) {
         if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
-          queues_[i].enqueue(item);
-          break;
+          tmp_queue.enqueue(item);
         }
       } else if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
-        queues_[i].enqueue(item);
-        break;
+        tmp_queue.enqueue(item);
       }
+    }
+    while (tmp_queue.try_dequeue(item)) {
+      queues_[i].enqueue(item);
     }
   }
 }
@@ -138,6 +144,14 @@ void MemoryLimitPool::release_parquet(const size_t buffer_size) {
 
 bool MemoryLimitPool::is_full() {
   return used_size_.load() >= pool_size_;
+}
+
+bool MemoryLimitPool::is_hot_level1() {
+  return used_size_.load() >= pool_size_ * 3 / 5; 
+}
+
+bool MemoryLimitPool::is_hot_level2() {
+  return used_size_.load() >= pool_size_ * 4 / 5;
 }
 
 }  // namespace ailego

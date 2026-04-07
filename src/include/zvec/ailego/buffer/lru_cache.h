@@ -98,7 +98,6 @@ class LRUCache {
   constexpr static size_t CATCH_QUEUE_NUM = 3;
   size_t block_size_{0};
   std::vector<ConcurrentQueue> queues_;
-  alignas(64) std::atomic<size_t> evict_queue_insertions_{0};
   std::unordered_set<LPMap *> valid_lp_maps_;
   std::shared_mutex valid_lp_maps_mutex_;
 };
@@ -125,6 +124,12 @@ class MemoryLimitPool {
   void release_parquet(const size_t buffer_size);
 
   bool is_full();
+
+  bool is_hot();
+
+  bool is_hot_level1();
+
+  bool is_hot_level2();
 
  private:
   MemoryLimitPool() = default;
