@@ -38,6 +38,7 @@ struct ParquetBufferID {
   int column;
   int row_group;
   uint64_t file_id;
+  long mtime;
   ParquetBufferID(std::string &filename, int column, int row_group)
       : filename(filename), column(column), row_group(row_group) {
     struct stat file_stat;
@@ -46,14 +47,16 @@ struct ParquetBufferID {
       // file_stat.st_dev contains the device ID
       // Together they uniquely identify a file
       file_id = file_stat.st_ino;
+      std::filesystem::path p(filename);
+      auto ftime = std::filesystem::last_write_time(p);
+      mtime = static_cast<std::uint64_t>(ftime.time_since_epoch().count());
     }
   }
 };
 
 struct IDHash {
   size_t operator()(const ParquetBufferID &buffer_id) const {
-    struct stat file_stat;
-    size_t hash = 1;
+    size_t hash = std::hash<int>{}(1);
     hash = hash ^ (std::hash<uint64_t>{}(buffer_id.file_id));
     hash = hash * 31 + std::hash<int>{}(buffer_id.column);
     hash = hash * 31 + std::hash<int>{}(buffer_id.row_group);
@@ -67,6 +70,9 @@ struct IDEqual {
       return false;
     }
     if (a.file_id != b.file_id) {
+      return false;
+    }
+    if (a.mtime != b.mtime) {
       return false;
     }
     return a.column == b.column && a.row_group == b.row_group;
