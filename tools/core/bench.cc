@@ -792,6 +792,7 @@ int main(int argc, char *argv[]) {
     usage();
     return -1;
   }
+  zvec::ailego::MemoryLimitPool::get_instance().init(2lu * 1024 * 1024 * 1024);
 
   IndexPluginBroker broker;
   std::string error;

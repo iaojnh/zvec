@@ -76,7 +76,7 @@ int parse_and_load_index_param(
       return -1;
     }
     core_interface::StorageOptions storage_options;
-    storage_options.type = core_interface::StorageOptions::StorageType::kMMAP;
+    storage_options.type = core_interface::StorageOptions::StorageType::kBufferPool;
     storage_options.create_new = false;
     storage_options.read_only = true;
 
@@ -161,7 +161,7 @@ int parse_and_load_index_param(
               reference_index_path_config.as<std::string>();
           core_interface::StorageOptions storage_options;
           storage_options.type =
-              core_interface::StorageOptions::StorageType::kMMAP;
+              core_interface::StorageOptions::StorageType::kBufferPool;
           storage_options.create_new = false;
           storage_options.read_only = true;
 
