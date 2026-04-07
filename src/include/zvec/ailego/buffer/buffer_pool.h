@@ -34,6 +34,7 @@ class LPMap {
   struct Entry {
     alignas(64) std::atomic<int> ref_count;
     alignas(64) std::atomic<version_t> load_count;
+    alignas(64) std::atomic<version_t> in_lru_version;
     char *buffer;
     size_t size;
   };
