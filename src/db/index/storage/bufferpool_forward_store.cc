@@ -194,15 +194,10 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
     for (size_t i = 0; i < col_indices.size(); ++i) {
       int col_idx = col_indices[i];
       auto buffer_id = ailego::ParquetBufferID(file_path_, col_idx, rg_id);
-      // ailego::BufferID::ParquetID(file_path_, col_idx, rg_id);
-      // auto buffer_handle = buf_mgr.acquire(buffer_id);
-      // buffer_handle.pin_parquet_data();
-      std::shared_ptr<arrow::ChunkedArray>  col_chunked_array{nullptr};
-      if (!ailego::ParquetBufferPool::get_instance().acquire_buffer(buffer_id, col_chunked_array)) {
-        LOG_ERROR("Failed to acquire parquet buffer");
-        return nullptr;
-      }
-
+      auto buffer_handle =
+          ailego::ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+      std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
+          buffer_handle.data();
       if (!col_chunked_array) {
         LOG_ERROR(
             "Failed to pin parquet data for file: %s, column: %d, row_group: "
@@ -326,14 +321,10 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   for (size_t i = 0; i < col_indices.size(); ++i) {
     int col_idx = col_indices[i];
     auto buffer_id = ailego::ParquetBufferID(file_path_, col_idx, rg_id);
-    std::shared_ptr<arrow::ChunkedArray>  col_chunked_array{nullptr};
-    if (!ailego::ParquetBufferPool::get_instance().acquire_buffer(buffer_id, col_chunked_array)) {
-      LOG_ERROR("Failed to acquire parquet buffer");
-      return nullptr;
-    }
-    // ailego::BufferID::ParquetID(file_path_, col_idx, rg_id);
-    // auto buffer_handle = buf_mgr.acquire(buffer_id);
-    // buffer_handle.pin_parquet_data();
+    auto buffer_handle =
+        ailego::ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+    std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
+        buffer_handle.data();
 
     if (!col_chunked_array) {
       LOG_ERROR(

@@ -50,7 +50,6 @@ class SegmentTest : public testing::TestWithParam<bool> {
     FileHelper::RemoveDirectory(col_path);
     FileHelper::CreateDirectory(col_path);
 
-    ailego::BufferManager::Instance().init(MIN_MEMORY_LIMIT_BYTES, 1);
     zvec::ailego::MemoryLimitPool::get_instance().init(MIN_MEMORY_LIMIT_BYTES);
 
     std::string idmap_path =
