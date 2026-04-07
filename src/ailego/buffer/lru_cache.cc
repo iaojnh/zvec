@@ -78,7 +78,7 @@ void LRUCache::clear_dead_node() {
     BlockType item;
     while (queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
       if (item.lp_map == nullptr) {
-        if (ParquetBufferPool::get_instance().is_dead_node(item)) {
+        if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
           if (!tmp.enqueue(item)) {
             LOG_ERROR("enqueue failed.");
           }
@@ -91,8 +91,8 @@ void LRUCache::clear_dead_node() {
     }
     while (tmp.try_dequeue(item)) {
       if (item.lp_map == nullptr) {
-        if (ParquetBufferPool::get_instance().is_dead_node(item)) {
-          if (!tmp.enqueue(item)) {
+        if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
+          if (!queues_[i].enqueue(item)) {
             LOG_ERROR("enqueue failed.");
           }
         }
