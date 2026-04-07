@@ -66,6 +66,9 @@ struct IDEqual {
     if (a.filename != b.filename) {
       return false;
     }
+    if (a.file_id != b.file_id) {
+      return false;
+    }
     return a.column == b.column && a.row_group == b.row_group;
   }
 };
