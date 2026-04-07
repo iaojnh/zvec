@@ -31,6 +31,13 @@ bool LRUCache::evict_block(BlockType &item) {
     if (!ok) {
       return false;
     }
+    if (item.lp_map == nullptr) {
+      if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
+        break;
+      } else {
+        continue;
+      }
+    }
   } while (!is_valid(item.lp_map) || item.lp_map->isDeadBlock(item));
   return ok;
 }
@@ -99,8 +106,9 @@ void LRUCache::clear_dead_node() {
 }
 
 int MemoryLimitPool::init(size_t pool_size) {
+  pool_size_ = 0;
+  LRUCache::get_instance().recycle();
   pool_size_ = pool_size;
-  used_size_ = 0;
   return 0;
 }
 
@@ -119,17 +127,12 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
   return true;
 }
 
-bool MemoryLimitPool::try_acquire_parquet(const size_t buffer_size) {
+void MemoryLimitPool::acquire_parquet(const size_t buffer_size) {
   size_t expected, desired;
   do {
     expected = used_size_.load();
-    if (expected >= pool_size_) {
-      // LOG_ERROR("expected: %lu, pool_size: %lu", expected, pool_size_);
-      return false;
-    }
     desired = expected + buffer_size;
   } while (!used_size_.compare_exchange_weak(expected, desired));
-  return true;
 }
 
 void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {

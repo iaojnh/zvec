@@ -115,24 +115,23 @@ ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
     }
   }
   {
-    std::unique_lock<std::shared_mutex> lock(table_mutex_);
-    {
-      bool found = MemoryLimitPool::get_instance().try_acquire_parquet(0);
-      if (!found) {
-        for (int i = 0; i < 5; i++) {
-          LRUCache::get_instance().recycle();
-          found = MemoryLimitPool::get_instance().try_acquire_parquet(0);
-          if (found) {
-            break;
-          }
+    bool found = !MemoryLimitPool::get_instance().is_full();
+    if (!found) {
+      for (int i = 0; i < 5; i++) {
+        LRUCache::get_instance().recycle();
+        found = !MemoryLimitPool::get_instance().is_full();
+        if (found) {
+          break;
         }
       }
-      if (!found) {
-        LOG_ERROR("Failed to acquire parquet buffer");
-        return ParquetBufferContextHandle();
-      }
     }
+    if (!found) {
+      LOG_ERROR("Failed to acquire parquet buffer");
+      return ParquetBufferContextHandle();
+    }
+    std::unique_lock<std::shared_mutex> lock(table_mutex_);
     if (acquire(buffer_id, table_[buffer_id]).ok()) {
+      MemoryLimitPool::get_instance().acquire_parquet(table_[buffer_id].size);
       arrow = set_block_acquired(buffer_id);
       return ParquetBufferContextHandle(buffer_id, arrow);
     } else {
@@ -224,7 +223,6 @@ void ParquetBufferPool::release(ParquetBufferID buffer_id) {
     LRUCache::BlockType block;
     block.parquet_buffer_block.first = buffer_id;
     block.parquet_buffer_block.second = context.load_count.load();
-    // TODO: set block
     LRUCache::get_instance().add_single_block(block, 0);
   }
 }
@@ -240,12 +238,13 @@ void ParquetBufferPool::evict(ParquetBufferID buffer_id) {
   if (context.ref_count.compare_exchange_strong(
           expected, std::numeric_limits<int>::min())) {
     MemoryLimitPool::get_instance().release_parquet(context.size);
-    table_.erase(buffer_id);
+    context.arrow = nullptr;
+    context.arrow_refs.clear();
   }
 }
 
 bool ParquetBufferPool::is_dead_node(LRUCache::BlockType &block) {
-  std::unique_lock<std::shared_mutex> lock(table_mutex_);
+  std::shared_lock<std::shared_mutex> lock(table_mutex_);
   auto iter = table_.find(block.parquet_buffer_block.first);
   if (iter == table_.end()) {
     return true;

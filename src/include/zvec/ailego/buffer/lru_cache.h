@@ -49,7 +49,7 @@ class LRUCache {
   struct BlockType {
     std::pair<block_id_t, version_t> block;
     std::pair<ParquetBufferID, version_t> parquet_buffer_block;
-    LPMap *lp_map;
+    LPMap *lp_map{nullptr};
   };
   typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;
 
@@ -118,7 +118,7 @@ class MemoryLimitPool {
 
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
 
-  bool try_acquire_parquet(const size_t buffer_size);
+  void acquire_parquet(const size_t buffer_size);
 
   void release_buffer(char *buffer, const size_t buffer_size);
 
