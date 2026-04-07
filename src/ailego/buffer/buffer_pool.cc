@@ -57,6 +57,9 @@ char *LPMap::acquire_block(block_id_t block_id) {
   if (MemoryLimitPool::get_instance().is_hot_level2()) {
     for (int i = 0; i < entry_num_; i++) {
       Entry &entry_hot = entries_[i];
+      if (entry_hot.ref_count.load() != 0) {
+        continue;
+      }
       while (true) {
         int current = entry_hot.in_lru_version.load(std::memory_order_relaxed);
         int expected = entry_hot.load_count.load(std::memory_order_relaxed);
