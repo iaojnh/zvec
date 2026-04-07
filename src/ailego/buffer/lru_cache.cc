@@ -147,7 +147,7 @@ bool MemoryLimitPool::is_full() {
 }
 
 bool MemoryLimitPool::is_hot_level1() {
-  return used_size_.load() >= pool_size_ * 3 / 5; 
+  return used_size_.load() >= pool_size_ * 3 / 5;
 }
 
 bool MemoryLimitPool::is_hot_level2() {
