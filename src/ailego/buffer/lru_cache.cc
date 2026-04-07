@@ -8,7 +8,7 @@ namespace ailego {
 int LRUCache::init() {
   block_size_ = 512;
   for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    queues_.push_back(ConcurrentQueue());
+    queues_.push_back(ConcurrentQueue(block_size_ * 20));
   }
   return 0;
 }
@@ -74,32 +74,16 @@ void LRUCache::clear_dead_node() {
       continue;
     }
     size_t clear_count = 0;
-    ConcurrentQueue tmp;
     BlockType item;
     while (queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
       if (item.lp_map == nullptr) {
         if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
-          if (!tmp.enqueue(item)) {
-            LOG_ERROR("enqueue failed.");
-          }
+          queues_[i].enqueue(item);
+          break;
         }
       } else if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
-        if (!tmp.enqueue(item)) {
-          LOG_ERROR("enqueue failed.");
-        }
-      }
-    }
-    while (tmp.try_dequeue(item)) {
-      if (item.lp_map == nullptr) {
-        if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
-          if (!queues_[i].enqueue(item)) {
-            LOG_ERROR("enqueue failed.");
-          }
-        }
-      } else if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
-        if (!queues_[i].enqueue(item)) {
-          LOG_ERROR("enqueue failed.");
-        }
+        queues_[i].enqueue(item);
+        break;
       }
     }
   }
