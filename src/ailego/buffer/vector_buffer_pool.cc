@@ -115,7 +115,7 @@ char *VectorPageTable::evict_block(block_id_t block_id) {
 }
 
 char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
-                                size_t size) {
+                                          size_t size) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
   entry.size = size;
