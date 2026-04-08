@@ -1,4 +1,4 @@
-#include <zvec/ailego/buffer/buffer_pool.h>
+#include <zvec/ailego/buffer/vector_buffer_pool.h>
 #include <zvec/core/framework/index_logger.h>
 
 #if defined(_MSC_VER)
@@ -23,7 +23,7 @@ static ssize_t zvec_pread(int fd, void *buf, size_t count, size_t offset) {
 namespace zvec {
 namespace ailego {
 
-void LPMap::init(size_t entry_num) {
+void VectorPageTable::init(size_t entry_num) {
   if (entries_) {
     delete[] entries_;
   }
@@ -37,7 +37,7 @@ void LPMap::init(size_t entry_num) {
   }
 }
 
-char *LPMap::acquire_block(block_id_t block_id) {
+char *VectorPageTable::acquire_block(block_id_t block_id) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
   while (true) {
@@ -80,7 +80,7 @@ char *LPMap::acquire_block(block_id_t block_id) {
   }
 }
 
-void LPMap::release_block(block_id_t block_id) {
+void VectorPageTable::release_block(block_id_t block_id) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
 
@@ -97,7 +97,7 @@ void LPMap::release_block(block_id_t block_id) {
   }
 }
 
-char *LPMap::evict_block(block_id_t block_id) {
+char *VectorPageTable::evict_block(block_id_t block_id) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
   int expected = 0;
@@ -114,7 +114,7 @@ char *LPMap::evict_block(block_id_t block_id) {
   }
 }
 
-char *LPMap::set_block_acquired(block_id_t block_id, char *buffer,
+char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
                                 size_t size) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];

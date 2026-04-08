@@ -14,7 +14,7 @@
 
 #include <algorithm>
 #include <mutex>
-#include <zvec/ailego/buffer/buffer_pool.h>
+#include <zvec/ailego/buffer/vector_buffer_pool.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
@@ -176,7 +176,7 @@ class BufferStorage : public IndexStorage {
   //! Initialize storage
   int init(const ailego::Params &params) override {
     params.get(BUFFER_STORAGE_MEMORY_SIZE, &buffer_size_);
-    // LOG_INFO("buffer size: %lu", buffer_size_);
+    // LOG_DEBUG("buffer size: %lu", buffer_size_);
     return 0;
   }
 

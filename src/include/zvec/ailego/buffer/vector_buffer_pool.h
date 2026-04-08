@@ -30,7 +30,7 @@ namespace ailego {
 using block_id_t = size_t;
 using version_t = size_t;
 
-class LPMap {
+class VectorPageTable {
   struct Entry {
     alignas(64) std::atomic<int> ref_count;
     alignas(64) std::atomic<version_t> load_count;
@@ -40,10 +40,10 @@ class LPMap {
   };
 
  public:
-  LPMap() : entry_num_(0), entries_(nullptr) {
+  VectorPageTable() : entry_num_(0), entries_(nullptr) {
     LRUCache::get_instance().set_valid(this);
   }
-  ~LPMap() {
+  ~VectorPageTable() {
     delete[] entries_;
     LRUCache::get_instance().set_invalid(this);
   }
@@ -110,7 +110,7 @@ class VecBufferPool {
   size_t pool_capacity_;
 
  public:
-  LPMap lp_map_;
+  VectorPageTable lp_map_;
 
  private:
   std::vector<std::unique_ptr<std::mutex>> mutex_vec_;

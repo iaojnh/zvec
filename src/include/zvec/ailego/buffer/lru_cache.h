@@ -29,7 +29,7 @@
 namespace zvec {
 namespace ailego {
 
-class LPMap;
+class VectorPageTable;
 
 using block_id_t = size_t;
 using version_t = size_t;
@@ -49,7 +49,7 @@ class LRUCache {
   struct BlockType {
     std::pair<block_id_t, version_t> block;
     std::pair<ParquetBufferID, version_t> parquet_buffer_block;
-    LPMap *lp_map{nullptr};
+    VectorPageTable *lp_map{nullptr};
   };
   typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;
 
@@ -72,17 +72,17 @@ class LRUCache {
 
   void clear_dead_node();
 
-  bool is_valid(LPMap *lp_map) {
+  bool is_valid(VectorPageTable *lp_map) {
     std::shared_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
     return valid_lp_maps_.find(lp_map) != valid_lp_maps_.end();
   }
 
-  void set_valid(LPMap *lp_map) {
+  void set_valid(VectorPageTable *lp_map) {
     std::unique_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
     valid_lp_maps_.insert(lp_map);
   }
 
-  void set_invalid(LPMap *lp_map) {
+  void set_invalid(VectorPageTable *lp_map) {
     std::unique_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
     valid_lp_maps_.erase(lp_map);
   }
@@ -98,7 +98,7 @@ class LRUCache {
   constexpr static size_t CATCH_QUEUE_NUM = 3;
   size_t block_size_{0};
   std::vector<ConcurrentQueue> queues_;
-  std::unordered_set<LPMap *> valid_lp_maps_;
+  std::unordered_set<VectorPageTable *> valid_lp_maps_;
   std::shared_mutex valid_lp_maps_mutex_;
 };
 
