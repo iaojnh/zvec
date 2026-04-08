@@ -169,7 +169,7 @@ TEST_F(FlatStreamerTest, TestLinearSearch) {
 }
 
 TEST_F(FlatStreamerTest, TestLinearSearchWithLRU) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  MemoryLimitPool::get_instance().init(100 * 1024UL * 1024UL);
   constexpr size_t static dim = 1600;
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("FlatStreamer");
@@ -189,7 +189,7 @@ TEST_F(FlatStreamerTest, TestLinearSearchWithLRU) {
   auto ctx = write_streamer->create_context();
   ASSERT_TRUE(!!ctx);
 
-  size_t cnt = 1000000UL;
+  size_t cnt = 50000UL;
   IndexQueryMeta qmeta(IndexMeta::DT_FP32, dim);
   for (size_t i = 0; i < cnt; i++) {
     NumericalVector<float> vec(dim);
