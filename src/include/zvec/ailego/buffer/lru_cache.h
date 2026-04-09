@@ -47,6 +47,7 @@ struct ParquetBufferID {
 class LRUCache {
  public:
   struct BlockType {
+    // TODO: lp_map & block
     std::pair<block_id_t, version_t> block;
     std::pair<ParquetBufferID, version_t> parquet_buffer_block;
     VectorPageTable *lp_map{nullptr};
