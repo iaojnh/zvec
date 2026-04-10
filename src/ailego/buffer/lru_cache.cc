@@ -6,17 +6,17 @@ namespace zvec {
 namespace ailego {
 
 int LRUCache::init() {
-  block_size_ = 512;
-  for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    queues_.push_back(ConcurrentQueue(block_size_ * 200));
+  evict_batch_size_ = 512;
+  for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
+    evict_queues_.push_back(ConcurrentQueue(evict_batch_size_ * 200));
   }
   return 0;
 }
 
 bool LRUCache::evict_single_block(BlockType &item) {
   bool found = false;
-  for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    found = queues_[i].try_dequeue(item);
+  for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
+    found = evict_queues_[i].try_dequeue(item);
     if (found) {
       break;
     }
@@ -31,22 +31,22 @@ bool LRUCache::evict_block(BlockType &item) {
     if (!ok) {
       return false;
     }
-    if (item.lp_map == nullptr) {
+    if (item.page_table == nullptr) {
       if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
         break;
       } else {
         continue;
       }
     }
-  } while (!is_valid(item.lp_map) || item.lp_map->isDeadBlock(item));
+  } while (!is_valid(item.page_table) || item.page_table->is_dead_block(item));
   return ok;
 }
 
 bool LRUCache::recycle() {
   BlockType item;
   while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
-    if (item.lp_map) {
-      item.lp_map->evict_block(item.block.first);
+    if (item.page_table) {
+      item.page_table->evict_block(item.vector_block.first);
     } else {
       ParquetBufferPool::get_instance().evict(item.parquet_buffer_block.first);
     }
@@ -54,14 +54,14 @@ bool LRUCache::recycle() {
   return MemoryLimitPool::get_instance().is_full();
 }
 
-bool LRUCache::add_single_block(const BlockType &block, int block_type) {
-  bool ok = queues_[block_type].enqueue(block);
+bool LRUCache::add_single_block(const BlockType &block, int queue_index) {
+  bool ok = evict_queues_[queue_index].enqueue(block);
   if (!ok) {
     LOG_ERROR("enqueue failed.");
     return false;
   }
   static thread_local int evict_queue_insertions = 0;
-  if (evict_queue_insertions++ > block_size_) {
+  if (evict_queue_insertions++ > evict_batch_size_) {
     this->clear_dead_node();
     evict_queue_insertions = 0;
   }
@@ -69,28 +69,28 @@ bool LRUCache::add_single_block(const BlockType &block, int block_type) {
 }
 
 void LRUCache::clear_dead_node() {
-  for (size_t i = 0; i < CATCH_QUEUE_NUM; i++) {
-    size_t clear_size = block_size_;
-    if (queues_[i].size_approx() < block_size_) {
+  for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
+    size_t clear_size = evict_batch_size_;
+    if (evict_queues_[i].size_approx() < evict_batch_size_) {
       continue;
     }
-    if (queues_[i].size_approx() > block_size_ * 8) {
+    if (evict_queues_[i].size_approx() > evict_batch_size_ * 8) {
       clear_size *= 2;
     }
     size_t clear_count = 0;
     BlockType item;
-    ConcurrentQueue tmp_queue(block_size_ * 200);
-    while (queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
-      if (item.lp_map == nullptr) {
+    ConcurrentQueue live_blocks_queue(evict_batch_size_ * 200);
+    while (evict_queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
+      if (item.page_table == nullptr) {
         if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
-          tmp_queue.enqueue(item);
+          live_blocks_queue.enqueue(item);
         }
-      } else if (is_valid(item.lp_map) && !item.lp_map->isDeadBlock(item)) {
-        tmp_queue.enqueue(item);
+      } else if (is_valid(item.page_table) && !item.page_table->is_dead_block(item)) {
+        live_blocks_queue.enqueue(item);
       }
     }
-    while (tmp_queue.try_dequeue(item)) {
-      queues_[i].enqueue(item);
+    while (live_blocks_queue.try_dequeue(item)) {
+      evict_queues_[i].enqueue(item);
     }
   }
 }

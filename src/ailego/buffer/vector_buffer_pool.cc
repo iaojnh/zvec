@@ -32,7 +32,7 @@ void VectorPageTable::init(size_t entry_num) {
   for (size_t i = 0; i < entry_num_; i++) {
     entries_[i].ref_count.store(std::numeric_limits<int>::min());
     entries_[i].load_count.store(0);
-    entries_[i].in_lru_version.store(0);
+    entries_[i].lru_version.store(0);
     entries_[i].buffer = nullptr;
   }
 }
@@ -56,23 +56,23 @@ char *VectorPageTable::acquire_block(block_id_t block_id) {
   }
   if (MemoryLimitPool::get_instance().is_hot_level2()) {
     for (int i = 0; i < entry_num_; i++) {
-      Entry &entry_hot = entries_[i];
-      if (entry_hot.ref_count.load() != 0) {
+      Entry &hot_entry = entries_[i];
+      if (hot_entry.ref_count.load() != 0) {
         continue;
       }
       while (true) {
-        int current = entry_hot.in_lru_version.load(std::memory_order_relaxed);
-        int expected = entry_hot.load_count.load(std::memory_order_relaxed);
+        int current = hot_entry.lru_version.load(std::memory_order_relaxed);
+        int expected = hot_entry.load_count.load(std::memory_order_relaxed);
         if (current == expected) {
           break;
         }
-        if (entry_hot.ref_count.compare_exchange_weak(
+        if (hot_entry.ref_count.compare_exchange_weak(
                 current, expected, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
           LRUCache::BlockType block;
-          block.lp_map = this;
-          block.block.first = i;
-          block.block.second = expected;
+          block.page_table = this;
+          block.vector_block.first = i;
+          block.vector_block.second = expected;
           LRUCache::get_instance().add_single_block(block, 0);
         }
       }
@@ -88,10 +88,10 @@ void VectorPageTable::release_block(block_id_t block_id) {
     std::atomic_thread_fence(std::memory_order_acquire);
     if (MemoryLimitPool::get_instance().is_hot_level1()) {
       LRUCache::BlockType block;
-      block.lp_map = this;
-      block.block.first = block_id;
-      block.block.second = entry.load_count.load();
-      entry.in_lru_version = entry.load_count.load();
+      block.page_table = this;
+      block.vector_block.first = block_id;
+      block.vector_block.second = entry.load_count.load();
+      entry.lru_version = entry.load_count.load();
       LRUCache::get_instance().add_single_block(block, 0);
     }
   }
@@ -169,12 +169,12 @@ int VecBufferPool::init(size_t /*pool_capacity*/, size_t block_size,
     return -1;
   }
   size_t block_num = segment_count + 10;
-  lp_map_.init(block_num);
-  mutex_vec_.reserve(block_num);
+  page_table_.init(block_num);
+  block_mutexes_.reserve(block_num);
   for (int i = 0; i < block_num; i++) {
-    mutex_vec_.emplace_back(std::make_unique<std::mutex>());
+    block_mutexes_.emplace_back(std::make_unique<std::mutex>());
   }
-  LOG_DEBUG("entry num: %zu", lp_map_.entry_num());
+  LOG_DEBUG("entry num: %zu", page_table_.entry_num());
   return 0;
 }
 
@@ -184,12 +184,12 @@ VecBufferPoolHandle VecBufferPool::get_handle() {
 
 char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
                                     size_t size, int retry) {
-  char *buffer = lp_map_.acquire_block(block_id);
+  char *buffer = page_table_.acquire_block(block_id);
   if (buffer) {
     return buffer;
   }
-  std::lock_guard<std::mutex> lock(*mutex_vec_[block_id]);
-  buffer = lp_map_.acquire_block(block_id);
+  std::lock_guard<std::mutex> lock(*block_mutexes_[block_id]);
+  buffer = page_table_.acquire_block(block_id);
   if (buffer) {
     return buffer;
   }
@@ -222,7 +222,7 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
     MemoryLimitPool::get_instance().release_buffer(buffer, size);
     return nullptr;
   }
-  return lp_map_.set_block_acquired(block_id, buffer, size);
+  return page_table_.set_block_acquired(block_id, buffer, size);
 }
 
 int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
@@ -249,11 +249,11 @@ int VecBufferPoolHandle::get_meta(size_t offset, size_t length, char *buffer) {
 }
 
 void VecBufferPoolHandle::release_one(block_id_t block_id) {
-  pool_.lp_map_.release_block(block_id);
+  pool_.page_table_.release_block(block_id);
 }
 
 void VecBufferPoolHandle::acquire_one(block_id_t block_id) {
-  pool_.lp_map_.acquire_block(block_id);
+  pool_.page_table_.acquire_block(block_id);
 }
 
 }  // namespace ailego

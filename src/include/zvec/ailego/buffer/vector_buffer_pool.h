@@ -34,7 +34,7 @@ class VectorPageTable {
   struct Entry {
     alignas(64) std::atomic<int> ref_count;
     alignas(64) std::atomic<version_t> load_count;
-    alignas(64) std::atomic<version_t> in_lru_version;
+    alignas(64) std::atomic<version_t> lru_version;
     char *buffer;
     size_t size;
   };
@@ -62,9 +62,9 @@ class VectorPageTable {
     return entry_num_;
   }
 
-  inline bool isDeadBlock(LRUCache::BlockType block) const {
-    Entry &entry = entries_[block.block.first];
-    return block.block.second != entry.load_count.load();
+  inline bool is_dead_block(LRUCache::BlockType block) const {
+    Entry &entry = entries_[block.vector_block.first];
+    return block.vector_block.second != entry.load_count.load();
   }
 
  private:
@@ -80,9 +80,9 @@ class VecBufferPool {
 
   VecBufferPool(const std::string &filename);
   ~VecBufferPool() {
-    // Free any buffers still pinned in the map
-    for (size_t i = 0; i < lp_map_.entry_num(); ++i) {
-      lp_map_.evict_block(i);
+    // Free any buffers still pinned in the page table
+    for (size_t i = 0; i < page_table_.entry_num(); ++i) {
+      page_table_.evict_block(i);
     }
 #if defined(_MSC_VER)
     _close(fd_);
@@ -110,10 +110,10 @@ class VecBufferPool {
   size_t pool_capacity_;
 
  public:
-  VectorPageTable lp_map_;
+  VectorPageTable page_table_;
 
  private:
-  std::vector<std::unique_ptr<std::mutex>> mutex_vec_;
+  std::vector<std::unique_ptr<std::mutex>> block_mutexes_;
 };
 
 class VecBufferPoolHandle {

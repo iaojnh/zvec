@@ -47,10 +47,10 @@ struct ParquetBufferID {
 class LRUCache {
  public:
   struct BlockType {
-    // TODO: lp_map & block
-    std::pair<block_id_t, version_t> block;
+    // TODO: page_table & vector_block
+    std::pair<block_id_t, version_t> vector_block;
     std::pair<ParquetBufferID, version_t> parquet_buffer_block;
-    VectorPageTable *lp_map{nullptr};
+    VectorPageTable *page_table{nullptr};
   };
   typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;
 
@@ -69,23 +69,23 @@ class LRUCache {
 
   bool evict_block(BlockType &item);
 
-  bool add_single_block(const BlockType &block, int block_type);
+  bool add_single_block(const BlockType &block, int queue_index);
 
   void clear_dead_node();
 
-  bool is_valid(VectorPageTable *lp_map) {
-    std::shared_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
-    return valid_lp_maps_.find(lp_map) != valid_lp_maps_.end();
+  bool is_valid(VectorPageTable *page_table) {
+    std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
+    return valid_page_tables_.find(page_table) != valid_page_tables_.end();
   }
 
-  void set_valid(VectorPageTable *lp_map) {
-    std::unique_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
-    valid_lp_maps_.insert(lp_map);
+  void set_valid(VectorPageTable *page_table) {
+    std::unique_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
+    valid_page_tables_.insert(page_table);
   }
 
-  void set_invalid(VectorPageTable *lp_map) {
-    std::unique_lock<std::shared_mutex> lock(valid_lp_maps_mutex_);
-    valid_lp_maps_.erase(lp_map);
+  void set_invalid(VectorPageTable *page_table) {
+    std::unique_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
+    valid_page_tables_.erase(page_table);
   }
 
   bool recycle();
@@ -96,11 +96,11 @@ class LRUCache {
   }
 
  private:
-  constexpr static size_t CATCH_QUEUE_NUM = 3;
-  size_t block_size_{0};
-  std::vector<ConcurrentQueue> queues_;
-  std::unordered_set<VectorPageTable *> valid_lp_maps_;
-  std::shared_mutex valid_lp_maps_mutex_;
+  constexpr static size_t CACHE_QUEUE_NUM = 3;
+  size_t evict_batch_size_{0};
+  std::vector<ConcurrentQueue> evict_queues_;
+  std::unordered_set<VectorPageTable *> valid_page_tables_;
+  std::shared_mutex valid_page_tables_mutex_;
 };
 
 class MemoryLimitPool {
