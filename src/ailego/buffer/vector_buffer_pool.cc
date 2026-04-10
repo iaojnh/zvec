@@ -40,20 +40,6 @@ void VectorPageTable::init(size_t entry_num) {
 char *VectorPageTable::acquire_block(block_id_t block_id) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
-  while (true) {
-    int current_count = entry.ref_count.load(std::memory_order_acquire);
-    if (current_count < 0) {
-      return nullptr;
-    }
-    if (entry.ref_count.compare_exchange_weak(current_count, current_count + 1,
-                                              std::memory_order_acq_rel,
-                                              std::memory_order_acquire)) {
-      if (current_count == 0) {
-        entry.load_count.fetch_add(1, std::memory_order_relaxed);
-      }
-      return entry.buffer;
-    }
-  }
   if (MemoryLimitPool::get_instance().is_hot_level2()) {
     for (int i = 0; i < entry_num_; i++) {
       Entry &hot_entry = entries_[i];
@@ -76,6 +62,20 @@ char *VectorPageTable::acquire_block(block_id_t block_id) {
           LRUCache::get_instance().add_single_block(block, 0);
         }
       }
+    }
+  }
+  while (true) {
+    int current_count = entry.ref_count.load(std::memory_order_acquire);
+    if (current_count < 0) {
+      return nullptr;
+    }
+    if (entry.ref_count.compare_exchange_weak(current_count, current_count + 1,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire)) {
+      if (current_count == 0) {
+        entry.load_count.fetch_add(1, std::memory_order_relaxed);
+      }
+      return entry.buffer;
     }
   }
 }
