@@ -122,12 +122,16 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
   while (true) {
     int current_count = entry.ref_count.load(std::memory_order_relaxed);
     if (current_count >= 0) {
+      // Another thread has already loaded this block. Release the buffer we
+      // allocated since it won't be used, then pin the existing entry.
       if (entry.ref_count.compare_exchange_weak(
               current_count, current_count + 1, std::memory_order_acq_rel,
               std::memory_order_acquire)) {
+        MemoryLimitPool::get_instance().release_buffer(buffer, size);
         return entry.buffer;
       }
     } else {
+      // Block is unloaded (ref_count < 0). Take ownership of buffer.
       if (entry.ref_count.compare_exchange_weak(current_count, 1,
                                                 std::memory_order_acq_rel,
                                                 std::memory_order_acquire)) {
