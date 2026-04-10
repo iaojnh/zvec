@@ -85,7 +85,8 @@ void LRUCache::clear_dead_node() {
         if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
           live_blocks_queue.enqueue(item);
         }
-      } else if (is_valid(item.page_table) && !item.page_table->is_dead_block(item)) {
+      } else if (is_valid(item.page_table) &&
+                 !item.page_table->is_dead_block(item)) {
         live_blocks_queue.enqueue(item);
       }
     }
