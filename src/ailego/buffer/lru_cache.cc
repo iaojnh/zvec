@@ -129,6 +129,10 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
     desired = expected + buffer_size;
   } while (!used_size_.compare_exchange_weak(expected, desired));
   buffer = (char *)ailego_malloc(buffer_size);
+  if (!buffer) {
+    used_size_.fetch_sub(buffer_size);
+    return false;
+  }
   return true;
 }
 

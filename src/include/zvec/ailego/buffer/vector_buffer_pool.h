@@ -85,6 +85,7 @@ class VectorPageTable {
  private:
   size_t entry_num_{0};
   Entry *entries_{nullptr};
+  moodycamel::ConcurrentQueue<block_id_t> evict_cache_;
 };
 
 class VecBufferPoolHandle;

@@ -54,30 +54,6 @@ void VectorPageTable::init(size_t entry_num) {
 char *VectorPageTable::acquire_block(block_id_t block_id) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
-  if (MemoryLimitPool::get_instance().is_hot_level2()) {
-    for (int i = 0; i < entry_num_; i++) {
-      Entry &hot_entry = entries_[i];
-      if (hot_entry.ref_count.load() != 0) {
-        continue;
-      }
-      while (true) {
-        int current = hot_entry.lru_version.load(std::memory_order_relaxed);
-        int expected = hot_entry.load_count.load(std::memory_order_relaxed);
-        if (current == expected) {
-          break;
-        }
-        if (hot_entry.ref_count.compare_exchange_weak(
-                current, expected, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-          LRUCache::BlockType block;
-          block.page_table = this;
-          block.vector_block.first = i;
-          block.vector_block.second = expected;
-          LRUCache::get_instance().add_single_block(block, 0);
-        }
-      }
-    }
-  }
   while (true) {
     int current_count = entry.ref_count.load(std::memory_order_acquire);
     if (current_count < 0) {
@@ -107,6 +83,10 @@ void VectorPageTable::release_block(block_id_t block_id) {
       block.vector_block.second = entry.load_count.load();
       entry.lru_version = entry.load_count.load();
       LRUCache::get_instance().add_single_block(block, 0);
+    } else {
+      if (entry.lru_version.load(std::memory_order_relaxed) + 1 == entry.load_count.load(std::memory_order_relaxed)) {
+        evict_cache_.enqueue(block_id);
+      }
     }
   }
 }
@@ -133,11 +113,41 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
   entry.size = size;
+  if (MemoryLimitPool::get_instance().is_hot_level2()) {
+    size_t evict_block_id = 0;
+    while(evict_cache_.try_dequeue(evict_block_id)) {
+      Entry &hot_entry = entries_[evict_block_id];
+      if (hot_entry.ref_count.load() != 0) {
+        continue;
+      }
+      while (true) {
+        version_t current = hot_entry.lru_version.load(std::memory_order_relaxed);
+        version_t expected = hot_entry.load_count.load(std::memory_order_relaxed);
+        if (current == expected) {
+          break;
+        }
+        if (hot_entry.lru_version.compare_exchange_weak(
+                current, expected, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+          LRUCache::BlockType block;
+          block.page_table = this;
+          block.vector_block.first = evict_block_id;
+          block.vector_block.second = expected;
+          LRUCache::get_instance().add_single_block(block, 0);
+        }
+      }
+    }
+  }
   while (true) {
     int current_count = entry.ref_count.load(std::memory_order_relaxed);
     if (current_count >= 0) {
-      // Another thread has already loaded this block. Release the buffer we
-      // allocated since it won't be used, then pin the existing entry.
+      // Defensive branch: in practice this path should never be reached.
+      // set_block_acquired() is always called under block_mutexes_[block_id],
+      // and the caller (acquire_buffer) re-checks acquire_block() inside the
+      // same lock before invoking this function. Therefore, if we get here,
+      // ref_count must still be negative (unloaded). This branch is retained
+      // as a safety net in case the locking contract is violated in the future,
+      // e.g. if set_block_acquired is called from an unlocked context.
       if (entry.ref_count.compare_exchange_weak(
               current_count, current_count + 1, std::memory_order_acq_rel,
               std::memory_order_acquire)) {
@@ -145,14 +155,10 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
         return entry.buffer;
       }
     } else {
-      // Block is unloaded (ref_count < 0). Take ownership of buffer.
-      if (entry.ref_count.compare_exchange_weak(current_count, 1,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_acquire)) {
-        entry.buffer = buffer;
-        entry.load_count.fetch_add(1, std::memory_order_relaxed);
-        return entry.buffer;
-      }
+      entry.buffer = buffer;
+      entry.load_count.fetch_add(1, std::memory_order_relaxed);
+      entry.ref_count.store(1, std::memory_order_release);
+      return entry.buffer;
     }
   }
 }
@@ -189,7 +195,7 @@ int VecBufferPool::init(size_t /*pool_capacity*/, size_t block_size,
   size_t block_num = segment_count + 10;
   page_table_.init(block_num);
   block_mutexes_.reserve(block_num);
-  for (int i = 0; i < block_num; i++) {
+  for (size_t i = 0; i < block_num; i++) {
     block_mutexes_.emplace_back(std::make_unique<std::mutex>());
   }
   LOG_DEBUG("entry num: %zu", page_table_.entry_num());
@@ -271,6 +277,9 @@ void VecBufferPoolHandle::release_one(block_id_t block_id) {
 }
 
 void VecBufferPoolHandle::acquire_one(block_id_t block_id) {
+  // The caller must guarantee the block is already loaded before calling
+  // acquire_one(). The return value of acquire_block() is intentionally
+  // ignored here, as a null return would indicate a contract violation.
   pool_.page_table_.acquire_block(block_id);
 }
 
