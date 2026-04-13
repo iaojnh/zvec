@@ -129,10 +129,8 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       // cause unbounded spinning under high concurrency.
       // If the CAS fails, another thread has already advanced lru_version (to
       // at least this version), so the block is already queued in LRU.
-      version_t desired =
-          hot_entry.load_count.load(std::memory_order_relaxed);
-      version_t current =
-          hot_entry.lru_version.load(std::memory_order_relaxed);
+      version_t desired = hot_entry.load_count.load(std::memory_order_relaxed);
+      version_t current = hot_entry.lru_version.load(std::memory_order_relaxed);
       if (current != desired) {
         if (hot_entry.lru_version.compare_exchange_strong(
                 current, desired, std::memory_order_acq_rel,

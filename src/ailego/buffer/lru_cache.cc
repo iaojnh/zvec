@@ -74,7 +74,8 @@ bool LRUCache::recycle() {
       // Hold the shared lock across the eviction call to prevent
       // use-after-free if the VectorPageTable is concurrently destroyed.
       std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
-      if (valid_page_tables_.find(item.page_table) != valid_page_tables_.end()) {
+      if (valid_page_tables_.find(item.page_table) !=
+          valid_page_tables_.end()) {
         item.page_table->evict_block(item.vector_block.first);
       }
     } else {
