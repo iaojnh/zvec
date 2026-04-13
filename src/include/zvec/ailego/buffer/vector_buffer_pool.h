@@ -59,8 +59,8 @@ class VectorPageTable {
     LRUCache::get_instance().set_valid(this);
   }
   ~VectorPageTable() {
-    delete[] entries_;
     LRUCache::get_instance().set_invalid(this);
+    delete[] entries_;
   }
 
   void init(size_t entry_num);
@@ -123,7 +123,6 @@ class VecBufferPool {
  private:
   int fd_;
   size_t file_size_;
-  size_t pool_capacity_;
 
  public:
   VectorPageTable page_table_;

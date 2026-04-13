@@ -14,6 +14,7 @@
 
 #include <zvec/ailego/buffer/vector_buffer_pool.h>
 #include <zvec/core/framework/index_logger.h>
+#include <unistd.h>
 
 #if defined(_MSC_VER)
 #ifndef NOMINMAX
@@ -80,8 +81,9 @@ void VectorPageTable::release_block(block_id_t block_id) {
       LRUCache::BlockType block;
       block.page_table = this;
       block.vector_block.first = block_id;
-      block.vector_block.second = entry.load_count.load();
-      entry.lru_version = entry.load_count.load();
+      version_t v = entry.load_count.load(std::memory_order_relaxed);
+      block.vector_block.second = v;
+      entry.lru_version.store(v, std::memory_order_relaxed);
       LRUCache::get_instance().add_single_block(block, 0);
     } else {
       if (entry.lru_version.load(std::memory_order_relaxed) + 1 == entry.load_count.load(std::memory_order_relaxed)) {
@@ -122,17 +124,17 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       }
       while (true) {
         version_t current = hot_entry.lru_version.load(std::memory_order_relaxed);
-        version_t expected = hot_entry.load_count.load(std::memory_order_relaxed);
-        if (current == expected) {
+        version_t desired = hot_entry.load_count.load(std::memory_order_relaxed);
+        if (current == desired) {
           break;
         }
         if (hot_entry.lru_version.compare_exchange_weak(
-                current, expected, std::memory_order_acq_rel,
+                current, desired, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
           LRUCache::BlockType block;
           block.page_table = this;
           block.vector_block.first = evict_block_id;
-          block.vector_block.second = expected;
+          block.vector_block.second = desired;
           LRUCache::get_instance().add_single_block(block, 0);
         }
       }
