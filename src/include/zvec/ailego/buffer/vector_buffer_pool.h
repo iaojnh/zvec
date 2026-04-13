@@ -77,6 +77,13 @@ class VectorPageTable {
     return entry_num_;
   }
 
+  // Returns true if the block has no active references (ref_count <= 0).
+  // Used by VecBufferPool destructor to assert all handles are released.
+  bool is_released(block_id_t block_id) const {
+    assert(block_id < entry_num_);
+    return entries_[block_id].ref_count.load(std::memory_order_relaxed) <= 0;
+  }
+
   inline bool is_dead_block(LRUCache::BlockType block) const {
     Entry &entry = entries_[block.vector_block.first];
     return block.vector_block.second != entry.load_count.load();
@@ -96,8 +103,11 @@ class VecBufferPool {
 
   VecBufferPool(const std::string &filename);
   ~VecBufferPool() {
-    // Free any buffers still pinned in the page table
     for (size_t i = 0; i < page_table_.entry_num(); ++i) {
+      // A positive ref_count means a VecBufferPoolHandle is still alive,
+      // which is a contract violation: all handles must be destroyed before
+      // the pool itself is destroyed.
+      assert(page_table_.is_released(i));
       page_table_.evict_block(i);
     }
 #if defined(_MSC_VER)

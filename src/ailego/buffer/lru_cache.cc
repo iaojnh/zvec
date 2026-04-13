@@ -164,6 +164,7 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
   do {
     expected = used_size_.load();
     desired = expected - buffer_size;
+    assert(expected >= buffer_size);
   } while (!used_size_.compare_exchange_weak(expected, desired));
   ailego_free(buffer);
 }
@@ -173,6 +174,7 @@ void MemoryLimitPool::release_parquet(const size_t buffer_size) {
   do {
     expected = used_size_.load();
     desired = expected - buffer_size;
+    assert(expected >= buffer_size);
   } while (!used_size_.compare_exchange_weak(expected, desired));
 }
 

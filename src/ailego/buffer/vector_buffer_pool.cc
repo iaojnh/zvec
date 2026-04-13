@@ -106,7 +106,6 @@ char *VectorPageTable::evict_block(block_id_t block_id) {
     char *buffer = entry.buffer;
     if (buffer) {
       MemoryLimitPool::get_instance().release_buffer(buffer, entry.size);
-      entry.buffer = nullptr;
     }
     return buffer;
   } else {
@@ -118,7 +117,6 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
                                           size_t size) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
-  entry.size = size;
   if (MemoryLimitPool::get_instance().is_hot_level2()) {
     size_t evict_block_id = 0;
     while (evict_cache_.try_dequeue(evict_block_id)) {
@@ -126,15 +124,17 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       if (hot_entry.ref_count.load() != 0) {
         continue;
       }
-      while (true) {
-        version_t current =
-            hot_entry.lru_version.load(std::memory_order_relaxed);
-        version_t desired =
-            hot_entry.load_count.load(std::memory_order_relaxed);
-        if (current == desired) {
-          break;
-        }
-        if (hot_entry.lru_version.compare_exchange_weak(
+      // Snapshot load_count once. We only need to advance lru_version to this
+      // snapshot version; chasing subsequent increments is unnecessary and can
+      // cause unbounded spinning under high concurrency.
+      // If the CAS fails, another thread has already advanced lru_version (to
+      // at least this version), so the block is already queued in LRU.
+      version_t desired =
+          hot_entry.load_count.load(std::memory_order_relaxed);
+      version_t current =
+          hot_entry.lru_version.load(std::memory_order_relaxed);
+      if (current != desired) {
+        if (hot_entry.lru_version.compare_exchange_strong(
                 current, desired, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
           LRUCache::BlockType block;
@@ -164,6 +164,7 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       }
     } else {
       entry.buffer = buffer;
+      entry.size = size;
       entry.load_count.fetch_add(1, std::memory_order_relaxed);
       entry.ref_count.store(1, std::memory_order_release);
       return entry.buffer;
