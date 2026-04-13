@@ -14,7 +14,10 @@
 
 #include <zvec/ailego/buffer/vector_buffer_pool.h>
 #include <zvec/core/framework/index_logger.h>
+
+#if !defined(_MSC_VER)
 #include <unistd.h>
+#endif
 
 #if defined(_MSC_VER)
 #ifndef NOMINMAX
@@ -86,7 +89,8 @@ void VectorPageTable::release_block(block_id_t block_id) {
       entry.lru_version.store(v, std::memory_order_relaxed);
       LRUCache::get_instance().add_single_block(block, 0);
     } else {
-      if (entry.lru_version.load(std::memory_order_relaxed) + 1 == entry.load_count.load(std::memory_order_relaxed)) {
+      if (entry.lru_version.load(std::memory_order_relaxed) + 1 ==
+          entry.load_count.load(std::memory_order_relaxed)) {
         evict_cache_.enqueue(block_id);
       }
     }
@@ -117,14 +121,16 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
   entry.size = size;
   if (MemoryLimitPool::get_instance().is_hot_level2()) {
     size_t evict_block_id = 0;
-    while(evict_cache_.try_dequeue(evict_block_id)) {
+    while (evict_cache_.try_dequeue(evict_block_id)) {
       Entry &hot_entry = entries_[evict_block_id];
       if (hot_entry.ref_count.load() != 0) {
         continue;
       }
       while (true) {
-        version_t current = hot_entry.lru_version.load(std::memory_order_relaxed);
-        version_t desired = hot_entry.load_count.load(std::memory_order_relaxed);
+        version_t current =
+            hot_entry.lru_version.load(std::memory_order_relaxed);
+        version_t desired =
+            hot_entry.load_count.load(std::memory_order_relaxed);
         if (current == desired) {
           break;
         }

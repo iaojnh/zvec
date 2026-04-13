@@ -38,6 +38,17 @@ bool LRUCache::evict_single_block(BlockType &item) {
   return found;
 }
 
+bool LRUCache::is_valid_and_alive(const BlockType &item) {
+  std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
+  if (valid_page_tables_.find(item.page_table) == valid_page_tables_.end()) {
+    return false;
+  }
+  // is_dead_block accesses entries_ under the same shared lock, so the
+  // VectorPageTable destructor (which holds the unique lock via set_invalid)
+  // cannot free entries_ while this check is in progress.
+  return !item.page_table->is_dead_block(item);
+}
+
 bool LRUCache::evict_block(BlockType &item) {
   bool ok = false;
   do {
@@ -52,7 +63,7 @@ bool LRUCache::evict_block(BlockType &item) {
         continue;
       }
     }
-  } while (!is_valid(item.page_table) || item.page_table->is_dead_block(item));
+  } while (!is_valid_and_alive(item));
   return ok;
 }
 
@@ -60,7 +71,12 @@ bool LRUCache::recycle() {
   BlockType item;
   while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
     if (item.page_table) {
-      item.page_table->evict_block(item.vector_block.first);
+      // Hold the shared lock across the eviction call to prevent
+      // use-after-free if the VectorPageTable is concurrently destroyed.
+      std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
+      if (valid_page_tables_.find(item.page_table) != valid_page_tables_.end()) {
+        item.page_table->evict_block(item.vector_block.first);
+      }
     } else {
       ParquetBufferPool::get_instance().evict(item.parquet_buffer_block.first);
     }
@@ -99,8 +115,7 @@ void LRUCache::clear_dead_node() {
         if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
           live_blocks_queue.enqueue(item);
         }
-      } else if (is_valid(item.page_table) &&
-                 !item.page_table->is_dead_block(item)) {
+      } else if (is_valid_and_alive(item)) {
         live_blocks_queue.enqueue(item);
       }
     }

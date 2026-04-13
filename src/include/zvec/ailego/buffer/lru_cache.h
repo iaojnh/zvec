@@ -103,6 +103,11 @@ class LRUCache {
     valid_page_tables_.erase(page_table);
   }
 
+  // Atomically checks under the shared lock that the page table is still valid
+  // AND the block version has not been superseded, preventing TOCTOU races
+  // when a VectorPageTable is concurrently destroyed.
+  bool is_valid_and_alive(const BlockType &item);
+
   bool recycle();
 
  private:
