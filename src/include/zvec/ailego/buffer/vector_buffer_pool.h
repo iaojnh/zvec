@@ -63,13 +63,18 @@ class VectorPageTable {
     delete[] entries_;
   }
 
+  VectorPageTable(const VectorPageTable &) = delete;
+  VectorPageTable &operator=(const VectorPageTable &) = delete;
+  VectorPageTable(VectorPageTable &&) = delete;
+  VectorPageTable &operator=(VectorPageTable &&) = delete;
+
   void init(size_t entry_num);
 
   char *acquire_block(block_id_t block_id);
 
   void release_block(block_id_t block_id);
 
-  char *evict_block(block_id_t block_id);
+  void evict_block(block_id_t block_id);
 
   char *set_block_acquired(block_id_t block_id, char *buffer, size_t size);
 

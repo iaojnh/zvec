@@ -52,7 +52,7 @@ bool LRUCache::is_valid_and_alive(const BlockType &item) {
 bool LRUCache::evict_block(BlockType &item) {
   bool ok = false;
   do {
-    ok = LRUCache::get_instance().evict_single_block(item);
+    ok = evict_single_block(item);
     if (!ok) {
       return false;
     }
@@ -67,7 +67,7 @@ bool LRUCache::evict_block(BlockType &item) {
   return ok;
 }
 
-bool LRUCache::recycle() {
+void LRUCache::recycle() {
   BlockType item;
   while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
     if (item.page_table) {
@@ -82,7 +82,6 @@ bool LRUCache::recycle() {
       ParquetBufferPool::get_instance().evict(item.parquet_buffer_block.first);
     }
   }
-  return MemoryLimitPool::get_instance().is_full();
 }
 
 bool LRUCache::add_single_block(const BlockType &block, int queue_index) {

@@ -108,7 +108,7 @@ class LRUCache {
   // when a VectorPageTable is concurrently destroyed.
   bool is_valid_and_alive(const BlockType &item);
 
-  bool recycle();
+  void recycle();
 
  private:
   LRUCache() {
@@ -145,8 +145,6 @@ class MemoryLimitPool {
   void release_parquet(const size_t buffer_size);
 
   bool is_full();
-
-  bool is_hot();
 
   bool is_hot_level1();
 

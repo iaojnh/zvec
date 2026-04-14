@@ -89,6 +89,11 @@ void VectorPageTable::release_block(block_id_t block_id) {
       entry.lru_version.store(v, std::memory_order_relaxed);
       LRUCache::get_instance().add_single_block(block, 0);
     } else {
+      // Two separate relaxed loads: a concurrent acquire_block may increment
+      // load_count between the two reads, making the condition transiently
+      // false (missed enqueue). This is benign: the block will satisfy the
+      // condition again on the next release cycle, and hot_level1 pressure
+      // will add it to LRU directly regardless.
       if (entry.lru_version.load(std::memory_order_relaxed) + 1 ==
           entry.load_count.load(std::memory_order_relaxed)) {
         evict_cache_.enqueue(block_id);
@@ -97,19 +102,17 @@ void VectorPageTable::release_block(block_id_t block_id) {
   }
 }
 
-char *VectorPageTable::evict_block(block_id_t block_id) {
+void VectorPageTable::evict_block(block_id_t block_id) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
+  char *buffer = entry.buffer;
+  size_t size = entry.size;
   int expected = 0;
   if (entry.ref_count.compare_exchange_strong(
           expected, std::numeric_limits<int>::min())) {
-    char *buffer = entry.buffer;
     if (buffer) {
-      MemoryLimitPool::get_instance().release_buffer(buffer, entry.size);
+      MemoryLimitPool::get_instance().release_buffer(buffer, size);
     }
-    return buffer;
-  } else {
-    return nullptr;
   }
 }
 
@@ -201,6 +204,7 @@ int VecBufferPool::init(size_t /*pool_capacity*/, size_t block_size,
   }
   size_t block_num = segment_count + 10;
   page_table_.init(block_num);
+  block_mutexes_.clear();
   block_mutexes_.reserve(block_num);
   for (size_t i = 0; i < block_num; i++) {
     block_mutexes_.emplace_back(std::make_unique<std::mutex>());
@@ -215,6 +219,7 @@ VecBufferPoolHandle VecBufferPool::get_handle() {
 
 char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
                                     size_t size, int retry) {
+  assert(block_id < block_mutexes_.size());
   char *buffer = page_table_.acquire_block(block_id);
   if (buffer) {
     return buffer;
