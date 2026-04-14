@@ -19,7 +19,7 @@
 #include <arrow/result.h>
 #include <arrow/table.h>
 #include <parquet/arrow/reader.h>
-#include <zvec/ailego/buffer/parquet_buffer_pool.h>
+#include <zvec/ailego/buffer/parquet_hash_table.h>
 
 namespace zvec {
 namespace ailego {

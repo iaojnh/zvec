@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <zvec/ailego/buffer/vector_buffer_pool.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/core/framework/index_logger.h>
 
 #if !defined(_MSC_VER)

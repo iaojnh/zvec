@@ -14,7 +14,7 @@
 
 #include <algorithm>
 #include <mutex>
-#include <zvec/ailego/buffer/vector_buffer_pool.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>

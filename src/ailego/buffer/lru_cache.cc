@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <zvec/ailego/buffer/parquet_buffer_pool.h>
-#include <zvec/ailego/buffer/vector_buffer_pool.h>
+#include <zvec/ailego/buffer/parquet_hash_table.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/core/framework/index_logger.h>
 
 namespace zvec {

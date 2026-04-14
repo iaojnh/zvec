@@ -22,7 +22,7 @@
 #include <arrow/status.h>
 #include <parquet/arrow/reader.h>
 #include <zvec/ailego/buffer/buffer_manager.h>
-#include <zvec/ailego/buffer/parquet_buffer_pool.h>
+#include <zvec/ailego/buffer/parquet_hash_table.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/index/storage/store_helper.h"
 #include "lazy_record_batch_reader.h"
