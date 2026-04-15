@@ -62,6 +62,9 @@ int main(int argc, char **argv) {
   // Parse arguments
   if (!ParseArgs(argc, argv, config)) {
     PrintUsage(argv[0]);
+#ifdef __ANDROID__
+    _exit(1);
+#endif
     return 1;
   }
 
@@ -79,15 +82,21 @@ int main(int argc, char **argv) {
   std::cout << "  Path:        " << config.path << std::endl;
   std::cout << std::endl;
 
-  auto result =
-      zvec::Collection::Open(config.path, zvec::CollectionOptions{false, true});
-  if (!result) {
-    LOG_ERROR("Failed to open collection[%s]: %s", config.path.c_str(),
-              result.error().c_str());
-    return -1;
+  // Scope 'result' so its shared_ptr is released before we call _exit().
+  zvec::Collection::Ptr collection;
+  {
+    auto result =
+        zvec::Collection::Open(config.path, zvec::CollectionOptions{false, true});
+    if (!result) {
+      LOG_ERROR("Failed to open collection[%s]: %s", config.path.c_str(),
+                result.error().c_str());
+#ifdef __ANDROID__
+      _exit(1);
+#endif
+      return -1;
+    }
+    collection = result.value();
   }
-
-  auto collection = result.value();
   std::cout << "Collection[" << config.path.c_str() << "] opened successfully"
             << std::endl;
 
@@ -101,9 +110,30 @@ int main(int argc, char **argv) {
     // Print final stats
     std::cout << "Final stats: " << collection->Stats()->to_string_formatted()
               << std::endl;
+#ifdef __ANDROID__
+    // On Android with c++_static STL, static destructors of glog/gflags
+    // crash during process teardown.  Use _exit() to skip them.
+    collection->Flush();
+    collection.reset();
+    sync();
+    std::cout.flush();
+    std::cerr.flush();
+    fflush(stdout);
+    fflush(stderr);
+    _exit(0);
+#endif
     return 0;
   } else {
     std::cout << "Optimize failed: " << s.message() << std::endl;
+#ifdef __ANDROID__
+    collection.reset();
+    sync();
+    std::cout.flush();
+    std::cerr.flush();
+    fflush(stdout);
+    fflush(stderr);
+    _exit(1);
+#endif
     return 1;
   }
 }
