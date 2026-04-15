@@ -129,6 +129,7 @@ int MemoryLimitPool::init(size_t pool_size) {
   pool_size_ = 0;
   LRUCache::get_instance().recycle();
   pool_size_ = pool_size;
+  LOG_INFO("MemoryLimitPool initialized with pool size: %lu", pool_size_);
   return 0;
 }
 
@@ -138,7 +139,6 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
   do {
     expected = used_size_.load();
     if (expected >= pool_size_) {
-      // LOG_ERROR("expected: %lu, pool_size: %lu", expected, pool_size_);
       return false;
     }
     desired = expected + buffer_size;
