@@ -168,7 +168,7 @@ int HnswStreamerBenchEntity::update_neighbors(
   return 0;
 }
 
-const Neighbors HnswStreamerBenchEntity::get_neighbors(level_t level,
+const Neighbors HnswStreamerBenchEntity::get_neighbors_old(level_t level,
                                                        node_id_t id) const {
   Chunk *chunk = nullptr;
   size_t offset = 0UL;
@@ -198,10 +198,10 @@ const Neighbors HnswStreamerBenchEntity::get_neighbors(level_t level,
   return Neighbors(neighbor_block);
 }
 
-const Neighbors HnswStreamerBenchEntity::get_neighbors_new(level_t level,
+const Neighbors HnswStreamerBenchEntity::get_neighbors(level_t level,
                                                            node_id_t id) const {
   if (id) {
-    return get_neighbors(level, id);
+    return get_neighbors_old(level, id);
   } else {
     const void *src = neighbors_value_ptr_->data() + id * neighbor_size_;
     const NeighborsHeader *header =
@@ -211,7 +211,7 @@ const Neighbors HnswStreamerBenchEntity::get_neighbors_new(level_t level,
 }
 
 //! Get vector data by key
-const void *HnswStreamerBenchEntity::get_vector(node_id_t id) const {
+const void *HnswStreamerBenchEntity::get_vector_old(node_id_t id) const {
   auto loc = get_vector_chunk_loc(id);
   const void *vec = nullptr;
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
@@ -229,12 +229,12 @@ const void *HnswStreamerBenchEntity::get_vector(node_id_t id) const {
   return vec;
 }
 
-const void *HnswStreamerBenchEntity::get_vector_new(node_id_t id) const {
+const void *HnswStreamerBenchEntity::get_vector(node_id_t id) const {
   return vector_value_ptr_->data() + vector_size() * id;
-  // return get_vector(id);
+  // return get_vector_old(id);
 }
 
-int HnswStreamerBenchEntity::get_vector(const node_id_t *ids, uint32_t count,
+int HnswStreamerBenchEntity::get_vector_old(const node_id_t *ids, uint32_t count,
                                         const void **vecs) const {
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
@@ -254,7 +254,7 @@ int HnswStreamerBenchEntity::get_vector(const node_id_t *ids, uint32_t count,
   return 0;
 }
 
-int HnswStreamerBenchEntity::get_vector(
+int HnswStreamerBenchEntity::get_vector_old(
     const node_id_t id, IndexStorage::MemoryBlock &block) const {
   auto loc = get_vector_chunk_loc(id);
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
@@ -272,15 +272,15 @@ int HnswStreamerBenchEntity::get_vector(
   return 0;
 }
 
-int HnswStreamerBenchEntity::get_vector_new(
+int HnswStreamerBenchEntity::get_vector(
     const node_id_t id, IndexStorage::MemoryBlock &block) const {
   const void *data = vector_value_ptr_->data() + vector_size() * id;
   block.reset((void *)data);
   return 0;
-  // return get_vector(id, block);
+  // return get_vector_old(id, block);
 }
 
-int HnswStreamerBenchEntity::get_vector_new(
+int HnswStreamerBenchEntity::get_vector(
     const node_id_t *ids, uint32_t count,
     std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
   vec_blocks.reserve(count);
@@ -289,10 +289,10 @@ int HnswStreamerBenchEntity::get_vector_new(
     vec_blocks.emplace_back((void *)data);
   }
   return 0;
-  // return get_vector(ids, count, vec_blocks);
+  // return get_vector_old(ids, count, vec_blocks);
 }
 
-int HnswStreamerBenchEntity::get_vector(
+int HnswStreamerBenchEntity::get_vector_old(
     const node_id_t *ids, uint32_t count,
     std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
@@ -487,13 +487,13 @@ int HnswStreamerBenchEntity::open(IndexStorage::Pointer stg,
   vector_value_ptr_ = std::make_shared<std::string>();
   vector_value_ptr_->reserve(vector_size() * doc_cnt());
   for (int i = 0; i < doc_cnt(); i++) {
-    vector_value_ptr_->append((const char *)get_vector(i), vector_size());
+    vector_value_ptr_->append((const char *)get_vector_old(i), vector_size());
   }
 
   neighbors_value_ptr_ = std::make_shared<std::string>();
   neighbors_value_ptr_->reserve(neighbor_size_ * doc_cnt());
   for (int i = 0; i < doc_cnt(); i++) {
-    Neighbors neighbor = get_neighbors(0, i);
+    Neighbors neighbor = get_neighbors_old(0, i);
     neighbors_value_ptr_->append((const char *)neighbor.neighbor_block.data(),
                                  neighbor_size_);
   }
@@ -932,7 +932,7 @@ int64_t HnswStreamerBenchEntity::dump_vectors(
 
   //! dump vectors
   for (node_id_t id = 0; id < doc_cnt(); ++id) {
-    data = get_vector(reorder_mapping.empty() ? id : reorder_mapping[id]);
+    data = get_vector_old(reorder_mapping.empty() ? id : reorder_mapping[id]);
     if (ailego_unlikely(!data)) {
       return IndexError_ReadData;
     }
@@ -984,7 +984,7 @@ int64_t HnswStreamerBenchEntity::dump_graph_neighbors(
 
   for (node_id_t id = 0; id < doc_cnt(); ++id) {
     const Neighbors neighbors =
-        get_neighbors(0, reorder_mapping.empty() ? id : reorder_mapping[id]);
+        get_neighbors_old(0, reorder_mapping.empty() ? id : reorder_mapping[id]);
     ailego_assert_with(!!neighbors.data, "invalid neighbors");
     ailego_assert_with(neighbors.size() <= l0_neighbor_cnt(),
                        "invalid neighbors");
@@ -1066,7 +1066,7 @@ int64_t HnswStreamerBenchEntity::dump_upper_neighbors(
     hnsw_meta.emplace_back(offset, level);
     ailego_assert_with((size_t)level < kMaxGraphLayers, "invalid level");
     for (level_t cur_level = 1; cur_level <= level; ++cur_level) {
-      const Neighbors neighbors = get_neighbors(cur_level, new_id);
+      const Neighbors neighbors = get_neighbors_old(cur_level, new_id);
       ailego_assert_with(!!neighbors.data, "invalid neighbors");
       ailego_assert_with(neighbors.size() <= neighbor_cnt(cur_level),
                          "invalid neighbors");

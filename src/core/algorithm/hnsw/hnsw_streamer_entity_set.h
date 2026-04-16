@@ -81,61 +81,23 @@ class HnswStreamerEntitySet {
 
   const void *get_vector(node_id_t id) const {
     return std::visit(
-        [&](const auto &e) -> const void * {
-          using T = std::decay_t<decltype(e)>;
-          if constexpr (std::is_same_v<T, std::unique_ptr<HnswStreamerEntity>>) {
-            return e->get_vector(id);
-          } else {
-            return e->get_vector_new(id);
-          }
-        },
-        entity_);
-  }
-
-  int get_vector(const node_id_t *ids, uint32_t count,
-                 const void **vecs) const {
-    return std::visit(
-        [&](const auto &e) { return e->get_vector(ids, count, vecs); }, entity_);
+        [&](const auto &e) { return e->get_vector(id); }, entity_);
   }
 
   int get_vector(const node_id_t id, IndexStorage::MemoryBlock &block) const {
     return std::visit(
-        [&](const auto &e) -> int {
-          using T = std::decay_t<decltype(e)>;
-          if constexpr (std::is_same_v<T, std::unique_ptr<HnswStreamerEntity>>) {
-            return e->get_vector(id, block);
-          } else {
-            return e->get_vector_new(id, block);
-          }
-        },
-        entity_);
+        [&](const auto &e) { return e->get_vector(id, block); }, entity_);
   }
 
   int get_vector(const node_id_t *ids, uint32_t count,
                  std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
     return std::visit(
-        [&](const auto &e) -> int {
-          using T = std::decay_t<decltype(e)>;
-          if constexpr (std::is_same_v<T, std::unique_ptr<HnswStreamerEntity>>) {
-            return e->get_vector(ids, count, vec_blocks);
-          } else {
-            return e->get_vector_new(ids, count, vec_blocks);
-          }
-        },
-        entity_);
+        [&](const auto &e) { return e->get_vector(ids, count, vec_blocks); }, entity_);
   }
 
   const Neighbors get_neighbors(level_t level, node_id_t id) const {
     return std::visit(
-        [&](const auto &e) -> Neighbors {
-          using T = std::decay_t<decltype(e)>;
-          if constexpr (std::is_same_v<T, std::unique_ptr<HnswStreamerEntity>>) {
-            return e->get_neighbors(level, id);
-          } else {
-            return e->get_neighbors_new(level, id);
-          }
-        },
-        entity_);
+        [&](const auto &e) { return e->get_neighbors(level, id); }, entity_);
   }
 
   int add_vector(level_t level, key_t key, const void *vec, node_id_t *id) {

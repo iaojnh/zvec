@@ -47,29 +47,29 @@ class HnswStreamerBenchEntity {
   key_t get_key(node_id_t id) const;
 
   //! Get vector feature data by key
+  const void *get_vector_old(node_id_t id) const;
+
   const void *get_vector(node_id_t id) const;
 
-  const void *get_vector_new(node_id_t id) const;
-
   //! Get vectors feature data by local ids
-  int get_vector(const node_id_t *ids, uint32_t count, const void **vecs) const;
+  int get_vector_old(const node_id_t *ids, uint32_t count, const void **vecs) const;
 
-  int get_vector(const node_id_t id, IndexStorage::MemoryBlock &block) const;
+  int get_vector_old(const node_id_t id, IndexStorage::MemoryBlock &block) const;
 
-  int get_vector(const node_id_t *ids, uint32_t count,
+  int get_vector_old(const node_id_t *ids, uint32_t count,
                  std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
 
-  int get_vector_new(const node_id_t id,
+  int get_vector(const node_id_t id,
                      IndexStorage::MemoryBlock &block) const;
 
-  int get_vector_new(const node_id_t *ids, uint32_t count,
+  int get_vector(const node_id_t *ids, uint32_t count,
                      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
 
   //! Get the node id's neighbors on graph level
   //! Note: the neighbors cannot be modified, using the following
   //! method to get WritableNeighbors if want to
+  const Neighbors get_neighbors_old(level_t level, node_id_t id) const;
   const Neighbors get_neighbors(level_t level, node_id_t id) const;
-  const Neighbors get_neighbors_new(level_t level, node_id_t id) const;
 
   //! Add vector and key to hnsw entity, and local id will be saved in id
   int add_vector(level_t level, key_t key, const void *vec, node_id_t *id);
@@ -93,14 +93,14 @@ class HnswStreamerBenchEntity {
 
   const void *get_vector_by_key(key_t key) const {
     auto id = get_id(key);
-    return id == kInvalidNodeId ? nullptr : get_vector(id);
+    return id == kInvalidNodeId ? nullptr : get_vector_old(id);
   }
 
   int get_vector_by_key(const key_t key,
                         IndexStorage::MemoryBlock &block) const {
     auto id = get_id(key);
     if (id != kInvalidNodeId) {
-      return get_vector(id, block);
+      return get_vector_old(id, block);
     } else {
       return IndexError_InvalidArgument;
     }
