@@ -1274,7 +1274,18 @@ function(_find_gtest)
   else()
     # Find gtest using target names
     set(FIND_GTEST_INCS "" CACHE STRING "GTest includes")
-    set(FIND_GTEST_LIBS "gtest;gtest_main" CACHE STRING "GTest libraries")
+    if(ANDROID)
+      # On Android, use a custom main that calls _exit() to skip static
+      # destructors and avoid glog/gflags teardown crashes.
+      if(NOT TARGET zvec_gtest_main)
+        add_library(zvec_gtest_main STATIC
+          ${PROJECT_ROOT_DIR}/tests/android_gtest_main.cc)
+        target_link_libraries(zvec_gtest_main PUBLIC gtest)
+      endif()
+      set(FIND_GTEST_LIBS "gtest;zvec_gtest_main" CACHE STRING "GTest libraries")
+    else()
+      set(FIND_GTEST_LIBS "gtest;gtest_main" CACHE STRING "GTest libraries")
+    endif()
   endif()
 endfunction()
 
@@ -1321,7 +1332,18 @@ function(_find_gmock)
   else()
     # Find gmock using target names
     set(FIND_GMOCK_INCS "" CACHE STRING "GMock includes")
-    set(FIND_GMOCK_LIBS "gmock;gmock_main" CACHE STRING "GMock libraries")
+    if(ANDROID)
+      # On Android, use a custom main that calls _exit() to skip static
+      # destructors and avoid glog/gflags teardown crashes.
+      if(NOT TARGET zvec_gmock_main)
+        add_library(zvec_gmock_main STATIC
+          ${PROJECT_ROOT_DIR}/tests/android_gmock_main.cc)
+        target_link_libraries(zvec_gmock_main PUBLIC gmock gtest)
+      endif()
+      set(FIND_GMOCK_LIBS "gmock;zvec_gmock_main" CACHE STRING "GMock libraries")
+    else()
+      set(FIND_GMOCK_LIBS "gmock;gmock_main" CACHE STRING "GMock libraries")
+    endif()
   endif()
 endfunction()
 
