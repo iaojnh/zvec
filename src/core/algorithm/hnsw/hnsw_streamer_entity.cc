@@ -197,14 +197,15 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
 
 const Neighbors HnswStreamerEntity::get_neighbors_new(level_t level,
                                                          node_id_t id) const {
-  if (id) {
-    return get_neighbors(level, id);
-  } else {
-    const void *src = neighbors_value_ptr_->data() + id * neighbor_size_;
-    const NeighborsHeader *header =
-        reinterpret_cast<const NeighborsHeader *>(src);
-    return Neighbors(header->neighbor_cnt, header->neighbors);
-  }
+  // if (id) {
+  //   return get_neighbors(level, id);
+  // } else {
+  //   const void *src = neighbors_value_ptr_->data() + id * neighbor_size_;
+  //   const NeighborsHeader *header =
+  //       reinterpret_cast<const NeighborsHeader *>(src);
+  //   return Neighbors(header->neighbor_cnt, header->neighbors);
+  // }
+  return get_neighbors(level, id);
 }
 
 //! Get vector data by key
@@ -227,8 +228,8 @@ const void *HnswStreamerEntity::get_vector(node_id_t id) const {
 }
 
 const void *HnswStreamerEntity::get_vector_new(node_id_t id) const {
-  return vector_value_ptr_->data() + vector_size() * id;
-  // return get_vector(id);
+  // return vector_value_ptr_->data() + vector_size() * id;
+  return get_vector(id);
 }
 
 int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
@@ -271,22 +272,22 @@ int HnswStreamerEntity::get_vector(const node_id_t id,
 
 int HnswStreamerEntity::get_vector_new(
     const node_id_t id, IndexStorage::MemoryBlock &block) const {
-  const void *data = vector_value_ptr_->data() + vector_size() * id;
-  block.reset((void *)data);
-  return 0;
-  // return get_vector(id, block);
+  // const void *data = vector_value_ptr_->data() + vector_size() * id;
+  // block.reset((void *)data);
+  // return 0;
+  return get_vector(id, block);
 }
 
 int HnswStreamerEntity::get_vector_new(
     const node_id_t *ids, uint32_t count,
     std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
-  vec_blocks.reserve(count);
-  for (int i = 0; i < count; i++) {
-    const void *data = vector_value_ptr_->data() + vector_size() * ids[i];
-    vec_blocks.emplace_back((void *)data);
-  }
-  return 0;
-  // return get_vector(ids, count, vec_blocks);
+  // vec_blocks.reserve(count);
+  // for (int i = 0; i < count; i++) {
+  //   const void *data = vector_value_ptr_->data() + vector_size() * ids[i];
+  //   vec_blocks.emplace_back((void *)data);
+  // }
+  // return 0;
+  return get_vector(ids, count, vec_blocks);
 }
 
 int HnswStreamerEntity::get_vector(
