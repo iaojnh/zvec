@@ -21,8 +21,8 @@ namespace ailego {
 
 #if defined(__SSE__)
 //! Compute the Inner Product between p and q, and each Squared L2-Norm value
-float InnerProductAndSquaredNormSSE(const float *lhs, const float *rhs,
-                                    size_t size, float *sql, float *sqr) {
+float InnerProductAndSquaredNormFp32SSE(const float *lhs, const float *rhs,
+                                        size_t size, float *sql, float *sqr) {
   const float *last = lhs + size;
   const float *last_aligned = lhs + ((size >> 3) << 3);
 
@@ -96,27 +96,25 @@ float InnerProductAndSquaredNormSSE(const float *lhs, const float *rhs,
   return result;
 }
 
-float MipsEucldeanDistanceSphericalInjectionSSE(const float *lhs,
-                                                const float *rhs, size_t size,
-                                                float e2) {
+float MipsEuclideanDistanceSphericalInjectionFp32SSE(const float *lhs,
+                                                     const float *rhs,
+                                                     size_t size, float e2) {
   float u2{0.0f};
   float v2{0.0f};
   float sum{0.0f};
 
-  sum = InnerProductAndSquaredNormSSE(lhs, rhs, size, &u2, &v2);
+  sum = InnerProductAndSquaredNormFp32SSE(lhs, rhs, size, &u2, &v2);
 
   return ComputeSphericalInjection(sum, u2, v2, e2);
 }
 
-float MipsEucldeanDistanceRepeatedQuadraticInjectionSSE(const float *lhs,
-                                                        const float *rhs,
-                                                        size_t size, size_t m,
-                                                        float e2) {
+float MipsEuclideanDistanceRepeatedQuadraticInjectionFp32SSE(
+    const float *lhs, const float *rhs, size_t size, size_t m, float e2) {
   float u2{0.0f};
   float v2{0.0f};
   float sum{0.0f};
 
-  sum = InnerProductAndSquaredNormSSE(lhs, rhs, size, &u2, &v2);
+  sum = InnerProductAndSquaredNormFp32SSE(lhs, rhs, size, &u2, &v2);
 
   sum = e2 * (u2 + v2 - 2 * sum);
   u2 *= e2;
@@ -328,7 +326,7 @@ do_scalar:
                                              _mm_loadu_ps(val_start_2 + k)));
     }
 
-    float __attribute__((aligned(16))) tmp_res[4];
+    alignas(16) float tmp_res[4];
     _mm_store_ps(tmp_res, sum128);
     sum += (tmp_res[0] + tmp_res[1] + tmp_res[2] + tmp_res[3]);
   }
