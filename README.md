@@ -1,3 +1,7 @@
+<p align="right">
+  English | <a href="./README_CN.md">简体中文</a>
+</p>
+
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://zvec.oss-cn-hongkong.aliyuncs.com/logo/github_log_2.svg" />
@@ -30,12 +34,16 @@
 
 **Zvec** is an open-source, in-process vector database — lightweight, lightning-fast, and designed to embed directly into applications. Built on **Proxima** (Alibaba's battle-tested vector search engine), it delivers production-grade, low-latency, scalable similarity search with minimal setup.
 
-> [!IMPORTANT]
-> **🚀 v0.3.0 Released on April 3, 2026**
+> [!Important]
+> 🚀 **v0.3.1 (Apr 17, 2026)**
+> - Relaxed collection path restrictions and improved Windows path handling.
+> 
+> 🚀 **v0.3.0 (April 3, 2026)**
+>
 > - **New Platforms**: Initial **Windows (MSVC)** and **Android** support. Published official Windows **Python** and **Node.js** packages.
 > - **Efficiency**: **RabitQ** quantization and **CPU Auto-Dispatch** for optimized SIMD execution.
 > - **Ecosystem**: **C-API** for custom language bindings and **[MCP](https://github.com/zvec-ai/zvec-mcp-server) / [Skill](https://github.com/zvec-ai/zvec-agent-skills)** integration for AI Agents.
-> 
+>
 > 👉 [Read the Release Notes](https://github.com/alibaba/zvec/releases/tag/v0.3.0) | [View Roadmap 📍](https://github.com/alibaba/zvec/issues/309)
 
 ## 💫 Features
@@ -120,7 +128,7 @@ Stay updated and get support — scan or click:
 
 | 💬 DingTalk | 📱 WeChat | 🎮 Discord | X (Twitter) |
 | :---: | :---: | :---: | :---: |
-| <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/dingding.png" width="150" alt="DingTalk QR Code"/> | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/wechat.png?v=4" width="150" alt="WeChat QR Code"/> | [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/rKddFBBu9z) | [![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ZvecAI)](<https://x.com/ZvecAI>) |
+| <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/dingding.png" width="150" alt="DingTalk QR Code"/> | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/wechat.png?v=5" width="150" alt="WeChat QR Code"/> | [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/rKddFBBu9z) | [![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ZvecAI)](<https://x.com/ZvecAI>) |
 | Scan to join | Scan to join | Click to join | Click to follow |
 
 </div>
