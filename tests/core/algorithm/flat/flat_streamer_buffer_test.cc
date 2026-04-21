@@ -170,6 +170,9 @@ TEST_F(FlatStreamerTest, TestLinearSearch) {
 
 TEST_F(FlatStreamerTest, TestLinearSearchWithLRU) {
   MemoryLimitPool::get_instance().init(100 * 1024UL * 1024UL);
+#ifdef __ANDROID__
+  GTEST_SKIP() << "Skipped on Android: requires ~6GB memory/disk (emulator limit)";
+#endif
   constexpr size_t static dim = 1600;
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("FlatStreamer");
