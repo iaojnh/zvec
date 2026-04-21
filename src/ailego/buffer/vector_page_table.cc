@@ -24,18 +24,6 @@
 #define NOMINMAX
 #endif
 #include <Windows.h>
-static ssize_t zvec_pread(int fd, void *buf, size_t count, size_t offset) {
-  HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-  if (handle == INVALID_HANDLE_VALUE) return -1;
-  OVERLAPPED ov = {};
-  ov.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
-  ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
-  DWORD bytes_read = 0;
-  if (!ReadFile(handle, buf, static_cast<DWORD>(count), &bytes_read, &ov)) {
-    return -1;
-  }
-  return static_cast<ssize_t>(bytes_read);
-}
 #endif
 
 namespace zvec {
@@ -111,6 +99,7 @@ void VectorPageTable::evict_block(block_id_t block_id) {
   if (entry.ref_count.compare_exchange_strong(
           expected, std::numeric_limits<int>::min())) {
     if (buffer) {
+      madvise(buffer, size, MADV_DONTNEED);
       MemoryLimitPool::get_instance().release_buffer(buffer, size);
     }
   }
@@ -160,6 +149,7 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       if (entry.ref_count.compare_exchange_weak(
               current_count, current_count + 1, std::memory_order_acq_rel,
               std::memory_order_acquire)) {
+        madvise(buffer, size, MADV_DONTNEED);
         MemoryLimitPool::get_instance().release_buffer(buffer, size);
         return entry.buffer;
       }
@@ -186,14 +176,42 @@ VecBufferPool::VecBufferPool(const std::string &filename) {
   struct _stat64 st;
   if (_fstat64(fd_, &st) < 0) {
     _close(fd_);
+    throw std::runtime_error("Failed to stat file: " + filename);
+  }
+  file_size_ = st.st_size;
+  if (file_size_ > 0) {
+    HANDLE file_handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
+    HANDLE mapping_handle =
+        CreateFileMapping(file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (mapping_handle == NULL) {
+      _close(fd_);
+      throw std::runtime_error("Failed to create file mapping: " + filename);
+    }
+    mmap_addr_ =
+        reinterpret_cast<char *>(MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0));
+    CloseHandle(mapping_handle);
+    if (!mmap_addr_) {
+      _close(fd_);
+      throw std::runtime_error("Failed to map view of file: " + filename);
+    }
+  }
 #else
   struct stat st;
   if (fstat(fd_, &st) < 0) {
     ::close(fd_);
-#endif
     throw std::runtime_error("Failed to stat file: " + filename);
   }
   file_size_ = st.st_size;
+  if (file_size_ > 0) {
+    mmap_addr_ = reinterpret_cast<char *>(
+        mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0));
+    if (mmap_addr_ == MAP_FAILED) {
+      mmap_addr_ = nullptr;
+      ::close(fd_);
+      throw std::runtime_error("Failed to mmap file: " + filename);
+    }
+  }
+#endif
 }
 
 int VecBufferPool::init(size_t /*pool_capacity*/, size_t block_size,
@@ -248,29 +266,23 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
     }
   }
 
-#if defined(_MSC_VER)
-  ssize_t read_bytes = zvec_pread(fd_, buffer, size, offset);
-#else
-  ssize_t read_bytes = pread(fd_, buffer, size, offset);
-#endif
-  if (read_bytes != static_cast<ssize_t>(size)) {
-    LOG_ERROR("Buffer pool failed to read file at offset: %zu", offset);
+  if (!mmap_addr_) {
+    LOG_ERROR("Buffer pool mmap region is not available");
+    madvise(buffer, size, MADV_DONTNEED);
     MemoryLimitPool::get_instance().release_buffer(buffer, size);
     return nullptr;
   }
+  buffer = mmap_addr_ + offset;
+  // memcpy(buffer, mmap_addr_ + offset, size);
   return page_table_.set_block_acquired(block_id, buffer, size);
 }
 
 int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
-#if defined(_MSC_VER)
-  ssize_t read_bytes = zvec_pread(fd_, buffer, length, offset);
-#else
-  ssize_t read_bytes = pread(fd_, buffer, length, offset);
-#endif
-  if (read_bytes != static_cast<ssize_t>(length)) {
-    LOG_ERROR("Buffer pool failed to read file at offset: %zu", offset);
+  if (!mmap_addr_) {
+    LOG_ERROR("Buffer pool mmap region is not available");
     return -1;
   }
+  memcpy(buffer, mmap_addr_ + offset, length);
   return 0;
 }
 

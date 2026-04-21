@@ -37,6 +37,8 @@
 
 #if defined(_MSC_VER)
 #include <io.h>
+#else
+#include <sys/mman.h>
 #endif
 
 namespace zvec {
@@ -116,8 +118,14 @@ class VecBufferPool {
       page_table_.evict_block(i);
     }
 #if defined(_MSC_VER)
+    if (mmap_addr_) {
+      UnmapViewOfFile(mmap_addr_);
+    }
     _close(fd_);
 #else
+    if (mmap_addr_) {
+      munmap(mmap_addr_, file_size_);
+    }
     close(fd_);
 #endif
   }
@@ -138,6 +146,7 @@ class VecBufferPool {
  private:
   int fd_;
   size_t file_size_;
+  char *mmap_addr_{nullptr};
 
  public:
   VectorPageTable page_table_;
