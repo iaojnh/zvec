@@ -99,6 +99,7 @@ void VectorPageTable::evict_block(block_id_t block_id) {
   if (entry.ref_count.compare_exchange_strong(
           expected, std::numeric_limits<int>::min())) {
     if (buffer) {
+      munlock(buffer, size);  
       madvise(buffer, size, MADV_DONTNEED);
       MemoryLimitPool::get_instance().release_buffer(buffer, size);
     }
@@ -149,6 +150,7 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       if (entry.ref_count.compare_exchange_weak(
               current_count, current_count + 1, std::memory_order_acq_rel,
               std::memory_order_acquire)) {
+        munlock(buffer, size);
         madvise(buffer, size, MADV_DONTNEED);
         MemoryLimitPool::get_instance().release_buffer(buffer, size);
         return entry.buffer;
@@ -268,11 +270,13 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
 
   if (!mmap_addr_) {
     LOG_ERROR("Buffer pool mmap region is not available");
+    munlock(buffer, size);
     madvise(buffer, size, MADV_DONTNEED);
     MemoryLimitPool::get_instance().release_buffer(buffer, size);
     return nullptr;
   }
   buffer = mmap_addr_ + offset;
+  mlock(buffer, size);
   madvise(buffer, size, MADV_WILLNEED);
   // memcpy(buffer, mmap_addr_ + offset, size);
   return page_table_.set_block_acquired(block_id, buffer, size);
