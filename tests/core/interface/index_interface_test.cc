@@ -22,12 +22,12 @@
 #include "core/algorithm/hnsw_rabitq/rabitq_converter.h"
 #include "zvec/core/framework/index_provider.h"
 #endif
+#include <zvec/ailego/buffer/lru_cache.h>
 #include "zvec/ailego/buffer/buffer_manager.h"
 #include "zvec/core/interface/index.h"
 #include "zvec/core/interface/index_factory.h"
 #include "zvec/core/interface/index_param.h"
 #include "zvec/core/interface/index_param_builders.h"
-#include <zvec/ailego/buffer/lru_cache.h>
 
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic push
