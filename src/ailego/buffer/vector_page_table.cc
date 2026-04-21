@@ -273,6 +273,7 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
     return nullptr;
   }
   buffer = mmap_addr_ + offset;
+  madvise(buffer, size, MADV_WILLNEED);
   // memcpy(buffer, mmap_addr_ + offset, size);
   return page_table_.set_block_acquired(block_id, buffer, size);
 }
