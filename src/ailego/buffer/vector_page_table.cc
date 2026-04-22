@@ -274,12 +274,12 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
   }
   buffer = mmap_addr_ + offset;
   madvise(buffer, size, MADV_WILLNEED);
-  {
-    volatile const char *p = buffer;
-    for (size_t i = 0; i < size; i += 4096) {
-      (void)p[i];
-    }
-  }
+  // {
+  //   volatile const char *p = buffer;
+  //   for (size_t i = 0; i < size; i += 4096) {
+  //     (void)p[i];
+  //   }
+  // }
   return page_table_.set_block_acquired(block_id, buffer, size);
 }
 
