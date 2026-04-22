@@ -187,8 +187,8 @@ VecBufferPool::VecBufferPool(const std::string &filename) {
       _close(fd_);
       throw std::runtime_error("Failed to create file mapping: " + filename);
     }
-    mmap_addr_ =
-        reinterpret_cast<char *>(MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0));
+    mmap_addr_ = reinterpret_cast<char *>(
+        MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0));
     CloseHandle(mapping_handle);
     if (!mmap_addr_) {
       _close(fd_);
@@ -274,7 +274,12 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
   }
   buffer = mmap_addr_ + offset;
   madvise(buffer, size, MADV_WILLNEED);
-  // memcpy(buffer, mmap_addr_ + offset, size);
+  {
+    volatile const char *p = buffer;
+    for (size_t i = 0; i < size; i += 4096) {
+      (void)p[i];
+    }
+  }
   return page_table_.set_block_acquired(block_id, buffer, size);
 }
 
