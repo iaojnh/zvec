@@ -48,8 +48,11 @@ using version_t = size_t;
 class VectorPageTable {
   struct Entry {
     alignas(64) std::atomic<int> ref_count;
-    alignas(64) std::atomic<version_t> load_count;
-    alignas(64) std::atomic<version_t> lru_version;
+    // True when this block has been registered in the LRU queue and has not
+    // yet been evicted.  Used in release_block() to suppress duplicate
+    // insertions: once a block is in LRU we never push it again until it is
+    // evicted (which resets the flag).
+    alignas(64) std::atomic<bool> in_lru;
     char *buffer;
     size_t size;
   };
@@ -89,15 +92,25 @@ class VectorPageTable {
     return entries_[block_id].ref_count.load(std::memory_order_relaxed) <= 0;
   }
 
+  // Returns true if the block is no longer registered in the LRU (either it
+  // was never added, or it has already been evicted).  Used by LRUCache to
+  // detect stale queue entries.
   inline bool is_dead_block(LRUCache::BlockType block) const {
     Entry &entry = entries_[block.vector_block.first];
-    return block.vector_block.second != entry.load_count.load();
+    return !entry.in_lru.load(std::memory_order_relaxed);
+  }
+
+  // Returns true if the block currently has at least one active reference
+  // (ref_count > 0).  Called by LRUCache::recycle() to decide whether to
+  // evict or move the block to the tail of the queue.
+  bool is_referenced(block_id_t block_id) const {
+    assert(block_id < entry_num_);
+    return entries_[block_id].ref_count.load(std::memory_order_acquire) > 0;
   }
 
  private:
   size_t entry_num_{0};
   Entry *entries_{nullptr};
-  moodycamel::ConcurrentQueue<block_id_t> evict_cache_;
 };
 
 class VecBufferPoolHandle;

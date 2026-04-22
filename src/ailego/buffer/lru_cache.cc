@@ -76,7 +76,15 @@ void LRUCache::recycle() {
       std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
       if (valid_page_tables_.find(item.page_table) !=
           valid_page_tables_.end()) {
-        item.page_table->evict_block(item.vector_block.first);
+        if (item.page_table->is_referenced(item.vector_block.first)) {
+          // Block is still held by a caller; move it from the head to the
+          // tail of the queue so that other (unreferenced) blocks get a
+          // chance to be evicted first.
+          lock.unlock();
+          add_single_block(item, 0);
+        } else {
+          item.page_table->evict_block(item.vector_block.first);
+        }
       }
     } else {
       ParquetBufferPool::get_instance().evict(item.parquet_buffer_block.first);
