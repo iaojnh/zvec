@@ -24,7 +24,7 @@
 namespace zvec {
 namespace core {
 
-int ChunkBroker::init_storage(size_t chunk_size) {
+int ChunkBroker::init_storage(uint32_t chunk_size) {
   chunk_meta_.clear();
   chunk_meta_.chunk_size = chunk_size;
   chunk_meta_.create_time = ailego::Realtime::Seconds();
@@ -61,7 +61,7 @@ int ChunkBroker::init_storage(size_t chunk_size) {
   return 0;
 }
 
-int ChunkBroker::load_storage(size_t chunk_size) {
+int ChunkBroker::load_storage(uint32_t &chunk_size) {
   IndexStorage::MemoryBlock data_block;
   size_t size = chunk_meta_segment_->read(0UL, data_block,
                                           chunk_meta_segment_->data_size());
@@ -72,11 +72,7 @@ int ChunkBroker::load_storage(size_t chunk_size) {
   }
   std::memcpy(&chunk_meta_, data_block.data(), size);
   if (chunk_meta_.chunk_size != chunk_size) {
-    LOG_ERROR(
-        "Params hnsw chunk size=%zu mismatch from previous %zu "
-        "in index",
-        chunk_size, (size_t)chunk_meta_.chunk_size);
-    return IndexError_Mismatch;
+    chunk_size = chunk_meta_.chunk_size;
   }
 
   *stats_.mutable_check_point() = stg_->check_point();
@@ -103,7 +99,7 @@ int ChunkBroker::load_storage(size_t chunk_size) {
 }
 
 int ChunkBroker::open(IndexStorage::Pointer stg, size_t max_index_size,
-                      size_t chunk_size, bool check_crc) {
+                      uint32_t &chunk_size, bool check_crc) {
   if (ailego_unlikely(stg_)) {
     LOG_ERROR("An storage instance is already opened");
     return IndexError_Duplicate;

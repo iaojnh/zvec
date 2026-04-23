@@ -302,14 +302,14 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
   std::lock_guard<std::mutex> lock(mutex_);
   bool huge_page = stg->isHugePage();
   LOG_DEBUG("huge_page: %d", (int)huge_page);
-  int ret = init_chunk_params(max_index_size, huge_page);
-  if (ailego_unlikely(ret != 0)) {
-    LOG_ERROR("init_chunk_params failed for %s", IndexError::What(ret));
-    return ret;
-  }
-  ret = broker_->open(std::move(stg), max_index_size_, chunk_size_, check_crc);
+  int ret = broker_->open(std::move(stg), max_index_size_, chunk_size_, check_crc);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Open index failed for %s", IndexError::What(ret));
+    return ret;
+  }
+  ret = init_chunk_params(max_index_size, huge_page);
+  if (ailego_unlikely(ret != 0)) {
+    LOG_ERROR("init_chunk_params failed for %s", IndexError::What(ret));
     return ret;
   }
   ret = upper_neighbor_index_->init(broker_, upper_neighbor_chunk_size_,
