@@ -215,18 +215,17 @@ class HnswStreamerEntity : public HnswEntity {
   using NIHashMapPointer = std::shared_ptr<NIHashMap>;
 
   //! Private construct, only be called by clone method
-  HnswStreamerEntity(
-      IndexStreamer::Stats &stats, const HNSWHeader &hd, size_t chunk_size,
-      uint32_t node_index_mask_bits, uint32_t upper_neighbor_mask_bits,
-      bool filter_same_key, bool get_vector_enabled,
-      const NIHashMapPointer &upper_neighbor_index,
-      std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
-      const HashMapPointer<key_t, node_id_t> &keys_map, bool use_key_info_map,
-      std::vector<Chunk::Pointer> &&node_chunks,
-      std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
-      const ChunkBroker::Pointer &broker,
-      std::shared_ptr<std::vector<const uint8_t *>> node_chunk_raw_bases,
-      std::shared_ptr<std::vector<const uint8_t *>> upper_chunk_raw_bases)
+  HnswStreamerEntity(IndexStreamer::Stats &stats, const HNSWHeader &hd,
+                     size_t chunk_size, uint32_t node_index_mask_bits,
+                     uint32_t upper_neighbor_mask_bits, bool filter_same_key,
+                     bool get_vector_enabled,
+                     const NIHashMapPointer &upper_neighbor_index,
+                     std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
+                     const HashMapPointer<key_t, node_id_t> &keys_map,
+                     bool use_key_info_map,
+                     std::vector<Chunk::Pointer> &&node_chunks,
+                     std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
+                     const ChunkBroker::Pointer &broker)
       : stats_(stats),
         chunk_size_(chunk_size),
         node_index_mask_bits_(node_index_mask_bits),
@@ -242,8 +241,6 @@ class HnswStreamerEntity : public HnswEntity {
         keys_map_(keys_map),
         node_chunks_(std::move(node_chunks)),
         upper_neighbor_chunks_(std::move(upper_neighbor_chunks)),
-        node_chunk_raw_bases_(std::move(node_chunk_raw_bases)),
-        upper_chunk_raw_bases_(std::move(upper_chunk_raw_bases)),
         broker_(broker) {
     *mutable_header() = hd;
 
@@ -510,13 +507,6 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! upper neighbor chunk inlude: UpperNeighborHeader + (1~level) neighbors
   mutable std::vector<Chunk::Pointer> upper_neighbor_chunks_{};
-
-  //! Pre-computed raw mmap base pointers for fast node access.
-  //! Shared across all clones (read-only after open), eliminates virtual
-  //! dispatch and shared_ptr dereference on the hot search path.
-  mutable std::shared_ptr<std::vector<const uint8_t *>> node_chunk_raw_bases_{};
-  mutable std::shared_ptr<std::vector<const uint8_t *>>
-      upper_chunk_raw_bases_{};
 
   ChunkBroker::Pointer broker_{};  // chunk broker
 };
