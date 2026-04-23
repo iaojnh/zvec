@@ -96,8 +96,7 @@ int ChunkBroker::load_storage(uint32_t &chunk_size) {
   return 0;
 }
 
-int ChunkBroker::open(IndexStorage::Pointer stg, size_t max_index_size,
-                      uint32_t &chunk_size, bool check_crc) {
+int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size, bool check_crc) {
   if (ailego_unlikely(stg_)) {
     LOG_ERROR("An storage instance is already opened");
     return IndexError_Duplicate;
@@ -109,7 +108,6 @@ int ChunkBroker::open(IndexStorage::Pointer stg, size_t max_index_size,
     page_mask_ = ailego::MemoryHelper::PageSize() - 1;
   }
   check_crc_ = check_crc;
-  max_chunks_size_ = max_index_size;
   dirty_ = false;
 
   const std::string segment_id =
