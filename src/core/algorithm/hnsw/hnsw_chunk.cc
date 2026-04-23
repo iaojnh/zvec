@@ -71,9 +71,7 @@ int ChunkBroker::load_storage(uint32_t &chunk_size) {
     return IndexError_InvalidFormat;
   }
   std::memcpy(&chunk_meta_, data_block.data(), size);
-  if (chunk_meta_.chunk_size != chunk_size) {
-    chunk_size = chunk_meta_.chunk_size;
-  }
+  chunk_size = chunk_meta_.chunk_size;
 
   *stats_.mutable_check_point() = stg_->check_point();
   stats_.set_revision_id(chunk_meta_.revision_id);
