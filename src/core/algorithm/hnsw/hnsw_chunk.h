@@ -49,8 +49,8 @@ class ChunkBroker {
   ChunkBroker(IndexStreamer::Stats &stats) : stats_(stats) {}
 
   //! Open storage
-  int open(IndexStorage::Pointer stg, size_t max_index_size, uint32_t &chunk_size,
-           bool check_crc);
+  int open(IndexStorage::Pointer stg, size_t max_index_size,
+           uint32_t &chunk_size, bool check_crc);
 
   int close(void);
 

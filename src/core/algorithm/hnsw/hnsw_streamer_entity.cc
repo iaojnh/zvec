@@ -302,7 +302,8 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
   std::lock_guard<std::mutex> lock(mutex_);
   bool huge_page = stg->isHugePage();
   LOG_DEBUG("huge_page: %d", (int)huge_page);
-  int ret = broker_->open(std::move(stg), max_index_size_, chunk_size_, check_crc);
+  int ret =
+      broker_->open(std::move(stg), max_index_size_, chunk_size_, check_crc);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Open index failed for %s", IndexError::What(ret));
     return ret;
