@@ -250,7 +250,7 @@ int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
 
 char *VecBufferPoolHandle::get_block(size_t offset, size_t size,
                                      size_t block_id) {
-  char *buffer = pool_.acquire_buffer(block_id, offset, size, 5);
+  char *buffer = pool_.acquire_buffer(block_id, offset, size, 50);
   return buffer;
 }
 

@@ -76,15 +76,7 @@ void LRUCache::recycle() {
       std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
       if (valid_page_tables_.find(item.page_table) !=
           valid_page_tables_.end()) {
-        if (item.page_table->is_referenced(item.vector_block.first)) {
-          // Block is still held by a caller; move it from the head to the
-          // tail of the queue so that other (unreferenced) blocks get a
-          // chance to be evicted first.
-          lock.unlock();
-          add_single_block(item, 0);
-        } else {
-          item.page_table->evict_block(item.vector_block.first);
-        }
+        item.page_table->evict_block(item.vector_block.first);
       }
     } else {
       ParquetBufferPool::get_instance().evict(item.parquet_buffer_block.first);
@@ -98,40 +90,40 @@ bool LRUCache::add_single_block(const BlockType &block, int queue_index) {
     LOG_ERROR("enqueue failed.");
     return false;
   }
-  static thread_local int evict_queue_insertions = 0;
-  if (evict_queue_insertions++ > evict_batch_size_) {
-    this->clear_dead_node();
-    evict_queue_insertions = 0;
-  }
+  // static thread_local int evict_queue_insertions = 0;
+  // if (evict_queue_insertions++ > evict_batch_size_) {
+  //   this->clear_dead_node();
+  //   evict_queue_insertions = 0;
+  // }
   return true;
 }
 
-void LRUCache::clear_dead_node() {
-  for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
-    size_t clear_size = evict_batch_size_;
-    if (evict_queues_[i].size_approx() < evict_batch_size_) {
-      continue;
-    }
-    if (evict_queues_[i].size_approx() > evict_batch_size_ * 8) {
-      clear_size *= 2;
-    }
-    size_t clear_count = 0;
-    BlockType item;
-    ConcurrentQueue live_blocks_queue(evict_batch_size_ * 200);
-    while (evict_queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
-      if (item.page_table == nullptr) {
-        if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
-          live_blocks_queue.enqueue(item);
-        }
-      } else if (is_valid_and_alive(item)) {
-        live_blocks_queue.enqueue(item);
-      }
-    }
-    while (live_blocks_queue.try_dequeue(item)) {
-      evict_queues_[i].enqueue(item);
-    }
-  }
-}
+// void LRUCache::clear_dead_node() {
+//   for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
+//     size_t clear_size = evict_batch_size_;
+//     if (evict_queues_[i].size_approx() < evict_batch_size_) {
+//       continue;
+//     }
+//     if (evict_queues_[i].size_approx() > evict_batch_size_ * 8) {
+//       clear_size *= 2;
+//     }
+//     size_t clear_count = 0;
+//     BlockType item;
+//     ConcurrentQueue live_blocks_queue(evict_batch_size_ * 200);
+//     while (evict_queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
+//       if (item.page_table == nullptr) {
+//         if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
+//           live_blocks_queue.enqueue(item);
+//         }
+//       } else if (is_valid_and_alive(item)) {
+//         live_blocks_queue.enqueue(item);
+//       }
+//     }
+//     while (live_blocks_queue.try_dequeue(item)) {
+//       evict_queues_[i].enqueue(item);
+//     }
+//   }
+// }
 
 int MemoryLimitPool::init(size_t pool_size) {
   pool_size_ = 0;

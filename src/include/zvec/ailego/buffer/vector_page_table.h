@@ -100,14 +100,6 @@ class VectorPageTable {
     return !entry.in_lru.load(std::memory_order_relaxed);
   }
 
-  // Returns true if the block currently has at least one active reference
-  // (ref_count > 0).  Called by LRUCache::recycle() to decide whether to
-  // evict or move the block to the tail of the queue.
-  bool is_referenced(block_id_t block_id) const {
-    assert(block_id < entry_num_);
-    return entries_[block_id].ref_count.load(std::memory_order_acquire) > 0;
-  }
-
  private:
   size_t entry_num_{0};
   Entry *entries_{nullptr};
