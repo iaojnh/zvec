@@ -381,7 +381,7 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
     return ret;
   }
   broker_->set_max_chunks_size(max_index_size_);
-  
+
   ret = upper_neighbor_index_->init(broker_, upper_neighbor_chunk_size_,
                                     scaling_factor(), estimate_doc_capacity(),
                                     kUpperHashMemoryInflateRatio);
