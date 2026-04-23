@@ -96,7 +96,8 @@ int ChunkBroker::load_storage(uint32_t &chunk_size) {
   return 0;
 }
 
-int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size, bool check_crc) {
+int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size,
+                      bool check_crc) {
   if (ailego_unlikely(stg_)) {
     LOG_ERROR("An storage instance is already opened");
     return IndexError_Duplicate;
