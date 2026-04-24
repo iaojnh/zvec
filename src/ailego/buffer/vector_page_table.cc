@@ -49,8 +49,7 @@ void VectorPageTable::init(size_t entry_num) {
   entries_ = new Entry[entry_num_];
   for (size_t i = 0; i < entry_num_; i++) {
     entries_[i].ref_count.store(std::numeric_limits<int>::min());
-    entries_[i].load_count.store(0);
-    entries_[i].lru_version.store(0);
+    entries_[i].in_lru.store(false);
     entries_[i].buffer = nullptr;
   }
 }
@@ -66,9 +65,6 @@ char *VectorPageTable::acquire_block(block_id_t block_id) {
     if (entry.ref_count.compare_exchange_weak(current_count, current_count + 1,
                                               std::memory_order_acq_rel,
                                               std::memory_order_acquire)) {
-      if (current_count == 0) {
-        entry.load_count.fetch_add(1, std::memory_order_relaxed);
-      }
       return entry.buffer;
     }
   }
@@ -80,25 +76,19 @@ void VectorPageTable::release_block(block_id_t block_id) {
 
   if (entry.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
     std::atomic_thread_fence(std::memory_order_acquire);
-    if (MemoryLimitPool::get_instance().is_hot_level1()) {
+    // Attempt to transition in_lru from false -> true.  The CAS ensures only
+    // one thread enqueues this block even if multiple threads race here.
+    bool expected = false;
+    if (entry.in_lru.compare_exchange_strong(expected, true,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
       LRUCache::BlockType block;
       block.page_table = this;
       block.vector_block.first = block_id;
-      version_t v = entry.load_count.load(std::memory_order_relaxed);
-      block.vector_block.second = v;
-      entry.lru_version.store(v, std::memory_order_relaxed);
+      block.vector_block.second = 0;
       LRUCache::get_instance().add_single_block(block, 0);
-    } else {
-      // Two separate relaxed loads: a concurrent acquire_block may increment
-      // load_count between the two reads, making the condition transiently
-      // false (missed enqueue). This is benign: the block will satisfy the
-      // condition again on the next release cycle, and hot_level1 pressure
-      // will add it to LRU directly regardless.
-      if (entry.lru_version.load(std::memory_order_relaxed) + 1 ==
-          entry.load_count.load(std::memory_order_relaxed)) {
-        evict_cache_.enqueue(block_id);
-      }
     }
+    // else: block is already in the LRU queue; do not add a duplicate entry.
   }
 }
 
@@ -114,39 +104,18 @@ void VectorPageTable::evict_block(block_id_t block_id) {
       MemoryLimitPool::get_instance().release_buffer(buffer, size);
     }
   }
+  // Always reset in_lru regardless of whether the CAS succeeded:
+  //  - On success: the block is evicted; future releases should re-register it.
+  //  - On failure: the block was re-acquired by another thread between the
+  //    ref-count check and this call.  Clearing in_lru lets the next
+  //    release_block() re-enqueue it so it is not silently lost.
+  entry.in_lru.store(false, std::memory_order_relaxed);
 }
 
 char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
                                           size_t size) {
   assert(block_id < entry_num_);
   Entry &entry = entries_[block_id];
-  if (MemoryLimitPool::get_instance().is_hot_level2()) {
-    size_t evict_block_id = 0;
-    while (evict_cache_.try_dequeue(evict_block_id)) {
-      Entry &hot_entry = entries_[evict_block_id];
-      if (hot_entry.ref_count.load() != 0) {
-        continue;
-      }
-      // Snapshot load_count once. We only need to advance lru_version to this
-      // snapshot version; chasing subsequent increments is unnecessary and can
-      // cause unbounded spinning under high concurrency.
-      // If the CAS fails, another thread has already advanced lru_version (to
-      // at least this version), so the block is already queued in LRU.
-      version_t desired = hot_entry.load_count.load(std::memory_order_relaxed);
-      version_t current = hot_entry.lru_version.load(std::memory_order_relaxed);
-      if (current != desired) {
-        if (hot_entry.lru_version.compare_exchange_strong(
-                current, desired, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-          LRUCache::BlockType block;
-          block.page_table = this;
-          block.vector_block.first = evict_block_id;
-          block.vector_block.second = desired;
-          LRUCache::get_instance().add_single_block(block, 0);
-        }
-      }
-    }
-  }
   while (true) {
     int current_count = entry.ref_count.load(std::memory_order_relaxed);
     if (current_count >= 0) {
@@ -166,7 +135,9 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
     } else {
       entry.buffer = buffer;
       entry.size = size;
-      entry.load_count.fetch_add(1, std::memory_order_relaxed);
+      // Ensure in_lru is cleared when the block is freshly loaded so that
+      // the first release_block() after loading can register it in LRU.
+      entry.in_lru.store(false, std::memory_order_relaxed);
       entry.ref_count.store(1, std::memory_order_release);
       return entry.buffer;
     }
@@ -254,7 +225,7 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
 #if defined(_MSC_VER)
   ssize_t read_bytes = zvec_pread(fd_, buffer, size, offset);
 #else
-  ssize_t read_bytes = pread(fd_, buffer, size, offset);
+  ssize_t read_bytes = pread(fd2_, buffer, size, offset);
 #endif
   if (read_bytes != static_cast<ssize_t>(size)) {
     LOG_ERROR("Buffer pool failed to read file at offset: %zu, size: %zu", offset, size);
@@ -279,7 +250,7 @@ int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
 
 char *VecBufferPoolHandle::get_block(size_t offset, size_t size,
                                      size_t block_id) {
-  char *buffer = pool_.acquire_buffer(block_id, offset, size, 5);
+  char *buffer = pool_.acquire_buffer(block_id, offset, size, 50);
   return buffer;
 }
 

@@ -86,7 +86,7 @@ class LRUCache {
 
   bool add_single_block(const BlockType &block, int queue_index);
 
-  void clear_dead_node();
+  // void clear_dead_node();
 
   bool is_valid(VectorPageTable *page_table) {
     std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
