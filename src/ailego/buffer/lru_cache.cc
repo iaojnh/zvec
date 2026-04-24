@@ -71,8 +71,6 @@ void LRUCache::recycle() {
   BlockType item;
   while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
     if (item.page_table) {
-      // Hold the shared lock across the eviction call to prevent
-      // use-after-free if the VectorPageTable is concurrently destroyed.
       std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
       if (valid_page_tables_.find(item.page_table) !=
           valid_page_tables_.end()) {
@@ -90,40 +88,8 @@ bool LRUCache::add_single_block(const BlockType &block, int queue_index) {
     LOG_ERROR("enqueue failed.");
     return false;
   }
-  // static thread_local int evict_queue_insertions = 0;
-  // if (evict_queue_insertions++ > evict_batch_size_) {
-  //   this->clear_dead_node();
-  //   evict_queue_insertions = 0;
-  // }
   return true;
 }
-
-// void LRUCache::clear_dead_node() {
-//   for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
-//     size_t clear_size = evict_batch_size_;
-//     if (evict_queues_[i].size_approx() < evict_batch_size_) {
-//       continue;
-//     }
-//     if (evict_queues_[i].size_approx() > evict_batch_size_ * 8) {
-//       clear_size *= 2;
-//     }
-//     size_t clear_count = 0;
-//     BlockType item;
-//     ConcurrentQueue live_blocks_queue(evict_batch_size_ * 200);
-//     while (evict_queues_[i].try_dequeue(item) && (clear_count++ < clear_size)) {
-//       if (item.page_table == nullptr) {
-//         if (!ParquetBufferPool::get_instance().is_dead_node(item)) {
-//           live_blocks_queue.enqueue(item);
-//         }
-//       } else if (is_valid_and_alive(item)) {
-//         live_blocks_queue.enqueue(item);
-//       }
-//     }
-//     while (live_blocks_queue.try_dequeue(item)) {
-//       evict_queues_[i].enqueue(item);
-//     }
-//   }
-// }
 
 int MemoryLimitPool::init(size_t pool_size) {
   pool_size_ = 0;
@@ -180,14 +146,6 @@ void MemoryLimitPool::release_parquet(const size_t buffer_size) {
 
 bool MemoryLimitPool::is_full() {
   return used_size_.load() >= pool_size_;
-}
-
-bool MemoryLimitPool::is_hot_level1() {
-  return used_size_.load() >= pool_size_ * 3 / 5;
-}
-
-bool MemoryLimitPool::is_hot_level2() {
-  return used_size_.load() >= pool_size_ * 4 / 5;
 }
 
 }  // namespace ailego
