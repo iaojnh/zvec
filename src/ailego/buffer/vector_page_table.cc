@@ -228,7 +228,8 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
   ssize_t read_bytes = pread(fd2_, buffer, size, offset);
 #endif
   if (read_bytes != static_cast<ssize_t>(size)) {
-    LOG_ERROR("Buffer pool failed to read file at offset: %zu, size: %zu", offset, size);
+    LOG_ERROR("Buffer pool failed to read file at offset: %zu, size: %zu",
+              offset, size);
     MemoryLimitPool::get_instance().release_buffer(buffer, size);
     return nullptr;
   }
