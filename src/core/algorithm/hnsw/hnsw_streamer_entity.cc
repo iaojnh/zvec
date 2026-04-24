@@ -114,7 +114,8 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
         (id & node_index_mask_) * node_size() + vector_size() + sizeof(key_t);
 
     // Fast path: use pre-cached stable base pointer (mmap backend).
-    if (!node_chunk_bases_.empty() && node_chunk_bases_[chunk_idx]) {
+    // Bounds-check guards against new chunks added after clone() was taken.
+    if (chunk_idx < node_chunk_bases_.size() && node_chunk_bases_[chunk_idx]) {
       neighbor_block.reset(
           (void *)(node_chunk_bases_[chunk_idx] + offset));
     } else {
@@ -135,7 +136,8 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
     neighbor_size = upper_neighbor_size_;
 
     // Fast path: use pre-cached stable base pointer (mmap backend).
-    if (!upper_neighbor_chunk_bases_.empty() &&
+    // Bounds-check guards against new chunks added after clone() was taken.
+    if (p.first < upper_neighbor_chunk_bases_.size() &&
         upper_neighbor_chunk_bases_[p.first]) {
       neighbor_block.reset(
           (void *)(upper_neighbor_chunk_bases_[p.first] + offset));
@@ -160,7 +162,8 @@ const void *HnswStreamerEntity::get_vector(node_id_t id) const {
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
 
   // Fast path: mmap backend — direct pointer arithmetic.
-  if (!node_chunk_bases_.empty() && node_chunk_bases_[loc.first]) {
+  // Bounds-check guards against new chunks added after clone() was taken.
+  if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
     return node_chunk_bases_[loc.first] + loc.second;
   }
 
@@ -183,7 +186,8 @@ int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
 
     // Fast path: mmap backend.
-    if (!node_chunk_bases_.empty() && node_chunk_bases_[loc.first]) {
+    // Bounds-check guards against new chunks added after clone() was taken.
+    if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
       vecs[i] = node_chunk_bases_[loc.first] + loc.second;
       continue;
     }
@@ -207,7 +211,8 @@ int HnswStreamerEntity::get_vector(const node_id_t id,
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
 
   // Fast path: mmap backend.
-  if (!node_chunk_bases_.empty() && node_chunk_bases_[loc.first]) {
+  // Bounds-check guards against new chunks added after clone() was taken.
+  if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
     block.reset((void *)(node_chunk_bases_[loc.first] + loc.second));
     return 0;
   }
@@ -233,7 +238,8 @@ int HnswStreamerEntity::get_vector(
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
 
     // Fast path: mmap backend.
-    if (!node_chunk_bases_.empty() && node_chunk_bases_[loc.first]) {
+    // Bounds-check guards against new chunks added after clone() was taken.
+    if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
       vec_blocks[i].reset(
           (void *)(node_chunk_bases_[loc.first] + loc.second));
       continue;
@@ -259,7 +265,8 @@ key_t HnswStreamerEntity::get_key(node_id_t id) const {
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
 
     // Fast path: mmap backend.
-    if (!node_chunk_bases_.empty() && node_chunk_bases_[loc.first]) {
+    // Bounds-check guards against new chunks added after clone() was taken.
+    if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
       return *reinterpret_cast<const key_t *>(node_chunk_bases_[loc.first] +
                                                loc.second);
     }
