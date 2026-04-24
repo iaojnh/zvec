@@ -49,8 +49,7 @@ class ChunkBroker {
   ChunkBroker(IndexStreamer::Stats &stats) : stats_(stats) {}
 
   //! Open storage
-  int open(IndexStorage::Pointer stg, size_t max_index_size, size_t chunk_size,
-           bool check_crc);
+  int open(IndexStorage::Pointer stg, uint32_t &chunk_size, bool check_crc);
 
   int close(void);
 
@@ -88,6 +87,10 @@ class ChunkBroker {
     return stg_;
   }
 
+  void set_max_chunks_size(size_t max_chunks_size) {
+    max_chunks_size_ = max_chunks_size;
+  }
+
  private:
   ChunkBroker(const ChunkBroker &) = delete;
   ChunkBroker &operator=(const ChunkBroker &) = delete;
@@ -113,10 +116,10 @@ class ChunkBroker {
                 "HnswChunkMeta must be aligned with 32 bytes");
 
   //! Init the storage after open an empty index
-  int init_storage(size_t chunk_size);
+  int init_storage(uint32_t chunk_size);
 
   //! Load index from storage
-  int load_storage(size_t chunk_size);
+  int load_storage(uint32_t &chunk_size);
 
   static inline const std::string make_segment_id(int type, uint64_t seq_id) {
     return "HnswT" + ailego::StringHelper::ToString(type) + "S" +

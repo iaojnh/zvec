@@ -246,6 +246,17 @@ class HnswStreamerEntity : public HnswEntity {
 
     neighbor_size_ = neighbors_size();
     upper_neighbor_size_ = upper_neighbors_size();
+
+    // Populate base pointer caches so the fast path works in cloned entities
+    // (bench/search threads always operate on a clone).
+    node_chunk_bases_.resize(node_chunks_.size(), nullptr);
+    for (size_t i = 0; i < node_chunks_.size(); ++i) {
+      node_chunk_bases_[i] = node_chunks_[i]->base_data();
+    }
+    upper_neighbor_chunk_bases_.resize(upper_neighbor_chunks_.size(), nullptr);
+    for (size_t i = 0; i < upper_neighbor_chunks_.size(); ++i) {
+      upper_neighbor_chunk_bases_[i] = upper_neighbor_chunks_[i]->base_data();
+    }
   }
 
   //! Called only in searching procedure per context, so no need to lock
@@ -505,8 +516,18 @@ class HnswStreamerEntity : public HnswEntity {
   //! data chunk include: vector, key, level 0 neighbors
   mutable std::vector<Chunk::Pointer> node_chunks_{};
 
+  //! Flat cache of base_data() pointers for node_chunks_ and
+  //! upper_neighbor_chunks_. Non-empty only when the storage backend
+  //! returns a stable mmap pointer (base_data() != nullptr). Avoids
+  //! following the full shared_ptr -> Segment -> IndexMapping::Segment
+  //! pointer chain on every get_vector() / get_neighbors() call, which
+  //! is critical for small chunk sizes (e.g. 16 K) where node_chunks_
+  //! can hold 100K+ entries and the metadata no longer fits in L2 cache.
+  mutable std::vector<const uint8_t *> node_chunk_bases_{};
+
   //! upper neighbor chunk inlude: UpperNeighborHeader + (1~level) neighbors
   mutable std::vector<Chunk::Pointer> upper_neighbor_chunks_{};
+  mutable std::vector<const uint8_t *> upper_neighbor_chunk_bases_{};
 
   ChunkBroker::Pointer broker_{};  // chunk broker
 };
