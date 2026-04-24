@@ -146,10 +146,6 @@ class MemoryLimitPool {
 
   bool is_full();
 
-  bool is_hot_level1();
-
-  bool is_hot_level2();
-
  private:
   MemoryLimitPool() = default;
 
