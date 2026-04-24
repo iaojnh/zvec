@@ -225,7 +225,9 @@ class HnswStreamerEntity : public HnswEntity {
                      bool use_key_info_map,
                      std::vector<Chunk::Pointer> &&node_chunks,
                      std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
-                     const ChunkBroker::Pointer &broker)
+                     const ChunkBroker::Pointer &broker,
+                     std::shared_ptr<std::vector<const uint8_t *>> node_bases,
+                     std::shared_ptr<std::vector<const uint8_t *>> upper_bases)
       : stats_(stats),
         chunk_size_(chunk_size),
         node_index_mask_bits_(node_index_mask_bits),
@@ -247,16 +249,12 @@ class HnswStreamerEntity : public HnswEntity {
     neighbor_size_ = neighbors_size();
     upper_neighbor_size_ = upper_neighbors_size();
 
-    // Populate base pointer caches so the fast path works in cloned entities
-    // (bench/search threads always operate on a clone).
-    node_chunk_bases_.resize(node_chunks_.size(), nullptr);
-    for (size_t i = 0; i < node_chunks_.size(); ++i) {
-      node_chunk_bases_[i] = node_chunks_[i]->base_data();
-    }
-    upper_neighbor_chunk_bases_.resize(upper_neighbor_chunks_.size(), nullptr);
-    for (size_t i = 0; i < upper_neighbor_chunks_.size(); ++i) {
-      upper_neighbor_chunk_bases_[i] = upper_neighbor_chunks_[i]->base_data();
-    }
+    // Reuse the shared base-pointer arrays created by init_chunks().
+    // All clones share the same arrays so hot HNSW hub-node chunks are
+    // collectively promoted to L1/L2 by every search thread instead of
+    // each clone warming its own private copy in L3.
+    node_chunk_bases_ = std::move(node_bases);
+    upper_neighbor_chunk_bases_ = std::move(upper_bases);
   }
 
   //! Called only in searching procedure per context, so no need to lock
@@ -523,11 +521,17 @@ class HnswStreamerEntity : public HnswEntity {
   //! pointer chain on every get_vector() / get_neighbors() call, which
   //! is critical for small chunk sizes (e.g. 16 K) where node_chunks_
   //! can hold 100K+ entries and the metadata no longer fits in L2 cache.
-  mutable std::vector<const uint8_t *> node_chunk_bases_{};
+  //!
+  //! Shared across all clones (read-only after open) so that hot entries
+  //! (hub-node chunks near the HNSW entry point) are promoted to L1/L2
+  //! by all search threads collectively, instead of each clone warming
+  //! its own private 250 KB copy in L3.
+  mutable std::shared_ptr<std::vector<const uint8_t *>> node_chunk_bases_{};
 
   //! upper neighbor chunk inlude: UpperNeighborHeader + (1~level) neighbors
   mutable std::vector<Chunk::Pointer> upper_neighbor_chunks_{};
-  mutable std::vector<const uint8_t *> upper_neighbor_chunk_bases_{};
+  mutable std::shared_ptr<std::vector<const uint8_t *>>
+      upper_neighbor_chunk_bases_{};
 
   ChunkBroker::Pointer broker_{};  // chunk broker
 };

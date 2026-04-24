@@ -69,9 +69,9 @@ int HnswStreamerEntity::cleanup() {
     keys_map_->clear();
   }
   node_chunks_.clear();
-  node_chunk_bases_.clear();
+  node_chunk_bases_.reset();
   upper_neighbor_chunks_.clear();
-  upper_neighbor_chunk_bases_.clear();
+  upper_neighbor_chunk_bases_.reset();
   filter_same_key_ = false;
   get_vector_enabled_ = false;
   broker_.reset();
@@ -115,8 +115,9 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
 
     // Fast path: use pre-cached stable base pointer (mmap backend).
     // Bounds-check guards against new chunks added after clone() was taken.
-    if (chunk_idx < node_chunk_bases_.size() && node_chunk_bases_[chunk_idx]) {
-      neighbor_block.reset((void *)(node_chunk_bases_[chunk_idx] + offset));
+    if (chunk_idx < node_chunk_bases_->size() &&
+        (*node_chunk_bases_)[chunk_idx]) {
+      neighbor_block.reset((void *)((*node_chunk_bases_)[chunk_idx] + offset));
     } else {
       sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_idx, &node_chunks_);
       ailego_assert_with(chunk_idx < node_chunks_.size(), "invalid chunk idx");
@@ -136,10 +137,10 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
 
     // Fast path: use pre-cached stable base pointer (mmap backend).
     // Bounds-check guards against new chunks added after clone() was taken.
-    if (p.first < upper_neighbor_chunk_bases_.size() &&
-        upper_neighbor_chunk_bases_[p.first]) {
+    if (p.first < upper_neighbor_chunk_bases_->size() &&
+        (*upper_neighbor_chunk_bases_)[p.first]) {
       neighbor_block.reset(
-          (void *)(upper_neighbor_chunk_bases_[p.first] + offset));
+          (void *)((*upper_neighbor_chunk_bases_)[p.first] + offset));
     } else {
       Chunk *chunk = upper_neighbor_chunks_[p.first].get();
       ailego_assert_with(offset < chunk->data_size(), "invalid chunk offset");
@@ -162,8 +163,9 @@ const void *HnswStreamerEntity::get_vector(node_id_t id) const {
 
   // Fast path: mmap backend — direct pointer arithmetic.
   // Bounds-check guards against new chunks added after clone() was taken.
-  if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
-    return node_chunk_bases_[loc.first] + loc.second;
+  if (loc.first < node_chunk_bases_->size() &&
+      (*node_chunk_bases_)[loc.first]) {
+    return (*node_chunk_bases_)[loc.first] + loc.second;
   }
 
   ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
@@ -186,8 +188,9 @@ int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
 
     // Fast path: mmap backend.
     // Bounds-check guards against new chunks added after clone() was taken.
-    if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
-      vecs[i] = node_chunk_bases_[loc.first] + loc.second;
+    if (loc.first < node_chunk_bases_->size() &&
+        (*node_chunk_bases_)[loc.first]) {
+      vecs[i] = (*node_chunk_bases_)[loc.first] + loc.second;
       continue;
     }
 
@@ -211,8 +214,9 @@ int HnswStreamerEntity::get_vector(const node_id_t id,
 
   // Fast path: mmap backend.
   // Bounds-check guards against new chunks added after clone() was taken.
-  if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
-    block.reset((void *)(node_chunk_bases_[loc.first] + loc.second));
+  if (loc.first < node_chunk_bases_->size() &&
+      (*node_chunk_bases_)[loc.first]) {
+    block.reset((void *)((*node_chunk_bases_)[loc.first] + loc.second));
     return 0;
   }
 
@@ -238,8 +242,10 @@ int HnswStreamerEntity::get_vector(
 
     // Fast path: mmap backend.
     // Bounds-check guards against new chunks added after clone() was taken.
-    if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
-      vec_blocks[i].reset((void *)(node_chunk_bases_[loc.first] + loc.second));
+    if (loc.first < node_chunk_bases_->size() &&
+        (*node_chunk_bases_)[loc.first]) {
+      vec_blocks[i].reset(
+          (void *)((*node_chunk_bases_)[loc.first] + loc.second));
       continue;
     }
 
@@ -264,8 +270,9 @@ key_t HnswStreamerEntity::get_key(node_id_t id) const {
 
     // Fast path: mmap backend.
     // Bounds-check guards against new chunks added after clone() was taken.
-    if (loc.first < node_chunk_bases_.size() && node_chunk_bases_[loc.first]) {
-      return *reinterpret_cast<const key_t *>(node_chunk_bases_[loc.first] +
+    if (loc.first < node_chunk_bases_->size() &&
+        (*node_chunk_bases_)[loc.first]) {
+      return *reinterpret_cast<const key_t *>((*node_chunk_bases_)[loc.first] +
                                               loc.second);
     }
 
@@ -327,7 +334,8 @@ int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   }
 
   node_chunks_.resize(broker_->get_chunk_cnt(ChunkBroker::CHUNK_TYPE_NODE));
-  node_chunk_bases_.resize(node_chunks_.size(), nullptr);
+  node_chunk_bases_ = std::make_shared<std::vector<const uint8_t *>>(
+      node_chunks_.size(), nullptr);
   for (auto seq = 0UL; seq < node_chunks_.size(); ++seq) {
     node_chunks_[seq] = broker_->get_chunk(ChunkBroker::CHUNK_TYPE_NODE, seq);
     if (!node_chunks_[seq]) {
@@ -335,12 +343,13 @@ int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
                 node_chunks_.size());
       return IndexError_InvalidFormat;
     }
-    node_chunk_bases_[seq] = node_chunks_[seq]->base_data();
+    (*node_chunk_bases_)[seq] = node_chunks_[seq]->base_data();
   }
 
   upper_neighbor_chunks_.resize(
       broker_->get_chunk_cnt(ChunkBroker::CHUNK_TYPE_UPPER_NEIGHBOR));
-  upper_neighbor_chunk_bases_.resize(upper_neighbor_chunks_.size(), nullptr);
+  upper_neighbor_chunk_bases_ = std::make_shared<std::vector<const uint8_t *>>(
+      upper_neighbor_chunks_.size(), nullptr);
   for (auto seq = 0UL; seq < upper_neighbor_chunks_.size(); ++seq) {
     upper_neighbor_chunks_[seq] =
         broker_->get_chunk(ChunkBroker::CHUNK_TYPE_UPPER_NEIGHBOR, seq);
@@ -349,7 +358,8 @@ int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
                 upper_neighbor_chunks_.size());
       return IndexError_InvalidFormat;
     }
-    upper_neighbor_chunk_bases_[seq] = upper_neighbor_chunks_[seq]->base_data();
+    (*upper_neighbor_chunk_bases_)[seq] =
+        upper_neighbor_chunks_[seq]->base_data();
   }
 
   return 0;
@@ -454,9 +464,9 @@ int HnswStreamerEntity::close() {
   keys_map_->clear();
   header_.clear();
   node_chunks_.clear();
-  node_chunk_bases_.clear();
+  node_chunk_bases_.reset();
   upper_neighbor_chunks_.clear();
-  upper_neighbor_chunk_bases_.clear();
+  upper_neighbor_chunk_bases_.reset();
 
   return broker_->close();
 }
@@ -754,7 +764,8 @@ const HnswEntity::Pointer HnswStreamerEntity::clone() const {
       stats_, header(), chunk_size_, node_index_mask_bits_,
       upper_neighbor_mask_bits_, filter_same_key_, get_vector_enabled_,
       upper_neighbor_index_, keys_map_lock_, keys_map_, use_key_info_map_,
-      std::move(node_chunks), std::move(upper_neighbor_chunks), broker_);
+      std::move(node_chunks), std::move(upper_neighbor_chunks), broker_,
+      node_chunk_bases_, upper_neighbor_chunk_bases_);
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("HnswStreamerEntity new failed");
   }
