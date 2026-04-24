@@ -178,11 +178,11 @@ int VecBufferPool::init(size_t /*pool_capacity*/, size_t block_size,
   }
   size_t block_num = segment_count + 10;
   page_table_.init(block_num);
-  block_mutexes_.clear();
-  block_mutexes_.reserve(block_num);
-  for (size_t i = 0; i < block_num; i++) {
-    block_mutexes_.emplace_back(std::make_unique<std::mutex>());
-  }
+  // Allocate all mutexes in a single contiguous array so that the cold-path
+  // lock in acquire_buffer() accesses cache-friendly memory instead of
+  // chasing 31K+ independent heap pointers.
+  block_mutexes_ = std::make_unique<std::mutex[]>(block_num);
+  block_mutexes_count_ = block_num;
   LOG_DEBUG("entry num: %zu", page_table_.entry_num());
   return 0;
 }
@@ -193,12 +193,12 @@ VecBufferPoolHandle VecBufferPool::get_handle() {
 
 char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
                                     size_t size, int retry) {
-  assert(block_id < block_mutexes_.size());
+  assert(block_id < block_mutexes_count_);
   char *buffer = page_table_.acquire_block(block_id);
   if (buffer) {
     return buffer;
   }
-  std::lock_guard<std::mutex> lock(*block_mutexes_[block_id]);
+  std::lock_guard<std::mutex> lock(block_mutexes_[block_id]);
   buffer = page_table_.acquire_block(block_id);
   if (buffer) {
     return buffer;
