@@ -148,8 +148,7 @@ VecBufferPool::VecBufferPool(const std::string &filename) {
 #if defined(_MSC_VER)
   fd_ = _open(filename.c_str(), O_RDONLY | _O_BINARY);
 #else
-  fd_ = open(filename.c_str(), O_RDONLY | O_DIRECT);
-  fd2_ = open(filename.c_str(), O_RDONLY);
+  fd_ = open(filename.c_str(), O_RDONLY);
 #endif
   if (fd_ < 0) {
     throw std::runtime_error("Failed to open file: " + filename);
@@ -158,12 +157,10 @@ VecBufferPool::VecBufferPool(const std::string &filename) {
   struct _stat64 st;
   if (_fstat64(fd_, &st) < 0) {
     _close(fd_);
-    _close(fd2_);
 #else
   struct stat st;
   if (fstat(fd_, &st) < 0) {
     ::close(fd_);
-    ::close(fd2_);
 #endif
     throw std::runtime_error("Failed to stat file: " + filename);
   }
@@ -225,7 +222,7 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
 #if defined(_MSC_VER)
   ssize_t read_bytes = zvec_pread(fd_, buffer, size, offset);
 #else
-  ssize_t read_bytes = pread(fd2_, buffer, size, offset);
+  ssize_t read_bytes = pread(fd_, buffer, size, offset);
 #endif
   if (read_bytes != static_cast<ssize_t>(size)) {
     LOG_ERROR("Buffer pool failed to read file at offset: %zu, size: %zu",
@@ -238,9 +235,9 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
 
 int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
 #if defined(_MSC_VER)
-  ssize_t read_bytes = zvec_pread(fd2_, buffer, length, offset);
+  ssize_t read_bytes = zvec_pread(fd_, buffer, length, offset);
 #else
-  ssize_t read_bytes = pread(fd2_, buffer, length, offset);
+  ssize_t read_bytes = pread(fd_, buffer, length, offset);
 #endif
   if (read_bytes != static_cast<ssize_t>(length)) {
     LOG_ERROR("Buffer pool failed to read file at offset: %zu", offset);

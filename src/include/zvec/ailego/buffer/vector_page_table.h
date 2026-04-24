@@ -118,10 +118,8 @@ class VecBufferPool {
     }
 #if defined(_MSC_VER)
     _close(fd_);
-    _close(fd2_);
 #else
     close(fd_);
-    close(fd2_);
 #endif
   }
 
@@ -139,7 +137,7 @@ class VecBufferPool {
   }
 
  private:
-  int fd_, fd2_;
+  int fd_;
   size_t file_size_;
 
  public:
