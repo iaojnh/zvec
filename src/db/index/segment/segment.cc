@@ -1575,7 +1575,7 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
   VectorColumnIndexer::Ptr vector_indexer =
       std::make_shared<VectorColumnIndexer>(index_file_path, field);
 
-  vector_column_params::ReadOptions options{options_.enable_mmap_, true};
+  vector_column_params::ReadOptions options{true, true};
 
   auto s = vector_indexer->Open(options);
   CHECK_RETURN_STATUS_EXPECTED(s);
