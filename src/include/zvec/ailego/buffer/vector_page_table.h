@@ -46,13 +46,9 @@ using block_id_t = size_t;
 using version_t = size_t;
 
 class VectorPageTable {
-  struct Entry {
-    alignas(64) std::atomic<int> ref_count;
-    // True when this block has been registered in the LRU queue and has not
-    // yet been evicted.  Used in release_block() to suppress duplicate
-    // insertions: once a block is in LRU we never push it again until it is
-    // evicted (which resets the flag).
-    alignas(64) std::atomic<bool> in_lru;
+  struct alignas(64) Entry {
+    std::atomic<int> ref_count;
+    std::atomic<bool> in_lru;
     char *buffer;
     size_t size;
   };
@@ -122,10 +118,8 @@ class VecBufferPool {
     }
 #if defined(_MSC_VER)
     _close(fd_);
-    _close(fd2_);
 #else
     close(fd_);
-    close(fd2_);
 #endif
   }
 
@@ -143,14 +137,18 @@ class VecBufferPool {
   }
 
  private:
-  int fd_, fd2_;
+  int fd_;
   size_t file_size_;
 
  public:
   VectorPageTable page_table_;
 
  private:
-  std::vector<std::unique_ptr<std::mutex>> block_mutexes_;
+  // Contiguous array of per-block mutexes (one allocation, cache-friendly for
+  // the cold-path load in acquire_buffer). block_mutexes_count_ mirrors the
+  // array length because unique_ptr<T[]> has no built-in size accessor.
+  std::unique_ptr<std::mutex[]> block_mutexes_{};
+  size_t block_mutexes_count_{0};
 };
 
 class VecBufferPoolHandle {
