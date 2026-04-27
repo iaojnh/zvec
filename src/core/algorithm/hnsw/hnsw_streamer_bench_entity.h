@@ -27,11 +27,11 @@
 namespace zvec {
 namespace core {
 
-//! HnswStreamerEntity manage vector data, pkey, and node's neighbors
-class HnswStreamerEntity {
+//! HnswStreamerBenchEntity manage vector data, pkey, and node's neighbors
+class HnswStreamerBenchEntity {
  public:  // override
-  typedef std::shared_ptr<HnswStreamerEntity> Pointer;
-  typedef std::unique_ptr<HnswStreamerEntity> UPointer;
+  typedef std::shared_ptr<HnswStreamerBenchEntity> Pointer;
+  typedef std::unique_ptr<HnswStreamerBenchEntity> UPointer;
 
   //! Cleanup
   //! return 0 on success, or errCode in failure
@@ -39,15 +39,17 @@ class HnswStreamerEntity {
 
   //! Make a copy of streamer entity, to support thread-safe operation.
   //! The segment in container cannot be read concurrenly
-  const HnswStreamerEntity::Pointer clone() const;
+  const HnswStreamerBenchEntity::Pointer clone() const;
 
-  HnswStreamerEntity::UPointer clone_uptr() const;
+  HnswStreamerBenchEntity::UPointer clone_uptr() const;
 
   //! Get primary key of the node id
   key_t get_key(node_id_t id) const;
 
   //! Get vector feature data by key
   const void *get_vector(node_id_t id) const;
+
+  const void *get_vector_new(node_id_t id) const;
 
   //! Get vectors feature data by local ids
   int get_vector(const node_id_t *ids, uint32_t count, const void **vecs) const;
@@ -57,10 +59,17 @@ class HnswStreamerEntity {
   int get_vector(const node_id_t *ids, uint32_t count,
                  std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
 
+  int get_vector_new(const node_id_t id,
+                     IndexStorage::MemoryBlock &block) const;
+
+  int get_vector_new(const node_id_t *ids, uint32_t count,
+                     std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
+
   //! Get the node id's neighbors on graph level
   //! Note: the neighbors cannot be modified, using the following
   //! method to get WritableNeighbors if want to
   const Neighbors get_neighbors(level_t level, node_id_t id) const;
+  const Neighbors get_neighbors_new(level_t level, node_id_t id) const;
 
   //! Add vector and key to hnsw entity, and local id will be saved in id
   int add_vector(level_t level, key_t key, const void *vec, node_id_t *id);
@@ -323,10 +332,10 @@ class HnswStreamerEntity {
 
  public:
   //! Constructor
-  HnswStreamerEntity(IndexStreamer::Stats &stats);
+  HnswStreamerBenchEntity(IndexStreamer::Stats &stats);
 
   //! Destructor
-  ~HnswStreamerEntity();
+  ~HnswStreamerBenchEntity();
 
   //! Get vector feature data by key
 
@@ -435,17 +444,19 @@ class HnswStreamerEntity {
   using NIHashMapPointer = std::shared_ptr<NIHashMap>;
 
   //! Private construct, only be called by clone method
-  HnswStreamerEntity(IndexStreamer::Stats &stats, const HNSWHeader &hd,
-                     size_t chunk_size, uint32_t node_index_mask_bits,
-                     uint32_t upper_neighbor_mask_bits, bool filter_same_key,
-                     bool get_vector_enabled,
-                     const NIHashMapPointer &upper_neighbor_index,
-                     std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
-                     const HashMapPointer<key_t, node_id_t> &keys_map,
-                     bool use_key_info_map,
-                     std::vector<Chunk::Pointer> &&node_chunks,
-                     std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
-                     const ChunkBroker::Pointer &broker)
+  HnswStreamerBenchEntity(IndexStreamer::Stats &stats, const HNSWHeader &hd,
+                          size_t chunk_size, uint32_t node_index_mask_bits,
+                          uint32_t upper_neighbor_mask_bits,
+                          bool filter_same_key, bool get_vector_enabled,
+                          const NIHashMapPointer &upper_neighbor_index,
+                          std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
+                          const HashMapPointer<key_t, node_id_t> &keys_map,
+                          bool use_key_info_map,
+                          std::vector<Chunk::Pointer> &&node_chunks,
+                          std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
+                          const ChunkBroker::Pointer &broker,
+                          std::shared_ptr<std::string> vector_value_ptr,
+                          std::shared_ptr<std::string> neighbors_value_ptr)
       : stats_(stats),
         chunk_size_(chunk_size),
         node_index_mask_bits_(node_index_mask_bits),
@@ -461,7 +472,9 @@ class HnswStreamerEntity {
         keys_map_(keys_map),
         node_chunks_(std::move(node_chunks)),
         upper_neighbor_chunks_(std::move(upper_neighbor_chunks)),
-        broker_(broker) {
+        broker_(broker),
+        vector_value_ptr_(vector_value_ptr),
+        neighbors_value_ptr_(neighbors_value_ptr) {
     *mutable_header() = hd;
 
     neighbor_size_ = neighbors_size();
@@ -551,10 +564,10 @@ class HnswStreamerEntity {
       return 0;
     }
     Chunk::Pointer chunk;
-    uint64_t chunk_offset = UINT64_MAX;
+    uint64_t chunk_offset = -1UL;
     size_t neighbors_size = get_total_upper_neighbors_size(level);
-    uint64_t chunk_index = upper_neighbor_chunks_.size() - 1ULL;
-    if (chunk_index == UINT64_MAX ||
+    uint64_t chunk_index = upper_neighbor_chunks_.size() - 1UL;
+    if (chunk_index == -1UL ||
         (upper_neighbor_chunks_[chunk_index]->padding_size() <
          neighbors_size)) {  // no space left and need to alloc
       chunk_index++;
@@ -692,8 +705,8 @@ class HnswStreamerEntity {
   }
 
  private:
-  HnswStreamerEntity(const HnswStreamerEntity &) = delete;
-  HnswStreamerEntity &operator=(const HnswStreamerEntity &) = delete;
+  HnswStreamerBenchEntity(const HnswStreamerBenchEntity &) = delete;
+  HnswStreamerBenchEntity &operator=(const HnswStreamerBenchEntity &) = delete;
   static constexpr float kUpperHashMemoryInflateRatio = 2.0f;
 
  private:
@@ -730,6 +743,9 @@ class HnswStreamerEntity {
   mutable std::vector<Chunk::Pointer> upper_neighbor_chunks_{};
 
   ChunkBroker::Pointer broker_{};  // chunk broker
+
+  std::shared_ptr<std::string> vector_value_ptr_{};
+  std::shared_ptr<std::string> neighbors_value_ptr_{};
 };
 
 }  // namespace core

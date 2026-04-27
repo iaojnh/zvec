@@ -17,7 +17,7 @@
 #include "utility/sparse_utility.h"
 #include "utility/visit_filter.h"
 #include "hnsw_dist_calculator.h"
-#include "hnsw_entity.h"
+#include "hnsw_streamer_entity_set.h"
 
 namespace zvec {
 namespace core {
@@ -36,11 +36,11 @@ class HnswContext : public IndexContext {
 
   //! Construct
   HnswContext(size_t dimension, const IndexMetric::Pointer &metric,
-              const HnswEntity::Pointer &entity);
+              const HnswStreamerEntitySet::Pointer &entity_set);
 
   //! Construct
   HnswContext(const IndexMetric::Pointer &metric,
-              const HnswEntity::Pointer &entity);
+              const HnswStreamerEntitySet::Pointer &entity_set);
 
   //! Destructor
   virtual ~HnswContext();
@@ -114,10 +114,12 @@ class HnswContext : public IndexContext {
   //! Update context, the context may be shared by different searcher/streamer
   int update_context(ContextType type, const IndexMeta &meta,
                      const IndexMetric::Pointer &metric,
-                     const HnswEntity::Pointer &entity, uint32_t magic_num);
+                     const HnswStreamerEntitySet::Pointer &entity_set,
+                     uint32_t magic_num);
 
-  inline const HnswEntity &get_entity() const {
-    return *entity_;
+
+  inline const HnswStreamerEntitySet &get_entity() const {
+    return *entity_set_;
   }
 
   inline void resize_results(size_t size) {
@@ -154,7 +156,7 @@ class HnswContext : public IndexContext {
 
   inline void topk_to_single_result(uint32_t idx) {
     if (force_padding_topk_ && !topk_heap_.full() &&
-        topk_heap_.size() < entity_->doc_cnt()) {
+        topk_heap_.size() < entity_set_->doc_cnt()) {
       this->fill_random_to_topk_full();
     }
     if (ailego_unlikely(topk_heap_.size() == 0)) {
@@ -174,10 +176,10 @@ class HnswContext : public IndexContext {
 
       node_id_t id = topk_heap_[i].first;
       if (fetch_vector_) {
-        results_[idx].emplace_back(entity_->get_key(id), score, id,
-                                   entity_->get_vector(id));
+        results_[idx].emplace_back(entity_set_->get_key(id), score, id,
+                                   entity_set_->get_vector(id));
       } else {
-        results_[idx].emplace_back(entity_->get_key(id), score, id);
+        results_[idx].emplace_back(entity_set_->get_key(id), score, id);
       }
     }
 
@@ -238,10 +240,10 @@ class HnswContext : public IndexContext {
 
         if (fetch_vector_) {
           group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id, entity_->get_vector(id));
+              entity_set_->get_key(id), score, id, entity_set_->get_vector(id));
         } else {
           group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id);
+              entity_set_->get_key(id), score, id);
         }
       }
     }
@@ -352,8 +354,8 @@ class HnswContext : public IndexContext {
       int cur_level = level_topks_.size();
       level_topks_.resize(level + 1);
       for (; cur_level <= level; ++cur_level) {
-        size_t heap_size = std::max(entity_->neighbor_cnt(cur_level),
-                                    entity_->ef_construction());
+        size_t heap_size = std::max(entity_set_->neighbor_cnt(cur_level),
+                                    entity_set_->ef_construction());
         level_topks_[cur_level].clear();
         level_topks_[cur_level].limit(heap_size);
       }
@@ -363,7 +365,7 @@ class HnswContext : public IndexContext {
   }
 
   inline void check_need_adjuct_ctx(void) {
-    check_need_adjuct_ctx(entity_->doc_cnt());
+    check_need_adjuct_ctx(entity_set_->doc_cnt());
   }
 
   inline size_t compute_reserve_cnt(uint32_t cur_doc) const {
@@ -492,7 +494,8 @@ class HnswContext : public IndexContext {
   constexpr static uint32_t kInvalidMgic = -1U;
 
  private:
-  HnswEntity::Pointer entity_;
+  HnswStreamerEntitySet::Pointer entity_set_;
+
   HnswDistCalculator dc_;
   IndexMetric::Pointer metric_;
 
@@ -505,9 +508,10 @@ class HnswContext : public IndexContext {
   uint32_t topk_{0};
   uint32_t group_topk_{0};
   uint32_t filter_mode_{VisitFilter::ByteMap};
-  float negative_probability_{HnswEntity::kDefaultBFNegativeProbability};
-  uint32_t ef_{HnswEntity::kDefaultEf};
-  float max_scan_ratio_{HnswEntity::kDefaultScanRatio};
+  float negative_probability_{
+      HnswStreamerEntity::kDefaultBFNegativeProbability};
+  uint32_t ef_{HnswStreamerEntity::kDefaultEf};
+  float max_scan_ratio_{HnswStreamerEntity::kDefaultScanRatio};
   uint32_t magic_{0U};
   std::vector<IndexDocumentList> results_{};
   std::vector<IndexGroupDocumentList> group_results_{};

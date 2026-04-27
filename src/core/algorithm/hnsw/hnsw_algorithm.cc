@@ -20,8 +20,8 @@
 namespace zvec {
 namespace core {
 
-HnswAlgorithm::HnswAlgorithm(HnswEntity &entity)
-    : entity_(entity),
+HnswAlgorithm::HnswAlgorithm(HnswStreamerEntitySet &entity_set)
+    : entity_set_(entity_set),
       mt_(std::chrono::system_clock::now().time_since_epoch().count()),
       lock_pool_(kLockCnt) {}
 
@@ -34,10 +34,10 @@ int HnswAlgorithm::add_node(node_id_t id, level_t level, HnswContext *ctx) {
 
   // std::cout << "id: " << id << ", level: " << level << std::endl;
 
-  auto cur_max_level = entity_.cur_max_level();
-  auto entry_point = entity_.entry_point();
+  auto cur_max_level = entity_set_.cur_max_level();
+  auto entry_point = entity_set_.entry_point();
   if (ailego_unlikely(entry_point == kInvalidNodeId)) {
-    entity_.update_ep_and_level(id, level);
+    entity_set_.update_ep_and_level(id, level);
     spin_lock_.unlock();
     return 0;
   }
@@ -46,8 +46,8 @@ int HnswAlgorithm::add_node(node_id_t id, level_t level, HnswContext *ctx) {
   if (ailego_unlikely(level > cur_max_level)) {
     mutex_.lock();
     // re-check max level
-    cur_max_level = entity_.cur_max_level();
-    entry_point = entity_.entry_point();
+    cur_max_level = entity_set_.cur_max_level();
+    entry_point = entity_set_.entry_point();
     if (level <= cur_max_level) {
       mutex_.unlock();
     }
@@ -73,7 +73,7 @@ int HnswAlgorithm::add_node(node_id_t id, level_t level, HnswContext *ctx) {
 
   if (ailego_unlikely(level > cur_max_level)) {
     spin_lock_.lock();
-    entity_.update_ep_and_level(id, level);
+    entity_set_.update_ep_and_level(id, level);
     spin_lock_.unlock();
     mutex_.unlock();
   }
@@ -83,8 +83,8 @@ int HnswAlgorithm::add_node(node_id_t id, level_t level, HnswContext *ctx) {
 
 int HnswAlgorithm::search(HnswContext *ctx) const {
   spin_lock_.lock();
-  auto maxLevel = entity_.cur_max_level();
-  auto entry_point = entity_.entry_point();
+  auto maxLevel = entity_set_.cur_max_level();
+  auto entry_point = entity_set_.entry_point();
   spin_lock_.unlock();
 
   if (ailego_unlikely(entry_point == kInvalidNodeId)) {
@@ -397,10 +397,10 @@ void HnswAlgorithm::update_neighbors(HnswDistCalculator &dc, node_id_t id,
                                      level_t level, TopkHeap &topk_heap) {
   topk_heap.sort();
 
-  uint32_t max_neighbor_cnt = entity_.neighbor_cnt(level);
-  if (topk_heap.size() <= static_cast<size_t>(entity_.prune_cnt())) {
+  uint32_t max_neighbor_cnt = entity_set_.neighbor_cnt(level);
+  if (topk_heap.size() <= static_cast<size_t>(entity_set_.prune_cnt())) {
     if (topk_heap.size() <= static_cast<size_t>(max_neighbor_cnt)) {
-      entity_.update_neighbors(level, id, topk_heap);
+      entity_set_.update_neighbors(level, id, topk_heap);
       return;
     }
   }
@@ -432,7 +432,7 @@ void HnswAlgorithm::update_neighbors(HnswDistCalculator &dc, node_id_t id,
   // we use this strategy to make-up enough edges
   // not only just make-up out-degrees
   // we also make-up enough in-degrees
-  uint32_t min_neighbors = entity_.min_neighbor_cnt();
+  uint32_t min_neighbors = entity_set_.min_neighbor_cnt();
   for (size_t k = cur_size; cur_size < min_neighbors && k < topk_heap.size();
        ++k) {
     bool exist = false;
@@ -450,7 +450,7 @@ void HnswAlgorithm::update_neighbors(HnswDistCalculator &dc, node_id_t id,
   }
 
   topk_heap.resize(cur_size);
-  entity_.update_neighbors(level, id, topk_heap);
+  entity_set_.update_neighbors(level, id, topk_heap);
 
   return;
 }
@@ -459,15 +459,15 @@ void HnswAlgorithm::reverse_update_neighbors(HnswDistCalculator &dc,
                                              node_id_t id, level_t level,
                                              node_id_t link_id, dist_t dist,
                                              TopkHeap &update_heap) {
-  const size_t max_neighbor_cnt = entity_.neighbor_cnt(level);
+  const size_t max_neighbor_cnt = entity_set_.neighbor_cnt(level);
 
   uint32_t lock_idx = id & kLockMask;
   lock_pool_[lock_idx].lock();
-  const Neighbors neighbors = entity_.get_neighbors(level, id);
+  const Neighbors neighbors = entity_set_.get_neighbors(level, id);
   size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {
-    entity_.add_neighbor(level, id, size, link_id);
+    entity_set_.add_neighbor(level, id, size, link_id);
     lock_pool_[lock_idx].unlock();
     return;
   }
@@ -507,7 +507,7 @@ void HnswAlgorithm::reverse_update_neighbors(HnswDistCalculator &dc,
   }
 
   update_heap.resize(cur_size);
-  entity_.update_neighbors(level, id, update_heap);
+  entity_set_.update_neighbors(level, id, update_heap);
 
   lock_pool_[lock_idx].unlock();
 
