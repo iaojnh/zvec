@@ -30,7 +30,6 @@
 #include "db/index/common/type_helper.h"
 #include "index/utils/utils.h"
 #include "zvec/ailego/utility/float_helper.h"
-#include "zvec/db/config.h"
 #include "zvec/db/doc.h"
 #include "zvec/db/index_params.h"
 #include "zvec/db/options.h"
@@ -2110,7 +2109,8 @@ TEST_F(CollectionTest, Feature_CreateIndex_Vector) {
 
 TEST_F(CollectionTest, Feature_CreateIndex_Scalar) {
 #ifdef __ANDROID__
-  GTEST_SKIP() << "Skipped on Android: emulator filesystem lacks hardlink support (needed by RocksDB checkpoint)";
+  GTEST_SKIP() << "Skipped on Android: emulator filesystem lacks hardlink "
+                  "support (needed by RocksDB checkpoint)";
 #endif
   auto func = [&](std::string field_name, bool enable_optimize,
                   IndexParams::Ptr scalar_index_params = nullptr) {
@@ -2387,7 +2387,8 @@ TEST_F(CollectionTest, Feature_DropIndex_Vector) {
 
 TEST_F(CollectionTest, Feature_DropIndex_Scalar) {
 #ifdef __ANDROID__
-  GTEST_SKIP() << "Skipped on Android: emulator filesystem lacks hardlink support (needed by RocksDB checkpoint)";
+  GTEST_SKIP() << "Skipped on Android: emulator filesystem lacks hardlink "
+                  "support (needed by RocksDB checkpoint)";
 #endif
   auto func = [&](std::string field_name, bool enable_optimize) {
     FileHelper::RemoveDirectory(col_path);
@@ -3266,7 +3267,7 @@ TEST_F(CollectionTest, Feature_Query_Validate) {
 
   {
     VectorQuery query;
-    query.topk_ = 1025;
+    query.topk_ = 100001;
     query.field_name_ = field_name;
 
     auto field_scheama = schema->get_vector_field(field_name);

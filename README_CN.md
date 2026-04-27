@@ -1,5 +1,5 @@
 <p align="right">
-  <a href="./README.md">English</a> | 简体中文
+  <a href="./README.md">English</a> | 中文
 </p>
 
 <div align="center">
@@ -23,10 +23,10 @@
 </p>
 
 <p align="center">
-  <a href="https://zvec.org/en/docs/quickstart/">🚀 <strong>快速开始</strong> </a> |
-  <a href="https://zvec.org/en/">🏠 <strong>主页</strong> </a> |
-  <a href="https://zvec.org/en/docs/">📚 <strong>文档</strong> </a> |
-  <a href="https://zvec.org/en/docs/benchmarks/">📊 <strong>性能报告</strong> </a> |
+  <a href="https://zvec.org/zh/docs/db/quickstart/">🚀 <strong>快速开始</strong> </a> |
+  <a href="https://zvec.org/zh/">🏠 <strong>主页</strong> </a> |
+  <a href="https://zvec.org/zh/docs/db/">📚 <strong>文档</strong> </a> |
+  <a href="https://zvec.org/zh/docs/db/benchmarks/">📊 <strong>性能报告</strong> </a> |
   <a href="https://deepwiki.com/alibaba/zvec">🔎 <strong>DeepWiki</strong> </a> |
   <a href="https://discord.gg/rKddFBBu9z">🎮 <strong>Discord</strong> </a> |
   <a href="https://x.com/ZvecAI">🐦 <strong>X (Twitter)</strong> </a>
@@ -36,8 +36,9 @@
 
 > [!IMPORTANT]
 > 🚀  **v0.3.1 （2026 年 4 月 17 日）**
+>
 > - 放宽 Collection 路径限制；改进 Windows 上的路径处理。
-> 
+>
 > 🚀  **v0.3.0 （2026 年 4 月 3 日）**
 >
 > - **新平台支持**：支持 **Windows (MSVC)** 和 **Android**。发布了官方 Windows **Python** 和 **Node.js** 安装包。
@@ -49,9 +50,11 @@
 ## 💫 核心特性
 
 - **极致性能**：毫秒级响应，轻松检索数十亿级向量。
-- **开箱即用**：[安装](#-安装)后即刻开始搜索，无需服务器、无需配置、零门槛。
+- **开箱即用**：[安装](#-安装)后即刻开始搜索，纯本地运行，无需服务器、无需配置、零门槛。
 - **稠密 + 稀疏向量**：支持稠密向量和稀疏向量，提供多向量联合查询的原生支持。
 - **混合检索**：向量语义搜索 + 标量条件过滤，获得精确结果。
+- **持久化存储**：WAL 预写日志保障数据持久性 — 即使进程崩溃或意外断电，数据也不会丢失。
+- **并发访问**：支持多进程同时读取同一个 Collection；写入为单进程独占模式。
 - **进程内运行**：无需单独部署服务，纯进程内运行。Notebook、高性能服务器、CLI 工具、边缘设备 — 随处可用。
 
 ## 📦 安装
@@ -78,7 +81,7 @@ npm install @zvec/zvec
 
 ### 🛠️ 源码构建
 
-如需从源码构建 Zvec，请参考[源码构建指南](https://zvec.org/en/docs/build/)。
+如需从源码构建 Zvec，请参考[源码构建指南](https://zvec.org/zh/docs/db/build/)。
 
 ## ⚡ 一分钟上手
 
@@ -116,13 +119,9 @@ Zvec 提供极致的速度和效率，能够轻松应对高要求的生产环境
 
 <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qps_10M.svg" width="800" alt="Zvec 性能基准测试" />
 
-有关具体的测试方法、配置及完整结果，请参阅[性能报告](https://zvec.org/en/docs/benchmarks/)。
+有关具体的测试方法、配置及完整结果，请参阅[性能报告](https://zvec.org/zh/docs/db/benchmarks/)。
 
 ## 🤝 加入社区
-
-<div align="center">
-
-获取最新动态和技术支持：
 
 <div align="center">
 
@@ -130,8 +129,6 @@ Zvec 提供极致的速度和效率，能够轻松应对高要求的生产环境
 | :---: | :---: | :---: | :---: |
 | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/dingding.png" width="150" alt="钉钉二维码"/> | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/wechat.png?v=5" width="150" alt="微信二维码"/> | [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/rKddFBBu9z) | [![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ZvecAI)](<https://x.com/ZvecAI>) |
 | 扫码加入 | 扫码加入 | 点击加入 | 点击关注 |
-
-</div>
 
 </div>
 

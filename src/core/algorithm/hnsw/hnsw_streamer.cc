@@ -355,9 +355,6 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
   shared_mutex_.lock();
   AILEGO_DEFER([&]() { shared_mutex_.unlock(); });
 
-  meta_.set_searcher("HnswSearcher", HnswStreamerEntity::kRevision,
-                     ailego::Params());
-
   int ret = IndexHelper::SerializeToDumper(meta_, dumper.get());
   if (ret != 0) {
     LOG_ERROR("Failed to serialize meta into dumper.");
