@@ -32,8 +32,8 @@
 #include <string>
 #include <unordered_map>
 #include <zvec/ailego/internal/platform.h>
-#include "concurrentqueue.h"
 #include "block_eviction_queue.h"
+#include "concurrentqueue.h"
 
 #if defined(_MSC_VER)
 #include <io.h>
