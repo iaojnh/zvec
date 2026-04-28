@@ -94,7 +94,7 @@ class ChunkBroker {
   //!
   //! Typical call sequence:
   //!   1. open(stg, chunk_size, check_crc)
-  //!   2. init_chunk_params(max_index_size, huge_page)   // computes max_index_size_
+  //!   2. init_chunk_params(max_index_size, huge_page)
   //!   3. set_max_chunks_size(max_index_size_)           // <- must be here
   //!   4. alloc_chunk(...)
   void set_max_chunks_size(size_t max_chunks_size) {
