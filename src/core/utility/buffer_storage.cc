@@ -174,14 +174,14 @@ class BufferStorage : public IndexStorage {
   }
 
   //! Initialize storage
-int init(const ailego::Params &params) override {
-  params.get(BUFFER_STORAGE_MEMORY_SIZE, &buffer_size_);
-  LOG_DEBUG("BufferStorage init: file=%s, buffer_size=%lu, "
-            "max_segment_size=%lu, segment_count=%zu",
-            file_name_.c_str(), buffer_size_,
-            max_segment_size_, segments_.size());
-  return 0;
-}
+  int init(const ailego::Params &params) override {
+    params.get(BUFFER_STORAGE_MEMORY_SIZE, &buffer_size_);
+    LOG_DEBUG(
+        "BufferStorage init: file=%s, buffer_size=%lu, "
+        "max_segment_size=%lu, segment_count=%zu",
+        file_name_.c_str(), buffer_size_, max_segment_size_, segments_.size());
+    return 0;
+  }
 
   //! Cleanup storage
   int cleanup(void) override {
