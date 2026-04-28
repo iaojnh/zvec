@@ -43,9 +43,6 @@ class Buffer;
 namespace zvec {
 namespace ailego {
 
-using block_id_t = size_t;
-using version_t = size_t;
-
 class BlockEvictionQueue;
 
 struct IDHash {

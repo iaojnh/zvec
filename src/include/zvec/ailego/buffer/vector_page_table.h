@@ -42,9 +42,6 @@
 namespace zvec {
 namespace ailego {
 
-using block_id_t = size_t;
-using version_t = size_t;
-
 class VectorPageTable {
   struct alignas(64) Entry {
     std::atomic<int> ref_count;

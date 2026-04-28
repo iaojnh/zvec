@@ -62,7 +62,6 @@ struct ParquetBufferID {
 class BlockEvictionQueue {
  public:
   struct BlockType {
-    // TODO: page_table & vector_block
     std::pair<block_id_t, version_t> vector_block;
     std::pair<ParquetBufferID, version_t> parquet_buffer_block;
     VectorPageTable *page_table{nullptr};
