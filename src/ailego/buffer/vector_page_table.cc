@@ -49,7 +49,7 @@ void VectorPageTable::init(size_t entry_num) {
   entries_ = new Entry[entry_num_];
   for (size_t i = 0; i < entry_num_; i++) {
     entries_[i].ref_count.store(std::numeric_limits<int>::min());
-    entries_[i].in_lru.store(false);
+    entries_[i].in_evict_queue.store(false);
     entries_[i].buffer = nullptr;
   }
 }
@@ -76,10 +76,10 @@ void VectorPageTable::release_block(block_id_t block_id) {
 
   if (entry.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
     std::atomic_thread_fence(std::memory_order_acquire);
-    // Attempt to transition in_lru from false -> true.  The CAS ensures only
-    // one thread enqueues this block even if multiple threads race here.
+    // Attempt to transition in_evict_queue from false -> true.  The CAS ensures
+    // only one thread enqueues this block even if multiple threads race here.
     bool expected = false;
-    if (entry.in_lru.compare_exchange_strong(expected, true,
+    if (entry.in_evict_queue.compare_exchange_strong(expected, true,
                                              std::memory_order_acq_rel,
                                              std::memory_order_relaxed)) {
       BlockEvictionQueue::BlockType block;
@@ -88,7 +88,7 @@ void VectorPageTable::release_block(block_id_t block_id) {
       block.vector_block.second = 0;
       BlockEvictionQueue::get_instance().add_single_block(block, 0);
     }
-    // else: block is already in the LRU queue; do not add a duplicate entry.
+    // else: block is already in the eviction queue; do not add a duplicate entry.
   }
 }
 
@@ -104,12 +104,12 @@ void VectorPageTable::evict_block(block_id_t block_id) {
       MemoryLimitPool::get_instance().release_buffer(buffer, size);
     }
   }
-  // Always reset in_lru regardless of whether the CAS succeeded:
+  // Always reset in_evict_queue regardless of whether the CAS succeeded:
   //  - On success: the block is evicted; future releases should re-register it.
   //  - On failure: the block was re-acquired by another thread between the
-  //    ref-count check and this call.  Clearing in_lru lets the next
+  //    ref-count check and this call.  Clearing in_evict_queue lets the next
   //    release_block() re-enqueue it so it is not silently lost.
-  entry.in_lru.store(false, std::memory_order_relaxed);
+  entry.in_evict_queue.store(false, std::memory_order_relaxed);
 }
 
 char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
@@ -135,9 +135,10 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
     } else {
       entry.buffer = buffer;
       entry.size = size;
-      // Ensure in_lru is cleared when the block is freshly loaded so that
-      // the first release_block() after loading can register it in LRU.
-      entry.in_lru.store(false, std::memory_order_relaxed);
+      // Ensure in_evict_queue is cleared when the block is freshly loaded so
+      // that the first release_block() after loading can register it in the
+      // eviction queue.
+      entry.in_evict_queue.store(false, std::memory_order_relaxed);
       entry.ref_count.store(1, std::memory_order_release);
       return entry.buffer;
     }

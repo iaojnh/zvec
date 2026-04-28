@@ -48,7 +48,11 @@ using version_t = size_t;
 class VectorPageTable {
   struct alignas(64) Entry {
     std::atomic<int> ref_count;
-    std::atomic<bool> in_lru;
+    // True when this block has been enqueued in BlockEvictionQueue and has not
+    // yet been evicted. Used in release_block() to suppress duplicate
+    // insertions: once a block is in the eviction queue we never push it again
+    // until it is evicted (which resets the flag).
+    std::atomic<bool> in_evict_queue;
     char *buffer;
     size_t size;
   };
@@ -93,7 +97,7 @@ class VectorPageTable {
   // Used by BlockEvictionQueue to detect stale queue entries.
   inline bool is_dead_block(BlockEvictionQueue::BlockType block) const {
     Entry &entry = entries_[block.vector_block.first];
-    return !entry.in_lru.load(std::memory_order_relaxed);
+    return !entry.in_evict_queue.load(std::memory_order_relaxed);
   }
 
  private:
