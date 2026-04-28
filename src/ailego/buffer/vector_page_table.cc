@@ -151,6 +151,7 @@ VecBufferPool::VecBufferPool(const std::string &filename) {
   fd_ = _open(filename.c_str(), O_RDONLY | _O_BINARY);
 #else
   fd_ = open(filename.c_str(), O_RDONLY);
+  fd2_ = open(filename.c_str(), O_RDONLY | O_DIRECT);
 #endif
   if (fd_ < 0) {
     throw std::runtime_error("Failed to open file: " + filename);
@@ -224,7 +225,7 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
 #if defined(_MSC_VER)
   ssize_t read_bytes = zvec_pread(fd_, buffer, size, offset);
 #else
-  ssize_t read_bytes = pread(fd_, buffer, size, offset);
+  ssize_t read_bytes = pread(fd2_, buffer, size, offset);
 #endif
   if (read_bytes != static_cast<ssize_t>(size)) {
     LOG_ERROR("Buffer pool failed to read file at offset: %zu, size: %zu",

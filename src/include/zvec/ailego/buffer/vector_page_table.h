@@ -138,7 +138,7 @@ class VecBufferPool {
   }
 
  private:
-  int fd_;
+  int fd_, fd2_;
   size_t file_size_;
 
  public:
