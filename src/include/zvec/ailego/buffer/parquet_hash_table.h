@@ -27,7 +27,7 @@
 #include <arrow/api.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/pattern/singleton.h>
-#include "lru_cache.h"
+#include "block_eviction_queue.h"
 
 namespace arrow {
 class ChunkedArray;
@@ -46,7 +46,7 @@ namespace ailego {
 using block_id_t = size_t;
 using version_t = size_t;
 
-class LRUCache;
+class BlockEvictionQueue;
 
 struct IDHash {
   size_t operator()(const ParquetBufferID &buffer_id) const {
@@ -142,7 +142,7 @@ class ParquetBufferPool {
 
   void evict(ParquetBufferID buffer_id);
 
-  bool is_dead_node(LRUCache::BlockType &block);
+  bool is_dead_node(BlockEvictionQueue::BlockType &block);
 
   static ParquetBufferPool &get_instance() {
     static ParquetBufferPool instance;

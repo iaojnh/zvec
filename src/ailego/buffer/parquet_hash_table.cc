@@ -118,7 +118,7 @@ ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
     bool found = !MemoryLimitPool::get_instance().is_full();
     if (!found) {
       for (int i = 0; i < 5; i++) {
-        LRUCache::get_instance().recycle();
+        BlockEvictionQueue::get_instance().recycle();
         found = !MemoryLimitPool::get_instance().is_full();
         if (found) {
           break;
@@ -220,10 +220,10 @@ void ParquetBufferPool::release(ParquetBufferID buffer_id) {
   ParquetBufferContext &context = table_[buffer_id];
   if (context.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
     std::atomic_thread_fence(std::memory_order_acquire);
-    LRUCache::BlockType block;
+    BlockEvictionQueue::BlockType block;
     block.parquet_buffer_block.first = buffer_id;
     block.parquet_buffer_block.second = context.load_count.load();
-    LRUCache::get_instance().add_single_block(block, 0);
+    BlockEvictionQueue::get_instance().add_single_block(block, 0);
   }
 }
 
@@ -243,7 +243,7 @@ void ParquetBufferPool::evict(ParquetBufferID buffer_id) {
   }
 }
 
-bool ParquetBufferPool::is_dead_node(LRUCache::BlockType &block) {
+bool ParquetBufferPool::is_dead_node(BlockEvictionQueue::BlockType &block) {
   std::shared_lock<std::shared_mutex> lock(table_mutex_);
   auto iter = table_.find(block.parquet_buffer_block.first);
   if (iter == table_.end()) {

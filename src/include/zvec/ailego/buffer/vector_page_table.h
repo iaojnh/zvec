@@ -33,7 +33,7 @@
 #include <unordered_map>
 #include <zvec/ailego/internal/platform.h>
 #include "concurrentqueue.h"
-#include "lru_cache.h"
+#include "block_eviction_queue.h"
 
 #if defined(_MSC_VER)
 #include <io.h>
@@ -59,10 +59,10 @@ class VectorPageTable {
 
  public:
   VectorPageTable() : entry_num_(0), entries_(nullptr) {
-    LRUCache::get_instance().set_valid(this);
+    BlockEvictionQueue::get_instance().set_valid(this);
   }
   ~VectorPageTable() {
-    LRUCache::get_instance().set_invalid(this);
+    BlockEvictionQueue::get_instance().set_invalid(this);
     delete[] entries_;
   }
 
@@ -92,10 +92,10 @@ class VectorPageTable {
     return entries_[block_id].ref_count.load(std::memory_order_relaxed) <= 0;
   }
 
-  // Returns true if the block is no longer registered in the LRU (either it
-  // was never added, or it has already been evicted).  Used by LRUCache to
-  // detect stale queue entries.
-  inline bool is_dead_block(LRUCache::BlockType block) const {
+  // Returns true if the block is no longer registered in the eviction queue
+  // (either it was never added, or it has already been evicted).
+  // Used by BlockEvictionQueue to detect stale queue entries.
+  inline bool is_dead_block(BlockEvictionQueue::BlockType block) const {
     Entry &entry = entries_[block.vector_block.first];
     return !entry.in_lru.load(std::memory_order_relaxed);
   }
@@ -148,8 +148,6 @@ class VecBufferPool {
 
  public:
   VectorPageTable page_table_;
-
- private:
   std::vector<std::unique_ptr<std::mutex>> block_mutexes_;
 };
 

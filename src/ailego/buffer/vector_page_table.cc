@@ -82,11 +82,11 @@ void VectorPageTable::release_block(block_id_t block_id) {
     if (entry.in_lru.compare_exchange_strong(expected, true,
                                              std::memory_order_acq_rel,
                                              std::memory_order_relaxed)) {
-      LRUCache::BlockType block;
+      BlockEvictionQueue::BlockType block;
       block.page_table = this;
       block.vector_block.first = block_id;
       block.vector_block.second = 0;
-      LRUCache::get_instance().add_single_block(block, 0);
+      BlockEvictionQueue::get_instance().add_single_block(block, 0);
     }
     // else: block is already in the LRU queue; do not add a duplicate entry.
   }
@@ -208,7 +208,7 @@ char *VecBufferPool::acquire_buffer(block_id_t block_id, size_t offset,
         MemoryLimitPool::get_instance().try_acquire_buffer(size, buffer);
     if (!found) {
       for (int i = 0; i < retry; i++) {
-        LRUCache::get_instance().recycle();
+        BlockEvictionQueue::get_instance().recycle();
         found =
             MemoryLimitPool::get_instance().try_acquire_buffer(size, buffer);
         if (found) {

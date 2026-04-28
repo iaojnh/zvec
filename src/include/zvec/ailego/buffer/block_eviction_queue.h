@@ -59,7 +59,7 @@ struct ParquetBufferID {
   ParquetBufferID(std::string &filename, int column, int row_group);
 };
 
-class LRUCache {
+class BlockEvictionQueue {
  public:
   struct BlockType {
     // TODO: page_table & vector_block
@@ -69,14 +69,14 @@ class LRUCache {
   };
   typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;
 
-  static LRUCache &get_instance() {
-    static LRUCache instance;
+  static BlockEvictionQueue &get_instance() {
+    static BlockEvictionQueue instance;
     return instance;
   }
-  LRUCache(const LRUCache &) = delete;
-  LRUCache &operator=(const LRUCache &) = delete;
-  LRUCache(LRUCache &&) = delete;
-  LRUCache &operator=(LRUCache &&) = delete;
+  BlockEvictionQueue(const BlockEvictionQueue &) = delete;
+  BlockEvictionQueue &operator=(const BlockEvictionQueue &) = delete;
+  BlockEvictionQueue(BlockEvictionQueue &&) = delete;
+  BlockEvictionQueue &operator=(BlockEvictionQueue &&) = delete;
 
   int init();
 
@@ -111,7 +111,7 @@ class LRUCache {
   void recycle();
 
  private:
-  LRUCache() {
+  BlockEvictionQueue() {
     init();
   }
 

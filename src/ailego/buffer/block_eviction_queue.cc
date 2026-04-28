@@ -19,7 +19,7 @@
 namespace zvec {
 namespace ailego {
 
-int LRUCache::init() {
+int BlockEvictionQueue::init() {
   evict_batch_size_ = 512;
   for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
     evict_queues_.push_back(ConcurrentQueue(evict_batch_size_ * 200));
@@ -27,7 +27,7 @@ int LRUCache::init() {
   return 0;
 }
 
-bool LRUCache::evict_single_block(BlockType &item) {
+bool BlockEvictionQueue::evict_single_block(BlockType &item) {
   bool found = false;
   for (size_t i = 0; i < CACHE_QUEUE_NUM; i++) {
     found = evict_queues_[i].try_dequeue(item);
@@ -38,7 +38,7 @@ bool LRUCache::evict_single_block(BlockType &item) {
   return found;
 }
 
-bool LRUCache::is_valid_and_alive(const BlockType &item) {
+bool BlockEvictionQueue::is_valid_and_alive(const BlockType &item) {
   std::shared_lock<std::shared_mutex> lock(valid_page_tables_mutex_);
   if (valid_page_tables_.find(item.page_table) == valid_page_tables_.end()) {
     return false;
@@ -49,7 +49,7 @@ bool LRUCache::is_valid_and_alive(const BlockType &item) {
   return !item.page_table->is_dead_block(item);
 }
 
-bool LRUCache::evict_block(BlockType &item) {
+bool BlockEvictionQueue::evict_block(BlockType &item) {
   bool ok = false;
   do {
     ok = evict_single_block(item);
@@ -67,7 +67,7 @@ bool LRUCache::evict_block(BlockType &item) {
   return ok;
 }
 
-void LRUCache::recycle() {
+void BlockEvictionQueue::recycle() {
   BlockType item;
   while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
     if (item.page_table) {
@@ -82,7 +82,7 @@ void LRUCache::recycle() {
   }
 }
 
-bool LRUCache::add_single_block(const BlockType &block, int queue_index) {
+bool BlockEvictionQueue::add_single_block(const BlockType &block, int queue_index) {
   bool ok = evict_queues_[queue_index].enqueue(block);
   if (!ok) {
     LOG_ERROR("enqueue failed.");
@@ -93,7 +93,7 @@ bool LRUCache::add_single_block(const BlockType &block, int queue_index) {
 
 int MemoryLimitPool::init(size_t pool_size) {
   pool_size_ = 0;
-  LRUCache::get_instance().recycle();
+  BlockEvictionQueue::get_instance().recycle();
   pool_size_ = pool_size;
   LOG_INFO("MemoryLimitPool initialized with pool size: %lu", pool_size_);
   return 0;
