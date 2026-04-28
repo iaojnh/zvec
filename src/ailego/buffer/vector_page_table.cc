@@ -79,16 +79,17 @@ void VectorPageTable::release_block(block_id_t block_id) {
     // Attempt to transition in_evict_queue from false -> true.  The CAS ensures
     // only one thread enqueues this block even if multiple threads race here.
     bool expected = false;
-    if (entry.in_evict_queue.compare_exchange_strong(expected, true,
-                                             std::memory_order_acq_rel,
-                                             std::memory_order_relaxed)) {
+    if (entry.in_evict_queue.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
       BlockEvictionQueue::BlockType block;
       block.page_table = this;
       block.vector_block.first = block_id;
       block.vector_block.second = 0;
       BlockEvictionQueue::get_instance().add_single_block(block, 0);
     }
-    // else: block is already in the eviction queue; do not add a duplicate entry.
+    // else: block is already in the eviction queue; do not add a duplicate
+    // entry.
   }
 }
 

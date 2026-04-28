@@ -82,7 +82,8 @@ void BlockEvictionQueue::recycle() {
   }
 }
 
-bool BlockEvictionQueue::add_single_block(const BlockType &block, int queue_index) {
+bool BlockEvictionQueue::add_single_block(const BlockType &block,
+                                          int queue_index) {
   bool ok = evict_queues_[queue_index].enqueue(block);
   if (!ok) {
     LOG_ERROR("enqueue failed.");
