@@ -77,7 +77,6 @@ int ChunkBroker::load_storage(uint32_t &chunk_size) {
         "Using index value to keep compatibility.",
         chunk_size, (size_t)chunk_meta_.chunk_size);
   }
-  // [REVIEW] 此处 uint64_t → uint32_t 的隐式窄化截断，上方已详述风险。
   chunk_size = chunk_meta_.chunk_size;
 
   *stats_.mutable_check_point() = stg_->check_point();
