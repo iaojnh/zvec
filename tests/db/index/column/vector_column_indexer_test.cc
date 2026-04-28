@@ -17,7 +17,7 @@
 #include <cassert>
 #include <cstdint>
 #include <gtest/gtest.h>
-#include <zvec/ailego/buffer/lru_cache.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "tests/test_util.h"
 #include "zvec/ailego/utility/float_helper.h"

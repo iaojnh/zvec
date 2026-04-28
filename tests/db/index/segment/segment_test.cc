@@ -38,7 +38,7 @@
 #include "db/index/storage/wal/wal_file.h"
 #include "utils/utils.h"
 #include "zvec/db/options.h"
-#include <zvec/ailego/buffer/lru_cache.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 
 using namespace zvec;
 
