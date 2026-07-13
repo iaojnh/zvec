@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "python_config.h"
+#include <ailego/io/io_backend.h>
 #include <pybind11/stl.h>
 
 namespace zvec {
@@ -217,6 +218,30 @@ void ZVecPyConfig::Initialize(pybind11::module_ &m) {
       "get_default_jieba_dict_dir",
       []() -> std::string { return GlobalConfig::Instance().jieba_dict_dir(); },
       "Read the currently registered default jieba dict directory.");
+
+  // Returns the current I/O backend type for DiskAnn async disk reads.
+  // Pure introspection \u2014 no side effects, no install hints.
+  m.def(
+      "io_backend_type",
+      []() -> ailego::IOBackendType {
+        return ailego::IOBackend::Instance().available();
+      },
+      "Returns the current I/O backend type for DiskAnn async disk reads "
+      "as an IOBackendType enum (zvec.typing.IOBackendType). "
+      "IOBackendType.LIBAIO if libaio is available, "
+      "IOBackendType.PREAD otherwise.");
+
+  // Returns a human-readable description of the I/O backend, including
+  // installation guidance for libaio when only pread is available.
+  m.def(
+      "io_backend_description",
+      []() -> std::string {
+        auto type = ailego::IOBackend::Instance().available();
+        return ailego::IOBackendDescription(type);
+      },
+      "Returns a human-readable description of the current I/O backend. "
+      "When only pread is available, includes instructions for installing "
+      "libaio to enable async I/O.");
 }
 
 

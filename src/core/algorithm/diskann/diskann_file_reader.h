@@ -18,7 +18,7 @@
 #include <fcntl.h>
 
 #if (defined(__linux) || defined(__linux__))
-#include <libaio.h>
+#include <ailego/io/libaio_loader.h>  // dlopen-based libaio wrapper
 #endif
 
 #include <unistd.h>

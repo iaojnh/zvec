@@ -29,6 +29,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <ailego/io/io_backend.h>
 #include <zvec/db/collection.h>
 #include <zvec/db/config.h>
 #include <zvec/db/doc.h>
@@ -756,6 +757,44 @@ const char *zvec_get_default_jieba_dict_dir(void) {
   // Thread-local buffer keeps c_str() valid until the next call on this thread.
   thread_local std::string cached;
   cached = zvec::GlobalConfig::Instance().jieba_dict_dir();
+  return cached.c_str();
+}
+
+// =============================================================================
+// I/O Backend Introspection
+// =============================================================================
+
+zvec_io_backend_type_t zvec_get_io_backend_type(void) {
+  auto type = zvec::ailego::IOBackend::Instance().available();
+  switch (type) {
+    case zvec::ailego::IOBackendType::kLibAio:
+      return ZVEC_IO_BACKEND_TYPE_LIBAIO;
+    case zvec::ailego::IOBackendType::kPread:
+    default:
+      return ZVEC_IO_BACKEND_TYPE_PREAD;
+  }
+}
+
+const char *zvec_get_io_backend_type_name(zvec_io_backend_type_t type) {
+  thread_local std::string cached;
+  zvec::ailego::IOBackendType cpp_type;
+  switch (type) {
+    case ZVEC_IO_BACKEND_TYPE_LIBAIO:
+      cpp_type = zvec::ailego::IOBackendType::kLibAio;
+      break;
+    case ZVEC_IO_BACKEND_TYPE_PREAD:
+    default:
+      cpp_type = zvec::ailego::IOBackendType::kPread;
+      break;
+  }
+  cached = zvec::ailego::IOBackendTypeName(cpp_type);
+  return cached.c_str();
+}
+
+const char *zvec_get_io_backend_description(void) {
+  thread_local std::string cached;
+  auto type = zvec::ailego::IOBackend::Instance().available();
+  cached = zvec::ailego::IOBackendDescription(type);
   return cached.c_str();
 }
 
@@ -2800,12 +2839,16 @@ const char *zvec_index_type_to_string(zvec_index_type_t index_type) {
       return "IVF";
     case ZVEC_INDEX_TYPE_FLAT:
       return "FLAT";
+    case ZVEC_INDEX_TYPE_HNSW_RABITQ:
+      return "HNSW_RABITQ";
+    case ZVEC_INDEX_TYPE_DISKANN:
+      return "DISKANN";
+    case ZVEC_INDEX_TYPE_VAMANA:
+      return "VAMANA";
     case ZVEC_INDEX_TYPE_INVERT:
       return "INVERT";
     case ZVEC_INDEX_TYPE_FTS:
       return "FTS";
-    case ZVEC_INDEX_TYPE_DISKANN:
-      return "DiskANN";
     default:
       return "UNKNOWN_INDEX_TYPE";
   }
