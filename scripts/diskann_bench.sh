@@ -71,6 +71,14 @@ RECALL_THREAD_COUNT="${RECALL_THREAD_COUNT:-16}"
 RECALL_SCORE_PRECISION="${RECALL_SCORE_PRECISION:-1e-4}"
 CONTAINER_TYPE="${CONTAINER_TYPE:-FileReadStorage}"    # 或 MMapFileReadStorage(全内存)
 
+# ---- 预热（套件级）----
+# 正式测试前先空跑一遍（丢弃结果），把索引文件灌进 OS page cache，
+# 避免“第一个跑的点”因冷缓存出现长尾（使 18 个数据点缓存状态一致）。
+# 注：仅作用于“运行间”缓存状态，不改变单次 bench 内部计时方式，与原文档同口径。
+DO_WARMUP="${DO_WARMUP:-1}"
+WARMUP_SECS="${WARMUP_SECS:-10}"          # 预热运行时长(秒)
+WARMUP_LIST_SIZE="${WARMUP_LIST_SIZE:-500}"  # 用较大 list_size 预热，触及更多索引页
+
 # ---- 行为开关 ----
 DO_BUILD="${DO_BUILD:-1}"       # 0 = 跳过构建，直接用已存在的索引
 DO_RECALL="${DO_RECALL:-1}"
@@ -101,6 +109,19 @@ dtype_of() {
 index_path_of() {
   # 每种 converter 一个独立索引文件
   echo "${WORK_DIR}/diskann_$(dtype_of "$1").index"
+}
+
+# 套件级预热：对给定索引空跑一遍 bench，丢弃结果，只为灌热 page cache
+warmup_index() {
+  local index_path="$1" dt="$2"
+  local warm_yaml="${WORK_DIR}/warmup_${dt}.yml"
+  local warm_log="${WORK_DIR}/warmup_${dt}.log"
+  # 用单线程、较大 list_size、短时长空跑
+  local saved_secs="${BENCH_SECS}"
+  BENCH_SECS="${WARMUP_SECS}"
+  gen_search_yaml "$index_path" "$WARMUP_LIST_SIZE" "1" "$warm_yaml"
+  BENCH_SECS="${saved_secs}"
+  "$BENCH_BIN" "$warm_yaml" > "$warm_log" 2>&1
 }
 
 human_size() {
@@ -283,6 +304,14 @@ for converter in $CONVERTERS; do
     echo "index_size_bytes=NA (index not found: ${INDEX_PATH})" | tee -a "$REPORT_FILE"
   fi
   echo "" | tee -a "$REPORT_FILE"
+
+  # -------- 套件级预热（丢弃结果，灌热 page cache）--------
+  if [ "$DO_WARMUP" = "1" ] && [ -e "$INDEX_PATH" ]; then
+    echo "[WARMUP] dtype=${DT} list_size=${WARMUP_LIST_SIZE} secs=${WARMUP_SECS} (结果丢弃)" | tee -a "$REPORT_FILE"
+    warmup_index "$INDEX_PATH" "$DT"
+    echo "warmup_done=1" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+  fi
 
   # -------- 召回 (每个 list_size 一次) --------
   if [ "$DO_RECALL" = "1" ]; then
