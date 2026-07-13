@@ -197,7 +197,8 @@ Status FieldSchema::validate() const {
       }
 
       if (index_params_->type() == IndexType::DISKANN) {
-        // DiskAnn requires Linux x86_64/i686/i386.  The CMake variable
+        // DiskAnn requires Linux x86_64/i686/i386/aarch64/arm64/riscv64.  The
+        // CMake variable
         // DISKANN_SUPPORTED (defined in the top-level CMakeLists.txt) is the
         // single source of truth for platform eligibility — it is also used by
         // index_factory.cc to conditionally compile the DiskAnn index
@@ -209,7 +210,8 @@ Status FieldSchema::validate() const {
         // back to synchronous pread() with degraded performance.
 #if !DISKANN_SUPPORTED
         return Status::NotSupported(
-            "DiskAnn is not supported on this platform (Linux x86_64 only)");
+            "DiskAnn is not supported on this platform (Linux x86_64 / arm64 / "
+            "riscv64 only)");
 #endif
       }
 
