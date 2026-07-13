@@ -122,14 +122,14 @@ else()
 endif()
 message(STATUS "RABITQ_ARCH_FLAG: ${RABITQ_ARCH_FLAG}")
 
-# DiskAnn support (Linux x86_64 only, requires libaio)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i686|i386" AND NOT ANDROID AND NOT IOS)
+# DiskAnn support (Linux x86_64 / arm64 / riscv64, requires libaio)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i686|i386|aarch64|arm64|riscv64" AND NOT ANDROID AND NOT IOS)
   set(DISKANN_SUPPORTED ON)
   add_definitions(-DDISKANN_SUPPORTED=1)
 else()
   set(DISKANN_SUPPORTED OFF)
   add_definitions(-DDISKANN_SUPPORTED=0)
-  message(STATUS "DiskAnn support disabled - only supported on Linux x86_64")
+  message(STATUS "DiskAnn support disabled - only supported on Linux x86_64 / arm64 / riscv64")
 endif()
 message(STATUS "DISKANN_SUPPORTED: ${DISKANN_SUPPORTED}")
 
@@ -189,11 +189,12 @@ if(BUILD_PYTHON_BINDINGS)
     # zvec package directory as well.
     #
     # Gate on DISKANN_SUPPORTED, not on the target's existence: on unsupported
-    # platforms (e.g. macOS / ARM64) the core_knn_diskann target is still
+    # platforms (e.g. macOS / Windows) the core_knn_diskann target is still
     # defined, but built from an empty stub (src/core/algorithm/CMakeLists.txt)
     # with zero exported symbols and a runtime load path compiled out
     # (#if DISKANN_SUPPORTED). Shipping that stub is pure dead weight, so it is
-    # only packaged where DiskAnn is real — currently Linux x86_64 with libaio.
+    # only packaged where DiskAnn is real — currently Linux x86_64 / arm64 with
+    # libaio.
     if(DISKANN_SUPPORTED)
         install(TARGETS core_knn_diskann LIBRARY DESTINATION ${ZVEC_PY_INSTALL_DIR}/zvec
                 COMPONENT python)
