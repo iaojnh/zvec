@@ -48,7 +48,7 @@ int EnsureDiskAnnRuntimeReady() {
             "or 'libaio1t64' on Ubuntu 24.04+) and retry.");
         break;
       case kDiskAnnPluginUnsupportedPlatform:
-        LOG_ERROR("DiskAnn is only supported on Linux x86_64.");
+        LOG_ERROR("DiskAnn is only supported on Linux (x86_64 / arm64).");
         break;
       case kDiskAnnPluginDlopenFailed:
       default:

@@ -242,7 +242,7 @@ int LoadDiskAnnPlugin(const std::string &path) {
   if (!kPlatformSupportsDiskAnnPlugin) {
     LOG_ERROR(
         "DiskAnn plugin is not supported on this platform; it is only "
-        "available on Linux x86_64 with libaio.");
+        "available on Linux (x86_64 / arm64) with libaio.");
     return kDiskAnnPluginUnsupportedPlatform;
   }
 
