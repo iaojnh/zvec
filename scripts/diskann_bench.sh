@@ -40,6 +40,8 @@ DATASET_NAME="${DATASET_NAME:-Cohere-1M}"
 BUILD_FILE="${BUILD_FILE:-/home/admin/yinzefeng.yzf/test_luofeng/cohere_1m/cohere_train_vector_1m.new.txt.vecs}"
 TRAIN_FILE="${TRAIN_FILE:-${BUILD_FILE}}"
 QUERY_FILE="${QUERY_FILE:-/home/admin/yinzefeng.yzf/test_luofeng/cohere_1m/cohere_test_vector_1000.new.txt}"
+# GROUNDTRUTH_FILE 可选：留空则由 recall_original 用暴力线性检索(load_gt_dense)自动生成 GT。
+#   注意：自动生成是对全量底库做 brute-force，数据量大时会很慢；有现成 GT 建议填上。
 GROUNDTRUTH_FILE="${GROUNDTRUTH_FILE:-/home/admin/yinzefeng.yzf/test_luofeng/cohere_1m/neighbors.txt}"
 METRIC_NAME="${METRIC_NAME:-Cosine}"
 QUERY_TYPE="${QUERY_TYPE:-float}"
@@ -147,7 +149,6 @@ SearcherCommon:
   QueryType: ${QUERY_TYPE}
   QueryFirstSep: "${QUERY_FIRST_SEP}"
   QuerySecondSep: "${QUERY_SECOND_SEP}"
-  GroundTruthFile: ${GROUNDTRUTH_FILE}
   RecallThreadCount: ${RECALL_THREAD_COUNT}
   RecallScorePrecision: ${RECALL_SCORE_PRECISION}
   BenchThreadCount: ${bench_threads}
@@ -156,6 +157,13 @@ SearcherCommon:
   CompareById: true
   ContainerType: ${CONTAINER_TYPE}
   LogLevel: Info
+EOF
+  # 仅当提供了 GroundTruthFile 时才写入该行；
+  # 留空则整行省略，recall_original 会用暴力线性检索(load_gt_dense)自动生成 GT。
+  if [ -n "${GROUNDTRUTH_FILE}" ]; then
+    echo "  GroundTruthFile: ${GROUNDTRUTH_FILE}" >> "$out"
+  fi
+  cat >> "$out" <<EOF
 
 SearcherParams:
   zvec.diskann.searcher.cache_node_num: ${CACHE_NODE_NUM}
