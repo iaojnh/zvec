@@ -11,10 +11,12 @@ file(GLOB_RECURSE ALL_SRCS *.cc *.c)
 #
 # libaio is loaded at runtime via dlopen()/dlsym() (see libaio_loader.h), so
 # we do NOT link against -laio. The only system-level link dependency is
-# ${CMAKE_DL_LIBS} for dlopen/dlsym/dlclose.
+# ${CMAKE_DL_LIBS} for dlopen/dlsym/dlclose. This applies to Linux and Android
+# (both define __linux__ and compile the dlopen-based loader); on iOS the
+# loader is compiled out and ${CMAKE_DL_LIBS} is empty.
 set(CORE_KNN_DISKANN_LIBS core_framework core_knn_cluster)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i686|i386|aarch64|arm64|riscv64")
+if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i686|i386|aarch64|arm64|riscv64") OR ANDROID)
     list(APPEND CORE_KNN_DISKANN_LIBS ${CMAKE_DL_LIBS})
 endif()
 

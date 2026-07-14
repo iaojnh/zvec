@@ -122,15 +122,22 @@ else()
 endif()
 message(STATUS "RABITQ_ARCH_FLAG: ${RABITQ_ARCH_FLAG}")
 
-# DiskAnn support (Linux x86_64 / arm64 / riscv64; libaio loaded at runtime via
-# dlopen, with a synchronous pread() fallback when libaio is absent)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i686|i386|aarch64|arm64|riscv64" AND NOT ANDROID AND NOT IOS)
+# DiskAnn support: only requires POSIX file I/O (pread), which is available on
+# every POSIX platform. libaio (Linux) / io_uring are optional runtime
+# accelerations loaded via dlopen; when absent the reader falls back to a
+# synchronous pread() path that works everywhere. Enabled platforms:
+#   - Linux (x86_64 / arm64 / riscv64): libaio -> pread
+#   - Android (arm64-v8a / x86_64):      pread (Bionic ships no libaio)
+#   - iOS (arm64):                       pread (statically linked, no dlopen)
+# Windows / macOS use dedicated async backends handled elsewhere.
+if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i686|i386|aarch64|arm64|riscv64" AND NOT ANDROID AND NOT IOS)
+   OR ANDROID OR IOS)
   set(DISKANN_SUPPORTED ON)
   add_definitions(-DDISKANN_SUPPORTED=1)
 else()
   set(DISKANN_SUPPORTED OFF)
   add_definitions(-DDISKANN_SUPPORTED=0)
-  message(STATUS "DiskAnn support disabled - only supported on Linux x86_64 / arm64 / riscv64")
+  message(STATUS "DiskAnn support disabled - requires a POSIX (Linux / Android / iOS) platform")
 endif()
 message(STATUS "DISKANN_SUPPORTED: ${DISKANN_SUPPORTED}")
 
