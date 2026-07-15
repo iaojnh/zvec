@@ -276,11 +276,6 @@ int HnswStreamer::open(IndexStorage::Pointer stg) {
   if (ret != 0) {
     return ret;
   }
-
-  if (entity_->storage_mode() == HnswStorageMode::kBufferPool) {
-    static_cast<HnswBufferPoolStreamerEntity *>(entity_.get())
-        ->mark_upper_level_pages();
-  }
   IndexMeta index_meta;
   ret = entity_->get_index_meta(&index_meta);
   if (ret == IndexError_NoExist) {

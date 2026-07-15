@@ -14,11 +14,7 @@
 
 #pragma once
 
-#include <algorithm>
-#include <atomic>
-#include <cstring>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -868,23 +864,13 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
     return *reinterpret_cast<const key_t *>(base + offset);
   }
 
+  //! Direct vector pointer access (no MemoryBlock wrapper).
+  //! For use in the merged search loop to avoid intermediate allocations.
   ailego_force_inline const void *get_vector_ptr(node_id_t id) const {
     uint32_t chunk_idx = id >> node_index_mask_bits_;
     uint32_t offset = (id & node_index_mask_) * node_size();
     return get_node_chunk_base(chunk_idx) + offset;
   }
-
-  ailego_force_inline int resolve_vectors(const node_id_t *ids, uint32_t count,
-                                          const void **out) const {
-    for (uint32_t i = 0; i < count; ++i) out[i] = get_vector_ptr(ids[i]);
-    return 0;
-  }
-
-  ailego_force_inline void release_vectors() const {}
-  void submit_prefetch(const node_id_t *, uint32_t) const {}  // no-op
-  void harvest_prefetch() const {}  // no-op
-  void wait_prefetch() const {}  // no-op for mmap
-  void reset_io_budget(int32_t) const {}  // no-op for mmap
 
  protected:
   //! Get cached base address for a node chunk, syncing if needed
@@ -931,6 +917,7 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
   mutable std::vector<const char *> upper_neighbor_chunk_bases_{};
 };
 
+//! Typed entity subclass for buffer pool mode.
 class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
  public:
   using MemoryBlock = BufferPoolMemoryBlock;
@@ -941,8 +928,6 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
   HnswStorageMode storage_mode() const override {
     return HnswStorageMode::kBufferPool;
   }
-
-  const HnswEntity::Pointer clone() const override;
 
   inline TypedNeighbors get_neighbors_typed(level_t level, node_id_t id) const {
     return HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(level,
@@ -959,310 +944,6 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
   inline key_t get_key_typed(node_id_t id) const {
     return HnswStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(id);
   }
-
-  //! Set I/O budget for the current search.
-  //!   budget < 0  → blocking mode (always pread on miss)
-  //!   budget = 0  → non-blocking mode (FLT_MAX on miss)
-  //!   budget > 0  → allow up to N preads per search
-  void reset_io_budget(int32_t budget) const { io_budget_ = budget; }
-
-  int resolve_vectors(const node_id_t *ids, uint32_t count,
-                      const void **out) const {
-    ensure_pinned_pages();
-    if (ailego_unlikely(!pinned_pages_.bound())) return -1;
-    const size_t vec_sz = vector_size();
-    const size_t pg_sz = ailego::kVectorPageSize;
-
-    cross_page_used_ = 0;
-    if (cross_page_arena_.size() < count * vec_sz)
-      cross_page_arena_.resize(count * vec_sz);
-    for (uint32_t i = 0; i < count; ++i) {
-      const size_t abs_off = get_vector_abs_offset(ids[i]);
-      const auto page_id = static_cast<ailego::block_id_t>(abs_off / pg_sz);
-      const size_t intra = abs_off % pg_sz;
-      if (ailego_likely(intra + vec_sz <= pg_sz)) {
-        char *page = pinned_pages_.try_get_page(page_id);
-        if (!page) {
-          // Cache miss: check budget
-          if (io_budget_ != 0) {
-            page = pinned_pages_.get_page(page_id);
-            if (io_budget_ > 0) --io_budget_;
-          }
-          if (!page) { out[i] = nullptr; continue; }
-        }
-        out[i] = page + intra;
-      } else {
-        const size_t part1 = pg_sz - intra;
-        char *p1 = pinned_pages_.try_get_page(page_id);
-        char *p2 = pinned_pages_.try_get_page(page_id + 1);
-        if (!p1 && io_budget_ != 0) {
-          p1 = pinned_pages_.get_page(page_id);
-          if (io_budget_ > 0) --io_budget_;
-        }
-        if (!p2 && io_budget_ != 0) {
-          p2 = pinned_pages_.get_page(page_id + 1);
-          if (io_budget_ > 0) --io_budget_;
-        }
-        if (!p1 || !p2) { out[i] = nullptr; continue; }
-        char *scratch = cross_page_arena_.data() + cross_page_used_ * vec_sz;
-        ++cross_page_used_;
-        std::memcpy(scratch, p1 + intra, part1);
-        std::memcpy(scratch + part1, p2, vec_sz - part1);
-        out[i] = scratch;
-      }
-    }
-    return 0;
-  }
-
-  void release_vectors() const {
-    pinned_pages_.release_all();
-  }
-
-  //! Submit non-blocking AIO prefetch for the given node ids' vector pages.
-  void submit_prefetch(const node_id_t *ids, uint32_t count) const {
-    auto *pool = vec_buffer_pool();
-    if (!pool || !pool->aio_enabled()) return;
-    const size_t pg_sz = ailego::kVectorPageSize;
-    const size_t vec_sz = vector_size();
-    ailego::block_id_t page_ids[128];
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < count && n < 126; ++i) {
-      const size_t abs_off = get_vector_abs_offset(ids[i]);
-      auto pid = static_cast<ailego::block_id_t>(abs_off / pg_sz);
-      page_ids[n++] = pid;
-      // Cross-page: also prefetch the next page
-      const size_t intra = abs_off % pg_sz;
-      if (intra + vec_sz > pg_sz) {
-        page_ids[n++] = pid + 1;
-      }
-    }
-    if (n > 0) pool->submit_aio_async(page_ids, n);
-  }
-
-  //! Harvest previously submitted async AIO results (non-blocking).
-  void harvest_prefetch() const {
-    auto *pool = vec_buffer_pool();
-    if (pool) pool->harvest_aio();
-  }
-
-  //! Block until every page submitted via submit_prefetch() is resident.
-  //! After this a hop can resolve all its neighbour pages as cache hits, so
-  //! the read cost of a whole hop collapses to a single concurrent burst
-  //! instead of a chain of per-neighbour synchronous preads.
-  void wait_prefetch() const {
-    auto *pool = vec_buffer_pool();
-    if (pool) pool->wait_aio();
-  }
-
-  void mark_upper_level_pages() {
-    auto *pool = vec_buffer_pool();
-    if (!pool) return;
-    auto ep = entry_point();
-    auto max_lvl = cur_max_level();
-    if (ep == kInvalidNodeId || max_lvl == 0) return;
-
-    const uint32_t n = doc_cnt();
-    std::vector<bool> visited(n, false);
-    std::vector<node_id_t> upper_nodes;
-    upper_nodes.reserve(n / scaling_factor() + 64);
-    upper_nodes.push_back(ep);
-    visited[ep] = true;
-
-    for (level_t lvl = max_lvl; lvl >= 1; --lvl) {
-      for (size_t idx = 0; idx < upper_nodes.size(); ++idx) {
-        auto id = upper_nodes[idx];
-        auto it = upper_neighbor_index_->find(id);
-        if (it == upper_neighbor_index_->end()) continue;
-        auto meta =
-            reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
-        if (lvl > static_cast<level_t>(meta->bits.level)) continue;
-        auto neighbors = get_neighbors_typed(lvl, id);
-        for (uint32_t i = 0; i < neighbors.size(); ++i) {
-          auto nid = neighbors[i];
-          if (nid < n && !visited[nid]) {
-            visited[nid] = true;
-            upper_nodes.push_back(nid);
-          }
-        }
-      }
-    }
-
-    const size_t pg_sz = ailego::kVectorPageSize;
-    const size_t vec_sz = vector_size();
-    std::vector<ailego::block_id_t> page_ids;
-    page_ids.reserve(upper_nodes.size());
-    for (auto id : upper_nodes) {
-      const size_t abs_off = get_vector_abs_offset(id);
-      page_ids.push_back(static_cast<ailego::block_id_t>(abs_off / pg_sz));
-      const size_t intra = abs_off % pg_sz;
-      if (intra + vec_sz > pg_sz) {
-        page_ids.push_back(static_cast<ailego::block_id_t>(abs_off / pg_sz) +
-                           1);
-      }
-    }
-    std::sort(page_ids.begin(), page_ids.end());
-    page_ids.erase(std::unique(page_ids.begin(), page_ids.end()),
-                   page_ids.end());
-
-    size_t marked = 0;
-    for (auto pid : page_ids) {
-      pool->page_table_.set_evict_priority(pid, 2);
-      char *buf = pool->acquire_buffer(pid, 50);
-      if (buf) {
-        pool->page_table_.release_block(pid);
-        ++marked;
-      }
-    }
-    LOG_DEBUG(
-        "mark_upper_level_pages: marked %zu/%zu pages for %zu upper-level "
-        "nodes (maxLevel=%d, priority=2)",
-        marked, page_ids.size(), upper_nodes.size(), (int)max_lvl);
-  }
-
- private:
-  struct PinnedPageSet {
-    // Open-addressing set of pinned pages for a single search hop.  It must be
-    // able to hold every distinct page a hop touches, otherwise get_page()
-    // returns nullptr on overflow and the corresponding neighbor is silently
-    // dropped -- which measurably lowers recall vs mmap.  A hop resolves up to
-    // l0_neighbor_cnt() vectors and each vector may straddle a 4K page
-    // boundary (two pages), so the worst case is 2 * l0_neighbor_cnt() pages.
-    // The table is therefore sized from the entity's neighbor count at bind()
-    // time instead of a fixed constant (see reserve_for()).
-    static constexpr size_t kMinCapacity = 128;
-    static constexpr ailego::block_id_t kEmpty =
-        std::numeric_limits<ailego::block_id_t>::max();
-
-    PinnedPageSet() = default;
-    ~PinnedPageSet() {
-      release_all();
-    }
-    PinnedPageSet(const PinnedPageSet &) = delete;
-    PinnedPageSet &operator=(const PinnedPageSet &) = delete;
-
-    //! Bind to a pool and size the table to hold up to "max_pages" distinct
-    //! entries without ever hitting the load-factor cap.
-    void bind(ailego::VecBufferPool *pool, size_t max_pages) {
-      pool_ = pool;
-      reserve_for(max_pages);
-    }
-    bool bound() const {
-      return pool_ != nullptr;
-    }
-
-    //! Try to get a page WITHOUT triggering disk I/O.
-    //! Returns buffer if page is in PinnedPageSet or already in pool memory.
-    //! Returns nullptr if page would need a pread (cache miss) or set is full.
-    char *try_get_page(ailego::block_id_t page_id) {
-      size_t slot = static_cast<size_t>(page_id) & mask_;
-      for (size_t probe = 0; probe < capacity_; ++probe) {
-        if (ids_[slot] == page_id) return bufs_[slot];
-        if (ids_[slot] == kEmpty) {
-          if (ailego_unlikely(count_ >= max_load_)) {
-            return nullptr;
-          }
-          char *buf = pool_->try_acquire_buffer(page_id);
-          if (!buf) return nullptr;  // page not in memory, skip
-          ids_[slot] = page_id;
-          bufs_[slot] = buf;
-          ++count_;
-          return buf;
-        }
-        slot = (slot + 1) & mask_;
-      }
-      return nullptr;
-    }
-
-    //! Get a page WITH blocking pread if not in cache.
-    //! Returns nullptr only if PinnedPageSet is full or pool alloc fails.
-    char *get_page(ailego::block_id_t page_id) {
-      size_t slot = static_cast<size_t>(page_id) & mask_;
-      for (size_t probe = 0; probe < capacity_; ++probe) {
-        if (ids_[slot] == page_id) return bufs_[slot];
-        if (ids_[slot] == kEmpty) {
-          if (ailego_unlikely(count_ >= max_load_)) {
-            return nullptr;
-          }
-          char *buf = pool_->acquire_buffer(page_id, 50);
-          if (ailego_unlikely(!buf)) return nullptr;
-          ids_[slot] = page_id;
-          bufs_[slot] = buf;
-          ++count_;
-          return buf;
-        }
-        slot = (slot + 1) & mask_;
-      }
-      return nullptr;
-    }
-
-    void release_all() {
-      if (!pool_ || count_ == 0) return;
-      for (size_t i = 0; i < capacity_; ++i) {
-        if (ids_[i] != kEmpty) {
-          pool_->page_table_.release_block(ids_[i]);
-          ids_[i] = kEmpty;
-          bufs_[i] = nullptr;
-        }
-      }
-      count_ = 0;
-    }
-
-   private:
-    //! Size the table so its 75% load-factor cap covers "max_pages" entries.
-    //! Capacity is rounded up to a power of two so the mask-based probe works.
-    void reserve_for(size_t max_pages) {
-      size_t need = (max_pages * 4 + 2) / 3 + 1;  // invert 3/4 load factor
-      size_t cap = kMinCapacity;
-      while (cap < need) cap <<= 1;
-      if (cap == capacity_ && !ids_.empty()) {
-        release_all();
-        return;
-      }
-      capacity_ = cap;
-      mask_ = cap - 1;
-      max_load_ = cap * 3 / 4;
-      ids_.assign(cap, kEmpty);
-      bufs_.assign(cap, nullptr);
-      count_ = 0;
-    }
-
-    ailego::VecBufferPool *pool_{nullptr};
-    std::vector<ailego::block_id_t> ids_{};
-    std::vector<char *> bufs_{};
-    size_t capacity_{0};
-    size_t mask_{0};
-    size_t max_load_{0};
-    size_t count_{0};
-  };
-
-  ailego::VecBufferPool *vec_buffer_pool() const {
-    if (broker_ && broker_->storage()) {
-      return broker_->storage()->vec_buffer_pool();
-    }
-    return nullptr;
-  }
-
-  size_t get_vector_abs_offset(node_id_t id) const {
-    auto loc = get_vector_chunk_loc(id);
-    return node_chunks_[loc.first]->abs_data_offset() + loc.second;
-  }
-
-  void ensure_pinned_pages() const {
-    if (!pinned_pages_.bound()) {
-      auto *pool = vec_buffer_pool();
-      if (pool) {
-        // A single hop resolves up to l0_neighbor_cnt() vectors, each of which
-        // may straddle a 4K page boundary (two pages).  Size the set to the
-        // worst case so a hop never overflows and silently drops neighbors.
-        pinned_pages_.bind(pool, 2 * l0_neighbor_cnt() + 2);
-      }
-    }
-  }
-
-  mutable PinnedPageSet pinned_pages_;
-  mutable std::vector<char> cross_page_arena_;
-  mutable uint32_t cross_page_used_{0};
-  mutable int32_t io_budget_{0};  // <0: blocking, 0: non-blocking, >0: limited
 };
 
 //! Typed entity subclass for contiguous memory mode.
@@ -1372,25 +1053,17 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
     return HnswMmapStreamerEntity::get_key_typed(id);
   }
 
+  //! Direct vector pointer from flat vector array (stride = vector_size).
+  //! For use in the merged search loop to avoid intermediate allocations.
   ailego_force_inline const void *get_vector_ptr(node_id_t id) const {
     if (ailego_likely(vector_base_ != nullptr)) {
       return vector_base_ + static_cast<size_t>(id) * vector_size();
     }
+    // Fallback to mmap chunk-based access
     uint32_t chunk_idx = id >> node_index_mask_bits_;
     uint32_t offset = (id & node_index_mask_) * node_size();
     return get_node_chunk_base(chunk_idx) + offset;
   }
-
-  ailego_force_inline int resolve_vectors(const node_id_t *ids, uint32_t count,
-                                          const void **out) const {
-    for (uint32_t i = 0; i < count; ++i) out[i] = get_vector_ptr(ids[i]);
-    return 0;
-  }
-
-  ailego_force_inline void release_vectors() const {}
-  void submit_prefetch(const node_id_t *, uint32_t) const {}  // no-op
-  void harvest_prefetch() const {}  // no-op
-  void reset_io_budget(int32_t) const {}  // no-op for contiguous
 
  protected:
   //! Custom deleter for contiguous memory (munmap / _aligned_free / free)

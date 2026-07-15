@@ -12,49 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "ivf_entity.h"
-#include <atomic>
-#include <cstdlib>
 #include <iostream>
-#include <thread>
 #include "ivf_utility.h"
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
-namespace {
-std::atomic<int> g_active_batch_callers{0};
-
-struct BatchCallerGuard {
-  BatchCallerGuard() {
-    g_active_batch_callers.fetch_add(1, std::memory_order_relaxed);
-  }
-  ~BatchCallerGuard() {
-    g_active_batch_callers.fetch_sub(1, std::memory_order_relaxed);
-  }
-};
-
-// 0=on-demand, 1=unconditional prefetch, 2=adaptive (default). Test switch.
-inline int prefetch_mode() {
-  static int mode = []() {
-    const char *e = std::getenv("ZVEC_PREFETCH_MODE");
-    return (e && *e) ? std::atoi(e) : 2;
-  }();
-  return mode;
-}
-
-#ifdef _OPENMP
-inline int adaptive_thread_count(size_t query_count) {
-  if (query_count <= 4) {
-    return 1;
-  }
-  int hw = omp_get_max_threads();
-  if (hw <= 0) hw = 1;
-  int active = g_active_batch_callers.load(std::memory_order_relaxed);
-  if (active <= 0) active = 1;
-  return std::max(1, hw / active);
-}
-#endif
-}  // namespace
 namespace zvec {
 namespace core {
 
@@ -503,14 +462,12 @@ int IVFEntity::load_header(const IndexStorage::Pointer &container) {
               IVF_INVERTED_HEADER_SEG_ID.c_str());
     return IndexError_InvalidFormat;
   }
-  IndexStorage::MemoryBlock header_block;
-  if (header->read(0, header_block, header->data_size()) !=
-      header->data_size()) {
+  const void *data = nullptr;
+  if (header->read(0, &data, header->data_size()) != header->data_size()) {
     LOG_ERROR("Failed to read data, segment %s",
               IVF_INVERTED_HEADER_SEG_ID.c_str());
     return IndexError_ReadData;
   }
-  const void *data = header_block.data();
   std::memcpy(&header_, data, sizeof(header_));
   if (header_.header_size < sizeof(header_) + header_.index_meta_size ||
       header_.header_size > header->data_size()) {
@@ -649,17 +606,14 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
                       IndexContext::Stats *context_stats) const {
   ailego_assert_with(inverted_list_id < header_.inverted_list_count,
                      "invalid id");
-  IndexStorage::MemoryBlock meta_block;
-  auto list_meta = this->inverted_list_meta(inverted_list_id, meta_block);
+  auto list_meta = this->inverted_list_meta(inverted_list_id);
   ivf_assert(list_meta, IndexError_ReadData);
 
-  const size_t block_size = header_.block_size;
-
-  IndexStorage::MemoryBlock data_block;
-  IndexStorage::MemoryBlock keys_block;
+  const void *data = nullptr;
   const size_t block_vecs = header_.block_vector_count;
   std::vector<float> distances(block_vecs);
   const size_t batch_size = kBatchBlocks;
+  const size_t block_size = header_.block_size;
   const auto norm_val = this->inverted_list_normalize_value(inverted_list_id);
   for (size_t i = 0; i < list_meta->block_count; i += batch_size) {
     //! Read vecs
@@ -668,17 +622,15 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     const size_t size =
         std::min(blocks * block_size,
                  static_cast<size_t>(header_.inverted_body_size - off));
-    if (inverted_->read(off, data_block, size) != size) {
+    if (inverted_->read(off, &data, size) != size) {
       LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
       return IndexError_ReadData;
     }
-    const void *data = data_block.data();
 
     //! Read keys
     size_t items = std::min(blocks * block_vecs,
                             list_meta->vector_count - (i * block_vecs));
-    auto keys = get_keys(list_meta->id_offset + i * block_vecs, items,
-                         keys_block);
+    auto keys = get_keys(list_meta->id_offset + i * block_vecs, items);
     if (!keys) {
       return IndexError_ReadData;
     }
@@ -728,17 +680,14 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
                       IndexContext::Stats *context_stats) const {
   ailego_assert_with(inverted_list_id < header_.inverted_list_count,
                      "invalid id");
-  IndexStorage::MemoryBlock meta_block;
-  auto list_meta = inverted_list_meta(inverted_list_id, meta_block);
+  auto list_meta = inverted_list_meta(inverted_list_id);
   ivf_assert(list_meta, IndexError_ReadData);
 
-  const size_t block_size = header_.block_size;
-
-  IndexStorage::MemoryBlock data_block;
-  IndexStorage::MemoryBlock keys_block;
+  const void *data = nullptr;
   const size_t block_vecs = header_.block_vector_count;
   std::vector<float> distances(block_vecs);
   const size_t batch_size = kBatchBlocks;
+  const size_t block_size = header_.block_size;
   const auto norm_val = this->inverted_list_normalize_value(inverted_list_id);
   for (size_t i = 0; i < list_meta->block_count; i += batch_size) {
     //! Read vecs
@@ -747,17 +696,15 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     const size_t size =
         std::min(blocks * block_size,
                  static_cast<size_t>(header_.inverted_body_size - off));
-    if (inverted_->read(off, data_block, size) != size) {
+    if (inverted_->read(off, &data, size) != size) {
       LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
       return IndexError_ReadData;
     }
-    const void *data = data_block.data();
 
     //! Read keys
     size_t items = std::min(blocks * block_vecs,
                             list_meta->vector_count - (i * block_vecs));
-    auto keys = get_keys(list_meta->id_offset + i * block_vecs, items,
-                         keys_block);
+    auto keys = get_keys(list_meta->id_offset + i * block_vecs, items);
     if (!keys) {
       return IndexError_ReadData;
     }
@@ -777,213 +724,6 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
         }
       }
       *(context_stats->mutable_dist_calced_count()) += vecs_count;
-    }
-  }
-
-  *scan_count = list_meta->vector_count;
-  return 0;
-}
-
-//! Block-level batch search: scan cluster once, compute for all queries (with
-//! filter)
-int IVFEntity::search_batch(size_t inverted_list_id, const IndexFilter &filter,
-                            BatchQueryItem *items, size_t query_count,
-                            uint32_t *scan_count) const {
-  ailego_assert_with(inverted_list_id < header_.inverted_list_count,
-                     "invalid id");
-  IndexStorage::MemoryBlock meta_block;
-  auto list_meta = this->inverted_list_meta(inverted_list_id, meta_block);
-  ivf_assert(list_meta, IndexError_ReadData);
-
-  const size_t block_size = header_.block_size;
-  // Adaptive prefetch admission: prefetch the whole cluster only if it fits in
-  // this caller's fair share of the pool's free space.  Avoids partial prefetch
-  // under memory pressure (which evicts still-useful pages and lowers QPS).
-  // The divisor is the number of concurrent batch callers because the buffer
-  // pool is shared process-wide.
-  {
-    const size_t total_data_size = list_meta->block_count * block_size;
-    const int pmode = prefetch_mode();
-    if (pmode == 1) {
-      inverted_->prefetch(list_meta->offset, total_data_size);
-    } else if (pmode == 2) {
-      int callers = g_active_batch_callers.load(std::memory_order_relaxed);
-      if (callers < 1) callers = 1;
-      const size_t budget =
-          inverted_->prefetch_budget() / static_cast<size_t>(callers);
-      if (total_data_size <= budget) {
-        inverted_->prefetch(list_meta->offset, total_data_size);
-      }
-    }
-  }
-
-  const void *data = nullptr;
-  const size_t block_vecs = header_.block_vector_count;
-  const size_t batch_size = kBatchBlocks;
-  const auto norm_val = this->inverted_list_normalize_value(inverted_list_id);
-  BatchCallerGuard caller_guard;
-#ifdef _OPENMP
-  const int omp_threads = adaptive_thread_count(query_count);
-#endif
-
-  IndexStorage::MemoryBlock data_block;
-  IndexStorage::MemoryBlock keys_block;
-  for (size_t i = 0; i < list_meta->block_count; i += batch_size) {
-    //! Read vecs - ONCE for all queries
-    const size_t off = list_meta->offset + i * block_size;
-    const size_t blocks = std::min(batch_size, list_meta->block_count - i);
-    const size_t size =
-        std::min(blocks * block_size,
-                 static_cast<size_t>(header_.inverted_body_size - off));
-    if (inverted_->read(off, data_block, size) != size) {
-      LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
-      return IndexError_ReadData;
-    }
-    data = data_block.data();
-
-    //! Read keys - ONCE for all queries
-    size_t items_count = std::min(blocks * block_vecs,
-                                  list_meta->vector_count - (i * block_vecs));
-    auto keys = get_keys(list_meta->id_offset + i * block_vecs, items_count,
-                         keys_block);
-    if (!keys) {
-      return IndexError_ReadData;
-    }
-
-    //! For each block, compute distances for ALL queries
-    for (size_t b = 0; b < blocks; ++b) {
-      const size_t vecs_count =
-          std::min(block_vecs, list_meta->vector_count - (i + b) * block_vecs);
-      auto block_keys = keys + b * block_vecs;
-
-      size_t keeps = 0;
-      ailego_assert_with(block_vecs < sizeof(keeps) * 8, "bits overflow");
-      for (size_t k = 0; k < vecs_count; ++k) {
-        if (!filter(block_keys[k])) {
-          keeps |= (1ULL << k);
-        }
-      }
-      size_t filtered = vecs_count - ailego_popcount64(keeps);
-
-      if (keeps == 0) {
-        for (size_t q = 0; q < query_count; ++q) {
-          *(items[q].stats->mutable_filtered_count()) += filtered;
-        }
-        continue;
-      }
-
-      const void *block_data = static_cast<const char *>(data) + b * block_size;
-      uint32_t id_off = list_meta->id_offset + (i + b) * block_vecs;
-
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(omp_threads) \
-    schedule(static) if (omp_threads > 1)
-#endif
-      for (size_t q = 0; q < query_count; ++q) {
-        std::vector<float> local_distances(block_vecs);
-        calculator_->query_features_distance(
-            items[q].query, block_data, vecs_count, local_distances.data());
-        *(items[q].stats->mutable_dist_calced_count()) += vecs_count;
-        *(items[q].stats->mutable_filtered_count()) += filtered;
-
-        for (size_t k = 0; k < vecs_count; ++k) {
-          if ((keeps & (1ULL << k)) && block_keys[k] != kInvalidKey) {
-            items[q].heap->emplace(block_keys[k], local_distances[k] * norm_val,
-                                   id_off + k);
-          }
-        }
-      }
-    }
-  }
-
-  *scan_count = list_meta->vector_count;
-  return 0;
-}
-
-//! Block-level batch search without filter
-int IVFEntity::search_batch(size_t inverted_list_id, BatchQueryItem *items,
-                            size_t query_count, uint32_t *scan_count) const {
-  ailego_assert_with(inverted_list_id < header_.inverted_list_count,
-                     "invalid id");
-  IndexStorage::MemoryBlock meta_block;
-  auto list_meta = inverted_list_meta(inverted_list_id, meta_block);
-  ivf_assert(list_meta, IndexError_ReadData);
-
-  const size_t block_size = header_.block_size;
-  // Adaptive prefetch admission (see the filtered search_batch above).
-  {
-    const size_t total_data_size = list_meta->block_count * block_size;
-    const int pmode = prefetch_mode();
-    if (pmode == 1) {
-      inverted_->prefetch(list_meta->offset, total_data_size);
-    } else if (pmode == 2) {
-      int callers = g_active_batch_callers.load(std::memory_order_relaxed);
-      if (callers < 1) callers = 1;
-      const size_t budget =
-          inverted_->prefetch_budget() / static_cast<size_t>(callers);
-      if (total_data_size <= budget) {
-        inverted_->prefetch(list_meta->offset, total_data_size);
-      }
-    }
-  }
-
-  const void *data = nullptr;
-  const size_t block_vecs = header_.block_vector_count;
-  const size_t batch_size = kBatchBlocks;
-  const auto norm_val = this->inverted_list_normalize_value(inverted_list_id);
-  BatchCallerGuard caller_guard;
-#ifdef _OPENMP
-  const int omp_threads = adaptive_thread_count(query_count);
-#endif
-
-  IndexStorage::MemoryBlock data_block;
-  IndexStorage::MemoryBlock keys_block;
-  for (size_t i = 0; i < list_meta->block_count; i += batch_size) {
-    //! Read vecs - ONCE for all queries
-    const size_t off = list_meta->offset + i * block_size;
-    const size_t blocks = std::min(batch_size, list_meta->block_count - i);
-    const size_t size =
-        std::min(blocks * block_size,
-                 static_cast<size_t>(header_.inverted_body_size - off));
-    if (inverted_->read(off, data_block, size) != size) {
-      LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
-      return IndexError_ReadData;
-    }
-    data = data_block.data();
-
-    //! Read keys - ONCE for all queries
-    size_t items_count = std::min(blocks * block_vecs,
-                                  list_meta->vector_count - (i * block_vecs));
-    auto keys = get_keys(list_meta->id_offset + i * block_vecs, items_count,
-                         keys_block);
-    if (!keys) {
-      return IndexError_ReadData;
-    }
-
-    //! For each block, compute distances for ALL queries
-    for (size_t b = 0; b < blocks; ++b) {
-      const size_t vecs_count =
-          std::min(block_vecs, list_meta->vector_count - (i + b) * block_vecs);
-      auto block_keys = keys + b * block_vecs;
-      const void *block_data = static_cast<const char *>(data) + b * block_size;
-      uint32_t id_off = list_meta->id_offset + (i + b) * block_vecs;
-
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(omp_threads) \
-    schedule(static) if (omp_threads > 1)
-#endif
-      for (size_t q = 0; q < query_count; ++q) {
-        std::vector<float> local_distances(block_vecs);
-        calculator_->query_features_distance(
-            items[q].query, block_data, vecs_count, local_distances.data());
-        for (size_t k = 0; k < vecs_count; ++k) {
-          if (block_keys[k] != kInvalidKey) {
-            items[q].heap->emplace(block_keys[k], local_distances[k] * norm_val,
-                                   id_off + k);
-          }
-        }
-        *(items[q].stats->mutable_dist_calced_count()) += vecs_count;
-      }
     }
   }
 
@@ -1022,53 +762,48 @@ int IVFEntity::search(const void *query, IndexDocumentHeap *heap,
 
 const void *IVFEntity::get_vector(size_t id) const {
   if (features_) {
+    const void *data = nullptr;
     size_t element_size = features_->data_size() / vector_count();
     size_t off = id * element_size;
-    IndexStorage::MemoryBlock block;
-    if (features_->read(off, block, element_size) != element_size) {
+    if (features_->read(off, &data, element_size) != element_size) {
       LOG_ERROR("Failed to read segment, off=%zu size=%zu", off, element_size);
       return nullptr;
     }
-    vector_.assign(static_cast<const char *>(block.data()), element_size);
-    return vector_.data();
+    return data;
   }
 
-  IndexStorage::MemoryBlock off_block;
+  const void *data = nullptr;
   size_t size = sizeof(InvertedVecLocation);
-  if (offsets_->read(id * size, off_block, size) != size) {
+  if (offsets_->read(id * size, &data, size) != size) {
     LOG_ERROR("Failed to read offsets segment, id=%zu", id);
     return nullptr;
   }
-  InvertedVecLocation loc =
-      *reinterpret_cast<const InvertedVecLocation *>(off_block.data());
+  auto &loc = *reinterpret_cast<const InvertedVecLocation *>(data);
   if (loc.column_major) {
     vector_.resize(meta_.element_size());
     auto unit_size = IndexMeta::AlignSizeof(meta_.data_type());
     size_t cols = meta_.element_size() / unit_size;
     size_t step = block_vector_count() * unit_size;
     size_t rd_size = step * (cols - 1) + unit_size;
-    IndexStorage::MemoryBlock block;
-    if (inverted_->read(loc.offset, block, rd_size) != rd_size) {
+    if (inverted_->read(loc.offset, &data, rd_size) != rd_size) {
       LOG_ERROR("Failed to read data, off=%zu size=%zu",
                 static_cast<size_t>(loc.offset), rd_size);
       return nullptr;
     }
-    const char *data = static_cast<const char *>(block.data());
     for (size_t c = 0; c < cols; ++c) {
-      vector_.replace(c * unit_size, unit_size, data + c * step, unit_size);
+      vector_.replace(c * unit_size, unit_size,
+                      reinterpret_cast<const char *>(data) + c * step,
+                      unit_size);
     }
     return vector_.data();
   } else {
-    IndexStorage::MemoryBlock block;
-    if (inverted_->read(loc.offset, block, meta_.element_size()) !=
+    if (inverted_->read(loc.offset, &data, meta_.element_size()) !=
         meta_.element_size()) {
       LOG_ERROR("Failed to read data, off=%zu size=%u",
                 static_cast<size_t>(loc.offset), meta_.element_size());
       return nullptr;
     }
-    vector_.assign(static_cast<const char *>(block.data()),
-                   meta_.element_size());
-    return vector_.data();
+    return data;
   }
 }
 
@@ -1090,23 +825,23 @@ int IVFEntity::get_vector(size_t id, IndexStorage::MemoryBlock &block) const {
     LOG_ERROR("Failed to read offsets segment, id=%zu", id);
     return IndexError_Runtime;
   }
-  InvertedVecLocation loc =
-      *reinterpret_cast<const InvertedVecLocation *>(data_block.data());
+  const void *data = data_block.data();
+  auto &loc = *reinterpret_cast<const InvertedVecLocation *>(data);
   if (loc.column_major) {
     vector_.resize(meta_.element_size());
     auto unit_size = IndexMeta::AlignSizeof(meta_.data_type());
     size_t cols = meta_.element_size() / unit_size;
     size_t step = block_vector_count() * unit_size;
     size_t rd_size = step * (cols - 1) + unit_size;
-    IndexStorage::MemoryBlock vec_block;
-    if (inverted_->read(loc.offset, vec_block, rd_size) != rd_size) {
+    if (inverted_->read(loc.offset, &data, rd_size) != rd_size) {
       LOG_ERROR("Failed to read data, off=%zu size=%zu",
                 static_cast<size_t>(loc.offset), rd_size);
       return IndexError_Runtime;
     }
-    const char *data = static_cast<const char *>(vec_block.data());
     for (size_t c = 0; c < cols; ++c) {
-      vector_.replace(c * unit_size, unit_size, data + c * step, unit_size);
+      vector_.replace(c * unit_size, unit_size,
+                      reinterpret_cast<const char *>(data) + c * step,
+                      unit_size);
     }
     block.reset(vector_.data());
     return 0;
@@ -1125,23 +860,23 @@ uint32_t IVFEntity::key_to_id(uint64_t key) const {
   //! Do binary search
   uint32_t start = 0UL;
   uint32_t end = vector_count();
+  const void *data = nullptr;
   uint32_t idx = 0u;
   while (start < end) {
     idx = start + (end - start) / 2;
-    IndexStorage::MemoryBlock map_block;
-    if (ailego_unlikely(mapping_->read(idx * sizeof(uint32_t), map_block,
+    if (ailego_unlikely(mapping_->read(idx * sizeof(uint32_t), &data,
                                        sizeof(uint32_t)) != sizeof(uint32_t))) {
       LOG_ERROR("Failed to read mapping segment, idx=%u", idx);
       return std::numeric_limits<uint32_t>::max();
     }
-    uint32_t local_id = *reinterpret_cast<const uint32_t *>(map_block.data());
-    IndexStorage::MemoryBlock key_block;
-    if (ailego_unlikely(keys_->read(local_id * sizeof(uint64_t), key_block,
+    const uint64_t *mkey;
+    uint32_t local_id = *reinterpret_cast<const uint32_t *>(data);
+    if (ailego_unlikely(keys_->read(local_id * sizeof(uint64_t),
+                                    (const void **)(&mkey),
                                     sizeof(uint64_t)) != sizeof(uint64_t))) {
       LOG_ERROR("Read key from segment failed");
       return std::numeric_limits<uint32_t>::max();
     }
-    const uint64_t *mkey = static_cast<const uint64_t *>(key_block.data());
     if (*mkey < key) {
       start = idx + 1;
     } else if (*mkey > key) {
