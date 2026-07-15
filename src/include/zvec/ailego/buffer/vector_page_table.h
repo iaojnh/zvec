@@ -107,6 +107,12 @@ class VectorPageTable : public EvictableBlockOwner {
 
   bool evict_block(block_id_t block_id) override;
 
+  //! Unconditionally reclaim a block, bypassing the CLOCK second-chance bit.
+  //! Used at teardown / full reset: the normal evict_block() spares a page
+  //! whose `referenced` bit is set, but at teardown that would leave the
+  //! buffer charged in MemoryLimitPool forever (a used_size_ leak).
+  bool force_evict_block(block_id_t block_id);
+
   void set_evict_priority(block_id_t block_id, uint8_t priority) {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
     Entry &e = entry_at(block_id);
@@ -180,10 +186,13 @@ class VectorPageTable : public EvictableBlockOwner {
   };
   Stats stats() const {
     Stats s;
-    s.hit = hit_count_.load(std::memory_order_relaxed);
-    s.evict = evict_count_.load(std::memory_order_relaxed);
-    s.second_chance = second_chance_count_.load(std::memory_order_relaxed);
-    s.dirty_flush = dirty_flush_count_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < kCounterShards; ++i) {
+      const CounterShard &c = counters_[i];
+      s.hit += c.hit.load(std::memory_order_relaxed);
+      s.evict += c.evict.load(std::memory_order_relaxed);
+      s.second_chance += c.second_chance.load(std::memory_order_relaxed);
+      s.dirty_flush += c.dirty_flush.load(std::memory_order_relaxed);
+    }
     return s;
   }
 
@@ -253,14 +262,50 @@ class VectorPageTable : public EvictableBlockOwner {
     return segments_[idx >> kSegmentShift][idx & kSegmentMask];
   }
 
+  // Shared implementation for evict_block()/force_evict_block(): when `force`
+  // is true the CLOCK second-chance branch is skipped so the block is always
+  // reclaimed.
+  bool do_evict_block(block_id_t block_id, bool force);
+
   FlushCallback flush_callback_{};
 
-  // Observability counters.  Relaxed ordering: these are statistics, never
-  // used to make correctness decisions.
-  std::atomic<uint64_t> hit_count_{0};
-  std::atomic<uint64_t> evict_count_{0};
-  std::atomic<uint64_t> second_chance_count_{0};
-  std::atomic<uint64_t> dirty_flush_count_{0};
+  // Observability counters, sharded across cache lines.  A single global
+  // atomic incurred severe contention on the hot acquire path: every cache
+  // hit did fetch_add on one counter, bouncing that line across all search
+  // threads.  Each thread now increments its own sticky shard, so counter
+  // updates never share a cache line.  Relaxed ordering: statistics only,
+  // never used for correctness decisions.
+  static constexpr size_t kCounterShards = 64;  // power of two for masking
+  struct alignas(64) CounterShard {
+    std::atomic<uint64_t> hit{0};
+    std::atomic<uint64_t> evict{0};
+    std::atomic<uint64_t> second_chance{0};
+    std::atomic<uint64_t> dirty_flush{0};
+  };
+  CounterShard counters_[kCounterShards];
+
+  // Sticky per-thread shard assignment (mirrors MemoryLimitPool::pick_shard):
+  // each thread keeps writing the same shard, maximizing locality and
+  // eliminating cross-thread contention on the counter cache lines.
+  static size_t counter_shard() {
+    static std::atomic<size_t> seq{0};
+    thread_local size_t idx = seq.fetch_add(1, std::memory_order_relaxed);
+    return idx & (kCounterShards - 1);
+  }
+  void inc_hit() {
+    counters_[counter_shard()].hit.fetch_add(1, std::memory_order_relaxed);
+  }
+  void inc_evict() {
+    counters_[counter_shard()].evict.fetch_add(1, std::memory_order_relaxed);
+  }
+  void inc_second_chance() {
+    counters_[counter_shard()].second_chance.fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  void inc_dirty_flush() {
+    counters_[counter_shard()].dirty_flush.fetch_add(
+        1, std::memory_order_relaxed);
+  }
 };
 
 class VecBufferPoolHandle;
@@ -282,7 +327,7 @@ class VecBufferPool {
     (void)this->flush_all();
     for (size_t i = 0; i < page_table_.entry_num(); ++i) {
       assert(page_table_.is_released(i));
-      page_table_.evict_block(i);
+      page_table_.force_evict_block(i);
     }
 #if defined(__linux) || defined(__linux__)
     if (aio_enabled_ && aio_ctx_) {

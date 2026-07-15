@@ -126,10 +126,21 @@ TEST_F(BufferPoolTest, SecondChanceKeepsHotSet) {
     ExpectPageContent(buf.data(), p);
   };
 
-  // Interleave a hot set (0..7) with a rolling cold scan to create pressure.
+  // Keep a small hot set (0..7) genuinely hot by re-touching it frequently
+  // during the cold scan so its reuse distance stays below the pool capacity
+  // (32).  A plain round-by-round scan touches every page once per round
+  // (reuse distance 128 >> capacity): the hot set is evicted before it can be
+  // re-hit, which is correct scan-resistant behavior but never exercises the
+  // second-chance path.  Interleaving creates real reuse -- the hot pages
+  // stay resident (hits) and carry a set reference bit when the evictor
+  // reaches them, so it spares them (second chance).
   for (int round = 0; round < 20; ++round) {
-    for (size_t h = 0; h < 8; ++h) read_page(h);      // keep hot set referenced
-    for (size_t c = 8; c < num_pages; ++c) read_page(c);  // cold churn
+    for (size_t c = 8; c < num_pages; ++c) {
+      read_page(c);                                   // cold churn
+      if ((c & 7u) == 0u) {                           // every 8 cold pages...
+        for (size_t h = 0; h < 8; ++h) read_page(h);  // ...re-touch hot set
+      }
+    }
   }
 
   VecBufferPool::Stats s = pool.stats();

@@ -150,9 +150,13 @@ char *VectorPageTable::acquire_block(block_id_t block_id) {
   int old = e.ref_count.fetch_add(1, std::memory_order_acq_rel);
   if (ailego_likely(old >= 0)) {
     // CLOCK: record the access so the evictor grants this page a second
-    // chance, and count the hit for observability.
-    e.referenced.store(true, std::memory_order_relaxed);
-    hit_count_.fetch_add(1, std::memory_order_relaxed);
+    // chance, and count the hit for observability.  Test-before-set: for a
+    // hot page hit by many threads, skipping the store once the bit is set
+    // keeps the Entry cache line in shared state instead of bouncing it.
+    if (!e.referenced.load(std::memory_order_relaxed)) {
+      e.referenced.store(true, std::memory_order_relaxed);
+    }
+    inc_hit();
     return e.buffer;
   }
   // Undo the increment: the entry is in eviction state.
@@ -193,6 +197,14 @@ void VectorPageTable::release_block(block_id_t block_id) {
 }
 
 bool VectorPageTable::evict_block(block_id_t block_id) {
+  return do_evict_block(block_id, /*force=*/false);
+}
+
+bool VectorPageTable::force_evict_block(block_id_t block_id) {
+  return do_evict_block(block_id, /*force=*/true);
+}
+
+bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
   assert(block_id < entry_num_.load(std::memory_order_relaxed));
   Entry &e = entry_at(block_id);
   int expected = 0;
@@ -203,9 +215,10 @@ bool VectorPageTable::evict_block(block_id_t block_id) {
     // eviction queue, spare it once -- clear the bit, return it to the
     // released state and re-enqueue it for a later eviction pass.  This is
     // what turns the underlying FIFO queue into an approximate-LRU policy.
-    if (e.referenced.load(std::memory_order_relaxed)) {
+    // Skipped when `force` is set (teardown/reset must always reclaim).
+    if (!force && e.referenced.load(std::memory_order_relaxed)) {
       e.referenced.store(false, std::memory_order_relaxed);
-      second_chance_count_.fetch_add(1, std::memory_order_relaxed);
+      inc_second_chance();
       // Restore the released state.  Keep in_evict_queue == true because the
       // page is (re)inserted into the queue below; recycle() only consumed
       // the previous slot.
@@ -223,13 +236,13 @@ bool VectorPageTable::evict_block(block_id_t block_id) {
         flush_callback_) {
       flush_callback_(block_id, buffer, kVectorPageSize, e.file_offset);
       e.is_dirty.store(false, std::memory_order_relaxed);
-      dirty_flush_count_.fetch_add(1, std::memory_order_relaxed);
+      inc_dirty_flush();
     }
     if (buffer) {
       e.buffer = nullptr;
       MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize);
     }
-    evict_count_.fetch_add(1, std::memory_order_relaxed);
+    inc_evict();
     e.ref_count.store(std::numeric_limits<int>::min(),
                       std::memory_order_release);
     evicted = true;
