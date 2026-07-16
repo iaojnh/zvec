@@ -79,7 +79,7 @@ class VectorPageTable : public EvictableBlockOwner {
   using FlushCallback = std::function<int(block_id_t, char *, size_t, size_t)>;
   using RetireCallback = std::function<void(char *)>;
 
-  VectorPageTable() {
+  VectorPageTable() : owner_version_(next_owner_version()) {
     BlockEvictionQueue::get_instance().set_valid(this);
   }
   ~VectorPageTable() {
@@ -234,8 +234,14 @@ class VectorPageTable : public EvictableBlockOwner {
     return entry_at(block_id).ref_count.load(std::memory_order_relaxed) <= 0;
   }
 
-  inline bool is_dead_block(block_id_t block_id,
-                            version_t /*version*/) override {
+  inline bool is_dead_block(block_id_t block_id, version_t version) override {
+    // Queue entries can outlive their owner.  A later VectorPageTable may be
+    // allocated at the same address, so pointer membership alone is not
+    // enough to distinguish a stale entry (owner-address ABA).
+    if (version != owner_version_ ||
+        block_id >= entry_num_.load(std::memory_order_acquire)) {
+      return true;
+    }
     const Entry &e = entry_at(block_id);
     return !e.in_evict_queue.load(std::memory_order_relaxed);
   }
@@ -299,6 +305,12 @@ class VectorPageTable : public EvictableBlockOwner {
   // is true the CLOCK second-chance branch is skipped so the block is always
   // reclaimed.
   bool do_evict_block(block_id_t block_id, bool force);
+  static version_t next_owner_version();
+
+  // Generation attached to every eviction-queue entry created by this page
+  // table.  It prevents stale entries from targeting a new table that happens
+  // to reuse the same object address.
+  const version_t owner_version_;
 
   FlushCallback flush_callback_{};
   RetireCallback retire_callback_{};

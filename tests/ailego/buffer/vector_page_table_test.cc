@@ -131,6 +131,25 @@ TEST_F(BufferPoolTest, PinnedEvictionBecomesReclaimableAfterRelease) {
   EXPECT_FALSE(pool.page_table_.is_loaded(page_id));
 }
 
+// A stale eviction item must not become valid again when a later page table
+// reuses the same owner address. Version zero represents an entry issued by a
+// different/legacy owner generation; the current resident page must survive.
+TEST_F(BufferPoolTest, StaleOwnerGenerationIsDead) {
+  InitPool(/*capacity_pages=*/2);
+  VectorPageTable table;
+  ASSERT_TRUE(table.init(/*entry_num=*/1));
+
+  char *buffer = nullptr;
+  ASSERT_TRUE(MemoryLimitPool::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
+  ASSERT_EQ(table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0),
+            buffer);
+  table.release_block(/*block_id=*/0);
+
+  EXPECT_TRUE(table.is_dead_block(/*block_id=*/0, /*stale version=*/0));
+  EXPECT_TRUE(table.force_evict_block(/*block_id=*/0));
+}
+
 // Scattered acquisition is storage-level functionality: it preserves caller
 // order, deduplicates cold I/O internally, and still returns one independent
 // pin for every occurrence of a duplicate page id.

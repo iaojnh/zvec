@@ -71,7 +71,8 @@ void BlockEvictionQueue::recycle() {
     {
       std::shared_lock<std::shared_mutex> lock(valid_owners_mutex_);
       if (item.owner != nullptr &&
-          valid_owners_.find(item.owner) != valid_owners_.end()) {
+          valid_owners_.find(item.owner) != valid_owners_.end() &&
+          !item.owner->is_dead_block(item.owner_key, item.version)) {
         item.owner->evict_block(item.owner_key);
       }
     }

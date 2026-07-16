@@ -69,6 +69,17 @@ namespace ailego {
 
 const size_t kVectorPageSize = MemoryHelper::PageSize();
 
+version_t VectorPageTable::next_owner_version() {
+  static std::atomic<version_t> sequence{1};
+  version_t version = sequence.fetch_add(1, std::memory_order_relaxed);
+  // Version zero is reserved for legacy/non-versioned owners.  Wraparound is
+  // practically unreachable, but skipping zero keeps the invariant explicit.
+  if (ailego_unlikely(version == 0)) {
+    version = sequence.fetch_add(1, std::memory_order_relaxed);
+  }
+  return version;
+}
+
 bool PageReadEpochDomain::enter(Token *token) {
   if (!token) return false;
   token->slot = kSlotCount;
@@ -284,7 +295,7 @@ void VectorPageTable::release_block(block_id_t block_id) {
       BlockEvictionQueue::BlockType block;
       block.owner = this;
       block.owner_key = block_id;
-      block.version = 0;
+      block.version = owner_version_;
       BlockEvictionQueue::get_instance().add_single_block(
           block, static_cast<int>(e.evict_priority));
     }
@@ -321,7 +332,7 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
       BlockEvictionQueue::BlockType block;
       block.owner = this;
       block.owner_key = block_id;
-      block.version = 0;
+      block.version = owner_version_;
       BlockEvictionQueue::get_instance().add_single_block(
           block, static_cast<int>(e.evict_priority));
       return false;  // spared, not reclaimed
@@ -356,7 +367,7 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
   BlockEvictionQueue::BlockType block;
   block.owner = this;
   block.owner_key = block_id;
-  block.version = 0;
+  block.version = owner_version_;
   if (!BlockEvictionQueue::get_instance().add_single_block(
           block, static_cast<int>(e.evict_priority))) {
     // Let release_block() retry registration when the last pin is dropped.
@@ -400,7 +411,7 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       BlockEvictionQueue::BlockType block;
       block.owner = this;
       block.owner_key = block_id;
-      block.version = 0;
+      block.version = owner_version_;
       if (!BlockEvictionQueue::get_instance().add_single_block(
               block, static_cast<int>(e.evict_priority))) {
         // The final release will take the rare fallback registration path.
