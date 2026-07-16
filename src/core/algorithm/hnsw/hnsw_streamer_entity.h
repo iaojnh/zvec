@@ -753,10 +753,17 @@ HnswStreamerEntity::get_neighbors_typed(
     ++profile->fallback_batches;
     ++profile->fallback_items;
   }
+  const uint64_t sync_reads_before = profile ? profile->sync_reads : 0;
+  const uint64_t sync_read_ns_before = profile ? profile->sync_read_ns : 0;
   ailego::BufferPoolProfileTimer fallback_timer(
       profile ? &profile->fallback_total_ns : nullptr);
   IndexStorage::MemoryBlock mem_block;
   const size_t ret = chunk->read(offset, mem_block, nbr_size);
+  if (profile) {
+    profile->neighbor_sync_reads += profile->sync_reads - sync_reads_before;
+    profile->neighbor_sync_read_ns +=
+        profile->sync_read_ns - sync_read_ns_before;
+  }
   if (ailego_unlikely(ret != nbr_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
     return NeighborsT<BufferPoolMemoryBlock>();
@@ -897,25 +904,80 @@ inline int HnswStreamerEntity::get_vector_typed(
       ++profile->fallback_batches;
       profile->fallback_items += cross_page_vectors.size();
     }
+    const uint64_t sync_reads_before = profile ? profile->sync_reads : 0;
+    const uint64_t sync_read_ns_before = profile ? profile->sync_read_ns : 0;
+    auto record_cross_page_sync = [&]() {
+      if (!profile) return;
+      profile->cross_page_sync_reads +=
+          profile->sync_reads - sync_reads_before;
+      profile->cross_page_sync_read_ns +=
+          profile->sync_read_ns - sync_read_ns_before;
+    };
     ailego::BufferPoolProfileTimer fallback_timer(
         profile ? &profile->fallback_total_ns : nullptr);
     for (const auto &item : cross_page_vectors) {
       int ret = read_one(item.result_index, item.chunk_index, item.chunk_offset);
       if (ret != 0) {
+        record_cross_page_sync();
         vec_blocks.clear();
         return ret;
       }
     }
+    record_cross_page_sync();
   }
 
   if (page_vectors.empty()) return 0;
 
   std::vector<char *> epoch_pages(page_vectors.size(), nullptr);
-  auto publish_if_resident = [&]() -> bool {
-    if (scope.pool != pool || !scope.resume()) return false;
+  auto publish_if_resident = [&](ailego::BufferPoolIoProfile *post_aio_profile =
+                                     nullptr) -> bool {
+    if (post_aio_profile) {
+      ++post_aio_profile->post_aio_publish_attempts;
+      uint64_t requested_unique_pages = 0;
+      for (size_t i = 0; i < page_vectors.size(); ++i) {
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j) {
+          if (page_vectors[j].page_id == page_vectors[i].page_id) {
+            seen = true;
+            break;
+          }
+        }
+        if (!seen) ++requested_unique_pages;
+      }
+      post_aio_profile->post_aio_requested_unique_pages +=
+          requested_unique_pages;
+    }
+    if (scope.pool != pool || !scope.resume()) {
+      if (post_aio_profile) {
+        ++post_aio_profile->post_aio_publish_failures;
+      }
+      return false;
+    }
     for (size_t i = 0; i < page_vectors.size(); ++i) {
       epoch_pages[i] = pool->try_get_epoch_page(page_vectors[i].page_id);
-      if (!epoch_pages[i]) return false;
+      if (!epoch_pages[i]) {
+        if (!post_aio_profile) return false;
+        const auto observed_missing_page = page_vectors[i].page_id;
+        uint64_t missing_unique_pages = 0;
+        for (size_t j = 0; j < page_vectors.size(); ++j) {
+          bool seen = false;
+          for (size_t k = 0; k < j; ++k) {
+            if (page_vectors[k].page_id == page_vectors[j].page_id) {
+              seen = true;
+              break;
+            }
+          }
+          if (!seen &&
+              (page_vectors[j].page_id == observed_missing_page ||
+               !pool->is_page_resident(page_vectors[j].page_id))) {
+            ++missing_unique_pages;
+          }
+        }
+        post_aio_profile->post_aio_missing_unique_pages +=
+            missing_unique_pages;
+        ++post_aio_profile->post_aio_publish_failures;
+        return false;
+      }
     }
     for (size_t i = 0; i < page_vectors.size(); ++i) {
       const PageVector &item = page_vectors[i];
@@ -936,13 +998,22 @@ inline int HnswStreamerEntity::get_vector_typed(
   // scattered misses with queue depth and retry the zero-copy path once.
   scope.suspend();
   ailego::BufferPoolIoProfile *profile = scope.mutable_io_profile();
+  const uint64_t prefetch_aio_pages_before = profile ? profile->aio_pages : 0;
+  const uint64_t prefetch_aio_wait_ns_before =
+      profile ? profile->aio_wait_ns : 0;
   static constexpr size_t kAioBatch = 128;
   for (size_t begin = 0; begin < page_ids.size(); begin += kAioBatch) {
     const size_t n = std::min(kAioBatch, page_ids.size() - begin);
     pool->submit_aio_async(page_ids.data() + begin, n, profile);
     pool->wait_aio(profile);
   }
-  if (publish_if_resident()) return 0;
+  if (profile) {
+    profile->vector_prefetch_aio_pages +=
+        profile->aio_pages - prefetch_aio_pages_before;
+    profile->vector_prefetch_aio_wait_ns +=
+        profile->aio_wait_ns - prefetch_aio_wait_ns_before;
+  }
+  if (publish_if_resident(profile)) return 0;
   scope.suspend();
 
   // If the whole batch is not resident, copy it through bounded pin batches.
@@ -972,11 +1043,26 @@ inline int HnswStreamerEntity::get_vector_typed(
       profile->fallback_items += n;
     }
     bool acquired = false;
+    const uint64_t sync_reads_before = profile ? profile->sync_reads : 0;
+    const uint64_t sync_read_ns_before = profile ? profile->sync_read_ns : 0;
+    const uint64_t fallback_aio_pages_before = profile ? profile->aio_pages : 0;
+    const uint64_t fallback_aio_wait_ns_before =
+        profile ? profile->aio_wait_ns : 0;
     {
       ailego::BufferPoolProfileTimer pin_timer(
           profile ? &profile->fallback_total_ns : nullptr);
       acquired =
           pool->acquire_pages(page_ids.data() + begin, n, pages.data());
+    }
+    if (profile) {
+      profile->post_aio_sync_reads +=
+          profile->sync_reads - sync_reads_before;
+      profile->post_aio_sync_read_ns +=
+          profile->sync_read_ns - sync_read_ns_before;
+      profile->vector_fallback_aio_pages +=
+          profile->aio_pages - fallback_aio_pages_before;
+      profile->vector_fallback_aio_wait_ns +=
+          profile->aio_wait_ns - fallback_aio_wait_ns_before;
     }
     if (!acquired) {
       vec_blocks.clear();

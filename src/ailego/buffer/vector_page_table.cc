@@ -1776,6 +1776,33 @@ void VecBufferPool::log_stats() const {
     const uint64_t io_wait_ns = p.aio_wait_ns + p.sync_read_ns;
     const double software_ns_per_read =
         io_reads ? static_cast<double>(p.software_ns()) / io_reads : 0.0;
+    const uint64_t classified_sync_reads =
+        p.neighbor_sync_reads + p.cross_page_sync_reads +
+        p.post_aio_sync_reads;
+    const uint64_t unclassified_sync_reads =
+        p.sync_reads > classified_sync_reads
+            ? p.sync_reads - classified_sync_reads
+            : 0;
+    const uint64_t classified_sync_read_ns =
+        p.neighbor_sync_read_ns + p.cross_page_sync_read_ns +
+        p.post_aio_sync_read_ns;
+    const uint64_t unclassified_sync_read_ns =
+        p.sync_read_ns > classified_sync_read_ns
+            ? p.sync_read_ns - classified_sync_read_ns
+            : 0;
+    const double post_aio_sync_share =
+        p.sync_reads ? static_cast<double>(p.post_aio_sync_reads) /
+                           static_cast<double>(p.sync_reads)
+                     : 0.0;
+    const double post_aio_sync_time_share =
+        p.sync_read_ns ? static_cast<double>(p.post_aio_sync_read_ns) /
+                             static_cast<double>(p.sync_read_ns)
+                       : 0.0;
+    const double post_aio_missing_rate =
+        p.post_aio_requested_unique_pages
+            ? static_cast<double>(p.post_aio_missing_unique_pages) /
+                  static_cast<double>(p.post_aio_requested_unique_pages)
+            : 0.0;
     LOG_INFO(
         "VecBufferPool io_profile: file[%s] queries=%llu query_wall_ns=%llu "
         "aio_submit_ns=%llu aio_wait_ns=%llu aio_install_ns=%llu "
@@ -1814,6 +1841,37 @@ void VecBufferPool::log_stats() const {
         static_cast<unsigned long long>(io_wait_ns),
         static_cast<unsigned long long>(p.software_ns()),
         software_ns_per_read);
+    LOG_INFO(
+        "VecBufferPool io_profile_paths: file[%s] "
+        "neighbor_sync_reads=%llu neighbor_sync_read_ns=%llu "
+        "cross_page_sync_reads=%llu cross_page_sync_read_ns=%llu "
+        "post_aio_sync_reads=%llu post_aio_sync_read_ns=%llu "
+        "post_aio_sync_share=%.4f post_aio_sync_time_share=%.4f "
+        "unclassified_sync_reads=%llu unclassified_sync_read_ns=%llu "
+        "vector_prefetch_aio_pages=%llu vector_prefetch_aio_wait_ns=%llu "
+        "vector_fallback_aio_pages=%llu vector_fallback_aio_wait_ns=%llu "
+        "post_aio_publish_attempts=%llu post_aio_publish_failures=%llu "
+        "post_aio_requested_unique_pages=%llu "
+        "post_aio_missing_unique_pages=%llu post_aio_missing_rate=%.4f",
+        file_name_.c_str(),
+        static_cast<unsigned long long>(p.neighbor_sync_reads),
+        static_cast<unsigned long long>(p.neighbor_sync_read_ns),
+        static_cast<unsigned long long>(p.cross_page_sync_reads),
+        static_cast<unsigned long long>(p.cross_page_sync_read_ns),
+        static_cast<unsigned long long>(p.post_aio_sync_reads),
+        static_cast<unsigned long long>(p.post_aio_sync_read_ns),
+        post_aio_sync_share, post_aio_sync_time_share,
+        static_cast<unsigned long long>(unclassified_sync_reads),
+        static_cast<unsigned long long>(unclassified_sync_read_ns),
+        static_cast<unsigned long long>(p.vector_prefetch_aio_pages),
+        static_cast<unsigned long long>(p.vector_prefetch_aio_wait_ns),
+        static_cast<unsigned long long>(p.vector_fallback_aio_pages),
+        static_cast<unsigned long long>(p.vector_fallback_aio_wait_ns),
+        static_cast<unsigned long long>(p.post_aio_publish_attempts),
+        static_cast<unsigned long long>(p.post_aio_publish_failures),
+        static_cast<unsigned long long>(p.post_aio_requested_unique_pages),
+        static_cast<unsigned long long>(p.post_aio_missing_unique_pages),
+        post_aio_missing_rate);
   }
 }
 

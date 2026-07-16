@@ -458,6 +458,27 @@ struct BufferPoolIoProfile {
   uint64_t aio_max_batch{0};
   uint64_t fallback_batches{0};
   uint64_t fallback_items{0};
+  // Physical synchronous reads split by the HNSW path that triggered them.
+  // These are subsets of sync_reads/sync_read_ns; any remainder is reported
+  // as unclassified so new read paths cannot silently skew the attribution.
+  uint64_t neighbor_sync_reads{0};
+  uint64_t neighbor_sync_read_ns{0};
+  uint64_t cross_page_sync_reads{0};
+  uint64_t cross_page_sync_read_ns{0};
+  uint64_t post_aio_sync_reads{0};
+  uint64_t post_aio_sync_read_ns{0};
+  // First-pass vector prefetch versus the second AIO pass performed by
+  // acquire_pages() after the all-resident publish retry failed.
+  uint64_t vector_prefetch_aio_pages{0};
+  uint64_t vector_prefetch_aio_wait_ns{0};
+  uint64_t vector_fallback_aio_pages{0};
+  uint64_t vector_fallback_aio_wait_ns{0};
+  // Unique page demand observed at the publish retry immediately after the
+  // first AIO pass.  requested is the denominator for missing.
+  uint64_t post_aio_publish_attempts{0};
+  uint64_t post_aio_publish_failures{0};
+  uint64_t post_aio_requested_unique_pages{0};
+  uint64_t post_aio_missing_unique_pages{0};
   uint64_t epoch_enter_attempts{0};
   uint64_t epoch_enter_failures{0};
   uint64_t epoch_suspends{0};
@@ -495,6 +516,21 @@ struct BufferPoolIoProfile {
     aio_max_batch = std::max(aio_max_batch, other.aio_max_batch);
     fallback_batches += other.fallback_batches;
     fallback_items += other.fallback_items;
+    neighbor_sync_reads += other.neighbor_sync_reads;
+    neighbor_sync_read_ns += other.neighbor_sync_read_ns;
+    cross_page_sync_reads += other.cross_page_sync_reads;
+    cross_page_sync_read_ns += other.cross_page_sync_read_ns;
+    post_aio_sync_reads += other.post_aio_sync_reads;
+    post_aio_sync_read_ns += other.post_aio_sync_read_ns;
+    vector_prefetch_aio_pages += other.vector_prefetch_aio_pages;
+    vector_prefetch_aio_wait_ns += other.vector_prefetch_aio_wait_ns;
+    vector_fallback_aio_pages += other.vector_fallback_aio_pages;
+    vector_fallback_aio_wait_ns += other.vector_fallback_aio_wait_ns;
+    post_aio_publish_attempts += other.post_aio_publish_attempts;
+    post_aio_publish_failures += other.post_aio_publish_failures;
+    post_aio_requested_unique_pages +=
+        other.post_aio_requested_unique_pages;
+    post_aio_missing_unique_pages += other.post_aio_missing_unique_pages;
     epoch_enter_attempts += other.epoch_enter_attempts;
     epoch_enter_failures += other.epoch_enter_failures;
     epoch_suspends += other.epoch_suspends;
@@ -654,6 +690,13 @@ class VecBufferPool {
   char *try_get_epoch_page(block_id_t page_id) {
     if (page_id >= page_table_.entry_num()) return nullptr;
     return page_table_.get_epoch_block(page_id);
+  }
+
+  //! Profile-only residency observation.  Unlike try_get_epoch_page(), this
+  //! does not update sampled hit/CLOCK state, so diagnostic scans after a
+  //! failed publish attempt cannot perturb cache policy.
+  bool is_page_resident(block_id_t page_id) const {
+    return page_id < page_table_.entry_num() && page_table_.is_loaded(page_id);
   }
 
   //! Acquire a pointer protected by the caller's active read epoch.  Resident

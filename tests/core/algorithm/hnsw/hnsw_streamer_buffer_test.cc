@@ -119,6 +119,19 @@ TEST_F(HnswStreamerTest, TestHnswBufferSearchUnderEviction) {
   EXPECT_GT(profile.sync_reads, 0u);
   EXPECT_GT(profile.sync_read_ns, 0u);
   EXPECT_GT(profile.software_ns(), 0u);
+  const uint64_t classified_sync_reads =
+      profile.neighbor_sync_reads + profile.cross_page_sync_reads +
+      profile.post_aio_sync_reads;
+  EXPECT_LE(classified_sync_reads, profile.sync_reads);
+  EXPECT_GT(profile.post_aio_publish_attempts, 0u);
+  EXPECT_LE(profile.post_aio_publish_failures,
+            profile.post_aio_publish_attempts);
+  EXPECT_GT(profile.post_aio_requested_unique_pages, 0u);
+  EXPECT_LE(profile.post_aio_missing_unique_pages,
+            profile.post_aio_requested_unique_pages);
+  EXPECT_LE(profile.vector_prefetch_aio_pages +
+                profile.vector_fallback_aio_pages,
+            profile.aio_pages);
   search_ctx.reset();
   ASSERT_EQ(reader->close(), 0);
   reader.reset();
