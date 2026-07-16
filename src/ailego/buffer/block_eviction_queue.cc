@@ -241,18 +241,28 @@ void MemoryLimitPool::background_evict_loop() {
 
 bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
                                          char *&buffer) {
-  size_t expected, desired;
-  do {
-    expected = used_size_.load();
-    if (expected >= pool_size_) {
-      // Out of budget: wake the background evictor so the next attempt is
-      // more likely to find a free buffer without inline eviction.
-      high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
-      bg_cv_.notify_one();
-      return false;
-    }
-    desired = expected + buffer_size;
-  } while (!used_size_.compare_exchange_weak(expected, desired));
+  // used_size_ is a pure accounting counter: buffer memory safety comes from
+  // the shard/slab mutexes, not from this atomic's ordering.  So relaxed is
+  // sufficient and drops the seq_cst full barriers (dmb ish on arm64).
+  //
+  // Optimistic reserve: a single fetch_add on the fast path instead of a CAS
+  // loop, so contended acquirers never spin-retry.  Semantics match the old
+  // loop: an acquire succeeds iff it observed the counter below the cap
+  // (prev < pool_size_) -- exactly one acquirer can claim the last slot, so
+  // the steady-state overshoot is unchanged (<= buffer_size for the last
+  // acquirer).  The only new effect is that concurrent acquirers may push the
+  // counter to a transient peak of up to (concurrent acquirers * buffer_size)
+  // over the cap before the losers roll back; acceptable for a soft memory
+  // limit whose hard safety comes from eviction, not this counter.
+  size_t prev = used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
+  if (prev >= pool_size_) {
+    used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    // Out of budget: wake the background evictor so the next attempt is
+    // more likely to find a free buffer without inline eviction.
+    high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
+    bg_cv_.notify_one();
+    return false;
+  }
 
   // Fast path: pull from this thread's shard free-list.
   size_t s = pick_shard();
@@ -296,20 +306,18 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
 }
 
 void MemoryLimitPool::charge_external(const size_t buffer_size) {
-  size_t expected, desired;
-  do {
-    expected = used_size_.load();
-    desired = expected + buffer_size;
-  } while (!used_size_.compare_exchange_weak(expected, desired));
+  // Unconditional add: a single fetch_add is equivalent to (and cheaper than)
+  // a compare_exchange loop, which would otherwise re-read the contended
+  // used_size_ cache line on every retry.
+  used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
 }
 
 void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
-  size_t expected, desired;
-  do {
-    expected = used_size_.load();
-    desired = expected - buffer_size;
-    assert(expected >= buffer_size);
-  } while (!used_size_.compare_exchange_weak(expected, desired));
+  // Unconditional subtract: single RMW instead of a CAS loop. fetch_sub
+  // returns the previous value so the invariant check is preserved.
+  size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+  (void)prev;
+  assert(prev >= buffer_size);
   size_t s = pick_shard();
   std::lock_guard<std::mutex> lock(free_shards_[s].mutex);
   *reinterpret_cast<char **>(buffer) = free_shards_[s].head;
@@ -318,16 +326,14 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
 }
 
 void MemoryLimitPool::release_external(const size_t buffer_size) {
-  size_t expected, desired;
-  do {
-    expected = used_size_.load();
-    desired = expected - buffer_size;
-    assert(expected >= buffer_size);
-  } while (!used_size_.compare_exchange_weak(expected, desired));
+  // Unconditional subtract: single RMW instead of a CAS loop.
+  size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+  (void)prev;
+  assert(prev >= buffer_size);
 }
 
 bool MemoryLimitPool::is_full() {
-  return used_size_.load() >= pool_size_;
+  return used_size_.load(std::memory_order_relaxed) >= pool_size_;
 }
 
 size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size,
@@ -337,14 +343,16 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size,
   size_t actual_count = count;
   size_t expected, desired;
   do {
-    expected = used_size_.load();
+    expected = used_size_.load(std::memory_order_relaxed);
     if (expected >= pool_size_) return 0;
     size_t avail = (pool_size_ - expected) / buffer_size;
     if (avail == 0) return 0;
     if (avail < actual_count) actual_count = avail;
     total_size = actual_count * buffer_size;
     desired = expected + total_size;
-  } while (!used_size_.compare_exchange_weak(expected, desired));
+  } while (!used_size_.compare_exchange_weak(expected, desired,
+                                             std::memory_order_relaxed,
+                                             std::memory_order_relaxed));
 
   size_t from_list = 0;
   size_t s = pick_shard();

@@ -146,7 +146,7 @@ class MemoryLimitPool {
   //! Returns 0 when the pool is at or over capacity.  Callers use this to gate
   //! whole-cluster prefetch under memory pressure.
   size_t available() const {
-    size_t used = used_size_.load();
+    size_t used = used_size_.load(std::memory_order_relaxed);
     return (used >= pool_size_) ? 0 : (pool_size_ - used);
   }
 

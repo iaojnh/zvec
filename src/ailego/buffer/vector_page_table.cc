@@ -147,7 +147,14 @@ bool VectorPageTable::extend(size_t new_entry_num) {
 char *VectorPageTable::acquire_block(block_id_t block_id) {
   assert(block_id < entry_num_.load(std::memory_order_relaxed));
   Entry &e = entry_at(block_id);
-  int old = e.ref_count.fetch_add(1, std::memory_order_acq_rel);
+  // Acquire (not acq_rel) is sufficient here: the acquire half synchronizes
+  // with the release-store on ref_count in set_block_acquired(), guaranteeing
+  // this thread observes the installed buffer.  The increment itself publishes
+  // no data to other threads, so the release half is unnecessary -- dropping
+  // it removes the store-release barrier (stlxr on arm64) from the hottest
+  // atomic in the cache.  The matching decrement in release_block() keeps its
+  // release ordering.
+  int old = e.ref_count.fetch_add(1, std::memory_order_acquire);
   if (ailego_likely(old >= 0)) {
     // CLOCK: record the access so the evictor grants this page a second
     // chance, and count the hit for observability.  Test-before-set: for a
