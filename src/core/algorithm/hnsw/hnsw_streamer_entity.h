@@ -726,33 +726,153 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
     const node_id_t *ids, uint32_t count,
     std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
+  if (count == 0) return 0;
+
+  const size_t read_size = vector_size();
+  ailego::VecBufferPool *pool = broker_->storage()->vec_buffer_pool();
+
+  // Compatibility path for any MBT_BUFFERPOOL storage that does not expose
+  // its underlying VecBufferPool, and for vectors spanning page boundaries.
+  auto read_one = [&](uint32_t i, uint32_t chunk_idx,
+                      size_t chunk_offset) -> int {
+    IndexStorage::MemoryBlock mem_block;
+    size_t ret =
+        node_chunks_[chunk_idx]->read(chunk_offset, mem_block, read_size);
+    if (ailego_unlikely(ret != read_size)) {
+      LOG_ERROR("Read vector failed, offset=%zu, read size=%zu, ret=%zu",
+                chunk_offset, read_size, ret);
+      return IndexError_ReadData;
+    }
+    if (mem_block.type_ == IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH) {
+      vec_blocks[i] = BufferPoolMemoryBlock::MakeOwned(mem_block.data_);
+      mem_block.data_ = nullptr;
+      mem_block.type_ = IndexStorage::MemoryBlock::MBT_UNKNOWN;
+    } else {
+      vec_blocks[i] = BufferPoolMemoryBlock(
+          mem_block.buffer_pool_handle_, mem_block.buffer_block_id_,
+          mem_block.data_);
+      mem_block.buffer_pool_handle_ = nullptr;
+    }
+    return 0;
+  };
+
+  if (!pool) {
+    for (auto i = 0U; i < count; ++i) {
+      auto loc = get_vector_chunk_loc(ids[i]);
+      ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+      ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
+                         "invalid chunk offset");
+      int ret = read_one(i, loc.first, loc.second);
+      if (ret != 0) return ret;
+    }
+    return 0;
+  }
+
+  struct PageVector {
+    ailego::block_id_t page_id;
+    uint32_t result_index;
+    size_t page_offset;
+  };
+  std::vector<PageVector> page_vectors;
+  page_vectors.reserve(count);
+  std::vector<ailego::block_id_t> page_ids;
+  page_ids.reserve(count);
+
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
     ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
                        "invalid chunk offset");
-    size_t read_size = vector_size();
-    IndexStorage::MemoryBlock mem_block;
-    size_t ret =
-        node_chunks_[loc.first]->read(loc.second, mem_block, read_size);
-    if (ailego_unlikely(ret != read_size)) {
-      LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
-                loc.second, read_size, ret);
+    const size_t abs_offset =
+        node_chunks_[loc.first]->abs_data_offset() + loc.second;
+    const size_t page_offset = abs_offset % ailego::kVectorPageSize;
+    if (read_size > ailego::kVectorPageSize - page_offset) {
+      int ret = read_one(i, loc.first, loc.second);
+      if (ret != 0) {
+        vec_blocks.clear();
+        return ret;
+      }
+      continue;
+    }
+    const auto page_id =
+        static_cast<ailego::block_id_t>(abs_offset / ailego::kVectorPageSize);
+    page_vectors.push_back(PageVector{page_id, i, page_offset});
+    page_ids.push_back(page_id);
+  }
+
+  if (page_vectors.empty()) return 0;
+
+  // Preload scattered misses with queue depth before entering the read epoch.
+  // Keeping the epoch short is important: eviction may recycle unrelated pages
+  // while I/O is in flight, and only the distance-computation window needs
+  // pointer lifetime protection.
+  static constexpr size_t kAioBatch = 128;
+  for (size_t begin = 0; begin < page_ids.size(); begin += kAioBatch) {
+    const size_t n = std::min(kAioBatch, page_ids.size() - begin);
+    pool->submit_aio_async(page_ids.data() + begin, n);
+    pool->wait_aio();
+  }
+
+  auto epoch_lease = std::make_shared<BufferPoolReadEpochLease>(pool);
+  if (epoch_lease->active) {
+    std::vector<char *> epoch_pages(page_vectors.size(), nullptr);
+    bool all_resident = true;
+    for (size_t i = 0; i < page_vectors.size(); ++i) {
+      epoch_pages[i] = pool->try_get_epoch_page(page_vectors[i].page_id);
+      if (!epoch_pages[i]) {
+        all_resident = false;
+        break;
+      }
+    }
+    if (all_resident) {
+      for (size_t i = 0; i < page_vectors.size(); ++i) {
+        const PageVector &item = page_vectors[i];
+        vec_blocks[item.result_index] = BufferPoolMemoryBlock(
+            epoch_lease, epoch_pages[i] + item.page_offset);
+      }
+      return 0;
+    }
+    // Never perform a cold load while an epoch is active: retired pages cannot
+    // return to the bounded pool until the epoch exits, which can otherwise
+    // starve a small cache.  No epoch-backed blocks have been published yet.
+    epoch_lease.reset();
+  }
+
+  // If the whole batch is not resident, copy it through bounded pin batches.
+  // Requiring all random neighbor pages to stay pinned at once can exceed a
+  // deliberately small cache.  One shared aligned scratch allocation keeps
+  // vector pointers stable for batch_distance while each page batch is
+  // released immediately after memcpy.
+  const size_t scratch_size = page_vectors.size() * read_size;
+  void *scratch = ailego_malloc(scratch_size);
+  if (!scratch) {
+    vec_blocks.clear();
+    return IndexError_NoMemory;
+  }
+  auto scratch_lease = std::make_shared<BufferPoolOwnedBatchLease>(scratch);
+  char *scratch_bytes = static_cast<char *>(scratch);
+
+  const size_t capacity_pages =
+      ailego::MemoryLimitPool::get_instance().capacity() /
+      ailego::kVectorPageSize;
+  const size_t pin_batch =
+      std::max<size_t>(1, std::min<size_t>(kAioBatch, capacity_pages / 4));
+  std::vector<char *> pages(pin_batch, nullptr);
+  for (size_t begin = 0; begin < page_vectors.size(); begin += pin_batch) {
+    const size_t n = std::min(pin_batch, page_vectors.size() - begin);
+    if (!pool->acquire_pages(page_ids.data() + begin, n, pages.data())) {
+      vec_blocks.clear();
       return IndexError_ReadData;
     }
-    vec_blocks[i] = [&]() {
-      if (mem_block.type_ == IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH) {
-        BufferPoolMemoryBlock b =
-            BufferPoolMemoryBlock::MakeOwned(mem_block.data_);
-        mem_block.data_ = nullptr;
-        mem_block.type_ = IndexStorage::MemoryBlock::MBT_UNKNOWN;
-        return b;
-      }
-      BufferPoolMemoryBlock b(mem_block.buffer_pool_handle_,
-                              mem_block.buffer_block_id_, mem_block.data_);
-      mem_block.buffer_pool_handle_ = nullptr;
-      return b;
-    }();
+    for (size_t j = 0; j < n; ++j) {
+      const size_t i = begin + j;
+      const PageVector &item = page_vectors[i];
+      char *dst = scratch_bytes + i * read_size;
+      std::memcpy(dst, pages[j] + item.page_offset, read_size);
+      vec_blocks[item.result_index] =
+          BufferPoolMemoryBlock(scratch_lease, dst);
+    }
+    pool->release_pages(page_ids.data() + begin, n);
   }
   return 0;
 }
@@ -928,6 +1048,8 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
   HnswStorageMode storage_mode() const override {
     return HnswStorageMode::kBufferPool;
   }
+
+  const HnswEntity::Pointer clone() const override;
 
   inline TypedNeighbors get_neighbors_typed(level_t level, node_id_t id) const {
     return HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(level,

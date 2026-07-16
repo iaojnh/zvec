@@ -17,6 +17,7 @@
 
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -33,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <zvec/ailego/internal/platform.h>
 #if defined(__linux) || defined(__linux__)
 #include <zvec/ailego/io/libaio_loader.h>
@@ -50,7 +52,12 @@ namespace ailego {
 extern const size_t kVectorPageSize;
 
 class VectorPageTable : public EvictableBlockOwner {
-  struct Entry {
+  // One page-table entry per cache line.  Adjacent HNSW vectors frequently
+  // land on adjacent pages and are searched by different cores; packing two
+  // ref_count values into one line turns independent page accesses into false
+  // sharing.  The 64-byte entry costs 1.56% relative to a 4K cached page and
+  // isolates both reader RMWs and eviction metadata per page-table slot.
+  struct alignas(64) Entry {
     std::atomic<int> ref_count;
     std::atomic<bool> in_evict_queue;
     std::atomic<bool> is_dirty;
@@ -61,14 +68,16 @@ class VectorPageTable : public EvictableBlockOwner {
     uint8_t evict_priority{0};
     bool ever_loaded{
         false};  // true once the page has been loaded at least once
-    char *buffer;
+    std::atomic<char *> buffer;
     size_t file_offset;
   };
+  static_assert(sizeof(Entry) == 64, "VectorPageTable::Entry must be one line");
 
  public:
   // Callback invoked by evict_block() to persist a dirty block before its
   // memory is released. Signature: (block_id, buffer, size, file_offset).
   using FlushCallback = std::function<int(block_id_t, char *, size_t, size_t)>;
+  using RetireCallback = std::function<void(char *)>;
 
   VectorPageTable() {
     BlockEvictionQueue::get_instance().set_valid(this);
@@ -117,7 +126,11 @@ class VectorPageTable : public EvictableBlockOwner {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
     Entry &e = entry_at(block_id);
     e.evict_priority = priority;
-    e.in_evict_queue.store(false, std::memory_order_relaxed);
+    // A loaded page has one persistent logical queue membership.  Changing
+    // the priority must not invalidate that membership: doing so can strand a
+    // released page with no future release operation available to re-enqueue
+    // it.  The new priority is used the next time the page is moved to the
+    // queue tail.
   }
 
   char *set_block_acquired(block_id_t block_id, char *buffer,
@@ -125,6 +138,10 @@ class VectorPageTable : public EvictableBlockOwner {
 
   void set_flush_callback(FlushCallback cb) {
     flush_callback_ = std::move(cb);
+  }
+
+  void set_retire_callback(RetireCallback cb) {
+    retire_callback_ = std::move(cb);
   }
 
   //! Mark a loaded block as dirty so that it is persisted on eviction.
@@ -142,7 +159,23 @@ class VectorPageTable : public EvictableBlockOwner {
   //! Used by batched flush to memcpy page contents into a coalescing buffer.
   char *get_block_buffer(block_id_t block_id) const {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
-    return entry_at(block_id).buffer;
+    return entry_at(block_id).buffer.load(std::memory_order_acquire);
+  }
+
+  //! Get a resident page for a caller protected by PageReadEpochDomain.
+  //! Epoch readers avoid ref_count RMWs, but still participate in sampled hit
+  //! accounting and CLOCK hot-page retention.
+  char *get_epoch_block(block_id_t block_id) {
+    assert(block_id < entry_num_.load(std::memory_order_acquire));
+    Entry &e = entry_at(block_id);
+    char *buffer = e.buffer.load(std::memory_order_acquire);
+    if (buffer && sample_hit()) {
+      if (!e.referenced.load(std::memory_order_relaxed)) {
+        e.referenced.store(true, std::memory_order_relaxed);
+      }
+      inc_sampled_hit();
+    }
+    return buffer;
   }
 
   //! Clear the dirty flag after a successful batched flush.
@@ -156,7 +189,7 @@ class VectorPageTable : public EvictableBlockOwner {
   int flush_block(block_id_t block_id) {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
     Entry &e = entry_at(block_id);
-    char *buffer = e.buffer;
+    char *buffer = e.buffer.load(std::memory_order_acquire);
     if (!buffer || !flush_callback_) {
       return 0;
     }
@@ -179,7 +212,7 @@ class VectorPageTable : public EvictableBlockOwner {
 
   //! Cache observability counters (monotonic, relaxed atomics).
   struct Stats {
-    uint64_t hit{0};           // acquire_block served from memory
+    uint64_t hit{0};           // estimated cache hits (1/64 sampling)
     uint64_t evict{0};         // pages actually reclaimed
     uint64_t second_chance{0}; // pages spared by the CLOCK bit
     uint64_t dirty_flush{0};   // dirty pages written back on eviction
@@ -211,7 +244,7 @@ class VectorPageTable : public EvictableBlockOwner {
   //! Used by try_acquire_buffer to avoid ref_count leaks on unloaded pages.
   bool is_loaded(block_id_t block_id) const {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
-    return entry_at(block_id).buffer != nullptr;
+    return entry_at(block_id).buffer.load(std::memory_order_acquire) != nullptr;
   }
 
   //! Check if a page has ever been loaded (so pread is needed on reload
@@ -268,6 +301,7 @@ class VectorPageTable : public EvictableBlockOwner {
   bool do_evict_block(block_id_t block_id, bool force);
 
   FlushCallback flush_callback_{};
+  RetireCallback retire_callback_{};
 
   // Observability counters, sharded across cache lines.  A single global
   // atomic incurred severe contention on the hot acquire path: every cache
@@ -292,8 +326,18 @@ class VectorPageTable : public EvictableBlockOwner {
     thread_local size_t idx = seq.fetch_add(1, std::memory_order_relaxed);
     return idx & (kCounterShards - 1);
   }
-  void inc_hit() {
-    counters_[counter_shard()].hit.fetch_add(1, std::memory_order_relaxed);
+  // Cache hits are a high-frequency observability signal, not correctness
+  // state.  Sample one in 64 and scale the counter to avoid adding another
+  // atomic RMW to every page acquisition.  Starting at zero records the first
+  // hit on each thread, which keeps short tests and low-traffic pools visible.
+  static constexpr uint32_t kHitSampleRate = 64;
+  static bool sample_hit() {
+    thread_local uint32_t sample_cursor = 0;
+    return (sample_cursor++ & (kHitSampleRate - 1)) == 0;
+  }
+  void inc_sampled_hit() {
+    counters_[counter_shard()].hit.fetch_add(kHitSampleRate,
+                                             std::memory_order_relaxed);
   }
   void inc_evict() {
     counters_[counter_shard()].evict.fetch_add(1, std::memory_order_relaxed);
@@ -308,6 +352,45 @@ class VectorPageTable : public EvictableBlockOwner {
   }
 };
 
+//! Epoch reclamation for refcount-free reads from read-only buffer pools.
+//! Readers occupy one slot for the duration of a query.  Evicted buffers are
+//! retired with the current generation and returned to MemoryLimitPool only
+//! after every reader that could have observed them has advanced or exited.
+class PageReadEpochDomain {
+ public:
+  struct Token {
+    size_t slot{kSlotCount};
+    bool valid() const {
+      return slot < kSlotCount;
+    }
+  };
+
+  bool enter(Token *token);
+  void exit(Token *token);
+  void retire(char *buffer);
+  void drain();
+
+ private:
+  static constexpr size_t kSlotCount = 256;
+  static constexpr uint64_t kReserved = 1;
+  struct RetiredBuffer {
+    char *buffer;
+    uint64_t epoch;
+  };
+  struct alignas(64) ReaderSlot {
+    std::atomic<uint64_t> epoch{0};
+  };
+
+  void reclaim_locked(bool force);
+
+  std::atomic<uint64_t> epoch_{0};
+  std::atomic<size_t> active_readers_{0};
+  std::atomic<size_t> next_slot_{0};
+  std::array<ReaderSlot, kSlotCount> slots_{};
+  std::mutex retired_mutex_{};
+  std::vector<RetiredBuffer> retired_{};
+};
+
 class VecBufferPoolHandle;
 
 class VecBufferPool {
@@ -319,6 +402,10 @@ class VecBufferPool {
   VecBufferPool(const std::string &filename, bool writable = false,
                 bool enable_direct_io = false);
   ~VecBufferPool() {
+    // A caller may have used the non-blocking submit API directly.  Drain the
+    // current thread's batch before page buffers or file descriptors can be
+    // reclaimed by teardown.
+    wait_aio();
     // Emit a one-line cache summary (hit rate / evictions) before teardown
     // so operators can reason about buffer-pool efficiency per file.
     log_stats();
@@ -329,6 +416,7 @@ class VecBufferPool {
       assert(page_table_.is_released(i));
       page_table_.force_evict_block(i);
     }
+    read_epoch_domain_.drain();
 #if defined(__linux) || defined(__linux__)
     if (aio_enabled_ && aio_ctx_) {
       LibAioLoader::Instance().io_destroy(aio_ctx_);
@@ -375,6 +463,45 @@ class VecBufferPool {
   VecBufferPoolHandle get_handle();
 
   char *acquire_buffer(block_id_t page_id, int retry = 0);
+
+  //! Pin a scattered set of pages as one logical operation.  Resident pages
+  //! are acquired immediately; cold pages are submitted in bounded AIO
+  //! batches when direct I/O is available, with a portable synchronous
+  //! fallback.  Duplicate page ids are allowed and receive one pin per output
+  //! slot.  On failure every pin acquired by this call is rolled back.
+  bool acquire_pages(const block_id_t *page_ids, size_t count, char **pages);
+
+  //! Release one pin per page id acquired by acquire_pages().
+  void release_pages(const block_id_t *page_ids, size_t count);
+
+  bool enter_read_epoch(PageReadEpochDomain::Token *token) {
+    return !writable_ && read_epoch_domain_.enter(token);
+  }
+
+  void exit_read_epoch(PageReadEpochDomain::Token *token) {
+    read_epoch_domain_.exit(token);
+  }
+
+  //! Return a resident page without taking a refcount.  The caller must hold
+  //! an active read epoch for this pool.  Unlike acquire_epoch_page(), this
+  //! never performs I/O, so callers can abandon the epoch path and fall back
+  //! to pinned reads if an entire batch is not already resident.
+  char *try_get_epoch_page(block_id_t page_id) {
+    if (page_id >= page_table_.entry_num()) return nullptr;
+    return page_table_.get_epoch_block(page_id);
+  }
+
+  //! Acquire a pointer protected by the caller's active read epoch.  Resident
+  //! hits avoid ref_count entirely; a miss uses the regular load path once,
+  //! then immediately drops that temporary ref because the epoch now protects
+  //! the installed buffer from reclamation.
+  char *acquire_epoch_page(block_id_t page_id) {
+    char *page = page_table_.get_block_buffer(page_id);
+    if (page) return page;
+    page = acquire_buffer(page_id, 50);
+    if (page) page_table_.release_block(page_id);
+    return page;
+  }
 
   int get_meta(size_t offset, size_t length, char *buffer);
 
@@ -473,6 +600,7 @@ class VecBufferPool {
   VectorPageTable page_table_;
 
  private:
+  PageReadEpochDomain read_epoch_domain_{};
   std::unique_ptr<std::mutex[]> block_mutexes_{};
 };
 
@@ -486,6 +614,10 @@ class VecBufferPoolHandle {
   typedef std::shared_ptr<VecBufferPoolHandle> Pointer;
 
   char *get_single_page(size_t file_offset, size_t len, size_t &out_page_id);
+
+  bool acquire_pages(const block_id_t *page_ids, size_t count, char **pages);
+
+  void release_pages(const block_id_t *page_ids, size_t count);
 
   bool read_range(size_t file_offset, size_t len, char *out);
 

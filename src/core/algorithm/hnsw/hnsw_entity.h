@@ -195,12 +195,47 @@ struct MmapMemoryBlock {
 };
 
 //! Lightweight MemoryBlock for buffer pool mode: release on destruction
+struct BufferPoolReadEpochLease {
+  explicit BufferPoolReadEpochLease(ailego::VecBufferPool *pool_in)
+      : pool(pool_in) {
+    active = pool && pool->enter_read_epoch(&token);
+  }
+
+  ~BufferPoolReadEpochLease() {
+    if (active) pool->exit_read_epoch(&token);
+  }
+
+  BufferPoolReadEpochLease(const BufferPoolReadEpochLease &) = delete;
+  BufferPoolReadEpochLease &operator=(const BufferPoolReadEpochLease &) =
+      delete;
+
+  ailego::VecBufferPool *pool{nullptr};
+  ailego::PageReadEpochDomain::Token token{};
+  bool active{false};
+};
+
+struct BufferPoolOwnedBatchLease {
+  explicit BufferPoolOwnedBatchLease(void *data_in) : data(data_in) {}
+  ~BufferPoolOwnedBatchLease() {
+    if (data) ailego_free(data);
+  }
+
+  BufferPoolOwnedBatchLease(const BufferPoolOwnedBatchLease &) = delete;
+  BufferPoolOwnedBatchLease &operator=(const BufferPoolOwnedBatchLease &) =
+      delete;
+
+  void *data{nullptr};
+};
+
 struct BufferPoolMemoryBlock {
   BufferPoolMemoryBlock() = default;
 
   BufferPoolMemoryBlock(ailego::VecBufferPoolHandle *handle, size_t block_id,
                         void *data)
       : buffer_pool_handle_(handle), buffer_block_id_(block_id), data_(data) {}
+
+  BufferPoolMemoryBlock(std::shared_ptr<void> lifetime, void *data)
+      : lifetime_(std::move(lifetime)), data_(data) {}
 
   static BufferPoolMemoryBlock MakeOwned(void *owned_data) {
     BufferPoolMemoryBlock b;
@@ -212,8 +247,11 @@ struct BufferPoolMemoryBlock {
   BufferPoolMemoryBlock(const BufferPoolMemoryBlock &rhs)
       : buffer_pool_handle_(rhs.buffer_pool_handle_),
         buffer_block_id_(rhs.buffer_block_id_),
+        lifetime_(rhs.lifetime_),
         data_(rhs.data_) {
-    if (rhs.owns_buffer_) {
+    if (lifetime_) {
+      buffer_pool_handle_ = nullptr;
+    } else if (rhs.owns_buffer_) {
       owns_buffer_ = false;
       buffer_pool_handle_ = nullptr;
     } else if (buffer_pool_handle_) {
@@ -226,8 +264,11 @@ struct BufferPoolMemoryBlock {
       release();
       buffer_pool_handle_ = rhs.buffer_pool_handle_;
       buffer_block_id_ = rhs.buffer_block_id_;
+      lifetime_ = rhs.lifetime_;
       data_ = rhs.data_;
-      if (rhs.owns_buffer_) {
+      if (lifetime_) {
+        buffer_pool_handle_ = nullptr;
+      } else if (rhs.owns_buffer_) {
         owns_buffer_ = false;
         buffer_pool_handle_ = nullptr;
       } else if (buffer_pool_handle_) {
@@ -241,6 +282,7 @@ struct BufferPoolMemoryBlock {
       : buffer_pool_handle_(rhs.buffer_pool_handle_),
         buffer_block_id_(rhs.buffer_block_id_),
         owns_buffer_(rhs.owns_buffer_),
+        lifetime_(std::move(rhs.lifetime_)),
         data_(rhs.data_) {
     rhs.buffer_pool_handle_ = nullptr;
     rhs.owns_buffer_ = false;
@@ -253,6 +295,7 @@ struct BufferPoolMemoryBlock {
       buffer_pool_handle_ = rhs.buffer_pool_handle_;
       buffer_block_id_ = rhs.buffer_block_id_;
       owns_buffer_ = rhs.owns_buffer_;
+      lifetime_ = std::move(rhs.lifetime_);
       data_ = rhs.data_;
       rhs.buffer_pool_handle_ = nullptr;
       rhs.owns_buffer_ = false;
@@ -287,12 +330,14 @@ struct BufferPoolMemoryBlock {
       buffer_pool_handle_->release_one(buffer_block_id_);
       buffer_pool_handle_ = nullptr;
     }
+    lifetime_.reset();
     data_ = nullptr;
   }
 
   ailego::VecBufferPoolHandle *buffer_pool_handle_{nullptr};
   size_t buffer_block_id_{0};
   bool owns_buffer_{false};
+  std::shared_ptr<void> lifetime_{};
   void *data_{nullptr};
 };
 

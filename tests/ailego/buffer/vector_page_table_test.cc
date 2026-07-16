@@ -106,6 +106,75 @@ TEST_F(BufferPoolTest, DataCorrectUnderEviction) {
   EXPECT_GT(s.miss, 0u);  // capacity < working set => guaranteed misses
 }
 
+// A page encountered by the evictor while pinned stays registered with the
+// queue and becomes reclaimable after its final release.  This exercises the
+// install-time queue registration used to keep release_block() free of the
+// steady-state in_evict_queue CAS.
+TEST_F(BufferPoolTest, PinnedEvictionBecomesReclaimableAfterRelease) {
+  InitPool(/*capacity_pages=*/2);
+  std::string file = NewFile(/*num_pages=*/2);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+
+  size_t page_id = 0;
+  char *page = handle.get_single_page(/*file_offset=*/0, /*len=*/1, page_id);
+  ASSERT_NE(page, nullptr);
+  EXPECT_EQ(page_id, 0u);
+
+  // The active pin prevents eviction, but the failed attempt must not make
+  // the page depend on a release-side CAS to become eligible again.
+  EXPECT_FALSE(pool.page_table_.evict_block(page_id));
+  handle.release_one(page_id);
+  EXPECT_TRUE(pool.page_table_.evict_block(page_id));
+  EXPECT_FALSE(pool.page_table_.is_loaded(page_id));
+}
+
+// Scattered acquisition is storage-level functionality: it preserves caller
+// order, deduplicates cold I/O internally, and still returns one independent
+// pin for every occurrence of a duplicate page id.
+TEST_F(BufferPoolTest, BatchAcquireScatteredPagesWithDuplicates) {
+  InitPool(/*capacity_pages=*/16);
+  std::string file = NewFile(/*num_pages=*/32);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+
+  const block_id_t page_ids[] = {7, 1, 7, 31, 0, 16};
+  char *pages[sizeof(page_ids) / sizeof(page_ids[0])] = {};
+  constexpr size_t count = sizeof(page_ids) / sizeof(page_ids[0]);
+
+  ASSERT_TRUE(handle.acquire_pages(page_ids, count, pages));
+  for (size_t i = 0; i < count; ++i) {
+    ASSERT_NE(pages[i], nullptr);
+    ExpectPageContent(pages[i], page_ids[i]);
+  }
+  EXPECT_EQ(pages[0], pages[2]);
+
+  handle.release_pages(page_ids, count);
+  for (block_id_t page_id : page_ids) {
+    EXPECT_TRUE(pool.page_table_.is_released(page_id));
+  }
+}
+
+TEST_F(BufferPoolTest, BatchAcquireRollsBackPinsOnInvalidPage) {
+  InitPool(/*capacity_pages=*/4);
+  std::string file = NewFile(/*num_pages=*/4);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+
+  const block_id_t page_ids[] = {1, 4};
+  char *pages[2] = {};
+  EXPECT_FALSE(handle.acquire_pages(page_ids, 2, pages));
+  EXPECT_EQ(pages[0], nullptr);
+  EXPECT_EQ(pages[1], nullptr);
+  EXPECT_TRUE(pool.page_table_.is_released(1));
+}
+
 // ---------------------------------------------------------------------------
 // 2. Re-touching a small hot set under memory pressure should trigger the CLOCK
 //    second-chance path (pages spared instead of evicted) and keep them hot.

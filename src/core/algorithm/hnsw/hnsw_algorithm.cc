@@ -131,6 +131,10 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
     }
 
     dc.batch_dist(neighbor_vecs.data(), size, dists.data());
+    // Distances own the only data needed below.  Release page pins/read epoch
+    // before the next graph-page access so a bounded BufferStorage cache can
+    // recycle retired pages immediately.
+    neighbor_vec_blocks.clear();
 
     for (uint32_t i = 0; i < size; ++i) {
       dist_t cur_dist = dists[i];
@@ -355,6 +359,7 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
     }
 
     dc.batch_dist(neighbor_vecs.data(), size, dists.data());
+    neighbor_vec_blocks.clear();
 
     for (uint32_t i = 0; i < size; ++i) {
       node_id_t node = neighbor_ids[i];
@@ -539,6 +544,7 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         neighbor_vecs[i] = neighbor_vec_blocks[i].data();
       }
       dc.batch_dist(neighbor_vecs.data(), size, dists.data());
+      neighbor_vec_blocks.clear();
 
       for (uint32_t i = 0; i < size; ++i) {
         node_id_t node = neighbor_ids[i];

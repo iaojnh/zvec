@@ -46,6 +46,75 @@ void HnswStreamerTest::TearDown(void) {
   zvec::test_util::RemoveTestPath(dir_);
 }
 
+TEST_F(HnswStreamerTest, TestHnswBufferSearchUnderEviction) {
+  const std::string path = dir_ + "Test/HnswLowMemory";
+  constexpr size_t count = 2048;
+  IndexQueryMeta qmeta(IndexMeta::DT_FP32, dim);
+  Params params;
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+  Params storage_params;
+
+  // Build independently of the bounded read cache so this test isolates the
+  // BufferStorage search path.
+  auto writer = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(writer, nullptr);
+  ASSERT_EQ(writer->init(*index_meta_ptr_, params), 0);
+  auto mmap_storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(mmap_storage, nullptr);
+  ASSERT_EQ(mmap_storage->init(storage_params), 0);
+  ASSERT_EQ(mmap_storage->open(path, true), 0);
+  ASSERT_EQ(writer->open(mmap_storage), 0);
+  auto build_ctx = writer->create_context();
+  ASSERT_NE(build_ctx, nullptr);
+  for (size_t i = 0; i < count; ++i) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) vec[j] = static_cast<float>(i);
+    ASSERT_EQ(writer->add_impl(i, vec.data(), qmeta, build_ctx), 0);
+  }
+  ASSERT_EQ(writer->flush(0), 0);
+  ASSERT_EQ(writer->close(), 0);
+  writer.reset();
+  ASSERT_EQ(mmap_storage->close(), 0);
+  mmap_storage.reset();
+  build_ctx.reset();
+
+  // The index is substantially larger than 32 pages. Searches therefore
+  // force repeated eviction/reload instead of succeeding from warmup alone.
+  MemoryLimitPool::get_instance().init(32 * kVectorPageSize);
+  auto reader = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(reader, nullptr);
+  ASSERT_EQ(reader->init(*index_meta_ptr_, params), 0);
+  auto buffer_storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(buffer_storage, nullptr);
+  ASSERT_EQ(buffer_storage->init(storage_params), 0);
+  ASSERT_EQ(buffer_storage->open(path, false), 0);
+  ASSERT_EQ(reader->open(buffer_storage), 0);
+  auto search_ctx = reader->create_context();
+  ASSERT_NE(search_ctx, nullptr);
+  search_ctx->set_topk(3);
+
+  for (size_t round = 0; round < 3; ++round) {
+    for (size_t i = 0; i < count; i += 17) {
+      NumericalVector<float> query(dim);
+      for (size_t j = 0; j < dim; ++j) {
+        query[j] = static_cast<float>(i) + 0.1f;
+      }
+      ASSERT_EQ(reader->search_impl(query.data(), qmeta, search_ctx), 0);
+      const auto &result = search_ctx->result();
+      ASSERT_EQ(result.size(), 3u);
+      ASSERT_EQ(result[0].key(), i);
+    }
+  }
+
+  auto *pool = buffer_storage->vec_buffer_pool();
+  ASSERT_NE(pool, nullptr);
+  EXPECT_GT(pool->stats().evict, 0u);
+  search_ctx.reset();
+  ASSERT_EQ(reader->close(), 0);
+  reader.reset();
+  ASSERT_EQ(buffer_storage->close(), 0);
+}
+
 TEST_F(HnswStreamerTest, TestHnswSearch) {
   MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
