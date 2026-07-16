@@ -186,15 +186,19 @@ bool VectorPageTable::init(size_t entry_num) {
   for (size_t i = 0; i < old_count; ++i) {
     delete[] segments_[i];
     segments_[i] = nullptr;
+    delete[] resident_segments_[i];
+    resident_segments_[i] = nullptr;
   }
   for (size_t s = 0; s < need_segments; ++s) {
     segments_[s] = new Entry[kSegmentSize];
+    resident_segments_[s] = new ResidentEntry[kSegmentSize];
     for (size_t i = 0; i < kSegmentSize; ++i) {
       segments_[s][i].ref_count.store(std::numeric_limits<int>::min());
       segments_[s][i].in_evict_queue.store(false);
       segments_[s][i].is_dirty.store(false);
       segments_[s][i].referenced.store(false);
-      segments_[s][i].buffer.store(nullptr, std::memory_order_relaxed);
+      resident_segments_[s][i].buffer.store(nullptr,
+                                             std::memory_order_relaxed);
       segments_[s][i].file_offset = 0;
     }
   }
@@ -226,12 +230,14 @@ bool VectorPageTable::extend(size_t new_entry_num) {
   size_t old_count = segment_count_.load(std::memory_order_relaxed);
   for (size_t s = old_count; s < new_segment_count; ++s) {
     segments_[s] = new Entry[kSegmentSize];
+    resident_segments_[s] = new ResidentEntry[kSegmentSize];
     for (size_t i = 0; i < kSegmentSize; ++i) {
       segments_[s][i].ref_count.store(std::numeric_limits<int>::min());
       segments_[s][i].in_evict_queue.store(false);
       segments_[s][i].is_dirty.store(false);
       segments_[s][i].referenced.store(false);
-      segments_[s][i].buffer.store(nullptr, std::memory_order_relaxed);
+      resident_segments_[s][i].buffer.store(nullptr,
+                                             std::memory_order_relaxed);
       segments_[s][i].file_offset = 0;
     }
   }
@@ -265,7 +271,8 @@ char *VectorPageTable::acquire_block(block_id_t block_id) {
         }
         inc_sampled_hit();
       }
-      return e.buffer.load(std::memory_order_acquire);
+      return resident_entry_at(block_id).buffer.load(
+          std::memory_order_acquire);
     }
   }
   return nullptr;
@@ -337,7 +344,8 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
           block, static_cast<int>(e.evict_priority));
       return false;  // spared, not reclaimed
     }
-    char *buffer = e.buffer.exchange(nullptr, std::memory_order_acq_rel);
+    char *buffer = resident_entry_at(block_id).buffer.exchange(
+        nullptr, std::memory_order_acq_rel);
     if (buffer && e.is_dirty.load(std::memory_order_relaxed) &&
         flush_callback_) {
       flush_callback_(block_id, buffer, kVectorPageSize, e.file_offset);
@@ -393,12 +401,14 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
                                             std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
         MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize);
-        return e.buffer.load(std::memory_order_acquire);
+        return resident_entry_at(block_id).buffer.load(
+            std::memory_order_acquire);
       }
     } else if (current_count == std::numeric_limits<int>::min()) {
       // Epoch readers publish no ref_count edge, so the buffer pointer itself
       // must release-publish the fully initialized page contents.
-      e.buffer.store(buffer, std::memory_order_release);
+      resident_entry_at(block_id).buffer.store(buffer,
+                                                std::memory_order_release);
       e.file_offset = file_offset;
       e.is_dirty.store(false, std::memory_order_relaxed);
       e.referenced.store(false, std::memory_order_relaxed);
@@ -417,7 +427,8 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
         // The final release will take the rare fallback registration path.
         e.in_evict_queue.store(false, std::memory_order_relaxed);
       }
-      return e.buffer.load(std::memory_order_acquire);
+      return resident_entry_at(block_id).buffer.load(
+          std::memory_order_acquire);
     } else {
       ++spin_count;
       if (spin_count < 64) {

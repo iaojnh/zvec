@@ -52,11 +52,11 @@ namespace ailego {
 extern const size_t kVectorPageSize;
 
 class VectorPageTable : public EvictableBlockOwner {
-  // One page-table entry per cache line.  Adjacent HNSW vectors frequently
-  // land on adjacent pages and are searched by different cores; packing two
-  // ref_count values into one line turns independent page accesses into false
-  // sharing.  The 64-byte entry costs 1.56% relative to a 4K cached page and
-  // isolates both reader RMWs and eviction metadata per page-table slot.
+  // Cold page metadata stays one entry per cache line.  Pinning, writes and
+  // eviction mutate these fields, so isolating adjacent entries avoids false
+  // sharing on those paths.  Read-only epoch hits do not touch this 64-byte
+  // table; their resident pointers live in the compact ResidentEntry table
+  // below.
   struct alignas(64) Entry {
     std::atomic<int> ref_count;
     std::atomic<bool> in_evict_queue;
@@ -68,10 +68,18 @@ class VectorPageTable : public EvictableBlockOwner {
     uint8_t evict_priority{0};
     bool ever_loaded{
         false};  // true once the page has been loaded at least once
-    std::atomic<char *> buffer;
     size_t file_offset;
   };
   static_assert(sizeof(Entry) == 64, "VectorPageTable::Entry must be one line");
+
+  // Hot read-only lookup table.  Eight resident pointers fit in one 64-byte
+  // cache line, reducing a 300K-page working set from ~19 MB of cold entries
+  // to ~2.4 MB.  The epoch domain protects a non-null pointer after load.
+  struct ResidentEntry {
+    std::atomic<char *> buffer{nullptr};
+  };
+  static_assert(sizeof(ResidentEntry) == sizeof(char *),
+                "ResidentEntry must contain only one pointer");
 
  public:
   // Callback invoked by evict_block() to persist a dirty block before its
@@ -90,6 +98,7 @@ class VectorPageTable : public EvictableBlockOwner {
     size_t cnt = segment_count_.load(std::memory_order_relaxed);
     for (size_t i = 0; i < cnt; ++i) {
       delete[] segments_[i];
+      delete[] resident_segments_[i];
     }
   }
 
@@ -159,7 +168,7 @@ class VectorPageTable : public EvictableBlockOwner {
   //! Used by batched flush to memcpy page contents into a coalescing buffer.
   char *get_block_buffer(block_id_t block_id) const {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
-    return entry_at(block_id).buffer.load(std::memory_order_acquire);
+    return resident_entry_at(block_id).buffer.load(std::memory_order_acquire);
   }
 
   //! Get a resident page for a caller protected by PageReadEpochDomain.
@@ -167,9 +176,13 @@ class VectorPageTable : public EvictableBlockOwner {
   //! accounting and CLOCK hot-page retention.
   char *get_epoch_block(block_id_t block_id) {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
-    Entry &e = entry_at(block_id);
-    char *buffer = e.buffer.load(std::memory_order_acquire);
+    // Keep the common path entirely in the compact resident-pointer table.
+    // CLOCK/observability metadata is cold and touched only by the sampled
+    // branch, after a successful resident lookup.
+    char *buffer =
+        resident_entry_at(block_id).buffer.load(std::memory_order_acquire);
     if (buffer && sample_hit()) {
+      Entry &e = entry_at(block_id);
       if (!e.referenced.load(std::memory_order_relaxed)) {
         e.referenced.store(true, std::memory_order_relaxed);
       }
@@ -189,7 +202,8 @@ class VectorPageTable : public EvictableBlockOwner {
   int flush_block(block_id_t block_id) {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
     Entry &e = entry_at(block_id);
-    char *buffer = e.buffer.load(std::memory_order_acquire);
+    char *buffer =
+        resident_entry_at(block_id).buffer.load(std::memory_order_acquire);
     if (!buffer || !flush_callback_) {
       return 0;
     }
@@ -250,7 +264,8 @@ class VectorPageTable : public EvictableBlockOwner {
   //! Used by try_acquire_buffer to avoid ref_count leaks on unloaded pages.
   bool is_loaded(block_id_t block_id) const {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
-    return entry_at(block_id).buffer.load(std::memory_order_acquire) != nullptr;
+    return resident_entry_at(block_id).buffer.load(std::memory_order_acquire) !=
+           nullptr;
   }
 
   //! Check if a page has ever been loaded (so pread is needed on reload
@@ -286,6 +301,7 @@ class VectorPageTable : public EvictableBlockOwner {
   std::atomic<size_t> entry_num_{0};
   std::atomic<size_t> segment_count_{0};
   Entry *segments_[kMaxSegments]{};
+  ResidentEntry *resident_segments_[kMaxSegments]{};
 
   // Pair with the release-store on segment_count_ in init()/extend() so
   // that any reader observing the published segment table also sees the
@@ -299,6 +315,14 @@ class VectorPageTable : public EvictableBlockOwner {
   const Entry &entry_at(size_t idx) const {
     (void)segment_count_.load(std::memory_order_acquire);
     return segments_[idx >> kSegmentShift][idx & kSegmentMask];
+  }
+  ResidentEntry &resident_entry_at(size_t idx) {
+    (void)segment_count_.load(std::memory_order_acquire);
+    return resident_segments_[idx >> kSegmentShift][idx & kSegmentMask];
+  }
+  const ResidentEntry &resident_entry_at(size_t idx) const {
+    (void)segment_count_.load(std::memory_order_acquire);
+    return resident_segments_[idx >> kSegmentShift][idx & kSegmentMask];
   }
 
   // Shared implementation for evict_block()/force_evict_block(): when `force`
