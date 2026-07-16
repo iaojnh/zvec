@@ -62,7 +62,8 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
     }
   }
 
-  auto vector_read_scope = entity_.make_vector_read_scope();
+  auto vector_read_scope =
+      entity_.make_vector_read_scope(/*profile_query=*/false);
   level_t cur_level = cur_max_level;
   dist_t dist = ctx->dist_calculator().batch_dist(entry_point);
   for (; cur_level > level; --cur_level) {

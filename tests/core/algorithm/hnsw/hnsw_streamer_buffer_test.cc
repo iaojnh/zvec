@@ -53,6 +53,7 @@ TEST_F(HnswStreamerTest, TestHnswBufferSearchUnderEviction) {
   Params params;
   params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
   Params storage_params;
+  storage_params.set("proxima.buffer.storage.enable_io_profile", true);
 
   // Build independently of the bounded read cache so this test isolates the
   // BufferStorage search path.
@@ -109,6 +110,15 @@ TEST_F(HnswStreamerTest, TestHnswBufferSearchUnderEviction) {
   auto *pool = buffer_storage->vec_buffer_pool();
   ASSERT_NE(pool, nullptr);
   EXPECT_GT(pool->stats().evict, 0u);
+  const auto profile = pool->stats().io_profile;
+  constexpr size_t queries_per_round = (count + 16) / 17;
+  EXPECT_EQ(profile.query_count, 3 * queries_per_round);
+  EXPECT_GT(profile.query_wall_ns, 0u);
+  EXPECT_GT(profile.epoch_enter_attempts, 0u);
+  EXPECT_GT(profile.fallback_total_ns, 0u);
+  EXPECT_GT(profile.sync_reads, 0u);
+  EXPECT_GT(profile.sync_read_ns, 0u);
+  EXPECT_GT(profile.software_ns(), 0u);
   search_ctx.reset();
   ASSERT_EQ(reader->close(), 0);
   reader.reset();

@@ -69,6 +69,18 @@ class BufferStorageWriteTest : public ::testing::Test {
 
 // ===== Basic Write Tests =====
 
+TEST_F(BufferStorageWriteTest, IoProfileParamReachesBufferPool) {
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ailego::Params params;
+  params.set("proxima.buffer.storage.enable_io_profile", true);
+  ASSERT_EQ(storage->init(params), 0);
+  ASSERT_EQ(storage->open(file_path_, true), 0);
+  ASSERT_NE(storage->vec_buffer_pool(), nullptr);
+  EXPECT_TRUE(storage->vec_buffer_pool()->io_profile_enabled());
+  EXPECT_EQ(storage->close(), 0);
+}
+
 // Test: Create new index via BufferStorage, append segment, write data, read back
 TEST_F(BufferStorageWriteTest, WriteBasicCreateAndWrite) {
   auto storage = OpenWritable();

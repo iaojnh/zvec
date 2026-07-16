@@ -69,6 +69,27 @@ namespace ailego {
 
 const size_t kVectorPageSize = MemoryHelper::PageSize();
 
+namespace {
+thread_local BufferPoolIoProfileBinding tl_io_profile_binding;
+}  // namespace
+
+BufferPoolIoProfileBinding VecBufferPool::bind_thread_io_profile(
+    BufferPoolIoProfile *profile) {
+  BufferPoolIoProfileBinding previous = tl_io_profile_binding;
+  tl_io_profile_binding = BufferPoolIoProfileBinding{this, profile};
+  return previous;
+}
+
+void VecBufferPool::restore_thread_io_profile(
+    const BufferPoolIoProfileBinding &binding) {
+  tl_io_profile_binding = binding;
+}
+
+BufferPoolIoProfile *VecBufferPool::current_thread_io_profile() const {
+  return tl_io_profile_binding.pool == this ? tl_io_profile_binding.profile
+                                            : nullptr;
+}
+
 version_t VectorPageTable::next_owner_version() {
   static std::atomic<version_t> sequence{1};
   version_t version = sequence.fetch_add(1, std::memory_order_relaxed);
@@ -474,9 +495,10 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
 }
 
 VecBufferPool::VecBufferPool(const std::string &filename, bool writable,
-                             bool enable_direct_io) {
+                             bool enable_direct_io, bool enable_io_profile) {
   file_name_ = filename;
   writable_ = writable;
+  io_profile_enabled_ = enable_io_profile;
 #if defined(_MSC_VER)
   int flags = writable_ ? (O_RDWR | _O_BINARY) : (O_RDONLY | _O_BINARY);
   fd_ = _open(filename.c_str(), flags, 0644);
@@ -605,13 +627,25 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
   if (buffer) {
     return buffer;
   }
-  std::lock_guard<std::mutex> lock(
-      block_mutexes_[page_id % VecBufferPool::kMutexBucketCount]);
+  BufferPoolIoProfile *profile = current_thread_io_profile();
+  std::unique_lock<std::mutex> lock(
+      block_mutexes_[page_id % VecBufferPool::kMutexBucketCount],
+      std::defer_lock);
+  if (profile) {
+    const uint64_t lock_start = BufferPoolProfileNowNs();
+    lock.lock();
+    profile->sync_page_lock_wait_ns +=
+        BufferPoolProfileNowNs() - lock_start;
+  } else {
+    lock.lock();
+  }
   buffer = page_table_.acquire_block(page_id);
   if (buffer) {
     return buffer;
   }
   {
+    BufferPoolProfileTimer prepare_timer(profile ? &profile->sync_prepare_ns
+                                                  : nullptr);
     bool found = MemoryLimitPool::get_instance().try_acquire_buffer(
         kVectorPageSize, buffer);
     if (!found) {
@@ -641,6 +675,8 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
   // ever_loaded flag stays true so reloads correctly pread the flushed data.
   if (writable_ && page_offset >= initial_file_size_ &&
       !page_table_.is_ever_loaded(page_id)) {
+    BufferPoolProfileTimer prepare_timer(profile ? &profile->sync_prepare_ns
+                                                  : nullptr);
     std::memset(buffer, 0, kVectorPageSize);
   } else {
     // O_DIRECT requires the IO length to be a multiple of the device block
@@ -654,7 +690,13 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
     if (read_len < kVectorPageSize) {
       std::memset(buffer + read_len, 0, kVectorPageSize - read_len);
     }
-    ssize_t read_bytes = zvec_pread(fd_, buffer, read_len, page_offset);
+    ssize_t read_bytes = 0;
+    {
+      BufferPoolProfileTimer read_timer(profile ? &profile->sync_read_ns
+                                                 : nullptr);
+      read_bytes = zvec_pread(fd_, buffer, read_len, page_offset);
+    }
+    if (profile) ++profile->sync_reads;
     if (read_bytes != static_cast<ssize_t>(read_len)) {
       // Accept short read at EOF: last page may not be full kVectorPageSize
       if (read_bytes > 0 &&
@@ -670,7 +712,13 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
       }
     }
   }
-  return page_table_.set_block_acquired(page_id, buffer, page_offset);
+  char *installed = nullptr;
+  {
+    BufferPoolProfileTimer install_timer(profile ? &profile->sync_install_ns
+                                                  : nullptr);
+    installed = page_table_.set_block_acquired(page_id, buffer, page_offset);
+  }
+  return installed;
 }
 
 bool VecBufferPool::acquire_pages(const block_id_t *page_ids, size_t count,
@@ -1465,8 +1513,10 @@ static thread_local ThreadLocalAioCtx tl_aio;
 }  // namespace
 #endif
 
-void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count) {
+void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count,
+                                     BufferPoolIoProfile *profile) {
   if (count == 0) return;
+  if (!profile) profile = current_thread_io_profile();
 
 #if defined(__linux) || defined(__linux__)
   if (!direct_io_enabled_) return;
@@ -1478,7 +1528,7 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count) {
   // pools would publish pages into the wrong page table (and use the wrong
   // striped mutex set).  Drain the previous owner's batch first.
   if (tl_aio.pending_count > 0 && tl_aio.pending_pool != this) {
-    wait_aio();
+    wait_aio(profile);
     if (tl_aio.pending_count > 0) {
       // A fatal io_getevents error left the old DMA batch in flight.  It is
       // unsafe to reuse either the slots or their buffers.
@@ -1490,6 +1540,11 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count) {
   if (tl_aio.pending_count > 0) {
     harvest_aio();
   }
+
+  // Time only preparation + io_submit.  A cross-pool drain above is already
+  // attributed to aio_wait_ns and must not be double-counted as submit work.
+  BufferPoolProfileTimer submit_timer(profile ? &profile->aio_submit_ns
+                                               : nullptr);
 
   // Determine how many slots are available for new submissions
   size_t base = tl_aio.pending_count;  // existing in-flight count
@@ -1547,6 +1602,12 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count) {
 
   // Append to pending state
   size_t actual = static_cast<size_t>(ret);
+  if (profile) {
+    ++profile->aio_batches;
+    profile->aio_pages += actual;
+    profile->aio_max_batch = std::max<uint64_t>(profile->aio_max_batch,
+                                                actual);
+  }
   for (size_t i = 0; i < actual; ++i) {
     tl_aio.pending_bufs[base + i] = buffers[i];
     tl_aio.pending_pids[base + i] = miss_pages[i];
@@ -1566,6 +1627,7 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count) {
 #else
   (void)page_ids;
   (void)count;
+  (void)profile;
 #endif
 }
 
@@ -1621,7 +1683,8 @@ void VecBufferPool::harvest_aio() {
 #endif
 }
 
-void VecBufferPool::wait_aio() {
+void VecBufferPool::wait_aio(BufferPoolIoProfile *profile) {
+  if (!profile) profile = current_thread_io_profile();
 #if defined(__linux) || defined(__linux__)
   if (!tl_aio.ok || tl_aio.pending_count == 0) return;
 
@@ -1633,9 +1696,14 @@ void VecBufferPool::wait_aio() {
   // without a per-neighbour synchronous fallback.
   while (tl_aio.harvested_count < tl_aio.pending_count) {
     size_t in_flight = tl_aio.pending_count - tl_aio.harvested_count;
-    int ret = LibAioLoader::Instance().io_getevents(
-        tl_aio.ctx, static_cast<long>(in_flight),
-        static_cast<long>(in_flight), events, nullptr);
+    int ret = 0;
+    {
+      BufferPoolProfileTimer wait_timer(profile ? &profile->aio_wait_ns
+                                                 : nullptr);
+      ret = LibAioLoader::Instance().io_getevents(
+          tl_aio.ctx, static_cast<long>(in_flight),
+          static_cast<long>(in_flight), events, nullptr);
+    }
     if (ret == -EINTR) continue;
     if (ret <= 0) {
       LOG_ERROR("VecBufferPool::wait_aio: io_getevents failed, ret=%d", ret);
@@ -1645,6 +1713,8 @@ void VecBufferPool::wait_aio() {
       return;
     }
     size_t completed = static_cast<size_t>(ret);
+    BufferPoolProfileTimer install_timer(profile ? &profile->aio_install_ns
+                                                  : nullptr);
     for (size_t i = 0; i < completed; ++i) {
       size_t idx = reinterpret_cast<size_t>(events[i].data);
       if (static_cast<ssize_t>(events[i].res) !=
@@ -1653,8 +1723,17 @@ void VecBufferPool::wait_aio() {
                                                       kVectorPageSize);
       } else {
         block_id_t pid = tl_aio.pending_pids[idx];
-        std::lock_guard<std::mutex> lock(
-            pool->block_mutexes_[pid % VecBufferPool::kMutexBucketCount]);
+        std::unique_lock<std::mutex> lock(
+            pool->block_mutexes_[pid % VecBufferPool::kMutexBucketCount],
+            std::defer_lock);
+        if (profile) {
+          const uint64_t lock_start = BufferPoolProfileNowNs();
+          lock.lock();
+          profile->aio_page_lock_wait_ns +=
+              BufferPoolProfileNowNs() - lock_start;
+        } else {
+          lock.lock();
+        }
         if (pool->page_table_.is_loaded(pid)) {
           MemoryLimitPool::get_instance().release_buffer(
               tl_aio.pending_bufs[idx], kVectorPageSize);
@@ -1674,6 +1753,8 @@ void VecBufferPool::wait_aio() {
     tl_aio.harvested_count = 0;
     tl_aio.pending_pool = nullptr;
   }
+#else
+  (void)profile;
 #endif
 }
 
@@ -1687,6 +1768,53 @@ void VecBufferPool::log_stats() const {
       static_cast<unsigned long long>(s.evict),
       static_cast<unsigned long long>(s.second_chance),
       static_cast<unsigned long long>(s.dirty_flush));
+  if (io_profile_enabled_) {
+    const BufferPoolIoProfile &p = s.io_profile;
+    const double avg_batch =
+        p.aio_batches ? static_cast<double>(p.aio_pages) / p.aio_batches : 0.0;
+    const uint64_t io_reads = p.aio_pages + p.sync_reads;
+    const uint64_t io_wait_ns = p.aio_wait_ns + p.sync_read_ns;
+    const double software_ns_per_read =
+        io_reads ? static_cast<double>(p.software_ns()) / io_reads : 0.0;
+    LOG_INFO(
+        "VecBufferPool io_profile: file[%s] queries=%llu query_wall_ns=%llu "
+        "aio_submit_ns=%llu aio_wait_ns=%llu aio_install_ns=%llu "
+        "aio_page_lock_wait_ns=%llu sync_prepare_ns=%llu sync_read_ns=%llu "
+        "sync_install_ns=%llu sync_page_lock_wait_ns=%llu sync_reads=%llu "
+        "epoch_transition_ns=%llu fallback_total_ns=%llu copy_ns=%llu "
+        "aio_batches=%llu aio_pages=%llu "
+        "aio_avg_batch=%.2f aio_max_batch=%llu fallback_batches=%llu "
+        "fallback_items=%llu epoch_enter_attempts=%llu "
+        "epoch_enter_failures=%llu epoch_suspends=%llu "
+        "io_reads=%llu io_wait_ns=%llu software_ns=%llu "
+        "software_ns_per_read=%.2f",
+        file_name_.c_str(), static_cast<unsigned long long>(p.query_count),
+        static_cast<unsigned long long>(p.query_wall_ns),
+        static_cast<unsigned long long>(p.aio_submit_ns),
+        static_cast<unsigned long long>(p.aio_wait_ns),
+        static_cast<unsigned long long>(p.aio_install_ns),
+        static_cast<unsigned long long>(p.aio_page_lock_wait_ns),
+        static_cast<unsigned long long>(p.sync_prepare_ns),
+        static_cast<unsigned long long>(p.sync_read_ns),
+        static_cast<unsigned long long>(p.sync_install_ns),
+        static_cast<unsigned long long>(p.sync_page_lock_wait_ns),
+        static_cast<unsigned long long>(p.sync_reads),
+        static_cast<unsigned long long>(p.epoch_transition_ns),
+        static_cast<unsigned long long>(p.fallback_total_ns),
+        static_cast<unsigned long long>(p.copy_ns),
+        static_cast<unsigned long long>(p.aio_batches),
+        static_cast<unsigned long long>(p.aio_pages), avg_batch,
+        static_cast<unsigned long long>(p.aio_max_batch),
+        static_cast<unsigned long long>(p.fallback_batches),
+        static_cast<unsigned long long>(p.fallback_items),
+        static_cast<unsigned long long>(p.epoch_enter_attempts),
+        static_cast<unsigned long long>(p.epoch_enter_failures),
+        static_cast<unsigned long long>(p.epoch_suspends),
+        static_cast<unsigned long long>(io_reads),
+        static_cast<unsigned long long>(io_wait_ns),
+        static_cast<unsigned long long>(p.software_ns()),
+        software_ns_per_read);
+  }
 }
 
 }  // namespace ailego

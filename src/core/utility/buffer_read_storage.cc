@@ -277,6 +277,7 @@ class BufferReadStorage : public IndexStorage {
     params.get(BUFFER_READ_STORAGE_HEADER_OFFSET, &header_offset_);
     params.get(BUFFER_READ_STORAGE_FOOTER_OFFSET, &footer_offset_);
     params.get(BUFFER_READ_STORAGE_ENABLE_DIRECT_IO, &enable_direct_io_);
+    params.get(BUFFER_READ_STORAGE_ENABLE_IO_PROFILE, &enable_io_profile_);
     return 0;
   }
 
@@ -305,7 +306,8 @@ class BufferReadStorage : public IndexStorage {
   int open(const std::string &path, bool) override {
     // Read-only buffer pool over the freshly-dumped FileDumper container.
     buffer_pool_ = std::make_shared<ailego::VecBufferPool>(
-        path, /*writable=*/false, /*enable_direct_io=*/enable_direct_io_);
+        path, /*writable=*/false, /*enable_direct_io=*/enable_direct_io_,
+        /*enable_io_profile=*/enable_io_profile_);
     if (!buffer_pool_) {
       LOG_ERROR("Failed to create VecBufferPool, path: %s", path.c_str());
       return IndexError_NoMemory;
@@ -411,6 +413,7 @@ class BufferReadStorage : public IndexStorage {
  private:
   bool checksum_validation_{false};
   bool enable_direct_io_{true};
+  bool enable_io_profile_{false};
   int64_t header_offset_{0};
   int64_t footer_offset_{0};
   size_t index_offset_{0};

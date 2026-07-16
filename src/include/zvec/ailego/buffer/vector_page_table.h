@@ -17,9 +17,11 @@
 
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -427,7 +429,110 @@ class PageReadEpochDomain {
   std::vector<RetiredBuffer> retired_{};
 };
 
+class VecBufferPool;
 class VecBufferPoolHandle;
+
+//! One query/thread-local profiling sample for BufferStorage reads.
+//!
+//! The sample contains plain integers: callers update it without atomics and
+//! merge it into VecBufferPool once when the query ends.  All durations are
+//! elapsed nanoseconds.  Profiling is opt-in so the production hot path does
+//! not execute clock reads or profile-counter writes.
+struct BufferPoolIoProfile {
+  uint64_t query_count{0};
+  uint64_t query_wall_ns{0};
+  uint64_t aio_submit_ns{0};
+  uint64_t aio_wait_ns{0};
+  uint64_t aio_install_ns{0};
+  uint64_t aio_page_lock_wait_ns{0};  // subset of aio_install_ns
+  uint64_t sync_prepare_ns{0};
+  uint64_t sync_read_ns{0};
+  uint64_t sync_install_ns{0};
+  uint64_t sync_page_lock_wait_ns{0};
+  uint64_t sync_reads{0};
+  uint64_t epoch_transition_ns{0};
+  uint64_t fallback_total_ns{0};  // inclusive of any nested sync_read_ns
+  uint64_t copy_ns{0};
+  uint64_t aio_batches{0};
+  uint64_t aio_pages{0};
+  uint64_t aio_max_batch{0};
+  uint64_t fallback_batches{0};
+  uint64_t fallback_items{0};
+  uint64_t epoch_enter_attempts{0};
+  uint64_t epoch_enter_failures{0};
+  uint64_t epoch_suspends{0};
+
+  uint64_t software_ns() const {
+    const uint64_t aio_install_cpu_ns =
+        aio_install_ns > aio_page_lock_wait_ns
+            ? aio_install_ns - aio_page_lock_wait_ns
+            : 0;
+    // fallback_total_ns is an inclusive phase timer and is not added here;
+    // its synchronous I/O and software sub-phases are recorded separately.
+    // Lock waits are reported separately and likewise excluded from the
+    // software-side estimate.
+    return aio_submit_ns + aio_install_cpu_ns + sync_prepare_ns +
+           sync_install_ns + epoch_transition_ns + copy_ns;
+  }
+
+  void merge(const BufferPoolIoProfile &other) {
+    query_count += other.query_count;
+    query_wall_ns += other.query_wall_ns;
+    aio_submit_ns += other.aio_submit_ns;
+    aio_wait_ns += other.aio_wait_ns;
+    aio_install_ns += other.aio_install_ns;
+    aio_page_lock_wait_ns += other.aio_page_lock_wait_ns;
+    sync_prepare_ns += other.sync_prepare_ns;
+    sync_read_ns += other.sync_read_ns;
+    sync_install_ns += other.sync_install_ns;
+    sync_page_lock_wait_ns += other.sync_page_lock_wait_ns;
+    sync_reads += other.sync_reads;
+    epoch_transition_ns += other.epoch_transition_ns;
+    fallback_total_ns += other.fallback_total_ns;
+    copy_ns += other.copy_ns;
+    aio_batches += other.aio_batches;
+    aio_pages += other.aio_pages;
+    aio_max_batch = std::max(aio_max_batch, other.aio_max_batch);
+    fallback_batches += other.fallback_batches;
+    fallback_items += other.fallback_items;
+    epoch_enter_attempts += other.epoch_enter_attempts;
+    epoch_enter_failures += other.epoch_enter_failures;
+    epoch_suspends += other.epoch_suspends;
+  }
+};
+
+//! Previous thread-local binding returned when a nested query profile is
+//! installed.  Restoring it on scope exit keeps profiling correct if a caller
+//! performs a nested search on the same worker thread.
+struct BufferPoolIoProfileBinding {
+  VecBufferPool *pool{nullptr};
+  BufferPoolIoProfile *profile{nullptr};
+};
+
+inline uint64_t BufferPoolProfileNowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+//! Adds elapsed time to a query-local field on scope exit.  A null target is
+//! the disabled fast path and performs no clock read.
+class BufferPoolProfileTimer {
+ public:
+  explicit BufferPoolProfileTimer(uint64_t *target)
+      : target_(target), start_ns_(target ? BufferPoolProfileNowNs() : 0) {}
+  ~BufferPoolProfileTimer() {
+    if (target_) *target_ += BufferPoolProfileNowNs() - start_ns_;
+  }
+
+  BufferPoolProfileTimer(const BufferPoolProfileTimer &) = delete;
+  BufferPoolProfileTimer &operator=(const BufferPoolProfileTimer &) = delete;
+
+ private:
+  uint64_t *target_{nullptr};
+  uint64_t start_ns_{0};
+};
 
 class VecBufferPool {
  public:
@@ -436,7 +541,8 @@ class VecBufferPool {
   static constexpr size_t kMutexBucketCount = 64UL * 1024UL;
 
   VecBufferPool(const std::string &filename, bool writable = false,
-                bool enable_direct_io = false);
+                bool enable_direct_io = false,
+                bool enable_io_profile = false);
   ~VecBufferPool() {
     // A caller may have used the non-blocking submit API directly.  Drain the
     // current thread's batch before page buffers or file descriptors can be
@@ -476,6 +582,7 @@ class VecBufferPool {
     uint64_t evict{0};
     uint64_t second_chance{0};
     uint64_t dirty_flush{0};
+    BufferPoolIoProfile io_profile{};
     double hit_rate() const {
       uint64_t total = hit + miss;
       return total ? static_cast<double>(hit) / static_cast<double>(total)
@@ -490,8 +597,30 @@ class VecBufferPool {
     s.second_chance = p.second_chance;
     s.dirty_flush = p.dirty_flush;
     s.miss = miss_count_.load(std::memory_order_relaxed);
+    if (io_profile_enabled_) {
+      std::lock_guard<std::mutex> lock(io_profile_mutex_);
+      s.io_profile = io_profile_totals_;
+    }
     return s;
   }
+
+  bool io_profile_enabled() const {
+    return io_profile_enabled_;
+  }
+
+  //! Merge one query-local sample.  One mutex acquisition per completed query
+  //! keeps timing instrumentation free of per-page global atomics.
+  void merge_io_profile(const BufferPoolIoProfile &sample) {
+    if (!io_profile_enabled_) return;
+    std::lock_guard<std::mutex> lock(io_profile_mutex_);
+    io_profile_totals_.merge(sample);
+  }
+
+  BufferPoolIoProfileBinding bind_thread_io_profile(
+      BufferPoolIoProfile *profile);
+  static void restore_thread_io_profile(
+      const BufferPoolIoProfileBinding &binding);
+  BufferPoolIoProfile *current_thread_io_profile() const;
 
   //! Log the current cache statistics at INFO level.
   void log_stats() const;
@@ -577,7 +706,8 @@ class VecBufferPool {
 
   //! Submit AIO for scattered pages without waiting for completion.
   //! Results are stored in thread-local state; call harvest_aio() later.
-  void submit_aio_async(const block_id_t *page_ids, size_t count);
+  void submit_aio_async(const block_id_t *page_ids, size_t count,
+                        BufferPoolIoProfile *profile = nullptr);
 
   //! Harvest previously submitted async AIO results (non-blocking).
   //! Installs completed pages into page_table. Safe to call when no pending.
@@ -589,7 +719,7 @@ class VecBufferPool {
   //! issue one concurrent read burst and block once for the whole batch,
   //! instead of rationing per-neighbour synchronous preads.  Safe to call
   //! when nothing is pending.
-  void wait_aio();
+  void wait_aio(BufferPoolIoProfile *profile = nullptr);
 
   bool aio_enabled() const {
 #if defined(__linux) || defined(__linux__)
@@ -623,10 +753,13 @@ class VecBufferPool {
   std::string file_name_;
   bool writable_{false};
   bool direct_io_enabled_{false};
+  bool io_profile_enabled_{false};
   // Cache miss counter: incremented once per page fetched from disk on the
   // cold acquire path (pread / zero-fill).  Combined with page_table_ hits it
   // yields the pool hit rate.
   std::atomic<uint64_t> miss_count_{0};
+  mutable std::mutex io_profile_mutex_{};
+  BufferPoolIoProfile io_profile_totals_{};
 #if defined(__linux) || defined(__linux__)
   io_context_t aio_ctx_{nullptr};
   bool aio_enabled_{false};

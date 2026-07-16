@@ -69,6 +69,8 @@ static const std::string BUFFER_READ_STORAGE_FOOTER_OFFSET =
     "proxima.buffer.read_storage.footer_offset";
 static const std::string BUFFER_READ_STORAGE_ENABLE_DIRECT_IO =
     "proxima.buffer.read_storage.enable_direct_io";
+static const std::string BUFFER_READ_STORAGE_ENABLE_IO_PROFILE =
+    "proxima.buffer.read_storage.enable_io_profile";
 
 //! MMapFileStorage
 static const std::string MMAPFILE_STORAGE_MEMORY_LOCKED =
@@ -85,6 +87,8 @@ static const std::string MMAPFILE_STORAGE_SEGMENT_META_CAPACITY =
 //! BufferStorage
 static const std::string BUFFER_STORAGE_ENABLE_DIRECT_IO =
     "proxima.buffer.storage.enable_direct_io";
+static const std::string BUFFER_STORAGE_ENABLE_IO_PROFILE =
+    "proxima.buffer.storage.enable_io_profile";
 
 //! MipsConverter
 static const std::string MIPS_CONVERTER_M_VALUE =

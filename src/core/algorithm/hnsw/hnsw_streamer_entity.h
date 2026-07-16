@@ -102,7 +102,8 @@ class HnswStreamerEntity : public HnswEntity {
     return HnswStorageMode::kMmap;
   }
 
-  HnswNoopVectorReadScope make_vector_read_scope() const {
+  HnswNoopVectorReadScope make_vector_read_scope(
+      bool /*profile_query*/ = true) const {
     return {};
   }
 
@@ -747,6 +748,13 @@ HnswStreamerEntity::get_neighbors_typed(
   // another scoped read can suspend this epoch.  Leave the epoch before a cold
   // or cross-page read so eviction can return retired pages to the pool.
   scope.suspend();
+  ailego::BufferPoolIoProfile *profile = scope.mutable_io_profile();
+  if (profile) {
+    ++profile->fallback_batches;
+    ++profile->fallback_items;
+  }
+  ailego::BufferPoolProfileTimer fallback_timer(
+      profile ? &profile->fallback_total_ns : nullptr);
   IndexStorage::MemoryBlock mem_block;
   const size_t ret = chunk->read(offset, mem_block, nbr_size);
   if (ailego_unlikely(ret != nbr_size)) {
@@ -795,7 +803,8 @@ template <>
 inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
     const node_id_t *ids, uint32_t count,
     std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
-  BufferPoolReadEpochScope scope(broker_->storage()->vec_buffer_pool());
+  BufferPoolReadEpochScope scope(broker_->storage()->vec_buffer_pool(),
+                                 /*profile_query=*/false);
   return get_vector_typed(ids, count, vec_blocks, scope);
 }
 
@@ -883,6 +892,13 @@ inline int HnswStreamerEntity::get_vector_typed(
 
   if (!cross_page_vectors.empty()) {
     scope.suspend();
+    ailego::BufferPoolIoProfile *profile = scope.mutable_io_profile();
+    if (profile) {
+      ++profile->fallback_batches;
+      profile->fallback_items += cross_page_vectors.size();
+    }
+    ailego::BufferPoolProfileTimer fallback_timer(
+        profile ? &profile->fallback_total_ns : nullptr);
     for (const auto &item : cross_page_vectors) {
       int ret = read_one(item.result_index, item.chunk_index, item.chunk_offset);
       if (ret != 0) {
@@ -919,11 +935,12 @@ inline int HnswStreamerEntity::get_vector_typed(
   // before I/O so retired pages can return to a bounded pool, then preload the
   // scattered misses with queue depth and retry the zero-copy path once.
   scope.suspend();
+  ailego::BufferPoolIoProfile *profile = scope.mutable_io_profile();
   static constexpr size_t kAioBatch = 128;
   for (size_t begin = 0; begin < page_ids.size(); begin += kAioBatch) {
     const size_t n = std::min(kAioBatch, page_ids.size() - begin);
-    pool->submit_aio_async(page_ids.data() + begin, n);
-    pool->wait_aio();
+    pool->submit_aio_async(page_ids.data() + begin, n, profile);
+    pool->wait_aio(profile);
   }
   if (publish_if_resident()) return 0;
   scope.suspend();
@@ -950,18 +967,37 @@ inline int HnswStreamerEntity::get_vector_typed(
   std::vector<char *> pages(pin_batch, nullptr);
   for (size_t begin = 0; begin < page_vectors.size(); begin += pin_batch) {
     const size_t n = std::min(pin_batch, page_vectors.size() - begin);
-    if (!pool->acquire_pages(page_ids.data() + begin, n, pages.data())) {
+    if (profile) {
+      ++profile->fallback_batches;
+      profile->fallback_items += n;
+    }
+    bool acquired = false;
+    {
+      ailego::BufferPoolProfileTimer pin_timer(
+          profile ? &profile->fallback_total_ns : nullptr);
+      acquired =
+          pool->acquire_pages(page_ids.data() + begin, n, pages.data());
+    }
+    if (!acquired) {
       vec_blocks.clear();
       return IndexError_ReadData;
     }
-    for (size_t j = 0; j < n; ++j) {
-      const size_t i = begin + j;
-      const PageVector &item = page_vectors[i];
-      char *dst = scratch_bytes + i * read_size;
-      std::memcpy(dst, pages[j] + item.page_offset, read_size);
-      vec_blocks[item.result_index] = BufferPoolMemoryBlock(dst);
+    {
+      ailego::BufferPoolProfileTimer copy_timer(
+          profile ? &profile->copy_ns : nullptr);
+      for (size_t j = 0; j < n; ++j) {
+        const size_t i = begin + j;
+        const PageVector &item = page_vectors[i];
+        char *dst = scratch_bytes + i * read_size;
+        std::memcpy(dst, pages[j] + item.page_offset, read_size);
+        vec_blocks[item.result_index] = BufferPoolMemoryBlock(dst);
+      }
     }
-    pool->release_pages(page_ids.data() + begin, n);
+    {
+      ailego::BufferPoolProfileTimer pin_timer(
+          profile ? &profile->fallback_total_ns : nullptr);
+      pool->release_pages(page_ids.data() + begin, n);
+    }
   }
   // One block owns the batch scratch allocation; the remaining blocks are raw
   // views.  Destruction is still safe because no view is dereferenced after
@@ -1147,9 +1183,11 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
 
   const HnswEntity::Pointer clone() const override;
 
-  BufferPoolReadEpochScope make_vector_read_scope() const {
+  BufferPoolReadEpochScope make_vector_read_scope(
+      bool profile_query = true) const {
     return BufferPoolReadEpochScope(
-        broker_ ? broker_->storage()->vec_buffer_pool() : nullptr);
+        broker_ ? broker_->storage()->vec_buffer_pool() : nullptr,
+        profile_query);
   }
 
   inline TypedNeighbors get_neighbors_typed(level_t level, node_id_t id) const {

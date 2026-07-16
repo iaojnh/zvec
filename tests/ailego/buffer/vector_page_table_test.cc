@@ -17,6 +17,7 @@
 //   2. Background evictor (proactive reclaim down to the low watermark)
 //   3. Sharded free-list correctness under concurrent access
 //   4. Observability counters (hit / miss / evict / second_chance / stats)
+//   5. Opt-in query-local I/O profile aggregation
 
 #include <atomic>
 #include <chrono>
@@ -344,4 +345,72 @@ TEST_F(BufferPoolTest, ShardedPoolAllocFreeAccounting) {
   MemoryLimitPool::PoolStats after = mp.stats();
   EXPECT_GT(after.alloc_from_freelist, before.alloc_from_freelist);
   mp.release_buffer(b, kVectorPageSize);
+}
+
+// Profiling samples stay query-local and are merged once at query completion.
+// Verify sum/max semantics independently of Linux AIO availability so this
+// instrumentation remains testable on every supported platform.
+TEST_F(BufferPoolTest, IoProfileMergesQueryLocalSamples) {
+  InitPool(/*capacity_pages=*/2);
+  std::string file = NewFile(/*num_pages=*/1);
+
+  VecBufferPool pool(file, /*writable=*/false, /*enable_direct_io=*/false,
+                     /*enable_io_profile=*/true);
+  ASSERT_EQ(pool.init(), 0);
+  ASSERT_TRUE(pool.io_profile_enabled());
+
+  BufferPoolIoProfile first;
+  first.query_count = 1;
+  first.query_wall_ns = 1000;
+  first.aio_submit_ns = 10;
+  first.aio_wait_ns = 20;
+  first.aio_install_ns = 30;
+  first.aio_page_lock_wait_ns = 7;
+  first.sync_prepare_ns = 11;
+  first.sync_read_ns = 12;
+  first.sync_install_ns = 13;
+  first.sync_page_lock_wait_ns = 14;
+  first.sync_reads = 2;
+  first.epoch_transition_ns = 40;
+  first.fallback_total_ns = 50;
+  first.copy_ns = 60;
+  first.aio_batches = 2;
+  first.aio_pages = 12;
+  first.aio_max_batch = 8;
+  first.fallback_batches = 3;
+  first.fallback_items = 9;
+  first.epoch_enter_attempts = 4;
+  first.epoch_enter_failures = 1;
+  first.epoch_suspends = 3;
+  pool.merge_io_profile(first);
+
+  BufferPoolIoProfile second = first;
+  second.aio_max_batch = 6;
+  pool.merge_io_profile(second);
+
+  const VecBufferPool::Stats stats = pool.stats();
+  const BufferPoolIoProfile &total = stats.io_profile;
+  EXPECT_EQ(total.query_count, 2u);
+  EXPECT_EQ(total.query_wall_ns, 2000u);
+  EXPECT_EQ(total.aio_submit_ns, 20u);
+  EXPECT_EQ(total.aio_wait_ns, 40u);
+  EXPECT_EQ(total.aio_install_ns, 60u);
+  EXPECT_EQ(total.aio_page_lock_wait_ns, 14u);
+  EXPECT_EQ(total.sync_prepare_ns, 22u);
+  EXPECT_EQ(total.sync_read_ns, 24u);
+  EXPECT_EQ(total.sync_install_ns, 26u);
+  EXPECT_EQ(total.sync_page_lock_wait_ns, 28u);
+  EXPECT_EQ(total.sync_reads, 4u);
+  EXPECT_EQ(total.epoch_transition_ns, 80u);
+  EXPECT_EQ(total.fallback_total_ns, 100u);
+  EXPECT_EQ(total.copy_ns, 120u);
+  EXPECT_EQ(total.aio_batches, 4u);
+  EXPECT_EQ(total.aio_pages, 24u);
+  EXPECT_EQ(total.aio_max_batch, 8u);
+  EXPECT_EQ(total.fallback_batches, 6u);
+  EXPECT_EQ(total.fallback_items, 18u);
+  EXPECT_EQ(total.epoch_enter_attempts, 8u);
+  EXPECT_EQ(total.epoch_enter_failures, 2u);
+  EXPECT_EQ(total.epoch_suspends, 6u);
+  EXPECT_EQ(total.software_ns(), 314u);
 }

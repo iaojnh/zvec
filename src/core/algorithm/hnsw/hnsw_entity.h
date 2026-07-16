@@ -14,6 +14,7 @@
 #pragma once
 
 #include <string.h>
+#include <optional>
 #include <ailego/utility/memory_helper.h>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/ailego/logger/logger.h>
@@ -198,11 +199,26 @@ struct MmapMemoryBlock {
 //! across resident graph/vector accesses and is suspended before any cold I/O,
 //! allowing a bounded cache to reclaim retired pages before loading misses.
 struct BufferPoolReadEpochScope {
-  explicit BufferPoolReadEpochScope(ailego::VecBufferPool *pool_in = nullptr)
-      : pool(pool_in) {}
+  explicit BufferPoolReadEpochScope(ailego::VecBufferPool *pool_in = nullptr,
+                                    bool profile_query = true)
+      : pool(pool_in),
+        profiling(pool && profile_query && pool->io_profile_enabled()),
+        query_start_ns(profiling ? ailego::BufferPoolProfileNowNs() : 0) {
+    if (profiling) {
+      profile.emplace();
+      previous_profile_binding = pool->bind_thread_io_profile(&*profile);
+    }
+  }
 
   ~BufferPoolReadEpochScope() {
     suspend();
+    if (profiling) {
+      profile->query_count = 1;
+      profile->query_wall_ns +=
+          ailego::BufferPoolProfileNowNs() - query_start_ns;
+      pool->restore_thread_io_profile(previous_profile_binding);
+      pool->merge_io_profile(*profile);
+    }
   }
 
   BufferPoolReadEpochScope(const BufferPoolReadEpochScope &) = delete;
@@ -210,20 +226,44 @@ struct BufferPoolReadEpochScope {
       delete;
 
   bool resume() {
-    if (!active) active = pool && pool->enter_read_epoch(&token);
+    if (!active) {
+      if (ailego_unlikely(profiling)) {
+        ++profile->epoch_enter_attempts;
+        ailego::BufferPoolProfileTimer timer(&profile->epoch_transition_ns);
+        active = pool && pool->enter_read_epoch(&token);
+        if (!active) ++profile->epoch_enter_failures;
+      } else {
+        active = pool && pool->enter_read_epoch(&token);
+      }
+    }
     return active;
   }
 
   void suspend() {
     if (active) {
-      pool->exit_read_epoch(&token);
-      active = false;
+      if (ailego_unlikely(profiling)) {
+        ailego::BufferPoolProfileTimer timer(&profile->epoch_transition_ns);
+        pool->exit_read_epoch(&token);
+        active = false;
+        ++profile->epoch_suspends;
+      } else {
+        pool->exit_read_epoch(&token);
+        active = false;
+      }
     }
+  }
+
+  ailego::BufferPoolIoProfile *mutable_io_profile() {
+    return profile ? &*profile : nullptr;
   }
 
   ailego::VecBufferPool *pool{nullptr};
   ailego::PageReadEpochDomain::Token token{};
   bool active{false};
+  bool profiling{false};
+  uint64_t query_start_ns{0};
+  std::optional<ailego::BufferPoolIoProfile> profile{};
+  ailego::BufferPoolIoProfileBinding previous_profile_binding{};
 };
 
 struct HnswNoopVectorReadScope {};

@@ -489,6 +489,7 @@ class BufferStorage : public IndexStorage {
     }
     // O_DIRECT is always on for memory controllability.
     params.get(BUFFER_STORAGE_ENABLE_DIRECT_IO, &enable_direct_io_);
+    params.get(BUFFER_STORAGE_ENABLE_IO_PROFILE, &enable_io_profile_);
     return 0;
   }
 
@@ -518,7 +519,8 @@ class BufferStorage : public IndexStorage {
     // controllable (no uncontrolled page-cache growth).
     buffer_pool_ = std::make_shared<ailego::VecBufferPool>(
         path, /*writable=*/create_if_missing,
-        /*enable_direct_io=*/enable_direct_io_);
+        /*enable_direct_io=*/enable_direct_io_,
+        /*enable_io_profile=*/enable_io_profile_);
     buffer_pool_handle_ = std::make_shared<ailego::VecBufferPoolHandle>(
         buffer_pool_->get_handle());
     int ret = ParseToMapping();
@@ -1547,6 +1549,7 @@ class BufferStorage : public IndexStorage {
   // When true, the page-data fd is opened with O_DIRECT (metadata fd stays
   // buffered).  Defaults to true for memory controllability.
   bool enable_direct_io_{true};
+  bool enable_io_profile_{false};
 
   // Per-header-chain file offsets used by flush_index() and append_segment().
   struct MetaChain {
