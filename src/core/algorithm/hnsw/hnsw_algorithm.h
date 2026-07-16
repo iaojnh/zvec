@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <chrono>
+#include <utility>
 #include <vector>
 #include <ailego/internal/cpu_features.h>
 #include <ailego/parallel/lock.h>
@@ -45,6 +46,8 @@ template <typename EntityType>
 class HnswAlgorithm : public HnswAlgorithmBase {
  public:
   using MemBlockType = typename EntityType::MemoryBlock;
+  using VectorReadScope =
+      decltype(std::declval<const EntityType &>().make_vector_read_scope());
 
   //! Constructor
   explicit HnswAlgorithm(EntityType &entity)
@@ -105,7 +108,8 @@ class HnswAlgorithm : public HnswAlgorithmBase {
  private:
   //! Select in upper layer to get entry point for next layer search
   void select_entry_point(level_t level, node_id_t *entry_point, dist_t *dist,
-                          HnswContext *ctx) const;
+                          HnswContext *ctx,
+                          VectorReadScope &vector_read_scope) const;
 
   //! update node id neighbors from topkHeap, and reverse link is also updated
   void add_neighbors(node_id_t id, level_t level, TopkHeap &topk_heap,
@@ -118,7 +122,8 @@ class HnswAlgorithm : public HnswAlgorithmBase {
   //! and BufferPool fallback.
   //! Note: entry_point and dist will be updated to current level nearest node.
   void search_neighbors(level_t level, node_id_t *entry_point, dist_t *dist,
-                        TopkHeap &topk, HnswContext *ctx, bool use_pool) const;
+                        TopkHeap &topk, HnswContext *ctx, bool use_pool,
+                        VectorReadScope &vector_read_scope) const;
 
   //! Update the node's neighbors
   void update_neighbors(HnswDistCalculator &dc, node_id_t id, level_t level,
@@ -132,7 +137,9 @@ class HnswAlgorithm : public HnswAlgorithmBase {
                                 TopkHeap &update_heap);
 
   //! expand neighbors until group nums are reached
-  void expand_neighbors_by_group(TopkHeap &topk, HnswContext *ctx) const;
+  void expand_neighbors_by_group(
+      TopkHeap &topk, HnswContext *ctx,
+      VectorReadScope &vector_read_scope) const;
 
  private:
   HnswAlgorithm(const HnswAlgorithm &) = delete;

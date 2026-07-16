@@ -194,25 +194,39 @@ struct MmapMemoryBlock {
   void *data_{nullptr};
 };
 
-//! Lightweight MemoryBlock for buffer pool mode: release on destruction
-struct BufferPoolReadEpochLease {
-  explicit BufferPoolReadEpochLease(ailego::VecBufferPool *pool_in)
-      : pool(pool_in) {
-    active = pool && pool->enter_read_epoch(&token);
+//! Query-level epoch for refcount-free BufferStorage reads.  It stays active
+//! across resident graph/vector accesses and is suspended before any cold I/O,
+//! allowing a bounded cache to reclaim retired pages before loading misses.
+struct BufferPoolReadEpochScope {
+  explicit BufferPoolReadEpochScope(ailego::VecBufferPool *pool_in = nullptr)
+      : pool(pool_in) {}
+
+  ~BufferPoolReadEpochScope() {
+    suspend();
   }
 
-  ~BufferPoolReadEpochLease() {
-    if (active) pool->exit_read_epoch(&token);
-  }
-
-  BufferPoolReadEpochLease(const BufferPoolReadEpochLease &) = delete;
-  BufferPoolReadEpochLease &operator=(const BufferPoolReadEpochLease &) =
+  BufferPoolReadEpochScope(const BufferPoolReadEpochScope &) = delete;
+  BufferPoolReadEpochScope &operator=(const BufferPoolReadEpochScope &) =
       delete;
+
+  bool resume() {
+    if (!active) active = pool && pool->enter_read_epoch(&token);
+    return active;
+  }
+
+  void suspend() {
+    if (active) {
+      pool->exit_read_epoch(&token);
+      active = false;
+    }
+  }
 
   ailego::VecBufferPool *pool{nullptr};
   ailego::PageReadEpochDomain::Token token{};
   bool active{false};
 };
+
+struct HnswNoopVectorReadScope {};
 
 struct BufferPoolOwnedBatchLease {
   explicit BufferPoolOwnedBatchLease(void *data_in) : data(data_in) {}
@@ -233,6 +247,8 @@ struct BufferPoolMemoryBlock {
   BufferPoolMemoryBlock(ailego::VecBufferPoolHandle *handle, size_t block_id,
                         void *data)
       : buffer_pool_handle_(handle), buffer_block_id_(block_id), data_(data) {}
+
+  explicit BufferPoolMemoryBlock(void *data) : data_(data) {}
 
   BufferPoolMemoryBlock(std::shared_ptr<void> lifetime, void *data)
       : lifetime_(std::move(lifetime)), data_(data) {}

@@ -102,6 +102,10 @@ class HnswStreamerEntity : public HnswEntity {
     return HnswStorageMode::kMmap;
   }
 
+  HnswNoopVectorReadScope make_vector_read_scope() const {
+    return {};
+  }
+
   void set_use_key_info_map(bool use_id_map) {
     use_key_info_map_ = use_id_map;
     LOG_DEBUG("use_key_info_map_: %d", (int)use_key_info_map_);
@@ -207,6 +211,14 @@ class HnswStreamerEntity : public HnswEntity {
   template <typename MemBlock>
   inline int get_vector_typed(const node_id_t *ids, uint32_t count,
                               std::vector<MemBlock> &vec_blocks) const;
+
+  inline NeighborsT<BufferPoolMemoryBlock> get_neighbors_typed(
+      level_t level, node_id_t id, BufferPoolReadEpochScope &scope) const;
+
+  inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      std::vector<BufferPoolMemoryBlock> &vec_blocks,
+      BufferPoolReadEpochScope &scope) const;
 
   //! Typed get_key: reads key using typed MemBlock
   template <typename MemBlock>
@@ -696,6 +708,64 @@ HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
   return NeighborsT<BufferPoolMemoryBlock>(std::move(block));
 }
 
+inline NeighborsT<BufferPoolMemoryBlock>
+HnswStreamerEntity::get_neighbors_typed(
+    level_t level, node_id_t id, BufferPoolReadEpochScope &scope) const {
+  Chunk *chunk = nullptr;
+  size_t offset = 0;
+  size_t nbr_size = neighbor_size_;
+  if (level == 0) {
+    const uint32_t chunk_idx = id >> node_index_mask_bits_;
+    offset =
+        (id & node_index_mask_) * node_size() + vector_size() + sizeof(key_t);
+    sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_idx, &node_chunks_);
+    ailego_assert_with(chunk_idx < node_chunks_.size(), "invalid chunk idx");
+    chunk = node_chunks_[chunk_idx].get();
+  } else {
+    const auto loc = get_upper_neighbor_chunk_loc(level, id);
+    chunk = upper_neighbor_chunks_[loc.first].get();
+    offset = loc.second;
+    nbr_size = upper_neighbor_size_;
+  }
+  ailego_assert_with(offset < chunk->data_size(), "invalid chunk offset");
+
+  ailego::VecBufferPool *pool = broker_->storage()->vec_buffer_pool();
+  const size_t abs_offset = chunk->abs_data_offset() + offset;
+  const size_t page_offset = abs_offset % ailego::kVectorPageSize;
+  if (pool && scope.pool == pool &&
+      nbr_size <= ailego::kVectorPageSize - page_offset && scope.resume()) {
+    const auto page_id = static_cast<ailego::block_id_t>(
+        abs_offset / ailego::kVectorPageSize);
+    char *page = pool->try_get_epoch_page(page_id);
+    if (page) {
+      BufferPoolMemoryBlock block(page + page_offset);
+      return NeighborsT<BufferPoolMemoryBlock>(std::move(block));
+    }
+  }
+
+  // The existing neighbors block has been fully consumed by the caller before
+  // another scoped read can suspend this epoch.  Leave the epoch before a cold
+  // or cross-page read so eviction can return retired pages to the pool.
+  scope.suspend();
+  IndexStorage::MemoryBlock mem_block;
+  const size_t ret = chunk->read(offset, mem_block, nbr_size);
+  if (ailego_unlikely(ret != nbr_size)) {
+    LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
+    return NeighborsT<BufferPoolMemoryBlock>();
+  }
+  BufferPoolMemoryBlock block;
+  if (mem_block.type_ == IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH) {
+    block = BufferPoolMemoryBlock::MakeOwned(mem_block.data_);
+    mem_block.data_ = nullptr;
+    mem_block.type_ = IndexStorage::MemoryBlock::MBT_UNKNOWN;
+  } else {
+    block = BufferPoolMemoryBlock(mem_block.buffer_pool_handle_,
+                                  mem_block.buffer_block_id_, mem_block.data_);
+    mem_block.buffer_pool_handle_ = nullptr;
+  }
+  return NeighborsT<BufferPoolMemoryBlock>(std::move(block));
+}
+
 //! MmapMemoryBlock specialization for batch get_vector
 template <>
 inline int HnswStreamerEntity::get_vector_typed<MmapMemoryBlock>(
@@ -725,6 +795,14 @@ template <>
 inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
     const node_id_t *ids, uint32_t count,
     std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
+  BufferPoolReadEpochScope scope(broker_->storage()->vec_buffer_pool());
+  return get_vector_typed(ids, count, vec_blocks, scope);
+}
+
+inline int HnswStreamerEntity::get_vector_typed(
+    const node_id_t *ids, uint32_t count,
+    std::vector<BufferPoolMemoryBlock> &vec_blocks,
+    BufferPoolReadEpochScope &scope) const {
   vec_blocks.resize(count);
   if (count == 0) return 0;
 
@@ -777,6 +855,12 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
   page_vectors.reserve(count);
   std::vector<ailego::block_id_t> page_ids;
   page_ids.reserve(count);
+  struct CrossPageVector {
+    uint32_t result_index;
+    uint32_t chunk_index;
+    size_t chunk_offset;
+  };
+  std::vector<CrossPageVector> cross_page_vectors;
 
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
@@ -787,11 +871,8 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
         node_chunks_[loc.first]->abs_data_offset() + loc.second;
     const size_t page_offset = abs_offset % ailego::kVectorPageSize;
     if (read_size > ailego::kVectorPageSize - page_offset) {
-      int ret = read_one(i, loc.first, loc.second);
-      if (ret != 0) {
-        vec_blocks.clear();
-        return ret;
-      }
+      cross_page_vectors.push_back(
+          CrossPageVector{i, loc.first, loc.second});
       continue;
     }
     const auto page_id =
@@ -800,43 +881,52 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
     page_ids.push_back(page_id);
   }
 
+  if (!cross_page_vectors.empty()) {
+    scope.suspend();
+    for (const auto &item : cross_page_vectors) {
+      int ret = read_one(item.result_index, item.chunk_index, item.chunk_offset);
+      if (ret != 0) {
+        vec_blocks.clear();
+        return ret;
+      }
+    }
+  }
+
   if (page_vectors.empty()) return 0;
 
-  // Preload scattered misses with queue depth before entering the read epoch.
-  // Keeping the epoch short is important: eviction may recycle unrelated pages
-  // while I/O is in flight, and only the distance-computation window needs
-  // pointer lifetime protection.
+  std::vector<char *> epoch_pages(page_vectors.size(), nullptr);
+  auto publish_if_resident = [&]() -> bool {
+    if (scope.pool != pool || !scope.resume()) return false;
+    for (size_t i = 0; i < page_vectors.size(); ++i) {
+      epoch_pages[i] = pool->try_get_epoch_page(page_vectors[i].page_id);
+      if (!epoch_pages[i]) return false;
+    }
+    for (size_t i = 0; i < page_vectors.size(); ++i) {
+      const PageVector &item = page_vectors[i];
+      // The query-level scope owns the epoch.  Individual blocks are raw views
+      // and therefore perform no shared_ptr/ref_count atomic operations.
+      vec_blocks[item.result_index] =
+          BufferPoolMemoryBlock(epoch_pages[i] + item.page_offset);
+    }
+    return true;
+  };
+
+  // The common full-cache path returns here: no AIO syscall/context check, no
+  // heap-allocated epoch lease, and no per-neighbor lifetime reference count.
+  if (publish_if_resident()) return 0;
+
+  // A miss invalidates any unpublished raw observations.  Leave the epoch
+  // before I/O so retired pages can return to a bounded pool, then preload the
+  // scattered misses with queue depth and retry the zero-copy path once.
+  scope.suspend();
   static constexpr size_t kAioBatch = 128;
   for (size_t begin = 0; begin < page_ids.size(); begin += kAioBatch) {
     const size_t n = std::min(kAioBatch, page_ids.size() - begin);
     pool->submit_aio_async(page_ids.data() + begin, n);
     pool->wait_aio();
   }
-
-  auto epoch_lease = std::make_shared<BufferPoolReadEpochLease>(pool);
-  if (epoch_lease->active) {
-    std::vector<char *> epoch_pages(page_vectors.size(), nullptr);
-    bool all_resident = true;
-    for (size_t i = 0; i < page_vectors.size(); ++i) {
-      epoch_pages[i] = pool->try_get_epoch_page(page_vectors[i].page_id);
-      if (!epoch_pages[i]) {
-        all_resident = false;
-        break;
-      }
-    }
-    if (all_resident) {
-      for (size_t i = 0; i < page_vectors.size(); ++i) {
-        const PageVector &item = page_vectors[i];
-        vec_blocks[item.result_index] = BufferPoolMemoryBlock(
-            epoch_lease, epoch_pages[i] + item.page_offset);
-      }
-      return 0;
-    }
-    // Never perform a cold load while an epoch is active: retired pages cannot
-    // return to the bounded pool until the epoch exits, which can otherwise
-    // starve a small cache.  No epoch-backed blocks have been published yet.
-    epoch_lease.reset();
-  }
+  if (publish_if_resident()) return 0;
+  scope.suspend();
 
   // If the whole batch is not resident, copy it through bounded pin batches.
   // Requiring all random neighbor pages to stay pinned at once can exceed a
@@ -869,11 +959,17 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
       const PageVector &item = page_vectors[i];
       char *dst = scratch_bytes + i * read_size;
       std::memcpy(dst, pages[j] + item.page_offset, read_size);
-      vec_blocks[item.result_index] =
-          BufferPoolMemoryBlock(scratch_lease, dst);
+      vec_blocks[item.result_index] = BufferPoolMemoryBlock(dst);
     }
     pool->release_pages(page_ids.data() + begin, n);
   }
+  // One block owns the batch scratch allocation; the remaining blocks are raw
+  // views.  Destruction is still safe because no view is dereferenced after
+  // the vector starts clearing, and this avoids two shared_ptr atomics per
+  // neighbor even on the copy fallback.
+  const PageVector &owner = page_vectors.front();
+  vec_blocks[owner.result_index] = BufferPoolMemoryBlock(
+      std::move(scratch_lease), scratch_bytes);
   return 0;
 }
 
@@ -1051,9 +1147,19 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
 
   const HnswEntity::Pointer clone() const override;
 
+  BufferPoolReadEpochScope make_vector_read_scope() const {
+    return BufferPoolReadEpochScope(
+        broker_ ? broker_->storage()->vec_buffer_pool() : nullptr);
+  }
+
   inline TypedNeighbors get_neighbors_typed(level_t level, node_id_t id) const {
     return HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(level,
                                                                           id);
+  }
+
+  inline TypedNeighbors get_neighbors_typed(
+      level_t level, node_id_t id, BufferPoolReadEpochScope &scope) const {
+    return HnswStreamerEntity::get_neighbors_typed(level, id, scope);
   }
 
   inline int get_vector_typed(
@@ -1061,6 +1167,13 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
       std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
     return HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
         ids, count, vec_blocks);
+  }
+
+  inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      std::vector<BufferPoolMemoryBlock> &vec_blocks,
+      BufferPoolReadEpochScope &scope) const {
+    return HnswStreamerEntity::get_vector_typed(ids, count, vec_blocks, scope);
   }
 
   inline key_t get_key_typed(node_id_t id) const {
