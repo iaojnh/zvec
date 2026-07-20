@@ -14,6 +14,12 @@ typedef int (*aio_getevents_fn)(io_context_t ctx, long min_nr, long nr,
                                 struct io_event *events,
                                 struct timespec *timeout);
 
+// Shares the ZVEC_LIBAIO_LOADER_CLASS_DEFINED guard with the mirror header
+// <ailego/io/libaio_loader.h>: the two declare a layout-identical class of the
+// same (global) name, so a translation unit that pulls in both include roots
+// must keep only the first definition it sees.
+#ifndef ZVEC_LIBAIO_LOADER_CLASS_DEFINED
+#define ZVEC_LIBAIO_LOADER_CLASS_DEFINED
 class LibAioLoader {
  public:
   static LibAioLoader &Instance() {
@@ -90,5 +96,6 @@ class LibAioLoader {
   std::atomic<bool> available_{false};
   void *handle_{nullptr};
 };
+#endif  // ZVEC_LIBAIO_LOADER_CLASS_DEFINED
 
 #endif

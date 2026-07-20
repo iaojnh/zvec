@@ -38,19 +38,28 @@ DiskAnnIndexer::~DiskAnnIndexer() {
 int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
   entity_ = &entity;
 
-  auto storage = entity.get_storage();
+  storage_ = entity.get_storage();
   auto vector_segment = entity.get_vector_segment();
 
   pq_table_ = entity.get_pq_table();
 
   index_segment_offset_ = vector_segment->data_offset();
 
-  reader_.reset(new LinuxAlignedFileReader());
-
-  auto file_path = storage->file_path();
-  reader_->open(file_path);
-
-  storage->cleanup();
+  if (auto *pool = storage_->vec_buffer_pool()) {
+    // BufferPool backend: route every sector read through the VecBufferPool
+    // paged cache.  The reader holds a raw pool pointer, so the storage (and
+    // thus the pool) must outlive this indexer -- keep storage_ alive and do
+    // NOT cleanup here.
+    reader_ = std::make_shared<BufferPoolAlignedFileReader>(pool);
+    reader_->open(storage_->file_path());
+  } else {
+    // Direct backend (FileReadStorage): open our own O_DIRECT + libaio reader
+    // and release the storage as before.
+    reader_ = std::make_shared<LinuxAlignedFileReader>();
+    reader_->open(storage_->file_path());
+    storage_->cleanup();
+    storage_.reset();
+  }
 
   int ret = setup_io_ctx(init_ctx_);
   if (ret != 0) {

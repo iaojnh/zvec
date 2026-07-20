@@ -18,6 +18,7 @@
 #include <zvec/core/interface/index.h>
 #include "algorithm/diskann/diskann_params.h"
 #include "holder_builder.h"
+#include "utility/utility_params.h"
 
 namespace zvec::core_interface {
 
@@ -76,11 +77,9 @@ int DiskAnnIndex::Open(const std::string &file_path,
   file_path_ = file_path;
   is_read_only_ = storage_options.read_only;
   switch (storage_options.type) {
-    case StorageOptions::StorageType::kMMAP:
-    case StorageOptions::StorageType::kBufferPool: {
-      // NOTE: DiskAnn index is dumped via FileDumper (plain binary file), which
-      // is not compatible with BufferStorage's IndexFormat layout. Fall back to
-      // FileReadStorage for both MMAP and BufferPool storage types.
+    case StorageOptions::StorageType::kMMAP: {
+      // DiskAnn index is dumped via FileDumper (plain binary file). The MMAP
+      // storage type maps to FileReadStorage (O_DIRECT + libaio direct reads).
       storage_ = core::IndexFactory::CreateStorage("FileReadStorage");
       if (storage_ == nullptr) {
         LOG_ERROR("Failed to create FileReadStorage");
@@ -89,6 +88,27 @@ int DiskAnnIndex::Open(const std::string &file_path,
       int ret = storage_->init(storage_params);
       if (ret != 0) {
         LOG_ERROR("Failed to init FileReadStorage, path: %s, err: %s",
+                  file_path_.c_str(), core::IndexError::What(ret));
+        return ret;
+      }
+      break;
+    }
+    case StorageOptions::StorageType::kBufferPool: {
+      // Route DiskAnn sector reads through a VecBufferPool paged cache.
+      // BufferReadStorage is a read-only backend that parses the same
+      // FileDumper container, so no re-dump is needed.
+      storage_ = core::IndexFactory::CreateStorage("BufferReadStorage");
+      if (storage_ == nullptr) {
+        LOG_ERROR("Failed to create BufferReadStorage");
+        return core::IndexError_Runtime;
+      }
+      // POC: enable direct I/O and I/O profiling. Production should gate the
+      // profile flag behind configuration.
+      storage_params.set(core::BUFFER_READ_STORAGE_ENABLE_DIRECT_IO, true);
+      storage_params.set(core::BUFFER_READ_STORAGE_ENABLE_IO_PROFILE, true);
+      int ret = storage_->init(storage_params);
+      if (ret != 0) {
+        LOG_ERROR("Failed to init BufferReadStorage, path: %s, err: %s",
                   file_path_.c_str(), core::IndexError::What(ret));
         return ret;
       }

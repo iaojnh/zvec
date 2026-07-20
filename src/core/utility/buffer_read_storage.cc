@@ -84,6 +84,13 @@ class BufferReadStorage : public IndexStorage {
       return data_size_;
     }
 
+    //! Retrieve absolute offset of data within the index file. DiskAnn relies
+    //! on this to compute sector addresses; without the override the base
+    //! class default (0) would make every sector address wrong.
+    size_t data_offset(void) const override {
+      return data_offset_;
+    }
+
     //! Retrieve crc of data
     uint32_t data_crc(void) const override {
       return data_crc_;
@@ -304,6 +311,7 @@ class BufferReadStorage : public IndexStorage {
 
   //! Load an index file into the container
   int open(const std::string &path, bool) override {
+    file_path_ = path;
     // Read-only buffer pool over the freshly-dumped FileDumper container.
     buffer_pool_ = std::make_shared<ailego::VecBufferPool>(
         path, /*writable=*/false, /*enable_direct_io=*/enable_direct_io_,
@@ -410,6 +418,17 @@ class BufferReadStorage : public IndexStorage {
     return MemoryBlock::MBT_BUFFERPOOL;
   }
 
+  //! Path of the opened index file (diagnostics / backend consistency).
+  std::string file_path(void) const override {
+    return file_path_;
+  }
+
+  //! Expose the backing VecBufferPool so callers (e.g. DiskAnn) can detect a
+  //! pooled backend and route reads through the paged cache.
+  ailego::VecBufferPool *vec_buffer_pool(void) const override {
+    return buffer_pool_.get();
+  }
+
  private:
   bool checksum_validation_{false};
   bool enable_direct_io_{true};
@@ -418,6 +437,7 @@ class BufferReadStorage : public IndexStorage {
   int64_t footer_offset_{0};
   size_t index_offset_{0};
   uint32_t magic_{0};
+  std::string file_path_{};
   std::vector<uint8_t> scratch_{};
   std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
   std::shared_ptr<ailego::VecBufferPool> buffer_pool_{nullptr};

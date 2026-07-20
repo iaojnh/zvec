@@ -21,6 +21,7 @@
 #include <ailego/io/io_backend_def.h>
 #include <zvec/ailego/io/io_backend.h>
 #include <zvec/core/framework/index_logger.h>
+#include "diskann_buffer_pool_shim.h"
 
 #define MAX_EVENTS 1024
 
@@ -336,6 +337,70 @@ int LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
   int ret = execute_io(ctx, this->file_desc, read_reqs);
 
   return ret;
+}
+
+BufferPoolAlignedFileReader::BufferPoolAlignedFileReader(
+    ailego::VecBufferPool *pool)
+    : pool_(pool) {}
+
+BufferPoolAlignedFileReader::~BufferPoolAlignedFileReader() {}
+
+IOContext &BufferPoolAlignedFileReader::get_ctx() {
+  // The VecBufferPool owns its AIO context; DiskAnn's per-thread IOContext is
+  // unused in buffer-pool mode.
+  return unused_ctx_;
+}
+
+void BufferPoolAlignedFileReader::register_thread() {}
+
+void BufferPoolAlignedFileReader::deregister_thread() {}
+
+void BufferPoolAlignedFileReader::deregister_all_threads() {}
+
+void BufferPoolAlignedFileReader::open(const std::string & /*fname*/) {
+  // No file descriptor of our own: the VecBufferPool already holds the file.
+}
+
+void BufferPoolAlignedFileReader::close() {}
+
+int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
+                                      IOContext & /*ctx*/, bool async) {
+  if (async == true) {
+    LOG_WARN("Async currently not supported");
+  }
+  if (pool_ == nullptr) {
+    LOG_ERROR("BufferPoolAlignedFileReader::read: null buffer pool");
+    return IndexError_Runtime;
+  }
+
+  const size_t count = read_reqs.size();
+  if (count == 0) {
+    return 0;
+  }
+
+  // Flatten to plain arrays so the actual pool interaction can live in a TU
+  // that includes vector_page_table.h without libaio header collisions.
+  std::vector<uint64_t> offsets(count);
+  std::vector<uint64_t> lens(count);
+  std::vector<void *> bufs(count);
+  for (size_t i = 0; i < count; ++i) {
+    offsets[i] = read_reqs[i].offset;
+    lens[i] = read_reqs[i].len;
+    bufs[i] = read_reqs[i].buf;
+  }
+
+  int rc = diskann_buffer_pool_read(pool_, offsets.data(), lens.data(),
+                                    bufs.data(), count);
+  switch (rc) {
+    case kDiskAnnBufferPoolOk:
+      return 0;
+    case kDiskAnnBufferPoolInvalidArg:
+      LOG_ERROR("BufferPoolAlignedFileReader::read: unaligned request");
+      return IndexError_InvalidArgument;
+    default:
+      LOG_ERROR("BufferPoolAlignedFileReader::read: buffer pool read failed");
+      return IndexError_ReadData;
+  }
 }
 
 

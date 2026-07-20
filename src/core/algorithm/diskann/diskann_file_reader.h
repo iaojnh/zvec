@@ -28,6 +28,17 @@
 #include "diskann_util.h"
 
 namespace zvec {
+namespace ailego {
+// Forward declaration only: including vector_page_table.h here would pull in
+// the <zvec/ailego/io/libaio_loader.h> definitions, which clash with the
+// <ailego/io/libaio_loader.h> copy this header already relies on. The buffer
+// pool is used only as an opaque pointer here; the concrete calls live in the
+// shim TU (diskann_buffer_pool_shim.cc).
+class VecBufferPool;
+}  // namespace ailego
+}  // namespace zvec
+
+namespace zvec {
 namespace core {
 
 #if (defined(__linux) || defined(__linux__))
@@ -101,6 +112,34 @@ class LinuxAlignedFileReader : public AlignedFileReader {
 
   int read(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
            bool async = false);
+};
+
+// AlignedFileReader that satisfies DiskAnn sector reads through a
+// VecBufferPool paged cache instead of O_DIRECT + libaio.  A DiskAnn sector
+// (4KB) maps 1:1 to a VecBufferPool page, so each AlignedRead is expanded into
+// one or more page ids, acquired in a single batch (preserving the pool's
+// batched miss / AIO path), copied into the caller's buffer, then released.
+// The pool manages its own AIO context, so thread registration / file open /
+// IOContext are all no-ops here.
+class BufferPoolAlignedFileReader : public AlignedFileReader {
+ public:
+  explicit BufferPoolAlignedFileReader(ailego::VecBufferPool *pool);
+  ~BufferPoolAlignedFileReader() override;
+
+  IOContext &get_ctx() override;
+
+  void register_thread() override;
+  void deregister_thread() override;
+  void deregister_all_threads() override;
+  void open(const std::string &fname) override;
+  void close() override;
+
+  int read(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
+           bool async = false) override;
+
+ private:
+  ailego::VecBufferPool *pool_{nullptr};
+  IOContext unused_ctx_{};
 };
 
 }  // namespace core
