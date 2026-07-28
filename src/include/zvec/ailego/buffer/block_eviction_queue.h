@@ -37,6 +37,7 @@
 #include <unordered_set>
 #include <vector>
 #include <zvec/ailego/internal/platform.h>
+#include <zvec/export.h>
 #include "concurrentqueue.h"
 
 #if defined(_MSC_VER)
@@ -50,7 +51,7 @@ using eviction_key_t = size_t;
 using block_id_t = size_t;
 using version_t = size_t;
 
-class EvictableBlockOwner {
+class ZVEC_AILEGO_API EvictableBlockOwner {
  public:
   virtual ~EvictableBlockOwner() = default;
 

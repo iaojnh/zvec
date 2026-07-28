@@ -38,6 +38,7 @@
 #include <unordered_map>
 #include <vector>
 #include <zvec/ailego/internal/platform.h>
+#include <zvec/export.h>
 #if defined(__linux) || defined(__linux__)
 #include <zvec/ailego/io/libaio_loader.h>
 #endif
@@ -53,7 +54,7 @@ namespace ailego {
 
 extern const size_t kVectorPageSize;
 
-class VectorPageTable : public EvictableBlockOwner {
+class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   // Cold page metadata stays one entry per cache line.  Pinning, writes and
   // eviction mutate these fields, so isolating adjacent entries avoids false
   // sharing on those paths.  Read-only epoch hits do not touch this 64-byte
@@ -570,7 +571,7 @@ class BufferPoolProfileTimer {
   uint64_t start_ns_{0};
 };
 
-class VecBufferPool {
+class ZVEC_AILEGO_API VecBufferPool {
  public:
   typedef std::shared_ptr<VecBufferPool> Pointer;
 
@@ -816,7 +817,7 @@ class VecBufferPool {
   std::unique_ptr<std::mutex[]> block_mutexes_{};
 };
 
-class VecBufferPoolHandle {
+class ZVEC_AILEGO_API VecBufferPoolHandle {
  public:
   VecBufferPoolHandle(VecBufferPool &pool) : pool_(pool) {}
   VecBufferPoolHandle(VecBufferPoolHandle &&other) : pool_(other.pool_) {}
