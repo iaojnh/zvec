@@ -141,7 +141,7 @@ class MemoryLimitPool {
 
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
 
-  //! Reserve capacity for memory allocated outside the page-buffer slab.
+  //! Reserve capacity for memory allocated outside the page-buffer cache.
   //! Unlike charge_external(), this enforces the configured limit and may
   //! recycle evictable pages before failing.
   bool try_charge_external(const size_t buffer_size);
@@ -170,6 +170,11 @@ class MemoryLimitPool {
     return used_size_.load(std::memory_order_relaxed);
   }
 
+  //! Bytes physically retained by page buffers plus external reservations.
+  size_t committed() const {
+    return committed_size_.load(std::memory_order_relaxed);
+  }
+
   //! Total capacity in bytes (fixed after init()).
   size_t capacity() const {
     return pool_size_;
@@ -179,9 +184,10 @@ class MemoryLimitPool {
   struct PoolStats {
     size_t pool_size{0};
     size_t used{0};
+    size_t committed{0};
     size_t free_buffers{0};           // buffers cached across all shards
     uint64_t alloc_from_freelist{0};  // acquisitions served from a shard
-    uint64_t alloc_from_slab{0};      // acquisitions that carved a new buffer
+    uint64_t alloc_from_slab{0};      // cold page-buffer allocations
     uint64_t bg_evict_rounds{0};      // background reclaim passes
     uint64_t bg_evicted_buffers{0};   // buffers reclaimed by background thread
     uint64_t high_watermark_hits{0};  // foreground acquire hit the capacity cap
@@ -194,8 +200,11 @@ class MemoryLimitPool {
   ~MemoryLimitPool();
 
   void drain_free_list();
-  char *carve_from_slab_locked(size_t buffer_size);
-  void free_all_slabs_locked();
+  bool try_reserve_used(size_t bytes);
+  bool try_reserve_committed(size_t bytes);
+  bool is_cacheable_buffer_size(size_t buffer_size);
+  char *pop_free_buffer(size_t start_shard);
+  size_t trim_free_buffers(size_t bytes_needed);
   size_t pick_shard();
 
   // Background evictor: proactively reclaims buffers down to the low
@@ -242,16 +251,16 @@ class MemoryLimitPool {
 
   size_t pool_size_{0};
   std::atomic<size_t> used_size_{0};
+  // Unlike used_size_, committed_size_ includes buffers retained on the
+  // free-list. External caches must reserve against this counter so cached
+  // page memory and external memory cannot together exceed pool_size_.
+  std::atomic<size_t> committed_size_{0};
 
   FreeShard free_shards_[kNumFreeShards];
   std::atomic<size_t> shard_seq_{0};
-
-  // Slab allocator (cold path) guarded by its own mutex, decoupled from the
-  // free-list shards.
-  std::mutex slab_mutex_;
-  std::vector<char *> slabs_;
-  char *slab_cursor_{nullptr};
-  size_t slab_remaining_{0};
+  // Free-list nodes do not carry a size, so only the first page-buffer size
+  // seen after init is cached. Other sizes are allocated and freed directly.
+  std::atomic<size_t> cached_buffer_size_{0};
 
   // Observability counters (relaxed atomics; statistics only).
   std::atomic<uint64_t> alloc_from_freelist_{0};

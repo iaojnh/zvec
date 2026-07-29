@@ -170,6 +170,38 @@ TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
   EXPECT_EQ(0u, memory_pool.used());
 }
 
+TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
+  constexpr size_t kCapacityPages = 4;
+  auto &memory_pool = MemoryLimitPool::get_instance();
+  InitPool(kCapacityPages);
+
+  std::vector<char *> pages;
+  for (size_t i = 0; i < kCapacityPages; ++i) {
+    char *page = nullptr;
+    ASSERT_TRUE(memory_pool.try_acquire_buffer(kVectorPageSize, page));
+    pages.push_back(page);
+  }
+  for (char *page : pages) {
+    memory_pool.release_buffer(page, kVectorPageSize);
+  }
+
+  MemoryLimitPool::PoolStats cached = memory_pool.stats();
+  EXPECT_EQ(0u, cached.used);
+  EXPECT_EQ(kCapacityPages * kVectorPageSize, cached.committed);
+  EXPECT_EQ(kCapacityPages, cached.free_buffers);
+
+  ASSERT_TRUE(memory_pool.try_charge_external(kCapacityPages *
+                                              kVectorPageSize));
+  MemoryLimitPool::PoolStats charged = memory_pool.stats();
+  EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.used);
+  EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.committed);
+  EXPECT_EQ(0u, charged.free_buffers);
+
+  memory_pool.release_external(kCapacityPages * kVectorPageSize);
+  EXPECT_EQ(0u, memory_pool.used());
+  EXPECT_EQ(0u, memory_pool.committed());
+}
+
 TEST_F(BufferPoolTest, LargeExternalReservationReclaimsMultipleBatches) {
   constexpr size_t kCapacityPages = 512;
   constexpr size_t kExternalPages = 400;
@@ -446,6 +478,7 @@ TEST_F(BufferPoolTest, ShardedPoolAllocFreeAccounting) {
   // Release everything back to the shards.
   for (char *b : bufs) mp.release_buffer(b, kVectorPageSize);
   EXPECT_EQ(mp.used(), 0u);
+  EXPECT_EQ(mp.committed(), cap_pages * kVectorPageSize);
 
   // Re-acquire should now be served from shard free-lists (no new slab carve).
   MemoryLimitPool::PoolStats before = mp.stats();

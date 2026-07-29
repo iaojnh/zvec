@@ -145,28 +145,30 @@ MemoryLimitPool::~MemoryLimitPool() {
 }
 
 void MemoryLimitPool::drain_free_list() {
-  // Clear every shard free-list, then release the backing slabs.  The shard
-  // heads point into the slabs, so they must be dropped before ailego_free.
+  const size_t buffer_size =
+      cached_buffer_size_.load(std::memory_order_relaxed);
+  size_t released = 0;
   for (size_t i = 0; i < kNumFreeShards; ++i) {
     std::lock_guard<std::mutex> lk(free_shards_[i].mutex);
+    char *buffer = free_shards_[i].head;
+    while (buffer) {
+      char *next = *reinterpret_cast<char **>(buffer);
+      ailego_free(buffer);
+      buffer = next;
+      ++released;
+    }
     free_shards_[i].head = nullptr;
     free_shards_[i].count.store(0, std::memory_order_relaxed);
   }
-  std::lock_guard<std::mutex> lock(slab_mutex_);
-  free_all_slabs_locked();
-}
-
-void MemoryLimitPool::free_all_slabs_locked() {
-  size_t n = slabs_.size();
-  for (char *base : slabs_) {
-    ailego_free(base);
+  if (released != 0) {
+    size_t released_bytes = released * buffer_size;
+    size_t prev = committed_size_.fetch_sub(released_bytes,
+                                            std::memory_order_relaxed);
+    (void)prev;
+    assert(buffer_size != 0 && prev >= released_bytes);
+    LOG_INFO("MemoryLimitPool: released %zu cached buffers", released);
   }
-  slabs_.clear();
-  slab_cursor_ = nullptr;
-  slab_remaining_ = 0;
-  if (n > 0) {
-    LOG_INFO("MemoryLimitPool: released %zu slabs", n);
-  }
+  cached_buffer_size_.store(0, std::memory_order_relaxed);
 }
 
 size_t MemoryLimitPool::pick_shard() {
@@ -176,33 +178,81 @@ size_t MemoryLimitPool::pick_shard() {
   return idx % kNumFreeShards;
 }
 
-char *MemoryLimitPool::carve_from_slab_locked(size_t buffer_size) {
-  static constexpr size_t kSlabAlign = 4096UL;
-  static constexpr size_t kSlabBytes = 2UL * 1024UL * 1024UL;
-  if (buffer_size == 0 || (buffer_size & (kSlabAlign - 1UL)) != 0) {
-    char *p =
-        static_cast<char *>(ailego_aligned_malloc(buffer_size, kSlabAlign));
-    if (p) {
-      slabs_.push_back(p);
+bool MemoryLimitPool::try_reserve_used(size_t bytes) {
+  size_t used = used_size_.load(std::memory_order_relaxed);
+  while (used <= pool_size_ && bytes <= pool_size_ - used) {
+    if (used_size_.compare_exchange_weak(used, used + bytes,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+      return true;
     }
-    return p;
   }
-  if (slab_remaining_ < buffer_size) {
-    size_t slab_size = (kSlabBytes < buffer_size) ? buffer_size : kSlabBytes;
-    slab_size = ((slab_size + buffer_size - 1UL) / buffer_size) * buffer_size;
-    char *base =
-        static_cast<char *>(ailego_aligned_malloc(slab_size, kSlabAlign));
-    if (!base) {
-      return nullptr;
+  return false;
+}
+
+bool MemoryLimitPool::try_reserve_committed(size_t bytes) {
+  size_t committed = committed_size_.load(std::memory_order_relaxed);
+  while (committed <= pool_size_ && bytes <= pool_size_ - committed) {
+    if (committed_size_.compare_exchange_weak(
+            committed, committed + bytes, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      return true;
     }
-    slabs_.push_back(base);
-    slab_cursor_ = base;
-    slab_remaining_ = slab_size;
   }
-  char *p = slab_cursor_;
-  slab_cursor_ += buffer_size;
-  slab_remaining_ -= buffer_size;
-  return p;
+  return false;
+}
+
+bool MemoryLimitPool::is_cacheable_buffer_size(size_t buffer_size) {
+  size_t cached = cached_buffer_size_.load(std::memory_order_relaxed);
+  if (cached == 0) {
+    cached_buffer_size_.compare_exchange_strong(
+        cached, buffer_size, std::memory_order_relaxed,
+        std::memory_order_relaxed);
+    if (cached == 0) {
+      cached = buffer_size;
+    }
+  }
+  return cached == buffer_size;
+}
+
+char *MemoryLimitPool::pop_free_buffer(size_t start_shard) {
+  for (size_t i = 0; i < kNumFreeShards; ++i) {
+    size_t shard = (start_shard + i) % kNumFreeShards;
+    std::lock_guard<std::mutex> lock(free_shards_[shard].mutex);
+    char *buffer = free_shards_[shard].head;
+    if (buffer) {
+      free_shards_[shard].head = *reinterpret_cast<char **>(buffer);
+      free_shards_[shard].count.fetch_sub(1, std::memory_order_relaxed);
+      return buffer;
+    }
+  }
+  return nullptr;
+}
+
+size_t MemoryLimitPool::trim_free_buffers(size_t bytes_needed) {
+  const size_t buffer_size =
+      cached_buffer_size_.load(std::memory_order_relaxed);
+  if (buffer_size == 0 || bytes_needed == 0) {
+    return 0;
+  }
+
+  size_t released_bytes = 0;
+  size_t shard = pick_shard();
+  while (released_bytes < bytes_needed) {
+    char *buffer = pop_free_buffer(shard);
+    if (!buffer) {
+      break;
+    }
+    // Publish the freed capacity only after the allocation is actually gone;
+    // otherwise a concurrent reservation could briefly exceed the hard cap.
+    ailego_free(buffer);
+    size_t prev =
+        committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    (void)prev;
+    assert(prev >= buffer_size);
+    released_bytes += buffer_size;
+  }
+  return released_bytes;
 }
 
 int MemoryLimitPool::init(size_t pool_size) {
@@ -266,22 +316,8 @@ void MemoryLimitPool::background_evict_loop() {
 
 bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
                                          char *&buffer) {
-  // used_size_ is a pure accounting counter: buffer memory safety comes from
-  // the shard/slab mutexes, not from this atomic's ordering.  So relaxed is
-  // sufficient and drops the seq_cst full barriers (dmb ish on arm64).
-  //
-  // Optimistic reserve: a single fetch_add on the fast path instead of a CAS
-  // loop, so contended acquirers never spin-retry.  Semantics match the old
-  // loop: an acquire succeeds iff it observed the counter below the cap
-  // (prev < pool_size_) -- exactly one acquirer can claim the last slot, so
-  // the steady-state overshoot is unchanged (<= buffer_size for the last
-  // acquirer).  The only new effect is that concurrent acquirers may push the
-  // counter to a transient peak of up to (concurrent acquirers * buffer_size)
-  // over the cap before the losers roll back; acceptable for a soft memory
-  // limit whose hard safety comes from eviction, not this counter.
-  size_t prev = used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
-  if (prev >= pool_size_) {
-    used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+  buffer = nullptr;
+  if (buffer_size == 0 || !try_reserve_used(buffer_size)) {
     // Out of budget: wake the background evictor so the next attempt is
     // more likely to find a free buffer without inline eviction.
     high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -289,41 +325,31 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
     return false;
   }
 
-  // Fast path: pull from this thread's shard free-list.
-  size_t s = pick_shard();
-  {
-    std::lock_guard<std::mutex> lock(free_shards_[s].mutex);
-    if (free_shards_[s].head) {
-      buffer = free_shards_[s].head;
-      free_shards_[s].head = *reinterpret_cast<char **>(buffer);
-      free_shards_[s].count.fetch_sub(1, std::memory_order_relaxed);
+  const bool cacheable = is_cacheable_buffer_size(buffer_size);
+  if (cacheable) {
+    buffer = pop_free_buffer(pick_shard());
+    if (buffer) {
       alloc_from_freelist_.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
   }
-  // Steal path: our shard is empty, but buffers freed by other threads (most
-  // notably the background evictor, which releases into its own sticky shard)
-  // may be sitting idle in foreign shards.  Reuse one of those before carving
-  // new slab memory, otherwise slab allocations grow without bound while freed
-  // buffers pile up unused, since used_size_ accounting stays within budget.
-  for (size_t i = 1; i < kNumFreeShards; ++i) {
-    size_t victim = (s + i) % kNumFreeShards;
-    std::lock_guard<std::mutex> lock(free_shards_[victim].mutex);
-    if (free_shards_[victim].head) {
-      buffer = free_shards_[victim].head;
-      free_shards_[victim].head = *reinterpret_cast<char **>(buffer);
-      free_shards_[victim].count.fetch_sub(1, std::memory_order_relaxed);
-      alloc_from_freelist_.fetch_add(1, std::memory_order_relaxed);
-      return true;
+
+  // Cold buffers are individually allocated so retained free-list memory can
+  // be returned to the OS when an external cache needs the shared budget.
+  if (!try_reserve_committed(buffer_size)) {
+    // This is primarily useful for a non-cacheable size. For the normal page
+    // size, all currently visible free buffers were already checked above.
+    trim_free_buffers(buffer_size);
+    if (!try_reserve_committed(buffer_size)) {
+      used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+      high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
+      return false;
     }
   }
-  // Cold path: all shards empty, carve a fresh buffer from the slab allocator.
-  {
-    std::lock_guard<std::mutex> lock(slab_mutex_);
-    buffer = carve_from_slab_locked(buffer_size);
-  }
+  buffer = static_cast<char *>(ailego_aligned_malloc(buffer_size, 4096UL));
   if (!buffer) {
-    used_size_.fetch_sub(buffer_size);
+    committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
     return false;
   }
   alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);
@@ -339,13 +365,19 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
   }
 
   while (true) {
-    size_t used = used_size_.load(std::memory_order_relaxed);
-    while (used <= pool_size_ && buffer_size <= pool_size_ - used) {
-      if (used_size_.compare_exchange_weak(used, used + buffer_size,
-                                           std::memory_order_relaxed,
-                                           std::memory_order_relaxed)) {
-        return true;
-      }
+    if (try_reserve_committed(buffer_size)) {
+      used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
+      return true;
+    }
+
+    size_t committed = committed_size_.load(std::memory_order_relaxed);
+    size_t available =
+        committed >= pool_size_ ? 0 : pool_size_ - committed;
+    if (available >= buffer_size) {
+      continue;
+    }
+    if (trim_free_buffers(buffer_size - available) != 0) {
+      continue;
     }
 
     // A large static cache may need to reclaim far more than one eviction
@@ -365,6 +397,7 @@ void MemoryLimitPool::charge_external(const size_t buffer_size) {
   // a compare_exchange loop, which would otherwise re-read the contended
   // used_size_ cache line on every retry.
   used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
+  committed_size_.fetch_add(buffer_size, std::memory_order_relaxed);
 }
 
 void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
@@ -373,6 +406,17 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
   size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
   (void)prev;
   assert(prev >= buffer_size);
+  if (!buffer) {
+    return;
+  }
+  if (!is_cacheable_buffer_size(buffer_size)) {
+    ailego_free(buffer);
+    size_t committed_prev =
+        committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    (void)committed_prev;
+    assert(committed_prev >= buffer_size);
+    return;
+  }
   size_t s = pick_shard();
   std::lock_guard<std::mutex> lock(free_shards_[s].mutex);
   *reinterpret_cast<char **>(buffer) = free_shards_[s].head;
@@ -385,6 +429,10 @@ void MemoryLimitPool::release_external(const size_t buffer_size) {
   size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
   (void)prev;
   assert(prev >= buffer_size);
+  size_t committed_prev =
+      committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+  (void)committed_prev;
+  assert(committed_prev >= buffer_size);
 }
 
 bool MemoryLimitPool::is_full() {
@@ -393,7 +441,7 @@ bool MemoryLimitPool::is_full() {
 
 size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
                                               size_t count) {
-  if (count == 0) return 0;
+  if (count == 0 || buffer_size == 0) return 0;
   size_t total_size = count * buffer_size;
   size_t actual_count = count;
   size_t expected, desired;
@@ -408,56 +456,47 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
   } while (!used_size_.compare_exchange_weak(
       expected, desired, std::memory_order_relaxed, std::memory_order_relaxed));
 
-  size_t from_list = 0;
+  size_t acquired = 0;
   size_t s = pick_shard();
-  {
-    std::lock_guard<std::mutex> lock(free_shards_[s].mutex);
-    while (from_list < actual_count && free_shards_[s].head) {
-      out[from_list] = free_shards_[s].head;
-      free_shards_[s].head = *reinterpret_cast<char **>(out[from_list]);
-      free_shards_[s].count.fetch_sub(1, std::memory_order_relaxed);
-      ++from_list;
-    }
-  }
-  if (from_list) {
-    alloc_from_freelist_.fetch_add(from_list, std::memory_order_relaxed);
-  }
-  // Steal from foreign shards before carving new slab memory (see the note in
-  // try_acquire_buffer): freed buffers stranded in other shards must be reused,
-  // otherwise slab allocations grow without bound under eviction churn.
-  if (from_list < actual_count) {
-    for (size_t i = 1; i < kNumFreeShards && from_list < actual_count; ++i) {
-      size_t victim = (s + i) % kNumFreeShards;
-      std::lock_guard<std::mutex> lock(free_shards_[victim].mutex);
-      while (from_list < actual_count && free_shards_[victim].head) {
-        out[from_list] = free_shards_[victim].head;
-        free_shards_[victim].head = *reinterpret_cast<char **>(out[from_list]);
-        free_shards_[victim].count.fetch_sub(1, std::memory_order_relaxed);
-        alloc_from_freelist_.fetch_add(1, std::memory_order_relaxed);
-        ++from_list;
-      }
-    }
-  }
-  if (from_list < actual_count) {
-    std::lock_guard<std::mutex> lock(slab_mutex_);
-    for (size_t i = from_list; i < actual_count; ++i) {
-      out[i] = carve_from_slab_locked(buffer_size);
-      if (!out[i]) {
-        size_t rollback = (actual_count - i) * buffer_size;
-        used_size_.fetch_sub(rollback);
-        actual_count = i;
+  if (is_cacheable_buffer_size(buffer_size)) {
+    while (acquired < actual_count) {
+      out[acquired] = pop_free_buffer(s);
+      if (!out[acquired]) {
         break;
       }
-      alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);
+      ++acquired;
     }
+    alloc_from_freelist_.fetch_add(acquired, std::memory_order_relaxed);
   }
-  return actual_count;
+
+  while (acquired < actual_count) {
+    if (!try_reserve_committed(buffer_size)) {
+      trim_free_buffers(buffer_size);
+      if (!try_reserve_committed(buffer_size)) {
+        break;
+      }
+    }
+    out[acquired] =
+        static_cast<char *>(ailego_aligned_malloc(buffer_size, 4096UL));
+    if (!out[acquired]) {
+      committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+      break;
+    }
+    alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);
+    ++acquired;
+  }
+  if (acquired < actual_count) {
+    used_size_.fetch_sub((actual_count - acquired) * buffer_size,
+                         std::memory_order_relaxed);
+  }
+  return acquired;
 }
 
 MemoryLimitPool::PoolStats MemoryLimitPool::stats() const {
   PoolStats s;
   s.pool_size = pool_size_;
   s.used = used_size_.load(std::memory_order_relaxed);
+  s.committed = committed_size_.load(std::memory_order_relaxed);
   size_t free_buffers = 0;
   for (size_t i = 0; i < kNumFreeShards; ++i) {
     free_buffers += free_shards_[i].count.load(std::memory_order_relaxed);
@@ -474,11 +513,13 @@ MemoryLimitPool::PoolStats MemoryLimitPool::stats() const {
 void MemoryLimitPool::log_stats() const {
   PoolStats s = stats();
   LOG_INFO(
-      "MemoryLimitPool stats: pool_size=%llu used=%llu free_buffers=%llu "
-      "alloc_from_freelist=%llu alloc_from_slab=%llu bg_evict_rounds=%llu "
-      "bg_evicted_buffers=%llu high_watermark_hits=%llu",
+      "MemoryLimitPool stats: pool_size=%llu used=%llu committed=%llu "
+      "free_buffers=%llu alloc_from_freelist=%llu alloc_from_slab=%llu "
+      "bg_evict_rounds=%llu bg_evicted_buffers=%llu "
+      "high_watermark_hits=%llu",
       static_cast<unsigned long long>(s.pool_size),
       static_cast<unsigned long long>(s.used),
+      static_cast<unsigned long long>(s.committed),
       static_cast<unsigned long long>(s.free_buffers),
       static_cast<unsigned long long>(s.alloc_from_freelist),
       static_cast<unsigned long long>(s.alloc_from_slab),

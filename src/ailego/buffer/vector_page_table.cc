@@ -927,8 +927,16 @@ int VecBufferPool::flush_all() {
     size_t run_count = 0;
     const size_t limit = batch_buf ? kBatchPages : 1;
     while (i < total && run_count < limit && page_table_.is_block_dirty(i)) {
-      char *buf = page_table_.get_block_buffer(i);
-      if (!buf) break;
+      char *buf = page_table_.acquire_block(i);
+      if (!buf) {
+        break;
+      }
+      // Another flusher may have completed between the optimistic dirty check
+      // and the pin. Do not include a now-clean page in this contiguous run.
+      if (!page_table_.is_block_dirty(i)) {
+        page_table_.release_block(i);
+        break;
+      }
       if (batch_buf) {
         std::memcpy(batch_buf + run_count * kVectorPageSize, buf,
                     kVectorPageSize);
@@ -961,6 +969,12 @@ int VecBufferPool::flush_all() {
           ++fail_count;
         }
       }
+    }
+    // Keep every page pinned until the write and dirty-flag update complete.
+    // The background evictor can no longer recycle a buffer while flush_all()
+    // is copying or writing it.
+    for (size_t j = 0; j < run_count; ++j) {
+      page_table_.release_block(run_start + j);
     }
   }
 
@@ -1486,7 +1500,15 @@ void VecBufferPool::prefetch_pages_aio([[maybe_unused]] block_id_t first_page,
       int n = LibAioLoader::Instance().io_getevents(
           ctx, static_cast<long>(accepted - done),
           static_cast<long>(accepted - done), events.data() + done, nullptr);
-      if (n <= 0) break;
+      if (n == -EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        LOG_ERROR(
+            "VecBufferPool::prefetch_pages_aio: io_getevents failed, ret=%d",
+            n);
+        break;
+      }
       done += static_cast<size_t>(n);
     }
 
@@ -1542,9 +1564,23 @@ struct ThreadLocalAioCtx {
     if (in_flight > 0 && ok) {
       struct io_event events[128];
       // Must block-wait: kernel is still DMA-ing into our buffers
-      LibAioLoader::Instance().io_getevents(ctx, static_cast<long>(in_flight),
-                                            static_cast<long>(in_flight),
-                                            events, nullptr);
+      size_t done = 0;
+      while (done < in_flight) {
+        int ret = LibAioLoader::Instance().io_getevents(
+            ctx, static_cast<long>(in_flight - done),
+            static_cast<long>(in_flight - done), events + done, nullptr);
+        if (ret == -EINTR) {
+          continue;
+        }
+        if (ret <= 0) {
+          LOG_ERROR(
+              "ThreadLocalAioCtx: io_getevents failed during teardown, "
+              "ret=%d",
+              ret);
+          break;
+        }
+        done += static_cast<size_t>(ret);
+      }
     }
     // Release ALL pending buffers (both harvested-but-not-released and
     // in-flight)
