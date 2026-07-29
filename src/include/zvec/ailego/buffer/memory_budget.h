@@ -123,8 +123,7 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
       return;
     }
     auto &used = used_bytes_[index(category)];
-    const uint64_t previous =
-        used.fetch_sub(bytes, std::memory_order_relaxed);
+    const uint64_t previous = used.fetch_sub(bytes, std::memory_order_relaxed);
     (void)previous;
     assert(previous >= bytes);
   }
@@ -171,8 +170,7 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
   }
 
   Config config_{};
-  std::array<std::atomic<uint64_t>,
-             static_cast<size_t>(Category::Count)>
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(Category::Count)>
       used_bytes_{};
   std::atomic<bool> configured_{false};
 };

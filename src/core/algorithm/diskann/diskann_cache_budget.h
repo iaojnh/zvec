@@ -46,16 +46,15 @@ class DiskAnnCacheBudget {
   static uint64_t EstimatedBytesPerNode(const IndexMeta &meta,
                                         uint32_t max_degree) {
     constexpr uint64_t kTreeLinksPerEntry = 4;
-    const uint64_t map_bookkeeping =
-        sizeof(CoordCacheValue) + sizeof(NeighborCacheValue) +
-        2 * kTreeLinksPerEntry * sizeof(void *);
+    const uint64_t map_bookkeeping = sizeof(CoordCacheValue) +
+                                     sizeof(NeighborCacheValue) +
+                                     2 * kTreeLinksPerEntry * sizeof(void *);
     return PayloadBytesPerNode(meta, max_degree) + map_bookkeeping;
   }
 
   static uint32_t ResolveNodeCount(uint64_t budget_bytes, uint64_t doc_count,
                                    uint64_t estimated_bytes_per_node) {
-    if (budget_bytes == 0 || doc_count == 0 ||
-        estimated_bytes_per_node == 0) {
+    if (budget_bytes == 0 || doc_count == 0 || estimated_bytes_per_node == 0) {
       return 0;
     }
 

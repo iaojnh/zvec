@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <chrono>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 
 namespace zvec {
@@ -79,8 +79,7 @@ void BlockEvictionQueue::recycle() {
   // spared pages, so is_full() alone could spin for a while when most queued
   // pages are hot.  Cap the work a single foreground caller absorbs; the
   // background evictor picks up the slack.
-  const size_t max_attempts =
-      evict_batch_size_ * 200 * CACHE_QUEUE_NUM + 16;
+  const size_t max_attempts = evict_batch_size_ * 200 * CACHE_QUEUE_NUM + 16;
   size_t attempts = 0;
   while (MemoryLimitPool::get_instance().is_full() && evict_block(item)) {
     {
@@ -109,7 +108,8 @@ size_t BlockEvictionQueue::batch_recycle(size_t count) {
     BlockType item;
     if (!evict_single_block(item)) break;
     if (item.owner == nullptr ||
-        valid_owners_.find(item.owner) == valid_owners_.end()) continue;
+        valid_owners_.find(item.owner) == valid_owners_.end())
+      continue;
     if (item.owner->is_dead_block(item.owner_key, item.version)) continue;
     const uint8_t current_priority =
         item.owner->eviction_priority(item.owner_key);
@@ -172,8 +172,7 @@ void MemoryLimitPool::free_all_slabs_locked() {
 size_t MemoryLimitPool::pick_shard() {
   // Sticky per-thread shard assignment: threads keep reusing the same shard,
   // maximizing free-list locality and minimizing cross-thread lock traffic.
-  thread_local size_t idx =
-      shard_seq_.fetch_add(1, std::memory_order_relaxed);
+  thread_local size_t idx = shard_seq_.fetch_add(1, std::memory_order_relaxed);
   return idx % kNumFreeShards;
 }
 
@@ -233,9 +232,7 @@ void MemoryLimitPool::stop_background_evictor() {
   if (!bg_running_.exchange(false)) {
     return;  // not running
   }
-  {
-    std::lock_guard<std::mutex> lk(bg_mutex_);
-  }
+  { std::lock_guard<std::mutex> lk(bg_mutex_); }
   bg_cv_.notify_all();
   if (bg_thread_.joinable()) {
     bg_thread_.join();
@@ -248,8 +245,7 @@ void MemoryLimitPool::background_evict_loop() {
     {
       std::unique_lock<std::mutex> lk(bg_mutex_);
       bg_cv_.wait_for(lk, milliseconds(5), [this] {
-        return !bg_running_.load() ||
-               used_size_.load() >= high_watermark();
+        return !bg_running_.load() || used_size_.load() >= high_watermark();
       });
     }
     if (!bg_running_.load()) break;
@@ -345,9 +341,9 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
   while (true) {
     size_t used = used_size_.load(std::memory_order_relaxed);
     while (used <= pool_size_ && buffer_size <= pool_size_ - used) {
-      if (used_size_.compare_exchange_weak(
-              used, used + buffer_size, std::memory_order_relaxed,
-              std::memory_order_relaxed)) {
+      if (used_size_.compare_exchange_weak(used, used + buffer_size,
+                                           std::memory_order_relaxed,
+                                           std::memory_order_relaxed)) {
         return true;
       }
     }
@@ -395,8 +391,8 @@ bool MemoryLimitPool::is_full() {
   return used_size_.load(std::memory_order_relaxed) >= pool_size_;
 }
 
-size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size,
-                                              char **out, size_t count) {
+size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
+                                              size_t count) {
   if (count == 0) return 0;
   size_t total_size = count * buffer_size;
   size_t actual_count = count;
@@ -409,9 +405,8 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size,
     if (avail < actual_count) actual_count = avail;
     total_size = actual_count * buffer_size;
     desired = expected + total_size;
-  } while (!used_size_.compare_exchange_weak(expected, desired,
-                                             std::memory_order_relaxed,
-                                             std::memory_order_relaxed));
+  } while (!used_size_.compare_exchange_weak(
+      expected, desired, std::memory_order_relaxed, std::memory_order_relaxed));
 
   size_t from_list = 0;
   size_t s = pick_shard();

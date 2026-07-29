@@ -1150,8 +1150,7 @@ Args:
             dict["max_degree"] = self.max_degree();
             dict["list_size"] = self.list_size();
             dict["pq_chunk_num"] = self.pq_chunk_num();
-            dict["cache_node_budget_bytes"] =
-                self.cache_node_budget_bytes();
+            dict["cache_node_budget_bytes"] = self.cache_node_budget_bytes();
             dict["quantize_type"] =
                 quantize_type_to_string(self.quantize_type());
             py::dict qp_dict;

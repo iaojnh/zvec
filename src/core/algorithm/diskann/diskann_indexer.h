@@ -39,14 +39,12 @@ class DiskAnnIndexer {
   int init(DiskAnnSearcherEntity &entity);
   int reserve_cache_memory(uint64_t node_count);
   int load_cache_list(const std::vector<diskann_id_t> &node_list);
-  void manage_cache_page_overlap(
-      const std::vector<diskann_id_t> &node_list, bool evict);
-  int configure_cache(uint32_t cache_node_num,
-                      uint64_t cache_node_budget_bytes,
+  void manage_cache_page_overlap(const std::vector<diskann_id_t> &node_list,
+                                 bool evict);
+  int configure_cache(uint32_t cache_node_num, uint64_t cache_node_budget_bytes,
                       const std::string &cache_node_list_path,
                       const std::string &cache_node_page_policy,
-                      const std::string &warmup_mode,
-                      uint32_t warmup_node_num);
+                      const std::string &warmup_mode, uint32_t warmup_node_num);
   int load_node_list(const std::string &path, uint32_t node_limit,
                      std::vector<diskann_id_t> &node_list) const;
   void warmup_node_pages(

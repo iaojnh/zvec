@@ -18,8 +18,8 @@
 #include <zvec/core/interface/index.h>
 #if DISKANN_SUPPORTED
 #include "algorithm/diskann/diskann_params.h"
-#include "holder_builder.h"
 #include "utility/utility_params.h"
+#include "holder_builder.h"
 #endif
 
 namespace zvec::core_interface {
@@ -97,10 +97,8 @@ int DiskAnnIndex::CreateAndInitStreamer(const BaseIndexParam &param) {
   param_.max_degree = std::min(100, param_.max_degree);
   param_.list_size = std::min(100, param_.list_size);
   param_.pq_chunk_num = std::min(1024, param_.pq_chunk_num);
-  if (param_.cache_node_num != 0 &&
-      param_.cache_node_budget_bytes != 0) {
-    LOG_ERROR(
-        "cache_node_num and cache_node_budget_bytes cannot both be set");
+  if (param_.cache_node_num != 0 && param_.cache_node_budget_bytes != 0) {
+    LOG_ERROR("cache_node_num and cache_node_budget_bytes cannot both be set");
     return core::IndexError_InvalidArgument;
   }
 

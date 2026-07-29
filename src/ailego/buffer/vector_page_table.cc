@@ -108,9 +108,9 @@ bool PageReadEpochDomain::enter(Token *token) {
     const size_t idx =
         next_slot_.fetch_add(1, std::memory_order_relaxed) % kSlotCount;
     uint64_t expected = 0;
-    if (!slots_[idx].epoch.compare_exchange_strong(
-            expected, kReserved, std::memory_order_seq_cst,
-            std::memory_order_relaxed)) {
+    if (!slots_[idx].epoch.compare_exchange_strong(expected, kReserved,
+                                                   std::memory_order_seq_cst,
+                                                   std::memory_order_relaxed)) {
       continue;
     }
     active_readers_.fetch_add(1, std::memory_order_acq_rel);
@@ -147,8 +147,7 @@ void PageReadEpochDomain::retire(char *buffer) {
     MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize);
     return;
   }
-  const uint64_t retired_epoch =
-      epoch_.fetch_add(1, std::memory_order_seq_cst);
+  const uint64_t retired_epoch = epoch_.fetch_add(1, std::memory_order_seq_cst);
   std::lock_guard<std::mutex> lock(retired_mutex_);
   retired_.push_back(RetiredBuffer{buffer, retired_epoch});
   reclaim_locked(false);
@@ -173,8 +172,7 @@ void PageReadEpochDomain::reclaim_locked(bool force) {
       safe = true;
       for (const auto &slot : slots_) {
         const uint64_t state = slot.epoch.load(std::memory_order_seq_cst);
-        if (state == kReserved ||
-            (state >= 2 && state - 2 <= retired.epoch)) {
+        if (state == kReserved || (state >= 2 && state - 2 <= retired.epoch)) {
           safe = false;
           break;
         }
@@ -218,8 +216,7 @@ bool VectorPageTable::init(size_t entry_num) {
       segments_[s][i].in_evict_queue.store(false);
       segments_[s][i].is_dirty.store(false);
       segments_[s][i].referenced.store(false);
-      resident_segments_[s][i].buffer.store(nullptr,
-                                             std::memory_order_relaxed);
+      resident_segments_[s][i].buffer.store(nullptr, std::memory_order_relaxed);
       segments_[s][i].file_offset = 0;
     }
   }
@@ -257,8 +254,7 @@ bool VectorPageTable::extend(size_t new_entry_num) {
       segments_[s][i].in_evict_queue.store(false);
       segments_[s][i].is_dirty.store(false);
       segments_[s][i].referenced.store(false);
-      resident_segments_[s][i].buffer.store(nullptr,
-                                             std::memory_order_relaxed);
+      resident_segments_[s][i].buffer.store(nullptr, std::memory_order_relaxed);
       segments_[s][i].file_offset = 0;
     }
   }
@@ -292,8 +288,7 @@ char *VectorPageTable::acquire_block(block_id_t block_id) {
         }
         inc_sampled_hit();
       }
-      return resident_entry_at(block_id).buffer.load(
-          std::memory_order_acquire);
+      return resident_entry_at(block_id).buffer.load(std::memory_order_acquire);
     }
   }
   return nullptr;
@@ -325,8 +320,8 @@ void VectorPageTable::release_block(block_id_t block_id) {
       block.owner_key = block_id;
       block.version = owner_version_;
       BlockEvictionQueue::get_instance().add_single_block(
-          block, static_cast<int>(
-                     e.evict_priority.load(std::memory_order_relaxed)));
+          block,
+          static_cast<int>(e.evict_priority.load(std::memory_order_relaxed)));
     }
   }
 }
@@ -363,8 +358,8 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
       block.owner_key = block_id;
       block.version = owner_version_;
       BlockEvictionQueue::get_instance().add_single_block(
-          block, static_cast<int>(
-                     e.evict_priority.load(std::memory_order_relaxed)));
+          block,
+          static_cast<int>(e.evict_priority.load(std::memory_order_relaxed)));
       return false;  // spared, not reclaimed
     }
     char *buffer = resident_entry_at(block_id).buffer.exchange(
@@ -379,8 +374,7 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
       if (retire_callback_) {
         retire_callback_(buffer);
       } else {
-        MemoryLimitPool::get_instance().release_buffer(buffer,
-                                                       kVectorPageSize);
+        MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize);
       }
     }
     inc_evict();
@@ -400,8 +394,8 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
   block.owner_key = block_id;
   block.version = owner_version_;
   if (!BlockEvictionQueue::get_instance().add_single_block(
-          block, static_cast<int>(
-                     e.evict_priority.load(std::memory_order_relaxed)))) {
+          block,
+          static_cast<int>(e.evict_priority.load(std::memory_order_relaxed)))) {
     // Let release_block() retry registration when the last pin is dropped.
     e.in_evict_queue.store(false, std::memory_order_relaxed);
   }
@@ -432,7 +426,7 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       // Epoch readers publish no ref_count edge, so the buffer pointer itself
       // must release-publish the fully initialized page contents.
       resident_entry_at(block_id).buffer.store(buffer,
-                                                std::memory_order_release);
+                                               std::memory_order_release);
       e.file_offset = file_offset;
       e.is_dirty.store(false, std::memory_order_relaxed);
       e.referenced.store(false, std::memory_order_relaxed);
@@ -452,8 +446,7 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
         // The final release will take the rare fallback registration path.
         e.in_evict_queue.store(false, std::memory_order_relaxed);
       }
-      return resident_entry_at(block_id).buffer.load(
-          std::memory_order_acquire);
+      return resident_entry_at(block_id).buffer.load(std::memory_order_acquire);
     } else {
       ++spin_count;
       if (spin_count < 64) {
@@ -638,8 +631,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
   if (profile) {
     const uint64_t lock_start = BufferPoolProfileNowNs();
     lock.lock();
-    profile->sync_page_lock_wait_ns +=
-        BufferPoolProfileNowNs() - lock_start;
+    profile->sync_page_lock_wait_ns += BufferPoolProfileNowNs() - lock_start;
   } else {
     lock.lock();
   }
@@ -649,7 +641,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
   }
   {
     BufferPoolProfileTimer prepare_timer(profile ? &profile->sync_prepare_ns
-                                                  : nullptr);
+                                                 : nullptr);
     bool found = MemoryLimitPool::get_instance().try_acquire_buffer(
         kVectorPageSize, buffer);
     if (!found) {
@@ -680,7 +672,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
   if (writable_ && page_offset >= initial_file_size_ &&
       !page_table_.is_ever_loaded(page_id)) {
     BufferPoolProfileTimer prepare_timer(profile ? &profile->sync_prepare_ns
-                                                  : nullptr);
+                                                 : nullptr);
     std::memset(buffer, 0, kVectorPageSize);
   } else {
     // O_DIRECT requires the IO length to be a multiple of the device block
@@ -697,7 +689,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
     ssize_t read_bytes = 0;
     {
       BufferPoolProfileTimer read_timer(profile ? &profile->sync_read_ns
-                                                 : nullptr);
+                                                : nullptr);
       read_bytes = zvec_pread(fd_, buffer, read_len, page_offset);
     }
     if (profile) ++profile->sync_reads;
@@ -708,7 +700,8 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
         std::memset(buffer + read_bytes, 0, kVectorPageSize - read_bytes);
       } else {
         LOG_ERROR(
-            "Buffer pool failed to read file at offset: file[%s], page_id[%zu], "
+            "Buffer pool failed to read file at offset: file[%s], "
+            "page_id[%zu], "
             "offset[%zu], expected[%zu], got[%zd]",
             file_name_.c_str(), page_id, page_offset, read_len, read_bytes);
         MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize);
@@ -719,7 +712,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
   char *installed = nullptr;
   {
     BufferPoolProfileTimer install_timer(profile ? &profile->sync_install_ns
-                                                  : nullptr);
+                                                 : nullptr);
     installed = page_table_.set_block_acquired(page_id, buffer, page_offset);
   }
   return installed;
@@ -824,19 +817,16 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
   bool ok = true;
   while (copied < length) {
     const size_t absolute = file_offset + copied;
-    const size_t page_offset =
-        (absolute / kVectorPageSize) * kVectorPageSize;
+    const size_t page_offset = (absolute / kVectorPageSize) * kVectorPageSize;
     const size_t within_page = absolute - page_offset;
     const size_t copy_size =
         std::min(length - copied, kVectorPageSize - within_page);
     const size_t available = file_size_ - page_offset;
-    const size_t read_size =
-        direct_io_enabled_
-            ? kVectorPageSize
-            : std::min(kVectorPageSize, available);
+    const size_t read_size = direct_io_enabled_
+                                 ? kVectorPageSize
+                                 : std::min(kVectorPageSize, available);
 
-    const ssize_t read_bytes =
-        zvec_pread(fd_, page, read_size, page_offset);
+    const ssize_t read_bytes = zvec_pread(fd_, page, read_size, page_offset);
     if (read_bytes <= 0 ||
         within_page + copy_size > static_cast<size_t>(read_bytes)) {
       ok = false;
@@ -1408,10 +1398,9 @@ static thread_local ThreadLocalPrefetchAioCtx tl_prefetch_aio;
 }  // namespace
 #endif
 
-void VecBufferPool::prefetch_pages_aio(
-    [[maybe_unused]] block_id_t first_page,
-    [[maybe_unused]] size_t page_count,
-    [[maybe_unused]] uint8_t priority) {
+void VecBufferPool::prefetch_pages_aio([[maybe_unused]] block_id_t first_page,
+                                       [[maybe_unused]] size_t page_count,
+                                       [[maybe_unused]] uint8_t priority) {
 #if defined(__linux) || defined(__linux__)
   static constexpr size_t kMaxBatch = 128;
 
@@ -1472,7 +1461,7 @@ void VecBufferPool::prefetch_pages_aio(
     if (ret <= 0) {
       for (size_t i = 0; i < submitted; ++i) {
         MemoryLimitPool::get_instance().release_buffer(buffers[i],
-                                                      kVectorPageSize);
+                                                       kVectorPageSize);
       }
       return;
     }
@@ -1483,7 +1472,7 @@ void VecBufferPool::prefetch_pages_aio(
     size_t accepted = static_cast<size_t>(ret);
     for (size_t i = accepted; i < submitted; ++i) {
       MemoryLimitPool::get_instance().release_buffer(buffers[i],
-                                                    kVectorPageSize);
+                                                     kVectorPageSize);
       buffers[i] = nullptr;
     }
 
@@ -1511,7 +1500,7 @@ void VecBufferPool::prefetch_pages_aio(
             block_mutexes_[pid % VecBufferPool::kMutexBucketCount]);
         if (page_table_.is_loaded(pid)) {
           MemoryLimitPool::get_instance().release_buffer(buffers[idx],
-                                                        kVectorPageSize);
+                                                         kVectorPageSize);
         } else {
           page_table_.set_evict_priority(pid, priority);
           page_table_.set_block_acquired(pid, buffers[idx],
@@ -1520,7 +1509,7 @@ void VecBufferPool::prefetch_pages_aio(
         }
       } else {
         MemoryLimitPool::get_instance().release_buffer(buffers[idx],
-                                                      kVectorPageSize);
+                                                       kVectorPageSize);
       }
       buffers[idx] = nullptr;
     }
@@ -1543,8 +1532,8 @@ struct ThreadLocalAioCtx {
   // Pending async AIO state
   char *pending_bufs[128];
   block_id_t pending_pids[128];
-  size_t pending_count{0};      // total submitted (slot high-water mark)
-  size_t harvested_count{0};    // how many completed & processed
+  size_t pending_count{0};    // total submitted (slot high-water mark)
+  size_t harvested_count{0};  // how many completed & processed
   VecBufferPool *pending_pool{nullptr};
 
   ~ThreadLocalAioCtx() {
@@ -1553,15 +1542,16 @@ struct ThreadLocalAioCtx {
     if (in_flight > 0 && ok) {
       struct io_event events[128];
       // Must block-wait: kernel is still DMA-ing into our buffers
-      LibAioLoader::Instance().io_getevents(
-          ctx, static_cast<long>(in_flight),
-          static_cast<long>(in_flight), events, nullptr);
+      LibAioLoader::Instance().io_getevents(ctx, static_cast<long>(in_flight),
+                                            static_cast<long>(in_flight),
+                                            events, nullptr);
     }
-    // Release ALL pending buffers (both harvested-but-not-released and in-flight)
+    // Release ALL pending buffers (both harvested-but-not-released and
+    // in-flight)
     for (size_t i = 0; i < pending_count; ++i) {
       if (pending_bufs[i]) {
         MemoryLimitPool::get_instance().release_buffer(pending_bufs[i],
-                                                      kVectorPageSize);
+                                                       kVectorPageSize);
       }
     }
     pending_count = 0;
@@ -1618,7 +1608,7 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count,
   // Time only preparation + io_submit.  A cross-pool drain above is already
   // attributed to aio_wait_ns and must not be double-counted as submit work.
   BufferPoolProfileTimer submit_timer(profile ? &profile->aio_submit_ns
-                                               : nullptr);
+                                              : nullptr);
 
   // Determine how many slots are available for new submissions
   size_t base = tl_aio.pending_count;  // existing in-flight count
@@ -1635,13 +1625,17 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count,
     bool in_flight = false;
     for (size_t j = 0; j < base; ++j) {
       if (tl_aio.pending_bufs[j] && tl_aio.pending_pids[j] == page_ids[i]) {
-        in_flight = true; break;
+        in_flight = true;
+        break;
       }
     }
     if (in_flight) continue;
     bool dup = false;
     for (size_t j = 0; j < miss_count; ++j) {
-      if (miss_pages[j] == page_ids[i]) { dup = true; break; }
+      if (miss_pages[j] == page_ids[i]) {
+        dup = true;
+        break;
+      }
     }
     if (!dup) miss_pages[miss_count++] = page_ids[i];
   }
@@ -1669,7 +1663,7 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count,
   if (ret <= 0) {
     for (size_t i = 0; i < submitted; ++i) {
       MemoryLimitPool::get_instance().release_buffer(buffers[i],
-                                                    kVectorPageSize);
+                                                     kVectorPageSize);
     }
     return;
   }
@@ -1679,8 +1673,7 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count,
   if (profile) {
     ++profile->aio_batches;
     profile->aio_pages += actual;
-    profile->aio_max_batch = std::max<uint64_t>(profile->aio_max_batch,
-                                                actual);
+    profile->aio_max_batch = std::max<uint64_t>(profile->aio_max_batch, actual);
   }
   for (size_t i = 0; i < actual; ++i) {
     tl_aio.pending_bufs[base + i] = buffers[i];
@@ -1695,8 +1688,7 @@ void VecBufferPool::submit_aio_async(const block_id_t *page_ids, size_t count,
 
   // Release buffers for requests that weren't submitted
   for (size_t i = actual; i < submitted; ++i) {
-    MemoryLimitPool::get_instance().release_buffer(buffers[i],
-                                                  kVectorPageSize);
+    MemoryLimitPool::get_instance().release_buffer(buffers[i], kVectorPageSize);
   }
 #else
   (void)page_ids;
@@ -1729,14 +1721,14 @@ void VecBufferPool::harvest_aio() {
     if (static_cast<ssize_t>(events[i].res) !=
         static_cast<ssize_t>(kVectorPageSize)) {
       MemoryLimitPool::get_instance().release_buffer(tl_aio.pending_bufs[idx],
-                                                    kVectorPageSize);
+                                                     kVectorPageSize);
     } else {
       block_id_t pid = tl_aio.pending_pids[idx];
       std::lock_guard<std::mutex> lock(
           pool->block_mutexes_[pid % VecBufferPool::kMutexBucketCount]);
       if (pool->page_table_.is_loaded(pid)) {
         MemoryLimitPool::get_instance().release_buffer(tl_aio.pending_bufs[idx],
-                                                      kVectorPageSize);
+                                                       kVectorPageSize);
       } else {
         pool->page_table_.set_block_acquired(pid, tl_aio.pending_bufs[idx],
                                              pid * kVectorPageSize);
@@ -1773,7 +1765,7 @@ void VecBufferPool::wait_aio(BufferPoolIoProfile *profile) {
     int ret = 0;
     {
       BufferPoolProfileTimer wait_timer(profile ? &profile->aio_wait_ns
-                                                 : nullptr);
+                                                : nullptr);
       ret = LibAioLoader::Instance().io_getevents(
           tl_aio.ctx, static_cast<long>(in_flight),
           static_cast<long>(in_flight), events, nullptr);
@@ -1788,13 +1780,13 @@ void VecBufferPool::wait_aio(BufferPoolIoProfile *profile) {
     }
     size_t completed = static_cast<size_t>(ret);
     BufferPoolProfileTimer install_timer(profile ? &profile->aio_install_ns
-                                                  : nullptr);
+                                                 : nullptr);
     for (size_t i = 0; i < completed; ++i) {
       size_t idx = reinterpret_cast<size_t>(events[i].data);
       if (static_cast<ssize_t>(events[i].res) !=
           static_cast<ssize_t>(kVectorPageSize)) {
         MemoryLimitPool::get_instance().release_buffer(tl_aio.pending_bufs[idx],
-                                                      kVectorPageSize);
+                                                       kVectorPageSize);
       } else {
         block_id_t pid = tl_aio.pending_pids[idx];
         std::unique_lock<std::mutex> lock(
@@ -1854,15 +1846,14 @@ void VecBufferPool::log_stats() const {
     const double software_ns_per_read =
         io_reads ? static_cast<double>(p.software_ns()) / io_reads : 0.0;
     const uint64_t classified_sync_reads =
-        p.neighbor_sync_reads + p.cross_page_sync_reads +
-        p.post_aio_sync_reads;
+        p.neighbor_sync_reads + p.cross_page_sync_reads + p.post_aio_sync_reads;
     const uint64_t unclassified_sync_reads =
         p.sync_reads > classified_sync_reads
             ? p.sync_reads - classified_sync_reads
             : 0;
-    const uint64_t classified_sync_read_ns =
-        p.neighbor_sync_read_ns + p.cross_page_sync_read_ns +
-        p.post_aio_sync_read_ns;
+    const uint64_t classified_sync_read_ns = p.neighbor_sync_read_ns +
+                                             p.cross_page_sync_read_ns +
+                                             p.post_aio_sync_read_ns;
     const uint64_t unclassified_sync_read_ns =
         p.sync_read_ns > classified_sync_read_ns
             ? p.sync_read_ns - classified_sync_read_ns
@@ -1916,8 +1907,7 @@ void VecBufferPool::log_stats() const {
         static_cast<unsigned long long>(p.epoch_suspends),
         static_cast<unsigned long long>(io_reads),
         static_cast<unsigned long long>(io_wait_ns),
-        static_cast<unsigned long long>(p.software_ns()),
-        software_ns_per_read);
+        static_cast<unsigned long long>(p.software_ns()), software_ns_per_read);
     LOG_INFO(
         "VecBufferPool io_profile_paths: file[%s] "
         "neighbor_sync_reads=%llu neighbor_sync_read_ns=%llu "

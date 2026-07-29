@@ -132,8 +132,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
     if (owner_key >= entry_num_.load(std::memory_order_acquire)) {
       return 0;
     }
-    return entry_at(owner_key).evict_priority.load(
-        std::memory_order_relaxed);
+    return entry_at(owner_key).evict_priority.load(std::memory_order_relaxed);
   }
 
   //! Unconditionally reclaim a block, bypassing the CLOCK second-chance bit.
@@ -237,10 +236,10 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
 
   //! Cache observability counters (monotonic, relaxed atomics).
   struct Stats {
-    uint64_t hit{0};           // estimated cache hits (1/64 sampling)
-    uint64_t evict{0};         // pages actually reclaimed
-    uint64_t second_chance{0}; // pages spared by the CLOCK bit
-    uint64_t dirty_flush{0};   // dirty pages written back on eviction
+    uint64_t hit{0};            // estimated cache hits (1/64 sampling)
+    uint64_t evict{0};          // pages actually reclaimed
+    uint64_t second_chance{0};  // pages spared by the CLOCK bit
+    uint64_t dirty_flush{0};    // dirty pages written back on eviction
   };
   Stats stats() const {
     Stats s;
@@ -394,8 +393,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
         1, std::memory_order_relaxed);
   }
   void inc_dirty_flush() {
-    counters_[counter_shard()].dirty_flush.fetch_add(
-        1, std::memory_order_relaxed);
+    counters_[counter_shard()].dirty_flush.fetch_add(1,
+                                                     std::memory_order_relaxed);
   }
 };
 
@@ -537,8 +536,7 @@ struct BufferPoolIoProfile {
     vector_fallback_aio_wait_ns += other.vector_fallback_aio_wait_ns;
     post_aio_publish_attempts += other.post_aio_publish_attempts;
     post_aio_publish_failures += other.post_aio_publish_failures;
-    post_aio_requested_unique_pages +=
-        other.post_aio_requested_unique_pages;
+    post_aio_requested_unique_pages += other.post_aio_requested_unique_pages;
     post_aio_missing_unique_pages += other.post_aio_missing_unique_pages;
     epoch_enter_attempts += other.epoch_enter_attempts;
     epoch_enter_failures += other.epoch_enter_failures;
@@ -589,8 +587,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   static constexpr uint8_t kHighPriority = 2;
 
   VecBufferPool(const std::string &filename, bool writable = false,
-                bool enable_direct_io = false,
-                bool enable_io_profile = false);
+                bool enable_direct_io = false, bool enable_io_profile = false);
   ~VecBufferPool() {
     // A caller may have used the non-blocking submit API directly.  Drain the
     // current thread's batch before page buffers or file descriptors can be

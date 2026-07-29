@@ -51,8 +51,8 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
         (static_cast<uint64_t>(list_size_) + 1) * sizeof(Neighbor) +
         static_cast<uint64_t>(list_size_) * sizeof(Neighbor);
     const uint64_t visit_map = entity_->doc_cnt();
-    if (fixed_buffers > std::numeric_limits<uint64_t>::max() -
-                            search_containers ||
+    if (fixed_buffers >
+            std::numeric_limits<uint64_t>::max() - search_containers ||
         fixed_buffers + search_containers >
             std::numeric_limits<uint64_t>::max() - visit_map) {
       return IndexError_NoMemory;
@@ -130,8 +130,7 @@ DiskAnnContext::~DiskAnnContext() {
     destroy_io_ctx(io_ctx_);
   }
   ailego::MemoryBudgetManager::get_instance().release(
-      ailego::MemoryBudgetManager::Category::QueryWorking,
-      query_budget_bytes_);
+      ailego::MemoryBudgetManager::Category::QueryWorking, query_budget_bytes_);
 }
 
 int DiskAnnContext::update(const ailego::Params &params) {
@@ -146,16 +145,14 @@ int DiskAnnContext::update(const ailego::Params &params) {
         static_cast<uint64_t>(list_size) * sizeof(Neighbor);
     auto &budget = ailego::MemoryBudgetManager::get_instance();
     if (new_container_bytes > old_container_bytes) {
-      const uint64_t additional =
-          new_container_bytes - old_container_bytes;
+      const uint64_t additional = new_container_bytes - old_container_bytes;
       if (!budget.try_charge(
               ailego::MemoryBudgetManager::Category::QueryWorking,
               additional)) {
         LOG_ERROR(
             "DiskANN query working-memory budget exhausted while updating "
             "list_size: old=%u new=%u additional=%llu",
-            list_size_, list_size,
-            static_cast<unsigned long long>(additional));
+            list_size_, list_size, static_cast<unsigned long long>(additional));
         return IndexError_NoMemory;
       }
       query_budget_bytes_ += additional;

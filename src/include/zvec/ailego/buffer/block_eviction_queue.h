@@ -214,8 +214,8 @@ class MemoryLimitPool {
   // and thrashes a 1.17 GB index).  Reserve a small absolute margin instead so
   // the pool fills to near capacity before anything is evicted.
   size_t reserve_margin() const {
-    size_t m = pool_size_ / 64;   // ~1.5% of the pool
-    const size_t lo = 8UL << 20;  // but at least 8 MB
+    size_t m = pool_size_ / 64;    // ~1.5% of the pool
+    const size_t lo = 8UL << 20;   // but at least 8 MB
     const size_t hi = 64UL << 20;  // and at most 64 MB
     if (m < lo) m = lo;
     if (m > hi) m = hi;

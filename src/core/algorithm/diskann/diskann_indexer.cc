@@ -241,8 +241,7 @@ int DiskAnnIndexer::load_cache_list(
 
   memset(coord_cache_buf_, 0, coord_cache_buf_len * meta_.unit_size());
   allocated_cache_payload_bytes_ =
-      static_cast<uint64_t>(num_cached_nodes) *
-      cache_payload_bytes_per_node();
+      static_cast<uint64_t>(num_cached_nodes) * cache_payload_bytes_per_node();
 
   constexpr size_t BLOCK_SIZE = 8;
   size_t num_blocks = DiskAnnUtil::div_round_up(num_cached_nodes, BLOCK_SIZE);
@@ -278,26 +277,24 @@ int DiskAnnIndexer::load_cache_list(
       "estimated_bytes=%llu",
       num_cached_nodes,
       static_cast<unsigned long long>(allocated_cache_payload_bytes_),
-      static_cast<unsigned long long>(
-          static_cast<uint64_t>(num_cached_nodes) *
-          cache_estimated_bytes_per_node()));
+      static_cast<unsigned long long>(static_cast<uint64_t>(num_cached_nodes) *
+                                      cache_estimated_bytes_per_node()));
 
   return 0;
 }
 
 int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count) {
-  const uint64_t estimated_bytes_per_node =
-      cache_estimated_bytes_per_node();
+  const uint64_t estimated_bytes_per_node = cache_estimated_bytes_per_node();
   if (estimated_bytes_per_node != 0 &&
-      node_count > std::numeric_limits<uint64_t>::max() /
-                       estimated_bytes_per_node) {
-    LOG_ERROR("DiskANN node cache size overflow: nodes=%llu bytes_per_node=%llu",
-              static_cast<unsigned long long>(node_count),
-              static_cast<unsigned long long>(estimated_bytes_per_node));
+      node_count >
+          std::numeric_limits<uint64_t>::max() / estimated_bytes_per_node) {
+    LOG_ERROR(
+        "DiskANN node cache size overflow: nodes=%llu bytes_per_node=%llu",
+        static_cast<unsigned long long>(node_count),
+        static_cast<unsigned long long>(estimated_bytes_per_node));
     return IndexError_NoMemory;
   }
-  const uint64_t estimated_cache_bytes =
-      node_count * estimated_bytes_per_node;
+  const uint64_t estimated_cache_bytes = node_count * estimated_bytes_per_node;
   if (estimated_cache_bytes > std::numeric_limits<size_t>::max()) {
     LOG_ERROR("DiskANN node cache does not fit the platform address space");
     return IndexError_NoMemory;
@@ -348,16 +345,14 @@ void DiskAnnIndexer::manage_cache_page_overlap(
   const uint64_t sector_num =
       node_per_sector_ > 0
           ? 1
-          : DiskAnnUtil::div_round_up(max_node_size_,
-                                      DiskAnnUtil::kSectorSize);
+          : DiskAnnUtil::div_round_up(max_node_size_, DiskAnnUtil::kSectorSize);
   std::vector<uint64_t> page_ids;
   page_ids.reserve(node_list.size() * sector_num);
   for (diskann_id_t node_id : node_list) {
     const uint64_t first_page =
         index_segment_offset_ / DiskAnnUtil::kSectorSize +
-        DiskAnnUtil::get_node_sector(
-            node_per_sector_, max_node_size_, DiskAnnUtil::kSectorSize,
-            node_id);
+        DiskAnnUtil::get_node_sector(node_per_sector_, max_node_size_,
+                                     DiskAnnUtil::kSectorSize, node_id);
     for (uint64_t i = 0; i < sector_num; ++i) {
       page_ids.push_back(first_page + i);
     }
@@ -372,15 +367,14 @@ void DiskAnnIndexer::manage_cache_page_overlap(
       evict ? "evict" : "keep",
       static_cast<unsigned long long>(stats.unique_pages),
       static_cast<unsigned long long>(stats.resident_pages_before),
-      static_cast<unsigned long long>(
-          stats.resident_pages_before * DiskAnnUtil::kSectorSize),
+      static_cast<unsigned long long>(stats.resident_pages_before *
+                                      DiskAnnUtil::kSectorSize),
       static_cast<unsigned long long>(stats.evicted_pages),
       static_cast<unsigned long long>(stats.resident_pages_after));
 }
 
-int DiskAnnIndexer::load_node_list(
-    const std::string &path, uint32_t node_limit,
-    std::vector<diskann_id_t> &node_list) const {
+int DiskAnnIndexer::load_node_list(const std::string &path, uint32_t node_limit,
+                                   std::vector<diskann_id_t> &node_list) const {
   std::ifstream input(path);
   if (!input.is_open()) {
     LOG_ERROR("Failed to open DiskANN cache node list: %s", path.c_str());
@@ -444,8 +438,7 @@ void DiskAnnIndexer::warmup_node_pages(
   const uint64_t sector_num =
       node_per_sector_ > 0
           ? 1
-          : DiskAnnUtil::div_round_up(max_node_size_,
-                                      DiskAnnUtil::kSectorSize);
+          : DiskAnnUtil::div_round_up(max_node_size_, DiskAnnUtil::kSectorSize);
   std::vector<uint64_t> page_ids;
   page_ids.reserve(node_list.size() * sector_num);
   for (diskann_id_t node_id : node_list) {
@@ -454,9 +447,8 @@ void DiskAnnIndexer::warmup_node_pages(
     }
     const uint64_t first_page =
         index_segment_offset_ / DiskAnnUtil::kSectorSize +
-        DiskAnnUtil::get_node_sector(
-            node_per_sector_, max_node_size_, DiskAnnUtil::kSectorSize,
-            node_id);
+        DiskAnnUtil::get_node_sector(node_per_sector_, max_node_size_,
+                                     DiskAnnUtil::kSectorSize, node_id);
     for (uint64_t page = 0; page < sector_num; ++page) {
       page_ids.push_back(first_page + page);
     }
@@ -466,27 +458,24 @@ void DiskAnnIndexer::warmup_node_pages(
   }
 
   std::sort(page_ids.begin(), page_ids.end());
-  page_ids.erase(std::unique(page_ids.begin(), page_ids.end()),
-                 page_ids.end());
+  page_ids.erase(std::unique(page_ids.begin(), page_ids.end()), page_ids.end());
   size_t resident_before = 0;
   for (uint64_t page_id : page_ids) {
     if (buffer_pool_->is_page_resident(page_id)) {
       ++resident_before;
     }
-    buffer_pool_->set_page_priority(
-        page_id, ailego::VecBufferPool::kHighPriority);
+    buffer_pool_->set_page_priority(page_id,
+                                    ailego::VecBufferPool::kHighPriority);
   }
 
   size_t cursor = 0;
   while (cursor < page_ids.size()) {
     size_t end = cursor + 1;
-    while (end < page_ids.size() &&
-           page_ids[end] == page_ids[end - 1] + 1) {
+    while (end < page_ids.size() && page_ids[end] == page_ids[end - 1] + 1) {
       ++end;
     }
-    buffer_pool_->prefetch_pages(
-        page_ids[cursor], end - cursor,
-        ailego::VecBufferPool::kHighPriority);
+    buffer_pool_->prefetch_pages(page_ids[cursor], end - cursor,
+                                 ailego::VecBufferPool::kHighPriority);
     cursor = end;
   }
 
@@ -499,15 +488,16 @@ void DiskAnnIndexer::warmup_node_pages(
   LOG_INFO(
       "DiskANN semantic warmup: requested_nodes=%zu excluded_nodes=%zu "
       "unique_pages=%zu resident_before=%zu resident_after=%zu priority=high",
-      node_list.size(), excluded_nodes.size(), page_ids.size(),
-      resident_before, resident_after);
+      node_list.size(), excluded_nodes.size(), page_ids.size(), resident_before,
+      resident_after);
 }
 
-int DiskAnnIndexer::configure_cache(
-    uint32_t cache_node_num, uint64_t cache_node_budget_bytes,
-    const std::string &cache_node_list_path,
-    const std::string &cache_node_page_policy,
-    const std::string &warmup_mode, uint32_t warmup_node_num) {
+int DiskAnnIndexer::configure_cache(uint32_t cache_node_num,
+                                    uint64_t cache_node_budget_bytes,
+                                    const std::string &cache_node_list_path,
+                                    const std::string &cache_node_page_policy,
+                                    const std::string &warmup_mode,
+                                    uint32_t warmup_node_num) {
   if (cache_node_budget_bytes != 0) {
     cache_node_num = cache_node_count_for_budget(cache_node_budget_bytes);
     LOG_INFO(

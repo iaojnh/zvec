@@ -16,8 +16,8 @@
 #include <string>
 #include <zvec/core/interface/index.h>
 #include "algorithm/ivf/ivf_params.h"
-#include "holder_builder.h"
 #include "utility/utility_params.h"
+#include "holder_builder.h"
 
 namespace zvec::core_interface {
 

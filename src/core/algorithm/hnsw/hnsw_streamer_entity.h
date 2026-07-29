@@ -216,10 +216,9 @@ class HnswStreamerEntity : public HnswEntity {
   inline NeighborsT<BufferPoolMemoryBlock> get_neighbors_typed(
       level_t level, node_id_t id, BufferPoolReadEpochScope &scope) const;
 
-  inline int get_vector_typed(
-      const node_id_t *ids, uint32_t count,
-      std::vector<BufferPoolMemoryBlock> &vec_blocks,
-      BufferPoolReadEpochScope &scope) const;
+  inline int get_vector_typed(const node_id_t *ids, uint32_t count,
+                              std::vector<BufferPoolMemoryBlock> &vec_blocks,
+                              BufferPoolReadEpochScope &scope) const;
 
   //! Typed get_key: reads key using typed MemBlock
   template <typename MemBlock>
@@ -710,8 +709,8 @@ HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
 }
 
 inline NeighborsT<BufferPoolMemoryBlock>
-HnswStreamerEntity::get_neighbors_typed(
-    level_t level, node_id_t id, BufferPoolReadEpochScope &scope) const {
+HnswStreamerEntity::get_neighbors_typed(level_t level, node_id_t id,
+                                        BufferPoolReadEpochScope &scope) const {
   Chunk *chunk = nullptr;
   size_t offset = 0;
   size_t nbr_size = neighbor_size_;
@@ -735,8 +734,8 @@ HnswStreamerEntity::get_neighbors_typed(
   const size_t page_offset = abs_offset % ailego::kVectorPageSize;
   if (pool && scope.pool == pool &&
       nbr_size <= ailego::kVectorPageSize - page_offset && scope.resume()) {
-    const auto page_id = static_cast<ailego::block_id_t>(
-        abs_offset / ailego::kVectorPageSize);
+    const auto page_id =
+        static_cast<ailego::block_id_t>(abs_offset / ailego::kVectorPageSize);
     char *page = pool->try_get_epoch_page(page_id);
     if (page) {
       BufferPoolMemoryBlock block(page + page_offset);
@@ -842,9 +841,9 @@ inline int HnswStreamerEntity::get_vector_typed(
       mem_block.data_ = nullptr;
       mem_block.type_ = IndexStorage::MemoryBlock::MBT_UNKNOWN;
     } else {
-      vec_blocks[i] = BufferPoolMemoryBlock(
-          mem_block.buffer_pool_handle_, mem_block.buffer_block_id_,
-          mem_block.data_);
+      vec_blocks[i] =
+          BufferPoolMemoryBlock(mem_block.buffer_pool_handle_,
+                                mem_block.buffer_block_id_, mem_block.data_);
       mem_block.buffer_pool_handle_ = nullptr;
     }
     return 0;
@@ -887,8 +886,7 @@ inline int HnswStreamerEntity::get_vector_typed(
         node_chunks_[loc.first]->abs_data_offset() + loc.second;
     const size_t page_offset = abs_offset % ailego::kVectorPageSize;
     if (read_size > ailego::kVectorPageSize - page_offset) {
-      cross_page_vectors.push_back(
-          CrossPageVector{i, loc.first, loc.second});
+      cross_page_vectors.push_back(CrossPageVector{i, loc.first, loc.second});
       continue;
     }
     const auto page_id =
@@ -908,15 +906,15 @@ inline int HnswStreamerEntity::get_vector_typed(
     const uint64_t sync_read_ns_before = profile ? profile->sync_read_ns : 0;
     auto record_cross_page_sync = [&]() {
       if (!profile) return;
-      profile->cross_page_sync_reads +=
-          profile->sync_reads - sync_reads_before;
+      profile->cross_page_sync_reads += profile->sync_reads - sync_reads_before;
       profile->cross_page_sync_read_ns +=
           profile->sync_read_ns - sync_read_ns_before;
     };
     ailego::BufferPoolProfileTimer fallback_timer(
         profile ? &profile->fallback_total_ns : nullptr);
     for (const auto &item : cross_page_vectors) {
-      int ret = read_one(item.result_index, item.chunk_index, item.chunk_offset);
+      int ret =
+          read_one(item.result_index, item.chunk_index, item.chunk_offset);
       if (ret != 0) {
         record_cross_page_sync();
         vec_blocks.clear();
@@ -967,14 +965,12 @@ inline int HnswStreamerEntity::get_vector_typed(
               break;
             }
           }
-          if (!seen &&
-              (page_vectors[j].page_id == observed_missing_page ||
-               !pool->is_page_resident(page_vectors[j].page_id))) {
+          if (!seen && (page_vectors[j].page_id == observed_missing_page ||
+                        !pool->is_page_resident(page_vectors[j].page_id))) {
             ++missing_unique_pages;
           }
         }
-        post_aio_profile->post_aio_missing_unique_pages +=
-            missing_unique_pages;
+        post_aio_profile->post_aio_missing_unique_pages += missing_unique_pages;
         ++post_aio_profile->post_aio_publish_failures;
         return false;
       }
@@ -1051,12 +1047,10 @@ inline int HnswStreamerEntity::get_vector_typed(
     {
       ailego::BufferPoolProfileTimer pin_timer(
           profile ? &profile->fallback_total_ns : nullptr);
-      acquired =
-          pool->acquire_pages(page_ids.data() + begin, n, pages.data());
+      acquired = pool->acquire_pages(page_ids.data() + begin, n, pages.data());
     }
     if (profile) {
-      profile->post_aio_sync_reads +=
-          profile->sync_reads - sync_reads_before;
+      profile->post_aio_sync_reads += profile->sync_reads - sync_reads_before;
       profile->post_aio_sync_read_ns +=
           profile->sync_read_ns - sync_read_ns_before;
       profile->vector_fallback_aio_pages +=
@@ -1069,8 +1063,8 @@ inline int HnswStreamerEntity::get_vector_typed(
       return IndexError_ReadData;
     }
     {
-      ailego::BufferPoolProfileTimer copy_timer(
-          profile ? &profile->copy_ns : nullptr);
+      ailego::BufferPoolProfileTimer copy_timer(profile ? &profile->copy_ns
+                                                        : nullptr);
       for (size_t j = 0; j < n; ++j) {
         const size_t i = begin + j;
         const PageVector &item = page_vectors[i];
@@ -1090,8 +1084,8 @@ inline int HnswStreamerEntity::get_vector_typed(
   // the vector starts clearing, and this avoids two shared_ptr atomics per
   // neighbor even on the copy fallback.
   const PageVector &owner = page_vectors.front();
-  vec_blocks[owner.result_index] = BufferPoolMemoryBlock(
-      std::move(scratch_lease), scratch_bytes);
+  vec_blocks[owner.result_index] =
+      BufferPoolMemoryBlock(std::move(scratch_lease), scratch_bytes);
   return 0;
 }
 
@@ -1293,10 +1287,9 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
         ids, count, vec_blocks);
   }
 
-  inline int get_vector_typed(
-      const node_id_t *ids, uint32_t count,
-      std::vector<BufferPoolMemoryBlock> &vec_blocks,
-      BufferPoolReadEpochScope &scope) const {
+  inline int get_vector_typed(const node_id_t *ids, uint32_t count,
+                              std::vector<BufferPoolMemoryBlock> &vec_blocks,
+                              BufferPoolReadEpochScope &scope) const {
     return HnswStreamerEntity::get_vector_typed(ids, count, vec_blocks, scope);
   }
 

@@ -28,9 +28,10 @@ inline auto get_neighbors_scoped(const EntityType &entity, level_t level,
 }
 
 template <typename EntityType, typename MemBlockType, typename Scope>
-inline int get_vectors_scoped(
-    const EntityType &entity, const node_id_t *ids, uint32_t count,
-    std::vector<MemBlockType> &vec_blocks, Scope &scope) {
+inline int get_vectors_scoped(const EntityType &entity, const node_id_t *ids,
+                              uint32_t count,
+                              std::vector<MemBlockType> &vec_blocks,
+                              Scope &scope) {
   if constexpr (std::is_same_v<Scope, BufferPoolReadEpochScope>) {
     return entity.get_vector_typed(ids, count, vec_blocks, scope);
   } else {
@@ -67,8 +68,7 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
   level_t cur_level = cur_max_level;
   dist_t dist = ctx->dist_calculator().batch_dist(entry_point);
   for (; cur_level > level; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx,
-                       vector_read_scope);
+    select_entry_point(cur_level, &entry_point, &dist, ctx, vector_read_scope);
   }
 
   for (; cur_level >= 0; --cur_level) {
@@ -107,8 +107,7 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
   auto vector_read_scope = entity_.make_vector_read_scope();
   dist_t dist = ctx->dist_calculator().dist(entry_point);
   for (level_t cur_level = maxLevel; cur_level >= 1; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx,
-                       vector_read_scope);
+    select_entry_point(cur_level, &entry_point, &dist, ctx, vector_read_scope);
   }
 
   auto &topk_heap = ctx->topk_heap();
@@ -124,17 +123,14 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
 }
 
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
-                                                   node_id_t *entry_point,
-                                                   dist_t *dist,
-                                                   HnswContext *ctx,
-                                                   VectorReadScope
-                                                       &vector_read_scope) const {
+void HnswAlgorithm<EntityType>::select_entry_point(
+    level_t level, node_id_t *entry_point, dist_t *dist, HnswContext *ctx,
+    VectorReadScope &vector_read_scope) const {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   HnswDistCalculator &dc = ctx->dist_calculator();
   while (true) {
-    const auto neighbors = get_neighbors_scoped(
-        entity, level, *entry_point, vector_read_scope);
+    const auto neighbors =
+        get_neighbors_scoped(entity, level, *entry_point, vector_read_scope);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
     }
@@ -145,8 +141,7 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
 
     // A vector miss may suspend the query epoch.  Copy graph ids first so the
     // neighbor page is no longer dereferenced after that suspension point.
-    std::vector<node_id_t> neighbor_ids(neighbors.data,
-                                        neighbors.data + size);
+    std::vector<node_id_t> neighbor_ids(neighbors.data, neighbors.data + size);
     std::vector<MemBlockType> neighbor_vec_blocks;
     int ret = get_vectors_scoped(entity, neighbor_ids.data(), size,
                                  neighbor_vec_blocks, vector_read_scope);
@@ -427,13 +422,9 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
 //     BufferPool       →  dual_heap_search_neighbors (fallback)
 // ============================================================================
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::search_neighbors(level_t level,
-                                                 node_id_t *entry_point,
-                                                 dist_t *dist, TopkHeap &topk,
-                                                 HnswContext *ctx,
-                                                 bool use_pool,
-                                                 VectorReadScope
-                                                     &vector_read_scope) const {
+void HnswAlgorithm<EntityType>::search_neighbors(
+    level_t level, node_id_t *entry_point, dist_t *dist, TopkHeap &topk,
+    HnswContext *ctx, bool use_pool, VectorReadScope &vector_read_scope) const {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   HnswDistCalculator &dc = ctx->dist_calculator();
 

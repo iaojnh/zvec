@@ -122,8 +122,7 @@ BaseIndexParam::Pointer IndexFactory::DeserializeIndexParamFromJson(
       return param;
     }
     case IndexType::kDiskAnn: {
-      DiskAnnIndexParam::Pointer param =
-          std::make_shared<DiskAnnIndexParam>();
+      DiskAnnIndexParam::Pointer param = std::make_shared<DiskAnnIndexParam>();
       if (!param->DeserializeFromJson(json_str)) {
         LOG_ERROR("Failed to deserialize diskann index param");
         return nullptr;

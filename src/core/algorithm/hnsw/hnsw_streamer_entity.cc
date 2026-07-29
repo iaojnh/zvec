@@ -827,8 +827,7 @@ const HnswEntity::Pointer HnswBufferPoolStreamerEntity::clone() const {
   for (size_t i = 0UL; i < upper_neighbor_chunks_.size(); ++i) {
     upper_neighbor_chunks.emplace_back(upper_neighbor_chunks_[i]->clone());
     if (ailego_unlikely(!upper_neighbor_chunks[i])) {
-      LOG_ERROR(
-          "HnswBufferPoolStreamerEntity get upper chunk failed in clone");
+      LOG_ERROR("HnswBufferPoolStreamerEntity get upper chunk failed in clone");
       return HnswEntity::Pointer();
     }
   }

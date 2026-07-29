@@ -40,9 +40,8 @@ int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
   // If a query-level profile is already bound, contribute to that instead.
   std::unique_ptr<ailego::BufferPoolIoProfile> local_profile;
   ailego::BufferPoolIoProfileBinding previous_binding;
-  const bool owns_profile =
-      pool->io_profile_enabled() &&
-      pool->current_thread_io_profile() == nullptr;
+  const bool owns_profile = pool->io_profile_enabled() &&
+                            pool->current_thread_io_profile() == nullptr;
   if (owns_profile) {
     local_profile = std::make_unique<ailego::BufferPoolIoProfile>();
     previous_binding = pool->bind_thread_io_profile(local_profile.get());
@@ -124,13 +123,11 @@ DiskAnnBufferPoolOverlapStats diskann_buffer_pool_manage_overlap(
   std::vector<ailego::block_id_t> unique_pages;
   unique_pages.reserve(count);
   for (size_t i = 0; i < count; ++i) {
-    unique_pages.push_back(
-        static_cast<ailego::block_id_t>(page_ids[i]));
+    unique_pages.push_back(static_cast<ailego::block_id_t>(page_ids[i]));
   }
   std::sort(unique_pages.begin(), unique_pages.end());
-  unique_pages.erase(
-      std::unique(unique_pages.begin(), unique_pages.end()),
-      unique_pages.end());
+  unique_pages.erase(std::unique(unique_pages.begin(), unique_pages.end()),
+                     unique_pages.end());
 
   stats.unique_pages = unique_pages.size();
   for (ailego::block_id_t page_id : unique_pages) {

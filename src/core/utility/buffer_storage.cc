@@ -515,8 +515,7 @@ class BufferStorage : public IndexStorage {
     // O_DIRECT is always on for memory controllability.
     params.get(BUFFER_STORAGE_ENABLE_DIRECT_IO, &enable_direct_io_);
     params.get(BUFFER_STORAGE_ENABLE_IO_PROFILE, &enable_io_profile_);
-    params.get(BUFFER_STORAGE_READ_ADMISSION_POLICY,
-               &read_admission_policy_);
+    params.get(BUFFER_STORAGE_READ_ADMISSION_POLICY, &read_admission_policy_);
     if (read_admission_policy_ != BUFFER_STORAGE_ADMISSION_CACHE &&
         read_admission_policy_ != BUFFER_STORAGE_ADMISSION_BYPASS) {
       LOG_ERROR("Invalid BufferStorage read admission policy: %s",
@@ -567,8 +566,7 @@ class BufferStorage : public IndexStorage {
       return ret;
     }
     bypass_reads_ = !create_if_missing &&
-                    read_admission_policy_ ==
-                        BUFFER_STORAGE_ADMISSION_BYPASS;
+                    read_admission_policy_ == BUFFER_STORAGE_ADMISSION_BYPASS;
     if (!bypass_reads_) {
       buffer_pool_->warmup();
     }

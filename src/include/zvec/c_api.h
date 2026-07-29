@@ -623,16 +623,14 @@ ZVEC_EXPORT uint64_t ZVEC_CALL
 zvec_config_data_get_query_working_memory(const zvec_config_data_t *config);
 
 /** Set/get the resident-metadata partition in bytes. */
-ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
-zvec_config_data_set_resident_metadata(zvec_config_data_t *config,
-                                       uint64_t bytes);
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_config_data_set_resident_metadata(
+    zvec_config_data_t *config, uint64_t bytes);
 ZVEC_EXPORT uint64_t ZVEC_CALL
 zvec_config_data_get_resident_metadata(const zvec_config_data_t *config);
 
 /** Set/get memory kept outside all managed allocations in bytes. */
 ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
-zvec_config_data_set_safety_reserve(zvec_config_data_t *config,
-                                    uint64_t bytes);
+zvec_config_data_set_safety_reserve(zvec_config_data_t *config, uint64_t bytes);
 ZVEC_EXPORT uint64_t ZVEC_CALL
 zvec_config_data_get_safety_reserve(const zvec_config_data_t *config);
 

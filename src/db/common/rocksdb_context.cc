@@ -14,8 +14,6 @@
 
 
 #include "rocksdb_context.h"
-#include "db/common/global_resource.h"
-#include <zvec/db/config.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/memtablerep.h>
 #include <rocksdb/slice_transform.h>
@@ -23,6 +21,8 @@
 #include <rocksdb/table.h>
 #include <rocksdb/utilities/checkpoint.h>
 #include <zvec/ailego/logger/logger.h>
+#include <zvec/db/config.h>
+#include "db/common/global_resource.h"
 
 
 namespace zvec {
