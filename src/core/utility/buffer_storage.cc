@@ -159,10 +159,14 @@ class BufferStorage : public IndexStorage {
       size_t abs_offset = segment_info_->segment_header_start_offset +
                           segment_info_->segment_header->content_offset +
                           segment_info_->segment.meta()->data_index + offset;
-      if (!owner_->buffer_pool_handle_->read_range(abs_offset, len,
-                                                   static_cast<char *>(buf))) {
+      const bool ok = owner_->bypass_reads_
+                          ? owner_->buffer_pool_handle_->read_range_bypass(
+                                abs_offset, len, static_cast<char *>(buf))
+                          : owner_->buffer_pool_handle_->read_range(
+                                abs_offset, len, static_cast<char *>(buf));
+      if (!ok) {
         LOG_ERROR(
-            "WrappedSegment::fetch: read_range failed, file[%s], id[%zu], "
+            "WrappedSegment::fetch: read failed, file[%s], id[%zu], "
             "abs_offset=%zu, len=%zu",
             owner_->file_name_.c_str(), segment_id_, abs_offset, len);
         return 0;
@@ -285,6 +289,27 @@ class BufferStorage : public IndexStorage {
       size_t abs_offset = segment_info_->segment_header_start_offset +
                           segment_info_->segment_header->content_offset +
                           segment_info_->segment.meta()->data_index + offset;
+      if (len == 0) {
+        return 0;
+      }
+      if (owner_->bypass_reads_) {
+        static constexpr size_t kAlign = 4096UL;
+        size_t alloc_size = (len + (kAlign - 1UL)) & ~(kAlign - 1UL);
+        char *tmp =
+            static_cast<char *>(ailego_aligned_malloc(alloc_size, kAlign));
+        if (!tmp) {
+          LOG_ERROR("read error (alloc bypass buffer failed).");
+          return 0;
+        }
+        if (!owner_->buffer_pool_handle_->read_range_bypass(abs_offset, len,
+                                                            tmp)) {
+          ailego_free(tmp);
+          LOG_ERROR("read error (bypass read failed).");
+          return 0;
+        }
+        data = MemoryBlock::MakeOwned(tmp, len);
+        return len;
+      }
       size_t first_page = abs_offset / ailego::kVectorPageSize;
       size_t last_page = (len == 0)
                              ? first_page
@@ -490,6 +515,14 @@ class BufferStorage : public IndexStorage {
     // O_DIRECT is always on for memory controllability.
     params.get(BUFFER_STORAGE_ENABLE_DIRECT_IO, &enable_direct_io_);
     params.get(BUFFER_STORAGE_ENABLE_IO_PROFILE, &enable_io_profile_);
+    params.get(BUFFER_STORAGE_READ_ADMISSION_POLICY,
+               &read_admission_policy_);
+    if (read_admission_policy_ != BUFFER_STORAGE_ADMISSION_CACHE &&
+        read_admission_policy_ != BUFFER_STORAGE_ADMISSION_BYPASS) {
+      LOG_ERROR("Invalid BufferStorage read admission policy: %s",
+                read_admission_policy_.c_str());
+      return IndexError_InvalidArgument;
+    }
     return 0;
   }
 
@@ -533,7 +566,12 @@ class BufferStorage : public IndexStorage {
       this->close_index();
       return ret;
     }
-    buffer_pool_->warmup();
+    bypass_reads_ = !create_if_missing &&
+                    read_admission_policy_ ==
+                        BUFFER_STORAGE_ADMISSION_BYPASS;
+    if (!bypass_reads_) {
+      buffer_pool_->warmup();
+    }
     LOG_INFO(
         "BufferStorage opened: file=%s, writable=%d, max_segment_size=%" PRIu64
         ", segment_count=%zu",
@@ -1550,6 +1588,8 @@ class BufferStorage : public IndexStorage {
   // buffered).  Defaults to true for memory controllability.
   bool enable_direct_io_{true};
   bool enable_io_profile_{false};
+  bool bypass_reads_{false};
+  std::string read_admission_policy_{BUFFER_STORAGE_ADMISSION_CACHE};
 
   // Per-header-chain file offsets used by flush_index() and append_segment().
   struct MetaChain {

@@ -147,6 +147,30 @@ class TestDbConfigMemoryLimitValidation:
         with pytest.raises(TypeError):
             zvec.init(memory_limit_mb=512.5)
 
+    @run_in_subprocess
+    def test_explicit_memory_partitions(self):
+        zvec.init(
+            memory_limit_mb=512,
+            rocksdb_block_cache_mb=64,
+            query_working_memory_mb=64,
+            resident_metadata_mb=128,
+            safety_reserve_mb=32,
+        )
+
+    @run_in_subprocess
+    def test_memory_partitions_cannot_exceed_total(self):
+        with pytest.raises(RuntimeError):
+            zvec.init(
+                memory_limit_mb=128,
+                resident_metadata_mb=96,
+                safety_reserve_mb=64,
+            )
+
+    @run_in_subprocess
+    def test_memory_partitions_reject_negative_values(self):
+        with pytest.raises(ValueError):
+            zvec.init(memory_limit_mb=128, safety_reserve_mb=-1)
+
 
 class TestDbConfigThreadValidation:
     @run_in_subprocess

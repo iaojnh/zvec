@@ -14,6 +14,8 @@
 
 #include "diskann_context.h"
 #include <chrono>
+#include <limits>
+#include <zvec/ailego/buffer/memory_budget.h>
 #include "diskann_params.h"
 #include "diskann_pq_table.h"
 #include "diskann_util.h"
@@ -27,10 +29,44 @@ DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
     : dc_(entity.get(), measure, meta.dimension()), entity_{entity} {}
 
 int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
-                         uint32_t pq_chunk_num, uint32_t element_size) {
+                         uint32_t pq_chunk_num, uint32_t element_size,
+                         uint32_t list_size) {
   type_ = type;
   element_size_ = element_size;
   pq_chunk_num_ = pq_chunk_num;
+  list_size_ = list_size;
+
+  if (type == kSearcherContext) {
+    // Account the stable per-context working set before allocating it. This
+    // includes the visit map, aligned query/PQ/I/O buffers and the two
+    // list-sized candidate containers used by graph search.
+    const uint64_t fixed_buffers =
+        static_cast<uint64_t>(element_size_) * 3 +
+        static_cast<uint64_t>(PQTable::kPQCentroidNum) * pq_chunk_num_ *
+            sizeof(float) +
+        static_cast<uint64_t>(graph_degree) * pq_chunk_num_ * sizeof(uint8_t) +
+        static_cast<uint64_t>(DiskAnnUtil::kMaxSectorReadNum) *
+            DiskAnnUtil::kSectorSize;
+    const uint64_t search_containers =
+        (static_cast<uint64_t>(list_size_) + 1) * sizeof(Neighbor) +
+        static_cast<uint64_t>(list_size_) * sizeof(Neighbor);
+    const uint64_t visit_map = entity_->doc_cnt();
+    if (fixed_buffers > std::numeric_limits<uint64_t>::max() -
+                            search_containers ||
+        fixed_buffers + search_containers >
+            std::numeric_limits<uint64_t>::max() - visit_map) {
+      return IndexError_NoMemory;
+    }
+    query_budget_bytes_ = fixed_buffers + search_containers + visit_map;
+    if (!ailego::MemoryBudgetManager::get_instance().try_charge(
+            ailego::MemoryBudgetManager::Category::QueryWorking,
+            query_budget_bytes_)) {
+      LOG_ERROR("DiskANN query working-memory budget exhausted: request=%llu",
+                static_cast<unsigned long long>(query_budget_bytes_));
+      query_budget_bytes_ = 0;
+      return IndexError_NoMemory;
+    }
+  }
 
   DiskAnnUtil::alloc_aligned((void **)&query_, element_size_, 32);
   DiskAnnUtil::alloc_aligned((void **)&query_rotated_, element_size_, 32);
@@ -88,15 +124,48 @@ DiskAnnContext::~DiskAnnContext() {
   free(pq_coord_buffer_);
   free(coord_buffer_);
   free(sector_buffer_);
+  visit_filter_.destroy();
 
   if (type_ == kSearcherContext) {
     destroy_io_ctx(io_ctx_);
   }
+  ailego::MemoryBudgetManager::get_instance().release(
+      ailego::MemoryBudgetManager::Category::QueryWorking,
+      query_budget_bytes_);
 }
 
 int DiskAnnContext::update(const ailego::Params &params) {
   uint32_t list_size = list_size_;
   params.get(PARAM_DISKANN_SEARCHER_LIST_SIZE, &list_size);
+  if (type_ == kSearcherContext && list_size != list_size_) {
+    const uint64_t old_container_bytes =
+        (static_cast<uint64_t>(list_size_) + 1) * sizeof(Neighbor) +
+        static_cast<uint64_t>(list_size_) * sizeof(Neighbor);
+    const uint64_t new_container_bytes =
+        (static_cast<uint64_t>(list_size) + 1) * sizeof(Neighbor) +
+        static_cast<uint64_t>(list_size) * sizeof(Neighbor);
+    auto &budget = ailego::MemoryBudgetManager::get_instance();
+    if (new_container_bytes > old_container_bytes) {
+      const uint64_t additional =
+          new_container_bytes - old_container_bytes;
+      if (!budget.try_charge(
+              ailego::MemoryBudgetManager::Category::QueryWorking,
+              additional)) {
+        LOG_ERROR(
+            "DiskANN query working-memory budget exhausted while updating "
+            "list_size: old=%u new=%u additional=%llu",
+            list_size_, list_size,
+            static_cast<unsigned long long>(additional));
+        return IndexError_NoMemory;
+      }
+      query_budget_bytes_ += additional;
+    } else {
+      const uint64_t released = old_container_bytes - new_container_bytes;
+      budget.release(ailego::MemoryBudgetManager::Category::QueryWorking,
+                     released);
+      query_budget_bytes_ -= released;
+    }
+  }
   list_size_ = list_size;
   return 0;
 }

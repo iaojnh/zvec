@@ -17,7 +17,9 @@
 // <zvec/ailego/io/libaio_loader.h> definitions) without colliding with the
 // DiskAnn reader's <ailego/io/libaio_loader.h> copy.
 #include "diskann_buffer_pool_shim.h"
+#include <algorithm>
 #include <cstring>
+#include <memory>
 #include <utility>
 #include <vector>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -31,6 +33,32 @@ int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
   if (pool == nullptr) {
     return kDiskAnnBufferPoolReadError;
   }
+
+  // DiskANN does not include VecBufferPool's profiling types in its reader
+  // translation unit because both stacks define libaio symbols. Install a
+  // local profile here so diagnostic runs still collect physical read counts.
+  // If a query-level profile is already bound, contribute to that instead.
+  std::unique_ptr<ailego::BufferPoolIoProfile> local_profile;
+  ailego::BufferPoolIoProfileBinding previous_binding;
+  const bool owns_profile =
+      pool->io_profile_enabled() &&
+      pool->current_thread_io_profile() == nullptr;
+  if (owns_profile) {
+    local_profile = std::make_unique<ailego::BufferPoolIoProfile>();
+    previous_binding = pool->bind_thread_io_profile(local_profile.get());
+  }
+  struct ProfileGuard {
+    ailego::VecBufferPool *pool;
+    ailego::BufferPoolIoProfile *profile;
+    ailego::BufferPoolIoProfileBinding previous;
+    bool active;
+
+    ~ProfileGuard() {
+      if (!active) return;
+      ailego::VecBufferPool::restore_thread_io_profile(previous);
+      pool->merge_io_profile(*profile);
+    }
+  } profile_guard{pool, local_profile.get(), previous_binding, owns_profile};
 
   const size_t page_size = ailego::kVectorPageSize;
 
@@ -83,6 +111,41 @@ int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
   }
 
   return kDiskAnnBufferPoolOk;
+}
+
+DiskAnnBufferPoolOverlapStats diskann_buffer_pool_manage_overlap(
+    ailego::VecBufferPool *pool, const uint64_t *page_ids, size_t count,
+    bool evict) {
+  DiskAnnBufferPoolOverlapStats stats;
+  if (pool == nullptr || page_ids == nullptr || count == 0) {
+    return stats;
+  }
+
+  std::vector<ailego::block_id_t> unique_pages;
+  unique_pages.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    unique_pages.push_back(
+        static_cast<ailego::block_id_t>(page_ids[i]));
+  }
+  std::sort(unique_pages.begin(), unique_pages.end());
+  unique_pages.erase(
+      std::unique(unique_pages.begin(), unique_pages.end()),
+      unique_pages.end());
+
+  stats.unique_pages = unique_pages.size();
+  for (ailego::block_id_t page_id : unique_pages) {
+    if (!pool->is_page_resident(page_id)) {
+      continue;
+    }
+    ++stats.resident_pages_before;
+    if (evict && pool->evict_page(page_id)) {
+      ++stats.evicted_pages;
+    }
+    if (pool->is_page_resident(page_id)) {
+      ++stats.resident_pages_after;
+    }
+  }
+  return stats;
 }
 
 }  // namespace core

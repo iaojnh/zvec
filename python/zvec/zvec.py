@@ -40,6 +40,10 @@ def init(
     brute_force_by_keys_ratio: Optional[float] = None,
     fts_brute_force_by_keys_ratio: Optional[float] = None,
     memory_limit_mb: Optional[int] = None,
+    rocksdb_block_cache_mb: Optional[int] = None,
+    query_working_memory_mb: Optional[int] = None,
+    resident_metadata_mb: Optional[int] = None,
+    safety_reserve_mb: Optional[int] = None,
     jieba_dict_dir: Optional[str] = None,
 ) -> None:
     """Initialize Zvec with configuration options.
@@ -101,6 +105,21 @@ def init(
             approaching this limit.
             If ``None``, inferred from cgroup memory limit * 0.8 (e.g., in Docker).
             Must be > 0 if provided.
+        rocksdb_block_cache_mb (Optional[int], optional):
+            Shared RocksDB block-cache partition in MB.
+        query_working_memory_mb (Optional[int], optional):
+            Maximum aggregate DiskANN query working memory in MB.
+        resident_metadata_mb (Optional[int], optional):
+            Maximum DiskANN resident PQ/key/entrypoint metadata in MB.
+        safety_reserve_mb (Optional[int], optional):
+            Memory held back from caches and query allocations in MB.
+            The sum of explicit partitions must not exceed
+            ``memory_limit_mb``. If any of these four partition options is
+            nonzero, explicit budgeting is enabled: an omitted or zero
+            RocksDB/query/resident partition has zero capacity, and the
+            remainder of ``memory_limit_mb`` is assigned to the shared
+            DiskANN node cache and VecBufferPool. If all four are omitted or
+            zero, legacy memory behavior is preserved.
         jieba_dict_dir (Optional[str], optional):
             Override the default directory containing ``jieba.dict.utf8`` and
             ``hmm_model.utf8`` for the jieba FTS tokenizer. When ``None``, the
@@ -177,6 +196,14 @@ def init(
         config_dict["fts_brute_force_by_keys_ratio"] = fts_brute_force_by_keys_ratio
     if memory_limit_mb is not None:
         config_dict["memory_limit_mb"] = memory_limit_mb
+    if rocksdb_block_cache_mb is not None:
+        config_dict["rocksdb_block_cache_mb"] = rocksdb_block_cache_mb
+    if query_working_memory_mb is not None:
+        config_dict["query_working_memory_mb"] = query_working_memory_mb
+    if resident_metadata_mb is not None:
+        config_dict["resident_metadata_mb"] = resident_metadata_mb
+    if safety_reserve_mb is not None:
+        config_dict["safety_reserve_mb"] = safety_reserve_mb
     if jieba_dict_dir is not None:
         config_dict["jieba_dict_dir"] = jieba_dict_dir
 

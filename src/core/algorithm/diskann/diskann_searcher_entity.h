@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <zvec/ailego/buffer/memory_budget.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_holder.h>
 #include "diskann_entity.h"
@@ -23,6 +24,19 @@ namespace zvec {
 namespace core {
 
 class DiskAnnSearcherEntity : public DiskAnnEntity {
+ private:
+  class ResidentBudgetToken {
+   public:
+    explicit ResidentBudgetToken(uint64_t bytes) : bytes_(bytes) {}
+    ~ResidentBudgetToken() {
+      ailego::MemoryBudgetManager::get_instance().release(
+          ailego::MemoryBudgetManager::Category::ResidentMetadata, bytes_);
+    }
+
+   private:
+    uint64_t bytes_;
+  };
+
  public:
   using Pointer = std::shared_ptr<DiskAnnSearcherEntity>;
   using SegmentPointer = IndexStorage::Segment::Pointer;
@@ -55,7 +69,30 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   }
 
   std::vector<diskann_id_t> &entrypoints() {
-    return entrypoints_;
+    return *entrypoints_;
+  }
+
+  uint64_t resident_bytes() const {
+    return (pq_table_ ? pq_table_->resident_bytes() : 0) +
+           static_cast<uint64_t>(key_buffer_->capacity()) +
+           static_cast<uint64_t>(key_mapping_buffer_->capacity()) +
+           static_cast<uint64_t>(entrypoints_->capacity()) *
+               sizeof(diskann_id_t);
+  }
+
+  int charge_resident_budget() {
+    if (resident_budget_) {
+      return 0;
+    }
+    const uint64_t bytes = resident_bytes();
+    if (!ailego::MemoryBudgetManager::get_instance().try_charge(
+            ailego::MemoryBudgetManager::Category::ResidentMetadata, bytes)) {
+      LOG_ERROR("DiskANN resident-metadata budget exhausted: request=%llu",
+                static_cast<unsigned long long>(bytes));
+      return IndexError_NoMemory;
+    }
+    resident_budget_ = std::make_shared<ResidentBudgetToken>(bytes);
+    return 0;
   }
 
   std::pair<uint32_t, const diskann_id_t *> get_neighbors(
@@ -75,8 +112,10 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
       const SegmentPointer &entrypoint_segment, uint32_t num_threads,
       uint32_t list_size, uint32_t cache_nodes_num, bool warm_up,
       uint32_t beam_size, const IndexMeta meta, PQTable::Pointer pq_table,
-      const std::string &key_buffer, const std::string &key_mapping_buffer,
-      const std::vector<diskann_id_t> &entrypoints)
+      const std::shared_ptr<std::string> &key_buffer,
+      const std::shared_ptr<std::string> &key_mapping_buffer,
+      const std::shared_ptr<std::vector<diskann_id_t>> &entrypoints,
+      const std::shared_ptr<ResidentBudgetToken> &resident_budget)
       : DiskAnnEntity(meta_header, pq_meta),
         meta_segment_(meta_segment),
         pq_meta_segment_(pq_meta_segment),
@@ -94,7 +133,8 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
         pq_table_{pq_table},
         key_buffer_{key_buffer},
         key_mapping_buffer_{key_mapping_buffer},
-        entrypoints_{entrypoints} {}
+        entrypoints_{entrypoints},
+        resident_budget_{resident_budget} {}
 
   IndexStorage::Pointer storage_{};
 
@@ -116,9 +156,12 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   IndexMeta meta_;
 
   PQTable::Pointer pq_table_;
-  std::string key_buffer_;
-  std::string key_mapping_buffer_;
-  std::vector<diskann_id_t> entrypoints_;
+  std::shared_ptr<std::string> key_buffer_{std::make_shared<std::string>()};
+  std::shared_ptr<std::string> key_mapping_buffer_{
+      std::make_shared<std::string>()};
+  std::shared_ptr<std::vector<diskann_id_t>> entrypoints_{
+      std::make_shared<std::vector<diskann_id_t>>()};
+  std::shared_ptr<ResidentBudgetToken> resident_budget_{};
 };
 
 }  // namespace core

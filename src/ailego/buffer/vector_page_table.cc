@@ -325,7 +325,8 @@ void VectorPageTable::release_block(block_id_t block_id) {
       block.owner_key = block_id;
       block.version = owner_version_;
       BlockEvictionQueue::get_instance().add_single_block(
-          block, static_cast<int>(e.evict_priority));
+          block, static_cast<int>(
+                     e.evict_priority.load(std::memory_order_relaxed)));
     }
   }
 }
@@ -362,7 +363,8 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
       block.owner_key = block_id;
       block.version = owner_version_;
       BlockEvictionQueue::get_instance().add_single_block(
-          block, static_cast<int>(e.evict_priority));
+          block, static_cast<int>(
+                     e.evict_priority.load(std::memory_order_relaxed)));
       return false;  // spared, not reclaimed
     }
     char *buffer = resident_entry_at(block_id).buffer.exchange(
@@ -398,7 +400,8 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
   block.owner_key = block_id;
   block.version = owner_version_;
   if (!BlockEvictionQueue::get_instance().add_single_block(
-          block, static_cast<int>(e.evict_priority))) {
+          block, static_cast<int>(
+                     e.evict_priority.load(std::memory_order_relaxed)))) {
     // Let release_block() retry registration when the last pin is dropped.
     e.in_evict_queue.store(false, std::memory_order_relaxed);
   }
@@ -444,7 +447,8 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
       block.owner_key = block_id;
       block.version = owner_version_;
       if (!BlockEvictionQueue::get_instance().add_single_block(
-              block, static_cast<int>(e.evict_priority))) {
+              block, static_cast<int>(
+                         e.evict_priority.load(std::memory_order_relaxed)))) {
         // The final release will take the rare fallback registration path.
         e.in_evict_queue.store(false, std::memory_order_relaxed);
       }
@@ -800,6 +804,56 @@ int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
   return 0;
 }
 
+bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
+                                      char *buffer) {
+  if (length == 0) {
+    return true;
+  }
+  if (buffer == nullptr || file_offset > file_size_ ||
+      length > file_size_ - file_offset) {
+    return false;
+  }
+
+  char *page = static_cast<char *>(
+      ailego_aligned_malloc(kVectorPageSize, kVectorPageSize));
+  if (page == nullptr) {
+    return false;
+  }
+
+  size_t copied = 0;
+  bool ok = true;
+  while (copied < length) {
+    const size_t absolute = file_offset + copied;
+    const size_t page_offset =
+        (absolute / kVectorPageSize) * kVectorPageSize;
+    const size_t within_page = absolute - page_offset;
+    const size_t copy_size =
+        std::min(length - copied, kVectorPageSize - within_page);
+    const size_t available = file_size_ - page_offset;
+    const size_t read_size =
+        direct_io_enabled_
+            ? kVectorPageSize
+            : std::min(kVectorPageSize, available);
+
+    const ssize_t read_bytes =
+        zvec_pread(fd_, page, read_size, page_offset);
+    if (read_bytes <= 0 ||
+        within_page + copy_size > static_cast<size_t>(read_bytes)) {
+      ok = false;
+      break;
+    }
+    std::memcpy(buffer + copied, page + within_page, copy_size);
+    copied += copy_size;
+  }
+  ailego_free(page);
+
+  if (ok) {
+    bypass_reads_.fetch_add(1, std::memory_order_relaxed);
+    bypass_bytes_.fetch_add(length, std::memory_order_relaxed);
+  }
+  return ok;
+}
+
 int VecBufferPool::write_range(size_t file_offset, size_t length,
                                const char *src) {
   if (!writable_) {
@@ -1132,6 +1186,11 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len,
   return true;
 }
 
+bool VecBufferPoolHandle::read_range_bypass(size_t file_offset, size_t len,
+                                            char *out) {
+  return pool_.read_range_bypass(file_offset, len, out);
+}
+
 int VecBufferPoolHandle::get_meta(size_t offset, size_t length, char *buffer) {
   return pool_.get_meta(offset, length, buffer);
 }
@@ -1183,10 +1242,17 @@ void VecBufferPool::warmup() {
     const size_t pages_in_chunk = std::min(kChunkPages, total_pages - base);
     const size_t read_bytes = pages_in_chunk * kVectorPageSize;
     const size_t file_offset = base * kVectorPageSize;
+    const size_t expected_bytes =
+        std::min(read_bytes, file_size_ - file_offset);
 
     // One large sequential pread instead of N individual ones.
     ssize_t got = zvec_pread(fd_, chunk_buf, read_bytes, file_offset);
-    if (got != static_cast<ssize_t>(read_bytes)) break;
+    if (got != static_cast<ssize_t>(expected_bytes)) break;
+    // The final page may extend past EOF. Keep its unread tail deterministic,
+    // matching the regular single-page load path.
+    if (expected_bytes < read_bytes) {
+      std::memset(chunk_buf + expected_bytes, 0, read_bytes - expected_bytes);
+    }
 
     // Distribute chunk data into individual page buffers.
     for (size_t j = 0; j < pages_in_chunk; ++j) {
@@ -1218,7 +1284,11 @@ void VecBufferPool::warmup() {
             loaded, total_pages, file_name_.c_str());
 }
 
-void VecBufferPool::prefetch_pages(block_id_t first_page, size_t page_count) {
+void VecBufferPool::prefetch_pages(block_id_t first_page, size_t page_count,
+                                   uint8_t priority) {
+  if (priority > kHighPriority) {
+    return;
+  }
   size_t end_page = first_page + page_count;
   if (end_page > page_table_.entry_num()) {
     end_page = page_table_.entry_num();
@@ -1227,7 +1297,7 @@ void VecBufferPool::prefetch_pages(block_id_t first_page, size_t page_count) {
 
 #if defined(__linux) || defined(__linux__)
   if (aio_enabled_) {
-    prefetch_pages_aio(first_page, end_page - first_page);
+    prefetch_pages_aio(first_page, end_page - first_page, priority);
     return;
   }
 #endif
@@ -1286,6 +1356,7 @@ void VecBufferPool::prefetch_pages(block_id_t first_page, size_t page_count) {
         }
       }
       std::memcpy(buf, chunk_buf + j * kVectorPageSize, kVectorPageSize);
+      page_table_.set_evict_priority(pid, priority);
       page_table_.set_block_acquired(pid, buf, file_off + j * kVectorPageSize);
       page_table_.release_block(pid);
     }
@@ -1294,12 +1365,13 @@ void VecBufferPool::prefetch_pages(block_id_t first_page, size_t page_count) {
   ailego_free(chunk_buf);
 }
 
-void VecBufferPoolHandle::prefetch_range(size_t file_offset, size_t len) {
+void VecBufferPoolHandle::prefetch_range(size_t file_offset, size_t len,
+                                         uint8_t priority) {
   if (len == 0) return;
   size_t first_page = file_offset / kVectorPageSize;
   size_t last_page = (file_offset + len - 1) / kVectorPageSize;
   pool_.prefetch_pages(static_cast<block_id_t>(first_page),
-                       last_page - first_page + 1);
+                       last_page - first_page + 1, priority);
 }
 
 #if defined(__linux) || defined(__linux__)
@@ -1338,7 +1410,8 @@ static thread_local ThreadLocalPrefetchAioCtx tl_prefetch_aio;
 
 void VecBufferPool::prefetch_pages_aio(
     [[maybe_unused]] block_id_t first_page,
-    [[maybe_unused]] size_t page_count) {
+    [[maybe_unused]] size_t page_count,
+    [[maybe_unused]] uint8_t priority) {
 #if defined(__linux) || defined(__linux__)
   static constexpr size_t kMaxBatch = 128;
 
@@ -1440,6 +1513,7 @@ void VecBufferPool::prefetch_pages_aio(
           MemoryLimitPool::get_instance().release_buffer(buffers[idx],
                                                         kVectorPageSize);
         } else {
+          page_table_.set_evict_priority(pid, priority);
           page_table_.set_block_acquired(pid, buffers[idx],
                                          pid * kVectorPageSize);
           page_table_.release_block(pid);
@@ -1762,12 +1836,15 @@ void VecBufferPool::log_stats() const {
   Stats s = stats();
   LOG_INFO(
       "VecBufferPool stats: file[%s] hit=%llu miss=%llu hit_rate=%.4f "
-      "evict=%llu second_chance=%llu dirty_flush=%llu",
+      "evict=%llu second_chance=%llu dirty_flush=%llu bypass_reads=%llu "
+      "bypass_bytes=%llu",
       file_name_.c_str(), static_cast<unsigned long long>(s.hit),
       static_cast<unsigned long long>(s.miss), s.hit_rate(),
       static_cast<unsigned long long>(s.evict),
       static_cast<unsigned long long>(s.second_chance),
-      static_cast<unsigned long long>(s.dirty_flush));
+      static_cast<unsigned long long>(s.dirty_flush),
+      static_cast<unsigned long long>(s.bypass_reads),
+      static_cast<unsigned long long>(s.bypass_bytes));
   if (io_profile_enabled_) {
     const BufferPoolIoProfile &p = s.io_profile;
     const double avg_batch =

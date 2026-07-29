@@ -17,6 +17,7 @@
 #include <zvec/core/interface/index.h>
 #include "algorithm/ivf/ivf_params.h"
 #include "holder_builder.h"
+#include "utility/utility_params.h"
 
 namespace zvec::core_interface {
 
@@ -92,6 +93,11 @@ int IVFIndex::Open(const std::string &file_path,
         LOG_ERROR("Failed to create BufferReadStorage (IVF buffer-pool)");
         return core::IndexError_Runtime;
       }
+      // IVF centroids and routing metadata are loaded into resident objects by
+      // the streamer. Avoid warming the entire inverted body: only lists
+      // selected by real queries should enter the page cache.
+      storage_params.set(core::BUFFER_READ_STORAGE_WARMUP_MODE,
+                         core::BUFFER_READ_STORAGE_WARMUP_NONE);
       int ret = storage_->init(storage_params);
       if (ret != 0) {
         LOG_ERROR(

@@ -163,6 +163,28 @@ TEST(IndexParamsTest, IVFIndexParams) {
   EXPECT_EQ(params.n_list(), 64);
 }
 
+TEST(IndexParamsTest, DiskAnnIndexParamsCacheBudget) {
+  constexpr uint64_t kBudgetBytes = 512ULL * 1024 * 1024;
+  DiskAnnIndexParams params(MetricType::L2, 48, 80, 16,
+                            QuantizeType::FP16, QuantizerParam(true),
+                            kBudgetBytes);
+
+  EXPECT_EQ(IndexType::DISKANN, params.type());
+  EXPECT_EQ(kBudgetBytes, params.cache_node_budget_bytes());
+  EXPECT_NE(std::string::npos,
+            params.to_string().find("cache_node_budget_bytes:536870912"));
+
+  auto cloned = params.clone();
+  auto *cloned_diskann =
+      dynamic_cast<DiskAnnIndexParams *>(cloned.get());
+  ASSERT_NE(nullptr, cloned_diskann);
+  EXPECT_EQ(kBudgetBytes, cloned_diskann->cache_node_budget_bytes());
+  EXPECT_EQ(params, *cloned_diskann);
+
+  cloned_diskann->set_cache_node_budget_bytes(kBudgetBytes / 2);
+  EXPECT_NE(params, *cloned_diskann);
+}
+
 TEST(IndexParamsTest, DefaultVectorIndexParams) {
   // Test default vector index params
   EXPECT_EQ(DefaultVectorIndexParams.type(), IndexType::FLAT);

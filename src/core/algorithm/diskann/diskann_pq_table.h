@@ -138,6 +138,15 @@ class PQTable {
     return pq_data_.data();
   }
 
+  uint64_t resident_bytes() const {
+    return static_cast<uint64_t>(full_pivot_data_.capacity()) +
+           static_cast<uint64_t>(transposed_tables_.capacity()) +
+           static_cast<uint64_t>(centroid_.capacity()) +
+           static_cast<uint64_t>(chunk_offsets_.capacity()) *
+               sizeof(uint32_t) +
+           static_cast<uint64_t>(pq_data_.capacity());
+  }
+
  private:
   std::vector<uint8_t> full_pivot_data_;
   std::vector<uint8_t> transposed_tables_;

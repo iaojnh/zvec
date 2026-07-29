@@ -60,7 +60,7 @@ class DiskAnnContext : public IndexContext,
  public:
   //! Init
   int init(ContextType type, uint32_t graph_degree, uint32_t pq_chunk_num,
-           uint32_t element_size);
+           uint32_t element_size, uint32_t list_size = 0);
 
   //! Update context, the context may be shared by different searcher/streamer
   int update_context(ContextType type, const IndexMeta &meta,
@@ -372,6 +372,7 @@ class DiskAnnContext : public IndexContext,
   VisitFilter visit_filter_{};
   uint32_t filter_mode_{VisitFilter::ByteMap};
   float negative_probility_{DiskAnnEntity::kDefaultBFNegativeProbility};
+  uint64_t query_budget_bytes_{0};
 };
 
 }  // namespace core

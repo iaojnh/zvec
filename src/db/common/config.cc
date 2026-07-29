@@ -33,6 +33,10 @@ static void ExitLogHandler() {
 GlobalConfig::ConfigData::ConfigData()
     : memory_limit_bytes(CgroupUtil::getMemoryLimit() *
                          DEFAULT_MEMORY_LIMIT_RATIO),
+      rocksdb_block_cache_bytes(0),
+      query_working_memory_bytes(0),
+      resident_metadata_bytes(0),
+      safety_reserve_bytes(0),
       log_config(std::make_shared<ConsoleLogConfig>()),
       query_thread_count(CgroupUtil::getCpuLimit()),
       invert_to_forward_scan_ratio(0.9),
@@ -50,6 +54,18 @@ Status GlobalConfig::Validate(const ConfigData &config) const {
   if (config.memory_limit_bytes > CgroupUtil::getMemoryLimit()) {
     return Status::InvalidArgument("memory_limit_bytes must be less than ",
                                    CgroupUtil::getMemoryLimit());
+  }
+
+  uint64_t reserved = 0;
+  const uint64_t partitions[] = {
+      config.rocksdb_block_cache_bytes, config.query_working_memory_bytes,
+      config.resident_metadata_bytes, config.safety_reserve_bytes};
+  for (uint64_t bytes : partitions) {
+    if (bytes > config.memory_limit_bytes - reserved) {
+      return Status::InvalidArgument(
+          "memory budget partitions must not exceed memory_limit_bytes");
+    }
+    reserved += bytes;
   }
 
   // Validate query thread count

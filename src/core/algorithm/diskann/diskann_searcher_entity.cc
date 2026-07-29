@@ -64,7 +64,8 @@ const DiskAnnEntity::Pointer DiskAnnSearcherEntity::clone() const {
       meta_header_, pq_meta_, meta_segment, pq_meta_segment, pq_data_segment,
       vector_segment, key_segment, key_mapping_segment, entrypoint_segment,
       num_threads_, list_size_, cache_nodes_num_, warm_up_, beam_size_, meta_,
-      pq_table_, key_buffer_, key_mapping_buffer_, entrypoints_);
+      pq_table_, key_buffer_, key_mapping_buffer_, entrypoints_,
+      resident_budget_);
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("DiskAnnSearcherEntity new failed");
   }
@@ -276,8 +277,8 @@ int DiskAnnSearcherEntity::load_key_segment() {
     return IndexError_ReadData;
   }
 
-  key_buffer_.resize(key_data_len);
-  memcpy(&(key_buffer_[0]), data, key_data_len);
+  key_buffer_->resize(key_data_len);
+  memcpy(&((*key_buffer_)[0]), data, key_data_len);
 
   return 0;
 }
@@ -311,8 +312,8 @@ int DiskAnnSearcherEntity::load_entrypoint_segment() {
       return IndexError_ReadData;
     }
 
-    entrypoints_.resize(entrypoint_cnt);
-    memcpy(&(entrypoints_[0]), data, entrypoint_data_len);
+    entrypoints_->resize(entrypoint_cnt);
+    memcpy(&((*entrypoints_)[0]), data, entrypoint_data_len);
   }
 
   return 0;
@@ -337,8 +338,8 @@ int DiskAnnSearcherEntity::load_key_mapping_segment() {
     return IndexError_ReadData;
   }
 
-  key_mapping_buffer_.resize(key_mapping_data_len);
-  memcpy(&(key_mapping_buffer_[0]), data, key_mapping_data_len);
+  key_mapping_buffer_->resize(key_mapping_data_len);
+  memcpy(&((*key_mapping_buffer_)[0]), data, key_mapping_data_len);
 
   return 0;
 }
@@ -346,10 +347,10 @@ int DiskAnnSearcherEntity::load_key_mapping_segment() {
 //! Get vector local id by key
 diskann_id_t DiskAnnSearcherEntity::get_id(diskann_key_t key) const {
   const diskann_id_t *key_mapping_data_ptr =
-      reinterpret_cast<const diskann_id_t *>(key_mapping_buffer_.data());
+      reinterpret_cast<const diskann_id_t *>(key_mapping_buffer_->data());
 
   const diskann_key_t *key_data_ptr =
-      reinterpret_cast<const diskann_key_t *>(key_buffer_.data());
+      reinterpret_cast<const diskann_key_t *>(key_buffer_->data());
 
   //! Do binary search
   diskann_id_t start = 0UL;
@@ -375,7 +376,7 @@ diskann_id_t DiskAnnSearcherEntity::get_id(diskann_key_t key) const {
 
 diskann_key_t DiskAnnSearcherEntity::get_key(diskann_id_t id) const {
   const diskann_key_t *key_data_ptr =
-      reinterpret_cast<const diskann_key_t *>(key_buffer_.data());
+      reinterpret_cast<const diskann_key_t *>(key_buffer_->data());
 
   return key_data_ptr[id];
 }

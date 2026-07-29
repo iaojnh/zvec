@@ -23,6 +23,7 @@ from zvec import (
     AddColumnOption,
     AlterColumnOption,
     CollectionOption,
+    DiskAnnIndexParam,
     FlatIndexParam,
     HnswIndexParam,
     IndexOption,
@@ -177,6 +178,25 @@ class TestIVFIndexParam:
             match_pattern = r"can't set attribute"
         with pytest.raises(AttributeError, match=match_pattern):
             setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# DiskANN Index Param Test Case
+# ----------------------------
+class TestDiskAnnIndexParam:
+    def test_cache_node_budget(self):
+        import pickle
+
+        param = DiskAnnIndexParam(cache_node_budget_bytes=512 * 1024 * 1024)
+        assert param.cache_node_budget_bytes == 512 * 1024 * 1024
+        assert param.to_dict()["cache_node_budget_bytes"] == 512 * 1024 * 1024
+        assert "cache_node_budget_bytes" in repr(param)
+
+        restored = pickle.loads(pickle.dumps(param))
+        assert restored.cache_node_budget_bytes == 512 * 1024 * 1024
+
+    def test_cache_node_budget_default(self):
+        assert DiskAnnIndexParam().cache_node_budget_bytes == 0
 
 
 # ----------------------------

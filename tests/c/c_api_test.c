@@ -228,6 +228,18 @@ void test_zvec_config() {
     TEST_ASSERT(err == ZVEC_OK);
     TEST_ASSERT(zvec_config_data_get_memory_limit(config_data) ==
                 1024 * 1024 * 1024);
+    TEST_ASSERT(zvec_config_data_set_rocksdb_block_cache(config_data, 64) ==
+                ZVEC_OK);
+    TEST_ASSERT(zvec_config_data_get_rocksdb_block_cache(config_data) == 64);
+    TEST_ASSERT(zvec_config_data_set_query_working_memory(config_data, 128) ==
+                ZVEC_OK);
+    TEST_ASSERT(zvec_config_data_get_query_working_memory(config_data) == 128);
+    TEST_ASSERT(zvec_config_data_set_resident_metadata(config_data, 256) ==
+                ZVEC_OK);
+    TEST_ASSERT(zvec_config_data_get_resident_metadata(config_data) == 256);
+    TEST_ASSERT(zvec_config_data_set_safety_reserve(config_data, 32) ==
+                ZVEC_OK);
+    TEST_ASSERT(zvec_config_data_get_safety_reserve(config_data) == 32);
 
     // Test thread count settings
     err = zvec_config_data_set_query_thread_count(config_data, 8);
@@ -256,6 +268,14 @@ void test_zvec_config() {
   // Test NULL pointer handling
   zvec_error_code_t err = zvec_config_data_set_memory_limit(NULL, 1024);
   TEST_ASSERT(err == ZVEC_ERROR_INVALID_ARGUMENT);
+  TEST_ASSERT(zvec_config_data_set_rocksdb_block_cache(NULL, 1) ==
+              ZVEC_ERROR_INVALID_ARGUMENT);
+  TEST_ASSERT(zvec_config_data_set_query_working_memory(NULL, 1) ==
+              ZVEC_ERROR_INVALID_ARGUMENT);
+  TEST_ASSERT(zvec_config_data_set_resident_metadata(NULL, 1) ==
+              ZVEC_ERROR_INVALID_ARGUMENT);
+  TEST_ASSERT(zvec_config_data_set_safety_reserve(NULL, 1) ==
+              ZVEC_ERROR_INVALID_ARGUMENT);
 
   err = zvec_config_data_set_log_config(NULL, NULL);
   TEST_ASSERT(err == ZVEC_ERROR_INVALID_ARGUMENT);
@@ -6184,11 +6204,14 @@ void test_diskann_index_params_functions(void) {
   TEST_ASSERT(params != NULL);
   TEST_ASSERT(zvec_index_params_get_type(params) == ZVEC_INDEX_TYPE_DISKANN);
 
-  // Check defaults: max_degree=100, list_size=50, pq_chunk_num=0
+  // Check defaults: max_degree=100, list_size=50, pq_chunk_num=0,
+  // cache_node_budget_bytes=0
   // (aligned with DiskAnnIndexParams constructor defaults)
   TEST_ASSERT(zvec_index_params_get_diskann_max_degree(params) == 100);
   TEST_ASSERT(zvec_index_params_get_diskann_list_size(params) == 50);
   TEST_ASSERT(zvec_index_params_get_diskann_pq_chunk_num(params) == 0);
+  TEST_ASSERT(
+      zvec_index_params_get_diskann_cache_node_budget_bytes(params) == 0);
 
   // Default metric type is L2
   TEST_ASSERT(zvec_index_params_get_metric_type(params) == ZVEC_METRIC_TYPE_L2);
@@ -6204,11 +6227,19 @@ void test_diskann_index_params_functions(void) {
   TEST_ASSERT(zvec_index_params_get_diskann_max_degree(params) == 200);
   TEST_ASSERT(zvec_index_params_get_diskann_list_size(params) == 100);
   TEST_ASSERT(zvec_index_params_get_diskann_pq_chunk_num(params) == 8);
+  err = zvec_index_params_set_diskann_cache_node_budget_bytes(
+      params, UINT64_C(536870912));
+  TEST_ASSERT(err == ZVEC_OK);
+  TEST_ASSERT(
+      zvec_index_params_get_diskann_cache_node_budget_bytes(params) ==
+      UINT64_C(536870912));
 
   // Type-mismatch error path: HNSW params must not accept DiskANN setter
   zvec_index_params_t *hnsw = zvec_index_params_create(ZVEC_INDEX_TYPE_HNSW);
   TEST_ASSERT(hnsw != NULL);
   err = zvec_index_params_set_diskann_params(hnsw, 100, 50, 0);
+  TEST_ASSERT(err == ZVEC_ERROR_INVALID_ARGUMENT);
+  err = zvec_index_params_set_diskann_cache_node_budget_bytes(hnsw, 1024);
   TEST_ASSERT(err == ZVEC_ERROR_INVALID_ARGUMENT);
   zvec_index_params_destroy(hnsw);
 
@@ -6218,6 +6249,10 @@ void test_diskann_index_params_functions(void) {
   TEST_ASSERT(zvec_index_params_get_diskann_max_degree(NULL) == 0);
   TEST_ASSERT(zvec_index_params_get_diskann_list_size(NULL) == 0);
   TEST_ASSERT(zvec_index_params_get_diskann_pq_chunk_num(NULL) == 0);
+  err = zvec_index_params_set_diskann_cache_node_budget_bytes(NULL, 1024);
+  TEST_ASSERT(err == ZVEC_ERROR_INVALID_ARGUMENT);
+  TEST_ASSERT(
+      zvec_index_params_get_diskann_cache_node_budget_bytes(NULL) == 0);
 
   // to_string should report DiskANN
   const char *type_str = zvec_index_type_to_string(ZVEC_INDEX_TYPE_DISKANN);

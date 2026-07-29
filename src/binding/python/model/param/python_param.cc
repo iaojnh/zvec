@@ -1075,6 +1075,9 @@ Attributes:
     pq_chunk_num (int): Number of PQ chunks used for product-quantizing the
         in-memory compressed vectors. ``0`` means auto-pick based on dimension.
         Clamped to the range [1, 1024]. Default is 0.
+    cache_node_budget_bytes (int): Maximum nominal memory budget for the
+        DiskANN static node cache. ``0`` disables the static node cache.
+        Default is 0.
     quantize_type (QuantizeType): Optional quantization type for vector
         compression (e.g., FP16, INT8). Default is ``QuantizeType.UNDEFINED``.
 
@@ -1085,6 +1088,7 @@ Examples:
     ...     max_degree=100,
     ...     list_size=50,
     ...     pq_chunk_num=8,
+    ...     cache_node_budget_bytes=536870912,
     ...     quantize_type=QuantizeType.FP16
     ... )
     >>> print(params.max_degree)
@@ -1093,15 +1097,17 @@ Examples:
   diskann_params
       .def(py::init([](MetricType metric_type, int max_degree, int list_size,
                        int pq_chunk_num, QuantizeType quantize_type,
-                       QuantizerParam quantizer_param) {
+                       QuantizerParam quantizer_param,
+                       uint64_t cache_node_budget_bytes) {
              return std::make_shared<DiskAnnIndexParams>(
                  metric_type, max_degree, list_size, pq_chunk_num,
-                 quantize_type, quantizer_param);
+                 quantize_type, quantizer_param, cache_node_budget_bytes);
            }),
            py::arg("metric_type") = MetricType::IP, py::arg("max_degree") = 100,
            py::arg("list_size") = 50, py::arg("pq_chunk_num") = 0,
            py::arg("quantize_type") = QuantizeType::UNDEFINED,
            py::arg("quantizer_param") = QuantizerParam(),
+           py::arg("cache_node_budget_bytes") = 0,
            R"pbdoc(
 Constructs an DiskAnnIndexParams instance.
 
@@ -1118,6 +1124,8 @@ Args:
         Defaults to QuantizeType.UNDEFINED.
     quantizer_param (QuantizerParam, optional): Quantizer configuration.
         Defaults to QuantizerParam().
+    cache_node_budget_bytes (int, optional): Maximum nominal memory budget for
+        the static node cache. ``0`` disables it. Defaults to 0.
 )pbdoc")
       .def_property_readonly("max_degree", &DiskAnnIndexParams::max_degree,
                              "int: max node degree.")
@@ -1129,6 +1137,10 @@ Args:
             return self.pq_chunk_num();
           },
           "int: chunk num of production quantization.")
+      .def_property_readonly(
+          "cache_node_budget_bytes",
+          &DiskAnnIndexParams::cache_node_budget_bytes,
+          "int: nominal byte budget for the static node cache.")
       .def(
           "to_dict",
           [](const DiskAnnIndexParams &self) -> py::dict {
@@ -1138,6 +1150,8 @@ Args:
             dict["max_degree"] = self.max_degree();
             dict["list_size"] = self.list_size();
             dict["pq_chunk_num"] = self.pq_chunk_num();
+            dict["cache_node_budget_bytes"] =
+                self.cache_node_budget_bytes();
             dict["quantize_type"] =
                 quantize_type_to_string(self.quantize_type());
             py::dict qp_dict;
@@ -1155,6 +1169,8 @@ Args:
                    ", \"max_degree\":" + std::to_string(self.max_degree()) +
                    ", \"list_size\":" + std::to_string(self.list_size()) +
                    ", \"pq_chunk_num\":" + std::to_string(self.pq_chunk_num()) +
+                   ", \"cache_node_budget_bytes\":" +
+                   std::to_string(self.cache_node_budget_bytes()) +
                    ", \"quantize_type\":" +
                    quantize_type_to_string(self.quantize_type()) +
                    ", \"quantizer_param\":{" + "\"enable_rotate\":" +
@@ -1166,15 +1182,19 @@ Args:
             return py::make_tuple(self.metric_type(), self.max_degree(),
                                   self.list_size(), self.pq_chunk_num(),
                                   self.quantize_type(),
-                                  self.quantizer_param().enable_rotate());
+                                  self.quantizer_param().enable_rotate(),
+                                  self.cache_node_budget_bytes());
           },
           [](py::tuple t) {
-            if (t.size() != 5 && t.size() != 6)
+            if (t.size() != 5 && t.size() != 6 && t.size() != 7)
               throw std::runtime_error("Invalid state for DiskAnnIndexParams");
             QuantizerParam qp(t.size() >= 6 ? t[5].cast<bool>() : false);
+            uint64_t cache_node_budget_bytes =
+                t.size() >= 7 ? t[6].cast<uint64_t>() : 0;
             return std::make_shared<DiskAnnIndexParams>(
                 t[0].cast<MetricType>(), t[1].cast<int>(), t[2].cast<int>(),
-                t[3].cast<int>(), t[4].cast<QuantizeType>(), qp);
+                t[3].cast<int>(), t[4].cast<QuantizeType>(), qp,
+                cache_node_budget_bytes);
           }));
 }
 

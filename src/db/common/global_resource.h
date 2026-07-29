@@ -17,6 +17,10 @@
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/pattern/singleton.h>
 
+namespace rocksdb {
+class Cache;
+}
+
 namespace zvec {
 
 class GlobalResource : public ailego::Singleton<GlobalResource> {
@@ -33,9 +37,15 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
     return optimize_thread_pool_.get();
   }
 
+  std::shared_ptr<rocksdb::Cache> rocksdb_block_cache() {
+    initialize();
+    return rocksdb_block_cache_;
+  }
+
  private:
   std::unique_ptr<ailego::ThreadPool> query_thread_pool_;
   std::unique_ptr<ailego::ThreadPool> optimize_thread_pool_;
+  std::shared_ptr<rocksdb::Cache> rocksdb_block_cache_;
 };
 
 }  // namespace zvec

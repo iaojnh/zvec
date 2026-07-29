@@ -18,6 +18,7 @@
 #include <iostream>
 #include <mutex>
 #include <ailego/parallel/lock.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/hash/crc32c.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/parallel/thread_pool.h>
@@ -1948,6 +1949,16 @@ int main(int argc, char *argv[]) {
   string container_type = config_common["ContainerType"]
                               ? config_common["ContainerType"].as<string>()
                               : "MMapFileStorage";
+  if (container_type == "BufferReadStorage") {
+    const auto pool_size_node = config_common["BufferPoolSizeBytes"];
+    if (!pool_size_node || pool_size_node.as<uint64_t>() == 0) {
+      cerr << "BufferPoolSizeBytes must be set to a positive value when "
+              "ContainerType is BufferReadStorage"
+           << endl;
+      return -1;
+    }
+    MemoryLimitPool::get_instance().init(pool_size_node.as<uint64_t>());
+  }
 
   string ground_truth_file = "";
   string ground_truth_first_sep = ";";

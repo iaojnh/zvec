@@ -14,7 +14,10 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <unordered_set>
 #include <zvec/core/framework/index_framework.h>
+#include "diskann_cache_budget.h"
 #include "diskann_context.h"
 #include "diskann_file_reader.h"
 #include "diskann_pq_table.h"
@@ -34,10 +37,43 @@ class DiskAnnIndexer {
 
  public:
   int init(DiskAnnSearcherEntity &entity);
+  int reserve_cache_memory(uint64_t node_count);
   int load_cache_list(const std::vector<diskann_id_t> &node_list);
+  void manage_cache_page_overlap(
+      const std::vector<diskann_id_t> &node_list, bool evict);
+  int configure_cache(uint32_t cache_node_num,
+                      uint64_t cache_node_budget_bytes,
+                      const std::string &cache_node_list_path,
+                      const std::string &cache_node_page_policy,
+                      const std::string &warmup_mode,
+                      uint32_t warmup_node_num);
+  int load_node_list(const std::string &path, uint32_t node_limit,
+                     std::vector<diskann_id_t> &node_list) const;
+  void warmup_node_pages(
+      const std::vector<diskann_id_t> &node_list,
+      const std::unordered_set<diskann_id_t> &excluded_nodes = {});
 
   void cache_bfs_levels(uint64_t num_nodes_to_cache,
-                        std::vector<diskann_id_t> &node_list);
+                        std::vector<diskann_id_t> &node_list,
+                        bool enforce_legacy_ten_percent_cap = true);
+
+  uint32_t cache_node_count_for_budget(uint64_t budget_bytes) const {
+    return DiskAnnCacheBudget::ResolveNodeCount(
+        budget_bytes, doc_cnt_,
+        DiskAnnCacheBudget::EstimatedBytesPerNode(meta_, max_degree_));
+  }
+
+  uint64_t cache_payload_bytes_per_node() const {
+    return DiskAnnCacheBudget::PayloadBytesPerNode(meta_, max_degree_);
+  }
+
+  uint64_t cache_estimated_bytes_per_node() const {
+    return DiskAnnCacheBudget::EstimatedBytesPerNode(meta_, max_degree_);
+  }
+
+  uint64_t allocated_cache_payload_bytes() const {
+    return allocated_cache_payload_bytes_;
+  }
 
   int cached_beam_search(DiskAnnContext *ctx);
   int cached_beam_search_by_group(DiskAnnContext *ctx);
@@ -71,6 +107,7 @@ class DiskAnnIndexer {
   DiskAnnSearcherEntity *entity_;
 
   IndexStorage::Pointer storage_{};
+  ailego::VecBufferPool *buffer_pool_{nullptr};
   IndexMeta meta_;
 
   uint32_t max_degree_{0};
@@ -103,6 +140,8 @@ class DiskAnnIndexer {
   uint32_t io_limit_{std::numeric_limits<uint32_t>::max()};
 
   uint64_t doc_cnt_{0};
+  uint64_t allocated_cache_payload_bytes_{0};
+  uint64_t cache_memory_charge_bytes_{0};
 };
 
 }  // namespace core

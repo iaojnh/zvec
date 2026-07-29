@@ -24,6 +24,7 @@
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_helper.h>
+#include "utility/utility_params.h"
 
 using namespace zvec;
 using namespace zvec::core;
@@ -79,6 +80,56 @@ TEST_F(BufferStorageWriteTest, IoProfileParamReachesBufferPool) {
   ASSERT_NE(storage->vec_buffer_pool(), nullptr);
   EXPECT_TRUE(storage->vec_buffer_pool()->io_profile_enabled());
   EXPECT_EQ(storage->close(), 0);
+}
+
+TEST_F(BufferStorageWriteTest, RejectsUnknownReadAdmissionPolicy) {
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ailego::Params params;
+  params.set(BUFFER_STORAGE_READ_ADMISSION_POLICY, "unknown");
+  EXPECT_EQ(IndexError_InvalidArgument, storage->init(params));
+}
+
+TEST_F(BufferStorageWriteTest, BypassPolicySkipsWarmupAndPageAdmission) {
+  {
+    auto storage = OpenWritable();
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->append("seg1", 4096));
+    auto segment = storage->get("seg1");
+    ASSERT_TRUE(segment);
+    std::string data(4096, 'b');
+    ASSERT_EQ(data.size(), segment->write(0, data.data(), data.size()));
+    ASSERT_EQ(0, storage->close());
+  }
+
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ailego::Params params;
+  params.set(BUFFER_STORAGE_READ_ADMISSION_POLICY,
+             BUFFER_STORAGE_ADMISSION_BYPASS);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(file_path_, false));
+
+  auto *pool = storage->vec_buffer_pool();
+  ASSERT_NE(pool, nullptr);
+  EXPECT_EQ(0u, pool->stats().miss);
+
+  auto segment = storage->get("seg1");
+  ASSERT_TRUE(segment);
+  std::string actual(4096, '\0');
+  ASSERT_EQ(actual.size(),
+            segment->fetch(0, actual.data(), actual.size()));
+  EXPECT_EQ(std::string(4096, 'b'), actual);
+  EXPECT_EQ(0u, pool->stats().miss);
+  EXPECT_EQ(1u, pool->stats().bypass_reads);
+  EXPECT_EQ(actual.size(), pool->stats().bypass_bytes);
+
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(actual.size(), segment->read(0, block, actual.size()));
+  ASSERT_NE(nullptr, block.data());
+  EXPECT_EQ(0, std::memcmp(block.data(), actual.data(), actual.size()));
+  EXPECT_EQ(0u, pool->stats().miss);
+  EXPECT_EQ(2u, pool->stats().bypass_reads);
 }
 
 // Test: Create new index via BufferStorage, append segment, write data, read back

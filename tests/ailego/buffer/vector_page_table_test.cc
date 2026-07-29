@@ -29,6 +29,7 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_budget.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 
 using namespace zvec::ailego;
@@ -149,6 +150,114 @@ TEST_F(BufferPoolTest, StaleOwnerGenerationIsDead) {
 
   EXPECT_TRUE(table.is_dead_block(/*block_id=*/0, /*stale version=*/0));
   EXPECT_TRUE(table.force_evict_block(/*block_id=*/0));
+}
+
+TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
+  auto &memory_pool = MemoryLimitPool::get_instance();
+  InitPool(/*capacity_pages=*/4);
+
+  ASSERT_TRUE(
+      memory_pool.try_charge_external(3 * kVectorPageSize));
+  EXPECT_EQ(3 * kVectorPageSize, memory_pool.used());
+
+  char *page = nullptr;
+  ASSERT_TRUE(memory_pool.try_acquire_buffer(kVectorPageSize, page));
+  ASSERT_NE(nullptr, page);
+  EXPECT_FALSE(memory_pool.try_charge_external(1));
+
+  memory_pool.release_buffer(page, kVectorPageSize);
+  memory_pool.release_external(3 * kVectorPageSize);
+  EXPECT_EQ(0u, memory_pool.used());
+}
+
+TEST_F(BufferPoolTest, LargeExternalReservationReclaimsMultipleBatches) {
+  constexpr size_t kCapacityPages = 512;
+  constexpr size_t kExternalPages = 400;
+  auto &memory_pool = MemoryLimitPool::get_instance();
+  InitPool(kCapacityPages);
+  std::string file = NewFile(kCapacityPages);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+  std::vector<char> data(kVectorPageSize);
+  for (size_t page = 0; page < kCapacityPages; ++page) {
+    ASSERT_TRUE(handle.read_range(
+        page * kVectorPageSize, kVectorPageSize, data.data()));
+  }
+
+  ASSERT_TRUE(memory_pool.try_charge_external(
+      kExternalPages * kVectorPageSize));
+  EXPECT_LE(memory_pool.used(), memory_pool.capacity());
+  memory_pool.release_external(kExternalPages * kVectorPageSize);
+}
+
+TEST_F(BufferPoolTest, PriorityChangeMigratesQueuedPageBeforeEviction) {
+  InitPool(/*capacity_pages=*/4);
+  std::string file = NewFile(/*num_pages=*/2);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+  std::vector<char> data(kVectorPageSize);
+  ASSERT_TRUE(handle.read_range(0, kVectorPageSize, data.data()));
+  ASSERT_TRUE(handle.read_range(kVectorPageSize, kVectorPageSize,
+                                data.data()));
+
+  ASSERT_TRUE(pool.set_page_priority(0, VecBufferPool::kHighPriority));
+  ASSERT_TRUE(pool.set_page_priority(1, VecBufferPool::kLowPriority));
+  ASSERT_EQ(1u, BlockEvictionQueue::get_instance().batch_recycle(1));
+
+  EXPECT_TRUE(pool.is_page_resident(0));
+  EXPECT_FALSE(pool.is_page_resident(1));
+}
+
+TEST_F(BufferPoolTest, BypassReadDoesNotAdmitPage) {
+  InitPool(/*capacity_pages=*/2);
+  std::string file = NewFile(/*num_pages=*/4);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+  std::vector<char> data(kVectorPageSize);
+  ASSERT_TRUE(handle.read_range_bypass(
+      kVectorPageSize, kVectorPageSize, data.data()));
+
+  ExpectPageContent(data.data(), 1);
+  EXPECT_FALSE(pool.is_page_resident(1));
+  auto stats = pool.stats();
+  EXPECT_EQ(1u, stats.bypass_reads);
+  EXPECT_EQ(kVectorPageSize, stats.bypass_bytes);
+  EXPECT_EQ(0u, stats.miss);
+}
+
+TEST_F(BufferPoolTest, UnifiedMemoryBudgetEnforcesExplicitPartitions) {
+  auto &budget = MemoryBudgetManager::get_instance();
+  MemoryBudgetManager::Config config;
+  config.total_bytes = 1000;
+  config.enforce_accounting = true;
+  config.buffer_cache_bytes = 500;
+  config.rocksdb_block_cache_bytes = 200;
+  config.query_working_bytes = 150;
+  config.resident_metadata_bytes = 100;
+  config.safety_reserve_bytes = 50;
+  ASSERT_TRUE(budget.configure(config));
+
+  EXPECT_TRUE(budget.try_charge(
+      MemoryBudgetManager::Category::QueryWorking, 100));
+  EXPECT_FALSE(budget.try_charge(
+      MemoryBudgetManager::Category::QueryWorking, 51));
+  EXPECT_TRUE(budget.try_charge(
+      MemoryBudgetManager::Category::ResidentMetadata, 80));
+  EXPECT_FALSE(budget.try_charge(
+      MemoryBudgetManager::Category::ResidentMetadata, 21));
+
+  budget.release(MemoryBudgetManager::Category::QueryWorking, 100);
+  budget.release(MemoryBudgetManager::Category::ResidentMetadata, 80);
+  auto snapshot = budget.snapshot();
+  EXPECT_EQ(0u, snapshot.query_working_used);
+  EXPECT_EQ(0u, snapshot.resident_metadata_used);
+  EXPECT_EQ(500u, snapshot.config.buffer_cache_bytes);
 }
 
 // Scattered acquisition is storage-level functionality: it preserves caller

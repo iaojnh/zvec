@@ -19,6 +19,26 @@ set(SRC_LISTS
 
 pybind11_add_module(_zvec ${SRC_LISTS})
 
+set(_zvec_whole_archive_libs
+        core_knn_flat_static
+        core_knn_flat_sparse_static
+        core_knn_hnsw_static
+        core_knn_hnsw_rabitq_static
+        core_knn_hnsw_sparse_static
+        core_knn_ivf_static
+        core_knn_vamana_static
+        core_knn_cluster_static
+        core_knn_diskann_static
+        core_mix_reducer_static
+        core_metric_static
+        core_utility_static
+        core_quantizer_static
+)
+# TARGET_FILE inside a raw linker option does not establish a build-order
+# dependency on all generators/platforms. A clean `_zvec`-only build must
+# create these archives before the final whole-archive/force-load link.
+add_dependencies(_zvec ${_zvec_whole_archive_libs})
+
 # Ensure any change to the linker version script (exports.map) triggers a
 # re-link of _zvec.so. target_link_options() alone is a command-line flag
 # and does not register the script file as a build dependency, so stale
@@ -80,20 +100,6 @@ elseif (APPLE)
             -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/exports.mac
     )
 elseif (MSVC)
-    set(_zvec_whole_archive_libs
-            core_knn_flat_static
-            core_knn_flat_sparse_static
-            core_knn_hnsw_static
-            core_knn_hnsw_sparse_static
-            core_knn_ivf_static
-            core_knn_vamana_static
-            core_knn_cluster_static
-            core_knn_diskann_static
-            core_mix_reducer_static
-            core_metric_static
-            core_utility_static
-            core_quantizer_static
-    )
     target_link_libraries(_zvec PRIVATE
             ${_zvec_whole_archive_libs}
             zvec

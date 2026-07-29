@@ -285,6 +285,13 @@ class BufferReadStorage : public IndexStorage {
     params.get(BUFFER_READ_STORAGE_FOOTER_OFFSET, &footer_offset_);
     params.get(BUFFER_READ_STORAGE_ENABLE_DIRECT_IO, &enable_direct_io_);
     params.get(BUFFER_READ_STORAGE_ENABLE_IO_PROFILE, &enable_io_profile_);
+    params.get(BUFFER_READ_STORAGE_WARMUP_MODE, &warmup_mode_);
+    if (warmup_mode_ != BUFFER_READ_STORAGE_WARMUP_NONE &&
+        warmup_mode_ != BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL) {
+      LOG_ERROR("Invalid BufferReadStorage warmup mode: %s",
+                warmup_mode_.c_str());
+      return IndexError_InvalidArgument;
+    }
     return 0;
   }
 
@@ -366,7 +373,9 @@ class BufferReadStorage : public IndexStorage {
       LOG_ERROR("Failed to init VecBufferPool, path: %s", path.c_str());
       return IndexError_Runtime;
     }
-    buffer_pool_->warmup();
+    if (warmup_mode_ == BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL) {
+      buffer_pool_->warmup();
+    }
     return 0;
   }
 
@@ -433,6 +442,7 @@ class BufferReadStorage : public IndexStorage {
   bool checksum_validation_{false};
   bool enable_direct_io_{true};
   bool enable_io_profile_{false};
+  std::string warmup_mode_{BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL};
   int64_t header_offset_{0};
   int64_t footer_offset_{0};
   size_t index_offset_{0};

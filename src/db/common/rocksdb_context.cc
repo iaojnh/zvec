@@ -14,6 +14,8 @@
 
 
 #include "rocksdb_context.h"
+#include "db/common/global_resource.h"
+#include <zvec/db/config.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/memtablerep.h>
 #include <rocksdb/slice_transform.h>
@@ -274,8 +276,19 @@ void RocksdbContext::prepare_options(
     create_opts_.write_buffer_size = 8 << 20;
   }
 
-  // Create default cache
-  table_options.block_cache = nullptr;
+  // All RocksDB instances share the explicitly-budgeted block cache. When no
+  // RocksDB slice is configured, preserve the legacy default-cache behavior.
+  auto shared_block_cache = GlobalResource::Instance().rocksdb_block_cache();
+  if (shared_block_cache) {
+    table_options.block_cache = std::move(shared_block_cache);
+  } else if (GlobalConfig::Instance().explicit_memory_budget()) {
+    // In explicit mode a zero RocksDB slice means zero, not RocksDB's
+    // implicit default cache outside the process budget.
+    table_options.no_block_cache = true;
+    table_options.block_cache = nullptr;
+  } else {
+    table_options.block_cache = nullptr;
+  }
 
   auto table_factory = NewBlockBasedTableFactory(table_options);
   create_opts_.table_factory.reset(table_factory);

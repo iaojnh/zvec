@@ -41,6 +41,22 @@ static const std::string PARAM_DISKANN_SEARCHER_LIST_SIZE(
     "zvec.diskann.searcher.list_size");
 static const std::string PARAM_DISKANN_SEARCHER_CACHE_NODE_NUM(
     "zvec.diskann.searcher.cache_node_num");
+static const std::string PARAM_DISKANN_SEARCHER_CACHE_NODE_BUDGET_BYTES(
+    "zvec.diskann.searcher.cache_node_budget_bytes");
+static const std::string PARAM_DISKANN_SEARCHER_CACHE_NODE_PAGE_POLICY(
+    "zvec.diskann.searcher.cache_node_page_policy");
+static const std::string DISKANN_CACHE_NODE_PAGE_POLICY_KEEP("keep");
+static const std::string DISKANN_CACHE_NODE_PAGE_POLICY_EVICT("evict");
+static const std::string PARAM_DISKANN_SEARCHER_CACHE_NODE_LIST_PATH(
+    "zvec.diskann.searcher.cache_node_list_path");
+static const std::string PARAM_DISKANN_SEARCHER_WARMUP_MODE(
+    "zvec.diskann.searcher.warmup_mode");
+static const std::string PARAM_DISKANN_SEARCHER_WARMUP_NODE_NUM(
+    "zvec.diskann.searcher.warmup_node_num");
+static const std::string DISKANN_WARMUP_MODE_NONE("none");
+static const std::string DISKANN_WARMUP_MODE_BFS("bfs");
+static const std::string DISKANN_WARMUP_MODE_QUERY_SAMPLE("query_sample");
+static const std::string DISKANN_WARMUP_MODE_CACHE_LIST("cache_list");
 
 static const std::string PARAM_DISKANN_REDUCER_INDEX_NAME(
     "zvec.diskann.reducer.index_name");

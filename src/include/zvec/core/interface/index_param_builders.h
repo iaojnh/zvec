@@ -221,6 +221,15 @@ class DiskAnnIndexParamBuilder
     param->pq_chunk_num = pq_chunk_num;
     return *this;
   }
+  DiskAnnIndexParamBuilder &WithCacheNodeNum(uint32_t cache_node_num) {
+    param->cache_node_num = cache_node_num;
+    return *this;
+  }
+  DiskAnnIndexParamBuilder &WithCacheNodeBudgetBytes(
+      uint64_t cache_node_budget_bytes) {
+    param->cache_node_budget_bytes = cache_node_budget_bytes;
+    return *this;
+  }
   std::shared_ptr<DiskAnnIndexParam> Build() override {
     return param;
   }

@@ -68,7 +68,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
     // evictor spares the page.  Turns the FIFO eviction queue into an
     // access-aware (approximate LRU) policy without a global LRU list.
     std::atomic<bool> referenced;
-    uint8_t evict_priority{0};
+    std::atomic<uint8_t> evict_priority{0};
     bool ever_loaded{
         false};  // true once the page has been loaded at least once
     size_t file_offset;
@@ -128,6 +128,14 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
 
   bool evict_block(block_id_t block_id) override;
 
+  uint8_t eviction_priority(eviction_key_t owner_key) const override {
+    if (owner_key >= entry_num_.load(std::memory_order_acquire)) {
+      return 0;
+    }
+    return entry_at(owner_key).evict_priority.load(
+        std::memory_order_relaxed);
+  }
+
   //! Unconditionally reclaim a block, bypassing the CLOCK second-chance bit.
   //! Used at teardown / full reset: the normal evict_block() spares a page
   //! whose `referenced` bit is set, but at teardown that would leave the
@@ -137,7 +145,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   void set_evict_priority(block_id_t block_id, uint8_t priority) {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
     Entry &e = entry_at(block_id);
-    e.evict_priority = priority;
+    e.evict_priority.store(priority, std::memory_order_relaxed);
     // A loaded page has one persistent logical queue membership.  Changing
     // the priority must not invalidate that membership: doing so can strand a
     // released page with no future release operation available to re-enqueue
@@ -576,6 +584,9 @@ class ZVEC_AILEGO_API VecBufferPool {
   typedef std::shared_ptr<VecBufferPool> Pointer;
 
   static constexpr size_t kMutexBucketCount = 64UL * 1024UL;
+  static constexpr uint8_t kLowPriority = 0;
+  static constexpr uint8_t kNormalPriority = 1;
+  static constexpr uint8_t kHighPriority = 2;
 
   VecBufferPool(const std::string &filename, bool writable = false,
                 bool enable_direct_io = false,
@@ -619,6 +630,8 @@ class ZVEC_AILEGO_API VecBufferPool {
     uint64_t evict{0};
     uint64_t second_chance{0};
     uint64_t dirty_flush{0};
+    uint64_t bypass_reads{0};
+    uint64_t bypass_bytes{0};
     BufferPoolIoProfile io_profile{};
     double hit_rate() const {
       uint64_t total = hit + miss;
@@ -634,6 +647,8 @@ class ZVEC_AILEGO_API VecBufferPool {
     s.second_chance = p.second_chance;
     s.dirty_flush = p.dirty_flush;
     s.miss = miss_count_.load(std::memory_order_relaxed);
+    s.bypass_reads = bypass_reads_.load(std::memory_order_relaxed);
+    s.bypass_bytes = bypass_bytes_.load(std::memory_order_relaxed);
     if (io_profile_enabled_) {
       std::lock_guard<std::mutex> lock(io_profile_mutex_);
       s.io_profile = io_profile_totals_;
@@ -700,6 +715,13 @@ class ZVEC_AILEGO_API VecBufferPool {
     return page_id < page_table_.entry_num() && page_table_.is_loaded(page_id);
   }
 
+  //! Force one released page out of the cache. Intended for explicit
+  //! cross-layer de-duplication after a higher cache copied the same data.
+  bool evict_page(block_id_t page_id) {
+    return page_id < page_table_.entry_num() &&
+           page_table_.force_evict_block(page_id);
+  }
+
   //! Acquire a pointer protected by the caller's active read epoch.  Resident
   //! hits avoid ref_count entirely; a miss uses the regular load path once,
   //! then immediately drops that temporary ref because the epoch now protects
@@ -713,6 +735,11 @@ class ZVEC_AILEGO_API VecBufferPool {
   }
 
   int get_meta(size_t offset, size_t length, char *buffer);
+
+  //! Read directly from the buffered metadata fd without admitting pages to
+  //! the cache. Used for sequential scans that would otherwise evict a useful
+  //! random-access working set.
+  bool read_range_bypass(size_t file_offset, size_t length, char *buffer);
 
   //! Write a contiguous range via the page cache; marks touched pages dirty.
   //! Returns 0 on success, -1 on failure (e.g. read-only pool or I/O error).
@@ -744,9 +771,19 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Sequentially preload pages into the pool until pool is full.
   void warmup();
 
-  void prefetch_pages(block_id_t first_page, size_t page_count);
+  void prefetch_pages(block_id_t first_page, size_t page_count,
+                      uint8_t priority = kLowPriority);
 
-  void prefetch_pages_aio(block_id_t first_page, size_t page_count);
+  void prefetch_pages_aio(block_id_t first_page, size_t page_count,
+                          uint8_t priority = kLowPriority);
+
+  bool set_page_priority(block_id_t page_id, uint8_t priority) {
+    if (page_id >= page_table_.entry_num() || priority > kHighPriority) {
+      return false;
+    }
+    page_table_.set_evict_priority(page_id, priority);
+    return true;
+  }
 
   //! Submit AIO for scattered pages without waiting for completion.
   //! Results are stored in thread-local state; call harvest_aio() later.
@@ -802,6 +839,8 @@ class ZVEC_AILEGO_API VecBufferPool {
   // cold acquire path (pread / zero-fill).  Combined with page_table_ hits it
   // yields the pool hit rate.
   std::atomic<uint64_t> miss_count_{0};
+  std::atomic<uint64_t> bypass_reads_{0};
+  std::atomic<uint64_t> bypass_bytes_{0};
   mutable std::mutex io_profile_mutex_{};
   BufferPoolIoProfile io_profile_totals_{};
 #if defined(__linux) || defined(__linux__)
@@ -834,7 +873,10 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
 
   bool read_range(size_t file_offset, size_t len, char *out);
 
-  void prefetch_range(size_t file_offset, size_t len);
+  bool read_range_bypass(size_t file_offset, size_t len, char *out);
+
+  void prefetch_range(size_t file_offset, size_t len,
+                      uint8_t priority = VecBufferPool::kLowPriority);
 
   int get_meta(size_t offset, size_t length, char *buffer);
 

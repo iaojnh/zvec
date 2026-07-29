@@ -29,6 +29,7 @@
 #include <zvec/core/framework/index_framework.h>
 #include "diskann_holder.h"
 #include "diskann_params.h"
+#include "utility/utility_params.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -89,17 +90,42 @@ class DiskAnnBufferPoolSearchTest : public testing::Test {
     ASSERT_EQ(0, dumper->close());
   }
 
-  // Create a searcher backed by `storage` with node cache disabled.
-  IndexSearcher::Pointer MakeSearcher(const IndexStorage::Pointer &storage) {
+  IndexSearcher::Pointer MakeSearcher(
+      const IndexStorage::Pointer &storage, uint64_t node_budget_bytes = 0,
+      const std::string &node_page_policy =
+          DISKANN_CACHE_NODE_PAGE_POLICY_KEEP) {
     IndexSearcher::Pointer searcher =
         IndexFactory::CreateSearcher("DiskAnnSearcher");
     EXPECT_NE(searcher, nullptr);
     Params sp;
-    sp.set("zvec.diskann.searcher.cache_node_num", 0);  // isolate pool value
+    if (node_budget_bytes == 0) {
+      sp.set(PARAM_DISKANN_SEARCHER_CACHE_NODE_NUM, 0);
+    } else {
+      sp.set(PARAM_DISKANN_SEARCHER_CACHE_NODE_BUDGET_BYTES,
+             node_budget_bytes);
+    }
+    sp.set(PARAM_DISKANN_SEARCHER_CACHE_NODE_PAGE_POLICY, node_page_policy);
     sp.set("zvec.diskann.searcher.list_size", 200);
     EXPECT_EQ(0, searcher->init(sp));
     EXPECT_EQ(0, searcher->load(storage, IndexMetric::Pointer()));
     return searcher;
+  }
+
+  IndexStorage::Pointer MakeBufferStorage(const string &path,
+                                          bool enable_io_profile = false) {
+    auto storage = IndexFactory::CreateStorage("BufferReadStorage");
+    EXPECT_NE(storage, nullptr);
+    if (!storage) {
+      return nullptr;
+    }
+
+    Params params;
+    params.set(BUFFER_READ_STORAGE_WARMUP_MODE,
+               BUFFER_READ_STORAGE_WARMUP_NONE);
+    params.set(BUFFER_READ_STORAGE_ENABLE_IO_PROFILE, enable_io_profile);
+    EXPECT_EQ(0, storage->init(params));
+    EXPECT_EQ(0, storage->open(path, false));
+    return storage;
   }
 
   string dir_{"DiskAnnBufferPoolSearchTest/"};
@@ -120,9 +146,8 @@ TEST_F(DiskAnnBufferPoolSearchTest, DirectAndBufferPoolResultsMatch) {
   auto direct_searcher = MakeSearcher(direct_storage);
 
   // Buffer path: BufferReadStorage over a VecBufferPool.
-  auto buffer_storage = IndexFactory::CreateStorage("BufferReadStorage");
+  auto buffer_storage = MakeBufferStorage(path);
   ASSERT_NE(buffer_storage, nullptr);
-  ASSERT_EQ(0, buffer_storage->open(path, false));
   ASSERT_NE(buffer_storage->vec_buffer_pool(), nullptr);
   auto buffer_searcher = MakeSearcher(buffer_storage);
 
@@ -159,9 +184,8 @@ TEST_F(DiskAnnBufferPoolSearchTest, RepeatedQueriesProduceCacheHits) {
   const string path = dir_ + "/index_hits";
   BuildIndex(path);
 
-  auto buffer_storage = IndexFactory::CreateStorage("BufferReadStorage");
+  auto buffer_storage = MakeBufferStorage(path, true);
   ASSERT_NE(buffer_storage, nullptr);
-  ASSERT_EQ(0, buffer_storage->open(path, false));
   auto *pool = buffer_storage->vec_buffer_pool();
   ASSERT_NE(pool, nullptr);
   auto searcher = MakeSearcher(buffer_storage);
@@ -184,4 +208,28 @@ TEST_F(DiskAnnBufferPoolSearchTest, RepeatedQueriesProduceCacheHits) {
   }
   uint64_t hit_after = pool->stats().hit;
   EXPECT_GT(hit_after, hit_before);
+  auto io_profile = pool->stats().io_profile;
+  EXPECT_GT(io_profile.aio_pages + io_profile.sync_reads, 0u);
+}
+
+TEST_F(DiskAnnBufferPoolSearchTest,
+       StaticNodeCacheSharesBudgetAndCanEvictDuplicatePages) {
+  const string path = dir_ + "/index_node_cache";
+  BuildIndex(path);
+
+  auto buffer_storage = MakeBufferStorage(path);
+  ASSERT_NE(buffer_storage, nullptr);
+  auto *pool = buffer_storage->vec_buffer_pool();
+  ASSERT_NE(pool, nullptr);
+
+  constexpr uint64_t kNodeBudget = 4ULL * 1024 * 1024;
+  const size_t used_before = MemoryLimitPool::get_instance().used();
+  const uint64_t evict_before = pool->stats().evict;
+  auto searcher = MakeSearcher(
+      buffer_storage, kNodeBudget,
+      DISKANN_CACHE_NODE_PAGE_POLICY_EVICT);
+  ASSERT_NE(searcher, nullptr);
+
+  EXPECT_GT(MemoryLimitPool::get_instance().used(), used_before);
+  EXPECT_GT(pool->stats().evict, evict_before);
 }

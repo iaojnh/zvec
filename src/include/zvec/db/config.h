@@ -87,6 +87,13 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
   // Configuration data structure
   struct ConfigData {
     uint64_t memory_limit_bytes;
+    // Optional process-wide partitions. If all are zero, legacy behavior is
+    // preserved. If any is nonzero, zero means zero capacity for that
+    // category and the buffer cache receives the remainder.
+    uint64_t rocksdb_block_cache_bytes;
+    uint64_t query_working_memory_bytes;
+    uint64_t resident_metadata_bytes;
+    uint64_t safety_reserve_bytes;
 
     // log
     std::shared_ptr<LogConfig> log_config;
@@ -121,6 +128,29 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
 
   // Read-only accessors
   uint64_t memory_limit_bytes() const noexcept;
+  uint64_t rocksdb_block_cache_bytes() const noexcept {
+    return config_.rocksdb_block_cache_bytes;
+  }
+  uint64_t query_working_memory_bytes() const noexcept {
+    return config_.query_working_memory_bytes;
+  }
+  uint64_t resident_metadata_bytes() const noexcept {
+    return config_.resident_metadata_bytes;
+  }
+  uint64_t safety_reserve_bytes() const noexcept {
+    return config_.safety_reserve_bytes;
+  }
+  uint64_t buffer_cache_bytes() const noexcept {
+    return config_.memory_limit_bytes - config_.rocksdb_block_cache_bytes -
+           config_.query_working_memory_bytes -
+           config_.resident_metadata_bytes - config_.safety_reserve_bytes;
+  }
+  bool explicit_memory_budget() const noexcept {
+    return config_.rocksdb_block_cache_bytes != 0 ||
+           config_.query_working_memory_bytes != 0 ||
+           config_.resident_metadata_bytes != 0 ||
+           config_.safety_reserve_bytes != 0;
+  }
 
   const LogConfig &log_config() const noexcept {
     return *config_.log_config;

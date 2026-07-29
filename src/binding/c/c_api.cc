@@ -533,6 +533,37 @@ uint64_t zvec_config_data_get_memory_limit(const zvec_config_data_t *config) {
   return cpp_config->memory_limit_bytes;
 }
 
+#define ZVEC_CONFIG_UINT64_ACCESSORS(suffix, field)                          \
+  zvec_error_code_t zvec_config_data_set_##suffix(                           \
+      zvec_config_data_t *config, uint64_t bytes) {                          \
+    if (!config) {                                                           \
+      SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Config pointer is null"); \
+      return ZVEC_ERROR_INVALID_ARGUMENT;                                    \
+    }                                                                        \
+    auto *cpp_config =                                                       \
+        reinterpret_cast<zvec::GlobalConfig::ConfigData *>(config);          \
+    cpp_config->field = bytes;                                               \
+    return ZVEC_OK;                                                          \
+  }                                                                          \
+  uint64_t zvec_config_data_get_##suffix(                                    \
+      const zvec_config_data_t *config) {                                    \
+    if (!config) {                                                           \
+      return 0;                                                              \
+    }                                                                        \
+    const auto *cpp_config = reinterpret_cast<                               \
+        const zvec::GlobalConfig::ConfigData *>(config);                     \
+    return cpp_config->field;                                                \
+  }
+
+ZVEC_CONFIG_UINT64_ACCESSORS(rocksdb_block_cache,
+                            rocksdb_block_cache_bytes)
+ZVEC_CONFIG_UINT64_ACCESSORS(query_working_memory,
+                            query_working_memory_bytes)
+ZVEC_CONFIG_UINT64_ACCESSORS(resident_metadata, resident_metadata_bytes)
+ZVEC_CONFIG_UINT64_ACCESSORS(safety_reserve, safety_reserve_bytes)
+
+#undef ZVEC_CONFIG_UINT64_ACCESSORS
+
 zvec_error_code_t zvec_config_data_set_log_config(zvec_config_data_t *config,
                                               zvec_log_config_t *log_config) {
   if (!config || !log_config) {
@@ -1787,6 +1818,42 @@ int zvec_index_params_get_diskann_pq_chunk_num(
     return 0;
   }
   return diskann_params->pq_chunk_num();
+}
+
+zvec_error_code_t zvec_index_params_set_diskann_cache_node_budget_bytes(
+    zvec_index_params_t *params, uint64_t cache_node_budget_bytes) {
+  if (!params) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
+                   "Invalid params or not DiskANN index type");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  auto *cpp_params = reinterpret_cast<zvec::IndexParams *>(params);
+  auto *diskann_params = dynamic_cast<zvec::DiskAnnIndexParams *>(cpp_params);
+  if (!diskann_params) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
+                   "Invalid params or not DiskANN index type");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  diskann_params->set_cache_node_budget_bytes(cache_node_budget_bytes);
+  return ZVEC_OK;
+}
+
+uint64_t zvec_index_params_get_diskann_cache_node_budget_bytes(
+    const zvec_index_params_t *params) {
+  if (!params) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
+                   "Invalid params or not DiskANN index type");
+    return 0;
+  }
+  auto *cpp_params = reinterpret_cast<const zvec::IndexParams *>(params);
+  auto *diskann_params =
+      dynamic_cast<const zvec::DiskAnnIndexParams *>(cpp_params);
+  if (!diskann_params) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
+                   "Invalid params or not DiskANN index type");
+    return 0;
+  }
+  return diskann_params->cache_node_budget_bytes();
 }
 
 /**

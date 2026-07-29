@@ -14,11 +14,17 @@
 
 #include "diskann_indexer.h"
 #include <algorithm>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <tuple>
 #include <unordered_set>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include "diskann_buffer_pool_shim.h"
+#include "diskann_params.h"
 
 namespace zvec {
 namespace core {
@@ -32,7 +38,16 @@ DiskAnnIndexer::~DiskAnnIndexer() {
   if (centroid_data_) {
     free(centroid_data_);
   }
+  coord_cache_.clear();
+  neighbor_cache_.clear();
+  std::vector<diskann_id_t>().swap(neighbor_cache_buffer_);
   DiskAnnUtil::free_aligned(coord_cache_buf_);
+  coord_cache_buf_ = nullptr;
+  if (cache_memory_charge_bytes_ != 0) {
+    ailego::MemoryLimitPool::get_instance().release_external(
+        cache_memory_charge_bytes_);
+    cache_memory_charge_bytes_ = 0;
+  }
 }
 
 int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
@@ -50,6 +65,7 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
     // paged cache.  The reader holds a raw pool pointer, so the storage (and
     // thus the pool) must outlive this indexer -- keep storage_ alive and do
     // NOT cleanup here.
+    buffer_pool_ = pool;
     reader_ = std::make_shared<BufferPoolAlignedFileReader>(pool);
     reader_->open(storage_->file_path());
   } else {
@@ -211,6 +227,10 @@ int DiskAnnIndexer::load_cache_list(
   LOG_INFO("Loading the cache list into memory");
 
   size_t num_cached_nodes = node_list.size();
+  int reserve_ret = reserve_cache_memory(num_cached_nodes);
+  if (reserve_ret != 0) {
+    return reserve_ret;
+  }
 
   neighbor_cache_buffer_.resize(num_cached_nodes * (max_degree_ + 1), 0);
 
@@ -220,6 +240,9 @@ int DiskAnnIndexer::load_cache_list(
                              8 * meta_.unit_size());
 
   memset(coord_cache_buf_, 0, coord_cache_buf_len * meta_.unit_size());
+  allocated_cache_payload_bytes_ =
+      static_cast<uint64_t>(num_cached_nodes) *
+      cache_payload_bytes_per_node();
 
   constexpr size_t BLOCK_SIZE = 8;
   size_t num_blocks = DiskAnnUtil::div_round_up(num_cached_nodes, BLOCK_SIZE);
@@ -250,17 +273,316 @@ int DiskAnnIndexer::load_cache_list(
     }
   }
 
-  LOG_INFO("Load Cache List Done");
+  LOG_INFO(
+      "Load Cache List Done: nodes=%zu payload_bytes=%llu "
+      "estimated_bytes=%llu",
+      num_cached_nodes,
+      static_cast<unsigned long long>(allocated_cache_payload_bytes_),
+      static_cast<unsigned long long>(
+          static_cast<uint64_t>(num_cached_nodes) *
+          cache_estimated_bytes_per_node()));
 
   return 0;
 }
 
+int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count) {
+  const uint64_t estimated_bytes_per_node =
+      cache_estimated_bytes_per_node();
+  if (estimated_bytes_per_node != 0 &&
+      node_count > std::numeric_limits<uint64_t>::max() /
+                       estimated_bytes_per_node) {
+    LOG_ERROR("DiskANN node cache size overflow: nodes=%llu bytes_per_node=%llu",
+              static_cast<unsigned long long>(node_count),
+              static_cast<unsigned long long>(estimated_bytes_per_node));
+    return IndexError_NoMemory;
+  }
+  const uint64_t estimated_cache_bytes =
+      node_count * estimated_bytes_per_node;
+  if (estimated_cache_bytes > std::numeric_limits<size_t>::max()) {
+    LOG_ERROR("DiskANN node cache does not fit the platform address space");
+    return IndexError_NoMemory;
+  }
+  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  if (memory_pool.capacity() == 0) {
+    return 0;
+  }
+  if (estimated_cache_bytes == cache_memory_charge_bytes_) {
+    return 0;
+  }
+
+  if (estimated_cache_bytes > cache_memory_charge_bytes_) {
+    const uint64_t additional_charge =
+        estimated_cache_bytes - cache_memory_charge_bytes_;
+    if (!memory_pool.try_charge_external(additional_charge)) {
+      LOG_ERROR(
+          "DiskANN node cache exceeds the shared memory budget: "
+          "requested=%llu available=%llu capacity=%llu",
+          static_cast<unsigned long long>(estimated_cache_bytes),
+          static_cast<unsigned long long>(memory_pool.available()),
+          static_cast<unsigned long long>(memory_pool.capacity()));
+      return IndexError_NoMemory;
+    }
+  } else if (estimated_cache_bytes < cache_memory_charge_bytes_) {
+    memory_pool.release_external(cache_memory_charge_bytes_ -
+                                 estimated_cache_bytes);
+  }
+  cache_memory_charge_bytes_ = estimated_cache_bytes;
+
+  LOG_INFO(
+      "DiskANN shared cache budget: node_cache_charge_bytes=%llu "
+      "memory_limit_used=%llu memory_limit_available=%llu "
+      "memory_limit_capacity=%llu",
+      static_cast<unsigned long long>(cache_memory_charge_bytes_),
+      static_cast<unsigned long long>(memory_pool.used()),
+      static_cast<unsigned long long>(memory_pool.available()),
+      static_cast<unsigned long long>(memory_pool.capacity()));
+  return 0;
+}
+
+void DiskAnnIndexer::manage_cache_page_overlap(
+    const std::vector<diskann_id_t> &node_list, bool evict) {
+  if (buffer_pool_ == nullptr || node_list.empty()) {
+    return;
+  }
+
+  const uint64_t sector_num =
+      node_per_sector_ > 0
+          ? 1
+          : DiskAnnUtil::div_round_up(max_node_size_,
+                                      DiskAnnUtil::kSectorSize);
+  std::vector<uint64_t> page_ids;
+  page_ids.reserve(node_list.size() * sector_num);
+  for (diskann_id_t node_id : node_list) {
+    const uint64_t first_page =
+        index_segment_offset_ / DiskAnnUtil::kSectorSize +
+        DiskAnnUtil::get_node_sector(
+            node_per_sector_, max_node_size_, DiskAnnUtil::kSectorSize,
+            node_id);
+    for (uint64_t i = 0; i < sector_num; ++i) {
+      page_ids.push_back(first_page + i);
+    }
+  }
+
+  const auto stats = diskann_buffer_pool_manage_overlap(
+      buffer_pool_, page_ids.data(), page_ids.size(), evict);
+  LOG_INFO(
+      "DiskANN L1/L2 overlap: policy=%s unique_source_pages=%llu "
+      "resident_before=%llu duplicate_bytes_before=%llu evicted=%llu "
+      "resident_after=%llu",
+      evict ? "evict" : "keep",
+      static_cast<unsigned long long>(stats.unique_pages),
+      static_cast<unsigned long long>(stats.resident_pages_before),
+      static_cast<unsigned long long>(
+          stats.resident_pages_before * DiskAnnUtil::kSectorSize),
+      static_cast<unsigned long long>(stats.evicted_pages),
+      static_cast<unsigned long long>(stats.resident_pages_after));
+}
+
+int DiskAnnIndexer::load_node_list(
+    const std::string &path, uint32_t node_limit,
+    std::vector<diskann_id_t> &node_list) const {
+  std::ifstream input(path);
+  if (!input.is_open()) {
+    LOG_ERROR("Failed to open DiskANN cache node list: %s", path.c_str());
+    return IndexError_InvalidArgument;
+  }
+
+  node_list.clear();
+  std::unordered_set<diskann_id_t> seen;
+  std::string line;
+  size_t line_number = 0;
+  while (std::getline(input, line) &&
+         (node_limit == 0 || node_list.size() < node_limit)) {
+    ++line_number;
+    const size_t comment = line.find('#');
+    if (comment != std::string::npos) {
+      line.resize(comment);
+    }
+    std::replace(line.begin(), line.end(), ',', ' ');
+    std::istringstream fields(line);
+    std::string token;
+    while (fields >> token &&
+           (node_limit == 0 || node_list.size() < node_limit)) {
+      size_t parsed = 0;
+      uint64_t value = 0;
+      try {
+        value = std::stoull(token, &parsed);
+      } catch (const std::exception &) {
+        LOG_ERROR("Invalid node id in %s at line %zu: %s", path.c_str(),
+                  line_number, token.c_str());
+        return IndexError_InvalidArgument;
+      }
+      if (parsed != token.size() || value >= doc_cnt_ ||
+          value > std::numeric_limits<diskann_id_t>::max()) {
+        LOG_ERROR("Out-of-range node id in %s at line %zu: %s", path.c_str(),
+                  line_number, token.c_str());
+        return IndexError_InvalidArgument;
+      }
+      const auto node_id = static_cast<diskann_id_t>(value);
+      if (seen.insert(node_id).second) {
+        node_list.push_back(node_id);
+      }
+    }
+  }
+
+  if (node_list.empty()) {
+    LOG_ERROR("DiskANN cache node list is empty: %s", path.c_str());
+    return IndexError_InvalidArgument;
+  }
+  LOG_INFO("Loaded DiskANN cache node list: path=%s nodes=%zu", path.c_str(),
+           node_list.size());
+  return 0;
+}
+
+void DiskAnnIndexer::warmup_node_pages(
+    const std::vector<diskann_id_t> &node_list,
+    const std::unordered_set<diskann_id_t> &excluded_nodes) {
+  if (buffer_pool_ == nullptr || node_list.empty()) {
+    return;
+  }
+
+  const uint64_t sector_num =
+      node_per_sector_ > 0
+          ? 1
+          : DiskAnnUtil::div_round_up(max_node_size_,
+                                      DiskAnnUtil::kSectorSize);
+  std::vector<uint64_t> page_ids;
+  page_ids.reserve(node_list.size() * sector_num);
+  for (diskann_id_t node_id : node_list) {
+    if (excluded_nodes.find(node_id) != excluded_nodes.end()) {
+      continue;
+    }
+    const uint64_t first_page =
+        index_segment_offset_ / DiskAnnUtil::kSectorSize +
+        DiskAnnUtil::get_node_sector(
+            node_per_sector_, max_node_size_, DiskAnnUtil::kSectorSize,
+            node_id);
+    for (uint64_t page = 0; page < sector_num; ++page) {
+      page_ids.push_back(first_page + page);
+    }
+  }
+  if (page_ids.empty()) {
+    return;
+  }
+
+  std::sort(page_ids.begin(), page_ids.end());
+  page_ids.erase(std::unique(page_ids.begin(), page_ids.end()),
+                 page_ids.end());
+  size_t resident_before = 0;
+  for (uint64_t page_id : page_ids) {
+    if (buffer_pool_->is_page_resident(page_id)) {
+      ++resident_before;
+    }
+    buffer_pool_->set_page_priority(
+        page_id, ailego::VecBufferPool::kHighPriority);
+  }
+
+  size_t cursor = 0;
+  while (cursor < page_ids.size()) {
+    size_t end = cursor + 1;
+    while (end < page_ids.size() &&
+           page_ids[end] == page_ids[end - 1] + 1) {
+      ++end;
+    }
+    buffer_pool_->prefetch_pages(
+        page_ids[cursor], end - cursor,
+        ailego::VecBufferPool::kHighPriority);
+    cursor = end;
+  }
+
+  size_t resident_after = 0;
+  for (uint64_t page_id : page_ids) {
+    if (buffer_pool_->is_page_resident(page_id)) {
+      ++resident_after;
+    }
+  }
+  LOG_INFO(
+      "DiskANN semantic warmup: requested_nodes=%zu excluded_nodes=%zu "
+      "unique_pages=%zu resident_before=%zu resident_after=%zu priority=high",
+      node_list.size(), excluded_nodes.size(), page_ids.size(),
+      resident_before, resident_after);
+}
+
+int DiskAnnIndexer::configure_cache(
+    uint32_t cache_node_num, uint64_t cache_node_budget_bytes,
+    const std::string &cache_node_list_path,
+    const std::string &cache_node_page_policy,
+    const std::string &warmup_mode, uint32_t warmup_node_num) {
+  if (cache_node_budget_bytes != 0) {
+    cache_node_num = cache_node_count_for_budget(cache_node_budget_bytes);
+    LOG_INFO(
+        "DiskANN node-cache budget: budget_bytes=%llu "
+        "estimated_bytes_per_node=%llu payload_bytes_per_node=%llu "
+        "resolved_nodes=%u",
+        static_cast<unsigned long long>(cache_node_budget_bytes),
+        static_cast<unsigned long long>(cache_estimated_bytes_per_node()),
+        static_cast<unsigned long long>(cache_payload_bytes_per_node()),
+        cache_node_num);
+  }
+
+  std::vector<diskann_id_t> cached_nodes;
+  if (cache_node_num != 0) {
+    if (cache_node_budget_bytes != 0) {
+      int ret = reserve_cache_memory(cache_node_num);
+      if (ret != 0) {
+        return ret;
+      }
+    }
+    if (!cache_node_list_path.empty()) {
+      int ret =
+          load_node_list(cache_node_list_path, cache_node_num, cached_nodes);
+      if (ret != 0) {
+        return ret;
+      }
+    } else {
+      cache_bfs_levels(cache_node_num, cached_nodes,
+                       cache_node_budget_bytes == 0);
+    }
+
+    int ret = load_cache_list(cached_nodes);
+    if (ret != 0) {
+      return ret;
+    }
+    manage_cache_page_overlap(
+        cached_nodes,
+        cache_node_page_policy == DISKANN_CACHE_NODE_PAGE_POLICY_EVICT);
+  }
+
+  if (warmup_mode == DISKANN_WARMUP_MODE_NONE) {
+    return 0;
+  }
+  if (buffer_pool_ == nullptr) {
+    LOG_WARN("DiskANN semantic warmup skipped without BufferReadStorage");
+    return 0;
+  }
+
+  std::vector<diskann_id_t> warmup_nodes;
+  if (warmup_mode == DISKANN_WARMUP_MODE_BFS) {
+    cache_bfs_levels(warmup_node_num, warmup_nodes,
+                     /*enforce_legacy_ten_percent_cap=*/false);
+  } else {
+    int ret =
+        load_node_list(cache_node_list_path, warmup_node_num, warmup_nodes);
+    if (ret != 0) {
+      return ret;
+    }
+  }
+
+  std::unordered_set<diskann_id_t> excluded_nodes;
+  if (cache_node_page_policy == DISKANN_CACHE_NODE_PAGE_POLICY_EVICT) {
+    excluded_nodes.insert(cached_nodes.begin(), cached_nodes.end());
+  }
+  warmup_node_pages(warmup_nodes, excluded_nodes);
+  return 0;
+}
+
 void DiskAnnIndexer::cache_bfs_levels(uint64_t num_nodes_to_cache,
-                                      std::vector<diskann_id_t> &node_list) {
+                                      std::vector<diskann_id_t> &node_list,
+                                      bool enforce_legacy_ten_percent_cap) {
   std::set<diskann_id_t> node_set;
 
   size_t tenp_cnt = static_cast<uint64_t>(std::round(doc_cnt_ * 0.1));
-  if (num_nodes_to_cache > tenp_cnt) {
+  if (enforce_legacy_ten_percent_cap && num_nodes_to_cache > tenp_cnt) {
     LOG_WARN(
         "Reducing nodes to cache from: %zu, to: (10 percent of total nodes: "
         "%zu)",

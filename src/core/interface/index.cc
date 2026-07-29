@@ -322,6 +322,11 @@ int Index::Open(const std::string &file_path, StorageOptions storage_options) {
   // index_mapping.cc.
   storage_params.set(core::MMAPFILE_STORAGE_FORCE_FLUSH,
                      storage_options.copy_on_write);
+  if (param_.index_type == IndexType::kFlat &&
+      !storage_options.create_new) {
+    storage_params.set(core::BUFFER_STORAGE_READ_ADMISSION_POLICY,
+                       core::BUFFER_STORAGE_ADMISSION_BYPASS);
+  }
 
   switch (storage_options.type) {
     case StorageOptions::StorageType::kMMAP: {

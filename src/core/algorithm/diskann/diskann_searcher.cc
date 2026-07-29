@@ -29,6 +29,43 @@ int DiskAnnSearcher::init(const ailego::Params &search_params) {
 
   search_params.get(PARAM_DISKANN_SEARCHER_LIST_SIZE, &list_size_);
   search_params.get(PARAM_DISKANN_SEARCHER_CACHE_NODE_NUM, &cache_nodes_num_);
+  search_params.get(PARAM_DISKANN_SEARCHER_CACHE_NODE_BUDGET_BYTES,
+                    &cache_node_budget_bytes_);
+  search_params.get(PARAM_DISKANN_SEARCHER_CACHE_NODE_PAGE_POLICY,
+                    &cache_node_page_policy_);
+  search_params.get(PARAM_DISKANN_SEARCHER_CACHE_NODE_LIST_PATH,
+                    &cache_node_list_path_);
+  search_params.get(PARAM_DISKANN_SEARCHER_WARMUP_MODE, &warmup_mode_);
+  search_params.get(PARAM_DISKANN_SEARCHER_WARMUP_NODE_NUM,
+                    &warmup_node_num_);
+  if (cache_nodes_num_ != 0 && cache_node_budget_bytes_ != 0) {
+    LOG_ERROR(
+        "cache_node_num and cache_node_budget_bytes cannot both be set");
+    return IndexError_InvalidArgument;
+  }
+  if (cache_node_page_policy_ != DISKANN_CACHE_NODE_PAGE_POLICY_KEEP &&
+      cache_node_page_policy_ != DISKANN_CACHE_NODE_PAGE_POLICY_EVICT) {
+    LOG_ERROR("Unknown cache_node_page_policy: %s",
+              cache_node_page_policy_.c_str());
+    return IndexError_InvalidArgument;
+  }
+  if (warmup_mode_ != DISKANN_WARMUP_MODE_NONE &&
+      warmup_mode_ != DISKANN_WARMUP_MODE_BFS &&
+      warmup_mode_ != DISKANN_WARMUP_MODE_QUERY_SAMPLE &&
+      warmup_mode_ != DISKANN_WARMUP_MODE_CACHE_LIST) {
+    LOG_ERROR("Unknown DiskANN warmup_mode: %s", warmup_mode_.c_str());
+    return IndexError_InvalidArgument;
+  }
+  if (warmup_mode_ != DISKANN_WARMUP_MODE_NONE && warmup_node_num_ == 0) {
+    LOG_ERROR("DiskANN warmup_node_num must be positive when warmup is enabled");
+    return IndexError_InvalidArgument;
+  }
+  if ((warmup_mode_ == DISKANN_WARMUP_MODE_QUERY_SAMPLE ||
+       warmup_mode_ == DISKANN_WARMUP_MODE_CACHE_LIST) &&
+      cache_node_list_path_.empty()) {
+    LOG_ERROR("DiskANN query-sample warmup requires cache_node_list_path");
+    return IndexError_InvalidArgument;
+  }
   return 0;
 }
 
@@ -59,6 +96,10 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
     LOG_INFO("Searcher Entity Load Failed");
     return ret;
   }
+  ret = entity_.charge_resident_budget();
+  if (ret != 0) {
+    return ret;
+  }
 
   diskann_indexer_ = std::make_shared<DiskAnnIndexer>(meta_);
 
@@ -67,16 +108,11 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
     return res;
   }
 
-  if (cache_nodes_num_ != 0) {
-    std::vector<diskann_id_t> node_list;
-    LOG_INFO("Caching %u nodes around medoid(s)", cache_nodes_num_);
-
-    diskann_indexer_->cache_bfs_levels(cache_nodes_num_, node_list);
-
-    diskann_indexer_->load_cache_list(node_list);
-
-    node_list.clear();
-    node_list.shrink_to_fit();
+  ret = diskann_indexer_->configure_cache(
+      cache_nodes_num_, cache_node_budget_bytes_, cache_node_list_path_,
+      cache_node_page_policy_, warmup_mode_, warmup_node_num_);
+  if (ret != 0) {
+    return ret;
   }
 
   if (measure) {
@@ -295,7 +331,8 @@ IndexSearcher::Context::Pointer DiskAnnSearcher::create_context() const {
   }
   if (ailego_unlikely(ctx->init(
           DiskAnnContext::kSearcherContext, search_ctx_entity->max_degree(),
-          search_ctx_entity->pq_chunk_num(), meta_.element_size())) != 0) {
+          search_ctx_entity->pq_chunk_num(), meta_.element_size(),
+          list_size_)) != 0) {
     LOG_ERROR("Init DiskAnn Context failed");
     delete ctx;
 

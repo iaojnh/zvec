@@ -608,6 +608,34 @@ ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_config_data_set_memory_limit(
 ZVEC_EXPORT uint64_t ZVEC_CALL
 zvec_config_data_get_memory_limit(const zvec_config_data_t *config);
 
+/** Set/get the shared RocksDB block-cache partition in bytes. */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_config_data_set_rocksdb_block_cache(zvec_config_data_t *config,
+                                         uint64_t bytes);
+ZVEC_EXPORT uint64_t ZVEC_CALL
+zvec_config_data_get_rocksdb_block_cache(const zvec_config_data_t *config);
+
+/** Set/get the aggregate query working-memory partition in bytes. */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_config_data_set_query_working_memory(zvec_config_data_t *config,
+                                          uint64_t bytes);
+ZVEC_EXPORT uint64_t ZVEC_CALL
+zvec_config_data_get_query_working_memory(const zvec_config_data_t *config);
+
+/** Set/get the resident-metadata partition in bytes. */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_config_data_set_resident_metadata(zvec_config_data_t *config,
+                                       uint64_t bytes);
+ZVEC_EXPORT uint64_t ZVEC_CALL
+zvec_config_data_get_resident_metadata(const zvec_config_data_t *config);
+
+/** Set/get memory kept outside all managed allocations in bytes. */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_config_data_set_safety_reserve(zvec_config_data_t *config,
+                                    uint64_t bytes);
+ZVEC_EXPORT uint64_t ZVEC_CALL
+zvec_config_data_get_safety_reserve(const zvec_config_data_t *config);
+
 /**
  * @brief Set log configuration in configuration data
  * @param config Configuration data pointer
@@ -1124,6 +1152,25 @@ zvec_index_params_get_diskann_list_size(const zvec_index_params_t *params);
  */
 ZVEC_EXPORT int ZVEC_CALL
 zvec_index_params_get_diskann_pq_chunk_num(const zvec_index_params_t *params);
+
+/**
+ * @brief Set the DiskANN static node-cache byte budget
+ * @param params Index parameters (must be DiskANN type)
+ * @param cache_node_budget_bytes Nominal byte budget; 0 disables node cache
+ * @return ZVEC_OK on success, error code on failure
+ */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_index_params_set_diskann_cache_node_budget_bytes(
+    zvec_index_params_t *params, uint64_t cache_node_budget_bytes);
+
+/**
+ * @brief Get the DiskANN static node-cache byte budget
+ * @param params Index parameters (must not be NULL)
+ * @return Byte budget, or 0 on error
+ */
+ZVEC_EXPORT uint64_t ZVEC_CALL
+zvec_index_params_get_diskann_cache_node_budget_bytes(
+    const zvec_index_params_t *params);
 
 /**
  * @brief Set IVF specific parameters

@@ -97,6 +97,12 @@ int DiskAnnIndex::CreateAndInitStreamer(const BaseIndexParam &param) {
   param_.max_degree = std::min(100, param_.max_degree);
   param_.list_size = std::min(100, param_.list_size);
   param_.pq_chunk_num = std::min(1024, param_.pq_chunk_num);
+  if (param_.cache_node_num != 0 &&
+      param_.cache_node_budget_bytes != 0) {
+    LOG_ERROR(
+        "cache_node_num and cache_node_budget_bytes cannot both be set");
+    return core::IndexError_InvalidArgument;
+  }
 
   proxima_index_params_.set(core::PARAM_DISKANN_BUILDER_MAX_DEGREE,
                             param_.max_degree);
@@ -104,6 +110,13 @@ int DiskAnnIndex::CreateAndInitStreamer(const BaseIndexParam &param) {
                             param_.list_size);
   proxima_index_params_.set(core::PARAM_DISKANN_BUILDER_MAX_PQ_CHUNK_NUM,
                             param_.pq_chunk_num);
+  proxima_index_params_.set(core::PARAM_DISKANN_SEARCHER_LIST_SIZE,
+                            param_.list_size);
+  proxima_index_params_.set(core::PARAM_DISKANN_SEARCHER_CACHE_NODE_NUM,
+                            param_.cache_node_num);
+  proxima_index_params_.set(
+      core::PARAM_DISKANN_SEARCHER_CACHE_NODE_BUDGET_BYTES,
+      param_.cache_node_budget_bytes);
 
   builder_ = core::IndexFactory::CreateBuilder("DiskAnnBuilder");
   streamer_ = core::IndexFactory::CreateStreamer("DiskAnnStreamer");
@@ -167,10 +180,12 @@ int DiskAnnIndex::Open(const std::string &file_path,
         LOG_ERROR("Failed to create BufferReadStorage");
         return core::IndexError_Runtime;
       }
-      // POC: enable direct I/O and I/O profiling. Production should gate the
-      // profile flag behind configuration.
+      // DiskANN should form its cache from graph-query access rather than
+      // sequentially preloading the beginning of the index file. I/O profile
+      // stays at its BufferReadStorage default (off) outside diagnostics.
       storage_params.set(core::BUFFER_READ_STORAGE_ENABLE_DIRECT_IO, true);
-      storage_params.set(core::BUFFER_READ_STORAGE_ENABLE_IO_PROFILE, true);
+      storage_params.set(core::BUFFER_READ_STORAGE_WARMUP_MODE,
+                         core::BUFFER_READ_STORAGE_WARMUP_NONE);
       int ret = storage_->init(storage_params);
       if (ret != 0) {
         LOG_ERROR("Failed to init BufferReadStorage, path: %s, err: %s",

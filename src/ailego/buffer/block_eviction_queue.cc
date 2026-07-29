@@ -54,8 +54,23 @@ bool BlockEvictionQueue::evict_block(BlockType &item) {
     if (!ok) {
       return false;
     }
-  } while (!is_valid_and_alive(item));
-  return ok;
+    uint8_t current_priority = 0;
+    {
+      std::shared_lock<std::shared_mutex> lock(valid_owners_mutex_);
+      if (item.owner == nullptr ||
+          valid_owners_.find(item.owner) == valid_owners_.end() ||
+          item.owner->is_dead_block(item.owner_key, item.version)) {
+        continue;
+      }
+      current_priority = item.owner->eviction_priority(item.owner_key);
+    }
+    if (item.priority != current_priority) {
+      item.priority = current_priority;
+      add_single_block(item, static_cast<int>(current_priority));
+      continue;
+    }
+    return true;
+  } while (true);
 }
 
 void BlockEvictionQueue::recycle() {
@@ -96,6 +111,13 @@ size_t BlockEvictionQueue::batch_recycle(size_t count) {
     if (item.owner == nullptr ||
         valid_owners_.find(item.owner) == valid_owners_.end()) continue;
     if (item.owner->is_dead_block(item.owner_key, item.version)) continue;
+    const uint8_t current_priority =
+        item.owner->eviction_priority(item.owner_key);
+    if (item.priority != current_priority) {
+      item.priority = current_priority;
+      add_single_block(item, static_cast<int>(current_priority));
+      continue;
+    }
     if (item.owner->evict_block(item.owner_key)) ++evicted;
   }
   return evicted;
@@ -103,7 +125,13 @@ size_t BlockEvictionQueue::batch_recycle(size_t count) {
 
 bool BlockEvictionQueue::add_single_block(const BlockType &block,
                                           int queue_index) {
-  bool ok = evict_queues_[queue_index].enqueue(block);
+  if (queue_index < 0 || queue_index >= static_cast<int>(CACHE_QUEUE_NUM)) {
+    LOG_ERROR("invalid eviction priority: %d", queue_index);
+    return false;
+  }
+  BlockType queued = block;
+  queued.priority = static_cast<uint8_t>(queue_index);
+  bool ok = evict_queues_[queue_index].enqueue(queued);
   if (!ok) {
     LOG_ERROR("enqueue failed.");
     return false;
@@ -304,6 +332,36 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
   }
   alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);
   return true;
+}
+
+bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
+  if (buffer_size == 0) {
+    return true;
+  }
+  if (pool_size_ == 0 || buffer_size > pool_size_) {
+    return false;
+  }
+
+  while (true) {
+    size_t used = used_size_.load(std::memory_order_relaxed);
+    while (used <= pool_size_ && buffer_size <= pool_size_ - used) {
+      if (used_size_.compare_exchange_weak(
+              used, used + buffer_size, std::memory_order_relaxed,
+              std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+
+    // A large static cache may need to reclaim far more than one eviction
+    // batch. Keep making progress until enough capacity is available; zero
+    // reclaimed pages means the remaining memory is pinned or externally
+    // charged and cannot satisfy this reservation.
+    if (BlockEvictionQueue::get_instance().batch_recycle(256) == 0) {
+      high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+  }
+  return false;
 }
 
 void MemoryLimitPool::charge_external(const size_t buffer_size) {

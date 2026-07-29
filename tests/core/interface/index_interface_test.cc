@@ -947,6 +947,38 @@ TEST(IndexInterface, Serialize) {
   }
 
   {
+    std::cout << "\n\n----diskann index----" << std::endl;
+    auto param = DiskAnnIndexParamBuilder()
+                     .WithMetricType(MetricType::kL2sq)
+                     .WithDataType(DataType::DT_FP32)
+                     .WithDimension(64)
+                     .WithIsSparse(false)
+                     .WithMaxDegree(48)
+                     .WithListSize(80)
+                     .WithPqChunkNum(16)
+                     .WithCacheNodeBudgetBytes(512ULL * 1024 * 1024)
+                     .Build();
+
+    auto json = param->SerializeToJson();
+    auto deserialized_param =
+        IndexFactory::DeserializeIndexParamFromJson(json);
+    ASSERT_NE(nullptr, deserialized_param.get());
+
+    auto diskann_param =
+        std::dynamic_pointer_cast<DiskAnnIndexParam>(deserialized_param);
+    ASSERT_NE(nullptr, diskann_param.get());
+    EXPECT_EQ(48, diskann_param->max_degree);
+    EXPECT_EQ(80, diskann_param->list_size);
+    EXPECT_EQ(16, diskann_param->pq_chunk_num);
+    EXPECT_EQ(0U, diskann_param->cache_node_num);
+    EXPECT_EQ(512ULL * 1024 * 1024,
+              diskann_param->cache_node_budget_bytes);
+    EXPECT_EQ(json, diskann_param->SerializeToJson());
+    EXPECT_EQ(param->SerializeToJson(true),
+              diskann_param->SerializeToJson(true));
+  }
+
+  {
     std::cout << "\n\n----vamana index----" << std::endl;
     auto param = VamanaIndexParamBuilder()
                      .WithMetricType(MetricType::kInnerProduct)

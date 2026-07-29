@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "python_config.h"
+#include <limits>
 #include <pybind11/stl.h>
 #include <zvec/ailego/io/io_backend.h>
 
@@ -89,6 +90,30 @@ void ZVecPyConfig::Initialize(pybind11::module_ &m) {
       if (mb <= 0) throw py::value_error("memory_limit_mb must be positive");
       data.memory_limit_bytes = static_cast<uint64_t>(mb) * 1024 * 1024;
     }
+    const auto read_partition_mb =
+        [&config_dict](const char *key, uint64_t *out) {
+          if (!has_key(config_dict, key)) {
+            return;
+          }
+          const auto mb = get_if<int64_t>(config_dict, key).value();
+          if (mb < 0) {
+            throw py::value_error(std::string(key) +
+                                  " must be non-negative");
+          }
+          constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+          if (static_cast<uint64_t>(mb) >
+              std::numeric_limits<uint64_t>::max() / kMiB) {
+            throw py::value_error(std::string(key) + " is too large");
+          }
+          *out = static_cast<uint64_t>(mb) * kMiB;
+        };
+    read_partition_mb("rocksdb_block_cache_mb",
+                      &data.rocksdb_block_cache_bytes);
+    read_partition_mb("query_working_memory_mb",
+                      &data.query_working_memory_bytes);
+    read_partition_mb("resident_metadata_mb",
+                      &data.resident_metadata_bytes);
+    read_partition_mb("safety_reserve_mb", &data.safety_reserve_bytes);
 
     // config log
     bool has_log_type = has_key(config_dict, "log_type");

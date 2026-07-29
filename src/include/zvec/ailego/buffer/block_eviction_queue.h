@@ -62,6 +62,12 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
   //! false if it was spared (CLOCK second chance / still pinned) so callers
   //! can tell real reclamation from a no-op and make progress accordingly.
   virtual bool evict_block(eviction_key_t owner_key) = 0;
+
+  //! Current eviction-queue priority for an item. Owners that do not support
+  //! priority keep the default low-priority queue.
+  virtual uint8_t eviction_priority(eviction_key_t /*owner_key*/) const {
+    return 0;
+  }
 };
 
 class BlockEvictionQueue {
@@ -70,6 +76,7 @@ class BlockEvictionQueue {
     eviction_key_t owner_key{0};
     version_t version{0};
     EvictableBlockOwner *owner{nullptr};
+    uint8_t priority{0};
   };
   typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;
 
@@ -133,6 +140,11 @@ class MemoryLimitPool {
   int init(size_t pool_size);
 
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
+
+  //! Reserve capacity for memory allocated outside the page-buffer slab.
+  //! Unlike charge_external(), this enforces the configured limit and may
+  //! recycle evictable pages before failing.
+  bool try_charge_external(const size_t buffer_size);
 
   void charge_external(const size_t buffer_size);
 

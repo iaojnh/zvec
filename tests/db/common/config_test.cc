@@ -118,6 +118,25 @@ TEST_F(ConfigTest, ValidateConfigWithInvalidMemoryLimit) {
             std::string::npos);
 }
 
+TEST_F(ConfigTest, ValidateExplicitMemoryBudgetPartitions) {
+  GlobalConfig::ConfigData config;
+  config.memory_limit_bytes = 1024ULL * 1024ULL * 1024ULL;
+  config.rocksdb_block_cache_bytes = 128ULL * 1024ULL * 1024ULL;
+  config.query_working_memory_bytes = 64ULL * 1024ULL * 1024ULL;
+  config.resident_metadata_bytes = 256ULL * 1024ULL * 1024ULL;
+  config.safety_reserve_bytes = 64ULL * 1024ULL * 1024ULL;
+
+  GlobalConfig config_instance;
+  ASSERT_TRUE(config_instance.Validate(config).ok());
+
+  config.safety_reserve_bytes = config.memory_limit_bytes;
+  auto status = config_instance.Validate(config);
+  ASSERT_FALSE(status.ok());
+  ASSERT_NE(status.message().find(
+                "memory budget partitions must not exceed memory_limit_bytes"),
+            std::string::npos);
+}
+
 TEST_F(ConfigTest, ValidateConfigWithInvalidQueryThreadCount) {
   GlobalConfig::ConfigData config;
   config.query_thread_count = 0;  // Invalid value

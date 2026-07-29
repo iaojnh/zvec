@@ -31,6 +31,13 @@ enum DiskAnnBufferPoolReadStatus {
   kDiskAnnBufferPoolReadError = 2,
 };
 
+struct DiskAnnBufferPoolOverlapStats {
+  uint64_t unique_pages{0};
+  uint64_t resident_pages_before{0};
+  uint64_t evicted_pages{0};
+  uint64_t resident_pages_after{0};
+};
+
 // Satisfy a batch of aligned sector reads through a VecBufferPool paged cache.
 // Each (offset[i], len[i]) must be page-aligned; every page is acquired in one
 // batch (preserving the pool's batched miss / AIO path), copied into buf[i],
@@ -41,6 +48,12 @@ enum DiskAnnBufferPoolReadStatus {
 int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
                              const uint64_t *offsets, const uint64_t *lens,
                              void *const *bufs, size_t count);
+
+// Observe pages copied into DiskANN's static node cache and optionally evict
+// their now-duplicated Buffer Pool copies. Duplicate page ids are accepted.
+DiskAnnBufferPoolOverlapStats diskann_buffer_pool_manage_overlap(
+    ailego::VecBufferPool *pool, const uint64_t *page_ids, size_t count,
+    bool evict);
 
 }  // namespace core
 }  // namespace zvec
