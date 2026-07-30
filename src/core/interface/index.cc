@@ -600,7 +600,10 @@ int Index::Search(const VectorData &vector_data,
       return core::IndexError_Runtime;
     }
 
-    auto &base_result = context->result();
+    // _dense_search moves the coarse-search documents out of the context and
+    // into result. Use that destination for refinement candidates; reading the
+    // context here would observe an empty, moved-from list.
+    auto &base_result = result->doc_list_;
     std::vector<uint64_t> keys(base_result.size());
     for (size_t i = 0; i < base_result.size(); ++i) {
       keys[i] = base_result[i].key();

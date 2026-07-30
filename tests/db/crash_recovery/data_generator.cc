@@ -14,6 +14,7 @@
 
 
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #ifdef __ANDROID__
 #include <unistd.h>  // _exit()
@@ -34,6 +35,7 @@ struct Config {
   int end_id = 0;
   std::string operation;  // "insert", "upsert", "update", "delete"
   int version = 999999;
+  std::string started_file;
 };
 
 
@@ -51,6 +53,8 @@ bool ParseArgs(int argc, char **argv, Config &config) {
       config.operation = argv[++i];
     } else if (arg == "--version" && i + 1 < argc) {
       config.version = std::stoi(argv[++i]);
+    } else if (arg == "--started-file" && i + 1 < argc) {
+      config.started_file = argv[++i];
     } else if (arg == "--help" || arg == "-h") {
       return false;
     }
@@ -91,6 +95,9 @@ void PrintUsage(const char *program) {
       << "  --op        Operation: insert, upsert, update, or delete (required)"
       << std::endl;
   std::cout << "  --version   Operation: version (required)" << std::endl;
+  std::cout << "  --started-file  Create this file after the first successful "
+               "batch (optional)"
+            << std::endl;
   std::cout << std::endl;
   std::cout << "Examples:" << std::endl;
   std::cout << "  # Insert 1000 documents (pk_0 to pk_999)" << std::endl;
@@ -220,6 +227,17 @@ int main(int argc, char **argv) {
     processed += batch_count;
     config.start_id = batch_end;
     batch_num++;
+
+    if (batch_num == 1 && !config.started_file.empty()) {
+      std::ofstream started(config.started_file,
+                            std::ios::out | std::ios::trunc);
+      if (!started) {
+        LOG_ERROR("Failed to create started file[%s]",
+                  config.started_file.c_str());
+        return 1;
+      }
+      started << processed << std::endl;
+    }
 
     // Print progress every 10%
     if (processed >= next_progress_threshold) {

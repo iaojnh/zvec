@@ -47,6 +47,19 @@ static std::string LocateDataGenerator() {
   return LocateBinary("data_generator");
 }
 
+static bool WaitForGeneratorStarted(const std::string &started_file) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  std::error_code ec;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (std::filesystem::exists(started_file, ec)) {
+      return true;
+    }
+    ec.clear();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
 
 /**
  * Internal helper to execute the data generator process.
@@ -57,12 +70,18 @@ void ExecuteProcess(const std::string &start, const std::string &end,
                     const std::string &op, const std::string &version,
                     int kill_after_seconds = -1) {
   bool should_crash = kill_after_seconds >= 0;
+  const std::string started_file = dir_path_ + ".started";
+  std::error_code ec;
+  std::filesystem::remove(started_file, ec);
 
 #ifdef _WIN32
   // 1. Build the command line string with quotes to handle paths with spaces
   std::string cmd_str = data_generator_bin_ + " --path " + dir_path_ +
                         " --start " + start + " --end " + end + " --op " + op +
                         " --version " + version;
+  if (should_crash) {
+    cmd_str += " --started-file " + started_file;
+  }
 
   STARTUPINFOA si = {sizeof(si)};
   PROCESS_INFORMATION pi;
@@ -77,6 +96,13 @@ void ExecuteProcess(const std::string &start, const std::string &end,
   }
 
   if (should_crash) {
+    if (!WaitForGeneratorStarted(started_file)) {
+      TerminateProcess(pi.hProcess, 1);
+      WaitForSingleObject(pi.hProcess, INFINITE);
+      CloseHandle(pi.hProcess);
+      CloseHandle(pi.hThread);
+      FAIL() << "Data generator did not complete its first batch in time.";
+    }
     std::this_thread::sleep_for(std::chrono::seconds(kill_after_seconds));
     // Simulate a crash by killing the process
     TerminateProcess(pi.hProcess, 1);
@@ -88,6 +114,7 @@ void ExecuteProcess(const std::string &start, const std::string &end,
   GetExitCodeProcess(pi.hProcess, &exit_code);
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
+  std::filesystem::remove(started_file, ec);
 
   if (should_crash) {
     // In crash tests, we expect the process to have been terminated
@@ -113,8 +140,12 @@ void ExecuteProcess(const std::string &start, const std::string &end,
                                       "--op",
                                       op.c_str(),
                                       "--version",
-                                      version.c_str(),
-                                      nullptr};
+                                      version.c_str()};
+    if (should_crash) {
+      args.push_back("--started-file");
+      args.push_back(started_file.c_str());
+    }
+    args.push_back(nullptr);
     execvp(args[0], const_cast<char *const *>(args.data()));
     perror("execvp failed");
     _exit(1);
@@ -122,6 +153,11 @@ void ExecuteProcess(const std::string &start, const std::string &end,
 
   int status;
   if (should_crash) {
+    if (!WaitForGeneratorStarted(started_file)) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+      FAIL() << "Data generator did not complete its first batch in time.";
+    }
     std::this_thread::sleep_for(std::chrono::seconds(kill_after_seconds));
     kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
@@ -131,6 +167,7 @@ void ExecuteProcess(const std::string &start, const std::string &end,
     ASSERT_TRUE(WIFEXITED(status)) << "Process exited abnormally.";
     ASSERT_EQ(WEXITSTATUS(status), 0);
   }
+  std::filesystem::remove(started_file, ec);
 #endif
 }
 

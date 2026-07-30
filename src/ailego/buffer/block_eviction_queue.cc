@@ -400,12 +400,10 @@ void MemoryLimitPool::charge_external(const size_t buffer_size) {
 }
 
 void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
-  // Unconditional subtract: single RMW instead of a CAS loop. fetch_sub
-  // returns the previous value so the invariant check is preserved.
-  size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
-  (void)prev;
-  assert(prev >= buffer_size);
   if (!buffer) {
+    size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    (void)prev;
+    assert(prev >= buffer_size);
     return;
   }
   if (!is_cacheable_buffer_size(buffer_size)) {
@@ -414,13 +412,25 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
         committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
     (void)committed_prev;
     assert(committed_prev >= buffer_size);
+    size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    (void)prev;
+    assert(prev >= buffer_size);
     return;
   }
   size_t s = pick_shard();
-  std::lock_guard<std::mutex> lock(free_shards_[s].mutex);
-  *reinterpret_cast<char **>(buffer) = free_shards_[s].head;
-  free_shards_[s].head = buffer;
-  free_shards_[s].count.fetch_add(1, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(free_shards_[s].mutex);
+    *reinterpret_cast<char **>(buffer) = free_shards_[s].head;
+    free_shards_[s].head = buffer;
+    free_shards_[s].count.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Publish the reusable buffer before releasing its logical budget slot.
+  // Otherwise an acquiring thread can reserve that slot while the buffer is
+  // still between used_size_ and the free-list, then fail because committed
+  // memory is already at the hard cap.
+  size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+  (void)prev;
+  assert(prev >= buffer_size);
 }
 
 void MemoryLimitPool::release_external(const size_t buffer_size) {

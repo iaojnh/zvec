@@ -378,10 +378,15 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
       }
     }
     inc_evict();
+    // Clear the consumed queue membership before publishing the unloaded
+    // sentinel. A loader may install this page as soon as it observes
+    // ref_count == INT_MIN and will set in_evict_queue back to true. Clearing
+    // the flag after that publication can race with the new installation and
+    // strand a resident page outside the eviction queue forever.
+    e.in_evict_queue.store(false, std::memory_order_relaxed);
     e.ref_count.store(std::numeric_limits<int>::min(),
                       std::memory_order_release);
     evicted = true;
-    e.in_evict_queue.store(false, std::memory_order_relaxed);
     return true;
   }
 
@@ -655,8 +660,16 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry) {
       }
     }
     if (!found) {
-      LOG_ERROR("Buffer pool failed to get free buffer: file[%s], page_id[%zu]",
-                file_name_.c_str(), page_id);
+      const auto memory_stats = MemoryLimitPool::get_instance().stats();
+      const auto page_stats = page_table_.stats();
+      LOG_ERROR(
+          "Buffer pool failed to get free buffer: file[%s], page_id[%zu], "
+          "used[%zu], committed[%zu], free_buffers[%zu], evict[%llu], "
+          "second_chance[%llu]",
+          file_name_.c_str(), page_id, memory_stats.used,
+          memory_stats.committed, memory_stats.free_buffers,
+          static_cast<unsigned long long>(page_stats.evict),
+          static_cast<unsigned long long>(page_stats.second_chance));
       return nullptr;
     }
   }
