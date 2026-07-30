@@ -88,6 +88,11 @@ class AlignedFileReader {
 
   virtual int read(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
                    bool async = false) = 0;
+
+  virtual int read_bypass(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
+                          bool async = false) {
+    return read(read_reqs, ctx, async);
+  }
 };
 
 class LinuxAlignedFileReader : public AlignedFileReader {
@@ -136,6 +141,8 @@ class BufferPoolAlignedFileReader : public AlignedFileReader {
 
   int read(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
            bool async = false) override;
+  int read_bypass(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
+                  bool async = false) override;
 
  private:
   ailego::VecBufferPool *pool_{nullptr};

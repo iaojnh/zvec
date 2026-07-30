@@ -81,8 +81,7 @@ TEST_F(BufferReadStorageTest, NoneStartsWithAnEmptyPageCache) {
   auto segment = storage->get("payload");
   ASSERT_NE(segment, nullptr);
   std::string actual(payload_.size(), '\0');
-  ASSERT_EQ(actual.size(),
-            segment->fetch(0, actual.data(), actual.size()));
+  ASSERT_EQ(actual.size(), segment->fetch(0, actual.data(), actual.size()));
   EXPECT_EQ(payload_, actual);
   EXPECT_GT(pool->stats().miss, 0u);
 }
@@ -99,8 +98,7 @@ TEST_F(BufferReadStorageTest, SequentialPreservesExistingWarmupBehavior) {
   auto segment = storage->get("payload");
   ASSERT_NE(segment, nullptr);
   std::string actual(payload_.size(), '\0');
-  ASSERT_EQ(actual.size(),
-            segment->fetch(0, actual.data(), actual.size()));
+  ASSERT_EQ(actual.size(), segment->fetch(0, actual.data(), actual.size()));
   EXPECT_EQ(payload_, actual);
 }
 

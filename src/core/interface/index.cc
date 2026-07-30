@@ -627,7 +627,7 @@ int Index::_dense_fetch(const uint32_t doc_id,
   int ret = streamer_->get_vector_by_id(doc_id, vector_block);
   if (ret != 0) {
     LOG_ERROR("Failed to fetch vector, doc_id: %u", doc_id);
-    return core::IndexError_Runtime;
+    return ret;
   }
   const void *vector = vector_block.data();
 
@@ -805,7 +805,12 @@ int Index::_dense_search(const VectorData &vector_data,
     }
     result->group_doc_list_ = std::move(*group_result);
   } else {
-    result->doc_list_ = std::move(context->result());
+    auto *docs = context->mutable_result(0);
+    if (docs == nullptr) {
+      LOG_ERROR("Failed to retrieve search result");
+      return core::IndexError_Runtime;
+    }
+    result->doc_list_ = std::move(*docs);
   }
 
   if (metric_->support_normalize()) {
@@ -934,7 +939,12 @@ int Index::_sparse_search(const VectorData &vector_data,
     }
     result->group_doc_list_ = std::move(*group_result);
   } else {
-    result->doc_list_ = std::move(context->result());
+    auto *docs = context->mutable_result(0);
+    if (docs == nullptr) {
+      LOG_ERROR("Failed to retrieve search result");
+      return core::IndexError_Runtime;
+    }
+    result->doc_list_ = std::move(*docs);
   }
 
   if (metric_->support_normalize()) {

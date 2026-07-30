@@ -19,6 +19,7 @@
 #include "diskann_buffer_pool_shim.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -32,6 +33,10 @@ int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
                              void *const *bufs, size_t count) {
   if (pool == nullptr) {
     return kDiskAnnBufferPoolReadError;
+  }
+  if (count != 0 &&
+      (offsets == nullptr || lens == nullptr || bufs == nullptr)) {
+    return kDiskAnnBufferPoolInvalidArg;
   }
 
   // DiskANN does not include VecBufferPool's profiling types in its reader
@@ -61,26 +66,38 @@ int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
 
   const size_t page_size = ailego::kVectorPageSize;
 
-  // Expand each sector request into one or more page ids. A DiskAnn sector is
-  // 4KB, matching a single VecBufferPool page, so offset/len must be page
-  // aligned.
+  // Expand every requested byte range into the backing pages it overlaps.
+  // Segment offsets in a FileDumper container are not guaranteed to be page
+  // aligned even though each DiskANN sector is 4KB.
+  struct PageCopy {
+    size_t request_index;
+    size_t destination_offset;
+    size_t page_offset;
+    size_t size;
+  };
   std::vector<ailego::block_id_t> page_ids;
-  std::vector<std::pair<size_t, size_t>> mappings;  // (req_idx, page_idx)
+  std::vector<PageCopy> mappings;
   page_ids.reserve(count);
   mappings.reserve(count);
 
   for (size_t i = 0; i < count; ++i) {
     const uint64_t offset = offsets[i];
     const uint64_t len = lens[i];
-    if (bufs[i] == nullptr || len == 0 || offset % page_size != 0 ||
-        len % page_size != 0) {
+    if (bufs[i] == nullptr || len == 0 ||
+        offset > std::numeric_limits<size_t>::max() ||
+        len > std::numeric_limits<size_t>::max() ||
+        offset > std::numeric_limits<uint64_t>::max() - len) {
       return kDiskAnnBufferPoolInvalidArg;
     }
-    const size_t page_count = static_cast<size_t>(len / page_size);
-    for (size_t p = 0; p < page_count; ++p) {
-      page_ids.push_back(
-          static_cast<ailego::block_id_t>(offset / page_size + p));
-      mappings.emplace_back(i, p);
+    size_t copied = 0;
+    while (copied < static_cast<size_t>(len)) {
+      const size_t absolute = static_cast<size_t>(offset) + copied;
+      const size_t page_offset = absolute % page_size;
+      const size_t copy_size =
+          std::min(static_cast<size_t>(len) - copied, page_size - page_offset);
+      page_ids.push_back(static_cast<ailego::block_id_t>(absolute / page_size));
+      mappings.push_back(PageCopy{i, copied, page_offset, copy_size});
+      copied += copy_size;
     }
   }
 
@@ -105,10 +122,39 @@ int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
 
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto &m = mappings[i];
-    std::memcpy(static_cast<char *>(bufs[m.first]) + m.second * page_size,
-                pages[i], page_size);
+    std::memcpy(
+        static_cast<char *>(bufs[m.request_index]) + m.destination_offset,
+        pages[i] + m.page_offset, m.size);
   }
 
+  return kDiskAnnBufferPoolOk;
+}
+
+int diskann_buffer_pool_read_bypass(ailego::VecBufferPool *pool,
+                                    const uint64_t *offsets,
+                                    const uint64_t *lens, void *const *bufs,
+                                    size_t count) {
+  if (pool == nullptr) {
+    return kDiskAnnBufferPoolReadError;
+  }
+  if (count != 0 &&
+      (offsets == nullptr || lens == nullptr || bufs == nullptr)) {
+    return kDiskAnnBufferPoolInvalidArg;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    if (bufs[i] == nullptr || lens[i] == 0 ||
+        offsets[i] > std::numeric_limits<size_t>::max() ||
+        lens[i] > std::numeric_limits<size_t>::max() ||
+        offsets[i] > std::numeric_limits<uint64_t>::max() - lens[i]) {
+      return kDiskAnnBufferPoolInvalidArg;
+    }
+    if (!pool->read_range_bypass(static_cast<size_t>(offsets[i]),
+                                 static_cast<size_t>(lens[i]),
+                                 static_cast<char *>(bufs[i]))) {
+      return kDiskAnnBufferPoolReadError;
+    }
+  }
   return kDiskAnnBufferPoolOk;
 }
 

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "diskann_cache_budget.h"
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_factory.h>
-#include "diskann_cache_budget.h"
 #include "diskann_params.h"
 
 using namespace zvec::core;
@@ -36,22 +36,18 @@ TEST(DiskAnnCacheBudgetTest, ResolvesBudgetAndAppliesDocumentCountCap) {
   constexpr uint64_t kBytesPerNode = 2048;
   constexpr uint64_t kDocCount = 10000;
 
-  EXPECT_EQ(
-      DiskAnnCacheBudget::ResolveNodeCount(100 * kBytesPerNode, kDocCount,
-                                           kBytesPerNode),
-      100u);
-  EXPECT_EQ(
-      DiskAnnCacheBudget::ResolveNodeCount(2000 * kBytesPerNode, kDocCount,
-                                           kBytesPerNode),
-      2000u);
-  EXPECT_EQ(
-      DiskAnnCacheBudget::ResolveNodeCount(20000 * kBytesPerNode, kDocCount,
-                                           kBytesPerNode),
-      10000u);
-  EXPECT_EQ(
-      DiskAnnCacheBudget::ResolveNodeCount(kBytesPerNode - 1, kDocCount,
-                                           kBytesPerNode),
-      0u);
+  EXPECT_EQ(DiskAnnCacheBudget::ResolveNodeCount(100 * kBytesPerNode, kDocCount,
+                                                 kBytesPerNode),
+            100u);
+  EXPECT_EQ(DiskAnnCacheBudget::ResolveNodeCount(2000 * kBytesPerNode,
+                                                 kDocCount, kBytesPerNode),
+            2000u);
+  EXPECT_EQ(DiskAnnCacheBudget::ResolveNodeCount(20000 * kBytesPerNode,
+                                                 kDocCount, kBytesPerNode),
+            10000u);
+  EXPECT_EQ(DiskAnnCacheBudget::ResolveNodeCount(kBytesPerNode - 1, kDocCount,
+                                                 kBytesPerNode),
+            0u);
 }
 
 TEST(DiskAnnCacheBudgetTest, RejectsConflictingNodeCountAndByteBudget) {

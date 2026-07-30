@@ -80,21 +80,6 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
                sizeof(diskann_id_t);
   }
 
-  int charge_resident_budget() {
-    if (resident_budget_) {
-      return 0;
-    }
-    const uint64_t bytes = resident_bytes();
-    if (!ailego::MemoryBudgetManager::get_instance().try_charge(
-            ailego::MemoryBudgetManager::Category::ResidentMetadata, bytes)) {
-      LOG_ERROR("DiskANN resident-metadata budget exhausted: request=%llu",
-                static_cast<unsigned long long>(bytes));
-      return IndexError_NoMemory;
-    }
-    resident_budget_ = std::make_shared<ResidentBudgetToken>(bytes);
-    return 0;
-  }
-
   std::pair<uint32_t, const diskann_id_t *> get_neighbors(
       diskann_id_t id) const override;
 
@@ -103,6 +88,9 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   const void *get_vector(diskann_id_t id) const override;
 
  private:
+  int reserve_resident_budget();
+  void clear_resident_data();
+
   DiskAnnSearcherEntity(
       const DiskAnnMetaHeader &meta_header, const DiskAnnPqMeta &pq_meta,
       const SegmentPointer &meta_segment, const SegmentPointer &pq_meta_segment,

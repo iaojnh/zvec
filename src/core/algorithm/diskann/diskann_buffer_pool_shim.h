@@ -49,6 +49,14 @@ int diskann_buffer_pool_read(ailego::VecBufferPool *pool,
                              const uint64_t *offsets, const uint64_t *lens,
                              void *const *bufs, size_t count);
 
+// Read directly from the pool's backing file without admitting or pinning
+// pages. Static DiskANN cache construction uses this after reserving its own
+// memory, so it cannot deadlock against that reservation for page buffers.
+int diskann_buffer_pool_read_bypass(ailego::VecBufferPool *pool,
+                                    const uint64_t *offsets,
+                                    const uint64_t *lens, void *const *bufs,
+                                    size_t count);
+
 // Observe pages copied into DiskANN's static node cache and optionally evict
 // their now-duplicated Buffer Pool copies. Duplicate page ids are accepted.
 DiskAnnBufferPoolOverlapStats diskann_buffer_pool_manage_overlap(

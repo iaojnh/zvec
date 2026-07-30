@@ -139,8 +139,7 @@ TEST(ConverterTest, DiskAnnIndexParamsConversion) {
   EXPECT_EQ(kBudgetBytes, roundtrip_pb.cache_node_budget_bytes());
   EXPECT_EQ(proto::MT_L2, roundtrip_pb.base().metric_type());
   EXPECT_EQ(proto::QT_FP16, roundtrip_pb.base().quantize_type());
-  EXPECT_TRUE(
-      roundtrip_pb.base().quantizer_param().enable_rotate());
+  EXPECT_TRUE(roundtrip_pb.base().quantizer_param().enable_rotate());
 }
 
 TEST(ConverterTest, IndexParamsConversion) {

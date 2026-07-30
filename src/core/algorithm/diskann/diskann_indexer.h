@@ -51,9 +51,9 @@ class DiskAnnIndexer {
       const std::vector<diskann_id_t> &node_list,
       const std::unordered_set<diskann_id_t> &excluded_nodes = {});
 
-  void cache_bfs_levels(uint64_t num_nodes_to_cache,
-                        std::vector<diskann_id_t> &node_list,
-                        bool enforce_legacy_ten_percent_cap = true);
+  int cache_bfs_levels(uint64_t num_nodes_to_cache,
+                       std::vector<diskann_id_t> &node_list,
+                       bool enforce_legacy_ten_percent_cap = true);
 
   uint32_t cache_node_count_for_budget(uint64_t budget_bytes) const {
     return DiskAnnCacheBudget::ResolveNodeCount(
@@ -96,12 +96,17 @@ class DiskAnnIndexer {
   std::vector<bool> read_nodes(
       const std::vector<diskann_id_t> &node_ids,
       std::vector<void *> &coord_buffers,
-      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers);
+      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers,
+      bool bypass_buffer_pool = false);
 
  protected:
   int use_medroids_data_as_centroids();
 
  private:
+  void clear_cache_memory();
+  bool validate_neighbors(uint32_t neighbor_num,
+                          const diskann_id_t *neighbors) const;
+
   DiskAnnSearcherEntity *entity_;
 
   IndexStorage::Pointer storage_{};
@@ -140,6 +145,7 @@ class DiskAnnIndexer {
   uint64_t doc_cnt_{0};
   uint64_t allocated_cache_payload_bytes_{0};
   uint64_t cache_memory_charge_bytes_{0};
+  uint64_t resident_budget_bytes_{0};
 };
 
 }  // namespace core

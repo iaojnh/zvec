@@ -165,9 +165,8 @@ TEST(IndexParamsTest, IVFIndexParams) {
 
 TEST(IndexParamsTest, DiskAnnIndexParamsCacheBudget) {
   constexpr uint64_t kBudgetBytes = 512ULL * 1024 * 1024;
-  DiskAnnIndexParams params(MetricType::L2, 48, 80, 16,
-                            QuantizeType::FP16, QuantizerParam(true),
-                            kBudgetBytes);
+  DiskAnnIndexParams params(MetricType::L2, 48, 80, 16, QuantizeType::FP16,
+                            QuantizerParam(true), kBudgetBytes);
 
   EXPECT_EQ(IndexType::DISKANN, params.type());
   EXPECT_EQ(kBudgetBytes, params.cache_node_budget_bytes());
@@ -175,8 +174,7 @@ TEST(IndexParamsTest, DiskAnnIndexParamsCacheBudget) {
             params.to_string().find("cache_node_budget_bytes:536870912"));
 
   auto cloned = params.clone();
-  auto *cloned_diskann =
-      dynamic_cast<DiskAnnIndexParams *>(cloned.get());
+  auto *cloned_diskann = dynamic_cast<DiskAnnIndexParams *>(cloned.get());
   ASSERT_NE(nullptr, cloned_diskann);
   EXPECT_EQ(kBudgetBytes, cloned_diskann->cache_node_budget_bytes());
   EXPECT_EQ(params, *cloned_diskann);

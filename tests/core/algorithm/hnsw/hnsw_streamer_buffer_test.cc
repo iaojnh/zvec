@@ -119,9 +119,9 @@ TEST_F(HnswStreamerTest, TestHnswBufferSearchUnderEviction) {
   EXPECT_GT(profile.sync_reads, 0u);
   EXPECT_GT(profile.sync_read_ns, 0u);
   EXPECT_GT(profile.software_ns(), 0u);
-  const uint64_t classified_sync_reads =
-      profile.neighbor_sync_reads + profile.cross_page_sync_reads +
-      profile.post_aio_sync_reads;
+  const uint64_t classified_sync_reads = profile.neighbor_sync_reads +
+                                         profile.cross_page_sync_reads +
+                                         profile.post_aio_sync_reads;
   EXPECT_LE(classified_sync_reads, profile.sync_reads);
   EXPECT_GT(profile.post_aio_publish_attempts, 0u);
   EXPECT_LE(profile.post_aio_publish_failures,
@@ -129,9 +129,9 @@ TEST_F(HnswStreamerTest, TestHnswBufferSearchUnderEviction) {
   EXPECT_GT(profile.post_aio_requested_unique_pages, 0u);
   EXPECT_LE(profile.post_aio_missing_unique_pages,
             profile.post_aio_requested_unique_pages);
-  EXPECT_LE(profile.vector_prefetch_aio_pages +
-                profile.vector_fallback_aio_pages,
-            profile.aio_pages);
+  EXPECT_LE(
+      profile.vector_prefetch_aio_pages + profile.vector_fallback_aio_pages,
+      profile.aio_pages);
   search_ctx.reset();
   ASSERT_EQ(reader->close(), 0);
   reader.reset();
@@ -426,7 +426,8 @@ TEST_F(HnswStreamerTest, TestHnswSearchBufferMMap) {
   auto read_storage = IndexFactory::CreateStorage("MMapFileStorage");
   ASSERT_NE(nullptr, read_storage);
   ASSERT_EQ(0, read_storage->init(stg_params));
-  ASSERT_EQ(0, read_storage->open(dir_ + "Test/TestHnswSearchBufferMMap", false));
+  ASSERT_EQ(0,
+            read_storage->open(dir_ + "Test/TestHnswSearchBufferMMap", false));
   ASSERT_EQ(0, read_streamer->open(read_storage));
   size_t topk = 3;
   auto provider = read_streamer->create_provider();

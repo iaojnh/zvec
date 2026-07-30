@@ -14,15 +14,14 @@
 
 // Unit tests for diskann_buffer_pool_read -- the core sector->page bridge that
 // BufferPoolAlignedFileReader forwards to. Verifies byte-identical reads, cache
-// hits on repeated access, unaligned rejection, correct handling of duplicate
-// pages, eviction/reload, and no page-pin leaks on the acquire-failure path.
+// hits on repeated access, unaligned range stitching, correct handling of
+// duplicate pages, eviction/reload, and no pin leaks on acquire failure.
 //
 // NOTE: this targets the shim rather than BufferPoolAlignedFileReader directly
 // because the reader header pulls <ailego/io/libaio_loader.h>, which cannot
 // coexist in one TU with vector_page_table.h's <zvec/ailego/io/...> copy. The
 // reader is exercised end-to-end in diskann_buffer_pool_search_test.cc.
 
-#include "diskann_buffer_pool_shim.h"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -31,6 +30,7 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include "diskann_buffer_pool_shim.h"
 
 using zvec::ailego::block_id_t;
 using zvec::ailego::kVectorPageSize;
@@ -86,6 +86,12 @@ class DiskAnnReaderTest : public ::testing::Test {
     return diskann_buffer_pool_read(pool, offsets.data(), lens.data(),
                                     bufs.data(), offsets.size());
   }
+  int ReadReqsBypass(VecBufferPool *pool, const std::vector<uint64_t> &offsets,
+                     const std::vector<uint64_t> &lens,
+                     const std::vector<void *> &bufs) {
+    return diskann_buffer_pool_read_bypass(pool, offsets.data(), lens.data(),
+                                           bufs.data(), offsets.size());
+  }
   std::vector<std::string> files_;
 };
 
@@ -98,9 +104,9 @@ TEST_F(DiskAnnReaderTest, SingleSectorRead) {
   ASSERT_EQ(pool.init(), 0);
 
   std::vector<char> buf(kVectorPageSize);
-  ASSERT_EQ(ReadReqs(&pool, {3 * kVectorPageSize}, {kVectorPageSize},
-                     {buf.data()}),
-            kDiskAnnBufferPoolOk);
+  ASSERT_EQ(
+      ReadReqs(&pool, {3 * kVectorPageSize}, {kVectorPageSize}, {buf.data()}),
+      kDiskAnnBufferPoolOk);
   ExpectPageContent(buf.data(), 3);
 }
 
@@ -159,9 +165,9 @@ TEST_F(DiskAnnReaderTest, MissThenHit) {
 
   std::vector<char> buf(kVectorPageSize);
   auto read_page = [&](size_t p) {
-    ASSERT_EQ(ReadReqs(&pool, {p * kVectorPageSize}, {kVectorPageSize},
-                       {buf.data()}),
-              kDiskAnnBufferPoolOk);
+    ASSERT_EQ(
+        ReadReqs(&pool, {p * kVectorPageSize}, {kVectorPageSize}, {buf.data()}),
+        kDiskAnnBufferPoolOk);
     ExpectPageContent(buf.data(), p);
   };
 
@@ -195,27 +201,35 @@ TEST_F(DiskAnnReaderTest, EvictionThenReReadCorrect) {
   EXPECT_GT(s.evict, 0u);
 }
 
-// Unaligned offset is rejected.
-TEST_F(DiskAnnReaderTest, RejectUnalignedOffset) {
+// FileDumper segment offsets may be unaligned even when DiskANN requests a
+// whole sector. The bridge must stitch the range from both backing pages.
+TEST_F(DiskAnnReaderTest, ReadUnalignedOffsetAcrossPages) {
   InitPool(/*capacity_pages=*/16);
   VecBufferPool pool(NewFile(/*num_pages=*/8), /*writable=*/false);
   ASSERT_EQ(pool.init(), 0);
 
   std::vector<char> buf(kVectorPageSize);
-  EXPECT_EQ(ReadReqs(&pool, {/*offset=*/123}, {kVectorPageSize}, {buf.data()}),
-            kDiskAnnBufferPoolInvalidArg);
+  ASSERT_EQ(ReadReqs(&pool, {/*offset=*/123}, {kVectorPageSize}, {buf.data()}),
+            kDiskAnnBufferPoolOk);
+  EXPECT_EQ(0, buf.front());
+  EXPECT_EQ(0, buf[kVectorPageSize - 124]);
+  EXPECT_EQ(1, buf[kVectorPageSize - 123]);
+  EXPECT_EQ(1, buf.back());
 }
 
-// Unaligned length is rejected.
-TEST_F(DiskAnnReaderTest, RejectUnalignedLength) {
+// The shim also supports a final partial page for generic range reads.
+TEST_F(DiskAnnReaderTest, ReadUnalignedLength) {
   InitPool(/*capacity_pages=*/16);
   VecBufferPool pool(NewFile(/*num_pages=*/8), /*writable=*/false);
   ASSERT_EQ(pool.init(), 0);
 
   std::vector<char> buf(kVectorPageSize + 100);
-  EXPECT_EQ(
-      ReadReqs(&pool, {0}, {kVectorPageSize + 100}, {buf.data()}),
-      kDiskAnnBufferPoolInvalidArg);
+  ASSERT_EQ(ReadReqs(&pool, {0}, {kVectorPageSize + 100}, {buf.data()}),
+            kDiskAnnBufferPoolOk);
+  EXPECT_EQ(0, buf.front());
+  EXPECT_EQ(0, buf[kVectorPageSize - 1]);
+  EXPECT_EQ(1, buf[kVectorPageSize]);
+  EXPECT_EQ(1, buf.back());
 }
 
 // An out-of-range page makes acquire fail; no pin may leak, and a subsequent
@@ -229,17 +243,46 @@ TEST_F(DiskAnnReaderTest, AcquireFailureLeavesNoPin) {
   std::vector<char> buf0(kVectorPageSize);
   std::vector<char> buf1(kVectorPageSize);
   // Page 1 is valid, page num_pages is one past the end -> acquire fails.
-  EXPECT_NE(ReadReqs(&pool,
-                     {1 * kVectorPageSize, num_pages * kVectorPageSize},
-                     {kVectorPageSize, kVectorPageSize},
-                     {buf0.data(), buf1.data()}),
-            kDiskAnnBufferPoolOk);
+  EXPECT_NE(
+      ReadReqs(&pool, {1 * kVectorPageSize, num_pages * kVectorPageSize},
+               {kVectorPageSize, kVectorPageSize}, {buf0.data(), buf1.data()}),
+      kDiskAnnBufferPoolOk);
   EXPECT_TRUE(pool.page_table_.is_released(1));
 
   // A valid read still works afterwards.
-  ASSERT_EQ(ReadReqs(&pool, {1 * kVectorPageSize}, {kVectorPageSize},
-                     {buf0.data()}),
-            kDiskAnnBufferPoolOk);
+  ASSERT_EQ(
+      ReadReqs(&pool, {1 * kVectorPageSize}, {kVectorPageSize}, {buf0.data()}),
+      kDiskAnnBufferPoolOk);
   ExpectPageContent(buf0.data(), 1);
   EXPECT_TRUE(pool.page_table_.is_released(1));
+}
+
+// Static-cache construction reserves its bytes from the same hard pool. A
+// normal cached read cannot allocate a page when that reservation fills the
+// pool, while the direct bypass must still read successfully without admitting
+// a page.
+TEST_F(DiskAnnReaderTest, BypassReadSurvivesFullExternalReservation) {
+  InitPool(/*capacity_pages=*/2);
+  VecBufferPool pool(NewFile(/*num_pages=*/4), /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+
+  auto &memory_pool = MemoryLimitPool::get_instance();
+  ASSERT_TRUE(memory_pool.try_charge_external(memory_pool.capacity()));
+  struct ExternalChargeGuard {
+    MemoryLimitPool &pool;
+    size_t bytes;
+    ~ExternalChargeGuard() {
+      pool.release_external(bytes);
+    }
+  } charge_guard{memory_pool, memory_pool.capacity()};
+
+  std::vector<char> buf(kVectorPageSize);
+  EXPECT_NE(
+      ReadReqs(&pool, {2 * kVectorPageSize}, {kVectorPageSize}, {buf.data()}),
+      kDiskAnnBufferPoolOk);
+  ASSERT_EQ(ReadReqsBypass(&pool, {2 * kVectorPageSize}, {kVectorPageSize},
+                           {buf.data()}),
+            kDiskAnnBufferPoolOk);
+  ExpectPageContent(buf.data(), 2);
+  EXPECT_FALSE(pool.is_page_resident(2));
 }

@@ -20,16 +20,16 @@
 // top-K keys and scores. It also verifies that repeated queries turn logical
 // sector reads into buffer-pool cache hits.
 
-#include "diskann_searcher.h"
-#include <gtest/gtest.h>
 #include <memory>
 #include <vector>
+#include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_framework.h>
+#include "utility/utility_params.h"
 #include "diskann_holder.h"
 #include "diskann_params.h"
-#include "utility/utility_params.h"
+#include "diskann_searcher.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -90,10 +90,10 @@ class DiskAnnBufferPoolSearchTest : public testing::Test {
     ASSERT_EQ(0, dumper->close());
   }
 
-  IndexSearcher::Pointer MakeSearcher(
-      const IndexStorage::Pointer &storage, uint64_t node_budget_bytes = 0,
-      const std::string &node_page_policy =
-          DISKANN_CACHE_NODE_PAGE_POLICY_KEEP) {
+  IndexSearcher::Pointer MakeSearcher(const IndexStorage::Pointer &storage,
+                                      uint64_t node_budget_bytes = 0,
+                                      const std::string &node_page_policy =
+                                          DISKANN_CACHE_NODE_PAGE_POLICY_KEEP) {
     IndexSearcher::Pointer searcher =
         IndexFactory::CreateSearcher("DiskAnnSearcher");
     EXPECT_NE(searcher, nullptr);
@@ -101,8 +101,7 @@ class DiskAnnBufferPoolSearchTest : public testing::Test {
     if (node_budget_bytes == 0) {
       sp.set(PARAM_DISKANN_SEARCHER_CACHE_NODE_NUM, 0);
     } else {
-      sp.set(PARAM_DISKANN_SEARCHER_CACHE_NODE_BUDGET_BYTES,
-             node_budget_bytes);
+      sp.set(PARAM_DISKANN_SEARCHER_CACHE_NODE_BUDGET_BYTES, node_budget_bytes);
     }
     sp.set(PARAM_DISKANN_SEARCHER_CACHE_NODE_PAGE_POLICY, node_page_policy);
     sp.set("zvec.diskann.searcher.list_size", 200);
@@ -225,9 +224,8 @@ TEST_F(DiskAnnBufferPoolSearchTest,
   constexpr uint64_t kNodeBudget = 4ULL * 1024 * 1024;
   const size_t used_before = MemoryLimitPool::get_instance().used();
   const uint64_t evict_before = pool->stats().evict;
-  auto searcher = MakeSearcher(
-      buffer_storage, kNodeBudget,
-      DISKANN_CACHE_NODE_PAGE_POLICY_EVICT);
+  auto searcher = MakeSearcher(buffer_storage, kNodeBudget,
+                               DISKANN_CACHE_NODE_PAGE_POLICY_EVICT);
   ASSERT_NE(searcher, nullptr);
 
   EXPECT_GT(MemoryLimitPool::get_instance().used(), used_before);

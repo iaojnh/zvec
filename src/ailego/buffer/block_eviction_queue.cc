@@ -162,8 +162,8 @@ void MemoryLimitPool::drain_free_list() {
   }
   if (released != 0) {
     size_t released_bytes = released * buffer_size;
-    size_t prev = committed_size_.fetch_sub(released_bytes,
-                                            std::memory_order_relaxed);
+    size_t prev =
+        committed_size_.fetch_sub(released_bytes, std::memory_order_relaxed);
     (void)prev;
     assert(buffer_size != 0 && prev >= released_bytes);
     LOG_INFO("MemoryLimitPool: released %zu cached buffers", released);
@@ -193,9 +193,9 @@ bool MemoryLimitPool::try_reserve_used(size_t bytes) {
 bool MemoryLimitPool::try_reserve_committed(size_t bytes) {
   size_t committed = committed_size_.load(std::memory_order_relaxed);
   while (committed <= pool_size_ && bytes <= pool_size_ - committed) {
-    if (committed_size_.compare_exchange_weak(
-            committed, committed + bytes, std::memory_order_relaxed,
-            std::memory_order_relaxed)) {
+    if (committed_size_.compare_exchange_weak(committed, committed + bytes,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
       return true;
     }
   }
@@ -205,9 +205,9 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes) {
 bool MemoryLimitPool::is_cacheable_buffer_size(size_t buffer_size) {
   size_t cached = cached_buffer_size_.load(std::memory_order_relaxed);
   if (cached == 0) {
-    cached_buffer_size_.compare_exchange_strong(
-        cached, buffer_size, std::memory_order_relaxed,
-        std::memory_order_relaxed);
+    cached_buffer_size_.compare_exchange_strong(cached, buffer_size,
+                                                std::memory_order_relaxed,
+                                                std::memory_order_relaxed);
     if (cached == 0) {
       cached = buffer_size;
     }
@@ -371,8 +371,7 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
     }
 
     size_t committed = committed_size_.load(std::memory_order_relaxed);
-    size_t available =
-        committed >= pool_size_ ? 0 : pool_size_ - committed;
+    size_t available = committed >= pool_size_ ? 0 : pool_size_ - committed;
     if (available >= buffer_size) {
       continue;
     }

@@ -29,6 +29,7 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/external_cache.h>
 #include <zvec/ailego/buffer/memory_budget.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 
@@ -36,8 +37,8 @@ using namespace zvec::ailego;
 
 namespace {
 
-// Create a backing file of `num_pages` pages, page p filled with byte (p & 0xff)
-// so page content can be verified after arbitrary eviction/reload.
+// Create a backing file of `num_pages` pages, page p filled with byte (p &
+// 0xff) so page content can be verified after arbitrary eviction/reload.
 std::string MakeBackingFile(size_t num_pages) {
   static std::atomic<uint64_t> seq{0};
   const size_t ps = kVectorPageSize;
@@ -78,6 +79,32 @@ class BufferPoolTest : public ::testing::Test {
   std::vector<std::string> files_;
 };
 
+struct SizedCachePayload {
+  std::shared_ptr<std::vector<char>> data;
+};
+
+struct SizedCacheLoader {
+  using Value = std::shared_ptr<std::vector<char>>;
+
+  bool load(size_t bytes, SizedCachePayload &payload, size_t &size) {
+    payload.data = std::make_shared<std::vector<char>>(bytes);
+    size = bytes;
+    return true;
+  }
+
+  Value value(const SizedCachePayload &payload) const {
+    return payload.data;
+  }
+
+  void clear(SizedCachePayload &payload) const {
+    payload.data.reset();
+  }
+};
+
+using SizedExternalCache =
+    ExternalCache<size_t, SizedCachePayload, SizedCacheLoader,
+                  std::hash<size_t>, std::equal_to<size_t>>;
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -97,8 +124,8 @@ TEST_F(BufferPoolTest, DataCorrectUnderEviction) {
   std::vector<char> buf(kVectorPageSize);
   for (int iter = 0; iter < 3; ++iter) {
     for (size_t p = 0; p < num_pages; ++p) {
-      ASSERT_TRUE(handle.read_range(p * kVectorPageSize, kVectorPageSize,
-                                    buf.data()));
+      ASSERT_TRUE(
+          handle.read_range(p * kVectorPageSize, kVectorPageSize, buf.data()));
       ExpectPageContent(buf.data(), p);
     }
   }
@@ -156,8 +183,7 @@ TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
   auto &memory_pool = MemoryLimitPool::get_instance();
   InitPool(/*capacity_pages=*/4);
 
-  ASSERT_TRUE(
-      memory_pool.try_charge_external(3 * kVectorPageSize));
+  ASSERT_TRUE(memory_pool.try_charge_external(3 * kVectorPageSize));
   EXPECT_EQ(3 * kVectorPageSize, memory_pool.used());
 
   char *page = nullptr;
@@ -168,6 +194,25 @@ TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
   memory_pool.release_buffer(page, kVectorPageSize);
   memory_pool.release_external(3 * kVectorPageSize);
   EXPECT_EQ(0u, memory_pool.used());
+}
+
+TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
+  auto &memory_pool = MemoryLimitPool::get_instance();
+  InitPool(/*capacity_pages=*/2);
+
+  {
+    SizedExternalCache cache;
+    EXPECT_EQ(nullptr, cache.acquire(3 * kVectorPageSize));
+    EXPECT_EQ(0u, memory_pool.used());
+
+    auto value = cache.acquire(kVectorPageSize);
+    ASSERT_NE(nullptr, value);
+    EXPECT_EQ(kVectorPageSize, memory_pool.used());
+    cache.release(kVectorPageSize);
+  }
+
+  EXPECT_EQ(0u, memory_pool.used());
+  EXPECT_EQ(0u, memory_pool.committed());
 }
 
 TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
@@ -190,8 +235,8 @@ TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
   EXPECT_EQ(kCapacityPages * kVectorPageSize, cached.committed);
   EXPECT_EQ(kCapacityPages, cached.free_buffers);
 
-  ASSERT_TRUE(memory_pool.try_charge_external(kCapacityPages *
-                                              kVectorPageSize));
+  ASSERT_TRUE(
+      memory_pool.try_charge_external(kCapacityPages * kVectorPageSize));
   MemoryLimitPool::PoolStats charged = memory_pool.stats();
   EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.used);
   EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.committed);
@@ -214,12 +259,12 @@ TEST_F(BufferPoolTest, LargeExternalReservationReclaimsMultipleBatches) {
   auto handle = pool.get_handle();
   std::vector<char> data(kVectorPageSize);
   for (size_t page = 0; page < kCapacityPages; ++page) {
-    ASSERT_TRUE(handle.read_range(
-        page * kVectorPageSize, kVectorPageSize, data.data()));
+    ASSERT_TRUE(handle.read_range(page * kVectorPageSize, kVectorPageSize,
+                                  data.data()));
   }
 
-  ASSERT_TRUE(memory_pool.try_charge_external(
-      kExternalPages * kVectorPageSize));
+  ASSERT_TRUE(
+      memory_pool.try_charge_external(kExternalPages * kVectorPageSize));
   EXPECT_LE(memory_pool.used(), memory_pool.capacity());
   memory_pool.release_external(kExternalPages * kVectorPageSize);
 }
@@ -233,8 +278,7 @@ TEST_F(BufferPoolTest, PriorityChangeMigratesQueuedPageBeforeEviction) {
   auto handle = pool.get_handle();
   std::vector<char> data(kVectorPageSize);
   ASSERT_TRUE(handle.read_range(0, kVectorPageSize, data.data()));
-  ASSERT_TRUE(handle.read_range(kVectorPageSize, kVectorPageSize,
-                                data.data()));
+  ASSERT_TRUE(handle.read_range(kVectorPageSize, kVectorPageSize, data.data()));
 
   ASSERT_TRUE(pool.set_page_priority(0, VecBufferPool::kHighPriority));
   ASSERT_TRUE(pool.set_page_priority(1, VecBufferPool::kLowPriority));
@@ -252,8 +296,8 @@ TEST_F(BufferPoolTest, BypassReadDoesNotAdmitPage) {
   ASSERT_EQ(pool.init(), 0);
   auto handle = pool.get_handle();
   std::vector<char> data(kVectorPageSize);
-  ASSERT_TRUE(handle.read_range_bypass(
-      kVectorPageSize, kVectorPageSize, data.data()));
+  ASSERT_TRUE(
+      handle.read_range_bypass(kVectorPageSize, kVectorPageSize, data.data()));
 
   ExpectPageContent(data.data(), 1);
   EXPECT_FALSE(pool.is_page_resident(1));
@@ -275,14 +319,14 @@ TEST_F(BufferPoolTest, UnifiedMemoryBudgetEnforcesExplicitPartitions) {
   config.safety_reserve_bytes = 50;
   ASSERT_TRUE(budget.configure(config));
 
-  EXPECT_TRUE(budget.try_charge(
-      MemoryBudgetManager::Category::QueryWorking, 100));
-  EXPECT_FALSE(budget.try_charge(
-      MemoryBudgetManager::Category::QueryWorking, 51));
-  EXPECT_TRUE(budget.try_charge(
-      MemoryBudgetManager::Category::ResidentMetadata, 80));
-  EXPECT_FALSE(budget.try_charge(
-      MemoryBudgetManager::Category::ResidentMetadata, 21));
+  EXPECT_TRUE(
+      budget.try_charge(MemoryBudgetManager::Category::QueryWorking, 100));
+  EXPECT_FALSE(
+      budget.try_charge(MemoryBudgetManager::Category::QueryWorking, 51));
+  EXPECT_TRUE(
+      budget.try_charge(MemoryBudgetManager::Category::ResidentMetadata, 80));
+  EXPECT_FALSE(
+      budget.try_charge(MemoryBudgetManager::Category::ResidentMetadata, 21));
 
   budget.release(MemoryBudgetManager::Category::QueryWorking, 100);
   budget.release(MemoryBudgetManager::Category::ResidentMetadata, 80);
@@ -413,7 +457,8 @@ TEST_F(BufferPoolTest, BackgroundReclaimsToLowWatermark) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Concurrent random reads across many threads exercise the sharded free-list,
+// 4. Concurrent random reads across many threads exercise the sharded
+// free-list,
 //    concurrent acquire/release/evict and the background thread simultaneously.
 //    All reads must return correct data with no crash or corruption.
 // ---------------------------------------------------------------------------

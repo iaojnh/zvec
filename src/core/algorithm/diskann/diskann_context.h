@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <limits>
 #include <zvec/core/framework/index_context.h>
 #include "utility/topk_result_builder.h"
 #include "diskann_dist_calculator.h"
@@ -128,6 +129,11 @@ class DiskAnnContext : public IndexContext,
   //! Update the parameters of context
   int update(const ailego::Params &params) override;
 
+  //! Atomically update search parameters after reserving their full working
+  //! set. The top-k heap and fetched result documents own vector copies, so
+  //! their slots and payloads must be charged before reserve().
+  int set_search_params(uint32_t topk, uint32_t list_size);
+
   inline DistCalculator &dist_calculator() {
     return dc_;
   }
@@ -135,16 +141,19 @@ class DiskAnnContext : public IndexContext,
  public:
   //! Set topk of search result
   void set_topk(uint32_t val) override {
-    topk_ = val;
-    topk_heap_.limit(val);
+    parameter_error_ = set_search_params(val, list_size_);
   }
 
   void set_list_size(uint32_t list_size) {
-    list_size_ = list_size;
+    parameter_error_ = set_search_params(topk_, list_size);
   }
 
   void set_fetch_vector(bool v) override {
     fetch_vector_ = v;
+  }
+
+  bool fetch_vector() const override {
+    return fetch_vector_;
   }
 
   //! Get topk
@@ -154,6 +163,10 @@ class DiskAnnContext : public IndexContext,
 
   inline uint32_t list_size() const {
     return list_size_;
+  }
+
+  inline int parameter_error() const {
+    return parameter_error_;
   }
 
   inline void reset_query(const void *query) {
@@ -276,13 +289,19 @@ class DiskAnnContext : public IndexContext,
 
   //! Set group params
   void set_group_params(uint32_t group_num, uint32_t group_topk) override {
+    const uint64_t total =
+        static_cast<uint64_t>(group_topk) * static_cast<uint64_t>(group_num);
+    if (total > std::numeric_limits<uint32_t>::max()) {
+      parameter_error_ = IndexError_InvalidArgument;
+      return;
+    }
+    const int ret = set_search_params(static_cast<uint32_t>(total), list_size_);
+    if (ret != 0) {
+      parameter_error_ = ret;
+      return;
+    }
     group_num_ = group_num;
     group_topk_ = group_topk;
-
-    topk_ = group_topk_ * group_num_;
-
-    topk_heap_.limit(topk_);
-
     group_topk_heaps_.clear();
   }
 
@@ -305,6 +324,9 @@ class DiskAnnContext : public IndexContext,
   }
 
  private:
+  bool calculate_query_budget(uint32_t topk, uint32_t list_size,
+                              uint64_t *bytes) const;
+
   //! Hooks required by TopkResultBuilder.
   std::vector<IndexDocumentList> &mutable_results() {
     return results_;
@@ -372,7 +394,9 @@ class DiskAnnContext : public IndexContext,
   VisitFilter visit_filter_{};
   uint32_t filter_mode_{VisitFilter::ByteMap};
   float negative_probility_{DiskAnnEntity::kDefaultBFNegativeProbility};
+  uint64_t query_fixed_budget_bytes_{0};
   uint64_t query_budget_bytes_{0};
+  int parameter_error_{0};
 };
 
 }  // namespace core

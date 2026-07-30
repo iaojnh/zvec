@@ -17,6 +17,7 @@
 #include <string>
 #include <zvec/core/interface/index.h>
 #if DISKANN_SUPPORTED
+#include "algorithm/diskann/diskann_context.h"
 #include "algorithm/diskann/diskann_params.h"
 #include "utility/utility_params.h"
 #include "holder_builder.h"
@@ -323,15 +324,23 @@ int DiskAnnIndex::_prepare_for_search(
     return core::IndexError_Unsupported;
   }
 
-  context->set_topk(diskann_search_param->topk);
+  auto *diskann_context = dynamic_cast<core::DiskAnnContext *>(context.get());
+  if (diskann_context == nullptr) {
+    LOG_ERROR("Invalid search context: expected DiskAnnContext");
+    return core::IndexError_Cast;
+  }
 
-  // Propagate the query-time beam-search list size into the context. Must be
-  // at least topk to keep enough candidates for a correct result.
-  ailego::Params params;
-  params.set(
-      core::PARAM_DISKANN_SEARCHER_LIST_SIZE,
+  // Charge both the beam-search candidates and the full-vector copies owned
+  // by the top-k heap before either container is allowed to grow.
+  const int ret = diskann_context->set_search_params(
+      diskann_search_param->topk,
       std::max(diskann_search_param->topk, diskann_search_param->list_size));
-  context->update(params);
+  if (ret != 0) {
+    LOG_ERROR("Failed to prepare DiskANN search context: %s",
+              core::IndexError::What(ret));
+    return ret;
+  }
+  diskann_context->set_fetch_vector(diskann_search_param->fetch_vector);
 
   return 0;
 }

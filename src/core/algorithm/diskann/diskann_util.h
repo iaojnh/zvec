@@ -35,7 +35,20 @@ class DiskAnnUtil {
   }
 
   static inline void alloc_aligned(void **ptr, size_t size, size_t align) {
-    *ptr = ::aligned_alloc(align, size);
+    if (ptr == nullptr) {
+      return;
+    }
+    *ptr = nullptr;
+    if (size == 0 || align < sizeof(void *) || (align & (align - 1)) != 0) {
+      return;
+    }
+#if defined(_MSC_VER)
+    *ptr = _aligned_malloc(size, align);
+#else
+    if (::posix_memalign(ptr, align, size) != 0) {
+      *ptr = nullptr;
+    }
+#endif
   }
 
   static inline void free_aligned(void *ptr) {
@@ -43,7 +56,7 @@ class DiskAnnUtil {
       return;
     }
 
-    free(ptr);
+    ailego_aligned_free(ptr);
   }
 
   template <typename T>

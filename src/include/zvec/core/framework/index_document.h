@@ -132,12 +132,14 @@ class IndexDocument {
       : key_(rhs.key_),
         score_(rhs.score_),
         index_(rhs.index_),
-        vector_(rhs.vector_),
-        vector_string_(std::move(rhs.vector_string_)),
+        vector_string_(rhs.vector_string_),
         sparse_doc_{rhs.sparse_doc_} {
     if (rhs.has_vec_mem_block_) {
       vec_mem_block_ = rhs.vec_mem_block_;
       has_vec_mem_block_ = true;
+      vector_ = vec_mem_block_.data();
+    } else {
+      vector_ = rhs.vector_;
     }
   }
 
@@ -147,11 +149,15 @@ class IndexDocument {
       key_ = rhs.key_;
       score_ = rhs.score_;
       index_ = rhs.index_;
-      vector_ = rhs.vector_;
       vector_string_ = rhs.vector_string_;
       if (rhs.has_vec_mem_block_) {
         vec_mem_block_ = rhs.vec_mem_block_;
         has_vec_mem_block_ = true;
+        vector_ = vec_mem_block_.data();
+      } else {
+        vec_mem_block_.reset();
+        has_vec_mem_block_ = false;
+        vector_ = rhs.vector_;
       }
       sparse_doc_ = rhs.sparse_doc_;
     }

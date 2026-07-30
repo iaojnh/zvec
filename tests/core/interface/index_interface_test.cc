@@ -960,8 +960,7 @@ TEST(IndexInterface, Serialize) {
                      .Build();
 
     auto json = param->SerializeToJson();
-    auto deserialized_param =
-        IndexFactory::DeserializeIndexParamFromJson(json);
+    auto deserialized_param = IndexFactory::DeserializeIndexParamFromJson(json);
     ASSERT_NE(nullptr, deserialized_param.get());
 
     auto diskann_param =
@@ -971,8 +970,7 @@ TEST(IndexInterface, Serialize) {
     EXPECT_EQ(80, diskann_param->list_size);
     EXPECT_EQ(16, diskann_param->pq_chunk_num);
     EXPECT_EQ(0U, diskann_param->cache_node_num);
-    EXPECT_EQ(512ULL * 1024 * 1024,
-              diskann_param->cache_node_budget_bytes);
+    EXPECT_EQ(512ULL * 1024 * 1024, diskann_param->cache_node_budget_bytes);
     EXPECT_EQ(json, diskann_param->SerializeToJson());
     EXPECT_EQ(param->SerializeToJson(true),
               diskann_param->SerializeToJson(true));
@@ -2335,8 +2333,8 @@ TEST(IndexInterface, ExternalVectorFastSearchRecallRegression) {
   exact_results.reserve(kNumVectors);
   for (uint32_t i = 0; i < kNumVectors; ++i) {
     const float *vector = all_vectors.data() + i * kDimension;
-    const float score = std::inner_product(
-        query_vector.begin(), query_vector.end(), vector, 0.0f);
+    const float score = std::inner_product(query_vector.begin(),
+                                           query_vector.end(), vector, 0.0f);
     exact_results.emplace_back(score, i);
   }
   std::sort(exact_results.begin(), exact_results.end(),
@@ -2361,13 +2359,11 @@ TEST(IndexInterface, ExternalVectorFastSearchRecallRegression) {
                    .Build();
   auto index = IndexFactory::CreateAndInitIndex(*param);
   ASSERT_NE(nullptr, index);
-  ASSERT_EQ(0,
-            index->Open(index_name,
-                        {StorageOptions::StorageType::kMMAP, true}));
+  ASSERT_EQ(
+      0, index->Open(index_name, {StorageOptions::StorageType::kMMAP, true}));
 
   for (uint32_t i = 0; i < kNumVectors; ++i) {
-    VectorData vector_data{
-        DenseVector{all_vectors.data() + i * kDimension}};
+    VectorData vector_data{DenseVector{all_vectors.data() + i * kDimension}};
     ASSERT_EQ(0, index->AddWithSource(vector_data, i, source));
   }
 

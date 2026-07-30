@@ -486,6 +486,44 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
   }
 }
 
+int BufferPoolAlignedFileReader::read_bypass(
+    std::vector<AlignedRead> &read_reqs, IOContext & /*ctx*/, bool async) {
+  if (async == true) {
+    LOG_WARN("Async currently not supported");
+  }
+  if (pool_ == nullptr) {
+    LOG_ERROR("BufferPoolAlignedFileReader::read_bypass: null buffer pool");
+    return IndexError_Runtime;
+  }
+
+  const size_t count = read_reqs.size();
+  if (count == 0) {
+    return 0;
+  }
+  std::vector<uint64_t> offsets(count);
+  std::vector<uint64_t> lens(count);
+  std::vector<void *> bufs(count);
+  for (size_t i = 0; i < count; ++i) {
+    offsets[i] = read_reqs[i].offset;
+    lens[i] = read_reqs[i].len;
+    bufs[i] = read_reqs[i].buf;
+  }
+
+  const int rc = diskann_buffer_pool_read_bypass(
+      pool_, offsets.data(), lens.data(), bufs.data(), count);
+  switch (rc) {
+    case kDiskAnnBufferPoolOk:
+      return 0;
+    case kDiskAnnBufferPoolInvalidArg:
+      LOG_ERROR("BufferPoolAlignedFileReader::read_bypass: invalid request");
+      return IndexError_InvalidArgument;
+    default:
+      LOG_ERROR(
+          "BufferPoolAlignedFileReader::read_bypass: backing read failed");
+      return IndexError_ReadData;
+  }
+}
+
 
 }  // namespace core
 }  // namespace zvec
