@@ -1165,6 +1165,11 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len,
       return false;
     }
     size_t actually_read = static_cast<size_t>(got);
+    // The bulk path bypasses acquire_buffer(), so account for the cold pages
+    // fetched by this pread here. Without this, cache-miss statistics depend
+    // on the host page size and whether a read crosses the bulk threshold.
+    size_t pages_read = (actually_read + kVectorPageSize - 1) / kVectorPageSize;
+    pool_.miss_count_.fetch_add(pages_read, std::memory_order_relaxed);
 
     for (size_t j = 0; j < run_pages; ++j) {
       block_id_t pid = static_cast<block_id_t>(run_start + j);

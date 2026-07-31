@@ -26,7 +26,6 @@ using namespace zvec::core;
 namespace {
 
 constexpr size_t kPoolSize = 16UL * 1024UL * 1024UL;
-constexpr size_t kPayloadSize = 3UL * 4096UL;
 
 class BufferReadStorageTest : public testing::Test {
  protected:
@@ -37,7 +36,9 @@ class BufferReadStorageTest : public testing::Test {
     ASSERT_NE(dumper, nullptr);
     ASSERT_EQ(0, dumper->create(file_path_));
 
-    payload_.resize(kPayloadSize);
+    // Four native pages force read_range's bulk cold-read path on every
+    // platform (macOS commonly uses 16 KiB pages, Linux 4 KiB).
+    payload_.resize(4UL * ailego::kVectorPageSize);
     for (size_t i = 0; i < payload_.size(); ++i) {
       payload_[i] = static_cast<char>(i % 251);
     }
