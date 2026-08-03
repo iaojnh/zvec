@@ -81,7 +81,7 @@ std::vector<float16_t> MakeFp16Vector(uint64_t doc_id) {
 CollectionSchema::Ptr MakeSchema(MetricType metric, bool include_fp16 = false,
                                  bool include_dynamic = false) {
   auto schema = std::make_shared<CollectionSchema>("diskann_mobile");
-  schema->set_max_doc_count_per_segment(128);
+  schema->set_max_doc_count_per_segment(1000);
   EXPECT_TRUE(schema
                   ->add_field(std::make_shared<FieldSchema>(
                       "category", DataType::INT32, false))
