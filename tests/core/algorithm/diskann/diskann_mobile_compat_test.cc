@@ -97,7 +97,7 @@ TEST(DiskAnnMobileCompatTest, PortableReaderReadsAlignedBatch) {
 
   LinuxAlignedFileReader reader;
   reader.open(file.path());
-  IOContext context{0};
+  IOContext context{};
   std::vector<AlignedRead> requests;
   requests.emplace_back(0, kBlockSize, output);
   requests.emplace_back(kBlockSize, kBlockSize,
