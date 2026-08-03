@@ -14,6 +14,8 @@
 
 #include "diskann_searcher_entity.h"
 
+#include <cinttypes>
+
 namespace zvec {
 namespace core {
 
@@ -398,7 +400,7 @@ const void *DiskAnnSearcherEntity::get_vector(diskann_id_t id) const {
   const void *vec;
   if (ailego_unlikely(vector_segment_->read(total_offset, &vec, read_size) !=
                       read_size)) {
-    LOG_ERROR("Read vector from segment failed, id: %u, offset: %lu", id,
+    LOG_ERROR("Read vector from segment failed, id: %u, offset: %" PRIu64, id,
               total_offset);
     return nullptr;
   }

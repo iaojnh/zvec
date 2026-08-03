@@ -17,7 +17,7 @@
 
 #include <fcntl.h>
 
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <ailego/io/libaio_loader.h>  // dlopen-based libaio wrapper
 #endif
 
@@ -30,7 +30,7 @@
 namespace zvec {
 namespace core {
 
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
 typedef io_context_t IOContext;
 #else
 typedef uint32_t IOContext;
@@ -40,7 +40,8 @@ int setup_io_ctx(IOContext &ctx);
 int destroy_io_ctx(IOContext &ctx);
 
 // Log the current DiskAnn I/O backend status (async vs. synchronous pread).
-// Probes the backend on first call.  No-op on non-Linux platforms.
+// Probes the backend on first call. No-op outside desktop Linux; Android and
+// iOS always use synchronous pread.
 void log_diskann_io_backend();
 
 struct AlignedRead {

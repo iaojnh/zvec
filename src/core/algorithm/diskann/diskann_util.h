@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <cstdlib>
 #include <iostream>
 #include <zvec/core/framework/index_framework.h>
 #include "diskann_entity.h"
@@ -35,7 +36,13 @@ class DiskAnnUtil {
   }
 
   static inline void alloc_aligned(void **ptr, size_t size, size_t align) {
-    *ptr = ::aligned_alloc(align, size);
+    if (ptr == nullptr) {
+      return;
+    }
+    *ptr = nullptr;
+    if (size == 0 || ::posix_memalign(ptr, align, size) != 0) {
+      *ptr = nullptr;
+    }
   }
 
   static inline void free_aligned(void *ptr) {

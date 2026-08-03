@@ -21,8 +21,8 @@
  * a Vamana graph structure combined with product quantization (PQ) to
  * achieve high recall with efficient disk I/O.
  *
- * NOTE: DiskANN requires Linux x86_64 with libaio. On other platforms the
- * example will compile but the runtime plugin will fail to load.
+ * NOTE: DiskANN uses libaio when available on Linux x86. Android and iOS use
+ * the portable synchronous pread backend.
  *
  * Workflow demonstrated:
  *   1. Create collection schema with DiskANN-indexed vector field

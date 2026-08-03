@@ -28,7 +28,7 @@
 namespace zvec {
 namespace core {
 
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
 typedef struct io_event io_event_t;
 typedef struct iocb iocb_t;
 
@@ -39,7 +39,7 @@ static std::once_flag g_io_backend_log_once;
 #endif
 
 void log_diskann_io_backend() {
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
   auto &backend = ailego::IOBackend::Instance();
   if (backend.is_pread()) {
     LOG_WARN(
@@ -55,7 +55,7 @@ void log_diskann_io_backend() {
 }
 
 int setup_io_ctx(IOContext &ctx) {
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
   std::call_once(g_io_backend_log_once, log_diskann_io_backend);
   if (ailego::IOBackend::Instance().is_pread()) {
     return 0;
@@ -64,12 +64,13 @@ int setup_io_ctx(IOContext &ctx) {
 
   return ret;
 #else
+  (void)ctx;
   return 0;
 #endif
 }
 
 int destroy_io_ctx(IOContext &ctx) {
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
   if (ailego::IOBackend::Instance().is_pread() || ctx == nullptr) {
     return 0;
   }
@@ -80,6 +81,7 @@ int destroy_io_ctx(IOContext &ctx) {
 
   return ret;
 #else
+  (void)ctx;
   return 0;
 #endif
 }
@@ -102,7 +104,7 @@ static int execute_io_pread(int fd, std::vector<AlignedRead> &read_reqs) {
   return 0;
 }
 
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
 // io_getevents() should only fail permanently for an invalid context or
 // invalid arguments. If that happens after submission, io_destroy() is the
 // only safe way to quiesce the context before synchronous I/O touches the same
@@ -256,12 +258,14 @@ int execute_io_libaio(IOContext &ctx, int fd,
 
 int execute_io(IOContext &ctx, int fd, std::vector<AlignedRead> &read_reqs,
                uint64_t n_retries = 0) {
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
   if (ailego::IOBackend::Instance().is_pread() || ctx == nullptr) {
     return execute_io_pread(fd, read_reqs);
   }
   return execute_io_libaio(ctx, fd, read_reqs, n_retries);
 #else
+  (void)ctx;
+  (void)n_retries;
   return execute_io_pread(fd, read_reqs);
 #endif
 }
@@ -294,7 +298,7 @@ IOContext &LinuxAlignedFileReader::get_ctx() {
 }
 
 void LinuxAlignedFileReader::register_thread() {
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
   auto thread_id = std::this_thread::get_id();
   std::unique_lock<std::mutex> lk(ctx_mut);
   if (ctx_map.find(thread_id) != ctx_map.end()) {
@@ -330,7 +334,7 @@ void LinuxAlignedFileReader::register_thread() {
 }
 
 void LinuxAlignedFileReader::deregister_thread() {
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
   auto thread_id = std::this_thread::get_id();
   IOContext ctx;
 
@@ -355,7 +359,7 @@ void LinuxAlignedFileReader::deregister_thread() {
 }
 
 void LinuxAlignedFileReader::deregister_all_threads() {
-#if (defined(__linux) || defined(__linux__))
+#if defined(__linux__) && !defined(__ANDROID__)
   std::unique_lock<std::mutex> lk(ctx_mut);
   bool aio_available = ailego::IOBackend::Instance().available() !=
                        ailego::IOBackendType::kPread;
@@ -372,13 +376,13 @@ void LinuxAlignedFileReader::deregister_all_threads() {
 void LinuxAlignedFileReader::open(const std::string &fname) {
   int flags = O_RDONLY;
 
-#if defined(__linux__) || defined(__linux)
+#if defined(__linux__) && !defined(__ANDROID__)
   flags |= O_DIRECT | O_LARGEFILE;
 #endif
 
   this->file_desc = ::open(fname.c_str(), flags);
 
-#if defined(__linux__) || defined(__linux)
+#if defined(__linux__) && !defined(__ANDROID__)
   // O_DIRECT may not be supported on all filesystems (e.g. tmpfs, overlay).
   // Fall back to regular buffered I/O when it fails.
   if (this->file_desc == -1) {
