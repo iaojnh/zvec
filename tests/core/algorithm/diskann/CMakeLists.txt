@@ -4,7 +4,8 @@ file(GLOB_RECURSE ALL_TEST_SRCS *_test.cc)
 
 # The full DiskAnn suite repeatedly builds 10k-vector indexes and is intended
 # for desktop CI. Mobile CI runs a focused compatibility test that covers the
-# portable I/O path and an end-to-end build/dump/load/search cycle.
+# portable I/O path, failure recovery, concurrency, and an end-to-end
+# build/dump/load/search cycle.
 if(ANDROID OR IOS)
   list(FILTER ALL_TEST_SRCS INCLUDE REGEX "diskann_mobile_compat_test\\.cc$")
 endif()

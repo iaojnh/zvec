@@ -25,7 +25,7 @@ file(GLOB ALL_TEST_SRCS *_test.cc)
 
 # The collection DiskAnn stress cases repeatedly rebuild large indexes and are
 # intended for desktop CI. Mobile CI exercises DiskAnn through the focused
-# compatibility suite under tests/core/algorithm/diskann instead.
+# diskann_mobile_collection_test target and the core compatibility suite.
 if(ANDROID OR IOS)
   set(DISKANN_STRESS_TESTS 0)
 else()
