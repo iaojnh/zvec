@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "diskann_searcher_entity.h"
-
 #include <cinttypes>
 
 namespace zvec {
