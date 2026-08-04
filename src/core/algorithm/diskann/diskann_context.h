@@ -273,6 +273,21 @@ class DiskAnnContext : public IndexContext,
     return group_num_ > 0;
   }
 
+  //! Preserve query options when a pooled DiskAnn context is recreated for a
+  //! different index whose buffers have a different layout.
+  void copy_query_state_from(const DiskAnnContext &other) {
+    IndexContext::copy_query_state_from(other);
+    topk_ = other.topk_;
+    list_size_ = other.list_size_;
+    group_topk_ = other.group_topk_;
+    group_num_ = other.group_num_;
+    fetch_vector_ = other.fetch_vector_;
+    debug_mode_ = other.debug_mode_;
+    topk_heap_.clear();
+    topk_heap_.limit(topk_);
+    group_topk_heaps_.clear();
+  }
+
   //! Set group params
   void set_group_params(uint32_t group_num, uint32_t group_topk) override {
     group_num_ = group_num;

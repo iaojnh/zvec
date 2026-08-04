@@ -298,6 +298,35 @@ TEST(DiskAnnMobileCompatTest, BuildDumpLoadAndSearch) {
                    [](const auto &item) { return item.key() == kExpectedKey; }),
       result.end());
 
+  IndexStreamer::Pointer first_streamer =
+      IndexFactory::CreateStreamer("DiskAnnStreamer");
+  ASSERT_NE(first_streamer, nullptr);
+  ASSERT_EQ(first_streamer->init(meta, search_params), 0);
+  auto first_streamer_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(first_streamer_storage, nullptr);
+  ASSERT_EQ(first_streamer_storage->open(index_file.path(), false), 0);
+  ASSERT_EQ(first_streamer->open(first_streamer_storage), 0);
+
+  IndexStreamer::Pointer second_streamer =
+      IndexFactory::CreateStreamer("DiskAnnStreamer");
+  ASSERT_NE(second_streamer, nullptr);
+  ASSERT_EQ(second_streamer->init(meta, search_params), 0);
+  auto second_streamer_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(second_streamer_storage, nullptr);
+  ASSERT_EQ(second_streamer_storage->open(index_file.path(), false), 0);
+  ASSERT_EQ(second_streamer->open(second_streamer_storage), 0);
+
+  auto switching_context = first_streamer->create_context();
+  ASSERT_NE(switching_context, nullptr);
+  switching_context->set_topk(5);
+  switching_context->set_filter(
+      [](uint64_t key) { return key != kExpectedKey; });
+  ASSERT_EQ(
+      second_streamer->search_impl(query.data(), query_meta, switching_context),
+      0);
+  ASSERT_EQ(switching_context->result().size(), 1u);
+  EXPECT_EQ(switching_context->result().front().key(), kExpectedKey);
+
   context.reset();
   searcher.reset();
   storage.reset();

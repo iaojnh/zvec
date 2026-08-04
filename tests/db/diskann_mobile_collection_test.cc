@@ -282,7 +282,7 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
       std::make_shared<DiskAnnIndexParams>(MetricType::L2, 16, 32, 2);
   ASSERT_TRUE(collection->CreateIndex(kDynamicField, dynamic_index).ok());
   ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
-  auto dynamic_result = collection->Query(MakeFp32Query(8, kDynamicField));
+  auto dynamic_result = collection->Query(MakeFp32Query(8, kDynamicField, 32));
   ASSERT_TRUE(dynamic_result.has_value()) << dynamic_result.error().message();
   EXPECT_TRUE(ContainsPk(*dynamic_result, "pk_8"));
   ASSERT_TRUE(collection->DropIndex(kDynamicField).ok());
@@ -384,6 +384,27 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     ASSERT_FALSE(fp16_result->empty());
     if (metric == MetricType::L2) {
       EXPECT_TRUE(ContainsPk(*fp16_result, "pk_12"));
+    }
+
+    ASSERT_GE(fp32_result->size(), 2u);
+    const float best_score = fp32_result->front()->score();
+    const float worst_score = fp32_result->back()->score();
+    const float radius = (best_score + worst_score) / 2.0F;
+    ASSERT_GT(radius, 0.0F);
+    auto radius_query = MakeFp32Query(12, kFp32Field, 8);
+    radius_query.filter_ = "category = 0";
+    radius_query.target_.query_params_->set_radius(radius);
+    auto radius_result = collection->Query(radius_query);
+    ASSERT_TRUE(radius_result.has_value()) << radius_result.error().message();
+    ASSERT_FALSE(radius_result->empty());
+    EXPECT_LT(radius_result->size(), fp32_result->size());
+    for (const auto &doc : *radius_result) {
+      ASSERT_NE(doc, nullptr);
+      if (metric == MetricType::IP) {
+        EXPECT_GE(doc->score(), radius);
+      } else {
+        EXPECT_LE(doc->score(), radius);
+      }
     }
 
     MultiQuery multi_query;

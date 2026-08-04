@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "diskann_streamer.h"
+#include <utility>
 #include "diskann_context.h"
 #include "diskann_index_provider.h"
 #include "diskann_indexer.h"
@@ -144,14 +145,15 @@ int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   // with different element sizes (e.g., fp16 vs fp32), the cached context has
   // undersized buffers. Recreate it to ensure correct buffer allocations.
   if (ctx->magic() != magic_) {
-    uint32_t saved_topk = ctx->topk();
+    auto previous_context = std::move(context);
+    auto *previous_ctx = dynamic_cast<DiskAnnContext *>(previous_context.get());
     context = create_context();
     if (!context) {
       LOG_ERROR("Failed to recreate context for current streamer");
       return IndexError_Runtime;
     }
     ctx = dynamic_cast<DiskAnnContext *>(context.get());
-    ctx->set_topk(saved_topk);
+    ctx->copy_query_state_from(*previous_ctx);
   }
 
   ctx->clear();
@@ -187,14 +189,15 @@ int DiskAnnStreamer::search_bf_impl(const void *query,
   if (ctx->magic() != magic_) {
     //! context is created by another searcher or streamer, recreate it
     //! to ensure buffers are correctly sized for this index's parameters.
-    uint32_t saved_topk = ctx->topk();
+    auto previous_context = std::move(context);
+    auto *previous_ctx = dynamic_cast<DiskAnnContext *>(previous_context.get());
     context = create_context();
     if (!context) {
       LOG_ERROR("Failed to recreate context for current streamer");
       return IndexError_Runtime;
     }
     ctx = dynamic_cast<DiskAnnContext *>(context.get());
-    ctx->set_topk(saved_topk);
+    ctx->copy_query_state_from(*previous_ctx);
   }
 
   ctx->clear();
@@ -240,14 +243,15 @@ int DiskAnnStreamer::search_bf_by_p_keys_impl(
   if (ctx->magic() != magic_) {
     //! context is created by another searcher or streamer, recreate it
     //! to ensure buffers are correctly sized for this index's parameters.
-    uint32_t saved_topk = ctx->topk();
+    auto previous_context = std::move(context);
+    auto *previous_ctx = dynamic_cast<DiskAnnContext *>(previous_context.get());
     context = create_context();
     if (!context) {
       LOG_ERROR("Failed to recreate context for current streamer");
       return IndexError_Runtime;
     }
     ctx = dynamic_cast<DiskAnnContext *>(context.get());
-    ctx->set_topk(saved_topk);
+    ctx->copy_query_state_from(*previous_ctx);
   }
 
   ctx->clear();
@@ -338,6 +342,7 @@ IndexSearcher::Context::Pointer DiskAnnStreamer::create_context() const {
   }
 
   ctx->set_list_size(list_size_);
+  ctx->set_magic(magic_);
 
   return Context::Pointer(ctx);
 }
