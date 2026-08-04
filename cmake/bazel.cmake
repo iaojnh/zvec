@@ -616,17 +616,24 @@ function(_absolute_paths _RESULT)
   set(${_RESULT} "${FILEPATHS}" PARENT_SCOPE)
 endfunction()
 
-## Add both shared and static library
+## Add a main library target and an explicit static variant.
 macro(_add_library _NAME _OPTION)
   add_library(${_NAME}_objects OBJECT ${_OPTION} ${ARGN})
   add_library(
       ${_NAME}_static STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
     )
-  if(IOS)
-    # iOS: create the main target as static too (no shared libs on iOS)
+  if(IOS OR (ANDROID AND ANDROID_STL STREQUAL "c++_static"))
+    # iOS and Android c++_static builds use a static main target. The Android
+    # static runtime must not be linked into multiple shared libraries in the
+    # same process. The all-in-one SDK shared library is built separately.
     add_library(
         ${_NAME} STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
       )
+    if(ANDROID)
+      # Keep this internal archive distinct from the explicit static variant,
+      # whose OUTPUT_NAME is also ${_NAME}.
+      set_property(TARGET ${_NAME} PROPERTY OUTPUT_NAME ${_NAME}_main)
+    endif()
   else()
     add_library(
         ${_NAME} SHARED ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
