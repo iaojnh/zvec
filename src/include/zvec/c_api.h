@@ -592,7 +592,14 @@ ZVEC_EXPORT zvec_config_data_t *ZVEC_CALL zvec_config_data_create(void);
 ZVEC_EXPORT void ZVEC_CALL zvec_config_data_destroy(zvec_config_data_t *config);
 
 /**
- * @brief Set memory limit in configuration data
+ * @brief Set the process-wide soft memory budget in configuration data
+ *
+ * Explicit RocksDB, query-working, resident-metadata, and safety-reserve
+ * partitions remain active when a DiskANN collection uses mmap/direct
+ * storage. In that mode VecBufferPool is disabled and the remaining shared
+ * cache capacity is available to the DiskANN node cache. The first DiskANN
+ * budget phase covers index loading and querying, not index construction or a
+ * strict process RSS limit.
  * @param config Configuration data pointer
  * @param memory_limit_bytes Memory limit in bytes
  * @return zvec_error_code_t Error code
@@ -615,14 +622,20 @@ zvec_config_data_set_rocksdb_block_cache(zvec_config_data_t *config,
 ZVEC_EXPORT uint64_t ZVEC_CALL
 zvec_config_data_get_rocksdb_block_cache(const zvec_config_data_t *config);
 
-/** Set/get the aggregate query working-memory partition in bytes. */
+/**
+ * Set/get the aggregate DiskANN query working-memory partition in bytes.
+ * This explicit partition is independent of the collection storage backend.
+ */
 ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
 zvec_config_data_set_query_working_memory(zvec_config_data_t *config,
                                           uint64_t bytes);
 ZVEC_EXPORT uint64_t ZVEC_CALL
 zvec_config_data_get_query_working_memory(const zvec_config_data_t *config);
 
-/** Set/get the resident-metadata partition in bytes. */
+/**
+ * Set/get the DiskANN resident-metadata partition in bytes.
+ * This explicit partition is independent of the collection storage backend.
+ */
 ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_config_data_set_resident_metadata(
     zvec_config_data_t *config, uint64_t bytes);
 ZVEC_EXPORT uint64_t ZVEC_CALL
@@ -2721,7 +2734,12 @@ ZVEC_EXPORT void ZVEC_CALL
 zvec_collection_options_destroy(zvec_collection_options_t *options);
 
 /**
- * @brief Set whether to enable memory mapping
+ * @brief Set whether to use the mmap/direct storage mode
+ *
+ * For DiskANN, enabling this option disables VecBufferPool but does not
+ * disable explicitly configured memory partitions or the shared DiskANN node
+ * cache budget. Existing collections use the storage mode persisted in their
+ * manifest.
  * @param options Collection options pointer
  * @param enable Whether to enable mmap
  * @return zvec_error_code_t Error code

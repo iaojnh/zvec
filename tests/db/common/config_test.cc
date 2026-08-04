@@ -139,6 +139,8 @@ TEST_F(ConfigTest, ValidateExplicitMemoryBudgetPartitions) {
 
   GlobalConfig config_instance;
   ASSERT_TRUE(config_instance.Validate(config).ok());
+  ASSERT_EQ(config_instance.shared_cache_bytes(),
+            config_instance.buffer_cache_bytes());
 
   config.safety_reserve_bytes = config.memory_limit_bytes;
   auto status = config_instance.Validate(config);

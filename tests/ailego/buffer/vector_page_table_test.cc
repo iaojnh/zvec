@@ -185,15 +185,21 @@ TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
 
   ASSERT_TRUE(memory_pool.try_charge_external(3 * kVectorPageSize));
   EXPECT_EQ(3 * kVectorPageSize, memory_pool.used());
+  EXPECT_EQ(3 * kVectorPageSize, memory_pool.external_used());
+  EXPECT_EQ(0u, memory_pool.stats().page_used);
 
   char *page = nullptr;
   ASSERT_TRUE(memory_pool.try_acquire_buffer(kVectorPageSize, page));
   ASSERT_NE(nullptr, page);
+  auto shared = memory_pool.stats();
+  EXPECT_EQ(kVectorPageSize, shared.page_used);
+  EXPECT_EQ(3 * kVectorPageSize, shared.external_used);
   EXPECT_FALSE(memory_pool.try_charge_external(1));
 
   memory_pool.release_buffer(page, kVectorPageSize);
   memory_pool.release_external(3 * kVectorPageSize);
   EXPECT_EQ(0u, memory_pool.used());
+  EXPECT_EQ(0u, memory_pool.external_used());
 }
 
 TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
@@ -240,6 +246,8 @@ TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
   MemoryLimitPool::PoolStats charged = memory_pool.stats();
   EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.used);
   EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.committed);
+  EXPECT_EQ(0u, charged.page_used);
+  EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.external_used);
   EXPECT_EQ(0u, charged.free_buffers);
 
   memory_pool.release_external(kCapacityPages * kVectorPageSize);
@@ -333,6 +341,8 @@ TEST_F(BufferPoolTest, UnifiedMemoryBudgetEnforcesExplicitPartitions) {
   auto snapshot = budget.snapshot();
   EXPECT_EQ(0u, snapshot.query_working_used);
   EXPECT_EQ(0u, snapshot.resident_metadata_used);
+  EXPECT_EQ(1u, snapshot.query_working_rejections);
+  EXPECT_EQ(1u, snapshot.resident_metadata_rejections);
   EXPECT_EQ(500u, snapshot.config.buffer_cache_bytes);
 }
 

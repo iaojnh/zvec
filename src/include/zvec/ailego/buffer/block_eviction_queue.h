@@ -175,6 +175,12 @@ class MemoryLimitPool {
     return committed_size_.load(std::memory_order_relaxed);
   }
 
+  //! Bytes reserved by shared-cache consumers outside VecBufferPool pages,
+  //! such as the DiskANN node cache and decoded Parquet cache entries.
+  size_t external_used() const {
+    return external_used_size_.load(std::memory_order_relaxed);
+  }
+
   //! Total capacity in bytes (fixed after init()).
   size_t capacity() const {
     return pool_size_;
@@ -185,6 +191,8 @@ class MemoryLimitPool {
     size_t pool_size{0};
     size_t used{0};
     size_t committed{0};
+    size_t page_used{0};
+    size_t external_used{0};
     size_t free_buffers{0};           // buffers cached across all shards
     uint64_t alloc_from_freelist{0};  // acquisitions served from a shard
     uint64_t alloc_from_slab{0};      // cold page-buffer allocations
@@ -255,6 +263,7 @@ class MemoryLimitPool {
   // free-list. External caches must reserve against this counter so cached
   // page memory and external memory cannot together exceed pool_size_.
   std::atomic<size_t> committed_size_{0};
+  std::atomic<size_t> external_used_size_{0};
 
   FreeShard free_shards_[kNumFreeShards];
   std::atomic<size_t> shard_seq_{0};

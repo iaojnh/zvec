@@ -24,6 +24,7 @@
 #include <tuple>
 #include <unordered_set>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_budget.h>
 #include "diskann_buffer_pool_shim.h"
 #include "diskann_params.h"
 
@@ -88,6 +89,38 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
     storage_->cleanup();
     storage_.reset();
   }
+
+  const auto budget = ailego::MemoryBudgetManager::get_instance().snapshot();
+  const auto shared_cache = ailego::MemoryLimitPool::get_instance().stats();
+  LOG_INFO(
+      "DiskANN memory mode: storage_mode=%s vec_buffer_pool_enabled=%s "
+      "explicit_memory_budget_enabled=%s shared_cache_capacity=%llu "
+      "shared_cache_used=%llu shared_cache_committed=%llu "
+      "shared_cache_external_used=%llu shared_cache_rejections=%llu "
+      "query_working_capacity=%llu query_working_used=%llu "
+      "query_working_rejections=%llu resident_metadata_capacity=%llu "
+      "resident_metadata_used=%llu resident_metadata_rejections=%llu "
+      "rocksdb_block_cache_capacity=%llu safety_reserve=%llu "
+      "shared_cache_consumers=%s",
+      buffer_pool_ == nullptr ? "direct" : "buffer_pool",
+      buffer_pool_ == nullptr ? "false" : "true",
+      budget.config.enforce_accounting ? "true" : "false",
+      static_cast<unsigned long long>(shared_cache.pool_size),
+      static_cast<unsigned long long>(shared_cache.used),
+      static_cast<unsigned long long>(shared_cache.committed),
+      static_cast<unsigned long long>(shared_cache.external_used),
+      static_cast<unsigned long long>(shared_cache.high_watermark_hits),
+      static_cast<unsigned long long>(budget.config.query_working_bytes),
+      static_cast<unsigned long long>(budget.query_working_used),
+      static_cast<unsigned long long>(budget.query_working_rejections),
+      static_cast<unsigned long long>(budget.config.resident_metadata_bytes),
+      static_cast<unsigned long long>(budget.resident_metadata_used),
+      static_cast<unsigned long long>(budget.resident_metadata_rejections),
+      static_cast<unsigned long long>(
+          budget.config.rocksdb_block_cache_bytes),
+      static_cast<unsigned long long>(budget.config.safety_reserve_bytes),
+      buffer_pool_ == nullptr ? "diskann_node_cache"
+                              : "diskann_node_cache,vec_buffer_pool");
 
   int ret = setup_io_ctx(init_ctx_);
   if (ret != 0) {
@@ -461,10 +494,11 @@ int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count) {
 
   LOG_INFO(
       "DiskANN shared cache budget: node_cache_charge_bytes=%llu "
-      "memory_limit_used=%llu memory_limit_available=%llu "
-      "memory_limit_capacity=%llu",
+      "shared_cache_used=%llu shared_cache_external_used=%llu "
+      "shared_cache_available=%llu shared_cache_capacity=%llu",
       static_cast<unsigned long long>(cache_memory_charge_bytes_),
       static_cast<unsigned long long>(memory_pool.used()),
+      static_cast<unsigned long long>(memory_pool.external_used()),
       static_cast<unsigned long long>(memory_pool.available()),
       static_cast<unsigned long long>(memory_pool.capacity()));
   return 0;

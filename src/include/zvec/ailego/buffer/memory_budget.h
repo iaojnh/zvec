@@ -25,10 +25,12 @@ namespace ailego {
 
 //! Process-wide memory partitioning and accounting.
 //!
-//! Buffer-cache and RocksDB capacities are enforced by their native cache
-//! implementations. Query and resident-metadata allocations use try_charge()
-//! and release() directly. SafetyReserve is deliberately unavailable to
-//! allocators: its capacity is subtracted from the other partitions.
+//! Shared-cache and RocksDB capacities are enforced by their native cache
+//! implementations. The shared-cache partition covers VecBufferPool pages
+//! plus external consumers such as the DiskANN node cache. Query and
+//! resident-metadata allocations use try_charge() and release() directly.
+//! SafetyReserve is deliberately unavailable to allocators: its capacity is
+//! subtracted from the other partitions.
 class ZVEC_AILEGO_API MemoryBudgetManager {
  public:
   enum class Category : uint8_t {
@@ -56,6 +58,8 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
     Config config{};
     uint64_t query_working_used{0};
     uint64_t resident_metadata_used{0};
+    uint64_t query_working_rejections{0};
+    uint64_t resident_metadata_rejections{0};
   };
 
   static MemoryBudgetManager &get_instance();
@@ -85,6 +89,9 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
     for (auto &used : used_bytes_) {
       used.store(0, std::memory_order_relaxed);
     }
+    for (auto &rejections : rejected_charges_) {
+      rejections.store(0, std::memory_order_relaxed);
+    }
     configured_.store(true, std::memory_order_release);
     return true;
   }
@@ -98,10 +105,15 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
         !config_.enforce_accounting) {
       return true;
     }
+    if (category == Category::Count) {
+      return false;
+    }
     const uint64_t limit = capacity(category);
     if (limit == 0 || category == Category::SafetyReserve ||
         category == Category::BufferCache ||
         category == Category::RocksDbBlockCache) {
+      rejected_charges_[index(category)].fetch_add(1,
+                                                   std::memory_order_relaxed);
       return false;
     }
 
@@ -114,6 +126,8 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
         return true;
       }
     }
+    rejected_charges_[index(category)].fetch_add(1,
+                                                 std::memory_order_relaxed);
     return false;
   }
 
@@ -155,6 +169,12 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
     result.config = config_;
     result.query_working_used = used(Category::QueryWorking);
     result.resident_metadata_used = used(Category::ResidentMetadata);
+    result.query_working_rejections =
+        rejected_charges_[index(Category::QueryWorking)].load(
+            std::memory_order_relaxed);
+    result.resident_metadata_rejections =
+        rejected_charges_[index(Category::ResidentMetadata)].load(
+            std::memory_order_relaxed);
     return result;
   }
 
@@ -172,6 +192,8 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
   Config config_{};
   std::array<std::atomic<uint64_t>, static_cast<size_t>(Category::Count)>
       used_bytes_{};
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(Category::Count)>
+      rejected_charges_{};
   std::atomic<bool> configured_{false};
 };
 

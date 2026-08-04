@@ -24,6 +24,7 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_budget.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_framework.h>
 #include "utility/utility_params.h"
@@ -49,6 +50,10 @@ class DiskAnnBufferPoolSearchTest : public testing::Test {
     // repeated queries hit; individual eviction behavior is covered by the
     // reader unit tests.
     MemoryLimitPool::get_instance().init(512UL * 1024UL * 1024UL);
+    MemoryBudgetManager::Config budget;
+    budget.total_bytes = MemoryLimitPool::get_instance().capacity();
+    budget.buffer_cache_bytes = budget.total_bytes;
+    ASSERT_TRUE(MemoryBudgetManager::get_instance().configure(budget));
     meta_.reset(new IndexMeta(IndexMeta::DataType::DT_FP32, kDim));
     meta_->set_metric("SquaredEuclidean", 0, Params());
   }
@@ -229,5 +234,57 @@ TEST_F(DiskAnnBufferPoolSearchTest,
   ASSERT_NE(searcher, nullptr);
 
   EXPECT_GT(MemoryLimitPool::get_instance().used(), used_before);
+  EXPECT_GT(MemoryLimitPool::get_instance().external_used(), 0u);
   EXPECT_GT(pool->stats().evict, evict_before);
+
+  searcher.reset();
+  EXPECT_EQ(0u, MemoryLimitPool::get_instance().external_used());
+}
+
+TEST_F(DiskAnnBufferPoolSearchTest,
+       DirectModeKeepsExplicitPartitionsAndSharedNodeCache) {
+  const string path = dir_ + "/index_direct_budget";
+  BuildIndex(path);
+
+  constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+  MemoryBudgetManager::Config budget;
+  budget.total_bytes = 656 * kMiB;
+  budget.enforce_accounting = true;
+  budget.buffer_cache_bytes = 512 * kMiB;
+  budget.query_working_bytes = 64 * kMiB;
+  budget.resident_metadata_bytes = 64 * kMiB;
+  budget.safety_reserve_bytes = 16 * kMiB;
+  ASSERT_TRUE(MemoryBudgetManager::get_instance().configure(budget));
+
+  auto direct_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(direct_storage, nullptr);
+  ASSERT_EQ(0, direct_storage->open(path, false));
+  ASSERT_EQ(nullptr, direct_storage->vec_buffer_pool());
+
+  constexpr uint64_t kNodeBudget = 4 * kMiB;
+  auto searcher = MakeSearcher(direct_storage, kNodeBudget);
+  ASSERT_NE(searcher, nullptr);
+
+  auto snapshot = MemoryBudgetManager::get_instance().snapshot();
+  EXPECT_TRUE(snapshot.config.enforce_accounting);
+  EXPECT_GT(snapshot.resident_metadata_used, 0u);
+  EXPECT_GT(MemoryLimitPool::get_instance().external_used(), 0u);
+  EXPECT_LE(MemoryLimitPool::get_instance().external_used(), kNodeBudget);
+
+  auto context = searcher->create_context();
+  ASSERT_TRUE(!!context);
+  EXPECT_GT(MemoryBudgetManager::get_instance()
+                .snapshot()
+                .query_working_used,
+            0u);
+
+  context.reset();
+  EXPECT_EQ(0u, MemoryBudgetManager::get_instance()
+                    .snapshot()
+                    .query_working_used);
+
+  searcher.reset();
+  snapshot = MemoryBudgetManager::get_instance().snapshot();
+  EXPECT_EQ(0u, snapshot.resident_metadata_used);
+  EXPECT_EQ(0u, MemoryLimitPool::get_instance().external_used());
 }

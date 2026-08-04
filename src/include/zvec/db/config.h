@@ -89,7 +89,9 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
     uint64_t memory_limit_bytes;
     // Optional process-wide partitions. If all are zero, legacy behavior is
     // preserved. If any is nonzero, zero means zero capacity for that
-    // category and the buffer cache receives the remainder.
+    // category and the shared cache receives the remainder. The shared cache
+    // is used by DiskANN's node cache in every storage mode and additionally
+    // by VecBufferPool when mmap/direct storage is disabled.
     uint64_t rocksdb_block_cache_bytes;
     uint64_t query_working_memory_bytes;
     uint64_t resident_metadata_bytes;
@@ -144,10 +146,15 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
   uint64_t safety_reserve_bytes() const noexcept {
     return config_.safety_reserve_bytes;
   }
-  uint64_t buffer_cache_bytes() const noexcept {
+  uint64_t shared_cache_bytes() const noexcept {
     return config_.memory_limit_bytes - config_.rocksdb_block_cache_bytes -
            config_.query_working_memory_bytes -
            config_.resident_metadata_bytes - config_.safety_reserve_bytes;
+  }
+  // Backward-compatible name retained for existing callers. This capacity is
+  // shared by external caches as well as VecBufferPool pages.
+  uint64_t buffer_cache_bytes() const noexcept {
+    return shared_cache_bytes();
   }
   bool explicit_memory_budget() const noexcept {
     return config_.rocksdb_block_cache_bytes != 0 ||

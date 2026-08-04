@@ -263,7 +263,7 @@ int MemoryLimitPool::init(size_t pool_size) {
   BlockEvictionQueue::get_instance().recycle();
   drain_free_list();
   pool_size_ = pool_size;
-  LOG_INFO("MemoryLimitPool initialized with pool size: %lu", pool_size_);
+  LOG_INFO("Shared cache initialized with capacity: %lu", pool_size_);
   if (pool_size_ > 0) {
     start_background_evictor();
   }
@@ -361,12 +361,14 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
     return true;
   }
   if (pool_size_ == 0 || buffer_size > pool_size_) {
+    high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
   while (true) {
     if (try_reserve_committed(buffer_size)) {
       used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
+      external_used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
       return true;
     }
 
@@ -397,6 +399,7 @@ void MemoryLimitPool::charge_external(const size_t buffer_size) {
   // used_size_ cache line on every retry.
   used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
   committed_size_.fetch_add(buffer_size, std::memory_order_relaxed);
+  external_used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
 }
 
 void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
@@ -435,6 +438,10 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
 
 void MemoryLimitPool::release_external(const size_t buffer_size) {
   // Unconditional subtract: single RMW instead of a CAS loop.
+  size_t external_prev =
+      external_used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+  (void)external_prev;
+  assert(external_prev >= buffer_size);
   size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
   (void)prev;
   assert(prev >= buffer_size);
@@ -506,6 +513,8 @@ MemoryLimitPool::PoolStats MemoryLimitPool::stats() const {
   s.pool_size = pool_size_;
   s.used = used_size_.load(std::memory_order_relaxed);
   s.committed = committed_size_.load(std::memory_order_relaxed);
+  s.external_used = external_used_size_.load(std::memory_order_relaxed);
+  s.page_used = s.used >= s.external_used ? s.used - s.external_used : 0;
   size_t free_buffers = 0;
   for (size_t i = 0; i < kNumFreeShards; ++i) {
     free_buffers += free_shards_[i].count.load(std::memory_order_relaxed);
@@ -522,13 +531,16 @@ MemoryLimitPool::PoolStats MemoryLimitPool::stats() const {
 void MemoryLimitPool::log_stats() const {
   PoolStats s = stats();
   LOG_INFO(
-      "MemoryLimitPool stats: pool_size=%llu used=%llu committed=%llu "
-      "free_buffers=%llu alloc_from_freelist=%llu alloc_from_slab=%llu "
+      "Shared cache stats: capacity=%llu used=%llu committed=%llu "
+      "page_used=%llu external_used=%llu free_buffers=%llu "
+      "alloc_from_freelist=%llu alloc_from_slab=%llu "
       "bg_evict_rounds=%llu bg_evicted_buffers=%llu "
       "high_watermark_hits=%llu",
       static_cast<unsigned long long>(s.pool_size),
       static_cast<unsigned long long>(s.used),
       static_cast<unsigned long long>(s.committed),
+      static_cast<unsigned long long>(s.page_used),
+      static_cast<unsigned long long>(s.external_used),
       static_cast<unsigned long long>(s.free_buffers),
       static_cast<unsigned long long>(s.alloc_from_freelist),
       static_cast<unsigned long long>(s.alloc_from_slab),

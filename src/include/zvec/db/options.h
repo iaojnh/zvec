@@ -21,7 +21,11 @@ const uint32_t DEFAULT_MAX_BUFFER_SIZE = 64 * 1024 * 1024;  // 64M
 
 struct CollectionOptions {
   bool read_only_{false};
-  bool enable_mmap_{true};  // ignored when load collection
+  // Controls the storage backend only. For DiskANN, true selects direct file
+  // reads and disables VecBufferPool; process-wide explicit memory partitions
+  // and the DiskANN node-cache share remain active. Ignored when loading an
+  // existing collection because the persisted version supplies this value.
+  bool enable_mmap_{true};
   uint32_t max_buffer_size_{
       DEFAULT_MAX_BUFFER_SIZE};  // ignored when read_only=true
 
