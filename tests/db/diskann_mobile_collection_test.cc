@@ -80,7 +80,8 @@ std::vector<float16_t> MakeFp16Vector(uint64_t doc_id) {
 }
 
 CollectionSchema::Ptr MakeSchema(MetricType metric, bool include_fp16 = false,
-                                 bool include_dynamic = false) {
+                                 bool include_dynamic = false,
+                                 bool include_group_by = false) {
   auto schema = std::make_shared<CollectionSchema>("diskann_mobile");
   schema->set_max_doc_count_per_segment(1000);
   EXPECT_TRUE(schema
@@ -98,11 +99,13 @@ CollectionSchema::Ptr MakeSchema(MetricType metric, bool include_fp16 = false,
           ->add_field(std::make_shared<FieldSchema>(
               kFp32Field, DataType::VECTOR_FP32, kDimension, false, diskann))
           .ok());
-  EXPECT_TRUE(schema
-                  ->add_field(std::make_shared<FieldSchema>(
-                      kGroupByField, DataType::VECTOR_FP32, kDimension, false,
-                      std::make_shared<FlatIndexParams>(metric)))
-                  .ok());
+  if (include_group_by) {
+    EXPECT_TRUE(schema
+                    ->add_field(std::make_shared<FieldSchema>(
+                        kGroupByField, DataType::VECTOR_FP32, kDimension, false,
+                        std::make_shared<FlatIndexParams>(metric)))
+                    .ok());
+  }
   if (include_fp16) {
     EXPECT_TRUE(schema
                     ->add_field(std::make_shared<FieldSchema>(
@@ -121,13 +124,16 @@ CollectionSchema::Ptr MakeSchema(MetricType metric, bool include_fp16 = false,
 }
 
 Doc MakeDoc(uint64_t doc_id, bool include_fp16 = false,
-            bool include_dynamic = false, std::string pk = "") {
+            bool include_dynamic = false, bool include_group_by = false,
+            std::string pk = "") {
   Doc doc;
   doc.set_pk(pk.empty() ? "pk_" + std::to_string(doc_id) : std::move(pk));
   doc.set<int32_t>("category", static_cast<int32_t>(doc_id % 4));
   doc.set<std::string>("name", "name_" + std::to_string(doc_id));
   doc.set<std::vector<float>>(kFp32Field, MakeFp32Vector(doc_id));
-  doc.set<std::vector<float>>(kGroupByField, MakeFp32Vector(doc_id));
+  if (include_group_by) {
+    doc.set<std::vector<float>>(kGroupByField, MakeFp32Vector(doc_id));
+  }
   if (include_fp16) {
     doc.set<std::vector<float16_t>>(kFp16Field, MakeFp16Vector(doc_id));
   }
@@ -139,11 +145,13 @@ Doc MakeDoc(uint64_t doc_id, bool include_fp16 = false,
 
 std::vector<Doc> MakeDocs(uint64_t begin, uint64_t end,
                           bool include_fp16 = false,
-                          bool include_dynamic = false) {
+                          bool include_dynamic = false,
+                          bool include_group_by = false) {
   std::vector<Doc> docs;
   docs.reserve(end - begin);
   for (uint64_t doc_id = begin; doc_id < end; ++doc_id) {
-    docs.emplace_back(MakeDoc(doc_id, include_fp16, include_dynamic));
+    docs.emplace_back(
+        MakeDoc(doc_id, include_fp16, include_dynamic, include_group_by));
   }
   return docs;
 }
@@ -248,17 +256,29 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
   ASSERT_TRUE(create_result.has_value()) << create_result.error().message();
   auto collection = std::move(create_result.value());
 
-  ASSERT_EQ(collection->Path().value(), kCollectionPath);
-  ASSERT_EQ(collection->Schema().value(), *schema);
-  ASSERT_EQ(collection->Options().value(), options);
-  ASSERT_EQ(collection->Stats()->doc_count, 0u);
+  auto path_result = collection->Path();
+  ASSERT_TRUE(path_result.has_value()) << path_result.error().message();
+  EXPECT_EQ(*path_result, kCollectionPath);
+  auto schema_result = collection->Schema();
+  ASSERT_TRUE(schema_result.has_value()) << schema_result.error().message();
+  EXPECT_EQ(*schema_result, *schema);
+  auto options_result = collection->Options();
+  ASSERT_TRUE(options_result.has_value()) << options_result.error().message();
+  EXPECT_EQ(*options_result, options);
+  auto empty_stats = collection->Stats();
+  ASSERT_TRUE(empty_stats.has_value()) << empty_stats.error().message();
+  EXPECT_EQ(empty_stats->doc_count, 0u);
 
   auto docs = MakeDocs(0, 32, false, true);
   ASSERT_TRUE(WriteSucceeded(collection->Insert(docs), docs.size()));
   ASSERT_TRUE(collection->Flush().ok());
-  ASSERT_EQ(collection->Stats()->index_completeness[kFp32Field], 0);
+  auto flushed_stats = collection->Stats();
+  ASSERT_TRUE(flushed_stats.has_value()) << flushed_stats.error().message();
+  ASSERT_EQ(flushed_stats->index_completeness[kFp32Field], 0);
   ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
-  ASSERT_EQ(collection->Stats()->index_completeness[kFp32Field], 1);
+  auto optimized_stats = collection->Stats();
+  ASSERT_TRUE(optimized_stats.has_value()) << optimized_stats.error().message();
+  ASSERT_EQ(optimized_stats->index_completeness[kFp32Field], 1);
 
   auto fetch = collection->Fetch(
       {"pk_8"}, std::vector<std::string>{"category", "name"}, false);
@@ -268,11 +288,11 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
   EXPECT_TRUE(fetch->at("pk_8")->has("name"));
   EXPECT_FALSE(fetch->at("pk_8")->has(kFp32Field));
 
-  std::vector<Doc> update_docs{MakeDoc(100, false, true, "pk_0")};
+  std::vector<Doc> update_docs{MakeDoc(100, false, true, false, "pk_0")};
   ASSERT_TRUE(
       WriteSucceeded(collection->Update(update_docs), update_docs.size()));
 
-  std::vector<Doc> upsert_docs{MakeDoc(101, false, true, "pk_1"),
+  std::vector<Doc> upsert_docs{MakeDoc(101, false, true, false, "pk_1"),
                                MakeDoc(32, false, true)};
   ASSERT_TRUE(
       WriteSucceeded(collection->Upsert(upsert_docs), upsert_docs.size()));
@@ -313,7 +333,9 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
   auto primary_result = collection->Query(MakeFp32Query(8, kFp32Field));
   ASSERT_TRUE(primary_result.has_value()) << primary_result.error().message();
   ASSERT_FALSE(primary_result->empty());
-  EXPECT_LT(collection->Stats()->doc_count, 33u);
+  auto reopened_stats = collection->Stats();
+  ASSERT_TRUE(reopened_stats.has_value()) << reopened_stats.error().message();
+  EXPECT_LT(reopened_stats->doc_count, 33u);
   collection.reset();
 
   auto read_only_result = Collection::Open(kCollectionPath, Options(true));
@@ -341,13 +363,13 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
        {MetricType::L2, MetricType::IP, MetricType::COSINE}) {
     SCOPED_TRACE(static_cast<uint32_t>(metric));
     ailego::FileHelper::RemoveDirectory(kCollectionPath);
-    auto schema = MakeSchema(metric, true);
+    auto schema = MakeSchema(metric, true, false, true);
     auto create_result =
         Collection::CreateAndOpen(kCollectionPath, *schema, Options());
     ASSERT_TRUE(create_result.has_value()) << create_result.error().message();
     auto collection = std::move(create_result.value());
 
-    auto docs = MakeDocs(0, kDocCount, true);
+    auto docs = MakeDocs(0, kDocCount, true, false, true);
     ASSERT_TRUE(WriteSucceeded(collection->Insert(docs), docs.size()));
     ASSERT_TRUE(collection->Flush().ok());
     ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
