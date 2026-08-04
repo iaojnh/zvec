@@ -23,11 +23,13 @@ namespace zvec {
 
 void GlobalResource::initialize() {
   static std::once_flag flag;
-  std::call_once(flag, [this]() mutable {
-    this->query_thread_pool_.reset(
-        new ailego::ThreadPool(GlobalConfig::Instance().query_thread_count()));
+  std::call_once(flag, [this]() {
+    this->query_thread_pool_.reset(new ailego::ThreadPool(
+        GlobalConfig::Instance().query_thread_count(),
+        GlobalConfig::Instance().query_thread_binding()));
     this->optimize_thread_pool_.reset(new ailego::ThreadPool(
-        GlobalConfig::Instance().optimize_thread_count()));
+        GlobalConfig::Instance().optimize_thread_count(),
+        GlobalConfig::Instance().optimize_thread_binding()));
     const auto &config = GlobalConfig::Instance();
     ailego::MemoryBudgetManager::Config budget;
     budget.total_bytes = config.memory_limit_bytes();
