@@ -56,6 +56,7 @@ constexpr char kCollectionPath[] = "diskann_mobile_collection";
 constexpr char kFp32Field[] = "dense_fp32";
 constexpr char kFp16Field[] = "dense_fp16";
 constexpr char kDynamicField[] = "dense_dynamic";
+constexpr char kGroupByField[] = "dense_group_by";
 constexpr size_t kDimension = 16;
 constexpr uint64_t kDocCount = 48;
 
@@ -97,6 +98,11 @@ CollectionSchema::Ptr MakeSchema(MetricType metric, bool include_fp16 = false,
           ->add_field(std::make_shared<FieldSchema>(
               kFp32Field, DataType::VECTOR_FP32, kDimension, false, diskann))
           .ok());
+  EXPECT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      kGroupByField, DataType::VECTOR_FP32, kDimension, false,
+                      std::make_shared<FlatIndexParams>(metric)))
+                  .ok());
   if (include_fp16) {
     EXPECT_TRUE(schema
                     ->add_field(std::make_shared<FieldSchema>(
@@ -121,6 +127,7 @@ Doc MakeDoc(uint64_t doc_id, bool include_fp16 = false,
   doc.set<int32_t>("category", static_cast<int32_t>(doc_id % 4));
   doc.set<std::string>("name", "name_" + std::to_string(doc_id));
   doc.set<std::vector<float>>(kFp32Field, MakeFp32Vector(doc_id));
+  doc.set<std::vector<float>>(kGroupByField, MakeFp32Vector(doc_id));
   if (include_fp16) {
     doc.set<std::vector<float16_t>>(kFp16Field, MakeFp16Vector(doc_id));
   }
@@ -164,6 +171,18 @@ SearchQuery MakeFp16Query(uint64_t doc_id, int topk = 5) {
   query.target_.set_vector(
       std::string(reinterpret_cast<const char *>(vector.data()),
                   vector.size() * sizeof(float16_t)));
+  return query;
+}
+
+SearchQuery MakeFlatQuery(uint64_t doc_id, int topk = 5) {
+  auto vector = MakeFp32Vector(doc_id);
+  SearchQuery query;
+  query.topk_ = topk;
+  query.target_.field_name_ = kGroupByField;
+  query.target_.query_params_ = std::make_shared<FlatQueryParams>();
+  query.target_.set_vector(
+      std::string(reinterpret_cast<const char *>(vector.data()),
+                  vector.size() * sizeof(float)));
   return query;
 }
 
@@ -248,7 +267,9 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
   ASSERT_TRUE(collection->DeleteByFilter("category = 3").ok());
   auto deleted_fetch = collection->Fetch({"pk_2", "pk_3"});
   ASSERT_TRUE(deleted_fetch.has_value()) << deleted_fetch.error().message();
-  ASSERT_TRUE(deleted_fetch->empty());
+  ASSERT_EQ(deleted_fetch->size(), 2u);
+  EXPECT_EQ(deleted_fetch->at("pk_2"), nullptr);
+  EXPECT_EQ(deleted_fetch->at("pk_3"), nullptr);
 
   auto added_field =
       std::make_shared<FieldSchema>("category_copy", DataType::INT32, false);
@@ -323,7 +344,9 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     ASSERT_FALSE(fp32_result->empty());
     for (const auto &doc : *fp32_result) {
       ASSERT_NE(doc, nullptr);
-      EXPECT_EQ(doc->get<int32_t>("category"), 0);
+      auto category = doc->get<int32_t>("category");
+      ASSERT_TRUE(category.has_value());
+      EXPECT_EQ(category.value(), 0);
       EXPECT_TRUE(doc->has("name"));
       EXPECT_TRUE(doc->has(kFp32Field));
     }
@@ -349,6 +372,12 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     auto scalar_result = collection->Query(scalar_query);
     ASSERT_TRUE(scalar_result.has_value()) << scalar_result.error().message();
     ASSERT_EQ(scalar_result->size(), 5u);
+    for (const auto &doc : *scalar_result) {
+      ASSERT_NE(doc, nullptr);
+      auto category = doc->get<int32_t>("category");
+      ASSERT_TRUE(category.has_value());
+      EXPECT_EQ(category.value(), 1);
+    }
 
     auto fp16_result = collection->Query(MakeFp16Query(12, 8));
     ASSERT_TRUE(fp16_result.has_value()) << fp16_result.error().message();
@@ -359,7 +388,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
 
     MultiQuery multi_query;
     multi_query.topk = 8;
-    multi_query.filter = "category >= 0";
+    multi_query.filter = "category = 0";
     multi_query.include_vector = true;
     multi_query.include_doc_id_ = true;
     multi_query.output_fields = std::vector<std::string>{"category", "name"};
@@ -380,6 +409,9 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
       EXPECT_TRUE(doc->has("category"));
       EXPECT_TRUE(doc->has("name"));
       EXPECT_TRUE(doc->has(kFp32Field));
+      auto category = doc->get<int32_t>("category");
+      ASSERT_TRUE(category.has_value());
+      EXPECT_EQ(category.value(), 0);
     }
     EXPECT_TRUE(std::any_of(multi_result->begin(), multi_result->end(),
                             [](const Doc::Ptr &doc) {
@@ -387,7 +419,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
                             }));
 
     GroupByVectorQuery group_query;
-    group_query.target_ = MakeFp32Query(12, kFp32Field, 8).target_;
+    group_query.target_ = MakeFlatQuery(12, 8).target_;
     group_query.filter_ = "category >= 0";
     group_query.group_by_field_name_ = "category";
     group_query.group_count_ = 4;
@@ -405,7 +437,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
       for (const auto &doc : group.docs_) {
         EXPECT_TRUE(doc.has("category"));
         EXPECT_TRUE(doc.has("name"));
-        EXPECT_TRUE(doc.has(kFp32Field));
+        EXPECT_TRUE(doc.has(kGroupByField));
       }
     }
 
@@ -544,6 +576,13 @@ TEST_F(DiskAnnMobileCollectionTest, OperationFailuresDoNotPoisonCollection) {
   auto invalid_write = collection->Insert(invalid_docs);
   EXPECT_TRUE(!invalid_write.has_value() || invalid_write->empty() ||
               !invalid_write->front().ok());
+
+  GroupByVectorQuery unsupported_group_query;
+  unsupported_group_query.target_ = MakeFp32Query(12, kFp32Field, 8).target_;
+  unsupported_group_query.group_by_field_name_ = "category";
+  unsupported_group_query.group_count_ = 4;
+  unsupported_group_query.topk_per_group_ = 2;
+  EXPECT_FALSE(collection->GroupByQuery(unsupported_group_query).has_value());
 
   auto valid_result = collection->Query(MakeFp32Query(12, kFp32Field));
   ASSERT_TRUE(valid_result.has_value()) << valid_result.error().message();
