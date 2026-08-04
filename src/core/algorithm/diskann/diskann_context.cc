@@ -24,7 +24,9 @@ namespace core {
 DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
                                const IndexMetric::Pointer &measure,
                                const DiskAnnEntity::Pointer &entity)
-    : dc_(entity.get(), measure, meta.dimension()), entity_{entity} {}
+    : IndexContext(measure),
+      dc_(entity.get(), measure, meta.dimension()),
+      entity_{entity} {}
 
 int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
                          uint32_t pq_chunk_num, uint32_t element_size) {

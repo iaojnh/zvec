@@ -192,6 +192,18 @@ bool ContainsPk(const DocPtrList &docs, const std::string &pk) {
   });
 }
 
+std::vector<std::string> SortedPks(const DocPtrList &docs) {
+  std::vector<std::string> pks;
+  pks.reserve(docs.size());
+  for (const auto &doc : docs) {
+    if (doc != nullptr) {
+      pks.emplace_back(doc->pk());
+    }
+  }
+  std::sort(pks.begin(), pks.end());
+  return pks;
+}
+
 ::testing::AssertionResult WriteSucceeded(const Result<WriteResults> &result,
                                           size_t expected_count) {
   if (!result.has_value()) {
@@ -493,6 +505,14 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
   ASSERT_TRUE(WriteSucceeded(collection->Insert(docs), docs.size()));
   ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
 
+  std::array<std::vector<std::string>, kDocCount> query_baselines;
+  for (uint64_t doc_id = 0; doc_id < kDocCount; ++doc_id) {
+    auto query_result = collection->Query(MakeFp32Query(doc_id, kFp32Field));
+    ASSERT_TRUE(query_result.has_value()) << query_result.error().message();
+    ASSERT_FALSE(query_result->empty());
+    query_baselines[doc_id] = SortedPks(*query_result);
+  }
+
   std::atomic<size_t> failure_count{0};
   std::mutex failure_mutex;
   std::vector<std::string> failures;
@@ -510,16 +530,17 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
         auto query_result =
             collection->Query(MakeFp32Query(doc_id, kFp32Field));
         auto fetch_result = collection->Fetch({"pk_" + std::to_string(doc_id)});
-        bool query_ok =
-            query_result.has_value() &&
-            ContainsPk(*query_result, "pk_" + std::to_string(doc_id));
+        bool query_ok = query_result.has_value() &&
+                        SortedPks(*query_result) == query_baselines[doc_id];
         bool fetch_ok =
             fetch_result.has_value() && fetch_result->size() == 1 &&
             fetch_result->at("pk_" + std::to_string(doc_id)) != nullptr;
         if (!query_ok || !fetch_ok) {
           record_failure(
               "shared collection: thread=" + std::to_string(thread_id) +
-              ", iteration=" + std::to_string(iteration));
+              ", iteration=" + std::to_string(iteration) +
+              ", query_ok=" + std::to_string(query_ok) +
+              ", fetch_ok=" + std::to_string(fetch_ok));
         }
       }
     });
@@ -533,6 +554,8 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
 
   ASSERT_TRUE(collection->Flush().ok());
   collection.reset();
+  failure_count.store(0);
+  failures.clear();
   threads.clear();
   for (size_t thread_id = 0; thread_id < kThreadCount; ++thread_id) {
     threads.emplace_back([&, thread_id]() {
@@ -548,16 +571,17 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
             read_only_collection->Query(MakeFp32Query(doc_id, kFp32Field));
         auto fetch_result =
             read_only_collection->Fetch({"pk_" + std::to_string(doc_id)});
-        bool query_ok =
-            query_result.has_value() &&
-            ContainsPk(*query_result, "pk_" + std::to_string(doc_id));
+        bool query_ok = query_result.has_value() &&
+                        SortedPks(*query_result) == query_baselines[doc_id];
         bool fetch_ok =
             fetch_result.has_value() && fetch_result->size() == 1 &&
             fetch_result->at("pk_" + std::to_string(doc_id)) != nullptr;
         if (!query_ok || !fetch_ok) {
           record_failure(
               "read-only collection: thread=" + std::to_string(thread_id) +
-              ", iteration=" + std::to_string(iteration));
+              ", iteration=" + std::to_string(iteration) +
+              ", query_ok=" + std::to_string(query_ok) +
+              ", fetch_ok=" + std::to_string(fetch_ok));
         }
       }
     });
