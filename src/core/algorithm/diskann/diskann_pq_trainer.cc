@@ -149,13 +149,11 @@ int DiskAnnPqTrainer::convert_pivot_data(
     for (size_t cluster = 0; cluster < num_centers; ++cluster) {
       size_t idx = chunk * num_centers + cluster;
 
-      T *pivot_data_ptr = reinterpret_cast<T *>(&(full_pivot_data[0])) +
-                          cluster * dim + chunk_offsets[chunk];
-      const T *feature_ptr =
-          reinterpret_cast<const T *>(centroids[idx].feature());
-      for (size_t d = 0; d <= chunk_dims[chunk]; ++d) {
-        pivot_data_ptr[d] = feature_ptr[d];
-      }
+      uint8_t *pivot_data_ptr =
+          full_pivot_data.data() +
+          (cluster * dim + chunk_offsets[chunk]) * sizeof(T);
+      std::memcpy(pivot_data_ptr, centroids[idx].feature(),
+                  chunk_dims[chunk] * sizeof(T));
     }
   }
 
