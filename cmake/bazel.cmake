@@ -623,17 +623,17 @@ macro(_add_library _NAME _OPTION)
       ${_NAME}_static STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
     )
   if(IOS OR (ANDROID AND ANDROID_STL STREQUAL "c++_static"))
-    # iOS and Android c++_static builds use a static main target. The Android
-    # static runtime must not be linked into multiple shared libraries in the
-    # same process. The all-in-one SDK shared library is built separately.
     add_library(
         ${_NAME} STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
       )
-    if(ANDROID)
-      # Keep this internal archive distinct from the explicit static variant,
-      # whose OUTPUT_NAME is also ${_NAME}.
-      set_property(TARGET ${_NAME} PROPERTY OUTPUT_NAME ${_NAME}_main)
-    endif()
+    # Keep the two mobile build targets available but give the main archive a
+    # distinct file name for Ninja. Link-time canonicalization below ensures
+    # only the main archive is ever whole-archived into an executable.
+    set_property(TARGET ${_NAME} PROPERTY OUTPUT_NAME ${_NAME}_main)
+    set_property(
+      TARGET ${_NAME} PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
+    set_property(
+      TARGET ${_NAME}_static PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
   else()
     add_library(
         ${_NAME} SHARED ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
@@ -678,6 +678,18 @@ endfunction()
 
 ## Link libraries
 function(_target_link_libraries _NAME)
+  function(_resolve_link_target LIB RESULT_VAR)
+    if(TARGET ${LIB})
+      get_target_property(
+        CANONICAL_LINK_TARGET ${LIB} ZVEC_CANONICAL_LINK_TARGET)
+      if(CANONICAL_LINK_TARGET)
+        set(${RESULT_VAR} ${CANONICAL_LINK_TARGET} PARENT_SCOPE)
+        return()
+      endif()
+    endif()
+    set(${RESULT_VAR} ${LIB} PARENT_SCOPE)
+  endfunction()
+
   function(_collect_always_link_libs LIB_LIST RESULT_VAR)
     if(NOT _COLLECT_ALWAYS_LINK_VISITED)
       set(_COLLECT_ALWAYS_LINK_VISITED "" PARENT_SCOPE)
@@ -685,6 +697,7 @@ function(_target_link_libraries _NAME)
 
     set(LOCAL_RESULT "")
     foreach(LIB ${LIB_LIST})
+      _resolve_link_target(${LIB} LIB)
       if(NOT TARGET ${LIB})
         continue()
       endif()
@@ -714,7 +727,10 @@ function(_target_link_libraries _NAME)
       endif()
 
       get_target_property(LINK_LIBS ${LIB} LINK_LIBRARIES)
-      if(LINK_LIBS)
+      get_target_property(LIB_TYPE ${LIB} TYPE)
+      if(LINK_LIBS AND
+         NOT LIB_TYPE STREQUAL "SHARED_LIBRARY" AND
+         NOT LIB_TYPE STREQUAL "MODULE_LIBRARY")
         _collect_always_link_libs("${LINK_LIBS}" LINK_ALWAYS_LINK_LIBS)
         list(APPEND LOCAL_RESULT ${LINK_ALWAYS_LINK_LIBS})
       endif()
@@ -724,11 +740,18 @@ function(_target_link_libraries _NAME)
     set(${RESULT_VAR} "${LOCAL_RESULT}" PARENT_SCOPE)
   endfunction()
 
-  _collect_always_link_libs("${ARGN}" ALL_ALWAYS_LINK_LIBS)
+  set(INPUT_LIBS "")
+  foreach(LIB ${ARGN})
+    _resolve_link_target(${LIB} RESOLVED_LIB)
+    list(APPEND INPUT_LIBS ${RESOLVED_LIB})
+  endforeach()
+  list(REMOVE_DUPLICATES INPUT_LIBS)
 
-  set(ALL_LIBS_TO_PROCESS ${ARGN})
+  _collect_always_link_libs("${INPUT_LIBS}" ALL_ALWAYS_LINK_LIBS)
+
+  set(ALL_LIBS_TO_PROCESS ${INPUT_LIBS})
   foreach(ALWAYS_LIB ${ALL_ALWAYS_LINK_LIBS})
-    list(FIND ARGN ${ALWAYS_LIB} FOUND_INDEX)
+    list(FIND INPUT_LIBS ${ALWAYS_LIB} FOUND_INDEX)
     if(FOUND_INDEX EQUAL -1)
       list(APPEND ALL_LIBS_TO_PROCESS ${ALWAYS_LIB})
     endif()

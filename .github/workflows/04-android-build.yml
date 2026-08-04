@@ -117,8 +117,12 @@ jobs:
             -DANDROID_NATIVE_API_LEVEL=${{ matrix.api }} \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_ZVEC_SHARED=OFF \
+            -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DBUILD_ZVEC_CORE_SHARED=OFF \
             -DBUILD_PYTHON_BINDINGS=OFF \
             -DBUILD_TOOLS=OFF \
+            -DBUILD_CPP_EXAMPLES=ON \
             -DENABLE_NATIVE=OFF \
             -DAUTO_DETECT_ARCH=OFF \
             -DENABLE_WERROR=ON \
@@ -391,38 +395,28 @@ jobs:
         env:
           BUILD_DIR: build_android_${{ matrix.abi }}
         run: |
-          ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
-          EXAMPLES_BUILD="examples/c++/build-android-examples-${{ matrix.abi }}"
-
-          cmake -S examples/c++ -B "$EXAMPLES_BUILD" -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=android-${{ matrix.api }} \
-            -DANDROID_STL=c++_static \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DHOST_BUILD_DIR="$BUILD_DIR" \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build "$EXAMPLES_BUILD" --parallel
-
-          # Reuse the shared-library directory from Step 4; push again in
-          # case Step 4 was skipped or the directory was cleaned.
-          DEVICE_LIB_DIR="/data/local/tmp/zvec_tests/lib"
-          adb shell "mkdir -p $DEVICE_LIB_DIR" 2>/dev/null || true
-          SO_COUNT=0
-          while IFS= read -r so_file; do
-            adb push "$so_file" "$DEVICE_LIB_DIR/$(basename "$so_file")" > /dev/null 2>&1
-            SO_COUNT=$((SO_COUNT + 1))
-          done < <(find "$BUILD_DIR/lib" -name "*.so" -type f 2>/dev/null)
-          echo "Pushed $SO_COUNT shared libraries to $DEVICE_LIB_DIR"
+          cmake --build "$BUILD_DIR" --target zvec_cpp_examples --parallel
+          READELF="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
 
           for example in ailego-example core-example db-example; do
-            if [ -f "$EXAMPLES_BUILD/$example" ]; then
-              echo "=== Running $example ==="
-              adb push "$EXAMPLES_BUILD/$example" "/data/local/tmp/$example" > /dev/null 2>&1
-              adb shell "chmod 755 /data/local/tmp/$example && cd /data/local/tmp && LD_LIBRARY_PATH=$DEVICE_LIB_DIR ./$example"
-              adb shell "rm -f /data/local/tmp/$example"
+            example_path="$BUILD_DIR/bin/$example"
+            if [ ! -f "$example_path" ]; then
+              echo "Missing example binary: $example_path"
+              exit 1
             fi
+
+            echo "=== Verifying $example is self-contained ==="
+            dynamic_section=$("$READELF" --dynamic "$example_path")
+            echo "$dynamic_section" | grep NEEDED || true
+            if echo "$dynamic_section" | grep -Eq 'libzvec[^]]*\.so|libc\+\+_shared\.so'; then
+              echo "$example unexpectedly depends on a C++ shared library"
+              exit 1
+            fi
+
+            echo "=== Running $example ==="
+            adb push "$example_path" "/data/local/tmp/$example" > /dev/null 2>&1
+            adb shell "chmod 755 /data/local/tmp/$example && cd /data/local/tmp && ./$example"
+            adb shell "rm -f /data/local/tmp/$example"
           done
 
       # ── Cleanup ────────────────────────────────────────────────────────
