@@ -18,8 +18,20 @@ namespace zvec {
 namespace ailego {
 
 MemoryBudgetManager &MemoryBudgetManager::get_instance() {
-  static MemoryBudgetManager instance;
-  return instance;
+  auto &instance = instance_slot();
+  MemoryBudgetManager *current = instance.load(std::memory_order_acquire);
+  if (current != nullptr) {
+    return *current;
+  }
+
+  MemoryBudgetManager *created = new MemoryBudgetManager();
+  if (instance.compare_exchange_strong(current, created,
+                                       std::memory_order_acq_rel,
+                                       std::memory_order_acquire)) {
+    return *created;
+  }
+  delete created;
+  return *current;
 }
 
 }  // namespace ailego

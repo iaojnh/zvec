@@ -81,8 +81,24 @@ class BlockEvictionQueue {
   typedef moodycamel::ConcurrentQueue<BlockType> ConcurrentQueue;
 
   static BlockEvictionQueue &get_instance() {
-    static BlockEvictionQueue instance;
-    return instance;
+    // See MemoryBudgetManager::get_instance().  The atomic pointer is weak
+    // COMDAT storage and is coalesced when zvec_ailego is embedded in
+    // multiple ELF/Mach-O images; a magic-static object and its guard are not
+    // reliably kept together across that boundary.
+    static std::atomic<BlockEvictionQueue *> instance{nullptr};
+    BlockEvictionQueue *current = instance.load(std::memory_order_acquire);
+    if (current != nullptr) {
+      return *current;
+    }
+
+    BlockEvictionQueue *created = new BlockEvictionQueue();
+    if (instance.compare_exchange_strong(current, created,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+      return *created;
+    }
+    delete created;
+    return *current;
   }
   BlockEvictionQueue(const BlockEvictionQueue &) = delete;
   BlockEvictionQueue &operator=(const BlockEvictionQueue &) = delete;
@@ -129,8 +145,23 @@ class BlockEvictionQueue {
 class MemoryLimitPool {
  public:
   static MemoryLimitPool &get_instance() {
-    static MemoryLimitPool instance;
-    return instance;
+    // See MemoryBudgetManager::get_instance().  Deliberately retain the pool
+    // for process lifetime: its background thread and cached buffers must not
+    // be torn down while another DSO can still use the shared instance.
+    static std::atomic<MemoryLimitPool *> instance{nullptr};
+    MemoryLimitPool *current = instance.load(std::memory_order_acquire);
+    if (current != nullptr) {
+      return *current;
+    }
+
+    MemoryLimitPool *created = new MemoryLimitPool();
+    if (instance.compare_exchange_strong(current, created,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+      return *created;
+    }
+    delete created;
+    return *current;
   }
   MemoryLimitPool(const MemoryLimitPool &) = delete;
   MemoryLimitPool &operator=(const MemoryLimitPool &) = delete;

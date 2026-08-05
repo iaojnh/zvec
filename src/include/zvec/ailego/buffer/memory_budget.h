@@ -62,6 +62,17 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
     uint64_t resident_metadata_rejections{0};
   };
 
+  //! Retrieve the process-wide budget manager.
+  //!
+  //! zvec component libraries are also shipped as static archives and may be
+  //! embedded in more than one DSO in the same process (for example, a host
+  //! library plus the standalone DiskANN library).  A conventional function
+  //! local object would then be constructed once per DSO.  Keep only a
+  //! constant-initialized atomic pointer in COMDAT storage instead: ELF and
+  //! Mach-O loaders coalesce that weak storage across images, so every copy of
+  //! the accessor implementation publishes and observes the same heap object.
+  //! The object is intentionally process-lifetime, avoiding both
+  //! guard-variable splitting and cross-DSO destruction-order hazards.
   static MemoryBudgetManager &get_instance();
 
   MemoryBudgetManager(const MemoryBudgetManager &) = delete;
@@ -183,6 +194,15 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
 
  private:
   MemoryBudgetManager() = default;
+
+  //! Weak COMDAT storage shared by every out-of-line get_instance() copy.
+  //! Keeping this inline preserves the existing exported accessor ABI while
+  //! ensuring copies pulled from a static archive still coordinate through
+  //! one process-wide pointer.
+  static std::atomic<MemoryBudgetManager *> &instance_slot() {
+    static std::atomic<MemoryBudgetManager *> instance{nullptr};
+    return instance;
+  }
 
   static constexpr size_t index(Category category) {
     return static_cast<size_t>(category);
