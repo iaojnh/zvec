@@ -248,6 +248,11 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
   // Atomic flag to ensure initialization happens only once
   std::atomic<bool> initialized_{false};
 
+  // Serializes the complete one-shot initialization transaction. The flag is
+  // published only after validation and resource initialization succeed, so
+  // a rejected configuration does not consume the one allowed attempt.
+  std::mutex initialize_mutex_;
+
   // Guards config_ fields that may be written outside Initialize().
   mutable std::mutex mutex_;
 };

@@ -154,13 +154,15 @@ class MemoryLimitPool {
 
   bool is_full();
 
-  //! Currently available (free) bytes in the pool.  Lock-free read-only
-  //! estimate: used_size_ is atomic and pool_size_ is fixed after init().
+  //! Currently available (free) bytes in the pool. Lock-free read-only
+  //! estimate: both counters are atomic. Reinitialization is allowed only
+  //! while no page or external reservation is active.
   //! Returns 0 when the pool is at or over capacity.  Callers use this to gate
   //! whole-cluster prefetch under memory pressure.
   size_t available() const {
     size_t used = used_size_.load(std::memory_order_relaxed);
-    return (used >= pool_size_) ? 0 : (pool_size_ - used);
+    size_t capacity = pool_size_.load(std::memory_order_relaxed);
+    return (used >= capacity) ? 0 : (capacity - used);
   }
 
   size_t batch_acquire_buffers(size_t buffer_size, char **out, size_t count);
@@ -181,9 +183,16 @@ class MemoryLimitPool {
     return external_used_size_.load(std::memory_order_relaxed);
   }
 
-  //! Total capacity in bytes (fixed after init()).
+  //! Current configured capacity in bytes.
   size_t capacity() const {
-    return pool_size_;
+    return pool_size_.load(std::memory_order_relaxed);
+  }
+
+  //! Whether init() has explicitly published a capacity, including zero.
+  //! Standalone core users use this to distinguish legacy unconfigured mode
+  //! from an explicit zero-byte shared-cache budget.
+  bool initialized() const {
+    return initialized_.load(std::memory_order_acquire);
   }
 
   //! Snapshot of pool-level counters for monitoring / export.
@@ -230,20 +239,22 @@ class MemoryLimitPool {
   // evicts and re-reads its hottest pages (e.g. a 1.4 GB pool caps at ~1.05 GB
   // and thrashes a 1.17 GB index).  Reserve a small absolute margin instead so
   // the pool fills to near capacity before anything is evicted.
-  size_t reserve_margin() const {
-    size_t m = pool_size_ / 64;    // ~1.5% of the pool
+  size_t reserve_margin(size_t capacity) const {
+    size_t m = capacity / 64;      // ~1.5% of the pool
     const size_t lo = 8UL << 20;   // but at least 8 MB
     const size_t hi = 64UL << 20;  // and at most 64 MB
     if (m < lo) m = lo;
     if (m > hi) m = hi;
-    if (m * 2 >= pool_size_) m = pool_size_ / 8;  // tiny pools: fall back
+    if (m * 2 >= capacity) m = capacity / 8;  // tiny pools: fall back
     return m;
   }
   size_t high_watermark() const {
-    return pool_size_ - reserve_margin();
+    size_t capacity = pool_size_.load(std::memory_order_relaxed);
+    return capacity - reserve_margin(capacity);
   }
   size_t low_watermark() const {
-    return pool_size_ - reserve_margin() * 2;
+    size_t capacity = pool_size_.load(std::memory_order_relaxed);
+    return capacity - reserve_margin(capacity) * 2;
   }
 
  private:
@@ -257,7 +268,14 @@ class MemoryLimitPool {
     std::atomic<size_t> count{0};
   };
 
-  size_t pool_size_{0};
+  // Capacity is atomic because monitoring and the background evictor read it
+  // while init() may publish a new idle-pool capacity.
+  std::atomic<size_t> pool_size_{0};
+  std::atomic<bool> initialized_{false};
+  // Serializes reinitialization against cache-miss reservations. Release
+  // paths deliberately do not take this lock, so an active consumer can
+  // drain while a rejected reinitialization returns.
+  mutable std::shared_mutex lifecycle_mutex_;
   std::atomic<size_t> used_size_{0};
   // Unlike used_size_, committed_size_ includes buffers retained on the
   // free-list. External caches must reserve against this counter so cached

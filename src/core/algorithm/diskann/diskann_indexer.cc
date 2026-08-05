@@ -467,6 +467,15 @@ int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count,
     return IndexError_NoMemory;
   }
   auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  if (!memory_pool.initialized()) {
+    if (log_budget_exhaustion) {
+      LOG_INFO(
+          "DiskANN node cache is running without shared-pool accounting in "
+          "standalone core mode: estimated_bytes=%llu",
+          static_cast<unsigned long long>(estimated_cache_bytes));
+    }
+    return 0;
+  }
   if (estimated_cache_bytes == cache_memory_charge_bytes_) {
     return 0;
   }

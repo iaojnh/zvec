@@ -179,8 +179,9 @@ size_t MemoryLimitPool::pick_shard() {
 }
 
 bool MemoryLimitPool::try_reserve_used(size_t bytes) {
+  const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   size_t used = used_size_.load(std::memory_order_relaxed);
-  while (used <= pool_size_ && bytes <= pool_size_ - used) {
+  while (used <= capacity && bytes <= capacity - used) {
     if (used_size_.compare_exchange_weak(used, used + bytes,
                                          std::memory_order_relaxed,
                                          std::memory_order_relaxed)) {
@@ -191,8 +192,9 @@ bool MemoryLimitPool::try_reserve_used(size_t bytes) {
 }
 
 bool MemoryLimitPool::try_reserve_committed(size_t bytes) {
+  const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   size_t committed = committed_size_.load(std::memory_order_relaxed);
-  while (committed <= pool_size_ && bytes <= pool_size_ - committed) {
+  while (committed <= capacity && bytes <= capacity - committed) {
     if (committed_size_.compare_exchange_weak(committed, committed + bytes,
                                               std::memory_order_relaxed,
                                               std::memory_order_relaxed)) {
@@ -256,15 +258,28 @@ size_t MemoryLimitPool::trim_free_buffers(size_t bytes_needed) {
 }
 
 int MemoryLimitPool::init(size_t pool_size) {
+  std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  const size_t used = used_size_.load(std::memory_order_relaxed);
+  const size_t external = external_used_size_.load(std::memory_order_relaxed);
+  if (used != 0 || external != 0) {
+    LOG_ERROR(
+        "MemoryLimitPool reinitialization rejected while cache memory is "
+        "active: requested_capacity=%zu current_capacity=%zu used=%zu "
+        "external_used=%zu",
+        pool_size, pool_size_.load(std::memory_order_relaxed), used, external);
+    return -1;
+  }
+
   // Tear down the background evictor first: it reads pool_size_ and touches
   // the free-list, both of which we are about to reset.
   stop_background_evictor();
-  pool_size_ = 0;
+  pool_size_.store(0, std::memory_order_relaxed);
   BlockEvictionQueue::get_instance().recycle();
   drain_free_list();
-  pool_size_ = pool_size;
-  LOG_INFO("Shared cache initialized with capacity: %lu", pool_size_);
-  if (pool_size_ > 0) {
+  pool_size_.store(pool_size, std::memory_order_relaxed);
+  initialized_.store(true, std::memory_order_release);
+  LOG_INFO("Shared cache initialized with capacity: %zu", pool_size);
+  if (pool_size > 0) {
     start_background_evictor();
   }
   return 0;
@@ -299,7 +314,7 @@ void MemoryLimitPool::background_evict_loop() {
       });
     }
     if (!bg_running_.load()) break;
-    if (pool_size_ == 0) continue;
+    if (pool_size_.load(std::memory_order_relaxed) == 0) continue;
     const size_t low = low_watermark();
     if (used_size_.load() > low) {
       bg_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
@@ -316,6 +331,7 @@ void MemoryLimitPool::background_evict_loop() {
 
 bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
                                          char *&buffer) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   buffer = nullptr;
   if (buffer_size == 0 || !try_reserve_used(buffer_size)) {
     // Out of budget: wake the background evictor so the next attempt is
@@ -357,10 +373,12 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
 }
 
 bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   if (buffer_size == 0) {
     return true;
   }
-  if (pool_size_ == 0 || buffer_size > pool_size_) {
+  const size_t capacity = pool_size_.load(std::memory_order_relaxed);
+  if (capacity == 0 || buffer_size > capacity) {
     high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -373,7 +391,7 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
     }
 
     size_t committed = committed_size_.load(std::memory_order_relaxed);
-    size_t available = committed >= pool_size_ ? 0 : pool_size_ - committed;
+    size_t available = committed >= capacity ? 0 : capacity - committed;
     if (available >= buffer_size) {
       continue;
     }
@@ -394,6 +412,7 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
 }
 
 void MemoryLimitPool::charge_external(const size_t buffer_size) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   // Unconditional add: a single fetch_add is equivalent to (and cheaper than)
   // a compare_exchange loop, which would otherwise re-read the contended
   // used_size_ cache line on every retry.
@@ -452,19 +471,22 @@ void MemoryLimitPool::release_external(const size_t buffer_size) {
 }
 
 bool MemoryLimitPool::is_full() {
-  return used_size_.load(std::memory_order_relaxed) >= pool_size_;
+  return used_size_.load(std::memory_order_relaxed) >=
+         pool_size_.load(std::memory_order_relaxed);
 }
 
 size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
                                               size_t count) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   if (count == 0 || buffer_size == 0) return 0;
+  const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   size_t total_size = count * buffer_size;
   size_t actual_count = count;
   size_t expected, desired;
   do {
     expected = used_size_.load(std::memory_order_relaxed);
-    if (expected >= pool_size_) return 0;
-    size_t avail = (pool_size_ - expected) / buffer_size;
+    if (expected >= capacity) return 0;
+    size_t avail = (capacity - expected) / buffer_size;
     if (avail == 0) return 0;
     if (avail < actual_count) actual_count = avail;
     total_size = actual_count * buffer_size;
@@ -510,7 +532,7 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
 
 MemoryLimitPool::PoolStats MemoryLimitPool::stats() const {
   PoolStats s;
-  s.pool_size = pool_size_;
+  s.pool_size = pool_size_.load(std::memory_order_relaxed);
   s.used = used_size_.load(std::memory_order_relaxed);
   s.committed = committed_size_.load(std::memory_order_relaxed);
   s.external_used = external_used_size_.load(std::memory_order_relaxed);

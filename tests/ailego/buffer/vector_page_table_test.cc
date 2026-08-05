@@ -202,6 +202,22 @@ TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
   EXPECT_EQ(0u, memory_pool.external_used());
 }
 
+TEST_F(BufferPoolTest, RejectsReinitializationWhileMemoryIsActive) {
+  auto &memory_pool = MemoryLimitPool::get_instance();
+  InitPool(/*capacity_pages=*/4);
+  const size_t original_capacity = memory_pool.capacity();
+
+  ASSERT_TRUE(memory_pool.try_charge_external(kVectorPageSize));
+  EXPECT_NE(0, memory_pool.init(8 * kVectorPageSize));
+  EXPECT_EQ(original_capacity, memory_pool.capacity());
+  EXPECT_EQ(kVectorPageSize, memory_pool.used());
+  EXPECT_EQ(kVectorPageSize, memory_pool.external_used());
+
+  memory_pool.release_external(kVectorPageSize);
+  ASSERT_EQ(0, memory_pool.init(8 * kVectorPageSize));
+  EXPECT_EQ(8 * kVectorPageSize, memory_pool.capacity());
+}
+
 TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
   auto &memory_pool = MemoryLimitPool::get_instance();
   InitPool(/*capacity_pages=*/2);

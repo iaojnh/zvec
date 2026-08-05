@@ -129,6 +129,20 @@ TEST_F(ConfigTest, ValidateConfigWithInvalidMemoryLimit) {
             std::string::npos);
 }
 
+TEST_F(ConfigTest, InvalidInitializationDoesNotConsumeOneShot) {
+  GlobalConfig::ConfigData config;
+  config.memory_limit_bytes = 0;
+
+  GlobalConfig config_instance;
+  auto first = config_instance.Initialize(config);
+  auto second = config_instance.Initialize(config);
+
+  ASSERT_FALSE(first.ok());
+  ASSERT_FALSE(second.ok());
+  EXPECT_EQ(StatusCode::INVALID_ARGUMENT, first.code());
+  EXPECT_EQ(StatusCode::INVALID_ARGUMENT, second.code());
+}
+
 TEST_F(ConfigTest, ValidateExplicitMemoryBudgetPartitions) {
   GlobalConfig::ConfigData config;
   config.memory_limit_bytes = 1024ULL * 1024ULL * 1024ULL;

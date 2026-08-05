@@ -1954,15 +1954,34 @@ int main(int argc, char *argv[]) {
   string container_type = config_common["ContainerType"]
                               ? config_common["ContainerType"].as<string>()
                               : "MMapFileStorage";
+  uint64_t shared_cache_capacity = 0;
+  const auto pool_size_node = config_common["BufferPoolSizeBytes"];
+  if (pool_size_node) {
+    shared_cache_capacity = pool_size_node.as<uint64_t>();
+  }
   if (container_type == "BufferReadStorage") {
-    const auto pool_size_node = config_common["BufferPoolSizeBytes"];
-    if (!pool_size_node || pool_size_node.as<uint64_t>() == 0) {
+    if (shared_cache_capacity == 0) {
       cerr << "BufferPoolSizeBytes must be set to a positive value when "
               "ContainerType is BufferReadStorage"
            << endl;
       return -1;
     }
-    MemoryLimitPool::get_instance().init(pool_size_node.as<uint64_t>());
+  } else if (shared_cache_capacity == 0 && config_node["SearcherParams"]) {
+    // FileReadStorage does not need a page cache, but DiskANN's static node
+    // cache still uses MemoryLimitPool for admission. Use its byte budget as
+    // the standalone shared-cache capacity when no explicit pool size exists.
+    const auto node_budget =
+        config_node["SearcherParams"]
+                   ["zvec.diskann.searcher.cache_node_budget_bytes"];
+    if (node_budget) {
+      shared_cache_capacity = node_budget.as<uint64_t>();
+    }
+  }
+  if (shared_cache_capacity != 0 &&
+      MemoryLimitPool::get_instance().init(shared_cache_capacity) != 0) {
+    cerr << "Failed to initialize shared cache with capacity "
+         << shared_cache_capacity << endl;
+    return -1;
   }
 
   string ground_truth_file = "";

@@ -134,9 +134,8 @@ Status GlobalConfig::Validate(const ConfigData &config) const {
 }
 
 Status GlobalConfig::Initialize(const ConfigData &config) {
-  // Use atomic compare-exchange to ensure only one initialization
-  bool expected = false;
-  if (!initialized_.compare_exchange_strong(expected, true)) {
+  std::lock_guard<std::mutex> initialize_lock(initialize_mutex_);
+  if (initialized_.load(std::memory_order_acquire)) {
     return Status::OK();
   }
 
@@ -164,6 +163,7 @@ Status GlobalConfig::Initialize(const ConfigData &config) {
   }
 
   GlobalResource::Instance().initialize();
+  initialized_.store(true, std::memory_order_release);
   return Status::OK();
 }
 
