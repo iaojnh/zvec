@@ -405,7 +405,7 @@ if [ -z "$READELF" ]; then
     exit 1
 fi
 
-for example in ailego-example core-example db-example; do
+for example in ailego-example core-example external-vector-example db-example; do
     example_path="$BUILD_DIR/bin/$example"
     if [ ! -f "$example_path" ]; then
         echo "ERROR: Example binary not found: $example_path"

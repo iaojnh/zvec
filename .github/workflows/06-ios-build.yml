@@ -69,8 +69,12 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
             -DCMAKE_OSX_SYSROOT="$SDK_PATH" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_ZVEC_SHARED=OFF \
+            -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DBUILD_ZVEC_CORE_SHARED=OFF \
             -DBUILD_PYTHON_BINDINGS=OFF \
             -DBUILD_TOOLS=OFF \
+            -DBUILD_CPP_EXAMPLES=ON \
             -DENABLE_WERROR=ON \
             -DCMAKE_INSTALL_PREFIX="./install" \
             -DGLOBAL_CC_PROTOBUF_PROTOC="$GITHUB_WORKSPACE/build_host/bin/protoc" \
@@ -80,6 +84,19 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
           cmake --build build_ios_${{ matrix.platform }} --parallel $NPROC
+
+      - name: Build public static C++ examples
+        run: |
+          NPROC=$(sysctl -n hw.ncpu)
+          BUILD_DIR=build_ios_${{ matrix.platform }}
+          cmake --build "$BUILD_DIR" --target zvec_cpp_examples --parallel "$NPROC"
+
+          for example in ailego-example core-example external-vector-example db-example; do
+            if [ ! -f "$BUILD_DIR/bin/$example" ]; then
+              echo "Missing iOS example binary: $BUILD_DIR/bin/$example"
+              exit 1
+            fi
+          done
 
       - name: Build test targets
         if: matrix.test_on_simulator

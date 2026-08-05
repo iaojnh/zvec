@@ -23,7 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        abi: [x86_64]
+        # x86_64 runs the emulator suite; arm64-v8a provides compile/link
+        # coverage for the ABI used by physical Android devices.
+        abi: [x86_64, arm64-v8a]
         api: ${{ github.event.inputs.api && fromJSON(format('["{0}"]', github.event.inputs.api)) || fromJSON('["34"]') }}
     steps:
       # ── Environment setup ──────────────────────────────────────────────
@@ -55,16 +57,22 @@ jobs:
         uses: android-actions/setup-android@v4
 
       - name: Enable KVM
+        if: matrix.abi == 'x86_64'
         run: sudo chmod 666 /dev/kvm || true
 
-      - name: Install NDK, emulator and system image
+      - name: Install NDK and Android platform
         shell: bash
         run: |
           sdkmanager --install \
             "ndk;$NDK_VERSION" \
             "platform-tools" \
-            "platforms;android-${{ matrix.api }}" \
-            "emulator"
+            "platforms;android-${{ matrix.api }}"
+
+      - name: Install emulator and x86_64 system image
+        if: matrix.abi == 'x86_64'
+        shell: bash
+        run: |
+          sdkmanager --install "emulator"
 
           # Install x86_64 system image (try variants in order of availability)
           sdkmanager --install "system-images;android-${{ matrix.api }};google_apis;x86_64" 2>/dev/null || \
@@ -131,7 +139,15 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-          echo "Building all targets..."
+          if [ "${{ matrix.abi }}" = "arm64-v8a" ]; then
+            echo "Building focused DiskAnn tests and public C++ examples for arm64-v8a..."
+            cmake --build "$BUILD_DIR" \
+              --target diskann_mobile_compat_test diskann_mobile_collection_test zvec_cpp_examples \
+              --parallel
+            exit 0
+          fi
+
+          echo "Building all x86_64 targets..."
           cmake --build "$BUILD_DIR" --parallel
 
           # Discover test targets from ctest metadata
@@ -156,6 +172,7 @@ jobs:
 
       # ── Step 3: start emulator ─────────────────────────────────────────
       - name: 'Step 3: Start Android emulator'
+        if: matrix.abi == 'x86_64'
         shell: bash
         run: |
           AVD_NAME="zvec_test_avd"
@@ -250,6 +267,7 @@ jobs:
 
       # ── Step 4: run unit tests on emulator ─────────────────────────────
       - name: 'Step 4: Run unit tests on emulator'
+        if: matrix.abi == 'x86_64'
         shell: bash
         env:
           BUILD_DIR: build_android_${{ matrix.abi }}
@@ -391,6 +409,7 @@ jobs:
 
       # ── Step 5: build and run examples ─────────────────────────────────
       - name: 'Step 5: Build and run examples'
+        if: matrix.abi == 'x86_64'
         shell: bash
         env:
           BUILD_DIR: build_android_${{ matrix.abi }}
@@ -398,7 +417,7 @@ jobs:
           cmake --build "$BUILD_DIR" --target zvec_cpp_examples --parallel
           READELF="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
 
-          for example in ailego-example core-example db-example; do
+          for example in ailego-example core-example external-vector-example db-example; do
             example_path="$BUILD_DIR/bin/$example"
             if [ ! -f "$example_path" ]; then
               echo "Missing example binary: $example_path"
@@ -419,9 +438,44 @@ jobs:
             adb shell "rm -f /data/local/tmp/$example"
           done
 
+      - name: 'Step 3: Verify arm64-v8a artifacts'
+        if: matrix.abi == 'arm64-v8a'
+        shell: bash
+        env:
+          BUILD_DIR: build_android_${{ matrix.abi }}
+        run: |
+          READELF="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          for binary in \
+            diskann_mobile_compat_test \
+            diskann_mobile_collection_test \
+            ailego-example \
+            core-example \
+            external-vector-example \
+            db-example; do
+            binary_path="$BUILD_DIR/bin/$binary"
+            if [ ! -f "$binary_path" ]; then
+              echo "Missing arm64-v8a binary: $binary_path"
+              exit 1
+            fi
+            if ! "$READELF" --file-header "$binary_path" | grep -q 'Machine:.*AArch64'; then
+              echo "$binary_path is not an AArch64 binary"
+              exit 1
+            fi
+          done
+
+          for example in ailego-example core-example external-vector-example db-example; do
+            example_path="$BUILD_DIR/bin/$example"
+            dynamic_section=$("$READELF" --dynamic "$example_path")
+            if echo "$dynamic_section" | grep -Eq 'libzvec[^]]*\.so|libc\+\+_shared\.so'; then
+              echo "$example unexpectedly depends on a C++ shared library"
+              exit 1
+            fi
+          done
+
       # ── Cleanup ────────────────────────────────────────────────────────
       - name: Stop emulator
-        if: always()
+        if: matrix.abi == 'x86_64' && always()
         shell: bash
         run: |
           adb emu kill 2>/dev/null || true
