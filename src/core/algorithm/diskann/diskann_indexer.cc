@@ -116,8 +116,7 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
       static_cast<unsigned long long>(budget.config.resident_metadata_bytes),
       static_cast<unsigned long long>(budget.resident_metadata_used),
       static_cast<unsigned long long>(budget.resident_metadata_rejections),
-      static_cast<unsigned long long>(
-          budget.config.rocksdb_block_cache_bytes),
+      static_cast<unsigned long long>(budget.config.rocksdb_block_cache_bytes),
       static_cast<unsigned long long>(budget.config.safety_reserve_bytes),
       buffer_pool_ == nullptr ? "diskann_node_cache"
                               : "diskann_node_cache,vec_buffer_pool");

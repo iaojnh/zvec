@@ -84,8 +84,7 @@ GlobalResource::MemoryStats GlobalResource::memory_stats() {
   result.query_working_rejections = budget.query_working_rejections;
   result.resident_metadata_capacity = budget.config.resident_metadata_bytes;
   result.resident_metadata_used = budget.resident_metadata_used;
-  result.resident_metadata_rejections =
-      budget.resident_metadata_rejections;
+  result.resident_metadata_rejections = budget.resident_metadata_rejections;
   result.safety_reserve_capacity = budget.config.safety_reserve_bytes;
   if (rocksdb_block_cache_) {
     result.rocksdb_block_cache_capacity = rocksdb_block_cache_->GetCapacity();

@@ -126,8 +126,7 @@ class ZVEC_AILEGO_API MemoryBudgetManager {
         return true;
       }
     }
-    rejected_charges_[index(category)].fetch_add(1,
-                                                 std::memory_order_relaxed);
+    rejected_charges_[index(category)].fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
