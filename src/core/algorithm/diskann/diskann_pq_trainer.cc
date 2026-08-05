@@ -160,6 +160,15 @@ int DiskAnnPqTrainer::convert_pivot_data(
   return 0;
 }
 
+template int DiskAnnPqTrainer::convert_pivot_data<float>(
+    const IndexMeta &, uint32_t, uint32_t, const std::vector<uint32_t> &,
+    const std::vector<uint32_t> &, IndexCluster::CentroidList &,
+    std::vector<uint8_t> &);
+template int DiskAnnPqTrainer::convert_pivot_data<ailego::Float16>(
+    const IndexMeta &, uint32_t, uint32_t, const std::vector<uint32_t> &,
+    const std::vector<uint32_t> &, IndexCluster::CentroidList &,
+    std::vector<uint8_t> &);
+
 int DiskAnnPqTrainer::train_pq(IndexThreads::Pointer threads,
                                const IndexMeta &meta, std::string &train_data,
                                size_t num_train, uint32_t num_centers,
