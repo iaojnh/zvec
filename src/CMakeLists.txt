@@ -236,11 +236,22 @@ function(zvec_add_mobile_static_sdk TARGET_NAME)
                 ${CMAKE_DL_LIBS}
         )
     else()
+        # Keep whole-archive scoped to the SDK archives themselves.  Putting
+        # these flags in target_link_libraries() also encloses transitive
+        # dependencies inserted by CMake, which forces both Arrow's bundled
+        # utf8proc and zvec's standalone utf8proc into the executable.
+        set(ZVEC_STATIC_SDK_LINK_OPTIONS)
+        foreach(ZVEC_STATIC_SDK_LIB ${ZVEC_STATIC_SDK_LIBS})
+            list(APPEND ZVEC_STATIC_SDK_LINK_OPTIONS
+                -Wl,--whole-archive,$<TARGET_FILE:${ZVEC_STATIC_SDK_LIB}>,--no-whole-archive
+            )
+        endforeach()
+        target_link_options(${TARGET_NAME}
+            INTERFACE ${ZVEC_STATIC_SDK_LINK_OPTIONS}
+        )
         target_link_libraries(${TARGET_NAME}
             INTERFACE
-                -Wl,--whole-archive
-                    ${ZVEC_STATIC_SDK_LIBS}
-                -Wl,--no-whole-archive
+                ${ZVEC_STATIC_SDK_LIBS}
                 Threads::Threads
                 ${CMAKE_DL_LIBS}
         )
