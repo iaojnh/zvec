@@ -65,14 +65,14 @@ class DiskAnnBufferPoolSearchTest : public testing::Test {
   }
 
   // Build a DiskAnn index and dump it to `path`.
-  void BuildIndex(const string &path) {
+  void BuildIndex(const string &path, size_t doc_count = kDocCnt) {
     IndexBuilder::Pointer builder =
         IndexFactory::CreateBuilder("DiskAnnBuilder");
     ASSERT_NE(builder, nullptr);
 
     auto holder =
         make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(kDim);
-    for (size_t i = 0; i < kDocCnt; i++) {
+    for (size_t i = 0; i < doc_count; i++) {
       NumericalVector<float> vec(kDim);
       for (size_t j = 0; j < kDim; ++j) vec[j] = static_cast<float>(i);
       ASSERT_TRUE(holder->emplace(i, vec));
@@ -287,4 +287,102 @@ TEST_F(DiskAnnBufferPoolSearchTest,
   snapshot = MemoryBudgetManager::get_instance().snapshot();
   EXPECT_EQ(0u, snapshot.resident_metadata_used);
   EXPECT_EQ(0u, MemoryLimitPool::get_instance().external_used());
+}
+
+TEST_F(DiskAnnBufferPoolSearchTest,
+       ExplicitZeroSharedCacheDisablesStaticNodeCache) {
+  const string path = dir_ + "/index_zero_shared_cache";
+  BuildIndex(path, 1000);
+
+  constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+  MemoryBudgetManager::Config budget;
+  budget.total_bytes = 512 * kMiB;
+  budget.enforce_accounting = true;
+  budget.query_working_bytes = 128 * kMiB;
+  budget.resident_metadata_bytes = 384 * kMiB;
+  ASSERT_TRUE(MemoryBudgetManager::get_instance().configure(budget));
+  MemoryLimitPool::get_instance().init(0);
+
+  auto direct_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(direct_storage, nullptr);
+  ASSERT_EQ(0, direct_storage->open(path, false));
+
+  const auto rejections_before =
+      MemoryLimitPool::get_instance().stats().high_watermark_hits;
+  auto searcher = MakeSearcher(direct_storage, 4 * kMiB);
+  ASSERT_NE(searcher, nullptr);
+  const auto stats = MemoryLimitPool::get_instance().stats();
+  EXPECT_EQ(0u, stats.pool_size);
+  EXPECT_EQ(0u, stats.used);
+  EXPECT_EQ(0u, stats.external_used);
+  EXPECT_GT(stats.high_watermark_hits, rejections_before);
+
+  auto context = searcher->create_context();
+  ASSERT_TRUE(!!context);
+  context->set_topk(kTopk);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, kDim);
+  NumericalVector<float> query(kDim);
+  for (size_t i = 0; i < kDim; ++i) query[i] = 100.1f;
+  EXPECT_EQ(0, searcher->search_impl(query.data(), qmeta, context));
+}
+
+TEST_F(DiskAnnBufferPoolSearchTest,
+       InsufficientSharedCacheShrinksStaticNodeCache) {
+  const string path = dir_ + "/index_small_shared_cache";
+  BuildIndex(path, 1000);
+
+  constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+  constexpr uint64_t kSharedCacheBytes = 128ULL * 1024ULL;
+  MemoryBudgetManager::Config budget;
+  budget.total_bytes = 512 * kMiB;
+  budget.enforce_accounting = true;
+  budget.buffer_cache_bytes = kSharedCacheBytes;
+  budget.query_working_bytes = 128 * kMiB;
+  budget.resident_metadata_bytes =
+      budget.total_bytes - budget.buffer_cache_bytes -
+      budget.query_working_bytes;
+  ASSERT_TRUE(MemoryBudgetManager::get_instance().configure(budget));
+  MemoryLimitPool::get_instance().init(kSharedCacheBytes);
+
+  auto direct_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(direct_storage, nullptr);
+  ASSERT_EQ(0, direct_storage->open(path, false));
+
+  const auto rejections_before =
+      MemoryLimitPool::get_instance().stats().high_watermark_hits;
+  auto searcher = MakeSearcher(direct_storage, 4 * kMiB);
+  ASSERT_NE(searcher, nullptr);
+
+  const auto stats = MemoryLimitPool::get_instance().stats();
+  EXPECT_GT(stats.external_used, 0u);
+  EXPECT_LE(stats.external_used, kSharedCacheBytes);
+  EXPECT_GT(stats.high_watermark_hits, rejections_before);
+
+  searcher.reset();
+  EXPECT_EQ(0u, MemoryLimitPool::get_instance().external_used());
+}
+
+TEST_F(DiskAnnBufferPoolSearchTest,
+       ZeroCapacityDisablesCacheWithoutBreakingCoreOnlyUse) {
+  const string path = dir_ + "/index_unmanaged_zero_capacity";
+  BuildIndex(path, 1000);
+
+  MemoryBudgetManager::Config budget;
+  ASSERT_TRUE(MemoryBudgetManager::get_instance().configure(budget));
+  ASSERT_FALSE(budget.enforce_accounting);
+  MemoryLimitPool::get_instance().init(0);
+
+  auto direct_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(direct_storage, nullptr);
+  ASSERT_EQ(0, direct_storage->open(path, false));
+
+  constexpr uint64_t kNodeBudget = 4ULL * 1024ULL * 1024ULL;
+  const auto rejections_before =
+      MemoryLimitPool::get_instance().stats().high_watermark_hits;
+  auto searcher = MakeSearcher(direct_storage, kNodeBudget);
+  ASSERT_NE(searcher, nullptr);
+  EXPECT_EQ(0u, MemoryLimitPool::get_instance().capacity());
+  EXPECT_EQ(0u, MemoryLimitPool::get_instance().external_used());
+  EXPECT_GT(MemoryLimitPool::get_instance().stats().high_watermark_hits,
+            rejections_before);
 }

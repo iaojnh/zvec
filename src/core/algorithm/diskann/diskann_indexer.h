@@ -37,7 +37,8 @@ class DiskAnnIndexer {
 
  public:
   int init(DiskAnnSearcherEntity &entity);
-  int reserve_cache_memory(uint64_t node_count);
+  int reserve_cache_memory(uint64_t node_count,
+                           bool log_budget_exhaustion = true);
   int load_cache_list(const std::vector<diskann_id_t> &node_list);
   void manage_cache_page_overlap(const std::vector<diskann_id_t> &node_list,
                                  bool evict);
@@ -103,6 +104,7 @@ class DiskAnnIndexer {
   int use_medroids_data_as_centroids();
 
  private:
+  uint32_t admit_cache_nodes(uint32_t requested_node_count);
   void clear_cache_memory();
   bool validate_neighbors(uint32_t neighbor_num,
                           const diskann_id_t *neighbors) const;

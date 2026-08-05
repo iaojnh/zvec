@@ -449,7 +449,8 @@ int DiskAnnIndexer::load_cache_list(
   return 0;
 }
 
-int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count) {
+int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count,
+                                         bool log_budget_exhaustion) {
   const uint64_t estimated_bytes_per_node = cache_estimated_bytes_per_node();
   if (estimated_bytes_per_node != 0 &&
       node_count >
@@ -466,9 +467,6 @@ int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count) {
     return IndexError_NoMemory;
   }
   auto &memory_pool = ailego::MemoryLimitPool::get_instance();
-  if (memory_pool.capacity() == 0) {
-    return 0;
-  }
   if (estimated_cache_bytes == cache_memory_charge_bytes_) {
     return 0;
   }
@@ -477,12 +475,14 @@ int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count) {
     const uint64_t additional_charge =
         estimated_cache_bytes - cache_memory_charge_bytes_;
     if (!memory_pool.try_charge_external(additional_charge)) {
-      LOG_ERROR(
-          "DiskANN node cache exceeds the shared memory budget: "
-          "requested=%llu available=%llu capacity=%llu",
-          static_cast<unsigned long long>(estimated_cache_bytes),
-          static_cast<unsigned long long>(memory_pool.available()),
-          static_cast<unsigned long long>(memory_pool.capacity()));
+      if (log_budget_exhaustion) {
+        LOG_ERROR(
+            "DiskANN node cache exceeds the shared memory budget: "
+            "requested=%llu available=%llu capacity=%llu",
+            static_cast<unsigned long long>(estimated_cache_bytes),
+            static_cast<unsigned long long>(memory_pool.available()),
+            static_cast<unsigned long long>(memory_pool.capacity()));
+      }
       return IndexError_NoMemory;
     }
   } else if (estimated_cache_bytes < cache_memory_charge_bytes_) {
@@ -500,6 +500,88 @@ int DiskAnnIndexer::reserve_cache_memory(uint64_t node_count) {
       static_cast<unsigned long long>(memory_pool.external_used()),
       static_cast<unsigned long long>(memory_pool.available()),
       static_cast<unsigned long long>(memory_pool.capacity()));
+  return 0;
+}
+
+uint32_t DiskAnnIndexer::admit_cache_nodes(uint32_t requested_node_count) {
+  if (requested_node_count == 0) {
+    return 0;
+  }
+
+  const uint64_t bytes_per_node = cache_estimated_bytes_per_node();
+  if (bytes_per_node == 0) {
+    return requested_node_count;
+  }
+
+  uint32_t candidate = requested_node_count;
+  while (candidate != 0) {
+    const auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+    bool additional_charge_exceeds_pool = true;
+    if (candidate <=
+        std::numeric_limits<uint64_t>::max() / bytes_per_node) {
+      const uint64_t desired_bytes = candidate * bytes_per_node;
+      const uint64_t additional_charge =
+          desired_bytes > cache_memory_charge_bytes_
+              ? desired_bytes - cache_memory_charge_bytes_
+              : 0;
+      additional_charge_exceeds_pool =
+          additional_charge > memory_pool.capacity();
+    }
+    if (reserve_cache_memory(candidate, /*log_budget_exhaustion=*/false) == 0) {
+      if (candidate != requested_node_count) {
+        LOG_WARN(
+            "DiskANN node cache reduced to fit the shared memory budget: "
+            "requested_nodes=%u admitted_nodes=%u bytes_per_node=%llu "
+            "capacity=%llu available=%llu",
+            requested_node_count, candidate,
+            static_cast<unsigned long long>(bytes_per_node),
+            static_cast<unsigned long long>(memory_pool.capacity()),
+            static_cast<unsigned long long>(memory_pool.available()));
+      }
+      return candidate;
+    }
+
+    const auto stats = memory_pool.stats();
+    uint64_t max_cache_bytes = 0;
+    if (additional_charge_exceeds_pool) {
+      // try_charge_external() rejects an individual request larger than the
+      // whole pool before reclaiming pages. Compute the theoretical maximum
+      // after evicting page-cache memory, while preserving other external
+      // reservations, and retry once at that size.
+      const uint64_t other_external =
+          stats.external_used > cache_memory_charge_bytes_
+              ? stats.external_used - cache_memory_charge_bytes_
+              : 0;
+      max_cache_bytes = other_external < stats.pool_size
+                            ? stats.pool_size - other_external
+                            : 0;
+    } else {
+      // A normal failed reservation has already exhausted page eviction, so
+      // only currently uncommitted capacity is a realistic fallback.
+      const uint64_t free_committed =
+          stats.committed < stats.pool_size
+              ? stats.pool_size - stats.committed
+              : 0;
+      max_cache_bytes =
+          cache_memory_charge_bytes_ >
+                  std::numeric_limits<uint64_t>::max() - free_committed
+              ? std::numeric_limits<uint64_t>::max()
+              : cache_memory_charge_bytes_ + free_committed;
+    }
+    const uint64_t max_nodes = max_cache_bytes / bytes_per_node;
+    const uint32_t next = static_cast<uint32_t>(std::min<uint64_t>(
+        static_cast<uint64_t>(candidate - 1),
+        std::min<uint64_t>(max_nodes,
+                           std::numeric_limits<uint32_t>::max())));
+    candidate = next;
+  }
+
+  LOG_WARN(
+      "DiskANN node cache disabled because no shared memory budget is "
+      "available: requested_nodes=%u bytes_per_node=%llu capacity=%llu",
+      requested_node_count, static_cast<unsigned long long>(bytes_per_node),
+      static_cast<unsigned long long>(
+          ailego::MemoryLimitPool::get_instance().capacity()));
   return 0;
 }
 
@@ -689,12 +771,9 @@ int DiskAnnIndexer::configure_cache(uint32_t cache_node_num,
 
   std::vector<diskann_id_t> cached_nodes;
   if (cache_node_num != 0) {
-    if (cache_node_budget_bytes != 0) {
-      int ret = reserve_cache_memory(cache_node_num);
-      if (ret != 0) {
-        return ret;
-      }
-    }
+    cache_node_num = admit_cache_nodes(cache_node_num);
+  }
+  if (cache_node_num != 0) {
     if (!cache_node_list_path.empty()) {
       int ret =
           load_node_list(cache_node_list_path, cache_node_num, cached_nodes);

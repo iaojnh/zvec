@@ -112,4 +112,13 @@ TEST_F(BufferReadStorageTest, RejectsUnknownWarmupMode) {
   EXPECT_EQ(IndexError_InvalidArgument, storage->init(params));
 }
 
+TEST_F(BufferReadStorageTest, RejectsPoolSmallerThanOnePage) {
+  const size_t kTooSmall = ailego::kVectorPageSize - 1;
+  ailego::MemoryLimitPool::get_instance().init(kTooSmall);
+
+  auto storage = CreateStorage(BUFFER_READ_STORAGE_WARMUP_NONE);
+  ASSERT_NE(storage, nullptr);
+  EXPECT_EQ(IndexError_InvalidArgument, storage->open(file_path_, false));
+}
+
 }  // namespace

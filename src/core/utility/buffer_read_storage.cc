@@ -318,6 +318,16 @@ class BufferReadStorage : public IndexStorage {
 
   //! Load an index file into the container
   int open(const std::string &path, bool) override {
+    const size_t shared_cache_capacity =
+        ailego::MemoryLimitPool::get_instance().capacity();
+    if (shared_cache_capacity < ailego::kVectorPageSize) {
+      LOG_ERROR(
+          "BufferReadStorage requires at least one cache page: "
+          "capacity=%zu page_size=%zu path=%s",
+          shared_cache_capacity, ailego::kVectorPageSize, path.c_str());
+      return IndexError_InvalidArgument;
+    }
+
     file_path_ = path;
     // Read-only buffer pool over the freshly-dumped FileDumper container.
     buffer_pool_ = std::make_shared<ailego::VecBufferPool>(
