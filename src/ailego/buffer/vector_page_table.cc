@@ -20,7 +20,7 @@
 #include <ailego/utility/memory_helper.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/logger/logger.h>
-#include <zvec/core/framework/index_logger.h>
+#include <zvec/ailego/logger/logger.h>
 
 #if defined(_MSC_VER)
 #ifndef NOMINMAX
