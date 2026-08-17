@@ -255,6 +255,52 @@ TEST(DiskAnnFileReaderWindowsTest, DeregisterDrainsOutstandingBatch) {
   reader.deregister_thread();
 }
 
+TEST(DiskAnnFileReaderWindowsTest, CollectsIocpDiagnosticsWhenEnabled) {
+  constexpr size_t kReadCount = 8;
+
+  TemporaryFile file;
+  ASSERT_TRUE(file.valid());
+  ASSERT_TRUE(file.write_pages());
+
+  WindowsAlignedFileReader reader;
+  reader.open(file.path());
+  reader.register_thread();
+
+  AlignedBuffer output = make_aligned_buffer(kPageSize * kReadCount);
+  ASSERT_NE(output, nullptr);
+
+  std::vector<AlignedRead> requests;
+  requests.reserve(kReadCount);
+  for (size_t i = 0; i < kReadCount; ++i) {
+    requests.emplace_back(i * kPageSize, kPageSize,
+                          output.get() + i * kPageSize);
+  }
+
+  IOContext &ctx = reader.get_ctx();
+  ASSERT_NE(ctx, nullptr);
+  ASSERT_NE(ctx, reinterpret_cast<IOContext>(-1));
+  ctx->diagnostics_enabled = true;
+
+  PendingBatch batch;
+  ASSERT_EQ(reader.submit(batch, requests, ctx), 0);
+  EXPECT_EQ(ctx->diagnostics.submit_calls, 1U);
+  EXPECT_EQ(ctx->diagnostics.submitted_reads, kReadCount);
+  EXPECT_EQ(ctx->diagnostics.immediate_reads + ctx->diagnostics.pending_reads,
+            kReadCount);
+  EXPECT_EQ(ctx->diagnostics.max_outstanding, kReadCount);
+
+  std::vector<uint32_t> completed;
+  while (batch.n_reaped < batch.n_submitted) {
+    ASSERT_GT(reader.get_completed(batch, ctx, 1, completed), 0);
+  }
+
+  EXPECT_GE(ctx->diagnostics.dequeue_calls, 1U);
+  EXPECT_EQ(ctx->diagnostics.dequeued_reads, kReadCount);
+  EXPECT_GE(ctx->diagnostics.max_dequeued_once, 1U);
+  EXPECT_EQ(ctx->outstanding_count, 0U);
+  reader.deregister_thread();
+}
+
 TEST(DiskAnnFileReaderWindowsTest, RejectsMisalignedUnbufferedRead) {
   TemporaryFile file;
   ASSERT_TRUE(file.valid());

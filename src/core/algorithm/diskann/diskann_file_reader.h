@@ -67,6 +67,18 @@ struct IoBackend {
   IoUringRing ring{};
   io_context_t aio_ctx{nullptr};
 #elif defined(_WIN32) || defined(_WIN64)
+  struct IocpDiagnostics {
+    uint64_t submit_calls{0};
+    uint64_t submitted_reads{0};
+    uint64_t immediate_reads{0};
+    uint64_t pending_reads{0};
+    uint64_t dequeue_calls{0};
+    uint64_t dequeued_reads{0};
+    uint64_t wait_us{0};
+    uint32_t max_outstanding{0};
+    uint32_t max_dequeued_once{0};
+  };
+
   std::vector<OVERLAPPED> reqs;
   HANDLE file_handle{INVALID_HANDLE_VALUE};
   HANDLE completion_port{nullptr};
@@ -74,6 +86,8 @@ struct IoBackend {
   uint32_t submitted_count{0};
   uint32_t outstanding_count{0};
   uint64_t generation{0};
+  bool diagnostics_enabled{false};
+  IocpDiagnostics diagnostics;
 #endif
 };
 
@@ -81,6 +95,11 @@ typedef IoBackend *IOContext;
 
 int setup_io_ctx(IOContext &ctx);
 int destroy_io_ctx(IOContext &ctx);
+
+// Diagnostics are opt-in so production searches do not pay for timing and
+// histogram collection. Set ZVEC_DISKANN_IO_DIAGNOSTICS=1 before starting the
+// process to enable them.
+bool diskann_io_diagnostics_enabled();
 
 // Log the current DiskAnn I/O backend (io_uring, libaio, or pread). Probes the
 // backend on first call. No-op outside Linux and macOS.

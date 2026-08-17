@@ -21,6 +21,65 @@
 namespace zvec {
 namespace core {
 
+namespace {
+
+double average(double total, uint64_t count) {
+  return count == 0 ? 0.0 : total / static_cast<double>(count);
+}
+
+void log_search_diagnostics(const SearchStats &stats, IOContext io_ctx) {
+  if (stats.query_count == 0) {
+    return;
+  }
+
+  LOG_INFO(
+      "DiskAnn search diagnostics: queries=%llu, reads/query=%.2f, "
+      "cache_hits/query=%.2f, hops/query=%.2f, batches/query=%.2f, "
+      "reads/batch=%.2f, max_batch=%u, beam_limit/query=%.2f, "
+      "max_beam_limit=%u, io_us/query=%.2f, cpu_us/query=%.2f, "
+      "batch_histogram=[1:%llu,2-4:%llu,5-8:%llu,9-16:%llu,17-32:%llu]",
+      static_cast<unsigned long long>(stats.query_count),
+      average(stats.disk_page_reads, stats.query_count),
+      average(stats.cache_hits, stats.query_count),
+      average(stats.hop_num, stats.query_count),
+      average(stats.io_batch_count, stats.query_count),
+      average(stats.io_batch_size_sum, stats.io_batch_count),
+      stats.io_batch_size_max,
+      average(stats.effective_beam_width_sum, stats.query_count),
+      stats.effective_beam_width_max, average(stats.io_us, stats.query_count),
+      average(stats.cpu_us, stats.query_count),
+      static_cast<unsigned long long>(stats.io_batch_size_histogram[0]),
+      static_cast<unsigned long long>(stats.io_batch_size_histogram[1]),
+      static_cast<unsigned long long>(stats.io_batch_size_histogram[2]),
+      static_cast<unsigned long long>(stats.io_batch_size_histogram[3]),
+      static_cast<unsigned long long>(stats.io_batch_size_histogram[4]));
+
+#if defined(_WIN32) || defined(_WIN64)
+  if (io_ctx == nullptr || io_ctx == reinterpret_cast<IOContext>(-1)) {
+    return;
+  }
+
+  const auto &io = io_ctx->diagnostics;
+  LOG_INFO(
+      "DiskAnn IOCP diagnostics: submit_calls=%llu, submitted_reads=%llu, "
+      "immediate_reads=%llu, pending_reads=%llu, pending_ratio=%.2f%%, "
+      "max_outstanding=%u, dequeue_calls=%llu, completions/dequeue=%.2f, "
+      "max_dequeued_once=%u, iocp_wait_us/query=%.2f",
+      static_cast<unsigned long long>(io.submit_calls),
+      static_cast<unsigned long long>(io.submitted_reads),
+      static_cast<unsigned long long>(io.immediate_reads),
+      static_cast<unsigned long long>(io.pending_reads),
+      100.0 * average(io.pending_reads, io.submitted_reads), io.max_outstanding,
+      static_cast<unsigned long long>(io.dequeue_calls),
+      average(io.dequeued_reads, io.dequeue_calls), io.max_dequeued_once,
+      average(io.wait_us, stats.query_count));
+#else
+  (void)io_ctx;
+#endif
+}
+
+}  // namespace
+
 DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
                                const IndexMetric::Pointer &measure,
                                const DiskAnnEntity::Pointer &entity)
@@ -36,6 +95,7 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
     return IndexError_InvalidArgument;
   }
   type_ = type;
+  io_diagnostics_enabled_ = diskann_io_diagnostics_enabled();
   element_size_ = element_size;
   pq_chunk_num_ = pq_chunk_num;
 
@@ -107,6 +167,10 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
 }
 
 DiskAnnContext::~DiskAnnContext() {
+  if (io_diagnostics_enabled_) {
+    log_search_diagnostics(query_stats_, io_ctx_);
+  }
+
   DiskAnnUtil::free_aligned(query_);
   DiskAnnUtil::free_aligned(query_rotated_);
   DiskAnnUtil::free_aligned(pq_table_dist_buffer_);

@@ -865,6 +865,9 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
                                          sector_num_per_node));
   uint32_t effective_beam_width = std::min(
       std::max(8u, std::min(ctx->list_size() / 5, 32u)), max_beam_width);
+  if (ctx->io_diagnostics_enabled()) {
+    stats.record_query(effective_beam_width);
+  }
 
   std::vector<diskann_id_t> frontier;
   frontier.reserve(2 * effective_beam_width);
@@ -908,6 +911,9 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
 
     if (!frontier.empty()) {
       stats.hop_num++;
+      if (ctx->io_diagnostics_enabled()) {
+        stats.record_io_batch(static_cast<uint32_t>(frontier.size()));
+      }
 
       for (uint64_t i = 0; i < frontier.size(); i++) {
         diskann_id_t cur_id = frontier[i];
@@ -1157,6 +1163,9 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
 
       if (!frontier.empty()) {
         stats.hop_num++;
+        if (ctx->io_diagnostics_enabled()) {
+          stats.record_io_batch(static_cast<uint32_t>(frontier.size()));
+        }
 
         for (uint64_t i = 0; i < frontier.size(); i++) {
           diskann_id_t cur_id = frontier[i];

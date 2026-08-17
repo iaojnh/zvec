@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -83,6 +84,14 @@ static constexpr size_t kIoUringDrainRetries = 10000;
 
 void log_diskann_io_backend() {
   log_diskann_io_backend(ailego::IOBackend::Instance().available());
+}
+
+bool diskann_io_diagnostics_enabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("ZVEC_DISKANN_IO_DIAGNOSTICS");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
 }
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -158,6 +167,7 @@ int setup_io_ctx(IOContext &ctx) {
 
 #if defined(_WIN32) || defined(_WIN64)
   ctx->reqs.resize(MAX_IO_DEPTH);
+  ctx->diagnostics_enabled = diskann_io_diagnostics_enabled();
   log_diskann_io_backend(ctx->type);
   return 0;
 #elif defined(__linux) || defined(__linux__)
@@ -1327,6 +1337,10 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
   batch.expected_lengths.reserve(read_reqs.size());
   batch.completed.assign(read_reqs.size(), 0);
 
+  if (ctx->diagnostics_enabled) {
+    ++ctx->diagnostics.submit_calls;
+  }
+
   uint32_t issued_count = 0;
   for (size_t i = 0; i < read_reqs.size(); ++i) {
     ctx->reqs[i] = OVERLAPPED{};
@@ -1338,8 +1352,9 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
 
     BOOL queued = ::ReadFile(ctx->file_handle, req.buf,
                              static_cast<DWORD>(req.len), nullptr, &request);
-    if (!queued && ::GetLastError() != ERROR_IO_PENDING) {
-      LOG_ERROR("Error queuing IOCP read %zu (error=%lu)", i, ::GetLastError());
+    DWORD read_error = queued ? ERROR_SUCCESS : ::GetLastError();
+    if (!queued && read_error != ERROR_IO_PENDING) {
+      LOG_ERROR("Error queuing IOCP read %zu (error=%lu)", i, read_error);
       ctx->submitted_count = issued_count;
       ctx->outstanding_count = issued_count;
       reset_io_ctx(ctx);
@@ -1353,6 +1368,16 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
     ++issued_count;
     ctx->submitted_count = issued_count;
     ctx->outstanding_count = issued_count;
+    if (ctx->diagnostics_enabled) {
+      ++ctx->diagnostics.submitted_reads;
+      if (queued) {
+        ++ctx->diagnostics.immediate_reads;
+      } else {
+        ++ctx->diagnostics.pending_reads;
+      }
+      ctx->diagnostics.max_outstanding =
+          std::max(ctx->diagnostics.max_outstanding, ctx->outstanding_count);
+    }
   }
 
   batch.n_submitted = issued_count;
@@ -1387,8 +1412,22 @@ int WindowsAlignedFileReader::get_completed(
     ULONG removed = 0;
     const ULONG max_entries = static_cast<ULONG>(std::min<uint32_t>(
         ctx->outstanding_count, static_cast<uint32_t>(MAX_IO_DEPTH)));
+    std::chrono::steady_clock::time_point wait_start;
+    if (ctx->diagnostics_enabled) {
+      ++ctx->diagnostics.dequeue_calls;
+      wait_start = std::chrono::steady_clock::now();
+    }
     BOOL dequeued = ::GetQueuedCompletionStatusEx(
         ctx->completion_port, entries, max_entries, &removed, INFINITE, FALSE);
+    if (ctx->diagnostics_enabled) {
+      ctx->diagnostics.wait_us += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - wait_start)
+              .count());
+      ctx->diagnostics.dequeued_reads += removed;
+      ctx->diagnostics.max_dequeued_once = std::max(
+          ctx->diagnostics.max_dequeued_once, static_cast<uint32_t>(removed));
+    }
     if (!dequeued || removed == 0) {
       LOG_ERROR("GetQueuedCompletionStatusEx failed (error=%lu)",
                 ::GetLastError());

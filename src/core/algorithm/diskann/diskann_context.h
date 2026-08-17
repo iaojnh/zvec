@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <array>
 #include <zvec/core/framework/index_context.h>
 #include "utility/topk_result_builder.h"
 #include "diskann_dist_calculator.h"
@@ -33,6 +34,45 @@ struct SearchStats {
   uint64_t dist_num = 0;
   uint64_t cache_hits = 0;
   uint64_t hop_num = 0;
+  uint64_t query_count = 0;
+  uint64_t effective_beam_width_sum = 0;
+  uint32_t effective_beam_width_max = 0;
+  uint64_t io_batch_count = 0;
+  uint64_t io_batch_size_sum = 0;
+  uint32_t io_batch_size_max = 0;
+  std::array<uint64_t, 5> io_batch_size_histogram{};
+
+  void record_query(uint32_t effective_beam_width) {
+    ++query_count;
+    effective_beam_width_sum += effective_beam_width;
+    if (effective_beam_width > effective_beam_width_max) {
+      effective_beam_width_max = effective_beam_width;
+    }
+  }
+
+  void record_io_batch(uint32_t batch_size) {
+    if (batch_size == 0) {
+      return;
+    }
+
+    ++io_batch_count;
+    io_batch_size_sum += batch_size;
+    if (batch_size > io_batch_size_max) {
+      io_batch_size_max = batch_size;
+    }
+
+    size_t bucket = 0;
+    if (batch_size > 16) {
+      bucket = 4;
+    } else if (batch_size > 8) {
+      bucket = 3;
+    } else if (batch_size > 4) {
+      bucket = 2;
+    } else if (batch_size > 1) {
+      bucket = 1;
+    }
+    ++io_batch_size_histogram[bucket];
+  }
 };
 
 class DiskAnnContext : public IndexContext,
@@ -245,6 +285,10 @@ class DiskAnnContext : public IndexContext,
     return query_stats_;
   }
 
+  bool io_diagnostics_enabled() const {
+    return io_diagnostics_enabled_;
+  }
+
   const DiskAnnEntity &get_entity() const {
     return *entity_;
   }
@@ -357,6 +401,7 @@ class DiskAnnContext : public IndexContext,
   uint32_t topk_{0};
   uint32_t magic_{0U};
   bool debug_mode_{false};
+  bool io_diagnostics_enabled_{false};
   uint32_t pq_chunk_num_{0};
   uint32_t element_size_{0};
   uint32_t element_rotated_size_{0};
