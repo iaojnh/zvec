@@ -19,6 +19,7 @@
 #include <set>
 #include <tuple>
 #include <unordered_set>
+#include "diskann_io_trace.h"
 
 namespace zvec {
 namespace core {
@@ -865,6 +866,10 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
                                          sector_num_per_node));
   uint32_t effective_beam_width = std::min(
       std::max(8u, std::min(ctx->list_size() / 5, 32u)), max_beam_width);
+  const bool trace_enabled = diskann_io_trace_enabled();
+  const uint64_t trace_query_id =
+      trace_enabled ? diskann_io_trace_begin_query() : 0;
+  uint32_t trace_batch_id = 0;
   if (ctx->io_diagnostics_enabled()) {
     stats.record_query(effective_beam_width);
   }
@@ -918,6 +923,10 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
     uint32_t outstanding = 0;
     auto fill_pipeline = [&]() -> int {
       uint32_t submitted = 0;
+      std::vector<AlignedRead> trace_requests;
+      if (trace_enabled) {
+        trace_requests.reserve(effective_beam_width);
+      }
       while (outstanding < effective_beam_width && num_ios < io_limit_ &&
              candidates.has_unexpanded_node()) {
         auto neighbor = candidates.closest_unexpanded();
@@ -961,9 +970,16 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
         ++num_ios;
         ++stats.disk_page_reads;
         ++stats.io_num;
+        if (trace_enabled) {
+          trace_requests.push_back(read_req);
+        }
       }
 
       if (submitted != 0) {
+        if (trace_enabled) {
+          diskann_io_trace_record_batch(trace_query_id, trace_batch_id++,
+                                        trace_requests);
+        }
         ++stats.hop_num;
         if (ctx->io_diagnostics_enabled()) {
           stats.record_io_batch(submitted);
@@ -1097,6 +1113,11 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
         stats.disk_page_reads++;
         stats.io_num++;
         num_ios++;
+      }
+
+      if (trace_enabled) {
+        diskann_io_trace_record_batch(trace_query_id, trace_batch_id++,
+                                      frontier_read_reqs);
       }
 
       io_timer.reset();

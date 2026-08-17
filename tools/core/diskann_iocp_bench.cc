@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -88,10 +89,12 @@ class VirtualBuffer {
 };
 
 struct Request {
-  Request() : overlapped(), submitted_at(0), buffer(nullptr) {}
+  Request()
+      : overlapped(), submitted_at(0), expected_length(0), buffer(nullptr) {}
 
   OVERLAPPED overlapped;
   uint64_t submitted_at;
+  uint32_t expected_length;
   unsigned char *buffer;
 };
 
@@ -101,6 +104,26 @@ static_assert(offsetof(Request, overlapped) == 0,
               "OVERLAPPED must be the first Request member");
 
 enum class RandomAccessHint { kOff, kOn, kBoth };
+enum class TraceMode { kContinuous, kBatched, kBoth };
+
+struct ReadSpec {
+  uint64_t offset;
+  uint32_t length;
+};
+
+struct TraceBatch {
+  uint64_t query_id;
+  uint32_t batch_id;
+  std::vector<ReadSpec> reads;
+};
+
+struct TraceData {
+  std::vector<ReadSpec> reads;
+  std::vector<TraceBatch> batches;
+  uint32_t max_length = 0;
+  uint32_t max_batch_size = 0;
+  bool truncated = false;
+};
 
 struct Options {
   std::wstring file_path;
@@ -110,12 +133,17 @@ struct Options {
   uint32_t block_size = kRequiredAlignment;
   uint64_t seed = 0x9e3779b97f4a7c15ULL;
   RandomAccessHint random_access_hint = RandomAccessHint::kOn;
+  std::wstring trace_file;
+  TraceMode trace_mode = TraceMode::kBoth;
 };
 
 struct RunResult {
+  std::string mode = "uniform";
   bool random_access_hint = false;
   uint32_t queue_depth = 0;
+  uint32_t max_batch_size = 0;
   uint64_t completed = 0;
+  uint64_t completed_bytes = 0;
   uint64_t immediate_submissions = 0;
   uint64_t pending_submissions = 0;
   uint64_t dequeue_calls = 0;
@@ -140,6 +168,35 @@ class XorShift64Star {
 
  private:
   uint64_t state_;
+};
+
+class ReadGenerator {
+ public:
+  ReadGenerator(uint64_t block_count, uint32_t block_size, uint64_t seed)
+      : block_count_(block_count), block_size_(block_size), random_(seed) {}
+
+  ReadGenerator(const std::vector<ReadSpec> &trace, uint64_t seed)
+      : trace_(&trace), random_(seed) {
+    if (trace.empty()) {
+      throw std::invalid_argument("Trace contains no read requests");
+    }
+  }
+
+  ReadSpec next() {
+    if (trace_ != nullptr) {
+      const ReadSpec spec = (*trace_)[trace_index_];
+      trace_index_ = (trace_index_ + 1) % trace_->size();
+      return spec;
+    }
+    return ReadSpec{(random_.next() % block_count_) * block_size_, block_size_};
+  }
+
+ private:
+  const std::vector<ReadSpec> *trace_{nullptr};
+  size_t trace_index_{0};
+  uint64_t block_count_{0};
+  uint32_t block_size_{0};
+  XorShift64Star random_;
 };
 
 uint64_t counter_now() {
@@ -253,6 +310,9 @@ void print_usage() {
       << "  --warmup SECONDS             Warmup time per run (default: 2)\n"
       << "  --block-size BYTES           Aligned read size (default: 4096)\n"
       << "  --random-access-hint MODE    on, off, or both (default: on)\n"
+      << "  --trace-file PATH            Replay a captured DiskANN I/O trace\n"
+      << "  --trace-mode MODE            continuous, batched, or both "
+         "(default: both)\n"
       << "  --seed VALUE                 Random seed\n"
       << "  --help                       Show this help\n";
 }
@@ -295,6 +355,21 @@ Options parse_options(int argc, wchar_t **argv) {
         throw std::invalid_argument(
             "--random-access-hint must be on, off, or both");
       }
+    } else if (argument == L"--trace-file") {
+      options.trace_file = require_value(argc, argv, index, "--trace-file");
+    } else if (argument == L"--trace-mode") {
+      const std::wstring mode =
+          require_value(argc, argv, index, "--trace-mode");
+      if (mode == L"continuous") {
+        options.trace_mode = TraceMode::kContinuous;
+      } else if (mode == L"batched") {
+        options.trace_mode = TraceMode::kBatched;
+      } else if (mode == L"both") {
+        options.trace_mode = TraceMode::kBoth;
+      } else {
+        throw std::invalid_argument(
+            "--trace-mode must be continuous, batched, or both");
+      }
     } else {
       throw std::invalid_argument("Unknown argument");
     }
@@ -308,6 +383,95 @@ Options parse_options(int argc, wchar_t **argv) {
         "--block-size must be a multiple of 4096 bytes");
   }
   return options;
+}
+
+uint64_t parse_trace_integer(const std::string &text, const char *field_name,
+                             size_t line_number) {
+  size_t parsed = 0;
+  unsigned long long value = 0;
+  try {
+    value = std::stoull(text, &parsed, 10);
+  } catch (const std::exception &) {
+    throw std::runtime_error("Invalid trace " + std::string(field_name) +
+                             " on line " + std::to_string(line_number));
+  }
+  if (parsed != text.size()) {
+    throw std::runtime_error("Invalid trace " + std::string(field_name) +
+                             " on line " + std::to_string(line_number));
+  }
+  return static_cast<uint64_t>(value);
+}
+
+TraceData load_trace(const std::wstring &path) {
+  std::ifstream input(wide_to_utf8(path));
+  if (!input) {
+    throw std::runtime_error("Failed to open trace file");
+  }
+
+  TraceData trace;
+  std::string line;
+  size_t line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    if (line.empty() || line == "query_id,batch_id,offset,length") {
+      continue;
+    }
+    if (line[0] == '#') {
+      if (line == "# truncated=true") {
+        trace.truncated = true;
+      }
+      continue;
+    }
+
+    std::vector<std::string> fields;
+    std::stringstream stream(line);
+    std::string field;
+    while (std::getline(stream, field, ',')) {
+      fields.push_back(field);
+    }
+    if (fields.size() != 4) {
+      throw std::runtime_error("Invalid trace row on line " +
+                               std::to_string(line_number));
+    }
+
+    const uint64_t query_id =
+        parse_trace_integer(fields[0], "query_id", line_number);
+    const uint64_t batch_value =
+        parse_trace_integer(fields[1], "batch_id", line_number);
+    const uint64_t offset =
+        parse_trace_integer(fields[2], "offset", line_number);
+    const uint64_t length_value =
+        parse_trace_integer(fields[3], "length", line_number);
+    if (batch_value > (std::numeric_limits<uint32_t>::max)() ||
+        length_value == 0 ||
+        length_value > (std::numeric_limits<uint32_t>::max)()) {
+      throw std::runtime_error("Trace value is out of range on line " +
+                               std::to_string(line_number));
+    }
+    const uint32_t batch_id = static_cast<uint32_t>(batch_value);
+    const uint32_t length = static_cast<uint32_t>(length_value);
+    if (offset % kRequiredAlignment != 0 || length % kRequiredAlignment != 0) {
+      throw std::runtime_error("Unaligned trace read on line " +
+                               std::to_string(line_number));
+    }
+
+    const ReadSpec spec{offset, length};
+    trace.reads.push_back(spec);
+    if (trace.batches.empty() || trace.batches.back().query_id != query_id ||
+        trace.batches.back().batch_id != batch_id) {
+      trace.batches.push_back(TraceBatch{query_id, batch_id, {}});
+    }
+    trace.batches.back().reads.push_back(spec);
+    trace.max_length = std::max(trace.max_length, length);
+    trace.max_batch_size =
+        std::max(trace.max_batch_size,
+                 static_cast<uint32_t>(trace.batches.back().reads.size()));
+  }
+
+  if (trace.reads.empty()) {
+    throw std::runtime_error("Trace file contains no read requests");
+  }
+  return trace;
 }
 
 uint64_t file_size(HANDLE file_handle) {
@@ -325,14 +489,13 @@ void set_overlapped_offset(OVERLAPPED &overlapped, uint64_t offset) {
   overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
 }
 
-bool submit_read(HANDLE file_handle, Request &request, uint32_t block_size,
-                 uint64_t block_count, XorShift64Star &random,
+bool submit_read(HANDLE file_handle, Request &request, const ReadSpec &spec,
                  uint32_t &outstanding, RunResult *result, std::string &error) {
-  const uint64_t offset = (random.next() % block_count) * block_size;
-  set_overlapped_offset(request.overlapped, offset);
+  set_overlapped_offset(request.overlapped, spec.offset);
   request.submitted_at = counter_now();
+  request.expected_length = spec.length;
 
-  const BOOL completed = ::ReadFile(file_handle, request.buffer, block_size,
+  const BOOL completed = ::ReadFile(file_handle, request.buffer, spec.length,
                                     nullptr, &request.overlapped);
   if (!completed) {
     const DWORD last_error = ::GetLastError();
@@ -350,7 +513,7 @@ bool submit_read(HANDLE file_handle, Request &request, uint32_t block_size,
   return true;
 }
 
-bool validate_completion(const OVERLAPPED_ENTRY &entry, uint32_t block_size,
+bool validate_completion(const OVERLAPPED_ENTRY &entry, Request *&request,
                          std::string &error) {
   if (entry.lpOverlapped == nullptr) {
     error = "IOCP returned a null OVERLAPPED pointer";
@@ -363,8 +526,9 @@ bool validate_completion(const OVERLAPPED_ENTRY &entry, uint32_t block_size,
     error = stream.str();
     return false;
   }
-  if (entry.dwNumberOfBytesTransferred != block_size) {
-    error = "Short read: expected " + std::to_string(block_size) +
+  request = reinterpret_cast<Request *>(entry.lpOverlapped);
+  if (entry.dwNumberOfBytesTransferred != request->expected_length) {
+    error = "Short read: expected " + std::to_string(request->expected_length) +
             " bytes, received " +
             std::to_string(entry.dwNumberOfBytesTransferred);
     return false;
@@ -373,8 +537,8 @@ bool validate_completion(const OVERLAPPED_ENTRY &entry, uint32_t block_size,
 }
 
 bool process_until(HANDLE file_handle, HANDLE completion_port,
-                   uint64_t deadline, uint64_t frequency, uint32_t block_size,
-                   uint64_t block_count, XorShift64Star &random,
+                   uint64_t deadline, uint64_t frequency,
+                   ReadGenerator &generator,
                    std::vector<OVERLAPPED_ENTRY> &entries,
                    uint32_t &outstanding, bool keep_queue_full,
                    RunResult *result, std::string &error) {
@@ -402,10 +566,10 @@ bool process_until(HANDLE file_handle, HANDLE completion_port,
 
     for (ULONG entry_index = 0; entry_index < removed; ++entry_index) {
       const OVERLAPPED_ENTRY &entry = entries[entry_index];
-      if (!validate_completion(entry, block_size, error)) {
+      Request *request = nullptr;
+      if (!validate_completion(entry, request, error)) {
         return false;
       }
-      Request *request = reinterpret_cast<Request *>(entry.lpOverlapped);
       if (result != nullptr) {
         const uint64_t completed_at = counter_now();
         const double latency =
@@ -413,11 +577,12 @@ bool process_until(HANDLE file_handle, HANDLE completion_port,
             static_cast<double>(frequency);
         result->latency_ms.push_back(latency);
         ++result->completed;
+        result->completed_bytes += request->expected_length;
       }
 
       if ((keep_queue_full || counter_now() < deadline) &&
-          !submit_read(file_handle, *request, block_size, block_count, random,
-                       outstanding, result, error)) {
+          !submit_read(file_handle, *request, generator.next(), outstanding,
+                       result, error)) {
         return false;
       }
     }
@@ -447,14 +612,19 @@ bool drain_requests(HANDLE completion_port,
   return true;
 }
 
-RunResult run_benchmark(const Options &options, uint32_t queue_depth,
-                        bool random_access_hint) {
+RunResult run_continuous_benchmark(const Options &options, uint32_t queue_depth,
+                                   bool random_access_hint,
+                                   const TraceData *trace) {
   RunResult result;
+  result.mode = trace == nullptr ? "uniform" : "trace_continuous";
   result.random_access_hint = random_access_hint;
   result.queue_depth = queue_depth;
   const size_t expected_completions = std::min<size_t>(
       static_cast<size_t>(options.duration_seconds) * 50000U, 10000000U);
   result.latency_ms.reserve(expected_completions);
+  const uint32_t buffer_stride =
+      trace == nullptr ? options.block_size : trace->max_length;
+  VirtualBuffer buffer(static_cast<size_t>(queue_depth) * buffer_stride);
 
   DWORD flags =
       FILE_ATTRIBUTE_READONLY | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED;
@@ -462,7 +632,6 @@ RunResult run_benchmark(const Options &options, uint32_t queue_depth,
     flags |= FILE_FLAG_RANDOM_ACCESS;
   }
 
-  VirtualBuffer buffer(static_cast<size_t>(queue_depth) * options.block_size);
   UniqueHandle file_handle(
       ::CreateFileW(options.file_path.c_str(), GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -477,7 +646,13 @@ RunResult run_benchmark(const Options &options, uint32_t queue_depth,
   if (block_count == 0) {
     throw std::runtime_error("Input file is smaller than one aligned block");
   }
-
+  if (trace != nullptr) {
+    for (const ReadSpec &spec : trace->reads) {
+      if (spec.offset > size || spec.length > size - spec.offset) {
+        throw std::runtime_error("Trace read extends beyond the input file");
+      }
+    }
+  }
   UniqueHandle completion_port(
       ::CreateIoCompletionPort(file_handle.get(), nullptr, 0, 1));
   if (!completion_port.valid()) {
@@ -495,16 +670,20 @@ RunResult run_benchmark(const Options &options, uint32_t queue_depth,
   std::vector<OVERLAPPED_ENTRY> entries(queue_depth);
   for (uint32_t index = 0; index < queue_depth; ++index) {
     requests[index].buffer =
-        buffer.data() + static_cast<size_t>(index) * options.block_size;
+        buffer.data() + static_cast<size_t>(index) * buffer_stride;
   }
 
   const uint64_t frequency = counter_frequency();
-  XorShift64Star random(options.seed + queue_depth);
+  ReadGenerator generator(block_count, options.block_size,
+                          options.seed + queue_depth);
+  if (trace != nullptr) {
+    generator = ReadGenerator(trace->reads, options.seed + queue_depth);
+  }
   uint32_t outstanding = 0;
   std::string error;
   for (uint32_t index = 0; index < queue_depth; ++index) {
-    if (!submit_read(file_handle.get(), requests[index], options.block_size,
-                     block_count, random, outstanding, nullptr, error)) {
+    if (!submit_read(file_handle.get(), requests[index], generator.next(),
+                     outstanding, nullptr, error)) {
       ::CancelIoEx(file_handle.get(), nullptr);
       drain_requests(completion_port.get(), entries, outstanding, error);
       throw std::runtime_error(error);
@@ -514,8 +693,8 @@ RunResult run_benchmark(const Options &options, uint32_t queue_depth,
   const uint64_t warmup_deadline =
       counter_now() + static_cast<uint64_t>(options.warmup_seconds) * frequency;
   if (!process_until(file_handle.get(), completion_port.get(), warmup_deadline,
-                     frequency, options.block_size, block_count, random,
-                     entries, outstanding, true, nullptr, error)) {
+                     frequency, generator, entries, outstanding, true, nullptr,
+                     error)) {
     ::CancelIoEx(file_handle.get(), nullptr);
     drain_requests(completion_port.get(), entries, outstanding, error);
     throw std::runtime_error(error);
@@ -526,9 +705,8 @@ RunResult run_benchmark(const Options &options, uint32_t queue_depth,
       measurement_start +
       static_cast<uint64_t>(options.duration_seconds) * frequency;
   if (!process_until(file_handle.get(), completion_port.get(),
-                     measurement_deadline, frequency, options.block_size,
-                     block_count, random, entries, outstanding, false, &result,
-                     error)) {
+                     measurement_deadline, frequency, generator, entries,
+                     outstanding, false, &result, error)) {
     ::CancelIoEx(file_handle.get(), nullptr);
     drain_requests(completion_port.get(), entries, outstanding, error);
     throw std::runtime_error(error);
@@ -544,6 +722,159 @@ RunResult run_benchmark(const Options &options, uint32_t queue_depth,
   return result;
 }
 
+bool wait_for_batch(HANDLE completion_port, uint64_t frequency,
+                    std::vector<OVERLAPPED_ENTRY> &entries,
+                    uint32_t &outstanding, RunResult *result,
+                    std::string &error) {
+  while (outstanding != 0) {
+    ULONG removed = 0;
+    const BOOL dequeued = ::GetQueuedCompletionStatusEx(
+        completion_port, entries.data(), static_cast<ULONG>(entries.size()),
+        &removed, INFINITE, FALSE);
+    if (!dequeued || removed == 0) {
+      error = "GetQueuedCompletionStatusEx failed with error " +
+              std::to_string(::GetLastError());
+      return false;
+    }
+    if (removed > outstanding) {
+      error = "IOCP completion count exceeded submitted read count";
+      return false;
+    }
+    outstanding -= removed;
+
+    if (result != nullptr) {
+      ++result->dequeue_calls;
+      result->max_dequeued =
+          std::max(result->max_dequeued, static_cast<uint32_t>(removed));
+    }
+    for (ULONG entry_index = 0; entry_index < removed; ++entry_index) {
+      Request *request = nullptr;
+      if (!validate_completion(entries[entry_index], request, error)) {
+        return false;
+      }
+      if (result != nullptr) {
+        const uint64_t completed_at = counter_now();
+        const double latency =
+            static_cast<double>(completed_at - request->submitted_at) * 1000.0 /
+            static_cast<double>(frequency);
+        result->latency_ms.push_back(latency);
+        ++result->completed;
+        result->completed_bytes += request->expected_length;
+      }
+    }
+  }
+  return true;
+}
+
+bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
+                          uint64_t deadline, uint64_t frequency,
+                          const TraceData &trace,
+                          std::vector<Request> &requests,
+                          std::vector<OVERLAPPED_ENTRY> &entries,
+                          size_t &batch_index, RunResult *result,
+                          std::string &error) {
+  while (counter_now() < deadline) {
+    const TraceBatch &batch = trace.batches[batch_index];
+    batch_index = (batch_index + 1) % trace.batches.size();
+    uint32_t outstanding = 0;
+    for (size_t index = 0; index < batch.reads.size(); ++index) {
+      if (!submit_read(file_handle, requests[index], batch.reads[index],
+                       outstanding, result, error)) {
+        ::CancelIoEx(file_handle, nullptr);
+        drain_requests(completion_port, entries, outstanding, error);
+        return false;
+      }
+    }
+    if (!wait_for_batch(completion_port, frequency, entries, outstanding,
+                        result, error)) {
+      ::CancelIoEx(file_handle, nullptr);
+      drain_requests(completion_port, entries, outstanding, error);
+      return false;
+    }
+  }
+  return true;
+}
+
+RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
+                                const TraceData &trace) {
+  RunResult result;
+  result.mode = "trace_batched";
+  result.random_access_hint = random_access_hint;
+  result.max_batch_size = trace.max_batch_size;
+  const size_t expected_completions = std::min<size_t>(
+      static_cast<size_t>(options.duration_seconds) * 50000U, 10000000U);
+  result.latency_ms.reserve(expected_completions);
+
+  DWORD flags =
+      FILE_ATTRIBUTE_READONLY | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED;
+  if (random_access_hint) {
+    flags |= FILE_FLAG_RANDOM_ACCESS;
+  }
+
+  VirtualBuffer buffer(static_cast<size_t>(trace.max_batch_size) *
+                       trace.max_length);
+  UniqueHandle file_handle(
+      ::CreateFileW(options.file_path.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, flags, nullptr));
+  if (!file_handle.valid()) {
+    throw std::runtime_error("CreateFileW failed with error " +
+                             std::to_string(::GetLastError()));
+  }
+  const uint64_t size = file_size(file_handle.get());
+  for (const ReadSpec &spec : trace.reads) {
+    if (spec.offset > size || spec.length > size - spec.offset) {
+      throw std::runtime_error("Trace read extends beyond the input file");
+    }
+  }
+
+  UniqueHandle completion_port(
+      ::CreateIoCompletionPort(file_handle.get(), nullptr, 0, 1));
+  if (!completion_port.valid()) {
+    throw std::runtime_error("CreateIoCompletionPort failed with error " +
+                             std::to_string(::GetLastError()));
+  }
+  if (!::SetFileCompletionNotificationModes(file_handle.get(),
+                                            FILE_SKIP_SET_EVENT_ON_HANDLE)) {
+    std::cerr << "Warning: SetFileCompletionNotificationModes failed with "
+                 "error "
+              << ::GetLastError() << '\n';
+  }
+
+  std::vector<Request> requests(trace.max_batch_size);
+  std::vector<OVERLAPPED_ENTRY> entries(trace.max_batch_size);
+  for (uint32_t index = 0; index < trace.max_batch_size; ++index) {
+    requests[index].buffer =
+        buffer.data() + static_cast<size_t>(index) * trace.max_length;
+  }
+
+  const uint64_t frequency = counter_frequency();
+  size_t batch_index = 0;
+  std::string error;
+  const uint64_t warmup_deadline =
+      counter_now() + static_cast<uint64_t>(options.warmup_seconds) * frequency;
+  if (!replay_batches_until(file_handle.get(), completion_port.get(),
+                            warmup_deadline, frequency, trace, requests,
+                            entries, batch_index, nullptr, error)) {
+    throw std::runtime_error(error);
+  }
+
+  const uint64_t measurement_start = counter_now();
+  const uint64_t measurement_deadline =
+      measurement_start +
+      static_cast<uint64_t>(options.duration_seconds) * frequency;
+  if (!replay_batches_until(file_handle.get(), completion_port.get(),
+                            measurement_deadline, frequency, trace, requests,
+                            entries, batch_index, &result, error)) {
+    throw std::runtime_error(error);
+  }
+  const uint64_t measurement_end = counter_now();
+  result.elapsed_seconds =
+      static_cast<double>(measurement_end - measurement_start) /
+      static_cast<double>(frequency);
+  return result;
+}
+
 double percentile(const std::vector<double> &sorted_values, double fraction) {
   if (sorted_values.empty()) {
     return 0.0;
@@ -553,7 +884,7 @@ double percentile(const std::vector<double> &sorted_values, double fraction) {
   return sorted_values[static_cast<size_t>(position)];
 }
 
-void print_result(RunResult result, uint32_t block_size) {
+void print_result(RunResult result) {
   std::sort(result.latency_ms.begin(), result.latency_ms.end());
   const double latency_sum =
       std::accumulate(result.latency_ms.begin(), result.latency_ms.end(), 0.0);
@@ -563,8 +894,8 @@ void print_result(RunResult result, uint32_t block_size) {
           : latency_sum / static_cast<double>(result.latency_ms.size());
   const double iops =
       static_cast<double>(result.completed) / result.elapsed_seconds;
-  const double mib_per_second =
-      iops * static_cast<double>(block_size) / (1024.0 * 1024.0);
+  const double mib_per_second = static_cast<double>(result.completed_bytes) /
+                                (result.elapsed_seconds * 1024.0 * 1024.0);
   const double effective_queue_depth = iops * average_latency / 1000.0;
   const double completions_per_dequeue =
       result.dequeue_calls == 0 ? 0.0
@@ -577,9 +908,10 @@ void print_result(RunResult result, uint32_t block_size) {
                        : static_cast<double>(result.pending_submissions) *
                              100.0 / static_cast<double>(submissions);
 
-  std::cout << (result.random_access_hint ? "on" : "off") << ','
-            << result.queue_depth << ',' << std::fixed << std::setprecision(2)
-            << iops << ',' << mib_per_second << ',' << average_latency << ','
+  std::cout << result.mode << ',' << (result.random_access_hint ? "on" : "off")
+            << ',' << result.queue_depth << ',' << result.max_batch_size << ','
+            << std::fixed << std::setprecision(2) << iops << ','
+            << mib_per_second << ',' << average_latency << ','
             << percentile(result.latency_ms, 0.50) << ','
             << percentile(result.latency_ms, 0.95) << ','
             << percentile(result.latency_ms, 0.99) << ','
@@ -601,21 +933,45 @@ std::vector<bool> hint_modes(RandomAccessHint mode) {
 int wmain(int argc, wchar_t **argv) {
   try {
     const Options options = parse_options(argc, argv);
+    TraceData trace;
+    const bool has_trace = !options.trace_file.empty();
+    if (has_trace) {
+      trace = load_trace(options.trace_file);
+    }
     std::cout << "DiskANN Windows IOCP microbenchmark\n"
               << "file: " << wide_to_utf8(options.file_path) << '\n'
               << "block_size: " << options.block_size << " bytes\n"
               << "warmup: " << options.warmup_seconds << " seconds/run\n"
-              << "duration: " << options.duration_seconds << " seconds/run\n\n"
-              << "random_access_hint,queue_depth,iops,mib_per_s,avg_latency_"
-                 "ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,min_latency_"
-                 "ms,max_latency_ms,effective_qd,completions_per_dequeue,max_"
-                 "dequeued,pending_ratio_pct,completed_reads\n";
+              << "duration: " << options.duration_seconds << " seconds/run\n";
+    if (has_trace) {
+      std::cout << "trace_file: " << wide_to_utf8(options.trace_file) << '\n'
+                << "trace_reads: " << trace.reads.size() << '\n'
+                << "trace_batches: " << trace.batches.size() << '\n'
+                << "trace_max_batch: " << trace.max_batch_size << '\n';
+      if (trace.truncated) {
+        std::cout << "WARNING: trace capture was truncated\n";
+      }
+    }
+    std::cout
+        << '\n'
+        << "mode,random_access_hint,queue_depth,max_batch_size,iops,mib_per_s,"
+           "avg_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,min_"
+           "latency_ms,max_latency_ms,effective_qd,completions_per_dequeue,max_"
+           "dequeued,pending_ratio_pct,completed_reads\n";
 
     const std::vector<bool> modes = hint_modes(options.random_access_hint);
     for (bool random_access_hint : modes) {
-      for (uint32_t queue_depth : options.queue_depths) {
-        print_result(run_benchmark(options, queue_depth, random_access_hint),
-                     options.block_size);
+      if (!has_trace || options.trace_mode == TraceMode::kContinuous ||
+          options.trace_mode == TraceMode::kBoth) {
+        for (uint32_t queue_depth : options.queue_depths) {
+          print_result(run_continuous_benchmark(options, queue_depth,
+                                                random_access_hint,
+                                                has_trace ? &trace : nullptr));
+        }
+      }
+      if (has_trace && (options.trace_mode == TraceMode::kBatched ||
+                        options.trace_mode == TraceMode::kBoth)) {
+        print_result(run_batched_benchmark(options, random_access_hint, trace));
       }
     }
   } catch (const std::exception &error) {
