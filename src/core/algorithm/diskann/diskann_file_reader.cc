@@ -162,6 +162,8 @@ static void close_windows_io_handles(IOContext ctx) {
   ctx->submitted_count = 0;
   ctx->outstanding_count = 0;
   ctx->request_mode = IoBackend::RequestMode::kIdle;
+  ctx->diagnostics.active_batch_started_ns = 0;
+  ctx->diagnostics.active_batch_first_completion_recorded = false;
   std::fill(ctx->slot_active.begin(), ctx->slot_active.end(), 0);
 }
 #endif
@@ -1303,6 +1305,13 @@ static void record_windows_submission(IOContext ctx, BOOL queued) {
       std::max(ctx->diagnostics.max_outstanding, ctx->outstanding_count);
 }
 
+static uint64_t windows_steady_now_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 static int dequeue_windows_entries(IOContext ctx, OVERLAPPED_ENTRY *entries,
                                    ULONG max_entries, ULONG &removed) {
   std::chrono::steady_clock::time_point wait_start;
@@ -1424,6 +1433,8 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
   if (ctx->diagnostics_enabled) {
     ++ctx->diagnostics.submit_calls;
   }
+  const uint64_t batch_started_ns =
+      ctx->diagnostics_enabled ? windows_steady_now_ns() : 0;
 
   uint32_t issued_count = 0;
   for (size_t i = 0; i < read_reqs.size(); ++i) {
@@ -1434,8 +1445,14 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
     request.Offset = static_cast<DWORD>(req.offset & 0xffffffffULL);
     request.OffsetHigh = static_cast<DWORD>(req.offset >> 32);
 
+    const uint64_t readfile_started_ns =
+        ctx->diagnostics_enabled ? windows_steady_now_ns() : 0;
     BOOL queued = ::ReadFile(ctx->file_handle, req.buf,
                              static_cast<DWORD>(req.len), nullptr, &request);
+    if (ctx->diagnostics_enabled) {
+      ctx->diagnostics.readfile_submit_ns +=
+          windows_steady_now_ns() - readfile_started_ns;
+    }
     DWORD read_error = queued ? ERROR_SUCCESS : ::GetLastError();
     if (!queued && read_error != ERROR_IO_PENDING) {
       LOG_ERROR("Error queuing IOCP read %zu (error=%lu)", i, read_error);
@@ -1456,6 +1473,13 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
   }
 
   batch.n_submitted = issued_count;
+  if (ctx->diagnostics_enabled) {
+    ++ctx->diagnostics.batch_count;
+    ctx->diagnostics.batch_submit_ns +=
+        windows_steady_now_ns() - batch_started_ns;
+    ctx->diagnostics.active_batch_started_ns = batch_started_ns;
+    ctx->diagnostics.active_batch_first_completion_recorded = false;
+  }
   return 0;
 }
 
@@ -1494,6 +1518,12 @@ int WindowsAlignedFileReader::get_completed(
       completed_indices.clear();
       return IndexError_Runtime;
     }
+    if (ctx->diagnostics_enabled &&
+        !ctx->diagnostics.active_batch_first_completion_recorded) {
+      ctx->diagnostics.batch_first_completion_ns +=
+          windows_steady_now_ns() - ctx->diagnostics.active_batch_started_ns;
+      ctx->diagnostics.active_batch_first_completion_recorded = true;
+    }
 
     bool completion_error = false;
     for (ULONG i = 0; i < removed; ++i) {
@@ -1523,8 +1553,15 @@ int WindowsAlignedFileReader::get_completed(
       }
 
       DWORD bytes_transferred = 0;
-      if (!::GetOverlappedResult(ctx->file_handle, &ctx->reqs[index],
-                                 &bytes_transferred, FALSE)) {
+      const uint64_t overlapped_started_ns =
+          ctx->diagnostics_enabled ? windows_steady_now_ns() : 0;
+      const BOOL result = ::GetOverlappedResult(
+          ctx->file_handle, &ctx->reqs[index], &bytes_transferred, FALSE);
+      if (ctx->diagnostics_enabled) {
+        ctx->diagnostics.get_overlapped_ns +=
+            windows_steady_now_ns() - overlapped_started_ns;
+      }
+      if (!result) {
         LOG_ERROR("IOCP read %u failed (error=%lu)", index, ::GetLastError());
         completion_error = true;
       } else if (static_cast<uint64_t>(bytes_transferred) !=
@@ -1552,6 +1589,13 @@ int WindowsAlignedFileReader::get_completed(
   }
 
   if (ctx->outstanding_count == 0) {
+    if (ctx->diagnostics_enabled &&
+        ctx->diagnostics.active_batch_started_ns != 0) {
+      ctx->diagnostics.batch_duration_ns +=
+          windows_steady_now_ns() - ctx->diagnostics.active_batch_started_ns;
+      ctx->diagnostics.active_batch_started_ns = 0;
+      ctx->diagnostics.active_batch_first_completion_recorded = false;
+    }
     ctx->submitted_count = 0;
     ctx->request_mode = IoBackend::RequestMode::kIdle;
   }
@@ -1598,8 +1642,14 @@ int WindowsAlignedFileReader::submit_streaming(const AlignedRead &read_req,
   request.Offset = static_cast<DWORD>(read_req.offset & 0xffffffffULL);
   request.OffsetHigh = static_cast<DWORD>(read_req.offset >> 32);
 
+  const uint64_t readfile_started_ns =
+      ctx->diagnostics_enabled ? windows_steady_now_ns() : 0;
   BOOL queued = ::ReadFile(ctx->file_handle, read_req.buf,
                            static_cast<DWORD>(read_req.len), nullptr, &request);
+  if (ctx->diagnostics_enabled) {
+    ctx->diagnostics.readfile_submit_ns +=
+        windows_steady_now_ns() - readfile_started_ns;
+  }
   DWORD read_error = queued ? ERROR_SUCCESS : ::GetLastError();
   if (!queued && read_error != ERROR_IO_PENDING) {
     LOG_ERROR("Error queuing streaming IOCP read (error=%lu)", read_error);
@@ -1674,8 +1724,15 @@ int WindowsAlignedFileReader::get_streaming_completed(
       }
 
       DWORD bytes_transferred = 0;
-      if (!::GetOverlappedResult(ctx->file_handle, &ctx->reqs[slot],
-                                 &bytes_transferred, FALSE)) {
+      const uint64_t overlapped_started_ns =
+          ctx->diagnostics_enabled ? windows_steady_now_ns() : 0;
+      const BOOL result = ::GetOverlappedResult(
+          ctx->file_handle, &ctx->reqs[slot], &bytes_transferred, FALSE);
+      if (ctx->diagnostics_enabled) {
+        ctx->diagnostics.get_overlapped_ns +=
+            windows_steady_now_ns() - overlapped_started_ns;
+      }
+      if (!result) {
         LOG_ERROR("Streaming IOCP read %u failed (error=%lu)", slot,
                   ::GetLastError());
         completion_error = true;

@@ -29,6 +29,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "diskann_file_reader.h"
 
 namespace {
 
@@ -135,6 +136,7 @@ struct Options {
   RandomAccessHint random_access_hint = RandomAccessHint::kOn;
   std::wstring trace_file;
   TraceMode trace_mode = TraceMode::kBoth;
+  bool reader_replay = false;
 };
 
 struct RunResult {
@@ -149,6 +151,13 @@ struct RunResult {
   uint64_t dequeue_calls = 0;
   uint32_t max_dequeued = 0;
   double elapsed_seconds = 0.0;
+  uint64_t batch_count = 0;
+  double batch_submit_us = 0.0;
+  double batch_first_completion_us = 0.0;
+  double batch_duration_us = 0.0;
+  double iocp_wait_us = 0.0;
+  double readfile_submit_us = 0.0;
+  double get_overlapped_us = 0.0;
   std::vector<double> latency_ms;
 };
 
@@ -313,6 +322,8 @@ void print_usage() {
       << "  --trace-file PATH            Replay a captured DiskANN I/O trace\n"
       << "  --trace-mode MODE            continuous, batched, or both "
          "(default: both)\n"
+      << "  --reader-replay              Replay trace through the project's "
+         "WindowsAlignedFileReader\n"
       << "  --seed VALUE                 Random seed\n"
       << "  --help                       Show this help\n";
 }
@@ -370,6 +381,8 @@ Options parse_options(int argc, wchar_t **argv) {
         throw std::invalid_argument(
             "--trace-mode must be continuous, batched, or both");
       }
+    } else if (argument == L"--reader-replay") {
+      options.reader_replay = true;
     } else {
       throw std::invalid_argument("Unknown argument");
     }
@@ -544,9 +557,11 @@ bool process_until(HANDLE file_handle, HANDLE completion_port,
                    RunResult *result, std::string &error) {
   while (counter_now() < deadline) {
     ULONG removed = 0;
+    const uint64_t wait_started = counter_now();
     const BOOL dequeued = ::GetQueuedCompletionStatusEx(
         completion_port, entries.data(), static_cast<ULONG>(entries.size()),
         &removed, INFINITE, FALSE);
+    const uint64_t wait_finished = counter_now();
     if (!dequeued || removed == 0) {
       error = "GetQueuedCompletionStatusEx failed with error " +
               std::to_string(::GetLastError());
@@ -555,6 +570,9 @@ bool process_until(HANDLE file_handle, HANDLE completion_port,
 
     if (result != nullptr) {
       ++result->dequeue_calls;
+      result->iocp_wait_us +=
+          static_cast<double>(wait_finished - wait_started) * 1000000.0 /
+          static_cast<double>(frequency);
       result->max_dequeued =
           std::max(result->max_dequeued, static_cast<uint32_t>(removed));
     }
@@ -725,12 +743,14 @@ RunResult run_continuous_benchmark(const Options &options, uint32_t queue_depth,
 bool wait_for_batch(HANDLE completion_port, uint64_t frequency,
                     std::vector<OVERLAPPED_ENTRY> &entries,
                     uint32_t &outstanding, RunResult *result,
-                    std::string &error) {
+                    uint64_t &first_completion_at, std::string &error) {
   while (outstanding != 0) {
     ULONG removed = 0;
+    const uint64_t wait_started = counter_now();
     const BOOL dequeued = ::GetQueuedCompletionStatusEx(
         completion_port, entries.data(), static_cast<ULONG>(entries.size()),
         &removed, INFINITE, FALSE);
+    const uint64_t wait_finished = counter_now();
     if (!dequeued || removed == 0) {
       error = "GetQueuedCompletionStatusEx failed with error " +
               std::to_string(::GetLastError());
@@ -744,8 +764,14 @@ bool wait_for_batch(HANDLE completion_port, uint64_t frequency,
 
     if (result != nullptr) {
       ++result->dequeue_calls;
+      result->iocp_wait_us +=
+          static_cast<double>(wait_finished - wait_started) * 1000000.0 /
+          static_cast<double>(frequency);
       result->max_dequeued =
           std::max(result->max_dequeued, static_cast<uint32_t>(removed));
+    }
+    if (first_completion_at == 0) {
+      first_completion_at = wait_finished;
     }
     for (ULONG entry_index = 0; entry_index < removed; ++entry_index) {
       Request *request = nullptr;
@@ -776,6 +802,7 @@ bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
   while (counter_now() < deadline) {
     const TraceBatch &batch = trace.batches[batch_index];
     batch_index = (batch_index + 1) % trace.batches.size();
+    const uint64_t batch_started = counter_now();
     uint32_t outstanding = 0;
     for (size_t index = 0; index < batch.reads.size(); ++index) {
       if (!submit_read(file_handle, requests[index], batch.reads[index],
@@ -785,11 +812,26 @@ bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
         return false;
       }
     }
+    const uint64_t batch_submitted = counter_now();
+    uint64_t first_completion_at = 0;
     if (!wait_for_batch(completion_port, frequency, entries, outstanding,
-                        result, error)) {
+                        result, first_completion_at, error)) {
       ::CancelIoEx(file_handle, nullptr);
       drain_requests(completion_port, entries, outstanding, error);
       return false;
+    }
+    if (result != nullptr) {
+      const uint64_t batch_finished = counter_now();
+      ++result->batch_count;
+      result->batch_submit_us +=
+          static_cast<double>(batch_submitted - batch_started) * 1000000.0 /
+          static_cast<double>(frequency);
+      result->batch_first_completion_us +=
+          static_cast<double>(first_completion_at - batch_started) * 1000000.0 /
+          static_cast<double>(frequency);
+      result->batch_duration_us +=
+          static_cast<double>(batch_finished - batch_started) * 1000000.0 /
+          static_cast<double>(frequency);
     }
   }
   return true;
@@ -875,6 +917,165 @@ RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
   return result;
 }
 
+class ScopedDiskAnnIoContext {
+ public:
+  ScopedDiskAnnIoContext() {
+    const int result = zvec::core::setup_io_ctx(context_);
+    if (result != 0 || context_ == nullptr) {
+      throw std::runtime_error("setup_io_ctx failed with result " +
+                               std::to_string(result));
+    }
+  }
+
+  ~ScopedDiskAnnIoContext() {
+    zvec::core::destroy_io_ctx(context_);
+  }
+
+  ScopedDiskAnnIoContext(const ScopedDiskAnnIoContext &) = delete;
+  ScopedDiskAnnIoContext &operator=(const ScopedDiskAnnIoContext &) = delete;
+
+  zvec::core::IOContext &get() {
+    return context_;
+  }
+
+ private:
+  zvec::core::IOContext context_{nullptr};
+};
+
+void replay_reader_batches_until(zvec::core::WindowsAlignedFileReader &reader,
+                                 zvec::core::IOContext &context,
+                                 uint64_t deadline, uint64_t frequency,
+                                 const TraceData &trace, VirtualBuffer &buffer,
+                                 size_t &batch_index, RunResult *result) {
+  std::vector<zvec::core::AlignedRead> read_requests;
+  read_requests.reserve(trace.max_batch_size);
+  std::vector<uint32_t> completed_indices;
+  completed_indices.reserve(trace.max_batch_size);
+
+  while (counter_now() < deadline) {
+    const TraceBatch &batch = trace.batches[batch_index];
+    batch_index = (batch_index + 1) % trace.batches.size();
+    read_requests.clear();
+    for (size_t index = 0; index < batch.reads.size(); ++index) {
+      const ReadSpec &spec = batch.reads[index];
+      read_requests.emplace_back(
+          spec.offset, spec.length,
+          buffer.data() + static_cast<size_t>(index) * trace.max_length);
+    }
+
+    const uint64_t batch_started = counter_now();
+    zvec::core::PendingBatch pending;
+    const int submit_result = reader.submit(pending, read_requests, context);
+    if (submit_result != 0) {
+      throw std::runtime_error(
+          "WindowsAlignedFileReader::submit failed with "
+          "result " +
+          std::to_string(submit_result));
+    }
+
+    while (pending.n_reaped < pending.n_submitted) {
+      completed_indices.clear();
+      const int completed =
+          reader.get_completed(pending, context, 1, completed_indices);
+      if (completed < 0) {
+        throw std::runtime_error(
+            "WindowsAlignedFileReader::get_completed failed with result " +
+            std::to_string(completed));
+      }
+      if (result == nullptr) {
+        continue;
+      }
+
+      const uint64_t completed_at = counter_now();
+      const double latency_ms =
+          static_cast<double>(completed_at - batch_started) * 1000.0 /
+          static_cast<double>(frequency);
+      for (uint32_t index : completed_indices) {
+        const size_t request_index = static_cast<size_t>(index);
+        if (request_index >= batch.reads.size()) {
+          throw std::runtime_error(
+              "WindowsAlignedFileReader returned an invalid request index");
+        }
+        result->latency_ms.push_back(latency_ms);
+        ++result->completed;
+        result->completed_bytes += batch.reads[request_index].length;
+      }
+    }
+  }
+}
+
+RunResult run_reader_batched_benchmark(const Options &options,
+                                       const TraceData &trace) {
+  RunResult result;
+  result.mode = "reader_batched";
+  result.random_access_hint = true;
+  result.max_batch_size = trace.max_batch_size;
+  const size_t expected_completions = std::min<size_t>(
+      static_cast<size_t>(options.duration_seconds) * 50000U, 10000000U);
+  result.latency_ms.reserve(expected_completions);
+
+  {
+    UniqueHandle validation_handle(::CreateFileW(
+        options.file_path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_READONLY, nullptr));
+    if (!validation_handle.valid()) {
+      throw std::runtime_error("CreateFileW failed with error " +
+                               std::to_string(::GetLastError()));
+    }
+    const uint64_t size = file_size(validation_handle.get());
+    for (const ReadSpec &spec : trace.reads) {
+      if (spec.offset > size || spec.length > size - spec.offset) {
+        throw std::runtime_error("Trace read extends beyond the input file");
+      }
+    }
+  }
+
+  VirtualBuffer buffer(static_cast<size_t>(trace.max_batch_size) *
+                       trace.max_length);
+  zvec::core::WindowsAlignedFileReader reader;
+  reader.open(wide_to_utf8(options.file_path));
+  ScopedDiskAnnIoContext scoped_context;
+  zvec::core::IOContext &context = scoped_context.get();
+  context->diagnostics_enabled = true;
+
+  const uint64_t frequency = counter_frequency();
+  size_t batch_index = 0;
+  const uint64_t warmup_deadline =
+      counter_now() + static_cast<uint64_t>(options.warmup_seconds) * frequency;
+  replay_reader_batches_until(reader, context, warmup_deadline, frequency,
+                              trace, buffer, batch_index, nullptr);
+
+  context->diagnostics = zvec::core::IoBackend::IocpDiagnostics{};
+  context->diagnostics_enabled = true;
+  const uint64_t measurement_start = counter_now();
+  const uint64_t measurement_deadline =
+      measurement_start +
+      static_cast<uint64_t>(options.duration_seconds) * frequency;
+  replay_reader_batches_until(reader, context, measurement_deadline, frequency,
+                              trace, buffer, batch_index, &result);
+  const uint64_t measurement_end = counter_now();
+  result.elapsed_seconds =
+      static_cast<double>(measurement_end - measurement_start) /
+      static_cast<double>(frequency);
+
+  const auto &io = context->diagnostics;
+  result.immediate_submissions = io.immediate_reads;
+  result.pending_submissions = io.pending_reads;
+  result.dequeue_calls = io.dequeue_calls;
+  result.max_dequeued = io.max_dequeued_once;
+  result.batch_count = io.batch_count;
+  result.batch_submit_us = static_cast<double>(io.batch_submit_ns) / 1000.0;
+  result.batch_first_completion_us =
+      static_cast<double>(io.batch_first_completion_ns) / 1000.0;
+  result.batch_duration_us = static_cast<double>(io.batch_duration_ns) / 1000.0;
+  result.iocp_wait_us = static_cast<double>(io.wait_us);
+  result.readfile_submit_us =
+      static_cast<double>(io.readfile_submit_ns) / 1000.0;
+  result.get_overlapped_us = static_cast<double>(io.get_overlapped_ns) / 1000.0;
+  return result;
+}
+
 double percentile(const std::vector<double> &sorted_values, double fraction) {
   if (sorted_values.empty()) {
     return 0.0;
@@ -907,6 +1108,33 @@ void print_result(RunResult result) {
       submissions == 0 ? 0.0
                        : static_cast<double>(result.pending_submissions) *
                              100.0 / static_cast<double>(submissions);
+  const double submit_us_per_batch =
+      result.batch_count == 0
+          ? 0.0
+          : result.batch_submit_us / static_cast<double>(result.batch_count);
+  const double first_completion_ms =
+      result.batch_count == 0
+          ? 0.0
+          : result.batch_first_completion_us /
+                static_cast<double>(result.batch_count) / 1000.0;
+  const double batch_duration_ms =
+      result.batch_count == 0
+          ? 0.0
+          : result.batch_duration_us / static_cast<double>(result.batch_count) /
+                1000.0;
+  const double iocp_wait_ms_per_batch =
+      result.batch_count == 0
+          ? 0.0
+          : result.iocp_wait_us / static_cast<double>(result.batch_count) /
+                1000.0;
+  const double readfile_submit_us_per_read =
+      result.completed == 0
+          ? 0.0
+          : result.readfile_submit_us / static_cast<double>(result.completed);
+  const double get_overlapped_us_per_read =
+      result.completed == 0
+          ? 0.0
+          : result.get_overlapped_us / static_cast<double>(result.completed);
 
   std::cout << result.mode << ',' << (result.random_access_hint ? "on" : "off")
             << ',' << result.queue_depth << ',' << result.max_batch_size << ','
@@ -916,9 +1144,12 @@ void print_result(RunResult result) {
             << percentile(result.latency_ms, 0.95) << ','
             << percentile(result.latency_ms, 0.99) << ','
             << result.latency_ms.front() << ',' << result.latency_ms.back()
-            << ',' << effective_queue_depth << ',' << completions_per_dequeue
-            << ',' << result.max_dequeued << ',' << pending_ratio << ','
-            << result.completed << '\n';
+            << ',' << effective_queue_depth << ',' << result.batch_count << ','
+            << submit_us_per_batch << ',' << first_completion_ms << ','
+            << batch_duration_ms << ',' << iocp_wait_ms_per_batch << ','
+            << readfile_submit_us_per_read << ',' << get_overlapped_us_per_read
+            << ',' << completions_per_dequeue << ',' << result.max_dequeued
+            << ',' << pending_ratio << ',' << result.completed << '\n';
 }
 
 std::vector<bool> hint_modes(RandomAccessHint mode) {
@@ -938,6 +1169,9 @@ int wmain(int argc, wchar_t **argv) {
     if (has_trace) {
       trace = load_trace(options.trace_file);
     }
+    if (options.reader_replay && !has_trace) {
+      throw std::invalid_argument("--reader-replay requires --trace-file");
+    }
     std::cout << "DiskANN Windows IOCP microbenchmark\n"
               << "file: " << wide_to_utf8(options.file_path) << '\n'
               << "block_size: " << options.block_size << " bytes\n"
@@ -956,8 +1190,11 @@ int wmain(int argc, wchar_t **argv) {
         << '\n'
         << "mode,random_access_hint,queue_depth,max_batch_size,iops,mib_per_s,"
            "avg_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,min_"
-           "latency_ms,max_latency_ms,effective_qd,completions_per_dequeue,max_"
-           "dequeued,pending_ratio_pct,completed_reads\n";
+           "latency_ms,max_latency_ms,effective_qd,batch_count,submit_us_per_"
+           "batch,first_completion_ms,batch_duration_ms,iocp_wait_ms_per_"
+           "batch,readfile_submit_us_per_read,get_overlapped_us_per_read,"
+           "completions_per_dequeue,max_dequeued,pending_ratio_pct,completed_"
+           "reads\n";
 
     const std::vector<bool> modes = hint_modes(options.random_access_hint);
     for (bool random_access_hint : modes) {
@@ -973,6 +1210,9 @@ int wmain(int argc, wchar_t **argv) {
                         options.trace_mode == TraceMode::kBoth)) {
         print_result(run_batched_benchmark(options, random_access_hint, trace));
       }
+    }
+    if (options.reader_replay) {
+      print_result(run_reader_batched_benchmark(options, trace));
     }
   } catch (const std::exception &error) {
     std::cerr << "ERROR: " << error.what() << '\n';

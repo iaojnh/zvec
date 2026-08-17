@@ -237,6 +237,11 @@ def search_metrics(lines: Sequence[str]) -> dict[str, str]:
         "reads_per_query": r"reads/query=([0-9.]+)",
         "io_us_per_query": r"io_us/query=([0-9.]+)",
         "cpu_us_per_query": r"cpu_us/query=([0-9.]+)",
+        "readfile_submit_us_per_query": r"readfile_submit_us/query=([0-9.]+)",
+        "get_overlapped_us_per_query": r"get_overlapped_us/query=([0-9.]+)",
+        "batch_submit_us": r"batch_submit_us=([0-9.]+)",
+        "first_completion_us": r"first_completion_us=([0-9.]+)",
+        "batch_duration_us": r"batch_duration_us=([0-9.]+)",
     }
     for line in lines:
         for name, pattern in patterns.items():
@@ -251,18 +256,23 @@ def best_row(rows: Sequence[dict[str, str]], mode: str) -> dict[str, str] | None
     return max(candidates, key=lambda row: float(row["iops"]), default=None)
 
 
-def interpretation(rows: Sequence[dict[str, str]]) -> list[str]:
+def interpretation(
+    rows: Sequence[dict[str, str]], capture_metrics: dict[str, str]
+) -> list[str]:
     uniform = best_row(rows, "uniform")
     continuous = best_row(rows, "trace_continuous")
     batched = best_row(rows, "trace_batched")
-    if uniform is None or continuous is None or batched is None:
+    reader = best_row(rows, "reader_batched")
+    if uniform is None or continuous is None or batched is None or reader is None:
         return ["- Not enough replay modes were produced for comparison."]
 
     uniform_iops = float(uniform["iops"])
     continuous_iops = float(continuous["iops"])
     batched_iops = float(batched["iops"])
+    reader_iops = float(reader["iops"])
     access_ratio = continuous_iops / uniform_iops
     scheduling_ratio = batched_iops / continuous_iops
+    reader_ratio = reader_iops / batched_iops
     lines = [
         (
             f"- Real offsets with a continuously full queue retain "
@@ -274,6 +284,11 @@ def interpretation(rows: Sequence[dict[str, str]]) -> list[str]:
             f"**{scheduling_ratio:.1%}** of continuous trace replay "
             f"({batched_iops:.0f} vs {continuous_iops:.0f} IOPS)."
         ),
+        (
+            f"- The project's `WindowsAlignedFileReader` retains "
+            f"**{reader_ratio:.1%}** of direct batched IOCP replay "
+            f"({reader_iops:.0f} vs {batched_iops:.0f} IOPS)."
+        ),
     ]
     if access_ratio < 0.7:
         lines.append(
@@ -284,10 +299,25 @@ def interpretation(rows: Sequence[dict[str, str]]) -> list[str]:
             "- Batch barriers leave significant device parallelism unused; "
             "cross-batch pipelining is the strongest next optimization target."
         )
-    if access_ratio >= 0.7 and scheduling_ratio >= 0.7:
+    if reader_ratio < 0.7:
         lines.append(
-            "- Neither replay isolates a large I/O loss; inspect search CPU, "
-            "cache traversal, and benchmark concurrency next."
+            "- The performance loss is reproduced inside the project reader; "
+            "focus on its submit/completion path and the timing columns below."
+        )
+    elif capture_metrics.get("qps") and capture_metrics.get("reads_per_query"):
+        search_read_iops = float(capture_metrics["qps"]) * float(
+            capture_metrics["reads_per_query"]
+        )
+        search_ratio = search_read_iops / reader_iops
+        lines.append(
+            f"- Full search delivers about **{search_read_iops:.0f} read IOPS**, "
+            f"or **{search_ratio:.1%}** of reader replay; the remaining loss is "
+            "in search orchestration rather than the reader wrapper."
+        )
+    if access_ratio >= 0.7 and scheduling_ratio >= 0.7 and reader_ratio >= 0.7:
+        lines.append(
+            "- Raw IOCP, real offsets, batch barriers, and the project reader "
+            "all retain good throughput."
         )
     return lines
 
@@ -306,13 +336,24 @@ def write_results(
         writer.writerows(rows)
 
     table_lines = [
-        "| Mode | QD | Max batch | IOPS | Avg ms | P95 ms | Effective QD |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            "| Mode | QD | Max batch | IOPS | Avg ms | P95 ms | Effective QD | "
+            "First ms | Batch ms | IOCP wait ms | ReadFile us | "
+            "GetOverlapped us | Comp/dequeue |"
+        ),
+        (
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+            "---: | ---: | ---: | ---: |"
+        ),
     ]
     for row in rows:
         table_lines.append(
             "| {mode} | {queue_depth} | {max_batch_size} | {iops} | "
-            "{avg_latency_ms} | {p95_latency_ms} | {effective_qd} |".format(**row)
+            "{avg_latency_ms} | {p95_latency_ms} | {effective_qd} | "
+            "{first_completion_ms} | {batch_duration_ms} | "
+            "{iocp_wait_ms_per_batch} | {readfile_submit_us_per_read} | "
+            "{get_overlapped_us_per_read} | "
+            "{completions_per_dequeue} |".format(**row)
         )
     search_lines = ["## Captured DiskANN search", ""]
     if capture_metrics:
@@ -322,6 +363,11 @@ def write_results(
             "reads_per_query": "Reads/query",
             "io_us_per_query": "I/O time/query (us)",
             "cpu_us_per_query": "CPU time/query (us)",
+            "readfile_submit_us_per_query": "ReadFile submit/query (us)",
+            "get_overlapped_us_per_query": "GetOverlappedResult/query (us)",
+            "batch_submit_us": "Batch submit (us)",
+            "first_completion_us": "First completion/batch (us)",
+            "batch_duration_us": "Batch duration (us)",
         }
         search_lines.extend(
             f"- {labels[name]}: {capture_metrics[name]}"
@@ -344,10 +390,14 @@ def write_results(
             "- `uniform`: uniform random reads from the same index file.",
             "- `trace_continuous`: real offsets replayed with a full queue.",
             "- `trace_batched`: real offsets replayed with original barriers.",
+            (
+                "- `reader_batched`: the same batches replayed through the "
+                "project's `WindowsAlignedFileReader`."
+            ),
             "",
             "## Interpretation",
             "",
-            *interpretation(rows),
+            *interpretation(rows, capture_metrics),
             "",
             (
                 "The replay excludes DiskANN distance computation and cache "
@@ -454,7 +504,14 @@ def main() -> int:
     )
     write_console("\nReplaying captured offsets...")
     trace_lines = run_logged(
-        [*common, "--trace-file", trace_path, "--trace-mode", "both"],
+        [
+            *common,
+            "--trace-file",
+            trace_path,
+            "--trace-mode",
+            "both",
+            "--reader-replay",
+        ],
         cwd=output_dir,
         log_path=output_dir / "trace_replay.log",
     )

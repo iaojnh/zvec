@@ -81,8 +81,16 @@ struct IoBackend {
     uint64_t dequeue_calls{0};
     uint64_t dequeued_reads{0};
     uint64_t wait_us{0};
+    uint64_t readfile_submit_ns{0};
+    uint64_t get_overlapped_ns{0};
+    uint64_t batch_count{0};
+    uint64_t batch_submit_ns{0};
+    uint64_t batch_first_completion_ns{0};
+    uint64_t batch_duration_ns{0};
     uint32_t max_outstanding{0};
     uint32_t max_dequeued_once{0};
+    uint64_t active_batch_started_ns{0};
+    bool active_batch_first_completion_recorded{false};
   };
 
   std::vector<OVERLAPPED> reqs;

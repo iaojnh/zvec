@@ -6,6 +6,8 @@ if(WIN32)
         NAME diskann_iocp_bench
         STRICT PACKED
         SRCS diskann_iocp_bench.cc
+        INCS ${PROJECT_ROOT_DIR}/src/core/algorithm/diskann
+        LIBS core_knn_diskann core_knn_cluster core_framework zvec_ailego
         DEFS NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601
     )
 endif()

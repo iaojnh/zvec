@@ -67,7 +67,10 @@ void log_search_diagnostics(const SearchStats &stats, IOContext io_ctx,
       "DiskAnn IOCP diagnostics: submit_calls=%llu, submitted_reads=%llu, "
       "immediate_reads=%llu, pending_reads=%llu, pending_ratio=%.2f%%, "
       "max_outstanding=%u, dequeue_calls=%llu, completions/dequeue=%.2f, "
-      "max_dequeued_once=%u, iocp_wait_us/query=%.2f",
+      "max_dequeued_once=%u, iocp_wait_us/query=%.2f, "
+      "readfile_submit_us/query=%.2f, get_overlapped_us/query=%.2f, "
+      "batch_submit_us=%.2f, first_completion_us=%.2f, "
+      "batch_duration_us=%.2f",
       static_cast<unsigned long long>(io.submit_calls),
       static_cast<unsigned long long>(io.submitted_reads),
       static_cast<unsigned long long>(io.immediate_reads),
@@ -75,7 +78,12 @@ void log_search_diagnostics(const SearchStats &stats, IOContext io_ctx,
       100.0 * average(io.pending_reads, io.submitted_reads), io.max_outstanding,
       static_cast<unsigned long long>(io.dequeue_calls),
       average(io.dequeued_reads, io.dequeue_calls), io.max_dequeued_once,
-      average(io.wait_us, stats.query_count));
+      average(io.wait_us, stats.query_count),
+      average(io.readfile_submit_ns, stats.query_count) / 1000.0,
+      average(io.get_overlapped_ns, stats.query_count) / 1000.0,
+      average(io.batch_submit_ns, io.batch_count) / 1000.0,
+      average(io.batch_first_completion_ns, io.batch_count) / 1000.0,
+      average(io.batch_duration_ns, io.batch_count) / 1000.0);
 #else
   (void)io_ctx;
 #endif
