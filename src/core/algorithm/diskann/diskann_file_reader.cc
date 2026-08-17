@@ -102,6 +102,14 @@ bool diskann_io_pipeline_enabled() {
   return enabled;
 }
 
+bool diskann_io_drain_first_enabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("ZVEC_DISKANN_IO_DRAIN_FIRST");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 #if defined(_WIN32) || defined(_WIN64)
 // Cancel and reap every request that may still reference caller-owned buffers.
 // Closing the file or completion port before the cancellation packets have

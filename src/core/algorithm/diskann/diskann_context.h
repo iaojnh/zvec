@@ -293,6 +293,10 @@ class DiskAnnContext : public IndexContext,
     return io_pipeline_enabled_;
   }
 
+  bool io_drain_first_enabled() const {
+    return io_drain_first_enabled_;
+  }
+
   const DiskAnnEntity &get_entity() const {
     return *entity_;
   }
@@ -407,6 +411,7 @@ class DiskAnnContext : public IndexContext,
   bool debug_mode_{false};
   bool io_diagnostics_enabled_{false};
   bool io_pipeline_enabled_{false};
+  bool io_drain_first_enabled_{false};
   uint32_t pq_chunk_num_{0};
   uint32_t element_size_{0};
   uint32_t element_rotated_size_{0};

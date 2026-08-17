@@ -28,19 +28,20 @@ double average(double total, uint64_t count) {
 }
 
 void log_search_diagnostics(const SearchStats &stats, IOContext io_ctx,
-                            bool pipeline_enabled) {
+                            bool pipeline_enabled, bool drain_first_enabled) {
   if (stats.query_count == 0) {
     return;
   }
 
   LOG_INFO(
-      "DiskAnn search diagnostics: pipeline=%s, queries=%llu, "
+      "DiskAnn search diagnostics: pipeline=%s, completion=%s, queries=%llu, "
       "reads/query=%.2f, "
       "cache_hits/query=%.2f, hops/query=%.2f, batches/query=%.2f, "
       "reads/batch=%.2f, max_batch=%u, beam_limit/query=%.2f, "
       "max_beam_limit=%u, io_us/query=%.2f, cpu_us/query=%.2f, "
       "batch_histogram=[1:%llu,2-4:%llu,5-8:%llu,9-16:%llu,17-32:%llu]",
       pipeline_enabled ? "rolling" : "batched",
+      drain_first_enabled ? "drain_first" : "interleaved",
       static_cast<unsigned long long>(stats.query_count),
       average(stats.disk_page_reads, stats.query_count),
       average(stats.cache_hits, stats.query_count),
@@ -109,6 +110,8 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
   io_diagnostics_enabled_ = diskann_io_diagnostics_enabled();
 #if defined(_WIN32) || defined(_WIN64)
   io_pipeline_enabled_ = diskann_io_pipeline_enabled();
+  io_drain_first_enabled_ =
+      !io_pipeline_enabled_ && diskann_io_drain_first_enabled();
 #endif
   element_size_ = element_size;
   pq_chunk_num_ = pq_chunk_num;
@@ -182,7 +185,8 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
 
 DiskAnnContext::~DiskAnnContext() {
   if (io_diagnostics_enabled_) {
-    log_search_diagnostics(query_stats_, io_ctx_, io_pipeline_enabled_);
+    log_search_diagnostics(query_stats_, io_ctx_, io_pipeline_enabled_,
+                           io_drain_first_enabled_);
   }
 
   DiskAnnUtil::free_aligned(query_);

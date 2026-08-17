@@ -124,6 +124,12 @@ bool diskann_io_diagnostics_enabled();
 // traversal and recall. Set ZVEC_DISKANN_IO_PIPELINE=1 to enable it.
 bool diskann_io_pipeline_enabled();
 
+// Experimental Windows-only batched completion mode. The default search path
+// processes each group of completed reads before dequeuing more completions.
+// Set ZVEC_DISKANN_IO_DRAIN_FIRST=1 to drain the active batch first and process
+// its nodes afterwards, preserving the observed completion order.
+bool diskann_io_drain_first_enabled();
+
 // Log the current DiskAnn I/O backend (io_uring, libaio, or pread). Probes the
 // backend on first call. No-op outside Linux and macOS.
 void log_diskann_io_backend();

@@ -24,7 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build the Windows DiskANN diagnostic tools, capture the real "
-            "search I/O trace, and replay it with continuous and original "
+            "search I/O trace, compare interleaved and drain-first completion "
+            "processing, and replay the trace with continuous and original "
             "batch scheduling."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -232,13 +233,17 @@ def extract_rows(lines: Sequence[str]) -> list[dict[str, str]]:
 def search_metrics(lines: Sequence[str]) -> dict[str, str]:
     metrics: dict[str, str] = {}
     patterns = {
+        "completion_mode": r"completion=([a-z_]+)",
         "qps": r"Avg latency: [0-9.]+ms qps: ([0-9.]+)",
         "avg_latency_ms": r"Avg latency: ([0-9.]+)ms qps:",
         "reads_per_query": r"reads/query=([0-9.]+)",
+        "batches_per_query": r"batches/query=([0-9.]+)",
         "io_us_per_query": r"io_us/query=([0-9.]+)",
         "cpu_us_per_query": r"cpu_us/query=([0-9.]+)",
+        "iocp_wait_us_per_query": r"iocp_wait_us/query=([0-9.]+)",
         "readfile_submit_us_per_query": r"readfile_submit_us/query=([0-9.]+)",
         "get_overlapped_us_per_query": r"get_overlapped_us/query=([0-9.]+)",
+        "completions_per_dequeue": r"completions/dequeue=([0-9.]+)",
         "batch_submit_us": r"batch_submit_us=([0-9.]+)",
         "first_completion_us": r"first_completion_us=([0-9.]+)",
         "batch_duration_us": r"batch_duration_us=([0-9.]+)",
@@ -251,13 +256,25 @@ def search_metrics(lines: Sequence[str]) -> dict[str, str]:
     return metrics
 
 
+def require_search_mode(metrics: dict[str, str], expected: str) -> None:
+    actual = metrics.get("completion_mode")
+    if actual == expected:
+        return
+    msg = (
+        f"Expected DiskANN completion mode '{expected}', got "
+        f"'{actual or 'no mode marker'}'. Rebuild bench_original without "
+        "--skip-build so the drain-first diagnostic code is included."
+    )
+    raise RuntimeError(msg)
+
+
 def best_row(rows: Sequence[dict[str, str]], mode: str) -> dict[str, str] | None:
     candidates = [row for row in rows if row["mode"] == mode]
     return max(candidates, key=lambda row: float(row["iops"]), default=None)
 
 
 def interpretation(
-    rows: Sequence[dict[str, str]], capture_metrics: dict[str, str]
+    rows: Sequence[dict[str, str]], search_runs: dict[str, dict[str, str]]
 ) -> list[str]:
     uniform = best_row(rows, "uniform")
     continuous = best_row(rows, "trace_continuous")
@@ -304,10 +321,35 @@ def interpretation(
             "- The performance loss is reproduced inside the project reader; "
             "focus on its submit/completion path and the timing columns below."
         )
-    elif capture_metrics.get("qps") and capture_metrics.get("reads_per_query"):
-        search_read_iops = float(capture_metrics["qps"]) * float(
-            capture_metrics["reads_per_query"]
+    baseline = search_runs.get("interleaved", {})
+    drain_first = search_runs.get("drain_first", {})
+    if baseline.get("qps") and drain_first.get("qps"):
+        baseline_qps = float(baseline["qps"])
+        drain_qps = float(drain_first["qps"])
+        drain_ratio = drain_qps / baseline_qps
+        lines.append(
+            f"- Drain-first search reaches **{drain_qps:.1f} QPS** versus "
+            f"**{baseline_qps:.1f} QPS** for interleaved completion "
+            f"(**{drain_ratio:.1%}**)."
         )
+        if drain_ratio >= 1.1:
+            lines.append(
+                "- Draining the IOCP batch before node processing materially "
+                "improves search throughput; completion/compute interleaving "
+                "is a viable Windows optimization target."
+            )
+        elif drain_ratio <= 0.9:
+            lines.append(
+                "- Drain-first is materially slower; retaining I/O and CPU "
+                "overlap is preferable on this system."
+            )
+        else:
+            lines.append(
+                "- Drain-first does not materially change search throughput; "
+                "completion/compute interleaving is not the primary loss."
+            )
+    if baseline.get("qps") and baseline.get("reads_per_query"):
+        search_read_iops = float(baseline["qps"]) * float(baseline["reads_per_query"])
         search_ratio = search_read_iops / reader_iops
         lines.append(
             f"- Full search delivers about **{search_read_iops:.0f} read IOPS**, "
@@ -325,7 +367,7 @@ def interpretation(
 def write_results(
     output_dir: Path,
     rows: list[dict[str, str]],
-    capture_metrics: dict[str, str],
+    search_runs: dict[str, dict[str, str]],
 ) -> None:
     if not rows:
         raise RuntimeError("No replay results were produced")
@@ -355,33 +397,75 @@ def write_results(
             "{get_overlapped_us_per_read} | "
             "{completions_per_dequeue} |".format(**row)
         )
-    search_lines = ["## Captured DiskANN search", ""]
-    if capture_metrics:
-        labels = {
-            "qps": "QPS",
-            "avg_latency_ms": "Average latency (ms)",
-            "reads_per_query": "Reads/query",
-            "io_us_per_query": "I/O time/query (us)",
-            "cpu_us_per_query": "CPU time/query (us)",
-            "readfile_submit_us_per_query": "ReadFile submit/query (us)",
-            "get_overlapped_us_per_query": "GetOverlappedResult/query (us)",
-            "batch_submit_us": "Batch submit (us)",
-            "first_completion_us": "First completion/batch (us)",
-            "batch_duration_us": "Batch duration (us)",
-        }
-        search_lines.extend(
-            f"- {labels[name]}: {capture_metrics[name]}"
-            for name in labels
-            if name in capture_metrics
+    search_fields = [
+        "mode",
+        "qps",
+        "avg_latency_ms",
+        "reads_per_query",
+        "batches_per_query",
+        "io_us_per_query",
+        "cpu_us_per_query",
+        "iocp_wait_us_per_query",
+        "batch_submit_us",
+        "first_completion_us",
+        "batch_duration_us",
+        "readfile_submit_us_per_query",
+        "get_overlapped_us_per_query",
+        "completions_per_dequeue",
+    ]
+    with (output_dir / "search_results.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as output:
+        writer = csv.DictWriter(output, fieldnames=search_fields)
+        writer.writeheader()
+        for mode, metrics in search_runs.items():
+            writer.writerow(
+                {
+                    name: mode if name == "mode" else metrics.get(name, "")
+                    for name in search_fields
+                }
+            )
+
+    search_lines = [
+        "## DiskANN search A/B",
+        "",
+        (
+            "| Mode | QPS | Avg ms | Reads/query | Batches/query | I/O us/query | "
+            "CPU us/query | IOCP wait us/query | Batch submit us | First us | "
+            "Batch duration us | Comp/dequeue |"
+        ),
+        (
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+            "---: | ---: | ---: |"
+        ),
+    ]
+    for mode in ("interleaved", "drain_first"):
+        metrics = search_runs.get(mode, {})
+        search_lines.append(
+            "| {mode} | {qps} | {avg_latency_ms} | {reads_per_query} | "
+            "{batches_per_query} | {io_us_per_query} | {cpu_us_per_query} | "
+            "{iocp_wait_us_per_query} | {batch_submit_us} | "
+            "{first_completion_us} | {batch_duration_us} | "
+            "{completions_per_dequeue} |".format(
+                mode=mode,
+                **{
+                    name: metrics.get(name, "")
+                    for name in search_fields
+                    if name != "mode"
+                },
+            )
         )
-    else:
-        search_lines.append("- Search metrics were not found in the capture log.")
 
     summary = "\n".join(
         [
             "# DiskANN Windows I/O trace diagnosis",
             "",
             *search_lines,
+            "",
+            (
+                "The trace-capture run is separate from this A/B table. Both "
+                "search measurements run without trace recording overhead."
+            ),
             "",
             "## I/O replay",
             "",
@@ -397,12 +481,16 @@ def write_results(
             "",
             "## Interpretation",
             "",
-            *interpretation(rows, capture_metrics),
+            *interpretation(rows, search_runs),
             "",
             (
                 "The replay excludes DiskANN distance computation and cache "
                 "traversal, so it isolates only the storage request pattern "
                 "and scheduling barriers."
+            ),
+            (
+                "`trace_batched` preserves batch boundaries but does not "
+                "reproduce node processing between completion dequeues."
             ),
             "",
         ]
@@ -435,12 +523,27 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--cache-nodes must not be negative")
 
 
+def search_environment(
+    *, drain_first: bool, trace_path: Path | None = None, max_trace_records: int = 0
+) -> dict[str, str]:
+    env = os.environ.copy()
+    env["ZVEC_DISKANN_IO_DIAGNOSTICS"] = "1"
+    env["ZVEC_DISKANN_IO_PIPELINE"] = "0"
+    env["ZVEC_DISKANN_IO_DRAIN_FIRST"] = "1" if drain_first else "0"
+    env.pop("ZVEC_DISKANN_IO_TRACE", None)
+    env.pop("ZVEC_DISKANN_IO_TRACE_MAX_RECORDS", None)
+    if trace_path is not None:
+        env["ZVEC_DISKANN_IO_TRACE"] = str(trace_path)
+        env["ZVEC_DISKANN_IO_TRACE_MAX_RECORDS"] = str(max_trace_records)
+    return env
+
+
 def main() -> int:
     args = parse_args()
     validate_args(args)
     repo_root = args.repo_root.resolve()
     build_dir = (args.build_dir or repo_root / "build").resolve()
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = dt.datetime.now(dt.timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
     output_dir = (
         args.output_dir or build_dir / "diskann_iocp_diagnostics" / timestamp
     ).resolve()
@@ -466,20 +569,34 @@ def main() -> int:
         top_k=args.top_k,
     )
 
-    capture_env = os.environ.copy()
-    capture_env["ZVEC_DISKANN_IO_DIAGNOSTICS"] = "1"
-    capture_env["ZVEC_DISKANN_IO_PIPELINE"] = "0"
-    capture_env["ZVEC_DISKANN_IO_TRACE"] = str(trace_path)
-    capture_env["ZVEC_DISKANN_IO_TRACE_MAX_RECORDS"] = str(args.max_trace_records)
     write_console("\nCapturing real DiskANN I/O offsets...")
-    capture_lines = run_logged(
+    run_logged(
         [bench_tool, config_path],
         cwd=output_dir,
-        env=capture_env,
-        log_path=output_dir / "capture.log",
+        env=search_environment(
+            drain_first=False,
+            trace_path=trace_path,
+            max_trace_records=args.max_trace_records,
+        ),
+        log_path=output_dir / "trace_capture.log",
     )
     if not trace_path.is_file() or trace_path.stat().st_size == 0:
         raise RuntimeError("DiskANN did not produce an I/O trace")
+
+    write_console("\nRunning interleaved-completion search baseline...")
+    interleaved_lines = run_logged(
+        [bench_tool, config_path],
+        cwd=output_dir,
+        env=search_environment(drain_first=False),
+        log_path=output_dir / "search_interleaved.log",
+    )
+    write_console("\nRunning drain-first search experiment...")
+    drain_first_lines = run_logged(
+        [bench_tool, config_path],
+        cwd=output_dir,
+        env=search_environment(drain_first=True),
+        log_path=output_dir / "search_drain_first.log",
+    )
 
     queue_depths = ",".join(str(value) for value in args.queue_depths)
     common: list[str | Path] = [
@@ -516,11 +633,20 @@ def main() -> int:
         log_path=output_dir / "trace_replay.log",
     )
     rows = [*extract_rows(uniform_lines), *extract_rows(trace_lines)]
-    write_results(output_dir, rows, search_metrics(capture_lines))
+    interleaved_metrics = search_metrics(interleaved_lines)
+    drain_first_metrics = search_metrics(drain_first_lines)
+    require_search_mode(interleaved_metrics, "interleaved")
+    require_search_mode(drain_first_metrics, "drain_first")
+    search_runs = {
+        "interleaved": interleaved_metrics,
+        "drain_first": drain_first_metrics,
+    }
+    write_results(output_dir, rows, search_runs)
 
     write_console("\nDiagnosis complete.")
     write_console(f"Summary: {output_dir / 'summary.md'}")
     write_console(f"Results: {output_dir / 'results.csv'}")
+    write_console(f"Search:  {output_dir / 'search_results.csv'}")
     write_console(f"Trace:   {trace_path}")
     return 0
 
@@ -531,6 +657,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         write_console("\nInterrupted.")
         raise SystemExit(130) from None
-    except Exception as error:
+    except (OSError, RuntimeError, ValueError) as error:
         sys.stderr.write(f"\nERROR: {error}\n")
         raise SystemExit(1) from None

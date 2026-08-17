@@ -1140,6 +1140,26 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
 
     if (!frontier.empty()) {
       std::vector<uint32_t> completed;
+      std::vector<uint32_t> completion_order;
+      if (ctx->io_drain_first_enabled()) {
+        completion_order.reserve(frontier.size());
+      }
+
+      auto process_completed = [&](uint32_t idx) {
+        auto &frontier_neighbor = frontier_neighbors[idx];
+        uint8_t *node_disk_buf = DiskAnnUtil::offset_to_node(
+            node_per_sector_, max_node_size_, frontier_neighbor.second,
+            frontier_neighbor.first);
+        uint32_t *node_buf = DiskAnnUtil::offset_to_node_neighbor(
+            node_disk_buf, meta_.element_size());
+        uint32_t neighbor_num = *node_buf;
+
+        diskann_id_t *node_neighbors =
+            reinterpret_cast<diskann_id_t *>(node_buf + 1);
+        process_node(frontier_neighbor.first, node_disk_buf, neighbor_num,
+                     node_neighbors, true);
+      };
+
       while (pending.n_reaped < pending.n_submitted) {
         completed.clear();
         io_timer.reset();
@@ -1152,19 +1172,16 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
         }
 
         for (uint32_t idx : completed) {
-          auto &frontier_neighbor = frontier_neighbors[idx];
-          uint8_t *node_disk_buf = DiskAnnUtil::offset_to_node(
-              node_per_sector_, max_node_size_, frontier_neighbor.second,
-              frontier_neighbor.first);
-          uint32_t *node_buf = DiskAnnUtil::offset_to_node_neighbor(
-              node_disk_buf, meta_.element_size());
-          uint32_t neighbor_num = *node_buf;
-
-          diskann_id_t *node_neighbors =
-              reinterpret_cast<diskann_id_t *>(node_buf + 1);
-          process_node(frontier_neighbor.first, node_disk_buf, neighbor_num,
-                       node_neighbors, true);
+          if (ctx->io_drain_first_enabled()) {
+            completion_order.push_back(idx);
+          } else {
+            process_completed(idx);
+          }
         }
+      }
+
+      for (uint32_t idx : completion_order) {
+        process_completed(idx);
       }
     }
   }
