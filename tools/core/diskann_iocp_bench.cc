@@ -129,6 +129,7 @@ struct TraceData {
 struct Options {
   std::wstring file_path;
   std::vector<uint32_t> queue_depths{1, 2, 4, 8, 20};
+  std::vector<uint32_t> batch_gaps_us{0};
   uint32_t duration_seconds = 10;
   uint32_t warmup_seconds = 2;
   uint32_t block_size = kRequiredAlignment;
@@ -144,6 +145,7 @@ struct RunResult {
   bool random_access_hint = false;
   uint32_t queue_depth = 0;
   uint32_t max_batch_size = 0;
+  uint32_t batch_gap_us = 0;
   uint64_t completed = 0;
   uint64_t completed_bytes = 0;
   uint64_t immediate_submissions = 0;
@@ -152,6 +154,8 @@ struct RunResult {
   uint32_t max_dequeued = 0;
   double elapsed_seconds = 0.0;
   uint64_t batch_count = 0;
+  uint64_t gap_count = 0;
+  double gap_duration_us = 0.0;
   double batch_submit_us = 0.0;
   double batch_first_completion_us = 0.0;
   double batch_duration_us = 0.0;
@@ -298,6 +302,23 @@ std::vector<uint32_t> parse_queue_depths(const std::wstring &text) {
   return depths;
 }
 
+std::vector<uint32_t> parse_batch_gaps(const std::wstring &text) {
+  std::vector<uint32_t> gaps;
+  std::wstringstream stream(text);
+  std::wstring item;
+  while (std::getline(stream, item, L',')) {
+    uint32_t gap = parse_uint32(item, "--batch-gaps-us", true);
+    if (gap > 1000000) {
+      throw std::invalid_argument("Batch gap cannot exceed 1000000 us");
+    }
+    gaps.push_back(gap);
+  }
+  if (gaps.empty()) {
+    throw std::invalid_argument("--batch-gaps-us cannot be empty");
+  }
+  return gaps;
+}
+
 std::wstring require_value(int argc, wchar_t **argv, int &index,
                            const char *name) {
   if (index + 1 >= argc) {
@@ -322,6 +343,8 @@ void print_usage() {
       << "  --trace-file PATH            Replay a captured DiskANN I/O trace\n"
       << "  --trace-mode MODE            continuous, batched, or both "
          "(default: both)\n"
+      << "  --batch-gaps-us LIST         Comma-separated busy gaps between "
+         "trace batches (default: 0)\n"
       << "  --reader-replay              Replay trace through the project's "
          "WindowsAlignedFileReader\n"
       << "  --seed VALUE                 Random seed\n"
@@ -381,6 +404,9 @@ Options parse_options(int argc, wchar_t **argv) {
         throw std::invalid_argument(
             "--trace-mode must be continuous, batched, or both");
       }
+    } else if (argument == L"--batch-gaps-us") {
+      options.batch_gaps_us =
+          parse_batch_gaps(require_value(argc, argv, index, "--batch-gaps-us"));
     } else if (argument == L"--reader-replay") {
       options.reader_replay = true;
     } else {
@@ -797,9 +823,25 @@ bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
                           const TraceData &trace,
                           std::vector<Request> &requests,
                           std::vector<OVERLAPPED_ENTRY> &entries,
-                          size_t &batch_index, RunResult *result,
+                          size_t &batch_index, uint32_t batch_gap_us,
+                          bool &has_previous_batch, RunResult *result,
                           std::string &error) {
   while (counter_now() < deadline) {
+    if (has_previous_batch && batch_gap_us != 0) {
+      const uint64_t gap_started = counter_now();
+      const uint64_t gap_ticks =
+          (static_cast<uint64_t>(batch_gap_us) * frequency + 999999ULL) /
+          1000000ULL;
+      const uint64_t gap_deadline = gap_started + gap_ticks;
+      while (counter_now() < gap_deadline) {
+      }
+      if (result != nullptr) {
+        ++result->gap_count;
+        result->gap_duration_us +=
+            static_cast<double>(counter_now() - gap_started) * 1000000.0 /
+            static_cast<double>(frequency);
+      }
+    }
     const TraceBatch &batch = trace.batches[batch_index];
     batch_index = (batch_index + 1) % trace.batches.size();
     const uint64_t batch_started = counter_now();
@@ -833,16 +875,18 @@ bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
           static_cast<double>(batch_finished - batch_started) * 1000000.0 /
           static_cast<double>(frequency);
     }
+    has_previous_batch = true;
   }
   return true;
 }
 
 RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
-                                const TraceData &trace) {
+                                const TraceData &trace, uint32_t batch_gap_us) {
   RunResult result;
-  result.mode = "trace_batched";
+  result.mode = batch_gap_us == 0 ? "trace_batched" : "trace_gapped";
   result.random_access_hint = random_access_hint;
   result.max_batch_size = trace.max_batch_size;
+  result.batch_gap_us = batch_gap_us;
   const size_t expected_completions = std::min<size_t>(
       static_cast<size_t>(options.duration_seconds) * 50000U, 10000000U);
   result.latency_ms.reserve(expected_completions);
@@ -892,12 +936,14 @@ RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
 
   const uint64_t frequency = counter_frequency();
   size_t batch_index = 0;
+  bool has_previous_batch = false;
   std::string error;
   const uint64_t warmup_deadline =
       counter_now() + static_cast<uint64_t>(options.warmup_seconds) * frequency;
   if (!replay_batches_until(file_handle.get(), completion_port.get(),
                             warmup_deadline, frequency, trace, requests,
-                            entries, batch_index, nullptr, error)) {
+                            entries, batch_index, batch_gap_us,
+                            has_previous_batch, nullptr, error)) {
     throw std::runtime_error(error);
   }
 
@@ -907,7 +953,8 @@ RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
       static_cast<uint64_t>(options.duration_seconds) * frequency;
   if (!replay_batches_until(file_handle.get(), completion_port.get(),
                             measurement_deadline, frequency, trace, requests,
-                            entries, batch_index, &result, error)) {
+                            entries, batch_index, batch_gap_us,
+                            has_previous_batch, &result, error)) {
     throw std::runtime_error(error);
   }
   const uint64_t measurement_end = counter_now();
@@ -1112,6 +1159,10 @@ void print_result(RunResult result) {
       result.batch_count == 0
           ? 0.0
           : result.batch_submit_us / static_cast<double>(result.batch_count);
+  const double actual_gap_us =
+      result.gap_count == 0
+          ? 0.0
+          : result.gap_duration_us / static_cast<double>(result.gap_count);
   const double first_completion_ms =
       result.batch_count == 0
           ? 0.0
@@ -1138,10 +1189,10 @@ void print_result(RunResult result) {
 
   std::cout << result.mode << ',' << (result.random_access_hint ? "on" : "off")
             << ',' << result.queue_depth << ',' << result.max_batch_size << ','
-            << std::fixed << std::setprecision(2) << iops << ','
-            << mib_per_second << ',' << average_latency << ','
-            << percentile(result.latency_ms, 0.50) << ','
-            << percentile(result.latency_ms, 0.95) << ','
+            << result.batch_gap_us << ',' << std::fixed << std::setprecision(2)
+            << actual_gap_us << ',' << iops << ',' << mib_per_second << ','
+            << average_latency << ',' << percentile(result.latency_ms, 0.50)
+            << ',' << percentile(result.latency_ms, 0.95) << ','
             << percentile(result.latency_ms, 0.99) << ','
             << result.latency_ms.front() << ',' << result.latency_ms.back()
             << ',' << effective_queue_depth << ',' << result.batch_count << ','
@@ -1188,7 +1239,8 @@ int wmain(int argc, wchar_t **argv) {
     }
     std::cout
         << '\n'
-        << "mode,random_access_hint,queue_depth,max_batch_size,iops,mib_per_s,"
+        << "mode,random_access_hint,queue_depth,max_batch_size,batch_gap_us,"
+           "actual_gap_us,iops,mib_per_s,"
            "avg_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,min_"
            "latency_ms,max_latency_ms,effective_qd,batch_count,submit_us_per_"
            "batch,first_completion_ms,batch_duration_ms,iocp_wait_ms_per_"
@@ -1208,7 +1260,10 @@ int wmain(int argc, wchar_t **argv) {
       }
       if (has_trace && (options.trace_mode == TraceMode::kBatched ||
                         options.trace_mode == TraceMode::kBoth)) {
-        print_result(run_batched_benchmark(options, random_access_hint, trace));
+        for (uint32_t batch_gap_us : options.batch_gaps_us) {
+          print_result(run_batched_benchmark(options, random_access_hint, trace,
+                                             batch_gap_us));
+        }
       }
     }
     if (options.reader_replay) {

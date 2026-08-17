@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-seconds", type=int, default=10)
     parser.add_argument("--warmup-seconds", type=int, default=2)
     parser.add_argument("--queue-depths", nargs="+", type=int, default=(1, 2, 4, 8, 20))
+    parser.add_argument(
+        "--batch-gaps-us", nargs="+", type=int, default=(0, 50, 100, 250, 500, 1000)
+    )
     parser.add_argument("--list-size", type=int, default=100)
     parser.add_argument("--cache-nodes", type=int, default=10_000)
     parser.add_argument("--beam-size", type=int, default=20)
@@ -227,7 +230,14 @@ def extract_rows(lines: Sequence[str]) -> list[dict[str, str]]:
     if header_index is None:
         raise RuntimeError("IOCP benchmark output did not contain a CSV table")
     table = [line for line in lines[header_index:] if line.count(",") >= 16]
-    return list(csv.DictReader(table))
+    rows = list(csv.DictReader(table))
+    required_fields = {"batch_gap_us", "actual_gap_us"}
+    if not rows or not required_fields.issubset(rows[0]):
+        raise RuntimeError(
+            "IOCP benchmark does not expose gap diagnostics; rebuild without "
+            "--skip-build"
+        )
+    return rows
 
 
 def search_metrics(lines: Sequence[str]) -> dict[str, str]:
@@ -273,6 +283,61 @@ def best_row(rows: Sequence[dict[str, str]], mode: str) -> dict[str, str] | None
     return max(candidates, key=lambda row: float(row["iops"]), default=None)
 
 
+def gap_interpretation(
+    rows: Sequence[dict[str, str]], baseline: dict[str, str]
+) -> list[str]:
+    gapped_rows = [row for row in rows if row["mode"] == "trace_gapped"]
+    baseline_batch_ms = float(baseline["batch_duration_ms"])
+    if not gapped_rows or baseline_batch_ms <= 0.0:
+        return []
+
+    worst = max(gapped_rows, key=lambda row: float(row["batch_duration_ms"]))
+    worst_batch_ms = float(worst["batch_duration_ms"])
+    worst_ratio = worst_batch_ms / baseline_batch_ms
+    worst_gap = int(worst["batch_gap_us"])
+    worst_actual_gap = float(worst["actual_gap_us"])
+    lines = [
+        (
+            f"- The largest gapped-replay batch duration is "
+            f"**{worst_batch_ms:.2f} ms** at **{worst_gap} us** requested "
+            f"gap (**{worst_actual_gap:.1f} us** actual), or "
+            f"**{worst_ratio:.1f}x** the zero-gap replay."
+        )
+    ]
+    material_rows = [
+        row
+        for row in gapped_rows
+        if float(row["batch_duration_ms"]) / baseline_batch_ms >= 2.0
+    ]
+    if material_rows:
+        first_material = min(material_rows, key=lambda row: int(row["batch_gap_us"]))
+        first_material_gap = int(first_material["batch_gap_us"])
+        first_material_actual_gap = float(first_material["actual_gap_us"])
+    else:
+        first_material_gap = None
+        first_material_actual_gap = None
+    if first_material_actual_gap is not None and first_material_actual_gap <= 300:
+        lines.append(
+            f"- The latency doubles by **{first_material_gap} us** requested "
+            f"gap (**{first_material_actual_gap:.1f} us** actual); this "
+            "matches the search's short dependency gaps and can explain its "
+            "effective-QD collapse."
+        )
+    elif first_material_gap is not None:
+        lines.append(
+            f"- Latency only doubles at **{first_material_gap} us** requested "
+            f"gap (**{first_material_actual_gap:.1f} us** actual), which "
+            "is longer than the observed search dependency gap and is "
+            "unlikely to be the primary cause."
+        )
+    else:
+        lines.append(
+            "- Short queue-idle gaps do not reproduce the full-search batch "
+            "latency; inspect the search destination-buffer allocation next."
+        )
+    return lines
+
+
 def interpretation(
     rows: Sequence[dict[str, str]], search_runs: dict[str, dict[str, str]]
 ) -> list[str]:
@@ -307,6 +372,7 @@ def interpretation(
             f"({reader_iops:.0f} vs {batched_iops:.0f} IOPS)."
         ),
     ]
+    lines.extend(gap_interpretation(rows, batched))
     if access_ratio < 0.7:
         lines.append(
             "- The captured offset/size pattern itself has a substantial cost."
@@ -379,18 +445,19 @@ def write_results(
 
     table_lines = [
         (
-            "| Mode | QD | Max batch | IOPS | Avg ms | P95 ms | Effective QD | "
-            "First ms | Batch ms | IOCP wait ms | ReadFile us | "
-            "GetOverlapped us | Comp/dequeue |"
+            "| Mode | QD | Max batch | Gap us | Actual gap us | IOPS | Avg ms | "
+            "P95 ms | Effective QD | First ms | Batch ms | IOCP wait ms | "
+            "ReadFile us | GetOverlapped us | Comp/dequeue |"
         ),
         (
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-            "---: | ---: | ---: | ---: |"
+            "---: | ---: | ---: | ---: | ---: | ---: |"
         ),
     ]
     for row in rows:
         table_lines.append(
-            "| {mode} | {queue_depth} | {max_batch_size} | {iops} | "
+            "| {mode} | {queue_depth} | {max_batch_size} | {batch_gap_us} | "
+            "{actual_gap_us} | {iops} | "
             "{avg_latency_ms} | {p95_latency_ms} | {effective_qd} | "
             "{first_completion_ms} | {batch_duration_ms} | "
             "{iocp_wait_ms_per_batch} | {readfile_submit_us_per_read} | "
@@ -475,6 +542,10 @@ def write_results(
             "- `trace_continuous`: real offsets replayed with a full queue.",
             "- `trace_batched`: real offsets replayed with original barriers.",
             (
+                "- `trace_gapped`: the same barriers plus a CPU-busy delay "
+                "between batches; `Gap us` is excluded from batch latency."
+            ),
+            (
                 "- `reader_batched`: the same batches replayed through the "
                 "project's `WindowsAlignedFileReader`."
             ),
@@ -519,6 +590,10 @@ def validate_args(args: argparse.Namespace) -> None:
     )
     if any(value <= 0 for value in positive_values) or args.warmup_seconds < 0:
         raise ValueError("Durations, queue depths, and sizes must be positive")
+    if any(value < 0 or value > 1_000_000 for value in args.batch_gaps_us):
+        raise ValueError("--batch-gaps-us must be between 0 and 1000000")
+    if 0 not in args.batch_gaps_us:
+        raise ValueError("--batch-gaps-us must include 0 for the baseline")
     if args.cache_nodes < 0:
         raise ValueError("--cache-nodes must not be negative")
 
@@ -599,6 +674,7 @@ def main() -> int:
     )
 
     queue_depths = ",".join(str(value) for value in args.queue_depths)
+    batch_gaps_us = ",".join(str(value) for value in args.batch_gaps_us)
     common: list[str | Path] = [
         iocp_tool,
         "--file",
@@ -627,6 +703,8 @@ def main() -> int:
             trace_path,
             "--trace-mode",
             "both",
+            "--batch-gaps-us",
+            batch_gaps_us,
             "--reader-replay",
         ],
         cwd=output_dir,
