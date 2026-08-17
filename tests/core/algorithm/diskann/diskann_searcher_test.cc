@@ -47,6 +47,12 @@ shared_ptr<IndexMeta> DiskAnnSearcherTest::_index_meta_ptr;
 void DiskAnnSearcherTest::SetUp(void) {
   LoggerBroker::SetLevel(Logger::LEVEL_INFO);
 
+#if defined(_WIN32) || defined(_WIN64)
+  // Exercise the opt-in rolling IOCP search path throughout the Windows test
+  // suite. Other platforms continue to validate the established batch path.
+  ASSERT_TRUE(::SetEnvironmentVariableA("ZVEC_DISKANN_IO_PIPELINE", "1"));
+#endif
+
   _index_meta_ptr.reset(new (nothrow)
                             IndexMeta(IndexMeta::DataType::DT_FP32, dim));
   _index_meta_ptr->set_metric("SquaredEuclidean", 0, Params());

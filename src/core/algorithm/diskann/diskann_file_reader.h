@@ -67,6 +67,12 @@ struct IoBackend {
   IoUringRing ring{};
   io_context_t aio_ctx{nullptr};
 #elif defined(_WIN32) || defined(_WIN64)
+  enum class RequestMode {
+    kIdle,
+    kBatch,
+    kStreaming,
+  };
+
   struct IocpDiagnostics {
     uint64_t submit_calls{0};
     uint64_t submitted_reads{0};
@@ -80,12 +86,16 @@ struct IoBackend {
   };
 
   std::vector<OVERLAPPED> reqs;
+  std::vector<uint64_t> slot_expected_lengths;
+  std::vector<uint64_t> slot_tags;
+  std::vector<uint8_t> slot_active;
   HANDLE file_handle{INVALID_HANDLE_VALUE};
   HANDLE completion_port{nullptr};
   std::wstring file_path;
   uint32_t submitted_count{0};
   uint32_t outstanding_count{0};
   uint64_t generation{0};
+  RequestMode request_mode{RequestMode::kIdle};
   bool diagnostics_enabled{false};
   IocpDiagnostics diagnostics;
 #endif
@@ -100,6 +110,11 @@ int destroy_io_ctx(IOContext &ctx);
 // histogram collection. Set ZVEC_DISKANN_IO_DIAGNOSTICS=1 before starting the
 // process to enable them.
 bool diskann_io_diagnostics_enabled();
+
+// Experimental Windows-only rolling pipeline. It is deliberately opt-in
+// because processing nodes in completion order can change approximate-search
+// traversal and recall. Set ZVEC_DISKANN_IO_PIPELINE=1 to enable it.
+bool diskann_io_pipeline_enabled();
 
 // Log the current DiskAnn I/O backend (io_uring, libaio, or pread). Probes the
 // backend on first call. No-op outside Linux and macOS.
@@ -223,6 +238,14 @@ class WindowsAlignedFileReader : public AlignedFileReader {
              IOContext &ctx) override;
   int get_completed(PendingBatch &batch, IOContext &ctx, int min_completed,
                     std::vector<uint32_t> &completed_indices) override;
+
+  // Streaming requests may be added while earlier requests are still in
+  // flight. The caller-provided tag is returned with the completion so search
+  // buffers can be safely reused without exposing native OVERLAPPED slots.
+  int submit_streaming(const AlignedRead &read_req, uint64_t tag,
+                       IOContext &ctx);
+  int get_streaming_completed(IOContext &ctx, int min_completed,
+                              std::vector<uint64_t> &completed_tags);
 };
 #endif
 

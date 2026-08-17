@@ -301,6 +301,72 @@ TEST(DiskAnnFileReaderWindowsTest, CollectsIocpDiagnosticsWhenEnabled) {
   reader.deregister_thread();
 }
 
+TEST(DiskAnnFileReaderWindowsTest, StreamingReadsRefillActiveQueue) {
+  constexpr size_t kQueueDepth = 20;
+  constexpr size_t kTotalReads = 128;
+
+  TemporaryFile file;
+  ASSERT_TRUE(file.valid());
+  ASSERT_TRUE(file.write_pages());
+
+  WindowsAlignedFileReader reader;
+  reader.open(file.path());
+  reader.register_thread();
+
+  AlignedBuffer output = make_aligned_buffer(kPageSize * kQueueDepth);
+  ASSERT_NE(output, nullptr);
+  IOContext &ctx = reader.get_ctx();
+  ASSERT_NE(ctx, nullptr);
+  ASSERT_NE(ctx, reinterpret_cast<IOContext>(-1));
+  ctx->diagnostics_enabled = true;
+
+  std::vector<size_t> expected_pages(kQueueDepth);
+  auto submit_read = [&](size_t sequence, uint32_t buffer_index) {
+    const size_t page = (sequence * 37 + 17) % kPageCount;
+    expected_pages[buffer_index] = page;
+    AlignedRead request(page * kPageSize, kPageSize,
+                        output.get() + buffer_index * kPageSize);
+    return reader.submit_streaming(request, buffer_index, ctx);
+  };
+
+  size_t issued = 0;
+  for (; issued < kQueueDepth; ++issued) {
+    ASSERT_EQ(submit_read(issued, static_cast<uint32_t>(issued)), 0);
+  }
+  ASSERT_EQ(ctx->outstanding_count, kQueueDepth);
+  ASSERT_EQ(ctx->request_mode, IoBackend::RequestMode::kStreaming);
+
+  size_t completed_count = 0;
+  while (completed_count < kTotalReads) {
+    std::vector<uint64_t> completed_tags;
+    ASSERT_GT(reader.get_streaming_completed(ctx, 1, completed_tags), 0);
+    for (uint64_t tag : completed_tags) {
+      ASSERT_LT(tag, kQueueDepth);
+      const uint32_t buffer_index = static_cast<uint32_t>(tag);
+      ASSERT_TRUE(verify_page(output.get() + buffer_index * kPageSize,
+                              expected_pages[buffer_index]));
+      ++completed_count;
+      if (issued < kTotalReads) {
+        ASSERT_EQ(submit_read(issued, buffer_index), 0);
+        ++issued;
+      }
+    }
+  }
+
+  EXPECT_EQ(ctx->outstanding_count, 0U);
+  EXPECT_EQ(ctx->request_mode, IoBackend::RequestMode::kIdle);
+  EXPECT_EQ(ctx->diagnostics.submitted_reads, kTotalReads);
+  EXPECT_EQ(ctx->diagnostics.dequeued_reads, kTotalReads);
+  EXPECT_EQ(ctx->diagnostics.max_outstanding, kQueueDepth);
+
+  // A completed streaming sequence must leave the context reusable by the
+  // established batch API.
+  std::vector<AlignedRead> one_read{{0, kPageSize, output.get()}};
+  ASSERT_EQ(reader.read(one_read, ctx, false), 0);
+  EXPECT_TRUE(verify_page(output.get(), 0));
+  reader.deregister_thread();
+}
+
 TEST(DiskAnnFileReaderWindowsTest, RejectsMisalignedUnbufferedRead) {
   TemporaryFile file;
   ASSERT_TRUE(file.valid());

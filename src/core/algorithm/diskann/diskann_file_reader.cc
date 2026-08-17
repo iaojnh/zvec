@@ -94,6 +94,14 @@ bool diskann_io_diagnostics_enabled() {
   return enabled;
 }
 
+bool diskann_io_pipeline_enabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("ZVEC_DISKANN_IO_PIPELINE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 #if defined(_WIN32) || defined(_WIN64)
 // Cancel and reap every request that may still reference caller-owned buffers.
 // Closing the file or completion port before the cancellation packets have
@@ -153,6 +161,8 @@ static void close_windows_io_handles(IOContext ctx) {
   ctx->file_path.clear();
   ctx->submitted_count = 0;
   ctx->outstanding_count = 0;
+  ctx->request_mode = IoBackend::RequestMode::kIdle;
+  std::fill(ctx->slot_active.begin(), ctx->slot_active.end(), 0);
 }
 #endif
 
@@ -167,6 +177,9 @@ int setup_io_ctx(IOContext &ctx) {
 
 #if defined(_WIN32) || defined(_WIN64)
   ctx->reqs.resize(MAX_IO_DEPTH);
+  ctx->slot_expected_lengths.resize(MAX_IO_DEPTH);
+  ctx->slot_tags.resize(MAX_IO_DEPTH);
+  ctx->slot_active.assign(MAX_IO_DEPTH, 0);
   ctx->diagnostics_enabled = diskann_io_diagnostics_enabled();
   log_diskann_io_backend(ctx->type);
   return 0;
@@ -212,6 +225,9 @@ int destroy_io_ctx(IOContext &ctx) {
 #if defined(_WIN32) || defined(_WIN64)
   close_windows_io_handles(ctx);
   ctx->reqs.clear();
+  ctx->slot_expected_lengths.clear();
+  ctx->slot_tags.clear();
+  ctx->slot_active.clear();
 #elif defined(__linux) || defined(__linux__)
   if (ctx->type == ailego::IOBackendType::kIoUring) {
     ctx->ring.teardown();
@@ -1239,28 +1255,94 @@ void WindowsAlignedFileReader::reset_io_ctx(IOContext &ctx) {
   }
 }
 
+static int validate_windows_read_request(const AlignedRead &req,
+                                         size_t request_index) {
+  constexpr uint64_t kSectorLen = 4096;
+  if (req.buf == nullptr ||
+      reinterpret_cast<uintptr_t>(req.buf) % kSectorLen != 0 ||
+      req.offset % kSectorLen != 0 || req.len % kSectorLen != 0) {
+    LOG_ERROR(
+        "Invalid unbuffered read request %zu: buffer=%p, offset=%llu, "
+        "len=%llu; all values must be aligned to %llu bytes",
+        request_index, req.buf, static_cast<unsigned long long>(req.offset),
+        static_cast<unsigned long long>(req.len),
+        static_cast<unsigned long long>(kSectorLen));
+    return IndexError_InvalidArgument;
+  }
+  if (req.len > (std::numeric_limits<DWORD>::max)()) {
+    LOG_ERROR("Windows read request %zu is too large: %llu bytes",
+              request_index, static_cast<unsigned long long>(req.len));
+    return IndexError_InvalidArgument;
+  }
+  return 0;
+}
+
 static int validate_windows_read_requests(
     const std::vector<AlignedRead> &read_reqs) {
-  constexpr uint64_t kSectorLen = 4096;
   for (size_t i = 0; i < read_reqs.size(); ++i) {
-    const AlignedRead &req = read_reqs[i];
-    if (req.buf == nullptr ||
-        reinterpret_cast<uintptr_t>(req.buf) % kSectorLen != 0 ||
-        req.offset % kSectorLen != 0 || req.len % kSectorLen != 0) {
-      LOG_ERROR(
-          "Invalid unbuffered read request %zu: buffer=%p, offset=%llu, "
-          "len=%llu; all values must be aligned to %llu bytes",
-          i, req.buf, static_cast<unsigned long long>(req.offset),
-          static_cast<unsigned long long>(req.len),
-          static_cast<unsigned long long>(kSectorLen));
-      return IndexError_InvalidArgument;
-    }
-    if (req.len > (std::numeric_limits<DWORD>::max)()) {
-      LOG_ERROR("Windows read request %zu is too large: %llu bytes", i,
-                static_cast<unsigned long long>(req.len));
-      return IndexError_InvalidArgument;
+    int ret = validate_windows_read_request(read_reqs[i], i);
+    if (ret != 0) {
+      return ret;
     }
   }
+  return 0;
+}
+
+static void record_windows_submission(IOContext ctx, BOOL queued) {
+  if (!ctx->diagnostics_enabled) {
+    return;
+  }
+
+  ++ctx->diagnostics.submitted_reads;
+  if (queued) {
+    ++ctx->diagnostics.immediate_reads;
+  } else {
+    ++ctx->diagnostics.pending_reads;
+  }
+  ctx->diagnostics.max_outstanding =
+      std::max(ctx->diagnostics.max_outstanding, ctx->outstanding_count);
+}
+
+static int dequeue_windows_entries(IOContext ctx, OVERLAPPED_ENTRY *entries,
+                                   ULONG max_entries, ULONG &removed) {
+  std::chrono::steady_clock::time_point wait_start;
+  if (ctx->diagnostics_enabled) {
+    ++ctx->diagnostics.dequeue_calls;
+    wait_start = std::chrono::steady_clock::now();
+  }
+
+  BOOL dequeued = ::GetQueuedCompletionStatusEx(
+      ctx->completion_port, entries, max_entries, &removed, INFINITE, FALSE);
+  if (ctx->diagnostics_enabled) {
+    ctx->diagnostics.wait_us += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - wait_start)
+            .count());
+    ctx->diagnostics.dequeued_reads += removed;
+    ctx->diagnostics.max_dequeued_once = std::max(
+        ctx->diagnostics.max_dequeued_once, static_cast<uint32_t>(removed));
+  }
+  if (!dequeued || removed == 0) {
+    LOG_ERROR("GetQueuedCompletionStatusEx failed (error=%lu)",
+              ::GetLastError());
+    return IndexError_Runtime;
+  }
+  return 0;
+}
+
+static int windows_overlapped_index(IOContext ctx, OVERLAPPED *overlapped,
+                                    uint32_t slot_count, uint32_t &index) {
+  const uintptr_t address = reinterpret_cast<uintptr_t>(overlapped);
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(ctx->reqs.data());
+  const uintptr_t span =
+      static_cast<uintptr_t>(slot_count) * sizeof(OVERLAPPED);
+  if (address < begin || address >= begin + span ||
+      (address - begin) % sizeof(OVERLAPPED) != 0) {
+    LOG_ERROR("IOCP returned an unknown OVERLAPPED request");
+    return IndexError_Runtime;
+  }
+
+  index = static_cast<uint32_t>((address - begin) / sizeof(OVERLAPPED));
   return 0;
 }
 
@@ -1324,7 +1406,8 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
   if (ret != 0) {
     return ret;
   }
-  if (ctx->outstanding_count != 0 || ctx->submitted_count != 0) {
+  if (ctx->request_mode != IoBackend::RequestMode::kIdle ||
+      ctx->outstanding_count != 0 || ctx->submitted_count != 0) {
     LOG_ERROR("Windows I/O context already has an active batch");
     return IndexError_Runtime;
   }
@@ -1336,6 +1419,7 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
   batch.generation = ctx->generation;
   batch.expected_lengths.reserve(read_reqs.size());
   batch.completed.assign(read_reqs.size(), 0);
+  ctx->request_mode = IoBackend::RequestMode::kBatch;
 
   if (ctx->diagnostics_enabled) {
     ++ctx->diagnostics.submit_calls;
@@ -1368,16 +1452,7 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
     ++issued_count;
     ctx->submitted_count = issued_count;
     ctx->outstanding_count = issued_count;
-    if (ctx->diagnostics_enabled) {
-      ++ctx->diagnostics.submitted_reads;
-      if (queued) {
-        ++ctx->diagnostics.immediate_reads;
-      } else {
-        ++ctx->diagnostics.pending_reads;
-      }
-      ctx->diagnostics.max_outstanding =
-          std::max(ctx->diagnostics.max_outstanding, ctx->outstanding_count);
-    }
+    record_windows_submission(ctx, queued);
   }
 
   batch.n_submitted = issued_count;
@@ -1394,6 +1469,7 @@ int WindowsAlignedFileReader::get_completed(
   if (ctx == nullptr || ctx == reinterpret_cast<IOContext>(-1) ||
       ctx->completion_port == nullptr || batch.generation == 0 ||
       batch.generation != ctx->generation ||
+      ctx->request_mode != IoBackend::RequestMode::kBatch ||
       batch.expected_lengths.size() != batch.n_submitted ||
       batch.completed.size() != batch.n_submitted ||
       ctx->outstanding_count != batch.n_submitted - batch.n_reaped) {
@@ -1412,25 +1488,7 @@ int WindowsAlignedFileReader::get_completed(
     ULONG removed = 0;
     const ULONG max_entries = static_cast<ULONG>(std::min<uint32_t>(
         ctx->outstanding_count, static_cast<uint32_t>(MAX_IO_DEPTH)));
-    std::chrono::steady_clock::time_point wait_start;
-    if (ctx->diagnostics_enabled) {
-      ++ctx->diagnostics.dequeue_calls;
-      wait_start = std::chrono::steady_clock::now();
-    }
-    BOOL dequeued = ::GetQueuedCompletionStatusEx(
-        ctx->completion_port, entries, max_entries, &removed, INFINITE, FALSE);
-    if (ctx->diagnostics_enabled) {
-      ctx->diagnostics.wait_us += static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - wait_start)
-              .count());
-      ctx->diagnostics.dequeued_reads += removed;
-      ctx->diagnostics.max_dequeued_once = std::max(
-          ctx->diagnostics.max_dequeued_once, static_cast<uint32_t>(removed));
-    }
-    if (!dequeued || removed == 0) {
-      LOG_ERROR("GetQueuedCompletionStatusEx failed (error=%lu)",
-                ::GetLastError());
+    if (dequeue_windows_entries(ctx, entries, max_entries, removed) != 0) {
       reset_io_ctx(ctx);
       batch.n_reaped = batch.n_submitted;
       completed_indices.clear();
@@ -1452,20 +1510,12 @@ int WindowsAlignedFileReader::get_completed(
         continue;
       }
 
-      const uintptr_t address =
-          reinterpret_cast<uintptr_t>(entries[i].lpOverlapped);
-      const uintptr_t begin = reinterpret_cast<uintptr_t>(ctx->reqs.data());
-      const uintptr_t span =
-          static_cast<uintptr_t>(batch.n_submitted) * sizeof(OVERLAPPED);
-      if (address < begin || address >= begin + span ||
-          (address - begin) % sizeof(OVERLAPPED) != 0) {
-        LOG_ERROR("IOCP returned an unknown OVERLAPPED request");
+      uint32_t index = 0;
+      if (windows_overlapped_index(ctx, entries[i].lpOverlapped,
+                                   batch.n_submitted, index) != 0) {
         completion_error = true;
         continue;
       }
-
-      const uint32_t index =
-          static_cast<uint32_t>((address - begin) / sizeof(OVERLAPPED));
       if (batch.completed[index] != 0) {
         LOG_ERROR("IOCP returned duplicate completion for request %u", index);
         completion_error = true;
@@ -1503,8 +1553,159 @@ int WindowsAlignedFileReader::get_completed(
 
   if (ctx->outstanding_count == 0) {
     ctx->submitted_count = 0;
+    ctx->request_mode = IoBackend::RequestMode::kIdle;
   }
   return static_cast<int>(completed_indices.size());
+}
+
+int WindowsAlignedFileReader::submit_streaming(const AlignedRead &read_req,
+                                               uint64_t tag, IOContext &ctx) {
+  int ret = validate_windows_read_request(read_req, 0);
+  if (ret != 0) {
+    return ret;
+  }
+  ret = prepare_io_ctx(ctx);
+  if (ret != 0) {
+    return ret;
+  }
+  if (ctx->request_mode == IoBackend::RequestMode::kBatch) {
+    LOG_ERROR("Cannot stream a Windows read while a batch is active");
+    return IndexError_Runtime;
+  }
+  if (ctx->outstanding_count >= MAX_IO_DEPTH) {
+    LOG_ERROR("Windows IOCP streaming queue is full");
+    return IndexError_Runtime;
+  }
+
+  uint32_t slot = MAX_IO_DEPTH;
+  for (uint32_t i = 0; i < MAX_IO_DEPTH; ++i) {
+    if (ctx->slot_active[i] == 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == MAX_IO_DEPTH) {
+    LOG_ERROR("Windows IOCP streaming queue has no free request slot");
+    return IndexError_Runtime;
+  }
+
+  if (ctx->diagnostics_enabled) {
+    ++ctx->diagnostics.submit_calls;
+  }
+
+  OVERLAPPED &request = ctx->reqs[slot];
+  request = OVERLAPPED{};
+  request.Offset = static_cast<DWORD>(read_req.offset & 0xffffffffULL);
+  request.OffsetHigh = static_cast<DWORD>(read_req.offset >> 32);
+
+  BOOL queued = ::ReadFile(ctx->file_handle, read_req.buf,
+                           static_cast<DWORD>(read_req.len), nullptr, &request);
+  DWORD read_error = queued ? ERROR_SUCCESS : ::GetLastError();
+  if (!queued && read_error != ERROR_IO_PENDING) {
+    LOG_ERROR("Error queuing streaming IOCP read (error=%lu)", read_error);
+    reset_io_ctx(ctx);
+    return IndexError_Runtime;
+  }
+
+  ctx->slot_expected_lengths[slot] = read_req.len;
+  ctx->slot_tags[slot] = tag;
+  ctx->slot_active[slot] = 1;
+  ++ctx->outstanding_count;
+  ctx->request_mode = IoBackend::RequestMode::kStreaming;
+  record_windows_submission(ctx, queued);
+  return 0;
+}
+
+int WindowsAlignedFileReader::get_streaming_completed(
+    IOContext &ctx, int min_completed, std::vector<uint64_t> &completed_tags) {
+  completed_tags.clear();
+  if (ctx == nullptr || ctx == reinterpret_cast<IOContext>(-1) ||
+      ctx->completion_port == nullptr ||
+      ctx->request_mode != IoBackend::RequestMode::kStreaming ||
+      ctx->outstanding_count == 0 ||
+      ctx->slot_expected_lengths.size() != MAX_IO_DEPTH ||
+      ctx->slot_tags.size() != MAX_IO_DEPTH ||
+      ctx->slot_active.size() != MAX_IO_DEPTH) {
+    LOG_ERROR("Invalid Windows IOCP streaming context");
+    reset_io_ctx(ctx);
+    return IndexError_Runtime;
+  }
+
+  const uint32_t target =
+      std::min<uint32_t>(ctx->outstanding_count,
+                         static_cast<uint32_t>(std::max(min_completed, 1)));
+  while (completed_tags.size() < target) {
+    OVERLAPPED_ENTRY entries[MAX_IO_DEPTH]{};
+    ULONG removed = 0;
+    const ULONG max_entries = static_cast<ULONG>(std::min<uint32_t>(
+        ctx->outstanding_count, static_cast<uint32_t>(MAX_IO_DEPTH)));
+    if (dequeue_windows_entries(ctx, entries, max_entries, removed) != 0) {
+      reset_io_ctx(ctx);
+      completed_tags.clear();
+      return IndexError_Runtime;
+    }
+
+    bool completion_error = false;
+    for (ULONG i = 0; i < removed; ++i) {
+      if (ctx->outstanding_count == 0) {
+        LOG_ERROR("IOCP returned more streaming completions than requests");
+        completion_error = true;
+      } else {
+        --ctx->outstanding_count;
+      }
+
+      if (entries[i].lpCompletionKey != reinterpret_cast<ULONG_PTR>(ctx)) {
+        LOG_ERROR("IOCP returned a streaming completion for another context");
+        completion_error = true;
+        continue;
+      }
+
+      uint32_t slot = 0;
+      if (windows_overlapped_index(ctx, entries[i].lpOverlapped, MAX_IO_DEPTH,
+                                   slot) != 0) {
+        completion_error = true;
+        continue;
+      }
+      if (ctx->slot_active[slot] == 0) {
+        LOG_ERROR("IOCP returned a duplicate streaming completion for slot %u",
+                  slot);
+        completion_error = true;
+        continue;
+      }
+
+      DWORD bytes_transferred = 0;
+      if (!::GetOverlappedResult(ctx->file_handle, &ctx->reqs[slot],
+                                 &bytes_transferred, FALSE)) {
+        LOG_ERROR("Streaming IOCP read %u failed (error=%lu)", slot,
+                  ::GetLastError());
+        completion_error = true;
+      } else if (static_cast<uint64_t>(bytes_transferred) !=
+                 ctx->slot_expected_lengths[slot]) {
+        LOG_ERROR(
+            "Streaming IOCP read %u completed with %lu bytes, expected %llu",
+            slot, static_cast<unsigned long>(bytes_transferred),
+            static_cast<unsigned long long>(ctx->slot_expected_lengths[slot]));
+        completion_error = true;
+      }
+
+      const uint64_t tag = ctx->slot_tags[slot];
+      ctx->slot_active[slot] = 0;
+      if (!completion_error) {
+        completed_tags.push_back(tag);
+      }
+    }
+
+    if (completion_error) {
+      reset_io_ctx(ctx);
+      completed_tags.clear();
+      return IndexError_Runtime;
+    }
+  }
+
+  if (ctx->outstanding_count == 0) {
+    ctx->request_mode = IoBackend::RequestMode::kIdle;
+  }
+  return static_cast<int>(completed_tags.size());
 }
 
 #endif  // Windows/POSIX reader implementation

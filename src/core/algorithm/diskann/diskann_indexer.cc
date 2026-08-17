@@ -869,6 +869,165 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
     stats.record_query(effective_beam_width);
   }
 
+  auto process_node = [&](diskann_id_t node_id, void *node_fp_coords,
+                          uint32_t neighbor_num, diskann_id_t *node_neighbors,
+                          bool count_candidate_insertions) {
+    float cur_expanded_dist = dc.dist(ctx->query(), node_fp_coords);
+
+    if (!ctx->filter().is_valid() || !ctx->filter()(get_key(node_id))) {
+      topk_heap.emplace(node_id, VectorInfo(cur_expanded_dist,
+                                            make_vector_copy(node_fp_coords)));
+    }
+
+    cpu_timer.reset();
+    std::vector<float> distances(neighbor_num);
+    pq_table_->compute_dists(neighbor_num, node_neighbors, pq_chunk_num_,
+                             ctx->pq_table_dist_buffer(),
+                             ctx->pq_coord_buffer(), distances.data());
+    stats.dist_num += neighbor_num;
+    stats.cpu_us += cpu_timer.micro_seconds();
+
+    if (count_candidate_insertions) {
+      cpu_timer.reset();
+    }
+    for (uint64_t i = 0; i < neighbor_num; ++i) {
+      diskann_id_t id = node_neighbors[i];
+      if (!visit_filter.visited(id)) {
+        visit_filter.set_visited(id);
+        if (count_candidate_insertions) {
+          stats.dist_num++;
+        }
+        candidates.insert(Neighbor(id, distances[i]));
+      }
+    }
+    if (count_candidate_insertions) {
+      stats.cpu_us += cpu_timer.micro_seconds();
+    }
+  };
+
+#if defined(_WIN32) || defined(_WIN64)
+  if (ctx->io_pipeline_enabled()) {
+    std::vector<diskann_id_t> in_flight_ids(effective_beam_width);
+    std::vector<uint8_t> in_flight(effective_beam_width, 0);
+    std::vector<uint32_t> free_buffers;
+    free_buffers.reserve(effective_beam_width);
+    for (uint32_t i = effective_beam_width; i > 0; --i) {
+      free_buffers.push_back(i - 1);
+    }
+
+    uint32_t outstanding = 0;
+    auto fill_pipeline = [&]() -> int {
+      uint32_t submitted = 0;
+      while (outstanding < effective_beam_width && num_ios < io_limit_ &&
+             candidates.has_unexpanded_node()) {
+        auto neighbor = candidates.closest_unexpanded();
+        auto cache_iter = neighbor_cache_.find(neighbor.id);
+        if (cache_iter != neighbor_cache_.end()) {
+          auto coord_iter = coord_cache_.find(neighbor.id);
+          process_node(neighbor.id, coord_iter->second,
+                       cache_iter->second.first, cache_iter->second.second,
+                       false);
+          stats.cache_hits++;
+          continue;
+        }
+
+        if (free_buffers.empty()) {
+          LOG_ERROR("DiskAnn rolling pipeline has no free sector buffer");
+          return IndexError_Runtime;
+        }
+        uint32_t buffer_index = free_buffers.back();
+        free_buffers.pop_back();
+        uint8_t *buffer = sector_buffer + sector_num_per_node * buffer_index *
+                                              DiskAnnUtil::kSectorSize;
+        AlignedRead read_req(
+            index_segment_offset_ + DiskAnnUtil::get_node_sector(
+                                        node_per_sector_, max_node_size_,
+                                        DiskAnnUtil::kSectorSize, neighbor.id) *
+                                        DiskAnnUtil::kSectorSize,
+            sector_num_per_node * DiskAnnUtil::kSectorSize, buffer);
+
+        io_timer.reset();
+        int ret = reader_->submit_streaming(read_req, buffer_index, io_ctx);
+        stats.io_us += io_timer.micro_seconds();
+        if (ret != 0) {
+          LOG_ERROR("DiskAnn rolling submit failed, ret=%d", ret);
+          return ret;
+        }
+
+        in_flight_ids[buffer_index] = neighbor.id;
+        in_flight[buffer_index] = 1;
+        ++outstanding;
+        ++submitted;
+        ++num_ios;
+        ++stats.disk_page_reads;
+        ++stats.io_num;
+      }
+
+      if (submitted != 0) {
+        ++stats.hop_num;
+        if (ctx->io_diagnostics_enabled()) {
+          stats.record_io_batch(submitted);
+        }
+      }
+      return 0;
+    };
+
+    std::vector<uint64_t> completed_tags;
+    completed_tags.reserve(effective_beam_width);
+    while ((num_ios < io_limit_ && candidates.has_unexpanded_node()) ||
+           outstanding != 0) {
+      int ret = fill_pipeline();
+      if (ret != 0) {
+        ctx->set_error(true);
+        return ret;
+      }
+      if (outstanding == 0) {
+        break;
+      }
+
+      io_timer.reset();
+      int completed =
+          reader_->get_streaming_completed(io_ctx, 1, completed_tags);
+      stats.io_us += io_timer.micro_seconds();
+      if (completed < 0) {
+        LOG_ERROR("DiskAnn rolling completion failed, ret=%d", completed);
+        ctx->set_error(true);
+        return completed;
+      }
+
+      for (uint64_t tag : completed_tags) {
+        if (tag >= in_flight.size() || in_flight[tag] == 0 ||
+            outstanding == 0) {
+          LOG_ERROR("DiskAnn rolling completion has an invalid tag: %llu",
+                    static_cast<unsigned long long>(tag));
+          ctx->set_error(true);
+          return IndexError_Runtime;
+        }
+
+        const uint32_t buffer_index = static_cast<uint32_t>(tag);
+        const diskann_id_t node_id = in_flight_ids[buffer_index];
+        uint8_t *buffer = sector_buffer + sector_num_per_node * buffer_index *
+                                              DiskAnnUtil::kSectorSize;
+        uint8_t *node_disk_buf = DiskAnnUtil::offset_to_node(
+            node_per_sector_, max_node_size_, buffer, node_id);
+        uint32_t *node_buf = DiskAnnUtil::offset_to_node_neighbor(
+            node_disk_buf, meta_.element_size());
+        const uint32_t neighbor_num = *node_buf;
+        auto *node_neighbors = reinterpret_cast<diskann_id_t *>(node_buf + 1);
+
+        process_node(node_id, node_disk_buf, neighbor_num, node_neighbors,
+                     true);
+        in_flight[buffer_index] = 0;
+        free_buffers.push_back(buffer_index);
+        --outstanding;
+      }
+    }
+
+    stats.total_us += query_timer.micro_seconds();
+    return 0;
+  }
+#endif
+
   std::vector<diskann_id_t> frontier;
   frontier.reserve(2 * effective_beam_width);
 
@@ -953,37 +1112,9 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
     for (auto &cached_neighbor : cached_neighbors) {
       auto global_cache_iter = coord_cache_.find(std::get<0>(cached_neighbor));
       void *node_fp_coords_copy = global_cache_iter->second;
-
-      float cur_expanded_dist = dc.dist(ctx->query(), node_fp_coords_copy);
-
-      if (!ctx->filter().is_valid() ||
-          !ctx->filter()(get_key(std::get<0>(cached_neighbor)))) {
-        topk_heap.emplace(std::get<0>(cached_neighbor),
-                          VectorInfo(cur_expanded_dist,
-                                     make_vector_copy(node_fp_coords_copy)));
-      }
-
-      uint32_t neighbor_num = std::get<1>(cached_neighbor);
-      diskann_id_t *node_neighbors = std::get<2>(cached_neighbor);
-
-      cpu_timer.reset();
-
-      std::vector<float> distances(neighbor_num);
-      pq_table_->compute_dists(neighbor_num, node_neighbors, pq_chunk_num_,
-                               ctx->pq_table_dist_buffer(),
-                               ctx->pq_coord_buffer(), distances.data());
-
-      stats.dist_num += neighbor_num;
-      stats.cpu_us += cpu_timer.micro_seconds();
-
-      for (uint64_t m = 0; m < neighbor_num; ++m) {
-        diskann_id_t id = node_neighbors[m];
-        if (!visit_filter.visited(id)) {
-          visit_filter.set_visited(id);
-          Neighbor nn(id, distances[m]);
-          candidates.insert(nn);
-        }
-      }
+      process_node(std::get<0>(cached_neighbor), node_fp_coords_copy,
+                   std::get<1>(cached_neighbor), std::get<2>(cached_neighbor),
+                   false);
     }
 
     if (!frontier.empty()) {
@@ -1008,41 +1139,10 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
               node_disk_buf, meta_.element_size());
           uint32_t neighbor_num = *node_buf;
 
-          void *node_fp_coords = node_disk_buf;
-
-          float cur_expanded_dist = dc.dist(ctx->query(), node_fp_coords);
-
-          if (!ctx->filter().is_valid() ||
-              !ctx->filter()(get_key(frontier_neighbor.first))) {
-            topk_heap.emplace(frontier_neighbor.first,
-                              VectorInfo(cur_expanded_dist,
-                                         make_vector_copy(node_fp_coords)));
-          }
-
           diskann_id_t *node_neighbors =
               reinterpret_cast<diskann_id_t *>(node_buf + 1);
-
-          cpu_timer.reset();
-          std::vector<float> distances(neighbor_num);
-          pq_table_->compute_dists(neighbor_num, node_neighbors, pq_chunk_num_,
-                                   ctx->pq_table_dist_buffer(),
-                                   ctx->pq_coord_buffer(), distances.data());
-
-          stats.dist_num += neighbor_num;
-          stats.cpu_us += cpu_timer.micro_seconds();
-
-          cpu_timer.reset();
-          for (uint64_t m = 0; m < neighbor_num; ++m) {
-            diskann_id_t id = node_neighbors[m];
-            if (!visit_filter.visited(id)) {
-              visit_filter.set_visited(id);
-              stats.dist_num++;
-              Neighbor nn(id, distances[m]);
-              candidates.insert(nn);
-            }
-          }
-
-          stats.cpu_us += cpu_timer.micro_seconds();
+          process_node(frontier_neighbor.first, node_disk_buf, neighbor_num,
+                       node_neighbors, true);
         }
       }
     }
