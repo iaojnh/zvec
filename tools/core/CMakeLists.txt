@@ -1,6 +1,15 @@
 include(${PROJECT_ROOT_DIR}/cmake/bazel.cmake)
 include(${PROJECT_ROOT_DIR}/cmake/option.cmake)
 
+if(WIN32)
+    cc_binary(
+        NAME diskann_iocp_bench
+        STRICT PACKED
+        SRCS diskann_iocp_bench.cc
+        DEFS NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601
+    )
+endif()
+
 cc_binary(
     NAME txt2vecs
     STRICT PACKED
