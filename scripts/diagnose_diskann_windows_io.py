@@ -386,13 +386,87 @@ def random_batched_interpretation(
     return lines
 
 
+def reader_buffer_interpretation(
+    rows: Sequence[dict[str, str]], search_metrics: dict[str, str]
+) -> list[str]:
+    mode_labels = {
+        "reader_virtual_compact": "VirtualAlloc compact",
+        "reader_virtual_context": "VirtualAlloc 512 KiB",
+        "reader_aligned_compact": "_aligned_malloc compact",
+        "reader_aligned_context": "_aligned_malloc 512 KiB",
+    }
+    reader_rows = {mode: best_row(rows, mode) for mode in mode_labels}
+    missing = [mode for mode, row in reader_rows.items() if row is None]
+    if missing:
+        return [
+            (
+                "- Reader destination-buffer allocation matrix is incomplete; "
+                "rebuild the IOCP benchmark without `--skip-build`."
+            )
+        ]
+
+    measured = {mode: row for mode, row in reader_rows.items() if row is not None}
+    compact = measured["reader_virtual_compact"]
+    context = measured["reader_aligned_context"]
+    compact_batch_ms = float(compact["batch_duration_ms"])
+    context_batch_ms = float(context["batch_duration_ms"])
+    allocation_ratio = context_batch_ms / compact_batch_ms
+    slowest_mode, slowest = max(
+        measured.items(), key=lambda item: float(item[1]["batch_duration_ms"])
+    )
+    fastest_mode, fastest = min(
+        measured.items(), key=lambda item: float(item[1]["batch_duration_ms"])
+    )
+    spread = float(slowest["batch_duration_ms"]) / float(fastest["batch_duration_ms"])
+    lines = [
+        (
+            "- The search-equivalent `_aligned_malloc` 512 KiB buffer takes "
+            f"**{context_batch_ms:.2f} ms/batch**, or "
+            f"**{allocation_ratio:.1f}x** the VirtualAlloc compact buffer "
+            f"(**{compact_batch_ms:.2f} ms/batch**)."
+        ),
+        (
+            f"- Across all four buffer variants, the slowest is "
+            f"**{mode_labels[slowest_mode]}** and the fastest is "
+            f"**{mode_labels[fastest_mode]}**; batch latency spread is "
+            f"**{spread:.1f}x**."
+        ),
+    ]
+
+    search_batch_us = search_metrics.get("batch_duration_us")
+    if search_batch_us is None:
+        return lines
+    search_batch_ms = float(search_batch_us) / 1000.0
+    search_ratio = context_batch_ms / search_batch_ms
+    if 0.7 <= search_ratio <= 1.3:
+        lines.append(
+            f"- The search-equivalent buffer reproduces **{search_ratio:.0%}** "
+            "of full-search batch latency; buffer allocation is the leading "
+            "cause and should be changed in `DiskAnnContext`."
+        )
+    elif allocation_ratio >= 1.5:
+        lines.append(
+            f"- Buffer allocation is material but reproduces only "
+            f"**{search_ratio:.0%}** of full-search batch latency; it explains "
+            "part, but not all, of the loss."
+        )
+    else:
+        lines.append(
+            f"- The search-equivalent buffer reproduces only "
+            f"**{search_ratio:.0%}** of full-search batch latency. Allocation "
+            "API and reserved size are ruled out; the next diagnostic must "
+            "replay inside `bench_original` with the actual `DiskAnnContext`."
+        )
+    return lines
+
+
 def interpretation(
     rows: Sequence[dict[str, str]], search_runs: dict[str, dict[str, str]]
 ) -> list[str]:
     uniform = best_row(rows, "uniform")
     continuous = best_row(rows, "trace_continuous")
     batched = best_row(rows, "trace_batched")
-    reader = best_row(rows, "reader_batched")
+    reader = best_row(rows, "reader_virtual_compact")
     if uniform is None or continuous is None or batched is None or reader is None:
         return ["- Not enough replay modes were produced for comparison."]
 
@@ -430,6 +504,7 @@ def interpretation(
     lines.extend(
         random_batched_interpretation(random_batched, batched, search_baseline)
     )
+    lines.extend(reader_buffer_interpretation(rows, search_baseline))
     if random_batched is not None:
         lines.extend(
             gap_interpretation(
@@ -621,8 +696,15 @@ def write_results(
                 "CPU-busy inter-batch delay."
             ),
             (
-                "- `reader_batched`: the same batches replayed through the "
-                "project's `WindowsAlignedFileReader`."
+                "- `reader_virtual_compact` / `reader_virtual_context`: the "
+                "same batches replayed through `WindowsAlignedFileReader` "
+                "using `VirtualAlloc`, with a compact buffer or the 512 KiB "
+                "DiskANN context size."
+            ),
+            (
+                "- `reader_aligned_compact` / `reader_aligned_context`: the "
+                "same reader replay using `_aligned_malloc`; the context "
+                "variant matches DiskANN's search allocator and size."
             ),
             "",
             "## Interpretation",

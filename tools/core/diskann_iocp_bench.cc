@@ -30,10 +30,15 @@
 #include <type_traits>
 #include <vector>
 #include "diskann_file_reader.h"
+#include "diskann_util.h"
 
 namespace {
 
-constexpr uint32_t kRequiredAlignment = 4096;
+constexpr uint32_t kRequiredAlignment =
+    static_cast<uint32_t>(zvec::core::DiskAnnUtil::kSectorSize);
+constexpr size_t kDiskAnnContextBufferSize =
+    static_cast<size_t>(zvec::core::DiskAnnUtil::kMaxSectorReadNum) *
+    zvec::core::DiskAnnUtil::kSectorSize;
 
 class UniqueHandle {
  public:
@@ -86,6 +91,51 @@ class VirtualBuffer {
   }
 
  private:
+  void *data_;
+};
+
+enum class BufferAllocator { kVirtual, kAlignedHeap };
+
+class ReaderBuffer {
+ public:
+  ReaderBuffer(size_t size, BufferAllocator allocator)
+      : allocator_(allocator), data_(nullptr) {
+    if (allocator_ == BufferAllocator::kVirtual) {
+      data_ = ::VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE,
+                             PAGE_READWRITE);
+      if (data_ == nullptr) {
+        throw std::runtime_error("VirtualAlloc failed with error " +
+                                 std::to_string(::GetLastError()));
+      }
+      return;
+    }
+
+    zvec::core::DiskAnnUtil::alloc_aligned(&data_, size, kRequiredAlignment);
+    if (data_ == nullptr) {
+      throw std::runtime_error("_aligned_malloc failed");
+    }
+  }
+
+  ~ReaderBuffer() {
+    if (data_ == nullptr) {
+      return;
+    }
+    if (allocator_ == BufferAllocator::kVirtual) {
+      ::VirtualFree(data_, 0, MEM_RELEASE);
+    } else {
+      zvec::core::DiskAnnUtil::free_aligned(data_);
+    }
+  }
+
+  ReaderBuffer(const ReaderBuffer &) = delete;
+  ReaderBuffer &operator=(const ReaderBuffer &) = delete;
+
+  unsigned char *data() {
+    return static_cast<unsigned char *>(data_);
+  }
+
+ private:
+  BufferAllocator allocator_;
   void *data_;
 };
 
@@ -347,7 +397,7 @@ void print_usage() {
       << "  --batch-gaps-us LIST         Comma-separated busy gaps between "
          "trace batches (default: 0)\n"
       << "  --reader-replay              Replay trace through the project's "
-         "WindowsAlignedFileReader\n"
+         "WindowsAlignedFileReader with four buffer allocations\n"
       << "  --random-batched             Replay trace batch shapes with fresh "
          "random offsets\n"
       << "  --seed VALUE                 Random seed\n"
@@ -1008,7 +1058,7 @@ class ScopedDiskAnnIoContext {
 void replay_reader_batches_until(zvec::core::WindowsAlignedFileReader &reader,
                                  zvec::core::IOContext &context,
                                  uint64_t deadline, uint64_t frequency,
-                                 const TraceData &trace, VirtualBuffer &buffer,
+                                 const TraceData &trace, unsigned char *buffer,
                                  size_t &batch_index, RunResult *result) {
   std::vector<zvec::core::AlignedRead> read_requests;
   read_requests.reserve(trace.max_batch_size);
@@ -1023,7 +1073,7 @@ void replay_reader_batches_until(zvec::core::WindowsAlignedFileReader &reader,
       const ReadSpec &spec = batch.reads[index];
       read_requests.emplace_back(
           spec.offset, spec.length,
-          buffer.data() + static_cast<size_t>(index) * trace.max_length);
+          buffer + static_cast<size_t>(index) * trace.max_length);
     }
 
     const uint64_t batch_started = counter_now();
@@ -1068,9 +1118,12 @@ void replay_reader_batches_until(zvec::core::WindowsAlignedFileReader &reader,
 }
 
 RunResult run_reader_batched_benchmark(const Options &options,
-                                       const TraceData &trace) {
+                                       const TraceData &trace,
+                                       const std::string &mode,
+                                       BufferAllocator allocator,
+                                       size_t buffer_size) {
   RunResult result;
-  result.mode = "reader_batched";
+  result.mode = mode;
   result.random_access_hint = true;
   result.max_batch_size = trace.max_batch_size;
   const size_t expected_completions = std::min<size_t>(
@@ -1094,8 +1147,14 @@ RunResult run_reader_batched_benchmark(const Options &options,
     }
   }
 
-  VirtualBuffer buffer(static_cast<size_t>(trace.max_batch_size) *
-                       trace.max_length);
+  const size_t required_size = static_cast<size_t>(trace.max_batch_size) *
+                               static_cast<size_t>(trace.max_length);
+  if (buffer_size < required_size) {
+    throw std::runtime_error(
+        "Reader replay buffer is smaller than the largest "
+        "captured batch");
+  }
+  ReaderBuffer buffer(buffer_size, allocator);
   zvec::core::WindowsAlignedFileReader reader;
   reader.open(wide_to_utf8(options.file_path));
   ScopedDiskAnnIoContext scoped_context;
@@ -1107,7 +1166,7 @@ RunResult run_reader_batched_benchmark(const Options &options,
   const uint64_t warmup_deadline =
       counter_now() + static_cast<uint64_t>(options.warmup_seconds) * frequency;
   replay_reader_batches_until(reader, context, warmup_deadline, frequency,
-                              trace, buffer, batch_index, nullptr);
+                              trace, buffer.data(), batch_index, nullptr);
 
   context->diagnostics = zvec::core::IoBackend::IocpDiagnostics{};
   context->diagnostics_enabled = true;
@@ -1116,7 +1175,7 @@ RunResult run_reader_batched_benchmark(const Options &options,
       measurement_start +
       static_cast<uint64_t>(options.duration_seconds) * frequency;
   replay_reader_batches_until(reader, context, measurement_deadline, frequency,
-                              trace, buffer, batch_index, &result);
+                              trace, buffer.data(), batch_index, &result);
   const uint64_t measurement_end = counter_now();
   result.elapsed_seconds =
       static_cast<double>(measurement_end - measurement_start) /
@@ -1292,7 +1351,24 @@ int wmain(int argc, wchar_t **argv) {
       }
     }
     if (options.reader_replay) {
-      print_result(run_reader_batched_benchmark(options, trace));
+      const size_t compact_size = static_cast<size_t>(trace.max_batch_size) *
+                                  static_cast<size_t>(trace.max_length);
+      if (compact_size > kDiskAnnContextBufferSize) {
+        throw std::runtime_error(
+            "Captured batch exceeds the DiskAnnContext 512 KiB buffer");
+      }
+      print_result(run_reader_batched_benchmark(
+          options, trace, "reader_virtual_compact", BufferAllocator::kVirtual,
+          compact_size));
+      print_result(run_reader_batched_benchmark(
+          options, trace, "reader_virtual_context", BufferAllocator::kVirtual,
+          kDiskAnnContextBufferSize));
+      print_result(run_reader_batched_benchmark(
+          options, trace, "reader_aligned_compact",
+          BufferAllocator::kAlignedHeap, compact_size));
+      print_result(run_reader_batched_benchmark(
+          options, trace, "reader_aligned_context",
+          BufferAllocator::kAlignedHeap, kDiskAnnContextBufferSize));
     }
   } catch (const std::exception &error) {
     std::cerr << "ERROR: " << error.what() << '\n';
