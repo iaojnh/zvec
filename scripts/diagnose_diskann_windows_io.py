@@ -25,8 +25,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Build the Windows DiskANN diagnostic tools, capture the real "
             "search I/O trace, compare interleaved and drain-first completion "
-            "processing, and replay the trace with continuous and original "
-            "batch scheduling."
+            "processing, and compare repeated-trace and fresh-random offsets "
+            "under the original batch scheduling."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -284,9 +284,13 @@ def best_row(rows: Sequence[dict[str, str]], mode: str) -> dict[str, str] | None
 
 
 def gap_interpretation(
-    rows: Sequence[dict[str, str]], baseline: dict[str, str]
+    rows: Sequence[dict[str, str]],
+    baseline: dict[str, str],
+    *,
+    gapped_mode: str,
+    label: str,
 ) -> list[str]:
-    gapped_rows = [row for row in rows if row["mode"] == "trace_gapped"]
+    gapped_rows = [row for row in rows if row["mode"] == gapped_mode]
     baseline_batch_ms = float(baseline["batch_duration_ms"])
     if not gapped_rows or baseline_batch_ms <= 0.0:
         return []
@@ -298,7 +302,7 @@ def gap_interpretation(
     worst_actual_gap = float(worst["actual_gap_us"])
     lines = [
         (
-            f"- The largest gapped-replay batch duration is "
+            f"- The largest {label} gapped batch duration is "
             f"**{worst_batch_ms:.2f} ms** at **{worst_gap} us** requested "
             f"gap (**{worst_actual_gap:.1f} us** actual), or "
             f"**{worst_ratio:.1f}x** the zero-gap replay."
@@ -338,6 +342,50 @@ def gap_interpretation(
     return lines
 
 
+def random_batched_interpretation(
+    random_batched: dict[str, str] | None,
+    trace_batched: dict[str, str],
+    search_metrics: dict[str, str],
+) -> list[str]:
+    if random_batched is None:
+        return ["- Fresh-random batched replay was not produced."]
+
+    random_batch_ms = float(random_batched["batch_duration_ms"])
+    trace_batch_ms = float(trace_batched["batch_duration_ms"])
+    trace_ratio = random_batch_ms / trace_batch_ms
+    lines = [
+        (
+            f"- Fresh-random zero-gap batches take **{random_batch_ms:.2f} "
+            f"ms**, or **{trace_ratio:.1f}x** repeated-trace batches."
+        )
+    ]
+    search_batch_us = search_metrics.get("batch_duration_us")
+    if search_batch_us is None:
+        return lines
+
+    search_batch_ms = float(search_batch_us) / 1000.0
+    search_ratio = random_batch_ms / search_batch_ms
+    if 0.7 <= search_ratio <= 1.3:
+        lines.append(
+            f"- Fresh-random batching reproduces **{search_ratio:.0%}** of "
+            "full-search batch latency; repeated-offset cache warmth is the "
+            "leading explanation."
+        )
+    elif search_ratio < 0.5:
+        lines.append(
+            f"- Fresh-random batching reproduces only **{search_ratio:.0%}** "
+            "of full-search batch latency; address warmth is not sufficient, "
+            "so destination-buffer allocation is the next A/B target."
+        )
+    else:
+        lines.append(
+            f"- Fresh-random batching reaches **{search_ratio:.0%}** of "
+            "full-search batch latency; repeat the run before assigning the "
+            "remaining difference."
+        )
+    return lines
+
+
 def interpretation(
     rows: Sequence[dict[str, str]], search_runs: dict[str, dict[str, str]]
 ) -> list[str]:
@@ -355,6 +403,8 @@ def interpretation(
     access_ratio = continuous_iops / uniform_iops
     scheduling_ratio = batched_iops / continuous_iops
     reader_ratio = reader_iops / batched_iops
+    search_baseline = search_runs.get("interleaved", {})
+    random_batched = best_row(rows, "random_batched")
     lines = [
         (
             f"- Real offsets with a continuously full queue retain "
@@ -372,7 +422,23 @@ def interpretation(
             f"({reader_iops:.0f} vs {batched_iops:.0f} IOPS)."
         ),
     ]
-    lines.extend(gap_interpretation(rows, batched))
+    lines.extend(
+        gap_interpretation(
+            rows, batched, gapped_mode="trace_gapped", label="repeated-trace"
+        )
+    )
+    lines.extend(
+        random_batched_interpretation(random_batched, batched, search_baseline)
+    )
+    if random_batched is not None:
+        lines.extend(
+            gap_interpretation(
+                rows,
+                random_batched,
+                gapped_mode="random_gapped",
+                label="fresh-random",
+            )
+        )
     if access_ratio < 0.7:
         lines.append(
             "- The captured offset/size pattern itself has a substantial cost."
@@ -387,10 +453,9 @@ def interpretation(
             "- The performance loss is reproduced inside the project reader; "
             "focus on its submit/completion path and the timing columns below."
         )
-    baseline = search_runs.get("interleaved", {})
     drain_first = search_runs.get("drain_first", {})
-    if baseline.get("qps") and drain_first.get("qps"):
-        baseline_qps = float(baseline["qps"])
+    if search_baseline.get("qps") and drain_first.get("qps"):
+        baseline_qps = float(search_baseline["qps"])
         drain_qps = float(drain_first["qps"])
         drain_ratio = drain_qps / baseline_qps
         lines.append(
@@ -414,8 +479,10 @@ def interpretation(
                 "- Drain-first does not materially change search throughput; "
                 "completion/compute interleaving is not the primary loss."
             )
-    if baseline.get("qps") and baseline.get("reads_per_query"):
-        search_read_iops = float(baseline["qps"]) * float(baseline["reads_per_query"])
+    if search_baseline.get("qps") and search_baseline.get("reads_per_query"):
+        search_read_iops = float(search_baseline["qps"]) * float(
+            search_baseline["reads_per_query"]
+        )
         search_ratio = search_read_iops / reader_iops
         lines.append(
             f"- Full search delivers about **{search_read_iops:.0f} read IOPS**, "
@@ -544,6 +611,14 @@ def write_results(
             (
                 "- `trace_gapped`: the same barriers plus a CPU-busy delay "
                 "between batches; `Gap us` is excluded from batch latency."
+            ),
+            (
+                "- `random_batched`: original batch sizes and read lengths "
+                "with freshly generated random aligned offsets."
+            ),
+            (
+                "- `random_gapped`: fresh-random batches plus the requested "
+                "CPU-busy inter-batch delay."
             ),
             (
                 "- `reader_batched`: the same batches replayed through the "
@@ -695,7 +770,7 @@ def main() -> int:
         cwd=output_dir,
         log_path=output_dir / "uniform_replay.log",
     )
-    write_console("\nReplaying captured offsets...")
+    write_console("\nRunning repeated-trace and fresh-random batch replays...")
     trace_lines = run_logged(
         [
             *common,
@@ -705,6 +780,7 @@ def main() -> int:
             "both",
             "--batch-gaps-us",
             batch_gaps_us,
+            "--random-batched",
             "--reader-replay",
         ],
         cwd=output_dir,

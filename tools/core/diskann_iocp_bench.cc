@@ -138,6 +138,7 @@ struct Options {
   std::wstring trace_file;
   TraceMode trace_mode = TraceMode::kBoth;
   bool reader_replay = false;
+  bool random_batched = false;
 };
 
 struct RunResult {
@@ -347,6 +348,8 @@ void print_usage() {
          "trace batches (default: 0)\n"
       << "  --reader-replay              Replay trace through the project's "
          "WindowsAlignedFileReader\n"
+      << "  --random-batched             Replay trace batch shapes with fresh "
+         "random offsets\n"
       << "  --seed VALUE                 Random seed\n"
       << "  --help                       Show this help\n";
 }
@@ -409,6 +412,8 @@ Options parse_options(int argc, wchar_t **argv) {
           parse_batch_gaps(require_value(argc, argv, index, "--batch-gaps-us"));
     } else if (argument == L"--reader-replay") {
       options.reader_replay = true;
+    } else if (argument == L"--random-batched") {
+      options.random_batched = true;
     } else {
       throw std::invalid_argument("Unknown argument");
     }
@@ -818,14 +823,12 @@ bool wait_for_batch(HANDLE completion_port, uint64_t frequency,
   return true;
 }
 
-bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
-                          uint64_t deadline, uint64_t frequency,
-                          const TraceData &trace,
-                          std::vector<Request> &requests,
-                          std::vector<OVERLAPPED_ENTRY> &entries,
-                          size_t &batch_index, uint32_t batch_gap_us,
-                          bool &has_previous_batch, RunResult *result,
-                          std::string &error) {
+bool replay_batches_until(
+    HANDLE file_handle, HANDLE completion_port, uint64_t deadline,
+    uint64_t frequency, const TraceData &trace, std::vector<Request> &requests,
+    std::vector<OVERLAPPED_ENTRY> &entries, size_t &batch_index,
+    uint32_t batch_gap_us, uint64_t input_size, XorShift64Star *random,
+    bool &has_previous_batch, RunResult *result, std::string &error) {
   while (counter_now() < deadline) {
     if (has_previous_batch && batch_gap_us != 0) {
       const uint64_t gap_started = counter_now();
@@ -847,8 +850,14 @@ bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
     const uint64_t batch_started = counter_now();
     uint32_t outstanding = 0;
     for (size_t index = 0; index < batch.reads.size(); ++index) {
-      if (!submit_read(file_handle, requests[index], batch.reads[index],
-                       outstanding, result, error)) {
+      ReadSpec spec = batch.reads[index];
+      if (random != nullptr) {
+        const uint64_t eligible_blocks =
+            (input_size - spec.length) / kRequiredAlignment + 1;
+        spec.offset = (random->next() % eligible_blocks) * kRequiredAlignment;
+      }
+      if (!submit_read(file_handle, requests[index], spec, outstanding, result,
+                       error)) {
         ::CancelIoEx(file_handle, nullptr);
         drain_requests(completion_port, entries, outstanding, error);
         return false;
@@ -881,9 +890,14 @@ bool replay_batches_until(HANDLE file_handle, HANDLE completion_port,
 }
 
 RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
-                                const TraceData &trace, uint32_t batch_gap_us) {
+                                const TraceData &trace, uint32_t batch_gap_us,
+                                bool random_offsets) {
   RunResult result;
-  result.mode = batch_gap_us == 0 ? "trace_batched" : "trace_gapped";
+  if (random_offsets) {
+    result.mode = batch_gap_us == 0 ? "random_batched" : "random_gapped";
+  } else {
+    result.mode = batch_gap_us == 0 ? "trace_batched" : "trace_gapped";
+  }
   result.random_access_hint = random_access_hint;
   result.max_batch_size = trace.max_batch_size;
   result.batch_gap_us = batch_gap_us;
@@ -936,14 +950,16 @@ RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
 
   const uint64_t frequency = counter_frequency();
   size_t batch_index = 0;
+  XorShift64Star random(options.seed);
+  XorShift64Star *random_ptr = random_offsets ? &random : nullptr;
   bool has_previous_batch = false;
   std::string error;
   const uint64_t warmup_deadline =
       counter_now() + static_cast<uint64_t>(options.warmup_seconds) * frequency;
   if (!replay_batches_until(file_handle.get(), completion_port.get(),
                             warmup_deadline, frequency, trace, requests,
-                            entries, batch_index, batch_gap_us,
-                            has_previous_batch, nullptr, error)) {
+                            entries, batch_index, batch_gap_us, size,
+                            random_ptr, has_previous_batch, nullptr, error)) {
     throw std::runtime_error(error);
   }
 
@@ -953,8 +969,8 @@ RunResult run_batched_benchmark(const Options &options, bool random_access_hint,
       static_cast<uint64_t>(options.duration_seconds) * frequency;
   if (!replay_batches_until(file_handle.get(), completion_port.get(),
                             measurement_deadline, frequency, trace, requests,
-                            entries, batch_index, batch_gap_us,
-                            has_previous_batch, &result, error)) {
+                            entries, batch_index, batch_gap_us, size,
+                            random_ptr, has_previous_batch, &result, error)) {
     throw std::runtime_error(error);
   }
   const uint64_t measurement_end = counter_now();
@@ -1223,6 +1239,9 @@ int wmain(int argc, wchar_t **argv) {
     if (options.reader_replay && !has_trace) {
       throw std::invalid_argument("--reader-replay requires --trace-file");
     }
+    if (options.random_batched && !has_trace) {
+      throw std::invalid_argument("--random-batched requires --trace-file");
+    }
     std::cout << "DiskANN Windows IOCP microbenchmark\n"
               << "file: " << wide_to_utf8(options.file_path) << '\n'
               << "block_size: " << options.block_size << " bytes\n"
@@ -1262,7 +1281,13 @@ int wmain(int argc, wchar_t **argv) {
                         options.trace_mode == TraceMode::kBoth)) {
         for (uint32_t batch_gap_us : options.batch_gaps_us) {
           print_result(run_batched_benchmark(options, random_access_hint, trace,
-                                             batch_gap_us));
+                                             batch_gap_us, false));
+        }
+        if (options.random_batched) {
+          for (uint32_t batch_gap_us : options.batch_gaps_us) {
+            print_result(run_batched_benchmark(options, random_access_hint,
+                                               trace, batch_gap_us, true));
+          }
         }
       }
     }
