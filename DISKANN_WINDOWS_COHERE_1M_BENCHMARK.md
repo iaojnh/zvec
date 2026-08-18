@@ -1,278 +1,140 @@
-# Zvec DiskANN Windows Cohere 1M 性能测试报告
+# Zvec DiskANN Windows 性能测试
 
-## 1. 测试目的
+## 背景
 
-本次测试用于验证 Zvec DiskANN 在 Windows 平台上的构建、召回和检索性能，重点关注以下指标：
+测试 Zvec DiskANN 在 Windows 下的性能表现，重点记录 Recall、QPS 和 RSS。
 
-- FP32 与 FP16 索引的大小、构建耗时和构建峰值 RSS；
-- `list_size=100/300/500` 时的 Recall@1、Recall@10、Recall@50；
-- 1、2、4 个检索线程下的 QPS、延迟和峰值 RSS；
-- Windows Overlapped I/O 路径的实际读请求吞吐。
+## 环境
 
-本次运行已经确认使用 `windows_overlapped` 后端。新版本 DiskANN 检索 QPS 相比用户提供的外部原测试文档记录值提升约 **11.0～16.4 倍**。由于两个结果的代码版本和实际操作系统版本不同，该倍数用于端到端效果参考，不能全部归因于某一项代码修改。
+- 服务器：阿里云 `ecs.g9i.4xlarge`
+- 操作系统：Windows Server 2022，10.0.20348，64 位
+- CPU：Intel64 Family 6 Model 106 Stepping 6，GenuineIntel
+- 逻辑 CPU：16
+- Python：3.12.7，MSC v.1941，AMD64
+- 数据集：Cohere 1M
+  - 训练数据：`D:\zvec_data\cohere_train_vector_1m.new.centaur.vecs`
+  - 查询数据：`D:\zvec_data\cohere_test_vector_1000.new.txt`
+  - Ground Truth：`D:\diskann_bench\baseline\ground_truth_d768_k100.txt`
+- 代码分支：`feat/windows-diskann-benchmark`
+- 代码提交：`e3af0baa`
+- 构建类型：Release
+- I/O 后端：`windows_overlapped`
 
-## 2. 测试环境
+> 本次测试记录的 Git 工作区状态为 Dirty。
 
-| 项目 | 配置 |
+## 结果
+
+### 测试参数
+
+| 项目 | 参数 |
 | --- | --- |
-| 测试时间 | 2026-08-18 18:58:29（UTC+8） |
-| 云服务器 | 阿里云 `ecs.g9i.4xlarge` |
-| 操作系统 | Windows Server 2022，10.0.20348，64 位 |
-| CPU | Intel64 Family 6 Model 106 Stepping 6，GenuineIntel |
-| 逻辑 CPU | 16 |
-| Python | 3.12.7，MSC v.1941，AMD64 |
-| Git 分支 | `feat/windows-diskann-benchmark` |
-| Git 提交 | `e3af0baa` |
-| Git 工作区 | Dirty |
-| 构建类型 | Release |
-| DiskANN I/O 后端 | `windows_overlapped` |
-| I/O 说明 | Windows asynchronous I/O enabled |
+| 测试数据 | 记录数：1,000,000；维度：768；查询数：1,000；距离度量：Cosine |
+| 构建 | 线程：8；训练样本：200,000；max degree：32；builder list size：50；PQ chunks：384；memory limit：100.0 |
+| 检索 | Cache 节点数：10,000；beam size：2；list size：100/300/500；线程：1/2/4；QPS TopK：50 |
+| FP32 | `CosineFp32Converter` |
+| FP16 | `CosineFp16Converter` |
 
-> 注意：测试时 `Git dirty=True`，表示工作区存在未提交修改。性能数据本身完整，但若用于正式归档，建议同时保存 `git status --short`，或在干净工作区复测并更新提交信息。
+### 测试数据
 
-用户提供的原测试文档写的是 Windows Server 2025，但本次机器实际报告为 Windows Server 2022（Build 20348），本文以实测环境为准。
+| 项目 | 指标 | FP32 L100 | FP32 L300 | FP32 L500 | FP16 L100 | FP16 L300 | FP16 L500 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 构建 | 索引大小（GiB） | 4.18 |  |  | 2.28 |  |  |
+| 构建 | 训练时间（s） | 232.182 |  |  | 464.040 |  |  |
+| 构建 | 构建时间（s） | 311.084 |  |  | 320.433 |  |  |
+| 构建 | 导出时间（s） | 8.095 |  |  | 6.102 |  |  |
+| 构建 | 总 Wall 时间（s） | 552.976 |  |  | 791.823 |  |  |
+| 构建 | 峰值 RSS（MiB） | 19,471.5 |  |  | 12,716.9 |  |  |
+| Recall | Recall@1 | 92.900% | 96.500% | 97.800% | 92.400% | 96.900% | 98.100% |
+| Recall | Recall@10 | 94.030% | 97.220% | 98.150% | 93.890% | 97.160% | 97.980% |
+| Recall | Recall@50 | 91.424% | 96.644% | 97.880% | 91.370% | 96.498% | 97.728% |
+| Recall | 峰值 RSS（MiB） | 455.9 | 457.0 | 456.0 | 438.7 | 439.8 | 440.5 |
+| QPS | 1 线程 | 213.6 | 93.1 | 57.8 | 191.2 | 92.9 | 57.4 |
+| QPS | 2 线程 | 245.7 | 93.1 | 57.6 | 245.1 | 92.9 | 57.5 |
+| QPS | 4 线程 | 245.8 | 92.9 | 57.8 | 245.6 | 92.9 | 57.5 |
+| 检索 RSS | 1 线程（MiB） | 422.6 | 422.8 | 422.7 | 407.2 | 407.1 | 407.1 |
+| 检索 RSS | 2 线程（MiB） | 424.4 | 424.5 | 424.3 | 408.7 | 408.7 | 408.8 |
+| 检索 RSS | 4 线程（MiB） | 427.7 | 428.0 | 428.0 | 411.8 | 411.9 | 412.3 |
 
-## 3. 测试数据
+> RSS 使用 Windows `PeakWorkingSetSize`，表示完整测试进程生命周期内的物理工作集峰值，包含索引加载和 Cache 预加载。
 
-| 项目 | 配置 |
-| --- | --- |
-| 数据集 | Cohere 1M |
-| 训练记录数 | 1,000,000 |
-| 向量维度 | 768 |
-| 查询数 | 1,000 |
-| 距离度量 | Cosine |
-| FP32 Converter | `CosineFp32Converter` |
-| FP16 Converter | `CosineFp16Converter` |
-| Ground Truth | `D:\diskann_bench\baseline\ground_truth_d768_k100.txt` |
-| 训练数据 | `D:\zvec_data\cohere_train_vector_1m.new.centaur.vecs` |
-| 查询数据 | `D:\zvec_data\cohere_test_vector_1000.new.txt` |
+## 配置
 
-## 4. 测试参数
+### FP32 build.yaml
 
-### 4.1 构建参数
-
-| 参数 | 值 |
-| --- | ---: |
-| Builder | `DiskAnnBuilder` |
-| 构建工具 | `local_builder` |
-| 构建线程 | 8 |
-| Disable ID map | `true` |
-| Max degree | 32 |
-| Builder list size | 50 |
-| PQ chunk num | 384 |
-| 最大训练样本数 | 200,000 |
-| Memory limit | 100.0 |
-
-> 用户提供的原测试文档参数汇总表写了 `max degree=64`，但其 FP32、FP16 YAML 均配置为32。本次测试严格按照实际 YAML，使用32。
-
-### 4.2 检索参数
-
-| 参数 | 值 |
-| --- | ---: |
-| Searcher | `DiskAnnSearcher` |
-| Cache 节点数 | 10,000 |
-| Beam size | 2 |
-| List size | 100、300、500 |
-| Recall TopK | 1、10、50 |
-| QPS TopK | 50 |
-| 检索线程 | 1、2、4 |
-| 单组压测时长 | 30 秒 |
-| 最大迭代次数 | 10,000,000 |
-
-## 5. 测试方法与指标口径
-
-1. 使用 `local_builder` 分别构建 FP32、FP16 DiskANN 索引。
-2. 使用 `recall_original` 对每种精度和每个 list size 计算 Recall@1、Recall@10、Recall@50。
-3. 使用 `bench_original` 对每种精度、list size 和线程数组合执行30秒 TopK=50 检索压测。
-4. RSS 使用 Windows `GetProcessMemoryInfo` 返回的 `PeakWorkingSetSize`，表示完整子进程生命周期内的物理工作集高水位，包含索引加载和缓存预加载。
-5. Read IOPS、Read MiB/s 来自压测进程的 Windows I/O counters，仅描述该进程的查询读负载，不是设备级硬件计数器。
-
-## 6. 构建结果
-
-| 精度 | 索引大小 GiB | 训练时间 s | 构建时间 s | 导出时间 s | 总 Wall s | 峰值 RSS MiB | 峰值 RSS GiB |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 4.18 | 232.182 | 311.084 | 8.095 | 552.976 | 19,471.5 | 19.02 |
-| FP16 | 2.28 | 464.040 | 320.433 | 6.102 | 791.823 | 12,716.9 | 12.42 |
-
-构建阶段观察：
-
-- FP16 索引大小为 FP32 的约54.5%，节省约45.5%的磁盘空间；
-- FP16 构建峰值 RSS 比 FP32 低约34.7%；
-- FP16 训练时间约为 FP32 的2倍，使总构建 Wall 时间增加约43%；
-- FP16 的主体图构建时间仅比 FP32 高约3.0%，总 Wall 时间差异主要来自训练阶段。
-
-## 7. Recall 结果
-
-### 7.1 FP32
-
-| 指标 | List 100 | List 300 | List 500 |
-| --- | ---: | ---: | ---: |
-| Recall@1 | 92.900% | 96.500% | 97.800% |
-| Recall@10 | 94.030% | 97.220% | 98.150% |
-| Recall@50 | 91.424% | 96.644% | 97.880% |
-| Recall 进程峰值 RSS | 455.9 MiB | 457.0 MiB | 456.0 MiB |
-
-### 7.2 FP16
-
-| 指标 | List 100 | List 300 | List 500 |
-| --- | ---: | ---: | ---: |
-| Recall@1 | 92.400% | 96.900% | 98.100% |
-| Recall@10 | 93.890% | 97.160% | 97.980% |
-| Recall@50 | 91.370% | 96.498% | 97.728% |
-| Recall 进程峰值 RSS | 438.7 MiB | 439.8 MiB | 440.5 MiB |
-
-随着 list size 从100增加到500，两种精度的召回均明显提高。单次测试中 FP16 与 FP32 的差异不超过0.5个百分点；FP16 的 Recall@10/Recall@50 分别低约0.054～0.170个百分点，差异较小，但本次单轮结果不能用于声明统计等价。
-
-## 8. QPS 结果
-
-### 8.1 FP32 QPS
-
-| 线程数 | List 100 | List 300 | List 500 |
-| --- | ---: | ---: | ---: |
-| 1 | 213.6 | 93.1 | 57.8 |
-| 2 | 245.7 | 93.1 | 57.6 |
-| 4 | 245.8 | 92.9 | 57.8 |
-
-### 8.2 FP16 QPS
-
-| 线程数 | List 100 | List 300 | List 500 |
-| --- | ---: | ---: | ---: |
-| 1 | 191.2 | 92.9 | 57.4 |
-| 2 | 245.1 | 92.9 | 57.5 |
-| 4 | 245.6 | 92.9 | 57.5 |
-
-## 9. 检索峰值 RSS
-
-### 9.1 FP32 峰值 RSS（MiB）
-
-| 线程数 | List 100 | List 300 | List 500 |
-| --- | ---: | ---: | ---: |
-| 1 | 422.6 | 422.8 | 422.7 |
-| 2 | 424.4 | 424.5 | 424.3 |
-| 4 | 427.7 | 428.0 | 428.0 |
-
-### 9.2 FP16 峰值 RSS（MiB）
-
-| 线程数 | List 100 | List 300 | List 500 |
-| --- | ---: | ---: | ---: |
-| 1 | 407.2 | 407.1 | 407.1 |
-| 2 | 408.7 | 408.7 | 408.8 |
-| 4 | 411.8 | 411.9 | 412.3 |
-
-检索阶段 FP16 比 FP32 节省约15～16 MiB RSS，比例约3.7%。线程数增加时，每个检索上下文会增加少量内存，因此4线程比1线程高约5 MiB。
-
-## 10. 检索延迟与 I/O
-
-| 精度 | List | 线程 | QPS | Avg ms | P50 ms | P95 ms | P99 ms | Read IOPS | Read MiB/s | Reads/query |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 100 | 1 | 213.6 | 4.7 | 4.6 | 6.2 | 7.2 | 23,893.2 | 93.3 | 112.1 |
-| FP32 | 100 | 2 | 245.7 | 8.1 | 8.7 | 13.4 | 14.9 | 27,496.0 | 107.4 | 112.2 |
-| FP32 | 100 | 4 | 245.8 | 16.3 | 18.6 | 20.6 | 27.5 | 27,399.0 | 107.0 | 111.7 |
-| FP32 | 300 | 1 | 93.1 | 10.7 | 10.3 | 15.7 | 17.6 | 27,598.8 | 107.8 | 297.2 |
-| FP32 | 300 | 2 | 93.1 | 21.5 | 21.0 | 28.4 | 29.2 | 27,544.2 | 107.6 | 295.5 |
-| FP32 | 300 | 4 | 92.9 | 43.1 | 41.8 | 50.6 | 58.4 | 27,381.7 | 107.0 | 294.5 |
-| FP32 | 500 | 1 | 57.8 | 17.3 | 18.4 | 21.7 | 22.8 | 27,566.7 | 107.7 | 478.2 |
-| FP32 | 500 | 2 | 57.6 | 34.7 | 37.6 | 40.5 | 41.6 | 27,440.8 | 107.2 | 477.1 |
-| FP32 | 500 | 4 | 57.8 | 69.2 | 70.5 | 80.0 | 81.4 | 27,325.1 | 106.7 | 473.5 |
-| FP16 | 100 | 1 | 191.2 | 5.2 | 5.1 | 6.8 | 7.6 | 21,496.2 | 84.0 | 112.3 |
-| FP16 | 100 | 2 | 245.1 | 8.2 | 8.6 | 11.6 | 13.9 | 27,541.5 | 107.6 | 112.6 |
-| FP16 | 100 | 4 | 245.6 | 16.3 | 18.5 | 20.6 | 21.7 | 27,496.5 | 107.4 | 111.9 |
-| FP16 | 300 | 1 | 92.9 | 10.8 | 10.4 | 15.5 | 17.1 | 27,642.4 | 108.0 | 297.3 |
-| FP16 | 300 | 2 | 92.9 | 21.5 | 21.0 | 28.6 | 29.8 | 27,561.6 | 107.7 | 296.5 |
-| FP16 | 300 | 4 | 92.9 | 43.0 | 41.8 | 50.6 | 58.3 | 27,513.7 | 107.5 | 296.7 |
-| FP16 | 500 | 1 | 57.4 | 17.4 | 18.6 | 21.0 | 22.4 | 27,442.3 | 107.2 | 479.5 |
-| FP16 | 500 | 2 | 57.5 | 34.8 | 37.7 | 40.4 | 41.4 | 27,419.4 | 107.1 | 476.3 |
-| FP16 | 500 | 4 | 57.5 | 69.5 | 70.6 | 80.0 | 81.3 | 27,597.6 | 107.8 | 480.1 |
-
-## 11. 性能分析
-
-### 11.1 当前检索已进入稳定的 I/O 吞吐平台
-
-除两组 `list_size=100, threads=1` 外，其余16组测试的进程读请求速率位于 **27,325～27,642 IOPS**，均值约 **27,498 IOPS**，对应约 **107～108 MiB/s** 的4 KiB随机读取。
-
-不同 list size 下：
-
-- List 100：每次查询约112次读取，吞吐上限约245 QPS；
-- List 300：每次查询约296次读取，吞吐上限约93 QPS；
-- List 500：每次查询约477次读取，吞吐上限约57.5 QPS。
-
-三组数据满足 `QPS × Reads/query ≈ 27.5K IOPS`，说明当前查询受到稳定的进程读请求吞吐平台约束。这里的 IOPS 是进程级计数器结果，不能直接等同于云盘或物理设备的硬件 IOPS 上限。
-
-### 11.2 增加线程不会继续提高 L300/L500 的吞吐
-
-List 300 和 List 500 在单线程下已经达到约27.5K Read IOPS。线程数从1增加到4时：
-
-- QPS 基本不变；
-- 平均延迟约按并发线程数线性增长；
-- P95/P99 延迟同步升高。
-
-因此，对于单实例延迟敏感场景，List 300/500 建议优先使用1个检索线程；List 100 从1线程增加到2线程时，FP32 QPS 提升约15.0%，FP16 提升约28.2%，但继续增加到4线程没有明显收益。
-
-### 11.3 FP16 的主要收益是空间和内存，而非 QPS
-
-FP16 与 FP32 的 reads/query 基本相同，并且都以4 KiB随机读取为主，因此达到 I/O 平台后 QPS 几乎一致。FP16 的主要价值是：
-
-- 索引大小减少约45.5%；
-- 构建峰值 RSS 减少约34.7%；
-- 检索峰值 RSS 减少约15～16 MiB，约3.7%；
-- Recall 与 FP32 基本相当。
-
-### 11.4 Recall/QPS 的建议平衡点
-
-- List 100：约245 QPS，Recall@50 约91.4%，适合吞吐优先；
-- List 300：约93 QPS，Recall@50 约96.5%～96.6%，是比较均衡的选择；
-- List 500：约57.5 QPS，Recall@50 约97.7%～97.9%，适合召回优先。
-
-## 12. 与原测试文档的 QPS 对比
-
-下表是对用户提供的原测试文档记录值的参考对比。由于代码版本和实际操作系统版本不同，它不是严格的同进程 A/B，只用于展示新版本端到端性能的数量级变化。
-
-| 精度 | List | 原1线程 QPS | 新1线程 QPS | 提升 | 原4线程 QPS | 新4线程 QPS | 提升 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 100 | 17.3 | 213.6 | 12.3× | 18.4 | 245.8 | 13.4× |
-| FP32 | 300 | 6.0 | 93.1 | 15.5× | 6.3 | 92.9 | 14.7× |
-| FP32 | 500 | 3.6 | 57.8 | 16.1× | 3.8 | 57.8 | 15.2× |
-| FP16 | 100 | 17.4 | 191.2 | 11.0× | 18.5 | 245.6 | 13.3× |
-| FP16 | 300 | 6.0 | 92.9 | 15.5× | 6.3 | 92.9 | 14.7× |
-| FP16 | 500 | 3.5 | 57.4 | 16.4× | 3.8 | 57.5 | 15.1× |
-
-## 13. 测试局限性
-
-- 测试工作区为 Dirty，未提交改动没有包含在 Git SHA 中；
-- 外部旧基线与本次测试的代码版本和操作系统版本不同，旧正文中的 degree=64 又与旧 YAML 的32冲突；
-- 本次版本的直接父提交 `189282b` 包含 cached-handle 生命周期修复，但相对外部旧基线还包含其他 IOCP、缓存预加载等改动，因此历史 QPS 提升不能全部归因于单个提交；
-- 报告没有包含云盘具体型号、缓存策略和设备级硬件 IOPS，进程 Read IOPS 只能描述应用观测到的读负载；
-- 每个配置只运行一轮，没有给出多轮均值、方差或置信区间。
-
-## 14. 结论
-
-1. Windows DiskANN 已确认运行在 `windows_overlapped` 异步 I/O 后端。
-2. 独立的 cached-handle ABBA 诊断已经证明普通缓存句柄会显著降低同文件 Overlapped I/O 吞吐；本次完整测试确认释放该句柄后的生产路径能够保持高吞吐。旧、新文档的总体 QPS 差异还包含其他代码及环境差异。
-3. 当前检索吞吐稳定在约27.5K进程 Read IOPS；该数值描述进程读请求速率，不是设备级硬件计数器。
-4. List 300 是本次数据上 Recall 与吞吐较均衡的配置；List 500进一步提高召回，但吞吐降至约57.5 QPS。
-5. FP16 能显著降低索引空间和构建阶段内存占用；检索 RSS 的降幅较温和，约3.7%。它在2/4线程下保持与 FP32 基本相同的 QPS，单轮 Recall 差异不超过0.5个百分点，适合磁盘容量敏感场景。
-6. 正式归档前建议清理工作区并记录干净的 Git 提交，以保证测试可复现。
-
-## 15. 复现命令
-
-在 Visual Studio 2022 x64 Native Tools Command Prompt 中执行：
-
-```bat
-cd /d D:\zvec-iaojnh
-
-python scripts\benchmark_diskann_windows.py ^
-  --train-file D:\zvec_data\cohere_train_vector_1m.new.centaur.vecs ^
-  --query-file D:\zvec_data\cohere_test_vector_1000.new.txt ^
-  --ground-truth-file D:\diskann_bench\baseline\ground_truth_d768_k100.txt ^
-  --output-dir D:\diskann_bench\windows_report_20260818 ^
-  --server-label ecs.g9i.4xlarge
+```yaml
+BuilderCommon:
+    BuilderClass: DiskAnnBuilder
+    BuildFile: D:\zvec_data\cohere_train_vector_1m.new.centaur.vecs
+    NeedTrain: true
+    TrainFile: D:\zvec_data\cohere_train_vector_1m.new.centaur.vecs
+    DumpPath: D:\diskann_bench\windows_report_20260818\indexes\diskann_fp32.index
+    IndexPath: D:\diskann_bench\windows_report_20260818\indexes\diskann_fp32.index
+    MetricName: Cosine
+    ConverterName: CosineFp32Converter
+    DisableIdMap: true
+    ThreadCount: 8
+    LogLevel: Info
+BuilderParams:
+    zvec.general.builder.thread_count: !!int 8
+    zvec.diskann.builder.thread_count: !!int 8
+    zvec.diskann.builder.max_degree: !!int 32
+    zvec.diskann.builder.list_size: !!int 50
+    zvec.diskann.builder.memory_limit: !!float 100.0
+    zvec.diskann.builder.max_pq_chunk_num: !!int 384
+    zvec.diskann.builder.max_train_sample_count: !!int 200000
 ```
 
-主要输出：
+### FP16 build.yaml
 
-- `summary.md`：完整环境、构建、Recall、QPS、RSS和I/O结果；
-- `document_results.md`：适合直接复制到测试文档的横向结果表；
-- `build_results.csv`：构建结果；
-- `recall_results.csv`：Recall结果；
-- `results.csv`：18组检索结果；
-- `metadata.json`：机器、Git和实际测试参数。
+```yaml
+BuilderCommon:
+    BuilderClass: DiskAnnBuilder
+    BuildFile: D:\zvec_data\cohere_train_vector_1m.new.centaur.vecs
+    NeedTrain: true
+    TrainFile: D:\zvec_data\cohere_train_vector_1m.new.centaur.vecs
+    DumpPath: D:\diskann_bench\windows_report_20260818\indexes\diskann_fp16.index
+    IndexPath: D:\diskann_bench\windows_report_20260818\indexes\diskann_fp16.index
+    MetricName: Cosine
+    ConverterName: CosineFp16Converter
+    DisableIdMap: true
+    ThreadCount: 8
+    LogLevel: Info
+BuilderParams:
+    zvec.general.builder.thread_count: !!int 8
+    zvec.diskann.builder.thread_count: !!int 8
+    zvec.diskann.builder.max_degree: !!int 32
+    zvec.diskann.builder.list_size: !!int 50
+    zvec.diskann.builder.memory_limit: !!float 100.0
+    zvec.diskann.builder.max_pq_chunk_num: !!int 384
+    zvec.diskann.builder.max_train_sample_count: !!int 200000
+```
+
+### search.yaml 模板
+
+Recall 测试的 `TopK` 为 `1,10,50`，QPS 测试的 `TopK` 为 `50`。脚本会分别替换 precision、list size 和线程数。
+
+```yaml
+SearcherCommon:
+    SearcherClass: DiskAnnSearcher
+    IndexPath: <FP32 或 FP16 索引路径>
+    TopK: <1,10,50 或 50>
+    QueryFile: D:\zvec_data\cohere_test_vector_1000.new.txt
+    QueryType: float
+    QueryFirstSep: ";"
+    QuerySecondSep: " "
+    GroundTruthFile: D:\diskann_bench\baseline\ground_truth_d768_k100.txt
+    RecallThreadCount: 16
+    RecallGTCount: 100
+    RecallScorePrecision: 1e-4
+    BenchThreadCount: <1、2 或 4>
+    BenchSecs: 30
+    BenchIterCount: 10000000
+    CompareById: true
+    ContainerType: FileReadStorage
+    LogLevel: Info
+SearcherParams:
+    zvec.diskann.searcher.cache_node_num: !!int 10000
+    zvec.diskann.searcher.list_size: !!int <100、300 或 500>
+    zvec.diskann.searcher.beam_size: !!int 2
+ContainerParams: {}
+```
