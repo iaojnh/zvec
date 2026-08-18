@@ -25,8 +25,9 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Build the Windows DiskANN diagnostic tools, capture the real "
             "search I/O trace, compare interleaved and drain-first completion "
-            "processing, and compare repeated-trace and fresh-random offsets "
-            "under the original batch scheduling."
+            "processing, replay pure I/O inside the post-search context, and "
+            "compare repeated-trace and fresh-random offsets under the "
+            "original batch scheduling."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -248,6 +249,7 @@ def search_metrics(lines: Sequence[str]) -> dict[str, str]:
         "avg_latency_ms": r"Avg latency: ([0-9.]+)ms qps:",
         "reads_per_query": r"reads/query=([0-9.]+)",
         "batches_per_query": r"batches/query=([0-9.]+)",
+        "reads_per_batch": r"reads/batch=([0-9.]+)",
         "io_us_per_query": r"io_us/query=([0-9.]+)",
         "cpu_us_per_query": r"cpu_us/query=([0-9.]+)",
         "iocp_wait_us_per_query": r"iocp_wait_us/query=([0-9.]+)",
@@ -264,6 +266,97 @@ def search_metrics(lines: Sequence[str]) -> dict[str, str]:
             if match:
                 metrics[name] = match.group(1)
     return metrics
+
+
+def context_replay_metrics(lines: Sequence[str]) -> dict[str, str]:
+    metrics: dict[str, str] = {}
+    patterns = {
+        "phase": r"phase=([a-z_]+)",
+        "batches": r"batches=([0-9]+)",
+        "reads": r"reads=([0-9]+)",
+        "reads_per_batch": r"reads/batch=([0-9.]+)",
+        "iops": r"iops=([0-9.]+)",
+        "pending_ratio_pct": r"pending_ratio=([0-9.]+)%",
+        "max_outstanding": r"max_outstanding=([0-9]+)",
+        "batch_submit_us": r"submit_us/batch=([0-9.]+)",
+        "first_completion_us": r"first_completion_us=([0-9.]+)",
+        "batch_duration_us": r"batch_duration_us=([0-9.]+)",
+        "iocp_wait_us_per_batch": r"iocp_wait_us/batch=([0-9.]+)",
+        "readfile_submit_us_per_read": r"readfile_submit_us/read=([0-9.]+)",
+        "get_overlapped_us_per_read": r"get_overlapped_us/read=([0-9.]+)",
+        "completions_per_dequeue": r"completions/dequeue=([0-9.]+)",
+        "max_dequeued_once": r"max_dequeued_once=([0-9]+)",
+        "buffer_bytes": r"buffer_bytes=([0-9]+)",
+        "read_stride": r"read_stride=([0-9]+)",
+    }
+    for line in lines:
+        if "DiskAnn in-process IOCP replay:" not in line:
+            continue
+        for name, pattern in patterns.items():
+            match = re.search(pattern, line)
+            if match:
+                metrics[name] = match.group(1)
+    required = {
+        "phase",
+        "batches",
+        "reads",
+        "reads_per_batch",
+        "iops",
+        "pending_ratio_pct",
+        "max_outstanding",
+        "batch_submit_us",
+        "first_completion_us",
+        "batch_duration_us",
+        "iocp_wait_us_per_batch",
+        "readfile_submit_us_per_read",
+        "get_overlapped_us_per_read",
+        "completions_per_dequeue",
+        "max_dequeued_once",
+        "buffer_bytes",
+        "read_stride",
+    }
+    if not required.issubset(metrics):
+        raise RuntimeError(
+            "bench_original did not emit the in-process context replay "
+            "diagnostics; rebuild without --skip-build"
+        )
+    return metrics
+
+
+def add_live_search_context(
+    context_replay: dict[str, str], live_search: dict[str, str]
+) -> None:
+    required = {
+        "reads_per_batch",
+        "batches_per_query",
+        "iocp_wait_us_per_query",
+        "batch_submit_us",
+        "first_completion_us",
+        "batch_duration_us",
+        "completions_per_dequeue",
+    }
+    if not required.issubset(live_search):
+        raise RuntimeError(
+            "The context replay process did not retain the preceding live "
+            "search diagnostics"
+        )
+    batches_per_query = float(live_search["batches_per_query"])
+    if batches_per_query <= 0:
+        raise RuntimeError("Live search reported no I/O batches")
+    context_replay.update(
+        {
+            "live_search_reads_per_batch": live_search["reads_per_batch"],
+            "live_search_batch_submit_us": live_search["batch_submit_us"],
+            "live_search_first_completion_us": live_search["first_completion_us"],
+            "live_search_batch_duration_us": live_search["batch_duration_us"],
+            "live_search_iocp_wait_us_per_batch": (
+                f"{float(live_search['iocp_wait_us_per_query']) / batches_per_query:.2f}"
+            ),
+            "live_search_completions_per_dequeue": live_search[
+                "completions_per_dequeue"
+            ],
+        }
+    )
 
 
 def require_search_mode(metrics: dict[str, str], expected: str) -> None:
@@ -337,7 +430,7 @@ def gap_interpretation(
     else:
         lines.append(
             "- Short queue-idle gaps do not reproduce the full-search batch "
-            "latency; inspect the search destination-buffer allocation next."
+            "latency and do not explain the effective-QD collapse."
         )
     return lines
 
@@ -374,8 +467,8 @@ def random_batched_interpretation(
     elif search_ratio < 0.5:
         lines.append(
             f"- Fresh-random batching reproduces only **{search_ratio:.0%}** "
-            "of full-search batch latency; address warmth is not sufficient, "
-            "so destination-buffer allocation is the next A/B target."
+            "of full-search batch latency; address warmth does not explain "
+            "the slowdown."
         )
     else:
         lines.append(
@@ -454,14 +547,63 @@ def reader_buffer_interpretation(
         lines.append(
             f"- The search-equivalent buffer reproduces only "
             f"**{search_ratio:.0%}** of full-search batch latency. Allocation "
-            "API and reserved size are ruled out; the next diagnostic must "
-            "replay inside `bench_original` with the actual `DiskAnnContext`."
+            "API and reserved size do not explain the slowdown."
+        )
+    return lines
+
+
+def context_replay_interpretation(
+    rows: Sequence[dict[str, str]],
+    search_metrics: dict[str, str],
+    context_replay: dict[str, str],
+) -> list[str]:
+    external = best_row(rows, "reader_aligned_context")
+    search_batch_us = context_replay.get("live_search_batch_duration_us")
+    if search_batch_us is None:
+        search_batch_us = search_metrics.get("batch_duration_us")
+    if external is None or search_batch_us is None:
+        return ["- The context replay boundary comparison is incomplete."]
+
+    context_batch_us = float(context_replay["batch_duration_us"])
+    search_batch_us_value = float(search_batch_us)
+    external_batch_us = float(external["batch_duration_ms"]) * 1000.0
+    search_ratio = context_batch_us / search_batch_us_value
+    external_ratio = context_batch_us / external_batch_us
+    lines = [
+        (
+            "- After a real query, pure I/O replay through the same reader, "
+            "file handle, `IOContext`, and sector buffer takes "
+            f"**{context_batch_us:.0f} us/batch**: "
+            f"**{search_ratio:.0%}** of live search and "
+            f"**{external_ratio:.1f}x** external reader replay."
+        )
+    ]
+    if 0.7 <= search_ratio <= 1.3:
+        lines.append(
+            "- The slowdown is reproduced without graph traversal. Its "
+            "boundary is the live process/context/handle state, not DiskANN "
+            "distance computation or candidate processing."
+        )
+    elif 0.7 <= external_ratio <= 1.3:
+        lines.append(
+            "- Reusing the real post-search context does not reproduce the "
+            "slowdown. The missing condition exists only in the live search "
+            "batch lifecycle, not as persistent reader/context/handle state; "
+            "inspect per-completion timelines and buffer consumption next."
+        )
+    else:
+        lines.append(
+            "- The post-search context reproduces only part of the slowdown. "
+            "Both context state and live search activity contribute; compare "
+            "per-completion timelines before changing production behavior."
         )
     return lines
 
 
 def interpretation(
-    rows: Sequence[dict[str, str]], search_runs: dict[str, dict[str, str]]
+    rows: Sequence[dict[str, str]],
+    search_runs: dict[str, dict[str, str]],
+    context_replay: dict[str, str],
 ) -> list[str]:
     uniform = best_row(rows, "uniform")
     continuous = best_row(rows, "trace_continuous")
@@ -505,6 +647,7 @@ def interpretation(
         random_batched_interpretation(random_batched, batched, search_baseline)
     )
     lines.extend(reader_buffer_interpretation(rows, search_baseline))
+    lines.extend(context_replay_interpretation(rows, search_baseline, context_replay))
     if random_batched is not None:
         lines.extend(
             gap_interpretation(
@@ -576,6 +719,7 @@ def write_results(
     output_dir: Path,
     rows: list[dict[str, str]],
     search_runs: dict[str, dict[str, str]],
+    context_replay: dict[str, str],
 ) -> None:
     if not rows:
         raise RuntimeError("No replay results were produced")
@@ -665,6 +809,68 @@ def write_results(
             )
         )
 
+    context_fields = [
+        "phase",
+        "batches",
+        "reads",
+        "reads_per_batch",
+        "iops",
+        "pending_ratio_pct",
+        "max_outstanding",
+        "batch_submit_us",
+        "first_completion_us",
+        "batch_duration_us",
+        "iocp_wait_us_per_batch",
+        "readfile_submit_us_per_read",
+        "get_overlapped_us_per_read",
+        "completions_per_dequeue",
+        "max_dequeued_once",
+        "buffer_bytes",
+        "read_stride",
+        "live_search_reads_per_batch",
+        "live_search_batch_submit_us",
+        "live_search_first_completion_us",
+        "live_search_batch_duration_us",
+        "live_search_iocp_wait_us_per_batch",
+        "live_search_completions_per_dequeue",
+    ]
+    with (output_dir / "context_replay.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as output:
+        writer = csv.DictWriter(output, fieldnames=context_fields)
+        writer.writeheader()
+        writer.writerow({name: context_replay.get(name, "") for name in context_fields})
+
+    context_lines = [
+        "## In-process context replay",
+        "",
+        (
+            "| Phase | Batches | Reads/batch | IOPS | First us | Batch us | "
+            "IOCP wait us/batch | Submit us/batch | Comp/dequeue |"
+        ),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            "| live_search |  | {live_search_reads_per_batch} |  | "
+            "{live_search_first_completion_us} | "
+            "{live_search_batch_duration_us} | "
+            "{live_search_iocp_wait_us_per_batch} | "
+            "{live_search_batch_submit_us} | "
+            "{live_search_completions_per_dequeue} |"
+        ).format(**context_replay),
+        (
+            "| {phase} | {batches} | {reads_per_batch} | {iops} | "
+            "{first_completion_us} | {batch_duration_us} | "
+            "{iocp_wait_us_per_batch} | {batch_submit_us} | "
+            "{completions_per_dequeue} |"
+        ).format(**context_replay),
+        "",
+        (
+            "This control runs after the first real query and reuses that "
+            "query's reader, file handle, `IOContext`, and sector buffer, but "
+            "does not execute graph traversal or distance computation."
+        ),
+    ]
+
     summary = "\n".join(
         [
             "# DiskANN Windows I/O trace diagnosis",
@@ -675,6 +881,8 @@ def write_results(
                 "The trace-capture run is separate from this A/B table. Both "
                 "search measurements run without trace recording overhead."
             ),
+            "",
+            *context_lines,
             "",
             "## I/O replay",
             "",
@@ -709,7 +917,7 @@ def write_results(
             "",
             "## Interpretation",
             "",
-            *interpretation(rows, search_runs),
+            *interpretation(rows, search_runs, context_replay),
             "",
             (
                 "The replay excludes DiskANN distance computation and cache "
@@ -756,7 +964,13 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def search_environment(
-    *, drain_first: bool, trace_path: Path | None = None, max_trace_records: int = 0
+    *,
+    drain_first: bool,
+    trace_path: Path | None = None,
+    max_trace_records: int = 0,
+    context_replay_trace: Path | None = None,
+    context_replay_seconds: int = 0,
+    context_replay_warmup_seconds: int = 0,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["ZVEC_DISKANN_IO_DIAGNOSTICS"] = "1"
@@ -764,9 +978,18 @@ def search_environment(
     env["ZVEC_DISKANN_IO_DRAIN_FIRST"] = "1" if drain_first else "0"
     env.pop("ZVEC_DISKANN_IO_TRACE", None)
     env.pop("ZVEC_DISKANN_IO_TRACE_MAX_RECORDS", None)
+    env.pop("ZVEC_DISKANN_IO_CONTEXT_REPLAY", None)
+    env.pop("ZVEC_DISKANN_IO_CONTEXT_REPLAY_SECONDS", None)
+    env.pop("ZVEC_DISKANN_IO_CONTEXT_REPLAY_WARMUP_SECONDS", None)
     if trace_path is not None:
         env["ZVEC_DISKANN_IO_TRACE"] = str(trace_path)
         env["ZVEC_DISKANN_IO_TRACE_MAX_RECORDS"] = str(max_trace_records)
+    if context_replay_trace is not None:
+        env["ZVEC_DISKANN_IO_CONTEXT_REPLAY"] = str(context_replay_trace)
+        env["ZVEC_DISKANN_IO_CONTEXT_REPLAY_SECONDS"] = str(context_replay_seconds)
+        env["ZVEC_DISKANN_IO_CONTEXT_REPLAY_WARMUP_SECONDS"] = str(
+            context_replay_warmup_seconds
+        )
     return env
 
 
@@ -829,6 +1052,18 @@ def main() -> int:
         env=search_environment(drain_first=True),
         log_path=output_dir / "search_drain_first.log",
     )
+    write_console("\nRunning pure I/O replay inside the post-search context...")
+    context_replay_lines = run_logged(
+        [bench_tool, config_path],
+        cwd=output_dir,
+        env=search_environment(
+            drain_first=False,
+            context_replay_trace=trace_path,
+            context_replay_seconds=args.replay_seconds,
+            context_replay_warmup_seconds=args.warmup_seconds,
+        ),
+        log_path=output_dir / "context_replay.log",
+    )
 
     queue_depths = ",".join(str(value) for value in args.queue_depths)
     batch_gaps_us = ",".join(str(value) for value in args.batch_gaps_us)
@@ -871,18 +1106,23 @@ def main() -> int:
     rows = [*extract_rows(uniform_lines), *extract_rows(trace_lines)]
     interleaved_metrics = search_metrics(interleaved_lines)
     drain_first_metrics = search_metrics(drain_first_lines)
+    context_metrics = context_replay_metrics(context_replay_lines)
+    context_live_search = search_metrics(context_replay_lines)
     require_search_mode(interleaved_metrics, "interleaved")
     require_search_mode(drain_first_metrics, "drain_first")
+    require_search_mode(context_live_search, "interleaved")
+    add_live_search_context(context_metrics, context_live_search)
     search_runs = {
         "interleaved": interleaved_metrics,
         "drain_first": drain_first_metrics,
     }
-    write_results(output_dir, rows, search_runs)
+    write_results(output_dir, rows, search_runs, context_metrics)
 
     write_console("\nDiagnosis complete.")
     write_console(f"Summary: {output_dir / 'summary.md'}")
     write_console(f"Results: {output_dir / 'results.csv'}")
     write_console(f"Search:  {output_dir / 'search_results.csv'}")
+    write_console(f"Context: {output_dir / 'context_replay.csv'}")
     write_console(f"Trace:   {trace_path}")
     return 0
 

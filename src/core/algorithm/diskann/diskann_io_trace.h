@@ -31,5 +31,16 @@ void diskann_io_trace_record_batch(
     uint64_t query_id, uint32_t batch_id,
     const std::vector<AlignedRead> &read_requests);
 
+#if defined(_WIN32) || defined(_WIN64)
+// Diagnostic-only control run. When ZVEC_DISKANN_IO_CONTEXT_REPLAY names a
+// captured trace, the first completed real search is followed by a pure I/O
+// replay through that search's reader, IOContext, file handle, and sector
+// buffer. The real search diagnostics are restored afterwards.
+int diskann_io_context_replay_once(AlignedFileReader &reader, IOContext &io_ctx,
+                                   void *sector_buffer,
+                                   size_t sector_buffer_size,
+                                   size_t read_stride);
+#endif
+
 }  // namespace core
 }  // namespace zvec

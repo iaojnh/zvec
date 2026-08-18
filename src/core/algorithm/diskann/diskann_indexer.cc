@@ -1188,6 +1188,17 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
 
   stats.total_us += query_timer.micro_seconds();
 
+#if defined(_WIN32) || defined(_WIN64)
+  int replay_ret = diskann_io_context_replay_once(
+      *reader_, io_ctx, sector_buffer,
+      DiskAnnUtil::kMaxSectorReadNum * DiskAnnUtil::kSectorSize,
+      sector_num_per_node * DiskAnnUtil::kSectorSize);
+  if (replay_ret != 0) {
+    ctx->set_error(true);
+    return replay_ret;
+  }
+#endif
+
   return 0;
 }
 
