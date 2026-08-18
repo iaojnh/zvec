@@ -6,12 +6,14 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -62,7 +64,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", default="50")
     parser.add_argument("--max-trace-records", type=int, default=1_000_000)
     parser.add_argument("--skip-build", action="store_true")
-    parser.add_argument(
+    diagnostic_group = parser.add_mutually_exclusive_group()
+    diagnostic_group.add_argument(
+        "--cached-handle-abba",
+        action="store_true",
+        help=(
+            "after trace capture, run only the cached-handle A-B-B-A "
+            "reader comparison; this mode uses one complete trace warmup "
+            "cycle instead of --warmup-seconds"
+        ),
+    )
+    diagnostic_group.add_argument(
         "--full",
         action="store_true",
         help="also rerun the older search and standalone I/O experiments",
@@ -270,6 +282,269 @@ def extract_rows(lines: Sequence[str]) -> list[dict[str, str]]:
             "--skip-build"
         )
     return rows
+
+
+CACHED_HANDLE_ABBA_MODES = (
+    "cached_closed_a1",
+    "cached_held_b1",
+    "cached_held_b2",
+    "cached_closed_a2",
+)
+CACHED_HANDLE_ABBA_REQUIRED_FIELDS = {
+    "mode",
+    "random_access_hint",
+    "queue_depth",
+    "max_batch_size",
+    "batch_gap_us",
+    "iops",
+    "batch_count",
+    "first_completion_ms",
+    "batch_duration_ms",
+    "completions_per_dequeue",
+    "completed_reads",
+}
+CACHED_HANDLE_ABBA_STABILITY_LIMIT = 0.20
+CACHED_HANDLE_ABBA_MATERIAL_SLOWDOWN = 0.20
+
+
+@dataclass(frozen=True)
+class CachedHandleAbbaAnalysis:
+    closed_geomean_iops: float
+    held_geomean_iops: float
+    held_retention_ratio: float
+    closed_spread_ratio: float
+    held_spread_ratio: float
+    stable: bool
+    verdict: str
+
+
+def positive_float(row: dict[str, str], field: str) -> float:
+    try:
+        value = float(row[field])
+    except (KeyError, TypeError, ValueError) as error:
+        msg = f"Invalid cached-handle ABBA {field!r} value"
+        raise RuntimeError(msg) from error
+    if not math.isfinite(value) or value <= 0.0:
+        msg = f"Cached-handle ABBA {field!r} must be finite and positive"
+        raise RuntimeError(msg)
+    return value
+
+
+def cached_handle_abba_rows(lines: Sequence[str]) -> list[dict[str, str]]:
+    rows = extract_rows(lines)
+    modes = tuple(row.get("mode", "") for row in rows)
+    if modes != CACHED_HANDLE_ABBA_MODES:
+        msg = (
+            "Expected exactly cached-handle ABBA rows A1/B1/B2/A2; got "
+            f"{modes or 'no rows'}"
+        )
+        raise RuntimeError(msg)
+
+    max_batch_sizes: set[str] = set()
+    for row in rows:
+        if None in row or not CACHED_HANDLE_ABBA_REQUIRED_FIELDS.issubset(row):
+            raise RuntimeError("Cached-handle ABBA output has an invalid CSV schema")
+        if row["random_access_hint"] != "on" or row["queue_depth"] != "0":
+            raise RuntimeError(
+                "Cached-handle ABBA output is not the aligned reader replay"
+            )
+        if row["batch_gap_us"] != "0":
+            raise RuntimeError("Cached-handle ABBA output unexpectedly includes gaps")
+        for field in (
+            "iops",
+            "batch_count",
+            "first_completion_ms",
+            "batch_duration_ms",
+            "completions_per_dequeue",
+            "completed_reads",
+        ):
+            positive_float(row, field)
+        max_batch_sizes.add(row["max_batch_size"])
+    if len(max_batch_sizes) != 1 or positive_float(rows[0], "max_batch_size") <= 0:
+        raise RuntimeError("Cached-handle ABBA rows do not use one positive batch size")
+    return rows
+
+
+def pair_spread_ratio(first: float, second: float) -> float:
+    return max(first, second) / min(first, second) - 1.0
+
+
+def analyze_cached_handle_abba(
+    rows: Sequence[dict[str, str]],
+) -> CachedHandleAbbaAnalysis:
+    if tuple(row.get("mode", "") for row in rows) != CACHED_HANDLE_ABBA_MODES:
+        raise RuntimeError("Cached-handle ABBA analysis requires A1/B1/B2/A2")
+    iops = {row["mode"]: positive_float(row, "iops") for row in rows}
+    closed_first = iops["cached_closed_a1"]
+    closed_second = iops["cached_closed_a2"]
+    held_first = iops["cached_held_b1"]
+    held_second = iops["cached_held_b2"]
+    closed_geomean = math.sqrt(closed_first * closed_second)
+    held_geomean = math.sqrt(held_first * held_second)
+    closed_spread = pair_spread_ratio(closed_first, closed_second)
+    held_spread = pair_spread_ratio(held_first, held_second)
+    stable = (
+        closed_spread <= CACHED_HANDLE_ABBA_STABILITY_LIMIT
+        and held_spread <= CACHED_HANDLE_ABBA_STABILITY_LIMIT
+    )
+    retention = held_geomean / closed_geomean
+    if not stable:
+        verdict = "inconclusive_unstable"
+    elif retention <= 1.0 - CACHED_HANDLE_ABBA_MATERIAL_SLOWDOWN:
+        verdict = "cached_handle_slowdown_supported"
+    else:
+        verdict = "cached_handle_slowdown_not_supported"
+    return CachedHandleAbbaAnalysis(
+        closed_geomean_iops=closed_geomean,
+        held_geomean_iops=held_geomean,
+        held_retention_ratio=retention,
+        closed_spread_ratio=closed_spread,
+        held_spread_ratio=held_spread,
+        stable=stable,
+        verdict=verdict,
+    )
+
+
+def write_cached_handle_abba_results(
+    output_dir: Path, rows: list[dict[str, str]]
+) -> CachedHandleAbbaAnalysis:
+    analysis = analyze_cached_handle_abba(rows)
+    fields = list(rows[0])
+    with (output_dir / "cached_handle_abba.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    if analysis.verdict == "inconclusive_unstable":
+        verdict_text = (
+            "The A or B repeats differ by more than 20%, so this run is "
+            "inconclusive. Repeat it before attributing the slowdown to the "
+            "cached handle."
+        )
+    elif analysis.verdict == "cached_handle_slowdown_supported":
+        verdict_text = (
+            "Both pairs are stable and retaining the idle cached handle lowers "
+            "the IOPS geometric mean by at least 20%. The cached-handle "
+            "slowdown hypothesis is supported."
+        )
+    else:
+        verdict_text = (
+            "Both pairs are stable, but retaining the idle cached handle does "
+            "not lower the IOPS geometric mean by 20%. The cached-handle "
+            "slowdown hypothesis is not supported."
+        )
+
+    table_lines = [
+        (
+            "| Sequence | Cached handle during replay | IOPS | First ms | "
+            "Batch ms | Comp/dequeue | Completed reads |"
+        ),
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        held = "held open" if "_held_" in row["mode"] else "closed before replay"
+        table_lines.append(
+            "| {mode} | {held} | {iops} | {first_completion_ms} | "
+            "{batch_duration_ms} | {completions_per_dequeue} | "
+            "{completed_reads} |".format(held=held, **row)
+        )
+
+    summary = "\n".join(
+        [
+            "# DiskANN Windows cached-handle ABBA diagnosis",
+            "",
+            *table_lines,
+            "",
+            "## Aggregates",
+            "",
+            (
+                f"- Closed-handle IOPS geometric mean: "
+                f"**{analysis.closed_geomean_iops:.2f}**"
+            ),
+            (
+                f"- Held-handle IOPS geometric mean: "
+                f"**{analysis.held_geomean_iops:.2f}**"
+            ),
+            (
+                f"- Held/closed throughput retention: "
+                f"**{analysis.held_retention_ratio:.1%}**"
+            ),
+            (
+                f"- Closed repeat spread: **{analysis.closed_spread_ratio:.1%}**; "
+                f"held repeat spread: **{analysis.held_spread_ratio:.1%}** "
+                "(stable when each is at most 20%)."
+            ),
+            "",
+            "## Verdict",
+            "",
+            f"**{analysis.verdict}** — {verdict_text}",
+            "",
+            (
+                "A and B use the same captured trace, aligned 512 KiB reader "
+                "buffer, one complete unmeasured trace warmup cycle, and "
+                "measurement duration. Each run creates a fresh "
+                "WindowsAlignedFileReader and IOContext; only the idle ordinary "
+                "cached file handle's lifetime changes. Both conditions first "
+                "perform the same buffered probe read through that handle."
+            ),
+            "",
+        ]
+    )
+    (output_dir / "summary.md").write_text(summary, encoding="utf-8")
+    return analysis
+
+
+def cached_handle_abba_command(
+    iocp_tool: Path,
+    index_file: Path,
+    trace_path: Path,
+    *,
+    replay_seconds: int,
+) -> list[str | Path]:
+    return [
+        iocp_tool,
+        "--file",
+        index_file,
+        "--trace-file",
+        trace_path,
+        "--duration",
+        str(replay_seconds),
+        "--cached-handle-abba",
+    ]
+
+
+def run_cached_handle_abba_diagnosis(
+    iocp_tool: Path | None,
+    index_file: Path,
+    trace_path: Path,
+    output_dir: Path,
+    *,
+    replay_seconds: int,
+) -> None:
+    if iocp_tool is None:
+        raise AssertionError(
+            "Cached-handle ABBA diagnostics require diskann_iocp_bench"
+        )
+    write_console("\nRunning cached-handle A-B-B-A reader comparison...")
+    abba_lines = run_logged(
+        cached_handle_abba_command(
+            iocp_tool,
+            index_file,
+            trace_path,
+            replay_seconds=replay_seconds,
+        ),
+        cwd=output_dir,
+        log_path=output_dir / "cached_handle_abba.log",
+    )
+    abba_rows = cached_handle_abba_rows(abba_lines)
+    analysis = write_cached_handle_abba_results(output_dir, abba_rows)
+    write_console("\nDiagnosis complete.")
+    write_console(f"Verdict: {analysis.verdict}")
+    write_console(f"Summary: {output_dir / 'summary.md'}")
+    write_console(f"ABBA:    {output_dir / 'cached_handle_abba.csv'}")
+    write_console(f"Trace:   {trace_path}")
 
 
 def search_metrics(lines: Sequence[str]) -> dict[str, str]:
@@ -1120,7 +1395,7 @@ def main() -> int:
         output_dir,
         parallel=args.parallel,
         skip_build=args.skip_build,
-        full=args.full,
+        full=args.full or args.cached_handle_abba,
     )
     config_path = output_dir / "capture.yaml"
     trace_path = output_dir / "diskann_io_trace.csv"
@@ -1149,6 +1424,16 @@ def main() -> int:
     )
     if not trace_path.is_file() or trace_path.stat().st_size == 0:
         raise RuntimeError("DiskANN did not produce an I/O trace")
+
+    if args.cached_handle_abba:
+        run_cached_handle_abba_diagnosis(
+            iocp_tool,
+            args.index_file.resolve(),
+            trace_path,
+            output_dir,
+            replay_seconds=args.replay_seconds,
+        )
+        return 0
 
     context_metrics = run_context_comparison(
         bench_tool,

@@ -46,9 +46,7 @@ class UniqueHandle {
       : handle_(handle) {}
 
   ~UniqueHandle() {
-    if (valid()) {
-      ::CloseHandle(handle_);
-    }
+    close();
   }
 
   UniqueHandle(const UniqueHandle &) = delete;
@@ -60,6 +58,13 @@ class UniqueHandle {
 
   HANDLE get() const {
     return handle_;
+  }
+
+  void close() {
+    if (valid()) {
+      ::CloseHandle(handle_);
+      handle_ = INVALID_HANDLE_VALUE;
+    }
   }
 
  private:
@@ -189,6 +194,7 @@ struct Options {
   TraceMode trace_mode = TraceMode::kBoth;
   bool reader_replay = false;
   bool random_batched = false;
+  bool cached_handle_abba = false;
 };
 
 struct RunResult {
@@ -398,6 +404,8 @@ void print_usage() {
          "trace batches (default: 0)\n"
       << "  --reader-replay              Replay trace through the project's "
          "WindowsAlignedFileReader with four buffer allocations\n"
+      << "  --cached-handle-abba         Run only the cached-handle A-B-B-A "
+         "reader comparison\n"
       << "  --random-batched             Replay trace batch shapes with fresh "
          "random offsets\n"
       << "  --seed VALUE                 Random seed\n"
@@ -462,6 +470,8 @@ Options parse_options(int argc, wchar_t **argv) {
           parse_batch_gaps(require_value(argc, argv, index, "--batch-gaps-us"));
     } else if (argument == L"--reader-replay") {
       options.reader_replay = true;
+    } else if (argument == L"--cached-handle-abba") {
+      options.cached_handle_abba = true;
     } else if (argument == L"--random-batched") {
       options.random_batched = true;
     } else {
@@ -575,6 +585,22 @@ uint64_t file_size(HANDLE file_handle) {
                              std::to_string(::GetLastError()));
   }
   return static_cast<uint64_t>(size.QuadPart);
+}
+
+void prime_cached_handle(HANDLE file_handle, uint64_t size) {
+  const DWORD probe_size = static_cast<DWORD>(
+      std::min<uint64_t>(size, static_cast<uint64_t>(kRequiredAlignment)));
+  std::vector<unsigned char> probe(probe_size);
+  DWORD bytes_read = 0;
+  if (!::ReadFile(file_handle, probe.data(), probe_size, &bytes_read,
+                  nullptr)) {
+    throw std::runtime_error("Cached-handle probe read failed with error " +
+                             std::to_string(::GetLastError()));
+  }
+  if (bytes_read != probe_size) {
+    throw std::runtime_error(
+        "Cached-handle probe returned an unexpected byte count");
+  }
 }
 
 void set_overlapped_offset(OVERLAPPED &overlapped, uint64_t offset) {
@@ -1055,19 +1081,22 @@ class ScopedDiskAnnIoContext {
   zvec::core::IOContext context_{nullptr};
 };
 
-void replay_reader_batches_until(zvec::core::WindowsAlignedFileReader &reader,
-                                 zvec::core::IOContext &context,
-                                 uint64_t deadline, uint64_t frequency,
-                                 const TraceData &trace, unsigned char *buffer,
-                                 size_t &batch_index, RunResult *result) {
+void replay_reader_batches_until(
+    zvec::core::WindowsAlignedFileReader &reader,
+    zvec::core::IOContext &context, uint64_t deadline, uint64_t frequency,
+    const TraceData &trace, unsigned char *buffer, size_t &batch_index,
+    RunResult *result,
+    size_t max_batches = std::numeric_limits<size_t>::max()) {
   std::vector<zvec::core::AlignedRead> read_requests;
   read_requests.reserve(trace.max_batch_size);
   std::vector<uint32_t> completed_indices;
   completed_indices.reserve(trace.max_batch_size);
 
-  while (counter_now() < deadline) {
+  size_t processed_batches = 0;
+  while (processed_batches < max_batches && counter_now() < deadline) {
     const TraceBatch &batch = trace.batches[batch_index];
     batch_index = (batch_index + 1) % trace.batches.size();
+    ++processed_batches;
     read_requests.clear();
     for (size_t index = 0; index < batch.reads.size(); ++index) {
       const ReadSpec &spec = batch.reads[index];
@@ -1117,11 +1146,9 @@ void replay_reader_batches_until(zvec::core::WindowsAlignedFileReader &reader,
   }
 }
 
-RunResult run_reader_batched_benchmark(const Options &options,
-                                       const TraceData &trace,
-                                       const std::string &mode,
-                                       BufferAllocator allocator,
-                                       size_t buffer_size) {
+RunResult run_reader_batched_benchmark(
+    const Options &options, const TraceData &trace, const std::string &mode,
+    BufferAllocator allocator, size_t buffer_size, bool keep_cached_handle) {
   RunResult result;
   result.mode = mode;
   result.random_access_hint = true;
@@ -1130,26 +1157,33 @@ RunResult run_reader_batched_benchmark(const Options &options,
       static_cast<size_t>(options.duration_seconds) * 50000U, 10000000U);
   result.latency_ms.reserve(expected_completions);
 
-  {
-    UniqueHandle validation_handle(::CreateFileW(
-        options.file_path.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_READONLY, nullptr));
-    if (!validation_handle.valid()) {
-      throw std::runtime_error("CreateFileW failed with error " +
-                               std::to_string(::GetLastError()));
-    }
-    const uint64_t size = file_size(validation_handle.get());
-    for (const ReadSpec &spec : trace.reads) {
-      if (spec.offset > size || spec.length > size - spec.offset) {
-        throw std::runtime_error("Trace read extends beyond the input file");
-      }
+  const DWORD cached_handle_attributes = options.cached_handle_abba
+                                             ? FILE_ATTRIBUTE_NORMAL
+                                             : FILE_ATTRIBUTE_READONLY;
+  UniqueHandle cached_handle(
+      ::CreateFileW(options.file_path.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, cached_handle_attributes, nullptr));
+  if (!cached_handle.valid()) {
+    throw std::runtime_error("CreateFileW failed with error " +
+                             std::to_string(::GetLastError()));
+  }
+  const uint64_t size = file_size(cached_handle.get());
+  if (options.cached_handle_abba) {
+    prime_cached_handle(cached_handle.get(), size);
+  }
+  for (const ReadSpec &spec : trace.reads) {
+    if (spec.offset > size || spec.length > size - spec.offset) {
+      throw std::runtime_error("Trace read extends beyond the input file");
     }
   }
+  if (!keep_cached_handle) {
+    cached_handle.close();
+  }
 
-  const size_t required_size = static_cast<size_t>(trace.max_batch_size) *
-                               static_cast<size_t>(trace.max_length);
-  if (buffer_size < required_size) {
+  if (trace.max_length == 0 || trace.max_batch_size == 0 ||
+      static_cast<size_t>(trace.max_batch_size) >
+          buffer_size / static_cast<size_t>(trace.max_length)) {
     throw std::runtime_error(
         "Reader replay buffer is smaller than the largest "
         "captured batch");
@@ -1163,11 +1197,20 @@ RunResult run_reader_batched_benchmark(const Options &options,
 
   const uint64_t frequency = counter_frequency();
   size_t batch_index = 0;
-  const uint64_t warmup_deadline =
-      counter_now() + static_cast<uint64_t>(options.warmup_seconds) * frequency;
-  replay_reader_batches_until(reader, context, warmup_deadline, frequency,
-                              trace, buffer.data(), batch_index, nullptr);
+  if (options.cached_handle_abba) {
+    replay_reader_batches_until(
+        reader, context, std::numeric_limits<uint64_t>::max(), frequency, trace,
+        buffer.data(), batch_index, nullptr, trace.batches.size());
+  } else {
+    const uint64_t warmup_deadline =
+        counter_now() +
+        static_cast<uint64_t>(options.warmup_seconds) * frequency;
+    replay_reader_batches_until(reader, context, warmup_deadline, frequency,
+                                trace, buffer.data(), batch_index, nullptr);
+  }
 
+  // Restart measurement at the first captured batch after either warmup mode.
+  batch_index = 0;
   context->diagnostics = zvec::core::IoBackend::IocpDiagnostics{};
   context->diagnostics_enabled = true;
   const uint64_t measurement_start = counter_now();
@@ -1298,14 +1341,21 @@ int wmain(int argc, wchar_t **argv) {
     if (options.reader_replay && !has_trace) {
       throw std::invalid_argument("--reader-replay requires --trace-file");
     }
+    if (options.cached_handle_abba && !has_trace) {
+      throw std::invalid_argument("--cached-handle-abba requires --trace-file");
+    }
     if (options.random_batched && !has_trace) {
       throw std::invalid_argument("--random-batched requires --trace-file");
     }
     std::cout << "DiskANN Windows IOCP microbenchmark\n"
               << "file: " << wide_to_utf8(options.file_path) << '\n'
-              << "block_size: " << options.block_size << " bytes\n"
-              << "warmup: " << options.warmup_seconds << " seconds/run\n"
-              << "duration: " << options.duration_seconds << " seconds/run\n";
+              << "block_size: " << options.block_size << " bytes\n";
+    if (options.cached_handle_abba) {
+      std::cout << "warmup: one complete trace cycle/run\n";
+    } else {
+      std::cout << "warmup: " << options.warmup_seconds << " seconds/run\n";
+    }
+    std::cout << "duration: " << options.duration_seconds << " seconds/run\n";
     if (has_trace) {
       std::cout << "trace_file: " << wide_to_utf8(options.trace_file) << '\n'
                 << "trace_reads: " << trace.reads.size() << '\n'
@@ -1325,6 +1375,27 @@ int wmain(int argc, wchar_t **argv) {
            "batch,readfile_submit_us_per_read,get_overlapped_us_per_read,"
            "completions_per_dequeue,max_dequeued,pending_ratio_pct,completed_"
            "reads\n";
+
+    if (options.cached_handle_abba) {
+      std::vector<RunResult> results;
+      results.reserve(4);
+      results.emplace_back(run_reader_batched_benchmark(
+          options, trace, "cached_closed_a1", BufferAllocator::kAlignedHeap,
+          kDiskAnnContextBufferSize, false));
+      results.emplace_back(run_reader_batched_benchmark(
+          options, trace, "cached_held_b1", BufferAllocator::kAlignedHeap,
+          kDiskAnnContextBufferSize, true));
+      results.emplace_back(run_reader_batched_benchmark(
+          options, trace, "cached_held_b2", BufferAllocator::kAlignedHeap,
+          kDiskAnnContextBufferSize, true));
+      results.emplace_back(run_reader_batched_benchmark(
+          options, trace, "cached_closed_a2", BufferAllocator::kAlignedHeap,
+          kDiskAnnContextBufferSize, false));
+      for (const RunResult &result : results) {
+        print_result(result);
+      }
+      return 0;
+    }
 
     const std::vector<bool> modes = hint_modes(options.random_access_hint);
     for (bool random_access_hint : modes) {
@@ -1359,16 +1430,16 @@ int wmain(int argc, wchar_t **argv) {
       }
       print_result(run_reader_batched_benchmark(
           options, trace, "reader_virtual_compact", BufferAllocator::kVirtual,
-          compact_size));
+          compact_size, false));
       print_result(run_reader_batched_benchmark(
           options, trace, "reader_virtual_context", BufferAllocator::kVirtual,
-          kDiskAnnContextBufferSize));
+          kDiskAnnContextBufferSize, false));
       print_result(run_reader_batched_benchmark(
           options, trace, "reader_aligned_compact",
-          BufferAllocator::kAlignedHeap, compact_size));
+          BufferAllocator::kAlignedHeap, compact_size, false));
       print_result(run_reader_batched_benchmark(
           options, trace, "reader_aligned_context",
-          BufferAllocator::kAlignedHeap, kDiskAnnContextBufferSize));
+          BufferAllocator::kAlignedHeap, kDiskAnnContextBufferSize, false));
     }
   } catch (const std::exception &error) {
     std::cerr << "ERROR: " << error.what() << '\n';
