@@ -264,34 +264,14 @@ int replay_until(AlignedFileReader &reader, IOContext &io_ctx,
   return 0;
 }
 
-int run_context_replay(AlignedFileReader &reader, IOContext &io_ctx,
-                       void *sector_buffer, size_t sector_buffer_size,
-                       size_t read_stride, const std::string &trace_path) {
+int measure_context_replay(AlignedFileReader &reader, IOContext &io_ctx,
+                           std::vector<std::vector<AlignedRead>> &batches,
+                           size_t sector_buffer_size, size_t read_stride,
+                           const char *context_name) {
   if (io_ctx == nullptr || io_ctx == reinterpret_cast<IOContext>(-1) ||
-      sector_buffer == nullptr) {
+      context_name == nullptr) {
     LOG_ERROR("DiskAnn context replay received an invalid search context");
     return IndexError_InvalidArgument;
-  }
-
-  std::vector<ReplayBatch> trace_batches;
-  int ret = load_replay_trace(trace_path, trace_batches, sector_buffer_size,
-                              read_stride);
-  if (ret != 0) {
-    return ret;
-  }
-
-  auto *buffer = static_cast<uint8_t *>(sector_buffer);
-  std::vector<std::vector<AlignedRead>> batches;
-  batches.reserve(trace_batches.size());
-  for (const ReplayBatch &trace_batch : trace_batches) {
-    std::vector<AlignedRead> requests;
-    requests.reserve(trace_batch.reads.size());
-    for (size_t index = 0; index < trace_batch.reads.size(); ++index) {
-      const ReplayRead &read = trace_batch.reads[index];
-      requests.emplace_back(read.offset, read.length,
-                            buffer + index * read_stride);
-    }
-    batches.push_back(std::move(requests));
   }
 
   const bool saved_diagnostics_enabled = io_ctx->diagnostics_enabled;
@@ -307,7 +287,7 @@ int run_context_replay(AlignedFileReader &reader, IOContext &io_ctx,
       replay_seconds("ZVEC_DISKANN_IO_CONTEXT_REPLAY_SECONDS", 10);
   size_t batch_index = 0;
   io_ctx->diagnostics_enabled = false;
-  ret = replay_until(
+  int ret = replay_until(
       reader, io_ctx, batches,
       std::chrono::steady_clock::now() + std::chrono::seconds(warmup_seconds),
       batch_index);
@@ -348,14 +328,14 @@ int run_context_replay(AlignedFileReader &reader, IOContext &io_ctx,
       100.0 * average(replay.pending_reads, replay.submitted_reads);
 
   LOG_INFO(
-      "DiskAnn in-process IOCP replay: phase=after_search, batches=%llu, "
-      "reads=%llu, reads/batch=%.2f, iops=%.2f, pending_ratio=%.2f%%, "
-      "max_outstanding=%u, submit_us/batch=%.2f, first_completion_us=%.2f, "
-      "batch_duration_us=%.2f, iocp_wait_us/batch=%.2f, "
-      "readfile_submit_us/read=%.2f, get_overlapped_us/read=%.2f, "
-      "completions/dequeue=%.2f, max_dequeued_once=%u, buffer_bytes=%zu, "
-      "read_stride=%zu",
-      static_cast<unsigned long long>(replay.batch_count),
+      "DiskAnn in-process IOCP replay: phase=after_search, context=%s, "
+      "batches=%llu, reads=%llu, reads/batch=%.2f, iops=%.2f, "
+      "pending_ratio=%.2f%%, max_outstanding=%u, submit_us/batch=%.2f, "
+      "first_completion_us=%.2f, batch_duration_us=%.2f, "
+      "iocp_wait_us/batch=%.2f, readfile_submit_us/read=%.2f, "
+      "get_overlapped_us/read=%.2f, completions/dequeue=%.2f, "
+      "max_dequeued_once=%u, buffer_bytes=%zu, read_stride=%zu",
+      context_name, static_cast<unsigned long long>(replay.batch_count),
       static_cast<unsigned long long>(replay.submitted_reads), reads_per_batch,
       iops, pending_ratio, replay.max_outstanding,
       average(replay.batch_submit_ns, replay.batch_count) / 1000.0,
@@ -367,6 +347,57 @@ int run_context_replay(AlignedFileReader &reader, IOContext &io_ctx,
       average(replay.dequeued_reads, replay.dequeue_calls),
       replay.max_dequeued_once, sector_buffer_size, read_stride);
   return 0;
+}
+
+int run_context_replay(AlignedFileReader &reader, IOContext &io_ctx,
+                       void *sector_buffer, size_t sector_buffer_size,
+                       size_t read_stride, const std::string &trace_path) {
+  if (io_ctx == nullptr || io_ctx == reinterpret_cast<IOContext>(-1) ||
+      sector_buffer == nullptr) {
+    LOG_ERROR("DiskAnn context replay received an invalid search context");
+    return IndexError_InvalidArgument;
+  }
+
+  std::vector<ReplayBatch> trace_batches;
+  int ret = load_replay_trace(trace_path, trace_batches, sector_buffer_size,
+                              read_stride);
+  if (ret != 0) {
+    return ret;
+  }
+
+  auto *buffer = static_cast<uint8_t *>(sector_buffer);
+  std::vector<std::vector<AlignedRead>> batches;
+  batches.reserve(trace_batches.size());
+  for (const ReplayBatch &trace_batch : trace_batches) {
+    std::vector<AlignedRead> requests;
+    requests.reserve(trace_batch.reads.size());
+    for (size_t index = 0; index < trace_batch.reads.size(); ++index) {
+      const ReplayRead &read = trace_batch.reads[index];
+      requests.emplace_back(read.offset, read.length,
+                            buffer + index * read_stride);
+    }
+    batches.push_back(std::move(requests));
+  }
+
+  ret = measure_context_replay(reader, io_ctx, batches, sector_buffer_size,
+                               read_stride, "used");
+  if (ret != 0) {
+    return ret;
+  }
+
+  IOContext fresh_io_ctx = nullptr;
+  ret = setup_io_ctx(fresh_io_ctx);
+  if (ret != 0) {
+    LOG_ERROR("Failed to create fresh DiskAnn replay context, ret=%d", ret);
+    return ret;
+  }
+  ret = measure_context_replay(reader, fresh_io_ctx, batches,
+                               sector_buffer_size, read_stride, "fresh");
+  const int destroy_ret = destroy_io_ctx(fresh_io_ctx);
+  if (ret != 0) {
+    return ret;
+  }
+  return destroy_ret;
 }
 
 #endif

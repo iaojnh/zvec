@@ -34,8 +34,9 @@ void diskann_io_trace_record_batch(
 #if defined(_WIN32) || defined(_WIN64)
 // Diagnostic-only control run. When ZVEC_DISKANN_IO_CONTEXT_REPLAY names a
 // captured trace, the first completed real search is followed by a pure I/O
-// replay through that search's reader, IOContext, file handle, and sector
-// buffer. The real search diagnostics are restored afterwards.
+// replay through both the search's used IOContext and a freshly created
+// IOContext. Both controls reuse the same reader, request batches, thread, and
+// sector buffer. The real search diagnostics are restored afterwards.
 int diskann_io_context_replay_once(AlignedFileReader &reader, IOContext &io_ctx,
                                    void *sector_buffer,
                                    size_t sector_buffer_size,
