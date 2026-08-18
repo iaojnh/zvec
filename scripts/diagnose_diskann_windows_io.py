@@ -24,10 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build the Windows DiskANN diagnostic tools, capture the real "
-            "search I/O trace, compare interleaved and drain-first completion "
-            "processing, replay pure I/O inside the post-search context, and "
-            "compare repeated-trace and fresh-random offsets under the "
-            "original batch scheduling."
+            "search I/O trace, then compare its used IOContext with a fresh "
+            "IOContext in the same process."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -50,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", default="50")
     parser.add_argument("--max-trace-records", type=int, default=1_000_000)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="also rerun the older search and standalone I/O experiments",
+    )
     return parser.parse_args()
 
 
@@ -122,8 +125,9 @@ def ensure_tools(
     *,
     parallel: int,
     skip_build: bool,
-) -> tuple[Path, Path]:
-    names = ("bench_original", "diskann_iocp_bench")
+    full: bool,
+) -> tuple[Path, Path | None]:
+    names = ("bench_original", "diskann_iocp_bench") if full else ("bench_original",)
     tools = {name: find_tool(build_dir, name) for name in names}
     if not skip_build:
         cmake = executable("cmake", repo_root)
@@ -175,8 +179,8 @@ def ensure_tools(
         msg = f"Missing tools in {build_dir}: {', '.join(missing)}"
         raise FileNotFoundError(msg)
     bench_tool = tools["bench_original"]
-    iocp_tool = tools["diskann_iocp_bench"]
-    if bench_tool is None or iocp_tool is None:
+    iocp_tool = tools.get("diskann_iocp_bench")
+    if bench_tool is None or (full and iocp_tool is None):
         raise AssertionError("Tool discovery and validation disagree")
     return bench_tool, iocp_tool
 
@@ -715,6 +719,110 @@ def interpretation(
     return lines
 
 
+CONTEXT_FIELDS = (
+    "phase",
+    "context",
+    "batches",
+    "reads",
+    "reads_per_batch",
+    "iops",
+    "pending_ratio_pct",
+    "max_outstanding",
+    "batch_submit_us",
+    "first_completion_us",
+    "batch_duration_us",
+    "iocp_wait_us_per_batch",
+    "readfile_submit_us_per_read",
+    "get_overlapped_us_per_read",
+    "completions_per_dequeue",
+    "max_dequeued_once",
+    "buffer_bytes",
+    "read_stride",
+    "live_search_reads_per_batch",
+    "live_search_batch_submit_us",
+    "live_search_first_completion_us",
+    "live_search_batch_duration_us",
+    "live_search_iocp_wait_us_per_batch",
+    "live_search_completions_per_dequeue",
+)
+
+
+def write_context_csv(
+    output_dir: Path, context_replays: dict[str, dict[str, str]]
+) -> None:
+    with (output_dir / "context_replay.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as output:
+        writer = csv.DictWriter(output, fieldnames=CONTEXT_FIELDS)
+        writer.writeheader()
+        for context in ("used", "fresh"):
+            replay = context_replays[context]
+            writer.writerow({name: replay.get(name, "") for name in CONTEXT_FIELDS})
+
+
+def context_report_lines(
+    context_replays: dict[str, dict[str, str]],
+) -> list[str]:
+    used_context = context_replays["used"]
+    lines = [
+        "## In-process context replay",
+        "",
+        (
+            "| Context | Batches | Reads/batch | IOPS | First us | Batch us | "
+            "IOCP wait us/batch | Submit us/batch | Comp/dequeue |"
+        ),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            "| live_search |  | {live_search_reads_per_batch} |  | "
+            "{live_search_first_completion_us} | "
+            "{live_search_batch_duration_us} | "
+            "{live_search_iocp_wait_us_per_batch} | "
+            "{live_search_batch_submit_us} | "
+            "{live_search_completions_per_dequeue} |"
+        ).format(**used_context),
+    ]
+    for context in ("used", "fresh"):
+        lines.append(
+            (
+                "| {context} | {batches} | {reads_per_batch} | {iops} | "
+                "{first_completion_us} | {batch_duration_us} | "
+                "{iocp_wait_us_per_batch} | {batch_submit_us} | "
+                "{completions_per_dequeue} |"
+            ).format(**context_replays[context])
+        )
+    lines.extend(
+        [
+            "",
+            (
+                "Both controls run after the first real query. They use the "
+                "same process, thread, reader, request batches, and sector "
+                "buffer; only the IOContext and its file handle/completion "
+                "port change."
+            ),
+        ]
+    )
+    return lines
+
+
+def write_context_results(
+    output_dir: Path, context_replays: dict[str, dict[str, str]]
+) -> None:
+    write_context_csv(output_dir, context_replays)
+    summary = "\n".join(
+        [
+            "# DiskANN Windows IOContext diagnosis",
+            "",
+            *context_report_lines(context_replays),
+            "",
+            "## Interpretation",
+            "",
+            *context_replay_interpretation(context_replays),
+            "",
+        ]
+    )
+    (output_dir / "summary.md").write_text(summary, encoding="utf-8")
+
+
 def write_results(
     output_dir: Path,
     rows: list[dict[str, str]],
@@ -809,80 +917,8 @@ def write_results(
             )
         )
 
-    context_fields = [
-        "phase",
-        "context",
-        "batches",
-        "reads",
-        "reads_per_batch",
-        "iops",
-        "pending_ratio_pct",
-        "max_outstanding",
-        "batch_submit_us",
-        "first_completion_us",
-        "batch_duration_us",
-        "iocp_wait_us_per_batch",
-        "readfile_submit_us_per_read",
-        "get_overlapped_us_per_read",
-        "completions_per_dequeue",
-        "max_dequeued_once",
-        "buffer_bytes",
-        "read_stride",
-        "live_search_reads_per_batch",
-        "live_search_batch_submit_us",
-        "live_search_first_completion_us",
-        "live_search_batch_duration_us",
-        "live_search_iocp_wait_us_per_batch",
-        "live_search_completions_per_dequeue",
-    ]
-    with (output_dir / "context_replay.csv").open(
-        "w", encoding="utf-8", newline=""
-    ) as output:
-        writer = csv.DictWriter(output, fieldnames=context_fields)
-        writer.writeheader()
-        for context in ("used", "fresh"):
-            replay = context_replays[context]
-            writer.writerow({name: replay.get(name, "") for name in context_fields})
-
-    used_context = context_replays["used"]
-
-    context_lines = [
-        "## In-process context replay",
-        "",
-        (
-            "| Context | Batches | Reads/batch | IOPS | First us | Batch us | "
-            "IOCP wait us/batch | Submit us/batch | Comp/dequeue |"
-        ),
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-        (
-            "| live_search |  | {live_search_reads_per_batch} |  | "
-            "{live_search_first_completion_us} | "
-            "{live_search_batch_duration_us} | "
-            "{live_search_iocp_wait_us_per_batch} | "
-            "{live_search_batch_submit_us} | "
-            "{live_search_completions_per_dequeue} |"
-        ).format(**used_context),
-    ]
-    for context in ("used", "fresh"):
-        context_lines.append(
-            (
-                "| {context} | {batches} | {reads_per_batch} | {iops} | "
-                "{first_completion_us} | {batch_duration_us} | "
-                "{iocp_wait_us_per_batch} | {batch_submit_us} | "
-                "{completions_per_dequeue} |"
-            ).format(**context_replays[context])
-        )
-    context_lines.extend(
-        [
-            "",
-            (
-                "Both controls run after the first real query. They use the "
-                "same process, thread, reader, request batches, and sector "
-                "buffer; only the IOContext and its file handle/completion "
-                "port change."
-            ),
-        ]
-    )
+    write_context_csv(output_dir, context_replays)
+    context_lines = context_report_lines(context_replays)
 
     summary = "\n".join(
         [
@@ -1006,6 +1042,34 @@ def search_environment(
     return env
 
 
+def run_context_comparison(
+    bench_tool: Path,
+    config_path: Path,
+    output_dir: Path,
+    trace_path: Path,
+    *,
+    replay_seconds: int,
+    warmup_seconds: int,
+) -> dict[str, dict[str, str]]:
+    write_console("\nComparing the used and fresh IOContext...")
+    lines = run_logged(
+        [bench_tool, config_path],
+        cwd=output_dir,
+        env=search_environment(
+            drain_first=False,
+            context_replay_trace=trace_path,
+            context_replay_seconds=replay_seconds,
+            context_replay_warmup_seconds=warmup_seconds,
+        ),
+        log_path=output_dir / "context_replay.log",
+    )
+    context_metrics = context_replay_metrics(lines)
+    live_search = search_metrics(lines)
+    require_search_mode(live_search, "interleaved")
+    add_live_search_context(context_metrics, live_search)
+    return context_metrics
+
+
 def main() -> int:
     args = parse_args()
     validate_args(args)
@@ -1023,6 +1087,7 @@ def main() -> int:
         output_dir,
         parallel=args.parallel,
         skip_build=args.skip_build,
+        full=args.full,
     )
     config_path = output_dir / "capture.yaml"
     trace_path = output_dir / "diskann_io_trace.csv"
@@ -1051,6 +1116,26 @@ def main() -> int:
     if not trace_path.is_file() or trace_path.stat().st_size == 0:
         raise RuntimeError("DiskANN did not produce an I/O trace")
 
+    context_metrics = run_context_comparison(
+        bench_tool,
+        config_path,
+        output_dir,
+        trace_path,
+        replay_seconds=args.replay_seconds,
+        warmup_seconds=args.warmup_seconds,
+    )
+
+    if not args.full:
+        write_context_results(output_dir, context_metrics)
+        write_console("\nDiagnosis complete.")
+        write_console(f"Summary: {output_dir / 'summary.md'}")
+        write_console(f"Context: {output_dir / 'context_replay.csv'}")
+        write_console(f"Trace:   {trace_path}")
+        return 0
+
+    if iocp_tool is None:
+        raise AssertionError("Full diagnostics require diskann_iocp_bench")
+
     write_console("\nRunning interleaved-completion search baseline...")
     interleaved_lines = run_logged(
         [bench_tool, config_path],
@@ -1065,19 +1150,6 @@ def main() -> int:
         env=search_environment(drain_first=True),
         log_path=output_dir / "search_drain_first.log",
     )
-    write_console("\nRunning pure I/O replay inside the post-search context...")
-    context_replay_lines = run_logged(
-        [bench_tool, config_path],
-        cwd=output_dir,
-        env=search_environment(
-            drain_first=False,
-            context_replay_trace=trace_path,
-            context_replay_seconds=args.replay_seconds,
-            context_replay_warmup_seconds=args.warmup_seconds,
-        ),
-        log_path=output_dir / "context_replay.log",
-    )
-
     queue_depths = ",".join(str(value) for value in args.queue_depths)
     batch_gaps_us = ",".join(str(value) for value in args.batch_gaps_us)
     common: list[str | Path] = [
@@ -1119,12 +1191,8 @@ def main() -> int:
     rows = [*extract_rows(uniform_lines), *extract_rows(trace_lines)]
     interleaved_metrics = search_metrics(interleaved_lines)
     drain_first_metrics = search_metrics(drain_first_lines)
-    context_metrics = context_replay_metrics(context_replay_lines)
-    context_live_search = search_metrics(context_replay_lines)
     require_search_mode(interleaved_metrics, "interleaved")
     require_search_mode(drain_first_metrics, "drain_first")
-    require_search_mode(context_live_search, "interleaved")
-    add_live_search_context(context_metrics, context_live_search)
     search_runs = {
         "interleaved": interleaved_metrics,
         "drain_first": drain_first_metrics,
