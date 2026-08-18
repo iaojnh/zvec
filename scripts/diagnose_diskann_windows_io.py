@@ -43,7 +43,21 @@ def parse_args() -> argparse.Namespace:
         "--batch-gaps-us", nargs="+", type=int, default=(0, 50, 100, 250, 500, 1000)
     )
     parser.add_argument("--list-size", type=int, default=100)
-    parser.add_argument("--cache-nodes", type=int, default=10_000)
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument(
+        "--cache-nodes",
+        type=int,
+        help="cache this many BFS nodes (legacy sizing mode)",
+    )
+    cache_group.add_argument(
+        "--cache-budget-mb",
+        type=int,
+        help=(
+            "size each physical index's BFS node cache from this nominal "
+            "memory budget; "
+            "recommended for cross-platform comparisons"
+        ),
+    )
     parser.add_argument("--beam-size", type=int, default=20)
     parser.add_argument("--top-k", default="50")
     parser.add_argument("--max-trace-records", type=int, default=1_000_000)
@@ -53,7 +67,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="also rerun the older search and standalone I/O experiments",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.cache_nodes is None and args.cache_budget_mb is None:
+        args.cache_nodes = 10_000
+    return args
 
 
 def write_console(message: str = "") -> None:
@@ -196,10 +213,20 @@ def write_search_config(
     query_file: Path,
     capture_seconds: int,
     list_size: int,
-    cache_nodes: int,
+    cache_nodes: int | None,
+    cache_budget_mb: int | None,
     beam_size: int,
     top_k: str,
 ) -> None:
+    if cache_budget_mb is not None:
+        cache_setting = (
+            "    zvec.diskann.searcher.cache_node_budget_bytes: !!int "
+            f"{cache_budget_mb * 1024 * 1024}"
+        )
+    else:
+        cache_setting = (
+            f"    zvec.diskann.searcher.cache_node_num: !!int {cache_nodes or 0}"
+        )
     content = f"""SearcherCommon:
     SearcherClass: DiskAnnSearcher
     IndexPath: {yaml_string(index_file)}
@@ -215,7 +242,7 @@ def write_search_config(
     ContainerType: FileReadStorage
     LogLevel: Info
 SearcherParams:
-    zvec.diskann.searcher.cache_node_num: !!int {cache_nodes}
+{cache_setting}
     zvec.diskann.searcher.list_size: !!int {list_size}
     zvec.diskann.searcher.beam_size: !!int {beam_size}
 ContainerParams: {{}}
@@ -1008,8 +1035,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--batch-gaps-us must be between 0 and 1000000")
     if 0 not in args.batch_gaps_us:
         raise ValueError("--batch-gaps-us must include 0 for the baseline")
-    if args.cache_nodes < 0:
-        raise ValueError("--cache-nodes must not be negative")
+    if args.cache_nodes is not None and not 0 <= args.cache_nodes <= 0xFFFFFFFF:
+        raise ValueError("--cache-nodes must be between 0 and UINT32_MAX")
+    if args.cache_budget_mb is not None and args.cache_budget_mb <= 0:
+        raise ValueError("--cache-budget-mb must be positive")
+    if args.cache_budget_mb is not None and args.cache_budget_mb > ((1 << 63) - 1) // (
+        1024 * 1024
+    ):
+        raise ValueError("--cache-budget-mb exceeds INT64_MAX bytes")
 
 
 def search_environment(
@@ -1098,6 +1131,7 @@ def main() -> int:
         capture_seconds=args.capture_seconds,
         list_size=args.list_size,
         cache_nodes=args.cache_nodes,
+        cache_budget_mb=args.cache_budget_mb,
         beam_size=args.beam_size,
         top_k=args.top_k,
     )
