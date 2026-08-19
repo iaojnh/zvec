@@ -23,12 +23,16 @@
 #include "distance/neon/fp32/cosine.h"
 #include "distance/neon/fp32/inner_product.h"
 #include "distance/neon/fp32/squared_euclidean.h"
+#include "distance/neon/record_quantized_int4/common.h"
+#include "distance/neon/record_quantized_int8/common.h"
 #include "distance/scalar/fp16/cosine.h"
 #include "distance/scalar/fp16/inner_product.h"
 #include "distance/scalar/fp16/squared_euclidean.h"
 #include "distance/scalar/fp32/cosine.h"
 #include "distance/scalar/fp32/inner_product.h"
 #include "distance/scalar/fp32/squared_euclidean.h"
+#include "distance/scalar/record_quantized_int4/common.h"
+#include "distance/scalar/record_quantized_int8/common.h"
 
 namespace zvec::turbo {
 namespace {
@@ -97,7 +101,37 @@ TEST(NeonDistance, Fp16MatchesScalarForRemainders) {
 #endif
 }
 
-TEST(NeonDistance, DispatchProvidesAllFpKernels) {
+TEST(NeonDistance, RecordIntegerProductsMatchScalarForRemainders) {
+#if !defined(__ARM_NEON) || !defined(__aarch64__)
+  GTEST_SKIP() << "NEON distance kernels require AArch64";
+#else
+  std::vector<int8_t> int8_a(97);
+  std::vector<int8_t> int8_b(97);
+  for (size_t i = 0; i < int8_a.size(); ++i) {
+    int8_a[i] = static_cast<int8_t>((i * 37) % 255 - 127);
+    int8_b[i] = static_cast<int8_t>((i * 53) % 255 - 127);
+  }
+  for (size_t dim = 0; dim <= int8_a.size(); ++dim) {
+    EXPECT_FLOAT_EQ(
+        scalar::internal::ip_int8_scalar(int8_a.data(), int8_b.data(), dim),
+        neon::internal::ip_int8_neon(int8_a.data(), int8_b.data(), dim));
+  }
+
+  std::vector<uint8_t> int4_a(49);
+  std::vector<uint8_t> int4_b(49);
+  for (size_t i = 0; i < int4_a.size(); ++i) {
+    int4_a[i] = static_cast<uint8_t>((i * 67) & 0xff);
+    int4_b[i] = static_cast<uint8_t>((i * 89) & 0xff);
+  }
+  for (size_t dim = 0; dim <= int4_a.size() * 2; dim += 2) {
+    EXPECT_FLOAT_EQ(
+        scalar::internal::ip_int4_scalar(int4_a.data(), int4_b.data(), dim),
+        neon::internal::ip_int4_neon(int4_a.data(), int4_b.data(), dim));
+  }
+#endif
+}
+
+TEST(NeonDistance, DispatchProvidesAllKernels) {
 #if !defined(__ARM_NEON) || !defined(__aarch64__)
   GTEST_SKIP() << "NEON distance kernels require AArch64";
 #else
@@ -114,6 +148,16 @@ TEST(NeonDistance, DispatchProvidesAllFpKernels) {
         metric, DataType::kFp16, QuantizeType::kFp16, CpuArchType::kNEON);
     EXPECT_TRUE(fp16.dist);
     EXPECT_TRUE(fp16.batch);
+
+    const auto int8 = get_distance_kernels(
+        metric, DataType::kInt8, QuantizeType::kRecord, CpuArchType::kNEON);
+    EXPECT_TRUE(int8.dist);
+    EXPECT_TRUE(int8.batch);
+
+    const auto int4 = get_distance_kernels(
+        metric, DataType::kInt4, QuantizeType::kRecord, CpuArchType::kNEON);
+    EXPECT_TRUE(int4.dist);
+    EXPECT_TRUE(int4.batch);
   }
 #endif
 }
