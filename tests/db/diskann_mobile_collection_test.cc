@@ -256,31 +256,31 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
   ASSERT_TRUE(create_result.has_value()) << create_result.error().message();
   auto collection = std::move(create_result.value());
 
-  auto path_result = collection->Path();
+  auto path_result = collection->path();
   ASSERT_TRUE(path_result.has_value()) << path_result.error().message();
   EXPECT_EQ(*path_result, kCollectionPath);
-  auto schema_result = collection->Schema();
+  auto schema_result = collection->schema();
   ASSERT_TRUE(schema_result.has_value()) << schema_result.error().message();
   EXPECT_EQ(*schema_result, *schema);
-  auto options_result = collection->Options();
+  auto options_result = collection->options();
   ASSERT_TRUE(options_result.has_value()) << options_result.error().message();
   EXPECT_EQ(*options_result, options);
-  auto empty_stats = collection->Stats();
+  auto empty_stats = collection->stats();
   ASSERT_TRUE(empty_stats.has_value()) << empty_stats.error().message();
   EXPECT_EQ(empty_stats->doc_count, 0u);
 
   auto docs = MakeDocs(0, 32, false, true);
-  ASSERT_TRUE(WriteSucceeded(collection->Insert(docs), docs.size()));
-  ASSERT_TRUE(collection->Flush().ok());
-  auto flushed_stats = collection->Stats();
+  ASSERT_TRUE(WriteSucceeded(collection->insert(docs), docs.size()));
+  ASSERT_TRUE(collection->flush().ok());
+  auto flushed_stats = collection->stats();
   ASSERT_TRUE(flushed_stats.has_value()) << flushed_stats.error().message();
   ASSERT_EQ(flushed_stats->index_completeness[kFp32Field], 0);
-  ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
-  auto optimized_stats = collection->Stats();
+  ASSERT_TRUE(collection->optimize(OptimizeOptions{2}).ok());
+  auto optimized_stats = collection->stats();
   ASSERT_TRUE(optimized_stats.has_value()) << optimized_stats.error().message();
   ASSERT_EQ(optimized_stats->index_completeness[kFp32Field], 1);
 
-  auto fetch = collection->Fetch(
+  auto fetch = collection->fetch(
       {"pk_8"}, std::vector<std::string>{"category", "name"}, false);
   ASSERT_TRUE(fetch.has_value()) << fetch.error().message();
   ASSERT_TRUE(FetchContainsPk(fetch, "pk_8"));
@@ -290,15 +290,15 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
 
   std::vector<Doc> update_docs{MakeDoc(100, false, true, false, "pk_0")};
   ASSERT_TRUE(
-      WriteSucceeded(collection->Update(update_docs), update_docs.size()));
+      WriteSucceeded(collection->update(update_docs), update_docs.size()));
 
   std::vector<Doc> upsert_docs{MakeDoc(101, false, true, false, "pk_1"),
                                MakeDoc(32, false, true)};
   ASSERT_TRUE(
-      WriteSucceeded(collection->Upsert(upsert_docs), upsert_docs.size()));
-  ASSERT_TRUE(WriteSucceeded(collection->Delete({"pk_2"}), 1));
-  ASSERT_TRUE(collection->DeleteByFilter("category = 3").ok());
-  auto deleted_fetch = collection->Fetch({"pk_2", "pk_3"});
+      WriteSucceeded(collection->upsert(upsert_docs), upsert_docs.size()));
+  ASSERT_TRUE(WriteSucceeded(collection->delete_({"pk_2"}), 1));
+  ASSERT_TRUE(collection->delete_by_filter("category = 3").ok());
+  auto deleted_fetch = collection->fetch({"pk_2", "pk_3"});
   ASSERT_TRUE(deleted_fetch.has_value()) << deleted_fetch.error().message();
   ASSERT_EQ(deleted_fetch->size(), 2u);
   auto deleted_pk2 = deleted_fetch->find("pk_2");
@@ -310,30 +310,30 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
 
   auto added_field =
       std::make_shared<FieldSchema>("category_copy", DataType::INT32, false);
-  ASSERT_TRUE(collection->AddColumn(added_field, "category").ok());
+  ASSERT_TRUE(collection->add_column(added_field, "category").ok());
   ASSERT_TRUE(
-      collection->AlterColumn("category_copy", "category_renamed").ok());
-  ASSERT_TRUE(collection->DropColumn("category_renamed").ok());
+      collection->alter_column("category_copy", "category_renamed").ok());
+  ASSERT_TRUE(collection->drop_column("category_renamed").ok());
 
   auto dynamic_index =
       std::make_shared<DiskAnnIndexParams>(MetricType::L2, 16, 32, 2);
-  ASSERT_TRUE(collection->CreateIndex(kDynamicField, dynamic_index).ok());
-  ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
-  auto dynamic_result = collection->Query(MakeFp32Query(8, kDynamicField, 32));
+  ASSERT_TRUE(collection->create_index(kDynamicField, dynamic_index).ok());
+  ASSERT_TRUE(collection->optimize(OptimizeOptions{2}).ok());
+  auto dynamic_result = collection->query(MakeFp32Query(8, kDynamicField, 32));
   ASSERT_TRUE(dynamic_result.has_value()) << dynamic_result.error().message();
   ASSERT_FALSE(dynamic_result->empty());
-  ASSERT_TRUE(collection->DropIndex(kDynamicField).ok());
+  ASSERT_TRUE(collection->drop_index(kDynamicField).ok());
 
-  ASSERT_TRUE(collection->Flush().ok());
+  ASSERT_TRUE(collection->flush().ok());
   collection.reset();
 
   auto reopen_result = Collection::Open(kCollectionPath, options);
   ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().message();
   collection = std::move(reopen_result.value());
-  auto primary_result = collection->Query(MakeFp32Query(8, kFp32Field));
+  auto primary_result = collection->query(MakeFp32Query(8, kFp32Field));
   ASSERT_TRUE(primary_result.has_value()) << primary_result.error().message();
   ASSERT_FALSE(primary_result->empty());
-  auto reopened_stats = collection->Stats();
+  auto reopened_stats = collection->stats();
   ASSERT_TRUE(reopened_stats.has_value()) << reopened_stats.error().message();
   EXPECT_LT(reopened_stats->doc_count, 33u);
   collection.reset();
@@ -342,19 +342,19 @@ TEST_F(DiskAnnMobileCollectionTest, PublicCollectionApiLifecycle) {
   ASSERT_TRUE(read_only_result.has_value())
       << read_only_result.error().message();
   collection = std::move(read_only_result.value());
-  auto read_only_query = collection->Query(MakeFp32Query(8, kFp32Field));
+  auto read_only_query = collection->query(MakeFp32Query(8, kFp32Field));
   ASSERT_TRUE(read_only_query.has_value()) << read_only_query.error().message();
   ASSERT_FALSE(read_only_query->empty());
   auto rejected_docs = MakeDocs(40, 41, false, true);
-  EXPECT_FALSE(collection->Insert(rejected_docs).has_value());
-  EXPECT_FALSE(collection->Optimize().ok());
+  EXPECT_FALSE(collection->insert(rejected_docs).has_value());
+  EXPECT_FALSE(collection->optimize().ok());
   collection.reset();
 
   reopen_result = Collection::Open(kCollectionPath, options);
   ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().message();
   collection = std::move(reopen_result.value());
-  ASSERT_TRUE(collection->Destroy().ok());
-  EXPECT_FALSE(collection->Stats().has_value());
+  ASSERT_TRUE(collection->destroy().ok());
+  EXPECT_FALSE(collection->stats().has_value());
   EXPECT_FALSE(Collection::Open(kCollectionPath, options).has_value());
 }
 
@@ -370,16 +370,16 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     auto collection = std::move(create_result.value());
 
     auto docs = MakeDocs(0, kDocCount, true, false, true);
-    ASSERT_TRUE(WriteSucceeded(collection->Insert(docs), docs.size()));
-    ASSERT_TRUE(collection->Flush().ok());
-    ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
+    ASSERT_TRUE(WriteSucceeded(collection->insert(docs), docs.size()));
+    ASSERT_TRUE(collection->flush().ok());
+    ASSERT_TRUE(collection->optimize(OptimizeOptions{2}).ok());
 
     auto fp32_query = MakeFp32Query(12, kFp32Field, 8);
     fp32_query.filter_ = "category = 0";
     fp32_query.include_vector_ = true;
     fp32_query.include_doc_id_ = true;
     fp32_query.output_fields_ = std::vector<std::string>{"category", "name"};
-    auto fp32_result = collection->Query(fp32_query);
+    auto fp32_result = collection->query(fp32_query);
     ASSERT_TRUE(fp32_result.has_value()) << fp32_result.error().message();
     ASSERT_FALSE(fp32_result->empty());
     for (const auto &doc : *fp32_result) {
@@ -396,7 +396,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
                             }));
     auto default_params_query = MakeFp32Query(12, kFp32Field);
     default_params_query.target_.query_params_.reset();
-    auto default_params_result = collection->Query(default_params_query);
+    auto default_params_result = collection->query(default_params_query);
     ASSERT_TRUE(default_params_result.has_value())
         << default_params_result.error().message();
     ASSERT_FALSE(default_params_result->empty());
@@ -405,7 +405,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     scalar_query.topk_ = 5;
     scalar_query.filter_ = "category = 1";
     scalar_query.output_fields_ = std::vector<std::string>{"category", "name"};
-    auto scalar_result = collection->Query(scalar_query);
+    auto scalar_result = collection->query(scalar_query);
     ASSERT_TRUE(scalar_result.has_value()) << scalar_result.error().message();
     ASSERT_EQ(scalar_result->size(), 5u);
     for (const auto &doc : *scalar_result) {
@@ -415,7 +415,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
       EXPECT_EQ(category.value(), 1);
     }
 
-    auto fp16_result = collection->Query(MakeFp16Query(12, 8));
+    auto fp16_result = collection->query(MakeFp16Query(12, 8));
     ASSERT_TRUE(fp16_result.has_value()) << fp16_result.error().message();
     ASSERT_FALSE(fp16_result->empty());
 
@@ -427,7 +427,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     auto radius_query = MakeFp32Query(12, kFp32Field, 8);
     radius_query.filter_ = "category = 0";
     radius_query.target_.query_params_->set_radius(radius);
-    auto radius_result = collection->Query(radius_query);
+    auto radius_result = collection->query(radius_query);
     ASSERT_TRUE(radius_result.has_value()) << radius_result.error().message();
     ASSERT_FALSE(radius_result->empty());
     EXPECT_LT(radius_result->size(), fp32_result->size());
@@ -454,7 +454,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
       sub_query.num_candidates_ = 16;
       multi_query.queries.emplace_back(std::move(sub_query));
     }
-    auto multi_result = collection->Query(multi_query);
+    auto multi_result = collection->query(multi_query);
     ASSERT_TRUE(multi_result.has_value()) << multi_result.error().message();
     ASSERT_FALSE(multi_result->empty());
     EXPECT_LE(multi_result->size(), 8u);
@@ -480,7 +480,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     group_query.topk_per_group_ = 2;
     group_query.include_vector_ = true;
     group_query.output_fields_ = std::vector<std::string>{"category", "name"};
-    auto group_result = collection->GroupByQuery(group_query);
+    auto group_result = collection->group_by_query(group_query);
     ASSERT_TRUE(group_result.has_value()) << group_result.error().message();
     ASSERT_FALSE(group_result->empty());
     EXPECT_LE(group_result->size(), 4u);
@@ -495,7 +495,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
       }
     }
 
-    auto selected_fetch = collection->Fetch(
+    auto selected_fetch = collection->fetch(
         {"pk_12"}, std::vector<std::string>{"category"}, false);
     ASSERT_TRUE(selected_fetch.has_value()) << selected_fetch.error().message();
     ASSERT_TRUE(FetchContainsPk(selected_fetch, "pk_12"));
@@ -507,7 +507,7 @@ TEST_F(DiskAnnMobileCollectionTest, CompleteQuerySurfaceAndMetricMatrix) {
     auto reopen_result = Collection::Open(kCollectionPath, Options());
     ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().message();
     collection = std::move(reopen_result.value());
-    auto reopened_query = collection->Query(MakeFp32Query(12, kFp32Field));
+    auto reopened_query = collection->query(MakeFp32Query(12, kFp32Field));
     ASSERT_TRUE(reopened_query.has_value()) << reopened_query.error().message();
     ASSERT_FALSE(reopened_query->empty());
   }
@@ -523,12 +523,12 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
   ASSERT_TRUE(create_result.has_value()) << create_result.error().message();
   auto collection = std::move(create_result.value());
   auto docs = MakeDocs(0, kDocCount);
-  ASSERT_TRUE(WriteSucceeded(collection->Insert(docs), docs.size()));
-  ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
+  ASSERT_TRUE(WriteSucceeded(collection->insert(docs), docs.size()));
+  ASSERT_TRUE(collection->optimize(OptimizeOptions{2}).ok());
 
   std::array<std::vector<std::string>, kDocCount> query_baselines;
   for (uint64_t doc_id = 0; doc_id < kDocCount; ++doc_id) {
-    auto query_result = collection->Query(MakeFp32Query(doc_id, kFp32Field));
+    auto query_result = collection->query(MakeFp32Query(doc_id, kFp32Field));
     ASSERT_TRUE(query_result.has_value()) << query_result.error().message();
     ASSERT_FALSE(query_result->empty());
     query_baselines[doc_id] = SortedPks(*query_result);
@@ -550,8 +550,8 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
       for (size_t iteration = 0; iteration < kIterations; ++iteration) {
         uint64_t doc_id = (thread_id * kIterations + iteration) % kDocCount;
         auto query_result =
-            collection->Query(MakeFp32Query(doc_id, kFp32Field));
-        auto fetch_result = collection->Fetch({"pk_" + std::to_string(doc_id)});
+            collection->query(MakeFp32Query(doc_id, kFp32Field));
+        auto fetch_result = collection->fetch({"pk_" + std::to_string(doc_id)});
         bool query_ok = query_result.has_value() &&
                         SortedPks(*query_result) == query_baselines[doc_id];
         bool fetch_ok =
@@ -573,7 +573,7 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
   EXPECT_EQ(failure_count.load(), 0u);
   EXPECT_TRUE(failures.empty()) << (failures.empty() ? "" : failures.front());
 
-  ASSERT_TRUE(collection->Flush().ok());
+  ASSERT_TRUE(collection->flush().ok());
   collection.reset();
   failure_count.store(0);
   failures.clear();
@@ -589,9 +589,9 @@ TEST_F(DiskAnnMobileCollectionTest, ConcurrentQueryAndFetch) {
       for (size_t iteration = 0; iteration < kIterations; ++iteration) {
         uint64_t doc_id = (thread_id * kIterations + iteration) % kDocCount;
         auto query_result =
-            read_only_collection->Query(MakeFp32Query(doc_id, kFp32Field));
+            read_only_collection->query(MakeFp32Query(doc_id, kFp32Field));
         auto fetch_result =
-            read_only_collection->Fetch({"pk_" + std::to_string(doc_id)});
+            read_only_collection->fetch({"pk_" + std::to_string(doc_id)});
         bool query_ok = query_result.has_value() &&
                         SortedPks(*query_result) == query_baselines[doc_id];
         bool fetch_ok =
@@ -621,24 +621,24 @@ TEST_F(DiskAnnMobileCollectionTest, OperationFailuresDoNotPoisonCollection) {
   ASSERT_TRUE(create_result.has_value()) << create_result.error().message();
   auto collection = std::move(create_result.value());
   auto docs = MakeDocs(0, kDocCount);
-  ASSERT_TRUE(WriteSucceeded(collection->Insert(docs), docs.size()));
-  ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
+  ASSERT_TRUE(WriteSucceeded(collection->insert(docs), docs.size()));
+  ASSERT_TRUE(collection->optimize(OptimizeOptions{2}).ok());
 
   auto invalid_query = MakeFp32Query(12, kFp32Field);
   invalid_query.target_.set_vector("invalid-size");
-  EXPECT_FALSE(collection->Query(invalid_query).has_value());
+  EXPECT_FALSE(collection->query(invalid_query).has_value());
 
   auto wrong_params_query = MakeFp32Query(12, kFp32Field);
   wrong_params_query.target_.query_params_ =
       std::make_shared<FlatQueryParams>();
-  EXPECT_FALSE(collection->Query(wrong_params_query).has_value());
+  EXPECT_FALSE(collection->query(wrong_params_query).has_value());
 
   Doc invalid_doc;
   invalid_doc.set_pk("invalid_doc");
   invalid_doc.set<int32_t>("category", 0);
   invalid_doc.set<std::string>("name", "missing required vector");
   std::vector<Doc> invalid_docs{invalid_doc};
-  auto invalid_write = collection->Insert(invalid_docs);
+  auto invalid_write = collection->insert(invalid_docs);
   EXPECT_TRUE(!invalid_write.has_value() || invalid_write->empty() ||
               !invalid_write->front().ok());
 
@@ -647,31 +647,31 @@ TEST_F(DiskAnnMobileCollectionTest, OperationFailuresDoNotPoisonCollection) {
   unsupported_group_query.group_by_field_name_ = "category";
   unsupported_group_query.group_count_ = 4;
   unsupported_group_query.topk_per_group_ = 2;
-  EXPECT_FALSE(collection->GroupByQuery(unsupported_group_query).has_value());
+  EXPECT_FALSE(collection->group_by_query(unsupported_group_query).has_value());
 
-  auto valid_result = collection->Query(MakeFp32Query(12, kFp32Field));
+  auto valid_result = collection->query(MakeFp32Query(12, kFp32Field));
   ASSERT_TRUE(valid_result.has_value()) << valid_result.error().message();
   ASSERT_FALSE(valid_result->empty());
 
   auto recovery_docs = MakeDocs(kDocCount, kDocCount + 1);
   ASSERT_TRUE(
-      WriteSucceeded(collection->Insert(recovery_docs), recovery_docs.size()));
-  ASSERT_TRUE(collection->Flush().ok());
-  ASSERT_TRUE(collection->Optimize(OptimizeOptions{2}).ok());
+      WriteSucceeded(collection->insert(recovery_docs), recovery_docs.size()));
+  ASSERT_TRUE(collection->flush().ok());
+  ASSERT_TRUE(collection->optimize(OptimizeOptions{2}).ok());
   collection.reset();
 
   auto reopen_result = Collection::Open(kCollectionPath, Options());
   ASSERT_TRUE(reopen_result.has_value()) << reopen_result.error().message();
   collection = std::move(reopen_result.value());
   auto recovered_result =
-      collection->Query(MakeFp32Query(kDocCount, kFp32Field));
+      collection->query(MakeFp32Query(kDocCount, kFp32Field));
   ASSERT_TRUE(recovered_result.has_value())
       << recovered_result.error().message();
   ASSERT_FALSE(recovered_result->empty());
   const std::string recovered_pk = "pk_" + std::to_string(kDocCount);
-  auto recovered_fetch = collection->Fetch({recovered_pk});
+  auto recovered_fetch = collection->fetch({recovered_pk});
   EXPECT_TRUE(FetchContainsPk(recovered_fetch, recovered_pk));
-  auto recovered_stats = collection->Stats();
+  auto recovered_stats = collection->stats();
   ASSERT_TRUE(recovered_stats.has_value()) << recovered_stats.error().message();
   EXPECT_EQ(recovered_stats->doc_count, kDocCount + 1);
 }
