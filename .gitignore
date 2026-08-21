@@ -39,6 +39,7 @@ python/zvec/*.pyd
 
 # Production
 /build
+/diskann_bench_windows/
 
 # Generated files
 .docusaurus
