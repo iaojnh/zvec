@@ -21,6 +21,9 @@ def test_default_matrix_and_native_build_commands(tmp_path, monkeypatch):
     assert args.train_file == benchmark.DEFAULT_TRAIN_FILE
     assert args.query_file == benchmark.DEFAULT_QUERY_FILE
     assert args.ground_truth_file == benchmark.DEFAULT_GROUND_TRUTH_FILE
+    assert args.ground_truth_mode == "generate"
+    assert args.repo_root == benchmark.DEFAULT_REPO_ROOT
+    assert args.build_dir == benchmark.DEFAULT_BUILD_DIR
     assert tuple(args.precision) == ("fp32", "fp16")
     assert tuple(args.list_sizes) == (100, 300, 500)
     assert tuple(args.thread_counts) == (1, 2, 4)

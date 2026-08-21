@@ -12,16 +12,15 @@ The defaults intentionally match the supplied Cohere 1M Windows benchmark:
 The script drives the repository's native C++ benchmark tools. It creates all
 YAML files and writes raw logs,
 CSV/JSON data, environment metadata, and document-ready Markdown tables under
-diskann_bench_windows/<timestamp>_<git-sha>.
+D:/zvec-iaojnh/diskann_bench_windows/<timestamp>_<git-sha>.
 
 Run from an "x64 Native Tools Command Prompt for VS 2022", with the project's
 virtual environment activated:
 
     python scripts\benchmark_diskann_windows.py
 
-External ground truth is required by default so a full 1M x 1K exact scan is
-never started accidentally. Use --ground-truth-mode generate or internal only
-when that extra work is intentional.
+If the generated ground-truth file does not exist, the script creates it from
+the Cohere training/query files and reuses it on later runs.
 """
 
 from __future__ import annotations
@@ -54,11 +53,13 @@ IS_WINDOWS = sys.platform == "win32"
 UINT64_MAX = (1 << 64) - 1
 UINT32_MAX = (1 << 32) - 1
 VECS_HEADER = struct.Struct("<QHHI11Q")
-DEFAULT_TRAIN_FILE = Path(
-    r"D:\zvec\_data\cohere_train_vector_1m.new.centaur.vecs"
-)
-DEFAULT_QUERY_FILE = Path(r"D:\zvec\_data\cohere_test_vector_1000.new.txt")
-DEFAULT_GROUND_TRUTH_FILE = Path(r"D:\zvec\_data\neighbors.txt")
+DEFAULT_REPO_ROOT = Path("D:/zvec-iaojnh")
+DEFAULT_DATA_DIR = Path("D:/zvec_data")
+DEFAULT_TRAIN_FILE = DEFAULT_DATA_DIR / "cohere_train_vector_1m.new.centaur.vecs"
+DEFAULT_QUERY_FILE = DEFAULT_DATA_DIR / "cohere_test_vector_1000.new.txt"
+DEFAULT_GROUND_TRUTH_FILE = DEFAULT_DATA_DIR / "ground_truth_d768_k100.txt"
+DEFAULT_BUILD_DIR = DEFAULT_REPO_ROOT / "build"
+DEFAULT_RESULTS_ROOT = DEFAULT_REPO_ROOT / "diskann_bench_windows"
 
 
 def write_console(
@@ -211,7 +212,6 @@ def discover_repo_root() -> Path:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    repo_default = discover_repo_root()
     parser = argparse.ArgumentParser(
         description=(
             "Run the Windows DiskANN build/recall/QPS matrix using the native "
@@ -227,7 +227,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ground-truth-mode",
         choices=("external", "generate", "internal"),
-        default="external",
+        default="generate",
         help=(
             "'external' requires --ground-truth-file; 'generate' creates an "
             "exact neighbors file with blocked NumPy matrix multiplication; "
@@ -257,18 +257,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=8192,
         help="Database vectors processed per exact-search matrix block.",
     )
-    parser.add_argument("--repo-root", type=Path, default=repo_default)
+    parser.add_argument("--repo-root", type=Path, default=DEFAULT_REPO_ROOT)
     parser.add_argument(
         "--build-dir",
         type=Path,
-        help="CMake build directory; defaults to <repo-root>/build.",
+        default=DEFAULT_BUILD_DIR,
+        help="CMake build directory.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         help=(
             "Result directory; defaults to "
-            "<repo-root>/diskann_bench_windows/<timestamp>_<git-sha>."
+            "D:/zvec-iaojnh/diskann_bench_windows/<timestamp>_<git-sha>."
         ),
     )
     parser.add_argument(
@@ -1826,11 +1827,7 @@ def main() -> int:  # noqa: PLR0915
     ground_truth_file = (
         resolved(args.ground_truth_file) if args.ground_truth_file else None
     )
-    build_dir = (
-        resolved(args.build_dir, repo_root)
-        if args.build_dir
-        else (repo_root / "build").resolve()
-    )
+    build_dir = resolved(args.build_dir, repo_root)
 
     require_positive(args.list_sizes, "list sizes")
     require_positive(args.thread_counts, "thread counts")
@@ -1909,7 +1906,7 @@ def main() -> int:  # noqa: PLR0915
     output_dir = (
         resolved(args.output_dir, repo_root)
         if args.output_dir
-        else (repo_root / "diskann_bench_windows" / f"{stamp}_{sha}").resolve()
+        else (DEFAULT_RESULTS_ROOT / f"{stamp}_{sha}").resolve()
     )
     index_dir = (
         resolved(args.index_dir, repo_root)
