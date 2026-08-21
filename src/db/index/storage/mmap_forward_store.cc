@@ -118,11 +118,13 @@ arrow::Status MmapForwardStore::OpenIPC(
     chunk_index_map_.emplace_back(num_rows_, num_rows_ + chunk->length() - 1);
     num_rows_ += chunk->length();
 
-    // Check if all chunks have the same size except possibly the last one
+    // All non-last chunks must have the same size. The last chunk may be
+    // smaller, but a larger last chunk also requires the general lookup path.
     if (fixed_batch_size_ == -1) {
       fixed_batch_size_ = chunk->length();
     } else if (fixed_batch_size_ != chunk->length()) {
-      if (i != chunked_array->num_chunks() - 1) {
+      if (i != chunked_array->num_chunks() - 1 ||
+          chunk->length() > fixed_batch_size_) {
         is_fixed_batch_size_ = false;
       }
     }
@@ -376,7 +378,7 @@ ExecBatchPtr MmapForwardStore::FetchParquet(
     scalars.emplace_back(std::move(scalar_result.ValueOrDie()));
   }
 
-  return std::make_shared<arrow::ExecBatch>(std::move(scalars), 1);
+  return std::make_shared<arrow::compute::ExecBatch>(std::move(scalars), 1);
 }
 
 TablePtr MmapForwardStore::FetchIPC(const std::vector<std::string> &columns,
@@ -458,7 +460,7 @@ ExecBatchPtr MmapForwardStore::FetchIPC(const std::vector<std::string> &columns,
     }
   }
 
-  return std::make_shared<arrow::ExecBatch>(std::move(scalars), 1);
+  return std::make_shared<arrow::compute::ExecBatch>(std::move(scalars), 1);
 }
 
 int MmapForwardStore::FindRowGroupForRow(int64_t row) {

@@ -360,7 +360,7 @@ class Recall {
         query_param->filter = filter_ptr;
 
         core_interface::SearchResult search_result;
-        int ret = index->Search(query_data, query_param, &search_result);
+        int ret = index->search(query_data, query_param, &search_result);
         if (ret < 0) {
           LOG_ERROR("Failed to linear search, ret=%d %s", ret,
                     IndexError::What(ret));
@@ -631,7 +631,7 @@ class Recall {
     query_data.vector = dense_query;
 
     // query_param is required in the config, so it should not be nullptr
-    auto query_param_clone = query_param->Clone();
+    auto query_param_clone = query_param->clone();
     query_param_clone->topk = topk;
     query_param_clone->filter = filter_ptr;
     query_param_clone->is_linear = false;
@@ -639,7 +639,7 @@ class Recall {
     if (call_batch_api_) {
       size_t qnum = query.size() / dim_;
       // For batch search, we need to search each query separately
-      // since Index::Search doesn't support batch natively in the same way
+      // since Index::search doesn't support batch natively in the same way
       for (size_t i = 0; i < qnum; ++i) {
         size_t query_idx = idx * batch_count_ + i;
         if (query_idx >= linear_queries_.size()) {
@@ -654,7 +654,7 @@ class Recall {
 
         core_interface::SearchResult search_result;
         int ret =
-            index->Search(single_query_data, query_param_clone, &search_result);
+            index->search(single_query_data, query_param_clone, &search_result);
         if (ret < 0) {
           LOG_ERROR("Failed to knn_search batch, ret=%d %s", ret,
                     IndexError::What(ret));
@@ -665,7 +665,7 @@ class Recall {
       }
     } else {
       core_interface::SearchResult search_result;
-      int ret = index->Search(query_data, query_param_clone, &search_result);
+      int ret = index->search(query_data, query_param_clone, &search_result);
       if (ret < 0) {
         LOG_ERROR("Failed to knn_search, ret=%d %s", ret,
                   IndexError::What(ret));
@@ -1022,7 +1022,7 @@ class SparseRecall {
         query_param->filter = filter_ptr;
 
         core_interface::SearchResult search_result;
-        int ret = index->Search(query_data, query_param, &search_result);
+        int ret = index->search(query_data, query_param, &search_result);
         if (ret < 0) {
           LOG_ERROR("Failed to sparse linear search, ret=%d", ret);
           error.exchange(true);
@@ -1340,7 +1340,7 @@ class SparseRecall {
     core_interface::VectorData query_data;
     query_data.vector = sparse_query;
 
-    auto query_param_clone = query_param->Clone();
+    auto query_param_clone = query_param->clone();
     query_param_clone->topk = topk;
     query_param_clone->filter = filter_ptr;
     query_param_clone->is_linear = true;
@@ -1363,7 +1363,7 @@ class SparseRecall {
 
         core_interface::SearchResult search_result;
         int ret =
-            index->Search(single_query_data, query_param_clone, &search_result);
+            index->search(single_query_data, query_param_clone, &search_result);
         if (ret < 0) {
           LOG_ERROR("Failed to sparse_knn_search batch, ret=%d %s", ret,
                     IndexError::What(ret));
@@ -1374,7 +1374,7 @@ class SparseRecall {
       }
     } else {
       core_interface::SearchResult search_result;
-      int ret = index->Search(query_data, query_param_clone, &search_result);
+      int ret = index->search(query_data, query_param_clone, &search_result);
       if (ret < 0) {
         LOG_ERROR("Failed to sparse_knn_search, ret=%d %s", ret,
                   IndexError::What(ret));
@@ -1660,17 +1660,16 @@ int main(int argc, char *argv[]) {
   }
   auto config_common = config_node["IndexCommon"];
 
-  map<string, int> LOG_LEVEL = {{"debug", IndexLogger::LEVEL_DEBUG},
-                                {"info", IndexLogger::LEVEL_INFO},
-                                {"warn", IndexLogger::LEVEL_WARN},
-                                {"error", IndexLogger::LEVEL_ERROR},
-                                {"fatal", IndexLogger::LEVEL_FATAL}};
+  map<string, int> LOG_LEVEL = {{"debug", zvec::ailego::Logger::LEVEL_DEBUG},
+                                {"info", zvec::ailego::Logger::LEVEL_INFO},
+                                {"warn", zvec::ailego::Logger::LEVEL_WARN},
+                                {"error", zvec::ailego::Logger::LEVEL_ERROR},
+                                {"fatal", zvec::ailego::Logger::LEVEL_FATAL}};
   string log_level = config_common["LogLevel"]
                          ? config_common["LogLevel"].as<string>()
                          : "debug";
   transform(log_level.begin(), log_level.end(), log_level.begin(), ::tolower);
   if (LOG_LEVEL.find(log_level) != LOG_LEVEL.end()) {
-    IndexLoggerBroker::SetLevel(LOG_LEVEL[log_level]);
     zvec::ailego::LoggerBroker::SetLevel(LOG_LEVEL[log_level]);
   }
 
@@ -1783,7 +1782,7 @@ int main(int argc, char *argv[]) {
   }
 
   // Cleanup
-  index->Close();
+  index->close();
 
   cout << "Recall done." << endl;
 

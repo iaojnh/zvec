@@ -48,7 +48,7 @@ jobs:
           max-size: 300M
 
       - name: Setup Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v5.7.0
         with:
           distribution: temurin
           java-version: '17'
@@ -79,33 +79,8 @@ jobs:
           sdkmanager --install "system-images;android-${{ matrix.api }};google_apis_playstore;x86_64" 2>/dev/null || \
           sdkmanager --install "system-images;android-${{ matrix.api }};default;x86_64"
 
-      # ── Step 1: build host protoc (using HOST compiler, NOT NDK) ───────
-      - name: Cache host protoc
-        uses: actions/cache@v6
-        with:
-          path: build_host
-          key: ${{ runner.os }}-host-protoc-${{ hashFiles('thirdparty/protobuf/**', 'CMakeLists.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-host-protoc-
-
-      - name: 'Step 1: Build host protoc'
-        shell: bash
-        run: |
-          if [ ! -f "build_host/bin/protoc" ]; then
-            git submodule foreach --recursive 'git stash --include-untracked' 2>/dev/null || true
-            cmake -S . -B build_host \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_TOOLCHAIN_FILE="" \
-              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-              -G Ninja
-            cmake --build build_host --target protoc --parallel
-          else
-            echo "Using cached host protoc"
-          fi
-
-      # ── Step 2: cross-compile zvec + tests for Android ─────────────────
-      - name: 'Step 2: Cross-compile zvec and tests'
+      # ── Step 1: cross-compile zvec + tests for Android ─────────────────────────
+      - name: 'Step 1: Cross-compile zvec and tests'
         shell: bash
         env:
           BUILD_DIR: build_android_${{ matrix.abi }}
@@ -135,7 +110,6 @@ jobs:
             -DAUTO_DETECT_ARCH=OFF \
             -DENABLE_WERROR=ON \
             -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/install" \
-            -DGLOBAL_CC_PROTOBUF_PROTOC="$GITHUB_WORKSPACE/build_host/bin/protoc" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 

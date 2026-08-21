@@ -39,8 +39,13 @@ class DiskAnnUtil {
     if (ptr == nullptr) {
       return;
     }
-    *ptr = nullptr;
-    if (size == 0 || ::posix_memalign(ptr, align, size) != 0) {
+    if (size == 0) {
+      *ptr = nullptr;
+      return;
+    }
+    // Unlike aligned_alloc(), posix_memalign() does not require size to be an
+    // integral multiple of alignment and is available on Linux and macOS.
+    if (::posix_memalign(ptr, align, size) != 0) {
       *ptr = nullptr;
     }
   }
