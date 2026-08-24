@@ -619,31 +619,54 @@ endfunction()
 ## Add a main library target and an explicit static variant.
 macro(_add_library _NAME _OPTION)
   add_library(${_NAME}_objects OBJECT ${_OPTION} ${ARGN})
-  add_library(
-      ${_NAME}_static STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
-    )
-  if(IOS OR (ANDROID AND ANDROID_STL STREQUAL "c++_static"))
+  if(IOS)
+    # iOS has no shared libraries. Expose the single static archive under both
+    # target names to avoid duplicate objects while preserving callers of the
+    # explicit _static target.
     add_library(
         ${_NAME} STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
       )
-    # Keep the two mobile build targets available but give the main archive a
-    # distinct file name for Ninja. Link-time canonicalization below ensures
-    # only the main archive is ever whole-archived into an executable.
-    set_property(TARGET ${_NAME} PROPERTY OUTPUT_NAME ${_NAME}_main)
-    set_property(
-      TARGET ${_NAME} PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
-    set_property(
-      TARGET ${_NAME}_static PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
+    add_library(${_NAME}_static ALIAS ${_NAME})
   else()
     add_library(
-        ${_NAME} SHARED ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
+        ${_NAME}_static STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
       )
-  endif()
-  add_dependencies(${_NAME} ${_NAME}_static)
-  if(NOT MSVC)
-    set_property(TARGET ${_NAME}_static PROPERTY OUTPUT_NAME ${_NAME})
+    if(ANDROID AND ANDROID_STL STREQUAL "c++_static")
+      add_library(
+          ${_NAME} STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
+        )
+      # Keep both Android static build targets but give the main archive a
+      # distinct file name. Canonicalization ensures only the main archive is
+      # whole-archived when both target names appear in a dependency graph.
+      set_property(TARGET ${_NAME} PROPERTY OUTPUT_NAME ${_NAME}_main)
+      set_property(
+        TARGET ${_NAME} PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
+      set_property(
+        TARGET ${_NAME}_static PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
+    else()
+      add_library(
+          ${_NAME} SHARED ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
+        )
+    endif()
+    add_dependencies(${_NAME} ${_NAME}_static)
+    if(NOT MSVC)
+      set_property(TARGET ${_NAME}_static PROPERTY OUTPUT_NAME ${_NAME})
+    endif()
   endif()
 endmacro()
+
+## Check whether <name>_static is a target of its own rather than an alias of
+## <name> (see _add_library: on iOS the two names share a single archive).
+function(_has_own_static_variant _RESULT _NAME)
+  set(${_RESULT} FALSE PARENT_SCOPE)
+  if(NOT TARGET ${_NAME}_static)
+    return()
+  endif()
+  get_target_property(_ALIASED ${_NAME}_static ALIASED_TARGET)
+  if(NOT _ALIASED)
+    set(${_RESULT} TRUE PARENT_SCOPE)
+  endif()
+endfunction()
 
 ## Add a static library backed by an object library.
 macro(_add_static_library_with_objects _NAME _OPTION)
@@ -679,15 +702,22 @@ endfunction()
 ## Link libraries
 function(_target_link_libraries _NAME)
   function(_resolve_link_target LIB RESULT_VAR)
-    if(TARGET ${LIB})
+    set(RESOLVED_LINK_TARGET ${LIB})
+    if(TARGET ${RESOLVED_LINK_TARGET})
       get_target_property(
-        CANONICAL_LINK_TARGET ${LIB} ZVEC_CANONICAL_LINK_TARGET)
+        ALIASED_LINK_TARGET ${RESOLVED_LINK_TARGET} ALIASED_TARGET)
+      if(ALIASED_LINK_TARGET)
+        set(RESOLVED_LINK_TARGET ${ALIASED_LINK_TARGET})
+      endif()
+      get_target_property(
+        CANONICAL_LINK_TARGET
+        ${RESOLVED_LINK_TARGET}
+        ZVEC_CANONICAL_LINK_TARGET)
       if(CANONICAL_LINK_TARGET)
-        set(${RESULT_VAR} ${CANONICAL_LINK_TARGET} PARENT_SCOPE)
-        return()
+        set(RESOLVED_LINK_TARGET ${CANONICAL_LINK_TARGET})
       endif()
     endif()
-    set(${RESULT_VAR} ${LIB} PARENT_SCOPE)
+    set(${RESULT_VAR} ${RESOLVED_LINK_TARGET} PARENT_SCOPE)
   endfunction()
 
   function(_collect_always_link_libs LIB_LIST RESULT_VAR)
@@ -1054,7 +1084,8 @@ function(cc_library)
     )
   endif()
 
-  if(TARGET ${CC_ARGS_NAME}_static)
+  _has_own_static_variant(_CC_HAS_STATIC ${CC_ARGS_NAME})
+  if(_CC_HAS_STATIC)
     _cc_target_properties(
         NAME "${CC_ARGS_NAME}_static"
         INCS "${CC_ARGS_INCS}"
@@ -1651,7 +1682,8 @@ function(cc_proto_library)
       )
   endif()
 
-  if(TARGET ${CC_ARGS_NAME}_static)
+  _has_own_static_variant(_CC_PROTO_HAS_STATIC ${CC_ARGS_NAME})
+  if(_CC_PROTO_HAS_STATIC)
     _cc_target_properties(
         NAME "${CC_ARGS_NAME}_static"
         PUBINCS "${CPP_OUTPATH};${CC_PROTOBUF_INCS}"
@@ -1890,7 +1922,8 @@ function(cuda_library)
       )
   endif()
 
-  if(TARGET ${CUDA_ARGS_NAME}_static)
+  _has_own_static_variant(_CUDA_HAS_STATIC ${CUDA_ARGS_NAME})
+  if(_CUDA_HAS_STATIC)
     _cuda_target_properties(
         NAME "${CUDA_ARGS_NAME}_static"
         INCS "${CUDA_ARGS_INCS}"
