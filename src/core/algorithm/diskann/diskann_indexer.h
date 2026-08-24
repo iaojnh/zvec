@@ -88,6 +88,9 @@ class DiskAnnIndexer {
   int prepare_cache_storage(size_t capacity, CacheLoadState &state);
   int load_cache_list(CacheLoadState &state);
   int cache_bfs_levels(uint64_t num_nodes_to_cache, CacheLoadState &state);
+  int parse_node_neighbors(const uint8_t *node_buf, diskann_id_t node_id,
+                           uint32_t &neighbor_count,
+                           diskann_id_t *neighbors) const;
   void reset_cache_storage();
   int cached_beam_search_impl(DiskAnnContext *ctx);
 

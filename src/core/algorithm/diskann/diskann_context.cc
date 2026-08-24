@@ -194,6 +194,10 @@ DiskAnnContext::~DiskAnnContext() {
 int DiskAnnContext::update(const ailego::Params &params) {
   uint32_t list_size = list_size_;
   params.get(PARAM_DISKANN_SEARCHER_LIST_SIZE, &list_size);
+  if (list_size == 0) {
+    LOG_ERROR("list_size must be positive");
+    return IndexError_InvalidArgument;
+  }
   list_size_ = list_size;
   return 0;
 }

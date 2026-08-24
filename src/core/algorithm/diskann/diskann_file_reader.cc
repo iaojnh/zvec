@@ -300,6 +300,9 @@ int destroy_io_ctx(IOContext &ctx) {
 }
 
 #if !defined(_WIN32) && !defined(_WIN64)
+static_assert(sizeof(off_t) >= sizeof(uint64_t),
+              "DiskAnn requires 64-bit POSIX file offsets");
+
 static int execute_one_pread(int fd, const AlignedRead &req) {
   auto *buf = static_cast<uint8_t *>(req.buf);
   uint64_t offset = req.offset;

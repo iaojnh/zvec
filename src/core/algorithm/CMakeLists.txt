@@ -17,7 +17,7 @@ else()
   # Empty stub library for unsupported platforms
   file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/diskann_stub.cc
     "// Stub implementation for unsupported platforms\n"
-    "// DiskAnn supports Linux (x86/ARM64), macOS ARM64, Android and iOS\n"
+    "// DiskAnn supports Linux x86_64/ARM64, macOS ARM64, 64-bit Android/iOS, and Windows x86_64\n"
     "namespace zvec { namespace core { /* empty namespace for compatibility */ } }\n"
   )
 

@@ -168,20 +168,49 @@ endif()
 message(STATUS "RABITQ_SUPPORTED: ${RABITQ_SUPPORTED}")
 
 # DiskAnn support:
-#   - Linux x86 and ARM64 with io_uring, libaio, or pread
+#   - Linux x86_64 and ARM64 with io_uring, libaio, or pread
+#   - 64-bit Android and iOS with the portable synchronous pread backend
 #   - macOS ARM64 (Apple Silicon) with synchronous pread
-#   - Android and iOS with the portable synchronous pread backend
 #   - Windows x86_64 with overlapped I/O
-if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64|i686|i386)$" AND NOT ANDROID AND NOT IOS)
-    OR ANDROID OR IOS
-    OR (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" AND NOT IOS)
-    OR (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"))
+set(DISKANN_SUPPORTED OFF)
+set(_diskann_unsupported_reason
+    "unsupported target ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+
+# All supported targets require 64-bit pointers. This is also the authoritative
+# gate for Android, whose ABI-specific processor names vary.
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(_diskann_unsupported_reason
+      "32-bit targets are not supported (CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P})")
+elseif(ANDROID OR IOS)
   set(DISKANN_SUPPORTED ON)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$")
+    set(DISKANN_SUPPORTED ON)
+  else()
+    set(_diskann_unsupported_reason
+        "Linux requires x86_64 or ARM64 (detected ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+    set(DISKANN_SUPPORTED ON)
+  else()
+    set(_diskann_unsupported_reason
+        "macOS requires ARM64 (detected ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+elseif(WIN32)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(DISKANN_SUPPORTED ON)
+  else()
+    set(_diskann_unsupported_reason
+        "Windows requires x86_64 (detected ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+endif()
+
+if(DISKANN_SUPPORTED)
   add_definitions(-DDISKANN_SUPPORTED=1)
 else()
-  set(DISKANN_SUPPORTED OFF)
   add_definitions(-DDISKANN_SUPPORTED=0)
-  message(STATUS "DiskAnn support disabled for ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+  message(STATUS "DiskAnn support disabled: ${_diskann_unsupported_reason}")
 endif()
 message(STATUS "DISKANN_SUPPORTED: ${DISKANN_SUPPORTED}")
 

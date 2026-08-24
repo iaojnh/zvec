@@ -108,9 +108,14 @@ class DiskAnnUtil {
                 : node_id * div_round_up(max_nodesize_, sectorsize_));
   }
 
-  static inline uint32_t *offset_to_node_neighbor(uint8_t *node_buf,
-                                                  uint32_t elementsize_) {
-    return (uint32_t *)(node_buf + elementsize_);
+  static inline uint8_t *offset_to_node_neighbor(uint8_t *node_buf,
+                                                 uint32_t elementsize_) {
+    return node_buf + elementsize_;
+  }
+
+  static inline const uint8_t *offset_to_node_neighbor(
+      const uint8_t *node_buf, uint32_t elementsize_) {
+    return node_buf + elementsize_;
   }
 
   static inline uint8_t *offset_to_node(uint32_t node_per_sector,
@@ -164,6 +169,9 @@ class NeighborPriorityQueue {
       : size_(0), capacity_(capacity), cur_(0), data_(capacity + 1) {}
 
   void insert(const Neighbor &nbr) {
+    if (capacity_ == 0) {
+      return;
+    }
     if (size_ == capacity_ && data_[size_ - 1] < nbr) {
       return;
     }

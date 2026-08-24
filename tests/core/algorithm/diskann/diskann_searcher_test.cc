@@ -253,6 +253,15 @@ size_t expected_fetch_buffer_size(const DiskAnnContext &context) {
   return static_cast<size_t>(sector_num_per_node) * DiskAnnUtil::kSectorSize;
 }
 
+void expect_same_results(const IndexDocumentList &expected,
+                         const IndexDocumentList &actual) {
+  ASSERT_EQ(expected.size(), actual.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(expected[i].key(), actual[i].key());
+    EXPECT_FLOAT_EQ(expected[i].score(), actual[i].score());
+  }
+}
+
 }  // namespace
 
 class DiskAnnSearcherTest : public testing::Test {
@@ -277,6 +286,28 @@ void DiskAnnSearcherTest::SetUp(void) {
 
 void DiskAnnSearcherTest::TearDown(void) {
   std::filesystem::remove_all(_dir);
+}
+
+TEST_F(DiskAnnSearcherTest, TestRejectZeroSearchListSize) {
+  Params params;
+  params.set(PARAM_DISKANN_SEARCHER_LIST_SIZE, 0);
+
+  auto searcher = IndexFactory::CreateSearcher("DiskAnnSearcher");
+  ASSERT_NE(searcher, nullptr);
+  EXPECT_EQ(IndexError_InvalidArgument, searcher->init(params));
+
+  auto streamer = IndexFactory::CreateStreamer("DiskAnnStreamer");
+  ASSERT_NE(streamer, nullptr);
+  EXPECT_EQ(IndexError_InvalidArgument,
+            streamer->init(*_index_meta_ptr, params));
+
+  NeighborPriorityQueue default_queue;
+  default_queue.insert(Neighbor(1, 1.0f));
+  EXPECT_EQ(0U, default_queue.size());
+
+  NeighborPriorityQueue zero_capacity_queue(0);
+  zero_capacity_queue.insert(Neighbor(1, 1.0f));
+  EXPECT_EQ(0U, zero_capacity_queue.size());
 }
 
 TEST_F(DiskAnnSearcherTest, TestGeneral) {
@@ -430,10 +461,12 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   auto linearCtx = searcher->create_context();
   auto linearByPKeysCtx = searcher->create_context();
   auto knnCtx = searcher->create_context();
+  auto singleKnnCtx = searcher->create_context();
 
   ASSERT_TRUE(!!linearCtx);
   ASSERT_TRUE(!!linearByPKeysCtx);
   ASSERT_TRUE(!!knnCtx);
+  ASSERT_TRUE(!!singleKnnCtx);
 
   NumericalVector<float> vec(dim);
   IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
@@ -444,6 +477,16 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   linearCtx->set_topk(topk);
   linearByPKeysCtx->set_topk(topk);
   knnCtx->set_topk(topk);
+  singleKnnCtx->set_topk(topk);
+
+  auto *diskann_knn_ctx = dynamic_cast<DiskAnnContext *>(knnCtx.get());
+  ASSERT_NE(diskann_knn_ctx, nullptr);
+  ASSERT_EQ(500U, diskann_knn_ctx->list_size());
+  Params zero_list_size;
+  zero_list_size.set(PARAM_DISKANN_SEARCHER_LIST_SIZE, 0);
+  EXPECT_EQ(IndexError_InvalidArgument,
+            diskann_knn_ctx->update(zero_list_size));
+  EXPECT_EQ(500U, diskann_knn_ctx->list_size());
 
   auto *diskann_searcher = dynamic_cast<DiskAnnSearcher *>(searcher.get());
   ASSERT_NE(diskann_searcher, nullptr);
@@ -467,6 +510,14 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   ASSERT_EQ(0, searcher->search_impl(batch_queries.data(), qmeta,
                                      kBatchQueryCount, knnCtx));
   EXPECT_EQ(release_count + 1, batch_counting_reader->release_count());
+  for (uint32_t query_index = 0; query_index < kBatchQueryCount;
+       ++query_index) {
+    SCOPED_TRACE(query_index);
+    ASSERT_EQ(0, searcher->search_impl(
+                     batch_queries.data() + query_index * dim, qmeta,
+                     singleKnnCtx));
+    expect_same_results(singleKnnCtx->result(), knnCtx->result(query_index));
+  }
 
   release_count = batch_counting_reader->release_count();
   ASSERT_EQ(0, searcher->search_bf_impl(batch_queries.data(), qmeta,
@@ -582,14 +633,26 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
                                       streamer_counting_reader);
 
   auto streamer_ctx = streamer->create_context();
+  auto single_streamer_ctx = streamer->create_context();
   ASSERT_NE(streamer_ctx, nullptr);
+  ASSERT_NE(single_streamer_ctx, nullptr);
   streamer_ctx->set_topk(topk);
+  single_streamer_ctx->set_topk(topk);
   auto *original_ctx = streamer_ctx.get();
 
   release_count = streamer_counting_reader->release_count();
   ASSERT_EQ(0, streamer->search_impl(batch_queries.data(), qmeta,
                                      kBatchQueryCount, streamer_ctx));
   EXPECT_EQ(release_count + 1, streamer_counting_reader->release_count());
+  for (uint32_t query_index = 0; query_index < kBatchQueryCount;
+       ++query_index) {
+    SCOPED_TRACE(query_index);
+    ASSERT_EQ(0, streamer->search_impl(
+                     batch_queries.data() + query_index * dim, qmeta,
+                     single_streamer_ctx));
+    expect_same_results(single_streamer_ctx->result(),
+                        streamer_ctx->result(query_index));
+  }
 
   ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, streamer_ctx));
   EXPECT_EQ(original_ctx, streamer_ctx.get());

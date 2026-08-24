@@ -218,8 +218,8 @@ Status FieldSchema::validate() const {
       }
 
       if (index_params_->type() == IndexType::DISKANN) {
-        // DiskAnn supports Linux (x86/ARM64), macOS ARM64, Android, iOS, and
-        // Windows x86_64.
+        // DiskAnn supports 64-bit Linux (x86_64/ARM64), macOS ARM64,
+        // 64-bit Android/iOS, and Windows x86_64.
         // The CMake variable
         // DISKANN_SUPPORTED (defined in the top-level CMakeLists.txt) is the
         // single source of truth for platform eligibility — it is also used by
@@ -234,8 +234,8 @@ Status FieldSchema::validate() const {
 #if !DISKANN_SUPPORTED
         return Status::NotSupported(
             "DiskAnn is not supported on this platform. It is available on "
-            "Linux (x86/ARM64), macOS (ARM64), Android, iOS, and Windows "
-            "(x86_64).");
+            "64-bit Linux (x86_64/ARM64), macOS (ARM64), 64-bit Android/iOS, "
+            "and Windows (x86_64).");
 #endif
       }
       if (vector_index_params->quantize_type() != QuantizeType::UNDEFINED) {

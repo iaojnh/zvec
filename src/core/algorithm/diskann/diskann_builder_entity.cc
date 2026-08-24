@@ -119,7 +119,8 @@ std::pair<uint32_t, const diskann_id_t *> DiskAnnBuilderEntity::get_neighbors(
   const uint8_t *start_ptr =
       reinterpret_cast<const uint8_t *>(neighbors_buffer_.data()) + offset;
 
-  uint32_t neighbor_cnt = *(reinterpret_cast<const uint32_t *>(start_ptr));
+  uint32_t neighbor_cnt = 0;
+  memcpy(&neighbor_cnt, start_ptr, sizeof(neighbor_cnt));
 
   const diskann_id_t *neighbors =
       reinterpret_cast<const diskann_id_t *>(start_ptr + sizeof(uint32_t));
@@ -154,7 +155,8 @@ int DiskAnnBuilderEntity::add_neighbor(diskann_id_t id,
   uint8_t *start_ptr =
       reinterpret_cast<uint8_t *>(&neighbors_buffer_[0]) + offset;
 
-  uint32_t neighbor_cnt = *reinterpret_cast<uint32_t *>(start_ptr);
+  uint32_t neighbor_cnt = 0;
+  memcpy(&neighbor_cnt, start_ptr, sizeof(neighbor_cnt));
 
   memcpy(start_ptr + sizeof(uint32_t) + sizeof(diskann_id_t) * neighbor_cnt,
          &neighbor_id, sizeof(diskann_id_t));
@@ -417,10 +419,6 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
   std::string node_buf;
   node_buf.resize(max_node_size);
 
-  diskann_id_t *neighbor_buf =
-      (diskann_id_t *)(node_buf.data() + (meta_.element_size()) +
-                       sizeof(uint32_t));
-
   LOG_INFO(
       "Dump Data, medoid: %zu, max node size: %zu, node per sector: %zu, "
       "max observed degree: %zu",
@@ -476,9 +474,6 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
         ailego_assert(neighbor_num > 0);
         ailego_assert(neighbor_num <= max_observed_degree_);
 
-        memcpy(&(neighbor_buf[0]), neighbors.second,
-               neighbors.first * sizeof(diskann_id_t));
-
         if (iter->is_valid()) {
           const void *vec = iter->data();
           memcpy(&(node_buf[0]), vec, meta.element_size());
@@ -489,11 +484,12 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
         }
 
         // write neighbor num
-        *(uint32_t *)(node_buf.data() + meta_.element_size()) = neighbor_num;
+        memcpy(node_buf.data() + meta_.element_size(), &neighbor_num,
+               sizeof(neighbor_num));
 
         // write neighbor buffer
         memcpy(&(node_buf[0]) + meta_.element_size() + sizeof(uint32_t),
-               neighbor_buf, neighbor_num * sizeof(diskann_id_t));
+               neighbors.second, neighbor_num * sizeof(diskann_id_t));
 
         // get offset into sector_buf
         char *sector_node_buf = &sector_buf[sector_node_id * max_node_size];
@@ -544,10 +540,6 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
       ailego_assert(neighbor_num > 0);
       ailego_assert(neighbor_num <= max_observed_degree_);
 
-      // read node's nhood
-      memcpy((char *)neighbor_buf, neighbors.second,
-             neighbor_num * sizeof(diskann_id_t));
-
       if (iter->is_valid()) {
         const void *vec = iter->data();
         memcpy(&(multisector_buf[0]), vec, meta.element_size());
@@ -558,12 +550,12 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
       }
 
       // write neighbor
-      *(uint32_t *)(&(multisector_buf[0]) + meta_.element_size()) =
-          neighbor_num;
+      memcpy(&(multisector_buf[0]) + meta_.element_size(), &neighbor_num,
+             sizeof(neighbor_num));
 
       // write nhood next
       memcpy(&(multisector_buf[0]) + meta_.element_size() + sizeof(uint32_t),
-             neighbor_buf, neighbor_num * sizeof(diskann_id_t));
+             neighbors.second, neighbor_num * sizeof(diskann_id_t));
 
       // flush sector to disk
       len = dumper->write(multisector_buf.data(),
