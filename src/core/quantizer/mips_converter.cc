@@ -512,6 +512,7 @@ class MipsConverter : public IndexConverter {
 
   //! Cleanup Converter
   int cleanup(void) override {
+    holder_.reset();
     return 0;
   }
 

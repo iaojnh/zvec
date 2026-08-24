@@ -108,17 +108,22 @@ struct FileDumper : public IndexDumper {
   //! Close index file
   bool close_index(void) {
     if (file_.is_valid()) {
+      bool succeeded = true;
       auto write_data = [this](const void *buf, size_t size) {
         return this->file_.write(buf, size);
       };
 
       if (!packer_.finish(write_data, stab_)) {
         LOG_ERROR("Failed to finish packing index package");
-        return false;
+        succeeded = false;
+      } else if (!file_.flush()) {
+        LOG_ERROR("Failed to flush packed index file");
+        succeeded = false;
       }
       stab_.clear();
       file_.close();
       packer_.reset();
+      return succeeded;
     }
     return true;
   }

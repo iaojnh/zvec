@@ -142,6 +142,7 @@ class HalfFloatConverter : public IndexConverter {
 
   //! Cleanup Converter
   int cleanup(void) override {
+    holder_.reset();
     return 0;
   }
 
@@ -319,6 +320,7 @@ class HalfFloatSparseConverter : public IndexConverter {
 
   //! Cleanup Converter
   int cleanup(void) override {
+    holder_.reset();
     return 0;
   }
 

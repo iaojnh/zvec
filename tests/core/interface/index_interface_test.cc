@@ -117,6 +117,41 @@ TEST(IndexInterface, BuildMultiPassHolderPropagatesConverterFailures) {
                                  empty_result_converter, &holder));
 }
 
+TEST(IndexInterface, ConverterCleanupReleasesTransientResult) {
+  std::vector<float> values{1.0F, 2.0F};
+  std::vector<std::pair<uint64_t, std::string>> doc_cache;
+  doc_cache.emplace_back(
+      0, std::string(reinterpret_cast<const char *>(values.data()),
+                     values.size() * sizeof(float)));
+
+  for (const char *converter_name :
+       {"HalfFloatConverter", "CosineNormalizeConverter",
+        "Int8StreamingConverter", "UniformUint7Converter",
+        "UniformUint8Converter"}) {
+    SCOPED_TRACE(converter_name);
+    zvec::core::IndexMeta meta(zvec::core::IndexMeta::DataType::DT_FP32, 2);
+    meta.set_metric("SquaredEuclidean", 0, zvec::ailego::Params());
+    auto converter = zvec::core::IndexFactory::CreateConverter(converter_name);
+    ASSERT_NE(nullptr, converter);
+    ASSERT_EQ(0, converter->init(meta, zvec::ailego::Params()));
+
+    zvec::core::IndexHolder::Pointer holder;
+    ASSERT_EQ(0, BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                      converter, &holder));
+    ASSERT_NE(nullptr, converter->result());
+    ASSERT_EQ(0, converter->cleanup());
+    EXPECT_EQ(nullptr, converter->result());
+
+    // Releasing the transient result must not make a converter single-use;
+    // DiskAnn retrains it during a later merge.
+    holder.reset();
+    ASSERT_EQ(0, BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                      converter, &holder));
+    ASSERT_NE(nullptr, converter->result());
+    EXPECT_EQ(0, converter->cleanup());
+  }
+}
+
 TEST(IndexInterface, DiskAnnParamJsonRoundTrip) {
   auto param = DiskAnnIndexParamBuilder()
                    .with_metric_type(MetricType::kL2sq)
@@ -364,14 +399,16 @@ TEST(IndexInterface, DiskAnnSupportsRepeatedMerge) {
         0, second->add(VectorData{DenseVector{second_vectors[id].data()}}, id));
   }
 
-  auto diskann_param = DiskAnnIndexParamBuilder()
-                           .with_metric_type(MetricType::kL2sq)
-                           .with_data_type(DataType::DT_FP32)
-                           .with_dimension(kDimension)
-                           .with_max_degree(16)
-                           .with_list_size(32)
-                           .with_pq_chunk_num(2)
-                           .build();
+  auto diskann_param =
+      DiskAnnIndexParamBuilder()
+          .with_metric_type(MetricType::kL2sq)
+          .with_data_type(DataType::DT_FP32)
+          .with_dimension(kDimension)
+          .with_max_degree(16)
+          .with_list_size(32)
+          .with_pq_chunk_num(2)
+          .with_quantizer_param(QuantizerParam(QuantizerType::kFP16))
+          .build();
   auto target = IndexFactory::CreateAndInitIndex(*diskann_param);
   ASSERT_NE(nullptr, target);
   ASSERT_EQ(

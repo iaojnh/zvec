@@ -349,6 +349,7 @@ class CosineConverter : public IndexConverter {
   //! Cleanup Converter
   int cleanup(void) override {
     *stats_.mutable_transformed_count() = 0;
+    holder_.reset();
     return 0;
   }
 

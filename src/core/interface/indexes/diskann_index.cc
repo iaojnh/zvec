@@ -27,6 +27,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
 #endif
 #include <zvec/core/interface/index.h>
 #if DISKANN_SUPPORTED
@@ -56,7 +60,44 @@ bool ReplaceFileAtomically(const std::string &source,
   return ::MoveFileExW(source_path.c_str(), destination_path.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
-  return ailego::File::Rename(source, destination);
+  const size_t separator = destination.rfind('/');
+  const std::string parent_directory =
+      separator == std::string::npos
+          ? "."
+          : (separator == 0 ? "/" : destination.substr(0, separator));
+  int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+  flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+  flags |= O_CLOEXEC;
+#endif
+
+  int directory_fd;
+  do {
+    directory_fd = ::open(parent_directory.c_str(), flags);
+  } while (directory_fd < 0 && errno == EINTR);
+  if (directory_fd < 0) {
+    return false;
+  }
+
+  if (!ailego::File::Rename(source, destination)) {
+    const int rename_error = errno;
+    ::close(directory_fd);
+    errno = rename_error;
+    return false;
+  }
+
+  int sync_result;
+  do {
+    sync_result = ::fsync(directory_fd);
+  } while (sync_result != 0 && errno == EINTR);
+  const int sync_error = sync_result == 0 ? 0 : errno;
+  ::close(directory_fd);
+  if (sync_result != 0) {
+    errno = sync_error;
+  }
+  return sync_result == 0;
 #endif
 }
 
@@ -408,12 +449,19 @@ int DiskAnnIndex::train() {
       converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
   auto reset_builder_after_failure = [&]() -> bool {
     holder_.reset();
+    bool reset_succeeded = true;
+    if (converter_ != nullptr && converter_->cleanup() != 0) {
+      LOG_ERROR(
+          "Failed to release DiskAnn converter result after training "
+          "failure");
+      reset_succeeded = false;
+    }
     if (builder_ == nullptr || builder_->cleanup() != 0 ||
         builder_->init(build_meta, proxima_index_params_) != 0) {
       LOG_ERROR("Failed to reset DiskAnn builder after training failure");
-      return false;
+      reset_succeeded = false;
     }
-    return true;
+    return reset_succeeded;
   };
   auto return_training_failure = [&](int failure) -> int {
     return reset_builder_after_failure() ? failure : core::IndexError_Runtime;
@@ -423,7 +471,7 @@ int DiskAnnIndex::train() {
   if (ret != 0) {
     LOG_ERROR("Failed to generate holder, err: %s",
               core::IndexError::What(ret));
-    return ret;
+    return return_training_failure(ret);
   }
   ret = builder_->train(holder_);
   if (ret != 0) {
@@ -451,6 +499,9 @@ int DiskAnnIndex::train() {
   }
   if (builder_->cleanup() != 0) {
     LOG_WARN("Failed to release DiskAnn builder memory after training");
+  }
+  if (converter_ != nullptr && converter_->cleanup() != 0) {
+    LOG_WARN("Failed to release DiskAnn converter memory after training");
   }
   return 0;
 }
@@ -570,11 +621,15 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
       converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
   auto rollback_training_state = [&]() {
     is_trained_ = was_trained;
-    if (!was_trained && builder_ != nullptr) {
-      if (builder_->cleanup() != 0 ||
-          builder_->init(build_meta, proxima_index_params_) != 0) {
-        LOG_ERROR("Failed to reset DiskAnn builder after merge failure");
-      }
+    holder_.reset();
+    if (converter_ != nullptr && converter_->cleanup() != 0) {
+      LOG_ERROR(
+          "Failed to release DiskAnn converter result after merge "
+          "failure");
+    }
+    if (builder_ == nullptr || builder_->cleanup() != 0 ||
+        builder_->init(build_meta, proxima_index_params_) != 0) {
+      LOG_ERROR("Failed to reset DiskAnn builder after merge failure");
     }
   };
 
@@ -601,7 +656,19 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
     rollback_training_state();
     return ret;
   }
-  is_trained_ = true;
+  holder_.reset();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_trained_ = true;
+    decltype(doc_cache_) empty_cache;
+    doc_cache_.swap(empty_cache);
+  }
+  if (builder_->cleanup() != 0) {
+    LOG_WARN("Failed to release DiskAnn builder memory after merge");
+  }
+  if (converter_ != nullptr && converter_->cleanup() != 0) {
+    LOG_WARN("Failed to release DiskAnn converter memory after merge");
+  }
   return 0;
 }
 

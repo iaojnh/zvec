@@ -203,6 +203,7 @@ class IntegerQuantizerConverter : public IndexConverter {
 
   //! Cleanup Converter
   int cleanup(void) override {
+    holder_.reset();
     return 0;
   }
 
@@ -429,6 +430,7 @@ class IntegerStreamingConverter : public IndexConverter {
   //! Cleanup Converter
   int cleanup(void) override {
     *stats_.mutable_transformed_count() = 0;
+    holder_.reset();
     return 0;
   }
 
