@@ -14,8 +14,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <ailego/pattern/defer.h>
 #include <zvec/ailego/io/file.h>
@@ -336,26 +339,55 @@ int DiskAnnIndex::CommitBuiltSnapshot() {
 }
 
 int DiskAnnIndex::add(const VectorData &vector, uint32_t doc_id) {
+  if (!is_open_) {
+    LOG_ERROR("Open DiskAnn index before adding vectors");
+    return core::IndexError_NoReady;
+  }
+  if (is_read_only_) {
+    LOG_ERROR("Cannot add to a read-only DiskAnn index");
+    return core::IndexError_Runtime;
+  }
   if (is_trained_) {
     LOG_ERROR("this diskann index is trained");
     return core::IndexError_Runtime;
   }
   if (!std::holds_alternative<DenseVector>(vector.vector)) {
     LOG_ERROR("Invalid vector data");
-    return core::IndexError_Runtime;
+    return core::IndexError_InvalidArgument;
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector.vector);
-  std::string out_vector_buffer = std::string(
-      static_cast<const char *>(dense_vector.data),
-      input_vector_meta_.dimension() * input_vector_meta_.unit_size());
-
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (doc_cache_.size() <= doc_id) {
-    std::string fake_data(
-        input_vector_meta_.dimension() * input_vector_meta_.unit_size(), 0);
-    doc_cache_.resize(doc_id + 1, std::make_pair(kInvalidKey, fake_data));
+  if (dense_vector.data == nullptr) {
+    LOG_ERROR("Invalid null vector data");
+    return core::IndexError_InvalidArgument;
   }
-  doc_cache_[doc_id] = std::make_pair(doc_id, out_vector_buffer);
+  if (doc_id == (std::numeric_limits<uint32_t>::max)()) {
+    LOG_ERROR("Invalid reserved document id: %u", doc_id);
+    return core::IndexError_OutOfRange;
+  }
+
+  try {
+    const size_t vector_size = input_vector_meta_.element_size();
+    std::string out_vector_buffer(static_cast<const char *>(dense_vector.data),
+                                  vector_size);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t required_size = static_cast<size_t>(doc_id) + 1;
+    if (required_size > doc_cache_.max_size()) {
+      LOG_ERROR("Document id exceeds cache capacity: %u", doc_id);
+      return core::IndexError_OutOfRange;
+    }
+    if (doc_cache_.size() < required_size) {
+      std::string fake_data(vector_size, 0);
+      doc_cache_.resize(required_size, std::make_pair(kInvalidKey, fake_data));
+    }
+    doc_cache_[doc_id] = std::make_pair(doc_id, std::move(out_vector_buffer));
+  } catch (const std::bad_alloc &) {
+    LOG_ERROR("Not enough memory to cache vector for document id: %u", doc_id);
+    return core::IndexError_NoMemory;
+  } catch (const std::length_error &) {
+    LOG_ERROR("Document id exceeds cache capacity: %u", doc_id);
+    return core::IndexError_OutOfRange;
+  }
   return 0;
 }
 
@@ -396,7 +428,38 @@ int DiskAnnIndex::train() {
 int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
                                VectorDataBuffer *vector_data_buffer) {
   if (is_trained_) {
-    return Index::_dense_fetch(doc_id, vector_data_buffer);
+    auto &context = acquire_context();
+    if (context == nullptr) {
+      LOG_ERROR("Failed to acquire DiskAnn fetch context");
+      return core::IndexError_Runtime;
+    }
+
+    std::string stored_vector;
+    const int ret = streamer_->get_vector(doc_id, context, stored_vector);
+    context->reset();
+    if (ret != 0) {
+      return ret;
+    }
+    const size_t expected_vector_size = streamer_vector_meta_.element_size();
+    if (stored_vector.size() != expected_vector_size) {
+      LOG_ERROR("Invalid fetched vector size: %zu, expected: %zu",
+                stored_vector.size(), expected_vector_size);
+      return core::IndexError_InvalidFormat;
+    }
+
+    DenseVectorBuffer dense_vector_buffer;
+    if (reformer_ != nullptr) {
+      dense_vector_buffer.data.resize(input_vector_meta_.element_size());
+      if (reformer_->revert(stored_vector.data(), streamer_vector_meta_,
+                            &dense_vector_buffer.data) != 0) {
+        LOG_ERROR("Failed to revert fetched DiskAnn vector");
+        return core::IndexError_Runtime;
+      }
+    } else {
+      dense_vector_buffer.data = std::move(stored_vector);
+    }
+    vector_data_buffer->vector_buffer = std::move(dense_vector_buffer);
+    return 0;
   } else {
     std::lock_guard<std::mutex> lock(mutex_);
     if (doc_id >= doc_cache_.size() ||

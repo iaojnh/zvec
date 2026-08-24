@@ -188,7 +188,7 @@ TEST(IndexInterface, DiskAnnQueryParamJsonRoundTrip) {
 }
 
 #if DISKANN_SUPPORTED
-TEST(IndexInterface, DiskAnnFetchRejectsMissingUntrainedDocuments) {
+TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
   const std::string path{"diskann_fetch_untrained.index"};
   zvec::test_util::RemoveTestFiles(path);
 
@@ -202,20 +202,79 @@ TEST(IndexInterface, DiskAnnFetchRejectsMissingUntrainedDocuments) {
                    .build();
   auto index = IndexFactory::CreateAndInitIndex(*param);
   ASSERT_NE(nullptr, index);
-  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+  EXPECT_EQ(0U, index->get_doc_count());
 
-  std::array<float, 4> vector{1.0F, 2.0F, 3.0F, 4.0F};
-  ASSERT_EQ(0, index->add(VectorData{DenseVector{vector.data()}}, 2));
+  std::array<float, 4> first_vector{1.0F, 2.0F, 3.0F, 4.0F};
+  EXPECT_EQ(zvec::core::IndexError_NoReady,
+            index->add(VectorData{DenseVector{first_vector.data()}}, 2));
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+  EXPECT_EQ(0U, index->get_doc_count());
+
+  std::array<float, 4> second_vector{5.0F, 6.0F, 7.0F, 8.0F};
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{first_vector.data()}}, 2));
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{second_vector.data()}}, 7));
+  EXPECT_EQ(zvec::core::IndexError_InvalidArgument,
+            index->add(VectorData{DenseVector{nullptr}}, 8));
+  EXPECT_EQ(zvec::core::IndexError_OutOfRange,
+            index->add(VectorData{DenseVector{first_vector.data()}},
+                       (std::numeric_limits<uint32_t>::max)()));
 
   VectorDataBuffer fetched;
   EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(0, &fetched));
   EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(99, &fetched));
+  EXPECT_EQ(zvec::core::IndexError_InvalidArgument, index->fetch(2, nullptr));
   EXPECT_EQ(0, index->fetch(2, &fetched));
   const auto &dense = std::get<DenseVectorBuffer>(fetched.vector_buffer);
-  ASSERT_EQ(sizeof(vector), dense.data.size());
-  EXPECT_EQ(0, std::memcmp(vector.data(), dense.data.data(), sizeof(vector)));
+  ASSERT_EQ(sizeof(first_vector), dense.data.size());
+  EXPECT_EQ(0, std::memcmp(first_vector.data(), dense.data.data(),
+                           sizeof(first_vector)));
+
+  ASSERT_EQ(0, index->train());
+  EXPECT_EQ(2U, index->get_doc_count());
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(0, &fetched));
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(1, &fetched));
+  EXPECT_EQ(0, index->fetch(2, &fetched));
+  EXPECT_EQ(0,
+            std::memcmp(
+                first_vector.data(),
+                std::get<DenseVectorBuffer>(fetched.vector_buffer).data.data(),
+                sizeof(first_vector)));
+  EXPECT_EQ(0, index->fetch(7, &fetched));
+  EXPECT_EQ(0,
+            std::memcmp(
+                second_vector.data(),
+                std::get<DenseVectorBuffer>(fetched.vector_buffer).data.data(),
+                sizeof(second_vector)));
 
   EXPECT_EQ(0, index->close());
+  EXPECT_EQ(0U, index->get_doc_count());
+
+  auto reopened = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, reopened);
+  ASSERT_EQ(0,
+            reopened->open(path, {StorageOptions::StorageType::kMMAP,
+                                  /*create_new=*/false, /*read_only=*/true}));
+  EXPECT_EQ(2U, reopened->get_doc_count());
+  EXPECT_EQ(zvec::core::IndexError_NoExist, reopened->fetch(1, &fetched));
+  EXPECT_EQ(0, reopened->fetch(7, &fetched));
+  EXPECT_EQ(0,
+            std::memcmp(
+                second_vector.data(),
+                std::get<DenseVectorBuffer>(fetched.vector_buffer).data.data(),
+                sizeof(second_vector)));
+  EXPECT_EQ(0, reopened->close());
+  EXPECT_EQ(0U, reopened->get_doc_count());
+
+  auto read_only_new = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, read_only_new);
+  ASSERT_EQ(
+      0, read_only_new->open(path, {StorageOptions::StorageType::kMMAP,
+                                    /*create_new=*/true, /*read_only=*/true}));
+  EXPECT_EQ(
+      zvec::core::IndexError_Runtime,
+      read_only_new->add(VectorData{DenseVector{first_vector.data()}}, 2));
+  EXPECT_EQ(0, read_only_new->close());
+
   zvec::test_util::RemoveTestFiles(path);
 }
 

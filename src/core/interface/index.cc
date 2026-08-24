@@ -69,12 +69,14 @@ bool Index::is_trained() const {
 
 uint32_t Index::get_doc_count() const {
   if (streamer_ == nullptr) {
-    return -1;
+    return 0;
   }
   if (is_sparse_) {
-    return streamer_->create_sparse_provider()->count();
+    const auto provider = streamer_->create_sparse_provider();
+    return provider == nullptr ? 0 : provider->count();
   }
-  return streamer_->create_provider()->count();
+  const auto provider = streamer_->create_provider();
+  return provider == nullptr ? 0 : provider->count();
 }
 
 core::IndexStreamer::Pointer Index::index_searcher() {
@@ -486,6 +488,10 @@ int Index::fetch(const uint32_t doc_id, VectorDataBuffer *vector_data_buffer) {
   if (!is_open_) {
     LOG_ERROR("Index is not open");
     return core::IndexError_Runtime;
+  }
+  if (vector_data_buffer == nullptr) {
+    LOG_ERROR("Invalid output vector buffer");
+    return core::IndexError_InvalidArgument;
   }
   if (is_sparse_) {
     return _sparse_fetch(doc_id, vector_data_buffer);
