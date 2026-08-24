@@ -135,6 +135,20 @@ class IOBackend {
     return available() == IOBackendType::kIoUring;
   }
 
+  // Persist a per-context setup fallback as the process-wide selection. The
+  // Linux enum values are ordered from the synchronous backend to the most
+  // capable asynchronous backend, so this operation is monotonic: a racing
+  // successful setup can never promote the process after another context has
+  // demonstrated that the preferred backend is unavailable at runtime.
+  void downgrade(IOBackendType fallback) {
+    IOBackendType current = type_.load(std::memory_order_acquire);
+    while (static_cast<int>(fallback) < static_cast<int>(current) &&
+           !type_.compare_exchange_weak(current, fallback,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+    }
+  }
+
   // Returns the cached backend type without triggering the probe.
   IOBackendType type() const {
     return type_.load(std::memory_order_acquire);

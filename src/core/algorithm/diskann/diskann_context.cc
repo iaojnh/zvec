@@ -115,7 +115,8 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
       break;
 
     case kSearcherContext:
-      if (graph_degree == 0 || pq_chunk_num_ == 0) {
+      if (pq_chunk_num_ == 0 ||
+          (graph_degree == 0 && entity_->doc_cnt() != 1)) {
         LOG_ERROR("Invalid DiskAnn search context dimensions");
         return IndexError_InvalidArgument;
       }
@@ -133,7 +134,8 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
                                  256);
       DiskAnnUtil::alloc_aligned(
           (void **)&pq_coord_buffer_,
-          static_cast<size_t>(graph_degree) * pq_chunk_num_ * sizeof(uint8_t),
+          static_cast<size_t>(std::max(graph_degree, 1U)) * pq_chunk_num_ *
+              sizeof(uint8_t),
           256);
       DiskAnnUtil::alloc_aligned((void **)&coord_buffer_, element_size_, 256);
       sector_buffer_size_ = static_cast<size_t>(DiskAnnUtil::kMaxSectorReadNum *
@@ -198,7 +200,7 @@ int DiskAnnContext::update(const ailego::Params &params) {
     LOG_ERROR("list_size must be positive");
     return IndexError_InvalidArgument;
   }
-  list_size_ = list_size;
+  set_list_size(list_size);
   return 0;
 }
 

@@ -190,6 +190,18 @@ Status QueryTarget::validate(const FieldSchema *schema,
           "Invalid query: IVF_RABITQ nprobe must be greater than 0");
     }
   }
+  if (query_params && query_params->type() == IndexType::DISKANN) {
+    auto diskann_params =
+        std::dynamic_pointer_cast<DiskAnnQueryParams>(query_params);
+    if (!diskann_params) {
+      return Status::InvalidArgument(
+          "Invalid query: DISKANN index requires DiskAnnQueryParams");
+    }
+    if (diskann_params->list_size() <= 0) {
+      return Status::InvalidArgument(
+          "Invalid query: DiskAnn list_size must be greater than 0");
+    }
+  }
   return Status::OK();
 }
 

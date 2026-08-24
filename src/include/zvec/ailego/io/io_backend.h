@@ -42,13 +42,16 @@ enum class IOBackendType {
   kUnavailable = 4,        // DiskAnn is disabled on this target
 };
 
-// Returns the currently active I/O backend type.
+// Returns the currently selected I/O backend type for new contexts.
 // Triggers backend selection on first call. Linux tries io_uring, then libaio,
-// and finally synchronous pread. macOS ARM64 uses synchronous pread. Windows
-// uses unbuffered overlapped I/O with a per-context completion port.
+// and finally synchronous pread. If a context cannot initialize the preferred
+// Linux backend, the process-wide selection is downgraded so later calls and
+// contexts report and use the effective fallback. macOS ARM64 uses synchronous
+// pread. Windows uses unbuffered overlapped I/O with a per-context completion
+// port.
 ZVEC_AILEGO_API IOBackendType current_io_backend_type();
 
-// Returns a human-readable description of the currently active I/O backend.
+// Returns a human-readable description of the currently selected I/O backend.
 // The description identifies io_uring, libaio, or pread. On Linux, the pread
 // description also explains that io_uring and libaio were unavailable and
 // provides guidance for enabling an asynchronous backend.

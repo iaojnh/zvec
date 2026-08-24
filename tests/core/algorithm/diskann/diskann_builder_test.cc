@@ -24,6 +24,7 @@
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_framework.h>
 #include "diskann_builder_entity.h"
+#include "diskann_context.h"
 #include "diskann_holder.h"
 #include "diskann_params.h"
 
@@ -289,6 +290,55 @@ TEST_F(DiskAnnBuilderTest, SmallDatasetBuildTime) {
   EXPECT_LT(elapsed_ms, 5000)
       << "DiskAnn build with " << kSmallDocCnt << " vectors took " << elapsed_ms
       << " ms — likely a lost-wakeup regression in progress loops.";
+}
+
+TEST_F(DiskAnnBuilderTest, SingleDocumentIndexCanBeSearched) {
+  auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+  ASSERT_NE(nullptr, builder);
+
+  auto holder =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  NumericalVector<float> vector(dim, 1.0F);
+  ASSERT_TRUE(holder->emplace(7, vector));
+
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 16);
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 32);
+  params.set(PARAM_DISKANN_BUILDER_MAX_PQ_CHUNK_NUM, 1);
+  params.set(PARAM_DISKANN_BUILDER_THREAD_COUNT, 1);
+  ASSERT_EQ(0, builder->init(*_index_meta_ptr, params));
+  ASSERT_EQ(0, builder->train(holder));
+  ASSERT_EQ(0, builder->build(holder));
+
+  const string path = _dir + "/SingleDocumentIndexCanBeSearched";
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, dumper);
+  ASSERT_EQ(0, dumper->create(path));
+  ASSERT_EQ(0, builder->dump(dumper));
+  ASSERT_EQ(0, dumper->close());
+
+  auto storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->open(path, false));
+
+  auto searcher = IndexFactory::CreateSearcher("DiskAnnSearcher");
+  ASSERT_NE(nullptr, searcher);
+  Params search_params;
+  search_params.set(PARAM_DISKANN_SEARCHER_LIST_SIZE, 32);
+  ASSERT_EQ(0, searcher->init(search_params));
+  ASSERT_EQ(0, searcher->load(storage, IndexMetric::Pointer()));
+
+  auto context = searcher->create_context();
+  ASSERT_NE(nullptr, context);
+  auto *diskann_context = dynamic_cast<DiskAnnContext *>(context.get());
+  ASSERT_NE(nullptr, diskann_context);
+  EXPECT_EQ(1U, diskann_context->list_size());
+
+  context->set_topk(1);
+  IndexQueryMeta query_meta(IndexMeta::DataType::DT_FP32, dim);
+  ASSERT_EQ(0, searcher->search_impl(vector.data(), query_meta, context));
+  ASSERT_EQ(1U, context->result().size());
+  EXPECT_EQ(7U, context->result()[0].key());
 }
 
 TEST_F(DiskAnnBuilderTest, MemoryLimitCapsPqChunkCount) {

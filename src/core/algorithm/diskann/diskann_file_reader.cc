@@ -263,6 +263,9 @@ int setup_io_ctx(IOContext &ctx) {
     int ret = LibAioLoader::Instance().io_setup(MAX_EVENTS, &ctx->aio_ctx);
     if (ret == 0) {
       ctx->type = ailego::IOBackendType::kLibAio;
+      if (selected == ailego::IOBackendType::kIoUring) {
+        ailego::IOBackend::Instance().downgrade(ctx->type);
+      }
       log_diskann_io_backend(ctx->type);
       return 0;
     }
@@ -272,6 +275,7 @@ int setup_io_ctx(IOContext &ctx) {
 
   // Priority 3: synchronous pread (always available).
   ctx->type = ailego::IOBackendType::kPread;
+  ailego::IOBackend::Instance().downgrade(ctx->type);
 #endif
   log_diskann_io_backend(ctx->type);
   return 0;

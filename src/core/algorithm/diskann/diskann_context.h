@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <algorithm>
 #include <zvec/core/framework/index_context.h>
 #include "utility/topk_result_builder.h"
 #include "diskann_dist_calculator.h"
@@ -145,7 +146,12 @@ class DiskAnnContext : public IndexContext,
   }
 
   void set_list_size(uint32_t list_size) {
-    list_size_ = list_size;
+    if (entity_ && entity_->doc_cnt() > 0) {
+      list_size_ = static_cast<uint32_t>(
+          std::min<uint64_t>(list_size, entity_->doc_cnt()));
+    } else {
+      list_size_ = list_size;
+    }
   }
 
   void set_fetch_vector(bool v) override {

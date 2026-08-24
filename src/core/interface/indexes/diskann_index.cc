@@ -12,9 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <ailego/pattern/defer.h>
+#include <zvec/ailego/io/file.h>
+#if defined(_WIN32) || defined(_WIN64)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <zvec/core/interface/index.h>
 #if DISKANN_SUPPORTED
 #include "algorithm/diskann/diskann_params.h"
@@ -22,6 +32,33 @@
 #endif
 
 namespace zvec::core_interface {
+
+#if DISKANN_SUPPORTED
+namespace {
+
+std::string MakeMergeTemporaryPath(const std::string &file_path) {
+  static std::atomic<uint64_t> sequence{0};
+  const auto timestamp =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  return file_path + ".merge-" + std::to_string(timestamp) + "-" +
+         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) +
+         ".tmp";
+}
+
+bool ReplaceFileAtomically(const std::string &source,
+                           const std::string &destination) {
+#if defined(_WIN32) || defined(_WIN64)
+  const auto source_path = ailego::FileHelper::PathFromUtf8(source);
+  const auto destination_path = ailego::FileHelper::PathFromUtf8(destination);
+  return ::MoveFileExW(source_path.c_str(), destination_path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+  return ailego::File::Rename(source, destination);
+#endif
+}
+
+}  // namespace
+#endif
 
 #if !DISKANN_SUPPORTED
 
@@ -321,7 +358,12 @@ int DiskAnnIndex::_prepare_for_search(
   params.set(
       core::PARAM_DISKANN_SEARCHER_LIST_SIZE,
       std::max(diskann_search_param->topk, diskann_search_param->list_size));
-  context->update(params);
+  const int ret = context->update(params);
+  if (ret != 0) {
+    LOG_ERROR("Failed to update DiskAnn search context: %s",
+              core::IndexError::What(ret));
+    return ret;
+  }
 
   return 0;
 }
@@ -333,6 +375,19 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
     return core::IndexError_Success;
   }
 
+  const bool was_trained = is_trained_;
+  const core::IndexMeta &build_meta =
+      converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
+  auto rollback_training_state = [&]() {
+    is_trained_ = was_trained;
+    if (!was_trained && builder_ != nullptr) {
+      if (builder_->cleanup() != 0 ||
+          builder_->init(build_meta, proxima_index_params_) != 0) {
+        LOG_ERROR("Failed to reset DiskAnn builder after merge failure");
+      }
+    }
+  };
+
   // A DiskAnn builder is single-use. Reinitialize it before rebuilding an
   // already trained target so repeated merge calls behave like other indexes.
   if (is_trained_) {
@@ -340,8 +395,6 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
       LOG_ERROR("Failed to reset DiskAnn builder before merge");
       return core::IndexError_Runtime;
     }
-    const core::IndexMeta &build_meta =
-        converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
     if (builder_->init(build_meta, proxima_index_params_) != 0) {
       LOG_ERROR("Failed to reinitialize DiskAnn builder before merge");
       return core::IndexError_Runtime;
@@ -350,52 +403,108 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
 
   int pre_ret = Index::merge(indexes, filter, options);
   if (pre_ret != 0) {
+    rollback_training_state();
     return pre_ret;
   }
   auto dumper = core::IndexFactory::CreateDumper("FileDumper");
   if (dumper == nullptr) {
     LOG_ERROR("Failed to create FileDumper");
+    rollback_training_state();
     return core::IndexError_Runtime;
   }
 
-  // Drop readers of the previous snapshot before replacing the file. This is
-  // required by the Windows sharing mode and also prevents stale reload state.
-  if (streamer_ == nullptr || streamer_->unload() != 0 ||
-      (storage_ != nullptr && storage_->close() != 0)) {
-    LOG_ERROR("Failed to release the previous DiskAnn snapshot");
-    return core::IndexError_Runtime;
-  }
+  const std::string temporary_path = MakeMergeTemporaryPath(file_path_);
+  bool temporary_committed = false;
+  AILEGO_DEFER([&]() {
+    if (!temporary_committed &&
+        ailego::FileHelper::IsExist(temporary_path.c_str())) {
+      ailego::File::Delete(temporary_path);
+    }
+  });
 
-  int ret = dumper->create(file_path_);
+  int ret = dumper->create(temporary_path);
   if (ret != 0) {
-    LOG_ERROR("Failed to create dumper, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
+    LOG_ERROR("Failed to create dumper, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    rollback_training_state();
     return core::IndexError_Runtime;
   }
   ret = builder_->dump(dumper);
   if (ret != 0) {
-    LOG_ERROR("Failed to dump index, path: %s, err: %s", file_path_.c_str(),
+    LOG_ERROR("Failed to dump index, path: %s, err: %s", temporary_path.c_str(),
               core::IndexError::What(ret));
     dumper->close();
+    rollback_training_state();
     return core::IndexError_Runtime;
   }
 
   ret = dumper->close();
   if (ret != 0) {
-    LOG_ERROR("Failed to close dumper, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
+    LOG_ERROR("Failed to close dumper, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    rollback_training_state();
     return core::IndexError_Runtime;
   }
 
-  ret = storage_->open(file_path_, false);
-  if (ret != 0) {
-    LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
+  auto replacement_storage =
+      core::IndexFactory::CreateStorage("FileReadStorage");
+  auto replacement_streamer =
+      core::IndexFactory::CreateStreamer("DiskAnnStreamer");
+  if (replacement_storage == nullptr || replacement_streamer == nullptr) {
+    LOG_ERROR("Failed to create replacement DiskAnn reader");
+    rollback_training_state();
     return core::IndexError_Runtime;
   }
-  if (streamer_ == nullptr || streamer_->open(storage_) != 0) {
-    LOG_ERROR("Failed to open streamer, path: %s", file_path_.c_str());
+
+  ailego::Params storage_params;
+  ret = replacement_storage->init(storage_params);
+  if (ret != 0) {
+    LOG_ERROR("Failed to initialize replacement storage, err: %s",
+              core::IndexError::What(ret));
+    rollback_training_state();
     return core::IndexError_Runtime;
+  }
+
+  ret = replacement_streamer->init(build_meta, proxima_index_params_);
+  if (ret != 0) {
+    LOG_ERROR("Failed to initialize replacement streamer, err: %s",
+              core::IndexError::What(ret));
+    rollback_training_state();
+    return core::IndexError_Runtime;
+  }
+  ret = replacement_storage->open(temporary_path, false);
+  if (ret != 0) {
+    LOG_ERROR("Failed to open replacement storage, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    rollback_training_state();
+    return core::IndexError_Runtime;
+  }
+  ret = replacement_streamer->open(replacement_storage);
+  if (ret != 0) {
+    LOG_ERROR("Failed to validate replacement streamer, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    rollback_training_state();
+    return core::IndexError_Runtime;
+  }
+
+  if (!ReplaceFileAtomically(temporary_path, file_path_)) {
+    LOG_ERROR("Failed to atomically replace DiskAnn index, path: %s, err: %s",
+              file_path_.c_str(),
+              ailego::FileHelper::GetLastErrorString().c_str());
+    rollback_training_state();
+    return core::IndexError_Runtime;
+  }
+  temporary_committed = true;
+
+  auto previous_streamer = std::move(streamer_);
+  auto previous_storage = std::move(storage_);
+  streamer_ = std::move(replacement_streamer);
+  storage_ = std::move(replacement_storage);
+  if (previous_streamer != nullptr && previous_streamer->unload() != 0) {
+    LOG_WARN("Failed to unload previous DiskAnn snapshot after replacement");
+  }
+  if (previous_storage != nullptr && previous_storage->close() != 0) {
+    LOG_WARN("Failed to close previous DiskAnn storage after replacement");
   }
   is_trained_ = true;
   return 0;

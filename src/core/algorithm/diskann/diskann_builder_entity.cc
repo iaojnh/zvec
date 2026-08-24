@@ -521,7 +521,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
         auto neighbors = get_neighbors(cur_node_id);
         neighbor_num = neighbors.first;
 
-        ailego_assert(neighbor_num > 0);
+        ailego_assert(neighbor_num > 0 || doc_cnt == 1);
         ailego_assert(neighbor_num <= max_observed_degree);
 
         if (iter->is_valid()) {
@@ -587,7 +587,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
       auto neighbors = get_neighbors(i);
       neighbor_num = neighbors.first;
 
-      ailego_assert(neighbor_num > 0);
+      ailego_assert(neighbor_num > 0 || doc_cnt == 1);
       ailego_assert(neighbor_num <= max_observed_degree);
 
       if (iter->is_valid()) {
