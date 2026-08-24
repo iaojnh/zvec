@@ -30,11 +30,10 @@ namespace zvec::core_interface {
 
 inline constexpr uint64_t kInvalidKey = std::numeric_limits<uint64_t>::max();
 
-template <core::IndexMeta::DataType DT, typename T>
-inline int BuildMultiPassHolderImpl(
-    uint32_t dimension,
-    const std::vector<std::pair<uint64_t, std::string>> &doc_cache,
-    core::IndexHolder::Pointer *holder_out) {
+template <core::IndexMeta::DataType DT, typename T, typename DocCache>
+inline int BuildMultiPassHolderImpl(uint32_t dimension,
+                                    const DocCache &doc_cache,
+                                    core::IndexHolder::Pointer *holder_out) {
   auto holder =
       std::make_shared<zvec::core::MultiPassIndexHolder<DT>>(dimension);
   for (const auto &doc : doc_cache) {
@@ -51,11 +50,11 @@ inline int BuildMultiPassHolderImpl(
   return 0;
 }
 
-inline int BuildMultiPassHolder(
-    DataType data_type, uint32_t dimension,
-    const std::vector<std::pair<uint64_t, std::string>> &doc_cache,
-    const core::IndexConverter::Pointer &converter,
-    core::IndexHolder::Pointer *holder) {
+template <typename DocCache>
+inline int BuildMultiPassHolder(DataType data_type, uint32_t dimension,
+                                const DocCache &doc_cache,
+                                const core::IndexConverter::Pointer &converter,
+                                core::IndexHolder::Pointer *holder) {
   int ret = 0;
   switch (data_type) {
     case DataType::DT_FP16:

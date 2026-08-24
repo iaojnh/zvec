@@ -27,7 +27,6 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_framework.h>
-#include "diskann_holder.h"
 #include "diskann_index_provider.h"
 #include "diskann_params.h"
 #include "diskann_streamer.h"

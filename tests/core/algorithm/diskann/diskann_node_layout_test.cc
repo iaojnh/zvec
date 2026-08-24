@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "diskann_searcher.h"
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -23,8 +22,8 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_factory.h>
-#include "diskann_holder.h"
 #include "diskann_params.h"
+#include "diskann_searcher.h"
 #include "diskann_util.h"
 
 namespace zvec {
@@ -48,8 +47,7 @@ class DiskAnnCacheTestPeer {
   }
 
   static int parse_node_neighbors(DiskAnnIndexer &indexer,
-                                  const uint8_t *node_buf,
-                                  diskann_id_t node_id,
+                                  const uint8_t *node_buf, diskann_id_t node_id,
                                   uint32_t &neighbor_count,
                                   diskann_id_t *neighbors) {
     return indexer.parse_node_neighbors(node_buf, node_id, neighbor_count,
@@ -58,9 +56,12 @@ class DiskAnnCacheTestPeer {
 
   static DiskAnnNodeLayoutForTest layout(const DiskAnnSearcher &searcher) {
     const DiskAnnIndexer &indexer = *searcher.diskann_indexer_;
-    return {indexer.index_segment_offset_, indexer.node_per_sector_,
-            indexer.max_node_size_,       indexer.max_degree_,
-            indexer.doc_cnt_,             indexer.medoid_};
+    return {indexer.index_segment_offset_,
+            indexer.node_per_sector_,
+            indexer.max_node_size_,
+            indexer.max_degree_,
+            indexer.doc_cnt_,
+            indexer.medoid_};
   }
 };
 
@@ -246,17 +247,17 @@ TEST_F(DiskAnnNodeLayoutTest,
   ASSERT_GT(layout.max_degree, 0U);
   ASSERT_EQ(layout.doc_count, kDocCount);
 
-  const uint64_t node_sector = DiskAnnUtil::get_node_sector(
-      layout.node_per_sector, layout.max_node_size, DiskAnnUtil::kSectorSize,
-      layout.medoid);
+  const uint64_t node_sector =
+      DiskAnnUtil::get_node_sector(layout.node_per_sector, layout.max_node_size,
+                                   DiskAnnUtil::kSectorSize, layout.medoid);
   const uint64_t node_offset =
       layout.node_per_sector == 0
           ? 0
           : static_cast<uint64_t>(layout.medoid % layout.node_per_sector) *
                 layout.max_node_size;
-  const uint64_t count_offset =
-      layout.index_segment_offset + node_sector * DiskAnnUtil::kSectorSize +
-      node_offset + meta.element_size();
+  const uint64_t count_offset = layout.index_segment_offset +
+                                node_sector * DiskAnnUtil::kSectorSize +
+                                node_offset + meta.element_size();
 
   uint32_t original_count = 0;
   diskann_id_t original_neighbor = 0;

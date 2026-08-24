@@ -347,10 +347,6 @@ int DiskAnnIndex::add(const VectorData &vector, uint32_t doc_id) {
     LOG_ERROR("Cannot add to a read-only DiskAnn index");
     return core::IndexError_Runtime;
   }
-  if (is_trained_) {
-    LOG_ERROR("this diskann index is trained");
-    return core::IndexError_Runtime;
-  }
   if (!std::holds_alternative<DenseVector>(vector.vector)) {
     LOG_ERROR("Invalid vector data");
     return core::IndexError_InvalidArgument;
@@ -371,16 +367,11 @@ int DiskAnnIndex::add(const VectorData &vector, uint32_t doc_id) {
                                   vector_size);
 
     std::lock_guard<std::mutex> lock(mutex_);
-    const size_t required_size = static_cast<size_t>(doc_id) + 1;
-    if (required_size > doc_cache_.max_size()) {
-      LOG_ERROR("Document id exceeds cache capacity: %u", doc_id);
-      return core::IndexError_OutOfRange;
+    if (is_trained_ || is_training_) {
+      LOG_ERROR("Cannot add vectors while DiskAnn is trained or training");
+      return core::IndexError_NoReady;
     }
-    if (doc_cache_.size() < required_size) {
-      std::string fake_data(vector_size, 0);
-      doc_cache_.resize(required_size, std::make_pair(kInvalidKey, fake_data));
-    }
-    doc_cache_[doc_id] = std::make_pair(doc_id, std::move(out_vector_buffer));
+    doc_cache_.insert_or_assign(doc_id, std::move(out_vector_buffer));
   } catch (const std::bad_alloc &) {
     LOG_ERROR("Not enough memory to cache vector for document id: %u", doc_id);
     return core::IndexError_NoMemory;
@@ -400,6 +391,33 @@ int DiskAnnIndex::train() {
     LOG_ERROR("Cannot train a read-only DiskAnn index");
     return core::IndexError_Runtime;
   }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_trained_ || is_training_) {
+      LOG_ERROR("DiskAnn index is already trained or training");
+      return core::IndexError_NoReady;
+    }
+    is_training_ = true;
+  }
+  AILEGO_DEFER([&]() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_training_ = false;
+  });
+
+  const core::IndexMeta &build_meta =
+      converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
+  auto reset_builder_after_failure = [&]() -> bool {
+    holder_.reset();
+    if (builder_ == nullptr || builder_->cleanup() != 0 ||
+        builder_->init(build_meta, proxima_index_params_) != 0) {
+      LOG_ERROR("Failed to reset DiskAnn builder after training failure");
+      return false;
+    }
+    return true;
+  };
+  auto return_training_failure = [&](int failure) -> int {
+    return reset_builder_after_failure() ? failure : core::IndexError_Runtime;
+  };
 
   int ret = GenerateHolder();
   if (ret != 0) {
@@ -410,18 +428,30 @@ int DiskAnnIndex::train() {
   ret = builder_->train(holder_);
   if (ret != 0) {
     LOG_ERROR("Failed to train builder, err: %s", core::IndexError::What(ret));
-    return ret;
+    return return_training_failure(ret);
   }
   ret = builder_->build(holder_);
   if (ret != 0) {
     LOG_ERROR("Failed to build index, err: %s", core::IndexError::What(ret));
-    return ret;
+    return return_training_failure(ret);
   }
   ret = CommitBuiltSnapshot();
   if (ret != 0) {
-    return ret;
+    return return_training_failure(ret);
   }
-  is_trained_ = true;
+  // The committed streamer owns the searchable snapshot. Drop all build-time
+  // copies immediately so a trained mobile index does not retain the input
+  // cache, holder, and builder entity for the rest of its lifetime.
+  holder_.reset();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_trained_ = true;
+    decltype(doc_cache_) empty_cache;
+    doc_cache_.swap(empty_cache);
+  }
+  if (builder_->cleanup() != 0) {
+    LOG_WARN("Failed to release DiskAnn builder memory after training");
+  }
   return 0;
 }
 
@@ -462,14 +492,14 @@ int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
     return 0;
   } else {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (doc_id >= doc_cache_.size() ||
-        doc_cache_[doc_id].first == kInvalidKey) {
+    const auto iter = doc_cache_.find(doc_id);
+    if (iter == doc_cache_.end()) {
       LOG_ERROR("Vector id does not exist: %u", doc_id);
       return core::IndexError_NoExist;
     }
     DenseVectorBuffer dense_vector_buffer;
     std::string &out_vector_buffer = dense_vector_buffer.data;
-    out_vector_buffer = doc_cache_[doc_id].second;
+    out_vector_buffer = iter->second;
     vector_data_buffer->vector_buffer = std::move(dense_vector_buffer);
     return 0;
   }

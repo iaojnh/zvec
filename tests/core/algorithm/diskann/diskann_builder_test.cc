@@ -25,7 +25,6 @@
 #include <zvec/core/framework/index_framework.h>
 #include "diskann_builder_entity.h"
 #include "diskann_context.h"
-#include "diskann_holder.h"
 #include "diskann_params.h"
 
 using namespace zvec::core;

@@ -380,6 +380,10 @@ TEST(DiskAnnMobileCompatTest, MinimalEntityUsesValidatedTypedKeyStorage) {
   ASSERT_NE(cloned, nullptr);
   EXPECT_EQ(cloned->get_id(42), 1u);
   EXPECT_EQ(cloned->get_key(0), 84u);
+  const auto cloned_entity =
+      std::dynamic_pointer_cast<DiskAnnSearcherEntity>(cloned);
+  ASSERT_NE(cloned_entity, nullptr);
+  EXPECT_EQ(&entity.entrypoints(), &cloned_entity->entrypoints());
 }
 
 TEST(DiskAnnMobileCompatTest, EntityAllowsMultipleInvalidKeySlots) {

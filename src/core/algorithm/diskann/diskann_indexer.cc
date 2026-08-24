@@ -289,7 +289,7 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
   medoid_ = entity.medoid();
 
   entrypoints_.push_back(medoid_);
-  auto &entrypoints = entity.entrypoints();
+  const auto &entrypoints = entity.entrypoints();
   for (size_t i = 0; i < entrypoints.size(); ++i) {
     entrypoints_.push_back(entrypoints[i]);
   }

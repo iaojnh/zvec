@@ -82,7 +82,7 @@ void DiskAnnSearcherEntity::clear() {
   pq_table_.reset();
   key_buffer_.reset();
   key_mapping_buffer_.reset();
-  entrypoints_.clear();
+  entrypoints_.reset();
   meta_.clear();
   meta_header_ = {};
   pq_meta_ = {};
@@ -494,7 +494,13 @@ int DiskAnnSearcherEntity::load_entrypoint_segment() {
       return IndexError_InvalidFormat;
     }
   }
-  entrypoints_ = std::move(entrypoints);
+  try {
+    entrypoints_ = std::make_shared<const std::vector<diskann_id_t>>(
+        std::move(entrypoints));
+  } catch (const std::bad_alloc &) {
+    LOG_ERROR("Failed to retain DiskAnn entrypoints");
+    return IndexError_NoMemory;
+  }
 
   return 0;
 }

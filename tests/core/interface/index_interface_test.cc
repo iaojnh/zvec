@@ -27,6 +27,7 @@
 #include "zvec/core/framework/index_provider.h"
 #endif
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/utility/file_helper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_holder.h>
 #include "algorithm/hnsw/hnsw_params.h"
@@ -189,6 +190,7 @@ TEST(IndexInterface, DiskAnnQueryParamJsonRoundTrip) {
 
 #if DISKANN_SUPPORTED
 TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
+  constexpr uint32_t kSparseDocId = 1'000'000'000U;
   const std::string path{"diskann_fetch_untrained.index"};
   zvec::test_util::RemoveTestFiles(path);
 
@@ -212,7 +214,8 @@ TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
 
   std::array<float, 4> second_vector{5.0F, 6.0F, 7.0F, 8.0F};
   ASSERT_EQ(0, index->add(VectorData{DenseVector{first_vector.data()}}, 2));
-  ASSERT_EQ(0, index->add(VectorData{DenseVector{second_vector.data()}}, 7));
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{second_vector.data()}},
+                          kSparseDocId));
   EXPECT_EQ(zvec::core::IndexError_InvalidArgument,
             index->add(VectorData{DenseVector{nullptr}}, 8));
   EXPECT_EQ(zvec::core::IndexError_OutOfRange,
@@ -239,7 +242,7 @@ TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
                 first_vector.data(),
                 std::get<DenseVectorBuffer>(fetched.vector_buffer).data.data(),
                 sizeof(first_vector)));
-  EXPECT_EQ(0, index->fetch(7, &fetched));
+  EXPECT_EQ(0, index->fetch(kSparseDocId, &fetched));
   EXPECT_EQ(0,
             std::memcmp(
                 second_vector.data(),
@@ -256,7 +259,7 @@ TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
                                   /*create_new=*/false, /*read_only=*/true}));
   EXPECT_EQ(2U, reopened->get_doc_count());
   EXPECT_EQ(zvec::core::IndexError_NoExist, reopened->fetch(1, &fetched));
-  EXPECT_EQ(0, reopened->fetch(7, &fetched));
+  EXPECT_EQ(0, reopened->fetch(kSparseDocId, &fetched));
   EXPECT_EQ(0,
             std::memcmp(
                 second_vector.data(),
@@ -275,6 +278,52 @@ TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
       read_only_new->add(VectorData{DenseVector{first_vector.data()}}, 2));
   EXPECT_EQ(0, read_only_new->close());
 
+  zvec::test_util::RemoveTestFiles(path);
+}
+
+TEST(IndexInterface, DiskAnnTrainCanRetryAfterSnapshotCommitFailure) {
+  constexpr uint32_t kDimension = 8;
+  constexpr uint32_t kDocCount = 16;
+  const std::string path{"diskann_train_retry.index"};
+  zvec::test_util::RemoveTestFiles(path);
+  zvec::ailego::FileHelper::RemoveDirectory(path.c_str());
+
+  auto param = DiskAnnIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(kDimension)
+                   .with_max_degree(8)
+                   .with_list_size(16)
+                   .with_pq_chunk_num(2)
+                   .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+
+  std::vector<std::array<float, kDimension>> vectors(kDocCount);
+  for (uint32_t id = 0; id < kDocCount; ++id) {
+    for (uint32_t dim = 0; dim < kDimension; ++dim) {
+      vectors[id][dim] = static_cast<float>(id * kDimension + dim);
+    }
+    ASSERT_EQ(0, index->add(VectorData{DenseVector{vectors[id].data()}}, id));
+  }
+
+  // A directory cannot be atomically replaced by the completed index file.
+  // Once that transient obstruction is removed, the same Index instance must
+  // be able to rebuild and commit without remaining in BUILT state.
+  ASSERT_TRUE(zvec::ailego::FileHelper::MakePath(path.c_str()));
+  EXPECT_NE(0, index->train());
+  ASSERT_TRUE(zvec::ailego::FileHelper::RemoveDirectory(path.c_str()));
+  ASSERT_EQ(0, index->train());
+
+  VectorDataBuffer fetched;
+  ASSERT_EQ(0, index->fetch(7, &fetched));
+  const auto &dense = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+  ASSERT_EQ(sizeof(vectors[7]), dense.data.size());
+  EXPECT_EQ(
+      0, std::memcmp(vectors[7].data(), dense.data.data(), dense.data.size()));
+
+  EXPECT_EQ(0, index->close());
   zvec::test_util::RemoveTestFiles(path);
 }
 
