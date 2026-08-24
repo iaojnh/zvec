@@ -30,11 +30,16 @@ namespace {
 
 bool matches_query_meta(const IndexMeta &meta,
                         const IndexQueryMeta &query_meta) {
-  return meta.meta_type() == query_meta.meta_type() &&
-         meta.data_type() == query_meta.data_type() &&
-         meta.dimension() == query_meta.dimension() &&
-         meta.unit_size() == query_meta.unit_size() &&
-         meta.element_size() == query_meta.element_size();
+  if (meta.meta_type() != query_meta.meta_type() ||
+      meta.data_type() != query_meta.data_type() ||
+      meta.unit_size() != query_meta.unit_size()) {
+    return false;
+  }
+  // Sparse records carry their logical length per document. Their metadata
+  // dimension and element size are not the size of an individual record.
+  return meta.meta_type() == IndexMeta::MetaType::MT_SPARSE ||
+         (meta.dimension() == query_meta.dimension() &&
+          meta.element_size() == query_meta.element_size());
 }
 
 bool matches_index_meta(const IndexQueryMeta &query_meta,
@@ -203,6 +208,28 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
   // append new docs after the existing ones instead of overwriting from 0.
   uint64_t id_offset = 0;
   uint64_t next_id = 0;
+  auto find_next_target_id = [&next_id](const auto &provider) -> int {
+    const uint64_t target_count = provider->count();
+    next_id = (std::max)(next_id, target_count);
+    if (target_count == 0) {
+      return 0;
+    }
+    auto iterator = provider->create_iterator();
+    if (!iterator) {
+      LOG_ERROR("Failed to create target provider iterator");
+      return IndexError_Runtime;
+    }
+    while (iterator->is_valid()) {
+      const uint64_t key = iterator->key();
+      if (key == (std::numeric_limits<uint64_t>::max)()) {
+        LOG_ERROR("Invalid target vector key");
+        return IndexError_InvalidFormat;
+      }
+      next_id = (std::max)(next_id, key + 1);
+      iterator->next();
+    }
+    return 0;
+  };
   if (target_builder_ == nullptr) {
     if (is_sparse_) {
       auto provider = target_streamer_->create_sparse_provider();
@@ -210,14 +237,20 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
         LOG_ERROR("Failed to create target sparse provider");
         return IndexError_Runtime;
       }
-      next_id = provider->count();
+      const int ret = find_next_target_id(provider);
+      if (ret != 0) {
+        return ret;
+      }
     } else {
       auto provider = target_streamer_->create_provider();
       if (!provider) {
         LOG_ERROR("Failed to create target provider");
         return IndexError_Runtime;
       }
-      next_id = provider->count();
+      const int ret = find_next_target_id(provider);
+      if (ret != 0) {
+        return ret;
+      }
     }
   }
 

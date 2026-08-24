@@ -272,6 +272,12 @@ int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
   if (is_trained_) {
     return Index::_dense_fetch(doc_id, vector_data_buffer);
   } else {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (doc_id >= doc_cache_.size() ||
+        doc_cache_[doc_id].first == kInvalidKey) {
+      LOG_ERROR("Vector id does not exist: %u", doc_id);
+      return core::IndexError_NoExist;
+    }
     DenseVectorBuffer dense_vector_buffer;
     std::string &out_vector_buffer = dense_vector_buffer.data;
     out_vector_buffer = doc_cache_[doc_id].second;
@@ -323,21 +329,63 @@ int DiskAnnIndex::_prepare_for_search(
 int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
                         const IndexFilter &filter,
                         const MergeOptions &options) {
+  if (indexes.empty()) {
+    return core::IndexError_Success;
+  }
+
+  // A DiskAnn builder is single-use. Reinitialize it before rebuilding an
+  // already trained target so repeated merge calls behave like other indexes.
+  if (is_trained_) {
+    if (builder_ == nullptr || builder_->cleanup() != 0) {
+      LOG_ERROR("Failed to reset DiskAnn builder before merge");
+      return core::IndexError_Runtime;
+    }
+    const core::IndexMeta &build_meta =
+        converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
+    if (builder_->init(build_meta, proxima_index_params_) != 0) {
+      LOG_ERROR("Failed to reinitialize DiskAnn builder before merge");
+      return core::IndexError_Runtime;
+    }
+  }
+
   int pre_ret = Index::merge(indexes, filter, options);
   if (pre_ret != 0) {
     return pre_ret;
   }
   auto dumper = core::IndexFactory::CreateDumper("FileDumper");
-
-  dumper->create(file_path_);
-  int ret = builder_->dump(dumper);
-  if (ret != 0) {
-    LOG_ERROR("Failed to dump index, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
+  if (dumper == nullptr) {
+    LOG_ERROR("Failed to create FileDumper");
     return core::IndexError_Runtime;
   }
 
-  dumper->close();
+  // Drop readers of the previous snapshot before replacing the file. This is
+  // required by the Windows sharing mode and also prevents stale reload state.
+  if (streamer_ == nullptr || streamer_->unload() != 0 ||
+      (storage_ != nullptr && storage_->close() != 0)) {
+    LOG_ERROR("Failed to release the previous DiskAnn snapshot");
+    return core::IndexError_Runtime;
+  }
+
+  int ret = dumper->create(file_path_);
+  if (ret != 0) {
+    LOG_ERROR("Failed to create dumper, path: %s, err: %s", file_path_.c_str(),
+              core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
+  ret = builder_->dump(dumper);
+  if (ret != 0) {
+    LOG_ERROR("Failed to dump index, path: %s, err: %s", file_path_.c_str(),
+              core::IndexError::What(ret));
+    dumper->close();
+    return core::IndexError_Runtime;
+  }
+
+  ret = dumper->close();
+  if (ret != 0) {
+    LOG_ERROR("Failed to close dumper, path: %s, err: %s", file_path_.c_str(),
+              core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
 
   ret = storage_->open(file_path_, false);
   if (ret != 0) {

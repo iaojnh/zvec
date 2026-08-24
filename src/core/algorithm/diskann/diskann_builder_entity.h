@@ -103,6 +103,10 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   std::vector<uint8_t> pq_centroid_;
   std::vector<uint32_t> pq_chunk_offsets_;
   std::vector<uint8_t> block_compressed_data_;
+
+  int build_key_mapping(std::vector<diskann_id_t> *mapping) const;
+  int dump_key_mapping_segment(const IndexDumper::Pointer &dumper,
+                               const std::vector<diskann_id_t> &mapping) const;
 };
 
 }  // namespace core

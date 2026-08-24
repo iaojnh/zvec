@@ -121,6 +121,106 @@ TEST(IndexInterface, DiskAnnQueryParamJsonRoundTrip) {
           R"({"index_type":"kDiskAnn","topk":1,"fetch_vector":false,"radius":0,"is_linear":false,"list_size":0})"));
 }
 
+#if DISKANN_SUPPORTED
+TEST(IndexInterface, DiskAnnFetchRejectsMissingUntrainedDocuments) {
+  const std::string path{"diskann_fetch_untrained.index"};
+  zvec::test_util::RemoveTestFiles(path);
+
+  auto param = DiskAnnIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(4)
+                   .with_max_degree(16)
+                   .with_list_size(32)
+                   .with_pq_chunk_num(2)
+                   .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+
+  std::array<float, 4> vector{1.0F, 2.0F, 3.0F, 4.0F};
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{vector.data()}}, 2));
+
+  VectorDataBuffer fetched;
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(0, &fetched));
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(99, &fetched));
+  EXPECT_EQ(0, index->fetch(2, &fetched));
+  const auto &dense = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+  ASSERT_EQ(sizeof(vector), dense.data.size());
+  EXPECT_EQ(0, std::memcmp(vector.data(), dense.data.data(), sizeof(vector)));
+
+  EXPECT_EQ(0, index->close());
+  zvec::test_util::RemoveTestFiles(path);
+}
+
+TEST(IndexInterface, DiskAnnSupportsRepeatedMerge) {
+  constexpr uint32_t kDimension = 8;
+  constexpr uint32_t kDocCount = 64;
+  const std::string first_path{"diskann_repeat_merge_source_1.index"};
+  const std::string second_path{"diskann_repeat_merge_source_2.index"};
+  const std::string target_path{"diskann_repeat_merge_target.index"};
+  for (const auto &path : {first_path, second_path, target_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+
+  auto flat_param = FlatIndexParamBuilder()
+                        .with_metric_type(MetricType::kL2sq)
+                        .with_data_type(DataType::DT_FP32)
+                        .with_dimension(kDimension)
+                        .build();
+  auto first = IndexFactory::CreateAndInitIndex(*flat_param);
+  auto second = IndexFactory::CreateAndInitIndex(*flat_param);
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  ASSERT_EQ(
+      0, first->open(first_path, {StorageOptions::StorageType::kMMAP, true}));
+  ASSERT_EQ(
+      0, second->open(second_path, {StorageOptions::StorageType::kMMAP, true}));
+
+  std::vector<std::array<float, kDimension>> first_vectors(kDocCount);
+  std::vector<std::array<float, kDimension>> second_vectors(kDocCount);
+  for (uint32_t id = 0; id < kDocCount; ++id) {
+    for (uint32_t dim = 0; dim < kDimension; ++dim) {
+      first_vectors[id][dim] = static_cast<float>(id + dim);
+      second_vectors[id][dim] = static_cast<float>(1000 + id + dim);
+    }
+    ASSERT_EQ(
+        0, first->add(VectorData{DenseVector{first_vectors[id].data()}}, id));
+    ASSERT_EQ(
+        0, second->add(VectorData{DenseVector{second_vectors[id].data()}}, id));
+  }
+
+  auto diskann_param = DiskAnnIndexParamBuilder()
+                           .with_metric_type(MetricType::kL2sq)
+                           .with_data_type(DataType::DT_FP32)
+                           .with_dimension(kDimension)
+                           .with_max_degree(16)
+                           .with_list_size(32)
+                           .with_pq_chunk_num(2)
+                           .build();
+  auto target = IndexFactory::CreateAndInitIndex(*diskann_param);
+  ASSERT_NE(nullptr, target);
+  ASSERT_EQ(
+      0, target->open(target_path, {StorageOptions::StorageType::kMMAP, true}));
+  ASSERT_EQ(0, target->merge({first}, IndexFilter()));
+  ASSERT_EQ(0, target->merge({second}, IndexFilter()));
+
+  VectorDataBuffer fetched;
+  ASSERT_EQ(0, target->fetch(7, &fetched));
+  const auto &dense = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+  ASSERT_EQ(sizeof(second_vectors[7]), dense.data.size());
+  EXPECT_EQ(0, std::memcmp(second_vectors[7].data(), dense.data.data(),
+                           sizeof(second_vectors[7])));
+
+  EXPECT_EQ(0, target->close());
+  EXPECT_EQ(0, first->close());
+  EXPECT_EQ(0, second->close());
+  for (const auto &path : {first_path, second_path, target_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+}
+#endif
+
 #if RABITQ_SUPPORTED
 TEST(IndexInterface, IvfRabitqValidatesBuildParams) {
   auto make_param = [](int nlist, int sample_count) {

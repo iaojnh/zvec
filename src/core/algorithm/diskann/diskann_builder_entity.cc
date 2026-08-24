@@ -73,6 +73,10 @@ int DiskAnnBuilderEntity::reserve_space(uint32_t docs) {
 }
 
 int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) {
+  if (vec == nullptr) {
+    LOG_ERROR("Cannot add a null vector to DiskAnn");
+    return IndexError_InvalidArgument;
+  }
   vectors_buffer_.append(reinterpret_cast<const char *>(vec),
                          meta_.element_size());
   keys_buffer_.append(reinterpret_cast<const char *>(&key), sizeof(key));
@@ -356,10 +360,9 @@ int DiskAnnBuilderEntity::dump_key_segment(
   return 0;
 }
 
-int DiskAnnBuilderEntity::dump_key_mapping_segment(
-    const IndexDumper::Pointer &dumper) const {
-  std::vector<diskann_id_t> mapping(doc_cnt());
-
+int DiskAnnBuilderEntity::build_key_mapping(
+    std::vector<diskann_id_t> *mapping) const {
+  mapping->resize(doc_cnt());
   auto get_key = [this](diskann_id_t id) {
     diskann_key_t key = kInvalidKey;
     memcpy(
@@ -369,13 +372,38 @@ int DiskAnnBuilderEntity::dump_key_mapping_segment(
     return key;
   };
 
-  std::iota(mapping.begin(), mapping.end(), 0U);
+  std::iota(mapping->begin(), mapping->end(), 0U);
   std::sort(
-      mapping.begin(), mapping.end(),
+      mapping->begin(), mapping->end(),
       [&](diskann_id_t i, diskann_id_t j) { return get_key(i) < get_key(j); });
 
-  size_t size = mapping.size() * sizeof(diskann_id_t);
-  int64_t ret =
+  for (size_t i = 1; i < mapping->size(); ++i) {
+    const diskann_key_t previous_key = get_key((*mapping)[i - 1]);
+    const diskann_key_t current_key = get_key((*mapping)[i]);
+    if (current_key != kInvalidKey && current_key == previous_key) {
+      LOG_ERROR("Duplicate DiskAnn vector key: %llu",
+                static_cast<unsigned long long>(current_key));
+      return IndexError_Exist;
+    }
+  }
+  return 0;
+}
+
+int DiskAnnBuilderEntity::dump_key_mapping_segment(
+    const IndexDumper::Pointer &dumper) const {
+  std::vector<diskann_id_t> mapping;
+  const int ret = build_key_mapping(&mapping);
+  if (ret != 0) {
+    return ret;
+  }
+  return dump_key_mapping_segment(dumper, mapping);
+}
+
+int DiskAnnBuilderEntity::dump_key_mapping_segment(
+    const IndexDumper::Pointer &dumper,
+    const std::vector<diskann_id_t> &mapping) const {
+  const size_t size = mapping.size() * sizeof(diskann_id_t);
+  const int64_t ret =
       dump_segment(dumper, kDiskAnnKeyMappingSegmentId, mapping.data(), size);
 
   if (ret != 0) {
@@ -416,6 +444,12 @@ int DiskAnnBuilderEntity::dump_entrypoint_segment(
 int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
                                const IndexDumper::Pointer &dumper) {
   uint64_t doc_cnt = holder->count();
+  std::vector<diskann_id_t> key_mapping;
+  int ret = build_key_mapping(&key_mapping);
+  if (ret != 0) {
+    LOG_ERROR("Failed to build key mapping");
+    return ret;
+  }
   uint64_t max_node_size =
       (uint64_t)max_observed_degree_ * sizeof(diskann_id_t) + sizeof(uint32_t) +
       meta_.element_size();
@@ -433,7 +467,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
       (size_t)max_observed_degree_);
 
   // write a dummy segment to make data align
-  int ret = dump_dummy_segment(dumper);
+  ret = dump_dummy_segment(dumper);
   if (ret != 0) {
     LOG_ERROR("Dump dummy segment failed");
 
@@ -647,7 +681,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
   }
 
   // dump key mapping
-  ret = dump_key_mapping_segment(dumper);
+  ret = dump_key_mapping_segment(dumper, key_mapping);
   if (ret != 0) {
     LOG_ERROR("Dump key mapping segment failed");
 

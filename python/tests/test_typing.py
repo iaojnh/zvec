@@ -39,6 +39,7 @@ from zvec import (
         (IOBackendType.PREAD, "PREAD"),
         (IOBackendType.IO_URING, "IO_URING"),
         (IOBackendType.WINDOWS_OVERLAPPED, "WINDOWS_OVERLAPPED"),
+        (IOBackendType.UNAVAILABLE, "UNAVAILABLE"),
         (MetricType.COSINE, "COSINE"),
         (QuantizeType.INT8, "INT8"),
         (StatusCode.OK, "OK"),
@@ -56,6 +57,7 @@ def test_enum_names(member, name):
         (IOBackendType.PREAD, 0),
         (IOBackendType.IO_URING, 2),
         (IOBackendType.WINDOWS_OVERLAPPED, 3),
+        (IOBackendType.UNAVAILABLE, 4),
         (MetricType.COSINE, 3),
         (QuantizeType.INT8, 2),
         (StatusCode.OK, 0),
@@ -121,7 +123,8 @@ def test_index_type_has_member(member):
 
 
 @pytest.mark.parametrize(
-    "member", ["PREAD", "LIBAIO", "IO_URING", "WINDOWS_OVERLAPPED"]
+    "member",
+    ["PREAD", "LIBAIO", "IO_URING", "WINDOWS_OVERLAPPED", "UNAVAILABLE"],
 )
 def test_io_backend_type_has_member(member):
     assert member in IOBackendType.__members__

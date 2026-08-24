@@ -32,12 +32,14 @@ namespace ailego {
 // Supported DiskAnn I/O backend types.
 //
 // Numeric values are part of the C ABI (see zvec_io_backend_type_t in c_api.h):
-//   kPread = 0, kLibAio = 1, kIoUring = 2, kWindowsOverlapped = 3.
+//   kPread = 0, kLibAio = 1, kIoUring = 2, kWindowsOverlapped = 3,
+//   kUnavailable = 4.
 enum class IOBackendType {
   kPread = 0,              // Synchronous pread(); no async I/O
   kLibAio = 1,             // libaio loaded at runtime via dlopen()
   kIoUring = 2,            // io_uring via raw kernel syscalls
   kWindowsOverlapped = 3,  // Windows overlapped I/O using per-context IOCP
+  kUnavailable = 4,        // DiskAnn is disabled on this target
 };
 
 // Returns the currently active I/O backend type.

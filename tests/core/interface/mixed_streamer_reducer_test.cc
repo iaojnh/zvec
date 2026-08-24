@@ -572,6 +572,36 @@ TEST(MixedStreamerReducer, FilterOffsetsUseSourceKeySpan) {
   EXPECT_FLOAT_EQ(1.0F, added[1][0]);
 }
 
+TEST(MixedStreamerReducer, AppendsAfterGappedTargetKeySpan) {
+  const IndexMeta meta = MakeDenseMeta();
+  auto target = std::make_shared<TestStreamer>(
+      meta, std::make_shared<TestProvider>(meta, std::vector<uint64_t>{0, 2},
+                                           TestProvider::IteratorMode::kValid,
+                                           std::array<float, 2>{1.0F, 2.0F}));
+  auto source = std::make_shared<TestStreamer>(
+      meta, std::make_shared<TestProvider>(meta, std::vector<uint64_t>{0},
+                                           TestProvider::IteratorMode::kValid,
+                                           std::array<float, 2>{3.0F, 4.0F}));
+
+  MixedStreamerReducer reducer;
+  ailego::Params params;
+  params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1U);
+  ASSERT_EQ(0, reducer.init(params));
+  ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                   nullptr, target, nullptr, nullptr,
+                   IndexQueryMeta(IndexMeta::DataType::DT_FP32, 2)));
+  ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+
+  ailego::ThreadPool thread_pool(1, false);
+  reducer.set_thread_pool(&thread_pool);
+  ASSERT_EQ(0, reducer.reduce(IndexFilter()));
+
+  const auto &added = target->added_vectors();
+  ASSERT_EQ(4U, added.size());
+  EXPECT_FLOAT_EQ(3.0F, added[3][0]);
+  EXPECT_FLOAT_EQ(4.0F, added[3][1]);
+}
+
 TEST(MixedStreamerReducer, CleanupWithoutTargetIsSafe) {
   MixedStreamerReducer reducer;
   ailego::Params params;

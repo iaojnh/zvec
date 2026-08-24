@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_framework.h>
+#include "diskann_builder_entity.h"
 #include "diskann_holder.h"
 #include "diskann_params.h"
 
@@ -100,6 +101,37 @@ TEST_F(DiskAnnBuilderTest, TestGeneral) {
   ASSERT_EQ(0UL, stats.discarded_count());
   ASSERT_GT(stats.trained_costtime(), 0UL);
   ASSERT_GT(stats.built_costtime(), 0UL);
+}
+
+TEST_F(DiskAnnBuilderTest, RejectsDuplicateValidKeysAtDump) {
+  DiskAnnBuilderEntity entity;
+  ASSERT_EQ(0, entity.init(*_index_meta_ptr, 16, 32, 0.0, 1));
+
+  std::vector<float> vector(dim, 1.0F);
+  EXPECT_EQ(0, entity.add_vector(42, vector.data()));
+  EXPECT_EQ(0, entity.add_vector(42, vector.data()));
+
+  // Invalid keys represent empty/deleted slots and may legitimately repeat.
+  EXPECT_EQ(0, entity.add_vector(kInvalidKey, vector.data()));
+  EXPECT_EQ(0, entity.add_vector(kInvalidKey, vector.data()));
+  EXPECT_EQ(4U, entity.doc_cnt());
+  EXPECT_EQ(IndexError_InvalidArgument, entity.add_vector(7, nullptr));
+
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, dumper);
+  ASSERT_EQ(0, dumper->create(_dir + "/DuplicateKeys"));
+  EXPECT_EQ(IndexError_Exist, entity.dump_key_mapping_segment(dumper));
+  EXPECT_EQ(0, dumper->close());
+
+  DiskAnnBuilderEntity holes;
+  ASSERT_EQ(0, holes.init(*_index_meta_ptr, 16, 32, 0.0, 1));
+  ASSERT_EQ(0, holes.add_vector(kInvalidKey, vector.data()));
+  ASSERT_EQ(0, holes.add_vector(kInvalidKey, vector.data()));
+  auto holes_dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, holes_dumper);
+  ASSERT_EQ(0, holes_dumper->create(_dir + "/InvalidKeySlots"));
+  EXPECT_EQ(0, holes.dump_key_mapping_segment(holes_dumper));
+  EXPECT_EQ(0, holes_dumper->close());
 }
 
 // Regression test: building a small DiskAnn index must complete quickly.

@@ -50,6 +50,8 @@ inline const char *IOBackendTypeName(IOBackendType type) {
       return "pread";
     case IOBackendType::kWindowsOverlapped:
       return "windows_overlapped";
+    case IOBackendType::kUnavailable:
+      return "unavailable";
   }
   return "unknown";
 }
@@ -76,6 +78,8 @@ inline const char *IOBackendDescription(IOBackendType type) {
     case IOBackendType::kWindowsOverlapped:
       return "windows_overlapped: Windows unbuffered overlapped I/O backend "
              "using per-context I/O completion ports.";
+    case IOBackendType::kUnavailable:
+      return "unavailable: DiskAnn is disabled on this target.";
   }
   return "Unknown I/O backend.";
 }
@@ -102,7 +106,9 @@ class IOBackend {
   IOBackendType available() {
     std::call_once(probe_once_, [this]() {
       IOBackendType selected = IOBackendType::kPread;
-#if defined(_WIN32) || defined(_WIN64)
+#if !defined(DISKANN_SUPPORTED) || !DISKANN_SUPPORTED
+      selected = IOBackendType::kUnavailable;
+#elif defined(_WIN32) || defined(_WIN64)
       selected = IOBackendType::kWindowsOverlapped;
 #elif (defined(__linux) || defined(__linux__)) && !defined(__ANDROID__)
       if (io_uring_supported()) {

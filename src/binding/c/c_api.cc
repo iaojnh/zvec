@@ -779,6 +779,9 @@ static_assert(
     static_cast<uint32_t>(
         zvec::ailego::IOBackendType::kWindowsOverlapped) ==
     ZVEC_IO_BACKEND_TYPE_WINDOWS_OVERLAPPED);
+static_assert(
+    static_cast<uint32_t>(zvec::ailego::IOBackendType::kUnavailable) ==
+    ZVEC_IO_BACKEND_TYPE_UNAVAILABLE);
 
 zvec_io_backend_type_t zvec_get_io_backend_type(void) {
   auto type = zvec::ailego::current_io_backend_type();

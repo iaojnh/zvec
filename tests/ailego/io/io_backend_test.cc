@@ -37,7 +37,9 @@ TEST(IOBackend, ConcurrentProbeReturnsStableType) {
   for (IOBackendType type : results) {
     EXPECT_EQ(type, results[0]);
   }
-#if defined(_WIN32) || defined(_WIN64)
+#if !defined(DISKANN_SUPPORTED) || !DISKANN_SUPPORTED
+  EXPECT_EQ(results[0], IOBackendType::kUnavailable);
+#elif defined(_WIN32) || defined(_WIN64)
   EXPECT_EQ(results[0], IOBackendType::kWindowsOverlapped);
 #endif
   std::string description = current_io_backend_description();
@@ -55,6 +57,9 @@ TEST(IOBackend, ConcurrentProbeReturnsStableType) {
       break;
     case IOBackendType::kWindowsOverlapped:
       backend_name = "windows_overlapped";
+      break;
+    case IOBackendType::kUnavailable:
+      backend_name = "unavailable";
       break;
   }
   EXPECT_NE(description.find(backend_name), std::string::npos);
