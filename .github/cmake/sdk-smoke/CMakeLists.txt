@@ -18,6 +18,10 @@ file(GLOB _smoke_cpp_headers "${ZVEC_SDK_DIR}/include/zvec/db/*.h")
 if(NOT _smoke_cpp_headers)
   message(FATAL_ERROR "SDK package is missing C++ headers under include/zvec/db/")
 endif()
+if(ANDROID AND NOT EXISTS "${ZVEC_SDK_DIR}/lib/libc++_shared.so")
+  message(FATAL_ERROR
+    "Android C++ SDK is missing its required lib/libc++_shared.so runtime")
+endif()
 # The jieba FTS dict must ship with the SDK (mirrors the Python wheel's
 # zvec/data/jieba_dict bundle). Consumers register the directory via
 # zvec_set_default_jieba_dict_dir() or ZVEC_JIEBA_DICT_DIR.

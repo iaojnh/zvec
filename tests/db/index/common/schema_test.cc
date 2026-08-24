@@ -1068,6 +1068,48 @@ TEST(FieldSchemaTest, IvfRabitqIndexValidationParameters) {
 }
 #endif
 
+#if DISKANN_SUPPORTED
+TEST(FieldSchemaTest, DiskAnnRejectsUnsupportedDataAndQuantizationTypes) {
+  auto make_field = [](DataType data_type, QuantizeType quantize_type,
+                       QuantizerParam quantizer_param = QuantizerParam()) {
+    return FieldSchema(
+        "vector_field", data_type, 128, false,
+        std::make_shared<DiskAnnIndexParams>(MetricType::L2, 32, 50, 8,
+                                             quantize_type, quantizer_param));
+  };
+
+  EXPECT_TRUE(make_field(DataType::VECTOR_FP32, QuantizeType::UNDEFINED)
+                  .validate()
+                  .ok());
+  EXPECT_TRUE(
+      make_field(DataType::VECTOR_FP32, QuantizeType::FP16).validate().ok());
+  EXPECT_TRUE(make_field(DataType::VECTOR_FP16, QuantizeType::UNDEFINED)
+                  .validate()
+                  .ok());
+
+  for (QuantizeType quantize_type :
+       {QuantizeType::INT4, QuantizeType::INT8, QuantizeType::RABITQ}) {
+    auto status = make_field(DataType::VECTOR_FP32, quantize_type).validate();
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("only supports FP16 quantization"),
+              std::string::npos);
+  }
+
+  auto int8_status =
+      make_field(DataType::VECTOR_INT8, QuantizeType::UNDEFINED).validate();
+  EXPECT_FALSE(int8_status.ok());
+  EXPECT_NE(int8_status.message().find("only supports FP32/FP16"),
+            std::string::npos);
+
+  auto rotate_status = make_field(DataType::VECTOR_FP32, QuantizeType::FP16,
+                                  QuantizerParam(true))
+                           .validate();
+  EXPECT_FALSE(rotate_status.ok());
+  EXPECT_NE(rotate_status.message().find("does not support quantizer rotation"),
+            std::string::npos);
+}
+#endif
+
 TEST(FieldSchemaTest, HnswRabitqIndexValidation_UnsupportedDataTypes) {
   // Test unsupported data types with HNSW_RABITQ index
 

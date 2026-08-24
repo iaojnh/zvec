@@ -480,7 +480,7 @@ TEST(MixedStreamerReducer, RejectsFirstSourceVectorLayoutMismatch) {
             reducer.feed_streamer_with_reformer(source, nullptr));
 }
 
-TEST(MixedStreamerReducer, ConvertsEachSourceWithItsOwnReformer) {
+TEST(MixedStreamerReducer, ReencodesSourcesEvenWhenReformerNamesMatch) {
   IndexMeta target_meta = MakeDenseMeta();
   target_meta.set_reformer("target", 0, ailego::Params());
   IndexMeta matching_source_meta = target_meta;
@@ -501,6 +501,7 @@ TEST(MixedStreamerReducer, ConvertsEachSourceWithItsOwnReformer) {
                                      TestProvider::IteratorMode::kValid,
                                      std::array<float, 2>{3.0F, 4.0F}));
   auto target_reformer = std::make_shared<OffsetReformer>(0.0F, 10.0F);
+  auto matching_source_reformer = std::make_shared<OffsetReformer>(5.0F, 0.0F);
   auto source_reformer = std::make_shared<OffsetReformer>(2.0F, 0.0F);
 
   MixedStreamerReducer reducer;
@@ -510,7 +511,8 @@ TEST(MixedStreamerReducer, ConvertsEachSourceWithItsOwnReformer) {
   ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
                    nullptr, target, nullptr, target_reformer,
                    IndexQueryMeta(IndexMeta::DataType::DT_FP32, 2)));
-  ASSERT_EQ(0, reducer.feed_streamer_with_reformer(matching_source, nullptr));
+  ASSERT_EQ(0, reducer.feed_streamer_with_reformer(matching_source,
+                                                   matching_source_reformer));
   ASSERT_EQ(0, reducer.feed_streamer_with_reformer(different_source,
                                                    source_reformer));
 
@@ -520,8 +522,8 @@ TEST(MixedStreamerReducer, ConvertsEachSourceWithItsOwnReformer) {
 
   const auto &added = target->added_vectors();
   ASSERT_EQ(2U, added.size());
-  EXPECT_FLOAT_EQ(1.0F, added[0][0]);
-  EXPECT_FLOAT_EQ(2.0F, added[0][1]);
+  EXPECT_FLOAT_EQ(16.0F, added[0][0]);
+  EXPECT_FLOAT_EQ(17.0F, added[0][1]);
   EXPECT_FLOAT_EQ(15.0F, added[1][0]);
   EXPECT_FLOAT_EQ(16.0F, added[1][1]);
 

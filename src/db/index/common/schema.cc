@@ -237,6 +237,24 @@ Status FieldSchema::validate() const {
             "64-bit Linux (x86_64/ARM64), macOS (ARM64), 64-bit Android/iOS, "
             "and Windows (x86_64).");
 #endif
+        if (data_type_ != DataType::VECTOR_FP32 &&
+            data_type_ != DataType::VECTOR_FP16) {
+          return Status::InvalidArgument(
+              "schema validate failed: DiskAnn only supports FP32/FP16 "
+              "vector data types");
+        }
+        const auto diskann_quantize_type = vector_index_params->quantize_type();
+        if (diskann_quantize_type != QuantizeType::UNDEFINED &&
+            diskann_quantize_type != QuantizeType::FP16) {
+          return Status::InvalidArgument(
+              "schema validate failed: DiskAnn only supports FP16 "
+              "quantization");
+        }
+        if (vector_index_params->quantizer_param().enable_rotate()) {
+          return Status::InvalidArgument(
+              "schema validate failed: DiskAnn does not support quantizer "
+              "rotation");
+        }
       }
       if (vector_index_params->quantize_type() != QuantizeType::UNDEFINED) {
         auto iter = quantize_type_map.find(data_type_);

@@ -87,14 +87,14 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   uint32_t num_threads_{0};
   uint32_t max_build_degree_{0};
   uint32_t max_observed_degree_{0};
-  uint32_t neighbor_size_{0};
+  uint32_t neighbor_stride_{0};
 
   std::string mem_index_file_{""};
   std::string index_path_prefix_{""};
 
   std::string vectors_buffer_{};
   std::string keys_buffer_{};
-  std::string neighbors_buffer_{};
+  std::vector<diskann_id_t> neighbors_buffer_{};
   std::vector<diskann_id_t> entrypoints_{};
 
   IndexMeta meta_;

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "diskann_builder_entity.h"
+#include <algorithm>
 #include <iostream>
 #include <numeric>
 #include "diskann_algorithm.h"
@@ -28,7 +29,7 @@ void DiskAnnBuilderEntity::clear() {
   num_threads_ = 0;
   max_build_degree_ = 0;
   max_observed_degree_ = 0;
-  neighbor_size_ = 0;
+  neighbor_stride_ = 0;
   mem_index_file_.clear();
   index_path_prefix_.clear();
   vectors_buffer_.clear();
@@ -59,7 +60,10 @@ int DiskAnnBuilderEntity::init(const IndexMeta &meta, uint32_t max_degree,
 
   max_build_degree_ = max_degree_ * kDefaultGraphSlackFactor;
 
-  neighbor_size_ = sizeof(uint32_t) + max_build_degree_ * sizeof(diskann_id_t);
+  // Store the neighbor count and ids in typed storage. Besides avoiding
+  // repeated byte conversions, this guarantees the alignment required by
+  // callers that consume the returned diskann_id_t pointer.
+  neighbor_stride_ = max_build_degree_ + 1;
 
   return 0;
 }
@@ -67,7 +71,7 @@ int DiskAnnBuilderEntity::init(const IndexMeta &meta, uint32_t max_degree,
 int DiskAnnBuilderEntity::reserve_space(uint32_t docs) {
   vectors_buffer_.reserve(meta_.element_size() * docs);
   keys_buffer_.reserve(sizeof(diskann_key_t) * docs);
-  neighbors_buffer_.reserve(neighbor_size_ * docs);
+  neighbors_buffer_.reserve(static_cast<size_t>(neighbor_stride_) * docs);
 
   return 0;
 }
@@ -81,17 +85,8 @@ int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) {
                          meta_.element_size());
   keys_buffer_.append(reinterpret_cast<const char *>(&key), sizeof(key));
 
-  uint32_t neighbor_cnt = 0;
-  // Parentheses are intentional: brace initialization would select the
-  // initializer-list constructor and create only two elements
-  // {max_build_degree_, 0}.  The append below reads max_build_degree_
-  // elements, so that form causes an out-of-bounds read.
-  std::vector<diskann_id_t> neighbor(max_build_degree_, 0);
-
-  neighbors_buffer_.append(reinterpret_cast<const char *>(&neighbor_cnt),
-                           sizeof(uint32_t));
-  neighbors_buffer_.append(reinterpret_cast<const char *>(neighbor.data()),
-                           sizeof(diskann_id_t) * max_build_degree_);
+  neighbors_buffer_.push_back(0);
+  neighbors_buffer_.resize(neighbors_buffer_.size() + max_build_degree_, 0);
 
   (*mutable_doc_cnt())++;
 
@@ -118,32 +113,23 @@ diskann_id_t DiskAnnBuilderEntity::get_id(diskann_key_t /*key*/) const {
 
 std::pair<uint32_t, const diskann_id_t *> DiskAnnBuilderEntity::get_neighbors(
     diskann_id_t id) const {
-  size_t offset = (size_t)id * neighbor_size_;
-
-  const uint8_t *start_ptr =
-      reinterpret_cast<const uint8_t *>(neighbors_buffer_.data()) + offset;
-
-  uint32_t neighbor_cnt = 0;
-  memcpy(&neighbor_cnt, start_ptr, sizeof(neighbor_cnt));
-
-  const diskann_id_t *neighbors =
-      reinterpret_cast<const diskann_id_t *>(start_ptr + sizeof(uint32_t));
-
-  return std::make_pair(neighbor_cnt, neighbors);
+  const size_t offset = static_cast<size_t>(id) * neighbor_stride_;
+  return std::make_pair(neighbors_buffer_[offset],
+                        neighbors_buffer_.data() + offset + 1);
 }
 
 int DiskAnnBuilderEntity::set_neighbors(
     diskann_id_t id, const std::vector<diskann_id_t> &neighbor_ids) {
-  size_t offset = (size_t)id * neighbor_size_;
-
-  uint8_t *start_ptr =
-      reinterpret_cast<uint8_t *>(&neighbors_buffer_[0]) + offset;
-
-  uint32_t neighbor_cnt = neighbor_ids.size();
-
-  memcpy(start_ptr + sizeof(uint32_t), neighbor_ids.data(),
-         sizeof(diskann_id_t) * neighbor_cnt);
-  memcpy(start_ptr, &neighbor_cnt, sizeof(uint32_t));
+  if (id >= doc_cnt() || neighbor_ids.size() > max_build_degree_) {
+    LOG_ERROR("Invalid DiskAnn neighbor update: id=%u count=%zu", id,
+              neighbor_ids.size());
+    return IndexError_OutOfRange;
+  }
+  const size_t offset = static_cast<size_t>(id) * neighbor_stride_;
+  const uint32_t neighbor_cnt = static_cast<uint32_t>(neighbor_ids.size());
+  std::copy(neighbor_ids.begin(), neighbor_ids.end(),
+            neighbors_buffer_.begin() + offset + 1);
+  neighbors_buffer_[offset] = neighbor_cnt;
 
   if (max_observed_degree_ < neighbor_cnt) {
     max_observed_degree_ = neighbor_cnt;
@@ -154,20 +140,19 @@ int DiskAnnBuilderEntity::set_neighbors(
 
 int DiskAnnBuilderEntity::add_neighbor(diskann_id_t id,
                                        diskann_id_t neighbor_id) {
-  size_t offset = (size_t)id * neighbor_size_;
-
-  uint8_t *start_ptr =
-      reinterpret_cast<uint8_t *>(&neighbors_buffer_[0]) + offset;
-
-  uint32_t neighbor_cnt = 0;
-  memcpy(&neighbor_cnt, start_ptr, sizeof(neighbor_cnt));
-
-  memcpy(start_ptr + sizeof(uint32_t) + sizeof(diskann_id_t) * neighbor_cnt,
-         &neighbor_id, sizeof(diskann_id_t));
-
-  neighbor_cnt += 1;
-
-  memcpy(start_ptr, &neighbor_cnt, sizeof(uint32_t));
+  if (id >= doc_cnt()) {
+    LOG_ERROR("Invalid DiskAnn node id: %u", id);
+    return IndexError_OutOfRange;
+  }
+  const size_t offset = static_cast<size_t>(id) * neighbor_stride_;
+  uint32_t &neighbor_cnt = neighbors_buffer_[offset];
+  if (neighbor_cnt >= max_build_degree_) {
+    LOG_ERROR("DiskAnn neighbor list is full: id=%u count=%u", id,
+              neighbor_cnt);
+    return IndexError_IndexFull;
+  }
+  neighbors_buffer_[offset + 1 + neighbor_cnt] = neighbor_id;
+  ++neighbor_cnt;
 
   if (max_observed_degree_ < neighbor_cnt) {
     max_observed_degree_ = neighbor_cnt;

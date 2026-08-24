@@ -134,6 +134,24 @@ TEST_F(DiskAnnBuilderTest, RejectsDuplicateValidKeysAtDump) {
   EXPECT_EQ(0, holes_dumper->close());
 }
 
+TEST_F(DiskAnnBuilderTest, NeighborStorageIsNaturallyAligned) {
+  DiskAnnBuilderEntity entity;
+  ASSERT_EQ(0, entity.init(*_index_meta_ptr, 1, 1, 0.0, 1));
+
+  std::vector<float> vector(dim, 1.0F);
+  ASSERT_EQ(0, entity.add_vector(0, vector.data()));
+
+  auto neighbors = entity.get_neighbors(0);
+  ASSERT_NE(nullptr, neighbors.second);
+  EXPECT_EQ(0U, reinterpret_cast<uintptr_t>(neighbors.second) %
+                    alignof(diskann_id_t));
+
+  ASSERT_EQ(0, entity.add_neighbor(0, 7));
+  neighbors = entity.get_neighbors(0);
+  ASSERT_EQ(1U, neighbors.first);
+  EXPECT_EQ(7U, neighbors.second[0]);
+}
+
 // Regression test: building a small DiskAnn index must complete quickly.
 // A lost-wakeup bug in the condition-variable progress loops previously caused
 // 15–30 second stalls during train/build on small datasets because

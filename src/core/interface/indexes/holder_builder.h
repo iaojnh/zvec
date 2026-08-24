@@ -78,8 +78,17 @@ inline int BuildMultiPassHolder(
     return ret;
   }
   if (converter) {
-    core::IndexConverter::TrainAndTransform(converter, *holder);
-    *holder = converter->result();
+    ret = core::IndexConverter::TrainAndTransform(converter, *holder);
+    if (ret != 0) {
+      LOG_ERROR("Failed to train and transform holder, ret=%d", ret);
+      return ret;
+    }
+    auto converted_holder = converter->result();
+    if (!converted_holder) {
+      LOG_ERROR("Converter returned no result holder");
+      return core::IndexError_Runtime;
+    }
+    *holder = std::move(converted_holder);
   }
   return 0;
 }

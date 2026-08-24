@@ -157,22 +157,19 @@ int MixedStreamerReducer::feed_streamer_with_reformer(
     return IndexError_InvalidArgument;
   }
 
-  const bool same_reformer =
-      target_meta.reformer_name() == source_meta.reformer_name();
-  bool compatible = true;
-  if (target_builder_ != nullptr) {
-    compatible = reformer != nullptr ||
-                 matches_query_meta(source_meta, original_query_meta_);
-  } else if (same_reformer) {
-    compatible = target_meta.data_type() == source_meta.data_type() &&
-                 target_meta.dimension() == source_meta.dimension() &&
-                 target_meta.unit_size() == source_meta.unit_size() &&
-                 target_meta.element_size() == source_meta.element_size();
-  } else {
-    compatible = (reformer != nullptr ||
-                  matches_query_meta(source_meta, original_query_meta_)) &&
-                 (target_streamer_reformer_ != nullptr ||
-                  matches_query_meta(target_meta, original_query_meta_));
+  const bool source_is_encoded = !source_meta.reformer_name().empty();
+  const bool target_is_encoded = !target_meta.reformer_name().empty();
+  const bool source_is_decodable =
+      source_is_encoded ? reformer != nullptr
+                        : matches_query_meta(source_meta, original_query_meta_);
+  bool compatible = source_is_decodable;
+  // Builders consume the original representation and retrain their target
+  // converter after all source records have been decoded.
+  if (target_builder_ == nullptr) {
+    compatible = compatible &&
+                 (target_is_encoded
+                      ? target_streamer_reformer_ != nullptr
+                      : matches_query_meta(target_meta, original_query_meta_));
   }
   if (!compatible) {
     LOG_ERROR("Streamer vector representation mismatch");
@@ -381,12 +378,13 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
   const auto &reformer = source_streamers_reformers_[source_streamer_index];
   const IndexQueryMeta source_streamer_query_meta{streamer->meta().data_type(),
                                                   streamer->meta().dimension()};
-  const bool same_reformer = target_streamer_->meta().reformer_name() ==
-                             streamer->meta().reformer_name();
-  const bool need_revert =
-      reformer != nullptr && (target_builder_ != nullptr || !same_reformer);
-  const bool need_convert = target_builder_ == nullptr && !same_reformer &&
-                            target_streamer_reformer_ != nullptr;
+  // A reformer name identifies an algorithm, not its trained state. Separate
+  // indexes can use the same name with different scale/bias values or rotation
+  // matrices. Always return source records to the original representation and
+  // then encode them with the target reformer instead of copying encoded bytes.
+  const bool need_revert = !streamer->meta().reformer_name().empty();
+  const bool need_convert = target_builder_ == nullptr &&
+                            !target_streamer_->meta().reformer_name().empty();
 
   if (!provider) {
     LOG_ERROR("Source provider is null, index=%zu", source_streamer_index);
@@ -608,12 +606,9 @@ int MixedStreamerReducer::read_sparse_vec(
     uint64_t *source_span) {
   const auto &streamer = streamers_[source_streamer_index];
   const auto &reformer = source_streamers_reformers_[source_streamer_index];
-  const bool same_reformer = target_streamer_->meta().reformer_name() ==
-                             streamer->meta().reformer_name();
-  const bool need_revert =
-      reformer != nullptr && (target_builder_ != nullptr || !same_reformer);
-  const bool need_convert = target_builder_ == nullptr && !same_reformer &&
-                            target_streamer_reformer_ != nullptr;
+  const bool need_revert = !streamer->meta().reformer_name().empty();
+  const bool need_convert = target_builder_ == nullptr &&
+                            !target_streamer_->meta().reformer_name().empty();
 
   if (!provider) {
     LOG_ERROR("Source sparse provider is null, index=%zu",

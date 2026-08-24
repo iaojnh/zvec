@@ -31,6 +31,7 @@
 #include <zvec/core/framework/index_holder.h>
 #include "algorithm/hnsw/hnsw_params.h"
 #include "algorithm/vamana/vamana_streamer.h"
+#include "core/interface/indexes/holder_builder.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/interface/index.h"
 #include "zvec/core/interface/index_factory.h"
@@ -44,10 +45,75 @@
 
 using namespace zvec::core_interface;
 
+namespace {
+
+class HolderBuilderTestConverter final : public zvec::core::IndexConverter {
+ public:
+  explicit HolderBuilderTestConverter(int train_result)
+      : train_result_(train_result),
+        meta_(zvec::core::IndexMeta::DataType::DT_FP32, 2) {}
+
+  int init(const zvec::core::IndexMeta &,
+           const zvec::ailego::Params &) override {
+    return 0;
+  }
+
+  int cleanup() override {
+    return 0;
+  }
+
+  int train(zvec::core::IndexHolder::Pointer) override {
+    return train_result_;
+  }
+
+  int transform(zvec::core::IndexHolder::Pointer) override {
+    return 0;
+  }
+
+  int dump(const zvec::core::IndexDumper::Pointer &) override {
+    return 0;
+  }
+
+  const Stats &stats() const override {
+    return stats_;
+  }
+
+  const zvec::core::IndexMeta &meta() const override {
+    return meta_;
+  }
+
+ private:
+  int train_result_{0};
+  Stats stats_{};
+  zvec::core::IndexMeta meta_{};
+};
+
+}  // namespace
+
 TEST(IndexInterface, IndexTypeKeepsExistingValues) {
   EXPECT_EQ(5, static_cast<int>(IndexType::kDiskAnn));
   EXPECT_EQ(6, static_cast<int>(IndexType::kVamana));
   EXPECT_EQ(7, static_cast<int>(IndexType::kIVFRabitq));
+}
+
+TEST(IndexInterface, BuildMultiPassHolderPropagatesConverterFailures) {
+  std::vector<float> values{1.0F, 2.0F};
+  std::vector<std::pair<uint64_t, std::string>> doc_cache;
+  doc_cache.emplace_back(
+      0, std::string(reinterpret_cast<const char *>(values.data()),
+                     values.size() * sizeof(float)));
+
+  zvec::core::IndexHolder::Pointer holder;
+  auto failing_converter = std::make_shared<HolderBuilderTestConverter>(
+      zvec::core::IndexError_ReadData);
+  EXPECT_EQ(zvec::core::IndexError_ReadData,
+            BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                 failing_converter, &holder));
+
+  auto empty_result_converter = std::make_shared<HolderBuilderTestConverter>(0);
+  EXPECT_EQ(zvec::core::IndexError_Runtime,
+            BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                 empty_result_converter, &holder));
 }
 
 TEST(IndexInterface, DiskAnnParamJsonRoundTrip) {
