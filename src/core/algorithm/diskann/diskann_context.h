@@ -146,6 +146,7 @@ class DiskAnnContext : public IndexContext,
   }
 
   void set_list_size(uint32_t list_size) {
+    requested_list_size_ = list_size;
     if (entity_ && entity_->doc_cnt() > 0) {
       list_size_ = static_cast<uint32_t>(
           std::min<uint64_t>(list_size, entity_->doc_cnt()));
@@ -165,6 +166,10 @@ class DiskAnnContext : public IndexContext,
 
   inline uint32_t list_size() const {
     return list_size_;
+  }
+
+  inline uint32_t requested_list_size() const {
+    return requested_list_size_;
   }
 
   inline void reset_query(const void *query) {
@@ -256,7 +261,7 @@ class DiskAnnContext : public IndexContext,
     group_num_ = rhs.group_num_;
     group_topk_ = rhs.group_topk_;
     group_topk_heaps_.clear();
-    list_size_ = rhs.list_size_;
+    set_list_size(rhs.requested_list_size_);
     fetch_vector_ = rhs.fetch_vector_;
     debug_mode_ = rhs.debug_mode_;
   }
@@ -318,7 +323,7 @@ class DiskAnnContext : public IndexContext,
   void copy_query_state_from(const DiskAnnContext &other) {
     IndexContext::copy_query_state_from(other);
     topk_ = other.topk_;
-    list_size_ = other.list_size_;
+    set_list_size(other.requested_list_size_);
     group_topk_ = other.group_topk_;
     group_num_ = other.group_num_;
     fetch_vector_ = other.fetch_vector_;
@@ -402,6 +407,7 @@ class DiskAnnContext : public IndexContext,
   uint32_t element_size_{0};
   uint32_t element_rotated_size_{0};
   uint32_t list_size_{0};
+  uint32_t requested_list_size_{0};
 
   TopkHeap topk_heap_{};
 

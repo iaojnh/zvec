@@ -279,9 +279,90 @@ TEST(IndexInterface, DiskAnnSupportsRepeatedMerge) {
                            sizeof(second_vectors[7])));
 
   EXPECT_EQ(0, target->close());
+
+  auto read_only_target = IndexFactory::CreateAndInitIndex(*diskann_param);
+  ASSERT_NE(nullptr, read_only_target);
+  ASSERT_EQ(0, read_only_target->open(
+                   target_path, {StorageOptions::StorageType::kMMAP,
+                                 /*create_new=*/false, /*read_only=*/true}));
+  EXPECT_EQ(zvec::core::IndexError_Runtime,
+            read_only_target->merge({first}, IndexFilter()));
+  VectorDataBuffer read_only_fetched;
+  ASSERT_EQ(0, read_only_target->fetch(7, &read_only_fetched));
+  const auto &read_only_dense =
+      std::get<DenseVectorBuffer>(read_only_fetched.vector_buffer);
+  ASSERT_EQ(sizeof(second_vectors[7]), read_only_dense.data.size());
+  EXPECT_EQ(0,
+            std::memcmp(second_vectors[7].data(), read_only_dense.data.data(),
+                        sizeof(second_vectors[7])));
+  EXPECT_EQ(0, read_only_target->close());
+
   EXPECT_EQ(0, first->close());
   EXPECT_EQ(0, second->close());
   for (const auto &path : {first_path, second_path, target_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+}
+
+TEST(IndexInterface, DiskAnnContextUsesCurrentIndexListSize) {
+  constexpr uint32_t kDimension = 8;
+  constexpr uint32_t kLargeDocCount = 32;
+  const std::string small_path{"diskann_context_small.index"};
+  const std::string large_path{"diskann_context_large.index"};
+  for (const auto &path : {small_path, large_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+
+  auto diskann_param = DiskAnnIndexParamBuilder()
+                           .with_metric_type(MetricType::kL2sq)
+                           .with_data_type(DataType::DT_FP32)
+                           .with_dimension(kDimension)
+                           .with_max_degree(16)
+                           .with_list_size(32)
+                           .with_pq_chunk_num(2)
+                           .build();
+
+  auto build_index = [&](const std::string &path, uint32_t count) {
+    auto index = IndexFactory::CreateAndInitIndex(*diskann_param);
+    EXPECT_NE(nullptr, index);
+    if (index == nullptr) {
+      return index;
+    }
+    EXPECT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+    for (uint32_t id = 0; id < count; ++id) {
+      std::array<float, kDimension> vector{};
+      vector.fill(static_cast<float>(id));
+      EXPECT_EQ(0, index->add(VectorData{DenseVector{vector.data()}}, id));
+    }
+    EXPECT_EQ(0, index->train());
+    return index;
+  };
+
+  auto small = build_index(small_path, 1);
+  auto large = build_index(large_path, kLargeDocCount);
+  ASSERT_NE(nullptr, small);
+  ASSERT_NE(nullptr, large);
+
+  auto query_param = std::make_shared<DiskAnnQueryParam>();
+  query_param->topk = 1;
+  query_param->list_size = 64;
+  std::array<float, kDimension> small_query{};
+  SearchResult small_result;
+  ASSERT_EQ(0, small->search(VectorData{DenseVector{small_query.data()}},
+                             query_param, &small_result));
+  ASSERT_EQ(1U, small_result.doc_list_.size());
+
+  query_param->topk = 8;
+  std::array<float, kDimension> large_query{};
+  large_query.fill(7.0F);
+  SearchResult large_result;
+  ASSERT_EQ(0, large->search(VectorData{DenseVector{large_query.data()}},
+                             query_param, &large_result));
+  EXPECT_EQ(query_param->topk, large_result.doc_list_.size());
+
+  EXPECT_EQ(0, small->close());
+  EXPECT_EQ(0, large->close());
+  for (const auto &path : {small_path, large_path}) {
     zvec::test_util::RemoveTestFiles(path);
   }
 }

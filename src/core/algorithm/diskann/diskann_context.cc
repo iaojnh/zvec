@@ -243,6 +243,7 @@ int DiskAnnContext::update_context(ContextType type, const IndexMeta &meta,
   }
 
   entity_ = entity;
+  set_list_size(requested_list_size_);
   update_index_metric(measure);
   dc_.update(entity_.get(), measure, meta.dimension());
   magic_ = magic_num;

@@ -36,7 +36,7 @@ namespace zvec::core_interface {
 #if DISKANN_SUPPORTED
 namespace {
 
-std::string MakeMergeTemporaryPath(const std::string &file_path) {
+std::string MakeSnapshotTemporaryPath(const std::string &file_path) {
   static std::atomic<uint64_t> sequence{0};
   const auto timestamp =
       std::chrono::steady_clock::now().time_since_epoch().count();
@@ -77,6 +77,11 @@ int DiskAnnIndex::open(const std::string &file_path,
 }
 
 int DiskAnnIndex::GenerateHolder() {
+  LOG_ERROR("DiskAnn is not supported on this platform");
+  return core::IndexError_Unsupported;
+}
+
+int DiskAnnIndex::CommitBuiltSnapshot() {
   LOG_ERROR("DiskAnn is not supported on this platform");
   return core::IndexError_Unsupported;
 }
@@ -230,6 +235,106 @@ int DiskAnnIndex::GenerateHolder() {
                               converter_, &holder_);
 }
 
+int DiskAnnIndex::CommitBuiltSnapshot() {
+  if (builder_ == nullptr || file_path_.empty()) {
+    LOG_ERROR("Cannot commit an uninitialized DiskAnn snapshot");
+    return core::IndexError_NoReady;
+  }
+
+  auto dumper = core::IndexFactory::CreateDumper("FileDumper");
+  if (dumper == nullptr) {
+    LOG_ERROR("Failed to create FileDumper");
+    return core::IndexError_Runtime;
+  }
+
+  const std::string temporary_path = MakeSnapshotTemporaryPath(file_path_);
+  bool temporary_committed = false;
+  AILEGO_DEFER([&]() {
+    if (!temporary_committed &&
+        ailego::FileHelper::IsExist(temporary_path.c_str())) {
+      ailego::File::Delete(temporary_path);
+    }
+  });
+
+  int ret = dumper->create(temporary_path);
+  if (ret != 0) {
+    LOG_ERROR("Failed to create dumper, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
+  ret = builder_->dump(dumper);
+  if (ret != 0) {
+    LOG_ERROR("Failed to dump index, path: %s, err: %s", temporary_path.c_str(),
+              core::IndexError::What(ret));
+    dumper->close();
+    return core::IndexError_Runtime;
+  }
+  ret = dumper->close();
+  if (ret != 0) {
+    LOG_ERROR("Failed to close dumper, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
+
+  const core::IndexMeta &build_meta =
+      converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
+  auto replacement_storage =
+      core::IndexFactory::CreateStorage("FileReadStorage");
+  auto replacement_streamer =
+      core::IndexFactory::CreateStreamer("DiskAnnStreamer");
+  if (replacement_storage == nullptr || replacement_streamer == nullptr) {
+    LOG_ERROR("Failed to create replacement DiskAnn reader");
+    return core::IndexError_Runtime;
+  }
+
+  ailego::Params storage_params;
+  ret = replacement_storage->init(storage_params);
+  if (ret != 0) {
+    LOG_ERROR("Failed to initialize replacement storage, err: %s",
+              core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
+  ret = replacement_streamer->init(build_meta, proxima_index_params_);
+  if (ret != 0) {
+    LOG_ERROR("Failed to initialize replacement streamer, err: %s",
+              core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
+  ret = replacement_storage->open(temporary_path, false);
+  if (ret != 0) {
+    LOG_ERROR("Failed to open replacement storage, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
+  ret = replacement_streamer->open(replacement_storage);
+  if (ret != 0) {
+    LOG_ERROR("Failed to validate replacement streamer, path: %s, err: %s",
+              temporary_path.c_str(), core::IndexError::What(ret));
+    return core::IndexError_Runtime;
+  }
+
+  if (!ReplaceFileAtomically(temporary_path, file_path_)) {
+    LOG_ERROR("Failed to atomically replace DiskAnn index, path: %s, err: %s",
+              file_path_.c_str(),
+              ailego::FileHelper::GetLastErrorString().c_str());
+    return core::IndexError_Runtime;
+  }
+  temporary_committed = true;
+
+  auto previous_streamer = std::move(streamer_);
+  auto previous_storage = std::move(storage_);
+  streamer_ = std::move(replacement_streamer);
+  storage_ = std::move(replacement_storage);
+  if (previous_streamer != nullptr && previous_streamer->unload() != 0) {
+    LOG_WARN("Failed to unload previous DiskAnn snapshot after replacement");
+  }
+  if (previous_storage != nullptr && previous_storage->close() != 0) {
+    LOG_WARN("Failed to close previous DiskAnn storage after replacement");
+  }
+
+  return 0;
+}
+
 int DiskAnnIndex::add(const VectorData &vector, uint32_t doc_id) {
   if (is_trained_) {
     LOG_ERROR("this diskann index is trained");
@@ -255,6 +360,15 @@ int DiskAnnIndex::add(const VectorData &vector, uint32_t doc_id) {
 }
 
 int DiskAnnIndex::train() {
+  if (!is_open_) {
+    LOG_ERROR("Open DiskAnn index before training");
+    return core::IndexError_NoReady;
+  }
+  if (is_read_only_) {
+    LOG_ERROR("Cannot train a read-only DiskAnn index");
+    return core::IndexError_Runtime;
+  }
+
   int ret = GenerateHolder();
   if (ret != 0) {
     LOG_ERROR("Failed to generate holder, err: %s",
@@ -271,34 +385,9 @@ int DiskAnnIndex::train() {
     LOG_ERROR("Failed to build index, err: %s", core::IndexError::What(ret));
     return ret;
   }
-  auto dumper = core::IndexFactory::CreateDumper("FileDumper");
-  if (dumper == nullptr) {
-    LOG_ERROR("Failed to create FileDumper");
-    return core::IndexError_Runtime;
-  }
-
-  ret = dumper->create(file_path_);
+  ret = CommitBuiltSnapshot();
   if (ret != 0) {
-    LOG_ERROR("Failed to create dumper, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
-    return core::IndexError_Runtime;
-  }
-  ret = builder_->dump(dumper);
-  if (ret != 0) {
-    LOG_ERROR("Failed to dump index, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
-    return core::IndexError_Runtime;
-  }
-  dumper->close();
-  ret = storage_->open(file_path_, false);
-  if (ret != 0) {
-    LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
-    return core::IndexError_Runtime;
-  }
-  if (streamer_ == nullptr || streamer_->open(storage_) != 0) {
-    LOG_ERROR("Failed to open streamer, path: %s", file_path_.c_str());
-    return core::IndexError_Runtime;
+    return ret;
   }
   is_trained_ = true;
   return 0;
@@ -374,6 +463,14 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
   if (indexes.empty()) {
     return core::IndexError_Success;
   }
+  if (!is_open_) {
+    LOG_ERROR("Open DiskAnn index before merging");
+    return core::IndexError_NoReady;
+  }
+  if (is_read_only_) {
+    LOG_ERROR("Cannot merge into a read-only DiskAnn index");
+    return core::IndexError_Runtime;
+  }
 
   const bool was_trained = is_trained_;
   const core::IndexMeta &build_meta =
@@ -406,105 +503,10 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
     rollback_training_state();
     return pre_ret;
   }
-  auto dumper = core::IndexFactory::CreateDumper("FileDumper");
-  if (dumper == nullptr) {
-    LOG_ERROR("Failed to create FileDumper");
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-
-  const std::string temporary_path = MakeMergeTemporaryPath(file_path_);
-  bool temporary_committed = false;
-  AILEGO_DEFER([&]() {
-    if (!temporary_committed &&
-        ailego::FileHelper::IsExist(temporary_path.c_str())) {
-      ailego::File::Delete(temporary_path);
-    }
-  });
-
-  int ret = dumper->create(temporary_path);
+  const int ret = CommitBuiltSnapshot();
   if (ret != 0) {
-    LOG_ERROR("Failed to create dumper, path: %s, err: %s",
-              temporary_path.c_str(), core::IndexError::What(ret));
     rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-  ret = builder_->dump(dumper);
-  if (ret != 0) {
-    LOG_ERROR("Failed to dump index, path: %s, err: %s", temporary_path.c_str(),
-              core::IndexError::What(ret));
-    dumper->close();
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-
-  ret = dumper->close();
-  if (ret != 0) {
-    LOG_ERROR("Failed to close dumper, path: %s, err: %s",
-              temporary_path.c_str(), core::IndexError::What(ret));
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-
-  auto replacement_storage =
-      core::IndexFactory::CreateStorage("FileReadStorage");
-  auto replacement_streamer =
-      core::IndexFactory::CreateStreamer("DiskAnnStreamer");
-  if (replacement_storage == nullptr || replacement_streamer == nullptr) {
-    LOG_ERROR("Failed to create replacement DiskAnn reader");
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-
-  ailego::Params storage_params;
-  ret = replacement_storage->init(storage_params);
-  if (ret != 0) {
-    LOG_ERROR("Failed to initialize replacement storage, err: %s",
-              core::IndexError::What(ret));
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-
-  ret = replacement_streamer->init(build_meta, proxima_index_params_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to initialize replacement streamer, err: %s",
-              core::IndexError::What(ret));
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-  ret = replacement_storage->open(temporary_path, false);
-  if (ret != 0) {
-    LOG_ERROR("Failed to open replacement storage, path: %s, err: %s",
-              temporary_path.c_str(), core::IndexError::What(ret));
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-  ret = replacement_streamer->open(replacement_storage);
-  if (ret != 0) {
-    LOG_ERROR("Failed to validate replacement streamer, path: %s, err: %s",
-              temporary_path.c_str(), core::IndexError::What(ret));
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-
-  if (!ReplaceFileAtomically(temporary_path, file_path_)) {
-    LOG_ERROR("Failed to atomically replace DiskAnn index, path: %s, err: %s",
-              file_path_.c_str(),
-              ailego::FileHelper::GetLastErrorString().c_str());
-    rollback_training_state();
-    return core::IndexError_Runtime;
-  }
-  temporary_committed = true;
-
-  auto previous_streamer = std::move(streamer_);
-  auto previous_storage = std::move(storage_);
-  streamer_ = std::move(replacement_streamer);
-  storage_ = std::move(replacement_storage);
-  if (previous_streamer != nullptr && previous_streamer->unload() != 0) {
-    LOG_WARN("Failed to unload previous DiskAnn snapshot after replacement");
-  }
-  if (previous_storage != nullptr && previous_storage->close() != 0) {
-    LOG_WARN("Failed to close previous DiskAnn storage after replacement");
+    return ret;
   }
   is_trained_ = true;
   return 0;
