@@ -123,6 +123,9 @@ jobs:
 
           echo "Building all x86_64 targets..."
           cmake --build "$BUILD_DIR" --parallel
+          cmake --build "$BUILD_DIR" \
+            --target diskann_mobile_compat_test diskann_mobile_collection_test \
+            --parallel
 
           # Discover test targets from ctest metadata
           echo "Discovering test targets..."
@@ -141,8 +144,35 @@ jobs:
             done < <(ninja -C "$BUILD_DIR" -t targets all 2>/dev/null || true)
           fi
 
+          if [ ${#TEST_NAMES[@]} -eq 0 ]; then
+            echo "ERROR: No Android test targets were discovered"
+            exit 1
+          fi
+
+          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+            found=0
+            for name in "${TEST_NAMES[@]}"; do
+              if [ "$name" = "$required_test" ]; then
+                found=1
+                break
+              fi
+            done
+            if [ "$found" -ne 1 ]; then
+              echo "ERROR: Required Android DiskAnn test target was not discovered: $required_test"
+              exit 1
+            fi
+          done
+
           echo "Building ${#TEST_NAMES[@]} test executables..."
           ninja -C "$BUILD_DIR" -j$(nproc) "${TEST_NAMES[@]}"
+
+          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+            required_binary="$BUILD_DIR/bin/$required_test"
+            if [ ! -x "$required_binary" ]; then
+              echo "ERROR: Missing required Android DiskAnn test binary: $required_binary"
+              exit 1
+            fi
+          done
 
       # ── Step 3: start emulator ─────────────────────────────────────────
       - name: 'Step 3: Start Android emulator'
@@ -284,6 +314,25 @@ jobs:
             done < <(ninja -C "$BUILD_DIR" -t targets all 2>/dev/null || true)
           fi
 
+          if [ ${#TEST_NAMES[@]} -eq 0 ]; then
+            echo "ERROR: No Android test targets were discovered"
+            exit 1
+          fi
+
+          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+            found=0
+            for name in "${TEST_NAMES[@]}"; do
+              if [ "$name" = "$required_test" ]; then
+                found=1
+                break
+              fi
+            done
+            if [ "$found" -ne 1 ]; then
+              echo "ERROR: Required Android DiskAnn test target was not discovered: $required_test"
+              exit 1
+            fi
+          done
+
           # Collect test binaries
           TEST_BINS=()
           for name in "${TEST_NAMES[@]}"; do
@@ -291,15 +340,31 @@ jobs:
             if [ -n "$bin_path" ]; then
               TEST_BINS+=("$bin_path")
             else
-              echo "WARNING: binary not found for '$name'"
+              echo "ERROR: binary not found for discovered test target '$name'"
+              exit 1
+            fi
+          done
+
+          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+            required_binary="$BUILD_DIR/bin/$required_test"
+            if [ ! -x "$required_binary" ]; then
+              echo "ERROR: Missing required Android DiskAnn test binary: $required_binary"
+              exit 1
             fi
           done
 
           TOTAL=${#TEST_BINS[@]}
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "ERROR: No Android test binaries were collected"
+            exit 1
+          fi
+
           PASSED=0
           FAILED=0
           FAILED_NAMES=()
           IDX=0
+          DISKANN_COMPAT_PASSED=0
+          DISKANN_COLLECTION_PASSED=0
 
           echo "Running $TOTAL unit tests on emulator..."
 
@@ -315,45 +380,90 @@ jobs:
             echo "  [$IDX/$TOTAL] $test_name"
             echo "────────────────────────────────────────"
 
-            set +e
             # Create isolated working directory
             adb shell "mkdir -p $WORK_DIR" 2>/dev/null
 
             # Copy helper binaries into working directory so crash_recovery tests
             # (which fork+exec data_generator / collection_optimizer) can find them
-            adb shell "for h in $DEVICE_TEST_DIR/data_generator $DEVICE_TEST_DIR/collection_optimizer; do [ -f \$h ] && cp \$h $WORK_DIR/; done" 2>/dev/null
+            adb shell "for h in $DEVICE_TEST_DIR/data_generator $DEVICE_TEST_DIR/collection_optimizer; do [ -f \$h ] && cp \$h $WORK_DIR/; done" 2>/dev/null || true
 
             # Push test binary
             adb push "$test_bin" "$device_path" > /dev/null 2>&1
             adb shell "chmod 755 $device_path" 2>/dev/null
 
-            # Run test from its own working directory with LD_LIBRARY_PATH
-            OUTPUT=$(adb shell "cd $WORK_DIR && LD_LIBRARY_PATH=$DEVICE_LIB_DIR $device_path 2>&1; echo EXIT_CODE=\$?" 2>&1)
+            # Run test from its own working directory with a hard timeout.
+            # GTEST_COLOR=no keeps the required summary machine-readable.
+            set +e
+            OUTPUT=$(timeout --signal=TERM --kill-after=10s 600s \
+              adb shell "cd $WORK_DIR && GTEST_COLOR=no LD_LIBRARY_PATH=$DEVICE_LIB_DIR $device_path 2>&1; echo EXIT_CODE=\$?" 2>&1)
+            ADB_EXIT=$?
+            set -e
 
             # Extract exit code from the output
-            EXIT_CODE=$(echo "$OUTPUT" | grep -o 'EXIT_CODE=[0-9]*' | tail -1 | cut -d= -f2)
-            set -e
+            EXIT_CODE=$(printf '%s\n' "$OUTPUT" | grep -o 'EXIT_CODE=[0-9]*' | tail -1 | cut -d= -f2 || true)
 
             # Print test output (without the EXIT_CODE marker)
             echo "$OUTPUT" | grep -v 'EXIT_CODE=' | sed 's/^/  /' || true
 
-            if [ "$EXIT_CODE" = "0" ]; then
+            EXPECTED_COUNT=""
+            case "$test_name" in
+              diskann_mobile_compat_test)
+                EXPECTED_COUNT=7
+                ;;
+              diskann_mobile_collection_test)
+                EXPECTED_COUNT=4
+                ;;
+            esac
+
+            TEST_PASSED=1
+            if [ "$ADB_EXIT" -eq 124 ] || [ "$ADB_EXIT" -eq 137 ]; then
+              echo "  >>> FAILED (timed out after 600 seconds)"
+              adb shell "pkill -f $device_path" 2>/dev/null || true
+              TEST_PASSED=0
+            elif [ "$ADB_EXIT" -ne 0 ]; then
+              echo "  >>> FAILED (adb exit=$ADB_EXIT)"
+              TEST_PASSED=0
+            elif [ -z "$EXIT_CODE" ]; then
+              echo "  >>> FAILED (missing device exit code)"
+              TEST_PASSED=0
+            elif [ "$EXIT_CODE" -ne 0 ]; then
+              echo "  >>> FAILED (exit=$EXIT_CODE)"
+              TEST_PASSED=0
+            elif grep -Eq '^\[  FAILED  \]' <<< "$OUTPUT"; then
+              echo "  >>> FAILED (GTest reported failures)"
+              TEST_PASSED=0
+            elif [ -n "$EXPECTED_COUNT" ] && \
+                 ! grep -Eq "^\\[  PASSED  \\][[:space:]]+${EXPECTED_COUNT} tests?\\.[[:space:]]*$" <<< "$OUTPUT"; then
+              echo "  >>> FAILED (required ${EXPECTED_COUNT}/${EXPECTED_COUNT} summary not found)"
+              TEST_PASSED=0
+            elif [ -n "$EXPECTED_COUNT" ] && \
+                 ! grep -Eq "^\\[==========\\][[:space:]]+${EXPECTED_COUNT} tests?[[:space:]]+from[[:space:]]+[1-9][0-9]* test (suites?|cases?)[[:space:]]+ran\\." <<< "$OUTPUT"; then
+              echo "  >>> FAILED (expected exactly ${EXPECTED_COUNT} executed tests)"
+              TEST_PASSED=0
+            elif [ -n "$EXPECTED_COUNT" ]; then
+              : # The required DiskAnn suite ran exactly N/N tests successfully.
+            elif grep -Eq '^\[==========\][[:space:]]+[1-9][0-9]* tests?[[:space:]]+from[[:space:]]+[1-9][0-9]* test (suites?|cases?)[[:space:]]+ran\.' <<< "$OUTPUT"; then
+              : # A non-empty GTest suite completed without failures; skips are valid.
+            elif [ "$test_name" = "c_api_test" ] && \
+                 grep -Eq '^Passed: [1-9][0-9]*[[:space:]]*$' <<< "$OUTPUT" && \
+                 grep -Eq '^Failed: 0[[:space:]]*$' <<< "$OUTPUT"; then
+              : # c_api_test uses a custom test framework.
+            else
+              echo "  >>> FAILED (no recognisable non-empty passing test summary)"
+              TEST_PASSED=0
+            fi
+
+            if [ "$TEST_PASSED" -eq 1 ]; then
               echo "  >>> PASSED"
               PASSED=$((PASSED + 1))
-            else
-              # Detect "crash-on-exit" pattern: all gtest assertions passed but
-              # process crashed during static destructor teardown (common with c++_static STL)
-              GTEST_PASSED_LINE=$(echo "$OUTPUT" | grep '\[  PASSED  \]' | tail -1 || true)
-              GTEST_FAILED_LINE=$(echo "$OUTPUT" | grep '\[  FAILED  \]' | head -1 || true)
-              if [ -n "$GTEST_PASSED_LINE" ] && [ -z "$GTEST_FAILED_LINE" ] && \
-                 { [ "$EXIT_CODE" = "139" ] || [ "$EXIT_CODE" = "134" ] || [ "$EXIT_CODE" = "135" ]; }; then
-                echo "  >>> PASSED (crash-on-exit ignored, exit=$EXIT_CODE)"
-                PASSED=$((PASSED + 1))
-              else
-                echo "  >>> FAILED (exit=$EXIT_CODE)"
-                FAILED=$((FAILED + 1))
-                FAILED_NAMES+=("$test_name")
+              if [ "$test_name" = "diskann_mobile_compat_test" ]; then
+                DISKANN_COMPAT_PASSED=1
+              elif [ "$test_name" = "diskann_mobile_collection_test" ]; then
+                DISKANN_COLLECTION_PASSED=1
               fi
+            else
+              FAILED=$((FAILED + 1))
+              FAILED_NAMES+=("$test_name")
             fi
 
             # Clean up binary and working directory to reclaim disk space
@@ -376,6 +486,14 @@ jobs:
           fi
           echo "============================================================"
 
+          if [ "$DISKANN_COMPAT_PASSED" -ne 1 ] || [ "$DISKANN_COLLECTION_PASSED" -ne 1 ]; then
+            echo "Required DiskAnn tests did not both complete successfully"
+            exit 1
+          fi
+          if [ "$PASSED" -ne "$TOTAL" ]; then
+            echo "Only ${PASSED}/${TOTAL} Android tests completed successfully"
+            exit 1
+          fi
           if [ $FAILED -gt 0 ]; then
             exit 1
           fi
