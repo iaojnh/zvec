@@ -218,7 +218,8 @@ Status FieldSchema::validate() const {
       }
 
       if (index_params_->type() == IndexType::DISKANN) {
-        // DiskAnn supports Linux (x86/ARM64), macOS ARM64, Android and iOS.
+        // DiskAnn supports Linux (x86/ARM64), macOS ARM64, Android, iOS, and
+        // Windows x86_64.
         // The CMake variable
         // DISKANN_SUPPORTED (defined in the top-level CMakeLists.txt) is the
         // single source of truth for platform eligibility — it is also used by
@@ -228,15 +229,15 @@ Status FieldSchema::validate() const {
         //
         // On Linux, DiskAnn prefers io_uring, then libaio, and falls back to
         // synchronous pread() if neither async backend is available. On macOS,
-        // Android and iOS, DiskAnn uses synchronous pread().
+        // Android and iOS, DiskAnn uses synchronous pread(); Windows uses
+        // overlapped I/O.
 #if !DISKANN_SUPPORTED
         return Status::NotSupported(
             "DiskAnn is not supported on this platform. It is available on "
-            "Linux (x86/ARM64), macOS (ARM64), Android and iOS.");
+            "Linux (x86/ARM64), macOS (ARM64), Android, iOS, and Windows "
+            "(x86_64).");
 #endif
       }
-
-
       if (vector_index_params->quantize_type() != QuantizeType::UNDEFINED) {
         auto iter = quantize_type_map.find(data_type_);
         if (iter == quantize_type_map.end()) {

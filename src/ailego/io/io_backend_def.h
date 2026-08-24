@@ -48,6 +48,8 @@ inline const char *IOBackendTypeName(IOBackendType type) {
       return "libaio";
     case IOBackendType::kPread:
       return "pread";
+    case IOBackendType::kWindowsOverlapped:
+      return "windows_overlapped";
   }
   return "unknown";
 }
@@ -71,6 +73,9 @@ inline const char *IOBackendDescription(IOBackendType type) {
 #else
       return "Synchronous pread() I/O backend.";
 #endif
+    case IOBackendType::kWindowsOverlapped:
+      return "windows_overlapped: Windows unbuffered overlapped I/O backend "
+             "using per-context I/O completion ports.";
   }
   return "Unknown I/O backend.";
 }
@@ -88,7 +93,8 @@ class IOBackend {
   }
 
   // Returns the active backend, probing on the first call. Linux prefers
-  // io_uring, then libaio, then pread; macOS ARM64, Android and iOS use pread.
+  // io_uring, then libaio, then pread; Windows uses overlapped I/O; macOS
+  // ARM64, Android and iOS use pread.
   //
   // Android is deliberately excluded from async probing: its seccomp sandbox
   // may not permit the io_uring_setup() syscall, and a blocked syscall raises
@@ -96,7 +102,9 @@ class IOBackend {
   IOBackendType available() {
     std::call_once(probe_once_, [this]() {
       IOBackendType selected = IOBackendType::kPread;
-#if (defined(__linux) || defined(__linux__)) && !defined(__ANDROID__)
+#if defined(_WIN32) || defined(_WIN64)
+      selected = IOBackendType::kWindowsOverlapped;
+#elif (defined(__linux) || defined(__linux__)) && !defined(__ANDROID__)
       if (io_uring_supported()) {
         selected = IOBackendType::kIoUring;
       } else if (LibAioLoader::Instance().load() &&
