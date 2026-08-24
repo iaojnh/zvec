@@ -14,7 +14,9 @@
 
 #include "diskann_builder_entity.h"
 #include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include "diskann_algorithm.h"
 #include "diskann_util.h"
@@ -22,13 +24,26 @@
 namespace zvec {
 namespace core {
 
+namespace {
+
+void update_atomic_max(std::atomic<uint32_t> *value, uint32_t candidate) {
+  uint32_t current = value->load(std::memory_order_relaxed);
+  while (current < candidate &&
+         !value->compare_exchange_weak(current, candidate,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
+}
+
+}  // namespace
+
 void DiskAnnBuilderEntity::clear() {
   max_degree_ = 0;
   list_size_ = 0;
   memory_limit_ = 0;
   num_threads_ = 0;
   max_build_degree_ = 0;
-  max_observed_degree_ = 0;
+  max_observed_degree_.store(0, std::memory_order_relaxed);
   neighbor_stride_ = 0;
   mem_index_file_.clear();
   index_path_prefix_.clear();
@@ -49,6 +64,17 @@ int DiskAnnBuilderEntity::init(const IndexMeta &meta, uint32_t max_degree,
                                uint32_t list_size, double memory_limit,
                                uint32_t build_threads) {
   clear();
+  const double max_build_degree =
+      std::ceil(static_cast<double>(max_degree) *
+                static_cast<double>(kDefaultGraphSlackFactor));
+  if (max_degree == 0 || list_size == 0 ||
+      max_build_degree >
+          static_cast<double>((std::numeric_limits<uint32_t>::max)() - 1U)) {
+    LOG_ERROR("Invalid DiskAnn graph parameters: max_degree=%u list_size=%u",
+              max_degree, list_size);
+    return IndexError_InvalidArgument;
+  }
+
   meta_ = meta;
 
   max_degree_ = max_degree;
@@ -58,7 +84,7 @@ int DiskAnnBuilderEntity::init(const IndexMeta &meta, uint32_t max_degree,
 
   num_threads_ = build_threads;
 
-  max_build_degree_ = max_degree_ * kDefaultGraphSlackFactor;
+  max_build_degree_ = static_cast<uint32_t>(max_build_degree);
 
   // Store the neighbor count and ids in typed storage. Besides avoiding
   // repeated byte conversions, this guarantees the alignment required by
@@ -131,9 +157,7 @@ int DiskAnnBuilderEntity::set_neighbors(
             neighbors_buffer_.begin() + offset + 1);
   neighbors_buffer_[offset] = neighbor_cnt;
 
-  if (max_observed_degree_ < neighbor_cnt) {
-    max_observed_degree_ = neighbor_cnt;
-  }
+  update_atomic_max(&max_observed_degree_, neighbor_cnt);
 
   return 0;
 }
@@ -154,9 +178,7 @@ int DiskAnnBuilderEntity::add_neighbor(diskann_id_t id,
   neighbors_buffer_[offset + 1 + neighbor_cnt] = neighbor_id;
   ++neighbor_cnt;
 
-  if (max_observed_degree_ < neighbor_cnt) {
-    max_observed_degree_ = neighbor_cnt;
-  }
+  update_atomic_max(&max_observed_degree_, neighbor_cnt);
 
   return 0;
 }
@@ -429,6 +451,8 @@ int DiskAnnBuilderEntity::dump_entrypoint_segment(
 int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
                                const IndexDumper::Pointer &dumper) {
   uint64_t doc_cnt = holder->count();
+  const uint32_t max_observed_degree =
+      max_observed_degree_.load(std::memory_order_acquire);
   std::vector<diskann_id_t> key_mapping;
   int ret = build_key_mapping(&key_mapping);
   if (ret != 0) {
@@ -436,7 +460,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
     return ret;
   }
   uint64_t max_node_size =
-      (uint64_t)max_observed_degree_ * sizeof(diskann_id_t) + sizeof(uint32_t) +
+      (uint64_t)max_observed_degree * sizeof(diskann_id_t) + sizeof(uint32_t) +
       meta_.element_size();
   uint64_t node_per_sector =
       DiskAnnUtil::kSectorSize /
@@ -449,7 +473,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
       "Dump Data, medoid: %zu, max node size: %zu, node per sector: %zu, "
       "max observed degree: %zu",
       (size_t)medoid(), (size_t)max_node_size, (size_t)node_per_sector,
-      (size_t)max_observed_degree_);
+      (size_t)max_observed_degree);
 
   // write a dummy segment to make data align
   ret = dump_dummy_segment(dumper);
@@ -498,7 +522,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
         neighbor_num = neighbors.first;
 
         ailego_assert(neighbor_num > 0);
-        ailego_assert(neighbor_num <= max_observed_degree_);
+        ailego_assert(neighbor_num <= max_observed_degree);
 
         if (iter->is_valid()) {
           const void *vec = iter->data();
@@ -564,7 +588,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
       neighbor_num = neighbors.first;
 
       ailego_assert(neighbor_num > 0);
-      ailego_assert(neighbor_num <= max_observed_degree_);
+      ailego_assert(neighbor_num <= max_observed_degree);
 
       if (iter->is_valid()) {
         const void *vec = iter->data();
@@ -626,7 +650,7 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
   meta_header_.ndims = meta_.dimension();
   meta_header_.medoid = medoid();
   meta_header_.max_node_size = max_node_size;
-  meta_header_.max_degree = max_observed_degree_;
+  meta_header_.max_degree = max_observed_degree;
   meta_header_.node_per_sector = node_per_sector;
   meta_header_.vamana_frozen_num = 0;
   meta_header_.vamana_frozen_loc = medoid();

@@ -46,6 +46,17 @@ int DiskAnnBuilder::init(const IndexMeta &meta, const ailego::Params &params) {
   params.get(PARAM_DISKANN_BUILDER_LIST_SIZE, &list_size_);
   params.get(PARAM_DISKANN_BUILDER_THREAD_COUNT, &build_thread_count_);
 
+  const double max_build_degree =
+      std::ceil(static_cast<double>(max_degree_) *
+                static_cast<double>(DiskAnnEntity::kDefaultGraphSlackFactor));
+  if (max_degree_ == 0 || list_size_ == 0 ||
+      max_build_degree >
+          static_cast<double>((std::numeric_limits<uint32_t>::max)() - 1U)) {
+    LOG_ERROR("Invalid DiskAnn graph parameters: max_degree=%u list_size=%u",
+              max_degree_, list_size_);
+    return IndexError_InvalidArgument;
+  }
+
   if (build_thread_count_ == 0) {
     build_thread_count_ = std::max(1U, std::thread::hardware_concurrency());
   }
@@ -89,6 +100,12 @@ int DiskAnnBuilder::init(const IndexMeta &meta, const ailego::Params &params) {
 
   if (params.has(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO)) {
     params.get(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO, &train_sample_ratio_);
+  }
+  if (max_train_sample_count_ == 0 || !std::isfinite(train_sample_ratio_) ||
+      train_sample_ratio_ <= 0.0 || train_sample_ratio_ > 1.0) {
+    LOG_ERROR("Invalid DiskAnn PQ sampling parameters: max_samples=%u ratio=%f",
+              max_train_sample_count_, train_sample_ratio_);
+    return IndexError_InvalidArgument;
   }
 
   raw_meta_ = meta;
@@ -141,8 +158,8 @@ int DiskAnnBuilder::init(const IndexMeta &meta, const ailego::Params &params) {
   algo_ =
       DiskAnnAlgorithm::UPointer(new DiskAnnAlgorithm(entity_, max_degree_));
 
-  trainer_ =
-      DiskAnnPqTrainer::UPointer(new DiskAnnPqTrainer(max_train_sample_count_));
+  trainer_ = DiskAnnPqTrainer::UPointer(
+      new DiskAnnPqTrainer(max_train_sample_count_, train_sample_ratio_));
 
   state_ = BUILD_STATE_INITED;
 
@@ -304,6 +321,16 @@ int DiskAnnBuilder::calculate_pq_chunk_num() {
   return 0;
 }
 
+bool DiskAnnBuilder::record_worker_error(int error_code) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (error_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  errcode_ = error_code != 0 ? error_code : IndexError_Runtime;
+  error_.store(true, std::memory_order_release);
+  return true;
+}
+
 int DiskAnnBuilder::build_internal(IndexThreads::Pointer threads) {
   auto task_group = threads->make_group();
   if (!task_group) {
@@ -319,24 +346,23 @@ int DiskAnnBuilder::build_internal(IndexThreads::Pointer threads) {
 
   {
     std::unique_lock<std::mutex> lk(mutex_);
-    while (finished.load() < entity_.doc_cnt()) {
+    while (finished.load() < entity_.doc_cnt() &&
+           !error_.load(std::memory_order_acquire)) {
       cond_.wait_until(lk, std::chrono::system_clock::now() +
                                std::chrono::seconds(check_interval_secs_));
-      if (error_.load(std::memory_order_acquire)) {
-        LOG_ERROR("Failed to build index while waiting finish");
-        return errcode_;
-      }
       LOG_INFO("Built cnt %zu, finished percent %.3f%%",
                (size_t)finished.load(),
                finished.load() * 100.0f / entity_.doc_cnt());
     }
   }
 
+  // Every task captures the address of the local progress counter. Never
+  // return while a task can still access it, including failure paths.
+  task_group->wait_finish();
   if (error_.load(std::memory_order_acquire)) {
     LOG_ERROR("Failed to build index while waiting finish");
     return errcode_;
   }
-  task_group->wait_finish();
 
   return 0;
 }
@@ -356,24 +382,21 @@ int DiskAnnBuilder::prune_internal(IndexThreads::Pointer threads) {
 
   {
     std::unique_lock<std::mutex> lk(mutex_);
-    while (finished.load() < entity_.doc_cnt()) {
+    while (finished.load() < entity_.doc_cnt() &&
+           !error_.load(std::memory_order_acquire)) {
       cond_.wait_until(lk, std::chrono::system_clock::now() +
                                std::chrono::seconds(check_interval_secs_));
-      if (error_.load(std::memory_order_acquire)) {
-        LOG_ERROR("Failed to prune index while waiting finish");
-        return errcode_;
-      }
       LOG_INFO("Prune cnt %zu, finished percent %.3f%%",
                (size_t)finished.load(),
                finished.load() * 100.0f / entity_.doc_cnt());
     }
   }
 
+  task_group->wait_finish();
   if (error_.load(std::memory_order_acquire)) {
     LOG_ERROR("Failed to prune index while waiting finish");
     return errcode_;
   }
-  task_group->wait_finish();
 
   return 0;
 }
@@ -433,9 +456,8 @@ void DiskAnnBuilder::do_build(uint64_t idx, size_t step_size,
       std::shared_ptr<DiskAnnEntity>(&entity_, [](DiskAnnEntity *) {}));
 
   if (ailego_unlikely(ctx == nullptr)) {
-    if (!error_.exchange(true)) {
+    if (record_worker_error(IndexError_NoMemory)) {
       LOG_ERROR("Failed to create context");
-      errcode_ = IndexError_NoMemory;
     }
     return;
   }
@@ -444,21 +466,21 @@ void DiskAnnBuilder::do_build(uint64_t idx, size_t step_size,
   int ret = ctx->init(DiskAnnContext::kBuilderContext, max_degree_,
                       pq_chunk_num_, build_meta_.element_size());
   if (ailego_unlikely(ret != 0)) {
-    if (!error_.exchange(true)) {
+    if (record_worker_error(ret)) {
       LOG_ERROR("Failed to initialize build context");
-      errcode_ = ret;
     }
     return;
   }
   ctx->set_list_size(list_size_);
 
-  for (uint64_t id = idx; id < entity_.doc_cnt(); id += step_size) {
+  for (uint64_t id = idx;
+       id < entity_.doc_cnt() && !error_.load(std::memory_order_acquire);
+       id += step_size) {
     ctx->reset_query(entity_.get_vector(id));
     ret = algo_->add_node(id, ctx);
     if (ailego_unlikely(ret != 0)) {
-      if (!error_.exchange(true)) {
+      if (record_worker_error(ret)) {
         LOG_ERROR("DiskAnn graph add node failed");
-        errcode_ = ret;
       }
       return;
     }
@@ -479,9 +501,8 @@ void DiskAnnBuilder::do_prune(uint64_t idx, size_t step_size,
       std::shared_ptr<DiskAnnEntity>(&entity_, [](DiskAnnEntity *) {}));
 
   if (ailego_unlikely(ctx == nullptr)) {
-    if (!error_.exchange(true)) {
+    if (record_worker_error(IndexError_NoMemory)) {
       LOG_ERROR("Failed to create context");
-      errcode_ = IndexError_NoMemory;
     }
     return;
   }
@@ -490,21 +511,21 @@ void DiskAnnBuilder::do_prune(uint64_t idx, size_t step_size,
   int ret = ctx->init(DiskAnnContext::kBuilderContext, max_degree_,
                       pq_chunk_num_, build_meta_.element_size());
   if (ailego_unlikely(ret != 0)) {
-    if (!error_.exchange(true)) {
+    if (record_worker_error(ret)) {
       LOG_ERROR("Failed to initialize prune context");
-      errcode_ = ret;
     }
     return;
   }
   ctx->set_list_size(list_size_);
 
-  for (uint64_t id = idx; id < entity_.doc_cnt(); id += step_size) {
+  for (uint64_t id = idx;
+       id < entity_.doc_cnt() && !error_.load(std::memory_order_acquire);
+       id += step_size) {
     ctx->reset_query(entity_.get_vector(id));
     ret = algo_->prune_node(id, ctx);
     if (ailego_unlikely(ret != 0)) {
-      if (!error_.exchange(true)) {
+      if (record_worker_error(ret)) {
         LOG_ERROR("DiskAnn graph add node failed");
-        errcode_ = ret;
       }
       return;
     }
@@ -631,7 +652,8 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
 
   int ret = entity_.reserve_space(holder->count());
 
-  error_ = false;
+  errcode_ = 0;
+  error_.store(false, std::memory_order_release);
   while (iter->is_valid()) {
     ret = entity_.add_vector(iter->key(), iter->data());
     if (ailego_unlikely(ret != 0)) {

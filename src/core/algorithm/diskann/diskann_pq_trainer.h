@@ -26,7 +26,8 @@ class DiskAnnPqTrainer {
   typedef std::unique_ptr<DiskAnnPqTrainer> UPointer;
 
  public:
-  DiskAnnPqTrainer(uint32_t max_train_sample_count);
+  DiskAnnPqTrainer(uint32_t max_train_sample_count,
+                   double train_sample_ratio = PQTable::kTrainSampleRatio);
   virtual ~DiskAnnPqTrainer();
 
  public:
@@ -81,6 +82,7 @@ class DiskAnnPqTrainer {
   MultiChunkCluster chunk_cluster_;
   IndexCluster::CentroidList cluster_centroids_;
   uint32_t max_train_sample_count_{PQTable::kMaxTrainSampleCount};
+  double train_sample_ratio_{PQTable::kTrainSampleRatio};
 };
 
 }  // namespace core

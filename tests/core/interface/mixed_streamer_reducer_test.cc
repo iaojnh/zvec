@@ -253,6 +253,43 @@ class OffsetReformer final : public IndexReformer {
   float convert_offset_{0};
 };
 
+class FailingTestBuilder final : public IndexBuilder {
+ public:
+  explicit FailingTestBuilder(int train_result) : train_result_(train_result) {}
+
+  int cleanup() override {
+    return 0;
+  }
+
+  const Stats &stats() const override {
+    return stats_;
+  }
+
+  int train(IndexHolder::Pointer) override {
+    ++train_count_;
+    return train_result_;
+  }
+
+  int dump(const IndexDumper::Pointer &) override {
+    ++dump_count_;
+    return 0;
+  }
+
+  size_t train_count() const {
+    return train_count_;
+  }
+
+  size_t dump_count() const {
+    return dump_count_;
+  }
+
+ private:
+  int train_result_{0};
+  Stats stats_;
+  size_t train_count_{0};
+  size_t dump_count_{0};
+};
+
 class TestDumper final : public IndexDumper {
  public:
   int init(const ailego::Params &) override {
@@ -610,6 +647,34 @@ TEST(MixedStreamerReducer, CleanupWithoutTargetIsSafe) {
   params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1U);
   ASSERT_EQ(0, reducer.init(params));
   EXPECT_EQ(0, reducer.cleanup());
+}
+
+TEST(MixedStreamerReducer, FailedTargetBuildDoesNotEnterReducedState) {
+  const IndexMeta meta = MakeDenseMeta();
+  auto target = std::make_shared<TestStreamer>(
+      meta, std::make_shared<TestProvider>(meta, 0,
+                                           TestProvider::IteratorMode::kValid));
+  auto source = std::make_shared<TestStreamer>(
+      meta, std::make_shared<TestProvider>(meta, 1,
+                                           TestProvider::IteratorMode::kValid));
+  auto builder = std::make_shared<FailingTestBuilder>(IndexError_ReadData);
+
+  MixedStreamerReducer reducer;
+  ailego::Params params;
+  params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1U);
+  ASSERT_EQ(0, reducer.init(params));
+  ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                   builder, target, nullptr, nullptr,
+                   IndexQueryMeta(IndexMeta::DataType::DT_FP32, 2)));
+  ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+
+  ailego::ThreadPool thread_pool(1, false);
+  reducer.set_thread_pool(&thread_pool);
+  EXPECT_EQ(IndexError_ReadData, reducer.reduce(IndexFilter()));
+  EXPECT_EQ(1U, builder->train_count());
+
+  EXPECT_EQ(IndexError_NoReady, reducer.dump(std::make_shared<TestDumper>()));
+  EXPECT_EQ(0U, builder->dump_count());
 }
 
 }  // namespace

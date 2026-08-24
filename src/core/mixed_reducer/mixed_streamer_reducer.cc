@@ -325,8 +325,6 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     return IndexError_Runtime;
   }
 
-  stats_.set_reduced_costtime(timer.seconds());
-  state_ = STATE_REDUCE;
   if (target_builder_ != nullptr) {
     int ret = IndexBuild();
     if (ret != 0) {
@@ -335,6 +333,8 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     }
   }
 
+  stats_.set_reduced_costtime(timer.seconds());
+  state_ = STATE_REDUCE;
   LOG_INFO("End brute force reduce. cost time: [%zu]s",
            (size_t)timer.seconds());
   return 0;

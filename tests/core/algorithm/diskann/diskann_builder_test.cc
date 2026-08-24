@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <gtest/gtest.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_framework.h>
@@ -150,6 +151,101 @@ TEST_F(DiskAnnBuilderTest, NeighborStorageIsNaturallyAligned) {
   neighbors = entity.get_neighbors(0);
   ASSERT_EQ(1U, neighbors.first);
   EXPECT_EQ(7U, neighbors.second[0]);
+
+  DiskAnnBuilderEntity slack_entity;
+  ASSERT_EQ(0, slack_entity.init(*_index_meta_ptr, 100, 100, 0.0, 1));
+  ASSERT_EQ(0, slack_entity.add_vector(0, vector.data()));
+  for (diskann_id_t neighbor_id = 0; neighbor_id < 130; ++neighbor_id) {
+    ASSERT_EQ(0, slack_entity.add_neighbor(0, neighbor_id));
+  }
+  EXPECT_EQ(IndexError_IndexFull, slack_entity.add_neighbor(0, 130));
+}
+
+TEST_F(DiskAnnBuilderTest, RejectsInvalidGraphAndSamplingParameters) {
+  auto expect_invalid = [](const Params &params) {
+    auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+    ASSERT_NE(nullptr, builder);
+    EXPECT_EQ(IndexError_InvalidArgument,
+              builder->init(*_index_meta_ptr, params));
+  };
+
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 0U);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 0U);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_MAX_TRAIN_SAMPLE_COUNT, 0U);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO, 0.0);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO, 1.01);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO,
+             std::numeric_limits<double>::quiet_NaN());
+  expect_invalid(params);
+
+  DiskAnnBuilderEntity entity;
+  EXPECT_EQ(IndexError_InvalidArgument,
+            entity.init(*_index_meta_ptr, 0, 1, 0.0, 1));
+  EXPECT_EQ(IndexError_InvalidArgument,
+            entity.init(*_index_meta_ptr, 1, 0, 0.0, 1));
+}
+
+TEST_F(DiskAnnBuilderTest, PqSamplingUsesRatioAndWholeDataset) {
+  constexpr size_t kSamplingDim = 1;
+  constexpr size_t kDocCount = 100;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, kSamplingDim);
+  meta.set_metric("SquaredEuclidean", 0, Params());
+  auto holder = make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(
+      kSamplingDim);
+  for (size_t i = 0; i < kDocCount; ++i) {
+    NumericalVector<float> vector(kSamplingDim, static_cast<float>(i));
+    ASSERT_TRUE(holder->emplace(i, vector));
+  }
+
+  DiskAnnPqTrainer trainer(10, 0.5);
+  std::string sample_data;
+  size_t sample_size = 0;
+  ASSERT_EQ(0,
+            trainer.gen_random_sample(holder, meta, sample_data, sample_size));
+  EXPECT_EQ(10U, sample_size);
+  ASSERT_EQ(sample_size * sizeof(float), sample_data.size());
+
+  std::string prefix(sample_data.size(), '\0');
+  for (size_t i = 0; i < sample_size; ++i) {
+    const float value = static_cast<float>(i);
+    std::memcpy(prefix.data() + i * sizeof(float), &value, sizeof(value));
+  }
+  EXPECT_NE(prefix, sample_data)
+      << "PQ sampling must not always select the first vectors";
+
+  DiskAnnPqTrainer repeated_trainer(10, 0.5);
+  std::string repeated_data;
+  size_t repeated_size = 0;
+  ASSERT_EQ(0, repeated_trainer.gen_random_sample(holder, meta, repeated_data,
+                                                  repeated_size));
+  EXPECT_EQ(sample_size, repeated_size);
+  EXPECT_EQ(sample_data, repeated_data);
+
+  DiskAnnPqTrainer ratio_limited_trainer(100, 0.05);
+  ASSERT_EQ(0, ratio_limited_trainer.gen_random_sample(
+                   holder, meta, sample_data, sample_size));
+  EXPECT_EQ(5U, sample_size);
+
+  DiskAnnPqTrainer invalid_trainer(0, 1.0);
+  EXPECT_EQ(IndexError_InvalidArgument,
+            invalid_trainer.gen_random_sample(holder, meta, sample_data,
+                                              sample_size));
 }
 
 // Regression test: building a small DiskAnn index must complete quickly.

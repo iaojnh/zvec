@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_holder.h>
 #include "diskann_entity.h"
@@ -86,7 +87,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   double memory_limit_{0};
   uint32_t num_threads_{0};
   uint32_t max_build_degree_{0};
-  uint32_t max_observed_degree_{0};
+  std::atomic<uint32_t> max_observed_degree_{0};
   uint32_t neighbor_stride_{0};
 
   std::string mem_index_file_{""};
