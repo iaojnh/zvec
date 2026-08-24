@@ -77,8 +77,8 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   IndexMeta meta_;
 
   PQTable::Pointer pq_table_;
-  std::shared_ptr<const std::string> key_buffer_;
-  std::shared_ptr<const std::string> key_mapping_buffer_;
+  std::shared_ptr<const std::vector<diskann_key_t>> key_buffer_;
+  std::shared_ptr<const std::vector<diskann_id_t>> key_mapping_buffer_;
   std::vector<diskann_id_t> entrypoints_;
 };
 

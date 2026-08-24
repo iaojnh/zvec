@@ -24,6 +24,7 @@
 
 #include <string>
 #include <zvec/ailego/internal/platform.h>
+#include <zvec/export.h>
 
 namespace zvec {
 namespace ailego {
@@ -43,13 +44,13 @@ enum class IOBackendType {
 // Triggers backend selection on first call. Linux tries io_uring, then libaio,
 // and finally synchronous pread. macOS ARM64 uses synchronous pread. Windows
 // uses unbuffered overlapped I/O with a per-context completion port.
-IOBackendType current_io_backend_type();
+ZVEC_AILEGO_API IOBackendType current_io_backend_type();
 
 // Returns a human-readable description of the currently active I/O backend.
 // The description identifies io_uring, libaio, or pread. On Linux, the pread
 // description also explains that io_uring and libaio were unavailable and
 // provides guidance for enabling an asynchronous backend.
-std::string current_io_backend_description();
+ZVEC_AILEGO_API std::string current_io_backend_description();
 
 }  // namespace ailego
 }  // namespace zvec

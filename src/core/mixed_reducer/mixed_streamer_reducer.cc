@@ -153,10 +153,18 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
   if (target_builder_ == nullptr) {
     if (is_sparse_) {
       auto provider = target_streamer_->create_sparse_provider();
-      if (provider) next_id = provider->count();
+      if (!provider) {
+        LOG_ERROR("Failed to create target sparse provider");
+        return IndexError_Runtime;
+      }
+      next_id = provider->count();
     } else {
       auto provider = target_streamer_->create_provider();
-      if (provider) next_id = provider->count();
+      if (!provider) {
+        LOG_ERROR("Failed to create target provider");
+        return IndexError_Runtime;
+      }
+      next_id = provider->count();
     }
   }
 
@@ -168,8 +176,19 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
 
     for (size_t i = 0; i < streamers_.size(); i++) {
       // due to filter, producing can't be parallel
-      read_results[i] = read_sparse_vec(i, filter, id_offset, &next_id);
-      id_offset += streamers_[i]->create_sparse_provider()->count();
+      auto provider = streamers_[i]->create_sparse_provider();
+      if (!provider) {
+        LOG_ERROR("Failed to create source sparse provider, index=%zu", i);
+        read_results[i] = IndexError_Runtime;
+        break;
+      }
+      const size_t source_count = provider->count();
+      read_results[i] =
+          read_sparse_vec(i, provider, filter, id_offset, &next_id);
+      if (read_results[i] != 0) {
+        break;
+      }
+      id_offset += source_count;
     }
 
     sparse_mt_list_.done();
@@ -181,8 +200,18 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     }
 
     for (size_t i = 0; i < streamers_.size(); i++) {
-      read_results[i] = read_vec(i, filter, id_offset, &next_id);
-      id_offset += streamers_[i]->create_provider()->count();
+      auto provider = streamers_[i]->create_provider();
+      if (!provider) {
+        LOG_ERROR("Failed to create source provider, index=%zu", i);
+        read_results[i] = IndexError_Runtime;
+        break;
+      }
+      const size_t source_count = provider->count();
+      read_results[i] = read_vec(i, provider, filter, id_offset, &next_id);
+      if (read_results[i] != 0) {
+        break;
+      }
+      id_offset += source_count;
     }
 
     mt_list_.done();
@@ -244,6 +273,7 @@ int MixedStreamerReducer::dump(const IndexDumper::Pointer &dumper) {
 }
 
 int MixedStreamerReducer::read_vec(size_t source_streamer_index,
+                                   const IndexProvider::Pointer &provider,
                                    const IndexFilter &filter,
                                    const uint32_t id_offset,
                                    uint32_t *next_id) {
@@ -259,8 +289,16 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
     need_revert = true;
   }
 
-  IndexProvider::Pointer provider = streamer->create_provider();
+  if (!provider) {
+    LOG_ERROR("Source provider is null, index=%zu", source_streamer_index);
+    return IndexError_Runtime;
+  }
   IndexProvider::Iterator::Pointer iterator = provider->create_iterator();
+  if (!iterator) {
+    LOG_ERROR("Failed to create source provider iterator, index=%zu",
+              source_streamer_index);
+    return IndexError_Runtime;
+  }
 
   while (iterator->is_valid()) {
     if (stop_flag_ != nullptr && stop_flag_->load(std::memory_order_relaxed)) {
@@ -274,9 +312,15 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
     }
 
     std::vector<uint8_t> bytes;
+    const void *vector_data = iterator->data();
+    if (!vector_data) {
+      LOG_ERROR("Failed to read source vector, index=%zu key=%zu",
+                source_streamer_index, static_cast<size_t>(iterator->key()));
+      return IndexError_ReadData;
+    }
     if (need_revert) {
       std::string new_vector;
-      if (reformer->revert(iterator->data(), source_streamer_query_meta,
+      if (reformer->revert(vector_data, source_streamer_query_meta,
                            &new_vector) != 0) {
         LOG_ERROR("Failed to revert the vector");
         return IndexError_Runtime;
@@ -286,7 +330,7 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
     } else {
       // TODO: eliminate the copy
       bytes.resize(provider->element_size());
-      memcpy(bytes.data(), iterator->data(), bytes.size());
+      memcpy(bytes.data(), vector_data, bytes.size());
     }
 
     // TODO: use id instead of key
@@ -449,19 +493,27 @@ void MixedStreamerReducer::add_sparse_vec(int *result) {
 }
 
 
-int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
-                                          const IndexFilter &filter,
-                                          const uint32_t id_offset,
-                                          uint32_t *next_id) {
+int MixedStreamerReducer::read_sparse_vec(
+    size_t source_streamer_index,
+    const IndexStreamer::SparseProvider::Pointer &provider,
+    const IndexFilter &filter, const uint32_t id_offset, uint32_t *next_id) {
   const auto &streamer = streamers_[source_streamer_index];
   const auto &reformer = source_streamers_reformers_[source_streamer_index];
   const bool need_revert =
       !is_target_and_source_same_reformer_ && reformer != nullptr;
 
-  IndexStreamer::SparseProvider::Pointer provider =
-      streamer->create_sparse_provider();
+  if (!provider) {
+    LOG_ERROR("Source sparse provider is null, index=%zu",
+              source_streamer_index);
+    return IndexError_Runtime;
+  }
   IndexStreamer::SparseProvider::Iterator::Pointer iterator =
       provider->create_iterator();
+  if (!iterator) {
+    LOG_ERROR("Failed to create source sparse provider iterator, index=%zu",
+              source_streamer_index);
+    return IndexError_Runtime;
+  }
 
   while (iterator->is_valid()) {
     if (stop_flag_ != nullptr && stop_flag_->load(std::memory_order_relaxed)) {
@@ -474,14 +526,21 @@ int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
       continue;
     }
 
-    auto sparse_count = iterator->sparse_count();
+    const auto sparse_count = iterator->sparse_count();
+    const uint32_t *const source_indices = iterator->sparse_indices();
+    const void *const source_values = iterator->sparse_data();
+    if (sparse_count > 0 &&
+        (source_indices == nullptr || source_values == nullptr)) {
+      LOG_ERROR("Failed to read source sparse vector, index=%zu",
+                source_streamer_index);
+      return IndexError_ReadData;
+    }
     std::vector<uint32_t> sparse_indices(sparse_count);
     std::string sparse_values;
 
     if (need_revert) {
       std::string new_sparse_values;
-      if (reformer->revert(iterator->sparse_count(), iterator->sparse_indices(),
-                           iterator->sparse_data(),
+      if (reformer->revert(sparse_count, source_indices, source_values,
                            {
                                IndexMeta::MetaType::MT_SPARSE,
                                streamer->meta().data_type(),
@@ -493,13 +552,16 @@ int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
       sparse_values = std::move(new_sparse_values);
     } else {
       sparse_values.resize(sparse_count * streamer->meta().unit_size());
-      memcpy(sparse_values.data(), iterator->sparse_data(),
-             sparse_values.size());
+      if (!sparse_values.empty()) {
+        memcpy(sparse_values.data(), source_values, sparse_values.size());
+      }
     }
 
     // TODO: eliminate the copy
-    memcpy(sparse_indices.data(), iterator->sparse_indices(),
-           sparse_indices.size() * sizeof(uint32_t));
+    if (!sparse_indices.empty()) {
+      memcpy(sparse_indices.data(), source_indices,
+             sparse_indices.size() * sizeof(uint32_t));
+    }
 
     // TODO: use id instead of key
     if (!sparse_mt_list_.produce(SparseVectorItem((*next_id)++,

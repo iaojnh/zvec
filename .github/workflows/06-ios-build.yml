@@ -199,7 +199,7 @@ jobs:
             EXPECTED_COUNT=""
             case "$TEST_NAME" in
               diskann_mobile_compat_test)
-                EXPECTED_COUNT=7
+                EXPECTED_COUNT=10
                 ;;
               diskann_mobile_collection_test)
                 EXPECTED_COUNT=4

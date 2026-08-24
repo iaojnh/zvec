@@ -10,7 +10,10 @@ if(ANDROID OR IOS)
   list(FILTER ALL_TEST_SRCS INCLUDE REGEX "diskann_mobile_compat_test\\.cc$")
 else()
   if(WIN32)
-    list(FILTER ALL_TEST_SRCS EXCLUDE REGEX "/diskann_file_reader_test\\.cc$")
+    # Windows has a dedicated overlapped-I/O suite; the mobile compatibility
+    # suite intentionally exercises POSIX file-descriptor behavior.
+    list(FILTER ALL_TEST_SRCS EXCLUDE REGEX
+         "/diskann_file_reader_test\\.cc$|/diskann_mobile_compat_test\\.cc$")
   else()
     list(FILTER ALL_TEST_SRCS EXCLUDE REGEX
          "/diskann_file_reader_windows_test\\.cc$")

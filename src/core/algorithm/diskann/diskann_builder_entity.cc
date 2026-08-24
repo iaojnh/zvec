@@ -101,9 +101,9 @@ const void *DiskAnnBuilderEntity::get_vector(diskann_id_t id) const {
 
 diskann_key_t DiskAnnBuilderEntity::get_key(diskann_id_t id) const {
   size_t offset = (size_t)id * sizeof(diskann_key_t);
-
-  return *(
-      reinterpret_cast<const diskann_key_t *>(keys_buffer_.data() + offset));
+  diskann_key_t key = kInvalidKey;
+  memcpy(&key, keys_buffer_.data() + offset, sizeof(key));
+  return key;
 }
 
 //! Get vector local id by key
@@ -360,12 +360,19 @@ int DiskAnnBuilderEntity::dump_key_mapping_segment(
     const IndexDumper::Pointer &dumper) const {
   std::vector<diskann_id_t> mapping(doc_cnt());
 
-  const diskann_key_t *keys = reinterpret_cast<diskann_key_t *>(
-      const_cast<char *>(keys_buffer_.data()));
+  auto get_key = [this](diskann_id_t id) {
+    diskann_key_t key = kInvalidKey;
+    memcpy(
+        &key,
+        keys_buffer_.data() + static_cast<size_t>(id) * sizeof(diskann_key_t),
+        sizeof(key));
+    return key;
+  };
 
   std::iota(mapping.begin(), mapping.end(), 0U);
-  std::sort(mapping.begin(), mapping.end(),
-            [&](diskann_id_t i, diskann_id_t j) { return keys[i] < keys[j]; });
+  std::sort(
+      mapping.begin(), mapping.end(),
+      [&](diskann_id_t i, diskann_id_t j) { return get_key(i) < get_key(j); });
 
   size_t size = mapping.size() * sizeof(diskann_id_t);
   int64_t ret =

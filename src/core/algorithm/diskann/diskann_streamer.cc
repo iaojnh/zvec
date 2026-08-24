@@ -108,6 +108,12 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
     LOG_ERROR("Initialize and close DiskAnnStreamer before opening an index");
     return IndexError_NoReady;
   }
+  if (!storage->file()) {
+    LOG_ERROR(
+        "DiskAnn requires storage with a shared file handle; disable "
+        "proxima.file.read_storage.alone_file_handle");
+    return IndexError_InvalidArgument;
+  }
 
   {
     std::lock_guard<std::mutex> lock(fetch_mutex_);

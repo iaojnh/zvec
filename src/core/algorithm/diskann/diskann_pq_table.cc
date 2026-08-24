@@ -24,9 +24,11 @@ PQTable::PQTable(const IndexMeta &meta, uint32_t chunk_num)
 
   if (meta.metric_name() == "Cosine") {
     if (meta.data_type() == IndexMeta::DataType::DT_FP32) {
-      meta_.set_dimension(meta.dimension() - 1);
+      meta_.set_dimension(meta.dimension() > 1 ? meta.dimension() - 1 : 0);
+    } else if (meta.data_type() == IndexMeta::DataType::DT_FP16) {
+      meta_.set_dimension(meta.dimension() > 2 ? meta.dimension() - 2 : 0);
     } else {
-      meta_.set_dimension(meta.dimension() - 2);
+      meta_.set_dimension(0);
     }
   }
 }
@@ -37,13 +39,48 @@ int PQTable::init(std::vector<uint8_t> &full_pivot_data,
                   std::vector<uint8_t> &centroid,
                   std::vector<uint32_t> &chunk_offsets,
                   std::vector<uint8_t> &pq_data) {
+  if (meta_.data_type() != IndexMeta::DataType::DT_FP32 &&
+      meta_.data_type() != IndexMeta::DataType::DT_FP16) {
+    LOG_ERROR("Unsupported DiskAnn PQ data type: %u", meta_.data_type());
+    return IndexError_Unsupported;
+  }
+  if (meta_.dimension() == 0 || chunk_num_ == 0 ||
+      chunk_num_ > meta_.dimension()) {
+    LOG_ERROR("Invalid DiskAnn PQ table dimensions");
+    return IndexError_InvalidFormat;
+  }
+
+  const size_t expected_pivot_size =
+      static_cast<size_t>(meta_.element_size()) * kPQCentroidNum;
+  const size_t expected_centroid_size = meta_.element_size();
+  if (full_pivot_data.size() != expected_pivot_size ||
+      centroid.size() != expected_centroid_size ||
+      chunk_offsets.size() != chunk_num_ + 1 || pq_data.empty() ||
+      pq_data.size() % chunk_num_ != 0 || chunk_offsets.front() != 0 ||
+      chunk_offsets.back() != meta_.dimension()) {
+    LOG_ERROR("Invalid DiskAnn PQ table buffer sizes or boundaries");
+    return IndexError_InvalidFormat;
+  }
+  for (size_t i = 1; i < chunk_offsets.size(); ++i) {
+    if (chunk_offsets[i - 1] >= chunk_offsets[i] ||
+        chunk_offsets[i] > meta_.dimension()) {
+      LOG_ERROR("Invalid DiskAnn PQ table chunk offsets");
+      return IndexError_InvalidFormat;
+    }
+  }
+
   full_pivot_data_ = std::move(full_pivot_data);
   centroid_ = std::move(centroid);
   chunk_offsets_ = std::move(chunk_offsets);
   pq_data_ = std::move(pq_data);
 
   // alloc and compute transpose
-  transposed_tables_.resize(kPQCentroidNum * meta_.element_size());
+  try {
+    transposed_tables_.resize(expected_pivot_size);
+  } catch (const std::bad_alloc &) {
+    LOG_ERROR("Failed to allocate DiskAnn transposed PQ table");
+    return IndexError_NoMemory;
+  }
 
   uint32_t dim = meta_.dimension();
   uint32_t type = meta_.data_type();

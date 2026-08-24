@@ -116,18 +116,17 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
   }
 
   auto cached_file = storage->file();
-#if defined(_WIN32) || defined(_WIN64)
-  // Windows DiskAnn must be able to close the single buffered handle before
-  // opening its unbuffered IOCP handles.  FileReadStorage's
-  // alone_file_handle mode gives every Segment an independent handle, which
-  // cannot be closed through IndexStorage and may be retained by the caller.
+  // DiskAnn must capture the exact file object that supplied every in-memory
+  // segment before releasing IndexStorage. FileReadStorage's
+  // alone_file_handle mode gives each Segment an independent file object and
+  // exposes no shared descriptor, so an atomic path replacement could mix
+  // metadata and graph data from different index snapshots.
   if (!cached_file) {
     LOG_ERROR(
-        "DiskAnn on Windows requires FileReadStorage with "
+        "DiskAnn requires FileReadStorage with "
         "proxima.file.read_storage.alone_file_handle disabled");
     return IndexError_InvalidArgument;
   }
-#endif
 
   max_node_size_ = static_cast<uint32_t>(stored_max_node_size);
   sector_num_per_node_ =
@@ -170,18 +169,11 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
   ret = static_cast<WindowsAlignedFileReader *>(reader_.get())
             ->open_from_handle(file_path, cached_file->native_handle());
 #else
-  if (cached_file) {
-    // POSIX atomic replacement leaves an open descriptor bound to the old
-    // inode. Capture an independent descriptor before cleanup so graph reads
-    // use the same file object that supplied the in-memory metadata.
-    ret = static_cast<LinuxAlignedFileReader *>(reader_.get())
-              ->open_from_handle(file_path, cached_file->native_handle());
-  } else {
-    // Preserve support for FileReadStorage's alone_file_handle mode. Its
-    // Segment abstraction does not expose a descriptor, so retain the
-    // origin/main ordering and bind the path before releasing the storage.
-    reader_->open(file_path);
-  }
+  // POSIX atomic replacement leaves an open descriptor bound to the old
+  // inode. Capture an independent descriptor before cleanup so graph reads
+  // use the same file object that supplied the in-memory metadata.
+  ret = static_cast<LinuxAlignedFileReader *>(reader_.get())
+            ->open_from_handle(file_path, cached_file->native_handle());
 #endif
   if (ret != 0) {
     LOG_ERROR("Failed to capture DiskAnn index file, ret=%d", ret);
@@ -319,8 +311,7 @@ int DiskAnnIndexer::parse_node_neighbors(const uint8_t *node_buf,
       LOG_ERROR(
           "DiskAnn node %u has invalid neighbor %u at position %u; "
           "document count is %llu",
-          node_id, neighbor_id, i,
-          static_cast<unsigned long long>(doc_cnt_));
+          node_id, neighbor_id, i, static_cast<unsigned long long>(doc_cnt_));
       return IndexError_InvalidFormat;
     }
     neighbors[i] = neighbor_id;
@@ -408,8 +399,8 @@ std::vector<bool> DiskAnnIndexer::read_nodes(
 
     if (neighbor_buffers[i].second != nullptr) {
       uint32_t neighbor_num = 0;
-      int parse_ret = parse_node_neighbors(
-          node_buf, node_ids[i], neighbor_num, neighbor_buffers[i].second);
+      int parse_ret = parse_node_neighbors(node_buf, node_ids[i], neighbor_num,
+                                           neighbor_buffers[i].second);
       if (parse_ret != 0) {
         retval[i] = false;
         continue;
@@ -1433,9 +1424,9 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
               node_per_sector_, max_node_size_, frontier_neighbor.second,
               frontier_neighbor.first);
           uint32_t neighbor_num = 0;
-          int parse_ret = parse_node_neighbors(
-              node_disk_buf, frontier_neighbor.first, neighbor_num,
-              parsed_neighbors.data());
+          int parse_ret =
+              parse_node_neighbors(node_disk_buf, frontier_neighbor.first,
+                                   neighbor_num, parsed_neighbors.data());
           if (parse_ret != 0) {
             batch_parse_error = parse_ret;
             ctx->set_error(true);
@@ -1455,10 +1446,9 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
           cpu_timer.reset();
           std::vector<float> distances(neighbor_num);
-          pq_table_->compute_dists(
-              neighbor_num, parsed_neighbors.data(), pq_chunk_num_,
-              ctx->pq_table_dist_buffer(), ctx->pq_coord_buffer(),
-              distances.data());
+          pq_table_->compute_dists(neighbor_num, parsed_neighbors.data(),
+                                   pq_chunk_num_, ctx->pq_table_dist_buffer(),
+                                   ctx->pq_coord_buffer(), distances.data());
 
           stats.dist_num += neighbor_num;
           stats.cpu_us += cpu_timer.micro_seconds();
@@ -1555,9 +1545,6 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
         node_per_sector_ > 0 ? 1
                              : DiskAnnUtil::div_round_up(
                                    max_node_size_, DiskAnnUtil::kSectorSize);
-
-    pq_table_->preprocess_pq_dist_table(ctx->query_rotated(),
-                                        ctx->pq_table_dist_buffer());
 
     uint32_t num_ios = 0;
 
@@ -1691,9 +1678,9 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
             node_per_sector_, max_node_size_, frontier_neighbor.second,
             frontier_neighbor.first);
         uint32_t neighbor_num = 0;
-        int parse_ret = parse_node_neighbors(
-            node_disk_buf, frontier_neighbor.first, neighbor_num,
-            parsed_neighbors.data());
+        int parse_ret =
+            parse_node_neighbors(node_disk_buf, frontier_neighbor.first,
+                                 neighbor_num, parsed_neighbors.data());
         if (parse_ret != 0) {
           ctx->set_error(true);
           return parse_ret;
@@ -1726,10 +1713,9 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
         cpu_timer.reset();
 
         std::vector<float> distances(neighbor_num);
-        pq_table_->compute_dists(
-            neighbor_num, parsed_neighbors.data(), pq_chunk_num_,
-            ctx->pq_table_dist_buffer(), ctx->pq_coord_buffer(),
-            distances.data());
+        pq_table_->compute_dists(neighbor_num, parsed_neighbors.data(),
+                                 pq_chunk_num_, ctx->pq_table_dist_buffer(),
+                                 ctx->pq_coord_buffer(), distances.data());
 
         stats.dist_num += neighbor_num;
         stats.cpu_us += cpu_timer.micro_seconds();

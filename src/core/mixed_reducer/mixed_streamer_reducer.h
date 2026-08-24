@@ -57,12 +57,16 @@ class MixedStreamerReducer : public IndexStreamerReducer {
       const IndexReformer::Pointer reformer) override;
 
  private:
-  int read_vec(size_t source_streamer_index, const IndexFilter &filter,
-               const uint32_t id_offset, uint32_t *next_id);
+  int read_vec(size_t source_streamer_index,
+               const IndexProvider::Pointer &provider,
+               const IndexFilter &filter, const uint32_t id_offset,
+               uint32_t *next_id);
   void add_vec(int *result);
   void add_vec_with_builder(int *result);
-  int read_sparse_vec(size_t source_streamer_index, const IndexFilter &filter,
-                      const uint32_t id_offset, uint32_t *next_id);
+  int read_sparse_vec(size_t source_streamer_index,
+                      const IndexStreamer::SparseProvider::Pointer &provider,
+                      const IndexFilter &filter, const uint32_t id_offset,
+                      uint32_t *next_id);
   void add_sparse_vec(int *result);
 
   void PushToDocCache(const IndexQueryMeta &meta, uint32_t doc_id,

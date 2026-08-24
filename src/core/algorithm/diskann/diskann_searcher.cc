@@ -106,6 +106,12 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
     LOG_ERROR("Initialize and unload DiskAnnSearcher before loading an index");
     return IndexError_NoReady;
   }
+  if (!storage->file()) {
+    LOG_ERROR(
+        "DiskAnn requires storage with a shared file handle; disable "
+        "proxima.file.read_storage.alone_file_handle");
+    return IndexError_InvalidArgument;
+  }
 
   diskann_indexer_.reset();
   entity_.clear();

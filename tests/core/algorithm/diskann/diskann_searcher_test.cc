@@ -399,10 +399,9 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
 
   ASSERT_EQ(0, searcher->init(search_params));
 
-#if defined(_WIN32) || defined(_WIN64)
-  // Independent FileReadStorage segments can outlive the storage and keep
-  // buffered handles open.  Windows DiskAnn must reject that configuration
-  // before opening its unbuffered IOCP handles.
+  // Independent FileReadStorage segments do not expose one file object that
+  // can anchor all DiskAnn segments to the same snapshot. Reject that mode on
+  // every platform before opening the aligned graph reader.
   auto independent_storage = IndexFactory::CreateStorage("FileReadStorage");
   ASSERT_NE(independent_storage, nullptr);
   Params independent_storage_params;
@@ -416,9 +415,21 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   ASSERT_EQ(nullptr, independent_storage->file());
   EXPECT_EQ(IndexError_InvalidArgument,
             searcher->load(independent_storage, IndexMetric::Pointer()));
+  auto independent_streamer = IndexFactory::CreateStreamer("DiskAnnStreamer");
+  ASSERT_NE(independent_streamer, nullptr);
+  ASSERT_EQ(0, independent_streamer->init(*_index_meta_ptr, search_params));
+  EXPECT_EQ(IndexError_InvalidArgument,
+            independent_streamer->open(independent_storage));
+  {
+    DiskAnnSearcherEntity independent_entity;
+    ASSERT_EQ(0,
+              independent_entity.load(*_index_meta_ptr, independent_storage));
+    DiskAnnIndexer independent_indexer(*_index_meta_ptr);
+    EXPECT_EQ(IndexError_InvalidArgument,
+              independent_indexer.init(independent_entity));
+  }
   retained_independent_segment.reset();
   independent_storage.reset();
-#endif
 
   auto storage = IndexFactory::CreateStorage("FileReadStorage");
   ASSERT_EQ(0, storage->open(path, false));
@@ -513,9 +524,8 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   for (uint32_t query_index = 0; query_index < kBatchQueryCount;
        ++query_index) {
     SCOPED_TRACE(query_index);
-    ASSERT_EQ(0, searcher->search_impl(
-                     batch_queries.data() + query_index * dim, qmeta,
-                     singleKnnCtx));
+    ASSERT_EQ(0, searcher->search_impl(batch_queries.data() + query_index * dim,
+                                       qmeta, singleKnnCtx));
     expect_same_results(singleKnnCtx->result(), knnCtx->result(query_index));
   }
 
@@ -647,9 +657,8 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   for (uint32_t query_index = 0; query_index < kBatchQueryCount;
        ++query_index) {
     SCOPED_TRACE(query_index);
-    ASSERT_EQ(0, streamer->search_impl(
-                     batch_queries.data() + query_index * dim, qmeta,
-                     single_streamer_ctx));
+    ASSERT_EQ(0, streamer->search_impl(batch_queries.data() + query_index * dim,
+                                       qmeta, single_streamer_ctx));
     expect_same_results(single_streamer_ctx->result(),
                         streamer_ctx->result(query_index));
   }
@@ -1071,9 +1080,46 @@ TEST_F(DiskAnnSearcherTest, TestGroup) {
   ctx->set_group_params(group_num, group_topk);
   ctx->set_group_by(groupbyFunc);
 
-  size_t query_value = doc_cnt / 2;
+  size_t query_value = doc_cnt * 11 / 20;
   for (size_t j = 0; j < dim; ++j) {
     vec[j] = query_value / 10 + 0.1f;
+  }
+
+  // Force group stage 2 by assigning the regular top two documents to one
+  // group and every newly discovered document to another. Its PQ query must
+  // remain identical to a regular search, because stage 1 already centered it
+  // and built the distance table.
+  auto regular_ctx = searcher->create_context();
+  regular_ctx->set_topk(2);
+  ASSERT_EQ(0, searcher->search_impl(vec.data(), qmeta, regular_ctx));
+
+  std::unordered_set<uint64_t> initial_keys;
+  for (const auto &doc : regular_ctx->result()) {
+    initial_keys.insert(doc.key());
+  }
+  auto forcedGroupbyFunc = [&initial_keys](uint64_t key) {
+    return initial_keys.count(key) != 0 ? std::string("initial")
+                                        : std::string("expanded");
+  };
+  auto forced_group_ctx = searcher->create_context();
+  forced_group_ctx->set_group_params(2, 1);
+  forced_group_ctx->set_group_by(forcedGroupbyFunc);
+  ASSERT_EQ(0, searcher->search_impl(vec.data(), qmeta, forced_group_ctx));
+
+  auto *regular_diskann_ctx = dynamic_cast<DiskAnnContext *>(regular_ctx.get());
+  auto *forced_group_diskann_ctx =
+      dynamic_cast<DiskAnnContext *>(forced_group_ctx.get());
+  ASSERT_NE(nullptr, regular_diskann_ctx);
+  ASSERT_NE(nullptr, forced_group_diskann_ctx);
+  EXPECT_EQ(0, std::memcmp(regular_diskann_ctx->query_rotated(),
+                           forced_group_diskann_ctx->query_rotated(),
+                           _index_meta_ptr->element_size()));
+
+  const auto &forced_group_result = forced_group_ctx->group_result();
+  ASSERT_EQ(2U, forced_group_result.size());
+  for (const auto &group : forced_group_result) {
+    ASSERT_EQ(1U, group.docs().size());
+    EXPECT_EQ(group.group_id(), forcedGroupbyFunc(group.docs()[0].key()));
   }
 
   ASSERT_EQ(0, searcher->search_impl(vec.data(), qmeta, ctx));

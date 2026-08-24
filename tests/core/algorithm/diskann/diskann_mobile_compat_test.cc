@@ -19,6 +19,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <map>
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
@@ -27,6 +29,7 @@
 #include "diskann_builder.h"
 #include "diskann_file_reader.h"
 #include "diskann_pq_trainer.h"
+#include "diskann_searcher_entity.h"
 #include "diskann_util.h"
 
 namespace zvec::core {
@@ -66,6 +69,188 @@ class TemporaryFile {
   char path_[64] = "DiskAnnMobileCompatTest.XXXXXX";
   int fd_{-1};
 };
+
+class VectorSegment final : public IndexStorage::Segment {
+ public:
+  explicit VectorSegment(std::vector<uint8_t> data) : data_(std::move(data)) {}
+
+  size_t data_size() const override {
+    return data_.size();
+  }
+
+  uint32_t data_crc() const override {
+    return 0;
+  }
+
+  size_t padding_size() const override {
+    return 0;
+  }
+
+  size_t capacity() const override {
+    return data_.size();
+  }
+
+  size_t fetch(size_t offset, void *buffer, size_t length) const override {
+    if (offset > data_.size()) {
+      return 0;
+    }
+    const size_t read_size = std::min(length, data_.size() - offset);
+    if (read_size != 0) {
+      std::memcpy(buffer, data_.data() + offset, read_size);
+    }
+    return read_size;
+  }
+
+  size_t read(size_t offset, const void **data, size_t length) override {
+    if (offset > data_.size()) {
+      *data = nullptr;
+      return 0;
+    }
+    const size_t read_size = std::min(length, data_.size() - offset);
+    *data = read_size == 0 ? nullptr : data_.data() + offset;
+    return read_size;
+  }
+
+  size_t read(size_t offset, IndexStorage::MemoryBlock &data,
+              size_t length) override {
+    const void *read_data = nullptr;
+    const size_t read_size = read(offset, &read_data, length);
+    data.reset(const_cast<void *>(read_data));
+    return read_size;
+  }
+
+  size_t write(size_t, const void *, size_t) override {
+    return 0;
+  }
+
+  size_t resize(size_t) override {
+    return 0;
+  }
+
+  void update_data_crc(uint32_t) override {}
+
+  Pointer clone() override {
+    return std::make_shared<VectorSegment>(data_);
+  }
+
+ private:
+  std::vector<uint8_t> data_;
+};
+
+class VectorStorage final : public IndexStorage {
+ public:
+  void add(const std::string &id, std::vector<uint8_t> data) {
+    segments_[id] = std::make_shared<VectorSegment>(std::move(data));
+  }
+
+  int init(const ailego::Params &) override {
+    return 0;
+  }
+
+  int cleanup() override {
+    return 0;
+  }
+
+  int open(const std::string &, bool) override {
+    return 0;
+  }
+
+  int flush() override {
+    return 0;
+  }
+
+  int close() override {
+    return 0;
+  }
+
+  int append(const std::string &, size_t) override {
+    return IndexError_NotImplemented;
+  }
+
+  void refresh(uint64_t) override {}
+
+  uint64_t check_point() const override {
+    return 0;
+  }
+
+  Segment::Pointer get(const std::string &id, int = -1) override {
+    const auto it = segments_.find(id);
+    return it == segments_.end() ? nullptr : it->second;
+  }
+
+  bool has(const std::string &id) const override {
+    return segments_.find(id) != segments_.end();
+  }
+
+  uint32_t magic() const override {
+    return 0;
+  }
+
+ private:
+  std::map<std::string, Segment::Pointer> segments_;
+};
+
+template <typename T>
+void AppendBytes(std::vector<uint8_t> *bytes, const T &value) {
+  const auto *begin = reinterpret_cast<const uint8_t *>(&value);
+  bytes->insert(bytes->end(), begin, begin + sizeof(value));
+}
+
+template <typename T>
+std::vector<uint8_t> ToBytes(const std::vector<T> &values) {
+  std::vector<uint8_t> bytes(values.size() * sizeof(T));
+  if (!bytes.empty()) {
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+  }
+  return bytes;
+}
+
+std::shared_ptr<VectorStorage> MakeMinimalEntityStorage(
+    const std::vector<uint32_t> &chunk_offsets,
+    const std::vector<diskann_id_t> &key_mapping,
+    const std::vector<diskann_key_t> &keys = {42},
+    uint64_t declared_pivot_size = 2 * sizeof(float) *
+                                   PQTable::kPQCentroidNum) {
+  constexpr uint32_t kDimension = 2;
+  constexpr uint64_t kChunkCount = 2;
+  const uint64_t document_count = keys.size();
+
+  auto storage = std::make_shared<VectorStorage>();
+
+  DiskAnnMetaHeader header;
+  header.doc_cnt = document_count;
+  header.ndims = kDimension;
+  storage->add(DiskAnnEntity::kDiskAnnMetaSegmentId,
+               ToBytes(std::vector<DiskAnnMetaHeader>{header}));
+
+  DiskAnnPqMeta pq_meta;
+  pq_meta.full_pivot_data_size = declared_pivot_size;
+  pq_meta.centroid_data_size = kDimension * sizeof(float);
+  // Legacy indexes leave this field at zero, so the valid case deliberately
+  // exercises that compatibility path.
+  pq_meta.chunk_offsets_size = 0;
+  pq_meta.chunk_num = kChunkCount;
+  std::vector<uint8_t> pq_meta_data;
+  AppendBytes(&pq_meta_data, pq_meta);
+  pq_meta_data.resize(pq_meta_data.size() +
+                          kDimension * sizeof(float) * PQTable::kPQCentroidNum +
+                          kDimension * sizeof(float),
+                      0);
+  const std::vector<uint8_t> chunk_offset_bytes = ToBytes(chunk_offsets);
+  pq_meta_data.insert(pq_meta_data.end(), chunk_offset_bytes.begin(),
+                      chunk_offset_bytes.end());
+  storage->add(DiskAnnEntity::kDiskAnnPqMetaSegmentId, std::move(pq_meta_data));
+  storage->add(DiskAnnEntity::kDiskAnnPqDataSegmentId,
+               std::vector<uint8_t>(document_count * kChunkCount, 0));
+
+  storage->add(DiskAnnEntity::kDiskAnnKeySegmentId, ToBytes(keys));
+  storage->add(DiskAnnEntity::kDiskAnnKeyMappingSegmentId,
+               ToBytes(key_mapping));
+  storage->add(DiskAnnEntity::kDiskAnnEntryPointSegmentId,
+               ToBytes(std::vector<uint32_t>{0}));
+  storage->add(DiskAnnEntity::kDiskAnnVectorSegmentId, {});
+  return storage;
+}
 
 TEST(DiskAnnMobileCompatTest, AlignedAllocationSupportsUnroundedSize) {
   constexpr size_t kSize = 400;
@@ -118,6 +303,84 @@ void ExpectExactPqPivotCopy(IndexMeta::DataType data_type) {
 TEST(DiskAnnMobileCompatTest, PqPivotConversionCopiesExactChunkWidths) {
   ExpectExactPqPivotCopy<float>(IndexMeta::DataType::DT_FP32);
   ExpectExactPqPivotCopy<ailego::Float16>(IndexMeta::DataType::DT_FP16);
+}
+
+TEST(DiskAnnMobileCompatTest, MinimalEntityUsesValidatedTypedKeyStorage) {
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, 2);
+  // Two uint64_t keys and two uint32_t mapping entries both fit in libc++'s
+  // small-string storage. This specifically exercises the layout that was
+  // unsafe when these buffers were strings cast to typed pointers.
+  auto storage = MakeMinimalEntityStorage({0, 1, 2}, {1, 0}, {84, 42});
+
+  DiskAnnSearcherEntity entity;
+  ASSERT_EQ(entity.load(meta, storage), 0);
+  EXPECT_EQ(entity.get_id(42), 1u);
+  EXPECT_EQ(entity.get_id(84), 0u);
+  EXPECT_EQ(entity.get_id(41), kInvalidId);
+  EXPECT_EQ(entity.get_key(0), 84u);
+  EXPECT_EQ(entity.get_key(1), 42u);
+  EXPECT_EQ(entity.get_key(2), kInvalidKey);
+
+  const auto cloned = entity.clone();
+  ASSERT_NE(cloned, nullptr);
+  EXPECT_EQ(cloned->get_id(42), 1u);
+  EXPECT_EQ(cloned->get_key(0), 84u);
+}
+
+TEST(DiskAnnMobileCompatTest, EntityAllowsMultipleInvalidKeySlots) {
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, 2);
+  auto storage = MakeMinimalEntityStorage({0, 1, 2}, {0, 1, 2},
+                                          {42, kInvalidKey, kInvalidKey});
+
+  DiskAnnSearcherEntity entity;
+  ASSERT_EQ(entity.load(meta, storage), 0);
+  EXPECT_EQ(entity.get_id(42), 0u);
+  EXPECT_EQ(entity.get_id(kInvalidKey), kInvalidId);
+  EXPECT_EQ(entity.get_key(1), kInvalidKey);
+  EXPECT_EQ(entity.get_key(2), kInvalidKey);
+}
+
+TEST(DiskAnnMobileCompatTest, EntityRejectsMalformedPqAndKeyMetadata) {
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, 2);
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage(
+        {0, 1, 2}, {0}, {42}, 2 * sizeof(float) * PQTable::kPQCentroidNum - 1);
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage(
+        {0, 1, 2}, {0}, {42}, std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage({0, 2, 2}, {0});
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage(
+        {0, 1, 2}, {std::numeric_limits<diskann_id_t>::max()});
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage({0, 1, 2}, {0, 0}, {42, 84});
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage({0, 1, 2}, {1, 0}, {42, 84});
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
 }
 
 TEST(DiskAnnMobileCompatTest, PortableReaderReadsAlignedBatch) {
