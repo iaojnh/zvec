@@ -58,6 +58,26 @@ class DiskAnnCacheTestPeer {
   static size_t neighbor_cache_size(const DiskAnnSearcher *searcher) {
     return searcher->diskann_indexer_->neighbor_cache_.size();
   }
+
+  static diskann_key_t replace_key(DiskAnnSearcher *searcher, diskann_id_t id,
+                                   diskann_key_t replacement) {
+    auto *entity = dynamic_cast<DiskAnnSearcherEntity *>(
+        searcher->diskann_indexer_->entity_.get());
+    if (entity == nullptr || !entity->key_buffer_ ||
+        !entity->key_mapping_buffer_ ||
+        id >= entity->key_mapping_buffer_->size()) {
+      return kInvalidKey;
+    }
+    const diskann_id_t key_index = (*entity->key_mapping_buffer_)[id];
+    if (key_index >= entity->key_buffer_->size()) {
+      return kInvalidKey;
+    }
+    auto keys = std::const_pointer_cast<std::vector<diskann_key_t>>(
+        entity->key_buffer_);
+    const diskann_key_t previous = (*keys)[key_index];
+    (*keys)[key_index] = replacement;
+    return previous;
+  }
 };
 
 class DiskAnnStreamerTestPeer {
@@ -241,6 +261,10 @@ class CorruptibleDiskAnnSearcherEntity final : public DiskAnnSearcherEntity {
     meta_header_.max_node_size = max_node_size;
     meta_header_.node_per_sector = node_per_sector;
   }
+
+  void set_index_size(uint64_t index_size) {
+    meta_header_.index_size = index_size;
+  }
 };
 
 size_t expected_fetch_buffer_size(const DiskAnnContext &context) {
@@ -357,6 +381,7 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
     CorruptibleDiskAnnSearcherEntity malformed_entity;
     ASSERT_EQ(0, malformed_entity.load(*_index_meta_ptr, malformed_storage));
     const uint64_t max_node_size = malformed_entity.max_node_size();
+    const uint64_t index_size = malformed_entity.index_size();
     const uint64_t expected_node_per_sector =
         max_node_size <= DiskAnnUtil::kSectorSize
             ? DiskAnnUtil::kSectorSize / max_node_size
@@ -378,6 +403,12 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
     DiskAnnIndexer undersized_indexer(*_index_meta_ptr);
     EXPECT_EQ(IndexError_InvalidFormat,
               undersized_indexer.init(malformed_entity));
+
+    malformed_entity.set_node_layout(max_node_size, expected_node_per_sector);
+    malformed_entity.set_index_size(index_size + DiskAnnUtil::kSectorSize);
+    DiskAnnIndexer wrong_size_indexer(*_index_meta_ptr);
+    EXPECT_EQ(IndexError_InvalidFormat,
+              wrong_size_indexer.init(malformed_entity));
   }
 
   auto &stats = builder->stats();
@@ -501,6 +532,46 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
 
   auto *diskann_searcher = dynamic_cast<DiskAnnSearcher *>(searcher.get());
   ASSERT_NE(diskann_searcher, nullptr);
+
+  // Deleted or never-populated slots remain graph nodes so traversal can use
+  // them for connectivity, but they must never reach filters or user-visible
+  // results.
+  {
+    const diskann_key_t original_key =
+        DiskAnnCacheTestPeer::replace_key(diskann_searcher, 3, kInvalidKey);
+    ASSERT_EQ(3U, original_key);
+
+    auto invalid_slot_ctx = searcher->create_context();
+    ASSERT_NE(invalid_slot_ctx, nullptr);
+    invalid_slot_ctx->set_topk(8);
+    bool invalid_key_reached_filter = false;
+    invalid_slot_ctx->set_filter([&](uint64_t key) {
+      invalid_key_reached_filter |= key == kInvalidKey;
+      return false;
+    });
+
+    std::array<float, dim> invalid_slot_query{};
+    invalid_slot_query.fill(3.1F);
+    ASSERT_EQ(0, searcher->search_bf_impl(invalid_slot_query.data(), qmeta,
+                                          invalid_slot_ctx));
+    EXPECT_FALSE(invalid_key_reached_filter);
+    for (const auto &doc : invalid_slot_ctx->result()) {
+      EXPECT_NE(kInvalidKey, doc.key());
+      EXPECT_NE(3U, doc.key());
+    }
+
+    ASSERT_EQ(0, searcher->search_impl(invalid_slot_query.data(), qmeta,
+                                       invalid_slot_ctx));
+    EXPECT_FALSE(invalid_key_reached_filter);
+    for (const auto &doc : invalid_slot_ctx->result()) {
+      EXPECT_NE(kInvalidKey, doc.key());
+      EXPECT_NE(3U, doc.key());
+    }
+
+    EXPECT_EQ(kInvalidKey, DiskAnnCacheTestPeer::replace_key(diskann_searcher,
+                                                             3, original_key));
+  }
+
   auto batch_counting_reader = std::make_shared<CountingAlignedFileReader>(
       DiskAnnCacheTestPeer::reader(diskann_searcher));
   DiskAnnCacheTestPeer::set_reader(diskann_searcher, batch_counting_reader);

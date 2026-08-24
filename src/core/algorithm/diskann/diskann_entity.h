@@ -178,6 +178,14 @@ class DiskAnnEntity {
     return meta_header_.doc_cnt;
   }
 
+  uint64_t dimension() const {
+    return meta_header_.ndims;
+  }
+
+  uint64_t index_size() const {
+    return meta_header_.index_size;
+  }
+
   uint64_t *mutable_doc_cnt() {
     return &meta_header_.doc_cnt;
   }

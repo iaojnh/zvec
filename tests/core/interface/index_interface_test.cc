@@ -67,6 +67,58 @@ TEST(IndexInterface, DiskAnnParamJsonRoundTrip) {
   EXPECT_EQ(48, diskann->max_degree);
   EXPECT_EQ(80, diskann->list_size);
   EXPECT_EQ(16, diskann->pq_chunk_num);
+
+  auto invalid = DiskAnnIndexParamBuilder()
+                     .with_metric_type(MetricType::kL2sq)
+                     .with_data_type(DataType::DT_FP32)
+                     .with_dimension(64)
+                     .with_max_degree(-1)
+                     .with_list_size(32)
+                     .with_pq_chunk_num(8)
+                     .build();
+  EXPECT_EQ(nullptr, IndexFactory::DeserializeIndexParamFromJson(
+                         invalid->serialize_to_json()));
+  invalid->max_degree = 32;
+  invalid->list_size = -1;
+  EXPECT_EQ(nullptr, IndexFactory::DeserializeIndexParamFromJson(
+                         invalid->serialize_to_json()));
+  invalid->list_size = 32;
+  invalid->pq_chunk_num = -1;
+  EXPECT_EQ(nullptr, IndexFactory::DeserializeIndexParamFromJson(
+                         invalid->serialize_to_json()));
+#if DISKANN_SUPPORTED
+  EXPECT_EQ(nullptr, IndexFactory::CreateAndInitIndex(*invalid));
+#endif
+}
+
+TEST(IndexInterface, DiskAnnQueryParamJsonRoundTrip) {
+  DiskAnnQueryParam param;
+  param.topk = 12;
+  param.fetch_vector = true;
+  param.radius = 0.25F;
+  param.is_linear = true;
+  param.list_size = 321;
+
+  const std::string json = IndexFactory::QueryParamSerializeToJson(param);
+  auto typed =
+      IndexFactory::QueryParamDeserializeFromJson<DiskAnnQueryParam>(json);
+  ASSERT_NE(nullptr, typed);
+  EXPECT_EQ(param.topk, typed->topk);
+  EXPECT_EQ(param.fetch_vector, typed->fetch_vector);
+  EXPECT_FLOAT_EQ(param.radius, typed->radius);
+  EXPECT_EQ(param.is_linear, typed->is_linear);
+  EXPECT_EQ(param.list_size, typed->list_size);
+
+  auto polymorphic =
+      IndexFactory::QueryParamDeserializeFromJson<BaseIndexQueryParam>(json);
+  auto diskann = std::dynamic_pointer_cast<DiskAnnQueryParam>(polymorphic);
+  ASSERT_NE(nullptr, diskann);
+  EXPECT_EQ(param.list_size, diskann->list_size);
+
+  EXPECT_EQ(
+      nullptr,
+      IndexFactory::QueryParamDeserializeFromJson<DiskAnnQueryParam>(
+          R"({"index_type":"kDiskAnn","topk":1,"fetch_vector":false,"radius":0,"is_linear":false,"list_size":0})"));
 }
 
 #if RABITQ_SUPPORTED

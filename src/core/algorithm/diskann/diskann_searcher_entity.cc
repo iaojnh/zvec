@@ -15,6 +15,7 @@
 #include "diskann_searcher_entity.h"
 #include <cinttypes>
 #include <limits>
+#include <stdexcept>
 
 namespace zvec {
 namespace core {
@@ -365,6 +366,15 @@ int DiskAnnSearcherEntity::load_header_segment() {
     LOG_ERROR("Invalid DiskAnn document count: %" PRIu64, meta_header_.doc_cnt);
     return IndexError_InvalidFormat;
   }
+  if (meta_header_.ndims != meta_.dimension()) {
+    LOG_ERROR("Invalid DiskAnn dimension: stored=%" PRIu64 " expected=%u",
+              meta_header_.ndims, meta_.dimension());
+    return IndexError_InvalidFormat;
+  }
+  if (meta_header_.medoid >= meta_header_.doc_cnt) {
+    LOG_ERROR("Invalid DiskAnn medoid: %" PRIu64, meta_header_.medoid);
+    return IndexError_InvalidFormat;
+  }
 
   return 0;
 }
@@ -427,10 +437,15 @@ int DiskAnnSearcherEntity::load_entrypoint_segment() {
     return IndexError_InvalidFormat;
   }
 
-  const void *data = nullptr;
+  if (entrypoint_segment_->data_size() < sizeof(uint32_t)) {
+    LOG_ERROR("Invalid segment %s size", kDiskAnnEntryPointSegmentId.c_str());
+    return IndexError_InvalidFormat;
+  }
 
+  const void *data = nullptr;
   if (entrypoint_segment_->read(0, reinterpret_cast<const void **>(&data),
-                                sizeof(uint32_t)) != sizeof(uint32_t)) {
+                                sizeof(uint32_t)) != sizeof(uint32_t) ||
+      data == nullptr) {
     LOG_ERROR("Read segment %s failed", kDiskAnnEntryPointSegmentId.c_str());
     return IndexError_ReadData;
   }
@@ -438,19 +453,48 @@ int DiskAnnSearcherEntity::load_entrypoint_segment() {
   uint32_t entrypoint_cnt = 0;
   memcpy(&entrypoint_cnt, data, sizeof(uint32_t));
 
-  if (entrypoint_cnt != 0) {
-    size_t entrypoint_data_len = entrypoint_cnt * sizeof(diskann_id_t);
-
-    if (entrypoint_segment_->read(sizeof(uint32_t),
-                                  reinterpret_cast<const void **>(&data),
-                                  entrypoint_data_len) != entrypoint_data_len) {
-      LOG_ERROR("Read segment %s failed", kDiskAnnEntryPointSegmentId.c_str());
-      return IndexError_ReadData;
-    }
-
-    entrypoints_.resize(entrypoint_cnt);
-    memcpy(&(entrypoints_[0]), data, entrypoint_data_len);
+  size_t entrypoint_data_len = 0;
+  size_t expected_segment_size = 0;
+  if (entrypoint_cnt > meta_header_.doc_cnt ||
+      !checked_multiply(entrypoint_cnt, sizeof(diskann_id_t),
+                        &entrypoint_data_len) ||
+      !checked_add(sizeof(uint32_t), entrypoint_data_len,
+                   &expected_segment_size) ||
+      entrypoint_segment_->data_size() != expected_segment_size) {
+    LOG_ERROR("Invalid DiskAnn entrypoint count or segment size: count=%u",
+              entrypoint_cnt);
+    return IndexError_InvalidFormat;
   }
+
+  std::vector<diskann_id_t> entrypoints;
+  try {
+    entrypoints.resize(entrypoint_cnt);
+  } catch (const std::bad_alloc &) {
+    LOG_ERROR("Failed to allocate DiskAnn entrypoints");
+    return IndexError_NoMemory;
+  } catch (const std::length_error &) {
+    LOG_ERROR("Invalid DiskAnn entrypoint count: %u", entrypoint_cnt);
+    return IndexError_InvalidFormat;
+  }
+
+  if (entrypoint_data_len != 0 &&
+      (entrypoint_segment_->read(sizeof(uint32_t),
+                                 reinterpret_cast<const void **>(&data),
+                                 entrypoint_data_len) != entrypoint_data_len ||
+       data == nullptr)) {
+    LOG_ERROR("Read segment %s failed", kDiskAnnEntryPointSegmentId.c_str());
+    return IndexError_ReadData;
+  }
+  if (entrypoint_data_len != 0) {
+    memcpy(entrypoints.data(), data, entrypoint_data_len);
+  }
+  for (diskann_id_t id : entrypoints) {
+    if (id >= meta_header_.doc_cnt) {
+      LOG_ERROR("Invalid DiskAnn entrypoint id: %u", id);
+      return IndexError_InvalidFormat;
+    }
+  }
+  entrypoints_ = std::move(entrypoints);
 
   return 0;
 }

@@ -12,15 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <sys/stat.h>
+#if defined(_WIN32) || defined(_WIN64)
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
+#include <string>
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
@@ -37,13 +45,27 @@ namespace {
 
 class TemporaryFile {
  public:
-  TemporaryFile() : fd_(::mkstemp(path_)) {}
+  TemporaryFile() {
+#if defined(_WIN32) || defined(_WIN64)
+    char temp_directory[MAX_PATH]{};
+    char temp_file[MAX_PATH]{};
+    if (::GetTempPathA(MAX_PATH, temp_directory) != 0 &&
+        ::GetTempFileNameA(temp_directory, "zvc", 0, temp_file) != 0) {
+      path_ = temp_file;
+      fd_ = ::_open(path_.c_str(), _O_BINARY | _O_RDWR);
+    }
+#else
+    char path[] = "DiskAnnMobileCompatTest.XXXXXX";
+    fd_ = ::mkstemp(path);
+    path_ = path;
+#endif
+  }
 
   ~TemporaryFile() {
     if (fd_ >= 0) {
-      ::close(fd_);
+      close_descriptor(fd_);
     }
-    ::unlink(path_);
+    remove_file(path_.c_str());
   }
 
   TemporaryFile(const TemporaryFile &) = delete;
@@ -54,21 +76,54 @@ class TemporaryFile {
   }
 
   const char *path() const {
-    return path_;
+    return path_.c_str();
+  }
+
+  void close() {
+    if (fd_ >= 0) {
+      close_descriptor(fd_);
+      fd_ = -1;
+    }
   }
 
   void release_descriptor_and_unlink() {
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
-    }
-    ::unlink(path_);
+    close();
+    remove_file(path_.c_str());
   }
 
  private:
-  char path_[64] = "DiskAnnMobileCompatTest.XXXXXX";
+  static int close_descriptor(int fd) {
+#if defined(_WIN32) || defined(_WIN64)
+    return ::_close(fd);
+#else
+    return ::close(fd);
+#endif
+  }
+
+  static int remove_file(const char *path) {
+#if defined(_WIN32) || defined(_WIN64)
+    return ::_unlink(path);
+#else
+    return ::unlink(path);
+#endif
+  }
+
+  std::string path_;
   int fd_{-1};
 };
+
+int64_t WriteAt(int fd, const void *data, size_t length, uint64_t offset) {
+#if defined(_WIN32) || defined(_WIN64)
+  if (::_lseeki64(fd, static_cast<__int64>(offset), SEEK_SET) < 0 ||
+      length >
+          static_cast<size_t>((std::numeric_limits<unsigned int>::max)())) {
+    return -1;
+  }
+  return ::_write(fd, data, static_cast<unsigned int>(length));
+#else
+  return ::pwrite(fd, data, length, static_cast<off_t>(offset));
+#endif
+}
 
 class VectorSegment final : public IndexStorage::Segment {
  public:
@@ -340,7 +395,7 @@ TEST(DiskAnnMobileCompatTest, EntityAllowsMultipleInvalidKeySlots) {
   EXPECT_EQ(entity.get_key(2), kInvalidKey);
 }
 
-TEST(DiskAnnMobileCompatTest, EntityRejectsMalformedPqAndKeyMetadata) {
+TEST(DiskAnnMobileCompatTest, EntityRejectsMalformedMetadata) {
   IndexMeta meta(IndexMeta::DataType::DT_FP32, 2);
 
   {
@@ -378,6 +433,33 @@ TEST(DiskAnnMobileCompatTest, EntityRejectsMalformedPqAndKeyMetadata) {
 
   {
     DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage({0, 1, 2}, {0});
+    DiskAnnMetaHeader header;
+    header.doc_cnt = 1;
+    header.ndims = 3;
+    storage->add(DiskAnnEntity::kDiskAnnMetaSegmentId,
+                 ToBytes(std::vector<DiskAnnMetaHeader>{header}));
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage({0, 1, 2}, {0});
+    storage->add(DiskAnnEntity::kDiskAnnEntryPointSegmentId,
+                 ToBytes(std::vector<uint32_t>{1, 1}));
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
+    auto storage = MakeMinimalEntityStorage({0, 1, 2}, {0});
+    storage->add(DiskAnnEntity::kDiskAnnEntryPointSegmentId,
+                 ToBytes(std::vector<uint32_t>{2, 0, 0}));
+    EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
+  }
+
+  {
+    DiskAnnSearcherEntity entity;
     auto storage = MakeMinimalEntityStorage({0, 1, 2}, {1, 0}, {42, 84});
     EXPECT_EQ(entity.load(meta, storage), IndexError_InvalidFormat);
   }
@@ -394,15 +476,16 @@ TEST(DiskAnnMobileCompatTest, PortableReaderReadsAlignedBatch) {
   std::vector<uint8_t> expected(kDataSize);
   std::fill(expected.begin(), expected.begin() + kBlockSize, 0x3c);
   std::fill(expected.begin() + kBlockSize, expected.end(), 0xc3);
-  ASSERT_EQ(::pwrite(file.fd(), expected.data(), expected.size(), 0),
-            static_cast<ssize_t>(expected.size()));
+  ASSERT_EQ(WriteAt(file.fd(), expected.data(), expected.size(), 0),
+            static_cast<int64_t>(expected.size()));
+  file.close();
 
   void *output = nullptr;
   DiskAnnUtil::alloc_aligned(&output, kDataSize, kBlockSize);
   ASSERT_NE(output, nullptr);
   std::memset(output, 0, kDataSize);
 
-  LinuxAlignedFileReader reader;
+  PlatformAlignedFileReader reader;
   reader.open(file.path());
   IOContext context{};
   std::vector<AlignedRead> requests;
@@ -424,14 +507,15 @@ TEST(DiskAnnMobileCompatTest, PortableReaderRejectsShortRead) {
   ASSERT_GE(file.fd(), 0);
 
   std::vector<uint8_t> expected(kBlockSize, 0x5a);
-  ASSERT_EQ(::pwrite(file.fd(), expected.data(), expected.size(), 0),
-            static_cast<ssize_t>(expected.size()));
+  ASSERT_EQ(WriteAt(file.fd(), expected.data(), expected.size(), 0),
+            static_cast<int64_t>(expected.size()));
+  file.close();
 
   void *output = nullptr;
   DiskAnnUtil::alloc_aligned(&output, kBlockSize * 2, kBlockSize);
   ASSERT_NE(output, nullptr);
 
-  LinuxAlignedFileReader reader;
+  PlatformAlignedFileReader reader;
   reader.open(file.path());
   IOContext context{};
   std::vector<AlignedRead> requests;
@@ -454,14 +538,15 @@ TEST(DiskAnnMobileCompatTest, PortableReaderRecoversAfterOpenFailure) {
   TemporaryFile file;
   ASSERT_GE(file.fd(), 0);
   std::vector<uint8_t> expected(kBlockSize, 0x6b);
-  ASSERT_EQ(::pwrite(file.fd(), expected.data(), expected.size(), 0),
-            static_cast<ssize_t>(expected.size()));
+  ASSERT_EQ(WriteAt(file.fd(), expected.data(), expected.size(), 0),
+            static_cast<int64_t>(expected.size()));
+  file.close();
 
   void *output = nullptr;
   DiskAnnUtil::alloc_aligned(&output, kBlockSize, kBlockSize);
   ASSERT_NE(output, nullptr);
 
-  LinuxAlignedFileReader reader;
+  PlatformAlignedFileReader reader;
   reader.open("DiskAnnMobileCompatTest.missing");
   IOContext context{};
   std::vector<AlignedRead> requests;
@@ -490,8 +575,9 @@ TEST(DiskAnnMobileCompatTest, PortableReaderSupportsConcurrentReads) {
               expected.begin() + (i + 1) * kBlockSize,
               static_cast<uint8_t>(i + 1));
   }
-  ASSERT_EQ(::pwrite(file.fd(), expected.data(), expected.size(), 0),
-            static_cast<ssize_t>(expected.size()));
+  ASSERT_EQ(WriteAt(file.fd(), expected.data(), expected.size(), 0),
+            static_cast<int64_t>(expected.size()));
+  file.close();
 
   std::array<void *, kThreadCount> outputs{};
   for (void *&output : outputs) {
@@ -499,7 +585,7 @@ TEST(DiskAnnMobileCompatTest, PortableReaderSupportsConcurrentReads) {
     ASSERT_NE(output, nullptr);
   }
 
-  LinuxAlignedFileReader reader;
+  PlatformAlignedFileReader reader;
   reader.open(file.path());
   std::array<int, kThreadCount> statuses{};
   std::vector<std::thread> threads;
@@ -564,15 +650,16 @@ TEST(DiskAnnMobileCompatTest, BuildDumpLoadAndSearch) {
   ASSERT_EQ(builder->dump(dumper), 0);
   ASSERT_EQ(dumper->close(), 0);
 
-  int snapshot_fd = ::open(index_file.path(), O_RDONLY);
-  ASSERT_GE(snapshot_fd, 0);
-  struct stat snapshot_stat {};
-  ASSERT_EQ(::fstat(snapshot_fd, &snapshot_stat), 0);
-  ASSERT_GT(snapshot_stat.st_size, 4096);
-  std::vector<uint8_t> snapshot(static_cast<size_t>(snapshot_stat.st_size));
-  ASSERT_EQ(::pread(snapshot_fd, snapshot.data(), snapshot.size(), 0),
-            static_cast<ssize_t>(snapshot.size()));
-  ASSERT_EQ(::close(snapshot_fd), 0);
+  std::ifstream snapshot_input(index_file.path(),
+                               std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(snapshot_input.is_open());
+  const std::streamsize snapshot_size = snapshot_input.tellg();
+  ASSERT_GT(snapshot_size, 4096);
+  snapshot_input.seekg(0);
+  std::vector<uint8_t> snapshot(static_cast<size_t>(snapshot_size));
+  ASSERT_TRUE(snapshot_input.read(reinterpret_cast<char *>(snapshot.data()),
+                                  snapshot_size));
+  snapshot_input.close();
 
   IndexSearcher::Pointer searcher =
       IndexFactory::CreateSearcher("DiskAnnSearcher");
@@ -631,11 +718,17 @@ TEST(DiskAnnMobileCompatTest, BuildDumpLoadAndSearch) {
   ASSERT_EQ(switching_context->result().size(), 1u);
   EXPECT_EQ(switching_context->result().front().key(), kExpectedKey);
 
+  switching_context.reset();
+  ASSERT_EQ(first_streamer->close(), 0);
+  ASSERT_EQ(second_streamer->close(), 0);
+  first_streamer.reset();
+  second_streamer.reset();
   context.reset();
   searcher.reset();
   storage.reset();
 
-  ASSERT_EQ(::truncate(index_file.path(), snapshot.size() - 4096), 0);
+  ASSERT_NO_THROW(
+      std::filesystem::resize_file(index_file.path(), snapshot.size() - 4096));
   searcher = IndexFactory::CreateSearcher("DiskAnnSearcher");
   ASSERT_NE(searcher, nullptr);
   ASSERT_EQ(searcher->init(search_params), 0);
@@ -651,12 +744,14 @@ TEST(DiskAnnMobileCompatTest, BuildDumpLoadAndSearch) {
 
   searcher.reset();
   storage.reset();
-  int restore_fd = ::open(index_file.path(), O_WRONLY | O_TRUNC);
-  ASSERT_GE(restore_fd, 0);
-  ASSERT_EQ(::pwrite(restore_fd, snapshot.data(), snapshot.size(), 0),
-            static_cast<ssize_t>(snapshot.size()));
-  ASSERT_EQ(::fsync(restore_fd), 0);
-  ASSERT_EQ(::close(restore_fd), 0);
+  std::ofstream restore_output(index_file.path(),
+                               std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(restore_output.is_open());
+  restore_output.write(reinterpret_cast<const char *>(snapshot.data()),
+                       static_cast<std::streamsize>(snapshot.size()));
+  restore_output.flush();
+  ASSERT_TRUE(restore_output.good());
+  restore_output.close();
 
   searcher = IndexFactory::CreateSearcher("DiskAnnSearcher");
   ASSERT_NE(searcher, nullptr);

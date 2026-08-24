@@ -56,6 +56,22 @@ class IOContextReleaseGuard {
   bool enabled_;
 };
 
+bool checked_multiply_u64(uint64_t lhs, uint64_t rhs, uint64_t *result) {
+  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+    return false;
+  }
+  *result = lhs * rhs;
+  return true;
+}
+
+bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t *result) {
+  if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
+    return false;
+  }
+  *result = lhs + rhs;
+  return true;
+}
+
 }  // namespace
 
 DiskAnnIndexer::DiskAnnIndexer(const IndexMeta &meta) {
@@ -115,6 +131,45 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
     return IndexError_InvalidFormat;
   }
 
+  uint64_t expected_index_size = 0;
+  if (entity.node_per_sector() > 0) {
+    const uint64_t sector_count =
+        entity.doc_cnt() / entity.node_per_sector() +
+        (entity.doc_cnt() % entity.node_per_sector() != 0 ? 1 : 0);
+    if (!checked_multiply_u64(sector_count, DiskAnnUtil::kSectorSize,
+                              &expected_index_size)) {
+      LOG_ERROR("DiskAnn graph size overflows uint64");
+      return IndexError_InvalidFormat;
+    }
+  } else {
+    const uint64_t sectors_per_node =
+        stored_max_node_size / DiskAnnUtil::kSectorSize +
+        (stored_max_node_size % DiskAnnUtil::kSectorSize != 0 ? 1 : 0);
+    uint64_t total_sectors = 0;
+    if (!checked_multiply_u64(entity.doc_cnt(), sectors_per_node,
+                              &total_sectors) ||
+        !checked_multiply_u64(total_sectors, DiskAnnUtil::kSectorSize,
+                              &expected_index_size)) {
+      LOG_ERROR("DiskAnn graph size overflows uint64");
+      return IndexError_InvalidFormat;
+    }
+  }
+
+  const uint64_t vector_segment_size = vector_segment->data_size();
+  const uint64_t vector_segment_offset = vector_segment->data_offset();
+  if (entity.index_size() != expected_index_size ||
+      vector_segment_size != expected_index_size ||
+      vector_segment_offset % DiskAnnUtil::kSectorSize != 0) {
+    LOG_ERROR(
+        "Invalid DiskAnn graph layout: declared=%llu segment=%llu "
+        "expected=%llu offset=%llu",
+        static_cast<unsigned long long>(entity.index_size()),
+        static_cast<unsigned long long>(vector_segment_size),
+        static_cast<unsigned long long>(expected_index_size),
+        static_cast<unsigned long long>(vector_segment_offset));
+    return IndexError_InvalidFormat;
+  }
+
   auto cached_file = storage->file();
   // DiskAnn must capture the exact file object that supplied every in-memory
   // segment before releasing IndexStorage. FileReadStorage's
@@ -126,6 +181,16 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity) {
         "DiskAnn requires FileReadStorage with "
         "proxima.file.read_storage.alone_file_handle disabled");
     return IndexError_InvalidArgument;
+  }
+  uint64_t graph_end = 0;
+  if (!checked_add_u64(vector_segment_offset, expected_index_size,
+                       &graph_end) ||
+      graph_end > cached_file->size()) {
+    LOG_ERROR(
+        "DiskAnn graph exceeds the captured file: end=%llu file_size=%llu",
+        static_cast<unsigned long long>(graph_end),
+        static_cast<unsigned long long>(cached_file->size()));
+    return IndexError_InvalidFormat;
   }
 
   max_node_size_ = static_cast<uint32_t>(stored_max_node_size);
@@ -273,6 +338,16 @@ int DiskAnnIndexer::use_medroids_data_as_centroids() {
 
 diskann_key_t DiskAnnIndexer::get_key(diskann_id_t id) const {
   return entity_->get_key(id);
+}
+
+bool DiskAnnIndexer::should_include_result(DiskAnnContext *ctx, diskann_id_t id,
+                                           diskann_key_t *key) const {
+  const diskann_key_t resolved_key = get_key(id);
+  if (key != nullptr) {
+    *key = resolved_key;
+  }
+  return resolved_key != kInvalidKey &&
+         (!ctx->filter().is_valid() || !ctx->filter()(resolved_key));
 }
 
 diskann_id_t DiskAnnIndexer::get_id(diskann_key_t key) const {
@@ -774,9 +849,13 @@ int DiskAnnIndexer::linear_search(DiskAnnContext *ctx) {
   auto &group_topk_heaps = ctx->group_topk_heaps();
   group_topk_heaps.clear();
   auto emplace_candidate = [&](diskann_id_t id, VectorInfo info) {
+    const diskann_key_t key = get_key(id);
+    if (key == kInvalidKey) {
+      return;
+    }
     if (ctx->group_by_search() && ctx->group_by().is_valid()) {
       topk_heap.emplace(id, info);
-      std::string group_id = ctx->group_by()(get_key(id));
+      std::string group_id = ctx->group_by()(key);
       auto &group_topk_heap = group_topk_heaps[group_id];
       if (group_topk_heap.empty()) {
         group_topk_heap.limit(ctx->group_topk());
@@ -821,7 +900,7 @@ int DiskAnnIndexer::linear_search(DiskAnnContext *ctx) {
   diskann_id_t id = 0;
   while (id < doc_cnt_) {
     while (frontier.size() < beam_width_) {
-      if (!ctx->filter().is_valid() || !ctx->filter()(get_key(id))) {
+      if (should_include_result(ctx, id, nullptr)) {
         auto iter = neighbor_cache_.find(id);
         if (iter != neighbor_cache_.end()) {
           cached_neighbors.push_back(
@@ -924,9 +1003,13 @@ int DiskAnnIndexer::keys_search(const std::vector<uint64_t> &keys,
   auto &group_topk_heaps = ctx->group_topk_heaps();
   group_topk_heaps.clear();
   auto emplace_candidate = [&](diskann_id_t id, VectorInfo info) {
+    const diskann_key_t key = get_key(id);
+    if (key == kInvalidKey) {
+      return;
+    }
     if (ctx->group_by_search() && ctx->group_by().is_valid()) {
       topk_heap.emplace(id, info);
-      std::string group_id = ctx->group_by()(get_key(id));
+      std::string group_id = ctx->group_by()(key);
       auto &group_topk_heap = group_topk_heaps[group_id];
       if (group_topk_heap.empty()) {
         group_topk_heap.limit(ctx->group_topk());
@@ -1370,8 +1453,7 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
       float cur_expanded_dist = dc.dist(ctx->query(), node_fp_coords_copy);
 
-      if (!ctx->filter().is_valid() ||
-          !ctx->filter()(get_key(std::get<0>(cached_neighbor)))) {
+      if (should_include_result(ctx, std::get<0>(cached_neighbor), nullptr)) {
         topk_heap.emplace(std::get<0>(cached_neighbor),
                           VectorInfo(cur_expanded_dist,
                                      make_vector_copy(node_fp_coords_copy)));
@@ -1437,8 +1519,7 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
           float cur_expanded_dist = dc.dist(ctx->query(), node_fp_coords);
 
-          if (!ctx->filter().is_valid() ||
-              !ctx->filter()(get_key(frontier_neighbor.first))) {
+          if (should_include_result(ctx, frontier_neighbor.first, nullptr)) {
             topk_heap.emplace(frontier_neighbor.first,
                               VectorInfo(cur_expanded_dist,
                                          make_vector_copy(node_fp_coords)));
@@ -1493,7 +1574,11 @@ void DiskAnnIndexer::populate_group_topk_heaps(DiskAnnContext *ctx) {
   for (uint32_t i = 0; i < topk_heap.size(); ++i) {
     diskann_id_t id = topk_heap[i].first;
     const auto &info = topk_heap[i].second;
-    std::string group_id = ctx->group_by()(get_key(id));
+    const diskann_key_t key = get_key(id);
+    if (key == kInvalidKey) {
+      continue;
+    }
+    std::string group_id = ctx->group_by()(key);
 
     auto &group_topk_heap = group_topk_heaps[group_id];
     if (group_topk_heap.empty()) {
@@ -1631,10 +1716,9 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
 
         float cur_expanded_dist = dc.dist(ctx->query(), node_fp_coords_copy);
 
-        if (!ctx->filter().is_valid() ||
-            !ctx->filter()(get_key(std::get<0>(cached_neighbor)))) {
-          std::string group_id =
-              ctx->group_by()(get_key(std::get<0>(cached_neighbor)));
+        diskann_key_t key = kInvalidKey;
+        if (should_include_result(ctx, std::get<0>(cached_neighbor), &key)) {
+          std::string group_id = ctx->group_by()(key);
 
           auto &group_topk_heap = group_topk_heaps[group_id];
           if (group_topk_heap.empty()) {
@@ -1691,10 +1775,9 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
 
         float cur_expanded_dist = dc.dist(ctx->query(), data_buf);
 
-        if (!ctx->filter().is_valid() ||
-            !ctx->filter()(get_key(frontier_neighbor.first))) {
-          std::string group_id =
-              ctx->group_by()(get_key(frontier_neighbor.first));
+        diskann_key_t key = kInvalidKey;
+        if (should_include_result(ctx, frontier_neighbor.first, &key)) {
+          std::string group_id = ctx->group_by()(key);
 
           auto &group_topk_heap = group_topk_heaps[group_id];
           if (group_topk_heap.empty()) {

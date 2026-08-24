@@ -93,6 +93,14 @@ int DiskAnnIndex::CreateAndInitStreamer(const BaseIndexParam &param) {
   }
 
   param_ = dynamic_cast<const DiskAnnIndexParam &>(param);
+  if (param_.max_degree <= 0 || param_.list_size <= 0 ||
+      param_.pq_chunk_num < 0) {
+    LOG_ERROR(
+        "Invalid DiskAnn parameters: max_degree=%d list_size=%d "
+        "pq_chunk_num=%d",
+        param_.max_degree, param_.list_size, param_.pq_chunk_num);
+    return core::IndexError_InvalidArgument;
+  }
   param_.max_degree = std::min(100, param_.max_degree);
   param_.list_size = std::min(100, param_.list_size);
   param_.pq_chunk_num = std::min(1024, param_.pq_chunk_num);

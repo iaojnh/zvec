@@ -368,10 +368,14 @@ class DiskAnnContext : public IndexContext,
 
   void emplace_result_doc(IndexDocumentList &docs, diskann_id_t id, float score,
                           const VectorInfo &info) {
+    const diskann_key_t key = entity_->get_key(id);
+    if (key == kInvalidKey) {
+      return;
+    }
     if (fetch_vector_) {
-      docs.emplace_back(entity_->get_key(id), score, id, info.vec_);
+      docs.emplace_back(key, score, id, info.vec_);
     } else {
-      docs.emplace_back(entity_->get_key(id), score, id);
+      docs.emplace_back(key, score, id);
     }
   }
 

@@ -211,6 +211,11 @@ std::string IndexFactory::QueryParamSerializeToJson(const QueryParamType &param,
       json_obj.set("nprobe", ailego::JsonValue(param.nprobe));
     }
     index_type = IndexType::kIVFRabitq;
+  } else if constexpr (std::is_same_v<QueryParamType, DiskAnnQueryParam>) {
+    if (!omit_empty_value || param.list_size != 0) {
+      json_obj.set("list_size", ailego::JsonValue(param.list_size));
+    }
+    index_type = IndexType::kDiskAnn;
   } else if constexpr (std::is_same_v<QueryParamType, VamanaQueryParam>) {
     if (!omit_empty_value || param.ef_search != 0) {
       json_obj.set("ef_search", ailego::JsonValue(param.ef_search));
@@ -239,6 +244,8 @@ template std::string IndexFactory::QueryParamSerializeToJson<HNSWQueryParam>(
     const HNSWQueryParam &param, bool omit_empty_value);
 template std::string IndexFactory::QueryParamSerializeToJson<IVFQueryParam>(
     const IVFQueryParam &param, bool omit_empty_value);
+template std::string IndexFactory::QueryParamSerializeToJson<DiskAnnQueryParam>(
+    const DiskAnnQueryParam &param, bool omit_empty_value);
 
 template <typename QueryParamType,
           std::enable_if_t<
@@ -348,6 +355,18 @@ typename QueryParamType::Pointer IndexFactory::QueryParamDeserializeFromJson(
         return nullptr;
       }
       return param;
+    } else if (index_type == IndexType::kDiskAnn) {
+      auto param = std::make_shared<DiskAnnQueryParam>();
+      if (!parse_common_fields(param)) {
+        return nullptr;
+      }
+      if (!extract_value_from_json(json_obj, "list_size", param->list_size,
+                                   tmp_json_value) ||
+          param->list_size == 0) {
+        LOG_ERROR("Failed to deserialize DiskAnn list_size");
+        return nullptr;
+      }
+      return param;
     } else if (index_type == IndexType::kVamana) {
       auto param = std::make_shared<VamanaQueryParam>();
       if (!parse_common_fields(param)) {
@@ -414,6 +433,14 @@ typename QueryParamType::Pointer IndexFactory::QueryParamDeserializeFromJson(
         LOG_ERROR("Failed to deserialize nprobe");
         return nullptr;
       }
+    } else if constexpr (std::is_same_v<QueryParamType, DiskAnnQueryParam>) {
+      if (index_type != IndexType::kDiskAnn ||
+          !extract_value_from_json(json_obj, "list_size", param->list_size,
+                                   tmp_json_value) ||
+          param->list_size == 0) {
+        LOG_ERROR("Failed to deserialize DiskAnn list_size");
+        return nullptr;
+      }
     } else if constexpr (std::is_same_v<QueryParamType, VamanaQueryParam>) {
       if (!extract_value_from_json(json_obj, "ef_search", param->ef_search,
                                    tmp_json_value)) {
@@ -448,6 +475,8 @@ template HNSWQueryParam::Pointer IndexFactory::QueryParamDeserializeFromJson<
     HNSWQueryParam>(const std::string &json_str);
 template IVFQueryParam::Pointer IndexFactory::QueryParamDeserializeFromJson<
     IVFQueryParam>(const std::string &json_str);
+template DiskAnnQueryParam::Pointer IndexFactory::QueryParamDeserializeFromJson<
+    DiskAnnQueryParam>(const std::string &json_str);
 template std::string IndexFactory::QueryParamSerializeToJson<VamanaQueryParam>(
     const VamanaQueryParam &param, bool omit_empty_value);
 template VamanaQueryParam::Pointer IndexFactory::QueryParamDeserializeFromJson<

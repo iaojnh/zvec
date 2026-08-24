@@ -22,6 +22,8 @@
 namespace zvec {
 namespace core {
 
+class DiskAnnCacheTestPeer;
+
 class DiskAnnSearcherEntity : public DiskAnnEntity {
  public:
   using Pointer = std::shared_ptr<DiskAnnSearcherEntity>;
@@ -80,6 +82,8 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   std::shared_ptr<const std::vector<diskann_key_t>> key_buffer_;
   std::shared_ptr<const std::vector<diskann_id_t>> key_mapping_buffer_;
   std::vector<diskann_id_t> entrypoints_;
+
+  friend class DiskAnnCacheTestPeer;
 };
 
 }  // namespace core
