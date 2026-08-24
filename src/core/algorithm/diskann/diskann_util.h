@@ -113,8 +113,8 @@ class DiskAnnUtil {
     return node_buf + elementsize_;
   }
 
-  static inline const uint8_t *offset_to_node_neighbor(
-      const uint8_t *node_buf, uint32_t elementsize_) {
+  static inline const uint8_t *offset_to_node_neighbor(const uint8_t *node_buf,
+                                                       uint32_t elementsize_) {
     return node_buf + elementsize_;
   }
 
