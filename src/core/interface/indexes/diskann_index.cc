@@ -397,17 +397,16 @@ int DiskAnnIndex::CommitBuiltSnapshot(bool *snapshot_replaced) {
   core::IndexStorage::Pointer previous_storage;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    previous_streamer = std::move(streamer_);
-    previous_storage = std::move(storage_);
-    streamer_ = std::move(replacement_streamer);
-    storage_ = std::move(replacement_storage);
+    previous_streamer = exchange_streamer(std::move(replacement_streamer));
+    previous_storage = exchange_storage(std::move(replacement_storage));
   }
-  if (previous_streamer != nullptr && previous_streamer->unload() != 0) {
-    LOG_WARN("Failed to unload previous DiskAnn snapshot after replacement");
-  }
-  if (previous_storage != nullptr && previous_storage->close() != 0) {
-    LOG_WARN("Failed to close previous DiskAnn storage after replacement");
-  }
+  // Do not explicitly unload the previous streamer. Searches, fetches and
+  // providers atomically acquire their own shared_ptr snapshot; its file
+  // reader must remain usable until the last in-flight operation releases it.
+  // The old streamer and storage clean themselves up when these local owners
+  // and all reader owners have gone away.
+  (void)previous_streamer;
+  (void)previous_storage;
 
   if (replace_result == SnapshotReplaceResult::kReplacedNotDurable) {
     LOG_ERROR(
@@ -551,6 +550,10 @@ int DiskAnnIndex::train() {
 int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
                                VectorDataBuffer *vector_data_buffer) {
   if (is_trained_) {
+    const auto streamer = streamer_snapshot();
+    if (streamer == nullptr) {
+      return core::IndexError_NoReady;
+    }
     auto &context = acquire_context();
     if (context == nullptr) {
       LOG_ERROR("Failed to acquire DiskAnn fetch context");
@@ -558,7 +561,7 @@ int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
     }
 
     std::string stored_vector;
-    const int ret = streamer_->get_vector(doc_id, context, stored_vector);
+    const int ret = streamer->get_vector(doc_id, context, stored_vector);
     context->reset();
     if (ret != 0) {
       return ret;

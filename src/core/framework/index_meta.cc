@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstring>
+#include <limits>
 #include <zvec/ailego/encoding/json.h>
 #include <zvec/core/framework/index_meta.h>
 
@@ -36,6 +38,57 @@ struct IndexMetaFormatHeader {
 
 static_assert(sizeof(IndexMetaFormatHeader) % 32 == 0,
               "IndexMetaBufferFormat must be aligned with 32 bytes");
+
+namespace {
+
+bool ComputeElementSize(uint32_t data_type, uint32_t unit_size,
+                        uint32_t dimension, uint32_t extra_meta_size,
+                        uint32_t *element_size) {
+  if (data_type > static_cast<uint32_t>(IndexMeta::DataType::DT_BINARY64)) {
+    return false;
+  }
+
+  const auto type = static_cast<IndexMeta::DataType>(data_type);
+  const uint32_t expected_unit_size = IndexMeta::UnitSizeof(type);
+  if (unit_size != expected_unit_size) {
+    return false;
+  }
+
+  uint64_t base_size = 0;
+  switch (type) {
+    case IndexMeta::DataType::DT_UNDEFINED:
+      break;
+    case IndexMeta::DataType::DT_FP16:
+    case IndexMeta::DataType::DT_FP32:
+    case IndexMeta::DataType::DT_FP64:
+    case IndexMeta::DataType::DT_INT8:
+    case IndexMeta::DataType::DT_INT16:
+      base_size = static_cast<uint64_t>(dimension) * unit_size;
+      break;
+    case IndexMeta::DataType::DT_INT4: {
+      const uint64_t values_per_unit = static_cast<uint64_t>(unit_size) * 2;
+      base_size = (static_cast<uint64_t>(dimension) + values_per_unit - 1) /
+                  values_per_unit * unit_size;
+      break;
+    }
+    case IndexMeta::DataType::DT_BINARY32:
+    case IndexMeta::DataType::DT_BINARY64: {
+      const uint64_t values_per_unit = static_cast<uint64_t>(unit_size) * 8;
+      base_size = (static_cast<uint64_t>(dimension) + values_per_unit - 1) /
+                  values_per_unit * unit_size;
+      break;
+    }
+  }
+
+  const uint64_t total_size = base_size + extra_meta_size;
+  if (total_size > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  *element_size = static_cast<uint32_t>(total_size);
+  return true;
+}
+
+}  // namespace
 
 void IndexMeta::serialize(std::string *out) const {
   ailego::Params attachment;
@@ -119,55 +172,70 @@ void IndexMeta::serialize(std::string *out) const {
     attachment.set("attributes", attributes_);
   }
 
-  out->assign(reinterpret_cast<const char *>(&format), sizeof(format));
-  size_t offset = static_cast<uint32_t>(out->size());
-
+  std::string attachment_buffer;
   if (!attachment.empty()) {
-    std::string buf;
-    ailego::Params::SerializeToBuffer(attachment, &buf);
-    out->append(buf.data(), buf.size());
-    IndexMetaFormatHeader *header = (IndexMetaFormatHeader *)out->data();
-    header->attachment_offset = static_cast<uint32_t>(offset);
-    header->attachment_size = static_cast<uint32_t>(buf.size());
-    offset += buf.size();
+    ailego::Params::SerializeToBuffer(attachment, &attachment_buffer);
+    if (attachment_buffer.size() > std::numeric_limits<uint32_t>::max()) {
+      out->clear();
+      return;
+    }
+    format.attachment_offset = sizeof(format);
+    format.attachment_size = static_cast<uint32_t>(attachment_buffer.size());
   }
+  out->assign(reinterpret_cast<const char *>(&format), sizeof(format));
+  out->append(attachment_buffer);
 }
 
 bool IndexMeta::deserialize(const void *data, size_t len) {
-  const IndexMetaFormatHeader *format =
-      reinterpret_cast<const IndexMetaFormatHeader *>(data);
-
   this->clear();
-  if (sizeof(IndexMetaFormatHeader) > len) {
-    return false;
-  }
-  if (sizeof(IndexMetaFormatHeader) > format->header_size) {
+  if (data == nullptr || sizeof(IndexMetaFormatHeader) > len) {
     return false;
   }
 
-  meta_type_ = static_cast<IndexMeta::MetaType>(format->meta_type);
-  major_order_ = static_cast<IndexMeta::MajorOrder>(format->major_order);
-  data_type_ = static_cast<IndexMeta::DataType>(format->data_type);
-  dimension_ = format->dimension;
-  unit_size_ = format->unit_size;
-  extra_meta_size_ = format->extra_meta_size;
-  element_size_ = IndexMeta::ElementSizeof(data_type_, unit_size_, dimension_) +
-                  extra_meta_size_;
-  space_id_ = format->space_id;
+  IndexMetaFormatHeader format;
+  std::memcpy(&format, data, sizeof(format));
+  if (format.header_size < sizeof(IndexMetaFormatHeader) ||
+      format.header_size > len) {
+    return false;
+  }
+
+  if (format.meta_type >
+          static_cast<uint32_t>(IndexMeta::MetaType::MT_SPARSE) ||
+      format.major_order >
+          static_cast<uint32_t>(IndexMeta::MajorOrder::MO_COLUMN)) {
+    return false;
+  }
+
+  uint32_t element_size = 0;
+  if (!ComputeElementSize(format.data_type, format.unit_size, format.dimension,
+                          format.extra_meta_size, &element_size)) {
+    return false;
+  }
 
   // Read attachment
   ailego::Params attachment;
-  if (format->attachment_size) {
-    if (format->attachment_offset + format->attachment_size > len) {
+  if (format.attachment_size != 0) {
+    if (format.attachment_offset < format.header_size ||
+        format.attachment_offset > len ||
+        format.attachment_size > len - format.attachment_offset) {
       return false;
     }
     std::string str(
-        reinterpret_cast<const char *>(data) + format->attachment_offset,
-        format->attachment_size);
+        reinterpret_cast<const char *>(data) + format.attachment_offset,
+        format.attachment_size);
     if (!ailego::Params::ParseFromBuffer(str, &attachment)) {
       return false;
     }
   }
+
+  meta_type_ = static_cast<IndexMeta::MetaType>(format.meta_type);
+  major_order_ = static_cast<IndexMeta::MajorOrder>(format.major_order);
+  data_type_ = static_cast<IndexMeta::DataType>(format.data_type);
+  dimension_ = format.dimension;
+  unit_size_ = format.unit_size;
+  extra_meta_size_ = format.extra_meta_size;
+  element_size_ = element_size;
+  space_id_ = format.space_id;
 
   ailego::Params item;
   if (attachment.get("metric", &item)) {

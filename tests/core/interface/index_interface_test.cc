@@ -97,6 +97,34 @@ TEST(IndexInterface, IndexTypeKeepsExistingValues) {
   EXPECT_EQ(7, static_cast<int>(IndexType::kIVFRabitq));
 }
 
+TEST(IndexInterface, RejectsInvalidBaseVectorMetadata) {
+  for (const int dimension : {0, -1, MAX_DIMENSION + 1}) {
+    auto param = FlatIndexParamBuilder()
+                     .with_metric_type(MetricType::kL2sq)
+                     .with_data_type(DataType::DT_FP32)
+                     .with_dimension(dimension)
+                     .build();
+    EXPECT_EQ(nullptr, IndexFactory::CreateAndInitIndex(*param)) << dimension;
+  }
+
+  auto invalid_data_type = FlatIndexParamBuilder()
+                               .with_metric_type(MetricType::kL2sq)
+                               .with_data_type(static_cast<DataType>(
+                                   static_cast<int>(DataType::DT_BINARY64) + 1))
+                               .with_dimension(8)
+                               .build();
+  EXPECT_EQ(nullptr, IndexFactory::CreateAndInitIndex(*invalid_data_type));
+
+  // Sparse vectors do not use a fixed dense dimension, so their established
+  // zero-dimension metadata remains valid.
+  auto sparse = FlatIndexParamBuilder()
+                    .with_metric_type(MetricType::kInnerProduct)
+                    .with_data_type(DataType::DT_FP32)
+                    .with_is_sparse(true)
+                    .build();
+  EXPECT_NE(nullptr, IndexFactory::CreateAndInitIndex(*sparse));
+}
+
 TEST(IndexInterface, BuildMultiPassHolderPropagatesConverterFailures) {
   std::vector<float> values{1.0F, 2.0F};
   std::vector<std::pair<uint64_t, std::string>> doc_cache;
@@ -415,7 +443,16 @@ TEST(IndexInterface, DiskAnnSupportsRepeatedMerge) {
   ASSERT_EQ(
       0, target->open(target_path, {StorageOptions::StorageType::kMMAP, true}));
   ASSERT_EQ(0, target->merge({first}, IndexFilter()));
+  auto first_snapshot = target->index_searcher();
+  ASSERT_NE(nullptr, first_snapshot);
   ASSERT_EQ(0, target->merge({second}, IndexFilter()));
+
+  // A caller that acquired the previous snapshot before the atomic swap keeps
+  // it alive. Commit must not unload its file reader while an in-flight search
+  // or provider can still use it.
+  auto first_snapshot_provider = first_snapshot->create_provider();
+  ASSERT_NE(nullptr, first_snapshot_provider);
+  EXPECT_EQ(kDocCount, first_snapshot_provider->count());
 
   VectorDataBuffer fetched;
   ASSERT_EQ(0, target->fetch(7, &fetched));
@@ -425,6 +462,8 @@ TEST(IndexInterface, DiskAnnSupportsRepeatedMerge) {
                            sizeof(second_vectors[7])));
 
   EXPECT_EQ(0, target->close());
+  first_snapshot_provider.reset();
+  first_snapshot.reset();
 
   auto read_only_target = IndexFactory::CreateAndInitIndex(*diskann_param);
   ASSERT_NE(nullptr, read_only_target);

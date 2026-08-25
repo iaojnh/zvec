@@ -14,11 +14,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <zvec/core/framework/index_context.h>
@@ -210,8 +212,28 @@ class ZVEC_CORE_API Index {
   bool init_context();
   core::IndexContext::Pointer &acquire_context();
 
+  core::IndexStreamer::Pointer streamer_snapshot() const {
+    return std::atomic_load_explicit(&streamer_, std::memory_order_acquire);
+  }
+
+  core::IndexStreamer::Pointer exchange_streamer(
+      core::IndexStreamer::Pointer replacement) {
+    return std::atomic_exchange_explicit(&streamer_, std::move(replacement),
+                                         std::memory_order_acq_rel);
+  }
+
+  core::IndexStorage::Pointer storage_snapshot() const {
+    return std::atomic_load_explicit(&storage_, std::memory_order_acquire);
+  }
+
+  core::IndexStorage::Pointer exchange_storage(
+      core::IndexStorage::Pointer replacement) {
+    return std::atomic_exchange_explicit(&storage_, std::move(replacement),
+                                         std::memory_order_acq_rel);
+  }
+
  protected:
-  bool is_trained_{false};
+  std::atomic<bool> is_trained_{false};
 
   BaseIndexParam param_;
   ailego::Params proxima_index_params_{};
