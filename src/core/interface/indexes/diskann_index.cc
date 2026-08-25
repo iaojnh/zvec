@@ -14,6 +14,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -58,13 +60,98 @@ enum class SnapshotReplaceResult {
   kReplacedNotDurable,
 };
 
+#if defined(_WIN32) || defined(_WIN64)
+bool ReplaceOpenFileWithPosixSemantics(
+    const std::filesystem::path &source_path,
+    const std::filesystem::path &destination_path) {
+  // FileRenameInfoEx is available at runtime on supported Windows Server
+  // versions, but the project still builds against an older SDK view. Keep
+  // the ABI declarations local so an open destination can be replaced while
+  // existing readers retain the old file object.
+  constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+  constexpr DWORD kReplaceIfExists = 0x00000001;
+  constexpr DWORD kPosixSemantics = 0x00000002;
+  struct ExtendedFileRenameInfo {
+    DWORD flags;
+    HANDLE root_directory;
+    DWORD file_name_length;
+    WCHAR file_name[1];
+  };
+  static_assert(offsetof(ExtendedFileRenameInfo, root_directory) ==
+                offsetof(FILE_RENAME_INFO, RootDirectory));
+  static_assert(offsetof(ExtendedFileRenameInfo, file_name_length) ==
+                offsetof(FILE_RENAME_INFO, FileNameLength));
+  static_assert(offsetof(ExtendedFileRenameInfo, file_name) ==
+                offsetof(FILE_RENAME_INFO, FileName));
+
+  std::error_code path_error;
+  const std::filesystem::path absolute_destination =
+      std::filesystem::absolute(destination_path, path_error);
+  if (path_error) {
+    ::SetLastError(ERROR_PATH_NOT_FOUND);
+    return false;
+  }
+  const std::wstring &destination = absolute_destination.native();
+  if (destination.size() >
+      (std::numeric_limits<DWORD>::max)() / sizeof(WCHAR)) {
+    ::SetLastError(ERROR_FILENAME_EXCED_RANGE);
+    return false;
+  }
+
+  const size_t destination_bytes = destination.size() * sizeof(WCHAR);
+  if (destination_bytes >
+      (std::numeric_limits<DWORD>::max)() - sizeof(ExtendedFileRenameInfo)) {
+    ::SetLastError(ERROR_FILENAME_EXCED_RANGE);
+    return false;
+  }
+  const size_t rename_info_size =
+      sizeof(ExtendedFileRenameInfo) + destination_bytes;
+
+  std::unique_ptr<unsigned char[]> rename_buffer(
+      new (std::nothrow) unsigned char[rename_info_size]);
+  if (!rename_buffer) {
+    ::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    return false;
+  }
+  std::memset(rename_buffer.get(), 0, rename_info_size);
+  auto *rename_info =
+      reinterpret_cast<ExtendedFileRenameInfo *>(rename_buffer.get());
+  rename_info->flags = kReplaceIfExists | kPosixSemantics;
+  rename_info->root_directory = nullptr;
+  rename_info->file_name_length = static_cast<DWORD>(destination_bytes);
+  std::memcpy(rename_info->file_name, destination.data(), destination_bytes);
+
+  HANDLE source_handle =
+      ::CreateFileW(source_path.c_str(), DELETE | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (source_handle == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+
+  const BOOL renamed = ::SetFileInformationByHandle(
+      source_handle, kFileRenameInfoEx, rename_info,
+      static_cast<DWORD>(rename_info_size));
+  const DWORD rename_error = renamed ? ERROR_SUCCESS : ::GetLastError();
+  ::CloseHandle(source_handle);
+  ::SetLastError(rename_error);
+  return renamed != FALSE;
+}
+#endif
+
 SnapshotReplaceResult ReplaceFileAtomically(const std::string &source,
                                             const std::string &destination) {
 #if defined(_WIN32) || defined(_WIN64)
   const auto source_path = ailego::FileHelper::PathFromUtf8(source);
   const auto destination_path = ailego::FileHelper::PathFromUtf8(destination);
-  return ::MoveFileExW(source_path.c_str(), destination_path.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0
+  // MoveFileExW cannot reliably replace an open destination. DiskAnn keeps
+  // old snapshots readable until the final in-flight query releases them, so
+  // use Windows POSIX rename semantics and retain MoveFileExW as a fallback
+  // for older systems where FileRenameInfoEx is unavailable.
+  return (ReplaceOpenFileWithPosixSemantics(source_path, destination_path) ||
+          ::MoveFileExW(source_path.c_str(), destination_path.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) !=
+              0)
              ? SnapshotReplaceResult::kReplaced
              : SnapshotReplaceResult::kNotReplaced;
 #else
