@@ -30,14 +30,13 @@ class BinaryConverterHolder : public IndexHolder {
   class Iterator : public IndexHolder::Iterator {
    public:
     //! Constructor
-    Iterator(const BinaryConverterHolder *owner,
+    Iterator(size_t dimension,
+             const std::shared_ptr<ailego::BinaryQuantizer> &quantizer,
              IndexHolder::Iterator::Pointer &&iter)
-        : buffer_(ailego::BinaryQuantizer::EncodedSizeInBinary32(
-                      owner->dimension()),
-                  0),
+        : buffer_(ailego::BinaryQuantizer::EncodedSizeInBinary32(dimension), 0),
           front_iter_(std::move(iter)),
-          quantizer_(owner->quantizer_),
-          dim_{owner->dimension()} {
+          quantizer_(quantizer),
+          dim_{dimension} {
       this->encode_record();
     }
 
@@ -76,7 +75,7 @@ class BinaryConverterHolder : public IndexHolder {
       if (!vec || !quantizer_) {
         return;
       }
-      quantizer_->encode(vec, dim_ / 2, buffer_.data());
+      quantizer_->encode(vec, dim_, buffer_.data());
       data_valid_ = true;
     }
 
@@ -123,10 +122,10 @@ class BinaryConverterHolder : public IndexHolder {
   //! Create a new iterator
   IndexHolder::Iterator::Pointer create_iterator(void) override {
     IndexHolder::Iterator::Pointer iter = front_->create_iterator();
-    return iter
-               ? IndexHolder::Iterator::Pointer(
-                     new BinaryConverterHolder::Iterator(this, std::move(iter)))
-               : IndexHolder::Iterator::Pointer();
+    return iter ? IndexHolder::Iterator::Pointer(
+                      new BinaryConverterHolder::Iterator(
+                          front_->dimension(), quantizer_, std::move(iter)))
+                : IndexHolder::Iterator::Pointer();
   }
 
  private:

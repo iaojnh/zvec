@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <array>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <gtest/gtest.h>
@@ -141,7 +142,33 @@ TEST(ConverterReadFailure, BinaryConverterInitializesQuantizer) {
   auto iterator = converter->result()->create_iterator();
   ASSERT_NE(nullptr, iterator);
   ASSERT_TRUE(iterator->is_valid());
-  EXPECT_NE(nullptr, iterator->data());
+  const void *data = iterator->data();
+  ASSERT_NE(nullptr, data);
+  uint32_t encoded = 0;
+  std::memcpy(&encoded, data, sizeof(encoded));
+  EXPECT_EQ(0xFU, encoded);
+}
+
+TEST(ConverterReadFailure, BinaryReformerPreservesBatchBoundaries) {
+  auto reformer = IndexFactory::CreateReformer("BinaryReformer");
+  ASSERT_NE(nullptr, reformer);
+  ASSERT_EQ(0, reformer->init(ailego::Params()));
+
+  const std::array<float, 8> queries{-1.0F, -2.0F, -3.0F, -4.0F,
+                                     1.0F,  2.0F,  3.0F,  4.0F};
+  const IndexQueryMeta query_meta(IndexMeta::DataType::DT_FP32, 4);
+  IndexQueryMeta output_meta;
+  std::string output;
+  ASSERT_EQ(0, reformer->transform(queries.data(), query_meta, 2, &output,
+                                   &output_meta));
+  ASSERT_EQ(2 * sizeof(uint32_t), output.size());
+  EXPECT_EQ(IndexMeta::DataType::DT_BINARY32, output_meta.data_type());
+  EXPECT_EQ(32U, output_meta.dimension());
+
+  std::array<uint32_t, 2> encoded{};
+  std::memcpy(encoded.data(), output.data(), output.size());
+  EXPECT_EQ(0U, encoded[0]);
+  EXPECT_EQ(0xFU, encoded[1]);
 }
 
 }  // namespace

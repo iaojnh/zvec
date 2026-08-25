@@ -45,6 +45,40 @@ class DiskAnnBuilderTest : public testing::Test {
 std::string DiskAnnBuilderTest::_dir("DiskAnnBuilderTest");
 shared_ptr<IndexMeta> DiskAnnBuilderTest::_index_meta_ptr;
 
+class CountOverrideHolder : public IndexHolder {
+ public:
+  CountOverrideHolder(IndexHolder::Pointer holder, size_t declared_count)
+      : holder_(std::move(holder)), declared_count_(declared_count) {}
+
+  size_t count() const override {
+    return declared_count_;
+  }
+
+  size_t dimension() const override {
+    return holder_->dimension();
+  }
+
+  IndexMeta::DataType data_type() const override {
+    return holder_->data_type();
+  }
+
+  size_t element_size() const override {
+    return holder_->element_size();
+  }
+
+  bool multipass() const override {
+    return holder_->multipass();
+  }
+
+  Iterator::Pointer create_iterator() override {
+    return holder_->create_iterator();
+  }
+
+ private:
+  IndexHolder::Pointer holder_;
+  size_t declared_count_;
+};
+
 void DiskAnnBuilderTest::SetUp(void) {
   LoggerBroker::SetLevel(Logger::LEVEL_INFO);
 
@@ -208,6 +242,65 @@ TEST_F(DiskAnnBuilderTest, RejectsInvalidGraphAndSamplingParameters) {
   EXPECT_EQ(IndexError_InvalidLength, entity.reserve_space(0));
   EXPECT_EQ(IndexError_InvalidLength,
             entity.reserve_space((std::numeric_limits<size_t>::max)()));
+}
+
+TEST_F(DiskAnnBuilderTest, RejectsMismatchedHolderMetadata) {
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 16);
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 20);
+  params.set(PARAM_DISKANN_BUILDER_MAX_PQ_CHUNK_NUM, 1);
+  params.set(PARAM_DISKANN_BUILDER_THREAD_COUNT, 1);
+
+  auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+  ASSERT_NE(nullptr, builder);
+  ASSERT_EQ(0, builder->init(*_index_meta_ptr, params));
+
+  auto mismatched =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim / 2);
+  NumericalVector<float> short_vector(dim / 2, 1.0F);
+  ASSERT_TRUE(mismatched->emplace(0, short_vector));
+  EXPECT_EQ(IndexError_Mismatch, builder->train(mismatched));
+
+  auto valid =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  NumericalVector<float> vector(dim, 1.0F);
+  ASSERT_TRUE(valid->emplace(0, vector));
+  ASSERT_EQ(0, builder->train(valid));
+  EXPECT_EQ(IndexError_Mismatch, builder->build(mismatched));
+  EXPECT_EQ(0, builder->build(valid));
+}
+
+TEST_F(DiskAnnBuilderTest, FailedBuildDiscardsPartialEntity) {
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 16);
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 20);
+  params.set(PARAM_DISKANN_BUILDER_MAX_PQ_CHUNK_NUM, 1);
+  params.set(PARAM_DISKANN_BUILDER_THREAD_COUNT, 1);
+
+  auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+  ASSERT_NE(nullptr, builder);
+  ASSERT_EQ(0, builder->init(*_index_meta_ptr, params));
+
+  auto valid =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  for (size_t i = 0; i < 2; ++i) {
+    NumericalVector<float> vector(dim, static_cast<float>(i));
+    ASSERT_TRUE(valid->emplace(i, vector));
+  }
+  ASSERT_EQ(0, builder->train(valid));
+
+  auto incomplete =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  NumericalVector<float> vector(dim, 1.0F);
+  ASSERT_TRUE(incomplete->emplace(0, vector));
+  auto wrong_count = make_shared<CountOverrideHolder>(incomplete, 2);
+  EXPECT_EQ(IndexError_InvalidLength, builder->build(wrong_count));
+
+  // A failed build invalidates the trained state instead of appending a retry
+  // to the partial entity. Retraining starts from a clean entity.
+  EXPECT_EQ(IndexError_NoReady, builder->build(valid));
+  ASSERT_EQ(0, builder->train(valid));
+  EXPECT_EQ(0, builder->build(valid));
 }
 
 TEST_F(DiskAnnBuilderTest, PqSamplingUsesRatioAndWholeDataset) {

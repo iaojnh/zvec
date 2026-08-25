@@ -11,6 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
+#include <vector>
 #include <ailego/algorithm/binary_quantizer.h>
 #include <core/quantizer/quantizer_params.h>
 #include <zvec/core/framework/index_factory.h>
@@ -53,14 +58,20 @@ class BinaryReformer : public IndexReformer {
       return IndexError_Unsupported;
     }
 
-    size_t dim =
-        ailego::BinaryQuantizer::EncodedSizeInBinary32(qmeta.dimension()) * 32u;
-    out->resize(
-        IndexMeta::ElementSizeof(IndexMeta::DataType::DT_BINARY32, dim));
+    const size_t encoded_words =
+        ailego::BinaryQuantizer::EncodedSizeInBinary32(qmeta.dimension());
+    const size_t dim = encoded_words * 32u;
     const float *vec = reinterpret_cast<const float *>(query);
-
-    quantizer_.encode(vec, qmeta.dimension(),
-                      reinterpret_cast<uint32_t *>(&(*out)[0]));
+    try {
+      std::vector<uint32_t> encoded(encoded_words);
+      quantizer_.encode(vec, qmeta.dimension(), encoded.data());
+      out->assign(reinterpret_cast<const char *>(encoded.data()),
+                  encoded.size() * sizeof(uint32_t));
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    } catch (const std::length_error &) {
+      return IndexError_InvalidLength;
+    }
     *ometa = qmeta;
     ometa->set_meta(IndexMeta::DataType::DT_BINARY32, dim);
 
@@ -77,14 +88,33 @@ class BinaryReformer : public IndexReformer {
       return IndexError_Unsupported;
     }
 
-    size_t dim =
-        ailego::BinaryQuantizer::EncodedSizeInBinary32(qmeta.dimension()) * 32u;
-    out->resize(count * IndexMeta::ElementSizeof(
-                            IndexMeta::DataType::DT_BINARY32, dim));
+    const size_t encoded_words =
+        ailego::BinaryQuantizer::EncodedSizeInBinary32(qmeta.dimension());
+    const size_t dim = encoded_words * 32u;
+    if (encoded_words >
+        (std::numeric_limits<size_t>::max)() / sizeof(uint32_t)) {
+      return IndexError_InvalidLength;
+    }
+    const size_t encoded_size = encoded_words * sizeof(uint32_t);
+    if (encoded_size != 0 &&
+        count > (std::numeric_limits<size_t>::max)() / encoded_size) {
+      return IndexError_InvalidLength;
+    }
     const float *vec = reinterpret_cast<const float *>(query);
-
-    quantizer_.encode(vec, qmeta.dimension() * count,
-                      reinterpret_cast<uint32_t *>(&(*out)[0]));
+    try {
+      out->resize(static_cast<size_t>(count) * encoded_size);
+      std::vector<uint32_t> encoded(encoded_words);
+      for (uint32_t i = 0; i < count; ++i) {
+        quantizer_.encode(vec + static_cast<size_t>(i) * qmeta.dimension(),
+                          qmeta.dimension(), encoded.data());
+        std::memcpy(out->data() + static_cast<size_t>(i) * encoded_size,
+                    encoded.data(), encoded_size);
+      }
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    } catch (const std::length_error &) {
+      return IndexError_InvalidLength;
+    }
     *ometa = qmeta;
     ometa->set_meta(IndexMeta::DataType::DT_BINARY32, dim);
 

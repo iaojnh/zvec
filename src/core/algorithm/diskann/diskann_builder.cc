@@ -561,6 +561,10 @@ int DiskAnnBuilder::train(IndexThreads::Pointer threads,
     LOG_ERROR("Invalid holder for DiskAnnBuilder::train");
     return IndexError_InvalidArgument;
   }
+  if (!holder->is_matched(raw_meta_)) {
+    LOG_ERROR("Holder does not match DiskAnn builder metadata during train");
+    return IndexError_Mismatch;
+  }
 
   LOG_INFO("Begin DiskAnnBuilder::train");
 
@@ -624,12 +628,38 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
     LOG_ERROR("Invalid holder for DiskAnnBuilder::build");
     return IndexError_InvalidArgument;
   }
+  if (!holder->is_matched(raw_meta_)) {
+    LOG_ERROR("Holder does not match DiskAnn builder metadata during build");
+    return IndexError_Mismatch;
+  }
 
   LOG_INFO("Start DiskAnnBuilder::build");
 
   auto start_time = ailego::Monotime::MilliSeconds();
 
   holder_ = holder;
+
+  bool build_succeeded = false;
+  AILEGO_DEFER([&]() {
+    holder_.reset();
+    if (build_succeeded || entity_.doc_cnt() == 0) {
+      return;
+    }
+
+    // A failed graph build may have appended vectors or mutated neighbors.
+    // Discard the partial entity and require training again before retrying.
+    const int reset_ret = entity_.init(raw_meta_, max_degree_, list_size_,
+                                       memory_limit_, build_thread_count_);
+    if (reset_ret != 0) {
+      LOG_ERROR("Failed to reset DiskAnn entity after build failure: %d",
+                reset_ret);
+      state_ = BUILD_STATE_INIT;
+      return;
+    }
+    stats_.set_trained_count(0UL);
+    stats_.set_trained_costtime(0UL);
+    state_ = BUILD_STATE_INITED;
+  });
 
   if (!threads) {
     threads =
@@ -702,7 +732,7 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   }
 
   state_ = BUILD_STATE_BUILT;
-  holder_.reset();
+  build_succeeded = true;
 
   stats_.set_built_count(entity_.doc_cnt());
   stats_.set_built_costtime(ailego::Monotime::MilliSeconds() - start_time);
