@@ -150,7 +150,7 @@ class ZVEC_CORE_API Index {
 
   bool is_dirty() const;
 
-  uint32_t get_doc_count() const;
+  virtual uint32_t get_doc_count() const;
 
   core::IndexStreamer::Pointer index_searcher();
 
@@ -388,6 +388,8 @@ class ZVEC_CORE_API DiskAnnIndex : public Index {
  public:
   DiskAnnIndex() = default;
 
+  uint32_t get_doc_count() const override;
+
  protected:
   int CreateAndInitStreamer(const BaseIndexParam &param) override;
 
@@ -409,10 +411,10 @@ class ZVEC_CORE_API DiskAnnIndex : public Index {
   int GenerateHolder();
 
  private:
-  int CommitBuiltSnapshot();
+  int CommitBuiltSnapshot(bool *snapshot_replaced);
 
   DiskAnnIndexParam param_{};
-  std::mutex mutex_{};
+  mutable std::mutex mutex_{};
   bool is_training_{false};
   std::map<uint64_t, std::string> doc_cache_;
   core::IndexHolder::Pointer holder_{};

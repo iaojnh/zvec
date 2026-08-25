@@ -47,8 +47,19 @@ int DiskAnnPqTrainer::gen_random_sample(IndexHolder::Pointer holder,
   }
 
   const size_t holder_count = holder->count();
+  long double requested_sample_count =
+      static_cast<long double>(holder_count) * train_sample_ratio_;
+  const long double nearest_integer = std::round(requested_sample_count);
+  const long double rounding_tolerance =
+      std::numeric_limits<double>::epsilon() *
+      (std::max)(1.0L, std::fabs(requested_sample_count));
+  if (std::fabs(requested_sample_count - nearest_integer) <=
+      rounding_tolerance) {
+    requested_sample_count = nearest_integer;
+  }
   const size_t ratio_sample_count = static_cast<size_t>(
-      std::ceil(static_cast<long double>(holder_count) * train_sample_ratio_));
+      std::ceil((std::min)(requested_sample_count,
+                           static_cast<long double>(max_train_sample_count_))));
   const size_t target_sample_count =
       (std::min)({holder_count, ratio_sample_count,
                   static_cast<size_t>(max_train_sample_count_)});

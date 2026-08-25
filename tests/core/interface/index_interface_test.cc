@@ -251,6 +251,7 @@ TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
   ASSERT_EQ(0, index->add(VectorData{DenseVector{first_vector.data()}}, 2));
   ASSERT_EQ(0, index->add(VectorData{DenseVector{second_vector.data()}},
                           kSparseDocId));
+  EXPECT_EQ(2U, index->get_doc_count());
   EXPECT_EQ(zvec::core::IndexError_InvalidArgument,
             index->add(VectorData{DenseVector{nullptr}}, 8));
   EXPECT_EQ(zvec::core::IndexError_OutOfRange,

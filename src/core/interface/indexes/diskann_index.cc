@@ -52,13 +52,21 @@ std::string MakeSnapshotTemporaryPath(const std::string &file_path) {
          ".tmp";
 }
 
-bool ReplaceFileAtomically(const std::string &source,
-                           const std::string &destination) {
+enum class SnapshotReplaceResult {
+  kNotReplaced,
+  kReplaced,
+  kReplacedNotDurable,
+};
+
+SnapshotReplaceResult ReplaceFileAtomically(const std::string &source,
+                                            const std::string &destination) {
 #if defined(_WIN32) || defined(_WIN64)
   const auto source_path = ailego::FileHelper::PathFromUtf8(source);
   const auto destination_path = ailego::FileHelper::PathFromUtf8(destination);
   return ::MoveFileExW(source_path.c_str(), destination_path.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0
+             ? SnapshotReplaceResult::kReplaced
+             : SnapshotReplaceResult::kNotReplaced;
 #else
   const size_t separator = destination.rfind('/');
   const std::string parent_directory =
@@ -78,14 +86,14 @@ bool ReplaceFileAtomically(const std::string &source,
     directory_fd = ::open(parent_directory.c_str(), flags);
   } while (directory_fd < 0 && errno == EINTR);
   if (directory_fd < 0) {
-    return false;
+    return SnapshotReplaceResult::kNotReplaced;
   }
 
   if (!ailego::File::Rename(source, destination)) {
     const int rename_error = errno;
     ::close(directory_fd);
     errno = rename_error;
-    return false;
+    return SnapshotReplaceResult::kNotReplaced;
   }
 
   int sync_result;
@@ -96,13 +104,22 @@ bool ReplaceFileAtomically(const std::string &source,
   ::close(directory_fd);
   if (sync_result != 0) {
     errno = sync_error;
+    return SnapshotReplaceResult::kReplacedNotDurable;
   }
-  return sync_result == 0;
+  return SnapshotReplaceResult::kReplaced;
 #endif
 }
 
 }  // namespace
 #endif
+
+uint32_t DiskAnnIndex::get_doc_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_trained_) {
+    return static_cast<uint32_t>(doc_cache_.size());
+  }
+  return Index::get_doc_count();
+}
 
 #if !DISKANN_SUPPORTED
 
@@ -125,7 +142,10 @@ int DiskAnnIndex::GenerateHolder() {
   return core::IndexError_Unsupported;
 }
 
-int DiskAnnIndex::CommitBuiltSnapshot() {
+int DiskAnnIndex::CommitBuiltSnapshot(bool *snapshot_replaced) {
+  if (snapshot_replaced != nullptr) {
+    *snapshot_replaced = false;
+  }
   LOG_ERROR("DiskAnn is not supported on this platform");
   return core::IndexError_Unsupported;
 }
@@ -279,7 +299,10 @@ int DiskAnnIndex::GenerateHolder() {
                               converter_, &holder_);
 }
 
-int DiskAnnIndex::CommitBuiltSnapshot() {
+int DiskAnnIndex::CommitBuiltSnapshot(bool *snapshot_replaced) {
+  if (snapshot_replaced != nullptr) {
+    *snapshot_replaced = false;
+  }
   if (builder_ == nullptr || file_path_.empty()) {
     LOG_ERROR("Cannot commit an uninitialized DiskAnn snapshot");
     return core::IndexError_NoReady;
@@ -357,23 +380,41 @@ int DiskAnnIndex::CommitBuiltSnapshot() {
     return core::IndexError_Runtime;
   }
 
-  if (!ReplaceFileAtomically(temporary_path, file_path_)) {
+  const SnapshotReplaceResult replace_result =
+      ReplaceFileAtomically(temporary_path, file_path_);
+  if (replace_result == SnapshotReplaceResult::kNotReplaced) {
     LOG_ERROR("Failed to atomically replace DiskAnn index, path: %s, err: %s",
               file_path_.c_str(),
               ailego::FileHelper::GetLastErrorString().c_str());
     return core::IndexError_Runtime;
   }
   temporary_committed = true;
+  if (snapshot_replaced != nullptr) {
+    *snapshot_replaced = true;
+  }
 
-  auto previous_streamer = std::move(streamer_);
-  auto previous_storage = std::move(storage_);
-  streamer_ = std::move(replacement_streamer);
-  storage_ = std::move(replacement_storage);
+  core::IndexStreamer::Pointer previous_streamer;
+  core::IndexStorage::Pointer previous_storage;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    previous_streamer = std::move(streamer_);
+    previous_storage = std::move(storage_);
+    streamer_ = std::move(replacement_streamer);
+    storage_ = std::move(replacement_storage);
+  }
   if (previous_streamer != nullptr && previous_streamer->unload() != 0) {
     LOG_WARN("Failed to unload previous DiskAnn snapshot after replacement");
   }
   if (previous_storage != nullptr && previous_storage->close() != 0) {
     LOG_WARN("Failed to close previous DiskAnn storage after replacement");
+  }
+
+  if (replace_result == SnapshotReplaceResult::kReplacedNotDurable) {
+    LOG_ERROR(
+        "DiskAnn snapshot was replaced but its directory entry could not be "
+        "made durable, path: %s, err: %s",
+        file_path_.c_str(), ailego::FileHelper::GetLastErrorString().c_str());
+    return core::IndexError_WriteData;
   }
 
   return 0;
@@ -483,8 +524,9 @@ int DiskAnnIndex::train() {
     LOG_ERROR("Failed to build index, err: %s", core::IndexError::What(ret));
     return return_training_failure(ret);
   }
-  ret = CommitBuiltSnapshot();
-  if (ret != 0) {
+  bool snapshot_replaced = false;
+  ret = CommitBuiltSnapshot(&snapshot_replaced);
+  if (ret != 0 && !snapshot_replaced) {
     return return_training_failure(ret);
   }
   // The committed streamer owns the searchable snapshot. Drop all build-time
@@ -503,7 +545,7 @@ int DiskAnnIndex::train() {
   if (converter_ != nullptr && converter_->cleanup() != 0) {
     LOG_WARN("Failed to release DiskAnn converter memory after training");
   }
-  return 0;
+  return ret;
 }
 
 int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
@@ -616,11 +658,28 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
     return core::IndexError_Runtime;
   }
 
-  const bool was_trained = is_trained_;
+  bool was_trained = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_training_) {
+      LOG_ERROR("DiskAnn index is already training or merging");
+      return core::IndexError_NoReady;
+    }
+    is_training_ = true;
+    was_trained = is_trained_;
+  }
+  AILEGO_DEFER([&]() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_training_ = false;
+  });
+
   const core::IndexMeta &build_meta =
       converter_ != nullptr ? converter_->meta() : proxima_index_meta_;
   auto rollback_training_state = [&]() {
-    is_trained_ = was_trained;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      is_trained_ = was_trained;
+    }
     holder_.reset();
     if (converter_ != nullptr && converter_->cleanup() != 0) {
       LOG_ERROR(
@@ -635,7 +694,7 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
 
   // A DiskAnn builder is single-use. Reinitialize it before rebuilding an
   // already trained target so repeated merge calls behave like other indexes.
-  if (is_trained_) {
+  if (was_trained) {
     if (builder_ == nullptr || builder_->cleanup() != 0) {
       LOG_ERROR("Failed to reset DiskAnn builder before merge");
       return core::IndexError_Runtime;
@@ -651,8 +710,9 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
     rollback_training_state();
     return pre_ret;
   }
-  const int ret = CommitBuiltSnapshot();
-  if (ret != 0) {
+  bool snapshot_replaced = false;
+  const int ret = CommitBuiltSnapshot(&snapshot_replaced);
+  if (ret != 0 && !snapshot_replaced) {
     rollback_training_state();
     return ret;
   }
@@ -669,7 +729,7 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
   if (converter_ != nullptr && converter_->cleanup() != 0) {
     LOG_WARN("Failed to release DiskAnn converter memory after merge");
   }
-  return 0;
+  return ret;
 }
 
 #endif  // DISKANN_SUPPORTED
