@@ -451,7 +451,7 @@ TEST(IndexInterface, DiskAnnSupportsRepeatedMerge) {
 }
 
 TEST(IndexInterface, DiskAnnContextUsesCurrentIndexListSize) {
-  constexpr uint32_t kDimension = 8;
+  static constexpr uint32_t kDimension = 8;
   constexpr uint32_t kLargeDocCount = 32;
   const std::string small_path{"diskann_context_small.index"};
   const std::string large_path{"diskann_context_large.index"};
