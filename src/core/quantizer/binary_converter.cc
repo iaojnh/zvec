@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <iterator>
+#include <new>
 #include <ailego/algorithm/binary_quantizer.h>
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
@@ -45,7 +46,7 @@ class BinaryConverterHolder : public IndexHolder {
 
     //! Retrieve pointer of data
     const void *data(void) const override {
-      return buffer_.data();
+      return data_valid_ ? buffer_.data() : nullptr;
     }
 
     //! Test if the iterator is valid
@@ -67,10 +68,16 @@ class BinaryConverterHolder : public IndexHolder {
    private:
     //! Encode the data by quantizer
     inline void encode_record(void) {
-      if (front_iter_->is_valid()) {
-        const float *vec = reinterpret_cast<const float *>(front_iter_->data());
-        quantizer_->encode(vec, dim_ / 2, buffer_.data());
+      data_valid_ = false;
+      if (!front_iter_->is_valid()) {
+        return;
       }
+      const float *vec = static_cast<const float *>(front_iter_->data());
+      if (!vec || !quantizer_) {
+        return;
+      }
+      quantizer_->encode(vec, dim_ / 2, buffer_.data());
+      data_valid_ = true;
     }
 
     //! Members
@@ -78,6 +85,7 @@ class BinaryConverterHolder : public IndexHolder {
     IndexHolder::Iterator::Pointer front_iter_{};
     std::shared_ptr<ailego::BinaryQuantizer> quantizer_{};
     size_t dim_{0u};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -155,6 +163,11 @@ class BinaryConverter : public IndexConverter {
     }
 
     dimension_ = meta_.dimension();
+
+    quantizer_.reset(new (std::nothrow) ailego::BinaryQuantizer());
+    if (!quantizer_) {
+      return IndexError_NoMemory;
+    }
 
     size_t dim =
         ailego::BinaryQuantizer::EncodedSizeInBinary32(dimension_) * 32u;

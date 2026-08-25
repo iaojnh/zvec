@@ -49,7 +49,7 @@ class IntegerQuantizerConverterHolder : public IndexHolder {
 
     //! Retrieve pointer of data
     const void *data(void) const override {
-      return buffer_.data();
+      return data_valid_ ? buffer_.data() : nullptr;
     }
 
     //! Test if the iterator is valid
@@ -71,12 +71,18 @@ class IntegerQuantizerConverterHolder : public IndexHolder {
    private:
     //! Encode the data by quantizer
     inline void encode_record(void) {
-      if (front_iter_->is_valid()) {
-        const float *vec = reinterpret_cast<const float *>(front_iter_->data());
-        quantizer_->encode(
-            vec, dim_,
-            reinterpret_cast<typename Quantizer::ValueType *>(buffer_.data()));
+      data_valid_ = false;
+      if (!front_iter_->is_valid()) {
+        return;
       }
+      const float *vec = static_cast<const float *>(front_iter_->data());
+      if (!vec) {
+        return;
+      }
+      quantizer_->encode(
+          vec, dim_,
+          reinterpret_cast<typename Quantizer::ValueType *>(buffer_.data()));
+      data_valid_ = true;
     }
 
     //! Members
@@ -84,6 +90,7 @@ class IntegerQuantizerConverterHolder : public IndexHolder {
     IndexHolder::Iterator::Pointer front_iter_{};
     std::shared_ptr<Quantizer> quantizer_{};
     size_t dim_{0u};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -228,7 +235,11 @@ class IntegerQuantizerConverter : public IndexConverter {
         float max = -std::numeric_limits<float>::max();
         float min = std::numeric_limits<float>::max();
         for (; iter->is_valid(); iter->next()) {
-          const float *vec = reinterpret_cast<const float *>(iter->data());
+          const float *vec = static_cast<const float *>(iter->data());
+          if (!vec) {
+            LOG_ERROR("Failed to read holder data while training quantizer");
+            return IndexError_ReadData;
+          }
           for (size_t i = 0; i < meta_.dimension(); ++i) {
             max = std::max(max, vec[i]);
             min = std::min(min, vec[i]);
@@ -244,9 +255,13 @@ class IntegerQuantizerConverter : public IndexConverter {
           return IndexError_Runtime;
         }
         for (; iter->is_valid(); iter->next()) {
+          const float *vec = static_cast<const float *>(iter->data());
+          if (!vec) {
+            LOG_ERROR("Failed to read holder data while training quantizer");
+            return IndexError_ReadData;
+          }
           (*stats_.mutable_trained_count())++;
-          quantizer_->feed(reinterpret_cast<const float *>(iter->data()),
-                           meta_.dimension());
+          quantizer_->feed(vec, meta_.dimension());
         }
       }
     } else {
@@ -260,7 +275,11 @@ class IntegerQuantizerConverter : public IndexConverter {
       float max = -std::numeric_limits<float>::max();
       float min = std::numeric_limits<float>::max();
       for (; iter->is_valid(); iter->next()) {
-        const float *vec = reinterpret_cast<const float *>(iter->data());
+        const float *vec = static_cast<const float *>(iter->data());
+        if (!vec) {
+          LOG_ERROR("Failed to read holder data while training quantizer");
+          return IndexError_ReadData;
+        }
         for (size_t i = 0; i < meta_.dimension(); ++i) {
           max = std::max(max, vec[i]);
           min = std::min(min, vec[i]);
@@ -512,7 +531,7 @@ class IntegerStreamingConverter : public IndexConverter {
 
       //! Retrieve pointer of data
       const void *data(void) const override {
-        return buffer_.data();
+        return data_valid_ ? buffer_.data() : nullptr;
       }
 
       //! Test if the iterator is valid
@@ -534,28 +553,31 @@ class IntegerStreamingConverter : public IndexConverter {
      private:
       //! Encode the data by quantizer
       void encode_record(void) {
-        if (front_iter_->is_valid()) {
-          const float *vec =
-              reinterpret_cast<const float *>(front_iter_->data());
-          size_t dim = owner_->dimension_;
-          if (owner_->rotator_) {
-            float *rotate_buf =
-                reinterpret_cast<float *>(rotate_buffer_.data());
-            owner_->rotator_->rotate(vec, rotate_buf);
-            vec = rotate_buf;
-          }
-          if (owner_->enable_normalize_) {
-            float norm = 0.0;
-            memcpy((void *)normalize_buffer_.data(), vec, dim * sizeof(float));
-            ailego::Normalizer<float>::L2((float *)normalize_buffer_.data(),
-                                          dim, &norm);
-            vec = (float *)normalize_buffer_.data();
-          }
-
-          RecordQuantizer::quantize_record(vec, dim, owner_->data_type(),
-                                           owner_->is_euclidean_,
-                                           buffer_.data());
+        data_valid_ = false;
+        if (!front_iter_->is_valid()) {
+          return;
         }
+        const float *vec = static_cast<const float *>(front_iter_->data());
+        if (!vec) {
+          return;
+        }
+        size_t dim = owner_->dimension_;
+        if (owner_->rotator_) {
+          float *rotate_buf = reinterpret_cast<float *>(rotate_buffer_.data());
+          owner_->rotator_->rotate(vec, rotate_buf);
+          vec = rotate_buf;
+        }
+        if (owner_->enable_normalize_) {
+          float norm = 0.0;
+          memcpy((void *)normalize_buffer_.data(), vec, dim * sizeof(float));
+          ailego::Normalizer<float>::L2((float *)normalize_buffer_.data(), dim,
+                                        &norm);
+          vec = (float *)normalize_buffer_.data();
+        }
+
+        RecordQuantizer::quantize_record(vec, dim, owner_->data_type(),
+                                         owner_->is_euclidean_, buffer_.data());
+        data_valid_ = true;
       }
 
       //! Members
@@ -564,6 +586,7 @@ class IntegerStreamingConverter : public IndexConverter {
       std::string normalize_buffer_{};
       std::string rotate_buffer_{};
       IndexHolder::Iterator::Pointer front_iter_{};
+      bool data_valid_{false};
     };
 
     //! Constructor

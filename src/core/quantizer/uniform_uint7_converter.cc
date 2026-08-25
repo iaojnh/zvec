@@ -130,7 +130,11 @@ class UniformUint7Converter : public IndexConverter {
 
     bool all_integer = true;
     for (; iter->is_valid(); iter->next()) {
-      const float *vec = reinterpret_cast<const float *>(iter->data());
+      const float *vec = static_cast<const float *>(iter->data());
+      if (!vec) {
+        LOG_ERROR("UniformUint7Converter: failed to read training vector");
+        return IndexError_ReadData;
+      }
       for (size_t i = 0; i < original_dimension_; ++i) {
         float v = vec[i];
         if (!std::isfinite(v)) {
@@ -254,7 +258,7 @@ class UniformUint7Converter : public IndexConverter {
       ~Iterator(void) override {}
 
       const void *data(void) const override {
-        return buffer_.data();
+        return data_valid_ ? buffer_.data() : nullptr;
       }
 
       bool is_valid(void) const override {
@@ -272,10 +276,14 @@ class UniformUint7Converter : public IndexConverter {
 
      private:
       void encode_record(void) {
+        data_valid_ = false;
         if (!front_iter_->is_valid()) {
           return;
         }
-        const float *vec = reinterpret_cast<const float *>(front_iter_->data());
+        const float *vec = static_cast<const float *>(front_iter_->data());
+        if (!vec) {
+          return;
+        }
         int8_t *out = buffer_.data();
         const float scale = owner_->scale_;
         const float bias = owner_->bias_;
@@ -283,6 +291,7 @@ class UniformUint7Converter : public IndexConverter {
 
         if (owner_->quantize_func_ != nullptr) {
           owner_->quantize_func_(vec, dim, scale, bias, out);
+          data_valid_ = true;
           return;
         }
         for (size_t i = 0; i < dim; ++i) {
@@ -292,11 +301,13 @@ class UniformUint7Converter : public IndexConverter {
           v = std::max(0.0f, std::min(127.0f, v));
           out[i] = static_cast<int8_t>(v);
         }
+        data_valid_ = true;
       }
 
       const UniformUint7Holder *owner_{nullptr};
       std::vector<int8_t> buffer_{};
       IndexHolder::Iterator::Pointer front_iter_{};
+      bool data_valid_{false};
     };
 
     UniformUint7Holder(IndexHolder::Pointer front, size_t original_dim,

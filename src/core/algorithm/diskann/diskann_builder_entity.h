@@ -50,8 +50,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   int init(const IndexMeta &meta, uint32_t max_degree, uint32_t list_size,
            double memory_limit, uint32_t build_threads);
 
-  int dump(IndexHolder::Pointer holder, IndexMeta &meta,
-           const IndexDumper::Pointer &dumper);
+  int dump(IndexMeta &meta, const IndexDumper::Pointer &dumper);
 
   int64_t dump_segment(const IndexDumper::Pointer &dumper,
                        const std::string &segment_id, const void *data,
@@ -63,7 +62,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   int dump_entrypoint_segment(const IndexDumper::Pointer &dumper) const;
   int dump_key_segment(const IndexDumper::Pointer &dumper) const;
 
-  int reserve_space(uint32_t docs);
+  int reserve_space(size_t docs);
 
   std::vector<uint8_t> &pq_full_pivot_data() {
     return pq_full_pivot_data_;

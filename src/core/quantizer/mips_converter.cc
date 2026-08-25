@@ -90,7 +90,7 @@ class MipsConverterHolder : public IndexHolder {
 
     //! Retrieve pointer of data
     const void *data(void) const override {
-      return buffer_.data();
+      return data_valid_ ? buffer_.data() : nullptr;
     }
 
     //! Test if the iterator is valid
@@ -112,11 +112,15 @@ class MipsConverterHolder : public IndexHolder {
    private:
     //! Transform the data
     void transform_data(void) {
+      data_valid_ = false;
       if (!front_iter_->is_valid()) {
         return;
       }
 
-      const float *src = reinterpret_cast<const float *>(front_iter_->data());
+      const float *src = static_cast<const float *>(front_iter_->data());
+      if (!src) {
+        return;
+      }
       float *dst = buffer_.data();
       if (!spherical_injection_) {
         ConvertRepeatedQuadraticInjection(src, buffer_.size() - m_value_,
@@ -125,6 +129,7 @@ class MipsConverterHolder : public IndexHolder {
         ConvertSphericalInjection(src, buffer_.size() - m_value_, u_value_,
                                   l2_norm_, dst);
       }
+      data_valid_ = true;
     }
 
     std::vector<float> buffer_{};
@@ -133,6 +138,7 @@ class MipsConverterHolder : public IndexHolder {
     float l2_norm_{0.0f};
     bool spherical_injection_{false};
     IndexHolder::Iterator::Pointer front_iter_{};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -218,7 +224,7 @@ class MipsConverterForcedHalfHolder : public IndexHolder {
 
     //! Retrieve pointer of data
     const void *data(void) const override {
-      return buffer_.data();
+      return data_valid_ ? buffer_.data() : nullptr;
     }
 
     //! Test if the iterator is valid
@@ -239,11 +245,15 @@ class MipsConverterForcedHalfHolder : public IndexHolder {
 
    private:
     void transform_record(void) {
+      data_valid_ = false;
       if (!front_iter_->is_valid()) {
         return;
       }
 
-      const float *src = reinterpret_cast<const float *>(front_iter_->data());
+      const float *src = static_cast<const float *>(front_iter_->data());
+      if (!src) {
+        return;
+      }
       ailego::Float16 *dst = buffer_.data();
       if (!spherical_injection_) {
         ConvertRepeatedQuadraticInjection(src, buffer_.size() - m_value_,
@@ -252,6 +262,7 @@ class MipsConverterForcedHalfHolder : public IndexHolder {
         ConvertSphericalInjection(src, buffer_.size() - m_value_, u_value_,
                                   l2_norm_, dst);
       }
+      data_valid_ = true;
     }
 
     std::vector<ailego::Float16> buffer_{};
@@ -260,6 +271,7 @@ class MipsConverterForcedHalfHolder : public IndexHolder {
     float l2_norm_{0.0f};
     bool spherical_injection_{false};
     IndexHolder::Iterator::Pointer front_iter_{};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -347,7 +359,7 @@ class MipsConverterHalfHolder : public IndexHolder {
 
     //! Retrieve pointer of data
     const void *data(void) const override {
-      return buffer_.data();
+      return data_valid_ ? buffer_.data() : nullptr;
     }
 
     //! Test if the iterator is valid
@@ -368,12 +380,16 @@ class MipsConverterHalfHolder : public IndexHolder {
 
    private:
     void transform_record(void) {
+      data_valid_ = false;
       if (!front_iter_->is_valid()) {
         return;
       }
 
       const ailego::Float16 *src =
-          reinterpret_cast<const ailego::Float16 *>(front_iter_->data());
+          static_cast<const ailego::Float16 *>(front_iter_->data());
+      if (!src) {
+        return;
+      }
       ailego::Float16 *dst = buffer_.data();
       if (!spherical_injection_) {
         ConvertRepeatedQuadraticInjection(src, buffer_.size() - m_value_,
@@ -382,6 +398,7 @@ class MipsConverterHalfHolder : public IndexHolder {
         ConvertSphericalInjection(src, buffer_.size() - m_value_, u_value_,
                                   l2_norm_, dst);
       }
+      data_valid_ = true;
     }
 
     std::vector<ailego::Float16> buffer_{};
@@ -390,6 +407,7 @@ class MipsConverterHalfHolder : public IndexHolder {
     float l2_norm_{0.0f};
     bool spherical_injection_{false};
     IndexHolder::Iterator::Pointer front_iter_{};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -533,10 +551,14 @@ class MipsConverter : public IndexConverter {
     switch (holder->data_type()) {
       case IndexMeta::DataType::DT_FP16:
         for (; iter->is_valid(); iter->next()) {
+          const auto *vector =
+              static_cast<const ailego::Float16 *>(iter->data());
+          if (!vector) {
+            LOG_ERROR("Failed to read holder data while training MIPS");
+            return IndexError_ReadData;
+          }
           float score = 0.0f;
-          ailego::Norm2Matrix<ailego::Float16, 1>::Compute(
-              reinterpret_cast<const ailego::Float16 *>(iter->data()), dim,
-              &score);
+          ailego::Norm2Matrix<ailego::Float16, 1>::Compute(vector, dim, &score);
 
           if (score > l2_norm_) {
             l2_norm_ = score;
@@ -550,9 +572,13 @@ class MipsConverter : public IndexConverter {
 
       case IndexMeta::DataType::DT_FP32:
         for (; iter->is_valid(); iter->next()) {
+          const auto *vector = static_cast<const float *>(iter->data());
+          if (!vector) {
+            LOG_ERROR("Failed to read holder data while training MIPS");
+            return IndexError_ReadData;
+          }
           float score = 0.0f;
-          ailego::Norm2Matrix<float, 1>::Compute(
-              reinterpret_cast<const float *>(iter->data()), dim, &score);
+          ailego::Norm2Matrix<float, 1>::Compute(vector, dim, &score);
 
           if (score > l2_norm_) {
             l2_norm_ = score;

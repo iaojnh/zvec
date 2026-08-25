@@ -645,22 +645,34 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
     return IndexError_Runtime;
   }
 
-  if (ailego_unlikely(holder->count() == 0)) {
+  const size_t declared_count = holder->count();
+  if (ailego_unlikely(declared_count == 0)) {
     LOG_ERROR("Holder is empty");
-    return IndexError_Runtime;
+    return IndexError_InvalidLength;
   }
 
-  int ret = entity_.reserve_space(holder->count());
+  int ret = entity_.reserve_space(declared_count);
+  if (ailego_unlikely(ret != 0)) {
+    return ret;
+  }
 
   errcode_ = 0;
   error_.store(false, std::memory_order_release);
   while (iter->is_valid()) {
+    if (ailego_unlikely(entity_.doc_cnt() >= declared_count)) {
+      LOG_ERROR("Holder contains more vectors than its declared count");
+      return IndexError_InvalidLength;
+    }
     ret = entity_.add_vector(iter->key(), iter->data());
     if (ailego_unlikely(ret != 0)) {
       return ret;
     }
 
     iter->next();
+  }
+  if (ailego_unlikely(entity_.doc_cnt() != declared_count)) {
+    LOG_ERROR("Holder ended before its declared vector count");
+    return IndexError_InvalidLength;
   }
 
   LOG_INFO("Finished saving vector");
@@ -690,6 +702,7 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   }
 
   state_ = BUILD_STATE_BUILT;
+  holder_.reset();
 
   stats_.set_built_count(entity_.doc_cnt());
   stats_.set_built_costtime(ailego::Monotime::MilliSeconds() - start_time);
@@ -716,14 +729,13 @@ int DiskAnnBuilder::dump(const IndexDumper::Pointer &dumper) {
     return ret;
   }
 
-  ret = entity_.dump(holder_, raw_meta_, dumper);
+  ret = entity_.dump(raw_meta_, dumper);
   if (ret != 0) {
     LOG_ERROR("Index dump failed, ret: %u", ret);
-
-    return IndexError_Runtime;
+    return ret;
   }
 
-  stats_.set_dumped_count(holder_->count());
+  stats_.set_dumped_count(entity_.doc_cnt());
   stats_.set_dumped_costtime(ailego::Monotime::MilliSeconds() - start_time);
 
   LOG_INFO("DiskAnnBuilder::dump");

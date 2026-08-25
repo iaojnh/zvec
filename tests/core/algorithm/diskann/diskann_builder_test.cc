@@ -87,6 +87,11 @@ TEST_F(DiskAnnBuilderTest, TestGeneral) {
 
   ASSERT_EQ(0, builder->build(holder));
 
+  // Dump must use the vectors captured by build, not reread a holder that may
+  // have changed after the graph and PQ data were finalized.
+  NumericalVector<float> late_vector(dim, -1.0F);
+  ASSERT_TRUE(holder->emplace(doc_cnt, late_vector));
+
   auto dumper = IndexFactory::CreateDumper("FileDumper");
   ASSERT_NE(dumper, nullptr);
 
@@ -199,6 +204,10 @@ TEST_F(DiskAnnBuilderTest, RejectsInvalidGraphAndSamplingParameters) {
             entity.init(*_index_meta_ptr, 0, 1, 0.0, 1));
   EXPECT_EQ(IndexError_InvalidArgument,
             entity.init(*_index_meta_ptr, 1, 0, 0.0, 1));
+  ASSERT_EQ(0, entity.init(*_index_meta_ptr, 1, 1, 0.0, 1));
+  EXPECT_EQ(IndexError_InvalidLength, entity.reserve_space(0));
+  EXPECT_EQ(IndexError_InvalidLength,
+            entity.reserve_space((std::numeric_limits<size_t>::max)()));
 }
 
 TEST_F(DiskAnnBuilderTest, PqSamplingUsesRatioAndWholeDataset) {
