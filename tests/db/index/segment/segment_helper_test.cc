@@ -106,8 +106,10 @@ class SegmentHelperTest : public testing::Test {
                                   const VersionManager::Ptr &version_manager,
                                   int concurrency = 1) {
     const bool forward_use_parquet = false;
+    const bool enable_mmap = true;
     CompactTask task(col_path, schema, std::move(segments), output_segment_id,
-                     std::move(filter), forward_use_parquet, concurrency);
+                     std::move(filter), forward_use_parquet, enable_mmap,
+                     concurrency);
     auto segment_task = SegmentTask::CreateCompactTask(task);
     EXPECT_NE(segment_task, nullptr);
     if (segment_task == nullptr) return {task, nullptr};
@@ -125,9 +127,8 @@ class SegmentHelperTest : public testing::Test {
     auto dst_path = FileHelper::MakeSegmentPath(col_path, output_segment_id);
     EXPECT_TRUE(FileHelper::MoveDirectory(tmp_path, dst_path));
 
-    SegmentOptions read_options{true, !forward_use_parquet,
-                                DEFAULT_MAX_BUFFER_SIZE};
-    version_manager->set_enable_mmap(!forward_use_parquet);
+    SegmentOptions read_options{true, enable_mmap, DEFAULT_MAX_BUFFER_SIZE};
+    version_manager->set_enable_mmap(enable_mmap);
     auto seg_ret =
         Segment::Open(col_path, *schema, *executed.output_segment_meta_, id_map,
                       delete_store, version_manager, read_options);
