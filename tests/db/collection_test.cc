@@ -2912,7 +2912,7 @@ TEST_F(CollectionTest, Feature_Optimize_General) {
     stats = collection->stats().value();
     ASSERT_EQ(stats.doc_count, doc_count);
     ASSERT_EQ(stats.index_completeness["dense_fp32"], 1);
-    auto storage_mode = collection->DebugGetHnswStorageMode("dense_fp32");
+    auto storage_mode = collection->debug_get_hnsw_storage_mode("dense_fp32");
     ASSERT_TRUE(storage_mode.has_value());
     ASSERT_EQ(enable_mmap ? "mmap" : "buffer_pool", storage_mode.value());
 
@@ -2924,7 +2924,7 @@ TEST_F(CollectionTest, Feature_Optimize_General) {
     ASSERT_TRUE(result.has_value());
     collection = std::move(result.value());
 
-    storage_mode = collection->DebugGetHnswStorageMode("dense_fp32");
+    storage_mode = collection->debug_get_hnsw_storage_mode("dense_fp32");
     ASSERT_TRUE(storage_mode.has_value());
     ASSERT_EQ(enable_mmap ? "mmap" : "buffer_pool", storage_mode.value());
 
@@ -2964,7 +2964,7 @@ TEST_F(CollectionTest, Feature_BufferStorage_OnlineWriteAndOptimize) {
     query.target_.set_vector(
         std::string(reinterpret_cast<const char *>(vector.value().data()),
                     vector.value().size() * sizeof(float)));
-    auto result = collection->Query(query);
+    auto result = collection->query(query);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(1U, result.value().size());
     ASSERT_EQ(TestHelper::MakePK(doc_id), result.value()[0]->pk());
@@ -2976,11 +2976,11 @@ TEST_F(CollectionTest, Feature_BufferStorage_OnlineWriteAndOptimize) {
   auto pool_stats = ailego::MemoryLimitPool::get_instance().stats();
   ASSERT_GT(pool_stats.page_used, 0U);
   ASSERT_LE(pool_stats.used, pool_stats.pool_size);
-  ASSERT_TRUE(collection->Flush().ok());
+  ASSERT_TRUE(collection->flush().ok());
   check_query(7);
 
-  ASSERT_TRUE(collection->Optimize().ok());
-  auto storage_mode = collection->DebugGetHnswStorageMode("dense_fp32");
+  ASSERT_TRUE(collection->optimize().ok());
+  auto storage_mode = collection->debug_get_hnsw_storage_mode("dense_fp32");
   ASSERT_TRUE(storage_mode.has_value());
   ASSERT_EQ("buffer_pool", storage_mode.value());
   pool_stats = ailego::MemoryLimitPool::get_instance().stats();
@@ -2994,8 +2994,8 @@ TEST_F(CollectionTest, Feature_BufferStorage_OnlineWriteAndOptimize) {
       TestHelper::CollectionInsertDoc(collection, kDocCount, kDocCount + 16)
           .ok());
   check_query(kDocCount + 3);
-  ASSERT_TRUE(collection->Optimize().ok());
-  storage_mode = collection->DebugGetHnswStorageMode("dense_fp32");
+  ASSERT_TRUE(collection->optimize().ok());
+  storage_mode = collection->debug_get_hnsw_storage_mode("dense_fp32");
   ASSERT_TRUE(storage_mode.has_value());
   ASSERT_EQ("buffer_pool", storage_mode.value());
   check_query(7);
@@ -3005,7 +3005,7 @@ TEST_F(CollectionTest, Feature_BufferStorage_OnlineWriteAndOptimize) {
   auto reopened = Collection::Open(col_path, options);
   ASSERT_TRUE(reopened.has_value());
   collection = std::move(reopened.value());
-  storage_mode = collection->DebugGetHnswStorageMode("dense_fp32");
+  storage_mode = collection->debug_get_hnsw_storage_mode("dense_fp32");
   ASSERT_TRUE(storage_mode.has_value());
   ASSERT_EQ("buffer_pool", storage_mode.value());
   check_query(7);
