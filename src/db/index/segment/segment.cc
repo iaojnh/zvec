@@ -297,6 +297,9 @@ class SegmentImpl : public Segment,
       const std::string &index_file_path, const std::string &column,
       const FieldSchema &field, int concurrency);
 
+  Status reopen_vector_indexer_for_serving(
+      const VectorColumnIndexer::Ptr &vector_indexer);
+
   // Helper functions for Insert/Update/Upsert/Delete
   template <typename ValueType>
   Status InsertScalar(InvertedColumnIndexer::Ptr &indexer, const Doc &doc,
@@ -1488,6 +1491,10 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
   vector_column_params::MergeOptions merge_options;
   if (concurrency == 0) {
     merge_options.pool = GlobalResource::Instance().optimize_thread_pool();
+    if (merge_options.pool == nullptr) {
+      return tl::make_unexpected(
+          Status::InternalError("Optimize thread pool initialization failed"));
+    }
     merge_options.write_concurrency =
         static_cast<uint32_t>(merge_options.pool->count());
   } else {
@@ -1498,7 +1505,25 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
   s = vector_indexer->Flush();
   CHECK_RETURN_STATUS_EXPECTED(s);
 
+  s = reopen_vector_indexer_for_serving(vector_indexer);
+  CHECK_RETURN_STATUS_EXPECTED(s);
+
   return vector_indexer;
+}
+
+Status SegmentImpl::reopen_vector_indexer_for_serving(
+    const VectorColumnIndexer::Ptr &vector_indexer) {
+  if (options_.enable_mmap_) {
+    return Status::OK();
+  }
+  if (vector_indexer == nullptr) {
+    return Status::InvalidArgument("Vector indexer is null");
+  }
+
+  auto s = vector_indexer->Close();
+  CHECK_RETURN_STATUS(s);
+  return vector_indexer->Open(
+      vector_column_params::ReadOptions{false, false, true});
 }
 
 Status SegmentImpl::create_vector_index(
@@ -1714,6 +1739,9 @@ Status SegmentImpl::drop_vector_index(
   s = new_vector_indexer->Merge(vector_indexers_[column], nullptr);
   CHECK_RETURN_STATUS(s);
   s = new_vector_indexer->Flush();
+  CHECK_RETURN_STATUS(s);
+
+  s = reopen_vector_indexer_for_serving(new_vector_indexer);
   CHECK_RETURN_STATUS(s);
 
   (*vector_indexers)[column] = new_vector_indexer;
@@ -3364,11 +3392,6 @@ Status SegmentImpl::alter_column(const std::string &column_name,
     persist_stores_.erase(persist_stores_.begin() + local_idx);
   }
 
-  if (!options_.enable_mmap_) {
-    zvec::ailego::MemoryLimitPool::get_instance().init(
-        GlobalConfig::Instance().memory_limit_bytes());
-  }
-
   // delete single column store file
   for (auto block_id : will_del_block_ids) {
     // delete forward store file
@@ -3457,11 +3480,6 @@ Status SegmentImpl::drop_column(const std::string &column_name) {
        idx >= 0; idx--) {
     int local_idx = will_del_local_block_idx[idx];
     persist_stores_.erase(persist_stores_.begin() + local_idx);
-  }
-
-  if (!options_.enable_mmap_) {
-    zvec::ailego::MemoryLimitPool::get_instance().init(
-        GlobalConfig::Instance().memory_limit_bytes());
   }
 
   // delete single column store file
@@ -4050,7 +4068,7 @@ VectorColumnIndexer::Ptr SegmentImpl::create_vector_indexer(
 
   auto vector_indexer =
       std::make_shared<VectorColumnIndexer>(index_file_path, field);
-  vector_column_params::ReadOptions options{true, true};
+  vector_column_params::ReadOptions options{options_.enable_mmap_, true};
   auto status = vector_indexer->Open(options);
   if (!status.ok()) {
     LOG_ERROR("Failed to open vector indexer for field: %s, err: %s",
@@ -4357,6 +4375,8 @@ Status SegmentImpl::finish_memory_components() {
 
   // remove indexer from memory to persist
   for (auto &[column_name, indexer] : memory_vector_indexers_) {
+    s = reopen_vector_indexer_for_serving(indexer);
+    CHECK_RETURN_STATUS(s);
     auto block_id = memory_vector_block_ids_[column_name];
     BlockMeta vb =
         BlockMeta{block_id,          BlockType::VECTOR_INDEX, block.min_doc_id_,
@@ -4373,6 +4393,8 @@ Status SegmentImpl::finish_memory_components() {
 
   // remove quant indexer from memory to persist
   for (auto &[column_name, indexer] : quant_memory_vector_indexers_) {
+    s = reopen_vector_indexer_for_serving(indexer);
+    CHECK_RETURN_STATUS(s);
     auto block_id = quant_memory_vector_block_ids_[column_name];
     BlockMeta block_meta(block_id, BlockType::VECTOR_INDEX_QUANTIZE,
                          block.min_doc_id_, block.max_doc_id_, block.doc_count_,

@@ -29,7 +29,8 @@ DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
       entity_{entity} {}
 
 int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
-                         uint32_t pq_chunk_num, uint32_t element_size) {
+                         uint32_t pq_chunk_num, uint32_t element_size,
+                         bool setup_io_context) {
   if (!entity_ || element_size == 0) {
     LOG_ERROR("Invalid DiskAnn context parameters");
     return IndexError_InvalidArgument;
@@ -89,10 +90,12 @@ int DiskAnnContext::init(ContextType type, uint32_t graph_degree,
         return IndexError_NoMemory;
       }
 
-      ret = setup_io_ctx(io_ctx_);
-      if (ret != 0) {
-        LOG_ERROR("setup io ctx error, ret=%d", ret);
-        return ret;
+      if (setup_io_context) {
+        ret = setup_io_ctx(io_ctx_);
+        if (ret != 0) {
+          LOG_ERROR("setup io ctx error, ret=%d", ret);
+          return ret;
+        }
       }
       break;
 

@@ -19,6 +19,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <thread>
 #include <unordered_map>
 #include <gtest/gtest.h>
 #include "tests/test_util.h"
@@ -667,6 +668,11 @@ TEST(IndexInterface, BufferGeneral) {
 
   auto func = [&](const BaseIndexParam::Pointer &param,
                   const BaseIndexQueryParam::Pointer &query_param) {
+    const float value_tolerance =
+        param->quantizer_param &&
+                param->quantizer_param->type == QuantizerType::kInt4
+            ? 0.1f
+            : 1e-6f;
     std::string real_index_name = index_name;
     zvec::test_util::RemoveTestFiles(index_name + "*");
     auto write_index = IndexFactory::CreateAndInitIndex(*param);
@@ -681,6 +687,7 @@ TEST(IndexInterface, BufferGeneral) {
     VectorData vector_data;
     vector_data.vector = DenseVector{vector.data()};
     ASSERT_TRUE(0 == write_index->add(vector_data, 233));
+    ASSERT_TRUE(0 == write_index->train());
     write_index->close();
 
     auto read_index = IndexFactory::CreateAndInitIndex(*param);
@@ -694,7 +701,7 @@ TEST(IndexInterface, BufferGeneral) {
     read_index->search(query, query_param, &result);
     ASSERT_EQ(1, result.doc_list_.size());
     ASSERT_EQ(233, result.doc_list_[0].key());
-    ASSERT_FLOAT_EQ(5.0f, result.doc_list_[0].score());
+    ASSERT_NEAR(5.0f, result.doc_list_[0].score(), value_tolerance);
     if (query_param->fetch_vector) {
       auto &doc = result.doc_list_[0];
       if (result.reverted_vector_list_.size() != 0) {
@@ -702,12 +709,12 @@ TEST(IndexInterface, BufferGeneral) {
         ASSERT_EQ(1, result.reverted_vector_list_.size());
         auto reverted_vector = reinterpret_cast<const float *>(
             result.reverted_vector_list_[0].data());
-        ASSERT_FLOAT_EQ(1.0f, reverted_vector[1]);
-        ASSERT_FLOAT_EQ(2.0f, reverted_vector[2]);
+        ASSERT_NEAR(1.0f, reverted_vector[1], value_tolerance);
+        ASSERT_NEAR(2.0f, reverted_vector[2], value_tolerance);
       } else {
         auto vector = reinterpret_cast<const float *>(doc.vector());
-        ASSERT_FLOAT_EQ(1.0f, vector[1]);
-        ASSERT_FLOAT_EQ(2.0f, vector[2]);
+        ASSERT_NEAR(1.0f, vector[1], value_tolerance);
+        ASSERT_NEAR(2.0f, vector[2], value_tolerance);
       }
     }
 
@@ -718,8 +725,8 @@ TEST(IndexInterface, BufferGeneral) {
     float *fetched_vector = reinterpret_cast<float *>(
         std::get<DenseVectorBuffer>(fetched_vector_data.vector_buffer)
             .data.data());
-    ASSERT_FLOAT_EQ(1.0f, fetched_vector[1]);
-    ASSERT_FLOAT_EQ(2.0f, fetched_vector[2]);
+    ASSERT_NEAR(1.0f, fetched_vector[1], value_tolerance);
+    ASSERT_NEAR(2.0f, fetched_vector[2], value_tolerance);
     result.doc_list_.clear();
     read_index->close();
     zvec::test_util::RemoveTestFiles(index_name + "*");
@@ -768,6 +775,196 @@ TEST(IndexInterface, BufferGeneral) {
            .with_fetch_vector(true)
            .with_ef_search(20)
            .build());
+  func(IVFIndexParamBuilder()
+           .with_metric_type(MetricType::kInnerProduct)
+           .with_data_type(DataType::DT_FP32)
+           .with_dimension(kDimension)
+           .with_is_sparse(false)
+           .with_n_list(10)
+           .build(),
+       IVFQueryParamBuilder().with_topk(10).with_fetch_vector(true).build());
+  func(IVFIndexParamBuilder()
+           .with_metric_type(MetricType::kInnerProduct)
+           .with_data_type(DataType::DT_FP32)
+           .with_dimension(kDimension)
+           .with_is_sparse(false)
+           .with_n_list(10)
+           .with_quantizer_param(QuantizerParam(QuantizerType::kFP16))
+           .build(),
+       IVFQueryParamBuilder().with_topk(10).with_fetch_vector(true).build());
+  func(IVFIndexParamBuilder()
+           .with_metric_type(MetricType::kInnerProduct)
+           .with_data_type(DataType::DT_FP32)
+           .with_dimension(kDimension)
+           .with_is_sparse(false)
+           .with_n_list(10)
+           .with_quantizer_param(QuantizerParam(QuantizerType::kInt4))
+           .build(),
+       IVFQueryParamBuilder().with_topk(10).with_fetch_vector(true).build());
+}
+
+TEST(IndexInterface, HnswBufferPoolSearchWithEviction) {
+  constexpr uint32_t kDimension = 768;
+  constexpr uint32_t kDocCount = 512;
+  constexpr size_t kBufferBudget = 1024 * 1024;
+  const std::string index_name{"test_hnsw_buffer_eviction.index"};
+  zvec::test_util::RemoveTestFiles(index_name + "*");
+
+  auto param = HNSWIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(kDimension)
+                   .with_is_sparse(false)
+                   .with_ef_construction(100)
+                   .build();
+
+  {
+    auto write_index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, write_index);
+    ASSERT_EQ(0, write_index->open(index_name,
+                                   {StorageOptions::StorageType::kMMAP, true}));
+
+    std::vector<float> vector(kDimension);
+    VectorData vector_data;
+    for (uint32_t id = 0; id < kDocCount; ++id) {
+      std::fill(vector.begin(), vector.end(), static_cast<float>(id));
+      vector_data.vector = DenseVector{vector.data()};
+      ASSERT_EQ(0, write_index->add(vector_data, id));
+    }
+    ASSERT_EQ(0, write_index->flush());
+    ASSERT_EQ(0, write_index->close());
+  }
+
+  // A 768-D FP32 HNSW node is larger than 3 KiB, so this index is larger
+  // than the 1 MiB pool and many vector reads cross a 4 KiB page boundary.
+  ASSERT_EQ(0,
+            zvec::ailego::MemoryLimitPool::get_instance().init(kBufferBudget));
+  {
+    auto read_index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, read_index);
+    ASSERT_EQ(0, read_index->open(
+                     index_name,
+                     {StorageOptions::StorageType::kBufferPool, false, true}));
+    auto *hnsw_index = dynamic_cast<HNSWIndex *>(read_index.get());
+    ASSERT_NE(nullptr, hnsw_index);
+    ASSERT_EQ("buffer_pool", hnsw_index->storage_mode());
+
+    auto query_param =
+        HNSWQueryParamBuilder().with_topk(1).with_ef_search(100).build();
+    std::vector<float> query_vector(kDimension);
+    VectorData query;
+    for (uint32_t id : {0U, 63U, 127U, 255U, 383U, 511U}) {
+      std::fill(query_vector.begin(), query_vector.end(),
+                static_cast<float>(id));
+      query.vector = DenseVector{query_vector.data()};
+      SearchResult result;
+      ASSERT_EQ(0, read_index->search(query, query_param, &result));
+      ASSERT_EQ(1U, result.doc_list_.size());
+      ASSERT_EQ(id, result.doc_list_[0].key());
+    }
+    ASSERT_EQ(0, read_index->close());
+  }
+
+  zvec::test_util::RemoveTestFiles(index_name + "*");
+  ASSERT_EQ(
+      0, zvec::ailego::MemoryLimitPool::get_instance().init(100 * 1024 * 1024));
+}
+
+TEST(IndexInterface, IvfBufferPoolSearchAfterOpenThreadExits) {
+  constexpr uint32_t kDimension = 768;
+  constexpr uint32_t kDocCount = 256;
+  // Enough for VecBufferPool metadata plus only a fraction of this index's
+  // data pages, so searches exercise real cache pressure rather than the
+  // bypass-only fallback.
+  constexpr size_t kBufferBudget = 1024 * 1024;
+  const std::string index_name{"test_ivf_buffer_eviction.index"};
+  zvec::test_util::RemoveTestFiles(index_name + "*");
+
+  auto param = IVFIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(kDimension)
+                   .with_is_sparse(false)
+                   .with_n_list(16)
+                   .with_n_iters(4)
+                   .build();
+
+  {
+    auto write_index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, write_index);
+    ASSERT_EQ(0, write_index->open(index_name,
+                                   {StorageOptions::StorageType::kMMAP, true}));
+
+    std::vector<float> vector(kDimension);
+    for (uint32_t id = 0; id < kDocCount; ++id) {
+      std::fill(vector.begin(), vector.end(), static_cast<float>(id));
+      VectorData vector_data{DenseVector{vector.data()}};
+      ASSERT_EQ(0, write_index->add(vector_data, id));
+    }
+    ASSERT_EQ(0, write_index->train());
+    ASSERT_EQ(0, write_index->close());
+  }
+
+  ASSERT_EQ(0,
+            zvec::ailego::MemoryLimitPool::get_instance().init(kBufferBudget));
+  auto read_index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, read_index);
+
+  // Load on a short-lived thread. Buffer-backed sub-indexes must own every
+  // pointer they retain after Open rather than referencing that thread's TLS.
+  int open_rc = -1;
+  std::thread opener([&]() {
+    open_rc = read_index->open(
+        index_name, {StorageOptions::StorageType::kBufferPool, false, true});
+  });
+  opener.join();
+  ASSERT_EQ(0, open_rc);
+
+  auto query_param = IVFQueryParamBuilder()
+                         .with_topk(1)
+                         .with_nprobe(16)
+                         .with_fetch_vector(true)
+                         .build();
+  auto search_one = [&](uint32_t id) {
+    std::vector<float> query_vector(kDimension, static_cast<float>(id));
+    VectorData query{DenseVector{query_vector.data()}};
+    SearchResult result;
+    if (read_index->search(query, query_param, &result) != 0 ||
+        result.doc_list_.size() != 1 || result.doc_list_[0].key() != id) {
+      return false;
+    }
+    auto vector = static_cast<const float *>(result.doc_list_[0].vector());
+    return vector != nullptr && vector[0] == static_cast<float>(id);
+  };
+
+  for (uint32_t id : {0U, 63U, 127U, 191U, 255U}) {
+    ASSERT_TRUE(search_one(id));
+  }
+
+  std::array<bool, 4> concurrent_ok{};
+  std::array<std::thread, 4> workers;
+  for (size_t i = 0; i < workers.size(); ++i) {
+    workers[i] = std::thread([&, i]() {
+      concurrent_ok[i] = search_one(static_cast<uint32_t>(i * 63));
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  for (bool ok : concurrent_ok) {
+    ASSERT_TRUE(ok);
+  }
+
+  auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
+  ASSERT_GT(memory_pool.metadata_used(), 0u);
+  ASSERT_GT(memory_pool.used(), memory_pool.metadata_used());
+
+  ASSERT_EQ(0, read_index->close());
+  read_index.reset();
+  ASSERT_EQ(0u, memory_pool.metadata_used());
+  ASSERT_EQ(0u, memory_pool.used());
+  zvec::test_util::RemoveTestFiles(index_name + "*");
+  ASSERT_EQ(0, memory_pool.init(100 * 1024 * 1024));
 }
 
 

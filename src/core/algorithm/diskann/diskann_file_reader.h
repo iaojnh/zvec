@@ -24,6 +24,7 @@
 
 #include <unistd.h>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -32,6 +33,9 @@
 #include "diskann_util.h"
 
 namespace zvec {
+namespace ailego {
+class VecBufferPool;
+}
 namespace core {
 
 // IoBackend holds the selected backend for each thread. On Linux it also owns
@@ -50,7 +54,7 @@ struct IoBackend {
   ailego::IOBackendType type{ailego::IOBackendType::kPread};
 
 #if (defined(__linux) || defined(__linux__))
-  IoUringRing ring{};
+  ailego::IoUringRing ring{};
   io_context_t aio_ctx{nullptr};
 #endif
 };
@@ -64,6 +68,9 @@ int destroy_io_ctx(IOContext &ctx);
 // backend on first call. No-op outside Linux and macOS.
 void log_diskann_io_backend();
 
+#if (defined(__linux) || defined(__linux__))
+using AlignedRead = ailego::IoUringRead;
+#else
 struct AlignedRead {
   uint64_t offset;
   uint64_t len;
@@ -81,6 +88,7 @@ struct AlignedRead {
 #endif
   }
 };
+#endif
 
 struct PendingBatch {
 #if (defined(__linux) || defined(__linux__))
@@ -118,6 +126,10 @@ class AlignedFileReader {
   virtual int get_completed(PendingBatch &batch, IOContext &ctx,
                             int min_completed,
                             std::vector<uint32_t> &completed_indices) = 0;
+
+  virtual bool requires_io_context() const {
+    return true;
+  }
 };
 
 // Reader implementation used on all supported platforms. Linux selects
@@ -150,6 +162,35 @@ class LinuxAlignedFileReader : public AlignedFileReader {
 
   int get_completed(PendingBatch &batch, IOContext &ctx, int min_completed,
                     std::vector<uint32_t> &completed_indices);
+};
+
+class BufferPoolAlignedFileReader : public AlignedFileReader {
+ public:
+  explicit BufferPoolAlignedFileReader(
+      std::shared_ptr<ailego::VecBufferPool> pool);
+  ~BufferPoolAlignedFileReader() override;
+
+  IOContext &get_ctx() override;
+  void register_thread() override;
+  void deregister_thread() override;
+  void deregister_all_threads() override;
+  void open(const std::string &fname) override;
+  void close() override;
+  int read(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
+           bool async = false) override;
+  int submit(PendingBatch &batch, std::vector<AlignedRead> &read_reqs,
+             IOContext &ctx) override;
+  int get_completed(PendingBatch &batch, IOContext &ctx, int min_completed,
+                    std::vector<uint32_t> &completed_indices) override;
+
+  bool requires_io_context() const override {
+    return false;
+  }
+
+ private:
+  std::shared_ptr<ailego::VecBufferPool> pool_;
+  LinuxAlignedFileReader bypass_reader_;
+  IOContext unused_ctx_{};
 };
 
 }  // namespace core

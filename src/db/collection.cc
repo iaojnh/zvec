@@ -1117,10 +1117,10 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
         if (current_actual_doc_count + actual_doc_count >
             max_doc_count_per_segment) {
           // only create SegmentCompactTask when rebuild=true
-          task = SegmentTask::CreateCompactTask(
-              CompactTask{path_, schema, current_group,
-                          allocate_segment_id_for_tmp_segment(), filter,
-                          !options_.enable_mmap_, concurrency});
+          task = SegmentTask::CreateCompactTask(CompactTask{
+              path_, schema, current_group,
+              allocate_segment_id_for_tmp_segment(), filter,
+              !options_.enable_mmap_, options_.enable_mmap_, concurrency});
         }
       } else {
         if (current_doc_count + doc_count > max_doc_count_per_segment) {
@@ -1131,10 +1131,10 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
                     current_group[0], "", nullptr, concurrency});
             skip_task = current_group[0]->all_vector_index_ready();
           } else {
-            task = SegmentTask::CreateCompactTask(
-                CompactTask{path_, schema, current_group,
-                            allocate_segment_id_for_tmp_segment(), nullptr,
-                            !options_.enable_mmap_, concurrency});
+            task = SegmentTask::CreateCompactTask(CompactTask{
+                path_, schema, current_group,
+                allocate_segment_id_for_tmp_segment(), nullptr,
+                !options_.enable_mmap_, options_.enable_mmap_, concurrency});
           }
         }
       }
@@ -1162,7 +1162,8 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
     } else {
       task = SegmentTask::CreateCompactTask(CompactTask{
           path_, schema, current_group, allocate_segment_id_for_tmp_segment(),
-          rebuild ? filter : nullptr, !options_.enable_mmap_, concurrency});
+          rebuild ? filter : nullptr, !options_.enable_mmap_,
+          options_.enable_mmap_, concurrency});
     }
     tasks.push_back(task);
   }
@@ -1916,7 +1917,12 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const {
   // Single-segment queries have no segment-level fanout; multi-segment queries
   // already use the query pool per sub-query.
   if (segments.size() == 1) {
-    auto group = GlobalResource::Instance().query_thread_pool()->make_group();
+    auto *pool = GlobalResource::Instance().query_thread_pool();
+    if (pool == nullptr) {
+      return tl::make_unexpected(
+          Status::InternalError("Query thread pool initialization failed"));
+    }
+    auto group = pool->make_group();
     for (size_t i = 0; i < pending_queries.size(); ++i) {
       group->execute(
           [&, i]() { results[i] = execute_query(pending_queries[i]); });

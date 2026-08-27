@@ -18,8 +18,6 @@
 #include "diskann_context.h"
 #include "diskann_indexer.h"
 
-class LinuxAlignedFileReader;
-
 namespace zvec {
 namespace core {
 

@@ -16,14 +16,15 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <thread>
 #include <ailego/io/io_backend_def.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/io_backend.h>
 #include <zvec/ailego/logger/logger.h>
 #if defined(__APPLE__) || defined(__MACH__)
@@ -69,10 +70,6 @@ static void log_diskann_io_backend(ailego::IOBackendType type) {
 #if (defined(__linux) || defined(__linux__))
 typedef struct io_event io_event_t;
 typedef struct iocb iocb_t;
-
-// Retry budget for draining in-flight io_uring requests when the kernel
-// keeps returning EAGAIN/EBUSY (100 us sleep per retry, ~1 s total).
-static constexpr size_t kIoUringDrainRetries = 10000;
 #endif
 
 void log_diskann_io_backend() {
@@ -369,218 +366,6 @@ int execute_io(IOContext ctx, int fd, std::vector<AlignedRead> &read_reqs,
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// IoUringRing::execute — defined here (not in iouring_loader.h) because it
-// accesses AlignedRead members, and AlignedRead is defined in
-// diskann_file_reader.h after iouring_loader.h is included.
-// ---------------------------------------------------------------------------
-#if (defined(__linux) || defined(__linux__))
-int IoUringRing::execute(int fd, std::vector<AlignedRead> &read_reqs) {
-  if (!is_valid()) {
-    return -1;
-  }
-  if (read_reqs.empty()) {
-    return 0;
-  }
-
-  // Process in batches limited by the SQ ring size.
-  uint32_t batch_size =
-      std::min(sq_entries_, static_cast<uint32_t>(kIoUringMaxBatch));
-  uint64_t iters = DiskAnnUtil::div_round_up(read_reqs.size(), batch_size);
-
-  for (uint64_t iter = 0; iter < iters; iter++) {
-    uint64_t n_ops =
-        std::min(static_cast<uint64_t>(read_reqs.size()) - iter * batch_size,
-                 static_cast<uint64_t>(batch_size));
-
-    // --- Phase 1: Fill SQEs ---
-    //
-    // Reads land in the ring-owned staging pool, never in the caller's
-    // buffers.  io_uring teardown is asynchronous — closing the ring fd
-    // only initiates cancellation — so the kernel may still write into
-    // request buffers after execute() has returned an error.  Staging
-    // memory can simply be leaked in that case (abandon_staging()), while
-    // the caller's buffers stay safe to reuse or free.  The copy-out below
-    // costs one sector-scale memcpy per read, negligible next to the I/O.
-    std::vector<size_t> slot_off(n_ops);
-    size_t staging_bytes = 0;
-    for (uint64_t j = 0; j < n_ops; j++) {
-      slot_off[j] = staging_bytes;
-      size_t len = read_reqs[j + iter * batch_size].len;
-      // Round every slot up so each staging pointer stays O_DIRECT-legal.
-      staging_bytes +=
-          (len + kIoUringStagingAlign - 1) & ~(kIoUringStagingAlign - 1);
-    }
-    // Safe: the previous batch is fully drained before we get here, so no
-    // in-flight request can reference the old pool being freed on growth.
-    if (!ensure_staging(staging_bytes)) {
-      return -1;  // nothing submitted; pread fallback is safe
-    }
-
-    unsigned tail = __atomic_load_n(sq_tail_, __ATOMIC_ACQUIRE);
-    unsigned mask = *sq_ring_mask_;
-
-    for (uint64_t j = 0; j < n_ops; j++) {
-      unsigned idx = (tail + static_cast<unsigned>(j)) & mask;
-      unsigned sqe_idx = sq_array_[idx];
-      struct io_uring_sqe *sqe = &sqes_[sqe_idx];
-
-      uint64_t req_idx = j + iter * batch_size;
-      io_uring_prep_read(sqe, fd, staging_ + slot_off[j],
-                         static_cast<uint32_t>(read_reqs[req_idx].len),
-                         read_reqs[req_idx].offset);
-      // Store the request index so we can verify the completion.
-      sqe->user_data = req_idx;
-    }
-
-    // Memory barrier: ensure SQE contents are visible before tail update.
-    __sync_synchronize();
-    __atomic_store_n(sq_tail_, tail + static_cast<unsigned>(n_ops),
-                     __ATOMIC_RELEASE);
-
-    // --- Phase 2: Submit and reap completions ---
-    //
-    // io_uring_enter() returns the number of SQEs consumed, not the number
-    // of CQEs available.  A partial submission returns before the wait
-    // phase, and a signal can interrupt the wait while preserving a
-    // positive submission count, so IORING_ENTER_GETEVENTS guarantees
-    // min_complete completions only when the call finishes normally.
-    // Completions must therefore be counted against cq_tail instead of
-    // assuming n_ops CQEs are ready.
-    uint64_t submitted = 0;
-    uint64_t completed = 0;
-    bool all_ok = true;
-
-    // Consume every CQE the kernel has published so far and verify it.
-    // Completion order is unspecified, so use cqe->user_data to find the
-    // request instead of assuming submission order.
-    auto reap_available = [&]() {
-      unsigned chead = *cq_head_;  // single consumer — plain load is enough
-      unsigned ctail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
-      unsigned cq_mask = *cq_ring_mask_;
-      if (chead == ctail) {
-        return;
-      }
-      while (chead != ctail) {
-        struct io_uring_cqe *cqe = &cqes_[chead & cq_mask];
-        uint64_t req_idx = cqe->user_data;
-
-        if (req_idx < iter * batch_size ||
-            req_idx >= iter * batch_size + n_ops) {
-          LOG_WARN("io_uring completion referenced unknown request: %lu",
-                   (unsigned long)req_idx);
-          all_ok = false;
-        } else if (cqe->res < 0) {
-          LOG_WARN("io_uring read failed: req=%lu, res=%d, offset=%lu",
-                   (unsigned long)req_idx, cqe->res,
-                   (unsigned long)read_reqs[req_idx].offset);
-          all_ok = false;
-        } else if (static_cast<uint64_t>(cqe->res) != read_reqs[req_idx].len) {
-          LOG_WARN("io_uring short read: req=%lu, got=%d, expected=%lu",
-                   (unsigned long)req_idx, cqe->res,
-                   (unsigned long)read_reqs[req_idx].len);
-          all_ok = false;
-        } else {
-          // Verified completion — copy from staging into the caller's
-          // buffer.  This is the only place caller memory is written.
-          std::memcpy(read_reqs[req_idx].buf,
-                      staging_ + slot_off[req_idx - iter * batch_size],
-                      read_reqs[req_idx].len);
-        }
-        chead++;
-        completed++;
-      }
-      // Release: CQE reads must complete before the kernel may reuse slots.
-      __atomic_store_n(cq_head_, chead, __ATOMIC_RELEASE);
-    };
-
-    while (completed < n_ops) {
-      reap_available();
-      if (completed >= n_ops) {
-        break;
-      }
-
-      unsigned to_submit = static_cast<unsigned>(n_ops - submitted);
-      int ret = static_cast<int>(syscall(
-          __NR_io_uring_enter, ring_fd_, to_submit, 1u, IORING_ENTER_GETEVENTS,
-          static_cast<void *>(nullptr), static_cast<size_t>(0)));
-      if (ret >= 0) {
-        submitted += static_cast<uint64_t>(ret);
-        continue;
-      }
-      if (errno == EINTR) {
-        // Interrupted during submit or wait; the SQEs already consumed are
-        // tracked in `submitted`, so simply retry.
-        continue;
-      }
-      if ((errno == EAGAIN || errno == EBUSY) && completed < submitted) {
-        // Kernel resources are exhausted, but in-flight requests will free
-        // them as they complete; keep reaping and retrying.
-        continue;
-      }
-
-      // Unrecoverable failure (or EAGAIN with nothing in flight).
-      LOG_WARN(
-          "io_uring_enter failed; errno=%d, %s, submitted=%lu/%lu, "
-          "completed=%lu. draining before falling back to pread",
-          errno, ::strerror(errno), (unsigned long)submitted,
-          (unsigned long)n_ops, (unsigned long)completed);
-
-      // Un-publish the SQEs the kernel never consumed so a later batch
-      // cannot submit them against stale buffers.
-      __atomic_store_n(sq_tail_, tail + static_cast<unsigned>(submitted),
-                       __ATOMIC_RELEASE);
-
-      // Drain every in-flight request before the staging pool may be
-      // freed or reused by a later batch.  CQEs are posted to the shared
-      // ring by the kernel on its own, so completions can still be reaped
-      // here even when io_uring_enter() keeps failing.
-      size_t drain_retries = 0;
-      while (completed < submitted) {
-        reap_available();
-        if (completed >= submitted) {
-          break;
-        }
-        int wret = static_cast<int>(syscall(
-            __NR_io_uring_enter, ring_fd_, 0u, 1u, IORING_ENTER_GETEVENTS,
-            static_cast<void *>(nullptr), static_cast<size_t>(0)));
-        if (wret >= 0 || errno == EINTR) {
-          continue;
-        }
-        if ((errno == EAGAIN || errno == EBUSY) &&
-            drain_retries++ < kIoUringDrainRetries) {
-          // Give in-flight requests time to complete; entering the kernel
-          // via the sleep also lets pending completion task-work run.
-          std::this_thread::sleep_for(std::chrono::microseconds(100));
-          continue;
-        }
-        // The ring cannot be drained.  Leak the staging pool — the kernel
-        // may keep writing into it through the asynchronous teardown — and
-        // disable io_uring for this context.  The caller's buffers were
-        // never exposed to the kernel, so the pread fallback stays safe.
-        LOG_ERROR(
-            "io_uring drain failed; errno=%d, %s. leaking the staging pool "
-            "and disabling io_uring for this context",
-            errno, ::strerror(errno));
-        abandon_staging();
-        teardown();
-        return -1;
-      }
-      return -1;
-    }
-
-    if (!all_ok) {
-      // Every request completed and the staging pool is quiesced, but at
-      // least one read failed or was short — let the caller retry with
-      // pread.
-      return -1;
-    }
-  }
-
-  return 0;
-}
-#endif  // __linux__
-
 LinuxAlignedFileReader::LinuxAlignedFileReader(int file_desc) {
   this->file_desc = file_desc;
 }
@@ -722,10 +507,9 @@ void LinuxAlignedFileReader::close() {
 
 int LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
                                  IOContext &ctx, bool async) {
-  if (async == true) {
+  if (async) {
     LOG_WARN("Async currently not supported");
   }
-
   if (this->file_desc == -1) {
     LOG_ERROR("Attempt to read from invalid file descriptor");
     return IndexError_Runtime;
@@ -734,6 +518,316 @@ int LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
   int ret = execute_io(ctx, this->file_desc, read_reqs);
 
   return ret;
+}
+
+BufferPoolAlignedFileReader::BufferPoolAlignedFileReader(
+    std::shared_ptr<ailego::VecBufferPool> pool)
+    : pool_(std::move(pool)) {}
+
+BufferPoolAlignedFileReader::~BufferPoolAlignedFileReader() = default;
+
+IOContext &BufferPoolAlignedFileReader::get_ctx() {
+  return unused_ctx_;
+}
+
+void BufferPoolAlignedFileReader::register_thread() {}
+
+void BufferPoolAlignedFileReader::deregister_thread() {}
+
+void BufferPoolAlignedFileReader::deregister_all_threads() {}
+
+void BufferPoolAlignedFileReader::open(const std::string &fname) {
+  bypass_reader_.open(fname);
+}
+
+void BufferPoolAlignedFileReader::close() {
+  bypass_reader_.close();
+  pool_.reset();
+}
+
+int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
+                                      IOContext &ctx, bool /*async*/) {
+  if (!pool_) {
+    LOG_ERROR("BufferPoolAlignedFileReader: buffer pool is not available");
+    return IndexError_Runtime;
+  }
+  if (read_reqs.empty()) return 0;
+
+  try {
+    struct UniquePage {
+      ailego::block_id_t page_id;
+      char *cached_page{nullptr};
+      bool bypass_candidate{false};
+    };
+    struct PageOccurrence {
+      size_t unique_index;
+      char *destination;
+      size_t offset_in_page;
+      size_t length;
+      size_t canonical_index;
+    };
+
+    size_t total_pages = 0;
+    for (const AlignedRead &req : read_reqs) {
+      if (req.buf == nullptr || req.len == 0 ||
+          req.offset > std::numeric_limits<size_t>::max() ||
+          req.len > std::numeric_limits<size_t>::max()) {
+        return IndexError_InvalidArgument;
+      }
+      const size_t offset = static_cast<size_t>(req.offset);
+      const size_t length = static_cast<size_t>(req.len);
+      if (ailego::kVectorPageSize < DiskAnnUtil::kSectorSize ||
+          ailego::kVectorPageSize % DiskAnnUtil::kSectorSize != 0 ||
+          offset % DiskAnnUtil::kSectorSize != 0 ||
+          length % DiskAnnUtil::kSectorSize != 0 ||
+          offset > pool_->file_size() || length > pool_->file_size() - offset) {
+        return IndexError_InvalidArgument;
+      }
+      const size_t first_page = offset / ailego::kVectorPageSize;
+      const size_t last_page = (offset + length - 1) / ailego::kVectorPageSize;
+      const size_t pages = last_page - first_page + 1;
+      if (pages > std::numeric_limits<size_t>::max() - total_pages) {
+        return IndexError_InvalidLength;
+      }
+      total_pages += pages;
+    }
+
+    std::vector<UniquePage> unique_pages;
+    std::vector<PageOccurrence> occurrences;
+    unique_pages.reserve(total_pages);
+    occurrences.reserve(total_pages);
+    for (const AlignedRead &req : read_reqs) {
+      size_t source_offset = static_cast<size_t>(req.offset);
+      size_t remaining = static_cast<size_t>(req.len);
+      char *destination = static_cast<char *>(req.buf);
+      while (remaining != 0) {
+        const auto page_id = static_cast<ailego::block_id_t>(
+            source_offset / ailego::kVectorPageSize);
+        const size_t offset_in_page = source_offset % ailego::kVectorPageSize;
+        const size_t copy_length =
+            std::min(remaining, ailego::kVectorPageSize - offset_in_page);
+        size_t unique_index = 0;
+        while (unique_index < unique_pages.size() &&
+               unique_pages[unique_index].page_id != page_id) {
+          ++unique_index;
+        }
+        if (unique_index == unique_pages.size()) {
+          unique_pages.push_back(UniquePage{page_id, nullptr, false});
+        }
+        size_t canonical_index = occurrences.size();
+        for (size_t i = 0; i < occurrences.size(); ++i) {
+          const PageOccurrence &prior = occurrences[i];
+          if (prior.unique_index == unique_index &&
+              prior.offset_in_page == offset_in_page &&
+              prior.length == copy_length) {
+            canonical_index = prior.canonical_index;
+            break;
+          }
+        }
+        occurrences.push_back(PageOccurrence{unique_index, destination,
+                                             offset_in_page, copy_length,
+                                             canonical_index});
+        source_offset += copy_length;
+        destination += copy_length;
+        remaining -= copy_length;
+      }
+    }
+
+    std::vector<ailego::block_id_t> admitted_ids;
+    std::vector<size_t> admitted_indices;
+    std::vector<char *> admitted_pages(unique_pages.size(), nullptr);
+    std::vector<AlignedRead> bypass_requests;
+    admitted_ids.reserve(unique_pages.size());
+    admitted_indices.reserve(unique_pages.size());
+    bypass_requests.reserve(unique_pages.size());
+
+    auto release_cached_pages = [&]() {
+      for (UniquePage &page : unique_pages) {
+        if (page.cached_page != nullptr) {
+          pool_->release_pages(&page.page_id, 1);
+          page.cached_page = nullptr;
+        }
+      }
+    };
+    struct CachedPageGuard {
+      decltype(release_cached_pages) &release;
+      ~CachedPageGuard() {
+        release();
+      }
+    } cached_page_guard{release_cached_pages};
+
+    for (size_t i = 0; i < unique_pages.size(); ++i) {
+      UniquePage &page = unique_pages[i];
+      page.cached_page = pool_->try_acquire_buffer(page.page_id);
+      if (page.cached_page != nullptr) {
+        continue;
+      }
+      if (pool_->should_admit_page(page.page_id)) {
+        admitted_ids.push_back(page.page_id);
+        admitted_indices.push_back(i);
+      } else {
+        page.bypass_candidate = true;
+      }
+    }
+
+    if (!admitted_ids.empty()) {
+      if (pool_->acquire_pages(admitted_ids.data(), admitted_ids.size(),
+                               admitted_pages.data())) {
+        for (size_t i = 0; i < admitted_ids.size(); ++i) {
+          unique_pages[admitted_indices[i]].cached_page = admitted_pages[i];
+        }
+      } else {
+        // A cache-admission race may exhaust the remaining budget after the
+        // policy decision above. acquire_pages() rolls back all pins on
+        // failure, so preserve query availability by reading the batch
+        // directly instead of surfacing a capacity error to the caller.
+        for (const size_t index : admitted_indices) {
+          unique_pages[index].bypass_candidate = true;
+        }
+      }
+    }
+
+    // A rejected page may have become resident or started loading while the
+    // admitted portion of this batch was populated. Rejoin that cache flight
+    // instead of issuing duplicate direct I/O. This does not record another
+    // admission observation.
+    size_t bypass_rechecks = 0;
+    size_t bypass_cache_joins = 0;
+    admitted_ids.clear();
+    admitted_indices.clear();
+    for (size_t i = 0; i < unique_pages.size(); ++i) {
+      UniquePage &page = unique_pages[i];
+      if (!page.bypass_candidate) {
+        continue;
+      }
+      ++bypass_rechecks;
+      page.cached_page = pool_->try_acquire_buffer(page.page_id);
+      if (page.cached_page != nullptr) {
+        page.bypass_candidate = false;
+        ++bypass_cache_joins;
+      } else if (pool_->should_join_cache_path(page.page_id)) {
+        admitted_ids.push_back(page.page_id);
+        admitted_indices.push_back(i);
+      }
+    }
+    if (!admitted_ids.empty() &&
+        pool_->acquire_pages(admitted_ids.data(), admitted_ids.size(),
+                             admitted_pages.data())) {
+      for (size_t i = 0; i < admitted_ids.size(); ++i) {
+        UniquePage &page = unique_pages[admitted_indices[i]];
+        page.cached_page = admitted_pages[i];
+        page.bypass_candidate = false;
+      }
+      bypass_cache_joins += admitted_ids.size();
+    }
+    pool_->record_bypass_recheck(bypass_rechecks, bypass_cache_joins);
+
+    // Preserve contiguous DiskANN reads on the direct path. Duplicate slices
+    // use their first destination as the canonical read target and are fanned
+    // out after I/O completes. A native buffer-pool page may contain multiple
+    // 4 KiB DiskANN sectors (for example, 16 KiB pages on Apple silicon).
+    uint64_t run_offset = 0;
+    uint64_t run_length = 0;
+    char *run_destination = nullptr;
+    size_t bypass_bytes = 0;
+    auto flush_bypass_run = [&]() {
+      if (run_length != 0) {
+        bypass_requests.emplace_back(run_offset, run_length, run_destination);
+        run_length = 0;
+      }
+    };
+    for (size_t i = 0; i < occurrences.size(); ++i) {
+      const PageOccurrence &occurrence = occurrences[i];
+      const UniquePage &page = unique_pages[occurrence.unique_index];
+      if (!page.bypass_candidate || occurrence.canonical_index != i) {
+        continue;
+      }
+      const uint64_t slice_offset =
+          static_cast<uint64_t>(page.page_id) * ailego::kVectorPageSize +
+          occurrence.offset_in_page;
+      if (run_length != 0 && run_offset + run_length == slice_offset &&
+          run_destination + run_length == occurrence.destination) {
+        run_length += occurrence.length;
+      } else {
+        flush_bypass_run();
+        run_offset = slice_offset;
+        run_length = occurrence.length;
+        run_destination = occurrence.destination;
+      }
+      bypass_bytes += occurrence.length;
+    }
+    flush_bypass_run();
+
+    if (!bypass_requests.empty()) {
+#if defined(__linux__) || defined(__linux)
+      // Buffer-pool hits need no DiskANN I/O context. Create it only when
+      // admission first chooses direct AIO; the caller already owns and
+      // destroys this context with its normal DiskANN context lifecycle.
+      if (ctx == nullptr && setup_io_ctx(ctx) != 0) {
+        release_cached_pages();
+        return IndexError_Runtime;
+      }
+#endif
+      const int read_ret = bypass_reader_.read(bypass_requests, ctx);
+      if (read_ret != 0) {
+        release_cached_pages();
+        return read_ret;
+      }
+      pool_->record_bypass_read(bypass_bytes, bypass_requests.size());
+    }
+
+    for (size_t i = 0; i < occurrences.size(); ++i) {
+      const PageOccurrence &occurrence = occurrences[i];
+      const UniquePage &page = unique_pages[occurrence.unique_index];
+      if (page.cached_page != nullptr) {
+        std::memcpy(occurrence.destination,
+                    page.cached_page + occurrence.offset_in_page,
+                    occurrence.length);
+      } else if (occurrence.canonical_index != i) {
+        std::memcpy(occurrence.destination,
+                    occurrences[occurrence.canonical_index].destination,
+                    occurrence.length);
+      }
+    }
+    release_cached_pages();
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  }
+}
+
+int BufferPoolAlignedFileReader::submit(PendingBatch &batch,
+                                        std::vector<AlignedRead> &read_reqs,
+                                        IOContext &ctx) {
+  batch.n_submitted = 0;
+  batch.n_reaped = 0;
+  batch.used_pread = false;
+#if defined(__linux__) || defined(__linux)
+  batch.cbs.clear();
+  batch.cb_ptrs.clear();
+#endif
+
+  const int ret = read(read_reqs, ctx);
+  if (ret != 0) {
+    return ret;
+  }
+
+  // Buffer-pool reads complete synchronously. Reporting them through the
+  // completion API keeps the search pipeline identical to the direct reader.
+  batch.used_pread = true;
+  batch.n_submitted = static_cast<uint32_t>(read_reqs.size());
+  return 0;
+}
+
+int BufferPoolAlignedFileReader::get_completed(
+    PendingBatch &batch, IOContext & /*ctx*/, int /*min_completed*/,
+    std::vector<uint32_t> &completed_indices) {
+  completed_indices.clear();
+  for (uint32_t i = batch.n_reaped; i < batch.n_submitted; ++i) {
+    completed_indices.push_back(i);
+  }
+  batch.n_reaped = batch.n_submitted;
+  return static_cast<int>(completed_indices.size());
 }
 
 #if (defined(__linux) || defined(__linux__))
