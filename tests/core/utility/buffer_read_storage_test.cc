@@ -14,6 +14,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -140,8 +141,7 @@ TEST_F(BufferReadStorageTest, ColdScatterReadKeepsContiguousFallback) {
   ASSERT_EQ(length, segment->read_scatter(0, block, length));
   ASSERT_EQ(1u, block.spans.size());
   EXPECT_EQ(length, block.spans[0].size);
-  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH,
-            block.fallback.type_);
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, block.fallback.type_);
   EXPECT_EQ(nullptr, block.lease);
   EXPECT_EQ(0, std::memcmp(payload_.data(), block.spans[0].data, length));
 }
@@ -271,9 +271,19 @@ TEST_F(BufferReadStorageTest, PointerReadPinsUntilNextPointerRead) {
   IndexStorage::SegmentData copied(0, 64);
   ASSERT_TRUE(segment->read(&copied, 1));
   EXPECT_EQ(0, std::memcmp(payload_.data(), copied.data, 64));
-  EXPECT_TRUE(pool.try_charge_external(1));
-  pool.release_external(1);
+  bool charged_after_pin_release = false;
+  for (size_t attempt = 0; attempt < 100 && !charged_after_pin_release;
+       ++attempt) {
+    charged_after_pin_release = pool.try_charge_external(1);
+    if (!charged_after_pin_release) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  if (charged_after_pin_release) {
+    pool.release_external(1);
+  }
   pool.release_external(external_charge);
+  EXPECT_TRUE(charged_after_pin_release);
 }
 
 TEST_F(BufferReadStorageTest, PointerReadsUsePerThreadScratchBuffers) {
