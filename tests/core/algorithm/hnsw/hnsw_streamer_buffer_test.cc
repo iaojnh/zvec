@@ -402,22 +402,21 @@ TEST_F(HnswStreamerTest, TestWideMConcurrentBuildBuffer) {
   ASSERT_NE(nullptr, storage);
   Params storage_params;
   ASSERT_EQ(0, storage->init(storage_params));
-  ASSERT_EQ(0,
-            storage->open(dir_ + "Test/WideMConcurrentBuildBuffer", true));
+  ASSERT_EQ(0, storage->open(dir_ + "Test/WideMConcurrentBuildBuffer", true));
   ASSERT_EQ(0, streamer->open(storage));
 
   constexpr size_t kThreadCount = 8;
   constexpr size_t kVectorsPerThread = 1000;
-  auto add_vectors = [&streamer](size_t first) {
+  auto add_vectors = [&streamer](size_t first, size_t vector_count) {
     auto context = streamer->create_context();
     IndexQueryMeta query_meta(IndexMeta::DataType::DT_FP32, dim);
     NumericalVector<float> vector(dim);
     size_t added = 0;
-    for (size_t i = 0; i < kVectorsPerThread; ++i) {
+    for (size_t i = 0; i < vector_count; ++i) {
       const size_t key = first + i;
       for (size_t j = 0; j < dim; ++j) {
-        const uint32_t bits = static_cast<uint32_t>(
-            key * 2654435761ULL + j * 2246822519ULL);
+        const uint32_t bits =
+            static_cast<uint32_t>(key * 2654435761ULL + j * 2246822519ULL);
         vector[j] = static_cast<float>(bits) / 4294967295.0f;
       }
       added += streamer->add_impl(key, vector.data(), query_meta, context) == 0;
@@ -428,7 +427,8 @@ TEST_F(HnswStreamerTest, TestWideMConcurrentBuildBuffer) {
   std::vector<std::future<size_t>> workers;
   for (size_t thread = 0; thread < kThreadCount; ++thread) {
     workers.emplace_back(std::async(std::launch::async, add_vectors,
-                                    thread * kVectorsPerThread));
+                                    thread * kVectorsPerThread,
+                                    kVectorsPerThread));
   }
   for (auto &worker : workers) {
     EXPECT_EQ(kVectorsPerThread, worker.get());
