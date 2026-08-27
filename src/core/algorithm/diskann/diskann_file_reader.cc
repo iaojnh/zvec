@@ -70,10 +70,6 @@ static void log_diskann_io_backend(ailego::IOBackendType type) {
 #if (defined(__linux) || defined(__linux__))
 typedef struct io_event io_event_t;
 typedef struct iocb iocb_t;
-
-// Retry budget for draining in-flight io_uring requests when the kernel
-// keeps returning EAGAIN/EBUSY (100 us sleep per retry, ~1 s total).
-static constexpr size_t kIoUringDrainRetries = 10000;
 #endif
 
 void log_diskann_io_backend() {
