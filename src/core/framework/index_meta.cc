@@ -44,7 +44,7 @@ namespace {
 bool ComputeElementSize(uint32_t data_type, uint32_t unit_size,
                         uint32_t dimension, uint32_t extra_meta_size,
                         uint32_t *element_size) {
-  if (data_type > static_cast<uint32_t>(IndexMeta::DataType::DT_BINARY64)) {
+  if (data_type > static_cast<uint32_t>(IndexMeta::DataType::DT_UINT8)) {
     return false;
   }
 
@@ -63,6 +63,7 @@ bool ComputeElementSize(uint32_t data_type, uint32_t unit_size,
     case IndexMeta::DataType::DT_FP64:
     case IndexMeta::DataType::DT_INT8:
     case IndexMeta::DataType::DT_INT16:
+    case IndexMeta::DataType::DT_UINT8:
       base_size = static_cast<uint64_t>(dimension) * unit_size;
       break;
     case IndexMeta::DataType::DT_INT4: {

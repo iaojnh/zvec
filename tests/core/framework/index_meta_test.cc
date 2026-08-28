@@ -66,7 +66,7 @@ TEST(IndexMeta, RejectsInvalidTypesUnitsAndElementSizeOverflow) {
   IndexMeta parsed;
   std::string invalid_type = serialized;
   WriteHeaderWord(&invalid_type, 3,
-                  static_cast<uint32_t>(IndexMeta::DataType::DT_BINARY64) + 1);
+                  static_cast<uint32_t>(IndexMeta::DataType::DT_UINT8) + 1);
   EXPECT_FALSE(parsed.deserialize(invalid_type.data(), invalid_type.size()));
 
   std::string invalid_unit = serialized;
