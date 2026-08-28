@@ -437,6 +437,14 @@ bool DiskAnnIndexParam::DeserializeFromJsonObject(
   DESERIALIZE_VALUE_FIELD(json_obj, list_size);
   DESERIALIZE_VALUE_FIELD(json_obj, pq_chunk_num);
 
+  if (max_degree <= 0 || list_size <= 0 || pq_chunk_num < 0) {
+    LOG_ERROR(
+        "Invalid DiskAnn parameters: max_degree=%d list_size=%d "
+        "pq_chunk_num=%d",
+        max_degree, list_size, pq_chunk_num);
+    return false;
+  }
+
   return true;
 }
 

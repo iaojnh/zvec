@@ -88,7 +88,8 @@ int setup_io_ctx(IOContext &ctx);
 int destroy_io_ctx(IOContext &ctx);
 
 // Log the current DiskAnn I/O backend (io_uring, libaio, or pread). Probes the
-// backend on first call. No-op outside Linux and macOS.
+// backend on first call. No-op outside Linux and macOS; Android and iOS always
+// use synchronous pread.
 void log_diskann_io_backend();
 
 struct AlignedRead {

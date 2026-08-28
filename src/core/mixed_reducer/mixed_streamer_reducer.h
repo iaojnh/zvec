@@ -59,12 +59,14 @@ class MixedStreamerReducer : public IndexStreamerReducer {
  private:
   int read_vec(size_t source_streamer_index,
                const IndexProvider::Pointer &provider,
-               const IndexFilter &filter, const uint32_t id_offset,
-               uint32_t *next_id);
+               const IndexFilter &filter, uint64_t id_offset, uint64_t *next_id,
+               uint64_t *source_span);
   void add_vec(int *result);
   void add_vec_with_builder(int *result);
-  int read_sparse_vec(size_t source_streamer_index, const IndexFilter &filter,
-                      const uint32_t id_offset, uint32_t *next_id);
+  int read_sparse_vec(size_t source_streamer_index,
+                      const IndexStreamer::SparseProvider::Pointer &provider,
+                      const IndexFilter &filter, uint64_t id_offset,
+                      uint64_t *next_id, uint64_t *source_span);
   void add_sparse_vec(int *result);
 
   void PushToDocCache(const IndexQueryMeta &meta, uint32_t doc_id,
@@ -99,7 +101,6 @@ class MixedStreamerReducer : public IndexStreamerReducer {
   ailego::Params params_;
   IndexStreamer::Pointer target_streamer_{nullptr};
   IndexReformer::Pointer target_streamer_reformer_{nullptr};
-  bool is_target_and_source_same_reformer_{false};
   IndexQueryMeta original_query_meta_{};
 
   std::vector<IndexStreamer::Pointer> streamers_;

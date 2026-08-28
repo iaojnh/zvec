@@ -1152,7 +1152,8 @@ Attributes:
     use_soar (bool): Whether to enable SOAR (Scalable Optimized Adaptive Routing)
         for improved IVF search performance. Default is False.
     quantize_type (QuantizeType): Optional quantization type for vector
-        compression (e.g., FP16, INT8). Default is ``QuantizeType.UNDEFINED``.
+        compression. DiskAnn currently supports ``QuantizeType.FP16`` only.
+        Default is ``QuantizeType.UNDEFINED``.
 
 Examples:
     >>> from zvec.typing import MetricType, QuantizeType
@@ -1188,8 +1189,9 @@ Args:
     n_iters (int, optional): Number of k-means iterations during training.
         Defaults to 10.
     use_soar (bool, optional): Enable SOAR optimization. Defaults to False.
-    quantize_type (QuantizeType, optional): Vector quantization type.
-        Defaults to QuantizeType.UNDEFINED.
+    quantize_type (QuantizeType, optional): Vector quantization type. DiskAnn
+        currently supports QuantizeType.FP16 only. Defaults to
+        QuantizeType.UNDEFINED.
     quantizer_param (QuantizerParam, optional): Quantizer configuration.
         Defaults to QuantizerParam().
 )pbdoc")

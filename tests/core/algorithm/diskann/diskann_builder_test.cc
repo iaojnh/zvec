@@ -19,10 +19,12 @@
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <gtest/gtest.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_framework.h>
-#include "diskann_holder.h"
+#include "diskann_builder_entity.h"
+#include "diskann_context.h"
 #include "diskann_params.h"
 
 using namespace zvec::core;
@@ -42,6 +44,40 @@ class DiskAnnBuilderTest : public testing::Test {
 
 std::string DiskAnnBuilderTest::_dir("DiskAnnBuilderTest");
 shared_ptr<IndexMeta> DiskAnnBuilderTest::_index_meta_ptr;
+
+class CountOverrideHolder : public IndexHolder {
+ public:
+  CountOverrideHolder(IndexHolder::Pointer holder, size_t declared_count)
+      : holder_(std::move(holder)), declared_count_(declared_count) {}
+
+  size_t count() const override {
+    return declared_count_;
+  }
+
+  size_t dimension() const override {
+    return holder_->dimension();
+  }
+
+  IndexMeta::DataType data_type() const override {
+    return holder_->data_type();
+  }
+
+  size_t element_size() const override {
+    return holder_->element_size();
+  }
+
+  bool multipass() const override {
+    return holder_->multipass();
+  }
+
+  Iterator::Pointer create_iterator() override {
+    return holder_->create_iterator();
+  }
+
+ private:
+  IndexHolder::Pointer holder_;
+  size_t declared_count_;
+};
 
 void DiskAnnBuilderTest::SetUp(void) {
   LoggerBroker::SetLevel(Logger::LEVEL_INFO);
@@ -85,6 +121,11 @@ TEST_F(DiskAnnBuilderTest, TestGeneral) {
 
   ASSERT_EQ(0, builder->build(holder));
 
+  // Dump must use the vectors captured by build, not reread a holder that may
+  // have changed after the graph and PQ data were finalized.
+  NumericalVector<float> late_vector(dim, -1.0F);
+  ASSERT_TRUE(holder->emplace(doc_cnt, late_vector));
+
   auto dumper = IndexFactory::CreateDumper("FileDumper");
   ASSERT_NE(dumper, nullptr);
 
@@ -100,6 +141,213 @@ TEST_F(DiskAnnBuilderTest, TestGeneral) {
   ASSERT_EQ(0UL, stats.discarded_count());
   ASSERT_GT(stats.trained_costtime(), 0UL);
   ASSERT_GT(stats.built_costtime(), 0UL);
+}
+
+TEST_F(DiskAnnBuilderTest, RejectsDuplicateValidKeysAtDump) {
+  DiskAnnBuilderEntity entity;
+  ASSERT_EQ(0, entity.init(*_index_meta_ptr, 16, 32, 0.0, 1));
+
+  std::vector<float> vector(dim, 1.0F);
+  EXPECT_EQ(0, entity.add_vector(42, vector.data()));
+  EXPECT_EQ(0, entity.add_vector(42, vector.data()));
+
+  // Invalid keys represent empty/deleted slots and may legitimately repeat.
+  EXPECT_EQ(0, entity.add_vector(kInvalidKey, vector.data()));
+  EXPECT_EQ(0, entity.add_vector(kInvalidKey, vector.data()));
+  EXPECT_EQ(4U, entity.doc_cnt());
+  EXPECT_EQ(IndexError_InvalidArgument, entity.add_vector(7, nullptr));
+
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, dumper);
+  ASSERT_EQ(0, dumper->create(_dir + "/DuplicateKeys"));
+  EXPECT_EQ(IndexError_Exist, entity.dump_key_mapping_segment(dumper));
+  EXPECT_EQ(0, dumper->close());
+
+  DiskAnnBuilderEntity holes;
+  ASSERT_EQ(0, holes.init(*_index_meta_ptr, 16, 32, 0.0, 1));
+  ASSERT_EQ(0, holes.add_vector(kInvalidKey, vector.data()));
+  ASSERT_EQ(0, holes.add_vector(kInvalidKey, vector.data()));
+  auto holes_dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, holes_dumper);
+  ASSERT_EQ(0, holes_dumper->create(_dir + "/InvalidKeySlots"));
+  EXPECT_EQ(0, holes.dump_key_mapping_segment(holes_dumper));
+  EXPECT_EQ(0, holes_dumper->close());
+}
+
+TEST_F(DiskAnnBuilderTest, NeighborStorageIsNaturallyAligned) {
+  DiskAnnBuilderEntity entity;
+  ASSERT_EQ(0, entity.init(*_index_meta_ptr, 1, 1, 0.0, 1));
+
+  std::vector<float> vector(dim, 1.0F);
+  ASSERT_EQ(0, entity.add_vector(0, vector.data()));
+
+  auto neighbors = entity.get_neighbors(0);
+  ASSERT_NE(nullptr, neighbors.second);
+  EXPECT_EQ(0U, reinterpret_cast<uintptr_t>(neighbors.second) %
+                    alignof(diskann_id_t));
+
+  ASSERT_EQ(0, entity.add_neighbor(0, 7));
+  neighbors = entity.get_neighbors(0);
+  ASSERT_EQ(1U, neighbors.first);
+  EXPECT_EQ(7U, neighbors.second[0]);
+
+  DiskAnnBuilderEntity slack_entity;
+  ASSERT_EQ(0, slack_entity.init(*_index_meta_ptr, 100, 100, 0.0, 1));
+  ASSERT_EQ(0, slack_entity.add_vector(0, vector.data()));
+  for (diskann_id_t neighbor_id = 0; neighbor_id < 130; ++neighbor_id) {
+    ASSERT_EQ(0, slack_entity.add_neighbor(0, neighbor_id));
+  }
+  EXPECT_EQ(IndexError_IndexFull, slack_entity.add_neighbor(0, 130));
+}
+
+TEST_F(DiskAnnBuilderTest, RejectsInvalidGraphAndSamplingParameters) {
+  auto expect_invalid = [](const Params &params) {
+    auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+    ASSERT_NE(nullptr, builder);
+    EXPECT_EQ(IndexError_InvalidArgument,
+              builder->init(*_index_meta_ptr, params));
+  };
+
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 0U);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 0U);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_MAX_TRAIN_SAMPLE_COUNT, 0U);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO, 0.0);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO, 1.01);
+  expect_invalid(params);
+
+  params.clear();
+  params.set(PARAM_DISKANN_BUILDER_TRAIN_SAMPLE_RATIO,
+             std::numeric_limits<double>::quiet_NaN());
+  expect_invalid(params);
+
+  DiskAnnBuilderEntity entity;
+  EXPECT_EQ(IndexError_InvalidArgument,
+            entity.init(*_index_meta_ptr, 0, 1, 0.0, 1));
+  EXPECT_EQ(IndexError_InvalidArgument,
+            entity.init(*_index_meta_ptr, 1, 0, 0.0, 1));
+  ASSERT_EQ(0, entity.init(*_index_meta_ptr, 1, 1, 0.0, 1));
+  EXPECT_EQ(IndexError_InvalidLength, entity.reserve_space(0));
+  EXPECT_EQ(IndexError_InvalidLength,
+            entity.reserve_space((std::numeric_limits<size_t>::max)()));
+}
+
+TEST_F(DiskAnnBuilderTest, RejectsMismatchedHolderMetadata) {
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 16);
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 20);
+  params.set(PARAM_DISKANN_BUILDER_MAX_PQ_CHUNK_NUM, 1);
+  params.set(PARAM_DISKANN_BUILDER_THREAD_COUNT, 1);
+
+  auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+  ASSERT_NE(nullptr, builder);
+  ASSERT_EQ(0, builder->init(*_index_meta_ptr, params));
+
+  auto mismatched =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim / 2);
+  NumericalVector<float> short_vector(dim / 2, 1.0F);
+  ASSERT_TRUE(mismatched->emplace(0, short_vector));
+  EXPECT_EQ(IndexError_Mismatch, builder->train(mismatched));
+
+  auto valid =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  NumericalVector<float> vector(dim, 1.0F);
+  ASSERT_TRUE(valid->emplace(0, vector));
+  ASSERT_EQ(0, builder->train(valid));
+  EXPECT_EQ(IndexError_Mismatch, builder->build(mismatched));
+  EXPECT_EQ(0, builder->build(valid));
+}
+
+TEST_F(DiskAnnBuilderTest, FailedBuildDiscardsPartialEntity) {
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 16);
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 20);
+  params.set(PARAM_DISKANN_BUILDER_MAX_PQ_CHUNK_NUM, 1);
+  params.set(PARAM_DISKANN_BUILDER_THREAD_COUNT, 1);
+
+  auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+  ASSERT_NE(nullptr, builder);
+  ASSERT_EQ(0, builder->init(*_index_meta_ptr, params));
+
+  auto valid =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  for (size_t i = 0; i < 2; ++i) {
+    NumericalVector<float> vector(dim, static_cast<float>(i));
+    ASSERT_TRUE(valid->emplace(i, vector));
+  }
+  ASSERT_EQ(0, builder->train(valid));
+
+  auto incomplete =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  NumericalVector<float> vector(dim, 1.0F);
+  ASSERT_TRUE(incomplete->emplace(0, vector));
+  auto wrong_count = make_shared<CountOverrideHolder>(incomplete, 2);
+  EXPECT_EQ(IndexError_InvalidLength, builder->build(wrong_count));
+
+  // A failed build invalidates the trained state instead of appending a retry
+  // to the partial entity. Retraining starts from a clean entity.
+  EXPECT_EQ(IndexError_NoReady, builder->build(valid));
+  ASSERT_EQ(0, builder->train(valid));
+  EXPECT_EQ(0, builder->build(valid));
+}
+
+TEST_F(DiskAnnBuilderTest, PqSamplingUsesRatioAndWholeDataset) {
+  constexpr size_t kSamplingDim = 1;
+  constexpr size_t kDocCount = 100;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, kSamplingDim);
+  meta.set_metric("SquaredEuclidean", 0, Params());
+  auto holder = make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(
+      kSamplingDim);
+  for (size_t i = 0; i < kDocCount; ++i) {
+    NumericalVector<float> vector(kSamplingDim, static_cast<float>(i));
+    ASSERT_TRUE(holder->emplace(i, vector));
+  }
+
+  DiskAnnPqTrainer trainer(10, 0.5);
+  std::string sample_data;
+  size_t sample_size = 0;
+  ASSERT_EQ(0,
+            trainer.gen_random_sample(holder, meta, sample_data, sample_size));
+  EXPECT_EQ(10U, sample_size);
+  ASSERT_EQ(sample_size * sizeof(float), sample_data.size());
+
+  std::string prefix(sample_data.size(), '\0');
+  for (size_t i = 0; i < sample_size; ++i) {
+    const float value = static_cast<float>(i);
+    std::memcpy(prefix.data() + i * sizeof(float), &value, sizeof(value));
+  }
+  EXPECT_NE(prefix, sample_data)
+      << "PQ sampling must not always select the first vectors";
+
+  DiskAnnPqTrainer repeated_trainer(10, 0.5);
+  std::string repeated_data;
+  size_t repeated_size = 0;
+  ASSERT_EQ(0, repeated_trainer.gen_random_sample(holder, meta, repeated_data,
+                                                  repeated_size));
+  EXPECT_EQ(sample_size, repeated_size);
+  EXPECT_EQ(sample_data, repeated_data);
+
+  DiskAnnPqTrainer ratio_limited_trainer(100, 0.05);
+  ASSERT_EQ(0, ratio_limited_trainer.gen_random_sample(
+                   holder, meta, sample_data, sample_size));
+  EXPECT_EQ(5U, sample_size);
+
+  DiskAnnPqTrainer invalid_trainer(0, 1.0);
+  EXPECT_EQ(IndexError_InvalidArgument,
+            invalid_trainer.gen_random_sample(holder, meta, sample_data,
+                                              sample_size));
 }
 
 // Regression test: building a small DiskAnn index must complete quickly.
@@ -143,6 +391,55 @@ TEST_F(DiskAnnBuilderTest, SmallDatasetBuildTime) {
   EXPECT_LT(elapsed_ms, 5000)
       << "DiskAnn build with " << kSmallDocCnt << " vectors took " << elapsed_ms
       << " ms — likely a lost-wakeup regression in progress loops.";
+}
+
+TEST_F(DiskAnnBuilderTest, SingleDocumentIndexCanBeSearched) {
+  auto builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+  ASSERT_NE(nullptr, builder);
+
+  auto holder =
+      make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  NumericalVector<float> vector(dim, 1.0F);
+  ASSERT_TRUE(holder->emplace(7, vector));
+
+  Params params;
+  params.set(PARAM_DISKANN_BUILDER_MAX_DEGREE, 16);
+  params.set(PARAM_DISKANN_BUILDER_LIST_SIZE, 32);
+  params.set(PARAM_DISKANN_BUILDER_MAX_PQ_CHUNK_NUM, 1);
+  params.set(PARAM_DISKANN_BUILDER_THREAD_COUNT, 1);
+  ASSERT_EQ(0, builder->init(*_index_meta_ptr, params));
+  ASSERT_EQ(0, builder->train(holder));
+  ASSERT_EQ(0, builder->build(holder));
+
+  const string path = _dir + "/SingleDocumentIndexCanBeSearched";
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, dumper);
+  ASSERT_EQ(0, dumper->create(path));
+  ASSERT_EQ(0, builder->dump(dumper));
+  ASSERT_EQ(0, dumper->close());
+
+  auto storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->open(path, false));
+
+  auto searcher = IndexFactory::CreateSearcher("DiskAnnSearcher");
+  ASSERT_NE(nullptr, searcher);
+  Params search_params;
+  search_params.set(PARAM_DISKANN_SEARCHER_LIST_SIZE, 32);
+  ASSERT_EQ(0, searcher->init(search_params));
+  ASSERT_EQ(0, searcher->load(storage, IndexMetric::Pointer()));
+
+  auto context = searcher->create_context();
+  ASSERT_NE(nullptr, context);
+  auto *diskann_context = dynamic_cast<DiskAnnContext *>(context.get());
+  ASSERT_NE(nullptr, diskann_context);
+  EXPECT_EQ(1U, diskann_context->list_size());
+
+  context->set_topk(1);
+  IndexQueryMeta query_meta(IndexMeta::DataType::DT_FP32, dim);
+  ASSERT_EQ(0, searcher->search_impl(vector.data(), query_meta, context));
+  ASSERT_EQ(1U, context->result().size());
+  EXPECT_EQ(7U, context->result()[0].key());
 }
 
 TEST_F(DiskAnnBuilderTest, MemoryLimitCapsPqChunkCount) {

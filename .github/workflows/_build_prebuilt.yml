@@ -397,14 +397,15 @@ jobs:
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           echo "Using NDK: $NDK"
-          # c++_static matches scripts/build_android.sh since #627: the
-          # slimmed libraries are self-contained, no shared libc++ needed.
+          # The packaged C++ API exchanges STL objects across the shared-library
+          # boundary, so zvec and its consumers must use the same libc++.
+          # c++_static is reserved for the build-tree static SDK targets.
           cmake -S . -B build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_NDK="$NDK" \
             -DANDROID_ABI="$ZVEC_ANDROID_ABI" \
             -DANDROID_NATIVE_API_LEVEL="$ZVEC_ANDROID_API_LEVEL" \
-            -DANDROID_STL=c++_static \
+            -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$ZVEC_INSTALL_DIR" \
             -DBUILD_TOOLS=OFF \
@@ -437,8 +438,28 @@ jobs:
         run: |
           mkdir -p "$ZVEC_DIST_DIR"
           cp -R "$ZVEC_INSTALL_DIR"/. "$ZVEC_DIST_DIR"/.
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          case "$ZVEC_ANDROID_ABI" in
+            arm64-v8a) LIBCXX_TRIPLE=aarch64-linux-android ;;
+            armeabi-v7a) LIBCXX_TRIPLE=arm-linux-androideabi ;;
+            x86) LIBCXX_TRIPLE=i686-linux-android ;;
+            x86_64) LIBCXX_TRIPLE=x86_64-linux-android ;;
+            *)
+              echo "Unsupported Android ABI: $ZVEC_ANDROID_ABI" >&2
+              exit 1
+              ;;
+          esac
+          LIBCXX_SHARED=$(find "$NDK/toolchains/llvm/prebuilt" -type f \
+            -path "*/sysroot/usr/lib/$LIBCXX_TRIPLE/libc++_shared.so" \
+            -print -quit)
+          if [ -z "$LIBCXX_SHARED" ]; then
+            echo "Unable to locate libc++_shared.so for $ZVEC_ANDROID_ABI" >&2
+            exit 1
+          fi
+          cp "$LIBCXX_SHARED" "$ZVEC_DIST_DIR/lib/libc++_shared.so"
           # Ship shared libraries only (same policy as desktop platforms).
           rm -f "$ZVEC_DIST_DIR"/lib/*.a
+          test -f "$ZVEC_DIST_DIR/lib/libc++_shared.so"
 
       - name: Smoke-test staged SDK (link only)
         shell: bash
@@ -451,6 +472,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI="$ZVEC_ANDROID_ABI" \
             -DANDROID_NATIVE_API_LEVEL="$ZVEC_ANDROID_API_LEVEL" \
+            -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DZVEC_SDK_DIR="$ZVEC_DIST_DIR"
           cmake --build build_smoke --parallel 2

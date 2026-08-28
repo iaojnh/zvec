@@ -114,13 +114,22 @@ endif()
 include_directories(${PROJECT_ROOT_DIR}/src/include)
 include_directories(${PROJECT_ROOT_DIR}/src)
 
-option(BUILD_ZVEC_SHARED "Build all-in-one C++ shared library libzvec" ON)
-option(BUILD_ZVEC_AILEGO_SHARED "Build all-in-one zvec-ailego shared library libzvec_ailego" ON)
-option(BUILD_ZVEC_CORE_SHARED "Build all-in-one zvec-core shared library libzvec_core" ON)
+set(ZVEC_CPP_SHARED_DEFAULT ON)
+if(ANDROID OR IOS)
+  # A C++ shared library built with a static libc++ cannot safely exchange STL
+  # objects with a mobile application. Mobile C++ consumers use the static SDK
+  # targets below; the shared C API remains available through BUILD_C_BINDINGS.
+  set(ZVEC_CPP_SHARED_DEFAULT OFF)
+endif()
+
+option(BUILD_ZVEC_SHARED "Build all-in-one C++ shared library libzvec" ${ZVEC_CPP_SHARED_DEFAULT})
+option(BUILD_ZVEC_AILEGO_SHARED "Build all-in-one zvec-ailego shared library libzvec_ailego" ${ZVEC_CPP_SHARED_DEFAULT})
+option(BUILD_ZVEC_CORE_SHARED "Build all-in-one zvec-core shared library libzvec_core" ${ZVEC_CPP_SHARED_DEFAULT})
 
 option(BUILD_PYTHON_BINDINGS "Build Python bindings using pybind11" OFF)
 option(BUILD_C_BINDINGS "Build C bindings" ON)
 option(BUILD_TOOLS "Build tools" ON)
+option(BUILD_CPP_EXAMPLES "Build C++ examples" OFF)
 
 message(STATUS "BUILD_ZVEC_SHARED:${BUILD_ZVEC_SHARED}")
 message(STATUS "BUILD_ZVEC_AILEGO_SHARED:${BUILD_ZVEC_AILEGO_SHARED}")
@@ -128,6 +137,7 @@ message(STATUS "BUILD_ZVEC_CORE_SHARED:${BUILD_ZVEC_CORE_SHARED}")
 message(STATUS "BUILD_PYTHON_BINDINGS:${BUILD_PYTHON_BINDINGS}")
 message(STATUS "BUILD_C_BINDINGS:${BUILD_C_BINDINGS}")
 message(STATUS "BUILD_TOOLS:${BUILD_TOOLS}")
+message(STATUS "BUILD_CPP_EXAMPLES:${BUILD_CPP_EXAMPLES}")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64" AND NOT ANDROID AND NOT IOS)
   include(CheckCXXCompilerFlag)
@@ -163,17 +173,48 @@ message(STATUS "RABITQ_SUPPORTED: ${RABITQ_SUPPORTED}")
 
 # DiskAnn support:
 #   - Linux x86_64 and ARM64 with io_uring, libaio, or pread
+#   - 64-bit Android and iOS with the portable synchronous pread backend
 #   - macOS ARM64 (Apple Silicon) with synchronous pread
 #   - Windows x86_64 with overlapped I/O
-if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$" AND NOT ANDROID AND NOT IOS)
-    OR (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" AND NOT IOS)
-    OR (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"))
+set(DISKANN_SUPPORTED OFF)
+set(_diskann_unsupported_reason
+    "unsupported target ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+
+# All supported targets require 64-bit pointers. This is also the authoritative
+# gate for Android, whose ABI-specific processor names vary.
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(_diskann_unsupported_reason
+      "32-bit targets are not supported (CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P})")
+elseif(ANDROID OR IOS)
   set(DISKANN_SUPPORTED ON)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$")
+    set(DISKANN_SUPPORTED ON)
+  else()
+    set(_diskann_unsupported_reason
+        "Linux requires x86_64 or ARM64 (detected ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+    set(DISKANN_SUPPORTED ON)
+  else()
+    set(_diskann_unsupported_reason
+        "macOS requires ARM64 (detected ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+elseif(WIN32)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(DISKANN_SUPPORTED ON)
+  else()
+    set(_diskann_unsupported_reason
+        "Windows requires x86_64 (detected ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+endif()
+
+if(DISKANN_SUPPORTED)
   add_definitions(-DDISKANN_SUPPORTED=1)
 else()
-  set(DISKANN_SUPPORTED OFF)
   add_definitions(-DDISKANN_SUPPORTED=0)
-  message(STATUS "DiskAnn support disabled for ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+  message(STATUS "DiskAnn support disabled: ${_diskann_unsupported_reason}")
 endif()
 message(STATUS "DISKANN_SUPPORTED: ${DISKANN_SUPPORTED}")
 
@@ -185,6 +226,10 @@ message(STATUS "USE_OSS_MIRROR:${USE_OSS_MIRROR}")
 
 cc_directory(thirdparty)
 cc_directories(src)
+
+if(BUILD_CPP_EXAMPLES)
+  add_subdirectory(examples/c++ EXCLUDE_FROM_ALL)
+endif()
 
 cc_directories(tests)
 

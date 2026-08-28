@@ -46,22 +46,15 @@ endif()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(_zvec PRIVATE
             -Wl,--whole-archive
-            $<TARGET_FILE:core_knn_flat_static>
-            $<TARGET_FILE:core_knn_flat_sparse_static>
-            $<TARGET_FILE:core_knn_hnsw_static>
-            $<TARGET_FILE:core_knn_hnsw_rabitq_static>
-            $<TARGET_FILE:core_knn_ivf_rabitq_static>
-            $<TARGET_FILE:core_knn_hnsw_sparse_static>
-            $<TARGET_FILE:core_knn_ivf_static>
-            $<TARGET_FILE:core_knn_vamana_static>
-            $<TARGET_FILE:core_knn_cluster_static>
-            $<TARGET_FILE:core_knn_diskann_static>
-            $<TARGET_FILE:core_mix_reducer_static>
-            $<TARGET_FILE:core_metric_static>
-            $<TARGET_FILE:core_utility_static>
-            $<TARGET_FILE:core_quantizer_static>
+            $<TARGET_FILE:zvec>
+            $<TARGET_FILE:zvec_core>
+            $<TARGET_FILE:zvec_ailego>
+            $<TARGET_FILE:zvec_turbo>
             -Wl,--no-whole-archive
             zvec
+            zvec_core
+            zvec_ailego
+            zvec_turbo
             ${CMAKE_DL_LIBS}
     )
     target_link_options(_zvec PRIVATE
@@ -84,43 +77,27 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # DiskAnn runtime library.
 elseif (APPLE)
     target_link_libraries(_zvec PRIVATE
-            -Wl,-force_load,$<TARGET_FILE:core_knn_flat_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_flat_sparse_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_hnsw_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_hnsw_rabitq_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_ivf_rabitq_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_hnsw_sparse_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_ivf_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_vamana_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_cluster_static>
-            -Wl,-force_load,$<TARGET_FILE:core_knn_diskann_static>
-            -Wl,-force_load,$<TARGET_FILE:core_mix_reducer_static>
-            -Wl,-force_load,$<TARGET_FILE:core_metric_static>
-            -Wl,-force_load,$<TARGET_FILE:core_utility_static>
-            -Wl,-force_load,$<TARGET_FILE:core_quantizer_static>
+            -Wl,-force_load,$<TARGET_FILE:zvec>
+            -Wl,-force_load,$<TARGET_FILE:zvec_core>
+            -Wl,-force_load,$<TARGET_FILE:zvec_ailego>
+            -Wl,-force_load,$<TARGET_FILE:zvec_turbo>
             zvec
+            zvec_core
+            zvec_ailego
+            zvec_turbo
     )
     target_link_libraries(_zvec PRIVATE
             -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/exports.mac
     )
 elseif (MSVC)
     set(_zvec_whole_archive_libs
-            core_knn_flat_static
-            core_knn_flat_sparse_static
-            core_knn_hnsw_static
-            core_knn_hnsw_sparse_static
-            core_knn_ivf_static
-            core_knn_vamana_static
-            core_knn_cluster_static
-            core_knn_diskann_static
-            core_mix_reducer_static
-            core_metric_static
-            core_utility_static
-            core_quantizer_static
+            zvec
+            zvec_core
+            zvec_ailego
+            zvec_turbo
     )
     target_link_libraries(_zvec PRIVATE
             ${_zvec_whole_archive_libs}
-            zvec
     )
     foreach(_lib ${_zvec_whole_archive_libs})
         target_link_options(_zvec PRIVATE

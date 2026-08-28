@@ -14,10 +14,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <zvec/core/framework/index_context.h>
@@ -149,7 +152,7 @@ class ZVEC_CORE_API Index {
 
   bool is_dirty() const;
 
-  uint32_t get_doc_count() const;
+  virtual uint32_t get_doc_count() const;
 
   core::IndexStreamer::Pointer index_searcher();
 
@@ -211,8 +214,28 @@ class ZVEC_CORE_API Index {
   bool init_context();
   core::IndexContext::Pointer &acquire_context();
 
+  core::IndexStreamer::Pointer streamer_snapshot() const {
+    return std::atomic_load_explicit(&streamer_, std::memory_order_acquire);
+  }
+
+  core::IndexStreamer::Pointer exchange_streamer(
+      core::IndexStreamer::Pointer replacement) {
+    return std::atomic_exchange_explicit(&streamer_, std::move(replacement),
+                                         std::memory_order_acq_rel);
+  }
+
+  core::IndexStorage::Pointer storage_snapshot() const {
+    return std::atomic_load_explicit(&storage_, std::memory_order_acquire);
+  }
+
+  core::IndexStorage::Pointer exchange_storage(
+      core::IndexStorage::Pointer replacement) {
+    return std::atomic_exchange_explicit(&storage_, std::move(replacement),
+                                         std::memory_order_acq_rel);
+  }
+
  protected:
-  bool is_trained_{false};
+  std::atomic<bool> is_trained_{false};
 
   BaseIndexParam param_;
   ailego::Params proxima_index_params_{};
@@ -392,6 +415,8 @@ class ZVEC_CORE_API DiskAnnIndex : public Index {
  public:
   DiskAnnIndex() = default;
 
+  uint32_t get_doc_count() const override;
+
  protected:
   int CreateAndInitStreamer(const BaseIndexParam &param) override;
 
@@ -413,9 +438,12 @@ class ZVEC_CORE_API DiskAnnIndex : public Index {
   int GenerateHolder();
 
  private:
+  int CommitBuiltSnapshot(bool *snapshot_replaced);
+
   DiskAnnIndexParam param_{};
-  std::mutex mutex_{};
-  std::vector<std::pair<uint64_t, std::string>> doc_cache_;
+  mutable std::mutex mutex_{};
+  bool is_training_{false};
+  std::map<uint64_t, std::string> doc_cache_;
   core::IndexHolder::Pointer holder_{};
   std::string file_path_;
 };

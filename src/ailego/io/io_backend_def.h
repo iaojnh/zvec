@@ -50,6 +50,8 @@ inline const char *IOBackendTypeName(IOBackendType type) {
       return "pread";
     case IOBackendType::kWindowsOverlapped:
       return "windows_overlapped";
+    case IOBackendType::kUnavailable:
+      return "unavailable";
   }
   return "unknown";
 }
@@ -76,6 +78,8 @@ inline const char *IOBackendDescription(IOBackendType type) {
     case IOBackendType::kWindowsOverlapped:
       return "windows_overlapped: Windows unbuffered overlapped I/O backend "
              "using per-context I/O completion ports.";
+    case IOBackendType::kUnavailable:
+      return "unavailable: DiskAnn is disabled on this target.";
   }
   return "Unknown I/O backend.";
 }
@@ -93,13 +97,20 @@ class IOBackend {
   }
 
   // Returns the active backend, probing on the first call. Linux prefers
-  // io_uring, then libaio, then pread; macOS ARM64 uses pread.
+  // io_uring, then libaio, then pread; Windows uses overlapped I/O; macOS
+  // ARM64, Android and iOS use pread.
+  //
+  // Android is deliberately excluded from async probing: its seccomp sandbox
+  // may not permit the io_uring_setup() syscall, and a blocked syscall raises
+  // SIGSYS rather than returning an error, so probing could crash the process.
   IOBackendType available() {
     std::call_once(probe_once_, [this]() {
       IOBackendType selected = IOBackendType::kPread;
-#if defined(_WIN32) || defined(_WIN64)
+#if !defined(DISKANN_SUPPORTED) || !DISKANN_SUPPORTED
+      selected = IOBackendType::kUnavailable;
+#elif defined(_WIN32) || defined(_WIN64)
       selected = IOBackendType::kWindowsOverlapped;
-#elif defined(__linux) || defined(__linux__)
+#elif (defined(__linux) || defined(__linux__)) && !defined(__ANDROID__)
       if (io_uring_supported()) {
         selected = IOBackendType::kIoUring;
       } else if (LibAioLoader::Instance().load() &&
@@ -124,6 +135,20 @@ class IOBackend {
     return available() == IOBackendType::kIoUring;
   }
 
+  // Persist a per-context setup fallback as the process-wide selection. The
+  // Linux enum values are ordered from the synchronous backend to the most
+  // capable asynchronous backend, so this operation is monotonic: a racing
+  // successful setup can never promote the process after another context has
+  // demonstrated that the preferred backend is unavailable at runtime.
+  void downgrade(IOBackendType fallback) {
+    IOBackendType current = type_.load(std::memory_order_acquire);
+    while (static_cast<int>(fallback) < static_cast<int>(current) &&
+           !type_.compare_exchange_weak(current, fallback,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+    }
+  }
+
   // Returns the cached backend type without triggering the probe.
   IOBackendType type() const {
     return type_.load(std::memory_order_acquire);
@@ -142,7 +167,7 @@ class IOBackend {
  private:
   IOBackend() = default;
 
-#if defined(__linux) || defined(__linux__)
+#if (defined(__linux) || defined(__linux__)) && !defined(__ANDROID__)
   // Probe io_uring availability with a minimal ring setup using only raw
   // syscalls — no dependency on liburing.  A successful setup alone is NOT
   // sufficient: io_uring_setup() exists since Linux 5.1, but the read path

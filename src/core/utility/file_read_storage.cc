@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <limits>
 #include <ailego/utility/memory_helper.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/utility/file_helper.h>
@@ -89,10 +90,10 @@ class FileReadStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
+      if (ailego_unlikely(offset > region_size_)) {
+        offset = region_size_;
+        len = 0;
+      } else if (ailego_unlikely(len > region_size_ - offset)) {
         len = region_size_ - offset;
       }
       return file_ptr_->read(data_offset_ + offset, buf, len);
@@ -100,25 +101,25 @@ class FileReadStorage : public IndexStorage {
 
     //! Read data from segment
     size_t read(size_t offset, const void **data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
+      if (ailego_unlikely(offset > region_size_)) {
+        offset = region_size_;
+        len = 0;
+      } else if (ailego_unlikely(len > region_size_ - offset)) {
         len = region_size_ - offset;
       }
-      buffer_.reserve(len);
+      buffer_.resize(len);
       *data = buffer_.data();
       return file_ptr_->read(data_offset_ + offset, (void *)*data, len);
     }
 
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
+      if (ailego_unlikely(offset > region_size_)) {
+        offset = region_size_;
+        len = 0;
+      } else if (ailego_unlikely(len > region_size_ - offset)) {
         len = region_size_ - offset;
       }
-      buffer_.reserve(len);
+      buffer_.resize(len);
       data.reset(buffer_.data());
       return file_ptr_->read(data_offset_ + offset, (void *)data.data(), len);
     }
@@ -127,12 +128,15 @@ class FileReadStorage : public IndexStorage {
     bool read(SegmentData *iovec, size_t count) override {
       size_t total = 0u;
       for (auto *it = iovec, *end = iovec + count; it != end; ++it) {
-        ailego_false_if_false(it->offset + it->length <= region_size_);
+        ailego_false_if_false(it->offset <= region_size_);
+        ailego_false_if_false(it->length <= region_size_ - it->offset);
+        ailego_false_if_false(it->length <=
+                              std::numeric_limits<size_t>::max() - total);
         total += it->length;
       }
       ailego_false_if_false(total != 0);
 
-      buffer_.reserve(total);
+      buffer_.resize(total);
       uint8_t *buf = buffer_.data();
       for (auto *it = iovec, *end = iovec + count; it != end; ++it) {
         ailego_false_if_false(file_ptr_->read(data_offset_ + it->offset, buf,
@@ -209,10 +213,10 @@ class FileReadStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
+      if (ailego_unlikely(offset > region_size_)) {
+        offset = region_size_;
+        len = 0;
+      } else if (ailego_unlikely(len > region_size_ - offset)) {
         len = region_size_ - offset;
       }
       memcpy(buf, data_ + offset, len);
@@ -221,10 +225,10 @@ class FileReadStorage : public IndexStorage {
 
     //! Read data from segment
     size_t read(size_t offset, const void **data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
+      if (ailego_unlikely(offset > region_size_)) {
+        offset = region_size_;
+        len = 0;
+      } else if (ailego_unlikely(len > region_size_ - offset)) {
         len = region_size_ - offset;
       }
       *data = data_ + offset;
@@ -232,10 +236,10 @@ class FileReadStorage : public IndexStorage {
     }
 
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
+      if (ailego_unlikely(offset > region_size_)) {
+        offset = region_size_;
+        len = 0;
+      } else if (ailego_unlikely(len > region_size_ - offset)) {
         len = region_size_ - offset;
       }
       data.reset((void *)(data_ + offset));
@@ -245,7 +249,8 @@ class FileReadStorage : public IndexStorage {
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
       for (auto *it = iovec, *end = iovec + count; it != end; ++it) {
-        ailego_false_if_false(it->offset + it->length <= region_size_);
+        ailego_false_if_false(it->offset <= region_size_);
+        ailego_false_if_false(it->length <= region_size_ - it->offset);
         it->data = data_ + it->offset;
       }
       return true;
@@ -327,15 +332,17 @@ class FileReadStorage : public IndexStorage {
     size_t size = end_offset > index_offset_ ? end_offset - index_offset_ : 0;
     auto read_data = [this, &file_ptr, end_offset](
                          size_t offset, const void **data, size_t len) {
-      buffer_.reserve(len);
-      *data = buffer_.data();
-      size_t off = index_offset_ + offset;
-      if (off + len > end_offset) {
-        if (off > end_offset) {
-          off = end_offset;
-        }
+      size_t off = end_offset;
+      if (index_offset_ <= end_offset && offset <= end_offset - index_offset_) {
+        off = index_offset_ + offset;
+      } else {
+        len = 0;
+      }
+      if (len > end_offset - off) {
         len = end_offset - off;
       }
+      buffer_.resize(len);
+      *data = buffer_.data();
       return file_ptr->read(off, (void *)*data, len);
     };
 

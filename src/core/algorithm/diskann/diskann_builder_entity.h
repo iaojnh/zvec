@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_holder.h>
 #include "diskann_entity.h"
@@ -49,8 +50,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   int init(const IndexMeta &meta, uint32_t max_degree, uint32_t list_size,
            double memory_limit, uint32_t build_threads);
 
-  int dump(IndexHolder::Pointer holder, IndexMeta &meta,
-           const IndexDumper::Pointer &dumper);
+  int dump(IndexMeta &meta, const IndexDumper::Pointer &dumper);
 
   int64_t dump_segment(const IndexDumper::Pointer &dumper,
                        const std::string &segment_id, const void *data,
@@ -62,7 +62,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   int dump_entrypoint_segment(const IndexDumper::Pointer &dumper) const;
   int dump_key_segment(const IndexDumper::Pointer &dumper) const;
 
-  int reserve_space(uint32_t docs);
+  int reserve_space(size_t docs);
 
   std::vector<uint8_t> &pq_full_pivot_data() {
     return pq_full_pivot_data_;
@@ -86,15 +86,15 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   double memory_limit_{0};
   uint32_t num_threads_{0};
   uint32_t max_build_degree_{0};
-  uint32_t max_observed_degree_{0};
-  uint32_t neighbor_size_{0};
+  std::atomic<uint32_t> max_observed_degree_{0};
+  uint32_t neighbor_stride_{0};
 
   std::string mem_index_file_{""};
   std::string index_path_prefix_{""};
 
   std::string vectors_buffer_{};
   std::string keys_buffer_{};
-  std::string neighbors_buffer_{};
+  std::vector<diskann_id_t> neighbors_buffer_{};
   std::vector<diskann_id_t> entrypoints_{};
 
   IndexMeta meta_;
@@ -103,6 +103,10 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   std::vector<uint8_t> pq_centroid_;
   std::vector<uint32_t> pq_chunk_offsets_;
   std::vector<uint8_t> block_compressed_data_;
+
+  int build_key_mapping(std::vector<diskann_id_t> *mapping) const;
+  int dump_key_mapping_segment(const IndexDumper::Pointer &dumper,
+                               const std::vector<diskann_id_t> &mapping) const;
 };
 
 }  // namespace core

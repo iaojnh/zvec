@@ -220,7 +220,8 @@ void ZVecPyConfig::Initialize(pybind11::module_ &m) {
       "Read the currently registered default jieba dict directory.");
 
   // Returns the selected DiskAnn I/O backend. Linux tries io_uring, then
-  // libaio, then pread; macOS ARM64 uses pread.
+  // libaio, then pread; macOS ARM64 uses pread. Unsupported targets report
+  // that DiskAnn is unavailable.
   m.def(
       "io_backend_type",
       []() -> ailego::IOBackendType {
@@ -230,8 +231,9 @@ void ZVecPyConfig::Initialize(pybind11::module_ &m) {
       "as an IOBackendType enum (zvec.typing.IOBackendType). "
       "Linux selects IOBackendType.IO_URING, IOBackendType.LIBAIO, or "
       "IOBackendType.PREAD in that order. macOS ARM64 uses "
-      "IOBackendType.PREAD. Windows uses "
-      "IOBackendType.WINDOWS_OVERLAPPED.");
+      "IOBackendType.PREAD. Windows x86_64 uses "
+      "IOBackendType.WINDOWS_OVERLAPPED. Unsupported target architectures "
+      "return IOBackendType.UNAVAILABLE.");
 
   // Returns a human-readable description identifying io_uring, libaio, or
   // pread, with asynchronous-backend guidance for Linux pread fallback.
@@ -241,7 +243,9 @@ void ZVecPyConfig::Initialize(pybind11::module_ &m) {
       "Returns a human-readable description of the current I/O backend. "
       "The description identifies io_uring, libaio, or pread. On Linux, the "
       "pread description includes guidance for enabling io_uring or "
-      "installing libaio. Windows reports its overlapped-I/O backend.");
+      "installing libaio. Windows reports its overlapped-I/O backend. "
+      "Unsupported target architectures report that DiskAnn is "
+      "unavailable.");
 }
 
 

@@ -14,6 +14,7 @@
 
 #include "diskann_searcher.h"
 #include <limits>
+#include <utility>
 #include <ailego/pattern/defer.h>
 #include "diskann_context.h"
 #include "diskann_indexer.h"
@@ -52,6 +53,10 @@ int DiskAnnSearcher::init(const ailego::Params &search_params) {
   uint32_t list_size = 200;
   uint32_t cache_nodes_num = 0;
   search_params.get(PARAM_DISKANN_SEARCHER_LIST_SIZE, &list_size);
+  if (list_size == 0) {
+    LOG_ERROR("list_size must be positive");
+    return IndexError_InvalidArgument;
+  }
   long long configured_cache_nodes = 0;
   if (search_params.get(PARAM_DISKANN_SEARCHER_CACHE_NODE_NUM,
                         &configured_cache_nodes)) {
@@ -100,6 +105,12 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
   if (state_ != STATE_INITED) {
     LOG_ERROR("Initialize and unload DiskAnnSearcher before loading an index");
     return IndexError_NoReady;
+  }
+  if (!storage->file()) {
+    LOG_ERROR(
+        "DiskAnn requires storage with a shared file handle; disable "
+        "proxima.file.read_storage.alone_file_handle");
+    return IndexError_InvalidArgument;
   }
 
   diskann_indexer_.reset();
@@ -246,6 +257,7 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
   ctx->resize_results(count);
 
   for (uint32_t i = 0; i < count; i++) {
+    ctx->visit_filter().clear();
     ctx->reset_query(query);
 
     ret = diskann_indexer_->knn_search(ctx);

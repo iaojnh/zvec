@@ -70,6 +70,9 @@ class DiskAnnBuilder : public IndexBuilder {
 
   int calculate_pq_chunk_num();
 
+  //! Publish the first worker failure before waking the coordinator.
+  bool record_worker_error(int error_code);
+
   double get_memory_in_bytes(double search_ram_budget) {
     return search_ram_budget * 1024 * 1024 * 1024;
   }

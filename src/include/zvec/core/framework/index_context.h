@@ -307,6 +307,24 @@ class IndexContext {
     return profiler_;
   }
 
+ protected:
+  //! Copy query-scoped state when a pooled context must be recreated for a
+  //! different index instance. Derived contexts remain responsible for their
+  //! own query parameters.
+  void copy_query_state_from(const IndexContext &other) {
+    filter_ = other.filter_;
+    group_by_ = other.group_by_;
+    threshold_ = other.threshold_;
+    if (threshold_ != std::numeric_limits<float>::max()) {
+      if (other.index_metric_ && other.index_metric_->support_normalize()) {
+        other.index_metric_->normalize(&threshold_);
+      }
+      if (index_metric_ && index_metric_->support_normalize()) {
+        index_metric_->denormalize(&threshold_);
+      }
+    }
+  }
+
  private:
   //! Members
   IndexFilter filter_{};

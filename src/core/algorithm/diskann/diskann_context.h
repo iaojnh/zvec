@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <algorithm>
 #include <zvec/core/framework/index_context.h>
 #include "utility/topk_result_builder.h"
 #include "diskann_dist_calculator.h"
@@ -145,7 +146,13 @@ class DiskAnnContext : public IndexContext,
   }
 
   void set_list_size(uint32_t list_size) {
-    list_size_ = list_size;
+    requested_list_size_ = list_size;
+    if (entity_ && entity_->doc_cnt() > 0) {
+      list_size_ = static_cast<uint32_t>(
+          std::min<uint64_t>(list_size, entity_->doc_cnt()));
+    } else {
+      list_size_ = list_size;
+    }
   }
 
   void set_fetch_vector(bool v) override {
@@ -159,6 +166,10 @@ class DiskAnnContext : public IndexContext,
 
   inline uint32_t list_size() const {
     return list_size_;
+  }
+
+  inline uint32_t requested_list_size() const {
+    return requested_list_size_;
   }
 
   inline void reset_query(const void *query) {
@@ -250,7 +261,7 @@ class DiskAnnContext : public IndexContext,
     group_num_ = rhs.group_num_;
     group_topk_ = rhs.group_topk_;
     group_topk_heaps_.clear();
-    list_size_ = rhs.list_size_;
+    set_list_size(rhs.requested_list_size_);
     fetch_vector_ = rhs.fetch_vector_;
     debug_mode_ = rhs.debug_mode_;
   }
@@ -307,6 +318,21 @@ class DiskAnnContext : public IndexContext,
     return group_num_ > 0;
   }
 
+  //! Preserve query options when a pooled DiskAnn context is recreated for a
+  //! different index whose buffers have a different layout.
+  void copy_query_state_from(const DiskAnnContext &other) {
+    IndexContext::copy_query_state_from(other);
+    topk_ = other.topk_;
+    set_list_size(other.requested_list_size_);
+    group_topk_ = other.group_topk_;
+    group_num_ = other.group_num_;
+    fetch_vector_ = other.fetch_vector_;
+    debug_mode_ = other.debug_mode_;
+    topk_heap_.clear();
+    topk_heap_.limit(topk_);
+    group_topk_heaps_.clear();
+  }
+
   //! Set group params
   void set_group_params(uint32_t group_num, uint32_t group_topk) override {
     group_num_ = group_num;
@@ -353,10 +379,14 @@ class DiskAnnContext : public IndexContext,
 
   void emplace_result_doc(IndexDocumentList &docs, diskann_id_t id, float score,
                           const VectorInfo &info) {
+    const diskann_key_t key = entity_->get_key(id);
+    if (key == kInvalidKey) {
+      return;
+    }
     if (fetch_vector_) {
-      docs.emplace_back(entity_->get_key(id), score, id, info.vec_);
+      docs.emplace_back(key, score, id, info.vec_);
     } else {
-      docs.emplace_back(entity_->get_key(id), score, id);
+      docs.emplace_back(key, score, id);
     }
   }
 
@@ -377,6 +407,7 @@ class DiskAnnContext : public IndexContext,
   uint32_t element_size_{0};
   uint32_t element_rotated_size_{0};
   uint32_t list_size_{0};
+  uint32_t requested_list_size_{0};
 
   TopkHeap topk_heap_{};
 

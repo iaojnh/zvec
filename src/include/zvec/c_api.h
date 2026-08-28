@@ -792,6 +792,8 @@ typedef uint32_t zvec_io_backend_type_t;
   2 /**< io_uring via raw Linux kernel syscalls (zero dependency) */
 #define ZVEC_IO_BACKEND_TYPE_WINDOWS_OVERLAPPED \
   3 /**< Windows overlapped I/O using per-context IOCP */
+#define ZVEC_IO_BACKEND_TYPE_UNAVAILABLE \
+  4 /**< DiskAnn is disabled on this target */
 
 /**
  * @brief Get the current I/O backend type for DiskAnn disk reads.
@@ -803,7 +805,9 @@ typedef uint32_t zvec_io_backend_type_t;
  * @return zvec_io_backend_type_t The loaded backend type
  *         ZVEC_IO_BACKEND_TYPE_IO_URING, ZVEC_IO_BACKEND_TYPE_LIBAIO,
  *         ZVEC_IO_BACKEND_TYPE_PREAD, or
- *         ZVEC_IO_BACKEND_TYPE_WINDOWS_OVERLAPPED.
+ *         ZVEC_IO_BACKEND_TYPE_WINDOWS_OVERLAPPED. Returns
+ *         ZVEC_IO_BACKEND_TYPE_UNAVAILABLE when DiskAnn is disabled for the
+ *         current target architecture.
  */
 ZVEC_EXPORT zvec_io_backend_type_t ZVEC_CALL zvec_get_io_backend_type(void);
 
@@ -813,7 +817,7 @@ ZVEC_EXPORT zvec_io_backend_type_t ZVEC_CALL zvec_get_io_backend_type(void);
  * @param type The backend type code.
  * @return Thread-local string valid until the next call on this thread;
  *         "io_uring", "libaio", "pread", "windows_overlapped", or
- *         "unknown".
+ *         "unavailable"; unknown numeric values return "unknown".
  */
 ZVEC_EXPORT const char *ZVEC_CALL
 zvec_get_io_backend_type_name(zvec_io_backend_type_t type);

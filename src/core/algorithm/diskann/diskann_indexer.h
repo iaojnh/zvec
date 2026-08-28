@@ -25,6 +25,7 @@ namespace zvec {
 namespace core {
 
 class DiskAnnCacheTestPeer;
+class DiskAnnStreamerTestPeer;
 
 class DiskAnnIndexer {
  public:
@@ -87,6 +88,11 @@ class DiskAnnIndexer {
   int prepare_cache_storage(size_t capacity, CacheLoadState &state);
   int load_cache_list(CacheLoadState &state);
   int cache_bfs_levels(uint64_t num_nodes_to_cache, CacheLoadState &state);
+  int parse_node_neighbors(const uint8_t *node_buf, diskann_id_t node_id,
+                           uint32_t &neighbor_count,
+                           diskann_id_t *neighbors) const;
+  bool should_include_result(DiskAnnContext *ctx, diskann_id_t id,
+                             diskann_key_t *key) const;
   void reset_cache_storage();
   int cached_beam_search_impl(DiskAnnContext *ctx);
 
@@ -125,6 +131,7 @@ class DiskAnnIndexer {
   uint64_t doc_cnt_{0};
 
   friend class DiskAnnCacheTestPeer;
+  friend class DiskAnnStreamerTestPeer;
 };
 
 }  // namespace core

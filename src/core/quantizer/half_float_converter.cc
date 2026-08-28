@@ -57,7 +57,7 @@ class HalfFloatHolder : public IndexHolder {
 
     //! Retrieve pointer of data
     const void *data(void) const override {
-      return buffer_.data();
+      return data_valid_ ? buffer_.data() : nullptr;
     }
 
     //! Test if the iterator is valid
@@ -78,16 +78,23 @@ class HalfFloatHolder : public IndexHolder {
 
    private:
     inline void transform_record(void) {
-      if (front_iter_->is_valid()) {
-        owner_->convert_func_(
-            reinterpret_cast<const float *>(front_iter_->data()),
-            buffer_.size(), buffer_.data());
+      data_valid_ = false;
+      if (!front_iter_->is_valid()) {
+        return;
       }
+      const void *data = front_iter_->data();
+      if (!data) {
+        return;
+      }
+      owner_->convert_func_(reinterpret_cast<const float *>(data),
+                            buffer_.size(), buffer_.data());
+      data_valid_ = true;
     }
 
     const HalfFloatHolder *owner_{nullptr};
     std::vector<uint16_t> buffer_{};
     IndexHolder::Iterator::Pointer front_iter_{};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -164,6 +171,7 @@ class HalfFloatConverter : public IndexConverter {
 
   //! Cleanup Converter
   int cleanup(void) override {
+    holder_.reset();
     return 0;
   }
 
@@ -254,7 +262,7 @@ class HalfFloatSparseHolder : public IndexSparseHolder {
 
     //! Retrieve sparse data
     const void *sparse_data() const override {
-      return sparse_buffer_.data();
+      return data_valid_ ? sparse_buffer_.data() : nullptr;
     }
 
     //! Next iterator
@@ -265,17 +273,27 @@ class HalfFloatSparseHolder : public IndexSparseHolder {
 
    private:
     inline void transform_record(void) {
-      if (front_iter_->is_valid()) {
-        ailego::FloatHelper::ToFP16(
-            reinterpret_cast<const float *>(front_iter_->sparse_data()),
-            front_iter_->sparse_count(), sparse_buffer_.data());
+      data_valid_ = false;
+      if (!front_iter_->is_valid()) {
+        return;
       }
+      const uint32_t sparse_count = front_iter_->sparse_count();
+      const void *data = front_iter_->sparse_data();
+      if (sparse_count != 0 && !data) {
+        return;
+      }
+      if (sparse_count != 0) {
+        ailego::FloatHelper::ToFP16(reinterpret_cast<const float *>(data),
+                                    sparse_count, sparse_buffer_.data());
+      }
+      data_valid_ = true;
     }
 
     constexpr static uint32_t MAX_DIM_COUNT = 4096;
     std::vector<uint16_t> sparse_buffer_{};
 
     IndexSparseHolder::Iterator::Pointer front_iter_{};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -343,6 +361,7 @@ class HalfFloatSparseConverter : public IndexConverter {
 
   //! Cleanup Converter
   int cleanup(void) override {
+    holder_.reset();
     return 0;
   }
 

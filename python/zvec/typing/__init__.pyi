@@ -134,6 +134,7 @@ class IOBackendType:
     - IO_URING: io_uring via raw kernel syscalls (zero dependency).
     - WINDOWS_OVERLAPPED: Windows unbuffered overlapped I/O using per-context
       I/O completion ports.
+    - UNAVAILABLE: DiskAnn is disabled on this target architecture.
 
     Examples:
         >>> from zvec.typing import IOBackendType
@@ -150,6 +151,8 @@ class IOBackendType:
       IO_URING
 
       WINDOWS_OVERLAPPED
+
+      UNAVAILABLE
     """
 
     PREAD: typing.ClassVar[IOBackendType]  # value = <IOBackendType.PREAD: 0>
@@ -158,9 +161,12 @@ class IOBackendType:
     WINDOWS_OVERLAPPED: typing.ClassVar[
         IOBackendType
     ]  # value = <IOBackendType.WINDOWS_OVERLAPPED: 3>
+    UNAVAILABLE: typing.ClassVar[
+        IOBackendType
+    ]  # value = <IOBackendType.UNAVAILABLE: 4>
     __members__: typing.ClassVar[
         dict[str, IOBackendType]
-    ]  # value includes PREAD, LIBAIO, IO_URING, and WINDOWS_OVERLAPPED
+    ]  # value includes PREAD, LIBAIO, IO_URING, WINDOWS_OVERLAPPED, and UNAVAILABLE
 
     def __eq__(self, other: typing.Any) -> bool: ...
     def __getstate__(self) -> int: ...

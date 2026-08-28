@@ -109,6 +109,10 @@ class UniformUint8Converter : public IndexConverter {
 
     for (; iterator->is_valid(); iterator->next()) {
       const auto *vector = static_cast<const float *>(iterator->data());
+      if (!vector) {
+        LOG_ERROR("UniformUint8Converter: failed to read training vector");
+        return IndexError_ReadData;
+      }
       for (size_t i = 0; i < original_dimension_; ++i) {
         const float value = vector[i];
         if (!std::isfinite(value)) {
@@ -238,7 +242,7 @@ class UniformUint8Converter : public IndexConverter {
       }
 
       const void *data(void) const override {
-        return buffer_.data();
+        return data_valid_ ? buffer_.data() : nullptr;
       }
 
       bool is_valid(void) const override {
@@ -256,17 +260,23 @@ class UniformUint8Converter : public IndexConverter {
 
      private:
       void encode() {
+        data_valid_ = false;
         if (!is_valid()) {
           return;
         }
-        EncodeRecord(static_cast<const float *>(iterator_->data()),
-                     owner_->original_dimension_, owner_->scale_, owner_->bias_,
-                     buffer_.data());
+        const float *vector = static_cast<const float *>(iterator_->data());
+        if (!vector) {
+          return;
+        }
+        EncodeRecord(vector, owner_->original_dimension_, owner_->scale_,
+                     owner_->bias_, buffer_.data());
+        data_valid_ = true;
       }
 
       const UniformUint8Holder *owner_;
       std::vector<int8_t> buffer_;
       IndexHolder::Iterator::Pointer iterator_;
+      bool data_valid_{false};
     };
 
     UniformUint8Holder(IndexHolder::Pointer holder, size_t original_dimension,

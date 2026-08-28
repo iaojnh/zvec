@@ -151,6 +151,7 @@ Enumeration of supported I/O backend types for DiskAnn disk reads.
 - IO_URING: io_uring via raw kernel syscalls (zero dependency).
 - WINDOWS_OVERLAPPED: Windows unbuffered overlapped I/O using per-context
   I/O completion ports.
+- UNAVAILABLE: DiskAnn is disabled on this target architecture.
 
 Examples:
     >>> from zvec.typing import IOBackendType
@@ -160,7 +161,8 @@ Examples:
       .value("PREAD", ailego::IOBackendType::kPread)
       .value("LIBAIO", ailego::IOBackendType::kLibAio)
       .value("IO_URING", ailego::IOBackendType::kIoUring)
-      .value("WINDOWS_OVERLAPPED", ailego::IOBackendType::kWindowsOverlapped);
+      .value("WINDOWS_OVERLAPPED", ailego::IOBackendType::kWindowsOverlapped)
+      .value("UNAVAILABLE", ailego::IOBackendType::kUnavailable);
 }
 
 void ZVecPyTyping::bind_status(py::module_ &m) {

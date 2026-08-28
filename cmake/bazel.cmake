@@ -616,16 +616,13 @@ function(_absolute_paths _RESULT)
   set(${_RESULT} "${FILEPATHS}" PARENT_SCOPE)
 endfunction()
 
-## Add both shared and static library
+## Add a main library target and an explicit static variant.
 macro(_add_library _NAME _OPTION)
   add_library(${_NAME}_objects OBJECT ${_OPTION} ${ARGN})
   if(IOS)
-    # iOS has no shared libraries, so the main target is static as well.
-    # Building a second, identical archive under the ${_NAME}_static name is
-    # not just wasteful, it breaks the build: giving both the same OUTPUT_NAME
-    # makes Ninja fail ("multiple rules generate ..."), while distinct names
-    # make targets that link both variants fail with duplicate symbols.
-    # A single archive exposed under both names avoids both problems.
+    # iOS has no shared libraries. Expose the single static archive under both
+    # target names to avoid duplicate objects while preserving callers of the
+    # explicit _static target.
     add_library(
         ${_NAME} STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
       )
@@ -634,9 +631,23 @@ macro(_add_library _NAME _OPTION)
     add_library(
         ${_NAME}_static STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
       )
-    add_library(
-        ${_NAME} SHARED ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
-      )
+    if(ANDROID AND ANDROID_STL STREQUAL "c++_static")
+      add_library(
+          ${_NAME} STATIC ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
+        )
+      # Keep both Android static build targets but give the main archive a
+      # distinct file name. Canonicalization ensures only the main archive is
+      # whole-archived when both target names appear in a dependency graph.
+      set_property(TARGET ${_NAME} PROPERTY OUTPUT_NAME ${_NAME}_main)
+      set_property(
+        TARGET ${_NAME} PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
+      set_property(
+        TARGET ${_NAME}_static PROPERTY ZVEC_CANONICAL_LINK_TARGET ${_NAME})
+    else()
+      add_library(
+          ${_NAME} SHARED ${_OPTION} $<TARGET_OBJECTS:${_NAME}_objects>
+        )
+    endif()
     add_dependencies(${_NAME} ${_NAME}_static)
     if(NOT MSVC)
       set_property(TARGET ${_NAME}_static PROPERTY OUTPUT_NAME ${_NAME})
@@ -690,6 +701,25 @@ endfunction()
 
 ## Link libraries
 function(_target_link_libraries _NAME)
+  function(_resolve_link_target LIB RESULT_VAR)
+    set(RESOLVED_LINK_TARGET ${LIB})
+    if(TARGET ${RESOLVED_LINK_TARGET})
+      get_target_property(
+        ALIASED_LINK_TARGET ${RESOLVED_LINK_TARGET} ALIASED_TARGET)
+      if(ALIASED_LINK_TARGET)
+        set(RESOLVED_LINK_TARGET ${ALIASED_LINK_TARGET})
+      endif()
+      get_target_property(
+        CANONICAL_LINK_TARGET
+        ${RESOLVED_LINK_TARGET}
+        ZVEC_CANONICAL_LINK_TARGET)
+      if(CANONICAL_LINK_TARGET)
+        set(RESOLVED_LINK_TARGET ${CANONICAL_LINK_TARGET})
+      endif()
+    endif()
+    set(${RESULT_VAR} ${RESOLVED_LINK_TARGET} PARENT_SCOPE)
+  endfunction()
+
   function(_collect_always_link_libs LIB_LIST RESULT_VAR)
     if(NOT _COLLECT_ALWAYS_LINK_VISITED)
       set(_COLLECT_ALWAYS_LINK_VISITED "" PARENT_SCOPE)
@@ -697,6 +727,7 @@ function(_target_link_libraries _NAME)
 
     set(LOCAL_RESULT "")
     foreach(LIB ${LIB_LIST})
+      _resolve_link_target(${LIB} LIB)
       if(NOT TARGET ${LIB})
         continue()
       endif()
@@ -726,7 +757,10 @@ function(_target_link_libraries _NAME)
       endif()
 
       get_target_property(LINK_LIBS ${LIB} LINK_LIBRARIES)
-      if(LINK_LIBS)
+      get_target_property(LIB_TYPE ${LIB} TYPE)
+      if(LINK_LIBS AND
+         NOT LIB_TYPE STREQUAL "SHARED_LIBRARY" AND
+         NOT LIB_TYPE STREQUAL "MODULE_LIBRARY")
         _collect_always_link_libs("${LINK_LIBS}" LINK_ALWAYS_LINK_LIBS)
         list(APPEND LOCAL_RESULT ${LINK_ALWAYS_LINK_LIBS})
       endif()
@@ -736,11 +770,18 @@ function(_target_link_libraries _NAME)
     set(${RESULT_VAR} "${LOCAL_RESULT}" PARENT_SCOPE)
   endfunction()
 
-  _collect_always_link_libs("${ARGN}" ALL_ALWAYS_LINK_LIBS)
+  set(INPUT_LIBS "")
+  foreach(LIB ${ARGN})
+    _resolve_link_target(${LIB} RESOLVED_LIB)
+    list(APPEND INPUT_LIBS ${RESOLVED_LIB})
+  endforeach()
+  list(REMOVE_DUPLICATES INPUT_LIBS)
 
-  set(ALL_LIBS_TO_PROCESS ${ARGN})
+  _collect_always_link_libs("${INPUT_LIBS}" ALL_ALWAYS_LINK_LIBS)
+
+  set(ALL_LIBS_TO_PROCESS ${INPUT_LIBS})
   foreach(ALWAYS_LIB ${ALL_ALWAYS_LINK_LIBS})
-    list(FIND ARGN ${ALWAYS_LIB} FOUND_INDEX)
+    list(FIND INPUT_LIBS ${ALWAYS_LIB} FOUND_INDEX)
     if(FOUND_INDEX EQUAL -1)
       list(APPEND ALL_LIBS_TO_PROCESS ${ALWAYS_LIB})
     endif()

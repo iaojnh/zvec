@@ -1465,6 +1465,41 @@ TEST(SearchQuery, ValidateAndSanitize) {
     EXPECT_TRUE(s.ok()) << s.message();
   }
 
+  // DiskAnn list_size must be positive and the concrete parameter type must
+  // match the advertised index type.
+  {
+    SearchQuery query;
+    query.target_.field_name_ = "embedding";
+    query.topk_ = 10;
+    std::vector<float> query_vector(128, 1.0f);
+    query.target_.set_vector(
+        std::string(reinterpret_cast<char *>(query_vector.data()),
+                    query_vector.size() * sizeof(float)));
+    FieldSchema schema =
+        FieldSchema("embedding", DataType::VECTOR_FP32, 128, false,
+                    std::make_shared<DiskAnnIndexParams>(MetricType::L2));
+
+    query.target_.query_params_ = std::make_shared<DiskAnnQueryParams>(0);
+    auto s = query.validate(&schema, nullptr);
+    EXPECT_FALSE(s.ok());
+    EXPECT_EQ(s.code(), StatusCode::INVALID_ARGUMENT);
+
+    query.target_.query_params_ = std::make_shared<DiskAnnQueryParams>(-1);
+    s = query.validate(&schema, nullptr);
+    EXPECT_FALSE(s.ok());
+    EXPECT_EQ(s.code(), StatusCode::INVALID_ARGUMENT);
+
+    query.target_.query_params_ =
+        std::make_shared<QueryParams>(IndexType::DISKANN);
+    s = query.validate(&schema, nullptr);
+    EXPECT_FALSE(s.ok());
+    EXPECT_EQ(s.code(), StatusCode::INVALID_ARGUMENT);
+
+    query.target_.query_params_ = std::make_shared<DiskAnnQueryParams>(300);
+    s = query.validate(&schema, nullptr);
+    EXPECT_TRUE(s.ok()) << s.message();
+  }
+
   // FTS clause validation
   {
     auto fts_params = std::make_shared<FtsIndexParams>();

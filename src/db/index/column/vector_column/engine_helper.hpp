@@ -250,6 +250,14 @@ class ProximaEngineHelper {
           auto db_diskann_query_params =
               dynamic_cast<const DiskAnnQueryParams *>(
                   query_params.query_params.get());
+          if (db_diskann_query_params == nullptr) {
+            return tl::make_unexpected(Status::InvalidArgument(
+                "DISKANN index requires DiskAnnQueryParams"));
+          }
+          if (db_diskann_query_params->list_size() <= 0) {
+            return tl::make_unexpected(Status::InvalidArgument(
+                "DiskAnn list_size must be greater than 0"));
+          }
           diskann_query_param->list_size =
               static_cast<uint32_t>(db_diskann_query_params->list_size());
         }

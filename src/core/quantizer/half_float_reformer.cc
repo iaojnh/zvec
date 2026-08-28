@@ -198,7 +198,7 @@ class HalfFloatSparseReformer : public IndexReformer {
             reinterpret_cast<uint16_t *>(&(*out)[0]));
 
         *ometa = qmeta;
-        ometa->set_data_type(IndexMeta::DataType::DT_FP16);
+        ometa->set_meta(IndexMeta::DataType::DT_FP16, 0);
 
         break;
 

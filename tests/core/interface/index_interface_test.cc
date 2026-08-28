@@ -27,11 +27,13 @@
 #include "zvec/core/framework/index_provider.h"
 #endif
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/utility/file_helper.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_holder.h>
 #include "algorithm/hnsw/hnsw_params.h"
 #include "algorithm/vamana/vamana_streamer.h"
+#include "core/interface/indexes/holder_builder.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/interface/index.h"
 #include "zvec/core/interface/index_factory.h"
@@ -45,10 +47,138 @@
 
 using namespace zvec::core_interface;
 
+namespace {
+
+class HolderBuilderTestConverter final : public zvec::core::IndexConverter {
+ public:
+  explicit HolderBuilderTestConverter(int train_result)
+      : train_result_(train_result),
+        meta_(zvec::core::IndexMeta::DataType::DT_FP32, 2) {}
+
+  int init(const zvec::core::IndexMeta &,
+           const zvec::ailego::Params &) override {
+    return 0;
+  }
+
+  int cleanup() override {
+    return 0;
+  }
+
+  int train(zvec::core::IndexHolder::Pointer) override {
+    return train_result_;
+  }
+
+  int transform(zvec::core::IndexHolder::Pointer) override {
+    return 0;
+  }
+
+  int dump(const zvec::core::IndexDumper::Pointer &) override {
+    return 0;
+  }
+
+  const Stats &stats() const override {
+    return stats_;
+  }
+
+  const zvec::core::IndexMeta &meta() const override {
+    return meta_;
+  }
+
+ private:
+  int train_result_{0};
+  Stats stats_{};
+  zvec::core::IndexMeta meta_{};
+};
+
+}  // namespace
+
 TEST(IndexInterface, IndexTypeKeepsExistingValues) {
   EXPECT_EQ(5, static_cast<int>(IndexType::kDiskAnn));
   EXPECT_EQ(6, static_cast<int>(IndexType::kVamana));
   EXPECT_EQ(7, static_cast<int>(IndexType::kIVFRabitq));
+}
+
+TEST(IndexInterface, RejectsInvalidBaseVectorMetadata) {
+  for (const int dimension : {0, -1, MAX_DIMENSION + 1}) {
+    auto param = FlatIndexParamBuilder()
+                     .with_metric_type(MetricType::kL2sq)
+                     .with_data_type(DataType::DT_FP32)
+                     .with_dimension(dimension)
+                     .build();
+    EXPECT_EQ(nullptr, IndexFactory::CreateAndInitIndex(*param)) << dimension;
+  }
+
+  auto invalid_data_type = FlatIndexParamBuilder()
+                               .with_metric_type(MetricType::kL2sq)
+                               .with_data_type(static_cast<DataType>(
+                                   static_cast<int>(DataType::DT_BINARY64) + 1))
+                               .with_dimension(8)
+                               .build();
+  EXPECT_EQ(nullptr, IndexFactory::CreateAndInitIndex(*invalid_data_type));
+
+  // Sparse vectors do not use a fixed dense dimension, so their established
+  // zero-dimension metadata remains valid.
+  auto sparse = FlatIndexParamBuilder()
+                    .with_metric_type(MetricType::kInnerProduct)
+                    .with_data_type(DataType::DT_FP32)
+                    .with_is_sparse(true)
+                    .build();
+  EXPECT_NE(nullptr, IndexFactory::CreateAndInitIndex(*sparse));
+}
+
+TEST(IndexInterface, BuildMultiPassHolderPropagatesConverterFailures) {
+  std::vector<float> values{1.0F, 2.0F};
+  std::vector<std::pair<uint64_t, std::string>> doc_cache;
+  doc_cache.emplace_back(
+      0, std::string(reinterpret_cast<const char *>(values.data()),
+                     values.size() * sizeof(float)));
+
+  zvec::core::IndexHolder::Pointer holder;
+  auto failing_converter = std::make_shared<HolderBuilderTestConverter>(
+      zvec::core::IndexError_ReadData);
+  EXPECT_EQ(zvec::core::IndexError_ReadData,
+            BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                 failing_converter, &holder));
+
+  auto empty_result_converter = std::make_shared<HolderBuilderTestConverter>(0);
+  EXPECT_EQ(zvec::core::IndexError_Runtime,
+            BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                 empty_result_converter, &holder));
+}
+
+TEST(IndexInterface, ConverterCleanupReleasesTransientResult) {
+  std::vector<float> values{1.0F, 2.0F};
+  std::vector<std::pair<uint64_t, std::string>> doc_cache;
+  doc_cache.emplace_back(
+      0, std::string(reinterpret_cast<const char *>(values.data()),
+                     values.size() * sizeof(float)));
+
+  for (const char *converter_name :
+       {"HalfFloatConverter", "CosineNormalizeConverter",
+        "Int8StreamingConverter", "UniformUint7Converter",
+        "UniformUint8Converter"}) {
+    SCOPED_TRACE(converter_name);
+    zvec::core::IndexMeta meta(zvec::core::IndexMeta::DataType::DT_FP32, 2);
+    meta.set_metric("SquaredEuclidean", 0, zvec::ailego::Params());
+    auto converter = zvec::core::IndexFactory::CreateConverter(converter_name);
+    ASSERT_NE(nullptr, converter);
+    ASSERT_EQ(0, converter->init(meta, zvec::ailego::Params()));
+
+    zvec::core::IndexHolder::Pointer holder;
+    ASSERT_EQ(0, BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                      converter, &holder));
+    ASSERT_NE(nullptr, converter->result());
+    ASSERT_EQ(0, converter->cleanup());
+    EXPECT_EQ(nullptr, converter->result());
+
+    // Releasing the transient result must not make a converter single-use;
+    // DiskAnn retrains it during a later merge.
+    holder.reset();
+    ASSERT_EQ(0, BuildMultiPassHolder(DataType::DT_FP32, 2, doc_cache,
+                                      converter, &holder));
+    ASSERT_NE(nullptr, converter->result());
+    EXPECT_EQ(0, converter->cleanup());
+  }
 }
 
 TEST(IndexInterface, DiskAnnParamJsonRoundTrip) {
@@ -68,7 +198,361 @@ TEST(IndexInterface, DiskAnnParamJsonRoundTrip) {
   EXPECT_EQ(48, diskann->max_degree);
   EXPECT_EQ(80, diskann->list_size);
   EXPECT_EQ(16, diskann->pq_chunk_num);
+
+  auto invalid = DiskAnnIndexParamBuilder()
+                     .with_metric_type(MetricType::kL2sq)
+                     .with_data_type(DataType::DT_FP32)
+                     .with_dimension(64)
+                     .with_max_degree(-1)
+                     .with_list_size(32)
+                     .with_pq_chunk_num(8)
+                     .build();
+  EXPECT_EQ(nullptr, IndexFactory::DeserializeIndexParamFromJson(
+                         invalid->serialize_to_json()));
+  invalid->max_degree = 32;
+  invalid->list_size = -1;
+  EXPECT_EQ(nullptr, IndexFactory::DeserializeIndexParamFromJson(
+                         invalid->serialize_to_json()));
+  invalid->list_size = 32;
+  invalid->pq_chunk_num = -1;
+  EXPECT_EQ(nullptr, IndexFactory::DeserializeIndexParamFromJson(
+                         invalid->serialize_to_json()));
+#if DISKANN_SUPPORTED
+  EXPECT_EQ(nullptr, IndexFactory::CreateAndInitIndex(*invalid));
+#endif
 }
+
+TEST(IndexInterface, DiskAnnQueryParamJsonRoundTrip) {
+  DiskAnnQueryParam param;
+  param.topk = 12;
+  param.fetch_vector = true;
+  param.radius = 0.25F;
+  param.is_linear = true;
+  param.list_size = 321;
+
+  const std::string json = IndexFactory::QueryParamSerializeToJson(param);
+  auto typed =
+      IndexFactory::QueryParamDeserializeFromJson<DiskAnnQueryParam>(json);
+  ASSERT_NE(nullptr, typed);
+  EXPECT_EQ(param.topk, typed->topk);
+  EXPECT_EQ(param.fetch_vector, typed->fetch_vector);
+  EXPECT_FLOAT_EQ(param.radius, typed->radius);
+  EXPECT_EQ(param.is_linear, typed->is_linear);
+  EXPECT_EQ(param.list_size, typed->list_size);
+
+  auto polymorphic =
+      IndexFactory::QueryParamDeserializeFromJson<BaseIndexQueryParam>(json);
+  auto diskann = std::dynamic_pointer_cast<DiskAnnQueryParam>(polymorphic);
+  ASSERT_NE(nullptr, diskann);
+  EXPECT_EQ(param.list_size, diskann->list_size);
+
+  EXPECT_EQ(
+      nullptr,
+      IndexFactory::QueryParamDeserializeFromJson<DiskAnnQueryParam>(
+          R"({"index_type":"kDiskAnn","topk":1,"fetch_vector":false,"radius":0,"is_linear":false,"list_size":0})"));
+}
+
+#if DISKANN_SUPPORTED
+TEST(IndexInterface, DiskAnnFetchHandlesSparseDocumentIdsAcrossLifecycle) {
+  constexpr uint32_t kSparseDocId = 1'000'000'000U;
+  const std::string path{"diskann_fetch_untrained.index"};
+  zvec::test_util::RemoveTestFiles(path);
+
+  auto param = DiskAnnIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(4)
+                   .with_max_degree(16)
+                   .with_list_size(32)
+                   .with_pq_chunk_num(2)
+                   .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, index);
+  EXPECT_EQ(0U, index->get_doc_count());
+
+  std::array<float, 4> first_vector{1.0F, 2.0F, 3.0F, 4.0F};
+  EXPECT_EQ(zvec::core::IndexError_NoReady,
+            index->add(VectorData{DenseVector{first_vector.data()}}, 2));
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+  EXPECT_EQ(0U, index->get_doc_count());
+
+  std::array<float, 4> second_vector{5.0F, 6.0F, 7.0F, 8.0F};
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{first_vector.data()}}, 2));
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{second_vector.data()}},
+                          kSparseDocId));
+  EXPECT_EQ(2U, index->get_doc_count());
+  EXPECT_EQ(zvec::core::IndexError_InvalidArgument,
+            index->add(VectorData{DenseVector{nullptr}}, 8));
+  EXPECT_EQ(zvec::core::IndexError_OutOfRange,
+            index->add(VectorData{DenseVector{first_vector.data()}},
+                       (std::numeric_limits<uint32_t>::max)()));
+
+  VectorDataBuffer fetched;
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(0, &fetched));
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(99, &fetched));
+  EXPECT_EQ(zvec::core::IndexError_InvalidArgument, index->fetch(2, nullptr));
+  EXPECT_EQ(0, index->fetch(2, &fetched));
+  const auto &dense = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+  ASSERT_EQ(sizeof(first_vector), dense.data.size());
+  EXPECT_EQ(0, std::memcmp(first_vector.data(), dense.data.data(),
+                           sizeof(first_vector)));
+
+  ASSERT_EQ(0, index->train());
+  EXPECT_EQ(2U, index->get_doc_count());
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(0, &fetched));
+  EXPECT_EQ(zvec::core::IndexError_NoExist, index->fetch(1, &fetched));
+  EXPECT_EQ(0, index->fetch(2, &fetched));
+  EXPECT_EQ(0,
+            std::memcmp(
+                first_vector.data(),
+                std::get<DenseVectorBuffer>(fetched.vector_buffer).data.data(),
+                sizeof(first_vector)));
+  EXPECT_EQ(0, index->fetch(kSparseDocId, &fetched));
+  EXPECT_EQ(0,
+            std::memcmp(
+                second_vector.data(),
+                std::get<DenseVectorBuffer>(fetched.vector_buffer).data.data(),
+                sizeof(second_vector)));
+
+  EXPECT_EQ(0, index->close());
+  EXPECT_EQ(0U, index->get_doc_count());
+
+  auto reopened = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, reopened);
+  ASSERT_EQ(0,
+            reopened->open(path, {StorageOptions::StorageType::kMMAP,
+                                  /*create_new=*/false, /*read_only=*/true}));
+  EXPECT_EQ(2U, reopened->get_doc_count());
+  EXPECT_EQ(zvec::core::IndexError_NoExist, reopened->fetch(1, &fetched));
+  EXPECT_EQ(0, reopened->fetch(kSparseDocId, &fetched));
+  EXPECT_EQ(0,
+            std::memcmp(
+                second_vector.data(),
+                std::get<DenseVectorBuffer>(fetched.vector_buffer).data.data(),
+                sizeof(second_vector)));
+  EXPECT_EQ(0, reopened->close());
+  EXPECT_EQ(0U, reopened->get_doc_count());
+
+  auto read_only_new = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, read_only_new);
+  ASSERT_EQ(
+      0, read_only_new->open(path, {StorageOptions::StorageType::kMMAP,
+                                    /*create_new=*/true, /*read_only=*/true}));
+  EXPECT_EQ(
+      zvec::core::IndexError_Runtime,
+      read_only_new->add(VectorData{DenseVector{first_vector.data()}}, 2));
+  EXPECT_EQ(0, read_only_new->close());
+
+  zvec::test_util::RemoveTestFiles(path);
+}
+
+TEST(IndexInterface, DiskAnnTrainCanRetryAfterSnapshotCommitFailure) {
+  constexpr uint32_t kDimension = 8;
+  constexpr uint32_t kDocCount = 16;
+  const std::string path{"diskann_train_retry.index"};
+  zvec::test_util::RemoveTestFiles(path);
+  zvec::ailego::FileHelper::RemoveDirectory(path.c_str());
+
+  auto param = DiskAnnIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(kDimension)
+                   .with_max_degree(8)
+                   .with_list_size(16)
+                   .with_pq_chunk_num(2)
+                   .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+
+  std::vector<std::array<float, kDimension>> vectors(kDocCount);
+  for (uint32_t id = 0; id < kDocCount; ++id) {
+    for (uint32_t dim = 0; dim < kDimension; ++dim) {
+      vectors[id][dim] = static_cast<float>(id * kDimension + dim);
+    }
+    ASSERT_EQ(0, index->add(VectorData{DenseVector{vectors[id].data()}}, id));
+  }
+
+  // A directory cannot be atomically replaced by the completed index file.
+  // Once that transient obstruction is removed, the same Index instance must
+  // be able to rebuild and commit without remaining in BUILT state.
+  ASSERT_TRUE(zvec::ailego::FileHelper::MakePath(path.c_str()));
+  EXPECT_NE(0, index->train());
+  ASSERT_TRUE(zvec::ailego::FileHelper::RemoveDirectory(path.c_str()));
+  ASSERT_EQ(0, index->train());
+
+  VectorDataBuffer fetched;
+  ASSERT_EQ(0, index->fetch(7, &fetched));
+  const auto &dense = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+  ASSERT_EQ(sizeof(vectors[7]), dense.data.size());
+  EXPECT_EQ(
+      0, std::memcmp(vectors[7].data(), dense.data.data(), dense.data.size()));
+
+  EXPECT_EQ(0, index->close());
+  zvec::test_util::RemoveTestFiles(path);
+}
+
+TEST(IndexInterface, DiskAnnSupportsRepeatedMerge) {
+  constexpr uint32_t kDimension = 8;
+  constexpr uint32_t kDocCount = 64;
+  const std::string first_path{"diskann_repeat_merge_source_1.index"};
+  const std::string second_path{"diskann_repeat_merge_source_2.index"};
+  const std::string target_path{"diskann_repeat_merge_target.index"};
+  for (const auto &path : {first_path, second_path, target_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+
+  auto flat_param = FlatIndexParamBuilder()
+                        .with_metric_type(MetricType::kL2sq)
+                        .with_data_type(DataType::DT_FP32)
+                        .with_dimension(kDimension)
+                        .build();
+  auto first = IndexFactory::CreateAndInitIndex(*flat_param);
+  auto second = IndexFactory::CreateAndInitIndex(*flat_param);
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  ASSERT_EQ(
+      0, first->open(first_path, {StorageOptions::StorageType::kMMAP, true}));
+  ASSERT_EQ(
+      0, second->open(second_path, {StorageOptions::StorageType::kMMAP, true}));
+
+  std::vector<std::array<float, kDimension>> first_vectors(kDocCount);
+  std::vector<std::array<float, kDimension>> second_vectors(kDocCount);
+  for (uint32_t id = 0; id < kDocCount; ++id) {
+    for (uint32_t dim = 0; dim < kDimension; ++dim) {
+      first_vectors[id][dim] = static_cast<float>(id + dim);
+      second_vectors[id][dim] = static_cast<float>(1000 + id + dim);
+    }
+    ASSERT_EQ(
+        0, first->add(VectorData{DenseVector{first_vectors[id].data()}}, id));
+    ASSERT_EQ(
+        0, second->add(VectorData{DenseVector{second_vectors[id].data()}}, id));
+  }
+
+  auto diskann_param =
+      DiskAnnIndexParamBuilder()
+          .with_metric_type(MetricType::kL2sq)
+          .with_data_type(DataType::DT_FP32)
+          .with_dimension(kDimension)
+          .with_max_degree(16)
+          .with_list_size(32)
+          .with_pq_chunk_num(2)
+          .with_quantizer_param(QuantizerParam(QuantizerType::kFP16))
+          .build();
+  auto target = IndexFactory::CreateAndInitIndex(*diskann_param);
+  ASSERT_NE(nullptr, target);
+  ASSERT_EQ(
+      0, target->open(target_path, {StorageOptions::StorageType::kMMAP, true}));
+  ASSERT_EQ(0, target->merge({first}, IndexFilter()));
+  auto first_snapshot = target->index_searcher();
+  ASSERT_NE(nullptr, first_snapshot);
+  ASSERT_EQ(0, target->merge({second}, IndexFilter()));
+
+  // A caller that acquired the previous snapshot before the atomic swap keeps
+  // it alive. Commit must not unload its file reader while an in-flight search
+  // or provider can still use it.
+  auto first_snapshot_provider = first_snapshot->create_provider();
+  ASSERT_NE(nullptr, first_snapshot_provider);
+  EXPECT_EQ(kDocCount, first_snapshot_provider->count());
+
+  VectorDataBuffer fetched;
+  ASSERT_EQ(0, target->fetch(7, &fetched));
+  const auto &dense = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+  ASSERT_EQ(sizeof(second_vectors[7]), dense.data.size());
+  EXPECT_EQ(0, std::memcmp(second_vectors[7].data(), dense.data.data(),
+                           sizeof(second_vectors[7])));
+
+  EXPECT_EQ(0, target->close());
+  first_snapshot_provider.reset();
+  first_snapshot.reset();
+
+  auto read_only_target = IndexFactory::CreateAndInitIndex(*diskann_param);
+  ASSERT_NE(nullptr, read_only_target);
+  ASSERT_EQ(0, read_only_target->open(
+                   target_path, {StorageOptions::StorageType::kMMAP,
+                                 /*create_new=*/false, /*read_only=*/true}));
+  EXPECT_EQ(zvec::core::IndexError_Runtime,
+            read_only_target->merge({first}, IndexFilter()));
+  VectorDataBuffer read_only_fetched;
+  ASSERT_EQ(0, read_only_target->fetch(7, &read_only_fetched));
+  const auto &read_only_dense =
+      std::get<DenseVectorBuffer>(read_only_fetched.vector_buffer);
+  ASSERT_EQ(sizeof(second_vectors[7]), read_only_dense.data.size());
+  EXPECT_EQ(0,
+            std::memcmp(second_vectors[7].data(), read_only_dense.data.data(),
+                        sizeof(second_vectors[7])));
+  EXPECT_EQ(0, read_only_target->close());
+
+  EXPECT_EQ(0, first->close());
+  EXPECT_EQ(0, second->close());
+  for (const auto &path : {first_path, second_path, target_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+}
+
+TEST(IndexInterface, DiskAnnContextUsesCurrentIndexListSize) {
+  static constexpr uint32_t kDimension = 8;
+  constexpr uint32_t kLargeDocCount = 32;
+  const std::string small_path{"diskann_context_small.index"};
+  const std::string large_path{"diskann_context_large.index"};
+  for (const auto &path : {small_path, large_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+
+  auto diskann_param = DiskAnnIndexParamBuilder()
+                           .with_metric_type(MetricType::kL2sq)
+                           .with_data_type(DataType::DT_FP32)
+                           .with_dimension(kDimension)
+                           .with_max_degree(16)
+                           .with_list_size(32)
+                           .with_pq_chunk_num(2)
+                           .build();
+
+  auto build_index = [&](const std::string &path, uint32_t count) {
+    auto index = IndexFactory::CreateAndInitIndex(*diskann_param);
+    EXPECT_NE(nullptr, index);
+    if (index == nullptr) {
+      return index;
+    }
+    EXPECT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+    for (uint32_t id = 0; id < count; ++id) {
+      std::array<float, kDimension> vector{};
+      vector.fill(static_cast<float>(id));
+      EXPECT_EQ(0, index->add(VectorData{DenseVector{vector.data()}}, id));
+    }
+    EXPECT_EQ(0, index->train());
+    return index;
+  };
+
+  auto small = build_index(small_path, 1);
+  auto large = build_index(large_path, kLargeDocCount);
+  ASSERT_NE(nullptr, small);
+  ASSERT_NE(nullptr, large);
+
+  auto query_param = std::make_shared<DiskAnnQueryParam>();
+  query_param->topk = 1;
+  query_param->list_size = 64;
+  std::array<float, kDimension> small_query{};
+  SearchResult small_result;
+  ASSERT_EQ(0, small->search(VectorData{DenseVector{small_query.data()}},
+                             query_param, &small_result));
+  ASSERT_EQ(1U, small_result.doc_list_.size());
+
+  query_param->topk = 8;
+  std::array<float, kDimension> large_query{};
+  large_query.fill(7.0F);
+  SearchResult large_result;
+  ASSERT_EQ(0, large->search(VectorData{DenseVector{large_query.data()}},
+                             query_param, &large_result));
+  EXPECT_EQ(query_param->topk, large_result.doc_list_.size());
+
+  EXPECT_EQ(0, small->close());
+  EXPECT_EQ(0, large->close());
+  for (const auto &path : {small_path, large_path}) {
+    zvec::test_util::RemoveTestFiles(path);
+  }
+}
+#endif
 
 #if RABITQ_SUPPORTED
 TEST(IndexInterface, IvfRabitqValidatesBuildParams) {

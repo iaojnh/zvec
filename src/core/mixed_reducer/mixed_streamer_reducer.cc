@@ -26,6 +26,45 @@
 namespace zvec {
 namespace core {
 
+namespace {
+
+bool matches_query_meta(const IndexMeta &meta,
+                        const IndexQueryMeta &query_meta) {
+  if (meta.meta_type() != query_meta.meta_type() ||
+      meta.data_type() != query_meta.data_type() ||
+      meta.unit_size() != query_meta.unit_size()) {
+    return false;
+  }
+  // Sparse records carry their logical length per document. Their metadata
+  // dimension and element size are not the size of an individual record.
+  return meta.meta_type() == IndexMeta::MetaType::MT_SPARSE ||
+         (meta.dimension() == query_meta.dimension() &&
+          meta.element_size() == query_meta.element_size());
+}
+
+bool matches_index_meta(const IndexQueryMeta &query_meta,
+                        const IndexMeta &meta) {
+  return matches_query_meta(meta, query_meta);
+}
+
+bool checked_add(uint64_t lhs, uint64_t rhs, uint64_t *result) {
+  if (rhs > (std::numeric_limits<uint64_t>::max)() - lhs) {
+    return false;
+  }
+  *result = lhs + rhs;
+  return true;
+}
+
+bool checked_multiply(size_t lhs, size_t rhs, size_t *result) {
+  if (lhs != 0 && rhs > (std::numeric_limits<size_t>::max)() / lhs) {
+    return false;
+  }
+  *result = lhs * rhs;
+  return true;
+}
+
+}  // namespace
+
 int MixedStreamerReducer::init(const ailego::Params &params) {
   enable_pk_rewrite_ =
       params.get_as_bool(PARAM_MIXED_STREAMER_REDUCER_ENABLE_PK_REWRITE);
@@ -44,15 +83,31 @@ int MixedStreamerReducer::init(const ailego::Params &params) {
 }
 
 int MixedStreamerReducer::cleanup(void) {
+  int ret = 0;
   streamers_.clear();
-  target_streamer_->cleanup();
-
-  target_builder_->cleanup();
+  source_streamers_reformers_.clear();
+  if (target_streamer_ != nullptr) {
+    ret = target_streamer_->cleanup();
+  }
+  if (target_builder_ != nullptr) {
+    const int builder_ret = target_builder_->cleanup();
+    if (ret == 0) {
+      ret = builder_ret;
+    }
+  }
+  target_streamer_.reset();
+  target_streamer_reformer_.reset();
+  target_builder_.reset();
+  target_builder_converter_.reset();
   doc_cache_.clear();
+  mt_list_.reset();
+  mt_list_.resume_consume();
+  sparse_mt_list_.reset();
+  sparse_mt_list_.resume_consume();
 
   stats_.clear_attributes();
   state_ = STATE_UNINITED;
-  return 0;
+  return ret;
 }
 
 int MixedStreamerReducer::set_target_streamer_wiht_info(
@@ -63,6 +118,11 @@ int MixedStreamerReducer::set_target_streamer_wiht_info(
   if (state_ != STATE_INITED) {
     LOG_ERROR("Set target streamer after init");
     return IndexError_Uninitialized;
+  }
+  if (!streamer ||
+      original_query_meta.meta_type() != streamer->meta().meta_type()) {
+    LOG_ERROR("Invalid target streamer or original query metadata");
+    return IndexError_InvalidArgument;
   }
 
   target_builder_ = builder;
@@ -90,35 +150,30 @@ int MixedStreamerReducer::feed_streamer_with_reformer(
     return IndexError_InvalidArgument;
   }
 
-  auto check_datatype = [&](const IndexMeta & /*target_meta*/,
-                            const IndexMeta &source_meta) -> bool {
-    if (!streamers_.empty()) {
-      auto &last_meta = streamers_.back()->meta();
-      return last_meta.data_type() == source_meta.data_type() &&
-             last_meta.dimension() == source_meta.dimension() &&
-             last_meta.unit_size() == source_meta.unit_size();
-    }
-    // TODO: check target meta
-    return true;
-  };
-
-  auto check_other = [&](const IndexMeta &target_meta,
-                         const IndexMeta &source_meta) -> bool {
-    return target_meta.meta_type() == source_meta.meta_type();
-    // when create a new index, there is a case that ip_flat merged into l2_hnsw
-    // target_meta.metric_name() == source_meta.metric_name();
-  };
-
-  if (!(check_datatype(target_streamer_->meta(), streamer->meta()) &&
-        check_other(target_streamer_->meta(), streamer->meta()))) {
+  const IndexMeta &target_meta = target_streamer_->meta();
+  const IndexMeta &source_meta = streamer->meta();
+  if (target_meta.meta_type() != source_meta.meta_type()) {
     LOG_ERROR("Streamer meta mismatch");
     return IndexError_InvalidArgument;
   }
 
-  if (streamers_.empty()) {
-    is_target_and_source_same_reformer_ =
-        target_streamer_->meta().reformer_name() ==
-        streamer->meta().reformer_name();
+  const bool source_is_encoded = !source_meta.reformer_name().empty();
+  const bool target_is_encoded = !target_meta.reformer_name().empty();
+  const bool source_is_decodable =
+      source_is_encoded ? reformer != nullptr
+                        : matches_query_meta(source_meta, original_query_meta_);
+  bool compatible = source_is_decodable;
+  // Builders consume the original representation and retrain their target
+  // converter after all source records have been decoded.
+  if (target_builder_ == nullptr) {
+    compatible = compatible &&
+                 (target_is_encoded
+                      ? target_streamer_reformer_ != nullptr
+                      : matches_query_meta(target_meta, original_query_meta_));
+  }
+  if (!compatible) {
+    LOG_ERROR("Streamer vector representation mismatch");
+    return IndexError_InvalidArgument;
   }
 
   streamers_.push_back(streamer);
@@ -148,15 +203,51 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
   // TODO: use id instead of key
   // When merging into a non-empty target (e.g. reusing one input as base),
   // append new docs after the existing ones instead of overwriting from 0.
-  uint32_t id_offset = 0;
-  uint32_t next_id = 0;
+  uint64_t id_offset = 0;
+  uint64_t next_id = 0;
+  auto find_next_target_id = [&next_id](const auto &provider) -> int {
+    const uint64_t target_count = provider->count();
+    next_id = (std::max)(next_id, target_count);
+    if (target_count == 0) {
+      return 0;
+    }
+    auto iterator = provider->create_iterator();
+    if (!iterator) {
+      LOG_ERROR("Failed to create target provider iterator");
+      return IndexError_Runtime;
+    }
+    while (iterator->is_valid()) {
+      const uint64_t key = iterator->key();
+      if (key == (std::numeric_limits<uint64_t>::max)()) {
+        LOG_ERROR("Invalid target vector key");
+        return IndexError_InvalidFormat;
+      }
+      next_id = (std::max)(next_id, key + 1);
+      iterator->next();
+    }
+    return 0;
+  };
   if (target_builder_ == nullptr) {
     if (is_sparse_) {
       auto provider = target_streamer_->create_sparse_provider();
-      if (provider) next_id = provider->count();
+      if (!provider) {
+        LOG_ERROR("Failed to create target sparse provider");
+        return IndexError_Runtime;
+      }
+      const int ret = find_next_target_id(provider);
+      if (ret != 0) {
+        return ret;
+      }
     } else {
       auto provider = target_streamer_->create_provider();
-      if (provider) next_id = provider->count();
+      if (!provider) {
+        LOG_ERROR("Failed to create target provider");
+        return IndexError_Runtime;
+      }
+      const int ret = find_next_target_id(provider);
+      if (ret != 0) {
+        return ret;
+      }
     }
   }
 
@@ -168,8 +259,23 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
 
     for (size_t i = 0; i < streamers_.size(); i++) {
       // due to filter, producing can't be parallel
-      read_results[i] = read_sparse_vec(i, filter, id_offset, &next_id);
-      id_offset += streamers_[i]->create_sparse_provider()->count();
+      auto provider = streamers_[i]->create_sparse_provider();
+      if (!provider) {
+        LOG_ERROR("Failed to create source sparse provider, index=%zu", i);
+        read_results[i] = IndexError_Runtime;
+        break;
+      }
+      uint64_t source_span = 0;
+      read_results[i] = read_sparse_vec(i, provider, filter, id_offset,
+                                        &next_id, &source_span);
+      if (read_results[i] != 0) {
+        break;
+      }
+      if (!checked_add(id_offset, source_span, &id_offset)) {
+        LOG_ERROR("Source sparse vector key range overflows");
+        read_results[i] = IndexError_InvalidFormat;
+        break;
+      }
     }
 
     sparse_mt_list_.done();
@@ -187,11 +293,17 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
         read_results[i] = IndexError_Runtime;
         break;
       }
-      read_results[i] = read_vec(i, provider, filter, id_offset, &next_id);
+      uint64_t source_span = 0;
+      read_results[i] =
+          read_vec(i, provider, filter, id_offset, &next_id, &source_span);
       if (read_results[i] != 0) {
         break;
       }
-      id_offset += provider->count();
+      if (!checked_add(id_offset, source_span, &id_offset)) {
+        LOG_ERROR("Source vector key range overflows");
+        read_results[i] = IndexError_InvalidFormat;
+        break;
+      }
     }
 
     mt_list_.done();
@@ -213,8 +325,6 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     return IndexError_Runtime;
   }
 
-  stats_.set_reduced_costtime(timer.seconds());
-  state_ = STATE_REDUCE;
   if (target_builder_ != nullptr) {
     int ret = IndexBuild();
     if (ret != 0) {
@@ -223,6 +333,8 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     }
   }
 
+  stats_.set_reduced_costtime(timer.seconds());
+  state_ = STATE_REDUCE;
   LOG_INFO("End brute force reduce. cost time: [%zu]s",
            (size_t)timer.seconds());
   return 0;
@@ -236,12 +348,17 @@ int MixedStreamerReducer::dump(const IndexDumper::Pointer &dumper) {
     return IndexError_NoReady;
   }
 
+  if (!dumper) {
+    LOG_ERROR("Dumper is null");
+    return IndexError_InvalidArgument;
+  }
+
   ailego::ElapsedTime timer;
   int ret = 0;
   if (target_builder_ != nullptr) {
-    target_builder_->dump(dumper);
+    ret = target_builder_->dump(dumper);
   } else {
-    target_streamer_->dump(dumper);
+    ret = target_streamer_->dump(dumper);
   }
   if (ret == IndexError_NotImplemented) {
     LOG_WARN("Dump index not implemented");
@@ -255,24 +372,25 @@ int MixedStreamerReducer::dump(const IndexDumper::Pointer &dumper) {
 int MixedStreamerReducer::read_vec(size_t source_streamer_index,
                                    const IndexProvider::Pointer &provider,
                                    const IndexFilter &filter,
-                                   const uint32_t id_offset,
-                                   uint32_t *next_id) {
+                                   uint64_t id_offset, uint64_t *next_id,
+                                   uint64_t *source_span) {
   const auto &streamer = streamers_[source_streamer_index];
   const auto &reformer = source_streamers_reformers_[source_streamer_index];
   const IndexQueryMeta source_streamer_query_meta{streamer->meta().data_type(),
                                                   streamer->meta().dimension()};
-
-  bool need_revert = (target_streamer_->meta().reformer_name() !=
-                          streamer->meta().reformer_name() &&
-                      reformer != nullptr);
-  if (target_builder_ && reformer) {
-    need_revert = true;
-  }
+  // A reformer name identifies an algorithm, not its trained state. Separate
+  // indexes can use the same name with different scale/bias values or rotation
+  // matrices. Always return source records to the original representation and
+  // then encode them with the target reformer instead of copying encoded bytes.
+  const bool need_revert = !streamer->meta().reformer_name().empty();
+  const bool need_convert = target_builder_ == nullptr &&
+                            !target_streamer_->meta().reformer_name().empty();
 
   if (!provider) {
     LOG_ERROR("Source provider is null, index=%zu", source_streamer_index);
     return IndexError_Runtime;
   }
+  *source_span = provider->count();
   IndexProvider::Iterator::Pointer iterator = provider->create_iterator();
   if (!iterator) {
     LOG_ERROR("Failed to create source provider iterator, index=%zu",
@@ -285,7 +403,18 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
       LOG_DEBUG("read_vec cancelled.");
       return 0;
     }
-    if (filter(iterator->key() + (uint64_t)id_offset)) {
+    const uint64_t source_key = iterator->key();
+    if (source_key == (std::numeric_limits<uint64_t>::max)()) {
+      LOG_ERROR("Invalid source vector key");
+      return IndexError_InvalidFormat;
+    }
+    *source_span = (std::max)(*source_span, source_key + 1);
+    uint64_t global_id = 0;
+    if (!checked_add(id_offset, source_key, &global_id)) {
+      LOG_ERROR("Source vector key overflows global id range");
+      return IndexError_InvalidFormat;
+    }
+    if (filter(global_id)) {
       (*stats_.mutable_filtered_count())++;
       iterator->next();
       continue;
@@ -297,24 +426,60 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
                 source_streamer_index, static_cast<size_t>(iterator->key()));
       return IndexError_ReadData;
     }
-
-    std::vector<uint8_t> bytes;
+    std::string reverted_vector;
     if (need_revert) {
-      std::string new_vector;
       if (reformer->revert(vector_data, source_streamer_query_meta,
-                           &new_vector) != 0) {
+                           &reverted_vector) != 0) {
         LOG_ERROR("Failed to revert the vector");
         return IndexError_Runtime;
       }
-      bytes.resize(new_vector.size());
-      memcpy(bytes.data(), new_vector.data(), bytes.size());
-    } else {
-      // TODO: eliminate the copy
-      bytes.resize(provider->element_size());
+      if (reverted_vector.size() != original_query_meta_.element_size()) {
+        LOG_ERROR("Reverted vector has an invalid size: actual=%zu expected=%u",
+                  reverted_vector.size(), original_query_meta_.element_size());
+        return IndexError_Mismatch;
+      }
+      vector_data = reverted_vector.data();
+    }
+
+    std::string converted_vector;
+    if (need_convert) {
+      IndexQueryMeta converted_meta;
+      if (target_streamer_reformer_->convert(vector_data, original_query_meta_,
+                                             &converted_vector,
+                                             &converted_meta) != 0) {
+        LOG_ERROR("Failed to convert vector into target representation");
+        return IndexError_Runtime;
+      }
+      if (!matches_index_meta(converted_meta, target_streamer_->meta())) {
+        LOG_ERROR("Converted vector metadata does not match target streamer");
+        return IndexError_Mismatch;
+      }
+      vector_data = converted_vector.data();
+    }
+
+    const size_t expected_size = target_builder_ != nullptr
+                                     ? original_query_meta_.element_size()
+                                     : target_streamer_->meta().element_size();
+    const size_t source_size =
+        need_convert
+            ? converted_vector.size()
+            : (need_revert ? reverted_vector.size() : provider->element_size());
+    if (source_size != expected_size) {
+      LOG_ERROR("Source vector has an invalid size: actual=%zu expected=%zu",
+                source_size, expected_size);
+      return IndexError_Mismatch;
+    }
+
+    std::vector<uint8_t> bytes(expected_size);
+    if (!bytes.empty()) {
       memcpy(bytes.data(), vector_data, bytes.size());
     }
 
     // TODO: use id instead of key
+    if (*next_id > (std::numeric_limits<uint32_t>::max)()) {
+      LOG_ERROR("Target vector id overflows uint32 range");
+      return IndexError_InvalidFormat;
+    }
     if (!mt_list_.produce(VectorItem((*next_id)++, std::move(bytes)))) {
       LOG_ERROR("Produce vector to queue failed. key[%lu]",
                 (size_t)iterator->key());
@@ -335,8 +500,6 @@ void MixedStreamerReducer::add_vec(int *result) {
   auto target_streamer_query_meta = IndexQueryMeta{
       IndexMeta::MetaType::MT_DENSE, target_streamer_->meta().data_type(),
       target_streamer_->meta().dimension()};
-  const bool need_convert = (!is_target_and_source_same_reformer_) &&
-                            target_streamer_reformer_ != nullptr;
 
   AILEGO_DEFER([&]() {
     // make producer quit
@@ -350,31 +513,10 @@ void MixedStreamerReducer::add_vec(int *result) {
       return;
     }
 
-    const void *vector = vector_item.vec_.data();
-    std::string new_vector;
-
-
-    if (need_convert) {
-      IndexQueryMeta new_meta;
-      if (target_streamer_reformer_->convert(vector, original_query_meta_,
-                                             &new_vector, &new_meta) != 0) {
-        LOG_ERROR("Failed to transform vector");
-        *result = IndexError_Runtime;
-        return;
-      }
-      vector = new_vector.data();
-    }
-    // 1. no reformer: target_streamer_query_meta_ = original_query_meta_
-    // 2. has reformer, matched(need_convert = false): use
-    // target_streamer_query_meta_
-    // 3. has reformer, not matched(need_convert = true): use
-    // target_streamer_query_meta_
-
-
     // TODO: use id instead of key
     int ret = target_streamer_->add_with_id_impl(
-        (uint32_t)vector_item.pkey_, vector, target_streamer_query_meta,
-        target_streamer_context);
+        (uint32_t)vector_item.pkey_, vector_item.vec_.data(),
+        target_streamer_query_meta, target_streamer_context);
     if (ret != 0) {
       LOG_ERROR("Insert target streamer failed. ret[%d] reason[%s] pkey[%zu]",
                 ret, IndexError::What(ret), (size_t)vector_item.pkey_);
@@ -424,9 +566,6 @@ void MixedStreamerReducer::add_sparse_vec(int *result) {
       target_streamer_->meta().data_type(),
   };
 
-  auto need_convert = !is_target_and_source_same_reformer_ &&
-                      target_streamer_reformer_ != nullptr;
-
   AILEGO_DEFER([&]() {
     // make producer quit
     sparse_mt_list_.done();
@@ -441,20 +580,6 @@ void MixedStreamerReducer::add_sparse_vec(int *result) {
     auto sparse_count = sparse_vector_item.sparse_indices_.size();
     auto indices = sparse_vector_item.sparse_indices_.data();
     auto values = sparse_vector_item.sparse_values_.data();
-
-    std::string converted_sparse_values_buffer;
-    if (need_convert) {
-      IndexQueryMeta new_meta;
-      if (target_streamer_reformer_->convert(
-              sparse_count, indices, values, original_query_meta_,
-              &converted_sparse_values_buffer, &new_meta) != 0) {
-        LOG_ERROR("Failed to transform vector");
-        *result = IndexError_Runtime;
-        return;
-      }
-      values = converted_sparse_values_buffer.data();
-      target_streamer_query_meta = new_meta;
-    }
 
     // TODO: use id instead of key
     int ret = target_streamer_->add_with_id_impl(
@@ -474,59 +599,137 @@ void MixedStreamerReducer::add_sparse_vec(int *result) {
 }
 
 
-int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
-                                          const IndexFilter &filter,
-                                          const uint32_t id_offset,
-                                          uint32_t *next_id) {
+int MixedStreamerReducer::read_sparse_vec(
+    size_t source_streamer_index,
+    const IndexStreamer::SparseProvider::Pointer &provider,
+    const IndexFilter &filter, uint64_t id_offset, uint64_t *next_id,
+    uint64_t *source_span) {
   const auto &streamer = streamers_[source_streamer_index];
   const auto &reformer = source_streamers_reformers_[source_streamer_index];
-  const bool need_revert =
-      !is_target_and_source_same_reformer_ && reformer != nullptr;
+  const bool need_revert = !streamer->meta().reformer_name().empty();
+  const bool need_convert = target_builder_ == nullptr &&
+                            !target_streamer_->meta().reformer_name().empty();
 
-  IndexStreamer::SparseProvider::Pointer provider =
-      streamer->create_sparse_provider();
+  if (!provider) {
+    LOG_ERROR("Source sparse provider is null, index=%zu",
+              source_streamer_index);
+    return IndexError_Runtime;
+  }
+  *source_span = provider->count();
   IndexStreamer::SparseProvider::Iterator::Pointer iterator =
       provider->create_iterator();
+  if (!iterator) {
+    LOG_ERROR("Failed to create source sparse provider iterator, index=%zu",
+              source_streamer_index);
+    return IndexError_Runtime;
+  }
 
   while (iterator->is_valid()) {
     if (stop_flag_ != nullptr && stop_flag_->load(std::memory_order_relaxed)) {
       LOG_DEBUG("read_sparse_vec cancelled.");
       return 0;
     }
-    if (filter(iterator->key() + (uint64_t)id_offset)) {
+    const uint64_t source_key = iterator->key();
+    if (source_key == (std::numeric_limits<uint64_t>::max)()) {
+      LOG_ERROR("Invalid source sparse vector key");
+      return IndexError_InvalidFormat;
+    }
+    *source_span = (std::max)(*source_span, source_key + 1);
+    uint64_t global_id = 0;
+    if (!checked_add(id_offset, source_key, &global_id)) {
+      LOG_ERROR("Source sparse vector key overflows global id range");
+      return IndexError_InvalidFormat;
+    }
+    if (filter(global_id)) {
       (*stats_.mutable_filtered_count())++;
       iterator->next();
       continue;
     }
 
-    auto sparse_count = iterator->sparse_count();
+    const auto sparse_count = iterator->sparse_count();
+    const uint32_t *const source_indices = iterator->sparse_indices();
+    const void *const source_values = iterator->sparse_data();
+    if (sparse_count > 0 &&
+        (source_indices == nullptr || source_values == nullptr)) {
+      LOG_ERROR("Failed to read source sparse vector, index=%zu",
+                source_streamer_index);
+      return IndexError_ReadData;
+    }
     std::vector<uint32_t> sparse_indices(sparse_count);
+    if (!sparse_indices.empty()) {
+      memcpy(sparse_indices.data(), source_indices,
+             sparse_indices.size() * sizeof(uint32_t));
+    }
+    const void *values = source_values;
     std::string sparse_values;
 
     if (need_revert) {
-      std::string new_sparse_values;
-      if (reformer->revert(iterator->sparse_count(), iterator->sparse_indices(),
-                           iterator->sparse_data(),
+      if (reformer->revert(sparse_count, source_indices, source_values,
                            {
                                IndexMeta::MetaType::MT_SPARSE,
                                streamer->meta().data_type(),
                            },
-                           &new_sparse_values) != 0) {
+                           &sparse_values) != 0) {
         LOG_ERROR("Failed to revert the sparse vector");
         return IndexError_Runtime;
       }
-      sparse_values = std::move(new_sparse_values);
-    } else {
-      sparse_values.resize(sparse_count * streamer->meta().unit_size());
-      memcpy(sparse_values.data(), iterator->sparse_data(),
-             sparse_values.size());
+      values = sparse_values.data();
     }
 
-    // TODO: eliminate the copy
-    memcpy(sparse_indices.data(), iterator->sparse_indices(),
-           sparse_indices.size() * sizeof(uint32_t));
+    std::string converted_sparse_values;
+    if (need_convert) {
+      IndexQueryMeta converted_meta;
+      if (target_streamer_reformer_->convert(
+              sparse_count, source_indices, values, original_query_meta_,
+              &converted_sparse_values, &converted_meta) != 0) {
+        LOG_ERROR("Failed to convert sparse vector into target representation");
+        return IndexError_Runtime;
+      }
+      if (!matches_index_meta(converted_meta, target_streamer_->meta())) {
+        LOG_ERROR(
+            "Converted sparse vector metadata does not match target streamer");
+        return IndexError_Mismatch;
+      }
+      values = converted_sparse_values.data();
+    }
+
+    const size_t expected_unit_size =
+        target_builder_ != nullptr ? original_query_meta_.unit_size()
+                                   : target_streamer_->meta().unit_size();
+    size_t expected_size = 0;
+    if (!checked_multiply(sparse_count, expected_unit_size, &expected_size)) {
+      LOG_ERROR("Sparse vector size overflows");
+      return IndexError_InvalidFormat;
+    }
+    size_t raw_source_size = 0;
+    if (!checked_multiply(sparse_count, streamer->meta().unit_size(),
+                          &raw_source_size)) {
+      LOG_ERROR("Source sparse vector size overflows");
+      return IndexError_InvalidFormat;
+    }
+    const size_t source_size =
+        need_convert ? converted_sparse_values.size()
+                     : (need_revert ? sparse_values.size() : raw_source_size);
+    if (source_size != expected_size) {
+      LOG_ERROR(
+          "Source sparse vector has an invalid size: actual=%zu expected=%zu",
+          source_size, expected_size);
+      return IndexError_Mismatch;
+    }
+    if (!need_revert && !need_convert) {
+      sparse_values.resize(expected_size);
+      if (!sparse_values.empty()) {
+        memcpy(sparse_values.data(), values, sparse_values.size());
+      }
+    } else if (need_convert) {
+      sparse_values = std::move(converted_sparse_values);
+    }
 
     // TODO: use id instead of key
+    if (*next_id > (std::numeric_limits<uint32_t>::max)()) {
+      LOG_ERROR("Target sparse vector id overflows uint32 range");
+      return IndexError_InvalidFormat;
+    }
     if (!sparse_mt_list_.produce(SparseVectorItem((*next_id)++,
                                                   std::move(sparse_indices),
                                                   std::move(sparse_values)))) {
@@ -603,9 +806,17 @@ int MixedStreamerReducer::IndexBuild() {
     return core::IndexError_Runtime;
   }
   if (target_builder_converter_) {
-    core::IndexConverter::TrainAndTransform(target_builder_converter_,
-                                            target_holder);
+    int ret = core::IndexConverter::TrainAndTransform(target_builder_converter_,
+                                                      target_holder);
+    if (ret != 0) {
+      LOG_ERROR("Failed to convert target holder, ret=%d", ret);
+      return ret;
+    }
     target_holder = target_builder_converter_->result();
+    if (!target_holder) {
+      LOG_ERROR("Target converter returned no result holder");
+      return core::IndexError_Runtime;
+    }
   }
   int ret = target_builder_->train(target_holder);
   if (ret != 0) {

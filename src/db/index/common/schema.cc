@@ -218,6 +218,8 @@ Status FieldSchema::validate() const {
       }
 
       if (index_params_->type() == IndexType::DISKANN) {
+        // DiskAnn supports 64-bit Linux (x86_64/ARM64), macOS ARM64,
+        // 64-bit Android/iOS, and Windows x86_64.
         // The CMake variable
         // DISKANN_SUPPORTED (defined in the top-level CMakeLists.txt) is the
         // single source of truth for platform eligibility — it is also used by
@@ -227,15 +229,33 @@ Status FieldSchema::validate() const {
         //
         // On Linux, DiskAnn prefers io_uring, then libaio, and falls back to
         // synchronous pread() if neither async backend is available. On macOS,
-        // DiskAnn uses synchronous pread(); Windows uses overlapped I/O.
+        // Android and iOS, DiskAnn uses synchronous pread(); Windows uses
+        // overlapped I/O.
 #if !DISKANN_SUPPORTED
         return Status::NotSupported(
             "DiskAnn is not supported on this platform. It is available on "
-            "Linux (x86_64/ARM64), macOS (ARM64), and Windows "
-            "(x86_64).");
+            "64-bit Linux (x86_64/ARM64), macOS (ARM64), 64-bit Android/iOS, "
+            "and Windows (x86_64).");
 #endif
+        if (data_type_ != DataType::VECTOR_FP32 &&
+            data_type_ != DataType::VECTOR_FP16) {
+          return Status::InvalidArgument(
+              "schema validate failed: DiskAnn only supports FP32/FP16 "
+              "vector data types");
+        }
+        const auto diskann_quantize_type = vector_index_params->quantize_type();
+        if (diskann_quantize_type != QuantizeType::UNDEFINED &&
+            diskann_quantize_type != QuantizeType::FP16) {
+          return Status::InvalidArgument(
+              "schema validate failed: DiskAnn only supports FP16 "
+              "quantization");
+        }
+        if (vector_index_params->quantizer_param().enable_rotate()) {
+          return Status::InvalidArgument(
+              "schema validate failed: DiskAnn does not support quantizer "
+              "rotation");
+        }
       }
-
       const auto flat_data_type = vector_index_params->flat_data_type();
       if (flat_data_type != DataType::UNDEFINED) {
         if (flat_data_type != DataType::VECTOR_FP32 &&

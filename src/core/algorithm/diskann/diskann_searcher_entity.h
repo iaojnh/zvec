@@ -22,6 +22,8 @@
 namespace zvec {
 namespace core {
 
+class DiskAnnCacheTestPeer;
+
 class DiskAnnSearcherEntity : public DiskAnnEntity {
  public:
   using Pointer = std::shared_ptr<DiskAnnSearcherEntity>;
@@ -56,8 +58,9 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
     return vector_segment_;
   }
 
-  std::vector<diskann_id_t> &entrypoints() {
-    return entrypoints_;
+  const std::vector<diskann_id_t> &entrypoints() const {
+    static const std::vector<diskann_id_t> empty;
+    return entrypoints_ == nullptr ? empty : *entrypoints_;
   }
 
   diskann_id_t get_id(diskann_key_t key) const override;
@@ -77,9 +80,11 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   IndexMeta meta_;
 
   PQTable::Pointer pq_table_;
-  std::shared_ptr<const std::string> key_buffer_;
-  std::shared_ptr<const std::string> key_mapping_buffer_;
-  std::vector<diskann_id_t> entrypoints_;
+  std::shared_ptr<const std::vector<diskann_key_t>> key_buffer_;
+  std::shared_ptr<const std::vector<diskann_id_t>> key_mapping_buffer_;
+  std::shared_ptr<const std::vector<diskann_id_t>> entrypoints_;
+
+  friend class DiskAnnCacheTestPeer;
 };
 
 }  // namespace core

@@ -86,6 +86,9 @@ class CosineConverterHolder : public IndexHolder {
 
     //! Retrieve pointer of data
     const void *data(void) const override {
+      if (!data_valid_) {
+        return nullptr;
+      }
       return type_ == original_type_ ? normalize_buffer_.data()
                                      : buffer_.data();
     }
@@ -109,7 +112,12 @@ class CosineConverterHolder : public IndexHolder {
    private:
     //! Encode the data by quantizer
     void convert_record(void) {
+      data_valid_ = false;
       if (!front_iter_->is_valid()) {
+        return;
+      }
+      const void *source_data = front_iter_->data();
+      if (!source_data) {
         return;
       }
 
@@ -119,8 +127,7 @@ class CosineConverterHolder : public IndexHolder {
 
       if (original_type_ == IndexMeta::DataType::DT_FP16) {
         ::memcpy(reinterpret_cast<char *>(&normalize_buffer_[0]),
-                 reinterpret_cast<const char *>(front_iter_->data()),
-                 original_element_size);
+                 static_cast<const char *>(source_data), original_element_size);
 
         ailego::Float16 *buf =
             reinterpret_cast<ailego::Float16 *>(&normalize_buffer_[0]);
@@ -144,8 +151,7 @@ class CosineConverterHolder : public IndexHolder {
         ::memcpy(buffer_.data() + element_size - NORM_SIZE, &norm, NORM_SIZE);
       } else {  // original_type_ == IndexMeta::DataType::DT_FP32
         ::memcpy(reinterpret_cast<char *>(&normalize_buffer_[0]),
-                 reinterpret_cast<const char *>(front_iter_->data()),
-                 original_element_size);
+                 static_cast<const char *>(source_data), original_element_size);
 
         float *buf = reinterpret_cast<float *>(&normalize_buffer_[0]);
         const float *vec = buf;
@@ -183,6 +189,7 @@ class CosineConverterHolder : public IndexHolder {
                    &norm, NORM_SIZE);
         }
       }
+      data_valid_ = true;
     }
 
     //! Members
@@ -195,6 +202,7 @@ class CosineConverterHolder : public IndexHolder {
     size_t original_dimension_{0u};
     IndexMeta::DataType original_type_{IndexMeta::DataType::DT_UNDEFINED};
     IndexMeta::DataType type_{IndexMeta::DataType::DT_UNDEFINED};
+    bool data_valid_{false};
   };
 
   //! Constructor
@@ -396,6 +404,7 @@ class CosineConverter : public IndexConverter {
   //! Cleanup Converter
   int cleanup(void) override {
     *stats_.mutable_transformed_count() = 0;
+    holder_.reset();
     return 0;
   }
 

@@ -21,6 +21,8 @@
 namespace zvec {
 namespace core {
 
+class DiskAnnStreamerTestPeer;
+
 class DiskAnnStreamer : public IndexStreamer {
  public:
   using ContextPointer = IndexStreamer::Context::Pointer;
@@ -175,6 +177,8 @@ class DiskAnnStreamer : public IndexStreamer {
 
   Stats stats_;
   State state_{STATE_INIT};
+
+  friend class DiskAnnStreamerTestPeer;
 };
 
 }  // namespace core

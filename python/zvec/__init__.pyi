@@ -56,7 +56,8 @@ def io_backend_type() -> IOBackendType:
 
     Linux selects IOBackendType.IO_URING, IOBackendType.LIBAIO, or
     IOBackendType.PREAD in that order. macOS ARM64 uses IOBackendType.PREAD.
-    Windows uses IOBackendType.WINDOWS_OVERLAPPED.
+    Windows x86_64 uses IOBackendType.WINDOWS_OVERLAPPED. Unsupported target
+    architectures return IOBackendType.UNAVAILABLE.
     """
 
 def io_backend_description() -> str:
@@ -64,7 +65,8 @@ def io_backend_description() -> str:
 
     The description identifies io_uring, libaio, or pread. On Linux, the
     pread description includes guidance for enabling io_uring or installing
-    libaio. Windows reports its overlapped-I/O backend.
+    libaio. Windows reports its overlapped-I/O backend. Unsupported target
+    architectures report that DiskAnn is unavailable.
     """
 
 def set_default_jieba_dict_dir(dir: str) -> None:

@@ -263,6 +263,9 @@ int setup_io_ctx(IOContext &ctx) {
     int ret = LibAioLoader::Instance().io_setup(MAX_EVENTS, &ctx->aio_ctx);
     if (ret == 0) {
       ctx->type = ailego::IOBackendType::kLibAio;
+      if (selected == ailego::IOBackendType::kIoUring) {
+        ailego::IOBackend::Instance().downgrade(ctx->type);
+      }
       log_diskann_io_backend(ctx->type);
       return 0;
     }
@@ -272,6 +275,7 @@ int setup_io_ctx(IOContext &ctx) {
 
   // Priority 3: synchronous pread (always available).
   ctx->type = ailego::IOBackendType::kPread;
+  ailego::IOBackend::Instance().downgrade(ctx->type);
 #endif
   log_diskann_io_backend(ctx->type);
   return 0;
@@ -300,6 +304,9 @@ int destroy_io_ctx(IOContext &ctx) {
 }
 
 #if !defined(_WIN32) && !defined(_WIN64)
+static_assert(sizeof(off_t) >= sizeof(uint64_t),
+              "DiskAnn requires 64-bit POSIX file offsets");
+
 static int execute_one_pread(int fd, const AlignedRead &req) {
   auto *buf = static_cast<uint8_t *>(req.buf);
   uint64_t offset = req.offset;
@@ -861,13 +868,13 @@ static void configure_macos_reader(int file_desc, const std::string &fname) {
 void LinuxAlignedFileReader::open(const std::string &fname) {
   int flags = O_RDONLY;
 
-#if defined(__linux__) || defined(__linux)
+#if defined(__linux__) && !defined(__ANDROID__)
   flags |= O_DIRECT | O_LARGEFILE;
 #endif
 
   this->file_desc = ::open(fname.c_str(), flags);
 
-#if defined(__linux__) || defined(__linux)
+#if defined(__linux__) && !defined(__ANDROID__)
   // O_DIRECT may not be supported on all filesystems (e.g. tmpfs, overlay).
   // Fall back to regular buffered I/O when it fails.
   if (this->file_desc == -1) {

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <iostream>
+#include <limits>
 #include <gtest/gtest.h>
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_helper.h"
@@ -61,6 +62,50 @@ TEST(FileDumper, General) {
     std::string hello = "Hello world!!! #" + std::to_string(i);
     EXPECT_EQ(hello, std::string((const char *)data, seg->data_size()));
   }
+}
+
+TEST(FileReadStorage, BufferedSegmentReadsOwnConstructedBytes) {
+  const std::string file_path = "file_read_storage_buffered_test_file";
+  const std::string payload = "buffered segment payload";
+
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, dumper);
+  ASSERT_EQ(0, dumper->create(file_path));
+  ASSERT_EQ(payload.size(), dumper->write(payload.data(), payload.size()));
+  ASSERT_EQ(0, dumper->append("payload", payload.size(), 0, 0));
+  ASSERT_EQ(0, dumper->close());
+
+  auto storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(ailego::Params()));
+  ASSERT_EQ(0, storage->open(file_path, false));
+
+  auto segment = storage->get("payload", 1);
+  ASSERT_NE(nullptr, segment);
+
+  const void *data = nullptr;
+  ASSERT_EQ(payload.size(), segment->read(0, &data, payload.size()));
+  EXPECT_EQ(payload,
+            std::string(static_cast<const char *>(data), payload.size()));
+
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(payload.size(), segment->read(0, block, payload.size()));
+  EXPECT_EQ(payload, std::string(static_cast<const char *>(block.data()),
+                                 payload.size()));
+
+  IndexStorage::SegmentData pieces[] = {{0, 8}, {9, payload.size() - 9}};
+  ASSERT_TRUE(segment->read(pieces, 2));
+  EXPECT_EQ(
+      payload.substr(0, 8),
+      std::string(static_cast<const char *>(pieces[0].data), pieces[0].length));
+  EXPECT_EQ(
+      payload.substr(9),
+      std::string(static_cast<const char *>(pieces[1].data), pieces[1].length));
+
+  EXPECT_EQ(0U, segment->read(std::numeric_limits<size_t>::max(), &data, 1));
+  IndexStorage::SegmentData invalid(std::numeric_limits<size_t>::max(), 1);
+  EXPECT_FALSE(segment->read(&invalid, 1));
+  EXPECT_EQ(0, storage->close());
 }
 
 TEST(IndexSegmentDumper, General) {
