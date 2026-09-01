@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "neon/fp16/squared_euclidean.h"
+#include "common/fp16_common.h"
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
@@ -30,7 +31,7 @@ void squared_euclidean_fp16_distance(const void *a, const void *b, size_t dim,
   const float16_t *last = lhs + dim;
   const float16_t *last_aligned = lhs + ((dim >> 3) << 3);
 
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#if ZVEC_TURBO_FP16_NEON
   float16x8_t sum = vdupq_n_f16(0.0f);
   for (; lhs != last_aligned; lhs += 8, rhs += 8) {
     const float16x8_t diff = vsubq_f16(vld1q_f16(lhs), vld1q_f16(rhs));
