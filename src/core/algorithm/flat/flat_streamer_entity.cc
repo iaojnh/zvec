@@ -43,15 +43,21 @@ int FlatContiguousStreamerEntity::evaluate_distances(
       return;
     }
     distances.resize(vector_ptrs.size());
-    const auto &batch_distance_func = batch_distance();
-    if (batch_distance_func) {
-      batch_distance_func(vector_ptrs.data(), query, vector_ptrs.size(),
-                          meta().dimension(), distances.data());
+    if (quantizer()) {
+      quantizer()->calc_distance_dp_query_batch(
+          vector_ptrs.data(), static_cast<int>(vector_ptrs.size()), query,
+          distances.data());
     } else {
-      const auto &distance_func = distance();
-      for (size_t i = 0; i < vector_ptrs.size(); ++i) {
-        distance_func(query, vector_ptrs[i], meta().dimension(),
-                      distances.data() + i);
+      const auto &batch_distance_func = batch_distance();
+      if (batch_distance_func) {
+        batch_distance_func(vector_ptrs.data(), query, vector_ptrs.size(),
+                            meta().dimension(), distances.data());
+      } else {
+        const auto &distance_func = distance();
+        for (size_t i = 0; i < vector_ptrs.size(); ++i) {
+          distance_func(query, vector_ptrs[i], meta().dimension(),
+                        distances.data() + i);
+        }
       }
     }
     if (context_stats) {
@@ -149,21 +155,24 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
   storage_ = storage;
 
   //! Create the distance calculator
-  auto metric = IndexFactory::CreateMetric(index_meta_.metric_name());
-  if (!metric) {
-    LOG_ERROR("Failed to create metric %s", index_meta_.metric_name().c_str());
-    return IndexError_NoExist;
+  if (!quantizer_) {
+    auto metric = IndexFactory::CreateMetric(index_meta_.metric_name());
+    if (!metric) {
+      LOG_ERROR("Failed to create metric %s",
+                index_meta_.metric_name().c_str());
+      return IndexError_NoExist;
+    }
+    int ret = metric->init(index_meta_, index_meta_.metric_params());
+    if (ret != 0) {
+      LOG_ERROR("Failed to initialize metric %s",
+                index_meta_.metric_name().c_str());
+      return ret;
+    }
+    row_distance_ = metric->distance();
+    column_distance_ =
+        metric->distance_matrix(meta_.header.block_vector_count, 1);
+    batch_distance_ = metric->batch_distance();
   }
-  int ret = metric->init(index_meta_, index_meta_.metric_params());
-  if (ret != 0) {
-    LOG_ERROR("Failed to initialize metric %s",
-              index_meta_.metric_name().c_str());
-    return ret;
-  }
-  row_distance_ = metric->distance();
-  column_distance_ =
-      metric->distance_matrix(meta_.header.block_vector_count, 1);
-  batch_distance_ = metric->batch_distance();
 
   LOG_DEBUG("Open storage %s done, metric=%s", storage_->name().c_str(),
             index_meta_.metric_name().c_str());
@@ -458,6 +467,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone(void) const {
   // entity->reformer_ = this->reformer_;
   entity->segments_ = segments;
   entity->meta_ = this->meta_;
+  entity->quantizer_ = this->quantizer_;
   entity->key_info_map_lock_ = this->key_info_map_lock_;
   entity->key_info_map_ = this->key_info_map_;
   entity->id_key_vector_ = this->id_key_vector_;
