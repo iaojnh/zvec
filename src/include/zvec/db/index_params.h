@@ -200,7 +200,10 @@ class ZVEC_API VectorIndexParams : public IndexParams {
     return quantizer_param_.enable_rotate();
   }
 
-  // Controls the auxiliary Flat index used to refine graph candidates.
+  // Controls the Flat index materialized by the DB layer. For graph indexes,
+  // this is the auxiliary Flat index used to refine graph candidates. A
+  // direct Flat index overrides this to expose its own contiguous-memory
+  // setting.
   virtual bool use_flat_contiguous_memory() const {
     return false;
   }
@@ -558,6 +561,10 @@ class ZVEC_API FlatIndexParams : public VectorIndexParams {
     return use_contiguous_memory_;
   }
 
+  bool use_flat_contiguous_memory() const override {
+    return use_contiguous_memory_;
+  }
+
   DataType storage_data_type() const {
     return storage_data_type_;
   }
@@ -579,8 +586,10 @@ inline FlatIndexParams MakeDefaultVectorIndexParams(
 
 inline FlatIndexParams MakeDefaultQuantVectorIndexParams(
     MetricType metric_type, QuantizeType quantize_type,
-    QuantizerParam quantizer_param = {}) {
-  return FlatIndexParams(metric_type, quantize_type, quantizer_param);
+    QuantizerParam quantizer_param = {},
+    bool use_contiguous_memory = false) {
+  return FlatIndexParams(metric_type, quantize_type, quantizer_param,
+                         use_contiguous_memory);
 }
 
 class ZVEC_API IVFIndexParams : public VectorIndexParams {

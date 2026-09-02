@@ -162,12 +162,19 @@ TEST(IndexParamsTest, DefaultFlatReferenceParams) {
       MakeDefaultVectorIndexParams(MetricType::L2, true, DataType::VECTOR_FP16);
   EXPECT_EQ(flat.quantize_type(), QuantizeType::UNDEFINED);
   EXPECT_TRUE(flat.use_contiguous_memory());
+  EXPECT_TRUE(flat.use_flat_contiguous_memory());
   EXPECT_EQ(flat.storage_data_type(), DataType::VECTOR_FP16);
   auto cloned = std::dynamic_pointer_cast<FlatIndexParams>(flat.clone());
   ASSERT_NE(cloned, nullptr);
   EXPECT_TRUE(cloned->use_contiguous_memory());
   EXPECT_EQ(cloned->storage_data_type(), DataType::VECTOR_FP16);
   EXPECT_TRUE(*cloned == flat);
+
+  auto quant_flat = MakeDefaultQuantVectorIndexParams(
+      MetricType::L2, QuantizeType::INT8, QuantizerParam(), true);
+  EXPECT_EQ(quant_flat.quantize_type(), QuantizeType::INT8);
+  EXPECT_TRUE(quant_flat.use_contiguous_memory());
+  EXPECT_TRUE(quant_flat.use_flat_contiguous_memory());
 }
 
 TEST(IndexParamsTest, IVFIndexParams) {

@@ -177,6 +177,60 @@ TEST_P(SegmentTest, InsertVectorTypes) {
   }
 }
 
+TEST_P(SegmentTest, FlatInt8ContiguousMemoryPropagatesToAllIndexers) {
+  auto tmp_schema = test::TestHelper::CreateSchemaWithVectorIndex(
+      false, col_name_,
+      std::make_shared<FlatIndexParams>(
+          MetricType::IP, QuantizeType::INT8, QuantizerParam(), true));
+
+  auto assert_contiguous = [](const VectorColumnIndexer::Ptr &indexer) {
+    ASSERT_NE(indexer, nullptr);
+    auto params = std::dynamic_pointer_cast<FlatIndexParams>(
+        indexer->field_schema().index_params());
+    ASSERT_NE(params, nullptr);
+    EXPECT_TRUE(params->use_contiguous_memory());
+  };
+
+  {
+    auto segment = test::TestHelper::CreateSegmentWithDoc(
+        col_path_, *tmp_schema, 0, 0, id_map_, delete_store_, version_manager_,
+        options_, 0, 10);
+    ASSERT_NE(segment, nullptr);
+
+    auto combined = segment->get_combined_vector_indexer("dense_fp32");
+    auto quant_combined =
+        segment->get_quant_combined_vector_indexer("dense_fp32");
+    ASSERT_NE(combined, nullptr);
+    ASSERT_NE(quant_combined, nullptr);
+
+    ASSERT_TRUE(segment->flush().ok());
+    const auto raw_indexers = segment->get_vector_indexer("dense_fp32");
+    const auto quant_indexers =
+        segment->get_quant_vector_indexer("dense_fp32");
+    ASSERT_EQ(raw_indexers.size(), 1u);
+    ASSERT_EQ(quant_indexers.size(), 1u);
+    assert_contiguous(raw_indexers.front());
+    assert_contiguous(quant_indexers.front());
+  }
+
+  {
+    Version version = version_manager_->get_current_version();
+    auto result = Segment::Open(
+        col_path_, *tmp_schema, *version.writing_segment_meta(), id_map_,
+        delete_store_, version_manager_, options_);
+    ASSERT_TRUE(result.has_value());
+    auto segment = result.value();
+
+    const auto raw_indexers = segment->get_vector_indexer("dense_fp32");
+    const auto quant_indexers =
+        segment->get_quant_vector_indexer("dense_fp32");
+    ASSERT_EQ(raw_indexers.size(), 1u);
+    ASSERT_EQ(quant_indexers.size(), 1u);
+    assert_contiguous(raw_indexers.front());
+    assert_contiguous(quant_indexers.front());
+  }
+}
+
 TEST_P(SegmentTest, FetchByGlobalDocID) {
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_, options_,

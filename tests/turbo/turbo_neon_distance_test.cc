@@ -25,6 +25,7 @@
 #include "distance/neon/fp32/squared_euclidean.h"
 #include "distance/neon/record_quantized_int4/common.h"
 #include "distance/neon/record_quantized_int8/common.h"
+#include "distance/neon/record_quantized_int8/inner_product.h"
 #include "distance/scalar/fp16/cosine.h"
 #include "distance/scalar/fp16/inner_product.h"
 #include "distance/scalar/fp16/squared_euclidean.h"
@@ -159,6 +160,27 @@ TEST(NeonDistance, DispatchProvidesAllKernels) {
     EXPECT_TRUE(int4.dist);
     EXPECT_TRUE(int4.batch);
   }
+#endif
+}
+
+TEST(NeonDistance, AutoDispatchSelectsRecordInt8InnerProduct) {
+#if !defined(__ARM_NEON) || !defined(__aarch64__)
+  GTEST_SKIP() << "NEON distance kernels require AArch64";
+#else
+  const auto kernels =
+      get_distance_kernels(MetricType::kInnerProduct, DataType::kInt8,
+                           QuantizeType::kRecord, CpuArchType::kAuto);
+  ASSERT_TRUE(kernels.dist);
+  ASSERT_TRUE(kernels.batch);
+
+  const auto *distance_target =
+      kernels.dist.target<decltype(&neon::inner_product_int8_distance)>();
+  const auto *batch_target = kernels.batch.target<
+      decltype(&neon::inner_product_int8_batch_distance)>();
+  ASSERT_NE(distance_target, nullptr);
+  ASSERT_NE(batch_target, nullptr);
+  EXPECT_EQ(*distance_target, &neon::inner_product_int8_distance);
+  EXPECT_EQ(*batch_target, &neon::inner_product_int8_batch_distance);
 #endif
 }
 
