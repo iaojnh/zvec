@@ -1075,7 +1075,7 @@ TEST(IndexInterface, Merge) {
 
 TEST(IndexInterface, MergeFp16FlatSourcesIntoIvfWithDenseIdRewrite) {
   constexpr uint32_t kDimension = 16;
-  constexpr uint32_t kSourceCount = 64;
+  static constexpr uint32_t kSourceCount = 64;
   const std::string first_name{"provider_merge_ivf_source_1.index"};
   const std::string second_name{"provider_merge_ivf_source_2.index"};
   const std::string target_name{"provider_merge_ivf_target.index"};
