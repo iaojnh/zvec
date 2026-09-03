@@ -1073,6 +1073,88 @@ TEST(IndexInterface, Merge) {
   }
 }
 
+TEST(IndexInterface, MergeFp16FlatSourcesIntoIvfWithDenseIdRewrite) {
+  constexpr uint32_t kDimension = 16;
+  static constexpr uint32_t kSourceCount = 64;
+  const std::string first_name{"provider_merge_ivf_source_1.index"};
+  const std::string second_name{"provider_merge_ivf_source_2.index"};
+  const std::string target_name{"provider_merge_ivf_target.index"};
+
+  auto remove_files = [](const std::string &path) {
+    zvec::test_util::RemoveTestFiles(path);
+  };
+  remove_files(first_name);
+  remove_files(second_name);
+  remove_files(target_name);
+
+  auto source_param = FlatIndexParamBuilder()
+                          .with_metric_type(MetricType::kL2sq)
+                          .with_data_type(DataType::DT_FP32)
+                          .with_storage_data_type(DataType::DT_FP16)
+                          .with_dimension(kDimension)
+                          .with_is_sparse(false)
+                          .build();
+  auto target_param = IVFIndexParamBuilder()
+                          .with_metric_type(MetricType::kL2sq)
+                          .with_data_type(DataType::DT_FP32)
+                          .with_dimension(kDimension)
+                          .with_is_sparse(false)
+                          .with_n_list(4)
+                          .build();
+
+  auto create_index = [](const BaseIndexParam::Pointer &param,
+                         const std::string &path) {
+    auto index = IndexFactory::CreateAndInitIndex(*param);
+    if (!index ||
+        index->open(path, {StorageOptions::StorageType::kMMAP, true}) != 0) {
+      return Index::Pointer();
+    }
+    return index;
+  };
+
+  auto first = create_index(source_param, first_name);
+  auto second = create_index(source_param, second_name);
+  auto target = create_index(target_param, target_name);
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  ASSERT_NE(nullptr, target);
+
+  std::vector<float> vector(kDimension, 0.0f);
+  for (uint32_t i = 0; i < kSourceCount; ++i) {
+    vector[0] = static_cast<float>(i);
+    ASSERT_EQ(0, first->add(VectorData{DenseVector{vector.data()}}, i));
+    vector[0] = static_cast<float>(1000 + i);
+    ASSERT_EQ(0, second->add(VectorData{DenseVector{vector.data()}}, i));
+  }
+
+  IndexFilter filter;
+  filter.set([](uint64_t logical_id) {
+    return logical_id == 3 || logical_id == kSourceCount + 5;
+  });
+  ASSERT_EQ(0, target->merge({first, second}, filter));
+  ASSERT_EQ(kSourceCount * 2 - 2, target->get_doc_count());
+
+  auto expect_first_value = [&](uint32_t doc_id, float expected) {
+    VectorDataBuffer fetched;
+    ASSERT_EQ(0, target->fetch(doc_id, &fetched));
+    const auto &buffer = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+    const float *data = reinterpret_cast<const float *>(buffer.data.data());
+    ASSERT_NE(nullptr, data);
+    EXPECT_FLOAT_EQ(expected, data[0]);
+  };
+  expect_first_value(0, 0.0f);
+  expect_first_value(3, 4.0f);
+  expect_first_value(kSourceCount - 1, 1000.0f);
+  expect_first_value(kSourceCount + 4, 1006.0f);
+
+  ASSERT_EQ(0, first->close());
+  ASSERT_EQ(0, second->close());
+  ASSERT_EQ(0, target->close());
+  remove_files(first_name);
+  remove_files(second_name);
+  remove_files(target_name);
+}
+
 TEST(IndexInterface, FlatStorageDataTypeConvertsFp32InputAndQuery) {
   constexpr uint32_t kDimension = 17;
   constexpr uint32_t kVectorCount = 8;
@@ -1341,15 +1423,26 @@ TEST(IndexInterface, Fp16CosineRefineMatchesNativeFlatPipeline) {
               direct_result.reverted_vector_list_.size());
     ASSERT_EQ(direct_result.reverted_vector_list_.size(),
               refined_result.reverted_vector_list_.size());
+    // FP16 cosine can produce equal scores. Direct search and refinement scan
+    // candidates in different orders, so align refined results by key instead
+    // of requiring an unspecified stable order for ties.
+    std::unordered_map<uint64_t, size_t> refined_positions;
+    for (size_t i = 0; i < refined_result.doc_list_.size(); ++i) {
+      ASSERT_TRUE(
+          refined_positions.emplace(refined_result.doc_list_[i].key(), i)
+              .second);
+    }
     for (size_t i = 0; i < native_result.doc_list_.size(); ++i) {
       EXPECT_EQ(native_result.doc_list_[i].key(),
                 direct_result.doc_list_[i].key());
-      EXPECT_EQ(direct_result.doc_list_[i].key(),
-                refined_result.doc_list_[i].key());
+      auto refined_it =
+          refined_positions.find(direct_result.doc_list_[i].key());
+      ASSERT_NE(refined_positions.end(), refined_it);
+      const size_t refined_i = refined_it->second;
       EXPECT_NEAR(native_result.doc_list_[i].score(),
                   direct_result.doc_list_[i].score(), 1e-7F);
       EXPECT_NEAR(direct_result.doc_list_[i].score(),
-                  refined_result.doc_list_[i].score(), 1e-7F);
+                  refined_result.doc_list_[refined_i].score(), 1e-7F);
 
       ASSERT_EQ(kDimension * sizeof(uint16_t),
                 native_result.reverted_vector_list_[i].size());
@@ -1363,7 +1456,7 @@ TEST(IndexInterface, Fp16CosineRefineMatchesNativeFlatPipeline) {
               native_result.reverted_vector_list_[i].data()),
           kDimension, expected.data());
       const auto *restored = reinterpret_cast<const float *>(
-          refined_result.reverted_vector_list_[i].data());
+          refined_result.reverted_vector_list_[refined_i].data());
       const auto *direct_restored = reinterpret_cast<const float *>(
           direct_result.reverted_vector_list_[i].data());
       for (uint32_t d = 0; d < kDimension; ++d) {
