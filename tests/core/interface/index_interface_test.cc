@@ -1423,15 +1423,26 @@ TEST(IndexInterface, Fp16CosineRefineMatchesNativeFlatPipeline) {
               direct_result.reverted_vector_list_.size());
     ASSERT_EQ(direct_result.reverted_vector_list_.size(),
               refined_result.reverted_vector_list_.size());
+    // FP16 cosine can produce equal scores. Direct search and refinement scan
+    // candidates in different orders, so align refined results by key instead
+    // of requiring an unspecified stable order for ties.
+    std::unordered_map<uint64_t, size_t> refined_positions;
+    for (size_t i = 0; i < refined_result.doc_list_.size(); ++i) {
+      ASSERT_TRUE(
+          refined_positions.emplace(refined_result.doc_list_[i].key(), i)
+              .second);
+    }
     for (size_t i = 0; i < native_result.doc_list_.size(); ++i) {
       EXPECT_EQ(native_result.doc_list_[i].key(),
                 direct_result.doc_list_[i].key());
-      EXPECT_EQ(direct_result.doc_list_[i].key(),
-                refined_result.doc_list_[i].key());
+      auto refined_it =
+          refined_positions.find(direct_result.doc_list_[i].key());
+      ASSERT_NE(refined_positions.end(), refined_it);
+      const size_t refined_i = refined_it->second;
       EXPECT_NEAR(native_result.doc_list_[i].score(),
                   direct_result.doc_list_[i].score(), 1e-7F);
       EXPECT_NEAR(direct_result.doc_list_[i].score(),
-                  refined_result.doc_list_[i].score(), 1e-7F);
+                  refined_result.doc_list_[refined_i].score(), 1e-7F);
 
       ASSERT_EQ(kDimension * sizeof(uint16_t),
                 native_result.reverted_vector_list_[i].size());
@@ -1445,7 +1456,7 @@ TEST(IndexInterface, Fp16CosineRefineMatchesNativeFlatPipeline) {
               native_result.reverted_vector_list_[i].data()),
           kDimension, expected.data());
       const auto *restored = reinterpret_cast<const float *>(
-          refined_result.reverted_vector_list_[i].data());
+          refined_result.reverted_vector_list_[refined_i].data());
       const auto *direct_restored = reinterpret_cast<const float *>(
           direct_result.reverted_vector_list_[i].data());
       for (uint32_t d = 0; d < kDimension; ++d) {
