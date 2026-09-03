@@ -36,16 +36,17 @@ class MergedProviderIndexHolder final : public IndexHolder {
   typedef std::shared_ptr<MergedProviderIndexHolder> Pointer;
 
   struct Source {
-    // Some providers keep references or raw pointers to their streamer. Keep
-    // the streamer alive for as long as a builder may retain this holder.
+    // Keep the streamer alive for as long as a builder may retain this holder.
+    // Providers are created lazily so the holder does not retain one provider
+    // (and its source-specific buffers) for every source at the same time.
     IndexStreamer::Pointer owner{};
-    IndexProvider::Pointer provider{};
     IndexReformer::Pointer reformer{};
     IndexQueryMeta provider_meta{};
     bool need_revert{false};
 
     // Filled by init() and consumed by each merged iterator.
     uint64_t logical_id_base{0};
+    size_t provider_count{0};
     size_t iterated_count{0};
     std::vector<uint64_t> keep_bits{};
   };
@@ -73,6 +74,8 @@ class MergedProviderIndexHolder final : public IndexHolder {
  private:
   class Iterator;
 
+  IndexProvider::Pointer acquire_provider(size_t source_index,
+                                          bool validate_planned_count);
   bool keep(size_t source_index, size_t ordinal) const;
   bool canceled(void) const;
   void set_status(int status);

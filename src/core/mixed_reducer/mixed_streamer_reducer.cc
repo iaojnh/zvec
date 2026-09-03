@@ -530,15 +530,8 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) {
   sources.reserve(streamers_.size());
 
   for (size_t i = 0; i < streamers_.size(); ++i) {
-    auto provider = streamers_[i]->create_provider();
-    if (!provider) {
-      LOG_ERROR("Failed to create source provider, source=%zu", i);
-      return IndexError_Runtime;
-    }
-
     MergedProviderIndexHolder::Source source;
     source.owner = streamers_[i];
-    source.provider = std::move(provider);
     source.reformer = source_streamers_reformers_[i];
     source.provider_meta = IndexQueryMeta{streamers_[i]->meta().data_type(),
                                           streamers_[i]->meta().dimension()};

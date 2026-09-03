@@ -115,11 +115,16 @@ class MergedProviderIndexHolder::Iterator final : public IndexHolder::Iterator {
 
       const auto &source = owner_->sources_[source_index_];
       if (!source_iter_) {
-        source_iter_ = source.provider->create_iterator();
+        source_provider_ = owner_->acquire_provider(source_index_, true);
+        if (!source_provider_) {
+          return;
+        }
+        source_iter_ = source_provider_->create_iterator();
         source_ordinal_ = 0;
         if (!source_iter_) {
           LOG_ERROR("Failed to create source provider iterator, source=%zu",
                     source_index_);
+          source_provider_.reset();
           owner_->set_status(IndexError_Runtime);
           return;
         }
@@ -150,6 +155,7 @@ class MergedProviderIndexHolder::Iterator final : public IndexHolder::Iterator {
         return;
       }
       source_iter_.reset();
+      source_provider_.reset();
       ++source_index_;
     }
   }
@@ -172,6 +178,7 @@ class MergedProviderIndexHolder::Iterator final : public IndexHolder::Iterator {
   size_t source_index_{0};
   size_t source_ordinal_{0};
   uint64_t output_key_{0};
+  IndexProvider::Pointer source_provider_{};
   IndexHolder::Iterator::Pointer source_iter_{};
   mutable std::string revert_buffer_{};
   mutable const void *data_{nullptr};
@@ -200,22 +207,17 @@ int MergedProviderIndexHolder::init(const IndexFilter &filter,
   for (size_t source_index = 0; source_index < sources_.size();
        ++source_index) {
     auto &source = sources_[source_index];
-    if (!source.provider || (source.need_revert && !source.reformer)) {
+    if (!source.owner || (source.need_revert && !source.reformer)) {
       this->set_status(IndexError_InvalidArgument);
       return this->status();
     }
-    if (!source.need_revert &&
-        (source.provider->data_type() != output_meta_.data_type() ||
-         source.provider->dimension() != output_meta_.dimension() ||
-         source.provider->element_size() != output_meta_.element_size())) {
-      LOG_ERROR(
-          "Source provider meta does not match merged holder output, "
-          "source=%zu",
-          source_index);
-      this->set_status(IndexError_Mismatch);
+
+    auto provider = this->acquire_provider(source_index, false);
+    if (!provider) {
       return this->status();
     }
-    if (source.provider->count() >
+    source.provider_count = provider->count();
+    if (source.provider_count >
         std::numeric_limits<uint64_t>::max() - logical_id_base) {
       this->set_status(IndexError_Overflow);
       return this->status();
@@ -224,12 +226,12 @@ int MergedProviderIndexHolder::init(const IndexFilter &filter,
     source.logical_id_base = logical_id_base;
     source.keep_bits.clear();
     if (has_filter_) {
-      const size_t provider_count = source.provider->count();
+      const size_t provider_count = source.provider_count;
       source.keep_bits.reserve(provider_count / kBitsPerWord +
                                (provider_count % kBitsPerWord != 0));
     }
 
-    auto iter = source.provider->create_iterator();
+    auto iter = provider->create_iterator();
     if (!iter) {
       LOG_ERROR("Failed to create source provider iterator, source=%zu",
                 source_index);
@@ -295,7 +297,7 @@ int MergedProviderIndexHolder::init(const IndexFilter &filter,
       }
     }
     source.iterated_count = ordinal;
-    logical_id_base += source.provider->count();
+    logical_id_base += source.provider_count;
   }
 
   initialized_ = true;
@@ -340,6 +342,57 @@ int MergedProviderIndexHolder::status(void) const {
 
 void MergedProviderIndexHolder::set_stop_flag(std::atomic<bool> *stop_flag) {
   stop_flag_ = stop_flag;
+}
+
+IndexProvider::Pointer MergedProviderIndexHolder::acquire_provider(
+    size_t source_index, bool validate_planned_count) {
+  if (source_index >= sources_.size()) {
+    this->set_status(IndexError_OutOfRange);
+    return nullptr;
+  }
+
+  const auto &source = sources_[source_index];
+  if (!source.owner) {
+    this->set_status(IndexError_InvalidArgument);
+    return nullptr;
+  }
+
+  auto provider = source.owner->create_provider();
+  if (!provider) {
+    LOG_ERROR("Failed to create source provider, source=%zu", source_index);
+    this->set_status(IndexError_Runtime);
+    return nullptr;
+  }
+
+  if (provider->data_type() != source.provider_meta.data_type() ||
+      provider->dimension() != source.provider_meta.dimension() ||
+      provider->element_size() != source.provider_meta.element_size()) {
+    LOG_ERROR("Source provider meta changed, source=%zu", source_index);
+    this->set_status(IndexError_Mismatch);
+    return nullptr;
+  }
+
+  if (!source.need_revert &&
+      (provider->data_type() != output_meta_.data_type() ||
+       provider->dimension() != output_meta_.dimension() ||
+       provider->element_size() != output_meta_.element_size())) {
+    LOG_ERROR(
+        "Source provider meta does not match merged holder output, source=%zu",
+        source_index);
+    this->set_status(IndexError_Mismatch);
+    return nullptr;
+  }
+
+  if (validate_planned_count && provider->count() != source.provider_count) {
+    LOG_ERROR(
+        "Source provider count changed after filter planning, "
+        "source=%zu expected=%zu actual=%zu",
+        source_index, source.provider_count, provider->count());
+    this->set_status(IndexError_Mismatch);
+    return nullptr;
+  }
+
+  return provider;
 }
 
 bool MergedProviderIndexHolder::keep(size_t source_index,
