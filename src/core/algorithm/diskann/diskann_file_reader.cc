@@ -600,8 +600,8 @@ static int reopen_macos_file_descriptor(const std::string &fname,
   }
 #endif
 
-  struct stat source_stat{};
-  struct stat reopened_stat{};
+  struct stat source_stat {};
+  struct stat reopened_stat {};
   if (::fstat(source_fd, &source_stat) == -1 ||
       ::fstat(reopened_fd, &reopened_stat) == -1) {
     const int saved_errno = errno;
