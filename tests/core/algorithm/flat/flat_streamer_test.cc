@@ -12,9 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "algorithm/flat/flat_streamer.h"
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <future>
 #include <string>
+#include <thread>
 #include <vector>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
@@ -35,6 +41,19 @@ using namespace zvec::ailego;
 using namespace std;
 
 constexpr size_t static dim = 16;
+
+std::string EncodeUniformUint8Record(size_t dimension, uint32_t seed) {
+  std::string record(dimension + sizeof(uint32_t), '\0');
+  uint32_t sum_squared = 0;
+  for (size_t d = 0; d < dimension; ++d) {
+    const uint8_t code =
+        static_cast<uint8_t>((seed * 73U + d * 29U + d * seed * 3U) & 0xffU);
+    record[d] = static_cast<char>(static_cast<int>(code) - 128);
+    sum_squared += static_cast<uint32_t>(code) * code;
+  }
+  std::memcpy(record.data() + dimension, &sum_squared, sizeof(sum_squared));
+  return record;
+}
 
 class FlatStreamerTest : public testing::Test {
  protected:
@@ -95,6 +114,203 @@ TEST_F(FlatStreamerTest, TestAddVector) {
 
   streamer->flush(0UL);
   streamer.reset();
+}
+
+TEST_F(FlatStreamerTest, TestContiguousCandidateSearchAndInsertFallback) {
+  const std::string path = dir_ + "Test/ContiguousEntity";
+  Params params;
+  params.set(PARAM_FLAT_USE_ID_MAP, false);
+  params.set(PARAM_FLAT_USE_CONTIGUOUS_MEMORY, true);
+  IndexQueryMeta qmeta(IndexMeta::DT_FP32, dim);
+
+  {
+    auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open(path, true));
+
+    auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+    ASSERT_NE(nullptr, streamer);
+    ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+    ASSERT_EQ(0, streamer->open(storage));
+    auto context = streamer->create_context();
+    for (uint32_t id = 0; id < 64; ++id) {
+      NumericalVector<float> vec(dim);
+      for (size_t d = 0; d < dim; ++d) {
+        vec[d] = static_cast<float>(id);
+      }
+      ASSERT_EQ(0, streamer->add_with_id_impl(id, vec.data(), qmeta, context));
+    }
+    ASSERT_EQ(0, streamer->flush(0));
+    ASSERT_EQ(0, streamer->close());
+    ASSERT_EQ(0, storage->close());
+  }
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  ASSERT_EQ(0, storage->open(path, false));
+
+  auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+  ASSERT_NE(nullptr, streamer);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+  auto *flat = dynamic_cast<FlatStreamer<32> *>(streamer.get());
+  ASSERT_NE(nullptr, flat);
+  auto *contiguous_entity =
+      dynamic_cast<const FlatContiguousStreamerEntity *>(&flat->entity());
+  ASSERT_NE(nullptr, contiguous_entity);
+  ASSERT_TRUE(contiguous_entity->is_contiguous());
+
+  auto context = streamer->create_context();
+  context->set_topk(2);
+  NumericalVector<float> query(dim);
+  for (size_t d = 0; d < dim; ++d) {
+    query[d] = 17.0F;
+  }
+  ASSERT_EQ(0, streamer->search_bf_impl(query.data(), qmeta, 1, context));
+  ASSERT_EQ(2, context->result().size());
+  EXPECT_EQ(17, context->result()[0].key());
+
+  std::vector<std::vector<uint64_t>> keys{{5, 17, 31}};
+  ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(query.data(), keys, qmeta, 1,
+                                                  context));
+  ASSERT_EQ(2, context->result().size());
+  EXPECT_EQ(17, context->result()[0].key());
+
+  IndexStorage::MemoryBlock contiguous_block;
+  ASSERT_EQ(0, streamer->get_vector_by_id(17, contiguous_block));
+  ASSERT_NE(nullptr, contiguous_block.data());
+  EXPECT_FLOAT_EQ(17.0F,
+                  static_cast<const float *>(contiguous_block.data())[0]);
+
+  NumericalVector<float> appended(dim);
+  for (size_t d = 0; d < dim; ++d) {
+    appended[d] = 64.0F;
+  }
+
+  std::promise<void> search_started;
+  std::promise<void> resume_search;
+  auto resume_search_future = resume_search.get_future().share();
+  std::atomic_bool search_paused{false};
+  context->set_filter([&](uint64_t) {
+    if (!search_paused.exchange(true)) {
+      search_started.set_value();
+      resume_search_future.wait();
+    }
+    return false;
+  });
+  auto search_future = std::async(std::launch::async, [&]() {
+    return streamer->search_bf_impl(query.data(), qmeta, 1, context);
+  });
+  search_started.get_future().wait();
+
+  auto add_context = streamer->create_context();
+  int add_ret =
+      streamer->add_with_id_impl(64, appended.data(), qmeta, add_context);
+  resume_search.set_value();
+  EXPECT_EQ(0, add_ret);
+  ASSERT_EQ(0, search_future.get());
+  ASSERT_EQ(2, context->result().size());
+  EXPECT_EQ(17, context->result()[0].key());
+  context->reset_filter();
+
+  EXPECT_FALSE(contiguous_entity->is_contiguous());
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(0, streamer->get_vector_by_id(64, block));
+  ASSERT_NE(nullptr, block.data());
+  EXPECT_FLOAT_EQ(64.0F, static_cast<const float *>(block.data())[0]);
+
+  ASSERT_EQ(0, streamer->search_bf_impl(appended.data(), qmeta, 1, context));
+  ASSERT_EQ(2, context->result().size());
+  EXPECT_EQ(64, context->result()[0].key());
+
+  NumericalVector<float> updated(dim);
+  for (size_t d = 0; d < dim; ++d) {
+    updated[d] = 80.0F;
+  }
+  ASSERT_EQ(0, streamer->add_with_id_impl(17, updated.data(), qmeta, context));
+  keys = {{17, 64}};
+  ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(updated.data(), keys, qmeta,
+                                                  1, context));
+  ASSERT_EQ(2, context->result().size());
+  EXPECT_EQ(17, context->result()[0].key());
+
+  keys = {{17, 64}};
+  ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(appended.data(), keys, qmeta,
+                                                  1, context));
+  ASSERT_EQ(2, context->result().size());
+  EXPECT_EQ(64, context->result()[0].key());
+
+  ASSERT_EQ(0, streamer->close());
+  ASSERT_EQ(0, storage->close());
+}
+
+TEST_F(FlatStreamerTest, TestContiguousUniformUint8ExtraValues) {
+  constexpr size_t kOriginalDimension = 128;
+  constexpr size_t kEncodedDimension = kOriginalDimension + sizeof(uint32_t);
+  constexpr size_t kCount = 64;
+  const std::string path = dir_ + "Test/ContiguousUniformUint8";
+
+  Params metric_params;
+  metric_params.set("proxima.uniform_uint8.metric.origin_metric_name",
+                    std::string("SquaredEuclidean"));
+  IndexMeta meta(IndexMeta::DataType::DT_INT8, kEncodedDimension);
+  meta.set_metric("UniformUint8", 0, metric_params);
+
+  Params params;
+  params.set(PARAM_FLAT_USE_ID_MAP, false);
+  IndexQueryMeta query_meta(IndexMeta::DataType::DT_INT8, kEncodedDimension);
+
+  {
+    auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open(path, true));
+
+    auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+    ASSERT_NE(nullptr, streamer);
+    ASSERT_EQ(0, streamer->init(meta, params));
+    ASSERT_EQ(0, streamer->open(storage));
+    auto context = streamer->create_context();
+    for (uint32_t id = 0; id < kCount; ++id) {
+      const auto record = EncodeUniformUint8Record(kOriginalDimension, id);
+      ASSERT_EQ(0, streamer->add_with_id_impl(id, record.data(), query_meta,
+                                              context));
+    }
+    ASSERT_EQ(0, streamer->flush(0));
+    ASSERT_EQ(0, streamer->close());
+    ASSERT_EQ(0, storage->close());
+  }
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  ASSERT_EQ(0, storage->open(path, false));
+
+  params.set(PARAM_FLAT_USE_CONTIGUOUS_MEMORY, true);
+  auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+  ASSERT_NE(nullptr, streamer);
+  ASSERT_EQ(0, streamer->init(meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+  auto *flat = dynamic_cast<FlatStreamer<32> *>(streamer.get());
+  ASSERT_NE(nullptr, flat);
+  auto *contiguous_entity =
+      dynamic_cast<const FlatContiguousStreamerEntity *>(&flat->entity());
+  ASSERT_NE(nullptr, contiguous_entity);
+  ASSERT_TRUE(contiguous_entity->is_contiguous());
+
+  constexpr uint32_t kProbe = 37;
+  const auto query = EncodeUniformUint8Record(kOriginalDimension, kProbe);
+  auto context = streamer->create_context();
+  context->set_topk(1);
+  ASSERT_EQ(0, streamer->search_bf_impl(query.data(), query_meta, 1, context));
+  ASSERT_EQ(1U, context->result().size());
+  EXPECT_EQ(kProbe, context->result()[0].key());
+  EXPECT_FLOAT_EQ(0.0F, context->result()[0].score());
+
+  ASSERT_EQ(0, streamer->close());
+  ASSERT_EQ(0, storage->close());
 }
 
 TEST_F(FlatStreamerTest, TestLinearSearch) {
@@ -722,6 +938,86 @@ TEST_F(FlatStreamerTest, TestConcurrentAddAndSearch) {
   ASSERT_EQ(3000, total);
   ASSERT_EQ(0, min);
   ASSERT_EQ(2999, max);
+}
+
+TEST_F(FlatStreamerTest, TestConcurrentSegmentGrowthAndFetch) {
+  MemoryLimitPool::get_instance().init(64 * 1024UL * 1024UL);
+  for (const char *storage_name : {"MMapFileStorage", "BufferStorage"}) {
+    SCOPED_TRACE(storage_name);
+    auto storage = IndexFactory::CreateStorage(storage_name);
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open(dir_ + storage_name, true));
+
+    IndexStreamer::Stats stats;
+    FlatStreamerEntity entity(stats);
+    *entity.mutable_meta() = *index_meta_ptr_;
+    entity.set_block_vector_count(32);
+    entity.set_linear_list_count(1);
+    // Force repeated cache reallocations with a small dataset.
+    entity.set_segment_size(MemoryHelper::PageSize());
+    ASSERT_EQ(0, entity.open(storage, *index_meta_ptr_));
+    std::vector<float> vec(dim, 0.0f);
+    ASSERT_EQ(0, entity.add(0, vec.data(), vec.size() * sizeof(float)));
+
+    std::atomic<uint32_t> published{0};
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<bool> done{false};
+    std::vector<std::future<bool>> readers;
+    for (unsigned reader = 0; reader < 3; ++reader) {
+      readers.push_back(std::async(std::launch::async, [&]() {
+        ready.fetch_add(1);
+        while (!start.load()) std::this_thread::yield();
+        unsigned rounds = 0;
+        do {
+          const uint32_t newest = published.load();
+          // Read an old segment and a newly published one during growth.
+          for (uint32_t key : {0U, newest}) {
+            IndexStorage::MemoryBlock block;
+            if (entity.get_vector_by_key(key, block) != 0 || !block.data()) {
+              return false;
+            }
+            const auto *data = static_cast<const float *>(block.data());
+            for (size_t d = 0; d < dim; ++d) {
+              if (data[d] != static_cast<float>(key)) return false;
+            }
+          }
+          ++rounds;
+        } while (!done.load() || rounds < 64);
+        return true;
+      }));
+    }
+    while (ready.load() != readers.size()) std::this_thread::yield();
+    start.store(true);
+    constexpr uint32_t count = 4096;
+    for (uint32_t key = 1; key < count; ++key) {
+      std::fill(vec.begin(), vec.end(), static_cast<float>(key));
+      const int ret = entity.add(key, vec.data(), vec.size() * sizeof(float));
+      EXPECT_EQ(0, ret);
+      if (ret != 0) break;
+      published.store(key);
+    }
+    done.store(true);
+    for (auto &reader : readers) EXPECT_TRUE(reader.get());
+    ASSERT_EQ(count - 1, published.load());
+    ASSERT_TRUE(
+        storage->has(StringHelper::Concat(FLAT_SEGMENT_FEATURES_SEG_ID, 8)));
+
+    // Verify that each allocated block kept the correct segment ID.
+    for (uint32_t key = 0; key < count; ++key) {
+      IndexStorage::MemoryBlock block;
+      ASSERT_EQ(0, entity.get_vector_by_key(key, block));
+      ASSERT_NE(nullptr, block.data());
+      const auto *data = static_cast<const float *>(block.data());
+      for (size_t d = 0; d < dim; ++d) {
+        ASSERT_FLOAT_EQ(static_cast<float>(key), data[d]);
+      }
+    }
+    ASSERT_EQ(0, entity.flush(0));
+    ASSERT_EQ(0, entity.close());
+    ASSERT_EQ(0, storage->close());
+  }
 }
 
 TEST_F(FlatStreamerTest, TestFilter) {

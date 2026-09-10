@@ -649,9 +649,12 @@ TEST_F(BufferPoolTest, DirtyFlushFailureKeepsPageResident) {
 }
 
 TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
-  constexpr size_t kCapacityPages = 4;
   constexpr size_t kFilePages = 64;
   constexpr size_t kThreadCount = 8;
+  // Keep enough headroom that all writer threads cannot pin every cache slot
+  // at once. The file is still much larger than the pool, so the test retains
+  // sustained writeback pressure without depending on scheduler fairness.
+  constexpr size_t kCapacityPages = kThreadCount * 2;
   InitVecPool(kCapacityPages, kFilePages, /*writable=*/true);
   // BufferStorage creates a small metadata-only file and grows it as segments
   // are appended. Exercise that path instead of opening a pre-sized file.
@@ -1513,8 +1516,13 @@ TEST_F(BufferPoolTest, ReusedReadOnlyPagePromotesAfterPressure) {
   // promotion counter are the durable policy outcomes under test.
 }
 
+// Keep one resident page below the background-reclaim high watermark so these
+// tests can advance the CLOCK/ghost policy deterministically by hand.
+constexpr size_t kManualEvictionCapacityPages = 2;
+
 TEST_F(BufferPoolTest, ProtectedPageAgesThroughProbationBeforeEviction) {
-  InitTablePool(/*capacity_pages=*/1, /*entry_num=*/1);
+  InitTablePool(/*capacity_pages=*/kManualEvictionCapacityPages,
+                /*entry_num=*/1);
   VectorPageTable table;
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
@@ -1548,7 +1556,8 @@ TEST_F(BufferPoolTest, ProtectedPageAgesThroughProbationBeforeEviction) {
 }
 
 TEST_F(BufferPoolTest, EvictedHotPageGetsProtectedGhostAdmission) {
-  InitTablePool(/*capacity_pages=*/1, /*entry_num=*/1);
+  InitTablePool(/*capacity_pages=*/kManualEvictionCapacityPages,
+                /*entry_num=*/1);
   VectorPageTable table;
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
@@ -1579,7 +1588,8 @@ TEST_F(BufferPoolTest, EvictedHotPageGetsProtectedGhostAdmission) {
 }
 
 TEST_F(BufferPoolTest, UnusedGhostAdmissionDoesNotRenewItself) {
-  InitTablePool(/*capacity_pages=*/1, /*entry_num=*/1);
+  InitTablePool(/*capacity_pages=*/kManualEvictionCapacityPages,
+                /*entry_num=*/1);
   VectorPageTable table;
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
@@ -1620,7 +1630,8 @@ TEST_F(BufferPoolTest, UnusedGhostAdmissionDoesNotRenewItself) {
 }
 
 TEST_F(BufferPoolTest, ReusedGhostAdmissionRenewsHotHistory) {
-  InitTablePool(/*capacity_pages=*/1, /*entry_num=*/1);
+  InitTablePool(/*capacity_pages=*/kManualEvictionCapacityPages,
+                /*entry_num=*/1);
   VectorPageTable table;
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
@@ -1710,6 +1721,29 @@ TEST_F(BufferPoolTest, WritablePoolDoesNotAdaptReadPriority) {
   EXPECT_EQ(VecBufferPool::kLowPriority, pool.page_table_.eviction_priority(0));
   EXPECT_EQ(0u,
             pool.stats().priority_promotions[VecBufferPool::kNormalPriority]);
+}
+
+TEST_F(BufferPoolTest, WritablePrefetchUsesClaimedLoadPath) {
+  constexpr size_t kPageCount = 2;
+  InitVecPool(/*capacity_pages=*/4, /*file_pages=*/kPageCount,
+              /*writable=*/true);
+  std::string file = NewFile(kPageCount);
+
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(pool.init(), 0);
+
+  pool.prefetch_pages(/*first_page=*/0, /*page_count=*/kPageCount,
+                      VecBufferPool::kHighPriority);
+
+  EXPECT_EQ(kPageCount, pool.stats().miss);
+  for (block_id_t page_id = 0; page_id < kPageCount; ++page_id) {
+    char *page = pool.try_acquire_buffer(page_id);
+    ASSERT_NE(nullptr, page);
+    ExpectPageContent(page, page_id);
+    EXPECT_EQ(VecBufferPool::kHighPriority,
+              pool.page_table_.eviction_priority(page_id));
+    pool.page_table_.release_block(page_id);
+  }
 }
 
 TEST_F(BufferPoolTest, BypassReadDoesNotAdmitPage) {

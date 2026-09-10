@@ -37,8 +37,16 @@ TEST(IOBackend, ConcurrentProbeReturnsStableType) {
   for (IOBackendType type : results) {
     EXPECT_EQ(type, results[0]);
   }
+#if defined(_WIN32) || defined(_WIN64)
+  EXPECT_EQ(results[0], IOBackendType::kWindowsOverlapped);
+#elif defined(__ANDROID__)
+  EXPECT_EQ(results[0], IOBackendType::kPread);
+#endif
   std::string description = current_io_backend_description();
   EXPECT_FALSE(description.empty());
+#if defined(__ANDROID__)
+  EXPECT_EQ(description, "Synchronous pread() I/O backend.");
+#endif
   const char *backend_name = "";
   switch (results[0]) {
     case IOBackendType::kIoUring:
@@ -49,6 +57,9 @@ TEST(IOBackend, ConcurrentProbeReturnsStableType) {
       break;
     case IOBackendType::kPread:
       backend_name = "pread";
+      break;
+    case IOBackendType::kWindowsOverlapped:
+      backend_name = "windows_overlapped";
       break;
   }
   EXPECT_NE(description.find(backend_name), std::string::npos);

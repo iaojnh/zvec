@@ -56,6 +56,7 @@ def io_backend_type() -> IOBackendType:
 
     Linux selects IOBackendType.IO_URING, IOBackendType.LIBAIO, or
     IOBackendType.PREAD in that order. macOS ARM64 uses IOBackendType.PREAD.
+    Windows uses IOBackendType.WINDOWS_OVERLAPPED.
     """
 
 def io_backend_description() -> str:
@@ -63,7 +64,7 @@ def io_backend_description() -> str:
 
     The description identifies io_uring, libaio, or pread. On Linux, the
     pread description includes guidance for enabling io_uring or installing
-    libaio.
+    libaio. Windows reports its overlapped-I/O backend.
     """
 
 def set_default_jieba_dict_dir(dir: str) -> None:
@@ -170,7 +171,9 @@ class _Collection:
     def Optimize(self, arg0: param.OptimizeOption) -> None: ...
     def Options(self) -> param.CollectionOption: ...
     def Path(self) -> str: ...
-    def Query(self, arg0: param._SearchQuery) -> list[_Doc]: ...
+    def Query(
+        self, arg0: param._SearchQuery
+    ) -> list[tuple[str, float, dict | None, dict | None] | None]: ...
     def Schema(self) -> schema._CollectionSchema: ...
     def Stats(self) -> schema.CollectionStats: ...
     def Update(self, arg0: collections.abc.Sequence[_Doc]) -> list[typing.Status]: ...

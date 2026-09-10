@@ -28,9 +28,12 @@
 #include "zvec/core/framework/index_provider.h"
 #endif
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_holder.h>
+#include "algorithm/cluster/cluster_params.h"
 #include "algorithm/hnsw/hnsw_params.h"
+#include "algorithm/ivf/ivf_params.h"
 #include "algorithm/vamana/vamana_streamer.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/interface/index.h"
@@ -45,11 +48,69 @@
 
 using namespace zvec::core_interface;
 
+namespace {
+
+class TestableIVFIndex : public IVFIndex {
+ public:
+  int CreateAndInitStreamerForTest(const BaseIndexParam &param) {
+    return CreateAndInitStreamer(param);
+  }
+
+  const zvec::ailego::Params &proxima_index_params() const {
+    return proxima_index_params_;
+  }
+};
+
+}  // namespace
+
+TEST(IndexInterface, IVFPropagatesIterationCountToClusterParams) {
+  TestableIVFIndex index;
+  auto param = IVFIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(8)
+                   .with_n_list(4)
+                   .with_n_iters(37)
+                   .build();
+
+  ASSERT_EQ(0, index.CreateAndInitStreamerForTest(*param));
+
+  zvec::ailego::Params cluster_params;
+  ASSERT_TRUE(index.proxima_index_params().get(
+      zvec::core::PARAM_IVF_BUILDER_CLUSTER_PARAMS_IN_LEVEL_PREFIX + "1",
+      &cluster_params));
+  EXPECT_EQ(37, cluster_params.get_as_int32(
+                    zvec::core::KMEANS_CLUSTER_MAX_ITERATIONS));
+  EXPECT_EQ(37, cluster_params.get_as_int32(
+                    zvec::core::OPTKMEANS_CLUSTER_MAX_ITERATIONS));
+}
+
 TEST(IndexInterface, IndexTypeKeepsExistingValues) {
   EXPECT_EQ(5, static_cast<int>(IndexType::kDiskAnn));
   EXPECT_EQ(6, static_cast<int>(IndexType::kVamana));
   EXPECT_EQ(7, static_cast<int>(IndexType::kIVFRabitq));
 }
+
+#if DISKANN_SUPPORTED
+TEST(IndexInterface, DiskAnnParamJsonRoundTrip) {
+  auto param = DiskAnnIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(768)
+                   .with_max_degree(48)
+                   .with_list_size(80)
+                   .with_pq_chunk_num(16)
+                   .build();
+
+  auto restored =
+      IndexFactory::DeserializeIndexParamFromJson(param->serialize_to_json());
+  auto diskann = std::dynamic_pointer_cast<DiskAnnIndexParam>(restored);
+  ASSERT_NE(nullptr, diskann);
+  EXPECT_EQ(48, diskann->max_degree);
+  EXPECT_EQ(80, diskann->list_size);
+  EXPECT_EQ(16, diskann->pq_chunk_num);
+}
+#endif
 
 #if RABITQ_SUPPORTED
 TEST(IndexInterface, IvfRabitqValidatesBuildParams) {
@@ -320,6 +381,8 @@ TEST(IndexInterface, ReopenRestoresUniformReformer) {
        "test_uniform_uint7_reopen.index"},
       {QuantizerType::kUniformUint8, "UniformUint8Converter",
        "test_uniform_uint8_reopen.index"},
+      {QuantizerType::kUniformUint4, "UniformUint4Converter",
+       "test_uniform_uint4_reopen.index"},
   };
 
   for (const auto &test_case : test_cases) {
@@ -1250,6 +1313,274 @@ TEST(IndexInterface, Merge) {
   }
 }
 
+TEST(IndexInterface, FlatStorageDataTypeConvertsFp32InputAndQuery) {
+  constexpr uint32_t kDimension = 17;
+  constexpr uint32_t kVectorCount = 8;
+  constexpr uint32_t kTopk = 4;
+  const std::string source_name{"native_flat_refine_source.index"};
+  zvec::test_util::RemoveTestFiles(source_name);
+
+  auto source_param = FlatIndexParamBuilder()
+                          .with_metric_type(MetricType::kL2sq)
+                          .with_data_type(DataType::DT_FP32)
+                          .with_dimension(kDimension)
+                          .with_is_sparse(false)
+                          .build();
+  auto source = IndexFactory::CreateAndInitIndex(*source_param);
+  ASSERT_NE(nullptr, source);
+  ASSERT_EQ(
+      0, source->open(source_name, {StorageOptions::StorageType::kMMAP, true}));
+
+  std::vector<std::vector<float>> vectors(kVectorCount,
+                                          std::vector<float>(kDimension));
+  for (uint32_t i = 0; i < kVectorCount; ++i) {
+    for (uint32_t d = 0; d < kDimension; ++d) {
+      vectors[i][d] = static_cast<float>((i * 47 + d * 29) % 311) - 23.25F;
+    }
+    ASSERT_EQ(0, source->add(VectorData{DenseVector{vectors[i].data()}}, i));
+  }
+
+  auto to_native = [](const std::vector<float> &input, DataType target_type) {
+    std::vector<float> output(input.size());
+    if (target_type == DataType::DT_FP16) {
+      std::vector<uint16_t> fp16(input.size());
+      zvec::ailego::FloatHelper::ToFP16(input.data(), input.size(),
+                                        fp16.data());
+      zvec::ailego::FloatHelper::ToFP32(fp16.data(), fp16.size(),
+                                        output.data());
+    } else {
+      for (size_t i = 0; i < input.size(); ++i) {
+        const float value = input[i];
+        output[i] = !(value > 0.0F) ? 0.0F
+                    : value >= 255.0F
+                        ? 255.0F
+                        : static_cast<float>(static_cast<uint8_t>(value));
+      }
+    }
+    return output;
+  };
+
+  for (const auto target_type : {DataType::DT_FP16, DataType::DT_UINT8}) {
+    for (const bool use_contiguous : {false, true}) {
+      const std::string target_name =
+          std::string("native_flat_refine_") +
+          (target_type == DataType::DT_FP16 ? "fp16_" : "uint8_") +
+          (use_contiguous ? "contiguous.index" : "generic.index");
+      zvec::test_util::RemoveTestFiles(target_name);
+
+      auto target_param = FlatIndexParamBuilder()
+                              .with_metric_type(MetricType::kL2sq)
+                              .with_data_type(DataType::DT_FP32)
+                              .with_storage_data_type(target_type)
+                              .with_dimension(kDimension)
+                              .with_is_sparse(false)
+                              .with_use_contiguous_memory(use_contiguous)
+                              .build();
+      auto target = IndexFactory::CreateAndInitIndex(*target_param);
+      ASSERT_NE(nullptr, target);
+      ASSERT_EQ(0, target->open(target_name,
+                                {StorageOptions::StorageType::kMMAP, true}));
+      for (uint32_t i = 0; i < kVectorCount; ++i) {
+        ASSERT_EQ(0,
+                  target->add(VectorData{DenseVector{vectors[i].data()}}, i));
+      }
+
+      auto refiner_param = std::make_shared<RefinerParam>();
+      refiner_param->scale_factor_ = kVectorCount;
+      refiner_param->reference_index = target;
+      auto query_param = FlatQueryParamBuilder()
+                             .with_topk(kTopk)
+                             .with_fetch_vector(true)
+                             .with_refiner_param(refiner_param)
+                             .build();
+
+      constexpr uint32_t kQueryId = 3;
+      SearchResult result;
+      ASSERT_EQ(
+          0, source->search(VectorData{DenseVector{vectors[kQueryId].data()}},
+                            query_param, &result));
+
+      auto direct_query_param = FlatQueryParamBuilder()
+                                    .with_topk(kTopk)
+                                    .with_fetch_vector(true)
+                                    .build();
+      SearchResult direct_result;
+      ASSERT_EQ(
+          0, target->search(VectorData{DenseVector{vectors[kQueryId].data()}},
+                            direct_query_param, &direct_result));
+      ASSERT_EQ(
+          0, source->search(VectorData{DenseVector{vectors[kQueryId].data()}},
+                            query_param, &result));
+
+      const auto native_query = to_native(vectors[kQueryId], target_type);
+      std::vector<std::pair<float, uint64_t>> expected;
+      expected.reserve(kVectorCount);
+      for (uint32_t i = 0; i < kVectorCount; ++i) {
+        const auto native_vector = to_native(vectors[i], target_type);
+        float distance = 0.0F;
+        for (uint32_t d = 0; d < kDimension; ++d) {
+          const float delta = native_vector[d] - native_query[d];
+          distance += delta * delta;
+        }
+        expected.emplace_back(distance, i);
+      }
+      std::sort(expected.begin(), expected.end());
+
+      ASSERT_EQ(kTopk, result.doc_list_.size());
+      ASSERT_EQ(kTopk, result.reverted_vector_list_.size());
+      ASSERT_EQ(kTopk, direct_result.doc_list_.size());
+      ASSERT_EQ(kTopk, direct_result.reverted_vector_list_.size());
+      for (size_t i = 0; i < kTopk; ++i) {
+        EXPECT_EQ(expected[i].second, result.doc_list_[i].key());
+        EXPECT_NEAR(expected[i].first, result.doc_list_[i].score(), 1e-3F);
+        EXPECT_EQ(result.doc_list_[i].key(), direct_result.doc_list_[i].key());
+        EXPECT_FLOAT_EQ(result.doc_list_[i].score(),
+                        direct_result.doc_list_[i].score());
+
+        const auto expected_vector =
+            to_native(vectors[expected[i].second], target_type);
+        const auto *restored = reinterpret_cast<const float *>(
+            result.reverted_vector_list_[i].data());
+        const auto *direct_restored = reinterpret_cast<const float *>(
+            direct_result.reverted_vector_list_[i].data());
+        for (uint32_t d = 0; d < kDimension; ++d) {
+          EXPECT_FLOAT_EQ(expected_vector[d], restored[d]);
+          EXPECT_FLOAT_EQ(restored[d], direct_restored[d]);
+        }
+      }
+
+      ASSERT_EQ(0, target->close());
+      zvec::test_util::RemoveTestFiles(target_name);
+    }
+  }
+
+  ASSERT_EQ(0, source->close());
+  zvec::test_util::RemoveTestFiles(source_name);
+}
+
+TEST(IndexInterface, Fp16CosineRefinementMatchesFp16Storage) {
+  constexpr uint32_t kDimension = 33;
+  constexpr uint32_t kVectorCount = 40;
+  constexpr uint32_t kTopk = 16;
+  const std::string source_name{"fp16_cosine_refine_source.index"};
+  zvec::test_util::RemoveTestFiles(source_name);
+
+  auto source_param = FlatIndexParamBuilder()
+                          .with_metric_type(MetricType::kCosine)
+                          .with_data_type(DataType::DT_FP32)
+                          .with_dimension(kDimension)
+                          .with_is_sparse(false)
+                          .build();
+  auto source = IndexFactory::CreateAndInitIndex(*source_param);
+  ASSERT_NE(nullptr, source);
+  ASSERT_EQ(
+      0, source->open(source_name, {StorageOptions::StorageType::kMMAP, true}));
+
+  // Documents must stay far apart in FP16 space: vectors spaced more finely
+  // than the FP16 resolution quantize to (nearly) the same codes and their
+  // cosine scores tie. Tied scores leave the top-k order up to the
+  // enumeration order of each search path (full scan vs brute force over
+  // refiner candidates), which makes the key/vector comparisons below depend
+  // on the SIMD kernel in use. Integer-valued components are exact in FP16
+  // and keep neighboring scores well separated.
+  std::vector<std::vector<float>> vectors(kVectorCount,
+                                          std::vector<float>(kDimension));
+  for (uint32_t i = 0; i < kVectorCount; ++i) {
+    for (uint32_t d = 0; d < kDimension; ++d) {
+      const int32_t value =
+          static_cast<int32_t>((i * 37U + d * 19U) % 97U) - 48;
+      vectors[i][d] = static_cast<float>(value);
+    }
+    ASSERT_EQ(0, source->add(VectorData{DenseVector{vectors[i].data()}}, i));
+  }
+
+  std::vector<float> query = vectors[7];
+  for (uint32_t d = 0; d < kDimension; ++d) {
+    query[d] += static_cast<float>(static_cast<int32_t>(d % 5) - 2) * 0.01F;
+  }
+
+  for (const bool use_contiguous : {false, true}) {
+    const std::string target_name = use_contiguous
+                                        ? "fp16_cosine_refine_contiguous.index"
+                                        : "fp16_cosine_refine_generic.index";
+    zvec::test_util::RemoveTestFiles(target_name);
+    auto target_param = FlatIndexParamBuilder()
+                            .with_metric_type(MetricType::kCosine)
+                            .with_data_type(DataType::DT_FP32)
+                            .with_storage_data_type(DataType::DT_FP16)
+                            .with_dimension(kDimension)
+                            .with_is_sparse(false)
+                            .with_use_contiguous_memory(use_contiguous)
+                            .build();
+    {
+      auto writer = IndexFactory::CreateAndInitIndex(*target_param);
+      ASSERT_NE(nullptr, writer);
+      ASSERT_EQ(0, writer->open(target_name,
+                                {StorageOptions::StorageType::kMMAP, true}));
+      for (uint32_t i = 0; i < kVectorCount; ++i) {
+        ASSERT_EQ(0,
+                  writer->add(VectorData{DenseVector{vectors[i].data()}}, i));
+      }
+      ASSERT_EQ(0, writer->close());
+    }
+
+    auto target = IndexFactory::CreateAndInitIndex(*target_param);
+    ASSERT_NE(nullptr, target);
+    ASSERT_EQ(0, target->open(target_name,
+                              {StorageOptions::StorageType::kMMAP, false}));
+
+    auto query_param = FlatQueryParamBuilder()
+                           .with_topk(kTopk)
+                           .with_fetch_vector(true)
+                           .build();
+    SearchResult direct_result;
+    ASSERT_EQ(0, target->search(VectorData{DenseVector{query.data()}},
+                                query_param, &direct_result));
+
+    auto refiner_param = std::make_shared<RefinerParam>();
+    refiner_param->scale_factor_ = kVectorCount;
+    refiner_param->reference_index = target;
+    auto refine_param = FlatQueryParamBuilder()
+                            .with_topk(kTopk)
+                            .with_fetch_vector(true)
+                            .with_refiner_param(refiner_param)
+                            .build();
+    SearchResult refined_result;
+    ASSERT_EQ(0, source->search(VectorData{DenseVector{query.data()}},
+                                refine_param, &refined_result));
+
+    ASSERT_EQ(direct_result.doc_list_.size(), refined_result.doc_list_.size());
+    ASSERT_EQ(direct_result.doc_list_.size(),
+              direct_result.reverted_vector_list_.size());
+    ASSERT_EQ(direct_result.reverted_vector_list_.size(),
+              refined_result.reverted_vector_list_.size());
+    for (size_t i = 0; i < direct_result.doc_list_.size(); ++i) {
+      EXPECT_EQ(direct_result.doc_list_[i].key(),
+                refined_result.doc_list_[i].key());
+      EXPECT_NEAR(direct_result.doc_list_[i].score(),
+                  refined_result.doc_list_[i].score(), 1e-6F);
+
+      ASSERT_EQ(kDimension * sizeof(float),
+                refined_result.reverted_vector_list_[i].size());
+      ASSERT_EQ(kDimension * sizeof(float),
+                direct_result.reverted_vector_list_[i].size());
+      const auto *restored = reinterpret_cast<const float *>(
+          refined_result.reverted_vector_list_[i].data());
+      const auto *direct_restored = reinterpret_cast<const float *>(
+          direct_result.reverted_vector_list_[i].data());
+      for (uint32_t d = 0; d < kDimension; ++d) {
+        EXPECT_FLOAT_EQ(direct_restored[d], restored[d]);
+      }
+    }
+
+    ASSERT_EQ(0, target->close());
+    zvec::test_util::RemoveTestFiles(target_name);
+  }
+
+  ASSERT_EQ(0, source->close());
+  zvec::test_util::RemoveTestFiles(source_name);
+}
+
 TEST(IndexInterface, VamanaTwoPassFinalizeOnMerge) {
   constexpr uint32_t kDimension = 16;
   constexpr uint32_t kVectorCount = 64;
@@ -1370,7 +1701,7 @@ TEST(IndexInterface, Serialize) {
                      .with_data_type(DataType::DT_FP32)
                      .with_dimension(64)
                      .with_is_sparse(false)
-                     .with_quantizer_param(QuantizerParam{QuantizerType::kFP16})
+                     .with_storage_data_type(DataType::DT_FP16)
                      .build();
 
     std::cout << "flat index -- omit=true: " << param->serialize_to_json(true)
@@ -1380,7 +1711,10 @@ TEST(IndexInterface, Serialize) {
     auto deserialized_param =
         IndexFactory::DeserializeIndexParamFromJson(param->serialize_to_json());
     ASSERT_NE(nullptr, deserialized_param.get());
-
+    auto flat_param =
+        std::dynamic_pointer_cast<FlatIndexParam>(deserialized_param);
+    ASSERT_NE(nullptr, flat_param);
+    EXPECT_EQ(DataType::DT_FP16, flat_param->storage_data_type);
 
     std::cout << "serialize then de then se:"
               << deserialized_param->serialize_to_json() << std::endl;
@@ -1582,6 +1916,19 @@ TEST(IndexInterface, Serialize) {
     ASSERT_TRUE(IndexFactory::QueryParamSerializeToJson(*deserialized_param) ==
                 IndexFactory::QueryParamSerializeToJson(*param));
   }
+#if DISKANN_SUPPORTED
+  {
+    DiskAnnQueryParam param;
+    param.topk = 12;
+    param.list_size = 80;
+    const auto json = IndexFactory::QueryParamSerializeToJson(param);
+    const auto parsed =
+        IndexFactory::QueryParamDeserializeFromJson<DiskAnnQueryParam>(json);
+    ASSERT_NE(nullptr, parsed);
+    EXPECT_EQ(param.topk, parsed->topk);
+    EXPECT_EQ(param.list_size, parsed->list_size);
+  }
+#endif
 }
 
 TEST(IndexInterface, Failure) {
@@ -2075,7 +2422,7 @@ TEST(IndexInterface, Score) {
       assert(v1.size() == 3);
       assert(v2.size() == 3);
       float ret = 0.0f;
-      for (int i = 0; i < v1.size(); ++i) {
+      for (size_t i = 0; i < v1.size(); ++i) {
         ret += (v1[i] - v2[i]) * (v1[i] - v2[i]);
       }
       return ret;

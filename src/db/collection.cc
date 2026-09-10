@@ -37,6 +37,7 @@
 #include <zvec/db/reranker.h>
 #include <zvec/db/schema.h>
 #include <zvec/db/status.h>
+#include "db/collection_query_internal.h"
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
 #include "db/common/global_resource.h"
@@ -144,7 +145,22 @@ class CollectionImpl : public Collection {
   Result<std::string> debug_get_hnsw_storage_mode(
       const std::string &column_name) const override;
 
+  // Execute a query and capture the docs together with a shared_ptr snapshot of
+  // schema_, all within a single shared lock on schema_handle_mtx_. Used by the
+  // internal query_result_snapshot() free functions below. Public because those
+  // free functions are not members/friends, but CollectionImpl itself is not
+  // exposed in any public header, so this stays internal to this .cc.
+  template <typename Query>
+  Result<internal::QueryResultSnapshot> query_result_snapshot_impl(
+      const Query &query) const;
+
  private:
+  // Query bodies without locking; the caller must hold schema_handle_mtx_
+  // (at least shared) for the whole duration.
+  Result<DocPtrList> query_unsafe(const SearchQuery &query) const;
+
+  Result<DocPtrList> query_unsafe(const MultiQuery &query) const;
+
   void prepare_schema();
 
   Status close_internal();
@@ -286,6 +302,9 @@ class CollectionImpl : public Collection {
   int active_iterators_{0};
   // Signalled when the count reaches zero; close_internal waits on it.
   std::condition_variable_any iterator_cv_;
+  // Guards writes and every read that includes the mutable writing segment.
+  // Readers take this shared for the complete query/fetch operation so the
+  // segment's forward store, indexes and metadata form one visible state.
   mutable std::shared_mutex write_mtx_;
   // Serializes maintenance operations (optimize, schema DDL, close and
   // destroy) without holding schema_handle_mtx_, so a maintenance
@@ -1753,8 +1772,13 @@ Status CollectionImpl::delete_by_filter(const std::string &filter) {
   query.output_fields_ = std::vector<std::string>{};
   query.include_doc_id_ = true;
 
-  auto ret =
-      sql_engine_->execute(schema_, std::move(query), get_all_segments());
+  // A query must see a stable writing segment. Writers publish the forward
+  // store, scalar/vector indexes and segment metadata in several steps while
+  // holding write_mtx_ exclusively.
+  auto ret = [&]() {
+    std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
+    return sql_engine_->execute(schema_, std::move(query), get_all_segments());
+  }();
   if (!ret.has_value()) {
     return ret.error();
   }
@@ -1778,6 +1802,44 @@ Result<DocPtrList> CollectionImpl::query(const SearchQuery &query) const {
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
 
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
+  return query_unsafe(query);
+}
+
+Result<DocPtrList> CollectionImpl::query(const MultiQuery &query) const {
+  std::shared_lock lock(schema_handle_mtx_);
+
+  CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
+  CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
+
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
+  return query_unsafe(query);
+}
+
+template <typename Query>
+Result<internal::QueryResultSnapshot>
+CollectionImpl::query_result_snapshot_impl(const Query &query) const {
+  std::shared_lock lock(schema_handle_mtx_);
+
+  CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
+  CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
+
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
+  auto docs = query_unsafe(query);
+  if (!docs) {
+    return tl::make_unexpected(docs.error());
+  }
+  // Snapshot the schema within the same critical section so it always matches
+  // the one used by query_unsafe, even under concurrent DDL. The shared_ptr
+  // only bumps the refcount; DDL uses clone-and-swap under the exclusive lock,
+  // so this captured schema stays valid after the lock is released.
+  std::shared_ptr<const CollectionSchema> schema_snapshot = schema_;
+  return internal::QueryResultSnapshot{std::move(docs.value()),
+                                       std::move(schema_snapshot)};
+}
+
+Result<DocPtrList> CollectionImpl::query_unsafe(
+    const SearchQuery &query) const {
   // When field_name_ is set, use get_field to retrieve the schema uniformly.
   // validate checks that the field type matches the query type
   // (FTS query requires an FTS field, vector query requires a vector field).
@@ -1804,12 +1866,7 @@ Result<DocPtrList> CollectionImpl::query(const SearchQuery &query) const {
   return sql_engine_->execute(schema_, std::move(sanitized_query), segments);
 }
 
-Result<DocPtrList> CollectionImpl::query(const MultiQuery &query) const {
-  std::shared_lock lock(schema_handle_mtx_);
-
-  CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
-  CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
-
+Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const {
   if (query.queries.size() < 2) {
     return tl::make_unexpected(Status::InvalidArgument(
         "Invalid query: MultiQuery requires at least 2 sub-queries, got ",
@@ -1909,6 +1966,7 @@ Result<GroupResults> CollectionImpl::group_by_query(
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
 
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
   auto segments = get_all_segments();
   if (segments.empty()) {
     return GroupResults();
@@ -1941,6 +1999,7 @@ Result<DocPtrMap> CollectionImpl::fetch(
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
 
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
   auto segments = get_all_segments();
 
   DocPtrMap results;
@@ -1975,6 +2034,7 @@ Result<std::string> CollectionImpl::debug_get_hnsw_storage_mode(
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
 
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
   // Try all segments (including the writing one). The first segment that has
   // a fully-built HNSW index wins; if only a building segment exists we still
   // surface its current storage mode so that tests can observe the entity
@@ -2360,6 +2420,38 @@ std::vector<Segment::Ptr> CollectionImpl::get_all_segments() const {
 std::vector<Segment::Ptr> CollectionImpl::get_all_persist_segments() const {
   return segment_manager_->get_segments();
 }
+
+namespace internal {
+
+namespace {
+// The binding layer only holds a Collection reference and cannot see
+// CollectionImpl, so recover the concrete type here. CollectionImpl is the sole
+// Collection implementation; the dynamic_cast is negligible next to a query and
+// safer than assuming the concrete type. Should a decorator/proxy Collection
+// ever appear, this returns NotSupported at runtime instead of misbehaving.
+template <typename Query>
+Result<QueryResultSnapshot> query_result_snapshot_dispatch(
+    const Collection &collection, const Query &query) {
+  const auto *impl = dynamic_cast<const CollectionImpl *>(&collection);
+  if (impl == nullptr) {
+    return tl::make_unexpected(
+        Status::NotSupported("Unsupported Collection implementation"));
+  }
+  return impl->query_result_snapshot_impl(query);
+}
+}  // namespace
+
+Result<QueryResultSnapshot> query_result_snapshot(const Collection &collection,
+                                                  const SearchQuery &query) {
+  return query_result_snapshot_dispatch(collection, query);
+}
+
+Result<QueryResultSnapshot> query_result_snapshot(const Collection &collection,
+                                                  const MultiQuery &query) {
+  return query_result_snapshot_dispatch(collection, query);
+}
+
+}  // namespace internal
 
 Result<std::vector<std::string>> CollectionImpl::build_iterator_columns(
     const IteratorOptions &options) const {

@@ -103,6 +103,8 @@ enum class QuantizerType {
   kUniformUint7 = 8,
   // Global uniform quantization with the full uint8 code range [0, 255].
   kUniformUint8 = 9,
+  // Global uniform quantization with packed 4-bit codes in [0, 15].
+  kUniformUint4 = 10,
 };
 
 struct ZVEC_CORE_API SerializableBase {
@@ -361,6 +363,9 @@ struct ZVEC_CORE_API FlatIndexParam : public BaseIndexParam {
   FlatIndexParam() : BaseIndexParam(IndexType::kFlat) {}
 
   IndexMeta::MajorOrder major_order = IndexMeta::MajorOrder::MO_ROW;
+  bool use_contiguous_memory = false;
+  // Physical row type used by Flat. DT_UNDEFINED keeps the input data type.
+  DataType storage_data_type = DataType::DT_UNDEFINED;
 
  protected:
   bool DeserializeFromJsonObject(const ailego::JsonObject &json_obj) override;
@@ -462,6 +467,9 @@ struct ZVEC_CORE_API VamanaQueryParam : public BaseIndexQueryParam {
   using Pointer = std::shared_ptr<VamanaQueryParam>;
 
   uint32_t ef_search = kDefaultVamanaEfSearch;
+  // Requested values: Vamana resolves PO=8 / PL=0 against the loaded layout.
+  // Auto PO uses a nominal 6 KiB budget for pool-phase vector prefetch only;
+  // PO=0 disables that prefix, not local-descent, graph-row or kernel prefetch.
   uint32_t prefetch_offset = kDefaultPrefetchOffset;
   uint32_t prefetch_lines = kDefaultPrefetchLines;
 

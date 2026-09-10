@@ -277,7 +277,12 @@ class GroupByInterfaceTest : public ::testing::Test {
     ASSERT_EQ(
         0, index->open(index_name, {StorageOptions::StorageType::kMMAP, true}))
         << test_case.name;
-    ASSERT_EQ(0, index->merge({source}, IndexFilter())) << test_case.name;
+    // Unsupported combinations are rejected by Index::search before training
+    // or backend-specific search setup.  Do not turn this API validation into
+    // an integration build of every rejected backend (notably DiskAnn).
+    if (!expect_error) {
+      ASSERT_EQ(0, index->merge({source}, IndexFilter())) << test_case.name;
+    }
 
     auto query_param = test_case.query_param->clone();
     AttachGroupBy(query_param);
@@ -590,14 +595,22 @@ TEST_F(GroupByInterfaceTest, UnsupportedIndexTypes) {
        /*is_sparse=*/false, /*dimension=*/64},
 #endif
 #if DISKANN_SUPPORTED
-      {"unsupported_diskann_graph", DenseDiskAnnParam(), DiskAnnQuery()},
+      {"unsupported_diskann_graph", DenseDiskAnnParam(), DiskAnnQuery(),
+       /*is_sparse=*/false, /*dimension=*/kDimension,
+       /*with_refiner=*/false},
       {"unsupported_diskann_linear", DenseDiskAnnParam(),
-       DiskAnnQuery(/*fetch_vector=*/false, /*is_linear=*/true)},
+       DiskAnnQuery(/*fetch_vector=*/false, /*is_linear=*/true),
+       /*is_sparse=*/false, /*dimension=*/kDimension,
+       /*with_refiner=*/false},
       {"unsupported_diskann_bf_pks", DenseDiskAnnParam(),
        DiskAnnQuery(/*fetch_vector=*/false, /*is_linear=*/false,
-                    /*with_bf_pks=*/true)},
+                    /*with_bf_pks=*/true),
+       /*is_sparse=*/false, /*dimension=*/kDimension,
+       /*with_refiner=*/false},
       {"unsupported_diskann_fetch_vector", DenseDiskAnnParam(),
-       DiskAnnQuery(/*fetch_vector=*/true)},
+       DiskAnnQuery(/*fetch_vector=*/true),
+       /*is_sparse=*/false, /*dimension=*/kDimension,
+       /*with_refiner=*/false},
 #endif
   };
 
@@ -672,6 +685,9 @@ TEST(DiskAnnInterfaceTest, PropagatesCommonQueryOptions) {
   auto radius_query = std::make_shared<DiskAnnQueryParam>();
   radius_query->topk = kNumDocs;
   radius_query->list_size = kSearchTopk;
+  // Radius propagation is the behavior under test. Use exact search so the
+  // assertion does not also depend on approximate DiskANN recall.
+  radius_query->is_linear = true;
   radius_query->radius = 1.0f;
 
   SearchResult radius_result;

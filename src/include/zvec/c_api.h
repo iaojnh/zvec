@@ -790,17 +790,21 @@ typedef uint32_t zvec_io_backend_type_t;
 #define ZVEC_IO_BACKEND_TYPE_LIBAIO \
   1 /**< libaio loaded at runtime via dlopen() */
 #define ZVEC_IO_BACKEND_TYPE_IO_URING \
-  2 /**< io_uring via raw kernel syscalls (zero dependency) */
+  2 /**< io_uring via raw Linux kernel syscalls (zero dependency) */
+#define ZVEC_IO_BACKEND_TYPE_WINDOWS_OVERLAPPED \
+  3 /**< Windows overlapped I/O using per-context IOCP */
 
 /**
  * @brief Get the current I/O backend type for DiskAnn disk reads.
  *
  * Linux selects the first usable backend in this order: io_uring, libaio,
- * then synchronous pread. macOS ARM64 uses synchronous pread.
+ * then synchronous pread. macOS ARM64 uses synchronous pread. Windows uses
+ * unbuffered overlapped I/O with a per-context completion port.
  *
  * @return zvec_io_backend_type_t The loaded backend type
- *         (ZVEC_IO_BACKEND_TYPE_IO_URING, ZVEC_IO_BACKEND_TYPE_LIBAIO,
- *         or ZVEC_IO_BACKEND_TYPE_PREAD).
+ *         ZVEC_IO_BACKEND_TYPE_IO_URING, ZVEC_IO_BACKEND_TYPE_LIBAIO,
+ *         ZVEC_IO_BACKEND_TYPE_PREAD, or
+ *         ZVEC_IO_BACKEND_TYPE_WINDOWS_OVERLAPPED.
  */
 ZVEC_EXPORT zvec_io_backend_type_t ZVEC_CALL zvec_get_io_backend_type(void);
 
@@ -809,7 +813,8 @@ ZVEC_EXPORT zvec_io_backend_type_t ZVEC_CALL zvec_get_io_backend_type(void);
  *
  * @param type The backend type code.
  * @return Thread-local string valid until the next call on this thread;
- *         "io_uring", "libaio", "pread", or "unknown".
+ *         "io_uring", "libaio", "pread", "windows_overlapped", or
+ *         "unknown".
  */
 ZVEC_EXPORT const char *ZVEC_CALL
 zvec_get_io_backend_type_name(zvec_io_backend_type_t type);
@@ -819,7 +824,8 @@ zvec_get_io_backend_type_name(zvec_io_backend_type_t type);
  *
  * The description identifies io_uring, libaio, or pread. On Linux, the pread
  * description also explains that io_uring and libaio were unavailable and
- * provides guidance for enabling an asynchronous backend.
+ * provides guidance for enabling an asynchronous backend. Windows reports its
+ * overlapped-I/O backend.
  *
  * @return Thread-local string valid until the next call on this thread.
  */
@@ -854,6 +860,7 @@ typedef uint32_t zvec_data_type_t;
 #define ZVEC_DATA_TYPE_VECTOR_INT4 25
 #define ZVEC_DATA_TYPE_VECTOR_INT8 26
 #define ZVEC_DATA_TYPE_VECTOR_INT16 27
+#define ZVEC_DATA_TYPE_VECTOR_UINT8 28
 #define ZVEC_DATA_TYPE_SPARSE_VECTOR_FP16 30
 #define ZVEC_DATA_TYPE_SPARSE_VECTOR_FP32 31
 #define ZVEC_DATA_TYPE_ARRAY_BINARY 40

@@ -218,6 +218,9 @@ int Index::CreateAndInitConverterReformer(const QuantizerParam &param,
         case QuantizerType::kUniformUint8:
           converter_name = "UniformUint8Converter";
           break;
+        case QuantizerType::kUniformUint4:
+          converter_name = "UniformUint4Converter";
+          break;
         default:
           LOG_ERROR("Unsupported quantizer type: ");
           return core::IndexError_Unsupported;
@@ -243,6 +246,11 @@ int Index::CreateAndInitConverterReformer(const QuantizerParam &param,
     }
   }
 
+  return InitConverterReformer(converter_name, converter_params);
+}
+
+int Index::InitConverterReformer(const std::string &converter_name,
+                                 const ailego::Params &converter_params) {
   proxima_index_meta_.set_converter(converter_name, 0, converter_params);
   converter_ = core::IndexFactory::CreateConverter(converter_name);
   if (converter_ == nullptr ||
@@ -618,14 +626,14 @@ int Index::search(const VectorData &vector_data,
       keys[i] = base_result[i].key();
     }
 
-    FlatQueryParam::Pointer flat_search_param =
-        std::make_shared<FlatQueryParam>();
+    auto flat_search_param = std::make_shared<FlatQueryParam>();
     flat_search_param->topk = search_param->topk;
     flat_search_param->fetch_vector = search_param->fetch_vector;
     flat_search_param->filter = search_param->filter;
-    // TODO: should copy other params?
-    flat_search_param->bf_pks = std::make_shared<std::vector<uint64_t>>(keys);
+    flat_search_param->bf_pks =
+        std::make_shared<std::vector<uint64_t>>(std::move(keys));
 
+    result->reverted_vector_list_.clear();
     ret = reference_index->search(vector_data, flat_search_param, result);
     context->reset();
   }
@@ -699,15 +707,15 @@ int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
   const DenseVector &dense_vector = std::get<DenseVector>(vector_data.vector);
   if (reformer_ != nullptr) {
     core::IndexQueryMeta new_meta;
-    std::string new_vector;
+    auto *new_vector = context->mutable_features();
     int ret;
-    ret = reformer_->convert(dense_vector.data, input_vector_meta_, &new_vector,
+    ret = reformer_->convert(dense_vector.data, input_vector_meta_, new_vector,
                              &new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to convert vector");
       return core::IndexError_Runtime;
     }
-    ret = streamer_->add_with_id_impl(doc_id, new_vector.data(), new_meta,
+    ret = streamer_->add_with_id_impl(doc_id, new_vector->data(), new_meta,
                                       context);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
@@ -775,16 +783,19 @@ int Index::_dense_search(const VectorData &vector_data,
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector_data.vector);
   auto vector = dense_vector.data;
+  std::string transformed_vector;
   // Check if need to transform feature
-  std::string new_vector;
   core::IndexQueryMeta new_meta = input_vector_meta_;
   if (reformer_ != nullptr) {
-    if (reformer_->transform(dense_vector.data, input_vector_meta_, &new_vector,
-                             &new_meta) != 0) {
+    if (reformer_->transform(dense_vector.data, input_vector_meta_,
+                             &transformed_vector, &new_meta) != 0) {
       LOG_ERROR("Failed to transform vector");
       return core::IndexError_Runtime;
     }
-    vector = new_vector.data();
+    // A streamer may replace an incompatible pooled context before searching.
+    // Keep the transformed query independent from that context so its data
+    // remains valid for the complete search call.
+    vector = transformed_vector.data();
   }
   if (search_param->bf_pks != nullptr) {
     // should we eliminate the copy of bf_pks?
