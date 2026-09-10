@@ -303,7 +303,7 @@ void fast_search_neighbors(const EntityType &entity, HeapType &pool,
 template <typename EntityType, typename HeapType>
 void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
                                   VisitFilter &visit, HnswDistCalculator &dc,
-                                  uint32_t topk, uint32_t ef,
+                                  HnswContext *ctx, uint32_t topk, uint32_t ef,
                                   node_id_t entry_point, dist_t entry_dist,
                                   uint32_t prefetch_lines,
                                   uint32_t prefetch_offset) {
@@ -323,6 +323,9 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
   std::vector<const void *> neighbor_vecs(buf_capacity);
   std::vector<MemBlockType> neighbor_vec_blocks;
   neighbor_vec_blocks.reserve(buf_capacity);
+  const bool has_extra_values = ctx->has_extra_values();
+  std::vector<const void *> neighbor_extra_values(
+      has_extra_values ? buf_capacity : 0);
 
   while (pool.has_next()) {
     const auto current_node = pool.pop();
@@ -335,6 +338,9 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
       dists.resize(buf_capacity);
       neighbor_vecs.resize(buf_capacity);
       neighbor_vec_blocks.reserve(buf_capacity);
+      if (has_extra_values) {
+        neighbor_extra_values.resize(buf_capacity);
+      }
     }
 
     uint32_t unvisited_count = 0;
@@ -354,6 +360,9 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
     }
     for (uint32_t i = 0; i < unvisited_count; ++i) {
       neighbor_vecs[i] = neighbor_vec_blocks[i].data();
+      if (has_extra_values) {
+        neighbor_extra_values[i] = ctx->get_extra_values(neighbor_vecs[i]);
+      }
     }
     const uint32_t po = std::min(prefetch_offset, unvisited_count);
     for (uint32_t i = 0; i < po; ++i) {
@@ -363,7 +372,8 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
       }
     }
 
-    dc.batch_dist(neighbor_vecs.data(), unvisited_count, dists.data());
+    dc.batch_dist(neighbor_vecs.data(), unvisited_count, dists.data(),
+                  has_extra_values ? neighbor_extra_values.data() : nullptr);
     pool.push_block(dists.data(), neighbor_ids.data(),
                     static_cast<int32_t>(unvisited_count));
   }
@@ -588,14 +598,14 @@ void HnswAlgorithm<EntityType>::search_neighbors(level_t level,
 
       if (avx2_ok) {
         auto &bpool = ctx->block_pool();
-        fast_search_neighbors_buffer(entity, bpool, visit, dc, topk_v, ef_v,
-                                     *entry_point, *dist, prefetch_lines,
+        fast_search_neighbors_buffer(entity, bpool, visit, dc, ctx, topk_v,
+                                     ef_v, *entry_point, *dist, prefetch_lines,
                                      ctx->po());
         copy_pool_to_topk(bpool, topk);
       } else {
         auto &lpool = ctx->pool();
-        fast_search_neighbors_buffer(entity, lpool, visit, dc, topk_v, ef_v,
-                                     *entry_point, *dist, prefetch_lines,
+        fast_search_neighbors_buffer(entity, lpool, visit, dc, ctx, topk_v,
+                                     ef_v, *entry_point, *dist, prefetch_lines,
                                      ctx->po());
         copy_pool_to_topk(lpool, topk);
       }
