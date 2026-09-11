@@ -1114,11 +1114,10 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
         if (current_live_doc_count + seg_live_doc_count >
             max_doc_count_per_segment) {
           // Compaction physically removes deleted rows.
-          task = SegmentTask::CreateCompactTask(
-              CompactTask{path_, schema, current_group,
-                          allocate_segment_id_for_tmp_segment(), filter,
-                          !options_.enable_mmap_, options_.enable_mmap_,
-                          concurrency});
+          task = SegmentTask::CreateCompactTask(CompactTask{
+              path_, schema, current_group,
+              allocate_segment_id_for_tmp_segment(), filter,
+              !options_.enable_mmap_, options_.enable_mmap_, concurrency});
         }
       } else {
         if (current_physical_doc_count + seg_physical_doc_count >
@@ -1130,11 +1129,10 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
             skip_task = current_group[0]->all_vector_index_ready();
           } else {
             // Merge segments while preserving deleted rows.
-            task = SegmentTask::CreateCompactTask(
-                CompactTask{path_, schema, current_group,
-                            allocate_segment_id_for_tmp_segment(), nullptr,
-                            !options_.enable_mmap_, options_.enable_mmap_,
-                            concurrency});
+            task = SegmentTask::CreateCompactTask(CompactTask{
+                path_, schema, current_group,
+                allocate_segment_id_for_tmp_segment(), nullptr,
+                !options_.enable_mmap_, options_.enable_mmap_, concurrency});
           }
         }
       }
