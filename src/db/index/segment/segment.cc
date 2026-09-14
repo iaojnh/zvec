@@ -3911,6 +3911,9 @@ Status SegmentImpl::load_persist_scalar_blocks() {
         continue;
       }
       auto rb_reader = forward_store->scan({GLOBAL_DOC_ID});
+      if (!rb_reader) {
+        return Status::InternalError("Failed to create docid scan reader");
+      }
       while (true) {
         std::shared_ptr<arrow::RecordBatch> batch;
         auto status = rb_reader->ReadNext(&batch);
