@@ -21,6 +21,7 @@
 #include <random>
 #include <thread>
 #include <unordered_map>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "tests/test_util.h"
 #if RABITQ_SUPPORTED
@@ -930,6 +931,88 @@ TEST(IndexInterface, HnswBufferPoolSearchWithEviction) {
   zvec::test_util::RemoveTestFiles(index_name + "*");
   ASSERT_EQ(
       0, zvec::ailego::MemoryLimitPool::get_instance().init(100 * 1024 * 1024));
+}
+
+TEST(IndexInterface, IvfBufferPoolDefersWarmupUntilReads) {
+  constexpr uint32_t kDimension = 256;
+  constexpr uint32_t kDocCount = 1024;
+  constexpr size_t kVectorBytes = kDimension * kDocCount * sizeof(float);
+  constexpr size_t kBufferBudget = 32UL * 1024UL * 1024UL;
+  const std::string index_name{"test_ivf_buffer_lazy_open.index"};
+  auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
+  const size_t previous_capacity = memory_pool.capacity();
+  ASSERT_EQ(0u, memory_pool.used());
+  auto cleanup = zvec::ailego::ScopeGuard::Make([&]() {
+    zvec::test_util::RemoveTestFiles(index_name + "*");
+    EXPECT_EQ(0u, memory_pool.used());
+    EXPECT_EQ(0, memory_pool.init(previous_capacity));
+  });
+  zvec::test_util::RemoveTestFiles(index_name + "*");
+  ASSERT_EQ(0, memory_pool.init(kBufferBudget));
+
+  auto param = IVFIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(kDimension)
+                   .with_n_list(8)
+                   .with_n_iters(4)
+                   .build();
+  auto verify_lazy_reads = [&](const Index::Pointer &index) {
+    const size_t open_page_bytes = memory_pool.stats().page_used;
+    ASSERT_GT(memory_pool.metadata_used(), 0u);
+    // Opening may read headers and centroids, but not all posting-list pages.
+    // The pool fits the entire index, so eviction cannot hide eager warmup.
+    ASSERT_LT(open_page_bytes, kVectorBytes / 2);
+
+    for (uint32_t id : {0U, 127U, 511U, 895U, 1023U}) {
+      VectorDataBuffer fetched;
+      ASSERT_EQ(0, index->fetch(id, &fetched));
+      const auto &buffer = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+      ASSERT_EQ(kDimension * sizeof(float), buffer.data.size());
+      const auto *values = reinterpret_cast<const float *>(buffer.data.data());
+      for (uint32_t dim = 0; dim < kDimension; ++dim) {
+        ASSERT_FLOAT_EQ(static_cast<float>(id), values[dim]);
+      }
+    }
+    EXPECT_GT(memory_pool.stats().page_used, open_page_bytes);
+
+    std::vector<float> vector(kDimension, 511.0f);
+    VectorData query{DenseVector{vector.data()}};
+    auto query_param =
+        IVFQueryParamBuilder().with_topk(1).with_nprobe(8).build();
+    SearchResult result;
+    ASSERT_EQ(0, index->search(query, query_param, &result));
+    ASSERT_EQ(1u, result.doc_list_.size());
+    EXPECT_EQ(511u, result.doc_list_[0].key());
+  };
+
+  {
+    auto index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, index);
+    ASSERT_EQ(0,
+              index->open(index_name, {StorageOptions::StorageType::kBufferPool,
+                                       /*create_new=*/true}));
+    std::vector<float> vector(kDimension);
+    for (uint32_t id = 0; id < kDocCount; ++id) {
+      std::fill(vector.begin(), vector.end(), static_cast<float>(id));
+      ASSERT_EQ(0, index->add(VectorData{DenseVector{vector.data()}}, id));
+    }
+    // train() dumps the file and opens its read storage before returning.
+    ASSERT_EQ(0, index->train());
+    verify_lazy_reads(index);
+    ASSERT_EQ(0, index->close());
+  }
+  ASSERT_EQ(0u, memory_pool.used());
+
+  {
+    auto index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, index);
+    ASSERT_EQ(
+        0, index->open(index_name, {StorageOptions::StorageType::kBufferPool,
+                                    /*create_new=*/false, /*read_only=*/true}));
+    verify_lazy_reads(index);
+    ASSERT_EQ(0, index->close());
+  }
 }
 
 TEST(IndexInterface, IvfBufferPoolSearchAfterOpenThreadExits) {
