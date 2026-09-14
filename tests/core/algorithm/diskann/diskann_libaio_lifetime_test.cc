@@ -22,9 +22,9 @@
 
 namespace {
 
-class ThreadLocalAioContext {
+class WorkerAioContext {
  public:
-  ~ThreadLocalAioContext() {
+  ~WorkerAioContext() {
     if (ctx_ == nullptr || LibAioLoader::Instance().io_destroy(ctx_) != 0) {
       std::_Exit(EXIT_FAILURE);
     }
@@ -35,13 +35,16 @@ class ThreadLocalAioContext {
 };
 
 // Mirror GlobalResource: its thread pool is constructed before libaio is
-// loaded, but its workers retain thread-local query contexts until shutdown.
+// loaded, but its workers retain AIO contexts until shutdown.
 class ShutdownWorker {
  public:
   void start() {
     auto ready = ready_.get_future();
     worker_ = std::thread([this] {
-      thread_local ThreadLocalAioContext context;
+      // Keep cleanup on the worker stack: on musl, libstdc++ can delete its
+      // TLS destructor key before ShutdownWorker joins this thread. A
+      // thread_local destructor would then be skipped by the runtime.
+      WorkerAioContext context;
       ready_.set_value(LibAioLoader::Instance().io_setup(1, &context.ctx_));
       stop_.get_future().wait();
     });
@@ -63,7 +66,7 @@ class ShutdownWorker {
 
 [[noreturn]] void exit_with_worker_context() {
   // Registration order matters: the old loader destructor runs before the
-  // worker destructor and unloads the code needed by its TLS io_destroy().
+  // worker destructor and unloads the code needed by its io_destroy().
   static ShutdownWorker worker;
   if (!LibAioLoader::Instance().load()) {
     std::_Exit(EXIT_FAILURE);
