@@ -407,7 +407,7 @@ class IndexStorage : public IndexModule {
     };
 
     //! Destructor
-    virtual ~Segment(void) {}
+    virtual ~Segment(void) = default;
 
     //! Retrieve size of data
     virtual size_t data_size(void) const = 0;
@@ -600,7 +600,7 @@ class IndexStorage : public IndexModule {
   };
 
   //! Destructor
-  ~IndexStorage(void) override {}
+  ~IndexStorage(void) override = default;
 
   //! Initialize storage
   virtual int init(const ailego::Params &params) = 0;

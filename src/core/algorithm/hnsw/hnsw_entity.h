@@ -250,7 +250,7 @@ struct HnswNeighborMeta {
 class HnswEntity {
  public:
   //! Constructor
-  HnswEntity() {}
+  HnswEntity() = default;
 
   //! Constructor
   HnswEntity(const HNSWHeader &hd) {
@@ -258,7 +258,7 @@ class HnswEntity {
   }
 
   //! Destructor
-  virtual ~HnswEntity() {}
+  virtual ~HnswEntity() = default;
 
   //! HnswEntity Pointerd;
   typedef std::shared_ptr<HnswEntity> Pointer;
