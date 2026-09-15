@@ -185,6 +185,10 @@ Status GlobalConfig::initialize(const ConfigData &config) {
     }
 
     if (result.ok()) {
+      // Construct the logger state before registering its shutdown callback.
+      // Exit callbacks run in reverse order: resources created below must
+      // finish first, then the logger is cleared while its state is alive.
+      ailego::LoggerBroker::EnsureInitialized();
       static const bool exit_handler_registered =
           std::atexit(ExitLogHandler) == 0;
       if (!exit_handler_registered) {

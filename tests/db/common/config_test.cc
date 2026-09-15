@@ -13,11 +13,84 @@
 // limitations under the License.
 
 #include "zvec/db/config.h"
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <gtest/gtest.h>
+#include <zvec/ailego/logger/logger.h>
 #include "db/common/global_resource.h"
 #include "zvec/db/status.h"
 
 using namespace zvec;
+
+namespace {
+
+std::weak_ptr<ailego::Logger> &ShutdownLoggerProbe() {
+  static std::weak_ptr<ailego::Logger> logger;
+  return logger;
+}
+
+int shutdown_logger_destructions = 0;
+
+class ShutdownProbeLogger : public ailego::Logger {
+ public:
+  ~ShutdownProbeLogger() override {
+    ++shutdown_logger_destructions;
+  }
+  int init(const ailego::Params &) override {
+    return 0;
+  }
+  int cleanup() override {
+    return 0;
+  }
+  void log(int, const char *, int, const char *, va_list) override {}
+};
+
+void CheckLoggerShutdown() {
+  // Keeping a weak reference alive prevents the control block from being
+  // freed. A shutdown hook accessing an already-destroyed broker shared_ptr
+  // then exposes its second release instead of relying on allocator reuse.
+  const auto use_count = ShutdownLoggerProbe().use_count();
+  if (shutdown_logger_destructions != 1 || use_count != 0) {
+    std::fprintf(stderr, "logger destructions=%d, remaining owners=%ld\n",
+                 shutdown_logger_destructions, use_count);
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  std::fputs("logger shutdown released exactly once\n", stderr);
+  std::fflush(stderr);
+  std::_Exit(0);
+}
+
+void ExitAfterConfigInitialization() {
+  auto &probe = ShutdownLoggerProbe();
+  if (std::atexit(CheckLoggerShutdown) != 0) {
+    std::_Exit(2);
+  }
+  GlobalConfig::ConfigData config;
+  config.memory_limit_bytes = 128ULL * 1024 * 1024;
+  config.query_thread_count = 1;
+  config.optimize_thread_count = 1;
+  if (!GlobalConfig::Instance().initialize(config).ok()) {
+    std::_Exit(3);
+  }
+  auto logger = std::make_shared<ShutdownProbeLogger>();
+  probe = logger;
+  ailego::LoggerBroker::Register(std::move(logger));
+  std::exit(0);
+}
+
+}  // namespace
+
+TEST(ConfigDeathTest, LoggingShutdownPrecedesBrokerStaticDestruction) {
+  // Re-exec so no earlier test can initialize the broker and mask the
+  // first-initialization ordering of its destructor and the exit hook.
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(ExitAfterConfigInitialization(), ::testing::ExitedWithCode(0),
+              "logger shutdown released exactly once");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
 
 class ConfigTest : public ::testing::Test {
  protected:
