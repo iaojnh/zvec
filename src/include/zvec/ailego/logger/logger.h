@@ -126,11 +126,6 @@ struct ZVEC_AILEGO_API Logger {
  */
 class ZVEC_AILEGO_API LoggerBroker {
  public:
-  //! Establish logger state lifetime before registering shutdown callbacks.
-  static void EnsureInitialized() {
-    (void)LoggerInstance();
-  }
-
   //! Register Logger
   static Logger::Pointer Register(Logger::Pointer logger) {
     Logger::Pointer ret = std::move(LoggerInstance());

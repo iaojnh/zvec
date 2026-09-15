@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <memory>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/common/global_resource.h"
 #include "zvec/db/status.h"
@@ -80,7 +81,73 @@ void ExitAfterConfigInitialization() {
   std::exit(0);
 }
 
+void CheckFailedConfigInitializationKeepsLoggingAvailable() {
+  constexpr uint64_t kExistingPoolBytes = 85ULL * 1024 * 1024;
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(kExistingPoolBytes));
+
+  auto original_logger = std::make_shared<ShutdownProbeLogger>();
+  ailego::LoggerBroker::Register(original_logger);
+  ailego::LoggerBroker::SetLevel(ailego::Logger::LEVEL_ERROR);
+
+  auto &config = GlobalConfig::Instance();
+  const auto original_memory_limit = config.memory_limit_bytes();
+  const auto original_query_threads = config.query_thread_count();
+  const auto original_log_level = config.log_level();
+  GlobalConfig::ConfigData requested;
+  requested.memory_limit_bytes = 128ULL * 1024 * 1024;
+  requested.query_thread_count = original_query_threads == 1 ? 2 : 1;
+  requested.optimize_thread_count = 1;
+  requested.log_config = std::make_shared<GlobalConfig::ConsoleLogConfig>(
+      GlobalConfig::LogLevel::kDebug);
+
+  const auto status = config.initialize(requested);
+  ASSERT_FALSE(status.ok());
+  EXPECT_EQ(original_memory_limit, config.memory_limit_bytes());
+  EXPECT_EQ(original_query_threads, config.query_thread_count());
+  EXPECT_EQ(original_log_level, config.log_level());
+  EXPECT_EQ(kExistingPoolBytes, pool.capacity());
+  // Logging is initialized before resources and remains available for
+  // diagnosing a later failure. Configuration is not published.
+  EXPECT_TRUE(
+      ailego::LoggerBroker::IsLevelEnabled(ailego::Logger::LEVEL_DEBUG));
+  auto initialized_logger = ailego::LoggerBroker::Register(original_logger);
+  ASSERT_NE(nullptr, initialized_logger);
+  EXPECT_NE(original_logger, initialized_logger);
+  ailego::LoggerBroker::Register(initialized_logger);
+
+  // A compatible retry must still return the terminal initialization error,
+  // not reconfigure logging or publish a new configuration.
+  requested.memory_limit_bytes = 100ULL * 1024 * 1024;
+  requested.log_config = std::make_shared<GlobalConfig::ConsoleLogConfig>(
+      GlobalConfig::LogLevel::kFatal);
+  const auto repeated_status = config.initialize(requested);
+  EXPECT_EQ(status.code(), repeated_status.code());
+  EXPECT_EQ(status.message(), repeated_status.message());
+  EXPECT_EQ(original_memory_limit, config.memory_limit_bytes());
+  EXPECT_EQ(original_query_threads, config.query_thread_count());
+  EXPECT_EQ(original_log_level, config.log_level());
+  EXPECT_EQ(kExistingPoolBytes, pool.capacity());
+  EXPECT_TRUE(
+      ailego::LoggerBroker::IsLevelEnabled(ailego::Logger::LEVEL_DEBUG));
+  EXPECT_EQ(initialized_logger,
+            ailego::LoggerBroker::Register(initialized_logger));
+}
+
 }  // namespace
+
+TEST(ConfigDeathTest,
+     FailedResourceInitializationKeepsLoggingWithoutPublishing) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        CheckFailedConfigInitializationKeepsLoggingAvailable();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
 
 TEST(ConfigDeathTest, LoggingShutdownPrecedesBrokerStaticDestruction) {
   // Re-exec so no earlier test can initialize the broker and mask the
