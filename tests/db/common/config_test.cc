@@ -24,6 +24,7 @@
 
 using namespace zvec;
 
+#if GTEST_HAS_DEATH_TEST
 namespace {
 
 std::weak_ptr<ailego::Logger> &ShutdownLoggerProbe() {
@@ -135,9 +136,11 @@ void CheckFailedConfigInitializationKeepsLoggingAvailable() {
 }
 
 }  // namespace
+#endif  // GTEST_HAS_DEATH_TEST
 
 TEST(ConfigDeathTest,
      FailedResourceInitializationKeepsLoggingWithoutPublishing) {
+#if GTEST_HAS_DEATH_TEST
   const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
   ::testing::FLAGS_gtest_death_test_style = "threadsafe";
   EXPECT_EXIT(
@@ -147,9 +150,14 @@ TEST(ConfigDeathTest,
       },
       ::testing::ExitedWithCode(0), "");
   ::testing::FLAGS_gtest_death_test_style = previous_style;
+#else
+  GTEST_SKIP()
+      << "Process-isolated exit tests are not supported on this platform";
+#endif
 }
 
 TEST(ConfigDeathTest, LoggingShutdownPrecedesBrokerStaticDestruction) {
+#if GTEST_HAS_DEATH_TEST
   // Re-exec so no earlier test can initialize the broker and mask the
   // first-initialization ordering of its destructor and the exit hook.
   const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
@@ -157,6 +165,10 @@ TEST(ConfigDeathTest, LoggingShutdownPrecedesBrokerStaticDestruction) {
   EXPECT_EXIT(ExitAfterConfigInitialization(), ::testing::ExitedWithCode(0),
               "logger shutdown released exactly once");
   ::testing::FLAGS_gtest_death_test_style = previous_style;
+#else
+  GTEST_SKIP()
+      << "Process-isolated exit tests are not supported on this platform";
+#endif
 }
 
 class ConfigTest : public ::testing::Test {
