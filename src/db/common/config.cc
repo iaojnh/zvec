@@ -185,10 +185,21 @@ Status GlobalConfig::initialize(const ConfigData &config) {
     }
 
     if (result.ok()) {
-      // Construct the logger state before registering its shutdown callback.
-      // Exit callbacks run in reverse order: resources created below must
-      // finish first, then the logger is cleared while its state is alive.
-      ailego::LoggerBroker::EnsureInitialized();
+      const auto *file_config = dynamic_cast<const FileLogConfig *>(
+          effective_config.log_config.get());
+      static const std::string empty;
+      result = LogUtil::Init(file_config ? file_config->dir : empty,
+                             file_config ? file_config->basename : empty,
+                             int(effective_config.log_config->level),
+                             effective_config.log_config->get_logger_type(),
+                             file_config ? file_config->file_size : 0,
+                             file_config ? file_config->overdue_days : 0);
+    }
+
+    if (result.ok()) {
+      // Initialize the logger before its exit callback and create global
+      // resources afterwards, so normal shutdown releases resources before
+      // clearing the still-live logger state.
       static const bool exit_handler_registered =
           std::atexit(ExitLogHandler) == 0;
       if (!exit_handler_registered) {
@@ -197,43 +208,16 @@ Status GlobalConfig::initialize(const ConfigData &config) {
       }
     }
 
-    bool log_setup_attempted = false;
-    bool log_initialized = false;
     if (result.ok()) {
-      Status log_status;
-      const int resource_result =
-          GlobalResource::Instance().initialize_with_setup(
-              effective_config.memory_limit_bytes,
-              effective_config.query_thread_count,
-              effective_config.query_thread_binding,
-              effective_config.optimize_thread_count,
-              effective_config.optimize_thread_binding, [&] {
-                log_setup_attempted = true;
-                const auto *file_config = dynamic_cast<const FileLogConfig *>(
-                    effective_config.log_config.get());
-                static const std::string empty;
-                log_status = LogUtil::Init(
-                    file_config ? file_config->dir : empty,
-                    file_config ? file_config->basename : empty,
-                    int(effective_config.log_config->level),
-                    effective_config.log_config->get_logger_type(),
-                    file_config ? file_config->file_size : 0,
-                    file_config ? file_config->overdue_days : 0);
-                log_initialized = log_status.ok();
-                return log_initialized ? 0 : -1;
-              });
-      if (resource_result != 0 && log_setup_attempted) {
-        // LogUtil::Init may have made partial progress even when it returns an
-        // error, so normalize every failed setup/resource transaction back to
-        // an uninitialized logger.
-        LogUtil::Shutdown();
-      }
-      if (!log_status.ok()) {
-        result = log_status;
-      } else if (resource_result != 0) {
-        // A predictable configuration mismatch is rejected before the setup
-        // callback. If a later memory-pool stage fails, undo the newly-created
-        // logger so Initialize() does not leave a half-published subsystem.
+      const int resource_result = GlobalResource::Instance().initialize(
+          effective_config.memory_limit_bytes,
+          effective_config.query_thread_count,
+          effective_config.query_thread_binding,
+          effective_config.optimize_thread_count,
+          effective_config.optimize_thread_binding);
+      if (resource_result != 0) {
+        // Keep the initialized logger available for diagnostics, but do not
+        // publish configuration when resource initialization fails.
         result = Status::InternalError(
             "Failed to initialize the process-wide global resources");
       }

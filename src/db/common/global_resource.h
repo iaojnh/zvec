@@ -14,7 +14,6 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <zvec/ailego/parallel/thread_pool.h>
@@ -86,14 +85,8 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
 
   int initialize(uint64_t memory_limit_bytes, uint32_t query_thread_count,
                  bool query_thread_binding, uint32_t optimize_thread_count,
-                 bool optimize_thread_binding);
-  int initialize_with_setup(uint64_t memory_limit_bytes,
-                            uint32_t query_thread_count,
-                            bool query_thread_binding,
-                            uint32_t optimize_thread_count,
-                            bool optimize_thread_binding,
-                            const std::function<int()> &setup,
-                            bool preserve_existing_pool = false);
+                 bool optimize_thread_binding,
+                 bool preserve_existing_pool = false);
 
   std::mutex initialization_mutex_;
   uint64_t memory_limit_bytes_{0};

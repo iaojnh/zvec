@@ -51,29 +51,18 @@ int GlobalResource::initialize() {
   const uint64_t effective_memory_limit = preserve_existing_pool
                                               ? memory_pool.capacity()
                                               : config.memory_limit_bytes();
-  return initialize_with_setup(
-      effective_memory_limit, config.query_thread_count(),
-      config.query_thread_binding(), config.optimize_thread_count(),
-      config.optimize_thread_binding(), {}, preserve_existing_pool);
+  return initialize(effective_memory_limit, config.query_thread_count(),
+                    config.query_thread_binding(),
+                    config.optimize_thread_count(),
+                    config.optimize_thread_binding(), preserve_existing_pool);
 }
 
 int GlobalResource::initialize(uint64_t memory_limit_bytes,
                                uint32_t query_thread_count,
                                bool query_thread_binding,
                                uint32_t optimize_thread_count,
-                               bool optimize_thread_binding) {
-  return initialize_with_setup(memory_limit_bytes, query_thread_count,
-                               query_thread_binding, optimize_thread_count,
-                               optimize_thread_binding, {});
-}
-
-int GlobalResource::initialize_with_setup(uint64_t memory_limit_bytes,
-                                          uint32_t query_thread_count,
-                                          bool query_thread_binding,
-                                          uint32_t optimize_thread_count,
-                                          bool optimize_thread_binding,
-                                          const std::function<int()> &setup,
-                                          bool preserve_existing_pool) {
+                               bool optimize_thread_binding,
+                               bool preserve_existing_pool) {
   std::lock_guard<std::mutex> lock(initialization_mutex_);
   try {
     auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
@@ -89,7 +78,7 @@ int GlobalResource::initialize_with_setup(uint64_t memory_limit_bytes,
           optimize_thread_count_ == optimize_thread_count &&
           query_thread_binding_ == query_thread_binding &&
           optimize_thread_binding_ == optimize_thread_binding) {
-        return setup ? setup() : 0;
+        return 0;
       }
       LOG_ERROR(
           "GlobalResource::initialize rejected configuration change after "
@@ -99,10 +88,10 @@ int GlobalResource::initialize_with_setup(uint64_t memory_limit_bytes,
 
     // An explicit GlobalConfig initialization must never publish a memory
     // limit different from an already configured lower-level pool. Reject it
-    // before logger setup or thread-pool publication; lazy initialize() above
-    // deliberately passes the existing capacity and therefore remains
+    // before thread-pool publication; lazy initialize() above deliberately
+    // passes the existing capacity and therefore remains
     // compatible with standalone/core callers.
-    if (setup && memory_pool.initialized() &&
+    if (!preserve_existing_pool && memory_pool.initialized() &&
         memory_pool.capacity() != buffer_pool_capacity) {
       LOG_ERROR(
           "GlobalResource::initialize rejected memory limit change after "
@@ -128,13 +117,6 @@ int GlobalResource::initialize_with_setup(uint64_t memory_limit_bytes,
         std::make_shared<rocksdb::WriteBufferManager>(
             static_cast<size_t>(rocksdb_memory_capacity), rocksdb_block_cache,
             /*allow_stall=*/true);
-    // Run side-effecting setup only after every fallible resource allocation
-    // and compatibility check that can be performed without mutating global
-    // state. Holding initialization_mutex_ closes the race with lazy callers
-    // attempting to initialize a different resource configuration.
-    if (setup && setup() != 0) {
-      return -1;
-    }
     if (memory_pool.init(static_cast<size_t>(buffer_pool_capacity)) != 0) {
       return -1;
     }
