@@ -67,6 +67,14 @@ void ExpectPageContent(const char *buf, size_t page_id) {
 
 class BufferPoolTest : public ::testing::Test {
  protected:
+  void SetUp() override {
+    // Join any prior reclaim batch before removing stale global queue entries.
+    ASSERT_EQ(0, MemoryLimitPool::get_instance().init(0));
+    auto &queue = BlockEvictionQueue::get_instance();
+    BlockEvictionQueue::BlockType discarded;
+    while (queue.evict_single_block(discarded)) {
+    }
+  }
   void InitPool(size_t capacity_pages) {
     ASSERT_EQ(0, MemoryLimitPool::get_instance().init(capacity_pages *
                                                       kVectorPageSize));
@@ -727,7 +735,9 @@ TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
 }
 
 TEST_F(BufferPoolTest, RecoversDirtyPageAfterQueueRegistrationFailure) {
-  InitTablePool(/*capacity_pages=*/1, /*entry_num=*/1);
+  // Keep the page below the background-reclaim watermark so only this test
+  // advances eviction and invokes the flush callback.
+  InitTablePool(/*capacity_pages=*/2, /*entry_num=*/1);
   VectorPageTable table;
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
