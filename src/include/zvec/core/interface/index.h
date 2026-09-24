@@ -229,6 +229,11 @@ class ZVEC_CORE_API Index {
                               const ailego::Params &converter_params = {});
   virtual int create_and_init_streamer(const BaseIndexParam &param) = 0;
 
+  //! Adjust the pipeline after storage opens, before the streamer reads it.
+  virtual int prepare_streamer_open(const StorageOptions & /*options*/) {
+    return 0;
+  }
+
  protected:
   bool init_context();
   core::IndexContext::Pointer &acquire_context();
@@ -246,10 +251,9 @@ class ZVEC_CORE_API Index {
   core::IndexStreamer::Pointer streamer_{};
   core::IndexReformer::Pointer reformer_{};
   core::IndexConverter::Pointer converter_{};  // for build()
-  core::IndexMetric::Pointer metric_{};        // to do normalization
-  // Turbo quantizer for the FLAT-on-turbo path: quantizes records and
-  // queries and computes distances via turbo SIMD batch kernels. When set,
-  // converter_/reformer_/metric_ stay null.
+  core::IndexMetric::Pointer metric_{};        // legacy distance/score path
+  // Quantizes records and queries and computes distances through turbo SIMD
+  // kernels. When set, converter_/reformer_/metric_ stay null.
   std::shared_ptr<turbo::Quantizer> turbo_quantizer_{};
 
   size_t context_index_{std::numeric_limits<size_t>::max()};
@@ -336,7 +340,8 @@ class ZVEC_CORE_API IVFIndex : public Index {
   BuildStage build_stage_{BuildStage::kCollecting};
   IVFIndexParam param_{};
   std::mutex mutex_{};
-  std::vector<std::pair<uint64_t, std::string>> doc_cache_;
+  using DocCache = std::vector<std::pair<uint64_t, std::string>>;
+  std::shared_ptr<DocCache> doc_cache_{std::make_shared<DocCache>()};
   core::IndexHolder::Pointer holder_{};
   std::string file_path_;
 };
@@ -363,6 +368,9 @@ class ZVEC_CORE_API HNSWIndex : public Index {
  protected:
   int create_and_init_streamer(const BaseIndexParam &param) override;
 
+  int create_and_init_converter_reformer(
+      const QuantizerParam &param, const BaseIndexParam &index_param) override;
+
   int _prepare_for_search(const VectorData &query,
                           const BaseIndexQueryParam::Pointer &search_param,
                           core::IndexContext::Pointer &context) override;
@@ -370,7 +378,10 @@ class ZVEC_CORE_API HNSWIndex : public Index {
       const BaseIndexQueryParam::Pointer &search_param) override;
 
  private:
+  int prepare_streamer_open(const StorageOptions &options) override;
+
   HNSWIndexParam param_{};
+  bool use_legacy_pipeline_{false};
 };
 
 class ZVEC_CORE_API VamanaIndex : public Index {
