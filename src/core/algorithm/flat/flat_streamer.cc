@@ -359,13 +359,7 @@ int FlatStreamer<BATCH_SIZE>::add_with_id_impl(uint32_t id, const void *query,
     if (state_ != STATE_OPENED || !ctx->vector_source())
       return IndexError_NoReady;
     if (id == kInvalidNodeId) return IndexError_InvalidArgument;
-    VectorSource::Batch batch;
-    int ret = ctx->vector_source()->get_vector_batch(&id, 1, &batch);
-    if (ret != 0) return ret;
-    if (batch.ids.size() != 1 || batch.ids[0] != id ||
-        batch.vectors.size() != 1 || !batch.vectors[0]) {
-      return IndexError_ReadData;
-    }
+    if (!ctx->vector_source()->get_vector(id)) return IndexError_NoExist;
   }
   READ_LOCK_GUARD_DEFER(dump_mutex_, dump_lock);
 
@@ -506,10 +500,8 @@ int FlatStreamer<BATCH_SIZE>::search_external(
   if (ctx->magic() != magic_) ctx->reset(this);
   const auto *source = ctx->vector_source();
   if (!source || !ctx->threshold_is_valid()) return IndexError_NoReady;
-  const bool grouped = ctx->group_by_search();
-  if (grouped && !ctx->group_by().is_valid()) return IndexError_InvalidArgument;
+  if (ctx->group_by_search()) return IndexError_Unsupported;
   ctx->reset_results(count);
-  ctx->resize_group_results(count);
   // Bound both pointer scratch space and per-request pinned vector bytes.
   const uint32_t batch_limit = static_cast<uint32_t>(std::min<size_t>(
       1024,
@@ -521,7 +513,6 @@ int FlatStreamer<BATCH_SIZE>::search_external(
         static_cast<const char *>(query) + q * qmeta.element_size();
     auto *heap = ctx->result_heap();
     heap->clear();
-    ctx->group_topk_heaps().clear();
     // Destroy the outstanding lease before its cursor, including on errors.
     VectorSource::Iterator::Pointer cursor;
     VectorSource::Batch batch;
@@ -565,13 +556,7 @@ int FlatStreamer<BATCH_SIZE>::search_external(
       for (size_t i = 0; i < size; ++i) {
         const auto id = scratch->vector_keys[i];
         const auto distance = scratch->distances[i];
-        if (grouped) {
-          auto &group_heap = ctx->group_topk_heaps()[ctx->group_by()(id)];
-          if (group_heap.empty()) group_heap.limit(ctx->group_topk());
-          group_heap.emplace(id, distance);
-        } else {
-          heap->emplace(id, distance);
-        }
+        heap->emplace(id, distance);
       }
       return 0;
     };
@@ -582,10 +567,10 @@ int FlatStreamer<BATCH_SIZE>::search_external(
       auto read_candidates = [&]() -> int {
         if (ids.empty()) return 0;
         batch.clear();
-        int ret = source->get_vector_batch(ids.data(), ids.size(), &batch);
-        if (ret != 0) return ret;
-        if (batch.ids != ids) return IndexError_ReadData;
-        ret = consume();
+        batch.ids = ids;
+        batch.vectors.resize(ids.size());
+        source->get_vectors(ids.data(), ids.size(), batch.vectors.data());
+        int ret = consume();
         ids.clear();
         return ret;
       };
@@ -614,47 +599,16 @@ int FlatStreamer<BATCH_SIZE>::search_external(
       }
     }
     batch.clear();
-    if (grouped)
-      ctx->topk_to_group_result(q);
-    else
-      ctx->take_topk_result(q);
-
-    // Results outlive the source snapshot, cursor and index. Own the selected
-    // raw vectors instead of retaining borrowed pointers or disk page pins.
-    auto fetch_results = [&](IndexDocumentList *docs) -> int {
-      for (size_t begin = 0; begin < docs->size(); begin += batch_limit) {
-        const size_t end = std::min(docs->size(), begin + batch_limit);
-        std::vector<uint32_t> ids;
-        ids.reserve(end - begin);
-        for (size_t i = begin; i < end; ++i) ids.push_back((*docs)[i].key());
-        batch.clear();
-        int ret = source->get_vector_batch(ids.data(), ids.size(), &batch);
-        if (ret != 0) return ret;
-        if (batch.ids != ids || batch.vectors.size() != ids.size()) {
-          return IndexError_ReadData;
-        }
-        for (size_t i = 0; i < ids.size(); ++i) {
-          if (!batch.vectors[i]) return IndexError_ReadData;
-          auto owned = std::make_shared<std::string>(
-              static_cast<const char *>(batch.vectors[i]),
-              meta_.element_size());
-          auto block =
-              IndexStorage::MemoryBlock::MakeSharedView(owned->data(), owned);
-          auto &doc = (*docs)[begin + i];
-          doc = IndexDocument(doc.key(), doc.score(), doc.index(), block);
-        }
-      }
-      return 0;
-    };
+    ctx->take_topk_result(q);
     if (ctx->fetch_vector()) {
-      if (grouped) {
-        for (auto &group : *ctx->mutable_group_result(q)) {
-          int ret = fetch_results(group.mutable_docs());
-          if (ret != 0) return ret;
-        }
-      } else {
-        int ret = fetch_results(ctx->mutable_result(q));
-        if (ret != 0) return ret;
+      // Match HNSW's borrowed random-access result contract. Scan pages have
+      // already been released, so result pointers must come from the source.
+      for (auto &doc : *ctx->mutable_result(q)) {
+        const void *vector = source->get_vector(doc.key());
+        if (!vector) return IndexError_NoExist;
+        IndexStorage::MemoryBlock block;
+        block.reset(const_cast<void *>(vector));
+        doc = IndexDocument(doc.key(), doc.score(), doc.index(), block);
       }
     }
   }
@@ -665,10 +619,7 @@ template <size_t BATCH_SIZE>
 int FlatStreamer<BATCH_SIZE>::group_by_search_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
-  if (use_external_vector_) {
-    if (state_ != STATE_OPENED) return IndexError_NoReady;
-    return search_external(query, qmeta, count, nullptr, context);
-  }
+  if (use_external_vector_) return IndexError_Unsupported;
   FlatStreamerContext<BATCH_SIZE> *bf_context =
       dynamic_cast<FlatStreamerContext<BATCH_SIZE> *>(context.get());
   if (!bf_context) {
@@ -717,10 +668,7 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
-  if (use_external_vector_) {
-    if (state_ != STATE_OPENED) return IndexError_NoReady;
-    return search_external(query, qmeta, count, &p_keys, context);
-  }
+  if (use_external_vector_) return IndexError_Unsupported;
   if (count == 0 || count > p_keys.size()) return IndexError_InvalidArgument;
   FlatStreamerContext<BATCH_SIZE> *bf_context =
       dynamic_cast<FlatStreamerContext<BATCH_SIZE> *>(context.get());

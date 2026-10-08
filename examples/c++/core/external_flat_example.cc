@@ -94,6 +94,7 @@ int main() {
   VectorData query{DenseVector{source.rows[0].vector.data()}};
   auto qp =
       FlatQueryParamBuilder().with_topk(1).with_fetch_vector(true).build();
+  // fetch_vector returns borrowed pointers; source outlives result.
   SearchResult result;
   if (index->search_with_source(query, qp, source, &result) ||
       result.doc_list_.size() != 1 || result.doc_list_[0].key() != 42 ||
@@ -112,9 +113,7 @@ int main() {
       result.doc_list_.size() != 1 || result.doc_list_[0].key() != 42)
     return 1;
   std::cout << "Candidate search after reopen: id=42\n";
-  VectorDataBuffer fetched;
-  if (index->fetch_with_source(42, source, &fetched) || index->close())
-    return 1;
+  if (index->close()) return 1;
   std::filesystem::remove(path);
   return 0;
 }

@@ -200,8 +200,8 @@ class FlatStreamerContext : public IndexStreamer::Context {
           break;
         }
         node_id_t id = group_topk_list[i].second[j].first;
-        if (fetch_vector_ && !owner_->use_external_vector()) {
-          auto provider = owner_->create_provider();
+        auto provider = owner_->create_provider();
+        if (fetch_vector_) {
           IndexStorage::MemoryBlock block;
           provider->get_vector(id, block);
           group_results_[idx][i].mutable_docs()->emplace_back(id, score, id,

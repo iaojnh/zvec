@@ -148,9 +148,6 @@ class ZVEC_CORE_API Index {
       const VectorData &query, const BaseIndexQueryParam::Pointer &search_param,
       const core::VectorSource &src, SearchResult *result);
 
-  virtual int fetch_with_source(uint32_t doc_id, const core::VectorSource &src,
-                                VectorDataBuffer *result);
-
   virtual BaseIndexParam::Pointer get_param() const;
 
   virtual bool is_trained() const;
@@ -171,11 +168,6 @@ class ZVEC_CORE_API Index {
   }
 
  protected:
-  virtual int bind_vector_source(const core::VectorSource *,
-                                 core::IndexContext::Pointer &) {
-    return core::IndexError_Unsupported;
-  }
-
   int _sparse_fetch(const uint32_t doc_id,
                     VectorDataBuffer *vector_data_buffer);
   virtual int _dense_fetch(const uint32_t doc_id,
@@ -284,14 +276,14 @@ class ZVEC_CORE_API FlatIndex : public Index {
   int add_with_source(const VectorData &vector, uint32_t doc_id,
                       const core::VectorSource &src) override;
   // Full scans enumerate every registered ID once (extra IDs are ignored).
-  // Candidate searches/refinement use random batches. Hold one stable source
-  // snapshot across enumeration and random reads for the entire request.
+  // Candidate searches use get_vectors(). Hold a stable source snapshot for
+  // the request. With fetch_vector, returned pointers borrow source memory;
+  // keep that memory valid while using the results, as with external HNSW.
+  // External Flat does not support group-by or binding a source for refinement.
   int search_with_source(const VectorData &query,
                          const BaseIndexQueryParam::Pointer &search_param,
                          const core::VectorSource &src,
                          SearchResult *result) override;
-  int fetch_with_source(uint32_t doc_id, const core::VectorSource &src,
-                        VectorDataBuffer *result) override;
   // FlatIndex(const FlatIndexParam &param) : param_(param) {}
   // FlatIndex(FlatIndexParam &&param) : param(std::move(param)) {}
 
@@ -327,8 +319,8 @@ class ZVEC_CORE_API FlatIndex : public Index {
   int create_and_init_legacy_converter_reformer(
       const QuantizerParam &param, const BaseIndexParam &index_param);
 
-  int bind_vector_source(const core::VectorSource *source,
-                         core::IndexContext::Pointer &context) override;
+  int bind_vector_source(const core::VectorSource &source,
+                         core::IndexContext::Pointer &context);
 
   FlatIndexParam param_{};
 };

@@ -142,15 +142,14 @@ ailego::Params MakeTurboQuantizerParams(const QuantizerParam &quantizer_param,
 
 }  // namespace
 
-int FlatIndex::bind_vector_source(const core::VectorSource *source,
+int FlatIndex::bind_vector_source(const core::VectorSource &source,
                                   core::IndexContext::Pointer &context) {
   if (!param_.use_external_vector) return core::IndexError_Unsupported;
-  if (!source) return core::IndexError_InvalidArgument;
   auto *ctx = dynamic_cast<core::FlatStreamerContext<32> *>(context.get());
   auto *streamer = dynamic_cast<core::FlatStreamer<32> *>(streamer_.get());
   if (!ctx || !streamer) return core::IndexError_Cast;
   if (ctx->magic() != streamer->magic()) ctx->reset(streamer);
-  ctx->set_vector_source(source);
+  ctx->set_vector_source(&source);
   return 0;
 }
 
@@ -160,7 +159,7 @@ int FlatIndex::add_with_source(const VectorData &vector, uint32_t doc_id,
   auto &context = acquire_context();
   if (!context) return core::IndexError_Runtime;
   FlatSourceScope scope{context};
-  int ret = bind_vector_source(&source, context);
+  int ret = bind_vector_source(source, context);
   return ret == 0 ? Index::add(vector, doc_id) : ret;
 }
 
@@ -173,31 +172,8 @@ int FlatIndex::search_with_source(
   auto &context = acquire_context();
   if (!context) return core::IndexError_Runtime;
   FlatSourceScope scope{context};
-  int ret = bind_vector_source(&source, context);
+  int ret = bind_vector_source(source, context);
   return ret == 0 ? Index::search(query, search_param, result) : ret;
-}
-
-int FlatIndex::fetch_with_source(uint32_t doc_id,
-                                 const core::VectorSource &source,
-                                 VectorDataBuffer *result) {
-  if (!is_open_) return core::IndexError_NoReady;
-  if (!param_.use_external_vector) return core::IndexError_Unsupported;
-  if (!result) return core::IndexError_InvalidArgument;
-  auto *streamer = dynamic_cast<core::FlatStreamer<32> *>(streamer_.get());
-  if (!streamer) return core::IndexError_Cast;
-  if (!streamer->entity().contains_key(doc_id)) return core::IndexError_NoExist;
-  core::VectorSource::Batch batch;
-  int ret = source.get_vector_batch(&doc_id, 1, &batch);
-  if (ret != 0) return ret;
-  if (batch.ids.size() != 1 || batch.ids[0] != doc_id ||
-      batch.vectors.size() != 1 || !batch.vectors[0]) {
-    return core::IndexError_ReadData;
-  }
-  DenseVectorBuffer buffer;
-  buffer.data.assign(static_cast<const char *>(batch.vectors[0]),
-                     input_vector_meta_.element_size());
-  result->vector_buffer = std::move(buffer);
-  return 0;
 }
 
 int FlatIndex::open(const std::string &file_path,
@@ -421,6 +397,10 @@ int FlatIndex::_prepare_for_search(
   if (ailego_unlikely(!flat_search_param)) {
     LOG_ERROR("Invalid search param type, expected FlatQueryParam");
     return core::IndexError_Runtime;
+  }
+
+  if (param_.use_external_vector && flat_search_param->group_by_param) {
+    return core::IndexError_Unsupported;
   }
 
   context->set_topk(flat_search_param->topk);

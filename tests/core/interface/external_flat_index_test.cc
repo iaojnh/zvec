@@ -35,11 +35,10 @@ constexpr uint32_t kDimension = 8;
 class BatchSource : public core::VectorSource {
  public:
   std::map<uint32_t, std::vector<float>> rows;
-  mutable std::atomic<uint32_t> scans{0}, reads{0};
+  mutable std::atomic<uint32_t> scans{0};
   size_t page_rows{7};
   bool supports_scan{true}, fail_scan{false}, malformed_scan{false};
-  bool null_scan{false}, fail_read{false}, wrong_read_ids{false};
-  bool legacy_reads{false};
+  bool null_scan{false}, fail_read{false};
 
   explicit BatchSource(uint32_t count = 89, float offset = 0) {
     for (uint32_t i = 0; i < count; ++i) {
@@ -51,27 +50,9 @@ class BatchSource : public core::VectorSource {
   }
 
   const void *get_vector(uint32_t id) const override {
+    if (fail_read) return nullptr;
     auto it = rows.find(id);
     return it == rows.end() ? nullptr : it->second.data();
-  }
-
-  int get_vector_batch(const uint32_t *ids, uint32_t count,
-                       Batch *out) const override {
-    ++reads;
-    if (legacy_reads) return VectorSource::get_vector_batch(ids, count, out);
-    if (fail_read) return core::IndexError_ReadData;
-    out->clear();
-    auto page = std::make_shared<std::vector<float>>(count * kDimension);
-    for (uint32_t i = 0; i < count; ++i) {
-      const void *data = get_vector(ids[i]);
-      if (!data) return core::IndexError_NoExist;
-      std::memcpy(page->data() + i * kDimension, data,
-                  kDimension * sizeof(float));
-      out->ids.push_back(ids[i] + (wrong_read_ids ? 1 : 0));
-      out->vectors.push_back(page->data() + i * kDimension);
-    }
-    out->lease = page;
-    return 0;
   }
 
   class Cursor : public Iterator {
@@ -91,7 +72,7 @@ class BatchSource : public core::VectorSource {
       auto page = std::make_shared<std::vector<float>>(count * kDimension);
       for (size_t i = 0; i < count; ++i) {
         auto id = ids_[position_++];
-        std::memcpy(page->data() + i * kDimension, source_.get_vector(id),
+        std::memcpy(page->data() + i * kDimension, source_.rows.at(id).data(),
                     kDimension * sizeof(float));
         out->ids.push_back(id);
         out->vectors.push_back(
@@ -187,7 +168,7 @@ class ExternalFlatTest : public testing::Test {
   }
 };
 
-TEST_F(ExternalFlatTest, ScanMatchesEmbeddedAndOwnsReturnedVectors) {
+TEST_F(ExternalFlatTest, ScanMatchesEmbeddedAndBorrowsReturnedVectors) {
   int case_id = 0;
   for (auto metric : {MetricType::kL2sq, MetricType::kInnerProduct}) {
     for (bool id_map : {false, true}) {
@@ -210,8 +191,6 @@ TEST_F(ExternalFlatTest, ScanMatchesEmbeddedAndOwnsReturnedVectors) {
                 external->search_with_source(Vector(query), qp, source, &got));
       SameResults(want, got);
       EXPECT_EQ(1, source.scans);
-      auto expected = source.rows;
-      source.rows.clear();
       close_index(external);
       ASSERT_EQ(11, got.doc_list_.size());
       // External vectors are returned directly in the input layout, without
@@ -219,9 +198,9 @@ TEST_F(ExternalFlatTest, ScanMatchesEmbeddedAndOwnsReturnedVectors) {
       EXPECT_TRUE(got.reverted_vector_list_.empty());
       for (size_t i = 0; i < got.doc_list_.size(); ++i) {
         const auto &doc = got.doc_list_[i];
-        const auto &row = expected.at(doc.key());
-        EXPECT_EQ(0, std::memcmp(row.data(), doc.vector(),
-                                 kDimension * sizeof(float)));
+        // Returned vectors borrow the stable random-access source, not the
+        // transient scan pages. The source remains alive after index close.
+        EXPECT_EQ(source.get_vector(doc.key()), doc.vector());
       }
     }
   }
@@ -249,16 +228,9 @@ TEST_F(ExternalFlatTest, CandidateLookupFilterRadiusAndFetch) {
   for (auto &doc : result.doc_list_) {
     EXPECT_NE(3, doc.key());
     EXPECT_LE(doc.score(), qp->radius);
-    VectorDataBuffer buffer;
-    ASSERT_EQ(0, index->fetch_with_source(doc.key(), source, &buffer));
-    EXPECT_EQ(0,
-              std::memcmp(
-                  source.get_vector(doc.key()),
-                  std::get<DenseVectorBuffer>(buffer.vector_buffer).data.data(),
-                  kDimension * sizeof(float)));
+    EXPECT_EQ(source.get_vector(doc.key()), doc.vector());
   }
   VectorDataBuffer buffer;
-  EXPECT_NE(0, index->fetch_with_source(999999, source, &buffer));
   EXPECT_NE(0, index->fetch(3, &buffer));
   EXPECT_NE(0, index->add(Vector(query), 3));
   EXPECT_NE(0, index->search(Vector(query), qp, &result));
@@ -327,117 +299,18 @@ TEST_F(ExternalFlatTest, RejectsReadFailuresAndClearsRequestSource) {
   source.fail_scan = source.malformed_scan = source.null_scan = false;
   source.supports_scan = true;
   ASSERT_EQ(0, index->search_with_source(Vector(query), qp, source, &result));
+  source.fail_read = true;
+  qp->fetch_vector = true;
+  EXPECT_NE(0, index->search_with_source(Vector(query), qp, source, &result));
+  EXPECT_TRUE(result.doc_list_.empty());
+  qp->fetch_vector = false;
   qp->bf_pks = std::make_shared<std::vector<uint64_t>>(
       std::initializer_list<uint64_t>{3});
-  source.fail_read = true;
   EXPECT_NE(0, index->search_with_source(Vector(query), qp, source, &result));
   source.fail_read = false;
-  source.wrong_read_ids = true;
-  EXPECT_NE(0, index->search_with_source(Vector(query), qp, source, &result));
-  source.wrong_read_ids = false;
   source.rows.erase(3);
   EXPECT_NE(0, index->search_with_source(Vector(query), qp, source, &result));
   EXPECT_NE(0, index->add_with_source(Vector(query), 3, source));
-}
-
-TEST_F(ExternalFlatTest, GroupByUsesExternalVectors) {
-  BatchSource source;
-  auto index = open_index(Param(true), test_path("ext"));
-  auto embedded = open_index(Param(false), test_path("base"));
-  add_vectors(index.get(), source);
-  add_vectors(embedded.get(), source, false);
-  auto qp =
-      FlatQueryParamBuilder().with_topk(6).with_fetch_vector(true).build();
-  qp->group_by_param = std::make_shared<GroupByParam>();
-  qp->group_by_param->group_count = 3;
-  qp->group_by_param->group_topk = 2;
-  qp->group_by_param->group_by = [](uint64_t id) {
-    return std::to_string(id % 3);
-  };
-  std::vector<float> query(kDimension, 0.3f);
-  SearchResult want, got;
-  ASSERT_EQ(0, embedded->search(Vector(query), qp, &want));
-  ASSERT_EQ(0, index->search_with_source(Vector(query), qp, source, &got));
-  ASSERT_EQ(3, got.group_doc_list_.size());
-  for (size_t i = 0; i < want.group_doc_list_.size(); ++i) {
-    const auto &a = want.group_doc_list_[i];
-    const auto &b = got.group_doc_list_[i];
-    EXPECT_EQ(a.group_id(), b.group_id());
-    ASSERT_EQ(2, b.docs().size());
-    for (size_t j = 0; j < b.docs().size(); ++j) {
-      EXPECT_EQ(a.docs()[j].key(), b.docs()[j].key());
-      EXPECT_NEAR(a.docs()[j].score(), b.docs()[j].score(), 1e-5);
-      EXPECT_EQ(0,
-                std::memcmp(source.get_vector(b.docs()[j].key()),
-                            b.docs()[j].vector(), kDimension * sizeof(float)));
-    }
-  }
-}
-
-TEST_F(ExternalFlatTest, RefineBindsItsOwnSource) {
-  BatchSource coarse_source(30), reference_source(30, 0.8f);
-  auto coarse = open_index(Param(true), test_path("coarse"));
-  auto reference = open_index(Param(true), test_path("reference"));
-  add_vectors(coarse.get(), coarse_source);
-  add_vectors(reference.get(), reference_source);
-  auto qp =
-      FlatQueryParamBuilder().with_topk(5).with_fetch_vector(true).build();
-  std::vector<float> query(kDimension, 0.3f);
-  SearchResult want, got;
-  ASSERT_EQ(0, reference->search_with_source(Vector(query), qp,
-                                             reference_source, &want));
-  reference_source.supports_scan = false;
-  qp->refiner_param = std::make_shared<RefinerParam>();
-  qp->refiner_param->scale_factor_ = 6;
-  qp->refiner_param->reference_index = reference;
-  qp->refiner_param->reference_vector_source = &reference_source;
-  ASSERT_EQ(0,
-            coarse->search_with_source(Vector(query), qp, coarse_source, &got));
-  SameResults(want, got);
-  for (auto &doc : got.doc_list_) {
-    EXPECT_EQ(0, std::memcmp(reference_source.get_vector(doc.key()),
-                             doc.vector(), kDimension * sizeof(float)));
-  }
-  qp->refiner_param->reference_vector_source = nullptr;
-  EXPECT_NE(0,
-            coarse->search_with_source(Vector(query), qp, coarse_source, &got));
-  qp->refiner_param.reset();
-  EXPECT_NE(0, reference->search(Vector(query), qp, &got));
-}
-
-TEST_F(ExternalFlatTest, HnswExternalRefinesWithExternalFlat) {
-  BatchSource source(30);
-  auto original = std::move(source.rows);
-  uint32_t id = 0;
-  for (auto &entry : original) source.rows[id++] = entry.second;
-  auto coarse_param = HNSWIndexParamBuilder()
-                          .with_data_type(DataType::DT_FP32)
-                          .with_dimension(kDimension)
-                          .with_metric_type(MetricType::kL2sq)
-                          .with_use_external_vector(true)
-                          .build();
-  auto coarse = open_index(coarse_param, test_path("coarse"));
-  auto reference = open_index(Param(true), test_path("reference"));
-  add_vectors(coarse.get(), source);
-  add_vectors(reference.get(), source);
-  std::vector<float> query(kDimension, 0.3f);
-  auto flat_qp =
-      FlatQueryParamBuilder().with_topk(5).with_fetch_vector(true).build();
-  SearchResult want, got;
-  ASSERT_EQ(
-      0, reference->search_with_source(Vector(query), flat_qp, source, &want));
-  auto qp = HNSWQueryParamBuilder()
-                .with_topk(5)
-                .with_ef_search(64)
-                .with_fetch_vector(true)
-                .build();
-  qp->refiner_param = std::make_shared<RefinerParam>();
-  qp->refiner_param->scale_factor_ = 6;
-  qp->refiner_param->reference_index = reference;
-  qp->refiner_param->reference_vector_source = &source;
-  source.supports_scan = false;
-  ASSERT_EQ(0, coarse->search_with_source(Vector(query), qp, source, &got));
-  SameResults(want, got);
 }
 
 TEST_F(ExternalFlatTest, ConcurrentRequestsKeepTheirSourceAndCursor) {
@@ -492,11 +365,31 @@ TEST_F(ExternalFlatTest, RejectsUnsupportedFormatsAndUnboundOperations) {
   EXPECT_EQ(nullptr, provider->create_iterator());
   EXPECT_EQ(nullptr, provider->get_vector(3));
   EXPECT_NE(0, index->merge({index}, IndexFilter{}));
+  EXPECT_EQ(0, index->merge({}, IndexFilter{}));
+  auto embedded = open_index(Param(false), test_path("embedded"));
+  add_vectors(embedded.get(), source, false);
+  EXPECT_NE(0, embedded->merge({index}, IndexFilter{}));
+
+  auto qp = FlatQueryParamBuilder().with_topk(1).build();
+  qp->group_by_param = std::make_shared<GroupByParam>();
+  qp->group_by_param->group_count = 1;
+  qp->group_by_param->group_topk = 1;
+  qp->group_by_param->group_by = [](uint64_t) { return std::string("group"); };
+  SearchResult result;
+  const auto query = Vector(source.rows.at(3));
+  EXPECT_EQ(core::IndexError_Unsupported,
+            index->search_with_source(query, qp, source, &result));
+  EXPECT_TRUE(result.group_doc_list_.empty());
+  qp->group_by_param.reset();
+  // The existing refine entry point has no source binding for external Flat.
+  qp->refiner_param = std::make_shared<RefinerParam>();
+  qp->refiner_param->scale_factor_ = 1;
+  qp->refiner_param->reference_index = index;
+  EXPECT_NE(0, embedded->search(query, qp, &result));
 }
 
-TEST_F(ExternalFlatTest, LegacyRandomAccessAndBufferPoolReopen) {
+TEST_F(ExternalFlatTest, BufferPoolReopen) {
   BatchSource source(40);
-  source.legacy_reads = true;
   auto path = test_path("index");
   auto index = open_index(Param(true), path);
   add_vectors(index.get(), source);
@@ -551,6 +444,13 @@ TEST_F(ExternalFlatTest, LowLevelBatchQueriesAndMetadataValidation) {
   EXPECT_EQ(2, source.scans);
   core::IndexQueryMeta wrong(core::IndexMeta::DT_FP32, kDimension - 1);
   EXPECT_NE(0, streamer->search_bf_impl(query.data(), wrong, 2, context));
+  ctx->set_group_params(1, 1);
+  EXPECT_EQ(core::IndexError_Unsupported,
+            streamer->search_bf_impl(query.data(), qmeta, 2, context));
+  EXPECT_EQ(core::IndexError_Unsupported,
+            streamer->search_bf_by_p_keys_impl(query.data(), {{3}, {16}}, qmeta,
+                                               2, context));
+  ctx->set_group_params(0, 0);
   context->reset();
   EXPECT_NE(0, streamer->search_bf_impl(query.data(), qmeta, 2, context));
   EXPECT_EQ(0, streamer->close());
