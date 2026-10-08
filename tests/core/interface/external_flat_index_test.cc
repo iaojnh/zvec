@@ -145,7 +145,7 @@ class ExternalFlatTest : public testing::Test {
   std::vector<Index::Pointer> opened_;
   std::vector<std::string> paths_;
 
-  std::string Path(const std::string &suffix) {
+  std::string test_path(const std::string &suffix) {
     std::string path =
         "test_external_flat_" +
         std::string(
@@ -156,8 +156,8 @@ class ExternalFlatTest : public testing::Test {
     return path;
   }
 
-  Index::Pointer Open(const BaseIndexParam::Pointer &param,
-                      const std::string &path, bool create = true) {
+  Index::Pointer open_index(const BaseIndexParam::Pointer &param,
+                            const std::string &path, bool create = true) {
     auto index = IndexFactory::CreateAndInitIndex(*param);
     EXPECT_NE(nullptr, index);
     if (!index) return index;
@@ -167,14 +167,15 @@ class ExternalFlatTest : public testing::Test {
     return index;
   }
 
-  void Add(Index *index, const BatchSource &source, bool external = true) {
+  void add_vectors(Index *index, const BatchSource &source,
+                   bool external = true) {
     for (auto &[id, row] : source.rows) {
       ASSERT_EQ(0, external ? index->add_with_source(Vector(row), id, source)
                             : index->add(Vector(row), id));
     }
   }
 
-  void Close(const Index::Pointer &index) {
+  void close_index(const Index::Pointer &index) {
     EXPECT_EQ(0, index->close());
     opened_.erase(std::remove(opened_.begin(), opened_.end(), index),
                   opened_.end());
@@ -192,10 +193,12 @@ TEST_F(ExternalFlatTest, ScanMatchesEmbeddedAndOwnsReturnedVectors) {
     for (bool id_map : {false, true}) {
       BatchSource source;
       auto suffix = std::to_string(case_id++);
-      auto external = Open(Param(true, metric, id_map), Path(suffix + "ext"));
-      auto embedded = Open(Param(false, metric, id_map), Path(suffix + "base"));
-      Add(external.get(), source);
-      Add(embedded.get(), source, false);
+      auto external =
+          open_index(Param(true, metric, id_map), test_path(suffix + "ext"));
+      auto embedded =
+          open_index(Param(false, metric, id_map), test_path(suffix + "base"));
+      add_vectors(external.get(), source);
+      add_vectors(embedded.get(), source, false);
       ASSERT_EQ(source.rows.size(), external->get_doc_count());
       source.rows[99999] = std::vector<float>(kDimension, 0.3f);
       std::vector<float> query(kDimension, 0.3f);
@@ -209,7 +212,7 @@ TEST_F(ExternalFlatTest, ScanMatchesEmbeddedAndOwnsReturnedVectors) {
       EXPECT_EQ(1, source.scans);
       auto expected = source.rows;
       source.rows.clear();
-      Close(external);
+      close_index(external);
       ASSERT_EQ(11, got.doc_list_.size());
       // External vectors are returned directly in the input layout, without
       // creating a redundant dequantized copy in reverted_vector_list_.
@@ -227,8 +230,8 @@ TEST_F(ExternalFlatTest, ScanMatchesEmbeddedAndOwnsReturnedVectors) {
 TEST_F(ExternalFlatTest, CandidateLookupFilterRadiusAndFetch) {
   BatchSource source;
   source.supports_scan = false;
-  auto index = Open(Param(true), Path("index"));
-  Add(index.get(), source);
+  auto index = open_index(Param(true), test_path("index"));
+  add_vectors(index.get(), source);
   auto qp =
       FlatQueryParamBuilder().with_topk(5).with_fetch_vector(true).build();
   qp->radius = 0.5f;
@@ -263,9 +266,9 @@ TEST_F(ExternalFlatTest, CandidateLookupFilterRadiusAndFetch) {
 
 TEST_F(ExternalFlatTest, ReopenUpdatesAndRejectsWrongStorageMode) {
   BatchSource source;
-  auto path = Path("index");
-  auto index = Open(Param(true, MetricType::kL2sq, false), path);
-  Add(index.get(), source);
+  auto path = test_path("index");
+  auto index = open_index(Param(true, MetricType::kL2sq, false), path);
+  add_vectors(index.get(), source);
   auto *streamer =
       dynamic_cast<core::FlatStreamer<32> *>(index->index_searcher().get());
   ASSERT_NE(nullptr, streamer);
@@ -277,8 +280,8 @@ TEST_F(ExternalFlatTest, ReopenUpdatesAndRejectsWrongStorageMode) {
   ASSERT_EQ(0, index->add_with_source(Vector(source.rows.at(3)), 3, source));
   EXPECT_EQ(89, index->get_doc_count());
   ASSERT_EQ(0, index->flush());
-  Close(index);
-  index = Open(Param(true, MetricType::kL2sq, false), path, false);
+  close_index(index);
+  index = open_index(Param(true, MetricType::kL2sq, false), path, false);
   ASSERT_EQ(89, index->get_doc_count());
   auto qp = FlatQueryParamBuilder().with_topk(1).build();
   SearchResult result;
@@ -291,14 +294,14 @@ TEST_F(ExternalFlatTest, ReopenUpdatesAndRejectsWrongStorageMode) {
   ASSERT_EQ(0, index->add_with_source(Vector(source.rows.at(1000000)), 1000000,
                                       source));
   EXPECT_EQ(90, index->get_doc_count());
-  Close(index);
+  close_index(index);
   auto wrong = IndexFactory::CreateAndInitIndex(*Param(false));
   ASSERT_NE(nullptr, wrong);
   EXPECT_NE(0, wrong->open(path, {StorageOptions::StorageType::kMMAP, false}));
   wrong.reset();
-  auto embedded_path = Path("embedded");
-  auto embedded = Open(Param(false), embedded_path);
-  Close(embedded);
+  auto embedded_path = test_path("embedded");
+  auto embedded = open_index(Param(false), embedded_path);
+  close_index(embedded);
   wrong = IndexFactory::CreateAndInitIndex(*Param(true));
   EXPECT_NE(0, wrong->open(embedded_path,
                            {StorageOptions::StorageType::kMMAP, false}));
@@ -306,8 +309,8 @@ TEST_F(ExternalFlatTest, ReopenUpdatesAndRejectsWrongStorageMode) {
 
 TEST_F(ExternalFlatTest, RejectsReadFailuresAndClearsRequestSource) {
   BatchSource source;
-  auto index = Open(Param(true), Path("index"));
-  Add(index.get(), source);
+  auto index = open_index(Param(true), test_path("index"));
+  add_vectors(index.get(), source);
   auto qp = FlatQueryParamBuilder().with_topk(3).build();
   std::vector<float> query(kDimension, 0.3f);
   SearchResult result;
@@ -339,10 +342,10 @@ TEST_F(ExternalFlatTest, RejectsReadFailuresAndClearsRequestSource) {
 
 TEST_F(ExternalFlatTest, GroupByUsesExternalVectors) {
   BatchSource source;
-  auto index = Open(Param(true), Path("ext"));
-  auto embedded = Open(Param(false), Path("base"));
-  Add(index.get(), source);
-  Add(embedded.get(), source, false);
+  auto index = open_index(Param(true), test_path("ext"));
+  auto embedded = open_index(Param(false), test_path("base"));
+  add_vectors(index.get(), source);
+  add_vectors(embedded.get(), source, false);
   auto qp =
       FlatQueryParamBuilder().with_topk(6).with_fetch_vector(true).build();
   qp->group_by_param = std::make_shared<GroupByParam>();
@@ -373,10 +376,10 @@ TEST_F(ExternalFlatTest, GroupByUsesExternalVectors) {
 
 TEST_F(ExternalFlatTest, RefineBindsItsOwnSource) {
   BatchSource coarse_source(30), reference_source(30, 0.8f);
-  auto coarse = Open(Param(true), Path("coarse"));
-  auto reference = Open(Param(true), Path("reference"));
-  Add(coarse.get(), coarse_source);
-  Add(reference.get(), reference_source);
+  auto coarse = open_index(Param(true), test_path("coarse"));
+  auto reference = open_index(Param(true), test_path("reference"));
+  add_vectors(coarse.get(), coarse_source);
+  add_vectors(reference.get(), reference_source);
   auto qp =
       FlatQueryParamBuilder().with_topk(5).with_fetch_vector(true).build();
   std::vector<float> query(kDimension, 0.3f);
@@ -413,10 +416,10 @@ TEST_F(ExternalFlatTest, HnswExternalRefinesWithExternalFlat) {
                           .with_metric_type(MetricType::kL2sq)
                           .with_use_external_vector(true)
                           .build();
-  auto coarse = Open(coarse_param, Path("coarse"));
-  auto reference = Open(Param(true), Path("reference"));
-  Add(coarse.get(), source);
-  Add(reference.get(), source);
+  auto coarse = open_index(coarse_param, test_path("coarse"));
+  auto reference = open_index(Param(true), test_path("reference"));
+  add_vectors(coarse.get(), source);
+  add_vectors(reference.get(), source);
   std::vector<float> query(kDimension, 0.3f);
   auto flat_qp =
       FlatQueryParamBuilder().with_topk(5).with_fetch_vector(true).build();
@@ -439,8 +442,8 @@ TEST_F(ExternalFlatTest, HnswExternalRefinesWithExternalFlat) {
 
 TEST_F(ExternalFlatTest, ConcurrentRequestsKeepTheirSourceAndCursor) {
   BatchSource first(50), second(50, 2.0f);
-  auto index = Open(Param(true), Path("index"));
-  Add(index.get(), first);
+  auto index = open_index(Param(true), test_path("index"));
+  add_vectors(index.get(), first);
   std::vector<float> query(kDimension, 0.3f);
   SearchResult expected[2];
   BatchSource *sources[] = {&first, &second};
@@ -480,8 +483,8 @@ TEST_F(ExternalFlatTest, RejectsUnsupportedFormatsAndUnboundOperations) {
     EXPECT_EQ(nullptr, IndexFactory::CreateAndInitIndex(*param));
   }
   BatchSource source(1);
-  auto index = Open(Param(true), Path("index"));
-  Add(index.get(), source);
+  auto index = open_index(Param(true), test_path("index"));
+  add_vectors(index.get(), source);
   EXPECT_NE(0, index->index_searcher()->dump(nullptr));
   auto provider = index->create_index_provider();
   ASSERT_NE(nullptr, provider);
@@ -494,10 +497,10 @@ TEST_F(ExternalFlatTest, RejectsUnsupportedFormatsAndUnboundOperations) {
 TEST_F(ExternalFlatTest, LegacyRandomAccessAndBufferPoolReopen) {
   BatchSource source(40);
   source.legacy_reads = true;
-  auto path = Path("index");
-  auto index = Open(Param(true), path);
-  Add(index.get(), source);
-  Close(index);
+  auto path = test_path("index");
+  auto index = open_index(Param(true), path);
+  add_vectors(index.get(), source);
+  close_index(index);
   index = IndexFactory::CreateAndInitIndex(*Param(true));
   ASSERT_NE(nullptr, index);
   ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
@@ -519,7 +522,7 @@ TEST_F(ExternalFlatTest, LowLevelBatchQueriesAndMetadataValidation) {
   BatchSource source(20);
   auto storage = core::IndexFactory::CreateStorage("MMapFileStorage");
   ASSERT_EQ(0, storage->init(zvec::ailego::Params{}));
-  ASSERT_EQ(0, storage->open(Path("index"), true));
+  ASSERT_EQ(0, storage->open(test_path("index"), true));
   core::IndexMeta meta;
   meta.set_meta(core::IndexMeta::DT_FP32, kDimension);
   meta.set_metric("SquaredEuclidean", 0, zvec::ailego::Params{});
@@ -557,7 +560,7 @@ TEST_F(ExternalFlatTest, LowLevelBatchQueriesAndMetadataValidation) {
 
 TEST_F(ExternalFlatTest, EmptyIndexAndEmptyCandidates) {
   BatchSource source(0);
-  auto index = Open(Param(true), Path("index"));
+  auto index = open_index(Param(true), test_path("index"));
   auto qp = FlatQueryParamBuilder().with_topk(3).build();
   std::vector<float> query(kDimension, 0.3f);
   SearchResult result;
