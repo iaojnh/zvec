@@ -18,11 +18,19 @@
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/index.h>
 #include "algorithm/flat/flat_index_format.h"
+#include "algorithm/flat/flat_streamer_context.h"
 #include "algorithm/flat/flat_utility.h"
 
 namespace zvec::core_interface {
 
 namespace {
+
+struct FlatSourceScope {
+  core::IndexContext::Pointer &context;
+  ~FlatSourceScope() {
+    if (context) context->reset();
+  }
+};
 
 //! Read the IndexMeta persisted in the flat linear meta segment without
 //! initializing a streamer. Returns non-zero when the storage or segment
@@ -134,6 +142,40 @@ ailego::Params MakeTurboQuantizerParams(const QuantizerParam &quantizer_param,
 
 }  // namespace
 
+int FlatIndex::bind_vector_source(const core::VectorSource &source,
+                                  core::IndexContext::Pointer &context) {
+  if (!param_.use_external_vector) return core::IndexError_Unsupported;
+  auto *ctx = dynamic_cast<core::FlatStreamerContext<32> *>(context.get());
+  auto *streamer = dynamic_cast<core::FlatStreamer<32> *>(streamer_.get());
+  if (!ctx || !streamer) return core::IndexError_Cast;
+  if (ctx->magic() != streamer->magic()) ctx->reset(streamer);
+  ctx->set_vector_source(&source);
+  return 0;
+}
+
+int FlatIndex::add_with_source(const VectorData &vector, uint32_t doc_id,
+                               const core::VectorSource &source) {
+  if (!is_open_) return core::IndexError_NoReady;
+  auto &context = acquire_context();
+  if (!context) return core::IndexError_Runtime;
+  FlatSourceScope scope{context};
+  int ret = bind_vector_source(source, context);
+  return ret == 0 ? Index::add(vector, doc_id) : ret;
+}
+
+int FlatIndex::search_with_source(
+    const VectorData &query, const BaseIndexQueryParam::Pointer &search_param,
+    const core::VectorSource &source, SearchResult *result) {
+  if (!is_open_) return core::IndexError_NoReady;
+  if (!search_param || !result) return core::IndexError_InvalidArgument;
+  *result = SearchResult{};
+  auto &context = acquire_context();
+  if (!context) return core::IndexError_Runtime;
+  FlatSourceScope scope{context};
+  int ret = bind_vector_source(source, context);
+  return ret == 0 ? Index::search(query, search_param, result) : ret;
+}
+
 int FlatIndex::open(const std::string &file_path,
                     StorageOptions storage_options) {
   // Restore the persisted encoding while keeping the configured structural
@@ -220,6 +262,21 @@ int FlatIndex::fallback_to_legacy_pipeline() {
 int FlatIndex::create_and_init_converter_reformer(
     const QuantizerParam &quantizer_param, const BaseIndexParam &index_param) {
   const auto &flat_param = dynamic_cast<const FlatIndexParam &>(index_param);
+  if (flat_param.use_external_vector &&
+      (flat_param.is_sparse || flat_param.data_type != DataType::DT_FP32 ||
+       flat_param.dimension <= 0 || flat_param.dimension > MAX_DIMENSION ||
+       (flat_param.metric_type != MetricType::kL2sq &&
+        flat_param.metric_type != MetricType::kInnerProduct) ||
+       flat_param.major_order == IndexMeta::MO_COLUMN ||
+       flat_param.use_contiguous_memory || quantizer_param.enable_rotate ||
+       quantizer_param.type != QuantizerType::kNone ||
+       flat_param.preprocess_param.type != PreprocessorType::kNone ||
+       (flat_param.storage_data_type != DataType::DT_UNDEFINED &&
+        flat_param.storage_data_type != DataType::DT_FP32))) {
+    LOG_ERROR("External Flat requires raw row-major FP32 L2/IP vectors");
+    return core::IndexError_Unsupported;
+  }
+
   // Prefer the turbo quantizer path (quantized records + SIMD batch distance
   // kernels funneled through the streamer entity) whenever a turbo quantizer
   // can express the configuration; only the remaining combinations fall
@@ -299,6 +356,8 @@ int FlatIndex::create_and_init_streamer(const BaseIndexParam &param) {
   proxima_index_params_.set(core::PARAM_FLAT_COLUMN_MAJOR_ORDER,
                             param_.major_order == IndexMeta::MO_COLUMN);
   proxima_index_params_.set(core::PARAM_FLAT_USE_ID_MAP, param_.use_id_map);
+  proxima_index_params_.set(core::PARAM_FLAT_USE_EXTERNAL_VECTOR,
+                            param_.use_external_vector);
   proxima_index_params_.set(core::PARAM_FLAT_USE_CONTIGUOUS_MEMORY,
                             param_.use_contiguous_memory);
   if (is_sparse_) {
@@ -338,6 +397,10 @@ int FlatIndex::_prepare_for_search(
   if (ailego_unlikely(!flat_search_param)) {
     LOG_ERROR("Invalid search param type, expected FlatQueryParam");
     return core::IndexError_Runtime;
+  }
+
+  if (param_.use_external_vector && flat_search_param->group_by_param) {
+    return core::IndexError_Unsupported;
   }
 
   context->set_topk(flat_search_param->topk);

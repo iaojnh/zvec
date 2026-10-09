@@ -269,6 +269,21 @@ class ZVEC_CORE_API Index {
 class ZVEC_CORE_API FlatIndex : public Index {
  public:
   FlatIndex() = default;
+
+  // External Flat supports raw row-major FP32 L2/IP. Register IDs after
+  // writing the source; vector bytes and subsequent updates stay in the source.
+  // doc_id is the source ID with either use_id_map setting.
+  int add_with_source(const VectorData &vector, uint32_t doc_id,
+                      const core::VectorSource &src) override;
+  // Full scans enumerate every registered ID once (extra IDs are ignored).
+  // Candidate searches use get_vectors(). Hold a stable source snapshot for
+  // the request. With fetch_vector, returned pointers borrow source memory;
+  // keep that memory valid while using the results, as with external HNSW.
+  // External Flat does not support group-by or binding a source for refinement.
+  int search_with_source(const VectorData &query,
+                         const BaseIndexQueryParam::Pointer &search_param,
+                         const core::VectorSource &src,
+                         SearchResult *result) override;
   // FlatIndex(const FlatIndexParam &param) : param_(param) {}
   // FlatIndex(FlatIndexParam &&param) : param(std::move(param)) {}
 
@@ -303,6 +318,9 @@ class ZVEC_CORE_API FlatIndex : public Index {
   //! converters).
   int create_and_init_legacy_converter_reformer(
       const QuantizerParam &param, const BaseIndexParam &index_param);
+
+  int bind_vector_source(const core::VectorSource &source,
+                         core::IndexContext::Pointer &context);
 
   FlatIndexParam param_{};
 };

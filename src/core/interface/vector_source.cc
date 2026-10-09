@@ -21,6 +21,10 @@ VectorSource::VectorSource() = default;
 
 VectorSource::~VectorSource() = default;
 
+VectorSource::Iterator::Pointer VectorSource::create_iterator() const {
+  return nullptr;
+}
+
 void VectorSource::get_vectors(const uint32_t *ids, uint32_t count,
                                const void **out) const {
   for (uint32_t i = 0; i < count; ++i) {
