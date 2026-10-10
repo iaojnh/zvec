@@ -16,6 +16,8 @@
 #include <cstring>
 #include <limits>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include "ailego/pattern/defer.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_memory.h"
@@ -85,8 +87,33 @@ class TrainingInput : public IndexHolder {
   }
 };
 
-TEST(RabitqTrainingMemoryTest,
-     CentroidsMatchLegacySamplingIncludingFullCorpus) {
+class RabitqTrainingMemoryTest : public ::testing::TestWithParam<bool> {
+ protected:
+  void SetUp() override {
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    previous_capacity_ = pool.capacity();
+    ASSERT_EQ(pool.used(), 0u);
+    ASSERT_EQ(
+        pool.init(
+            GetParam()
+                ? 2 * ailego::VecBufferPool::metadata_bytes_for_page_count(
+                          4096, true) +
+                      64 * 1024
+                : 0),
+        0);
+  }
+  void TearDown() override {
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    EXPECT_EQ(pool.used(), 0u);
+    EXPECT_EQ(pool.init(previous_capacity_), 0);
+  }
+
+ private:
+  size_t previous_capacity_{0};
+};
+
+TEST_P(RabitqTrainingMemoryTest,
+       CentroidsMatchLegacySamplingIncludingFullCorpus) {
   auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
   for (size_t extra_dimensions : {size_t{0}, size_t{1}}) {
     SCOPED_TRACE(extra_dimensions);
@@ -108,13 +135,15 @@ TEST(RabitqTrainingMemoryTest,
       ASSERT_NE(legacy, nullptr);
       ASSERT_EQ(legacy->init(input->meta, ailego::Params()), 0);
       ASSERT_EQ(legacy->mount(sampler), 0);
-      legacy->suggest(4);
+      // A single centroid has a deterministic mean; independent randomized
+      // KMC2 initializations must not be compared bit for bit for k > 1.
+      legacy->suggest(1);
       IndexCluster::CentroidList expected;
       ASSERT_EQ(legacy->cluster(threads, expected), 0);
 
       RabitqConverter converter;
       ailego::Params params;
-      params.set(PARAM_RABITQ_NUM_CLUSTERS, 4U);
+      params.set(PARAM_RABITQ_NUM_CLUSTERS, 1U);
       params.set(PARAM_RABITQ_SAMPLE_COUNT, requested);
       ASSERT_EQ(converter.init(input->meta, params), 0);
       input->iterations = 0;
@@ -136,15 +165,17 @@ TEST(RabitqTrainingMemoryTest,
       auto segment = storage->get(RABITQ_CONVERTER_SEG_ID);
       ASSERT_NE(segment, nullptr);
       RabitqConverterHeader header{};
-      ASSERT_EQ(segment->fetch(0, &header, sizeof(header)), sizeof(header));
+      const void *data = nullptr;
+      ASSERT_EQ(segment->read(0, &data, sizeof(header)), sizeof(header));
+      std::memcpy(&header, data, sizeof(header));
       ASSERT_EQ(header.num_clusters, expected.size());
       size_t offset = sizeof(header) +
                       header.num_clusters * header.padded_dim * sizeof(float);
       std::vector<float> actual(input->meta.dimension());
       for (const auto &centroid : expected) {
-        ASSERT_EQ(
-            segment->fetch(offset, actual.data(), input->meta.element_size()),
-            input->meta.element_size());
+        ASSERT_EQ(segment->read(offset, &data, input->meta.element_size()),
+                  input->meta.element_size());
+        std::memcpy(actual.data(), data, input->meta.element_size());
         EXPECT_EQ(std::memcmp(actual.data(), centroid.feature(),
                               input->meta.element_size()),
                   0);
@@ -154,7 +185,7 @@ TEST(RabitqTrainingMemoryTest,
   }
 }
 
-TEST(RabitqTrainingMemoryTest, DoesNotRetryAfterInputError) {
+TEST_P(RabitqTrainingMemoryTest, DoesNotRetryAfterInputError) {
   for (uint32_t sample_count : {0U, 64U}) {
     for (size_t fail_at : {size_t{0}, size_t{11}, size_t{259}}) {
       auto input = std::make_shared<TrainingInput>();
@@ -171,7 +202,7 @@ TEST(RabitqTrainingMemoryTest, DoesNotRetryAfterInputError) {
   }
 }
 
-TEST(RabitqTrainingMemoryTest, FullTrainingValidatesReportedCount) {
+TEST_P(RabitqTrainingMemoryTest, FullTrainingValidatesReportedCount) {
   for (size_t count : {size_t{258}, size_t{260}}) {
     auto input = std::make_shared<TrainingInput>();
     input->reported_count = count;
@@ -184,6 +215,9 @@ TEST(RabitqTrainingMemoryTest, FullTrainingValidatesReportedCount) {
     EXPECT_EQ(input->iterations, 1u);
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(StorageModes, RabitqTrainingMemoryTest,
+                         ::testing::Bool());
 
 }  // namespace
 }  // namespace zvec::core

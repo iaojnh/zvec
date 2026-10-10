@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <random>
 #include <tuple>
 #include <utility>
@@ -341,6 +342,73 @@ class VisitByteMap {
   }
 };  // end of VisitByteMap
 
+// Exact visitation with one bit per ID and one generation byte per 64 IDs.
+// Like ByteMap, normal clear() is O(1); unlike a plain bitmap it need not scan
+// the entire corpus on every graph expansion/query. No probabilistic misses.
+class VisitEpochBitMap {
+ public:
+  static constexpr int mode = 4;
+  struct Context {
+    VisitFilterHeader h;
+    std::vector<uint64_t> bits;
+    std::vector<uint8_t> generations;
+    uint8_t generation{1};
+  };
+  inline static bool reset(Context *c, uint64_t count, uint64_t scans) {
+    if (count > c->h.max_doc_cnt) {
+      const size_t words = count / 64 + (count % 64 != 0);
+      try {
+        c->bits.resize(words);
+        c->generations.resize(words, 0);
+      } catch (const std::exception &) {
+        return false;
+      }
+      c->h.max_doc_cnt = count;
+    }
+    c->h.max_scan_num = std::max(c->h.max_scan_num, scans);
+    return true;
+  }
+  inline static void set_visited(Context *c, id_t id) {
+    if (id >= c->h.max_doc_cnt &&
+        !reset(c, uint64_t{id} + 1, c->h.max_scan_num))
+      throw std::bad_alloc();
+    const size_t word = id / 64;
+    if (c->generations[word] != c->generation) {
+      c->bits[word] = 0;
+      c->generations[word] = c->generation;
+    }
+    c->bits[word] |= uint64_t{1} << (id % 64);
+  }
+  inline static bool visited(Context *c, id_t id) {
+    return id < c->h.max_doc_cnt && c->generations[id / 64] == c->generation &&
+           (c->bits[id / 64] & (uint64_t{1} << (id % 64))) != 0;
+  }
+  inline static void *get_visited(Context *c, id_t id) {
+    return id < c->h.max_doc_cnt ? &c->bits[id / 64] : nullptr;
+  }
+  inline static int set_max_scan_num(Context *c, uint64_t count) {
+    c->h.max_scan_num = count;
+    return 0;
+  }
+  inline static void clear(Context *c) {
+    if (++c->generation == 0) {
+      std::fill(c->generations.begin(), c->generations.end(), 0);
+      c->generation = 1;
+    }
+  }
+  template <class... T>
+  static int init(Context *, void **out, uint64_t count, uint64_t scans,
+                  std::tuple<T...> &&) {
+    auto c = std::unique_ptr<Context>(new (std::nothrow) Context);
+    if (!c || !reset(c.get(), count, scans)) return IndexError_NoMemory;
+    *out = c.release();
+    return 0;
+  }
+  inline static void destroy(Context *c) {
+    delete c;
+  }
+};
+
 
 #define PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(cls, impl, ctx, ...) \
   case cls::mode:                                                 \
@@ -353,6 +421,8 @@ class VisitByteMap {
     PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(VisitBitMap, impl, ctx_,      \
                                          ##__VA_ARGS__)                \
     PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(VisitByteMap, impl, ctx_,     \
+                                         ##__VA_ARGS__)                \
+    PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(VisitEpochBitMap, impl, ctx_, \
                                          ##__VA_ARGS__)                \
   }
 
@@ -398,7 +468,8 @@ class VisitFilter {
     Default = 0,
     BloomFilter = VisitBloomFilter::mode,
     BitMap = VisitBitMap::mode,
-    ByteMap = VisitByteMap::mode
+    ByteMap = VisitByteMap::mode,
+    EpochBitMap = VisitEpochBitMap::mode
   };
 
   VisitFilter() : mode_(0), ctx_(nullptr) {};
@@ -454,6 +525,10 @@ class VisitFilter {
       case ByteMap:
         VisitByteMap::destroy(static_cast<VisitByteMap::Context *>(ctx));
         return;
+      case EpochBitMap:
+        VisitEpochBitMap::destroy(
+            static_cast<VisitEpochBitMap::Context *>(ctx));
+        return;
       default:
         return;
     }
@@ -479,6 +554,11 @@ class VisitFilter {
         ret = VisitByteMap::init(static_cast<VisitByteMap::Context *>(nullptr),
                                  &ctx_, max_doc_cnt, max_scan_num,
                                  std::make_tuple(negative_probability));
+        break;
+      case EpochBitMap:
+        ret = VisitEpochBitMap::init(
+            static_cast<VisitEpochBitMap::Context *>(nullptr), &ctx_,
+            max_doc_cnt, max_scan_num, std::make_tuple(negative_probability));
         break;
       default:
         // Preserve the existing contract for an unsupported mode: context
@@ -526,6 +606,10 @@ bool dispatch_visit_filter(VisitFilter &visit_filter, Fn &&fn) {
     case VisitByteMap::mode:
       std::forward<Fn>(fn)(VisitFilterView<VisitByteMap>(
           static_cast<VisitByteMap::Context *>(visit_filter.ctx_)));
+      return true;
+    case VisitEpochBitMap::mode:
+      std::forward<Fn>(fn)(VisitFilterView<VisitEpochBitMap>(
+          static_cast<VisitEpochBitMap::Context *>(visit_filter.ctx_)));
       return true;
     default:
       return false;

@@ -25,6 +25,41 @@ namespace {
 using zvec::turbo::CpuArchType;
 using zvec::turbo::RotateType;
 
+TEST(OpqRotator, StreamedPairsMatchDenseFitAndPropagateReadFailure) {
+  constexpr size_t kDim = 8, kRows = 2057;
+  std::vector<float> x(kRows * kDim), reconstruction(x.size());
+  for (size_t i = 0; i < x.size(); ++i) {
+    x[i] = std::sin(float(i) * 0.017f);
+    reconstruction[i] = std::cos(float(i * 7) * 0.013f);
+  }
+  auto dense = zvec::turbo::OpqRotator::create(kDim);
+  auto paged = zvec::turbo::OpqRotator::create(kDim);
+  ASSERT_EQ(dense->fit(x.data(), reconstruction.data(), kRows), 0);
+  size_t reads = 0;
+  ASSERT_EQ(
+      paged->fit_rows(kRows,
+                      [&](size_t first, size_t count, float *a, float *b) {
+                        EXPECT_LE(count, 1024u);
+                        ++reads;
+                        std::memcpy(a, x.data() + first * kDim,
+                                    count * kDim * sizeof(float));
+                        std::memcpy(b, reconstruction.data() + first * kDim,
+                                    count * kDim * sizeof(float));
+                        return 0;
+                      }),
+      0);
+  EXPECT_EQ(reads, 3u);
+  std::string expected, actual;
+  ASSERT_EQ(dense->serialize(&expected), 0);
+  ASSERT_EQ(paged->serialize(&actual), 0);
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(paged->fit_rows(
+                kRows, [](size_t, size_t, float *, float *) { return -123; }),
+            -123);
+  ASSERT_EQ(paged->serialize(&actual), 0);
+  EXPECT_EQ(actual, expected);
+}
+
 TEST(OpqRotator, FromSerializedRestoresStoredMatrix) {
   zvec::turbo::RotatorSerHeader header{};
   header.magic = zvec::turbo::kRotatorMagic;

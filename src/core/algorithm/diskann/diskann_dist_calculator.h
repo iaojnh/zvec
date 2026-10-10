@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_context.h>
@@ -121,11 +122,14 @@ class DistCalculator {
     return dist(vec);
   }
 
-  inline void bind_quantizer(const turbo::Quantizer *quantizer,
-                             const uint8_t *codes, uint32_t code_size) {
+  inline void bind_quantizer(
+      const turbo::Quantizer *quantizer, const uint8_t *codes,
+      uint32_t code_size,
+      IndexStorage::Segment::Pointer paged_codes = nullptr) {
     quantizer_ = quantizer;
     quant_codes_ = codes;
     quant_code_size_ = code_size;
+    paged_quant_codes_ = std::move(paged_codes);
   }
 
   void quantize_query(const void *query_rotated) {
@@ -135,13 +139,52 @@ class DistCalculator {
         quantizer_->distance(quant_query_scratch_.data(), IndexQueryMeta());
   }
 
-  void quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) {
+  void quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) try {
+    auto release =
+        ailego::ScopeGuard::Make([&]() { quant_code_blocks_.clear(); });
     quant_dp_list_.resize(n);
+    if (paged_quant_codes_) {
+      quant_code_blocks_.resize(n);
+      quant_code_reads_.clear();
+      quant_code_reads_.reserve(n);
+    }
     for (uint32_t i = 0; i < n; ++i) {
-      quant_dp_list_[i] =
-          quant_codes_ + static_cast<size_t>(ids[i]) * quant_code_size_;
+      if (ids[i] >= entity_->doc_cnt()) {
+        error_code_ = IndexError_InvalidFormat;
+        return;
+      }
+      const size_t offset = static_cast<size_t>(ids[i]) * quant_code_size_;
+      if (paged_quant_codes_) {
+        quant_code_reads_.emplace_back(paged_quant_codes_.get(), offset,
+                                       quant_code_size_,
+                                       &quant_code_blocks_[i]);
+      } else {
+        if (!quant_codes_) {
+          error_code_ = IndexError_NoReady;
+          return;
+        }
+        quant_dp_list_[i] = quant_codes_ + offset;
+      }
+    }
+    if (paged_quant_codes_) {
+      if (!paged_quant_codes_->read_borrowed_batch(quant_code_reads_.data(),
+                                                   n)) {
+        error_code_ = IndexError_ReadData;
+        return;
+      }
+      for (size_t i = 0; i < n; ++i) {
+        quant_dp_list_[i] = quant_code_blocks_[i].data();
+        if (!quant_dp_list_[i]) {
+          error_code_ = IndexError_ReadData;
+          return;
+        }
+      }
     }
     quant_dist_impl_.batch(quant_dp_list_.data(), n, dists);
+  } catch (const std::bad_alloc &) {
+    error_code_ = IndexError_NoMemory;
+  } catch (const std::exception &) {
+    error_code_ = IndexError_ReadData;
   }
 
   inline void clear() {
@@ -249,12 +292,15 @@ class DistCalculator {
 
   const turbo::Quantizer *quantizer_{nullptr};
   const uint8_t *quant_codes_{nullptr};
+  IndexStorage::Segment::Pointer paged_quant_codes_;
   uint32_t quant_code_size_{0};
 
   turbo::DistanceImpl quant_dist_impl_{};
 
   std::vector<const void *> quant_dp_list_;
   std::vector<uint8_t> quant_query_scratch_;
+  std::vector<IndexStorage::MemoryBlock> quant_code_blocks_;
+  std::vector<IndexStorage::Segment::BorrowedRead> quant_code_reads_;
 };
 
 }  // namespace core

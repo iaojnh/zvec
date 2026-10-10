@@ -17,6 +17,8 @@
 #include <cstring>
 #include <limits>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include "ailego/pattern/defer.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_memory.h"
@@ -90,8 +92,33 @@ class ObservedBuildInput : public IndexHolder, public OrdinalAccessHolder {
   IndexHolder::Pointer input_;
 };
 
-TEST(IvfRabitqBuildMemoryTest,
-     BorrowedRowsPropagateErrorsAndSurviveSourceRelease) {
+class IvfRabitqBuildMemoryTest : public ::testing::TestWithParam<bool> {
+ protected:
+  void SetUp() override {
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    previous_capacity_ = pool.capacity();
+    ASSERT_EQ(pool.used(), 0u);
+    ASSERT_EQ(
+        pool.init(
+            GetParam()
+                ? 2 * ailego::VecBufferPool::metadata_bytes_for_page_count(
+                          4096, true) +
+                      64 * 1024
+                : 0),
+        0);
+  }
+  void TearDown() override {
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    EXPECT_EQ(pool.used(), 0u);
+    EXPECT_EQ(pool.init(previous_capacity_), 0);
+  }
+
+ private:
+  size_t previous_capacity_{0};
+};
+
+TEST_P(IvfRabitqBuildMemoryTest,
+       BorrowedRowsPropagateErrorsAndSurviveSourceRelease) {
   constexpr size_t kDim = 128;
   constexpr size_t kCount = 259;
   auto holder =
@@ -155,6 +182,9 @@ TEST(IvfRabitqBuildMemoryTest,
   }
   EXPECT_EQ(builder.cleanup(), 0);
 }
+
+INSTANTIATE_TEST_SUITE_P(StorageModes, IvfRabitqBuildMemoryTest,
+                         ::testing::Bool());
 
 }  // namespace
 }  // namespace zvec::core

@@ -54,8 +54,11 @@ const DiskAnnEntity::Pointer DiskAnnSearcherEntity::clone() const {
   entity->meta_ = meta_;
   entity->legacy_pq_layout_ = legacy_pq_layout_;
   entity->pq_codes_ = pq_codes_;
+  if (!pq_codes_) entity->pq_data_segment_ = pq_data_segment_;
   entity->key_buffer_ = key_buffer_;
   entity->key_mapping_buffer_ = key_mapping_buffer_;
+  if (!key_buffer_) entity->key_segment_ = key_segment_;
+  if (!key_mapping_buffer_) entity->key_mapping_segment_ = key_mapping_segment_;
   entity->entrypoints_ = entrypoints_;
 
   return DiskAnnEntity::Pointer(entity.release());
@@ -166,6 +169,12 @@ int DiskAnnSearcherEntity::load_pq_segment() {
   }
 
   size_t code_bytes = meta_header_.doc_cnt * pq_meta_.chunk_num;
+  if (pq_data_segment_->data_size() < code_bytes)
+    return IndexError_InvalidFormat;
+  if (storage_->vec_buffer_pool()) {
+    pq_codes_.reset();
+    return 0;
+  }
 
   try {
     auto pq_codes = std::make_shared<std::string>(code_bytes, '\0');
@@ -249,6 +258,11 @@ int DiskAnnSearcherEntity::load_key_segment() {
   }
 
   size_t key_data_len = doc_cnt() * sizeof(diskann_key_t);
+  if (key_segment_->data_size() < key_data_len) return IndexError_InvalidFormat;
+  if (storage_->vec_buffer_pool()) {
+    key_buffer_.reset();
+    return 0;
+  }
 
   const void *data = nullptr;
   if (key_segment_->read(0, reinterpret_cast<const void **>(&data),
@@ -315,6 +329,12 @@ int DiskAnnSearcherEntity::load_key_mapping_segment() {
   }
 
   size_t key_mapping_data_len = doc_cnt() * sizeof(diskann_id_t);
+  if (key_mapping_segment_->data_size() < key_mapping_data_len)
+    return IndexError_InvalidFormat;
+  if (storage_->vec_buffer_pool()) {
+    key_mapping_buffer_.reset();
+    return 0;
+  }
 
   const void *data = nullptr;
   if (key_mapping_segment_->read(0, reinterpret_cast<const void **>(&data),
@@ -339,11 +359,14 @@ int DiskAnnSearcherEntity::load_key_mapping_segment() {
 
 //! Get vector local id by key
 diskann_id_t DiskAnnSearcherEntity::get_id(diskann_key_t key) const {
-  const diskann_id_t *key_mapping_data_ptr =
-      reinterpret_cast<const diskann_id_t *>(key_mapping_buffer_->data());
+  diskann_id_t id = kInvalidId;
+  return find_id(key, &id) == 0 ? id : kInvalidId;
+}
 
-  const diskann_key_t *key_data_ptr =
-      reinterpret_cast<const diskann_key_t *>(key_buffer_->data());
+int DiskAnnSearcherEntity::find_id(diskann_key_t key, diskann_id_t *id) const
+    try {
+  if (!id) return IndexError_InvalidArgument;
+  *id = kInvalidId;
 
   //! Do binary search
   diskann_id_t start = 0UL;
@@ -351,27 +374,65 @@ diskann_id_t DiskAnnSearcherEntity::get_id(diskann_key_t key) const {
   diskann_id_t idx = 0u;
   while (start < end) {
     idx = start + (end - start) / 2;
-    diskann_id_t local_id = key_mapping_data_ptr[idx];
-
-    const diskann_key_t local_key = key_data_ptr[local_id];
+    diskann_id_t local_id;
+    if (key_mapping_buffer_) {
+      std::memcpy(&local_id,
+                  key_mapping_buffer_->data() + idx * sizeof(local_id),
+                  sizeof(local_id));
+    } else {
+      IndexStorage::MemoryBlock block;
+      if (!key_mapping_segment_ ||
+          key_mapping_segment_->read(idx * sizeof(local_id), block,
+                                     sizeof(local_id)) != sizeof(local_id) ||
+          !block.data())
+        return IndexError_ReadData;
+      std::memcpy(&local_id, block.data(), sizeof(local_id));
+    }
+    diskann_key_t local_key;
+    int ret = read_key(local_id, &local_key);
+    if (ret != 0) return ret;
 
     if (local_key < key) {
       start = idx + 1;
     } else if (local_key > key) {
       end = idx;
     } else {
-      return local_id;
+      *id = local_id;
+      return 0;
     }
   }
 
-  return kInvalidId;
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_ReadData;
 }
 
 diskann_key_t DiskAnnSearcherEntity::get_key(diskann_id_t id) const {
-  const diskann_key_t *key_data_ptr =
-      reinterpret_cast<const diskann_key_t *>(key_buffer_->data());
+  diskann_key_t key = kInvalidKey;
+  return read_key(id, &key) == 0 ? key : kInvalidKey;
+}
 
-  return key_data_ptr[id];
+int DiskAnnSearcherEntity::read_key(diskann_id_t id, diskann_key_t *key) const
+    try {
+  if (!key || id >= doc_cnt()) return IndexError_InvalidArgument;
+  const size_t offset = static_cast<size_t>(id) * sizeof(*key);
+  if (key_buffer_) {
+    std::memcpy(key, key_buffer_->data() + offset, sizeof(*key));
+  } else {
+    IndexStorage::MemoryBlock block;
+    if (!key_segment_ ||
+        key_segment_->read(offset, block, sizeof(*key)) != sizeof(*key) ||
+        !block.data())
+      return IndexError_ReadData;
+    std::memcpy(key, block.data(), sizeof(*key));
+  }
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_ReadData;
 }
 
 }  // namespace core

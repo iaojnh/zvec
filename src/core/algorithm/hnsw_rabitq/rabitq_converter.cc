@@ -17,12 +17,16 @@
 #include <limits>
 #include <memory>
 #include <rabitqlib/utils/rotator.hpp>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include "ailego/pattern/defer.h"
+#include "algorithm/cluster/cluster_params.h"
 #include "algorithm/cluster/holder_cluster.h"
 #include "algorithm/hnsw_rabitq/rabitq_reformer.h"
+#include "utility/reservoir_sample_holder.h"
+#include "utility/temporary_buffer_storage.h"
 #include "zvec/core/framework/index_cluster.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/framework/index_factory.h"
@@ -198,6 +202,13 @@ int RabitqConverter::train(IndexHolder::Pointer holder,
       "Initializing KmeansCluster with meta: dim=%u, data_type=%d, metric=%s",
       meta_.dimension(), (int)meta_.data_type(), meta_.metric_name().c_str());
   ailego::Params cluster_params;
+  if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+    std::string prefix;
+    int status =
+        TemporaryBufferStorage::DefaultPrefix("zvec-rabitq-train", &prefix);
+    if (status != 0) return status;
+    cluster_params.set(OPTKMEANS_CLUSTER_BUFFERED_STORAGE_PATH, prefix);
+  }
   int ret = cluster->init(meta_, cluster_params);
   if (ret != 0) {
     LOG_ERROR("Failed to initialize KmeansCluster: %d", ret);
@@ -221,23 +232,34 @@ int RabitqConverter::train(IndexHolder::Pointer holder,
     if (streaming) ret = streaming->cluster_holder(threads, holder, cents);
   }
   if (ret == IndexError_NotImplemented) {
-    auto sampler = std::make_shared<SampleIndexFeatures<CompactIndexFeatures>>(
-        meta_, sample_count);
-    auto iter = holder->create_iterator();
-    if (!iter) return IndexError_Runtime;
-    for (; iter->is_valid(); iter->next()) {
+    if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+      IndexHolder::Pointer sampled;
+      ret = CreateReservoirSampleHolder(holder, sample_count, &sampled);
+      if (ret != 0) return ret;
+      trained_count = sampled->count();
+      auto *streaming = dynamic_cast<HolderCluster *>(cluster.get());
+      if (!streaming) return IndexError_NotImplemented;
+      ret = streaming->cluster_holder(threads, sampled, cents);
+    } else {
+      auto sampler =
+          std::make_shared<SampleIndexFeatures<CompactIndexFeatures>>(
+              meta_, sample_count);
+      auto iter = holder->create_iterator();
+      if (!iter) return IndexError_Runtime;
+      for (; iter->is_valid(); iter->next()) {
+        if (iter->status() != 0) return iter->status();
+        const void *data = iter->data();
+        if (iter->status() != 0) return iter->status();
+        if (!data) return IndexError_ReadData;
+        sampler->emplace(data);
+      }
       if (iter->status() != 0) return iter->status();
-      const void *data = iter->data();
-      if (iter->status() != 0) return iter->status();
-      if (!data) return IndexError_ReadData;
-      sampler->emplace(data);
+      trained_count = sampler->count();
+      if (trained_count == 0) return IndexError_InvalidLength;
+      ret = cluster->mount(sampler);
+      if (ret != 0) return ret;
+      ret = cluster->cluster(threads, cents);
     }
-    if (iter->status() != 0) return iter->status();
-    trained_count = sampler->count();
-    if (trained_count == 0) return IndexError_InvalidLength;
-    ret = cluster->mount(sampler);
-    if (ret != 0) return ret;
-    ret = cluster->cluster(threads, cents);
   }
   if (ret != 0) {
     LOG_ERROR("Failed to perform clustering: %d", ret);

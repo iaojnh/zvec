@@ -60,6 +60,11 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
                      : nullptr;
   }
 
+  // Buffer-backed queries keep only the current neighbor batch in scratch.
+  SegmentPointer paged_pq_codes() const {
+    return pq_codes_ ? nullptr : pq_data_segment_;
+  }
+
   IndexStorage::Pointer get_storage() {
     return storage_;
   }
@@ -74,6 +79,8 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
 
   diskann_id_t get_id(diskann_key_t key) const override;
   diskann_key_t get_key(diskann_id_t id) const override;
+  int read_key(diskann_id_t id, diskann_key_t *key) const override;
+  int find_id(diskann_key_t key, diskann_id_t *id) const override;
 
  private:
   IndexStorage::Pointer storage_{};

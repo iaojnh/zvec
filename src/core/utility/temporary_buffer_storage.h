@@ -37,6 +37,15 @@ class TemporaryBufferStorage {
   TemporaryBufferStorage(const TemporaryBufferStorage &) = delete;
   TemporaryBufferStorage &operator=(const TemporaryBufferStorage &) = delete;
 
+  static int DefaultPrefix(const std::string &name, std::string *out) {
+    if (!out) return IndexError_InvalidArgument;
+    std::error_code error;
+    auto directory = std::filesystem::temp_directory_path(error);
+    if (error) return IndexError_OpenFile;
+    *out = ailego::FileHelper::PathToUtf8(directory / name);
+    return 0;
+  }
+
   static int Create(const std::string &prefix, size_t bytes, Pointer *out) {
     if (!out || prefix.empty() || bytes == 0 ||
         bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {

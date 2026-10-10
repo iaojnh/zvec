@@ -18,6 +18,7 @@
 #include <zvec/core/interface/index.h>
 #include "zvec/ailego/io/file.h"
 #include "zvec/core/framework/index_error.h"
+#include "buffered_input.h"
 #include "holder_builder.h"
 
 #if RABITQ_SUPPORTED
@@ -25,6 +26,7 @@
 #include "algorithm/hnsw_rabitq/rabitq_params.h"
 #include "algorithm/ivf_rabitq/ivf_rabitq_params.h"
 #include "algorithm/ivf_rabitq/ivf_rabitq_streamer.h"
+#include "utility/utility_params.h"
 #endif
 
 namespace zvec::core_interface {
@@ -107,16 +109,21 @@ int IVFRabitqIndex::open(const std::string &file_path,
   file_path_ = file_path;
   is_read_only_ = storage_options.read_only;
 
-  // Use MMapFileReadStorage (consistent with IVFIndex, read-only after builder
-  // dump)
-  storage_ = core::IndexFactory::CreateStorage("MMapFileReadStorage");
+  const bool buffered =
+      storage_options.type == StorageOptions::StorageType::kBufferPool;
+  if (!buffered && storage_options.type != StorageOptions::StorageType::kMMAP)
+    return core::IndexError_Unsupported;
+  storage_params.set(core::BUFFER_READ_STORAGE_WARMUP_MODE,
+                     core::BUFFER_READ_STORAGE_WARMUP_NONE);
+  storage_ = core::IndexFactory::CreateStorage(
+      buffered ? "BufferReadStorage" : "MMapFileReadStorage");
   if (storage_ == nullptr) {
-    LOG_ERROR("Failed to create MMapFileReadStorage");
+    LOG_ERROR("Failed to create IVF RaBitQ storage");
     return core::IndexError_Runtime;
   }
   int ret = storage_->init(storage_params);
   if (ret != 0) {
-    LOG_ERROR("Failed to init MMapFileReadStorage, path: %s, err: %s",
+    LOG_ERROR("Failed to init IVF RaBitQ storage, path: %s, err: %s",
               file_path_.c_str(), core::IndexError::What(ret));
     return ret;
   }
@@ -135,6 +142,11 @@ int IVFRabitqIndex::open(const std::string &file_path,
     is_trained_ = true;
   }
   is_open_ = true;
+  if (storage_options.create_new && !is_read_only_ &&
+      storage_options.type == StorageOptions::StorageType::kBufferPool) {
+    buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
+                                                      file_path_ + ".input");
+  }
   return 0;
 #endif  // RABITQ_SUPPORTED
 }
@@ -144,8 +156,22 @@ int IVFRabitqIndex::generate_holder() {
   LOG_ERROR("RaBitQ is not supported on this platform (Linux x86_64 only)");
   return core::IndexError_Unsupported;
 #else
-  return BuildMultiPassHolder(param_.data_type, param_.dimension, doc_cache_,
-                              converter_, &holder_);
+  core::IndexHolder::Pointer input;
+  if (buffered_input_) {
+    int ret = buffered_input_->prepare();
+    if (ret != 0) return ret;
+    input = buffered_input_;
+  } else {
+    input = std::make_shared<DocCacheHolder>(input_vector_meta_, doc_cache_);
+  }
+  if (converter_) {
+    int ret = core::IndexConverter::TrainAndTransform(converter_, input);
+    if (ret != 0) return ret;
+    input = converter_->result();
+    if (!input) return core::IndexError_Runtime;
+  }
+  holder_ = std::move(input);
+  return 0;
 #endif  // RABITQ_SUPPORTED
 }
 
@@ -156,7 +182,8 @@ int IVFRabitqIndex::add(const VectorData &vector, uint32_t doc_id) {
   LOG_ERROR("RaBitQ is not supported on this platform (Linux x86_64 only)");
   return core::IndexError_Unsupported;
 #else
-  if (is_trained_) {
+  if (!is_open_ || is_read_only_) return core::IndexError_NoReady;
+  if (is_trained_ || build_stage_ != BuildStage::kCollecting) {
     LOG_ERROR("this IVF RaBitQ index is trained");
     return core::IndexError_Runtime;
   }
@@ -165,17 +192,18 @@ int IVFRabitqIndex::add(const VectorData &vector, uint32_t doc_id) {
     return core::IndexError_Runtime;
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector.vector);
+  if (!dense_vector.data) return core::IndexError_InvalidArgument;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (buffered_input_) return buffered_input_->add(doc_id, dense_vector.data);
   std::string out_vector_buffer = std::string(
       static_cast<const char *>(dense_vector.data),
       input_vector_meta_.dimension() * input_vector_meta_.unit_size());
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  while (doc_cache_.size() <= doc_id) {
-    std::string fake_data(
-        input_vector_meta_.dimension() * input_vector_meta_.unit_size(), 0);
-    doc_cache_.push_back(std::make_pair(kInvalidKey, fake_data));
+  if (doc_cache_->size() <= doc_id) {
+    doc_cache_->resize(static_cast<size_t>(doc_id) + 1,
+                       std::make_pair(kInvalidKey, std::string{}));
   }
-  doc_cache_[doc_id] = std::make_pair(doc_id, out_vector_buffer);
+  (*doc_cache_)[doc_id] = std::make_pair(doc_id, std::move(out_vector_buffer));
   return 0;
 #endif  // RABITQ_SUPPORTED
 }
@@ -185,43 +213,51 @@ int IVFRabitqIndex::train() {
   LOG_ERROR("RaBitQ is not supported on this platform (Linux x86_64 only)");
   return core::IndexError_Unsupported;
 #else
-  int ret = generate_holder();
-  if (ret != 0) {
-    LOG_ERROR("Failed to generate holder");
-    return core::IndexError_Runtime;
-  }
-
-  // Train centroids + rotator
-  ret = builder_->train(holder_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to train IVF RaBitQ index, ret=%d", ret);
-    return core::IndexError_Runtime;
+  if (is_trained_) return 0;
+  if (!is_open_ || is_read_only_) return core::IndexError_NoReady;
+  int ret = 0;
+  if (build_stage_ == BuildStage::kCollecting) {
+    ret = generate_holder();
+    if (ret != 0) return ret;
+    ret = builder_->train(holder_);
+    if (ret != 0) return ret;
+    build_stage_ = BuildStage::kTrained;
   }
 
   // Build index (assign vectors to centroids, quantize)
-  ret = builder_->build(holder_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to build IVF RaBitQ index, ret=%d", ret);
-    return core::IndexError_Runtime;
+  if (build_stage_ == BuildStage::kTrained) {
+    ret = builder_->build(holder_);
+    if (ret != 0) return ret;
+    build_stage_ = BuildStage::kBuilt;
+    holder_.reset();
+    buffered_input_.reset();
+    doc_cache_.reset();
+    converter_.reset();
   }
 
   // Dump to file
-  auto dumper = core::IndexFactory::CreateDumper("FileDumper");
-  if (!dumper) {
-    LOG_ERROR("Failed to create FileDumper");
-    return core::IndexError_Runtime;
+  if (build_stage_ == BuildStage::kBuilt) {
+    auto dumper = core::IndexFactory::CreateDumper("FileDumper");
+    if (!dumper) {
+      LOG_ERROR("Failed to create FileDumper");
+      return core::IndexError_Runtime;
+    }
+    ret = dumper->create(file_path_);
+    if (ret != 0) {
+      LOG_ERROR("Failed to create dumper at path: %s", file_path_.c_str());
+      return core::IndexError_Runtime;
+    }
+    ret = builder_->dump(dumper);
+    if (ret != 0) {
+      LOG_ERROR("Failed to dump IVF RaBitQ index, ret=%d", ret);
+      return core::IndexError_Runtime;
+    }
+    ret = dumper->close();
+    if (ret != 0) return ret;
+    build_stage_ = BuildStage::kDumped;
+    // dump() succeeded; a failed reopen only needs the persisted output.
+    builder_->cleanup();
   }
-  ret = dumper->create(file_path_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to create dumper at path: %s", file_path_.c_str());
-    return core::IndexError_Runtime;
-  }
-  ret = builder_->dump(dumper);
-  if (ret != 0) {
-    LOG_ERROR("Failed to dump IVF RaBitQ index, ret=%d", ret);
-    return core::IndexError_Runtime;
-  }
-  dumper->close();
 
   // Reopen storage + streamer
   ret = storage_->open(file_path_, false);
@@ -275,6 +311,13 @@ int IVFRabitqIndex::merge(const std::vector<Index::Pointer> &indexes,
     LOG_ERROR("Failed to close dumper at path: %s", file_path_.c_str());
     return core::IndexError_Runtime;
   }
+
+  // Only the persisted output is needed by the reader after a successful dump.
+  builder_->cleanup();
+  holder_.reset();
+  buffered_input_.reset();
+  doc_cache_.reset();
+  build_stage_ = BuildStage::kDumped;
 
   ret = storage_->open(file_path_, false);
   if (ret != 0) {

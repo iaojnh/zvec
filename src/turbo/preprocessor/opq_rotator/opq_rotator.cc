@@ -102,6 +102,27 @@ int OpqRotator::fit(const float *x, const float *x_hat, size_t num) {
   return 0;
 }
 
+int OpqRotator::fit_rows(size_t num, const ReadPairs &read) {
+  if (!read || num == 0 || dim_ <= 0) return kErrInvalidArgument;
+  const Eigen::Index dim = static_cast<Eigen::Index>(dim_);
+  const size_t tile = std::min<size_t>(num, kAccumBlockRows);
+  std::vector<float> x(tile * dim_), x_hat(x.size());
+  Eigen::MatrixXd m = Eigen::MatrixXd::Zero(dim, dim);
+  for (size_t first = 0; first < num; first += tile) {
+    const size_t count = std::min(tile, num - first);
+    int ret = read(first, count, x.data(), x_hat.data());
+    if (ret != 0) return ret;
+    ConstRowMajorMap xb(x.data(), count, dim);
+    ConstRowMajorMap xhb(x_hat.data(), count, dim);
+    m.noalias() += xb.cast<double>().transpose() * xhb.cast<double>();
+  }
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(
+      m, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  const Eigen::MatrixXd r = svd.matrixV() * svd.matrixU().transpose();
+  RowMajorMap(matrix_.data(), dim, dim) = r.cast<float>();
+  return 0;
+}
+
 void OpqRotator::train(const void * /*data*/, size_t /*num*/,
                        size_t /*stride*/) {
   // OPQ needs (x, x_hat) pairs, see the two-input train() overload.

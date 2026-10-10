@@ -240,6 +240,61 @@ TEST_F(IVFBufferedBuildTest, MmapLeavesBufferedTrainingDisabled) {
   ASSERT_EQ(index->close(), 0);
 }
 
+TEST_F(IVFBufferedBuildTest, ExternalLabelSortPreservesOriginalVectorOrder) {
+  // More than 4096 records force an external merge of the bucket ordinals.
+  static constexpr uint32_t kRows = 4099;
+  static constexpr uint32_t kDim = 8;
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(pool.init(4 * writable_metadata_ + 128 * 1024), 0);
+  for (auto quantizer : {QuantizerType::kNone, QuantizerType::kFP16}) {
+    auto param = IVFIndexParamBuilder()
+                     .with_dimension(kDim)
+                     .with_metric_type(MetricType::kL2sq)
+                     .with_data_type(DataType::DT_FP32)
+                     .with_quantizer_param(QuantizerParam(quantizer))
+                     .with_n_list(8)
+                     .with_n_iters(2)
+                     .build();
+    auto inspected = std::make_shared<InspectableBufferedIVF>();
+    ASSERT_EQ(inspected->initialize(*param), 0);
+    Index::Pointer index = inspected;
+    inspected.reset();
+    const auto path = (directory_ / "external-labels").string();
+    ASSERT_EQ(
+        index->open(path, {StorageOptions::StorageType::kBufferPool, true}), 0);
+    for (uint32_t i = 0; i < kRows; ++i) {
+      float row[kDim];
+      for (uint32_t d = 0; d < kDim; ++d)
+        row[d] = float((i * 17 + d * 31) % 1009) / 1024.0f;
+      ASSERT_EQ(index->add(VectorData{DenseVector{row}}, kRows - i), 0);
+    }
+    ASSERT_EQ(index->train(), 0);
+    EXPECT_LE(pool.used(), pool.capacity());
+    ASSERT_EQ(index->close(), 0);
+    index.reset();
+    for (auto mode : {StorageOptions::StorageType::kMMAP,
+                      StorageOptions::StorageType::kBufferPool}) {
+      auto reopened = IndexFactory::CreateAndInitIndex(*param);
+      ASSERT_EQ(reopened->open(path, {mode, false, true}), 0);
+      for (uint32_t i = 0; i < kRows; ++i) {
+        VectorDataBuffer result;
+        ASSERT_EQ(reopened->fetch(kRows - i, &result), 0);
+        const auto &bytes =
+            std::get<DenseVectorBuffer>(result.vector_buffer).data;
+        ASSERT_EQ(bytes.size(), kDim * sizeof(float));
+        for (uint32_t d = 0; d < kDim; ++d) {
+          float value = 0;
+          std::memcpy(&value, bytes.data() + d * sizeof(float), sizeof(value));
+          EXPECT_FLOAT_EQ(value, float((i * 17 + d * 31) % 1009) / 1024.0f);
+        }
+      }
+      ASSERT_EQ(reopened->close(), 0);
+    }
+    ASSERT_TRUE(std::filesystem::remove(path));
+    EXPECT_EQ(pool.used(), 0u);
+  }
+}
+
 TEST_F(IVFBufferedBuildTest, FailedDumpPreservesInputForFetchAndRetry) {
   auto param = IVFIndexParamBuilder()
                    .with_dimension(kDimension)

@@ -317,7 +317,7 @@ int PqFastQuantizer::train(IndexHolder::Pointer holder, int thread_count) {
     }
   }
 
-  opq_.train(
+  const int opq_status = opq_.train(
       all_data.data(), num, "PqFastQuantizer",
       [&](uint32_t max_iters) {
         train_all_chunks(all_data.data(), num, data_stride, max_iters,
@@ -326,7 +326,13 @@ int PqFastQuantizer::train(IndexHolder::Pointer holder, int thread_count) {
       },
       [this](const float *rotated, size_t count, float *x_hat) {
         return encode_reconstruct_batch(rotated, count, x_hat);
+      },
+      [this](const float *rotated, size_t count, float *x_hat) {
+        double error = 0.0;
+        encode_reconstruct_batch(rotated, count, x_hat, &error);
+        return error;
       });
+  if (opq_status != 0) return opq_status;
 
   train_all_chunks(all_data.data(), num, data_stride, kMaxKmeansIters,
                    thread_count);
@@ -381,11 +387,11 @@ void PqFastQuantizer::train_all_chunks(const void *data, size_t num,
 }
 
 float PqFastQuantizer::encode_reconstruct_batch(const float *rotated,
-                                                size_t num,
-                                                float *x_hat) const {
+                                                size_t num, float *x_hat,
+                                                double *sum_error) const {
   return pq_reconstruct_batch<kNumCentroids>(
       rotated, num, original_dim_, centroid_ptrs_cache_, l2_batch_fn_,
-      [this](size_t) { return sub_dim_; }, x_hat);
+      [this](size_t) { return sub_dim_; }, x_hat, sum_error);
 }
 
 // ---------------------------------------------------------------------------

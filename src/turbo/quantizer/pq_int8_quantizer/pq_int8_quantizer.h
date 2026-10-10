@@ -160,6 +160,9 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   void train_all_chunks(const void *data, size_t num, size_t stride,
                         uint32_t max_iters);
 
+  template <class T>
+  int train_buffered(const IndexHolder::Pointer &holder, size_t num);
+
   //! Encode \p rotated with the current codebook and write the reconstruction
   //! back into \p x_hat (num * original_dim floats, rotated space).  Returns
   //! the mean squared reconstruction error per vector.  fp32-only, used by the

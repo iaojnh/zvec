@@ -347,10 +347,15 @@ class DiskAnnContext : public IndexContext,
 
   void emplace_result_doc(IndexDocumentList &docs, diskann_id_t id, float score,
                           const VectorInfo &info) {
+    diskann_key_t key;
+    if (entity_->read_key(id, &key) != 0) {
+      set_error(true);
+      return;
+    }
     if (fetch_vector_) {
-      docs.emplace_back(entity_->get_key(id), score, id, info.vec_);
+      docs.emplace_back(key, score, id, info.vec_);
     } else {
-      docs.emplace_back(entity_->get_key(id), score, id);
+      docs.emplace_back(key, score, id);
     }
   }
 
@@ -398,7 +403,7 @@ class DiskAnnContext : public IndexContext,
   std::vector<float> occlude_factor_;
 
   VisitFilter visit_filter_{};
-  uint32_t filter_mode_{VisitFilter::ByteMap};
+  uint32_t filter_mode_{VisitFilter::EpochBitMap};
   float negative_probility_{DiskAnnEntity::kDefaultBFNegativeProbility};
 };
 

@@ -44,6 +44,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
 
   diskann_id_t get_id(diskann_key_t key) const override;
   diskann_key_t get_key(diskann_id_t id) const override;
+  int read_key(diskann_id_t id, diskann_key_t *key) const override;
   const void *get_vector(diskann_id_t id) const override;
   int read_vector(diskann_id_t id,
                   IndexStorage::MemoryBlock &block) const override;

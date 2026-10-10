@@ -18,6 +18,7 @@
 #include <vector>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_meta.h>
+#include "utility/paged_build_buffer.h"
 #include "ivf_rabitq_index_format.h"
 
 namespace zvec {
@@ -79,13 +80,13 @@ class IvfRabitqBuilder : public IndexBuilder {
   std::shared_ptr<RabitqConverter> converter_;
   std::shared_ptr<IvfRabitqReformer> reformer_;
 
-  // Build results (stored in memory until dump)
+  // Large build results are pageable until dump when a pool is configured.
   IvfRabitqHeader header_{};
-  std::vector<char> batch_data_buf_;
-  std::vector<char> ex_data_buf_;
+  PagedBuildBuffer batch_data_buf_;
+  PagedBuildBuffer ex_data_buf_;
   std::vector<IvfRabitqClusterMeta> cluster_metas_;
-  std::vector<uint64_t> keys_buf_;
-  std::vector<uint32_t> mapping_buf_;
+  PagedBuildBuffer keys_buf_;
+  PagedBuildBuffer mapping_buf_;
 };
 
 }  // namespace core

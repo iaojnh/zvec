@@ -34,6 +34,7 @@ class PqOpq {
   using TrainCodebook = std::function<void(uint32_t max_iters)>;
   using Reconstruct =
       std::function<float(const float *rotated, size_t num, float *x_hat)>;
+  using ReconstructSum = std::function<double(const float *, size_t, float *)>;
 
   int init(uint32_t dim, DataType data_type, const ailego::Params &params);
 
@@ -48,9 +49,17 @@ class PqOpq {
   //! Operates on packed fp32 data, leaving it rotated by the final matrix.
   //! train_codebook must refresh its centroid pointer cache each round.
   //! The caller performs the final full PQ training after this returns.
-  void train(void *data, size_t num, const char *name,
-             const TrainCodebook &train_codebook,
-             const Reconstruct &reconstruct);
+  int train(void *data, size_t num, const char *name,
+            const TrainCodebook &train_codebook, const Reconstruct &reconstruct,
+            const ReconstructSum &reconstruct_sum = {});
+
+  using ReadRows = std::function<int(size_t, size_t, float *)>;
+  using WriteRows = std::function<int(size_t, size_t, const float *)>;
+  using TrainPagedCodebook = std::function<int(uint32_t)>;
+  int train_rows(size_t num, const char *name, const ReadRows &read_original,
+                 const WriteRows &write_rotated,
+                 const TrainPagedCodebook &train_codebook,
+                 const ReconstructSum &reconstruct);
 
   //! Returns input unchanged when disabled, otherwise rotates into buffer.
   const void *apply(const void *input, std::vector<float> *buffer) const;
@@ -80,7 +89,8 @@ template <size_t NumCentroids, typename ChunkDim>
 float pq_reconstruct_batch(
     const float *rotated, size_t num, size_t dim,
     const std::vector<std::vector<const void *>> &centroid_ptrs,
-    const BatchDistanceFunc &l2_batch, ChunkDim chunk_dim, float *x_hat) {
+    const BatchDistanceFunc &l2_batch, ChunkDim chunk_dim, float *x_hat,
+    double *sum_error = nullptr) {
   float dists[NumCentroids];
   double sum_err = 0.0;
   for (size_t i = 0; i < num; ++i) {
@@ -105,6 +115,7 @@ float pq_reconstruct_batch(
       offset += width;
     }
   }
+  if (sum_error) *sum_error = sum_err;
   return static_cast<float>(sum_err / static_cast<double>(num));
 }
 

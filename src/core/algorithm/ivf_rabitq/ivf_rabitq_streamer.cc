@@ -548,7 +548,9 @@ int IvfRabitqStreamer::search_bf_by_p_keys_impl(
       if (filter.is_valid() && filter(key)) {
         continue;
       }
-      const uint32_t id = entity_->key_to_id(key);
+      uint32_t id = 0;
+      ret = entity_->find_id(key, &id);
+      if (ret != 0) return ret;
       if (id == std::numeric_limits<uint32_t>::max()) {
         continue;
       }

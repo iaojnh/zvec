@@ -26,6 +26,7 @@ namespace core {
  */
 class LabelFilteredIndexHolder : public IndexHolder {
  public:
+  using ReadId = std::function<int(size_t, uint32_t *)>;
   /*! Index Holder Iterator
    */
   class Iterator : public IndexHolder::Iterator {
@@ -35,8 +36,8 @@ class LabelFilteredIndexHolder : public IndexHolder {
 
     //! Constructor
     Iterator(const IVFBuilder::RandomAccessIndexHolder::Pointer &holder,
-             const std::vector<uint32_t> *elems)
-        : holder_(holder), elems_(elems) {}
+             size_t count, ReadId read)
+        : holder_(holder), count_(count), read_(std::move(read)) {}
 
     //! Destructor
     ~Iterator() override = default;
@@ -45,14 +46,16 @@ class LabelFilteredIndexHolder : public IndexHolder {
     const void *data() const override {
       const void *data = nullptr;
       if (status_ == 0) {
-        status_ = holder_->read_element((*elems_)[index_], &buffer_, &data);
+        uint32_t id = 0;
+        status_ = read_(index_, &id);
+        if (status_ == 0) status_ = holder_->read_element(id, &buffer_, &data);
       }
       return data;
     }
 
     //! Test if the iterator is valid
     bool is_valid() const override {
-      return status_ == 0 && index_ < elems_->size();
+      return status_ == 0 && index_ < count_;
     }
 
     int status() const override {
@@ -61,7 +64,9 @@ class LabelFilteredIndexHolder : public IndexHolder {
 
     //! Retrieve primary key
     uint64_t key() const override {
-      return (*elems_)[index_];
+      uint32_t id = 0;
+      if (status_ == 0) status_ = read_(index_, &id);
+      return id;
     }
 
     //! Next iterator
@@ -72,7 +77,8 @@ class LabelFilteredIndexHolder : public IndexHolder {
    private:
     //! Members
     const IVFBuilder::RandomAccessIndexHolder::Pointer holder_{nullptr};
-    const std::vector<uint32_t> *elems_{nullptr};
+    size_t count_{0};
+    ReadId read_;
     size_t index_{0};
     mutable std::string buffer_{};
     mutable int status_{0};
@@ -80,13 +86,13 @@ class LabelFilteredIndexHolder : public IndexHolder {
 
   //! Constructor
   LabelFilteredIndexHolder(
-      const IVFBuilder::RandomAccessIndexHolder::Pointer &holder,
-      const std::vector<uint32_t> &items)
-      : holder_(holder), elems_(&items) {}
+      const IVFBuilder::RandomAccessIndexHolder::Pointer &holder, size_t count,
+      ReadId read)
+      : holder_(holder), count_(count), read_(std::move(read)) {}
 
   //! Retrieve count of elements in holder (-1 indicates unknown)
   size_t count() const override {
-    return elems_->size();
+    return count_;
   }
 
   //! Retrieve dimension
@@ -112,13 +118,14 @@ class LabelFilteredIndexHolder : public IndexHolder {
   //! Create a new iterator
   IndexHolder::Iterator::Pointer create_iterator() override {
     return IndexHolder::Iterator::Pointer(
-        new LabelFilteredIndexHolder::Iterator(holder_, elems_));
+        new LabelFilteredIndexHolder::Iterator(holder_, count_, read_));
   }
 
  private:
   //! Members
   const IVFBuilder::RandomAccessIndexHolder::Pointer holder_{};
-  const std::vector<uint32_t> *elems_{};
+  size_t count_{0};
+  ReadId read_;
 };
 
 IVFBuilder::IVFBuilder() = default;
@@ -200,6 +207,9 @@ int IVFBuilder::cleanup() {
   cluster_params_.clear();
 
   labels_.clear();
+  label_records_ = PagedBuildBuffer();
+  label_offsets_.clear();
+  paged_labels_ = false;
   centroid_index_.reset();
   holder_.reset();
   source_reader_.reset();
@@ -382,6 +392,9 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
   source_reader_.reset();
   source_holder_.reset();
   labels_.clear();
+  label_records_ = PagedBuildBuffer();
+  label_offsets_.clear();
+  paged_labels_ = false;
   quantizers_.clear();
   error_ = false;
   err_code_ = 0;
@@ -462,11 +475,36 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
   }
 
   labels_.resize(centroid_index_->centroids_count());
+  paged_labels_ = ailego::MemoryLimitPool::get_instance().capacity() != 0;
+  if (paged_labels_) {
+    if (converted_holder->count() >
+        std::numeric_limits<size_t>::max() / sizeof(KeyOrderRecord))
+      return IndexError_Overflow;
+    int status = label_records_.init(
+        converted_holder->count() * sizeof(KeyOrderRecord), 64 * 1024);
+    if (status != 0) return status;
+  }
   int ret = this->build_label_index(threads.get(), converted_holder);
   ivf_check_with_msg(ret, "Failed to build index for %s",
                      IndexError::What(ret));
 
-  if (source_reader_) {
+  if (paged_labels_) {
+    ret = SortPagedRecords<KeyOrderRecord>(
+        &label_records_, [](const auto &a, const auto &b) {
+          return a.key != b.key ? a.key < b.key : a.id < b.id;
+        });
+    if (ret != 0) return ret;
+    label_offsets_.assign(labels_.size() + 1, 0);
+    for (size_t i = 0; i < converted_holder->count(); ++i) {
+      KeyOrderRecord record;
+      ret = label_records_.read(i * sizeof(record), &record, sizeof(record));
+      if (ret != 0) return ret;
+      if (record.key >= labels_.size()) return IndexError_InvalidFormat;
+      ++label_offsets_[record.key + 1];
+    }
+    for (size_t i = 1; i < label_offsets_.size(); ++i)
+      label_offsets_[i] += label_offsets_[i - 1];
+  } else if (source_reader_) {
     // Label workers finish out of order. Restore ordinal order within each
     // bucket so dump opens each source at most once per bucket, rather than
     // bouncing between providers for individual vectors.
@@ -771,6 +809,36 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
   return err_code_;
 }
 
+size_t IVFBuilder::label_count(size_t centroid) const {
+  return paged_labels_ ? label_offsets_[centroid + 1] - label_offsets_[centroid]
+                       : labels_[centroid].size();
+}
+
+int IVFBuilder::read_label(size_t centroid, size_t index, uint32_t *id) const {
+  if (!id || centroid >= labels_.size() || index >= label_count(centroid))
+    return IndexError_OutOfRange;
+  if (!paged_labels_) {
+    *id = labels_[centroid][index];
+    return 0;
+  }
+  KeyOrderRecord record;
+  int ret =
+      label_records_.read((label_offsets_[centroid] + index) * sizeof(record),
+                          &record, sizeof(record));
+  if (ret != 0) return ret;
+  if (record.key != centroid) return IndexError_InvalidFormat;
+  *id = record.id;
+  return 0;
+}
+
+IndexHolder::Pointer IVFBuilder::label_holder(size_t centroid) const {
+  return std::make_shared<LabelFilteredIndexHolder>(
+      holder_, label_count(centroid),
+      [this, centroid](size_t index, uint32_t *id) {
+        return read_label(centroid, index, id);
+      });
+}
+
 int IVFBuilder::read_vector(size_t id, uint64_t *key, const void **data) {
   if (source_reader_) {
     return source_reader_->read(id, key, data);
@@ -797,19 +865,20 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
   }
 
   //! Dump inverted vectors
-  std::vector<uint32_t> dumped_ids;
-  std::function<void(uint32_t)> record_dumped_id = [&](uint32_t) {};
-  if (store_original_features_) {
-    dumped_ids.reserve(stats_.built_count());
-    record_dumped_id = [&](uint32_t id) { dumped_ids.emplace_back(id); };
+  PagedBuildBuffer dumped_ids;
+  size_t dumped_count = 0;
+  if (store_original_features_ && !quantizers_.empty()) {
+    ret = dumped_ids.init(stats_.built_count() * sizeof(uint32_t), 64 * 1024);
+    ivf_check_error_code(ret);
   }
   if (quantizers_.size() == 0) {
     //! No quantizer for inverted vectors
     for (size_t i = 0; i < centroid_index_->centroids_count(); ++i) {
       ailego_assert_with(i < labels_.size(), "Index Overflow");
-      for (size_t j = 0; j < labels_[i].size(); ++j) {
-        auto id = labels_[i][j];
-        record_dumped_id(id);
+      for (size_t j = 0; j < label_count(i); ++j) {
+        uint32_t id = 0;
+        ret = read_label(i, j, &id);
+        ivf_check_error_code(ret);
         uint64_t key = 0;
         const void *data = nullptr;
         ret = read_vector(id, &key, &data);
@@ -821,8 +890,7 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
   } else {
     for (size_t i = 0; i < centroid_index_->centroids_count(); ++i) {
       ailego_assert_with(i < labels_.size(), "Index Overflow");
-      auto holder =
-          std::make_shared<LabelFilteredIndexHolder>(holder_, labels_[i]);
+      auto holder = label_holder(i);
       if (!holder) {
         return IndexError_NoMemory;
       }
@@ -843,7 +911,11 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
         if (!data) {
           return IndexError_ReadData;
         }
-        record_dumped_id(id);
+        if (store_original_features_) {
+          ret = dumped_ids.write(dumped_count * sizeof(id), &id, sizeof(id));
+          ivf_check_error_code(ret);
+          ++dumped_count;
+        }
         ret = ivf_dumper->dump_inverted_vector(i, holder_->key(id), data);
         ivf_check_error_code(ret);
       }
@@ -866,13 +938,34 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
   ivf_check_with_msg(ret, "Failed to dump CentroidIndex");
 
   if (store_original_features_) {
-    for (size_t i = 0; i < dumped_ids.size(); ++i) {
+    auto dump_original = [&](uint32_t id) -> int {
       uint64_t key = 0;
       const void *data = nullptr;
-      ret = read_vector(dumped_ids[i], &key, &data);
-      ivf_check_error_code(ret);
-      ret = ivf_dumper->dump_original_vector(data, meta_.element_size());
-      ivf_check_error_code(ret);
+      int status = read_vector(id, &key, &data);
+      return status != 0
+                 ? status
+                 : ivf_dumper->dump_original_vector(data, meta_.element_size());
+    };
+    if (quantizers_.empty()) {
+      // Unquantized output already follows bucket order; reuse it instead of
+      // retaining a second full list of the same ordinals.
+      for (size_t cid = 0; cid < labels_.size(); ++cid) {
+        for (size_t i = 0; i < label_count(cid); ++i) {
+          uint32_t id = 0;
+          ret = read_label(cid, i, &id);
+          ivf_check_error_code(ret);
+          ret = dump_original(id);
+          ivf_check_error_code(ret);
+        }
+      }
+    } else {
+      for (size_t i = 0; i < dumped_count; ++i) {
+        uint32_t id = 0;
+        ret = dumped_ids.read(i * sizeof(id), &id, sizeof(id));
+        ivf_check_error_code(ret);
+        ret = dump_original(id);
+        ivf_check_error_code(ret);
+      }
     }
   }
 
@@ -934,7 +1027,7 @@ int IVFBuilder::prepare_quantizer(IndexThreads *threads) {
     IndexHolder::Pointer holder = holder_;
     size_t idx = 0;
     if (quantize_by_centroid_) {
-      holder = std::make_shared<LabelFilteredIndexHolder>(holder_, labels_[i]);
+      holder = label_holder(i);
       if (!holder && !error_.exchange(true)) {
         err_code_ = IndexError_NoMemory;
         return;

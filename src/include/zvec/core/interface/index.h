@@ -261,7 +261,7 @@ class ZVEC_CORE_API Index {
   size_t context_index_{std::numeric_limits<size_t>::max()};
   core::IndexStorage::Pointer storage_{};
 
-  // Direct IVF/DiskANN input only; Collection merge borrows its providers.
+  // Direct builder input only; Collection merge borrows its providers.
   std::shared_ptr<BufferedInput> buffered_input_{};
 
   bool is_open_{false};
@@ -449,9 +449,12 @@ class ZVEC_CORE_API IVFRabitqIndex : public Index {
   int generate_holder();
 
  private:
+  enum class BuildStage { kCollecting, kTrained, kBuilt, kDumped };
+  [[maybe_unused]] BuildStage build_stage_{BuildStage::kCollecting};
   IVFRabitqIndexParam param_{};
   std::mutex mutex_{};
-  std::vector<std::pair<uint64_t, std::string>> doc_cache_;
+  using DocCache = std::vector<std::pair<uint64_t, std::string>>;
+  std::shared_ptr<DocCache> doc_cache_{std::make_shared<DocCache>()};
   core::IndexHolder::Pointer holder_{};
   std::string file_path_;
 };

@@ -204,6 +204,18 @@ class DiskAnnEntity {
   //! Get primary key of the node id
   virtual diskann_key_t get_key(diskann_id_t id) const = 0;
 
+  // Checked accessors distinguish pageable-metadata I/O errors from a miss.
+  virtual int read_key(diskann_id_t id, diskann_key_t *key) const {
+    if (!key || id >= doc_cnt()) return IndexError_InvalidArgument;
+    *key = get_key(id);
+    return 0;
+  }
+  virtual int find_id(diskann_key_t key, diskann_id_t *id) const {
+    if (!id) return IndexError_InvalidArgument;
+    *id = get_id(key);
+    return 0;
+  }
+
  public:
   uint64_t max_node_size() const {
     return meta_header_.max_node_size;

@@ -108,8 +108,9 @@ class DiskAnnIndexProvider : public IndexProvider {
       return nullptr;
     }
 
-    const diskann_id_t id = indexer_->get_id(static_cast<diskann_key_t>(key));
-    if (id == kInvalidId) {
+    diskann_id_t id;
+    if (indexer_->find_id(static_cast<diskann_key_t>(key), &id) != 0 ||
+        id == kInvalidId) {
       return nullptr;
     }
 
@@ -194,9 +195,11 @@ class DiskAnnIndexProvider : public IndexProvider {
               DiskAnnContext::create_fetch_context(meta_, measure_, entity_);
         }
         if (!context_) {
+          status_ = IndexError_NoMemory;
           return nullptr;
         }
-        if (indexer_->get_vector(cur_id_, context_, vector_buffer_) != 0) {
+        status_ = indexer_->get_vector(cur_id_, context_, vector_buffer_);
+        if (status_ != 0) {
           return nullptr;
         }
         data_loaded_ = true;
@@ -205,14 +208,20 @@ class DiskAnnIndexProvider : public IndexProvider {
     }
 
     bool is_valid() const override {
-      return cur_id_ < static_cast<diskann_id_t>(entity_->doc_cnt());
+      return status_ == 0 &&
+             cur_id_ < static_cast<diskann_id_t>(entity_->doc_cnt());
     }
 
     uint64_t key() const override {
-      return static_cast<uint64_t>(entity_->get_key(cur_id_));
+      return is_valid() ? current_key_ : kInvalidKey;
+    }
+
+    int status() const override {
+      return status_;
     }
 
     void next() override {
+      if (!is_valid()) return;
       cur_id_ = next_valid_id(cur_id_ + 1);
       data_loaded_ = false;
       vector_buffer_.clear();
@@ -225,7 +234,9 @@ class DiskAnnIndexProvider : public IndexProvider {
     diskann_id_t next_valid_id(diskann_id_t start_id) const {
       const auto total = static_cast<diskann_id_t>(entity_->doc_cnt());
       for (diskann_id_t i = start_id; i < total; ++i) {
-        if (entity_->get_key(i) != kInvalidKey) {
+        status_ = entity_->read_key(i, &current_key_);
+        if (status_ != 0) return total;
+        if (current_key_ != kInvalidKey) {
           return i;
         }
       }
@@ -239,6 +250,8 @@ class DiskAnnIndexProvider : public IndexProvider {
     mutable IndexContext::Pointer context_;
     mutable std::string vector_buffer_;
     mutable bool data_loaded_{false};
+    mutable int status_{0};
+    mutable diskann_key_t current_key_{kInvalidKey};
     diskann_id_t cur_id_;
   };
 

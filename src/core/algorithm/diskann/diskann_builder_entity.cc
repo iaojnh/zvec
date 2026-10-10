@@ -22,7 +22,9 @@
 #include <ailego/pattern/defer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_factory.h>
+#include "utility/immutable_segment_view.h"
 #include "utility/ordinal_access_holder.h"
+#include "utility/paged_record_sort.h"
 #include "diskann_algorithm.h"
 #include "diskann_util.h"
 
@@ -39,6 +41,7 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
   IndexStorage::Pointer graph_storage;
   IndexStorage::Segment::Pointer vectors;
   IndexStorage::Segment::Pointer graph;
+  IndexStorage::Segment::Pointer keys;
   mutable ailego::File codes;
 
   int ensure_directory() {
@@ -77,6 +80,7 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
   void clear_files() {
     release_vectors();
     graph.reset();
+    keys.reset();
     if (graph_storage) graph_storage->close();
     graph_storage.reset();
     codes.close();
@@ -197,7 +201,6 @@ int DiskAnnBuilderEntity::reserve_space(uint32_t docs) {
     return IndexError_InvalidArgument;
   }
   try {
-    keys_buffer_.reserve(sizeof(diskann_key_t) * count);
     if (buffered_state_) {
       auto open = [](const std::string &path, size_t bytes,
                      IndexStorage::Pointer *storage,
@@ -224,11 +227,20 @@ int DiskAnnBuilderEntity::reserve_space(uint32_t docs) {
             open(state.graph_path, static_cast<size_t>(neighbor_size_) * count,
                  &state.graph_storage, &state.graph);
       }
+      if (ret == 0) {
+        ret =
+            state.graph_storage->append("keys", sizeof(diskann_key_t) * count);
+        if (ret == 0) {
+          state.keys = state.graph_storage->get("keys");
+          if (!state.keys) ret = IndexError_Runtime;
+        }
+      }
       if (ret != 0) {
         state.clear_files();
         return ret;
       }
     } else {
+      keys_buffer_.reserve(sizeof(diskann_key_t) * count);
       vectors_buffer_.reserve(meta_.element_size() * count);
       neighbors_buffer_.reserve(static_cast<size_t>(neighbor_size_) * count);
     }
@@ -256,7 +268,9 @@ int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) try {
                            sizeof(neighbor_count)) != sizeof(neighbor_count)) {
       return IndexError_WriteData;
     }
-    keys_buffer_.append(reinterpret_cast<const char *>(&key), sizeof(key));
+    if (!state.keys || state.keys->write(doc_cnt() * sizeof(key), &key,
+                                         sizeof(key)) != sizeof(key))
+      return IndexError_WriteData;
     ++*mutable_doc_cnt();
     return 0;
   }
@@ -307,11 +321,21 @@ int DiskAnnBuilderEntity::read_vector(diskann_id_t id,
 }
 
 diskann_key_t DiskAnnBuilderEntity::get_key(diskann_id_t id) const {
-  if (id >= doc_cnt()) return kInvalidKey;
-  size_t offset = (size_t)id * sizeof(diskann_key_t);
+  diskann_key_t key = kInvalidKey;
+  return read_key(id, &key) == 0 ? key : kInvalidKey;
+}
 
-  return *(
-      reinterpret_cast<const diskann_key_t *>(keys_buffer_.data() + offset));
+int DiskAnnBuilderEntity::read_key(diskann_id_t id, diskann_key_t *key) const {
+  if (!key || id >= doc_cnt()) return IndexError_InvalidArgument;
+  size_t offset = (size_t)id * sizeof(diskann_key_t);
+  if (buffered_state_) {
+    auto segment = buffered_state_->keys;
+    return segment && segment->fetch(offset, key, sizeof(*key)) == sizeof(*key)
+               ? 0
+               : IndexError_ReadData;
+  }
+  std::memcpy(key, keys_buffer_.data() + offset, sizeof(*key));
+  return 0;
 }
 
 //! Get vector local id by key
@@ -675,6 +699,23 @@ int DiskAnnBuilderEntity::dump_dummy_segment(
 
 int DiskAnnBuilderEntity::dump_key_segment(
     const IndexDumper::Pointer &dumper) const {
+  if (buffered_state_) {
+    ImmutableSegmentView keys;
+    const size_t bytes = doc_cnt() * sizeof(diskann_key_t);
+    int ret = keys.load(buffered_state_->graph_storage, "keys", 0, bytes);
+    if (ret != 0) return ret;
+    uint32_t crc = 0;
+    ret = keys.copy_to([&](size_t, const void *data, size_t n) {
+      crc = ailego::Crc32c::Hash(data, n, crc);
+      return dumper->write(data, n) == n ? 0 : IndexError_WriteData;
+    });
+    if (ret != 0) return ret;
+    const size_t padding = AlignSize(bytes) - bytes;
+    const char zeros[4096]{};
+    if (padding && dumper->write(zeros, padding) != padding)
+      return IndexError_WriteData;
+    return dumper->append(kDiskAnnKeySegmentId, bytes, padding, crc);
+  }
   //! Dump keys
   size_t key_segment_size = doc_cnt() * sizeof(diskann_key_t);
   int64_t keys_size = dump_segment(dumper, kDiskAnnKeySegmentId,
@@ -688,6 +729,17 @@ int DiskAnnBuilderEntity::dump_key_segment(
 
 int DiskAnnBuilderEntity::dump_key_mapping_segment(
     const IndexDumper::Pointer &dumper) const {
+  if (buffered_state_) {
+    PagedBuildBuffer mapping;
+    int ret = BuildPagedKeyMapping(
+        doc_cnt(),
+        [this](size_t id, uint64_t *key) {
+          return read_key(static_cast<diskann_id_t>(id), key);
+        },
+        &mapping);
+    if (ret != 0) return ret;
+    return mapping.dump(dumper, kDiskAnnKeyMappingSegmentId, 4096);
+  }
   std::vector<diskann_id_t> mapping(doc_cnt());
 
   const diskann_key_t *keys = reinterpret_cast<diskann_key_t *>(

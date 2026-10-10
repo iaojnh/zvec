@@ -177,8 +177,8 @@ class PqFastQuantizer : public Quantizer,
   //! back into \p x_hat (num * original_dim floats, rotated space).  Returns
   //! the mean squared reconstruction error per vector.  fp32-only, used by the
   //! OPQ loop to feed the preprocessor's two-input train().
-  float encode_reconstruct_batch(const float *rotated, size_t num,
-                                 float *x_hat) const;
+  float encode_reconstruct_batch(const float *rotated, size_t num, float *x_hat,
+                                 double *sum_error = nullptr) const;
 
   //! Compute the per-dimension mean (accumulated in float to avoid FP16
   //! overflow) and subtract it from all training vectors in-place.

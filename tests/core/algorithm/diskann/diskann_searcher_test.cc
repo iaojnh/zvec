@@ -38,6 +38,19 @@ namespace core {
 
 class DiskAnnCacheTestPeer {
  public:
+  static void verify_buffered_cache_bypass() {
+    IndexMeta meta(IndexMeta::DT_FP32, 768);
+    DiskAnnIndexer indexer(meta);
+    indexer.buffer_backed_ = true;
+    indexer.doc_cnt_ = 1000000;
+    indexer.max_degree_ = 64;
+    ASSERT_EQ(indexer.configure_cache(100000), 0);
+    EXPECT_EQ(indexer.coord_cache_buf_, nullptr);
+    EXPECT_EQ(indexer.neighbor_cache_buffer_.capacity(), 0u);
+    EXPECT_TRUE(indexer.coord_cache_.empty());
+    EXPECT_TRUE(indexer.neighbor_cache_.empty());
+  }
+
   static std::shared_ptr<AlignedFileReader> reader(DiskAnnSearcher *searcher) {
     return searcher->diskann_indexer_->reader_;
   }
@@ -69,6 +82,10 @@ class DiskAnnCacheTestPeer {
     return searcher->diskann_indexer_->neighbor_cache_.size();
   }
 };
+
+TEST(DiskAnnCacheTest, BufferUsesPoolInsteadOfUnbudgetedNodeCopy) {
+  DiskAnnCacheTestPeer::verify_buffered_cache_bypass();
+}
 
 class DiskAnnProviderTestPeer {
  public:

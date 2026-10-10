@@ -17,6 +17,7 @@
 #include <memory>
 #include <vector>
 #include <rabitqlib/utils/space.hpp>
+#include "utility/immutable_segment_view.h"
 #include "zvec/core/framework/index_document.h"
 #include "zvec/core/framework/index_filter.h"
 #include "zvec/core/framework/index_storage.h"
@@ -93,39 +94,25 @@ class IvfRabitqEntity {
   }
 
   uint64_t get_key(size_t id) const;
+  int read_key(size_t id, uint64_t *key) const;
 
   const void *get_vector_by_key(uint64_t key) const;
 
   int get_vector_by_key(uint64_t key, IndexStorage::MemoryBlock &block) const;
 
   uint32_t key_to_id(uint64_t key) const;
+  int find_id(uint64_t key, uint32_t *id) const;
 
   uint32_t get_cluster_id(uint32_t id) const;
-
-  const uint32_t *get_key_order_mapping() const {
-    if (!mapping_) {
-      return nullptr;
-    }
-    const void *data = nullptr;
-    size_t size = total_vector_count() * sizeof(uint32_t);
-    if (mapping_->read(0, &data, size) != size) {
-      return nullptr;
-    }
-    return static_cast<const uint32_t *>(data);
-  }
 
  private:
   IvfRabitqHeader header_;
   std::vector<IvfRabitqClusterMeta> cluster_metas_;
 
-  IndexStorage::MemoryBlock batch_data_block_;
-  IndexStorage::MemoryBlock ex_data_block_;
-  IndexStorage::MemoryBlock keys_block_;
-  IndexStorage::Segment::Pointer mapping_;
-
-  const char *batch_data_{nullptr};
-  const char *ex_data_{nullptr};
-  const uint64_t *keys_{nullptr};
+  ImmutableSegmentView batch_data_;
+  ImmutableSegmentView ex_data_;
+  ImmutableSegmentView keys_;
+  ImmutableSegmentView mapping_;
   size_t batch_data_size_{0};
   size_t ex_data_size_{0};
 

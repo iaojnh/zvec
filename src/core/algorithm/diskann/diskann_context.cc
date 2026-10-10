@@ -107,7 +107,7 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
   int ret;
   switch (type) {
     case kBuilderContext:
-      ret = visit_filter_.init(VisitFilter::ByteMap, entity_->doc_cnt(),
+      ret = visit_filter_.init(VisitFilter::EpochBitMap, entity_->doc_cnt(),
                                entity_->doc_cnt(), negative_probility_);
       if (ret != 0) {
         LOG_ERROR("Create filter failed,  mode %d", filter_mode_);

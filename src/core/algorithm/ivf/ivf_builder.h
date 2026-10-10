@@ -17,6 +17,7 @@
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_meta.h>
 #include "utility/ordinal_access_holder.h"
+#include "utility/paged_record_sort.h"
 #include "utility/temporary_buffer_storage.h"
 #include "ivf_centroid_index.h"
 
@@ -271,6 +272,9 @@ class IVFBuilder : public IndexBuilder {
 
   //! Read one original vector; the returned data is consumed before next read.
   int read_vector(size_t id, uint64_t *key, const void **data);
+  size_t label_count(size_t centroid) const;
+  int read_label(size_t centroid, size_t index, uint32_t *id) const;
+  IndexHolder::Pointer label_holder(size_t centroid) const;
 
   //! Prepare the quantizer for inverted index
   int prepare_quantizer(IndexThreads *threads);
@@ -311,6 +315,16 @@ class IVFBuilder : public IndexBuilder {
         return;
       }
       ailego_assert_with(centroid_idx < labels_.size(), "Index Overflow");
+      if (paged_labels_) {
+        KeyOrderRecord record{centroid_idx, vec.id(), 0};
+        int ret = label_records_.write(size_t{vec.id()} * sizeof(record),
+                                       &record, sizeof(record));
+        if (ret != 0) {
+          if (!error_.exchange(true)) err_code_ = ret;
+          return;
+        }
+        continue;
+      }
       mutex_.lock();
       labels_[centroid_idx].emplace_back(vec.id());
       mutex_.unlock();
@@ -338,6 +352,9 @@ class IVFBuilder : public IndexBuilder {
   std::vector<ailego::Params> cluster_params_{};
 
   std::vector<std::vector<uint32_t>> labels_{};
+  bool paged_labels_{false};
+  PagedBuildBuffer label_records_;
+  std::vector<size_t> label_offsets_;
   std::mutex mutex_{};
   IVFCentroidIndex::Pointer centroid_index_{};
   IVFCentroidIndex::Pointer searcher_centroid_index_{};

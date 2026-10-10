@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,6 +46,10 @@ class OpqRotator : public Preprocessor {
   //! \p x_hat  codebook reconstruction of the same vectors in the ROTATED
   //!           space, num x dim, packed.
   int fit(const float *x, const float *x_hat, size_t num);
+  using ReadPairs = std::function<int(size_t, size_t, float *, float *)>;
+  // Fetch at most 1024 row pairs at a time. Only the dimension-squared
+  // covariance/SVD workspace stays resident, independent of sample count.
+  int fit_rows(size_t num, const ReadPairs &read);
 
   // -- Preprocessor interface ------------------------------------------------
 

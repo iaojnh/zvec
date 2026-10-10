@@ -11,7 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <atomic>
 #include <ailego/container/reservoir.h>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_cluster.h>
@@ -19,6 +21,7 @@
 #include <zvec/core/framework/index_factory.h>
 #include "cluster_params.h"
 #include "linear_seeker.h"
+#include "paged_mean_table.h"
 #include "vector_mean.h"
 
 namespace zvec {
@@ -102,8 +105,8 @@ class KmeansCluster : public IndexCluster {
   void init_features_containers(size_t shard_count);
 
   //! Split Clusters
-  void split_clusters(IndexThreads *threads,
-                      const IndexCluster::CentroidList &cents);
+  int split_clusters(IndexThreads *threads,
+                     const IndexCluster::CentroidList &cents);
 
   //! Update Centroids
   void update_centroids(IndexThreads *threads,
@@ -147,6 +150,10 @@ class KmeansCluster : public IndexCluster {
   std::vector<std::vector<const void *>> shard_cluster_features_{};
   std::shared_ptr<VectorMeanArray> shard_cluster_means_{};
   std::shared_ptr<VectorMeanArray> batch_means_{};
+  PagedMeanTable paged_shards_;
+  PagedMeanTable paged_batch_;
+  bool paged_means_{false};
+  std::atomic<int> workspace_error_{0};
   std::vector<double> batch_scores_{};
   double epsilon_{std::numeric_limits<float>::epsilon()};
   float shard_factor_{16.0f};
@@ -390,6 +397,8 @@ int KmeansCluster::init(const IndexMeta &meta, const ailego::Params &params) {
 }
 
 int KmeansCluster::cleanup() {
+  paged_shards_ = PagedMeanTable();
+  paged_batch_ = PagedMeanTable();
   features_.reset();
   shard_cluster_scores_.clear();
   shard_cluster_features_.clear();
@@ -401,11 +410,13 @@ int KmeansCluster::cleanup() {
 }
 
 int KmeansCluster::reset() {
+  paged_shards_ = PagedMeanTable();
+  paged_batch_ = PagedMeanTable();
   features_.reset();
   shard_cluster_scores_.clear();
   shard_cluster_features_.clear();
-  shard_cluster_means_->clear();
-  batch_means_->clear();
+  if (shard_cluster_means_) shard_cluster_means_->clear();
+  if (batch_means_) batch_means_->clear();
   batch_scores_.clear();
   seeker_->reset();
   return 0;
@@ -494,8 +505,29 @@ int KmeansCluster::cluster(IndexThreads::Pointer threads,
     this->init_centroids(cluster_count_, &cents);
   }
 
+  paged_means_ = ailego::MemoryLimitPool::get_instance().capacity() != 0;
+  auto release_workspaces = ailego::ScopeGuard::Make([&]() {
+    paged_shards_ = PagedMeanTable();
+    paged_batch_ = PagedMeanTable();
+  });
   if (batch_) {
-    batch_means_ = NewVectorMeanArray(meta_, cents);
+    batch_means_.reset();
+    if (paged_means_) {
+      auto prototype = NewVectorMean(meta_);
+      int ret = paged_batch_.init(cents.size(), *prototype);
+      if (ret != 0) return ret;
+      std::vector<uint8_t> scratch;
+      for (size_t i = 0; i < cents.size(); ++i) {
+        // Seed one accumulator at a time, preserving the existing type-
+        // specific rounding and prior follow counts used by batch KMeans.
+        IndexCluster::CentroidList single{cents[i]};
+        auto row = NewVectorMeanArray(meta_, single);
+        ret = paged_batch_.write(i, row->at(0), &scratch);
+        if (ret != 0) return ret;
+      }
+    } else {
+      batch_means_ = NewVectorMeanArray(meta_, cents);
+    }
     batch_scores_.clear();
     for (const auto &it : cents) {
       batch_scores_.push_back(it.score());
@@ -617,8 +649,11 @@ int KmeansCluster::clustering(IndexThreads *threads,
     return result;
   }
 
-  this->split_clusters(threads, cents);
+  result = this->split_clusters(threads, cents);
+  if (result != 0) return result;
   this->update_centroids(threads, cents);
+  result = workspace_error_.load(std::memory_order_relaxed);
+  if (result != 0) return result;
   *cost = CalculateSSE(cents);
   return 0;
 }
@@ -705,10 +740,23 @@ void KmeansCluster::init_features_containers(size_t shard_count) {
   }
 }
 
-void KmeansCluster::split_clusters(IndexThreads *threads,
-                                   const IndexCluster::CentroidList &cents) {
-  // Initilize containers
-  this->init_containers(threads->count() * cents.size());
+int KmeansCluster::split_clusters(IndexThreads *threads,
+                                  const IndexCluster::CentroidList &cents) {
+  workspace_error_.store(0, std::memory_order_relaxed);
+  if (cents.size() &&
+      threads->count() > std::numeric_limits<size_t>::max() / cents.size())
+    return IndexError_Overflow;
+  const size_t count = threads->count() * cents.size();
+  if (paged_means_) {
+    shard_cluster_means_.reset();
+    paged_shards_ = PagedMeanTable();
+    auto prototype = NewVectorMean(meta_);
+    int ret = paged_shards_.init(count, *prototype);
+    if (ret != 0) return ret;
+    shard_cluster_scores_.assign(count, 0.0);
+  } else {
+    this->init_containers(count);
+  }
   auto task_group = threads->make_group();
 
   // Initilize base information
@@ -733,6 +781,7 @@ void KmeansCluster::split_clusters(IndexThreads *threads,
     index = next_index;
   }
   task_group->wait_finish();
+  return workspace_error_.load(std::memory_order_relaxed);
 }
 
 void KmeansCluster::update_centroids(IndexThreads *threads,
@@ -813,11 +862,19 @@ void KmeansCluster::update_labels(IndexThreads *threads,
 }
 
 void KmeansCluster::split_clusters_thread(size_t index_begin, size_t index_end,
-                                          const IndexThreads *threads) {
+                                          const IndexThreads *threads) try {
   size_t feature_size = features_->element_size();
   size_t thread_offset = threads->indexof_this() * seeker_->original()->count();
+  auto mean = paged_means_ ? NewVectorMean(meta_) : nullptr;
+  std::vector<uint8_t> scratch;
+  size_t current = std::numeric_limits<size_t>::max();
+  auto flush = [&]() {
+    if (!mean || current == std::numeric_limits<size_t>::max()) return 0;
+    return paged_shards_.write(current, *mean, &scratch);
+  };
 
   for (size_t i = index_begin; i != index_end; ++i) {
+    if (workspace_error_.load(std::memory_order_relaxed) != 0) return;
     const void *feat = features_->element(i);
     LinearSeeker::Document result(0, std::numeric_limits<float>::max());
 
@@ -826,27 +883,70 @@ void KmeansCluster::split_clusters_thread(size_t index_begin, size_t index_end,
 
     size_t sel_column = thread_offset + result.index;
     shard_cluster_scores_[sel_column] += result.score;
-    shard_cluster_means_->at(sel_column).plus(feat, feature_size);
+    if (paged_means_) {
+      if (current != sel_column) {
+        int ret = flush();
+        if (ret == 0)
+          ret = paged_shards_.read(sel_column, mean.get(), &scratch);
+        if (ret != 0) {
+          workspace_error_.store(ret, std::memory_order_relaxed);
+          return;
+        }
+        current = sel_column;
+      }
+      if (!mean->plus(feat, feature_size)) {
+        workspace_error_.store(IndexError_Mismatch, std::memory_order_relaxed);
+        return;
+      }
+    } else {
+      shard_cluster_means_->at(sel_column).plus(feat, feature_size);
+    }
   }
+  const int ret = flush();
+  if (ret != 0) workspace_error_.store(ret, std::memory_order_relaxed);
+} catch (const std::bad_alloc &) {
+  workspace_error_.store(IndexError_NoMemory, std::memory_order_relaxed);
+} catch (const std::exception &) {
+  workspace_error_.store(IndexError_Runtime, std::memory_order_relaxed);
 }
 
-void KmeansCluster::update_centroid_thread(size_t column,
-                                           IndexCluster::CentroidList *out) {
+void KmeansCluster::update_centroid_thread(
+    size_t column, IndexCluster::CentroidList *out) try {
   size_t cluster_count = out->size();
   double cluster_score = 0.0;
 
   // Create Accumulator
   std::shared_ptr<VectorMean> accum = NewVectorMean(meta_);
+  auto row = paged_means_ ? NewVectorMean(meta_) : nullptr;
+  std::vector<uint8_t> scratch;
   if (batch_) {
     cluster_score += batch_scores_[column];
-    accum->merge(batch_means_->at(column));
+    if (paged_means_) {
+      int ret = paged_batch_.read(column, row.get(), &scratch);
+      if (ret != 0) {
+        workspace_error_.store(ret, std::memory_order_relaxed);
+        return;
+      }
+      accum->merge(*row);
+    } else {
+      accum->merge(batch_means_->at(column));
+    }
   }
 
   // Compute the score of centroid
   for (size_t i = column; i < shard_cluster_scores_.size();
        i += cluster_count) {
     cluster_score += shard_cluster_scores_[i];
-    accum->merge(shard_cluster_means_->at(i));
+    if (paged_means_) {
+      int ret = paged_shards_.read(i, row.get(), &scratch);
+      if (ret != 0) {
+        workspace_error_.store(ret, std::memory_order_relaxed);
+        return;
+      }
+      accum->merge(*row);
+    } else {
+      accum->merge(shard_cluster_means_->at(i));
+    }
   }
 
   // Update centroid
@@ -854,6 +954,10 @@ void KmeansCluster::update_centroid_thread(size_t column,
   centroid->set_score(cluster_score);
   centroid->set_follows(accum->count());
   accum->mean(centroid->mutable_buffer());
+} catch (const std::bad_alloc &) {
+  workspace_error_.store(IndexError_NoMemory, std::memory_order_relaxed);
+} catch (const std::exception &) {
+  workspace_error_.store(IndexError_Runtime, std::memory_order_relaxed);
 }
 
 void KmeansCluster::update_cluster_thread(size_t index_begin, size_t index_end,

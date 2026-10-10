@@ -21,9 +21,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rabitqlib/quantization/data_layout.hpp>
 #include "algorithm/hnsw_rabitq/rabitq_utils.h"
+#include "utility/utility_params.h"
 #include "zvec/ailego/container/params.h"
 #include "zvec/ailego/logger/logger.h"
 #include "zvec/ailego/utility/file_helper.h"
@@ -286,6 +288,101 @@ void IvfRabitqStreamerTest::SetUp() {
 
 void IvfRabitqStreamerTest::TearDown() {
   ailego::FileHelper::RemovePath(dir_.c_str());
+}
+
+TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(pool.used(), 0u);
+  auto restore = ailego::ScopeGuard::Make([&]() {
+    EXPECT_EQ(pool.used(), 0u);
+    EXPECT_EQ(pool.init(previous), 0);
+  });
+  auto holder = BuildHolder(kDim, 1027);  // Partial final fast-scan batches.
+  NumericalVector<float> query(kDim);
+  FillTestVector(37, &query);
+  const IndexQueryMeta qmeta(IndexMeta::DT_FP32, kDim);
+  for (const char *metric : {"SquaredEuclidean", "InnerProduct"}) {
+    for (uint32_t bits : {1u, 4u}) {
+      SCOPED_TRACE(metric);
+      SCOPED_TRACE(bits);
+      ASSERT_EQ(pool.init(0), 0);
+      IndexMeta meta(IndexMeta::DT_FP32, kDim);
+      meta.set_metric(metric, 0, ailego::Params());
+      ailego::Params params;
+      params.set(PARAM_IVF_RABITQ_NLIST, 16u);
+      params.set(PARAM_RABITQ_TOTAL_BITS, bits);
+      const std::string path = dir_ + "/buffer_compare";
+      BuildIndexFile(meta, holder, params, path);
+      ASSERT_FALSE(HasFatalFailure());
+      ASSERT_EQ(pool.init(128 * 1024), 0);
+      IndexStreamer::Pointer streamers[2];
+      for (size_t mode = 0; mode < 2; ++mode) {
+        auto storage = IndexFactory::CreateStorage(
+            mode ? "BufferReadStorage" : "MMapFileReadStorage");
+        ailego::Params options;
+        options.set(BUFFER_READ_STORAGE_WARMUP_MODE,
+                    BUFFER_READ_STORAGE_WARMUP_NONE);
+        ASSERT_EQ(storage->init(options), 0);
+        ASSERT_EQ(storage->open(path, false), 0);
+        streamers[mode] = std::make_shared<IvfRabitqStreamer>();
+        ASSERT_EQ(streamers[mode]->init(meta, params), 0);
+        ASSERT_EQ(streamers[mode]->open(storage), 0);
+      }
+      auto compare = [](const IndexDocumentList &a,
+                        const IndexDocumentList &b) {
+        ASSERT_EQ(a.size(), b.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+          EXPECT_EQ(a[i].key(), b[i].key());
+          EXPECT_FLOAT_EQ(a[i].score(), b[i].score());
+        }
+      };
+      for (uint32_t nprobe : {1u, 4u, 16u}) {
+        for (bool grouped : {false, true}) {
+          for (bool by_key : {false, true}) {
+            IndexStreamer::Context::Pointer contexts[2];
+            for (size_t mode = 0; mode < 2; ++mode) {
+              auto ctx = streamers[mode]->create_context();
+              ctx->set_topk(10);
+              ctx->set_filter([](uint64_t key) { return key % 7 == 0; });
+              ailego::Params search;
+              search.set(PARAM_IVF_RABITQ_NPROBE, nprobe);
+              ASSERT_EQ(ctx->update(search), 0);
+              if (grouped) {
+                ctx->set_group_by(
+                    [](uint64_t key) { return std::to_string(key % 3); });
+                ctx->set_group_params(3, 2);
+              }
+              if (by_key) {
+                const std::vector<std::vector<uint64_t>> keys{
+                    {3, 4, 5, 36, 37, 38, 90, 91, 92, 99999}};
+                ASSERT_EQ(streamers[mode]->search_bf_by_p_keys_impl(
+                              query.data(), keys, qmeta, 1, ctx),
+                          0);
+              } else {
+                ASSERT_EQ(
+                    streamers[mode]->search_impl(query.data(), qmeta, 1, ctx),
+                    0);
+              }
+              contexts[mode] = std::move(ctx);
+            }
+            if (grouped) {
+              const auto &a = contexts[0]->group_result(0);
+              const auto &b = contexts[1]->group_result(0);
+              ASSERT_EQ(a.size(), b.size());
+              for (size_t i = 0; i < a.size(); ++i) {
+                EXPECT_EQ(a[i].group_id(), b[i].group_id());
+                compare(a[i].docs(), b[i].docs());
+              }
+            } else {
+              compare(contexts[0]->result(0), contexts[1]->result(0));
+            }
+          }
+        }
+      }
+      EXPECT_LE(pool.used(), pool.capacity());
+    }
+  }
 }
 
 TEST_F(IvfRabitqStreamerTest, TestParamValidation) {

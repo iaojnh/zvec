@@ -289,6 +289,8 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
 
     ctx->topk_to_result(i);
 
+    if (ailego_unlikely(ctx->error())) return IndexError_ReadData;
+
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
 
@@ -432,7 +434,9 @@ int DiskAnnSearcher::get_vector(uint64_t key, Context::Pointer &context,
     return ret;
   }
 
-  diskann_id_t id = diskann_indexer_->get_id(key);
+  diskann_id_t id;
+  ret = diskann_indexer_->find_id(key, &id);
+  if (ret != 0) return ret;
   if (id == kInvalidId) {
     LOG_ERROR("Vector key does not exist: %lu", (unsigned long)key);
     return IndexError_NoExist;
