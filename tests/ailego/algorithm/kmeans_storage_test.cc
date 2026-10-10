@@ -53,16 +53,19 @@ void CheckMatrixEquivalence(Fill fill) {
   constexpr size_t dim = 8;
   for (size_t count : {size_t{1}, size_t{17}, size_t{259}}) {
     SCOPED_TRACE(count);
-    Algorithm memory(1, dim);
-    Algorithm external(1, dim);
+    const size_t k = std::min(count, size_t{65});
+    Algorithm memory(k, dim);
+    Algorithm external(k, dim);
     auto storage = std::make_shared<TestMatrixStorage>();
+    auto center_storage = std::make_shared<TestMatrixStorage>();
     external.set_feature_matrix_storage(storage);
+    external.set_centroid_matrix_storage(center_storage);
     memory.feature_matrix_reserve(count);
     external.feature_matrix_reserve(count);
     Container row(dim);
     row.resize(1);
     for (size_t i = 0; i < count; ++i) {
-      fill(i, row.data());
+      fill(i % k, row.data());
       memory.append(row.data(), dim);
       external.append(row.data(), dim);
     }
@@ -71,9 +74,11 @@ void CheckMatrixEquivalence(Fill fill) {
     EXPECT_EQ(memory.feature_cache().bytes(), external.feature_cache().bytes());
     EXPECT_EQ(memory.feature_matrix().bytes(), storage->data.size());
     EXPECT_LE(storage->largest_write, Algorithm::BatchCount * row.bytes());
-    fill(0, row.data());
-    memory.mutable_centroids()->append(row.data(), dim);
-    external.mutable_centroids()->append(row.data(), dim);
+    for (size_t i = 0; i < k; ++i) {
+      fill(i, row.data());
+      memory.mutable_centroids()->append(row.data(), dim);
+      external.mutable_centroids()->append(row.data(), dim);
+    }
     ThreadPool pool(1, false);
     for (int iteration = 0; iteration < 3; ++iteration) {
       double expected = 0;
@@ -85,7 +90,14 @@ void CheckMatrixEquivalence(Fill fill) {
       EXPECT_EQ(
           0, std::memcmp(memory.centroids().data(), external.centroids().data(),
                          memory.centroids().bytes()));
-      EXPECT_EQ(count, external.context().clusters()[0].count());
+      EXPECT_EQ(0u, external.centroid_matrix().bytes());
+      EXPECT_EQ(memory.centroid_matrix().bytes(), center_storage->data.size());
+      EXPECT_LE(center_storage->largest_write,
+                Algorithm::BatchCount * row.bytes());
+      size_t follows = 0;
+      for (const auto &item : external.context().clusters())
+        follows += item.count();
+      EXPECT_EQ(count, follows);
     }
   }
 }
@@ -94,7 +106,9 @@ template <typename T>
 void CheckNumeric() {
   auto fill = [](size_t i, T *out) {
     for (size_t d = 0; d < 8; ++d) {
-      out[d] = static_cast<T>(static_cast<float>((i + d) % 5) - 2.0f);
+      // Equal-norm distinct seeds keep all clusters populated for both L2
+      // and IP, including integer types (empty numeric clusters use NaN).
+      out[d] = static_cast<T>((i & (size_t{1} << d)) ? 1.0f : -1.0f);
     }
   };
   CheckMatrixEquivalence<NumericalKmeans<T, ThreadPool>>(fill);
@@ -110,7 +124,9 @@ TEST(KmeansMatrixStorage, NumericFullAndPartialBlocksMatchMemory) {
 TEST(KmeansMatrixStorage, PackedInt4FullAndPartialBlocksMatchMemory) {
   auto fill = [](size_t i, uint32_t *out) {
     NibbleVector<int32_t> row(8);
-    for (size_t d = 0; d < 8; ++d) row.set(d, int((i + d) % 5) - 2);
+    for (size_t d = 0; d < 8; ++d) {
+      row.set(d, (i & (size_t{1} << d)) ? 1 : -1);
+    }
     std::memcpy(out, row.data(), 4);
   };
   CheckMatrixEquivalence<NibbleKmeans<int32_t, ThreadPool>>(fill);
@@ -190,6 +206,40 @@ TEST(KmeansMatrixStorage, WorkerReadFailureDoesNotPublishPartialCentroids) {
   EXPECT_EQ(-73, algorithm.matrix_status());
   EXPECT_EQ(123, untouched);
   EXPECT_EQ(0, std::memcmp(seed, algorithm.centroids().data(), sizeof(seed)));
+}
+
+TEST(KmeansMatrixStorage, CentroidBackingErrorsDoNotPublishAndResetClearsThem) {
+  for (bool read_error : {true, false}) {
+    for (size_t fail_at : {size_t{0}, size_t{1}}) {
+      Algorithm algorithm(65, 3);
+      auto storage = std::make_shared<TestMatrixStorage>();
+      algorithm.set_centroid_matrix_storage(storage);
+      Populate(&algorithm);
+      for (size_t i = 0; i < 65; ++i) {
+        const float seed[] = {float(i % 3), float(i % 5), float(i % 7)};
+        algorithm.mutable_centroids()->append(seed, 3);
+      }
+      auto before = algorithm.centroids();
+      if (read_error)
+        storage->fail_read_at = fail_at;
+      else
+        storage->fail_write_at = fail_at;
+      ThreadPool pool(3, false);
+      double untouched = 123;
+      EXPECT_FALSE(algorithm.cluster_once(pool, &untouched));
+      EXPECT_EQ(read_error ? -73 : -75, algorithm.matrix_status());
+      EXPECT_EQ(123, untouched);
+      EXPECT_EQ(0, std::memcmp(before.data(), algorithm.centroids().data(),
+                               before.bytes()));
+      std::weak_ptr<TestMatrixStorage> lifetime = storage;
+      storage.reset();
+      algorithm.reset(1, 3);
+      EXPECT_TRUE(lifetime.expired());
+      EXPECT_EQ(0, algorithm.matrix_status());
+      Populate(&algorithm);
+      EXPECT_TRUE(algorithm.cluster_once(pool, &untouched));
+    }
+  }
 }
 
 TEST(KmeansMatrixStorage, WriteFailureIsStickyAndResetReleasesStorage) {

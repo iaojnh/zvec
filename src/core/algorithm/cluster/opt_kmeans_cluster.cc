@@ -29,19 +29,26 @@ namespace {
 class BufferedTrainingMatrix : public ailego::LloydClusterMatrixStorage {
  public:
   explicit BufferedTrainingMatrix(
-      std::shared_ptr<TemporaryBufferStorage> storage)
-      : storage_(std::move(storage)) {}
+      std::shared_ptr<TemporaryBufferStorage> storage, size_t base,
+      size_t bytes)
+      : storage_(std::move(storage)), base_(base), bytes_(bytes) {}
 
   int read(size_t offset, void *out, size_t bytes) const override {
-    return storage_->read(offset, out, bytes);
+    if (offset > bytes_ || bytes > bytes_ - offset)
+      return IndexError_InvalidArgument;
+    return storage_->read(base_ + offset, out, bytes);
   }
 
   int write(size_t offset, const void *data, size_t bytes) override {
-    return storage_->write(offset, data, bytes);
+    if (offset > bytes_ || bytes > bytes_ - offset)
+      return IndexError_InvalidArgument;
+    return storage_->write(base_ + offset, data, bytes);
   }
 
  private:
   std::shared_ptr<TemporaryBufferStorage> storage_;
+  size_t base_;
+  size_t bytes_;
 };
 }  // namespace
 
@@ -111,12 +118,24 @@ class OptKmeansAlgorithm : public IndexCluster {
     std::shared_ptr<TemporaryBufferStorage> storage;
     const size_t matrix_count =
         count / Algorithm::BatchCount * Algorithm::BatchCount;
-    if (!buffered_storage_path_.empty() && matrix_count != 0) {
-      int ret = TemporaryBufferStorage::Create(buffered_storage_path_,
-                                               matrix_count * bytes, &storage);
+    const size_t center_count =
+        algorithm.k_value() / Algorithm::BatchCount * Algorithm::BatchCount;
+    if (center_count >
+        std::numeric_limits<size_t>::max() / bytes - matrix_count)
+      return IndexError_Overflow;
+    if (!buffered_storage_path_.empty() && matrix_count + center_count != 0) {
+      int ret = TemporaryBufferStorage::Create(
+          buffered_storage_path_, (matrix_count + center_count) * bytes,
+          &storage);
       if (ret != 0) return ret;
       algorithm.set_feature_matrix_storage(
-          std::make_shared<BufferedTrainingMatrix>(storage));
+          std::make_shared<BufferedTrainingMatrix>(storage, 0,
+                                                   matrix_count * bytes));
+      if (center_count != 0) {
+        algorithm.set_centroid_matrix_storage(
+            std::make_shared<BufferedTrainingMatrix>(
+                storage, matrix_count * bytes, center_count * bytes));
+      }
     }
     std::vector<StoreType> aligned;
     auto append = [&](const void *data) -> int {

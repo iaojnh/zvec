@@ -196,15 +196,25 @@ class LloydCluster {
     context_.reset(centroids_.count(), centroids_.dimension());
 
     size_t count = centroids_.count() / BatchCount * BatchCount;
-    centroids_matrix_.resize(count);
-    for (size_t i = 0; i != count; i += BatchCount) {
-      ContextType::MatrixTranspose(centroids_[i], centroids_.dimension(),
-                                   centroids_matrix_[i]);
-    }
-    size_t remain = static_cast<uint32_t>(centroids_.count() - count);
-    if (remain > 0) {
-      centroids_matrix_.append(centroids_[count], centroids_.dimension(),
-                               remain);
+    if (centroid_matrix_storage_) {
+      ContainerType tile(centroids_.dimension());
+      if (count != 0) tile.resize(BatchCount);
+      for (size_t i = 0; i != count; i += BatchCount) {
+        ContextType::MatrixTranspose(centroids_[i], centroids_.dimension(),
+                                     tile.data());
+        const int ret = centroid_matrix_storage_->write(
+            i / BatchCount * tile.bytes(), tile.data(), tile.bytes());
+        if (ret != 0) {
+          record_matrix_error(ret);
+          return false;
+        }
+      }
+    } else {
+      centroids_matrix_.resize(count);
+      for (size_t i = 0; i != count; i += BatchCount) {
+        ContextType::MatrixTranspose(centroids_[i], centroids_.dimension(),
+                                     centroids_matrix_[i]);
+      }
     }
 
     // Using thread pool
@@ -300,7 +310,20 @@ class LloydCluster {
   }
 
   int matrix_status() const {
-    return matrix_storage_ ? matrix_error_.load(std::memory_order_relaxed) : 0;
+    return matrix_error_.load(std::memory_order_relaxed);
+  }
+
+  // Optional backing for the derived (transposed) centers. Unlike the public
+  // row-major centers, this matrix is only consumed one SIMD batch at a time.
+  void set_centroid_matrix_storage(
+      std::shared_ptr<LloydClusterMatrixStorage> storage) {
+    centroids_matrix_.clear();
+    centroids_matrix_.shrink_to_fit();
+    centroid_matrix_storage_ = std::move(storage);
+  }
+
+  const ContainerType &centroid_matrix() const {
+    return centroids_matrix_;
   }
 
   // A returned external block belongs to the caller's scratch and survives
@@ -324,17 +347,19 @@ class LloydCluster {
   //! Cluster the cache features
   void cluster_cache_features() {
     std::array<float, BatchCount> scores;
+    ContainerType centers(centroids_.dimension());
 
     for (size_t i = 0, n = feature_cache_.count(); i != n; ++i) {
-      size_t count = centroids_matrix_.count() / BatchCount * BatchCount;
+      size_t count = centroids_.count() / BatchCount * BatchCount;
       const StoreType *feature = feature_cache_[i];
       float nearest_score = std::numeric_limits<float>::max();
       size_t nearest_index = 0;
 
       for (size_t j = 0; j != count; j += BatchCount) {
-        ContextType::template BatchDistance<1>(centroids_matrix_[j], feature,
-                                               centroids_matrix_.dimension(),
-                                               scores.data());
+        const StoreType *block = read_centroid_matrix(j, &centers);
+        if (!block) return;
+        ContextType::template BatchDistance<1>(
+            block, feature, centroids_.dimension(), scores.data());
 
         for (size_t k = 0; k < BatchCount; ++k) {
           if (scores[k] < nearest_score) {
@@ -344,10 +369,10 @@ class LloydCluster {
         }
       }  // end of for
 
-      for (size_t j = count, total = centroids_matrix_.count(); j != total;
-           ++j) {
-        ContextType::Distance(centroids_matrix_[j], feature,
-                              centroids_matrix_.dimension(), scores.data());
+      for (size_t j = count, total = centroids_.count(); j != total; ++j) {
+        // The trailing centers are not transposed: reuse the canonical rows.
+        ContextType::Distance(centroids_[j], feature, centroids_.dimension(),
+                              scores.data());
 
         if (scores[0] < nearest_score) {
           nearest_score = scores[0];
@@ -362,8 +387,9 @@ class LloydCluster {
   //! Cluster the matrix features
   void cluster_matrix_features(size_t first, size_t last) {
     std::array<float, BatchCount * BatchCount> scores;
-    ContainerType rows(centroids_matrix_.dimension());
-    ContainerType scratch(centroids_matrix_.dimension());
+    ContainerType rows(centroids_.dimension());
+    ContainerType scratch(centroids_.dimension());
+    ContainerType centers(centroids_.dimension());
 
     auto comp = [](float i, float j) {
       if (std::isnan(i)) return false;
@@ -378,7 +404,7 @@ class LloydCluster {
     rows.resize(BatchCount);
     for (size_t i = first * BatchCount; i != last * BatchCount;
          i += BatchCount) {
-      size_t count = centroids_matrix_.count() / BatchCount * BatchCount;
+      size_t count = centroids_.count() / BatchCount * BatchCount;
       const StoreType *block = read_feature_matrix(i, &scratch);
       if (!block) return;
 
@@ -387,9 +413,10 @@ class LloydCluster {
                 std::numeric_limits<float>::max());
 
       for (size_t j = 0; j != count; j += BatchCount) {
+        const StoreType *center_block = read_centroid_matrix(j, &centers);
+        if (!center_block) return;
         ContextType::template BatchDistance<BatchCount>(
-            centroids_matrix_[j], block, centroids_matrix_.dimension(),
-            scores.data());
+            center_block, block, centroids_.dimension(), scores.data());
 
         for (size_t k = 0; k < BatchCount; ++k) {
           const float *start = &scores[k * BatchCount];
@@ -402,11 +429,9 @@ class LloydCluster {
         }
       }  // end of for
 
-      for (size_t j = count, total = centroids_matrix_.count(); j != total;
-           ++j) {
-        ContextType::template BatchDistance<1>(block, centroids_matrix_[j],
-                                               centroids_matrix_.dimension(),
-                                               scores.data());
+      for (size_t j = count, total = centroids_.count(); j != total; ++j) {
+        ContextType::template BatchDistance<1>(
+            block, centroids_[j], centroids_.dimension(), scores.data());
 
         for (size_t k = 0; k < BatchCount; ++k) {
           float score = scores[k];
@@ -427,6 +452,21 @@ class LloydCluster {
   }
 
  private:
+  const StoreType *read_centroid_matrix(size_t index,
+                                        ContainerType *scratch) const {
+    if (!centroid_matrix_storage_) return centroids_matrix_[index];
+    if (matrix_status() != 0) return nullptr;
+    scratch->resize(BatchCount);
+    const size_t bytes = scratch->bytes();
+    const int ret = centroid_matrix_storage_->read(index / BatchCount * bytes,
+                                                   scratch->data(), bytes);
+    if (ret != 0) {
+      record_matrix_error(ret);
+      return nullptr;
+    }
+    return scratch->data();
+  }
+
   void record_matrix_error(int error) const {
     int expected = 0;
     matrix_error_.compare_exchange_strong(expected, error,
@@ -435,6 +475,7 @@ class LloydCluster {
 
   void reset_matrix_storage(size_t dim) {
     matrix_storage_.reset();
+    centroid_matrix_storage_.reset();
     stored_matrix_count_ = 0;
     matrix_error_.store(0, std::memory_order_relaxed);
     matrix_write_buffer_.reset(dim);
@@ -449,6 +490,7 @@ class LloydCluster {
   size_t stored_matrix_count_{0};
   mutable std::atomic<int> matrix_error_{0};
   ContainerType centroids_matrix_{};
+  std::shared_ptr<LloydClusterMatrixStorage> centroid_matrix_storage_{};
   ContainerType centroids_{};
   ContextType context_{};
   bool spherical_{false};

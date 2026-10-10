@@ -13,11 +13,13 @@
 // limitations under the License.
 #include "stratified_cluster_trainer.h"
 #include <cmath>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_helper.h>
+#include "utility/reservoir_sample_holder.h"
 #include "cluster_params.h"
 #include "holder_cluster.h"
 
@@ -155,8 +157,8 @@ int StratifiedClusterTrainer::train(IndexThreads::Pointer threads,
     }
   }
 
-  const size_t holder_count = holder->count();
-  const bool has_known_count = holder_count != static_cast<size_t>(-1);
+  size_t holder_count = holder->count();
+  bool has_known_count = holder_count != static_cast<size_t>(-1);
   if (!std::isfinite(sample_ratio_) || sample_ratio_ < 0.0f ||
       (!has_known_count && sample_ratio_ > 0.0f)) {
     return IndexError_InvalidArgument;
@@ -176,12 +178,29 @@ int StratifiedClusterTrainer::train(IndexThreads::Pointer threads,
   }
 
   centroids_.clear();
+  auto streaming_cluster = dynamic_cast<HolderCluster *>(cluster_.get());
+  if (streaming_cluster && train_sample_count > 0 &&
+      (!has_known_count || train_sample_count < holder_count) &&
+      ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+    // Keep the legacy reservoir order, but do not materialize a second heap
+    // corpus before the streaming cluster creates its pageable matrix.
+    IndexHolder::Pointer sample;
+    const int ret =
+        CreateReservoirSampleHolder(holder, train_sample_count, &sample);
+    if (ret != 0) return ret;
+    holder = std::move(sample);
+    holder_count = holder->count();
+    has_known_count = true;
+    // An unsupported cluster may still use its legacy feature interface, but
+    // must consume this completed sample, not resample or reread the source.
+    train_sample_count = 0;
+  }
+
   int result = IndexError_NotImplemented;
   // Reservoir sampling preserves every row in input order when its capacity
   // covers the known corpus. Such a request is full training, too.
   if (has_known_count &&
       (train_sample_count == 0 || train_sample_count >= holder_count)) {
-    auto streaming_cluster = dynamic_cast<HolderCluster *>(cluster_.get());
     if (streaming_cluster) {
       // A previous fallback train may still have features mounted. They are
       // not needed by a new one-shot train and must not overlap its matrix.

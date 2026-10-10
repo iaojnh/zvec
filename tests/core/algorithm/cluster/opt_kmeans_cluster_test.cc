@@ -337,7 +337,9 @@ TEST(OptKmeansCluster, BufferedTrainingUnderPagePressure) {
   auto threads = std::make_shared<SingleQueueIndexThreads>(2, false);
   IndexCluster::CentroidList cents;
   std::vector<float> row(768);
-  for (size_t i = 0; i < 3; ++i) {
+  // More than two SIMD batches of centers, plus a row-major tail. Duplicated
+  // seeds are intentional: the existing empty-cluster handling is unchanged.
+  for (size_t i = 0; i < 65; ++i) {
     holder->fill(i, reinterpret_cast<char *>(row.data()));
     cents.emplace_back(row.data(), row.size() * sizeof(float));
   }

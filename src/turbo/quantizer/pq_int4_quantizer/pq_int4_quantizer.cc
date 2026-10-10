@@ -22,8 +22,10 @@
 #include <vector>
 #include <ailego/algorithm/kmeans.h>
 #include <ailego/math/normalizer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_threads.h>
+#include "quantizer/common/pq_buffered_training.h"
 
 namespace zvec {
 namespace turbo {
@@ -228,39 +230,57 @@ int PqInt4Quantizer::train(IndexHolder::Pointer holder) {
     return kErrUnsupported;
   }
 
-  size_t num = holder->count();
+  const size_t input_count = holder->count();
   const uint32_t elem_size = element_size();
+  const size_t vec_bytes = static_cast<size_t>(original_dim_) * elem_size;
+  if (!input_count || holder->dimension() != original_dim_ ||
+      holder->element_size() != vec_bytes ||
+      holder->data_type() != (input_data_type_ == DataType::kFp16
+                                  ? IndexMeta::DataType::DT_FP16
+                                  : IndexMeta::DataType::DT_FP32)) {
+    return kErrUnsupported;
+  }
+  const size_t num =
+      std::min(input_count, static_cast<size_t>(kMaxTrainVectors));
+  if (num > std::numeric_limits<size_t>::max() / vec_bytes)
+    return kErrUnsupported;
 
-  // Collect all data into a contiguous byte buffer (original data type).
-  auto iter = holder->create_iterator();
-  std::vector<uint8_t> all_data(num * original_dim_ * elem_size);
-  size_t row = 0;
-  for (; iter->is_valid(); iter->next(), ++row) {
-    std::memcpy(all_data.data() + row * original_dim_ * elem_size, iter->data(),
-                original_dim_ * elem_size);
+  if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+    std::vector<uint32_t> offsets(num_chunk_ + 1);
+    for (size_t m = 0; m <= num_chunk_; ++m) offsets[m] = m * sub_dim_;
+    const PqBufferedTrainingOptions options{
+        "PqInt4Quantizer",  original_dim_,
+        std::move(offsets), kNumCentroids,
+        kMaxTrainVectors,   kMaxKmeansIters,
+        thread_count_,      markov_chain_length_,
+        epsilon_,           meta_.metric_name() == "Cosine",
+        use_zero_mean_};
+    const auto refresh = [this]() { build_centroid_ptrs_cache(); };
+    const auto reconstruct = [this](const float *rows, size_t count,
+                                    float *out) {
+      double error = 0.0;
+      encode_reconstruct_batch(rows, count, out, &error);
+      return error;
+    };
+    const int ret =
+        input_data_type_ == DataType::kFp16
+            ? TrainPqBuffered<ailego::Float16>(holder, num, options, centroids_,
+                                               centroid_, opq_, refresh,
+                                               reconstruct)
+            : TrainPqBuffered<float>(holder, num, options, centroids_,
+                                     centroid_, opq_, refresh, reconstruct);
+    if (ret != 0) return ret;
+    build_centroid_ptrs_cache();
+    compute_dist_table();
+    compute_sub_centroid_norms();
+    return 0;
   }
 
-  // Subsample if the dataset exceeds the training limit (aligned with
-  // faiss/vsag: 256 centroids * 256 max_points_per_centroid ~= 65535).
-  if (num > kMaxTrainVectors) {
-    std::mt19937 rng(42);
-    // Fisher-Yates partial shuffle: randomly place kMaxTrainVectors vectors
-    // at the front of the buffer.
-    for (size_t i = 0; i < kMaxTrainVectors; ++i) {
-      std::uniform_int_distribution<size_t> dist(i, num - 1);
-      size_t j = dist(rng);
-      if (i != j) {
-        // Swap full vectors (dim-sized chunks in bytes).
-        size_t vec_bytes = original_dim_ * elem_size;
-        for (size_t b = 0; b < vec_bytes; ++b) {
-          std::swap(all_data[i * vec_bytes + b], all_data[j * vec_bytes + b]);
-        }
-      }
-    }
-    num = kMaxTrainVectors;
-    all_data.resize(num * original_dim_ * elem_size);
-    all_data.shrink_to_fit();
-  }
+  // Preserve the seeded partial Fisher-Yates sample order without copying
+  // the full corpus before sampling.
+  std::vector<uint8_t> all_data;
+  if (!CollectPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes, &all_data))
+    return kErrUnsupported;
 
   size_t data_stride = original_dim_ * elem_size;
 

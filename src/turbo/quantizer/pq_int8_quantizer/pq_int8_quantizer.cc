@@ -25,7 +25,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_threads.h>
-#include "core/utility/temporary_buffer_storage.h"
+#include "quantizer/common/pq_buffered_training.h"
 #include "quantizer/common/pq_training_samples.h"
 
 namespace zvec {
@@ -240,209 +240,26 @@ void PqInt8Quantizer::train_chunk(const T *data, size_t num, size_t stride,
   }
 }
 
-namespace {
-class PqMatrixSlice final : public ailego::LloydClusterMatrixStorage {
- public:
-  PqMatrixSlice(core::TemporaryBufferStorage::Pointer file, size_t base,
-                size_t size)
-      : file_(std::move(file)), base_(base), size_(size) {}
-  int read(size_t offset, void *out, size_t bytes) const override {
-    if (offset > size_ || bytes > size_ - offset)
-      return core::IndexError_InvalidArgument;
-    return file_->read(base_ + offset, out, bytes);
-  }
-  int write(size_t offset, const void *data, size_t bytes) override {
-    if (offset > size_ || bytes > size_ - offset)
-      return core::IndexError_InvalidArgument;
-    return file_->write(base_ + offset, data, bytes);
-  }
-
- private:
-  core::TemporaryBufferStorage::Pointer file_;
-  size_t base_;
-  size_t size_;
-};
-}  // namespace
-
 template <class T>
 int PqInt8Quantizer::train_buffered(const IndexHolder::Pointer &holder,
-                                    size_t num) try {
-  const size_t row_bytes = original_dim_ * sizeof(T);
-  if (num > std::numeric_limits<size_t>::max() / row_bytes / 3)
-    return core::IndexError_Overflow;
-  const size_t samples_bytes = num * row_bytes;
-  std::string prefix;
-  int ret =
-      core::TemporaryBufferStorage::DefaultPrefix("zvec-pq-train", &prefix);
-  if (ret != 0) return ret;
-  core::TemporaryBufferStorage::Pointer file;
-  // Three non-overlapping regions: selected rows, contiguous subspaces, and
-  // transposed Lloyd matrices. Only one shared pool-backed file is needed.
-  ret = core::TemporaryBufferStorage::Create(prefix, 3 * samples_bytes, &file);
-  if (ret != 0) return ret;
-  int write_error = 0;
-  if (!CollectPqTrainingSamplesTo(holder, kMaxTrainVectors, row_bytes,
-                                  [&](size_t slot, const void *row) {
-                                    write_error = file->write(slot * row_bytes,
-                                                              row, row_bytes);
-                                    return write_error == 0;
-                                  }))
-    return write_error != 0 ? write_error : core::IndexError_ReadData;
-
-  std::vector<T> row(original_dim_);
-  if (use_zero_mean_) centroid_.assign(original_dim_, 0.0f);
-  for (size_t i = 0; i < num; ++i) {
-    ret = file->read(i * row_bytes, row.data(), row_bytes);
-    if (ret != 0) return ret;
-    if (meta_.metric_name() == "Cosine") {
-      normalize(row.data(), 1);
-      ret = file->write(i * row_bytes, row.data(), row_bytes);
-      if (ret != 0) return ret;
-    }
-    // Sum in precisely the selected-sample order, as on the heap path.
-    if (use_zero_mean_) {
-      for (size_t d = 0; d < original_dim_; ++d)
-        centroid_[d] += static_cast<float>(row[d]);
-    }
-  }
-  if (use_zero_mean_) {
-    for (auto &value : centroid_) value /= static_cast<float>(num);
-  }
-  const size_t tile_rows = std::max<size_t>(1, 256 * 1024 / row_bytes);
-  std::vector<T> tile(std::min(num, tile_rows) * original_dim_);
-  std::vector<T> subspace(tile.size());
-  auto write_subspaces = [&](size_t first, size_t count, const T *rows) -> int {
-    subspace.resize(count * original_dim_);
-    for (size_t m = 0; m < num_chunk_; ++m) {
-      const size_t offset = chunk_offsets_[m];
-      const size_t width = chunk_dim(m);
-      for (size_t i = 0; i < count; ++i)
-        std::memcpy(subspace.data() + i * width,
-                    rows + i * original_dim_ + offset, width * sizeof(T));
-      int status = file->write(
-          samples_bytes + (offset * num + first * width) * sizeof(T),
-          subspace.data(), count * width * sizeof(T));
-      if (status != 0) return status;
-    }
-    return 0;
-  };
-  for (size_t first = 0; first < num; first += tile_rows) {
-    const size_t count = std::min(tile_rows, num - first);
-    ret = file->read(first * row_bytes, tile.data(), count * row_bytes);
-    if (ret != 0) return ret;
-    if (use_zero_mean_) {
-      for (size_t i = 0; i < count; ++i)
-        for (size_t d = 0; d < original_dim_; ++d)
-          tile[i * original_dim_ + d] -= centroid_[d];
-      ret = file->write(first * row_bytes, tile.data(), count * row_bytes);
-      if (ret != 0) return ret;
-    }
-    ret = write_subspaces(first, count, tile.data());
-    if (ret != 0) return ret;
-  }
-  std::vector<T>().swap(tile);
-  std::vector<T>().swap(subspace);
-
-  auto threads =
-      std::make_shared<SingleQueueIndexThreads>(thread_count_, false);
-  auto train_chunks = [&](uint32_t max_iters) -> int {
-    auto group = threads->make_group();
-    if (!group) return core::IndexError_Runtime;
-    std::atomic<int> error{0};
-    auto train_one = [&](size_t m) -> int {
-      const size_t width = chunk_dim(m);
-      const size_t offset = chunk_offsets_[m] * num * sizeof(T);
-      const size_t bytes = num * width * sizeof(T);
-      ailego::NumericalKmeans<T, SingleQueueIndexThreads> algorithm(
-          kNumCentroids, width);
-      algorithm.set_feature_matrix_storage(std::make_shared<PqMatrixSlice>(
-          file, 2 * samples_bytes + offset, bytes));
-      const size_t batch = std::max<size_t>(1, 64 * 1024 / (width * sizeof(T)));
-      std::vector<T> rows(std::min(num, batch) * width);
-      for (size_t first = 0; first < num; first += batch) {
-        const size_t count = std::min(batch, num - first);
-        int status =
-            file->read(samples_bytes + offset + first * width * sizeof(T),
-                       rows.data(), count * width * sizeof(T));
-        if (status != 0) return status;
-        for (size_t i = 0; i < count; ++i)
-          algorithm.append(rows.data() + i * width, width);
-        if (algorithm.matrix_status() != 0) return algorithm.matrix_status();
-      }
-      SingleQueueIndexThreads local_threads(1, false);
-      ailego::Kmc2CentroidsGenerator<decltype(algorithm),
-                                     SingleQueueIndexThreads>
-          gen;
-      gen.set_chain_length(markov_chain_length_);
-      gen.set_assumption_free(false);
-      algorithm.init_centroids(local_threads, gen);
-      double cost = 0.0;
-      for (uint32_t iter = 0; iter < max_iters; ++iter) {
-        const double old_cost = cost;
-        if (!algorithm.cluster_once(local_threads, &cost)) break;
-        if (std::abs(cost - old_cost) < epsilon_) break;
-      }
-      if (algorithm.matrix_status() != 0) return algorithm.matrix_status();
-      const auto &cents = algorithm.centroids();
-      if (cents.count() != kNumCentroids) return core::IndexError_Runtime;
-      auto *out =
-          centroids_.data() + chunk_offsets_[m] * kNumCentroids * sizeof(T);
-      for (size_t c = 0; c < cents.count(); ++c)
-        std::memcpy(out + c * width * sizeof(T), cents[c], width * sizeof(T));
-      return 0;
-    };
-    for (size_t worker = 0; worker < threads->count(); ++worker) {
-      group->submit(ailego::Closure::New([&, worker]() {
-        try {
-          for (size_t m = worker; m < num_chunk_ && error.load() == 0;
-               m += threads->count()) {
-            int status = train_one(m);
-            if (status != 0) {
-              int expected = 0;
-              error.compare_exchange_strong(expected, status);
-            }
-          }
-        } catch (const std::bad_alloc &) {
-          error.store(core::IndexError_NoMemory);
-        } catch (const std::exception &) {
-          error.store(core::IndexError_Runtime);
-        }
-      }));
-    }
-    group->wait_finish();
-    return error.load();
-  };
-  if (opq_.enabled()) {
-    if constexpr (std::is_same<T, float>::value) {
-      ret = opq_.train_rows(
-          num, "PqInt8Quantizer",
-          [&](size_t first, size_t count, float *rows) {
-            return file->read(first * row_bytes, rows, count * row_bytes);
-          },
-          write_subspaces,
-          [&](uint32_t max_iters) {
-            int status = train_chunks(max_iters);
-            if (status == 0) build_centroid_ptrs_cache();
-            return status;
-          },
-          [this](const float *rotated, size_t count, float *out) {
-            double error = 0.0;
-            pq_reconstruct_batch<kNumCentroids>(
-                rotated, count, original_dim_, centroid_ptrs_cache_,
-                l2_batch_fn_, [this](size_t m) { return chunk_dim(m); }, out,
-                &error);
-            return error;
-          });
-      if (ret != 0) return ret;
-    } else {
-      return kErrUnsupported;
-    }
-  }
-  return train_chunks(kMaxKmeansIters);
-} catch (const std::bad_alloc &) {
-  return core::IndexError_NoMemory;
-} catch (const std::exception &) {
-  return core::IndexError_Runtime;
+                                    size_t num) {
+  const PqBufferedTrainingOptions options{
+      "PqInt8Quantizer", original_dim_,
+      chunk_offsets_,    kNumCentroids,
+      kMaxTrainVectors,  kMaxKmeansIters,
+      thread_count_,     markov_chain_length_,
+      epsilon_,          meta_.metric_name() == "Cosine",
+      use_zero_mean_};
+  return TrainPqBuffered<T>(
+      holder, num, options, centroids_, centroid_, opq_,
+      [this]() { build_centroid_ptrs_cache(); },
+      [this](const float *rotated, size_t count, float *out) {
+        double error = 0.0;
+        pq_reconstruct_batch<kNumCentroids>(
+            rotated, count, original_dim_, centroid_ptrs_cache_, l2_batch_fn_,
+            [this](size_t m) { return chunk_dim(m); }, out, &error);
+        return error;
+      });
 }
 
 int PqInt8Quantizer::train(IndexHolder::Pointer holder) {

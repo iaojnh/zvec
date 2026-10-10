@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <cmath>
+#include <limits>
 #include <gtest/gtest.h>
 #include <turbo/quantizer/common/pq_quantizer/pq_opq.h>
 #include <turbo/quantizer/pq_fast_quantizer/pq_fast_quantizer.h>
@@ -94,11 +95,126 @@ class PqBufferedTrainingTest : public ::testing::Test {
   }
 };
 
+class CountingPqHolder final : public core::IndexHolder {
+ public:
+  class Cursor : public Iterator {
+   public:
+    explicit Cursor(CountingPqHolder *owner) : owner_(owner) {}
+    const void *data() const override {
+      ++owner_->data_reads;
+      for (size_t d = 0; d < 8; ++d) row_[d] = float(d + 1) / 32.0f;
+      return row_;
+    }
+    uint64_t key() const override {
+      return index_;
+    }
+    bool is_valid() const override {
+      return index_ < owner_->actual_count;
+    }
+    int status() const override {
+      return index_ == owner_->error_at ? core::IndexError_ReadData : 0;
+    }
+    void next() override {
+      ++index_;
+    }
+
+   private:
+    CountingPqHolder *owner_;
+    size_t index_{0};
+    mutable float row_[8]{};
+  };
+  size_t count() const override {
+    return reported_count;
+  }
+  size_t dimension() const override {
+    return 8;
+  }
+  size_t element_size() const override {
+    return 8 * sizeof(float);
+  }
+  core::IndexMeta::DataType data_type() const override {
+    return core::IndexMeta::DT_FP32;
+  }
+  bool multipass() const override {
+    return false;
+  }
+  Iterator::Pointer create_iterator() override {
+    return std::make_unique<Cursor>(this);
+  }
+  size_t actual_count{65543};
+  size_t reported_count{65543};
+  size_t error_at{std::numeric_limits<size_t>::max()};
+  size_t data_reads{0};
+};
+
+template <class Quantizer>
+void CheckSampledTraining(bool fail) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t budget =
+      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      128 * 1024;
+  std::string reference;
+  for (size_t capacity : {size_t{0}, budget}) {
+    ASSERT_EQ(pool.init(capacity), 0);
+    auto holder = std::make_shared<CountingPqHolder>();
+    if (fail) holder->error_at = holder->actual_count;
+    core::IndexMeta meta(core::IndexMeta::DT_FP32, 8);
+    meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+    ailego::Params params;
+    params.set("num_chunk", 2u);
+    params.set("thread_count", 2u);
+    params.set("markov_chain_length", 0u);
+    params.set("build_sdc_table", false);
+    Quantizer quantizer;
+    ASSERT_EQ(quantizer.init(meta, params), 0);
+    if (fail) {
+      EXPECT_NE(quantizer.train(holder), 0);
+    } else {
+      ASSERT_EQ(quantizer.train(holder), 0);
+      std::string actual;
+      ASSERT_EQ(quantizer.serialize(&actual), 0);
+      if (capacity == 0)
+        reference = std::move(actual);
+      else
+        EXPECT_EQ(reference, actual);
+    }
+    // Even a one-shot source larger than the training limit only copies
+    // selected rows. Its reused cursor buffer must not be retained.
+    EXPECT_EQ(holder->data_reads, 65536u);
+    EXPECT_EQ(pool.used(), 0u);
+  }
+}
+
+TEST_F(PqBufferedTrainingTest,
+       Int4SamplesBeforeCopyingAndChecksDeferredErrors) {
+  CheckSampledTraining<turbo::PqInt4Quantizer>(false);
+  CheckSampledTraining<turbo::PqInt4Quantizer>(true);
+}
+TEST_F(PqBufferedTrainingTest,
+       FastSamplesBeforeCopyingAndChecksDeferredErrors) {
+  CheckSampledTraining<turbo::PqFastQuantizer>(false);
+  CheckSampledTraining<turbo::PqFastQuantizer>(true);
+}
+
 TEST_F(PqBufferedTrainingTest, FP32MatchesHeapTrainingUnderPressure) {
   compare<core::IndexMeta::DT_FP32, float>();
 }
 TEST_F(PqBufferedTrainingTest, FP16MatchesHeapTrainingUnderPressure) {
   compare<core::IndexMeta::DT_FP16, ailego::Float16>();
+}
+TEST_F(PqBufferedTrainingTest, Int4FP32MatchesHeapTrainingUnderPressure) {
+  compare<core::IndexMeta::DT_FP32, float, turbo::PqInt4Quantizer, 16>();
+}
+TEST_F(PqBufferedTrainingTest, Int4FP16MatchesHeapTrainingUnderPressure) {
+  compare<core::IndexMeta::DT_FP16, ailego::Float16, turbo::PqInt4Quantizer,
+          16>();
+}
+TEST_F(PqBufferedTrainingTest, FastFP32MatchesHeapTrainingUnderPressure) {
+  compare<core::IndexMeta::DT_FP32, float, turbo::PqFastQuantizer, 16>();
+}
+TEST_F(PqBufferedTrainingTest, FastFP16MatchesHeapTrainingUnderPressure) {
+  compare<core::IndexMeta::DT_FP16, ailego::Float16, turbo::PqFastQuantizer,
+          16>();
 }
 TEST_F(PqBufferedTrainingTest, OpqFP32MatchesHeapTrainingUnderPressure) {
   compare<core::IndexMeta::DT_FP32, float>(true);
@@ -125,6 +241,12 @@ TEST_F(PqBufferedTrainingTest, MetadataExhaustionDoesNotFallBackToHeap) {
   turbo::PqInt8Quantizer quantizer;
   ASSERT_EQ(quantizer.init(meta, params), 0);
   EXPECT_NE(quantizer.train(input), 0);
+  turbo::PqInt4Quantizer int4;
+  ASSERT_EQ(int4.init(meta, params), 0);
+  EXPECT_NE(int4.train(input), 0);
+  turbo::PqFastQuantizer fast;
+  ASSERT_EQ(fast.init(meta, params), 0);
+  EXPECT_NE(fast.train(input), 0);
   EXPECT_EQ(pool.used(), 0u);
 }
 
