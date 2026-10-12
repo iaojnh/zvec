@@ -252,6 +252,26 @@ TEST_F(CollectionWriteBudgetTest, CompactedIdGapsSurviveBufferReopen) {
                 fetched->at(key)->get<std::string>("payload").value());
     }
   }
+  // Exercise the merged batch-fetch path with compacted, non-contiguous IDs
+  // in reverse order, spanning both a segment and a fetch microbatch boundary.
+  std::vector<std::string> batch_ids;
+  for (int i = 1099; i >= 0; --i) batch_ids.push_back(std::to_string(i));
+  batch_ids.push_back("1");
+  batch_ids.push_back("missing");
+  auto batch = reader.value()->fetch(batch_ids);
+  ASSERT_TRUE(batch.has_value()) << batch.error().message();
+  ASSERT_EQ(1101u, batch->size());
+  EXPECT_EQ(nullptr, batch->at("missing"));
+  for (int i = 0; i < 1100; ++i) {
+    const auto key = std::to_string(i);
+    const auto &doc = batch->at(key);
+    if (i % 2 == 0) {
+      EXPECT_EQ(nullptr, doc);
+    } else {
+      ASSERT_NE(nullptr, doc);
+      EXPECT_EQ("value_" + key, doc->get<std::string>("payload").value());
+    }
+  }
   ASSERT_TRUE(reader.value()->close().ok());
 }
 

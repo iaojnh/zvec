@@ -167,7 +167,12 @@ TEST(FlatPagedMetadataTest, LazyKeysMappingQueriesAndReadErrors) {
     for (size_t mode = 0; mode < 3; ++mode) {
       SCOPED_TRACE(mode);
       SCOPED_TRACE(static_cast<int>(order));
-      ASSERT_EQ(0, pool.init(mode == 2 ? 512 : 2 * 1024 * 1024));
+      // The bypass path still needs charged metadata reads/query scratch.
+      // This is below page-table metadata admission, not a zero-byte reader.
+      ASSERT_EQ(0, pool.init(mode == 2 ? 64 * 1024 : 2 * 1024 * 1024));
+      if (mode == 2)
+        ASSERT_LT(pool.capacity(),
+                  ailego::VecBufferPool::metadata_bytes_for_page_count(1));
       auto source = IndexFactory::CreateStorage(mode ? "BufferReadStorage"
                                                      : "MMapFileReadStorage");
       ailego::Params params;
