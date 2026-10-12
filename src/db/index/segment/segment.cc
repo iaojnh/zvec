@@ -4600,7 +4600,8 @@ Status SegmentImpl::append_wal(const Doc &doc) {
     CHECK_RETURN_STATUS(s);
   }
 
-  auto ret = wal_file_->append(std::string(buf.begin(), buf.end()));
+  auto ret = wal_file_->append(
+      std::string_view(reinterpret_cast<const char *>(buf.data()), buf.size()));
   if (ret != 0) {
     LOG_ERROR("WAL append failed: segment[%d], pk[%s], operator[%d], ret[%d]",
               id(), doc.pk_ref().c_str(), static_cast<int>(doc.get_operator()),

@@ -26,16 +26,12 @@
 
 namespace zvec {
 
-int LocalWalFile::append(std::string &&data) {
-  WalRecord record;
-  record.length_ = data.size();
-  record.crc_ = ailego::Crc32c::Hash(
-      reinterpret_cast<const void *>(data.data()), record.length_, 0);
-  record.content_ = std::forward<std::string>(data);
-
-  if (write_record(record) < 0) {
-    WLOG_ERROR("Wal write record error. record.length_[%zu]",
-               (size_t)record.length_);
+int LocalWalFile::append(std::string_view data) {
+  // Match the reader's limit before writing any part of an invalid record.
+  if (data.empty() || data.size() > MAX_RECORD_SIZE) return -1;
+  const uint32_t crc = ailego::Crc32c::Hash(data.data(), data.size(), 0);
+  if (write_record(data, crc) < 0) {
+    WLOG_ERROR("Wal write record error. record.length_[%zu]", data.size());
     return -1;
   }
   // if max_docs_wal_flush_ is 0, no need flush
@@ -158,31 +154,31 @@ int LocalWalFile::prepare_for_read() {
 }
 
 //! Return 1 if success or -1 if write error
-int LocalWalFile::write_record(WalRecord &record) {
+int LocalWalFile::write_record(std::string_view data, uint32_t crc) {
   CHECK_STATUS(opened_, true);
+  const auto length = static_cast<uint32_t>(data.size());
 
   int write_size = 0;
   int ret = -1;
 
   std::lock_guard<std::mutex> lock(file_mutex_);
   do {
-    write_size = file_.write((const void *)&record.length_, LENGTH_SIZE);
+    write_size = file_.write(&length, LENGTH_SIZE);
     if (write_size != LENGTH_SIZE) {
       WLOG_ERROR("Wal write error. record.length_ error write_size[%d]",
                  write_size);
       break;
     }
 
-    write_size = file_.write((const void *)&record.crc_, CRC_SIZE);
+    write_size = file_.write(&crc, CRC_SIZE);
     if (write_size != CRC_SIZE) {
       WLOG_ERROR("Wal write error. record.crc_ error write_size[%d]",
                  write_size);
       break;
     }
 
-    write_size =
-        file_.write((const void *)record.content_.data(), record.length_);
-    if (write_size != (int)record.length_) {
+    write_size = file_.write(data.data(), length);
+    if (write_size != static_cast<int>(length)) {
       WLOG_ERROR("Wal write error. record.content_ error write_size[%d]",
                  write_size);
       break;

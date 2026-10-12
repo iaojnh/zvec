@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 
 namespace zvec {
@@ -44,7 +45,9 @@ class WalFile {
                            const WalOptions &wal_options, WalFilePtr *wal_file);
 
  public:
-  virtual int append(std::string &&data) = 0;
+  // Synchronously consumes the view; callers keep its backing bytes alive
+  // until append returns. The WAL does not retain a second document copy.
+  virtual int append(std::string_view data) = 0;
   virtual int prepare_for_read() = 0;
   virtual std::string next() = 0;
 

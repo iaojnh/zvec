@@ -59,7 +59,7 @@ class LocalWalFile : public WalFile {
   }
 
  public:
-  int append(std::string &&data) override;
+  int append(std::string_view data) override;
   int prepare_for_read() override;
   std::string next() override;
 
@@ -77,7 +77,7 @@ class LocalWalFile : public WalFile {
   }
 
  private:
-  int write_record(WalRecord &record);
+  int write_record(std::string_view data, uint32_t crc);
   int read_record(WalRecord &record);
 
  private:

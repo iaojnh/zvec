@@ -25,6 +25,8 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <algorithm>
+#include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/utility/string_helper.h>
@@ -143,6 +145,33 @@ TEST_F(WalFileTest, TestGeneral) {
   // remove
   ret = wal_file->remove();
   ASSERT_EQ(ret, 0);
+}
+
+TEST_F(WalFileTest, BorrowedBinaryAndLimitRejectBeforeWrite) {
+  const auto path = FileHelper::MakeFilePath("./", FileID::WAL_FILE, 0);
+  auto wal = WalFile::Create(path);
+  ASSERT_NE(nullptr, wal);
+  WalOptions options;
+  options.create_new = true;
+  ASSERT_EQ(0, wal->open(options));
+  std::vector<char> bytes{'a', '\0', 'b', '\0', 'c'};
+  ASSERT_EQ(0, wal->append(std::string_view(bytes.data(), bytes.size())));
+  std::fill(bytes.begin(), bytes.end(), 'x');
+  std::string large(4 * 1024 * 1024 + 1, 'q');
+  EXPECT_EQ(-1, wal->append(large));
+  EXPECT_EQ(-1, wal->append(std::string_view{}));
+  ASSERT_EQ(0, wal->append(std::string_view(large.data(), large.size() - 1)));
+  ASSERT_EQ(0, wal->append("tail"));
+  ASSERT_EQ(0, wal->close());
+  options.create_new = false;
+  ASSERT_EQ(0, wal->open(options));
+  ASSERT_EQ(0, wal->prepare_for_read());
+  EXPECT_EQ(std::string("a\0b\0c", 5), wal->next());
+  EXPECT_EQ(large.substr(1), wal->next());
+  EXPECT_EQ("tail", wal->next());
+  EXPECT_TRUE(wal->next().empty());
+  ASSERT_EQ(0, wal->close());
+  ASSERT_EQ(0, wal->remove());
 }
 
 void do_append(WalFile *wal_file, size_t number) {
