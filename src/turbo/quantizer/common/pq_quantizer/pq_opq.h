@@ -92,12 +92,12 @@ class PqOpq {
 //! Reconstruct packed fp32 training vectors from a PQ codebook. chunk_dim(m)
 //! supports both uniform blocks and PQ-int8's unequal blocks. Centroid pointers
 //! must already be refreshed by the quantizer after training its codebook.
-template <size_t NumCentroids, typename ChunkDim>
-float pq_reconstruct_batch(
-    const float *rotated, size_t num, size_t dim,
-    const std::vector<std::vector<const void *>> &centroid_ptrs,
-    const BatchDistanceFunc &l2_batch, ChunkDim chunk_dim, float *x_hat,
-    double *sum_error = nullptr) {
+template <size_t NumCentroids, typename ChunkDim, typename CentroidPointers>
+float pq_reconstruct_batch(const float *rotated, size_t num, size_t dim,
+                           const CentroidPointers &centroid_ptrs,
+                           const BatchDistanceFunc &l2_batch,
+                           ChunkDim chunk_dim, float *x_hat,
+                           double *sum_error = nullptr) {
   float dists[NumCentroids];
   double sum_err = 0.0;
   for (size_t i = 0; i < num; ++i) {

@@ -18,6 +18,11 @@ TopKMergeNode::TopKMergeNode(std::vector<PlanInfo::Ptr> plans,
       output_(std::move(output)),
       candidates_(output_->query_topn(), descending),
       pool_(pool) {
+  if (output_->group_by()) {
+    groups_ = std::make_unique<GroupTopKCandidates>(
+        output_->group_by()->group_count, output_->group_by()->group_topk,
+        descending);
+  }
   auto table = segments_.front()->fetch(
       output_->get_selected_scalar_field_names(), std::vector<int>{});
   if (!table) throw std::runtime_error("Cannot resolve topK output schema");
@@ -31,6 +36,8 @@ TopKMergeNode::TopKMergeNode(std::vector<PlanInfo::Ptr> plans,
                                        : Util::sparse_type());
     }
   }
+  if (groups_)
+    schema_ = Util::append_field(*schema_, FIELD_GROUP_ID, arrow::utf8());
 }
 
 arrow::Status TopKMergeNode::collect(size_t segment,
@@ -48,18 +55,26 @@ arrow::Status TopKMergeNode::collect(size_t segment,
       return arrow::Status::Invalid("Invalid rank-only result batch");
     const auto &row_array = static_cast<const arrow::Int32Array &>(*rows);
     const auto &score_array = static_cast<const arrow::FloatArray &>(*scores);
+    auto names = batch->GetColumnByName(FIELD_GROUP_ID);
+    if (groups_ && (!names || names->type_id() != arrow::Type::STRING))
+      return arrow::Status::Invalid("Missing candidate group ID");
     for (int64_t i = 0; i < batch->num_rows(); ++i) {
       if (row_array.Value(i) < 0)
         return arrow::Status::Invalid("Negative local row ID");
-      candidates_.offer(
-          {segment, ordinal++, row_array.Value(i), score_array.Value(i)});
+      RankedDoc row{segment, ordinal++, row_array.Value(i),
+                    score_array.Value(i)};
+      if (groups_) {
+        const auto &strings = static_cast<const arrow::StringArray &>(*names);
+        if (!strings.IsNull(i)) groups_->offer(strings.GetView(i), row);
+      } else
+        candidates_.offer(row);
     }
   }
   return reader->Close();
 }
 
 arrow::Status TopKMergeNode::prepare() {
-  if (!output_->query_topn()) return arrow::Status::OK();
+  if (!groups_ && !output_->query_topn()) return arrow::Status::OK();
   // Keep only a window of searches in flight. Each child reader has explicit
   // backpressure; completed plans are released, including their index results.
   for (size_t end = plans_.size(); end > 0;) {
@@ -97,7 +112,10 @@ arrow::Status TopKMergeNode::prepare() {
     }
     end -= count;
   }
-  candidates_.finish();
+  if (groups_)
+    groups_->finish();
+  else
+    candidates_.finish();
   return arrow::Status::OK();
 }
 
@@ -131,7 +149,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> TopKMergeNode::fetch(
 arrow::Result<std::shared_ptr<arrow::RecordBatch>>
 TopKMergeNode::materialize() {
   constexpr size_t kBatchRows = 1024;
-  const auto &winners = candidates_.rows();
+  const auto &winners = this->winners();
   const size_t count = std::min(kBatchRows, winners.size() - offset_);
   std::array<size_t, kBatchRows> order;
   std::iota(order.begin(), order.begin() + count, 0);
@@ -144,17 +162,25 @@ TopKMergeNode::materialize() {
     const size_t segment = winners[offset_ + order[begin]].segment;
     std::vector<int> rows;
     arrow::FloatBuilder scores;
+    arrow::StringBuilder group_ids;
     size_t end = begin;
     while (end < count && winners[offset_ + order[end]].segment == segment) {
       const auto &winner = winners[offset_ + order[end]];
       rows.push_back(winner.row);
       ARROW_RETURN_NOT_OK(scores.Append(winner.score));
+      if (groups_)
+        ARROW_RETURN_NOT_OK(group_ids.Append(groups_->group(winner.group)));
       inverse[order[end]] = static_cast<uint32_t>(end);
       ++end;
     }
     ARROW_ASSIGN_OR_RAISE(auto score_array, scores.Finish());
     ARROW_ASSIGN_OR_RAISE(auto batch,
                           fetch(segment, rows, std::move(score_array)));
+    if (groups_) {
+      ARROW_ASSIGN_OR_RAISE(auto labels, group_ids.Finish());
+      ARROW_ASSIGN_OR_RAISE(batch, batch->AddColumn(batch->num_columns(),
+                                                    FIELD_GROUP_ID, labels));
+    }
     batches.push_back(std::move(batch));
     begin = end;
   }
@@ -181,7 +207,7 @@ TopKMergeNode::gen() {
         if (!status.ok()) return arrow::Future<Batch>::MakeFinished(status);
         self->prepared_ = true;
       }
-      if (self->offset_ == self->candidates_.rows().size())
+      if (self->offset_ == self->winners().size())
         return arrow::Future<Batch>::MakeFinished(std::nullopt);
       auto result = self->materialize();
       if (!result.ok())

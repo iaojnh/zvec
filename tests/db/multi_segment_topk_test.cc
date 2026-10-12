@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <unordered_set>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
@@ -136,6 +137,86 @@ TEST(MultiSegmentTopKTest, LateFetchPreservesFieldsVectorsFiltersAndScores) {
             auto sparse = doc.get<Sparse>("sparse");
             ASSERT_TRUE(sparse);
             EXPECT_EQ((std::vector<uint32_t>{0, 3}), sparse->first);
+          }
+        }
+      }
+    }
+    for (const std::string field : {"dense", "ip", "sparse"}) {
+      for (uint32_t group_count : {1u, 3u, 20u}) {
+        for (uint32_t per_group : {1u, 7u}) {
+          SCOPED_TRACE(field + ":groups=" + std::to_string(group_count) +
+                       ":per_group=" + std::to_string(per_group));
+          GroupByVectorQuery query;
+          query.target_.field_name_ = field;
+          const float value = 1;
+          const uint32_t index = 0;
+          if (field == "sparse")
+            query.target_.set_sparse_vector(
+                std::string(reinterpret_cast<const char *>(&index), 4),
+                std::string(reinterpret_cast<const char *>(&value), 4));
+          else {
+            const float target[]{1, 0, 0, 0};
+            query.target_.set_vector(std::string(
+                reinterpret_cast<const char *>(target), sizeof(target)));
+          }
+          query.group_by_field_name_ = "bucket";
+          query.group_count_ = group_count;
+          query.topk_per_group_ = per_group;
+          query.filter_ = "bucket >= 5";
+          query.output_fields_ = {"payload", "bucket", "dense"};
+          query.include_vector_ = true;
+          std::map<int, std::vector<float>> expected;
+          for (int i = 0; i < 2105; ++i) {
+            if (i % 17 == 0 || i % 11 < 5) continue;
+            float x = float(i % 1009) / 10.0f;
+            expected[i % 11].push_back(field == "dense" ? (x - 1) * (x - 1) + 1
+                                                        : x);
+          }
+          auto better = [&](float a, float b) {
+            return field == "dense" ? a < b : a > b;
+          };
+          std::vector<float> best;
+          for (auto &entry : expected) {
+            std::sort(entry.second.begin(), entry.second.end(), better);
+            best.push_back(entry.second.front());
+          }
+          std::sort(best.begin(), best.end(), better);
+          auto result = collection.value()->group_by_query(query);
+          ASSERT_TRUE(result) << result.error().message();
+          ASSERT_EQ(std::min(size_t(group_count), expected.size()),
+                    result->size());
+          for (size_t g = 0; g < result->size(); ++g) {
+            const auto &group = (*result)[g];
+            const int bucket = std::stoi(group.group_by_value_);
+            ASSERT_EQ(per_group, group.docs_.size());
+            EXPECT_FLOAT_EQ(best[g], group.docs_.front().score());
+            for (size_t i = 0; i < group.docs_.size(); ++i) {
+              const auto &doc = group.docs_[i];
+              EXPECT_EQ(bucket, *doc.get<int32_t>("bucket"));
+              // Index-level group_count truncates candidates before the DB
+              // merge. Only compare all runner-ups to a global exact oracle
+              // when every group is retained; compare the best score above
+              // for small group_count (the pre-existing query semantics).
+              if (group_count >= expected.size())
+                EXPECT_FLOAT_EQ(expected.at(bucket)[i], doc.score());
+              if (i)
+                EXPECT_FALSE(better(doc.score(), group.docs_[i - 1].score()));
+              const int id = std::stoi(doc.pk());
+              const float x = float(id % 1009) / 10.0f;
+              EXPECT_FLOAT_EQ(field == "dense" ? (x - 1) * (x - 1) + 1 : x,
+                              doc.score());
+              EXPECT_EQ(bucket, id % 11);
+              auto dense = doc.get<std::vector<float>>("dense");
+              ASSERT_TRUE(dense);
+              EXPECT_EQ((std::vector<float>{x, 1, 0, 0}), *dense);
+              if (id % 7) {
+                auto payload = doc.get<std::string>("payload");
+                ASSERT_TRUE(payload);
+                EXPECT_EQ(std::string(512, 'x') + std::to_string(id), *payload);
+              } else
+                EXPECT_FALSE(doc.get<std::string>("payload"));
+              EXPECT_NE(0, id % 17);
+            }
           }
         }
       }

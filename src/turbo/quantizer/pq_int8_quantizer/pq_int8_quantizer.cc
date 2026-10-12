@@ -105,8 +105,12 @@ int PqInt8Quantizer::setup_functions() {
   return 0;
 }
 
-int PqInt8Quantizer::init(const IndexMeta &meta, const ailego::Params &params) {
+int PqInt8Quantizer::init(const IndexMeta &meta,
+                          const ailego::Params &params) try {
   initialized_ = false;
+  ModelVector<ModelVector<const void *>>().swap(centroid_ptrs_cache_);
+  ModelVector<uint8_t>().swap(centroids_);
+  ModelVector<float>().swap(centroid_);
   meta_ = meta;
 
   // Map core IndexMeta::DataType to turbo DataType.
@@ -170,6 +174,8 @@ int PqInt8Quantizer::init(const IndexMeta &meta, const ailego::Params &params) {
   meta_.set_extra_meta_size(extra_meta_size_);
   initialized_ = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 void PqInt8Quantizer::setup_chunk_offsets() {
@@ -263,7 +269,7 @@ int PqInt8Quantizer::train_buffered(const IndexHolder::Pointer &holder,
       });
 }
 
-int PqInt8Quantizer::train(IndexHolder::Pointer holder) {
+int PqInt8Quantizer::train(IndexHolder::Pointer holder) try {
   if (!holder) {
     return kErrUnsupported;
   }
@@ -295,7 +301,6 @@ int PqInt8Quantizer::train(IndexHolder::Pointer holder) {
       ret = compute_dist_table();
       if (ret != 0) return ret;
     }
-    compute_sub_centroid_norms();
     return 0;
   }
 
@@ -368,10 +373,9 @@ int PqInt8Quantizer::train(IndexHolder::Pointer holder) {
     if (ret != 0) return ret;
   }
 
-  // Pre-compute sub-centroid norms for the precomputed residual table.
-  compute_sub_centroid_norms();
-
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 void PqInt8Quantizer::train_all_chunks(const void *data, size_t num,
@@ -491,18 +495,17 @@ float PagedSdc(const core::PagedBuildBuffer &table, const void *a,
 }
 }  // namespace
 
-void PqInt8Quantizer::compute_sub_centroid_norms() {
+void PqInt8Quantizer::compute_sub_centroid_norms(float *norms) const {
   const size_t k = kNumCentroids;
-  sub_centroid_norms_.resize(static_cast<size_t>(num_chunk_) * k);
 
   // ||c_m[j]||^2 = dist(zero, c_m[j]): reuse the L2 batch kernel with a
   // zero query vector instead of hand-rolling a norm loop.
-  std::vector<uint8_t> zero(chunk_dim(0) * element_size(), 0);
+  ModelVector<uint8_t> zero(chunk_dim(0) * element_size(), 0);
   for (uint32_t m = 0; m < num_chunk_; ++m) {
     const auto &centroid_ptrs = centroid_ptrs_cache_[m];
     // const_cast: see compute_dist_table for rationale.
     l2_batch_fn_(const_cast<const void **>(centroid_ptrs.data()), zero.data(),
-                 k, chunk_dim(m), sub_centroid_norms_.data() + m * k, nullptr);
+                 k, chunk_dim(m), norms + m * k, nullptr);
   }
 }
 
@@ -753,7 +756,8 @@ int PqInt8Quantizer::quantize(const void *query, const IndexQueryMeta &qmeta,
 
 int PqInt8Quantizer::build_centroid_distance_table(const void *centroids,
                                                    size_t centroid_num,
-                                                   std::string *table) const {
+                                                   std::string *table) const
+    try {
   //! The three-term decomposition below is pure L2 algebra.  IVF forces the
   //! residual meta's metric to L2 on both the build and the restore side, so
   //! any other metric here means that contract was broken.
@@ -767,7 +771,8 @@ int PqInt8Quantizer::build_centroid_distance_table(const void *centroids,
     return kErrUnsupported;
   }
   if (centroids == nullptr || centroid_num == 0 || table == nullptr ||
-      num_chunk_ == 0 || centroids_.empty() || sub_centroid_norms_.empty()) {
+      num_chunk_ == 0 || centroids_.empty() ||
+      centroid_ptrs_cache_.size() != num_chunk_) {
     return kErrInvalidArgument;
   }
 
@@ -779,6 +784,8 @@ int PqInt8Quantizer::build_centroid_distance_table(const void *centroids,
     return kErrUnsupported;
   }
 
+  ModelVector<float> norms(row_floats);
+  compute_sub_centroid_norms(norms.data());
   table->resize(centroid_num * row_floats * sizeof(float));
   float *tab = reinterpret_cast<float *>(&(*table)[0]);
   const uint32_t elem_size = element_size();
@@ -813,7 +820,7 @@ int PqInt8Quantizer::build_centroid_distance_table(const void *centroids,
             const_cast<const void **>(centroid_ptrs.data()),
             buf_bytes + static_cast<size_t>(chunk_offsets_[m]) * elem_size,
             kNumCentroids, chunk_dim(m), dists, nullptr);
-        const float *rn = sub_centroid_norms_.data() + m * kNumCentroids;
+        const float *rn = norms.data() + m * kNumCentroids;
         float *out_m = row + m * kNumCentroids;
         for (uint32_t j = 0; j < kNumCentroids; ++j) {
           out_m[j] = rn[j] - 2.0f * dists[j];
@@ -833,6 +840,8 @@ int PqInt8Quantizer::build_centroid_distance_table(const void *centroids,
       return kErrUnsupported;
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int PqInt8Quantizer::quantize_precomputed_query(const void *query,
@@ -1156,7 +1165,7 @@ int PqInt8Quantizer::deserialize(std::string &in) {
 //! meta_ and is intentionally NOT restored from hdr.metric: load paths (e.g.
 //! IVFResidualCodec) own the metric via the persisted IndexMeta and may even
 //! rewrite it before init().
-int PqInt8Quantizer::deserialize(const void *data, size_t len) {
+int PqInt8Quantizer::deserialize(const void *data, size_t len) try {
   if (!initialized_ || data == nullptr) return kErrUnsupported;
   if (len < sizeof(QuantizerSerHeader) + sizeof(PqInt8SerPayload)) {
     return kErrUnsupported;
@@ -1257,6 +1266,7 @@ int PqInt8Quantizer::deserialize(const void *data, size_t len) {
   const size_t centroids_bytes = static_cast<size_t>(centroids_bytes64);
   const size_t centroid_bytes = static_cast<size_t>(centroid_bytes64);
 
+  initialized_ = false;
   original_dim_ = payload.original_dim;
   num_chunk_ = payload.num_chunk;
   input_data_type_ = restored_data_type;
@@ -1294,26 +1304,28 @@ int PqInt8Quantizer::deserialize(const void *data, size_t len) {
   // Pre-build centroid pointer cache for fast encode/search.
   build_centroid_ptrs_cache();
 
-  // Pre-compute sub-centroid norms for the precomputed residual table.
-  compute_sub_centroid_norms();
-
+  initialized_ = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
-int PqInt8Quantizer::import_codebook(const void *data, size_t len) {
+int PqInt8Quantizer::import_codebook(const void *data, size_t len) try {
   // init() owns the geometry, so the codebook size is fully determined; a
   // mismatch means the caller repacked against a different layout.
   if (!initialized_ || data == nullptr) return kErrUnsupported;
   if (len != centroids_.size()) return kErrUnsupported;
 
+  initialized_ = false;
   std::memcpy(centroids_.data(), data, len);
 
   // Same derivations as deserialize(); dist_table_ stays unbuilt because SDC is
   // only used while building.
   build_centroid_ptrs_cache();
-  compute_sub_centroid_norms();
-
+  initialized_ = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_QUANTIZER(PqInt8Quantizer);

@@ -6,6 +6,7 @@
 #include <zvec/ailego/parallel/thread_pool.h>
 #include "db/index/segment/segment.h"
 #include "db/sqlengine/analyzer/query_info.h"
+#include "db/sqlengine/planner/group_topk_candidates.h"
 #include "db/sqlengine/planner/plan_info.h"
 #include "db/sqlengine/planner/topk_candidates.h"
 
@@ -36,6 +37,10 @@ class TopKMergeNode : public std::enable_shared_from_this<TopKMergeNode> {
   std::vector<Segment::Ptr> segments_;
   QueryInfo::Ptr output_;
   TopKCandidates candidates_;
+  std::unique_ptr<GroupTopKCandidates> groups_;
+  const auto &winners() const {
+    return groups_ ? groups_->rows() : candidates_.rows();
+  }
   ailego::ThreadPool *pool_;
   std::shared_ptr<arrow::Schema> schema_;
   size_t offset_{0};

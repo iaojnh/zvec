@@ -16,9 +16,11 @@
 
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <arrow/acero/api.h>
 #include <arrow/acero/exec_plan.h>
+#include <arrow/util/async_generator.h>
 #include <zvec/db/status.h>
 
 namespace zvec::sqlengine {
@@ -37,6 +39,10 @@ class PlanInfo {
   std::shared_ptr<arrow::Schema> schema() const {
     return schema_;
   }
+
+  // Non-blocking pull interface for composing plans on Arrow's own executor.
+  Result<arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>>>
+  execute_to_generator(size_t max_queued_bytes);
 
  private:
   arrow::acero::Declaration plan_;

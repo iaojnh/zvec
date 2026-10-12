@@ -49,6 +49,8 @@ VectorRecallNode::VectorRecallNode(Segment::Ptr segment,
   if (rank_only_) {
     schema_ = arrow::schema({arrow::field(LOCAL_ROW_ID, arrow::int32()),
                              arrow::field(FIELD_SCORE, arrow::float32())});
+    if (query_info_->group_by())
+      schema_ = Util::append_field(*schema_, FIELD_GROUP_ID, arrow::utf8());
     return;
   }
   auto table = segment_->fetch(fetched_columns_, std::vector<int>{});
@@ -240,8 +242,14 @@ VectorRecallNode::State::collect_batch() {
     ARROW_RETURN_NOT_OK(rows.AppendValues(indices.data(), indices.size()));
     ARROW_ASSIGN_OR_RAISE(auto row_array, rows.Finish());
     ARROW_ASSIGN_OR_RAISE(auto scores, builder.Finish());
+    std::vector<std::shared_ptr<arrow::Array>> columns{std::move(row_array),
+                                                       std::move(scores)};
+    if (self_->query_info_->group_by()) {
+      ARROW_ASSIGN_OR_RAISE(auto group_ids, group_id_builder.Finish());
+      columns.push_back(std::move(group_ids));
+    }
     return arrow::RecordBatch::Make(self_->schema_, indices.size(),
-                                    {std::move(row_array), std::move(scores)});
+                                    std::move(columns));
   }
   auto table = self_->segment_->fetch(self_->fetched_columns_, indices);
   if (!table) {

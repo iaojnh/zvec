@@ -16,6 +16,7 @@ struct RankedDoc {
   uint64_t ordinal;
   int32_t row;
   float score;
+  size_t group{0};
 };
 
 // Only compact row references survive global selection. The query workspace is

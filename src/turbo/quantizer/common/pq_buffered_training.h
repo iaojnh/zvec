@@ -69,11 +69,11 @@ class PqMatrixSlice final : public ailego::LloydClusterMatrixStorage {
   size_t size_;
 };
 
-template <class T>
+template <class T, class Centroids, class Center>
 int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
                     const PqBufferedTrainingOptions &options,
-                    std::vector<uint8_t> &centroids, std::vector<float> &center,
-                    PqOpq &opq, const std::function<void()> &refresh_cache,
+                    Centroids &centroids, Center &center, PqOpq &opq,
+                    const std::function<void()> &refresh_cache,
                     const PqOpq::ReconstructSum &reconstruct) try {
   const auto &offsets = options.chunk_offsets;
   if (!num || offsets.size() < 2 || offsets.front() != 0 ||

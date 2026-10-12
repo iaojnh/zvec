@@ -18,6 +18,7 @@
 #include <limits>
 #include <vector>
 #include <core/utility/paged_build_buffer.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
@@ -196,8 +197,8 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   int compute_dist_table();
 
   //! Compute the squared norms of all sub-centroids ([num_chunk * 256]).
-  //! Called after train() and deserialize() when centroids are available.
-  void compute_sub_centroid_norms();
+  //! Only the precomputed residual table builder needs these temporary norms.
+  void compute_sub_centroid_norms(float *norms) const;
 
   //! Build centroid_ptrs_cache_ from current centroids_.
   //! Called after train() and deserialize() when centroids are available.
@@ -257,28 +258,24 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   //! consecutive [kNumCentroids][chunk_dim(m)] blocks, totaling
   //! kNumCentroids * original_dim_ * sizeof(T) bytes.
   //! T = float for kFp32, ailego::Float16 for kFp16.
-  std::vector<uint8_t> centroids_;
+  template <typename T>
+  using ModelVector = std::vector<T, ailego::BudgetedAllocator<T>>;
+  ModelVector<uint8_t> centroids_;
 
   //! Global centroid (per-dimension mean) for zero-mean centering.
   //! Size: original_dim_ floats.  Only populated when use_zero_mean_ = true.
-  std::vector<float> centroid_;
+  ModelVector<float> centroid_;
 
   //! Centroid-to-centroid distance table for SDC:
   //! [num_chunk * kNumCentroids * kNumCentroids]
   std::vector<float> dist_table_;
   std::shared_ptr<core::PagedBuildBuffer> paged_dist_table_;
 
-  //! Squared norms of the sub-centroids: [num_chunk * kNumCentroids],
-  //! entry [m * 256 + j] = ||c_m[j]||^2.  Used by the precomputed
-  //! residual distance table (build_centroid_distance_table /
-  //! quantize_precomputed_query).
-  std::vector<float> sub_centroid_norms_;
-
   //! Pre-built centroid pointer arrays for each chunk.
   //! Layout: centroid_ptrs_cache_[sub_idx][centroid_idx] = pointer to centroid.
   //! Built once during init/deserialize, reused by compute_dist_table
   //! and quantize_query to avoid repeated allocations.
-  std::vector<std::vector<const void *>> centroid_ptrs_cache_;
+  ModelVector<ModelVector<const void *>> centroid_ptrs_cache_;
 
   //! ISA-dispatched kernel function pointers (ADC / SDC / Batch ADC).
   CodebookAsymmetricDistanceFunc adc_fn_{nullptr};

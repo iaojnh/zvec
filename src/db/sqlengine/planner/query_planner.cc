@@ -365,7 +365,7 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
       has_vector && query_info->vector_cond_info()->is_reverse_sort();
   bool has_group_by = query_info->group_by() != nullptr;
   const bool merge_topk =
-      segments.size() > 1 && !has_group_by && (has_vector || has_fts);
+      (segments.size() > 1 || has_group_by) && (has_vector || has_fts);
   auto output_query_info = (*query_infos)[0];
 
   // optimize plan by instrument query info condition, eg adjust invert cond
@@ -432,7 +432,7 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
       LOG_ERROR("Make plan failed: %s", seg_plan.error().c_str());
       return seg_plan;
     }
-    if (segments.size() == 1) {
+    if (segments.size() == 1 && !merge_topk) {
       return seg_plan;
     }
     segment_plans[idx] = std::move(seg_plan.value());
@@ -589,7 +589,8 @@ Result<PlanInfo::Ptr> QueryPlanner::vector_scan(
 
   int topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, false);
-  if (rank_only) batch_size = std::min(batch_size, 1024);
+  if (rank_only)
+    batch_size = query_info->group_by() ? 1024 : std::min(batch_size, 1024);
   auto recall_node = std::make_shared<VectorRecallNode>(
       std::move(seg), std::move(query_info), std::move(doc_filter), batch_size,
       single_stage_search, rank_only);

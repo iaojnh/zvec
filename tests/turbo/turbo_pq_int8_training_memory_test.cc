@@ -27,6 +27,8 @@
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
 #include "ailego/pattern/defer.h"
+#include "quantizer/pq_fast_quantizer/pq_fast_quantizer.h"
+#include "quantizer/pq_int4_quantizer/pq_int4_quantizer.h"
 #include "quantizer/pq_int8_quantizer/pq_int8_quantizer.h"
 
 namespace zvec {
@@ -51,6 +53,114 @@ class PqInt8QuantizerTestAccess {
 };
 
 namespace {
+
+template <typename QuantizerType>
+void check_small_codebook_budget() {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  pool.init(4 * 1024 * 1024);
+  auto reset = ailego::ScopeGuard::Make([&] { pool.init(0); });
+  {
+    QuantizerType quantizer;
+    core::IndexMeta meta;
+    meta.set_meta(core::IndexMeta::DT_FP32, 32);
+    meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+    ailego::Params params;
+    params.set("num_chunk", 8u);
+    params.set("thread_count", 1u);
+    params.set("markov_chain_length", 0u);
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    const size_t initial = pool.external_used();
+    EXPECT_GE(initial, 32u * 16 * sizeof(float));
+    auto holder =
+        std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(
+            32);
+    for (size_t i = 0; i < 128; ++i) {
+      ailego::NumericalVector<float> vector(32);
+      for (size_t d = 0; d < 32; ++d) vector[d] = float((i * 17 + d) % 31);
+      holder->emplace(i, vector);
+    }
+    ASSERT_EQ(0, quantizer.train(holder));
+    const auto resident = pool.external_used();
+    EXPECT_GT(resident, initial);
+    std::string before, after, table;
+    ASSERT_EQ(0, quantizer.serialize(&before));
+    std::vector<float> center(32, 0.0f);
+    ASSERT_EQ(
+        0, quantizer.build_centroid_distance_table(center.data(), 1, &table));
+    EXPECT_EQ(resident, pool.external_used());
+    ASSERT_EQ(0, quantizer.serialize(&after));
+    EXPECT_EQ(before, after);
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    EXPECT_EQ(initial, pool.external_used());
+    ASSERT_EQ(0, quantizer.deserialize(before));
+    ASSERT_EQ(
+        0, quantizer.build_centroid_distance_table(center.data(), 1, &after));
+    EXPECT_EQ(table, after);
+  }
+  EXPECT_EQ(0u, pool.external_used());
+  pool.init(64 * 1024);
+  {
+    QuantizerType quantizer;
+    core::IndexMeta meta;
+    meta.set_meta(core::IndexMeta::DT_FP32, 2048);
+    ailego::Params params;
+    params.set("num_chunk", 128u);
+    EXPECT_EQ(core::IndexError_NoMemory, quantizer.init(meta, params));
+  }
+  EXPECT_EQ(0u, pool.external_used());
+}
+
+TEST(PqModelMemoryTest, Int4ModelsAreChargedAndReinitReleasesThem) {
+  check_small_codebook_budget<PqInt4Quantizer>();
+}
+TEST(PqModelMemoryTest, FastModelsAreChargedAndReinitReleasesThem) {
+  check_small_codebook_budget<PqFastQuantizer>();
+}
+
+TEST(PqInt8ModelMemoryTest, CodebookIsChargedAndNormsAreOnlyTemporary) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  pool.init(8 * 1024 * 1024);
+  {
+    PqInt8Quantizer quantizer;
+    core::IndexMeta meta;
+    meta.set_meta(core::IndexMeta::DT_FP32, 768);
+    meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+    ailego::Params params;
+    params.set("num_chunk", 384u);
+    params.set("build_sdc_table", false);
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    EXPECT_GE(pool.external_used(), 768 * 256 * sizeof(float));
+    std::vector<float> codebook(768 * 256, 0.0f);
+    ASSERT_EQ(0, quantizer.import_codebook(codebook.data(),
+                                           codebook.size() * sizeof(float)));
+    const size_t resident = pool.external_used();
+    EXPECT_GE(resident, 768 * 256 * sizeof(float) + 384 * 256 * sizeof(void *));
+    EXPECT_LT(resident, 1600 * 1024u);
+    std::vector<float> center(768, 0.0f);
+    std::string table;
+    ASSERT_EQ(
+        0, quantizer.build_centroid_distance_table(center.data(), 1, &table));
+    EXPECT_EQ(384 * 256 * sizeof(float), table.size());
+    EXPECT_EQ(resident, pool.external_used());
+  }
+  EXPECT_EQ(0u, pool.external_used());
+  pool.init(0);
+}
+
+TEST(PqInt8ModelMemoryTest, BudgetDenialIsReportedAndDoesNotLeak) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  pool.init(64 * 1024);
+  {
+    PqInt8Quantizer quantizer;
+    core::IndexMeta meta;
+    meta.set_meta(core::IndexMeta::DT_FP32, 768);
+    ailego::Params params;
+    params.set("num_chunk", 384u);
+    EXPECT_EQ(core::IndexError_NoMemory, quantizer.init(meta, params));
+    EXPECT_EQ(0u, pool.external_used());
+  }
+  pool.init(0);
+}
 
 using PqTestAccess = PqInt8QuantizerTestAccess;
 
@@ -284,8 +394,17 @@ TEST_P(PqInt8TrainingMemoryTest, PooledTrainingBuildsSdcAndTinyBudgetFails) {
   ASSERT_EQ(0u, pool.used());
   ASSERT_EQ(0, pool.init(1));
   PqInt8Quantizer quantizer;
+  EXPECT_EQ(core::IndexError_NoMemory,
+            quantizer.init(input_meta(), training_params()));
+  // Leave room for the now-budgeted model, then exhaust the remaining budget
+  // to exercise SDC allocation failure independently of codebook admission.
+  ASSERT_EQ(0, pool.init(1024 * 1024));
   ASSERT_EQ(0, quantizer.init(input_meta(), training_params()));
   ASSERT_EQ(0, quantizer.deserialize(codebook.data(), codebook.size()));
+  const size_t blocked = pool.capacity() - pool.used() - 1;
+  ASSERT_TRUE(pool.try_charge_external(blocked));
+  auto unblock =
+      ailego::ScopeGuard::Make([&] { pool.release_external(blocked); });
   EXPECT_EQ(core::IndexError_NoMemory,
             PqTestAccess::compute_dist_table(quantizer));
   EXPECT_EQ(0u, PqTestAccess::dist_table(quantizer).capacity());

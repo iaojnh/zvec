@@ -29,27 +29,21 @@ namespace zvec::sqlengine {
 class SegmentNode : public std::enable_shared_from_this<SegmentNode> {
  public:
   SegmentNode(std::vector<PlanInfo::Ptr> segment_plans,
-              ailego::ThreadPool *thread_pool)
+              ailego::ThreadPool * /*thread_pool*/)
       : segment_plans_(std::move(segment_plans)),
-        thread_pool_(thread_pool),
-        readers_(segment_plans_.size()) {}
+        schema_(segment_plans_[0]->schema()) {}
 
   //! get schema
   std::shared_ptr<arrow::Schema> schema() const {
-    return segment_plans_[0]->schema();
+    return schema_;
   }
 
   arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> gen();
 
  private:
-  Status prepare();
-
- private:
   std::vector<PlanInfo::Ptr> segment_plans_;
-  ailego::ThreadPool *thread_pool_;
-
-  std::vector<std::unique_ptr<arrow::RecordBatchReader>> readers_;
-  std::atomic_bool prepared_{false};
+  std::shared_ptr<arrow::Schema> schema_;
+  arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> current_;
 };
 
 }  // namespace zvec::sqlengine
