@@ -143,7 +143,7 @@ class ParquetBufferPool {
   using Cache =
       ailego::ExternalCache<ParquetBufferID, detail::ParquetBufferPayload,
                             detail::ParquetBufferLoader, ParquetBufferIDHash,
-                            ParquetBufferIDEqual>;
+                            ParquetBufferIDEqual, /*PayloadOwnsBudget=*/true>;
 
   ParquetBufferPool()
       : cache_(detail::ParquetBufferLoader{}, kMaxConcurrentLoads) {}

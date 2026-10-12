@@ -18,21 +18,28 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 #include <arrow/memory_pool.h>
+
+namespace parquet {
+class FileMetaData;
+}
 
 namespace zvec {
 namespace detail {
 
-// Isolate large Parquet buffers from the general-purpose heap. This changes
-// allocation only: cache admission and the shared budget remain unchanged.
+// Isolate large Parquet buffers from the general-purpose heap. The shared
+// reader pool also reserves their backing capacity before decoding, including
+// temporary buffers which never become cache entries.
 class ParquetMemoryPool final : public arrow::MemoryPool {
  public:
   // An internal initial cutoff, not a claim of an optimal tuning value.
   static constexpr int64_t kMappedAllocationThreshold = 256 * 1024;
 
   explicit ParquetMemoryPool(
-      arrow::MemoryPool *small_pool = arrow::default_memory_pool())
-      : small_pool_(small_pool) {}
+      arrow::MemoryPool *small_pool = arrow::default_memory_pool(),
+      bool enforce_budget = false)
+      : small_pool_(small_pool), enforce_budget_(enforce_budget) {}
 
   using arrow::MemoryPool::Allocate;
   using arrow::MemoryPool::Free;
@@ -71,18 +78,33 @@ class ParquetMemoryPool final : public arrow::MemoryPool {
   int64_t total_mapped_bytes_allocated() const {
     return total_mapped_bytes_allocated_.load(std::memory_order_relaxed);
   }
+  size_t charged_bytes() const {
+    return charged_bytes_.load(std::memory_order_relaxed);
+  }
 
  private:
   arrow::MemoryPool *small_pool_;
+  const bool enforce_budget_;
   arrow::internal::MemoryPoolStats stats_;
   std::atomic<int64_t> mapped_bytes_{0};
   std::atomic<int64_t> num_mapped_allocations_{0};
   std::atomic<int64_t> total_mapped_bytes_allocated_{0};
+  std::atomic<size_t> charged_bytes_{0};
 };
 
 // Cached Arrow buffers retain this owner because Arrow stores a raw pool
 // pointer. Do not replace the shared owner with a loader-local pool.
 std::shared_ptr<ParquetMemoryPool> GetParquetMemoryPool();
+
+// ColumnChunkReader accepts top-level fields, but the streaming reader takes
+// physical leaf indices. Expand nested fields without dropping their children.
+std::vector<int> ParquetLeafColumns(const parquet::FileMetaData &metadata,
+                                    const std::vector<int> &fields);
+
+// A batch-sizing hint only: compressed/repeated values may decode to more
+// bytes. The allocator, not this estimate, enforces admission.
+int64_t ParquetDecodeBatchRows(const parquet::FileMetaData &metadata,
+                               int row_group, const std::vector<int> &columns);
 
 }  // namespace detail
 }  // namespace zvec

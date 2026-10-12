@@ -327,9 +327,11 @@ TEST_F(CollectionBatchFetchPressureTest, BatchesDecodeOnceUnderCachePressure) {
   auto &queue = ailego::BlockEvictionQueue::get_instance();
   auto &pool = ailego::MemoryLimitPool::get_instance();
   queue.batch_recycle(1024);
-  // Each decoded string column is slightly over 1 MiB. One fits, but two
-  // cannot coexist: per-document fetching necessarily reloads the columns.
-  constexpr size_t kHeadroom = 1536 * 1024;
+  // The four columns exceed 4 MiB. Allow a single column AND its decoder
+  // workspace, but not the full cached working set. Previously the decoder
+  // silently exceeded the smaller 1.5-MiB allowance outside pool accounting.
+  constexpr size_t kHeadroom = 3584 * 1024;
+  ASSERT_LT(kHeadroom, columns.size() * kRows * kStringBytes);
   ASSERT_GT(pool.available(), kHeadroom);
   ScopedPoolReservation reservation;
   ASSERT_TRUE(reservation.reserve(pool.available() - kHeadroom));
@@ -487,12 +489,12 @@ TEST_F(CollectionBatchFetchPressureTest,
   auto &queue = ailego::BlockEvictionQueue::get_instance();
   auto &pool = ailego::MemoryLimitPool::get_instance();
   queue.batch_recycle(1024);
-  constexpr size_t kHeadroom = 3 * 1024 * 1024;
+  constexpr size_t kHeadroom = 6 * 1024 * 1024;
   ASSERT_GT(pool.available(), kHeadroom);
   ScopedPoolReservation reservation;
   ASSERT_TRUE(reservation.reserve(pool.available() - kHeadroom));
-  // A LIST scalar retains its source row group. Each group fits alone, but
-  // two 2-MiB groups cannot stay pinned together during the batched read.
+  // A LIST scalar retains its source row group. Leave room for one group
+  // plus its live decoder, not two pinned groups plus the next decode peak.
   const std::vector<std::string> ids{"0", std::to_string(kRowsPerGroup)};
   for (const auto &id : ids) {
     auto single = collection_->fetch({id}, std::nullopt, false);

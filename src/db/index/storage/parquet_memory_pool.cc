@@ -19,6 +19,8 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <parquet/metadata.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -42,6 +44,7 @@ constexpr int64_t kMinimumAlignment = 64;
 struct MappingHeader {
   void *base;
   size_t size;
+  size_t charged;
 };
 
 arrow::Status ValidateRequest(int64_t size, int64_t alignment) {
@@ -117,15 +120,55 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
   }
   ARROW_RETURN_NOT_OK(ValidateRequest(size, alignment));
   alignment = std::max(alignment, kMinimumAlignment);
+  auto &budget = ailego::MemoryLimitPool::get_instance();
   if (size < kMappedAllocationThreshold) {
     // Arrow requires a non-null data address even for empty binary/string
     // buffers. Let its allocator provide and own the zero-size sentinel.
-    ARROW_RETURN_NOT_OK(small_pool_->Allocate(size, alignment, out));
+    if (!enforce_budget_ || size == 0) {
+      ARROW_RETURN_NOT_OK(small_pool_->Allocate(size, alignment, out));
+    } else {
+      // The prefix records the actual charge, even for allocations made
+      // before a process budget is configured. Never infer it at Free time.
+      if (size > std::numeric_limits<int64_t>::max() - alignment) {
+        return arrow::Status::OutOfMemory("Parquet allocation size overflow");
+      }
+      const auto backing_size = size + alignment;
+      if (static_cast<uint64_t>(backing_size) >
+          std::numeric_limits<size_t>::max()) {
+        return arrow::Status::OutOfMemory(
+            "Parquet allocation exceeds address space");
+      }
+      const size_t charge = budget.capacity() ? backing_size : 0;
+      if (charge && !budget.try_charge_workspace(charge)) {
+        return arrow::Status::OutOfMemory(
+            "Parquet decode exceeds shared budget: requested=", charge,
+            " used=", budget.used(), " capacity=", budget.capacity());
+      }
+      uint8_t *base = nullptr;
+      auto status = small_pool_->Allocate(backing_size, alignment, &base);
+      if (!status.ok()) {
+        budget.release_external(charge);
+        return status;
+      }
+      auto *buffer = base + alignment;
+      new (buffer - sizeof(MappingHeader))
+          MappingHeader{base, static_cast<size_t>(backing_size), charge};
+      *out = buffer;
+      charged_bytes_.fetch_add(charge, std::memory_order_relaxed);
+    }
   } else {
     size_t mapped_size = 0;
     ARROW_RETURN_NOT_OK(MappingSize(size, alignment, &mapped_size));
+    const size_t charge =
+        enforce_budget_ && budget.capacity() ? mapped_size : 0;
+    if (charge && !budget.try_charge_workspace(charge)) {
+      return arrow::Status::OutOfMemory(
+          "Parquet decode exceeds shared budget: requested=", charge,
+          " used=", budget.used(), " capacity=", budget.capacity());
+    }
     void *base = MapMemory(mapped_size);
     if (base == nullptr) {
+      budget.release_external(charge);
       return arrow::Status::OutOfMemory("Cannot map Parquet buffer of ", size,
                                         " bytes");
     }
@@ -134,8 +177,10 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
     const uintptr_t aligned = (start + static_cast<uintptr_t>(alignment - 1)) &
                               ~static_cast<uintptr_t>(alignment - 1);
     auto *buffer = reinterpret_cast<uint8_t *>(aligned);
-    new (buffer - sizeof(MappingHeader)) MappingHeader{base, mapped_size};
+    new (buffer - sizeof(MappingHeader))
+        MappingHeader{base, mapped_size, charge};
     *out = buffer;
+    charged_bytes_.fetch_add(charge, std::memory_order_relaxed);
     mapped_bytes_.fetch_add(static_cast<int64_t>(mapped_size),
                             std::memory_order_relaxed);
     num_mapped_allocations_.fetch_add(1, std::memory_order_relaxed);
@@ -156,7 +201,8 @@ arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
   if (old_size == new_size) {
     return arrow::Status::OK();
   }
-  if (old_size != 0 && old_size < kMappedAllocationThreshold &&
+  if (!enforce_budget_ && old_size != 0 &&
+      old_size < kMappedAllocationThreshold &&
       new_size < kMappedAllocationThreshold) {
     ARROW_RETURN_NOT_OK(
         small_pool_->Reallocate(old_size, new_size, alignment, ptr));
@@ -185,7 +231,16 @@ void ParquetMemoryPool::Free(uint8_t *buffer, int64_t size, int64_t alignment) {
   assert(size >= 0 && alignment > 0 && (alignment & (alignment - 1)) == 0);
   alignment = std::max(alignment, kMinimumAlignment);
   if (size < kMappedAllocationThreshold) {
-    small_pool_->Free(buffer, size, alignment);
+    if (!enforce_budget_ || size == 0) {
+      small_pool_->Free(buffer, size, alignment);
+    } else {
+      const auto header = *reinterpret_cast<const MappingHeader *>(
+          buffer - sizeof(MappingHeader));
+      small_pool_->Free(static_cast<uint8_t *>(header.base), header.size,
+                        alignment);
+      ailego::MemoryLimitPool::get_instance().release_external(header.charged);
+      charged_bytes_.fetch_sub(header.charged, std::memory_order_relaxed);
+    }
   } else {
     const auto header = *reinterpret_cast<const MappingHeader *>(
         buffer - sizeof(MappingHeader));
@@ -196,13 +251,51 @@ void ParquetMemoryPool::Free(uint8_t *buffer, int64_t size, int64_t alignment) {
     }
     mapped_bytes_.fetch_sub(static_cast<int64_t>(header.size),
                             std::memory_order_relaxed);
+    ailego::MemoryLimitPool::get_instance().release_external(header.charged);
+    charged_bytes_.fetch_sub(header.charged, std::memory_order_relaxed);
   }
   stats_.DidFreeBytes(size);
 }
 
 std::shared_ptr<ParquetMemoryPool> GetParquetMemoryPool() {
-  static auto pool = std::make_shared<ParquetMemoryPool>();
+  static auto pool = std::make_shared<ParquetMemoryPool>(
+      arrow::default_memory_pool(), /*enforce_budget=*/true);
   return pool;
+}
+
+int64_t ParquetDecodeBatchRows(const parquet::FileMetaData &metadata,
+                               int row_group, const std::vector<int> &columns) {
+  constexpr int64_t kTargetBytes = 512 * 1024;
+  auto group = metadata.RowGroup(row_group);
+  if (group->num_rows() <= 0) return 8192;
+  int64_t row_bytes = 0;
+  for (int column : columns) {
+    if (column < 0 || column >= group->num_columns()) continue;
+    const auto bytes = group->ColumnChunk(column)->total_uncompressed_size();
+    if (bytes <= 0) continue;
+    const int64_t width = std::min(bytes / group->num_rows(), kTargetBytes) + 1;
+    row_bytes += std::min(width, kTargetBytes);
+    if (row_bytes >= kTargetBytes) return 1;
+  }
+  return std::min<int64_t>(8192,
+                           kTargetBytes / std::max<int64_t>(1, row_bytes));
+}
+
+std::vector<int> ParquetLeafColumns(const parquet::FileMetaData &metadata,
+                                    const std::vector<int> &fields) {
+  const auto *schema = metadata.schema();
+  std::vector<int> leaves;
+  for (int field : fields) {
+    if (field < 0 || field >= schema->group_node()->field_count()) continue;
+    const auto *root = schema->group_node()->field(field).get();
+    for (int leaf = 0; leaf < schema->num_columns(); ++leaf) {
+      if (schema->GetColumnRoot(leaf) == root &&
+          std::find(leaves.begin(), leaves.end(), leaf) == leaves.end()) {
+        leaves.push_back(leaf);
+      }
+    }
+  }
+  return leaves;
 }
 
 }  // namespace detail

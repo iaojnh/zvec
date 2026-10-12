@@ -18,8 +18,10 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <arrow/buffer.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 
 namespace zvec {
 namespace detail {
@@ -251,6 +253,115 @@ TEST(ParquetMemoryPoolTest, ArrowResizableBufferUsesPoolUntilReleased) {
   EXPECT_EQ(0, pool.mapped_bytes());
   buffer.reset();
   EXPECT_EQ(0, pool.bytes_allocated());
+}
+
+class ParquetBudgetTest : public testing::Test {
+ protected:
+  void SetUp() override {
+    previous_capacity_ = budget_.capacity();
+    ASSERT_EQ(0u, budget_.used());
+    ASSERT_EQ(0, budget_.init(1024 * 1024));
+  }
+  void TearDown() override {
+    EXPECT_EQ(0u, budget_.used());
+    EXPECT_EQ(0, budget_.init(previous_capacity_));
+  }
+  ailego::MemoryLimitPool &budget_ = ailego::MemoryLimitPool::get_instance();
+  size_t previous_capacity_{0};
+};
+
+TEST_F(ParquetBudgetTest, ReservesBackingCapacityBeforeAllocation) {
+  arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
+  ParquetMemoryPool pool(&fallback, true);
+  uint8_t *small = nullptr, *large = nullptr, *denied = nullptr;
+  ASSERT_TRUE(pool.Allocate(1024, &small).ok());
+  EXPECT_EQ(fallback.bytes_allocated(), budget_.external_used());
+  EXPECT_GT(budget_.external_used(), 1024u);
+  ASSERT_TRUE(pool.Allocate(kThreshold, 65536, &large).ok());
+  EXPECT_EQ(fallback.bytes_allocated() + pool.mapped_bytes(),
+            budget_.external_used());
+  EXPECT_EQ(pool.charged_bytes(), budget_.external_used());
+  const auto allocations = pool.num_allocations();
+  EXPECT_TRUE(pool.Allocate(1024 * 1024, &denied).IsOutOfMemory());
+  EXPECT_EQ(nullptr, denied);
+  EXPECT_EQ(allocations, pool.num_allocations());
+  pool.Free(large, kThreshold, 65536);
+  pool.Free(small, 1024);
+  EXPECT_EQ(0u, pool.charged_bytes());
+}
+
+TEST_F(ParquetBudgetTest, FailedBackingAllocationRollsBackReservation) {
+  RejectingMemoryPool fallback;
+  ParquetMemoryPool pool(&fallback, true);
+  uint8_t *buffer = nullptr;
+  EXPECT_TRUE(pool.Allocate(1024, &buffer).IsOutOfMemory());
+  EXPECT_EQ(nullptr, buffer);
+  EXPECT_EQ(0u, budget_.external_used());
+  EXPECT_EQ(0u, pool.charged_bytes());
+  EXPECT_EQ(0, pool.num_allocations());
+}
+
+TEST_F(ParquetBudgetTest,
+       ReallocationReservesOverlapAndFailurePreservesOldData) {
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  uint8_t *buffer = nullptr;
+  ASSERT_TRUE(pool.Allocate(kThreshold, &buffer).ok());
+  std::memset(buffer, 17, kThreshold);
+  auto *original = buffer;
+  const auto charged = budget_.external_used();
+  // New capacity alone fits, but old + new backing cannot coexist.
+  EXPECT_TRUE(
+      pool.Reallocate(kThreshold, 3 * kThreshold, &buffer).IsOutOfMemory());
+  EXPECT_EQ(original, buffer);
+  EXPECT_EQ(charged, budget_.external_used());
+  EXPECT_EQ(17, buffer[kThreshold - 1]);
+  ASSERT_TRUE(pool.Reallocate(kThreshold, 2 * kThreshold, &buffer).ok());
+  EXPECT_EQ(17, buffer[kThreshold - 1]);
+  EXPECT_EQ(pool.mapped_bytes(), budget_.external_used());
+  ASSERT_TRUE(pool.Reallocate(2 * kThreshold, 1024, &buffer).ok());
+  EXPECT_EQ(17, buffer[1023]);
+  ASSERT_TRUE(pool.Reallocate(1024, 0, &buffer).ok());
+  EXPECT_NE(nullptr, buffer);
+  EXPECT_EQ(0u, budget_.external_used());
+  pool.Free(buffer, 0);
+}
+
+TEST_F(ParquetBudgetTest, FreeUsesRecordedChargeAcrossBudgetInitialization) {
+  ASSERT_EQ(0, budget_.init(0));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  uint8_t *small = nullptr, *large = nullptr;
+  ASSERT_TRUE(pool.Allocate(1024, &small).ok());
+  ASSERT_TRUE(pool.Allocate(kThreshold, &large).ok());
+  EXPECT_EQ(0u, pool.charged_bytes());
+  ASSERT_EQ(0, budget_.init(1024 * 1024));
+  pool.Free(small, 1024);
+  pool.Free(large, kThreshold);
+  EXPECT_EQ(0u, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, ConcurrentDecodersShareOneByteBudget) {
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  std::atomic<size_t> ready{0}, admitted{0};
+  std::array<std::thread, 8> workers;
+  for (auto &worker : workers) {
+    worker = std::thread([&] {
+      uint8_t *buffer = nullptr;
+      auto status = pool.Allocate(kThreshold, &buffer);
+      if (status.ok())
+        admitted.fetch_add(1);
+      else
+        EXPECT_TRUE(status.IsOutOfMemory());
+      EXPECT_LE(budget_.used(), budget_.capacity());
+      ready.fetch_add(1);
+      while (ready.load() != workers.size()) std::this_thread::yield();
+      if (buffer) pool.Free(buffer, kThreshold);
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  // Page rounding makes four 256-KiB mappings exceed the 1-MiB budget.
+  EXPECT_EQ(3u, admitted.load());
+  EXPECT_EQ(0u, budget_.external_used());
+  EXPECT_EQ(0u, pool.charged_bytes());
 }
 
 }  // namespace

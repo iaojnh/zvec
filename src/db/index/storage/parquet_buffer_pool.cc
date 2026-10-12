@@ -178,7 +178,15 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
   // Configure both the low-level Parquet reader and Arrow output builders;
   // OpenFile(input, pool) alone leaves ReaderProperties on the default pool.
   parquet::ReaderProperties read_properties(mem_pool);
+  read_properties.enable_buffered_stream();
+  read_properties.set_buffer_size(64 * 1024);
   parquet::arrow::FileReaderBuilder builder;
+  parquet::ArrowReaderProperties arrow_properties;
+  arrow_properties.set_pre_buffer(false);
+  // Bound output-builder growth even while retaining the resulting chunks
+  // for cache publication. Individual dictionary/data pages still need a
+  // contiguous decode workspace and are subject to allocation admission.
+  builder.properties(arrow_properties);
   auto open_status = builder.Open(input, read_properties);
   if (!open_status.ok()) {
     LOG_ERROR("Failed to open parquet reader[%s]: %s", file_name.c_str(),
@@ -195,13 +203,27 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
 
   int row_group = buffer_id.row_group;
   int column = buffer_id.column;
-  auto s = reader->RowGroup(row_group)->Column(column)->Read(&payload.arrow);
+  const auto metadata = reader->parquet_reader()->metadata();
+  const auto leaves = ParquetLeafColumns(*metadata, {column});
+  if (leaves.empty()) return false;
+  reader->set_batch_size(ParquetDecodeBatchRows(*metadata, row_group, leaves));
+  auto batches = reader->GetRecordBatchReader({row_group}, leaves);
+  if (!batches.ok()) {
+    LOG_ERROR("Failed to create parquet column reader[%s]: %s",
+              file_name.c_str(), batches.status().ToString().c_str());
+    return false;
+  }
+  auto result = (*batches)->ToTable();
+  auto s = result.status();
   if (!s.ok()) {
     LOG_ERROR("Failed to read parquet file[%s]: %s", file_name.c_str(),
               s.ToString().c_str());
     payload.arrow = nullptr;
     return false;
   }
+  auto table = *result;
+  if (table->num_columns() != 1) return false;
+  payload.arrow = table->column(0);
 
   size = 0;
   payload.arrow_refs.clear();

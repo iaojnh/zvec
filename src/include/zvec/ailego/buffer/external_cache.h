@@ -31,8 +31,11 @@
 namespace zvec {
 namespace ailego {
 
+// A precharged payload owns reservations from allocation through destruction.
+// The cache must not charge it again at publication or release those bytes
+// before its buffers are destroyed. Legacy loaders retain post-load accounting.
 template <typename Key, typename Payload, typename Loader, typename Hash,
-          typename Equal>
+          typename Equal, bool PayloadOwnsBudget = false>
 class ExternalCache : public EvictableBlockOwner {
  public:
   using Value = typename Loader::Value;
@@ -57,7 +60,7 @@ class ExternalCache : public EvictableBlockOwner {
     for (auto &item : table_) {
       Entry &entry = item.second;
       if (entry.size != 0) {
-        MemoryLimitPool::get_instance().release_external(entry.size);
+        release_charge(entry.size);
         entry.size = 0;
       }
       clear_noexcept(entry.payload);
@@ -160,7 +163,8 @@ class ExternalCache : public EvictableBlockOwner {
       return Value{};
     }
 
-    if (!MemoryLimitPool::get_instance().try_charge_external(size)) {
+    if (!PayloadOwnsBudget &&
+        !MemoryLimitPool::get_instance().try_charge_external(size)) {
       clear_noexcept(*loaded_payload);
       finish_loading(key);
       return Value{};
@@ -169,7 +173,7 @@ class ExternalCache : public EvictableBlockOwner {
     lock.lock();
     iter = table_.find(key);
     if (iter == table_.end()) {
-      MemoryLimitPool::get_instance().release_external(size);
+      release_charge(size);
       clear_noexcept(*loaded_payload);
       claimed_load_state->complete = true;
       if (active_loads_ != 0) {
@@ -200,7 +204,7 @@ class ExternalCache : public EvictableBlockOwner {
     } catch (...) {
       entry.ref_count.store(std::numeric_limits<int>::min(),
                             std::memory_order_release);
-      MemoryLimitPool::get_instance().release_external(size);
+      release_charge(size);
       entry.size = 0;
       clear_noexcept(entry.payload);
       clear_noexcept(*loaded_payload);
@@ -302,7 +306,7 @@ class ExternalCache : public EvictableBlockOwner {
     if (entry.ref_count.compare_exchange_strong(
             expected, std::numeric_limits<int>::min())) {
       entry.in_evict_queue.store(false, std::memory_order_relaxed);
-      MemoryLimitPool::get_instance().release_external(entry.size);
+      release_charge(entry.size);
       entry.size = 0;
       clear_noexcept(entry.payload);
       if (!entry.loading) {
@@ -353,7 +357,7 @@ class ExternalCache : public EvictableBlockOwner {
     int expected = 0;
     if (entry.ref_count.compare_exchange_strong(
             expected, std::numeric_limits<int>::min())) {
-      MemoryLimitPool::get_instance().release_external(entry.size);
+      release_charge(entry.size);
       entry.size = 0;
       clear_noexcept(entry.payload);
       if (!entry.loading) {
@@ -364,6 +368,12 @@ class ExternalCache : public EvictableBlockOwner {
   }
 
  private:
+  static void release_charge(size_t size) {
+    if constexpr (!PayloadOwnsBudget) {
+      MemoryLimitPool::get_instance().release_external(size);
+    }
+  }
+
   struct LoadState {
     std::condition_variable_any cv;
     bool complete{false};
