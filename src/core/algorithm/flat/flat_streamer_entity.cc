@@ -1420,9 +1420,9 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
           return ret;
         }
         ret = this->add_to_block(block, kInvalidKey, vec.data(), size);
-        if (ailego_unlikely(ret != 0)) {
-          return ret;
-        }
+      }
+      if (ailego_unlikely(ret != 0)) {
+        return ret;
       }
       if (ret != 0) return ret;
     }
@@ -1438,9 +1438,9 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
         return ret;
       }
       ret = this->add_to_block(block, id, query, size);
-      if (ailego_unlikely(ret != 0)) {
-        return ret;
-      }
+    }
+    if (ailego_unlikely(ret != 0)) {
+      return ret;
     }
     if (ret != 0) return ret;
   } else {

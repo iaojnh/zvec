@@ -440,6 +440,10 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
 
   // multi segment logic
   ailego::ThreadPool *pool = GlobalResource::Instance().query_thread_pool();
+  if (pool == nullptr) {
+    return tl::make_unexpected(
+        Status::InternalError("Query thread pool initialization failed"));
+  }
   if (merge_topk) {
     try {
       auto merge = std::make_shared<TopKMergeNode>(
