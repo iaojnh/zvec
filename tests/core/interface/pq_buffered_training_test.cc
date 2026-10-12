@@ -83,11 +83,13 @@ class PqBufferedTrainingTest : public ::testing::Test {
         Quantizer paged;
         ASSERT_EQ(paged.init(meta, params), 0);
         ASSERT_EQ(paged.train(input), 0);
-        // Training scratch is released, but the fitted OPQ rotation stays
-        // charged until the quantizer is destroyed. This small matrix uses
-        // PagedBuildBuffer's charged inline representation.
+        // Training scratch is released; the fitted model/optional rotation
+        // remain charged until the quantizer is destroyed (checked in
+        // teardown).
         const size_t retained = opq ? kDim * kDim * sizeof(float) : 0;
-        EXPECT_EQ(pool.used(), retained);
+        EXPECT_GT(pool.used(), retained);
+        EXPECT_EQ(pool.used(), pool.external_used());
+        EXPECT_LT(pool.used(), 128u * 1024);
         std::string actual;
         ASSERT_EQ(paged.serialize(&actual), 0);
         std::vector<uint8_t> a(legacy.quantized_datapoint_vector_length()),
@@ -212,7 +214,9 @@ void CheckSampledTraining(bool fail) {
   auto &pool = ailego::MemoryLimitPool::get_instance();
   const size_t budget =
       ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
-      128 * 1024;
+      // This test selects 65,536 ordinals. Its mandatory shuffled-ordinal
+      // workspace is now charged too, unlike evictable vector sample pages.
+      8 * 1024 * 1024;
   std::string reference;
   for (size_t capacity : {size_t{0}, budget}) {
     ASSERT_EQ(pool.init(capacity), 0);
@@ -241,7 +245,8 @@ void CheckSampledTraining(bool fail) {
     // Even a one-shot source larger than the training limit only copies
     // selected rows. Its reused cursor buffer must not be retained.
     EXPECT_EQ(holder->data_reads, 65536u);
-    EXPECT_EQ(pool.used(), 0u);
+    EXPECT_EQ(pool.used(), pool.external_used());
+    EXPECT_LT(pool.used(), 16u * 1024);
   }
 }
 
@@ -287,7 +292,8 @@ TEST_F(PqBufferedTrainingTest, OpqFastMatchesHeapTrainingUnderPressure) {
 }
 TEST_F(PqBufferedTrainingTest, MetadataExhaustionDoesNotFallBackToHeap) {
   auto &pool = ailego::MemoryLimitPool::get_instance();
-  ASSERT_EQ(pool.init(1), 0);
+  // Enough for the three tiny codebooks, not writable page-table metadata.
+  ASSERT_EQ(pool.init(64 * 1024), 0);
   auto input =
       std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(8);
   for (uint32_t i = 0; i < 512; ++i) {
@@ -307,7 +313,8 @@ TEST_F(PqBufferedTrainingTest, MetadataExhaustionDoesNotFallBackToHeap) {
   turbo::PqFastQuantizer fast;
   ASSERT_EQ(fast.init(meta, params), 0);
   EXPECT_NE(fast.train(input), 0);
-  EXPECT_EQ(pool.used(), 0u);
+  EXPECT_EQ(pool.used(), pool.external_used());
+  EXPECT_LT(pool.used(), 64u * 1024);
 }
 
 TEST_F(PqBufferedTrainingTest, OpqDistinctRowsMatchAcrossPagedTileBoundaries) {

@@ -14,8 +14,10 @@
 
 #include "pq_opq.h"
 #include <turbo/preprocessor/opq_rotator/opq_rotator.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/logger/logger.h>
 #include "core/utility/paged_build_buffer.h"
+#include "turbo/training_workspace.h"
 
 namespace zvec {
 namespace turbo {
@@ -112,12 +114,14 @@ int PqOpq::train_rows(size_t num, const char *name,
       num > std::numeric_limits<size_t>::max() / sizeof(float) / dim)
     return kErrInvalidArgument;
   const size_t row_bytes = dim * sizeof(float);
-  const size_t tile = std::min<size_t>(num, 1024);
-  std::vector<float> original(tile * dim), rotated(original.size()),
-      reconstructed(original.size());
   core::PagedBuildBuffer reconstruction;
   int ret = reconstruction.init(num * row_bytes, 64 * 1024);
   if (ret != 0) return ret;
+  // Reserve backing metadata first, then shrink tiles under budget pressure.
+  const size_t tile =
+      TrainingTileRows(std::min<size_t>(num, 1024), row_bytes, 3);
+  std::vector<float, ailego::BudgetedAllocator<float>> original(tile * dim),
+      rotated(original.size()), reconstructed(original.size());
   auto publish_rotation = [&]() -> int {
     for (size_t first = 0; first < num; first += tile) {
       const size_t count = std::min(tile, num - first);

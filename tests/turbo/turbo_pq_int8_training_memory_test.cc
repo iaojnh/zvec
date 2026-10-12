@@ -27,6 +27,7 @@
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
 #include "ailego/pattern/defer.h"
+#include "quantizer/common/pq_training_samples.h"
 #include "quantizer/pq_fast_quantizer/pq_fast_quantizer.h"
 #include "quantizer/pq_int4_quantizer/pq_int4_quantizer.h"
 #include "quantizer/pq_int8_quantizer/pq_int8_quantizer.h"
@@ -163,6 +164,42 @@ TEST(PqInt8ModelMemoryTest, BudgetDenialIsReportedAndDoesNotLeak) {
 }
 
 using PqTestAccess = PqInt8QuantizerTestAccess;
+
+TEST(PqSamplingMemoryTest, OrdinalWorkspaceIsChargedAndReleased) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(128 * 1024));
+  AILEGO_DEFER([&]() {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  auto holder =
+      std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(1);
+  for (size_t i = 0; i < 256; ++i) {
+    ailego::NumericalVector<float> row(1);
+    row[0] = static_cast<float>(i);
+    holder->emplace(i, row);
+  }
+  size_t copied = 0;
+  auto write = [&](size_t, const void *) {
+    ++copied;
+    EXPECT_GE(pool.external_used(), 128 * 2 * sizeof(size_t));
+    return true;
+  };
+  EXPECT_TRUE(CollectPqTrainingSamplesTo(holder, 128, sizeof(float), write));
+  EXPECT_EQ(128u, copied);
+  EXPECT_EQ(0u, pool.external_used());
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - 128);
+    const size_t charged = pool.external_used();
+    EXPECT_THROW(CollectPqTrainingSamplesTo(holder, 128, sizeof(float), write),
+                 std::bad_alloc);
+    EXPECT_EQ(128u, copied);
+    EXPECT_EQ(charged, pool.external_used());
+  }
+}
 
 class PqInt8TrainingMemoryTest
     : public ::testing::TestWithParam<core::IndexMeta::DataType> {

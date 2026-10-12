@@ -22,6 +22,7 @@
 #include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_error.h>
@@ -2106,17 +2107,51 @@ TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveLaterBatches) {
     EXPECT_EQ(0, std::memcmp(payload.data() + offset + 2 * page_size,
                              larger.data(), page_size + 256));
 
-    // With every slice from the latest batch released, reuse its allocation.
-    const void *reusable = other.data();
+    // Releasing the final slice returns its budget. Allocator address reuse
+    // is not an API guarantee and must not keep an idle TLS allocation alive.
+    auto &memory = ailego::MemoryLimitPool::get_instance();
+    const size_t charged = memory.external_used();
     other.reset();
+    EXPECT_LT(memory.external_used(), charged);
     ASSERT_TRUE(other_segment->read_borrowed_batch(cross_storage, 1));
-    EXPECT_EQ(reusable, other.data());
+    EXPECT_EQ(charged, memory.external_used());
     ASSERT_EQ(0, other_storage->close());
     ASSERT_EQ(0, storage->close());
     EXPECT_EQ(0, std::memcmp(payload.data() + offset, retained.data(), 128));
     EXPECT_EQ(0, std::memcmp(payload.data() + offset + 3 * page_size,
                              other.data(), 128));
   }
+}
+
+TEST_F(BufferStorageWriteTest, BatchDescriptorsRejectPressureBeforePinning) {
+  {
+    auto storage = open_writable();
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->append("descriptor_budget", 1));
+    ASSERT_EQ(0, storage->close());
+  }
+  auto storage = open_read_only();
+  ASSERT_TRUE(storage);
+  auto segment = storage->get("descriptor_budget");
+  ASSERT_TRUE(segment);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t initial = pool.external_used();
+  std::vector<IndexStorage::MemoryBlock> blocks(8192);
+  std::vector<IndexStorage::Segment::BorrowedRead> reads;
+  for (auto &block : blocks) reads.emplace_back(segment.get(), 0, 0, &block);
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.available() - 128 * 1024);
+    const size_t charged = pool.external_used();
+    EXPECT_FALSE(
+        segment->read_borrowed_batch_immutable(reads.data(), reads.size()));
+    EXPECT_EQ(charged, pool.external_used());
+    for (auto &block : blocks) EXPECT_EQ(nullptr, block.data());
+  }
+  EXPECT_EQ(initial, pool.external_used());
+  ASSERT_TRUE(segment->read_borrowed_batch_immutable(reads.data(), 8));
+  // Neither descriptors nor a bypass page remain charged to the idle thread.
+  EXPECT_EQ(initial, pool.external_used());
 }
 
 TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveReadingThreadExit) {

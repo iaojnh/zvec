@@ -6,7 +6,9 @@
 #include <cmath>
 #include <random>
 #include <rabitqlib/third/Eigen/Dense>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include "core/utility/paged_build_buffer.h"
+#include "turbo/training_workspace.h"
 
 namespace zvec::turbo {
 
@@ -105,7 +107,7 @@ class PagedOpqWorkspace {
     if (ret) return ret;
     std::mt19937_64 generator(seed);
     std::normal_distribution<float> distribution(0, 1);
-    std::vector<double> row(dim_), v(dim_);
+    std::vector<double, ailego::BudgetedAllocator<double>> row(dim_), v(dim_);
     for (size_t i = 0; i < dim_; ++i) {
       for (auto &x : row) x = distribution(generator);
       if ((ret = line(0, i, false, row.data(), true))) return ret;
@@ -141,7 +143,7 @@ class PagedOpqWorkspace {
     }
     ret = output->init(dim_ * dim_ * sizeof(float), 64 * 1024);
     if (ret) return ret;
-    std::vector<float> result(dim_);
+    std::vector<float, ailego::BudgetedAllocator<float>> result(dim_);
     for (size_t i = 0; i < dim_; ++i) {
       if ((ret = line(1, i, false, row.data()))) return ret;
       std::copy(row.begin(), row.end(), result.begin());
@@ -157,9 +159,9 @@ class PagedOpqWorkspace {
     int ret = init(3);  // covariance/work, U, V
     if (ret) return ret;
     const size_t batch =
-        std::min({num, size_t{1024},
-                  std::max<size_t>(1, 256 * 1024 / sizeof(float) / dim_)});
-    std::vector<float> x(batch * dim_), y(x.size());
+        TrainingTileRows(std::min<size_t>(num, 1024), dim_ * sizeof(float), 2);
+    std::vector<float, ailego::BudgetedAllocator<float>> x(batch * dim_),
+        y(x.size());
     using Rows =
         Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     Tile block;
@@ -234,7 +236,7 @@ class PagedOpqWorkspace {
     // Sign normalization is needed; sorting singular values is not: the same
     // permutation on U and V cancels in V * U^T, including zero singular
     // values.
-    std::vector<double> signs(dim_);
+    std::vector<double, ailego::BudgetedAllocator<double>> signs(dim_);
     for (size_t i = 0; i < dim_; ++i) {
       double diagonal = 0;
       if ((ret = value(0, i, i, &diagonal))) return ret;

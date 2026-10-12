@@ -381,29 +381,21 @@ class BufferStorage : public IndexStorage {
         size_t length{0};
       };
       struct BatchScratch {
-        std::vector<BatchState> states;
-        std::vector<ailego::block_id_t> page_ids;
-        std::vector<ailego::block_id_t> unique_page_ids;
-        std::vector<char *> pages;
-        std::vector<PageUse> page_uses;
-        std::vector<ailego::block_id_t> admitted_ids;
-        std::vector<size_t> admitted_indices;
-        std::vector<char *> admitted_pages;
+        std::vector<BatchState, ailego::BudgetedAllocator<BatchState>> states;
+        std::vector<ailego::block_id_t,
+                    ailego::BudgetedAllocator<ailego::block_id_t>>
+            page_ids, unique_page_ids, admitted_ids;
+        std::vector<char *, ailego::BudgetedAllocator<char *>> pages,
+            admitted_pages;
+        std::vector<PageUse, ailego::BudgetedAllocator<PageUse>> page_uses;
+        std::vector<size_t, ailego::BudgetedAllocator<size_t>> admitted_indices;
         std::shared_ptr<std::vector<char, ailego::BudgetedAllocator<char>>>
             arena;
         std::vector<char, ailego::BudgetedAllocator<char>> bypass_page;
       };
-      static thread_local BatchScratch scratch;
-
-      scratch.states.clear();
-      scratch.page_ids.clear();
-      scratch.unique_page_ids.clear();
-      scratch.pages.clear();
-      scratch.page_uses.clear();
-      scratch.admitted_ids.clear();
-      scratch.admitted_indices.clear();
-      scratch.admitted_pages.clear();
-      scratch.states.reserve(count);
+      // Descriptors scale with request count and touched pages. Own and
+      // charge them per operation, rather than retaining each thread's peak.
+      BatchScratch scratch;
       for (size_t i = 0; i < count; ++i) {
         if (reads[i].block != nullptr) {
           reads[i].block->reset();
@@ -434,15 +426,12 @@ class BufferStorage : public IndexStorage {
       struct Cleanup {
         decltype(cleanup_owned) &owned;
         decltype(release_pages) &pages;
-        BatchScratch &scratch;
         ~Cleanup() {
           owned();
           pages();
-          // Returned slices, not an idle TLS arena, retain the budget.
-          scratch.arena.reset();
-          decltype(scratch.bypass_page){}.swap(scratch.bypass_page);
         }
-      } cleanup{cleanup_owned, release_pages, scratch};
+      } cleanup{cleanup_owned, release_pages};
+      scratch.states.reserve(count);
       auto fail = [&]() {
         cleanup_owned();
         release_pages();
@@ -532,6 +521,12 @@ class BufferStorage : public IndexStorage {
                                                 scratch.unique_page_ids.end()),
                                     scratch.unique_page_ids.end());
       scratch.pages.assign(scratch.unique_page_ids.size(), nullptr);
+      // All descriptors must fit before taking any pins. Otherwise the
+      // pinned batch could consume the capacity needed to describe fallback.
+      scratch.admitted_ids.reserve(scratch.unique_page_ids.size());
+      scratch.admitted_indices.reserve(scratch.unique_page_ids.size());
+      scratch.admitted_pages.reserve(scratch.unique_page_ids.size());
+      scratch.page_uses.reserve(total_pages);
 
       // Take resident hits without I/O first, then admit only unique misses
       // selected by the compact frequency policy. One-off cold pages bypass
@@ -681,7 +676,6 @@ class BufferStorage : public IndexStorage {
       // Describe every copied fragment, sort by unique source page, and read
       // each bypass page exactly once before scattering it to all vectors that
       // overlap that page.
-      scratch.page_uses.reserve(total_pages);
       for (size_t state_index = 0; state_index < scratch.states.size();
            ++state_index) {
         const BatchState &state = scratch.states[state_index];

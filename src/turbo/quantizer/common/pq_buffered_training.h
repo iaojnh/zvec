@@ -27,6 +27,7 @@
 #include <zvec/core/framework/index_threads.h>
 #include "core/utility/temporary_buffer_storage.h"
 #include "pq_quantizer/pq_opq.h"
+#include "turbo/training_workspace.h"
 #include "pq_training_samples.h"
 
 namespace zvec::turbo {
@@ -106,7 +107,8 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
                                   }))
     return write_error != 0 ? write_error : core::IndexError_ReadData;
 
-  std::vector<T> row(options.dimension);
+  using Workspace = std::vector<T, ailego::BudgetedAllocator<T>>;
+  Workspace row(options.dimension);
   if (options.zero_mean) center.assign(options.dimension, 0.0f);
   for (size_t i = 0; i < num; ++i) {
     ret = file->read(i * row_bytes, row.data(), row_bytes);
@@ -126,9 +128,9 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
   if (options.zero_mean) {
     for (auto &value : center) value /= static_cast<float>(num);
   }
-  const size_t tile_rows = std::max<size_t>(1, 256 * 1024 / row_bytes);
-  std::vector<T> tile(std::min(num, tile_rows) * options.dimension);
-  std::vector<T> subspace(tile.size());
+  const size_t tile_rows = TrainingTileRows(num, row_bytes, 2);
+  Workspace tile(std::min(num, tile_rows) * options.dimension);
+  Workspace subspace(tile.size());
   auto write_subspaces = [&](size_t first, size_t count, const T *rows) -> int {
     subspace.resize(count * options.dimension);
     for (size_t m = 0; m < num_chunks; ++m) {
@@ -158,8 +160,9 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
     ret = write_subspaces(first, count, tile.data());
     if (ret != 0) return ret;
   }
-  std::vector<T>().swap(tile);
-  std::vector<T>().swap(subspace);
+  Workspace().swap(tile);
+  Workspace().swap(subspace);
+  Workspace().swap(row);
 
   auto threads = std::make_shared<core::SingleQueueIndexThreads>(
       options.thread_count, false);
@@ -175,8 +178,9 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
           options.centroid_count, width);
       algorithm.set_feature_matrix_storage(std::make_shared<PqMatrixSlice>(
           file, 2 * samples_bytes + offset, bytes));
-      const size_t batch = std::max<size_t>(1, 64 * 1024 / (width * sizeof(T)));
-      std::vector<T> rows(std::min(num, batch) * width);
+      const size_t batch =
+          TrainingTileRows(num, width * sizeof(T), threads->count(), 64 * 1024);
+      Workspace rows(std::min(num, batch) * width);
       for (size_t first = 0; first < num; first += batch) {
         const size_t count = std::min(batch, num - first);
         int status =

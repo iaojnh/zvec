@@ -20,6 +20,7 @@
 #include <random>
 #include <unordered_map>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/core/framework/index_holder.h>
 
 namespace zvec::turbo {
@@ -39,10 +40,14 @@ inline bool CollectPqTrainingSamplesTo(const core::IndexHolder::Pointer &holder,
   // Perform the same seeded partial Fisher-Yates shuffle on row ordinals,
   // then stream only selected rows into their original training slots. The
   // sparse permutation and data buffer are bounded by the training limit.
-  std::vector<std::pair<size_t, size_t>> selected;
+  using Selection = std::pair<size_t, size_t>;
+  std::vector<Selection, ailego::BudgetedAllocator<Selection>> selected;
   if (input_count > num) {
     selected.reserve(num);
-    std::unordered_map<size_t, size_t> permutation;
+    std::unordered_map<
+        size_t, size_t, std::hash<size_t>, std::equal_to<size_t>,
+        ailego::BudgetedAllocator<std::pair<const size_t, size_t>>>
+        permutation;
     permutation.reserve(num);
     auto at = [&](size_t position) {
       auto entry = permutation.find(position);

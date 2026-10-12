@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <limits>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_factory.h>
 #include "preprocessor/opq_rotator/opq_rotator.h"
@@ -260,6 +261,48 @@ TEST(PqOpq, PreservesRotatorBlobAndRejectsInvalidDimension) {
             opq.deserialize(type, 3, blob.data(), blob.size() - 1));
   EXPECT_EQ(0, opq.deserialize(0, 3, nullptr, 0));
   EXPECT_FALSE(opq.enabled());
+}
+
+TEST(PqOpq, StreamedTilesAreByteBoundedChargedAndReleasedOnFailure) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(16 * 1024 * 1024));
+  AILEGO_DEFER([&]() {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  PqOpq opq;
+  constexpr size_t kDimension = 128, kRows = 1025;
+  ASSERT_EQ(0, opq.init(kDimension, DataType::kFp32, opq_params()));
+  const auto baseline = pool.external_used();
+  size_t reads = 0;
+  auto read = [&](size_t first, size_t count, float *) {
+    ++reads;
+    EXPECT_EQ(0u, first);
+    EXPECT_EQ(256u * 1024 / (kDimension * sizeof(float)), count);
+    EXPECT_GE(pool.external_used(), baseline + 3 * 256u * 1024);
+    return -123;
+  };
+  auto write = [](size_t, size_t, const float *) { return 0; };
+  auto train = [](uint32_t) { return 0; };
+  auto reconstruct = [](const float *, size_t, float *) { return 0.0; };
+  EXPECT_EQ(-123, opq.train_rows(kRows, "budget-test", read, write, train,
+                                 reconstruct));
+  EXPECT_EQ(1u, reads);
+  EXPECT_EQ(baseline, pool.external_used());
+
+  // Mandatory backing metadata and even the smallest tiles must both fit.
+  // Refusal must precede input consumption and release all temporary charges.
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.metadata_used() - pool.external_used() -
+               384 * 1024);
+  const auto pressured = pool.external_used();
+  EXPECT_EQ(
+      core::IndexError_NoMemory,
+      opq.train_rows(kRows, "budget-test", read, write, train, reconstruct));
+  EXPECT_EQ(1u, reads);
+  EXPECT_EQ(pressured, pool.external_used());
 }
 
 }  // namespace
