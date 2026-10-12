@@ -18,6 +18,8 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/exception.h>
 #include <zvec/ailego/logger/logger.h>
+#include "parquet_memory_pool.h"
+#include "parquet_write_batch.h"
 
 
 namespace zvec {
@@ -70,12 +72,14 @@ class ParquetChunkedWriter : public ChunkedFileWriter {
                           arrow::io::FileOutputStream::Open(path));
 
     parquet::WriterProperties::Builder builder;
+    builder.memory_pool(detail::GetParquetMemoryPool().get());
     auto properties = builder.build();
 
     std::shared_ptr<parquet::arrow::FileWriter> writer;
-    ARROW_ASSIGN_OR_RAISE(writer, parquet::arrow::FileWriter::Open(
-                                      *schema, arrow::default_memory_pool(),
-                                      out_file, properties));
+    ARROW_ASSIGN_OR_RAISE(
+        writer, parquet::arrow::FileWriter::Open(
+                    *schema, detail::GetParquetMemoryPool().get(), out_file,
+                    properties));
 
     return std::make_unique<ParquetChunkedWriter>(schema, std::move(out_file),
                                                   std::move(writer));
@@ -89,11 +93,11 @@ class ParquetChunkedWriter : public ChunkedFileWriter {
         writer_(std::move(writer)) {}
 
   arrow::Status write(const arrow::RecordBatch &batch) override {
-    return writer_->WriteRecordBatch(batch);
+    return detail::WriteParquetBatch(writer_.get(), batch);
   }
 
   arrow::Status write(const arrow::Table &table) override {
-    return writer_->WriteTable(table);
+    return detail::WriteParquetTable(writer_.get(), table);
   }
 
   arrow::Status close() override {

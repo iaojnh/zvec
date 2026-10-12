@@ -319,6 +319,27 @@ TEST_F(CollectionBatchFetchPressureTest, BatchesDecodeOnceUnderCachePressure) {
   }
   ASSERT_TRUE(collection_->flush().ok());
   collection_.reset();
+  // Exercise an existing, large-row-group file independently of the current
+  // writer's byte-sized groups. Small new groups can all fit in this budget.
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(path_)) {
+    if (entry.path().extension() != ".parquet") continue;
+    auto input = arrow::io::ReadableFile::Open(entry.path().string());
+    ASSERT_TRUE(input.ok());
+    auto reader =
+        parquet::arrow::OpenFile(*input, arrow::default_memory_pool());
+    ASSERT_TRUE(reader.ok());
+    std::shared_ptr<arrow::Table> table;
+    ASSERT_TRUE((*reader)->ReadTable(&table).ok());
+    reader.ValueOrDie().reset();
+    ASSERT_TRUE((*input)->Close().ok());
+    auto output = arrow::io::FileOutputStream::Open(entry.path().string());
+    ASSERT_TRUE(output.ok());
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
+                                           *output, kRows)
+                    .ok());
+    ASSERT_TRUE((*output)->Close().ok());
+  }
   auto reopened = Collection::Open(
       path_, CollectionOptions{/*read_only=*/true, /*enable_mmap=*/false});
   ASSERT_TRUE(reopened.has_value()) << reopened.error().message();

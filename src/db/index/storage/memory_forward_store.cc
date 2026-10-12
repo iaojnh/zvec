@@ -354,6 +354,19 @@ Status MemForwardStore::flush_locked() {
     }
 
     if (!batches_to_merge.empty()) {
+      if (format_ == FileFormat::PARQUET) {
+        // The Parquet writer consumes chunked columns directly; concatenating
+        // them first needlessly overlaps a full extra payload with the input.
+        auto table = arrow::Table::FromRecordBatches(batches_to_merge);
+        if (!table.ok())
+          return Status::InternalError(table.status().ToString());
+        auto written = writer_->write(**table);
+        if (!written.ok()) return Status::InternalError(written.ToString());
+        flushed_batches_ = end_index;
+        has_incr = true;
+        start_index = end_index;
+        continue;
+      }
       std::shared_ptr<arrow::RecordBatch> batch_to_write;
 
       if (batches_to_merge.size() == 1) {

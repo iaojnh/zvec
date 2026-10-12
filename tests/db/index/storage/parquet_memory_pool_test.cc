@@ -15,13 +15,20 @@
 #include "db/index/storage/parquet_memory_pool.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <thread>
+#include <ailego/pattern/scope_guard.h>
+#include <arrow/api.h>
 #include <arrow/buffer.h>
 #include <gtest/gtest.h>
+#include <parquet/file_reader.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include "db/index/storage/chunked_file_writer.h"
+#include "db/index/storage/store_helper.h"
 
 namespace zvec {
 namespace detail {
@@ -270,6 +277,42 @@ class ParquetBudgetTest : public testing::Test {
   size_t previous_capacity_{0};
 };
 
+TEST_F(ParquetBudgetTest, ScalarConversionAdmitsBeforeAllocationAndCanRetry) {
+  arrow::Int32Builder values_builder;
+  ASSERT_TRUE(values_builder.Append(7).ok());
+  auto values_result = values_builder.Finish();
+  ASSERT_TRUE(values_result.ok());
+  auto values = values_result.ValueOrDie();
+  const std::vector<std::shared_ptr<arrow::Scalar>> samples{
+      std::make_shared<arrow::Int32Scalar>(7),
+      std::make_shared<arrow::StringScalar>("payload"),
+      std::make_shared<arrow::BinaryScalar>("binary"),
+      std::make_shared<arrow::ListScalar>(values)};
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  for (const auto &sample : samples) {
+    SCOPED_TRACE(sample->type->ToString());
+    const std::vector<std::shared_ptr<arrow::Scalar>> input{sample};
+    std::shared_ptr<arrow::Array> output = values;
+    ASSERT_TRUE(budget_.try_charge_external(budget_.capacity()));
+    {
+      auto release = ailego::ScopeGuard::Make(
+          [&] { budget_.release_external(budget_.capacity()); });
+      EXPECT_TRUE(ConvertScalarVectorToArrayByType(input, &output, &pool)
+                      .IsOutOfMemory());
+      EXPECT_EQ(values, output);
+      EXPECT_EQ(0, pool.bytes_allocated());
+    }
+    ASSERT_TRUE(ConvertScalarVectorToArrayByType(input, &output, &pool).ok());
+    auto actual = output->GetScalar(0);
+    ASSERT_TRUE(actual.ok());
+    EXPECT_TRUE(actual.ValueOrDie()->Equals(*sample));
+    EXPECT_GT(pool.charged_bytes(), 0u);
+    actual = arrow::Status::Invalid("Release result before checking budget");
+    output.reset();
+    EXPECT_EQ(0u, budget_.used());
+  }
+}
+
 TEST_F(ParquetBudgetTest, ReservesBackingCapacityBeforeAllocation) {
   arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
   ParquetMemoryPool pool(&fallback, true);
@@ -288,6 +331,41 @@ TEST_F(ParquetBudgetTest, ReservesBackingCapacityBeforeAllocation) {
   pool.Free(large, kThreshold, 65536);
   pool.Free(small, 1024);
   EXPECT_EQ(0u, pool.charged_bytes());
+}
+
+TEST_F(ParquetBudgetTest,
+       RepeatedWriterBatchesDoNotAccumulateOneBufferedRowGroup) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("zvec_parquet_budget_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto cleanup =
+      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+  auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
+  arrow::BinaryBuilder builder;
+  for (int i = 0; i < 1024; ++i)
+    ASSERT_TRUE(
+        builder.Append(std::string(1024, 'x') + std::to_string(i)).ok());
+  auto batch =
+      arrow::RecordBatch::Make(schema, 1024, {builder.Finish().ValueOrDie()});
+  auto writer =
+      ChunkedFileWriter::Open(path.string(), schema, FileFormat::PARQUET);
+  ASSERT_NE(nullptr, writer);
+  for (int i = 0; i < 32; ++i) {
+    ASSERT_TRUE(writer->write(*batch).ok());
+    EXPECT_LE(budget_.used(), budget_.capacity());
+  }
+  ASSERT_GT(GetParquetMemoryPool()->total_bytes_allocated(), 0);
+  ASSERT_TRUE(writer->close().ok());
+  writer.reset();
+  EXPECT_EQ(0u, budget_.used());
+  auto reader = parquet::ParquetFileReader::OpenFile(path.string(), false);
+  EXPECT_EQ(32 * 1024, reader->metadata()->num_rows());
+  EXPECT_GE(reader->metadata()->num_row_groups(), 32);
+  for (int i = 0; i < reader->metadata()->num_row_groups(); ++i)
+    EXPECT_LE(reader->metadata()->RowGroup(i)->num_rows(), 1024);
 }
 
 TEST_F(ParquetBudgetTest, FailedBackingAllocationRollsBackReservation) {
