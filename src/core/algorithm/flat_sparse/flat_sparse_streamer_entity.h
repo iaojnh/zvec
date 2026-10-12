@@ -97,10 +97,16 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
   }
 
   inline node_id_t get_id(uint64_t key) const override {
+    if (!use_id_map_) {
+      return key < doc_cnt() && get_key(static_cast<node_id_t>(key)) == key
+                 ? static_cast<node_id_t>(key)
+                 : kInvalidNodeId;
+    }
     keys_map_lock_->lock_shared();
     auto it = keys_map_->find(key);
+    const auto id = it == keys_map_->end() ? kInvalidNodeId : it->second;
     keys_map_lock_->unlock_shared();
-    return it == keys_map_->end() ? kInvalidNodeId : it->second;
+    return id;
   }
 
   uint64_t get_key(node_id_t node_id) const override;
@@ -206,11 +212,8 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
 
   int dump_index_meta(IndexDumper *dumper);
 
-  int dump_keys(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
-  int dump_mapping(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
   int dump_offset_data(IndexDumper *dumper);
+  int read_key(node_id_t id, uint64_t *key) const;
 
 
  private:
@@ -220,14 +223,15 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
       std::shared_ptr<ailego::SharedMutex> keys_map_lock,
       std::shared_ptr<std::map<uint64_t, node_id_t>> keys_map,
       std::vector<Chunk::Pointer> sparse_data_chunks,
-      std::vector<Chunk::Pointer> sparse_offset_chunks)
+      std::vector<Chunk::Pointer> sparse_offset_chunks, bool use_id_map)
       : stats_(stats),
         meta_(meta),
         streamer_meta_(streamer_meta),
         keys_map_lock_(keys_map_lock),
         keys_map_(keys_map),
         sparse_data_chunks_(std::move(sparse_data_chunks)),
-        sparse_offset_chunks_(std::move(sparse_offset_chunks)) {}
+        sparse_offset_chunks_(std::move(sparse_offset_chunks)),
+        use_id_map_(use_id_map) {}
 
  private:
   IndexStorage::Pointer storage_{};
@@ -252,12 +256,12 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
   mutable std::vector<Chunk::Pointer> sparse_offset_chunks_{};
 
   // config
+  bool use_id_map_{true};
   uint32_t max_doc_cnt_{1 << 24U};  // 16 million
   uint32_t max_data_chunk_cnt_{
       1 << 10U};  // 1024, default single_data_chunk_size = 8M,
                   // default_total_max = 1024 * 8M = 8G
 
-  uint64_t dump_size_{0U};
   size_t sparse_unit_size_{0U};
 };
 

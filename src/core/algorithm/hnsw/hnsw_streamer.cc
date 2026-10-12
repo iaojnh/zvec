@@ -17,6 +17,7 @@
 #include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
 #include <turbo/quantizer/quantizer.h>
+#include "utility/group_candidate_collector.h"
 #include "utility/sparse_utility.h"
 #include "hnsw_algorithm.h"
 #include "hnsw_context.h"
@@ -647,7 +648,7 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
   ctx->set_min_scan_limit(min_scan_limit_);
   ctx->set_max_scan_ratio(max_scan_ratio_);
   ctx->set_filter_mode(bf_enabled_ ? VisitFilter::BloomFilter
-                                   : VisitFilter::ByteMap);
+                                   : VisitFilter::EpochBitMap);
   ctx->set_filter_negative_probability(bf_negative_prob_);
   ctx->set_magic(magic_);
   ctx->set_force_padding_topk(force_padding_topk_enabled_);
@@ -664,7 +665,11 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
     LOG_DEBUG("HnswStreamer doc_count[%zu] estimate[%zu]",
               (size_t)entity_->doc_cnt(), (size_t)estimate_doc_count);
   }
-  ctx->check_need_adjuct_ctx(std::max(entity_->doc_cnt(), estimate_doc_count));
+  if (!ctx->check_need_adjuct_ctx(
+          std::max(entity_->doc_cnt(), estimate_doc_count))) {
+    delete ctx;
+    return Context::Pointer();
+  }
 
   return Context::Pointer(ctx);
 }
@@ -757,7 +762,8 @@ int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
 
   ctx->clear();
   bind_add_dist_space(ctx);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
 
   //! use the original vector from provider as the build query, fetched
   //! before mutating the entity so a missing vector cannot leave an
@@ -859,7 +865,8 @@ int HnswStreamer::add_impl(uint64_t pkey, const void *query,
 
   ctx->clear();
   bind_add_dist_space(ctx);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
 
   //! use the original vector from provider as the build query
   IndexStorage::MemoryBlock original_query_block;
@@ -920,14 +927,18 @@ int HnswStreamer::add_impl(uint64_t pkey, const void *query,
 
 
 int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                              IndexStreamer::Context::Pointer &context) const {
+                              IndexStreamer::Context::Pointer &context) const
+    try {
   return search_impl(query, qmeta, 1, context);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search
 int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                               uint32_t count,
-                              IndexStreamer::Context::Pointer &context) const {
+                              IndexStreamer::Context::Pointer &context) const
+    try {
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -954,7 +965,8 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   //! search always uses the vectors stored in the entity
   bind_search_dist_space(ctx);
   ctx->resize_results(count);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   for (size_t q = 0; q < count; ++q) {
     ctx->reset_query(query, meta_);
     ret = alg_->search(ctx);
@@ -971,11 +983,13 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int HnswStreamer::search_candidates_impl(
     const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
   keys.clear();
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
@@ -1003,7 +1017,8 @@ int HnswStreamer::search_candidates_impl(
 
   ctx->clear();
   bind_search_dist_space(ctx);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   ctx->reset_query(query, meta_);
   ret = alg_->search(ctx);
   if (ailego_unlikely(ret != 0)) {
@@ -1017,6 +1032,8 @@ int HnswStreamer::search_candidates_impl(
     return IndexError_Runtime;
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 void HnswStreamer::print_debug_info() {
@@ -1041,15 +1058,18 @@ void HnswStreamer::print_debug_info() {
   // entity_->print_key_map();
 }
 
-int HnswStreamer::search_bf_impl(
-    const void *query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) const {
+int HnswStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                                 IndexStreamer::Context::Pointer &context) const
+    try {
   return search_bf_impl(query, qmeta, 1, context);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int HnswStreamer::search_bf_impl(
-    const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const {
+int HnswStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                                 uint32_t count,
+                                 IndexStreamer::Context::Pointer &context) const
+    try {
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -1085,6 +1105,7 @@ int HnswStreamer::search_bf_impl(
     for (size_t q = 0; q < count; ++q) {
       ctx->reset_query(query, meta_);
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (node_id_t id = 0; id < entity_->doc_cnt(); ++id) {
         if (entity_->get_key(id) == kInvalidKey) {
@@ -1096,13 +1117,14 @@ int HnswStreamer::search_bf_impl(
 
           std::string group_id = group_by(id);
 
-          auto &topk_heap = ctx->group_topk_heaps()[group_id];
-          if (topk_heap.empty()) {
-            topk_heap.limit(ctx->group_topk());
-          }
-          topk_heap.emplace(id, dist);
+          if (int group_ret = groups.add(group_id, id, dist); group_ret != 0)
+            return group_ret;
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
@@ -1133,12 +1155,14 @@ int HnswStreamer::search_bf_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int HnswStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -1180,6 +1204,7 @@ int HnswStreamer::search_bf_by_p_keys_impl(
     for (size_t q = 0; q < count; ++q) {
       ctx->reset_query(query, meta_);
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (size_t idx = 0; idx < p_keys[q].size(); ++idx) {
         uint64_t pk = p_keys[q][idx];
@@ -1189,14 +1214,15 @@ int HnswStreamer::search_bf_by_p_keys_impl(
             dist_t dist = ctx->batch_dist(id);
             std::string group_id = group_by(id);
 
-            auto &topk_heap = ctx->group_topk_heaps()[group_id];
-            if (topk_heap.empty()) {
-              topk_heap.limit(ctx->group_topk());
-            }
-            topk_heap.emplace(id, dist);
+            if (int group_ret = groups.add(group_id, id, dist); group_ret != 0)
+              return group_ret;
           }
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
@@ -1227,6 +1253,8 @@ int HnswStreamer::search_bf_by_p_keys_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 

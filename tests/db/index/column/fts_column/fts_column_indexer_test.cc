@@ -1216,6 +1216,45 @@ TEST_F(FtsColumnIndexerTest, ConvertPostingsToBitpackedEmptyIndexer) {
   // about them here beyond "the conversion did not crash".
 }
 
+TEST_F(FtsColumnIndexerTest, ConversionBudgetFailurePreservesSideDataForRetry) {
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  struct RestorePool {
+    size_t capacity;
+    ~RestorePool() {
+      zvec::ailego::MemoryLimitPool::get_instance().init(capacity);
+    }
+  } restore{pool.capacity()};
+  auto indexer = make_indexer();
+  for (uint32_t i = 0; i < 2049; ++i) {
+    ASSERT_TRUE(indexer->insert(i * 2, "common common other").has_value());
+  }
+  ASSERT_TRUE(indexer->flush().has_value());
+  const size_t tf_count = count_cf_entries(db_, term_freq_cf_);
+  const size_t dl_count = count_cf_entries(db_, doc_len_cf_);
+  pool.init(1);
+  auto denied = indexer->convert_postings_to_bitpacked();
+  ASSERT_FALSE(denied.has_value());
+  EXPECT_EQ(zvec::StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  EXPECT_EQ(tf_count, count_cf_entries(db_, term_freq_cf_));
+  EXPECT_EQ(dl_count, count_cf_entries(db_, doc_len_cf_));
+
+  pool.init(8 * 1024 * 1024);
+  ASSERT_TRUE(indexer->convert_postings_to_bitpacked().has_value());
+  ASSERT_TRUE(indexer->convert_postings_to_bitpacked().has_value());
+  std::string bytes;
+  ASSERT_TRUE(
+      db_.db_->Get(db_.read_opts_, postings_cf_, "common", &bytes).ok());
+  BitPackedPostingIterator iter;
+  ASSERT_EQ(0, iter.open(bytes.data(), bytes.size()));
+  EXPECT_EQ(2049u, iter.cost());
+  for (uint32_t i = 0; i < 2049; ++i) {
+    EXPECT_EQ(i * 2, iter.next_doc());
+    EXPECT_EQ(2u, iter.term_freq());
+    EXPECT_EQ(3u, iter.doc_len());
+  }
+  EXPECT_EQ(BitPackedPostingIterator::NO_MORE_DOCS, iter.next_doc());
+}
+
 // After conversion the search() path must keep working — readers fall through
 // to the BitPacked branch via is_bitpacked_format(), and no longer require the
 // $TF / $DOC_LEN CFs.

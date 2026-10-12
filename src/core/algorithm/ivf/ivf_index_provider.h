@@ -15,8 +15,8 @@
 
 #include <algorithm>
 #include <new>
-#include <numeric>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/core/framework/index_searcher.h>
 #include "ivf_entity.h"
 
@@ -75,15 +75,9 @@ class IVFIndexProvider : public IndexProvider {
    public:
     SortedIterator(const IVFEntity::Pointer &entity) : entity_(entity) {
       count_ = entity_->vector_count();
-      use_mapping_ = entity_->has_key_order_mapping();
-      if (!use_mapping_) {
-        // Fallback: compute sorting if mapping segment is unavailable
-        fallback_.resize(count_);
-        std::iota(fallback_.begin(), fallback_.end(), size_t(0));
-        std::sort(fallback_.begin(), fallback_.end(), [&](size_t a, size_t b) {
-          return entity_->get_key(a) < entity_->get_key(b);
-        });
-      }
+      // load() requires this segment. Do not turn a malformed/partially loaded
+      // entity into an O(N) heap sort and potentially dereference missing keys.
+      if (!entity_->has_key_order_mapping()) status_ = IndexError_InvalidFormat;
     }
 
     //! Retrieve pointer of data
@@ -103,8 +97,7 @@ class IVFIndexProvider : public IndexProvider {
 
     //! Test if the iterator is valid
     bool is_valid() const override {
-      return status_ == 0 && pos_ < count_ &&
-             (!use_mapping_ || ensure_mapping_chunk());
+      return status_ == 0 && pos_ < count_ && ensure_mapping_chunk();
     }
 
     int status() const override {
@@ -169,9 +162,6 @@ class IVFIndexProvider : public IndexProvider {
       if (status_ != 0 || pos_ >= count_) {
         return count_;
       }
-      if (!use_mapping_) {
-        return fallback_[pos_];
-      }
       if (!ensure_mapping_chunk()) {
         return count_;
       }
@@ -181,11 +171,10 @@ class IVFIndexProvider : public IndexProvider {
     //! Members
     static constexpr size_t kMappingChunkEntries = 4096;
     IVFEntity::Pointer entity_;
-    bool use_mapping_{false};
     mutable int status_{0};
-    mutable std::vector<uint32_t> mapping_chunk_;
+    mutable std::vector<uint32_t, ailego::BudgetedAllocator<uint32_t>>
+        mapping_chunk_;
     mutable size_t mapping_chunk_begin_{0};
-    std::vector<size_t> fallback_;  // used only if mapping_ unavailable
     size_t count_{0};
     size_t pos_{0};
   };

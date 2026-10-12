@@ -106,6 +106,8 @@ struct QueryParams {
   std::shared_ptr<RefinerParam> refiner_param{nullptr};
 
   ailego::Params extra_params{};
+  // Call-scoped view into a block's translated keys; not retained by search.
+  const std::vector<uint64_t> *bf_pks_view{nullptr};
 };
 }  // namespace vector_column_params
 }  // namespace zvec

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -20,6 +19,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/logger/logger.h>
 #include "zvec/ailego/container/params.h"
 #include "zvec/core/framework/index_context.h"
@@ -58,7 +58,10 @@ struct IvfRabitqQueryState {
 class IvfRabitqContext : public IndexContext {
  public:
   typedef std::shared_ptr<IvfRabitqContext> Pointer;
-  using GroupTopkHeaps = std::map<std::string, IndexDocumentHeap>;
+  using GroupTopkHeaps =
+      std::map<std::string, IndexCandidateHeap, std::less<std::string>,
+               ailego::BudgetedAllocator<
+                   std::pair<const std::string, IndexCandidateHeap>>>;
 
   IvfRabitqContext() = default;
   ~IvfRabitqContext() override = default;
@@ -114,8 +117,12 @@ class IvfRabitqContext : public IndexContext {
     reset_group_by();
     group_state_.reset();
     set_fetch_vector(false);
-    result_heap_.clear();
+    result_heap_.release();
     result_heap_.set_threshold(this->threshold());
+    for (auto &result : results_) {
+      result.clear();
+      if (result.capacity() > 4096) IndexDocumentList().swap(result);
+    }
     query_state.rotated_query.clear();
     query_state.query_norm_sq = 0.0f;
     query_state.batch_query.reset();
@@ -171,7 +178,7 @@ class IvfRabitqContext : public IndexContext {
   // -----------------------------------------------------------------------
 
   //! Accessor for the result heap (used by entity::search_cluster)
-  IndexDocumentHeap &mutable_result_heap() {
+  IndexCandidateHeap &mutable_result_heap() {
     return result_heap_;
   }
 
@@ -199,6 +206,7 @@ class IvfRabitqContext : public IndexContext {
 
   //! Drain heap → results_[idx], sorted by score ascending (same as IVF)
   void topk_to_result(uint32_t idx) {
+    auto release = ailego::ScopeGuard::Make([&] { result_heap_.release(); });
     if (result_heap_.empty()) {
       return;
     }
@@ -218,6 +226,9 @@ class IvfRabitqContext : public IndexContext {
   }
 
   void topk_to_group_result(uint32_t idx) {
+    auto release = ailego::ScopeGuard::Make([&] {
+      if (group_state_) group_state_->heaps.clear();
+    });
     if (!group_state_ || idx >= group_state_->results.size()) {
       return;
     }
@@ -225,7 +236,9 @@ class IvfRabitqContext : public IndexContext {
     auto &result = group_state_->results[idx];
     result.clear();
 
-    std::vector<std::pair<const std::string *, float>> ranked_groups;
+    using RankedGroup = std::pair<const std::string *, float>;
+    std::vector<RankedGroup, ailego::BudgetedAllocator<RankedGroup>>
+        ranked_groups;
     ranked_groups.reserve(group_state_->heaps.size());
     for (auto &entry : group_state_->heaps) {
       auto &heap = entry.second;
@@ -288,6 +301,9 @@ class IvfRabitqContext : public IndexContext {
 
   uint32_t group_topk() const {
     return group_state_ ? group_state_->group_topk : 0;
+  }
+  uint32_t group_num() const {
+    return group_state_ ? group_state_->group_num : 0;
   }
 
   GroupTopkHeaps &group_topk_heaps() {
@@ -354,7 +370,7 @@ class IvfRabitqContext : public IndexContext {
     std::vector<IndexGroupDocumentList> results;
   };
 
-  IndexDocumentHeap result_heap_;
+  IndexCandidateHeap result_heap_;
   std::vector<IndexDocumentList> results_;
   std::unique_ptr<GroupSearchState> group_state_;
 

@@ -449,7 +449,7 @@ int IVFEntity::IVFReformerWrapper::convert(const void *records,
 
 //! Normalize score
 void IVFEntity::IVFReformerWrapper::normalize(size_t qidx,
-                                              IndexDocumentHeap *heap) const {
+                                              IndexCandidateHeap *heap) const {
   switch (type_) {
     case kReformerTpNone:
       return;
@@ -481,7 +481,7 @@ void IVFEntity::IVFReformerWrapper::normalize(size_t qidx,
 //! Normalize score
 void IVFEntity::IVFReformerWrapper::normalize(size_t qidx, const void *query,
                                               const IndexQueryMeta &qmeta,
-                                              IndexDocumentHeap *heap) const {
+                                              IndexCandidateHeap *heap) const {
   switch (type_) {
     case kReformerTpNone:
       return;
@@ -504,9 +504,21 @@ void IVFEntity::IVFReformerWrapper::normalize(size_t qidx, const void *query,
       }
       break;
 
-    case kReformerTpDefault:
-      reformer_->normalize(query, qmeta, heap->mutable_container());
+    case kReformerTpDefault: {
+      // Legacy normalizers accept full documents; bound that adapter scratch.
+      auto &items = heap->mutable_container();
+      IndexDocumentList batch;
+      constexpr size_t kBatch = 256;
+      batch.reserve(std::min(kBatch, items.size()));
+      for (size_t first = 0; first < items.size(); first += kBatch) {
+        size_t count = std::min(kBatch, items.size() - first);
+        batch.assign(items.begin() + first, items.begin() + first + count);
+        reformer_->normalize(query, qmeta, batch);
+        for (size_t i = 0; i < count; ++i)
+          *items[first + i].mutable_score() = batch[i].score();
+      }
       break;
+    }
 
     default:
       // Not support
@@ -718,7 +730,7 @@ int IVFEntity::load(const IndexStorage::Pointer &container) {
 
 int IVFEntity::search(size_t inverted_list_id, const void *query,
                       const IndexFilter &filter, uint32_t *scan_count,
-                      IndexDocumentHeap *heap,
+                      IndexCandidateHeap *heap,
                       IndexContext::Stats *context_stats) const {
   ailego_assert_with(inverted_list_id < header_.inverted_list_count,
                      "invalid id");
@@ -831,7 +843,7 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
 
 //! search in inverted list without filter
 int IVFEntity::search(size_t inverted_list_id, const void *query,
-                      uint32_t *scan_count, IndexDocumentHeap *heap,
+                      uint32_t *scan_count, IndexCandidateHeap *heap,
                       IndexContext::Stats *context_stats) const {
   ailego_assert_with(inverted_list_id < header_.inverted_list_count,
                      "invalid id");
@@ -918,7 +930,7 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
 
 //! search all inverted list with filter
 int IVFEntity::search(const void *query, const IndexFilter &filter,
-                      IndexDocumentHeap *heap,
+                      IndexCandidateHeap *heap,
                       IndexContext::Stats *context_stats) const {
   for (size_t i = 0; i < header_.inverted_list_count; ++i) {
     uint32_t scan_count;
@@ -932,7 +944,7 @@ int IVFEntity::search(const void *query, const IndexFilter &filter,
 }
 
 //! search all inverted list without filter
-int IVFEntity::search(const void *query, IndexDocumentHeap *heap,
+int IVFEntity::search(const void *query, IndexCandidateHeap *heap,
                       IndexContext::Stats *context_stats) const {
   for (size_t i = 0; i < header_.inverted_list_count; ++i) {
     uint32_t scan_count;

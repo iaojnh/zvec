@@ -34,17 +34,23 @@ namespace zvec::sqlengine {
 VectorRecallNode::VectorRecallNode(Segment::Ptr segment,
                                    QueryInfo::Ptr query_info,
                                    DocFilter::Ptr doc_filter, int batch_size,
-                                   bool single_stage_search)
+                                   bool single_stage_search, bool rank_only)
     : segment_(std::move(segment)),
       query_info_(std::move(query_info)),
       doc_filter_(doc_filter),
       batch_size_(batch_size),
+      rank_only_(rank_only),
       // need fetch filter fields if single stage search, otherwise only fetch
       // selectd scalar fields, as forward filter is already performed and order
       // by only support vector score
       fetched_columns_(single_stage_search
                            ? query_info_->get_all_fetched_scalar_field_names()
                            : query_info_->get_selected_scalar_field_names()) {
+  if (rank_only_) {
+    schema_ = arrow::schema({arrow::field(LOCAL_ROW_ID, arrow::int32()),
+                             arrow::field(FIELD_SCORE, arrow::float32())});
+    return;
+  }
   auto table = segment_->fetch(fetched_columns_, std::vector<int>{});
   schema_ = table->schema();
   schema_ = Util::append_field(*schema_, FIELD_SCORE, arrow::float32());
@@ -160,10 +166,11 @@ Result<IndexResults::Ptr> VectorRecallNode::prepare() {
   query_params.data_type = vector_cond->vector_schema()->data_type();
   query_params.dimension = vector_cond->dimension();
   query_params.query_params = vector_cond->query_params();
+  ailego::MemoryReservation keys_memory;
   auto brute_force_keys = doc_filter_->get_bf_by_keys_and_update(
-      GlobalConfig::Instance().brute_force_by_keys_ratio());
+      GlobalConfig::Instance().brute_force_by_keys_ratio(), keys_memory);
   if (brute_force_keys) {
-    query_params.bf_pks.emplace_back(std::move(brute_force_keys.value()));
+    query_params.bf_pks_view = &brute_force_keys.value();
   }
   // set filter after brute force check
   query_params.filter = doc_filter_->empty() ? nullptr : doc_filter_.get();
@@ -227,6 +234,14 @@ VectorRecallNode::State::collect_batch() {
     if (self_->query_info_->group_by()) {
       ARROW_RETURN_NOT_OK(group_id_builder.Append(iter_->group_id()));
     }
+  }
+  if (self_->rank_only_) {
+    arrow::Int32Builder rows;
+    ARROW_RETURN_NOT_OK(rows.AppendValues(indices.data(), indices.size()));
+    ARROW_ASSIGN_OR_RAISE(auto row_array, rows.Finish());
+    ARROW_ASSIGN_OR_RAISE(auto scores, builder.Finish());
+    return arrow::RecordBatch::Make(self_->schema_, indices.size(),
+                                    {std::move(row_array), std::move(scores)});
   }
   auto table = self_->segment_->fetch(self_->fetched_columns_, indices);
   if (!table) {

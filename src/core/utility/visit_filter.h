@@ -24,6 +24,7 @@
 #include <vector>
 #include <ailego/container/bloom_filter.h>
 #include <ailego/utility/bitset_helper.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_error.h>
@@ -44,12 +45,13 @@ class VisitBloomFilter {
   static constexpr int mode = 1;
 
   static constexpr int N = 5;
+  using Filter = ailego::BloomFilter<N, ailego::BudgetedAllocator<uint32_t>>;
   struct Context {
     Context()
         : mt(std::chrono::system_clock::now().time_since_epoch().count()) {};
     VisitFilterHeader h;
     std::mt19937 mt;
-    ailego::BloomFilter<N> *filter{nullptr};
+    Filter *filter{nullptr};
     int offset[N] = {0};
   };
 #define BLOOM_FILTER_HASH_BITS_OFFSETS(i)                                 \
@@ -76,11 +78,11 @@ class VisitBloomFilter {
     if (max_scan_num == c->h.max_scan_num) {
       return 0;
     }
-    c->h.max_scan_num = max_scan_num;
-    if (c->filter->reset(max_scan_num, c->filter->probability()) != 0) {
+    if (!c->filter->reset(max_scan_num, c->filter->probability())) {
       LOG_ERROR("reset BloomFilter failed");
       return IndexError_Runtime;
     }
+    c->h.max_scan_num = max_scan_num;
     gen_random_hash_bits(c);
     return 0;
   }
@@ -95,8 +97,12 @@ class VisitBloomFilter {
     if (ailego_unlikely(max_doc_cnt > c->h.max_doc_cnt ||
                         max_scan_num > c->h.max_scan_num)) {
       // Create a new one, if failed, we can reuse the old one
-      auto filter = new (std::nothrow) ailego::BloomFilter<VisitBloomFilter::N>(
-          max_scan_num, c->filter->probability());
+      Filter *filter = nullptr;
+      try {
+        filter = new Filter(max_scan_num, c->filter->probability());
+      } catch (const std::bad_alloc &) {
+        return false;
+      }
       if (ailego_unlikely(filter == nullptr)) {
         LOG_ERROR("reset bloomfilter failed, maxScanNum %zu prob %f",
                   (size_t)max_scan_num, c->filter->probability());
@@ -143,8 +149,12 @@ class VisitBloomFilter {
     c->h.max_scan_num = max_scan_num;
     float p =
         std::get<PROXIMA_HNSW_VISITFILTER_CUSTOM_PARAMS_INDEX_NEGPROB>(tpl);
-    c->filter = new (std::nothrow)
-        ailego::BloomFilter<VisitBloomFilter::N>(max_scan_num, p);
+    try {
+      c->filter = new Filter(max_scan_num, p);
+    } catch (const std::bad_alloc &) {
+      delete c;
+      return IndexError_NoMemory;
+    }
     if (c->filter == nullptr) {
       LOG_ERROR("New BloomFilter failed");
       delete c;
@@ -169,6 +179,7 @@ class VisitBitMap {
   struct Context {
     VisitFilterHeader h;
     ailego::BitsetHelper bitset;
+    std::vector<uint32_t, ailego::BudgetedAllocator<uint32_t>> storage;
     char *buf{nullptr};
   };
 
@@ -201,20 +212,19 @@ class VisitBitMap {
                            uint64_t max_scan_num) {
     if (ailego_unlikely(max_doc_cnt > c->h.max_doc_cnt ||
                         max_scan_num > c->h.max_scan_num)) {
-      uint64_t len = ((max_doc_cnt + 31) >> 5) << 2;  // round to uint32_t
-      auto buf = new (std::nothrow) char[len];
-      if (buf == nullptr) {
-        LOG_ERROR("New memory in initVisitBitMap failed");
-        c->bitset.clear();
+      const uint64_t words = max_doc_cnt / 32 + (max_doc_cnt % 32 != 0);
+      if (words > std::numeric_limits<size_t>::max() / sizeof(uint32_t))
+        return false;
+      try {
+        c->storage.resize(static_cast<size_t>(words));
+      } catch (const std::exception &) {
         return false;
       }
-
       c->h.max_doc_cnt = max_doc_cnt;
       c->h.max_scan_num = max_scan_num;
-      delete[] c->buf;
-      c->buf = buf;
-      memset(c->buf, 0, len);
-      c->bitset.mount(c->buf, len);
+      c->buf = reinterpret_cast<char *>(c->storage.data());
+      std::fill(c->storage.begin(), c->storage.end(), 0);
+      c->bitset.mount(c->buf, c->storage.size() * sizeof(uint32_t));
     }
     return true;
   }
@@ -228,23 +238,15 @@ class VisitBitMap {
       LOG_ERROR("New memory in initVisitBitMap failed");
       return IndexError_NoMemory;
     }
-    c->h.max_doc_cnt = max_doc_cnt;
-    c->h.max_scan_num = max_scan_num;
-    uint64_t len = ((max_doc_cnt + 31) >> 5) << 2;  // round to uint32_t
-    c->buf = new (std::nothrow) char[len];
-    if (c->buf == nullptr) {
-      LOG_ERROR("New memory in initVisitBitMap failed, reuse old one");
+    if (!reset(c, max_doc_cnt, max_scan_num)) {
       delete c;
       return IndexError_NoMemory;
     }
-    memset(c->buf, 0, len);
-    c->bitset.mount(c->buf, len);
     *ctx = c;
     return 0;
   }
 
   inline static void destroy(Context *c) {
-    delete[] c->buf;
     delete c;
   }
 };  // end of VisitBitMap
@@ -255,15 +257,16 @@ class VisitByteMap {
   struct Context {
     VisitFilterHeader h;
     uint8_t cur_num{0};
-    std::vector<uint8_t> buf;
+    std::vector<uint8_t, ailego::BudgetedAllocator<uint8_t>> buf;
   };
 
   VisitByteMap() = delete;
 
   inline static void set_visited(Context *c, id_t idx) {
     if (ailego_unlikely(idx >= c->h.max_doc_cnt)) {
-      c->h.max_doc_cnt = idx + 1024;  // reserved
-      c->buf.resize(c->h.max_doc_cnt);
+      const uint64_t count = uint64_t{idx} + 1024;
+      c->buf.resize(count);
+      c->h.max_doc_cnt = count;
     }
     c->buf[idx] = c->cur_num;
     return;
@@ -350,16 +353,23 @@ class VisitEpochBitMap {
   static constexpr int mode = 4;
   struct Context {
     VisitFilterHeader h;
-    std::vector<uint64_t> bits;
-    std::vector<uint8_t> generations;
+    std::vector<uint64_t, ailego::BudgetedAllocator<uint64_t>> bits;
+    std::vector<uint8_t, ailego::BudgetedAllocator<uint8_t>> generations;
     uint8_t generation{1};
   };
   inline static bool reset(Context *c, uint64_t count, uint64_t scans) {
     if (count > c->h.max_doc_cnt) {
       const size_t words = count / 64 + (count % 64 != 0);
       try {
-        c->bits.resize(words);
-        c->generations.resize(words, 0);
+        // Publish both arrays together: a failed growth preserves existing
+        // marks and releases any partial reservation.
+        decltype(c->bits) bits(words);
+        decltype(c->generations) generations(words, 0);
+        std::copy(c->bits.begin(), c->bits.end(), bits.begin());
+        std::copy(c->generations.begin(), c->generations.end(),
+                  generations.begin());
+        c->bits.swap(bits);
+        c->generations.swap(generations);
       } catch (const std::exception &) {
         return false;
       }
@@ -536,39 +546,39 @@ class VisitFilter {
 
   int init(int mode, uint64_t max_doc_cnt, uint64_t max_scan_num,
            float negative_probability) {
-    destroy();
-    mode_ = mode;
+    void *candidate = nullptr;
     int ret = 0;
-    switch (mode_) {
+    switch (mode) {
       case BloomFilter:
         ret = VisitBloomFilter::init(
-            static_cast<VisitBloomFilter::Context *>(nullptr), &ctx_,
+            static_cast<VisitBloomFilter::Context *>(nullptr), &candidate,
             max_doc_cnt, max_scan_num, std::make_tuple(negative_probability));
         break;
       case BitMap:
         ret = VisitBitMap::init(static_cast<VisitBitMap::Context *>(nullptr),
-                                &ctx_, max_doc_cnt, max_scan_num,
+                                &candidate, max_doc_cnt, max_scan_num,
                                 std::make_tuple(negative_probability));
         break;
       case ByteMap:
         ret = VisitByteMap::init(static_cast<VisitByteMap::Context *>(nullptr),
-                                 &ctx_, max_doc_cnt, max_scan_num,
+                                 &candidate, max_doc_cnt, max_scan_num,
                                  std::make_tuple(negative_probability));
         break;
       case EpochBitMap:
         ret = VisitEpochBitMap::init(
-            static_cast<VisitEpochBitMap::Context *>(nullptr), &ctx_,
+            static_cast<VisitEpochBitMap::Context *>(nullptr), &candidate,
             max_doc_cnt, max_scan_num, std::make_tuple(negative_probability));
         break;
       default:
         // Preserve the existing contract for an unsupported mode: context
         // construction succeeds with no implementation, and the search-time
         // dispatcher reports the unsupported mode explicitly.
-        return 0;
+        break;
     }
-    if (ret != 0) {
-      ctx_ = nullptr;
-      mode_ = Default;
+    if (ret == 0) {
+      destroy();
+      ctx_ = candidate;
+      mode_ = mode;
     }
     return ret;
   }

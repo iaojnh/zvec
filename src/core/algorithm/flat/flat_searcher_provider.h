@@ -65,8 +65,10 @@ class FlatSearcherProvider : public IndexProvider {
   }
 
   //! Retrieve a vector using a primary key
-  const void *get_vector(uint64_t key) const override {
+  const void *get_vector(uint64_t key) const override try {
     return this->get_vector_by_index(owner_->get_id(key));
+  } catch (const typename FlatSearcher<BATCH_SIZE>::MetadataReadError &) {
+    return nullptr;
   }
 
   //! Retrieve the owner class
@@ -101,12 +103,20 @@ class FlatSearcherProvider : public IndexProvider {
 
     //! Test if the iterator is valid
     bool is_valid() const override {
-      return (!invalid_ && cursor_index_ < total_vector_count_);
+      return (status_ == 0 && !invalid_ && cursor_index_ < total_vector_count_);
     }
 
     //! Retrieve primary key
-    uint64_t key() const override {
+    uint64_t key() const override try {
       return owner_->key(cursor_index_);
+    } catch (
+        const typename FlatSearcher<BATCH_SIZE>::MetadataReadError &error) {
+      status_ = error.status;
+      return 0;
+    }
+
+    int status() const override {
+      return status_;
     }
 
     //! Next iterator
@@ -141,6 +151,7 @@ class FlatSearcherProvider : public IndexProvider {
         LOG_ERROR("Failed to read data (%zu bytes) from features segment",
                   read_size);
         invalid_ = true;
+        status_ = IndexError_ReadData;
         return;
       }
       offset_ += read_size;
@@ -169,6 +180,7 @@ class FlatSearcherProvider : public IndexProvider {
     uint64_t offset_{0};
     uint32_t cursor_index_{0};
     bool invalid_{false};
+    mutable int status_{0};
   };
 
   //! Retrieve a vector via local index

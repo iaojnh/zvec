@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_error.h>
@@ -338,7 +339,7 @@ class BufferStorage : public IndexStorage {
     }
 
     bool read_borrowed_batch_impl(BorrowedRead *reads, size_t count,
-                                  bool immutable) {
+                                  bool immutable) try {
       if (count == 0) {
         return true;
       }
@@ -356,13 +357,11 @@ class BufferStorage : public IndexStorage {
                    : IndexStorage::Segment::read_borrowed_batch(reads, count);
       }
 
-      // Copied results share one batch allocation. Cache an arena per thread,
-      // but recycle it only after all previously returned slices (and copies)
-      // have been released, including results from other storage instances.
-      // Cap the cached arena: larger batches use individually owned buffers
-      // that are freed with their results instead of retained by the thread.
+      // Copied results share one bounded allocation. Only returned slices
+      // retain its budget; an idle thread must not keep result bytes alive.
+      // Larger batches use individually owned buffers.
       static constexpr size_t kMaxArenaBytes = 2UL
-                                               << 20;  // 2 MiB cached / thread
+                                               << 20;  // 2 MiB shared / batch
       bool batch_arena = false;
 
       struct BatchState {
@@ -372,6 +371,7 @@ class BufferStorage : public IndexStorage {
         size_t page_count{0};
         bool copy_result{false};
         char *owned{nullptr};
+        MemoryBlock owned_block;
       };
       struct PageUse {
         size_t unique_index{0};
@@ -389,8 +389,9 @@ class BufferStorage : public IndexStorage {
         std::vector<ailego::block_id_t> admitted_ids;
         std::vector<size_t> admitted_indices;
         std::vector<char *> admitted_pages;
-        std::shared_ptr<std::vector<char>> arena;
-        std::vector<char> bypass_page;
+        std::shared_ptr<std::vector<char, ailego::BudgetedAllocator<char>>>
+            arena;
+        std::vector<char, ailego::BudgetedAllocator<char>> bypass_page;
       };
       static thread_local BatchScratch scratch;
 
@@ -414,7 +415,7 @@ class BufferStorage : public IndexStorage {
         // freed.
         for (BatchState &state : scratch.states) {
           if (!batch_arena && state.owned != nullptr) {
-            ailego_free(state.owned);
+            state.owned_block.reset();
           }
           state.owned = nullptr;
         }
@@ -433,11 +434,15 @@ class BufferStorage : public IndexStorage {
       struct Cleanup {
         decltype(cleanup_owned) &owned;
         decltype(release_pages) &pages;
+        BatchScratch &scratch;
         ~Cleanup() {
           owned();
           pages();
+          // Returned slices, not an idle TLS arena, retain the budget.
+          scratch.arena.reset();
+          decltype(scratch.bypass_page){}.swap(scratch.bypass_page);
         }
-      } cleanup{cleanup_owned, release_pages};
+      } cleanup{cleanup_owned, release_pages, scratch};
       auto fail = [&]() {
         cleanup_owned();
         release_pages();
@@ -450,6 +455,7 @@ class BufferStorage : public IndexStorage {
       };
 
       size_t total_pages = 0;
+      size_t copy_upper_bound = 0;
       for (size_t i = 0; i < count; ++i) {
         BorrowedRead &request = reads[i];
         auto *segment = dynamic_cast<WrappedSegment *>(request.segment);
@@ -494,11 +500,25 @@ class BufferStorage : public IndexStorage {
           return fail();
         }
         total_pages += state.page_count;
+        if (request.length > std::numeric_limits<size_t>::max() - 63 ||
+            ((request.length + 63) & ~size_t{63}) >
+                std::numeric_limits<size_t>::max() - copy_upper_bound)
+          return fail();
+        copy_upper_bound += (request.length + 63) & ~size_t{63};
         scratch.states.emplace_back(state);
         for (size_t page = first_page; page <= last_page; ++page) {
           scratch.page_ids.emplace_back(page);
         }
       }
+
+      // Reserve bounded fallback space before pinning pages. Otherwise a
+      // large batch can pin the entire budget and prevent its own fallback.
+      if (copy_upper_bound && copy_upper_bound <= kMaxArenaBytes) {
+        scratch.arena = std::make_shared<
+            std::vector<char, ailego::BudgetedAllocator<char>>>(
+            copy_upper_bound);
+      }
+      scratch.bypass_page.resize(ailego::kVectorPageSize);
 
       // Pin unique pages rather than one pin per vector occurrence. Besides
       // removing duplicate work, this lets a pressured batch preserve all
@@ -618,10 +638,12 @@ class BufferStorage : public IndexStorage {
         total += aligned;
       }
       batch_arena = total <= kMaxArenaBytes;
-      std::shared_ptr<std::vector<char>> arena_owner;
+      std::shared_ptr<std::vector<char, ailego::BudgetedAllocator<char>>>
+          arena_owner;
       if (batch_arena && total != 0) {
         if (!scratch.arena || scratch.arena.use_count() != 1) {
-          scratch.arena = std::make_shared<std::vector<char>>();
+          scratch.arena = std::make_shared<
+              std::vector<char, ailego::BudgetedAllocator<char>>>();
         }
         if (scratch.arena->size() < total) {
           scratch.arena->resize(total);
@@ -646,8 +668,10 @@ class BufferStorage : public IndexStorage {
           if (!AlignBufferSize(length, &alloc_size)) {
             return fail();
           }
-          state.owned = static_cast<char *>(
-              ailego_aligned_malloc(alloc_size, kBufferAlignment));
+          state.owned_block =
+              MemoryBlock::AllocateOwned(alloc_size, kBufferAlignment);
+          state.owned_block.scratch_size_ = length;
+          state.owned = static_cast<char *>(state.owned_block.data_);
           if (state.owned == nullptr) {
             return fail();
           }
@@ -733,13 +757,17 @@ class BufferStorage : public IndexStorage {
           continue;
         }
         *state.request->block =
-            batch_arena
-                ? MemoryBlock::MakeSharedView(state.owned, arena_owner)
-                : MemoryBlock::MakeOwned(state.owned, state.request->length);
+            batch_arena ? MemoryBlock::MakeSharedView(state.owned, arena_owner)
+                        : std::move(state.owned_block);
         state.owned = nullptr;
       }
       release_pages();
       return true;
+    } catch (const std::bad_alloc &) {
+      for (size_t i = 0; reads && i < count; ++i) {
+        if (reads[i].block) reads[i].block->reset();
+      }
+      return false;
     }
 
     //! Write data into the storage with offset. The shard latch excludes
@@ -962,7 +990,7 @@ class BufferStorage : public IndexStorage {
     }
 
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
-                             bool borrow_handle, bool immutable) const {
+                             bool borrow_handle, bool immutable) const try {
       const bool can_pin = owner_->cache_enabled_ &&
                            (immutable || !owner_->buffer_pool_->writable());
       bool force_bypass = !owner_->cache_enabled_;
@@ -989,16 +1017,16 @@ class BufferStorage : public IndexStorage {
       // from it, but let the allocator's thread cache handle small objects.
       static constexpr size_t kSmallSnapshotBytes = 512;
       size_t alloc_size = len;
-      char *tmp = nullptr;
+      MemoryBlock owned;
       if (!immutable && len <= kSmallSnapshotBytes) {
-        tmp = static_cast<char *>(ailego_malloc(len));
+        owned = MemoryBlock::AllocateOwned(len);
       } else {
         if (ailego_unlikely(!AlignBufferSize(len, &alloc_size))) {
           return 0;
         }
-        tmp = static_cast<char *>(
-            ailego_aligned_malloc(alloc_size, kBufferAlignment));
+        owned = MemoryBlock::AllocateOwned(alloc_size, kBufferAlignment);
       }
+      auto *tmp = static_cast<char *>(owned.data_);
       if (tmp == nullptr) {
         LOG_ERROR(
             "WrappedSegment::read: owned buffer allocation failed, file[%s], "
@@ -1020,15 +1048,17 @@ class BufferStorage : public IndexStorage {
                                                                  len, tmp);
       }
       if (!read_ok) {
-        ailego_free(tmp);
         LOG_ERROR(
             "WrappedSegment::read: owned read failed, file[%s], id[%s], "
             "abs_offset=%zu, len=%zu",
             owner_->file_name_.c_str(), segment_id_->c_str(), abs_offset, len);
         return 0;
       }
-      data = MemoryBlock::MakeOwned(tmp, len);
+      owned.scratch_size_ = len;
+      data = std::move(owned);
       return len;
+    } catch (const std::bad_alloc &) {
+      return 0;
     }
 
     BufferStorage *owner_{nullptr};
@@ -1582,11 +1612,6 @@ class BufferStorage : public IndexStorage {
     meta_chains_.clear();
     {
       std::lock_guard<std::mutex> tmp_latch(tmp_buffers_mutex_);
-      for (const ArenaBlock &b : tmp_buffers_) {
-        if (b.base) {
-          ailego_free(b.base);
-        }
-      }
       tmp_buffers_.clear();
     }
     // Drop persistent pointer-read pins before destroying the pool.
@@ -1941,12 +1966,13 @@ class BufferStorage : public IndexStorage {
 
   // Aligned arenas retain legacy pointer-read results until close_index().
   struct ArenaBlock {
+    MemoryBlock owner;
     char *base{nullptr};
     size_t size{0};  // Total bytes in this arena (4K-aligned).
     size_t used{0};  // Bytes already handed out (4K-aligned).
   };
   // Requires tmp_buffers_mutex_; alloc_size must be 4K-aligned.
-  char *tmp_arena_alloc_locked(size_t alloc_size) {
+  char *tmp_arena_alloc_locked(size_t alloc_size) try {
     static constexpr size_t kArenaSize = 1UL << 20;  // 1 MiB
     if (!tmp_buffers_.empty()) {
       ArenaBlock &back = tmp_buffers_.back();
@@ -1957,13 +1983,20 @@ class BufferStorage : public IndexStorage {
       }
     }
     size_t new_size = alloc_size > kArenaSize ? alloc_size : kArenaSize;
-    char *p =
-        static_cast<char *>(ailego_aligned_malloc(new_size, kBufferAlignment));
-    if (!p) {
-      return nullptr;
+    MemoryBlock block;
+    try {
+      block = MemoryBlock::AllocateOwned(new_size, kBufferAlignment);
+    } catch (const std::bad_alloc &) {
+      // A small legacy read must not require a whole 1 MiB arena.
+      new_size = alloc_size;
+      block = MemoryBlock::AllocateOwned(new_size, kBufferAlignment);
     }
-    tmp_buffers_.push_back(ArenaBlock{p, new_size, alloc_size});
+    auto *p = static_cast<char *>(block.data_);
+    tmp_buffers_.push_back(
+        ArenaBlock{std::move(block), p, new_size, alloc_size});
     return p;
+  } catch (const std::bad_alloc &) {
+    return nullptr;
   }
   std::vector<ArenaBlock> tmp_buffers_{};
   mutable std::mutex tmp_buffers_mutex_{};

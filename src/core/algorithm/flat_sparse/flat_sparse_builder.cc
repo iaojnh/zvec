@@ -20,6 +20,7 @@
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_error.h>
+#include "flat_sparse_dump_offsets.h"
 #include "flat_sparse_index_format.h"
 #include "flat_sparse_utility.h"
 
@@ -157,20 +158,20 @@ int FlatSparseBuilder::do_dump(const IndexDumper::Pointer &dumper,
     return ret;
   }
 
-  std::vector<uint64_t> keys;
+  FlatDumpKeys keys;
   ret = dump_vector_and_offset(dumper.get(), &keys);
   if (ret != 0) {
     LOG_ERROR("Failed to dump offset data");
     return ret;
   }
 
-  ret = dump_keys(keys, dumper.get());
+  ret = keys.write_keys(dumper.get(), PARAM_FLAT_SPARSE_DUMP_KEYS_SEG_ID);
   if (ret != 0) {
     LOG_ERROR("Failed to dump keys");
     return ret;
   }
 
-  ret = dump_mapping(keys, dumper.get());
+  ret = keys.write_mapping(dumper.get(), PARAM_FLAT_SPARSE_DUMP_MAPPING_SEG_ID);
   if (ret != 0) {
     LOG_ERROR("Failed to dump mapping");
     return ret;
@@ -205,7 +206,7 @@ int FlatSparseBuilder::dump_meta(IndexDumper *dumper) {
 }
 
 int FlatSparseBuilder::dump_vector_and_offset(IndexDumper *dumper,
-                                              std::vector<uint64_t> *keys) {
+                                              FlatDumpKeys *keys) {
   // iterate the holder
   auto iter = holder_->create_iterator();
   if (!iter) {
@@ -215,9 +216,10 @@ int FlatSparseBuilder::dump_vector_and_offset(IndexDumper *dumper,
 
   uint64_t written_length{0U};
 
-  std::vector<std::pair<uint64_t, uint32_t>> offset_lens;
+  FlatSparseDumpOffsets offsets;
   while (iter->is_valid()) {
-    keys->push_back(iter->key());
+    int ret = keys->append(iter->key());
+    if (ret != 0) return ret;
 
     uint32_t length;
     if (write_vector_data(iter->sparse_count(), iter->sparse_indices(),
@@ -225,7 +227,8 @@ int FlatSparseBuilder::dump_vector_and_offset(IndexDumper *dumper,
       return IndexError_WriteData;
     }
 
-    offset_lens.push_back({written_length, length});
+    ret = offsets.append(written_length, length);
+    if (ret != 0) return ret;
     written_length += length;
     iter->next();
   }
@@ -238,31 +241,7 @@ int FlatSparseBuilder::dump_vector_and_offset(IndexDumper *dumper,
 
   LOG_DEBUG("Data total written: %zu", (size_t)written_length);
 
-  for (auto &offset_len : offset_lens) {
-    if (dumper->write(&offset_len.first, sizeof(offset_len.first)) !=
-        sizeof(offset_len.first)) {
-      LOG_ERROR("Failed to write offset");
-      return IndexError_WriteData;
-    }
-
-    if (dumper->write(&offset_len.second, sizeof(offset_len.second)) !=
-        sizeof(offset_len.second)) {
-      LOG_ERROR("Failed to write length");
-      return IndexError_WriteData;
-    }
-  }
-
-  if (dumper->append(PARAM_FLAT_SPARSE_DUMP_OFFSET_SEG_ID,
-                     offset_lens.size() * (sizeof(uint64_t) + sizeof(uint32_t)),
-                     0, 0) != 0) {
-    LOG_ERROR("Failed to append offset data");
-    return IndexError_WriteData;
-  }
-
-  LOG_DEBUG("Offset total written: %zu",
-            offset_lens.size() * (sizeof(uint64_t) + sizeof(uint32_t)));
-
-  return 0;
+  return offsets.dump(dumper);
 }
 
 int FlatSparseBuilder::write_vector_data(const uint32_t sparse_count,
@@ -284,52 +263,6 @@ int FlatSparseBuilder::write_vector_data(const uint32_t sparse_count,
   *length = sparse_buffer.size();
 
   return 0;
-}
-
-int FlatSparseBuilder::dump_keys(const std::vector<uint64_t> &keys,
-                                 IndexDumper *dumper) {
-  size_t keys_size = keys.size() * sizeof(uint64_t);
-  if (dumper->write(keys.data(), keys_size) != keys_size) {
-    LOG_ERROR("Failed to write keys to dumper %s", dumper->name().c_str());
-    return IndexError_WriteData;
-  }
-  size_t keys_padding_size = ailego_align(keys_size, 32) - keys_size;
-  if (keys_padding_size) {
-    std::string padding(keys_padding_size, '\0');
-    if (dumper->write(padding.data(), padding.size()) != padding.size()) {
-      LOG_ERROR("Failed to write padding to dumper %s", dumper->name().c_str());
-      return IndexError_WriteData;
-    }
-  }
-  return dumper->append(PARAM_FLAT_SPARSE_DUMP_KEYS_SEG_ID, keys_size,
-                        keys_padding_size, 0);
-}
-
-int FlatSparseBuilder::dump_mapping(const std::vector<uint64_t> &keys,
-                                    IndexDumper *dumper) {
-  std::vector<uint32_t> mapping(keys.size());
-  std::iota(mapping.begin(), mapping.end(), 0);
-  std::sort(
-      mapping.begin(), mapping.end(),
-      [&keys](uint32_t lhs, uint32_t rhs) { return (keys[lhs] < keys[rhs]); });
-
-  size_t mapping_size = mapping.size() * sizeof(uint32_t);
-  size_t mapping_padding_size = ailego_align(mapping_size, 32) - mapping_size;
-  if (dumper->write(mapping.data(), mapping_size) != mapping_size) {
-    LOG_ERROR("Failed to write data into dumper %s", dumper->name().c_str());
-    return IndexError_WriteData;
-  }
-
-  // Write the padding if need
-  if (mapping_padding_size) {
-    std::string padding(mapping_padding_size, '\0');
-    if (dumper->write(padding.data(), padding.size()) != padding.size()) {
-      LOG_ERROR("Failed to write data into dumper %s", dumper->name().c_str());
-      return IndexError_WriteData;
-    }
-  }
-  return dumper->append(PARAM_FLAT_SPARSE_DUMP_MAPPING_SEG_ID, mapping_size,
-                        mapping_padding_size, 0);
 }
 
 INDEX_FACTORY_REGISTER_BUILDER(FlatSparseBuilder);

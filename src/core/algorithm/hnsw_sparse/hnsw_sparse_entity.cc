@@ -14,6 +14,7 @@
 
 #include "hnsw_sparse_entity.h"
 #include <numeric>
+#include "utility/graph_segment_writer.h"
 
 namespace zvec {
 namespace core {
@@ -105,29 +106,8 @@ int64_t HnswSparseEntity::dump_header(const IndexDumper::Pointer &dumper,
   return graph_hd_size + hnsw_hd_size;
 }
 
-void HnswSparseEntity::reshuffle_vectors(
-    const std::function<level_t(node_id_t)> & /*get_level*/,
-    std::vector<node_id_t> * /*n2o_mapping*/,
-    std::vector<node_id_t> * /*o2n_mapping*/, key_t * /*keys*/) const {
-  // TODO
-  return;
-}
-
-int64_t HnswSparseEntity::dump_mapping_segment(
-    const IndexDumper::Pointer &dumper, const key_t *keys) const {
-  std::vector<node_id_t> mapping(doc_cnt());
-
-  std::iota(mapping.begin(), mapping.end(), 0U);
-  std::sort(mapping.begin(), mapping.end(),
-            [&](node_id_t i, node_id_t j) { return keys[i] < keys[j]; });
-
-  size_t size = mapping.size() * sizeof(node_id_t);
-  return dump_segment(dumper, kSparseGraphMappingSegmentId, mapping.data(),
-                      size);
-}
-
 int64_t HnswSparseEntity::dump_segments(
-    const IndexDumper::Pointer &dumper, key_t *keys,
+    const IndexDumper::Pointer &dumper,
     const std::function<level_t(node_id_t)> &get_level) const {
   HNSWSparseHeader dump_hd(header());
 
@@ -135,7 +115,7 @@ int64_t HnswSparseEntity::dump_segments(
 
   std::vector<node_id_t> n2o_mapping;  // map new id to origin id
   std::vector<node_id_t> o2n_mapping;  // map origin id to new id
-  reshuffle_vectors(get_level, &n2o_mapping, &o2n_mapping, keys);
+  // Preserve node order; reshuffling was never implemented.
   if (!o2n_mapping.empty()) {
     dump_hd.hnsw.entry_point = o2n_mapping[entry_point()];
   }
@@ -168,16 +148,15 @@ int64_t HnswSparseEntity::dump_segments(
   n2o_mapping = std::vector<node_id_t>();
   o2n_mapping = std::vector<node_id_t>();
 
-  //! Dump keys
-  size_t key_segment_size = doc_cnt() * sizeof(key_t);
-  int64_t keys_size =
-      dump_segment(dumper, kSparseGraphKeysSegmentId, keys, key_segment_size);
-  if (keys_size < 0) {
-    return keys_size;
-  }
-
-  //! Dump mapping
-  int64_t mapping_size = dump_mapping_segment(dumper, keys);
+  int64_t keys_size = DumpGraphRecords<key_t>(
+      dumper, kSparseGraphKeysSegmentId, doc_cnt(), [&](size_t i, key_t *key) {
+        *key = get_key(i);
+        return 0;
+      });
+  if (keys_size < 0) return keys_size;
+  int64_t mapping_size =
+      DumpGraphKeyMapping(dumper, kSparseGraphMappingSegmentId, doc_cnt(),
+                          [&](size_t i) { return get_key(i); });
   if (mapping_size < 0) {
     return mapping_size;
   }
@@ -296,8 +275,6 @@ int64_t HnswSparseEntity::dump_graph_neighbors(
     const IndexDumper::Pointer &dumper,
     const std::vector<node_id_t> &reorder_mapping,
     const std::vector<node_id_t> &neighbor_mapping) const {
-  std::vector<SparseGraphNeighborMeta> graph_meta;
-  graph_meta.reserve(doc_cnt());
   size_t offset = 0;
   uint32_t crc = 0;
   std::vector<node_id_t> mapping(l0_neighbor_cnt());
@@ -322,7 +299,6 @@ int64_t HnswSparseEntity::dump_graph_neighbors(
     }
     sum_neighbor_count += neighbor_count;
 
-    graph_meta.emplace_back(offset, neighbor_count);
     size_t size = neighbors.size() * sizeof(node_id_t);
     const node_id_t *data = &neighbors[0];
     if (!neighbor_mapping.empty()) {
@@ -362,9 +338,20 @@ int64_t HnswSparseEntity::dump_graph_neighbors(
   }
 
   //! dump level 0 neighbors meta
-  auto len =
-      dump_segment(dumper, kSparseGraphOffsetsSegmentId, graph_meta.data(),
-                   graph_meta.size() * sizeof(SparseGraphNeighborMeta));
+  // The graph is unchanged throughout dump. Recompute offsets using bounded
+  // output tiles, rather than retaining an array proportional to doc count.
+  size_t meta_offset = 0;
+  auto len = DumpGraphRecords<SparseGraphNeighborMeta>(
+      dumper, kSparseGraphOffsetsSegmentId, doc_cnt(),
+      [&](size_t id, SparseGraphNeighborMeta *record) -> int {
+        const auto neighbors = get_neighbors(
+            0, reorder_mapping.empty() ? id : reorder_mapping[id]);
+        if (!neighbors.data && neighbors.size()) return IndexError_ReadData;
+        record->offset = meta_offset;
+        record->neighbor_cnt = neighbors.size();
+        meta_offset += neighbors.size() * sizeof(node_id_t);
+        return 0;
+      });
   if (len < 0) {
     return len;
   }
@@ -377,8 +364,6 @@ int64_t HnswSparseEntity::dump_upper_neighbors(
     const std::function<level_t(node_id_t)> &get_level,
     const std::vector<node_id_t> &reorder_mapping,
     const std::vector<node_id_t> &neighbor_mapping) const {
-  std::vector<HnswSparseNeighborMeta> hnsw_meta;
-  hnsw_meta.reserve(doc_cnt());
   size_t offset = 0;
   uint32_t crc = 0;
   std::vector<node_id_t> buffer(upper_neighbor_cnt() + 1);
@@ -386,11 +371,10 @@ int64_t HnswSparseEntity::dump_upper_neighbors(
   for (node_id_t id = 0; id < doc_cnt(); ++id) {
     node_id_t new_id = reorder_mapping.empty() ? id : reorder_mapping[id];
     auto level = get_level(new_id);
+    if (level < 0) return level;
     if (level == 0) {
-      hnsw_meta.emplace_back(0U, 0U);
       continue;
     }
-    hnsw_meta.emplace_back(offset, level);
     ailego_assert_with((size_t)level < kMaxGraphLayers, "invalid level");
     for (level_t cur_level = 1; cur_level <= level; ++cur_level) {
       const Neighbors neighbors = get_neighbors(cur_level, new_id);
@@ -430,8 +414,21 @@ int64_t HnswSparseEntity::dump_upper_neighbors(
   }
 
   //! dump level 0 neighbors meta
-  auto len = dump_segment(dumper, kSparseHnswOffsetsSegmentId, hnsw_meta.data(),
-                          hnsw_meta.size() * sizeof(HnswSparseNeighborMeta));
+  size_t meta_offset = 0;
+  auto len = DumpGraphRecords<HnswSparseNeighborMeta>(
+      dumper, kSparseHnswOffsetsSegmentId, doc_cnt(),
+      [&](size_t id, HnswSparseNeighborMeta *record) -> int {
+        auto level =
+            get_level(reorder_mapping.empty() ? id : reorder_mapping[id]);
+        if (level < 0) return level;
+        if (static_cast<size_t>(level) >= kMaxGraphLayers)
+          return IndexError_InvalidFormat;
+        record->level = level;
+        record->offset = level ? meta_offset : 0;
+        meta_offset += static_cast<size_t>(level) * (upper_neighbor_cnt() + 1) *
+                       sizeof(node_id_t);
+        return 0;
+      });
   if (len < 0) {
     return len;
   }

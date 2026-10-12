@@ -47,18 +47,21 @@ class IVFEntity {
   //! search in inverted list with filter
   int search(size_t inverted_list_id, const void *query,
              const IndexFilter &filter, uint32_t *scan_count,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const;
+             IndexCandidateHeap *heap,
+             IndexContext::Stats *context_stats) const;
 
   //! search in inverted list without filter
   int search(size_t inverted_list_id, const void *query, uint32_t *scan_count,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const;
+             IndexCandidateHeap *heap,
+             IndexContext::Stats *context_stats) const;
 
   //! search all inverted list with filter
   int search(const void *query, const IndexFilter &filter,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const;
+             IndexCandidateHeap *heap,
+             IndexContext::Stats *context_stats) const;
 
   //! search all inverted list without filter
-  int search(const void *query, IndexDocumentHeap *heap,
+  int search(const void *query, IndexCandidateHeap *heap,
              IndexContext::Stats *context_stats) const;
 
   //! Clone the entity
@@ -68,7 +71,7 @@ class IVFEntity {
   IVFEntity::Pointer clone(const IVFEntity::Pointer &entity) const;
 
   //! Retrieve the primary keys by local id in heap
-  int retrieve_keys(IndexDocumentHeap *heap) const {
+  int retrieve_keys(IndexCandidateHeap *heap) const {
     for (auto &it : heap->mutable_container()) {
       uint64_t key = this->get_key(it.index());
       if (key == kInvalidKey) {
@@ -103,6 +106,10 @@ class IVFEntity {
   //! Retrieve IndexMeta of the inverted index
   const IndexMeta &meta() const {
     return meta_;
+  }
+
+  size_t query_workspace_bytes() const {
+    return reformer_.workspace_bytes();
   }
 
   //! Retrieve a block of vectors
@@ -213,7 +220,7 @@ class IVFEntity {
   }
 
   //! Normalize the score in query part
-  void normalize(size_t qidx, IndexDocumentHeap *heap) const {
+  void normalize(size_t qidx, IndexCandidateHeap *heap) const {
     return reformer_.normalize(qidx, heap);
   }
 
@@ -271,6 +278,10 @@ class IVFEntity {
     //! Initialize
     int init(const IndexMeta &imeta);
 
+    size_t workspace_bytes() const {
+      return buffer_.capacity() + scales_.capacity() * sizeof(float);
+    }
+
     //! Load reformer state (e.g. rotation matrix) from storage
     int load(const IndexStorage::Pointer &storage);
 
@@ -299,11 +310,11 @@ class IVFEntity {
                       uint32_t count, const void **out, IndexQueryMeta *ometa);
 
     //! Normalize the score in query part
-    void normalize(size_t qidx, IndexDocumentHeap *heap) const;
+    void normalize(size_t qidx, IndexCandidateHeap *heap) const;
 
     //! Normalize the score in query part
     void normalize(size_t qidx, const void *query, const IndexQueryMeta &qmeta,
-                   IndexDocumentHeap *heap) const;
+                   IndexCandidateHeap *heap) const;
 
    private:
     //! Transform query from fp32 to int8

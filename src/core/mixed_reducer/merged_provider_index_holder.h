@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <zvec/core/framework/index_filter.h>
@@ -83,6 +84,9 @@ class MergedProviderIndexHolder final : public IndexHolder,
  private:
   class Iterator;
   class OrdinalReader;
+  struct OrdinalMap;
+
+  int prepare_ordinal_map();
 
   IndexProvider::Pointer acquire_provider(size_t source_index,
                                           bool validate_planned_count);
@@ -96,6 +100,9 @@ class MergedProviderIndexHolder final : public IndexHolder,
   size_t filtered_count_{0};
   bool has_filter_{false};
   bool initialized_{false};
+  // One immutable, optionally paged key map shared by all worker readers.
+  std::mutex ordinal_mutex_;
+  std::shared_ptr<OrdinalMap> ordinal_map_;
   std::atomic<int> status_{0};
   std::atomic<bool> *stop_flag_{nullptr};
 };

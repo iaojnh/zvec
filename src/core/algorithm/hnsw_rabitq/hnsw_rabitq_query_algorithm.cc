@@ -44,7 +44,7 @@ int HnswRabitqQueryAlgorithm::cleanup() {
 }
 
 int HnswRabitqQueryAlgorithm::search(HnswRabitqQueryEntity *entity,
-                                     HnswRabitqContext *ctx) const {
+                                     HnswRabitqContext *ctx) const try {
   spin_lock_.lock();
   auto maxLevel = entity_.cur_max_level();
   auto entry_point = entity_.entry_point();
@@ -66,10 +66,17 @@ int HnswRabitqQueryAlgorithm::search(HnswRabitqQueryEntity *entity,
   search_neighbors(0, &entry_point, &curest, topk_heap, ctx, entity);
 
   if (ctx->group_by_search()) {
-    expand_neighbors_by_group(topk_heap, ctx, entity);
+    try {
+      expand_neighbors_by_group(topk_heap, ctx, entity);
+    } catch (const std::bad_alloc &) {
+      ctx->group_topk_heaps().clear();
+      return IndexError_NoMemory;
+    }
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 
@@ -213,7 +220,7 @@ void HnswRabitqQueryAlgorithm::expand_neighbors_by_group(
   };
 
   // devide into groups
-  std::map<std::string, TopkHeap> &group_topk_heaps = ctx->group_topk_heaps();
+  auto &group_topk_heaps = ctx->group_topk_heaps();
   for (uint32_t i = 0; i < topk.size(); ++i) {
     node_id_t id = topk[i].first;
     auto score = topk[i].second;

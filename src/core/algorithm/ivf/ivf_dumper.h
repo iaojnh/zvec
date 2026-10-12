@@ -16,6 +16,7 @@
 #include <core/quantizer/quantizer_params.h>
 #include <zvec/core/framework/index_framework.h>
 #include "metric/metric_params.h"
+#include "utility/paged_record_sort.h"
 #include "ivf_index_format.h"
 #include "ivf_params.h"
 #include "ivf_utility.h"
@@ -191,6 +192,10 @@ class IVFDumper {
   int dump_inverted_vector(uint32_t inverted_list_id, uint64_t key,
                            const void *vec);
 
+  // Reserve known input before writing. Pool-backed keys retain only pageable
+  // sort records; the unbudgeted path keeps its existing in-memory layout.
+  int reserve_keys(size_t count);
+
   int dump_inverted_block(uint32_t inverted_list_id, const uint64_t *keys,
                           const void *vecs, uint32_t vector_count,
                           bool column_major);
@@ -200,6 +205,8 @@ class IVFDumper {
 
   //! Dump the centroids index
   int dump_centroid_index(const void *data, size_t size);
+  int dump_centroid_index(
+      size_t size, const std::function<int(size_t, void *, size_t)> &read);
 
   //! Dump params for each inverted list quantizer
   int dump_quantizer_params(
@@ -237,6 +244,8 @@ class IVFDumper {
 
   //! Dump a vector block
   int dump_block();
+  int append_keys(const uint64_t *keys, size_t count);
+  int dump_key_column(bool mapping) const;
 
  private:
   //! Constants
@@ -250,10 +259,16 @@ class IVFDumper {
   std::vector<InvertedListMeta> inverted_lists_meta_{};
   std::vector<uint64_t> keys_{};
   uint32_t cur_list_id_{0};
+  PagedBuildBuffer key_records_;
+  std::vector<KeyOrderRecord> key_scratch_;
+  size_t key_capacity_{0};
+  size_t key_count_{0};
+  bool paged_keys_{false};
+  bool keys_ready_{false};
   uint32_t dumped_feature_count_{0};
   size_t dumped_features_size_{0};
   mutable size_t dumped_size_{0};
-  InvertedIndexHeader header_;
+  InvertedIndexHeader header_{};
 };
 
 }  // namespace core

@@ -328,75 +328,31 @@ int StratifiedClusterTrainer::load(IndexStorage::Pointer cntr) {
     LOG_ERROR("IndexStorage is nullptr.");
     return IndexError_InvalidArgument;
   }
-  std::shared_ptr<MemoryIndexBundle> bundle =
-      std::make_shared<MemoryIndexBundle>();
-  if (!bundle) {
-    LOG_ERROR("New MemoryInndexBundle failed.");
-    return IndexError_NoMemory;
-  }
 
-  auto results = cntr->get_all();
-  for (auto &it : results) {
-    IndexStorage::Segment::Pointer &seg = it.second;
-    if (!seg) {
-      LOG_ERROR("Get Segment %s failed.", it.first.c_str());
-      return IndexError_InvalidArgument;
-    }
-    size_t data_size = seg->data_size();
-    const void *data = nullptr;
-    size_t actual_size = seg->read(0, &data, data_size);
-    if (actual_size != data_size) {
-      LOG_ERROR("Read data failed expect %zu, actual %zu.", data_size,
-                actual_size);
-      return IndexError_ReadData;
-    }
-    bundle->set(it.first, data, data_size);
-  }
-
-  int result = IndexHelper::DeserializeFromStorage(cntr.get(), &meta_);
+  IndexMeta loaded_meta;
+  int result = IndexHelper::DeserializeFromStorage(cntr.get(), &loaded_meta);
   if (result != 0) {
     LOG_ERROR("Failed to deserialize meta from container");
     return result;
   }
 
-  result = IndexCluster::Deserialize(meta_, std::move(bundle), &centroids_);
+  result = IndexCluster::Load(loaded_meta, std::move(cntr), &centroids_);
   if (result != 0) {
     LOG_ERROR("Failed to deserialize index: %d", result);
     return result;
   }
+  meta_ = std::move(loaded_meta);
   return 0;
 }
 
 int StratifiedClusterTrainer::dump(const IndexDumper::Pointer &dumper) {
-  IndexBundle::Pointer bundle;
-  int result = IndexCluster::Serialize(meta_, centroids_, &bundle);
-  if (result != 0) {
-    LOG_ERROR("IndexCluster Serialize failed with ret %d.", result);
-    return result;
-  }
-
-  result = IndexHelper::SerializeToDumper(meta_, dumper.get());
+  int result = IndexHelper::SerializeToDumper(meta_, dumper.get());
   if (result != 0) {
     LOG_ERROR("Failed to serialize meta into dumper.");
     return result;
   }
 
-  for (const auto &it : bundle->all()) {
-    size_t data_size = it.second.size();
-    result = dumper->append(it.first, data_size, 0, 0);
-    if (result != 0) {
-      LOG_ERROR("Dumper append meta %s %zu failed.", it.first.c_str(),
-                data_size);
-      return IndexError_PackIndex;
-    }
-    size_t actual_size = dumper->write(it.second.buffer(), data_size);
-    if (actual_size != data_size) {
-      LOG_ERROR("Dumper segment %s expect %zu, actual %zu.", it.first.c_str(),
-                data_size, actual_size);
-      return IndexError_PackIndex;
-    }
-  }
-  return 0;
+  return IndexCluster::Dump(meta_, centroids_, dumper);
 }
 
 const IndexMeta &StratifiedClusterTrainer::meta() const {

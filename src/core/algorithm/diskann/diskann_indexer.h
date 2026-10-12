@@ -68,9 +68,11 @@ class DiskAnnIndexer {
     return entity_->find_id(key, id);
   }
 
-  //! Copy element_size() bytes from src into a new vector value string
-  std::string make_vector_copy(const void *src) const {
-    return std::string(static_cast<const char *>(src), meta_.element_size());
+  void emplace_candidate(DiskAnnContext *ctx, TopkHeap &heap, diskann_id_t id,
+                         float distance, const void *src) const {
+    if (!AcceptsCandidate(heap, distance)) return;
+    heap.emplace(id, VectorInfo(distance, ctx->fetch_vector() ? src : nullptr,
+                                meta_.element_size()));
   }
 
   std::vector<bool> read_nodes(
@@ -83,6 +85,11 @@ class DiskAnnIndexer {
   void populate_group_topk_heaps(DiskAnnContext *ctx);
 
  private:
+  template <typename Buffer>
+  int read_vector(diskann_id_t id, DiskAnnContext *ctx, Buffer &vector);
+  int finish_group_candidates(DiskAnnContext *ctx,
+                              class GroupCandidateCollector &groups);
+
   int is_filtered(DiskAnnContext *ctx, diskann_id_t id, bool *filtered) const {
     *filtered = false;
     if (!ctx->filter().is_valid()) return 0;

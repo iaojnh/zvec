@@ -156,6 +156,9 @@ class PqFastQuantizer : public Quantizer,
                  std::string *out) const override;
 
   int serialize(std::string *out) const override;
+  using Quantizer::serialize;
+  size_t serialized_size() const override;
+  int serialize_to(const SerializationSink &sink) const override;
 
   int deserialize(std::string &in) override;
 

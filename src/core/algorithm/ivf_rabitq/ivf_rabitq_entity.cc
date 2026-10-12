@@ -167,7 +167,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) {
 int IvfRabitqEntity::search_cluster(uint32_t cluster_id,
                                     const IvfRabitqQueryState &query_state,
                                     size_t padded_dim, size_t ex_bits,
-                                    IndexDocumentHeap *heap) const {
+                                    IndexCandidateHeap *heap) const {
   return search_cluster_impl<false>(cluster_id, query_state, padded_dim,
                                     ex_bits, nullptr, heap);
 }
@@ -176,7 +176,7 @@ int IvfRabitqEntity::search_cluster(uint32_t cluster_id,
                                     const IvfRabitqQueryState &query_state,
                                     size_t padded_dim, size_t ex_bits,
                                     const IndexFilter &filter,
-                                    IndexDocumentHeap *heap) const {
+                                    IndexCandidateHeap *heap) const {
   return search_cluster_impl<true>(cluster_id, query_state, padded_dim, ex_bits,
                                    &filter, heap);
 }
@@ -185,7 +185,7 @@ int IvfRabitqEntity::search_cluster_group_by(
     uint32_t cluster_id, const IvfRabitqQueryState &query_state,
     size_t padded_dim, size_t ex_bits, const IndexGroupBy &group_by,
     uint32_t group_topk, float threshold,
-    IvfRabitqContext::GroupTopkHeaps *heaps) const {
+    GroupCandidateCollector *heaps) const {
   return search_cluster_group_by_impl<false>(
       cluster_id, query_state, padded_dim, ex_bits, nullptr, group_by,
       group_topk, threshold, heaps);
@@ -195,7 +195,7 @@ int IvfRabitqEntity::search_cluster_group_by(
     uint32_t cluster_id, const IvfRabitqQueryState &query_state,
     size_t padded_dim, size_t ex_bits, const IndexFilter &filter,
     const IndexGroupBy &group_by, uint32_t group_topk, float threshold,
-    IvfRabitqContext::GroupTopkHeaps *heaps) const {
+    GroupCandidateCollector *heaps) const {
   return search_cluster_group_by_impl<true>(cluster_id, query_state, padded_dim,
                                             ex_bits, &filter, group_by,
                                             group_topk, threshold, heaps);
@@ -399,12 +399,11 @@ const IvfRabitqClusterMeta *IvfRabitqEntity::find_cluster_meta(
   return &(*it);
 }
 
-int IvfRabitqEntity::compute_distances(uint32_t cluster_id,
-                                       const std::vector<uint32_t> &ids,
-                                       const IvfRabitqQueryState &query_state,
-                                       size_t padded_dim, size_t ex_bits,
-                                       IndexDocumentList *documents) const {
-  if (!documents) {
+int IvfRabitqEntity::compute_distances(
+    uint32_t cluster_id, std::vector<uint32_t> &ids,
+    const IvfRabitqQueryState &query_state, size_t padded_dim, size_t ex_bits,
+    const std::function<void(uint64_t, float)> &consume) const {
+  if (!consume) {
     return IndexError_InvalidArgument;
   }
   if (cluster_id >= cluster_metas_.size()) {
@@ -418,8 +417,7 @@ int IvfRabitqEntity::compute_distances(uint32_t cluster_id,
   }
 
   const auto &meta = cluster_metas_[cluster_id];
-  std::vector<uint32_t> sorted_ids(ids);
-  std::sort(sorted_ids.begin(), sorted_ids.end());
+  std::sort(ids.begin(), ids.end());
 
   const size_t batch_stride =
       rabitqlib::BatchDataMap<float>::data_bytes(padded_dim);
@@ -430,9 +428,7 @@ int IvfRabitqEntity::compute_distances(uint32_t cluster_id,
   std::array<float, rabitqlib::fastscan::kBatchSize> ip_x0_qr;
   uint32_t loaded_batch = std::numeric_limits<uint32_t>::max();
 
-  documents->clear();
-  documents->reserve(sorted_ids.size());
-  for (uint32_t id : sorted_ids) {
+  for (uint32_t id : ids) {
     if (static_cast<size_t>(id) < meta.key_offset ||
         static_cast<size_t>(id) >= meta.key_offset + meta.vector_count) {
       return IndexError_InvalidArgument;
@@ -470,7 +466,7 @@ int IvfRabitqEntity::compute_distances(uint32_t cluster_id,
     uint64_t key = 0;
     int ret = read_key(id, &key);
     if (ret != 0) return ret;
-    documents->emplace_back(key, distance);
+    consume(key, distance);
   }
   return 0;
 }
@@ -481,7 +477,7 @@ int IvfRabitqEntity::search_cluster_impl(uint32_t cluster_id,
                                          const IvfRabitqQueryState &query_state,
                                          size_t padded_dim, size_t ex_bits,
                                          const IndexFilter *filter,
-                                         IndexDocumentHeap *heap) const {
+                                         IndexCandidateHeap *heap) const {
   if (cluster_id >= cluster_metas_.size()) {
     LOG_ERROR("Invalid cluster_id=%zu", (size_t)cluster_id);
     return IndexError_OutOfRange;
@@ -598,7 +594,7 @@ int IvfRabitqEntity::search_cluster_group_by_impl(
     uint32_t cluster_id, const IvfRabitqQueryState &query_state,
     size_t padded_dim, size_t ex_bits, const IndexFilter *filter,
     const IndexGroupBy &group_by, uint32_t group_topk, float threshold,
-    IvfRabitqContext::GroupTopkHeaps *heaps) const {
+    GroupCandidateCollector *heaps) const {
   if (cluster_id >= cluster_metas_.size()) {
     return IndexError_OutOfRange;
   }
@@ -657,23 +653,14 @@ int IvfRabitqEntity::search_cluster_group_by_impl(
       }
 
       const std::string group_id = group_by(key);
-      auto &heap = (*heaps)[group_id];
-      if (heap.empty()) {
-        heap.limit(group_topk);
-        heap.set_threshold(threshold);
-      }
-
       if (ex_bits == 0) {
-        if (heap.full() && est_dist[i] >= heap.begin()->score()) {
-          continue;
+        if (est_dist[i] <= threshold) {
+          ret = heaps->add(group_id, key, est_dist[i]);
+          if (ret != 0) return ret;
         }
-        heap.emplace(key, est_dist[i]);
         continue;
       }
-
-      const float group_threshold =
-          heap.full() ? heap.begin()->score() : threshold;
-      if (low_dist[i] >= group_threshold) {
+      if (low_dist[i] >= heaps->threshold_for(group_id, threshold)) {
         continue;
       }
       if (!ex_data) {
@@ -685,7 +672,10 @@ int IvfRabitqEntity::search_cluster_group_by_impl(
           static_cast<const char *>(ex_data) +
               (static_cast<size_t>(i) * ex_stride),
           ip_func_, *batch_query, padded_dim, ex_bits, ip_x0_qr[i]);
-      heap.emplace(key, distance);
+      if (distance <= threshold) {
+        ret = heaps->add(group_id, key, distance);
+        if (ret != 0) return ret;
+      }
     }
 
     offset += batch_size;

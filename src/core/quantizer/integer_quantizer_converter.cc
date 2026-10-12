@@ -19,6 +19,7 @@
 #include <core/quantizer/quantizer_params.h>
 #include <zvec/core/framework/index_factory.h>
 #include "rotator/rotator.h"
+#include "utility/appendable_build_buffer.h"
 #include "record_quantizer.h"
 #include "../metric/metric_params.h"
 
@@ -218,7 +219,8 @@ class IntegerQuantizerConverter : public IndexConverter {
 
   //! Train the data
   int train(IndexHolder::Pointer holder) override {
-    if (holder->dimension() != meta_.dimension() ||
+    if (!holder || meta_.dimension() == 0 ||
+        holder->dimension() != meta_.dimension() ||
         holder->data_type() != IndexMeta::DataType::DT_FP32) {
       return IndexError_Mismatch;
     }
@@ -265,24 +267,49 @@ class IntegerQuantizerConverter : public IndexConverter {
         LOG_ERROR("Failed to create iterator of holder");
         return IndexError_Runtime;
       }
-      std::vector<float> features;
+      AppendableBuildBuffer features;
+      const size_t row_bytes =
+          static_cast<size_t>(meta_.dimension()) * sizeof(float);
       float max = -std::numeric_limits<float>::max();
       float min = std::numeric_limits<float>::max();
       for (; iter->is_valid(); iter->next()) {
         const float *vec = reinterpret_cast<const float *>(iter->data());
+        if (!vec) return IndexError_ReadData;
         for (size_t i = 0; i < meta_.dimension(); ++i) {
           max = std::max(max, vec[i]);
           min = std::min(min, vec[i]);
-          features.emplace_back(vec[i]);
         }
+        const size_t offset = features.size();
+        if (offset > std::numeric_limits<size_t>::max() - row_bytes)
+          return IndexError_IndexFull;
+        int ret = features.resize(offset + row_bytes);
+        if (ret != 0) return ret;
+        ret = features.write(offset, vec, row_bytes);
+        if (ret != 0) return ret;
       }
+      if (iter->status() != 0) return iter->status();
       quantizer_->set_max(max);
       quantizer_->set_min(min);
 
       //! step2: feed quantizer with training data
-      for (size_t i = 0; i < features.size(); i += meta_.dimension()) {
-        quantizer_->feed(&features[i], meta_.dimension());
-        (*stats_.mutable_trained_count())++;
+      // Replay in bounded, float-aligned batches. Never retain the entire
+      // single-pass input on the heap when a pool is configured.
+      const size_t rows_per_batch =
+          std::max(size_t{1}, (1024 * 1024) / row_bytes);
+      std::vector<float> batch(
+          std::min(rows_per_batch, features.size() / row_bytes) *
+          meta_.dimension());
+      for (size_t offset = 0; offset < features.size();) {
+        const size_t rows =
+            std::min(rows_per_batch, (features.size() - offset) / row_bytes);
+        int ret = features.read(offset, batch.data(), rows * row_bytes);
+        if (ret != 0) return ret;
+        for (size_t i = 0; i < rows; ++i) {
+          quantizer_->feed(batch.data() + i * meta_.dimension(),
+                           meta_.dimension());
+          (*stats_.mutable_trained_count())++;
+        }
+        offset += rows * row_bytes;
       }
     }
 

@@ -22,6 +22,7 @@
 #include <ailego/parallel/lock.h>
 #include <ailego/utility/memory_helper.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_framework.h>
@@ -70,7 +71,7 @@ class FlatStreamerEntity {
 
   //! Search in linear list with filter
   virtual int search(const void *query, const IndexFilter &filter,
-                     uint32_t *scan_count, IndexDocumentHeap *heap,
+                     uint32_t *scan_count, IndexCandidateHeap *heap,
                      IndexContext::Stats *context_stats,
                      FlatSearchScratch *scratch = nullptr,
                      size_t batch_size = 0) const;
@@ -79,25 +80,25 @@ class FlatStreamerEntity {
   virtual int search_by_p_keys(const void *query,
                                const std::vector<uint64_t> &p_keys,
                                const IndexFilter &filter,
-                               IndexDocumentHeap *heap,
+                               IndexCandidateHeap *heap,
                                FlatSearchScratch *scratch = nullptr,
                                size_t batch_size = 0) const;
 
   //! Search in a block
   void search_block(const void *query, const BlockLocation &bl,
                     const BlockHeader *hd, float norm_val,
-                    IndexDocumentHeap *heap) const;
+                    IndexCandidateHeap *heap) const;
 
   //! Search in a block with filter
   void search_block(const void *query, const BlockLocation &bl,
                     const BlockHeader *hd, float norm_val,
                     const IndexFilter &filter, const DeletionMap *deletion_map,
-                    IndexDocumentHeap *heap,
+                    IndexCandidateHeap *heap,
                     IndexContext::Stats *context_stats) const;
 
   //! Flat Search with filter
   int search_bf(const void *query, const IndexFilter &filter,
-                IndexDocumentHeap *heap,
+                IndexCandidateHeap *heap,
                 IndexContext::Stats *context_stats) const;
 
   //! Clone the entity
@@ -178,11 +179,8 @@ class FlatStreamerEntity {
   }
 
   inline uint64_t key(uint32_t id) const {
-    if (id < id_key_vector_.size()) {
-      return id_key_vector_[id];
-    } else {
-      return kInvalidKey;
-    }
+    uint64_t result = kInvalidKey;
+    return get_key_by_position(id, &result) == 0 ? result : kInvalidKey;
   }
 
   inline void row_major_distance(const void *query, const void *feature,
@@ -238,7 +236,7 @@ class FlatStreamerEntity {
   int get_key_by_position(uint32_t id, uint64_t *key) const;
 
   size_t id_key_count() const {
-    return id_key_vector_.size();
+    return vector_count();
   }
 
   bool use_key_info_map() const {
@@ -256,11 +254,14 @@ class FlatStreamerEntity {
   class Iterator : public IndexProvider::Iterator {
    public:
     //! Constructor
-    Iterator(const FlatStreamerEntity::Pointer &entity) : entity_(entity) {
+    Iterator(const FlatStreamerEntity::Pointer &entity)
+        : entity_(entity), remaining_(entity->vector_count()) {
       this->read_next_block();
     }
     //! Retrieve pointer of data
     const void *data() const override {
+      if (!is_valid_) return nullptr;
+      if (entity_->storage_->vec_buffer_pool()) return row_.data();
       return reinterpret_cast<const char *>(data_) +
              block_vector_index_ * entity_->index_meta_.element_size();
     }
@@ -268,24 +269,38 @@ class FlatStreamerEntity {
     bool is_valid() const override {
       return is_valid_;
     }
+    int status() const override {
+      return status_;
+    }
     //! Retrieve primary key
     uint64_t key() const override {
+      if (entity_->storage_->vec_buffer_pool()) return key_;
       return keys_[block_vector_index_];
     }
     //! Next iterator
     void next() override {
+      if (!is_valid_) return;
+      if (--remaining_ == 0) {
+        is_valid_ = false;
+        return;
+      }
       if (++block_vector_index_ == block_vector_count_) {
         ++block_index_;
         this->read_next_block();
+      } else if (entity_->storage_->vec_buffer_pool()) {
+        read_row();
       }
     }
 
    private:
     //! Read next non-empty block
     void read_next_block();
+    void read_row();
 
     //! Members
     std::string buffer_{};
+    std::vector<char, ailego::BudgetedAllocator<char>> row_;
+    uint64_t key_{0};
     const FlatStreamerEntity::Pointer entity_;
     IndexStorage::MemoryBlock block_;
     const void *data_{nullptr};
@@ -295,6 +310,8 @@ class FlatStreamerEntity {
     uint32_t block_vector_index_{0u};
     uint32_t block_vector_count_{0u};
     bool is_valid_{true};
+    size_t remaining_{0};
+    int status_{0};
   };
 
   //! Retrive storage segment by index
@@ -334,8 +351,11 @@ class FlatStreamerEntity {
   //! Load keys to keys map
   int load_segment_keys_to_map(BlockLocation block);
 
-  //! Load keys to keys map
-  int load_segment_keys_to_vector();
+  // Positions are derived from block layout; only one prefix per segment.
+  bool locate_position(uint64_t id, VectorLocation *loc,
+                       size_t *key_offset = nullptr) const;
+
+  Pointer clone_impl(bool copy_key_map) const;
 
   //! Load index from storage
   int load_storage(IndexStorage::Pointer storage);
@@ -487,9 +507,7 @@ class FlatStreamerEntity {
   IndexStreamer::Stats &stats_;
   mutable std::shared_ptr<ailego::SharedMutex> key_info_map_lock_{};
   std::unordered_map<uint64_t, VectorLocation> key_info_map_{};
-  std::vector<VectorLocation> withid_key_info_map_{};
-  std::vector<uint32_t> withid_key_map_{};
-  std::vector<uint64_t> id_key_vector_{};
+  std::vector<uint64_t> segment_first_id_{};
   bool filter_same_key_{false};
   bool use_key_info_map_{true};
   uint32_t vec_unit_size_{0};
@@ -513,10 +531,10 @@ class FlatContiguousStreamerEntity : public FlatStreamerEntity {
                          uint32_t element_size) override;
 
   int search(const void *query, const IndexFilter &filter, uint32_t *scan_count,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats,
+             IndexCandidateHeap *heap, IndexContext::Stats *context_stats,
              FlatSearchScratch *scratch, size_t batch_size) const override;
   int search_by_p_keys(const void *query, const std::vector<uint64_t> &p_keys,
-                       const IndexFilter &filter, IndexDocumentHeap *heap,
+                       const IndexFilter &filter, IndexCandidateHeap *heap,
                        FlatSearchScratch *scratch,
                        size_t batch_size) const override;
 
@@ -554,7 +572,7 @@ class FlatContiguousStreamerEntity : public FlatStreamerEntity {
                          const IndexFilter &filter, size_t batch_size,
                          FlatSearchScratch *scratch,
                          IndexContext::Stats *context_stats,
-                         IndexDocumentHeap *heap) const;
+                         IndexCandidateHeap *heap) const;
   const void *get_vector_ptr(const ContiguousStorage &storage,
                              size_t position) const;
   const void *get_vector_ptr_by_key(const ContiguousStorage &storage,

@@ -15,6 +15,7 @@
 #include "diskann_searcher.h"
 #include <limits>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include "diskann_context.h"
 #include "diskann_indexer.h"
 #include "diskann_params.h"
@@ -138,14 +139,14 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
   // only owns the bytes and the indexer receives the ready-to-use quantizer.
   // The implementation is resolved from the meta buffer header, so any
   // supported quantize type (PQ today, others later) plugs in transparently.
-  std::string quantizer_meta_buffer;
+  DiskAnnSearcherEntity::QuantizerMetaBuffer quantizer_meta_buffer;
   ret = entity_.read_pq_quantizer_meta_buffer(&quantizer_meta_buffer);
   if (ret != 0) {
     LOG_ERROR("Read quantizer meta buffer failed, ret=%d", ret);
     return ret;
   }
   auto quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-      quantizer_meta_buffer, meta_,
+      quantizer_meta_buffer.bytes, meta_,
       static_cast<uint32_t>(entity_.pq_chunk_num()),
       entity_.legacy_pq_layout());
   if (!quantizer) {
@@ -242,7 +243,7 @@ int DiskAnnSearcher::ensure_compatible_context(ContextPointer &context,
 
 int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
                                  uint32_t count,
-                                 Context::Pointer &context) const {
+                                 Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -267,6 +268,11 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
     return ret;
   }
   AILEGO_DEFER(diskann_indexer_.get(), &DiskAnnIndexer::release_io_ctx, ctx);
+  auto release_candidates = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().release();
+    ctx->group_topk_heaps().clear();
+    if (ret || ctx->error()) ctx->clear();
+  });
   if (ailego_unlikely(!group_options_valid(ctx))) {
     LOG_ERROR("Group search requires a callback and a positive group topk");
     return IndexError_InvalidArgument;
@@ -295,11 +301,14 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  if (auto *ctx = dynamic_cast<DiskAnnContext *>(context.get())) ctx->clear();
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::search_bf_impl(const void *query,
                                     const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const {
+                                    Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -324,6 +333,11 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
     return ret;
   }
   AILEGO_DEFER(diskann_indexer_.get(), &DiskAnnIndexer::release_io_ctx, ctx);
+  auto release_candidates = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().release();
+    ctx->group_topk_heaps().clear();
+    if (ret || ctx->error()) ctx->clear();
+  });
   if (ailego_unlikely(!group_options_valid(ctx))) {
     LOG_ERROR("Group search requires a callback and a positive group topk");
     return IndexError_InvalidArgument;
@@ -350,12 +364,15 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  if (auto *ctx = dynamic_cast<DiskAnnContext *>(context.get())) ctx->clear();
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -385,6 +402,11 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
     return ret;
   }
   AILEGO_DEFER(diskann_indexer_.get(), &DiskAnnIndexer::release_io_ctx, ctx);
+  auto release_candidates = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().release();
+    ctx->group_topk_heaps().clear();
+    if (ret || ctx->error()) ctx->clear();
+  });
   if (ailego_unlikely(!group_options_valid(ctx))) {
     LOG_ERROR("Group search requires a callback and a positive group topk");
     return IndexError_InvalidArgument;
@@ -411,6 +433,9 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  if (auto *ctx = dynamic_cast<DiskAnnContext *>(context.get())) ctx->clear();
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::get_vector(uint64_t key, Context::Pointer &context,

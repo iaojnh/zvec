@@ -69,7 +69,7 @@ class FlatSparseContext : public IndexContext {
     return &results_.at(idx);
   }
 
-  inline IndexDocumentHeap *result_heap() {
+  inline IndexCandidateHeap *result_heap() {
     return &result_heap_;
   }
 
@@ -129,7 +129,15 @@ class FlatSparseContext : public IndexContext {
     return group_num_;
   }
 
-  void reset() override {}
+  void reset() override {
+    result_heap_.release();
+    result_group_heap_.clear();
+    group_results_.clear();
+    for (auto &result : results_) {
+      result.clear();
+      if (result.capacity() > 4096) IndexDocumentList().swap(result);
+    }
+  }
 
   //! Reset the context
   void reset(const FlatSparseStreamer *streamer_ptr) {
@@ -192,7 +200,8 @@ class FlatSparseContext : public IndexContext {
           SparseUtility::ReverseSparseFormat(sparse_data, sparse_doc,
                                              entity()->sparse_unit_size());
         }
-        results_[idx].emplace_back(key, score, id, nullptr, sparse_doc);
+        results_[idx].emplace_back(key, score, id, nullptr,
+                                   std::move(sparse_doc));
       } else {
         results_[idx].emplace_back(key, score);
       }
@@ -209,14 +218,14 @@ class FlatSparseContext : public IndexContext {
   std::vector<Stats> stats_vec_{};
   uint32_t magic_{0};
   uint32_t topk_{0};
-  IndexDocumentHeap result_heap_;
+  IndexCandidateHeap result_heap_;
   // std::string batch_queries_{};
   bool fetch_vector_{false};
 
   // group
   uint32_t group_num_{0};
   uint32_t group_topk_{0};
-  std::map<std::string, IndexDocumentHeap> result_group_heap_{};
+  std::map<std::string, IndexCandidateHeap> result_group_heap_{};
   std::vector<IndexDocumentList> results_{};
   std::vector<IndexGroupDocumentList> group_results_{};
 };

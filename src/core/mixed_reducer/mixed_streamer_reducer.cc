@@ -695,11 +695,14 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) {
 
   AILEGO_DEFER([&]() { holder->set_stop_flag(nullptr); });
   IndexHolder::Pointer target_holder = holder;
-  // IVF and DiskAnn propagate source read failures during dump.
+  // IVF and DiskAnn propagate source read failures during dump. IVF RaBitQ
+  // consumes its input during train/build, checking every read, and dumps
+  // only its owned paged output. None needs a full in-memory input snapshot.
   // Other builders retain an owned multipass snapshot, as before, so their
   // dump paths never depend on a source provider or its deferred error state.
   if (target_builder_->name() != "IVFBuilder" &&
-      target_builder_->name() != "DiskAnnBuilder") {
+      target_builder_->name() != "DiskAnnBuilder" &&
+      target_builder_->name() != "IvfRabitqBuilder") {
     switch (holder->data_type()) {
       case IndexMeta::DataType::DT_FP32:
         ret = MaterializeMergedInput<IndexMeta::DataType::DT_FP32, float>(

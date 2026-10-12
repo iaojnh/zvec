@@ -20,6 +20,7 @@
 #include <limits>
 #include <numeric>
 #include <ailego/pattern/defer.h>
+#include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_factory.h>
 #include "utility/immutable_segment_view.h"
@@ -152,7 +153,7 @@ void DiskAnnBuilderEntity::clear() {
   std::string().swap(neighbors_buffer_);
   entrypoints_.clear();
   meta_.clear();
-  std::string().swap(pq_quantizer_meta_buffer_);
+  pq_quantizer_.reset();
   std::vector<uint8_t>().swap(block_compressed_data_);
   meta_header_.clear();
   pq_meta_.clear();
@@ -558,8 +559,18 @@ int64_t DiskAnnBuilderEntity::dump_segment(const IndexDumper::Pointer &dumper,
   return 0;
 }
 
+void DiskAnnBuilderEntity::set_pq_quantizer(
+    std::shared_ptr<const turbo::Quantizer> quantizer) {
+  pq_quantizer_ = std::move(quantizer);
+  pq_meta_.quantizer_meta_buffer_size =
+      pq_quantizer_ ? pq_quantizer_->serialized_size() : 0;
+}
+
 int DiskAnnBuilderEntity::dump_pq_meta_segment(
     const IndexDumper::Pointer &dumper) const {
+  if (!pq_quantizer_ || pq_meta_.quantizer_meta_buffer_size == 0) {
+    return IndexError_InvalidArgument;
+  }
   uint32_t crc = 0U;
 
   // write meta
@@ -572,17 +583,22 @@ int DiskAnnBuilderEntity::dump_pq_meta_segment(
 
   crc = ailego::Crc32c::Hash(&pq_meta_, sizeof(DiskAnnPqMeta), crc);
 
-  // write serialized quantizer meta buffer
-  size_t size_meta_buffer = dumper->write(pq_quantizer_meta_buffer_.data(),
-                                          pq_meta_.quantizer_meta_buffer_size);
+  // Write bounded chunks directly from the retained trained quantizer.
+  size_t size_meta_buffer = 0;
+  int ret =
+      pq_quantizer_->serialize_to([&](const void *data, size_t bytes) -> int {
+        if (bytes > pq_meta_.quantizer_meta_buffer_size - size_meta_buffer ||
+            dumper->write(data, bytes) != bytes) {
+          return IndexError_WriteData;
+        }
+        crc = ailego::Crc32c::Hash(data, bytes, crc);
+        size_meta_buffer += bytes;
+        return 0;
+      });
+  if (ret != 0) return ret;
   if (size_meta_buffer != pq_meta_.quantizer_meta_buffer_size) {
-    LOG_ERROR("Failed to dump quantizer meta buffer, expect: %zu, actual: %zu",
-              (size_t)pq_meta_.quantizer_meta_buffer_size, size_meta_buffer);
     return IndexError_WriteData;
   }
-
-  crc = ailego::Crc32c::Hash(pq_quantizer_meta_buffer_.data(),
-                             pq_meta_.quantizer_meta_buffer_size, crc);
 
   // write size
   size_t size_total = size_pq_meta + size_meta_buffer;
@@ -597,8 +613,7 @@ int DiskAnnBuilderEntity::dump_pq_meta_segment(
     }
   }
 
-  int ret =
-      dumper->append(kDiskAnnPqMetaSegmentId, size_total, padding_size, crc);
+  ret = dumper->append(kDiskAnnPqMetaSegmentId, size_total, padding_size, crc);
   if (ret != 0) {
     LOG_ERROR("Dump PQ segment failed, ret %d", ret);
     return ret;

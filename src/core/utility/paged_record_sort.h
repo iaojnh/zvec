@@ -22,13 +22,23 @@ namespace zvec::core {
 // External merge sort for fixed-width scratch records. Only three bounded
 // tiles are on the heap; the runs and merge output share the process pool.
 // Equal records retain input order across merge passes.
-template <typename T, typename Compare>
-int SortPagedRecords(PagedBuildBuffer *records, Compare less) try {
+// With an explicit count, records must reserve space for twice that many
+// records. Merge passes use the second half of the same file, avoiding a
+// second page table. The sorted result always ends at offset zero.
+template <typename T, typename Compare, typename Buffer>
+int SortPagedRecords(Buffer *records, Compare less,
+                     size_t count = std::numeric_limits<size_t>::max()) try {
   static_assert(std::is_trivially_copyable<T>::value,
                 "Scratch records must be POD");
   if (!records || records->size() % sizeof(T))
     return IndexError_InvalidArgument;
-  const size_t count = records->size() / sizeof(T);
+  const bool shared_scratch = count != std::numeric_limits<size_t>::max();
+  if (shared_scratch) {
+    if (count > records->size() / sizeof(T) / 2)
+      return IndexError_InvalidArgument;
+  } else {
+    count = records->size() / sizeof(T);
+  }
   if (count < 2) return 0;
   const size_t tile =
       records->paged() ? std::max<size_t>(1, 64 * 1024 / sizeof(T)) : count;
@@ -42,9 +52,15 @@ int SortPagedRecords(PagedBuildBuffer *records, Compare less) try {
     if (ret != 0) return ret;
   }
   if (count <= tile) return 0;
-  PagedBuildBuffer output;
-  int ret = output.init(records->size());
-  if (ret != 0) return ret;
+  Buffer separate_output;
+  auto *output = shared_scratch ? records : &separate_output;
+  int ret = 0;
+  if (!shared_scratch) {
+    ret = output->init(records->size());
+    if (ret != 0) return ret;
+  }
+  size_t input_base = 0;
+  size_t output_base = shared_scratch ? count * sizeof(T) : 0;
   std::vector<T> right(left.size()), merged(left.size());
   for (size_t width = tile; width < count;) {
     for (size_t first = 0; first < count;) {
@@ -55,14 +71,16 @@ int SortPagedRecords(PagedBuildBuffer *records, Compare less) try {
       while (l < middle || r < end || li < ln || ri < rn) {
         if (li == ln && l < middle) {
           ln = std::min(tile, middle - l);
-          ret = records->read(l * sizeof(T), left.data(), ln * sizeof(T));
+          ret = records->read(input_base + l * sizeof(T), left.data(),
+                              ln * sizeof(T));
           if (ret != 0) return ret;
           l += ln;
           li = 0;
         }
         if (ri == rn && r < end) {
           rn = std::min(tile, end - r);
-          ret = records->read(r * sizeof(T), right.data(), rn * sizeof(T));
+          ret = records->read(input_base + r * sizeof(T), right.data(),
+                              rn * sizeof(T));
           if (ret != 0) return ret;
           r += rn;
           ri = 0;
@@ -73,22 +91,34 @@ int SortPagedRecords(PagedBuildBuffer *records, Compare less) try {
           merged[pending++] = right[ri++];
         }
         if (pending == merged.size()) {
-          ret = output.write(written * sizeof(T), merged.data(),
-                             pending * sizeof(T));
+          ret = output->write(output_base + written * sizeof(T), merged.data(),
+                              pending * sizeof(T));
           if (ret != 0) return ret;
           written += pending;
           pending = 0;
         }
       }
       if (pending) {
-        ret = output.write(written * sizeof(T), merged.data(),
-                           pending * sizeof(T));
+        ret = output->write(output_base + written * sizeof(T), merged.data(),
+                            pending * sizeof(T));
         if (ret != 0) return ret;
       }
       first = end;
     }
-    std::swap(*records, output);
+    if (shared_scratch)
+      std::swap(input_base, output_base);
+    else
+      std::swap(*records, *output);
     width = width > count / 2 ? count : width * 2;
+  }
+  if (input_base != 0) {
+    for (size_t first = 0; first < count; first += tile) {
+      const size_t bytes = std::min(tile, count - first) * sizeof(T);
+      ret = records->read(input_base + first * sizeof(T), left.data(), bytes);
+      if (ret != 0) return ret;
+      ret = records->write(first * sizeof(T), left.data(), bytes);
+      if (ret != 0) return ret;
+    }
   }
   return 0;
 } catch (const std::bad_alloc &) {

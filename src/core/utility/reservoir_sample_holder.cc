@@ -19,6 +19,7 @@ namespace zvec::core {
 namespace {
 class ReservoirHolder final
     : public IndexHolder,
+      public OrdinalAccessHolder,
       public std::enable_shared_from_this<ReservoirHolder> {
  public:
   size_t count() const override {
@@ -73,6 +74,46 @@ class ReservoirHolder final
   };
   Iterator::Pointer create_iterator() override {
     return std::make_unique<Cursor>(shared_from_this());
+  }
+
+  // The sample is already pageable and immutable. Expose ordinal reads so
+  // multi-pass consumers can borrow it instead of spooling a second copy.
+  int create_ordinal_reader(Reader::Pointer *out) override try {
+    if (!out) return IndexError_InvalidArgument;
+    class SampleReader : public Reader {
+     public:
+      explicit SampleReader(std::shared_ptr<ReservoirHolder> holder)
+          : holder_(std::move(holder)) {}
+      int read(size_t ordinal, uint64_t *key, const void **data) override try {
+        if (!key || !data) return IndexError_InvalidArgument;
+        *data = nullptr;
+        if (ordinal >= holder_->count_) return IndexError_OutOfRange;
+        row_.resize((holder_->bytes_ + 7) / 8);
+        int ret = holder_->buffer_.read(ordinal * holder_->bytes_, row_.data(),
+                                        holder_->bytes_);
+        if (ret != 0) return ret;
+        *key = ordinal;
+        *data = row_.data();
+        return 0;
+      } catch (const std::bad_alloc &) {
+        return IndexError_NoMemory;
+      } catch (const std::exception &) {
+        return IndexError_ReadData;
+      }
+      void reset() override {
+        std::vector<uint64_t>().swap(row_);
+      }
+
+     private:
+      std::shared_ptr<ReservoirHolder> holder_;
+      std::vector<uint64_t> row_;
+    };
+    *out = std::make_unique<SampleReader>(shared_from_this());
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::exception &) {
+    return IndexError_Runtime;
   }
 
   int init(const IndexHolder::Pointer &input, size_t limit) {

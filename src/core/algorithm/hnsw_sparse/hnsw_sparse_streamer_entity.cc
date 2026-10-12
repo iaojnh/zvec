@@ -76,14 +76,14 @@ int HnswSparseStreamerEntity::cleanup() {
   upper_neighbor_chunks_.clear();
   filter_same_key_ = false;
   get_vector_enabled_ = false;
+  use_key_info_map_ = true;
   broker_.reset();
 
   return 0;
 }
 
 int HnswSparseStreamerEntity::update_neighbors(
-    level_t level, node_id_t id,
-    const std::vector<std::pair<node_id_t, dist_t>> &neighbors) {
+    level_t level, node_id_t id, const TopkHeap::Container &neighbors) {
   std::vector<char> buffer(neighbor_size_);
   NeighborsHeader *hd = reinterpret_cast<NeighborsHeader *>(buffer.data());
   hd->neighbor_cnt = neighbors.size();
@@ -481,9 +481,10 @@ int HnswSparseStreamerEntity::open(IndexStorage::Pointer stg, bool check_crc) {
     LOG_WARN("Index closed abnormally, using totalVecs as curDocCnt");
     *mutable_doc_cnt() = total_vecs;
   }
-  if (filter_same_key_ || get_vector_enabled_) {
+  if (use_key_info_map_ && (filter_same_key_ || get_vector_enabled_)) {
     for (node_id_t id = 0U; id < doc_cnt(); ++id) {
-      (*keys_map_)[get_key(id)] = id;
+      const auto key = get_key(id);
+      if (key != kInvalidKey) (*keys_map_)[key] = id;
     }
   }
 
@@ -525,22 +526,18 @@ int HnswSparseStreamerEntity::flush(uint64_t checkpoint) {
 int HnswSparseStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("Dump index, curDocs=%u", doc_cnt());
 
-  //! sort by keys, to support get_vector by key in searcher
-  std::vector<key_t> keys(doc_cnt());
-  for (node_id_t i = 0; i < doc_cnt(); ++i) {
-    keys[i] = get_key(i);
-  }
-
   //! dump neighbors
-  auto get_level = [&](node_id_t id) {
-    auto it = upper_neighbor_index_->find(id);
+  auto get_level = [&](node_id_t id) -> level_t {
+    int status = 0;
+    auto it = upper_neighbor_index_->find(id, &status);
+    if (status != 0) return status;
     if (it == upper_neighbor_index_->end()) {
       return 0U;
     };
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
     return meta->bits.level;
   };
-  auto ret = dump_segments(dumper, keys.data(), get_level);
+  auto ret = dump_segments(dumper, get_level);
   if (ailego_unlikely(ret < 0)) {
     return ret;
   }
@@ -723,7 +720,7 @@ int HnswSparseStreamerEntity::add_vector(level_t level, key_t key,
     return IndexError_Runtime;
   }
 
-  if (filter_same_key_ || get_vector_enabled_) {
+  if (use_key_info_map_ && (filter_same_key_ || get_vector_enabled_)) {
     keys_map_lock_->lock();
     (*keys_map_)[key] = local_id;
     keys_map_lock_->unlock();
@@ -902,7 +899,7 @@ int HnswSparseStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
   }
   *mutable_total_sparse_count() += sparse_count;
 
-  if (filter_same_key_ || get_vector_enabled_) {
+  if (use_key_info_map_ && (filter_same_key_ || get_vector_enabled_)) {
     keys_map_lock_->lock();
     (*keys_map_)[key] = id;
     keys_map_lock_->unlock();
@@ -956,9 +953,10 @@ const HnswSparseEntity::Pointer HnswSparseStreamerEntity::clone() const {
       new (std::nothrow) HnswSparseStreamerEntity(
           stats_, header(), chunk_size_, node_index_mask_bits_,
           upper_neighbor_mask_bits_, filter_same_key_, get_vector_enabled_,
-          sparse_chunk_size_, upper_neighbor_index_, keys_map_lock_, keys_map_,
-          std::move(node_chunks), std::move(upper_neighbor_chunks),
-          std::move(sparse_node_chunks), broker_);
+          use_key_info_map_, sparse_chunk_size_, upper_neighbor_index_,
+          keys_map_lock_, keys_map_, std::move(node_chunks),
+          std::move(upper_neighbor_chunks), std::move(sparse_node_chunks),
+          broker_);
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("HnswSparseStreamerEntity new failed");
   }

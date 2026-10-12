@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
+#include <core/utility/paged_build_buffer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
@@ -117,11 +118,15 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
 
   DistanceImpl distance(const void *query,
                         const IndexQueryMeta &qmeta) const override;
+  int prepare_distance(const void *query, DistanceImpl *out) const override;
 
   DistanceImpl sym_distance(const void *query,
                             const IndexQueryMeta &qmeta) const;
 
   int serialize(std::string *out) const override;
+  using Quantizer::serialize;
+  size_t serialized_size() const override;
+  int serialize_to(const SerializationSink &sink) const override;
 
   int deserialize(std::string &in) override;
 
@@ -188,7 +193,7 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   void subtract_center(T *vec) const;
 
   //! Compute the centroid-to-centroid distance table for SDC.
-  void compute_dist_table();
+  int compute_dist_table();
 
   //! Compute the squared norms of all sub-centroids ([num_chunk * 256]).
   //! Called after train() and deserialize() when centroids are available.
@@ -261,6 +266,7 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   //! Centroid-to-centroid distance table for SDC:
   //! [num_chunk * kNumCentroids * kNumCentroids]
   std::vector<float> dist_table_;
+  std::shared_ptr<core::PagedBuildBuffer> paged_dist_table_;
 
   //! Squared norms of the sub-centroids: [num_chunk * kNumCentroids],
   //! entry [m * 256 + j] = ||c_m[j]||^2.  Used by the precomputed

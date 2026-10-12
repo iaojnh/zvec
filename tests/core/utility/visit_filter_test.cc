@@ -130,6 +130,42 @@ TEST(VisitEpochBitMapTest, CompactExactStateSurvivesWordBoundariesAndGrowth) {
   EXPECT_TRUE(VisitEpochBitMap::visited(&state, 1000099));
 }
 
+TEST(VisitFilterBudgetTest,
+     EveryModeChargesAndRejectsGrowthWithoutLosingState) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  for (auto mode : {VisitFilter::BitMap, VisitFilter::ByteMap,
+                    VisitFilter::EpochBitMap, VisitFilter::BloomFilter}) {
+    SCOPED_TRACE(mode);
+    ASSERT_EQ(0, pool.init(4096));
+    {
+      VisitFilter filter;
+      ASSERT_EQ(0, filter.init(mode, 1024, 256, 0.001f));
+      filter.set_visited(17);
+      const size_t charged = pool.used();
+      EXPECT_GT(charged, 0u);
+      EXPECT_FALSE(filter.reset(1000000, 1000000));
+      EXPECT_EQ(charged, pool.used());
+      EXPECT_TRUE(filter.visited(17));
+      EXPECT_EQ(IndexError_NoMemory,
+                filter.init(VisitFilter::ByteMap, 1000000, 1000000, 0.001f));
+      EXPECT_EQ(mode, filter.get_mode());
+      EXPECT_EQ(charged, pool.used());
+      EXPECT_TRUE(filter.visited(17));
+      filter.clear();
+      EXPECT_FALSE(filter.visited(17));
+    }
+    EXPECT_EQ(0u, pool.used());
+    ASSERT_EQ(0, pool.init(1));
+    VisitFilter failed;
+    EXPECT_EQ(IndexError_NoMemory, failed.init(mode, 1024, 256, 0.001f));
+    EXPECT_EQ(VisitFilter::Default, failed.get_mode());
+    EXPECT_EQ(0u, pool.used());
+  }
+  EXPECT_EQ(0, pool.init(previous));
+}
+
 TEST(VisitFilterDispatch, RejectsUninitializedFilterWithoutInvokingCallback) {
   VisitFilter filter;
   int calls = 0;

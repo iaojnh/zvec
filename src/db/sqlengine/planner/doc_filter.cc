@@ -107,7 +107,7 @@ std::optional<bool> DocFilter::get_forward_bit(uint64_t id) const {
 }
 
 std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
-    float ratio) {
+    float ratio, ailego::MemoryReservation &keys_memory) {
   // TODO: support forward
   if (!invert_result_) {
     return std::nullopt;
@@ -119,15 +119,27 @@ std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
   // decide to use brute force by keys or not
   if (size_t match_count = invert_result_->count();
       match_count <= bf_by_keys_threshold) {
-    std::vector<uint32_t> ids;
-    invert_result_->extract_ids(&ids);
+    ailego::MemoryReservation reservation;
+    std::vector<uint64_t> ids;
+    try {
+      reservation.add_array(match_count, sizeof(uint64_t));
+      ids.reserve(match_count);
+      // Widen directly into the sole owned candidate list, without a
+      // temporary uint32 list that duplicates all matching document IDs.
+      auto iter = invert_result_->create_iterator();
+      for (; iter->valid(); iter->next()) ids.push_back(iter->doc_id());
+      if (ids.size() != match_count) return std::nullopt;
+    } catch (const std::bad_alloc &) {
+      return std::nullopt;
+    }
+    keys_memory.swap(reservation);
     invert_filter_.reset();
     invert_result_.reset();
     LOG_INFO(
         "Use brute force by keys, doc_count[%zu] invert_result_count[%zu] "
         "ratio[%.4f]",
         doc_count, match_count, ratio);
-    return std::vector<uint64_t>(ids.begin(), ids.end());
+    return ids;
   } else {
     LOG_DEBUG(
         "Not use brute force by keys, doc_count[%zu] invert_result_count[%zu] "

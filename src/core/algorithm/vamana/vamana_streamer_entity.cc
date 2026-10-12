@@ -474,8 +474,7 @@ int VamanaStreamerEntity::flush(uint64_t checkpoint) {
 int VamanaStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("Dump Vamana index, curDocs=%u", doc_cnt());
 
-  std::vector<key_t> keys(doc_cnt());
-  auto ret = dump_segments(dumper, keys.data());
+  auto ret = dump_segments(dumper);
   if (ailego_unlikely(ret < 0)) {
     return static_cast<int>(ret);
   }

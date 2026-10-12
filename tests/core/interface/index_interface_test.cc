@@ -1152,7 +1152,7 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
   const size_t page_count = (file_bytes + page_size - 1) / page_size;
   const size_t metadata_bytes =
       zvec::ailego::VecBufferPool::metadata_bytes_for_page_count(page_count);
-  ASSERT_GT(file_bytes, 4 * page_size);
+  ASSERT_GT(file_bytes, 8 * page_size);
   ASSERT_GT(metadata_bytes, 0u);
 
   auto query_param = std::make_shared<DiskAnnQueryParam>();
@@ -1183,16 +1183,20 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
     ASSERT_NE(nullptr, index);
     ASSERT_EQ(0, index->open(index_name, {StorageOptions::StorageType::kMMAP,
                                           false, true}));
+    auto close =
+        zvec::ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, index->close()); });
     for (size_t i = 0; i < baseline.size(); ++i) {
       ASSERT_NO_FATAL_FAILURE(query(index, i, &baseline[i]));
     }
-    ASSERT_EQ(0, index->close());
   }
 
-  // Cover both bypass-only thresholds, then actual cache pressure and a pool
-  // large enough for the entire index. Every mode reads the same built file.
+  // Bypass-only storage still needs a budget for query scratch and returned
+  // payloads. A sub-page budget cannot hold this query's 48 KiB sector buffer
+  // alone; reject it without escaping accounting. The metadata-bypass budget
+  // can hold query scratch. The pressure budget includes scratch headroom,
+  // but still cannot hold the full index. All successful queries match mmap.
   for (size_t budget : {page_size - 1, metadata_bytes + page_size - 1,
-                        metadata_bytes + 4 * page_size, kFullBudget}) {
+                        metadata_bytes + 8 * page_size, kFullBudget}) {
     SCOPED_TRACE(budget);
     ASSERT_EQ(0u, memory_pool.used());
     ASSERT_EQ(0, memory_pool.init(budget));
@@ -1201,9 +1205,22 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
     ASSERT_EQ(0,
               index->open(index_name, {StorageOptions::StorageType::kBufferPool,
                                        false, true}));
+    auto close = zvec::ailego::ScopeGuard::Make([&] {
+      if (index) EXPECT_EQ(0, index->close());
+    });
     const bool cache_enabled = budget >= metadata_bytes + page_size;
     EXPECT_EQ(cache_enabled ? metadata_bytes : 0u, memory_pool.metadata_used());
     for (size_t repeat = 0; repeat < 2; ++repeat) {
+      if (budget < page_size) {
+        SearchResult result;
+        EXPECT_NE(0, index->search(VectorData{DenseVector{values.data()}},
+                                   query_param, &result));
+        EXPECT_TRUE(result.doc_list_.empty());
+        EXPECT_EQ(0u, memory_pool.metadata_used());
+        EXPECT_EQ(0u, memory_pool.stats().page_used);
+        EXPECT_LE(memory_pool.used(), budget);
+        continue;
+      }
       for (size_t i = 0; i < baseline.size(); ++i) {
         Result actual;
         ASSERT_NO_FATAL_FAILURE(query(index, i, &actual));
@@ -2732,7 +2749,9 @@ TEST(IndexInterface, FlatCandidateHandoffPreservesModesAndContextReuse) {
       EXPECT_EQ(i, actual.doc_list_[i].key());
     }
   }
-  for (int mode : {0, 1, 2, 3, 4, 5, 0}) {
+  const std::vector<uint64_t> borrowed_keys{9, 7, 5, 3, 1, 999};
+  const std::vector<uint64_t> empty_keys;
+  for (int mode : {0, 1, 2, 3, 4, 5, 6, 7, 0}) {
     SCOPED_TRACE(mode);
     auto make_param = [&](uint32_t topk) {
       auto param = FlatQueryParamBuilder().with_topk(topk).build();
@@ -2747,6 +2766,8 @@ TEST(IndexInterface, FlatCandidateHandoffPreservesModesAndContextReuse) {
         param->filter->set([](uint64_t key) { return key >= 4; });
       }
       if (mode == 5) param->radius = 1.0f;
+      if (mode == 6) param->borrowed_bf_pks = &borrowed_keys;
+      if (mode == 7) param->borrowed_bf_pks = &empty_keys;
       return param;
     };
     auto candidate_param = make_param(6);

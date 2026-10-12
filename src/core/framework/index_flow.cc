@@ -14,6 +14,7 @@
 
 #include <ailego/pattern/defer.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_flow.h>
@@ -24,6 +25,60 @@
 
 namespace zvec {
 namespace core {
+
+namespace {
+// Convert one row at a time into a single, budgeted contiguous input. Preserve
+// the downstream batch call so Flat still scans the index only once.
+template <typename Convert, typename Search>
+int SearchConvertedBatch(const void *query, const IndexQueryMeta &qmeta,
+                         uint32_t count, Convert &&convert, Search &&search) {
+  std::string row;
+  IndexQueryMeta converted;
+  int ret = convert(query, qmeta, &row, &converted);
+  if (ret) return ret;
+  const size_t stride = row.size();
+  if (!stride || stride != converted.element_size() ||
+      count > SIZE_MAX / stride || !qmeta.element_size() ||
+      count > SIZE_MAX / qmeta.element_size())
+    return IndexError_InvalidArgument;
+  std::vector<char, ailego::BudgetedAllocator<char>> input(stride * count);
+  memcpy(input.data(), row.data(), stride);
+  for (uint32_t i = 1; i < count; ++i) {
+    IndexQueryMeta current;
+    ret = convert(
+        static_cast<const char *>(query) + size_t{i} * qmeta.element_size(),
+        qmeta, &row, &current);
+    if (ret) return ret;
+    if (row.size() != stride || current.data_type() != converted.data_type() ||
+        current.dimension() != converted.dimension() ||
+        current.quantize_type() != converted.quantize_type() ||
+        current.extra_meta_size() != converted.extra_meta_size())
+      return IndexError_Mismatch;
+    memcpy(input.data() + size_t{i} * stride, row.data(), stride);
+  }
+  return search(input.data(), converted);
+}
+template <typename Search>
+int SearchConvertedSparse(const IndexReformer &reformer, const uint32_t *counts,
+                          const uint32_t *indices, const void *query,
+                          const IndexQueryMeta &meta, uint32_t count,
+                          Search &&search) {
+  IndexReformer::SparseQueryBuffer workspace;
+  const void *output = nullptr;
+  IndexQueryMeta converted;
+  int ret = reformer.transform_sparse_batch(counts, indices, query, meta, count,
+                                            &workspace, &output, &converted);
+  if (ret == IndexError_NotImplemented &&
+      ailego::MemoryLimitPool::get_instance().capacity() == 0) {
+    // Preserve legacy custom reformers in unbounded mode only.
+    std::string legacy;
+    ret = reformer.transform(counts, indices, query, meta, count, &legacy,
+                             &converted);
+    return ret ? ret : search(legacy.data(), converted);
+  }
+  return ret ? ret : search(output, converted);
+}
+}  // namespace
 
 // Index Flow
 int IndexFlow::set_storage(const std::string &name,
@@ -426,50 +481,34 @@ int IndexFlow::search_impl(const void *query, const IndexQueryMeta &qmeta,
 }
 
 int IndexFlow::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                              uint32_t count, Context::Pointer &context) const {
+                              uint32_t count, Context::Pointer &context) const
+    try {
   if (ailego_unlikely(!query || !count || !context)) {
     return IndexError_InvalidArgument;
   }
 
   int error_code = 0;
-  if (query_quantizer_) {
-    IndexQueryMeta new_qmeta;
-    std::string tmp;
-    error_code = query_quantizer_->quantize(query, qmeta, &tmp, &new_qmeta);
-    if (error_code == 0) {
-      if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-        return IndexError_Mismatch;
-      }
-      std::string *features = context->mutable_features();
-      features->resize(tmp.size() * count);
-      memcpy(&(*features)[0], tmp.data(), tmp.size());
-      for (uint32_t i = 1; i < count && error_code == 0; ++i) {
-        IndexQueryMeta qmeta_i;
-        error_code = query_quantizer_->quantize(
-            static_cast<const char *>(query) + i * qmeta.element_size(), qmeta,
-            &tmp, &qmeta_i);
-        if (error_code == 0) {
-          memcpy(&(*features)[i * tmp.size()], tmp.data(), tmp.size());
-        }
-      }
-      if (error_code == 0) {
-        error_code = searcher_->search_bf_impl(
-            reinterpret_cast<const void *>(features->data()), new_qmeta, count,
-            context->searcher_context());
-      }
-    }
-  } else if (reformer_) {
-    IndexQueryMeta new_qmeta;
-    error_code = reformer_->transform(query, qmeta, count,
-                                      context->mutable_features(), &new_qmeta);
-    if (error_code == 0) {
-      if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-        return IndexError_Mismatch;
-      }
-      error_code = searcher_->search_bf_impl(
-          reinterpret_cast<const void *>(context->features().data()), new_qmeta,
-          count, context->searcher_context());
-    }
+  // Never retain a previous batch's converted matrix in the context.
+  std::string().swap(*context->mutable_features());
+  if (query_quantizer_ || reformer_) {
+    error_code = SearchConvertedBatch(
+        query, qmeta, count,
+        [&](const void *data, const IndexQueryMeta &meta, std::string *out,
+            IndexQueryMeta *converted) -> int {
+          const int ret =
+              query_quantizer_
+                  ? query_quantizer_->quantize(data, meta, out, converted)
+                  : reformer_->transform(data, meta, out, converted);
+          if (ret) return ret;
+          return metric_->is_matched(meta_, *converted) ? 0
+                                                        : IndexError_Mismatch;
+        },
+        [&](const void *data, const IndexQueryMeta &converted) -> int {
+          if (!metric_->is_matched(meta_, converted))
+            return IndexError_Mismatch;
+          return searcher_->search_bf_impl(data, converted, count,
+                                           context->searcher_context());
+        });
   } else {
     if (ailego_unlikely(!metric_->is_matched(meta_, qmeta))) {
       return IndexError_Mismatch;
@@ -504,53 +543,41 @@ int IndexFlow::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
     }
   }
   return error_code;
+} catch (const std::bad_alloc &) {
+  if (context && context->searcher_context())
+    context->searcher_context()->reset();
+  return IndexError_NoMemory;
 }
 
 int IndexFlow::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                           uint32_t count, Context::Pointer &context) const {
+                           uint32_t count, Context::Pointer &context) const
+    try {
   if (ailego_unlikely(!query || !count || !context)) {
     return IndexError_InvalidArgument;
   }
 
   int error_code = 0;
-  if (query_quantizer_) {
-    IndexQueryMeta new_qmeta;
-    std::string tmp;
-    error_code = query_quantizer_->quantize(query, qmeta, &tmp, &new_qmeta);
-    if (error_code == 0) {
-      if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-        return IndexError_Mismatch;
-      }
-      std::string *features = context->mutable_features();
-      features->resize(tmp.size() * count);
-      memcpy(&(*features)[0], tmp.data(), tmp.size());
-      for (uint32_t i = 1; i < count && error_code == 0; ++i) {
-        IndexQueryMeta qmeta_i;
-        error_code = query_quantizer_->quantize(
-            static_cast<const char *>(query) + i * qmeta.element_size(), qmeta,
-            &tmp, &qmeta_i);
-        if (error_code == 0) {
-          memcpy(&(*features)[i * tmp.size()], tmp.data(), tmp.size());
-        }
-      }
-      if (error_code == 0) {
-        error_code = searcher_->search_impl(
-            reinterpret_cast<const void *>(features->data()), new_qmeta, count,
-            context->searcher_context());
-      }
-    }
-  } else if (reformer_) {
-    IndexQueryMeta new_qmeta;
-    error_code = reformer_->transform(query, qmeta, count,
-                                      context->mutable_features(), &new_qmeta);
-    if (error_code == 0) {
-      if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-        return IndexError_Mismatch;
-      }
-      error_code = searcher_->search_impl(
-          reinterpret_cast<const void *>(context->features().data()), new_qmeta,
-          count, context->searcher_context());
-    }
+  // Never retain a previous batch's converted matrix in the context.
+  std::string().swap(*context->mutable_features());
+  if (query_quantizer_ || reformer_) {
+    error_code = SearchConvertedBatch(
+        query, qmeta, count,
+        [&](const void *data, const IndexQueryMeta &meta, std::string *out,
+            IndexQueryMeta *converted) -> int {
+          const int ret =
+              query_quantizer_
+                  ? query_quantizer_->quantize(data, meta, out, converted)
+                  : reformer_->transform(data, meta, out, converted);
+          if (ret) return ret;
+          return metric_->is_matched(meta_, *converted) ? 0
+                                                        : IndexError_Mismatch;
+        },
+        [&](const void *data, const IndexQueryMeta &converted) -> int {
+          if (!metric_->is_matched(meta_, converted))
+            return IndexError_Mismatch;
+          return searcher_->search_impl(data, converted, count,
+                                        context->searcher_context());
+        });
   } else {
     if (ailego_unlikely(!metric_->is_matched(meta_, qmeta))) {
       return IndexError_Mismatch;
@@ -585,6 +612,10 @@ int IndexFlow::search_impl(const void *query, const IndexQueryMeta &qmeta,
     }
   }
   return error_code;
+} catch (const std::bad_alloc &) {
+  if (context && context->searcher_context())
+    context->searcher_context()->reset();
+  return IndexError_NoMemory;
 }
 
 // Index Sparse Flow
@@ -825,25 +856,22 @@ int IndexSparseFlow::search_bf_impl(const uint32_t sparse_count,
                                     const uint32_t *sparse_indices,
                                     const void *sparse_query,
                                     const IndexQueryMeta &qmeta,
-                                    Context::Pointer &context) const {
+                                    Context::Pointer &context) const try {
   if (ailego_unlikely(!context)) {
     return IndexError_InvalidArgument;
   }
 
   int error_code = 0;
   if (reformer_) {
-    std::string ovec;
-    IndexQueryMeta new_qmeta;
-    error_code = reformer_->transform(sparse_count, sparse_indices,
-                                      sparse_query, qmeta, &ovec, &new_qmeta);
-    if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-      return IndexError_Mismatch;
-    }
-    if (error_code == 0) {
-      error_code =
-          searcher_->search_bf_impl(sparse_count, sparse_indices, ovec.data(),
-                                    new_qmeta, context->searcher_context());
-    }
+    error_code = SearchConvertedSparse(
+        *reformer_, &sparse_count, sparse_indices, sparse_query, qmeta, 1,
+        [&](const void *output, const IndexQueryMeta &converted) -> int {
+          if (!metric_->is_matched(meta_, converted))
+            return IndexError_Mismatch;
+          return searcher_->search_bf_impl(sparse_count, sparse_indices, output,
+                                           converted,
+                                           context->searcher_context());
+        });
   } else {
     if (ailego_unlikely(!metric_->is_matched(meta_, qmeta))) {
       return IndexError_Mismatch;
@@ -861,32 +889,34 @@ int IndexSparseFlow::search_bf_impl(const uint32_t sparse_count,
       }
     }
   }
+  if (error_code && context->searcher_context())
+    context->searcher_context()->reset();
   return error_code;
+} catch (const std::bad_alloc &) {
+  if (context && context->searcher_context())
+    context->searcher_context()->reset();
+  return IndexError_NoMemory;
 }
 
 int IndexSparseFlow::search_impl(const uint32_t sparse_count,
                                  const uint32_t *sparse_indices,
                                  const void *sparse_query,
                                  const IndexQueryMeta &qmeta,
-                                 Context::Pointer &context) const {
+                                 Context::Pointer &context) const try {
   if (ailego_unlikely(!context)) {
     return IndexError_InvalidArgument;
   }
 
   int error_code = 0;
   if (reformer_) {
-    std::string ovec;
-    IndexQueryMeta new_qmeta;
-    error_code = reformer_->transform(sparse_count, sparse_indices,
-                                      sparse_query, qmeta, &ovec, &new_qmeta);
-    if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-      return IndexError_Mismatch;
-    }
-    if (error_code == 0) {
-      error_code =
-          searcher_->search_impl(sparse_count, sparse_indices, ovec.data(),
-                                 new_qmeta, context->searcher_context());
-    }
+    error_code = SearchConvertedSparse(
+        *reformer_, &sparse_count, sparse_indices, sparse_query, qmeta, 1,
+        [&](const void *output, const IndexQueryMeta &converted) -> int {
+          if (!metric_->is_matched(meta_, converted))
+            return IndexError_Mismatch;
+          return searcher_->search_impl(sparse_count, sparse_indices, output,
+                                        converted, context->searcher_context());
+        });
   } else {
     if (ailego_unlikely(!metric_->is_matched(meta_, qmeta))) {
       return IndexError_Mismatch;
@@ -904,35 +934,35 @@ int IndexSparseFlow::search_impl(const uint32_t sparse_count,
       }
     }
   }
+  if (error_code && context->searcher_context())
+    context->searcher_context()->reset();
   return error_code;
+} catch (const std::bad_alloc &) {
+  if (context && context->searcher_context())
+    context->searcher_context()->reset();
+  return IndexError_NoMemory;
 }
 
 int IndexSparseFlow::search_bf_impl(const uint32_t *sparse_count,
                                     const uint32_t *sparse_indices,
                                     const void *sparse_query,
                                     const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const {
+                                    Context::Pointer &context) const try {
   if (ailego_unlikely(!count || !context)) {
     return IndexError_InvalidArgument;
   }
 
   int error_code = 0;
   if (reformer_) {
-    std::string ovec;
-    IndexQueryMeta new_qmeta;
-    error_code =
-        reformer_->transform(sparse_count, sparse_indices, sparse_query, qmeta,
-                             count, &ovec, &new_qmeta);
-
-    if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-      return IndexError_Mismatch;
-    }
-
-    if (error_code == 0) {
-      error_code = searcher_->search_bf_impl(sparse_count, sparse_indices,
-                                             ovec.data(), new_qmeta, count,
-                                             context->searcher_context());
-    }
+    error_code = SearchConvertedSparse(
+        *reformer_, sparse_count, sparse_indices, sparse_query, qmeta, count,
+        [&](const void *output, const IndexQueryMeta &converted) -> int {
+          if (!metric_->is_matched(meta_, converted))
+            return IndexError_Mismatch;
+          return searcher_->search_bf_impl(sparse_count, sparse_indices, output,
+                                           converted, count,
+                                           context->searcher_context());
+        });
   } else {
     if (ailego_unlikely(!metric_->is_matched(meta_, qmeta))) {
       return IndexError_Mismatch;
@@ -954,35 +984,35 @@ int IndexSparseFlow::search_bf_impl(const uint32_t *sparse_count,
       }
     }
   }
+  if (error_code && context->searcher_context())
+    context->searcher_context()->reset();
   return error_code;
+} catch (const std::bad_alloc &) {
+  if (context && context->searcher_context())
+    context->searcher_context()->reset();
+  return IndexError_NoMemory;
 }
 
 int IndexSparseFlow::search_impl(const uint32_t *sparse_count,
                                  const uint32_t *sparse_indices,
                                  const void *sparse_query,
                                  const IndexQueryMeta &qmeta, uint32_t count,
-                                 Context::Pointer &context) const {
+                                 Context::Pointer &context) const try {
   if (ailego_unlikely(!count || !context)) {
     return IndexError_InvalidArgument;
   }
 
   int error_code = 0;
   if (reformer_) {
-    std::string ovec;
-    IndexQueryMeta new_qmeta;
-    error_code =
-        reformer_->transform(sparse_count, sparse_indices, sparse_query, qmeta,
-                             count, &ovec, &new_qmeta);
-
-    if (ailego_unlikely(!metric_->is_matched(meta_, new_qmeta))) {
-      return IndexError_Mismatch;
-    }
-
-    if (error_code == 0) {
-      error_code =
-          searcher_->search_impl(sparse_count, sparse_indices, ovec.data(),
-                                 new_qmeta, count, context->searcher_context());
-    }
+    error_code = SearchConvertedSparse(
+        *reformer_, sparse_count, sparse_indices, sparse_query, qmeta, count,
+        [&](const void *output, const IndexQueryMeta &converted) -> int {
+          if (!metric_->is_matched(meta_, converted))
+            return IndexError_Mismatch;
+          return searcher_->search_impl(sparse_count, sparse_indices, output,
+                                        converted, count,
+                                        context->searcher_context());
+        });
   } else {
     if (ailego_unlikely(!metric_->is_matched(meta_, qmeta))) {
       return IndexError_Mismatch;
@@ -1004,7 +1034,13 @@ int IndexSparseFlow::search_impl(const uint32_t *sparse_count,
       }
     }
   }
+  if (error_code && context->searcher_context())
+    context->searcher_context()->reset();
   return error_code;
+} catch (const std::bad_alloc &) {
+  if (context && context->searcher_context())
+    context->searcher_context()->reset();
+  return IndexError_NoMemory;
 }
 
 }  // namespace core

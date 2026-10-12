@@ -19,6 +19,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -207,15 +208,44 @@ TEST_F(BufferReadStorageTest, CachePressureFallsBackToOwnedRead) {
   ASSERT_NE(segment, nullptr);
 
   auto &pool = ailego::MemoryLimitPool::get_instance();
-  const size_t external_charge = pool.available();
+  const size_t external_charge = pool.available() - 4096;
   ASSERT_GT(external_charge, 0u);
   ASSERT_TRUE(pool.try_charge_external(external_charge));
+  AILEGO_DEFER([&] { pool.release_external(external_charge); });
 
   IndexStorage::MemoryBlock block;
   ASSERT_EQ(64u, segment->read(0, block, 64));
   EXPECT_EQ(0, std::memcmp(payload_.data(), block.data(), 64));
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, block.type_);
-  pool.release_external(external_charge);
+}
+
+TEST_F(BufferReadStorageTest, ExhaustedScratchBudgetFailsAndCanRetry) {
+  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  auto segment = storage->get("payload");
+  ASSERT_TRUE(segment);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.available());
+    IndexStorage::MemoryBlock block;
+    EXPECT_EQ(0u, segment->read(0, block, payload_.size()));
+    EXPECT_EQ(nullptr, block.data());
+    const void *pointer = nullptr;
+    EXPECT_EQ(0u, segment->read(0, &pointer, payload_.size()));
+    EXPECT_EQ(nullptr, pointer);
+  }
+  const size_t before = pool.external_used();
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(payload_.size(), segment->read(0, block, payload_.size()));
+  EXPECT_GE(pool.external_used(), before + payload_.size());
+  ASSERT_EQ(0, storage->close());
+  segment.reset();
+  storage.reset();
+  EXPECT_GE(pool.external_used(), payload_.size());
+  EXPECT_EQ(0, std::memcmp(payload_.data(), block.data(), payload_.size()));
+  block.reset();
+  EXPECT_EQ(0u, pool.external_used());
 }
 
 TEST_F(BufferReadStorageTest, MemoryBlockKeepsPoolAliveAfterStorageClose) {

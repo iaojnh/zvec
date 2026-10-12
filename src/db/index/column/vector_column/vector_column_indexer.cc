@@ -185,10 +185,10 @@ Result<IndexResults::Ptr> VectorColumnIndexer::search(
     LOG_ERROR("bf_pks size > 1 is not supported");
     return tl::make_unexpected(
         Status::InvalidArgument("bf_pks size > 1 is not supported"));
+  } else if (query_params.bf_pks_view) {
+    engine_query_param->borrowed_bf_pks = query_params.bf_pks_view;
   } else if (query_params.bf_pks.size() == 1) {
-    auto &bf_pks = query_params.bf_pks[0];
-    engine_query_param->bf_pks =
-        std::make_shared<std::vector<uint64_t>>(std::move(bf_pks));
+    engine_query_param->borrowed_bf_pks = &query_params.bf_pks[0];
   } else {
     engine_query_param->bf_pks = nullptr;
   }
@@ -203,14 +203,16 @@ Result<IndexResults::Ptr> VectorColumnIndexer::search(
     auto result = std::make_shared<GroupVectorIndexResults>(
         std::move(search_result.group_doc_list_),
         std::move(search_result.group_reverted_vector_list_),
-        std::move(search_result.group_reverted_sparse_values_list_));
+        std::move(search_result.group_reverted_sparse_values_list_),
+        search_result.take_reverted_memory());
     return result;
   }
 
   auto result = std::make_shared<VectorIndexResults>(
       is_sparse_, std::move(search_result.doc_list_),
       std::move(search_result.reverted_vector_list_),
-      std::move(search_result.reverted_sparse_values_list_));
+      std::move(search_result.reverted_sparse_values_list_),
+      search_result.take_reverted_memory());
   return result;
 }
 

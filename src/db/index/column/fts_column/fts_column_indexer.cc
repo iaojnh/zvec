@@ -30,6 +30,7 @@
 #include "iterator/fts_phrase_iterator.h"
 #include "iterator/fts_term_iterator.h"
 #include "posting/bitpacked_posting_list.h"
+#include "posting/posting_build_buffer.h"
 #include "fts_pipeline.h"
 #include "fts_utils.h"
 
@@ -736,7 +737,7 @@ Result<void> FtsColumnIndexer::flush() {
 // BitPacked conversion (called by MutableSegment::dump_fts_column_indexers)
 // ============================================================
 
-Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() {
+Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
   if (!ctx_) {
     return tl::make_unexpected(Status::InternalError(
         "FtsColumnIndexer: not opened. field=", field_name_));
@@ -779,11 +780,9 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() {
   }
 
   // ---------------------------------------------------------------
-  // 1) Load doc_len_cf into an in-memory vector indexed by local doc_id.
-  //    Single segment is at most a few MB even for 1M docs (4B per doc),
-  //    so a flat vector is by far the cheapest lookup structure.
+  // 1) Build a pageable doc-length lookup. Do not retain a full heap copy.
   // ---------------------------------------------------------------
-  std::vector<uint32_t> doc_lens;
+  PostingDocLengths doc_lens;
   {
     std::unique_ptr<rocksdb::Iterator> iter(
         ctx_->db_->NewIterator(ctx_->read_opts_, doc_len_cf));
@@ -803,14 +802,12 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() {
       uint32_t doc_len = 0;
       std::memcpy(&local_doc_id, key.data(), sizeof(uint32_t));
       std::memcpy(&doc_len, value.data(), sizeof(uint32_t));
-      if (local_doc_id >= doc_lens.size()) {
-        // Resize with default 1 to avoid divide-by-zero / log(0) downstream
-        // if a stray doc_id ever shows up without a doc_len entry.
-        doc_lens.resize(local_doc_id + 1, 1);
-      }
-      doc_lens[local_doc_id] = doc_len;
+      doc_lens.set(local_doc_id, doc_len);
       iter->Next();
     }
+    if (!iter->status().ok())
+      return tl::make_unexpected(
+          Status::InternalError(iter->status().ToString()));
   }
 
   // ---------------------------------------------------------------
@@ -820,18 +817,16 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() {
   //    BitPackedPostingList::encode() requires.
   // ---------------------------------------------------------------
   std::string current_term;
-  std::vector<uint32_t> doc_ids;
-  std::vector<uint32_t> tfs;
-  std::vector<uint32_t> term_doc_lens;  // reused buffer
+  PostingBuildBuffer postings;
 
   auto flush_current_term = [&]() -> Result<void> {
-    if (current_term.empty() || doc_ids.empty()) {
+    if (current_term.empty() || postings.empty()) {
       return {};
     }
     // Idempotency: skip if this term's postings are already BitPacked.
     // Important for crash-recovery — a re-run of dump after a partial
     // conversion must not double-encode.
-    std::string existing;
+    rocksdb::PinnableSlice existing;
     auto get_ret =
         ctx_->db_->Get(ctx_->read_opts_, postings_cf_, current_term, &existing);
     if (get_ret.ok() && !existing.empty() &&
@@ -839,18 +834,12 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() {
                                                   existing.size())) {
       return {};
     }
-
-    term_doc_lens.assign(doc_ids.size(), 1);
-    for (size_t i = 0; i < doc_ids.size(); ++i) {
-      const uint32_t did = doc_ids[i];
-      if (did < doc_lens.size() && doc_lens[did] > 0) {
-        term_doc_lens[i] = doc_lens[did];
-      }
-    }
-    std::string packed = BitPackedPostingList::encode(
-        doc_ids.data(), tfs.data(), term_doc_lens.data(), doc_ids.size(),
-        /*df=*/doc_ids.size(), *scorer_);
-    if (!ctx_->db_->Put(ctx_->write_opts_, postings_cf_, current_term, packed)
+    if (!get_ret.ok() && !get_ret.IsNotFound())
+      return tl::make_unexpected(Status::InternalError(get_ret.ToString()));
+    existing.Reset();
+    auto packed = postings.encode(postings.size(), *scorer_);
+    if (!ctx_->db_
+             ->Put(ctx_->write_opts_, postings_cf_, current_term, packed.data)
              .ok()) {
       return tl::make_unexpected(Status::InternalError(
           "FtsColumnIndexer::convert_postings_to_bitpacked: put failed. field=",
@@ -886,13 +875,14 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() {
           return ret;
         }
         current_term = std::move(term);
-        doc_ids.clear();
-        tfs.clear();
+        postings.clear();
       }
-      doc_ids.push_back(local_doc_id);
-      tfs.push_back(tf);
+      postings.append(local_doc_id, tf, doc_lens.get(local_doc_id));
       iter->Next();
     }
+    if (!iter->status().ok())
+      return tl::make_unexpected(
+          Status::InternalError(iter->status().ToString()));
   }
   // Flush the last term.
   auto ret = flush_current_term();
@@ -922,6 +912,12 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() {
   }
 
   return {};
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "FTS conversion exceeds memory budget"));
+} catch (const std::exception &e) {
+  return tl::make_unexpected(
+      Status::InternalError("FTS conversion failed: ", e.what()));
 }
 
 // ============================================================

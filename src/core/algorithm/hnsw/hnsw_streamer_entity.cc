@@ -83,9 +83,8 @@ int HnswStreamerEntity::cleanup() {
   return 0;
 }
 
-int HnswStreamerEntity::update_neighbors(
-    level_t level, node_id_t id,
-    const std::vector<std::pair<node_id_t, dist_t>> &neighbors) {
+int HnswStreamerEntity::update_neighbors(level_t level, node_id_t id,
+                                         const TopkHeap::Container &neighbors) {
   std::vector<char> buffer(neighbor_size_);
   NeighborsHeader *hd = reinterpret_cast<NeighborsHeader *>(buffer.data());
   hd->neighbor_cnt = neighbors.size();
@@ -579,22 +578,18 @@ int HnswStreamerEntity::flush(uint64_t checkpoint) {
 int HnswStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("Dump index, curDocs=%u", doc_cnt());
 
-  //! sort by keys, to support get_vector by key in searcher
-  std::vector<key_t> keys(doc_cnt());
-  for (node_id_t i = 0; i < doc_cnt(); ++i) {
-    keys[i] = get_key(i);
-  }
-
   //! dump neighbors
-  auto get_level = [&](node_id_t id) {
-    auto it = upper_neighbor_index_->find(id);
+  auto get_level = [&](node_id_t id) -> level_t {
+    int status = 0;
+    auto it = upper_neighbor_index_->find(id, &status);
+    if (status != 0) return status;
     if (it == upper_neighbor_index_->end()) {
       return 0U;
     };
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
     return meta->bits.level;
   };
-  auto ret = dump_segments(dumper, keys.data(), get_level);
+  auto ret = dump_segments(dumper, get_level);
   if (ailego_unlikely(ret < 0)) {
     return ret;
   }

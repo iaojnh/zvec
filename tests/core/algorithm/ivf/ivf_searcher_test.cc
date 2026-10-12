@@ -15,6 +15,7 @@
 #include <future>
 #include <iostream>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "zvec/core/framework/index_framework.h"
 #include "ivf_builder.h"
@@ -3837,6 +3838,90 @@ TEST_F(IVFSearcherTest, TestNprobeClampToListCount) {
 
   ret = searcher.unload();
   EXPECT_EQ(0, ret);
+}
+
+TEST_F(IVFSearcherTest, BoundedBatchMatchesSingleQueriesAndKeepsScratchSmall) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  for (const std::string &metric : {"SquaredEuclidean", "InnerProduct"}) {
+    for (const std::string &quantizer :
+         {"", "HalfFloatConverter", "Int8QuantizerConverter",
+          "Int4QuantizerConverter"}) {
+      SCOPED_TRACE(metric + "/" + quantizer);
+      ASSERT_EQ(0, pool.init(0));
+      index_meta_.set_metric(metric, 0, Params());
+      prepare_index_holder(100, 137);
+      Params build_params;
+      build_params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4");
+      build_params.set(PARAM_IVF_BUILDER_QUANTIZER_CLASS, quantizer);
+      IVFBuilder builder;
+      ASSERT_EQ(0, builder.init(index_meta_, build_params));
+      // Use the real trainer: InnerProduct carries an augmented centroid
+      // representation which the fixed Euclidean test trainer does not emit.
+      ASSERT_EQ(0, builder.train(threads_, holder_));
+      ASSERT_EQ(0, builder.build(threads_, holder_));
+      auto dumper = IndexFactory::CreateDumper("FileDumper");
+      ASSERT_EQ(0, dumper->create(index_path_));
+      ASSERT_EQ(0, builder.dump(dumper));
+      ASSERT_EQ(0, dumper->close());
+      auto storage = IndexFactory::CreateStorage("MMapFileReadStorage");
+      ASSERT_EQ(0, storage->init(Params()));
+      ASSERT_EQ(0, storage->open(index_path_, false));
+      IVFSearcher searcher;
+      Params options;
+      options.set(PARAM_IVF_SEARCHER_NPROBE, 4);
+      options.set(PARAM_IVF_SEARCHER_BRUTE_FORCE_THRESHOLD, 1);
+      ASSERT_EQ(0, searcher.init(options));
+      ASSERT_EQ(0, searcher.load(storage, nullptr));
+      constexpr size_t queries = 257;
+      std::vector<float> data(queries * dimension_);
+      for (size_t q = 0; q < queries; ++q)
+        for (size_t d = 0; d < dimension_; ++d)
+          data[q * dimension_ + d] =
+              static_cast<float>((q * 17) % 137) + 0.125f;
+      IndexQueryMeta qmeta(IndexMeta::DT_FP32, dimension_);
+      for (size_t budget : {size_t{0}, size_t{4 * 1024 * 1024}}) {
+        ASSERT_EQ(0, pool.init(budget));
+        for (bool brute : {false, true}) {
+          auto batch = searcher.create_context();
+          auto single = searcher.create_context();
+          ASSERT_NE(nullptr, batch);
+          ASSERT_NE(nullptr, single);
+          for (auto *context : {batch.get(), single.get()}) {
+            context->set_topk(3);
+            context->set_threshold(1e10f);
+            context->set_filter([](uint64_t key) { return key % 7 == 0; });
+          }
+          ASSERT_EQ(0, brute ? searcher.search_bf_impl(data.data(), qmeta,
+                                                       queries, batch)
+                             : searcher.search_impl(data.data(), qmeta, queries,
+                                                    batch));
+          auto *ivf_ctx = dynamic_cast<IVFSearcherContext *>(batch.get());
+          ASSERT_NE(nullptr, ivf_ctx);
+          EXPECT_LE(ivf_ctx->entity()->query_workspace_bytes(),
+                    32u * qmeta.element_size());
+          for (size_t q = 0; q < queries; ++q) {
+            single->reset();
+            const float *one = data.data() + q * dimension_;
+            ASSERT_EQ(0, brute ? searcher.search_bf_impl(one, qmeta, single)
+                               : searcher.search_impl(one, qmeta, single));
+            const auto &expected = single->result();
+            const auto &actual = batch->result(q);
+            ASSERT_EQ(expected.size(), actual.size());
+            for (size_t i = 0; i < actual.size(); ++i) {
+              EXPECT_EQ(expected[i].key(), actual[i].key());
+              EXPECT_FLOAT_EQ(expected[i].score(), actual[i].score());
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 #if defined(__GNUC__) || defined(__GNUG__)

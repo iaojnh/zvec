@@ -274,7 +274,9 @@ int HnswSparseBuilder::build(IndexThreads::Pointer threads,
     iter->next();
   }
   // Holder is not needed, cleanup it.
+  iter.reset();
   sparse_holder.reset();
+  holder.reset();
 
   LOG_INFO("Finished save vector, start build graph...");
 
@@ -309,24 +311,24 @@ int HnswSparseBuilder::build_graph(IndexThreads::Pointer threads,
 
   {
     std::unique_lock<std::mutex> lk(mutex_);
-    while (finished.load() < entity_.doc_cnt()) {
+    while (finished.load() < entity_.doc_cnt() && !error_.load()) {
       cond_.wait_until(lk, std::chrono::system_clock::now() +
                                std::chrono::seconds(check_interval_secs_));
       if (error_.load(std::memory_order_acquire)) {
         LOG_ERROR("Failed to build index while waiting finish");
-        return errcode_;
+        break;
       }
       LOG_INFO("Built cnt %u, finished percent %.3f%%", finished.load(),
                finished.load() * 100.0f / entity_.doc_cnt());
     }
   }
 
+  // Never let workers outlive the builder or its temporary storage on error.
+  task_group->wait_finish();
   if (error_.load(std::memory_order_acquire)) {
     LOG_ERROR("Failed to build index while waiting finish");
     return errcode_;
   }
-  task_group->wait_finish();
-
   return 0;
 }
 
@@ -360,13 +362,17 @@ void HnswSparseBuilder::do_build(node_id_t idx, size_t step_size,
 
   IndexQueryMeta qmeta(meta_.data_type());
   for (node_id_t id = idx; id < entity_.doc_cnt(); id += step_size) {
-    const void *vec = entity_.get_vector_meta(id);
-
-    auto sparse_data = entity_.get_sparse_data_from_vector(vec);
-
-    ctx->reset_query(sparse_data.first);
-
-    ret = alg_->add_node(id, entity_.get_level(id), ctx);
+    if (error_.load()) return;
+    IndexStorage::MemoryBlock sparse;
+    ret = entity_.get_sparse_data(id, sparse);
+    if (ret == 0) {
+      ctx->reset_query(sparse.data());
+      auto level = entity_.get_level(id);
+      ret = entity_.status();
+      if (ret == 0) ret = alg_->add_node(id, level, ctx);
+      if (ret == 0) ret = entity_.status();
+      if (ret == 0 && ctx->dist_calculator().error()) ret = IndexError_ReadData;
+    }
     if (ailego_unlikely(ret != 0)) {
       if (!error_.exchange(true)) {
         LOG_ERROR("Hnsw graph add node failed");

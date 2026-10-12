@@ -97,19 +97,16 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
                          const std::string &sparse_vec,
                          uint32_t sparse_count) override;
 
-  int update_neighbors(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+  int update_neighbors(level_t level, node_id_t id,
+                       const TopkHeap::Container &neighbors) override;
 
   //! Replace node id in level's neighbors
-  int update_neighbors_dense(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors);
+  int update_neighbors_dense(level_t level, node_id_t id,
+                             const TopkHeap::Container &neighbors);
 
   //! Replace node id in level's neighbors
-  int update_neighbors_sparse(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors);
+  int update_neighbors_sparse(level_t level, node_id_t id,
+                              const TopkHeap::Container &neighbors);
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
@@ -168,8 +165,17 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
     get_vector_enabled_ = val;
   }
 
+  void set_use_key_info_map(bool enabled) {
+    use_key_info_map_ = enabled;
+  }
+
   //! Get vector local id by key
   inline node_id_t get_id(key_t key) const {
+    if (!use_key_info_map_) {
+      return key < doc_cnt() && get_key(static_cast<node_id_t>(key)) == key
+                 ? static_cast<node_id_t>(key)
+                 : kInvalidNodeId;
+    }
     keys_map_lock_->lock_shared();
     auto it = keys_map_->find(key);
     node_id_t id = it == keys_map_->end() ? kInvalidNodeId : it->second;
@@ -231,8 +237,8 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
       IndexStreamer::Stats &stats, const HNSWSparseHeader &hd,
       size_t chunk_size, uint32_t node_index_mask_bits,
       uint32_t upper_neighbor_mask_bits, bool filter_same_key,
-      bool get_vector_enabled, uint32_t sparse_chunk_size,
-      const NIHashMapPointer &upper_neighbor_index,
+      bool get_vector_enabled, bool use_key_info_map,
+      uint32_t sparse_chunk_size, const NIHashMapPointer &upper_neighbor_index,
       std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
       const HashMapPointer<key_t, node_id_t> &keys_map,
       std::vector<SparseChunk::Pointer> &&node_chunks,
@@ -248,6 +254,7 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
         upper_neighbor_mask_((1U << upper_neighbor_mask_bits_) - 1),
         filter_same_key_(filter_same_key),
         get_vector_enabled_(get_vector_enabled),
+        use_key_info_map_(use_key_info_map),
         sparse_chunk_size_(sparse_chunk_size),
         upper_neighbor_index_(upper_neighbor_index),
         keys_map_lock_(keys_map_lock),
@@ -520,6 +527,7 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
   uint32_t upper_neighbor_mask_{0U};
   bool filter_same_key_{false};
   bool get_vector_enabled_{false};
+  bool use_key_info_map_{true};
 
   uint32_t sparse_chunk_size_{kDefaultChunkSize};
 

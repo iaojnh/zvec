@@ -86,8 +86,8 @@ class FtsRocksdbReducer {
  private:
   // Two-pass streaming merge.  Pass 1: collect effective stats.  Pass 2:
   // multi-way merge by term, encode + put one BitPacked posting per term
-  // (peak memory bounded by one term's entries).  Both passes take the
-  // shared delete bitmap by reference rather than storing it on the
+  // (pageable entries and a budgeted contiguous encoded value). Both passes
+  // take the shared delete bitmap by reference rather than storing it on the
   // reducer so its lifetime stays scoped to reduce().
   Result<void> reduce_postings(const roaring::Roaring &delete_row_id_bitmap);
 

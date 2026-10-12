@@ -26,6 +26,7 @@
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
+#include "ailego/pattern/defer.h"
 #include "quantizer/pq_int8_quantizer/pq_int8_quantizer.h"
 
 namespace zvec {
@@ -40,8 +41,12 @@ class PqInt8QuantizerTestAccess {
     return quantizer.dist_table_;
   }
 
-  static void compute_dist_table(PqInt8Quantizer &quantizer) {
-    quantizer.compute_dist_table();
+  static int compute_dist_table(PqInt8Quantizer &quantizer) {
+    return quantizer.compute_dist_table();
+  }
+  static size_t paged_bytes(const PqInt8Quantizer &quantizer) {
+    return quantizer.paged_dist_table_ ? quantizer.paged_dist_table_->size()
+                                       : 0;
   }
 };
 
@@ -164,7 +169,7 @@ void PqInt8TrainingMemoryTest::check_derived_sdc(bool varied) {
   }
 
   // Hold the trained codebook fixed and add only the skipped derivative.
-  PqTestAccess::compute_dist_table(quantizer);
+  ASSERT_EQ(0, PqTestAccess::compute_dist_table(quantizer));
   ASSERT_EQ(kChunks * 256u * 256u, PqTestAccess::dist_table(quantizer).size());
   std::string after;
   ASSERT_EQ(0, quantizer.serialize(&after));
@@ -210,6 +215,83 @@ TEST_P(PqInt8TrainingMemoryTest, ReinitReleasesTableAndRestoresDefault) {
   EXPECT_EQ(kChunks * 256u * 256u, PqTestAccess::dist_table(quantizer).size());
 }
 
+TEST_P(PqInt8TrainingMemoryTest, PagedSdcMatchesHeapAndHandleOwnsLifetime) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  for (const char *metric : {"SquaredEuclidean", "InnerProduct", "Cosine"}) {
+    ASSERT_EQ(0u, pool.used());
+    ASSERT_EQ(0, pool.init(0));
+    PqInt8Quantizer quantizer;
+    auto meta = input_meta();
+    meta.set_metric(metric, 0, ailego::Params());
+    auto params = training_params();
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    auto holder = make_holder(true);
+    ASSERT_EQ(0, quantizer.train(holder));
+    auto codes = encode_all(quantizer, holder);
+    const size_t stride = quantizer.quantized_datapoint_vector_length();
+    std::vector<float> expected(32);
+    for (size_t i = 0; i < expected.size(); ++i)
+      expected[i] = quantizer.calc_distance_dp_dp(codes.data(),
+                                                  codes.data() + i * stride);
+    // Account for platform-dependent writable metadata (16 KiB macOS pages),
+    // but leave fewer resident pages than the 1 MiB SDC table needs.
+    const size_t budget =
+        ailego::VecBufferPool::metadata_bytes_for_page_count(256, true) +
+        32 * ailego::kVectorPageSize;
+    ASSERT_EQ(0, pool.init(budget));
+    ASSERT_EQ(0, PqTestAccess::compute_dist_table(quantizer));
+    EXPECT_EQ(0u, PqTestAccess::dist_table(quantizer).capacity());
+    EXPECT_EQ(kChunks * 256u * 256u * sizeof(float),
+              PqTestAccess::paged_bytes(quantizer));
+    auto handle = quantizer.sym_distance(codes.data(), core::IndexQueryMeta());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      const void *code = codes.data() + i * stride;
+      EXPECT_NEAR(expected[i],
+                  quantizer.calc_distance_dp_dp(codes.data(), code), 1e-5f);
+      EXPECT_NEAR(expected[i], handle(code), 1e-5f);
+    }
+    params.set("build_sdc_table", false);
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    EXPECT_EQ(0u, PqTestAccess::paged_bytes(quantizer));
+    EXPECT_NEAR(expected[1], handle(codes.data() + stride), 1e-5f);
+    EXPECT_LE(pool.used(), pool.capacity());
+  }
+}
+
+TEST_P(PqInt8TrainingMemoryTest, PooledTrainingBuildsSdcAndTinyBudgetFails) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(32 * 1024 * 1024));
+  auto holder = make_holder(true);
+  std::string codebook;
+  {
+    PqInt8Quantizer quantizer;
+    ASSERT_EQ(0, quantizer.init(input_meta(), training_params()));
+    ASSERT_EQ(0, quantizer.train(holder));
+    EXPECT_EQ(0u, PqTestAccess::dist_table(quantizer).capacity());
+    EXPECT_GT(PqTestAccess::paged_bytes(quantizer), 0u);
+    ASSERT_EQ(0, quantizer.serialize(&codebook));
+  }
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(1));
+  PqInt8Quantizer quantizer;
+  ASSERT_EQ(0, quantizer.init(input_meta(), training_params()));
+  ASSERT_EQ(0, quantizer.deserialize(codebook.data(), codebook.size()));
+  EXPECT_EQ(core::IndexError_NoMemory,
+            PqTestAccess::compute_dist_table(quantizer));
+  EXPECT_EQ(0u, PqTestAccess::dist_table(quantizer).capacity());
+  EXPECT_EQ(0u, PqTestAccess::paged_bytes(quantizer));
+}
+
 TEST_P(PqInt8TrainingMemoryTest, RejectsMalformedFlag) {
   PqInt8Quantizer quantizer;
   auto params = training_params();
@@ -217,6 +299,60 @@ TEST_P(PqInt8TrainingMemoryTest, RejectsMalformedFlag) {
   EXPECT_NE(0, quantizer.init(input_meta(), params));
   params.set("build_sdc_table", false);
   EXPECT_EQ(0, quantizer.init(input_meta(), params));
+}
+
+TEST_P(PqInt8TrainingMemoryTest, FusedQueryOwnsOneBudgetedReusableLut) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(0));
+  PqInt8Quantizer quantizer;
+  auto params = training_params();
+  params.set("build_sdc_table", false);
+  ASSERT_EQ(0, quantizer.init(input_meta(), params));
+  auto holder = make_holder(true);
+  ASSERT_EQ(0, quantizer.train(holder));
+  auto it = holder->create_iterator();
+  std::string query(static_cast<const char *>(it->data()),
+                    holder->element_size());
+  auto codes = encode_all(quantizer, holder);
+  std::string lut(quantizer.quantized_query_vector_length(), '\0');
+  quantizer.quantize_query(query.data(), lut.data());
+  auto legacy = quantizer.distance(lut.data(), core::IndexQueryMeta());
+  DistanceImpl unbudgeted;
+  ASSERT_EQ(0, quantizer.prepare_distance(query.data(), &unbudgeted));
+  ASSERT_EQ(0, pool.init(1024 * 1024));
+  {
+    auto fused = std::move(unbudgeted);
+    ASSERT_EQ(0, quantizer.prepare_distance(query.data(), &fused));
+    EXPECT_EQ(lut.size(), fused.query_bytes());
+    EXPECT_EQ(0, std::memcmp(lut.data(), fused.query_data(), lut.size()));
+    EXPECT_EQ(std::string_view(lut), fused.query_storage());
+    const size_t charged = pool.used();
+    EXPECT_GE(charged, lut.size());
+    EXPECT_LT(charged, 2 * lut.size());
+    const void *original = fused.query_data();
+    ASSERT_EQ(0, quantizer.prepare_distance(query.data(), &fused));
+    EXPECT_EQ(original, fused.query_data());
+    EXPECT_EQ(charged, pool.used());
+    EXPECT_FLOAT_EQ(legacy(codes.data()), fused(codes.data()));
+    auto retained = fused;
+    it->next();
+    ASSERT_EQ(0, quantizer.prepare_distance(it->data(), &fused));
+    EXPECT_NE(retained.query_data(), fused.query_data());
+    EXPECT_FLOAT_EQ(legacy(codes.data()), retained(codes.data()));
+  }
+  EXPECT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(1));
+  DistanceImpl rejected;
+  EXPECT_EQ(core::IndexError_NoMemory,
+            quantizer.prepare_distance(query.data(), &rejected));
+  EXPECT_FALSE(rejected.valid());
+  EXPECT_EQ(0u, pool.used());
 }
 
 INSTANTIATE_TEST_SUITE_P(InputPrecisions, PqInt8TrainingMemoryTest,

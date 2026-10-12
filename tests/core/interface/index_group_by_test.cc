@@ -13,11 +13,15 @@
 // limitations under the License.
 
 #include <cstring>
+#include <map>
 #include <numeric>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include "ailego/pattern/defer.h"
 #include "tests/test_util.h"
 #if RABITQ_SUPPORTED
 #include "core/algorithm/hnsw_rabitq/rabitq_converter.h"
@@ -475,6 +479,159 @@ class GroupByInterfaceTest : public ::testing::Test {
 };
 
 }  // namespace
+
+TEST_F(GroupByInterfaceTest, FlatHighCardinalitySpillMatchesHeapResults) {
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore_pool = zvec::ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(0));
+  for (bool sparse : {false, true}) {
+    ASSERT_EQ(0, pool.init(0));
+    const std::string path =
+        sparse ? "group_spill_sparse" : "group_spill_dense";
+    zvec::test_util::RemoveTestFiles(path + "*");
+    auto remove_files = zvec::ailego::ScopeGuard::Make(
+        [&] { zvec::test_util::RemoveTestFiles(path + "*"); });
+    auto index = IndexFactory::CreateAndInitIndex(
+        *(sparse ? SparseFlatParam() : DenseFlatParam()));
+    ASSERT_NE(nullptr, index);
+    ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+    std::vector<uint32_t> indices{0, 1, 2, 3};
+    std::vector<float> values(kDimension);
+    auto vector = [&]() -> VectorData {
+      if (sparse)
+        return VectorData{
+            SparseVector{kDimension, indices.data(), values.data()}};
+      return VectorData{DenseVector{values.data()}};
+    };
+    constexpr uint32_t count = 1031;
+    for (uint32_t key = 0; key < count; ++key) {
+      std::fill(values.begin(), values.end(), static_cast<float>(key));
+      ASSERT_EQ(0, index->add(vector(), key));
+    }
+    ASSERT_EQ(0, index->train());
+    std::fill(values.begin(), values.end(), 1.0f);
+    for (bool by_keys : {false, true}) {
+      auto query = FlatQuery();
+      AttachGroupBy(query);
+      query->group_by_param->group_by = [](uint64_t key) {
+        return std::to_string(key % 257);
+      };
+      if (by_keys) {
+        query->bf_pks = std::make_shared<std::vector<uint64_t>>(count);
+        std::iota(query->bf_pks->begin(), query->bf_pks->end(), uint64_t{0});
+      }
+      using Result =
+          std::map<std::string, std::vector<std::pair<uint64_t, float>>>;
+      Result reference;
+      for (size_t budget : {size_t{0}, size_t{4 * 1024 * 1024}}) {
+        ASSERT_EQ(0u, pool.used());
+        ASSERT_EQ(0, pool.init(budget));
+        SearchResult result;
+        ASSERT_EQ(0, index->search(vector(), query, &result));
+        ASSERT_EQ(kNumGroups, result.group_doc_list_.size());
+        Result actual;
+        for (const auto &group : result.group_doc_list_) {
+          ASSERT_EQ(kGroupTopk, group.docs().size());
+          for (const auto &doc : group.docs())
+            actual[group.group_id()].emplace_back(doc.key(), doc.score());
+        }
+        if (!budget)
+          reference = actual;
+        else
+          EXPECT_EQ(reference, actual);
+        EXPECT_LE(pool.used(), pool.capacity());
+      }
+    }
+    ASSERT_EQ(0, index->close());
+  }
+}
+
+TEST_F(GroupByInterfaceTest, HnswGraphAndLinearBudgetedGroupsMatchHeapResults) {
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore_pool = zvec::ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(0));
+  for (bool sparse : {false, true}) {
+    ASSERT_EQ(0, pool.init(0));
+    const std::string path =
+        sparse ? "group_hnsw_spill_sparse" : "group_hnsw_spill_dense";
+    zvec::test_util::RemoveTestFiles(path + "*");
+    auto remove_files = zvec::ailego::ScopeGuard::Make(
+        [&] { zvec::test_util::RemoveTestFiles(path + "*"); });
+    auto index = IndexFactory::CreateAndInitIndex(
+        *(sparse ? SparseHnswParam() : DenseHnswParam(kDimension)));
+    ASSERT_NE(nullptr, index);
+    ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+    std::vector<uint32_t> indices{0, 1, 2, 3};
+    std::vector<float> values(kDimension);
+    auto vector = [&]() -> VectorData {
+      if (sparse)
+        return VectorData{
+            SparseVector{kDimension, indices.data(), values.data()}};
+      return VectorData{DenseVector{values.data()}};
+    };
+    constexpr uint32_t count = 1031;
+    for (uint32_t key = 0; key < count; ++key) {
+      std::fill(values.begin(), values.end(), static_cast<float>(key));
+      ASSERT_EQ(0, index->add(vector(), key));
+    }
+    ASSERT_EQ(0, index->train());
+    std::fill(values.begin(), values.end(), 1.0f);
+    for (int mode : {0, 1, 2}) {
+      const bool by_keys = mode == 2;
+      auto query = HnswQuery(false, mode != 0, false);
+      AttachGroupBy(query);
+      query->group_by_param->group_by = [](uint64_t key) {
+        return std::to_string(key % 257);
+      };
+      if (by_keys) {
+        query->bf_pks = std::make_shared<std::vector<uint64_t>>(count);
+        std::iota(query->bf_pks->begin(), query->bf_pks->end(), uint64_t{0});
+      }
+      using Result =
+          std::map<std::string, std::vector<std::pair<uint64_t, float>>>;
+      Result reference;
+      for (size_t budget : {size_t{0}, size_t{4 * 1024 * 1024}}) {
+        ASSERT_EQ(0u, pool.used());
+        ASSERT_EQ(0, pool.init(budget));
+        SearchResult result;
+        // Contexts are cached per worker thread. End that worker before
+        // reinitializing the global budget; a live visit filter stays charged.
+        int search_ret = zvec::core::IndexError_Runtime;
+        std::thread worker(
+            [&] { search_ret = index->search(vector(), query, &result); });
+        worker.join();
+        ASSERT_EQ(0, search_ret);
+        ASSERT_EQ(kNumGroups, result.group_doc_list_.size());
+        Result actual;
+        for (const auto &group : result.group_doc_list_) {
+          if (mode != 0) ASSERT_EQ(kGroupTopk, group.docs().size());
+          // Graph search may find fewer runners-up; compare the exact trace's
+          // results across budgets, not an exhaustive-search cardinality.
+          ASSERT_FALSE(group.docs().empty());
+          ASSERT_LE(group.docs().size(), kGroupTopk);
+          for (const auto &doc : group.docs())
+            actual[group.group_id()].emplace_back(doc.key(), doc.score());
+        }
+        if (!budget)
+          reference = actual;
+        else
+          EXPECT_EQ(reference, actual);
+        EXPECT_LE(pool.used(), pool.capacity());
+      }
+    }
+    ASSERT_EQ(0, index->close());
+  }
+}
 
 TEST_F(GroupByInterfaceTest, Dense) {
   std::vector<GroupByCase> cases{

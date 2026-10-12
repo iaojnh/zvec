@@ -21,6 +21,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_converter.h>
 #include <zvec/core/framework/index_factory.h>
@@ -103,6 +104,48 @@ struct VectorDataBuffer {
 
 
 struct SearchResult {
+ private:
+  // Copies charge before copying buffers; moves transfer their reservation.
+  ailego::MemoryReservation reverted_memory_;
+
+ public:
+  SearchResult() = default;
+  SearchResult(const SearchResult &) = default;
+  SearchResult(SearchResult &&) noexcept = default;
+  SearchResult &operator=(SearchResult rhs) {
+    swap(rhs);
+    return *this;
+  }
+  void swap(SearchResult &rhs) noexcept {
+    reverted_memory_.swap(rhs.reverted_memory_);
+    doc_list_.swap(rhs.doc_list_);
+    group_doc_list_.swap(rhs.group_doc_list_);
+    reverted_vector_list_.swap(rhs.reverted_vector_list_);
+    reverted_sparse_values_list_.swap(rhs.reverted_sparse_values_list_);
+    group_reverted_vector_list_.swap(rhs.group_reverted_vector_list_);
+    group_reverted_sparse_values_list_.swap(
+        rhs.group_reverted_sparse_values_list_);
+  }
+  void clear() {
+    SearchResult empty;
+    swap(empty);
+  }
+  void reserve_reverted_array(size_t count, size_t element_size) {
+    reverted_memory_.add_array(count, element_size);
+  }
+  void reserve_reverted_vector(size_t bytes) {
+    // Include terminator, allocator rounding and string growth before decoding.
+    if (bytes > (std::numeric_limits<size_t>::max() - 32) / 2)
+      throw std::bad_alloc();
+    reverted_memory_.add(bytes * 2 + 32);
+  }
+  ailego::MemoryReservation take_reverted_memory() {
+    return std::move(reverted_memory_);
+  }
+  size_t reverted_memory_bytes() const {
+    return reverted_memory_.bytes();
+  }
+
   core::IndexDocumentList doc_list_;
   core::IndexGroupDocumentList group_doc_list_;
   // use string to manage memory

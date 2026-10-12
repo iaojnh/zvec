@@ -18,7 +18,9 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <vector>
 #include <ailego/parallel/lock.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/utility/type_helper.h>
@@ -34,6 +36,66 @@ class LloydClusterMatrixStorage {
   virtual ~LloydClusterMatrixStorage() = default;
   virtual int read(size_t offset, void *out, size_t bytes) const = 0;
   virtual int write(size_t offset, const void *data, size_t bytes) = 0;
+};
+
+// Exact double sums, either owned or backed by the caller's training storage.
+// Workers reuse one row of scratch; a cluster lock covers read/modify/write.
+class LloydAccumulatorRow {
+ public:
+  explicit LloydAccumulatorRow(
+      size_t dim, std::shared_ptr<LloydClusterMatrixStorage> storage = nullptr,
+      size_t offset = 0)
+      : dimension_(dim), storage_(std::move(storage)), offset_(offset) {
+    if (!storage_) values_.resize(dim);
+  }
+  size_t size() const {
+    return dimension_;
+  }
+  int prepare(bool empty, std::vector<double> *scratch, double **out) try {
+    if (!storage_) {
+      if (empty) std::fill(values_.begin(), values_.end(), 0.0);
+      *out = values_.data();
+      return 0;
+    }
+    scratch->resize(dimension_);
+    if (empty) {
+      std::fill(scratch->begin(), scratch->end(), 0.0);
+    } else {
+      int ret =
+          storage_->read(offset_, scratch->data(), dimension_ * sizeof(double));
+      if (ret != 0) return ret;
+    }
+    *out = scratch->data();
+    return 0;
+  } catch (const std::exception &) {
+    return -1;
+  }
+  int commit(const std::vector<double> &scratch) try {
+    return storage_ ? storage_->write(offset_, scratch.data(),
+                                      dimension_ * sizeof(double))
+                    : 0;
+  } catch (const std::exception &) {
+    return -1;
+  }
+  int read(std::vector<double> *scratch, const double **out) const try {
+    if (!storage_) {
+      *out = values_.data();
+      return 0;
+    }
+    scratch->resize(dimension_);
+    int ret =
+        storage_->read(offset_, scratch->data(), dimension_ * sizeof(double));
+    if (ret == 0) *out = scratch->data();
+    return ret;
+  } catch (const std::exception &) {
+    return -1;
+  }
+
+ private:
+  size_t dimension_;
+  std::shared_ptr<LloydClusterMatrixStorage> storage_;
+  size_t offset_;
+  std::vector<double> values_;
 };
 
 /*! Random Centroids Generator
@@ -239,11 +301,17 @@ class LloydCluster {
     group->wait_finish();
     if (matrix_status() != 0) return false;
 
-    *cost = 0.0;
+    double next_cost = 0.0;
+    std::vector<double> accumulator_scratch;
     for (size_t i = 0, n = centroids_.count(); i != n; ++i) {
       const auto &item = context_[i];
-      item.centroid(centroids_[i], centroids_.dimension());
-      *cost += item.cost();
+      const int ret = item.centroid(centroids_[i], centroids_.dimension(),
+                                    &accumulator_scratch);
+      if (ret != 0) {
+        record_matrix_error(ret);
+        return false;
+      }
+      next_cost += item.cost();
     }
 
     if (spherical_) {
@@ -253,6 +321,7 @@ class LloydCluster {
       }
     }
 
+    *cost = next_cost;
     return true;
   }
 
@@ -322,6 +391,11 @@ class LloydCluster {
     centroid_matrix_storage_ = std::move(storage);
   }
 
+  void set_accumulator_storage(
+      std::shared_ptr<LloydClusterMatrixStorage> storage) {
+    context_.set_accumulator_storage(std::move(storage));
+  }
+
   const ContainerType &centroid_matrix() const {
     return centroids_matrix_;
   }
@@ -348,6 +422,7 @@ class LloydCluster {
   void cluster_cache_features() {
     std::array<float, BatchCount> scores;
     ContainerType centers(centroids_.dimension());
+    std::vector<double> accumulator_scratch;
 
     for (size_t i = 0, n = feature_cache_.count(); i != n; ++i) {
       size_t count = centroids_.count() / BatchCount * BatchCount;
@@ -379,8 +454,13 @@ class LloydCluster {
           nearest_index = j;
         }
       }
-      context_[nearest_index].append(feature, feature_cache_.dimension(),
-                                     nearest_score);
+      const int ret =
+          context_[nearest_index].append(feature, feature_cache_.dimension(),
+                                         nearest_score, &accumulator_scratch);
+      if (ret != 0) {
+        record_matrix_error(ret);
+        return;
+      }
     }  // end of for
   }
 
@@ -390,6 +470,7 @@ class LloydCluster {
     ContainerType rows(centroids_.dimension());
     ContainerType scratch(centroids_.dimension());
     ContainerType centers(centroids_.dimension());
+    std::vector<double> accumulator_scratch;
 
     auto comp = [](float i, float j) {
       if (std::isnan(i)) return false;
@@ -445,8 +526,13 @@ class LloydCluster {
       ContextType::MatrixReverseTranspose(block, feature_cache_.dimension(),
                                           rows.data());
       for (size_t k = 0; k < BatchCount; ++k) {
-        context_[nearest_indexes[k]].append(rows[k], feature_cache_.dimension(),
-                                            nearest_scores[k]);
+        const int ret = context_[nearest_indexes[k]].append(
+            rows[k], feature_cache_.dimension(), nearest_scores[k],
+            &accumulator_scratch);
+        if (ret != 0) {
+          record_matrix_error(ret);
+          return;
+        }
       }
     }  // end of for
   }
@@ -474,6 +560,7 @@ class LloydCluster {
   }
 
   void reset_matrix_storage(size_t dim) {
+    context_.set_accumulator_storage(nullptr);
     matrix_storage_.reset();
     centroid_matrix_storage_.reset();
     stored_matrix_count_ = 0;

@@ -1314,7 +1314,8 @@ TEST_F(BufferStorageWriteTest, ImmutableFallbackPreservesUnflushedPrefix) {
   const size_t cold_page = (segment->data_offset() + offset + 64) / page_size;
   ASSERT_FALSE(vec_pool->is_page_resident(cold_page));
   auto &memory_pool = ailego::MemoryLimitPool::get_instance();
-  const size_t external_charge = memory_pool.available();
+  // Leave room for the now-accounted contiguous fallback, not a cache page.
+  const size_t external_charge = memory_pool.available() - 4096;
   ASSERT_TRUE(memory_pool.try_charge_external(external_charge));
   AILEGO_DEFER([&] { memory_pool.release_external(external_charge); });
 
@@ -1324,6 +1325,35 @@ TEST_F(BufferStorageWriteTest, ImmutableFallbackPreservesUnflushedPrefix) {
   EXPECT_EQ(std::string(64, '\0'),
             std::string(static_cast<const char *>(result.data()) + 64, 64));
   EXPECT_FALSE(vec_pool->is_page_resident(cold_page));
+}
+
+TEST_F(BufferStorageWriteTest, LegacyCrossPageCopiesHoldBudgetUntilClose) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t baseline = pool.external_used();
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  const size_t size = 2 * ailego::kVectorPageSize;
+  ASSERT_EQ(0, storage->append("legacy", size));
+  auto segment = storage->get("legacy");
+  ASSERT_TRUE(segment);
+  std::string payload(size, 'a');
+  ASSERT_EQ(size, segment->write(0, payload.data(), size));
+  const size_t before = pool.external_used();
+  const void *first = nullptr;
+  ASSERT_EQ(size, segment->read(0, &first, size));
+  EXPECT_GE(pool.external_used(), before + size);
+  payload.assign(size, 'b');
+  ASSERT_EQ(size, segment->write(0, payload.data(), size));
+  const void *second = nullptr;
+  ASSERT_EQ(size, segment->read(0, &second, size));
+  EXPECT_NE(first, second);
+  EXPECT_EQ(std::string(size, 'a'),
+            std::string(static_cast<const char *>(first), size));
+  EXPECT_EQ(payload, std::string(static_cast<const char *>(second), size));
+  ASSERT_EQ(0, storage->close());
+  segment.reset();
+  storage.reset();
+  EXPECT_EQ(baseline, pool.external_used());
 }
 
 TEST_F(BufferStorageWriteTest, ImmutableBatchReadUsesWritableCache) {
@@ -1816,9 +1846,10 @@ TEST_F(BufferStorageWriteTest, BorrowedReadUsesOneColdPageLoadSequence) {
   ASSERT_TRUE(segment);
 
   auto &pool = ailego::MemoryLimitPool::get_instance();
-  const size_t external_charge = pool.available();
+  const size_t external_charge = pool.available() - 4096;
   ASSERT_GT(external_charge, 0u);
   ASSERT_TRUE(pool.try_charge_external(external_charge));
+  AILEGO_DEFER([&] { pool.release_external(external_charge); });
   const uint64_t high_watermark_hits_before = pool.stats().high_watermark_hits;
 
   IndexStorage::MemoryBlock block;
@@ -1828,7 +1859,6 @@ TEST_F(BufferStorageWriteTest, BorrowedReadUsesOneColdPageLoadSequence) {
   // get_single_page() performs one initial attempt plus at most 50 retries.
   EXPECT_LE(pool.stats().high_watermark_hits - high_watermark_hits_before, 51u);
 
-  pool.release_external(external_charge);
   ASSERT_EQ(0, storage->close());
 }
 

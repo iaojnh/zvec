@@ -15,13 +15,14 @@
 #pragma once
 
 #include <ailego/math/inner_product_matrix.h>
+#include <ailego/pattern/scope_guard.h>
 #include "flat_sparse_context.h"
 
 namespace zvec {
 namespace core {
 
 static inline IndexGroupDocumentList ConvertGroupMapToResult(
-    std::unordered_map<std::string, IndexDocumentHeap> group_map,
+    std::unordered_map<std::string, IndexCandidateHeap> group_map,
     uint32_t group_num) {
   IndexGroupDocumentList result;
 
@@ -46,8 +47,9 @@ static inline IndexGroupDocumentList ConvertGroupMapToResult(
   for (uint32_t i = 0; i < group_num && i < best_score_in_groups.size(); ++i) {
     const std::string &group_id = best_score_in_groups[i].first;
 
+    const auto &items = group_map[group_id].container();
     result.emplace_back(GroupIndexDocument(
-        group_id, std::move(group_map[group_id].mutable_container())));
+        group_id, IndexDocumentList(items.begin(), items.end())));
   }
 
   return result;
@@ -56,10 +58,10 @@ static inline IndexGroupDocumentList ConvertGroupMapToResult(
 static inline int FlatSearch(const uint32_t *sparse_count,
                              const uint32_t *sparse_indices,
                              const void *sparse_query, bool with_p_keys,
-                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             IndexKeyBatchView p_keys,
                              const IndexQueryMeta &qmeta, uint32_t count,
                              const IndexMeta, IndexContext::Pointer &context,
-                             FlatSparseEntity *entity) {
+                             FlatSparseEntity *entity) try {
   int ret;
 
   FlatSparseContext *ctx = dynamic_cast<FlatSparseContext *>(context.get());
@@ -68,6 +70,8 @@ static inline int FlatSearch(const uint32_t *sparse_count,
     return IndexError_Cast;
   }
 
+  auto release_candidates =
+      ailego::ScopeGuard::Make([&] { ctx->result_heap()->release(); });
   // reset context results
   ctx->reset_results(count);
 
@@ -90,15 +94,16 @@ static inline int FlatSearch(const uint32_t *sparse_count,
           sparse_count[q], sparse_indices_tmp, sparse_query_tmp,
           sparse_query_buffer);
 
-      std::unordered_map<std::string, IndexDocumentHeap> group_heap{};
+      std::unordered_map<std::string, IndexCandidateHeap> group_heap{};
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       if (with_p_keys) {
         ret = entity->search_group_p_keys(sparse_query_buffer, p_keys[q],
                                           ctx->filter(), group_by,
-                                          ctx->group_topk(), &group_heap);
+                                          ctx->group_topk(), &groups);
       } else {
         ret = entity->search_group(sparse_query_buffer, ctx->filter(), group_by,
-                                   ctx->group_topk(), &group_heap);
+                                   ctx->group_topk(), &groups);
       }
 
       if (ailego_unlikely(ret != 0)) {
@@ -107,6 +112,8 @@ static inline int FlatSearch(const uint32_t *sparse_count,
       }
 
       // sort group heap
+      ret = groups.finish_heaps(group_heap, ctx->group_topk());
+      if (ret != 0) return ret;
       for (auto &group : group_heap) {
         group.second.sort();
       }
@@ -130,7 +137,7 @@ static inline int FlatSearch(const uint32_t *sparse_count,
               }
               // Reconstruct doc with sparse vector data
               doc = IndexDocument(doc.key(), doc.score(), id, nullptr,
-                                  sparse_doc);
+                                  std::move(sparse_doc));
             }
           }
         }
@@ -146,6 +153,7 @@ static inline int FlatSearch(const uint32_t *sparse_count,
           sparse_query_buffer);
 
       auto heap = ctx->result_heap();
+      heap->clear();
 
       if (with_p_keys) {
         ret = entity->search_p_keys(sparse_query_buffer, p_keys[q],
@@ -168,6 +176,9 @@ static inline int FlatSearch(const uint32_t *sparse_count,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 }  // namespace core

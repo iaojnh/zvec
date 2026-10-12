@@ -21,6 +21,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <turbo/preprocessor/opq_rotator/opq_rotator.h>
 #include <turbo/preprocessor/preprocessor.h>
 #include <zvec/ailego/container/params.h>
 
@@ -70,6 +71,12 @@ class PqOpq {
 
   //! Retains the existing rotator blob format; disabled OPQ has an empty blob.
   int serialize(std::string *out) const;
+  size_t serialized_size() const {
+    return enabled() ? preprocessor_->serialized_size() : 0;
+  }
+  int serialize_to(const SerializationSink &sink) const {
+    return enabled() ? preprocessor_->serialize_to(sink) : 0;
+  }
   int deserialize(uint8_t rotate_type, uint32_t dim, const void *data,
                   size_t len);
 
@@ -77,7 +84,7 @@ class PqOpq {
   void rotate_batch(const float *input, size_t num, float *output) const;
 
   static constexpr float kMinImprovement = 1e-4f;
-  Preprocessor::Pointer preprocessor_;
+  OpqRotator::Pointer preprocessor_;
   uint32_t opq_iter_{5};
   uint32_t opq_pq_iter_{4};
 };

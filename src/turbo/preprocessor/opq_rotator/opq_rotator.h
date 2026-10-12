@@ -23,6 +23,8 @@
 // Rooted at src/ so this header stays includable from the PQ quantizer headers,
 // which are themselves included from outside the turbo include root.
 #include <turbo/preprocessor/preprocessor.h>
+#include <turbo/serialization.h>
+#include "core/utility/paged_build_buffer.h"
 
 namespace zvec {
 namespace turbo {
@@ -47,8 +49,8 @@ class OpqRotator : public Preprocessor {
   //!           space, num x dim, packed.
   int fit(const float *x, const float *x_hat, size_t num);
   using ReadPairs = std::function<int(size_t, size_t, float *, float *)>;
-  // Fetch at most 1024 row pairs at a time. Only the dimension-squared
-  // covariance/SVD workspace stays resident, independent of sample count.
+  // Fetch bounded row pairs. With a pool, covariance, Jacobi SVD workspaces
+  // and the resulting rotation are pageable as well as the training samples.
   int fit_rows(size_t num, const ReadPairs &read);
 
   // -- Preprocessor interface ------------------------------------------------
@@ -71,6 +73,13 @@ class OpqRotator : public Preprocessor {
   void train(const void *data, void *ctx, size_t num, size_t stride) override;
 
   int serialize(std::string *out) const override;
+  size_t serialized_size() const;
+  int serialize_to(const SerializationSink &sink) const;
+  int serialize(std::string *out, ailego::MemoryReservation *owner) const {
+    return SerializeString(
+        serialized_size(),
+        [this](const auto &sink) { return serialize_to(sink); }, out, owner);
+  }
   int deserialize(const void *data, size_t len) override;
 
   RotateType rotate_type() const {
@@ -85,6 +94,7 @@ class OpqRotator : public Preprocessor {
   //! Rotation matrix R, row-major dim x dim: apply() = R * in,
   //! apply_inverse() = R^T * in.
   std::vector<float> matrix_;
+  std::unique_ptr<core::PagedBuildBuffer> paged_matrix_;
 
   RotatorKernels kernels_{};
 };

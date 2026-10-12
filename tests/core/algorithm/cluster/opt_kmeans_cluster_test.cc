@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <ailego/algorithm/kmeans.h>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -323,9 +324,11 @@ TEST_P(HolderTrainingTest, BufferedTrainingMatchesMemoryAndCleansScratch) {
 TEST(OptKmeansCluster, BufferedTrainingUnderPagePressure) {
   const size_t metadata =
       VecBufferPool::metadata_bytes_for_page_count(1024, true);
-  MemoryLimitPool::get_instance().init(metadata + 64u * 1024u);
+  // Training and the independently owned result overlap during row export.
+  // Budget both page tables, while keeping the corpus larger than the pool.
+  MemoryLimitPool::get_instance().init(2 * metadata + 128u * 1024u);
   TemporaryTrainingDirectory directory;
-  auto holder = std::make_shared<StreamingTestHolder>(768, 1027);
+  auto holder = std::make_shared<StreamingTestHolder>(768, 4099);
   auto cluster = IndexFactory::CreateCluster("OptKmeansCluster");
   Params params;
   params.set(OPTKMEANS_CLUSTER_BUFFERED_STORAGE_PATH,
@@ -344,10 +347,22 @@ TEST(OptKmeansCluster, BufferedTrainingUnderPagePressure) {
     cents.emplace_back(row.data(), row.size() * sizeof(float));
   }
   ASSERT_EQ(0, fast->cluster_holder(threads, holder, cents));
+  EXPECT_GT(holder->count() * holder->element_size(),
+            MemoryLimitPool::get_instance().capacity());
   size_t follows = 0;
-  for (const auto &centroid : cents) follows += centroid.follows();
+  for (const auto &centroid : cents) {
+    EXPECT_TRUE(centroid.feature_stored());
+    ASSERT_EQ(0, centroid.read_feature(row.data(), row.size() * sizeof(float)));
+    follows += centroid.follows();
+  }
   EXPECT_EQ(holder->count(), follows);
   EXPECT_TRUE(std::filesystem::is_empty(directory.path));
+  cluster.reset();
+  ASSERT_EQ(0,
+            cents.front().read_feature(row.data(), row.size() * sizeof(float)));
+  EXPECT_GT(MemoryLimitPool::get_instance().used(), 0u);
+  cents.clear();
+  EXPECT_EQ(0u, MemoryLimitPool::get_instance().used());
 }
 
 TEST(OptKmeansCluster, BufferedCreationAndDeferredReadFailuresDoNotPublish) {
@@ -385,6 +400,61 @@ TEST(OptKmeansCluster, BufferedCreationAndDeferredReadFailuresDoNotPublish) {
     if (fault == 0) EXPECT_TRUE(std::filesystem::remove(blocked_parent));
     EXPECT_TRUE(std::filesystem::is_empty(directory.path));
   }
+}
+
+TEST(OptKmeansCluster, StoredCentroidRowsOutliveProducerAndFailExplicitly) {
+  auto &pool = MemoryLimitPool::get_instance();
+  ASSERT_EQ(0u, pool.used());
+  const size_t previous = pool.capacity();
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  {
+    auto storage = PagedCentroids::Create();
+    std::weak_ptr<PagedCentroids> owner = storage;
+    IndexCluster::CentroidList rows(128);
+    std::vector<float> input(768), output(768);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      std::fill(input.begin(), input.end(), static_cast<float>(i));
+      ASSERT_EQ(0, storage->append(input.data(), input.size() * sizeof(float),
+                                   &rows[i]));
+      EXPECT_TRUE(rows[i].feature_stored());
+    }
+    storage.reset();
+    auto last = rows.back();
+    rows.clear();
+    EXPECT_FALSE(owner.expired());
+    ASSERT_EQ(0,
+              last.read_feature(output.data(), output.size() * sizeof(float)));
+    EXPECT_EQ(std::vector<float>(768, 127.0f), output);
+    auto copied = last;
+    (*copied.mutable_buffer())[0] ^= 1;
+    ASSERT_EQ(0,
+              last.read_feature(output.data(), output.size() * sizeof(float)));
+    EXPECT_EQ(std::vector<float>(768, 127.0f), output);
+    last = IndexCluster::Centroid();
+    EXPECT_TRUE(owner.expired());
+  }
+  EXPECT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(1));
+  auto storage = PagedCentroids::Create();
+  IndexCluster::Centroid row;
+  const float value = 1.0f;
+  EXPECT_EQ(IndexError_NoMemory, storage->append(&value, sizeof(value), &row));
+  EXPECT_EQ(0u, row.size());
+  EXPECT_EQ(0u, pool.used());
+  struct FailedStorage : IndexCluster::FeatureStorage {
+    int read(size_t, void *, size_t) const override {
+      return IndexError_ReadData;
+    }
+  };
+  row.set_feature_storage(std::make_shared<FailedStorage>(), 0, sizeof(value));
+  float out = 0;
+  EXPECT_EQ(IndexError_ReadData, row.read_feature(&out, sizeof(out)));
+  EXPECT_THROW(row.feature(), std::bad_alloc);
+  EXPECT_EQ(0u, pool.used());
 }
 
 TEST(OptKmeansCluster, TrainerPropagatesDeferredAndFallbackReadFailures) {
@@ -545,6 +615,19 @@ TEST(OptKmeansCluster, HolderTrainingRejectsInvalidPackedDimensions) {
 }
 
 TEST(OptKmeansCluster, TrainerStreamsOrFallsBackAsAppropriate) {
+  auto &pool = MemoryLimitPool::get_instance();
+  struct RestorePool {
+    size_t capacity;
+    ~RestorePool() {
+      EXPECT_EQ(0u, MemoryLimitPool::get_instance().used());
+      EXPECT_EQ(0, MemoryLimitPool::get_instance().init(capacity));
+    }
+  } restore{pool.capacity()};
+  // Two-level streaming may have input, permutation and training matrix
+  // stores live together. Do not inherit a previous test's single-store pool.
+  const size_t metadata =
+      VecBufferPool::metadata_bytes_for_page_count(4096, true);
+  ASSERT_EQ(0, pool.init(3 * metadata + 256u * 1024u));
   auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
   for (int mode = 0; mode < 6; ++mode) {
     SCOPED_TRACE(mode);

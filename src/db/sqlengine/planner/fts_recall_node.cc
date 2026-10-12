@@ -23,12 +23,19 @@ namespace cp = arrow::compute;
 namespace zvec::sqlengine {
 
 FtsRecallNode::FtsRecallNode(Segment::Ptr segment, QueryInfo::Ptr query_info,
-                             DocFilter::Ptr doc_filter, int batch_size)
+                             DocFilter::Ptr doc_filter, int batch_size,
+                             bool rank_only)
     : segment_(std::move(segment)),
       query_info_(std::move(query_info)),
       doc_filter_(std::move(doc_filter)),
       fetched_columns_(query_info_->get_all_fetched_scalar_field_names()),
-      batch_size_(batch_size) {
+      batch_size_(batch_size),
+      rank_only_(rank_only) {
+  if (rank_only_) {
+    schema_ = arrow::schema({arrow::field(LOCAL_ROW_ID, arrow::int32()),
+                             arrow::field(FIELD_SCORE, arrow::float32())});
+    return;
+  }
   auto table = segment_->fetch(fetched_columns_, std::vector<int>{});
   // Append BM25 score column so downstream fill_doc_score() surfaces it to
   // the Python Doc.score, matching the vector-recall path.
@@ -75,6 +82,26 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
           std::nullopt);
     }
 
+    if (self->rank_only_) {
+      auto make_batch =
+          [&]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
+        arrow::Int32Builder rows;
+        ARROW_RETURN_NOT_OK(rows.AppendValues(indices.data(), indices.size()));
+        ARROW_ASSIGN_OR_RAISE(auto row_array, rows.Finish());
+        ARROW_ASSIGN_OR_RAISE(auto scores, score_builder.Finish());
+        return arrow::RecordBatch::Make(
+            self->schema_, indices.size(),
+            {std::move(row_array), std::move(scores)});
+      };
+      auto batch = make_batch();
+      if (!batch.ok()) {
+        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+            batch.status());
+      }
+      return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+          cp::ExecBatch(**batch));
+    }
+
     auto table = self->segment_->fetch(self->fetched_columns_, indices);
     if (!table) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
@@ -119,12 +146,14 @@ Result<FtsIndexResults::Ptr> FtsRecallNode::prepare() {
         Status::InvalidArgument("FtsRecallNode: no fts_cond_info in query"));
   }
 
+  ailego::MemoryReservation keys_memory;
   fts::FtsQueryParams params;
   params.topk = query_info_->query_topn();
   // Brute-force path: get_bf_by_keys_and_update also clears invert_filter_
   // when it returns ids, so the filter set below won't double-check them.
   if (auto bf_keys = doc_filter_->get_bf_by_keys_and_update(
-          GlobalConfig::Instance().fts_brute_force_by_keys_ratio())) {
+          GlobalConfig::Instance().fts_brute_force_by_keys_ratio(),
+          keys_memory)) {
     params.candidate_ids = std::move(bf_keys.value());
   }
   // Push down remaining filters (delete / forward) so filtered docs are

@@ -379,12 +379,12 @@ int FlatSparseStreamer::get_sparse_vector(
   return 0;
 }
 
-int FlatSparseStreamer::do_search(
-    const uint32_t *sparse_count, const uint32_t *sparse_indices,
-    const void *sparse_query, bool with_p_keys,
-    const std::vector<std::vector<uint64_t>> &p_keys,
-    const IndexQueryMeta &qmeta, uint32_t count,
-    ContextPointer &context) const {
+int FlatSparseStreamer::do_search(const uint32_t *sparse_count,
+                                  const uint32_t *sparse_indices,
+                                  const void *sparse_query, bool with_p_keys,
+                                  IndexKeyBatchView p_keys,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  ContextPointer &context) const {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to do_search, open streamer first!");
     return IndexError_NoReady;

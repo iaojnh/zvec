@@ -2,6 +2,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
 #include <algorithm/hnsw/hnsw_algorithm.h>
@@ -49,6 +50,66 @@ void HnswStreamerTest::SetUp() {
 
 void HnswStreamerTest::TearDown() {
   zvec::test_util::RemoveTestPath(dir_);
+}
+
+TEST_F(HnswStreamerTest, FailedVisitGrowthKeepsCapacityAndCanBeRetried) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(1UL << 20));
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
+  HnswContext context(dim, nullptr, entity);
+  context.set_filter_mode(VisitFilter::BitMap);
+  ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
+  auto &filter = context.visit_filter();
+  filter.set_visited(17);
+  ASSERT_GT(pool.available(), 4096u);
+  const size_t pressure = pool.available() - 4096;
+  ASSERT_TRUE(pool.try_charge_external(pressure));
+  {
+    auto release = ScopeGuard::Make([&] { pool.release_external(pressure); });
+    const size_t charged = pool.used();
+    // Both attempts must fail: a failed reset must not publish the new size.
+    EXPECT_FALSE(context.check_need_adjuct_ctx(1000000));
+    EXPECT_FALSE(context.check_need_adjuct_ctx(1000000));
+    EXPECT_EQ(charged, pool.used());
+    EXPECT_TRUE(filter.visited(17));
+  }
+  ASSERT_TRUE(context.check_need_adjuct_ctx(1000000));
+  filter.set_visited(999999);
+  EXPECT_TRUE(filter.visited(999999));
+}
+
+TEST_F(HnswStreamerTest, InterruptedBuildReleasesEveryCandidateHeap) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(64 * 1024));
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
+  HnswContext context(dim, nullptr, entity);
+  for (uint32_t i = 0; i < 3; ++i) {
+    context.candidates().emplace(i, 1.0f);
+    context.update_heap().emplace(i, 1.0f);
+    context.level_topk(0).emplace(i, 1.0f);
+    context.level_topk(1).emplace(i, 1.0f);
+    EXPECT_GT(pool.used(), 0u);
+    context.release_build_workspace();
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_TRUE(context.candidates().empty());
+    EXPECT_TRUE(context.update_heap().empty());
+    EXPECT_TRUE(context.level_topk(0).empty());
+    EXPECT_TRUE(context.level_topk(1).empty());
+  }
 }
 
 TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
@@ -212,6 +273,7 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
   ASSERT_NE(nullptr, ctx);
   auto *hnsw_ctx = dynamic_cast<HnswContext *>(ctx.get());
   ASSERT_NE(nullptr, hnsw_ctx);
+  EXPECT_EQ(VisitFilter::EpochBitMap, hnsw_ctx->visit_filter().get_mode());
   ASSERT_NE(nullptr, dynamic_cast<const HnswBufferPoolStreamerEntity *>(
                          &hnsw_ctx->get_entity()));
   ctx->set_topk(3);
@@ -221,8 +283,8 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
 
   const bool expect_block =
       zvec::ailego::internal::CpuFeatures::static_flags_.AVX2;
-  for (const auto mode :
-       {VisitFilter::ByteMap, VisitFilter::BitMap, VisitFilter::BloomFilter}) {
+  for (const auto mode : {VisitFilter::ByteMap, VisitFilter::EpochBitMap,
+                          VisitFilter::BitMap, VisitFilter::BloomFilter}) {
     SCOPED_TRACE(static_cast<int>(mode));
     ASSERT_EQ(0,
               hnsw_ctx->visit_filter().init(mode, kDocCount, kDocCount, 1e-9f));

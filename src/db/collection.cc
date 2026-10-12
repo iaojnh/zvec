@@ -38,13 +38,16 @@
 #include <zvec/db/status.h>
 #include "db/collection_query_internal.h"
 #include "db/common/constants.h"
+#include "db/common/doc_id_buffer.h"
 #include "db/common/file_helper.h"
 #include "db/common/global_resource.h"
 #include "db/common/profiler.h"
 #include "db/common/typedef.h"
 #include "db/common/utils.h"
+#include "db/common/write_buffer_reservation.h"
 #include "db/doc_iterator_internal.h"
 #include "db/index/common/delete_store.h"
+#include "db/index/common/doc_id_map.h"
 #include "db/index/common/id_map.h"
 #include "db/index/common/identifier_validation.h"
 #include "db/index/common/index_filter.h"
@@ -320,6 +323,10 @@ class CollectionImpl : public Collection {
   std::atomic<SegmentID> segment_id_allocator_;
   std::atomic<SegmentID> tmp_segment_id_allocator_;
 
+  // Declared before the stores so the allowance outlives them on open failure.
+  // One serialized writer per Collection; flush/rotation reuse this allowance.
+  WriteBufferReservation write_buffer_reservation_;
+
   // writing segment
   Segment::Ptr writing_segment_;
   // non-writing segments, sort by doc_id range
@@ -464,6 +471,9 @@ Status CollectionImpl::close_unsafe() {
   id_map_.reset();
   delete_store_.reset();
 
+  // Keep the allowance through the final flush and store destruction.
+  write_buffer_reservation_.release();
+
   lock_file_.close();
 
   return result;
@@ -518,7 +528,7 @@ Result<std::string> CollectionImpl::path() const {
   return path_;
 }
 
-Result<CollectionStats> CollectionImpl::stats() const {
+Result<CollectionStats> CollectionImpl::stats() const try {
   std::shared_lock<std::shared_mutex> lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
@@ -563,6 +573,8 @@ Result<CollectionStats> CollectionImpl::stats() const {
   }
 
   return stats;
+} catch (const DocIdMap::ReadError &error) {
+  return tl::make_unexpected(error.status());
 }
 
 Result<CollectionSchema> CollectionImpl::schema() const {
@@ -910,7 +922,7 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_drop_scalar_index_task(
   return tasks;
 }
 
-Status CollectionImpl::optimize(const OptimizeOptions &options) {
+Status CollectionImpl::optimize(const OptimizeOptions &options) try {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
   // Serialize against other maintenance operations for the whole optimize.
@@ -1082,6 +1094,8 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) {
   persist_segments.clear();
 
   return Status::OK();
+} catch (const DocIdMap::ReadError &error) {
+  return error.status();
 }
 
 std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
@@ -1564,7 +1578,7 @@ Result<WriteResults> CollectionImpl::upsert(std::vector<Doc> &docs) {
 }
 
 Status CollectionImpl::internal_fetch_by_doc(const Doc &doc,
-                                             Doc::Ptr *doc_out) {
+                                             Doc::Ptr *doc_out) try {
   // Called from handle_update(), i.e. under write_impl()'s write_mtx_.
   auto segments = get_all_segments_unsafe();
   uint64_t doc_id;
@@ -1589,6 +1603,8 @@ Status CollectionImpl::internal_fetch_by_doc(const Doc &doc,
   }
   *doc_out = old_doc;
   return Status::OK();
+} catch (const DocIdMap::ReadError &error) {
+  return error.status();
 }
 
 Status CollectionImpl::handle_upsert(Doc &doc) {
@@ -1775,11 +1791,7 @@ Status CollectionImpl::delete_by_filter(const std::string &filter) {
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS(closed_, false);
 
-  SearchQuery query;
-  query.filter_ = filter;
-  query.topk_ = INT32_MAX;
-  query.output_fields_ = std::vector<std::string>{};
-  query.include_doc_id_ = true;
+  DocIdBuffer matched_ids;
 
   // The matched set decides what gets deleted, so it must reflect one
   // collection state: hold write_mtx_ shared across the scan to exclude
@@ -1787,24 +1799,23 @@ Status CollectionImpl::delete_by_filter(const std::string &filter) {
   // this; delete needs the stronger guarantee.
   auto ret = [&]() {
     std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
-    return sql_engine_->execute(schema_, std::move(query),
-                                get_all_segments_unsafe());
+    return sql_engine_->scan_doc_ids(
+        schema_, filter, get_all_segments_unsafe(),
+        [&matched_ids](const uint64_t *ids, size_t count) {
+          return matched_ids.append(ids, count);
+        });
   }();
-  if (!ret.has_value()) {
-    return ret.error();
-  }
+  if (!ret.ok()) return ret;
 
   // TODO: The granularity of the write_lock is too coarse.
   std::lock_guard write_lock(write_mtx_);
-  for (auto &doc : ret.value()) {
-    Status s = writing_segment_->Delete(doc->doc_id());
+  return matched_ids.for_each([&](uint64_t id) {
+    Status s = writing_segment_->Delete(id);
     if (!s.ok()) {
-      LOG_ERROR("Delete doc_id: %zu failed", (size_t)doc->doc_id());
-      return s;
+      LOG_ERROR("Delete doc_id: %zu failed", static_cast<size_t>(id));
     }
-  }
-
-  return Status::OK();
+    return s;
+  });
 }
 
 Result<DocPtrList> CollectionImpl::query(const SearchQuery &query) const {
@@ -1995,7 +2006,7 @@ Result<GroupResults> CollectionImpl::group_by_query(
 Result<DocPtrMap> CollectionImpl::fetch(
     const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
-    bool include_vector) const {
+    bool include_vector) const try {
   std::shared_lock lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
@@ -2026,6 +2037,8 @@ Result<DocPtrMap> CollectionImpl::fetch(
   }
 
   return results;
+} catch (const DocIdMap::ReadError &error) {
+  return tl::make_unexpected(error.status());
 }
 
 Result<std::string> CollectionImpl::debug_get_hnsw_storage_mode(
@@ -2092,6 +2105,21 @@ Status CollectionImpl::recovery() {
   const auto v = version_manager_->get_current_version();
   schema_ = std::make_shared<CollectionSchema>(v.schema());
   options_.enable_mmap_ = v.enable_mmap();
+
+  // A read-only open normally needs no write allowance, but WAL replay may
+  // reconstruct an in-memory forward store. Reserve before opening any stores
+  // or replaying records. Use the persisted storage mode, not the open hint.
+  bool replays_wal = false;
+  if (const auto &meta = v.writing_segment_meta(); meta) {
+    if (const auto &block = meta->writing_forward_block(); block.has_value()) {
+      replays_wal = FileHelper::FileExists(
+          FileHelper::MakeWalPath(path_, meta->id(), block->id()));
+    }
+  }
+  if (!options_.enable_mmap_ && (!options_.read_only_ || replays_wal)) {
+    s = write_buffer_reservation_.acquire(options_.max_buffer_size_);
+    CHECK_RETURN_STATUS(s);
+  }
   s = recover_idmap_and_delete_store();
   CHECK_RETURN_STATUS(s);
 
@@ -2270,6 +2298,13 @@ Status CollectionImpl::create() {
   // check schema
   auto s = schema_->validate();
   CHECK_RETURN_STATUS(s);
+
+  // Admission precedes directory creation and all WAL/ID-map mutations. The
+  // mmap path keeps its existing behavior; this reserves shared Buffer budget.
+  if (!options_.enable_mmap_) {
+    s = write_buffer_reservation_.acquire(options_.max_buffer_size_);
+    CHECK_RETURN_STATUS(s);
+  }
 
   if (!ailego::FileHelper::MakePath(path_.c_str())) {
     return Status::InvalidArgument(

@@ -77,6 +77,19 @@ class HnswSparseStreamer : public IndexStreamer {
                      Context::Pointer &context) const override;
 
   //! Linear search by primary keys
+  int search_bf_key_batch(const uint32_t *sparse_count, const uint32_t *indices,
+                          const void *query, IndexKeyBatchView keys,
+                          const IndexQueryMeta &meta, uint32_t count,
+                          Context::Pointer &context) const;
+  int search_bf_by_keys_impl(uint32_t sparse_count, const uint32_t *indices,
+                             const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &meta,
+                             Context::Pointer &context) const override {
+    return search_bf_key_batch(&sparse_count, indices, query,
+                               IndexKeyBatchView(keys), meta, 1, context);
+  }
+
   int search_bf_by_p_keys_impl(const uint32_t sparse_count,
                                const uint32_t *sparse_indices,
                                const void *sparse_query,
@@ -216,6 +229,7 @@ class HnswSparseStreamer : public IndexStreamer {
   bool check_crc_enabled_{false};
   bool filter_same_key_{false};
   bool get_vector_enabled_{false};
+  bool use_key_info_map_{true};
   bool force_padding_topk_enabled_{false};
 
   //! avoid add vector while dumping index

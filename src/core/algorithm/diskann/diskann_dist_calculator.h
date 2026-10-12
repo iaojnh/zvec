@@ -22,6 +22,7 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_meta.h>
 #include "diskann_entity.h"
+#include "diskann_visit_filter.h"
 
 namespace zvec {
 namespace core {
@@ -132,11 +133,14 @@ class DistCalculator {
     paged_quant_codes_ = std::move(paged_codes);
   }
 
-  void quantize_query(const void *query_rotated) {
-    quant_query_scratch_.resize(quantizer_->quantized_query_vector_length());
-    quantizer_->quantize_query(query_rotated, quant_query_scratch_.data());
-    quant_dist_impl_ =
-        quantizer_->distance(quant_query_scratch_.data(), IndexQueryMeta());
+  int quantize_query(const void *query_rotated) try {
+    error_code_ =
+        quantizer_->prepare_distance(query_rotated, &quant_dist_impl_);
+    return error_code_;
+  } catch (const std::bad_alloc &) {
+    return error_code_ = IndexError_NoMemory;
+  } catch (const std::exception &) {
+    return error_code_ = IndexError_Runtime;
   }
 
   void quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) try {
@@ -185,6 +189,32 @@ class DistCalculator {
     error_code_ = IndexError_NoMemory;
   } catch (const std::exception &) {
     error_code_ = IndexError_ReadData;
+  }
+
+  // Keep first-visit order, but avoid reading PQ pages for neighbors that
+  // cannot enter the candidate queue. Scratch is bounded by one graph row;
+  // quantized_dist releases all page pins before returning.
+  void quantized_dist_unvisited(const diskann_id_t *ids, uint32_t n,
+                                VisitFilter &visited,
+                                std::vector<diskann_id_t> &unvisited,
+                                std::vector<float> &distances) {
+    unvisited.clear();
+    distances.clear();
+    for (uint32_t i = 0; i < n; ++i) {
+      // Validate before indexing the visit bitmap, including skipped IDs.
+      if (ids[i] >= entity_->doc_cnt()) {
+        error_code_ = IndexError_InvalidFormat;
+        return;
+      }
+      if (!visited.visited(ids[i])) {
+        visited.set_visited(ids[i]);
+        unvisited.push_back(ids[i]);
+      }
+    }
+    if (unvisited.empty()) return;
+    distances.resize(unvisited.size());
+    quantized_dist(unvisited.data(), static_cast<uint32_t>(unvisited.size()),
+                   distances.data());
   }
 
   inline void clear() {
@@ -298,7 +328,6 @@ class DistCalculator {
   turbo::DistanceImpl quant_dist_impl_{};
 
   std::vector<const void *> quant_dp_list_;
-  std::vector<uint8_t> quant_query_scratch_;
   std::vector<IndexStorage::MemoryBlock> quant_code_blocks_;
   std::vector<IndexStorage::Segment::BorrowedRead> quant_code_reads_;
 };

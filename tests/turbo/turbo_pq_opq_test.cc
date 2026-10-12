@@ -16,8 +16,10 @@
 #include <limits>
 #include <vector>
 #include <gtest/gtest.h>
+#include <zvec/core/framework/index_factory.h>
 #include "preprocessor/opq_rotator/opq_rotator.h"
 #include "quantizer/common/pq_quantizer/pq_opq.h"
+#include "quantizer/quantizer.h"
 
 namespace zvec {
 namespace turbo {
@@ -76,6 +78,62 @@ void check_reconstruction(const std::vector<size_t> &widths) {
   for (size_t d = 0; d < dim; ++d) {
     EXPECT_FLOAT_EQ(expected[d], output[d]);
     EXPECT_FLOAT_EQ(-expected[d], output[dim + d]);
+  }
+}
+
+TEST(PqOpq, StreamingExportMatchesBlobForAllCodeFormats) {
+  for (const char *name :
+       {"PqInt8Quantizer", "PqInt4Quantizer", "PqFastQuantizer"}) {
+    SCOPED_TRACE(name);
+    for (bool rotated : {false, true}) {
+      SCOPED_TRACE(rotated);
+      core::IndexMeta meta;
+      meta.set_meta(core::IndexMeta::DT_FP32, 8);
+      meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+      ailego::Params params;
+      params.set("num_chunk", uint32_t{2});
+      params.set("max_iter", uint32_t{1});
+      params.set("thread_count", uint32_t{1});
+      params.set("build_sdc_table", false);
+      if (rotated) {
+        params.set("rotate_type", std::string("opq"));
+        params.set("opq_iter", uint32_t{1});
+        params.set("opq_pq_iter", uint32_t{1});
+      }
+      auto quantizer = core::IndexFactory::CreateQuantizer(name);
+      ASSERT_TRUE(quantizer);
+      ASSERT_EQ(0, quantizer->init(meta, params));
+      auto holder = std::make_shared<
+          core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(8);
+      for (size_t i = 0; i < 256; ++i) {
+        ailego::NumericalVector<float> row(8);
+        for (size_t d = 0; d < 8; ++d)
+          row[d] = static_cast<float>((i * 17 + d * 3) % 251) / 251;
+        holder->emplace(i, row);
+      }
+      ASSERT_EQ(0, quantizer->train(holder));
+      std::string blob, streamed;
+      ASSERT_EQ(0, quantizer->serialize(&blob));
+      EXPECT_EQ(blob.size(), quantizer->serialized_size());
+      ASSERT_EQ(0, quantizer->serialize_to([&](const void *data, size_t bytes) {
+        EXPECT_LE(bytes, 64u * 1024u);
+        streamed.append(static_cast<const char *>(data), bytes);
+        return 0;
+      }));
+      EXPECT_EQ(blob, streamed);
+      size_t calls = 0;
+      EXPECT_EQ(-123, quantizer->serialize_to([&](const void *, size_t) {
+        return ++calls == 3 ? -123 : 0;
+      }));
+      EXPECT_EQ(3u, calls);
+      auto restored = core::IndexFactory::CreateQuantizer(name);
+      ASSERT_TRUE(restored);
+      ASSERT_EQ(0, restored->init(meta, params));
+      ASSERT_EQ(0, restored->deserialize(streamed));
+      std::string roundtrip;
+      ASSERT_EQ(0, restored->serialize(&roundtrip));
+      EXPECT_EQ(blob, roundtrip);
+    }
   }
 }
 

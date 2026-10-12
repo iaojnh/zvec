@@ -13,8 +13,12 @@
 // limitations under the License.
 #pragma once
 
+#include <map>
+#include <mutex>
+#include <thread>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_framework.h>
+#include "utility/temporary_buffer_storage.h"
 #include "ivf_params.h"
 #include "ivf_utility.h"
 
@@ -80,6 +84,8 @@ class IVFCentroidIndex {
   //! Build Centroid Index From Centroid List
   int build(const IndexCluster::CentroidList &centroid_list);
 
+  int read_dump(size_t offset, void *out, size_t bytes) const;
+
   //! Load Centroid Index From container
   int load(const IndexStorage::Pointer &container, const ailego::Params params);
 
@@ -111,14 +117,26 @@ class IVFCentroidIndex {
       typedef std::unique_ptr<Iterator> Pointer;
 
       //! Constructor
-      Iterator(std::vector<const void *> *features) : features_(features) {}
+      Iterator(std::vector<const IndexCluster::Centroid *> *features)
+          : features_(features) {}
 
       //! Destructor
       ~Iterator() override = default;
 
       //! Retrieve pointer of data
       const void *data() const override {
-        return (*features_)[id_];
+        const auto &row = *(*features_)[id_];
+        if (!row.feature_stored()) return row.feature();
+        if (loaded_ != id_) {
+          scratch_.resize(row.size());
+          status_ = row.read_feature(scratch_.data(), scratch_.size());
+          loaded_ = id_;
+        }
+        return status_ == 0 ? scratch_.data() : nullptr;
+      }
+
+      int status() const override {
+        return status_;
       }
 
       //! Test if the iterator is valid
@@ -138,8 +156,11 @@ class IVFCentroidIndex {
 
      private:
       //! Members
-      std::vector<const void *> *features_{nullptr};
+      std::vector<const IndexCluster::Centroid *> *features_{nullptr};
       uint32_t id_{0};
+      mutable size_t loaded_{static_cast<size_t>(-1)};
+      mutable int status_{0};
+      mutable std::vector<uint8_t> scratch_;
     };
 
     //! Constructor
@@ -157,7 +178,7 @@ class IVFCentroidIndex {
             }
             for (const auto &it : cents) {
               if (it.subitems().empty()) {
-                features_.emplace_back(it.feature());
+                features_.emplace_back(&it);
               } else {
                 get_leaf_features(it.subitems());
               }
@@ -200,7 +221,7 @@ class IVFCentroidIndex {
 
    private:
     //! Members
-    std::vector<const void *> features_{};
+    std::vector<const IndexCluster::Centroid *> features_{};
     size_t dimension_{0};
     size_t element_size_{0};
     IndexMeta::DataType data_type_{IndexMeta::DataType::DT_UNDEFINED};
@@ -225,7 +246,12 @@ class IVFCentroidIndex {
   //! Members
   IndexMeta meta_{};
 
+  TemporaryBufferStorage::Pointer dump_file_;
   IndexSearcher::Pointer searcher_{};
+  // Contexts belong to this index, not a process-long thread_local holding an
+  // earlier index's page table after training/cleanup.
+  std::mutex contexts_mutex_;
+  std::map<std::thread::id, IndexSearcher::Context::Pointer> contexts_;
   IndexReformer::Pointer reformer_{};
   std::string builder_class_{kDefaultBuilder};
   std::string searcher_class_{};

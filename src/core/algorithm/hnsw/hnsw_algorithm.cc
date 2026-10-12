@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "hnsw_algorithm.h"
+#include <mutex>
 
 namespace zvec {
 namespace core {
 
 template <typename EntityType>
 int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
-                                        HnswContext *ctx) {
+                                        HnswContext *ctx) try {
   spin_lock_.lock();
 
   auto cur_max_level = entity_.cur_max_level();
@@ -30,13 +31,14 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
   }
   spin_lock_.unlock();
 
+  std::unique_lock<decltype(mutex_)> level_lock(mutex_, std::defer_lock);
   if (ailego_unlikely(level > cur_max_level)) {
-    mutex_.lock();
+    level_lock.lock();
     // re-check max level
     cur_max_level = entity_.cur_max_level();
     entry_point = entity_.entry_point();
     if (level <= cur_max_level) {
-      mutex_.unlock();
+      level_lock.unlock();
     }
   }
 
@@ -62,14 +64,17 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
     spin_lock_.lock();
     entity_.update_ep_and_level(id, level);
     spin_lock_.unlock();
-    mutex_.unlock();
+    level_lock.unlock();
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  ctx->release_build_workspace();
+  return IndexError_NoMemory;
 }
 
 template <typename EntityType>
-int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
+int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const try {
   spin_lock_.lock();
   auto max_level = entity_.cur_max_level();
   auto entry_point = entity_.entry_point();
@@ -95,10 +100,17 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
   }
 
   if (ctx->group_by_search()) {
-    expand_neighbors_by_group(ctx);
+    try {
+      expand_neighbors_by_group(ctx);
+    } catch (const std::bad_alloc &) {
+      ctx->group_topk_heaps().clear();
+      return IndexError_NoMemory;
+    }
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <typename EntityType>
@@ -597,7 +609,7 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
   };
 
   // devide into groups
-  std::map<std::string, TopkHeap> &group_topk_heaps = ctx->group_topk_heaps();
+  auto &group_topk_heaps = ctx->group_topk_heaps();
   ctx->search_heap().for_each([&](node_id_t id, dist_t score) {
     std::string group_id = group_by(id);
 

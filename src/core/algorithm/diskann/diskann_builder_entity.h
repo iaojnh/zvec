@@ -19,6 +19,9 @@
 #include "diskann_entity.h"
 
 namespace zvec {
+namespace turbo {
+class Quantizer;
+}
 namespace core {
 
 // wrapper class aligned with diskann
@@ -86,9 +89,9 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   // and dump read the retained source holder instead.
   void release_vectors();
 
-  std::string &pq_quantizer_meta_buffer() {
-    return pq_quantizer_meta_buffer_;
-  }
+  // Retain the trained state for streaming export, including dump retries.
+  // Do not keep another contiguous copy of its codebook / OPQ matrix.
+  void set_pq_quantizer(std::shared_ptr<const turbo::Quantizer> quantizer);
 
   std::vector<uint8_t> &block_compressed_data() {
     return block_compressed_data_;
@@ -121,7 +124,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
 
   IndexMeta meta_;
 
-  std::string pq_quantizer_meta_buffer_{};
+  std::shared_ptr<const turbo::Quantizer> pq_quantizer_;
   std::vector<uint8_t> block_compressed_data_;
 };
 

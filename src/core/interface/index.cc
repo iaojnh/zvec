@@ -22,6 +22,7 @@
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/index.h>
+#include "ailego/pattern/defer.h"
 #include "indexes/buffered_input.h"
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "utility/utility_params.h"
@@ -756,7 +757,19 @@ int Index::search_with_source(
 
 int Index::search(const VectorData &vector_data,
                   const BaseIndexQueryParam::Pointer &search_param,
-                  SearchResult *result) {
+                  SearchResult *output) {
+  if (!output || !search_param) return core::IndexError_InvalidArgument;
+  // The query may borrow a vector from the previous output. Keep it alive
+  // through normalization/decoding, then replace the whole result atomically.
+  SearchResult pending;
+  SearchResult *result = &pending;
+  bool completed = false;
+  AILEGO_DEFER([&] {
+    if (completed)
+      output->swap(pending);
+    else
+      output->clear();
+  });
   if (!is_open_) {
     LOG_ERROR("Index is not open");
     return core::IndexError_Runtime;
@@ -784,75 +797,68 @@ int Index::search(const VectorData &vector_data,
     return core::IndexError_Runtime;
   }
 
-  int prepare_ret = _prepare_for_search(vector_data, search_param, context);
-  if (prepare_ret != 0) {
-    LOG_ERROR("Failed to prepare for search");
-    context->reset();
-    return prepare_ret;
-  }
-
-  if (is_sparse_) {
-    int ret = _sparse_search(vector_data, search_param, result, context);
-    if (context) {
-      context->reset();
-    }
-    return ret;
-  }
-
-  // dense supports refiner, but sparse doesn't
-  int ret = 0;
-  if (search_param->refiner_param == nullptr) {
-    ret = _dense_search(vector_data, search_param, result, context);
-  } else {
-    auto &reference_index = search_param->refiner_param->reference_index;
-    if (reference_index == nullptr) {
-      LOG_ERROR("Reference index is not set");
-      context->reset();
-      return core::IndexError_Runtime;
-    }
-    // TODO: tackle query_param's type info loss to loosen the constraint
-    if (reference_index->param_.index_type != IndexType::kFlat) {
-      LOG_ERROR("Reference index is not flat");
-      context->reset();
-      return core::IndexError_Runtime;
+  // Successful output retains its reservation after the context is reset.
+  AILEGO_DEFER([&] { context->reset(); });
+  try {
+    int prepare_ret = _prepare_for_search(vector_data, search_param, context);
+    if (prepare_ret != 0) {
+      LOG_ERROR("Failed to prepare for search");
+      return prepare_ret;
     }
 
-    const int coarse_topk = _get_coarse_search_topk(search_param);
-    if (coarse_topk < 0) {
-      context->reset();
-      return coarse_topk;
-    }
-    context->set_topk(coarse_topk);
-    context->set_fetch_vector(false);  // no need to fetch vector
-    std::string transformed_vector;
-    const void *query = nullptr;
-    core::IndexQueryMeta query_meta;
-    ret = _prepare_dense_query(vector_data, &transformed_vector, &query,
-                               &query_meta);
-    if (ret != 0) {
-      context->reset();
+    if (is_sparse_) {
+      int ret = _sparse_search(vector_data, search_param, result, context);
+      completed = ret == 0;
       return ret;
     }
-    // Refine replaces the coarse scores; only candidate membership and order
-    // cross this boundary, not document/vector materialization or
-    // normalization.
-    std::vector<std::vector<uint64_t>> keys(1);
-    if (_execute_dense_search(query, query_meta, search_param, context,
-                              &keys[0]) != 0) {
-      LOG_ERROR("Failed to search");
-      if (context) {
-        context->reset();
+
+    // dense supports refiner, but sparse doesn't
+    int ret = 0;
+    if (search_param->refiner_param == nullptr) {
+      ret = _dense_search(vector_data, search_param, result, context);
+    } else {
+      auto &reference_index = search_param->refiner_param->reference_index;
+      if (reference_index == nullptr) {
+        LOG_ERROR("Reference index is not set");
+        return core::IndexError_Runtime;
       }
-      return core::IndexError_Runtime;
+      // TODO: tackle query_param's type info loss to loosen the constraint
+      if (reference_index->param_.index_type != IndexType::kFlat) {
+        LOG_ERROR("Reference index is not flat");
+        return core::IndexError_Runtime;
+      }
+
+      const int coarse_topk = _get_coarse_search_topk(search_param);
+      if (coarse_topk < 0) {
+        return coarse_topk;
+      }
+      context->set_topk(coarse_topk);
+      context->set_fetch_vector(false);  // no need to fetch vector
+      std::string transformed_vector;
+      const void *query = nullptr;
+      core::IndexQueryMeta query_meta;
+      ret = _prepare_dense_query(vector_data, &transformed_vector, &query,
+                                 &query_meta);
+      if (ret != 0) {
+        return ret;
+      }
+      // Refine replaces the coarse scores; only candidate membership and order
+      // cross this boundary, not document/vector materialization or
+      // normalization.
+      std::vector<std::vector<uint64_t>> keys(1);
+      if (_execute_dense_search(query, query_meta, search_param, context,
+                                &keys[0]) != 0) {
+        LOG_ERROR("Failed to search");
+        return core::IndexError_Runtime;
+      }
+      ret = reference_index->_refine_dense_candidates(vector_data, search_param,
+                                                      keys, result);
     }
-    result->reverted_vector_list_.clear();
-    ret = reference_index->_refine_dense_candidates(vector_data, search_param,
-                                                    keys, result);
+    completed = ret == 0;
+    return ret;
+  } catch (const std::bad_alloc &) {
+    return core::IndexError_NoMemory;
   }
-  if (context) {
-    context->reset();
-  }
-  return ret;
 }
 
 
@@ -1065,10 +1071,9 @@ int Index::_execute_dense_search(
     core::IndexContext::Pointer &context,
     std::vector<uint64_t> *candidate_keys) {
   if (candidate_keys) candidate_keys->clear();
-  if (search_param->bf_pks != nullptr) {
-    if (streamer_->search_bf_by_p_keys_impl(
-            vector, std::vector<std::vector<uint64_t>>{*search_param->bf_pks},
-            new_meta, 1, context) != 0) {
+  if (search_param->bf_keys() != nullptr) {
+    if (streamer_->search_bf_by_keys_impl(vector, *search_param->bf_keys(),
+                                          new_meta, context) != 0) {
       LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
       return core::IndexError_Runtime;
     }
@@ -1112,6 +1117,7 @@ int Index::_refine_dense_candidates(
 
   auto &context = acquire_context();
   if (!context) return core::IndexError_Runtime;
+  AILEGO_DEFER([&] { context->reset(); });
   context->set_topk(search_param->topk);
   context->set_fetch_vector(search_param->fetch_vector);
   if (search_param->filter && search_param->filter->is_valid()) {
@@ -1130,22 +1136,15 @@ int Index::_refine_dense_candidates(
   int ret = _prepare_dense_query(vector_data, &transformed_vector, &query,
                                  &query_meta);
   if (ret != 0) {
-    context->reset();
     return ret;
   }
   ret =
       streamer_->search_bf_by_p_keys_impl(query, keys, query_meta, 1, context);
   if (ret != 0) {
-    if (context) {
-      context->reset();
-    }
     return ret;
   }
   ret = _collect_dense_result(vector_data, query_meta, search_param, result,
                               context);
-  if (context) {
-    context->reset();
-  }
   return ret;
 }
 
@@ -1166,11 +1165,11 @@ int Index::_collect_dense_result(
     }
     result->group_doc_list_ = std::move(*group_result);
   } else {
-    // Transfer the final documents instead of copying a const result(). The
-    // context receives the caller's previous buffer for reuse on later calls.
+    // Transfer the final documents and release the caller's previous output.
+    // Swapping would leave those old payloads charged in the pooled context.
     auto *documents = context->mutable_result(0);
     if (documents) {
-      result->doc_list_.swap(*documents);
+      result->doc_list_ = std::move(*documents);
     } else {
       result->doc_list_ = context->result();
     }
@@ -1209,6 +1208,10 @@ int Index::_collect_dense_result(
       int revert_err = 0;
       auto revert_one = [&](const void *vec, std::vector<std::string> *out) {
         if (revert_err) return;
+        // Turbo dequantizers return FP32 even for FP16 training input.
+        result->reserve_reverted_vector(
+            static_cast<size_t>(input_vector_meta_.dimension()) *
+            sizeof(float));
         std::string reverted_vector;
         if (turbo_quantizer_->dequantize(vec, streamer_vector_meta_,
                                          &reverted_vector) != 0) {
@@ -1219,12 +1222,15 @@ int Index::_collect_dense_result(
         out->push_back(std::move(reverted_vector));
       };
       auto revert_docs = [&](auto &docs, std::vector<std::string> &out) {
+        result->reserve_reverted_array(docs.size(), sizeof(std::string));
         out.reserve(docs.size());
         for (auto &doc : docs) {
           revert_one(doc.vector(), &out);
         }
       };
       if (has_group_by) {
+        result->reserve_reverted_array(result->group_doc_list_.size(),
+                                       sizeof(std::vector<std::string>));
         result->group_reverted_vector_list_.reserve(
             result->group_doc_list_.size());
         for (auto &group : result->group_doc_list_) {
@@ -1261,6 +1267,7 @@ int Index::_collect_dense_result(
       int revert_err = 0;
       auto revert_one = [&](const void *vec, std::vector<std::string> *out) {
         if (revert_err) return;
+        result->reserve_reverted_vector(input_vector_meta_.element_size());
         std::string reverted_vector;
         reverted_vector.resize(input_vector_meta_.dimension() *
                                input_vector_meta_.unit_size());
@@ -1272,12 +1279,15 @@ int Index::_collect_dense_result(
         out->push_back(std::move(reverted_vector));
       };
       auto revert_docs = [&](auto &docs, std::vector<std::string> &out) {
+        result->reserve_reverted_array(docs.size(), sizeof(std::string));
         out.reserve(docs.size());
         for (auto &doc : docs) {
           revert_one(doc.vector(), &out);
         }
       };
       if (has_group_by) {
+        result->reserve_reverted_array(result->group_doc_list_.size(),
+                                       sizeof(std::vector<std::string>));
         result->group_reverted_vector_list_.reserve(
             result->group_doc_list_.size());
         for (auto &group : result->group_doc_list_) {
@@ -1322,11 +1332,10 @@ int Index::_sparse_search(const VectorData &vector_data,
     values = converted_sparse_values_buffer.data();
   }
 
-  if (search_param->bf_pks != nullptr) {
-    if (streamer_->search_bf_by_p_keys_impl(
-            sparse_vector.count, indices, values,
-            std::vector<std::vector<uint64_t>>{*search_param->bf_pks}, new_meta,
-            context) != 0) {
+  if (search_param->bf_keys() != nullptr) {
+    if (streamer_->search_bf_by_keys_impl(sparse_vector.count, indices, values,
+                                          *search_param->bf_keys(), new_meta,
+                                          context) != 0) {
       LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
       return core::IndexError_Runtime;
     }
@@ -1353,7 +1362,9 @@ int Index::_sparse_search(const VectorData &vector_data,
     }
     result->group_doc_list_ = std::move(*group_result);
   } else {
-    result->doc_list_ = std::move(context->result());
+    auto *documents = context->mutable_result(0);
+    if (!documents) return core::IndexError_Runtime;
+    result->doc_list_ = std::move(*documents);
   }
 
   if (metric_ != nullptr && metric_->support_normalize()) {
@@ -1390,6 +1401,11 @@ int Index::_sparse_search(const VectorData &vector_data,
                             std::vector<std::string> *out) {
         if (revert_err) return;
         auto &result_doc = doc.sparse_doc();
+        const size_t count = result_doc.sparse_count();
+        const size_t unit = input_vector_meta_.unit_size();
+        if (unit && count > std::numeric_limits<size_t>::max() / unit)
+          throw std::bad_alloc();
+        result->reserve_reverted_vector(count * unit);
         std::string reverted_sparse_values;
         reverted_sparse_values.resize(result_doc.sparse_count() *
                                       input_vector_meta_.unit_size());
@@ -1406,12 +1422,15 @@ int Index::_sparse_search(const VectorData &vector_data,
         out->push_back(std::move(reverted_sparse_values));
       };
       auto revert_docs = [&](auto &docs, std::vector<std::string> &out) {
+        result->reserve_reverted_array(docs.size(), sizeof(std::string));
         out.reserve(docs.size());
         for (auto &doc : docs) {
           revert_one(doc, &out);
         }
       };
       if (has_group_by) {
+        result->reserve_reverted_array(result->group_doc_list_.size(),
+                                       sizeof(std::vector<std::string>));
         result->group_reverted_sparse_values_list_.reserve(
             result->group_doc_list_.size());
         for (auto &group : result->group_doc_list_) {

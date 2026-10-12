@@ -50,6 +50,7 @@
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "db/index/common/doc_field_converter.h"
+#include "db/index/common/doc_id_map.h"
 #include "db/index/common/index_filter.h"
 #include "db/index/common/meta.h"
 #include "db/index/segment/segment_helper.h"
@@ -408,7 +409,7 @@ class SegmentImpl : public Segment,
   DeleteStore::Ptr delete_store_;
 
   // Maps segment-local doc ID (array index) to global doc ID (stored value)
-  std::vector<uint64_t> doc_ids_;
+  DocIdMap doc_ids_;
 
   std::array<std::variant<std::vector<int>,
                           std::unordered_map<std::string, std::vector<int>>>,
@@ -643,11 +644,8 @@ uint64_t SegmentImpl::doc_count_snapshot() const {
 uint64_t SegmentImpl::doc_count(const IndexFilter::Ptr filter) {
   uint64_t doc_count = doc_ids_.size();
   if (filter) {
-    for (const auto &doc_id : doc_ids_) {
-      if (filter->is_filtered(doc_id)) {
-        doc_count--;
-      }
-    }
+    doc_count -= doc_ids_.count_filtered(
+        [&](uint64_t doc_id) { return filter->is_filtered(doc_id); });
   }
 
   return doc_count;
@@ -914,8 +912,12 @@ Status SegmentImpl::internal_insert(Doc &doc) {
     CHECK_RETURN_STATUS(s);
   }
 
+  // Reserve mapping storage before mutating the document's stores.
+  auto s = doc_ids_.prepare_append(g_doc_id);
+  CHECK_RETURN_STATUS(s);
+
   // write idmap
-  auto s = id_map_->upsert(doc.pk_ref(), g_doc_id);
+  s = id_map_->upsert(doc.pk_ref(), g_doc_id);
   CHECK_RETURN_STATUS(s);
 
   // write forward
@@ -940,7 +942,7 @@ Status SegmentImpl::internal_insert(Doc &doc) {
   mem_block.max_doc_id_ = g_doc_id;
   mem_block.doc_count_ = mem_block.doc_count_ + 1;
 
-  doc_ids_.push_back(g_doc_id);
+  doc_ids_.commit_append(g_doc_id);
 
   return Status::OK();
 }
@@ -1068,10 +1070,13 @@ Doc::Ptr SegmentImpl::fetch(
   }
 
   int segment_doc_id = 0;
-  auto it = std::lower_bound(doc_ids_.begin(), doc_ids_.end(), g_doc_id);
-  if (it != doc_ids_.end() && *it == g_doc_id) {
-    segment_doc_id = static_cast<int>(std::distance(doc_ids_.begin(), it));
+  auto position = doc_ids_.find(g_doc_id);
+  if (position) {
+    segment_doc_id = static_cast<int>(*position);
   } else {
+    if (position.error().code() != StatusCode::NOT_FOUND) {
+      throw DocIdMap::ReadError(position.error());
+    }
     LOG_ERROR(
         "g_doc_id[%zu] not found in doc_ids_[%zu], min_doc_id[%zu] "
         "max_doc_id[%zu], meta[%s]",
@@ -3955,7 +3960,6 @@ const std::vector<BlockMeta> &SegmentImpl::get_persist_block_metas(
 }
 
 Status SegmentImpl::load_persist_scalar_blocks() {
-  doc_ids_.reserve(segment_meta_->doc_count());
   for (const auto &block : segment_meta_->persisted_blocks()) {
     if (block.type() == BlockType::SCALAR) {
       auto forward_path = FileHelper::MakeForwardBlockPath(
@@ -3994,8 +3998,10 @@ Status SegmentImpl::load_persist_scalar_blocks() {
           return Status::InternalError("Array type mismatch");
         }
         auto *values = uint64_array->raw_values();
-        doc_ids_.insert(doc_ids_.end(), values,
-                        values + uint64_array->length());
+        for (int64_t i = 0; i < uint64_array->length(); ++i) {
+          auto append_status = doc_ids_.append(values[i]);
+          CHECK_RETURN_STATUS(append_status);
+        }
       }
     }
   }
@@ -4541,7 +4547,7 @@ Result<uint64_t> SegmentImpl::get_global_doc_id(uint32_t segment_doc_id) const {
     return tl::make_unexpected(
         Status::InvalidArgument("segment_doc_id out of range"));
   }
-  return doc_ids_[segment_doc_id];
+  return doc_ids_.at(segment_doc_id);
 }
 
 

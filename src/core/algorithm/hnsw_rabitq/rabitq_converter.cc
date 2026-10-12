@@ -26,6 +26,7 @@
 #include "algorithm/cluster/holder_cluster.h"
 #include "algorithm/hnsw_rabitq/rabitq_reformer.h"
 #include "utility/reservoir_sample_holder.h"
+#include "utility/storage_segment_dumper.h"
 #include "utility/temporary_buffer_storage.h"
 #include "zvec/core/framework/index_cluster.h"
 #include "zvec/core/framework/index_error.h"
@@ -34,6 +35,7 @@
 #include "zvec/core/framework/index_holder.h"
 #include "zvec/core/framework/index_memory.h"
 #include "zvec/core/framework/index_meta.h"
+#include "paged_rabitq_rotator.h"
 #include "rabitq_params.h"
 #include "rabitq_utils.h"
 
@@ -135,8 +137,9 @@ int RabitqConverter::init(const IndexMeta &meta, const ailego::Params &params) {
   }
 
   // Create rotator
-  rotator_.reset(
-      rabitqlib::choose_rotator<float>(dimension_, rotator_type_, padded_dim_));
+  int ret =
+      MakeRabitqRotator(dimension_, rotator_type_, padded_dim_, &rotator_);
+  if (ret != 0) return ret;
 
   LOG_INFO(
       "RabitqConverter initialized: dim=%zu, padded_dim=%zu, "
@@ -148,8 +151,8 @@ int RabitqConverter::init(const IndexMeta &meta, const ailego::Params &params) {
 }
 
 int RabitqConverter::cleanup() {
-  centroids_.clear();
-  rotated_centroids_.clear();
+  centroids_ = PagedBuildBuffer();
+  rotated_centroids_ = PagedBuildBuffer();
   result_holder_.reset();
   rotator_.reset();
   return 0;
@@ -274,17 +277,26 @@ int RabitqConverter::train(IndexHolder::Pointer holder,
     LOG_WARN("Expected %zu clusters, got %zu", num_clusters_, cents.size());
     num_clusters_ = cents.size();
   }
-  // Extract original centroids (for LinearSeeker query)
-  centroids_.resize(num_clusters_ * dimension_);
-  // Extract rotated centroids (for quantization)
-  rotated_centroids_.resize(num_clusters_ * padded_dim_);
-  for (uint32_t i = 0; i < num_clusters_; ++i) {
-    const float *cent_data = static_cast<const float *>(cents[i].feature());
-    // Save original centroids
-    std::memcpy(&centroids_[i * dimension_], cent_data,
-                dimension_ * sizeof(float));
-    // Save rotated centroids
-    this->rotator_->rotate(cent_data, &rotated_centroids_[i * padded_dim_]);
+  ret = centroids_.init(num_clusters_ * dimension_ * sizeof(float));
+  if (ret != 0) return ret;
+  ret = rotated_centroids_.init(num_clusters_ * padded_dim_ * sizeof(float));
+  if (ret != 0) return ret;
+  std::vector<float> row(padded_dim_);
+  std::vector<float> center(dimension_);
+  for (size_t i = 0; i < num_clusters_; ++i) {
+    ret = cents[i].read_feature(center.data(), center.size() * sizeof(float));
+    if (ret != 0) return ret;
+    const float *cent_data = center.data();
+    ret = centroids_.write(i * dimension_ * sizeof(float), cent_data,
+                           dimension_ * sizeof(float));
+    if (ret != 0) return ret;
+    rotator_->rotate(cent_data, row.data());
+    ret = rotated_centroids_.write(i * padded_dim_ * sizeof(float), row.data(),
+                                   padded_dim_ * sizeof(float));
+    if (ret != 0) return ret;
+    // The cluster API returns owning rows. Release each once persisted rather
+    // than retaining another full centroid table through the handoff.
+    cents[i] = IndexCluster::Centroid();
   }
 
   stats_.set_trained_count(trained_count);
@@ -303,7 +315,7 @@ int RabitqConverter::transform(IndexHolder::Pointer holder) {
     return IndexError_InvalidArgument;
   }
 
-  if (rotated_centroids_.empty()) {
+  if (rotated_centroids_.size() == 0) {
     LOG_ERROR("Centroids not trained yet");
     return IndexError_NoReady;
   }
@@ -318,7 +330,7 @@ int RabitqConverter::dump(const IndexDumper::Pointer &dumper) {
     return IndexError_InvalidArgument;
   }
 
-  if (rotated_centroids_.empty() || centroids_.empty()) {
+  if (rotated_centroids_.size() == 0 || centroids_.size() == 0) {
     LOG_ERROR("No centroids to dump");
     return IndexError_NoReady;
   }
@@ -328,7 +340,13 @@ int RabitqConverter::dump(const IndexDumper::Pointer &dumper) {
 
   int ret = dump_rabitq_centroids(
       dumper, dimension_, padded_dim_, ex_bits_, num_clusters_, rotator_type_,
-      rotated_centroids_, centroids_, rotator_, &dumped_size);
+      [&](size_t offset, void *out, size_t bytes) {
+        return rotated_centroids_.read(offset, out, bytes);
+      },
+      [&](size_t offset, void *out, size_t bytes) {
+        return centroids_.read(offset, out, bytes);
+      },
+      rotator_, &dumped_size);
   if (ret != 0) {
     return ret;
   }
@@ -341,52 +359,44 @@ int RabitqConverter::dump(const IndexDumper::Pointer &dumper) {
   return 0;
 }
 
-int RabitqConverter::to_reformer(IndexReformer::Pointer *reformer) {
-  auto memory_dumper = IndexFactory::CreateDumper("MemoryDumper");
-  memory_dumper->init(ailego::Params());
-  std::string file_id = ailego::StringHelper::Concat(
+int RabitqConverter::training_storage(IndexStorage::Pointer *storage) {
+  if (!storage) return IndexError_InvalidArgument;
+  if (!rotator_ || centroids_.size() == 0 || rotated_centroids_.size() == 0)
+    return IndexError_NoReady;
+  if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+    int ret = CreateTemporaryIndexStorage(storage);
+    if (ret != 0) return ret;
+    auto dumper = std::make_shared<StorageSegmentDumper>();
+    size_t bytes = sizeof(RabitqConverterHeader) + centroids_.size() +
+                   rotated_centroids_.size() + rotator_->dump_bytes();
+    ret = dumper->prepare(*storage, RABITQ_CONVERTER_SEG_ID,
+                          (bytes + 31) & ~size_t(31));
+    return ret == 0 ? dump(dumper) : ret;
+  }
+  auto dumper = IndexFactory::CreateDumper("MemoryDumper");
+  dumper->init(ailego::Params());
+  std::string id = ailego::StringHelper::Concat(
       "rabitq_converter_", ailego::Monotime::MilliSeconds(), rand());
-  int ret = memory_dumper->create(file_id);
-  if (ret != 0) {
-    LOG_ERROR("Failed to create memory dumper: %d", ret);
-    return ret;
-  }
-  // Release memory
-  AILEGO_DEFER([&file_id]() { IndexMemory::Instance()->remove(file_id); });
-  ret = this->dump(memory_dumper);
-  if (ret != 0) {
-    LOG_ERROR("Failed to dump RabitqConverter: %d", ret);
-    return ret;
-  }
-  ret = memory_dumper->close();
-  if (ret != 0) {
-    LOG_ERROR("Failed to close memory dumper: %d", ret);
-    return ret;
-  }
-
-  auto res = std::make_shared<RabitqReformer>();
-  ailego::Params reformer_params;
-  reformer_params.set(PARAM_RABITQ_METRIC_NAME, meta_.metric_name());
-  ret = res->init(reformer_params);
-  if (ret != 0) {
-    LOG_ERROR("Failed to initialize RabitqReformer: %d", ret);
-    return ret;
-  }
-  auto memory_storage = IndexFactory::CreateStorage("MemoryReadStorage");
-  ret = memory_storage->open(file_id, false);
-  if (ret != 0) {
-    LOG_ERROR("Failed to open memory storage: %d", ret);
-    return ret;
-  }
-  ret = res->load(memory_storage);
-  if (ret != 0) {
-    LOG_ERROR("Failed to load RabitqReformer: %d", ret);
-    return ret;
-  }
-  *reformer = std::move(res);
-  return 0;
+  AILEGO_DEFER([&id]() { IndexMemory::Instance()->remove(id); });
+  int ret = dumper->create(id);
+  if (ret == 0) ret = dump(dumper);
+  if (ret == 0) ret = dumper->close();
+  if (ret != 0) return ret;
+  *storage = IndexFactory::CreateStorage("MemoryReadStorage");
+  return (*storage)->open(id, false);
 }
 
-
+int RabitqConverter::to_reformer(IndexReformer::Pointer *reformer) {
+  IndexStorage::Pointer storage;
+  int ret = training_storage(&storage);
+  if (ret != 0) return ret;
+  auto res = std::make_shared<RabitqReformer>();
+  ailego::Params params;
+  params.set(PARAM_RABITQ_METRIC_NAME, meta_.metric_name());
+  ret = res->init(params);
+  if (ret == 0) ret = res->load(storage);
+  if (ret == 0) *reformer = std::move(res);
+  return ret;
+}
 }  // namespace core
 }  // namespace zvec

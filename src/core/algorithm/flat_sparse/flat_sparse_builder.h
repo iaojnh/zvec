@@ -20,6 +20,7 @@
 #include <zvec/core/framework/index_dumper.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_holder.h>
+#include "algorithm/flat/flat_dump_keys.h"
 
 namespace zvec {
 namespace core {
@@ -70,11 +71,7 @@ class FlatSparseBuilder : public IndexBuilder {
 
   int dump_meta(IndexDumper *dumper);
 
-  int dump_keys(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
-  int dump_mapping(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
-  int dump_vector_and_offset(IndexDumper *dumper, std::vector<uint64_t> *keys);
+  int dump_vector_and_offset(IndexDumper *dumper, FlatDumpKeys *keys);
 
   int write_vector_data(const uint32_t sparse_count,
                         const uint32_t *sparse_indices, const void *sparse_vec,

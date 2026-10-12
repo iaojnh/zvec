@@ -155,12 +155,12 @@ FlatSparseSearcher::create_sparse_provider() const {
           entity, meta_, "FlatSparseSearcher"));
 }
 
-int FlatSparseSearcher::do_search(
-    const uint32_t *sparse_count, const uint32_t *sparse_indices,
-    const void *sparse_query, bool with_p_keys,
-    const std::vector<std::vector<uint64_t>> &p_keys,
-    const IndexQueryMeta &qmeta, uint32_t count,
-    ContextPointer &context) const {
+int FlatSparseSearcher::do_search(const uint32_t *sparse_count,
+                                  const uint32_t *sparse_indices,
+                                  const void *sparse_query, bool with_p_keys,
+                                  IndexKeyBatchView p_keys,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  ContextPointer &context) const {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Failed to do search, load container first!");
     return IndexError_NoIndexLoaded;

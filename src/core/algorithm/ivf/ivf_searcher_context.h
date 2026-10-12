@@ -53,7 +53,7 @@ class IVFSearcherContext : public IndexSearcher::Context {
     return &results_[idx];
   }
 
-  inline IndexDocumentHeap *result_heap() {
+  inline IndexCandidateHeap *result_heap() {
     return &result_heap_;
   }
 
@@ -135,7 +135,7 @@ class IVFSearcherContext : public IndexSearcher::Context {
   }
 
   //! Retrieve Mutable Query Result By Query Index
-  IndexDocumentHeap &mutable_result_heap() {
+  IndexCandidateHeap &mutable_result_heap() {
     return result_heap_;
   }
 
@@ -148,6 +148,14 @@ class IVFSearcherContext : public IndexSearcher::Context {
   }
 
   //! Reset all the query results
+  void reset() override {
+    result_heap_.release();
+    for (auto &result : results_) {
+      result.clear();
+      if (result.capacity() > 4096) IndexDocumentList().swap(result);
+    }
+  }
+
   void reset_results(size_t qnum) {
     results_.resize(qnum);
     stats_vec_.resize(qnum);
@@ -223,7 +231,7 @@ class IVFSearcherContext : public IndexSearcher::Context {
   //! Members
   IVFEntity::Pointer entity_{};
   IndexSearcher::Context::Pointer centroid_searcher_ctx_{};
-  IndexDocumentHeap result_heap_;
+  IndexCandidateHeap result_heap_;
   std::vector<IndexDocumentList> results_{};
   std::vector<Stats> stats_vec_{};
 

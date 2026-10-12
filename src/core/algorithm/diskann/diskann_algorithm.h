@@ -26,7 +26,12 @@ class DiskAnnAlgorithm {
   typedef std::unique_ptr<DiskAnnAlgorithm> UPointer;
 
  public:
-  DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree);
+  DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree,
+                   size_t thread_count = 1);
+
+  size_t lock_count() const {
+    return lock_pool_.size();
+  }
 
  public:
   int add_node(diskann_id_t id, DiskAnnContext *ctx);
@@ -37,31 +42,31 @@ class DiskAnnAlgorithm {
                                 std::vector<diskann_id_t> &pruned_list,
                                 DiskAnnContext *ctx);
   int iterate_to_fixed_point(const std::vector<diskann_id_t> &init_ids,
-                             DiskAnnContext *ctx);
-  int prune_neighbors(diskann_id_t id, std::vector<Neighbor> &pool,
+                             diskann_id_t excluded, DiskAnnContext *ctx);
+  int prune_neighbors(diskann_id_t id, PruneCandidates &pool,
                       std::vector<diskann_id_t> &pruned_list,
                       DiskAnnContext *ctx);
   int inter_insert(diskann_id_t id, std::vector<diskann_id_t> &pruned_list,
                    DiskAnnContext *ctx);
-  int occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
+  int occlude_list(diskann_id_t id, PruneCandidates &pool,
                    std::vector<diskann_id_t> &result, DiskAnnContext *ctx);
 
   std::vector<diskann_id_t> get_init_ids(DiskAnnContext *ctx);
 
  private:
   static constexpr uint32_t kLockCnt{1U << 16};
-  static constexpr uint32_t kLockMask{kLockCnt - 1U};
 
   DiskAnnEntity &entity_;
 
   uint32_t max_degree_{DiskAnnEntity::kDefaultMaxDegree};
   uint32_t max_candidate_size_{DiskAnnEntity::kDefaultMaxOcclusionSize};
 
-  std::vector<std::mutex> lock_pool_{};
+  std::vector<std::mutex, ailego::BudgetedAllocator<std::mutex>> lock_pool_{};
 
   //! Acquire the striped lock guarding the given id (RAII).
   [[nodiscard]] std::unique_lock<std::mutex> lock_for(diskann_id_t id) {
-    return std::unique_lock<std::mutex>(lock_pool_[id & kLockMask]);
+    return std::unique_lock<std::mutex>(
+        lock_pool_[id & (lock_pool_.size() - 1)]);
   }
 
   float alpha_{DiskAnnEntity::kDefaultAlpha};

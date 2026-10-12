@@ -21,8 +21,10 @@
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
+#include "ailego/pattern/defer.h"
 
 using namespace zvec::core;
+namespace ailego = zvec::ailego;
 
 namespace {
 
@@ -148,7 +150,7 @@ class MappingStorage : public IndexStorage {
 };
 
 struct MappingProvider {
-  MappingProvider()
+  explicit MappingProvider(bool with_mapping = true)
       : mapping(std::make_shared<TestSegment<uint32_t>>(kVectorCount)),
         entity(std::make_shared<IVFEntity>()) {
     // IVFEntity contains a header with a flexible array member, so MSVC
@@ -200,6 +202,7 @@ struct MappingProvider {
                          {IVF_OFFSETS_SEG_ID, offsets},
                          {IVF_MAPPING_SEG_ID, mapping},
                          {IVF_FEATURES_SEG_ID, features}};
+    if (!with_mapping) storage->segments.erase(IVF_MAPPING_SEG_ID);
 
     load_status = entity->load(storage);
     if (load_status == 0) {
@@ -215,6 +218,68 @@ struct MappingProvider {
 };
 
 }  // namespace
+
+TEST(IVFIndexProviderTest, MappingScratchIsChargedAndMatchesPersistedOrder) {
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    pool.init(previous);
+  });
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  MappingProvider fixture;
+  ASSERT_EQ(0, fixture.load_status);
+  auto iter = fixture.provider->create_iterator();
+  ASSERT_NE(nullptr, iter);
+  for (size_t rank = 0; rank < kVectorCount; ++rank) {
+    ASSERT_TRUE(iter->is_valid()) << iter->status();
+    EXPECT_EQ(rank + 1, iter->key());
+    ASSERT_NE(nullptr, iter->data());
+    EXPECT_FLOAT_EQ(static_cast<float>(rank + 1),
+                    *static_cast<const float *>(iter->data()));
+    iter->next();
+  }
+  EXPECT_FALSE(iter->is_valid());
+  EXPECT_EQ(0, iter->status());
+  EXPECT_LE(pool.used(), pool.capacity());
+}
+
+TEST(IVFIndexProviderTest, MappingScratchRejectsPressureAndCanRetry) {
+  MappingProvider fixture;
+  ASSERT_EQ(0, fixture.load_status);
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    pool.init(previous);
+  });
+  ASSERT_EQ(0, pool.init(1));
+  auto iter = fixture.provider->create_iterator();
+  ASSERT_NE(nullptr, iter);
+  EXPECT_FALSE(iter->is_valid());
+  EXPECT_EQ(IndexError_NoMemory, iter->status());
+  iter.reset();
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  iter = fixture.provider->create_iterator();
+  ASSERT_NE(nullptr, iter);
+  EXPECT_TRUE(iter->is_valid());
+  EXPECT_EQ(1u, iter->key());
+}
+
+TEST(IVFIndexProviderTest, MissingRequiredMappingIsNotReconstructedInHeap) {
+  MappingProvider fixture(false);
+  ASSERT_EQ(IndexError_InvalidFormat, fixture.load_status);
+  auto provider = std::make_shared<IVFIndexProvider>(
+      fixture.entity->meta(), fixture.entity, "InvalidMapping");
+  auto iter = provider->create_iterator();
+  ASSERT_NE(nullptr, iter);
+  EXPECT_FALSE(iter->is_valid());
+  EXPECT_EQ(IndexError_InvalidFormat, iter->status());
+  EXPECT_EQ(kInvalidKey, iter->key());
+}
 
 TEST(IVFIndexProviderTest, MappingFetchFailuresAreStickyAndNotNormalEof) {
   for (size_t failed_rank : {size_t{0}, kMappingChunkEntries}) {

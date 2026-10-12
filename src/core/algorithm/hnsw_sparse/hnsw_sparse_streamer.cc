@@ -16,6 +16,7 @@
 #include <ailego/internal/cpu_features.h>
 #include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
+#include "utility/group_candidate_collector.h"
 #include "hnsw_sparse_algorithm.h"
 #include "hnsw_sparse_context.h"
 #include "hnsw_sparse_dist_calculator.h"
@@ -66,6 +67,7 @@ int HnswSparseStreamer::init(const IndexMeta &imeta,
 
   params.get(PARAM_HNSW_SPARSE_STREAMER_CHUNK_SIZE, &chunk_size_);
   params.get(PARAM_HNSW_SPARSE_STREAMER_FILTER_SAME_KEY, &filter_same_key_);
+  params.get(PARAM_HNSW_SPARSE_STREAMER_USE_ID_MAP, &use_key_info_map_);
   params.get(PARAM_HNSW_SPARSE_STREAMER_GET_VECTOR_ENABLE,
              &get_vector_enabled_);
   params.get(PARAM_HNSW_SPARSE_STREAMER_MIN_NEIGHBOR_COUNT, &min_neighbor_cnt_);
@@ -177,6 +179,7 @@ int HnswSparseStreamer::init(const IndexMeta &imeta,
   entity_.set_chunk_size(chunk_size_);
   entity_.set_filter_same_key(filter_same_key_);
   entity_.set_get_vector(get_vector_enabled_);
+  entity_.set_use_key_info_map(use_key_info_map_);
   entity_.set_min_neighbor_cnt(min_neighbor_cnt_);
 
   entity_.set_sparse_meta_size(HnswSparseEntity::kSparseMetaSize);
@@ -248,6 +251,7 @@ int HnswSparseStreamer::cleanup() {
   check_crc_enabled_ = false;
   filter_same_key_ = false;
   get_vector_enabled_ = false;
+  use_key_info_map_ = true;
 
   sparse_neighbor_ratio_ = HnswSparseEntity::kDefaultSparseNeighborRatio;
   sparse_neighbor_cnt_ = 0UL;
@@ -383,7 +387,7 @@ IndexStreamer::Context::Pointer HnswSparseStreamer::create_context() const {
   ctx->set_min_scan_limit(min_scan_limit_);
   ctx->set_max_scan_ratio(max_scan_ratio_);
   ctx->set_filter_mode(bf_enabled_ ? VisitFilter::BloomFilter
-                                   : VisitFilter::ByteMap);
+                                   : VisitFilter::EpochBitMap);
   ctx->set_filter_negative_probability(bf_negative_prob_);
   ctx->set_magic(magic_);
   ctx->set_force_padding_topk(force_padding_topk_enabled_);
@@ -487,7 +491,8 @@ int HnswSparseStreamer::add_with_id_impl(uint32_t id,
                                    sparse_query_buffer);
 
   ctx->reset_query(sparse_query_buffer.data());
-  ctx->check_need_adjuct_ctx(entity_.doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_.doc_cnt()))
+    return IndexError_NoMemory;
 
   level_t level = alg_->get_random_level();
   ret =
@@ -574,7 +579,8 @@ int HnswSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
                                    sparse_query_buffer);
 
   ctx->reset_query(sparse_query_buffer.data());
-  ctx->check_need_adjuct_ctx(entity_.doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_.doc_cnt()))
+    return IndexError_NoMemory;
 
   level_t level = alg_->get_random_level();
   node_id_t id;
@@ -605,16 +611,18 @@ int HnswSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
 int HnswSparseStreamer::search_impl(
     const uint32_t sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
   return search_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                      context);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
 int HnswSparseStreamer::search_impl(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
   int ret = check_params(qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -641,7 +649,8 @@ int HnswSparseStreamer::search_impl(
   ctx->clear();
   ctx->update_dist_caculator_distance(search_distance_);
   ctx->resize_results(count);
-  ctx->check_need_adjuct_ctx(entity_.doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_.doc_cnt()))
+    return IndexError_NoMemory;
 
   const uint32_t *sparse_indices_tmp = sparse_indices;
   const void *sparse_query_tmp = sparse_query;
@@ -692,22 +701,26 @@ int HnswSparseStreamer::search_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
 int HnswSparseStreamer::search_bf_impl(
     const uint32_t sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
   return search_bf_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                         context);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
 int HnswSparseStreamer::search_bf_impl(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
   int ret = check_params(qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -751,6 +764,7 @@ int HnswSparseStreamer::search_bf_impl(
 
       ctx->reset_query(sparse_query_buffer.data());
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (node_id_t id = 0; id < entity_.doc_cnt(); ++id) {
         if (entity_.get_key(id) == kInvalidKey) {
@@ -762,13 +776,14 @@ int HnswSparseStreamer::search_bf_impl(
 
           std::string group_id = group_by(id);
 
-          auto &topk_heap = ctx->group_topk_heaps()[group_id];
-          if (topk_heap.empty()) {
-            topk_heap.limit(ctx->group_topk());
-          }
-          topk_heap.emplace(id, dist);
+          if (int group_ret = groups.add(group_id, id, dist); group_ret != 0)
+            return group_ret;
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
 
       sparse_indices_tmp += sparse_count[q];
@@ -810,15 +825,19 @@ int HnswSparseStreamer::search_bf_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Linear search by primary keys
 int HnswSparseStreamer::search_bf_by_p_keys_impl(
     const uint32_t sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
-    const IndexQueryMeta &qmeta, ContextPointer &context) const {
+    const IndexQueryMeta &qmeta, ContextPointer &context) const try {
   return search_bf_by_p_keys_impl(&sparse_count, sparse_indices, sparse_query,
                                   p_keys, qmeta, 1, context);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Linear search by primary keys with sparse inputs
@@ -827,6 +846,15 @@ int HnswSparseStreamer::search_bf_by_p_keys_impl(
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
+  return search_bf_key_batch(sparse_count, sparse_indices, sparse_query, p_keys,
+                             qmeta, count, context);
+}
+
+int HnswSparseStreamer::search_bf_key_batch(
+    const uint32_t *sparse_count, const uint32_t *sparse_indices,
+    const void *sparse_query, IndexKeyBatchView p_keys,
+    const IndexQueryMeta &qmeta, uint32_t count,
+    Context::Pointer &context) const try {
   int ret = check_params(qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -875,6 +903,7 @@ int HnswSparseStreamer::search_bf_by_p_keys_impl(
 
       ctx->reset_query(sparse_query_buffer.data());
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (size_t idx = 0; idx < p_keys[q].size(); ++idx) {
         uint64_t pk = p_keys[q][idx];
@@ -885,14 +914,15 @@ int HnswSparseStreamer::search_bf_by_p_keys_impl(
 
             std::string group_id = group_by(id);
 
-            auto &topk_heap = ctx->group_topk_heaps()[group_id];
-            if (topk_heap.empty()) {
-              topk_heap.limit(ctx->group_topk());
-            }
-            topk_heap.emplace(id, dist);
+            if (int group_ret = groups.add(group_id, id, dist); group_ret != 0)
+              return group_ret;
           }
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
 
       sparse_indices_tmp += sparse_count[q];
@@ -934,6 +964,8 @@ int HnswSparseStreamer::search_bf_by_p_keys_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 void HnswSparseStreamer::print_debug_info() {

@@ -73,4 +73,44 @@ TEST(PagedRecordSortTest, SourceErrorDoesNotPublishPartialMapping) {
   ASSERT_EQ(mapping.read(0, &value, sizeof(value)), 0);
   EXPECT_EQ(value, marker);
 }
+
+TEST(PagedRecordSortTest, MergeScratchSharesOnePageTable) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t old = pool.capacity();
+  ASSERT_EQ(pool.used(), 0u);
+  auto restore = ailego::ScopeGuard::Make([&]() {
+    EXPECT_EQ(pool.used(), 0u);
+    EXPECT_EQ(pool.init(old), 0);
+  });
+  const size_t metadata =
+      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+  ASSERT_EQ(pool.init(metadata + 64 * 1024), 0);
+  for (size_t count : {size_t{0}, size_t{1}, size_t{4096}, size_t{4097},
+                       size_t{8193}, size_t{24577}}) {
+    SCOPED_TRACE(count);
+    PagedBuildBuffer records;
+    ASSERT_EQ(records.init(count * sizeof(KeyOrderRecord) * 2), 0);
+    std::vector<KeyOrderRecord> reference(count);
+    for (size_t i = 0; i < count; ++i) {
+      reference[i].key = (i * 7879) % 6553;
+      reference[i].id = static_cast<uint32_t>(i);
+    }
+    ASSERT_EQ(
+        records.write(0, reference.data(), count * sizeof(KeyOrderRecord)), 0);
+    auto less = [](const auto &a, const auto &b) {
+      return a.key != b.key ? a.key < b.key : a.id < b.id;
+    };
+    EXPECT_EQ(SortPagedRecords<KeyOrderRecord>(&records, less, count + 1),
+              IndexError_InvalidArgument);
+    ASSERT_EQ(SortPagedRecords<KeyOrderRecord>(&records, less, count), 0);
+    std::sort(reference.begin(), reference.end(), less);
+    for (size_t i = 0; i < count; ++i) {
+      KeyOrderRecord actual;
+      ASSERT_EQ(records.read(i * sizeof(actual), &actual, sizeof(actual)), 0);
+      ASSERT_EQ(actual.key, reference[i].key);
+      ASSERT_EQ(actual.id, reference[i].id);
+    }
+    EXPECT_LE(pool.used(), pool.capacity());
+  }
+}
 }  // namespace zvec::core

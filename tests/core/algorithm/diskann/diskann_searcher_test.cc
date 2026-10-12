@@ -23,6 +23,7 @@
 #include <type_traits>
 #include <unordered_set>
 #include <ailego/math/distance.h>
+#include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/container/vector.h>
@@ -1086,6 +1087,51 @@ TEST_F(DiskAnnSearcherTest, TestGroup) {
 
     ASSERT_EQ(10 - i, result[0].key());
   }
+  // The bounded exhaustive path must not retain a vector/heap for every
+  // distinct group. Exercise queries with and without vector output.
+  {
+    auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+    const size_t previous = pool.capacity();
+    ASSERT_EQ(0u, pool.used());
+    auto restore_pool =
+        zvec::ailego::ScopeGuard::Make([&] { pool.init(previous); });
+    // macOS uses 16 KiB pages: writable staging alone needs 2 MiB.
+    // Separate that mandatory storage overhead from the query working set.
+    const size_t budget =
+        zvec::ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+        1024 * 1024;
+    ASSERT_EQ(0, pool.init(budget));
+    {
+      auto bounded = searcher->create_context();
+      ASSERT_NE(nullptr, bounded);
+      bounded->set_group_params(3, 2);
+      bounded->set_group_by([](uint64_t key) { return std::to_string(key); });
+      for (bool vectors : {false, true}) {
+        bounded->set_fetch_vector(vectors);
+        ASSERT_EQ(0, searcher->search_bf_impl(vec.data(), qmeta, bounded));
+        ASSERT_EQ(3u, bounded->group_result().size());
+        for (const auto &group : bounded->group_result()) {
+          ASSERT_EQ(1u, group.docs().size());
+          const auto &doc = group.docs()[0];
+          EXPECT_EQ(std::to_string(doc.key()), group.group_id());
+          if (vectors) {
+            ASSERT_EQ(dim * sizeof(float), doc.vector_string().size());
+            float value;
+            memcpy(&value, doc.vector_string().data(), sizeof(value));
+            EXPECT_FLOAT_EQ(float(doc.key()) / 10, value);
+          } else {
+            EXPECT_TRUE(doc.vector_string().empty());
+          }
+        }
+        auto *typed = dynamic_cast<DiskAnnContext *>(bounded.get());
+        ASSERT_NE(nullptr, typed);
+        EXPECT_TRUE(typed->topk_heap().empty());
+        EXPECT_TRUE(typed->group_topk_heaps().empty());
+        EXPECT_LE(pool.used(), pool.capacity());
+      }
+    }
+    EXPECT_EQ(0u, pool.used());
+  }
 }
 
 TEST_F(DiskAnnSearcherTest, TestFetchVector) {
@@ -1154,9 +1200,7 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   auto *diskann_search_context =
       dynamic_cast<DiskAnnContext *>(linear_ctx.get());
   ASSERT_NE(diskann_search_context, nullptr);
-  EXPECT_EQ(static_cast<size_t>(DiskAnnUtil::kMaxSectorReadNum) *
-                DiskAnnUtil::kSectorSize,
-            diskann_search_context->sector_buffer_size());
+  EXPECT_EQ(0u, diskann_search_context->sector_buffer_size());
   knn_ctx->set_fetch_vector(true);
 
   for (size_t i = 0; i < doc_cnt; i += doc_cnt / 10) {

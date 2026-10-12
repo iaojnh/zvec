@@ -16,6 +16,7 @@
 
 #include <unordered_map>
 #include <zvec/core/framework/index_framework.h>
+#include "utility/group_candidate_collector.h"
 #include "flat_sparse_index_format.h"
 
 namespace zvec {
@@ -42,7 +43,7 @@ class FlatSparseEntity {
 
   //! Search in linear list with filter
   int search(const std::string &sparse_vector, const IndexFilter &filter,
-             IndexDocumentHeap *heap) const {
+             IndexCandidateHeap *heap) const {
     for (node_id_t i = 0; i < doc_cnt(); i++) {
       uint64_t key = get_key(i);
       if (ailego_unlikely(key == kInvalidKey)) {
@@ -62,7 +63,7 @@ class FlatSparseEntity {
   //! Search in linear list with filter and target pkeys
   int search_p_keys(const std::string &sparse_vector,
                     const std::vector<uint64_t> &p_keys,
-                    const IndexFilter &filter, IndexDocumentHeap *heap) const {
+                    const IndexFilter &filter, IndexCandidateHeap *heap) const {
     for (auto p_key : p_keys) {
       if (!filter.is_valid() || !filter(p_key)) {
         auto node_id = get_id(p_key);
@@ -77,10 +78,9 @@ class FlatSparseEntity {
   }
 
   //! Group search in linear list with filter
-  int search_group(
-      const std::string &sparse_vector, const IndexFilter &filter,
-      const std::function<std::string(uint64_t)> &group_by_func, uint32_t topk,
-      std::unordered_map<std::string, IndexDocumentHeap> *heap) const {
+  int search_group(const std::string &sparse_vector, const IndexFilter &filter,
+                   const std::function<std::string(uint64_t)> &group_by_func,
+                   uint32_t /*topk*/, GroupCandidateCollector *heap) const {
     for (node_id_t i = 0; i < doc_cnt(); i++) {
       uint64_t key = get_key(i);
       if (ailego_unlikely(key == kInvalidKey)) {
@@ -92,11 +92,8 @@ class FlatSparseEntity {
 
         std::string group_id = group_by_func(key);
 
-        auto &group_heap = (*heap)[group_id];
-        if (group_heap.empty()) {
-          group_heap.limit(topk);
-        }
-        group_heap.emplace(key, dist);
+        int ret = heap->add(group_id, key, dist);
+        if (ret != 0) return ret;
       }
     }
 
@@ -107,8 +104,8 @@ class FlatSparseEntity {
   int search_group_p_keys(
       const std::string &sparse_vector, const std::vector<uint64_t> &p_keys,
       const IndexFilter &filter,
-      const std::function<std::string(uint64_t)> &group_by_func, uint32_t topk,
-      std::unordered_map<std::string, IndexDocumentHeap> *heap) const {
+      const std::function<std::string(uint64_t)> &group_by_func,
+      uint32_t /*topk*/, GroupCandidateCollector *heap) const {
     for (auto p_key : p_keys) {
       if (!filter.is_valid() || !filter(p_key)) {
         auto node_id = get_id(p_key);
@@ -117,11 +114,8 @@ class FlatSparseEntity {
 
           std::string group_id = group_by_func(p_key);
 
-          auto &group_heap = (*heap)[group_id];
-          if (group_heap.empty()) {
-            group_heap.limit(topk);
-          }
-          group_heap.emplace(p_key, dist);
+          int ret = heap->add(group_id, p_key, dist);
+          if (ret != 0) return ret;
         }
       }
     }

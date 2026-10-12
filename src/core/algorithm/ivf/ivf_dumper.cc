@@ -16,8 +16,108 @@
 namespace zvec {
 namespace core {
 
+int IVFDumper::reserve_keys(size_t count) try {
+  if (keys_ready_ || header_.total_vector_count != 0)
+    return IndexError_InvalidArgument;
+  if (count > std::numeric_limits<uint32_t>::max() ||
+      count > std::numeric_limits<size_t>::max() / sizeof(KeyOrderRecord))
+    return IndexError_Overflow;
+  paged_keys_ = ailego::MemoryLimitPool::get_instance().capacity() != 0;
+  if (paged_keys_) {
+    size_t bytes = count * sizeof(KeyOrderRecord);
+    if (bytes > 64 * 1024) {
+      if (bytes > std::numeric_limits<size_t>::max() / 2)
+        return IndexError_Overflow;
+      bytes *= 2;  // Sort runs share this file's page table.
+    }
+    int ret = key_records_.init(bytes, 64 * 1024);
+    if (ret != 0) return ret;
+  } else {
+    keys_.reserve(count);
+  }
+  key_capacity_ = count;
+  keys_ready_ = true;
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_Runtime;
+}
+
+int IVFDumper::append_keys(const uint64_t *keys, size_t count) try {
+  if (!keys_ready_) return IndexError_NoReady;
+  if (count > key_capacity_ - key_count_) return IndexError_Overflow;
+  if (!paged_keys_) {
+    keys_.insert(keys_.end(), keys, keys + count);
+    key_count_ += count;
+    return 0;
+  }
+  constexpr size_t kBatch = 4096;
+  key_scratch_.resize(std::min(count, kBatch));
+  for (size_t begin = 0; begin < count;) {
+    const size_t n = std::min(kBatch, count - begin);
+    for (size_t i = 0; i < n; ++i) {
+      key_scratch_[i].key = keys[begin + i];
+      key_scratch_[i].id = static_cast<uint32_t>(key_count_ + begin + i);
+    }
+    int ret =
+        key_records_.write((key_count_ + begin) * sizeof(KeyOrderRecord),
+                           key_scratch_.data(), n * sizeof(KeyOrderRecord));
+    if (ret != 0) return ret;
+    begin += n;
+  }
+  key_count_ += count;
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_Runtime;
+}
+
+int IVFDumper::dump_key_column(bool mapping) const try {
+  constexpr size_t kBatch = 4096;
+  const size_t nmax = std::min(key_count_, kBatch);
+  std::vector<KeyOrderRecord> records(nmax);
+  std::vector<uint64_t> keys(mapping ? 0 : nmax);
+  std::vector<uint32_t> ids(mapping ? nmax : 0);
+  const size_t stride = mapping ? sizeof(uint32_t) : sizeof(uint64_t);
+  uint32_t crc = 0;
+  for (size_t begin = 0; begin < key_count_;) {
+    const size_t n = std::min(kBatch, key_count_ - begin);
+    int ret = key_records_.read(begin * sizeof(KeyOrderRecord), records.data(),
+                                n * sizeof(KeyOrderRecord));
+    if (ret != 0) return ret;
+    for (size_t i = 0; i < n; ++i) {
+      if (mapping)
+        ids[i] = records[i].id;
+      else
+        keys[i] = records[i].key;
+    }
+    const void *data = mapping ? static_cast<const void *>(ids.data())
+                               : static_cast<const void *>(keys.data());
+    if (dumper_->write(data, n * stride) != n * stride)
+      return IndexError_WriteData;
+    crc = ailego::Crc32c::Hash(data, n * stride, crc);
+    begin += n;
+  }
+  const size_t bytes = key_count_ * stride;
+  size_t padding = 0;
+  int ret = dump_padding(bytes, &padding);
+  if (ret != 0) return ret;
+  ret = dumper_->append(mapping ? IVF_MAPPING_SEG_ID : IVF_KEYS_SEG_ID, bytes,
+                        padding, crc);
+  if (ret == 0) dumped_size_ += bytes + padding;
+  return ret;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_WriteData;
+}
+
 int IVFDumper::dump_inverted_vector(uint32_t inverted_list_id, uint64_t key,
                                     const void *vec) {
+  if (!keys_ready_) return IndexError_NoReady;
+  if (header_.total_vector_count >= key_capacity_) return IndexError_Overflow;
   int ret = this->check_dump_inverted_list(inverted_list_id);
   ivf_check_error_code(ret);
 
@@ -34,6 +134,9 @@ int IVFDumper::dump_inverted_vector(uint32_t inverted_list_id, uint64_t key,
 int IVFDumper::dump_inverted_block(uint32_t inverted_list_id,
                                    const uint64_t *keys, const void *vecs,
                                    uint32_t vector_count, bool column_major) {
+  if (!keys_ready_) return IndexError_NoReady;
+  if (vector_count > key_capacity_ - header_.total_vector_count)
+    return IndexError_Overflow;
   int ret = this->check_dump_inverted_list(inverted_list_id);
   ivf_check_error_code(ret);
 
@@ -53,7 +156,8 @@ int IVFDumper::dump_inverted_block(uint32_t inverted_list_id,
         return IndexError_WriteData;
       }
     }
-    std::copy(keys, keys + vector_count, std::back_inserter(keys_));
+    ret = append_keys(keys, vector_count);
+    ivf_check_error_code(ret);
     ++inverted_lists_meta_[cur_list_id_].block_count;
     ++header_.block_count;
     header_.inverted_body_size += size + pd_size;
@@ -116,6 +220,7 @@ int IVFDumper::dump_container_segment(const IndexStorage::Pointer &container,
 }
 
 int IVFDumper::dump_inverted_vector_finished() {
+  if (!keys_ready_) return IndexError_NoReady;
   //! Dump Inverted Index Segment
   if (!block_.empty()) {
     int ret = this->dump_block();
@@ -170,18 +275,39 @@ int IVFDumper::dump_inverted_vector_finished() {
                            inverted_lists_meta_.data(), segment_size);
   ivf_check_error_code(ret);
 
-  //! Dump Keys Segment
-  ret = this->dump_segment(IVF_KEYS_SEG_ID, keys_.data(),
-                           keys_.size() * sizeof(keys_[0]));
-  ivf_check_error_code(ret);
-
-  //! Dump Mapping Segment
-  auto mapping = std::make_shared<std::vector<uint32_t>>();
-  IVFUtility::Sort(keys_.data(), mapping.get(), keys_.size());
-  ret = this->dump_segment(IVF_MAPPING_SEG_ID, mapping->data(),
-                           mapping->size() * sizeof(uint32_t));
-  ivf_check_error_code(ret);
-  mapping.reset();
+  if (paged_keys_) {
+    ret = dump_key_column(false);
+    ivf_check_error_code(ret);
+    if (!key_records_.paged()) {
+      ret = key_records_.truncate(key_count_ * sizeof(KeyOrderRecord));
+      ivf_check_error_code(ret);
+    }
+    ret = SortPagedRecords<KeyOrderRecord>(
+        &key_records_,
+        [](const auto &a, const auto &b) {
+          return a.key != b.key ? a.key < b.key : a.id < b.id;
+        },
+        key_records_.paged() ? key_count_ : std::numeric_limits<size_t>::max());
+    ivf_check_error_code(ret);
+    ret = dump_key_column(true);
+    ivf_check_error_code(ret);
+    key_records_ = PagedBuildBuffer();
+  } else {
+    ret = this->dump_segment(IVF_KEYS_SEG_ID, keys_.data(),
+                             keys_.size() * sizeof(keys_[0]));
+    ivf_check_error_code(ret);
+    // Keys have already been written. Only sorted ordinals are needed; do
+    // not reorder the keys or allocate a second, inverse permutation.
+    std::vector<uint32_t> mapping(keys_.size());
+    std::iota(mapping.begin(), mapping.end(), 0u);
+    std::sort(mapping.begin(), mapping.end(), [&](uint32_t a, uint32_t b) {
+      return keys_[a] != keys_[b] ? keys_[a] < keys_[b] : a < b;
+    });
+    ret = this->dump_segment(IVF_MAPPING_SEG_ID, mapping.data(),
+                             mapping.size() * sizeof(uint32_t));
+    ivf_check_error_code(ret);
+    std::vector<uint64_t>().swap(keys_);
+  }
 
   //! Dump the Offsets Segment
   return this->dump_offsets_segment();
@@ -192,6 +318,26 @@ int IVFDumper::dump_centroid_index(const void *data, size_t size) {
   ivf_check_error_code(ret);
 
   return 0;
+}
+
+int IVFDumper::dump_centroid_index(
+    size_t size, const std::function<int(size_t, void *, size_t)> &read) {
+  std::vector<uint8_t> scratch(std::min<size_t>(size, 64 * 1024));
+  uint32_t crc = 0;
+  for (size_t offset = 0; offset < size;) {
+    const size_t bytes = std::min(scratch.size(), size - offset);
+    int ret = read(offset, scratch.data(), bytes);
+    if (ret != 0) return ret;
+    if (dumper_->write(scratch.data(), bytes) != bytes)
+      return IndexError_WriteData;
+    crc = ailego::Crc32c::Hash(scratch.data(), bytes, crc);
+    offset += bytes;
+  }
+  size_t padding = 0;
+  int ret = dump_padding(size, &padding);
+  if (ret == 0) ret = dumper_->append(IVF_CENTROID_SEG_ID, size, padding, crc);
+  if (ret == 0) dumped_size_ += size + padding;
+  return ret;
 }
 
 int IVFDumper::dump_quantizer_params(
@@ -297,8 +443,18 @@ int IVFDumper::check_dump_inverted_list(uint32_t inverted_list_id) {
 int IVFDumper::dump_offsets_segment() const {
   bool col_pri = meta_.major_order() == IndexMeta::MajorOrder::MO_COLUMN;
   size_t total_size = 0;
+  constexpr size_t kBatch = 4096;
+  std::vector<InvertedVecLocation> offsets;
+  offsets.reserve(kBatch);
+  auto flush = [&]() -> int {
+    const size_t bytes = offsets.size() * sizeof(InvertedVecLocation);
+    if (bytes && dumper_->write(offsets.data(), bytes) != bytes)
+      return IndexError_WriteData;
+    total_size += bytes;
+    offsets.clear();
+    return 0;
+  };
   for (size_t i = 0; i < inverted_lists_meta_.size(); ++i) {
-    std::vector<InvertedVecLocation> offsets;
     const auto &m = inverted_lists_meta_[i];
     size_t vec_cnt = m.vector_count;
     size_t idx = 0;
@@ -310,6 +466,10 @@ int IVFDumper::dump_offsets_segment() const {
       } else {
         offsets.emplace_back(off + idx * block_.element_size(), false);
       }
+      if (offsets.size() == kBatch) {
+        int ret = flush();
+        if (ret != 0) return ret;
+      }
       ++idx;
       if (idx == block_vector_count_) {
         off += header_.block_size;
@@ -319,16 +479,10 @@ int IVFDumper::dump_offsets_segment() const {
     if (idx != 0) {
       off += (vec_cnt - align_idx) * meta_.element_size();
     }
-
-    size_t len = offsets.size() * sizeof(offsets[0]);
-    size_t actual_len = dumper_->write(offsets.data(), len);
-    if (actual_len != len) {
-      LOG_ERROR("Write offsets failed expect %zu, actual: %zu.", len,
-                actual_len);
-      return IndexError_WriteData;
-    }
-    total_size += len;
   }
+
+  int status = flush();
+  if (status != 0) return status;
 
   size_t padding_size = 0;
   int ret = this->dump_padding(total_size, &padding_size);
@@ -396,7 +550,8 @@ int IVFDumper::dump_block() {
     return IndexError_WriteData;
   }
   auto &keys = block_.keys();
-  std::copy(keys.begin(), keys.end(), std::back_inserter(keys_));
+  int ret = append_keys(keys.data(), keys.size());
+  ivf_check_error_code(ret);
   ++inverted_lists_meta_[cur_list_id_].block_count;
   ++header_.block_count;
   header_.inverted_body_size += size;

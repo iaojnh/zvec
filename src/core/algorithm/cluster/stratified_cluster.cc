@@ -11,18 +11,204 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <vector>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_cluster.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
+#include "utility/paged_build_buffer.h"
+#include "utility/vector_build_source.h"
 #include "cluster_params.h"
+#include "holder_cluster.h"
 
 namespace zvec {
 namespace core {
 
+namespace {
+
+// A slice of ordinal build input, optionally gathered through a pageable
+// permutation. Iterators own one source reader, never pointers into other
+// iterators' scratch or a pinned corpus.
+class StratifiedInput : public IndexHolder {
+ public:
+  StratifiedInput(IndexMeta meta, VectorBuildSource::Pointer source,
+                  std::shared_ptr<PagedBuildBuffer> order, size_t begin,
+                  size_t count)
+      : meta_(std::move(meta)),
+        source_(std::move(source)),
+        order_(std::move(order)),
+        begin_(begin),
+        count_(count) {}
+
+  size_t count() const override {
+    return count_;
+  }
+  size_t dimension() const override {
+    return meta_.dimension();
+  }
+  size_t element_size() const override {
+    return meta_.element_size();
+  }
+  IndexMeta::DataType data_type() const override {
+    return meta_.data_type();
+  }
+  bool multipass() const override {
+    return true;
+  }
+
+  Iterator::Pointer create_iterator() override {
+    class Cursor : public Iterator {
+     public:
+      Cursor(VectorBuildSource::Pointer source,
+             std::shared_ptr<PagedBuildBuffer> order, size_t begin,
+             size_t count)
+          : source_(std::move(source)),
+            order_(std::move(order)),
+            position_(begin),
+            end_(begin + count) {
+        status_ = source_->create_ordinal_reader(&reader_);
+        load();
+      }
+      const void *data() const override {
+        return data_;
+      }
+      uint64_t key() const override {
+        return key_;
+      }
+      bool is_valid() const override {
+        return status_ == 0 && position_ < end_;
+      }
+      int status() const override {
+        return status_;
+      }
+      void next() override {
+        if (is_valid()) ++position_;
+        load();
+      }
+
+     private:
+      void load() {
+        data_ = nullptr;
+        if (!is_valid()) return;
+        uint32_t id = static_cast<uint32_t>(position_);
+        if (order_)
+          status_ = order_->read(position_ * sizeof(id), &id, sizeof(id));
+        if (status_ == 0) status_ = reader_->read(id, &key_, &data_);
+        if (status_ == 0 && !data_) status_ = IndexError_ReadData;
+      }
+      VectorBuildSource::Pointer source_;
+      std::shared_ptr<PagedBuildBuffer> order_;
+      OrdinalAccessHolder::Reader::Pointer reader_;
+      size_t position_;
+      size_t end_;
+      uint64_t key_{0};
+      const void *data_{nullptr};
+      int status_{0};
+    };
+    return std::make_unique<Cursor>(source_, order_, begin_, count_);
+  }
+
+ private:
+  IndexMeta meta_;
+  VectorBuildSource::Pointer source_;
+  std::shared_ptr<PagedBuildBuffer> order_;
+  size_t begin_;
+  size_t count_;
+};
+
+// Use the selected cluster's existing label implementation (including custom
+// metrics and tie handling), but only mount a bounded batch. Stable partition
+// by ordinal replaces classify()'s corpus-sized lists of raw feature pointers.
+int PartitionStratifiedInput(const IndexMeta &meta,
+                             const VectorBuildSource::Pointer &source,
+                             const IndexCluster::Pointer &cluster,
+                             const IndexThreads::Pointer &threads,
+                             const IndexCluster::CentroidList &cents,
+                             PagedBuildBuffer *order,
+                             std::vector<size_t> *offsets) {
+  const size_t count = source->count();
+  if (count > std::numeric_limits<size_t>::max() / (2 * sizeof(uint32_t)))
+    return IndexError_Overflow;
+  // Labels and grouped ordinals share one backing file (and one writable
+  // page table/writeback workspace), rather than doubling fixed metadata.
+  const size_t order_offset = count * sizeof(uint32_t);
+  int ret = order->init(2 * order_offset);
+  if (ret != 0) return ret;
+  OrdinalAccessHolder::Reader::Pointer reader;
+  ret = source->create_ordinal_reader(&reader);
+  if (ret != 0) return ret;
+  const size_t batch_size = std::max<size_t>(
+      1, std::min<size_t>(1024, 256 * 1024 / meta.element_size()));
+  offsets->assign(cents.size() + 1, 0);
+  std::vector<uint32_t> ids;
+  for (size_t begin = 0; begin < count; begin += batch_size) {
+    const size_t n = std::min(batch_size, count - begin);
+    auto batch = std::make_shared<CompactIndexFeatures>(meta);
+    batch->reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      uint64_t key = 0;
+      const void *data = nullptr;
+      ret = reader->read(begin + i, &key, &data);
+      if (ret != 0) return ret;
+      if (!data) return IndexError_ReadData;
+      batch->emplace(data);
+    }
+    ret = cluster->mount(std::move(batch));
+    if (ret != 0) return ret;
+    ret = cluster->label(threads, cents, &ids);
+    if (ret != 0) return ret;
+    if (ids.size() != n) return IndexError_InvalidLength;
+    for (const auto id : ids) {
+      if (id >= cents.size()) return IndexError_OutOfRange;
+      ++(*offsets)[id + 1];
+    }
+    ret = order->write(begin * sizeof(uint32_t), ids.data(),
+                       n * sizeof(uint32_t));
+    if (ret != 0) return ret;
+  }
+  // Release the final mounted batch before second-level training starts.
+  ret = cluster->reset();
+  if (ret != 0) return ret;
+  reader.reset();
+  for (size_t i = 1; i < offsets->size(); ++i)
+    (*offsets)[i] += (*offsets)[i - 1];
+  auto positions = *offsets;
+  for (size_t begin = 0; begin < count; begin += batch_size) {
+    const size_t n = std::min(batch_size, count - begin);
+    ids.resize(n);
+    ret =
+        order->read(begin * sizeof(uint32_t), ids.data(), n * sizeof(uint32_t));
+    if (ret != 0) return ret;
+    for (size_t i = 0; i < n; ++i) {
+      const uint32_t ordinal = static_cast<uint32_t>(begin + i);
+      ret = order->write(order_offset + positions[ids[i]]++ * sizeof(ordinal),
+                         &ordinal, sizeof(ordinal));
+      if (ret != 0) return ret;
+    }
+  }
+  // Drop labels, compacting the completed permutation into the same file.
+  for (size_t begin = 0; begin < count; begin += batch_size) {
+    const size_t n = std::min(batch_size, count - begin);
+    ids.resize(n);
+    ret = order->read(order_offset + begin * sizeof(uint32_t), ids.data(),
+                      n * sizeof(uint32_t));
+    if (ret == 0)
+      ret = order->write(begin * sizeof(uint32_t), ids.data(),
+                         n * sizeof(uint32_t));
+    if (ret != 0) return ret;
+  }
+  return order->truncate(order_offset);
+}
+
+}  // namespace
+
 /*! Stratified Cluster
  */
-class StratifiedCluster : public IndexCluster {
+class StratifiedCluster : public IndexCluster, public HolderCluster {
  public:
   //! Constructor
   StratifiedCluster() = default;
@@ -76,6 +262,9 @@ class StratifiedCluster : public IndexCluster {
   int cluster(IndexThreads::Pointer threads,
               IndexCluster::CentroidList &cents) override;
 
+  int cluster_holder(IndexThreads::Pointer threads, IndexHolder::Pointer holder,
+                     IndexCluster::CentroidList &cents) override;
+
   //! Classify
   int classify(IndexThreads::Pointer threads,
                IndexCluster::CentroidList &cents) override;
@@ -128,6 +317,103 @@ class StratifiedCluster : public IndexCluster {
   // TODO: Maybe optimize later
   uint32_t second_threads_count_{10u};  // todo
 };
+
+int StratifiedCluster::cluster_holder(IndexThreads::Pointer threads,
+                                      IndexHolder::Pointer holder,
+                                      IndexCluster::CentroidList &cents) try {
+  if (!holder || !holder->count() || !meta_.element_size())
+    return IndexError_InvalidArgument;
+  if (!holder->is_matched(meta_) || !check_centroids(cents))
+    return IndexError_Mismatch;
+  // Keep the legacy path without a pool, and reject unsupported capabilities
+  // before touching the input. A later I/O/budget error must not retry on heap.
+  if (ailego::MemoryLimitPool::get_instance().capacity() == 0 ||
+      holder->count() > std::numeric_limits<uint32_t>::max())
+    return IndexError_NotImplemented;
+  auto first = IndexFactory::CreateCluster(first_cluster_class_);
+  auto second = IndexFactory::CreateCluster(second_cluster_class_);
+  if (!first || !second) return IndexError_NoExist;
+  auto *first_holder = dynamic_cast<HolderCluster *>(first.get());
+  auto *second_holder = dynamic_cast<HolderCluster *>(second.get());
+  if (!first_holder || !second_holder) return IndexError_NotImplemented;
+  auto init_child = [&](const IndexCluster::Pointer &child,
+                        ailego::Params params) {
+    if (params.get_as_string(OPTKMEANS_CLUSTER_BUFFERED_STORAGE_PATH).empty()) {
+      std::string prefix;
+      int ret =
+          TemporaryBufferStorage::DefaultPrefix("zvec-stratified", &prefix);
+      if (ret != 0) return ret;
+      params.set(OPTKMEANS_CLUSTER_BUFFERED_STORAGE_PATH, prefix);
+    }
+    return child->init(meta_, params);
+  };
+  int ret = init_child(first, first_cluster_params_);
+  if (ret != 0) return ret;
+  ret = init_child(second, second_cluster_params_);
+  if (ret != 0) return ret;
+  if (!threads)
+    threads = std::make_shared<SingleQueueIndexThreads>(thread_count_, false);
+  auto output =
+      centroid_storage_ ? centroid_storage_ : PagedCentroids::Create();
+  first_holder->set_centroid_storage(output);
+  second_holder->set_centroid_storage(output);
+  VectorBuildSource::Pointer source;
+  ret = VectorBuildSource::Create(std::move(holder), &source);
+  if (ret != 0) return ret;
+  auto input = std::make_shared<StratifiedInput>(meta_, source, nullptr, 0,
+                                                 source->count());
+  CentroidList candidate = cents;
+  if (first_cluster_count_) first->suggest(first_cluster_count_);
+  ret = first_holder->cluster_holder(threads, input, candidate);
+  // The source has already been consumed/spooled: do not signal safe fallback.
+  if (ret != 0)
+    return ret == IndexError_NotImplemented ? IndexError_Unsupported : ret;
+  if (candidate.empty()) return IndexError_InvalidArgument;
+  auto order = std::make_shared<PagedBuildBuffer>();
+  std::vector<size_t> offsets;
+  ret = PartitionStratifiedInput(meta_, source, first, threads, candidate,
+                                 order.get(), &offsets);
+  if (ret != 0)
+    return ret == IndexError_NotImplemented ? IndexError_Unsupported : ret;
+  first.reset();
+  const size_t total_clusters =
+      cluster_count_
+          ? cluster_count_
+          : candidate.size() * static_cast<size_t>(second_cluster_count_);
+  if (total_clusters > std::numeric_limits<uint32_t>::max())
+    return IndexError_Overflow;
+  // Reuse the caller's workers, with only one second-level training matrix
+  // live at a time. Do not build per-bucket thread pools or mounted copies.
+  for (size_t i = 0; i < candidate.size(); ++i) {
+    auto &centroid = candidate[i];
+    centroid.set_similars(std::vector<const void *>{});
+    const size_t n = offsets[i + 1] - offsets[i];
+    if (n == 0) continue;
+    ret = second->reset();
+    if (ret != 0) return ret;
+    if (auto_tuning_) {
+      if (total_clusters) {
+        const double factor = static_cast<double>(n) / source->count();
+        second->suggest(std::max(
+            static_cast<uint32_t>(std::floor(total_clusters * factor)), 1u));
+      }
+    } else if (second_cluster_count_) {
+      second->suggest(second_cluster_count_);
+    }
+    auto subset =
+        std::make_shared<StratifiedInput>(meta_, source, order, offsets[i], n);
+    ret = second_holder->cluster_holder(threads, std::move(subset),
+                                        *centroid.mutable_subitems());
+    if (ret != 0)
+      return ret == IndexError_NotImplemented ? IndexError_Unsupported : ret;
+  }
+  cents = std::move(candidate);
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_Runtime;
+}
 
 int StratifiedCluster::cluster(IndexThreads::Pointer threads,
                                IndexCluster::CentroidList &cents) {

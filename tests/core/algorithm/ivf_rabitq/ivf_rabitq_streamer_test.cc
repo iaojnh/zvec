@@ -1120,6 +1120,78 @@ TEST_F(IvfRabitqStreamerTest, TestSearchByPrimaryKeys) {
   }
 }
 
+TEST_F(IvfRabitqStreamerTest, KeyBatchesPreserveResultsAndInput) {
+  auto holder = BuildHolder(kDim, 256);
+  ailego::Params params;
+  params.set(PARAM_IVF_RABITQ_NLIST, 16U);
+  params.set(PARAM_RABITQ_TOTAL_BITS, 1U);
+  IndexStreamer::Pointer streamer;
+  BuildAndOpenStreamer(*index_meta_ptr_, holder, params,
+                       dir_ + "/KeyBatchesPreserveResultsAndInput", &streamer);
+  ASSERT_NE(nullptr, streamer);
+  NumericalVector<float> query(kDim);
+  FillTestVector(37, &query);
+  IndexQueryMeta qmeta(IndexMeta::DT_FP32, kDim);
+  // Cross three batches with valid keys, missing keys and duplicates.
+  const std::vector<uint64_t> compact{3, 37, 90, 4, 38, 91, 5, 36, 92, 37};
+  std::vector<uint64_t> keys(10003, 99999);
+  for (size_t i = 0; i < compact.size(); ++i) keys[i * 1100] = compact[i];
+  const auto original = keys;
+  auto compare = [](const IndexDocumentList &a, const IndexDocumentList &b) {
+    ASSERT_EQ(a.size(), b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+      EXPECT_EQ(a[i].key(), b[i].key());
+      EXPECT_FLOAT_EQ(a[i].score(), b[i].score());
+    }
+  };
+  for (bool grouped : {false, true}) {
+    for (bool filtered : {false, true}) {
+      for (bool radius : {false, true}) {
+        auto reference = streamer->create_context();
+        auto context = streamer->create_context();
+        for (auto *ctx : {reference.get(), context.get()}) {
+          ctx->set_topk(5);
+          if (filtered) ctx->set_filter([](uint64_t key) { return key == 37; });
+          if (radius) ctx->set_threshold(0.5f);
+          if (grouped) {
+            ctx->set_group_by(
+                [](uint64_t key) { return std::to_string(key % 3); });
+            ctx->set_group_params(3, 2);
+          }
+        }
+        ASSERT_EQ(0, streamer->search_bf_by_keys_impl(query.data(), compact,
+                                                      qmeta, reference));
+        for (bool batched_api : {false, true}) {
+          if (batched_api)
+            ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(
+                             query.data(), {keys}, qmeta, 1, context));
+          else
+            ASSERT_EQ(0, streamer->search_bf_by_keys_impl(query.data(), keys,
+                                                          qmeta, context));
+          if (grouped) {
+            const auto &a = reference->group_result(0);
+            const auto &b = context->group_result(0);
+            ASSERT_EQ(a.size(), b.size());
+            for (size_t i = 0; i < a.size(); ++i) {
+              EXPECT_EQ(a[i].group_id(), b[i].group_id());
+              compare(a[i].docs(), b[i].docs());
+            }
+          } else {
+            compare(reference->result(0), context->result(0));
+          }
+        }
+        EXPECT_EQ(original, keys);
+        ASSERT_EQ(0, streamer->search_bf_by_keys_impl(query.data(), {}, qmeta,
+                                                      context));
+        if (grouped)
+          EXPECT_TRUE(context->group_result(0).empty());
+        else
+          EXPECT_TRUE(context->result(0).empty());
+      }
+    }
+  }
+}
+
 TEST_F(IvfRabitqStreamerTest, TestGroupBySearchByPrimaryKeys) {
   constexpr size_t kDocCount = 256;
   auto holder = BuildHolder(kDim, kDocCount);

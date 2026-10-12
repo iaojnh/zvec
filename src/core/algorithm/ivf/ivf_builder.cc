@@ -16,6 +16,7 @@
 #include <limits>
 #include <ailego/pattern/defer.h>
 #include <zvec/ailego/utility/string_helper.h>
+#include "algorithm/cluster/centroid_trainer.h"
 #include "algorithm/cluster/cluster_params.h"
 #include "ivf_dumper.h"
 
@@ -211,6 +212,7 @@ int IVFBuilder::cleanup() {
   label_offsets_.clear();
   paged_labels_ = false;
   centroid_index_.reset();
+  searcher_centroid_index_.reset();
   holder_.reset();
   source_reader_.reset();
   source_holder_.reset();
@@ -305,12 +307,32 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
     return IndexError_InvalidArgument;
   }
 
-  IndexCluster::CentroidList centroid_list;
-  IndexBundle::Pointer boundle = trainer->indexes();
-  int ret = IndexCluster::Deserialize(trainer->meta(), boundle, &centroid_list);
-  ivf_check_with_msg(ret, "Failed to deserialize index");
-
   const IndexMeta &meta = trainer->meta();
+  IndexCluster::CentroidList owned_centroids;
+  const IndexCluster::CentroidList *centroid_list = &owned_centroids;
+  int ret = 0;
+  if (const auto *source =
+          dynamic_cast<const CentroidTrainer *>(trainer.get())) {
+    // Both coarse indexes finish consuming the borrowed tree in this call.
+    // Do not retain it: the caller may immediately clean up the trainer.
+    centroid_list = &source->centroids();
+    if (centroid_list->empty()) {
+      return IndexError_InvalidFormat;
+    }
+    // Preserve the recursive feature-size check normally done by Serialize.
+    for (const auto &centroid : *centroid_list) {
+      if (!centroid.is_matched(meta)) {
+        return IndexError_Mismatch;
+      }
+    }
+  } else {
+    // Third-party/legacy trainers still use the serialized interface. Release
+    // the bundle before building the coarse index to reduce peak overlap.
+    auto bundle = trainer->indexes();
+    ret = IndexCluster::Deserialize(meta, bundle, &owned_centroids);
+    ivf_check_with_msg(ret, "Failed to deserialize index");
+  }
+
   if (meta.data_type() != converted_meta_.data_type() ||
       meta.metric_name().compare(converted_meta_.metric_name()) != 0 ||
       meta.element_size() != converted_meta_.element_size()) {
@@ -333,7 +355,7 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
   ret = centroid_index_->init(converted_meta_, params_);
   ivf_check_error_code(ret);
 
-  ret = centroid_index_->build(centroid_list);
+  ret = centroid_index_->build(*centroid_list);
   ivf_check_with_msg(ret, "Failed to build centroid index");
 
   if (params_.has(PARAM_IVF_BUILDER_OPTIMIZER_QUANTIZER_CLASS)) {
@@ -350,7 +372,7 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
     ret = searcher_centroid_index_->init(converted_meta_, params_);
     ivf_check_error_code(ret);
 
-    ret = searcher_centroid_index_->build(centroid_list);
+    ret = searcher_centroid_index_->build(*centroid_list);
     ivf_check_with_msg(ret, "Failed to build centroid index");
   }
 
@@ -843,8 +865,8 @@ int IVFBuilder::read_vector(size_t id, uint64_t *key, const void **data) {
   if (source_reader_) {
     return source_reader_->read(id, key, data);
   }
-  *key = holder_->key(id);
-  return holder_->read_element(id, &read_buffer_, data);
+  int ret = holder_->read_key(id, key);
+  return ret == 0 ? holder_->read_element(id, &read_buffer_, data) : ret;
 }
 
 int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
@@ -863,6 +885,9 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
     LOG_ERROR("Alloc IVFDumper failed");
     return IndexError_NoMemory;
   }
+
+  ret = ivf_dumper->reserve_keys(stats_.built_count());
+  ivf_check_error_code(ret);
 
   //! Dump inverted vectors
   PagedBuildBuffer dumped_ids;
@@ -916,7 +941,10 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
           ivf_check_error_code(ret);
           ++dumped_count;
         }
-        ret = ivf_dumper->dump_inverted_vector(i, holder_->key(id), data);
+        uint64_t key = std::numeric_limits<uint64_t>::max();
+        ret = holder_->read_key(id, &key);
+        ivf_check_error_code(ret);
+        ret = ivf_dumper->dump_inverted_vector(i, key, data);
         ivf_check_error_code(ret);
       }
       if (iter->status() != 0) {
@@ -933,8 +961,10 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
 
   auto centroid_index =
       searcher_centroid_index_ ? searcher_centroid_index_ : centroid_index_;
-  ret = ivf_dumper->dump_centroid_index(centroid_index->data(),
-                                        centroid_index->size());
+  ret = ivf_dumper->dump_centroid_index(
+      centroid_index->size(), [&](size_t offset, void *out, size_t bytes) {
+        return centroid_index->read_dump(offset, out, bytes);
+      });
   ivf_check_with_msg(ret, "Failed to dump CentroidIndex");
 
   if (store_original_features_) {

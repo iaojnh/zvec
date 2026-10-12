@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <numeric>
 #include <unordered_map>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 
 namespace zvec {
 
@@ -43,6 +44,7 @@ bool HasRevertedValues(const std::vector<std::vector<std::string>> &values) {
   });
 }
 
+
 struct ResultDoc {
   core::IndexDocument doc;
   // Keep fetched/reverted payloads attached to the doc while sorting and
@@ -51,11 +53,36 @@ struct ResultDoc {
   std::string reverted_sparse_values;
 };
 
+using ResultDocs = std::vector<ResultDoc, ailego::BudgetedAllocator<ResultDoc>>;
+
+size_t PayloadBytes(const ResultDoc &doc) {
+  return (doc.reverted_vector.empty() ? 0
+                                      : doc.reverted_vector.capacity() + 1) +
+         (doc.reverted_sparse_values.empty()
+              ? 0
+              : doc.reverted_sparse_values.capacity() + 1);
+}
+
+void TrimDocs(ResultDocs &docs, MetricType metric, size_t topk,
+              size_t *payload_bytes) {
+  const auto better = [metric](const ResultDoc &a, const ResultDoc &b) {
+    if (a.doc.score() == b.doc.score()) return a.doc.key() < b.doc.key();
+    return IsBetterScore(metric, a.doc.score(), b.doc.score());
+  };
+  const size_t keep = std::min(topk, docs.size());
+  std::partial_sort(docs.begin(), docs.begin() + keep, docs.end(), better);
+  for (size_t i = keep; i < docs.size(); ++i)
+    *payload_bytes -= PayloadBytes(docs[i]);
+  docs.resize(keep);
+}
+
 class VectorResultAccumulator {
  public:
   // Collect plain topk results from each block after translating block-local
   // doc IDs back to segment-level IDs.
-  void add_block(uint32_t block_offset, VectorIndexResults *results) {
+  void add_block(uint32_t block_offset, VectorIndexResults *results,
+                 MetricType metric, uint32_t topk) {
+    reverted_memory_.absorb(results->take_reverted_memory());
     auto &docs = results->docs();
     auto &reverted_vectors = results->reverted_vector_list();
     auto &reverted_sparse_values = results->reverted_sparse_values_list();
@@ -73,8 +100,13 @@ class VectorResultAccumulator {
         result_doc.reverted_sparse_values =
             std::move(reverted_sparse_values[i]);
       }
+      payload_bytes_ += PayloadBytes(result_doc);
       docs_.emplace_back(std::move(result_doc));
     }
+    TrimDocs(docs_, metric, topk, &payload_bytes_);
+    std::vector<std::string>().swap(reverted_vectors);
+    std::vector<std::string>().swap(reverted_sparse_values);
+    reverted_memory_.retain_at_most(payload_bytes_);
   }
 
   IndexResults::Ptr finish(bool is_sparse, MetricType metric_type,
@@ -83,15 +115,10 @@ class VectorResultAccumulator {
     // rank all docs globally, keep topk, then split ResultDoc back into the
     // doc list and optional reverted payload lists expected by
     // VectorIndexResults.
-    std::sort(docs_.begin(), docs_.end(),
-              [metric_type](const ResultDoc &lhs, const ResultDoc &rhs) {
-                return IsBetterScore(metric_type, lhs.doc.score(),
-                                     rhs.doc.score());
-              });
-    if (docs_.size() > topk) {
-      docs_.resize(topk);
-    }
+    TrimDocs(docs_, metric_type, topk, &payload_bytes_);
 
+    reverted_memory_.add_array(
+        docs_.size(), sizeof(core::IndexDocument) + 2 * sizeof(std::string));
     core::IndexDocumentList doc_list;
     std::vector<std::string> reverted_vector_list;
     std::vector<std::string> reverted_sparse_values_list;
@@ -112,26 +139,31 @@ class VectorResultAccumulator {
       reverted_sparse_values_list.clear();
     }
 
+    ResultDocs().swap(docs_);
     return std::make_unique<VectorIndexResults>(
         is_sparse, std::move(doc_list), std::move(reverted_vector_list),
-        std::move(reverted_sparse_values_list));
+        std::move(reverted_sparse_values_list), std::move(reverted_memory_));
   }
 
  private:
-  std::vector<ResultDoc> docs_;
+  ailego::MemoryReservation reverted_memory_;
+  ResultDocs docs_;
+  size_t payload_bytes_{0};
 };
 
 class GroupResultAccumulator {
  private:
   struct GroupResult {
-    std::string group_id;
-    std::vector<ResultDoc> docs;
+    const std::string *group_id;
+    ResultDocs docs;
   };
 
  public:
   // Merge same-named groups across blocks. The per-doc payload stays inside
   // ResultDoc until the final GroupVectorIndexResults is materialized.
-  void add_block(uint32_t block_offset, GroupVectorIndexResults *results) {
+  void add_block(uint32_t block_offset, GroupVectorIndexResults *results,
+                 MetricType metric, uint32_t group_topk) {
+    reverted_memory_.absorb(results->take_reverted_memory());
     auto &groups = results->groups();
     auto &reverted_vectors = results->reverted_vector_list();
     auto &reverted_sparse_values = results->reverted_sparse_values_list();
@@ -139,7 +171,12 @@ class GroupResultAccumulator {
     for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
       auto &group = groups[group_idx];
       auto *docs = group.mutable_docs();
-      auto &merged_docs = docs_by_group_[group.group_id()];
+      auto found = docs_by_group_.find(group.group_id());
+      if (found == docs_by_group_.end()) {
+        group_keys_memory_.add_array(group.group_id().size() + 1, 2);
+        found = docs_by_group_.try_emplace(group.group_id()).first;
+      }
+      auto &merged_docs = found->second;
       merged_docs.reserve(merged_docs.size() + docs->size());
 
       for (size_t doc_idx = 0; doc_idx < docs->size(); ++doc_idx) {
@@ -157,9 +194,17 @@ class GroupResultAccumulator {
           result_doc.reverted_sparse_values =
               std::move(reverted_sparse_values[group_idx][doc_idx]);
         }
+        payload_bytes_ += PayloadBytes(result_doc);
         merged_docs.emplace_back(std::move(result_doc));
       }
+      // Keep each group's earlier candidates: a group can re-enter the final
+      // group_count after a better result arrives in a later block.
+      if (group_topk)
+        TrimDocs(merged_docs, metric, group_topk, &payload_bytes_);
     }
+    std::vector<std::vector<std::string>>().swap(reverted_vectors);
+    std::vector<std::vector<std::string>>().swap(reverted_sparse_values);
+    reverted_memory_.retain_at_most(payload_bytes_);
   }
 
   bool empty() const {
@@ -171,22 +216,16 @@ class GroupResultAccumulator {
     // Finish first ranks docs inside each merged group and trims group_topk.
     // It then ranks groups by their best remaining doc, trims group_count, and
     // finally expands ResultDoc back into GroupVectorIndexResults payloads.
-    std::vector<GroupResult> groups;
+    std::vector<GroupResult, ailego::BudgetedAllocator<GroupResult>> groups;
     groups.reserve(docs_by_group_.size());
 
     for (auto &[group_id, docs] : docs_by_group_) {
       if (docs.empty()) {
         continue;
       }
-      std::sort(docs.begin(), docs.end(),
-                [metric_type](const ResultDoc &lhs, const ResultDoc &rhs) {
-                  return IsBetterScore(metric_type, lhs.doc.score(),
-                                       rhs.doc.score());
-                });
-      if (group_topk > 0 && docs.size() > group_topk) {
-        docs.resize(group_topk);
-      }
-      groups.emplace_back(GroupResult{group_id, std::move(docs)});
+      TrimDocs(docs, metric_type, group_topk ? group_topk : docs.size(),
+               &payload_bytes_);
+      groups.emplace_back(GroupResult{&group_id, std::move(docs)});
     }
 
     std::sort(groups.begin(), groups.end(),
@@ -197,7 +236,7 @@ class GroupResultAccumulator {
                 const float lhs_score = lhs.docs[0].doc.score();
                 const float rhs_score = rhs.docs[0].doc.score();
                 if (lhs_score == rhs_score) {
-                  return lhs.group_id < rhs.group_id;
+                  return *lhs.group_id < *rhs.group_id;
                 }
                 return IsBetterScore(metric_type, lhs_score, rhs_score);
               });
@@ -205,6 +244,20 @@ class GroupResultAccumulator {
       groups.resize(group_count);
     }
 
+    size_t retained_payload = 0;
+    for (const auto &group : groups)
+      for (const auto &doc : group.docs) retained_payload += PayloadBytes(doc);
+    reverted_memory_.retain_at_most(retained_payload);
+
+    reverted_memory_.add_array(groups.size(),
+                               sizeof(core::GroupIndexDocument) +
+                                   2 * sizeof(std::vector<std::string>));
+    for (const auto &group : groups) {
+      reverted_memory_.add_array(
+          group.docs.size(),
+          sizeof(core::IndexDocument) + 2 * sizeof(std::string));
+      reverted_memory_.add_array(group.group_id->size() + 1, 2);
+    }
     core::IndexGroupDocumentList group_list;
     std::vector<std::vector<std::string>> reverted_vector_list;
     std::vector<std::vector<std::string>> reverted_sparse_values_list;
@@ -214,7 +267,7 @@ class GroupResultAccumulator {
 
     for (auto &group : groups) {
       core::GroupIndexDocument group_doc;
-      group_doc.set_group_id(group.group_id);
+      group_doc.set_group_id(*group.group_id);
       auto *docs = group_doc.mutable_docs();
       docs->reserve(group.docs.size());
 
@@ -242,13 +295,22 @@ class GroupResultAccumulator {
       reverted_sparse_values_list.clear();
     }
 
+    decltype(groups)().swap(groups);
+    docs_by_group_.clear();
     return std::make_unique<GroupVectorIndexResults>(
         std::move(group_list), std::move(reverted_vector_list),
-        std::move(reverted_sparse_values_list));
+        std::move(reverted_sparse_values_list), std::move(reverted_memory_));
   }
 
  private:
-  std::unordered_map<std::string, std::vector<ResultDoc>> docs_by_group_;
+  ailego::MemoryReservation reverted_memory_;
+  ailego::MemoryReservation group_keys_memory_;
+  std::unordered_map<
+      std::string, ResultDocs, std::hash<std::string>,
+      std::equal_to<std::string>,
+      ailego::BudgetedAllocator<std::pair<const std::string, ResultDocs>>>
+      docs_by_group_;
+  size_t payload_bytes_{0};
 };
 
 }  // namespace
@@ -288,40 +350,36 @@ CombinedVectorColumnIndexer::CombinedVectorColumnIndexer(
 
 Result<IndexResults::Ptr> CombinedVectorColumnIndexer::search(
     const vector_column_params::VectorData &vector_data,
-    const vector_column_params::QueryParams &query_params) {
+    const vector_column_params::QueryParams &query_params) try {
   // Search runs each block with block-local query params, then folds those
   // partial results into one segment-level result. The accumulators keep doc
-  // IDs and fetched/reverted payloads aligned while final sorting and
-  // truncation are deferred until every block has been searched.
+  // IDs and fetched/reverted payloads aligned, pruning after each block.
   VectorResultAccumulator vector_results;
   GroupResultAccumulator group_results;
 
-  // query_params.bf_pks is segment level, here we need to convert it to block
-  // level
-  std::vector<std::vector<uint64_t>> block_bf_pks(indexers_.size());
-
-  if (!query_params.bf_pks.empty()) {
-    // dispatcher pks to corresponding block_bf_pks
-    for (auto &pk : query_params.bf_pks[0]) {
-      for (size_t i = 0; i < block_offsets_.size(); ++i) {
-        if (pk >= block_offsets_[i] &&
-            pk < block_offsets_[i] + blocks_[i].doc_count_) {
-          block_bf_pks[i].push_back(
-              static_cast<uint64_t>(pk - block_offsets_[i]));
-          break;
-        }
-      }
-    }
-  }
+  if (query_params.bf_pks.size() > 1)
+    return tl::make_unexpected(Status::InvalidArgument("Multiple key lists"));
+  const auto *keys = query_params.bf_pks_view;
+  if (!keys && !query_params.bf_pks.empty()) keys = &query_params.bf_pks[0];
 
   auto q_params = query_params.query_params;
   for (size_t i = 0; i < indexers_.size(); ++i) {
-    if (!query_params.bf_pks.empty() && block_bf_pks[i].empty()) {
-      LOG_DEBUG(
-          "query_params has bf_pks, but block_bf_pks[%zu] is empty, just skip "
-          "this indexer",
-          i);
-      continue;
+    // Translate just this block. No all-block copy and no copies at either
+    // subsequent synchronous handoff. Preserve the caller's key order.
+    ailego::MemoryReservation keys_memory;
+    std::vector<uint64_t> block_keys;
+    if (keys) {
+      const uint64_t begin = block_offsets_[i];
+      const uint64_t end = begin + blocks_[i].doc_count_;
+      const auto belongs = [begin, end](uint64_t key) {
+        return key >= begin && key < end;
+      };
+      const size_t n = std::count_if(keys->begin(), keys->end(), belongs);
+      if (!n) continue;
+      keys_memory.add_array(n, sizeof(uint64_t));
+      block_keys.reserve(n);
+      for (uint64_t key : *keys)
+        if (belongs(key)) block_keys.push_back(key - begin);
     }
     zvec::Result<zvec::IndexResults::Ptr> result{nullptr};
     float scale_factor{};
@@ -377,9 +435,7 @@ Result<IndexResults::Ptr> CombinedVectorColumnIndexer::search(
                     : nullptr,
         query_params.extra_params};
 
-    if (!query_params.bf_pks.empty()) {
-      modified_query_params.bf_pks.emplace_back(block_bf_pks[i]);
-    }
+    if (keys) modified_query_params.bf_pks_view = &block_keys;
 
     result = indexers_[i]->search(vector_data, modified_query_params);
     if (!result) {
@@ -391,14 +447,17 @@ Result<IndexResults::Ptr> CombinedVectorColumnIndexer::search(
     GroupVectorIndexResults *group_index_results =
         dynamic_cast<GroupVectorIndexResults *>(index_results.get());
     if (group_index_results != nullptr) {
-      group_results.add_block(block_offsets_[i], group_index_results);
+      group_results.add_block(
+          block_offsets_[i], group_index_results, metric_type_,
+          query_params.group_by ? query_params.group_by->group_topk : 0);
       continue;
     }
 
     VectorIndexResults *vector_index_results =
         dynamic_cast<VectorIndexResults *>(index_results.get());
     if (vector_index_results != nullptr) {
-      vector_results.add_block(block_offsets_[i], vector_index_results);
+      vector_results.add_block(block_offsets_[i], vector_index_results,
+                               metric_type_, query_params.topk);
     }
   }
 
@@ -411,6 +470,9 @@ Result<IndexResults::Ptr> CombinedVectorColumnIndexer::search(
   }
   return vector_results.finish(field_schema_.is_sparse_vector(), metric_type_,
                                query_params.topk);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Vector result workspace exceeds budget"));
 }
 
 Result<vector_column_params::VectorDataBuffer>

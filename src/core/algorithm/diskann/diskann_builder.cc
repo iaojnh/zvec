@@ -145,9 +145,6 @@ int DiskAnnBuilder::init(const IndexMeta &meta, const ailego::Params &params) {
     if (ret != 0) return ret;
   }
 
-  algo_ =
-      DiskAnnAlgorithm::UPointer(new DiskAnnAlgorithm(entity_, max_degree_));
-
   state_ = BUILD_STATE_INITED;
 
   return 0;
@@ -438,18 +435,11 @@ int DiskAnnBuilder::train_quantized_data(IndexThreads::Pointer /*threads*/) {
     return ret;
   }
 
-  std::string &quantizer_meta_buffer = entity_.pq_quantizer_meta_buffer();
-  ret = quantizer_->serialize(&quantizer_meta_buffer);
-  if (ret != 0) {
-    LOG_ERROR("PqInt8Quantizer serialize failed, ret=%d", ret);
-    return ret;
-  }
+  entity_.set_pq_quantizer(quantizer_);
 
   size_t pq_time = timer.milli_seconds();
   LOG_INFO("Train Quantized Data Done, time: %zu ms", pq_time);
 
-  (*entity_.mutable_pq_meta()).quantizer_meta_buffer_size =
-      quantizer_meta_buffer.size();
   (*entity_.mutable_pq_meta()).chunk_num = pq_chunk_num_;
 
   return 0;
@@ -484,13 +474,10 @@ int DiskAnnBuilder::generate_quantized_data(IndexThreads::Pointer threads) {
   if (elem_size == 0) return IndexError_InvalidArgument;
   const size_t thread_count =
       threads ? std::max<size_t>(1, threads->count()) : 1;
-  constexpr size_t kEncodeMemoryBudget = 4u * 1024u * 1024u;
-  const size_t batch_size =
-      std::min(num_vecs, std::max<size_t>(1, kEncodeMemoryBudget / elem_size));
-  std::vector<uint8_t> block(batch_size * elem_size);
-  // The encoded output is bounded by this batch, even for buffered builds
-  // whose complete PQ array is larger than the shared cache.
-  std::vector<uint8_t> block_codes(batch_size * pq_chunk_num_);
+  DiskAnnEncodeBuffer buffer;
+  ret = buffer.init(num_vecs, elem_size, pq_chunk_num_);
+  if (ret != 0) return ret;
+  const size_t batch_size = buffer.rows();
 
   size_t id = 0;
   while (id < num_vecs) {
@@ -501,7 +488,7 @@ int DiskAnnBuilder::generate_quantized_data(IndexThreads::Pointer threads) {
       const void *data = iter->data();
       if (!data || !iter->is_valid()) return IndexError_ReadData;
       if (iter->key() != entity_.get_key(id + cur)) return IndexError_Mismatch;
-      std::memcpy(block.data() + cur * elem_size, data, elem_size);
+      std::memcpy(buffer.input() + cur * elem_size, data, elem_size);
     }
     if (cur == 0) {
       break;
@@ -522,15 +509,15 @@ int DiskAnnBuilder::generate_quantized_data(IndexThreads::Pointer threads) {
         }
         task_group->submit(
             ailego::Closure::New(this, &DiskAnnBuilder::encode_pq_batch,
-                                 static_cast<const uint8_t *>(block.data()),
-                                 block_codes.data(), begin, end));
+                                 static_cast<const uint8_t *>(buffer.input()),
+                                 buffer.codes(), begin, end));
       }
       task_group->wait_finish();
     } else {
-      encode_pq_batch(block.data(), block_codes.data(), 0, cur);
+      encode_pq_batch(buffer.input(), buffer.codes(), 0, cur);
     }
 
-    ret = entity_.append_codes(block_codes.data(), cur * pq_chunk_num_);
+    ret = entity_.append_codes(buffer.codes(), cur * pq_chunk_num_);
     if (ret != 0) return ret;
 
     id += cur;
@@ -733,7 +720,7 @@ int DiskAnnBuilder::do_norm(const void *data_ptr, std::string *norm_data) {
 }
 
 int DiskAnnBuilder::build(IndexThreads::Pointer threads,
-                          IndexHolder::Pointer holder) {
+                          IndexHolder::Pointer holder) try {
   if (state_ != BUILD_STATE_TRAINED) {
     LOG_ERROR("Train the builder before DiskAnnBuilder::build");
     return IndexError_NoReady;
@@ -800,6 +787,9 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   }
 
   LOG_INFO("Start to build vamana graph");
+  algo_ = std::make_unique<DiskAnnAlgorithm>(entity_, max_degree_,
+                                             threads->count());
+  AILEGO_DEFER([&] { algo_.reset(); });
   ret = build_internal(threads);
   if (ret != 0) {
     return ret;
@@ -813,6 +803,7 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
 
   // All graph workers have joined. Subsequent stages consume holder_, so
   // release the full vector copy before allocating PQ buffers.
+  algo_.reset();
   entity_.release_vectors();
   LOG_INFO("Start to generate quantized data");
   ret = generate_quantized_data(threads);
@@ -828,6 +819,8 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   LOG_INFO("End DiskAnnBuilder::build");
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnBuilder::dump(const IndexDumper::Pointer &dumper) {

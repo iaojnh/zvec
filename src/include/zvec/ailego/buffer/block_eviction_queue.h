@@ -210,6 +210,11 @@ class MemoryLimitPool {
   //! Reserve bounded capacity outside the page cache, evicting if needed.
   bool try_charge_external(const size_t buffer_size);
 
+  //! Reserve mandatory non-evictable workspace capacity. Unlike optional cache
+  //! admission, allow pending page reclamation up to 100 ms to release space.
+  //! Successful reservations must be paired with release_external().
+  bool try_charge_workspace(const size_t buffer_size);
+
   //! Reserve non-evictable buffer-pool metadata capacity.
   bool try_charge_metadata(const size_t buffer_size);
 
@@ -359,6 +364,7 @@ class MemoryLimitPool {
   bool try_reserve_page_used(size_t bytes);
   bool try_reserve_committed(size_t bytes);
   bool try_charge_fixed(size_t bytes, std::atomic<size_t> *counter);
+  bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter);
   bool is_cacheable_buffer_size(size_t buffer_size);
   char *pop_free_buffer(size_t start_shard);

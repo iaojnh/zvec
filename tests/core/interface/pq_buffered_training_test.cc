@@ -13,8 +13,11 @@
 // limitations under the License.
 
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <type_traits>
 #include <gtest/gtest.h>
+#include <turbo/distance/common/fast_scan_common.h>
 #include <turbo/quantizer/common/pq_quantizer/pq_opq.h>
 #include <turbo/quantizer/pq_fast_quantizer/pq_fast_quantizer.h>
 #include <turbo/quantizer/pq_int4_quantizer/pq_int4_quantizer.h>
@@ -80,16 +83,73 @@ class PqBufferedTrainingTest : public ::testing::Test {
         Quantizer paged;
         ASSERT_EQ(paged.init(meta, params), 0);
         ASSERT_EQ(paged.train(input), 0);
-        EXPECT_EQ(pool.used(), 0u);
+        // Training scratch is released, but the fitted OPQ rotation stays
+        // charged until the quantizer is destroyed. This small matrix uses
+        // PagedBuildBuffer's charged inline representation.
+        const size_t retained = opq ? kDim * kDim * sizeof(float) : 0;
+        EXPECT_EQ(pool.used(), retained);
         std::string actual;
         ASSERT_EQ(paged.serialize(&actual), 0);
-        EXPECT_EQ(actual, reference);
         std::vector<uint8_t> a(legacy.quantized_datapoint_vector_length()),
             b(a.size());
         auto row = input->create_iterator();
         legacy.quantize_data(row->data(), a.data());
         paged.quantize_data(row->data(), b.data());
-        EXPECT_EQ(a, b);
+        if (!opq) {
+          EXPECT_EQ(actual, reference);
+          EXPECT_EQ(a, b);
+        } else {
+          // Identical rows make the Procrustes covariance rank-deficient:
+          // the rotation on its nullspace is not unique. Tiled/dense QR and
+          // SVD need not produce identical model bytes or centroid labels.
+          // Check the observable reconstruction instead, including finiteness,
+          // and require exact persistence of each fitted model independently.
+          core::IndexQueryMeta qmeta(Type, kDim);
+          auto check_reconstruction = [&](const Quantizer &quantizer,
+                                          const std::vector<uint8_t> &code) {
+            if constexpr (std::is_same_v<Quantizer, turbo::PqFastQuantizer>) {
+              // FastScan only exposes packed-block distances, not vector
+              // reconstruction. Identical training rows have zero
+              // self-distance.
+              std::vector<uint8_t> packed(
+                  turbo::fast_scan_packed_block_size(4));
+              ASSERT_EQ(0, quantizer.pack_codes(code.data(), 1, code.size(),
+                                                packed.data()));
+              std::vector<uint8_t> query(
+                  quantizer.quantized_query_vector_length());
+              quantizer.quantize_query(row->data(), query.data());
+              float distance = std::numeric_limits<float>::quiet_NaN();
+              quantizer.calc_distance_packed_block(packed.data(), 1,
+                                                   query.data(), &distance);
+              ASSERT_TRUE(std::isfinite(distance));
+              EXPECT_NEAR(0.0f, distance, 1e-4f);
+              return;
+            }
+            std::string decoded;
+            ASSERT_EQ(0, quantizer.dequantize(code.data(), qmeta, &decoded));
+            ASSERT_EQ(kDim * sizeof(float), decoded.size());
+            for (size_t d = 0; d < kDim; ++d) {
+              float value;
+              std::memcpy(&value, decoded.data() + d * sizeof(float),
+                          sizeof(value));
+              ASSERT_TRUE(std::isfinite(value)) << d;
+              EXPECT_NEAR(float(d + 1) / 32.0f, value, 1e-4f) << d;
+            }
+          };
+          ASSERT_NO_FATAL_FAILURE(check_reconstruction(legacy, a));
+          ASSERT_NO_FATAL_FAILURE(check_reconstruction(paged, b));
+          Quantizer restored;
+          ASSERT_EQ(0, restored.init(meta, params));
+          ASSERT_EQ(0, restored.deserialize(actual));
+          std::string roundtrip;
+          ASSERT_EQ(0, restored.serialize(&roundtrip));
+          EXPECT_EQ(actual, roundtrip);
+          std::vector<uint8_t> restored_code(b.size());
+          restored.quantize_data(row->data(), restored_code.data());
+          EXPECT_EQ(b, restored_code);
+          ASSERT_NO_FATAL_FAILURE(
+              check_reconstruction(restored, restored_code));
+        }
       }
     }
   }
@@ -289,7 +349,7 @@ TEST_F(PqBufferedTrainingTest, OpqDistinctRowsMatchAcrossPagedTileBoundaries) {
                   data.data(), kRows, "test", [&](uint32_t) { ++rounds; },
                   reconstruct, reconstruct_sum),
               0);
-    EXPECT_EQ(pool.used(), 0u);
+    EXPECT_EQ(pool.used(), capacity ? kDim * kDim * sizeof(float) : 0u);
     if (!capacity) {
       reference = std::move(data);
       reference_rounds = rounds;

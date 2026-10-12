@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "flat_sparse_streamer_entity.h"
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -22,6 +23,8 @@
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_error.h>
+#include "algorithm/flat/flat_dump_keys.h"
+#include "algorithm/flat/flat_utility.h"
 #include "flat_sparse_index_format.h"
 #include "flat_sparse_utility.h"
 
@@ -38,6 +41,8 @@ int FlatSparseStreamerEntity::open(IndexStorage::Pointer storage,
     return IndexError_Duplicate;
   }
 
+  use_id_map_ = true;
+  meta.streamer_params().get(PARAM_FLAT_USE_ID_MAP, &use_id_map_);
   keys_map_lock_ = std::make_shared<ailego::SharedMutex>();
   if (!keys_map_lock_) {
     LOG_ERROR("FlatSparseStreamerEntity new object failed");
@@ -205,7 +210,7 @@ int FlatSparseStreamerEntity::load_storage(IndexStorage::Pointer storage,
   }
 
   // load keys
-  for (node_id_t i = 0; i < meta_.doc_cnt; ++i) {
+  for (node_id_t i = 0; use_id_map_ && i < meta_.doc_cnt; ++i) {
     (*keys_map_)[get_key(i)] = i;
   }
 
@@ -213,7 +218,7 @@ int FlatSparseStreamerEntity::load_storage(IndexStorage::Pointer storage,
   stats_.set_check_point(storage->check_point());
   stats_.set_create_time(meta_.create_time);
   stats_.set_update_time(meta_.update_time);
-  stats_.set_loaded_count(keys_map_->size());
+  stats_.set_loaded_count(meta_.doc_cnt);
 
   return 0;
 }
@@ -358,8 +363,15 @@ int FlatSparseStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   auto duration_dump_offset_data = stamp.milli_seconds() - duration_dump_meta;
 
   // keys
-  std::vector<uint64_t> keys = get_keys();
-  ret = dump_keys(keys, dumper.get());
+  FlatDumpKeys keys;
+  for (node_id_t id = 0; id < doc_cnt(); ++id) {
+    uint64_t key = kInvalidKey;
+    ret = read_key(id, &key);
+    if (ret != 0) return ret;
+    ret = keys.append(key);
+    if (ret != 0) return ret;
+  }
+  ret = keys.write_keys(dumper.get(), PARAM_FLAT_SPARSE_DUMP_KEYS_SEG_ID);
   if (ret != 0) {
     return ret;
   }
@@ -368,7 +380,7 @@ int FlatSparseStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
       stamp.milli_seconds() - duration_dump_offset_data - duration_dump_meta;
 
   // mapping
-  ret = dump_mapping(keys, dumper.get());
+  ret = keys.write_mapping(dumper.get(), PARAM_FLAT_SPARSE_DUMP_MAPPING_SEG_ID);
   if (ret != 0) {
     return ret;
   }
@@ -389,8 +401,7 @@ int FlatSparseStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
 int FlatSparseStreamerEntity::dump_offset_data(IndexDumper *dumper) {
   ailego::ElapsedTime stamp;
 
-  uint64_t init_offset = dump_size_;
-  std::vector<std::pair<uint64_t, uint32_t>> offset_length;
+  uint64_t written_length = 0;
 
   // write data
   int ret;
@@ -413,43 +424,49 @@ int FlatSparseStreamerEntity::dump_offset_data(IndexDumper *dumper) {
       return ret;
     }
 
-    offset_length.push_back({dump_size_ - init_offset, target_vector_len});
-    dump_size_ += target_vector_len;
+    written_length += target_vector_len;
   }
 
   // append data segment
-  if (dumper->append(PARAM_FLAT_SPARSE_DUMP_DATA_SEG_ID,
-                     dump_size_ - init_offset, 0, 0) != 0) {
+  if (dumper->append(PARAM_FLAT_SPARSE_DUMP_DATA_SEG_ID, written_length, 0,
+                     0) != 0) {
     LOG_ERROR("append data segment failed");
     return IndexError_WriteData;
   }
 
   auto duration_dump_data = stamp.milli_seconds();
 
-  // write offset
-  for (auto &offset_length_pair : offset_length) {
-    if (dumper->write(&offset_length_pair.first,
-                      sizeof(offset_length_pair.first)) !=
-        sizeof(offset_length_pair.first)) {
-      return IndexError_WriteData;
+  // The streamer already persists each row length. Re-read that small
+  // metadata in a second pass instead of retaining or spilling an N-row copy.
+  constexpr size_t kRecordBytes = sizeof(uint64_t) + sizeof(uint32_t);
+  std::array<char, 1024 * kRecordBytes> batch{};
+  uint64_t offset = 0;
+  for (size_t first = 0; first < total_doc_cnt;) {
+    const size_t count = std::min(size_t{1024}, total_doc_cnt - first);
+    for (size_t i = 0; i < count; ++i) {
+      const size_t id = first + i;
+      const size_t chunk = id / get_offset_info_number_per_chunk();
+      const size_t pos =
+          id % get_offset_info_number_per_chunk() * offset_size_per_node() +
+          sizeof(uint64_t);
+      uint32_t length = 0;
+      if (sparse_offset_chunks_[chunk]->fetch(pos, &length, sizeof(length)) !=
+          sizeof(length))
+        return IndexError_ReadData;
+      std::memcpy(batch.data() + i * kRecordBytes, &offset, sizeof(offset));
+      std::memcpy(batch.data() + i * kRecordBytes + sizeof(offset), &length,
+                  sizeof(length));
+      offset += length;
     }
-    if (dumper->write(&offset_length_pair.second,
-                      sizeof(offset_length_pair.second)) !=
-        sizeof(offset_length_pair.second)) {
+    const size_t bytes = count * kRecordBytes;
+    if (dumper->write(batch.data(), bytes) != bytes)
       return IndexError_WriteData;
-    }
-    dump_size_ +=
-        sizeof(offset_length_pair.first) + sizeof(offset_length_pair.second);
+    first += count;
   }
-
-  // append offset segment
-  if (dumper->append(
-          PARAM_FLAT_SPARSE_DUMP_OFFSET_SEG_ID,
-          offset_length.size() * (sizeof(uint64_t) + sizeof(uint32_t)), 0,
-          0) != 0) {
-    LOG_ERROR("append offset segment failed");
-    return IndexError_WriteData;
-  }
+  if (offset != written_length) return IndexError_InvalidFormat;
+  ret = dumper->append(PARAM_FLAT_SPARSE_DUMP_OFFSET_SEG_ID,
+                       static_cast<size_t>(total_doc_cnt) * kRecordBytes, 0, 0);
+  if (ret != 0) return ret;
 
   auto duration_dump_offset = stamp.milli_seconds() - duration_dump_data;
 
@@ -486,66 +503,21 @@ int FlatSparseStreamerEntity::dump_meta(IndexDumper *dumper) {
                         meta_padding_size, 0);
 }
 
-int FlatSparseStreamerEntity::dump_keys(const std::vector<uint64_t> &keys,
-                                        IndexDumper *dumper) {
-  if (keys.size() == 1 && keys.back() == kInvalidKey) {
-    return IndexError_Runtime;
-  }
-
-  size_t keys_size = keys.size() * sizeof(uint64_t);
-  if (dumper->write(keys.data(), keys_size) != keys_size) {
-    LOG_ERROR("Failed to write keys to dumper %s", dumper->name().c_str());
-    return IndexError_WriteData;
-  }
-  size_t keys_padding_size = ailego_align(keys_size, 32) - keys_size;
-  if (keys_padding_size) {
-    std::string padding(keys_padding_size, '\0');
-    if (dumper->write(padding.data(), padding.size()) != padding.size()) {
-      LOG_ERROR("Failed to write padding to dumper %s", dumper->name().c_str());
-      return IndexError_WriteData;
-    }
-  }
-  return dumper->append(PARAM_FLAT_SPARSE_DUMP_KEYS_SEG_ID, keys_size,
-                        keys_padding_size, 0);
-}
-
-int FlatSparseStreamerEntity::dump_mapping(const std::vector<uint64_t> &keys,
-                                           IndexDumper *dumper) {
-  std::vector<uint32_t> mapping(keys.size());
-  std::iota(mapping.begin(), mapping.end(), 0);
-  std::sort(
-      mapping.begin(), mapping.end(),
-      [&keys](uint32_t lhs, uint32_t rhs) { return (keys[lhs] < keys[rhs]); });
-
-  size_t mapping_size = mapping.size() * sizeof(uint32_t);
-  size_t mapping_padding_size = ailego_align(mapping_size, 32) - mapping_size;
-  if (dumper->write(mapping.data(), mapping_size) != mapping_size) {
-    LOG_ERROR("Failed to write data into dumper %s", dumper->name().c_str());
-    return IndexError_WriteData;
-  }
-
-  // Write the padding if need
-  if (mapping_padding_size) {
-    std::string padding(mapping_padding_size, '\0');
-    if (dumper->write(padding.data(), padding.size()) != padding.size()) {
-      LOG_ERROR("Failed to write data into dumper %s", dumper->name().c_str());
-      return IndexError_WriteData;
-    }
-  }
-  return dumper->append(PARAM_FLAT_SPARSE_DUMP_MAPPING_SEG_ID, mapping_size,
-                        mapping_padding_size, 0);
-}
-
 FlatSparseStreamerEntity::Pointer FlatSparseStreamerEntity::clone() const {
   auto entity = new (std::nothrow) FlatSparseStreamerEntity(
       stats_, meta_, streamer_meta_, keys_map_lock_, keys_map_,
-      sparse_data_chunks_, sparse_offset_chunks_);
+      sparse_data_chunks_, sparse_offset_chunks_, use_id_map_);
   return FlatSparseStreamerEntity::Pointer(entity);
 }
 
 int FlatSparseStreamerEntity::add(uint64_t key,
                                   const std::string &sparse_vector,
                                   const uint32_t sparse_count) {
+  if (!use_id_map_) {
+    if (key >= kInvalidNodeId) return IndexError_InvalidArgument;
+    return add_vector_with_id(static_cast<node_id_t>(key), sparse_vector,
+                              sparse_count);
+  }
   uint32_t sparse_vector_len = sparse_vector.size();
 
   sparse_vector_len = AlignSize(sparse_vector_len);
@@ -693,8 +665,8 @@ int FlatSparseStreamerEntity::add(uint64_t key,
     }
   }
 
-  // persist in keys_map
-  {
+  // Direct IDs are already stored in the offset records.
+  if (use_id_map_) {
     keys_map_lock_->lock();
     (*keys_map_)[key] = local_id;
     keys_map_lock_->unlock();
@@ -709,6 +681,7 @@ int FlatSparseStreamerEntity::add(uint64_t key,
 int FlatSparseStreamerEntity::add_vector_with_id(
     uint32_t id, const std::string &sparse_vector,
     const uint32_t sparse_count) {
+  if (id >= max_doc_cnt_) return IndexError_IndexFull;
   uint32_t sparse_vector_len = sparse_vector.size();
 
   sparse_vector_len = AlignSize(sparse_vector_len);
@@ -723,6 +696,7 @@ int FlatSparseStreamerEntity::add_vector_with_id(
 
   std::lock_guard<std::mutex> lock(mutex_);
 
+  int ret = 0;
   if (id >= doc_cnt()) {
     for (auto i = doc_cnt(); i <= id; i++) {
       node_id_t local_id = doc_cnt();
@@ -733,26 +707,30 @@ int FlatSparseStreamerEntity::add_vector_with_id(
       }
       uint32_t sparse_data_chunk_index, sparse_data_chunk_offset,
           sparse_offset_chunk_index, sparse_offset_chunk_offset;
+      uint32_t stored_length = i < id ? 0 : sparse_vector_len;
       if (i < id) {
-        write_sparse_vector_to_chunk("", 0, sparse_data_chunk_index,
-                                     sparse_data_chunk_offset);
+        ret = write_sparse_vector_to_chunk("", 0, sparse_data_chunk_index,
+                                           sparse_data_chunk_offset);
       } else {
-        write_sparse_vector_to_chunk(sparse_vector, sparse_vector_len,
-                                     sparse_data_chunk_index,
-                                     sparse_data_chunk_offset);
+        ret = write_sparse_vector_to_chunk(sparse_vector, sparse_vector_len,
+                                           sparse_data_chunk_index,
+                                           sparse_data_chunk_offset);
       }
+      if (ret != 0) return ret;
       uint64_t sparse_offset =
           ((uint64_t)sparse_data_chunk_index << 32U) + sparse_data_chunk_offset;
-      get_new_sparse_offset_chunk(sparse_offset_chunk_index,
-                                  sparse_offset_chunk_offset);
+      ret = get_new_sparse_offset_chunk(sparse_offset_chunk_index,
+                                        sparse_offset_chunk_offset);
+      if (ret != 0) return ret;
       uint64_t written_key = kInvalidKey;
       if (i == id) {
         written_key = i;
       }
-      write_sparse_offset_to_chunk(sparse_offset_chunk_index,
-                                   sparse_offset_chunk_offset, sparse_offset,
-                                   sparse_vector_len, written_key);
-      {
+      ret = write_sparse_offset_to_chunk(
+          sparse_offset_chunk_index, sparse_offset_chunk_offset, sparse_offset,
+          stored_length, written_key);
+      if (ret != 0) return ret;
+      if (use_id_map_) {
         keys_map_lock_->lock();
         (*keys_map_)[i] = written_key;
         keys_map_lock_->unlock();
@@ -761,19 +739,21 @@ int FlatSparseStreamerEntity::add_vector_with_id(
     }
   } else {
     uint32_t sparse_data_chunk_index, sparse_data_chunk_offset;
-    write_sparse_vector_to_chunk(sparse_vector, sparse_vector_len,
-                                 sparse_data_chunk_index,
-                                 sparse_data_chunk_offset);
+    ret = write_sparse_vector_to_chunk(sparse_vector, sparse_vector_len,
+                                       sparse_data_chunk_index,
+                                       sparse_data_chunk_offset);
+    if (ret != 0) return ret;
     uint64_t sparse_offset =
         ((uint64_t)sparse_data_chunk_index << 32U) + sparse_data_chunk_offset;
     uint32_t sparse_offset_chunk_index =
         id / get_offset_info_number_per_chunk();
     uint32_t sparse_offset_chunk_offset =
         id % get_offset_info_number_per_chunk() * offset_size_per_node();
-    write_sparse_offset_to_chunk(sparse_offset_chunk_index,
-                                 sparse_offset_chunk_offset, sparse_offset,
-                                 sparse_vector_len, id);
-    {
+    ret = write_sparse_offset_to_chunk(sparse_offset_chunk_index,
+                                       sparse_offset_chunk_offset,
+                                       sparse_offset, sparse_vector_len, id);
+    if (ret != 0) return ret;
+    if (use_id_map_) {
       keys_map_lock_->lock();
       (*keys_map_)[id] = id;
       keys_map_lock_->unlock();
@@ -911,26 +891,34 @@ int FlatSparseStreamerEntity::write_sparse_offset_to_chunk(
 }
 
 uint64_t FlatSparseStreamerEntity::get_key(node_id_t node_id) const {
+  uint64_t key = kInvalidKey;
+  return read_key(node_id, &key) == 0 ? key : kInvalidKey;
+}
+
+int FlatSparseStreamerEntity::read_key(node_id_t node_id, uint64_t *key) const {
+  if (node_id >= doc_cnt()) return IndexError_OutOfRange;
   uint32_t offset_chunk_index = node_id / get_offset_info_number_per_chunk();
   uint32_t offset_chunk_key_offset =
       node_id % get_offset_info_number_per_chunk() * offset_size_per_node() +
       2 * sizeof(uint64_t);
 
-  IndexStorage::MemoryBlock block;
-  if (ailego_unlikely(sparse_offset_chunks_[offset_chunk_index]->read(
-                          offset_chunk_key_offset, block, sizeof(uint64_t)) !=
+  if (ailego_unlikely(sparse_offset_chunks_[offset_chunk_index]->fetch(
+                          offset_chunk_key_offset, key, sizeof(uint64_t)) !=
                       sizeof(uint64_t))) {
     LOG_ERROR("Read key failed, offset=%u, node_id=%u", offset_chunk_key_offset,
               node_id);
-    return kInvalidKey;
+    return IndexError_ReadData;
   };
 
-  return *reinterpret_cast<const uint64_t *>(block.data());
+  return 0;
 }
 
 int FlatSparseStreamerEntity::get_sparse_vector_ptr_by_id(
     node_id_t node_id, const void **sparse_vector_ptr,
     uint32_t *sparse_vector_len_ptr) const {
+  *sparse_vector_ptr = nullptr;
+  *sparse_vector_len_ptr = 0;
+  if (node_id >= doc_cnt()) return IndexError_OutOfRange;
   uint32_t offset_chunk_index = node_id / get_offset_info_number_per_chunk();
   uint32_t offset_chunk_offset =
       node_id % get_offset_info_number_per_chunk() * offset_size_per_node();
@@ -982,6 +970,9 @@ int FlatSparseStreamerEntity::get_sparse_vector_ptr_by_id(
 int FlatSparseStreamerEntity::get_sparse_vector_ptr_by_id(
     node_id_t node_id, IndexStorage::MemoryBlock &sparse_vector_block,
     uint32_t *sparse_vector_len_ptr) const {
+  sparse_vector_block = IndexStorage::MemoryBlock{};
+  *sparse_vector_len_ptr = 0;
+  if (node_id >= doc_cnt()) return IndexError_OutOfRange;
   uint32_t offset_chunk_index = node_id / get_offset_info_number_per_chunk();
   uint32_t offset_chunk_offset =
       node_id % get_offset_info_number_per_chunk() * offset_size_per_node();

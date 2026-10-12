@@ -17,6 +17,7 @@
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_searcher.h>
+#include "utility/immutable_segment_view.h"
 #include "flat_distance_matrix.h"
 #include "flat_index_format.h"
 
@@ -28,6 +29,11 @@ namespace core {
 template <size_t BATCH_SIZE>
 class FlatSearcher : public IndexSearcher {
  public:
+  // Internal query/iterator boundary converts metadata I/O failures into the
+  // existing error-code API. Never turn an unreadable key into a real key.
+  struct MetadataReadError {
+    int status;
+  };
   //! Destructor
   ~FlatSearcher() override = default;
 
@@ -60,9 +66,11 @@ class FlatSearcher : public IndexSearcher {
     measure_ = nullptr;
     quantizer_.reset();
     features_segment_ = nullptr;
-    keys_block_.reset();
-    keys_ = nullptr;
-    key_id_mapping_.clear();
+    keys_ = {};
+    mapping_ = {};
+    mapping_loaded_ = false;
+    paged_metadata_ = false;
+    decltype(key_id_mapping_)().swap(key_id_mapping_);
     return 0;
   }
 
@@ -133,11 +141,36 @@ class FlatSearcher : public IndexSearcher {
 
   //! Retrieve primary key via index id
   uint64_t key(size_t i) const {
-    return keys_[i];
+    uint64_t value = 0;
+    if (i >= keys_.size() / sizeof(value))
+      throw MetadataReadError{IndexError_OutOfRange};
+    const int ret = keys_.read(i * sizeof(value), &value, sizeof(value));
+    if (ret != 0) throw MetadataReadError{ret};
+    return value;
   }
 
   // Retrieve index id via primary key
   node_id_t get_id(key_t key) const {
+    if (paged_metadata_) {
+      // The index already persists ids sorted by key. Reuse that table rather
+      // than building an unbudgeted hash with one node per document.
+      size_t lo = 0, hi = mapping_.size() / sizeof(uint32_t);
+      while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (this->key(local_index(mid)) < key)
+          lo = mid + 1;
+        else
+          hi = mid;
+      }
+      node_id_t result = kInvalidNodeId;
+      for (; lo < mapping_.size() / sizeof(uint32_t); ++lo) {
+        const auto id = local_index(lo);
+        if (this->key(id) != key) break;
+        // Preserve the old hash's last-id-wins behavior for duplicate keys.
+        if (result == kInvalidNodeId || id > result) result = id;
+      }
+      return result;
+    }
     auto it = key_id_mapping_.find(key);
     if (it != key_id_mapping_.end()) {
       return it->second;
@@ -148,7 +181,14 @@ class FlatSearcher : public IndexSearcher {
 
   //! Retrieve primary key via index id
   uint32_t local_index(size_t i) const {
-    return mapping_[i];
+    uint32_t value = 0;
+    if (i >= mapping_.size() / sizeof(value))
+      throw MetadataReadError{IndexError_OutOfRange};
+    const int ret = mapping_.read(i * sizeof(value), &value, sizeof(value));
+    if (ret != 0) throw MetadataReadError{ret};
+    if (value >= keys_.size() / sizeof(uint64_t))
+      throw MetadataReadError{IndexError_InvalidFormat};
+    return value;
   }
 
   //! Retrieve primary key via index id
@@ -177,7 +217,7 @@ class FlatSearcher : public IndexSearcher {
 
   const void *get_vector(key_t key) const override {
     auto provider = this->create_provider();
-    return provider->get_vector(key);
+    return provider ? provider->get_vector(key) : nullptr;
   }
 
  private:
@@ -185,8 +225,7 @@ class FlatSearcher : public IndexSearcher {
   int check_query_meta(const IndexQueryMeta &qmeta) const;
 
   //! Members
-  IndexStorage::MemoryBlock keys_block_{};
-  const uint64_t *keys_{nullptr};
+  ImmutableSegmentView keys_;
   std::unordered_map<key_t, node_id_t> key_id_mapping_;
   uint32_t magic_{IndexContext::GenerateMagic()};
   uint32_t read_block_size_{FLAT_DEFAULT_READ_BLOCK_SIZE};
@@ -196,7 +235,9 @@ class FlatSearcher : public IndexSearcher {
   IndexMetric::Pointer measure_{};
   ailego::Params params_{};
   IndexStorage::Segment::Pointer features_segment_{};
-  mutable std::vector<uint32_t> mapping_{};
+  mutable ImmutableSegmentView mapping_;
+  mutable bool mapping_loaded_{false};
+  bool paged_metadata_{false};
   mutable std::mutex mapping_mutex_{};
   FlatDistanceMatrix<BATCH_SIZE> distance_matrix_{};
   std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};

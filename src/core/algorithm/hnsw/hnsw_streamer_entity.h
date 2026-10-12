@@ -86,9 +86,8 @@ class HnswStreamerEntity : public HnswEntity {
   //! Add vector and id to hnsw entity
   int add_vector_with_id(level_t level, node_id_t id, const void *vec) override;
 
-  int update_neighbors(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+  int update_neighbors(level_t level, node_id_t id,
+                       const TopkHeap::Container &neighbors) override;
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full

@@ -109,7 +109,9 @@ class IVFBuilder : public IndexBuilder {
 
       //! Retrieve primary key
       uint64_t key() const override {
-        return holder_->key(id_);
+        uint64_t key = std::numeric_limits<uint64_t>::max();
+        if (status_ == 0) status_ = holder_->read_key(id_, &key);
+        return key;
       }
 
       //! Next iterator
@@ -131,7 +133,7 @@ class IVFBuilder : public IndexBuilder {
 
     //! Retrieve count of elements in holder (-1 indicates unknown)
     size_t count() const override {
-      return keys_.size();
+      return count_;
     }
 
     //! Retrieve dimension
@@ -161,29 +163,53 @@ class IVFBuilder : public IndexBuilder {
     }
 
     void reserve(size_t elems) {
-      if (!storage_) features_->reserve(elems);
-      keys_.reserve(elems);
+      if (!storage_) {
+        features_->reserve(elems);
+        keys_.reserve(elems);
+      }
     }
 
     int enable_buffered_storage(const std::string &prefix, size_t elems) {
-      if (element_size() == 0 ||
-          elems > std::numeric_limits<size_t>::max() / element_size()) {
+      if (count_ != 0 || element_size() == 0 ||
+          element_size() >
+              std::numeric_limits<size_t>::max() - sizeof(uint64_t) ||
+          elems > std::numeric_limits<size_t>::max() /
+                      (element_size() + sizeof(uint64_t))) {
         return IndexError_InvalidArgument;
       }
-      return TemporaryBufferStorage::Create(prefix, elems * element_size(),
-                                            &storage_);
+      const int ret = TemporaryBufferStorage::Create(
+          prefix, elems * (element_size() + sizeof(uint64_t)), &storage_);
+      if (ret == 0) {
+        capacity_ = elems;
+        key_offset_ = elems * element_size();
+      }
+      return ret;
     }
 
     //! Append an element into holder
     int emplace(uint64_t pkey, const void *vec) {
+      if (!vec) return IndexError_InvalidArgument;
       if (storage_) {
-        int ret =
-            storage_->write(keys_.size() * element_size(), vec, element_size());
+        if (count_ >= capacity_) return IndexError_OutOfRange;
+        int ret = storage_->write(count_ * element_size(), vec, element_size());
+        if (ret == 0)
+          ret = storage_->write(key_offset_ + count_ * sizeof(pkey), &pkey,
+                                sizeof(pkey));
         if (ret != 0) return ret;
       } else {
-        features_->emplace(vec);
+        try {
+          keys_.emplace_back(pkey);
+          try {
+            features_->emplace(vec);
+          } catch (...) {
+            keys_.pop_back();
+            throw;
+          }
+        } catch (const std::bad_alloc &) {
+          return IndexError_NoMemory;
+        }
       }
-      keys_.emplace_back(pkey);
+      ++count_;
       return 0;
     }
 
@@ -207,9 +233,23 @@ class IVFBuilder : public IndexBuilder {
     }
 
     //! Retrieve key via local id
+    int read_key(size_t id, uint64_t *key) const {
+      if (!key || id >= count_) return IndexError_OutOfRange;
+      if (storage_)
+        return storage_->read(key_offset_ + id * sizeof(*key), key,
+                              sizeof(*key));
+      *key = keys_[id];
+      return 0;
+    }
+
     uint64_t key(size_t id) const {
-      ailego_assert_with(id < keys_.size(), "Index Overflow");
-      return keys_[id];
+      uint64_t result = std::numeric_limits<uint64_t>::max();
+      (void)read_key(id, &result);
+      return result;
+    }
+
+    size_t resident_key_capacity() const {
+      return keys_.capacity();
     }
 
    public:
@@ -221,6 +261,7 @@ class IVFBuilder : public IndexBuilder {
     CompactIndexFeatures::Pointer features_{};
     std::vector<uint64_t> keys_{};
     std::shared_ptr<TemporaryBufferStorage> storage_{};
+    size_t count_{0}, capacity_{0}, key_offset_{0};
   };
 
  private:

@@ -16,7 +16,7 @@
 
 #include <string.h>
 #include <ailego/utility/memory_helper.h>
-#include <zvec/ailego/container/heap.h>
+#include <zvec/ailego/buffer/budgeted_heap.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_dumper.h>
 #include <zvec/core/framework/index_error.h>
@@ -29,9 +29,9 @@ using node_id_t = uint32_t;
 using key_t = uint64_t;
 using level_t = int32_t;
 using dist_t = float;
-using TopkHeap = ailego::KeyValueHeap<node_id_t, dist_t>;
+using TopkHeap = ailego::BudgetedKeyValueHeap<node_id_t, dist_t>;
 using CandidateHeap =
-    ailego::KeyValueHeap<node_id_t, dist_t, std::greater<dist_t>>;
+    ailego::BudgetedKeyValueHeap<node_id_t, dist_t, std::greater<dist_t>>;
 constexpr node_id_t kInvalidNodeId = static_cast<node_id_t>(-1);
 constexpr key_t kInvalidKey = static_cast<key_t>(-1);
 class HnswSparseDistCalculator;
@@ -196,7 +196,7 @@ struct Neighbors {
 
 //! level 0 neighbors offset
 struct SparseGraphNeighborMeta {
-  SparseGraphNeighborMeta(size_t o, size_t cnt)
+  SparseGraphNeighborMeta(size_t o = 0, size_t cnt = 0)
       : offset(o), neighbor_cnt(cnt) {}
 
   uint64_t offset : 48;
@@ -205,7 +205,7 @@ struct SparseGraphNeighborMeta {
 
 //! hnsw upper neighbors meta
 struct HnswSparseNeighborMeta {
-  HnswSparseNeighborMeta(size_t o, size_t l) : offset(o), level(l) {}
+  HnswSparseNeighborMeta(size_t o = 0, size_t l = 0) : offset(o), level(l) {}
 
   uint64_t offset : 48;  // offset = idx * upper neighors size
   uint64_t level : 16;
@@ -366,14 +366,10 @@ class HnswSparseEntity {
   //! Dump all segment by dumper
   //! Return dump size if success, errno(<0) in failure
   int64_t dump_segments(
-      const IndexDumper::Pointer &dumper, key_t *keys,
+      const IndexDumper::Pointer &dumper,
       const std::function<level_t(node_id_t)> &get_level) const;
 
  private:
-  //! dump mapping segment, for get_vector_by_key in provider
-  int64_t dump_mapping_segment(const IndexDumper::Pointer &dumper,
-                               const key_t *keys) const;
-
   //! dump hnsw head by dumper
   //! Return dump size if success, errno(<0) in failure
   int64_t dump_header(const IndexDumper::Pointer &dumper,
@@ -524,9 +520,8 @@ class HnswSparseEntity {
     return IndexError_NotImplemented;
   }
 
-  virtual int update_neighbors(
-      level_t /*level*/, node_id_t /*id*/,
-      const std::vector<std::pair<node_id_t, dist_t>> & /*neighbors*/) {
+  virtual int update_neighbors(level_t /*level*/, node_id_t /*id*/,
+                               const TopkHeap::Container & /*neighbors*/) {
     LOG_ERROR("Update neighbors dense not implemented");
 
     return 0;
@@ -568,12 +563,6 @@ class HnswSparseEntity {
     size_t page_mask = ailego::MemoryHelper::PageSize() - 1;
     return (size + page_mask) & (~page_mask);
   }
-
-  //! rearrange vectors to improve cache locality
-  void reshuffle_vectors(const std::function<level_t(node_id_t)> &get_level,
-                         std::vector<node_id_t> *n2o_mapping,
-                         std::vector<node_id_t> *o2n_mapping,
-                         key_t *keys) const;
 
  public:
   const static std::string kSparseGraphHeaderSegmentId;

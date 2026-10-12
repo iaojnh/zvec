@@ -229,6 +229,12 @@ class ZVEC_CORE_API BaseIndexQueryParam {
   bool fetch_vector = false;
   std::shared_ptr<IndexFilter> filter = nullptr;
   std::shared_ptr<std::vector<uint64_t>> bf_pks = nullptr;
+  // Synchronous internal callers may borrow keys instead of making a copy.
+  // The owner must outlive search(); this view is never retained by a context.
+  const std::vector<uint64_t> *borrowed_bf_pks = nullptr;
+  const std::vector<uint64_t> *bf_keys() const {
+    return borrowed_bf_pks ? borrowed_bf_pks : bf_pks.get();
+  }
   float radius = 0.0f;
   bool is_linear = false;
   RefinerParam::Pointer refiner_param = nullptr;

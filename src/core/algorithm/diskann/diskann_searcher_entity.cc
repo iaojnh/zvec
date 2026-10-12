@@ -196,16 +196,30 @@ int DiskAnnSearcherEntity::load_pq_segment() {
 }
 
 int DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer(
-    std::string *meta_buffer) const {
+    QuantizerMetaBuffer *meta_buffer) const try {
   if (!meta_buffer || !pq_meta_segment_) {
     return IndexError_InvalidArgument;
   }
 
   // The meta buffer is stored right after the DiskAnnPqMeta header in the
   // segment.
-  const void *data = nullptr;
-  size_t read_size = pq_meta_segment_->read(
-      sizeof(DiskAnnPqMeta), &data, pq_meta_.quantizer_meta_buffer_size);
+  // Read directly into the decoding input. A pointer read would retain a
+  // second full model in the storage's thread-local scratch after load.
+  QuantizerMetaBuffer candidate;
+  if (pq_meta_.quantizer_meta_buffer_size >=
+          std::numeric_limits<size_t>::max() ||
+      pq_meta_segment_->data_size() < sizeof(DiskAnnPqMeta) ||
+      pq_meta_.quantizer_meta_buffer_size >
+          pq_meta_segment_->data_size() - sizeof(DiskAnnPqMeta) ||
+      pq_meta_.quantizer_meta_buffer_size > candidate.bytes.max_size())
+    return IndexError_InvalidFormat;
+  const size_t bytes = pq_meta_.quantizer_meta_buffer_size;
+  candidate.charge.add(bytes + 1);
+  candidate.bytes.resize(bytes);
+  if (candidate.bytes.capacity() > bytes)
+    candidate.charge.add(candidate.bytes.capacity() - bytes);
+  size_t read_size = pq_meta_segment_->fetch(sizeof(DiskAnnPqMeta),
+                                             candidate.bytes.data(), bytes);
   if (read_size != pq_meta_.quantizer_meta_buffer_size) {
     LOG_ERROR("Read segment %s failed, expect: %zu, actual: %zu",
               DiskAnnEntity::kDiskAnnPqMetaSegmentId.c_str(),
@@ -213,8 +227,10 @@ int DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer(
     return IndexError_ReadData;
   }
 
-  meta_buffer->assign(reinterpret_cast<const char *>(data), read_size);
+  *meta_buffer = std::move(candidate);
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcherEntity::load_header_segment() {

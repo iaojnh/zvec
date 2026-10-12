@@ -70,8 +70,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   int add_vector_with_id(level_t level, node_id_t id, const void *vec) override;
 
   int update_neighbors(level_t level, node_id_t id,
-                       const std::vector<std::pair<node_id_t, ResultRecord>>
-                           &neighbors) override;
+                       const TopkHeap::Container &neighbors) override;
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
@@ -210,7 +209,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   using HashSetPointer = std::shared_ptr<HashSet<Key>>;
 
   //! upper neighbor index hashmap
-  using NIHashMap = HnswIndexHashMap<node_id_t, uint32_t>;
+  using NIHashMap = HnswRabitqIndexHashMap<node_id_t, uint32_t>;
   using NIHashMapPointer = std::shared_ptr<NIHashMap>;
 
   //! Private construct, only be called by clone method

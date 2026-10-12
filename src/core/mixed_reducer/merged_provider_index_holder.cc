@@ -14,12 +14,14 @@
 
 #include "merged_provider_index_holder.h"
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <new>
 #include <utility>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_error.h>
+#include "utility/paged_build_buffer.h"
 
 namespace zvec {
 namespace core {
@@ -212,59 +214,78 @@ class MergedProviderIndexHolder::Iterator final : public IndexHolder::Iterator {
   mutable bool data_prepared_{false};
 };
 
+struct MergedProviderIndexHolder::OrdinalMap {
+  PagedBuildBuffer keys;
+  std::vector<size_t> source_ends;
+};
+
+int MergedProviderIndexHolder::prepare_ordinal_map() {
+  std::lock_guard<std::mutex> lock(ordinal_mutex_);
+  if (status() != 0) return status();
+  if (ordinal_map_) return 0;
+  auto fail = [this](int error) {
+    set_status(error);
+    return error;
+  };
+  if (count() > std::numeric_limits<size_t>::max() / sizeof(uint64_t))
+    return fail(IndexError_Overflow);
+  auto map = std::make_shared<OrdinalMap>();
+  int ret = map->keys.init(count() * sizeof(uint64_t), 64 * 1024);
+  if (ret != 0) return fail(ret);
+  map->source_ends.reserve(sources_.size());
+  std::array<uint64_t, 8192> batch{};
+  size_t total = 0, buffered = 0, written = 0;
+  auto flush = [&]() {
+    const size_t bytes = buffered * sizeof(uint64_t);
+    const int error = map->keys.write(written, batch.data(), bytes);
+    written += bytes;
+    buffered = 0;
+    return error;
+  };
+  for (size_t source_index = 0; source_index < sources_.size();
+       ++source_index) {
+    auto provider = acquire_provider(source_index, true);
+    if (!provider) return status();
+    auto iter = provider->create_iterator();
+    if (!iter) return fail(IndexError_Runtime);
+    const auto &source = sources_[source_index];
+    size_t ordinal = 0;
+    for (; iter->is_valid(); iter->next(), ++ordinal) {
+      if (iter->status() != 0) return fail(iter->status());
+      if (canceled()) return fail(IndexError_Canceled);
+      if (ordinal >= source.iterated_count) return fail(IndexError_Mismatch);
+      if (keep(source_index, ordinal)) {
+        const uint64_t key = iter->key();
+        if (iter->status() != 0) return fail(iter->status());
+        if (total >= count()) return fail(IndexError_Mismatch);
+        batch[buffered++] = key;
+        ++total;
+        if (buffered == batch.size()) {
+          ret = flush();
+          if (ret != 0) return fail(ret);
+        }
+      }
+    }
+    if (iter->status() != 0) return fail(iter->status());
+    if (ordinal != source.iterated_count) return fail(IndexError_Mismatch);
+    map->source_ends.push_back(total);
+  }
+  if (total != count()) return fail(IndexError_Mismatch);
+  ret = flush();
+  if (ret != 0) return fail(ret);
+  // Publish only after the entire map is valid. Readers never mutate it.
+  ordinal_map_ = std::move(map);
+  return 0;
+}
+
 class MergedProviderIndexHolder::OrdinalReader final
     : public OrdinalAccessHolder::Reader {
  public:
-  explicit OrdinalReader(MergedProviderIndexHolder *owner) : owner_(owner) {}
+  explicit OrdinalReader(MergedProviderIndexHolder *owner)
+      : owner_(owner), map_(owner->ordinal_map_) {}
 
   ~OrdinalReader() override {
     reset();
-  }
-
-  int init() {
-    // Build only a key map, on demand. Other builders pay neither this pass
-    // nor these eight bytes per kept vector. Filter decisions are never rerun.
-    keys_.reserve(owner_->count());
-    source_ends_.reserve(owner_->sources_.size());
-    for (size_t source_index = 0; source_index < owner_->sources_.size();
-         ++source_index) {
-      auto provider = owner_->acquire_provider(source_index, true);
-      if (!provider) {
-        return owner_->status();
-      }
-      auto iter = provider->create_iterator();
-      if (!iter) {
-        return fail(IndexError_Runtime);
-      }
-      const auto &source = owner_->sources_[source_index];
-      size_t ordinal = 0;
-      for (; iter->is_valid(); iter->next(), ++ordinal) {
-        if (iter->status() != 0) {
-          return fail(iter->status());
-        }
-        if (owner_->canceled()) {
-          return fail(IndexError_Canceled);
-        }
-        if (ordinal >= source.iterated_count) {
-          return fail(IndexError_Mismatch);
-        }
-        if (owner_->keep(source_index, ordinal)) {
-          const uint64_t key = iter->key();
-          if (iter->status() != 0) {
-            return fail(iter->status());
-          }
-          keys_.push_back(key);
-        }
-      }
-      if (iter->status() != 0) {
-        return fail(iter->status());
-      }
-      if (ordinal != source.iterated_count) {
-        return fail(IndexError_Mismatch);
-      }
-      source_ends_.push_back(keys_.size());
-    }
-    return keys_.size() == owner_->count() ? 0 : fail(IndexError_Mismatch);
   }
 
   int read(size_t ordinal, uint64_t *key, const void **data) override {
@@ -277,7 +298,7 @@ class MergedProviderIndexHolder::OrdinalReader final
     if (!key || !data) {
       return IndexError_InvalidArgument;
     }
-    if (ordinal >= keys_.size()) {
+    if (ordinal >= map_->keys.size() / sizeof(uint64_t)) {
       return IndexError_OutOfRange;
     }
     if (owner_->status() != 0) {
@@ -287,8 +308,9 @@ class MergedProviderIndexHolder::OrdinalReader final
       return fail(IndexError_Canceled);
     }
     const size_t source_index =
-        std::upper_bound(source_ends_.begin(), source_ends_.end(), ordinal) -
-        source_ends_.begin();
+        std::upper_bound(map_->source_ends.begin(), map_->source_ends.end(),
+                         ordinal) -
+        map_->source_ends.begin();
     if (!provider_ || source_index != source_index_) {
       // Drop the old provider before acquiring another: never retain all
       // source-specific buffers just to enable random reads.
@@ -299,11 +321,15 @@ class MergedProviderIndexHolder::OrdinalReader final
       }
       source_index_ = source_index;
     }
-    const int ret = provider_->get_vector(keys_[ordinal], block_);
+    uint64_t source_key = 0;
+    int ret = map_->keys.read(ordinal * sizeof(source_key), &source_key,
+                              sizeof(source_key));
+    if (ret != 0) return fail(ret);
+    ret = provider_->get_vector(source_key, block_);
     if (ret == IndexError_NotImplemented) {
       // Preserve compatibility with providers that only expose raw pointers.
       block_ = {};
-      *data = provider_->get_vector(keys_[ordinal]);
+      *data = provider_->get_vector(source_key);
     } else if (ret != 0) {
       return fail(ret);
     } else {
@@ -334,15 +360,14 @@ class MergedProviderIndexHolder::OrdinalReader final
   }
 
   MergedProviderIndexHolder *owner_;
-  std::vector<uint64_t> keys_{};
-  std::vector<size_t> source_ends_{};
+  std::shared_ptr<const OrdinalMap> map_;
   IndexProvider::Pointer provider_{};
   IndexStorage::MemoryBlock block_{};
   size_t source_index_{0};
 };
 
 int MergedProviderIndexHolder::create_ordinal_reader(
-    OrdinalAccessHolder::Reader::Pointer *reader) {
+    OrdinalAccessHolder::Reader::Pointer *reader) try {
   if (!reader || !initialized_) {
     return IndexError_InvalidArgument;
   }
@@ -359,15 +384,20 @@ int MergedProviderIndexHolder::create_ordinal_reader(
     set_status(IndexError_Canceled);
     return status();
   }
+  int ret = prepare_ordinal_map();
+  if (ret != 0) return ret;
   std::unique_ptr<OrdinalReader> result(new (std::nothrow) OrdinalReader(this));
   if (!result) {
     return IndexError_NoMemory;
   }
-  int ret = result->init();
-  if (ret == 0) {
-    *reader = std::move(result);
-  }
-  return ret;
+  *reader = std::move(result);
+  return 0;
+} catch (const std::bad_alloc &) {
+  set_status(IndexError_NoMemory);
+  return status();
+} catch (const std::exception &) {
+  set_status(IndexError_Runtime);
+  return status();
 }
 
 MergedProviderIndexHolder::MergedProviderIndexHolder(

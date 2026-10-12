@@ -13,13 +13,22 @@
 // limitations under the License.
 #pragma once
 
+#include <cstring>
+#include <mutex>
+#include <stdexcept>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_bundle.h>
+#include <zvec/core/framework/index_dumper.h>
+#include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_features.h>
 #include <zvec/core/framework/index_meta.h>
 #include <zvec/core/framework/index_module.h>
+#include <zvec/core/framework/index_storage.h>
 #include <zvec/core/framework/index_threads.h>
 
 namespace zvec {
@@ -29,6 +38,14 @@ namespace core {
  */
 struct IndexCluster : public IndexModule {
  public:
+  // Optional immutable backing for trained centroid rows. Internal consumers
+  // use read_feature() with one reusable row; legacy pointer APIs materialize
+  // only when explicitly requested.
+  class FeatureStorage {
+   public:
+    virtual ~FeatureStorage() = default;
+    virtual int read(size_t offset, void *out, size_t bytes) const = 0;
+  };
   //! Index Cluster Pointer
   typedef std::shared_ptr<IndexCluster> Pointer;
 
@@ -55,7 +72,9 @@ struct IndexCluster : public IndexModule {
 
     //! Constructor
     Centroid(Centroid &&rhs)
-        : buffer_(std::move(rhs.buffer_)),
+        : metadata_memory_(std::move(rhs.metadata_memory_)),
+          buffer_(std::move(rhs.buffer_)),
+          stored_(std::move(rhs.stored_)),
           score_(rhs.score_),
           follows_(rhs.follows_),
           similars_(std::move(rhs.similars_)),
@@ -66,7 +85,9 @@ struct IndexCluster : public IndexModule {
 
     //! Assignment
     Centroid &operator=(Centroid &&rhs) {
+      metadata_memory_ = std::move(rhs.metadata_memory_);
       buffer_ = std::move(rhs.buffer_);
+      stored_ = std::move(rhs.stored_);
       score_ = rhs.score_;
       follows_ = rhs.follows_;
       similars_ = std::move(rhs.similars_);
@@ -81,7 +102,7 @@ struct IndexCluster : public IndexModule {
 
     //! Test if matchs the meta
     bool is_matched(const IndexMeta &meta) const {
-      if (buffer_.size() != meta.element_size()) {
+      if (size() != meta.element_size()) {
         return false;
       }
       for (const auto &it : subitems_) {
@@ -95,18 +116,53 @@ struct IndexCluster : public IndexModule {
     //! Set feature of centroid
     void set_feature(const void *feat, size_t bytes) {
       buffer_.assign(std::string(reinterpret_cast<const char *>(feat), bytes));
+      stored_.reset();
+    }
+
+    void set_feature_storage(std::shared_ptr<const FeatureStorage> storage,
+                             size_t offset, size_t bytes) {
+      if (!storage) throw std::invalid_argument("Missing centroid storage");
+      auto row = std::make_shared<StoredFeature>();
+      row->storage = std::move(storage);
+      row->offset = offset;
+      row->bytes = bytes;
+      stored_ = std::move(row);
+      std::string().swap(buffer_);
+    }
+
+    // Loaded trees retain their directory reservation for their entire
+    // lifetime, including copies of the public CentroidList.
+    void adopt_metadata(ailego::MemoryReservation reservation) {
+      metadata_memory_ = std::move(reservation);
+    }
+
+    static size_t loaded_metadata_bytes() {
+      return sizeof(Centroid) + sizeof(StoredFeature) + 2 * sizeof(void *);
+    }
+
+    int read_feature(void *out, size_t bytes) const {
+      if (bytes != size() || (!out && bytes)) return IndexError_InvalidArgument;
+      if (stored_) return stored_->storage->read(stored_->offset, out, bytes);
+      if (bytes) std::memcpy(out, buffer_.data(), bytes);
+      return 0;
+    }
+
+    bool feature_stored() const {
+      return stored_ != nullptr;
     }
 
     //! Set feature of centroid
     template <typename T>
     void set_feature(const ailego::NumericalVector<T> &feat) {
       buffer_.assign(feat);
+      stored_.reset();
     }
 
     //! Set feature of centroid
     template <typename T>
     void set_feature(ailego::NumericalVector<T> &&feat) {
       buffer_.assign(std::forward<ailego::NumericalVector<T>>(feat));
+      stored_.reset();
     }
 
     //! Set score of centroid
@@ -141,34 +197,57 @@ struct IndexCluster : public IndexModule {
 
     //! Retrieve feature buffer
     std::string *mutable_buffer() {
+      if (stored_) {
+        buffer_ = buffer();
+        stored_.reset();
+      }
       return &buffer_;
     }
 
     //! Retrieve feature buffer
     const std::string &buffer() const {
+      if (stored_) {
+        std::call_once(stored_->once, [&] {
+          auto &pool = ailego::MemoryLimitPool::get_instance();
+          const size_t charge = pool.capacity() ? stored_->bytes : 0;
+          if (charge && !pool.try_charge_external(charge))
+            throw std::bad_alloc();
+          try {
+            std::string row(stored_->bytes, '\0');
+            if (read_feature(row.data(), row.size()) != 0)
+              throw std::runtime_error("Failed to read stored centroid");
+            stored_->materialized = std::move(row);
+            stored_->charged = charge;
+          } catch (...) {
+            if (charge) pool.release_external(charge);
+            throw;
+          }
+        });
+        return stored_->materialized;
+      }
       return buffer_;
     }
 
     //! Retrieve feature vector
     template <typename T>
     ailego::NumericalVector<T> *mutable_vector() {
-      return static_cast<ailego::NumericalVector<T> *>(&buffer_);
+      return static_cast<ailego::NumericalVector<T> *>(mutable_buffer());
     }
 
     //! Retrieve feature vector
     template <typename T>
     const ailego::NumericalVector<T> &vector() const {
-      return static_cast<const ailego::NumericalVector<T> &>(buffer_);
+      return static_cast<const ailego::NumericalVector<T> &>(buffer());
     }
 
     //! Retrieve feature pointer
     const void *feature() const {
-      return buffer_.data();
+      return buffer().data();
     }
 
     //! Retrieve size of centroid in bytes
     size_t size() const {
-      return buffer_.size();
+      return stored_ ? stored_->bytes : buffer_.size();
     }
 
     //! Retrieve score of centroid
@@ -211,8 +290,21 @@ struct IndexCluster : public IndexModule {
     }
 
    private:
+    struct StoredFeature {
+      std::shared_ptr<const FeatureStorage> storage;
+      size_t offset{0}, bytes{0};
+      std::once_flag once;
+      std::string materialized;
+      size_t charged{0};
+      ~StoredFeature() {
+        if (charged)
+          ailego::MemoryLimitPool::get_instance().release_external(charged);
+      }
+    };
     //! Members
+    ailego::MemoryReservation metadata_memory_;
     std::string buffer_;
+    std::shared_ptr<StoredFeature> stored_;
     double score_;
     size_t follows_;
     std::vector<const void *> similars_;
@@ -229,9 +321,17 @@ struct IndexCluster : public IndexModule {
   static int Deserialize(const IndexMeta &meta, IndexBundle::Pointer bundle,
                          CentroidList *cents);
 
+  //! Load only the centroid segments, with bounded reads and pageable rows.
+  static int Load(const IndexMeta &meta, IndexStorage::Pointer storage,
+                  CentroidList *cents);
+
   //! Serialize centroids into bundle
   static int Serialize(const IndexMeta &meta, const CentroidList &cents,
                        IndexBundle::Pointer *out);
+
+  //! Stream the same centroid segments without materializing a whole bundle.
+  static int Dump(const IndexMeta &meta, const CentroidList &cents,
+                  const IndexDumper::Pointer &dumper);
 
   //! Initialize Cluster
   virtual int init(const IndexMeta &meta, const ailego::Params &params) = 0;

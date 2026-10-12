@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <vector>
 #include <rabitqlib/utils/rotator.hpp>
@@ -44,8 +45,8 @@ static_assert(sizeof(RabitqConverterHeader) % 32 == 0,
 int dump_rabitq_centroids(
     const IndexDumper::Pointer &dumper, size_t dimension, size_t padded_dim,
     size_t ex_bits, size_t num_clusters, rabitqlib::RotatorType rotator_type,
-    const std::vector<float> &rotated_centroids,
-    const std::vector<float> &centroids,
+    const std::function<int(size_t, void *, size_t)> &rotated_centroids,
+    const std::function<int(size_t, void *, size_t)> &centroids,
     const std::unique_ptr<rabitqlib::Rotator<float>> &rotator,
     size_t *out_dumped_size = nullptr);
 

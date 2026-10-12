@@ -35,6 +35,7 @@
 #include "db/sqlengine/planner/ops/fetch_vector_op.h"
 #include "db/sqlengine/planner/plan_info.h"
 #include "db/sqlengine/planner/segment_node.h"
+#include "db/sqlengine/planner/topk_merge_node.h"
 #include "db/sqlengine/planner/vector_recall_node.h"
 #include "optimizer.h"
 
@@ -363,6 +364,9 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
   bool vector_is_reverse =
       has_vector && query_info->vector_cond_info()->is_reverse_sort();
   bool has_group_by = query_info->group_by() != nullptr;
+  const bool merge_topk =
+      segments.size() > 1 && !has_group_by && (has_vector || has_fts);
+  auto output_query_info = (*query_infos)[0];
 
   // optimize plan by instrument query info condition, eg adjust invert cond
   Optimizer::Ptr optimizer =
@@ -411,10 +415,12 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     Result<PlanInfo::Ptr> seg_plan;
     if (segment_query_info->vector_cond_info()) {
       seg_plan = vector_scan(segment, std::move(segment_query_info),
-                             std::move(forward_filter), single_stage_search);
+                             std::move(forward_filter), single_stage_search,
+                             merge_topk);
     } else if (segment_query_info->fts_cond_info()) {
-      seg_plan = fts_scan(segment, std::move(segment_query_info),
-                          std::move(forward_filter), single_stage_search);
+      seg_plan =
+          fts_scan(segment, std::move(segment_query_info),
+                   std::move(forward_filter), single_stage_search, merge_topk);
     } else if (segment_query_info->invert_cond()) {
       seg_plan = invert_scan(segment, std::move(segment_query_info),
                              std::move(forward_filter));
@@ -434,6 +440,22 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
 
   // multi segment logic
   ailego::ThreadPool *pool = GlobalResource::Instance().query_thread_pool();
+  if (merge_topk) {
+    try {
+      auto merge = std::make_shared<TopKMergeNode>(
+          std::move(segment_plans), segments, std::move(output_query_info),
+          has_fts || vector_is_reverse, pool);
+      ac::Declaration node{"source",
+                           ac::SourceNodeOptions{merge->schema(), merge->gen(),
+                                                 cp::Ordering::Implicit()}};
+      return std::make_shared<PlanInfo>(std::move(node), merge->schema());
+    } catch (const std::bad_alloc &) {
+      return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                        "Cannot allocate global topK plan"));
+    } catch (const std::exception &error) {
+      return tl::make_unexpected(Status::InternalError(error.what()));
+    }
+  }
   auto recall_node =
       std::make_shared<SegmentNode>(std::move(segment_plans), pool);
   auto source_node_options =
@@ -561,15 +583,16 @@ DocFilter::Ptr QueryPlanner::build_doc_filter(
 Result<PlanInfo::Ptr> QueryPlanner::vector_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter,
-    bool single_stage_search) {
+    bool single_stage_search, bool rank_only) {
   auto doc_filter =
       build_doc_filter(seg, query_info, forward_filter, single_stage_search);
 
   int topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, false);
+  if (rank_only) batch_size = std::min(batch_size, 1024);
   auto recall_node = std::make_shared<VectorRecallNode>(
       std::move(seg), std::move(query_info), std::move(doc_filter), batch_size,
-      single_stage_search);
+      single_stage_search, rank_only);
 
   auto source_node_options =
       arrow::acero::SourceNodeOptions{recall_node->schema(), recall_node->gen(),
@@ -644,14 +667,16 @@ Result<PlanInfo::Ptr> QueryPlanner::invert_scan(
 Result<PlanInfo::Ptr> QueryPlanner::fts_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter,
-    bool single_stage_search) {
+    bool single_stage_search, bool rank_only) {
   auto doc_filter =
       build_doc_filter(seg, query_info, forward_filter, single_stage_search);
 
   auto topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, false);
+  if (rank_only) batch_size = std::min(batch_size, 1024);
   auto recall_node = std::make_shared<FtsRecallNode>(
-      std::move(seg), std::move(query_info), std::move(doc_filter), batch_size);
+      std::move(seg), std::move(query_info), std::move(doc_filter), batch_size,
+      rank_only);
 
   auto source_node_options =
       arrow::acero::SourceNodeOptions{recall_node->schema(), recall_node->gen(),

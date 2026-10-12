@@ -59,8 +59,73 @@ SQLEngineImpl::SQLEngineImpl(zvec::Profiler::Ptr profiler)
 Result<DocPtrList> SQLEngineImpl::execute(
     CollectionSchema::Ptr collection, SearchQuery query,
     const std::vector<Segment::Ptr> &segments) {
+  std::vector<FieldAndSchema> output_fields;
+  auto reader = prepare_search(collection, query, segments, &output_fields);
+  if (!reader) return tl::make_unexpected(reader.error());
+  if (!reader.value()) return DocPtrList{};
+  return fill_result(output_fields, reader.value().get());
+}
+
+Status SQLEngineImpl::scan_doc_ids(CollectionSchema::Ptr collection,
+                                   const std::string &filter,
+                                   const std::vector<Segment::Ptr> &segments,
+                                   const DocIdConsumer &consume) {
+  if (!consume) return Status::InvalidArgument("Missing document ID consumer");
+  SearchQuery query;
+  query.filter_ = filter;
+  query.topk_ = INT32_MAX;
+  query.output_fields_ = std::vector<std::string>{};
+  query.include_doc_id_ = true;
+  // Drain one segment at a time, in SegmentNode's existing reverse order.
+  // Otherwise each segment's asynchronous Arrow sink can collect the entire
+  // scan while pageable ID staging is busy with I/O. Explicit backpressure
+  // pauses production when the reader's output queue exceeds 64 KiB.
+  for (auto it = segments.rbegin(); it != segments.rend() && query.topk_ > 0;
+       ++it) {
+    auto reader = prepare_search(collection, query, {*it}, nullptr, 64 * 1024);
+    if (!reader) return reader.error();
+    if (!reader.value()) continue;
+    auto scan_status = [&]() -> Status {
+      for (;;) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto status = reader.value()->ReadNext(&batch);
+        if (!status.ok()) {
+          return Status::InternalError("Read document ID batch failed: ",
+                                       status.ToString());
+        }
+        if (!batch) return Status::OK();
+        auto column = batch->GetColumnByName(GLOBAL_DOC_ID);
+        if (!column || column->type_id() != arrow::Type::UINT64 ||
+            column->null_count() != 0 || column->length() > query.topk_) {
+          return Status::InternalError("Missing or invalid document ID column");
+        }
+        if (column->length() == 0) continue;
+        const auto &ids = static_cast<const arrow::UInt64Array &>(*column);
+        auto result =
+            consume(ids.raw_values(), static_cast<size_t>(ids.length()));
+        if (!result.ok()) return result;
+        query.topk_ -= static_cast<int>(ids.length());
+      }
+    }();
+    // Cancel unfinished work before the caller releases its scan lock, also
+    // when the consumer cannot stage another batch. Preserve its original
+    // error.
+    auto close_status = reader.value()->Close();
+    if (!scan_status.ok()) return scan_status;
+    if (!close_status.ok()) {
+      return Status::InternalError("Close document ID scan failed: ",
+                                   close_status.ToString());
+    }
+  }
+  return Status::OK();
+}
+
+Result<std::unique_ptr<arrow::RecordBatchReader>> SQLEngineImpl::prepare_search(
+    CollectionSchema::Ptr collection, const SearchQuery &query,
+    const std::vector<Segment::Ptr> &segments,
+    std::vector<FieldAndSchema> *output_fields, size_t max_queued_bytes) {
   if (segments.empty()) {
-    return DocPtrList{};
+    return std::unique_ptr<arrow::RecordBatchReader>{};
   }
 
   // Check filter satisfiability once before the loop (result depends only on
@@ -72,11 +137,12 @@ Result<DocPtrList> SQLEngineImpl::execute(
   if (first_query_info.value()->is_filter_unsatisfiable()) {
     LOG_WARN("filter is unsatisfiable: %s",
              first_query_info.value()->to_string().c_str());
-    return {};
+    return std::unique_ptr<arrow::RecordBatchReader>{};
   }
   // Capture output field schema before query_infos are moved into the planner.
-  auto select_item_meta_ptrs =
-      first_query_info.value()->select_item_schema_ptrs();
+  if (output_fields) {
+    *output_fields = first_query_info.value()->select_item_schema_ptrs();
+  }
 
   // Build a separate QueryInfo per segment so the optimizer can mutate each
   // independently.  Reuse first_query_info for segment 0.
@@ -90,12 +156,13 @@ Result<DocPtrList> SQLEngineImpl::execute(
     }
     query_infos.emplace_back(std::move(query_info.value()));
   }
-  auto reader = search_by_query_info(collection, segments, &query_infos);
+  auto reader = search_by_query_info(collection, segments, &query_infos,
+                                     max_queued_bytes);
   if (!reader) {
     return tl::make_unexpected(Status::InternalError(
         "Execute plan failed (query): ", reader.error().c_str()));
   }
-  return fill_result(select_item_meta_ptrs, reader.value().get());
+  return reader;
 }
 
 SearchQuery from_group_by(const GroupByVectorQuery &gq) {
@@ -348,7 +415,8 @@ Result<QueryInfo::Ptr> SQLEngineImpl::build_query_info(
 Result<std::unique_ptr<arrow::RecordBatchReader>>
 SQLEngineImpl::search_by_query_info(
     CollectionSchema::Ptr collection, const std::vector<Segment::Ptr> &segments,
-    std::vector<sqlengine::QueryInfo::Ptr> *query_infos) {
+    std::vector<sqlengine::QueryInfo::Ptr> *query_infos,
+    size_t max_queued_bytes) {
   global_init();
 
   ScopedProfilerStage stage_guard(profiler_, "build_query_plan");
@@ -360,7 +428,7 @@ SQLEngineImpl::search_by_query_info(
     return tl::make_unexpected(plan_info.error());
   }
   // LOG_DEBUG("plan_info: [%s]", plan_info->to_string().c_str());
-  return plan_info.value()->execute_to_reader();
+  return plan_info.value()->execute_to_reader(max_queued_bytes);
 }
 
 #define GET_FIELD_FROM_RECORD_BATCH(res, field_name)                    \

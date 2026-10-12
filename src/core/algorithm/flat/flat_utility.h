@@ -104,14 +104,16 @@ static inline void Transpose(size_t align_size, const void *src, size_t m,
 }
 
 //! Transpose queries
-template <size_t K>
+template <size_t K, typename Buffer>
 void TransposeQueries(const void *query, const IndexQueryMeta &qmeta,
-                      size_t query_count, std::string *out) {
+                      size_t query_count, Buffer *out) {
   if constexpr (K <= 1) {
     ailego_assert(query_count == 1);
     (void)query_count;
-    out->append(reinterpret_cast<const char *>(query) + out->size(),
-                qmeta.element_size());
+    const size_t offset = out->size();
+    out->resize(offset + qmeta.element_size());
+    memcpy(out->data() + offset, static_cast<const char *>(query) + offset,
+           qmeta.element_size());
   } else {
     ailego_assert_with(IsEqualPowerofTwo<K>::value,
                        "K must be equal to two to the power of n.");

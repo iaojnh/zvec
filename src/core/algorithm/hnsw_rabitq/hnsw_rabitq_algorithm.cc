@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "hnsw_rabitq_algorithm.h"
 #include <chrono>
+#include <mutex>
 #include "hnsw_rabitq_entity.h"
 
 namespace zvec {
@@ -28,7 +29,7 @@ int HnswRabitqAlgorithm::cleanup() {
 }
 
 int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
-                                  HnswRabitqContext *ctx) {
+                                  HnswRabitqContext *ctx) try {
   spin_lock_.lock();
 
   // std::cout << "id: " << id << ", level: " << level << std::endl;
@@ -42,13 +43,14 @@ int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
   }
   spin_lock_.unlock();
 
+  std::unique_lock<decltype(mutex_)> level_lock(mutex_, std::defer_lock);
   if (ailego_unlikely(level > cur_max_level)) {
-    mutex_.lock();
+    level_lock.lock();
     // re-check max level
     cur_max_level = entity_.cur_max_level();
     entry_point = entity_.entry_point();
     if (level <= cur_max_level) {
-      mutex_.unlock();
+      level_lock.unlock();
     }
   }
 
@@ -74,10 +76,13 @@ int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
     spin_lock_.lock();
     entity_.update_ep_and_level(id, level);
     spin_lock_.unlock();
-    mutex_.unlock();
+    level_lock.unlock();
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  ctx->release_build_workspace();
+  return IndexError_NoMemory;
 }
 
 //! select_entry_point on hnsw level, ef = 1
@@ -375,13 +380,14 @@ void HnswRabitqAlgorithm::reverse_update_neighbors(
   const size_t max_neighbor_cnt = entity_.neighbor_cnt(level);
 
   uint32_t lock_idx = id & kLockMask;
-  lock_pool_[lock_idx].lock();
+  std::unique_lock<std::remove_reference_t<decltype(lock_pool_[lock_idx])>>
+      node_lock(lock_pool_[lock_idx]);
   const Neighbors neighbors = entity_.get_neighbors(level, id);
   size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {
     entity_.add_neighbor(level, id, size, link_id);
-    lock_pool_[lock_idx].unlock();
+    node_lock.unlock();
     return;
   }
 
@@ -420,7 +426,7 @@ void HnswRabitqAlgorithm::reverse_update_neighbors(
   update_heap.truncate(cur_size);
   entity_.update_neighbors(level, id, update_heap.container());
 
-  lock_pool_[lock_idx].unlock();
+  node_lock.unlock();
 
   update_heap.clear();
 

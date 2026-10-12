@@ -29,6 +29,7 @@
 #include <rabitqlib/utils/space.hpp>
 #include <zvec/ailego/hash/crc32c.h>
 #include <zvec/ailego/logger/logger.h>
+#include "algorithm/hnsw_rabitq/paged_rabitq_rotator.h"
 #include "algorithm/hnsw_rabitq/rabitq_utils.h"
 #include "core/algorithm/cluster/linear_seeker.h"
 #include "utility/immutable_segment_view.h"
@@ -227,20 +228,17 @@ int IvfRabitqReformer::load(IndexStorage::Pointer storage) {
   if (ret != 0) return ret;
   offset += layout.centroids_size;
 
-  // Read rotator
-  size = segment->read(offset, block, layout.rotator_size);
-  if (size != layout.rotator_size) {
-    LOG_ERROR("Failed to read rotator");
-    return IndexError_InvalidFormat;
-  }
-  impl_->rotator.reset(rabitqlib::choose_rotator<float>(
-      impl_->dimension, impl_->rotator_type, impl_->padded_dim));
-  if (!impl_->rotator) {
-    LOG_ERROR("Failed to create IVF RaBitQ rotator");
-    return IndexError_InvalidFormat;
-  }
-  impl_->rotator->load(reinterpret_cast<const char *>(block.data()));
-  offset += size;
+  ret = MakeRabitqRotator(impl_->dimension, impl_->rotator_type,
+                          impl_->padded_dim, &impl_->rotator, false);
+  if (ret != 0) return ret;
+  ret = LoadRabitqRotator(
+      impl_->rotator.get(), [&](size_t pos, void *out, size_t bytes) {
+        return segment->fetch(offset + pos, out, bytes) == bytes
+                   ? 0
+                   : IndexError_ReadData;
+      });
+  if (ret != 0) return ret;
+  offset += layout.rotator_size;
 
   // Precompute configs
   impl_->query_config = rabitqlib::quant::faster_config(

@@ -29,7 +29,8 @@ namespace core {
 //   5. If this is the first node, set it as entry point
 // ============================================================================
 template <typename EntityType>
-int VamanaAlgorithm<EntityType>::add_node(node_id_t id, VamanaContext *ctx) {
+int VamanaAlgorithm<EntityType>::add_node(node_id_t id,
+                                          VamanaContext *ctx) try {
   // Lazily initialize distance storage on first insert
   entity_.ensure_dist_storage();
 
@@ -75,6 +76,8 @@ int VamanaAlgorithm<EntityType>::add_node(node_id_t id, VamanaContext *ctx) {
   update_neighbors_and_reverse_links(id, pruned_neighbors, ctx);
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // ============================================================================
@@ -86,7 +89,8 @@ int VamanaAlgorithm<EntityType>::add_node(node_id_t id, VamanaContext *ctx) {
 // applies RobustPrune with the configured target alpha.
 // ============================================================================
 template <typename EntityType>
-int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx, float alpha) {
+int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx,
+                                              float alpha) try {
   if (ctx == nullptr) return IndexError_InvalidArgument;
   int ret = entity_.ensure_dist_storage();
   if (ailego_unlikely(ret != 0)) {
@@ -98,7 +102,7 @@ int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx, float alpha) {
     return 0;
   }
 
-  ctx->check_need_adjuct_ctx(n);
+  if (!ctx->check_need_adjuct_ctx(n)) return IndexError_NoMemory;
   for (node_id_t id = 0; id < n; ++id) {
     if (entity_.get_key(id) == kInvalidKey) continue;
     if (entity_.get_vector(id) == nullptr) continue;
@@ -111,13 +115,15 @@ int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx, float alpha) {
     }
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // ============================================================================
 // search: Greedy search for approximate nearest neighbors.
 // ============================================================================
 template <typename EntityType>
-int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const {
+int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const try {
   spin_lock_.lock();
   auto entry_point = entity_.entry_point();
   spin_lock_.unlock();
@@ -142,6 +148,8 @@ int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const {
   }
 
   return greedy_search(entry_point, ctx, /*use_pool=*/true);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // ============================================================================

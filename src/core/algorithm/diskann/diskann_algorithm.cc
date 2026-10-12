@@ -21,8 +21,27 @@
 namespace zvec {
 namespace core {
 
-DiskAnnAlgorithm::DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree)
-    : entity_(entity), max_degree_(max_degree), lock_pool_(kLockCnt) {}
+DiskAnnAlgorithm::DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree,
+                                   size_t thread_count)
+    : entity_(entity), max_degree_(max_degree) {
+  const size_t concurrency = std::max<size_t>(1, thread_count);
+  const size_t target = std::max<size_t>(
+      1, std::min<size_t>(entity.doc_cnt(), concurrency >= kLockCnt / 64
+                                                ? kLockCnt
+                                                : concurrency * 64));
+  size_t count = 1;
+  while (count * 2 <= target) count *= 2;
+  for (;;) {
+    try {
+      decltype(lock_pool_) replacement(count);
+      lock_pool_.swap(replacement);
+      break;
+    } catch (const std::bad_alloc &) {
+      if (count == 1) throw;
+      count /= 2;
+    }
+  }
+}
 
 std::vector<diskann_id_t> DiskAnnAlgorithm::get_init_ids(DiskAnnContext *ctx) {
   const auto &entity = ctx->get_entity();
@@ -34,7 +53,7 @@ std::vector<diskann_id_t> DiskAnnAlgorithm::get_init_ids(DiskAnnContext *ctx) {
   return init_ids;
 }
 
-int DiskAnnAlgorithm::add_node(diskann_id_t id, DiskAnnContext *ctx) {
+int DiskAnnAlgorithm::add_node(diskann_id_t id, DiskAnnContext *ctx) try {
   // reset_query copies the vector into context-owned storage, so the page can
   // be released before traversal needs to read any other vector.
   {
@@ -65,9 +84,13 @@ int DiskAnnAlgorithm::add_node(diskann_id_t id, DiskAnnContext *ctx) {
   }
 
   return inter_insert(id, pruned_list, ctx);
+} catch (const std::bad_alloc &) {
+  ctx->best_list_nodes().release();
+  ctx->clear();
+  return IndexError_NoMemory;
 }
 
-int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) {
+int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) try {
   DistCalculator &dc = ctx->dist_calculator();
   dc.clear();
 
@@ -83,7 +106,7 @@ int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) {
 
   if (neighbors.size() > max_degree_) {
     std::set<diskann_id_t> dummy_visited;
-    std::vector<Neighbor> dummy_pool(0);
+    PruneCandidates dummy_pool;
     std::vector<diskann_id_t> new_out_neighbors;
 
     for (diskann_id_t node_id : neighbors) {
@@ -94,7 +117,8 @@ int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) {
           return dc.error_code();
         }
 
-        dummy_pool.emplace_back(Neighbor(node_id, dist));
+        CollectPruneCandidate(dummy_pool, Neighbor(node_id, dist), id,
+                              max_candidate_size_);
         dummy_visited.insert(node_id);
       }
     }
@@ -114,6 +138,9 @@ int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) {
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  ctx->clear();
+  return IndexError_NoMemory;
 }
 
 int DiskAnnAlgorithm::inter_insert(diskann_id_t id,
@@ -162,12 +189,12 @@ int DiskAnnAlgorithm::inter_insert(diskann_id_t id,
 
     if (need_prune) {
       std::set<diskann_id_t> new_visited;
-      std::vector<Neighbor> new_pool(0);
+      PruneCandidates new_pool;
 
       size_t reserve_size = static_cast<size_t>(std::ceil(
           1.05 * DiskAnnEntity::kDefaultGraphSlackFactor * max_degree_));
 
-      new_pool.reserve(reserve_size);
+      new_pool.reserve(std::min<size_t>(reserve_size, max_candidate_size_));
 
       for (auto node_id : new_neighbors) {
         if (new_visited.find(node_id) == new_visited.end() && node_id != des) {
@@ -175,7 +202,8 @@ int DiskAnnAlgorithm::inter_insert(diskann_id_t id,
           if (dc.error()) {
             return dc.error_code();
           }
-          new_pool.emplace_back(Neighbor(node_id, dist));
+          CollectPruneCandidate(new_pool, Neighbor(node_id, dist), des,
+                                max_candidate_size_);
           new_visited.insert(node_id);
         }
       }
@@ -200,9 +228,11 @@ int DiskAnnAlgorithm::inter_insert(diskann_id_t id,
 }
 
 int DiskAnnAlgorithm::iterate_to_fixed_point(
-    const std::vector<diskann_id_t> &init_ids, DiskAnnContext *ctx) {
+    const std::vector<diskann_id_t> &init_ids, diskann_id_t excluded,
+    DiskAnnContext *ctx) {
   DistCalculator &dc = ctx->dist_calculator();
-  std::vector<Neighbor> &expanded_nodes = ctx->expanded_nodes();
+  auto &expanded_nodes = ctx->expanded_nodes();
+  expanded_nodes.clear();
   NeighborPriorityQueue &best_list_nodes = ctx->best_list_nodes();
   VisitFilter &visit = ctx->visit_filter();
 
@@ -222,7 +252,8 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
     auto neighbor = best_list_nodes.closest_unexpanded();
     auto node_id = neighbor.id;
 
-    expanded_nodes.emplace_back(neighbor);
+    CollectPruneCandidate(expanded_nodes, neighbor, excluded,
+                          max_candidate_size_);
 
     std::vector<diskann_id_t> id_scratch;
     {
@@ -257,7 +288,7 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
   return 0;
 }
 
-int DiskAnnAlgorithm::occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
+int DiskAnnAlgorithm::occlude_list(diskann_id_t id, PruneCandidates &pool,
                                    std::vector<diskann_id_t> &result,
                                    DiskAnnContext *ctx) {
   if (pool.size() == 0) return 0;
@@ -271,7 +302,7 @@ int DiskAnnAlgorithm::occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
     pool.resize(max_candidate_size_);
   }
 
-  std::vector<float> &occlude_factor = ctx->occlude_factor();
+  auto &occlude_factor = ctx->occlude_factor();
 
   occlude_factor.clear();
   occlude_factor.insert(occlude_factor.end(), pool.size(), 0.0f);
@@ -312,8 +343,7 @@ int DiskAnnAlgorithm::occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
   return 0;
 }
 
-int DiskAnnAlgorithm::prune_neighbors(diskann_id_t id,
-                                      std::vector<Neighbor> &pool,
+int DiskAnnAlgorithm::prune_neighbors(diskann_id_t id, PruneCandidates &pool,
                                       std::vector<diskann_id_t> &pruned_list,
                                       DiskAnnContext *ctx) {
   if (pool.size() == 0) {
@@ -355,7 +385,7 @@ int DiskAnnAlgorithm::search_neighbor_and_prune(
     DiskAnnContext *ctx) {
   const std::vector<diskann_id_t> init_ids = get_init_ids(ctx);
 
-  int ret = iterate_to_fixed_point(init_ids, ctx);
+  int ret = iterate_to_fixed_point(init_ids, id, ctx);
   if (ret != 0) {
     return ret;
   }

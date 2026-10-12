@@ -477,7 +477,8 @@ int VamanaStreamer::finalize_build_locked() {
     return ret;
   }
 
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   ctx->update_dist_calculator_distance(add_distance_, add_batch_distance_);
 
   LOG_INFO("Vamana two-pass second graph pass: alpha=%.2f", alpha_);
@@ -527,7 +528,10 @@ IndexStreamer::Context::Pointer VamanaStreamer::create_context() const {
     return Context::Pointer();
   }
 
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt())) {
+    delete ctx;
+    return Context::Pointer();
+  }
 
   return Context::Pointer(ctx);
 }
@@ -594,7 +598,8 @@ int VamanaStreamer::add_impl(uint64_t pkey, const void *query,
 
   ctx->clear();
   ctx->update_dist_calculator_distance(add_distance_, add_batch_distance_);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
 
   if (metric_->support_train()) {
     const std::lock_guard<std::mutex> lk(mutex_);
@@ -667,7 +672,8 @@ int VamanaStreamer::add_with_id_impl(uint32_t id, const void *query,
 
   ctx->clear();
   ctx->update_dist_calculator_distance(add_distance_, add_batch_distance_);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
 
   if (metric_->support_train()) {
     const std::lock_guard<std::mutex> lk(mutex_);
@@ -704,13 +710,15 @@ int VamanaStreamer::add_with_id_impl(uint32_t id, const void *query,
 }
 
 int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                                Context::Pointer &context) const {
+                                Context::Pointer &context) const try {
   return search_impl(query, qmeta, 1, context);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                                uint32_t count,
-                                Context::Pointer &context) const {
+                                uint32_t count, Context::Pointer &context) const
+    try {
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -733,7 +741,8 @@ int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   ctx->update_dist_calculator_distance(search_distance_,
                                        search_batch_distance_);
   ctx->resize_results(count);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   ctx->prepare_query_prefetch();
 
   for (size_t q = 0; q < count; ++q) {
@@ -749,12 +758,15 @@ int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_candidates_impl(const void *query,
                                            const IndexQueryMeta &qmeta,
                                            std::vector<uint64_t> &keys,
-                                           Context::Pointer &context) const {
+                                           Context::Pointer &context) const
+    try {
   keys.clear();
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
@@ -780,7 +792,8 @@ int VamanaStreamer::search_candidates_impl(const void *query,
   ctx->clear();
   ctx->update_dist_calculator_distance(search_distance_,
                                        search_batch_distance_);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   ctx->prepare_query_prefetch();
   ctx->reset_query(query);
   ret = alg_->search(ctx);
@@ -795,6 +808,8 @@ int VamanaStreamer::search_candidates_impl(const void *query,
     return IndexError_Runtime;
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 void VamanaStreamer::print_debug_info() {
@@ -819,13 +834,15 @@ void VamanaStreamer::print_debug_info() {
 
 int VamanaStreamer::search_bf_impl(const void *query,
                                    const IndexQueryMeta &qmeta,
-                                   Context::Pointer &context) const {
+                                   Context::Pointer &context) const try {
   return search_bf_impl(query, qmeta, 1, context);
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_bf_impl(const void *query,
                                    const IndexQueryMeta &qmeta, uint32_t count,
-                                   Context::Pointer &context) const {
+                                   Context::Pointer &context) const try {
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -863,12 +880,14 @@ int VamanaStreamer::search_bf_impl(const void *query,
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -908,6 +927,8 @@ int VamanaStreamer::search_bf_by_p_keys_impl(
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_STREAMER(VamanaStreamer);

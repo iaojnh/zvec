@@ -54,6 +54,32 @@ TEST(ReservoirSampleHolderTest, MatchesLegacyReservoirOrderUnderPressure) {
             std::memcmp(it->data(), legacy.element(i), meta.element_size()), 0);
       }
       EXPECT_EQ(i, result->count());
+      auto *ordinal = dynamic_cast<OrdinalAccessHolder *>(result.get());
+      ASSERT_NE(nullptr, ordinal);
+      OrdinalAccessHolder::Reader::Pointer first, second;
+      ASSERT_EQ(0, ordinal->create_ordinal_reader(&first));
+      ASSERT_EQ(0, ordinal->create_ordinal_reader(&second));
+      // Readers keep the sample alive and own independent bounded scratch.
+      result.reset();
+      for (size_t id = legacy.count(); id > 0; --id) {
+        uint64_t key;
+        const void *data = nullptr;
+        ASSERT_EQ(0, first->read(id - 1, &key, &data));
+        EXPECT_EQ(id - 1, key);
+        const void *other = nullptr;
+        ASSERT_EQ(0, second->read(0, &key, &other));
+        EXPECT_EQ(
+            0, std::memcmp(data, legacy.element(id - 1), meta.element_size()));
+        EXPECT_EQ(0,
+                  std::memcmp(other, legacy.element(0), meta.element_size()));
+        second->reset();
+      }
+      uint64_t key;
+      const void *data = nullptr;
+      EXPECT_EQ(IndexError_OutOfRange,
+                first->read(legacy.count(), &key, &data));
+      EXPECT_EQ(nullptr, data);
+      EXPECT_EQ(IndexError_InvalidArgument, first->read(0, nullptr, &data));
     }
   }
 }

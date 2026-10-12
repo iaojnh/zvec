@@ -281,22 +281,29 @@ class VamanaContext : public IndexContext {
     IndexContext::set_fetch_vector(false);
   }
 
-  inline void check_need_adjuct_ctx() {
-    check_need_adjuct_ctx(entity_->doc_cnt());
+  inline bool check_need_adjuct_ctx() {
+    return check_need_adjuct_ctx(entity_->doc_cnt());
   }
 
-  inline void check_need_adjuct_ctx(uint32_t doc_cnt) {
-    if (ailego_unlikely(doc_cnt + kTriggerReserveCnt > reserve_max_doc_cnt_)) {
-      while (doc_cnt + kTriggerReserveCnt > reserve_max_doc_cnt_) {
-        reserve_max_doc_cnt_ =
-            reserve_max_doc_cnt_ + compute_reserve_cnt(reserve_max_doc_cnt_);
+  inline bool check_need_adjuct_ctx(uint32_t doc_cnt) {
+    const uint32_t target = static_cast<uint32_t>(
+        std::min<uint64_t>(uint64_t{doc_cnt} + kTriggerReserveCnt, UINT32_MAX));
+    if (ailego_unlikely(target > reserve_max_doc_cnt_)) {
+      uint32_t next = reserve_max_doc_cnt_;
+      while (target > next) {
+        next += static_cast<uint32_t>(
+            std::min<size_t>(compute_reserve_cnt(next), UINT32_MAX - next));
       }
-      uint32_t max_scan_cnt = compute_max_scan_num(reserve_max_doc_cnt_);
-      max_scan_num_ = max_scan_cnt;
-      visit_filter_.reset(reserve_max_doc_cnt_, max_scan_cnt);
+      const uint32_t scans = compute_max_scan_num(next);
+      if (!visit_filter_.reset(next, scans)) return false;
+      // Failed reservation must not publish a larger capacity or let a
+      // subsequent query index the previous, smaller bitmap.
+      reserve_max_doc_cnt_ = next;
+      max_scan_num_ = scans;
       candidates_.clear();
       candidates_.limit(max_scan_num_);
     }
+    return true;
   }
 
   inline size_t get_scan_num() const {

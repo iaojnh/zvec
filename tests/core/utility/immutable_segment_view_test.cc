@@ -58,6 +58,16 @@ TEST(ImmutableSegmentViewTest, BoundedReadsOwnTheirLifetimeUnderPressure) {
     ASSERT_EQ(view.load(storage, "payload", 0, bytes.size()), 0);
     EXPECT_EQ(view.data() == nullptr, storage->vec_buffer_pool() != nullptr);
     EXPECT_LE(pool.used(), pool.capacity());
+    if (mode_index == 2) {
+      // Opening a view needs no payload copy. Returning an owned contiguous
+      // range does need budget; bypass must not silently allocate outside it.
+      IndexStorage::MemoryBlock guard;
+      const void *data = nullptr;
+      EXPECT_EQ(view.view(0, 8193, &guard, &data), IndexError_ReadData);
+      EXPECT_EQ(nullptr, data);
+      EXPECT_EQ(0u, pool.used());
+      continue;
+    }
     auto verify = [&view, &bytes](size_t start) {
       for (size_t offset = start; offset < bytes.size(); offset += 8191) {
         const size_t count = std::min<size_t>(8193, bytes.size() - offset);

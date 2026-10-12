@@ -477,54 +477,13 @@ int IvfRabitqBuilder::train(IndexThreads::Pointer threads,
     return ret;
   }
 
-  // Create IvfRabitqReformer via dump+load cycle
-  auto memory_dumper = IndexFactory::CreateDumper("MemoryDumper");
-  memory_dumper->init(ailego::Params());
-  std::string file_id = ailego::StringHelper::Concat(
-      "ivf_rabitq_builder_train_", ailego::Monotime::MilliSeconds(), rand());
-  ret = memory_dumper->create(file_id);
-  if (ret != 0) {
-    LOG_ERROR("Failed to create memory dumper, ret=%d", ret);
-    return ret;
-  }
-
-  ret = converter_->dump(memory_dumper);
-  if (ret != 0) {
-    LOG_ERROR("Failed to dump converter, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-  ret = memory_dumper->close();
-  if (ret != 0) {
-    LOG_ERROR("Failed to close memory dumper, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
+  IndexStorage::Pointer storage;
+  ret = converter_->training_storage(&storage);
+  if (ret != 0) return ret;
   reformer_ = std::make_shared<IvfRabitqReformer>();
   ret = reformer_->init(metric_name_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to init IvfRabitqReformer, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
-  auto memory_storage = IndexFactory::CreateStorage("MemoryReadStorage");
-  ret = memory_storage->open(file_id, false);
-  if (ret != 0) {
-    LOG_ERROR("Failed to open memory storage, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
-  ret = reformer_->load(memory_storage);
-  if (ret != 0) {
-    LOG_ERROR("Failed to load IvfRabitqReformer, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
-  IndexMemory::Instance()->remove(file_id);
+  if (ret == 0) ret = reformer_->load(storage);
+  if (ret != 0) return ret;
 
   stats_.set_trained_count(converter_->stats().trained_count());
   // The reformer owns the trained state used by build/dump. Do not retain a

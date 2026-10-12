@@ -31,7 +31,8 @@ class PlanInfo {
            std::shared_ptr<arrow::Schema> schema)
       : plan_(std::move(plan)), schema_(std::move(schema)) {}
 
-  Result<std::unique_ptr<arrow::RecordBatchReader>> execute_to_reader();
+  Result<std::unique_ptr<arrow::RecordBatchReader>> execute_to_reader(
+      size_t max_queued_bytes = 0);
 
   std::shared_ptr<arrow::Schema> schema() const {
     return schema_;

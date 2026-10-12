@@ -765,9 +765,19 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
   return try_charge_fixed(buffer_size, &external_used_size_);
 }
 
+bool MemoryLimitPool::try_charge_workspace(const size_t buffer_size) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  return try_charge_fixed_with_wait(buffer_size, &external_used_size_);
+}
+
 bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
-  if (try_charge_fixed(buffer_size, &metadata_used_size_)) {
+  return try_charge_fixed_with_wait(buffer_size, &metadata_used_size_);
+}
+
+bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
+                                                 std::atomic<size_t> *counter) {
+  if (try_charge_fixed(buffer_size, counter)) {
     return true;
   }
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
@@ -776,11 +786,11 @@ bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
     return false;
   }
   // Dirty eviction may have queued writeback without freeing a page yet.
-  // Metadata is mandatory for opening/growing a store; allow that pending
-  // reclamation to finish, then retry the real reservation once. Keep this
-  // bounded wait out of ordinary external-cache admission.
+  // Mandatory workspace and metadata can wait for that pending reclamation,
+  // then retry the real reservation once. Keep this bounded wait out of
+  // ordinary external-cache admission.
   return wait_for_available(buffer_size, std::chrono::milliseconds(100)) &&
-         try_charge_fixed(buffer_size, &metadata_used_size_);
+         try_charge_fixed(buffer_size, counter);
 }
 
 bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,

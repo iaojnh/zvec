@@ -19,6 +19,7 @@
 #include <zvec/db/status.h>
 #include "db/index/column/fts_column/fts_utils.h"
 #include "db/index/column/fts_column/posting/bitpacked_posting_list.h"
+#include "db/index/column/fts_column/posting/posting_build_buffer.h"
 
 namespace zvec::fts {
 
@@ -71,7 +72,8 @@ inline uint32_t dense_rank(uint64_t scan_pos, const roaring::Roaring &bitmap) {
 //
 // Pass 2 (merge_and_flush_postings): N RocksDB iterators, term-by-term
 // multi-way merge in lex order; per-term entries are encoded + put
-// immediately so peak memory is one term's entries.  dst_local resolved
+// immediately. Term entries are pageable; only the budgeted serialized output
+// must be contiguous. dst_local resolved
 // on the fly via dense_rank(scan_pos), sharing the bitmap with the
 // vector reducer.
 
@@ -154,7 +156,7 @@ Result<void> FtsRocksdbReducer::feed(
 }
 
 Result<void> FtsRocksdbReducer::reduce(
-    const roaring::Roaring &delete_row_id_bitmap) {
+    const roaring::Roaring &delete_row_id_bitmap) try {
   if (state_ != STATE_FEED || num_segments_ == 0) {
     return tl::make_unexpected(Status::InternalError(
         "FtsRocksdbReducer: call feed() before reduce(). field=", field_name_));
@@ -170,6 +172,10 @@ Result<void> FtsRocksdbReducer::reduce(
   uint64_t cumulative = 0;
   for (uint32_t seg = 0; seg < num_segments_; ++seg) {
     scan_offset_per_seg_[seg] = cumulative;
+    if (segment_stats_[seg].doc_count > UINT32_MAX - cumulative) {
+      return tl::make_unexpected(
+          Status::InvalidArgument("FTS merge exceeds local ID range"));
+    }
     cumulative += segment_stats_[seg].doc_count;
   }
 
@@ -210,6 +216,12 @@ Result<void> FtsRocksdbReducer::reduce(
       field_name_.c_str(), num_segments_, (size_t)effective_total_docs_,
       (size_t)effective_total_tokens_);
   return {};
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "FTS merge exceeds memory budget"));
+} catch (const std::exception &e) {
+  return tl::make_unexpected(
+      Status::InternalError("FTS merge failed: ", e.what()));
 }
 
 // ============================================================
@@ -257,6 +269,9 @@ Result<void> FtsRocksdbReducer::collect_effective_stats(
   for (uint32_t seg = 0; seg < num_segments_; ++seg) {
     const uint64_t seg_doc_count = segment_stats_[seg].doc_count;
     const uint64_t scan_offset = scan_offset_per_seg_[seg];
+    ailego::MemoryReservation seen_reservation;
+    seen_reservation.add_array(static_cast<size_t>(seg_doc_count / 64 + 1),
+                               sizeof(uint64_t));
     std::vector<bool> seen_docs(seg_doc_count, false);
 
     auto *src_cf = src_postings_cfs_[seg];
@@ -265,7 +280,7 @@ Result<void> FtsRocksdbReducer::collect_effective_stats(
     iter->SeekToFirst();
 
     while (iter->Valid()) {
-      const std::string posting_data = iter->value().ToString();
+      const auto posting_data = iter->value();
 
       if (!BitPackedPostingList::is_bitpacked_format(posting_data.data(),
                                                      posting_data.size())) {
@@ -294,6 +309,9 @@ Result<void> FtsRocksdbReducer::collect_effective_stats(
       }
       iter->Next();
     }
+    if (!iter->status().ok())
+      return tl::make_unexpected(
+          Status::InternalError(iter->status().ToString()));
   }
 
   LOG_INFO(
@@ -306,12 +324,6 @@ Result<void> FtsRocksdbReducer::collect_effective_stats(
 
 Result<void> FtsRocksdbReducer::merge_and_flush_postings(
     const roaring::Roaring &delete_row_id_bitmap) {
-  struct PostingEntry {
-    uint32_t doc_id;
-    uint32_t tf;
-    uint32_t doc_len;
-  };
-
   // Open N iterators, one per source segment.
   struct SegmentCursor {
     uint32_t segment_index;
@@ -328,8 +340,7 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
   }
 
   // Reusable buffers.
-  std::vector<PostingEntry> term_entries;
-  std::vector<uint32_t> doc_ids_buf, tfs_buf, doc_lens_buf;
+  PostingBuildBuffer term_entries;
 
   while (true) {
     // Pick the lex-smallest current term across cursors.
@@ -337,6 +348,9 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
     bool found = false;
     for (auto &c : cursors) {
       if (!c.iter->Valid()) {
+        if (!c.iter->status().ok())
+          return tl::make_unexpected(
+              Status::InternalError(c.iter->status().ToString()));
         continue;
       }
       const std::string t = c.iter->key().ToString();
@@ -359,7 +373,7 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
         continue;
       }
 
-      const std::string posting_data = c.iter->value().ToString();
+      const auto posting_data = c.iter->value();
       if (!BitPackedPostingList::is_bitpacked_format(posting_data.data(),
                                                      posting_data.size())) {
         return tl::make_unexpected(Status::InternalError(
@@ -374,7 +388,6 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
             field_name_, " term=", min_term));
       }
 
-      term_entries.reserve(term_entries.size() + bp_iter.cost());
       const uint64_t scan_offset = scan_offset_per_seg_[c.segment_index];
       const uint64_t seg_doc_count = c.stats->doc_count;
       uint32_t local_doc_id = bp_iter.next_doc();
@@ -383,8 +396,8 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
           const uint32_t new_doc_id =
               dense_rank(scan_offset + local_doc_id, delete_row_id_bitmap);
           if (new_doc_id != kFilteredRank) {
-            term_entries.push_back(
-                {new_doc_id, bp_iter.term_freq(), bp_iter.doc_len()});
+            term_entries.append(new_doc_id, bp_iter.term_freq(),
+                                bp_iter.doc_len());
           }
         }
         local_doc_id = bp_iter.next_doc();
@@ -396,24 +409,11 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
       continue;
     }
 
-    // Encode + put per term ⇒ peak memory is one term's entries.
-    doc_ids_buf.clear();
-    tfs_buf.clear();
-    doc_lens_buf.clear();
-    doc_ids_buf.reserve(term_entries.size());
-    tfs_buf.reserve(term_entries.size());
-    doc_lens_buf.reserve(term_entries.size());
-    for (const auto &e : term_entries) {
-      doc_ids_buf.push_back(e.doc_id);
-      tfs_buf.push_back(e.tf);
-      doc_lens_buf.push_back(e.doc_len);
-    }
+    // Only the budgeted serialized value is contiguous; input is pageable.
+    auto packed = term_entries.encode(term_entries.size(), *scorer_);
 
-    std::string packed = BitPackedPostingList::encode(
-        doc_ids_buf.data(), tfs_buf.data(), doc_lens_buf.data(),
-        doc_ids_buf.size(), doc_ids_buf.size(), *scorer_);
-
-    if (!ctx_->db_->Put(ctx_->write_opts_, dst_postings_cf_, min_term, packed)
+    if (!ctx_->db_
+             ->Put(ctx_->write_opts_, dst_postings_cf_, min_term, packed.data)
              .ok()) {
       return tl::make_unexpected(Status::InternalError(
           "FtsRocksdbReducer: failed to put bitpacked postings. field=",

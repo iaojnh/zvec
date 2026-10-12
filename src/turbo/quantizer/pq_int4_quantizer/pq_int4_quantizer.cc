@@ -1002,8 +1002,18 @@ DistanceImpl PqInt4Quantizer::sym_distance(const void *query,
 // Serialization
 // ---------------------------------------------------------------------------
 int PqInt4Quantizer::serialize(std::string *out) const {
-  if (!out) return kErrUnsupported;
+  return serialize(out, nullptr);
+}
 
+size_t PqInt4Quantizer::serialized_size() const {
+  return sizeof(QuantizerSerHeader) + sizeof(PqInt4SerPayload) +
+         centroids_.size() +
+         (use_zero_mean_ ? centroid_.size() * sizeof(float) : 0) +
+         opq_.serialized_size();
+}
+
+int PqInt4Quantizer::serialize_to(const SerializationSink &sink) const {
+  if (!sink) return kErrUnsupported;
   QuantizerSerHeader hdr{};
   hdr.magic = kQuantizerMagic;
   hdr.version = kQuantizerSerVersion;
@@ -1021,33 +1031,22 @@ int PqInt4Quantizer::serialize(std::string *out) const {
   payload.input_data_type = static_cast<uint8_t>(input_data_type_);
   payload.rotate_type = opq_.rotate_type();
 
-  // The rotator blob is self-describing (RotatorSerHeader + matrix), so the
-  // payload only needs the type tag to know whether one follows.
-  std::string preprocessor_blob;
-  int opq_ret = opq_.serialize(&preprocessor_blob);
-  if (opq_ret != 0) return opq_ret;
 
-  size_t centroids_bytes = centroids_.size();  // already byte buffer
-  size_t centroid_bytes = use_zero_mean_ ? centroid_.size() * sizeof(float) : 0;
-  hdr.payload_size =
-      static_cast<uint32_t>(sizeof(payload) + centroids_bytes + centroid_bytes +
-                            preprocessor_blob.size());
-
-  out->clear();
-  out->append(reinterpret_cast<const char *>(&hdr), sizeof(hdr));
-  out->append(reinterpret_cast<const char *>(&payload), sizeof(payload));
-  out->append(reinterpret_cast<const char *>(centroids_.data()),
-              centroids_bytes);
-  // Append zero-mean centroid for centering support.
-  if (use_zero_mean_) {
-    out->append(reinterpret_cast<const char *>(centroid_.data()),
-                centroid_bytes);
-  }
-  out->append(preprocessor_blob);
-  // dist_table_ is NOT serialized: it is a build-phase-only derivative of the
-  // codebook (used by SDC), recomputable on demand and unneeded after
-  // deserialization (search uses ADC).
-  return 0;
+  const size_t centroids_bytes = centroids_.size();
+  const size_t centroid_bytes =
+      use_zero_mean_ ? centroid_.size() * sizeof(float) : 0;
+  const uint64_t payload_bytes = uint64_t{sizeof(payload)} + centroids_bytes +
+                                 centroid_bytes + opq_.serialized_size();
+  if (payload_bytes > std::numeric_limits<uint32_t>::max())
+    return kErrUnsupported;
+  hdr.payload_size = static_cast<uint32_t>(payload_bytes);
+  int ret = sink(&hdr, sizeof(hdr));
+  if (ret == 0) ret = sink(&payload, sizeof(payload));
+  if (ret == 0) ret = WriteSerialized(sink, centroids_.data(), centroids_bytes);
+  if (ret == 0 && centroid_bytes)
+    ret = WriteSerialized(sink, centroid_.data(), centroid_bytes);
+  if (ret == 0) ret = opq_.serialize_to(sink);
+  return ret;
 }
 
 int PqInt4Quantizer::deserialize(std::string &in) {

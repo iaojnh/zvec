@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -25,6 +26,7 @@
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
+#include "ailego/pattern/defer.h"
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "mixed_reducer/mixed_streamer_reducer.h"
 
@@ -567,9 +569,8 @@ class ReadFailureReformer : public IndexReformer {
 
 class RetainingTestBuilder : public IndexBuilder {
  public:
-  explicit RetainingTestBuilder(
-      const std::string &name = "SnapshotTestBuilder",
-      ailego::ThreadPool *expected_pool = nullptr)
+  explicit RetainingTestBuilder(const std::string &name = "SnapshotTestBuilder",
+                                ailego::ThreadPool *expected_pool = nullptr)
       : expected_pool_(expected_pool) {
     set_name(name);
   }
@@ -579,7 +580,8 @@ class RetainingTestBuilder : public IndexBuilder {
     train_used_expected_pool = uses_expected_pool(threads);
     return 0;
   }
-  int build(IndexThreads::Pointer threads, IndexHolder::Pointer input) override {
+  int build(IndexThreads::Pointer threads,
+            IndexHolder::Pointer input) override {
     build_thread_count = threads ? threads->count() : 0;
     build_used_expected_pool = uses_expected_pool(threads);
     holder = std::move(input);
@@ -724,30 +726,81 @@ TEST(MergedProviderIndexHolderTest,
 
 TEST(MergedProviderIndexHolderTest,
      IvfBuilderUsesProviderBackedInputAndReducerThreadPool) {
-  auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
-  ailego::ThreadPool pool(2, false);
-  auto builder =
-      std::make_shared<RetainingTestBuilder>("IVFBuilder", &pool);
-  MixedStreamerReducer reducer;
-  ailego::Params params;
-  params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
-  ASSERT_EQ(0, reducer.init(params));
-  reducer.set_thread_pool(&pool);
-  ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
-                   builder, source, nullptr, nullptr,
-                   IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension)));
-  ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
-  ASSERT_EQ(0, reducer.reduce({}));
-  EXPECT_EQ(pool.count(), builder->train_thread_count);
-  EXPECT_EQ(pool.count(), builder->build_thread_count);
-  EXPECT_TRUE(builder->train_used_expected_pool);
-  EXPECT_TRUE(builder->build_used_expected_pool);
-  ASSERT_NE(nullptr, builder->holder);
-  auto *merged =
-      dynamic_cast<MergedProviderIndexHolder *>(builder->holder.get());
-  ASSERT_NE(nullptr, merged);
-  EXPECT_EQ((std::vector<std::pair<uint64_t, float>>{{0, 0.0F}, {1, 1.0F}}),
-            ReadAll(merged));
+  for (const auto *name :
+       {"IVFBuilder", "DiskAnnBuilder", "IvfRabitqBuilder"}) {
+    SCOPED_TRACE(name);
+    auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
+    ailego::ThreadPool pool(2, false);
+    auto builder = std::make_shared<RetainingTestBuilder>(name, &pool);
+    MixedStreamerReducer reducer;
+    ailego::Params params;
+    params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
+    ASSERT_EQ(0, reducer.init(params));
+    reducer.set_thread_pool(&pool);
+    ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                     builder, source, nullptr, nullptr,
+                     IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension)));
+    ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+    ASSERT_EQ(0, reducer.reduce({}));
+    EXPECT_EQ(pool.count(), builder->train_thread_count);
+    EXPECT_EQ(pool.count(), builder->build_thread_count);
+    EXPECT_TRUE(builder->train_used_expected_pool);
+    EXPECT_TRUE(builder->build_used_expected_pool);
+    ASSERT_NE(nullptr, builder->holder);
+    auto *merged =
+        dynamic_cast<MergedProviderIndexHolder *>(builder->holder.get());
+    ASSERT_NE(nullptr, merged);
+    EXPECT_EQ((std::vector<std::pair<uint64_t, float>>{{0, 0.0F}, {1, 1.0F}}),
+              ReadAll(merged));
+  }
+}
+
+TEST(MergedProviderIndexHolderTest, RabitqMergePropagatesDeferredReadFailures) {
+  class ReadingBuilder : public RetainingTestBuilder {
+   public:
+    explicit ReadingBuilder(bool fail_in_train)
+        : RetainingTestBuilder("IvfRabitqBuilder"), in_train(fail_in_train) {}
+    int train(IndexThreads::Pointer threads,
+              IndexHolder::Pointer input) override {
+      RetainingTestBuilder::train(std::move(threads), input);
+      if (in_train) consume(input);
+      return 0;
+    }
+    int build(IndexThreads::Pointer, IndexHolder::Pointer input) override {
+      consume(input);
+      return 0;
+    }
+    void consume(const IndexHolder::Pointer &input) {
+      EXPECT_NE(nullptr,
+                dynamic_cast<MergedProviderIndexHolder *>(input.get()));
+      auto iter = input->create_iterator();
+      ASSERT_NE(nullptr, iter);
+      for (; iter->is_valid(); iter->next()) {
+        if (!iter->data()) break;
+      }
+      EXPECT_EQ(IndexError_ReadData, iter->status());
+    }
+    bool in_train;
+  };
+  for (bool in_train : {true, false}) {
+    auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
+    auto reformer = std::make_shared<ReadFailureReformer>();
+    reformer->failed_value = 1.0F;
+    reformer->fail = true;
+    auto builder = std::make_shared<ReadingBuilder>(in_train);
+    ailego::ThreadPool pool(1, false);
+    MixedStreamerReducer reducer;
+    ailego::Params params;
+    params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
+    ASSERT_EQ(0, reducer.init(params));
+    reducer.set_thread_pool(&pool);
+    ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                     builder, source, nullptr, nullptr,
+                     IndexQueryMeta(IndexMeta::DT_FP32, kDimension)));
+    ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, reformer));
+    EXPECT_EQ(IndexError_ReadData, reducer.reduce({}));
+    EXPECT_EQ(1u, builder->train_calls);
+  }
 }
 
 TEST(MergedProviderIndexHolderTest, PlainTurboFp32KeepsOrdinalReads) {
@@ -1000,6 +1053,79 @@ TEST(MergedProviderIndexHolderTest, OrdinalReadsReuseFilterAndOneProvider) {
   EXPECT_EQ(1u, lifetime->peak_live_count);
   EXPECT_EQ(5u, filter_calls);
   EXPECT_EQ(0, holder.status());
+}
+
+TEST(MergedProviderIndexHolderTest, TinyPoolRejectsUnbudgetedKeyMap) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t old = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(old));
+  });
+  ASSERT_EQ(0, pool.init(1));
+  MergedProviderIndexHolder holder(
+      IndexQueryMeta(IndexMeta::DT_FP32, kDimension),
+      {MakeSource(MakeStreamer({{7, 10.0f}, {9, 11.0f}}))});
+  ASSERT_EQ(0, holder.init({}));
+  OrdinalAccessHolder::Reader::Pointer reader;
+  EXPECT_EQ(IndexError_NoMemory, holder.create_ordinal_reader(&reader));
+  EXPECT_EQ(nullptr, reader);
+  EXPECT_EQ(IndexError_NoMemory, holder.status());
+  EXPECT_EQ(IndexError_NoMemory, holder.create_ordinal_reader(&reader));
+  EXPECT_EQ(0u, pool.used());
+}
+
+TEST(MergedProviderIndexHolderTest, ConcurrentReadersShareOnePagedKeyMap) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t old = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(old));
+  });
+  const size_t budget =
+      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      32 * 1024;
+  ASSERT_EQ(0, pool.init(budget));
+  auto lifetime = std::make_shared<ProviderLifetimeStats>();
+  std::vector<std::pair<uint64_t, float>> docs;
+  for (size_t i = 0; i < 524288; ++i)
+    docs.emplace_back(2 * i + 1, static_cast<float>(i));
+  MergedProviderIndexHolder holder(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension),
+      {MakeSource(MakeStreamer(docs, lifetime))});
+  ASSERT_EQ(0, holder.init({}));
+  const size_t before = lifetime->created_count;
+  std::vector<std::future<OrdinalAccessHolder::Reader::Pointer>> workers;
+  for (size_t i = 0; i < 8; ++i) {
+    workers.push_back(std::async(std::launch::async, [&holder] {
+      OrdinalAccessHolder::Reader::Pointer reader;
+      EXPECT_EQ(0, holder.create_ordinal_reader(&reader));
+      return reader;
+    }));
+  }
+  std::vector<OrdinalAccessHolder::Reader::Pointer> readers;
+  for (auto &worker : workers) readers.push_back(worker.get());
+  // Exactly one source scan, not one per worker. The key payload is larger
+  // than the pool and cannot be an inline or pinned whole-table copy.
+  EXPECT_EQ(before + 1, lifetime->created_count);
+  EXPECT_GT(docs.size() * sizeof(uint64_t), budget);
+  EXPECT_GT(pool.used(), 0u);
+  EXPECT_LE(pool.used(), budget);
+  for (auto &reader : readers) {
+    ASSERT_NE(nullptr, reader);
+    for (size_t ordinal : {131071u, 0u, 8192u}) {
+      uint64_t key = 0;
+      const void *data = nullptr;
+      ASSERT_EQ(0, reader->read(ordinal, &key, &data));
+      EXPECT_EQ(ordinal, key);
+      ASSERT_NE(nullptr, data);
+      EXPECT_FLOAT_EQ(static_cast<float>(ordinal),
+                      static_cast<const float *>(data)[0]);
+    }
+    reader->reset();
+  }
 }
 
 TEST(MergedProviderIndexHolderTest, OrdinalReadsReleaseBlocksBeforeNextRead) {

@@ -15,7 +15,7 @@
 
 #include <cstdint>
 #include <string>
-#include <zvec/ailego/container/heap.h>
+#include <zvec/ailego/buffer/budgeted_heap.h>
 #include <zvec/core/framework/index_storage.h>
 
 namespace zvec {
@@ -68,6 +68,36 @@ class IndexSparseDocument {
  */
 class IndexDocument {
  public:
+  // Immutable after publication. Candidate heaps and returned documents share
+  // one payload and one reservation, including copies retained by the caller.
+  struct VectorPayload {
+    VectorPayload(const void *src, size_t size) {
+      if (size == SIZE_MAX) throw std::bad_alloc();
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      charge_ = pool.capacity() ? size + 1 : 0;
+      if (charge_ && !pool.try_charge_workspace(charge_))
+        throw std::bad_alloc();
+      try {
+        data.assign(static_cast<const char *>(src), size);
+      } catch (...) {
+        if (charge_) pool.release_external(charge_);
+        throw;
+      }
+    }
+    ~VectorPayload() {
+      // Release the backing string before making its budget available again.
+      std::string().swap(data);
+      if (charge_)
+        ailego::MemoryLimitPool::get_instance().release_external(charge_);
+    }
+    VectorPayload(const VectorPayload &) = delete;
+    VectorPayload &operator=(const VectorPayload &) = delete;
+    std::string data;
+
+   private:
+    size_t charge_{0};
+  };
+
   //! Constructor
   IndexDocument() = default;
 
@@ -105,6 +135,10 @@ class IndexDocument {
         index_(i),
         vector_string_(std::move(vector_string)) {}
 
+  IndexDocument(uint64_t k, float v, uint32_t i,
+                std::shared_ptr<const VectorPayload> payload)
+      : key_(k), score_(v), index_(i), vector_payload_(std::move(payload)) {}
+
   //! Constructor
   IndexDocument(uint64_t k, float v, uint32_t i, std::string vector_string,
                 IndexSparseDocument sparse_doc)
@@ -133,13 +167,18 @@ class IndexDocument {
         score_(rhs.score_),
         index_(rhs.index_),
         vector_(rhs.vector_),
-        vector_string_(std::move(rhs.vector_string_)),
+        vector_string_(rhs.vector_string_),
+        vector_payload_(rhs.vector_payload_),
         sparse_doc_{rhs.sparse_doc_} {
     if (rhs.has_vec_mem_block_) {
       vec_mem_block_ = rhs.vec_mem_block_;
       has_vec_mem_block_ = true;
+      vector_ = vec_mem_block_.data();
     }
   }
+
+  IndexDocument(IndexDocument &&) noexcept = default;
+  IndexDocument &operator=(IndexDocument &&) noexcept = default;
 
   //! Assignment
   IndexDocument &operator=(const IndexDocument &rhs) {
@@ -149,10 +188,10 @@ class IndexDocument {
       index_ = rhs.index_;
       vector_ = rhs.vector_;
       vector_string_ = rhs.vector_string_;
-      if (rhs.has_vec_mem_block_) {
-        vec_mem_block_ = rhs.vec_mem_block_;
-        has_vec_mem_block_ = true;
-      }
+      vector_payload_ = rhs.vector_payload_;
+      vec_mem_block_ = rhs.vec_mem_block_;
+      has_vec_mem_block_ = rhs.has_vec_mem_block_;
+      if (has_vec_mem_block_) vector_ = vec_mem_block_.data();
       sparse_doc_ = rhs.sparse_doc_;
     }
     return *this;
@@ -190,7 +229,7 @@ class IndexDocument {
 
   //! Retrieve vec string
   const std::string &vector_string() const {
-    return vector_string_;
+    return vector_payload_ ? vector_payload_->data : vector_string_;
   }
 
   //! Retrieve vec
@@ -235,6 +274,7 @@ class IndexDocument {
   uint32_t index_{0u};
   const void *vector_{nullptr};
   std::string vector_string_{};
+  std::shared_ptr<const VectorPayload> vector_payload_{};
   bool has_vec_mem_block_{false};
   mutable IndexStorage::MemoryBlock vec_mem_block_{};
   IndexSparseDocument sparse_doc_{};
@@ -298,6 +338,91 @@ class IndexDocumentHeap : public ailego::Heap<IndexDocument> {
   //! members
   float threshold_{std::numeric_limits<float>::max()};
 };
+
+// Search scratch does not own vectors. Materialize IndexDocument only at the
+// result boundary, rather than carrying its payload holders in every heap slot.
+class IndexCandidate {
+ public:
+  IndexCandidate() = default;
+  IndexCandidate(uint64_t key, float score, uint32_t index = 0)
+      : key_(key), score_(score), index_(index) {}
+  uint64_t key() const {
+    return key_;
+  }
+  float score() const {
+    return score_;
+  }
+  uint32_t index() const {
+    return index_;
+  }
+  uint64_t *mutable_key() {
+    return &key_;
+  }
+  float *mutable_score() {
+    return &score_;
+  }
+  uint32_t *mutable_index() {
+    return &index_;
+  }
+  void set_key(uint64_t key) {
+    key_ = key;
+  }
+  bool operator<(const IndexCandidate &rhs) const {
+    return score_ < rhs.score_;
+  }
+  operator IndexDocument() const {
+    return IndexDocument(key_, score_, index_);
+  }
+
+ private:
+  uint64_t key_{0};
+  float score_{0};
+  uint32_t index_{0};
+};
+static_assert(sizeof(IndexCandidate) == 16,
+              "Candidate payload must stay compact");
+
+template <typename Base>
+class BasicIndexCandidateHeap : public Base {
+ public:
+  using Base::mutable_container;
+  using Container = std::remove_reference_t<
+      decltype(std::declval<Base &>().mutable_container())>;
+  BasicIndexCandidateHeap() = default;
+  explicit BasicIndexCandidateHeap(size_t max) {
+    limit(max);
+  }
+  void emplace(uint64_t key, float score, uint32_t index = 0) {
+    if (score <= threshold_) Base::emplace(key, score, index);
+  }
+  void set_threshold(float value) {
+    threshold_ = value;
+  }
+  float threshold() const {
+    return threshold_;
+  }
+  void clear() {
+    auto &items = mutable_container();
+    items.clear();
+    // Retain small scratch for the hot path, not a rare query's high-water
+    // mark.
+    if (items.capacity() > 4096) Container().swap(items);
+  }
+  void release() {
+    Container().swap(mutable_container());
+  }
+  void limit(size_t max) {
+    // Do not reserve user-supplied topk before seeing any candidates.
+    Base::limit(max, false);
+  }
+
+ private:
+  float threshold_{std::numeric_limits<float>::max()};
+};
+
+using IndexCandidateHeap =
+    BasicIndexCandidateHeap<ailego::BudgetedHeap<IndexCandidate>>;
+using BudgetedIndexCandidateHeap = IndexCandidateHeap;
 
 class GroupIndexDocument {
  public:

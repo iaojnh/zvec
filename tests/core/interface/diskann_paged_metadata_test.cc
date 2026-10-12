@@ -231,6 +231,52 @@ TEST(DiskAnnPagedMetadataTest, LazyReadsCloneLifetimeAndIoErrors) {
     EXPECT_EQ(pq_segment->lease.use_count(),
               1);  // No page pin retained between hops.
 
+    for (auto mode : {VisitFilter::BitMap, VisitFilter::ByteMap,
+                      VisitFilter::EpochBitMap}) {
+      SCOPED_TRACE(mode);
+      VisitFilter visited;
+      ASSERT_EQ(visited.init(mode, 3, 3, 0.01f), 0);
+      visited.set_visited(0);
+      std::vector<diskann_id_t> unvisited;
+      std::vector<float> selected_distances;
+      const size_t before = pq_segment->reads;
+      dc.quantized_dist_unvisited(ids, 4, visited, unvisited,
+                                  selected_distances);
+      ASSERT_FALSE(dc.error());
+      ASSERT_EQ(unvisited, (std::vector<diskann_id_t>{2, 1}));
+      ASSERT_EQ(selected_distances.size(), 2u);
+      EXPECT_FLOAT_EQ(selected_distances[0], distances[0]);
+      EXPECT_FLOAT_EQ(selected_distances[1], distances[3]);
+      EXPECT_EQ(pq_segment->reads - before, paged ? 2u : 0u);
+      EXPECT_EQ(pq_segment->lease.use_count(), 1);
+
+      // No read (or quantizer invocation) when every neighbor was visited.
+      pq_segment->fail = true;
+      dc.quantized_dist_unvisited(ids, 4, visited, unvisited,
+                                  selected_distances);
+      EXPECT_FALSE(dc.error());
+      EXPECT_TRUE(unvisited.empty());
+      EXPECT_TRUE(selected_distances.empty());
+      EXPECT_EQ(pq_segment->reads - before, paged ? 2u : 0u);
+
+      if (paged) {
+        // A fresh query still surfaces read failures and releases every pin.
+        visited.clear();
+        dc.quantized_dist_unvisited(ids, 4, visited, unvisited,
+                                    selected_distances);
+        EXPECT_EQ(dc.error_code(), IndexError_ReadData);
+        EXPECT_EQ(pq_segment->lease.use_count(), 1);
+        dc.clear();
+      }
+      pq_segment->fail = false;
+      visited.clear();
+      const diskann_id_t invalid = 3;
+      dc.quantized_dist_unvisited(&invalid, 1, visited, unvisited,
+                                  selected_distances);
+      EXPECT_EQ(dc.error_code(), IndexError_InvalidFormat);
+      dc.clear();
+    }
+
     if (paged) {
       pq_segment->fail = true;
       dc.quantized_dist(ids, 4, distances);

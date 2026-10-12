@@ -19,8 +19,10 @@
 #include <iostream>
 #include <limits>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_provider.h>
@@ -29,6 +31,57 @@
 using namespace zvec::core;
 using namespace zvec::ailego;
 using namespace std;
+
+TEST(IVFBufferedKeysTest, KeysShareVectorStorageWithoutResidentArray) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  // Writable stores also reserve writeback staging and lock metadata. Keep
+  // only a few data pages, and make the keys alone larger than the budget.
+  const size_t budget =
+      VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      16 * kVectorPageSize;
+  ASSERT_EQ(0, pool.init(budget));
+  IndexMeta meta;
+  meta.set_meta(IndexMeta::DT_FP32, 8);
+  std::string prefix;
+  ASSERT_EQ(0, TemporaryBufferStorage::DefaultPrefix("ivf-keys-test", &prefix));
+  const size_t count = budget / sizeof(uint64_t) + 503;
+  IVFBuilder::RandomAccessIndexHolder holder(meta);
+  ASSERT_EQ(0, holder.enable_buffered_storage(prefix, count));
+  holder.reserve(count);
+  EXPECT_EQ(0u, holder.resident_key_capacity());
+  for (size_t i = 0; i < count; ++i) {
+    const float row[8] = {static_cast<float>(i)};
+    ASSERT_EQ(0, holder.emplace((uint64_t{1} << 40) + count - i, row));
+  }
+  ASSERT_EQ(0, holder.flush());
+  ASSERT_EQ(count, holder.count());
+  EXPECT_EQ(0u, holder.resident_key_capacity());
+  EXPECT_LT(pool.used(), count * sizeof(uint64_t));
+  uint64_t key = 0;
+  EXPECT_EQ(IndexError_OutOfRange, holder.read_key(count, &key));
+  auto iter = holder.create_iterator();
+  size_t i = 0;
+  for (; iter->is_valid(); iter->next(), ++i) {
+    EXPECT_EQ((uint64_t{1} << 40) + count - i, iter->key());
+    ASSERT_EQ(0, iter->status());
+    if (i % 513 == 0) {
+      const auto *row = static_cast<const float *>(iter->data());
+      ASSERT_NE(nullptr, row);
+      EXPECT_EQ(static_cast<float>(i), row[0]);
+    }
+  }
+  EXPECT_EQ(count, i);
+  EXPECT_EQ(0, iter->status());
+  const float row[8] = {};
+  EXPECT_EQ(IndexError_OutOfRange, holder.emplace(0, row));
+  EXPECT_EQ(count, holder.count());
+}
 
 class IVFBuilderTest : public testing::Test {
  protected:
@@ -226,6 +279,57 @@ TEST_F(IVFBuilderTest, TwoPassHolderKeepsSuccessfulSecondPass) {
     }
     EXPECT_EQ(holder_->count(), read_count);
     EXPECT_EQ(0, iter->status());
+  }
+}
+
+TEST_F(IVFBuilderTest, TwoPassSpillsInputLargerThanPool) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  constexpr size_t kBudget = 8UL << 20;
+  ASSERT_EQ(0, pool.init(kBudget));
+  dimension_ = 768;
+  index_meta_.set_meta(IndexMeta::DT_FP32, dimension_);
+  prepare_index_holder(0, 4096);
+  ASSERT_GT(holder_->count() * holder_->element_size(), kBudget);
+  class UnknownCountSource : public SinglePassIteratorErrorHolder {
+   public:
+    using SinglePassIteratorErrorHolder::SinglePassIteratorErrorHolder;
+    size_t count() const override {
+      return size_t(-1);
+    }
+  };
+  for (bool unknown : {false, true}) {
+    SCOPED_TRACE(unknown);
+    IndexHolder::Pointer source;
+    if (unknown)
+      source = std::make_shared<UnknownCountSource>(
+          holder_, 5000, IteratorErrorOperation::kValidity);
+    else
+      source = std::make_shared<SinglePassIteratorErrorHolder>(
+          holder_, 5000, IteratorErrorOperation::kValidity);
+    auto two_pass = IndexHelper::MakeTwoPassHolder(source);
+    EXPECT_EQ(source->count(), two_pass->count());
+    for (size_t pass = 0; pass < 2; ++pass) {
+      auto iter = two_pass->create_iterator();
+      ASSERT_TRUE(iter);
+      size_t count = 0;
+      for (; iter->is_valid(); iter->next(), ++count) {
+        EXPECT_EQ(count, iter->key());
+        auto *row = static_cast<const float *>(iter->data());
+        ASSERT_NE(nullptr, row);
+        EXPECT_FLOAT_EQ(static_cast<float>(count), row[0]);
+      }
+      EXPECT_EQ(0, iter->status());
+      EXPECT_EQ(4096u, count);
+      EXPECT_LE(pool.used(), kBudget);
+      EXPECT_LT(pool.external_used(), 1UL << 20);
+    }
+    two_pass.reset();
+    EXPECT_EQ(0u, pool.used());
   }
 }
 

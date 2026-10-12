@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "hnsw_sparse_searcher.h"
+#include "utility/group_candidate_collector.h"
 #include "hnsw_sparse_algorithm.h"
 #include "hnsw_sparse_index_provider.h"
 #include "hnsw_sparse_params.h"
@@ -209,7 +210,7 @@ int HnswSparseSearcher::search_impl(const uint32_t *sparse_count,
                                     const uint32_t *sparse_indices,
                                     const void *sparse_query,
                                     const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const {
+                                    Context::Pointer &context) const try {
   if (ailego_unlikely(!context)) {
     LOG_ERROR("The context is not created by this searcher");
     return IndexError_Mismatch;
@@ -284,13 +285,15 @@ int HnswSparseSearcher::search_impl(const uint32_t *sparse_count,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
 int HnswSparseSearcher::search_bf_impl(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
   if (ailego_unlikely(!context)) {
     LOG_ERROR("The context is not created by this searcher");
     return IndexError_Mismatch;
@@ -333,6 +336,7 @@ int HnswSparseSearcher::search_bf_impl(
       ctx->reset_query(sparse_query_buffer.data());
 
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (node_id_t id = 0; id < entity_.doc_cnt(); ++id) {
         if (entity_.get_key(id) == kInvalidKey) {
@@ -344,13 +348,14 @@ int HnswSparseSearcher::search_bf_impl(
 
           std::string group_id = group_by(id);
 
-          auto &topk_heap = ctx->group_topk_heaps()[group_id];
-          if (topk_heap.empty()) {
-            topk_heap.limit(ctx->group_topk());
-          }
-          topk_heap.emplace(id, dist);
+          if (int group_ret = groups.add(group_id, id, dist); group_ret != 0)
+            return group_ret;
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
 
       sparse_indices_tmp += sparse_count[q];
@@ -390,6 +395,8 @@ int HnswSparseSearcher::search_bf_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
@@ -398,6 +405,15 @@ int HnswSparseSearcher::search_bf_by_p_keys_impl(
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
+  return search_bf_key_batch(sparse_count, sparse_indices, sparse_query, p_keys,
+                             qmeta, count, context);
+}
+
+int HnswSparseSearcher::search_bf_key_batch(
+    const uint32_t *sparse_count, const uint32_t *sparse_indices,
+    const void *sparse_query, IndexKeyBatchView p_keys,
+    const IndexQueryMeta &qmeta, uint32_t count,
+    Context::Pointer &context) const try {
   if (ailego_unlikely(!context)) {
     LOG_ERROR("The context is not created by this searcher");
     return IndexError_Mismatch;
@@ -445,6 +461,7 @@ int HnswSparseSearcher::search_bf_by_p_keys_impl(
 
       ctx->reset_query(sparse_query_buffer.data());
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (size_t idx = 0; idx < p_keys[q].size(); ++idx) {
         uint64_t pk = p_keys[q][idx];
@@ -455,14 +472,15 @@ int HnswSparseSearcher::search_bf_by_p_keys_impl(
 
             std::string group_id = group_by(id);
 
-            auto &topk_heap = ctx->group_topk_heaps()[group_id];
-            if (topk_heap.empty()) {
-              topk_heap.limit(ctx->group_topk());
-            }
-            topk_heap.emplace(id, dist);
+            if (int group_ret = groups.add(group_id, id, dist); group_ret != 0)
+              return group_ret;
           }
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
 
       sparse_indices_tmp += sparse_count[q];
@@ -501,6 +519,8 @@ int HnswSparseSearcher::search_bf_by_p_keys_impl(
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 IndexSearcher::Context::Pointer HnswSparseSearcher::create_context() const {
@@ -522,7 +542,7 @@ IndexSearcher::Context::Pointer HnswSparseSearcher::create_context() const {
   ctx->set_ef(ef_);
   ctx->set_max_scan_num(max_scan_num_);
   uint32_t filter_mode =
-      bf_enabled_ ? VisitFilter::BloomFilter : VisitFilter::ByteMap;
+      bf_enabled_ ? VisitFilter::BloomFilter : VisitFilter::EpochBitMap;
   ctx->set_filter_mode(filter_mode);
   ctx->set_filter_negative_probability(bf_negative_probability_);
   ctx->set_magic(magic_);

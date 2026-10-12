@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/core/framework/index_error.h>
@@ -162,7 +163,7 @@ class BufferReadStorage : public IndexStorage {
     }
 
     //! Read data from segment (stable until this thread's next pointer read)
-    size_t read(size_t offset, const void **data, size_t len) override {
+    size_t read(size_t offset, const void **data, size_t len) override try {
       if (ailego_unlikely(data == nullptr)) {
         return 0;
       }
@@ -204,6 +205,9 @@ class BufferReadStorage : public IndexStorage {
       }
       *data = scratch->buffer.data();
       return len;
+    } catch (const std::bad_alloc &) {
+      if (data) *data = nullptr;
+      return 0;
     }
 
     //! Read data from segment into a MemoryBlock
@@ -288,7 +292,7 @@ class BufferReadStorage : public IndexStorage {
     }
 
     //! Read scattered data (stable until this thread's next pointer read)
-    bool read(SegmentData *iovec, size_t count) override {
+    bool read(SegmentData *iovec, size_t count) override try {
       ailego_false_if_false(iovec != nullptr && count != 0);
       size_t total = 0u;
       for (size_t i = 0; i < count; ++i) {
@@ -313,6 +317,8 @@ class BufferReadStorage : public IndexStorage {
         buf += it->length;
       }
       return true;
+    } catch (const std::bad_alloc &) {
+      return false;
     }
 
     size_t write(size_t, const void *, size_t) override {
@@ -371,7 +377,7 @@ class BufferReadStorage : public IndexStorage {
       }
 
       std::weak_ptr<const uint8_t> owner;
-      std::vector<uint8_t> buffer;
+      std::vector<uint8_t, ailego::BudgetedAllocator<uint8_t>> buffer;
       std::shared_ptr<ailego::VecBufferPoolHandle> handle;
       size_t pinned_page_id{0};
       bool page_pinned{false};
@@ -468,7 +474,7 @@ class BufferReadStorage : public IndexStorage {
     }
 
     size_t read_owned(size_t abs_offset, MemoryBlock &data, size_t len,
-                      bool force_bypass) const {
+                      bool force_bypass) const try {
       static constexpr size_t kAlign = 4096UL;
       if (ailego_unlikely(len >
                           std::numeric_limits<size_t>::max() - (kAlign - 1))) {
@@ -479,28 +485,23 @@ class BufferReadStorage : public IndexStorage {
         return 0;
       }
       size_t alloc_size = (len + (kAlign - 1UL)) & ~(kAlign - 1UL);
-      char *tmp =
-          static_cast<char *>(ailego_aligned_malloc(alloc_size, kAlign));
-      if (!tmp) {
-        LOG_ERROR(
-            "BufferReadStorage::Segment::read(MemoryBlock&): cross-page alloc "
-            "failed, abs_offset=%zu, len=%zu",
-            abs_offset, len);
-        return 0;
-      }
+      auto owned = MemoryBlock::AllocateOwned(alloc_size, kAlign);
+      auto *tmp = static_cast<char *>(owned.data_);
       const bool read_ok =
           force_bypass ? handle_->read_range_bypass(abs_offset, len, tmp)
                        : read_bytes(abs_offset, len, tmp);
       if (!read_ok) {
-        ailego_free(tmp);
         LOG_ERROR(
             "BufferReadStorage::Segment::read(MemoryBlock&): cross-page "
             "read_range failed, abs_offset=%zu, len=%zu",
             abs_offset, len);
         return 0;
       }
-      data = MemoryBlock::MakeOwned(tmp, len);
+      owned.scratch_size_ = len;
+      data = std::move(owned);
       return len;
+    } catch (const std::bad_alloc &) {
+      return 0;
     }
     size_t clamp_length(size_t *offset, size_t len) const {
       if (ailego_unlikely(*offset > region_size_)) {

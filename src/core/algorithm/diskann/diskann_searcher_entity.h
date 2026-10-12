@@ -49,7 +49,11 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   //! The quantizer itself is constructed by the searcher/streamer and handed
   //! to the indexer; the entity only owns the persisted bytes.  For a legacy
   //! layout the raw codebook is returned instead (see DiskAnnUtil).
-  int read_pq_quantizer_meta_buffer(std::string *meta_buffer) const;
+  struct QuantizerMetaBuffer {
+    ailego::MemoryReservation charge;
+    std::string bytes;
+  };
+  int read_pq_quantizer_meta_buffer(QuantizerMetaBuffer *meta_buffer) const;
 
   bool legacy_pq_layout() const {
     return legacy_pq_layout_;
