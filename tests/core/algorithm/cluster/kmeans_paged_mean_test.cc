@@ -15,6 +15,7 @@
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_framework.h>
+#include "cluster/multi_chunk_cluster.h"
 #include "cluster/paged_mean_table.h"
 
 namespace zvec::core {
@@ -95,7 +96,9 @@ TEST_F(KmeansPagedMeanTest, FixedCentroidsMatchHeapAndReleasePool) {
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t budget_bytes =
         2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
-        64 * 1024;
+        // Keep 64 KiB for pages after admitting the newly charged worker
+        // rows and initialization tile; the means still exceed resident pages.
+        64 * 1024 + (kDimension * 40 + 256) + 64 * 1024;
     for (size_t budget : {size_t{0}, budget_bytes}) {
       ASSERT_EQ(pool.init(budget), 0);
       auto cluster = IndexFactory::CreateCluster("KmeansCluster");
@@ -131,6 +134,71 @@ TEST_F(KmeansPagedMeanTest, FixedCentroidsMatchHeapAndReleasePool) {
       }
     }
   }
+}
+
+TEST_F(KmeansPagedMeanTest,
+       LegacyClassificationDenialCanRetryWithoutLostInput) {
+  IndexMeta meta(IndexMeta::DT_FP32, 4);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto features = std::make_shared<CompactIndexFeatures>(meta);
+  const float low[]{0, 0, 0, 0}, high[]{10, 10, 10, 10};
+  for (size_t i = 0; i < 100; ++i) features->emplace(i % 2 ? high : low);
+  auto cluster = IndexFactory::CreateCluster("KmeansCluster");
+  ASSERT_EQ(0, cluster->init(meta, ailego::Params()));
+  ASSERT_EQ(0, cluster->mount(features));
+  IndexCluster::CentroidList centers;
+  centers.emplace_back(low, sizeof(low));
+  centers.emplace_back(high, sizeof(high));
+  auto threads = std::make_shared<SingleQueueIndexThreads>(2, false);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(1));
+  std::vector<uint32_t> labels{99};
+  EXPECT_EQ(IndexError_NoMemory, cluster->label(threads, centers, &labels));
+  EXPECT_EQ(std::vector<uint32_t>{99}, labels);
+  EXPECT_EQ(IndexError_NoMemory, cluster->classify(threads, centers));
+  EXPECT_TRUE(centers[0].similars().empty());
+  EXPECT_TRUE(centers[1].similars().empty());
+  EXPECT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(2 * 1024 * 1024));
+  ASSERT_EQ(0, cluster->label(threads, centers, &labels));
+  ASSERT_EQ(100u, labels.size());
+  for (size_t i = 0; i < labels.size(); ++i) EXPECT_EQ(i % 2, labels[i]);
+  ASSERT_EQ(0, cluster->classify(threads, centers));
+  EXPECT_EQ(50u, centers[0].similars().size());
+  EXPECT_EQ(50u, centers[1].similars().size());
+  // Outputs are now caller-owned; temporary shards/allowances are gone.
+  EXPECT_EQ(0u, pool.used());
+}
+
+TEST_F(KmeansPagedMeanTest, MultiChunkLabelsReserveBeforeChangingOutput) {
+  IndexMeta meta(IndexMeta::DT_FP32, 4);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto features = std::make_shared<CompactIndexFeatures>(meta);
+  const float low[]{0, 0, 0, 0}, high[]{10, 10, 10, 10};
+  for (size_t i = 0; i < 100; ++i) features->emplace(i % 2 ? high : low);
+  MultiChunkCluster cluster;
+  ailego::Params params;
+  params.set("zvec.cluster.multi_chunk_cluster.count", 2);
+  params.set("zvec.cluster.multi_chunk_cluster.chunk_count", 2);
+  params.set("zvec.cluster.multi_chunk_cluster.thread_count", 2);
+  ASSERT_EQ(0, cluster.init(meta, params));
+  ASSERT_EQ(0, cluster.mount(features));
+  IndexCluster::CentroidList centers;
+  for (size_t chunk = 0; chunk < 2; ++chunk) {
+    centers.emplace_back(low, 2 * sizeof(float));
+    centers.emplace_back(high, 2 * sizeof(float));
+  }
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(1));
+  std::vector<uint32_t> labels{99};
+  EXPECT_EQ(IndexError_NoMemory, cluster.label(nullptr, centers, &labels));
+  EXPECT_EQ(std::vector<uint32_t>{99}, labels);
+  EXPECT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(2 * 1024 * 1024));
+  ASSERT_EQ(0, cluster.label(nullptr, centers, &labels));
+  ASSERT_EQ(200u, labels.size());
+  for (size_t i = 0; i < labels.size(); ++i) EXPECT_EQ((i / 2) % 2, labels[i]);
+  EXPECT_EQ(0u, pool.used());
 }
 }  // namespace
 }  // namespace zvec::core

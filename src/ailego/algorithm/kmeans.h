@@ -23,6 +23,7 @@
 #include <ailego/math/norm2_matrix.h>
 #include <ailego/math/normalizer.h>
 #include <ailego/utility/matrix_helper.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/utility/float_helper.h>
@@ -140,6 +141,10 @@ class Kmc2CentroidsGenerator {
     const size_t matrix_count = owner->feature_matrix_count();
 
     // Probability
+    if (matrix_count > std::numeric_limits<size_t>::max() - cache.count())
+      throw std::bad_alloc();
+    MemoryReservation probabilities_memory;
+    probabilities_memory.add_array(matrix_count + cache.count(), sizeof(float));
     std::vector<float> probs(matrix_count + cache.count());
 
     // Sample first center uniformly

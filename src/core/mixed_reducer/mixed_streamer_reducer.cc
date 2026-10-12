@@ -13,9 +13,11 @@
 // limitations under the License.
 #include "mixed_streamer_reducer.h"
 #include <cstring>
+#include <limits>
 #include <ailego/pattern/defer.h>
 #include <turbo/quantizer/quantizer.h>
 #include <utility/sparse_utility.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/ailego/utility/string_helper.h>
@@ -33,7 +35,18 @@ namespace {
 
 template <IndexMeta::DataType DT, typename T>
 int MaterializeMergedInput(const MergedProviderIndexHolder::Pointer &source,
-                           IndexHolder::Pointer *output) {
+                           IndexHolder::Pointer *output) try {
+  // Legacy builders need stable pointers until dump. Admit the snapshot
+  // before copying it, and keep the allowance alive with the retained holder.
+  struct Owner {
+    ailego::MemoryReservation memory;
+    std::shared_ptr<MultiPassIndexHolder<DT>> snapshot;
+  };
+  auto owner = std::make_shared<Owner>();
+  constexpr size_t overhead = 2 * sizeof(ailego::NumericalVector<T>) + 64;
+  if (source->element_size() > std::numeric_limits<size_t>::max() - overhead)
+    return IndexError_Overflow;
+  owner->memory.add_array(source->count(), source->element_size() + overhead);
   auto snapshot =
       std::make_shared<MultiPassIndexHolder<DT>>(source->dimension());
   snapshot->reserve(source->count());
@@ -71,8 +84,11 @@ int MaterializeMergedInput(const MergedProviderIndexHolder::Pointer &source,
   if (snapshot->count() != source->count()) {
     return IndexError_Mismatch;
   }
-  *output = std::move(snapshot);
+  owner->snapshot = snapshot;
+  *output = IndexHolder::Pointer(std::move(owner), snapshot.get());
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 }  // namespace

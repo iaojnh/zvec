@@ -14,6 +14,7 @@
 #include <atomic>
 #include <ailego/container/reservoir.h>
 #include <ailego/pattern/scope_guard.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_cluster.h>
@@ -146,7 +147,8 @@ class KmeansCluster : public IndexCluster {
   IndexMeta meta_{};
   IndexFeatures::Pointer features_{};
   LinearSeeker::Pointer seeker_{};
-  std::vector<double> shard_cluster_scores_{};
+  std::vector<double, ailego::BudgetedAllocator<double>>
+      shard_cluster_scores_{};
   std::vector<std::vector<const void *>> shard_cluster_features_{};
   std::shared_ptr<VectorMeanArray> shard_cluster_means_{};
   std::shared_ptr<VectorMeanArray> batch_means_{};
@@ -154,7 +156,7 @@ class KmeansCluster : public IndexCluster {
   PagedMeanTable paged_batch_;
   bool paged_means_{false};
   std::atomic<int> workspace_error_{0};
-  std::vector<double> batch_scores_{};
+  std::vector<double, ailego::BudgetedAllocator<double>> batch_scores_{};
   double epsilon_{std::numeric_limits<float>::epsilon()};
   float shard_factor_{16.0f};
   uint32_t max_iterations_{20u};
@@ -478,7 +480,7 @@ int KmeansCluster::mount(IndexFeatures::Pointer feats) {
 }
 
 int KmeansCluster::cluster(IndexThreads::Pointer threads,
-                           IndexCluster::CentroidList &cents) {
+                           IndexCluster::CentroidList &cents) try {
   ailego::ElapsedTime stamp;
 
   if (!threads) {
@@ -505,10 +507,19 @@ int KmeansCluster::cluster(IndexThreads::Pointer threads,
     this->init_centroids(cluster_count_, &cents);
   }
 
+  // Account for the bounded rows retained by workers alongside paged means.
+  ailego::MemoryReservation worker_memory;
+  const size_t workspace_dimension = meta_.dimension();
+  if (workspace_dimension > (std::numeric_limits<size_t>::max() - 256) / 40)
+    return IndexError_Overflow;
+  worker_memory.add_array(threads->count(), workspace_dimension * 40 + 256);
+  worker_memory.add(64 * 1024);
   paged_means_ = ailego::MemoryLimitPool::get_instance().capacity() != 0;
   auto release_workspaces = ailego::ScopeGuard::Make([&]() {
     paged_shards_ = PagedMeanTable();
     paged_batch_ = PagedMeanTable();
+    decltype(shard_cluster_scores_)().swap(shard_cluster_scores_);
+    decltype(batch_scores_)().swap(batch_scores_);
   });
   if (batch_) {
     batch_means_.reset();
@@ -564,10 +575,12 @@ int KmeansCluster::cluster(IndexThreads::Pointer threads,
   // Purge the empty centroids
   PurgeCentroids(cents, purge_empty_);
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int KmeansCluster::classify(IndexThreads::Pointer threads,
-                            IndexCluster::CentroidList &cents) {
+                            IndexCluster::CentroidList &cents) try {
   if (!threads) {
     threads = std::make_shared<SingleQueueIndexThreads>(thread_count_, false);
     if (!threads) {
@@ -595,14 +608,30 @@ int KmeansCluster::classify(IndexThreads::Pointer threads,
     return result;
   }
 
+  // These legacy result lists become caller-owned on return. During the
+  // operation reserve worker-vector growth plus the returned pointer lists.
+  ailego::MemoryReservation workspace;
+  workspace.add_array(features_->count(), 4 * sizeof(const void *));
+  if (!threads->count() ||
+      cents.size() > std::numeric_limits<size_t>::max() / threads->count())
+    return IndexError_Overflow;
+  workspace.add_array(threads->count() * cents.size(),
+                      sizeof(std::vector<const void *>));
+  auto release = ailego::ScopeGuard::Make([&] {
+    decltype(shard_cluster_features_)().swap(shard_cluster_features_);
+  });
+  workspace_error_.store(0, std::memory_order_relaxed);
   this->update_clusters(threads.get(), cents);
+  if (workspace_error_.load() != 0) return workspace_error_.load();
   this->update_features(threads.get(), cents);
-  return 0;
+  return workspace_error_.load();
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int KmeansCluster::label(IndexThreads::Pointer threads,
                          const IndexCluster::CentroidList &cents,
-                         std::vector<uint32_t> *out) {
+                         std::vector<uint32_t> *out) try {
   if (!threads) {
     threads = std::make_shared<SingleQueueIndexThreads>(thread_count_, false);
     if (!threads) {
@@ -630,8 +659,13 @@ int KmeansCluster::label(IndexThreads::Pointer threads,
     return result;
   }
 
+  if (!out) return IndexError_InvalidArgument;
+  ailego::MemoryReservation output_memory;
+  output_memory.add_array(features_->count(), 2 * sizeof(uint32_t));
   this->update_labels(threads.get(), out);
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 bool KmeansCluster::is_valid() const {
@@ -961,7 +995,7 @@ void KmeansCluster::update_centroid_thread(
 }
 
 void KmeansCluster::update_cluster_thread(size_t index_begin, size_t index_end,
-                                          const IndexThreads *threads) {
+                                          const IndexThreads *threads) try {
   size_t thread_offset = threads->indexof_this() * seeker_->original()->count();
 
   for (size_t i = index_begin; i != index_end; ++i) {
@@ -974,10 +1008,12 @@ void KmeansCluster::update_cluster_thread(size_t index_begin, size_t index_end,
     size_t sel_column = thread_offset + result.index;
     shard_cluster_features_[sel_column].emplace_back(feat);
   }
+} catch (const std::bad_alloc &) {
+  workspace_error_.store(IndexError_NoMemory);
 }
 
-void KmeansCluster::update_features_thread(size_t column,
-                                           IndexCluster::CentroidList *out) {
+void KmeansCluster::update_features_thread(
+    size_t column, IndexCluster::CentroidList *out) try {
   size_t cluster_count = out->size();
   size_t cluster_follows = 0u;
 
@@ -1000,6 +1036,8 @@ void KmeansCluster::update_features_thread(size_t column,
       j += it.size();
     }
   }
+} catch (const std::bad_alloc &) {
+  workspace_error_.store(IndexError_NoMemory);
 }
 
 void KmeansCluster::update_labels_thread(size_t index_begin, size_t index_end,

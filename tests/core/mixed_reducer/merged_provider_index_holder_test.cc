@@ -725,6 +725,45 @@ TEST(MergedProviderIndexHolderTest,
 }
 
 TEST(MergedProviderIndexHolderTest,
+     LegacySnapshotAllowanceFollowsRetainedHolder) {
+  auto &memory = ailego::MemoryLimitPool::get_instance();
+  const auto previous = memory.capacity();
+  ASSERT_EQ(0u, memory.used());
+  ASSERT_EQ(0, memory.init(8 * 1024 * 1024));
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, memory.used());
+    EXPECT_EQ(0, memory.init(previous));
+  });
+  auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
+  auto builder = std::make_shared<RetainingTestBuilder>();
+  ailego::ThreadPool threads(1, false);
+  {
+    MixedStreamerReducer reducer;
+    ailego::Params params;
+    params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
+    ASSERT_EQ(0, reducer.init(params));
+    reducer.set_thread_pool(&threads);
+    ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                     builder, source, nullptr, nullptr,
+                     IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension)));
+    ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+    const size_t available = memory.capacity() - memory.used();
+    ASSERT_TRUE(memory.try_charge_external(available));
+    {
+      AILEGO_DEFER([&] { memory.release_external(available); });
+      EXPECT_EQ(IndexError_NoMemory, reducer.reduce({}));
+      EXPECT_EQ(0u, builder->train_calls);
+      EXPECT_FALSE(builder->holder);
+    }
+    ASSERT_EQ(0, reducer.reduce({}));
+  }
+  ASSERT_TRUE(builder->holder);
+  EXPECT_GE(memory.external_used(), 2u * kDimension * sizeof(float));
+  builder->holder.reset();
+  EXPECT_EQ(0u, memory.used());
+}
+
+TEST(MergedProviderIndexHolderTest,
      IvfBuilderUsesProviderBackedInputAndReducerThreadPool) {
   for (const auto *name :
        {"IVFBuilder", "DiskAnnBuilder", "IvfRabitqBuilder"}) {
