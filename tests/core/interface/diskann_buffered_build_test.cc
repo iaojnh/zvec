@@ -204,13 +204,20 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
 
     auto &pool = ailego::MemoryLimitPool::get_instance();
     size_t reservation = 0;
+    const size_t codebook_bytes =
+        256 * dimension * (fp16 ? sizeof(uint16_t) : sizeof(float));
+    // The live PQ model is mandatory workspace, not evictable vector pages.
+    // Include four chunks' centroid pointers and allocation headers as well.
+    const size_t model_allowance = codebook_bytes + 16 * 1024;
     auto release = ailego::ScopeGuard::Make([&]() {
       if (reservation != 0) pool.release_external(reservation);
     });
     if (pressure) {
       // Keep room for all three writable page tables (Flat source + vectors +
-      // graph), but not the source plus build vector working set.
-      const size_t available = 3 * writable_metadata_ + 256UL * 1024UL;
+      // graph) and the charged PQ model, but not the source plus build vector
+      // working set. Only 256 KiB remains for pages and graph workspaces.
+      const size_t available =
+          3 * writable_metadata_ + model_allowance + 256UL * 1024UL;
       const size_t resident_vector_bytes =
           static_cast<size_t>(kDocCount) * dimension *
           (fp16 ? sizeof(uint16_t) : sizeof(float));
@@ -251,7 +258,8 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       // Timing determines whether foreground admission or background
       // writeback reclaims a page. Assert the fixed reservation and budget,
       // then validate every result, rather than requiring one reclaim path.
-      EXPECT_EQ(pool.external_used(), reservation);
+      EXPECT_GE(pool.external_used(), reservation + codebook_bytes);
+      EXPECT_LE(pool.external_used(), reservation + model_allowance);
       EXPECT_LE(pool.used(), pool_budget_);
     }
     EXPECT_TRUE(target->is_trained());

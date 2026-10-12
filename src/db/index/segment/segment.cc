@@ -1181,12 +1181,14 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
     segment_doc_ids.reserve(end - begin);
     output_positions.reserve(end - begin);
     for (size_t i = begin; i < end; ++i) {
-      auto it =
-          std::lower_bound(doc_ids_.begin(), doc_ids_.end(), g_doc_ids[i]);
-      if (it == doc_ids_.end() || *it != g_doc_ids[i]) {
+      auto local_id = doc_ids_.find(g_doc_ids[i]);
+      if (!local_id) {
+        if (local_id.error().code() != StatusCode::NOT_FOUND) {
+          throw DocIdMap::ReadError(local_id.error());
+        }
         continue;
       }
-      segment_doc_ids.push_back(static_cast<int>(it - doc_ids_.begin()));
+      segment_doc_ids.push_back(static_cast<int>(*local_id));
       output_positions.push_back(i);
     }
     if (segment_doc_ids.empty()) {

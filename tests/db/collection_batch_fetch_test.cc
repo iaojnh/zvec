@@ -42,6 +42,7 @@ class CollectionBatchFetchTest : public ::testing::TestWithParam<bool> {
     ailego::MemoryLimitPool::get_instance().init(128ULL * 1024 * 1024);
     ailego::FileHelper::RemoveDirectory(path_.c_str());
     options_.enable_mmap_ = GetParam();
+    options_.max_buffer_size_ = 8U * 1024 * 1024;
   }
 
   void TearDown() override {
@@ -296,7 +297,8 @@ TEST_F(CollectionBatchFetchPressureTest, BatchesDecodeOnceUnderCachePressure) {
   }
   auto created = Collection::CreateAndOpen(
       path_, schema,
-      CollectionOptions{/*read_only=*/false, /*enable_mmap=*/false});
+      CollectionOptions{/*read_only=*/false, /*enable_mmap=*/false,
+                        /*max_buffer_size=*/8U * 1024 * 1024});
   ASSERT_TRUE(created.has_value()) << created.error().message();
   collection_ = std::move(created.value());
   {
@@ -374,7 +376,8 @@ TEST_F(CollectionBatchFetchPressureTest, FullPoolDoesNotReturnPartialDocs) {
           .ok());
   auto created = Collection::CreateAndOpen(
       path_, schema,
-      CollectionOptions{/*read_only=*/false, /*enable_mmap=*/false});
+      CollectionOptions{/*read_only=*/false, /*enable_mmap=*/false,
+                        /*max_buffer_size=*/8U * 1024 * 1024});
   ASSERT_TRUE(created.has_value()) << created.error().message();
   collection_ = std::move(created.value());
   std::vector<Doc> docs(2);
@@ -429,7 +432,8 @@ TEST_F(CollectionBatchFetchPressureTest,
                   .ok());
   auto created = Collection::CreateAndOpen(
       path_, schema,
-      CollectionOptions{/*read_only=*/false, /*enable_mmap=*/false});
+      CollectionOptions{/*read_only=*/false, /*enable_mmap=*/false,
+                        /*max_buffer_size=*/8U * 1024 * 1024});
   ASSERT_TRUE(created.has_value()) << created.error().message();
   collection_ = std::move(created.value());
   {
