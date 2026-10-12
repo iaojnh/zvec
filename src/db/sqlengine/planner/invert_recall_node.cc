@@ -67,7 +67,8 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> InvertRecallNode::gen() {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
           arrow::Status::UnknownError("fetch table failed"));
     }
-    auto batch = table->CombineChunksToBatch();
+    auto batch =
+        table->CombineChunksToBatch(self->segment_->query_memory_pool());
     if (!batch.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
           arrow::Status::ExecutionError("combine chunks to batch failed:",

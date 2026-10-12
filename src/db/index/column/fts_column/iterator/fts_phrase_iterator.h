@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include "db/common/rocksdb_context.h"
 #include "fts_conjunction_iterator.h"
 #include "fts_doc_iterator.h"
@@ -67,7 +68,8 @@ class PhraseDocIterator : public DocIterator {
   bool verify_phrase_positions(uint32_t doc_id) const;
 
   // Decode varint delta-encoded position list out of a RocksDB value slice.
-  static std::vector<uint32_t> decode_positions(const rocksdb::Slice &data);
+  using Positions = std::vector<uint32_t, ailego::BudgetedAllocator<uint32_t>>;
+  static Positions decode_positions(const rocksdb::Slice &data);
 
  private:
   DocIteratorPtr conjunction_;

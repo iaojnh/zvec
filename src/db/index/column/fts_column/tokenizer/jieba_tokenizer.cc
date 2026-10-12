@@ -14,6 +14,8 @@
 
 #include "jieba_tokenizer.h"
 #include <cstdlib>
+#include <filesystem>
+#include <limits>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
 
@@ -80,6 +82,22 @@ Status JiebaTokenizer::init(const ailego::JsonObject &config) {
   reset();
 
   try {
+    // Dictionaries scale with configuration, not collection row count. Keep
+    // a planning allowance for expanded trie/hash nodes and loader scratch;
+    // do not pretend that third-party STL allocations are exact pool bytes.
+    dictionary_memory_.add(8 * 1024 * 1024);
+    for (const auto &path :
+         {dict_path, model_path, needs_dict ? user_dict_path : std::string{}}) {
+      if (path.empty()) continue;
+      std::error_code error;
+      const auto bytes =
+          std::filesystem::file_size(std::filesystem::u8path(path), error);
+      if (error || bytes > std::numeric_limits<size_t>::max() / 16) {
+        reset();
+        return Status::InvalidArgument("Cannot size Jieba dictionary: ", path);
+      }
+      dictionary_memory_.add_array(static_cast<size_t>(bytes), 16);
+    }
     if (needs_dict) {
       dict_trie_ =
           std::make_unique<cppjieba::DictTrie>(dict_path, user_dict_path);
@@ -103,6 +121,10 @@ Status JiebaTokenizer::init(const ailego::JsonObject &config) {
         hmm_seg_ = std::make_unique<cppjieba::HMMSegment>(hmm_model_.get());
         break;
     }
+  } catch (const std::bad_alloc &) {
+    reset();
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Insufficient Jieba dictionary budget");
   } catch (const std::exception &e) {
     LOG_ERROR("JiebaTokenizer init failed: %s", e.what());
     reset();
@@ -117,6 +139,25 @@ Status JiebaTokenizer::init(const ailego::JsonObject &config) {
 
 JiebaTokenizer::~JiebaTokenizer() = default;
 
+JiebaTokenizer::JiebaTokenizer(JiebaTokenizer &&other) noexcept {
+  *this = std::move(other);
+}
+
+JiebaTokenizer &JiebaTokenizer::operator=(JiebaTokenizer &&other) noexcept {
+  if (this == &other) return *this;
+  reset();  // Free old dictionaries before releasing their allowance.
+  dictionary_memory_ = std::move(other.dictionary_memory_);
+  dict_trie_ = std::move(other.dict_trie_);
+  hmm_model_ = std::move(other.hmm_model_);
+  query_seg_ = std::move(other.query_seg_);
+  mix_seg_ = std::move(other.mix_seg_);
+  full_seg_ = std::move(other.full_seg_);
+  hmm_seg_ = std::move(other.hmm_seg_);
+  cut_mode_ = other.cut_mode_;
+  initialized_ = std::exchange(other.initialized_, false);
+  return *this;
+}
+
 void JiebaTokenizer::reset() {
   query_seg_.reset();
   mix_seg_.reset();
@@ -124,6 +165,7 @@ void JiebaTokenizer::reset() {
   hmm_seg_.reset();
   dict_trie_.reset();
   hmm_model_.reset();
+  dictionary_memory_.retain_at_most(0);
   initialized_ = false;
 }
 

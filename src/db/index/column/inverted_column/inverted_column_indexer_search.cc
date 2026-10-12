@@ -58,16 +58,6 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_contain(
     return tl::make_unexpected(Status::InvalidArgument());
   }
 
-  // Shall we sort the terms here? Does it make any difference in performance?
-  std::vector<Slice> slice_terms(terms.begin(), terms.end());
-  std::vector<PinnableSlice> bitmap_slices;
-  bitmap_slices.resize(terms.size());
-  std::vector<rocksdb::Status> statuses;
-  statuses.resize(terms.size());
-  ctx_.db_->MultiGet(ctx_.read_opts_, cf_terms_, slice_terms.size(),
-                     slice_terms.data(), bitmap_slices.data(), statuses.data(),
-                     false);
-
   roaring_bitmap_t *bitmap{nullptr};
   Status s = Status::OK();
   AILEGO_DEFER([&]() {
@@ -76,37 +66,38 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_contain(
     }
   });
 
-  auto init_or_merge_at_i = [&](size_t i) {
+  auto init_or_merge = [&](const std::string &term, const PinnableSlice &raw) {
     if (bitmap == nullptr) {
-      s = InvertedIndexCodec::Deserialize(bitmap_slices[i].data(),
-                                          bitmap_slices[i].size(), &bitmap);
+      s = InvertedIndexCodec::Deserialize(raw.data(), raw.size(), &bitmap);
       if (!s.ok()) {
         LOG_ERROR("Failed to deserialize bitmap for term[%s] from %s",
-                  terms[i].c_str(), id().c_str());
+                  term.c_str(), id().c_str());
       }
       return;
     }
 
     if (is_any) {
-      s = InvertedIndexCodec::merge_or(bitmap_slices[i].data(),
-                                       bitmap_slices[i].size(), true, bitmap);
+      s = InvertedIndexCodec::merge_or(raw.data(), raw.size(), true, bitmap);
     } else {
-      s = InvertedIndexCodec::merge_and(bitmap_slices[i].data(),
-                                        bitmap_slices[i].size(), bitmap);
+      s = InvertedIndexCodec::merge_and(raw.data(), raw.size(), bitmap);
     }
     if (!s.ok()) {
-      LOG_ERROR("Failed to merge bitmap for term[%s] from %s", terms[i].c_str(),
+      LOG_ERROR("Failed to merge bitmap for term[%s] from %s", term.c_str(),
                 id().c_str());
     }
   };
 
-  for (size_t i = 0; i < terms.size(); i++) {
-    if (statuses[i].ok()) {
-      init_or_merge_at_i(i);
+  // Keep one encoded posting alive at a time, not all inputs plus the
+  // decoded accumulator. This also stops immediately on a missing ALL term.
+  for (const auto &term : terms) {
+    PinnableSlice raw;
+    const auto status = ctx_.db_->Get(ctx_.read_opts_, cf_terms_, term, &raw);
+    if (status.ok()) {
+      init_or_merge(term, raw);
       if (!s.ok()) {
         return tl::make_unexpected(s);
       }
-    } else if (statuses[i].code() == rocksdb::Status::kNotFound) {
+    } else if (status.IsNotFound()) {
       if (!is_any) {  // For contain_all, if any term is not found, return empty
         s = Status::NotFound();
         return nullptr;
@@ -114,8 +105,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_contain(
     } else {
       LOG_ERROR(
           "Failed to retrieve data for term[%s] from %s, code[%d], reason[%s]",
-          terms[i].c_str(), id().c_str(), statuses[i].code(),
-          statuses[i].ToString().c_str());
+          term.c_str(), id().c_str(), status.code(), status.ToString().c_str());
       s = Status::InternalError();
       return tl::make_unexpected(s);
     }

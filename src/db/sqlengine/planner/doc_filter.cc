@@ -17,11 +17,13 @@
 #include <arrow/acero/exec_plan.h>
 #include <arrow/table.h>
 #include <zvec/ailego/logger/logger.h>
+#include "db/index/storage/parquet_memory_pool.h"
 #include "db/sqlengine/planner/invert_search.h"
 
 namespace zvec::sqlengine {
 
 Status DocFilter::compute_filter() {
+  error_.store(StatusCode::OK, std::memory_order_relaxed);
   if (invert_cond_) {
     InvertSearch search(segment_.get());
     auto invert_res = search.exec_invert_cond_tree(invert_cond_.get());
@@ -34,8 +36,15 @@ Status DocFilter::compute_filter() {
   }
 
   if (forward_plan_) {
-    auto forward_result = arrow::acero::DeclarationToTable(*forward_plan_);
+    auto *pool = segment_->uses_buffer_storage()
+                     ? detail::GetParquetMemoryPool().get()
+                     : arrow::default_memory_pool();
+    auto forward_result =
+        arrow::acero::DeclarationToTable(*forward_plan_, true, pool);
     if (!forward_result.ok()) {
+      if (forward_result.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      forward_result.status().ToString());
       return Status::InternalError("Execute filter bitmap failed: ",
                                    forward_result.status().ToString());
     }
@@ -70,7 +79,15 @@ bool DocFilter::empty() const {
            forward_filter_expr_);
 }
 
-bool DocFilter::is_filtered(uint64_t id) const {
+Status DocFilter::status() const {
+  const auto code = error_.load(std::memory_order_relaxed);
+  return code == StatusCode::OK
+             ? Status::OK()
+             : Status(code, "Forward filter evaluation failed");
+}
+
+bool DocFilter::is_filtered(uint64_t id) const try {
+  if (error_.load(std::memory_order_relaxed) != StatusCode::OK) return true;
   if (delete_filter_ && delete_filter_->is_filtered(id)) {
     return true;
   }
@@ -79,10 +96,18 @@ bool DocFilter::is_filtered(uint64_t id) const {
   }
   auto forward_bit = get_forward_bit(id);
   if (!forward_bit) {
+    if (forward_filter_expr_ || forward_bitmap_) {
+      if (error_.load(std::memory_order_relaxed) == StatusCode::OK)
+        error_.store(StatusCode::INTERNAL_ERROR, std::memory_order_relaxed);
+      return true;
+    }
     return false;
   }
   // revert to return false if forward filter is matched
   return !forward_bit.value();
+} catch (const std::bad_alloc &) {
+  error_.store(StatusCode::RESOURCE_EXHAUSTED, std::memory_order_relaxed);
+  return true;
 }
 
 std::optional<bool> DocFilter::get_forward_bit(uint64_t id) const {
@@ -156,9 +181,17 @@ std::optional<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
     LOG_ERROR("Fetch forward failed, id[%zu]", (size_t)id);
     return std::nullopt;
   }
+  auto *pool = segment_->uses_buffer_storage()
+                   ? detail::GetParquetMemoryPool().get()
+                   : arrow::default_memory_pool();
+  arrow::compute::ExecContext context(pool);
   auto maybe_result = arrow::compute::ExecuteScalarExpression(
-      *forward_filter_expr_, *exec_batch);
+      *forward_filter_expr_, *exec_batch, &context);
   if (!maybe_result.ok()) {
+    error_.store(maybe_result.status().IsOutOfMemory()
+                     ? StatusCode::RESOURCE_EXHAUSTED
+                     : StatusCode::INTERNAL_ERROR,
+                 std::memory_order_relaxed);
     LOG_ERROR("Execute scalar expression failed, id[%zu] err[%s]", (size_t)id,
               maybe_result.status().ToString().c_str());
     return std::nullopt;

@@ -37,6 +37,7 @@
 #include <zvec/db/schema.h>
 #include <zvec/db/status.h>
 #include <zvec/db/type.h>
+#include "db/index/storage/parquet_memory_pool.h"
 #if RABITQ_SUPPORTED
 #include "core/algorithm/hnsw_rabitq/rabitq_params.h"
 #endif
@@ -65,6 +66,11 @@
 #include "sql_expr_parser.h"
 
 namespace zvec {
+
+arrow::MemoryPool *Segment::query_memory_pool() const {
+  return uses_buffer_storage() ? detail::GetParquetMemoryPool().get()
+                               : arrow::default_memory_pool();
+}
 
 void global_init() {
   static std::once_flag once;
@@ -188,6 +194,10 @@ class SegmentImpl : public Segment,
       const fts::FtsQueryParams &params) override;
 
   const IndexFilter::Ptr get_filter() override;
+
+  bool uses_buffer_storage() const override {
+    return !options_.enable_mmap_;
+  }
 
   Status create_all_vector_indexes(
       int concurrency, SegmentMeta::Ptr *new_segment_meta,
@@ -969,7 +979,7 @@ Status SegmentImpl::internal_insert(Doc &doc) {
 }
 
 Status SegmentImpl::internal_update(Doc &doc) {
-  delete_store_->mark_deleted(doc.doc_id());
+  CHECK_RETURN_STATUS(delete_store_->mark_deleted(doc.doc_id()));
   return internal_insert(doc);
 }
 
@@ -977,13 +987,13 @@ Status SegmentImpl::internal_upsert(Doc &doc) {
   uint64_t g_doc_id;
   bool exist = id_map_->has(doc.pk_ref(), &g_doc_id);
   if (exist) {
-    delete_store_->mark_deleted(g_doc_id);
+    CHECK_RETURN_STATUS(delete_store_->mark_deleted(g_doc_id));
   }
   return internal_insert(doc);
 }
 
 Status SegmentImpl::internal_delete(const Doc &doc) {
-  delete_store_->mark_deleted(doc.doc_id());
+  CHECK_RETURN_STATUS(delete_store_->mark_deleted(doc.doc_id()));
   id_map_->remove(doc.pk_ref());
   return Status::OK();
 }
@@ -1015,6 +1025,7 @@ Status SegmentImpl::update(Doc &doc) {
 
   doc.set_doc_id(g_doc_id);
   doc.set_operator(Operator::UPDATE);
+  CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
 
   // append WAL
   auto s = append_wal(doc);
@@ -1027,6 +1038,9 @@ Status SegmentImpl::upsert(Doc &doc) {
   std::lock_guard lock(seg_mtx_);
 
   doc.set_operator(Operator::UPSERT);
+  uint64_t old_id;
+  if (id_map_->has(doc.pk_ref(), &old_id))
+    CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(old_id));
 
   // append WAL
   auto s = append_wal(doc);
@@ -1051,6 +1065,7 @@ Status SegmentImpl::Delete(const std::string &pk) {
   mutable_doc.set_pk(pk);
   mutable_doc.set_doc_id(g_doc_id);
   mutable_doc.set_operator(Operator::DELETE);
+  CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
 
   // append WAL
   auto s = append_wal(mutable_doc);
@@ -1069,6 +1084,7 @@ Status SegmentImpl::Delete(uint64_t g_doc_id) {
   Doc mutable_doc;
   mutable_doc.set_doc_id(g_doc_id);
   mutable_doc.set_operator(Operator::DELETE);
+  CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
 
   // append WAL
   auto s = append_wal(mutable_doc);
@@ -2715,18 +2731,8 @@ TablePtr SegmentImpl::fetch_normal(
       if (col_it == columns.end()) continue;
       size_t col_index = std::distance(columns.begin(), col_it);
 
-      auto chunked_array = block_table->column(i)->chunks();
-      auto flat_array_res =
-          arrow::Concatenate(chunked_array, arrow::default_memory_pool());
-      if (!flat_array_res.ok()) {
-        LOG_ERROR("Concatenate failed: %s",
-                  flat_array_res.status().message().c_str());
-        return nullptr;
-      }
-      auto flat_array = flat_array_res.ValueOrDie();
-
       for (size_t j = 0; j < fetch_block_rows.size(); ++j) {
-        auto scalar_result = flat_array->GetScalar(j);
+        auto scalar_result = block_table->column(i)->GetScalar(j);
         if (!scalar_result.ok()) {
           if (strict) {
             LOG_ERROR("Batch fetch scalar failed: %s",
@@ -2779,8 +2785,8 @@ TablePtr SegmentImpl::fetch_normal(
       }
     }
 
-    auto status = ConvertScalarVectorToArrayByType(ordered_scalars,
-                                                   &result_arrays[col_index]);
+    auto status = ConvertScalarVectorToArrayByType(
+        ordered_scalars, &result_arrays[col_index], query_memory_pool());
     if (!status.ok()) {
       LOG_ERROR("Failed to convert scalars to array for column '%s': %s",
                 col.c_str(), status.message().c_str());

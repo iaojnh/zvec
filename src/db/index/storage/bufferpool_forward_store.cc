@@ -244,7 +244,8 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
     }
 
     std::shared_ptr<arrow::Array> arr;
-    auto status = ConvertScalarVectorToArrayByType(ordered_scalars, &arr);
+    auto status = ConvertScalarVectorToArrayByType(
+        ordered_scalars, &arr, detail::GetParquetMemoryPool().get());
     if (!status.ok()) {
       LOG_ERROR("ConvertScalarVectorToArrayByType failed: %s",
                 status.message().c_str());
@@ -264,8 +265,8 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
     }
 
     // Create UInt64Array
-    auto buffer_result = arrow::AllocateBuffer(values.size() * sizeof(uint64_t),
-                                               arrow::default_memory_pool());
+    auto buffer_result = arrow::AllocateBuffer(
+        values.size() * sizeof(uint64_t), detail::GetParquetMemoryPool().get());
     if (!buffer_result.ok()) return nullptr;
     auto buffer = std::move(buffer_result.ValueOrDie());
     std::memcpy(buffer->mutable_data(), values.data(),

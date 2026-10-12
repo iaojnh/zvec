@@ -1255,6 +1255,32 @@ TEST_F(FtsColumnIndexerTest, ConversionBudgetFailurePreservesSideDataForRetry) {
   EXPECT_EQ(BitPackedPostingIterator::NO_MORE_DOCS, iter.next_doc());
 }
 
+TEST_F(FtsColumnIndexerTest, QueryWorkspaceDenialIsAnErrorAndCanRetry) {
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  struct RestorePool {
+    size_t capacity;
+    ~RestorePool() {
+      zvec::ailego::MemoryLimitPool::get_instance().init(capacity);
+    }
+  } restore{pool.capacity()};
+  auto indexer = make_indexer();
+  ASSERT_TRUE(indexer->insert(7, "common common other").has_value());
+  FtsQueryParser parser;
+  auto ast = parser.parse("common", make_whitespace_pipeline());
+  ASSERT_TRUE(ast);
+  FtsQueryParams params;
+  params.topk = 10;
+  pool.init(1);
+  auto denied = indexer->search(*ast, params);
+  ASSERT_FALSE(denied);
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  pool.init(8 * 1024 * 1024);
+  auto retried = indexer->search(*ast, params);
+  ASSERT_TRUE(retried) << retried.error().message();
+  ASSERT_EQ(1u, retried->size());
+  EXPECT_EQ(7u, retried->front().doc_id);
+}
+
 // After conversion the search() path must keep working — readers fall through
 // to the BitPacked branch via is_bitpacked_format(), and no longer require the
 // $TF / $DOC_LEN CFs.

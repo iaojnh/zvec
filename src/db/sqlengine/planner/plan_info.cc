@@ -22,6 +22,7 @@
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include "db/common/error_code.h"
+#include "db/index/storage/parquet_memory_pool.h"
 
 namespace zvec::sqlengine {
 
@@ -155,10 +156,10 @@ class BoundedSource : public arrow::acero::ExecNode {
       if (handling == arrow::acero::UnalignedBufferHandling::kError)
         return arrow::Status::Invalid("Unaligned source buffer");
       if (handling == arrow::acero::UnalignedBufferHandling::kReallocate) {
-        ARROW_ASSIGN_OR_RAISE(
-            value, arrow::util::EnsureAlignment(value.array(),
-                                                arrow::util::kValueAlignment,
-                                                arrow::default_memory_pool()));
+        ARROW_ASSIGN_OR_RAISE(value,
+                              arrow::util::EnsureAlignment(
+                                  value.array(), arrow::util::kValueAlignment,
+                                  plan_->query_context()->memory_pool()));
       } else
         LOG_WARN("Unaligned source buffer");
     }
@@ -257,8 +258,11 @@ class AsyncPlanStream {
 class BoundedPlanReader : public arrow::RecordBatchReader {
  public:
   static arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Make(
-      const arrow::acero::Declaration &declaration, size_t max_queued_bytes) {
-    ARROW_ASSIGN_OR_RAISE(auto plan, arrow::acero::ExecPlan::Make());
+      const arrow::acero::Declaration &declaration, size_t max_queued_bytes,
+      arrow::MemoryPool *pool) {
+    arrow::compute::ExecContext context(pool,
+                                        arrow::internal::GetCpuThreadPool());
+    ARROW_ASSIGN_OR_RAISE(auto plan, arrow::acero::ExecPlan::Make(context));
     ARROW_ASSIGN_OR_RAISE(auto source, bound_sources(declaration));
     arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> generator;
     std::shared_ptr<arrow::Schema> schema;
@@ -270,8 +274,8 @@ class BoundedPlanReader : public arrow::RecordBatchReader {
                                                         max_queued_bytes}}}});
     ARROW_RETURN_NOT_OK(with_sink.AddToPlan(plan.get()));
     ARROW_RETURN_NOT_OK(plan->Validate());
-    auto reader = arrow::acero::MakeGeneratorReader(
-        schema, std::move(generator), arrow::default_memory_pool());
+    auto reader =
+        arrow::acero::MakeGeneratorReader(schema, std::move(generator), pool);
     auto result = std::make_unique<BoundedPlanReader>(plan, std::move(reader));
     plan->StartProducing();
     result->started_ = true;
@@ -327,7 +331,11 @@ PlanInfo::execute_to_generator(size_t max_queued_bytes) {
       [&]() -> arrow::Result<arrow::AsyncGenerator<AsyncPlanStream::Batch>> {
     auto stream = std::make_shared<AsyncPlanStream>();
     ARROW_ASSIGN_OR_RAISE(auto source, bound_sources(plan_));
-    ARROW_ASSIGN_OR_RAISE(stream->plan, arrow::acero::ExecPlan::Make());
+    auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
+                           : arrow::default_memory_pool();
+    arrow::compute::ExecContext context(pool,
+                                        arrow::internal::GetCpuThreadPool());
+    ARROW_ASSIGN_OR_RAISE(stream->plan, arrow::acero::ExecPlan::Make(context));
     auto with_sink = arrow::acero::Declaration::Sequence(
         {source,
          {"sink", arrow::acero::SinkNodeOptions{
@@ -358,9 +366,16 @@ PlanInfo::execute_to_generator(size_t max_queued_bytes) {
 
 Result<std::unique_ptr<arrow::RecordBatchReader>> PlanInfo::execute_to_reader(
     size_t max_queued_bytes) {
-  auto res = max_queued_bytes ? BoundedPlanReader::Make(plan_, max_queued_bytes)
-                              : arrow::acero::DeclarationToReader(plan_);
+  auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
+                         : arrow::default_memory_pool();
+  if (budgeted_ && !max_queued_bytes) max_queued_bytes = 64 * 1024;
+  auto res = max_queued_bytes
+                 ? BoundedPlanReader::Make(plan_, max_queued_bytes, pool)
+                 : arrow::acero::DeclarationToReader(plan_, true, pool);
   if (!res.ok()) {
+    if (res.status().IsOutOfMemory())
+      return tl::make_unexpected(
+          Status(StatusCode::RESOURCE_EXHAUSTED, res.status().ToString()));
     return tl::make_unexpected(Status::InternalError(
         "execute plan_info failed: ", res.status().ToString()));
   }

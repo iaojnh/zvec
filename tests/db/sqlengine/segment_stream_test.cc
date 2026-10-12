@@ -4,9 +4,12 @@
 #include <chrono>
 #include <thread>
 #include <arrow/api.h>
+#include <arrow/compute/initialize.h>
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "ailego/pattern/defer.h"
+#include "db/index/storage/parquet_memory_pool.h"
 #include "db/sqlengine/planner/segment_node.h"
 
 namespace zvec::sqlengine {
@@ -286,6 +289,69 @@ TEST(SegmentStreamTest, ReadsSegmentsLazilyWithOneCpuWorker) {
   EXPECT_EQ(0, first->load());
   EXPECT_GT(last->load(), 0);
   EXPECT_LE(last->load(), 2);
+}
+TEST(SegmentStreamTest,
+     BufferPlanAccountsKernelOutputAndDeniesBeforeAllocation) {
+  ASSERT_TRUE(arrow::compute::Initialize().ok());
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  auto restore = ailego::ScopeGuard::Make([&] { pool.init(capacity); });
+  pool.init(1024 * 1024);
+  auto *arrow_pool = detail::GetParquetMemoryPool().get();
+  const auto baseline = arrow_pool->charged_bytes();
+  auto schema = arrow::schema({arrow::field("row", arrow::int32())});
+  arrow::Int32Builder builder;
+  ASSERT_TRUE(builder.AppendValues(std::vector<int32_t>(4096, 42)).ok());
+  auto input =
+      arrow::RecordBatch::Make(schema, 4096, {builder.Finish().ValueOrDie()});
+  auto run = [&](bool budgeted) {
+    auto delivered = std::make_shared<bool>(false);
+    arrow::AsyncGenerator<Batch> source = [input, delivered] {
+      if (std::exchange(*delivered, true))
+        return arrow::Future<Batch>::MakeFinished(Batch{});
+      return arrow::Future<Batch>::MakeFinished(
+          arrow::compute::ExecBatch(*input));
+    };
+    PlanInfo plan(
+        arrow::acero::Declaration::Sequence(
+            {{"source", arrow::acero::SourceNodeOptions{schema, source}},
+             {"project",
+              arrow::acero::ProjectNodeOptions{
+                  {arrow::compute::call("add",
+                                        {arrow::compute::field_ref("row"),
+                                         arrow::compute::literal(1)})},
+                  {"row"}}}}),
+        schema, budgeted);
+    return plan.execute_to_reader();
+  };
+  {
+    auto reader = run(true);
+    ASSERT_TRUE(reader) << reader.error().message();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
+    ASSERT_NE(nullptr, batch);
+    EXPECT_GT(arrow_pool->charged_bytes(), baseline);
+    EXPECT_EQ(43, std::static_pointer_cast<arrow::Int32Array>(batch->column(0))
+                      ->Value(0));
+    ASSERT_TRUE((*reader)->Close().ok());
+  }
+  EXPECT_EQ(baseline, arrow_pool->charged_bytes());
+  ASSERT_TRUE(pool.try_charge_external(pool.capacity()));
+  auto release =
+      ailego::ScopeGuard::Make([&] { pool.release_external(pool.capacity()); });
+  {
+    auto reader = run(true);
+    ASSERT_TRUE(reader);
+    std::shared_ptr<arrow::RecordBatch> batch;
+    EXPECT_TRUE((*reader)->ReadNext(&batch).IsOutOfMemory());
+    EXPECT_EQ(baseline, arrow_pool->charged_bytes());
+  }
+  // Mmap plans preserve the default allocator even under Buffer pressure.
+  auto reader = run(false);
+  ASSERT_TRUE(reader);
+  std::shared_ptr<arrow::RecordBatch> batch;
+  ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
+  ASSERT_NE(nullptr, batch);
 }
 }  // namespace
 }  // namespace zvec::sqlengine

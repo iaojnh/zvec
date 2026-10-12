@@ -1096,6 +1096,9 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
   return Status::OK();
 } catch (const DocIdMap::ReadError &error) {
   return error.status();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient compaction snapshot budget");
 }
 
 std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
@@ -1885,7 +1888,8 @@ Result<DocPtrList> CollectionImpl::query_unsafe(
   return sql_engine_->execute(schema_, std::move(sanitized_query), segments);
 }
 
-Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const {
+Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
+    try {
   if (query.queries.size() < 2) {
     return tl::make_unexpected(Status::InvalidArgument(
         "Invalid query: MultiQuery requires at least 2 sub-queries, got ",
@@ -1903,6 +1907,10 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const {
   }
 
   // Convert each SubQuery to a SearchQuery and validate.
+  // Built-in fusion only needs PKs and scores. Custom callbacks retain the
+  // documented full-document contract.
+  const bool late_fetch =
+      !std::holds_alternative<reranker::CallbackParams>(query.rerank);
   std::vector<SearchQuery> pending_queries;
   std::vector<FieldSchema::Ptr> field_schemas;
   pending_queries.reserve(query.queries.size());
@@ -1925,9 +1933,10 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const {
     sq.target_ = target;
     sq.topk_ = sub.num_candidates_;
     sq.filter_ = query.filter;
-    sq.include_vector_ = query.include_vector;
-    sq.include_doc_id_ = query.include_doc_id_;
-    sq.output_fields_ = query.output_fields;
+    sq.include_vector_ = late_fetch ? false : query.include_vector;
+    sq.include_doc_id_ = late_fetch || query.include_doc_id_;
+    sq.output_fields_ =
+        late_fetch ? std::vector<std::string>{} : query.output_fields;
 
     if (need_sanitize) {
       auto ss = sanitize_sparse_vector(sq.target_, field_schema);
@@ -1938,8 +1947,14 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const {
   }
 
   auto execute_query = [&](SearchQuery &pending) -> Result<DocPtrList> {
-    auto engine = sqlengine::SQLEngine::create(std::make_shared<Profiler>());
-    return engine->execute(schema_, std::move(pending), segments);
+    try {
+      auto engine = sqlengine::SQLEngine::create(std::make_shared<Profiler>());
+      return engine->execute(schema_, std::move(pending), segments);
+    } catch (const std::bad_alloc &) {
+      return tl::make_unexpected(
+          Status(StatusCode::RESOURCE_EXHAUSTED,
+                 "Hybrid sub-query exceeds memory budget"));
+    }
   };
 
   std::vector<Result<DocPtrList>> results(pending_queries.size());
@@ -1974,8 +1989,51 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const {
   }
 
   // Dispatch rerank — schema info injected via field_schemas
-  return reranker::rerank(query.rerank, query_results, field_schemas,
-                          query.topk);
+  auto ranked =
+      reranker::rerank(query.rerank, query_results, field_schemas, query.topk);
+  if (!ranked || !late_fetch) return ranked;
+  // Release losing candidates before materializing payloads. Use the same
+  // segment snapshot as recall, not a second public query/PK lookup.
+  query_results.clear();
+  ailego::MemoryReservation fetch_workspace;
+  fetch_workspace.add_array(
+      std::min(ranked->size(), Segment::kMaxFetchBatchSize), 128);
+  for (size_t begin = 0; begin < ranked->size();) {
+    const size_t end =
+        begin + std::min(Segment::kMaxFetchBatchSize, ranked->size() - begin);
+    std::map<Segment::Ptr, std::vector<size_t>> groups;
+    for (size_t i = begin; i < end; ++i) {
+      auto segment = local_segment_by_doc_id((*ranked)[i]->doc_id(), segments);
+      if (!segment)
+        return tl::make_unexpected(
+            Status::InternalError("Hybrid result segment is missing"));
+      groups[segment].push_back(i);
+    }
+    for (const auto &[segment, positions] : groups) {
+      std::vector<uint64_t> ids;
+      ids.reserve(positions.size());
+      for (auto i : positions) ids.push_back((*ranked)[i]->doc_id());
+      auto fetched =
+          segment->fetch_docs(ids, query.output_fields, query.include_vector);
+      if (fetched.size() != positions.size())
+        return tl::make_unexpected(
+            Status::InternalError("Incomplete hybrid fetch"));
+      for (size_t i = 0; i < positions.size(); ++i) {
+        if (!fetched[i])
+          return tl::make_unexpected(
+              Status::InternalError("Failed to fetch hybrid result"));
+        auto &doc = (*ranked)[positions[i]];
+        fetched[i]->set_score(doc->score());
+        fetched[i]->set_doc_id(query.include_doc_id_ ? doc->doc_id() : 0);
+        doc = std::move(fetched[i]);
+      }
+    }
+    begin = end;
+  }
+  return ranked;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Hybrid query exceeds memory budget"));
 }
 
 Result<GroupResults> CollectionImpl::group_by_query(
@@ -2580,7 +2638,7 @@ Result<std::vector<std::string>> CollectionImpl::build_iterator_columns(
 }
 
 Result<std::unique_ptr<DocIterator::Impl>> CollectionImpl::prepare_iterate(
-    const IteratorOptions &options) {
+    const IteratorOptions &options) try {
   // Caller holds schema_handle_mtx_ exclusively. The snapshot below
   // isolates concurrent writes and deletes (which the iterator count does
   // not block) by fixing segments and cloning the delete store under
@@ -2623,6 +2681,9 @@ Result<std::unique_ptr<DocIterator::Impl>> CollectionImpl::prepare_iterate(
 
   impl->filter = impl->delete_store->make_filter();
   return impl;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient iterator snapshot budget"));
 }
 
 Result<DocIterator::Ptr> CollectionImpl::create_iterator(

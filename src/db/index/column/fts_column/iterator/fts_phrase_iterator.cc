@@ -126,7 +126,8 @@ bool PhraseDocIterator::verify_phrase_positions(uint32_t doc_id) const {
   // Decode every position list once. A missing entry means this doc cannot
   // be a phrase match — this happens for docs filtered through the conjunction
   // without a position-CF entry, so we do NOT log here.
-  std::vector<std::vector<uint32_t>> positions_cache(unique_size);
+  std::vector<Positions, ailego::BudgetedAllocator<Positions>> positions_cache(
+      unique_size);
   for (size_t u = 0; u < unique_size; ++u) {
     if (!statuses[u].ok() || values[u].size() == 0) {
       return false;
@@ -180,9 +181,9 @@ bool PhraseDocIterator::verify_phrase_positions(uint32_t doc_id) const {
   return false;
 }
 
-std::vector<uint32_t> PhraseDocIterator::decode_positions(
+PhraseDocIterator::Positions PhraseDocIterator::decode_positions(
     const rocksdb::Slice &data) {
-  std::vector<uint32_t> positions;
+  Positions positions;
   size_t index = 0;
   uint32_t current_position = 0;
   const char *bytes = data.data();

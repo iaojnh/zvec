@@ -348,6 +348,10 @@ Result<PlanInfo::Ptr> QueryPlanner::make_plan(
 Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     const std::vector<Segment::Ptr> &segments, const std::string & /*trace_id*/,
     std::vector<sqlengine::QueryInfo::Ptr> *query_infos) {
+  const bool budgeted = std::any_of(
+      segments.begin(), segments.end(),
+      [](const auto &segment) { return segment->uses_buffer_storage(); });
+
   const std::string &table_name = schema_->name();
   if (segments.empty()) {
     LOG_ERROR("Segment not found [%s]", table_name.c_str());
@@ -452,7 +456,8 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
       ac::Declaration node{"source",
                            ac::SourceNodeOptions{merge->schema(), merge->gen(),
                                                  cp::Ordering::Implicit()}};
-      return std::make_shared<PlanInfo>(std::move(node), merge->schema());
+      return std::make_shared<PlanInfo>(std::move(node), merge->schema(),
+                                        budgeted);
     } catch (const std::bad_alloc &) {
       return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
                                         "Cannot allocate global topK plan"));
@@ -489,12 +494,15 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     node = ac::Declaration{
         "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
   }
-  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema());
+  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema(),
+                                    budgeted);
 }
 
 Result<PlanInfo::Ptr> QueryPlanner::forward_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto reader = seg->scan(query_info->get_all_fetched_scalar_field_names());
   auto schema = reader->schema();
   ac::Declaration node{
@@ -555,7 +563,8 @@ Result<PlanInfo::Ptr> QueryPlanner::forward_scan(
   node = ac::Declaration{"fetch",
                          {std::move(node)},
                          ac::FetchNodeOptions{0, query_info->query_topn()}};
-  return std::make_shared<PlanInfo>(std::move(node), std::move(schema));
+  return std::make_shared<PlanInfo>(std::move(node), std::move(schema),
+                                    budgeted);
 }
 
 DocFilter::Ptr QueryPlanner::build_doc_filter(
@@ -588,6 +597,8 @@ Result<PlanInfo::Ptr> QueryPlanner::vector_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter,
     bool single_stage_search, bool rank_only) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto doc_filter =
       build_doc_filter(seg, query_info, forward_filter, single_stage_search);
 
@@ -608,12 +619,15 @@ Result<PlanInfo::Ptr> QueryPlanner::vector_scan(
     node = ac::Declaration{
         "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
   }
-  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema());
+  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema(),
+                                    budgeted);
 }
 
 Result<PlanInfo::Ptr> QueryPlanner::invert_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, forward_filter != nullptr);
   auto recall_node =
@@ -666,13 +680,16 @@ Result<PlanInfo::Ptr> QueryPlanner::invert_scan(
 
   node = ac::Declaration{
       "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
-  return std::make_shared<PlanInfo>(std::move(node), std::move(schema));
+  return std::make_shared<PlanInfo>(std::move(node), std::move(schema),
+                                    budgeted);
 }
 
 Result<PlanInfo::Ptr> QueryPlanner::fts_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter,
     bool single_stage_search, bool rank_only) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto doc_filter =
       build_doc_filter(seg, query_info, forward_filter, single_stage_search);
 
@@ -690,7 +707,8 @@ Result<PlanInfo::Ptr> QueryPlanner::fts_scan(
 
   node = ac::Declaration{
       "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
-  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema());
+  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema(),
+                                    budgeted);
 }
 
 int QueryPlanner::get_batch_size(const QueryInfo &info, bool has_later_filter) {

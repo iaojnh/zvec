@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <arrow/acero/api.h>
 #include <arrow/chunked_array.h>
@@ -45,6 +46,10 @@ class DocFilter : public IndexFilter {
 
   bool is_filtered(uint64_t id) const override;
 
+  // IndexFilter callbacks cannot return errors. Recall checks this after
+  // workers finish, so a failed forward lookup never publishes partial hits.
+  Status status() const;
+
   //! When invert cardinality <= \p ratio * doc_count, extract the ids and
   //! clear invert_filter_ so the caller drives evaluation by ids instead of
   //! bitmap-checking. Ratio is per-caller (vector vs FTS use different
@@ -73,6 +78,7 @@ class DocFilter : public IndexFilter {
   IndexFilter::Ptr invert_filter_{nullptr};
 
   std::shared_ptr<arrow::ChunkedArray> forward_bitmap_;
+  mutable std::atomic<StatusCode> error_{StatusCode::OK};
 };
 
 }  // namespace zvec::sqlengine

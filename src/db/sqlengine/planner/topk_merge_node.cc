@@ -148,6 +148,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> TopKMergeNode::fetch(
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>>
 TopKMergeNode::materialize() {
+  auto *memory_pool = segments_.front()->query_memory_pool();
   constexpr size_t kBatchRows = 1024;
   const auto &winners = this->winners();
   const size_t count = std::min(kBatchRows, winners.size() - offset_);
@@ -161,8 +162,8 @@ TopKMergeNode::materialize() {
   for (size_t begin = 0; begin < count;) {
     const size_t segment = winners[offset_ + order[begin]].segment;
     std::vector<int> rows;
-    arrow::FloatBuilder scores;
-    arrow::StringBuilder group_ids;
+    arrow::FloatBuilder scores(memory_pool);
+    arrow::StringBuilder group_ids(memory_pool);
     size_t end = begin;
     while (end < count && winners[offset_ + order[end]].segment == segment) {
       const auto &winner = winners[offset_ + order[end]];
@@ -186,11 +187,16 @@ TopKMergeNode::materialize() {
   }
   ARROW_ASSIGN_OR_RAISE(auto table,
                         arrow::Table::FromRecordBatches(schema_, batches));
-  arrow::UInt32Builder positions;
+  arrow::UInt32Builder positions(memory_pool);
   ARROW_RETURN_NOT_OK(positions.AppendValues(inverse.data(), count));
   ARROW_ASSIGN_OR_RAISE(auto indices, positions.Finish());
-  ARROW_ASSIGN_OR_RAISE(auto sorted, arrow::compute::Take(table, indices));
-  ARROW_ASSIGN_OR_RAISE(auto result, sorted.table()->CombineChunksToBatch());
+  arrow::compute::ExecContext context(memory_pool);
+  ARROW_ASSIGN_OR_RAISE(
+      auto sorted,
+      arrow::compute::Take(table, indices,
+                           arrow::compute::TakeOptions::Defaults(), &context));
+  ARROW_ASSIGN_OR_RAISE(auto result,
+                        sorted.table()->CombineChunksToBatch(memory_pool));
   offset_ += count;
   return result;
 }

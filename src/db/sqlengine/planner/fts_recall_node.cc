@@ -66,7 +66,8 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
 
     std::vector<int> indices;
     indices.reserve(self->batch_size_);
-    arrow::FloatBuilder score_builder;
+    auto *pool = self->segment_->query_memory_pool();
+    arrow::FloatBuilder score_builder(pool);
     for (int i = 0; state.iter_->valid() && i < self->batch_size_;
          i++, state.iter_->next()) {
       indices.push_back(state.iter_->doc_id());
@@ -85,7 +86,7 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
     if (self->rank_only_) {
       auto make_batch =
           [&]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
-        arrow::Int32Builder rows;
+        arrow::Int32Builder rows(pool);
         ARROW_RETURN_NOT_OK(rows.AppendValues(indices.data(), indices.size()));
         ARROW_ASSIGN_OR_RAISE(auto row_array, rows.Finish());
         ARROW_ASSIGN_OR_RAISE(auto scores, score_builder.Finish());
@@ -107,7 +108,7 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
           arrow::Status::UnknownError("fetch table failed"));
     }
-    auto batch = table->CombineChunksToBatch();
+    auto batch = table->CombineChunksToBatch(pool);
     if (!batch.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
           arrow::Status::ExecutionError("combine chunks to batch failed:",
@@ -162,6 +163,8 @@ Result<FtsIndexResults::Ptr> FtsRecallNode::prepare() {
 
   auto results =
       segment_->fts_search(fts_cond->field_name, *fts_cond->fts_ast, params);
+  auto evaluation_status = doc_filter_->status();
+  if (!evaluation_status.ok()) return tl::make_unexpected(evaluation_status);
   if (!results) {
     return tl::make_unexpected(results.error());
   }

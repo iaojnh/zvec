@@ -72,6 +72,53 @@ TEST(MultiSegmentTopKTest, LateFetchPreservesFieldsVectorsFiltersAndScores) {
     ASSERT_TRUE(removed);
     for (const auto &status : *removed) ASSERT_TRUE(status.ok());
     ASSERT_TRUE(collection.value()->flush().ok());
+    // Built-in fusion must match the callback's full-document path while
+    // fetching payloads only after the union has been ranked.
+    for (bool include_id : {false, true}) {
+      MultiQuery hybrid;
+      hybrid.topk = 100;
+      hybrid.include_vector = true;
+      hybrid.include_doc_id_ = include_id;
+      hybrid.output_fields = {"payload", "bucket", "dense"};
+      for (const std::string field : {"dense", "ip"}) {
+        SubQuery sub;
+        sub.num_candidates_ = 20;
+        sub.target_.field_name_ = field;
+        const float target[]{1, 0, 0, 0};
+        sub.target_.set_vector(std::string(
+            reinterpret_cast<const char *>(target), sizeof(target)));
+        hybrid.queries.push_back(std::move(sub));
+      }
+      auto late = collection.value()->query(hybrid);
+      ASSERT_TRUE(late) << late.error().message();
+      hybrid.rerank = reranker::CallbackParams{
+          [](const std::vector<DocPtrList> &lists,
+             const std::vector<FieldSchema::Ptr> &fields, int topk) {
+            for (const auto &list : lists)
+              for (const auto &doc : list) {
+                EXPECT_TRUE(doc->has("bucket"));
+                EXPECT_TRUE(doc->has("dense"));
+              }
+            return reranker::rerank(reranker::RrfParams{}, lists, fields, topk)
+                .value();
+          }};
+      auto full = collection.value()->query(hybrid);
+      ASSERT_TRUE(full) << full.error().message();
+      std::map<std::string, Doc::Ptr> expected;
+      for (const auto &doc : *full) expected.emplace(doc->pk(), doc);
+      ASSERT_EQ(expected.size(), late->size());
+      for (const auto &doc : *late) {
+        ASSERT_TRUE(expected.count(doc->pk()));
+        const auto &other = expected.at(doc->pk());
+        EXPECT_FLOAT_EQ(other->score(), doc->score());
+        EXPECT_EQ(other->doc_id(), doc->doc_id());
+        EXPECT_EQ(other->get<std::string>("payload"),
+                  doc->get<std::string>("payload"));
+        EXPECT_EQ(other->get<int32_t>("bucket"), doc->get<int32_t>("bucket"));
+        EXPECT_EQ(other->get<std::vector<float>>("dense"),
+                  doc->get<std::vector<float>>("dense"));
+      }
+    }
     for (const std::string field : {"dense", "ip", "sparse"}) {
       for (int filter : {0, 1, 2, 3}) {
         for (int topk : {1, 7, 257, 3000}) {

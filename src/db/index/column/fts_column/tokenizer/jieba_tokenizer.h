@@ -13,10 +13,10 @@
 // limitations under the License.
 
 #pragma once
-
 #include <memory>
 #include <string>
 #include <cppjieba/QuerySegment.hpp>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include "tokenizer.h"
 
 namespace zvec::fts {
@@ -60,8 +60,8 @@ class JiebaTokenizer : public Tokenizer {
   }
 
   // Move-only (unique_ptr members)
-  JiebaTokenizer(JiebaTokenizer &&) = default;
-  JiebaTokenizer &operator=(JiebaTokenizer &&) = default;
+  JiebaTokenizer(JiebaTokenizer &&other) noexcept;
+  JiebaTokenizer &operator=(JiebaTokenizer &&other) noexcept;
 
  private:
   enum class CutMode { kSearch, kMix, kFull, kHmm };
@@ -72,6 +72,7 @@ class JiebaTokenizer : public Tokenizer {
 
   // Declared before segmenters: reverse-order destruction keeps the raw
   // pointers held by segmenters valid until the segmenters die.
+  ailego::MemoryReservation dictionary_memory_;
   std::unique_ptr<cppjieba::DictTrie> dict_trie_;
   std::unique_ptr<cppjieba::HMMModel> hmm_model_;
   std::unique_ptr<cppjieba::QuerySegment> query_seg_;

@@ -617,6 +617,9 @@ Result<DocPtrList> SQLEngineImpl::fill_result(
   while (true) {
     auto read_res = reader->ReadNext(&record_batch);
     if (!read_res.ok()) {
+      if (read_res.IsOutOfMemory())
+        return tl::make_unexpected(
+            Status(StatusCode::RESOURCE_EXHAUSTED, read_res.ToString()));
       return tl::make_unexpected(
           Status::InternalError("Read next record batch failed (fill_result): ",
                                 read_res.ToString()));
@@ -650,6 +653,9 @@ Result<GroupResults> SQLEngineImpl::fill_group_by_result(
   while (true) {
     auto read_res = reader->ReadNext(&record_batch);
     if (!read_res.ok()) {
+      if (read_res.IsOutOfMemory())
+        return tl::make_unexpected(
+            Status(StatusCode::RESOURCE_EXHAUSTED, read_res.ToString()));
       return tl::make_unexpected(Status::InternalError(
           "Read next record batch failed (group_by): ", read_res.ToString()));
     }

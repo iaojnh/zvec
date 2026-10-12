@@ -66,6 +66,11 @@ class Segment {
 
   virtual SegmentMeta::Ptr meta() const = 0;
 
+  virtual bool uses_buffer_storage() const {
+    return false;
+  }
+  arrow::MemoryPool *query_memory_pool() const;
+
   // Doc-id bounds for routing, read under the shared segment lock. Concurrent
   // callers must use this instead of min/max_doc_id() off meta(), which
   // Insert/flush() mutate.

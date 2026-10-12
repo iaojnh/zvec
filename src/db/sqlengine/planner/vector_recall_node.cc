@@ -216,6 +216,8 @@ Result<IndexResults::Ptr> VectorRecallNode::prepare() {
   }
 
   auto vector_ret = vector_indexer->search(vector_data, query_params);
+  auto evaluation_status = doc_filter_->status();
+  if (!evaluation_status.ok()) return tl::make_unexpected(evaluation_status);
   if (!vector_ret) {
     return tl::make_unexpected(vector_ret.error());
   }
@@ -227,8 +229,9 @@ VectorRecallNode::State::collect_batch() {
   // collect a batch
   std::vector<int> indices;
   indices.reserve(self_->batch_size_);
-  arrow::FloatBuilder builder;
-  arrow::StringBuilder group_id_builder;
+  auto *pool = self_->segment_->query_memory_pool();
+  arrow::FloatBuilder builder(pool);
+  arrow::StringBuilder group_id_builder(pool);
   for (int i = 0; iter_->valid() && i < self_->batch_size_;
        i++, iter_->next()) {
     indices.push_back(iter_->doc_id());
@@ -238,7 +241,7 @@ VectorRecallNode::State::collect_batch() {
     }
   }
   if (self_->rank_only_) {
-    arrow::Int32Builder rows;
+    arrow::Int32Builder rows(pool);
     ARROW_RETURN_NOT_OK(rows.AppendValues(indices.data(), indices.size()));
     ARROW_ASSIGN_OR_RAISE(auto row_array, rows.Finish());
     ARROW_ASSIGN_OR_RAISE(auto scores, builder.Finish());
@@ -255,7 +258,7 @@ VectorRecallNode::State::collect_batch() {
   if (!table) {
     return arrow::Status::ExecutionError("fetch table failed");
   }
-  auto batch = table->CombineChunksToBatch();
+  auto batch = table->CombineChunksToBatch(pool);
   if (!batch.ok()) {
     return arrow::Status::ExecutionError("combine chunks to batch failed:",
                                          batch.status().ToString());
