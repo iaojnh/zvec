@@ -191,9 +191,12 @@ TEST(SegmentStreamTest, DistinctBuffersAreBoundedAndReleased) {
       rows += (*batch)->length;
     }
     EXPECT_EQ(200 * kRows, rows);
-    // Allow a consumer-held batch and builder validity buffer in addition to
-    // the sink watermark. The 200 distinct allocations must not accumulate.
-    EXPECT_LE(memory.max_memory(), 5 * kBytes);
+    // Up to three sink batches (including the watermark-crossing batch),
+    // one consumer-held batch and one in-progress builder. The builder also
+    // owns a validity bitmap until Finish(), even though these rows are all
+    // valid. Do not confuse that transient bitmap with another data batch.
+    constexpr int64_t kValidityBytes = (kRows + 7) / 8;
+    EXPECT_LE(memory.max_memory(), 5 * kBytes + kValidityBytes);
   }
   EXPECT_TRUE(expires(weak));
   EXPECT_EQ(0, memory.bytes_allocated());
