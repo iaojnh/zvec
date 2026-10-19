@@ -71,7 +71,7 @@ int Int4Quantizer::init(const IndexMeta &meta,
 void Int4Quantizer::quantize_one(const void *input, void *output) const {
   const float *vec = reinterpret_cast<const float *>(input);
 
-  std::vector<float> normalized;
+  ailego::BudgetedVector<float> normalized;
   float norm = 0.0f;
   if (is_cosine_) {
     // L2-normalize before quantization; the norm is stored after the record
@@ -169,8 +169,8 @@ DistanceImpl Int4Quantizer::distance(const void *query,
   }
 
   // The query is assumed to be already quantized — copy it directly.
-  std::string quantized_query(static_cast<const char *>(query),
-                              qmeta.element_size());
+  ailego::BudgetedString quantized_query(static_cast<const char *>(query),
+                                         qmeta.element_size());
   return DistanceImpl(std::move(func), std::move(batch_func),
                       std::move(quantized_query), dist_dim_);
 }
@@ -206,7 +206,7 @@ void Int4Quantizer::calc_distance_dp_query_batch(const void *const *dp_list,
 
 float Int4Quantizer::calc_distance_dp_query_unquantized(
     const void *dp, const void *query) const {
-  std::string buf(quantized_length(), '\0');
+  ailego::BudgetedString buf(quantized_length(), '\0');
   quantize_one(query, &buf[0]);
   return calc_distance_dp_query(dp, buf.data());
 }
@@ -214,7 +214,7 @@ float Int4Quantizer::calc_distance_dp_query_unquantized(
 void Int4Quantizer::calc_distance_dp_query_batch_unquantized(
     const void *const *dp_list, int dp_num, const void *query,
     float *dist_list) const {
-  std::string buf(quantized_length(), '\0');
+  ailego::BudgetedString buf(quantized_length(), '\0');
   quantize_one(query, &buf[0]);
   calc_distance_dp_query_batch(dp_list, dp_num, buf.data(), dist_list);
 }

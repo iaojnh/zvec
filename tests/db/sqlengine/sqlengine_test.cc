@@ -51,6 +51,92 @@ class SqlEngineTest : public testing::Test {
   CollectionSchema::Ptr schema_;
 };
 
+TEST_F(SqlEngineTest, VectorMemoryFailureSurvivesArrowExecution) {
+  class FailingIndexer : public MockVectorIndexer {
+   public:
+    StatusCode code{StatusCode::RESOURCE_EXHAUSTED};
+    Result<IndexResults::Ptr> search(
+        const vector_column_params::VectorData &data,
+        const vector_column_params::QueryParams &params) override {
+      if (code == StatusCode::OK)
+        return MockVectorIndexer::search(data, params);
+      return tl::make_unexpected(Status(code, "vector admission test failure"));
+    }
+  };
+  class FailingSegment : public MockSegment {
+   public:
+    std::shared_ptr<FailingIndexer> indexer =
+        std::make_shared<FailingIndexer>();
+    CombinedVectorColumnIndexer::Ptr get_combined_vector_indexer(
+        const std::string &) const override {
+      return indexer;
+    }
+    CombinedVectorColumnIndexer::Ptr get_quant_combined_vector_indexer(
+        const std::string &) const override {
+      return indexer;
+    }
+  };
+  auto segment = std::make_shared<FailingSegment>();
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  SearchQuery query;
+  query.topk_ = 1;
+  query.output_fields_ = {"id"};
+  query.target_.set_sparse_vector("[0, 1, 2, 3]", "[0.1, 0.2, 0.3, 0.4]");
+  query.target_.field_name_ = "vector";
+  query.target_.query_params_ = std::make_shared<QueryParams>(IndexType::FLAT);
+  for (auto code :
+       {StatusCode::RESOURCE_EXHAUSTED, StatusCode::INTERNAL_ERROR}) {
+    segment->indexer->code = code;
+    auto result = engine->execute(schema_, query, {segment});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(code, result.error().code());
+    EXPECT_NE(std::string::npos,
+              result.error().message().find("vector admission test failure"));
+  }
+}
+
+TEST_F(SqlEngineTest, RecallMaterializationPreservesMemoryAndReadFailures) {
+  class FailingSegment : public MockSegment {
+   public:
+    StatusCode code{StatusCode::OK};
+    TablePtr fetch(const std::vector<std::string> &columns,
+                   const std::vector<int> &indices) const override {
+      if (!indices.empty()) {
+        if (code == StatusCode::RESOURCE_EXHAUSTED) throw std::bad_alloc();
+        if (code == StatusCode::INTERNAL_ERROR) return nullptr;
+      }
+      return MockSegment::fetch(columns, indices);
+    }
+  };
+  auto segment = std::make_shared<FailingSegment>();
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  for (bool vector_query : {false, true}) {
+    SCOPED_TRACE(vector_query);
+    SearchQuery query;
+    query.topk_ = 1;
+    query.output_fields_ = {"id"};
+    if (vector_query) {
+      query.target_.set_sparse_vector("[0, 1, 2, 3]", "[0.1, 0.2, 0.3, 0.4]");
+      query.target_.field_name_ = "vector";
+      query.target_.query_params_ =
+          std::make_shared<QueryParams>(IndexType::FLAT);
+    } else {
+      query.filter_ = "name is not null";
+    }
+    for (auto code :
+         {StatusCode::RESOURCE_EXHAUSTED, StatusCode::INTERNAL_ERROR}) {
+      segment->code = code;
+      auto result = engine->execute(schema_, query, {segment});
+      ASSERT_FALSE(result);
+      EXPECT_EQ(code, result.error().code());
+      EXPECT_NE(std::string::npos,
+                result.error().message().find("Segment forward fetch"));
+    }
+    segment->code = StatusCode::OK;
+    EXPECT_TRUE(engine->execute(schema_, query, {segment}));
+  }
+}
+
 TEST_F(SqlEngineTest, Forward) {
   std::vector<Segment::Ptr> segments = {std::make_shared<MockSegment>()};
   SearchQuery query;

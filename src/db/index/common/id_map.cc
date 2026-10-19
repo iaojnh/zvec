@@ -100,7 +100,7 @@ Status IDMap::upsert(const std::string &key, uint64_t doc_id) {
   }
 
   rocksdb::Slice value((const char *)&doc_id, sizeof(uint64_t));
-  auto s = rocksdb_context_.db_->Put(rocksdb_context_.write_opts_, key, value);
+  auto s = rocksdb_context_.put(key, value);
   if (s.ok()) {
     return Status::OK();
   } else {
@@ -113,7 +113,7 @@ Status IDMap::upsert(const std::string &key, uint64_t doc_id) {
 
 
 void IDMap::remove(const std::string &key) {
-  rocksdb_context_.db_->Delete(rocksdb_context_.write_opts_, key);
+  rocksdb_context_.remove(key);
 }
 
 

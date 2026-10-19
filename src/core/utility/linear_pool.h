@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/internal/platform.h>
 
 namespace zvec {
@@ -119,6 +120,11 @@ struct LinearPool {
     size_ = cur_ = 0;
     ef_ = capacity;
     capacity_ = capacity;
+    if (capacity < 0 || capacity == INT32_MAX) throw std::bad_alloc();
+    if (data_.capacity() > 4096 &&
+        data_.capacity() / 2 > static_cast<size_t>(capacity + 1)) {
+      decltype(data_)().swap(data_);
+    }
     if (data_.size() < static_cast<size_t>(capacity + 1)) {
       data_.resize(capacity + 1);
     }
@@ -247,7 +253,9 @@ struct LinearPool {
   }
 
   int size_ = 0, cur_ = 0, ef_ = 0, capacity_ = 0;
-  std::vector<linear_pool_impl::Neighbor<dist_t>> data_;
+  std::vector<linear_pool_impl::Neighbor<dist_t>,
+              ailego::BudgetedAllocator<linear_pool_impl::Neighbor<dist_t>>>
+      data_;
 };
 
 // Copy a single-heap pool's (LinearPool/BlockHeap) distance-sorted retained

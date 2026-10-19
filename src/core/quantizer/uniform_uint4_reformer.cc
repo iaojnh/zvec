@@ -18,6 +18,7 @@
 #include <cstring>
 #include <vector>
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/interface/index_param.h>
 #include <zvec/turbo/turbo.h>
@@ -158,7 +159,7 @@ class UniformUint4Reformer : public IndexReformer {
     out->resize(static_cast<size_t>(count) * output_stride);
     auto *output = reinterpret_cast<uint8_t *>(out->data());
     const auto *source_bytes = static_cast<const uint8_t *>(source);
-    static thread_local std::vector<float> decoded;
+    static thread_local ailego::BudgetedVector<float> decoded;
     if (!is_fp32) decoded.resize(original_dimension_);
     for (uint32_t i = 0; i < count; ++i) {
       const void *source_row =

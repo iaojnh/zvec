@@ -29,9 +29,11 @@ namespace core {
 //   5. If this is the first node, set it as entry point
 // ============================================================================
 template <typename EntityType>
-int VamanaAlgorithm<EntityType>::add_node(node_id_t id, VamanaContext *ctx) {
+int VamanaAlgorithm<EntityType>::add_node(node_id_t id,
+                                          VamanaContext *ctx) try {
   // Lazily initialize distance storage on first insert
-  entity_.ensure_dist_storage();
+  const int storage_ret = entity_.ensure_dist_storage();
+  if (storage_ret != 0) return storage_ret;
 
   spin_lock_.lock();
   auto entry_point = entity_.entry_point();
@@ -65,16 +67,23 @@ int VamanaAlgorithm<EntityType>::add_node(node_id_t id, VamanaContext *ctx) {
   // Step 2: RobustPrune to select diverse neighbors
   robust_prune(id, topk_heap, entity_.alpha(), entity_.max_degree(), ctx);
   // Copy result before reverse updates (which also call robust_prune)
+  ailego::MemoryReservation neighbors_memory;
+  neighbors_memory.add_array(ctx->prune_result().size(),
+                             sizeof(std::pair<node_id_t, dist_t>));
   auto pruned_neighbors = ctx->prune_result();
 
   // Step 3: Update the new node's neighbor list and distances
-  entity_.update_neighbors(id, pruned_neighbors);
+  CheckGraphStorage(entity_.update_neighbors(id, pruned_neighbors));
   entity_.update_neighbor_dists(id, pruned_neighbors);
 
   // Step 4: Reverse-link updates
   update_neighbors_and_reverse_links(id, pruned_neighbors, ctx);
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // ============================================================================
@@ -86,7 +95,8 @@ int VamanaAlgorithm<EntityType>::add_node(node_id_t id, VamanaContext *ctx) {
 // applies RobustPrune with the configured target alpha.
 // ============================================================================
 template <typename EntityType>
-int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx, float alpha) {
+int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx,
+                                              float alpha) try {
   if (ctx == nullptr) return IndexError_InvalidArgument;
   int ret = entity_.ensure_dist_storage();
   if (ailego_unlikely(ret != 0)) {
@@ -98,10 +108,11 @@ int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx, float alpha) {
     return 0;
   }
 
-  ctx->check_need_adjuct_ctx(n);
+  if (!ctx->check_need_adjuct_ctx(n)) return IndexError_NoMemory;
   for (node_id_t id = 0; id < n; ++id) {
     if (entity_.get_key(id) == kInvalidKey) continue;
-    if (entity_.get_vector(id) == nullptr) continue;
+    IndexStorage::MemoryBlock vector_block;
+    CheckGraphStorage(entity_.get_vector(id, vector_block));
     ret = refine_node(id, alpha, ctx);
     if (ailego_unlikely(ret != 0)) {
       return ret;
@@ -111,13 +122,17 @@ int VamanaAlgorithm<EntityType>::refine_graph(VamanaContext *ctx, float alpha) {
     }
   }
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // ============================================================================
 // search: Greedy search for approximate nearest neighbors.
 // ============================================================================
 template <typename EntityType>
-int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const {
+int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const try {
   spin_lock_.lock();
   auto entry_point = entity_.entry_point();
   spin_lock_.unlock();
@@ -142,6 +157,10 @@ int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const {
   }
 
   return greedy_search(entry_point, ctx, /*use_pool=*/true);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // ============================================================================
@@ -399,13 +418,14 @@ void dual_heap_greedy_search(const EntityType &entity, VamanaContext *ctx,
                                       : vector_body_lines;
 
   uint32_t buf_capacity = entity.max_degree();
-  std::vector<node_id_t> neighbor_ids(buf_capacity);
+  ailego::BudgetedVector<node_id_t> neighbor_ids(buf_capacity);
   std::vector<MemBlockType> neighbor_vec_blocks;
   neighbor_vec_blocks.reserve(buf_capacity);
-  std::vector<float> dists(buf_capacity);
-  std::vector<const void *> neighbor_vecs(buf_capacity);
+  ailego::BudgetedVector<float> dists(buf_capacity);
+  ailego::BudgetedVector<const void *> neighbor_vecs(buf_capacity);
   const bool has_extra_values = entity.extra_values_size() != 0;
-  std::vector<const void *> extra_values(has_extra_values ? buf_capacity : 0);
+  ailego::BudgetedVector<const void *> extra_values(
+      has_extra_values ? buf_capacity : 0);
 
   VisitFilter &visit = ctx->visit_filter();
   CandidateHeap &candidates = ctx->candidates();
@@ -515,7 +535,7 @@ void dual_heap_greedy_search(const EntityType &entity, VamanaContext *ctx,
 template <typename EntityType>
 int VamanaAlgorithm<EntityType>::greedy_search(node_id_t entry_point,
                                                VamanaContext *ctx,
-                                               bool use_pool) const {
+                                               bool use_pool) const try {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   VamanaDistCalculator &dc = ctx->dist_calculator();
 
@@ -580,11 +600,15 @@ int VamanaAlgorithm<EntityType>::greedy_search(node_id_t entry_point,
     }
   }
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <typename EntityType>
 int VamanaAlgorithm<EntityType>::refine_node(node_id_t id, float alpha,
-                                             VamanaContext *ctx) {
+                                             VamanaContext *ctx) try {
   IndexStorage::MemoryBlock query_block;
   if (ailego_unlikely(entity_.get_vector(id, query_block) != 0)) {
     return IndexError_ReadData;
@@ -643,7 +667,7 @@ int VamanaAlgorithm<EntityType>::refine_node(node_id_t id, float alpha,
     node_id_t neighbor = current_neighbors[i];
     if (neighbor == id || candidate_membership.visited(neighbor)) continue;
     const void *neighbor_vec = entity_.get_vector(neighbor);
-    if (neighbor_vec == nullptr) continue;
+    if (neighbor_vec == nullptr) throw GraphStorageError{IndexError_ReadData};
     dist_t dist = cached_dists ? cached_dists[i]
                                : ctx->dist_calculator().dist(query_block.data(),
                                                              neighbor_vec);
@@ -652,13 +676,20 @@ int VamanaAlgorithm<EntityType>::refine_node(node_id_t id, float alpha,
   }
 
   robust_prune(id, candidates, alpha, entity_.max_degree(), ctx);
+  ailego::MemoryReservation neighbors_memory;
+  neighbors_memory.add_array(ctx->prune_result().size(),
+                             sizeof(std::pair<node_id_t, dist_t>));
   auto pruned_neighbors = ctx->prune_result();
 
-  entity_.update_neighbors(id, pruned_neighbors);
+  CheckGraphStorage(entity_.update_neighbors(id, pruned_neighbors));
   entity_.update_neighbor_dists(id, pruned_neighbors);
   update_neighbors_and_reverse_links(id, pruned_neighbors, ctx);
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // ============================================================================
@@ -712,10 +743,9 @@ void VamanaAlgorithm<EntityType>::robust_prune(node_id_t id,
   vec_cache.resize(n);
   std::vector<IndexStorage::MemoryBlock> vector_blocks(n);
   for (size_t i = 0; i < n; ++i) {
-    vec_cache[i] =
-        entity_.get_vector(candidates[i].first, vector_blocks[i]) == 0
-            ? vector_blocks[i].data()
-            : nullptr;
+    CheckGraphStorage(
+        entity_.get_vector(candidates[i].first, vector_blocks[i]));
+    vec_cache[i] = vector_blocks[i].data();
   }
 
   // occlude_factor: tracks the maximum occlusion ratio for each candidate
@@ -882,12 +912,12 @@ void VamanaAlgorithm<EntityType>::reverse_update_neighbor(node_id_t id,
   } else {
     // Fallback: compute distances (first time or dist storage not loaded)
     IndexStorage::MemoryBlock neighbor_block;
-    if (ailego_unlikely(entity_.get_vector(neighbor_id, neighbor_block) != 0))
-      return;
+    CheckGraphStorage(entity_.get_vector(neighbor_id, neighbor_block));
     for (uint32_t i = 0; i < current_size; ++i) {
       node_id_t nbr = current_neighbors[i];
       const void *nbr_vec = entity_.get_vector(nbr);
-      if (ailego_unlikely(nbr_vec == nullptr)) continue;
+      if (ailego_unlikely(nbr_vec == nullptr))
+        throw GraphStorageError{IndexError_ReadData};
       dist_t nbr_dist = dc.dist(neighbor_block.data(), nbr_vec);
       prune_candidates.emplace(nbr, nbr_dist);
     }
@@ -901,7 +931,7 @@ void VamanaAlgorithm<EntityType>::reverse_update_neighbor(node_id_t id,
 
   // Update neighbor_id's neighbor list and distances
   const auto &prune_result = ctx->prune_result();
-  entity_.update_neighbors(neighbor_id, prune_result);
+  CheckGraphStorage(entity_.update_neighbors(neighbor_id, prune_result));
   entity_.update_neighbor_dists(neighbor_id, prune_result);
 }
 

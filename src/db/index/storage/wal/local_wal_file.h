@@ -59,9 +59,12 @@ class LocalWalFile : public WalFile {
   }
 
  public:
-  int append(std::string &&data) override;
+  int append(std::string_view data) override;
   int prepare_for_read() override;
-  std::string next() override;
+  std::string next(const ReadAdmission &admit = {}) override;
+  Status read_status() const override {
+    return read_status_;
+  }
 
  public:
   int open(const WalOptions &wal_option) override;
@@ -77,8 +80,8 @@ class LocalWalFile : public WalFile {
   }
 
  private:
-  int write_record(WalRecord &record);
-  int read_record(WalRecord &record);
+  int write_record(std::string_view data, uint32_t crc);
+  int read_record(WalRecord &record, const ReadAdmission &admit);
 
  private:
   ailego::File file_;
@@ -93,6 +96,7 @@ class LocalWalFile : public WalFile {
   WalHeader header_;
 
   bool opened_{false};
+  Status read_status_;
 };
 
 

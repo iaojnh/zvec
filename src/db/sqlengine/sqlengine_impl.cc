@@ -20,7 +20,9 @@
 #include <zvec/db/index_params.h>
 #include <zvec/db/type.h>
 #include "db/common/constants.h"
+#include "db/common/query_result_memory.h"
 #include "db/index/column/fts_column/fts_ast_rewriter.h"
+#include "db/index/column/fts_column/fts_memory.h"
 #include "db/index/column/fts_column/fts_pipeline.h"
 #include "db/index/column/fts_column/fts_query_ast.h"
 #include "db/index/common/doc_field_converter.h"
@@ -59,24 +61,97 @@ SQLEngineImpl::SQLEngineImpl(zvec::Profiler::Ptr profiler)
 Result<DocPtrList> SQLEngineImpl::execute(
     CollectionSchema::Ptr collection, SearchQuery query,
     const std::vector<Segment::Ptr> &segments) {
+  std::vector<FieldAndSchema> output_fields;
+  auto reader = prepare_search(collection, query, segments, &output_fields);
+  if (!reader) return tl::make_unexpected(reader.error());
+  if (!reader.value()) return DocPtrList{};
+  const bool budgeted = std::any_of(
+      segments.begin(), segments.end(),
+      [](const auto &segment) { return segment->uses_buffer_storage(); });
+  return fill_result(output_fields, reader.value().get(), budgeted);
+}
+
+Status SQLEngineImpl::scan_doc_ids(CollectionSchema::Ptr collection,
+                                   const std::string &filter,
+                                   const std::vector<Segment::Ptr> &segments,
+                                   const DocIdConsumer &consume) {
+  if (!consume) return Status::InvalidArgument("Missing document ID consumer");
+  SearchQuery query;
+  query.filter_ = filter;
+  query.topk_ = INT32_MAX;
+  query.output_fields_ = std::vector<std::string>{};
+  query.include_doc_id_ = true;
+  // Drain one segment at a time, in SegmentNode's existing reverse order.
+  // Otherwise each segment's asynchronous Arrow sink can collect the entire
+  // scan while pageable ID staging is busy with I/O. Explicit backpressure
+  // pauses production when the reader's output queue exceeds 64 KiB.
+  for (auto it = segments.rbegin(); it != segments.rend() && query.topk_ > 0;
+       ++it) {
+    auto reader = prepare_search(collection, query, {*it}, nullptr, 64 * 1024);
+    if (!reader) return reader.error();
+    if (!reader.value()) continue;
+    auto scan_status = [&]() -> Status {
+      for (;;) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto status = reader.value()->ReadNext(&batch);
+        if (!status.ok()) {
+          return Status::InternalError("Read document ID batch failed: ",
+                                       status.ToString());
+        }
+        if (!batch) return Status::OK();
+        auto column = batch->GetColumnByName(GLOBAL_DOC_ID);
+        if (!column || column->type_id() != arrow::Type::UINT64 ||
+            column->null_count() != 0 || column->length() > query.topk_) {
+          return Status::InternalError("Missing or invalid document ID column");
+        }
+        if (column->length() == 0) continue;
+        const auto &ids = static_cast<const arrow::UInt64Array &>(*column);
+        auto result =
+            consume(ids.raw_values(), static_cast<size_t>(ids.length()));
+        if (!result.ok()) return result;
+        query.topk_ -= static_cast<int>(ids.length());
+      }
+    }();
+    // Cancel unfinished work before the caller releases its scan lock, also
+    // when the consumer cannot stage another batch. Preserve its original
+    // error.
+    auto close_status = reader.value()->Close();
+    if (!scan_status.ok()) return scan_status;
+    if (!close_status.ok()) {
+      return Status::InternalError("Close document ID scan failed: ",
+                                   close_status.ToString());
+    }
+  }
+  return Status::OK();
+}
+
+Result<std::unique_ptr<arrow::RecordBatchReader>> SQLEngineImpl::prepare_search(
+    CollectionSchema::Ptr collection, const SearchQuery &query,
+    const std::vector<Segment::Ptr> &segments,
+    std::vector<FieldAndSchema> *output_fields, size_t max_queued_bytes) {
   if (segments.empty()) {
-    return DocPtrList{};
+    return std::unique_ptr<arrow::RecordBatchReader>{};
   }
 
   // Check filter satisfiability once before the loop (result depends only on
   // the query, not on segment data).
-  auto first_query_info = build_query_info(collection, query, nullptr);
+  const bool budgeted = std::any_of(
+      segments.begin(), segments.end(),
+      [](const auto &segment) { return segment->uses_buffer_storage(); });
+  auto first_query_info =
+      build_query_info(collection, query, nullptr, budgeted);
   if (!first_query_info) {
     return tl::make_unexpected(first_query_info.error());
   }
   if (first_query_info.value()->is_filter_unsatisfiable()) {
     LOG_WARN("filter is unsatisfiable: %s",
              first_query_info.value()->to_string().c_str());
-    return {};
+    return std::unique_ptr<arrow::RecordBatchReader>{};
   }
   // Capture output field schema before query_infos are moved into the planner.
-  auto select_item_meta_ptrs =
-      first_query_info.value()->select_item_schema_ptrs();
+  if (output_fields) {
+    *output_fields = first_query_info.value()->select_item_schema_ptrs();
+  }
 
   // Build a separate QueryInfo per segment so the optimizer can mutate each
   // independently.  Reuse first_query_info for segment 0.
@@ -84,18 +159,19 @@ Result<DocPtrList> SQLEngineImpl::execute(
   query_infos.reserve(segments.size());
   query_infos.emplace_back(std::move(first_query_info.value()));
   for (size_t i = 1; i < segments.size(); ++i) {
-    auto query_info = build_query_info(collection, query, nullptr);
+    auto query_info = build_query_info(collection, query, nullptr, budgeted);
     if (!query_info) {
       return tl::make_unexpected(query_info.error());
     }
     query_infos.emplace_back(std::move(query_info.value()));
   }
-  auto reader = search_by_query_info(collection, segments, &query_infos);
+  auto reader = search_by_query_info(collection, segments, &query_infos,
+                                     max_queued_bytes);
   if (!reader) {
     return tl::make_unexpected(Status::InternalError(
         "Execute plan failed (query): ", reader.error().c_str()));
   }
-  return fill_result(select_item_meta_ptrs, reader.value().get());
+  return reader;
 }
 
 SearchQuery from_group_by(const GroupByVectorQuery &gq) {
@@ -116,6 +192,9 @@ Result<GroupResults> SQLEngineImpl::execute_group_by(
   }
 
   SearchQuery query = from_group_by(group_by_query);
+  const bool budgeted = std::any_of(
+      segments.begin(), segments.end(),
+      [](const auto &segment) { return segment->uses_buffer_storage(); });
 
   // Check filter satisfiability once before the loop (result depends only on
   // the query, not on segment data).
@@ -123,7 +202,8 @@ Result<GroupResults> SQLEngineImpl::execute_group_by(
       collection, query,
       std::make_shared<GroupBy>(group_by_query.group_by_field_name_,
                                 group_by_query.topk_per_group_,
-                                group_by_query.group_count_));
+                                group_by_query.group_count_),
+      budgeted);
   if (!first_query_info) {
     return tl::make_unexpected(first_query_info.error());
   }
@@ -146,7 +226,8 @@ Result<GroupResults> SQLEngineImpl::execute_group_by(
         collection, query,
         std::make_shared<GroupBy>(group_by_query.group_by_field_name_,
                                   group_by_query.topk_per_group_,
-                                  group_by_query.group_count_));
+                                  group_by_query.group_count_),
+        budgeted);
     if (!query_info) {
       return tl::make_unexpected(query_info.error());
     }
@@ -157,7 +238,8 @@ Result<GroupResults> SQLEngineImpl::execute_group_by(
     return tl::make_unexpected(Status::InternalError(
         "Execute plan failed (group_by): ", reader.error().c_str()));
   }
-  return fill_group_by_result(*group_by_query_info, reader.value().get());
+  return fill_group_by_result(*group_by_query_info, reader.value().get(),
+                              budgeted);
 }
 
 Result<FtsCondInfo::Ptr> SQLEngineImpl::parse_fts_query(
@@ -213,9 +295,7 @@ Result<FtsCondInfo::Ptr> SQLEngineImpl::parse_fts_query(
   }
   auto pipeline_result = detail::AcquireFtsPipeline(*fts_idx_param);
   if (!pipeline_result.has_value()) {
-    return tl::make_unexpected(Status::InternalError(
-        "Failed to create tokenizer pipeline for field: ", field_name, " ",
-        pipeline_result.error().message()));
+    return tl::make_unexpected(pipeline_result.error());
   }
   auto &pipeline = pipeline_result.value();
 
@@ -287,8 +367,39 @@ Result<QueryInfo::Ptr> SQLEngineImpl::parse_sql_info(
 
 Result<QueryInfo::Ptr> SQLEngineImpl::build_query_info(
     CollectionSchema::Ptr collection, const SearchQuery &request,
-    std::shared_ptr<GroupBy> group_by) {
+    std::shared_ptr<GroupBy> group_by, bool budgeted) try {
   ScopedProfilerStage stage_guard(profiler_, "build_sql_info");
+  struct Owner {
+    detail::ResultMemoryAllowance::Lease memory;
+    QueryInfo::Ptr info;
+    explicit Owner(bool enabled)
+        : memory(enabled ? &detail::SharedResultMemoryAllowance() : nullptr) {}
+  };
+  auto owner = std::make_shared<Owner>(budgeted);
+  if (budgeted) {
+    // Reserve before tokenization/ANTLR, not only when admitting the parsed
+    // tree to its optional cache. Keep this allowance through the plan's last
+    // QueryInfo reference, including asynchronous readers. This is a planning
+    // allowance for parser/analyzer containers, not an allocator hard limit.
+    detail::QueryResultEstimate estimate;
+    estimate.add(4096);
+    estimate.add(256, request.filter_.size());
+    if (const auto *fts = request.target_.get_fts_clause()) {
+      estimate.add(256, fts->query_string_.size());
+      estimate.add(256, fts->match_string_.size());
+      const auto *field = collection->get_field(request.target_.field_name_);
+      const auto params =
+          field
+              ? std::dynamic_pointer_cast<FtsIndexParams>(field->index_params())
+              : nullptr;
+      if (params) {
+        estimate.add(detail::EstimateFtsWorkspace(*params, fts->query_string_));
+        estimate.add(detail::EstimateFtsWorkspace(*params, fts->match_string_));
+      }
+    }
+    estimate.add(512, collection->fields().size());
+    owner->memory.add(estimate.bytes());
+  }
   Node::Ptr filter_node;
   if (!request.filter_.empty()) {
     ZVecParser::Ptr parser = ZVecParser::create();
@@ -342,13 +453,22 @@ Result<QueryInfo::Ptr> SQLEngineImpl::build_query_info(
 
   LOG_DEBUG("Sql info is %s", sql_info.value()->to_string().c_str());
   stage_guard.close();
-  return parse_sql_info(*collection, std::move(sql_info.value()));
+  auto info = parse_sql_info(*collection, std::move(sql_info.value()));
+  if (!info) return info;
+  owner->info = std::move(info.value());
+  auto *raw = owner->info.get();
+  return QueryInfo::Ptr(std::move(owner), raw);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient shared budget for query parsing and planning"));
 }
 
 Result<std::unique_ptr<arrow::RecordBatchReader>>
 SQLEngineImpl::search_by_query_info(
     CollectionSchema::Ptr collection, const std::vector<Segment::Ptr> &segments,
-    std::vector<sqlengine::QueryInfo::Ptr> *query_infos) {
+    std::vector<sqlengine::QueryInfo::Ptr> *query_infos,
+    size_t max_queued_bytes) {
   global_init();
 
   ScopedProfilerStage stage_guard(profiler_, "build_query_plan");
@@ -360,7 +480,7 @@ SQLEngineImpl::search_by_query_info(
     return tl::make_unexpected(plan_info.error());
   }
   // LOG_DEBUG("plan_info: [%s]", plan_info->to_string().c_str());
-  return plan_info.value()->execute_to_reader();
+  return plan_info.value()->execute_to_reader(max_queued_bytes);
 }
 
 #define GET_FIELD_FROM_RECORD_BATCH(res, field_name)                    \
@@ -543,12 +663,19 @@ Status record_batch_to_doc_list(
 
 Result<DocPtrList> SQLEngineImpl::fill_result(
     const std::vector<FieldAndSchema> &output_fields,
-    arrow::RecordBatchReader *reader) {
+    arrow::RecordBatchReader *reader, bool budgeted) try {
+  auto memory = budgeted
+                    ? std::make_shared<detail::ResultMemoryAllowance::Lease>(
+                          &detail::SharedResultMemoryAllowance())
+                    : nullptr;
   DocPtrList docs;
   std::shared_ptr<RecordBatch> record_batch;
   while (true) {
     auto read_res = reader->ReadNext(&record_batch);
     if (!read_res.ok()) {
+      if (read_res.IsOutOfMemory())
+        return tl::make_unexpected(
+            Status(StatusCode::RESOURCE_EXHAUSTED, read_res.ToString()));
       return tl::make_unexpected(
           Status::InternalError("Read next record batch failed (fill_result): ",
                                 read_res.ToString()));
@@ -557,9 +684,10 @@ Result<DocPtrList> SQLEngineImpl::fill_result(
       break;
     }
     size_t cur_size = docs.size();
+    if (memory) memory->add(detail::EstimateQueryResult(*record_batch));
     docs.resize(docs.size() + record_batch->num_rows());
     for (int i = 0; i < record_batch->num_rows(); i++) {
-      docs[cur_size + i] = std::make_shared<Doc>();
+      docs[cur_size + i] = detail::MakeQueryDocument(memory);
     }
     auto status = record_batch_to_doc_list(output_fields, *record_batch,
                                            docs.begin() + cur_size);
@@ -568,11 +696,18 @@ Result<DocPtrList> SQLEngineImpl::fill_result(
     }
   }
   return docs;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient shared budget for query "
+                                    "results; reduce topk or output fields"));
 }
 
 
 Result<GroupResults> SQLEngineImpl::fill_group_by_result(
-    const QueryInfo &query_info, arrow::RecordBatchReader *reader) {
+    const QueryInfo &query_info, arrow::RecordBatchReader *reader,
+    bool budgeted) try {
+  detail::ResultMemoryAllowance::Lease memory(
+      budgeted ? &detail::SharedResultMemoryAllowance() : nullptr);
   const std::vector<FieldAndSchema> &output_fields =
       query_info.select_item_schema_ptrs();
   uint32_t group_count = query_info.group_by()->group_count;
@@ -582,11 +717,23 @@ Result<GroupResults> SQLEngineImpl::fill_group_by_result(
   while (true) {
     auto read_res = reader->ReadNext(&record_batch);
     if (!read_res.ok()) {
+      if (read_res.IsOutOfMemory())
+        return tl::make_unexpected(
+            Status(StatusCode::RESOURCE_EXHAUSTED, read_res.ToString()));
       return tl::make_unexpected(Status::InternalError(
           "Read next record batch failed (group_by): ", read_res.ToString()));
     }
     if (record_batch == nullptr) {
       break;
+    }
+    if (budgeted) {
+      // GroupResult stores Docs by value and its Python API materializes
+      // another set of field/list/Unicode objects. Admit that overlap here,
+      // before copying Arrow payloads; retained backing remains shared with
+      // ordinary Query/Fetch rather than creating a second cache allowance.
+      detail::QueryResultEstimate materialization;
+      materialization.add(detail::EstimateQueryResult(*record_batch), 4);
+      memory.add(materialization.bytes());
     }
     DocPtrList docs(record_batch->num_rows());
     for (int i = 0; i < record_batch->num_rows(); i++) {
@@ -636,6 +783,9 @@ Result<GroupResults> SQLEngineImpl::fill_group_by_result(
     }
   }
   return group_results;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient group result budget"));
 }
 
 }  // namespace zvec::sqlengine

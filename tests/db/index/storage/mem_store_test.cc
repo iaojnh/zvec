@@ -97,6 +97,75 @@ class MemStoreTest : public testing::Test {
 };
 
 // Test constructor
+TEST_F(MemStoreTest, ProjectsBeforeCopyingSelectedRows) {
+  arrow::UInt64Builder ids;
+  arrow::StringBuilder payload;
+  std::vector<int> rows;
+  for (int i = 0; i < 32; ++i) {
+    ASSERT_TRUE(ids.Append(i).ok());
+    ASSERT_TRUE(payload.Append(std::string(16384, 'x')).ok());
+    rows.push_back(i);
+  }
+  auto id_array = ids.Finish().ValueOrDie();
+  auto payload_array = payload.Finish().ValueOrDie();
+  auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("id", arrow::uint64()),
+                     arrow::field("payload", arrow::utf8())}),
+      {id_array, payload_array});
+  const auto before = arrow::default_memory_pool()->total_bytes_allocated();
+  auto result = store_->apply_row_and_column_selection(table, rows, {"id"});
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(1, (*result)->num_columns());
+  EXPECT_EQ(32, (*result)->num_rows());
+  EXPECT_LT(arrow::default_memory_pool()->total_bytes_allocated() - before,
+            64 * 1024);
+}
+
+TEST_F(MemStoreTest, MissingBuilderReturnsAllocationError) {
+  RecordBatchBuilderPtr builder;
+  EXPECT_TRUE(store_->convert_to_builder(builder).IsOutOfMemory());
+}
+
+TEST_F(MemStoreTest, ArrayPayloadParticipatesInBufferFullness) {
+  auto array_schema = std::make_shared<CollectionSchema>(
+      "arrays", std::vector<FieldSchema::Ptr>{std::make_shared<FieldSchema>(
+                    "values", DataType::ARRAY_INT32, false, nullptr)});
+  const std::string file = "./array_payload.block.0";
+  {
+    MemForwardStore store(array_schema, file, FileFormat::IPC, 16384);
+    ASSERT_TRUE(store.open().ok());
+    Doc doc;
+    doc.set_pk("array");
+    ASSERT_TRUE(
+        doc.set<std::vector<int32_t>>("values", std::vector<int32_t>(8192, 7)));
+    ASSERT_TRUE(store.insert(doc).ok());
+    EXPECT_GE(store.total_bytes(), 8192u * sizeof(int32_t));
+    EXPECT_TRUE(store.is_full());
+    ASSERT_TRUE(store.close().ok());
+  }
+  std::filesystem::remove(file);
+}
+
+TEST_F(MemStoreTest, UnpublishedPreparationLeavesRowsUnchanged) {
+  Doc doc = CreateDoc(10);
+  {
+    auto prepared = store_->prepare_insert(doc, 123);
+    ASSERT_TRUE(prepared.has_value()) << prepared.error().message();
+    EXPECT_EQ(0u, store_->num_rows());
+    EXPECT_EQ(10u, doc.doc_id());
+  }
+  EXPECT_EQ(0u, store_->num_rows());
+  auto prepared = store_->prepare_insert(doc, 123);
+  ASSERT_TRUE(prepared.has_value());
+  store_->commit_insert(std::move(*prepared));
+  EXPECT_EQ(1u, store_->num_rows());
+  auto result = store_->get_table();
+  ASSERT_NE(nullptr, result);
+  EXPECT_EQ(123u, std::static_pointer_cast<arrow::UInt64Array>(
+                      result->column(0)->chunk(0))
+                      ->Value(0));
+}
+
 TEST_F(MemStoreTest, ConstructorTest) {
   auto schema = GetCollectionSchema();
   MemForwardStore store(schema, "./scalar.block.0", FileFormat::IPC);
@@ -808,9 +877,9 @@ TEST_F(MemStoreTest, ThreadSafety) {
 
   for (int t = 0; t < num_threads; ++t) {
     futures.push_back(
-        std::async(std::launch::async, [this, t, inserts_per_thread]() {
-          for (int i = 0; i < inserts_per_thread; ++i) {
-            uint64_t doc_id = t * inserts_per_thread + i;
+        std::async(std::launch::async, [this, t, count = inserts_per_thread]() {
+          for (int i = 0; i < count; ++i) {
+            uint64_t doc_id = t * count + i;
             store_->insert(CreateDoc(doc_id));
           }
         }));

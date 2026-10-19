@@ -16,9 +16,11 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "tests/test_util.h"
 #include "vamana_algorithm.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
 namespace {
@@ -248,6 +250,28 @@ TEST_F(VamanaFastSearchTest, ExactVisitModesPreserveResultsAndSearchTrace) {
       EXPECT_EQ(expected_trace, evaluated_);
     }
   }
+}
+
+TEST_F(VamanaFastSearchTest, QueryWorkspaceRejectionDoesNotPoisonContext) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t old = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ailego::ScopeGuard::Make([&] {
+    context_.reset();
+    EXPECT_EQ(0u, pool.used());
+    pool.init(old);
+  });
+  ASSERT_EQ(0, pool.init(0));
+  create_graph({10, 2, 3, 1}, {{1, 2}, {0, 2}, {3}, {}});
+  ASSERT_EQ(0, pool.init(64 * 1024));
+  context_->set_topk(4);
+  context_->set_ef(100000);
+  std::array<float, kDimension> query{};
+  context_->reset_query(query.data());
+  EXPECT_EQ(IndexError_NoMemory, algorithm_->search(context_.get()));
+  search(0.0f, 4);
+  EXPECT_EQ(4u, context_->search_heap().size());
+  EXPECT_GT(pool.used(), 0u);
 }
 
 TEST_F(VamanaFastSearchTest, InvalidVisitFilterFailsSearchExplicitly) {

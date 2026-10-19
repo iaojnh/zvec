@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "diskann_searcher_entity.h"
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include "diskann_util.h"
 
 namespace zvec {
@@ -54,8 +56,11 @@ const DiskAnnEntity::Pointer DiskAnnSearcherEntity::clone() const {
   entity->meta_ = meta_;
   entity->legacy_pq_layout_ = legacy_pq_layout_;
   entity->pq_codes_ = pq_codes_;
+  if (!pq_codes_.data()) entity->pq_data_segment_ = pq_data_segment_;
   entity->key_buffer_ = key_buffer_;
   entity->key_mapping_buffer_ = key_mapping_buffer_;
+  if (!key_buffer_) entity->key_segment_ = key_segment_;
+  if (!key_mapping_buffer_) entity->key_mapping_segment_ = key_mapping_segment_;
   entity->entrypoints_ = entrypoints_;
 
   return DiskAnnEntity::Pointer(entity.release());
@@ -166,38 +171,52 @@ int DiskAnnSearcherEntity::load_pq_segment() {
     return IndexError_InvalidFormat;
   }
 
+  if (pq_meta_.chunk_num == 0 ||
+      meta_header_.doc_cnt > pq_data_segment_->data_size() / pq_meta_.chunk_num)
+    return IndexError_InvalidFormat;
   size_t code_bytes = meta_header_.doc_cnt * pq_meta_.chunk_num;
-
-  try {
-    auto pq_codes = std::make_shared<std::string>(code_bytes, '\0');
-    read_size = pq_data_segment_->fetch(0, &(*pq_codes)[0], code_bytes);
-    if (read_size != code_bytes) {
-      LOG_ERROR("Read segment %s failed, expect: %zu, actual: %zu",
-                DiskAnnEntity::kDiskAnnPqMetaSegmentId.c_str(), code_bytes,
-                (size_t)read_size);
-
-      return IndexError_ReadData;
-    }
-    pq_codes_ = std::move(pq_codes);
-  } catch (const std::bad_alloc &) {
-    LOG_ERROR("Failed to allocate DiskAnn PQ code buffer");
-    return IndexError_NoMemory;
+  if (storage_->vec_buffer_pool()) {
+    pq_codes_.reset();
+    return 0;
   }
 
-  return 0;
+  try {
+    auto codes = std::allocate_shared<ailego::BudgetedMappedBuffer>(
+        ailego::BudgetedAllocator<ailego::BudgetedMappedBuffer>{}, code_bytes);
+    if (pq_data_segment_->fetch(0, codes->data(), code_bytes) != code_bytes)
+      return IndexError_ReadData;
+    pq_codes_ = IndexStorage::MemoryBlock::MakeSharedView(codes->data(), codes);
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  }
 }
 
 int DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer(
-    std::string *meta_buffer) const {
+    QuantizerMetaBuffer *meta_buffer) const try {
   if (!meta_buffer || !pq_meta_segment_) {
     return IndexError_InvalidArgument;
   }
 
   // The meta buffer is stored right after the DiskAnnPqMeta header in the
   // segment.
-  IndexStorage::MemoryBlock data;
-  size_t read_size = pq_meta_segment_->read(
-      sizeof(DiskAnnPqMeta), data, pq_meta_.quantizer_meta_buffer_size);
+  // Read directly into the decoding input. A pointer read would retain a
+  // second full model in the storage's thread-local scratch after load.
+  QuantizerMetaBuffer candidate;
+  if (pq_meta_.quantizer_meta_buffer_size >=
+          std::numeric_limits<size_t>::max() ||
+      pq_meta_segment_->data_size() < sizeof(DiskAnnPqMeta) ||
+      pq_meta_.quantizer_meta_buffer_size >
+          pq_meta_segment_->data_size() - sizeof(DiskAnnPqMeta) ||
+      pq_meta_.quantizer_meta_buffer_size > candidate.bytes.max_size())
+    return IndexError_InvalidFormat;
+  const size_t bytes = pq_meta_.quantizer_meta_buffer_size;
+  ailego::ReserveStringCapacity(candidate.bytes, candidate.charge, bytes);
+  candidate.bytes.resize(bytes);
+  // The legacy quantizer API consumes std::string. Its capacity reservation
+  // belongs to candidate and remains live until decoding has finished.
+  size_t read_size = pq_meta_segment_->fetch(sizeof(DiskAnnPqMeta),
+                                             candidate.bytes.data(), bytes);
   if (read_size != pq_meta_.quantizer_meta_buffer_size) {
     LOG_ERROR("Read segment %s failed, expect: %zu, actual: %zu",
               DiskAnnEntity::kDiskAnnPqMetaSegmentId.c_str(),
@@ -205,8 +224,10 @@ int DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer(
     return IndexError_ReadData;
   }
 
-  meta_buffer->assign(reinterpret_cast<const char *>(data.data()), read_size);
+  *meta_buffer = std::move(candidate);
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcherEntity::load_header_segment() {
@@ -249,6 +270,11 @@ int DiskAnnSearcherEntity::load_key_segment() {
   }
 
   size_t key_data_len = doc_cnt() * sizeof(diskann_key_t);
+  if (key_segment_->data_size() < key_data_len) return IndexError_InvalidFormat;
+  if (storage_->vec_buffer_pool()) {
+    key_buffer_.reset();
+    return 0;
+  }
 
   IndexStorage::MemoryBlock data;
   if (key_segment_->read(0, data, key_data_len) != key_data_len) {
@@ -313,6 +339,12 @@ int DiskAnnSearcherEntity::load_key_mapping_segment() {
   }
 
   size_t key_mapping_data_len = doc_cnt() * sizeof(diskann_id_t);
+  if (key_mapping_segment_->data_size() < key_mapping_data_len)
+    return IndexError_InvalidFormat;
+  if (storage_->vec_buffer_pool()) {
+    key_mapping_buffer_.reset();
+    return 0;
+  }
 
   IndexStorage::MemoryBlock data;
   if (key_mapping_segment_->read(0, data, key_mapping_data_len) !=
@@ -336,11 +368,14 @@ int DiskAnnSearcherEntity::load_key_mapping_segment() {
 
 //! Get vector local id by key
 diskann_id_t DiskAnnSearcherEntity::get_id(diskann_key_t key) const {
-  const diskann_id_t *key_mapping_data_ptr =
-      reinterpret_cast<const diskann_id_t *>(key_mapping_buffer_->data());
+  diskann_id_t id = kInvalidId;
+  return find_id(key, &id) == 0 ? id : kInvalidId;
+}
 
-  const diskann_key_t *key_data_ptr =
-      reinterpret_cast<const diskann_key_t *>(key_buffer_->data());
+int DiskAnnSearcherEntity::find_id(diskann_key_t key, diskann_id_t *id) const
+    try {
+  if (!id) return IndexError_InvalidArgument;
+  *id = kInvalidId;
 
   //! Do binary search
   diskann_id_t start = 0UL;
@@ -348,27 +383,65 @@ diskann_id_t DiskAnnSearcherEntity::get_id(diskann_key_t key) const {
   diskann_id_t idx = 0u;
   while (start < end) {
     idx = start + (end - start) / 2;
-    diskann_id_t local_id = key_mapping_data_ptr[idx];
-
-    const diskann_key_t local_key = key_data_ptr[local_id];
+    diskann_id_t local_id;
+    if (key_mapping_buffer_) {
+      std::memcpy(&local_id,
+                  key_mapping_buffer_->data() + idx * sizeof(local_id),
+                  sizeof(local_id));
+    } else {
+      IndexStorage::MemoryBlock block;
+      if (!key_mapping_segment_) return IndexError_ReadData;
+      if (key_mapping_segment_->read(idx * sizeof(local_id), block,
+                                     sizeof(local_id)) != sizeof(local_id))
+        return key_mapping_segment_->read_error();
+      if (!block.data()) return IndexError_ReadData;
+      std::memcpy(&local_id, block.data(), sizeof(local_id));
+    }
+    diskann_key_t local_key;
+    int ret = read_key(local_id, &local_key);
+    if (ret != 0) return ret;
 
     if (local_key < key) {
       start = idx + 1;
     } else if (local_key > key) {
       end = idx;
     } else {
-      return local_id;
+      *id = local_id;
+      return 0;
     }
   }
 
-  return kInvalidId;
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_ReadData;
 }
 
 diskann_key_t DiskAnnSearcherEntity::get_key(diskann_id_t id) const {
-  const diskann_key_t *key_data_ptr =
-      reinterpret_cast<const diskann_key_t *>(key_buffer_->data());
+  diskann_key_t key = kInvalidKey;
+  return read_key(id, &key) == 0 ? key : kInvalidKey;
+}
 
-  return key_data_ptr[id];
+int DiskAnnSearcherEntity::read_key(diskann_id_t id, diskann_key_t *key) const
+    try {
+  if (!key || id >= doc_cnt()) return IndexError_InvalidArgument;
+  const size_t offset = static_cast<size_t>(id) * sizeof(*key);
+  if (key_buffer_) {
+    std::memcpy(key, key_buffer_->data() + offset, sizeof(*key));
+  } else {
+    IndexStorage::MemoryBlock block;
+    if (!key_segment_) return IndexError_ReadData;
+    if (key_segment_->read(offset, block, sizeof(*key)) != sizeof(*key))
+      return key_segment_->read_error();
+    if (!block.data()) return IndexError_ReadData;
+    std::memcpy(key, block.data(), sizeof(*key));
+  }
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_ReadData;
 }
 
 }  // namespace core

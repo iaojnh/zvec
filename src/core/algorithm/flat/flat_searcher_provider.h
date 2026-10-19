@@ -14,8 +14,8 @@
 
 #pragma once
 
-#include <cstring>
 #include <memory>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "utility/legacy_read_buffer.h"
 #include "flat_distance_matrix.h"
 #include "flat_searcher.h"
@@ -34,15 +34,18 @@ class FlatSearcherProvider : public IndexProvider {
   FlatSearcherProvider(const FlatSearcher<BATCH_SIZE> *owner) {
     feature_size_ = owner->meta().element_size();
     features_segment_ = owner->clone_features_segment();
+    if (!features_segment_) throw std::bad_alloc();
     total_vector_count_ =
         features_segment_->data_size() / owner->meta().element_size();
     owner_ = owner;
   }
 
   //! Create a new iterator
-  IndexProvider::Iterator::Pointer create_iterator() override {
+  IndexProvider::Iterator::Pointer create_iterator() override try {
     return IndexProvider::Iterator::Pointer(
         new (std::nothrow) FlatSearcherProvider::Iterator(owner_));
+  } catch (const std::bad_alloc &) {
+    return nullptr;
   }
 
   //! Retrieve count of vectors
@@ -66,16 +69,39 @@ class FlatSearcherProvider : public IndexProvider {
   }
 
   //! Retrieve a vector using a primary key
-  const void *get_vector(uint64_t key) const override {
+  const void *get_vector(uint64_t key) const override try {
     IndexStorage::MemoryBlock block;
     return get_vector(key, block) == 0
                ? legacy_buffer_.assign(block, feature_size_)
                : nullptr;
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  } catch (const typename FlatSearcher<BATCH_SIZE>::MetadataReadError &) {
+    return nullptr;
   }
 
-  int get_vector(uint64_t key,
-                 IndexStorage::MemoryBlock &block) const override {
-    return get_vector_by_index(owner_->get_id(key), block);
+  int get_vector(uint64_t key, IndexStorage::MemoryBlock &block) const override
+      try {
+    block.reset();
+    const auto index = owner_->get_id(key);
+    const int ret = get_vector_by_index(index, block);
+    if (ret != 0) return ret;
+    if (block.type_ == IndexStorage::MemoryBlock::MBT_MMAP) {
+      // Storage close can unmap a region even while its segment is retained.
+      // Returned documents need their own allocation; pooled blocks already
+      // carry a pin and keep their zero-copy path.
+      auto owned = IndexStorage::MemoryBlock::AllocateOwned(feature_size_);
+      std::memcpy(const_cast<void *>(owned.data()), block.data(),
+                  feature_size_);
+      block = std::move(owned);
+    }
+    return 0;
+  } catch (const typename FlatSearcher<BATCH_SIZE>::MetadataReadError &error) {
+    block.reset();
+    return error.status;
+  } catch (const std::bad_alloc &) {
+    block.reset();
+    return IndexError_NoMemory;
   }
 
   //! Retrieve the owner class
@@ -90,9 +116,9 @@ class FlatSearcherProvider : public IndexProvider {
    public:
     //! Constructor
     Iterator(const FlatSearcher<BATCH_SIZE> *owner) {
-      block_buffer_.resize(BATCH_SIZE * owner->meta().element_size());
       feature_size_ = owner->meta().element_size();
       features_segment_ = owner->clone_features_segment();
+      if (!features_segment_) throw std::bad_alloc();
       total_vector_count_ =
           features_segment_->data_size() / owner->meta().element_size();
       owner_ = owner;
@@ -110,12 +136,20 @@ class FlatSearcherProvider : public IndexProvider {
 
     //! Test if the iterator is valid
     bool is_valid() const override {
-      return (!invalid_ && cursor_index_ < total_vector_count_);
+      return (status_ == 0 && !invalid_ && cursor_index_ < total_vector_count_);
     }
 
     //! Retrieve primary key
-    uint64_t key() const override {
+    uint64_t key() const override try {
       return owner_->key(cursor_index_);
+    } catch (
+        const typename FlatSearcher<BATCH_SIZE>::MetadataReadError &error) {
+      status_ = error.status;
+      return 0;
+    }
+
+    int status() const override {
+      return status_;
     }
 
     //! Next iterator
@@ -131,10 +165,13 @@ class FlatSearcherProvider : public IndexProvider {
 
    protected:
     //! Read a block of data
-    void next_block() {
+    void next_block() try {
+      const void *read_data = nullptr;
       size_t read_size = 0;
 
       if (cursor_index_ >= total_vector_count_) {
+        read_block_.reset();
+        data_ = nullptr;
         invalid_ = true;
         return;
       }
@@ -144,13 +181,16 @@ class FlatSearcherProvider : public IndexProvider {
       } else {
         read_size = (total_vector_count_ - cursor_index_) * feature_size_;
       }
+      read_block_.reset();
       if (features_segment_->read(offset_, read_block_, read_size) !=
           read_size) {
         LOG_ERROR("Failed to read data (%zu bytes) from features segment",
                   read_size);
         invalid_ = true;
+        status_ = IndexError_ReadData;
         return;
       }
+      read_data = read_block_.data();
       offset_ += read_size;
 
       // The order of data may be a column format, convert it to the row format.
@@ -158,26 +198,34 @@ class FlatSearcherProvider : public IndexProvider {
           read_size == BATCH_SIZE * feature_size_) {
         uint32_t align_size =
             IndexMeta::AlignSizeof(owner_->meta().data_type());
-        ReverseTranspose<BATCH_SIZE>(align_size, read_block_.data(),
+        block_buffer_.resize(read_size);
+        ReverseTranspose<BATCH_SIZE>(align_size, read_data,
                                      feature_size_ / align_size,
                                      &block_buffer_[0]);
         data_ = block_buffer_.data();
+        read_block_.reset();
       } else {
-        data_ = reinterpret_cast<const uint8_t *>(read_block_.data());
+        data_ = reinterpret_cast<const uint8_t *>(read_data);
       }
+    } catch (const std::bad_alloc &) {
+      read_block_.reset();
+      invalid_ = true;
+      data_ = nullptr;
+      status_ = IndexError_NoMemory;
     }
 
    private:
     const FlatSearcher<BATCH_SIZE> *owner_{nullptr};
     IndexStorage::Segment::Pointer features_segment_{};
-    IndexStorage::MemoryBlock read_block_;
     uint32_t total_vector_count_{0};
     uint32_t feature_size_{0};
-    std::vector<uint8_t> block_buffer_{};
+    ailego::BudgetedVector<uint8_t> block_buffer_{};
+    IndexStorage::MemoryBlock read_block_;
     const uint8_t *data_{nullptr};
     uint64_t offset_{0};
     uint32_t cursor_index_{0};
     bool invalid_{false};
+    mutable int status_{0};
   };
 
   //! Retrieve a vector via local index
@@ -194,8 +242,8 @@ class FlatSearcherProvider : public IndexProvider {
       uint32_t block_size = feature_size_ * BATCH_SIZE;
       uint64_t offset = (index - (index % BATCH_SIZE)) * feature_size_;
 
-      IndexStorage::MemoryBlock read_block;
-      if (features_segment_->read(offset, read_block, block_size) !=
+      IndexStorage::MemoryBlock source_block;
+      if (features_segment_->read(offset, source_block, block_size) !=
           block_size) {
         LOG_ERROR("Failed to read data (%u bytes) from features segment",
                   block_size);
@@ -204,19 +252,19 @@ class FlatSearcherProvider : public IndexProvider {
 
       const size_t align_size =
           IndexMeta::AlignSizeof(owner_->meta().data_type());
-      auto buffer = std::make_shared<std::vector<uint8_t>>(feature_size_);
-      const auto *source = static_cast<const uint8_t *>(read_block.data()) +
+      auto owned = IndexStorage::MemoryBlock::AllocateOwned(feature_size_);
+      auto *destination =
+          static_cast<uint8_t *>(const_cast<void *>(owned.data()));
+      const auto *source = static_cast<const uint8_t *>(source_block.data()) +
                            (index % BATCH_SIZE) * align_size;
-      // Extract only this row; retaining a full transposed batch per result
-      // would multiply the result memory by BATCH_SIZE.
+      // Keep only this row, not a transposed batch for every returned vector.
       for (size_t pos = 0; pos < feature_size_; pos += align_size) {
-        std::memcpy(buffer->data() + pos, source + pos * BATCH_SIZE,
-                    align_size);
+        std::memcpy(destination + pos, source + pos * BATCH_SIZE, align_size);
       }
-      block = IndexStorage::MemoryBlock::MakeSharedView(buffer->data(), buffer);
+      block = std::move(owned);
 
     } else {
-      if (features_segment_->read(static_cast<uint64_t>(index) * feature_size_,
+      if (features_segment_->read(static_cast<size_t>(index) * feature_size_,
                                   block, feature_size_) != feature_size_) {
         LOG_ERROR("Failed to read data (%u bytes) from features segment",
                   feature_size_);
@@ -231,9 +279,9 @@ class FlatSearcherProvider : public IndexProvider {
   //! Members
   const FlatSearcher<BATCH_SIZE> *owner_{nullptr};
   IndexStorage::Segment::Pointer features_segment_{};
-  mutable LegacyReadBuffer legacy_buffer_;
   uint32_t feature_size_{0};
   uint32_t total_vector_count_{0};
+  mutable LegacyReadBuffer legacy_buffer_;
 };
 
 }  // namespace core

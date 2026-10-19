@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/db/doc.h>
@@ -23,6 +24,7 @@
 #include "db/common/constants.h"
 #include "db/common/utils.h"
 #include "db/index/common/identifier_validation.h"
+#include "db/index/common/serialized_doc_memory.h"
 #include "db/index/common/type_helper.h"
 
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
@@ -168,6 +170,135 @@ T read_value_from_buffer(const uint8_t *&data) {
   return value;
 }
 
+// Validate the complete record before allocating from any encoded length.
+// WAL checksums detect damaged bytes, but do not make lengths safe to trust.
+class SerializedDocValidator {
+ public:
+  SerializedDocValidator(const uint8_t *data, size_t size,
+                         bool estimate_memory = false)
+      : data_(data), remaining_(size), estimate_memory_(estimate_memory) {}
+
+  bool validate() {
+    if (!data_ || !add_memory(remaining_) || !sequence(1) ||
+        !skip(sizeof(float) + sizeof(uint64_t) + sizeof(Operator)))
+      return false;
+    uint32_t fields = 0;
+    if (!count(&fields) || fields > remaining_ / (sizeof(uint32_t) + 1))
+      return false;
+    // Include hash-node links, bucket growth, allocator rounding and small
+    // string capacities in addition to the serialized payload counted above.
+    constexpr size_t kFieldOverhead =
+        sizeof(std::pair<const std::string, Doc::Value>) + 8 * sizeof(void *) +
+        64;
+    if (!add_memory(kFieldOverhead, fields)) return false;
+    for (uint32_t i = 0; i < fields; ++i) {
+      if (!sequence(1) || !value()) return false;
+    }
+    return remaining_ == 0;
+  }
+
+  size_t memory_bytes() const {
+    return memory_bytes_;
+  }
+
+ private:
+  bool add_memory(size_t bytes, size_t count = 1) {
+    if (!estimate_memory_) return true;
+    if (count &&
+        bytes > (std::numeric_limits<size_t>::max() - memory_bytes_) / count)
+      return false;
+    memory_bytes_ += bytes * count;
+    return true;
+  }
+
+  bool skip(size_t bytes) {
+    if (bytes > remaining_) return false;
+    data_ += bytes;
+    remaining_ -= bytes;
+    return true;
+  }
+
+  bool count(uint32_t *out) {
+    if (remaining_ < sizeof(*out)) return false;
+    *out = read_value_from_buffer<uint32_t>(data_);
+    remaining_ -= sizeof(*out);
+    return true;
+  }
+
+  bool sequence(size_t width) {
+    uint32_t n = 0;
+    return count(&n) && n <= remaining_ / width && skip(n * width);
+  }
+
+  bool booleans(size_t n) {
+    if (n > remaining_) return false;
+    for (size_t i = 0; i < n; ++i) {
+      if (data_[i] > 1) return false;
+    }
+    return skip(n);
+  }
+
+  bool value() {
+    if (remaining_ == 0) return false;
+    const uint8_t type = *data_;
+    skip(1);
+    switch (type) {
+      case TYPE_EMPTY:
+        return true;
+      case TYPE_BOOL:
+        return booleans(1);
+      case TYPE_INT32:
+      case TYPE_UINT32:
+      case TYPE_FLOAT:
+        return skip(4);
+      case TYPE_INT64:
+      case TYPE_UINT64:
+      case TYPE_DOUBLE:
+        return skip(8);
+      case TYPE_STRING:
+      case TYPE_VECTOR_INT8:
+        return sequence(1);
+      case TYPE_VECTOR_BOOL: {
+        uint32_t n = 0;
+        return count(&n) && booleans(n);
+      }
+      case TYPE_VECTOR_INT16:
+      case TYPE_VECTOR_FLOAT16:
+        return sequence(2);
+      case TYPE_VECTOR_INT32:
+      case TYPE_VECTOR_UINT32:
+      case TYPE_VECTOR_FLOAT:
+        return sequence(4);
+      case TYPE_VECTOR_INT64:
+      case TYPE_VECTOR_UINT64:
+      case TYPE_VECTOR_DOUBLE:
+        return sequence(8);
+      case TYPE_VECTOR_STRING: {
+        uint32_t n = 0;
+        if (!count(&n) || n > remaining_ / sizeof(uint32_t)) return false;
+        // Empty/short strings have little serialized payload but still occupy
+        // string objects and allocator-rounded character storage in the Doc.
+        if (!add_memory(sizeof(std::string) + 32, n)) return false;
+        for (uint32_t i = 0; i < n; ++i) {
+          if (!sequence(1)) return false;
+        }
+        return true;
+      }
+      case TYPE_VECTOR_PAIR_INT_FLOAT:
+        return sequence(4) && sequence(4);
+      case TYPE_VECTOR_PAIR_INT_FLOAT16:
+        return sequence(4) && sequence(2);
+      default:
+        return false;
+    }
+  }
+
+  const uint8_t *data_;
+  size_t remaining_;
+  bool estimate_memory_;
+  size_t memory_bytes_{sizeof(Doc) + 256};
+};
+
 template <typename T>
 std::string vec_to_string(const std::vector<T> &v) {
   std::ostringstream oss;
@@ -191,6 +322,14 @@ Overloaded(Ts...) -> Overloaded<Ts...>;
 
 }  // namespace
 
+bool detail::EstimateSerializedDocMemory(const uint8_t *data, size_t size,
+                                         size_t *bytes) {
+  if (!bytes) return false;
+  SerializedDocValidator validator(data, size, true);
+  if (!validator.validate()) return false;
+  *bytes = validator.memory_bytes();
+  return true;
+}
 
 void Doc::write_to_buffer(std::vector<uint8_t> &buffer, const void *src,
                           size_t size) {
@@ -668,8 +807,56 @@ Doc::Value Doc::deserialize_value(const uint8_t *&data) {
   }
 }
 
+size_t Doc::serialized_size() const {
+  size_t bytes = sizeof(uint32_t) + sizeof(score_) + sizeof(doc_id_) +
+                 sizeof(op_) + sizeof(uint32_t);
+  auto add = [&bytes](size_t count, size_t width = 1) {
+    if (width && count > (std::numeric_limits<size_t>::max() - bytes) / width)
+      throw std::length_error("Serialized document size overflow");
+    bytes += count * width;
+  };
+  add(pk_.size());
+  for (const auto &[name, value] : fields_) {
+    add(sizeof(uint32_t) + sizeof(uint8_t));
+    add(name.size());
+    std::visit(
+        [&add](const auto &v) {
+          using T = std::decay_t<decltype(v)>;
+          if constexpr (std::is_same_v<T, std::monostate>) {
+            return;
+          } else if constexpr (std::is_arithmetic_v<T>) {
+            add(sizeof(T));
+          } else if constexpr (std::is_same_v<T, std::string>) {
+            add(sizeof(uint32_t));
+            add(v.size());
+          } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+            add(sizeof(uint32_t));
+            for (const auto &text : v) {
+              add(sizeof(uint32_t));
+              add(text.size());
+            }
+          } else if constexpr (std::is_same_v<T,
+                                              std::pair<std::vector<uint32_t>,
+                                                        std::vector<float>>> ||
+                               std::is_same_v<
+                                   T, std::pair<std::vector<uint32_t>,
+                                                std::vector<float16_t>>>) {
+            add(2 * sizeof(uint32_t));
+            add(v.first.size(), sizeof(uint32_t));
+            add(v.second.size(), sizeof(typename T::second_type::value_type));
+          } else {
+            add(sizeof(uint32_t));
+            add(v.size(), sizeof(typename T::value_type));
+          }
+        },
+        value);
+  }
+  return bytes;
+}
+
 std::vector<uint8_t> Doc::serialize() const {
   std::vector<uint8_t> buffer;
+  buffer.reserve(serialized_size());
   uint32_t pk_len = static_cast<uint32_t>(pk_.size());
   write_to_buffer(buffer, &pk_len, sizeof(pk_len));
   write_to_buffer(buffer, pk_.data(), pk_len);
@@ -692,7 +879,8 @@ std::vector<uint8_t> Doc::serialize() const {
   return buffer;
 }
 
-Doc::Ptr Doc::deserialize(const uint8_t *data, size_t /*size*/) {
+Doc::Ptr Doc::deserialize(const uint8_t *data, size_t size) {
+  if (!SerializedDocValidator(data, size).validate()) return nullptr;
   const uint8_t *ptr = data;
   Doc::Ptr doc = std::make_shared<Doc>();
 
@@ -719,7 +907,7 @@ Doc::Ptr Doc::deserialize(const uint8_t *data, size_t /*size*/) {
     ptr += name_len;
 
     Doc::Value value = deserialize_value(ptr);
-    doc->fields_[field_name] = value;
+    doc->fields_[std::move(field_name)] = std::move(value);
   }
 
   return doc;
@@ -1000,6 +1188,11 @@ size_t Doc::memory_usage() const {
   for (const auto &pair : fields_) {
     const auto &key = pair.first;
     const auto &value = pair.second;
+
+    // The variant is inline in a separately allocated hash-map node, not
+    // inline in Doc. Include the node and allocator/link overhead as well as
+    // its variable-sized payload when deciding when to flush the write cache.
+    usage += sizeof(decltype(fields_)::value_type) + 4 * sizeof(void *);
 
     // Memory for the key (string)
     usage += key.capacity();

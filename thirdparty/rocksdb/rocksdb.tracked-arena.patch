@@ -1,0 +1,66 @@
+diff --git a/memory/arena.cc b/memory/arena.cc
+index 0a92020..c955a35 100644
+--- a/memory/arena.cc
++++ b/memory/arena.cc
+@@ -10,6 +10,8 @@
+ #include "memory/arena.h"
+ 
+ #include <algorithm>
++#include <limits>
++#include <new>
+ 
+ #include "logging/logging.h"
+ #include "port/malloc.h"
+@@ -54,8 +56,12 @@ Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size)
+ }
+ 
+ Arena::~Arena() {
++  // Release backing pages before returning the write-buffer charge. Freeing
++  // just the objects does not make malloc's retained pages available to a
++  // separate vector cache using the same process memory budget.
++  blocks_.clear();
++  huge_blocks_.clear();
+   if (tracker_ != nullptr) {
+-    assert(tracker_->is_freed());
+     tracker_->FreeMem();
+   }
+ }
+@@ -143,6 +149,24 @@ char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
+ }
+ 
+ char* Arena::AllocateNewBlock(size_t block_bytes) {
++  // Memtable slabs have a single owner and an explicit destruction boundary.
++  // Map large tracked slabs so releasing them actually releases their pages,
++  // rather than refunding WBM while malloc still retains the same memory.
++  if (tracker_ != nullptr && block_bytes >= 64 * 1024) {
++    const size_t page_size = port::kPageSize;
++    if (block_bytes > std::numeric_limits<size_t>::max() - (page_size - 1)) {
++      throw std::bad_alloc();
++    }
++    const size_t mapped_size =
++        ((block_bytes + page_size - 1) / page_size) * page_size;
++    auto mapping = MemMapping::AllocateLazyZeroed(mapped_size);
++    if (mapping.Get() == nullptr) throw std::bad_alloc();
++    char* block = static_cast<char*>(mapping.Get());
++    huge_blocks_.push_back(std::move(mapping));
++    blocks_memory_ += mapped_size;
++    tracker_->Allocate(mapped_size);
++    return block;
++  }
+   // NOTE: std::make_unique zero-initializes the block so is not appropriate
+   // here
+   char* block = new char[block_bytes];
+diff --git a/db/memtable.cc b/db/memtable.cc
+index b99e1d3..6e42eb6 100644
+--- a/db/memtable.cc
++++ b/db/memtable.cc
+@@ -146,7 +146,8 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
+ }
+ 
+ MemTable::~MemTable() {
+-  mem_tracker_.FreeMem();
++  // arena_ dies after both memtable representations and before mem_tracker_.
++  // Let its destructor release backing storage before refunding WBM.
+   assert(refs_ == 0);
+ }
+ 

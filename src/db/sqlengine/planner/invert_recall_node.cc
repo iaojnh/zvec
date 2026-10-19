@@ -15,6 +15,7 @@
 #include "db/sqlengine/planner/invert_recall_node.h"
 #include <arrow/api.h>
 #include <zvec/ailego/logger/logger.h>
+#include "db/index/segment/segment_fetch_internal.h"
 #include "db/sqlengine/planner/invert_search.h"
 
 namespace cp = arrow::compute;
@@ -30,6 +31,10 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> InvertRecallNode::gen() {
     if (!state.iter_) {
       auto invert_ret = self->prepare();
       if (!invert_ret) {
+        if (invert_ret.error().code() == StatusCode::RESOURCE_EXHAUSTED) {
+          return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+              arrow::Status::OutOfMemory(invert_ret.error().message()));
+        }
         return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
             arrow::Status::ExecutionError("prepare invert failed:",
                                           invert_ret.error().c_str()));
@@ -62,16 +67,17 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> InvertRecallNode::gen() {
           std::nullopt);
     }
 
-    auto table = self->segment_->fetch(self->fetched_columns_, indices);
-    if (!table) {
+    auto table =
+        internal::fetch_table(*self->segment_, self->fetched_columns_, indices);
+    if (!table.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::UnknownError("fetch table failed"));
+          table.status());
     }
-    auto batch = table->CombineChunksToBatch();
+    auto batch =
+        (*table)->CombineChunksToBatch(self->segment_->query_memory_pool());
     if (!batch.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::ExecutionError("combine chunks to batch failed:",
-                                        batch.status().ToString()));
+          batch.status());
     }
     cp::ExecBatch exec_batch(*batch.ValueUnsafe());
     return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(

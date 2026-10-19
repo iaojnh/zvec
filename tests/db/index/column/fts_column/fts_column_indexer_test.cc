@@ -23,9 +23,11 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <rocksdb/utilities/stackable_db.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/index_params.h>
 #include "db/common/file_helper.h"
 #include "db/index/common/index_filter.h"
+#include "../../../../ailego/buffer/pool_payload_budget.h"
 // FtsQueryParams defined below
 #include "db/index/column/fts_column/fts_ast_rewriter.h"
 #include "db/index/column/fts_column/fts_indexer.h"
@@ -1260,6 +1262,66 @@ TEST_F(FtsColumnIndexerTest, ConvertPostingsToBitpackedEmptyIndexer) {
   EXPECT_EQ(count_postings_entries_and_check_bitpacked(db_, postings_cf_), 0u);
   // Side CFs were never populated (empty indexer); no special expectation
   // about them here beyond "the conversion did not crash".
+}
+
+TEST_F(FtsColumnIndexerTest, ConversionBudgetFailurePreservesSideDataForRetry) {
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  auto indexer = make_indexer();
+  for (uint32_t i = 0; i < 2049; ++i) {
+    ASSERT_TRUE(indexer->insert(i * 2, "common common other").has_value());
+  }
+  ASSERT_TRUE(indexer->flush().has_value());
+  const size_t tf_count = count_cf_entries(db_, term_freq_cf_);
+  const size_t dl_count = count_cf_entries(db_, doc_len_cf_);
+  // Active RocksDB metadata forbids reinitializing the process-wide pool.
+  // Occupy the remaining workspace instead, and keep the denial charged
+  // until the operation has returned.
+  zvec::ailego::MemoryReservation pressure;
+  ASSERT_GT(pool.capacity(), pool.used());
+  ASSERT_NO_THROW(pressure.add(pool.capacity() - pool.used()));
+  auto denied = indexer->convert_postings_to_bitpacked();
+  ASSERT_FALSE(denied.has_value());
+  EXPECT_EQ(zvec::StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  EXPECT_EQ(tf_count, count_cf_entries(db_, term_freq_cf_));
+  EXPECT_EQ(dl_count, count_cf_entries(db_, doc_len_cf_));
+
+  pressure.retain_at_most(0);
+  ASSERT_TRUE(indexer->convert_postings_to_bitpacked().has_value());
+  ASSERT_TRUE(indexer->convert_postings_to_bitpacked().has_value());
+  std::string bytes;
+  ASSERT_TRUE(
+      db_.db_->Get(db_.read_opts_, postings_cf_, "common", &bytes).ok());
+  BitPackedPostingIterator iter;
+  ASSERT_EQ(0, iter.open(bytes.data(), bytes.size()));
+  EXPECT_EQ(2049u, iter.cost());
+  for (uint32_t i = 0; i < 2049; ++i) {
+    EXPECT_EQ(i * 2, iter.next_doc());
+    EXPECT_EQ(2u, iter.term_freq());
+    EXPECT_EQ(3u, iter.doc_len());
+  }
+  EXPECT_EQ(BitPackedPostingIterator::NO_MORE_DOCS, iter.next_doc());
+}
+
+TEST_F(FtsColumnIndexerTest, QueryWorkspaceDenialIsAnErrorAndCanRetry) {
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  auto indexer = make_indexer();
+  ASSERT_TRUE(indexer->insert(7, "common common other").has_value());
+  FtsQueryParser parser;
+  auto ast = parser.parse("common", make_whitespace_pipeline());
+  ASSERT_TRUE(ast);
+  FtsQueryParams params;
+  params.topk = 10;
+  zvec::ailego::MemoryReservation pressure;
+  ASSERT_GT(pool.capacity(), pool.used());
+  ASSERT_NO_THROW(pressure.add(pool.capacity() - pool.used()));
+  auto denied = indexer->search(*ast, params);
+  ASSERT_FALSE(denied);
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  pressure.retain_at_most(0);
+  auto retried = indexer->search(*ast, params);
+  ASSERT_TRUE(retried) << retried.error().message();
+  ASSERT_EQ(1u, retried->size());
+  EXPECT_EQ(7u, retried->front().doc_id);
 }
 
 // After conversion the search() path must keep working — readers fall through

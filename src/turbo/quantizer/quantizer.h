@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <turbo/serialization.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
@@ -202,6 +203,15 @@ class Quantizer {
     return DistanceImpl{};
   }
 
+  // Internal fused query preparation. Quantizers may construct the LUT
+  // directly in the handle's sole, budgeted workspace.
+  virtual int prepare_distance(const void *query, DistanceImpl *out) const {
+    ailego::BudgetedString scratch(quantized_query_vector_length(), '\0');
+    quantize_query(query, scratch.data());
+    *out = distance(scratch.data(), IndexQueryMeta());
+    return 0;
+  }
+
   //! Convert an internal distance into the caller-facing score in place
   //! (e.g. the InnerProduct kernels rank by the negated dot product).
   virtual void normalize_score(float * /*score*/) const {}
@@ -217,6 +227,18 @@ class Quantizer {
   //! Serialize quantizer parameters
   virtual int serialize(std::string * /*out*/) const {
     return 0;
+  }
+
+  virtual size_t serialized_size() const {
+    return 0;
+  }
+  virtual int serialize_to(const SerializationSink &) const {
+    return kErrUnsupported;
+  }
+  int serialize(std::string *out, ailego::MemoryReservation *owner) const {
+    return SerializeString(
+        serialized_size(),
+        [this](const auto &sink) { return serialize_to(sink); }, out, owner);
   }
 
   //! Deserialize quantizer parameters

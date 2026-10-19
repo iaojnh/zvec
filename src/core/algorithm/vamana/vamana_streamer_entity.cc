@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "vamana_streamer_entity.h"
+#include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
 #include <zvec/ailego/hash/crc32c.h>
 #include <zvec/core/framework/index_stats.h>
@@ -31,16 +32,22 @@ VamanaStreamerEntity::VamanaStreamerEntity(IndexStreamer::Stats &stats)
 VamanaStreamerEntity::~VamanaStreamerEntity() = default;
 
 int VamanaStreamerEntity::cleanup() {
-  node_chunks_.clear();
+  failed_build_.store(false);
+  decltype(node_chunks_)().swap(node_chunks_);
   if (keys_map_) {
-    keys_map_->clear();
+    keys_map_.reset();
   }
+  decltype(dist_chunks_)().swap(dist_chunks_);
   header_.clear();
   extra_values_size_ = 0;
   return 0;
 }
 
 int VamanaStreamerEntity::init(size_t /*max_doc_cnt*/) {
+  if (!keys_map_) {
+    keys_map_ = std::make_shared<HashMap<key_t, node_id_t>>();
+    keys_map_->set_empty_key(kInvalidKey);
+  }
   // node_size = vector_size + key_size + neighbors_size
   set_node_size(vector_size() + sizeof(key_t) + neighbors_size());
   neighbor_size_ = neighbors_size();
@@ -84,7 +91,7 @@ int VamanaStreamerEntity::get_vector(const node_id_t id,
   size_t ret = node_chunks_[loc.first]->read(loc.second, block, vector_size());
   if (ailego_unlikely(ret != vector_size())) {
     LOG_ERROR("Read vector failed, ret=%zu", ret);
-    return IndexError_ReadData;
+    return node_chunks_[loc.first]->read_error();
   }
   return 0;
 }
@@ -122,7 +129,7 @@ const Neighbors VamanaStreamerEntity::get_neighbors(node_id_t id) const {
   size_t ret = loc.first->read(loc.second, mem_block, neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return Neighbors();
+    throw GraphStorageError{loc.first->read_error()};
   }
   return Neighbors(mem_block);
 }
@@ -165,6 +172,14 @@ int VamanaStreamerEntity::add_vector(key_t key, const void *vec,
   }
 
   // Write vector
+  if (use_key_info_map_) {
+    std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
+    keys_map_->resize(keys_map_->size() + 1);
+  }
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) mark_failed_build_unlocked();
+  });
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
@@ -185,15 +200,15 @@ int VamanaStreamerEntity::add_vector(key_t key, const void *vec,
   }
 
   if (use_key_info_map_) {
-    keys_map_lock_->lock();
+    std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
     (*keys_map_)[key] = local_id;
-    keys_map_lock_->unlock();
   }
 
   *mutable_doc_cnt() += 1;
   broker_->mark_dirty();
   *id = local_id;
 
+  complete = true;
   return 0;
 }
 
@@ -233,10 +248,20 @@ int VamanaStreamerEntity::add_vector_with_id(node_id_t id, const void *vec) {
   };
 
   // Fill gaps with invalid keys
+  if (use_key_info_map_) {
+    std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
+    keys_map_->resize(keys_map_->size() + 1);
+  }
+  bool writing = false;
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (writing && !complete) mark_failed_build_unlocked();
+  });
   for (size_t start_id = doc_cnt(); start_id < id; ++start_id) {
     if (auto ret = func_get_node_chunk_and_offset(start_id); ret != 0) {
       return ret;
     }
+    writing = true;
     size_t size = node_chunk->write(chunk_offset + vector_size(), &kInvalidKey,
                                     sizeof(key_t));
     if (ailego_unlikely(size != sizeof(key_t))) {
@@ -255,6 +280,7 @@ int VamanaStreamerEntity::add_vector_with_id(node_id_t id, const void *vec) {
   }
 
   // Write vector
+  writing = true;
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
@@ -277,12 +303,12 @@ int VamanaStreamerEntity::add_vector_with_id(node_id_t id, const void *vec) {
   }
 
   if (use_key_info_map_) {
-    keys_map_lock_->lock();
+    std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
     (*keys_map_)[key] = id;
-    keys_map_lock_->unlock();
   }
 
   broker_->mark_dirty();
+  complete = true;
   return 0;
 }
 
@@ -294,7 +320,7 @@ int VamanaStreamerEntity::update_neighbors(
 
   // Build neighbor data in a local buffer
   size_t nbr_size = neighbors_size();
-  std::vector<uint8_t> buffer(nbr_size, 0);
+  ailego::BudgetedVector<uint8_t> buffer(nbr_size, 0);
   auto *hd = reinterpret_cast<NeighborsHeader *>(buffer.data());
   hd->neighbor_cnt = count;
   for (uint32_t i = 0; i < count; ++i) {
@@ -319,11 +345,11 @@ void VamanaStreamerEntity::add_neighbor(node_id_t id, uint32_t size,
   size_t ret = loc.first->read(loc.second, mem_block, neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return;
+    throw GraphStorageError{loc.first->read_error()};
   }
 
   // Copy to mutable buffer, update, and write back
-  std::vector<uint8_t> buffer(neighbor_size_);
+  ailego::BudgetedVector<uint8_t> buffer(neighbor_size_);
   memcpy(buffer.data(), mem_block.data(), neighbor_size_);
   auto *hd = reinterpret_cast<NeighborsHeader *>(buffer.data());
   hd->neighbors[size] = neighbor_id;
@@ -332,6 +358,7 @@ void VamanaStreamerEntity::add_neighbor(node_id_t id, uint32_t size,
   ret = loc.first->write(loc.second, buffer.data(), neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Write neighbor failed, ret=%zu", ret);
+    throw GraphStorageError{IndexError_WriteData};
   }
 }
 
@@ -343,6 +370,12 @@ void VamanaStreamerEntity::update_entry_point(node_id_t ep) {
 int VamanaStreamerEntity::open(IndexStorage::Pointer stg,
                                uint64_t max_index_size, bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
+  failed_build_.store(false);
+  if (!keys_map_) {
+    keys_map_ = std::make_shared<HashMap<key_t, node_id_t>>();
+    keys_map_->set_empty_key(kInvalidKey);
+  }
+
   bool huge_page = stg->is_huge_page();
 
   int ret = broker_->open(std::move(stg), chunk_size_, check_crc);
@@ -425,6 +458,7 @@ int VamanaStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
     return IndexError_ReadData;
   }
   auto *hd = reinterpret_cast<const VamanaHeader *>(hd_ptr.data());
+  if (hd->graph.options & kGraphBuildFailed) return IndexError_InvalidFormat;
 
   // Validate
   if (vector_size() != hd->vector_size()) {
@@ -458,9 +492,9 @@ int VamanaStreamerEntity::close() {
   std::lock_guard<std::mutex> lock(mutex_);
   flush_header();
   mutable_header()->reset();
-  keys_map_->clear();
+  keys_map_.reset();
   header_.clear();
-  node_chunks_.clear();
+  decltype(node_chunks_)().swap(node_chunks_);
   dist_chunks_.clear();
   dist_loaded_ = false;
   return broker_->close();
@@ -476,8 +510,7 @@ int VamanaStreamerEntity::flush(uint64_t checkpoint) {
 int VamanaStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("Dump Vamana index, curDocs=%u", doc_cnt());
 
-  std::vector<key_t> keys(doc_cnt());
-  auto ret = dump_segments(dumper, keys.data());
+  auto ret = dump_segments(dumper);
   if (ailego_unlikely(ret < 0)) {
     return static_cast<int>(ret);
   }
@@ -486,7 +519,7 @@ int VamanaStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
 }
 
 const VamanaEntity::Pointer VamanaStreamerEntity::clone() const {
-  std::vector<Chunk::Pointer> cloned_chunks;
+  ailego::BudgetedVector<Chunk::Pointer> cloned_chunks;
   cloned_chunks.reserve(node_chunks_.size());
   for (size_t i = 0; i < node_chunks_.size(); ++i) {
     cloned_chunks.emplace_back(node_chunks_[i]->clone());
@@ -509,7 +542,7 @@ const VamanaEntity::Pointer VamanaStreamerEntity::clone() const {
 }
 
 const VamanaEntity::Pointer VamanaMmapStreamerEntity::clone() const {
-  std::vector<Chunk::Pointer> cloned_chunks;
+  ailego::BudgetedVector<Chunk::Pointer> cloned_chunks;
   cloned_chunks.reserve(node_chunks_.size());
   for (size_t i = 0; i < node_chunks_.size(); ++i) {
     cloned_chunks.emplace_back(node_chunks_[i]->clone());
@@ -532,7 +565,7 @@ const VamanaEntity::Pointer VamanaMmapStreamerEntity::clone() const {
 }
 
 const VamanaEntity::Pointer VamanaContiguousStreamerEntity::clone() const {
-  std::vector<Chunk::Pointer> cloned_chunks;
+  ailego::BudgetedVector<Chunk::Pointer> cloned_chunks;
   cloned_chunks.reserve(node_chunks_.size());
   for (size_t i = 0; i < node_chunks_.size(); ++i) {
     cloned_chunks.emplace_back(node_chunks_[i]->clone());
@@ -581,7 +614,21 @@ char *VamanaContiguousStreamerEntity::allocate_contiguous(size_t size) {
   return static_cast<char *>(ptr);
 }
 
+std::shared_ptr<char>
+VamanaContiguousStreamerEntity::allocate_budgeted_contiguous(size_t size) {
+  auto memory = std::make_shared<ailego::MemoryReservation>();
+  memory->add(size);
+  char *ptr = allocate_contiguous(size);
+  if (!ptr) throw std::bad_alloc();
+  return std::shared_ptr<char>(
+      ptr, [memory, size](char *data) { ContiguousDeleter{size}(data); });
+}
+
 int VamanaContiguousStreamerEntity::build_contiguous_memory() {
+  bool built = false;
+  AILEGO_DEFER([&] {
+    if (!built) degrade_to_mmap();
+  });
   vector_memory_.reset();
   vector_base_ = nullptr;
   vector_stride_ = 0;
@@ -594,7 +641,10 @@ int VamanaContiguousStreamerEntity::build_contiguous_memory() {
   extra_values_stride_ = 0;
 
   const uint32_t total_docs = doc_cnt();
-  if (total_docs == 0) return 0;
+  if (total_docs == 0) {
+    built = true;
+    return 0;
+  }
 
   const size_t per_node = node_size();
   const size_t vec_size = vector_size();
@@ -612,9 +662,10 @@ int VamanaContiguousStreamerEntity::build_contiguous_memory() {
   const size_t total_vec_data =
       static_cast<size_t>(total_docs) * vector_stride_;
   size_t vector_memory_size = AlignHugePageSize(total_vec_data);
-  char *raw_vec = allocate_contiguous(vector_memory_size);
+  auto raw_vec_owner = allocate_budgeted_contiguous(vector_memory_size);
+  char *raw_vec = raw_vec_owner.get();
   if (!raw_vec) return IndexError_Runtime;
-  vector_memory_.reset(raw_vec, ContiguousDeleter{vector_memory_size});
+  vector_memory_ = std::move(raw_vec_owner);
   vector_base_ = raw_vec;
 
   size_t extra_values_memory_size = 0;
@@ -622,7 +673,9 @@ int VamanaContiguousStreamerEntity::build_contiguous_memory() {
     extra_values_stride_ = extra_size;
     extra_values_memory_size = AlignHugePageSize(
         static_cast<size_t>(total_docs) * extra_values_stride_);
-    char *raw_extra_values = allocate_contiguous(extra_values_memory_size);
+    auto raw_extra_values_owner =
+        allocate_budgeted_contiguous(extra_values_memory_size);
+    char *raw_extra_values = raw_extra_values_owner.get();
     if (!raw_extra_values) {
       vector_memory_.reset();
       vector_base_ = nullptr;
@@ -630,8 +683,7 @@ int VamanaContiguousStreamerEntity::build_contiguous_memory() {
       extra_values_stride_ = 0;
       return IndexError_Runtime;
     }
-    extra_values_memory_.reset(raw_extra_values,
-                               ContiguousDeleter{extra_values_memory_size});
+    extra_values_memory_ = std::move(raw_extra_values_owner);
     extra_values_base_ = raw_extra_values;
   }
 
@@ -639,7 +691,8 @@ int VamanaContiguousStreamerEntity::build_contiguous_memory() {
   const size_t total_graph_data =
       static_cast<size_t>(total_docs) * graph_stride_;
   size_t graph_memory_size = AlignHugePageSize(total_graph_data);
-  char *raw_graph = allocate_contiguous(graph_memory_size);
+  auto raw_graph_owner = allocate_budgeted_contiguous(graph_memory_size);
+  char *raw_graph = raw_graph_owner.get();
   if (!raw_graph) {
     vector_memory_.reset();
     vector_base_ = nullptr;
@@ -649,7 +702,7 @@ int VamanaContiguousStreamerEntity::build_contiguous_memory() {
     extra_values_stride_ = 0;
     return IndexError_Runtime;
   }
-  graph_memory_.reset(raw_graph, ContiguousDeleter{graph_memory_size});
+  graph_memory_ = std::move(raw_graph_owner);
   graph_base_ = raw_graph;
   graph_capacity_ = total_docs;
 
@@ -705,6 +758,7 @@ int VamanaContiguousStreamerEntity::build_contiguous_memory() {
       total_docs, chunks.size(), vec_size, vector_body_size, vector_stride_,
       extra_size, extra_values_stride_, graph_stride_, kVectorAlignment);
 
+  built = true;
   return 0;
 }
 
@@ -762,25 +816,13 @@ int VamanaStreamerEntity::ensure_dist_storage() {
     return 0;
   }
 
-  // Check if dist chunks already exist in storage (reopened index)
-  size_t existing_dist_chunks =
-      broker_->get_chunk_cnt(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST);
-  if (existing_dist_chunks > 0) {
-    // Load existing dist chunks
-    for (size_t i = 0; i < existing_dist_chunks; ++i) {
-      auto chunk = broker_->get_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST, i);
-      if (ailego_unlikely(!chunk)) {
-        LOG_ERROR("Failed to load dist chunk %zu", i);
-        return IndexError_ReadData;
-      }
-      dist_chunks_.emplace_back(std::move(chunk));
-    }
-    LOG_INFO("Loaded %zu existing dist chunks", existing_dist_chunks);
-  } else {
-    // Allocate new dist chunks for all existing nodes
-    int ret = alloc_dist_chunks_for_existing_nodes();
-    if (ret != 0) return ret;
-  }
+  bool loaded = false;
+  AILEGO_DEFER([&] {
+    if (!loaded) dist_chunks_.clear();
+  });
+  int ret = alloc_dist_chunks_for_existing_nodes();
+  if (ret != 0) return ret;
+  loaded = true;
 
   dist_loaded_ = true;
   return 0;
@@ -799,13 +841,19 @@ int VamanaStreamerEntity::ensure_dist_chunk_for(uint32_t chunk_index) {
 
   uint32_t dist_chunk_data_size = node_cnt_per_chunk_ * dist_entry_size_;
   uint32_t dist_chunk_size = AlignPageSize(dist_chunk_data_size);
-  auto dp = broker_->alloc_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST,
-                                 chunk_index, dist_chunk_size);
-  if (ailego_unlikely(dp.first != 0)) {
-    LOG_ERROR("Alloc dist chunk %u failed", chunk_index);
-    return dp.first;
+  auto dist_chunk =
+      broker_->get_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST, chunk_index);
+  if (!dist_chunk) {
+    auto dp = broker_->alloc_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST,
+                                   chunk_index, dist_chunk_size);
+    if (ailego_unlikely(dp.first != 0)) {
+      LOG_ERROR("Alloc dist chunk %u failed", chunk_index);
+      return dp.first;
+    }
+    dist_chunk = std::move(dp.second);
   }
-  dp.second->resize(dist_chunk_data_size);
+  if (dist_chunk->resize(dist_chunk_data_size) != dist_chunk_data_size)
+    return IndexError_WriteData;
   {
     // Protect dist_chunks_ modification against concurrent readers in
     // get_neighbor_dists/update_neighbor_dists (called from add_node without
@@ -815,7 +863,7 @@ int VamanaStreamerEntity::ensure_dist_chunk_for(uint32_t chunk_index) {
     while (dist_chunks_.size() <= chunk_index) {
       dist_chunks_.emplace_back(nullptr);
     }
-    dist_chunks_[chunk_index] = std::move(dp.second);
+    dist_chunks_[chunk_index] = std::move(dist_chunk);
   }
   return 0;
 }
@@ -832,18 +880,23 @@ int VamanaStreamerEntity::alloc_dist_chunks_for_existing_nodes() {
       (total_docs + node_cnt_per_chunk_ - 1) >> node_index_mask_bits_;
 
   for (uint32_t i = 0; i < num_chunks_needed; ++i) {
-    auto p = broker_->alloc_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST, i,
-                                  dist_chunk_size);
-    if (ailego_unlikely(p.first != 0)) {
-      LOG_ERROR("Alloc dist chunk %u failed", i);
-      return p.first;
+    auto chunk = broker_->get_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST, i);
+    if (!chunk) {
+      auto p = broker_->alloc_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST, i,
+                                    dist_chunk_size);
+      if (ailego_unlikely(p.first != 0)) {
+        LOG_ERROR("Alloc dist chunk %u failed", i);
+        return p.first;
+      }
+      chunk = std::move(p.second);
     }
     // Resize to cover all nodes in this chunk
     uint32_t nodes_in_chunk =
         std::min(node_cnt_per_chunk_, total_docs - i * node_cnt_per_chunk_);
     size_t data_size = static_cast<size_t>(nodes_in_chunk) * dist_entry_size_;
-    p.second->resize(data_size);
-    dist_chunks_.emplace_back(std::move(p.second));
+    if (chunk->data_size() < data_size && chunk->resize(data_size) != data_size)
+      return IndexError_WriteData;
+    dist_chunks_.emplace_back(std::move(chunk));
   }
   broker_->mark_dirty();
   LOG_INFO("Allocated %u dist chunks for %u existing nodes", num_chunks_needed,
@@ -870,7 +923,7 @@ const dist_t *VamanaStreamerEntity::get_neighbor_dists(node_id_t id) const {
 
 void VamanaStreamerEntity::update_neighbor_dists(
     node_id_t id, const std::vector<std::pair<node_id_t, dist_t>> &neighbors) {
-  if (!dist_loaded_) return;
+  if (!dist_loaded_) throw GraphStorageError{IndexError_NoReady};
 
   auto loc = get_dist_chunk_loc(id);
   // Dist chunk must have been pre-allocated by add_vector or
@@ -878,27 +931,32 @@ void VamanaStreamerEntity::update_neighbor_dists(
   if (ailego_unlikely(loc.first >= dist_chunks_.size() ||
                       dist_chunks_[loc.first] == nullptr)) {
     LOG_ERROR("Dist chunk %u not allocated for node %u", loc.first, id);
-    return;
+    throw GraphStorageError{IndexError_WriteData};
   }
 
   // Write distances: fill max_degree slots, zero-pad unused slots
   uint32_t max_deg = static_cast<uint32_t>(max_degree());
-  std::vector<dist_t> dists(max_deg, 0.0f);
+  ailego::BudgetedVector<dist_t> dists(max_deg, 0.0f);
   for (size_t i = 0; i < neighbors.size() && i < max_deg; ++i) {
     dists[i] = neighbors[i].second;
   }
-  dist_chunks_[loc.first]->write(loc.second, dists.data(), dist_entry_size_);
+  if (dist_chunks_[loc.first]->write(loc.second, dists.data(),
+                                     dist_entry_size_) != dist_entry_size_)
+    throw GraphStorageError{IndexError_WriteData};
 }
 
 void VamanaStreamerEntity::set_neighbor_dist(node_id_t id, uint32_t idx,
                                              dist_t dist) {
-  if (!dist_loaded_) return;
+  if (!dist_loaded_) throw GraphStorageError{IndexError_NoReady};
 
   auto loc = get_dist_chunk_loc(id);
-  if (ailego_unlikely(loc.first >= dist_chunks_.size())) return;
+  if (ailego_unlikely(loc.first >= dist_chunks_.size()))
+    throw GraphStorageError{IndexError_WriteData};
 
   uint32_t offset = loc.second + idx * sizeof(dist_t);
-  dist_chunks_[loc.first]->write(offset, &dist, sizeof(dist_t));
+  if (dist_chunks_[loc.first]->write(offset, &dist, sizeof(dist_t)) !=
+      sizeof(dist_t))
+    throw GraphStorageError{IndexError_WriteData};
 }
 
 // calculate_medoid: Compute the medoid (entry point) following DiskANN's
@@ -937,13 +995,15 @@ node_id_t VamanaStreamerEntity::calculate_medoid(uint32_t dimension,
   }
 
   // Step 1: Compute centroid (mean) of all vectors in float space.
-  std::vector<float> centroid(dimension, 0.0f);
+  ailego::BudgetedVector<float> centroid(dimension, 0.0f);
   uint32_t valid_count = 0;
 
   for (node_id_t i = 0; i < n; ++i) {
     if (get_key(i) == kInvalidKey) continue;
-    const void *vec = get_vector(i);
-    if (vec == nullptr) continue;
+    IndexStorage::MemoryBlock vector_block;
+    CheckGraphStorage(get_vector(i, vector_block));
+    const void *vec = vector_block.data();
+    if (vec == nullptr) throw GraphStorageError{IndexError_ReadData};
 
     switch (data_type) {
       case DT_FP32: {
@@ -994,8 +1054,10 @@ node_id_t VamanaStreamerEntity::calculate_medoid(uint32_t dimension,
 
   for (node_id_t i = 0; i < n; ++i) {
     if (get_key(i) == kInvalidKey) continue;
-    const void *vec = get_vector(i);
-    if (vec == nullptr) continue;
+    IndexStorage::MemoryBlock vector_block;
+    CheckGraphStorage(get_vector(i, vector_block));
+    const void *vec = vector_block.data();
+    if (vec == nullptr) throw GraphStorageError{IndexError_ReadData};
 
     float dist = 0.0f;
     switch (data_type) {

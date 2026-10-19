@@ -48,7 +48,7 @@ Status InvertedColumnIndexer::insert(uint32_t id, const std::string &value) {
         return Status::InternalError();
       }
     }
-    if (s = ctx_.db_->Write(ctx_.write_opts_, &write_batch); !s.ok()) {
+    if (s = ctx_.write(&write_batch); !s.ok()) {
       return Status::InternalError();
     }
     if (s = index_array_len(id, encoded_values.size()); !s.ok()) {
@@ -56,13 +56,12 @@ Status InvertedColumnIndexer::insert(uint32_t id, const std::string &value) {
     }
   } else {
     std::string encoded_value = encode(value);
-    s = ctx_.db_->Merge(ctx_.write_opts_, cf_terms_, encoded_value, encoded_id);
+    s = ctx_.merge(cf_terms_, encoded_value, encoded_id);
     if (!s.ok()) {
       return Status::InternalError();
     }
     if (cf_reversed_terms_) {
-      s = ctx_.db_->Merge(ctx_.write_opts_, cf_reversed_terms_,
-                          encode_reversed(value), encoded_id);
+      s = ctx_.merge(cf_reversed_terms_, encode_reversed(value), encoded_id);
       if (!s.ok()) {
         return Status::InternalError();
       }
@@ -104,7 +103,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
       return Status::InternalError();
     }
   }
-  s = ctx_.db_->Write(ctx_.write_opts_, &write_batch);
+  s = ctx_.write(&write_batch);
   if (s.ok()) {
     update_max_id(id);
     return Status::OK();
@@ -123,8 +122,7 @@ Status InvertedColumnIndexer::insert(uint32_t id, bool value) {
       reinterpret_cast<const char *>(&id), sizeof(uint32_t));
   std::string encoded_value = encode(value);
 
-  auto s =
-      ctx_.db_->Merge(ctx_.write_opts_, cf_terms_, encoded_value, encoded_id);
+  auto s = ctx_.merge(cf_terms_, encoded_value, encoded_id);
   if (s.ok()) {
     update_max_id(id);
     return Status::OK();
@@ -168,7 +166,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
   if (has_false) {
     write_batch.Merge(cf_terms_, encode(false), encoded_id);
   }
-  rs = ctx_.db_->Write(ctx_.write_opts_, &write_batch);
+  rs = ctx_.write(&write_batch);
   if (rs.ok()) {
     update_max_id(id);
     return Status::OK();
@@ -201,7 +199,7 @@ Status InvertedColumnIndexer::flush_special_values() {
       LOG_ERROR("Failed to serialize null bitmap");
       return Status::InternalError();
     }
-    auto s = ctx_.db_->Put(ctx_.write_opts_, key_null(), value);
+    auto s = ctx_.put(key_null(), value);
     if (!s.ok()) {
       LOG_ERROR("Failed to insert null bitmap to %s, code[%d], reason[%s]",
                 id().c_str(), s.code(), s.ToString().c_str());
@@ -209,8 +207,7 @@ Status InvertedColumnIndexer::flush_special_values() {
     }
   }
 
-  auto s =
-      ctx_.db_->Put(ctx_.write_opts_, key_max_id(), std::to_string(max_id_));
+  auto s = ctx_.put(key_max_id(), std::to_string(max_id_));
   if (s.ok()) {
     LOG_DEBUG("Special values flushed to %s", id().c_str());
     return Status::OK();
@@ -234,8 +231,7 @@ rocksdb::Status InvertedColumnIndexer::index_array_len(uint32_t array_id,
   std::string encoded_len = InvertedIndexCodec::Encode(
       std::string((char *)&len, sizeof(uint32_t)), DataType::UINT32);
 
-  return ctx_.db_->Merge(ctx_.write_opts_, cf_array_len_, encoded_len,
-                         encoded_id);
+  return ctx_.merge(cf_array_len_, encoded_len, encoded_id);
 }
 
 
@@ -298,8 +294,7 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
       LOG_ERROR("Failed to serialize bitmap");
       return Status::InternalError();
     }
-    rs =
-        ctx_.db_->Put(ctx_.write_opts_, cf_ranges_, range_key, range_value_str);
+    rs = ctx_.put(cf_ranges_, range_key, range_value_str);
     if (!rs.ok()) {
       LOG_ERROR("Failed to put range slot: %s", rs.ToString().c_str());
       return Status::InternalError();
@@ -411,8 +406,8 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
   cdf_json_obj.set("field_value_histogram", cdf_json_array);
   cdf_json_obj.set("total_doc_count", ailego::JsonValue(doc_count));
   ailego::JsonValue cdf_json(std::move(cdf_json_obj));
-  rs = ctx_.db_->Put(ctx_.write_opts_, cf_cdf_, field_.name(),
-                     cdf_json.as_json_string().as_stl_string());
+  rs = ctx_.put(cf_cdf_, field_.name(),
+                cdf_json.as_json_string().as_stl_string());
   if (!rs.ok()) {
     LOG_ERROR("Failed to insert CDF of field[%s] to %s, code[%d], reason[%s]",
               field_.name().c_str(), id().c_str(), rs.code(),
@@ -451,7 +446,7 @@ Status InvertedColumnIndexer::seal() {
     }
   }
 
-  auto rs = ctx_.db_->Put(ctx_.write_opts_, key_sealed(), "sealed");
+  auto rs = ctx_.put(key_sealed(), "sealed");
   if (rs.ok()) {
     sealed_ = true;
     read_only_ = true;

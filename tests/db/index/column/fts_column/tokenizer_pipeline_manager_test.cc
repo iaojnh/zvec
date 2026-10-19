@@ -14,14 +14,76 @@
 
 #include "db/index/column/fts_column/tokenizer/tokenizer_pipeline_manager.h"
 #include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
+#include <zvec/db/index_params.h>
+#include <zvec/db/schema.h>
+#include "db/index/column/fts_column/fts_pipeline.h"
 #include "db/index/column/fts_column/fts_types.h"
 
 using namespace zvec::fts;
+
+TEST(TokenizerPipelineBudgetTest, ValidationUsesCurrentConfiguration) {
+  auto params = std::make_shared<zvec::FtsIndexParams>("standard");
+  zvec::FieldSchema field("content", zvec::DataType::STRING, false, params);
+  ASSERT_TRUE(field.validate().ok());
+  auto first = zvec::detail::AcquireFtsPipeline(*params);
+  ASSERT_TRUE(first.has_value());
+  params->set_tokenizer_name("invalid_analyzer");
+  EXPECT_EQ(zvec::StatusCode::INVALID_ARGUMENT, field.validate().code());
+  params->set_tokenizer_name("whitespace");
+  ASSERT_TRUE(field.validate().ok());
+  auto changed = zvec::detail::AcquireFtsPipeline(*params);
+  ASSERT_TRUE(changed.has_value());
+  EXPECT_NE(first.value(), changed.value());
+  EXPECT_EQ(1u, changed.value()->process("hello-world").size());
+}
+
+TEST(TokenizerPipelineBudgetTest, FailedInitializationCanRetrySameParams) {
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("zvec_tokenizer_budget_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{directory};
+  {
+    std::ofstream dictionary(directory / "jieba.dict.utf8");
+    dictionary << "hello 10 n\nworld 10 n\n";
+    ASSERT_TRUE(dictionary.good());
+  }
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(64 * 1024 * 1024));
+  zvec::FtsIndexParams params("jieba", {},
+                              "{\"cut_mode\":\"full\",\"jieba_dict_dir\":\"" +
+                                  directory.generic_string() + "\"}");
+  {
+    zvec::ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used() - 4096);
+    auto rejected = zvec::detail::AcquireFtsPipeline(params);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(zvec::StatusCode::RESOURCE_EXHAUSTED, rejected.error().code());
+  }
+  auto recovered = zvec::detail::AcquireFtsPipeline(params);
+  ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
+  EXPECT_FALSE(recovered.value()->process("hello world").empty());
+  auto reused = zvec::detail::AcquireFtsPipeline(params);
+  ASSERT_TRUE(reused.has_value());
+  EXPECT_EQ(recovered.value(), reused.value());
+}
 
 // ============================================================
 // Helpers

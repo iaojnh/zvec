@@ -30,10 +30,8 @@ class FlatStreamerProvider : public IndexProvider {
  public:
   //! Constructor
   FlatStreamerProvider(const FlatStreamer<BATCH_SIZE> *owner) {
-    feature_size_ = owner->meta().element_size();
     total_vector_count_ = owner->entity().vector_count();
     owner_ = owner;
-    block_buffer_.resize(BATCH_SIZE * feature_size_);
   }
 
   //! Create a new iterator
@@ -74,9 +72,37 @@ class FlatStreamerProvider : public IndexProvider {
   int get_vectors(
       const uint64_t *keys, uint32_t count,
       std::vector<IndexStorage::MemoryBlock> &blocks) const override {
-    return owner_->entity().get_vectors_by_key(keys, count, blocks);
+    return get_vectors_impl(keys, count, blocks);
+  }
+  int get_vectors(const uint64_t *keys, uint32_t count,
+                  IndexProvider::VectorBlocks &blocks) const override {
+    return get_vectors_impl(keys, count, blocks);
   }
 
+ private:
+  template <typename Blocks>
+  int get_vectors_impl(const uint64_t *keys, uint32_t count,
+                       Blocks &blocks) const try {
+    int ret = owner_->entity().get_vectors_by_key(keys, count, blocks);
+    if (ret != 0) {
+      blocks.clear();
+      return ret;
+    }
+    for (auto &block : blocks) {
+      if (block.type_ == IndexStorage::MemoryBlock::MBT_MMAP) {
+        auto owned = IndexStorage::MemoryBlock::AllocateOwned(element_size());
+        std::memcpy(const_cast<void *>(owned.data()), block.data(),
+                    element_size());
+        block = std::move(owned);
+      }
+    }
+    return 0;
+  } catch (const std::bad_alloc &) {
+    blocks.clear();
+    return IndexError_NoMemory;
+  }
+
+ public:
   //! Retrieve the owner class
   const std::string &owner_class() const override {
     return owner_->name();
@@ -96,10 +122,7 @@ class FlatStreamerProvider : public IndexProvider {
  private:
   //! Members
   const FlatStreamer<BATCH_SIZE> *owner_{nullptr};
-  IndexStorage::Segment::Pointer features_segment_{};
-  uint32_t feature_size_{0};
   uint32_t total_vector_count_{0};
-  mutable std::vector<uint8_t> block_buffer_{};
 };
 
 }  // namespace core

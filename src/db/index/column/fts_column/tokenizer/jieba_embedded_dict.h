@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <cppjieba/DictTrie.hpp>
 #include <cppjieba/HMMModel.hpp>
@@ -29,5 +30,9 @@ using EmbeddedJiebaHmmModel = std::shared_ptr<const cppjieba::HMMModel>;
 // is immutable and shared; the decompressed text is released after parsing.
 Result<EmbeddedJiebaDict> get_embedded_jieba_dict();
 Result<EmbeddedJiebaHmmModel> get_embedded_jieba_hmm_model();
+
+// Uncompressed input sizes for reserving tokenizer workspace before loading.
+size_t embedded_jieba_dict_bytes();
+size_t embedded_jieba_hmm_model_bytes();
 
 }  // namespace zvec::fts

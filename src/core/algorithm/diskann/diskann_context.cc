@@ -15,6 +15,7 @@
 #include "diskann_context.h"
 #include <chrono>
 #include <new>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "diskann_params.h"
 #include "diskann_util.h"
 
@@ -64,29 +65,46 @@ int DiskAnnContext::resize_fetch_sector_buffer(
     return IndexError_InvalidArgument;
   }
 
-  const size_t required_size =
-      static_cast<size_t>(sector_num_per_node) * DiskAnnUtil::kSectorSize;
-  if (sector_buffer_ != nullptr && sector_buffer_size_ == required_size) {
-    return 0;
-  }
+  return ensure_sector_buffer(static_cast<size_t>(sector_num_per_node));
+}
 
+int DiskAnnContext::ensure_sector_buffer(size_t sectors) {
+  if (!sectors || sectors > DiskAnnUtil::kMaxSectorReadNum)
+    return IndexError_InvalidArgument;
+  const size_t required_size = sectors * DiskAnnUtil::kSectorSize;
+  if (sector_buffer_size_ == required_size) return 0;
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t charge = pool.capacity() ? required_size : 0;
+  if (charge && !pool.try_charge_external(charge)) return IndexError_NoMemory;
   void *replacement = nullptr;
   DiskAnnUtil::alloc_aligned(&replacement, required_size,
                              DiskAnnUtil::kSectorSize);
   if (!replacement) {
-    LOG_ERROR("Failed to allocate DiskAnn fetch buffer");
+    if (charge) pool.release_external(charge);
     return IndexError_NoMemory;
   }
-
+  // An earlier error may have left reads outstanding. Cancel and join them
+  // before moving their destinations, including when shrinking after a query.
+  if (sector_buffer_ && io_initialized_) {
+    destroy_io_ctx(io_ctx_);
+    const int ret = setup_io_ctx(io_ctx_);
+    if (ret) {
+      DiskAnnUtil::free_aligned(replacement);
+      if (charge) pool.release_external(charge);
+      return ret;
+    }
+  }
   DiskAnnUtil::free_aligned(sector_buffer_);
+  if (sector_buffer_charge_) pool.release_external(sector_buffer_charge_);
   sector_buffer_ = replacement;
   sector_buffer_size_ = required_size;
+  sector_buffer_charge_ = charge;
   return 0;
 }
 
 int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
                          uint32_t pq_chunk_num, uint32_t element_size,
-                         bool setup_io_context) {
+                         bool setup_io_context) try {
   if (!entity_ || element_size == 0) {
     LOG_ERROR("Invalid DiskAnn context parameters");
     return IndexError_InvalidArgument;
@@ -95,19 +113,17 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
   element_size_ = element_size;
   pq_chunk_num_ = pq_chunk_num;
 
-  if (type != kFetchContext) {
-    DiskAnnUtil::alloc_aligned((void **)&query_, element_size_, 32);
-    DiskAnnUtil::alloc_aligned((void **)&query_rotated_, element_size_, 32);
-    if (!query_ || !query_rotated_) {
-      LOG_ERROR("Failed to allocate DiskAnn query buffers");
-      return IndexError_NoMemory;
-    }
-  }
+  // One charged allocation also covers alignment padding. Do not publish it
+  // until context initialization succeeds; a failed admission can be retried.
+  ailego::BudgetedAlignedBuffer query_memory;
+  const size_t stride = DiskAnnUtil::round_up(element_size_, 256);
+  if (type != kFetchContext)
+    query_memory.resize_array(type == kSearcherContext ? 3 : 2, stride, 256);
 
   int ret;
   switch (type) {
     case kBuilderContext:
-      ret = visit_filter_.init(VisitFilter::ByteMap, entity_->doc_cnt(),
+      ret = visit_filter_.init(VisitFilter::EpochBitMap, entity_->doc_cnt(),
                                entity_->doc_cnt(), negative_probility_);
       if (ret != 0) {
         LOG_ERROR("Create filter failed,  mode %d", filter_mode_);
@@ -128,18 +144,11 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
         return ret;
       }
 
-      DiskAnnUtil::alloc_aligned((void **)&coord_buffer_, element_size_, 256);
-      sector_buffer_size_ = static_cast<size_t>(DiskAnnUtil::kMaxSectorReadNum *
-                                                DiskAnnUtil::kSectorSize);
-      DiskAnnUtil::alloc_aligned((void **)&sector_buffer_, sector_buffer_size_,
-                                 DiskAnnUtil::kSectorSize);
-      if (!coord_buffer_ || !sector_buffer_) {
-        LOG_ERROR("Failed to allocate DiskAnn search buffers");
-        return IndexError_NoMemory;
-      }
+      // Sector scratch is allocated for the actual read batch, not the cap.
 
       if (setup_io_context) {
         ret = setup_io_ctx(io_ctx_);
+        io_initialized_ = (ret == 0);
         if (ret != 0) {
           LOG_ERROR("setup io ctx error, ret=%d", ret);
           return ret;
@@ -155,6 +164,7 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
 
       if (setup_io_context) {
         ret = setup_io_ctx(io_ctx_);
+        io_initialized_ = (ret == 0);
         if (ret != 0) {
           LOG_ERROR("setup fetch io ctx error, ret=%d", ret);
           return ret;
@@ -167,7 +177,14 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
       return IndexError_Runtime;
   }
 
+  query_memory_ = std::move(query_memory);
+  auto *data = static_cast<uint8_t *>(query_memory_.data());
+  query_ = data;
+  query_rotated_ = data ? data + stride : nullptr;
+  coord_buffer_ = type == kSearcherContext ? data + 2 * stride : nullptr;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 DiskAnnContext::~DiskAnnContext() {
@@ -179,10 +196,10 @@ DiskAnnContext::~DiskAnnContext() {
   }
 
   visit_filter_.destroy();
-  DiskAnnUtil::free_aligned(query_);
-  DiskAnnUtil::free_aligned(query_rotated_);
-  DiskAnnUtil::free_aligned(coord_buffer_);
   DiskAnnUtil::free_aligned(sector_buffer_);
+  if (sector_buffer_charge_)
+    ailego::MemoryLimitPool::get_instance().release_external(
+        sector_buffer_charge_);
 }
 
 int DiskAnnContext::update(const ailego::Params &params) {

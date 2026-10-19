@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
+#include <core/quantizer/quantizer_params.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_framework.h>
 #include "ivf_distance_calculator.h"
 #include "ivf_index_format.h"
@@ -53,23 +54,26 @@ class IVFEntity {
   //! search in inverted list with filter
   int search(size_t inverted_list_id, const void *query,
              const IndexFilter &filter, uint32_t *scan_count,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const;
+             IndexCandidateHeap *heap,
+             IndexContext::Stats *context_stats) const;
 
   //! search in inverted list without filter
   int search(size_t inverted_list_id, const void *query, uint32_t *scan_count,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const;
+             IndexCandidateHeap *heap,
+             IndexContext::Stats *context_stats) const;
 
   //! search all inverted list with filter
   int search(const void *query, const IndexFilter &filter,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const;
+             IndexCandidateHeap *heap,
+             IndexContext::Stats *context_stats) const;
 
   //! search all inverted list without filter
-  int search(const void *query, IndexDocumentHeap *heap,
+  int search(const void *query, IndexCandidateHeap *heap,
              IndexContext::Stats *context_stats) const;
 
   //! Search only the specified primary keys, using posting-space distances.
   int search_by_p_keys(const void *query, const std::vector<uint64_t> &p_keys,
-                       const IndexFilter &filter, IndexDocumentHeap *heap,
+                       const IndexFilter &filter, IndexCandidateHeap *heap,
                        IndexContext::Stats *context_stats) const;
 
   //! Clone the entity
@@ -79,11 +83,11 @@ class IVFEntity {
   IVFEntity::Pointer clone(const IVFEntity::Pointer &entity) const;
 
   //! Retrieve the primary keys by local id in heap
-  int retrieve_keys(IndexDocumentHeap *heap) const {
+  int retrieve_keys(IndexCandidateHeap *heap) const {
     for (auto &it : heap->mutable_container()) {
       uint64_t key = this->get_key(it.index());
       if (key == kInvalidKey) {
-        return IndexError_ReadData;
+        return keys_->read_error();
       }
       it.set_key(key);
     }
@@ -114,6 +118,10 @@ class IVFEntity {
   //! Retrieve IndexMeta of the inverted index
   const IndexMeta &meta() const {
     return meta_;
+  }
+
+  size_t query_workspace_bytes() const {
+    return reformer_.workspace_bytes();
   }
 
   //! Retrieve a block of vectors
@@ -207,6 +215,7 @@ class IVFEntity {
   int get_vector_by_key(uint64_t key, IndexStorage::MemoryBlock &block) const;
 
   uint32_t key_to_id(uint64_t key) const;
+  int resolve_key(uint64_t key, uint32_t *id) const;
 
   //! Transform a query
   int transform(const void *query, const IndexQueryMeta &qmeta,
@@ -231,38 +240,34 @@ class IVFEntity {
   }
 
   //! Normalize the score in query part
-  void normalize(size_t qidx, IndexDocumentHeap *heap) const {
-    if (quantizer_) {
-      return;
-    }
+  void normalize(size_t qidx, IndexCandidateHeap *heap) const {
+    if (quantizer_) return;
     return reformer_.normalize(qidx, heap);
   }
 
   //! Retrieve the value for each inverted list to multiply for normalizing
-  float inverted_list_normalize_value(size_t inverted_list_id) const {
+  int inverted_list_normalize_value(size_t inverted_list_id, float *value) const
+      try {
+    if (!value) return IndexError_InvalidArgument;
     if (quantizer_) {
-      return 1.0f;
+      *value = 1.0f;
+      return 0;
     }
     if (norm_value_ != 0.0f) {
-      return norm_value_;
+      *value = norm_value_;
+    } else if (integer_quantizer_params_) {
+      InvertedIntegerQuantizerParams params;
+      const size_t offset = inverted_list_id * sizeof(params);
+      if (integer_quantizer_params_->fetch(offset, &params, sizeof(params)) !=
+          sizeof(params))
+        return integer_quantizer_params_->read_error();
+      *value = convert_to_normalize_value(params.scale);
+    } else {
+      *value = 1.0f;
     }
-
-    // ailego_assert_with(integer_quantizer_params_, "nullptr");
-    if (integer_quantizer_params_ != nullptr) {
-      IndexStorage::MemoryBlock data;
-      size_t size = sizeof(InvertedIntegerQuantizerParams);
-      size_t off = inverted_list_id * size;
-      if (integer_quantizer_params_->read(off, data, size) != size) {
-        LOG_ERROR("Failed to read data from segment, off=%zu", off);
-        return 1.0f;
-      }
-      auto scale =
-          static_cast<const InvertedIntegerQuantizerParams *>(data.data())
-              ->scale;
-      return this->convert_to_normalize_value(scale);
-    }
-
-    return 1.0f;
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   //! Check whether the feature segment exist
@@ -287,14 +292,21 @@ class IVFEntity {
     IVFReformerWrapper &operator=(const IVFReformerWrapper &wrapper) {
       reformer_ = wrapper.reformer_;
       type_ = wrapper.type_;
+      output_element_size_ = wrapper.output_element_size_;
       buffer_.clear();
       buffer_.shrink_to_fit();
+      buffer_memory_.retain_at_most(0);
+      ailego::BudgetedVector<float>().swap(scales_);
       reciprocal_ = wrapper.reciprocal_;
       return *this;
     }
 
     //! Initialize
     int init(const IndexMeta &imeta);
+
+    size_t workspace_bytes() const {
+      return buffer_.capacity() + scales_.capacity() * sizeof(float);
+    }
 
     //! Load reformer state (e.g. rotation matrix) from storage
     int load(const IndexStorage::Pointer &storage);
@@ -324,11 +336,11 @@ class IVFEntity {
                       uint32_t count, const void **out, IndexQueryMeta *ometa);
 
     //! Normalize the score in query part
-    void normalize(size_t qidx, IndexDocumentHeap *heap) const;
+    void normalize(size_t qidx, IndexCandidateHeap *heap) const;
 
     //! Normalize the score in query part
     void normalize(size_t qidx, const void *query, const IndexQueryMeta &qmeta,
-                   IndexDocumentHeap *heap) const;
+                   IndexCandidateHeap *heap) const;
 
    private:
     //! Transform query from fp32 to int8
@@ -349,11 +361,23 @@ class IVFEntity {
     };
 
     //! Members
+    void reserve_buffer(const IndexQueryMeta &meta, size_t count) {
+      if (type_ == kReformerTpNone) return;
+      size_t stride =
+          std::max<size_t>(meta.element_size(), output_element_size_);
+      if (type_ == kReformerTpInnerProductInt8) stride = meta.dimension();
+      if (type_ == kReformerTpInnerProductInt4)
+        stride = (size_t{meta.dimension()} + 1) / 2;
+      if (stride && count > SIZE_MAX / stride) throw std::bad_alloc();
+      ailego::ReserveStringCapacity(buffer_, buffer_memory_, count * stride);
+    }
+    size_t output_element_size_{0};
     Type type_{kReformerTpNone};
     IndexReformer::Pointer reformer_{};
+    ailego::MemoryReservation buffer_memory_;
     std::string buffer_{};
-    float reciprocal_{0.0};        // for int8
-    std::vector<float> scales_{};  // for int8 IP
+    float reciprocal_{0.0};                   // for int8
+    ailego::BudgetedVector<float> scales_{};  // for int8 IP
   };
 
  private:
@@ -369,9 +393,7 @@ class IVFEntity {
   //! Unlike fetch, distance evaluation must not read retained original vectors.
   int read_posting_vector(size_t id, IndexStorage::MemoryBlock &block) const;
 
-  //! Distinguish missing keys from storage read failures.
-  int key_to_id(uint64_t key, uint32_t *id) const;
-
+  //! Retrieve the legacy per-centroid scale for a posting local ID.
   int key_normalize_value(uint32_t id, float *value) const;
 
   void query_features_distance(const void *query, const void *features,
@@ -409,9 +431,11 @@ class IVFEntity {
   IndexStorage::Segment::Pointer mapping_{};
   IndexStorage::Segment::Pointer features_{};
   IndexStorage::Segment::Pointer integer_quantizer_params_{};
-  mutable std::string vector_{};  // temporary buffer for colomn major order
+  mutable ailego::BudgetedString
+      vector_{};  // temporary buffer for colomn major order
   //! Temporary buffer for one row-major vector split across storage pages.
-  mutable std::vector<uint8_t> scatter_vector_{};
+  mutable ailego::BudgetedVector<uint8_t> scatter_vector_{};
+  mutable ailego::BudgetedVector<float> scatter_distances_{};
   float norm_value_{0.0f};  // normalize the inverted vector to orignal score
   bool norm_value_sqrt_{false};  // does the norm value need to sqrt
   InvertedIndexHeader header_;

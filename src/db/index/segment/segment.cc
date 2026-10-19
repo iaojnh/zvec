@@ -37,6 +37,8 @@
 #include <zvec/db/schema.h>
 #include <zvec/db/status.h>
 #include <zvec/db/type.h>
+#include "db/common/query_result_memory.h"
+#include "db/index/storage/parquet_memory_pool.h"
 #if RABITQ_SUPPORTED
 #include "core/algorithm/hnsw_rabitq/rabitq_params.h"
 #endif
@@ -50,11 +52,15 @@
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "db/index/common/doc_field_converter.h"
+#include "db/index/common/doc_id_map.h"
 #include "db/index/common/index_filter.h"
 #include "db/index/common/meta.h"
+#include "db/index/common/serialized_doc_memory.h"
+#include "db/index/segment/segment_fetch_internal.h"
 #include "db/index/segment/segment_helper.h"
 #include "db/index/storage/base_forward_store.h"
 #include "db/index/storage/bufferpool_forward_store.h"
+#include "db/index/storage/fetch_memory.h"
 #include "db/index/storage/memory_forward_store.h"
 #include "db/index/storage/mmap_forward_store.h"
 #include "db/index/storage/store_helper.h"
@@ -64,6 +70,11 @@
 #include "sql_expr_parser.h"
 
 namespace zvec {
+
+arrow::MemoryPool *Segment::query_memory_pool() const {
+  return uses_buffer_storage() ? detail::GetParquetMemoryPool().get()
+                               : arrow::default_memory_pool();
+}
 
 void global_init() {
   static std::once_flag once;
@@ -153,6 +164,22 @@ class SegmentImpl : public Segment,
                      std::nullopt,
                  bool include_vector = true) override;
 
+  std::vector<Doc::Ptr> fetch_docs(
+      const std::vector<uint64_t> &g_doc_ids,
+      const std::optional<std::vector<std::string>> &output_fields,
+      bool include_vector) override;
+
+  Result<Doc::Ptr> fetch_document(uint64_t g_doc_id);
+
+  Result<TablePtr> fetch_forward_batch(
+      const std::vector<uint64_t> &g_doc_ids,
+      const std::optional<std::vector<std::string>> &output_fields,
+      arrow::MemoryPool *memory_pool) const;
+
+  arrow::Result<TablePtr> fetch_table(
+      const std::vector<std::string> &columns,
+      const std::vector<int> &segment_doc_ids) const;
+
   CombinedVectorColumnIndexer::Ptr get_combined_vector_indexer(
       const std::string &field_name) const override;
 
@@ -182,6 +209,10 @@ class SegmentImpl : public Segment,
       const fts::FtsQueryParams &params) override;
 
   const IndexFilter::Ptr get_filter() override;
+
+  bool uses_buffer_storage() const override {
+    return !options_.enable_mmap_;
+  }
 
   Status create_all_vector_indexes(
       int concurrency, SegmentMeta::Ptr *new_segment_meta,
@@ -311,6 +342,9 @@ class SegmentImpl : public Segment,
       const std::vector<VectorColumnIndexer::Ptr> &source_indexers,
       int concurrency);
 
+  Status reopen_vector_indexer_for_serving(
+      const VectorColumnIndexer::Ptr &vector_indexer);
+
   // Helper functions for Insert/Update/Upsert/Delete
   template <typename ValueType>
   Status insert_scalar(InvertedColumnIndexer::Ptr &indexer, const Doc &doc,
@@ -320,11 +354,18 @@ class SegmentImpl : public Segment,
                        const FieldSchema::Ptr &field);
 
   Status insert_scalar_indexer(Doc &doc);
-  Status insert_fts_indexer(Doc &doc);
+  Status admit_fts_write(const Doc &doc, detail::FtsWriteAdmission *admission);
+  Status insert_fts_indexer(Doc &doc,
+                            const detail::FtsWriteAdmission &admission);
   Status insert_vector_indexer(Doc &doc);
-  Status internal_insert(Doc &doc);
-  Status internal_update(Doc &doc);
-  Status internal_upsert(Doc &doc);
+  using PreparedForward = std::unique_ptr<MemForwardStore::PreparedInsert>;
+  Result<PreparedForward> prepare_forward_write(const Doc &doc);
+  Status internal_insert(Doc &doc, const detail::FtsWriteAdmission &admission,
+                         PreparedForward prepared);
+  Status internal_update(Doc &doc, const detail::FtsWriteAdmission &admission,
+                         PreparedForward prepared);
+  Status internal_upsert(Doc &doc, const detail::FtsWriteAdmission &admission,
+                         PreparedForward prepared);
   Status internal_delete(const Doc &doc);
 
   Status recover();
@@ -353,19 +394,41 @@ class SegmentImpl : public Segment,
 
   // Require seg_mtx_; the public fetch() overloads take it before entering, so
   // a nested fetch never locks it twice.
+  Doc::Ptr fetch_doc_unsafe(
+      uint64_t g_doc_id,
+      const std::optional<std::vector<std::string>> &output_fields,
+      bool include_vector);
+  std::vector<std::string> doc_forward_columns(
+      const std::optional<std::vector<std::string>> &output_fields) const;
+  Doc::Ptr materialize_doc_unsafe(
+      uint64_t g_doc_id, int segment_doc_id,
+      const std::vector<std::string> &forward_columns,
+      const std::shared_ptr<arrow::Schema> &result_schema,
+      const ExecBatchPtr &exec_batch, bool include_vector,
+      Status *read_status = nullptr);
   TablePtr fetch_unsafe(const std::vector<std::string> &columns,
-                        const std::vector<int> &segment_doc_ids) const;
+                        const std::vector<int> &segment_doc_ids,
+                        bool strict = false,
+                        arrow::MemoryPool *memory_pool = nullptr) const;
+  arrow::Result<TablePtr> fetch_checked(const std::vector<std::string> &columns,
+                                        const std::vector<int> &segment_doc_ids,
+                                        bool strict,
+                                        arrow::MemoryPool *memory_pool) const;
   ExecBatchPtr fetch_exec_unsafe(const std::vector<std::string> &columns,
                                  int segment_doc_id) const;
-  TablePtr fetch_normal(const std::vector<std::string> &columns,
-                        const std::shared_ptr<arrow::Schema> &result_schema,
-                        const std::vector<int> &segment_doc_ids) const;
+  arrow::Result<TablePtr> fetch_normal(
+      const std::vector<std::string> &columns,
+      const std::shared_ptr<arrow::Schema> &result_schema,
+      const std::vector<int> &segment_doc_ids, bool strict,
+      arrow::MemoryPool *memory_pool) const;
 
   // For performance tuning
-  TablePtr fetch_perf(const std::vector<std::string> &columns,
-                      const std::shared_ptr<arrow::Schema> &result_schema,
-                      const std::vector<int> &segment_doc_ids,
-                      const std::vector<uint64_t> &chunk_offsets) const;
+  arrow::Result<TablePtr> fetch_perf(
+      const std::vector<std::string> &columns,
+      const std::shared_ptr<arrow::Schema> &result_schema,
+      const std::vector<int> &segment_doc_ids,
+      const std::vector<uint64_t> &chunk_offsets,
+      arrow::MemoryPool *memory_pool) const;
 
   const std::vector<uint64_t> *get_fetch_perf_chunk_offsets(
       const std::vector<std::string> &columns) const;
@@ -415,7 +478,7 @@ class SegmentImpl : public Segment,
   DeleteStore::Ptr delete_store_;
 
   // Maps segment-local doc ID (array index) to global doc ID (stored value)
-  std::vector<uint64_t> doc_ids_;
+  DocIdMap doc_ids_;
 
   // Only valid for a read-only collection; queries never modify this flag.
   bool has_identity_doc_ids_{false};
@@ -556,13 +619,11 @@ Status SegmentImpl::Open(const SegmentOptions &options) {
   // WAL recovery can append doc IDs even for a read-only open. Initialize
   // this property only after recovery has finished, before publication.
   if (options_.read_only_) {
-    has_identity_doc_ids_ = true;
-    for (size_t i = 0; i < doc_ids_.size(); ++i) {
-      if (doc_ids_[i] != i) {
-        has_identity_doc_ids_ = false;
-        break;
-      }
-    }
+    // DocIdMap guarantees strictly increasing IDs, so these endpoints prove
+    // identity without reading every pageable range during open.
+    has_identity_doc_ids_ =
+        doc_ids_.size() == 0 ||
+        (doc_ids_.front() == 0 && doc_ids_.back() == doc_ids_.size() - 1);
   }
 
   return Status::OK();
@@ -665,11 +726,8 @@ uint64_t SegmentImpl::doc_count_snapshot() const {
 uint64_t SegmentImpl::doc_count(const IndexFilter::Ptr filter) {
   uint64_t doc_count = doc_ids_.size();
   if (filter) {
-    for (const auto &doc_id : doc_ids_) {
-      if (filter->is_filtered(doc_id)) {
-        doc_count--;
-      }
-    }
+    doc_count -= doc_ids_.count_filtered(
+        [&](uint64_t doc_id) { return filter->is_filtered(doc_id); });
   }
 
   return doc_count;
@@ -921,28 +979,43 @@ Status SegmentImpl::insert_vector_indexer(Doc &doc) {
   return Status::OK();
 }
 
-Status SegmentImpl::internal_insert(Doc &doc) {
+Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
+    const Doc &doc) try {
+  if (doc.serialized_size() > WalFile::kMaxRecordSize)
+    return tl::make_unexpected(
+        Status::InvalidArgument("WAL document exceeds record size limit"));
+  if (ready_for_dump_block()) {
+    auto status = flush();
+    if (!status.ok()) return tl::make_unexpected(status);
+  }
+  if (!memory_store_) {
+    auto status = init_memory_components();
+    if (!status.ok()) return tl::make_unexpected(status);
+  }
+  const auto next_id = doc_id_allocator_.load();
+  auto status = doc_ids_.prepare_append(next_id);
+  if (!status.ok()) return tl::make_unexpected(status);
+  // Do not modify doc.doc_id(): UPDATE's WAL still needs the previous ID.
+  // Budgeted Arrow allocation must finish before recording/publishing a write.
+  return memory_store_->prepare_insert(doc, next_id);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient forward write buffer budget"));
+}
+
+Status SegmentImpl::internal_insert(Doc &doc,
+                                    const detail::FtsWriteAdmission &admission,
+                                    PreparedForward prepared) {
   uint64_t g_doc_id = doc_id_allocator_.fetch_add(1);
   doc.set_doc_id(g_doc_id);
-
-  if (ready_for_dump_block()) {
-    auto s = flush();
-    CHECK_RETURN_STATUS(s);
-  }
-
-  // init writing memory components
-  if (!memory_store_) {
-    auto s = init_memory_components();
-    CHECK_RETURN_STATUS(s);
-  }
 
   // write idmap
   auto s = id_map_->upsert(doc.pk_ref(), g_doc_id);
   CHECK_RETURN_STATUS(s);
 
   // write forward
-  s = memory_store_->insert(doc);
-  CHECK_RETURN_STATUS(s);
+  memory_store_->commit_insert(std::move(prepared));
 
   // write scalar index
   s = insert_scalar_indexer(doc);
@@ -950,7 +1023,7 @@ Status SegmentImpl::internal_insert(Doc &doc) {
     return s;
   }
   // write FTS index
-  s = insert_fts_indexer(doc);
+  s = insert_fts_indexer(doc, admission);
   CHECK_RETURN_STATUS(s);
   // write vector index
   s = insert_vector_indexer(doc);
@@ -962,27 +1035,31 @@ Status SegmentImpl::internal_insert(Doc &doc) {
   mem_block.max_doc_id_ = g_doc_id;
   mem_block.doc_count_ = mem_block.doc_count_ + 1;
 
-  doc_ids_.push_back(g_doc_id);
+  doc_ids_.commit_append(g_doc_id);
 
   return Status::OK();
 }
 
-Status SegmentImpl::internal_update(Doc &doc) {
-  delete_store_->mark_deleted(doc.doc_id());
-  return internal_insert(doc);
+Status SegmentImpl::internal_update(Doc &doc,
+                                    const detail::FtsWriteAdmission &admission,
+                                    PreparedForward prepared) {
+  CHECK_RETURN_STATUS(delete_store_->mark_deleted(doc.doc_id()));
+  return internal_insert(doc, admission, std::move(prepared));
 }
 
-Status SegmentImpl::internal_upsert(Doc &doc) {
+Status SegmentImpl::internal_upsert(Doc &doc,
+                                    const detail::FtsWriteAdmission &admission,
+                                    PreparedForward prepared) {
   uint64_t g_doc_id;
   bool exist = id_map_->has(doc.pk_ref(), &g_doc_id);
   if (exist) {
-    delete_store_->mark_deleted(g_doc_id);
+    CHECK_RETURN_STATUS(delete_store_->mark_deleted(g_doc_id));
   }
-  return internal_insert(doc);
+  return internal_insert(doc, admission, std::move(prepared));
 }
 
 Status SegmentImpl::internal_delete(const Doc &doc) {
-  delete_store_->mark_deleted(doc.doc_id());
+  CHECK_RETURN_STATUS(delete_store_->mark_deleted(doc.doc_id()));
   id_map_->remove(doc.pk_ref());
   return Status::OK();
 }
@@ -997,11 +1074,17 @@ Status SegmentImpl::insert(Doc &doc) {
 
   doc.set_operator(Operator::INSERT);
 
+  detail::FtsWriteAdmission admission(!options_.enable_mmap_);
+  CHECK_RETURN_STATUS(admit_fts_write(doc, &admission));
+
+  auto prepared = prepare_forward_write(doc);
+  if (!prepared) return prepared.error();
+
   // append WAL
   auto s = append_wal(doc);
   CHECK_RETURN_STATUS(s);
 
-  return internal_insert(doc);
+  return internal_insert(doc, admission, std::move(*prepared));
 }
 
 Status SegmentImpl::update(Doc &doc) {
@@ -1014,24 +1097,38 @@ Status SegmentImpl::update(Doc &doc) {
 
   doc.set_doc_id(g_doc_id);
   doc.set_operator(Operator::UPDATE);
+  detail::FtsWriteAdmission admission(!options_.enable_mmap_);
+  CHECK_RETURN_STATUS(admit_fts_write(doc, &admission));
+  CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
+
+  auto prepared = prepare_forward_write(doc);
+  if (!prepared) return prepared.error();
 
   // append WAL
   auto s = append_wal(doc);
   CHECK_RETURN_STATUS(s);
 
-  return internal_update(doc);
+  return internal_update(doc, admission, std::move(*prepared));
 }
 
 Status SegmentImpl::upsert(Doc &doc) {
   std::lock_guard lock(seg_mtx_);
 
   doc.set_operator(Operator::UPSERT);
+  detail::FtsWriteAdmission admission(!options_.enable_mmap_);
+  CHECK_RETURN_STATUS(admit_fts_write(doc, &admission));
+  uint64_t old_id;
+  if (id_map_->has(doc.pk_ref(), &old_id))
+    CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(old_id));
+
+  auto prepared = prepare_forward_write(doc);
+  if (!prepared) return prepared.error();
 
   // append WAL
   auto s = append_wal(doc);
   CHECK_RETURN_STATUS(s);
 
-  return internal_upsert(doc);
+  return internal_upsert(doc, admission, std::move(*prepared));
 }
 
 Status SegmentImpl::Delete(const std::string &pk) {
@@ -1050,6 +1147,7 @@ Status SegmentImpl::Delete(const std::string &pk) {
   mutable_doc.set_pk(pk);
   mutable_doc.set_doc_id(g_doc_id);
   mutable_doc.set_operator(Operator::DELETE);
+  CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
 
   // append WAL
   auto s = append_wal(mutable_doc);
@@ -1068,6 +1166,7 @@ Status SegmentImpl::Delete(uint64_t g_doc_id) {
   Doc mutable_doc;
   mutable_doc.set_doc_id(g_doc_id);
   mutable_doc.set_operator(Operator::DELETE);
+  CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
 
   // append WAL
   auto s = append_wal(mutable_doc);
@@ -1082,7 +1181,13 @@ Doc::Ptr SegmentImpl::fetch(
     bool include_vector) {
   // Shared so concurrent Fetch calls do not serialize.
   std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  return fetch_doc_unsafe(g_doc_id, output_fields, include_vector);
+}
 
+Doc::Ptr SegmentImpl::fetch_doc_unsafe(
+    uint64_t g_doc_id,
+    const std::optional<std::vector<std::string>> &output_fields,
+    bool include_vector) {
   if (g_doc_id > segment_meta_->max_doc_id()) {
     LOG_ERROR("g_doc_id[%zu] not exist in segment[%d] ", (size_t)g_doc_id,
               id());
@@ -1090,10 +1195,13 @@ Doc::Ptr SegmentImpl::fetch(
   }
 
   int segment_doc_id = 0;
-  auto it = std::lower_bound(doc_ids_.begin(), doc_ids_.end(), g_doc_id);
-  if (it != doc_ids_.end() && *it == g_doc_id) {
-    segment_doc_id = static_cast<int>(std::distance(doc_ids_.begin(), it));
+  auto position = doc_ids_.find(g_doc_id);
+  if (position) {
+    segment_doc_id = static_cast<int>(*position);
   } else {
+    if (position.error().code() != StatusCode::NOT_FOUND) {
+      throw DocIdMap::ReadError(position.error());
+    }
     LOG_ERROR(
         "g_doc_id[%zu] not found in doc_ids_[%zu], min_doc_id[%zu] "
         "max_doc_id[%zu], meta[%s]",
@@ -1102,25 +1210,7 @@ Doc::Ptr SegmentImpl::fetch(
     return nullptr;
   }
 
-  std::vector<std::string> forward_columns;
-  forward_columns.push_back(GLOBAL_DOC_ID);
-  forward_columns.push_back(USER_ID);
-  if (!output_fields.has_value()) {
-    // No output_fields specified: return all forward fields
-    for (const auto &field : collection_schema_->forward_fields()) {
-      forward_columns.push_back(field->name());
-    }
-  } else {
-    // output_fields specified: only return requested fields that exist
-    const auto &requested = *output_fields;
-    std::unordered_set<std::string> requested_set(requested.begin(),
-                                                  requested.end());
-    for (const auto &field : collection_schema_->forward_fields()) {
-      if (requested_set.count(field->name())) {
-        forward_columns.push_back(field->name());
-      }
-    }
-  }
+  auto forward_columns = doc_forward_columns(output_fields);
 
   // Build result schema
   std::vector<std::shared_ptr<arrow::Field>> fields;
@@ -1144,8 +1234,291 @@ Doc::Ptr SegmentImpl::fetch(
   }
   auto result_schema = std::make_shared<arrow::Schema>(fields);
 
-  // fetch forward columns
   auto exec_batch = fetch_exec_unsafe(forward_columns, segment_doc_id);
+  return materialize_doc_unsafe(g_doc_id, segment_doc_id, forward_columns,
+                                result_schema, exec_batch, include_vector);
+}
+
+Result<Doc::Ptr> SegmentImpl::fetch_document(uint64_t g_doc_id) {
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  // Preserve the existing mmap fast path. Buffer reads need the checked path:
+  // nullable fetch discards Arrow OOM before the update caller can classify it.
+  if (options_.enable_mmap_) {
+    auto doc = fetch_doc_unsafe(g_doc_id, std::nullopt, true);
+    if (!doc) {
+      return tl::make_unexpected(Status::InternalError("Fetch doc failed"));
+    }
+    return doc;
+  }
+  auto position = doc_ids_.find(g_doc_id);
+  if (!position) return tl::make_unexpected(position.error());
+  const int row = static_cast<int>(*position);
+  const auto columns = doc_forward_columns(std::nullopt);
+  auto table_result = fetch_checked(columns, {row}, /*strict=*/true, nullptr);
+  if (!table_result.ok()) {
+    const auto &status = table_result.status();
+    return tl::make_unexpected(
+        Status(status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED
+                                      : StatusCode::INTERNAL_ERROR,
+               "Failed to read document before update: " + status.ToString()));
+  }
+  auto table = std::move(table_result).ValueOrDie();
+  if (!table || table->num_rows() != 1 ||
+      table->num_columns() != static_cast<int>(columns.size())) {
+    return tl::make_unexpected(
+        Status::InternalError("Incomplete document before update"));
+  }
+  std::vector<arrow::Datum> values;
+  values.reserve(columns.size());
+  for (const auto &column : table->columns()) {
+    auto scalar = detail::FetchScalarView(*column, 0);
+    if (!scalar.ok()) {
+      const auto &status = scalar.status();
+      return tl::make_unexpected(
+          Status(status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED
+                                        : StatusCode::INTERNAL_ERROR,
+                 "Failed to read document scalar: " + status.ToString()));
+    }
+    values.emplace_back(std::move(scalar).ValueOrDie());
+  }
+  auto batch =
+      std::make_shared<arrow::compute::ExecBatch>(std::move(values), 1);
+  Status status = Status::OK();
+  auto doc = materialize_doc_unsafe(g_doc_id, row, columns, table->schema(),
+                                    batch, true, &status);
+  if (!status.ok()) return tl::make_unexpected(std::move(status));
+  if (!doc) {
+    return tl::make_unexpected(Status::InternalError("Fetch doc failed"));
+  }
+  return doc;
+}
+
+std::vector<std::string> SegmentImpl::doc_forward_columns(
+    const std::optional<std::vector<std::string>> &output_fields) const {
+  std::vector<std::string> forward_columns;
+  forward_columns.push_back(GLOBAL_DOC_ID);
+  forward_columns.push_back(USER_ID);
+  if (!output_fields.has_value()) {
+    // No output_fields specified: return all forward fields
+    for (const auto &field : collection_schema_->forward_fields()) {
+      forward_columns.push_back(field->name());
+    }
+  } else {
+    // output_fields specified: only return requested fields that exist
+    const auto &requested = *output_fields;
+    std::unordered_set<std::string> requested_set(requested.begin(),
+                                                  requested.end());
+    for (const auto &field : collection_schema_->forward_fields()) {
+      if (requested_set.count(field->name())) {
+        forward_columns.push_back(field->name());
+      }
+    }
+  }
+
+  return forward_columns;
+}
+
+Result<TablePtr> SegmentImpl::fetch_forward_batch(
+    const std::vector<uint64_t> &g_doc_ids,
+    const std::optional<std::vector<std::string>> &output_fields,
+    arrow::MemoryPool *memory_pool) const {
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  std::vector<int> rows;
+  rows.reserve(g_doc_ids.size());
+  for (auto id : g_doc_ids) {
+    auto local_id = doc_ids_.find(id);
+    if (!local_id) {
+      if (local_id.error().code() != StatusCode::NOT_FOUND) {
+        return tl::make_unexpected(local_id.error());
+      }
+      continue;
+    }
+    rows.push_back(static_cast<int>(*local_id));
+  }
+  if (rows.empty()) return TablePtr{};
+
+  const auto columns = doc_forward_columns(output_fields);
+  std::vector<std::shared_ptr<arrow::Field>> fields;
+  std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays;
+  for (const auto &column : columns) {
+    // Partial updates can give each column a different physical row layout.
+    auto result = fetch_checked({column}, rows, /*strict=*/true, memory_pool);
+    if (!result.ok()) {
+      const auto &status = result.status();
+      return tl::make_unexpected(Status(status.IsOutOfMemory()
+                                            ? StatusCode::RESOURCE_EXHAUSTED
+                                            : StatusCode::INTERNAL_ERROR,
+                                        "Failed to fetch forward column " +
+                                            column + ": " + status.ToString()));
+    }
+    auto table = std::move(result).ValueOrDie();
+    if (!table || table->num_columns() != 1 ||
+        table->num_rows() != static_cast<int64_t>(rows.size())) {
+      return tl::make_unexpected(
+          Status::InternalError("Failed to fetch forward column: ", column));
+    }
+    fields.push_back(table->schema()->field(0));
+    arrays.push_back(table->column(0));
+  }
+  return arrow::Table::Make(arrow::schema(std::move(fields)), std::move(arrays),
+                            static_cast<int64_t>(rows.size()));
+}
+
+namespace internal {
+Result<Doc::Ptr> fetch_document(Segment &segment, uint64_t doc_id) try {
+  if (auto *impl = dynamic_cast<SegmentImpl *>(&segment)) {
+    return impl->fetch_document(doc_id);
+  }
+  auto doc = segment.fetch(doc_id, std::nullopt, true);
+  if (!doc) {
+    return tl::make_unexpected(Status::InternalError("Fetch doc failed"));
+  }
+  return doc;
+} catch (const DocIdMap::ReadError &error) {
+  return tl::make_unexpected(error.status());
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient memory budget to read the document before update"));
+}
+
+arrow::Result<TablePtr> fetch_table(
+    const Segment &segment, const std::vector<std::string> &columns,
+    const std::vector<int> &segment_doc_ids) try {
+  if (const auto *impl = dynamic_cast<const SegmentImpl *>(&segment)) {
+    return impl->fetch_table(columns, segment_doc_ids);
+  }
+  // Keep other Segment implementations compatible with the existing interface.
+  auto table = segment.fetch(columns, segment_doc_ids);
+  if (!table) return arrow::Status::IOError("Segment forward fetch failed");
+  return table;
+} catch (const std::bad_alloc &) {
+  return arrow::Status::OutOfMemory("Segment forward fetch allocation failed");
+}
+
+Result<TablePtr> fetch_forward_batch(
+    Segment &segment, const std::vector<uint64_t> &doc_ids,
+    const std::optional<std::vector<std::string>> &output_fields,
+    arrow::MemoryPool *memory_pool) {
+  auto *impl = dynamic_cast<SegmentImpl *>(&segment);
+  if (!impl) {
+    return tl::make_unexpected(
+        Status::NotSupported("Unsupported Segment implementation"));
+  }
+  return impl->fetch_forward_batch(doc_ids, output_fields, memory_pool);
+}
+}  // namespace internal
+
+std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
+    const std::vector<uint64_t> &g_doc_ids,
+    const std::optional<std::vector<std::string>> &output_fields,
+    bool include_vector) {
+  std::vector<Doc::Ptr> docs(g_doc_ids.size());
+  size_t batch_rows = kMaxFetchBatchSize;
+  for (size_t begin = 0; begin < g_doc_ids.size();) {
+    // Keep row routing, forward values, and vectors consistent within a batch.
+    std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+    const size_t end = std::min(g_doc_ids.size(), begin + batch_rows);
+    std::vector<int> segment_doc_ids;
+    std::vector<size_t> output_positions;
+    segment_doc_ids.reserve(end - begin);
+    output_positions.reserve(end - begin);
+    for (size_t i = begin; i < end; ++i) {
+      auto local_id = doc_ids_.find(g_doc_ids[i]);
+      if (!local_id) {
+        if (local_id.error().code() != StatusCode::NOT_FOUND) {
+          throw DocIdMap::ReadError(local_id.error());
+        }
+        continue;
+      }
+      segment_doc_ids.push_back(static_cast<int>(*local_id));
+      output_positions.push_back(i);
+    }
+    if (segment_doc_ids.empty()) {
+      begin = end;
+      continue;
+    }
+
+    // Bound all temporary result arrays across columns, including the copy
+    // during reordering. Actual allocations still go through the shared pool.
+    // A single oversized document cannot be split; shared admission remains
+    // authoritative for that case.
+    detail::FetchMemoryPool workspace(query_memory_pool(),
+                                      end - begin == 1
+                                          ? std::numeric_limits<int64_t>::max()
+                                          : 4LL * 1024 * 1024);
+    auto columns = doc_forward_columns(output_fields);
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays;
+    fields.reserve(columns.size());
+    arrays.reserve(columns.size());
+    for (const auto &column : columns) {
+      // Updated columns may have different physical block/row layouts. Fetch
+      // each column's row list independently, still batching each row group.
+      auto table =
+          fetch_unsafe({column}, segment_doc_ids, /*strict=*/true, &workspace);
+      if (!table || table->num_columns() != 1 ||
+          table->num_rows() != static_cast<int64_t>(segment_doc_ids.size())) {
+        if (!workspace.exceeded()) {
+          LOG_ERROR("Batch fetch failed for column: %s", column.c_str());
+        }
+        arrays.clear();
+        break;
+      }
+      fields.push_back(table->schema()->field(0));
+      arrays.push_back(table->column(0));
+    }
+    if (arrays.size() != columns.size()) {
+      // Nested Arrow scalars can retain whole row groups while a batched
+      // fetch spans groups. Release every intermediate before trying the
+      // original one-document path, which needs fewer simultaneous pins.
+      arrays.clear();
+      fields.clear();
+      if (workspace.exceeded() && end - begin > 1) {
+        batch_rows = std::max<size_t>(1, (end - begin) / 2);
+        continue;
+      }
+      for (size_t output : output_positions) {
+        docs[output] =
+            fetch_doc_unsafe(g_doc_ids[output], output_fields, include_vector);
+      }
+      begin = end;
+      continue;
+    }
+    auto result_schema = std::make_shared<arrow::Schema>(std::move(fields));
+    for (size_t row = 0; row < segment_doc_ids.size(); ++row) {
+      std::vector<arrow::Datum> scalars;
+      scalars.reserve(arrays.size());
+      for (const auto &array : arrays) {
+        auto scalar =
+            detail::FetchScalarView(*array, static_cast<int64_t>(row));
+        if (!scalar.ok()) {
+          LOG_ERROR("Batch fetch scalar failed: %s",
+                    scalar.status().ToString().c_str());
+          break;
+        }
+        scalars.emplace_back(std::move(scalar).ValueOrDie());
+      }
+      if (scalars.size() != arrays.size()) {
+        continue;
+      }
+      const size_t output = output_positions[row];
+      auto batch =
+          std::make_shared<arrow::compute::ExecBatch>(std::move(scalars), 1);
+      docs[output] =
+          materialize_doc_unsafe(g_doc_ids[output], segment_doc_ids[row],
+                                 columns, result_schema, batch, include_vector);
+    }
+    begin = end;
+  }
+  return docs;
+}
+
+Doc::Ptr SegmentImpl::materialize_doc_unsafe(
+    uint64_t g_doc_id, int segment_doc_id,
+    const std::vector<std::string> &forward_columns,
+    const std::shared_ptr<arrow::Schema> &result_schema,
+    const ExecBatchPtr &exec_batch, bool include_vector, Status *read_status) {
   if (!exec_batch) {
     LOG_ERROR("Fetch failed, doc_id: %zu", (size_t)g_doc_id);
     return nullptr;
@@ -1162,20 +1535,35 @@ Doc::Ptr SegmentImpl::fetch(
     return nullptr;
   }
 
-  auto doc = std::make_shared<Doc>();
+  std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  if (!options_.enable_mmap_) {
+    detail::QueryResultEstimate estimate;
+    estimate.add(sizeof(Doc) + 256);
+    for (size_t i = 0; i < forward_columns.size(); ++i) {
+      estimate.add(192 + forward_columns[i].size() * 2);
+      const auto &value = (*exec_batch)[i].scalar();
+      if (value) estimate.value(*value);
+    }
+    memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+        &detail::SharedResultMemoryAllowance());
+    memory->add(estimate.bytes());
+  }
+  auto doc = detail::MakeQueryDocument(memory);
 
   // column 0 is the global doc_id
-  if (auto doc_id_scalar = std::static_pointer_cast<arrow::Int64Scalar>(
-          (*exec_batch)[0].scalar())) {
+  auto doc_id_scalar =
+      std::dynamic_pointer_cast<arrow::UInt64Scalar>((*exec_batch)[0].scalar());
+  if (doc_id_scalar && doc_id_scalar->is_valid) {
     doc->set_doc_id(doc_id_scalar->value);
   } else {
-    LOG_ERROR("Global doc id scalar is not of int64 type");
+    LOG_ERROR("Global doc id scalar is not a valid uint64");
     return nullptr;
   }
 
   // column 1 is the uid(pk)
   if (auto str_scalar = std::dynamic_pointer_cast<arrow::StringScalar>(
-          (*exec_batch)[1].scalar())) {
+          (*exec_batch)[1].scalar());
+      str_scalar && str_scalar->is_valid) {
     doc->set_pk(std::string(str_scalar->view()));
   } else {
     LOG_ERROR("Primary key scalar is not of string type");
@@ -1342,6 +1730,7 @@ Doc::Ptr SegmentImpl::fetch(
         auto vector_indexer = vector_indexers[block_idx];
         auto fetch_result = vector_indexer->fetch(block_doc_id);
         if (!fetch_result) {
+          if (read_status) *read_status = fetch_result.error();
           LOG_ERROR(
               "vector indexer fetch failed, block_doc_id: %d, block_idx: %d, "
               "segment_doc_id: %d",
@@ -1354,6 +1743,10 @@ Doc::Ptr SegmentImpl::fetch(
         if (!status.ok()) {
           LOG_ERROR("convert vector data buffer to doc field failed %s",
                     status.message().c_str());
+          if (read_status) {
+            *read_status = std::move(status);
+            return nullptr;
+          }
         }
       }
 
@@ -1374,6 +1767,10 @@ Doc::Ptr SegmentImpl::fetch(
           auto vector_indexer = iter->second;
           auto fetch_result = vector_indexer->fetch(block_doc_id);
           if (!fetch_result.has_value()) {
+            if (read_status) {
+              *read_status = fetch_result.error();
+              return nullptr;
+            }
             LOG_ERROR(
                 "vector indexer fetch failed, column: %s, doc_count: %lu, "
                 "mem_block_offset: %d, block_doc_id: %d",
@@ -1387,6 +1784,10 @@ Doc::Ptr SegmentImpl::fetch(
           if (!status.ok()) {
             LOG_ERROR("convert vector data buffer to doc field failed %s",
                       status.message().c_str());
+            if (read_status) {
+              *read_status = std::move(status);
+              return nullptr;
+            }
           }
         }
       } else {
@@ -1560,6 +1961,10 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
   vector_column_params::MergeOptions merge_options;
   if (concurrency == 0) {
     merge_options.pool = GlobalResource::Instance().optimize_thread_pool();
+    if (merge_options.pool == nullptr) {
+      return tl::make_unexpected(
+          Status::InternalError("Optimize thread pool initialization failed"));
+    }
     merge_options.write_concurrency =
         static_cast<uint32_t>(merge_options.pool->count());
   } else {
@@ -1571,7 +1976,25 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
   s = vector_indexer->flush();
   CHECK_RETURN_STATUS_EXPECTED(s);
 
+  s = reopen_vector_indexer_for_serving(vector_indexer);
+  CHECK_RETURN_STATUS_EXPECTED(s);
+
   return vector_indexer;
+}
+
+Status SegmentImpl::reopen_vector_indexer_for_serving(
+    const VectorColumnIndexer::Ptr &vector_indexer) {
+  if (options_.enable_mmap_) {
+    return Status::OK();
+  }
+  if (vector_indexer == nullptr) {
+    return Status::InvalidArgument("Vector indexer is null");
+  }
+
+  auto s = vector_indexer->close();
+  CHECK_RETURN_STATUS(s);
+  return vector_indexer->open(
+      vector_column_params::ReadOptions{false, false, true});
 }
 
 Status SegmentImpl::create_vector_index(
@@ -1818,6 +2241,9 @@ Status SegmentImpl::drop_vector_index(
   s = new_vector_indexer->flush();
   CHECK_RETURN_STATUS(s);
 
+  s = reopen_vector_indexer_for_serving(new_vector_indexer);
+  CHECK_RETURN_STATUS(s);
+
   (*vector_indexers)[column] = new_vector_indexer;
   new_segment_meta->remove_vector_persisted_block(
       column, vector_index_params->quantize_type() != QuantizeType::UNDEFINED);
@@ -1977,10 +2403,10 @@ Status SegmentImpl::create_scalar_index(const std::vector<std::string> &columns,
 
     new_scalar_indexer = InvertedIndexer::CreateAndOpen(
         collection_schema_->name(), new_invert_index_path, false,
-        inverted_fields, false);
+        inverted_fields, false, &s);
     if (!new_scalar_indexer) {
       LOG_ERROR("Failed to create scalar indexer");
-      return Status::InternalError("Failed to create scalar indexer");
+      return s;
     }
     for (const auto &field : fields) {
       if (std::find(inverted_field_names.begin(), inverted_field_names.end(),
@@ -1993,10 +2419,11 @@ Status SegmentImpl::create_scalar_index(const std::vector<std::string> &columns,
     }
   } else {
     new_scalar_indexer = InvertedIndexer::CreateAndOpen(
-        collection_schema_->name(), new_invert_index_path, true, fields, false);
+        collection_schema_->name(), new_invert_index_path, true, fields, false,
+        &s);
     if (!new_scalar_indexer) {
       LOG_ERROR("Failed to create scalar indexer");
-      return Status::InternalError("Failed to create scalar indexer");
+      return s;
     }
   }
 
@@ -2093,10 +2520,10 @@ Status SegmentImpl::drop_scalar_index(const std::vector<std::string> &columns,
   // The snapshot copy is mutated below to remove dropped columns and seal.
   auto new_scalar_indexer = InvertedIndexer::CreateAndOpen(
       collection_schema_->name(), new_invert_index_path, false, invert_fields,
-      false);
+      false, &s);
   if (!new_scalar_indexer) {
     LOG_ERROR("Failed to create scalar indexer");
-    return Status::InternalError("Failed to create scalar indexer");
+    return s;
   }
   for (const auto &field : drop_fields) {
     s = new_scalar_indexer->remove_column_indexer(field.name());
@@ -2336,11 +2763,13 @@ bool SegmentImpl::validate(const std::vector<std::string> &columns) const {
   return true;
 }
 
-TablePtr SegmentImpl::fetch_perf(
+arrow::Result<TablePtr> SegmentImpl::fetch_perf(
     const std::vector<std::string> &columns,
     const std::shared_ptr<arrow::Schema> &result_schema,
     const std::vector<int> &segment_doc_ids,
-    const std::vector<uint64_t> &chunk_offsets) const {
+    const std::vector<uint64_t> &chunk_offsets,
+    arrow::MemoryPool *memory_pool) const {
+  if (!memory_pool) memory_pool = query_memory_pool();
   std::vector<std::shared_ptr<arrow::ChunkedArray>> chunk_arrays;
   chunk_arrays.resize(columns.size());
 
@@ -2365,14 +2794,16 @@ TablePtr SegmentImpl::fetch_perf(
     if (segment_doc_id < 0 ||
         static_cast<uint64_t>(segment_doc_id) >= segment_meta_->doc_count()) {
       LOG_ERROR("Segment doc ID %d is out of bounds", segment_doc_id);
-      return nullptr;
+      return arrow::Status::IndexError("Segment row out of bounds: ",
+                                       segment_doc_id);
     }
 
     auto it = std::upper_bound(chunk_offsets.begin(), chunk_offsets.end(),
                                segment_doc_id);
     if (it == chunk_offsets.begin() || it == chunk_offsets.end()) {
       LOG_ERROR("Segment doc ID %d is out of chunk bounds", segment_doc_id);
-      return nullptr;
+      return arrow::Status::IndexError("Segment row outside chunks: ",
+                                       segment_doc_id);
     }
     int chunk_index =
         static_cast<int>(std::distance(chunk_offsets.begin(), it) - 1);
@@ -2387,10 +2818,10 @@ TablePtr SegmentImpl::fetch_perf(
     const auto &source_column = chunk_arrays[i];
     std::shared_ptr<arrow::Array> array;
     auto status = BuildArrayFromIndicesWithType(
-        source_column, chunk_row_indices_for_ids, &array);
+        source_column, chunk_row_indices_for_ids, &array, memory_pool);
     if (!status.ok()) {
       LOG_ERROR("BuildArrayFromIndices failed: %s", status.ToString().c_str());
-      return nullptr;
+      return status;
     }
     result_arrays[i] = array;
   }
@@ -2402,17 +2833,17 @@ TablePtr SegmentImpl::fetch_perf(
       values.push_back(segment_doc_id);
     }
 
-    arrow::UInt64Builder builder;
+    arrow::UInt64Builder builder(memory_pool);
     auto s = builder.AppendValues(values);
     if (!s.ok()) {
       LOG_ERROR("Failed to append values to builder: %s", s.message().c_str());
-      return nullptr;
+      return s;
     }
     std::shared_ptr<arrow::Array> array;
     s = builder.Finish(&array);
     if (!s.ok()) {
       LOG_ERROR("Failed to finish builder: %s", s.message().c_str());
-      return nullptr;
+      return s;
     }
     result_arrays[segment_row_id_col_index] = array;
   }
@@ -2461,10 +2892,12 @@ const std::vector<uint64_t> *SegmentImpl::get_fetch_perf_chunk_offsets(
   return &chunk_layout_offsets_[common_layout_id];
 }
 
-TablePtr SegmentImpl::fetch_normal(
+arrow::Result<TablePtr> SegmentImpl::fetch_normal(
     const std::vector<std::string> &columns,
     const std::shared_ptr<arrow::Schema> &result_schema,
-    const std::vector<int> &segment_doc_ids) const {
+    const std::vector<int> &segment_doc_ids, bool strict,
+    arrow::MemoryPool *memory_pool) const {
+  if (!memory_pool) memory_pool = query_memory_pool();
   // Store scalars per column: column_index -> (output_row, scalar)
   std::vector<std::vector<std::pair<int, std::shared_ptr<arrow::Scalar>>>>
       column_results(columns.size());
@@ -2525,7 +2958,8 @@ TablePtr SegmentImpl::fetch_normal(
 
       LOG_ERROR("Segment doc ID %d not found in segment %d", segment_doc_id,
                 meta()->id());
-      return nullptr;
+      return arrow::Status::IndexError("Segment row not found: ",
+                                       segment_doc_id);
     }
   }
 
@@ -2552,13 +2986,31 @@ TablePtr SegmentImpl::fetch_normal(
     std::shared_ptr<arrow::Table> block_table;
     if (block_index >= 0 &&
         block_index < static_cast<int>(persist_stores_.size())) {
-      block_table =
-          persist_stores_[block_index]->fetch(fetch_columns, fetch_block_rows);
+      auto buffer_store = std::dynamic_pointer_cast<BufferPoolForwardStore>(
+          persist_stores_[block_index]);
+      if (buffer_store) {
+        ARROW_ASSIGN_OR_RAISE(
+            block_table, buffer_store->fetch_checked(
+                             fetch_columns, fetch_block_rows, memory_pool));
+      } else {
+        block_table = persist_stores_[block_index]->fetch(fetch_columns,
+                                                          fetch_block_rows);
+      }
     } else if (block_index == -1 && memory_store_) {
       block_table = memory_store_->fetch(fetch_columns, fetch_block_rows);
     }
 
-    if (!block_table || block_table->num_rows() == 0) {
+    // A failed read is not a missing/nullable field. In particular, pool
+    // exhaustion must not fabricate an otherwise successful all-null result.
+    if (!block_table ||
+        block_table->num_rows() !=
+            static_cast<int64_t>(fetch_block_rows.size()) ||
+        block_table->num_columns() != static_cast<int>(fetch_columns.size())) {
+      LOG_ERROR("Batch fetch failed for forward block: %d", block_index);
+      return arrow::Status::IOError("Invalid forward fetch result for block: ",
+                                    block_index);
+    }
+    if (block_table->num_rows() == 0) {
       continue;
     }
 
@@ -2569,19 +3021,14 @@ TablePtr SegmentImpl::fetch_normal(
       if (col_it == columns.end()) continue;
       size_t col_index = std::distance(columns.begin(), col_it);
 
-      auto chunked_array = block_table->column(i)->chunks();
-      auto flat_array_res =
-          arrow::Concatenate(chunked_array, arrow::default_memory_pool());
-      if (!flat_array_res.ok()) {
-        LOG_ERROR("Concatenate failed: %s",
-                  flat_array_res.status().message().c_str());
-        return nullptr;
-      }
-      auto flat_array = flat_array_res.ValueOrDie();
-
       for (size_t j = 0; j < fetch_block_rows.size(); ++j) {
-        auto scalar_result = flat_array->GetScalar(j);
-        if (!scalar_result.ok()) continue;
+        auto scalar_result =
+            detail::FetchScalarView(*block_table->column(i), j);
+        if (!scalar_result.ok()) {
+          LOG_ERROR("Batch fetch scalar failed: %s",
+                    scalar_result.status().ToString().c_str());
+          return scalar_result.status();
+        }
         int output_row = output_to_result_index[j].first;
         column_results[col_index].emplace_back(
             output_row, std::move(scalar_result.ValueOrDie()));
@@ -2616,18 +3063,23 @@ TablePtr SegmentImpl::fetch_normal(
       if (it != result_vec.end()) {
         ordered_scalars.push_back(it->second);
       } else {
+        if (strict) {
+          LOG_ERROR("Batch fetch omitted column %s, row %d", col.c_str(), i);
+          return arrow::Status::Invalid("Forward fetch omitted column ", col,
+                                        ", row ", i);
+        }
         auto field = result_schema->GetFieldByName(col);
         ordered_scalars.push_back(
             arrow::MakeNullScalar(field ? field->type() : arrow::null()));
       }
     }
 
-    auto status = ConvertScalarVectorToArrayByType(ordered_scalars,
-                                                   &result_arrays[col_index]);
+    auto status = ConvertScalarVectorToArrayByType(
+        ordered_scalars, &result_arrays[col_index], memory_pool);
     if (!status.ok()) {
       LOG_ERROR("Failed to convert scalars to array for column '%s': %s",
                 col.c_str(), status.message().c_str());
-      return nullptr;
+      return status;
     }
   }
 
@@ -2640,17 +3092,17 @@ TablePtr SegmentImpl::fetch_normal(
       values.push_back(segment_row_id);
     }
 
-    arrow::UInt64Builder builder;
+    arrow::UInt64Builder builder(memory_pool);
     auto s = builder.AppendValues(values);
     if (!s.ok()) {
       LOG_ERROR("Failed to append values to builder: %s", s.message().c_str());
-      return nullptr;
+      return s;
     }
     std::shared_ptr<arrow::Array> array;
     s = builder.Finish(&array);
     if (!s.ok()) {
       LOG_ERROR("Failed to finish builder: %s", s.message().c_str());
-      return nullptr;
+      return s;
     }
     result_arrays[segment_row_id_col_index] = std::move(array);
   }
@@ -2672,11 +3124,33 @@ TablePtr SegmentImpl::fetch(const std::vector<std::string> &columns,
   return fetch_unsafe(columns, segment_doc_ids);
 }
 
-TablePtr SegmentImpl::fetch_unsafe(
+arrow::Result<TablePtr> SegmentImpl::fetch_table(
     const std::vector<std::string> &columns,
     const std::vector<int> &segment_doc_ids) const {
-  if (!validate(columns)) {
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  return fetch_checked(columns, segment_doc_ids, false, nullptr);
+}
+
+TablePtr SegmentImpl::fetch_unsafe(const std::vector<std::string> &columns,
+                                   const std::vector<int> &segment_doc_ids,
+                                   bool strict,
+                                   arrow::MemoryPool *memory_pool) const {
+  auto result = fetch_checked(columns, segment_doc_ids, strict, memory_pool);
+  if (!result.ok()) {
+    LOG_ERROR("Segment forward fetch failed: %s",
+              result.status().ToString().c_str());
     return nullptr;
+  }
+  return std::move(result).ValueOrDie();
+}
+
+arrow::Result<TablePtr> SegmentImpl::fetch_checked(
+    const std::vector<std::string> &columns,
+    const std::vector<int> &segment_doc_ids, bool strict,
+    arrow::MemoryPool *memory_pool) const try {
+  if (!memory_pool) memory_pool = query_memory_pool();
+  if (!validate(columns)) {
+    return arrow::Status::Invalid("Invalid segment fetch columns");
   }
 
   // Build result schema
@@ -2697,7 +3171,7 @@ TablePtr SegmentImpl::fetch_unsafe(
       if (!status.ok()) {
         LOG_ERROR("Convert field schema failed: %s",
                   field->to_string().c_str());
-        return nullptr;
+        return status;
       }
       fields.push_back(std::move(arrow_field));
     }
@@ -2709,26 +3183,32 @@ TablePtr SegmentImpl::fetch_unsafe(
   if (segment_doc_ids.empty()) {
     arrow::ArrayVector empty_arrays;
     for (const auto &field : fields) {
-      empty_arrays.push_back(arrow::MakeEmptyArray(field->type()).ValueOrDie());
+      ARROW_ASSIGN_OR_RAISE(auto array,
+                            arrow::MakeEmptyArray(field->type(), memory_pool));
+      empty_arrays.push_back(std::move(array));
     }
     return arrow::Table::Make(result_schema, empty_arrays, 0);
   }
 
   if (segment_meta_->doc_count() == 0) {
     LOG_ERROR("Segment has no rows");
-    return nullptr;
+    return arrow::Status::IndexError("Segment has no rows");
   }
 
   if (all_columns_same_chunk_layout_) {
     return fetch_perf(columns, result_schema, segment_doc_ids,
-                      chunk_layout_offsets_.front());
+                      chunk_layout_offsets_.front(), memory_pool);
   }
 
   const auto *chunk_offsets = get_fetch_perf_chunk_offsets(columns);
   if (chunk_offsets != nullptr) {
-    return fetch_perf(columns, result_schema, segment_doc_ids, *chunk_offsets);
+    return fetch_perf(columns, result_schema, segment_doc_ids, *chunk_offsets,
+                      memory_pool);
   }
-  return fetch_normal(columns, result_schema, segment_doc_ids);
+  return fetch_normal(columns, result_schema, segment_doc_ids, strict,
+                      memory_pool);
+} catch (const std::bad_alloc &) {
+  return arrow::Status::OutOfMemory("Segment forward fetch allocation failed");
 }
 
 ExecBatchPtr SegmentImpl::fetch(const std::vector<std::string> &columns,
@@ -3118,12 +3598,13 @@ Status SegmentImpl::reopen_invert_indexer(bool read_only) {
 
   // reopen invert indexer with read_only false
   invert_indexers_.reset();
-  invert_indexers_ = InvertedIndexer::CreateAndOpen(collection_schema_->name(),
-                                                    invert_index_path, false,
-                                                    inverted_fields, read_only);
+  Status open_status;
+  invert_indexers_ = InvertedIndexer::CreateAndOpen(
+      collection_schema_->name(), invert_index_path, false, inverted_fields,
+      read_only, &open_status);
   if (!invert_indexers_) {
     LOG_ERROR("Failed to create scalar indexer");
-    return Status::InternalError("Failed to create scalar indexer");
+    return open_status;
   }
   return Status::OK();
 }
@@ -3490,11 +3971,6 @@ Status SegmentImpl::alter_column(const std::string &column_name,
     persist_stores_.erase(persist_stores_.begin() + local_idx);
   }
 
-  if (!options_.enable_mmap_) {
-    zvec::ailego::MemoryLimitPool::get_instance().init(
-        GlobalConfig::Instance().memory_limit_bytes());
-  }
-
   // delete single column store file
   for (auto block_id : will_del_block_ids) {
     // delete forward store file
@@ -3583,11 +4059,6 @@ Status SegmentImpl::drop_column(const std::string &column_name) {
        idx >= 0; idx--) {
     int local_idx = will_del_local_block_idx[idx];
     persist_stores_.erase(persist_stores_.begin() + local_idx);
-  }
-
-  if (!options_.enable_mmap_) {
-    zvec::ailego::MemoryLimitPool::get_instance().init(
-        GlobalConfig::Instance().memory_limit_bytes());
   }
 
   // delete single column store file
@@ -3977,7 +4448,6 @@ const std::vector<BlockMeta> &SegmentImpl::get_persist_block_metas(
 }
 
 Status SegmentImpl::load_persist_scalar_blocks() {
-  doc_ids_.reserve(segment_meta_->doc_count());
   for (const auto &block : segment_meta_->persisted_blocks()) {
     if (block.type() == BlockType::SCALAR) {
       auto forward_path = FileHelper::MakeForwardBlockPath(
@@ -3997,6 +4467,9 @@ Status SegmentImpl::load_persist_scalar_blocks() {
         continue;
       }
       auto rb_reader = forward_store->scan({GLOBAL_DOC_ID});
+      if (!rb_reader) {
+        return Status::InternalError("Failed to create docid scan reader");
+      }
       while (true) {
         std::shared_ptr<arrow::RecordBatch> batch;
         auto status = rb_reader->ReadNext(&batch);
@@ -4016,8 +4489,10 @@ Status SegmentImpl::load_persist_scalar_blocks() {
           return Status::InternalError("Array type mismatch");
         }
         auto *values = uint64_array->raw_values();
-        doc_ids_.insert(doc_ids_.end(), values,
-                        values + uint64_array->length());
+        for (int64_t i = 0; i < uint64_array->length(); ++i) {
+          auto append_status = doc_ids_.append(values[i]);
+          CHECK_RETURN_STATUS(append_status);
+        }
       }
     }
   }
@@ -4044,11 +4519,13 @@ Status SegmentImpl::load_scalar_index_blocks(bool create) {
     auto block_id = allocate_block_id();
     auto invert_path = FileHelper::MakeInvertIndexPath(path_, id(), block_id);
     auto collection_name = collection_schema_->name();
+    Status open_status;
     invert_indexers_ = InvertedIndexer::CreateAndOpen(
-        collection_name, invert_path, true, fields, options_.read_only_);
+        collection_name, invert_path, true, fields, options_.read_only_,
+        &open_status);
     if (!invert_indexers_) {
       LOG_ERROR("Failed to open scalar indexer");
-      return Status::InternalError("Failed to open scalar indexer");
+      return open_status;
     }
 
     // scalar index block
@@ -4063,11 +4540,13 @@ Status SegmentImpl::load_scalar_index_blocks(bool create) {
         auto invert_path =
             FileHelper::MakeInvertIndexPath(path_, id(), block_id);
         auto collection_name = collection_schema_->name();
+        Status open_status;
         invert_indexers_ = InvertedIndexer::CreateAndOpen(
-            collection_name, invert_path, false, fields, options_.read_only_);
+            collection_name, invert_path, false, fields, options_.read_only_,
+            &open_status);
         if (!invert_indexers_) {
           LOG_ERROR("Failed to open scalar indexer");
-          return Status::InternalError("Failed to open scalar indexer");
+          return open_status;
         }
         return Status::OK();
       }
@@ -4176,7 +4655,7 @@ VectorColumnIndexer::Ptr SegmentImpl::create_vector_indexer(
 
   auto vector_indexer =
       std::make_shared<VectorColumnIndexer>(index_file_path, field);
-  vector_column_params::ReadOptions options{true, true};
+  vector_column_params::ReadOptions options{options_.enable_mmap_, true};
   auto status = vector_indexer->open(options);
   if (!status.ok()) {
     LOG_ERROR("Failed to open vector indexer for field: %s, err: %s",
@@ -4288,7 +4767,7 @@ Status SegmentImpl::init_memory_components() {
   return Status::OK();
 }
 
-Status SegmentImpl::recover() {
+Status SegmentImpl::recover() try {
   // recover mem block meta
   auto &mem_block = segment_meta_->writing_forward_block().value();
   doc_id_allocator_.store(mem_block.min_doc_id());
@@ -4308,7 +4787,8 @@ Status SegmentImpl::recover() {
       0) {
     LOG_ERROR("WAL recovery failed: unable to open WAL file [%s]",
               wal_file_path.c_str());
-    return Status::OK();
+    return Status::InternalError("Failed to open existing WAL file: ",
+                                 wal_file_path);
   }
   std::array<uint64_t, static_cast<size_t>(Operator::DELETE) + 1>
       recovered_doc_count{};
@@ -4330,12 +4810,36 @@ Status SegmentImpl::recover() {
 
   std::lock_guard<std::shared_mutex> lock(seg_mtx_);
 
+  // next() admits the actual record length before allocating its ordinary
+  // string. Only one record is live at a time: retain the largest record's
+  // allowance, not the sum of all records or the 4 MiB record-size ceiling.
+  detail::ResultMemoryAllowance::Lease read_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  size_t read_high_water = 0;
+  const WalFile::ReadAdmission admit_record = [&](size_t bytes) {
+    if (bytes > read_high_water) {
+      read_memory.add(bytes - read_high_water);
+      read_high_water = bytes;
+    }
+  };
   while (true) {
-    std::string buf = recover_wal_file->next();
+    std::string buf = recover_wal_file->next(admit_record);
     if (buf.empty()) {
+      CHECK_RETURN_STATUS(recover_wal_file->read_status());
       break;
     }
     total_recovered_doc_count++;
+    detail::ResultMemoryAllowance::Lease doc_memory(
+        options_.enable_mmap_ ? nullptr
+                              : &detail::SharedResultMemoryAllowance());
+    if (doc_memory.enabled()) {
+      size_t bytes = 0;
+      if (!detail::EstimateSerializedDocMemory(
+              reinterpret_cast<const uint8_t *>(buf.data()), buf.size(),
+              &bytes))
+        return Status::InternalError("WAL document deserialization failed");
+      doc_memory.add(bytes);
+    }
     auto doc = Doc::deserialize(reinterpret_cast<const uint8_t *>(buf.data()),
                                 buf.size());
     if (doc == nullptr) {
@@ -4343,25 +4847,33 @@ Status SegmentImpl::recover() {
           "WAL record recovery failed: path[%s], segment[%d], record[%zu], "
           "reason[deserialization failed]",
           wal_file_path.c_str(), id(), (size_t)total_recovered_doc_count);
-      continue;
+      return Status::InternalError("WAL document deserialization failed");
     }
 
+    detail::FtsWriteAdmission admission(!options_.enable_mmap_);
+    PreparedForward prepared;
+    if (doc->get_operator() != Operator::DELETE) {
+      CHECK_RETURN_STATUS(admit_fts_write(*doc, &admission));
+      auto result = prepare_forward_write(*doc);
+      if (!result) return result.error();
+      prepared = std::move(*result);
+    }
     Status status;
     switch (doc->get_operator()) {
       case Operator::INSERT: {
-        internal_insert(*doc);
+        status = internal_insert(*doc, admission, std::move(prepared));
         break;
       }
       case Operator::UPDATE: {
-        internal_update(*doc);
+        status = internal_update(*doc, admission, std::move(prepared));
         break;
       }
       case Operator::UPSERT: {
-        internal_upsert(*doc);
+        status = internal_upsert(*doc, admission, std::move(prepared));
         break;
       }
       case Operator::DELETE: {
-        internal_delete(*doc);
+        status = internal_delete(*doc);
         break;
       }
       default:
@@ -4370,6 +4882,7 @@ Status SegmentImpl::recover() {
             "operator[%d], reason[unknown operator]",
             wal_file_path.c_str(), id(), (size_t)total_recovered_doc_count,
             static_cast<int>(doc->get_operator()));
+        status = Status::InternalError("Unknown WAL operator");
         break;
     }
 
@@ -4379,7 +4892,9 @@ Status SegmentImpl::recover() {
           "operator[%d], reason[%s]",
           wal_file_path.c_str(), id(), (size_t)total_recovered_doc_count,
           static_cast<int>(doc->get_operator()), status.message().c_str());
-      continue;
+      // A failed replay (including admission failure) is not EOF and must
+      // not be reported as a successfully recovered collection.
+      return status;
     }
 
     recovered_doc_count[static_cast<size_t>(doc->get_operator())]++;
@@ -4417,6 +4932,9 @@ Status SegmentImpl::recover() {
   // member WAL, flush() treats the recovered memory components as empty and
   // returns without persisting them.
   return open_wal_file();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient memory budget for WAL recovery");
 }
 
 Status SegmentImpl::open_wal_file() {
@@ -4441,7 +4959,19 @@ Status SegmentImpl::open_wal_file() {
   return Status::OK();
 }
 
-Status SegmentImpl::append_wal(const Doc &doc) {
+Status SegmentImpl::append_wal(const Doc &doc) try {
+  // Enforce the reader's existing record limit before constructing a complete
+  // serialization buffer, and before opening/appending a WAL record.
+  const size_t serialized_bytes = doc.serialized_size();
+  if (serialized_bytes > WalFile::kMaxRecordSize) {
+    return Status::InvalidArgument("Document exceeds WAL record size limit");
+  }
+  detail::ResultMemoryAllowance::Lease wal_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  // serialize() reserves exactly this size. Keep allocator-retained backing
+  // charged after the transient vector is destroyed, and reject before WAL
+  // publication if the ordinary-heap allowance cannot grow.
+  wal_memory.add(serialized_bytes);
   std::vector<uint8_t> buf = doc.serialize();
 
   if (!wal_file_) {
@@ -4449,7 +4979,8 @@ Status SegmentImpl::append_wal(const Doc &doc) {
     CHECK_RETURN_STATUS(s);
   }
 
-  auto ret = wal_file_->append(std::string(buf.begin(), buf.end()));
+  auto ret = wal_file_->append(
+      std::string_view(reinterpret_cast<const char *>(buf.data()), buf.size()));
   if (ret != 0) {
     LOG_ERROR("WAL append failed: segment[%d], pk[%s], operator[%d], ret[%d]",
               id(), doc.pk_ref().c_str(), static_cast<int>(doc.get_operator()),
@@ -4461,6 +4992,11 @@ Status SegmentImpl::append_wal(const Doc &doc) {
   }
 
   return Status::OK();
+} catch (const std::length_error &) {
+  return Status::InvalidArgument("Serialized document size overflow");
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient memory for WAL serialization");
 }
 
 Status SegmentImpl::finish_memory_components() {
@@ -4496,6 +5032,8 @@ Status SegmentImpl::finish_memory_components() {
 
   // remove indexer from memory to persist
   for (auto &[column_name, indexer] : memory_vector_indexers_) {
+    s = reopen_vector_indexer_for_serving(indexer);
+    CHECK_RETURN_STATUS(s);
     auto block_id = memory_vector_block_ids_[column_name];
     BlockMeta vb =
         BlockMeta{block_id,          BlockType::VECTOR_INDEX, block.min_doc_id_,
@@ -4512,6 +5050,8 @@ Status SegmentImpl::finish_memory_components() {
 
   // remove quant indexer from memory to persist
   for (auto &[column_name, indexer] : quant_memory_vector_indexers_) {
+    s = reopen_vector_indexer_for_serving(indexer);
+    CHECK_RETURN_STATUS(s);
     auto block_id = quant_memory_vector_block_ids_[column_name];
     BlockMeta block_meta(block_id, BlockType::VECTOR_INDEX_QUANTIZE,
                          block.min_doc_id_, block.max_doc_id_, block.doc_count_,
@@ -4564,7 +5104,9 @@ Status SegmentImpl::get_global_doc_ids(std::vector<int64_t> &doc_ids) const {
     if (doc_id < 0 || static_cast<size_t>(doc_id) >= n) {
       return Status::InvalidArgument("segment_doc_id out of range: ", doc_id);
     }
-    doc_id = static_cast<int64_t>(doc_ids_[doc_id]);
+    auto global_id = doc_ids_.at(static_cast<size_t>(doc_id));
+    if (!global_id) return global_id.error();
+    doc_id = static_cast<int64_t>(*global_id);
   }
   return Status::OK();
 }
@@ -4577,7 +5119,7 @@ Result<uint64_t> SegmentImpl::get_global_doc_id(uint32_t segment_doc_id) const {
     return tl::make_unexpected(
         Status::InvalidArgument("segment_doc_id out of range"));
   }
-  return doc_ids_[segment_doc_id];
+  return doc_ids_.at(segment_doc_id);
 }
 
 
@@ -4646,14 +5188,14 @@ Status SegmentImpl::open_fts_indexers(bool create) {
     return Status::OK();
   }
 
+  Status open_status;
   if (create) {
     auto block_id = allocate_block_id();
     auto fts_path = FileHelper::MakeFtsIndexPath(seg_path_, block_id);
     fts_indexer_ = FtsIndexer::CreateAndOpen(
-        fts_path, collection_schema_->fts_fields(), true);
+        fts_path, collection_schema_->fts_fields(), true, false, &open_status);
     if (!fts_indexer_) {
-      return Status::InternalError("open_fts_indexers: create failed at [",
-                                   fts_path, "]");
+      return open_status;
     }
     segment_meta_->add_persisted_block(
         BlockMeta{block_id, BlockType::FTS_INDEX, 0, 0, 0, {}});
@@ -4663,10 +5205,9 @@ Status SegmentImpl::open_fts_indexers(bool create) {
         auto fts_path = FileHelper::MakeFtsIndexPath(seg_path_, block.id());
         fts_indexer_ = FtsIndexer::CreateAndOpen(
             fts_path, collection_schema_->fts_fields(), false,
-            options_.read_only_);
+            options_.read_only_, &open_status);
         if (!fts_indexer_) {
-          return Status::InternalError("open_fts_indexers: open failed at [",
-                                       fts_path, "]");
+          return open_status;
         }
         break;
       }
@@ -4691,16 +5232,33 @@ Status SegmentImpl::close_fts_indexers() {
   return Status::OK();
 }
 
-Status SegmentImpl::insert_fts_indexer(Doc &doc) {
+Status SegmentImpl::admit_fts_write(const Doc &doc,
+                                    detail::FtsWriteAdmission *admission) try {
+  if (!has_fts_) return Status::OK();
+  for (const auto &field : collection_schema_->fts_fields()) {
+    if (!doc.has_value(field->name())) continue;
+    const auto params =
+        std::dynamic_pointer_cast<FtsIndexParams>(field->index_params());
+    if (!params) return Status::InternalError("Missing FTS index parameters");
+    admission->add(*params, doc.get_ref<std::string>(field->name()));
+  }
+  return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient FTS write workspace budget before mutation");
+}
+
+Status SegmentImpl::insert_fts_indexer(
+    Doc &doc, const detail::FtsWriteAdmission &admission) {
   if (!has_fts_) {
     return Status::OK();
   }
   for (const auto &field : collection_schema_->fts_fields()) {
-    auto value = doc.get<std::string>(field->name());
-    if (value.has_value()) {
+    if (doc.has_value(field->name())) {
+      const auto &value = doc.get_ref<std::string>(field->name());
       auto segment_doc_id = doc_ids_.size();
-      auto s =
-          fts_indexer_->insert(field->name(), segment_doc_id, value.value());
+      auto s = fts_indexer_->insert(field->name(), segment_doc_id, value,
+                                    &admission);
       if (!s.ok()) {
         return s;
       }
@@ -4782,21 +5340,23 @@ Status SegmentImpl::create_fts_index(const std::string &column,
   new_schema->get_field(column)->set_index_params(index_params);
 
   FtsIndexer::Ptr new_fts_indexer;
+  Status open_status;
   if (fts_indexer_) {
     // Snapshot existing fts DB, then open the copy with current schema.
     auto s = fts_indexer_->create_snapshot(new_fts_path);
     CHECK_RETURN_STATUS(s);
 
     new_fts_indexer = FtsIndexer::CreateAndOpen(
-        new_fts_path, collection_schema_->fts_fields(), false);
+        new_fts_path, collection_schema_->fts_fields(), false, false,
+        &open_status);
   } else {
     // No existing fts DB — create a fresh one.
-    new_fts_indexer =
-        FtsIndexer::CreateAndOpen(new_fts_path, new_schema->fts_fields(), true);
+    new_fts_indexer = FtsIndexer::CreateAndOpen(
+        new_fts_path, new_schema->fts_fields(), true, false, &open_status);
   }
   if (!new_fts_indexer) {
     FileHelper::RemoveDirectory(new_fts_path);
-    return Status::InternalError("create_fts_index: failed to open snapshot");
+    return open_status;
   }
 
   // If the field already exists in the snapshot (params change), remove it
@@ -4913,10 +5473,10 @@ Status SegmentImpl::drop_fts_index(const std::string &column,
     CHECK_RETURN_STATUS(s);
 
     auto new_fts_indexer = FtsIndexer::CreateAndOpen(
-        new_fts_path, collection_schema_->fts_fields(), false);
+        new_fts_path, collection_schema_->fts_fields(), false, false, &s);
     if (!new_fts_indexer) {
       FileHelper::RemoveDirectory(new_fts_path);
-      return Status::InternalError("drop_fts_index: failed to open snapshot");
+      return s;
     }
 
     s = new_fts_indexer->remove_field_indexer(column);

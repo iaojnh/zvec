@@ -13,8 +13,11 @@
 // limitations under the License.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <zvec/db/status.h>
 
 
 namespace zvec {
@@ -30,6 +33,8 @@ struct WalOptions {
 
 class WalFile {
  public:
+  static constexpr size_t kMaxRecordSize = 4 * 1024 * 1024;
+
   //! Constructor
   WalFile() = default;
 
@@ -44,9 +49,19 @@ class WalFile {
                            const WalOptions &wal_options, WalFilePtr *wal_file);
 
  public:
-  virtual int append(std::string &&data) = 0;
+  // Synchronously consumes the view; callers keep its backing bytes alive
+  // until append returns. The WAL does not retain a second document copy.
+  virtual int append(std::string_view data) = 0;
   virtual int prepare_for_read() = 0;
-  virtual std::string next() = 0;
+  // Called after validating the record length, before allocating its payload.
+  // The caller keeps the admitted bytes alive until the returned string dies.
+  using ReadAdmission = std::function<void(size_t)>;
+  virtual std::string next(const ReadAdmission &admit = {}) = 0;
+
+  // An empty next() result is EOF only when this status is OK.
+  virtual Status read_status() const {
+    return Status::OK();
+  }
 
  public:
   //! Open and initialize WalFile

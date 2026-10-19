@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "memory_forward_store.h"
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,6 +29,8 @@
 #include <zvec/ailego/logger/logger.h>
 #include "db/common/constants.h"
 #include "db/index/storage/base_forward_store.h"
+#include "fetch_memory.h"
+#include "parquet_memory_pool.h"
 
 
 namespace zvec {
@@ -36,11 +39,16 @@ MemForwardStore::MemForwardStore(
     const std::shared_ptr<CollectionSchema> &collection_schema,
     const std::string &path, const FileFormat format,
     const uint32_t max_buffer_size)
-    : schema_(collection_schema),
+    : cache_memory_(format == FileFormat::PARQUET
+                        ? &detail::SharedResultMemoryAllowance()
+                        : nullptr),
+      schema_(collection_schema),
       path_(path),
       format_(format),
       max_cache_size_(max_buffer_size / 100),
       max_buffer_size_(max_buffer_size) {
+  cache_memory_bytes_ = 128 * sizeof(Doc);
+  cache_memory_.add(cache_memory_bytes_);
   cache_.reserve(128);
 }
 
@@ -61,9 +69,16 @@ Status MemForwardStore::open() {
   return Status::OK();
 }
 
-RecordBatchBuilderPtr MemForwardStore::create_builder() {
-  auto result = arrow::RecordBatchBuilder::Make(physic_schema_,
-                                                arrow::default_memory_pool());
+arrow::MemoryPool *MemForwardStore::query_memory_pool() const {
+  return format_ == FileFormat::PARQUET ? detail::GetParquetMemoryPool().get()
+                                        : arrow::default_memory_pool();
+}
+
+RecordBatchBuilderPtr MemForwardStore::create_builder(bool query) {
+  auto result = arrow::RecordBatchBuilder::Make(
+      physic_schema_, query || format_ == FileFormat::PARQUET
+                          ? query_memory_pool()
+                          : arrow::default_memory_pool());
   if (!result.ok()) {
     LOG_ERROR("failed to create RecordBatchBuilder: %s",
               result.status().ToString().c_str());
@@ -94,13 +109,14 @@ bool MemForwardStore::validate(const std::vector<std::string> &columns) const {
 // Notice: This function just convert the docs to arrow::ArrayBuilder, not clean
 // the cache_.
 arrow::Status MemForwardStore::append_doc_to_builder(
-    const Doc &doc, RecordBatchBuilderPtr &rb_builder) {
+    const Doc &doc, RecordBatchBuilderPtr &rb_builder,
+    std::optional<uint64_t> doc_id) {
   auto &fields = physic_schema_->fields();
 
   // global doc_id
   auto gid_builder =
       dynamic_cast<arrow::UInt64Builder *>(rb_builder->GetField(0));
-  ARROW_RETURN_NOT_OK(gid_builder->Append(doc.doc_id()));
+  ARROW_RETURN_NOT_OK(gid_builder->Append(doc_id.value_or(doc.doc_id())));
 
   // user id(pk)
   auto uid_builder =
@@ -118,6 +134,8 @@ arrow::Status MemForwardStore::append_doc_to_builder(
 
 arrow::Status MemForwardStore::convert_to_builder(
     RecordBatchBuilderPtr &rb_builder) {
+  if (!rb_builder)
+    return arrow::Status::OutOfMemory("Cannot allocate forward builder");
   for (const auto &doc : cache_) {
     ARROW_RETURN_NOT_OK(append_doc_to_builder(doc, rb_builder));
   }
@@ -125,37 +143,82 @@ arrow::Status MemForwardStore::convert_to_builder(
 }
 
 Status MemForwardStore::insert(const Doc &doc) {
-  std::lock_guard lock(cache_mtx_);
-  cache_.emplace_back(doc);
-  num_rows_++;
-  auto doc_bytes = doc.memory_usage();
-  total_cache_bytes_ = total_cache_bytes_ + (uint32_t)doc_bytes;
-  if (total_cache_bytes_ < max_cache_size_) {
-    return Status::OK();
-  }
-  // Flush cache when it reaches max size
-  auto rb_builder = create_builder();
-  auto status = convert_to_builder(rb_builder);
-  if (!status.ok()) {
-    return Status::InternalError("convertToBuilder error: ", status.ToString());
-  }
-  auto result = rb_builder->Flush(false);
-  if (!result.ok()) {
-    return Status::InternalError("flush error: ", result.status().ToString());
-  }
-  auto batch = result.ValueOrDie();
-  int64_t rb_size = MemorySize(*batch);
-  batches_.push_back(batch);
-
-  total_rb_bytes_ = total_rb_bytes_ + (uint32_t)rb_size;
-  cache_.clear();
-  total_cache_bytes_ = 0;
-
+  auto prepared = prepare_insert(doc, doc.doc_id());
+  if (!prepared) return prepared.error();
+  commit_insert(std::move(*prepared));
   return Status::OK();
 }
 
-arrow::Result<RecordBatchPtr> MemForwardStore::convert_to_record_batch() {
+Result<std::unique_ptr<MemForwardStore::PreparedInsert>>
+MemForwardStore::prepare_insert(const Doc &doc, uint64_t doc_id) try {
+  auto prepared = std::make_unique<PreparedInsert>(cache_mtx_);
+  const size_t bytes = doc.memory_usage();
+  if (bytes > std::numeric_limits<size_t>::max() - total_cache_bytes_)
+    throw std::bad_alloc();
+  prepared->cache_bytes = total_cache_bytes_ + bytes;
+  if (prepared->cache_bytes < max_cache_size_) {
+    const size_t capacity =
+        cache_.size() == cache_.capacity()
+            ? std::max(cache_.size() + 1, cache_.capacity() * 2)
+            : cache_.capacity();
+    if (capacity >
+        (std::numeric_limits<size_t>::max() - prepared->cache_bytes) /
+            sizeof(Doc))
+      throw std::bad_alloc();
+    const size_t target = prepared->cache_bytes + capacity * sizeof(Doc);
+    if (target > cache_memory_bytes_) {
+      cache_memory_.add(target - cache_memory_bytes_);
+      cache_memory_bytes_ = target;
+    }
+    prepared->doc = doc;
+    prepared->doc.set_doc_id(doc_id);
+    if (cache_.size() == cache_.capacity()) cache_.reserve(capacity);
+    return prepared;
+  }
+  if (batches_.size() == batches_.capacity())
+    batches_.reserve(std::max(batches_.size() + 1, batches_.capacity() * 2));
   auto rb_builder = create_builder();
+  auto status = convert_to_builder(rb_builder);
+  if (status.ok()) status = append_doc_to_builder(doc, rb_builder, doc_id);
+  if (!status.ok())
+    return tl::make_unexpected(Status(status.IsOutOfMemory()
+                                          ? StatusCode::RESOURCE_EXHAUSTED
+                                          : StatusCode::INTERNAL_ERROR,
+                                      status.ToString()));
+  auto result = rb_builder->Flush(false);
+  if (!result.ok())
+    return tl::make_unexpected(Status(result.status().IsOutOfMemory()
+                                          ? StatusCode::RESOURCE_EXHAUSTED
+                                          : StatusCode::INTERNAL_ERROR,
+                                      result.status().ToString()));
+  prepared->batch = std::move(result).ValueOrDie();
+  prepared->batch_bytes = static_cast<size_t>(MemorySize(*prepared->batch));
+  if (prepared->batch_bytes >
+      std::numeric_limits<size_t>::max() - total_rb_bytes_)
+    throw std::bad_alloc();
+  return prepared;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient forward write buffer budget"));
+}
+
+void MemForwardStore::commit_insert(std::unique_ptr<PreparedInsert> prepared) {
+  if (prepared->batch) {
+    total_rb_bytes_ += prepared->batch_bytes;
+    batches_.push_back(std::move(prepared->batch));
+    cache_.clear();
+    total_cache_bytes_ = 0;
+  } else {
+    cache_.emplace_back(std::move(prepared->doc));
+    total_cache_bytes_ = prepared->cache_bytes;
+  }
+  ++num_rows_;
+}
+
+arrow::Result<RecordBatchPtr> MemForwardStore::convert_to_record_batch(
+    bool query) {
+  auto rb_builder = create_builder(query);
   ARROW_RETURN_NOT_OK(convert_to_builder(rb_builder));
   ARROW_ASSIGN_OR_RAISE(auto batch, rb_builder->Flush(false));
   return batch;
@@ -199,7 +262,7 @@ bool MemForwardStore::locate_single_source(const std::vector<int> &indices,
     }
   }
   // Build a batch out of just the requested cache rows.
-  auto rb_builder = create_builder();
+  auto rb_builder = create_builder(/*query=*/true);
   if (rb_builder == nullptr) {
     return false;
   }
@@ -226,17 +289,28 @@ arrow::Result<TablePtr> MemForwardStore::apply_row_and_column_selection(
     const TablePtr &table, const std::vector<int> &indices,
     const std::vector<std::string> &columns) {
   std::shared_ptr<arrow::Table> filtered_table = table;
+  // Project before Take: copying all payload columns for an ID-only fetch
+  // multiplies memory by concurrent readers without improving the result.
+  if (!columns.empty()) {
+    std::vector<int> column_indices;
+    for (const auto &name : columns) {
+      if (name == LOCAL_ROW_ID) continue;
+      const int column = table->schema()->GetFieldIndex(name);
+      if (column >= 0) column_indices.push_back(column);
+    }
+    ARROW_ASSIGN_OR_RAISE(filtered_table, table->SelectColumns(column_indices));
+  }
   if (!indices.empty()) {
     // Filter rows by indices if provided
     std::shared_ptr<arrow::Array> index_array;
-    arrow::Int32Builder builder;
+    arrow::Int32Builder builder(query_memory_pool());
     ARROW_RETURN_NOT_OK(builder.AppendValues(indices));
     ARROW_RETURN_NOT_OK(builder.Finish(&index_array));
 
-    arrow::Datum input_datum(table);
+    arrow::Datum input_datum(filtered_table);
     arrow::Datum index_datum(index_array);
 
-    arrow::compute::ExecContext ctx;
+    arrow::compute::ExecContext ctx(query_memory_pool());
     arrow::Datum result_datum;
     ARROW_ASSIGN_OR_RAISE(
         result_datum,
@@ -245,24 +319,7 @@ arrow::Result<TablePtr> MemForwardStore::apply_row_and_column_selection(
     filtered_table = result_datum.table();
   }
 
-  std::shared_ptr<arrow::Table> selected_table = filtered_table;
-  if (!columns.empty()) {
-    // Select only specified columns
-    std::vector<int> column_indices;
-    for (const auto &column_name : columns) {
-      if (column_name == LOCAL_ROW_ID) continue;
-      int index = filtered_table->schema()->GetFieldIndex(column_name);
-      if (index != -1) {
-        column_indices.push_back(index);
-      }
-    }
-
-    if (!column_indices.empty()) {
-      ARROW_ASSIGN_OR_RAISE(selected_table,
-                            filtered_table->SelectColumns(column_indices));
-    }
-  }
-  return selected_table;
+  return filtered_table;
 }
 
 arrow::Result<TablePtr> MemForwardStore::convert_to_table(
@@ -278,7 +335,7 @@ arrow::Result<TablePtr> MemForwardStore::convert_to_table(
   }
 
   std::shared_ptr<arrow::RecordBatch> batch;
-  ARROW_ASSIGN_OR_RAISE(batch, convert_to_record_batch());
+  ARROW_ASSIGN_OR_RAISE(batch, convert_to_record_batch(/*query=*/true));
   std::vector<std::shared_ptr<arrow::RecordBatch>> all_batches = batches_;
   if (batch->num_rows() > 0) {
     all_batches.push_back(batch);
@@ -354,6 +411,19 @@ Status MemForwardStore::flush_locked() {
     }
 
     if (!batches_to_merge.empty()) {
+      if (format_ == FileFormat::PARQUET) {
+        // The Parquet writer consumes chunked columns directly; concatenating
+        // them first needlessly overlaps a full extra payload with the input.
+        auto table = arrow::Table::FromRecordBatches(batches_to_merge);
+        if (!table.ok())
+          return Status::InternalError(table.status().ToString());
+        auto written = writer_->write(**table);
+        if (!written.ok()) return Status::InternalError(written.ToString());
+        flushed_batches_ = end_index;
+        has_incr = true;
+        start_index = end_index;
+        continue;
+      }
       std::shared_ptr<arrow::RecordBatch> batch_to_write;
 
       if (batches_to_merge.size() == 1) {
@@ -417,8 +487,9 @@ Status MemForwardStore::close() {
 
 TablePtr MemForwardStore::get_table() {
   std::shared_lock<std::shared_mutex> lock(cache_mtx_);
-  std::shared_ptr<arrow::RecordBatch> batch =
-      convert_to_record_batch().ValueOrDie();
+  auto result = convert_to_record_batch(/*query=*/true);
+  if (!result.ok()) return nullptr;
+  auto batch = std::move(result).ValueOrDie();
   std::vector<std::shared_ptr<arrow::RecordBatch>> all_batches = batches_;
   if (batch->num_rows() > 0) {
     all_batches.push_back(batch);
@@ -464,6 +535,7 @@ TablePtr MemForwardStore::fetch(const std::vector<std::string> &columns,
 
   auto result = convert_to_table(data_columns, indices);
   if (!result.ok()) {
+    if (result.status().IsOutOfMemory()) throw std::bad_alloc();
     LOG_ERROR("failed to convert to table: %s",
               result.status().ToString().c_str());
     return nullptr;
@@ -491,7 +563,7 @@ TablePtr MemForwardStore::fetch(const std::vector<std::string> &columns,
 
   if (need_local_doc_id) {
     std::shared_ptr<arrow::Array> rowid_array;
-    arrow::UInt64Builder builder;
+    arrow::UInt64Builder builder(query_memory_pool());
 
     std::vector<uint64_t> indices_i64(indices.begin(), indices.end());
     auto status = builder.AppendValues(indices_i64);
@@ -530,6 +602,7 @@ ExecBatchPtr MemForwardStore::fetch(const std::vector<std::string> &columns,
 
   auto result = convert_to_table(columns, std::vector<int>{index});
   if (!result.ok()) {
+    if (result.status().IsOutOfMemory()) throw std::bad_alloc();
     LOG_ERROR("failed to convert to table: %s",
               result.status().ToString().c_str());
     return nullptr;
@@ -542,7 +615,7 @@ ExecBatchPtr MemForwardStore::fetch(const std::vector<std::string> &columns,
   scalars.reserve(columns.size());
   for (const auto &column : columns) {
     const auto &array = table->GetColumnByName(column);
-    auto scalar_result = array->GetScalar(0);
+    auto scalar_result = detail::FetchScalarView(*array, 0);
     if (!scalar_result.ok()) {
       LOG_ERROR("failed to get column %s scalar from array: %s", column.c_str(),
                 scalar_result.status().ToString().c_str());

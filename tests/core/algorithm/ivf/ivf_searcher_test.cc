@@ -30,6 +30,7 @@
 #include "ivf_builder.h"
 #include "ivf_dumper.h"
 #include "ivf_streamer.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic push
@@ -2659,7 +2660,7 @@ TEST_F(IVFSearcherTest, KeyedBruteForceWithEmptyQuantizedCentroids) {
         meta.set_metric("InnerProduct", 0, Params());
         meta.set_major_order(order);
         IndexCluster::CentroidList centroid_list;
-        std::vector<IndexConverter::Pointer> quantizers;
+        zvec::ailego::BudgetedVector<IndexConverter::Pointer> quantizers;
         for (float value : centroids) {
           NumericalVector<float> centroid(dimension_);
           for (size_t d = 0; d < dimension_; ++d) {
@@ -2694,6 +2695,8 @@ TEST_F(IVFSearcherTest, KeyedBruteForceWithEmptyQuantizedCentroids) {
         auto posting_meta = quantizers.front()->meta();
         posting_meta.set_major_order(order);
         IVFDumper postings(posting_meta, dumper, centroids.size());
+        // Every layout has two populated lists with ten vectors each.
+        ASSERT_EQ(0, postings.reserve_keys(20));
         for (size_t i = 0; i < centroids.size(); ++i) {
           // Write only two lists, leaving leading, interior and trailing gaps.
           if (centroids[i] == 0.0f) {
@@ -3174,7 +3177,7 @@ TEST_F(IVFSearcherTest, TestProvider) {
 }
 
 TEST_F(IVFSearcherTest, ProviderReleasesStorageBeforeThreadExit) {
-  auto &memory_pool = MemoryLimitPool::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   const size_t previous_capacity = memory_pool.capacity();
   ASSERT_EQ(0u, memory_pool.used());
   ASSERT_EQ(0, memory_pool.init(8 * 1024 * 1024));
@@ -4190,6 +4193,91 @@ TEST_F(IVFSearcherTest, TestNprobeClampToListCount) {
   EXPECT_EQ(0, ret);
 }
 
+TEST_F(IVFSearcherTest, BoundedBatchMatchesSingleQueriesAndKeepsScratchSmall) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  for (const std::string &metric : {"SquaredEuclidean", "InnerProduct"}) {
+    for (const std::string &quantizer :
+         {"", "HalfFloatConverter", "Int8QuantizerConverter",
+          "Int4QuantizerConverter"}) {
+      SCOPED_TRACE(metric + "/" + quantizer);
+      ASSERT_EQ(0, pool.init(0));
+      index_meta_.set_metric(metric, 0, Params());
+      prepare_index_holder(100, 137);
+      Params build_params;
+      build_params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4");
+      build_params.set(PARAM_IVF_BUILDER_QUANTIZER_CLASS, quantizer);
+      IVFBuilder builder;
+      ASSERT_EQ(0, builder.init(index_meta_, build_params));
+      // Use the real trainer: InnerProduct carries an augmented centroid
+      // representation which the fixed Euclidean test trainer does not emit.
+      ASSERT_EQ(0, builder.train(threads_, holder_));
+      ASSERT_EQ(0, builder.build(threads_, holder_));
+      auto dumper = IndexFactory::CreateDumper("FileDumper");
+      ASSERT_EQ(0, dumper->create(index_path_));
+      ASSERT_EQ(0, builder.dump(dumper));
+      ASSERT_EQ(0, dumper->close());
+      auto storage = IndexFactory::CreateStorage("MMapFileReadStorage");
+      ASSERT_EQ(0, storage->init(Params()));
+      ASSERT_EQ(0, storage->open(index_path_, false));
+      IVFSearcher searcher;
+      Params options;
+      options.set(PARAM_IVF_SEARCHER_NPROBE, 4);
+      options.set(PARAM_IVF_SEARCHER_BRUTE_FORCE_THRESHOLD, 1);
+      ASSERT_EQ(0, searcher.init(options));
+      ASSERT_EQ(0, searcher.load(storage, nullptr));
+      constexpr size_t queries = 257;
+      std::vector<float> data(queries * dimension_);
+      for (size_t q = 0; q < queries; ++q)
+        for (size_t d = 0; d < dimension_; ++d)
+          data[q * dimension_ + d] =
+              static_cast<float>((q * 17) % 137) + 0.125f;
+      IndexQueryMeta qmeta(IndexMeta::DT_FP32, dimension_);
+      for (size_t budget : {size_t{0}, size_t{4 * 1024 * 1024}}) {
+        ASSERT_EQ(0, pool.init(budget));
+        for (bool brute : {false, true}) {
+          auto batch = searcher.create_context();
+          auto single = searcher.create_context();
+          ASSERT_NE(nullptr, batch);
+          ASSERT_NE(nullptr, single);
+          for (auto *context : {batch.get(), single.get()}) {
+            context->set_topk(3);
+            context->set_threshold(1e10f);
+            context->set_filter([](uint64_t key) { return key % 7 == 0; });
+          }
+          ASSERT_EQ(0, brute ? searcher.search_bf_impl(data.data(), qmeta,
+                                                       queries, batch)
+                             : searcher.search_impl(data.data(), qmeta, queries,
+                                                    batch));
+          auto *ivf_ctx = dynamic_cast<IVFSearcherContext *>(batch.get());
+          ASSERT_NE(nullptr, ivf_ctx);
+          // std::string may round reserved capacity to an allocation boundary.
+          EXPECT_LE(ivf_ctx->entity()->query_workspace_bytes(),
+                    32u * qmeta.element_size() + 64);
+          for (size_t q = 0; q < queries; ++q) {
+            single->reset();
+            const float *one = data.data() + q * dimension_;
+            ASSERT_EQ(0, brute ? searcher.search_bf_impl(one, qmeta, single)
+                               : searcher.search_impl(one, qmeta, single));
+            const auto &expected = single->result();
+            const auto &actual = batch->result(q);
+            ASSERT_EQ(expected.size(), actual.size());
+            for (size_t i = 0; i < actual.size(); ++i) {
+              EXPECT_EQ(expected[i].key(), actual[i].key());
+              EXPECT_FLOAT_EQ(expected[i].score(), actual[i].score());
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic pop
 #endif
@@ -4467,6 +4555,7 @@ TEST_P(IVFTurboTest, PostingFormatDetection) {
     ASSERT_EQ(0, dumper->create(path_ + ".format"));
     // Reproduce the earlier Turbo format without the new metadata attribute.
     IVFDumper postings(posting_meta, dumper, 1, 8);
+    ASSERT_EQ(0, postings.reserve_keys(codes_.size()));
     for (size_t i = 0; i < codes_.size(); ++i) {
       ASSERT_EQ(0, postings.dump_inverted_vector(0, Key(i), codes_[i].data()));
     }

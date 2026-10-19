@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -20,6 +20,7 @@
 #include <ailego/parallel/lock.h>
 #include <ailego/utility/memory_helper.h>
 #include <sparsehash/dense_hash_map>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/core/framework/index_framework.h>
 #include "algorithm/hnsw/hnsw_chunk.h"
@@ -44,6 +45,19 @@ class VamanaStreamerEntity : public VamanaEntity {
  public:
   // Virtual interface implementation
   int cleanup() override;
+
+  bool failed_build() const {
+    return failed_build_.load();
+  }
+  void mark_failed_build() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mark_failed_build_unlocked();
+  }
+  void mark_failed_build_unlocked() {
+    failed_build_.store(true);
+    mutable_header()->graph.options |= kGraphBuildFailed;
+    broker_->mark_dirty();
+  }
   const VamanaEntity::Pointer clone() const override;
   key_t get_key(node_id_t id) const override;
   const void *get_vector(node_id_t id) const override;
@@ -172,7 +186,9 @@ class VamanaStreamerEntity : public VamanaEntity {
 
  protected:
   template <class Key, class T>
-  using HashMap = google::dense_hash_map<Key, T, std::hash<Key>>;
+  using HashMap = google::dense_hash_map<
+      Key, T, std::hash<Key>, std::equal_to<Key>,
+      ailego::BudgetedAllocator<std::pair<const Key, T>>>;
   template <class Key, class T>
   using HashMapPointer = std::shared_ptr<HashMap<Key, T>>;
 
@@ -182,7 +198,7 @@ class VamanaStreamerEntity : public VamanaEntity {
                        bool get_vector_enabled, bool use_key_info_map,
                        std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
                        const HashMapPointer<key_t, node_id_t> &keys_map,
-                       std::vector<Chunk::Pointer> &&node_chunks,
+                       ailego::BudgetedVector<Chunk::Pointer> &&node_chunks,
                        const ChunkBroker::Pointer &broker)
       : stats_(stats),
         chunk_size_(chunk_size),
@@ -203,7 +219,7 @@ class VamanaStreamerEntity : public VamanaEntity {
   //! Protected by node_chunks_mutex_ to synchronize with add_vector's
   //! emplace_back during concurrent build.
   void sync_chunks(ChunkBroker::ChunkType type, size_t idx,
-                   std::vector<Chunk::Pointer> *chunks) const {
+                   ailego::BudgetedVector<Chunk::Pointer> *chunks) const {
     if (ailego_likely(idx < chunks->size())) {
       return;
     }
@@ -315,6 +331,7 @@ class VamanaStreamerEntity : public VamanaEntity {
 
  protected:
   IndexStreamer::Stats &stats_;
+  std::atomic<bool> failed_build_{false};
   std::mutex mutex_{};
   size_t max_index_size_{0UL};
   uint32_t chunk_size_{kDefaultChunkSize};
@@ -333,10 +350,10 @@ class VamanaStreamerEntity : public VamanaEntity {
   //! Protects node_chunks_ against concurrent emplace_back from add_vector
   //! (writer) and sync_chunks from greedy_search (reader threads during build).
   mutable std::mutex node_chunks_mutex_{};
-  mutable std::vector<Chunk::Pointer> node_chunks_{};
+  mutable ailego::BudgetedVector<Chunk::Pointer> node_chunks_{};
 
  private:
-  mutable std::vector<Chunk::Pointer> dist_chunks_{};
+  mutable ailego::BudgetedVector<Chunk::Pointer> dist_chunks_{};
   bool dist_loaded_{false};
   uint32_t dist_entry_size_{0};  // max_degree * sizeof(dist_t)
 };
@@ -357,7 +374,7 @@ VamanaStreamerEntity::get_neighbors_typed<MmapMemoryBlock>(node_id_t id) const {
   size_t ret = node_chunks_[chunk_idx]->read(offset, ptr, neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<MmapMemoryBlock>();
+    throw GraphStorageError{node_chunks_[chunk_idx]->read_error()};
   }
   MmapMemoryBlock block(const_cast<void *>(ptr.data()));
   return NeighborsT<MmapMemoryBlock>(std::move(block));
@@ -377,7 +394,7 @@ VamanaStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
       node_chunks_[chunk_idx]->read_borrowed(offset, mem_block, neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<BufferPoolMemoryBlock>();
+    throw GraphStorageError{node_chunks_[chunk_idx]->read_error()};
   }
   return NeighborsT<BufferPoolMemoryBlock>(std::move(mem_block));
 }
@@ -394,7 +411,7 @@ inline int VamanaStreamerEntity::get_vector_typed<MmapMemoryBlock>(
     size_t ret = node_chunks_[loc.first]->read(loc.second, ptr, vector_size());
     if (ailego_unlikely(ret != vector_size())) {
       LOG_ERROR("Read vector failed, ret=%zu", ret);
-      return IndexError_ReadData;
+      return node_chunks_[loc.first]->read_error();
     }
     vec_blocks[i].reset(const_cast<void *>(ptr.data()));
   }
@@ -414,7 +431,7 @@ inline int VamanaStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
                                                         vector_size());
     if (ailego_unlikely(ret != vector_size())) {
       LOG_ERROR("Read vector failed, ret=%zu", ret);
-      return IndexError_ReadData;
+      return node_chunks_[loc.first]->read_error();
     }
     vec_blocks[i] = std::move(mem_block);
   }
@@ -462,6 +479,11 @@ class VamanaMmapStreamerEntity : public VamanaStreamerEntity {
   using TypedNeighbors = NeighborsT<MmapMemoryBlock>;
 
   using VamanaStreamerEntity::VamanaStreamerEntity;
+
+  int cleanup() override {
+    decltype(node_chunk_bases_)().swap(node_chunk_bases_);
+    return VamanaStreamerEntity::cleanup();
+  }
 
   VamanaStorageMode storage_mode() const override {
     return VamanaStorageMode::kMmap;
@@ -550,7 +572,7 @@ class VamanaMmapStreamerEntity : public VamanaStreamerEntity {
   }
 
   mutable std::mutex chunk_bases_mutex_{};
-  mutable std::vector<const char *> node_chunk_bases_{};
+  mutable ailego::BudgetedVector<const char *> node_chunk_bases_{};
 };
 
 // --- Typed entity subclass for buffer pool mode ---
@@ -599,6 +621,11 @@ class VamanaContiguousStreamerEntity : public VamanaMmapStreamerEntity {
   const VamanaEntity::Pointer clone() const override;
 
   ~VamanaContiguousStreamerEntity() override = default;
+
+  int cleanup() override {
+    degrade_to_mmap();
+    return VamanaMmapStreamerEntity::cleanup();
+  }
 
   // Build contiguous memory from chunks after open.
   int build_contiguous_memory();
@@ -769,6 +796,7 @@ class VamanaContiguousStreamerEntity : public VamanaMmapStreamerEntity {
 
  private:
   static char *allocate_contiguous(size_t size);
+  static std::shared_ptr<char> allocate_budgeted_contiguous(size_t size);
 
   ailego_force_inline const char *packed_graph_row(node_id_t id) const {
     return graph_base_ + static_cast<size_t>(id) * graph_stride_;

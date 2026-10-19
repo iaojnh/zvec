@@ -18,6 +18,7 @@
 
 #include <ailego/pattern/defer.h>
 #include <rocksdb/merge_operator.h>
+#include "db/index/column/posting_merge.h"
 #include "inverted_codec.h"
 
 
@@ -26,84 +27,27 @@ namespace zvec {
 
 class InvertedRocksdbValueMerger : public rocksdb::MergeOperator {
  public:
-  bool FullMergeV2(const MergeOperationInput &merge_in,
-                   MergeOperationOutput *merge_out) const override {
-    if (merge_in.existing_value == nullptr &&
-        merge_in.operand_list.size() == 1) {
-      merge_out->new_value = std::string(merge_in.operand_list[0].data(),
-                                         merge_in.operand_list[0].size());
+  bool FullMergeV2(const MergeOperationInput &in,
+                   MergeOperationOutput *out) const override {
+    if (!in.existing_value && in.operand_list.size() == 1) {
+      out->existing_operand = in.operand_list.front();
       return true;
     }
-
-    merge_out->new_value.clear();
-
-    Status s;
-    roaring_bitmap_t *bitmap{nullptr};
-    if (merge_in.existing_value != nullptr) {
-      s = InvertedIndexCodec::Deserialize(merge_in.existing_value->data(),
-                                          merge_in.existing_value->size(),
-                                          &bitmap);
-      if (!s.ok()) {
-        LOG_ERROR("Failed to deserialize existing value");
-        return false;
-      }
-    } else {
-      bitmap = roaring_bitmap_create();
-      if (!bitmap) {
-        LOG_ERROR("Failed to create bitmap");
-        return false;
-      }
-    }
-    AILEGO_DEFER([&]() { roaring_bitmap_free(bitmap); });
-
-    for (const rocksdb::Slice &m : merge_in.operand_list) {
-      s = InvertedIndexCodec::merge_or(m.data(), m.size(), true, bitmap);
-      if (!s.ok()) {
-        LOG_ERROR("Failed to merge bitmap");
-        return false;
-      }
-    }
-    roaring_bitmap_repair_after_lazy(bitmap);
-
-    s = InvertedIndexCodec::Serialize(bitmap, &(merge_out->new_value));
-    if (s.ok()) {
+    if (in.existing_value && in.operand_list.empty()) {
+      out->existing_operand = *in.existing_value;
       return true;
-    } else {
-      LOG_ERROR("Failed to serialize bitmap");
-      return false;
     }
+    return detail::PostingMerge::merge(
+        in.operand_list.data(), in.operand_list.size(), in.existing_value, true,
+        &out->new_value);
   }
 
-
-  bool PartialMerge(const rocksdb::Slice & /*key*/,
-                    const rocksdb::Slice &left_operand,
-                    const rocksdb::Slice &right_operand, std::string *new_value,
-                    rocksdb::Logger * /*logger*/) const override {
-    roaring_bitmap_t *bitmap{nullptr};
-    auto s = InvertedIndexCodec::Deserialize(left_operand.data(),
-                                             left_operand.size(), &bitmap);
-    if (!s.ok()) {
-      LOG_ERROR("Failed to deserialize existing value");
-      return false;
-    }
-    AILEGO_DEFER([&]() { roaring_bitmap_free(bitmap); });
-
-    s = InvertedIndexCodec::merge_or(right_operand.data(), right_operand.size(),
-                                     false, bitmap);
-    if (!s.ok()) {
-      LOG_ERROR("Failed to merge bitmap");
-      return false;
-    }
-
-    s = InvertedIndexCodec::Serialize(bitmap, new_value);
-    if (s.ok()) {
-      return true;
-    } else {
-      LOG_ERROR("Failed to serialize bitmap");
-      return false;
-    }
+  bool PartialMerge(const rocksdb::Slice &, const rocksdb::Slice &left,
+                    const rocksdb::Slice &right, std::string *out,
+                    rocksdb::Logger *) const override {
+    const rocksdb::Slice inputs[]{left, right};
+    return detail::PostingMerge::merge(inputs, 2, nullptr, true, out);
   }
-
 
   const char *Name() const override {
     return "InvertedRocksdbValueMerger";

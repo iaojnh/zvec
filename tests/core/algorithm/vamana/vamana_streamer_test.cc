@@ -14,6 +14,7 @@
 #include "vamana_streamer.h"
 #include <sys/stat.h>
 #include <sys/types.h>
+#include "vamana_algorithm.h"
 #include "vamana_context.h"
 #ifndef _MSC_VER
 #include <fcntl.h>
@@ -44,6 +45,22 @@ using namespace zvec::ailego;
 
 namespace zvec {
 namespace core {
+
+class RejectVamanaDistanceStorage : public VamanaMmapStreamerEntity {
+ public:
+  using VamanaMmapStreamerEntity::VamanaMmapStreamerEntity;
+  int ensure_dist_storage() override {
+    return IndexError_NoMemory;
+  }
+};
+
+TEST(VamanaMemoryBudget, RefusedDistanceStorageDoesNotPublishEntryPoint) {
+  IndexStreamer::Stats stats;
+  RejectVamanaDistanceStorage entity(stats);
+  VamanaAlgorithm<VamanaMmapStreamerEntity> algorithm(entity);
+  EXPECT_EQ(int(IndexError_NoMemory), algorithm.add_node(0, nullptr));
+  EXPECT_EQ(kInvalidNodeId, entity.entry_point());
+}
 
 constexpr size_t kDim = 16;
 

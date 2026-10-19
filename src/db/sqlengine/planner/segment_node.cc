@@ -23,63 +23,36 @@ namespace zvec::sqlengine {
 
 namespace cp = arrow::compute;
 
-arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>>
-SegmentNode::gen() {
-  return [self = shared_from_this()]()
-             -> arrow::Future<std::optional<arrow::compute::ExecBatch>> {
-    if (!self->prepared_.exchange(true)) {
-      auto status = self->prepare();
-      if (!status.ok()) {
-        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-            arrow::Status::ExecutionError("prepare segment node failed:",
-                                          status.c_str()));
+arrow::AsyncGenerator<std::optional<cp::ExecBatch>> SegmentNode::gen() {
+  return [self = shared_from_this()] {
+    using Batch = std::optional<cp::ExecBatch>;
+    // Scalar queries do not need every segment's candidates simultaneously.
+    // Preserve reverse traversal, start one bounded source at a time, and never
+    // block the CPU executor waiting for a child plan on that same executor.
+    return arrow::Loop([self]() -> arrow::Future<arrow::ControlFlow<Batch>> {
+      try {
+        if (!self->current_) {
+          if (self->segment_plans_.empty()) return arrow::Break(Batch{});
+          auto result =
+              self->segment_plans_.back()->execute_to_generator(64 * 1024);
+          if (!result)
+            return arrow::Status::ExecutionError(result.error().message());
+          self->current_ = std::move(*result);
+          self->segment_plans_.pop_back();
+        }
+        return self->current_().Then(
+            [self](const Batch &batch) -> arrow::ControlFlow<Batch> {
+              if (batch) return arrow::Break(batch);
+              self->current_ = {};
+              return arrow::ControlFlow<Batch>{};
+            });
+      } catch (const std::bad_alloc &) {
+        return arrow::Status::OutOfMemory("Segment stream allocation failed");
+      } catch (const std::exception &error) {
+        return arrow::Status::ExecutionError(error.what());
       }
-    }
-    // process backward
-    std::shared_ptr<arrow::RecordBatch> batch;
-    while (!self->readers_.empty()) {
-      auto &back = self->readers_.back();
-      auto status = back->ReadNext(&batch);
-      if (!status.ok()) {
-        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-            arrow::Status::ExecutionError("read next batch failed:",
-                                          status.ToString()));
-      }
-      if (batch == nullptr) {
-        LOG_DEBUG("batch finished: %p", back.get());
-        self->readers_.pop_back();
-        continue;
-      }
-      LOG_INFO("Segment batch: %p %s", back.get(), batch->ToString().c_str());
-      cp::ExecBatch exec_batch(*batch);
-      return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          std::move(exec_batch));
-    };
-    // 返回空的optional表示结束
-    return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-        std::nullopt);
+    });
   };
 }
-
-Status SegmentNode::prepare() {
-  auto group = thread_pool_->make_group();
-
-  std::vector<Result<std::unique_ptr<arrow::RecordBatchReader>>> results;
-  results.resize(segment_plans_.size());
-  for (size_t i = 0; i < segment_plans_.size(); i++) {
-    auto &plan = segment_plans_[i];
-    group->execute([&, i]() { results[i] = plan->execute_to_reader(); });
-  }
-  group->wait_finish();
-  for (size_t i = 0; i < segment_plans_.size(); i++) {
-    auto &result = results[i];
-    if (!result) {
-      return result.error();
-    }
-    readers_[i] = std::move(result.value());
-  }
-  return Status::OK();
-}
-
 
 }  // namespace zvec::sqlengine

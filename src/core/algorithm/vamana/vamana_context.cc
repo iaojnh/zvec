@@ -100,7 +100,7 @@ int VamanaContext::init(ContextType type) {
         return ret;
       }
       candidates_.limit(max_scan_num_);
-      check_need_adjuct_ctx();
+      if (!check_need_adjuct_ctx()) return IndexError_NoMemory;
       break;
 
     default:

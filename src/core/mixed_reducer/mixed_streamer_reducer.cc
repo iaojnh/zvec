@@ -13,9 +13,11 @@
 // limitations under the License.
 #include "mixed_streamer_reducer.h"
 #include <cstring>
+#include <limits>
 #include <ailego/pattern/defer.h>
 #include <turbo/quantizer/quantizer.h>
 #include <utility/sparse_utility.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/ailego/utility/string_helper.h>
@@ -33,7 +35,18 @@ namespace {
 
 template <IndexMeta::DataType DT, typename T>
 int MaterializeMergedInput(const MergedProviderIndexHolder::Pointer &source,
-                           IndexHolder::Pointer *output) {
+                           IndexHolder::Pointer *output) try {
+  // Legacy builders need stable pointers until dump. Admit the snapshot
+  // before copying it, and keep the allowance alive with the retained holder.
+  struct Owner {
+    ailego::MemoryReservation memory;
+    std::shared_ptr<MultiPassIndexHolder<DT>> snapshot;
+  };
+  auto owner = std::make_shared<Owner>();
+  constexpr size_t overhead = 2 * sizeof(ailego::NumericalVector<T>) + 64;
+  if (source->element_size() > std::numeric_limits<size_t>::max() - overhead)
+    return IndexError_Overflow;
+  owner->memory.add_array(source->count(), source->element_size() + overhead);
   auto snapshot =
       std::make_shared<MultiPassIndexHolder<DT>>(source->dimension());
   snapshot->reserve(source->count());
@@ -71,8 +84,11 @@ int MaterializeMergedInput(const MergedProviderIndexHolder::Pointer &source,
   if (snapshot->count() != source->count()) {
     return IndexError_Mismatch;
   }
-  *output = std::move(snapshot);
+  owner->snapshot = snapshot;
+  *output = IndexHolder::Pointer(std::move(owner), snapshot.get());
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 }  // namespace
@@ -669,7 +685,10 @@ int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
   return 0;
 }
 
-int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) {
+int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) try {
+  ailego::MemoryReservation source_memory;
+  source_memory.add_array(streamers_.size(),
+                          sizeof(MergedProviderIndexHolder::Source));
   std::vector<MergedProviderIndexHolder::Source> sources;
   sources.reserve(streamers_.size());
 
@@ -698,7 +717,7 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) {
   }
 
   auto holder = std::make_shared<MergedProviderIndexHolder>(
-      original_query_meta_, std::move(sources));
+      original_query_meta_, std::move(sources), std::move(source_memory));
   int ret = holder->init(filter, stop_flag_);
   if (ret != 0) {
     LOG_ERROR("Failed to initialize merged provider holder, ret=%d", ret);
@@ -710,11 +729,14 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) {
 
   AILEGO_DEFER([&]() { holder->set_stop_flag(nullptr); });
   IndexHolder::Pointer target_holder = holder;
-  // IVF and DiskAnn propagate source read failures during dump.
+  // IVF and DiskAnn propagate source read failures during dump. IVF RaBitQ
+  // consumes its input during train/build, checking every read, and dumps
+  // only its owned paged output. None needs a full in-memory input snapshot.
   // Other builders retain an owned multipass snapshot, as before, so their
   // dump paths never depend on a source provider or its deferred error state.
   if (target_builder_->name() != "IVFBuilder" &&
-      target_builder_->name() != "DiskAnnBuilder") {
+      target_builder_->name() != "DiskAnnBuilder" &&
+      target_builder_->name() != "IvfRabitqBuilder") {
     switch (holder->data_type()) {
       case IndexMeta::DataType::DT_FP32:
         ret = MaterializeMergedInput<IndexMeta::DataType::DT_FP32, float>(
@@ -737,6 +759,8 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) {
     }
   }
   return this->index_build(std::move(target_holder));
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int MixedStreamerReducer::index_build(IndexHolder::Pointer target_holder) {

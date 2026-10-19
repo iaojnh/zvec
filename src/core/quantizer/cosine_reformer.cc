@@ -15,6 +15,7 @@
 #include <ailego/algorithm/integer_quantizer.h>
 #include <ailego/math/norm2_matrix.h>
 #include <ailego/math/normalizer.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/turbo/turbo.h>
@@ -84,10 +85,9 @@ class CosineReformer : public IndexReformer {
     if (enable_rotate_ || storage->get(ROTATOR_SEG_ID)) {
       int ret = Rotator::open(&rotator_, storage);
       if (ret != 0) {
-        if (enable_rotate_) {
-          LOG_ERROR("CosineReformer: load rotator failed, ret=%d", ret);
-          return ret;
-        }
+        // A present rotator is required to interpret the stored vectors.
+        // Admission/read failure must not silently disable rotation.
+        return ret;
       } else {
         enable_rotate_ = true;
         LOG_DEBUG("CosineReformer: rotator auto-loaded, dim=%zu",
@@ -99,12 +99,13 @@ class CosineReformer : public IndexReformer {
 
   //! Unload index
   int unload() override {
+    rotator_.reset();
     return 0;
   }
 
   //! Transform query
   int transform(const void *query, const IndexQueryMeta &qmeta,
-                std::string *out, IndexQueryMeta *ometa) const override {
+                std::string *out, IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType type = qmeta.data_type();
 
     if (type == IndexMeta::DataType::DT_FP32) {
@@ -137,8 +138,8 @@ class CosineReformer : public IndexReformer {
       }
 
       // Fast path: no rotation — matches main branch behavior exactly
-      std::string normalized_buffer(reinterpret_cast<const char *>(query),
-                                    qmeta.element_size());
+      ailego::BudgetedString normalized_buffer(
+          reinterpret_cast<const char *>(query), qmeta.element_size());
       float *buf = reinterpret_cast<float *>(&normalized_buffer[0]);
 
       if (enable_rotate_ && rotator_) {
@@ -196,6 +197,10 @@ class CosineReformer : public IndexReformer {
     }
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Transform queries
@@ -223,7 +228,7 @@ class CosineReformer : public IndexReformer {
   }
 
   int revert(const void *in, const IndexQueryMeta &qmeta,
-             std::string *out) const override {
+             std::string *out) const override try {
     IndexMeta::DataType type = qmeta.data_type();
 
     if (type != IndexMeta::DataType::DT_FP32 &&
@@ -307,6 +312,10 @@ class CosineReformer : public IndexReformer {
     }
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
  private:

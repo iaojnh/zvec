@@ -211,6 +211,8 @@ int HNSWIndex::create_and_init_streamer(const BaseIndexParam &param) {
     // TODO: use index params'  default query param here
     proxima_index_params_.set(core::PARAM_HNSW_SPARSE_STREAMER_EF,
                               kDefaultHnswEfSearch);
+    proxima_index_params_.set(core::PARAM_HNSW_SPARSE_STREAMER_USE_ID_MAP,
+                              param_.use_id_map);
     streamer_ = core::IndexFactory::CreateStreamer("HnswSparseStreamer");
 
   } else {

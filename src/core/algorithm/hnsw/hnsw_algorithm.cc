@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "hnsw_algorithm.h"
+#include <mutex>
+#include <ailego/pattern/defer.h>
 
 namespace zvec {
 namespace core {
 
 template <typename EntityType>
 int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
-                                        HnswContext *ctx) {
+                                        HnswContext *ctx) try {
   spin_lock_.lock();
 
   auto cur_max_level = entity_.cur_max_level();
@@ -30,13 +32,14 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
   }
   spin_lock_.unlock();
 
+  std::unique_lock<decltype(mutex_)> level_lock(mutex_, std::defer_lock);
   if (ailego_unlikely(level > cur_max_level)) {
-    mutex_.lock();
+    level_lock.lock();
     // re-check max level
     cur_max_level = entity_.cur_max_level();
     entry_point = entity_.entry_point();
     if (level <= cur_max_level) {
-      mutex_.unlock();
+      level_lock.unlock();
     }
   }
 
@@ -62,14 +65,19 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
     spin_lock_.lock();
     entity_.update_ep_and_level(id, level);
     spin_lock_.unlock();
-    mutex_.unlock();
+    level_lock.unlock();
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  ctx->release_build_workspace();
+  return IndexError_NoMemory;
 }
 
 template <typename EntityType>
-int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
+int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const try {
   spin_lock_.lock();
   auto max_level = entity_.cur_max_level();
   auto entry_point = entity_.entry_point();
@@ -95,10 +103,19 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
   }
 
   if (ctx->group_by_search()) {
-    expand_neighbors_by_group(ctx);
+    try {
+      expand_neighbors_by_group(ctx);
+    } catch (const std::bad_alloc &) {
+      ctx->group_topk_heaps().clear();
+      return IndexError_NoMemory;
+    }
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <typename EntityType>
@@ -137,10 +154,10 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
 
     bool find_closer = false;
 
-    std::vector<float> dists(size);
-    std::vector<const void *> neighbor_vecs(size);
-    std::vector<const void *> neighbor_extra_values(has_extra_values ? size
-                                                                     : 0);
+    ailego::BudgetedVector<float> dists(size);
+    ailego::BudgetedVector<const void *> neighbor_vecs(size);
+    ailego::BudgetedVector<const void *> neighbor_extra_values(
+        has_extra_values ? size : 0);
     if (ailego_unlikely(use_provider)) {
       for (uint32_t i = 0; i < size; ++i) {
         neighbor_vecs[i] = provider_vec_blocks[i].data();
@@ -228,11 +245,11 @@ void fast_search_neighbors(const EntityType &entity, HeapType &pool,
   pool.push_block(&entry_dist, &entry_point, 1);
 
   uint32_t buf_capacity = max_deg;
-  std::vector<node_id_t> neighbor_ids(buf_capacity);
-  std::vector<float> dists(buf_capacity);
-  std::vector<const void *> neighbor_vecs(buf_capacity);
+  ailego::BudgetedVector<node_id_t> neighbor_ids(buf_capacity);
+  ailego::BudgetedVector<float> dists(buf_capacity);
+  ailego::BudgetedVector<const void *> neighbor_vecs(buf_capacity);
   const bool has_extra_values = ctx->has_extra_values();
-  std::vector<const void *> neighbor_extra_values(
+  ailego::BudgetedVector<const void *> neighbor_extra_values(
       has_extra_values ? buf_capacity : 0);
 
   while (pool.has_next()) {
@@ -315,13 +332,13 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
   pool.push_block(&entry_dist, &entry_point, 1);
 
   uint32_t buf_capacity = max_deg;
-  std::vector<node_id_t> neighbor_ids(buf_capacity);
-  std::vector<float> dists(buf_capacity);
-  std::vector<const void *> neighbor_vecs(buf_capacity);
+  ailego::BudgetedVector<node_id_t> neighbor_ids(buf_capacity);
+  ailego::BudgetedVector<float> dists(buf_capacity);
+  ailego::BudgetedVector<const void *> neighbor_vecs(buf_capacity);
   std::vector<MemBlockType> neighbor_vec_blocks;
   neighbor_vec_blocks.reserve(buf_capacity);
   const bool has_extra_values = ctx->has_extra_values();
-  std::vector<const void *> neighbor_extra_values(
+  ailego::BudgetedVector<const void *> neighbor_extra_values(
       has_extra_values ? buf_capacity : 0);
 
   while (pool.has_next()) {
@@ -393,14 +410,14 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
       ctx->pl() > 0 ? ctx->pl() : (entity.vector_size() + 63) / 64;
 
   uint32_t buf_capacity = entity.max_degree(level);
-  std::vector<node_id_t> neighbor_ids(buf_capacity);
+  ailego::BudgetedVector<node_id_t> neighbor_ids(buf_capacity);
   std::vector<MemBlockType> neighbor_vec_blocks;
   neighbor_vec_blocks.reserve(buf_capacity);
   std::vector<IndexStorage::MemoryBlock> provider_vec_blocks;
-  std::vector<float> dists(buf_capacity);
-  std::vector<const void *> neighbor_vecs(buf_capacity);
+  ailego::BudgetedVector<float> dists(buf_capacity);
+  ailego::BudgetedVector<const void *> neighbor_vecs(buf_capacity);
   const bool has_extra_values = ctx->has_extra_values();
-  std::vector<const void *> neighbor_extra_values(
+  ailego::BudgetedVector<const void *> neighbor_extra_values(
       has_extra_values ? buf_capacity : 0);
 
   const bool use_provider = dc.has_provider();
@@ -553,8 +570,10 @@ void HnswAlgorithm<EntityType>::search_neighbors(level_t level,
 }
 
 template <typename EntityType>
-int HnswAlgorithm<EntityType>::dispatch_search_neighbors(
-    node_id_t entry_point, dist_t entry_dist, HnswContext *ctx) const {
+int HnswAlgorithm<EntityType>::dispatch_search_neighbors(node_id_t entry_point,
+                                                         dist_t entry_dist,
+                                                         HnswContext *ctx) const
+    try {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   const uint32_t prefetch_lines =
       ctx->pl() > 0 ? ctx->pl() : (entity.vector_size() + 63) / 64;
@@ -582,6 +601,10 @@ int HnswAlgorithm<EntityType>::dispatch_search_neighbors(
     return IndexError_Runtime;
   }
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <typename EntityType>
@@ -597,7 +620,7 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
   };
 
   // devide into groups
-  std::map<std::string, TopkHeap> &group_topk_heaps = ctx->group_topk_heaps();
+  auto &group_topk_heaps = ctx->group_topk_heaps();
   ctx->search_heap().for_each([&](node_id_t id, dist_t score) {
     std::string group_id = group_by(id);
 
@@ -642,7 +665,7 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         (*ctx->mutable_stats_get_neighbors())++;
       }
 
-      std::vector<node_id_t> neighbor_ids(neighbors.size());
+      ailego::BudgetedVector<node_id_t> neighbor_ids(neighbors.size());
       uint32_t size = 0;
       for (uint32_t i = 0; i < neighbors.size(); ++i) {
         node_id_t node = neighbors[i];
@@ -669,11 +692,11 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         break;
       }
 
-      std::vector<float> dists(size);
-      std::vector<const void *> neighbor_vecs(size);
+      ailego::BudgetedVector<float> dists(size);
+      ailego::BudgetedVector<const void *> neighbor_vecs(size);
       const bool has_extra_values = ctx->has_extra_values();
-      std::vector<const void *> neighbor_extra_values(has_extra_values ? size
-                                                                       : 0);
+      ailego::BudgetedVector<const void *> neighbor_extra_values(
+          has_extra_values ? size : 0);
       for (uint32_t i = 0; i < size; ++i) {
         neighbor_vecs[i] = neighbor_vec_blocks[i].data();
         if (has_extra_values) {
@@ -717,7 +740,8 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
   uint32_t max_neighbor_cnt = entity_.neighbor_cnt(level);
   if (topk_heap.size() <= static_cast<size_t>(entity_.prune_cnt())) {
     if (topk_heap.size() <= static_cast<size_t>(max_neighbor_cnt)) {
-      entity_.update_neighbors(level, id, topk_heap.container());
+      CheckGraphStorage(
+          entity_.update_neighbors(level, id, topk_heap.container()));
       return;
     }
   }
@@ -728,6 +752,7 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
         static_cast<const EntityType &>(ctx->get_entity());
     auto &prune_ids = ctx->prune_ids();
     auto &prune_blocks = ctx->prune_blocks();
+    AILEGO_DEFER([&] { prune_blocks.clear(); });
     auto &selected_indices = ctx->prune_selected_indices();
 
     prune_ids.clear();
@@ -820,7 +845,7 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
   }
 
   topk_heap.truncate(cur_size);
-  entity_.update_neighbors(level, id, topk_heap.container());
+  CheckGraphStorage(entity_.update_neighbors(level, id, topk_heap.container()));
 
   return;
 }
@@ -852,6 +877,7 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
     // order exactly.
     auto &candidate_ids = ctx->prune_ids();
     auto &candidate_blocks = ctx->prune_blocks();
+    AILEGO_DEFER([&] { candidate_blocks.clear(); });
 
     candidate_ids.clear();
     candidate_ids.reserve(size + 2);
@@ -916,7 +942,8 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
     for (auto &selected : update_heap.mutable_container()) {
       selected.first = candidate_ids[selected.first];
     }
-    entity_.update_neighbors(level, id, update_heap.container());
+    CheckGraphStorage(
+        entity_.update_neighbors(level, id, update_heap.container()));
 
     node_lock.unlock();
     update_heap.clear();
@@ -955,7 +982,8 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
     }
 
     update_heap.truncate(cur_size);
-    entity_.update_neighbors(level, id, update_heap.container());
+    CheckGraphStorage(
+        entity_.update_neighbors(level, id, update_heap.container()));
     update_heap.clear();
   }
 

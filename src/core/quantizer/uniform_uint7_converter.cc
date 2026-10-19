@@ -18,6 +18,7 @@
 #include <vector>
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/interface/index_param.h>
 #include <zvec/turbo/turbo.h>
@@ -304,7 +305,7 @@ class UniformUint7Converter : public IndexConverter {
       }
 
       const UniformUint7Holder *owner_{nullptr};
-      std::vector<int8_t> buffer_{};
+      ailego::BudgetedVector<int8_t> buffer_{};
       IndexHolder::Iterator::Pointer front_iter_{};
       int status_{0};
     };

@@ -18,6 +18,7 @@
 #include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
 #include "algorithm/hnsw_rabitq/rabitq_reformer.h"
+#include "utility/group_candidate_collector.h"
 #include "zvec/ailego/container/params.h"
 #include "zvec/ailego/logger/logger.h"
 #include "hnsw_rabitq_algorithm.h"
@@ -45,7 +46,7 @@ HnswRabitqStreamer::~HnswRabitqStreamer() {
 }
 
 int HnswRabitqStreamer::init(const IndexMeta &imeta,
-                             const ailego::Params &params) {
+                             const ailego::Params &params) try {
   meta_ = imeta;
   meta_.set_streamer("HnswRabitqStreamer", HnswRabitqEntity::kRevision, params);
 
@@ -237,9 +238,13 @@ int HnswRabitqStreamer::init(const IndexMeta &imeta,
   state_ = STATE_INITED;
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int HnswRabitqStreamer::cleanup() {
+int HnswRabitqStreamer::cleanup() try {
   if (state_ == STATE_OPENED) {
     this->close();
   }
@@ -276,9 +281,13 @@ int HnswRabitqStreamer::cleanup() {
   get_vector_enabled_ = false;
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int HnswRabitqStreamer::open(IndexStorage::Pointer stg) {
+int HnswRabitqStreamer::open(IndexStorage::Pointer stg) try {
   LOG_INFO("HnswRabitqStreamer open");
 
   if (ailego_unlikely(state_ != STATE_INITED)) {
@@ -412,9 +421,13 @@ int HnswRabitqStreamer::open(IndexStorage::Pointer stg) {
       entity_, reformer_->num_clusters(), reformer_->rabitq_metric_type()));
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int HnswRabitqStreamer::close() {
+int HnswRabitqStreamer::close() try {
   LOG_INFO("HnswRabitqStreamer close");
 
   stats_.clear();
@@ -427,17 +440,27 @@ int HnswRabitqStreamer::close() {
   state_ = STATE_INITED;
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int HnswRabitqStreamer::flush(uint64_t checkpoint) {
+int HnswRabitqStreamer::flush(uint64_t checkpoint) try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   LOG_INFO("HnswRabitqStreamer flush checkpoint=%zu", (size_t)checkpoint);
 
   meta_.set_metric(metric_->name(), 0, metric_->params());
   entity_.set_index_meta(meta_);
   return entity_.flush(checkpoint);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int HnswRabitqStreamer::dump(const IndexDumper::Pointer &dumper) {
+int HnswRabitqStreamer::dump(const IndexDumper::Pointer &dumper) try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   LOG_INFO("HnswRabitqStreamer dump");
 
   shared_mutex_.lock();
@@ -454,6 +477,10 @@ int HnswRabitqStreamer::dump(const IndexDumper::Pointer &dumper) {
     return ret;
   }
   return entity_.dump(dumper);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
@@ -478,7 +505,7 @@ IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
   ctx->set_min_scan_limit(min_scan_limit_);
   ctx->set_max_scan_ratio(max_scan_ratio_);
   ctx->set_filter_mode(bf_enabled_ ? VisitFilter::BloomFilter
-                                   : VisitFilter::ByteMap);
+                                   : VisitFilter::EpochBitMap);
   ctx->set_filter_negative_probability(bf_negative_prob_);
   ctx->set_magic(magic_);
   ctx->set_force_padding_topk(force_padding_topk_enabled_);
@@ -495,7 +522,11 @@ IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
     LOG_DEBUG("HnswRabitqStreamer doc_count[%zu] estimate[%zu]",
               (size_t)entity_.doc_cnt(), (size_t)estimate_doc_count);
   }
-  ctx->check_need_adjuct_ctx(std::max(entity_.doc_cnt(), estimate_doc_count));
+  if (!ctx->check_need_adjuct_ctx(
+          std::max(entity_.doc_cnt(), estimate_doc_count))) {
+    delete ctx;
+    return Context::Pointer();
+  }
 
   return Context::Pointer(ctx);
 }
@@ -512,7 +543,7 @@ IndexProvider::Pointer HnswRabitqStreamer::create_provider() const {
       new HnswRabitqIndexProvider(meta_, entity, "HnswRabitqStreamer"));
 }
 
-int HnswRabitqStreamer::update_context(HnswRabitqContext *ctx) const {
+int HnswRabitqStreamer::update_context(HnswRabitqContext *ctx) const try {
   const HnswRabitqEntity::Pointer entity = entity_.clone();
   if (!entity) {
     LOG_ERROR("Failed to clone search context entity");
@@ -524,12 +555,17 @@ int HnswRabitqStreamer::update_context(HnswRabitqContext *ctx) const {
   ctx->set_bruteforce_threshold(bruteforce_threshold_);
   return ctx->update_context(HnswRabitqContext::kStreamerContext, meta_,
                              metric_, entity, magic_);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Add a vector with id into index
 int HnswRabitqStreamer::add_with_id_impl(
     uint32_t id, const void *query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) {
+    IndexStreamer::Context::Pointer &context) try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   if (!provider_) {
     LOG_ERROR("Provider is nullptr, cannot add vector");
     return IndexError_InvalidArgument;
@@ -577,7 +613,8 @@ int HnswRabitqStreamer::add_with_id_impl(
   ctx->clear();
   ctx->update_dist_caculator_distance(add_distance_, add_batch_distance_);
   ctx->reset_query(query);
-  ctx->check_need_adjuct_ctx(entity_.doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_.doc_cnt()))
+    return IndexError_NoMemory;
   ctx->set_provider(provider_);
 
   if (metric_->support_train()) {
@@ -606,6 +643,10 @@ int HnswRabitqStreamer::add_with_id_impl(
     return ret;
   }
 
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) entity_.mark_failed_build();
+  });
   ret = alg_->add_node(id, level, ctx);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Hnsw steamer add node failed");
@@ -619,13 +660,19 @@ int HnswRabitqStreamer::add_with_id_impl(
   }
   (*stats_.mutable_added_count())++;
 
+  complete = true;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Add a vector into index
 int HnswRabitqStreamer::add_impl(uint64_t pkey, const void *query,
                                  const IndexQueryMeta &qmeta,
-                                 IndexStreamer::Context::Pointer &context) {
+                                 IndexStreamer::Context::Pointer &context) try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   if (!provider_) {
     LOG_ERROR("Provider is nullptr, cannot add vector");
     return IndexError_InvalidArgument;
@@ -673,7 +720,8 @@ int HnswRabitqStreamer::add_impl(uint64_t pkey, const void *query,
   ctx->clear();
   ctx->update_dist_caculator_distance(add_distance_, add_batch_distance_);
   ctx->reset_query(query);
-  ctx->check_need_adjuct_ctx(entity_.doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_.doc_cnt()))
+    return IndexError_NoMemory;
   ctx->set_provider(provider_);
 
   if (metric_->support_train()) {
@@ -703,6 +751,10 @@ int HnswRabitqStreamer::add_impl(uint64_t pkey, const void *query,
     return ret;
   }
 
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) entity_.mark_failed_build();
+  });
   ret = alg_->add_node(id, level, ctx);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Hnsw steamer add node failed");
@@ -716,20 +768,31 @@ int HnswRabitqStreamer::add_impl(uint64_t pkey, const void *query,
   }
   (*stats_.mutable_added_count())++;
 
+  complete = true;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 
 int HnswRabitqStreamer::search_impl(
     const void *query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   return search_impl(query, qmeta, 1, context);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search
 int HnswRabitqStreamer::search_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -755,7 +818,8 @@ int HnswRabitqStreamer::search_impl(
   ctx->clear();
   ctx->update_dist_caculator_distance(search_distance_, search_batch_distance_);
   ctx->resize_results(count);
-  ctx->check_need_adjuct_ctx(entity_.doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_.doc_cnt()))
+    return IndexError_NoMemory;
   for (size_t q = 0; q < count; ++q) {
     HnswRabitqQueryEntity entity;
     ret = reformer_->transform_to_entity(query, &entity);
@@ -778,6 +842,10 @@ int HnswRabitqStreamer::search_impl(
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 void HnswRabitqStreamer::print_debug_info() {
@@ -804,13 +872,19 @@ void HnswRabitqStreamer::print_debug_info() {
 
 int HnswRabitqStreamer::search_bf_impl(
     const void *query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   return search_bf_impl(query, qmeta, 1, context);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int HnswRabitqStreamer::search_bf_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const {
+    IndexStreamer::Context::Pointer &context) const try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -851,6 +925,7 @@ int HnswRabitqStreamer::search_bf_impl(
       }
       ctx->reset_query(query);
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (node_id_t id = 0; id < entity_.doc_cnt(); ++id) {
         if (entity_.get_key(id) == kInvalidKey) {
@@ -863,13 +938,15 @@ int HnswRabitqStreamer::search_bf_impl(
 
           std::string group_id = group_by(id);
 
-          auto &topk_heap = ctx->group_topk_heaps()[group_id];
-          if (topk_heap.empty()) {
-            topk_heap.limit(ctx->group_topk());
-          }
-          topk_heap.emplace(id, dist);
+          if (int group_ret = groups.add(group_id, id, dist.est_dist);
+              group_ret != 0)
+            return group_ret;
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
@@ -903,12 +980,17 @@ int HnswRabitqStreamer::search_bf_impl(
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int HnswRabitqStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
+  if (entity_.failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -955,6 +1037,7 @@ int HnswRabitqStreamer::search_bf_by_p_keys_impl(
       }
       ctx->reset_query(query);
       ctx->group_topk_heaps().clear();
+      GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
 
       for (size_t idx = 0; idx < p_keys[q].size(); ++idx) {
         uint64_t pk = p_keys[q][idx];
@@ -965,14 +1048,16 @@ int HnswRabitqStreamer::search_bf_by_p_keys_impl(
             query_alg_->get_full_est(id, dist, entity);
             std::string group_id = group_by(id);
 
-            auto &topk_heap = ctx->group_topk_heaps()[group_id];
-            if (topk_heap.empty()) {
-              topk_heap.limit(ctx->group_topk());
-            }
-            topk_heap.emplace(id, dist);
+            if (int group_ret = groups.add(group_id, id, dist.est_dist);
+                group_ret != 0)
+              return group_ret;
           }
         }
       }
+      if (int group_ret =
+              groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+          group_ret != 0)
+        return group_ret;
       ctx->topk_to_result(q);
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
@@ -1007,6 +1092,10 @@ int HnswRabitqStreamer::search_bf_by_p_keys_impl(
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 

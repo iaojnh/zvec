@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_framework.h>
 #include "metric/metric_params.h"
 #include "turbo/quantizer/quantizer.h"
+#include "utility/paged_record_sort.h"
 #include "ivf_index_format.h"
 #include "ivf_params.h"
 #include "ivf_utility.h"
@@ -122,7 +123,7 @@ class IVFDumper {
       return major_order_;
     }
 
-    const std::vector<uint64_t> &keys() const {
+    const ailego::BudgetedVector<uint64_t> &keys() const {
       return keys_;
     }
 
@@ -133,7 +134,7 @@ class IVFDumper {
    private:
     //! Transpose the block vectors
     void transpose() {
-      std::vector<uint8_t> buf(data_.size());
+      ailego::BudgetedVector<uint8_t> buf(data_.size());
       IVFUtility::Transpose(align_size_, data_.data(), count_, units_,
                             buf.data());
       data_.swap(buf);
@@ -160,8 +161,8 @@ class IVFDumper {
 
    private:
     //! Members
-    std::vector<uint8_t> data_{};
-    std::vector<uint64_t> keys_{};
+    ailego::BudgetedVector<uint8_t> data_{};
+    ailego::BudgetedVector<uint64_t> keys_{};
     uint32_t count_{0u};
     uint32_t units_{0u};
     uint32_t align_size_{0u};
@@ -201,6 +202,10 @@ class IVFDumper {
   int dump_inverted_vector(uint32_t inverted_list_id, uint64_t key,
                            const void *vec);
 
+  // Reserve known input before writing. Pool-backed keys retain only pageable
+  // sort records; the unbudgeted path keeps its existing in-memory layout.
+  int reserve_keys(size_t count);
+
   int dump_inverted_block(uint32_t inverted_list_id, const uint64_t *keys,
                           const void *vecs, uint32_t vector_count,
                           bool column_major);
@@ -210,10 +215,12 @@ class IVFDumper {
 
   //! Dump the centroids index
   int dump_centroid_index(const void *data, size_t size);
+  int dump_centroid_index(
+      size_t size, const std::function<int(size_t, void *, size_t)> &read);
 
   //! Dump params for each inverted list quantizer
   int dump_quantizer_params(
-      const std::vector<IndexConverter::Pointer> &quantizers);
+      const ailego::BudgetedVector<IndexConverter::Pointer> &quantizers);
 
   //! Persist Turbo training state separately from the posting metadata.
   int dump_turbo_quantizer(const turbo::Quantizer::Pointer &quantizer);
@@ -250,6 +257,8 @@ class IVFDumper {
 
   //! Dump a vector block
   int dump_block();
+  int append_keys(const uint64_t *keys, size_t count);
+  int dump_key_column(bool mapping) const;
 
  private:
   //! Constants
@@ -260,13 +269,19 @@ class IVFDumper {
   const IndexMeta meta_{};  // IndexMeta of the inverted index
   const IndexDumper::Pointer dumper_{};
   size_t block_vector_count_{kDefaultBlockCount};
-  std::vector<InvertedListMeta> inverted_lists_meta_{};
-  std::vector<uint64_t> keys_{};
+  ailego::BudgetedVector<InvertedListMeta> inverted_lists_meta_{};
+  ailego::BudgetedVector<uint64_t> keys_{};
   uint32_t cur_list_id_{0};
+  PagedBuildBuffer key_records_;
+  ailego::BudgetedVector<KeyOrderRecord> key_scratch_;
+  size_t key_capacity_{0};
+  size_t key_count_{0};
+  bool paged_keys_{false};
+  bool keys_ready_{false};
   uint32_t dumped_feature_count_{0};
   size_t dumped_features_size_{0};
   mutable size_t dumped_size_{0};
-  InvertedIndexHeader header_;
+  InvertedIndexHeader header_{};
 };
 
 }  // namespace core

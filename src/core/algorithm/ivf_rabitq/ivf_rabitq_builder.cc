@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <rabitqlib/fastscan/data_layout.hpp>
 #include <rabitqlib/fastscan/encoder.hpp>
@@ -23,8 +24,11 @@
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/ailego/utility/time_helper.h>
+#include "ailego/pattern/defer.h"
 #include "algorithm/hnsw_rabitq/rabitq_converter.h"
 #include "algorithm/hnsw_rabitq/rabitq_params.h"
+#include "utility/paged_record_sort.h"
+#include "utility/vector_build_source.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_memory.h"
@@ -37,18 +41,13 @@ namespace core {
 
 namespace {
 
-struct IvfRabitqVectorEntry {
-  uint64_t key{0};
-  std::vector<float> owned_data;
-};
-
 struct IvfRabitqBuildData {
   IvfRabitqHeader header;
-  std::vector<char> batch_data_buf;
-  std::vector<char> ex_data_buf;
-  std::vector<IvfRabitqClusterMeta> cluster_metas;
-  std::vector<uint64_t> keys_buf;
-  std::vector<uint32_t> mapping_buf;
+  PagedBuildBuffer batch_data_buf;
+  PagedBuildBuffer ex_data_buf;
+  ailego::BudgetedVector<IvfRabitqClusterMeta> cluster_metas;
+  PagedBuildBuffer keys_buf;
+  PagedBuildBuffer mapping_buf;
 };
 
 struct IvfRabitqClusterBuildLayout {
@@ -61,8 +60,7 @@ struct IvfRabitqClusterBuildLayout {
 int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
                        const IndexHolder::Pointer &holder,
                        const IndexThreads::Pointer &threads,
-                       std::vector<IvfRabitqVectorEntry> extra_vectors,
-                       IvfRabitqBuildData *build_data) {
+                       IvfRabitqBuildData *build_data) try {
   if (!reformer || !reformer->loaded()) {
     LOG_ERROR("Reformer not loaded");
     return IndexError_NoReady;
@@ -79,31 +77,16 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
   size_t ex_bits = reformer->ex_bits();
   size_t cluster_count = reformer->num_clusters();
 
-  std::vector<IvfRabitqVectorEntry> all_vectors;
-  if (holder) {
-    if (holder->dimension() < dimension) {
-      LOG_ERROR("Holder dimension=%zu smaller than RaBitQ dimension=%zu",
-                holder->dimension(), dimension);
-      return IndexError_Mismatch;
-    }
-    auto iter = holder->create_iterator();
-    while (iter && iter->is_valid()) {
-      IvfRabitqVectorEntry entry;
-      entry.key = iter->key();
-      entry.owned_data.assign(
-          static_cast<const float *>(iter->data()),
-          static_cast<const float *>(iter->data()) + dimension);
-      all_vectors.push_back(std::move(entry));
-      iter->next();
-    }
+  if (!holder || holder->data_type() != IndexMeta::DT_FP32 ||
+      holder->dimension() < dimension ||
+      dimension > std::numeric_limits<size_t>::max() / sizeof(float) ||
+      holder->element_size() < dimension * sizeof(float)) {
+    return IndexError_Mismatch;
   }
-
-  all_vectors.reserve(all_vectors.size() + extra_vectors.size());
-  for (auto &entry : extra_vectors) {
-    all_vectors.push_back(std::move(entry));
-  }
-
-  size_t total_count = all_vectors.size();
+  VectorBuildSource::Pointer source;
+  int ret = VectorBuildSource::Create(holder, &source);
+  if (ret != 0) return ret;
+  size_t total_count = source->count();
   if (total_count == 0) {
     LOG_WARN("No vectors to build");
     return 0;
@@ -117,12 +100,16 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
     return IndexError_InvalidArgument;
   }
 
-  std::vector<uint32_t> cluster_labels(total_count);
+  PagedBuildBuffer cluster_labels;
+  ret = cluster_labels.init(total_count * sizeof(uint32_t), 64 * 1024);
+  if (ret != 0) return ret;
+  std::atomic<int> build_error{0};
   auto assignment_group = threads->make_group();
   if (!assignment_group) {
     LOG_ERROR("Failed to create IVF RaBitQ assignment task group");
     return IndexError_Runtime;
   }
+  AILEGO_DEFER([&] { assignment_group->wait_finish(); });
   size_t assignment_shards =
       std::min(total_count, std::max<size_t>(threads->count() * 4, 1));
   size_t assignment_shard_size =
@@ -130,25 +117,72 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
   for (size_t begin = 0; begin < total_count; begin += assignment_shard_size) {
     size_t end = std::min(begin + assignment_shard_size, total_count);
     assignment_group->submit(ailego::Closure::New(
-        [begin, end, &all_vectors, &cluster_labels, &reformer]() {
-          for (size_t i = begin; i < end; ++i) {
-            cluster_labels[i] = reformer->find_nearest_centroid(
-                all_vectors[i].owned_data.data());
+        [begin, end, &source, &cluster_labels, &reformer, &build_error]() {
+          try {
+            OrdinalAccessHolder::Reader::Pointer reader;
+            int error = source->create_ordinal_reader(&reader);
+            for (size_t i = begin;
+                 error == 0 && i < end &&
+                 build_error.load(std::memory_order_relaxed) == 0;
+                 ++i) {
+              uint64_t key = 0;
+              const void *data = nullptr;
+              error = reader->read(i, &key, &data);
+              if (error == 0 && !data) error = IndexError_ReadData;
+              if (error == 0) {
+                uint32_t label = 0;
+                error = reformer->find_nearest_centroid(
+                    static_cast<const float *>(data), &label);
+                if (error == 0)
+                  error = cluster_labels.write(i * sizeof(label), &label,
+                                               sizeof(label));
+              }
+            }
+            if (error != 0) {
+              int expected = 0;
+              build_error.compare_exchange_strong(expected, error);
+            }
+          } catch (const std::bad_alloc &) {
+            int expected = 0;
+            build_error.compare_exchange_strong(expected, IndexError_NoMemory);
           }
         }));
   }
   assignment_group->wait_finish();
+  ret = build_error.load(std::memory_order_relaxed);
+  if (ret != 0) return ret;
 
-  std::vector<std::vector<uint32_t>> cluster_assignments(cluster_count);
+  // Counting scatter replaces N heap ordinals across many growing vectors.
+  // Only per-cluster counts/cursors remain in memory; source order within each
+  // cluster is unchanged.
+  ailego::BudgetedVector<uint32_t> cluster_counts(cluster_count, 0);
   for (size_t i = 0; i < total_count; ++i) {
-    uint32_t cid = cluster_labels[i];
+    uint32_t cid = 0;
+    ret = cluster_labels.read(i * sizeof(cid), &cid, sizeof(cid));
+    if (ret != 0) return ret;
     if (cid >= cluster_count) {
       LOG_ERROR("Invalid IVF RaBitQ cluster id=%zu, cluster_count=%zu",
                 (size_t)cid, cluster_count);
       return IndexError_OutOfRange;
     }
-    cluster_assignments[cid].push_back(static_cast<uint32_t>(i));
+    ++cluster_counts[cid];
   }
+  ailego::BudgetedVector<size_t> starts(cluster_count + 1, 0);
+  for (size_t cid = 0; cid < cluster_count; ++cid)
+    starts[cid + 1] = starts[cid] + cluster_counts[cid];
+  auto cursors = starts;
+  PagedBuildBuffer cluster_assignments;
+  ret = cluster_assignments.init(total_count * sizeof(uint32_t), 64 * 1024);
+  if (ret != 0) return ret;
+  for (size_t i = 0; i < total_count; ++i) {
+    uint32_t cid = 0, ordinal = static_cast<uint32_t>(i);
+    ret = cluster_labels.read(i * sizeof(cid), &cid, sizeof(cid));
+    if (ret == 0)
+      ret = cluster_assignments.write(cursors[cid]++ * sizeof(ordinal),
+                                      &ordinal, sizeof(ordinal));
+    if (ret != 0) return ret;
+  }
+  cluster_labels = PagedBuildBuffer();
 
   size_t batch_data_per_batch =
       rabitqlib::BatchDataMap<float>::data_bytes(padded_dim);
@@ -157,33 +191,34 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
 
   size_t total_batch_data_size = 0;
   size_t total_ex_data_size = 0;
-  std::vector<IvfRabitqClusterBuildLayout> cluster_layouts(cluster_count);
+  ailego::BudgetedVector<IvfRabitqClusterBuildLayout> cluster_layouts(
+      cluster_count);
 
   for (size_t cid = 0; cid < cluster_count; ++cid) {
-    uint32_t vec_count = static_cast<uint32_t>(cluster_assignments[cid].size());
+    uint32_t vec_count = cluster_counts[cid];
     uint32_t num_batches = (vec_count + rabitqlib::fastscan::kBatchSize - 1) /
                            rabitqlib::fastscan::kBatchSize;
     auto &layout = cluster_layouts[cid];
     layout.batch_count = num_batches;
     layout.batch_data_offset = total_batch_data_size;
     layout.ex_data_offset = total_ex_data_size;
-    layout.key_offset =
-        cid == 0
-            ? 0
-            : cluster_layouts[cid - 1].key_offset +
-                  static_cast<uint32_t>(cluster_assignments[cid - 1].size());
+    layout.key_offset = cid == 0 ? 0
+                                 : cluster_layouts[cid - 1].key_offset +
+                                       cluster_counts[cid - 1];
     total_batch_data_size += num_batches * batch_data_per_batch;
     total_ex_data_size += vec_count * ex_data_per_vector;
   }
 
-  build_data->batch_data_buf.assign(total_batch_data_size, 0);
-  build_data->ex_data_buf.assign(total_ex_data_size, 0);
-  build_data->keys_buf.resize(total_count);
-  build_data->mapping_buf.resize(total_count);
+  ret = build_data->batch_data_buf.init(total_batch_data_size);
+  if (ret != 0) return ret;
+  ret = build_data->ex_data_buf.init(total_ex_data_size);
+  if (ret != 0) return ret;
+  ret = build_data->keys_buf.init(total_count * sizeof(uint64_t), 64 * 1024);
+  if (ret != 0) return ret;
   build_data->cluster_metas.resize(cluster_count);
 
   for (size_t cid = 0; cid < cluster_count; ++cid) {
-    uint32_t vec_count = static_cast<uint32_t>(cluster_assignments[cid].size());
+    uint32_t vec_count = cluster_counts[cid];
     const auto &layout = cluster_layouts[cid];
     build_data->cluster_metas[cid].batch_data_offset = layout.batch_data_offset;
     build_data->cluster_metas[cid].ex_data_offset = layout.ex_data_offset;
@@ -192,93 +227,134 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
     build_data->cluster_metas[cid].key_offset = layout.key_offset;
   }
 
-  std::atomic<int> build_error{0};
   auto encoding_group = threads->make_group();
   if (!encoding_group) {
     LOG_ERROR("Failed to create IVF RaBitQ encoding task group");
     return IndexError_Runtime;
   }
+  AILEGO_DEFER([&] { encoding_group->wait_finish(); });
   for (size_t cid = 0; cid < cluster_count; ++cid) {
-    if (cluster_assignments[cid].empty()) {
+    if (cluster_counts[cid] == 0) {
       continue;
     }
     encoding_group->submit(ailego::Closure::New(
-        [cid, padded_dim, batch_data_per_batch, ex_data_per_vector,
-         &all_vectors, &cluster_assignments, &cluster_layouts, &build_error,
-         &build_data, &reformer]() {
-          const auto &assignments = cluster_assignments[cid];
-          const auto &layout = cluster_layouts[cid];
-          uint32_t vec_count = static_cast<uint32_t>(assignments.size());
-          uint32_t key_offset = layout.key_offset;
-          for (uint32_t i = 0; i < vec_count; ++i) {
-            build_data->keys_buf[key_offset + i] =
-                all_vectors[assignments[i]].key;
-          }
+        [cid, padded_dim, batch_data_per_batch, ex_data_per_vector, &source,
+         &cluster_assignments, &cluster_counts, &starts, &cluster_layouts,
+         &build_error, &build_data, &reformer]() {
+          try {
+            const auto &layout = cluster_layouts[cid];
+            uint32_t vec_count = cluster_counts[cid];
+            uint32_t key_offset = layout.key_offset;
+            OrdinalAccessHolder::Reader::Pointer reader;
+            int error = source->create_ordinal_reader(&reader);
+            if (error != 0) {
+              int expected = 0;
+              build_error.compare_exchange_strong(expected, error);
+              return;
+            }
 
-          size_t batch_data_offset = layout.batch_data_offset;
-          size_t ex_data_offset = layout.ex_data_offset;
-          std::vector<float> rotated_batch(rabitqlib::fastscan::kBatchSize *
-                                           padded_dim);
-          uint32_t processed = 0;
-          while (processed < vec_count &&
-                 build_error.load(std::memory_order_relaxed) == 0) {
-            uint32_t batch_size =
-                std::min(static_cast<uint32_t>(rabitqlib::fastscan::kBatchSize),
-                         vec_count - processed);
+            size_t batch_data_offset = layout.batch_data_offset;
+            size_t ex_data_offset = layout.ex_data_offset;
+            ailego::BudgetedVector<float> rotated_batch(
+                rabitqlib::fastscan::kBatchSize * padded_dim);
+            ailego::BudgetedVector<char> batch_output(batch_data_per_batch);
+            ailego::BudgetedVector<char> ex_output(
+                rabitqlib::fastscan::kBatchSize * ex_data_per_vector);
+            ailego::BudgetedVector<uint64_t> batch_keys(
+                rabitqlib::fastscan::kBatchSize);
+            ailego::BudgetedVector<uint32_t> batch_ordinals(
+                rabitqlib::fastscan::kBatchSize);
+            ailego::MemoryReservation encoding_memory;
+            uint32_t processed = 0;
+            while (processed < vec_count &&
+                   build_error.load(std::memory_order_relaxed) == 0) {
+              uint32_t batch_size = std::min(
+                  static_cast<uint32_t>(rabitqlib::fastscan::kBatchSize),
+                  vec_count - processed);
 
-            std::memset(
-                rotated_batch.data(), 0,
-                rabitqlib::fastscan::kBatchSize * padded_dim * sizeof(float));
-            for (uint32_t i = 0; i < batch_size; ++i) {
-              const float *src =
-                  all_vectors[assignments[processed + i]].owned_data.data();
-              float *dst = rotated_batch.data() + (i * padded_dim);
-              int ret = reformer->rotate_vector(src, dst);
+              std::memset(
+                  rotated_batch.data(), 0,
+                  rabitqlib::fastscan::kBatchSize * padded_dim * sizeof(float));
+              error = cluster_assignments.read(
+                  (starts[cid] + processed) * sizeof(uint32_t),
+                  batch_ordinals.data(), batch_size * sizeof(uint32_t));
+              if (error != 0) {
+                int expected = 0;
+                build_error.compare_exchange_strong(expected, error);
+                return;
+              }
+              for (uint32_t i = 0; i < batch_size; ++i) {
+                const void *data = nullptr;
+                int read_ret =
+                    reader->read(batch_ordinals[i], &batch_keys[i], &data);
+                if (read_ret == 0 && !data) read_ret = IndexError_ReadData;
+                if (read_ret != 0) {
+                  int expected = 0;
+                  build_error.compare_exchange_strong(expected, read_ret);
+                  return;
+                }
+                const auto *src = static_cast<const float *>(data);
+                float *dst = rotated_batch.data() + (i * padded_dim);
+                int ret = reformer->rotate_vector(src, dst);
+                if (ret != 0) {
+                  int expected = 0;
+                  build_error.compare_exchange_strong(expected, ret);
+                  return;
+                }
+              }
+
+              std::fill(batch_output.begin(), batch_output.end(), 0);
+              std::fill(ex_output.begin(), ex_output.end(), 0);
+
+              int ret = reformer->quantize_batch(
+                  rotated_batch.data(), static_cast<uint32_t>(cid), batch_size,
+                  batch_output.data(),
+                  ex_output.empty() ? nullptr : ex_output.data(),
+                  &encoding_memory);
+              if (ret == 0)
+                ret = build_data->keys_buf.write(
+                    (key_offset + processed) * sizeof(uint64_t),
+                    batch_keys.data(), batch_size * sizeof(uint64_t));
+              if (ret == 0)
+                ret = build_data->batch_data_buf.write(batch_data_offset,
+                                                       batch_output.data(),
+                                                       batch_output.size());
+              if (ret == 0)
+                ret = build_data->ex_data_buf.write(
+                    ex_data_offset, ex_output.data(),
+                    batch_size * ex_data_per_vector);
               if (ret != 0) {
                 int expected = 0;
                 build_error.compare_exchange_strong(expected, ret);
                 return;
               }
-            }
 
-            char *bd_ptr =
-                build_data->batch_data_buf.data() + batch_data_offset;
-            char *ex_ptr = nullptr;
-            if (ex_data_per_vector > 0) {
-              ex_ptr = build_data->ex_data_buf.data() + ex_data_offset;
+              batch_data_offset += batch_data_per_batch;
+              ex_data_offset += batch_size * ex_data_per_vector;
+              processed += batch_size;
             }
-
-            int ret = reformer->quantize_batch(rotated_batch.data(),
-                                               static_cast<uint32_t>(cid),
-                                               batch_size, bd_ptr, ex_ptr);
-            if (ret != 0) {
-              int expected = 0;
-              build_error.compare_exchange_strong(expected, ret);
-              return;
-            }
-
-            batch_data_offset += batch_data_per_batch;
-            ex_data_offset += batch_size * ex_data_per_vector;
-            processed += batch_size;
+          } catch (const std::bad_alloc &) {
+            int expected = 0;
+            build_error.compare_exchange_strong(expected, IndexError_NoMemory);
           }
         }));
   }
   encoding_group->wait_finish();
 
-  int ret = build_error.load(std::memory_order_relaxed);
+  ret = build_error.load(std::memory_order_relaxed);
   if (ret != 0) {
     LOG_ERROR("Failed to encode IVF RaBitQ cluster, ret=%d", ret);
     return ret;
   }
 
-  std::iota(build_data->mapping_buf.begin(), build_data->mapping_buf.end(), 0U);
-  std::sort(build_data->mapping_buf.begin(), build_data->mapping_buf.end(),
-            [&keys_buf = build_data->keys_buf](uint32_t lhs, uint32_t rhs) {
-              if (keys_buf[lhs] == keys_buf[rhs]) {
-                return lhs < rhs;
-              }
-              return keys_buf[lhs] < keys_buf[rhs];
-            });
+  cluster_assignments = PagedBuildBuffer();
+  ret = BuildPagedKeyMapping(
+      total_count,
+      [&](size_t id, uint64_t *key) {
+        return build_data->keys_buf.read(id * sizeof(*key), key, sizeof(*key));
+      },
+      &build_data->mapping_buf);
+  if (ret != 0) return ret;
 
   build_data->header.total_vector_count = static_cast<uint32_t>(total_count);
   build_data->header.cluster_count = static_cast<uint32_t>(cluster_count);
@@ -292,6 +368,8 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
   build_data->header.ex_data_size = total_ex_data_size;
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 }  // namespace
@@ -306,7 +384,7 @@ IvfRabitqBuilder::~IvfRabitqBuilder() {
 // init
 // --------------------------------------------------------------------------
 int IvfRabitqBuilder::init(const IndexMeta &meta,
-                           const ailego::Params &params) {
+                           const ailego::Params &params) try {
   if (state_ != INIT) {
     LOG_ERROR("IvfRabitqBuilder state wrong. state=%d",
               static_cast<int>(state_));
@@ -358,31 +436,35 @@ int IvfRabitqBuilder::init(const IndexMeta &meta,
 
   state_ = INITED;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // --------------------------------------------------------------------------
 // cleanup
 // --------------------------------------------------------------------------
-int IvfRabitqBuilder::cleanup() {
+int IvfRabitqBuilder::cleanup() try {
   state_ = INIT;
   stats_.clear();
   converter_.reset();
   reformer_.reset();
   header_ = IvfRabitqHeader();
-  batch_data_buf_.clear();
-  ex_data_buf_.clear();
-  cluster_metas_.clear();
-  keys_buf_.clear();
-  mapping_buf_.clear();
+  batch_data_buf_ = PagedBuildBuffer();
+  ex_data_buf_ = PagedBuildBuffer();
+  ailego::BudgetedVector<IvfRabitqClusterMeta>().swap(cluster_metas_);
+  keys_buf_ = PagedBuildBuffer();
+  mapping_buf_ = PagedBuildBuffer();
   thread_count_ = 0;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // --------------------------------------------------------------------------
 // train — KMeans clustering + rotator training
 // --------------------------------------------------------------------------
 int IvfRabitqBuilder::train(IndexThreads::Pointer threads,
-                            IndexHolder::Pointer holder) {
+                            IndexHolder::Pointer holder) try {
   if (state_ != INITED) {
     LOG_ERROR("IvfRabitqBuilder train failed, wrong state=%d",
               static_cast<int>(state_));
@@ -420,56 +502,18 @@ int IvfRabitqBuilder::train(IndexThreads::Pointer threads,
     return ret;
   }
 
-  // Create IvfRabitqReformer via dump+load cycle
-  auto memory_dumper = IndexFactory::CreateDumper("MemoryDumper");
-  memory_dumper->init(ailego::Params());
-  std::string file_id = ailego::StringHelper::Concat(
-      "ivf_rabitq_builder_train_", ailego::Monotime::MilliSeconds(), rand());
-  ret = memory_dumper->create(file_id);
-  if (ret != 0) {
-    LOG_ERROR("Failed to create memory dumper, ret=%d", ret);
-    return ret;
-  }
-
-  ret = converter_->dump(memory_dumper);
-  if (ret != 0) {
-    LOG_ERROR("Failed to dump converter, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-  ret = memory_dumper->close();
-  if (ret != 0) {
-    LOG_ERROR("Failed to close memory dumper, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
+  IndexStorage::Pointer storage;
+  ret = converter_->training_storage(&storage);
+  if (ret != 0) return ret;
   reformer_ = std::make_shared<IvfRabitqReformer>();
   ret = reformer_->init(metric_name_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to init IvfRabitqReformer, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
-  auto memory_storage = IndexFactory::CreateStorage("MemoryReadStorage");
-  ret = memory_storage->open(file_id, false);
-  if (ret != 0) {
-    LOG_ERROR("Failed to open memory storage, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
-  ret = reformer_->load(memory_storage);
-  if (ret != 0) {
-    LOG_ERROR("Failed to load IvfRabitqReformer, ret=%d", ret);
-    IndexMemory::Instance()->remove(file_id);
-    return ret;
-  }
-
-  IndexMemory::Instance()->remove(file_id);
+  if (ret == 0) ret = reformer_->load(storage);
+  if (ret != 0) return ret;
 
   stats_.set_trained_count(converter_->stats().trained_count());
+  // The reformer owns the trained state used by build/dump. Do not retain a
+  // second set of centroids and rotator state in the training converter.
+  converter_.reset();
   stats_.set_trained_costtime(timer.milli_seconds());
 
   LOG_INFO("IvfRabitqBuilder training completed: %zu clusters, cost %zu ms",
@@ -478,13 +522,15 @@ int IvfRabitqBuilder::train(IndexThreads::Pointer threads,
 
   state_ = TRAINED;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // --------------------------------------------------------------------------
 // build — assign vectors to centroids, quantize, store results in memory
 // --------------------------------------------------------------------------
 int IvfRabitqBuilder::build(IndexThreads::Pointer threads,
-                            IndexHolder::Pointer holder) {
+                            IndexHolder::Pointer holder) try {
   if (state_ != TRAINED) {
     LOG_ERROR("Train the index first before build");
     return IndexError_Runtime;
@@ -504,7 +550,7 @@ int IvfRabitqBuilder::build(IndexThreads::Pointer threads,
     }
   }
   IvfRabitqBuildData build_data;
-  int ret = BuildIvfRabitqData(reformer_, holder, threads, {}, &build_data);
+  int ret = BuildIvfRabitqData(reformer_, holder, threads, &build_data);
   if (ret != 0) {
     return ret;
   }
@@ -530,12 +576,14 @@ int IvfRabitqBuilder::build(IndexThreads::Pointer threads,
 
   state_ = BUILT;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // --------------------------------------------------------------------------
 // dump — write meta + reformer + segments to dumper
 // --------------------------------------------------------------------------
-int IvfRabitqBuilder::dump(const IndexDumper::Pointer &dumper) {
+int IvfRabitqBuilder::dump(const IndexDumper::Pointer &dumper) try {
   if (state_ != BUILT) {
     LOG_ERROR("Build the index before dump");
     return IndexError_Runtime;
@@ -591,17 +639,15 @@ int IvfRabitqBuilder::dump(const IndexDumper::Pointer &dumper) {
     return ret;
   }
 
-  if (!batch_data_buf_.empty()) {
-    ret = dump_segment(IVF_RABITQ_BATCH_DATA_SEG_ID, batch_data_buf_.data(),
-                       batch_data_buf_.size());
+  if (batch_data_buf_.size() != 0) {
+    ret = batch_data_buf_.dump(dumper, IVF_RABITQ_BATCH_DATA_SEG_ID);
     if (ret != 0) {
       return ret;
     }
   }
 
-  if (!ex_data_buf_.empty()) {
-    ret = dump_segment(IVF_RABITQ_EX_DATA_SEG_ID, ex_data_buf_.data(),
-                       ex_data_buf_.size());
+  if (ex_data_buf_.size() != 0) {
+    ret = ex_data_buf_.dump(dumper, IVF_RABITQ_EX_DATA_SEG_ID);
     if (ret != 0) {
       return ret;
     }
@@ -615,17 +661,15 @@ int IvfRabitqBuilder::dump(const IndexDumper::Pointer &dumper) {
     }
   }
 
-  if (!keys_buf_.empty()) {
-    ret = dump_segment(IVF_RABITQ_KEYS_SEG_ID, keys_buf_.data(),
-                       keys_buf_.size() * sizeof(uint64_t));
+  if (keys_buf_.size()) {
+    ret = keys_buf_.dump(dumper, IVF_RABITQ_KEYS_SEG_ID);
     if (ret != 0) {
       return ret;
     }
   }
 
-  if (!mapping_buf_.empty()) {
-    ret = dump_segment(IVF_RABITQ_MAPPING_SEG_ID, mapping_buf_.data(),
-                       mapping_buf_.size() * sizeof(uint32_t));
+  if (mapping_buf_.size()) {
+    ret = mapping_buf_.dump(dumper, IVF_RABITQ_MAPPING_SEG_ID);
     if (ret != 0) {
       return ret;
     }
@@ -638,6 +682,8 @@ int IvfRabitqBuilder::dump(const IndexDumper::Pointer &dumper) {
            static_cast<size_t>(timer.milli_seconds()));
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_BUILDER(IvfRabitqBuilder);

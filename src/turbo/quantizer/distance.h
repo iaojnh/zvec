@@ -16,7 +16,10 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/turbo/turbo.h>
 
 namespace zvec {
@@ -30,19 +33,52 @@ namespace turbo {
 //! expected to already be in the same quantized layout.
 class DistanceImpl {
  public:
+  using QueryBuffer = std::vector<uint8_t, ailego::BudgetedAllocator<uint8_t>>;
   DistanceImpl() = default;
 
-  DistanceImpl(DistanceFunc func, std::string quantized_query, size_t dim)
+  DistanceImpl(DistanceFunc func, BatchDistanceFunc batch_func,
+               std::shared_ptr<QueryBuffer> query, size_t dim)
+      : func_(std::move(func)),
+        batch_func_(std::move(batch_func)),
+        owned_query_(std::move(query)),
+        dim_(dim) {}
+
+  // Reuse a private workspace; a copied handle must keep its old query intact.
+  std::shared_ptr<QueryBuffer> take_query_buffer() {
+    if (owned_query_ && owned_query_.use_count() == 1)
+      return std::move(owned_query_);
+    return std::make_shared<QueryBuffer>();
+  }
+  const void *query_data() const {
+    return owned_query_ ? static_cast<const void *>(owned_query_->data())
+                        : static_cast<const void *>(query_storage_.data());
+  }
+  size_t query_bytes() const {
+    return owned_query_ ? owned_query_->size() : query_storage_.size();
+  }
+
+  DistanceImpl(DistanceFunc func, ailego::BudgetedString quantized_query,
+               size_t dim)
       : func_(std::move(func)),
         query_storage_(std::move(quantized_query)),
         dim_(dim) {}
 
   DistanceImpl(DistanceFunc func, BatchDistanceFunc batch_func,
-               std::string quantized_query, size_t dim)
+               ailego::BudgetedString quantized_query, size_t dim)
       : func_(std::move(func)),
         batch_func_(std::move(batch_func)),
         query_storage_(std::move(quantized_query)),
         dim_(dim) {}
+
+  // Compatibility for caller-owned standard strings. Engine callers use the
+  // budgeted overload so their initial allocation is admitted as well.
+  DistanceImpl(DistanceFunc func, std::string query, size_t dim)
+      : DistanceImpl(std::move(func),
+                     ailego::BudgetedString(query.begin(), query.end()), dim) {}
+  DistanceImpl(DistanceFunc func, BatchDistanceFunc batch, std::string query,
+               size_t dim)
+      : DistanceImpl(std::move(func), std::move(batch),
+                     ailego::BudgetedString(query.begin(), query.end()), dim) {}
 
   //! Whether the handle is ready to compute distances.
   bool valid() const {
@@ -57,7 +93,7 @@ class DistanceImpl {
   //! Compute the distance between the stored query and `candidate`.
   float operator()(const void *candidate) const {
     float d = 0.0f;
-    func_(candidate, query_storage_.data(), dim_, &d);
+    func_(candidate, query_data(), dim_, &d);
     return d;
   }
 
@@ -66,18 +102,18 @@ class DistanceImpl {
   //! is bound.
   void batch(const void **candidates, size_t num, float *out) const {
     if (batch_func_) {
-      batch_func_(candidates, query_storage_.data(), num, dim_, out, nullptr);
+      batch_func_(candidates, query_data(), num, dim_, out, nullptr);
       return;
     }
     for (size_t i = 0; i < num; ++i) {
       out[i] = 0.0f;
-      func_(candidates[i], query_storage_.data(), dim_, out + i);
+      func_(candidates[i], query_data(), dim_, out + i);
     }
   }
 
   //! Access the quantized query bytes (for pairwise helpers).
-  const std::string &query_storage() const {
-    return query_storage_;
+  std::string_view query_storage() const {
+    return {static_cast<const char *>(query_data()), query_bytes()};
   }
 
   size_t dim() const {
@@ -99,7 +135,8 @@ class DistanceImpl {
  private:
   DistanceFunc func_{};
   BatchDistanceFunc batch_func_{};
-  std::string query_storage_{};
+  ailego::BudgetedString query_storage_{};
+  std::shared_ptr<QueryBuffer> owned_query_;
   size_t dim_{0};
 };
 

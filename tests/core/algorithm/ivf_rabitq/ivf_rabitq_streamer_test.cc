@@ -21,10 +21,12 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rabitqlib/fastscan/data_layout.hpp>
 #include <rabitqlib/fastscan/query.hpp>
 #include "algorithm/hnsw_rabitq/rabitq_utils.h"
+#include "utility/utility_params.h"
 #include "zvec/ailego/container/params.h"
 #include "zvec/ailego/logger/logger.h"
 #include "zvec/ailego/utility/file_helper.h"
@@ -40,6 +42,7 @@
 #include "ivf_rabitq_util.h"
 #include "rabitq_converter.h"
 #include "rabitq_params.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace std;
 using namespace zvec::ailego;
@@ -289,6 +292,148 @@ void IvfRabitqStreamerTest::TearDown() {
   ailego::FileHelper::RemovePath(dir_.c_str());
 }
 
+TEST_F(IvfRabitqStreamerTest, QueryAndEncodingScratchRequireAdmission) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(32 * 1024 * 1024));
+  auto restore =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
+  IndexMeta meta(IndexMeta::DT_FP32, kDim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto holder = BuildHolder(kDim, 128);
+  std::shared_ptr<IvfRabitqReformer> reformer;
+  BuildLoadedReformer(meta, "SquaredEuclidean", holder,
+                      dir_ + "/budget_reformer", &reformer, nullptr, 4);
+  ASSERT_NE(nullptr, reformer);
+  NumericalVector<float> query(kDim);
+  FillTestVector(7, &query);
+  IvfRabitqQueryState state;
+  const size_t before_query = pool.external_used();
+  ASSERT_EQ(0, reformer->create_query_state(query.data(), &state));
+  const size_t scratch_bytes =
+      state.rotated_query.capacity() * sizeof(float) +
+      state.lut_scratch.capacity() * sizeof(float) +
+      state.hacc_scratch.capacity() * sizeof(uint16_t) +
+      sizeof(rabitqlib::SplitBatchQuery<float>);
+  EXPECT_GE(pool.external_used() - before_query, scratch_bytes);
+  const size_t charged = pool.external_used();
+  std::vector<char> batch(reformer->padded_dim() * 32 * 8);
+  std::vector<char> extra(reformer->padded_dim() * 32 * 8);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.used());
+  EXPECT_EQ(0, reformer->create_query_state(query.data(), &state));
+  EXPECT_EQ(charged + pressure.bytes(), pool.external_used());
+  IvfRabitqQueryState rejected;
+  EXPECT_EQ(IndexError_NoMemory,
+            reformer->create_query_state(query.data(), &rejected));
+  EXPECT_EQ(nullptr, rejected.batch_query);
+  // Reformer loading no longer eagerly computes the build-only config. Its
+  // first use must reject before entering third-party sampling/quantization.
+  EXPECT_EQ(IndexError_NoMemory,
+            reformer->quantize_batch(state.rotated_query.data(), 0, 1,
+                                     batch.data(), extra.data()));
+  pressure.retain_at_most(0);
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> probes;
+  EXPECT_EQ(0,
+            reformer->select_probe_centroids(query.data(), 2, &state, &probes));
+  EXPECT_EQ(2u, probes.size());
+}
+
+TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(pool.used(), 0u);
+  auto restore = ailego::ScopeGuard::Make([&]() {
+    EXPECT_EQ(pool.used(), 0u);
+    EXPECT_EQ(pool.init(previous), 0);
+  });
+  auto holder = BuildHolder(kDim, 1027);  // Partial final fast-scan batches.
+  NumericalVector<float> query(kDim);
+  FillTestVector(37, &query);
+  const IndexQueryMeta qmeta(IndexMeta::DT_FP32, kDim);
+  for (const char *metric : {"SquaredEuclidean", "InnerProduct"}) {
+    for (uint32_t bits : {1u, 4u}) {
+      SCOPED_TRACE(metric);
+      SCOPED_TRACE(bits);
+      ASSERT_EQ(pool.init(0), 0);
+      IndexMeta meta(IndexMeta::DT_FP32, kDim);
+      meta.set_metric(metric, 0, ailego::Params());
+      ailego::Params params;
+      params.set(PARAM_IVF_RABITQ_NLIST, 16u);
+      params.set(PARAM_RABITQ_TOTAL_BITS, bits);
+      const std::string path = dir_ + "/buffer_compare";
+      BuildIndexFile(meta, holder, params, path);
+      ASSERT_FALSE(HasFatalFailure());
+      ASSERT_EQ(pool.init(128 * 1024), 0);
+      IndexStreamer::Pointer streamers[2];
+      for (size_t mode = 0; mode < 2; ++mode) {
+        auto storage = IndexFactory::CreateStorage(
+            mode ? "BufferReadStorage" : "MMapFileReadStorage");
+        ailego::Params options;
+        options.set(BUFFER_READ_STORAGE_WARMUP_MODE,
+                    BUFFER_READ_STORAGE_WARMUP_NONE);
+        ASSERT_EQ(storage->init(options), 0);
+        ASSERT_EQ(storage->open(path, false), 0);
+        streamers[mode] = std::make_shared<IvfRabitqStreamer>();
+        ASSERT_EQ(streamers[mode]->init(meta, params), 0);
+        ASSERT_EQ(streamers[mode]->open(storage), 0);
+      }
+      auto compare = [](const IndexDocumentList &a,
+                        const IndexDocumentList &b) {
+        ASSERT_EQ(a.size(), b.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+          EXPECT_EQ(a[i].key(), b[i].key());
+          EXPECT_FLOAT_EQ(a[i].score(), b[i].score());
+        }
+      };
+      for (uint32_t nprobe : {1u, 4u, 16u}) {
+        for (bool grouped : {false, true}) {
+          for (bool by_key : {false, true}) {
+            IndexStreamer::Context::Pointer contexts[2];
+            for (size_t mode = 0; mode < 2; ++mode) {
+              auto ctx = streamers[mode]->create_context();
+              ctx->set_topk(10);
+              ctx->set_filter([](uint64_t key) { return key % 7 == 0; });
+              ailego::Params search;
+              search.set(PARAM_IVF_RABITQ_NPROBE, nprobe);
+              ASSERT_EQ(ctx->update(search), 0);
+              if (grouped) {
+                ctx->set_group_by(
+                    [](uint64_t key) { return std::to_string(key % 3); });
+                ctx->set_group_params(3, 2);
+              }
+              if (by_key) {
+                const std::vector<std::vector<uint64_t>> keys{
+                    {3, 4, 5, 36, 37, 38, 90, 91, 92, 99999}};
+                ASSERT_EQ(streamers[mode]->search_bf_by_p_keys_impl(
+                              query.data(), keys, qmeta, 1, ctx),
+                          0);
+              } else {
+                ASSERT_EQ(
+                    streamers[mode]->search_impl(query.data(), qmeta, 1, ctx),
+                    0);
+              }
+              contexts[mode] = std::move(ctx);
+            }
+            if (grouped) {
+              const auto &a = contexts[0]->group_result(0);
+              const auto &b = contexts[1]->group_result(0);
+              ASSERT_EQ(a.size(), b.size());
+              for (size_t i = 0; i < a.size(); ++i) {
+                EXPECT_EQ(a[i].group_id(), b[i].group_id());
+                compare(a[i].docs(), b[i].docs());
+              }
+            } else {
+              compare(contexts[0]->result(0), contexts[1]->result(0));
+            }
+          }
+        }
+      }
+      EXPECT_LE(pool.used(), pool.capacity());
+    }
+  }
+}
+
 TEST_F(IvfRabitqStreamerTest, TestParamValidation) {
   auto init_builder = [&](const ailego::Params &params) {
     auto builder = std::make_shared<IvfRabitqBuilder>();
@@ -399,6 +544,17 @@ TEST_F(IvfRabitqStreamerTest, TestRejectInvalidFormatMagicAndVersion) {
   header->version = kIvfRabitqIndexVersion + 1;
   IvfRabitqEntity invalid_version_entity;
   EXPECT_EQ(IndexError_InvalidFormat, invalid_version_entity.load(storage));
+
+  // A rejected load must release its partially constructed entity and storage
+  // ownership, and leave the same streamer ready to retry.
+  IvfRabitqStreamer streamer;
+  ASSERT_EQ(0, streamer.init(*index_meta_ptr_, params));
+  const auto owners = storage.use_count();
+  EXPECT_EQ(IndexError_InvalidFormat, streamer.open(storage));
+  EXPECT_EQ(owners, storage.use_count());
+  header->version = kIvfRabitqIndexVersion;
+  ASSERT_EQ(0, streamer.open(storage));
+  EXPECT_EQ(0, streamer.close());
 
   ASSERT_EQ(0, storage->close());
   IndexMemory::Instance()->remove(file_id);
@@ -657,7 +813,7 @@ TEST_F(IvfRabitqStreamerTest, TestProbeCentroidsUseAssignmentMetric) {
   FillTestVector(71, &query_vec);
 
   uint32_t assigned = reformer->find_nearest_centroid(query_vec.data());
-  std::vector<uint32_t> probe_centroids;
+  ailego::BudgetedVector<uint32_t> probe_centroids;
   ASSERT_EQ(0, reformer->select_probe_centroids(query_vec.data(), 1,
                                                 &probe_centroids));
   ASSERT_EQ(1UL, probe_centroids.size());
@@ -709,7 +865,7 @@ TEST_F(IvfRabitqStreamerTest, TestCosineProbeCentroidsUseInnerProductMetric) {
   const float *query =
       reinterpret_cast<const float *>(transformed_query.data());
   uint32_t assigned = reformer->find_nearest_centroid(query);
-  std::vector<uint32_t> probe_centroids;
+  ailego::BudgetedVector<uint32_t> probe_centroids;
   ASSERT_EQ(0, reformer->select_probe_centroids(query, 1, &probe_centroids));
   ASSERT_EQ(1UL, probe_centroids.size());
   EXPECT_EQ(assigned, probe_centroids[0]);
@@ -737,7 +893,7 @@ TEST_F(IvfRabitqStreamerTest,
   IvfRabitqQueryState state;
   ASSERT_EQ(0, reformer->create_query_state(query.data(), &state));
 
-  std::vector<IvfRabitqProbeCentroid> probes;
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> probes;
   ASSERT_EQ(0,
             reformer->select_probe_centroids(query.data(), 3, &state, &probes));
   ASSERT_EQ(3UL, probes.size());
@@ -775,14 +931,14 @@ TEST_F(IvfRabitqStreamerTest,
     EXPECT_EQ(expected[i].second, probes[i].id);
   }
 
-  std::vector<uint32_t> legacy_ids;
+  ailego::BudgetedVector<uint32_t> legacy_ids;
   ASSERT_EQ(0, reformer->select_probe_centroids(query.data(), 3, &legacy_ids));
   ASSERT_EQ(probes.size(), legacy_ids.size());
   for (size_t i = 0; i < probes.size(); ++i) {
     EXPECT_EQ(probes[i].id, legacy_ids[i]);
   }
 
-  std::vector<IvfRabitqProbeCentroid> single_probe;
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> single_probe;
   ASSERT_EQ(0, reformer->select_probe_centroids(query.data(), 1, &state,
                                                 &single_probe));
   ASSERT_EQ(1UL, single_probe.size());
@@ -831,7 +987,7 @@ TEST_F(IvfRabitqStreamerTest, TestL2ProbeCarriesCoarseResidualNorm) {
   IvfRabitqQueryState state;
   ASSERT_EQ(0, reformer->create_query_state(query.data(), &state));
 
-  std::vector<IvfRabitqProbeCentroid> probes;
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> probes;
   ASSERT_EQ(0,
             reformer->select_probe_centroids(query.data(), 4, &state, &probes));
   ASSERT_EQ(4UL, probes.size());
@@ -1074,6 +1230,78 @@ TEST_F(IvfRabitqStreamerTest, TestSearchByPrimaryKeys) {
     for (const auto &doc : context->result(q)) {
       EXPECT_NE(37UL, doc.key());
       EXPECT_NE(42UL, doc.key());
+    }
+  }
+}
+
+TEST_F(IvfRabitqStreamerTest, KeyBatchesPreserveResultsAndInput) {
+  auto holder = BuildHolder(kDim, 256);
+  ailego::Params params;
+  params.set(PARAM_IVF_RABITQ_NLIST, 16U);
+  params.set(PARAM_RABITQ_TOTAL_BITS, 1U);
+  IndexStreamer::Pointer streamer;
+  BuildAndOpenStreamer(*index_meta_ptr_, holder, params,
+                       dir_ + "/KeyBatchesPreserveResultsAndInput", &streamer);
+  ASSERT_NE(nullptr, streamer);
+  NumericalVector<float> query(kDim);
+  FillTestVector(37, &query);
+  IndexQueryMeta qmeta(IndexMeta::DT_FP32, kDim);
+  // Cross three batches with valid keys, missing keys and duplicates.
+  const std::vector<uint64_t> compact{3, 37, 90, 4, 38, 91, 5, 36, 92, 37};
+  std::vector<uint64_t> keys(10003, 99999);
+  for (size_t i = 0; i < compact.size(); ++i) keys[i * 1100] = compact[i];
+  const auto original = keys;
+  auto compare = [](const IndexDocumentList &a, const IndexDocumentList &b) {
+    ASSERT_EQ(a.size(), b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+      EXPECT_EQ(a[i].key(), b[i].key());
+      EXPECT_FLOAT_EQ(a[i].score(), b[i].score());
+    }
+  };
+  for (bool grouped : {false, true}) {
+    for (bool filtered : {false, true}) {
+      for (bool radius : {false, true}) {
+        auto reference = streamer->create_context();
+        auto context = streamer->create_context();
+        for (auto *ctx : {reference.get(), context.get()}) {
+          ctx->set_topk(5);
+          if (filtered) ctx->set_filter([](uint64_t key) { return key == 37; });
+          if (radius) ctx->set_threshold(0.5f);
+          if (grouped) {
+            ctx->set_group_by(
+                [](uint64_t key) { return std::to_string(key % 3); });
+            ctx->set_group_params(3, 2);
+          }
+        }
+        ASSERT_EQ(0, streamer->search_bf_by_keys_impl(query.data(), compact,
+                                                      qmeta, reference));
+        for (bool batched_api : {false, true}) {
+          if (batched_api)
+            ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(
+                             query.data(), {keys}, qmeta, 1, context));
+          else
+            ASSERT_EQ(0, streamer->search_bf_by_keys_impl(query.data(), keys,
+                                                          qmeta, context));
+          if (grouped) {
+            const auto &a = reference->group_result(0);
+            const auto &b = context->group_result(0);
+            ASSERT_EQ(a.size(), b.size());
+            for (size_t i = 0; i < a.size(); ++i) {
+              EXPECT_EQ(a[i].group_id(), b[i].group_id());
+              compare(a[i].docs(), b[i].docs());
+            }
+          } else {
+            compare(reference->result(0), context->result(0));
+          }
+        }
+        EXPECT_EQ(original, keys);
+        ASSERT_EQ(0, streamer->search_bf_by_keys_impl(query.data(), {}, qmeta,
+                                                      context));
+        if (grouped)
+          EXPECT_TRUE(context->group_result(0).empty());
+        else
+          EXPECT_TRUE(context->result(0).empty());
+      }
     }
   }
 }

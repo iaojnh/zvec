@@ -22,6 +22,10 @@ namespace core {
 HnswSparseSearcherEntity::HnswSparseSearcherEntity() = default;
 
 int HnswSparseSearcherEntity::cleanup() {
+  fixed_neighbors_.reset();
+  mapping_.reset();
+  upper_neighbors_.reset();
+  upper_neighbors_meta_.reset();
   container_.reset();
   sparse_vector_meta_.reset();
   keys_.reset();
@@ -176,7 +180,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
   if (level == 0) {
     if (neighbors_in_memory_enabled_) {
       auto hd = reinterpret_cast<const NeighborsHeader *>(
-          fixed_neighbors_.get() + neighbors_size() * id);
+          fixed_neighbors_->data() + neighbors_size() * id);
       return {hd->neighbor_cnt, hd->neighbors};
     }
 
@@ -375,11 +379,10 @@ int HnswSparseSearcherEntity::load_segments(bool check_crc) {
 }
 
 int HnswSparseSearcherEntity::load_and_flat_neighbors() {
-  fixed_neighbors_.reset(
-      new (std::nothrow) char[neighbors_size() * doc_cnt()]{},
-      std::default_delete<char[]>());
-  if (!fixed_neighbors_) {
-    LOG_ERROR("Malloc memory failed");
+  try {
+    fixed_neighbors_ = std::make_shared<ailego::BudgetedMappedBuffer>(
+        static_cast<size_t>(neighbors_size()) * doc_cnt());
+  } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
 
@@ -409,7 +412,7 @@ int HnswSparseSearcherEntity::load_and_flat_neighbors() {
       return IndexError_ReadData;
     }
     // copy level 0 neighbors to fixed size neighbors memory
-    char *dst = fixed_neighbors_.get() + neighbors_size() * id;
+    char *dst = fixed_neighbors_->data() + neighbors_size() * id;
     *reinterpret_cast<uint32_t *>(dst) = neighbors_index[id].neighbor_cnt;
     memcpy(dst + sizeof(uint32_t), neighbor_data.data(), rd_size);
   }
@@ -418,7 +421,7 @@ int HnswSparseSearcherEntity::load_and_flat_neighbors() {
 }
 
 int HnswSparseSearcherEntity::get_fixed_neighbors(
-    std::vector<uint32_t> *fixed_neighbors) const {
+    ailego::BudgetedVector<uint32_t> *fixed_neighbors) const {
   //! Get a new segemnt to release the buffer after loading neighbors
   auto neighbors_meta = container_->get(kSparseGraphOffsetsSegmentId);
   if (!neighbors_meta) {

@@ -16,6 +16,7 @@
 #include <limits>
 #include <ailego/pattern/defer.h>
 #include <zvec/ailego/utility/string_helper.h>
+#include "algorithm/cluster/centroid_trainer.h"
 #include "algorithm/cluster/cluster_params.h"
 #include "turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h"
 #include "turbo/quantizer/quantizer.h"
@@ -28,6 +29,7 @@ namespace core {
  */
 class LabelFilteredIndexHolder : public IndexHolder {
  public:
+  using ReadId = std::function<int(size_t, uint32_t *)>;
   /*! Index Holder Iterator
    */
   class Iterator : public IndexHolder::Iterator {
@@ -37,25 +39,37 @@ class LabelFilteredIndexHolder : public IndexHolder {
 
     //! Constructor
     Iterator(const IVFBuilder::RandomAccessIndexHolder::Pointer &holder,
-             const std::vector<uint32_t> *elems)
-        : holder_(holder), elems_(elems) {}
+             size_t count, ReadId read)
+        : holder_(holder), count_(count), read_(std::move(read)) {}
 
     //! Destructor
     ~Iterator() override = default;
 
     //! Retrieve pointer of data
     const void *data() const override {
-      return holder_->element((*elems_)[index_]);
+      const void *data = nullptr;
+      if (status_ == 0) {
+        uint32_t id = 0;
+        status_ = read_(index_, &id);
+        if (status_ == 0) status_ = holder_->read_element(id, &buffer_, &data);
+      }
+      return data;
     }
 
     //! Test if the iterator is valid
     bool is_valid() const override {
-      return index_ < elems_->size();
+      return status_ == 0 && index_ < count_;
+    }
+
+    int status() const override {
+      return status_;
     }
 
     //! Retrieve primary key
     uint64_t key() const override {
-      return (*elems_)[index_];
+      uint32_t id = 0;
+      if (status_ == 0) status_ = read_(index_, &id);
+      return id;
     }
 
     //! Next iterator
@@ -66,19 +80,22 @@ class LabelFilteredIndexHolder : public IndexHolder {
    private:
     //! Members
     const IVFBuilder::RandomAccessIndexHolder::Pointer holder_{nullptr};
-    const std::vector<uint32_t> *elems_{nullptr};
+    size_t count_{0};
+    ReadId read_;
     size_t index_{0};
+    mutable ailego::BudgetedString buffer_{};
+    mutable int status_{0};
   };
 
   //! Constructor
   LabelFilteredIndexHolder(
-      const IVFBuilder::RandomAccessIndexHolder::Pointer &holder,
-      const std::vector<uint32_t> &items)
-      : holder_(holder), elems_(&items) {}
+      const IVFBuilder::RandomAccessIndexHolder::Pointer &holder, size_t count,
+      ReadId read)
+      : holder_(holder), count_(count), read_(std::move(read)) {}
 
   //! Retrieve count of elements in holder (-1 indicates unknown)
   size_t count() const override {
-    return elems_->size();
+    return count_;
   }
 
   //! Retrieve dimension
@@ -104,13 +121,14 @@ class LabelFilteredIndexHolder : public IndexHolder {
   //! Create a new iterator
   IndexHolder::Iterator::Pointer create_iterator() override {
     return IndexHolder::Iterator::Pointer(
-        new LabelFilteredIndexHolder::Iterator(holder_, elems_));
+        new LabelFilteredIndexHolder::Iterator(holder_, count_, read_));
   }
 
  private:
   //! Members
   const IVFBuilder::RandomAccessIndexHolder::Pointer holder_{};
-  const std::vector<uint32_t> *elems_{};
+  size_t count_{0};
+  ReadId read_;
 };
 
 IVFBuilder::IVFBuilder() = default;
@@ -260,16 +278,20 @@ int IVFBuilder::cleanup() {
   converter_class_.clear();
   cluster_params_.clear();
 
-  labels_.clear();
+  decltype(labels_)().swap(labels_);
+  label_records_ = PagedBuildBuffer();
+  decltype(label_offsets_)().swap(label_offsets_);
+  paged_labels_ = false;
   centroid_index_.reset();
   searcher_centroid_index_.reset();
   holder_.reset();
   source_reader_.reset();
   source_holder_.reset();
+  ailego::BudgetedString().swap(read_buffer_);
   converted_meta_ = meta_;
   converter_.reset();
   quantized_meta_ = meta_;
-  quantizers_.clear();
+  decltype(quantizers_)().swap(quantizers_);
   turbo_quantizer_.reset();
 
   error_ = false;
@@ -288,7 +310,7 @@ int IVFBuilder::cleanup() {
 }
 
 int IVFBuilder::train(IndexThreads::Pointer threads,
-                      IndexHolder::Pointer holder) {
+                      IndexHolder::Pointer holder) try {
   LOG_INFO("Begin IVFBuilder::train with holder");
   if (state_ != INITED) {
     LOG_ERROR("IVFBuilder train failed, wrong state=%d", state_);
@@ -345,9 +367,11 @@ int IVFBuilder::train(IndexThreads::Pointer threads,
 
   state_ = TRAINED;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
+int IVFBuilder::train(const IndexTrainer::Pointer &trainer) try {
   LOG_DEBUG("Begin IVFBuilder::train by trainer");
   ailego::ElapsedTime timer;
 
@@ -361,12 +385,32 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
     return IndexError_InvalidArgument;
   }
 
-  IndexCluster::CentroidList centroid_list;
-  IndexBundle::Pointer boundle = trainer->indexes();
-  int ret = IndexCluster::Deserialize(trainer->meta(), boundle, &centroid_list);
-  ivf_check_with_msg(ret, "Failed to deserialize index");
-
   const IndexMeta &meta = trainer->meta();
+  IndexCluster::CentroidList owned_centroids;
+  const IndexCluster::CentroidList *centroid_list = &owned_centroids;
+  int ret = 0;
+  if (const auto *source =
+          dynamic_cast<const CentroidTrainer *>(trainer.get())) {
+    // Both coarse indexes finish consuming the borrowed tree in this call.
+    // Do not retain it: the caller may immediately clean up the trainer.
+    centroid_list = &source->centroids();
+    if (centroid_list->empty()) {
+      return IndexError_InvalidFormat;
+    }
+    // Preserve the recursive feature-size check normally done by Serialize.
+    for (const auto &centroid : *centroid_list) {
+      if (!centroid.is_matched(meta)) {
+        return IndexError_Mismatch;
+      }
+    }
+  } else {
+    // Third-party/legacy trainers still use the serialized interface. Release
+    // the bundle before building the coarse index to reduce peak overlap.
+    auto bundle = trainer->indexes();
+    ret = IndexCluster::Deserialize(meta, bundle, &owned_centroids);
+    ivf_check_with_msg(ret, "Failed to deserialize index");
+  }
+
   if (meta.data_type() != converted_meta_.data_type() ||
       meta.metric_name().compare(converted_meta_.metric_name()) != 0 ||
       meta.element_size() != converted_meta_.element_size()) {
@@ -392,7 +436,7 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
   ret = centroid_index_->init(converted_meta_, params_);
   ivf_check_error_code(ret);
 
-  ret = centroid_index_->build(centroid_list);
+  ret = centroid_index_->build(*centroid_list);
   ivf_check_with_msg(ret, "Failed to build centroid index");
 
   if (params_.has(PARAM_IVF_BUILDER_OPTIMIZER_QUANTIZER_CLASS)) {
@@ -409,7 +453,7 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
     ret = searcher_centroid_index_->init(converted_meta_, params_);
     ivf_check_error_code(ret);
 
-    ret = searcher_centroid_index_->build(centroid_list);
+    ret = searcher_centroid_index_->build(*centroid_list);
     ivf_check_with_msg(ret, "Failed to build centroid index");
   }
 
@@ -419,10 +463,12 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) {
 
   state_ = TRAINED;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int IVFBuilder::build(IndexThreads::Pointer threads,
-                      IndexHolder::Pointer holder) {
+                      IndexHolder::Pointer holder) try {
   LOG_INFO("Begin IVFBuilder::build!");
 
   if (state_ != TRAINED) {
@@ -451,6 +497,9 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
   source_reader_.reset();
   source_holder_.reset();
   labels_.clear();
+  label_records_ = PagedBuildBuffer();
+  label_offsets_.clear();
+  paged_labels_ = false;
   quantizers_.clear();
   error_ = false;
   err_code_ = 0;
@@ -479,6 +528,18 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
     if (!holder_) {
       return IndexError_NoMemory;
     }
+    std::string scratch =
+        params_.get_as_string(PARAM_IVF_BUILDER_BUILD_STORAGE_PATH);
+    if (scratch.empty() && ailego::MemoryLimitPool::get_instance().capacity()) {
+      const int ret =
+          TemporaryBufferStorage::DefaultPrefix("zvec-ivf", &scratch);
+      if (ret != 0) return ret;
+    }
+    if (!scratch.empty()) {
+      const int ret = holder_->enable_buffered_storage(scratch + ".vectors",
+                                                       holder->count());
+      if (ret != 0) return ret;
+    }
     if (holder->count() > 0) {
       holder_->reserve(holder->count());
     }
@@ -498,11 +559,20 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
       if (!data) {
         return IndexError_ReadData;
       }
-      holder_->emplace(key, data);
+      if (holder_->count() >= holder->count()) {
+        return IndexError_Mismatch;
+      }
+      const int ret = holder_->emplace(key, data);
+      if (ret != 0) return ret;
     }
     if (iter->status() != 0) {
       return iter->status();
     }
+    if (holder_->count() != holder->count()) {
+      return IndexError_Mismatch;
+    }
+    const int ret = holder_->flush();
+    if (ret != 0) return ret;
     converted_holder = holder_;
   }
 
@@ -515,11 +585,36 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
   }
 
   labels_.resize(centroid_index_->centroids_count());
+  paged_labels_ = ailego::MemoryLimitPool::get_instance().capacity() != 0;
+  if (paged_labels_) {
+    if (converted_holder->count() >
+        std::numeric_limits<size_t>::max() / sizeof(KeyOrderRecord))
+      return IndexError_Overflow;
+    int status = label_records_.init(
+        converted_holder->count() * sizeof(KeyOrderRecord), 64 * 1024);
+    if (status != 0) return status;
+  }
   int ret = this->build_label_index(threads.get(), converted_holder);
   ivf_check_with_msg(ret, "Failed to build index for %s",
                      IndexError::What(ret));
 
-  if (source_reader_) {
+  if (paged_labels_) {
+    ret = SortPagedRecords<KeyOrderRecord>(
+        &label_records_, [](const auto &a, const auto &b) {
+          return a.key != b.key ? a.key < b.key : a.id < b.id;
+        });
+    if (ret != 0) return ret;
+    label_offsets_.assign(labels_.size() + 1, 0);
+    for (size_t i = 0; i < converted_holder->count(); ++i) {
+      KeyOrderRecord record;
+      ret = label_records_.read(i * sizeof(record), &record, sizeof(record));
+      if (ret != 0) return ret;
+      if (record.key >= labels_.size()) return IndexError_InvalidFormat;
+      ++label_offsets_[record.key + 1];
+    }
+    for (size_t i = 1; i < label_offsets_.size(); ++i)
+      label_offsets_[i] += label_offsets_[i - 1];
+  } else if (source_reader_) {
     // Label workers finish out of order. Restore ordinal order within each
     // bucket so dump opens each source at most once per bucket, rather than
     // bouncing between providers for individual vectors.
@@ -537,9 +632,11 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
 
   state_ = BUILT;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int IVFBuilder::dump(const IndexDumper::Pointer &dumper) {
+int IVFBuilder::dump(const IndexDumper::Pointer &dumper) try {
   LOG_INFO("Begin IVFBuilder::dump");
 
   if (state_ != BUILT) {
@@ -574,6 +671,8 @@ int IVFBuilder::dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("End IVFBuilder::dump");
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int IVFBuilder::check_and_update_major_order(IndexMeta &meta) {
@@ -748,7 +847,14 @@ int IVFBuilder::prepare_trainer_params(ailego::Params &params) {
   for (size_t i = 1; i <= cluster_params_.size(); ++i) {
     std::string level_params_key =
         STRATIFIED_TRAINER_PARAMS_IN_LEVEL_PREFIX + std::to_string(i);
-    params.set(level_params_key, cluster_params_[i - 1]);
+    auto level_params = cluster_params_[i - 1];
+    const std::string scratch =
+        params_.get_as_string(PARAM_IVF_BUILDER_BUILD_STORAGE_PATH);
+    if (!scratch.empty()) {
+      level_params.set(OPTKMEANS_CLUSTER_BUFFERED_STORAGE_PATH,
+                       scratch + ".train" + std::to_string(i));
+    }
+    params.set(level_params_key, level_params);
   }
   params.set(STRATIFIED_TRAINER_CLASS_NAME, cluster_class_);
 
@@ -831,13 +937,42 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
   return err_code_;
 }
 
+size_t IVFBuilder::label_count(size_t centroid) const {
+  return paged_labels_ ? label_offsets_[centroid + 1] - label_offsets_[centroid]
+                       : labels_[centroid].size();
+}
+
+int IVFBuilder::read_label(size_t centroid, size_t index, uint32_t *id) const {
+  if (!id || centroid >= labels_.size() || index >= label_count(centroid))
+    return IndexError_OutOfRange;
+  if (!paged_labels_) {
+    *id = labels_[centroid][index];
+    return 0;
+  }
+  KeyOrderRecord record;
+  int ret =
+      label_records_.read((label_offsets_[centroid] + index) * sizeof(record),
+                          &record, sizeof(record));
+  if (ret != 0) return ret;
+  if (record.key != centroid) return IndexError_InvalidFormat;
+  *id = record.id;
+  return 0;
+}
+
+IndexHolder::Pointer IVFBuilder::label_holder(size_t centroid) const {
+  return std::make_shared<LabelFilteredIndexHolder>(
+      holder_, label_count(centroid),
+      [this, centroid](size_t index, uint32_t *id) {
+        return read_label(centroid, index, id);
+      });
+}
+
 int IVFBuilder::read_vector(size_t id, uint64_t *key, const void **data) {
   if (source_reader_) {
     return source_reader_->read(id, key, data);
   }
-  *key = holder_->key(id);
-  *data = holder_->element(id);
-  return 0;
+  int ret = holder_->read_key(id, key);
+  return ret == 0 ? holder_->read_element(id, &read_buffer_, data) : ret;
 }
 
 int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
@@ -866,24 +1001,29 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
     return IndexError_NoMemory;
   }
 
+  ret = ivf_dumper->reserve_keys(stats_.built_count());
+  ivf_check_error_code(ret);
+
   //! Dump inverted vectors
-  std::vector<uint32_t> dumped_ids;
-  std::function<void(uint32_t)> record_dumped_id = [&](uint32_t) {};
-  if (store_original_features_) {
-    dumped_ids.reserve(stats_.built_count());
-    record_dumped_id = [&](uint32_t id) { dumped_ids.emplace_back(id); };
+  PagedBuildBuffer dumped_ids;
+  size_t dumped_count = 0;
+  if (store_original_features_ && !quantizers_.empty()) {
+    ret = dumped_ids.init(stats_.built_count() * sizeof(uint32_t), 64 * 1024);
+    ivf_check_error_code(ret);
   }
   if (turbo_quantizer_) {
-    std::string code(turbo_quantizer_->quantized_datapoint_vector_length(),
-                     '\0');
+    ailego::BudgetedVector<char> code(
+        turbo_quantizer_->quantized_datapoint_vector_length());
     for (size_t i = 0; i < labels_.size(); ++i) {
-      for (auto id : labels_[i]) {
+      for (size_t j = 0; j < label_count(i); ++j) {
+        uint32_t id = 0;
+        ret = read_label(i, j, &id);
+        ivf_check_error_code(ret);
         uint64_t key = 0;
         const void *data = nullptr;
         ret = read_vector(id, &key, &data);
         ivf_check_error_code(ret);
         turbo_quantizer_->quantize_data(data, &code[0]);
-        record_dumped_id(id);
         ret = ivf_dumper->dump_inverted_vector(i, key, code.data());
         ivf_check_error_code(ret);
       }
@@ -892,9 +1032,10 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
     //! No quantizer for inverted vectors
     for (size_t i = 0; i < centroid_index_->centroids_count(); ++i) {
       ailego_assert_with(i < labels_.size(), "Index Overflow");
-      for (size_t j = 0; j < labels_[i].size(); ++j) {
-        auto id = labels_[i][j];
-        record_dumped_id(id);
+      for (size_t j = 0; j < label_count(i); ++j) {
+        uint32_t id = 0;
+        ret = read_label(i, j, &id);
+        ivf_check_error_code(ret);
         uint64_t key = 0;
         const void *data = nullptr;
         ret = read_vector(id, &key, &data);
@@ -906,8 +1047,7 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
   } else {
     for (size_t i = 0; i < centroid_index_->centroids_count(); ++i) {
       ailego_assert_with(i < labels_.size(), "Index Overflow");
-      auto holder =
-          std::make_shared<LabelFilteredIndexHolder>(holder_, labels_[i]);
+      auto holder = label_holder(i);
       if (!holder) {
         return IndexError_NoMemory;
       }
@@ -928,8 +1068,15 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
         if (!data) {
           return IndexError_ReadData;
         }
-        record_dumped_id(id);
-        ret = ivf_dumper->dump_inverted_vector(i, holder_->key(id), data);
+        if (store_original_features_) {
+          ret = dumped_ids.write(dumped_count * sizeof(id), &id, sizeof(id));
+          ivf_check_error_code(ret);
+          ++dumped_count;
+        }
+        uint64_t key = std::numeric_limits<uint64_t>::max();
+        ret = holder_->read_key(id, &key);
+        ivf_check_error_code(ret);
+        ret = ivf_dumper->dump_inverted_vector(i, key, data);
         ivf_check_error_code(ret);
       }
       if (iter->status() != 0) {
@@ -951,18 +1098,41 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
 
   auto centroid_index =
       searcher_centroid_index_ ? searcher_centroid_index_ : centroid_index_;
-  ret = ivf_dumper->dump_centroid_index(centroid_index->data(),
-                                        centroid_index->size());
+  ret = ivf_dumper->dump_centroid_index(
+      centroid_index->size(), [&](size_t offset, void *out, size_t bytes) {
+        return centroid_index->read_dump(offset, out, bytes);
+      });
   ivf_check_with_msg(ret, "Failed to dump CentroidIndex");
 
   if (store_original_features_) {
-    for (size_t i = 0; i < dumped_ids.size(); ++i) {
+    auto dump_original = [&](uint32_t id) -> int {
       uint64_t key = 0;
       const void *data = nullptr;
-      ret = read_vector(dumped_ids[i], &key, &data);
-      ivf_check_error_code(ret);
-      ret = ivf_dumper->dump_original_vector(data, meta_.element_size());
-      ivf_check_error_code(ret);
+      int status = read_vector(id, &key, &data);
+      return status != 0
+                 ? status
+                 : ivf_dumper->dump_original_vector(data, meta_.element_size());
+    };
+    if (quantizers_.empty()) {
+      // Unquantized output already follows bucket order; reuse it instead of
+      // retaining a second full list of the same ordinals.
+      for (size_t cid = 0; cid < labels_.size(); ++cid) {
+        for (size_t i = 0; i < label_count(cid); ++i) {
+          uint32_t id = 0;
+          ret = read_label(cid, i, &id);
+          ivf_check_error_code(ret);
+          ret = dump_original(id);
+          ivf_check_error_code(ret);
+        }
+      }
+    } else {
+      for (size_t i = 0; i < dumped_count; ++i) {
+        uint32_t id = 0;
+        ret = dumped_ids.read(i * sizeof(id), &id, sizeof(id));
+        ivf_check_error_code(ret);
+        ret = dump_original(id);
+        ivf_check_error_code(ret);
+      }
     }
   }
 
@@ -1042,26 +1212,30 @@ int IVFBuilder::prepare_quantizer(IndexThreads *threads) {
 
   //! Train the quantizers
   auto train_data = [&](size_t i) {
-    IndexHolder::Pointer holder = holder_;
-    size_t idx = 0;
-    if (quantize_by_centroid_) {
-      holder = std::make_shared<LabelFilteredIndexHolder>(holder_, labels_[i]);
-      if (!holder && !error_.exchange(true)) {
-        err_code_ = IndexError_NoMemory;
+    try {
+      IndexHolder::Pointer holder = holder_;
+      size_t idx = 0;
+      if (quantize_by_centroid_) {
+        holder = label_holder(i);
+        if (!holder && !error_.exchange(true)) {
+          err_code_ = IndexError_NoMemory;
+          return;
+        }
+        idx = i;
+      }
+      if (holder->count() == 0) {
         return;
       }
-      idx = i;
-    }
-    if (holder->count() == 0) {
-      return;
-    }
-    ret = quantizers_[idx]->train(holder);
-    if (ret != 0) {
-      LOG_ERROR("Failed to train converter %s for %s", quantizer_name.c_str(),
-                IndexError::What(ret));
-      if (!error_.exchange(true)) {
-        err_code_ = IndexError_Runtime;
+      const int train_ret = quantizers_[idx]->train(holder);
+      if (train_ret != 0) {
+        LOG_ERROR("Failed to train converter %s for %s", quantizer_name.c_str(),
+                  IndexError::What(train_ret));
+        if (!error_.exchange(true)) {
+          err_code_ = train_ret;
+        }
       }
+    } catch (const std::bad_alloc &) {
+      if (!error_.exchange(true)) err_code_ = IndexError_NoMemory;
     }
   };
 
@@ -1071,6 +1245,7 @@ int IVFBuilder::prepare_quantizer(IndexThreads *threads) {
     return IndexError_Runtime;
   }
 
+  AILEGO_DEFER([&] { task_group->wait_finish(); });
   for (size_t i = 0; i < quantizers_.size(); ++i) {
     if (error_) {
       task_group->wait_finish();
@@ -1080,6 +1255,7 @@ int IVFBuilder::prepare_quantizer(IndexThreads *threads) {
   }
 
   task_group->wait_finish();
+  if (error_) return err_code_;
   if (quantizers_.size() > 0) {
     quantized_meta_ = quantizers_[0]->meta();
   }

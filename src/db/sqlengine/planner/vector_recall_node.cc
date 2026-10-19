@@ -26,6 +26,7 @@
 #include <zvec/db/schema.h>
 #include <zvec/db/type.h>
 #include "db/index/column/vector_column/vector_column_params.h"
+#include "db/index/segment/segment_fetch_internal.h"
 #include "db/sqlengine/common/util.h"
 #include "db/sqlengine/planner/ops/fetch_vector_op.h"
 
@@ -34,17 +35,25 @@ namespace zvec::sqlengine {
 VectorRecallNode::VectorRecallNode(Segment::Ptr segment,
                                    QueryInfo::Ptr query_info,
                                    DocFilter::Ptr doc_filter, int batch_size,
-                                   bool single_stage_search)
+                                   bool single_stage_search, bool rank_only)
     : segment_(std::move(segment)),
       query_info_(std::move(query_info)),
       doc_filter_(doc_filter),
       batch_size_(batch_size),
+      rank_only_(rank_only),
       // need fetch filter fields if single stage search, otherwise only fetch
       // selectd scalar fields, as forward filter is already performed and order
       // by only support vector score
       fetched_columns_(single_stage_search
                            ? query_info_->get_all_fetched_scalar_field_names()
                            : query_info_->get_selected_scalar_field_names()) {
+  if (rank_only_) {
+    schema_ = arrow::schema({arrow::field(LOCAL_ROW_ID, arrow::int32()),
+                             arrow::field(FIELD_SCORE, arrow::float32())});
+    if (query_info_->group_by())
+      schema_ = Util::append_field(*schema_, FIELD_GROUP_ID, arrow::utf8());
+    return;
+  }
   auto table = segment_->fetch(fetched_columns_, std::vector<int>{});
   schema_ = table->schema();
   schema_ = Util::append_field(*schema_, FIELD_SCORE, arrow::float32());
@@ -73,8 +82,10 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> VectorRecallNode::gen() {
       auto vector_ret = state.self_->prepare();
       if (!vector_ret) {
         return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-            arrow::Status::ExecutionError("prepare vector failed:",
-                                          vector_ret.error().c_str()));
+            vector_ret.error().code() == StatusCode::RESOURCE_EXHAUSTED
+                ? arrow::Status::OutOfMemory(vector_ret.error().message())
+                : arrow::Status::ExecutionError("prepare vector failed:",
+                                                vector_ret.error().c_str()));
       }
       state.vector_result_ = vector_ret.value();
       state.iter_ = state.vector_result_->create_iterator();
@@ -90,8 +101,7 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> VectorRecallNode::gen() {
     auto record_batch = state.collect_batch();
     if (!record_batch.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::ExecutionError("collect batch failed:",
-                                        record_batch.status().ToString()));
+          record_batch.status());
     }
     cp::ExecBatch exec_batch(*record_batch.ValueOrDie());
     return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
@@ -160,10 +170,11 @@ Result<IndexResults::Ptr> VectorRecallNode::prepare() {
   query_params.data_type = vector_cond->vector_schema()->data_type();
   query_params.dimension = vector_cond->dimension();
   query_params.query_params = vector_cond->query_params();
+  ailego::MemoryReservation keys_memory;
   auto brute_force_keys = doc_filter_->get_bf_by_keys_and_update(
-      GlobalConfig::Instance().brute_force_by_keys_ratio());
+      GlobalConfig::Instance().brute_force_by_keys_ratio(), keys_memory);
   if (brute_force_keys) {
-    query_params.bf_pks.emplace_back(std::move(brute_force_keys.value()));
+    query_params.bf_pks_view = &brute_force_keys.value();
   }
   // set filter after brute force check
   query_params.filter = doc_filter_->empty() ? nullptr : doc_filter_.get();
@@ -207,6 +218,8 @@ Result<IndexResults::Ptr> VectorRecallNode::prepare() {
   }
 
   auto vector_ret = vector_indexer->search(vector_data, query_params);
+  auto evaluation_status = doc_filter_->status();
+  if (!evaluation_status.ok()) return tl::make_unexpected(evaluation_status);
   if (!vector_ret) {
     return tl::make_unexpected(vector_ret.error());
   }
@@ -218,8 +231,9 @@ VectorRecallNode::State::collect_batch() {
   // collect a batch
   std::vector<int> indices;
   indices.reserve(self_->batch_size_);
-  arrow::FloatBuilder builder;
-  arrow::StringBuilder group_id_builder;
+  auto *pool = self_->segment_->query_memory_pool();
+  arrow::FloatBuilder builder(pool);
+  arrow::StringBuilder group_id_builder(pool);
   for (int i = 0; iter_->valid() && i < self_->batch_size_;
        i++, iter_->next()) {
     indices.push_back(iter_->doc_id());
@@ -228,19 +242,30 @@ VectorRecallNode::State::collect_batch() {
       ARROW_RETURN_NOT_OK(group_id_builder.Append(iter_->group_id()));
     }
   }
-  auto table = self_->segment_->fetch(self_->fetched_columns_, indices);
-  if (!table) {
-    return arrow::Status::ExecutionError("fetch table failed");
+  if (self_->rank_only_) {
+    arrow::Int32Builder rows(pool);
+    ARROW_RETURN_NOT_OK(rows.AppendValues(indices.data(), indices.size()));
+    ARROW_ASSIGN_OR_RAISE(auto row_array, rows.Finish());
+    ARROW_ASSIGN_OR_RAISE(auto scores, builder.Finish());
+    std::vector<std::shared_ptr<arrow::Array>> columns{std::move(row_array),
+                                                       std::move(scores)};
+    if (self_->query_info_->group_by()) {
+      ARROW_ASSIGN_OR_RAISE(auto group_ids, group_id_builder.Finish());
+      columns.push_back(std::move(group_ids));
+    }
+    return arrow::RecordBatch::Make(self_->schema_, indices.size(),
+                                    std::move(columns));
   }
-  auto batch = table->CombineChunksToBatch();
+  ARROW_ASSIGN_OR_RAISE(
+      auto table, internal::fetch_table(*self_->segment_,
+                                        self_->fetched_columns_, indices));
+  auto batch = table->CombineChunksToBatch(pool);
   if (!batch.ok()) {
-    return arrow::Status::ExecutionError("combine chunks to batch failed:",
-                                         batch.status().ToString());
+    return batch.status();
   }
   auto score_array = builder.Finish();
   if (!score_array.ok()) {
-    return arrow::Status::ExecutionError("finish builder failed:",
-                                         score_array.status().ToString());
+    return score_array.status();
   }
   auto record_batch = std::move(batch.ValueUnsafe());
   ARROW_ASSIGN_OR_RAISE(
@@ -259,6 +284,9 @@ VectorRecallNode::State::collect_batch() {
             *self_->segment_, field.field_name, indices);
       }
       if (!array_res) {
+        if (array_res.error().code() == StatusCode::RESOURCE_EXHAUSTED) {
+          return arrow::Status::OutOfMemory(array_res.error().message());
+        }
         return arrow::Status::ExecutionError("fetch vector failed:",
                                              array_res.error().c_str());
       }
@@ -272,8 +300,7 @@ VectorRecallNode::State::collect_batch() {
   if (self_->query_info_->group_by()) {
     auto group_id_array = group_id_builder.Finish();
     if (!group_id_array.ok()) {
-      return arrow::Status::ExecutionError("finish group id builder failed:",
-                                           group_id_array.status().ToString());
+      return group_id_array.status();
     }
     ARROW_ASSIGN_OR_RAISE(
         record_batch,

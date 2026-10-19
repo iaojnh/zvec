@@ -19,16 +19,23 @@
 
 namespace zvec::sqlengine {
 
-#define CHECK_ARROW_STATUS(msg, status)                                        \
-  if (!status.ok()) {                                                          \
-    return tl::make_unexpected(Status::InternalError(msg, status.ToString())); \
-  }
+#define CHECK_ARROW_STATUS(msg, expression)                                 \
+  do {                                                                      \
+    const auto operation_status = (expression);                             \
+    if (!operation_status.ok()) {                                           \
+      return tl::make_unexpected(Status(                                    \
+          operation_status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED \
+                                           : StatusCode::INTERNAL_ERROR,    \
+          std::string(msg) + operation_status.ToString()));                 \
+    }                                                                       \
+  } while (false)
 
 template <typename Iter>
 Result<std::shared_ptr<arrow::Array>> fetch_dense_vector_helper(
-    const CombinedVectorColumnIndexer *indexer, Iter begin, Iter end) {
+    const CombinedVectorColumnIndexer *indexer, Iter begin, Iter end,
+    arrow::MemoryPool *pool) {
   size_t count = std::distance(begin, end);
-  arrow::BinaryBuilder vector_builder;
+  arrow::BinaryBuilder vector_builder(pool);
   CHECK_ARROW_STATUS("Reserve vector builder failed:",
                      vector_builder.Reserve(count));
   for (Iter i = begin; i != end; ++i) {
@@ -61,18 +68,20 @@ Result<std::shared_ptr<arrow::Array>> FetchVectorOp::fetch_dense_vector(
     return tl::make_unexpected(
         Status::InvalidArgument("vector index not found:", vector_name));
   }
-  return fetch_dense_vector_helper(indexer.get(), rows.begin(), rows.end());
+  return fetch_dense_vector_helper(indexer.get(), rows.begin(), rows.end(),
+                                   segment.query_memory_pool());
 }
 
 
 template <typename Iter>
 Result<std::shared_ptr<arrow::Array>> fetch_sparse_vector_helper(
-    const CombinedVectorColumnIndexer *indexer, Iter begin, Iter end) {
+    const CombinedVectorColumnIndexer *indexer, Iter begin, Iter end,
+    arrow::MemoryPool *pool) {
   size_t count = std::distance(begin, end);
   std::unique_ptr<arrow::StructBuilder> sparse_builder;
   arrow::BinaryBuilder *sparse_index_builder = nullptr;
   arrow::BinaryBuilder *sparse_value_builder = nullptr;
-  auto array_builder = arrow::MakeBuilder(Util::sparse_type());
+  auto array_builder = arrow::MakeBuilder(Util::sparse_type(), pool);
   if (!array_builder.ok()) {
     return tl::make_unexpected(Status::InternalError(
         "make builder failed:", array_builder.status().ToString()));
@@ -122,7 +131,8 @@ Result<std::shared_ptr<arrow::Array>> FetchVectorOp::fetch_sparse_vector(
     return tl::make_unexpected(
         Status::InvalidArgument("vector index not found:", vector_name));
   }
-  return fetch_sparse_vector_helper(indexer.get(), rows.begin(), rows.end());
+  return fetch_sparse_vector_helper(indexer.get(), rows.begin(), rows.end(),
+                                    segment.query_memory_pool());
 }
 
 std::unique_ptr<cp::FunctionOptions> FetchVectorOp::FunctionOptionsType::Copy(
@@ -142,12 +152,15 @@ arrow::Status FetchVectorOp::FetchVectorFunction(cp::KernelContext *ctx,
   Result<std::shared_ptr<arrow::Array>> res;
   if (state->args.is_dense) {
     res = fetch_dense_vector_helper(state->args.indexer.get(), row_span.begin(),
-                                    row_span.end());
+                                    row_span.end(), ctx->memory_pool());
   } else {
-    res = fetch_sparse_vector_helper(state->args.indexer.get(),
-                                     row_span.begin(), row_span.end());
+    res =
+        fetch_sparse_vector_helper(state->args.indexer.get(), row_span.begin(),
+                                   row_span.end(), ctx->memory_pool());
   }
   if (!res) {
+    if (res.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return arrow::Status::OutOfMemory(res.error().message());
     return arrow::Status::ExecutionError("fetch vector failed:",
                                          res.error().c_str());
   }

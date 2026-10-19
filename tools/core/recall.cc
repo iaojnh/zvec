@@ -500,7 +500,7 @@ class Recall {
       linear_fs = output_fs[thread_index].second;
     }
 
-    auto cal_recall = [&, this](const std::vector<IndexDocument> &knn_res,
+    auto cal_recall = [&, this](const IndexDocumentList &knn_res,
                                 size_t query_idx) {
       vector<IndexDocument> linear_res;
 
@@ -1205,7 +1205,7 @@ class SparseRecall {
       linear_fs = output_fs[thread_index].second;
     }
 
-    auto cal_recall = [&, this](const std::vector<IndexDocument> &knn_res,
+    auto cal_recall = [&, this](const IndexDocumentList &knn_res,
                                 size_t query_idx) {
       vector<IndexDocument> linear_res;
 

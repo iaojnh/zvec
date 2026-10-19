@@ -18,6 +18,7 @@
 #include <limits>
 #include <gtest/gtest.h>
 #include <zvec/ailego/utility/float_helper.h>
+#include "db/index/common/serialized_doc_memory.h"
 #include "utils/utils.h"
 #include "zvec/db/index_params.h"
 #include "zvec/db/status.h"
@@ -38,6 +39,109 @@ class DocDetailedTest : public ::testing::Test {
 
   Doc::Ptr test_doc_;
 };
+
+TEST_F(DocDetailedTest, SerializedSizeMatchesEveryValueType) {
+  const std::vector<Doc::Value> values{
+      std::monostate{},
+      true,
+      int32_t{-3},
+      uint32_t{4},
+      int64_t{-5},
+      uint64_t{6},
+      float{1.5f},
+      double{2.5},
+      std::string("ab\0c", 4),
+      std::vector<bool>{true, false},
+      std::vector<int8_t>{1, -2},
+      std::vector<int16_t>{1, -2},
+      std::vector<int32_t>{1, -2},
+      std::vector<int64_t>{1, -2},
+      std::vector<uint32_t>{1, 2},
+      std::vector<uint64_t>{1, 2},
+      std::vector<zvec::float16_t>{zvec::float16_t(1.0f)},
+      std::vector<float>{1.0f, 2.0f},
+      std::vector<double>{1.0, 2.0},
+      std::vector<std::string>{"", "hello", std::string(4096, 'x')},
+      std::make_pair(std::vector<uint32_t>{1, 3}, std::vector<float>{1, 2}),
+      std::make_pair(std::vector<uint32_t>{1},
+                     std::vector<zvec::float16_t>{zvec::float16_t(1.0f)})};
+  for (const auto &value : values) {
+    SCOPED_TRACE(value.index());
+    std::visit(
+        [&](const auto &v) {
+          if constexpr (std::is_same_v<std::decay_t<decltype(v)>,
+                                       std::monostate>)
+            test_doc_->set_null("value");
+          else
+            test_doc_->set("value", v);
+        },
+        value);
+    const auto bytes = test_doc_->serialize();
+    EXPECT_EQ(test_doc_->serialized_size(), bytes.size());
+    const auto restored = Doc::deserialize(bytes.data(), bytes.size());
+    ASSERT_NE(nullptr, restored);
+    EXPECT_EQ(bytes, restored->serialize());
+    size_t estimated = 0;
+    ASSERT_TRUE(detail::EstimateSerializedDocMemory(bytes.data(), bytes.size(),
+                                                    &estimated));
+    EXPECT_GE(estimated, restored->memory_usage());
+    // Every prefix must fail before following a length outside the record.
+    for (size_t length = 0; length < bytes.size(); ++length) {
+      EXPECT_EQ(nullptr, Doc::deserialize(bytes.data(), length)) << length;
+      size_t unchanged = 123;
+      EXPECT_FALSE(detail::EstimateSerializedDocMemory(bytes.data(), length,
+                                                       &unchanged));
+      EXPECT_EQ(123u, unchanged);
+    }
+  }
+}
+
+TEST_F(DocDetailedTest, DecodeEstimateIncludesEmptyStringArrayAndHashNodes) {
+  ASSERT_TRUE(test_doc_->set<std::vector<std::string>>(
+      "empty_strings", std::vector<std::string>(10000)));
+  for (int i = 0; i < 1024; ++i)
+    test_doc_->set_null("field" + std::to_string(i));
+  const auto bytes = test_doc_->serialize();
+  size_t estimated = 0;
+  ASSERT_TRUE(detail::EstimateSerializedDocMemory(bytes.data(), bytes.size(),
+                                                  &estimated));
+  auto restored = Doc::deserialize(bytes);
+  ASSERT_NE(nullptr, restored);
+  EXPECT_GE(estimated, restored->memory_usage());
+  EXPECT_GT(estimated, bytes.size() * 4);
+  EXPECT_FALSE(detail::EstimateSerializedDocMemory(nullptr, 0, &estimated));
+  EXPECT_FALSE(
+      detail::EstimateSerializedDocMemory(bytes.data(), bytes.size(), nullptr));
+}
+
+TEST_F(DocDetailedTest, RejectsInvalidSerializedLengthsBeforeAllocation) {
+  EXPECT_EQ(nullptr, Doc::deserialize(nullptr, 0));
+  for (const auto &value : {Doc::Value(std::string("text")),
+                            Doc::Value(std::vector<std::string>{"a", "b"}),
+                            Doc::Value(std::vector<double>{1, 2})}) {
+    Doc doc;
+    std::visit(
+        [&](const auto &v) {
+          if constexpr (std::is_same_v<std::decay_t<decltype(v)>,
+                                       std::monostate>)
+            doc.set_null("v");
+          else
+            doc.set("v", v);
+        },
+        value);
+    auto bytes = doc.serialize();
+    // Empty pk, one field named v: corrupt its string/array length.
+    const size_t length_offset = sizeof(uint32_t) + sizeof(float) +
+                                 sizeof(uint64_t) + sizeof(Operator) +
+                                 2 * sizeof(uint32_t) + 1 + sizeof(uint8_t);
+    ASSERT_LT(length_offset + sizeof(uint32_t), bytes.size());
+    std::fill_n(bytes.begin() + length_offset, sizeof(uint32_t), uint8_t{255});
+    EXPECT_EQ(nullptr, Doc::deserialize(bytes));
+  }
+  auto bytes = test_doc_->serialize();
+  bytes.push_back(0);
+  EXPECT_EQ(nullptr, Doc::deserialize(bytes));
+}
 
 // Test serialization and deserialization of basic data types
 TEST_F(DocDetailedTest, BasicTypeSerializationDeserialization) {

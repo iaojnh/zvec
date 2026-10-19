@@ -24,8 +24,7 @@
 #include "db/common/constants.h"
 #include "db/common/typedef.h"
 #include "db/common/utils.h"
-#include "db/index/column/fts_column/fts_types.h"
-#include "db/index/column/fts_column/tokenizer/tokenizer_factory.h"
+#include "db/index/column/fts_column/fts_pipeline.h"
 #include "db/index/common/identifier_validation.h"
 #include "db/index/common/type_helper.h"
 
@@ -67,13 +66,13 @@ static Status validate_fts_index_params(const FieldSchema &field) {
         field.name(), "] has incompatible index params");
   }
 
-  fts::FtsIndexParams internal_params;
-  internal_params.tokenizer_name = params->tokenizer_name();
-  internal_params.filters = params->filters();
-  internal_params.extra_params = params->extra_params();
-
-  auto pipeline = fts::TokenizerFactory::create(internal_params);
+  // Reuse the validated analyzer for opening/querying. Constructing and
+  // discarding a full Jieba dictionary here doubles loader work and leaves
+  // allocator backing behind before the actual indexer opens.
+  auto pipeline = detail::AcquireFtsPipeline(*params);
   if (!pipeline.has_value()) {
+    if (pipeline.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return pipeline.error();
     return Status::InvalidArgument(
         "Invalid schema: invalid FTS index params for field[", field.name(),
         "]: ", pipeline.error().message());

@@ -17,9 +17,11 @@
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <queue>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <variant>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/index_params.h>
 #include <zvec/db/reranker.h>
@@ -38,8 +40,17 @@ Result<DocPtrList> score_based_rerank(const ScoreFn &score_fn,
     return DocPtrList();
   }
 
-  std::unordered_map<std::string, double> scores;
-  std::unordered_map<std::string, Doc::Ptr> id_to_doc;
+  // Borrow keys from the input documents, which outlive this operation.
+  // Keep score and document together instead of copying every PK twice.
+  struct Candidate {
+    double score{0};
+    Doc::Ptr doc;
+  };
+  using Entry = std::pair<const std::string_view, Candidate>;
+  std::unordered_map<std::string_view, Candidate, std::hash<std::string_view>,
+                     std::equal_to<std::string_view>,
+                     ailego::BudgetedAllocator<Entry>>
+      scores;
 
   for (size_t field_idx = 0; field_idx < results.size(); ++field_idx) {
     const auto &docs = results[field_idx];
@@ -51,34 +62,36 @@ Result<DocPtrList> score_based_rerank(const ScoreFn &score_fn,
       if (!rs.has_value()) {
         return tl::make_unexpected(rs.error());
       }
-      scores[doc_id] += rs.value();
-      if (id_to_doc.find(doc_id) == id_to_doc.end()) {
-        id_to_doc[doc_id] = doc;
-      }
+      auto &candidate = scores[doc_id];
+      candidate.score += rs.value();
+      if (!candidate.doc) candidate.doc = doc;
     }
   }
 
-  using ScorePair = std::pair<std::string, double>;
+  using ScorePair = const Candidate *;
   auto cmp = [](const ScorePair &a, const ScorePair &b) {
-    return a.second > b.second;
+    return a->score > b->score;
   };
-  std::priority_queue<ScorePair, std::vector<ScorePair>, decltype(cmp)> pq(cmp);
+  std::priority_queue<
+      ScorePair, std::vector<ScorePair, ailego::BudgetedAllocator<ScorePair>>,
+      decltype(cmp)>
+      pq(cmp);
 
-  for (const auto &[doc_id, score] : scores) {
+  for (const auto &entry : scores) {
+    const auto &candidate = entry.second;
     if (static_cast<int>(pq.size()) < topn) {
-      pq.emplace(doc_id, score);
-    } else if (score > pq.top().second) {
+      pq.push(&candidate);
+    } else if (candidate.score > pq.top()->score) {
       pq.pop();
-      pq.emplace(doc_id, score);
+      pq.push(&candidate);
     }
   }
 
   DocPtrList result;
   result.reserve(pq.size());
   while (!pq.empty()) {
-    const auto &[doc_id, score] = pq.top();
-    auto doc = std::move(id_to_doc[doc_id]);
-    doc->set_score(static_cast<float>(score));
+    auto doc = pq.top()->doc;
+    doc->set_score(static_cast<float>(pq.top()->score));
     result.push_back(std::move(doc));
     pq.pop();
   }
@@ -114,7 +127,7 @@ namespace reranker {
 Result<DocPtrList> rerank(const RerankParams &params,
                           const std::vector<DocPtrList> &results,
                           const std::vector<FieldSchema::Ptr> &fields,
-                          int topn) {
+                          int topn) try {
   return std::visit(
       [&](const auto &p) -> Result<DocPtrList> {
         using T = std::decay_t<decltype(p)>;
@@ -161,6 +174,9 @@ Result<DocPtrList> rerank(const RerankParams &params,
         }
       },
       params);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient reranking workspace"));
 }
 
 }  // namespace reranker

@@ -22,20 +22,14 @@
 #include "db/common/file_helper.h"
 #include "db/common/typedef.h"
 
-#define MAX_RECORD_SIZE 4194304  // 4Mb
-
 namespace zvec {
 
-int LocalWalFile::append(std::string &&data) {
-  WalRecord record;
-  record.length_ = data.size();
-  record.crc_ = ailego::Crc32c::Hash(
-      reinterpret_cast<const void *>(data.data()), record.length_, 0);
-  record.content_ = std::forward<std::string>(data);
-
-  if (write_record(record) < 0) {
-    WLOG_ERROR("Wal write record error. record.length_[%zu]",
-               (size_t)record.length_);
+int LocalWalFile::append(std::string_view data) {
+  // Match the reader's limit before writing any part of an invalid record.
+  if (data.empty() || data.size() > kMaxRecordSize) return -1;
+  const uint32_t crc = ailego::Crc32c::Hash(data.data(), data.size(), 0);
+  if (write_record(data, crc) < 0) {
+    WLOG_ERROR("Wal write record error. record.length_[%zu]", data.size());
     return -1;
   }
   // if max_docs_wal_flush_ is 0, no need flush
@@ -49,15 +43,20 @@ int LocalWalFile::append(std::string &&data) {
   return 0;
 }
 
-std::string LocalWalFile::next() {
+std::string LocalWalFile::next(const ReadAdmission &admit) try {
+  read_status_ = Status::OK();
   WalRecord record;
-  if (read_record(record) > 0) {
+  const int ret = read_record(record, admit);
+  if (ret < 0) {
+    read_status_ = Status::InternalError("Failed to read WAL record");
+  } else if (ret > 0) {
     uint32_t tmp_crc = ailego::Crc32c::Hash(
         reinterpret_cast<const void *>(record.content_.data()), record.length_,
         0);
     if (tmp_crc == record.crc_) {
       return std::move(record.content_);
     } else {
+      read_status_ = Status::InternalError("WAL record checksum mismatch");
       WLOG_ERROR(
           "Wal next error. record.length_[%zu] crc_[%zu] != tmp_crc[%zu]",
           (size_t)record.length_, (size_t)record.crc_, (size_t)tmp_crc);
@@ -65,6 +64,10 @@ std::string LocalWalFile::next() {
   }
   // end of file or read error
   return std::string();
+} catch (const std::bad_alloc &) {
+  read_status_ = Status(StatusCode::RESOURCE_EXHAUSTED,
+                        "Insufficient memory for WAL record");
+  return {};
 }
 
 int LocalWalFile::open(const WalOptions &wal_option) {
@@ -158,31 +161,31 @@ int LocalWalFile::prepare_for_read() {
 }
 
 //! Return 1 if success or -1 if write error
-int LocalWalFile::write_record(WalRecord &record) {
+int LocalWalFile::write_record(std::string_view data, uint32_t crc) {
   CHECK_STATUS(opened_, true);
+  const auto length = static_cast<uint32_t>(data.size());
 
   int write_size = 0;
   int ret = -1;
 
   std::lock_guard<std::mutex> lock(file_mutex_);
   do {
-    write_size = file_.write((const void *)&record.length_, LENGTH_SIZE);
+    write_size = file_.write(&length, LENGTH_SIZE);
     if (write_size != LENGTH_SIZE) {
       WLOG_ERROR("Wal write error. record.length_ error write_size[%d]",
                  write_size);
       break;
     }
 
-    write_size = file_.write((const void *)&record.crc_, CRC_SIZE);
+    write_size = file_.write(&crc, CRC_SIZE);
     if (write_size != CRC_SIZE) {
       WLOG_ERROR("Wal write error. record.crc_ error write_size[%d]",
                  write_size);
       break;
     }
 
-    write_size =
-        file_.write((const void *)record.content_.data(), record.length_);
-    if (write_size != (int)record.length_) {
+    write_size = file_.write(data.data(), length);
+    if (write_size != static_cast<int>(length)) {
       WLOG_ERROR("Wal write error. record.content_ error write_size[%d]",
                  write_size);
       break;
@@ -195,7 +198,7 @@ int LocalWalFile::write_record(WalRecord &record) {
 }
 
 //! Return 1 if success or 0 if eof or -1 if read error
-int LocalWalFile::read_record(WalRecord &record) {
+int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   CHECK_STATUS(opened_, true);
 
   int read_size = 0;
@@ -224,12 +227,13 @@ int LocalWalFile::read_record(WalRecord &record) {
     }
 
     // resize may crash if record.length_ very large
-    if (record.length_ <= 0 || record.length_ > MAX_RECORD_SIZE) {
+    if (record.length_ <= 0 || record.length_ > kMaxRecordSize) {
       WLOG_ERROR("Wal read error. record.length_ value error read_size[%d]",
                  read_size);
       break;
     }
 
+    if (admit) admit(static_cast<size_t>(record.length_) + 1);
     record.content_.resize(record.length_);
     read_size = file_.read((void *)const_cast<char *>(record.content_.data()),
                            record.length_);
