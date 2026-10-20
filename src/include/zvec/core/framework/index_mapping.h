@@ -164,7 +164,7 @@ class IndexMapping {
 
   //! Retrieve magic number of index
   uint32_t magic() const {
-    return (header_ ? header_->magic : 0);
+    return (header_ ? static_cast<uint32_t>(header_->magic) : 0);
   }
 
   //! Retrieve header information
@@ -193,7 +193,6 @@ class IndexMapping {
   bool ishugetlbfs(const std::string &path) const;
 
   int init_meta_section();
-  int init_hugepage_meta_section();
 
  public:
   //! Disable them

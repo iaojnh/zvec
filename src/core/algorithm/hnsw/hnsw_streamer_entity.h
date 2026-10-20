@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include "../streamer_layout.h"
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #endif
@@ -160,6 +161,7 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! Set params: chunk size
   inline void set_chunk_size(size_t val) {
+    configured_chunk_size_ = val;
     chunk_size_ = val;
   }
 
@@ -232,14 +234,17 @@ class HnswStreamerEntity : public HnswEntity {
 
 
  protected:
-  union UpperNeighborIndexMeta {
-    struct {
-      uint32_t level : 4;
-      uint32_t index : 28;  // index is composite type: chunk idx, and the
-                            // N th neighbors in chunk, they two composite
-                            // the 28 bits location
-    } bits;
-    uint32_t data;
+  struct UpperNeighborIndexMeta {
+    uint32_t data{0};
+    uint32_t index() const {
+      return data >> 4;
+    }
+    uint32_t level() const {
+      return data & 15;
+    }
+    void set(uint32_t level, uint32_t index) {
+      data = (index << 4) | (level & 15);
+    }
   };
 
  protected:
@@ -344,10 +349,9 @@ class HnswStreamerEntity : public HnswEntity {
     ailego_assert_abort(it != upper_neighbor_index_->end(),
                         "Get upper neighbor header failed");
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
-    uint32_t chunk_idx = (meta->bits.index) >> upper_neighbor_mask_bits_;
-    uint32_t offset =
-        (((meta->bits.index) & upper_neighbor_mask_) + level - 1) *
-        upper_neighbor_size_;
+    uint32_t chunk_idx = (meta->index()) >> upper_neighbor_mask_bits_;
+    uint32_t offset = (((meta->index()) & upper_neighbor_mask_) + level - 1) *
+                      upper_neighbor_size_;
     sync_chunks(ChunkBroker::CHUNK_TYPE_UPPER_NEIGHBOR, chunk_idx,
                 &upper_neighbor_chunks_);
     ailego_assert_abort(chunk_idx < upper_neighbor_chunks_.size(),
@@ -427,9 +431,8 @@ class HnswStreamerEntity : public HnswEntity {
     ailego_assert_with(chunk_index < (1U << (28 - upper_neighbor_mask_bits_)),
                        "invalid chunk index");
     UpperNeighborIndexMeta meta;
-    meta.bits.level = level;
-    meta.bits.index = (chunk_index << upper_neighbor_mask_bits_) |
-                      (chunk_offset / upper_neighbor_size_);
+    meta.set(level, (chunk_index << upper_neighbor_mask_bits_) |
+                        (chunk_offset / upper_neighbor_size_));
     size_t zero_start = chunk_offset;
     chunk_offset += upper_neighbor_size_ * level;
 
@@ -471,43 +474,26 @@ class HnswStreamerEntity : public HnswEntity {
     return node_chunks_.capacity() * node_cnt_per_chunk_;
   }
 
-  int init_chunk_params(size_t max_index_size, bool huge_page) {
-    node_cnt_per_chunk_ = std::max<uint32_t>(1, chunk_size_ / node_size());
-    //! align node cnt per chunk to pow of 2
-    node_index_mask_bits_ = std::ceil(std::log2(node_cnt_per_chunk_));
-    node_cnt_per_chunk_ = 1UL << node_index_mask_bits_;
-    if (huge_page) {
-      chunk_size_ = AlignHugePageSize(node_cnt_per_chunk_ * node_size());
-    } else {
-      chunk_size_ = AlignPageSize(node_cnt_per_chunk_ * node_size());
+  int init_chunk_params(const IndexStorage::Pointer &storage,
+                        size_t max_index_size) {
+    StreamerLayout layout{};
+    const int ret = StreamerLayout::Bind(
+        storage, StreamerLayout::Hnsw, configured_chunk_size_, node_size(),
+        upper_neighbor_size_, scaling_factor(), kMaxGraphLayers, &layout);
+    if (ret != 0) {
+      return ret;
     }
+    layout_ = layout;
+    chunk_size_ = layout.node_chunk_size;
+    node_cnt_per_chunk_ = layout.node_count;
+    node_index_mask_bits_ = layout.node_mask_bits;
     node_index_mask_ = node_cnt_per_chunk_ - 1;
-
-    if (max_index_size == 0UL) {
-      max_index_size_ = chunk_size_ * kDefaultMaxChunkCnt;
-    } else {
-      max_index_size_ = max_index_size;
-    }
-
-    //! To get a balanced upper neighbor chunk size.
-    //! If the upper chunk size is equal to node chunk size, it may waste
-    //! upper neighbor chunk space; if the upper neighbor chunk size is too
-    //! small, the will need large upper neighbor chunks index space. So to
-    //! get a balanced ratio be sqrt of the node/neighbor size ratio
-    float ratio =
-        std::sqrt(node_size() * scaling_factor() * 1.0f / upper_neighbor_size_);
-    if (huge_page) {
-      upper_neighbor_chunk_size_ = AlignHugePageSize(
-          std::max(get_total_upper_neighbors_size(kMaxGraphLayers),
-                   static_cast<size_t>(chunk_size_ / ratio)));
-    } else {
-      upper_neighbor_chunk_size_ = AlignPageSize(
-          std::max(get_total_upper_neighbors_size(kMaxGraphLayers),
-                   static_cast<size_t>(chunk_size_ / ratio)));
-    }
-    upper_neighbor_mask_bits_ =
-        std::ceil(std::log2(upper_neighbor_chunk_size_ / upper_neighbor_size_));
-    upper_neighbor_mask_ = (1 << upper_neighbor_mask_bits_) - 1;
+    upper_neighbor_chunk_size_ = layout.upper_chunk_size;
+    upper_neighbor_mask_bits_ = layout.upper_mask_bits;
+    upper_neighbor_mask_ = (uint32_t{1} << upper_neighbor_mask_bits_) - 1;
+    max_index_size_ = max_index_size
+                          ? max_index_size
+                          : uint64_t{chunk_size_} * kDefaultMaxChunkCnt;
 
     size_t max_node_chunk_cnt = std::ceil(max_index_size_ / chunk_size_);
     size_t max_upper_chunk_cnt = std::ceil(
@@ -525,10 +511,10 @@ class HnswStreamerEntity : public HnswEntity {
         "Settings: nodeSize=%zu chunkSize=%u upperNeighborSize=%u "
         "upperNeighborChunkSize=%u "
         "nodeCntPerChunk=%u maxChunkCnt=%zu maxNeighborChunkCnt=%zu "
-        "maxIndexSize=%zu ratio=%.3f",
+        "maxIndexSize=%zu",
         node_size(), chunk_size_, upper_neighbor_size_,
         upper_neighbor_chunk_size_, node_cnt_per_chunk_, max_node_chunk_cnt,
-        max_upper_chunk_cnt, max_index_size_, ratio);
+        max_upper_chunk_cnt, max_index_size_);
 
     return 0;
   }
@@ -584,6 +570,8 @@ class HnswStreamerEntity : public HnswEntity {
   //! Shared via shared_ptr so all clones synchronize on the SAME mutex.
   mutable std::shared_ptr<std::shared_mutex> upper_neighbor_rw_mutex_{};
   size_t max_index_size_{0UL};
+  StreamerLayout layout_{};
+  uint32_t configured_chunk_size_{kDefaultChunkSize};
   uint32_t chunk_size_{kDefaultChunkSize};
   uint32_t upper_neighbor_chunk_size_{kDefaultChunkSize};
   uint32_t node_index_mask_bits_{0U};
@@ -857,10 +845,9 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
     ailego_assert_abort(it != upper_neighbor_index_->end(),
                         "Get upper neighbor header failed");
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
-    uint32_t chunk_idx = (meta->bits.index) >> upper_neighbor_mask_bits_;
-    uint32_t offset =
-        (((meta->bits.index) & upper_neighbor_mask_) + level - 1) *
-        upper_neighbor_size_;
+    uint32_t chunk_idx = (meta->index()) >> upper_neighbor_mask_bits_;
+    uint32_t offset = (((meta->index()) & upper_neighbor_mask_) + level - 1) *
+                      upper_neighbor_size_;
     const char *base = get_upper_neighbor_chunk_base(chunk_idx);
     MmapMemoryBlock block(const_cast<char *>(base + offset));
     return TypedNeighbors(std::move(block));
@@ -1050,8 +1037,8 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
       ailego_assert_abort(it != upper_neighbor_index_->end(),
                           "Get upper neighbor header failed");
       auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
-      uint32_t chunk_idx = (meta->bits.index) >> upper_neighbor_mask_bits_;
-      uint32_t local_idx = (meta->bits.index) & upper_neighbor_mask_;
+      uint32_t chunk_idx = (meta->index()) >> upper_neighbor_mask_bits_;
+      uint32_t local_idx = (meta->index()) & upper_neighbor_mask_;
       size_t global_offset =
           upper_chunk_offsets_[chunk_idx] +
           static_cast<size_t>(local_idx + level - 1) * upper_neighbor_size_;

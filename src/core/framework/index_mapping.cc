@@ -34,16 +34,8 @@
 namespace zvec {
 namespace core {
 
-static inline size_t CalcPageAlignedSize(size_t size, bool huge_size) {
-  size_t page_size = ailego::MemoryHelper::PageSize();
-  if (huge_size) {
-    page_size = ailego::MemoryHelper::HugePageSize();
-  }
-  return (size + page_size - 1) / page_size * page_size;
-}
-
 static inline bool WritePadding(ailego::File &file, size_t size) {
-  std::string padding(ailego::MemoryHelper::PageSize(), 0);
+  std::string padding(kDiskAlignment, 0);
   for (size_t i = 0, count = size / padding.size(); i < count; ++i) {
     if (file.write(padding.data(), padding.size()) != padding.size()) {
       return false;
@@ -58,17 +50,19 @@ static inline bool WritePadding(ailego::File &file, size_t size) {
   return true;
 }
 
-static inline int UnpackMappingSize(ailego::File &file, size_t *len) {
+static inline int UnpackMappingSize(ailego::File &file, size_t *len,
+                                    uint64_t offset = 0) {
   IndexFormat::MetaHeader header;
-  if (file.read(&header, sizeof(header)) != sizeof(header)) {
+  if (offset > file.size() || sizeof(header) > file.size() - offset ||
+      file.read(offset, &header, sizeof(header)) != sizeof(header)) {
     LOG_ERROR("Failed to read file, %s",
               ailego::FileHelper::GetLastErrorString().c_str());
     return IndexError_ReadData;
   }
 
-  if (header.meta_header_size != sizeof(IndexFormat::MetaHeader) ||
-      header.meta_footer_size != sizeof(IndexFormat::MetaFooter)) {
-    return IndexError_InvalidValue;
+  if (!IndexFormat::Supported(header)) {
+    LOG_ERROR("Unsupported index format; rebuild using format V3");
+    return IndexError_Unsupported;
   }
 
   if (ailego::Crc32c::Hash(&header, sizeof(header), header.header_crc) !=
@@ -80,8 +74,10 @@ static inline int UnpackMappingSize(ailego::File &file, size_t *len) {
     return IndexError_Unsupported;
   }
 
-  *len = header.meta_footer_offset + header.meta_footer_size;
-  if (*len > file.size()) {
+  *len = uint64_t{header.meta_footer_offset} + header.meta_footer_size;
+  if (*len > file.size() - offset || *len != header.content_offset ||
+      *len % kDiskAlignment != 0 || offset % kDiskAlignment != 0 ||
+      header.meta_footer_offset < sizeof(header)) {
     return IndexError_InvalidLength;
   }
   return 0;
@@ -89,9 +85,14 @@ static inline int UnpackMappingSize(ailego::File &file, size_t *len) {
 
 int IndexMapping::open(const std::string &path, bool cow, bool full_mode) {
   path_ = path;
+  current_header_start_offset_ = 0;
   full_mode_ = full_mode;
   copy_on_write_ = cow;
   huge_page_ = ishugetlbfs(path);
+  if (huge_page_ || !NativeDiskPayloadSupported()) {
+    LOG_ERROR("V3 requires a little-endian host and a regular file system");
+    return IndexError_Unsupported;
+  }
 
   bool read_only = copy_on_write_ && !full_mode_;
   if (!file_.open(path.c_str(), read_only, false)) {
@@ -127,25 +128,25 @@ int IndexMapping::create(const std::string &path, size_t seg_meta_capacity) {
     return IndexError_CreateFile;
   }
   huge_page_ = ishugetlbfs(path);
-  if (huge_page_) {
-    return init_hugepage_meta_section();
+  if (huge_page_ || !NativeDiskPayloadSupported()) {
+    LOG_ERROR("V3 requires a little-endian host and a regular file system");
+    return IndexError_Unsupported;
   }
   return init_meta_section();
 }
 
 int IndexMapping::init_meta_section() {
-  if (current_header_start_offset_ % ailego::MemoryHelper::PageSize() != 0) {
-    LOG_ERROR("File offset %zu is not a multiple of the page size: %zu",
-              (size_t)current_header_start_offset_,
-              ailego::MemoryHelper::PageSize());
+  if (current_header_start_offset_ % kDiskAlignment != 0) {
     return IndexError_InvalidValue;
   }
-
-  auto &path = path_;
-  size_t len =
-      CalcPageAlignedSize(seg_meta_capacity_ + sizeof(IndexFormat::MetaHeader) +
-                              sizeof(IndexFormat::MetaFooter),
-                          false);
+  const auto &path = path_;
+  constexpr size_t overhead =
+      sizeof(IndexFormat::MetaHeader) + sizeof(IndexFormat::MetaFooter);
+  uint64_t len = 0;
+  if (seg_meta_capacity_ > INT32_MAX - overhead ||
+      !AlignDiskSize(seg_meta_capacity_ + overhead, &len) || len > INT32_MAX) {
+    return IndexError_InvalidLength;
+  }
 
   IndexFormat::MetaHeader meta_header;
   IndexFormat::MetaFooter meta_footer;
@@ -185,56 +186,6 @@ int IndexMapping::init_meta_section() {
   return this->init_index_mapping(len);
 }
 
-int IndexMapping::init_hugepage_meta_section() {
-  ssize_t file_offset = (ssize_t)current_header_start_offset_;
-  if (file_offset % ailego::MemoryHelper::HugePageSize() != 0) {
-    LOG_ERROR("File offset %zu is not a multiple of the page size: %zu",
-              file_offset, ailego::MemoryHelper::HugePageSize());
-    return IndexError_InvalidValue;
-  }
-
-  size_t len =
-      CalcPageAlignedSize(seg_meta_capacity_ + sizeof(IndexFormat::MetaHeader) +
-                              sizeof(IndexFormat::MetaFooter),
-                          true);
-  int opts = ailego::File::MMAP_SHARED | ailego::File::MMAP_HUGE_PAGE;
-  void *addr =
-      ailego::File::MemoryMap(file_.native_handle(), file_offset, len, opts);
-
-  IndexFormat::MetaHeader meta_header;
-  IndexFormat::MetaFooter meta_footer;
-
-  // Write index header
-  IndexFormat::SetupMetaHeader(&meta_header, len - sizeof(meta_footer), len);
-  memcpy((char *)addr + file_offset, &meta_header, sizeof(meta_header));
-  file_offset += sizeof(meta_header);
-
-  // Write padding data
-  uint32_t segments_meta_size =
-      static_cast<uint32_t>(len - (sizeof(meta_header) + sizeof(meta_footer)));
-  std::string padding(ailego::MemoryHelper::HugePageSize(), 0);
-  for (size_t i = 0, count = segments_meta_size / padding.size(); i < count;
-       ++i) {
-    memcpy((char *)addr + file_offset, padding.data(), padding.size());
-    file_offset += padding.size();
-  }
-  padding.resize(segments_meta_size % padding.size());
-  if (padding.size()) {
-    memcpy((char *)addr + file_offset, padding.data(), padding.size());
-    file_offset += padding.size();
-  }
-
-  // Write index footer
-  IndexFormat::SetupMetaFooter(&meta_footer);
-  meta_footer.segments_meta_size = segments_meta_size;
-  meta_footer.total_size = len;
-  IndexFormat::UpdateMetaFooter(&meta_footer, 0);
-  memcpy((char *)addr + file_offset, &meta_footer, sizeof(meta_footer));
-  file_offset += sizeof(meta_footer);
-
-  return this->init_index_mapping(len);
-}
-
 void IndexMapping::close() {
   // Unmap all memory
   this->unmap_all();
@@ -246,6 +197,7 @@ void IndexMapping::close() {
   }
   // Reset members
   segment_ids_offset_ = 0;
+  current_header_start_offset_ = 0;
   segment_start_ = nullptr;
   header_ = nullptr;
   header_addr_map_.clear();
@@ -276,17 +228,22 @@ void IndexMapping::refresh(uint64_t check_point) {
 }
 
 int IndexMapping::append(const std::string &id, size_t size) {
-  size = CalcPageAlignedSize(size, huge_page_);
-  if (size == 0) {
+  uint64_t aligned = 0;
+  if (!AlignDiskSize(size, &aligned) || aligned > SIZE_MAX ||
+      aligned > INT64_MAX - index_size_ || aligned == 0) {
     return IndexError_InvalidArgument;
   }
 
+  size = static_cast<size_t>(aligned);
   if (segments_.find(id) != segments_.end()) {
     return IndexError_Duplicate;
   }
 
   size_t id_size = std::strlen(id.c_str()) + 1;
   size_t need_size = sizeof(IndexFormat::SegmentMeta) + id_size;
+  if (need_size > seg_meta_capacity_ || id.find('\0') != std::string::npos) {
+    return IndexError_InvalidArgument;
+  }
   if (sizeof(IndexFormat::SegmentMeta) * footer_->segment_count + need_size >
       segment_ids_offset_) {
     LOG_DEBUG("segment meta section expanded: %s", path_.c_str());
@@ -299,8 +256,7 @@ int IndexMapping::append(const std::string &id, size_t size) {
     footer_ = nullptr;
 
     current_header_start_offset_ = index_size_;
-    const int ret =
-        huge_page_ ? init_hugepage_meta_section() : init_meta_section();
+    const int ret = init_meta_section();
     if (ret != 0) {
       return ret;
     }
@@ -491,23 +447,17 @@ int IndexMapping::init_index_mapping(size_t len) {
   }
 
   // Unpack header
-  header_ = reinterpret_cast<IndexFormat::MetaHeader *>(start);
+  auto *mapped_header = reinterpret_cast<IndexFormat::MetaHeader *>(start);
+  if (!IndexFormat::Supported(*mapped_header) ||
+      mapped_header->content_offset != len ||
+      ailego::Crc32c::Hash(mapped_header, sizeof(*mapped_header),
+                           mapped_header->header_crc) !=
+          mapped_header->header_crc) {
+    ailego::File::MemoryUnmap(start, len);
+    return IndexError_InvalidFormat;
+  }
+  header_ = mapped_header;
   header_addr_map_.insert({current_header_start_offset_, header_});
-  if (header_->meta_header_size != sizeof(IndexFormat::MetaHeader)) {
-    return IndexError_InvalidLength;
-  }
-  if (ailego::Crc32c::Hash(header_, sizeof(*header_), header_->header_crc) !=
-      header_->header_crc) {
-    return IndexError_InvalidChecksum;
-  }
-
-  switch (header_->version) {
-    case IndexFormat::FORMAT_VERSION:
-      break;
-    default:
-      LOG_ERROR("Unsupported index version: %u", header_->version);
-      return IndexError_Unsupported;
-  }
 
   // Unpack footer
   if (header_->meta_footer_size != sizeof(IndexFormat::MetaFooter)) {
@@ -522,15 +472,16 @@ int IndexMapping::init_index_mapping(size_t len) {
   }
 
   footer_ = reinterpret_cast<IndexFormat::MetaFooter *>(start + footer_offset);
-  if (footer_offset < footer_->segments_meta_size) {
+  if (footer_->segments_meta_size > footer_offset - sizeof(*header_)) {
     return IndexError_InvalidLength;
   }
 
   index_size_ = file_.size();
-  if ((footer_->total_size > index_size_) ||
-      (footer_->content_size + footer_->content_padding_size +
-           header_->content_offset >
-       index_size_)) {
+  const uint64_t remaining = index_size_ - current_header_start_offset_;
+  if (footer_->total_size > remaining || footer_->total_size < len ||
+      footer_->content_size > footer_->total_size - len ||
+      footer_->content_padding_size >
+          footer_->total_size - len - footer_->content_size) {
     return IndexError_InvalidLength;
   }
   if (ailego::Crc32c::Hash(footer_, sizeof(*footer_), footer_->footer_crc) !=
@@ -552,17 +503,25 @@ int IndexMapping::init_index_mapping(size_t len) {
     return IndexError_InvalidChecksum;
   }
 
+  seg_meta_capacity_ = footer_->segments_meta_size;
   segment_ids_offset_ = footer_->segments_meta_size;
   for (IndexFormat::SegmentMeta *iter = segment_start_,
                                 *end = segment_start_ + footer_->segment_count;
        iter != end; ++iter) {
-    if (iter->segment_id_offset > footer_->segments_meta_size) {
+    if (iter->segment_id_offset >= footer_->segments_meta_size) {
       return IndexError_InvalidValue;
     }
     if (iter->data_index > footer_->content_size) {
       return IndexError_InvalidValue;
     }
-    if (iter->data_index + iter->data_size > footer_->content_size) {
+    if (iter->data_size > footer_->content_size - iter->data_index ||
+        iter->padding_size >
+            footer_->content_size - iter->data_index - iter->data_size ||
+        iter->data_index % kDiskAlignment != 0 ||
+        (iter->data_size + iter->padding_size) % kDiskAlignment != 0 ||
+        !memchr(reinterpret_cast<const char *>(segment_start_) +
+                    iter->segment_id_offset,
+                0, footer_->segments_meta_size - iter->segment_id_offset)) {
       return IndexError_InvalidLength;
     }
 
@@ -579,21 +538,20 @@ int IndexMapping::init_index_mapping(size_t len) {
     return IndexError_InvalidLength;
   }
 
-  // if (header_->version == IndexFormat::COMPATIBLE_FORMAT_VERSION_0X0002) {
-  //   header_->version = IndexFormat::CURRENT_FORMAT_VERSION;
-  //   LOG_INFO("Index file format upgraded");
-  //   IndexFormat::UpdateMetaHeader(header_);
-  //   footer_->segments_meta_crc =
-  //       ailego::Crc32c::Hash(segment_start_, footer_->segments_meta_size, 0);
-  //   IndexFormat::UpdateMetaFooter(footer_, 0);
-  //   header_dirty_ = true;
-  // }
-
   if (footer_->next_meta_header_offset > 0) {
-    current_header_start_offset_ = footer_->next_meta_header_offset;
-    // Meta sections have all the same size, so we can use the same size to map
-    // the next meta section
-    return this->init_index_mapping(len);
+    const uint64_t next = footer_->next_meta_header_offset;
+    if (next < current_header_start_offset_ + footer_->total_size ||
+        next <= current_header_start_offset_ ||
+        header_addr_map_.size() >= 1024) {
+      return IndexError_InvalidLength;
+    }
+    size_t next_length = 0;
+    const int ret = UnpackMappingSize(file_, &next_length, next);
+    if (ret != 0) {
+      return ret;
+    }
+    current_header_start_offset_ = next;
+    return this->init_index_mapping(next_length);
   }
 
   return 0;

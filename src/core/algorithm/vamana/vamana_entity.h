@@ -46,7 +46,8 @@ struct VamanaGraphHeader {
   uint8_t reserved_[4076];
 };
 
-static_assert(sizeof(VamanaGraphHeader) % 32 == 0,
+static_assert(sizeof(VamanaGraphHeader) == 4128 &&
+                  offsetof(VamanaGraphHeader, reserved_) == 52,
               "VamanaGraphHeader must be aligned with 32 bytes");
 
 struct VamanaHeader {
@@ -351,10 +352,6 @@ class VamanaEntity {
     return (size + 0x1F) & (~0x1F);
   }
 
-  static inline size_t AlignPageSize(size_t size) {
-    size_t page_mask = ailego::MemoryHelper::PageSize() - 1;
-    return (size + page_mask) & (~page_mask);
-  }
 
   static inline size_t AlignHugePageSize(size_t size) {
     size_t page_mask = ailego::MemoryHelper::HugePageSize() - 1;

@@ -23,6 +23,7 @@
 #include <ailego/utility/memory_helper.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/utility/string_helper.h>
+#include <zvec/core/framework/disk_format.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_streamer.h>
@@ -324,14 +325,20 @@ class FlatStreamerEntity {
     return segments_[index];
   }
 
-  //! Rejust the segment size as to aligned by page size
-  void adjust_segment_size(StreamerLinearMeta *mt) {
-    if (mt->segment_size < mt->header.block_size) {
-      mt->segment_size = mt->header.block_size;
+  //! Establish disk allocation independently of the host's mapping pages.
+  bool adjust_segment_size(StreamerLinearMeta *mt) {
+    if (mt->header.block_size == 0) {
+      return false;
     }
-    mt->segment_size = ailego_align(
-        mt->segment_size / mt->header.block_size * mt->header.block_size,
-        ailego::MemoryHelper::PageSize());
+    uint64_t aligned = 0;
+    const uint64_t size = std::max(mt->segment_size, mt->header.block_size);
+    if (!AlignDiskSize(size / mt->header.block_size * mt->header.block_size,
+                       &aligned) ||
+        aligned > UINT32_MAX) {
+      return false;
+    }
+    mt->segment_size = aligned;
+    return true;
   }
 
   //! Init with an empty storage

@@ -25,6 +25,7 @@
 #include <ailego/math/norm_matrix.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/container/vector.h>
+#include <zvec/core/framework/index_unpacker.h>
 #include "tests/test_util.h"
 
 #if defined(__GNUC__) || defined(__GNUG__)
@@ -1500,7 +1501,7 @@ TEST_F(HnswSparseStreamerTest, TestCheckStats) {
   ASSERT_EQ(0U, stats.added_count());
   ASSERT_EQ(0U, stats.discarded_count());
   // header chunk + meta chunk
-  size_t init_size = ailego::MemoryHelper::PageSize() * 2;
+  size_t init_size = kDiskAlignment * 2;
   ASSERT_EQ(init_size, stats.index_size());
   ASSERT_EQ(0U, stats.dumped_size());
   ASSERT_EQ(0U, stats.check_point());
@@ -1608,7 +1609,31 @@ TEST_F(HnswSparseStreamerTest, TestCheckStats) {
   struct stat st;
   ASSERT_EQ(3001UL, doc_cnt);
   ASSERT_EQ(0, stat(dpath.c_str(), &st));
-  ASSERT_LT(st.st_size - stats3.dumped_size(), 8192);
+  // Dump statistics count algorithm payload; the container adds a header,
+  // directory, version segment, and independent 4 KiB padding per segment.
+  ailego::File dumped_file;
+  ASSERT_TRUE(dumped_file.open(dpath, true));
+  std::string bytes(dumped_file.size(), '\0');
+  ASSERT_EQ(bytes.size(), dumped_file.read(0, bytes.data(), bytes.size()));
+  IndexUnpacker unpacker;
+  ASSERT_TRUE(unpacker.unpack(
+      [&bytes](size_t offset, const void **data, size_t len) -> size_t {
+        if (offset > bytes.size() || len > bytes.size() - offset) return 0;
+        *data = bytes.data() + offset;
+        return len;
+      },
+      bytes.size(), true));
+  size_t payload_size = 0;
+  size_t simd_padded_size = 0;
+  for (const auto &segment : unpacker.segments()) {
+    if (segment.first != "IndexVersion" && segment.first != "IndexMeta") {
+      payload_size += segment.second.data_size();
+      simd_padded_size += ailego_align(segment.second.data_size(), 32);
+    }
+  }
+  EXPECT_GE(stats3.dumped_size(), payload_size);
+  EXPECT_LE(stats3.dumped_size(), simd_padded_size);
+  EXPECT_LE(stats3.dumped_size(), static_cast<size_t>(st.st_size));
 
   streamer->close();
 }

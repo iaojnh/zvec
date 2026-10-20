@@ -949,7 +949,9 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
 
   std::string str;
   index_meta_.serialize(&str);
-  const size_t page = ailego::MemoryHelper::PageSize();
+  if (str.size() > UINT32_MAX - sizeof(meta_)) {
+    return IndexError_InvalidLength;
+  }
 
   meta_.header.header_size = sizeof(LinearIndexHeader) + str.size();
   meta_.header.total_vector_count = 0;
@@ -958,7 +960,9 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
   meta_.header.index_meta_size = str.size();
   meta_.header.linear_list_count = 1;
 
-  adjust_segment_size(&meta_);
+  if (!adjust_segment_size(&meta_)) {
+    return IndexError_InvalidArgument;
+  }
 
   LOG_DEBUG(
       "Create Streamer Index, VecSize=%u, BlockSize=%u SegmentSize=%u "
@@ -966,7 +970,10 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
       index_meta_.element_size(), meta_.header.block_size, meta_.segment_size,
       meta_.header.linear_list_count);
 
-  size_t size = ailego_align(sizeof(meta_) + str.size(), page);
+  uint64_t size = 0;
+  if (!AlignDiskSize(sizeof(meta_) + str.size(), &size)) {
+    return IndexError_InvalidLength;
+  }
   int ret = storage->append(FLAT_LINEAR_META_SEG_ID, size);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to append segment %s", FLAT_LINEAR_META_SEG_ID.c_str());
@@ -999,12 +1006,15 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
   *stats_.mutable_index_size() += size;
 
   // Init Linear List Head Segment
-  size = ailego_align(sizeof(BlockLocation) * linear_list_count(), page);
+  if (!AlignDiskSize(sizeof(BlockLocation) * uint64_t{linear_list_count()},
+                     &size)) {
+    return IndexError_InvalidLength;
+  }
   ret = storage->append(FLAT_LINEAR_LIST_HEAD_SEG_ID, size);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to append segment %s for %s, size=%zu",
               FLAT_LINEAR_LIST_HEAD_SEG_ID.c_str(), IndexError::What(ret),
-              size);
+              static_cast<size_t>(size));
     return ret;
   }
   segment = storage->get(FLAT_LINEAR_LIST_HEAD_SEG_ID);
@@ -1013,7 +1023,7 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
     return IndexError_Runtime;
   }
   if (segment->resize(size) != size) {
-    LOG_ERROR("Failed to resize segment, size=%zu", size);
+    LOG_ERROR("Failed to resize segment, size=%zu", static_cast<size_t>(size));
     return IndexError_WriteData;
   }
   segments_.emplace_back(std::move(segment));
@@ -1024,8 +1034,6 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
 }
 
 int FlatStreamerEntity::load_linear_meta(IndexStorage::Pointer storage) {
-  adjust_segment_size(&meta_);
-
   // Load Meta Segment
   auto segment = storage->get(FLAT_LINEAR_META_SEG_ID);
   if (!segment || segment->data_size() < sizeof(meta_)) {
@@ -1088,10 +1096,11 @@ int FlatStreamerEntity::load_linear_meta(IndexStorage::Pointer storage) {
         index_meta_.quantizer_name().c_str());
     return IndexError_Mismatch;
   }
-  // Segment Size can be reconfigurable
-  auto segment_size = meta_.segment_size;
+  if (mt->segment_size == 0 || mt->segment_size % kDiskAlignment != 0 ||
+      mt->segment_size < mt->header.block_size) {
+    return IndexError_InvalidFormat;
+  }
   std::memcpy(&meta_, mt, sizeof(meta_));
-  meta_.segment_size = segment_size;
   return 0;
 }
 
@@ -1250,8 +1259,7 @@ int FlatStreamerEntity::alloc_segment() {
 
   std::string segment_id =
       ailego::StringHelper::Concat(FLAT_SEGMENT_FEATURES_SEG_ID, index);
-  size_t size =
-      ailego_align(meta_.segment_size, ailego::MemoryHelper::PageSize());
+  size_t size = meta_.segment_size;
   auto segment = storage_->get(segment_id);
   if (segment) {
     if (segment->padding_size() < linear_block_size()) {

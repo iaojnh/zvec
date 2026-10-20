@@ -26,6 +26,7 @@
 #include "algorithm/hnsw/hnsw_entity.h"  // MmapMemoryBlock, BufferPoolMemoryBlock, NeighborsT
 #include "vamana_entity.h"
 #include "vamana_params.h"
+#include "../streamer_layout.h"
 
 namespace zvec {
 namespace core {
@@ -123,6 +124,7 @@ class VamanaStreamerEntity : public VamanaEntity {
   }
 
   inline void set_chunk_size(size_t val) {
+    configured_chunk_size_ = val;
     chunk_size_ = val;
   }
   inline void set_get_vector(bool val) {
@@ -263,22 +265,22 @@ class VamanaStreamerEntity : public VamanaEntity {
     return node_chunks_.capacity() * node_cnt_per_chunk_;
   }
 
-  int init_chunk_params(size_t max_index_size, bool huge_page) {
-    node_cnt_per_chunk_ = std::max<uint32_t>(1, chunk_size_ / node_size());
-    node_index_mask_bits_ = std::ceil(std::log2(node_cnt_per_chunk_));
-    node_cnt_per_chunk_ = 1UL << node_index_mask_bits_;
-    if (huge_page) {
-      chunk_size_ = AlignHugePageSize(node_cnt_per_chunk_ * node_size());
-    } else {
-      chunk_size_ = AlignPageSize(node_cnt_per_chunk_ * node_size());
+  int init_chunk_params(const IndexStorage::Pointer &storage,
+                        size_t max_index_size) {
+    StreamerLayout layout{};
+    const int ret = StreamerLayout::Bind(storage, StreamerLayout::Vamana,
+                                         configured_chunk_size_, node_size(), 0,
+                                         0, 0, &layout);
+    if (ret != 0) {
+      return ret;
     }
+    chunk_size_ = layout.node_chunk_size;
+    node_cnt_per_chunk_ = layout.node_count;
+    node_index_mask_bits_ = layout.node_mask_bits;
     node_index_mask_ = node_cnt_per_chunk_ - 1;
-
-    if (max_index_size == 0UL) {
-      max_index_size_ = chunk_size_ * kDefaultMaxChunkCnt;
-    } else {
-      max_index_size_ = max_index_size;
-    }
+    max_index_size_ = max_index_size
+                          ? max_index_size
+                          : uint64_t{chunk_size_} * kDefaultMaxChunkCnt;
 
     size_t max_node_chunk_cnt =
         std::ceil(static_cast<double>(max_index_size_) / chunk_size_);
@@ -317,6 +319,7 @@ class VamanaStreamerEntity : public VamanaEntity {
   IndexStreamer::Stats &stats_;
   std::mutex mutex_{};
   size_t max_index_size_{0UL};
+  uint32_t configured_chunk_size_{kDefaultChunkSize};
   uint32_t chunk_size_{kDefaultChunkSize};
   uint32_t node_index_mask_bits_{0U};
   uint32_t node_cnt_per_chunk_{0U};

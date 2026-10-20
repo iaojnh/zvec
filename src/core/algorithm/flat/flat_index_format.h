@@ -66,7 +66,7 @@ struct LinearListMeta {
   uint32_t block_count{0};
   uint32_t vector_count{0};
   uint32_t id_offset{0};
-  char reserved_[16] = {0};
+  char reserved_[20] = {0};
 };
 
 /*! Index Format of Location in Linear Index for each vector
@@ -75,10 +75,13 @@ struct LinearVecLocation {
   LinearVecLocation(size_t off, bool col)
       : offset(off), column_major(col), reserved(0u) {}
 
-  uint64_t offset : 48;       // feature offset in posting block segment
-  uint64_t column_major : 1;  // coloum major if true
-  uint64_t reserved : 15;
+  uint64_t offset;        // feature offset in posting block segment
+  uint32_t column_major;  // coloum major if true
+  uint32_t reserved;
 };
+
+static_assert(sizeof(LinearListMeta) == 40 && sizeof(LinearVecLocation) == 16,
+              "V3 list records must have explicit, fixed-width fields");
 
 /*! Index Format of Integer Quantizer params for each linear list
  */
@@ -97,11 +100,10 @@ struct BlockLocation {
 /*! The Header of a Block in Storage Segment
  */
 struct BlockHeader {
-  BlockHeader() : vector_count(0u), column_major(0u), reserved(0u) {}
+  BlockHeader() : vector_count(0u), column_major(0u) {}
   BlockLocation next;
   uint16_t vector_count{0};
-  uint16_t column_major : 1;
-  uint16_t reserved : 15;
+  uint16_t column_major;
 };
 
 struct DeletionMap {
@@ -165,8 +167,8 @@ struct VectorLocation {
       : segment_id(id), column_major(col), reserved(0u), offset(off) {}
 
   uint32_t segment_id{0};
-  uint16_t column_major : 1;
-  uint16_t reserved : 15;
+  uint16_t column_major;
+  uint16_t reserved;
   uint32_t offset{0};
 
  public:

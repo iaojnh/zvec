@@ -21,6 +21,7 @@
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/time_helper.h>
+#include <zvec/core/framework/disk_format.h>
 #include <zvec/core/framework/index_error.h>
 #include "utility/legacy_read_buffer.h"
 #include "flat_sparse_index_format.h"
@@ -233,7 +234,7 @@ int FlatSparseStreamerEntity::init_storage(IndexStorage::Pointer storage,
                              &streamer_meta_.offset_chunk_size);
 
   // append meta segment
-  size_t size = ailego_align(sizeof(meta_), ailego::MemoryHelper::PageSize());
+  size_t size = ailego_align(sizeof(meta_), kDiskAlignment);
   int ret = storage->append(PARAM_FLAT_SPARSE_META_SEG_ID, size);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to append meta segment %s",
@@ -255,7 +256,7 @@ int FlatSparseStreamerEntity::init_storage(IndexStorage::Pointer storage,
   *stats_.mutable_index_size() += size;
 
   // append streamer meta segment
-  size = ailego_align(sizeof(streamer_meta_), ailego::MemoryHelper::PageSize());
+  size = ailego_align(sizeof(streamer_meta_), kDiskAlignment);
   ret = storage->append(PARAM_FLAT_SPARSE_STREAMER_META_SEG_ID, size);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to append streamer meta segment %s",
