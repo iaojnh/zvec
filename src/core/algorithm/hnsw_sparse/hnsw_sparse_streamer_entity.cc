@@ -55,13 +55,15 @@ int HnswSparseStreamerEntity::init(uint64_t max_index_size,
   size = AlignSize(size);
   set_node_size(size);
 
-  return init_chunk_params(max_index_size);
+  max_index_size_ = max_index_size;
+  return 0;
 }
 
 int HnswSparseStreamerEntity::cleanup() {
   std::lock_guard<std::mutex> lock(mutex_);
   mutable_header()->clear();
   chunk_size_ = kDefaultChunkSize;
+  configured_chunk_size_ = kDefaultChunkSize;
   node_index_mask_bits_ = 0U;
   node_index_mask_ = 0U;
   node_cnt_per_chunk_ = 0U;
@@ -394,15 +396,19 @@ int HnswSparseStreamerEntity::init_chunks(
 
 int HnswSparseStreamerEntity::open(IndexStorage::Pointer stg, bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
-  int ret =
-      broker_->open(std::move(stg), max_index_size_, chunk_size_, check_crc);
+  int ret = init_chunk_params(stg, max_index_size_);
+  if (ret != 0) {
+    return ret;
+  }
+  ret = broker_->open(std::move(stg), max_index_size_, chunk_size_, check_crc);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Open index failed for %s", IndexError::What(ret));
     return ret;
   }
-  ret = upper_neighbor_index_->init(broker_, upper_neighbor_chunk_size_,
-                                    scaling_factor(), estimate_doc_capacity(),
-                                    kUpperHashMemoryInflateRatio);
+  ret = upper_neighbor_index_->init(
+      broker_, upper_neighbor_chunk_size_, scaling_factor(),
+      estimate_doc_capacity(), kUpperHashMemoryInflateRatio,
+      layout_.hash_slot_items, layout_.hash_mask_bits);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Init neighbor hash map failed");
     return ret;
@@ -513,7 +519,7 @@ int HnswSparseStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
       return 0U;
     };
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
-    return meta->bits.level;
+    return meta->level();
   };
   auto ret = dump_segments(dumper, keys.data(), get_level);
   if (ailego_unlikely(ret < 0)) {

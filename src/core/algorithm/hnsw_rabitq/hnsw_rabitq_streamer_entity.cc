@@ -59,6 +59,7 @@ int HnswRabitqStreamerEntity::cleanup() {
   std::lock_guard<std::mutex> lock(mutex_);
   mutable_header()->clear();
   chunk_size_ = kDefaultChunkSize;
+  configured_chunk_size_ = kDefaultChunkSize;
   node_index_mask_bits_ = 0U;
   node_index_mask_ = 0U;
   node_cnt_per_chunk_ = 0U;
@@ -292,9 +293,7 @@ int HnswRabitqStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
 int HnswRabitqStreamerEntity::open(IndexStorage::Pointer stg,
                                    uint64_t max_index_size, bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
-  bool huge_page = stg->is_huge_page();
-  LOG_DEBUG("huge_page: %d", (int)huge_page);
-  int ret = init_chunk_params(max_index_size, huge_page);
+  int ret = init_chunk_params(stg, max_index_size);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("init_chunk_params failed for %s", IndexError::What(ret));
     return ret;
@@ -304,9 +303,10 @@ int HnswRabitqStreamerEntity::open(IndexStorage::Pointer stg,
     LOG_ERROR("Open index failed for %s", IndexError::What(ret));
     return ret;
   }
-  ret = upper_neighbor_index_->init(broker_, upper_neighbor_chunk_size_,
-                                    scaling_factor(), estimate_doc_capacity(),
-                                    kUpperHashMemoryInflateRatio);
+  ret = upper_neighbor_index_->init(
+      broker_, upper_neighbor_chunk_size_, scaling_factor(),
+      estimate_doc_capacity(), kUpperHashMemoryInflateRatio,
+      layout_.hash_slot_items, layout_.hash_mask_bits);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Init neighbor hash map failed");
     return ret;
@@ -421,7 +421,7 @@ int HnswRabitqStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
       return 0U;
     };
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
-    return meta->bits.level;
+    return meta->level();
   };
   auto ret = dump_segments(dumper, keys.data(), get_level);
   if (ailego_unlikely(ret < 0)) {

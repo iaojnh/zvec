@@ -34,7 +34,11 @@ int HnswRabitqChunkBroker::init_storage(size_t chunk_size) {
 
   //! alloc meta chunk
   size_t size = sizeof(HnswChunkMeta);
-  size = (size + page_mask_) & (~page_mask_);
+  uint64_t aligned = 0;
+  if (!AlignDiskSize(size, &aligned) || aligned > SIZE_MAX) {
+    return IndexError_InvalidLength;
+  }
+  size = aligned;
   const std::string segment_id =
       make_segment_id(CHUNK_TYPE_META, kDefaultChunkSeqId);
   int ret = stg_->append(segment_id, size);
@@ -110,11 +114,6 @@ int HnswRabitqChunkBroker::open(IndexStorage::Pointer stg,
     return IndexError_Duplicate;
   }
   stg_ = std::move(stg);
-  if (stg_->is_huge_page()) {
-    page_mask_ = ailego::MemoryHelper::HugePageSize() - 1;
-  } else {
-    page_mask_ = ailego::MemoryHelper::PageSize() - 1;
-  }
   check_crc_ = check_crc;
   max_chunks_size_ = max_index_size;
   dirty_ = false;
@@ -127,11 +126,19 @@ int HnswRabitqChunkBroker::open(IndexStorage::Pointer stg,
     return init_storage(chunk_size);
   }
 
-  return load_storage(chunk_size);
+  const int ret = load_storage(chunk_size);
+  if (ret != 0) {
+    stg_.reset();
+    chunk_meta_segment_.reset();
+  }
+  return ret;
 }
 
 int HnswRabitqChunkBroker::close() {
-  flush(0UL);
+  if (stg_ && chunk_meta_segment_) {
+    flush(0UL);
+  }
+  chunk_meta_segment_.reset();
 
   stg_.reset();
   check_crc_ = false;
@@ -141,7 +148,9 @@ int HnswRabitqChunkBroker::close() {
 }
 
 int HnswRabitqChunkBroker::flush(uint64_t checkpoint) {
-  ailego_assert_with(chunk_meta_segment_, "invalid meta segment");
+  if (!stg_ || !chunk_meta_segment_) {
+    return IndexError_Uninitialized;
+  }
 
   chunk_meta_.update_time = ailego::Realtime::Seconds();
   stats_.set_update_time(chunk_meta_.update_time);
@@ -185,7 +194,11 @@ std::pair<int, Chunk::Pointer> HnswRabitqChunkBroker::alloc_chunk(
     return std::make_pair(0, chunk);
   }
   //! align to page size
-  size = (size + page_mask_) & (~page_mask_);
+  uint64_t aligned = 0;
+  if (!AlignDiskSize(size, &aligned) || aligned > SIZE_MAX) {
+    return std::make_pair(IndexError_InvalidLength, chunk);
+  }
+  size = aligned;
   if (ailego_unlikely(chunk_meta_.total_size + size >= max_chunks_size_)) {
     LOG_ERROR("No space to new a chunk, curIndexSize=%zu allocSize=%zu",
               (size_t)chunk_meta_.total_size, size);

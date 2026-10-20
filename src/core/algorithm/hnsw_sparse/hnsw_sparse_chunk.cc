@@ -34,7 +34,11 @@ int SparseChunkBroker::init_storage(size_t chunk_size) {
 
   //! alloc meta chunk
   size_t size = sizeof(HnswSparseChunkMeta);
-  size = (size + page_mask_) & (~page_mask_);
+  uint64_t aligned_size = 0;
+  if (!AlignDiskSize(size, &aligned_size) || aligned_size > SIZE_MAX) {
+    return IndexError_InvalidLength;
+  }
+  size = aligned_size;
   const std::string segment_id =
       make_segment_id(CHUNK_TYPE_META, kDefaultChunkSeqId);
   int ret = stg_->append(segment_id, size);
@@ -122,11 +126,19 @@ int SparseChunkBroker::open(IndexStorage::Pointer stg, size_t max_index_size,
     return init_storage(chunk_size);
   }
 
-  return load_storage(chunk_size);
+  const int ret = load_storage(chunk_size);
+  if (ret != 0) {
+    stg_.reset();
+    chunk_meta_segment_.reset();
+  }
+  return ret;
 }
 
 int SparseChunkBroker::close() {
-  flush(0UL);
+  if (stg_ && chunk_meta_segment_) {
+    flush(0UL);
+  }
+  chunk_meta_segment_.reset();
 
   stg_.reset();
   check_crc_ = false;
@@ -136,7 +148,9 @@ int SparseChunkBroker::close() {
 }
 
 int SparseChunkBroker::flush(uint64_t checkpoint) {
-  ailego_assert_with(chunk_meta_segment_, "invalid meta segment");
+  if (!stg_ || !chunk_meta_segment_) {
+    return IndexError_Uninitialized;
+  }
 
   chunk_meta_.update_time = ailego::Realtime::Seconds();
   stats_.set_update_time(chunk_meta_.update_time);
@@ -180,8 +194,13 @@ std::pair<int, SparseChunk::Pointer> SparseChunkBroker::alloc_chunk(
     return std::make_pair(0, chunk);
   }
   //! align to page size
-  size = (size + page_mask_) & (~page_mask_);
-  if (ailego_unlikely(chunk_meta_.total_size + size >= max_chunks_size_)) {
+  uint64_t aligned_size = 0;
+  if (!AlignDiskSize(size, &aligned_size) || aligned_size > SIZE_MAX) {
+    return std::make_pair(IndexError_InvalidLength, chunk);
+  }
+  size = aligned_size;
+  if (ailego_unlikely(size >= max_chunks_size_ ||
+                      chunk_meta_.total_size >= max_chunks_size_ - size)) {
     LOG_ERROR("No space to new a chunk, curIndexSize=%zu allocSize=%zu",
               (size_t)chunk_meta_.total_size, size);
     return std::make_pair(IndexError_IndexFull, chunk);

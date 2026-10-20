@@ -34,7 +34,11 @@ int ChunkBroker::init_storage(uint32_t chunk_size) {
 
   //! alloc meta chunk
   size_t size = sizeof(HnswChunkMeta);
-  size = (size + page_mask_) & (~page_mask_);
+  uint64_t aligned_size = 0;
+  if (!AlignDiskSize(size, &aligned_size) || aligned_size > SIZE_MAX) {
+    return IndexError_InvalidLength;
+  }
+  size = aligned_size;
   const std::string segment_id =
       make_segment_id(CHUNK_TYPE_META, kDefaultChunkSeqId);
   int ret = stg_->append(segment_id, size);
@@ -72,12 +76,9 @@ int ChunkBroker::load_storage(uint32_t &chunk_size) {
   }
   std::memcpy(static_cast<void *>(&chunk_meta_), data_block.data(), size);
   if (chunk_meta_.chunk_size != chunk_size) {
-    LOG_WARN(
-        "chunk_size mismatch: config=%u, index=%zu. "
-        "Using index value to keep compatibility.",
-        chunk_size, (size_t)chunk_meta_.chunk_size);
+    LOG_ERROR("Chunk metadata differs from the persisted layout");
+    return IndexError_Mismatch;
   }
-  chunk_size = chunk_meta_.chunk_size;
 
   *stats_.mutable_check_point() = stg_->check_point();
   stats_.set_revision_id(chunk_meta_.revision_id);
@@ -109,11 +110,6 @@ int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size,
     return IndexError_Duplicate;
   }
   stg_ = std::move(stg);
-  if (stg_->is_huge_page()) {
-    page_mask_ = ailego::MemoryHelper::HugePageSize() - 1;
-  } else {
-    page_mask_ = ailego::MemoryHelper::PageSize() - 1;
-  }
   check_crc_ = check_crc;
   dirty_ = false;
 
@@ -125,11 +121,19 @@ int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size,
     return init_storage(chunk_size);
   }
 
-  return load_storage(chunk_size);
+  const int ret = load_storage(chunk_size);
+  if (ret != 0) {
+    stg_.reset();
+    chunk_meta_segment_.reset();
+  }
+  return ret;
 }
 
 int ChunkBroker::close() {
-  flush(0UL);
+  if (stg_ && chunk_meta_segment_) {
+    flush(0UL);
+  }
+  chunk_meta_segment_.reset();
 
   stg_.reset();
   check_crc_ = false;
@@ -139,7 +143,9 @@ int ChunkBroker::close() {
 }
 
 int ChunkBroker::flush(uint64_t checkpoint) {
-  ailego_assert_with(chunk_meta_segment_, "invalid meta segment");
+  if (!stg_ || !chunk_meta_segment_) {
+    return IndexError_Uninitialized;
+  }
 
   chunk_meta_.update_time = ailego::Realtime::Seconds();
   stats_.set_update_time(chunk_meta_.update_time);
@@ -184,8 +190,13 @@ std::pair<int, Chunk::Pointer> ChunkBroker::alloc_chunk(int type,
     return std::make_pair(0, chunk);
   }
   //! align to page size
-  size = (size + page_mask_) & (~page_mask_);
-  if (ailego_unlikely(chunk_meta_.total_size + size >= max_chunks_size_)) {
+  uint64_t aligned_size = 0;
+  if (!AlignDiskSize(size, &aligned_size) || aligned_size > SIZE_MAX) {
+    return std::make_pair(IndexError_InvalidLength, chunk);
+  }
+  size = aligned_size;
+  if (ailego_unlikely(size >= max_chunks_size_ ||
+                      chunk_meta_.total_size >= max_chunks_size_ - size)) {
     LOG_ERROR("No space to new a chunk, curIndexSize=%zu allocSize=%zu",
               (size_t)chunk_meta_.total_size, size);
     return std::make_pair(IndexError_IndexFull, chunk);

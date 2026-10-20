@@ -55,7 +55,8 @@ struct SparseGraphHeader {
   uint8_t reserved[868];
 };
 
-static_assert(sizeof(SparseGraphHeader) % 32 == 0,
+static_assert(sizeof(SparseGraphHeader) == 928 &&
+                  offsetof(SparseGraphHeader, reserved) == 60,
               "SparseGraphHeader must be aligned with 32 bytes");
 
 //! Hnsw upper neighbor header
@@ -68,8 +69,12 @@ struct HnswSparseHeader {
   uint32_t max_level;
   uint32_t entry_point;
   uint32_t options;
-  uint8_t reserved[30];
+  uint8_t reserved[32];
 };
+
+static_assert(sizeof(HnswSparseHeader) == 64 &&
+                  offsetof(HnswSparseHeader, reserved) == 32,
+              "Sparse graph headers must have explicit padding");
 
 struct SparseData {
  public:
@@ -199,16 +204,18 @@ struct SparseGraphNeighborMeta {
   SparseGraphNeighborMeta(size_t o, size_t cnt)
       : offset(o), neighbor_cnt(cnt) {}
 
-  uint64_t offset : 48;
-  uint64_t neighbor_cnt : 16;
+  uint64_t offset;
+  uint32_t neighbor_cnt;
+  uint32_t reserved{0};
 };
 
 //! hnsw upper neighbors meta
 struct HnswSparseNeighborMeta {
   HnswSparseNeighborMeta(size_t o, size_t l) : offset(o), level(l) {}
 
-  uint64_t offset : 48;  // offset = idx * upper neighors size
-  uint64_t level : 16;
+  uint64_t offset;  // offset = idx * upper neighors size
+  uint32_t level;
+  uint32_t reserved{0};
 };
 
 class HnswSparseEntity {
@@ -564,10 +571,6 @@ class HnswSparseEntity {
     return (size + 0x1F) & (~0x1F);
   }
 
-  static inline size_t AlignPageSize(size_t size) {
-    size_t page_mask = ailego::MemoryHelper::PageSize() - 1;
-    return (size + page_mask) & (~page_mask);
-  }
 
   //! rearrange vectors to improve cache locality
   void reshuffle_vectors(const std::function<level_t(node_id_t)> &get_level,

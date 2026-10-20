@@ -52,7 +52,8 @@ struct GraphHeader {
   uint8_t reserved_[4080];
 };
 
-static_assert(sizeof(GraphHeader) % 32 == 0,
+static_assert(sizeof(GraphHeader) == 4128 &&
+                  offsetof(GraphHeader, reserved_) == 48,
               "GraphHeader must be aligned with 32 bytes");
 
 //! Hnsw upper neighbor header
@@ -65,10 +66,10 @@ struct HnswHeader {
   uint32_t max_level;
   uint32_t entry_point;
   uint32_t options;
-  uint8_t reserved_[30];
+  uint8_t reserved_[32];
 };
 
-static_assert(sizeof(HnswHeader) % 32 == 0,
+static_assert(sizeof(HnswHeader) == 64 && offsetof(HnswHeader, reserved_) == 32,
               "GraphHeader must be aligned with 32 bytes");
 
 //! Hnsw common header and upper neighbor header
@@ -235,16 +236,18 @@ struct NeighborsT {
 struct GraphNeighborMeta {
   GraphNeighborMeta(size_t o, size_t cnt) : offset(o), neighbor_cnt(cnt) {}
 
-  uint64_t offset : 48;
-  uint64_t neighbor_cnt : 16;
+  uint64_t offset;
+  uint32_t neighbor_cnt;
+  uint32_t reserved{0};
 };
 
 //! hnsw upper neighbors meta
 struct HnswNeighborMeta {
   HnswNeighborMeta(size_t o, size_t l) : offset(o), level(l) {}
 
-  uint64_t offset : 48;  // offset = idx * upper neighors size
-  uint64_t level : 16;
+  uint64_t offset;  // offset = idx * upper neighors size
+  uint32_t level;
+  uint32_t reserved{0};
 };
 
 class HnswEntity {
@@ -548,10 +551,6 @@ class HnswEntity {
     return (size + 0x1F) & (~0x1F);
   }
 
-  static inline size_t AlignPageSize(size_t size) {
-    size_t page_mask = ailego::MemoryHelper::PageSize() - 1;
-    return (size + page_mask) & (~page_mask);
-  }
 
   static inline size_t AlignHugePageSize(size_t size) {
     size_t page_mask = ailego::MemoryHelper::HugePageSize() - 1;

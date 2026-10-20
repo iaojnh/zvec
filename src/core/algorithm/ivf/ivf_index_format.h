@@ -50,7 +50,7 @@ struct InvertedListMeta {
   uint32_t block_count{0};
   uint32_t vector_count{0};
   uint32_t id_offset{0};
-  char reserved_[16];
+  char reserved_[20]{};
 };
 
 /*! Index Format of Location in Inverted Index for each vector
@@ -59,10 +59,14 @@ struct InvertedVecLocation {
   InvertedVecLocation(size_t off, bool col)
       : offset(off), column_major(col), reserved(0u) {}
 
-  uint64_t offset : 48;       // feature offset in posting block segment
-  uint64_t column_major : 1;  // coloum major if true
-  uint64_t reserved : 15;
+  uint64_t offset;        // feature offset in posting block segment
+  uint32_t column_major;  // coloum major if true
+  uint32_t reserved;
 };
+
+static_assert(sizeof(InvertedListMeta) == 40 &&
+                  sizeof(InvertedVecLocation) == 16,
+              "V3 list records must have explicit, fixed-width fields");
 
 /*! Index Format of Integer Quantizer params for each inverted list
  */
@@ -83,8 +87,7 @@ struct BlockLocation {
 struct BlockHeader {
   BlockLocation next;
   uint16_t vector_count;
-  uint16_t column_major : 1;
-  uint16_t reserved_ : 15;
+  uint16_t column_major;
 };
 
 struct DeletionMap {
@@ -132,8 +135,7 @@ struct VectorLocation {
       : segment_id(id), column_major(col), offset(off) {}
 
   uint16_t segment_id;
-  uint16_t column_major : 1;
-  uint16_t reserved_ : 15;
+  uint16_t column_major;
   uint32_t offset;
 
  public:

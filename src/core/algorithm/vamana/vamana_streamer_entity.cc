@@ -343,17 +343,12 @@ void VamanaStreamerEntity::update_entry_point(node_id_t ep) {
 int VamanaStreamerEntity::open(IndexStorage::Pointer stg,
                                uint64_t max_index_size, bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
-  bool huge_page = stg->is_huge_page();
-
-  int ret = broker_->open(std::move(stg), chunk_size_, check_crc);
-  if (ailego_unlikely(ret != 0)) {
-    LOG_ERROR("Open index failed: %s", IndexError::What(ret));
+  int ret = init_chunk_params(stg, max_index_size);
+  if (ret != 0) {
     return ret;
   }
-
-  ret = init_chunk_params(max_index_size, huge_page);
-  if (ailego_unlikely(ret != 0)) {
-    LOG_ERROR("init_chunk_params failed: %s", IndexError::What(ret));
+  ret = broker_->open(std::move(stg), chunk_size_, check_crc);
+  if (ret != 0) {
     return ret;
   }
   broker_->set_max_chunks_size(max_index_size_);
@@ -797,8 +792,13 @@ int VamanaStreamerEntity::ensure_dist_chunk_for(uint32_t chunk_index) {
     return 0;
   }
 
-  uint32_t dist_chunk_data_size = node_cnt_per_chunk_ * dist_entry_size_;
-  uint32_t dist_chunk_size = AlignPageSize(dist_chunk_data_size);
+  const uint64_t dist_chunk_data_size =
+      uint64_t{node_cnt_per_chunk_} * dist_entry_size_;
+  uint64_t dist_chunk_size = 0;
+  if (!AlignDiskSize(dist_chunk_data_size, &dist_chunk_size) ||
+      dist_chunk_size > UINT32_MAX) {
+    return IndexError_InvalidLength;
+  }
   auto dp = broker_->alloc_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST,
                                  chunk_index, dist_chunk_size);
   if (ailego_unlikely(dp.first != 0)) {
@@ -825,8 +825,13 @@ int VamanaStreamerEntity::alloc_dist_chunks_for_existing_nodes() {
   if (total_docs == 0) return 0;
 
   // Calculate dist chunk size: same number of nodes per chunk as node chunks
-  uint32_t dist_chunk_data_size = node_cnt_per_chunk_ * dist_entry_size_;
-  uint32_t dist_chunk_size = AlignPageSize(dist_chunk_data_size);
+  const uint64_t dist_chunk_data_size =
+      uint64_t{node_cnt_per_chunk_} * dist_entry_size_;
+  uint64_t dist_chunk_size = 0;
+  if (!AlignDiskSize(dist_chunk_data_size, &dist_chunk_size) ||
+      dist_chunk_size > UINT32_MAX) {
+    return IndexError_InvalidLength;
+  }
 
   uint32_t num_chunks_needed =
       (total_docs + node_cnt_per_chunk_ - 1) >> node_index_mask_bits_;

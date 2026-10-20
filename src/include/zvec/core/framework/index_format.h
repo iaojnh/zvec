@@ -18,6 +18,7 @@
 #include <string>
 #include <zvec/ailego/hash/crc32c.h>
 #include <zvec/ailego/utility/time_helper.h>
+#include <zvec/core/framework/disk_format.h>
 
 namespace zvec {
 namespace core {
@@ -27,64 +28,84 @@ namespace core {
 struct IndexFormat {
   /*! Version Number
    */
-  enum { FORMAT_VERSION = 0x0002 };
+  enum { FORMAT_VERSION = 0x0003 };
+  static constexpr uint64_t kFormatMagic = 0x335844494345565aULL;  // ZVECIDX3
+  static constexpr uint64_t kLittleEndianIeee754 = 1;
 
   /*! Index Format Meta Header
    */
   struct MetaHeader {
-    uint32_t header_crc;
-    uint16_t reserved1_;
-    uint16_t version;
-    uint32_t revision;
-    uint32_t magic;
-    uint16_t meta_header_size;
-    uint16_t meta_footer_size;
-    uint32_t meta_footer_offset;
-    uint64_t content_offset;
-    uint64_t setup_time;
-    uint64_t reserved3_[3];
+    DiskUInt32 header_crc;
+    DiskUInt16 reserved1_;
+    DiskUInt16 version;
+    DiskUInt32 revision;
+    DiskUInt32 magic;
+    DiskUInt16 meta_header_size;
+    DiskUInt16 meta_footer_size;
+    DiskUInt32 meta_footer_offset;
+    DiskUInt64 content_offset;
+    DiskUInt64 setup_time;
+    DiskUInt64 format_magic;
+    DiskUInt64 required_features;
+    DiskUInt64 disk_alignment;
+    uint8_t reserved_[4032];
   };
 
-  static_assert(sizeof(MetaHeader) % 32 == 0,
-                "MetaHeader must be aligned with 32 bytes");
+  static_assert(sizeof(MetaHeader) == kDiskAlignment &&
+                    offsetof(MetaHeader, format_magic) == 40 &&
+                    offsetof(MetaHeader, reserved_) == 64,
+                "The canonical file header is exactly 4 KiB without padding");
 
   /*! Index Format Meta Footer
    */
   struct MetaFooter {
-    uint32_t footer_crc;
-    uint32_t segments_meta_crc;
-    uint32_t content_crc;
-    uint32_t segment_count;
+    DiskUInt32 footer_crc;
+    DiskUInt32 segments_meta_crc;
+    DiskUInt32 content_crc;
+    DiskUInt32 segment_count;
     // meta section size
-    uint32_t segments_meta_size;
-    uint32_t reserved1_;
+    DiskUInt32 segments_meta_size;
+    DiskUInt32 reserved1_;
     // segments' data section size
-    uint64_t content_size;
-    uint64_t content_padding_size;
+    DiskUInt64 content_size;
+    DiskUInt64 content_padding_size;
 
-    uint64_t check_point;
-    uint64_t update_time;
-    uint64_t reserved2_[7];
-    uint64_t next_meta_header_offset;
-    uint64_t total_size;
+    DiskUInt64 check_point;
+    DiskUInt64 update_time;
+    DiskUInt64 reserved2_[7];
+    DiskUInt64 next_meta_header_offset;
+    DiskUInt64 total_size;
   };
 
-  static_assert(sizeof(MetaFooter) % 32 == 0,
-                "MetaFooter must be aligned with 32 bytes");
+  static_assert(sizeof(MetaFooter) == 128 &&
+                    offsetof(MetaFooter, content_size) == 24 &&
+                    offsetof(MetaFooter, next_meta_header_offset) == 112,
+                "Canonical directory footer offsets must not change");
 
   /*! Index Format Segment Meta
    */
   struct SegmentMeta {
-    uint32_t segment_id_offset;
+    DiskUInt32 segment_id_offset;
     // used only by immutable segments, e.g., IndexMeta, or searcher
-    uint32_t data_crc;
-    uint64_t data_index;
-    uint64_t data_size;
-    uint64_t padding_size;
+    DiskUInt32 data_crc;
+    DiskUInt64 data_index;
+    DiskUInt64 data_size;
+    DiskUInt64 padding_size;
   };
 
-  static_assert(sizeof(SegmentMeta) % 32 == 0,
-                "SegmentMeta must be aligned with 32 bytes");
+  static_assert(sizeof(SegmentMeta) == 32 &&
+                    offsetof(SegmentMeta, data_index) == 8 &&
+                    offsetof(SegmentMeta, padding_size) == 24,
+                "Canonical segment records must not contain padding");
+
+  static bool Supported(const MetaHeader &header) {
+    return NativeDiskPayloadSupported() && header.version == FORMAT_VERSION &&
+           header.format_magic == kFormatMagic &&
+           header.required_features == kLittleEndianIeee754 &&
+           header.disk_alignment == kDiskAlignment &&
+           header.meta_header_size == sizeof(MetaHeader) &&
+           header.meta_footer_size == sizeof(MetaFooter);
+  }
 
   /*! Index Format Segment Meta Buffer
    */
@@ -99,7 +120,11 @@ struct IndexFormat {
     //! Append a segment meta into buffer
     bool append(const std::string &id, size_t data_size, size_t padding_size,
                 uint32_t data_crc) {
-      if (count_ >= capacity_) {
+      if (count_ >= capacity_ || id.find('\0') != std::string::npos ||
+          id.size() >= UINT32_MAX ||
+          buffer_.size() > UINT32_MAX - id.size() - 1 ||
+          data_size > SIZE_MAX - padding_size ||
+          offset_ > SIZE_MAX - data_size - padding_size) {
         return false;
       }
       SegmentMeta *meta = (SegmentMeta *)buffer_.data() + count_;
@@ -150,6 +175,9 @@ struct IndexFormat {
                               uint32_t content_offset) {
     memset(header, 0, sizeof(MetaHeader));
     header->version = IndexFormat::FORMAT_VERSION;
+    header->format_magic = kFormatMagic;
+    header->required_features = kLittleEndianIeee754;
+    header->disk_alignment = kDiskAlignment;
     header->revision = 0;
     header->magic = std::random_device()();
     header->meta_header_size = sizeof(MetaHeader);

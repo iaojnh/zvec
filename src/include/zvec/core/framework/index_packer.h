@@ -99,6 +99,9 @@ class IndexPacker {
     static_assert(ailego::IsInvocableWithResult<size_t, TFunc, const void *,
                                                 size_t>::value,
                   "Invocable function type");
+    if (!NativeDiskPayloadSupported()) {
+      return false;
+    }
     IndexFormat::MetaHeader header;
     IndexFormat::SetupMetaHeader(
         &header, (uint32_t)(0 - sizeof(IndexFormat::MetaFooter)),
@@ -111,12 +114,42 @@ class IndexPacker {
     return true;
   }
 
+  // All dumpers, including nested index dumpers, finish every segment on the
+  // same disk boundary. Algorithm-specific SIMD padding is part of its
+  // capacity.
+  template <typename TFunc>
+  bool append(TFunc write_data, std::vector<SegmentMeta> &stab,
+              const std::string &id, size_t data_size, size_t padding_size,
+              uint32_t crc) {
+    if (padding_size > std::numeric_limits<size_t>::max() - data_size) {
+      return false;
+    }
+    const size_t capacity = data_size + padding_size;
+    uint64_t aligned = 0;
+    if (!AlignDiskSize(capacity, &aligned) ||
+        aligned > std::numeric_limits<size_t>::max()) {
+      return false;
+    }
+    const size_t extra = static_cast<size_t>(aligned) - capacity;
+    if (extra) {
+      const std::string padding(extra, '\0');
+      if (pack(write_data, padding.data(), extra) != extra) {
+        return false;
+      }
+    }
+    stab.emplace_back(id, data_size, padding_size + extra, crc);
+    return true;
+  }
+
   //! Pack index data
   template <typename TFunc>
   size_t pack(TFunc write_data, const void *data, size_t len) {
     static_assert(ailego::IsInvocableWithResult<size_t, TFunc, const void *,
                                                 size_t>::value,
                   "Invocable function type");
+    if (len > SIZE_MAX - data_size_) {
+      return 0;
+    }
     size_t wrlen = write_data(data, len);
     if (wrlen > 0u) {
       data_crc_ = ailego::Crc32c::Hash(data, wrlen, data_crc_);
@@ -134,6 +167,10 @@ class IndexPacker {
 
     size_t content_size = 0u;
     for (const auto &it : stab) {
+      if (it.data_size() > SIZE_MAX - it.padding_size() ||
+          content_size > SIZE_MAX - it.data_size() - it.padding_size()) {
+        return false;
+      }
       content_size += it.data_size() + it.padding_size();
     }
 
@@ -146,7 +183,11 @@ class IndexPacker {
     }
 
     // Write the padding if need
-    size_t content_padding_size = ailego_align(data_size_, 32) - data_size_;
+    uint64_t aligned_content = 0;
+    if (!AlignDiskSize(data_size_, &aligned_content)) {
+      return false;
+    }
+    size_t content_padding_size = aligned_content - data_size_;
     if (content_padding_size) {
       std::string padding(content_padding_size, '\0');
 
@@ -156,11 +197,23 @@ class IndexPacker {
     }
 
     // Prepare segment meta buffer
+    if (stab.size() > UINT32_MAX / sizeof(IndexFormat::SegmentMeta)) {
+      return false;
+    }
     IndexFormat::SegmentMetaBuffer buffer(stab.size());
     for (const auto &it : stab) {
-      buffer.append(it.id(), it.data_size(), it.padding_size(), it.data_crc());
+      if (!buffer.append(it.id(), it.data_size(), it.padding_size(),
+                         it.data_crc())) {
+        return false;
+      }
     }
-    buffer.resize(ailego_align(buffer.size(), 32));
+    uint64_t directory_size = 0;
+    if (!AlignDiskSize(buffer.size() + sizeof(IndexFormat::MetaFooter),
+                       &directory_size) ||
+        directory_size > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+    buffer.resize(directory_size - sizeof(IndexFormat::MetaFooter));
 
     // Write segment table into file
     if (write_data(buffer.data(), buffer.size()) != buffer.size()) {
@@ -199,7 +252,11 @@ class IndexPacker {
 
     size_t data_size = buffer.size();
     uint32_t data_crc = ailego::Crc32c::Hash(buffer.data(), buffer.size(), 0);
-    buffer.resize((data_size + 31u) & ~31u);
+    uint64_t aligned = 0;
+    if (!AlignDiskSize(data_size, &aligned)) {
+      return false;
+    }
+    buffer.resize(aligned);
 
     if (write_data(buffer.data(), buffer.size()) != buffer.size()) {
       return false;

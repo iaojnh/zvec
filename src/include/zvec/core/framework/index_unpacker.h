@@ -127,6 +127,12 @@ class IndexUnpacker {
       if (footer_.next_meta_header_offset == 0) {
         break;
       }
+      if (footer_.next_meta_header_offset <= current_header_start_offset_ ||
+          footer_.next_meta_header_offset % kDiskAlignment != 0 ||
+          footer_.next_meta_header_offset > total ||
+          sizeof(header_) > total - footer_.next_meta_header_offset) {
+        return false;
+      }
       current_header_start_offset_ = footer_.next_meta_header_offset;
     }
 
@@ -150,7 +156,8 @@ class IndexUnpacker {
     }
 
     memcpy(&header_, data, sizeof(header_));
-    if (header_.meta_header_size != sizeof(header_)) {
+    if (!IndexFormat::Supported(header_)) {
+      LOG_ERROR("Unsupported index format; rebuild the index using format V3");
       return false;
     }
     if (ailego::Crc32c::Hash(&header_, sizeof(header_), header_.header_crc) !=
@@ -170,10 +177,13 @@ class IndexUnpacker {
       return false;
     }
 
-    size_t footer_offset = ((int32_t)header_.meta_footer_offset < 0)
-                               ? total + (int32_t)header_.meta_footer_offset
-                               : header_.meta_footer_offset;
-    if (footer_offset + sizeof(footer_) > total) {
+    size_t footer_offset =
+        ((int32_t)header_.meta_footer_offset < 0)
+            ? total + (int32_t)header_.meta_footer_offset
+            : static_cast<uint32_t>(header_.meta_footer_offset);
+    if (footer_offset > total || sizeof(footer_) > total - footer_offset ||
+        current_header_start_offset_ >
+            total - footer_offset - sizeof(footer_)) {
       return false;
     }
 
@@ -184,9 +194,13 @@ class IndexUnpacker {
     }
 
     memcpy(&footer_, data, sizeof(footer_));
-    if (footer_.content_size + footer_.content_padding_size +
-            header_.content_offset >
-        footer_.total_size) {
+    if (footer_.total_size > total - current_header_start_offset_ ||
+        header_.content_offset > footer_.total_size ||
+        header_.content_offset % kDiskAlignment != 0 ||
+        footer_.content_size > footer_.total_size - header_.content_offset ||
+        footer_.content_padding_size > footer_.total_size -
+                                           header_.content_offset -
+                                           footer_.content_size) {
       return false;
     }
     if (ailego::Crc32c::Hash(&footer_, sizeof(footer_), footer_.footer_crc) !=
@@ -208,7 +222,7 @@ class IndexUnpacker {
     }
     size_t offset = ((int32_t)header_.meta_footer_offset < 0)
                         ? total + (int32_t)header_.meta_footer_offset
-                        : header_.meta_footer_offset;
+                        : static_cast<uint32_t>(header_.meta_footer_offset);
     if (offset < footer_.segments_meta_size || offset > total) {
       return false;
     }
@@ -226,13 +240,20 @@ class IndexUnpacker {
 
     IndexFormat::SegmentMeta *seg = (IndexFormat::SegmentMeta *)data;
     for (size_t i = 0; i < footer_.segment_count; ++i, ++seg) {
-      if (seg->segment_id_offset > footer_.segments_meta_size) {
+      if (seg->segment_id_offset >= footer_.segments_meta_size ||
+          seg->segment_id_offset < sizeof(*seg) * footer_.segment_count) {
         return false;
       }
       if (seg->data_index > footer_.content_size) {
         return false;
       }
-      if (seg->data_index + seg->data_size > footer_.content_size) {
+      if (seg->data_size > footer_.content_size - seg->data_index ||
+          seg->padding_size >
+              footer_.content_size - seg->data_index - seg->data_size ||
+          seg->data_index % kDiskAlignment != 0 ||
+          (seg->data_size + seg->padding_size) % kDiskAlignment != 0 ||
+          !memchr(static_cast<const char *>(data) + seg->segment_id_offset, 0,
+                  footer_.segments_meta_size - seg->segment_id_offset)) {
         return false;
       }
       segments_.emplace(

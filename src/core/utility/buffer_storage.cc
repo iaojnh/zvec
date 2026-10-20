@@ -47,25 +47,29 @@ inline bool AlignBufferSize(size_t size, size_t *aligned_size) {
 }
 
 // C++17-compatible atomic access to serialized uint64_t fields.
-inline uint64_t bs_load_acquire(const uint64_t *p) {
+inline uint64_t bs_load_acquire(const DiskUInt64 *field) {
+  const uint64_t *p = field->encoded_storage();
 #if defined(__GNUC__) || defined(__clang__)
-  return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+  return DiskUInt64::Decode(__atomic_load_n(p, __ATOMIC_ACQUIRE));
 #else
   uint64_t v = *static_cast<const volatile uint64_t *>(p);
   std::atomic_thread_fence(std::memory_order_acquire);
-  return v;
+  return DiskUInt64::Decode(v);
 #endif
 }
 
-inline uint64_t bs_load_relaxed(const uint64_t *p) {
+inline uint64_t bs_load_relaxed(const DiskUInt64 *field) {
+  const uint64_t *p = field->encoded_storage();
 #if defined(__GNUC__) || defined(__clang__)
-  return __atomic_load_n(p, __ATOMIC_RELAXED);
+  return DiskUInt64::Decode(__atomic_load_n(p, __ATOMIC_RELAXED));
 #else
-  return *static_cast<const volatile uint64_t *>(p);
+  return DiskUInt64::Decode(*static_cast<const volatile uint64_t *>(p));
 #endif
 }
 
-inline void bs_store_release(uint64_t *p, uint64_t v) {
+inline void bs_store_release(DiskUInt64 *field, uint64_t value) {
+  uint64_t *p = field->encoded_storage();
+  const uint64_t v = DiskUInt64::Encode(value);
 #if defined(__GNUC__) || defined(__clang__)
   __atomic_store_n(p, v, __ATOMIC_RELEASE);
 #else
@@ -74,7 +78,9 @@ inline void bs_store_release(uint64_t *p, uint64_t v) {
 #endif
 }
 
-inline void bs_store_relaxed(uint64_t *p, uint64_t v) {
+inline void bs_store_relaxed(DiskUInt64 *field, uint64_t value) {
+  uint64_t *p = field->encoded_storage();
+  const uint64_t v = DiskUInt64::Encode(value);
 #if defined(__GNUC__) || defined(__clang__)
   __atomic_store_n(p, v, __ATOMIC_RELAXED);
 #else
@@ -1007,6 +1013,24 @@ class BufferStorage : public IndexStorage {
       }
     }
 
+    // Reject unsupported formats before creating a writable buffer pool.
+    {
+      ailego::File probe;
+      if (!probe.open(path, true)) {
+        return IndexError_OpenFile;
+      }
+      IndexFormat::MetaHeader header{};
+      if (probe.read(0, &header, sizeof(header)) != sizeof(header) ||
+          !IndexFormat::Supported(header)) {
+        LOG_ERROR("Unsupported index format; rebuild using format V3");
+        return IndexError_Unsupported;
+      }
+      if (ailego::Crc32c::Hash(&header, sizeof(header), header.header_crc) !=
+          header.header_crc) {
+        return IndexError_InvalidChecksum;
+      }
+    }
+
     try {
       // Capture both owners before replacing the published state. In
       // particular, a failed reopen must not change existing segments' pool.
@@ -1069,9 +1093,9 @@ class BufferStorage : public IndexStorage {
       LOG_ERROR("Get segment header failed.");
       return IndexError_Runtime;
     }
-    if (out->meta_header_size != kHeaderSize) {
-      LOG_ERROR("Header meta size is invalid.");
-      return IndexError_InvalidLength;
+    if (!IndexFormat::Supported(*out)) {
+      LOG_ERROR("Unsupported index format; rebuild using format V3");
+      return IndexError_Unsupported;
     }
     if (ailego::Crc32c::Hash(out, kHeaderSize, out->header_crc) !=
         out->header_crc) {
@@ -1131,7 +1155,11 @@ class BufferStorage : public IndexStorage {
       if (iter->data_index > footer.content_size) {
         return IndexError_InvalidValue;
       }
-      if (iter->data_index + iter->data_size > footer.content_size) {
+      if (iter->data_size > footer.content_size - iter->data_index ||
+          iter->padding_size >
+              footer.content_size - iter->data_index - iter->data_size ||
+          iter->data_index % kDiskAlignment != 0 ||
+          (iter->data_size + iter->padding_size) % kDiskAlignment != 0) {
         return IndexError_InvalidLength;
       }
 
@@ -1176,7 +1204,8 @@ class BufferStorage : public IndexStorage {
         case IndexFormat::FORMAT_VERSION:
           break;
         default:
-          LOG_ERROR("Unsupported index version: %u", chain_header->version);
+          LOG_ERROR("Unsupported index version: %u",
+                    static_cast<uint32_t>(chain_header->version));
           return IndexError_Unsupported;
       }
 
@@ -1230,9 +1259,10 @@ class BufferStorage : public IndexStorage {
       }
       // Reject invalid links before following the metadata chain.
       const uint64_t next_off = footer.next_meta_header_offset;
-      if (next_off <= header_start_offset ||
-          next_off + sizeof(IndexFormat::MetaHeader) >
-              buffer_pool_->file_size()) {
+      if (next_off <= header_start_offset || next_off % kDiskAlignment != 0 ||
+          next_off > buffer_pool_->file_size() ||
+          sizeof(IndexFormat::MetaHeader) >
+              buffer_pool_->file_size() - next_off) {
         LOG_ERROR("ParseToMapping: invalid next_meta_header_offset=%" PRIu64
                   " (current=%" PRIu64 ", file_size=%zu), file[%s]",
                   next_off, header_start_offset, buffer_pool_->file_size(),
@@ -1276,7 +1306,9 @@ class BufferStorage : public IndexStorage {
 
   //! Retrieve check point of storage
   uint64_t check_point() const override {
-    return meta_chains_.empty() ? 0 : meta_chains_.back().footer.check_point;
+    return meta_chains_.empty()
+               ? 0
+               : static_cast<uint64_t>(meta_chains_.back().footer.check_point);
   }
 
   //! Retrieve a segment by id
@@ -1532,12 +1564,19 @@ class BufferStorage : public IndexStorage {
       return IndexError_Runtime;
     }
 
-    // Page-aligned padded size; matches IndexMapping::CalcPageAlignedSize().
-    const size_t page_size = ailego::kVectorPageSize;
-    const size_t padded_size = (size + page_size - 1) / page_size * page_size;
+    uint64_t padded_size = 0;
+    if (!AlignDiskSize(size, &padded_size) ||
+        padded_size > INT64_MAX - buffer_pool_->file_size()) {
+      return IndexError_InvalidLength;
+    }
 
     size_t id_size = id.length() + 1;
     size_t need_size = sizeof(IndexFormat::SegmentMeta) + id_size;
+    if (need_size > segment_meta_capacity_ ||
+        id.find('\0') != std::string::npos ||
+        segment_meta_capacity_ > INT32_MAX - 2 * kDiskAlignment) {
+      return IndexError_InvalidArgument;
+    }
     MetaChain *chain = &meta_chains_.back();
     IndexFormat::MetaHeader *header = chain->header.get();
     char *meta_buf = chain->segment_meta.get();
@@ -1550,13 +1589,16 @@ class BufferStorage : public IndexStorage {
     // Step 1: split a full metadata chain.
     if (sizeof(IndexFormat::SegmentMeta) * footer->segment_count + need_size >
         chain->segment_ids_offset) {
-      size_t new_chain_start = buffer_pool_->file_size();
-      new_chain_start =
-          (new_chain_start + page_size - 1) / page_size * page_size;
-      size_t new_meta_total =
-          (segment_meta_capacity_ + sizeof(IndexFormat::MetaHeader) +
-           sizeof(IndexFormat::MetaFooter) + page_size - 1) /
-          page_size * page_size;
+      uint64_t new_chain_start = 0;
+      uint64_t new_meta_total = 0;
+      if (!AlignDiskSize(buffer_pool_->file_size(), &new_chain_start) ||
+          !AlignDiskSize(uint64_t{segment_meta_capacity_} +
+                             sizeof(IndexFormat::MetaHeader) +
+                             sizeof(IndexFormat::MetaFooter),
+                         &new_meta_total) ||
+          new_meta_total > INT64_MAX - new_chain_start) {
+        return IndexError_InvalidLength;
+      }
       uint32_t new_segments_meta_size = static_cast<uint32_t>(
           new_meta_total - sizeof(IndexFormat::MetaHeader) -
           sizeof(IndexFormat::MetaFooter));

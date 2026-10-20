@@ -108,8 +108,13 @@ class IndexSegmentDumper : public IndexDumper {
   //! Append a segment meta into table
   int append(const std::string &id, size_t data_size, size_t padding_size,
              uint32_t crc) override {
-    stab_.emplace_back(id, data_size, padding_size, crc);
-    return 0;
+    return packer_.append(
+               [this](const void *data, size_t size) {
+                 return write_to_dumper(data, size);
+               },
+               stab_, id, data_size, padding_size, crc)
+               ? 0
+               : IndexError_WriteData;
   }
 
   //! Write data to the storage

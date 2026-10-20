@@ -717,6 +717,45 @@ TEST_F(BufferPoolTest, DirtyFlushFailureKeepsPageResident) {
   EXPECT_FALSE(table.is_block_dirty(/*block_id=*/0));
 }
 
+TEST_F(BufferPoolTest, PartialTailGrowthAndMetadataStayCoherent) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/3, /*writable=*/true);
+  const std::string path = new_file(1);
+  std::string expected(2 * kVectorPageSize + 91, '\0');
+  {
+    VecBufferPool pool(path, true);
+    ASSERT_EQ(0, pool.init());
+    ASSERT_TRUE(pool.extend_file(kVectorPageSize + 37));
+    ASSERT_EQ(0, pool.write_range(kVectorPageSize + 8, 4, "data"));
+    // Update metadata in a dirty resident page, then flush its payload.
+    ASSERT_EQ(0, pool.write_meta(kVectorPageSize + 16, 4, "meta"));
+    ASSERT_EQ(0, pool.flush_all());
+    FILE *file = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(nullptr, file);
+    ASSERT_EQ(0, std::fseek(file, 0, SEEK_END));
+    EXPECT_EQ(kVectorPageSize + 37, static_cast<size_t>(std::ftell(file)));
+    std::fclose(file);
+
+    ASSERT_TRUE(pool.extend_file(expected.size()));
+    // Direct metadata writes before a page's first admission must survive it.
+    ASSERT_EQ(0, pool.write_meta(2 * kVectorPageSize + 12, 4, "cold"));
+    ASSERT_EQ(0, pool.write_range(2 * kVectorPageSize + 24, 4, "tail"));
+    ASSERT_EQ(0, pool.write_range(kVectorPageSize + 100, 4, "grow"));
+    ASSERT_EQ(0, pool.flush_all());
+  }
+  expected.replace(kVectorPageSize + 8, 4, "data");
+  expected.replace(kVectorPageSize + 16, 4, "meta");
+  expected.replace(kVectorPageSize + 100, 4, "grow");
+  expected.replace(2 * kVectorPageSize + 12, 4, "cold");
+  expected.replace(2 * kVectorPageSize + 24, 4, "tail");
+  FILE *file = std::fopen(path.c_str(), "rb");
+  ASSERT_NE(nullptr, file);
+  std::string actual(expected.size() + 1, '\0');
+  const size_t size = std::fread(actual.data(), 1, actual.size(), file);
+  std::fclose(file);
+  actual.resize(size);
+  EXPECT_EQ(expected, actual);
+}
+
 TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
   constexpr size_t kFilePages = 64;
   constexpr size_t kThreadCount = 8;

@@ -21,6 +21,7 @@
 #include <ailego/utility/memory_helper.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/utility/string_helper.h>
+#include <zvec/core/framework/disk_format.h>
 #include "zvec/ailego/logger/logger.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/framework/index_storage.h"
@@ -100,13 +101,13 @@ class HnswRabitqChunkBroker {
       memset(static_cast<void *>(this), 0, sizeof(HnswChunkMeta));
     }
 
-    uint64_t chunk_cnts[CHUNK_TYPE_MAX];
-    uint64_t chunk_size;   // size of per chunk
-    uint64_t total_size;   // total size of allocated chunk
-    uint64_t revision_id;  // index revision
-    uint64_t create_time;
-    uint64_t update_time;
-    uint64_t reserved[3];
+    DiskUInt64 chunk_cnts[CHUNK_TYPE_MAX];
+    DiskUInt64 chunk_size;   // size of per chunk
+    DiskUInt64 total_size;   // total size of allocated chunk
+    DiskUInt64 revision_id;  // index revision
+    DiskUInt64 create_time;
+    DiskUInt64 update_time;
+    DiskUInt64 reserved[3];
   };
 
   static_assert(sizeof(HnswChunkMeta) % 32 == 0,
@@ -126,7 +127,7 @@ class HnswRabitqChunkBroker {
  private:
   IndexStreamer::Stats &stats_;
   HnswChunkMeta chunk_meta_{};
-  size_t page_mask_{0UL};
+
   size_t max_chunks_size_{0UL};
   IndexStorage::Pointer stg_{};
   IndexStorage::Segment::Pointer chunk_meta_segment_{};

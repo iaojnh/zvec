@@ -86,15 +86,24 @@ class HnswSparseIndexHashMap {
   //! max         the max number key can be inserted
   //! expansion_ratio   memory expansion ratio
   int init(SparseChunkBroker::Pointer &broker, uint32_t chunk_size,
-           uint32_t factor, size_t max, float expansion_ratio) {
+           uint32_t factor, size_t max, float expansion_ratio,
+           uint32_t stored_slot_items = 0, uint32_t stored_mask_bits = 0) {
     ailego_assert_with(expansion_ratio > 1.0f, "ratio must > 1.0f");
     broker_ = broker;
 
-    size_t items = std::ceil(chunk_size * 1.0f / sizeof(Item));
-    slot_items_ = 1UL << static_cast<size_t>((std::ceil(std::log2(items))));
-    size_t range = slot_items_ * factor / expansion_ratio;
-    mask_bits_ = std::floor(std::log2(range));
-    range = 1UL << mask_bits_;
+    size_t range = 0;
+    if (stored_slot_items != 0) {
+      slot_items_ = stored_slot_items;
+      mask_bits_ = stored_mask_bits;
+      range = uint64_t{1} << mask_bits_;
+    } else {
+      // Retained for standalone in-memory users of the hash table.
+      size_t items = std::ceil(chunk_size * 1.0f / sizeof(Item));
+      slot_items_ = 1UL << static_cast<size_t>((std::ceil(std::log2(items))));
+      range = slot_items_ * factor / expansion_ratio;
+      mask_bits_ = std::floor(std::log2(range));
+      range = 1UL << mask_bits_;
+    }
     size_t max_slots = std::ceil(max * 1.0f / range);
     slots_.reserve(max_slots);
     slot_loc_mask_ = slot_items_ - 1U;

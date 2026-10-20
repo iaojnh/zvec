@@ -696,7 +696,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Apply ordered fragments that all lie in one page under one pin/latch.
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
 
-  //! Write metadata without cache admission.
+  //! Write through metadata coherently without requiring cache admission.
   int write_meta(size_t offset, size_t length, const char *buffer);
 
   //! Iterate all entries and persist any dirty blocks to disk. Safe to call
@@ -782,16 +782,14 @@ class ZVEC_AILEGO_API VecBufferPool {
   void drain_writeback();
   void writeback_loop();
   bool flush_writeback_batch(std::vector<block_id_t> &page_ids, char *staging);
+  bool flush_range(size_t offset, size_t length, const char *data);
   int writeback_error() const {
     return writeback_error_.load(std::memory_order_acquire);
   }
 
   int fd_;       // page-data channel: O_DIRECT or F_NOCACHE when supported
   int meta_fd_;  // metadata channel: always buffered IO
-  size_t file_size_;
-  size_t initial_file_size_;  // file size at open time; pages beyond this
-                              // are created by extend_file and can skip
-                              // pread on first load (content is zeros).
+  std::atomic<size_t> file_size_{0};
   std::string file_name_;
   bool writable_{false};
   bool direct_io_enabled_{false};
