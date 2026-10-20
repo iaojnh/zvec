@@ -20,6 +20,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
+#include "db/common/rocksdb_cache_allocator.h"
 
 namespace zvec {
 
@@ -147,10 +148,18 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
         query_thread_count, query_thread_binding);
     auto optimize_thread_pool = std::make_unique<ailego::ThreadPool>(
         optimize_thread_count, optimize_thread_binding);
+    std::shared_ptr<rocksdb::MemoryAllocator> rocksdb_cache_allocator;
+#if defined(__linux__)
+    // Linux malloc can retain flush/compaction buffers around live cache
+    // payloads even after all memtables have been freed. Use RocksDB's public
+    // allocator hook; keep other platforms' previously validated path.
+    rocksdb_cache_allocator = std::make_shared<RocksdbCacheAllocator>();
+#endif
     auto rocksdb_block_cache = rocksdb::NewLRUCache(
         static_cast<size_t>(rocksdb_memory_capacity),
         calculate_rocksdb_cache_shard_bits(rocksdb_memory_capacity),
-        /*strict_capacity_limit=*/true);
+        /*strict_capacity_limit=*/true, /*high_pri_pool_ratio=*/0.5,
+        std::move(rocksdb_cache_allocator));
     if (!rocksdb_block_cache) {
       LOG_ERROR("Failed to create the process-wide RocksDB block cache");
       return -1;

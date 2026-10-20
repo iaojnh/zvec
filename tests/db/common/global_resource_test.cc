@@ -120,6 +120,13 @@ void CheckConcurrentLazyResourceAccess(bool existing_pool) {
               snapshot.optimize_pool->count());
     EXPECT_EQ(expected_rocksdb_capacity, snapshot.rocksdb_capacity);
     EXPECT_EQ(expected_rocksdb_capacity, snapshot.cache->GetCapacity());
+#if defined(__linux__)
+    ASSERT_NE(nullptr, snapshot.cache->memory_allocator());
+    EXPECT_STREQ("ZvecMappedCacheAllocator",
+                 snapshot.cache->memory_allocator()->Name());
+#else
+    EXPECT_EQ(nullptr, snapshot.cache->memory_allocator());
+#endif
     EXPECT_EQ(GlobalResource::calculate_rocksdb_write_buffer_budget(
                   expected_rocksdb_capacity),
               snapshot.write_buffer_manager->buffer_size());

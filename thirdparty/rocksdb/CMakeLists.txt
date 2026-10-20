@@ -1,7 +1,4 @@
 set(ROCKSDB_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rocksdb-8.1.1)
-# Keep WBM refunds tied to actual release of tracked memtable backing pages.
-apply_patch_once("rocksdb_tracked_arena" "${ROCKSDB_SRC_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/rocksdb.tracked-arena.patch")
 if (ANDROID)
     set(ROCKSDB_ANDROID_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/rocksdb.android.patch)
     apply_patch_once("rocksdb_android_fix" "${ROCKSDB_SRC_DIR}" "${ROCKSDB_ANDROID_PATCH}")
