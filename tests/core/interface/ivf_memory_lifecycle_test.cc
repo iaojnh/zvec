@@ -9,6 +9,7 @@
 #include <zvec/core/interface/index_param_builders.h>
 #include "algorithm/ivf/ivf_params.h"
 #include "algorithm/ivf/ivf_searcher_context.h"
+#include "algorithm/ivf/ivf_streamer.h"
 #include "interface/indexes/holder_builder.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
@@ -20,8 +21,8 @@ class InspectableIVF : public IVFIndex {
     proxima_index_params_.set(core::PARAM_IVF_BUILDER_THREAD_COUNT, 2U);
     return init(param);
   }
-  void replace_reformer(core::IndexReformer::Pointer reformer) {
-    reformer_ = std::move(reformer);
+  void replace_streamer(core::IndexStreamer::Pointer streamer) {
+    streamer_ = std::move(streamer);
   }
   std::weak_ptr<core::IndexStorage> storage_handle() const {
     return storage_;
@@ -34,19 +35,17 @@ class InspectableIVF : public IVFIndex {
   }
 };
 
-class RetryReformer : public core::IndexReformer {
+class RetryStreamer : public core::IVFStreamer {
  public:
-  int init(const ailego::Params &) override {
-    return 0;
-  }
-  int cleanup() override {
-    return unload();
-  }
   int unload() override {
     ailego::BudgetedVector<char>().swap(partial);
-    return 0;
+    return core::IVFStreamer::unload();
   }
-  int load(core::IndexStorage::Pointer) override {
+  int open(core::IndexStorage::Pointer storage) override {
+    const int ret = core::IVFStreamer::open(std::move(storage));
+    if (ret != 0) return ret;
+    // Fail after the real persisted-format load. Injecting a reformer before
+    // open does not exercise turbo indexes, which discard legacy reformers.
     ++calls;
     partial.resize(1U << 20);
     return calls == 1 ? core::IndexError_NoMemory : 0;
@@ -170,19 +169,38 @@ TEST_F(IVFMemoryLifecycleTest, FailedOpenReleasesPartialStateAndCanRetry) {
   build();
   auto impl = make_index();
   Index::Pointer index = impl;
-  auto reformer = std::make_shared<RetryReformer>();
-  impl->replace_reformer(reformer);
+  auto streamer = std::make_shared<RetryStreamer>();
+  impl->replace_streamer(streamer);
   const auto before = pool.used();
   EXPECT_EQ(core::IndexError_NoMemory,
             index->open(
                 path, {StorageOptions::StorageType::kBufferPool, false, true}));
-  EXPECT_EQ(0u, reformer->partial.capacity());
+  EXPECT_EQ(1, streamer->calls);
+  EXPECT_EQ(0u, streamer->partial.capacity());
+  EXPECT_EQ(0u, streamer->stats().loaded_count());
+  EXPECT_EQ(nullptr, streamer->quantizer());
   EXPECT_EQ(before, pool.used());
-  EXPECT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
                                   false, true}));
-  EXPECT_EQ(2, reformer->calls);
+  EXPECT_EQ(2, streamer->calls);
+  EXPECT_EQ(64u, streamer->stats().loaded_count());
+  EXPECT_NE(nullptr, streamer->quantizer());
+  EXPECT_GE(streamer->partial.capacity(), 1U << 20);
+  {
+    auto query = std::make_shared<IVFQueryParam>();
+    query->topk = 1;
+    query->nprobe = 8;
+    SearchResult result;
+    ASSERT_EQ(
+        0, index->search(VectorData{DenseVector{row.data()}}, query, &result));
+    ASSERT_EQ(1u, result.doc_list_.size());
+    EXPECT_EQ(63u, result.doc_list_[0].key());
+    EXPECT_FLOAT_EQ(0.0f, result.doc_list_[0].score());
+  }
   EXPECT_EQ(0, index->close());
-  EXPECT_EQ(0u, reformer->partial.capacity());
+  EXPECT_EQ(0u, streamer->partial.capacity());
+  EXPECT_EQ(0u, streamer->stats().loaded_count());
+  EXPECT_EQ(before, pool.used());
 }
 
 TEST_F(IVFMemoryLifecycleTest, QueryReleasesFilterAndReusesContext) {
