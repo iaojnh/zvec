@@ -111,7 +111,10 @@ TEST(RevertedResultMemory, PublicQuantizedSearchReplacesOldDecodedPayload) {
     EXPECT_EQ(0u, pool.used());
     pool.init(previous);
   });
-  ASSERT_EQ(0, pool.init(1024 * 1024));
+  // The default mmap metadata region alone is 1 MiB plus header/footer and
+  // page alignment. Leave setup headroom; the failure check below explicitly
+  // reserves all remaining capacity except one byte.
+  ASSERT_EQ(0, pool.init(2 * 1024 * 1024));
   const std::string path = "reverted_result_memory_test.index";
   test_util::RemoveTestFiles(path);
   AILEGO_DEFER([&] { test_util::RemoveTestFiles(path); });
