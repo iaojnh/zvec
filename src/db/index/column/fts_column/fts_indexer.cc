@@ -27,9 +27,11 @@ FtsIndexer::~FtsIndexer() {
 
 FtsIndexer::Ptr FtsIndexer::CreateAndOpen(const std::string &working_dir,
                                           const FieldSchemaPtrList &fts_fields,
-                                          bool create, bool read_only) {
+                                          bool create, bool read_only,
+                                          Status *open_status) {
   auto indexer = std::make_shared<FtsIndexer>(working_dir);
   auto s = indexer->open(fts_fields, create, read_only);
+  if (open_status) *open_status = s;
   if (!s.ok()) {
     return nullptr;
   }
@@ -100,8 +102,7 @@ Status FtsIndexer::open(const FieldSchemaPtrList &fts_fields, bool create,
     if (!ret.has_value()) {
       LOG_ERROR("FtsIndexer: FtsColumnIndexer::open failed for field[%s]: %s",
                 name.c_str(), ret.error().message().c_str());
-      return Status::InternalError("FtsIndexer: open field failed: ", name, " ",
-                                   ret.error().message());
+      return ret.error();
     }
 
     if (!term_freq_cf) {
@@ -210,8 +211,7 @@ Status FtsIndexer::create_field_indexer(const FieldSchema &field) {
     LOG_ERROR(
         "FtsIndexer::create_field_indexer: FtsColumnIndexer::open failed: %s",
         ret.error().message().c_str());
-    return Status::InternalError("FtsIndexer::create_field_indexer: open: ",
-                                 ret.error().message());
+    return ret.error();
   }
 
   indexers_[name] = indexer;
@@ -234,8 +234,7 @@ Status FtsIndexer::remove_field_indexer(const std::string &field_name) {
   // Remove per-field stat keys.
   auto *stat_cf = fts_ctx_->get_cf(kFtsStatCfName);
   if (stat_cf) {
-    auto rs = fts_ctx_->db_->Delete(fts_ctx_->write_opts_, stat_cf,
-                                    fts::make_total_docs_key(field_name));
+    auto rs = fts_ctx_->remove(stat_cf, fts::make_total_docs_key(field_name));
     if (!rs.ok()) {
       LOG_ERROR(
           "FtsIndexer::remove_field_indexer: delete total_docs key "
@@ -243,8 +242,7 @@ Status FtsIndexer::remove_field_indexer(const std::string &field_name) {
           field_name.c_str(), rs.ToString().c_str());
       return Status::InternalError("delete total_docs key failed");
     }
-    rs = fts_ctx_->db_->Delete(fts_ctx_->write_opts_, stat_cf,
-                               fts::make_total_tokens_key(field_name));
+    rs = fts_ctx_->remove(stat_cf, fts::make_total_tokens_key(field_name));
     if (!rs.ok()) {
       LOG_ERROR(
           "FtsIndexer::remove_field_indexer: delete total_tokens key "
@@ -258,16 +256,16 @@ Status FtsIndexer::remove_field_indexer(const std::string &field_name) {
 }
 
 Status FtsIndexer::insert(const std::string &field_name, uint32_t seg_doc_id,
-                          const std::string &text) {
+                          const std::string &text,
+                          const detail::FtsWriteAdmission *admission) {
   auto it = indexers_.find(field_name);
   if (it == indexers_.end()) {
     return Status::NotFound("FtsIndexer::insert: field not found: ",
                             field_name);
   }
-  auto ret = it->second->insert(seg_doc_id, text);
+  auto ret = it->second->insert(seg_doc_id, text, admission);
   if (!ret.has_value()) {
-    return Status::InternalError("FtsIndexer::insert failed: ", field_name, " ",
-                                 ret.error().message());
+    return ret.error();
   }
   return Status::OK();
 }

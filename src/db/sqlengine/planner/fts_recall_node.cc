@@ -16,6 +16,7 @@
 #include <arrow/api.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
+#include "db/index/segment/segment_fetch_internal.h"
 #include "db/sqlengine/common/util.h"
 
 namespace cp = arrow::compute;
@@ -23,12 +24,19 @@ namespace cp = arrow::compute;
 namespace zvec::sqlengine {
 
 FtsRecallNode::FtsRecallNode(Segment::Ptr segment, QueryInfo::Ptr query_info,
-                             DocFilter::Ptr doc_filter, int batch_size)
+                             DocFilter::Ptr doc_filter, int batch_size,
+                             bool rank_only)
     : segment_(std::move(segment)),
       query_info_(std::move(query_info)),
       doc_filter_(std::move(doc_filter)),
       fetched_columns_(query_info_->get_all_fetched_scalar_field_names()),
-      batch_size_(batch_size) {
+      batch_size_(batch_size),
+      rank_only_(rank_only) {
+  if (rank_only_) {
+    schema_ = arrow::schema({arrow::field(LOCAL_ROW_ID, arrow::int32()),
+                             arrow::field(FIELD_SCORE, arrow::float32())});
+    return;
+  }
   auto table = segment_->fetch(fetched_columns_, std::vector<int>{});
   // Append BM25 score column so downstream fill_doc_score() surfaces it to
   // the Python Doc.score, matching the vector-recall path.
@@ -44,6 +52,10 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
     if (!state.iter_) {
       auto fts_ret = self->prepare();
       if (!fts_ret) {
+        if (fts_ret.error().code() == StatusCode::RESOURCE_EXHAUSTED) {
+          return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+              arrow::Status::OutOfMemory(fts_ret.error().message()));
+        }
         return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
             arrow::Status::ExecutionError("prepare fts failed:",
                                           fts_ret.error().c_str()));
@@ -59,15 +71,14 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
 
     std::vector<int> indices;
     indices.reserve(self->batch_size_);
-    arrow::FloatBuilder score_builder;
+    auto *pool = self->segment_->query_memory_pool();
+    arrow::FloatBuilder score_builder(pool);
     for (int i = 0; state.iter_->valid() && i < self->batch_size_;
          i++, state.iter_->next()) {
       indices.push_back(state.iter_->doc_id());
       auto s = score_builder.Append(state.iter_->score());
       if (!s.ok()) {
-        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-            arrow::Status::ExecutionError("score builder append failed:",
-                                          s.ToString()));
+        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(s);
       }
     }
     if (indices.empty()) {
@@ -75,22 +86,41 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
           std::nullopt);
     }
 
-    auto table = self->segment_->fetch(self->fetched_columns_, indices);
-    if (!table) {
+    if (self->rank_only_) {
+      auto make_batch =
+          [&]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
+        arrow::Int32Builder rows(pool);
+        ARROW_RETURN_NOT_OK(rows.AppendValues(indices.data(), indices.size()));
+        ARROW_ASSIGN_OR_RAISE(auto row_array, rows.Finish());
+        ARROW_ASSIGN_OR_RAISE(auto scores, score_builder.Finish());
+        return arrow::RecordBatch::Make(
+            self->schema_, indices.size(),
+            {std::move(row_array), std::move(scores)});
+      };
+      auto batch = make_batch();
+      if (!batch.ok()) {
+        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+            batch.status());
+      }
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::UnknownError("fetch table failed"));
+          cp::ExecBatch(**batch));
     }
-    auto batch = table->CombineChunksToBatch();
+
+    auto table =
+        internal::fetch_table(*self->segment_, self->fetched_columns_, indices);
+    if (!table.ok()) {
+      return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+          table.status());
+    }
+    auto batch = (*table)->CombineChunksToBatch(pool);
     if (!batch.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::ExecutionError("combine chunks to batch failed:",
-                                        batch.status().ToString()));
+          batch.status());
     }
     auto score_array = score_builder.Finish();
     if (!score_array.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::ExecutionError("finish score builder failed:",
-                                        score_array.status().ToString()));
+          score_array.status());
     }
     auto record_batch = std::move(batch.ValueUnsafe());
     auto with_score =
@@ -98,8 +128,7 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
                                 score_array.MoveValueUnsafe());
     if (!with_score.ok()) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::ExecutionError("add score column failed:",
-                                        with_score.status().ToString()));
+          with_score.status());
     }
     cp::ExecBatch exec_batch(*with_score.ValueUnsafe());
     return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
@@ -119,12 +148,14 @@ Result<FtsIndexResults::Ptr> FtsRecallNode::prepare() {
         Status::InvalidArgument("FtsRecallNode: no fts_cond_info in query"));
   }
 
+  ailego::MemoryReservation keys_memory;
   fts::FtsQueryParams params;
   params.topk = query_info_->query_topn();
   // Brute-force path: get_bf_by_keys_and_update also clears invert_filter_
   // when it returns ids, so the filter set below won't double-check them.
   if (auto bf_keys = doc_filter_->get_bf_by_keys_and_update(
-          GlobalConfig::Instance().fts_brute_force_by_keys_ratio())) {
+          GlobalConfig::Instance().fts_brute_force_by_keys_ratio(),
+          keys_memory)) {
     params.candidate_ids = std::move(bf_keys.value());
   }
   // Push down remaining filters (delete / forward) so filtered docs are
@@ -133,6 +164,8 @@ Result<FtsIndexResults::Ptr> FtsRecallNode::prepare() {
 
   auto results =
       segment_->fts_search(fts_cond->field_name, *fts_cond->fts_ast, params);
+  auto evaluation_status = doc_filter_->status();
+  if (!evaluation_status.ok()) return tl::make_unexpected(evaluation_status);
   if (!results) {
     return tl::make_unexpected(results.error());
   }

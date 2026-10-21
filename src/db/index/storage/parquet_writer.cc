@@ -16,6 +16,9 @@
 #include <cstdint>
 #include <iostream>
 #include <arrow/compute/api_vector.h>
+#include <arrow/compute/exec.h>
+#include "parquet_memory_pool.h"
+#include "parquet_write_batch.h"
 
 namespace zvec {
 
@@ -49,10 +52,11 @@ arrow::Status ParquetWriter::insert(
                           arrow::io::FileOutputStream::Open(filepath_));
 
     parquet::WriterProperties::Builder builder;
+    builder.memory_pool(detail::GetParquetMemoryPool().get());
     std::shared_ptr<parquet::WriterProperties> props = builder.build();
 
     auto writer = parquet::arrow::FileWriter::Open(
-        *schema, arrow::default_memory_pool(), outfile_, props);
+        *schema, detail::GetParquetMemoryPool().get(), outfile_, props);
     ARROW_RETURN_NOT_OK(writer);
     writer_ = std::move(writer.ValueOrDie());
   }
@@ -100,10 +104,11 @@ arrow::Status ParquetWriter::insert_batch(
                           arrow::io::FileOutputStream::Open(filepath_));
 
     parquet::WriterProperties::Builder builder;
+    builder.memory_pool(detail::GetParquetMemoryPool().get());
     std::shared_ptr<parquet::WriterProperties> props = builder.build();
 
     auto writer = parquet::arrow::FileWriter::Open(
-        *schema, arrow::default_memory_pool(), outfile_, props);
+        *schema, detail::GetParquetMemoryPool().get(), outfile_, props);
     ARROW_RETURN_NOT_OK(writer);
     writer_ = std::move(writer.ValueOrDie());
   }
@@ -129,38 +134,39 @@ arrow::Status ParquetWriter::insert_batch(
 arrow::Status ParquetWriter::write_batch(const arrow::RecordBatch &batch,
                                          const IndexFilter::Ptr &filter) {
   if (!filter) {
-    return writer_->WriteRecordBatch(batch);
+    return detail::WriteParquetBatch(writer_.get(), batch);
   }
 
-  std::vector<int64_t> selected_indices;
+  auto *pool = detail::GetParquetMemoryPool().get();
+  arrow::Int64Builder builder(pool);
   for (int64_t i = 0; i < batch.num_rows(); ++i) {
     if (filter->is_filtered(i)) {
-      selected_indices.push_back(i);
+      ARROW_RETURN_NOT_OK(builder.Append(i));
     }
   }
 
-  if (selected_indices.empty()) {
+  if (builder.length() == 0) {
     return arrow::Status::OK();
   }
 
-  arrow::Int64Builder builder;
-  ARROW_RETURN_NOT_OK(builder.AppendValues(selected_indices));
   std::shared_ptr<arrow::Array> selection_array;
   ARROW_RETURN_NOT_OK(builder.Finish(&selection_array));
 
+  arrow::compute::ExecContext context(pool);
   std::vector<std::shared_ptr<arrow::Array>> filtered_columns;
   for (int i = 0; i < batch.num_columns(); ++i) {
     arrow::Datum out;
     ARROW_ASSIGN_OR_RAISE(
-        out, arrow::compute::Take(batch.column(i), selection_array));
+        out, arrow::compute::Take(batch.column(i), selection_array,
+                                  arrow::compute::TakeOptions::Defaults(),
+                                  &context));
     filtered_columns.push_back(out.make_array());
   }
 
   auto filtered_batch = arrow::RecordBatch::Make(
-      batch.schema(), static_cast<int64_t>(selected_indices.size()),
-      filtered_columns);
+      batch.schema(), selection_array->length(), filtered_columns);
 
-  return writer_->WriteRecordBatch(*filtered_batch);
+  return detail::WriteParquetBatch(writer_.get(), *filtered_batch);
 }
 
 arrow::Status ParquetWriter::finalize() {

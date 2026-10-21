@@ -13,7 +13,8 @@
 // limitations under the License.
 
 #pragma once
-
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include "utility/group_key.h"
 #include "flat_streamer.h"
 
 namespace zvec {
@@ -54,7 +55,7 @@ class FlatStreamerContext : public IndexStreamer::Context {
     return &results_[idx];
   }
 
-  inline IndexDocumentHeap *result_heap() {
+  inline IndexCandidateHeap *result_heap() {
     return &result_heap_;
   }
 
@@ -97,7 +98,10 @@ class FlatStreamerContext : public IndexStreamer::Context {
   inline uint32_t group_num() const {
     return group_num_;
   }
-  inline std::map<std::string, TopkHeap> &group_topk_heaps() {
+  using GroupHeaps =
+      std::map<GroupKey, TopkHeap, std::less<>,
+               ailego::BudgetedAllocator<std::pair<const GroupKey, TopkHeap>>>;
+  inline GroupHeaps &group_topk_heaps() {
     return group_topk_heaps_;
   }
   void set_fetch_vector(bool v) override {
@@ -130,17 +134,17 @@ class FlatStreamerContext : public IndexStreamer::Context {
       key_t key = result_heap_[i].key();
       if (fetch_vector_) {
         IndexStorage::MemoryBlock block;
-        owner_->entity().get_vector_by_key(key, block);
-        results_[idx].emplace_back(key, score, key, block);
+        int ret = owner_->get_vector_by_key(key, block);
+        if (ret != 0) throw FlatStreamerEntity::ReadError{ret};
+        results_[idx].emplace_back(key, score, key, std::move(block));
       } else {
         results_[idx].emplace_back(key, score, key);
       }
     }
   }
 
-  // Candidate searches consume their heap once. Transfer its document buffer
-  // when vectors are not requested; keep the regular materialization path
-  // when storage blocks must be pinned for fetch_vector.
+  // Candidate searches consume compact scratch once. Only the final records
+  // become documents; vector requests also pin their storage blocks.
   void take_topk_result(uint32_t idx) {
     if (fetch_vector_) {
       topk_to_result(idx);
@@ -158,54 +162,44 @@ class FlatStreamerContext : public IndexStreamer::Context {
     }
     documents.resize(size);
     results_[idx].clear();
-    results_[idx].swap(documents);
+    results_[idx].assign(documents.begin(), documents.end());
+    result_heap_.clear();
   }
 
   void topk_to_group_result(uint32_t idx) {
     ailego_assert_with(idx < group_results_.size(), "invalid idx");
     group_results_[idx].clear();
-    std::vector<std::pair<std::string, TopkHeap>> group_topk_list;
-    std::vector<std::pair<std::string, float>> best_score_in_groups;
-    for (auto itr = group_topk_heaps_.begin(); itr != group_topk_heaps_.end();
-         itr++) {
-      const std::string &group_id = (*itr).first;
-      auto &heap = (*itr).second;
-      heap.sort();
-      if (heap.size() > 0) {
-        float best_score = heap[0].second;
-        best_score_in_groups.push_back(std::make_pair(group_id, best_score));
-      }
+    using Entry = typename GroupHeaps::value_type;
+    std::vector<Entry *, ailego::BudgetedAllocator<Entry *>> group_topk_list;
+    for (auto &entry : group_topk_heaps_) {
+      entry.second.sort();
+      if (!entry.second.empty()) group_topk_list.push_back(&entry);
     }
-    std::sort(best_score_in_groups.begin(), best_score_in_groups.end(),
-              [](const std::pair<std::string, float> &a,
-                 const std::pair<std::string, float> &b) -> int {
-                return a.second < b.second;
+    std::sort(group_topk_list.begin(), group_topk_list.end(),
+              [](const Entry *a, const Entry *b) {
+                return a->second[0].second < b->second[0].second;
               });
-    // truncate to group num
-    for (uint32_t i = 0; i < group_num() && i < best_score_in_groups.size();
-         ++i) {
-      const std::string &group_id = best_score_in_groups[i].first;
-      group_topk_list.emplace_back(
-          std::make_pair(group_id, group_topk_heaps_[group_id]));
-    }
+    if (group_topk_list.size() > group_num())
+      group_topk_list.resize(group_num());
     group_results_[idx].resize(group_topk_list.size());
     for (uint32_t i = 0; i < group_topk_list.size(); ++i) {
-      const std::string &group_id = group_topk_list[i].first;
+      const std::string &group_id = group_topk_list[i]->first;
       group_results_[idx][i].set_group_id(group_id);
-      uint32_t size = std::min(
-          group_topk_, static_cast<uint32_t>(group_topk_list[i].second.size()));
+      uint32_t size =
+          std::min(group_topk_,
+                   static_cast<uint32_t>(group_topk_list[i]->second.size()));
       for (uint32_t j = 0; j < size; ++j) {
-        auto score = group_topk_list[i].second[j].second;
+        auto score = group_topk_list[i]->second[j].second;
         if (score > this->threshold()) {
           break;
         }
-        node_id_t id = group_topk_list[i].second[j].first;
-        auto provider = owner_->create_provider();
+        node_id_t id = group_topk_list[i]->second[j].first;
         if (fetch_vector_) {
           IndexStorage::MemoryBlock block;
-          provider->get_vector(id, block);
+          int ret = owner_->get_vector_by_key(id, block);
+          if (ret != 0) throw FlatStreamerEntity::ReadError{ret};
           group_results_[idx][i].mutable_docs()->emplace_back(id, score, id,
-                                                              block);
+                                                              std::move(block));
         } else {
           group_results_[idx][i].mutable_docs()->emplace_back(id, score, id);
         }
@@ -225,8 +219,11 @@ class FlatStreamerContext : public IndexStreamer::Context {
   }
 
   void reset() override {
+    result_heap_.release();
+    group_topk_heaps_.clear();
     for (auto &it : results_) {
       it.clear();
+      if (it.capacity() > 4096) IndexDocumentList().swap(it);
     }
     for (auto &it : group_results_) {
       it.clear();
@@ -271,21 +268,21 @@ class FlatStreamerContext : public IndexStreamer::Context {
  private:
   const FlatStreamer<BATCH_SIZE> *owner_{nullptr};
   FlatSearchScratch search_scratch_{};
-  std::vector<Stats> stats_vec_{};
+  ailego::BudgetedVector<Stats> stats_vec_{};
   uint32_t magic_{0};
   uint32_t topk_{0};
   uint32_t feature_size_{0};
   uint32_t actual_read_size_{0};
-  IndexDocumentHeap result_heap_;
-  std::vector<IndexDocumentList> results_{};
+  IndexCandidateHeap result_heap_;
+  ailego::BudgetedVector<IndexDocumentList> results_{};
   std::string batch_queries_{};
   float scores_[BATCH_SIZE * BATCH_SIZE];
   bool fetch_vector_{false};
   // group
   uint32_t group_num_{0};
   uint32_t group_topk_{0};
-  std::map<std::string, TopkHeap> group_topk_heaps_{};
-  std::vector<IndexGroupDocumentList> group_results_{};
+  GroupHeaps group_topk_heaps_{};
+  ailego::BudgetedVector<IndexGroupDocumentList> group_results_{};
 };
 
 }  // namespace core

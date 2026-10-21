@@ -25,6 +25,7 @@
 #include <parquet/arrow/reader.h>
 #include <zvec/db/status.h>
 #include "base_forward_store.h"
+#include "parquet_buffer_pool.h"
 
 namespace zvec {
 
@@ -41,7 +42,7 @@ class BufferPoolForwardStore
   /// \param uri The URI of the file to be accessed
   explicit BufferPoolForwardStore(const std::string &uri);
 
-  virtual ~BufferPoolForwardStore() = default;
+  virtual ~BufferPoolForwardStore();
 
   Status open() override;
 
@@ -51,6 +52,14 @@ class BufferPoolForwardStore
   /// \return A table containing the requested data or nullptr on failure
   TablePtr fetch(const std::vector<std::string> &columns,
                  const std::vector<int> &indices) override;
+
+  TablePtr fetch(const std::vector<std::string> &columns,
+                 const std::vector<int> &indices, arrow::MemoryPool *pool);
+
+  // Preserve allocation, I/O and format failures for status-aware callers.
+  arrow::Result<TablePtr> fetch_checked(const std::vector<std::string> &columns,
+                                        const std::vector<int> &indices,
+                                        arrow::MemoryPool *pool);
 
   /// Fetch specific columns and row indices from the data source
   /// \param columns The list of column names to fetch
@@ -113,6 +122,7 @@ class BufferPoolForwardStore
 
   /// The parquet file reader
   std::unique_ptr<parquet::arrow::FileReader> parquet_reader_;
+  ParquetBufferID metadata_id_;
 
   /// Number of row groups in the file
   int64_t num_row_groups_ = 0;

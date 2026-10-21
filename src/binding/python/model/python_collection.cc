@@ -13,16 +13,28 @@
 // limitations under the License.
 
 #include "python_collection.h"
+#include <algorithm>
+#include <limits>
+#include <string_view>
+#include <unordered_set>
+#include <arrow/api.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <zvec/db/collection.h>
 #include <zvec/db/doc_iterator.h>
+#include "db/collection_fetch_internal.h"
 #include "db/collection_query_internal.h"
+#include "db/common/result_memory_allowance.h"
 #include "python_doc.h"
 
 namespace zvec {
 
 namespace {
+
+detail::ResultMemoryAllowance &forward_result_allowance();
+void reserve_query_forward_results(const DocPtrList &docs,
+                                   const CollectionSchema &schema,
+                                   detail::ResultMemoryAllowance::Lease &lease);
 
 // Batch-materialize a DocPtrList into a list of (id, score, fields, vectors)
 // tuples in a single GIL-held section, avoiding per-doc _Doc wrappers and
@@ -54,6 +66,9 @@ inline void throw_if_error(const Status &status) {
       throw py::key_error(status.message());
     case StatusCode::INVALID_ARGUMENT:
       throw py::value_error(status.message());
+    case StatusCode::RESOURCE_EXHAUSTED:
+      PyErr_SetString(PyExc_MemoryError, status.message().c_str());
+      throw py::error_already_set();
     case StatusCode::INTERNAL_ERROR:
     case StatusCode::ALREADY_EXISTS:
     case StatusCode::NOT_SUPPORTED:
@@ -89,6 +104,10 @@ T unwrap_expected(tl::expected<T, Status> &&exp) {
 // the batch into tuples after the GIL is reacquired and the read lock released.
 template <typename Query>
 py::list execute_for_python(const Collection &collection, const Query &query) {
+  const bool budgeted = !unwrap_expected(collection.options()).enable_mmap_ &&
+                        ailego::MemoryLimitPool::get_instance().capacity();
+  detail::ResultMemoryAllowance::Lease memory(
+      budgeted ? &forward_result_allowance() : nullptr);
   Result<internal::QueryResultSnapshot> result;
   {
     py::gil_scoped_release release;
@@ -96,6 +115,7 @@ py::list execute_for_python(const Collection &collection, const Query &query) {
   }
   // GIL restored, schema read lock already released.
   auto snapshot = unwrap_expected(std::move(result));
+  reserve_query_forward_results(snapshot.docs, *snapshot.schema, memory);
   return docs_to_tuples(snapshot.docs, *snapshot.schema);
 }
 
@@ -110,6 +130,340 @@ py::array_t<T> owned_array(std::vector<T> values) {
   buffer.release();
   return py::array_t<T>({size}, {static_cast<py::ssize_t>(sizeof(T))},
                         ptr->data(), owner);
+}
+
+namespace {
+
+detail::ResultMemoryAllowance &forward_result_allowance() {
+  // Construct the pool first so this reservation is released before it at
+  // process shutdown. Collection close must not refund retained heap backing.
+  return detail::SharedResultMemoryAllowance();
+}
+
+class PythonResultEstimate {
+ public:
+  void add(size_t bytes, size_t count = 1) {
+    if (count && bytes > (std::numeric_limits<size_t>::max() - bytes_) / count)
+      throw std::bad_alloc();
+    bytes_ += bytes * count;
+  }
+  void string(std::string_view value) {
+    add(128);  // Unicode object/header and allocator size-class rounding.
+    // A single non-BMP character can make the whole Python string UCS-4.
+    // ASCII remains one byte per character; never assume UTF-8 byte length
+    // also bounds the in-memory representation of a mixed Unicode string.
+    const bool ascii = std::all_of(value.begin(), value.end(),
+                                   [](unsigned char c) { return c < 128; });
+    add(value.size(), ascii ? 1 : 4);
+  }
+  size_t bytes() const {
+    return bytes_;
+  }
+
+ private:
+  size_t bytes_{0};
+};
+
+template <typename T>
+void estimate_query_array(const Doc &doc, const std::string &name,
+                          PythonResultEstimate &estimate) {
+  const auto &values = doc.get_ref<std::vector<T>>(name);
+  estimate.add(128);
+  estimate.add(sizeof(void *), values.size());
+  if constexpr (std::is_same_v<T, std::string>) {
+    for (const auto &value : values) estimate.string(value);
+  } else {
+    estimate.add(64, values.size());
+  }
+}
+
+void reserve_query_forward_results(
+    const DocPtrList &docs, const CollectionSchema &schema,
+    detail::ResultMemoryAllowance::Lease &lease) {
+  if (!lease.enabled()) return;
+  try {
+    py::gil_scoped_release release;
+    PythonResultEstimate estimate;
+    const auto fields = schema.forward_fields();
+    for (const auto &doc : docs) {
+      estimate.add(512);
+      if (!doc) continue;
+      estimate.string(doc->pk_ref());
+      for (const auto &field : fields) {
+        const auto &name = field->name();
+        if (!doc->has_value(name)) continue;
+        estimate.string(name);
+        estimate.add(64);
+        switch (field->data_type()) {
+          case DataType::STRING:
+          case DataType::BINARY:
+            estimate.string(doc->get_ref<std::string>(name));
+            break;
+          case DataType::ARRAY_STRING:
+          case DataType::ARRAY_BINARY:
+            estimate_query_array<std::string>(*doc, name, estimate);
+            break;
+          case DataType::ARRAY_BOOL:
+            estimate_query_array<bool>(*doc, name, estimate);
+            break;
+          case DataType::ARRAY_INT32:
+            estimate_query_array<int32_t>(*doc, name, estimate);
+            break;
+          case DataType::ARRAY_INT64:
+            estimate_query_array<int64_t>(*doc, name, estimate);
+            break;
+          case DataType::ARRAY_UINT32:
+            estimate_query_array<uint32_t>(*doc, name, estimate);
+            break;
+          case DataType::ARRAY_UINT64:
+            estimate_query_array<uint64_t>(*doc, name, estimate);
+            break;
+          case DataType::ARRAY_FLOAT:
+            estimate_query_array<float>(*doc, name, estimate);
+            break;
+          case DataType::ARRAY_DOUBLE:
+            estimate_query_array<double>(*doc, name, estimate);
+            break;
+          default:
+            estimate.add(64);
+            break;
+        }
+      }
+    }
+    lease.add(estimate.bytes());
+  } catch (const std::bad_alloc &) {
+    PyErr_SetString(PyExc_MemoryError,
+                    "Insufficient shared budget for Python query results; "
+                    "reduce topk or output fields");
+    throw py::error_already_set();
+  }
+}
+
+void estimate_forward_value(const arrow::Array &array, int64_t row,
+                            PythonResultEstimate &estimate) {
+  if (array.IsNull(row)) return;
+  switch (array.type_id()) {
+    case arrow::Type::STRING: {
+      const auto value =
+          static_cast<const arrow::StringArray &>(array).GetView(row);
+      estimate.string({value.data(), value.size()});
+      break;
+    }
+    case arrow::Type::LIST: {
+      const auto &list = static_cast<const arrow::ListArray &>(array);
+      if (list.values()->type_id() == arrow::Type::BINARY) return;
+      estimate.add(128);
+      const auto offset = list.value_offset(row);
+      const auto length = list.value_length(row);
+      estimate.add(sizeof(void *), static_cast<size_t>(length));
+      for (int64_t i = 0; i < length; ++i)
+        estimate_forward_value(*list.values(), offset + i, estimate);
+      break;
+    }
+    default:
+      estimate.add(64);  // Numeric objects; bool/None are conservative here.
+      break;
+  }
+}
+
+void reserve_forward_results(const internal::ForwardFetchResult &forward,
+                             detail::ResultMemoryAllowance::Lease &lease) {
+  if (!lease.enabled()) return;
+  try {
+    py::gil_scoped_release release;
+    PythonResultEstimate estimate;
+    for (const auto &table : forward.tables) {
+      // Doc/tuple/outer-dict entries, then field-dict slots. Include the
+      // wrapper objects created after FetchTuples returns, not only payloads.
+      estimate.add(512, static_cast<size_t>(table->num_rows()));
+      for (int c = 1; c < table->num_columns(); ++c) {
+        if (c >= 2) {
+          estimate.string(table->field(c)->name());
+          estimate.add(64, static_cast<size_t>(table->num_rows()));
+        }
+        for (const auto &chunk : table->column(c)->chunks()) {
+          for (int64_t row = 0; row < chunk->length(); ++row)
+            estimate_forward_value(*chunk, row, estimate);
+        }
+      }
+    }
+    // Reserve the entire native chunk before creating any Python values.
+    // The lease accumulates all chunks of this API call, including split ones.
+    lease.add(estimate.bytes());
+  } catch (const std::bad_alloc &) {
+    PyErr_SetString(PyExc_MemoryError,
+                    "Insufficient shared budget for Python fetch results; "
+                    "reduce fetch batch bytes or concurrent requests");
+    throw py::error_already_set();
+  }
+}
+
+py::object forward_value_to_python(const arrow::Array &array, int64_t row) {
+  if (array.IsNull(row)) return py::none();
+  switch (array.type_id()) {
+    case arrow::Type::STRING: {
+      const auto value =
+          static_cast<const arrow::StringArray &>(array).GetView(row);
+      return py::str(value.data(), value.size());
+    }
+    case arrow::Type::BOOL:
+      return py::bool_(
+          static_cast<const arrow::BooleanArray &>(array).Value(row));
+    case arrow::Type::INT32:
+      return py::int_(static_cast<const arrow::Int32Array &>(array).Value(row));
+    case arrow::Type::INT64:
+      return py::int_(static_cast<const arrow::Int64Array &>(array).Value(row));
+    case arrow::Type::UINT32:
+      return py::int_(
+          static_cast<const arrow::UInt32Array &>(array).Value(row));
+    case arrow::Type::UINT64:
+      return py::int_(
+          static_cast<const arrow::UInt64Array &>(array).Value(row));
+    case arrow::Type::FLOAT:
+      return py::float_(
+          static_cast<const arrow::FloatArray &>(array).Value(row));
+    case arrow::Type::DOUBLE:
+      return py::float_(
+          static_cast<const arrow::DoubleArray &>(array).Value(row));
+    case arrow::Type::LIST: {
+      const auto &list = static_cast<const arrow::ListArray &>(array);
+      if (list.values()->type_id() == arrow::Type::BINARY) return py::none();
+      const auto offset = list.value_offset(row);
+      const auto length = list.value_length(row);
+      py::list result(length);
+      for (int64_t i = 0; i < length; ++i) {
+        result[i] = forward_value_to_python(*list.values(), offset + i);
+      }
+      return result;
+    }
+    default:
+      // Binary fields are not exposed by the Python DataType API; retain the
+      // legacy Doc converter's None result for unsupported field types.
+      return py::none();
+  }
+}
+
+py::object forward_value_to_python(const arrow::ChunkedArray &column,
+                                   int64_t row, bool *is_null = nullptr) {
+  for (const auto &chunk : column.chunks()) {
+    if (row < chunk->length()) {
+      if (is_null) *is_null = chunk->IsNull(row);
+      return forward_value_to_python(*chunk, row);
+    }
+    row -= chunk->length();
+  }
+  throw std::runtime_error("Invalid forward fetch row");
+}
+
+void forward_to_tuples(internal::ForwardFetchResult &forward, py::dict &out) {
+  for (auto &table : forward.tables) {
+    std::vector<py::str> names;
+    for (int c = 2; c < table->num_columns(); ++c) {
+      names.emplace_back(table->field(c)->name());
+    }
+    for (int64_t row = 0; row < table->num_rows(); ++row) {
+      auto key = forward_value_to_python(*table->column(1), row);
+      if (key.is_none()) throw std::runtime_error("Missing forward fetch key");
+      py::dict fields;
+      for (int c = 2; c < table->num_columns(); ++c) {
+        bool is_null;
+        auto value = forward_value_to_python(*table->column(c), row, &is_null);
+        // Null fields are absent from Doc too. Unsupported non-null fields
+        // keep the legacy converter's None behavior.
+        if (!is_null) fields[names[c - 2]] = std::move(value);
+      }
+      out[key] = py::make_tuple(key, 0.0, std::move(fields), py::none());
+    }
+    table.reset();
+  }
+}
+
+internal::FetchResultSnapshot fetch_snapshot_for_python(
+    const Collection &collection, const std::vector<std::string> &pks,
+    const std::optional<std::vector<std::string>> &output_fields,
+    bool include_vector, const CollectionSchema *schema) {
+  Result<internal::FetchResultSnapshot> result;
+  {
+    py::gil_scoped_release release;
+    result = internal::fetch_result_snapshot(collection, pks, output_fields,
+                                             include_vector, schema, true);
+  }
+  return unwrap_expected(std::move(result));
+}
+
+void fetch_chunk_for_python(
+    const Collection &collection, const std::vector<std::string> &pks,
+    const std::optional<std::vector<std::string>> &output_fields,
+    bool include_vector, const CollectionSchema &schema, py::dict &out,
+    detail::ResultMemoryAllowance::Lease &allowance) {
+  auto snapshot = fetch_snapshot_for_python(collection, pks, output_fields,
+                                            include_vector, &schema);
+  if (snapshot.forward) {
+    if (snapshot.forward->batch_exceeded) {
+      snapshot.forward.reset();
+      if (pks.size() <= 1) throw std::runtime_error("Fetch allocation failed");
+      const auto middle = pks.begin() + pks.size() / 2;
+      fetch_chunk_for_python(collection, {pks.begin(), middle}, output_fields,
+                             include_vector, schema, out, allowance);
+      fetch_chunk_for_python(collection, {middle, pks.end()}, output_fields,
+                             include_vector, schema, out, allowance);
+      return;
+    }
+    reserve_forward_results(*snapshot.forward, allowance);
+    forward_to_tuples(*snapshot.forward, out);
+    return;
+  }
+  const auto forward_fields = schema.forward_fields();
+  const auto vector_fields = schema.vector_fields();
+  while (!snapshot.docs.empty()) {
+    auto it = snapshot.docs.begin();
+    if (it->second) {
+      out[py::str(it->first)] = ZVecPyDoc::doc_to_tuple_with_fields(
+          *it->second, forward_fields, vector_fields);
+    }
+    snapshot.docs.erase(it);
+  }
+}
+
+}  // namespace
+
+// Only one bounded native result batch is alive at a time. The final Python
+// values belong to the caller; a high-water allowance covers materialization,
+// not arbitrary caller retention. Release all database locks before taking the
+// GIL, including on error/DDL paths. Native reads may run concurrently, but
+// only one budgeted call accumulates Python results at a time. Waiting calls
+// retain at most their bounded native chunk, not growing Python dictionaries.
+py::dict fetch_for_python(
+    const Collection &collection, const std::vector<std::string> &pks,
+    const std::optional<std::vector<std::string>> &output_fields,
+    bool include_vector) {
+  auto initial = fetch_snapshot_for_python(collection, {}, output_fields,
+                                           include_vector, nullptr);
+  const auto schema = std::move(initial.schema);
+  const bool budgeted = initial.forward &&
+                        !unwrap_expected(collection.options()).enable_mmap_ &&
+                        ailego::MemoryLimitPool::get_instance().capacity();
+  detail::ResultMemoryAllowance::Lease allowance(
+      budgeted ? &forward_result_allowance() : nullptr,
+      /*serialize_materialization=*/true);
+  py::dict out;
+  // Columnar results remain charged; don't shrink them to Doc-sized chunks.
+  const size_t batch_rows = initial.forward ? 256 : 32;
+  std::unordered_set<std::string_view> seen;
+  size_t begin = 0;
+  do {
+    std::vector<std::string> batch;
+    batch.reserve(std::min(batch_rows, pks.size() - begin));
+    while (begin < pks.size() && batch.size() < batch_rows) {
+      const auto &pk = pks[begin++];
+      if (seen.emplace(pk).second) {
+        batch.push_back(pk);
+      }
+    }
+    fetch_chunk_for_python(collection, batch, output_fields, include_vector,
+                           *schema, out, allowance);
+  } while (begin < pks.size());
+  return out;
 }
 
 void ZVecPyCollection::Initialize(pybind11::module_ &m) {
@@ -401,7 +755,7 @@ are returned as None.
                py::gil_scoped_release release;
                result = self.group_by_query(query);
              }
-             return unwrap_expected(result);
+             return unwrap_expected(std::move(result));
            })
       .def(
           "Fetch",
@@ -414,10 +768,13 @@ are returned as None.
               result = self.fetch(pks, output_fields, include_vector);
             }
             // return DocPtrMap
-            return unwrap_expected(result);
+            return unwrap_expected(std::move(result));
           },
           py::arg("pks"), py::arg("output_fields") = py::none(),
           py::arg("include_vector") = true)
+      .def("FetchTuples", &fetch_for_python, py::arg("pks"),
+           py::arg("output_fields") = py::none(),
+           py::arg("include_vector") = true)
       .def(
           "CreateIterator",
           [](Collection &self,

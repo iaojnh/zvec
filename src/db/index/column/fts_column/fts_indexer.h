@@ -39,7 +39,8 @@ class FtsIndexer {
   // failure.
   static Ptr CreateAndOpen(const std::string &working_dir,
                            const FieldSchemaPtrList &fts_fields, bool create,
-                           bool read_only = false);
+                           bool read_only = false,
+                           Status *open_status = nullptr);
 
   // Get FtsColumnIndexer by field name.
   fts::FtsColumnIndexerPtr get(const std::string &field_name) const;
@@ -61,7 +62,8 @@ class FtsIndexer {
 
   // Insert a document's text into a specific field's indexer.
   Status insert(const std::string &field_name, uint32_t seg_doc_id,
-                const std::string &text);
+                const std::string &text,
+                const detail::FtsWriteAdmission *admission = nullptr);
 
   // Seal a single field: flush + convert_postings_to_bitpacked + drop side CFs.
   Status seal(const std::string &field_name);

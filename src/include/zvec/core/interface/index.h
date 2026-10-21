@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #pragma once
-
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -21,6 +20,8 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_converter.h>
 #include <zvec/core/framework/index_factory.h>
@@ -42,6 +43,9 @@ class Quantizer;
 }  // namespace zvec::turbo
 
 namespace zvec::core_interface {
+
+class BufferedInput;
+struct CachedIndexContext;
 
 class ZVEC_CORE_API IndexFactory;
 
@@ -76,12 +80,29 @@ struct VectorData {
 };
 
 // Used to pass mutable vectors
-struct DenseVectorBuffer {
-  std::string data;  // use string to manage memory
-};
+using DenseVectorBuffer = ailego::BudgetedStringBuffer;
 
 struct SparseVectorBuffer {
-  uint32_t count;
+ private:
+  // Keep capacity charged until both strings are destroyed, including copies.
+  ailego::MemoryReservation memory_;
+
+ public:
+  SparseVectorBuffer() = default;
+  explicit SparseVectorBuffer(core::IndexSparseDocument &&document) {
+    document.swap_buffers(count, indices, values, memory_);
+  }
+  SparseVectorBuffer(const SparseVectorBuffer &) = default;
+  SparseVectorBuffer(SparseVectorBuffer &&) noexcept = default;
+  SparseVectorBuffer &operator=(SparseVectorBuffer other) noexcept {
+    memory_.swap(other.memory_);
+    std::swap(count, other.count);
+    indices.swap(other.indices);
+    values.swap(other.values);
+    return *this;
+  }
+
+  uint32_t count{0};
   std::string indices;
   std::string values;
 
@@ -101,6 +122,48 @@ struct VectorDataBuffer {
 
 
 struct SearchResult {
+ private:
+  // Copies charge before copying buffers; moves transfer their reservation.
+  ailego::MemoryReservation reverted_memory_;
+
+ public:
+  SearchResult() = default;
+  SearchResult(const SearchResult &) = default;
+  SearchResult(SearchResult &&) noexcept = default;
+  SearchResult &operator=(SearchResult rhs) {
+    swap(rhs);
+    return *this;
+  }
+  void swap(SearchResult &rhs) noexcept {
+    reverted_memory_.swap(rhs.reverted_memory_);
+    doc_list_.swap(rhs.doc_list_);
+    group_doc_list_.swap(rhs.group_doc_list_);
+    reverted_vector_list_.swap(rhs.reverted_vector_list_);
+    reverted_sparse_values_list_.swap(rhs.reverted_sparse_values_list_);
+    group_reverted_vector_list_.swap(rhs.group_reverted_vector_list_);
+    group_reverted_sparse_values_list_.swap(
+        rhs.group_reverted_sparse_values_list_);
+  }
+  void clear() {
+    SearchResult empty;
+    swap(empty);
+  }
+  void reserve_reverted_array(size_t count, size_t element_size) {
+    reverted_memory_.add_array(count, element_size);
+  }
+  void reserve_reverted_vector(size_t bytes) {
+    // Include terminator, allocator rounding and string growth before decoding.
+    if (bytes > (std::numeric_limits<size_t>::max() - 32) / 2)
+      throw std::bad_alloc();
+    reverted_memory_.add(bytes * 2 + 32);
+  }
+  ailego::MemoryReservation take_reverted_memory() {
+    return std::move(reverted_memory_);
+  }
+  size_t reverted_memory_bytes() const {
+    return reverted_memory_.bytes();
+  }
+
   core::IndexDocumentList doc_list_;
   core::IndexGroupDocumentList group_doc_list_;
   // use string to manage memory
@@ -114,7 +177,7 @@ struct SearchResult {
 class ZVEC_CORE_API Index {
  public:
   typedef std::shared_ptr<Index> Pointer;
-  virtual ~Index() = default;
+  virtual ~Index();
 
   // static Index::Pointer Create(const BaseIndexParam &param); // IndexFactory
   virtual int open(const std::string &file_path,
@@ -195,7 +258,8 @@ class ZVEC_CORE_API Index {
                             const BaseIndexQueryParam::Pointer &search_param,
                             SearchResult *result,
                             core::IndexContext::Pointer &context);
-  int _prepare_dense_query(const VectorData &query, std::string *query_storage,
+  int _prepare_dense_query(const VectorData &query,
+                           ailego::BudgetedStringWorkspace *query_storage,
                            const void **prepared_query,
                            core::IndexQueryMeta *prepared_meta);
   int _execute_dense_search(const void *query,
@@ -245,6 +309,7 @@ class ZVEC_CORE_API Index {
   int init_converter_reformer(const std::string &converter_name,
                               const ailego::Params &converter_params = {});
   virtual int create_and_init_streamer(const BaseIndexParam &param) = 0;
+  virtual int reinitialize_streamer() = 0;
 
   //! Adjust the pipeline after storage opens, before the streamer reads it.
   virtual int prepare_streamer_open(const StorageOptions & /*options*/) {
@@ -253,7 +318,11 @@ class ZVEC_CORE_API Index {
 
  protected:
   bool init_context();
-  core::IndexContext::Pointer &acquire_context();
+  core::IndexContext::Pointer &acquire_context(bool active = false);
+  void release_context();
+  int open_trained_storage(const std::string &path);
+  virtual int load_streamer();
+  virtual void release_build_input() {}
 
  protected:
   bool is_trained_{false};
@@ -274,9 +343,17 @@ class ZVEC_CORE_API Index {
   std::shared_ptr<turbo::Quantizer> turbo_quantizer_{};
 
   size_t context_index_{std::numeric_limits<size_t>::max()};
+  // IVF contexts own storage readers. The index owns their lifetime; thread
+  // caches only borrow them, so closing on another thread releases readers.
+  std::mutex contexts_mutex_;
+  ailego::BudgetedVector<std::shared_ptr<CachedIndexContext>> contexts_;
   core::IndexStorage::Pointer storage_{};
 
+  // Direct builder input only; Collection merge borrows its providers.
+  std::shared_ptr<BufferedInput> buffered_input_{};
+
   bool is_open_{false};
+  bool streamer_needs_init_{false};
   bool is_sparse_{false};
   bool is_huge_page_{false};
   bool is_read_only_{false};
@@ -298,6 +375,9 @@ class ZVEC_CORE_API FlatIndex : public Index {
 
  protected:
   int create_and_init_streamer(const BaseIndexParam &param) override;
+  int reinitialize_streamer() override {
+    return create_and_init_streamer(param_);
+  }
 
   int create_and_init_converter_reformer(
       const QuantizerParam &param, const BaseIndexParam &index_param) override;
@@ -329,9 +409,16 @@ class ZVEC_CORE_API IVFIndex : public Index {
   IVFIndex() = default;
 
  protected:
+  void release_build_input() override {
+    holder_.reset();
+    doc_cache_.reset();
+  }
   int create_and_init_converter_reformer(
       const QuantizerParam &param, const BaseIndexParam &index_param) override;
   int create_and_init_streamer(const BaseIndexParam &param) override;
+  int reinitialize_streamer() override {
+    return create_and_init_streamer(param_);
+  }
 
   int _dense_search(const VectorData &query,
                     const BaseIndexQueryParam::Pointer &search_param,
@@ -356,7 +443,7 @@ class ZVEC_CORE_API IVFIndex : public Index {
   int generate_holder();
 
  private:
-  int load_streamer();
+  int load_streamer() override;
   int restore_legacy_pipeline();
 
   std::shared_ptr<zvec::turbo::Quantizer> ivf_quantizer_{};
@@ -369,7 +456,9 @@ class ZVEC_CORE_API IVFIndex : public Index {
   BuildStage build_stage_{BuildStage::kCollecting};
   IVFIndexParam param_{};
   std::mutex mutex_{};
-  std::vector<std::pair<uint64_t, std::string>> doc_cache_;
+  using DocCache =
+      ailego::BudgetedVector<std::pair<uint64_t, ailego::BudgetedString>>;
+  std::shared_ptr<DocCache> doc_cache_{std::make_shared<DocCache>()};
   core::IndexHolder::Pointer holder_{};
   std::string file_path_;
 };
@@ -395,6 +484,9 @@ class ZVEC_CORE_API HNSWIndex : public Index {
 
  protected:
   int create_and_init_streamer(const BaseIndexParam &param) override;
+  int reinitialize_streamer() override {
+    return create_and_init_streamer(param_);
+  }
 
   int create_and_init_converter_reformer(
       const QuantizerParam &param, const BaseIndexParam &index_param) override;
@@ -422,6 +514,9 @@ class ZVEC_CORE_API VamanaIndex : public Index {
 
  protected:
   int create_and_init_streamer(const BaseIndexParam &param) override;
+  int reinitialize_streamer() override {
+    return create_and_init_streamer(param_);
+  }
 
   int _prepare_for_search(const VectorData &query,
                           const BaseIndexQueryParam::Pointer &search_param,
@@ -439,6 +534,9 @@ class ZVEC_CORE_API HNSWRabitqIndex : public Index {
 
  protected:
   int create_and_init_streamer(const BaseIndexParam &param) override;
+  int reinitialize_streamer() override {
+    return create_and_init_streamer(param_);
+  }
 
   int _prepare_for_search(const VectorData &query,
                           const BaseIndexQueryParam::Pointer &search_param,
@@ -455,7 +553,15 @@ class ZVEC_CORE_API IVFRabitqIndex : public Index {
   IVFRabitqIndex() = default;
 
  protected:
+  void release_build_input() override {
+    holder_.reset();
+    doc_cache_.reset();
+  }
+
   int create_and_init_streamer(const BaseIndexParam &param) override;
+  int reinitialize_streamer() override {
+    return create_and_init_streamer(param_);
+  }
 
   int _prepare_for_search(const VectorData &query,
                           const BaseIndexQueryParam::Pointer &search_param,
@@ -472,9 +578,13 @@ class ZVEC_CORE_API IVFRabitqIndex : public Index {
   int generate_holder();
 
  private:
+  enum class BuildStage { kCollecting, kTrained, kBuilt, kDumped };
+  [[maybe_unused]] BuildStage build_stage_{BuildStage::kCollecting};
   IVFRabitqIndexParam param_{};
   std::mutex mutex_{};
-  std::vector<std::pair<uint64_t, std::string>> doc_cache_;
+  using DocCache =
+      ailego::BudgetedVector<std::pair<uint64_t, ailego::BudgetedString>>;
+  std::shared_ptr<DocCache> doc_cache_{std::make_shared<DocCache>()};
   core::IndexHolder::Pointer holder_{};
   std::string file_path_;
 };
@@ -485,6 +595,9 @@ class ZVEC_CORE_API DiskAnnIndex : public Index {
 
  protected:
   int create_and_init_streamer(const BaseIndexParam &param) override;
+  int reinitialize_streamer() override {
+    return create_and_init_streamer(param_);
+  }
 
   int _prepare_for_search(const VectorData &query,
                           const BaseIndexQueryParam::Pointer &search_param,

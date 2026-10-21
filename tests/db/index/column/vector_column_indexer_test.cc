@@ -14,6 +14,7 @@
 
 // #include "db/doc.h"
 #include "db/index/column/vector_column/vector_column_indexer.h"
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -24,6 +25,7 @@
 #include "zvec/ailego/utility/float_helper.h"
 #include "zvec/db/doc.h"
 #include "zvec/db/index_params.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic push
@@ -31,6 +33,70 @@
 #endif
 
 using namespace zvec;
+
+namespace {
+class FailingCoreIndex : public core_interface::Index {
+ public:
+  int error{core::IndexError_NoMemory};
+  int search(const core_interface::VectorData &,
+             const core_interface::BaseIndexQueryParam::Pointer &,
+             core_interface::SearchResult *) override {
+    return error;
+  }
+  int fetch(uint32_t, core_interface::VectorDataBuffer *) override {
+    return error;
+  }
+
+ protected:
+  int create_and_init_streamer(
+      const core_interface::BaseIndexParam &) override {
+    return error;
+  }
+  int reinitialize_streamer() override {
+    return error;
+  }
+  int _prepare_for_search(const core_interface::VectorData &,
+                          const core_interface::BaseIndexQueryParam::Pointer &,
+                          core::IndexContext::Pointer &) override {
+    return error;
+  }
+};
+
+class StatusTestVectorIndexer : public VectorColumnIndexer {
+ public:
+  explicit StatusTestVectorIndexer(
+      const core_interface::Index::Pointer &core_index)
+      : VectorColumnIndexer(
+            "",
+            FieldSchema("test", DataType::VECTOR_FP32, 4, false,
+                        std::make_shared<FlatIndexParams>(MetricType::L2))) {
+    index = core_index;
+  }
+};
+}  // namespace
+
+TEST(VectorColumnIndexerTest, PreservesCoreMemoryFailureClassification) {
+  auto core_index = std::make_shared<FailingCoreIndex>();
+  StatusTestVectorIndexer indexer(core_index);
+  const std::array<float, 4> vector{};
+  vector_column_params::VectorData data{
+      vector_column_params::DenseVector{vector.data()}};
+  vector_column_params::QueryParams params;
+  params.topk = 1;
+  params.query_params = std::make_shared<QueryParams>(IndexType::FLAT);
+  for (const auto code :
+       {StatusCode::RESOURCE_EXHAUSTED, StatusCode::INTERNAL_ERROR}) {
+    core_index->error = code == StatusCode::RESOURCE_EXHAUSTED
+                            ? core::IndexError_NoMemory
+                            : core::IndexError_ReadData;
+    auto search = indexer.search(data, params);
+    ASSERT_FALSE(search);
+    EXPECT_EQ(code, search.error().code());
+    auto fetch = indexer.fetch(0);
+    ASSERT_FALSE(fetch);
+    EXPECT_EQ(code, fetch.error().code());
+  }
+}
 
 
 TEST(VectorColumnIndexerTest, ReusedQueryParametersAndFlatFallback) {
@@ -2228,14 +2294,14 @@ TEST(VectorColumnIndexerTest, Failure) {
 
   // Test case 10: use_mmap = false
   {
-    zvec::ailego::MemoryLimitPool::get_instance().init(10 * 1024UL * 1024UL);
+    zvec::ailego::PoolPayloadBudget::get_instance().init(10 * 1024UL * 1024UL);
     auto indexer = std::make_shared<VectorColumnIndexer>(
         index_file_path,
         FieldSchema("test", DataType::VECTOR_FP32, 3, false,
                     std::make_shared<FlatIndexParams>(MetricType::IP)));
     ASSERT_TRUE(indexer);
     ASSERT_TRUE(
-        indexer->open(vector_column_params::ReadOptions{true, true, false})
+        indexer->open(vector_column_params::ReadOptions{false, true, false})
             .ok());
     // Insert some data first
     auto data = vector_column_params::VectorData{

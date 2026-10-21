@@ -20,7 +20,7 @@
 #include "algorithm/cluster/cluster_params.h"
 #include "algorithm/ivf/ivf_params.h"
 #include "algorithm/ivf/ivf_streamer.h"
-#include "utility/utility_params.h"
+#include "buffered_input.h"
 #include "holder_builder.h"
 
 namespace zvec::core_interface {
@@ -99,15 +99,15 @@ int IVFIndex::create_and_init_streamer(const BaseIndexParam &param) {
   } else {
     real_meta = proxima_index_meta_;
   }
-  if (ailego_unlikely(builder_->init(real_meta, proxima_index_params_,
-                                     ivf_quantizer_) != 0)) {
+  int ret = builder_->init(real_meta, proxima_index_params_, ivf_quantizer_);
+  if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to init builder");
-    return core::IndexError_Runtime;
+    return ret;
   }
-  if (ailego_unlikely(streamer_->init(real_meta, proxima_index_params_,
-                                      ivf_quantizer_) != 0)) {
+  ret = streamer_->init(real_meta, proxima_index_params_, ivf_quantizer_);
+  if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to init streamer");
-    return core::IndexError_Runtime;
+    return ret;
   }
   return 0;
 }
@@ -169,7 +169,7 @@ int IVFIndex::load_streamer() {
 }
 
 int IVFIndex::open(const std::string &file_path,
-                   StorageOptions storage_options) {
+                   StorageOptions storage_options) try {
   ailego::Params storage_params;
   file_path_ = file_path;
   is_read_only_ = storage_options.read_only;
@@ -189,13 +189,10 @@ int IVFIndex::open(const std::string &file_path,
       break;
     }
     case StorageOptions::StorageType::kBufferPool: {
-      // IVF is immutable after training and FileDumper already emits the
-      // IndexFormat consumed by BufferReadStorage. Keep construction on the
-      // FileDumper path and use the bounded page cache after dump/reopen.
+      // FileDumper emits the immutable IndexFormat consumed by this reader.
       // Opening an index must not prewarm the entire file or displace other
       // collections' cached pages. Populate the cache on demand instead.
-      storage_params.set(core::BUFFER_READ_STORAGE_WARMUP_MODE,
-                         core::BUFFER_READ_STORAGE_WARMUP_NONE);
+      storage_params.set("proxima.buffer.read_storage.warmup_mode", "none");
       storage_ = core::IndexFactory::CreateStorage("BufferReadStorage");
       if (storage_ == nullptr) {
         LOG_ERROR("Failed to create BufferReadStorage for IVF");
@@ -217,28 +214,56 @@ int IVFIndex::open(const std::string &file_path,
     }
   }
 
+  proxima_index_params_.set(
+      core::PARAM_IVF_BUILDER_BUILD_STORAGE_PATH,
+      storage_options.type == StorageOptions::StorageType::kBufferPool
+          ? file_path_ + ".build"
+          : std::string());
+  if (storage_options.create_new && !is_read_only_ &&
+      storage_options.type == StorageOptions::StorageType::kBufferPool) {
+    // Storage mode is selected after init. Configure the fresh builder now,
+    // then retain it through train/build/dump retries.
+    const int ret = reset_builder();
+    if (ret != 0) return ret;
+  }
+
   if (is_read_only_ || !storage_options.create_new) {
-    // read_options.create_new
-    int ret = storage_->open(file_path_, false);
-    if (ret != 0) {
-      LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
-                core::IndexError::What(ret));
-      return core::IndexError_Runtime;
-    }
-    ret = load_streamer();
+    const int ret = open_trained_storage(file_path_);
     if (ret != 0) return ret;
     is_trained_ = true;
   }
+  if (storage_options.create_new && !is_read_only_ &&
+      storage_options.type == StorageOptions::StorageType::kBufferPool) {
+    buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
+                                                      file_path_ + ".input");
+  }
   is_open_ = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int IVFIndex::generate_holder() {
-  return BuildMultiPassHolder(param_.data_type, param_.dimension, doc_cache_,
-                              converter_, &holder_);
+  core::IndexHolder::Pointer input;
+  if (buffered_input_) {
+    const int ret = buffered_input_->prepare();
+    if (ret != 0) return ret;
+    input = buffered_input_;
+  } else {
+    input = std::make_shared<DocCacheHolder>(input_vector_meta_, doc_cache_);
+  }
+  if (converter_) {
+    const int ret = core::IndexConverter::TrainAndTransform(converter_, input);
+    if (ret != 0) return ret;
+    input = converter_->result();
+    if (!input) return core::IndexError_Runtime;
+  }
+  holder_ = std::move(input);
+  return 0;
 }
 
-int IVFIndex::add(const VectorData &vector, uint32_t doc_id) {
+int IVFIndex::add(const VectorData &vector, uint32_t doc_id) try {
+  if (!is_open_ || is_read_only_) return core::IndexError_NoReady;
   if (is_trained_ || build_stage_ != BuildStage::kCollecting) {
     LOG_ERROR("this IVF index is trained or has a pending build");
     return core::IndexError_Runtime;
@@ -248,21 +273,22 @@ int IVFIndex::add(const VectorData &vector, uint32_t doc_id) {
     return core::IndexError_Runtime;
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector.vector);
-  std::string out_vector_buffer = std::string(
-      static_cast<const char *>(dense_vector.data),
-      input_vector_meta_.dimension() * input_vector_meta_.unit_size());
-
+  if (!dense_vector.data) return core::IndexError_InvalidArgument;
   std::lock_guard<std::mutex> lock(mutex_);
-  while (doc_cache_.size() <= doc_id) {
-    std::string fake_data(
-        input_vector_meta_.dimension() * input_vector_meta_.unit_size(), 0);
-    doc_cache_.push_back(std::make_pair(kInvalidKey, fake_data));
+  if (buffered_input_) return buffered_input_->add(doc_id, dense_vector.data);
+  ailego::BudgetedString value(static_cast<const char *>(dense_vector.data),
+                               input_vector_meta_.element_size());
+  if (doc_cache_->size() <= doc_id) {
+    doc_cache_->resize(static_cast<size_t>(doc_id) + 1,
+                       std::make_pair(kInvalidKey, ailego::BudgetedString{}));
   }
-  doc_cache_[doc_id] = std::make_pair(doc_id, out_vector_buffer);
+  (*doc_cache_)[doc_id] = std::make_pair(doc_id, std::move(value));
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
-int IVFIndex::train() {
+int IVFIndex::train() try {
   if (is_trained_) {
     return 0;
   }
@@ -286,6 +312,8 @@ int IVFIndex::train() {
     build_stage_ = BuildStage::kBuilt;
   }
   return dump_and_open();
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int IVFIndex::reset_builder() {
@@ -322,9 +350,9 @@ int IVFIndex::dump_and_open() {
       return ret;
     }
     // Dump converter state (e.g., rotator for INT8+rotate) to dumper
-    if (converter_ && converter_->dump(dumper) != 0) {
-      LOG_ERROR("Failed to dump converter, path: %s", file_path_.c_str());
-      return core::IndexError_Runtime;
+    if (converter_) {
+      ret = converter_->dump(dumper);
+      if (ret != 0) return ret;
     }
     ret = dumper->close();
     if (ret != 0) {
@@ -343,19 +371,7 @@ int IVFIndex::dump_and_open() {
     return core::IndexError_NoReady;
   }
 
-  AILEGO_DEFER([&]() {
-    if (!is_trained_) {
-      if (streamer_) streamer_->close();
-      storage_->close();
-    }
-  });
-  int ret = storage_->open(file_path_, false);
-  if (ret != 0) {
-    LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
-              core::IndexError::What(ret));
-    return core::IndexError_Runtime;
-  }
-  ret = load_streamer();
+  const int ret = open_trained_storage(file_path_);
   if (ret != 0) return ret;
   is_trained_ = true;
   // Only the reformer is needed after the persisted index is ready. Destroy
@@ -363,12 +379,13 @@ int IVFIndex::dump_and_open() {
   // every failure path so dump/open can be retried with the trained state.
   converter_.reset();
   holder_.reset();
-  decltype(doc_cache_)().swap(doc_cache_);
+  buffered_input_.reset();
+  doc_cache_.reset();
   return 0;
 }
 
 int IVFIndex::_dense_fetch(const uint32_t doc_id,
-                           VectorDataBuffer *vector_data_buffer) {
+                           VectorDataBuffer *vector_data_buffer) try {
   if (is_trained_) {
     if (ivf_quantizer_) {
       auto provider = streamer_->create_provider();
@@ -384,19 +401,28 @@ int IVFIndex::_dense_fetch(const uint32_t doc_id,
     return Index::_dense_fetch(doc_id, vector_data_buffer);
   } else {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (buffered_input_) {
+      DenseVectorBuffer result;
+      int ret = buffered_input_->fetch(doc_id, &result);
+      if (ret == 0) vector_data_buffer->vector_buffer = std::move(result);
+      return ret;
+    }
     // A failed merge has no cached input; sparse doc IDs also leave holes.
-    if (doc_id >= doc_cache_.size()) {
+    if (!doc_cache_ || doc_id >= doc_cache_->size()) {
       return core::IndexError_OutOfRange;
     }
-    if (doc_cache_[doc_id].first == kInvalidKey) {
+    if ((*doc_cache_)[doc_id].first == kInvalidKey) {
       return core::IndexError_NoExist;
     }
     DenseVectorBuffer dense_vector_buffer;
     std::string &out_vector_buffer = dense_vector_buffer.data;
-    out_vector_buffer = doc_cache_[doc_id].second;
+    dense_vector_buffer.reserve((*doc_cache_)[doc_id].second.size());
+    out_vector_buffer = (*doc_cache_)[doc_id].second;
     vector_data_buffer->vector_buffer = std::move(dense_vector_buffer);
     return 0;
   }
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int IVFIndex::_dense_search(const VectorData &query,
@@ -450,7 +476,8 @@ int IVFIndex::_prepare_for_search(
 }
 
 int IVFIndex::merge(const std::vector<Index::Pointer> &indexes,
-                    const IndexFilter &filter, const MergeOptions &options) {
+                    const IndexFilter &filter,
+                    const MergeOptions &options) try {
   if (indexes.empty()) {
     return 0;
   }
@@ -476,5 +503,7 @@ int IVFIndex::merge(const std::vector<Index::Pointer> &indexes,
   // dump/open finishes; train() may resume that phase if it fails.
   is_trained_ = false;
   return dump_and_open();
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 }  // namespace zvec::core_interface

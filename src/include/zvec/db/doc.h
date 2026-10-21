@@ -291,6 +291,9 @@ class ZVEC_API Doc {
  public:
   std::vector<uint8_t> serialize() const;
 
+  // Size of the existing WAL representation, without allocating a copy.
+  size_t serialized_size() const;
+
   static Doc::Ptr deserialize(const uint8_t *data, size_t size);
   static Doc::Ptr deserialize(const std::vector<uint8_t> &data) {
     return deserialize(data.data(), data.size());

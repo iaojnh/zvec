@@ -22,8 +22,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "db/index/column/fts_column/tokenizer/jieba_embedded_dict.h"
+#include "tests/ailego/buffer/pool_payload_budget.h"
 
 namespace {
 
@@ -35,6 +37,13 @@ using zvec::fts::Token;
 
 constexpr char kDictEnv[] = "ZVEC_JIEBA_DICT_DIR";
 const std::string kDictDir{JIEBA_DICT_DIR};
+
+TEST(JiebaDictionaryBudget, EmbeddedSizesMatchUncompressedResources) {
+  EXPECT_EQ(std::filesystem::file_size(kDictDir + "/jieba.dict.utf8"),
+            zvec::fts::embedded_jieba_dict_bytes());
+  EXPECT_EQ(std::filesystem::file_size(kDictDir + "/hmm_model.utf8"),
+            zvec::fts::embedded_jieba_hmm_model_bytes());
+}
 
 int set_dict_env(const char *value) {
 #ifdef _WIN32
@@ -125,6 +134,24 @@ class JiebaEmbeddedTokenizerTest : public ::testing::Test {
   std::string saved_env_;
   bool had_env_{false};
 };
+
+TEST_F(JiebaEmbeddedTokenizerTest, RejectsInsufficientDictionaryAllowance) {
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = zvec::ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(32 * 1024 * 1024));
+  for (const auto &dir : {std::string{}, kDictDir}) {
+    JiebaTokenizer tokenizer;
+    const auto status = tokenizer.init(make_config("full", dir));
+    EXPECT_EQ(zvec::StatusCode::RESOURCE_EXHAUSTED, status.code()) << status;
+    EXPECT_FALSE(tokenizer.is_valid());
+    EXPECT_EQ(0u, pool.used());
+  }
+}
 
 // Register this test first so a normal run races the first cache
 // initialization.

@@ -162,8 +162,20 @@ class FlatStreamer : public IndexStreamer {
   }
 
   int get_vector_by_key(const uint64_t key,
-                        IndexStorage::MemoryBlock &block) const override {
-    return entity_->get_vector_by_key(key, block);
+                        IndexStorage::MemoryBlock &block) const override try {
+    int ret = entity_->get_vector_by_key(key, block);
+    if (ret != 0) return ret;
+    if (block.type_ == IndexStorage::MemoryBlock::MBT_MMAP) {
+      auto owned =
+          IndexStorage::MemoryBlock::AllocateOwned(meta_.element_size());
+      std::memcpy(const_cast<void *>(owned.data()), block.data(),
+                  meta_.element_size());
+      block = std::move(owned);
+    }
+    return 0;
+  } catch (const std::bad_alloc &) {
+    block.reset();
+    return IndexError_NoMemory;
   }
   const void *get_vector_by_id(uint32_t id) const override {
     return get_vector_by_key(id);

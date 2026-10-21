@@ -15,9 +15,11 @@
 #pragma once
 
 #include <arrow/ipc/reader.h>
+#include <arrow/table.h>
 #include <parquet/arrow/reader.h>
 #include "db/common/constants.h"
 #include "parquet_buffer_pool.h"
+#include "parquet_memory_pool.h"
 
 
 namespace zvec {
@@ -83,12 +85,17 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   ParquetRecordBatchReader(std::unique_ptr<parquet::arrow::FileReader> &reader,
                            const std::vector<std::string> &columns,
                            std::shared_ptr<arrow::Schema> schema,
-                           const std::string &file_path, bool with_cache = true)
-      : reader_(std::move(reader)),
+                           const std::string &file_path, bool with_cache = true,
+                           bool stream_uncached = false,
+                           std::shared_ptr<arrow::MemoryPool> memory_pool = {},
+                           ParquetBufferID metadata_id = {})
+      : memory_pool_(std::move(memory_pool)),
+        reader_(std::move(reader)),
         schema_(std::move(schema)),
         columns_(columns),
         file_path_(file_path),
-        with_cache_(with_cache) {
+        with_cache_(with_cache),
+        stream_uncached_(stream_uncached) {
     std::vector<std::shared_ptr<arrow::Field>> fields;
     for (const auto &col : columns) {
       int index = schema_->GetFieldIndex(col);
@@ -100,6 +107,10 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
     projected_schema_ = arrow::schema(fields);
 
     auto parquet_metadata = reader_->parquet_reader()->metadata();
+    metadata_id_ = metadata_id.filename.empty()
+                       ? ParquetBufferID(file_path_, 0, 0)
+                       : std::move(metadata_id);
+    metadata_id_.metadata = parquet_metadata;
     total_rows_ = parquet_metadata->num_rows();
     num_row_groups_ = parquet_metadata->num_row_groups();
     int64_t offset = 0;
@@ -117,62 +128,134 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   }
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
-    if (current_row_group_ >= num_row_groups_) {
-      return arrow::Status::OK();
-    }
+    *batch = nullptr;
+    while (true) {
+      if (cached_batches_) {
+        ARROW_RETURN_NOT_OK(cached_batches_->ReadNext(batch));
+        if (*batch) {
+          if ((*batch)->num_rows() != 0) return arrow::Status::OK();
+          continue;
+        }
+        cached_batches_.reset();
+      }
+      if (current_row_group_ >= num_row_groups_) {
+        return arrow::Status::OK();
+      }
 
-    int64_t rg_id = current_row_group_;
-    int64_t num_rows_in_rg = row_group_row_nums_[rg_id];
+      if (!with_cache_) {
+        return stream_uncached_ ? read_next_uncached(batch)
+                                : read_row_group(batch);
+      }
 
-    std::vector<std::shared_ptr<arrow::Array>> chunks(col_indices_.size());
-    if (with_cache_) {
+      int64_t rg_id = current_row_group_;
+      int64_t num_rows_in_rg = row_group_row_nums_[rg_id];
+
+      std::vector<std::shared_ptr<arrow::ChunkedArray>> columns(
+          col_indices_.size());
       for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
-        auto buffer_id =
-            ParquetBufferID(file_path_, col_indices_[col_idx], rg_id);
-        auto buffer_handle =
-            ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+        auto buffer_id = ParquetBufferID(file_path_, col_indices_[col_idx],
+                                         rg_id, metadata_id_);
+        // A one-pass scan must not fill the point-read cache with entire cold
+        // columns. Reuse resident columns without copying; on a miss, stream
+        // bounded batches through the same budgeted decoder instead. Preserve
+        // the legacy reader's cache behavior when no budgeted pool is supplied.
+        auto &cache = ParquetBufferPool::get_instance();
+        auto buffer_handle = memory_pool_ ? cache.try_acquire_buffer(buffer_id)
+                                          : cache.acquire_buffer(buffer_id);
         std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
             buffer_handle.data();
-        if (col_chunked_array) {
-          std::shared_ptr<arrow::Array> concat;
-          auto concat_result = arrow::Concatenate(col_chunked_array->chunks(),
-                                                  arrow::default_memory_pool());
-          if (!concat_result.ok()) {
-            return concat_result.status();
-          }
-          concat = concat_result.ValueOrDie();
-          chunks[col_idx] = concat;
+        if (!col_chunked_array) {
+          // Cache residency is optional. Drop partial columns before reading
+          // the same row group in bounded batches, without publishing any rows
+          // twice or passing null columns to Arrow. Stay uncached for this scan
+          // to avoid repeatedly decoding columns that cannot fit in the pool.
+          columns.clear();
+          with_cache_ = false;
+          stream_uncached_ = true;
+          return read_next_uncached(batch);
         }
+        columns[col_idx] = std::move(col_chunked_array);
       }
-    } else {
-      std::shared_ptr<arrow::Table> rg_table;
-      ARROW_RETURN_NOT_OK(
-          reader_->RowGroup(rg_id)->ReadTable(col_indices_, &rg_table));
-      for (size_t i = 0; i < col_indices_.size(); ++i) {
-        std::shared_ptr<arrow::Array> concat;
-        auto concat_result = arrow::Concatenate(rg_table->column(i)->chunks(),
-                                                arrow::default_memory_pool());
-        if (!concat_result.ok()) {
-          return concat_result.status();
-        }
-        concat = concat_result.ValueOrDie();
-        chunks[i] = concat;
-      }
-    }
 
-    *batch =
-        arrow::RecordBatch::Make(projected_schema_, num_rows_in_rg, chunks);
-    current_row_group_++;
-    return arrow::Status::OK();
+      // Slice existing chunks and retain their cache pins; concatenation made
+      // a second, unbudgeted copy of every decoded row-group column.
+      cached_batches_ =
+          std::make_unique<arrow::TableBatchReader>(arrow::Table::Make(
+              projected_schema_, std::move(columns), num_rows_in_rg));
+      cached_batches_->set_chunksize(8192);
+      current_row_group_++;
+    }
   }
 
  private:
+  // Preserve the existing uncached mmap reader's row-group batch boundaries.
+  arrow::Status read_row_group(std::shared_ptr<arrow::RecordBatch> *batch) {
+    std::shared_ptr<arrow::Table> table;
+    ARROW_RETURN_NOT_OK(reader_->RowGroup(static_cast<int>(current_row_group_))
+                            ->ReadTable(col_indices_, &table));
+    std::vector<std::shared_ptr<arrow::Array>> chunks(col_indices_.size());
+    for (size_t i = 0; i < chunks.size(); ++i) {
+      ARROW_ASSIGN_OR_RAISE(chunks[i],
+                            arrow::Concatenate(table->column(i)->chunks(),
+                                               arrow::default_memory_pool()));
+    }
+    *batch = arrow::RecordBatch::Make(
+        projected_schema_, row_group_row_nums_[current_row_group_], chunks);
+    ++current_row_group_;
+    return arrow::Status::OK();
+  }
+
+  arrow::Status read_next_uncached(std::shared_ptr<arrow::RecordBatch> *batch) {
+    while (current_row_group_ < num_row_groups_) {
+      if (!row_group_reader_) {
+        const auto metadata = reader_->parquet_reader()->metadata();
+        const auto leaves = detail::ParquetLeafColumns(*metadata, col_indices_);
+        if (memory_pool_) {
+          reader_->set_batch_size(detail::ParquetDecodeBatchRows(
+              *metadata, static_cast<int>(current_row_group_), leaves));
+        }
+        ARROW_ASSIGN_OR_RAISE(
+            row_group_reader_,
+            reader_->GetRecordBatchReader(
+                {static_cast<int>(current_row_group_)}, leaves));
+      }
+      std::shared_ptr<arrow::RecordBatch> next;
+      ARROW_RETURN_NOT_OK(row_group_reader_->ReadNext(&next));
+      if (next) {
+        // Arrow deduplicates projected Parquet columns. Preserve the caller's
+        // order and duplicates, matching cached reads, without copying data.
+        std::vector<std::shared_ptr<arrow::Array>> columns;
+        columns.reserve(projected_schema_->num_fields());
+        for (const auto &field : projected_schema_->fields()) {
+          auto column = next->GetColumnByName(field->name());
+          if (!column) {
+            return arrow::Status::Invalid("Missing scanned column: ",
+                                          field->name());
+          }
+          columns.push_back(std::move(column));
+        }
+        *batch = arrow::RecordBatch::Make(projected_schema_, next->num_rows(),
+                                          std::move(columns));
+        return arrow::Status::OK();
+      }
+      row_group_reader_.reset();
+      ++current_row_group_;
+    }
+    return arrow::Status::OK();
+  }
+
+  // FileReader must outlive the batch reader (members are destroyed in reverse
+  // order). The reader and its file remain alive even if the store is closed.
+  std::shared_ptr<arrow::MemoryPool> memory_pool_;
   std::unique_ptr<parquet::arrow::FileReader> reader_;
+  std::unique_ptr<arrow::RecordBatchReader> row_group_reader_;
+  std::unique_ptr<arrow::TableBatchReader> cached_batches_;
   std::shared_ptr<arrow::Schema> schema_;
   std::shared_ptr<arrow::Schema> projected_schema_;
   std::vector<std::string> columns_;
   std::vector<int> col_indices_;
   std::string file_path_;
+  ParquetBufferID metadata_id_;
 
   int64_t current_row_group_ = 0;
   int64_t num_row_groups_ = 0;
@@ -180,6 +263,7 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   std::vector<int64_t> row_group_offsets_;
   std::vector<int64_t> row_group_row_nums_;
   bool with_cache_;
+  bool stream_uncached_;
 };
 
 

@@ -25,6 +25,8 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <algorithm>
+#include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/utility/string_helper.h>
@@ -143,6 +145,65 @@ TEST_F(WalFileTest, TestGeneral) {
   // remove
   ret = wal_file->remove();
   ASSERT_EQ(ret, 0);
+}
+
+TEST_F(WalFileTest, BorrowedBinaryAndLimitRejectBeforeWrite) {
+  const auto path = FileHelper::MakeFilePath("./", FileID::WAL_FILE, 0);
+  auto wal = WalFile::Create(path);
+  ASSERT_NE(nullptr, wal);
+  WalOptions options;
+  options.create_new = true;
+  ASSERT_EQ(0, wal->open(options));
+  std::vector<char> bytes{'a', '\0', 'b', '\0', 'c'};
+  ASSERT_EQ(0, wal->append(std::string_view(bytes.data(), bytes.size())));
+  std::fill(bytes.begin(), bytes.end(), 'x');
+  std::string large(4 * 1024 * 1024 + 1, 'q');
+  EXPECT_EQ(-1, wal->append(large));
+  EXPECT_EQ(-1, wal->append(std::string_view{}));
+  ASSERT_EQ(0, wal->append(std::string_view(large.data(), large.size() - 1)));
+  ASSERT_EQ(0, wal->append("tail"));
+  ASSERT_EQ(0, wal->close());
+  options.create_new = false;
+  ASSERT_EQ(0, wal->open(options));
+  ASSERT_EQ(0, wal->prepare_for_read());
+  EXPECT_EQ(std::string("a\0b\0c", 5), wal->next());
+  EXPECT_EQ(large.substr(1), wal->next());
+  EXPECT_EQ("tail", wal->next());
+  EXPECT_TRUE(wal->next().empty());
+  ASSERT_EQ(0, wal->close());
+  ASSERT_EQ(0, wal->remove());
+}
+
+TEST_F(WalFileTest, AdmitsActualRecordBytesBeforeReadAndReportsRejection) {
+  const auto path = FileHelper::MakeFilePath("./", FileID::WAL_FILE, 0);
+  auto wal = WalFile::Create(path);
+  ASSERT_NE(nullptr, wal);
+  ASSERT_EQ(0, wal->open(WalOptions{0, true}));
+  ASSERT_EQ(0, wal->append("small"));
+  ASSERT_EQ(0, wal->append(std::string(1024, 'x')));
+  ASSERT_EQ(0, wal->flush());
+  ASSERT_EQ(0, wal->prepare_for_read());
+  size_t requested = 0;
+  EXPECT_TRUE(wal->next([&](size_t bytes) {
+                   requested = bytes;
+                   throw std::bad_alloc();
+                 })
+                  .empty());
+  EXPECT_EQ(6u, requested);
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, wal->read_status().code());
+  // A denied read is not EOF, and rewind/retry still reads the original WAL.
+  ASSERT_EQ(0, wal->prepare_for_read());
+  std::vector<size_t> sizes;
+  const WalFile::ReadAdmission admit = [&](size_t bytes) {
+    sizes.push_back(bytes);
+  };
+  EXPECT_EQ("small", wal->next(admit));
+  EXPECT_EQ(std::string(1024, 'x'), wal->next(admit));
+  EXPECT_TRUE(wal->next(admit).empty());
+  EXPECT_TRUE(wal->read_status().ok());
+  EXPECT_EQ((std::vector<size_t>{6, 1025}), sizes);
+  ASSERT_EQ(0, wal->close());
+  ASSERT_EQ(0, wal->remove());
 }
 
 void do_append(WalFile *wal_file, size_t number) {
@@ -334,8 +395,8 @@ TEST_F(WalFileTest, TestBoundaryCondition) {
   ret = wal_file->open(wal_option);
   ASSERT_EQ(ret, 0);
   for (size_t i = 0; i < 99; i++) {
-    std::string record = "hello";
-    ret = wal_file->append(record + std::to_string(i));
+    std::string record_prefix = "hello";
+    ret = wal_file->append(record_prefix + std::to_string(i));
     ASSERT_EQ(ret, 0);
   }
   ret = wal_file->flush();
@@ -725,6 +786,7 @@ TEST_F(WalFileTest, TestCRCErrorCase) {
   }
   ASSERT_EQ(idx, 1);
   // close
+  EXPECT_FALSE(wal_file->read_status().ok());
   ret = wal_file->close();
   ASSERT_EQ(ret, 0);
   // remove

@@ -141,8 +141,8 @@ DistanceImpl Fp16Quantizer::distance(const void *query,
   }
 
   // The query is assumed to be already quantized — copy it directly.
-  std::string quantized_query(static_cast<const char *>(query),
-                              qmeta.element_size());
+  ailego::BudgetedString quantized_query(static_cast<const char *>(query),
+                                         qmeta.element_size());
   return DistanceImpl(dp_query_func_, dp_query_batch_func_,
                       std::move(quantized_query), original_dim_);
 }
@@ -164,7 +164,7 @@ void Fp16Quantizer::quantize_one(const void *input, void *output) const {
 
 float Fp16Quantizer::quantize_cosine(const float *input, size_t dim,
                                      uint16_t *output) const {
-  std::vector<float> normalized(dim);
+  ailego::BudgetedVector<float> normalized(dim);
   if (storage_data_type_ == IndexMeta::DT_FP16) {
     // Physical FP16 Flat storage casts first. Widen the rounded values before
     // normalization so CPUs with native FP16 arithmetic do not silently use
@@ -207,7 +207,7 @@ void Fp16Quantizer::calc_distance_dp_query_batch(const void *const *dp_list,
 
 float Fp16Quantizer::calc_distance_dp_query_unquantized(
     const void *dp, const void *query) const {
-  std::string buf(quantized_length(), '\0');
+  ailego::BudgetedString buf(quantized_length(), '\0');
   quantize_one(query, &buf[0]);
   return calc_distance_dp_query(dp, buf.data());
 }
@@ -215,7 +215,7 @@ float Fp16Quantizer::calc_distance_dp_query_unquantized(
 void Fp16Quantizer::calc_distance_dp_query_batch_unquantized(
     const void *const *dp_list, int dp_num, const void *query,
     float *dist_list) const {
-  std::string buf(quantized_length(), '\0');
+  ailego::BudgetedString buf(quantized_length(), '\0');
   quantize_one(query, &buf[0]);
   calc_distance_dp_query_batch(dp_list, dp_num, buf.data(), dist_list);
 }

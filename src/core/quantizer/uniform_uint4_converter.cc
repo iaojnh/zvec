@@ -22,6 +22,7 @@
 #include <vector>
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/interface/index_param.h>
 #include <zvec/turbo/turbo.h>
@@ -104,7 +105,7 @@ float SourceValue(const void *record, IndexMeta::DataType data_type,
 }
 
 void DecodeSource(const void *record, IndexMeta::DataType data_type,
-                  size_t dimension, std::vector<float> *output) {
+                  size_t dimension, ailego::BudgetedVector<float> *output) {
   output->resize(dimension);
   for (size_t i = 0; i < dimension; ++i) {
     (*output)[i] = SourceValue(record, data_type, i);
@@ -373,8 +374,8 @@ class UniformUint4Converter : public IndexConverter {
       }
 
       const UniformUint4Holder *owner_{nullptr};
-      std::vector<uint8_t> buffer_{};
-      std::vector<float> decoded_{};
+      ailego::BudgetedVector<uint8_t> buffer_{};
+      ailego::BudgetedVector<float> decoded_{};
       IndexHolder::Iterator::Pointer front_{};
       int status_{0};
     };

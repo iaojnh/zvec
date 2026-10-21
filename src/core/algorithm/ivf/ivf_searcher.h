@@ -122,9 +122,10 @@ class IVFSearcher : public IndexSearcher {
   }
 
  private:
-  int search_bf(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-                Context::Pointer &context,
-                const std::vector<std::vector<uint64_t>> *p_keys) const;
+  int search_batch(
+      const void *query, const IndexQueryMeta &qmeta, uint32_t count,
+      Context::Pointer &context, bool brute,
+      const std::vector<std::vector<uint64_t>> *p_keys = nullptr) const;
 
   //! Constants
   static constexpr uint32_t kDefaultBfThreshold = 1000u;

@@ -23,10 +23,11 @@ namespace zvec {
 namespace core {
 
 template <size_t BATCH_SIZE>
-IndexProvider::Pointer FlatSearcher<BATCH_SIZE>::create_provider() const {
+IndexProvider::Pointer FlatSearcher<BATCH_SIZE>::create_provider() const try {
   std::lock_guard<std::mutex> lock(mapping_mutex_);
 
-  if (mapping_.empty()) {
+  if (!container_) return nullptr;
+  if (!mapping_loaded_) {
     auto mapping_segment = container_->get(FLAT_SEGMENT_MAPPING_SEG_ID);
     if (!mapping_segment) {
       LOG_ERROR("Failed to fetch segment %s",
@@ -48,24 +49,28 @@ IndexProvider::Pointer FlatSearcher<BATCH_SIZE>::create_provider() const {
       return nullptr;
     }
 
-    mapping_.resize(mapping_count);
-    if (mapping_segment->fetch(0, mapping_.data(),
-                               mapping_segment->data_size()) !=
-        mapping_segment->data_size()) {
+    if (mapping_.load(container_, FLAT_SEGMENT_MAPPING_SEG_ID, 0,
+                      mapping_segment->data_size()) != 0) {
       LOG_ERROR("Failed to read data (%zu bytes) from mapping segment",
                 mapping_segment->data_size());
-      mapping_.clear();
       return nullptr;
     }
+    mapping_loaded_ = true;
   }
   return IndexProvider::Pointer(new (std::nothrow)
                                     FlatSearcherProvider<BATCH_SIZE>(this));
+} catch (const std::bad_alloc &) {
+  return nullptr;
 }
 
 template <size_t BATCH_SIZE>
 int FlatSearcher<BATCH_SIZE>::load(IndexStorage::Pointer cntr,
-                                   IndexMetric::Pointer measure) {
+                                   IndexMetric::Pointer measure) try {
   ailego::ElapsedTime stamp;
+  {
+    std::lock_guard<std::mutex> lock(vector_provider_mutex_);
+    vector_provider_.reset();
+  }
   if (!cntr) {
     return IndexError_InvalidArgument;
   }
@@ -185,17 +190,30 @@ int FlatSearcher<BATCH_SIZE>::load(IndexStorage::Pointer cntr,
     return IndexError_Mismatch;
   }
 
-  keys_block_.reset();
-  if (keys_segment->read(0, keys_block_, keys_segment->data_size()) !=
-      keys_segment->data_size()) {
+  if (keys_.load(cntr, FLAT_SEGMENT_KEYS_SEG_ID, 0,
+                 keys_segment->data_size()) != 0) {
     LOG_ERROR("Failed to read data (%zu bytes) from keys segment",
               keys_segment->data_size());
     return IndexError_ReadData;
   }
-  keys_ = static_cast<const uint64_t *>(keys_block_.data());
-
-  for (size_t i = 0; i < keys_count; i++) {
-    key_id_mapping_[keys_[i]] = i;
+  mapping_ = {};
+  mapping_loaded_ = false;
+  decltype(key_id_mapping_)().swap(key_id_mapping_);
+  paged_metadata_ =
+      cntr->memory_block_type() == IndexStorage::MemoryBlock::MBT_BUFFERPOOL;
+  if (paged_metadata_) {
+    const auto segment = cntr->get(FLAT_SEGMENT_MAPPING_SEG_ID);
+    if (!segment || segment->data_size() / sizeof(uint32_t) != keys_count ||
+        segment->data_size() % sizeof(uint32_t) != 0)
+      return IndexError_InvalidFormat;
+    const int ret = mapping_.load(cntr, FLAT_SEGMENT_MAPPING_SEG_ID, 0,
+                                  segment->data_size());
+    if (ret != 0) return ret;
+    mapping_loaded_ = true;
+  } else {
+    for (size_t i = 0; i < keys_count; i++) {
+      key_id_mapping_[key(i)] = i;
+    }
   }
 
   container_ = cntr;
@@ -203,6 +221,8 @@ int FlatSearcher<BATCH_SIZE>::load(IndexStorage::Pointer cntr,
   stats_.set_loaded_count(keys_count);
   stats_.set_loaded_costtime(stamp.milli_seconds());
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
@@ -239,7 +259,7 @@ int FlatSearcher<BATCH_SIZE>::check_query_meta(
 template <size_t BATCH_SIZE>
 int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
                                           const IndexQueryMeta &qmeta,
-                                          Context::Pointer &context) const {
+                                          Context::Pointer &context) const try {
   if (!container_) return IndexError_NoReady;
   ailego_assert(query && !!context);
   int error_code = this->check_query_meta(qmeta);
@@ -264,13 +284,18 @@ int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
     return (column_major_order_ ? bf_context->search_column(query, qmeta)
                                 : bf_context->search_row(query, qmeta));
   }
+} catch (const MetadataReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
 int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
                                           const IndexQueryMeta &qmeta,
                                           uint32_t count,
-                                          Context::Pointer &context) const {
+                                          Context::Pointer &context) const try {
   if (!container_) return IndexError_NoReady;
   ailego_assert(query && count && !!context);
   int error_code = this->check_query_meta(qmeta);
@@ -297,13 +322,18 @@ int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
     return (column_major_order_ ? bf_context->search_column(query, qmeta, count)
                                 : bf_context->search_row(query, qmeta, count));
   }
+} catch (const MetadataReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
 int FlatSearcher<BATCH_SIZE>::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
   if (!container_) return IndexError_NoReady;
   ailego_assert(query && count && !!context);
   int error_code = this->check_query_meta(qmeta);
@@ -330,6 +360,11 @@ int FlatSearcher<BATCH_SIZE>::search_bf_by_p_keys_impl(
   if (!bf_context->threshold_is_valid()) return IndexError_NoReady;
 
   return bf_context->search_bf_by_p_keys_impl(query, p_keys, qmeta, count);
+} catch (const MetadataReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>

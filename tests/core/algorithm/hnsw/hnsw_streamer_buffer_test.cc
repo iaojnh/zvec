@@ -2,6 +2,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
 #include <algorithm/hnsw/hnsw_algorithm.h>
@@ -12,7 +13,9 @@
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_streamer.h>
+#include "tests/core/algorithm/flat/flat_fault_storage.h"
 #include "tests/test_util.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -49,6 +52,149 @@ void HnswStreamerTest::SetUp() {
 
 void HnswStreamerTest::TearDown() {
   zvec::test_util::RemoveTestPath(dir_);
+}
+
+TEST_F(HnswStreamerTest, FailedVisitGrowthKeepsCapacityAndCanBeRetried) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(1UL << 20));
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
+  HnswContext context(dim, nullptr, entity);
+  context.set_filter_mode(VisitFilter::BitMap);
+  ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
+  auto &filter = context.visit_filter();
+  filter.set_visited(17);
+  ASSERT_GT(pool.available(), 4096u);
+  const size_t pressure = pool.available() - 4096;
+  ASSERT_TRUE(pool.try_charge_external(pressure));
+  {
+    auto release = ScopeGuard::Make([&] { pool.release_external(pressure); });
+    const size_t charged = pool.used();
+    // Both attempts must fail: a failed reset must not publish the new size.
+    EXPECT_FALSE(context.check_need_adjuct_ctx(1000000));
+    EXPECT_FALSE(context.check_need_adjuct_ctx(1000000));
+    EXPECT_EQ(charged, pool.used());
+    EXPECT_TRUE(filter.visited(17));
+  }
+  ASSERT_TRUE(context.check_need_adjuct_ctx(1000000));
+  filter.set_visited(999999);
+  EXPECT_TRUE(filter.visited(999999));
+}
+
+namespace {
+class ExposedBudgetedHnswEntity : public HnswStreamerEntity {
+ public:
+  using KeyMap = HashMap<uint64_t, node_id_t>;
+};
+}  // namespace
+
+TEST_F(HnswStreamerTest, KeyMapAndBatchResultsRejectGrowthAtBudget) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(2 * 1024 * 1024));
+  ExposedBudgetedHnswEntity::KeyMap map;
+  map.set_empty_key(kInvalidKey);
+  map[7] = 11;
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
+  HnswContext context(dim, nullptr, entity);
+  {
+    MemoryReservation pressure;
+    pressure.add(pool.available());
+    EXPECT_THROW(map.resize(100000), std::bad_alloc);
+    EXPECT_THROW(context.resize_results(100000), std::bad_alloc);
+    EXPECT_EQ(11u, map.find(7)->second);
+  }
+  map.resize(1000);
+  EXPECT_EQ(11u, map.find(7)->second);
+  EXPECT_NO_THROW(context.resize_results(100));
+}
+
+TEST_F(HnswStreamerTest, PartialWriteFailureBlocksUseAndReopen) {
+  for (bool fill_gap : {false, true}) {
+    SCOPED_TRACE(fill_gap);
+    const std::string path = "hnsw_partial_write_failure.index";
+    zvec::test_util::RemoveTestFiles(path);
+    auto remove =
+        ScopeGuard::Make([&] { zvec::test_util::RemoveTestFiles(path); });
+    auto storage = std::make_shared<zvec::core::test::FaultStorage>(
+        IndexFactory::CreateStorage("MMapFileStorage"));
+    ASSERT_EQ(0, storage->init({}));
+    ASSERT_EQ(0, storage->open(path, true));
+    auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
+    ASSERT_EQ(0, streamer->init(*index_meta_ptr_, {}));
+    ASSERT_EQ(0, streamer->open(storage));
+    auto context = streamer->create_context();
+    ASSERT_TRUE(context);
+    std::vector<float> row(dim, 1.0f);
+    IndexQueryMeta query(IndexMeta::DT_FP32, dim);
+    ASSERT_EQ(0, streamer->add_impl(1, row.data(), query, context));
+    storage->fault->segment = "HnswT3S0";
+    storage->fault->write = true;
+    EXPECT_EQ(int(IndexError_WriteData),
+              fill_gap
+                  ? streamer->add_with_id_impl(16, row.data(), query, context)
+                  : streamer->add_impl(2, row.data(), query, context));
+    EXPECT_EQ(int(IndexError_NoReady),
+              streamer->add_impl(3, row.data(), query, context));
+    EXPECT_EQ(int(IndexError_NoReady), streamer->flush(0));
+    EXPECT_EQ(int(IndexError_NoReady),
+              streamer->search_impl(row.data(), query, context));
+    EXPECT_EQ(int(IndexError_NoReady),
+              streamer->search_bf_impl(row.data(), query, context));
+    std::vector<std::vector<uint64_t>> keys{{1}};
+    EXPECT_EQ(int(IndexError_NoReady), streamer->search_bf_by_p_keys_impl(
+                                           row.data(), keys, query, context));
+    context.reset();
+    EXPECT_EQ(0, streamer->close());
+    EXPECT_EQ(0, streamer->cleanup());
+    ASSERT_EQ(0, storage->close());
+    ASSERT_EQ(0, storage->open(path, false));
+    ASSERT_EQ(0, streamer->init(*index_meta_ptr_, {}));
+    EXPECT_EQ(int(IndexError_InvalidFormat), streamer->open(storage));
+    EXPECT_EQ(0, streamer->cleanup());
+    EXPECT_EQ(0, storage->close());
+  }
+}
+
+TEST_F(HnswStreamerTest, InterruptedBuildReleasesEveryCandidateHeap) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(64 * 1024));
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
+  HnswContext context(dim, nullptr, entity);
+  for (uint32_t i = 0; i < 3; ++i) {
+    context.candidates().emplace(i, 1.0f);
+    context.update_heap().emplace(i, 1.0f);
+    context.level_topk(0).emplace(i, 1.0f);
+    context.level_topk(1).emplace(i, 1.0f);
+    context.prune_blocks().push_back(
+        IndexStorage::MemoryBlock::AllocateOwned(1024));
+    EXPECT_GT(pool.used(), 0u);
+    context.release_build_workspace();
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_TRUE(context.candidates().empty());
+    EXPECT_TRUE(context.update_heap().empty());
+    EXPECT_TRUE(context.level_topk(0).empty());
+    EXPECT_TRUE(context.level_topk(1).empty());
+  }
 }
 
 TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
@@ -138,7 +284,7 @@ TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {
     mutable std::vector<uint64_t> requested_keys;
   };
 
-  MemoryLimitPool::get_instance().init(64UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(64UL * 1024UL * 1024UL);
   auto storage = IndexFactory::CreateStorage("BufferStorage");
   ASSERT_NE(nullptr, storage);
   ASSERT_EQ(0, storage->init(Params()));
@@ -221,7 +367,7 @@ TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {
 }
 
 TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   constexpr uint32_t kDocCount = 128;
   const std::string path = dir_ + "SearchDispatch";
   Params params;
@@ -266,6 +412,7 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
   ASSERT_NE(nullptr, ctx);
   auto *hnsw_ctx = dynamic_cast<HnswContext *>(ctx.get());
   ASSERT_NE(nullptr, hnsw_ctx);
+  EXPECT_EQ(VisitFilter::EpochBitMap, hnsw_ctx->visit_filter().get_mode());
   ASSERT_NE(nullptr, dynamic_cast<const HnswBufferPoolStreamerEntity *>(
                          &hnsw_ctx->get_entity()));
   ctx->set_topk(3);
@@ -275,8 +422,8 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
 
   const bool expect_block =
       zvec::ailego::internal::CpuFeatures::static_flags_.AVX2;
-  for (const auto mode :
-       {VisitFilter::ByteMap, VisitFilter::BitMap, VisitFilter::BloomFilter}) {
+  for (const auto mode : {VisitFilter::ByteMap, VisitFilter::EpochBitMap,
+                          VisitFilter::BitMap, VisitFilter::BloomFilter}) {
     SCOPED_TRACE(static_cast<int>(mode));
     ASSERT_EQ(0,
               hnsw_ctx->visit_filter().init(mode, kDocCount, kDocCount, 1e-9f));
@@ -316,7 +463,7 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
 }
 
 TEST_F(HnswStreamerTest, TestHnswSearch) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_TRUE(write_streamer != nullptr);
@@ -515,7 +662,7 @@ TEST_F(HnswStreamerTest, TestHnswSearch) {
 }
 
 TEST_F(HnswStreamerTest, TestHnswSearchBuffer) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_TRUE(write_streamer != nullptr);
@@ -639,7 +786,7 @@ TEST_F(HnswStreamerTest, TestHnswSearchBuffer) {
 }
 
 TEST_F(HnswStreamerTest, TestWideMConcurrentBuildBuffer) {
-  MemoryLimitPool::get_instance().init(512UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(512UL * 1024UL * 1024UL);
   auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_NE(nullptr, streamer);
 
@@ -713,7 +860,7 @@ TEST_F(HnswStreamerTest, TestWideMConcurrentBuildBuffer) {
 }
 
 TEST_F(HnswStreamerTest, TestHnswSearchBufferMMap) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_TRUE(write_streamer != nullptr);

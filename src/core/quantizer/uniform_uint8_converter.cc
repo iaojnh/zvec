@@ -20,6 +20,7 @@
 #include <vector>
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/interface/index_param.h>
 #include "../metric/metric_params.h"
@@ -274,7 +275,7 @@ class UniformUint8Converter : public IndexConverter {
       }
 
       const UniformUint8Holder *owner_;
-      std::vector<int8_t> buffer_;
+      ailego::BudgetedVector<int8_t> buffer_;
       IndexHolder::Iterator::Pointer iterator_;
       int status_{0};
     };

@@ -17,6 +17,7 @@
 #include <cmath>
 #include <numeric>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_document.h>
 #include <zvec/core/framework/index_meta.h>
@@ -275,10 +276,11 @@ class SparseUtility {
     return true;
   }
 
+  template <typename Buffer>
   static void TransSparseFormat(uint32_t sparse_count,
                                 const uint32_t *sparse_index,
                                 const void *sparse_value, uint32_t unit_size,
-                                std::string &buffer) {
+                                Buffer &buffer) {
     uint32_t seg_count = 0;
     if (sparse_count == 0) {
       buffer.reserve(sizeof(uint32_t) + sizeof(uint32_t));
@@ -292,7 +294,7 @@ class SparseUtility {
       return;
     }
 
-    std::vector<SparseSegmentInfo> seg_infos;
+    ailego::BudgetedVector<SparseSegmentInfo> seg_infos;
 
     uint32_t cur_seg_id = -1U;
     uint32_t cur_vec_cnt = 0;
@@ -320,9 +322,9 @@ class SparseUtility {
       seg_infos.emplace_back(cur_seg_id, cur_vec_cnt);
     }
 
-    uint32_t buffer_len = 2 * sizeof(uint32_t) +
-                          seg_infos.size() * 2 * sizeof(uint32_t) +
-                          sparse_count * (sizeof(uint16_t) + sizeof(float));
+    size_t buffer_len =
+        2 * sizeof(uint32_t) + seg_infos.size() * 2 * sizeof(uint32_t) +
+        static_cast<size_t>(sparse_count) * (sizeof(uint16_t) + unit_size);
 
     buffer.reserve(buffer_len);
 
@@ -355,9 +357,29 @@ class SparseUtility {
     }
   }
 
+  // Legacy caller-owned strings cannot carry an engine reservation. With a
+  // pool enabled, fill supplied capacity only; use IndexSparseDocument for
+  // outputs that must grow. Check both buffers before changing either one.
+  static void ReverseSparseFormatToExternal(const void *buffer,
+                                            uint32_t *sparse_count,
+                                            std::string *indices,
+                                            std::string *values,
+                                            uint32_t unit_size) {
+    const size_t count = *static_cast<const uint32_t *>(buffer);
+    if (count > (SIZE_MAX - indices->size()) / sizeof(uint32_t) ||
+        (unit_size && count > (SIZE_MAX - values->size()) / unit_size))
+      throw std::bad_alloc();
+    if (ailego::MemoryLimitPool::get_instance().capacity() &&
+        (indices->size() + count * sizeof(uint32_t) > indices->capacity() ||
+         values->size() + count * unit_size > values->capacity()))
+      throw std::bad_alloc();
+    ReverseSparseFormat(buffer, sparse_count, indices, values, unit_size);
+  }
+
+  template <typename Buffer>
   static void ReverseSparseFormat(const void *buffer, uint32_t *sparse_count,
-                                  std::string *sparse_indices_buffer,
-                                  std::string *sparse_values_buffer,
+                                  Buffer *sparse_indices_buffer,
+                                  Buffer *sparse_values_buffer,
                                   uint32_t unit_size) {
     const uint8_t *buffer_data = reinterpret_cast<const uint8_t *>(buffer);
 
@@ -415,6 +437,12 @@ class SparseUtility {
   static void ReverseSparseFormat(const void *buffer,
                                   IndexSparseDocument &sparse_doc,
                                   uint32_t unit_size) {
+    const size_t count = *static_cast<const uint32_t *>(buffer);
+    if (unit_size && count > SIZE_MAX / unit_size) throw std::bad_alloc();
+    sparse_doc.reserve_sparse_buffers(count * sizeof(uint32_t),
+                                      count * unit_size);
+    sparse_doc.mutable_sparse_indices()->clear();
+    sparse_doc.mutable_sparse_values()->clear();
     return ReverseSparseFormat(buffer, sparse_doc.mutable_sparse_count(),
                                sparse_doc.mutable_sparse_indices(),
                                sparse_doc.mutable_sparse_values(), unit_size);

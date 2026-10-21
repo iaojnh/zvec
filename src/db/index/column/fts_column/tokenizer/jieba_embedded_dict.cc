@@ -58,6 +58,14 @@ Result<std::string> decompress(const unsigned char (&data)[N],
 
 }  // namespace
 
+size_t embedded_jieba_dict_bytes() {
+  return kJiebaDictLz4OriginalSize;
+}
+
+size_t embedded_jieba_hmm_model_bytes() {
+  return kJiebaHmmModelLz4OriginalSize;
+}
+
 Result<EmbeddedJiebaDict> get_embedded_jieba_dict() {
   static const Result<EmbeddedJiebaDict> dict =
       []() -> Result<EmbeddedJiebaDict> {

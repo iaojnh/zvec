@@ -457,12 +457,12 @@ class Collection:
             dict[str, Doc]: Mapping from ID to document. Missing IDs are omitted.
         """
         ids = [ids] if isinstance(ids, str) else ids
-        docs = self._obj.Fetch(ids, output_fields, include_vector)
-        return {
-            doc_id: py_doc
-            for doc_id, core_doc in docs.items()
-            if (py_doc := convert_to_py_doc(core_doc, self.schema)) is not None
-        }
+        docs = self._obj.FetchTuples(ids, output_fields, include_vector)
+        # The binding already captured the schema with each native batch and
+        # released its C++ documents. Reuse the Python payloads without copying.
+        for doc_id, value in docs.items():
+            docs[doc_id] = Doc._from_tuple(value)
+        return docs
 
     # ========== Collection DQL-Iterator Methods ==========
     def iter_docs(

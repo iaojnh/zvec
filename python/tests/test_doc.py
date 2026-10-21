@@ -97,6 +97,33 @@ class TestPyDoc:
 # CppDoc Test Case
 # ----------------------------
 class TestCppDoc:
+    @pytest.mark.parametrize(
+        "dtype,value",
+        [
+            (DataType.STRING, "text"),
+            (DataType.ARRAY_STRING, ["a", "b"]),
+            (DataType.ARRAY_INT32, [1, 2]),
+            (DataType.ARRAY_BOOL, [True, False]),
+        ],
+    )
+    def test_pickle_rejects_truncated_and_forged_lengths(self, dtype, value):
+        doc = _Doc()
+        schema = FieldSchema("v", dtype)
+        doc.set_any("v", schema._get_object(), value)
+        state = doc.__getstate__()
+        for length in range(len(state)):
+            restored = _Doc.__new__(_Doc)
+            with pytest.raises(RuntimeError, match="unpickle"):
+                restored.__setstate__(state[:length])
+        forged = bytearray(state)
+        # The last bytes contain the value. An invalid primary-key length
+        # must fail before trying to allocate/copy the requested payload.
+        forged[:4] = b"\xff" * 4
+        with pytest.raises(RuntimeError, match="unpickle"):
+            _Doc.__new__(_Doc).__setstate__(bytes(forged))
+        with pytest.raises(RuntimeError, match="unpickle"):
+            _Doc.__new__(_Doc).__setstate__(state + b"\0")
+
     def test_default(self):
         doc = _Doc()
         assert doc is not None
@@ -117,6 +144,34 @@ class TestCppDoc:
         doc.set_any("author", schema._get_object(), None)
         assert doc.has_field("author")
         assert doc.get_any("author", schema.data_type) is None
+
+    @pytest.mark.parametrize(
+        "dtype,value",
+        [
+            (DataType.STRING, "a\x00b" * 4096),
+            (DataType.ARRAY_STRING, ["first", "a\x00b"]),
+            (DataType.ARRAY_INT32, [1, -2, 3]),
+            (DataType.ARRAY_BOOL, [True, False]),
+            (DataType.VECTOR_FP16, [1.0, -2.0]),
+            (DataType.VECTOR_FP32, [1.0, -2.0]),
+            (DataType.SPARSE_VECTOR_FP16, {1: 1.0, 3: -2.0}),
+            (DataType.SPARSE_VECTOR_FP32, {1: 1.0, 3: -2.0}),
+        ],
+    )
+    def test_converted_value_owns_data_and_preserves_missing_semantics(
+        self, dtype, value
+    ):
+        doc = _Doc()
+        assert doc.get_any("field", dtype) is None
+        wrong_schema = FieldSchema("field", DataType.BOOL)
+        doc.set_any("field", wrong_schema._get_object(), True)
+        assert doc.get_any("field", dtype) is None
+        schema_type = VectorSchema if "VECTOR" in dtype.name else FieldSchema
+        schema = schema_type("field", dtype)
+        doc.set_any("field", schema._get_object(), value)
+        converted = doc.get_any("field", dtype)
+        del doc
+        assert converted == value
 
     def test_doc_get_set_has_null_field(self):
         doc = _Doc()

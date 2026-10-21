@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include "fts_doc_iterator.h"
 
 namespace zvec::fts {
@@ -48,8 +49,8 @@ class CandidateDocIterator : public DocIterator {
   }
 
  private:
-  std::vector<uint32_t> ids_;  // ascending segment-local doc_ids
-  size_t pos_{0};              // index of next element to return
+  std::vector<uint32_t, ailego::BudgetedAllocator<uint32_t>> ids_;
+  size_t pos_{0};  // index of next element to return
 };
 
 }  // namespace zvec::fts

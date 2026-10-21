@@ -13,6 +13,7 @@
 // limitations under the License.
 #include <cstdint>
 #include <cstring>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/turbo/turbo.h>
@@ -48,7 +49,7 @@ class HalfFloatHolder : public IndexHolder, public OrdinalAccessHolder {
           reader_(std::move(reader)),
           convert_func_(convert_func) {}
 
-    int read(size_t ordinal, uint64_t *key, const void **data) override {
+    int read(size_t ordinal, uint64_t *key, const void **data) override try {
       if (!key || !data) {
         return IndexError_InvalidArgument;
       }
@@ -80,12 +81,16 @@ class HalfFloatHolder : public IndexHolder, public OrdinalAccessHolder {
       *key = source_key;
       *data = output_.data();
       return 0;
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    } catch (const std::runtime_error &) {
+      return IndexError_ReadData;
     }
 
     void reset() override {
       reader_->reset();
-      std::vector<float>().swap(input_);
-      std::vector<uint16_t>().swap(output_);
+      ailego::BudgetedVector<float>().swap(input_);
+      ailego::BudgetedVector<uint16_t>().swap(output_);
     }
 
    private:
@@ -93,8 +98,8 @@ class HalfFloatHolder : public IndexHolder, public OrdinalAccessHolder {
     IndexHolder::Pointer front_;
     OrdinalAccessHolder::Reader::Pointer reader_;
     turbo::ConvertFunc convert_func_;
-    std::vector<float> input_{};
-    std::vector<uint16_t> output_{};
+    ailego::BudgetedVector<float> input_{};
+    ailego::BudgetedVector<uint16_t> output_{};
   };
 
   /*! Half Float Holder Iterator
@@ -155,7 +160,7 @@ class HalfFloatHolder : public IndexHolder, public OrdinalAccessHolder {
     }
 
     const HalfFloatHolder *owner_{nullptr};
-    std::vector<uint16_t> buffer_{};
+    ailego::BudgetedVector<uint16_t> buffer_{};
     IndexHolder::Iterator::Pointer front_iter_{};
     int status_{0};
   };
@@ -317,8 +322,7 @@ class HalfFloatSparseHolder : public IndexSparseHolder {
     //! Constructor
     Iterator(const HalfFloatSparseHolder * /*owner*/,
              IndexSparseHolder::Iterator::Pointer &&iter)
-        : sparse_buffer_(MAX_DIM_COUNT * sizeof(uint16_t), 0),
-          front_iter_(std::move(iter)) {
+        : front_iter_(std::move(iter)) {
       this->transform_record();
     }
 
@@ -328,6 +332,10 @@ class HalfFloatSparseHolder : public IndexSparseHolder {
     //! Test if the iterator is valid
     bool is_valid() const override {
       return front_iter_->is_valid();
+    }
+
+    int status() const override {
+      return front_iter_->status();
     }
 
     //! Retrieve primary key
@@ -359,14 +367,14 @@ class HalfFloatSparseHolder : public IndexSparseHolder {
    private:
     inline void transform_record() {
       if (front_iter_->is_valid()) {
+        sparse_buffer_.resize(front_iter_->sparse_count());
         ailego::FloatHelper::ToFP16(
             reinterpret_cast<const float *>(front_iter_->sparse_data()),
             front_iter_->sparse_count(), sparse_buffer_.data());
       }
     }
 
-    constexpr static uint32_t MAX_DIM_COUNT = 4096;
-    std::vector<uint16_t> sparse_buffer_{};
+    ailego::BudgetedVector<uint16_t> sparse_buffer_{};
 
     IndexSparseHolder::Iterator::Pointer front_iter_{};
   };

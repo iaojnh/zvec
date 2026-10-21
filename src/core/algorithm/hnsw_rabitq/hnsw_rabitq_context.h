@@ -13,7 +13,9 @@
 // limitations under the License.
 #pragma once
 
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
+#include "utility/group_topk_heap.h"
 #include "utility/visit_filter.h"
 #include "zvec/core/framework/index_context.h"
 #include "zvec/core/framework/index_provider.h"
@@ -173,7 +175,7 @@ class HnswRabitqContext : public IndexContext {
       node_id_t id = topk_heap_[i].first;
       if (fetch_vector_) {
         IndexStorage::MemoryBlock block;
-        entity_->get_vector(id, block);
+        CheckGraphStorage(entity_->get_vector(id, block));
         results_[idx].emplace_back(entity_->get_key(id), score.est_dist, id,
                                    std::move(block));
       } else {
@@ -190,56 +192,30 @@ class HnswRabitqContext : public IndexContext {
 
     group_results_[idx].clear();
 
-    std::vector<std::pair<std::string, TopkHeap>> group_topk_list;
-    std::vector<std::pair<std::string, ResultRecord>> best_score_in_groups;
-    for (auto itr = group_topk_heaps_.begin(); itr != group_topk_heaps_.end();
-         itr++) {
-      const std::string &group_id = (*itr).first;
-      auto &heap = (*itr).second;
-      heap.sort();
-
-      if (heap.size() > 0) {
-        ResultRecord best_score = heap[0].second;
-        best_score_in_groups.push_back(std::make_pair(group_id, best_score));
-      }
-    }
-
-    std::sort(best_score_in_groups.begin(), best_score_in_groups.end(),
-              [](const std::pair<std::string, ResultRecord> &a,
-                 const std::pair<std::string, ResultRecord> &b) -> int {
-                return a.second < b.second;
-              });
-
-    // truncate to group num
-    for (uint32_t i = 0; i < group_num() && i < best_score_in_groups.size();
-         ++i) {
-      const std::string &group_id = best_score_in_groups[i].first;
-
-      group_topk_list.emplace_back(
-          std::make_pair(group_id, group_topk_heaps_[group_id]));
-    }
+    auto group_topk_list = SelectGroupHeaps(group_topk_heaps_, group_num());
 
     group_results_[idx].resize(group_topk_list.size());
 
     for (uint32_t i = 0; i < group_topk_list.size(); ++i) {
-      const std::string &group_id = group_topk_list[i].first;
+      const std::string &group_id = group_topk_list[i]->first;
       group_results_[idx][i].set_group_id(group_id);
 
-      uint32_t size = std::min(
-          group_topk_, static_cast<uint32_t>(group_topk_list[i].second.size()));
+      uint32_t size =
+          std::min(group_topk_,
+                   static_cast<uint32_t>(group_topk_list[i]->second.size()));
 
       for (uint32_t j = 0; j < size; ++j) {
-        auto score = group_topk_list[i].second[j].second;
+        auto score = group_topk_list[i]->second[j].second;
         if (score > this->threshold()) {
           break;
         }
 
-        node_id_t id = group_topk_list[i].second[j].first;
+        node_id_t id = group_topk_list[i]->second[j].first;
 
         if (fetch_vector_) {
           IndexStorage::MemoryBlock block;
 
-          entity_->get_vector(id, block);
+          CheckGraphStorage(entity_->get_vector(id, block));
           group_results_[idx][i].mutable_docs()->emplace_back(
               entity_->get_key(id), score.est_dist, id, std::move(block));
         } else {
@@ -346,8 +322,16 @@ class HnswRabitqContext : public IndexContext {
     reset_group_by();
   }
 
-  inline std::map<std::string, TopkHeap> &group_topk_heaps() {
+  inline GroupTopkMap<node_id_t, ResultRecord> &group_topk_heaps() {
     return group_topk_heaps_;
+  }
+
+  // Allocation failure may interrupt neighbor selection before its usual
+  // per-level clear. Never carry those candidates into the next insertion.
+  void release_build_workspace() {
+    candidates_.release();
+    update_heap_.release();
+    decltype(level_topks_)().swap(level_topks_);
   }
 
   inline TopkHeap &level_topk(int level) {
@@ -365,8 +349,8 @@ class HnswRabitqContext : public IndexContext {
     return level_topks_[level];
   }
 
-  inline void check_need_adjuct_ctx() {
-    check_need_adjuct_ctx(entity_->doc_cnt());
+  inline bool check_need_adjuct_ctx() {
+    return check_need_adjuct_ctx(entity_->doc_cnt());
   }
 
   inline size_t compute_reserve_cnt(uint32_t cur_doc) const {
@@ -379,18 +363,25 @@ class HnswRabitqContext : public IndexContext {
   }
 
   //! candidates heap and visitfilter need to resize as doc cnt growing up
-  inline void check_need_adjuct_ctx(uint32_t doc_cnt) {
-    if (ailego_unlikely(doc_cnt + kTriggerReserveCnt > reserve_max_doc_cnt_)) {
-      while (doc_cnt + kTriggerReserveCnt > reserve_max_doc_cnt_) {
-        reserve_max_doc_cnt_ =
-            reserve_max_doc_cnt_ + compute_reserve_cnt(reserve_max_doc_cnt_);
+  inline bool check_need_adjuct_ctx(uint32_t doc_cnt) {
+    const uint32_t target = static_cast<uint32_t>(
+        std::min<uint64_t>(uint64_t{doc_cnt} + kTriggerReserveCnt, UINT32_MAX));
+    if (ailego_unlikely(target > reserve_max_doc_cnt_)) {
+      uint32_t next = reserve_max_doc_cnt_;
+      while (target > next) {
+        next += static_cast<uint32_t>(
+            std::min<size_t>(compute_reserve_cnt(next), UINT32_MAX - next));
       }
-      uint32_t max_scan_cnt = compute_max_scan_num(reserve_max_doc_cnt_);
-      max_scan_num_ = max_scan_cnt;
-      visit_filter_.reset(reserve_max_doc_cnt_, max_scan_cnt);
+      const uint32_t scans = compute_max_scan_num(next);
+      if (!visit_filter_.reset(next, scans)) return false;
+      // Failed reservation must not publish a larger capacity or let a
+      // subsequent query index the previous, smaller bitmap.
+      reserve_max_doc_cnt_ = next;
+      max_scan_num_ = scans;
       candidates_.clear();
       candidates_.limit(max_scan_num_);
     }
+    return true;
   }
 
   inline uint32_t compute_max_scan_num(uint32_t max_doc_cnt) const {
@@ -518,23 +509,23 @@ class HnswRabitqContext : public IndexContext {
   uint32_t reserve_max_doc_cnt_{kMinReserveDocCnt};
   uint32_t topk_{0};
   uint32_t group_topk_{0};
-  uint32_t filter_mode_{VisitFilter::ByteMap};
+  uint32_t filter_mode_{VisitFilter::EpochBitMap};
   float negative_probability_{HnswRabitqEntity::kDefaultBFNegativeProbability};
   uint32_t ef_{HnswRabitqEntity::kDefaultEf};
   float max_scan_ratio_{HnswRabitqEntity::kDefaultScanRatio};
   uint32_t magic_{0U};
-  std::vector<IndexDocumentList> results_{};
-  std::vector<IndexGroupDocumentList> group_results_{};
+  ailego::BudgetedVector<IndexDocumentList> results_{};
+  ailego::BudgetedVector<IndexGroupDocumentList> group_results_{};
   TopkHeap topk_heap_{};
   TopkHeap update_heap_{};
-  std::vector<TopkHeap> level_topks_{};
+  ailego::BudgetedVector<TopkHeap> level_topks_{};
   CandidateHeap candidates_{};
   VisitFilter visit_filter_{};
   uint32_t bruteforce_threshold_{};
   bool fetch_vector_{false};
 
   uint32_t group_num_{0};
-  std::map<std::string, TopkHeap> group_topk_heaps_{};
+  GroupTopkMap<node_id_t, ResultRecord> group_topk_heaps_{};
 
   uint32_t type_{kUnknownContext};
   //! debug stats info

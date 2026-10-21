@@ -19,11 +19,13 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <rocksdb/db.h>
 #include <rocksdb/write_batch.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/db/status.h>
+#include "metadata_memory.h"
 
 
 namespace zvec {
@@ -31,6 +33,11 @@ namespace zvec {
 
 // A very thin wrapper around RocksDB
 struct RocksdbContext {
+ private:
+  // Declare first: DB handles and options must die before releasing active
+  // ownership. The process-wide backing high water is retained for reuse.
+  std::unique_ptr<detail::RetainedMetadataBudget::Lease> metadata_memory_;
+
  public:
   struct Args {
     std::string db_path;
@@ -38,12 +45,12 @@ struct RocksdbContext {
     std::shared_ptr<rocksdb::MergeOperator> merge_op;
     std::unordered_map<std::string, std::shared_ptr<rocksdb::MergeOperator>>
         per_cf_merge_ops;
-    bool enable_hash_skiplist = false;
+    bool enable_prefix_extractor = false;
   };
   std::unique_ptr<rocksdb::DB> db_{nullptr};
   std::string db_path_;
   bool read_only_;
-  bool enable_hash_skiplist_{false};
+  bool enable_prefix_extractor_{false};
   std::vector<rocksdb::ColumnFamilyHandle *> cf_handles_;
   rocksdb::Options create_opts_;
   rocksdb::WriteOptions write_opts_;
@@ -57,6 +64,24 @@ struct RocksdbContext {
 
 
  public:
+  // Drain the writer's own memtables after crossing the shared WBM threshold.
+  // Another DB must not be the next writer left waiting for this DB to flush.
+  template <typename... Args>
+  rocksdb::Status put(Args &&...args) {
+    return finish_write(db_->Put(write_opts_, std::forward<Args>(args)...));
+  }
+  template <typename... Args>
+  rocksdb::Status merge(Args &&...args) {
+    return finish_write(db_->Merge(write_opts_, std::forward<Args>(args)...));
+  }
+  template <typename... Args>
+  rocksdb::Status remove(Args &&...args) {
+    return finish_write(db_->Delete(write_opts_, std::forward<Args>(args)...));
+  }
+  rocksdb::Status write(rocksdb::WriteBatch *batch) {
+    return finish_write(db_->Write(write_opts_, batch));
+  }
+
   // Create a Rocksdb instance
   Status create(const std::string &db_path,
                 std::shared_ptr<rocksdb::MergeOperator> merge_op = nullptr);
@@ -142,6 +167,7 @@ struct RocksdbContext {
   void prepare_options(std::shared_ptr<rocksdb::MergeOperator> merge_op);
 
   Status flush_unlocked();
+  rocksdb::Status finish_write(rocksdb::Status status);
 
   void delete_cf_handles();
 };

@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
 #include <cstring>
 #include <ailego/utility/memory_helper.h>
-#include <zvec/ailego/container/heap.h>
+#include <zvec/ailego/buffer/budgeted_heap.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_dumper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/vector_source.h>
+#include "utility/graph_storage_error.h"
 
 namespace zvec {
 namespace core {
@@ -29,9 +29,9 @@ using node_id_t = uint32_t;
 using key_t = uint64_t;
 using level_t = int32_t;
 using dist_t = float;
-using TopkHeap = ailego::KeyValueHeap<node_id_t, dist_t>;
+using TopkHeap = ailego::BudgetedKeyValueHeap<node_id_t, dist_t>;
 using CandidateHeap =
-    ailego::KeyValueHeap<node_id_t, dist_t, std::greater<dist_t>>;
+    ailego::BudgetedKeyValueHeap<node_id_t, dist_t, std::greater<dist_t>>;
 constexpr node_id_t kInvalidNodeId = static_cast<node_id_t>(-1);
 constexpr key_t kInvalidKey = static_cast<key_t>(-1);
 class DistCalculator;
@@ -233,7 +233,8 @@ struct NeighborsT {
 
 //! level 0 neighbors offset
 struct GraphNeighborMeta {
-  GraphNeighborMeta(size_t o, size_t cnt) : offset(o), neighbor_cnt(cnt) {}
+  GraphNeighborMeta(size_t o = 0, size_t cnt = 0)
+      : offset(o), neighbor_cnt(cnt) {}
 
   uint64_t offset : 48;
   uint64_t neighbor_cnt : 16;
@@ -241,7 +242,7 @@ struct GraphNeighborMeta {
 
 //! hnsw upper neighbors meta
 struct HnswNeighborMeta {
-  HnswNeighborMeta(size_t o, size_t l) : offset(o), level(l) {}
+  HnswNeighborMeta(size_t o = 0, size_t l = 0) : offset(o), level(l) {}
 
   uint64_t offset : 48;  // offset = idx * upper neighors size
   uint64_t level : 16;
@@ -376,14 +377,10 @@ class HnswEntity {
   //! Dump all segment by dumper
   //! Return dump size if success, errno(<0) in failure
   int64_t dump_segments(
-      const IndexDumper::Pointer &dumper, key_t *keys,
+      const IndexDumper::Pointer &dumper,
       const std::function<level_t(node_id_t)> &get_level) const;
 
  private:
-  //! dump mapping segment, for get_vector_by_key in provider
-  int64_t dump_mapping_segment(const IndexDumper::Pointer &dumper,
-                               const key_t *keys) const;
-
   //! dump hnsw head by dumper
   //! Return dump size if success, errno(<0) in failure
   int64_t dump_header(const IndexDumper::Pointer &dumper,
@@ -492,9 +489,8 @@ class HnswEntity {
     return IndexError_NotImplemented;
   }
 
-  virtual int update_neighbors(
-      level_t /*level*/, node_id_t /*id*/,
-      const std::vector<std::pair<node_id_t, dist_t>> & /*neighbors*/) {
+  virtual int update_neighbors(level_t /*level*/, node_id_t /*id*/,
+                               const TopkHeap::Container & /*neighbors*/) {
     LOG_ERROR("Update neighbors dense not implemented");
 
     return 0;
@@ -557,12 +553,6 @@ class HnswEntity {
     size_t page_mask = ailego::MemoryHelper::HugePageSize() - 1;
     return (size + page_mask) & (~page_mask);
   }
-
-  //! rearrange vectors to improve cache locality
-  void reshuffle_vectors(const std::function<level_t(node_id_t)> &get_level,
-                         std::vector<node_id_t> *n2o_mapping,
-                         std::vector<node_id_t> *o2n_mapping,
-                         key_t *keys) const;
 
  public:
   const static std::string kGraphHeaderSegmentId;

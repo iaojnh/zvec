@@ -166,7 +166,7 @@ Status InvertedColumnIndexer::drop_storage() {
     if (s = ctx_.drop_cf(cf_name_ranges()); !s.ok()) {
       return s;
     }
-    rs = ctx_.db_->Delete(ctx_.write_opts_, cf_cdf_, field_.name());
+    rs = ctx_.remove(cf_cdf_, field_.name());
     if (!rs.ok()) {
       LOG_ERROR("Failed to delete cdf of %s", id().c_str());
       s = Status::InternalError();
@@ -179,21 +179,21 @@ Status InvertedColumnIndexer::drop_storage() {
     }
   }
 
-  rs = ctx_.db_->Delete(ctx_.write_opts_, key_max_id());
+  rs = ctx_.remove(key_max_id());
   if (!rs.ok()) {
     LOG_ERROR("Failed to delete max_id of %s", id().c_str());
     s = Status::InternalError();
     return s;
   }
 
-  rs = ctx_.db_->Delete(ctx_.write_opts_, key_null());
+  rs = ctx_.remove(key_null());
   if (!rs.ok()) {
     LOG_ERROR("Failed to delete null bitmap of %s", id().c_str());
     s = Status::InternalError();
     return s;
   }
 
-  rs = ctx_.db_->Delete(ctx_.write_opts_, key_sealed());
+  rs = ctx_.remove(key_sealed());
   if (!rs.ok()) {
     LOG_ERROR("Failed to delete indexer state of %s", id().c_str());
     s = Status::InternalError();

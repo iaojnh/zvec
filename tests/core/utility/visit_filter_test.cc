@@ -16,6 +16,7 @@
 #include <memory>
 #include <type_traits>
 #include <gtest/gtest.h>
+#include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
 namespace {
@@ -48,6 +49,8 @@ TEST_P(VisitFilterDispatchTest, ConcreteViewSharesStateWithLegacyAccessors) {
               (std::is_same_v<View, VisitFilterView<VisitBitMap>>));
     EXPECT_EQ(GetParam() == VisitFilter::ByteMap,
               (std::is_same_v<View, VisitFilterView<VisitByteMap>>));
+    EXPECT_EQ(GetParam() == VisitFilter::EpochBitMap,
+              (std::is_same_v<View, VisitFilterView<VisitEpochBitMap>>));
     ++calls;
 
     EXPECT_TRUE(visit.visited(3));
@@ -94,7 +97,75 @@ TEST_P(VisitFilterDispatchTest, AcceptsMoveOnlyGenericCallback) {
 INSTANTIATE_TEST_SUITE_P(Modes, VisitFilterDispatchTest,
                          testing::Values(VisitFilter::BloomFilter,
                                          VisitFilter::BitMap,
-                                         VisitFilter::ByteMap));
+                                         VisitFilter::ByteMap,
+                                         VisitFilter::EpochBitMap));
+
+TEST(VisitEpochBitMapTest, CompactExactStateSurvivesWordBoundariesAndGrowth) {
+  VisitEpochBitMap::Context state;
+  ASSERT_TRUE(VisitEpochBitMap::reset(&state, 1000000, 1000000));
+  EXPECT_EQ(state.bits.size() * sizeof(uint64_t) + state.generations.size(),
+            140625u);
+  VisitFilter reference;
+  ASSERT_EQ(reference.init(VisitFilter::ByteMap, 1000000, 1000000, 0), 0);
+  for (size_t generation = 0; generation < 520; ++generation) {
+    VisitEpochBitMap::clear(&state);
+    reference.clear();
+    for (uint32_t i = 0; i < 1000; ++i) {
+      uint32_t id = (i * 7919 + generation * 61) % 1000000;
+      EXPECT_EQ(VisitEpochBitMap::visited(&state, id), reference.visited(id));
+      VisitEpochBitMap::set_visited(&state, id);
+      reference.set_visited(id);
+      EXPECT_TRUE(VisitEpochBitMap::visited(&state, id));
+      EXPECT_EQ(VisitEpochBitMap::visited(&state, id ^ 1),
+                reference.visited(id ^ 1));
+    }
+  }
+  VisitEpochBitMap::clear(&state);
+  for (uint32_t id : {0u, 63u, 64u, 999999u})
+    VisitEpochBitMap::set_visited(&state, id);
+  ASSERT_TRUE(VisitEpochBitMap::reset(&state, 1000100, 1000100));
+  for (uint32_t id : {0u, 63u, 64u, 999999u})
+    EXPECT_TRUE(VisitEpochBitMap::visited(&state, id));
+  EXPECT_FALSE(VisitEpochBitMap::visited(&state, 1000099));
+  VisitEpochBitMap::set_visited(&state, 1000099);
+  EXPECT_TRUE(VisitEpochBitMap::visited(&state, 1000099));
+}
+
+TEST(VisitFilterBudgetTest,
+     EveryModeChargesAndRejectsGrowthWithoutLosingState) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  for (auto mode : {VisitFilter::BitMap, VisitFilter::ByteMap,
+                    VisitFilter::EpochBitMap, VisitFilter::BloomFilter}) {
+    SCOPED_TRACE(mode);
+    ASSERT_EQ(0, pool.init(4096));
+    {
+      VisitFilter filter;
+      ASSERT_EQ(0, filter.init(mode, 1024, 256, 0.001f));
+      filter.set_visited(17);
+      const size_t charged = pool.used();
+      EXPECT_GT(charged, 0u);
+      EXPECT_FALSE(filter.reset(1000000, 1000000));
+      EXPECT_EQ(charged, pool.used());
+      EXPECT_TRUE(filter.visited(17));
+      EXPECT_EQ(IndexError_NoMemory,
+                filter.init(VisitFilter::ByteMap, 1000000, 1000000, 0.001f));
+      EXPECT_EQ(mode, filter.get_mode());
+      EXPECT_EQ(charged, pool.used());
+      EXPECT_TRUE(filter.visited(17));
+      filter.clear();
+      EXPECT_FALSE(filter.visited(17));
+    }
+    EXPECT_EQ(0u, pool.used());
+    ASSERT_EQ(0, pool.init(1));
+    VisitFilter failed;
+    EXPECT_EQ(IndexError_NoMemory, failed.init(mode, 1024, 256, 0.001f));
+    EXPECT_EQ(VisitFilter::Default, failed.get_mode());
+    EXPECT_EQ(0u, pool.used());
+  }
+  EXPECT_EQ(0, pool.init(previous));
+}
 
 TEST(VisitFilterDispatch, RejectsUninitializedFilterWithoutInvokingCallback) {
   VisitFilter filter;

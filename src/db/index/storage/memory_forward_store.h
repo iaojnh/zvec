@@ -24,6 +24,7 @@
 #include <arrow/util/async_generator.h>
 #include <zvec/db/doc.h>
 #include <zvec/db/status.h>
+#include "db/common/result_memory_allowance.h"
 #include "base_forward_store.h"
 #include "chunked_file_writer.h"
 #include "store_helper.h"
@@ -36,6 +37,16 @@ class MemForwardStore : public BaseForwardStore {
  public:
   /// Pointer type for MemForwardStore instances
   using Ptr = std::shared_ptr<MemForwardStore>;
+
+  struct PreparedInsert {
+    explicit PreparedInsert(std::shared_mutex &mutex) : lock(mutex) {}
+    // Hold the store lock through publication. Destroy buffers before unlock.
+    std::unique_lock<std::shared_mutex> lock;
+    Doc doc;
+    RecordBatchPtr batch;
+    size_t cache_bytes{0};
+    size_t batch_bytes{0};
+  };
 
   /// Constructor that initializes the store with collection schema and settings
   /// \param collection_schema The schema for the collection
@@ -82,7 +93,7 @@ class MemForwardStore : public BaseForwardStore {
   }
 
   /// Get the total bytes of the store
-  uint32_t total_bytes() const {
+  size_t total_bytes() const {
     return total_cache_bytes_ + total_rb_bytes_;
   }
 
@@ -121,13 +132,22 @@ class MemForwardStore : public BaseForwardStore {
   TablePtr get_table() override;
 
  private:
+  friend class SegmentImpl;
+
+  // Allocate/copy before WAL and ID-map mutation. Publication cannot allocate.
+  Result<std::unique_ptr<PreparedInsert>> prepare_insert(const Doc &doc,
+                                                         uint64_t doc_id);
+  void commit_insert(std::unique_ptr<PreparedInsert> prepared);
+
   /// Create a RecordBatchBuilder for this store
   /// \return A new RecordBatchBuilder
-  RecordBatchBuilderPtr create_builder();
+  RecordBatchBuilderPtr create_builder(bool query = false);
 
   /// Convert internal data to a RecordBatch
   /// \return A Result containing the RecordBatch or an error status
-  arrow::Result<RecordBatchPtr> convert_to_record_batch();
+  arrow::Result<RecordBatchPtr> convert_to_record_batch(bool query = false);
+
+  arrow::MemoryPool *query_memory_pool() const;
 
   /// Convert internal data to a Table
   /// \param columns The list of column names to include
@@ -145,8 +165,9 @@ class MemForwardStore : public BaseForwardStore {
   /// \param doc The document to append
   /// \param builder The builder to append into
   /// \return arrow::Status indicating success or failure
-  arrow::Status append_doc_to_builder(const Doc &doc,
-                                      RecordBatchBuilderPtr &builder);
+  arrow::Status append_doc_to_builder(
+      const Doc &doc, RecordBatchBuilderPtr &builder,
+      std::optional<uint64_t> doc_id = std::nullopt);
 
   /// Locate the single source holding every requested row
   /// \param indices The requested row ids
@@ -179,6 +200,12 @@ class MemForwardStore : public BaseForwardStore {
   /// rewrite. Read-only accessors take it shared so readers do not serialize.
   std::shared_mutex cache_mtx_;
 
+  // Payload uses the Arrow pool, but the staging Docs use ordinary heap.
+  // Charge their concurrent high water before copying. Destroy the allowance
+  // after cache_ so allocator-retained backing remains covered across stores.
+  detail::ResultMemoryAllowance::Lease cache_memory_;
+  size_t cache_memory_bytes_{0};
+
   /// Cache of documents waiting to be flushed
   std::vector<Doc> cache_;
 
@@ -192,10 +219,10 @@ class MemForwardStore : public BaseForwardStore {
   std::shared_ptr<arrow::Schema> physic_schema_;
 
   /// Total RecordBatch bytes in the store
-  uint32_t total_rb_bytes_{0};
+  size_t total_rb_bytes_{0};
 
   /// Total cache doc bytes
-  uint32_t total_cache_bytes_{0};
+  size_t total_cache_bytes_{0};
 
   /// Total number of rows in the store
   uint32_t num_rows_{0};

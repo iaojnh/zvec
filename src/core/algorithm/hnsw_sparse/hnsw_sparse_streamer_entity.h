@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
+#include <atomic>
 #include <iostream>
 #include <ailego/parallel/lock.h>
 #include <sparsehash/dense_hash_map>
 #include <sparsehash/dense_hash_set>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/core/framework/index_framework.h>
 #include "hnsw_sparse_chunk.h"
@@ -33,6 +34,19 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
   //! Cleanup
   //! return 0 on success, or errCode in failure
   int cleanup() override;
+
+  bool failed_build() const {
+    return failed_build_.load();
+  }
+  void mark_failed_build() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mark_failed_build_unlocked();
+  }
+  void mark_failed_build_unlocked() {
+    failed_build_.store(true);
+    mutable_header()->graph.options |= kGraphBuildFailed;
+    broker_->mark_dirty();
+  }
 
   //! Make a copy of streamer entity, to support thread-safe operation.
   //! The segment in container cannot be read concurrenly
@@ -97,19 +111,16 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
                          const std::string &sparse_vec,
                          uint32_t sparse_count) override;
 
-  int update_neighbors(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+  int update_neighbors(level_t level, node_id_t id,
+                       const TopkHeap::Container &neighbors) override;
 
   //! Replace node id in level's neighbors
-  int update_neighbors_dense(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors);
+  int update_neighbors_dense(level_t level, node_id_t id,
+                             const TopkHeap::Container &neighbors);
 
   //! Replace node id in level's neighbors
-  int update_neighbors_sparse(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors);
+  int update_neighbors_sparse(level_t level, node_id_t id,
+                              const TopkHeap::Container &neighbors);
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
@@ -168,8 +179,17 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
     get_vector_enabled_ = val;
   }
 
+  void set_use_key_info_map(bool enabled) {
+    use_key_info_map_ = enabled;
+  }
+
   //! Get vector local id by key
   inline node_id_t get_id(key_t key) const {
+    if (!use_key_info_map_) {
+      return key < doc_cnt() && get_key(static_cast<node_id_t>(key)) == key
+                 ? static_cast<node_id_t>(key)
+                 : kInvalidNodeId;
+    }
     keys_map_lock_->lock_shared();
     auto it = keys_map_->find(key);
     node_id_t id = it == keys_map_->end() ? kInvalidNodeId : it->second;
@@ -213,7 +233,9 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
   };
 
   template <class Key, class T>
-  using HashMap = google::dense_hash_map<Key, T, std::hash<Key>>;
+  using HashMap = google::dense_hash_map<
+      Key, T, std::hash<Key>, std::equal_to<Key>,
+      ailego::BudgetedAllocator<std::pair<const Key, T>>>;
   template <class Key, class T>
   using HashMapPointer = std::shared_ptr<HashMap<Key, T>>;
 
@@ -231,13 +253,13 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
       IndexStreamer::Stats &stats, const HNSWSparseHeader &hd,
       size_t chunk_size, uint32_t node_index_mask_bits,
       uint32_t upper_neighbor_mask_bits, bool filter_same_key,
-      bool get_vector_enabled, uint32_t sparse_chunk_size,
-      const NIHashMapPointer &upper_neighbor_index,
+      bool get_vector_enabled, bool use_key_info_map,
+      uint32_t sparse_chunk_size, const NIHashMapPointer &upper_neighbor_index,
       std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
       const HashMapPointer<key_t, node_id_t> &keys_map,
-      std::vector<SparseChunk::Pointer> &&node_chunks,
-      std::vector<SparseChunk::Pointer> &&upper_neighbor_chunks,
-      std::vector<SparseChunk::Pointer> &&sparse_node_chunks,
+      ailego::BudgetedVector<SparseChunk::Pointer> &&node_chunks,
+      ailego::BudgetedVector<SparseChunk::Pointer> &&upper_neighbor_chunks,
+      ailego::BudgetedVector<SparseChunk::Pointer> &&sparse_node_chunks,
       const SparseChunkBroker::Pointer &broker)
       : stats_(stats),
         chunk_size_(chunk_size),
@@ -248,6 +270,7 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
         upper_neighbor_mask_((1U << upper_neighbor_mask_bits_) - 1),
         filter_same_key_(filter_same_key),
         get_vector_enabled_(get_vector_enabled),
+        use_key_info_map_(use_key_info_map),
         sparse_chunk_size_(sparse_chunk_size),
         upper_neighbor_index_(upper_neighbor_index),
         keys_map_lock_(keys_map_lock),
@@ -264,7 +287,7 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
 
   //! Called only in searching procedure per context, so no need to lock
   void sync_chunks(SparseChunkBroker::ChunkType type, size_t idx,
-                   std::vector<SparseChunk::Pointer> *chunks) const {
+                   ailego::BudgetedVector<SparseChunk::Pointer> *chunks) const {
     if (ailego_likely(idx < chunks->size())) {
       return;
     }
@@ -505,6 +528,7 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
  private:
   IndexStreamer::Stats &stats_;
   HNSWSparseHeader header_{};
+  std::atomic<bool> failed_build_{false};
   std::mutex mutex_{};
   size_t max_index_size_{0UL};
   uint32_t chunk_size_{kDefaultChunkSize};
@@ -520,6 +544,7 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
   uint32_t upper_neighbor_mask_{0U};
   bool filter_same_key_{false};
   bool get_vector_enabled_{false};
+  bool use_key_info_map_{true};
 
   uint32_t sparse_chunk_size_{kDefaultChunkSize};
 
@@ -530,11 +555,11 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
 
   //! the chunks will be changed in searcher, so need mutable
   //! data chunk include: vector, key, level 0 neighbors
-  mutable std::vector<SparseChunk::Pointer> node_chunks_{};
+  mutable ailego::BudgetedVector<SparseChunk::Pointer> node_chunks_{};
   //! upper neighbor chunk inlude: UpperNeighborHeader + (1~level) neighbors
-  mutable std::vector<SparseChunk::Pointer> upper_neighbor_chunks_{};
+  mutable ailego::BudgetedVector<SparseChunk::Pointer> upper_neighbor_chunks_{};
   //! chunk that holds up sparse part
-  mutable std::vector<SparseChunk::Pointer> sparse_node_chunks_{};
+  mutable ailego::BudgetedVector<SparseChunk::Pointer> sparse_node_chunks_{};
 
   SparseChunkBroker::Pointer broker_{};  // chunk broker
 };

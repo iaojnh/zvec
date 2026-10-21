@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "hnsw_rabitq_streamer_entity.h"
+#include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
 #include "utility/legacy_read_buffer.h"
 
@@ -56,6 +57,7 @@ int HnswRabitqStreamerEntity::init(size_t max_doc_cnt) {
 }
 
 int HnswRabitqStreamerEntity::cleanup() {
+  failed_build_.store(false);
   std::lock_guard<std::mutex> lock(mutex_);
   mutable_header()->clear();
   chunk_size_ = kDefaultChunkSize;
@@ -68,10 +70,10 @@ int HnswRabitqStreamerEntity::cleanup() {
     upper_neighbor_index_->cleanup();
   }
   if (keys_map_) {
-    keys_map_->clear();
+    keys_map_.reset();
   }
-  node_chunks_.clear();
-  upper_neighbor_chunks_.clear();
+  decltype(node_chunks_)().swap(node_chunks_);
+  decltype(upper_neighbor_chunks_)().swap(upper_neighbor_chunks_);
   filter_same_key_ = false;
   get_vector_enabled_ = false;
   broker_.reset();
@@ -80,9 +82,8 @@ int HnswRabitqStreamerEntity::cleanup() {
 }
 
 int HnswRabitqStreamerEntity::update_neighbors(
-    level_t level, node_id_t id,
-    const std::vector<std::pair<node_id_t, ResultRecord>> &neighbors) {
-  std::vector<char> buffer(neighbor_size_);
+    level_t level, node_id_t id, const TopkHeap::Container &neighbors) {
+  ailego::BudgetedVector<char> buffer(neighbor_size_);
   NeighborsHeader *hd = reinterpret_cast<NeighborsHeader *>(buffer.data());
   hd->neighbor_cnt = neighbors.size();
   size_t i = 0;
@@ -128,7 +129,7 @@ const Neighbors HnswRabitqStreamerEntity::get_neighbors(level_t level,
   size_t size = chunk->read(offset, neighbor_block, neighbor_size);
   if (ailego_unlikely(size != neighbor_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-    return Neighbors();
+    throw GraphStorageError{IndexError_ReadData};
   }
   return Neighbors(std::move(neighbor_block));
 }
@@ -171,7 +172,7 @@ int HnswRabitqStreamerEntity::get_vector(
   if (ailego_unlikely(ret != read_size)) {
     LOG_ERROR("Read vector failed, offset=%zu, read size=%zu, ret=%zu",
               static_cast<size_t>(loc.second), read_size, ret);
-    return IndexError_ReadData;
+    return node_chunks_[loc.first]->read_error();
   }
   return 0;
 }
@@ -193,7 +194,7 @@ int HnswRabitqStreamerEntity::get_vector(
     if (ailego_unlikely(ret != read_size)) {
       LOG_ERROR("Read vector failed, offset=%zu, read size=%zu, ret=%zu",
                 static_cast<size_t>(loc.second), read_size, ret);
-      return IndexError_ReadData;
+      return node_chunks_[loc.first]->read_error();
     }
   }
   return 0;
@@ -230,13 +231,15 @@ void HnswRabitqStreamerEntity::add_neighbor(level_t level, node_id_t id,
   size_t ret = loc.first->write(offset, &neighbor_id, sizeof(node_id_t));
   if (ailego_unlikely(ret != sizeof(node_id_t))) {
     LOG_ERROR("Write neighbor id failed, ret=%zu", ret);
-    return;
+    throw GraphStorageError{IndexError_WriteData};
+    throw GraphStorageError{IndexError_ReadData};
   }
 
   uint32_t neighbors = size + 1;
   ret = loc.first->write(loc.second, &neighbors, sizeof(uint32_t));
   if (ailego_unlikely(ret != sizeof(uint32_t))) {
     LOG_ERROR("Write neighbor cnt failed, ret=%zu", ret);
+    throw GraphStorageError{IndexError_WriteData};
   }
 
   return;
@@ -256,6 +259,8 @@ int HnswRabitqStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   *mutable_header() =
       *reinterpret_cast<const HNSWHeader *>(header_block.data());
 
+  if (header().graph.options & kGraphBuildFailed)
+    return IndexError_InvalidFormat;
   int ret = check_hnsw_index(&header());
   if (ret != 0) {
     broker_->close();
@@ -292,6 +297,12 @@ int HnswRabitqStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
 int HnswRabitqStreamerEntity::open(IndexStorage::Pointer stg,
                                    uint64_t max_index_size, bool check_crc) {
   std::lock_guard<std::mutex> lock(mutex_);
+  failed_build_.store(false);
+  if (!keys_map_) {
+    keys_map_ = std::make_shared<HashMap<key_t, node_id_t>>();
+    keys_map_->set_empty_key(kInvalidKey);
+  }
+
   bool huge_page = stg->is_huge_page();
   LOG_DEBUG("huge_page: %d", (int)huge_page);
   int ret = init_chunk_params(max_index_size, huge_page);
@@ -384,10 +395,10 @@ int HnswRabitqStreamerEntity::close() {
   flush_header();
   mutable_header()->reset();
   upper_neighbor_index_->cleanup();
-  keys_map_->clear();
+  keys_map_.reset();
   header_.clear();
-  node_chunks_.clear();
-  upper_neighbor_chunks_.clear();
+  decltype(node_chunks_)().swap(node_chunks_);
+  decltype(upper_neighbor_chunks_)().swap(upper_neighbor_chunks_);
 
   return broker_->close();
 }
@@ -408,22 +419,18 @@ int HnswRabitqStreamerEntity::flush(uint64_t checkpoint) {
 int HnswRabitqStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("Dump index, curDocs=%zu", static_cast<size_t>(doc_cnt()));
 
-  //! sort by keys, to support get_vector by key in searcher
-  std::vector<key_t> keys(doc_cnt());
-  for (node_id_t i = 0; i < doc_cnt(); ++i) {
-    keys[i] = get_key(i);
-  }
-
   //! dump neighbors
-  auto get_level = [&](node_id_t id) {
-    auto it = upper_neighbor_index_->find(id);
+  auto get_level = [&](node_id_t id) -> level_t {
+    int status = 0;
+    auto it = upper_neighbor_index_->find(id, &status);
+    if (status != 0) return status;
     if (it == upper_neighbor_index_->end()) {
       return 0U;
     };
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
     return meta->bits.level;
   };
-  auto ret = dump_segments(dumper, keys.data(), get_level);
+  auto ret = dump_segments(dumper, get_level);
   if (ailego_unlikely(ret < 0)) {
     return ret;
   }
@@ -512,6 +519,14 @@ int HnswRabitqStreamerEntity::add_vector(level_t level, key_t key,
     chunk_offset = node_chunk->data_size();
   }
 
+  if (use_key_info_map_) {
+    std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
+    keys_map_->resize(keys_map_->size() + 1);
+  }
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) mark_failed_build_unlocked();
+  });
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
@@ -536,9 +551,8 @@ int HnswRabitqStreamerEntity::add_vector(level_t level, key_t key,
   }
   if (filter_same_key_ || get_vector_enabled_) {
     if (use_key_info_map_) {
-      keys_map_lock_->lock();
+      std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
       (*keys_map_)[key] = local_id;
-      keys_map_lock_->unlock();
     }
   }
 
@@ -546,6 +560,7 @@ int HnswRabitqStreamerEntity::add_vector(level_t level, key_t key,
   broker_->mark_dirty();
   *id = local_id;
 
+  complete = true;
   return 0;
 }
 
@@ -588,11 +603,21 @@ int HnswRabitqStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
     return 0;
   };
 
+  if (use_key_info_map_) {
+    std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
+    keys_map_->resize(keys_map_->size() + 1);
+  }
+  bool writing = false;
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (writing && !complete) mark_failed_build_unlocked();
+  });
   for (size_t start_id = doc_cnt(); start_id < id; ++start_id) {
     if (auto ret = func_get_node_chunk_and_offset(start_id); ret != 0) {
       LOG_ERROR("func_get_node_chunk_and_offset failed");
       return ret;
     }
+    writing = true;
     size_t size = node_chunk->write(chunk_offset + vector_size(), &kInvalidKey,
                                     sizeof(key_t));
     if (ailego_unlikely(size != sizeof(key_t))) {
@@ -612,6 +637,7 @@ int HnswRabitqStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
     return ret;
   }
 
+  writing = true;
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
@@ -641,14 +667,14 @@ int HnswRabitqStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
 
   if (filter_same_key_ || get_vector_enabled_) {
     if (use_key_info_map_) {
-      keys_map_lock_->lock();
+      std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
       (*keys_map_)[key] = id;
-      keys_map_lock_->unlock();
     }
   }
 
   broker_->mark_dirty();
 
+  complete = true;
   return 0;
 }
 
@@ -661,7 +687,7 @@ void HnswRabitqStreamerEntity::update_ep_and_level(node_id_t ep,
 }
 
 const HnswRabitqEntity::Pointer HnswRabitqStreamerEntity::clone() const {
-  std::vector<Chunk::Pointer> node_chunks;
+  ailego::BudgetedVector<Chunk::Pointer> node_chunks;
   node_chunks.reserve(node_chunks_.size());
   for (size_t i = 0UL; i < node_chunks_.size(); ++i) {
     node_chunks.emplace_back(node_chunks_[i]->clone());
@@ -671,7 +697,7 @@ const HnswRabitqEntity::Pointer HnswRabitqStreamerEntity::clone() const {
     }
   }
 
-  std::vector<Chunk::Pointer> upper_neighbor_chunks;
+  ailego::BudgetedVector<Chunk::Pointer> upper_neighbor_chunks;
   upper_neighbor_chunks.reserve(upper_neighbor_chunks_.size());
   for (size_t i = 0UL; i < upper_neighbor_chunks_.size(); ++i) {
     upper_neighbor_chunks.emplace_back(upper_neighbor_chunks_[i]->clone());

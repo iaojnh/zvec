@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/container/heap.h>
 #include "ivf_entity.h"
 #include "ivf_utility.h"
@@ -53,7 +53,7 @@ class IVFSearcherContext : public IndexSearcher::Context {
     return &results_[idx];
   }
 
-  inline IndexDocumentHeap *result_heap() {
+  inline IndexCandidateHeap *result_heap() {
     return &result_heap_;
   }
 
@@ -135,7 +135,7 @@ class IVFSearcherContext : public IndexSearcher::Context {
   }
 
   //! Retrieve Mutable Query Result By Query Index
-  IndexDocumentHeap &mutable_result_heap() {
+  IndexCandidateHeap &mutable_result_heap() {
     return result_heap_;
   }
 
@@ -148,6 +148,14 @@ class IVFSearcherContext : public IndexSearcher::Context {
   }
 
   //! Reset all the query results
+  void reset() override {
+    result_heap_.release();
+    for (auto &result : results_) {
+      result.clear();
+      if (result.capacity() > 4096) IndexDocumentList().swap(result);
+    }
+  }
+
   void reset_results(size_t qnum) {
     results_.resize(qnum);
     stats_vec_.resize(qnum);
@@ -189,9 +197,9 @@ class IVFSearcherContext : public IndexSearcher::Context {
     return stats_vec_[idx];
   }
 
-  void topk_to_result(uint32_t idx) {
+  int topk_to_result(uint32_t idx) {
     if (ailego_unlikely(result_heap_.size() == 0)) {
-      return;
+      return 0;
     }
 
     ailego_assert_with(idx < results_.size(), "invalid idx");
@@ -207,12 +215,17 @@ class IVFSearcherContext : public IndexSearcher::Context {
       key_t key = result_heap_[i].key();
       if (fetch_vector_) {
         IndexStorage::MemoryBlock block;
-        entity_->get_vector_by_key(key, block);
-        results_[idx].emplace_back(key, score, key, block);
+        const int ret = entity_->get_vector_by_key(key, block);
+        if (ret != 0) {
+          results_[idx].clear();
+          return ret;
+        }
+        results_[idx].emplace_back(key, score, key, std::move(block));
       } else {
         results_[idx].emplace_back(key, score);
       }
     }
+    return 0;
   }
 
  private:
@@ -223,9 +236,9 @@ class IVFSearcherContext : public IndexSearcher::Context {
   //! Members
   IVFEntity::Pointer entity_{};
   IndexSearcher::Context::Pointer centroid_searcher_ctx_{};
-  IndexDocumentHeap result_heap_;
-  std::vector<IndexDocumentList> results_{};
-  std::vector<Stats> stats_vec_{};
+  IndexCandidateHeap result_heap_;
+  ailego::BudgetedVector<IndexDocumentList> results_{};
+  ailego::BudgetedVector<Stats> stats_vec_{};
 
   bool fetch_vector_{false};
   uint32_t topk_{0};

@@ -15,6 +15,7 @@
 #include "invert_search.h"
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/type.h>
+#include "db/common/result_memory_allowance.h"
 #include "db/sqlengine/analyzer/query_node.h"
 #include "db/sqlengine/common/util.h"
 
@@ -80,7 +81,27 @@ CompareOp InvertSearch::query_nodeop2search_op(QueryNodeOp op) {
 }
 
 Result<InvertedSearchResult::Ptr> InvertSearch::exec_invert_cond_node(
-    const QueryNode *invert_cond) {
+    const QueryNode *invert_cond) try {
+  std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  if (segment_->uses_buffer_storage()) {
+    uint64_t min_id = 0, max_id = 0;
+    segment_->doc_id_range(&min_id, &max_id);
+    const uint64_t span = max_id >= min_id ? max_id - min_id : 0;
+    if (span > std::numeric_limits<uint32_t>::max()) throw std::bad_alloc();
+    // A normal Roaring container spans 64K IDs, with at most 8K payload.
+    // Cover decoded inputs, complement/merge scratch and the retained result
+    // before any posting is read. This planning allowance shares the query
+    // high water; it does not replace CRoaring's allocator or validate corrupt
+    // serialized container sizes.
+    const size_t containers = static_cast<size_t>(span / 65536 + 1);
+    memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+        &detail::SharedResultMemoryAllowance());
+    memory->add(4096 + containers * 4 * (8192 + 256));
+  }
+  const auto keep = [&memory](InvertedSearchResult::Ptr result) {
+    result->keep_memory(memory);
+    return result;
+  };
   auto term_node = invert_cond->right();
 
   // get search oper
@@ -128,14 +149,14 @@ Result<InvertedSearchResult::Ptr> InvertSearch::exec_invert_cond_node(
       return tl::make_unexpected(
           Status::InvalidArgument("invert column reader search null failed."));
     }
-    return invert_res;
+    return keep(std::move(invert_res));
   } else if (oper == CompareOp::IS_NOT_NULL) {
     auto invert_res = invert_reader->search_non_null();
     if (!invert_res) {
       return tl::make_unexpected(Status::InvalidArgument(
           "invert column reader search not null failed."));
     }
-    return invert_res;
+    return keep(std::move(invert_res));
   } else if (oper == CompareOp::CONTAIN_ALL || oper == CompareOp::CONTAIN_ANY) {
     // NOTE: IN is handled as CONTAIN_ANY
     QueryListNode::Ptr list_node =
@@ -150,7 +171,7 @@ Result<InvertedSearchResult::Ptr> InvertSearch::exec_invert_cond_node(
       return tl::make_unexpected(Status::InvalidArgument(
           "invert column reader multi_search failed. op:", int(oper)));
     }
-    return invert_res;
+    return keep(std::move(invert_res));
   } else if (!is_array_length) {
     auto invert_term = term_node->text();
     auto invert_res = invert_reader->search(invert_term, oper);
@@ -159,7 +180,7 @@ Result<InvertedSearchResult::Ptr> InvertSearch::exec_invert_cond_node(
           "invert column reader search failed. term:", invert_term.c_str(),
           " op:", invert_cond->op_name().c_str()));
     }
-    return invert_res;
+    return keep(std::move(invert_res));
   } else {
     auto invert_term = term_node->text();
     uint32_t len = *(reinterpret_cast<const uint32_t *>(invert_term.data()));
@@ -169,8 +190,12 @@ Result<InvertedSearchResult::Ptr> InvertSearch::exec_invert_cond_node(
           "invert column reader search failed. term:", invert_term.c_str(),
           " op:", invert_cond->op_name().c_str()));
     }
-    return invert_res;
+    return keep(std::move(invert_res));
   }
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient shared budget for scalar "
+                                    "posting decode and bitmap operations"));
 }
 
 

@@ -37,17 +37,24 @@ class SQLEngineImpl : public SQLEngine {
   //! Build analyzed query info from a structured search query.
   Result<QueryInfo::Ptr> build_query_info(CollectionSchema::Ptr collection,
                                           const SearchQuery &request,
-                                          std::shared_ptr<GroupBy> group_by);
+                                          std::shared_ptr<GroupBy> group_by,
+                                          bool budgeted = false);
 
   //! Perform search with given query_info, segments and index filter
   Result<std::unique_ptr<arrow::RecordBatchReader>> search_by_query_info(
       CollectionSchema::Ptr collection,
       const std::vector<Segment::Ptr> &segments,
-      std::vector<sqlengine::QueryInfo::Ptr> *query_infos);
+      std::vector<sqlengine::QueryInfo::Ptr> *query_infos,
+      size_t max_queued_bytes = 0);
 
   Result<DocPtrList> execute(
       CollectionSchema::Ptr collection, SearchQuery query,
       const std::vector<Segment::Ptr> &segments) override;
+
+  Status scan_doc_ids(CollectionSchema::Ptr collection,
+                      const std::string &filter,
+                      const std::vector<Segment::Ptr> &segments,
+                      const DocIdConsumer &consume) override;
 
   Result<GroupResults> execute_group_by(
       CollectionSchema::Ptr collection,
@@ -59,15 +66,23 @@ class SQLEngineImpl : public SQLEngine {
   }
 
  private:
+  // A null reader represents an empty result without starting an execution
+  // plan.
+  Result<std::unique_ptr<arrow::RecordBatchReader>> prepare_search(
+      CollectionSchema::Ptr collection, const SearchQuery &query,
+      const std::vector<Segment::Ptr> &segments,
+      std::vector<FieldAndSchema> *output_fields, size_t max_queued_bytes = 0);
+
   Result<DocPtrList> fill_result(
       const std::vector<FieldAndSchema> &output_fields,
-      arrow::RecordBatchReader *reader);
+      arrow::RecordBatchReader *reader, bool budgeted);
 
   Result<QueryInfo::Ptr> parse_sql_info(const CollectionSchema &schema,
                                         const SQLInfo::Ptr &sql_info);
 
   Result<GroupResults> fill_group_by_result(const QueryInfo &query_info,
-                                            arrow::RecordBatchReader *reader);
+                                            arrow::RecordBatchReader *reader,
+                                            bool budgeted);
 
   //! Parse FTS query into a FtsCondInfo (AST + field name).
   Result<FtsCondInfo::Ptr> parse_fts_query(

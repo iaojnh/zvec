@@ -14,6 +14,7 @@
 #pragma once
 
 #include <utility>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/interface/constants.h>
 #include "utility/search_heap.h"
@@ -156,41 +157,43 @@ class VamanaContext : public IndexContext {
   }
 
   // Pre-allocated buffers for robust_prune optimization
-  inline std::vector<const void *> &prune_vec_cache() {
+  inline ailego::BudgetedVector<const void *> &prune_vec_cache() {
     return prune_vec_cache_;
   }
-  inline std::vector<uint8_t> &prune_active() {
+  inline ailego::BudgetedVector<uint8_t> &prune_active() {
     return prune_active_;
   }
-  inline std::vector<float> &prune_occlude_factor() {
+  inline ailego::BudgetedVector<float> &prune_occlude_factor() {
     return prune_occlude_factor_;
   }
   inline std::vector<std::pair<node_id_t, dist_t>> &prune_result() {
+    ailego::ReserveVectorCapacity(prune_result_, prune_result_memory_,
+                                  entity_->max_degree());
     return prune_result_;
   }
-  inline std::vector<const void *> &batch_vecs_buf() {
+  inline ailego::BudgetedVector<const void *> &batch_vecs_buf() {
     return batch_vecs_buf_;
   }
-  inline std::vector<float> &batch_dists_buf() {
+  inline ailego::BudgetedVector<float> &batch_dists_buf() {
     return batch_dists_buf_;
   }
-  inline std::vector<uint32_t> &batch_indices_buf() {
+  inline ailego::BudgetedVector<uint32_t> &batch_indices_buf() {
     return batch_indices_buf_;
   }
 
   // Reusable scratch for the mmap/contiguous query fast path. Keeping these
   // buffers in the context avoids allocating three (or four for metrics with
   // extra values) max-degree arrays for every query.
-  inline std::vector<node_id_t> &search_neighbor_ids_buf() {
+  inline ailego::BudgetedVector<node_id_t> &search_neighbor_ids_buf() {
     return search_neighbor_ids_buf_;
   }
-  inline std::vector<float> &search_dists_buf() {
+  inline ailego::BudgetedVector<float> &search_dists_buf() {
     return search_dists_buf_;
   }
-  inline std::vector<const void *> &search_vecs_buf() {
+  inline ailego::BudgetedVector<const void *> &search_vecs_buf() {
     return search_vecs_buf_;
   }
-  inline std::vector<const void *> &search_extra_values_buf() {
+  inline ailego::BudgetedVector<const void *> &search_extra_values_buf() {
     return search_extra_values_buf_;
   }
 
@@ -282,22 +285,29 @@ class VamanaContext : public IndexContext {
     IndexContext::set_fetch_vector(false);
   }
 
-  inline void check_need_adjuct_ctx() {
-    check_need_adjuct_ctx(entity_->doc_cnt());
+  inline bool check_need_adjuct_ctx() {
+    return check_need_adjuct_ctx(entity_->doc_cnt());
   }
 
-  inline void check_need_adjuct_ctx(uint32_t doc_cnt) {
-    if (ailego_unlikely(doc_cnt + kTriggerReserveCnt > reserve_max_doc_cnt_)) {
-      while (doc_cnt + kTriggerReserveCnt > reserve_max_doc_cnt_) {
-        reserve_max_doc_cnt_ =
-            reserve_max_doc_cnt_ + compute_reserve_cnt(reserve_max_doc_cnt_);
+  inline bool check_need_adjuct_ctx(uint32_t doc_cnt) {
+    const uint32_t target = static_cast<uint32_t>(
+        std::min<uint64_t>(uint64_t{doc_cnt} + kTriggerReserveCnt, UINT32_MAX));
+    if (ailego_unlikely(target > reserve_max_doc_cnt_)) {
+      uint32_t next = reserve_max_doc_cnt_;
+      while (target > next) {
+        next += static_cast<uint32_t>(
+            std::min<size_t>(compute_reserve_cnt(next), UINT32_MAX - next));
       }
-      uint32_t max_scan_cnt = compute_max_scan_num(reserve_max_doc_cnt_);
-      max_scan_num_ = max_scan_cnt;
-      visit_filter_.reset(reserve_max_doc_cnt_, max_scan_cnt);
+      const uint32_t scans = compute_max_scan_num(next);
+      if (!visit_filter_.reset(next, scans)) return false;
+      // Failed reservation must not publish a larger capacity or let a
+      // subsequent query index the previous, smaller bitmap.
+      reserve_max_doc_cnt_ = next;
+      max_scan_num_ = scans;
       candidates_.clear();
       candidates_.limit(max_scan_num_);
     }
+    return true;
   }
 
   inline size_t get_scan_num() const {
@@ -379,7 +389,7 @@ class VamanaContext : public IndexContext {
   size_t max_scan_limit_{VamanaEntity::kDefaultMaxScanLimit};
   size_t min_scan_limit_{VamanaEntity::kDefaultMinScanLimit};
   uint32_t magic_{0U};
-  std::vector<IndexDocumentList> results_{};
+  ailego::BudgetedVector<IndexDocumentList> results_{};
   SearchHeap search_heap_{};
   TopkHeap update_heap_{};
   CandidateHeap candidates_{};
@@ -390,17 +400,18 @@ class VamanaContext : public IndexContext {
   std::string preprocess_buffer_;
 
   // Pre-allocated buffers for robust_prune optimization
-  std::vector<const void *> prune_vec_cache_;
-  std::vector<uint8_t> prune_active_;
-  std::vector<float> prune_occlude_factor_;
+  ailego::BudgetedVector<const void *> prune_vec_cache_;
+  ailego::BudgetedVector<uint8_t> prune_active_;
+  ailego::BudgetedVector<float> prune_occlude_factor_;
+  ailego::MemoryReservation prune_result_memory_;
   std::vector<std::pair<node_id_t, dist_t>> prune_result_;
-  std::vector<const void *> batch_vecs_buf_;
-  std::vector<float> batch_dists_buf_;
-  std::vector<uint32_t> batch_indices_buf_;
-  std::vector<node_id_t> search_neighbor_ids_buf_;
-  std::vector<float> search_dists_buf_;
-  std::vector<const void *> search_vecs_buf_;
-  std::vector<const void *> search_extra_values_buf_;
+  ailego::BudgetedVector<const void *> batch_vecs_buf_;
+  ailego::BudgetedVector<float> batch_dists_buf_;
+  ailego::BudgetedVector<uint32_t> batch_indices_buf_;
+  ailego::BudgetedVector<node_id_t> search_neighbor_ids_buf_;
+  ailego::BudgetedVector<float> search_dists_buf_;
+  ailego::BudgetedVector<const void *> search_vecs_buf_;
+  ailego::BudgetedVector<const void *> search_extra_values_buf_;
 
   //! Cached build-time distance offset (see build_distance_offset()).
   float build_distance_offset_{0.0f};

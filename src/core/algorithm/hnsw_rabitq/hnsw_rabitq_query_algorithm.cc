@@ -44,7 +44,7 @@ int HnswRabitqQueryAlgorithm::cleanup() {
 }
 
 int HnswRabitqQueryAlgorithm::search(HnswRabitqQueryEntity *entity,
-                                     HnswRabitqContext *ctx) const {
+                                     HnswRabitqContext *ctx) const try {
   spin_lock_.lock();
   auto max_level = entity_.cur_max_level();
   auto entry_point = entity_.entry_point();
@@ -66,10 +66,21 @@ int HnswRabitqQueryAlgorithm::search(HnswRabitqQueryEntity *entity,
   search_neighbors(0, &entry_point, &curest, topk_heap, ctx, entity);
 
   if (ctx->group_by_search()) {
-    expand_neighbors_by_group(topk_heap, ctx, entity);
+    try {
+      expand_neighbors_by_group(topk_heap, ctx, entity);
+    } catch (const GraphStorageError &error) {
+      return error.code;
+    } catch (const std::bad_alloc &) {
+      ctx->group_topk_heaps().clear();
+      return IndexError_NoMemory;
+    }
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 
@@ -213,7 +224,7 @@ void HnswRabitqQueryAlgorithm::expand_neighbors_by_group(
   };
 
   // devide into groups
-  std::map<std::string, TopkHeap> &group_topk_heaps = ctx->group_topk_heaps();
+  auto &group_topk_heaps = ctx->group_topk_heaps();
   for (uint32_t i = 0; i < topk.size(); ++i) {
     node_id_t id = topk[i].first;
     auto score = topk[i].second;
@@ -308,7 +319,10 @@ void HnswRabitqQueryAlgorithm::get_bin_est(
     HnswRabitqQueryEntity &entity) const {
   const auto &q_to_centroids = entity.q_to_centroids;
   auto &query_wrapper = *entity.query_wrapper;
+  if (!vector) throw GraphStorageError{IndexError_ReadData};
   uint32_t cluster_id = entity_.get_cluster_id(vector);
+  if (cluster_id >= num_clusters_)
+    throw GraphStorageError{IndexError_InvalidFormat};
   const char *bin_data = entity_.get_bin_data(vector);
   if (metric_type_ == RabitqMetricType::kIP) {
     float norm = q_to_centroids[cluster_id];
@@ -330,7 +344,10 @@ void HnswRabitqQueryAlgorithm::get_full_est(
     HnswRabitqQueryEntity &entity) const {
   const auto &q_to_centroids = entity.q_to_centroids;
   auto &query_wrapper = *entity.query_wrapper;
+  if (!vector) throw GraphStorageError{IndexError_ReadData};
   uint32_t cluster_id = entity_.get_cluster_id(vector);
+  if (cluster_id >= num_clusters_)
+    throw GraphStorageError{IndexError_InvalidFormat};
   const char *bin_data = entity_.get_bin_data(vector);
   const char *ex_data = entity_.get_ex_data(vector);
 

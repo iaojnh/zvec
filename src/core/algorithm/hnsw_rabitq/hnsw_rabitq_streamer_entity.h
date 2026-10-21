@@ -13,12 +13,13 @@
 // limitations under the License.
 
 #pragma once
-
+#include <atomic>
 #include <iostream>
 #include <shared_mutex>
 #include <ailego/parallel/lock.h>
 #include <sparsehash/dense_hash_map>
 #include <sparsehash/dense_hash_set>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/container/heap.h>
 #include "zvec/core/framework/index_framework.h"
 #include "hnsw_rabitq_chunk.h"
@@ -35,6 +36,19 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   //! Cleanup
   //! return 0 on success, or errCode in failure
   int cleanup() override;
+
+  bool failed_build() const {
+    return failed_build_.load();
+  }
+  void mark_failed_build() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mark_failed_build_unlocked();
+  }
+  void mark_failed_build_unlocked() {
+    failed_build_.store(true);
+    mutable_header()->graph.options |= kGraphBuildFailed;
+    broker_->mark_dirty();
+  }
 
   //! Make a copy of streamer entity, to support thread-safe operation.
   //! The segment in container cannot be read concurrenly
@@ -70,8 +84,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   int add_vector_with_id(level_t level, node_id_t id, const void *vec) override;
 
   int update_neighbors(level_t level, node_id_t id,
-                       const std::vector<std::pair<node_id_t, ResultRecord>>
-                           &neighbors) override;
+                       const TopkHeap::Container &neighbors) override;
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
@@ -201,7 +214,9 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   };
 
   template <class Key, class T>
-  using HashMap = google::dense_hash_map<Key, T, std::hash<Key>>;
+  using HashMap = google::dense_hash_map<
+      Key, T, std::hash<Key>, std::equal_to<Key>,
+      ailego::BudgetedAllocator<std::pair<const Key, T>>>;
   template <class Key, class T>
   using HashMapPointer = std::shared_ptr<HashMap<Key, T>>;
 
@@ -211,7 +226,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   using HashSetPointer = std::shared_ptr<HashSet<Key>>;
 
   //! upper neighbor index hashmap
-  using NIHashMap = HnswIndexHashMap<node_id_t, uint32_t>;
+  using NIHashMap = HnswRabitqIndexHashMap<node_id_t, uint32_t>;
   using NIHashMapPointer = std::shared_ptr<NIHashMap>;
 
   //! Private construct, only be called by clone method
@@ -223,8 +238,8 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
       const std::shared_ptr<std::shared_mutex> &upper_neighbor_rw_mutex,
       std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
       const HashMapPointer<key_t, node_id_t> &keys_map, bool use_key_info_map,
-      std::vector<Chunk::Pointer> &&node_chunks,
-      std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
+      ailego::BudgetedVector<Chunk::Pointer> &&node_chunks,
+      ailego::BudgetedVector<Chunk::Pointer> &&upper_neighbor_chunks,
       const HnswRabitqChunkBroker::Pointer &broker)
       : stats_(stats),
         chunk_size_(chunk_size),
@@ -251,7 +266,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
 
   //! Called only in searching procedure per context, so no need to lock
   void sync_chunks(HnswRabitqChunkBroker::CHUNK_TYPE type, size_t idx,
-                   std::vector<Chunk::Pointer> *chunks) const {
+                   ailego::BudgetedVector<Chunk::Pointer> *chunks) const {
     if (ailego_likely(idx < chunks->size())) {
       return;
     }
@@ -405,7 +420,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
 
     // Use std::vector instead of a VLA: VLAs are a GNU extension and may
     // produce different codegen / be rejected under clang/MSVC.
-    std::vector<char> zeros(neighbors_size, 0);
+    ailego::BudgetedVector<char> zeros(neighbors_size, 0);
     if (ailego_unlikely(chunk->write(zero_start, zeros.data(),
                                      neighbors_size) != neighbors_size)) {
       LOG_ERROR("Chunk write zeros failed");
@@ -519,6 +534,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   static constexpr uint64_t kUpperHashMemoryInflateRatio = 2.0f;
   IndexStreamer::Stats &stats_;
   HNSWHeader header_{};
+  std::atomic<bool> failed_build_{false};
   std::mutex mutex_{};
   size_t max_index_size_{0UL};
   uint32_t chunk_size_{kDefaultChunkSize};
@@ -548,10 +564,10 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
 
   //! the chunks will be changed in searcher, so need mutable
   //! data chunk include: vector, key, level 0 neighbors
-  mutable std::vector<Chunk::Pointer> node_chunks_{};
+  mutable ailego::BudgetedVector<Chunk::Pointer> node_chunks_{};
 
   //! upper neighbor chunk inlude: UpperNeighborHeader + (1~level) neighbors
-  mutable std::vector<Chunk::Pointer> upper_neighbor_chunks_{};
+  mutable ailego::BudgetedVector<Chunk::Pointer> upper_neighbor_chunks_{};
 
   HnswRabitqChunkBroker::Pointer broker_{};  // chunk broker
 };

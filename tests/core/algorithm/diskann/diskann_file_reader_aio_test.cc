@@ -14,6 +14,7 @@
 
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include "diskann_file_reader.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 #if defined(__linux) || defined(__linux__)
 
@@ -231,7 +232,7 @@ TEST(DiskAnnBufferPoolFileReaderTest,
             static_cast<ssize_t>(source.size()));
   ASSERT_EQ(::fsync(file.fd()), 0);
 
-  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
       0, memory_pool.init(
              8 * page_size +
@@ -288,7 +289,7 @@ TEST(DiskAnnBufferPoolFileReaderTest,
             static_cast<ssize_t>(source.size()));
   ASSERT_EQ(::fsync(file.fd()), 0);
 
-  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
       0, memory_pool.init(
              page_size +
@@ -362,7 +363,7 @@ TEST(DiskAnnBufferPoolFileReaderTest, RejectsNonPageAlignedRequests) {
   ASSERT_EQ(::pwrite(file.fd(), source.data(), source.size(), 0),
             static_cast<ssize_t>(source.size()));
 
-  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory_pool.init(
                    4 * ailego::kVectorPageSize +
                    ailego::VecBufferPool::metadata_bytes_for_page_count(2)));
@@ -381,8 +382,6 @@ TEST(DiskAnnBufferPoolFileReaderTest, RejectsNonPageAlignedRequests) {
   EXPECT_EQ(unused, nullptr);
   std::free(output);
 }
-
-#endif  // __linux__
 
 TEST(DiskAnnLinuxAioTest, DrainsPartialSubmissionBeforePreadFallback) {
   TemporaryFile file;
@@ -435,3 +434,5 @@ TEST(DiskAnnLinuxAioTest, DrainsAllCompletionsBeforePreadFallback) {
 
   std::free(output);
 }
+
+#endif  // __linux__

@@ -13,7 +13,9 @@
 // limitations under the License.
 
 #include "flat_streamer.h"
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/core/framework/index_factory.h>
+#include "utility/group_candidate_collector.h"
 #include "flat_streamer_context.h"
 #include "flat_streamer_dumper.h"
 #include "flat_streamer_provider.h"
@@ -156,7 +158,7 @@ int FlatStreamer<BATCH_SIZE>::cleanup() {
 }
 
 template <size_t BATCH_SIZE>
-int FlatStreamer<BATCH_SIZE>::open(IndexStorage::Pointer stg) {
+int FlatStreamer<BATCH_SIZE>::open(IndexStorage::Pointer stg) try {
   if (!stg) {
     LOG_ERROR("Failed to open for invalid storage");
     return IndexError_InvalidArgument;
@@ -206,6 +208,8 @@ int FlatStreamer<BATCH_SIZE>::open(IndexStorage::Pointer stg) {
   state_ = STATE_OPENED;
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
@@ -266,7 +270,7 @@ IndexProvider::Pointer FlatStreamer<BATCH_SIZE>::create_provider() const {
 template <size_t BATCH_SIZE>
 int FlatStreamer<BATCH_SIZE>::add_impl(uint64_t pkey, const void *query,
                                        const IndexQueryMeta &qmeta,
-                                       Context::UPointer &context) {
+                                       Context::UPointer &context) try {
   if (!query || qmeta.dimension() != meta_.dimension() ||
       qmeta.data_type() != meta_.data_type() ||
       qmeta.element_size() != meta_.element_size()) {
@@ -310,12 +314,14 @@ int FlatStreamer<BATCH_SIZE>::add_impl(uint64_t pkey, const void *query,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
 int FlatStreamer<BATCH_SIZE>::add_with_id_impl(uint32_t id, const void *query,
                                                const IndexQueryMeta &qmeta,
-                                               Context::Pointer &context) {
+                                               Context::Pointer &context) try {
   if (!query || qmeta.dimension() != meta_.dimension() ||
       qmeta.data_type() != meta_.data_type() ||
       qmeta.element_size() != meta_.element_size()) {
@@ -350,13 +356,16 @@ int FlatStreamer<BATCH_SIZE>::add_with_id_impl(uint32_t id, const void *query,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
 int FlatStreamer<BATCH_SIZE>::search_bf_impl(const void *query,
                                              const IndexQueryMeta &qmeta,
                                              uint32_t count,
-                                             Context::Pointer &context) const {
+                                             Context::Pointer &context) const
+    try {
   if (state_ != STATE_OPENED) return IndexError_NoReady;
   ailego_assert(query && count && !!context);
   ailego_assert(quantizer_ || metric_->is_matched(meta_, qmeta));
@@ -368,6 +377,10 @@ int FlatStreamer<BATCH_SIZE>::search_bf_impl(const void *query,
     return IndexError_InvalidArgument;
   }
 
+  auto release_candidates = ailego::ScopeGuard::Make([&] {
+    bf_context->result_heap()->release();
+    bf_context->group_topk_heaps().clear();
+  });
   if (bf_context->magic() != magic_) {
     bf_context->reset(this);
   }
@@ -398,13 +411,19 @@ int FlatStreamer<BATCH_SIZE>::search_bf_impl(const void *query,
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
   return 0;
+} catch (const FlatStreamerEntity::ReadError &error) {
+  if (context) context->reset();
+  return error.status;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
 int FlatStreamer<BATCH_SIZE>::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
   if (state_ != STATE_OPENED) return IndexError_NoReady;
   if (count == 0 || count > p_keys.size()) return IndexError_InvalidArgument;
   ailego_assert(query && count && !!context);
@@ -417,6 +436,10 @@ int FlatStreamer<BATCH_SIZE>::search_bf_by_p_keys_impl(
     return IndexError_InvalidArgument;
   }
 
+  auto release_candidates = ailego::ScopeGuard::Make([&] {
+    bf_context->result_heap()->release();
+    bf_context->group_topk_heaps().clear();
+  });
   if (bf_context->magic() != magic_) {
     bf_context->reset(this);
   }
@@ -447,6 +470,12 @@ int FlatStreamer<BATCH_SIZE>::search_bf_by_p_keys_impl(
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
   return 0;
+} catch (const FlatStreamerEntity::ReadError &error) {
+  if (context) context->reset();
+  return error.status;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>
@@ -501,26 +530,29 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_impl(
     return bf_context->group_by()(key);
   };
 
-  auto iterator = entity_->creater_iterator();
-
   for (size_t q = 0; q < count; ++q) {
     bf_context->group_topk_heaps().clear();
+    GroupCandidateCollector groups(bf_context->group_num(),
+                                   bf_context->group_topk());
     for (node_id_t id = 0; id < entity_->vector_count(); ++id) {
       uint64_t key = entity_->key(id);
+      if (key == kInvalidKey) continue;
       if (!bf_context->filter().is_valid() || !bf_context->filter()(key)) {
         dist_t dist = 0;
         IndexStorage::MemoryBlock block;
-        if (entity_->get_vector_by_key(key, block) != 0) continue;
+        int read_ret = entity_->get_vector_by_key(key, block);
+        if (read_ret == IndexError_NoExist) continue;
+        if (read_ret != 0) throw FlatStreamerEntity::ReadError{read_ret};
         entity_->row_major_distance(query, block.data(), 1, &dist);
 
         std::string group_id = group_by(key);
-        auto &topk_heap = bf_context->group_topk_heaps()[group_id];
-        if (topk_heap.empty()) {
-          topk_heap.limit(bf_context->group_topk());
-        }
-        topk_heap.emplace(key, dist);
+        int ret = groups.add(group_id, key, dist);
+        if (ret != 0) return ret;
       }
     }
+    int ret = groups.finish_heaps(bf_context->group_topk_heaps(),
+                                  bf_context->group_topk());
+    if (ret != 0) return ret;
     bf_context->topk_to_group_result(q);
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
@@ -550,26 +582,28 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_p_keys_impl(
     return bf_context->group_by()(key);
   };
 
-  auto iterator = entity_->creater_iterator();
-
   for (size_t q = 0; q < count; ++q) {
     bf_context->group_topk_heaps().clear();
+    GroupCandidateCollector groups(bf_context->group_num(),
+                                   bf_context->group_topk());
     for (node_id_t idx = 0; idx < p_keys[q].size(); ++idx) {
       uint64_t key = p_keys[q][idx];
       if (!bf_context->filter().is_valid() || !bf_context->filter()(key)) {
         dist_t dist = 0;
         IndexStorage::MemoryBlock block;
-        if (entity_->get_vector_by_key(key, block) != 0) continue;
+        int read_ret = entity_->get_vector_by_key(key, block);
+        if (read_ret == IndexError_NoExist) continue;
+        if (read_ret != 0) throw FlatStreamerEntity::ReadError{read_ret};
         entity_->row_major_distance(query, block.data(), 1, &dist);
 
         std::string group_id = group_by(key);
-        auto &topk_heap = bf_context->group_topk_heaps()[group_id];
-        if (topk_heap.empty()) {
-          topk_heap.limit(bf_context->group_topk());
-        }
-        topk_heap.emplace(key, dist);
+        int ret = groups.add(group_id, key, dist);
+        if (ret != 0) return ret;
       }
     }
+    int ret = groups.finish_heaps(bf_context->group_topk_heaps(),
+                                  bf_context->group_topk());
+    if (ret != 0) return ret;
     bf_context->topk_to_group_result(q);
     query = static_cast<const char *>(query) + qmeta.element_size();
   }

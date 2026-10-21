@@ -17,6 +17,7 @@
 #include <ailego/math/normalizer.h>
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include "rotator/rotator.h"
 #include "record_quantizer.h"
@@ -90,7 +91,7 @@ class IntegerQuantizerReformer : public IndexReformer {
 
   //! Transform query
   int transform(const void *query, const IndexQueryMeta &qmeta,
-                std::string *out, IndexQueryMeta *ometa) const override {
+                std::string *out, IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = qmeta.data_type();
 
     if (ft != IndexMeta::DataType::DT_FP32 ||
@@ -112,11 +113,15 @@ class IntegerQuantizerReformer : public IndexReformer {
       this->transform(vec, qmeta.dimension(), ovec);
     }
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Transform queries
   int transform(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-                std::string *out, IndexQueryMeta *ometa) const override {
+                std::string *out, IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = qmeta.data_type();
     if (ft != IndexMeta::DataType::DT_FP32 ||
         qmeta.unit_size() !=
@@ -149,11 +154,15 @@ class IntegerQuantizerReformer : public IndexReformer {
     }
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Convert a record
   int convert(const void *record, const IndexQueryMeta &rmeta, std::string *out,
-              IndexQueryMeta *ometa) const override {
+              IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = rmeta.data_type();
 
     if (ft != IndexMeta::DataType::DT_FP32 ||
@@ -171,11 +180,15 @@ class IntegerQuantizerReformer : public IndexReformer {
     quantizer_.encode(vec, rmeta.dimension(), ovec);
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Convert records
   int convert(const void *records, const IndexQueryMeta &rmeta, uint32_t count,
-              std::string *out, IndexQueryMeta *ometa) const override {
+              std::string *out, IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = rmeta.data_type();
 
     if (ft != IndexMeta::DataType::DT_FP32 ||
@@ -193,6 +206,10 @@ class IntegerQuantizerReformer : public IndexReformer {
         reinterpret_cast<typename Quantizer::ValueType *>(&(*out)[0]));
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Normalize results
@@ -304,13 +321,9 @@ class IntegerStreamingReformer : public IndexReformer {
     if (enable_rotate_ || storage->get(ROTATOR_SEG_ID)) {
       int ret = Rotator::open(&rotator_, storage);
       if (ret != 0) {
-        if (enable_rotate_) {
-          // Config said enable_rotate but storage has no rotator — error
-          LOG_ERROR("IntegerStreamingReformer: load rotator failed, ret=%d",
-                    ret);
-          return ret;
-        }
-        // No rotator in storage, rotation not available
+        // A present rotator is required to interpret the stored vectors.
+        // Admission/read failure must not silently disable rotation.
+        return ret;
       } else {
         enable_rotate_ = true;
         LOG_DEBUG("IntegerStreamingReformer: rotator auto-loaded, dim=%zu",
@@ -322,12 +335,13 @@ class IntegerStreamingReformer : public IndexReformer {
 
   //! Unload index
   int unload() override {
+    rotator_.reset();
     return 0;
   }
 
   //! Transform query
   int transform(const void *query, const IndexQueryMeta &qmeta,
-                std::string *out, IndexQueryMeta *ometa) const override {
+                std::string *out, IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = qmeta.data_type();
 
     if (ft != IndexMeta::DataType::DT_FP32 ||
@@ -340,27 +354,31 @@ class IntegerStreamingReformer : public IndexReformer {
     ometa->set_meta(data_type_, qmeta.dimension() + extra_dimension_);
     out->resize(ometa->element_size());
     const float *vec = reinterpret_cast<const float *>(query);
-    std::unique_ptr<float[]> rotate_buffer;
+    ailego::BudgetedVector<float> rotate_buffer;
     if (enable_rotate_ && rotator_) {
-      rotate_buffer.reset(new float[rotator_->dimension()]);
-      rotator_->rotate(vec, rotate_buffer.get());
-      vec = rotate_buffer.get();
+      rotate_buffer.resize(rotator_->dimension());
+      rotator_->rotate(vec, rotate_buffer.data());
+      vec = rotate_buffer.data();
     }
-    std::unique_ptr<float[]> normalized;
+    ailego::BudgetedVector<float> normalized;
     if (enable_normalize_) {
-      normalized.reset(new float[qmeta.dimension()]);
-      vec = normalize(vec, qmeta, normalized.get());
+      normalized.resize(qmeta.dimension());
+      vec = normalize(vec, qmeta, normalized.data());
     }
 
     RecordQuantizer::quantize_record(vec, qmeta.dimension(), data_type_,
                                      is_euclidean_, &(*out)[0]);
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Transform queries
   int transform(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-                std::string *out, IndexQueryMeta *ometa) const override {
+                std::string *out, IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = qmeta.data_type();
     if (ft != IndexMeta::DataType::DT_FP32 ||
         qmeta.unit_size() !=
@@ -371,23 +389,23 @@ class IntegerStreamingReformer : public IndexReformer {
     *ometa = qmeta;
     ometa->set_meta(data_type_, qmeta.dimension() + extra_dimension_);
     out->resize(count * ometa->element_size());
-    std::unique_ptr<float[]> rotate_buffer;
-    std::unique_ptr<float[]> normalized;
+    ailego::BudgetedVector<float> rotate_buffer;
+    ailego::BudgetedVector<float> normalized;
     if (enable_rotate_ && rotator_) {
-      rotate_buffer.reset(new float[rotator_->dimension()]);
+      rotate_buffer.resize(rotator_->dimension());
     }
     if (enable_normalize_) {
-      normalized.reset(new float[qmeta.dimension()]);
+      normalized.resize(qmeta.dimension());
     }
     for (size_t i = 0; i < count; ++i) {
       const float *vec =
           reinterpret_cast<const float *>(query) + i * qmeta.dimension();
       if (enable_rotate_ && rotator_) {
-        rotator_->rotate(vec, rotate_buffer.get());
-        vec = rotate_buffer.get();
+        rotator_->rotate(vec, rotate_buffer.data());
+        vec = rotate_buffer.data();
       }
       if (enable_normalize_) {
-        vec = normalize(vec, qmeta, normalized.get());
+        vec = normalize(vec, qmeta, normalized.data());
       }
 
       RecordQuantizer::quantize_record(vec, qmeta.dimension(), data_type_,
@@ -396,11 +414,15 @@ class IntegerStreamingReformer : public IndexReformer {
     }
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Convert a record
   int convert(const void *record, const IndexQueryMeta &rmeta, std::string *out,
-              IndexQueryMeta *ometa) const override {
+              IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = rmeta.data_type();
 
     if (ft != IndexMeta::DataType::DT_FP32 ||
@@ -413,27 +435,31 @@ class IntegerStreamingReformer : public IndexReformer {
     ometa->set_meta(data_type_, rmeta.dimension() + extra_dimension_);
     out->resize(ometa->element_size());
     const float *vec = reinterpret_cast<const float *>(record);
-    std::unique_ptr<float[]> rotate_buffer;
+    ailego::BudgetedVector<float> rotate_buffer;
     if (enable_rotate_ && rotator_) {
-      rotate_buffer.reset(new float[rotator_->dimension()]);
-      rotator_->rotate(vec, rotate_buffer.get());
-      vec = rotate_buffer.get();
+      rotate_buffer.resize(rotator_->dimension());
+      rotator_->rotate(vec, rotate_buffer.data());
+      vec = rotate_buffer.data();
     }
-    std::unique_ptr<float[]> normalized;
+    ailego::BudgetedVector<float> normalized;
     if (enable_normalize_) {
-      normalized.reset(new float[rmeta.dimension()]);
-      vec = normalize(vec, rmeta, normalized.get());
+      normalized.resize(rmeta.dimension());
+      vec = normalize(vec, rmeta, normalized.data());
     }
 
     RecordQuantizer::quantize_record(vec, rmeta.dimension(), data_type_,
                                      is_euclidean_, &(*out)[0]);
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Convert records
   int convert(const void *records, const IndexQueryMeta &rmeta, uint32_t count,
-              std::string *out, IndexQueryMeta *ometa) const override {
+              std::string *out, IndexQueryMeta *ometa) const override try {
     IndexMeta::DataType ft = rmeta.data_type();
 
     if (ft != IndexMeta::DataType::DT_FP32 ||
@@ -445,23 +471,23 @@ class IntegerStreamingReformer : public IndexReformer {
     *ometa = rmeta;
     ometa->set_meta(data_type_, rmeta.dimension() + extra_dimension_);
     out->resize(count * ometa->element_size());
-    std::unique_ptr<float[]> rotate_buffer;
-    std::unique_ptr<float[]> normalized;
+    ailego::BudgetedVector<float> rotate_buffer;
+    ailego::BudgetedVector<float> normalized;
     if (enable_rotate_ && rotator_) {
-      rotate_buffer.reset(new float[rotator_->dimension()]);
+      rotate_buffer.resize(rotator_->dimension());
     }
     if (enable_normalize_) {
-      normalized.reset(new float[rmeta.dimension()]);
+      normalized.resize(rmeta.dimension());
     }
     for (size_t i = 0; i < count; ++i) {
       const float *vec =
           reinterpret_cast<const float *>(records) + i * rmeta.dimension();
       if (enable_rotate_ && rotator_) {
-        rotator_->rotate(vec, rotate_buffer.get());
-        vec = rotate_buffer.get();
+        rotator_->rotate(vec, rotate_buffer.data());
+        vec = rotate_buffer.data();
       }
       if (enable_normalize_) {
-        vec = normalize(vec, rmeta, normalized.get());
+        vec = normalize(vec, rmeta, normalized.data());
       }
 
       RecordQuantizer::quantize_record(vec, rmeta.dimension(), data_type_,
@@ -470,6 +496,10 @@ class IntegerStreamingReformer : public IndexReformer {
     }
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Normalize results
@@ -493,7 +523,7 @@ class IntegerStreamingReformer : public IndexReformer {
   }
 
   int revert(const void *in, const IndexQueryMeta &qmeta,
-             std::string *out) const override {
+             std::string *out) const override try {
     if (enable_normalize_) {
       LOG_ERROR("Unsupported revert for normalized value");
       return IndexError_Unsupported;
@@ -512,6 +542,10 @@ class IntegerStreamingReformer : public IndexReformer {
     }
 
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const std::runtime_error &) {
+    return IndexError_ReadData;
   }
 
   //! Members

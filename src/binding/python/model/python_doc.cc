@@ -18,6 +18,26 @@
 
 namespace zvec {
 
+namespace {
+
+template <typename T>
+const T *doc_field_ref(const Doc &doc, const std::string &field) {
+  try {
+    return &doc.get_ref<T>(field);
+  } catch (const std::runtime_error &) {
+    // Match get<T>(): absent, null and mismatched fields convert to None.
+    return nullptr;
+  }
+}
+
+template <typename T>
+py::object doc_field_to_py(const Doc &doc, const std::string &field) {
+  const auto *value = doc_field_ref<T>(doc, field);
+  return value ? py::cast(*value) : py::none();
+}
+
+}  // namespace
+
 template <typename T>
 T checked_cast(const py::object &obj, const std::string &field,
                const std::string &expected_type) {
@@ -228,7 +248,7 @@ py::object ZVecPyDoc::doc_value_to_py(Doc &self, const std::string &field,
   switch (type) {
     // base datatypes
     case DataType::STRING:
-      return py::cast(self.get<std::string>(field));
+      return doc_field_to_py<std::string>(self, field);
     case DataType::BOOL:
       return py::cast(self.get<bool>(field));
     case DataType::INT32:
@@ -246,46 +266,44 @@ py::object ZVecPyDoc::doc_value_to_py(Doc &self, const std::string &field,
 
     // array datatypes
     case DataType::ARRAY_STRING:
-      return py::cast(self.get<std::vector<std::string>>(field));
+      return doc_field_to_py<std::vector<std::string>>(self, field);
     case DataType::ARRAY_INT32:
-      return py::cast(self.get<std::vector<int32_t>>(field));
+      return doc_field_to_py<std::vector<int32_t>>(self, field);
     case DataType::ARRAY_INT64:
-      return py::cast(self.get<std::vector<int64_t>>(field));
+      return doc_field_to_py<std::vector<int64_t>>(self, field);
     case DataType::ARRAY_UINT32:
-      return py::cast(self.get<std::vector<uint32_t>>(field));
+      return doc_field_to_py<std::vector<uint32_t>>(self, field);
     case DataType::ARRAY_UINT64:
-      return py::cast(self.get<std::vector<uint64_t>>(field));
+      return doc_field_to_py<std::vector<uint64_t>>(self, field);
     case DataType::ARRAY_FLOAT:
-      return py::cast(self.get<std::vector<float>>(field));
+      return doc_field_to_py<std::vector<float>>(self, field);
     case DataType::ARRAY_DOUBLE:
-      return py::cast(self.get<std::vector<double>>(field));
+      return doc_field_to_py<std::vector<double>>(self, field);
     case DataType::ARRAY_BOOL:
-      return py::cast(self.get<std::vector<bool>>(field));
+      return doc_field_to_py<std::vector<bool>>(self, field);
 
     // vector datatypes
     case DataType::VECTOR_INT8:
-      return py::cast(self.get<std::vector<int8_t>>(field));
+      return doc_field_to_py<std::vector<int8_t>>(self, field);
     case DataType::VECTOR_FP16: {
-      auto value = self.get<std::vector<ailego::Float16>>(field);
-      if (value.has_value()) {
-        std::vector<float> new_value;
-        new_value.reserve(value.value().size());
-        for (auto &item : value.value()) {
-          new_value.push_back(static_cast<float>(item));
-        }
-        return py::cast(new_value);
+      const auto *value =
+          doc_field_ref<std::vector<ailego::Float16>>(self, field);
+      if (!value) return py::none();
+      py::list result(value->size());
+      for (size_t i = 0; i < value->size(); ++i) {
+        result[i] = py::float_(static_cast<float>((*value)[i]));
       }
-      return py::none();
+      return result;
     }
     case DataType::VECTOR_FP32:
-      return py::cast(self.get<std::vector<float>>(field));
+      return doc_field_to_py<std::vector<float>>(self, field);
     case DataType::VECTOR_FP64:
-      return py::cast(self.get<std::vector<double>>(field));
+      return doc_field_to_py<std::vector<double>>(self, field);
     case DataType::SPARSE_VECTOR_FP16: {
-      auto vector = self.get<
+      const auto *vector = doc_field_ref<
           std::pair<std::vector<uint32_t>, std::vector<ailego::Float16>>>(
-          field);
-      if (!vector.has_value()) {
+          self, field);
+      if (!vector) {
         return py::none();
       }
       const auto &indices = vector->first;
@@ -297,9 +315,10 @@ py::object ZVecPyDoc::doc_value_to_py(Doc &self, const std::string &field,
       return d;
     }
     case DataType::SPARSE_VECTOR_FP32: {
-      auto vector =
-          self.get<std::pair<std::vector<uint32_t>, std::vector<float>>>(field);
-      if (!vector.has_value()) {
+      const auto *vector =
+          doc_field_ref<std::pair<std::vector<uint32_t>, std::vector<float>>>(
+              self, field);
+      if (!vector) {
         return py::none();
       }
       const auto &indices = vector->first;
