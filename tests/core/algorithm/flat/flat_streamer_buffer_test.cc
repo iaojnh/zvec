@@ -650,9 +650,6 @@ class FailingFlatSegment : public IndexStorage::Segment {
   size_t fetch(size_t offset, void *data, size_t length) const override {
     return segment_->fetch(offset, data, length);
   }
-  size_t read(size_t offset, const void **data, size_t length) override {
-    return segment_->read(offset, data, length);
-  }
   size_t read(size_t offset, IndexStorage::MemoryBlock &block,
               size_t length) override {
     return segment_->read(offset, block, length);

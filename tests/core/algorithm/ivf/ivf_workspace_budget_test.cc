@@ -3,10 +3,12 @@
 #include <array>
 #include <filesystem>
 #include <thread>
+#include <vector>
 #include <gtest/gtest.h>
 #include "ailego/algorithm/integer_quantizer.h"
 #include "ailego/algorithm/kmeans.h"
 #include "ailego/container/vector_array.h"
+#include "ailego/pattern/defer.h"
 #include "algorithm/ivf/ivf_dumper.h"
 #include "algorithm/ivf/ivf_entity.h"
 #include "algorithm/ivf/ivf_searcher_context.h"
@@ -230,11 +232,29 @@ TEST_F(IVFWorkspaceBudgetTest, ColumnFetchOwnsRowsAndPropagatesErrors) {
     context.mutable_result_heap().emplace(1000, 0.0f);
     EXPECT_NE(0, context.topk_to_result(0));
     EXPECT_TRUE(context.result().empty());
+    // Exhaust non-reclaimable capacity: otherwise workspace admission may
+    // legitimately evict a cached page and let this read succeed.
+    auto page_pool = storage->vec_buffer_pool();
+    ASSERT_NE(nullptr, page_pool);
+    const size_t page_count =
+        (std::filesystem::file_size(path) + ailego::kVectorPageSize - 1) /
+        ailego::kVectorPageSize;
+    std::vector<ailego::block_id_t> page_ids(page_count);
+    std::vector<char *> pages(page_count);
+    for (size_t i = 0; i < page_count; ++i) page_ids[i] = i;
+    ASSERT_TRUE(
+        page_pool->acquire_pages(page_ids.data(), page_count, pages.data()));
+    AILEGO_DEFER(
+        [&] { page_pool->release_pages(page_ids.data(), page_count); });
     ailego::MemoryReservation pressure;
     pressure.add(pool.capacity() - pool.used());
+    ASSERT_EQ(pool.capacity(), pool.used());
     IndexStorage::MemoryBlock rejected;
     EXPECT_EQ(IndexError_NoMemory, entity->get_vector_by_key(0, rejected));
     EXPECT_EQ(nullptr, rejected.data());
+    pressure.retain_at_most(0);
+    ASSERT_EQ(0, entity->get_vector_by_key(0, rejected));
+    EXPECT_EQ(0.0f, *static_cast<const float *>(rejected.data()));
   }
   std::filesystem::remove(path);
   EXPECT_EQ(0.0f, *static_cast<const float *>(first.data()));
@@ -267,9 +287,6 @@ class ScaleFaultSegment : public IndexStorage::Segment {
     if (failure || bytes != sizeof(params)) return 0;
     std::memcpy(out, &params, bytes);
     return bytes;
-  }
-  size_t read(size_t, const void **, size_t) override {
-    return 0;
   }
   size_t read(size_t, IndexStorage::MemoryBlock &, size_t) override {
     return 0;

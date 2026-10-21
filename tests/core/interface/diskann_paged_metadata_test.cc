@@ -50,19 +50,15 @@ class ObservedSegment : public IndexStorage::Segment {
     std::memcpy(out, bytes.data() + off, len);
     return len;
   }
-  size_t read(size_t off, const void **out, size_t len) override {
+  size_t read(size_t off, IndexStorage::MemoryBlock &out, size_t len) override {
+    out.reset();
     ++reads;
     if (fail || off > bytes.size() || len > bytes.size() - off) return 0;
-    *out = bytes.data() + off;
+    if (len != 0) {
+      out =
+          IndexStorage::MemoryBlock::MakeSharedView(bytes.data() + off, lease);
+    }
     return len;
-  }
-  size_t read(size_t off, IndexStorage::MemoryBlock &out, size_t len) override {
-    const void *data = nullptr;
-    const size_t size = read(off, &data, len);
-    if (size)
-      out = IndexStorage::MemoryBlock::MakeSharedView(const_cast<void *>(data),
-                                                      lease);
-    return size;
   }
   size_t write(size_t, const void *, size_t) override {
     return 0;

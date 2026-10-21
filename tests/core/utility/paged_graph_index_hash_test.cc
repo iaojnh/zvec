@@ -46,17 +46,14 @@ class HashSegment : public IndexStorage::Segment {
     std::memcpy(out, bytes_.data() + offset, bytes);
     return bytes;
   }
-  size_t read(size_t offset, const void **out, size_t bytes) override {
-    scratch.resize(bytes);
-    const size_t n = fetch(offset, scratch.data(), bytes);
-    *out = scratch.data();
-    return n;
-  }
   size_t read(size_t offset, IndexStorage::MemoryBlock &out,
               size_t bytes) override {
-    const void *data = nullptr;
-    const size_t n = read(offset, &data, bytes);
-    out.reset(const_cast<void *>(data));
+    out.reset();
+    scratch.resize(bytes);
+    const size_t n = fetch(offset, scratch.data(), bytes);
+    if (n != 0) {
+      out.reset(scratch.data());
+    }
     return n;
   }
   size_t write(size_t offset, const void *data, size_t bytes) override {

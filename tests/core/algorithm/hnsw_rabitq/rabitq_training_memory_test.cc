@@ -166,17 +166,17 @@ TEST_P(RabitqTrainingMemoryTest,
       auto segment = storage->get(RABITQ_CONVERTER_SEG_ID);
       ASSERT_NE(segment, nullptr);
       RabitqConverterHeader header{};
-      const void *data = nullptr;
-      ASSERT_EQ(segment->read(0, &data, sizeof(header)), sizeof(header));
-      std::memcpy(&header, data, sizeof(header));
+      IndexStorage::MemoryBlock data;
+      ASSERT_EQ(segment->read(0, data, sizeof(header)), sizeof(header));
+      std::memcpy(&header, data.data(), sizeof(header));
       ASSERT_EQ(header.num_clusters, expected.size());
       size_t offset = sizeof(header) +
                       header.num_clusters * header.padded_dim * sizeof(float);
       std::vector<float> actual(input->meta.dimension());
       for (const auto &centroid : expected) {
-        ASSERT_EQ(segment->read(offset, &data, input->meta.element_size()),
+        ASSERT_EQ(segment->read(offset, data, input->meta.element_size()),
                   input->meta.element_size());
-        std::memcpy(actual.data(), data, input->meta.element_size());
+        std::memcpy(actual.data(), data.data(), input->meta.element_size());
         EXPECT_EQ(std::memcmp(actual.data(), centroid.feature(),
                               input->meta.element_size()),
                   0);

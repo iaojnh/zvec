@@ -32,9 +32,6 @@ class FetchSegment : public IndexStorage::Segment {
     for (size_t i = 0; i < bytes; ++i) data[i] = (offset + i) % 251;
     return short_read ? bytes - 1 : bytes;
   }
-  size_t read(size_t, const void **, size_t) override {
-    return 0;
-  }
   size_t read(size_t, IndexStorage::MemoryBlock &, size_t) override {
     return 0;
   }

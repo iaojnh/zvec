@@ -80,11 +80,8 @@ class CentroidSegment : public IndexStorage::Segment {
     std::memcpy(out, bytes.data() + offset, n);
     return n;
   }
-  size_t read(size_t, const void **, size_t) override {
-    ADD_FAILURE() << "Centroid load must not request a whole pointer view";
-    return 0;
-  }
   size_t read(size_t, IndexStorage::MemoryBlock &, size_t) override {
+    ADD_FAILURE() << "Centroid load must not request a whole pointer view";
     return 0;
   }
   size_t write(size_t, const void *, size_t) override {

@@ -46,11 +46,6 @@ class WatchedSegment : public IndexStorage::Segment {
     *bytes_read += size;
     return fail ? 0 : source_->fetch(offset, out, size);
   }
-  size_t read(size_t offset, const void **out, size_t size) override {
-    max_read = std::max(max_read, size);
-    *bytes_read += size;
-    return fail ? 0 : source_->read(offset, out, size);
-  }
   size_t read(size_t offset, IndexStorage::MemoryBlock &out,
               size_t size) override {
     max_read = std::max(max_read, size);

@@ -87,9 +87,9 @@ TEST_F(PagedBuildBufferTest, ConcurrentDisjointWritesAndStreamingDump) {
   std::array<uint8_t, kChunk> row{};
   for (size_t offset = 0; offset < kBytes; offset += kChunk) {
     const size_t bytes = std::min(row.size(), kBytes - offset);
-    const void *stored = nullptr;
-    ASSERT_EQ(segment->read(offset, &stored, bytes), bytes);
-    std::memcpy(row.data(), stored, bytes);
+    IndexStorage::MemoryBlock stored;
+    ASSERT_EQ(segment->read(offset, stored, bytes), bytes);
+    std::memcpy(row.data(), stored.data(), bytes);
     for (size_t i = 0; i < bytes; ++i)
       ASSERT_EQ(row[i], (offset + i) % 251) << "after dump at " << offset + i;
   }
