@@ -50,7 +50,7 @@ TEST_F(FlatWorkspaceBudgetTest, BatchCapacityIsRetainedAndGrowthIsRejected) {
   EXPECT_TRUE(context.result(2047).empty());
 }
 
-TEST_F(FlatWorkspaceBudgetTest, ProviderTransposeIsLazyChargedAndOwned) {
+TEST_F(FlatWorkspaceBudgetTest, ProviderRowCopyIsLazyChargedAndOwned) {
   const std::string path = "flat_provider_workspace.index";
   ASSERT_FALSE(std::filesystem::exists(path));
   AILEGO_DEFER([&] { std::filesystem::remove(path); });
@@ -102,7 +102,7 @@ TEST_F(FlatWorkspaceBudgetTest, ProviderTransposeIsLazyChargedAndOwned) {
       ASSERT_EQ(1u, saved.size());
       ASSERT_EQ(2u, saved[0].docs().size());
       EXPECT_EQ(100u, saved[0].docs()[0].key());
-      // A later scan overwrites the provider transpose, but not saved results.
+      // A later scan must not overwrite the independently owned results.
       std::fill(queries.begin(), queries.end(), 63.0f);
       ASSERT_EQ(0, searcher->search_impl(queries.data(), query_meta, context));
       EXPECT_FLOAT_EQ(
@@ -113,23 +113,29 @@ TEST_F(FlatWorkspaceBudgetTest, ProviderTransposeIsLazyChargedAndOwned) {
     const size_t before = pool_.used();
     ailego::MemoryReservation pressure;
     pressure.add(pool_.capacity() - pool_.used());
+    // Both layouts export an owned row: mmap views cannot survive close().
+    // Column-major rows no longer retain a whole transposed batch.
+    IndexStorage::MemoryBlock rejected;
+    EXPECT_EQ(IndexError_NoMemory, provider->get_vector(100, rejected));
+    EXPECT_EQ(nullptr, rejected.data());
+    EXPECT_EQ(nullptr, provider->get_vector(100));
+    auto failed = provider->create_iterator();
+    ASSERT_NE(nullptr, failed);
     if (order == IndexMeta::MO_COLUMN) {
-      EXPECT_EQ(nullptr, provider->get_vector(100));
-      auto failed = provider->create_iterator();
-      ASSERT_NE(nullptr, failed);
       EXPECT_FALSE(failed->is_valid());
       EXPECT_EQ(IndexError_NoMemory, failed->status());
     } else {
-      ASSERT_NE(nullptr, provider->get_vector(100));
+      // An iterator's borrowed mmap view still needs no transpose workspace.
+      EXPECT_TRUE(failed->is_valid());
+      EXPECT_EQ(0, failed->status());
     }
+    failed.reset();
     pressure.retain_at_most(0);
     const auto *row = static_cast<const float *>(provider->get_vector(107));
     ASSERT_NE(nullptr, row);
     EXPECT_FLOAT_EQ(7.0f, row[1535]);
-    if (order == IndexMeta::MO_COLUMN)
-      EXPECT_GE(pool_.used(), before + 32 * 1536 * sizeof(float));
-    else
-      EXPECT_EQ(before, pool_.used());
+    EXPECT_GE(pool_.used(), before + 1536 * sizeof(float));
+    EXPECT_LT(pool_.used(), before + 32 * 1536 * sizeof(float));
     IndexStorage::MemoryBlock owned;
     ASSERT_EQ(0, provider->get_vector(107, owned));
     provider.reset();
