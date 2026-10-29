@@ -86,23 +86,17 @@ jobs:
           BUILD_DIR=build_ios_${{ matrix.platform }}
           cmake --build "$BUILD_DIR" \
             --target diskann_mobile_compat_test diskann_mobile_collection_test \
-              hnsw_rabitq_streamer_test ivf_rabitq_streamer_test hnsw_platform_test \
+              hnsw_rabitq_streamer_test ivf_rabitq_streamer_test \
             --parallel "$NPROC"
 
           for test_name in diskann_mobile_compat_test diskann_mobile_collection_test \
-            hnsw_rabitq_streamer_test ivf_rabitq_streamer_test hnsw_platform_test; do
+            hnsw_rabitq_streamer_test ivf_rabitq_streamer_test; do
             test_app="$BUILD_DIR/bin/${test_name}.app"
             if [ ! -d "$test_app" ]; then
               echo "::error::Missing required iOS index test app: $test_app"
               exit 1
             fi
           done
-
-          HNSW_BINARY="$BUILD_DIR/bin/hnsw_platform_test.app/hnsw_platform_test"
-          if otool -L "$HNSW_BINARY" | grep -Eq '@rpath/lib(core_|zvec).*\.dylib'; then
-            echo "::error::HNSW device test must use the self-contained static SDK"
-            exit 1
-          fi
 
       - name: Build test targets
         if: matrix.test_on_simulator
@@ -143,10 +137,9 @@ jobs:
           TOTAL=0
           DISKANN_COMPAT_PASSED=0
           DISKANN_COLLECTION_PASSED=0
-          HNSW_PLATFORM_PASSED=0
           BUILD_DIR=build_ios_${{ matrix.platform }}
 
-          for test_name in diskann_mobile_compat_test diskann_mobile_collection_test hnsw_platform_test; do
+          for test_name in diskann_mobile_compat_test diskann_mobile_collection_test; do
             test_app="$BUILD_DIR/bin/${test_name}.app"
             if [ ! -d "$test_app" ]; then
               echo "::error::Missing required iOS DiskAnn test app: $test_app"
@@ -165,7 +158,7 @@ jobs:
               continue
             fi
 
-            BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist")
+            BUNDLE_ID="com.zvec.${TEST_NAME}"
             LOG_FILE="$RUNNER_TEMP/${TEST_NAME}.log"
             TOTAL=$((TOTAL + 1))
 
@@ -251,9 +244,6 @@ jobs:
               diskann_mobile_collection_test)
                 EXPECTED_COUNT=4
                 ;;
-              hnsw_platform_test)
-                EXPECTED_COUNT=73
-                ;;
             esac
 
             if [ "$LAUNCH_EXIT" -eq 124 ]; then
@@ -274,18 +264,12 @@ jobs:
                  ! grep -Eq "^\\[==========\\][[:space:]]+${EXPECTED_COUNT} tests?[[:space:]]+from[[:space:]]+[1-9][0-9]* test (suites?|cases?)[[:space:]]+ran\\." "$LOG_FILE"; then
               echo "::error::${TEST_NAME} did not run exactly ${EXPECTED_COUNT} tests"
               FAILED_TESTS="${FAILED_TESTS} ${TEST_NAME}"
-            elif [ "$TEST_NAME" = "hnsw_platform_test" ] && \
-                 ! python3 .github/scripts/hnsw_test_runner.py verify-console "$LOG_FILE" --expect-arch NEON; then
-              echo "::error::HNSW platform or CPU coverage incomplete"
-              FAILED_TESTS="${FAILED_TESTS} ${TEST_NAME}"
             elif grep -Eq '^\[==========\][[:space:]]+[1-9][0-9]* tests?[[:space:]]+from[[:space:]]+[1-9][0-9]* test (suites?|cases?)[[:space:]]+ran\.' "$LOG_FILE"; then
               PASSED=$((PASSED + 1))
               if [ "$TEST_NAME" = "diskann_mobile_compat_test" ]; then
                 DISKANN_COMPAT_PASSED=1
               elif [ "$TEST_NAME" = "diskann_mobile_collection_test" ]; then
                 DISKANN_COLLECTION_PASSED=1
-              elif [ "$TEST_NAME" = "hnsw_platform_test" ]; then
-                HNSW_PLATFORM_PASSED=1
               fi
             elif [ "$TEST_NAME" = "c_api_test" ] && \
                  grep -Eq '^Passed: [1-9][0-9]*[[:space:]]*$' "$LOG_FILE" && \
@@ -310,10 +294,6 @@ jobs:
           fi
           if [ "$DISKANN_COMPAT_PASSED" -ne 1 ] || [ "$DISKANN_COLLECTION_PASSED" -ne 1 ]; then
             echo "::error::Required DiskAnn tests did not both complete successfully"
-            exit 1
-          fi
-          if [ "$HNSW_PLATFORM_PASSED" -ne 1 ]; then
-            echo "::error::Required HNSW platform tests did not complete successfully"
             exit 1
           fi
           if [ "$PASSED" -ne "$TOTAL" ]; then

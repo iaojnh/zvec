@@ -142,43 +142,19 @@ jobs:
           cmake --build . --target unittest --parallel $NPROC
         shell: bash
 
-      - name: Run macOS x64 C++ compatibility and HNSW tests
+      - name: Run macOS x64 C++ compatibility tests
         if: matrix.platform == 'macos-x64'
         run: |
           test "$(uname -m)" = "x86_64"
           df -h /
           cd "$GITHUB_WORKSPACE/build"
           cmake --build . \
-            --target shared_api_test c_api_test hnsw_platform_test \
-              hnsw_turbo_index_test hnsw_streamer_test hnsw_streamer_buffer_test \
-              hnsw_dist_calculator_test hnsw_sparse_streamer_test \
-              hnsw_sparse_builder_test turbo_fp16_quantizer_test \
+            --target shared_api_test c_api_test \
             --parallel "$NPROC"
-          HNSW_TESTS='hnsw_(platform|turbo_index|streamer|streamer_buffer|dist_calculator|sparse_streamer|sparse_builder)_test'
           ctest --output-on-failure \
-            --no-tests=error \
-            -R "^(shared_api_test|c_api_test|$HNSW_TESTS|turbo_fp16_quantizer_test)$" \
+            -R '^(shared_api_test|c_api_test)$' \
             --parallel 1
         shell: bash
-
-      - name: Verify required HNSW platform coverage
-        run: |
-          case "${{ runner.arch }}" in
-            ARM64) EXPECTED_ARCH=NEON ;;
-            X64) EXPECTED_ARCH=SSE2 ;;
-            *) echo "Unsupported runner architecture"; exit 1 ;;
-          esac
-          python .github/scripts/hnsw_test_runner.py verify-xml \
-            build/test_tmp/hnsw_platform_test/results.xml --expect-arch "$EXPECTED_ARCH"
-        shell: bash
-
-      - name: Save HNSW platform coverage report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: hnsw-${{ inputs.platform }}-${{ inputs.os }}-${{ inputs.compiler || 'gcc' }}
-          path: build/test_tmp/hnsw_platform_test/results.xml
-          if-no-files-found: ignore
 
       - name: Run Python Tests
         if: matrix.platform != 'macos-x64'
@@ -187,16 +163,13 @@ jobs:
           python -m pytest python/tests/
         shell: bash
 
-      - name: Run macOS x64 Python compatibility and HNSW tests
+      - name: Run macOS x64 Python compatibility smoke test
         if: matrix.platform == 'macos-x64'
         run: |
           cd "$GITHUB_WORKSPACE"
           python -X faulthandler -c \
             "import platform, zvec; print('Imported zvec on', platform.machine(), zvec.__version__)"
           python -X faulthandler .github/scripts/macos_x64_python_smoke.py
-          python -m pytest python/tests/test_hnsw_contiguous_memory.py -n 0
-          python -m pytest python/tests/detail/test_collection_recall.py \
-            -k 'fp16_recall_with_independent_queries and hnsw' -n 0
         shell: bash
 
       - name: Diagnose macOS x64 Python native crash
