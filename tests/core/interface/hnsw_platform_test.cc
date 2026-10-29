@@ -34,6 +34,7 @@
 #include <zvec/turbo/turbo.h>
 #include "algorithm/hnsw/hnsw_context.h"
 #include "tests/test_util.h"
+#include "fp16_test_util.h"
 
 namespace zvec::core_interface {
 namespace {
@@ -195,10 +196,14 @@ class HnswPlatformTest : public testing::TestWithParam<Case> {
             EXPECT_TRUE(seen.insert(hit.key()).second);
             if (filtered) EXPECT_NE(0U, hit.key() % 3);
             ASSERT_TRUE(std::isfinite(hit.score()));
-            const double tolerance =
+            double tolerance =
                 GetParam().metric == MetricType::kCosine
                     ? 2e-3
                     : 1e-5 * std::max(1.0, std::abs(expected[hit.key()]));
+            if (ip && GetParam().format == Format::NativeFp16) {
+              tolerance = std::max(tolerance, test_util::NativeFp16DotTolerance(
+                                                  vectors_[hit.key()], query));
+            }
             EXPECT_NEAR(expected[hit.key()], hit.score(), tolerance);
             if (rank) {
               const auto previous = result.doc_list_[rank - 1].score();

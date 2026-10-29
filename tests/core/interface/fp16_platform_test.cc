@@ -25,6 +25,7 @@
 #include <zvec/core/interface/index_factory.h>
 #include <zvec/core/interface/index_param_builders.h>
 #include "tests/test_util.h"
+#include "fp16_test_util.h"
 
 namespace zvec::core_interface {
 namespace {
@@ -185,10 +186,14 @@ class Fp16PlatformTest : public testing::TestWithParam<Case> {
             EXPECT_TRUE(seen.insert(hit.key()).second);
             if (filtered) EXPECT_NE(0U, hit.key() % 3);
             ASSERT_TRUE(std::isfinite(hit.score()));
-            const double tolerance =
+            double tolerance =
                 GetParam().metric == MetricType::kCosine
                     ? 2e-3
                     : 1e-4 * std::max(1.0, std::abs(expected[hit.key()]));
+            if (ip && !GetParam().quantized) {
+              tolerance = std::max(tolerance, test_util::NativeFp16DotTolerance(
+                                                  vectors_[hit.key()], query));
+            }
             EXPECT_NEAR(expected[hit.key()], hit.score(), tolerance);
             if (rank) {
               const auto previous = result.doc_list_[rank - 1].score();
