@@ -795,6 +795,13 @@ function(_target_link_libraries _NAME)
         list(APPEND LINK_LIBS ${LIB})
         list(APPEND ANDROID_WHOLEARCHIVE_OPTS
              -Wl,--whole-archive,$<TARGET_FILE:${LIB}>,--no-whole-archive)
+      elseif(IOS)
+        # Mobile SDKs already force-load their archives through link options.
+        # Use the same spelling so CMake deduplicates the option instead of
+        # loading an ALWAYS_LINK dependency twice via the library list.
+        list(APPEND LINK_LIBS ${LIB})
+        list(APPEND IOS_WHOLEARCHIVE_OPTS
+             -Wl,-force_load,$<TARGET_FILE:${LIB}>)
       elseif(NOT ${CMAKE_SYSTEM_NAME} MATCHES "Darwin" AND NOT ${CMAKE_SYSTEM_NAME} MATCHES "iOS")
         list(APPEND LINK_LIBS -Wl,--whole-archive ${LIB} -Wl,--no-whole-archive)
       else()
@@ -823,6 +830,9 @@ function(_target_link_libraries _NAME)
   target_link_libraries(${_NAME} ${LINK_LIBS})
   if(ANDROID_WHOLEARCHIVE_OPTS)
     target_link_options(${_NAME} PRIVATE ${ANDROID_WHOLEARCHIVE_OPTS})
+  endif()
+  if(IOS_WHOLEARCHIVE_OPTS)
+    target_link_options(${_NAME} PRIVATE ${IOS_WHOLEARCHIVE_OPTS})
   endif()
   if(MSVC_WHOLEARCHIVE_OPTS)
     target_link_options(${_NAME} PRIVATE ${MSVC_WHOLEARCHIVE_OPTS})
