@@ -227,6 +227,7 @@ class ZVEC_CORE_API BaseIndexQueryParam {
 
   uint32_t topk = 10;
   bool fetch_vector = false;
+  // The predicate can be reused across searches; contexts must copy it.
   std::shared_ptr<IndexFilter> filter = nullptr;
   std::shared_ptr<std::vector<uint64_t>> bf_pks = nullptr;
   float radius = 0.0f;

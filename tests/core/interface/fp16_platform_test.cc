@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -134,58 +135,73 @@ class Fp16PlatformTest : public testing::TestWithParam<Case> {
 
   void check(Index *index) const {
     const bool ip = GetParam().metric == MetricType::kInnerProduct;
-    for (const auto &query : queries_) {
-      std::vector<double> expected, ordered;
-      for (const auto &row : vectors_) expected.push_back(score(row, query));
-      ordered = expected;
-      std::sort(ordered.begin(), ordered.end(),
-                [ip](double a, double b) { return ip ? a > b : a < b; });
-      const std::vector<ailego::Float16> native(query.begin(), query.end());
-      const void *data = GetParam().quantized
-                             ? static_cast<const void *>(query.data())
-                             : static_cast<const void *>(native.data());
-      for (bool linear : {true, false}) {
-        BaseIndexQueryParam::Pointer params;
-        if (GetParam().index == IndexType::kFlat) {
-          params = FlatQueryParamBuilder().with_topk(kTopK).build();
-        } else if (GetParam().index == IndexType::kIVF) {
-          params =
-              IVFQueryParamBuilder().with_topk(kTopK).with_nprobe(4).build();
-        } else {
-          auto diskann = std::make_shared<DiskAnnQueryParam>();
-          diskann->topk = kTopK;
-          diskann->list_size = 256;
-          params = diskann;
-        }
-        params->is_linear = linear;
-        SCOPED_TRACE(testing::Message() << "linear=" << linear);
-        SearchResult result;
-        ASSERT_EQ(
-            0, index->search(VectorData{DenseVector{data}}, params, &result));
-        ASSERT_EQ(kTopK, result.doc_list_.size());
-        std::unordered_set<uint64_t> seen;
-        size_t relevant = 0;
-        for (size_t rank = 0; rank < result.doc_list_.size(); ++rank) {
-          const auto &hit = result.doc_list_[rank];
-          ASSERT_LT(hit.key(), kCount);
-          EXPECT_TRUE(seen.insert(hit.key()).second);
-          ASSERT_TRUE(std::isfinite(hit.score()));
-          const double tolerance =
-              GetParam().metric == MetricType::kCosine
-                  ? 2e-3
-                  : 1e-4 * std::max(1.0, std::abs(expected[hit.key()]));
-          EXPECT_NEAR(expected[hit.key()], hit.score(), tolerance);
-          if (rank) {
-            const auto previous = result.doc_list_[rank - 1].score();
-            EXPECT_TRUE(ip ? previous >= hit.score() : previous <= hit.score());
+    for (bool filtered : {false, true, false}) {
+      auto filter = std::make_shared<IndexFilter>();
+      const std::array<uint64_t, 8> excluded = {{0, 3, 6, 9, 12, 15, 18, 21}};
+      filter->set([excluded](uint64_t key) {
+        return std::find(excluded.begin(), excluded.end(), key % 24) !=
+               excluded.end();
+      });
+      for (const auto &query : queries_) {
+        std::vector<double> expected, ordered;
+        for (const auto &row : vectors_) expected.push_back(score(row, query));
+        for (uint32_t key = 0; key < kCount; ++key)
+          if (!filtered || key % 3 != 0) ordered.push_back(expected[key]);
+        std::sort(ordered.begin(), ordered.end(),
+                  [ip](double a, double b) { return ip ? a > b : a < b; });
+        const std::vector<ailego::Float16> native(query.begin(), query.end());
+        const void *data = GetParam().quantized
+                               ? static_cast<const void *>(query.data())
+                               : static_cast<const void *>(native.data());
+        for (bool linear : {true, false}) {
+          BaseIndexQueryParam::Pointer params;
+          if (GetParam().index == IndexType::kFlat) {
+            params = FlatQueryParamBuilder().with_topk(kTopK).build();
+          } else if (GetParam().index == IndexType::kIVF) {
+            params =
+                IVFQueryParamBuilder().with_topk(kTopK).with_nprobe(4).build();
+          } else {
+            auto diskann = std::make_shared<DiskAnnQueryParam>();
+            diskann->topk = kTopK;
+            diskann->list_size = 256;
+            params = diskann;
           }
-          relevant +=
-              ip ? expected[hit.key()] >= ordered[kTopK - 1] - tolerance
-                 : expected[hit.key()] <= ordered[kTopK - 1] + tolerance;
+          params->is_linear = linear;
+          params->filter = filtered ? filter : nullptr;
+          SCOPED_TRACE(testing::Message()
+                       << "linear=" << linear << " filtered=" << filtered);
+          SearchResult result;
+          ASSERT_EQ(
+              0, index->search(VectorData{DenseVector{data}}, params, &result));
+          ASSERT_TRUE(filter->is_valid())
+              << "Search consumed the caller's filter";
+          ASSERT_EQ(kTopK, result.doc_list_.size());
+          std::unordered_set<uint64_t> seen;
+          size_t relevant = 0;
+          for (size_t rank = 0; rank < result.doc_list_.size(); ++rank) {
+            const auto &hit = result.doc_list_[rank];
+            ASSERT_LT(hit.key(), kCount);
+            EXPECT_TRUE(seen.insert(hit.key()).second);
+            if (filtered) EXPECT_NE(0U, hit.key() % 3);
+            ASSERT_TRUE(std::isfinite(hit.score()));
+            const double tolerance =
+                GetParam().metric == MetricType::kCosine
+                    ? 2e-3
+                    : 1e-4 * std::max(1.0, std::abs(expected[hit.key()]));
+            EXPECT_NEAR(expected[hit.key()], hit.score(), tolerance);
+            if (rank) {
+              const auto previous = result.doc_list_[rank - 1].score();
+              EXPECT_TRUE(ip ? previous >= hit.score()
+                             : previous <= hit.score());
+            }
+            relevant +=
+                ip ? expected[hit.key()] >= ordered[kTopK - 1] - tolerance
+                   : expected[hit.key()] <= ordered[kTopK - 1] + tolerance;
+          }
+          // All IVF buckets are probed. Only DiskANN's graph is approximate.
+          const bool exact = linear || GetParam().index != IndexType::kDiskAnn;
+          EXPECT_GE(relevant, exact ? kTopK : 9U);
         }
-        // All IVF buckets are probed. Only DiskANN's graph is approximate.
-        const bool exact = linear || GetParam().index != IndexType::kDiskAnn;
-        EXPECT_GE(relevant, exact ? kTopK : 9U);
       }
     }
     if (GetParam().index == IndexType::kDiskAnn &&

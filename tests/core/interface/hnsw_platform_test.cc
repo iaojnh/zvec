@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -149,7 +150,13 @@ class HnswPlatformTest : public testing::TestWithParam<Case> {
     ASSERT_GT(index->get_doc_count(), hnsw->get_bruteforce_threshold());
     for (bool filtered : {false, true, false}) {
       auto filter = std::make_shared<IndexFilter>();
-      filter->set([](uint64_t key) { return key % 3 == 0; });
+      // A heap-backed callable is moved out even by libc++; small captureless
+      // lambdas may remain callable after a move and hide query reuse bugs.
+      const std::array<uint64_t, 8> excluded = {{0, 3, 6, 9, 12, 15, 18, 21}};
+      filter->set([excluded](uint64_t key) {
+        return std::find(excluded.begin(), excluded.end(), key % 24) !=
+               excluded.end();
+      });
       for (const auto &query : queries_) {
         std::vector<double> expected(kCount), ordered;
         for (uint32_t key = 0; key < kCount; ++key) {
@@ -176,6 +183,8 @@ class HnswPlatformTest : public testing::TestWithParam<Case> {
           SearchResult result;
           ASSERT_EQ(0, index->search(VectorData{DenseVector{query_data}},
                                      params, &result));
+          ASSERT_TRUE(filter->is_valid())
+              << "Search consumed the caller's filter";
           ASSERT_EQ(kTopK, result.doc_list_.size());
           std::unordered_set<uint64_t> seen;
           size_t relevant = 0;

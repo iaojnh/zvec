@@ -111,7 +111,7 @@ int VamanaIndex::_prepare_for_search(
   context->set_topk(vamana_search_param->topk);
   context->set_fetch_vector(vamana_search_param->fetch_vector);
   if (vamana_search_param->filter && vamana_search_param->filter->is_valid()) {
-    context->set_filter(std::move(*vamana_search_param->filter));
+    context->set_filter(*vamana_search_param->filter);
   } else {
     context->reset_filter();
   }
