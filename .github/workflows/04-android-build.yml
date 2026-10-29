@@ -119,7 +119,8 @@ jobs:
             echo "Building focused ARM64 index tests and public C++ examples..."
             cmake --build "$BUILD_DIR" \
               --target diskann_mobile_compat_test diskann_mobile_collection_test \
-                hnsw_rabitq_streamer_test ivf_rabitq_streamer_test zvec_cpp_examples \
+                hnsw_rabitq_streamer_test ivf_rabitq_streamer_test \
+                hnsw_platform_test fp16_platform_test zvec_cpp_examples \
               --parallel
             exit 0
           fi

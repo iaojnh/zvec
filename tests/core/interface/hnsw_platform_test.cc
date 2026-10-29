@@ -263,6 +263,18 @@ TEST(HnswPlatformDispatch, Fp16ExercisesEveryAvailableArchitecture) {
   std::ostringstream coverage;
   for (const auto &arch : arches)
     coverage << arch.name << '=' << arch.enabled << ';';
+  using RawDistance = void (*)(const void *, const void *, size_t, float *);
+  const auto neon_raw = turbo::get_distance_kernels(
+      turbo::MetricType::kCosine, turbo::DataType::kFp16,
+      turbo::QuantizeType::kRaw, turbo::CpuArchType::kNEON);
+  const auto neon_quantized = turbo::get_distance_kernels(
+      turbo::MetricType::kCosine, turbo::DataType::kFp16,
+      turbo::QuantizeType::kFp16, turbo::CpuArchType::kNEON);
+  const bool native_neon = neon_raw.dist && neon_quantized.dist &&
+                           *neon_raw.dist.target<RawDistance>() !=
+                               *neon_quantized.dist.target<RawDistance>();
+  coverage << "NEON_BASELINE=" << static_cast<bool>(neon_raw.dist)
+           << ";NEON_FP16=" << native_neon << ';';
   coverage << "F16C=" << flags.F16C << ";FP16=" << flags.FP16 << ';';
   RecordProperty("fp16_cpu_architectures", coverage.str());
   std::cout << "FP16 architecture coverage: " << coverage.str() << std::endl;
@@ -271,78 +283,98 @@ TEST(HnswPlatformDispatch, Fp16ExercisesEveryAvailableArchitecture) {
       {turbo::MetricType::kSquaredEuclidean, "SquaredEuclidean"},
       {turbo::MetricType::kInnerProduct, "InnerProduct"},
       {turbo::MetricType::kCosine, "Cosine"}};
-  using RawDistance = void (*)(const void *, const void *, size_t, float *);
   for (const auto &metric : metrics) {
-    auto automatic = turbo::get_distance_kernels(
-        metric.first, turbo::DataType::kFp16, turbo::QuantizeType::kFp16);
-    ASSERT_TRUE(automatic.dist);
-    ASSERT_NE(nullptr, automatic.dist.target<RawDistance>());
-    bool checked_auto = false;
-    for (const auto &arch : arches) {
-      SCOPED_TRACE(arch.name);
-      auto kernels =
-          turbo::get_distance_kernels(metric.first, turbo::DataType::kFp16,
-                                      turbo::QuantizeType::kFp16, arch.type);
-      ASSERT_EQ(arch.enabled, static_cast<bool>(kernels.dist));
-      ASSERT_EQ(arch.enabled, static_cast<bool>(kernels.batch));
-      if (!arch.enabled) continue;
-      if (!checked_auto) {
-        ASSERT_NE(nullptr, kernels.dist.target<RawDistance>());
-        EXPECT_EQ(*kernels.dist.target<RawDistance>(),
-                  *automatic.dist.target<RawDistance>());
-        checked_auto = true;
-      }
-      for (size_t dim : {1, 7, 8, 17, 32, 65}) {
-        auto quantizer = core::IndexFactory::CreateQuantizer("Fp16Quantizer");
-        ASSERT_NE(nullptr, quantizer);
-        core::IndexMeta meta(core::IndexMeta::DT_FP32, dim);
-        meta.set_metric(metric.second, 0, ailego::Params());
-        ASSERT_EQ(0, quantizer->init(meta, {}));
-        std::vector<std::string> codes(14);
-        for (size_t row = 0; row < codes.size(); ++row) {
-          std::vector<float> values(dim);
-          for (size_t d = 0; d < dim; ++d) {
-            values[d] =
-                (static_cast<int>((row * 31 + d * 17) % 29) - 14) / 32.0f;
-          }
-          core::IndexQueryMeta output_meta;
-          ASSERT_EQ(0, quantizer->quantize(
-                           values.data(),
-                           core::IndexQueryMeta(core::IndexMeta::DT_FP32, dim),
-                           &codes[row], &output_meta));
+    for (const auto encoding :
+         {turbo::QuantizeType::kFp16, turbo::QuantizeType::kRaw}) {
+      // Raw storage has specialized L2/cosine dispatch; IP uses Fp16Quantizer.
+      if (encoding == turbo::QuantizeType::kRaw &&
+          metric.first == turbo::MetricType::kInnerProduct)
+        continue;
+      auto automatic = turbo::get_distance_kernels(
+          metric.first, turbo::DataType::kFp16, encoding);
+      ASSERT_TRUE(automatic.dist);
+      ASSERT_NE(nullptr, automatic.dist.target<RawDistance>());
+      bool checked_auto = false;
+      for (const auto &arch : arches) {
+        SCOPED_TRACE(arch.name);
+        auto kernels = turbo::get_distance_kernels(
+            metric.first, turbo::DataType::kFp16, encoding, arch.type);
+        bool enabled = arch.enabled;
+        if (encoding == turbo::QuantizeType::kRaw &&
+            metric.first == turbo::MetricType::kSquaredEuclidean) {
+          enabled = arch.type == turbo::CpuArchType::kScalar ||
+                    (arch.type == turbo::CpuArchType::kNEON && flags.NEON) ||
+                    (arch.type == turbo::CpuArchType::kAVX512 && arch.enabled &&
+                     flags.AVX512DQ);
         }
-        std::vector<const void *> rows;
-        for (size_t row = 1; row < codes.size(); ++row)
-          rows.push_back(codes[row].data());
-        auto expected_score = [&](size_t row) {
-          double dot = 0, squared = 0;
-          for (size_t d = 0; d < dim; ++d) {
-            uint16_t a, b;
-            std::memcpy(&a, codes[row + 1].data() + d * sizeof(a), sizeof(a));
-            std::memcpy(&b, codes[0].data() + d * sizeof(b), sizeof(b));
-            const double x = ailego::FloatHelper::ToFP32(a),
-                         y = ailego::FloatHelper::ToFP32(b);
-            dot += x * y;
-            squared += (x - y) * (x - y);
-          }
-          return metric.first == turbo::MetricType::kSquaredEuclidean ? squared
-                 : metric.first == turbo::MetricType::kCosine         ? 1 - dot
-                                                                      : -dot;
-        };
-        for (size_t count : {1, 11, 12, 13}) {
-          std::vector<float> actual(count);
-          kernels.batch(rows.data(), codes[0].data(), count, dim, actual.data(),
-                        nullptr);
-          for (size_t row = 0; row < count; ++row) {
-            float single = 0;
-            kernels.dist(rows[row], codes[0].data(), dim, &single);
-            const double expected = expected_score(row);
-            const double tolerance =
-                metric.first == turbo::MetricType::kCosine
-                    ? 2e-3
-                    : 1e-5 * std::max(1.0, std::abs(expected));
-            EXPECT_NEAR(expected, single, tolerance);
-            EXPECT_NEAR(expected, actual[row], tolerance);
+        ASSERT_EQ(enabled, static_cast<bool>(kernels.dist));
+        ASSERT_EQ(enabled, static_cast<bool>(kernels.batch));
+        if (!enabled) continue;
+        if (!checked_auto) {
+          ASSERT_NE(nullptr, kernels.dist.target<RawDistance>());
+          EXPECT_EQ(*kernels.dist.target<RawDistance>(),
+                    *automatic.dist.target<RawDistance>());
+          checked_auto = true;
+        }
+        for (size_t dim : {1, 7, 8, 17, 32, 65}) {
+          for (float scale : {1.0f, 1.0f / 65536, 32768.0f}) {
+            auto quantizer =
+                core::IndexFactory::CreateQuantizer("Fp16Quantizer");
+            ASSERT_NE(nullptr, quantizer);
+            core::IndexMeta meta(core::IndexMeta::DT_FP32, dim);
+            meta.set_metric(metric.second, 0, ailego::Params());
+            ASSERT_EQ(0, quantizer->init(meta, {}));
+            std::vector<std::string> codes(14);
+            for (size_t row = 0; row < codes.size(); ++row) {
+              std::vector<float> values(dim);
+              for (size_t d = 0; d < dim; ++d) {
+                values[d] = scale *
+                            (static_cast<int>((row * 31 + d * 17) % 29) - 14) /
+                            32.0f;
+              }
+              core::IndexQueryMeta output_meta;
+              ASSERT_EQ(0,
+                        quantizer->quantize(
+                            values.data(),
+                            core::IndexQueryMeta(core::IndexMeta::DT_FP32, dim),
+                            &codes[row], &output_meta));
+            }
+            std::vector<const void *> rows;
+            for (size_t row = 1; row < codes.size(); ++row)
+              rows.push_back(codes[row].data());
+            auto expected_score = [&](size_t row) {
+              double dot = 0, squared = 0;
+              for (size_t d = 0; d < dim; ++d) {
+                uint16_t a, b;
+                std::memcpy(&a, codes[row + 1].data() + d * sizeof(a),
+                            sizeof(a));
+                std::memcpy(&b, codes[0].data() + d * sizeof(b), sizeof(b));
+                const double x = ailego::FloatHelper::ToFP32(a),
+                             y = ailego::FloatHelper::ToFP32(b);
+                dot += x * y;
+                squared += (x - y) * (x - y);
+              }
+              return metric.first == turbo::MetricType::kSquaredEuclidean
+                         ? squared
+                     : metric.first == turbo::MetricType::kCosine ? 1 - dot
+                                                                  : -dot;
+            };
+            for (size_t count : {1, 11, 12, 13}) {
+              std::vector<float> actual(count);
+              kernels.batch(rows.data(), codes[0].data(), count, dim,
+                            actual.data(), nullptr);
+              for (size_t row = 0; row < count; ++row) {
+                float single = 0;
+                kernels.dist(rows[row], codes[0].data(), dim, &single);
+                const double expected = expected_score(row);
+                const double tolerance =
+                    metric.first == turbo::MetricType::kCosine
+                        ? 2e-3
+                        : 1e-5 * std::max(1e-12, std::abs(expected));
+                EXPECT_NEAR(expected, single, tolerance);
+                EXPECT_NEAR(expected, actual[row], tolerance);
+              }
+            }
           }
         }
       }

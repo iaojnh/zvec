@@ -111,6 +111,9 @@ jobs:
         run: |
           cd "$env:GITHUB_WORKSPACE\build"
           cmake --build . --target unittest --config Release --parallel $env:NPROC
+          cd "$env:GITHUB_WORKSPACE"
+          $arch = if ("${{ matrix.msvc_arch }}" -eq "arm64") { "NEON" } else { "SSE2" }
+          python .github/scripts/hnsw_test_runner.py verify-build build --expect-arch $arch
         shell: powershell
 
       - name: Show sccache statistics after tests
