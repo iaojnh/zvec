@@ -1,0 +1,4 @@
+self-hosted-runner:
+  labels:
+    - hnsw-android-arm64
+    - hnsw-ios

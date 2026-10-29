@@ -53,8 +53,10 @@ from zvec.typing import DataType, IndexType, MetricType, QuantizeType
 
 
 DIMENSION = 32
-NUM_DOCS = 128
-TOPK = 5
+# Exceed the core's default 1000-document brute-force fallback so the layout
+# tests exercise graph traversal after optimize(), including after reopen.
+NUM_DOCS = 1257
+TOPK = 10
 
 # ---------------------------------------------------------------------------
 
@@ -103,6 +105,8 @@ def _generate_docs(rng: np.random.Generator, num: int = NUM_DOCS) -> list[Doc]:
     docs: list[Doc] = []
     for i in range(num):
         vec = rng.standard_normal(DIMENSION).astype(np.float32)
+        # Unit norms make self-recall a valid invariant for inner product.
+        vec /= np.linalg.norm(vec)
         docs.append(
             Doc(
                 id=str(i),
@@ -113,17 +117,30 @@ def _generate_docs(rng: np.random.Generator, num: int = NUM_DOCS) -> list[Doc]:
     return docs
 
 
-def _assert_query_matches(coll: Collection, query_vec: list[float]) -> list[str]:
+def _insert_docs(coll: Collection, docs: list[Doc]):
+    results = []
+    for start in range(0, len(docs), 256):
+        batch = docs[start : start + 256]
+        statuses = coll.insert(docs=batch)
+        assert len(statuses) == len(batch)
+        results.extend(statuses)
+    return results
+
+
+def _assert_query_matches(
+    coll: Collection, query_vec: list[float], *, is_linear: bool = False
+) -> list[str]:
     """Run a top-k vector query and return the returned ids in order."""
     vector_query = Query(
         field_name="dense",
         vector=query_vec,
-        param=HnswQueryParam(ef=128),
+        param=HnswQueryParam(ef=256, is_linear=is_linear),
     )
     hits = coll.query(vector_query, topk=TOPK)
     # Expect a single result group for the single vector query.
     assert hits is not None, "query returned None"
-    assert len(hits) >= 1, f"expected at least one hit, got {hits!r}"
+    assert len(hits) == TOPK, f"expected {TOPK} hits, got {hits!r}"
+    assert len({doc.id for doc in hits}) == TOPK
     return [doc.id for doc in hits]
 
 
@@ -283,7 +300,7 @@ class TestHnswContiguousMemoryEndToEnd:
             assert vec_schema.index_param.use_contiguous_memory is True
 
             docs = _generate_docs(rng)
-            insert_result = coll.insert(docs=docs)
+            insert_result = _insert_docs(coll, docs)
             for r in insert_result:
                 assert r.ok(), f"insert failed: code={r.code()}"
             assert coll.stats.doc_count == NUM_DOCS
@@ -319,7 +336,7 @@ class TestHnswContiguousMemoryEndToEnd:
             assert vec_schema.index_param.use_contiguous_memory is False
 
             docs = _generate_docs(rng)
-            for r in coll.insert(docs=docs):
+            for r in _insert_docs(coll, docs):
                 assert r.ok()
             assert coll.stats.doc_count == NUM_DOCS
 
@@ -360,7 +377,7 @@ class TestHnswContiguousMemoryEndToEnd:
             path=path_str, schema=schema, option=collection_option
         )
         docs = _generate_docs(rng)
-        for r in created.insert(docs=docs):
+        for r in _insert_docs(created, docs):
             assert r.ok()
         assert created.stats.doc_count == NUM_DOCS
         # Persist pending writes so that reopen reconstructs state from disk.
@@ -395,13 +412,14 @@ class TestHnswContiguousMemoryEndToEnd:
         rng,
     ):
         """
-        Two collections built from the same documents must return the same
-        top-k neighbors regardless of whether contiguous memory is enabled:
-        the flag is a memory-layout optimization and must not alter recall
-        for identical graph construction parameters on the same data.
+        Both layouts must preserve exact results and recover at least 90% of
+        independent top-10 ground truth through graph traversal. Independently
+        built approximate graphs need not return identical candidate sets.
         """
         docs = _generate_docs(rng)
         query_vec = docs[3].vector("dense")
+        vectors = np.asarray([doc.vector("dense") for doc in docs], dtype=np.float64)
+        expected = {str(i) for i in np.argsort(-(vectors @ query_vec))[:TOPK]}
 
         def _build_and_query(tag: str, flag: bool) -> list[str]:
             schema = _build_schema(f"hnsw_parity_{tag}", use_contiguous_memory=flag)
@@ -409,25 +427,21 @@ class TestHnswContiguousMemoryEndToEnd:
             path = tmp_path_factory.mktemp("zvec") / f"hnsw_parity_{tag}"
             coll = zvec.create_and_open(path=str(path), schema=schema, option=option)
             try:
-                for r in coll.insert(docs=docs):
+                for r in _insert_docs(coll, docs):
                     assert r.ok()
                 coll.optimize()
                 expected_mode = "contiguous" if flag else "mmap"
                 assert _debug_hnsw_storage_mode(coll) == expected_mode, (
                     f"{tag}: unexpected entity type"
                 )
-                return _assert_query_matches(coll, query_vec)
+                linear = _assert_query_matches(coll, query_vec, is_linear=True)
+                assert set(linear) == expected
+                graph = _assert_query_matches(coll, query_vec)
+                assert len(set(graph) & expected) >= TOPK - 1
+                assert graph[0] == "3"
+                return graph
             finally:
                 coll.destroy()
 
-        ids_off = _build_and_query("off", flag=False)
-        ids_on = _build_and_query("on", flag=True)
-
-        # The graph is built with the same (m, ef_construction, data, order),
-        # so top-k results must match exactly.
-        assert ids_on == ids_off, (
-            f"top-{TOPK} results diverged between use_contiguous_memory modes: "
-            f"on={ids_on}, off={ids_off}"
-        )
-        # Sanity: self-recall is still perfect.
-        assert ids_on[0] == "3"
+        _build_and_query("off", flag=False)
+        _build_and_query("on", flag=True)

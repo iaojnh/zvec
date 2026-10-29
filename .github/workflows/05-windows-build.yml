@@ -113,6 +113,21 @@ jobs:
           cmake --build . --target unittest --config Release --parallel $env:NPROC
         shell: powershell
 
+      - name: Verify required HNSW platform coverage
+        run: |
+          $expected = if ("${{ matrix.msvc_arch }}" -eq "arm64") { "NEON" } else { "SSE2" }
+          python .github/scripts/hnsw_test_runner.py verify-xml `
+            build/test_tmp/hnsw_platform_test/results.xml --expect-arch $expected
+        shell: powershell
+
+      - name: Save HNSW platform coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hnsw-${{ matrix.platform }}
+          path: build/test_tmp/hnsw_platform_test/results.xml
+          if-no-files-found: ignore
+
       - name: Show sccache statistics after tests
         if: always()
         continue-on-error: true
