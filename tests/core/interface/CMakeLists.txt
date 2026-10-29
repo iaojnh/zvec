@@ -25,7 +25,9 @@ endforeach()
 set_tests_properties(hnsw_platform_test PROPERTIES ENVIRONMENT
     "GTEST_OUTPUT=xml:${CMAKE_BINARY_DIR}/test_tmp/hnsw_platform_test/results.xml")
 
-if(IOS)
+# Simulator CI launches the default com.zvec.<target> bundle identifier.
+# Only physical devices need a custom identifier for provisioning profiles.
+if(IOS AND NOT CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
   set(ZVEC_HNSW_TEST_BUNDLE_ID "com.zvec.hnsw-platform-test" CACHE STRING
       "Bundle identifier used when signing the HNSW device test app")
   set_target_properties(hnsw_platform_test PROPERTIES
