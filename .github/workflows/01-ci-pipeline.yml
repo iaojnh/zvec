@@ -35,7 +35,8 @@ permissions:
   contents: read
 
 jobs:
-  # Code quality checks (fast, run first)
+  # Quality checks and platform builds run concurrently; every job still
+  # contributes to the final workflow result.
   lint:
     if: >-
       github.event_name != 'pull_request' ||
@@ -55,7 +56,6 @@ jobs:
   build-and-test-macos-arm64:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (macos-arm64)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/03-macos-linux-build.yml
     with:
       platform: macos-arm64
@@ -64,7 +64,6 @@ jobs:
   build-and-test-macos-26-arm64:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (macos-26-arm64)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/03-macos-linux-build.yml
     with:
       platform: macos-arm64
@@ -73,7 +72,6 @@ jobs:
   build-and-test-macos-x64:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (macos-x64)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/03-macos-linux-build.yml
     with:
       platform: macos-x64
@@ -82,7 +80,6 @@ jobs:
   build-and-test-wheel-macos-x64:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test Wheel (macos-x64)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/_build_wheel_job.yml
     with:
       runner: macos-15-intel
@@ -92,7 +89,6 @@ jobs:
   build-and-test-linux-arm64:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (linux-arm64)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/03-macos-linux-build.yml
     with:
       platform: linux-arm64
@@ -100,7 +96,6 @@ jobs:
 
   build-and-test-linux-x64:
     name: Build & Test (linux-x64)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/03-macos-linux-build.yml
     with:
       platform: linux-x64
@@ -109,7 +104,6 @@ jobs:
   build-and-test-linux-x64-clang:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (linux-x64-clang)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/03-macos-linux-build.yml
     with:
       platform: linux-x64-clang
@@ -119,23 +113,19 @@ jobs:
   build-android:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (android)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/04-android-build.yml
 
   build-and-test-on-windows:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (Windows)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/05-windows-build.yml
 
   build-ios:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (iOS)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/06-ios-build.yml
 
   build-and-test-musllinux:
     if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     name: Build & Test (musllinux)
-    needs: [lint, clang-tidy]
     uses: ./.github/workflows/09-musllinux-build.yml
