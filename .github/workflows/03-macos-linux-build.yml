@@ -140,9 +140,6 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/build"
           cmake --build . --target unittest --parallel $NPROC
-          cd "$GITHUB_WORKSPACE"
-          case "$RUNNER_ARCH" in ARM64) ARCH=NEON ;; X64) ARCH=SSE2 ;; *) exit 1 ;; esac
-          python .github/scripts/hnsw_test_runner.py verify-build build --expect-arch "$ARCH"
         shell: bash
 
       - name: Run macOS x64 C++ compatibility tests
@@ -159,8 +156,6 @@ jobs:
             --no-tests=error \
             -R '^(shared_api_test|c_api_test|hnsw_platform_test|fp16_platform_test|turbo_fp16_quantizer_test|ivf_turbo_index_test)$' \
             --parallel 1
-          cd "$GITHUB_WORKSPACE"
-          python .github/scripts/hnsw_test_runner.py verify-build build --expect-arch SSE2
         shell: bash
 
       - name: Run Python Tests

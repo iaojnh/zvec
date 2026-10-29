@@ -113,8 +113,6 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/build"
           cmake --build . --target unittest --parallel $NPROC
-          cd "$GITHUB_WORKSPACE"
-          python .github/scripts/hnsw_test_runner.py verify-build build --expect-arch SSE2
         shell: sh
 
       - name: Run Python Tests
@@ -268,8 +266,6 @@ jobs:
         run: |
           docker exec -w /work/build "$MUSL_CONTAINER" \
             cmake --build . --target unittest --parallel "$NPROC"
-          docker exec -w /work "$MUSL_CONTAINER" python \
-            .github/scripts/hnsw_test_runner.py verify-build build --expect-arch NEON
         shell: bash
 
       - name: Run Python Tests

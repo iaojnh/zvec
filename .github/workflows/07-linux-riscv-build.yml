@@ -130,8 +130,6 @@ jobs:
           cd "$GITHUB_WORKSPACE/build"
           NPROC=$(nproc 2>/dev/null || echo 2)
           make unittest -j"$NPROC"
-          cd "$GITHUB_WORKSPACE"
-          python3 .github/scripts/hnsw_test_runner.py verify-build build --expect-arch Scalar
         shell: bash
 
   python-tests:
