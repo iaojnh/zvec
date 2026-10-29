@@ -285,6 +285,10 @@ int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   ctx->resize_results(count);
 
   for (uint32_t i = 0; i < count; i++) {
+    // Previous queries in this batch must not hide graph nodes from this one.
+    if (i != 0) {
+      ctx->visit_filter().clear();
+    }
     ctx->reset_query(query);
 
     ret = diskann_indexer_->knn_search(ctx);

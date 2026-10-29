@@ -58,9 +58,12 @@ class IVFTurboIndexTest : public testing::TestWithParam<TestCase> {
     core::IndexMeta meta;
     meta.set_meta(core::IndexMeta::DT_FP32, kDimension);
     meta.set_metric(MetricName(std::get<1>(GetParam())), 0, ailego::Params());
-    quantizer_ = core::IndexFactory::CreateQuantizer(
-        std::get<0>(GetParam()) == QuantizerType::kNone ? "Fp32Quantizer"
-                                                        : "Int8Quantizer");
+    const auto type = std::get<0>(GetParam());
+    const char *quantizer_name = type == QuantizerType::kNone ? "Fp32Quantizer"
+                                 : type == QuantizerType::kFP16
+                                     ? "Fp16Quantizer"
+                                     : "Int8Quantizer";
+    quantizer_ = core::IndexFactory::CreateQuantizer(quantizer_name);
     ASSERT_NE(nullptr, quantizer_);
     ASSERT_EQ(0, quantizer_->init(meta, ailego::Params()));
     std::mt19937 random(8121);
@@ -243,11 +246,12 @@ TEST_P(IVFTurboIndexTest, MergeDecodesSourceVectorsBeforeRebuilding) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Fp32AndInt8, IVFTurboIndexTest,
-    testing::Combine(
-        testing::Values(QuantizerType::kNone, QuantizerType::kInt8),
-        testing::Values(MetricType::kL2sq, MetricType::kInnerProduct,
-                        MetricType::kCosine)));
+    Fp32Fp16AndInt8, IVFTurboIndexTest,
+    testing::Combine(testing::Values(QuantizerType::kNone, QuantizerType::kFP16,
+                                     QuantizerType::kInt8),
+                     testing::Values(MetricType::kL2sq,
+                                     MetricType::kInnerProduct,
+                                     MetricType::kCosine)));
 
 TEST(IVFTurboCompatibility, ReopensLegacyFp32File) {
   const std::string path = "ivf_turbo_legacy_fp32.index";

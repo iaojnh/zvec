@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import pytest
+import zvec
 
 from zvec.typing import DataType, StatusCode, MetricType, QuantizeType
 from zvec.model import Collection, Doc, Query
@@ -532,209 +534,115 @@ class TestRecall:
         for k, v in recall_at_k_stats.items():
             assert v["recall_at_k"] == 1.0
 
+    @pytest.mark.parametrize("doc_count", [500, 2000])
+    @pytest.mark.parametrize("index_kind", ["flat", "hnsw", "ivf"])
     @pytest.mark.parametrize(
-        "full_schema_new",
-        [
-            (True, True, HnswIndexParam()),
-            (False, True, IVFIndexParam()),
-            (False, True, FlatIndexParam()),  # ——ok
-            (
-                True,
-                True,
-                HnswIndexParam(
-                    metric_type=MetricType.IP,
-                    m=16,
-                    ef_construction=100,
-                ),
-            ),
-            (
-                True,
-                True,
-                HnswIndexParam(
-                    metric_type=MetricType.COSINE,
-                    m=24,
-                    ef_construction=150,
-                ),
-            ),
-            # (True, True, HnswIndexParam(metric_type=MetricType.L2, m=32, ef_construction=200, )),
-            (
-                False,
-                True,
-                FlatIndexParam(
-                    metric_type=MetricType.IP,
-                ),
-            ),
-            (
-                True,
-                True,
-                FlatIndexParam(
-                    metric_type=MetricType.COSINE,
-                ),
-            ),
-            # (True, True, FlatIndexParam(metric_type=MetricType.L2, )),
-            (
-                True,
-                True,
-                IVFIndexParam(
-                    metric_type=MetricType.IP,
-                    n_list=100,
-                    n_iters=10,
-                    use_soar=False,
-                ),
-            ),
-            (
-                True,
-                True,
-                IVFIndexParam(
-                    metric_type=MetricType.L2,
-                    n_list=200,
-                    n_iters=20,
-                    use_soar=True,
-                ),
-            ),
-            (
-                True,
-                True,
-                DiskAnnIndexParam(metric_type=MetricType.IP, max_degree=32),
-            ),
-            (
-                True,
-                True,
-                DiskAnnIndexParam(metric_type=MetricType.L2, max_degree=32),
-            ),
-            (
-                True,
-                True,
-                DiskAnnIndexParam(metric_type=MetricType.COSINE, max_degree=32),
-            ),
-        ],
-        indirect=True,
+        "metric", [MetricType.L2, MetricType.IP, MetricType.COSINE]
     )
-    @pytest.mark.parametrize("doc_num", [2000])
-    @pytest.mark.parametrize("query_num", [2])
-    @pytest.mark.parametrize("top_k", [1])
-    @pytest.mark.skip(reason="known bug")
-    def test_recall_with_single_vector_valid_2000(
-        self,
-        full_collection_new: Collection,
-        doc_num,
-        query_num,
-        top_k,
-        full_schema_new,
-        request,
+    @pytest.mark.parametrize("encoding", ["native", "quantized"])
+    def test_fp16_recall_with_independent_queries(
+        self, tmp_path, doc_count, index_kind, metric, encoding
     ):
-        full_schema_params = request.getfixturevalue("full_schema_new")
-
-        # Build per-field metric type map so ground truth uses each field's
-        # actual index metric (fields may fall back to HnswIndexParam/IP).
-        field_metric_map = {}
-        for vector_para in full_schema_params.vectors:
-            if vector_para.index_param is not None:
-                field_metric_map[vector_para.name] = vector_para.index_param.metric_type
-            else:
-                field_metric_map[vector_para.name] = MetricType.IP
-
-        metric_type = field_metric_map.get("vector_fp32_field", MetricType.IP)
-
-        multiple_docs = [
-            generate_doc_recall(i, full_collection_new.schema) for i in range(doc_num)
-        ]
-        print("len(multiple_docs):\n")
-        print(len(multiple_docs))
-        # print(multiple_docs)
-
-        for i in range(10):
-            if i != 0:
-                pass
-                # print(multiple_docs[i * 1000:1000 * (i + 1)])
-            batchdoc_and_check(
-                full_collection_new,
-                multiple_docs[i * 1000 : 1000 * (i + 1)],
-                operator="insert",
-            )
-
-        stats = full_collection_new.stats
-        assert stats.doc_count == len(multiple_docs)
-
-        doc_ids = ["0", "1"]
-        fetched_docs = full_collection_new.fetch(doc_ids)
-        print("fetched_docs,multiple_docs")
-        print(
-            fetched_docs[doc_ids[0]].vectors["sparse_vector_fp32_field"],
-            fetched_docs[doc_ids[0]].vectors["sparse_vector_fp16_field"],
-            fetched_docs[doc_ids[1]].vectors["sparse_vector_fp32_field"],
-            fetched_docs[doc_ids[1]].vectors["sparse_vector_fp16_field"],
-            "\n",
-            multiple_docs[0].vectors["sparse_vector_fp32_field"],
-            multiple_docs[0].vectors["sparse_vector_fp32_field"],
-            multiple_docs[1].vectors["sparse_vector_fp32_field"],
-            multiple_docs[1].vectors["sparse_vector_fp16_field"],
+        # The 2000-document case exceeds HNSW's small-index linear fallback.
+        # Independent queries and dyadic coordinates keep FP16 conversion exact
+        # across ISAs, including on IVF's unquantized-query path. Conversion
+        # rounding is tested separately; this checks retrieval and score space.
+        dimension = 17
+        rng = np.random.default_rng(20261029)
+        vectors = (
+            rng.integers(-512, 513, (doc_count, dimension)).astype(np.float32) / 1024
         )
-
-        full_collection_new.optimize(option=OptimizeOption())
-
-        time.sleep(2)
-
-        query_vectors_map = {}
-        for field_name in DEFAULT_VECTOR_FIELD_NAME.values():
-            query_vectors_map[field_name] = [
-                multiple_docs[i].vectors[field_name] for i in range(query_num)
-            ]
-
-        # Get ground truth mapping (pass per-field metric map)
-        ground_truth_map = get_ground_truth_map(
-            full_collection_new,
-            multiple_docs,
-            query_vectors_map,
-            field_metric_map,
-            top_k,
+        queries = rng.integers(-128, 129, (16, dimension)).astype(np.float32) / 256
+        stored = vectors.astype(np.float16).astype(np.float64)
+        quantizer = (
+            QuantizeType.UNDEFINED if encoding == "native" else QuantizeType.FP16
         )
-
-        # Validate ground truth mapping structure
-        for field_name in DEFAULT_VECTOR_FIELD_NAME.values():
-            assert field_name in ground_truth_map
-            field_gt = ground_truth_map[field_name]
-            assert len(field_gt) == query_num
-
-            for query_idx in range(query_num):
-                assert query_idx in field_gt
-                relevant_ids = field_gt[query_idx]
-                assert isinstance(relevant_ids, list)
-                assert len(relevant_ids) <= top_k
-
-        # Print ground truth statistics
-        print(f"Ground Truth for Top-{top_k} Retrieval:")
-        for field_name, field_gt in ground_truth_map.items():
-            print(f"  {field_name}:")
-            for query_idx, relevant_ids in field_gt.items():
-                print(
-                    f" Query {query_idx}: {len(relevant_ids)} relevant docs - {relevant_ids[:5]}{'...' if len(relevant_ids) > 5 else ''}"
+        options = dict(metric_type=metric, quantize_type=quantizer)
+        if index_kind == "flat":
+            index = FlatIndexParam(**options)
+            query_param = None
+        elif index_kind == "hnsw":
+            index = HnswIndexParam(m=24, ef_construction=160, **options)
+            query_param = HnswQueryParam(ef=256)
+        else:
+            index = IVFIndexParam(n_list=8, n_iters=5, use_soar=False, **options)
+            query_param = IVFQueryParam(nprobe=6)
+        schema = zvec.CollectionSchema(
+            name="fp16_recall",
+            vectors=[
+                VectorSchema(
+                    "dense",
+                    DataType.VECTOR_FP16
+                    if encoding == "native"
+                    else DataType.VECTOR_FP32,
+                    dimension=dimension,
+                    index_param=index,
                 )
-
-        # Calculate Recall@K using ground truth
-        recall_at_k_stats = calculate_recall_at_k(
-            full_collection_new,
-            multiple_docs,
-            query_vectors_map,
-            full_schema_new,
-            k=top_k,
-            expected_doc_ids_scores_map=ground_truth_map,
-            tolerance=0.01,
+            ],
         )
-        print("ground_truth_map:\n")
-        print(ground_truth_map)
+        path = str(tmp_path / "fp16_recall")
+        collection = zvec.create_and_open(path=path, schema=schema)
 
-        print("(recall_at_k_stats:\n")
-        print(recall_at_k_stats)
-        print("field_metric_map:")
-        print(field_metric_map)
-        # Print Recall@K statistics
-        print(f"Recall@{top_k} using Ground Truth:")
-        for field_name, stats in recall_at_k_stats.items():
-            print(f"  {field_name}:")
-            print(
-                f"    Relevant Retrieved: {stats['relevant_retrieved_count']}/{stats['total_relevant_count']}"
-            )
-            print(f"    Recall@{top_k}: {stats['recall_at_k']:.4f}")
-        for k, v in recall_at_k_stats.items():
-            assert v["recall_at_k"] == 1.0
+        def check_recall():
+            for topk in (1, 10):
+                relevant = 0
+                for query_vector in queries:
+                    query = query_vector.astype(np.float64)
+                    if metric == MetricType.L2:
+                        expected = np.sum((stored - query) ** 2, axis=1)
+                    elif metric == MetricType.IP:
+                        expected = stored @ query
+                    else:
+                        expected = 1 - (stored @ query) / (
+                            np.linalg.norm(stored, axis=1) * np.linalg.norm(query)
+                        )
+                    ranking = np.argsort(
+                        -expected if metric == MetricType.IP else expected
+                    )
+                    cutoff = expected[ranking[topk - 1]]
+                    hits = collection.query(
+                        Query("dense", vector=query_vector.tolist(), param=query_param),
+                        topk=topk,
+                    )
+                    assert len(hits) == topk
+                    assert len({hit.id for hit in hits}) == topk
+                    for rank, hit in enumerate(hits):
+                        doc_id = int(hit.id)
+                        assert 0 <= doc_id < doc_count
+                        assert np.isfinite(hit.score)
+                        # Cosine normalizes and rounds FP16 posting codes.
+                        # Allow that encoding error against the independent FP64
+                        # reference, including ties near the top-k boundary.
+                        tolerance = 2e-3 if metric == MetricType.COSINE else 1e-4
+                        assert hit.score == pytest.approx(
+                            expected[doc_id], abs=tolerance
+                        )
+                        if rank:
+                            previous = hits[rank - 1].score
+                            if metric == MetricType.IP:
+                                assert previous >= hit.score
+                            else:
+                                assert previous <= hit.score
+                        if metric == MetricType.IP:
+                            relevant += expected[doc_id] >= cutoff - tolerance
+                        else:
+                            relevant += expected[doc_id] <= cutoff + tolerance
+                recall = relevant / (len(queries) * topk)
+                assert recall >= (1.0 if index_kind == "flat" else 0.9)
+
+        try:
+            for start in range(0, doc_count, 256):
+                docs = [
+                    Doc(id=str(i), vectors={"dense": vectors[i].tolist()})
+                    for i in range(start, min(start + 256, doc_count))
+                ]
+                assert all(status.ok() for status in collection.insert(docs))
+            collection.optimize()
+            assert collection.stats.doc_count == doc_count
+            assert collection.stats.index_completeness["dense"] == 1.0
+            check_recall()
+            collection.close()
+            collection = zvec.open(path=path, option=CollectionOption(read_only=True))
+            check_recall()
+        finally:
+            collection.close()

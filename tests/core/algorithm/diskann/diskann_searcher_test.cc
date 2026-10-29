@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <set>
@@ -227,6 +228,81 @@ class DiskAnnSearcherTest : public testing::Test {
       EXPECT_EQ(0, quantizer->init(meta, meta.metric_params()));
     }
     return quantizer;
+  }
+
+  // Compute ground truth independently of both the legacy and Turbo kernels,
+  // using the FP16 values actually inserted by the entrypoint tests.
+  static void check_fp16_accuracy(IndexRunner *searcher) {
+    constexpr size_t kDocCount = 2000;
+    constexpr uint32_t kTopK = 10;
+    constexpr uint32_t kQueryCount = 3;
+    std::vector<Float16> queries(kQueryCount * dim);
+    const float query_values[] = {17.375f, 123.1f, 194.625f};
+    for (size_t q = 0; q < kQueryCount; ++q) {
+      std::fill_n(queries.data() + q * dim, dim, Float16(query_values[q]));
+    }
+    const IndexQueryMeta qmeta(IndexMeta::DT_FP16, dim);
+    auto context = searcher->create_context();
+    ASSERT_NE(nullptr, context);
+    context->set_topk(kTopK);
+    Params search_params;
+    search_params.set(PARAM_DISKANN_SEARCHER_LIST_SIZE, 256);
+    ASSERT_EQ(0, context->update(search_params));
+
+    for (bool exhaustive : {false, true}) {
+      for (bool batch : {false, true}) {
+        SCOPED_TRACE(testing::Message()
+                     << "exhaustive=" << exhaustive << " batch=" << batch);
+        if (batch) {
+          ASSERT_EQ(0, exhaustive
+                           ? searcher->search_bf_impl(queries.data(), qmeta,
+                                                      kQueryCount, context)
+                           : searcher->search_impl(queries.data(), qmeta,
+                                                   kQueryCount, context));
+        }
+        for (size_t q = 0; q < kQueryCount; ++q) {
+          SCOPED_TRACE(q);
+          const auto *query = queries.data() + q * dim;
+          if (!batch) {
+            ASSERT_EQ(0, exhaustive
+                             ? searcher->search_bf_impl(query, qmeta, context)
+                             : searcher->search_impl(query, qmeta, context));
+          }
+          std::vector<double> scores(kDocCount);
+          for (size_t key = 0; key < kDocCount; ++key) {
+            const Float16 stored(static_cast<float>(key) / 10.0f);
+            const double delta =
+                static_cast<float>(stored) -
+                static_cast<double>(static_cast<float>(*query));
+            scores[key] = dim * delta * delta;
+          }
+          auto sorted_scores = scores;
+          std::sort(sorted_scores.begin(), sorted_scores.end());
+          const auto &result = context->result(batch ? q : 0);
+          ASSERT_EQ(kTopK, result.size());
+          std::unordered_set<uint64_t> keys;
+          size_t relevant = 0;
+          for (size_t rank = 0; rank < result.size(); ++rank) {
+            const auto &hit = result[rank];
+            ASSERT_LT(hit.key(), kDocCount);
+            EXPECT_TRUE(keys.insert(hit.key()).second);
+            ASSERT_TRUE(std::isfinite(hit.score()));
+            const double tolerance = 1e-4 * std::max(1.0, scores[hit.key()]);
+            EXPECT_NEAR(scores[hit.key()], hit.score(), tolerance);
+            if (rank > 0) {
+              EXPECT_LE(result[rank - 1].score(), hit.score());
+            }
+            // Equivalent FP16 distances may legitimately return different IDs.
+            relevant += scores[hit.key()] <= sorted_scores[kTopK - 1] + 1e-6;
+            if (exhaustive) {
+              EXPECT_NEAR(sorted_scores[rank], hit.score(), tolerance);
+            }
+          }
+          EXPECT_GE(relevant, exhaustive ? kTopK : 9U)
+              << "FP16 recall@10 must be at least 90%";
+        }
+      }
+    }
   }
 
   static std::string _dir;
@@ -1413,30 +1489,17 @@ TEST_F(DiskAnnSearcherTest, TestFp16Entrypoint) {
   ASSERT_EQ(0, storage->open(path, false));
   ASSERT_EQ(0, searcher->load(storage, IndexMetric::Pointer()));
 
-  auto ctx = searcher->create_context();
-  ASSERT_NE(ctx, nullptr);
-  ctx->set_topk(10);
+  check_fp16_accuracy(searcher.get());
+  ASSERT_EQ(0, searcher->unload());
 
-  NumericalVector<Float16> query(dim);
-  for (size_t j = 0; j < dim; ++j) {
-    query[j] = 123.1f;
-  }
-  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP16, dim);
-  ASSERT_EQ(0, searcher->search_impl(query.data(), qmeta, ctx));
-  ASSERT_EQ(10, ctx->result().size());
-
-  // DiskAnn is approximate, so the exact top-1 key is not stable across graph
-  // builds and platforms. Validate the FP16 search result contract instead.
-  std::unordered_set<uint64_t> result_keys;
-  for (size_t i = 0; i < ctx->result().size(); ++i) {
-    const auto &result = ctx->result()[i];
-    EXPECT_LT(result.key(), doc_cnt);
-    EXPECT_TRUE(result_keys.emplace(result.key()).second);
-    EXPECT_GE(result.score(), 0.0f);
-    if (i > 0) {
-      EXPECT_LE(ctx->result()[i - 1].score(), result.score());
-    }
-  }
+  auto streamer = IndexFactory::CreateStreamer("DiskAnnStreamer");
+  ASSERT_NE(nullptr, streamer);
+  ASSERT_EQ(0, streamer->init(fp16_meta, params));
+  auto streamer_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_EQ(0, streamer_storage->open(path, false));
+  ASSERT_EQ(0, streamer->open(streamer_storage));
+  check_fp16_accuracy(streamer.get());
+  ASSERT_EQ(0, streamer->close());
 }
 
 TEST_F(DiskAnnSearcherTest, TestRnnSearch) {
@@ -2385,30 +2448,18 @@ TEST_F(DiskAnnSearcherTest, TestFp16EntrypointTurbo) {
   ASSERT_EQ(0, storage->open(path, false));
   ASSERT_EQ(0, searcher->load(storage, IndexMetric::Pointer()));
 
-  auto ctx = searcher->create_context();
-  ASSERT_NE(ctx, nullptr);
-  ctx->set_topk(10);
+  check_fp16_accuracy(searcher.get());
+  ASSERT_EQ(0, searcher->unload());
 
-  NumericalVector<Float16> query(dim);
-  for (size_t j = 0; j < dim; ++j) {
-    query[j] = 123.1f;
-  }
-  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP16, dim);
-  ASSERT_EQ(0, searcher->search_impl(query.data(), qmeta, ctx));
-  ASSERT_EQ(10, ctx->result().size());
-
-  // DiskAnn is approximate, so the exact top-1 key is not stable across graph
-  // builds and platforms. Validate the FP16 search result contract instead.
-  std::unordered_set<uint64_t> result_keys;
-  for (size_t i = 0; i < ctx->result().size(); ++i) {
-    const auto &result = ctx->result()[i];
-    EXPECT_LT(result.key(), doc_cnt);
-    EXPECT_TRUE(result_keys.emplace(result.key()).second);
-    EXPECT_GE(result.score(), 0.0f);
-    if (i > 0) {
-      EXPECT_LE(ctx->result()[i - 1].score(), result.score());
-    }
-  }
+  auto streamer = IndexFactory::CreateStreamer("DiskAnnStreamer");
+  ASSERT_NE(nullptr, streamer);
+  ASSERT_EQ(0,
+            streamer->init(fp16_meta, params, make_turbo_quantizer(fp16_meta)));
+  auto streamer_storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_EQ(0, streamer_storage->open(path, false));
+  ASSERT_EQ(0, streamer->open(streamer_storage));
+  check_fp16_accuracy(streamer.get());
+  ASSERT_EQ(0, streamer->close());
 }
 
 TEST_F(DiskAnnSearcherTest, TestRnnSearchTurbo) {
