@@ -1098,7 +1098,7 @@ int Index::_refine_dense_candidates(
   context->set_topk(search_param->topk);
   context->set_fetch_vector(search_param->fetch_vector);
   if (search_param->filter && search_param->filter->is_valid()) {
-    context->set_filter(*search_param->filter);
+    context->set_filter(std::move(*search_param->filter));
   } else {
     context->reset_filter();
   }

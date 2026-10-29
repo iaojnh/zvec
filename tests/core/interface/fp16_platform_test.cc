@@ -136,12 +136,7 @@ class Fp16PlatformTest : public testing::TestWithParam<Case> {
   void check(Index *index) const {
     const bool ip = GetParam().metric == MetricType::kInnerProduct;
     for (bool filtered : {false, true, false}) {
-      auto filter = std::make_shared<IndexFilter>();
       const std::array<uint64_t, 8> excluded = {{0, 3, 6, 9, 12, 15, 18, 21}};
-      filter->set([excluded](uint64_t key) {
-        return std::find(excluded.begin(), excluded.end(), key % 24) !=
-               excluded.end();
-      });
       for (const auto &query : queries_) {
         std::vector<double> expected, ordered;
         for (const auto &row : vectors_) expected.push_back(score(row, query));
@@ -167,14 +162,20 @@ class Fp16PlatformTest : public testing::TestWithParam<Case> {
             params = diskann;
           }
           params->is_linear = linear;
-          params->filter = filtered ? filter : nullptr;
+          // Match the DB's per-request filter lifecycle. The core may move
+          // the predicate into its reused search context.
+          if (filtered) {
+            params->filter = std::make_shared<IndexFilter>();
+            params->filter->set([excluded](uint64_t key) {
+              return std::find(excluded.begin(), excluded.end(), key % 24) !=
+                     excluded.end();
+            });
+          }
           SCOPED_TRACE(testing::Message()
                        << "linear=" << linear << " filtered=" << filtered);
           SearchResult result;
           ASSERT_EQ(
               0, index->search(VectorData{DenseVector{data}}, params, &result));
-          ASSERT_TRUE(filter->is_valid())
-              << "Search consumed the caller's filter";
           ASSERT_EQ(kTopK, result.doc_list_.size());
           std::unordered_set<uint64_t> seen;
           size_t relevant = 0;

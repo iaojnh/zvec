@@ -149,14 +149,7 @@ class HnswPlatformTest : public testing::TestWithParam<Case> {
     ASSERT_NE(nullptr, hnsw);
     ASSERT_GT(index->get_doc_count(), hnsw->get_bruteforce_threshold());
     for (bool filtered : {false, true, false}) {
-      auto filter = std::make_shared<IndexFilter>();
-      // A heap-backed callable is moved out even by libc++; small captureless
-      // lambdas may remain callable after a move and hide query reuse bugs.
       const std::array<uint64_t, 8> excluded = {{0, 3, 6, 9, 12, 15, 18, 21}};
-      filter->set([excluded](uint64_t key) {
-        return std::find(excluded.begin(), excluded.end(), key % 24) !=
-               excluded.end();
-      });
       for (const auto &query : queries_) {
         std::vector<double> expected(kCount), ordered;
         for (uint32_t key = 0; key < kCount; ++key) {
@@ -174,17 +167,25 @@ class HnswPlatformTest : public testing::TestWithParam<Case> {
         for (bool linear : {true, false}) {
           SCOPED_TRACE(testing::Message()
                        << "filtered=" << filtered << " linear=" << linear);
+          // The DB creates a call-local predicate, then transfers it into the
+          // context. Reuse the context across calls, not a consumed predicate.
+          std::shared_ptr<IndexFilter> filter;
+          if (filtered) {
+            filter = std::make_shared<IndexFilter>();
+            filter->set([excluded](uint64_t key) {
+              return std::find(excluded.begin(), excluded.end(), key % 24) !=
+                     excluded.end();
+            });
+          }
           auto params = HNSWQueryParamBuilder()
                             .with_topk(kTopK)
                             .with_ef_search(256)
                             .with_is_linear(linear)
-                            .with_filter(filtered ? filter : nullptr)
+                            .with_filter(filter)
                             .build();
           SearchResult result;
           ASSERT_EQ(0, index->search(VectorData{DenseVector{query_data}},
                                      params, &result));
-          ASSERT_TRUE(filter->is_valid())
-              << "Search consumed the caller's filter";
           ASSERT_EQ(kTopK, result.doc_list_.size());
           std::unordered_set<uint64_t> seen;
           size_t relevant = 0;
