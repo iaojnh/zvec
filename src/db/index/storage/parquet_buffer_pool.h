@@ -133,7 +133,7 @@ class ParquetBufferLoader {
 
   void clear(ParquetBufferPayload &payload) const;
 
- private:
+  // Also used to retain buffers materialized outside the Parquet reader.
   void retain_buffers(ParquetBufferPayload &payload, size_t &size) const;
 };
 

@@ -213,6 +213,15 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   std::string err_msg;
   int ret = -1;
 
+  // A crash can leave any prefix of the last record. Only a short read at
+  // the physical EOF is a recoverable tail; invalid lengths and bad CRCs
+  // in complete records must still be reported as corruption.
+  const auto truncated_tail = [&] {
+    const auto offset = file_.offset();
+    return read_size >= 0 && offset >= 0 &&
+           static_cast<size_t>(offset) == file_.size();
+  };
+
   do {
     read_size =
         file_.read(reinterpret_cast<void *>(&record.length_), LENGTH_SIZE);
@@ -223,6 +232,10 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
     }
 
     if (read_size != LENGTH_SIZE) {
+      if (truncated_tail()) {
+        ret = 0;
+        break;
+      }
       WLOG_ERROR("Wal read error. record.length_ error read_size[%d]",
                  read_size);
       break;
@@ -230,6 +243,10 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
 
     read_size = file_.read(reinterpret_cast<void *>(&record.crc_), CRC_SIZE);
     if (read_size != CRC_SIZE) {
+      if (truncated_tail()) {
+        ret = 0;
+        break;
+      }
       WLOG_ERROR("Wal read error. record.crc_ error read_size[%d]", read_size);
       break;
     }
@@ -246,6 +263,10 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
     read_size = file_.read((void *)const_cast<char *>(record.content_.data()),
                            record.length_);
     if (read_size != (int)record.length_) {
+      if (truncated_tail()) {
+        ret = 0;
+        break;
+      }
       WLOG_ERROR("Wal read error. record.content_ error read_size[%d]",
                  read_size);
       break;

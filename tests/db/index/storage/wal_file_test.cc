@@ -103,6 +103,39 @@ TEST_F(WalFileTest, ReadOnlyCannotCreateWal) {
   EXPECT_FALSE(FileHelper::FileExists(path));
 }
 
+TEST_F(WalFileTest, EveryIncompleteTailPreservesCompleteRecords) {
+  const std::string path = "./data.wal.partial_tail";
+  auto wal = WalFile::Create(path);
+  WalOptions options;
+  options.create_new = true;
+  ASSERT_EQ(0, wal->open(options));
+  ASSERT_EQ(0, wal->append("complete"));
+  ASSERT_EQ(0, wal->append("unfinished"));
+  ASSERT_EQ(0, wal->close());
+  std::ifstream input(path, std::ios::binary);
+  const std::string contents{std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>()};
+  input.close();
+  constexpr size_t kTailSize = 2 * sizeof(uint32_t) + sizeof("unfinished") - 1;
+  ASSERT_GT(contents.size(), kTailSize);
+  const size_t prefix_size = contents.size() - kTailSize;
+  options.create_new = false;
+  for (size_t tail = 0; tail < kTailSize; ++tail) {
+    SCOPED_TRACE(tail);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(contents.data(),
+                 static_cast<std::streamsize>(prefix_size + tail));
+    output.close();
+    ASSERT_EQ(0, wal->open(options));
+    ASSERT_EQ(0, wal->prepare_for_read());
+    EXPECT_EQ("complete", wal->next());
+    EXPECT_TRUE(wal->next().empty());
+    EXPECT_TRUE(wal->read_status().ok());
+    ASSERT_EQ(0, wal->close());
+  }
+  EXPECT_EQ(0, wal->remove());
+}
+
 TEST_F(WalFileTest, TestGeneral) {
   std::string dir_path = "./";
   SegmentID segment_id = 0;

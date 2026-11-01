@@ -1,6 +1,7 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <thread>
 #include <gtest/gtest.h>
@@ -8,6 +9,57 @@
 
 namespace zvec::ailego {
 namespace {
+struct FailingIndexQueueTraits : moodycamel::ConcurrentQueueDefaultTraits {
+  inline static size_t allocations_left = std::numeric_limits<size_t>::max();
+  static void *malloc(size_t bytes) {
+    if (allocations_left == 0) return nullptr;
+    --allocations_left;
+    return std::malloc(bytes);
+  }
+  static void free(void *ptr) {
+    std::free(ptr);
+  }
+};
+
+TEST(EvictionQueueRecoveryTest, InitialIndexFailureCanRetryWithoutNewProducer) {
+  moodycamel::ConcurrentQueue<int, FailingIndexQueueTraits> queue(0);
+  // Allow the producer itself, but fail its constructor's block index.
+  FailingIndexQueueTraits::allocations_left = 1;
+  EXPECT_FALSE(queue.enqueue(1));
+  FailingIndexQueueTraits::allocations_left =
+      std::numeric_limits<size_t>::max();
+  const auto available = FailingIndexQueueTraits::allocations_left;
+  EXPECT_FALSE(queue.try_enqueue(2));
+  EXPECT_EQ(available, FailingIndexQueueTraits::allocations_left);
+  ASSERT_TRUE(queue.enqueue(3));
+  int value = 0;
+  ASSERT_TRUE(queue.try_dequeue(value));
+  EXPECT_EQ(3, value);
+  EXPECT_FALSE(queue.try_dequeue(value));
+}
+
+TEST(EvictionQueueRecoveryTest, RecycledProducerRecoversItsMissingIndex) {
+  moodycamel::ConcurrentQueue<int, FailingIndexQueueTraits> queue(0);
+  std::thread first([&] {
+    FailingIndexQueueTraits::allocations_left = 1;
+    EXPECT_FALSE(queue.enqueue(1));
+  });
+  first.join();
+  FailingIndexQueueTraits::allocations_left =
+      std::numeric_limits<size_t>::max();
+  std::thread second([&] {
+    const int values[] = {2, 3};
+    EXPECT_TRUE(queue.enqueue_bulk(values, 2));
+  });
+  second.join();
+  int value = 0;
+  ASSERT_TRUE(queue.try_dequeue(value));
+  EXPECT_EQ(2, value);
+  ASSERT_TRUE(queue.try_dequeue(value));
+  EXPECT_EQ(3, value);
+  EXPECT_FALSE(queue.try_dequeue(value));
+}
+
 class EvictionQueueBudgetTest : public testing::Test {
  protected:
   void SetUp() override {
