@@ -158,20 +158,36 @@ TEST_F(FlatWorkspaceBudgetTest, KeyAdmissionFailureDoesNotPublishOrBlockRetry) {
   IndexStreamer::Stats stats;
   FlatStreamerEntity entity(stats);
   *entity.mutable_meta() = meta();
-  entity.set_block_vector_count(32);
+  // Keep vector storage in its first mmap block while the key map grows.
+  entity.set_block_vector_count(4096);
   entity.set_linear_list_count(1);
-  entity.set_segment_size(4096);
+  entity.set_segment_size(256 * 1024);
   ASSERT_EQ(0, entity.open(storage, meta()));
   std::array<float, 8> row{};
   ASSERT_EQ(0, entity.add(101, row.data(), sizeof(row)));
   ailego::MemoryReservation pressure;
   pressure.add(pool_.capacity() - pool_.used());
-  EXPECT_EQ(IndexError_NoMemory, entity.add(202, row.data(), sizeof(row)));
-  EXPECT_EQ(1u, entity.vector_count());
-  EXPECT_EQ(nullptr, entity.get_vector_by_key(202));
+  uint64_t rejected_key = 0;
+  size_t before_rejection = 0;
+  // A previously admitted allocator chunk may legitimately hold more keys.
+  // Exhaust those slots before asserting rejection of new backing.
+  for (uint64_t key = 202; key < 202 + 4096; ++key) {
+    const size_t count = entity.vector_count();
+    const int result = entity.add(key, row.data(), sizeof(row));
+    if (result == IndexError_NoMemory) {
+      rejected_key = key;
+      before_rejection = count;
+      break;
+    }
+    ASSERT_EQ(0, result);
+    ASSERT_EQ(count + 1, entity.vector_count());
+  }
+  ASSERT_NE(0u, rejected_key);
+  EXPECT_EQ(before_rejection, entity.vector_count());
+  EXPECT_EQ(nullptr, entity.get_vector_by_key(rejected_key));
   pressure.retain_at_most(0);
-  EXPECT_EQ(0, entity.add(202, row.data(), sizeof(row)));
-  EXPECT_EQ(2u, entity.vector_count());
+  EXPECT_EQ(0, entity.add(rejected_key, row.data(), sizeof(row)));
+  EXPECT_EQ(before_rejection + 1, entity.vector_count());
 }
 }  // namespace
 }  // namespace zvec::core

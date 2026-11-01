@@ -188,7 +188,7 @@ TEST(DiskAnnFileReaderTest, BufferPoolReadsSectorSlicesFromNativePages) {
 
   auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
-      memory_pool.init(native_page_size +
+      memory_pool.init(2 * native_page_size +
                        ailego::VecBufferPool::metadata_bytes_for_page_count(2)),
       0);
   auto pool =
@@ -246,7 +246,7 @@ TEST(DiskAnnFileReaderTest,
 
   auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
-      memory_pool.init(native_page_size +
+      memory_pool.init(2 * native_page_size +
                        ailego::VecBufferPool::metadata_bytes_for_page_count(2)),
       0);
   auto pool = std::make_shared<ailego::VecBufferPool>(original.path(), false);

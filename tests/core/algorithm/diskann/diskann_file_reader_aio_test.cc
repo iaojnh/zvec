@@ -292,7 +292,7 @@ TEST(DiskAnnBufferPoolFileReaderTest,
   auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
       0, memory_pool.init(
-             page_size +
+             2 * page_size +  // One payload page and its slab header.
              ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount)));
   auto pool =
       std::make_shared<ailego::VecBufferPool>(file.path(), /*writable=*/false);

@@ -1785,7 +1785,7 @@ TEST_F(BufferPoolTest, BackgroundCleansRetiredExternalEntriesBelowWatermark) {
 TEST_F(BufferPoolTest, RetirementCleanupReachesOlderProducerStreams) {
   // This exercises queue traversal, not unconfigured/failed admission. Give
   // all producer streams an explicit, bounded metadata budget.
-  init_pool(/*capacity_pages=*/256);
+  init_pool(/*capacity_pages=*/4096);
   class Owner : public EvictableBlockOwner {
    public:
     Owner() {
@@ -3064,7 +3064,9 @@ TEST_F(BufferPoolTest, BatchAcquireScatteredPagesWithDuplicates) {
 TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   static constexpr size_t kPageCount = 128;
   constexpr size_t kThreadCount = 8;
-  init_vec_pool(/*capacity_pages=*/512, /*file_pages=*/kPageCount);
+  // Independent producers and per-thread I/O staging also need capacity.
+  // This checks single-flight, not behavior under cache pressure.
+  init_vec_pool(/*capacity_pages=*/4096, /*file_pages=*/kPageCount);
   std::string file = new_file(kPageCount);
 
   VecBufferPool pool(file, /*writable=*/false);
