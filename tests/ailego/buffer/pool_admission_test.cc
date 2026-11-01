@@ -22,6 +22,9 @@ struct MemoryLimitPoolTestPeer {
   static void release_backing(MemoryLimitPool &pool, size_t bytes) {
     pool.committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
   }
+  static void stop_background(MemoryLimitPool &pool) {
+    pool.stop_background_evictor();
+  }
 };
 
 namespace {
@@ -194,6 +197,65 @@ TEST_F(PoolAdmissionTest, SlabHeaderRejectsPendingPageReservations) {
   ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
   ASSERT_NE(nullptr, page);
   pool_.release_buffer(page, page_);
+}
+
+TEST_F(PoolAdmissionTest, MandatoryConsumersWaitThroughClockOnlyPasses) {
+  // Warm producer metadata before measuring the deliberately small payload.
+  ASSERT_EQ(0, pool_.init(0));
+  auto &queue = BlockEvictionQueue::get_instance();
+  ASSERT_TRUE(queue.add_single_block({}, 0));
+  BlockEvictionQueue::BlockType stale;
+  while (queue.evict_single_block(stale)) {
+  }
+  baseline_ = pool_.queue_allocated();
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  // Advance CLOCK on this thread only; the reclaimer controls the release.
+  // This also avoids unrelated producer metadata allocation under pressure.
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  class DeferredPages : public EvictableBlockOwner {
+   public:
+    DeferredPages() {
+      auto &queue = BlockEvictionQueue::get_instance();
+      queue.set_valid(this);
+      for (size_t key = 0; key < 8; ++key) enqueue(key);
+    }
+    ~DeferredPages() override {
+      BlockEvictionQueue::get_instance().set_invalid(this);
+    }
+    bool is_dead_block(eviction_key_t, version_t) override {
+      return false;
+    }
+    bool evict_block(eviction_key_t key) override {
+      // A CLOCK pass can change an entry without releasing bytes yet.
+      enqueue(key);
+      return false;
+    }
+    void enqueue(eviction_key_t key) {
+      BlockEvictionQueue::BlockType item;
+      item.owner = this;
+      item.owner_key = key;
+      EXPECT_TRUE(BlockEvictionQueue::get_instance().add_single_block(item, 0));
+    }
+  } deferred;
+  auto pending = std::make_unique<PendingReservation>(pool_, pool_.available());
+  ASSERT_TRUE(pending->acquired());
+  const auto initial_waits = pool_.stats().capacity_waits;
+  std::atomic<bool> observed_second_wait{false};
+  std::thread reclaimer([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (pool_.stats().capacity_waits < initial_waits + 2 &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    observed_second_wait = pool_.stats().capacity_waits >= initial_waits + 2;
+    pending.reset();
+  });
+  const bool charged = pool_.try_charge_workspace(page_);
+  reclaimer.join();
+  EXPECT_TRUE(observed_second_wait.load());
+  EXPECT_TRUE(charged);
+  expect_bounded();
+  if (charged) pool_.release_external(page_);
 }
 
 TEST_F(PoolAdmissionTest, BackingRefusalRollsBackUsedReservation) {

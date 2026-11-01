@@ -55,9 +55,11 @@ class PqBufferedTrainingTest : public ::testing::Test {
     // two workers and 16 KiB-page platforms.
     const bool fast_opq =
         opq && std::is_same_v<Quantizer, turbo::PqFastQuantizer>;
-    // FastScan's OPQ path overlaps packed-codebook and rotation workspaces.
-    // Increase its corpus too, rather than turning this into a cached test.
-    const size_t workspace_bytes = (fast_opq ? 512 : 256) * 1024;
+    const bool wide_opq =
+        opq && (fast_opq || std::is_same_v<Quantizer, turbo::PqInt8Quantizer>);
+    // OPQ overlaps rotation tiles with two Lloyd workers' centroid scratch.
+    // Keep the corpus larger than this mandatory workspace allowance.
+    const size_t workspace_bytes = (wide_opq ? 512 : 256) * 1024;
     const size_t row_count = fast_opq ? 20003 : 10001;
     ASSERT_GT(row_count * kDim * sizeof(T), workspace_bytes);
     for (size_t i = 0; i < row_count; ++i) {

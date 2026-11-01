@@ -1238,17 +1238,24 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
   if (fixed > capacity || buffer_size > capacity - fixed) {
     return false;
   }
-  // Dirty eviction may have queued more writes than can finish in one wait.
-  // Retry while reclamation makes real capacity progress, not just until the
-  // first 100 ms expires. Pinned/non-reclaimable memory still fails after one
-  // idle wait, and even progressing reclamation has a finite total bound.
+  // Dirty writeback and CLOCK aging can need more than one bounded pass.
+  // A zero-page batch is not proof that the queue is unreclaimable: it may
+  // only have cleared reference bits or demoted recently used entries.
+  // Keep waiting while candidates remain, but never beyond 50 waits. Empty
+  // queues with no capacity progress still fail after one idle wait.
   // Ordinary external-cache admission never enters this waiting path.
   size_t previous_available = available();
   for (size_t attempt = 0; attempt < 50; ++attempt) {
     (void)wait_for_available(buffer_size, std::chrono::milliseconds(100));
     if (try_charge_fixed(buffer_size, counter)) return true;
     const size_t current_available = available();
-    if (current_available <= previous_available) return false;
+    if (current_available <= previous_available) {
+      const auto queues = BlockEvictionQueue::get_instance().stats();
+      if (std::all_of(queues.approximate_queue_sizes.begin(),
+                      queues.approximate_queue_sizes.end(),
+                      [](size_t depth) { return depth == 0; }))
+        return false;
+    }
     previous_available = current_available;
   }
   return false;
