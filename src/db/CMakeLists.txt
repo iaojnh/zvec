@@ -6,6 +6,12 @@ cc_directory(index)
 cc_directory(sqlengine)
 
 file(GLOB_RECURSE ALL_DB_SRCS *.cc *.c *.h)
+get_target_property(ZVEC_ROCKSDB_SOURCE_DIR rocksdb SOURCE_DIR)
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/common/rocksdb_memtable_factory.cc
+  DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/common
+  PROPERTIES INCLUDE_DIRECTORIES ${ZVEC_ROCKSDB_SOURCE_DIR}
+)
 
 # Ensure bitpacked_simd_sse41.cc is compiled with SSE4.1 flag and
 # bitpacked_simd_avx2.cc with AVX2 flag in the packed zvec target as well

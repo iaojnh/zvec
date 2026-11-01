@@ -24,6 +24,7 @@
 #include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/db/config.h>
+#include "db/common/native_worker_memory.h"
 
 using namespace zvec;
 
@@ -120,7 +121,7 @@ void CheckConcurrentLazyResourceAccess(bool existing_pool) {
               snapshot.optimize_pool->count());
     EXPECT_EQ(expected_rocksdb_capacity, snapshot.rocksdb_capacity);
     EXPECT_EQ(expected_rocksdb_capacity, snapshot.cache->GetCapacity());
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     ASSERT_NE(nullptr, snapshot.cache->memory_allocator());
     EXPECT_STREQ("ZvecMappedCacheAllocator",
                  snapshot.cache->memory_allocator()->Name());
@@ -280,11 +281,35 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
   EXPECT_EQ(expected_buffer_capacity,
             ailego::MemoryLimitPool::get_instance().capacity());
 
+#if defined(__APPLE__)
+  const auto stack_bytes = detail::DefaultNativeWorkerStackBytes();
+  const auto native_workers =
+      expected_query_workers + expected_optimize_workers +
+      detail::RocksDbBackgroundThreads(config.optimize_thread_count) + 2;
+  EXPECT_GT(stack_bytes, 0u);
+  EXPECT_EQ(native_workers * stack_bytes,
+            detail::NativeWorkerStackReservation().bytes());
+  EXPECT_GE(ailego::MemoryLimitPool::get_instance().external_used(),
+            native_workers * stack_bytes);
+  // Repeated access/initialization cannot charge the same process workers
+  // again, and collection close does not refund live worker-stack capacity.
+  const auto reserved = detail::NativeWorkerStackReservation().bytes();
+  EXPECT_EQ(0, GlobalResource::Instance().initialize());
+  EXPECT_EQ(reserved, detail::NativeWorkerStackReservation().bytes());
+#endif
+
   const auto rocksdb_cache = GlobalResource::Instance().rocksdb_block_cache();
   const auto write_buffer_manager =
       GlobalResource::Instance().rocksdb_write_buffer_manager();
   ASSERT_NE(nullptr, rocksdb_cache);
   ASSERT_NE(nullptr, write_buffer_manager);
+#if defined(__linux__) || defined(__APPLE__)
+  ASSERT_NE(nullptr, rocksdb_cache->memory_allocator());
+  EXPECT_STREQ("ZvecMappedCacheAllocator",
+               rocksdb_cache->memory_allocator()->Name());
+#else
+  EXPECT_EQ(nullptr, rocksdb_cache->memory_allocator());
+#endif
   EXPECT_EQ(expected_rocksdb_capacity, rocksdb_cache->GetCapacity());
   EXPECT_EQ(GlobalResource::calculate_rocksdb_write_buffer_budget(
                 expected_rocksdb_capacity),

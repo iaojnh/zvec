@@ -23,7 +23,12 @@
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/cache.h>
 
-#if defined(__linux__)
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cerrno>
@@ -34,7 +39,8 @@ namespace {
 
 TEST(RocksdbCacheAllocatorTest, CoversCapacityAndAlignment) {
   RocksdbCacheAllocator allocator;
-  for (size_t size : {0u, 1u, 4095u, 4096u, 65536u, 1048576u}) {
+  for (size_t size :
+       {0u, 1u, 4095u, 4096u, 16383u, 16384u, 16385u, 65536u, 1048576u}) {
     void *data = allocator.Allocate(size);
     ASSERT_NE(nullptr, data);
     EXPECT_EQ(0u,
@@ -125,13 +131,49 @@ TEST(RocksdbCacheAllocatorTest,
   EXPECT_EQ(0u, cache->GetUsage());
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
+TEST(RocksdbCacheAllocatorTest, ChargesNativePageRounding) {
+  RocksdbCacheAllocator allocator;
+  const auto page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  ASSERT_GT(page_size, 0u);
+  for (size_t size : {page_size - 1, page_size, page_size + 1}) {
+    void *data = allocator.Allocate(size);
+    const size_t charge = allocator.UsableSize(data, size);
+    EXPECT_EQ(0u, charge % page_size);
+    EXPECT_GT(charge, size);
+    EXPECT_LE(charge, size + page_size + alignof(std::max_align_t));
+    allocator.Deallocate(data);
+  }
+}
+
 TEST(RocksdbCacheAllocatorTest, DeallocationUnmapsBackingPages) {
   RocksdbCacheAllocator allocator;
   void *data = allocator.Allocate(65536);
   const auto page_size = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
   const uintptr_t base =
       reinterpret_cast<uintptr_t>(data) / page_size * page_size;
+#if defined(__APPLE__)
+  // Unlike Linux, macOS mincore can succeed for an unmapped address. Query
+  // the mapping itself, not its residency bits.
+  auto is_mapped = [base]() {
+    mach_vm_address_t address = base;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    const auto result = ::mach_vm_region(
+        ::mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+        reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+    if (object != MACH_PORT_NULL) {
+      ::mach_port_deallocate(::mach_task_self(), object);
+    }
+    EXPECT_TRUE(result == KERN_SUCCESS || result == KERN_INVALID_ADDRESS);
+    return result == KERN_SUCCESS && address <= base && base - address < size;
+  };
+  ASSERT_TRUE(is_mapped());
+  allocator.Deallocate(data);
+  EXPECT_FALSE(is_mapped());
+#else
   unsigned char resident = 0;
   ASSERT_EQ(0, ::mincore(reinterpret_cast<void *>(base), page_size, &resident));
   allocator.Deallocate(data);
@@ -139,6 +181,7 @@ TEST(RocksdbCacheAllocatorTest, DeallocationUnmapsBackingPages) {
   EXPECT_EQ(-1,
             ::mincore(reinterpret_cast<void *>(base), page_size, &resident));
   EXPECT_EQ(ENOMEM, errno);
+#endif
 }
 #endif
 

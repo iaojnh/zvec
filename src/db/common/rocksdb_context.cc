@@ -22,7 +22,12 @@
 #include <rocksdb/utilities/checkpoint.h>
 #include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/logger/logger.h>
+#include <zvec/db/config.h>
 #include "db/common/global_resource.h"
+#include "db/common/native_worker_memory.h"
+#if defined(__APPLE__)
+#include "db/common/rocksdb_memtable_factory.h"
+#endif
 
 
 namespace zvec {
@@ -98,7 +103,7 @@ Status RocksdbContext::create(Args args) {
   }
   auto metadata = ReserveRocksMetadata(column_family_count);
   if (!metadata) return metadata.error();
-  prepare_options(std::move(args.merge_op));
+  prepare_options(std::move(args.merge_op), true);
 
   rocksdb::DB *db;
   rocksdb::Status s = rocksdb::DB::Open(create_opts_, args.db_path, &db);
@@ -177,7 +182,7 @@ Status RocksdbContext::open(Args args, bool read_only) {
   create_opts_.create_if_missing = false;
   auto metadata = ReserveRocksMetadata(1);
   if (!metadata) return metadata.error();
-  prepare_options(std::move(args.merge_op));
+  prepare_options(std::move(args.merge_op), !read_only);
 
   rocksdb::Status s;
   std::vector<std::string> existing_cf_names{};
@@ -304,9 +309,26 @@ Status RocksdbContext::validate_and_set_db_path(const std::string &db_path,
 
 
 void RocksdbContext::prepare_options(
-    std::shared_ptr<rocksdb::MergeOperator> merge_op) {
-  // Increase parallelism with default thread count (typically 16)
-  create_opts_.IncreaseParallelism();
+    std::shared_ptr<rocksdb::MergeOperator> merge_op, bool writable) {
+#if defined(__APPLE__)
+  // Buffered file writes already use the OS cache. Avoid another growable
+  // malloc-backed copy whose freed buffers can remain resident after build.
+  // A zero capacity selects RocksDB's direct-to-file buffered-I/O path; direct
+  // I/O still requires its nonzero aligned buffer. Read-only opens stay as-is.
+  if (writable && !create_opts_.use_direct_io_for_flush_and_compaction) {
+    create_opts_.writable_file_max_buffer_size = 0;
+  }
+#else
+  (void)writable;
+#endif
+  // Background compaction is part of the configured optimize concurrency,
+  // not an independent fixed pool of 16 workers. Each worker can retain
+  // ordinary-heap merge/filter workspaces outside the cache/WBM. Keep two
+  // low-priority workers for flush/compaction progress and the historical
+  // upper bound; this does not change foreground query concurrency.
+  const auto background_threads = detail::RocksDbBackgroundThreads(
+      GlobalConfig::Instance().optimize_thread_count());
+  create_opts_.IncreaseParallelism(static_cast<int>(background_threads));
 
   // Optimize for level-based compaction style with default setting
   create_opts_.OptimizeLevelStyleCompaction();
@@ -378,6 +400,16 @@ void RocksdbContext::prepare_options(
   // are evicted as writes grow and writes stall if flushing cannot keep up.
   create_opts_.write_buffer_manager =
       GlobalResource::Instance().rocksdb_write_buffer_manager();
+#if defined(__APPLE__)
+  // malloc can retain freed MemTable blocks around unrelated live objects.
+  // Keep SkipList semantics and WBM accounting, but tie the large backing to
+  // a MemTable-owned mapping. Flush does not release pinned iterators' data;
+  // destruction unmaps it before returning the corresponding WBM charge.
+  if (create_opts_.write_buffer_manager) {
+    create_opts_.memtable_factory = std::make_shared<RocksdbMemtableFactory>(
+        create_opts_.write_buffer_manager);
+  }
+#endif
 
   // Reduce preallocation size for manifest file to 512KB to save disk space
   create_opts_.manifest_preallocation_size = 512 * 1024;

@@ -164,7 +164,8 @@ struct RocksdbContext {
   Status validate_and_set_db_path(const std::string &db_path,
                                   bool should_exist);
 
-  void prepare_options(std::shared_ptr<rocksdb::MergeOperator> merge_op);
+  void prepare_options(std::shared_ptr<rocksdb::MergeOperator> merge_op,
+                       bool writable);
 
   Status flush_unlocked();
   rocksdb::Status finish_write(rocksdb::Status status);

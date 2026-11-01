@@ -32,6 +32,11 @@ namespace zvec {
 namespace {
 
 constexpr char kTestPath[] = "./test_rocksdb_memory_budget";
+#if defined(__APPLE__)
+constexpr char kMemtableFactoryName[] = "ZvecMappedSkipList";
+#else
+constexpr char kMemtableFactoryName[] = "SkipListFactory";
+#endif
 
 std::vector<std::string> column_family_names(size_t count) {
   std::vector<std::string> names{rocksdb::kDefaultColumnFamilyName};
@@ -61,6 +66,31 @@ class RocksdbContextMemoryTest : public ::testing::Test {
   }
 };
 
+TEST_F(RocksdbContextMemoryTest, BackgroundWorkersRespectOptimizeConcurrency) {
+  RocksdbContext writer;
+  ASSERT_TRUE(writer.create(kTestPath).ok());
+  EXPECT_EQ(2, writer.create_opts_.max_background_jobs);
+  EXPECT_EQ(2,
+            writer.create_opts_.env->GetBackgroundThreads(rocksdb::Env::LOW));
+  EXPECT_EQ(1,
+            writer.create_opts_.env->GetBackgroundThreads(rocksdb::Env::HIGH));
+  EXPECT_EQ(1u, GlobalConfig::Instance().optimize_thread_count());
+  EXPECT_EQ(1u, GlobalConfig::Instance().query_thread_count());
+  EXPECT_EQ(GlobalResource::Instance().rocksdb_write_buffer_manager(),
+            writer.create_opts_.write_buffer_manager);
+  ASSERT_TRUE(writer.db_->Put(writer.write_opts_, "key", "value").ok());
+  ASSERT_TRUE(writer.flush().ok());
+  ASSERT_TRUE(writer.close().ok());
+
+  RocksdbContext reader;
+  ASSERT_TRUE(reader.open(kTestPath, true).ok());
+  EXPECT_EQ(2, reader.create_opts_.max_background_jobs);
+  std::string value;
+  ASSERT_TRUE(reader.db_->Get(reader.read_opts_, "key", &value).ok());
+  EXPECT_EQ("value", value);
+  ASSERT_TRUE(reader.close().ok());
+}
+
 TEST_F(RocksdbContextMemoryTest, SharesWriteBudgetWithoutFtsIteratorCopies) {
   const std::vector<std::string> column_families = {
       "postings", "positions", "term_freq", "max_tf", "doc_len", "stat"};
@@ -73,7 +103,8 @@ TEST_F(RocksdbContextMemoryTest, SharesWriteBudgetWithoutFtsIteratorCopies) {
   EXPECT_EQ(GlobalResource::Instance().rocksdb_write_buffer_manager(),
             writer.create_opts_.write_buffer_manager);
   EXPECT_EQ(nullptr, writer.create_opts_.statistics);
-  EXPECT_STREQ("SkipListFactory", writer.create_opts_.memtable_factory->Name());
+  EXPECT_STREQ(kMemtableFactoryName,
+               writer.create_opts_.memtable_factory->Name());
   EXPECT_NE(nullptr, writer.create_opts_.prefix_extractor);
   EXPECT_TRUE(writer.read_opts_.total_order_seek);
   ASSERT_TRUE(writer.close().ok());
@@ -86,7 +117,48 @@ TEST_F(RocksdbContextMemoryTest, SharesWriteBudgetWithoutFtsIteratorCopies) {
   EXPECT_EQ(GlobalResource::Instance().rocksdb_write_buffer_manager(),
             reader.create_opts_.write_buffer_manager);
   EXPECT_EQ(nullptr, reader.create_opts_.statistics);
-  EXPECT_STREQ("SkipListFactory", reader.create_opts_.memtable_factory->Name());
+  EXPECT_STREQ(kMemtableFactoryName,
+               reader.create_opts_.memtable_factory->Name());
+  ASSERT_TRUE(reader.close().ok());
+}
+
+TEST_F(RocksdbContextMemoryTest, BufferedWritesSurviveFlushAndWritableReopen) {
+  RocksdbContext writer;
+  ASSERT_TRUE(writer.create(kTestPath).ok());
+#if defined(__APPLE__)
+  EXPECT_EQ(0u, writer.create_opts_.writable_file_max_buffer_size);
+  EXPECT_FALSE(writer.create_opts_.use_direct_io_for_flush_and_compaction);
+#endif
+  const std::string value(128 * 1024, 'x');
+  for (size_t i = 0; i < 32; ++i) {
+    ASSERT_TRUE(
+        writer.db_->Put(writer.write_opts_, std::to_string(i), value).ok());
+  }
+  ASSERT_TRUE(writer.flush().ok());
+  ASSERT_TRUE(writer.close().ok());
+
+  RocksdbContext reopened;
+  ASSERT_TRUE(reopened.open(kTestPath, false).ok());
+#if defined(__APPLE__)
+  EXPECT_EQ(0u, reopened.create_opts_.writable_file_max_buffer_size);
+#endif
+  ASSERT_TRUE(reopened.db_->Put(reopened.write_opts_, "updated", value).ok());
+  ASSERT_TRUE(reopened.flush().ok());
+  ASSERT_TRUE(reopened.close().ok());
+
+  RocksdbContext reader;
+  ASSERT_TRUE(reader.open(kTestPath, true).ok());
+  EXPECT_EQ(rocksdb::DBOptions().writable_file_max_buffer_size,
+            reader.create_opts_.writable_file_max_buffer_size);
+  for (size_t i = 0; i < 32; ++i) {
+    std::string actual;
+    ASSERT_TRUE(
+        reader.db_->Get(reader.read_opts_, std::to_string(i), &actual).ok());
+    EXPECT_EQ(value, actual);
+  }
+  std::string actual;
+  ASSERT_TRUE(reader.db_->Get(reader.read_opts_, "updated", &actual).ok());
+  EXPECT_EQ(value, actual);
   ASSERT_TRUE(reader.close().ok());
 }
 
@@ -227,10 +299,10 @@ TEST_F(RocksdbContextMemoryTest, WritableFtsUsesBudgetedOrderedMemtables) {
             .create(RocksdbContext::Args{
                 kTestPath, column_family_names(cf_count), nullptr, {}, true})
             .ok());
-    EXPECT_STREQ("SkipListFactory",
+    EXPECT_STREQ(kMemtableFactoryName,
                  writer.create_opts_.memtable_factory->Name());
     for (auto *cf : writer.cf_handles_) {
-      EXPECT_STREQ("SkipListFactory",
+      EXPECT_STREQ(kMemtableFactoryName,
                    writer.db_->GetOptions(cf).memtable_factory->Name());
     }
     // Removing the copied sort structure must not change flush thresholds
@@ -253,7 +325,7 @@ TEST_F(RocksdbContextMemoryTest,
             .create(RocksdbContext::Args{
                 kTestPath, column_family_names(cf_count), nullptr, {}, true})
             .ok());
-    EXPECT_STREQ("SkipListFactory",
+    EXPECT_STREQ(kMemtableFactoryName,
                  writer.create_opts_.memtable_factory->Name());
     ASSERT_TRUE(writer.close().ok());
 
@@ -265,10 +337,10 @@ TEST_F(RocksdbContextMemoryTest,
             .open(RocksdbContext::Args{kTestPath, {}, nullptr, {}, true},
                   /*read_only=*/false)
             .ok());
-    EXPECT_STREQ("SkipListFactory",
+    EXPECT_STREQ(kMemtableFactoryName,
                  reopened.create_opts_.memtable_factory->Name());
     for (auto *cf : reopened.cf_handles_) {
-      EXPECT_STREQ("SkipListFactory",
+      EXPECT_STREQ(kMemtableFactoryName,
                    reopened.db_->GetOptions(cf).memtable_factory->Name());
     }
     ASSERT_TRUE(reopened.close().ok());
@@ -310,7 +382,8 @@ TEST_F(RocksdbContextMemoryTest, PrefixWritesSurviveFlushAndReadOnlyReopen) {
                   .open(RocksdbContext::Args{kTestPath, {}, nullptr, {}, true},
                         /*read_only=*/true)
                   .ok());
-  EXPECT_STREQ("SkipListFactory", reader.create_opts_.memtable_factory->Name());
+  EXPECT_STREQ(kMemtableFactoryName,
+               reader.create_opts_.memtable_factory->Name());
   for (const auto &name : names) {
     auto *cf = reader.get_cf(name);
     ASSERT_NE(nullptr, cf);

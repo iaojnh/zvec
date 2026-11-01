@@ -20,6 +20,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
+#include "db/common/native_worker_memory.h"
 #include "db/common/rocksdb_cache_allocator.h"
 
 namespace zvec {
@@ -149,10 +150,11 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     auto optimize_thread_pool = std::make_unique<ailego::ThreadPool>(
         optimize_thread_count, optimize_thread_binding);
     std::shared_ptr<rocksdb::MemoryAllocator> rocksdb_cache_allocator;
-#if defined(__linux__)
-    // Linux malloc can retain flush/compaction buffers around live cache
-    // payloads even after all memtables have been freed. Use RocksDB's public
-    // allocator hook; keep other platforms' previously validated path.
+#if defined(__linux__) || defined(__APPLE__)
+    // malloc can retain freed SST blocks around live cache payloads after
+    // flush/compaction. On macOS these pages can remain resident even after
+    // being marked reusable. Use RocksDB's allocator hook to unmap released
+    // payloads and include native page rounding in their cache charge.
     rocksdb_cache_allocator = std::make_shared<RocksdbCacheAllocator>();
 #endif
     auto rocksdb_block_cache = rocksdb::NewLRUCache(
@@ -172,6 +174,15 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
             /*allow_stall=*/true);
     if (memory_pool.init(static_cast<size_t>(buffer_pool_capacity)) != 0) {
       return -1;
+    }
+
+    if (!preserve_existing_pool) {
+      // Explicit process budgets cover zvec-owned worker stacks before any
+      // resource handle is published or collection can populate the cache.
+      // A preconfigured standalone/core cache is not a DB process budget.
+      detail::ReserveNativeWorkerStacks(query_thread_pool->count(),
+                                        optimize_thread_pool->count(),
+                                        optimize_thread_count);
     }
 
     memory_limit_bytes_ = memory_limit_bytes;
