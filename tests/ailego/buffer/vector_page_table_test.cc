@@ -3065,6 +3065,10 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   static constexpr size_t kPageCount = 128;
   constexpr size_t kThreadCount = 8;
   std::string file = new_file(kPageCount);
+  // SetUp leaves a zero-capacity pool. Producers can reuse old queue blocks
+  // there, but allocating a new producer must wait for a real warmup budget.
+  init_vec_pool(/*capacity_pages=*/4096, /*file_pages=*/kPageCount);
+  ASSERT_FALSE(HasFatalFailure());
 
   VecBufferPool pool(file, /*writable=*/false);
   // The handle only references the pool; workers wait until init completes.

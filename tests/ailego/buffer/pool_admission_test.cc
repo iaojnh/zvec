@@ -97,6 +97,27 @@ TEST_F(PoolAdmissionTest, SmallPoolWatermarksKeepFittingWorkingSets) {
   }
 }
 
+TEST_F(PoolAdmissionTest, WaitIncludesHeaderWhenEverySlabSlotIsOccupied) {
+  ASSERT_EQ(0, pool_.init(baseline_ + MemoryLimitPool::slab_size() + page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  auto release = [this](char *buffer) { pool_.release_buffer(buffer, page_); };
+  std::vector<std::unique_ptr<char, decltype(release)>> held;
+  const size_t pages = MemoryLimitPool::slab_size() / page_ - 1;
+  held.reserve(pages);
+  for (size_t i = 0; i < pages; ++i) {
+    char *buffer = nullptr;
+    ASSERT_TRUE(pool_.try_acquire_buffer(page_, buffer));
+    held.emplace_back(buffer, release);
+  }
+  EXPECT_EQ(page_, pool_.available());
+  char *extra = nullptr;
+  EXPECT_FALSE(pool_.try_acquire_buffer(page_, extra));
+  EXPECT_FALSE(pool_.wait_for_available(page_, std::chrono::milliseconds(1)));
+  held.pop_back();
+  EXPECT_TRUE(pool_.wait_for_available(page_, std::chrono::milliseconds(1)));
+  expect_bounded();
+}
+
 TEST_F(PoolAdmissionTest, FixedConsumersRejectPendingPageReservations) {
   using Charge = bool (MemoryLimitPool::*)(size_t);
   using Release = void (MemoryLimitPool::*)(size_t);

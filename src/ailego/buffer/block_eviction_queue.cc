@@ -1192,7 +1192,27 @@ bool MemoryLimitPool::wait_for_available(const size_t buffer_size,
         // cache headroom is not available to page admission. Use the same
         // page-limit predicate as eviction instead of turning backpressure
         // into immediate successful waits while pages still cannot fit.
-        return !is_cacheable_buffer_size(buffer_size) || !is_page_full();
+        if (!is_cacheable_buffer_size(buffer_size)) return true;
+        if (is_page_full()) return false;
+        for (const auto &shard : free_shards_)
+          if (shard.count.load(std::memory_order_relaxed) != 0) return true;
+        const size_t committed =
+            committed_size_.load(std::memory_order_relaxed);
+        const size_t fixed = fixed_used();
+        const size_t backed = committed > fixed ? committed - fixed : 0;
+        const size_t slots_per_slab = slab_size() / buffer_size - 1;
+        const size_t slabs = slab_count_.load(std::memory_order_relaxed);
+        // A full slab needs another resident header as well as the payload.
+        // Otherwise an apparent one-page allowance causes immediate waits
+        // to spin out before the dirty-writeback worker can run. Outstanding
+        // non-page backing only makes this hint conservative; allocation is
+        // retried after a timeout, without taking allocator locks under CV.
+        const bool has_slot =
+            slabs != 0 && backed / buffer_size / slabs < slots_per_slab;
+        const size_t extra = has_slot ? 0 : buffer_size;
+        return committed <= capacity && buffer_size <= capacity - committed &&
+               extra <= capacity - committed - buffer_size &&
+               extra <= capacity - used - buffer_size;
       });
   if (!available) {
     capacity_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);

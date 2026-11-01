@@ -15,6 +15,7 @@
 #include "db/sqlengine/sqlengine.h"
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <gtest/gtest.h>
 #include "zvec/db//schema.h"
 #include "zvec/db/query_params.h"
@@ -65,8 +66,9 @@ TEST_F(SqlEngineTest, VectorMemoryFailureSurvivesArrowExecution) {
   };
   class FailingSegment : public MockSegment {
    public:
-    std::shared_ptr<FailingIndexer> indexer =
-        std::make_shared<FailingIndexer>();
+    explicit FailingSegment(std::shared_ptr<FailingIndexer> failing_indexer)
+        : indexer(std::move(failing_indexer)) {}
+    std::shared_ptr<FailingIndexer> indexer;
     CombinedVectorColumnIndexer::Ptr get_combined_vector_indexer(
         const std::string &) const override {
       return indexer;
@@ -76,7 +78,8 @@ TEST_F(SqlEngineTest, VectorMemoryFailureSurvivesArrowExecution) {
       return indexer;
     }
   };
-  auto segment = std::make_shared<FailingSegment>();
+  auto segment =
+      std::make_shared<FailingSegment>(std::make_shared<FailingIndexer>());
   auto engine = SQLEngine::create(std::make_shared<Profiler>());
   SearchQuery query;
   query.topk_ = 1;
