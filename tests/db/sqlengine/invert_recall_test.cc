@@ -16,6 +16,9 @@
 #include <cstdint>
 #include <memory>
 #include <gtest/gtest.h>
+#if defined(__linux__)
+#include <glog/logging.h>
+#endif
 #include "db/sqlengine/planner/plan_info.h"
 #include "db/sqlengine/sqlengine.h"
 #include "db/sqlengine/sqlengine_impl.h"
@@ -24,7 +27,16 @@
 
 namespace zvec::sqlengine {
 
-class InvertRecallTest : public RecallTest {};
+class InvertRecallTest : public RecallTest {
+ protected:
+  static void SetUpTestSuite() {
+#if defined(__linux__)
+    // Keep CI shutdown crashes actionable even after every assertion passes.
+    google::InstallFailureSignalHandler();
+#endif
+    RecallTest::SetUpTestSuite();
+  }
+};
 
 TEST(DocIdScanPlanTest, BoundedReaderDoesNotQueueTheWholeScan) {
   class CountingReader : public arrow::RecordBatchReader {
