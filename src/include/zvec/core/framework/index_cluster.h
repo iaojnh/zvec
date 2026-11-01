@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -219,22 +220,26 @@ struct IndexCluster : public IndexModule {
     //! Retrieve feature buffer
     const std::string &buffer() const {
       if (stored_) {
-        std::call_once(stored_->once, [&] {
-          auto &pool = ailego::MemoryLimitPool::get_instance();
-          const size_t charge = pool.capacity() ? stored_->bytes : 0;
-          if (charge && !pool.try_charge_external(charge))
-            throw std::bad_alloc();
-          try {
-            std::string row(stored_->bytes, '\0');
-            if (read_feature(row.data(), row.size()) != 0)
-              throw std::runtime_error("Failed to read stored centroid");
-            stored_->materialized = std::move(row);
-            stored_->charged = charge;
-          } catch (...) {
-            if (charge) pool.release_external(charge);
-            throw;
+        if (!stored_->ready.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lock(stored_->mutex);
+          if (!stored_->ready.load(std::memory_order_relaxed)) {
+            auto &pool = ailego::MemoryLimitPool::get_instance();
+            const size_t charge = pool.capacity() ? stored_->bytes : 0;
+            if (charge && !pool.try_charge_external(charge))
+              throw std::bad_alloc();
+            try {
+              std::string row(stored_->bytes, '\0');
+              if (read_feature(row.data(), row.size()) != 0)
+                throw std::runtime_error("Failed to read stored centroid");
+              stored_->materialized = std::move(row);
+              stored_->charged = charge;
+              stored_->ready.store(true, std::memory_order_release);
+            } catch (...) {
+              if (charge) pool.release_external(charge);
+              throw;
+            }
           }
-        });
+        }
         return stored_->materialized;
       }
       return buffer_;
@@ -305,7 +310,10 @@ struct IndexCluster : public IndexModule {
     struct StoredFeature {
       std::shared_ptr<const FeatureStorage> storage;
       size_t offset{0}, bytes{0};
-      std::once_flag once;
+      // Allocation/read failures must be retryable without unwinding through
+      // pthread_once, whose exception handling is not portable to musl.
+      std::mutex mutex;
+      std::atomic<bool> ready{false};
       std::string materialized;
       size_t charged{0};
       ~StoredFeature() {

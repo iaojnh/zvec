@@ -482,6 +482,45 @@ TEST(OptKmeansCluster, StoredCentroidRowsOutliveProducerAndFailExplicitly) {
   EXPECT_EQ(0u, pool.used());
 }
 
+TEST(OptKmeansCluster, StoredCentroidMaterializationRetriesAfterFailures) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0u, pool.used());
+  const size_t previous = pool.capacity();
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  struct RetryStorage : IndexCluster::FeatureStorage {
+    mutable size_t reads{0};
+    bool fail{true};
+    int read(size_t, void *out, size_t bytes) const override {
+      ++reads;
+      if (fail) return IndexError_ReadData;
+      std::memset(out, 7, bytes);
+      return 0;
+    }
+  };
+  auto source = std::make_shared<RetryStorage>();
+  IndexCluster::Centroid row;
+  row.set_feature_storage(source, 0, 128);
+  ASSERT_EQ(0, pool.init(1));
+  EXPECT_THROW(row.feature(), std::bad_alloc);
+  EXPECT_THROW(row.feature(), std::bad_alloc);
+  EXPECT_EQ(0u, source->reads);
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  EXPECT_THROW(row.feature(), std::runtime_error);
+  EXPECT_THROW(row.feature(), std::runtime_error);
+  EXPECT_EQ(2u, source->reads);
+  source->fail = false;
+  const void *feature = row.feature();
+  ASSERT_NE(nullptr, feature);
+  EXPECT_EQ(7, static_cast<const unsigned char *>(feature)[127]);
+  auto copy = row;
+  EXPECT_EQ(feature, copy.feature());
+  EXPECT_EQ(feature, row.feature());
+  EXPECT_EQ(3u, source->reads);
+}
+
 TEST(OptKmeansCluster, TrainerPropagatesDeferredAndFallbackReadFailures) {
   auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
   for (int mode = 0; mode < 3; ++mode) {
