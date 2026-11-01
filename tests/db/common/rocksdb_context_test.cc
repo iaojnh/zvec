@@ -32,7 +32,7 @@ namespace zvec {
 namespace {
 
 constexpr char kTestPath[] = "./test_rocksdb_memory_budget";
-#if defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__)
 constexpr char kMemtableFactoryName[] = "ZvecMappedSkipList";
 #else
 constexpr char kMemtableFactoryName[] = "SkipListFactory";

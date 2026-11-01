@@ -27,6 +27,10 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#elif defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cerrno>
 #endif
 
 namespace zvec {
@@ -61,6 +65,18 @@ bool IsMapped(const void *pointer) {
   EXPECT_TRUE(result == KERN_SUCCESS || result == KERN_INVALID_ADDRESS);
   return result == KERN_SUCCESS && address <= base && base - address < size;
 }
+#elif defined(__linux__)
+bool IsMapped(const void *pointer) {
+  const auto page_size = ::sysconf(_SC_PAGESIZE);
+  EXPECT_GT(page_size, 0);
+  if (page_size <= 0) return false;
+  const auto address = reinterpret_cast<uintptr_t>(pointer);
+  auto *page = reinterpret_cast<void *>(address / page_size * page_size);
+  unsigned char resident = 0;
+  const int result = ::mincore(page, static_cast<size_t>(page_size), &resident);
+  EXPECT_TRUE(result == 0 || errno == ENOMEM);
+  return result == 0;
+}
 #endif
 
 TEST(RocksdbMemtableFactoryTest, HoldsBackingChargeUntilDestruction) {
@@ -88,12 +104,12 @@ TEST(RocksdbMemtableFactoryTest, HoldsBackingChargeUntilDestruction) {
   EXPECT_EQ(0u, manager->mutable_memtable_memory_usage());
   EXPECT_EQ(charge, manager->memory_usage());
   EXPECT_TRUE(table->Contains(data));
-#if defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__)
   EXPECT_TRUE(IsMapped(data));
 #endif
   table.reset();
   EXPECT_EQ(0u, manager->memory_usage());
-#if defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__)
   EXPECT_FALSE(IsMapped(data));
 #endif
 }

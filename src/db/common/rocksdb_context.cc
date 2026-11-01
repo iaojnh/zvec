@@ -25,7 +25,7 @@
 #include <zvec/db/config.h>
 #include "db/common/global_resource.h"
 #include "db/common/native_worker_memory.h"
-#if defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__)
 #include "db/common/rocksdb_memtable_factory.h"
 #endif
 
@@ -401,7 +401,7 @@ void RocksdbContext::prepare_options(
   // are evicted as writes grow and writes stall if flushing cannot keep up.
   create_opts_.write_buffer_manager =
       GlobalResource::Instance().rocksdb_write_buffer_manager();
-#if defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__)
   // malloc can retain freed MemTable blocks around unrelated live objects.
   // Keep SkipList semantics and WBM accounting, but tie the large backing to
   // a MemTable-owned mapping. Flush does not release pinned iterators' data;
