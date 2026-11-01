@@ -445,8 +445,8 @@ class MultiPassNumericalIndexHolder : public IndexHolder,
  private:
   class OrdinalReader : public OrdinalAccessHolder::Reader {
    public:
-    explicit OrdinalReader(const MultiPassNumericalIndexHolder *holder)
-        : holder_(holder) {}
+    explicit OrdinalReader(const MultiPassNumericalIndexHolder *source)
+        : holder_(source) {}
 
     int read(size_t ordinal, uint64_t *key, const void **data) override {
       if (!key || !data) return IndexError_InvalidArgument;

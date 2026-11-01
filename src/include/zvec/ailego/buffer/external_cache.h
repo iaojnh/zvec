@@ -227,11 +227,12 @@ class ExternalCache : public EvictableBlockOwner {
       return Value{};
     }
 
-    if (!PayloadOwnsBudget &&
-        !MemoryLimitPool::get_instance().try_charge_external(size)) {
-      clear_noexcept(*loaded_payload);
-      finish_loading(key);
-      return Value{};
+    if constexpr (!PayloadOwnsBudget) {
+      if (!MemoryLimitPool::get_instance().try_charge_external(size)) {
+        clear_noexcept(*loaded_payload);
+        finish_loading(key);
+        return Value{};
+      }
     }
 
     lock.lock();
