@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <iostream>
 #include <sstream>  // NOLINT(misc-include-cleaner): protects <sstream> from the private/public test macro below.
-#include "../../../ailego/buffer/pool_payload_budget.h"
 #define private public
 #define protected public
 #include "db/index/segment/segment.h"
@@ -45,9 +44,23 @@ using namespace zvec;
 
 namespace {
 
+Status InsertTwoPersistedBlocks(const Segment::Ptr &segment,
+                                const CollectionSchema &schema,
+                                uint64_t doc_count) {
+  for (uint64_t first : {uint64_t{0}, doc_count / 2}) {
+    const uint64_t end = first == 0 ? doc_count / 2 : doc_count;
+    auto status =
+        test::TestHelper::SegmentInsertDoc(segment, schema, first, end);
+    if (!status.ok()) return status;
+    status = segment->flush();
+    if (!status.ok()) return status;
+  }
+  return Status::OK();
+}
+
 class ExternalChargeGuard {
  public:
-  ExternalChargeGuard(zvec::ailego::PoolPayloadBudget &pool, size_t bytes)
+  ExternalChargeGuard(zvec::ailego::MemoryLimitPool &pool, size_t bytes)
       : pool_(pool),
         bytes_(bytes),
         charged_(pool_.try_charge_external(bytes_)) {}
@@ -63,7 +76,7 @@ class ExternalChargeGuard {
   }
 
  private:
-  zvec::ailego::PoolPayloadBudget &pool_;
+  zvec::ailego::MemoryLimitPool &pool_;
   size_t bytes_;
   bool charged_;
 };
@@ -941,7 +954,7 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexerWithQuantVectorIndex) {
 }
 
 TEST_P(SegmentTest, CombinedVectorColumnIndexerQueryWithPks) {
-  options_.max_buffer_size_ = 10 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
 
   auto tmp_schema = test::TestHelper::CreateSchemaWithVectorIndex(
       false, "demo", std::make_shared<HnswIndexParams>(MetricType::IP));
@@ -953,7 +966,11 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexerQueryWithPks) {
 
 
   uint64_t max_doc = 1000;
-  test::TestHelper::SegmentInsertDoc(segment, *schema_, 0, max_doc);
+  // Keep keys in two persisted blocks and the final keys in memory.
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, max_doc - 2).ok());
+  ASSERT_TRUE(test::TestHelper::SegmentInsertDoc(segment, *schema_, max_doc - 2,
+                                                 max_doc)
+                  .ok());
 
   auto combined_indexer = segment->get_combined_vector_indexer("dense_fp32");
   ASSERT_TRUE(combined_indexer != nullptr);
@@ -1650,15 +1667,15 @@ TEST_P(SegmentTest, AddColumn) {
 }
 
 TEST_P(SegmentTest, AddNullableColumnWithoutExpressionMultiBlock) {
-  // Use small buffer to force multiple scalar blocks within a single segment
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -1748,15 +1765,15 @@ TEST_P(SegmentTest, AddNullableColumnWithoutExpressionMultiBlock) {
 }
 
 TEST_P(SegmentTest, AddColumnWithExpressionMultiBlock) {
-  // Use small buffer to force multiple scalar blocks within a single segment
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -1858,19 +1875,18 @@ TEST_P(SegmentTest, AddColumnWithExpressionMultiBlock) {
 
 TEST_P(SegmentTest, AlterColumnMultiBlock) {
   constexpr size_t kSharedCacheCapacity = MIN_MEMORY_LIMIT_BYTES;
-  auto &memory_pool = zvec::ailego::PoolPayloadBudget::get_instance();
-  if (!GetParam() && memory_pool.capacity() != kSharedCacheCapacity) {
-    ASSERT_EQ(0, memory_pool.init(kSharedCacheCapacity));
-  }
+  auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(kSharedCacheCapacity, memory_pool.capacity());
 
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -1958,19 +1974,18 @@ TEST_P(SegmentTest, AlterColumnMultiBlock) {
 
 TEST_P(SegmentTest, DropColumnMultiBlock) {
   constexpr size_t kSharedCacheCapacity = MIN_MEMORY_LIMIT_BYTES;
-  auto &memory_pool = zvec::ailego::PoolPayloadBudget::get_instance();
-  if (!GetParam() && memory_pool.capacity() != kSharedCacheCapacity) {
-    ASSERT_EQ(0, memory_pool.init(kSharedCacheCapacity));
-  }
+  auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(kSharedCacheCapacity, memory_pool.capacity());
 
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -2060,14 +2075,15 @@ TEST_P(SegmentTest, DropColumnMultiBlock) {
 }
 
 TEST_P(SegmentTest, AddNullableThenAlterDropMultiBlock) {
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
