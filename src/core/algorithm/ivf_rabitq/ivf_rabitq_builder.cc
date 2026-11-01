@@ -295,10 +295,10 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
                 }
                 const auto *src = static_cast<const float *>(data);
                 float *dst = rotated_batch.data() + (i * padded_dim);
-                int ret = reformer->rotate_vector(src, dst);
-                if (ret != 0) {
+                const int rotate_ret = reformer->rotate_vector(src, dst);
+                if (rotate_ret != 0) {
                   int expected = 0;
-                  build_error.compare_exchange_strong(expected, ret);
+                  build_error.compare_exchange_strong(expected, rotate_ret);
                   return;
                 }
               }
@@ -306,26 +306,26 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
               std::fill(batch_output.begin(), batch_output.end(), 0);
               std::fill(ex_output.begin(), ex_output.end(), 0);
 
-              int ret = reformer->quantize_batch(
+              int encode_ret = reformer->quantize_batch(
                   rotated_batch.data(), static_cast<uint32_t>(cid), batch_size,
                   batch_output.data(),
                   ex_output.empty() ? nullptr : ex_output.data(),
                   &encoding_memory);
-              if (ret == 0)
-                ret = build_data->keys_buf.write(
+              if (encode_ret == 0)
+                encode_ret = build_data->keys_buf.write(
                     (key_offset + processed) * sizeof(uint64_t),
                     batch_keys.data(), batch_size * sizeof(uint64_t));
-              if (ret == 0)
-                ret = build_data->batch_data_buf.write(batch_data_offset,
-                                                       batch_output.data(),
-                                                       batch_output.size());
-              if (ret == 0)
-                ret = build_data->ex_data_buf.write(
+              if (encode_ret == 0)
+                encode_ret = build_data->batch_data_buf.write(
+                    batch_data_offset, batch_output.data(),
+                    batch_output.size());
+              if (encode_ret == 0)
+                encode_ret = build_data->ex_data_buf.write(
                     ex_data_offset, ex_output.data(),
                     batch_size * ex_data_per_vector);
-              if (ret != 0) {
+              if (encode_ret != 0) {
                 int expected = 0;
-                build_error.compare_exchange_strong(expected, ret);
+                build_error.compare_exchange_strong(expected, encode_ret);
                 return;
               }
 
