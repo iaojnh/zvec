@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <utility>
 #include <core/quantizer/quantizer_params.h>
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
 #include "metric/metric_params.h"
@@ -756,7 +757,9 @@ int IVFEntity::bind_query(const void *query, const IndexQueryMeta &qmeta) {
   if (!quantizer_) {
     return 0;
   }
-  query_distance_ = turbo::DistanceImpl{};
+  // Assigning an empty handle may retain its string capacity on libstdc++.
+  // Destroy the moved-out owner before admitting the next query copy.
+  (void)std::exchange(query_distance_, turbo::DistanceImpl{});
   query_encoding_.reserve(quantizer_->quantized_query_vector_length());
   auto &encoded = query_encoding_.value;
   encoded.clear();

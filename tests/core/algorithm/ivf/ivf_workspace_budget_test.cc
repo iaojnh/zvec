@@ -207,12 +207,15 @@ TEST_F(IVFWorkspaceBudgetTest, TurboQueryEncodingReusesChargedCapacity) {
     // for another temporary encoding allocation or a replacement overlap.
     ailego::MemoryReservation pressure;
     pressure.add(pool.capacity() - pool.used());
-    query.fill(1.0f);
-    ASSERT_EQ(0, entity.bind_query(query.data(), qmeta));
-    EXPECT_EQ(first, entity.encoding_data());
-    EXPECT_EQ(charge, entity.encoding_charge());
-    EXPECT_FLOAT_EQ(768.0f, entity.distance(candidate.data()));
-    EXPECT_EQ(used + pressure.bytes(), pool.external_used());
+    for (float value : {1.0f, 2.0f, 3.0f}) {
+      query.fill(value);
+      ASSERT_EQ(0, entity.bind_query(query.data(), qmeta));
+      EXPECT_EQ(first, entity.encoding_data());
+      EXPECT_EQ(charge, entity.encoding_charge());
+      EXPECT_FLOAT_EQ(768.0f * value * value,
+                      entity.distance(candidate.data()));
+      EXPECT_EQ(used + pressure.bytes(), pool.external_used());
+    }
   }
   EXPECT_EQ(0u, pool.external_used());
 }
