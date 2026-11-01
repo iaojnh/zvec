@@ -34,6 +34,52 @@ namespace zvec {
 
 namespace {
 
+using BufferSet =
+    std::unordered_set<const arrow::Buffer *, std::hash<const arrow::Buffer *>,
+                       std::equal_to<const arrow::Buffer *>,
+                       ailego::BudgetedAllocator<const arrow::Buffer *>>;
+
+// Arrow allocates these object shells with new, independently of MemoryPool.
+// This is a conservative planning allowance for the supported Arrow tree,
+// not a claim of exact heap/RSS accounting. Raw buffer capacity is excluded.
+size_t ArrayMetadataBytes(const arrow::DataType &type) {
+  constexpr size_t kArrayShellBytes = 512;
+  constexpr size_t kBufferShellBytes = 128;
+  const auto buffers = type.layout().buffers.size();
+  if (buffers > (SIZE_MAX - kArrayShellBytes) / kBufferShellBytes)
+    throw std::bad_alloc();
+  size_t bytes = kArrayShellBytes + buffers * kBufferShellBytes;
+  const auto add = [&bytes](const arrow::DataType &child) {
+    const size_t extra = ArrayMetadataBytes(child);
+    if (extra > SIZE_MAX - bytes) throw std::bad_alloc();
+    bytes += extra;
+  };
+  for (const auto &field : type.fields()) add(*field->type());
+  if (type.id() == arrow::Type::DICTIONARY)
+    add(*static_cast<const arrow::DictionaryType &>(type).value_type());
+  return bytes;
+}
+
+struct PinnedView {
+  ailego::MemoryReservation metadata;
+  ParquetBufferContextHandle pin;
+
+  explicit PinnedView(const ParquetBufferContextHandle &handle) : pin(handle) {}
+};
+
+// Even a null/empty array without buffers must keep the metadata allowance.
+template <typename T>
+std::shared_ptr<T> OwnView(std::shared_ptr<T> value,
+                           const std::shared_ptr<PinnedView> &pin) {
+  struct Owner {
+    std::shared_ptr<PinnedView> pin;
+    std::shared_ptr<T> value;
+  };
+  auto *raw = value.get();
+  auto owner = std::make_shared<Owner>(Owner{pin, std::move(value)});
+  return std::shared_ptr<T>(std::move(owner), raw);
+}
+
 class ParquetLoadError : public std::exception {
  public:
   explicit ParquetLoadError(arrow::Status status)
@@ -49,10 +95,9 @@ class ParquetLoadError : public std::exception {
   arrow::Status status_;
 };
 
-void RetainAndDetachArrowBuffers(
-    const std::shared_ptr<arrow::ArrayData> &data,
-    detail::ParquetBufferPayload *payload,
-    std::unordered_set<const arrow::Buffer *> *seen, size_t *size) {
+void RetainAndDetachArrowBuffers(const std::shared_ptr<arrow::ArrayData> &data,
+                                 detail::ParquetBufferPayload *payload,
+                                 BufferSet *seen, size_t *size) {
   if (!data) {
     return;
   }
@@ -74,8 +119,9 @@ void RetainAndDetachArrowBuffers(
                     : *size + capacity;
       }
     }
-    buffer =
-        std::shared_ptr<arrow::Buffer>(retained.get(), [](arrow::Buffer *) {});
+    buffer = std::shared_ptr<arrow::Buffer>(
+        retained.get(), [](arrow::Buffer *) {},
+        ailego::BudgetedAllocator<arrow::Buffer>{});
   }
   for (const auto &child : data->child_data) {
     RetainAndDetachArrowBuffers(child, payload, seen, size);
@@ -85,7 +131,7 @@ void RetainAndDetachArrowBuffers(
 
 std::shared_ptr<arrow::ArrayData> CloneWithPinnedBuffers(
     const std::shared_ptr<arrow::ArrayData> &data,
-    const std::shared_ptr<ParquetBufferContextHandle> &pin) {
+    const std::shared_ptr<PinnedView> &pin) {
   if (!data) {
     return nullptr;
   }
@@ -99,14 +145,25 @@ std::shared_ptr<arrow::ArrayData> CloneWithPinnedBuffers(
     child = CloneWithPinnedBuffers(child, pin);
   }
   clone->dictionary = CloneWithPinnedBuffers(clone->dictionary, pin);
-  return clone;
+  return OwnView(std::move(clone), pin);
 }
 
 }  // namespace
 
 ParquetBufferID::ParquetBufferID(const std::string &filename, int column,
                                  int row_group)
-    : filename(filename), column(column), row_group(row_group) {
+    : ParquetBufferID(filename, column, row_group, nullptr) {}
+
+ParquetBufferID::ParquetBufferID(
+    const std::string &filename, int column, int row_group,
+    std::shared_ptr<const Filename> shared_filename)
+    : column(column),
+      row_group(row_group),
+      filename_(shared_filename
+                    ? std::move(shared_filename)
+                    : std::allocate_shared<Filename>(
+                          ailego::CacheMetadataAllocator<Filename, true>{},
+                          filename.data(), filename.size())) {
   const auto path = ailego::FileHelper::PathFromUtf8(filename);
   bool has_stat_mtime = false;
   int64_t stat_mtime = 0;
@@ -134,8 +191,11 @@ ParquetBufferID::ParquetBufferID(const std::string &filename, int column,
 ParquetBufferID::ParquetBufferID(const std::string &filename, int column,
                                  int row_group,
                                  const ParquetBufferID &metadata_source)
-    : ParquetBufferID(filename, column, row_group) {
-  if (this->filename == metadata_source.filename &&
+    : ParquetBufferID(filename, column, row_group,
+                      filename == metadata_source.filename()
+                          ? metadata_source.filename_
+                          : nullptr) {
+  if (this->filename() == metadata_source.filename() &&
       file_id == metadata_source.file_id && mtime == metadata_source.mtime) {
     metadata = metadata_source.metadata;
   }
@@ -143,8 +203,8 @@ ParquetBufferID::ParquetBufferID(const std::string &filename, int column,
 
 const std::string ParquetBufferID::to_string() const {
   std::string msg{"Buffer["};
-  msg += "parquet: " + filename + "[" + std::to_string(file_id) + "]" +
-         ", column: " + std::to_string(column) +
+  msg += "parquet: " + std::string(filename()) + "[" + std::to_string(file_id) +
+         "]" + ", column: " + std::to_string(column) +
          ", row_group: " + std::to_string(row_group);
   msg += ", mtime: " + std::to_string(mtime);
   msg += "]";
@@ -161,6 +221,9 @@ ParquetBufferContextHandle::ParquetBufferContextHandle(
 
 ParquetBufferContextHandle::~ParquetBufferContextHandle() {
   if (arrow_) {
+    // Drop this shell owner before the final pin can retire the payload and
+    // refund its metadata allowance. The cache still owns it until release.
+    arrow_.reset();
     ParquetBufferPool::get_instance().release(buffer_id_);
   }
 }
@@ -169,10 +232,10 @@ std::shared_ptr<arrow::ChunkedArray> ParquetBufferContextHandle::data() const {
   if (!arrow_) {
     return nullptr;
   }
-  auto pin = std::make_shared<ParquetBufferContextHandle>(*this);
-  if (!pin->arrow_) {
-    return nullptr;
-  }
+  auto pin = std::make_shared<PinnedView>(*this);
+  pin->metadata.add(512);
+  pin->metadata.add_array(static_cast<size_t>(arrow_->num_chunks()),
+                          ArrayMetadataBytes(*arrow_->type()) + 128);
   // Alias every Arrow buffer to the cache pin while sharing payload bytes.
   arrow::ArrayVector chunks;
   chunks.reserve(arrow_->num_chunks());
@@ -180,8 +243,9 @@ std::shared_ptr<arrow::ChunkedArray> ParquetBufferContextHandle::data() const {
     chunks.emplace_back(
         arrow::MakeArray(CloneWithPinnedBuffers(chunk->data(), pin)));
   }
-  return std::make_shared<arrow::ChunkedArray>(std::move(chunks),
-                                               arrow_->type());
+  return OwnView(
+      std::make_shared<arrow::ChunkedArray>(std::move(chunks), arrow_->type()),
+      pin);
 }
 
 bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
@@ -196,15 +260,16 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
 
 arrow::Status detail::ParquetBufferLoader::load_checked(
     const ParquetBufferID &buffer_id, ParquetBufferPayload &payload,
-    size_t &size) {
+    size_t &size) try {
   payload.memory_pool = GetParquetMemoryPool();
   arrow::MemoryPool *mem_pool = payload.memory_pool.get();
 
   std::shared_ptr<arrow::io::RandomAccessFile> input;
-  const auto &file_name = buffer_id.filename;
-  auto input_result = arrow::io::ReadableFile::Open(file_name, mem_pool);
+  const auto file_name = buffer_id.filename();
+  auto input_result = arrow::io::ReadableFile::Open(
+      std::string(file_name.data(), file_name.size()), mem_pool);
   if (!input_result.ok()) {
-    LOG_ERROR("Failed to open parquet file[%s]: %s", file_name.c_str(),
+    LOG_ERROR("Failed to open parquet file[%s]: %s", file_name.data(),
               input_result.status().ToString().c_str());
     return input_result.status();
   }
@@ -226,14 +291,14 @@ arrow::Status detail::ParquetBufferLoader::load_checked(
   auto file_reader = OpenBudgetedParquetReader(input, read_properties,
                                                buffer_id.metadata.lock());
   if (!file_reader.ok()) {
-    LOG_ERROR("Failed to open parquet reader[%s]: %s", file_name.c_str(),
+    LOG_ERROR("Failed to open parquet reader[%s]: %s", file_name.data(),
               file_reader.status().ToString().c_str());
     return file_reader.status();
   }
   auto reader_status = parquet::arrow::FileReader::Make(
       mem_pool, std::move(file_reader).ValueOrDie(), arrow_properties, &reader);
   if (!reader_status.ok()) {
-    LOG_ERROR("Failed to create parquet reader[%s]: %s", file_name.c_str(),
+    LOG_ERROR("Failed to create parquet reader[%s]: %s", file_name.data(),
               reader_status.ToString().c_str());
     return reader_status;
   }
@@ -247,17 +312,29 @@ arrow::Status detail::ParquetBufferLoader::load_checked(
   const auto leaves = ParquetLeafColumns(*metadata, {column});
   if (leaves.empty())
     return arrow::Status::Invalid("Invalid parquet column: ", column);
-  reader->set_batch_size(ParquetDecodeBatchRows(*metadata, row_group, leaves));
+  const auto batch_rows = ParquetDecodeBatchRows(*metadata, row_group, leaves);
+  reader->set_batch_size(batch_rows);
   auto batches = reader->GetRecordBatchReader({row_group}, leaves);
   if (!batches.ok()) {
     LOG_ERROR("Failed to create parquet column reader[%s]: %s",
-              file_name.c_str(), batches.status().ToString().c_str());
+              file_name.data(), batches.status().ToString().c_str());
     return batches.status();
   }
+  const auto schema = (*batches)->schema();
+  if (schema->num_fields() != 1)
+    return arrow::Status::Invalid("Expected one parquet output column");
+  const auto rows = metadata->RowGroup(row_group)->num_rows();
+  if (rows < 0 || batch_rows <= 0)
+    return arrow::Status::Invalid("Invalid parquet batch size");
+  const size_t chunks =
+      static_cast<size_t>(rows / batch_rows) + (rows % batch_rows != 0);
+  payload.metadata_memory.add(512);
+  payload.metadata_memory.add_array(
+      chunks, ArrayMetadataBytes(*schema->field(0)->type()) + 128);
   auto result = (*batches)->ToTable();
   auto s = result.status();
   if (!s.ok()) {
-    LOG_ERROR("Failed to read parquet file[%s]: %s", file_name.c_str(),
+    LOG_ERROR("Failed to read parquet file[%s]: %s", file_name.data(),
               s.ToString().c_str());
     payload.arrow = nullptr;
     return s;
@@ -268,24 +345,34 @@ arrow::Status detail::ParquetBufferLoader::load_checked(
   }
   payload.arrow = table->column(0);
 
+  retain_buffers(payload, size);
+  return arrow::Status::OK();
+} catch (const std::bad_alloc &) {
+  return arrow::Status::OutOfMemory("Parquet cache metadata budget exhausted");
+}
+
+void detail::ParquetBufferLoader::retain_buffers(ParquetBufferPayload &payload,
+                                                 size_t &size) const {
+  // ExternalCache runs the loader outside its mutex. These nodes and control
+  // blocks may reclaim cached pages before admission; the no-reclaim allocator
+  // is only needed for cache bookkeeping performed while holding that mutex.
   size = 0;
   payload.arrow_refs.clear();
-  std::unordered_set<const arrow::Buffer *> seen;
+  BufferSet seen;
   for (auto &array : payload.arrow->chunks()) {
     RetainAndDetachArrowBuffers(array->data(), &payload, &seen, &size);
   }
-
-  return arrow::Status::OK();
 }
 
 void detail::ParquetBufferLoader::clear(ParquetBufferPayload &payload) const {
   payload.arrow = nullptr;
-  payload.arrow_refs.clear();
+  decltype(payload.arrow_refs){}.swap(payload.arrow_refs);
   payload.memory_pool.reset();
+  payload.metadata_memory.retain_at_most(0);
 }
 
 ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
-    ParquetBufferID buffer_id) {
+    const ParquetBufferID &buffer_id) {
   auto result = acquire_buffer_checked(buffer_id);
   if (!result.ok()) {
     LOG_ERROR("Failed to acquire parquet buffer: %s: %s",
@@ -331,12 +418,12 @@ ParquetBufferPool::acquire_buffer_checked(
   return arrow::Status::OutOfMemory("Parquet cache allocation failed");
 }
 
-void ParquetBufferPool::release(ParquetBufferID buffer_id) {
+void ParquetBufferPool::release(const ParquetBufferID &buffer_id) {
   cache_.release(buffer_id);
 }
 
 std::shared_ptr<arrow::ChunkedArray> ParquetBufferPool::retain(
-    ParquetBufferID buffer_id) {
+    const ParquetBufferID &buffer_id) {
   return cache_.retain(buffer_id);
 }
 

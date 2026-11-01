@@ -170,8 +170,19 @@ MemForwardStore::prepare_insert(const Doc &doc, uint64_t doc_id) try {
       cache_memory_.add(target - cache_memory_bytes_);
       cache_memory_bytes_ = target;
     }
-    prepared->doc = doc;
+    // The forward schema excludes vectors: copying the complete Doc clones
+    // vector payloads that are written separately by the vector indexer.
+    // Select by field name, not Value type (scalar arrays can share a vector
+    // representation). Keep the existing conservative admission/fullness
+    // estimate so this change cannot enlarge batches or spend more budget.
+    prepared->doc.set_pk(doc.pk_ref());
+    prepared->doc.set_score(doc.score());
+    prepared->doc.set_operator(doc.get_operator());
     prepared->doc.set_doc_id(doc_id);
+    const auto &fields = physic_schema_->fields();
+    for (size_t i = 2; i < fields.size(); ++i) {
+      prepared->doc.copy_field_from(doc, fields[i]->name());
+    }
     if (cache_.size() == cache_.capacity()) cache_.reserve(capacity);
     return prepared;
   }

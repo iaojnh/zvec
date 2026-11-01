@@ -18,6 +18,7 @@
 #include "db/index/storage/memory_forward_store.h"
 #undef private
 #undef protected
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -25,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <arrow/array.h>
 #include <arrow/io/file.h>
 #include <arrow/ipc/reader.h>
@@ -95,6 +97,103 @@ class MemStoreTest : public testing::Test {
   std::shared_ptr<CollectionSchema> schema_;
   std::shared_ptr<MemForwardStore> store_;
 };
+
+TEST_F(MemStoreTest, ForwardCacheOmitsVectorsButKeepsScalarArraysAndNulls) {
+  auto schema = GetCollectionSchema();
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "embedding", DataType::VECTOR_FP32, uint32_t{768}, false))
+                  .ok());
+  ASSERT_TRUE(
+      schema
+          ->add_field(std::make_shared<FieldSchema>(
+              "sparse", DataType::SPARSE_VECTOR_FP32, uint32_t{0}, false))
+          .ok());
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "samples", DataType::ARRAY_FLOAT, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "note", DataType::STRING, true))
+                  .ok());
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "missing", DataType::STRING, true))
+                  .ok());
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("zvec_forward_projection_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto cleanup =
+      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+  MemForwardStore store(schema, path.string(), FileFormat::IPC);
+  ASSERT_TRUE(store.open().ok());
+  Doc doc = CreateDoc(10);
+  ASSERT_TRUE(doc.set("embedding", std::vector<float>(768, 3.0f)));
+  ASSERT_TRUE(
+      doc.set("sparse", std::make_pair(std::vector<uint32_t>{1, 5},
+                                       std::vector<float>{2.0f, 4.0f})));
+  ASSERT_TRUE(doc.set("samples", std::vector<float>{1.0f, 2.0f, 3.0f}));
+  doc.set_null("note");
+  doc.set_score(0.5f);
+  doc.set_operator(Operator::UPDATE);
+  const auto *vector = doc.get_ref<std::vector<float>>("embedding").data();
+  auto prepared = store.prepare_insert(doc, 123);
+  ASSERT_TRUE(prepared.has_value()) << prepared.error().message();
+  const auto &projected = (*prepared)->doc;
+  EXPECT_FALSE(projected.has("embedding"));
+  EXPECT_FALSE(projected.has("sparse"));
+  EXPECT_TRUE(projected.has("samples"));
+  EXPECT_EQ(doc.get_ref<std::vector<float>>("samples"),
+            projected.get_ref<std::vector<float>>("samples"));
+  EXPECT_TRUE(projected.is_null("note"));
+  EXPECT_FALSE(projected.has("missing"));
+  EXPECT_EQ(doc.pk_ref(), projected.pk_ref());
+  EXPECT_EQ(123u, projected.doc_id());
+  EXPECT_EQ(doc.score(), projected.score());
+  EXPECT_EQ(doc.get_operator(), projected.get_operator());
+  EXPECT_LT(projected.memory_usage(), doc.memory_usage());
+  // Admission and fullness remain conservative; no newly freed budget is
+  // consumed by larger batches in the same change.
+  EXPECT_EQ(doc.memory_usage(), (*prepared)->cache_bytes);
+  store.commit_insert(std::move(*prepared));
+  EXPECT_EQ(vector, doc.get_ref<std::vector<float>>("embedding").data());
+  EXPECT_EQ(10u, doc.doc_id());
+  ASSERT_EQ(1u, store.cache_.size());
+  EXPECT_FALSE(store.cache_.front().has("embedding"));
+  // Force the next row through the existing cache-to-Arrow batch boundary.
+  store.max_cache_size_ = 1;
+  Doc next = CreateDoc(11);
+  ASSERT_TRUE(next.set("embedding", std::vector<float>(768, 5.0f)));
+  ASSERT_TRUE(next.set("samples", std::vector<float>{4.0f, 5.0f}));
+  ASSERT_TRUE(store.insert(next).ok());
+  EXPECT_TRUE(store.cache_.empty());
+  ASSERT_EQ(1u, store.batches_.size());
+  auto table = store.get_table();
+  ASSERT_NE(nullptr, table);
+  ASSERT_EQ(2, table->num_rows());
+  EXPECT_EQ(nullptr, table->GetColumnByName("embedding"));
+  EXPECT_EQ(nullptr, table->GetColumnByName("sparse"));
+  auto ids = std::static_pointer_cast<arrow::UInt64Array>(
+      table->GetColumnByName(GLOBAL_DOC_ID)->chunk(0));
+  EXPECT_EQ(123u, ids->Value(0));
+  EXPECT_EQ(11u, ids->Value(1));
+  auto lists = std::static_pointer_cast<arrow::ListArray>(
+      table->GetColumnByName("samples")->chunk(0));
+  auto first =
+      std::static_pointer_cast<arrow::FloatArray>(lists->value_slice(0));
+  auto second =
+      std::static_pointer_cast<arrow::FloatArray>(lists->value_slice(1));
+  ASSERT_EQ(3, first->length());
+  ASSERT_EQ(2, second->length());
+  EXPECT_FLOAT_EQ(3.0f, first->Value(2));
+  EXPECT_FLOAT_EQ(5.0f, second->Value(1));
+  EXPECT_EQ(2, table->GetColumnByName("note")->null_count());
+  EXPECT_EQ(2, table->GetColumnByName("missing")->null_count());
+  ASSERT_TRUE(store.close().ok());
+}
 
 // Test constructor
 TEST_F(MemStoreTest, ProjectsBeforeCopyingSelectedRows) {

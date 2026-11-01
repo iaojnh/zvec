@@ -40,6 +40,34 @@ class DocDetailedTest : public ::testing::Test {
   Doc::Ptr test_doc_;
 };
 
+TEST_F(DocDetailedTest, CopiesOnlyRequestedFieldWithoutChangingSource) {
+  const std::vector<float> values{1.0f, 2.0f, 3.0f};
+  ASSERT_TRUE(test_doc_->set("values", values));
+  test_doc_->set_null("nullable");
+  ASSERT_TRUE(test_doc_->set("unselected", std::string(4096, 'x')));
+  const auto *original =
+      test_doc_->get_ref<std::vector<float>>("values").data();
+  Doc projected;
+  projected.set_pk("destination");
+  projected.set_doc_id(7);
+  ASSERT_TRUE(projected.set("values", int32_t{1}));
+  ASSERT_TRUE(projected.set("missing", std::string("keep")));
+  ASSERT_TRUE(projected.copy_field_from(*test_doc_, "values"));
+  EXPECT_EQ(values, projected.get_ref<std::vector<float>>("values"));
+  EXPECT_NE(original, projected.get_ref<std::vector<float>>("values").data());
+  ASSERT_TRUE(projected.copy_field_from(*test_doc_, "nullable"));
+  EXPECT_TRUE(projected.is_null("nullable"));
+  EXPECT_FALSE(projected.copy_field_from(*test_doc_, "missing"));
+  EXPECT_EQ("keep", projected.get_ref<std::string>("missing"));
+  EXPECT_FALSE(projected.has("unselected"));
+  EXPECT_EQ("destination", projected.pk_ref());
+  EXPECT_EQ(7u, projected.doc_id());
+  EXPECT_EQ(original, test_doc_->get_ref<std::vector<float>>("values").data());
+  EXPECT_TRUE(test_doc_->has("unselected"));
+  EXPECT_EQ("test_pk", test_doc_->pk_ref());
+  EXPECT_EQ(12345u, test_doc_->doc_id());
+}
+
 TEST_F(DocDetailedTest, SerializedSizeMatchesEveryValueType) {
   const std::vector<Doc::Value> values{
       std::monostate{},

@@ -18,8 +18,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <arrow/result.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/external_cache.h>
 
 namespace arrow {
@@ -34,7 +36,6 @@ class FileMetaData;
 namespace zvec {
 
 struct ParquetBufferID {
-  std::string filename;
   int column{0};
   int row_group{0};
   uint64_t file_id{0};
@@ -49,12 +50,31 @@ struct ParquetBufferID {
   ParquetBufferID(const std::string &filename, int column, int row_group,
                   const ParquetBufferID &metadata_source);
 
+  std::string_view filename() const noexcept {
+    return filename_ ? std::string_view(filename_->data(), filename_->size())
+                     : std::string_view("");
+  }
+
   const std::string to_string() const;
+
+ private:
+  using Filename =
+      std::basic_string<char, std::char_traits<char>,
+                        ailego::CacheMetadataAllocator<char, true>>;
+  ParquetBufferID(const std::string &filename, int column, int row_group,
+                  std::shared_ptr<const Filename> shared_filename);
+
+  // Created with reclaim-capable admission outside the cache lock. Copying a
+  // key (including cache nodes and escaped views) only shares this immutable
+  // owner, so it neither allocates nor enters reclamation under that lock.
+  // Both string capacity and the shared control block remain budgeted until
+  // the final key owner is destroyed.
+  std::shared_ptr<const Filename> filename_;
 };
 
 struct ParquetBufferIDHash {
   size_t operator()(const ParquetBufferID &buffer_id) const {
-    size_t hash = std::hash<std::string>{}(buffer_id.filename);
+    size_t hash = std::hash<std::string_view>{}(buffer_id.filename());
     const auto combine = [&hash](size_t value) {
       hash ^= value + 0x9e3779b9U + (hash << 6) + (hash >> 2);
     };
@@ -68,7 +88,7 @@ struct ParquetBufferIDHash {
 
 struct ParquetBufferIDEqual {
   bool operator()(const ParquetBufferID &a, const ParquetBufferID &b) const {
-    if (a.filename != b.filename) {
+    if (a.filename() != b.filename()) {
       return false;
     }
     if (a.file_id != b.file_id) {
@@ -86,11 +106,15 @@ namespace detail {
 class ParquetMemoryPool;
 
 struct ParquetBufferPayload {
+  // Arrow's MemoryPool covers buffer bytes, not Array/ArrayData/Buffer
+  // wrappers. Admit a schema/chunk-based allowance before decoding and keep
+  // it until all cached wrappers have been destroyed.
+  ailego::MemoryReservation metadata_memory;
   // Arrow buffers store a raw pool pointer. Destroy their owners before this
   // shared pool owner, including when a cached payload outlives its reader.
   std::shared_ptr<ParquetMemoryPool> memory_pool;
   std::shared_ptr<arrow::ChunkedArray> arrow{nullptr};
-  std::vector<std::shared_ptr<arrow::Buffer>> arrow_refs{};
+  ailego::BudgetedVector<std::shared_ptr<arrow::Buffer>> arrow_refs{};
 };
 
 class ParquetBufferLoader {
@@ -108,6 +132,9 @@ class ParquetBufferLoader {
   }
 
   void clear(ParquetBufferPayload &payload) const;
+
+ private:
+  void retain_buffers(ParquetBufferPayload &payload, size_t &size) const;
 };
 
 }  // namespace detail
@@ -137,7 +164,7 @@ class ParquetBufferPool {
  public:
   typedef std::shared_ptr<ParquetBufferPool> Pointer;
 
-  ParquetBufferContextHandle acquire_buffer(ParquetBufferID buffer_id);
+  ParquetBufferContextHandle acquire_buffer(const ParquetBufferID &buffer_id);
 
   //! Pin an already loaded column without decoding or admitting a cold miss.
   ParquetBufferContextHandle try_acquire_buffer(
@@ -148,7 +175,7 @@ class ParquetBufferPool {
 
   void retire_file(const ParquetBufferID &file) {
     cache_.retire_if([&file](const ParquetBufferID &key) {
-      return key.filename == file.filename && key.file_id == file.file_id &&
+      return key.filename() == file.filename() && key.file_id == file.file_id &&
              key.mtime == file.mtime;
     });
   }
@@ -176,9 +203,9 @@ class ParquetBufferPool {
   ParquetBufferPool()
       : cache_(detail::ParquetBufferLoader{}, kMaxConcurrentLoads) {}
 
-  std::shared_ptr<arrow::ChunkedArray> retain(ParquetBufferID buffer_id);
+  std::shared_ptr<arrow::ChunkedArray> retain(const ParquetBufferID &buffer_id);
 
-  void release(ParquetBufferID buffer_id);
+  void release(const ParquetBufferID &buffer_id);
 
  private:
   Cache cache_;

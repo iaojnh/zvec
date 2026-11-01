@@ -260,6 +260,15 @@ class ZVEC_API Doc {
     fields_.erase(field_name);
   }
 
+  // Copy one present field without materializing unrelated values. Explicit
+  // nulls are copied; an absent field leaves the destination unchanged.
+  bool copy_field_from(const Doc &other, const std::string &field_name) {
+    auto it = other.fields_.find(field_name);
+    if (it == other.fields_.end()) return false;
+    fields_.insert_or_assign(it->first, it->second);
+    return true;
+  }
+
   Status validate_and_sanitize(const CollectionSchema::Ptr &schema,
                                bool is_update = false);
 

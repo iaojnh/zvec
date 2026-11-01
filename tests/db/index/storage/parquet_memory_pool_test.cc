@@ -25,9 +25,12 @@
 #include <arrow/api.h>
 #include <arrow/buffer.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
+#include <parquet/statistics.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "db/index/storage/chunked_file_writer.h"
+#include "db/index/storage/parquet_writer.h"
 #include "db/index/storage/store_helper.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
@@ -384,6 +387,189 @@ TEST_F(ParquetBudgetTest, SmallBackingAdmissionFailureCanRetry) {
   ASSERT_TRUE(pool.Allocate(1024, &buffer).ok());
   pool.Free(buffer, 1024);
   EXPECT_EQ(0u, budget_.used());
+}
+
+TEST_F(ParquetBudgetTest, SmallBatchesShareBoundedRowGroups) {
+  ASSERT_EQ(0, budget_.init(64 * 1024 * 1024));
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("zvec_parquet_small_batches_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto cleanup =
+      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+  auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
+  arrow::BinaryBuilder builder;
+  for (int i = 0; i < 64; ++i)
+    ASSERT_TRUE(builder.Append(std::string(64, 'x') + std::to_string(i)).ok());
+  auto array = builder.Finish().ValueOrDie();
+  auto batch = arrow::RecordBatch::Make(schema, 64, {array});
+  auto table = arrow::Table::FromRecordBatches({batch}).ValueOrDie();
+  auto writer =
+      ChunkedFileWriter::Open(path.string(), schema, FileFormat::PARQUET);
+  ASSERT_NE(nullptr, writer);
+  for (int i = 0; i < 256; ++i) {
+    auto status = i % 2 ? writer->write(*batch) : writer->write(*table);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_LE(budget_.used(), budget_.capacity());
+  }
+  ASSERT_TRUE(writer->close().ok());
+  writer.reset();
+  EXPECT_EQ(0u, budget_.used());
+  auto file = parquet::ParquetFileReader::OpenFile(path.string(), false);
+  EXPECT_EQ(16384, file->metadata()->num_rows());
+  ASSERT_EQ(2, file->metadata()->num_row_groups());
+  EXPECT_EQ(8192, file->metadata()->RowGroup(0)->num_rows());
+  EXPECT_EQ(8192, file->metadata()->RowGroup(1)->num_rows());
+  auto input = arrow::io::ReadableFile::Open(path.string()).ValueOrDie();
+  auto reader = parquet::arrow::OpenFile(input, arrow::default_memory_pool())
+                    .ValueOrDie();
+  std::shared_ptr<arrow::Table> actual;
+  ASSERT_TRUE(reader->ReadTable(&actual).ok());
+  auto expected =
+      arrow::Table::FromRecordBatches(
+          std::vector<std::shared_ptr<arrow::RecordBatch>>(256, batch))
+          .ValueOrDie();
+  EXPECT_TRUE(actual->Equals(*expected));
+}
+
+TEST_F(ParquetBudgetTest, SlicedBatchesUseReferencedBytesAndExplicitRowLimit) {
+  ASSERT_EQ(0, budget_.init(64 * 1024 * 1024));
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("zvec_parquet_sliced_batches_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto cleanup =
+      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+  auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
+  arrow::BinaryBuilder builder;
+  for (int i = 0; i < 8192; ++i)
+    ASSERT_TRUE(builder.Append(std::string(512, 'a') + std::to_string(i)).ok());
+  auto batch =
+      arrow::RecordBatch::Make(schema, 8192, {builder.Finish().ValueOrDie()});
+  std::vector<std::shared_ptr<arrow::RecordBatch>> expected_batches;
+  {
+    ParquetWriter writer(path.string(), 1000);
+    for (int i = 0; i < 32; ++i) {
+      auto slice = batch->Slice(i * 64, 64);
+      expected_batches.push_back(slice);
+      ASSERT_TRUE(writer.insert_batch(slice).ok());
+    }
+    ASSERT_TRUE(writer.finalize().ok());
+  }
+  EXPECT_EQ(0u, budget_.used());
+  auto file = parquet::ParquetFileReader::OpenFile(path.string(), false);
+  EXPECT_EQ(2048, file->metadata()->num_rows());
+  ASSERT_EQ(3, file->metadata()->num_row_groups());
+  for (int i = 0; i < 3; ++i)
+    EXPECT_LE(file->metadata()->RowGroup(i)->num_rows(), 1000);
+  auto input = arrow::io::ReadableFile::Open(path.string()).ValueOrDie();
+  auto reader = parquet::arrow::OpenFile(input, arrow::default_memory_pool())
+                    .ValueOrDie();
+  std::shared_ptr<arrow::Table> actual;
+  ASSERT_TRUE(reader->ReadTable(&actual).ok());
+  auto expected =
+      arrow::Table::FromRecordBatches(expected_batches).ValueOrDie();
+  EXPECT_TRUE(actual->Equals(*expected));
+}
+
+TEST_F(ParquetBudgetTest, FailedBufferedWriteDoesNotResumeOrReportSuccess) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("zvec_parquet_failed_batch_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto cleanup =
+      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+  auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
+  arrow::BinaryBuilder builder;
+  ASSERT_TRUE(builder.Append(std::string(4096, 'x')).ok());
+  auto batch =
+      arrow::RecordBatch::Make(schema, 1, {builder.Finish().ValueOrDie()});
+  auto writer =
+      ChunkedFileWriter::Open(path.string(), schema, FileFormat::PARQUET);
+  ASSERT_NE(nullptr, writer);
+  const size_t remaining = budget_.capacity() - budget_.used();
+  ASSERT_TRUE(budget_.try_charge_external(remaining));
+  auto status = writer->write(*batch);
+  budget_.release_external(remaining);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status, writer->write(*batch));
+  EXPECT_EQ(status, writer->close());
+  writer.reset();
+  EXPECT_EQ(0u, budget_.used());
+}
+
+TEST_F(ParquetBudgetTest,
+       WritersOmitUnusedPageIndexesAndPreserveRowGroupStatistics) {
+  ASSERT_EQ(0, budget_.init(64 * 1024 * 1024));
+  auto schema = arrow::schema({arrow::field("row", arrow::int64()),
+                               arrow::field("payload", arrow::utf8())});
+  arrow::Int64Builder rows;
+  arrow::StringBuilder strings;
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_TRUE(rows.Append(i).ok());
+    ASSERT_TRUE((i % 11 == 0 ? strings.AppendNull()
+                             : strings.Append("value_" + std::to_string(i)))
+                    .ok());
+  }
+  auto batch = arrow::RecordBatch::Make(
+      schema, 64, {rows.Finish().ValueOrDie(), strings.Finish().ValueOrDie()});
+  auto table = arrow::Table::FromRecordBatches({batch}).ValueOrDie();
+  auto expected = arrow::Table::FromRecordBatches({batch, batch}).ValueOrDie();
+  for (int entry = 0; entry < 3; ++entry) {
+    SCOPED_TRACE(entry);
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        ("zvec_parquet_no_page_index_" + std::to_string(entry) + "_" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    auto cleanup =
+        ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+    if (entry == 0) {
+      auto writer =
+          ChunkedFileWriter::Open(path.string(), schema, FileFormat::PARQUET);
+      ASSERT_NE(nullptr, writer);
+      ASSERT_TRUE(writer->write(*batch).ok());
+      ASSERT_TRUE(writer->write(*table).ok());
+      ASSERT_TRUE(writer->close().ok());
+    } else {
+      ParquetWriter writer(path.string(), 32);
+      if (entry == 1) {
+        ASSERT_TRUE(writer.insert_batch(batch).ok());
+        ASSERT_TRUE(writer.insert_batch(batch).ok());
+      } else {
+        auto input =
+            arrow::RecordBatchReader::Make({batch, batch}, schema).ValueOrDie();
+        ASSERT_TRUE(writer.insert(std::move(input)).ok());
+      }
+      ASSERT_TRUE(writer.finalize().ok());
+    }
+    EXPECT_EQ(0u, budget_.used());
+    auto file = parquet::ParquetFileReader::OpenFile(path.string(), false);
+    ASSERT_EQ(128, file->metadata()->num_rows());
+    ASSERT_GT(file->metadata()->num_row_groups(), 0);
+    for (int group = 0; group < file->metadata()->num_row_groups(); ++group) {
+      auto metadata = file->metadata()->RowGroup(group);
+      ASSERT_EQ(2, metadata->num_columns());
+      for (int column = 0; column < metadata->num_columns(); ++column) {
+        auto chunk = metadata->ColumnChunk(column);
+        EXPECT_FALSE(chunk->GetColumnIndexLocation().has_value());
+        EXPECT_FALSE(chunk->GetOffsetIndexLocation().has_value());
+        ASSERT_TRUE(chunk->is_stats_set());
+        ASSERT_NE(nullptr, chunk->statistics());
+        EXPECT_TRUE(chunk->statistics()->HasMinMax());
+      }
+    }
+    auto input = arrow::io::ReadableFile::Open(path.string()).ValueOrDie();
+    auto reader = parquet::arrow::OpenFile(input, arrow::default_memory_pool())
+                      .ValueOrDie();
+    std::shared_ptr<arrow::Table> actual;
+    ASSERT_TRUE(reader->ReadTable(&actual).ok());
+    EXPECT_TRUE(actual->Equals(*expected));
+  }
 }
 
 TEST_F(ParquetBudgetTest, SmallSlotsReuseBackingAndKeepItCharged) {

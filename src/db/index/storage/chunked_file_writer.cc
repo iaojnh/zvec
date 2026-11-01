@@ -73,6 +73,9 @@ class ParquetChunkedWriter : public ChunkedFileWriter {
 
     parquet::WriterProperties::Builder builder;
     builder.memory_pool(detail::GetParquetMemoryPool().get());
+    // Forward readers load row groups, not page indexes. Avoid accumulating
+    // unused page metadata outside Arrow's pool; keep row-group statistics.
+    builder.disable_write_page_index();
     auto properties = builder.build();
 
     std::shared_ptr<parquet::arrow::FileWriter> writer;
@@ -93,14 +96,15 @@ class ParquetChunkedWriter : public ChunkedFileWriter {
         writer_(std::move(writer)) {}
 
   arrow::Status write(const arrow::RecordBatch &batch) override {
-    return detail::WriteParquetBatch(writer_.get(), batch);
+    return batch_writer_.write(writer_.get(), batch);
   }
 
   arrow::Status write(const arrow::Table &table) override {
-    return detail::WriteParquetTable(writer_.get(), table);
+    return batch_writer_.write(writer_.get(), table);
   }
 
   arrow::Status close() override {
+    ARROW_RETURN_NOT_OK(batch_writer_.status());
     ARROW_RETURN_NOT_OK(writer_->Close());
     return out_file_->Close();
   }
@@ -108,6 +112,7 @@ class ParquetChunkedWriter : public ChunkedFileWriter {
  private:
   std::shared_ptr<arrow::io::FileOutputStream> out_file_;
   std::shared_ptr<parquet::arrow::FileWriter> writer_;
+  detail::ParquetBatchWriter batch_writer_;
 };
 
 

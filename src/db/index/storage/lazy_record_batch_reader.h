@@ -107,7 +107,7 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
     projected_schema_ = arrow::schema(fields);
 
     auto parquet_metadata = reader_->parquet_reader()->metadata();
-    metadata_id_ = metadata_id.filename.empty()
+    metadata_id_ = metadata_id.filename().empty()
                        ? ParquetBufferID(file_path_, 0, 0)
                        : std::move(metadata_id);
     metadata_id_.metadata = parquet_metadata;
@@ -127,7 +127,8 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
     return projected_schema_;
   }
 
-  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
+  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override
+      try {
     *batch = nullptr;
     while (true) {
       if (cached_batches_) {
@@ -153,17 +154,23 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
       std::vector<std::shared_ptr<arrow::ChunkedArray>> columns(
           col_indices_.size());
       for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
-        auto buffer_id = ParquetBufferID(file_path_, col_indices_[col_idx],
-                                         rg_id, metadata_id_);
         // A one-pass scan must not fill the point-read cache with entire cold
         // columns. Reuse resident columns without copying; on a miss, stream
         // bounded batches through the same budgeted decoder instead. Preserve
         // the legacy reader's cache behavior when no budgeted pool is supplied.
-        auto &cache = ParquetBufferPool::get_instance();
-        auto buffer_handle = memory_pool_ ? cache.try_acquire_buffer(buffer_id)
-                                          : cache.acquire_buffer(buffer_id);
-        std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
-            buffer_handle.data();
+        std::shared_ptr<arrow::ChunkedArray> col_chunked_array;
+        try {
+          auto buffer_id = ParquetBufferID(file_path_, col_indices_[col_idx],
+                                           rg_id, metadata_id_);
+          auto &cache = ParquetBufferPool::get_instance();
+          auto buffer_handle = memory_pool_
+                                   ? cache.try_acquire_buffer(buffer_id)
+                                   : cache.acquire_buffer(buffer_id);
+          col_chunked_array = buffer_handle.data();
+        } catch (const std::bad_alloc &) {
+          // Cache keys and escaped-view metadata also require admission.
+          // A refusal follows the same bounded streaming path as a cold miss.
+        }
         if (!col_chunked_array) {
           // Cache residency is optional. Drop partial columns before reading
           // the same row group in bounded batches, without publishing any rows
@@ -185,6 +192,9 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
       cached_batches_->set_chunksize(8192);
       current_row_group_++;
     }
+  } catch (const std::bad_alloc &) {
+    *batch = nullptr;
+    return arrow::Status::OutOfMemory("Parquet scan metadata budget exhausted");
   }
 
  private:

@@ -19,6 +19,7 @@
 #include <iostream>
 #include <memory>
 #include <thread>
+#include <type_traits>
 #include <arrow/api.h>
 #include <arrow/io/file.h>
 #include <arrow/result.h>
@@ -199,13 +200,330 @@ TEST_F(BufferPoolStoreTest, MetadataHintRequiresMatchingFileIdentity) {
   ++wrong_source.mtime;
   EXPECT_TRUE(
       ParquetBufferID(parquet_path, 1, 0, wrong_source).metadata.expired());
-  wrong_source = source;
-  wrong_source.filename += ".other";
+  wrong_source = ParquetBufferID(parquet_path + ".other", 0, 0);
+  wrong_source.file_id = source.file_id;
+  wrong_source.mtime = source.mtime;
+  wrong_source.metadata = source.metadata;
   EXPECT_TRUE(
       ParquetBufferID(parquet_path, 1, 0, wrong_source).metadata.expired());
 
   reader.reset();
   EXPECT_TRUE(hinted.metadata.expired());
+}
+
+TEST_F(BufferPoolStoreTest, CacheKeyCopiesShareBudgetUntilLastOwner) {
+  static_assert(std::is_nothrow_copy_constructible<ParquetBufferID>::value);
+  static_assert(std::is_nothrow_copy_assignable<ParquetBufferID>::value);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto before = pool.metadata_used();
+  ParquetBufferID escaped;
+  size_t first = 0;
+  {
+    ParquetBufferID key(parquet_path + std::string(1024, 'x'), 0, 0);
+    first = pool.metadata_used();
+    EXPECT_GT(first, before + 1024);
+    {
+      auto copy = key;
+      EXPECT_EQ(first, pool.metadata_used());
+      EXPECT_EQ(key.filename().data(), copy.filename().data());
+      auto moved = std::move(copy);
+      EXPECT_EQ(first, pool.metadata_used());
+      EXPECT_TRUE(ParquetBufferIDEqual{}(key, moved));
+      escaped = moved;
+    }
+    EXPECT_EQ(first, pool.metadata_used());
+  }
+  EXPECT_EQ(first, pool.metadata_used());
+  EXPECT_EQ(parquet_path + std::string(1024, 'x'), escaped.filename());
+  escaped = {};
+  EXPECT_EQ(before, pool.metadata_used());
+}
+
+TEST_F(BufferPoolStoreTest, CachedArrayShellsHaveSeparateMetadataAllowance) {
+  detail::ParquetBufferLoader loader;
+  detail::ParquetBufferPayload payload;
+  size_t bytes = 0;
+  ASSERT_TRUE(loader.load(ParquetBufferID(parquet_path, 0, 0), payload, bytes));
+  EXPECT_GT(payload.metadata_memory.bytes(), 0u);
+  EXPECT_GT(payload.arrow_refs.capacity(), 0u);
+  EXPECT_GT(ailego::MemoryLimitPool::get_instance().external_used(),
+            detail::GetParquetMemoryPool()->charged_bytes());
+  loader.clear(payload);
+  EXPECT_EQ(0u, payload.metadata_memory.bytes());
+  EXPECT_EQ(0u, payload.arrow_refs.capacity());
+  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().external_used());
+}
+
+namespace {
+
+// Model an evictable column, not an uncharged allocation. With no page
+// buffers, background page-watermark eviction stays idle; only foreground
+// admission should reclaim this payload. RAII also covers failed assertions.
+class ReclaimableParquetBudget : public ailego::EvictableBlockOwner {
+ public:
+  ReclaimableParquetBudget() {
+    memory_.add(1024 * 1024);
+    data_.resize(1024 * 1024);
+    auto &queue = ailego::BlockEvictionQueue::get_instance();
+    queue.set_valid(this);
+    registered_ = queue.add_single_block({0, 1, this, 0}, 0);
+  }
+  ~ReclaimableParquetBudget() override {
+    ailego::BlockEvictionQueue::get_instance().set_invalid(this);
+  }
+  bool is_dead_block(ailego::eviction_key_t, ailego::version_t) override {
+    return reclaimed_.load();
+  }
+  bool evict_block(ailego::eviction_key_t) override {
+    std::vector<char>{}.swap(data_);
+    memory_.retain_at_most(0);
+    reclaimed_.store(true);
+    return true;
+  }
+  bool registered() const {
+    return registered_;
+  }
+  bool reclaimed() const {
+    return reclaimed_.load();
+  }
+
+ private:
+  ailego::MemoryReservation memory_;
+  std::vector<char> data_;
+  std::atomic<bool> reclaimed_{false};
+  bool registered_{false};
+};
+
+}  // namespace
+
+TEST_F(BufferPoolStoreTest, CacheKeyConstructionReclaimsOutsideCacheLock) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ReclaimableParquetBudget cached;
+  ASSERT_TRUE(cached.registered());
+  ASSERT_EQ(0u, pool.stats().page_used);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.committed());
+  ASSERT_FALSE(cached.reclaimed());
+  ASSERT_NO_THROW(ParquetBufferID(parquet_path + std::string(1024, 'x'), 0, 0));
+  EXPECT_TRUE(cached.reclaimed());
+  EXPECT_LE(pool.committed(), pool.capacity());
+}
+
+TEST_F(BufferPoolStoreTest, SharedKeyCopiesDoNotReclaimAtFullBudget) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ParquetBufferID key(parquet_path, 0, 0);
+  ReclaimableParquetBudget cached;
+  ASSERT_TRUE(cached.registered());
+  ASSERT_EQ(0u, pool.stats().page_used);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.committed());
+  ASSERT_EQ(pool.capacity(), pool.committed());
+
+  auto copy = key;
+  ParquetBufferID assigned;
+  assigned = copy;
+  ParquetBufferID hinted(parquet_path, 1, 0, key);
+  EXPECT_EQ(key.filename().data(), assigned.filename().data());
+  EXPECT_EQ(key.filename().data(), hinted.filename().data());
+  EXPECT_TRUE(ParquetBufferIDEqual{}(key, copy));
+  EXPECT_EQ(ParquetBufferIDHash{}(key), ParquetBufferIDHash{}(copy));
+  EXPECT_FALSE(cached.reclaimed());
+  EXPECT_EQ(pool.capacity(), pool.committed());
+
+  // Cache node/bucket admission must still refuse without invoking an owner:
+  // its caller may hold the same cache lock that owner needs to evict.
+  ailego::CacheMetadataAllocator<char> allocator;
+  EXPECT_THROW(allocator.allocate(64), std::bad_alloc);
+  EXPECT_FALSE(cached.reclaimed());
+}
+
+TEST_F(BufferPoolStoreTest, CacheKeyRejectsPinnedBudgetAndCanRetry) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0u, pool.stats().page_used);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.committed());
+  const auto before = pool.metadata_used();
+  EXPECT_THROW(ParquetBufferID(parquet_path, 0, 0), std::bad_alloc);
+  EXPECT_EQ(before, pool.metadata_used());
+  EXPECT_LE(pool.committed(), pool.capacity());
+  // Allow the shared control block but not a long filename. Constructor
+  // rollback must release the control block's reservation as well.
+  pressure.retain_at_most(pressure.bytes() - 256);
+  const auto partial = pool.metadata_used();
+  EXPECT_THROW(ParquetBufferID(parquet_path + std::string(1024, 'x'), 0, 0),
+               std::bad_alloc);
+  EXPECT_EQ(partial, pool.metadata_used());
+  pressure.retain_at_most(0);
+  EXPECT_NO_THROW(ParquetBufferID(parquet_path, 0, 0));
+}
+
+TEST_F(BufferPoolStoreTest, ConcurrentKeyCopiesKeepLastOwnerBudget) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto before = pool.metadata_used();
+  ParquetBufferID key(parquet_path + std::string(1024, 'x'), 0, 0);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.committed());
+  std::atomic<bool> start{false};
+  std::atomic<bool> failed{false};
+  std::array<std::thread, 4> workers;
+  for (auto &worker : workers) {
+    worker = std::thread([key, &start, &failed] {
+      while (!start.load()) std::this_thread::yield();
+      for (size_t i = 0; i < 256; ++i) {
+        auto copy = key;
+        ParquetBufferID assigned;
+        assigned = copy;
+        if (assigned.filename().data() != key.filename().data() ||
+            !ParquetBufferIDEqual{}(assigned, key)) {
+          failed.store(true);
+        }
+      }
+    });
+  }
+  key = {};
+  EXPECT_GT(pool.metadata_used(), before);
+  start.store(true);
+  for (auto &worker : workers) worker.join();
+  EXPECT_FALSE(failed.load());
+  EXPECT_EQ(before, pool.metadata_used());
+}
+
+TEST_F(BufferPoolStoreTest, PinnedViewReclaimsBudgetWithoutCopyingKeyStorage) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ParquetBufferID key(parquet_path, 0, 0);
+  auto handle = ParquetBufferPool::get_instance().acquire_buffer(key);
+  ASSERT_NE(nullptr, handle.data());
+  ReclaimableParquetBudget cached;
+  ASSERT_TRUE(cached.registered());
+  ASSERT_EQ(0u, pool.stats().page_used);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.used());
+  ASSERT_EQ(pool.capacity(), pool.used());
+  ASSERT_EQ(pool.capacity(), pool.committed());
+  ASSERT_FALSE(cached.reclaimed());
+  std::shared_ptr<arrow::ChunkedArray> view;
+  ASSERT_NO_THROW(view = handle.data());
+  ASSERT_NE(nullptr, view);
+  EXPECT_TRUE(view->ValidateFull().ok());
+  EXPECT_TRUE(cached.reclaimed());
+  EXPECT_LE(pool.committed(), pool.capacity());
+}
+
+TEST_F(BufferPoolStoreTest, ForwardFetchReclaimsBudgetAtKeyBoundary) {
+  BufferPoolForwardStore store(parquet_path);
+  ASSERT_TRUE(store.open().ok());
+  auto expected = store.fetch({"id"}, std::vector<int>{1});
+  ASSERT_NE(nullptr, expected);
+  // Cover result buffers separately, so the first reclaim opportunity is
+  // the key/view path rather than an earlier Arrow output-builder reserve.
+  ailego::MemoryReservation output_allowance;
+  output_allowance.add(64 * 1024);
+  detail::FetchMemoryPool output_pool(arrow::default_memory_pool(), 64 * 1024);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ReclaimableParquetBudget cached;
+  ASSERT_TRUE(cached.registered());
+  ASSERT_EQ(0u, pool.stats().page_used);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.used());
+  ASSERT_EQ(pool.capacity(), pool.used());
+  ASSERT_EQ(pool.capacity(), pool.committed());
+  ASSERT_FALSE(cached.reclaimed());
+  {
+    auto actual = store.fetch_checked({"id"}, {1}, &output_pool);
+    ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+    EXPECT_TRUE((*actual)->Equals(*expected));
+    EXPECT_TRUE(cached.reclaimed());
+    EXPECT_LE(pool.committed(), pool.capacity());
+  }
+  EXPECT_EQ(0, output_pool.bytes_allocated());
+}
+
+TEST_F(BufferPoolStoreTest, DecodedBufferOwnershipReclaimsCachedBudget) {
+  arrow::Int64Builder builder;
+  ASSERT_TRUE(builder.AppendValues({17, 23}).ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  detail::ParquetBufferPayload payload;
+  payload.arrow = std::make_shared<arrow::ChunkedArray>(array);
+  ReclaimableParquetBudget cached;
+  ASSERT_TRUE(cached.registered());
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0u, pool.stats().page_used);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.used());
+  ASSERT_EQ(pool.capacity(), pool.committed());
+  ASSERT_FALSE(cached.reclaimed());
+  detail::ParquetBufferLoader loader;
+  size_t bytes = 0;
+  try {
+    loader.retain_buffers(payload, bytes);
+  } catch (const std::bad_alloc &) {
+    ADD_FAILURE()
+        << "Decoded buffer ownership rejected reclaimable cache budget";
+    return;
+  }
+  EXPECT_TRUE(cached.reclaimed());
+  EXPECT_GT(bytes, 0u);
+  EXPECT_LE(pool.committed(), pool.capacity());
+  EXPECT_EQ(23,
+            std::static_pointer_cast<arrow::Int64Array>(payload.arrow->chunk(0))
+                ->Value(1));
+  array.reset();
+  loader.clear(payload);
+}
+
+TEST_F(BufferPoolStoreTest,
+       DecodedBufferOwnershipRejectsPinnedBudgetAndRetries) {
+  arrow::StringBuilder builder;
+  ASSERT_TRUE(builder.Append("first").ok());
+  ASSERT_TRUE(builder.Append("second").ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  detail::ParquetBufferPayload payload;
+  payload.arrow =
+      std::make_shared<arrow::ChunkedArray>(arrow::ArrayVector{array, array});
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0u, pool.stats().page_used);
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.used());
+  ASSERT_EQ(pool.capacity(), pool.committed());
+  detail::ParquetBufferLoader loader;
+  size_t bytes = 0;
+  EXPECT_THROW(loader.retain_buffers(payload, bytes), std::bad_alloc);
+  EXPECT_LE(pool.committed(), pool.capacity());
+  EXPECT_TRUE(payload.arrow_refs.empty());
+  pressure.retain_at_most(0);
+  ASSERT_NO_THROW(loader.retain_buffers(payload, bytes));
+  EXPECT_EQ(2u, payload.arrow_refs.size());
+  EXPECT_EQ("second", std::static_pointer_cast<arrow::StringArray>(
+                          payload.arrow->chunk(1))
+                          ->GetString(1));
+  array.reset();
+  loader.clear(payload);
+  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().external_used());
+}
+
+TEST_F(BufferPoolStoreTest,
+       EscapedArrayDataKeepsMetadataAndPinAfterRetirement) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  auto &cache = ParquetBufferPool::get_instance();
+  std::shared_ptr<arrow::ArrayData> escaped;
+  {
+    ParquetBufferID key(parquet_path, 0, 0);
+    auto handle = cache.acquire_buffer(key);
+    const auto cached = pool.external_used();
+    ASSERT_GT(cached, 0u);
+    auto view = handle.data();
+    ASSERT_NE(nullptr, view);
+    EXPECT_GT(pool.external_used(), cached);
+    escaped = view->chunk(0)->data();
+    cache.retire_file(key);
+  }
+  EXPECT_GT(pool.external_used(), 0u);
+  EXPECT_TRUE(arrow::MakeArray(escaped)->ValidateFull().ok());
+  escaped.reset();
+  EXPECT_EQ(0u, pool.external_used());
+  EXPECT_EQ(0u, cache.cache_.entry_count());
 }
 
 TEST_F(BufferPoolStoreTest, BufferedFilesUseSuppliedPoolForPathsAndUris) {
@@ -975,21 +1293,29 @@ class BufferPoolScanBudgetTest : public testing::Test {
 TEST_F(BufferPoolScanBudgetTest, FullPoolRejectsDecodeAndRecoversAfterRelease) {
   BufferPoolForwardStore store(parquet_path_);
   ASSERT_TRUE(store.open().ok());
+  const ParquetBufferID key(parquet_path_, 0, 0);
+  auto reader = store.scan({GLOBAL_DOC_ID, "value"});
+  ASSERT_NE(nullptr, reader);
   ASSERT_NO_FATAL_FAILURE(reserve_remaining_capacity());
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t external_before = pool.external_used();
-  auto denied = ParquetBufferPool::get_instance().acquire_buffer(
-      ParquetBufferID(parquet_path_, /*column=*/0, /*row_group=*/0));
+  auto denied = ParquetBufferPool::get_instance().acquire_buffer(key);
   ASSERT_EQ(nullptr, denied.data());
-  auto checked = ParquetBufferPool::get_instance().acquire_buffer_checked(
-      ParquetBufferID(parquet_path_, /*column=*/0, /*row_group=*/0));
+  auto checked = ParquetBufferPool::get_instance().acquire_buffer_checked(key);
   EXPECT_TRUE(checked.status().IsOutOfMemory()) << checked.status().ToString();
   auto fetch = store.fetch_checked({"value"}, {0, 1},
                                    detail::GetParquetMemoryPool().get());
   EXPECT_TRUE(fetch.status().IsOutOfMemory()) << fetch.status().ToString();
+  EXPECT_EQ(nullptr, store.fetch({"value"}, 0));
+  // Opening a lazy reader may now reuse the store's immutable key without
+  // allocating. Admission must still reject its first actual decode.
+  auto denied_scan = store.scan({GLOBAL_DOC_ID, "value"});
+  if (denied_scan) {
+    std::shared_ptr<arrow::RecordBatch> batch;
+    EXPECT_TRUE(denied_scan->ReadNext(&batch).IsOutOfMemory());
+    EXPECT_EQ(nullptr, batch);
+  }
   {
-    auto reader = store.scan({GLOBAL_DOC_ID, "value"});
-    ASSERT_NE(nullptr, reader);
     std::shared_ptr<arrow::RecordBatch> batch;
     EXPECT_TRUE(reader->ReadNext(&batch).IsOutOfMemory());
     EXPECT_EQ(nullptr, batch);
@@ -1045,13 +1371,14 @@ TEST_F(BufferPoolScanBudgetTest, PartialCacheHitDoesNotBypassDecodeBudget) {
   auto pinned = first_column.data();
   ASSERT_NE(nullptr, pinned);
   ASSERT_EQ(kRowsPerGroup, pinned->length());
+  const ParquetBufferID missing_key(parquet_path_, 1, 0);
+  auto reader = store.scan({GLOBAL_DOC_ID, "value"});
+  ASSERT_NE(nullptr, reader);
   ASSERT_NO_FATAL_FAILURE(reserve_remaining_capacity());
-  auto missing_column = ParquetBufferPool::get_instance().acquire_buffer(
-      ParquetBufferID(parquet_path_, /*column=*/1, /*row_group=*/0));
+  auto missing_column =
+      ParquetBufferPool::get_instance().acquire_buffer(missing_key);
   ASSERT_EQ(nullptr, missing_column.data());
   {
-    auto reader = store.scan({GLOBAL_DOC_ID, "value"});
-    ASSERT_NE(nullptr, reader);
     std::shared_ptr<arrow::RecordBatch> batch;
     EXPECT_TRUE(reader->ReadNext(&batch).IsOutOfMemory());
     EXPECT_EQ(nullptr, batch);
@@ -1122,10 +1449,10 @@ TEST_F(BufferPoolScanBudgetTest, DefaultCacheFailureKeepsStreamingAcrossCalls) {
                                                std::move(file_reader),
                                                properties, &parquet_reader)
                   .ok());
-  ASSERT_NO_FATAL_FAILURE(reserve_remaining_capacity());
   auto reader = std::make_shared<ParquetRecordBatchReader>(
       parquet_reader, std::vector<std::string>{GLOBAL_DOC_ID, "value"}, schema_,
       parquet_path_);
+  ASSERT_NO_FATAL_FAILURE(reserve_remaining_capacity());
   ASSERT_NO_FATAL_FAILURE(check_scan(reader, 2));
 }
 
@@ -1396,8 +1723,8 @@ TEST_F(BufferPoolLargeDecodeTest, DecoderAndOutputUseDedicatedMemoryPool) {
   // ordinary Arrow heap, including small buffers (zero-size sentinels aside).
   EXPECT_GT(pool->total_bytes_allocated(), total_before);
   EXPECT_EQ(default_before, default_pool->total_bytes_allocated());
-  EXPECT_EQ(pool->charged_bytes(),
-            ailego::PoolPayloadBudget::get_instance().external_used());
+  EXPECT_GE(ailego::PoolPayloadBudget::get_instance().external_used(),
+            pool->charged_bytes() + payload.metadata_memory.bytes());
   loader.clear(payload);
   EXPECT_EQ(mapped_before, pool->mapped_bytes());
 }

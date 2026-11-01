@@ -44,7 +44,7 @@ BufferPoolForwardStore::~BufferPoolForwardStore() {
   }
 }
 
-Status BufferPoolForwardStore::open() {
+Status BufferPoolForwardStore::open() try {
   std::string uri = file_path_;
   // The footer reader lives as long as this store. A mapped file here would
   // keep faulted file pages resident outside the pool's eviction mechanism.
@@ -70,6 +70,9 @@ Status BufferPoolForwardStore::open() {
     return Status::InternalError("Unsupported format, file: ", file_path_);
   }
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Forward store metadata budget exhausted");
 }
 arrow::Status BufferPoolForwardStore::open_parquet(
     const std::shared_ptr<arrow::io::RandomAccessFile> &file) {
@@ -355,7 +358,7 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
 }
 
 ExecBatchPtr BufferPoolForwardStore::fetch(
-    const std::vector<std::string> &columns, int index) {
+    const std::vector<std::string> &columns, int index) try {
   if (!validate(columns) || index < 0 || index >= num_rows_) {
     return nullptr;
   }
@@ -405,10 +408,13 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   }
 
   return std::make_shared<arrow::compute::ExecBatch>(std::move(scalars), 1);
+} catch (const std::bad_alloc &) {
+  LOG_ERROR("Forward scalar fetch metadata budget exhausted");
+  return nullptr;
 }
 
 RecordBatchReaderPtr BufferPoolForwardStore::scan(
-    const std::vector<std::string> &columns) {
+    const std::vector<std::string> &columns) try {
   if (!validate(columns)) {
     return nullptr;
   }
@@ -441,6 +447,9 @@ RecordBatchReaderPtr BufferPoolForwardStore::scan(
   return std::make_shared<ParquetRecordBatchReader>(
       parquet_reader, columns, physic_schema_, file_path_, with_cache,
       /*stream_uncached=*/true, std::move(memory_pool), metadata_id_);
+} catch (const std::bad_alloc &) {
+  LOG_ERROR("Forward scan metadata budget exhausted");
+  return nullptr;
 }
 
 }  // namespace zvec

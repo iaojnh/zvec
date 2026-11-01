@@ -24,7 +24,9 @@ namespace zvec {
 
 ParquetWriter::ParquetWriter(const std::string &filepath,
                              int64_t max_rows_per_group)
-    : filepath_(filepath), max_rows_per_group_(max_rows_per_group) {}
+    : filepath_(filepath),
+      max_rows_per_group_(max_rows_per_group),
+      batch_writer_(max_rows_per_group) {}
 
 ParquetWriter::~ParquetWriter() {
   if (!finalized_ && writer_) {
@@ -53,6 +55,9 @@ arrow::Status ParquetWriter::insert(
 
     parquet::WriterProperties::Builder builder;
     builder.memory_pool(detail::GetParquetMemoryPool().get());
+    // Forward readers do not use page indexes. Keep row-group statistics,
+    // without building the optional per-page index and its metadata copies.
+    builder.disable_write_page_index();
     std::shared_ptr<parquet::WriterProperties> props = builder.build();
 
     auto writer = parquet::arrow::FileWriter::Open(
@@ -105,6 +110,7 @@ arrow::Status ParquetWriter::insert_batch(
 
     parquet::WriterProperties::Builder builder;
     builder.memory_pool(detail::GetParquetMemoryPool().get());
+    builder.disable_write_page_index();
     std::shared_ptr<parquet::WriterProperties> props = builder.build();
 
     auto writer = parquet::arrow::FileWriter::Open(
@@ -134,7 +140,7 @@ arrow::Status ParquetWriter::insert_batch(
 arrow::Status ParquetWriter::write_batch(const arrow::RecordBatch &batch,
                                          const IndexFilter::Ptr &filter) {
   if (!filter) {
-    return detail::WriteParquetBatch(writer_.get(), batch);
+    return batch_writer_.write(writer_.get(), batch);
   }
 
   auto *pool = detail::GetParquetMemoryPool().get();
@@ -166,7 +172,7 @@ arrow::Status ParquetWriter::write_batch(const arrow::RecordBatch &batch,
   auto filtered_batch = arrow::RecordBatch::Make(
       batch.schema(), selection_array->length(), filtered_columns);
 
-  return detail::WriteParquetBatch(writer_.get(), *filtered_batch);
+  return batch_writer_.write(writer_.get(), *filtered_batch);
 }
 
 arrow::Status ParquetWriter::finalize() {
@@ -178,6 +184,7 @@ arrow::Status ParquetWriter::finalize() {
         "No data written, cannot finalize empty file");
   }
 
+  ARROW_RETURN_NOT_OK(batch_writer_.status());
   ARROW_RETURN_NOT_OK(writer_->Close());
   writer_.reset();
 
