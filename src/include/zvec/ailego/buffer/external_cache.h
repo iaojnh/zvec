@@ -23,15 +23,75 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 
 namespace zvec {
 namespace ailego {
+
+// Cache nodes, bucket arrays, keys and single-flight state may be allocated
+// while holding the cache mutex. Never enter reclamation from this allocator:
+// acquire() retries failed metadata admission after releasing that mutex.
+// The explicit reclaiming variant is only for independently owned metadata
+// constructed outside cache locks (e.g. immutable shared key storage).
+template <typename T, bool Reclaim = false>
+class CacheMetadataAllocator {
+  struct alignas(alignof(T) > alignof(size_t) ? alignof(T)
+                                              : alignof(size_t)) Header {
+    size_t charged;
+  };
+
+ public:
+  using value_type = T;
+  using is_always_equal = std::true_type;
+  template <typename U>
+  struct rebind {
+    using other = CacheMetadataAllocator<U, Reclaim>;
+  };
+  CacheMetadataAllocator() = default;
+  template <typename U>
+  CacheMetadataAllocator(const CacheMetadataAllocator<U, Reclaim> &) {}
+
+  T *allocate(size_t count) {
+    if (count > (SIZE_MAX - sizeof(Header)) / sizeof(T)) throw std::bad_alloc();
+    const size_t bytes = sizeof(Header) + count * sizeof(T);
+    auto &pool = MemoryLimitPool::get_instance();
+    const size_t charge = pool.capacity() ? bytes : 0;
+    if (charge && !(Reclaim ? pool.try_charge_metadata(charge)
+                            : pool.try_charge_metadata_without_reclaim(charge)))
+      throw std::bad_alloc();
+    void *raw = nullptr;
+    try {
+      raw = ::operator new(bytes, std::align_val_t{alignof(Header)});
+    } catch (...) {
+      if (charge) pool.release_metadata(charge);
+      throw;
+    }
+    return reinterpret_cast<T *>(new (raw) Header{charge} + 1);
+  }
+
+  void deallocate(T *ptr, size_t) noexcept {
+    if (!ptr) return;
+    auto *header = reinterpret_cast<Header *>(ptr) - 1;
+    const size_t charge = header->charged;
+    ::operator delete(header, std::align_val_t{alignof(Header)});
+    if (charge) MemoryLimitPool::get_instance().release_metadata(charge);
+  }
+  template <typename U>
+  bool operator==(const CacheMetadataAllocator<U, Reclaim> &) const {
+    return true;
+  }
+  template <typename U>
+  bool operator!=(const CacheMetadataAllocator<U, Reclaim> &) const {
+    return false;
+  }
+};
 
 // A precharged payload owns reservations from allocation through destruction.
 // The cache must not charge it again at publication or release those bytes
@@ -100,6 +160,7 @@ class ExternalCache : public EvictableBlockOwner {
     }
 
     // Bound concurrent loaders because payload size is unknown up front.
+    int metadata_retries = 0;
     while (true) {
       iter = table_.find(key);
       if (iter != table_.end()) {
@@ -112,27 +173,23 @@ class ExternalCache : public EvictableBlockOwner {
         }
       }
       if (active_loads_ < max_concurrent_loads_) {
-        break;
+        try {
+          claim_load(key, iter);
+          break;
+        } catch (const std::bad_alloc &) {
+          release_empty_buckets();
+          // Node/key/bucket allocation rolled back. Reclamation can call
+          // this cache, so neither it nor a budget wait may hold mutex_.
+          if (metadata_retries++ == kRecycleAttempts) return Value{};
+          lock.unlock();
+          BlockEvictionQueue::get_instance().batch_recycle(256);
+          lock.lock();
+          continue;
+        }
       }
       loader_slot_cv_.wait(lock);
     }
 
-    if (iter == table_.end()) {
-      auto inserted = table_.try_emplace(key);
-      iter = inserted.first;
-      iter->second.owner_key = next_owner_key_;
-      try {
-        owner_keys_.emplace(iter->second.owner_key, key);
-        iter->second.load_state = std::make_shared<LoadState>();
-      } catch (...) {
-        owner_keys_.erase(iter->second.owner_key);
-        table_.erase(iter);
-        throw;
-      }
-      ++next_owner_key_;
-    } else {
-      iter->second.load_state = std::make_shared<LoadState>();
-    }
     iter->second.loading = true;
     ++active_loads_;
     std::shared_ptr<LoadState> claimed_load_state = iter->second.load_state;
@@ -221,6 +278,10 @@ class ExternalCache : public EvictableBlockOwner {
     entry.loading = false;
     claimed_load_state->published = true;
     claimed_load_state->complete = true;
+    // Flight synchronization is not resident cache data. Keep it only while
+    // joined waiters still need to identify this publication. The publisher
+    // owns claimed_load_state through notification, even without waiters.
+    if (claimed_load_state->waiters == 0) entry.load_state.reset();
     --active_loads_;
     lock.unlock();
     claimed_load_state->cv.notify_all();
@@ -257,6 +318,7 @@ class ExternalCache : public EvictableBlockOwner {
       iter = table_.erase(iter);
       BlockEvictionQueue::get_instance().request_dead_entry_cleanup();
     }
+    release_empty_buckets();
   }
 
   Value retain(const Key &key) {
@@ -294,6 +356,7 @@ class ExternalCache : public EvictableBlockOwner {
         clear_noexcept(found->second.payload);
         owner_keys_.erase(owner);
         table_.erase(found);
+        release_empty_buckets();
         BlockEvictionQueue::get_instance().request_dead_entry_cleanup();
         return;
       }
@@ -360,6 +423,7 @@ class ExternalCache : public EvictableBlockOwner {
     clear_noexcept(entry.payload);
     owner_keys_.erase(owner);
     table_.erase(iter);
+    release_empty_buckets();
     return true;
   }
 
@@ -386,6 +450,7 @@ class ExternalCache : public EvictableBlockOwner {
       if (!entry.loading) {
         owner_keys_.erase(key_iter);
         table_.erase(iter);
+        release_empty_buckets();
       }
       return true;
     }
@@ -437,6 +502,7 @@ class ExternalCache : public EvictableBlockOwner {
       if (!entry.loading) {
         owner_keys_.erase(key_iter);
         table_.erase(iter);
+        release_empty_buckets();
       }
     }
   }
@@ -451,6 +517,23 @@ class ExternalCache : public EvictableBlockOwner {
   }
 
   struct LoadState {
+    // condition_variable_any implementations allocate a shared mutex outside
+    // the LoadState object. Reserve its implementation/control-block allowance
+    // before constructing cv, and refund only after cv (and all waiters) die.
+    struct WaitMemory {
+      size_t charged{0};
+      WaitMemory() {
+        auto &pool = MemoryLimitPool::get_instance();
+        if (!pool.capacity()) return;
+        constexpr size_t kAllowance = sizeof(std::mutex) + 128;
+        if (!pool.try_charge_metadata_without_reclaim(kAllowance))
+          throw std::bad_alloc();
+        charged = kAllowance;
+      }
+      ~WaitMemory() {
+        if (charged) MemoryLimitPool::get_instance().release_metadata(charged);
+      }
+    } wait_memory;
     std::condition_variable_any cv;
     bool complete{false};
     bool published{false};
@@ -475,7 +558,34 @@ class ExternalCache : public EvictableBlockOwner {
     std::atomic<bool> referenced{false};
   };
 
-  using Table = std::unordered_map<Key, Entry, Hash, Equal>;
+  using Table =
+      std::unordered_map<Key, Entry, Hash, Equal,
+                         CacheMetadataAllocator<std::pair<const Key, Entry>>>;
+
+  void claim_load(const Key &key, typename Table::iterator &iter) {
+    auto state =
+        std::allocate_shared<LoadState>(CacheMetadataAllocator<LoadState>{});
+    if (iter == table_.end()) {
+      iter = table_.try_emplace(key).first;
+      iter->second.owner_key = next_owner_key_;
+      try {
+        owner_keys_.emplace(next_owner_key_, key);
+      } catch (...) {
+        table_.erase(iter);
+        throw;
+      }
+      ++next_owner_key_;
+    }
+    iter->second.load_state = std::move(state);
+  }
+
+  void release_empty_buckets() {
+    if (!table_.empty()) return;
+    // Empty singleton caches must not retain unbounded historical buckets.
+    // Swapping default empty maps does not allocate or enter reclamation.
+    Table{}.swap(table_);
+    decltype(owner_keys_){}.swap(owner_keys_);
+  }
 
   Value acquire_loaded(Entry &entry) {
     while (true) {
@@ -522,6 +632,11 @@ class ExternalCache : public EvictableBlockOwner {
     } catch (...) {
       --load_state->waiters;
       if (load_state->published) {
+        auto found = table_.find(key);
+        if (load_state->waiters == 0 && found != table_.end() &&
+            found->second.load_state == load_state) {
+          found->second.load_state.reset();
+        }
         lock.unlock();
         release(key);
       }
@@ -547,6 +662,9 @@ class ExternalCache : public EvictableBlockOwner {
     if (iter == table_.end() || iter->second.load_state != load_state) {
       throw std::logic_error("External-cache waiter lost its reserved pin");
     }
+    // The waiter retains its own shared owner until value delivery completes,
+    // including an exception. Do not retain the state until payload eviction.
+    if (load_state->waiters == 0) iter->second.load_state.reset();
     try {
       // Transfer the prepaid pin without incrementing ref_count again.
       Value value = loader_.value(iter->second.payload);
@@ -596,6 +714,7 @@ class ExternalCache : public EvictableBlockOwner {
         !entry.in_evict_queue.load(std::memory_order_relaxed)) {
       owner_keys_.erase(entry.owner_key);
       table_.erase(iter);
+      release_empty_buckets();
     }
     lock.unlock();
     load_state->cv.notify_all();
@@ -631,7 +750,11 @@ class ExternalCache : public EvictableBlockOwner {
 
   Loader loader_{};
   Table table_;
-  std::unordered_map<eviction_key_t, Key> owner_keys_;
+  std::unordered_map<
+      eviction_key_t, Key, std::hash<eviction_key_t>,
+      std::equal_to<eviction_key_t>,
+      CacheMetadataAllocator<std::pair<const eviction_key_t, Key>>>
+      owner_keys_;
   eviction_key_t next_owner_key_{1};
   size_t active_loads_{0};
   const size_t max_concurrent_loads_;

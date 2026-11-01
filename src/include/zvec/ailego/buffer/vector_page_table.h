@@ -783,6 +783,7 @@ class ZVEC_AILEGO_API VecBufferPool {
 
  private:
   friend class VecBufferPoolHandle;
+  friend struct VecBufferPoolTestPeer;
   void prefetch_pages_sync(block_id_t first_page, size_t page_count,
                            uint8_t priority);
   bool load_pages_aio(const block_id_t *page_ids, size_t count,
@@ -842,12 +843,22 @@ class ZVEC_AILEGO_API VecBufferPool {
  private:
   // Serialize writable in-place payload access. Single-flight owns loading.
   size_t block_mutex_metadata_bytes() const {
-    return block_mutex_count_ * sizeof(std::shared_mutex);
+    return block_mutexes_ ? block_mutexes_.get_deleter().mapped_bytes : 0;
   }
-  std::unique_ptr<std::shared_mutex[]> block_mutexes_{};
+  struct PageLockDeleter {
+    size_t count{0};
+    size_t mapped_bytes{0};
+    void operator()(std::shared_mutex *data) const noexcept;
+  };
+  // The deleter destroys every lock, unmaps its backing, then refunds only
+  // successfully released pages. Ordinary delete[] can retain a charged-away
+  // allocation in malloc's small-object regions across collection lifecycles.
+  using PageLockArray = std::unique_ptr<std::shared_mutex[], PageLockDeleter>;
+  PageLockArray block_mutexes_{nullptr, PageLockDeleter{}};
   size_t block_mutex_count_{0};
 
   std::thread writeback_thread_{};
+  // Anonymous page mapping: unmap before refunding its metadata reservation.
   char *writeback_staging_{nullptr};
   size_t writeback_staging_size_{0};
   size_t writeback_io_staging_charge_{0};

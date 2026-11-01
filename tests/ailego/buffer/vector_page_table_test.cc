@@ -21,6 +21,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -40,7 +41,18 @@
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include "pool_payload_budget.h"
 
+#if defined(_MSC_VER)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 #if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <unistd.h>
 #endif
 
@@ -48,10 +60,25 @@ using namespace zvec::ailego;
 
 namespace zvec::ailego {
 
+struct VecBufferPoolTestPeer {
+  static char *writeback_staging(const VecBufferPool &pool) {
+    return pool.writeback_staging_;
+  }
+  static std::shared_mutex *page_locks(const VecBufferPool &pool) {
+    return pool.block_mutexes_.get();
+  }
+};
+
 // Model a waiter descheduled between joining a load and consuming its result.
 // This makes eviction-before-wakeup deterministic, without sleeps or changing
 // production thread scheduling. The normal single-flight test covers cv wait.
 struct ExternalCacheTestPeer {
+  template <typename Cache>
+  static bool has_load_state(Cache &cache, size_t key) {
+    std::shared_lock<std::shared_mutex> lock(cache.mutex_);
+    return static_cast<bool>(cache.table_.at(key).load_state);
+  }
+
   template <typename Cache>
   static auto register_waiter(Cache &cache, size_t key) {
     std::unique_lock<std::shared_mutex> lock(cache.mutex_);
@@ -96,6 +123,43 @@ void ExpectPageContent(const char *buf, size_t page_id) {
   char expected = static_cast<char>(page_id & 0xff);
   ASSERT_EQ(buf[0], expected) << "page " << page_id << " head mismatch";
   ASSERT_EQ(buf[ps - 1], expected) << "page " << page_id << " tail mismatch";
+}
+
+// Check the backing itself: free can refund a logical reservation while its
+// pages remain resident in a malloc region. Darwin mincore tests residency,
+// not whether an address is mapped, so query its VM directory instead.
+void ExpectUnmapped(const void *data) {
+#if defined(_MSC_VER)
+  MEMORY_BASIC_INFORMATION info{};
+  const size_t queried = ::VirtualQuery(data, &info, sizeof(info));
+  ASSERT_NE(0u, queried);
+  EXPECT_EQ(MEM_FREE, info.State);
+#elif defined(__APPLE__)
+  const auto original = reinterpret_cast<mach_vm_address_t>(data);
+  mach_vm_address_t address = original;
+  mach_vm_size_t size = 0;
+  vm_region_basic_info_data_64_t info{};
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object = MACH_PORT_NULL;
+  const auto result = ::mach_vm_region(
+      ::mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+      reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+  if (object != MACH_PORT_NULL)
+    ::mach_port_deallocate(::mach_task_self(), object);
+  EXPECT_TRUE(result == KERN_INVALID_ADDRESS ||
+              (result == KERN_SUCCESS && address > original));
+#else
+#if defined(__linux__)
+  unsigned char resident = 0;
+#else
+  char resident = 0;
+#endif
+  const int result =
+      ::mincore(const_cast<void *>(data), kVectorPageSize, &resident);
+  const int error = errno;
+  EXPECT_EQ(-1, result);
+  EXPECT_EQ(ENOMEM, error);
+#endif
 }
 
 class BufferPoolTest : public ::testing::Test {
@@ -197,6 +261,7 @@ using EmptyValueExternalCache =
 
 struct BlockingLoadState {
   std::atomic<size_t> load_calls{0};
+  std::atomic<size_t> load_metadata{0};
   std::atomic<size_t> active_loads{0};
   std::atomic<size_t> max_active_loads{0};
   std::atomic<bool> finish{false};
@@ -210,6 +275,9 @@ struct BlockingLoader {
   using Value = std::shared_ptr<std::vector<char>>;
 
   bool load(size_t bytes, SizedCachePayload &payload, size_t &size) {
+    state->load_metadata.store(
+        PoolPayloadBudget::get_instance().metadata_used(),
+        std::memory_order_relaxed);
     state->load_calls.fetch_add(1, std::memory_order_release);
     const size_t active =
         state->active_loads.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -988,7 +1056,8 @@ TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
   EXPECT_EQ(page_table_bytes, read_only_bytes);
   EXPECT_LT(read_only_bytes, 1UL * 1024UL * 1024UL);
   size_t expected_writable_bytes =
-      VecBufferPool::kMutexBucketCount * sizeof(std::shared_mutex) +
+      BudgetedMappedBuffer::mapping_size(VecBufferPool::kMutexBucketCount *
+                                         sizeof(std::shared_mutex)) +
       VecBufferPool::kWritebackBatchPages * kVectorPageSize;
 #if defined(__linux__)
   if (current_io_backend_type() == IOBackendType::kIoUring) {
@@ -1030,7 +1099,8 @@ TEST_F(BufferPoolTest, WritablePoolReportsPageLockMetadata) {
   ASSERT_EQ(pool.init(), 0);
 
   const auto stats = pool.stats();
-  EXPECT_EQ(VecBufferPool::kMutexBucketCount * sizeof(std::shared_mutex),
+  EXPECT_EQ(BudgetedMappedBuffer::mapping_size(
+                VecBufferPool::kMutexBucketCount * sizeof(std::shared_mutex)),
             stats.page_lock_metadata_bytes);
   EXPECT_EQ(VecBufferPool::kWritebackBatchPages * kVectorPageSize,
             stats.writeback_staging_bytes);
@@ -1039,6 +1109,91 @@ TEST_F(BufferPoolTest, WritablePoolReportsPageLockMetadata) {
             stats.page_table_metadata_bytes + stats.page_lock_metadata_bytes +
                 stats.writeback_staging_bytes +
                 stats.writeback_io_staging_bytes);
+}
+
+TEST_F(BufferPoolTest, WritebackStagingUnmapsBeforeReservationIsReused) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/1, /*writable=*/true);
+  const std::string file = new_file(/*num_pages=*/1);
+  auto &budget = PoolPayloadBudget::get_instance();
+  const size_t baseline = budget.metadata_used();
+  const size_t bytes = VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+  for (size_t round = 0; round < 8; ++round) {
+    char *staging = nullptr;
+    {
+      VecBufferPool pool(file, /*writable=*/true);
+      ASSERT_EQ(0, pool.init());
+      staging = VecBufferPoolTestPeer::writeback_staging(pool);
+      ASSERT_NE(nullptr, staging);
+      EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(staging) % kVectorPageSize);
+      EXPECT_GE(budget.metadata_used(), baseline + bytes);
+      // No dirty pages exist, so the worker cannot access this test buffer.
+      std::memset(staging, 0x5a, bytes);
+    }
+    ExpectUnmapped(staging);
+    EXPECT_EQ(baseline, budget.metadata_used());
+  }
+}
+
+TEST_F(BufferPoolTest, PageLocksUnmapBeforeReservationIsReused) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/1, /*writable=*/true);
+  const std::string file = new_file(/*num_pages=*/1);
+  auto &budget = PoolPayloadBudget::get_instance();
+  const size_t baseline = budget.metadata_used();
+  const size_t bytes = BudgetedMappedBuffer::mapping_size(
+      VecBufferPool::kMutexBucketCount * sizeof(std::shared_mutex));
+  for (size_t round = 0; round < 8; ++round) {
+    std::shared_mutex *locks = nullptr;
+    {
+      VecBufferPool pool(file, /*writable=*/true);
+      ASSERT_EQ(0, pool.init());
+      locks = VecBufferPoolTestPeer::page_locks(pool);
+      ASSERT_NE(nullptr, locks);
+      EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(locks) % kVectorPageSize);
+      EXPECT_EQ(bytes, pool.stats().page_lock_metadata_bytes);
+      EXPECT_GE(budget.metadata_used(), baseline + bytes);
+      // Exercise constructed locks at both ends of the stable stripe array.
+      {
+        std::unique_lock<std::shared_mutex> exclusive(locks[0]);
+        std::shared_lock<std::shared_mutex> shared(
+            locks[VecBufferPool::kMutexBucketCount - 1]);
+      }
+    }
+    ExpectUnmapped(locks);
+    ExpectUnmapped(reinterpret_cast<const char *>(locks) + bytes -
+                   kVectorPageSize);
+    EXPECT_EQ(baseline, budget.metadata_used());
+  }
+}
+
+TEST_F(BufferPoolTest, FailedWritableInitReleasesStagingReservation) {
+  // Admit the writable staging and locks but not the nonempty page table.
+  const size_t writable_bytes = VecBufferPool::metadata_bytes_for_page_count(
+      /*page_count=*/0, /*writable=*/true);
+  auto &budget = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, budget.init(writable_bytes));
+  const size_t baseline = budget.metadata_used();
+  const std::string file = new_file(/*num_pages=*/1);
+  VecBufferPool pool(file, /*writable=*/true);
+  for (size_t attempt = 0; attempt < 3; ++attempt) {
+    EXPECT_NE(0, pool.init());
+    EXPECT_EQ(nullptr, VecBufferPoolTestPeer::writeback_staging(pool));
+    EXPECT_EQ(nullptr, VecBufferPoolTestPeer::page_locks(pool));
+    EXPECT_EQ(baseline, budget.metadata_used());
+  }
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/1, /*writable=*/true);
+  EXPECT_EQ(0, pool.init());
+  EXPECT_NE(nullptr, VecBufferPoolTestPeer::writeback_staging(pool));
+  EXPECT_NE(nullptr, VecBufferPoolTestPeer::page_locks(pool));
+}
+
+TEST_F(BufferPoolTest, ReadOnlyPoolDoesNotAllocateWritebackStaging) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/1);
+  const std::string file = new_file(/*num_pages=*/1);
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  EXPECT_EQ(nullptr, VecBufferPoolTestPeer::writeback_staging(pool));
+  EXPECT_EQ(nullptr, VecBufferPoolTestPeer::page_locks(pool));
+  EXPECT_EQ(0u, pool.stats().writeback_staging_bytes);
 }
 
 TEST_F(BufferPoolTest, FailedPageTableExtendLeavesStateUnchanged) {
@@ -1323,12 +1478,72 @@ TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
 
     auto value = cache.acquire(kVectorPageSize);
     ASSERT_NE(nullptr, value);
-    EXPECT_EQ(kVectorPageSize, memory_pool.used());
+    EXPECT_GT(memory_pool.metadata_used(), 0u);
+    EXPECT_EQ(kVectorPageSize + memory_pool.metadata_used(),
+              memory_pool.used());
     cache.release(kVectorPageSize);
   }
 
   EXPECT_EQ(0u, memory_pool.used());
   EXPECT_EQ(0u, memory_pool.committed());
+}
+
+TEST_F(BufferPoolTest, ExternalCacheMetadataRejectsAndRetriesWithoutDeadlock) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  init_pool(16);
+  SizedExternalCache cache;
+  auto value = cache.acquire(1);
+  ASSERT_NE(nullptr, value);
+  const auto live_metadata = pool.metadata_used();
+  ASSERT_GT(live_metadata, 0u);
+  const size_t reservation = pool.capacity() - pool.used();
+  ASSERT_TRUE(pool.try_charge_external(reservation));
+  // The first entry is pinned: neither metadata growth nor a new load fits.
+  EXPECT_EQ(nullptr, cache.acquire(2));
+  EXPECT_EQ(1u, cache.entry_count());
+  EXPECT_EQ(live_metadata, pool.metadata_used());
+  pool.release_external(reservation);
+  auto second = cache.acquire(2);
+  ASSERT_NE(nullptr, second);
+  EXPECT_GT(pool.metadata_used(), live_metadata);
+  cache.release(1);
+  cache.release(2);
+  cache.retire_if([](size_t) { return true; });
+  EXPECT_EQ(0u, pool.used());
+}
+
+TEST_F(BufferPoolTest, ExternalCacheDropsCompletedFlightWithoutWaiters) {
+  init_pool(/*capacity_pages=*/16);
+  SizedExternalCache cache;
+  auto value = cache.acquire(kVectorPageSize);
+  ASSERT_NE(nullptr, value);
+  EXPECT_FALSE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
+  EXPECT_EQ(1u, cache.entry_count());
+  const auto metadata = PoolPayloadBudget::get_instance().metadata_used();
+  auto retained = cache.retain(kVectorPageSize);
+  EXPECT_EQ(value, retained);
+  EXPECT_EQ(metadata, PoolPayloadBudget::get_instance().metadata_used());
+  cache.release(kVectorPageSize);
+  cache.release(kVectorPageSize);
+  EXPECT_TRUE(cache.evict_block(/*owner_key=*/1));
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().used());
+}
+
+TEST_F(BufferPoolTest, ExternalCacheMetadataReclaimsOnlyOutsideCacheLock) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  init_pool(16);
+  SizedExternalCache cache;
+  ASSERT_NE(nullptr, cache.acquire(1024));
+  cache.release(1024);
+  const size_t reservation = pool.capacity() - pool.used();
+  ASSERT_TRUE(pool.try_charge_external(reservation));
+  // Metadata admission must unlock before evicting this cache's old entry.
+  ASSERT_NE(nullptr, cache.acquire(1));
+  EXPECT_EQ(nullptr, cache.retain(1024));
+  pool.release_external(reservation);
+  cache.release(1);
+  cache.retire_if([](size_t) { return true; });
+  EXPECT_EQ(0u, pool.used());
 }
 
 TEST_F(BufferPoolTest,
@@ -1666,6 +1881,7 @@ TEST_F(BufferPoolTest, DelayedExternalWaitersKeepPublishedEntryPinned) {
   state->finish.store(true, std::memory_order_release);
   first.join();
   ASSERT_NE(nullptr, first_value);
+  EXPECT_TRUE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
   first_value.reset();
   cache.release(kVectorPageSize);
 
@@ -1675,6 +1891,7 @@ TEST_F(BufferPoolTest, DelayedExternalWaitersKeepPublishedEntryPinned) {
   auto value =
       ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize, waiter);
   ASSERT_NE(nullptr, value);
+  EXPECT_TRUE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
   EXPECT_EQ(kVectorPageSize, value->size());
   value.reset();
   cache.release(kVectorPageSize);
@@ -1682,6 +1899,17 @@ TEST_F(BufferPoolTest, DelayedExternalWaitersKeepPublishedEntryPinned) {
   value = ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize,
                                                 second_waiter);
   ASSERT_NE(nullptr, value);
+  EXPECT_FALSE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
+  // Removing the cache's owner must not refund metadata still held by a
+  // descheduled waiter. Only destruction of the last shared state does so.
+  const auto metadata = PoolPayloadBudget::get_instance().metadata_used();
+  std::weak_ptr flight = waiter;
+  waiter.reset();
+  EXPECT_FALSE(flight.expired());
+  EXPECT_EQ(metadata, PoolPayloadBudget::get_instance().metadata_used());
+  second_waiter.reset();
+  EXPECT_TRUE(flight.expired());
+  EXPECT_LT(PoolPayloadBudget::get_instance().metadata_used(), metadata);
   value.reset();
   cache.release(kVectorPageSize);
   EXPECT_TRUE(cache.evict_block(/*owner_key=*/1));
@@ -1795,6 +2023,7 @@ TEST_F(BufferPoolTest, ExternalWaiterValueFailureReleasesReservedPin) {
     EXPECT_THROW(
         ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize, waiter),
         std::runtime_error);
+    EXPECT_FALSE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
     EXPECT_TRUE(cache.evict_block(/*owner_key=*/1));
     EXPECT_EQ(0u, cache.entry_count());
     EXPECT_EQ(0u, PoolPayloadBudget::get_instance().external_used());
@@ -1880,7 +2109,20 @@ TEST_F(BufferPoolTest, DistinctExternalCacheLoadsRespectInflightLimit) {
 }
 
 TEST_F(BufferPoolTest, WaitingExternalLoadRechecksCapacityBeforeLoading) {
-  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(kVectorPageSize));
+  auto &pool = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, pool.init(2 * kVectorPageSize));
+  size_t metadata = 0;
+  {
+    // Measure peak in-flight metadata, before successful publication releases
+    // the synchronization state. First payload + load metadata must fit.
+    auto state = std::make_shared<BlockingLoadState>();
+    state->finish.store(true, std::memory_order_relaxed);
+    BlockingExternalCache probe(BlockingLoader{state});
+    ASSERT_NE(nullptr, probe.acquire(1));
+    metadata = state->load_metadata.load(std::memory_order_relaxed);
+    probe.release(1);
+  }
+  ASSERT_EQ(0, pool.init(kVectorPageSize + metadata));
   auto state = std::make_shared<BlockingLoadState>();
   BlockingExternalCache cache(BlockingLoader{state},
                               /*max_concurrent_loads=*/1);

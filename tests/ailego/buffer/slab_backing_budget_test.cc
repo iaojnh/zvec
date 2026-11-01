@@ -1,5 +1,6 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -188,6 +189,31 @@ TEST_F(SlabBackingBudgetTest, ConcurrentPressureKeepsLivePagesIntact) {
     });
   }
   for (auto &worker : workers) worker.join();
+}
+
+TEST_F(SlabBackingBudgetTest, BackgroundReturnsClosedPageBackingToReserve) {
+  // More than one maintenance batch, without reaching the admission limit.
+  // Repeating the lifecycle must not need a new allocation to drive cleanup.
+  for (size_t round = 0; round < 3; ++round) {
+    std::vector<Page> pages;
+    const size_t bytes = 24UL << 20;
+    for (size_t i = 0; i < bytes / page_size_; ++i) {
+      auto page = acquire();
+      ASSERT_NE(nullptr, page);
+      std::memset(page.get(), 7, page_size_);
+      pages.push_back(std::move(page));
+    }
+    pages.clear();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const size_t reserve = 8UL << 20;
+    while (pool_.committed() > pool_.used() + reserve &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_LE(pool_.committed(), pool_.used() + reserve);
+    EXPECT_LE(pool_.stats().free_buffers * page_size_, reserve);
+  }
 }
 }  // namespace
 }  // namespace zvec::ailego

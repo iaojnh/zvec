@@ -161,7 +161,7 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
     return nullptr;
   }
   const bool charged = pool_size_.load(std::memory_order_relaxed) != 0;
-  if (charged && !try_reserve_committed(total)) {
+  if (charged && !try_reserve_allocation(total)) {
     // Do not call try_charge_metadata here: that can recurse into this same
     // queue with owner/lifecycle locks held. Existing enqueue-failure recovery
     // retries registration after capacity becomes available.
@@ -171,7 +171,6 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
   }
   if (charged) {
     metadata_used_size_.fetch_add(total, std::memory_order_relaxed);
-    used_size_.fetch_add(total, std::memory_order_relaxed);
     queue_charged_size_.fetch_add(total, std::memory_order_relaxed);
   }
   void *raw = std::malloc(total);
@@ -255,11 +254,13 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     for (auto **link = &retained_free_; *link; link = &(*link)->next) {
       auto *block = *link;
       if (block->bytes != charge) continue;
+      // Backing is already charged, but a pending page may own the logical
+      // headroom. Leave the idle block linked until admission succeeds.
+      if (!try_reserve_used(charge)) break;
       *link = block->next;
       block->next = nullptr;
       block->metadata = metadata;
       retained_idle_bytes_.fetch_sub(charge, std::memory_order_relaxed);
-      used_size_.fetch_add(charge, std::memory_order_relaxed);
       counter->fetch_add(charge, std::memory_order_relaxed);
       retained_block_reuses_.fetch_add(1, std::memory_order_relaxed);
       return reinterpret_cast<char *>(block) + kRetainedBlockHeaderBytes;
@@ -709,6 +710,19 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes) {
   return false;
 }
 
+bool MemoryLimitPool::try_reserve_allocation(size_t bytes) {
+  // Pages reserve logical slots before acquiring backing. Checking only
+  // committed capacity here would spend those pending slots a second time.
+  // Keep both counters individually bounded without holding a lock across
+  // allocation, eviction, or writeback callbacks.
+  if (!try_reserve_used(bytes)) return false;
+  if (!try_reserve_committed(bytes)) {
+    release_buffer(nullptr, bytes);
+    return false;
+  }
+  return true;
+}
+
 bool MemoryLimitPool::is_cacheable_buffer_size(size_t buffer_size) {
   return buffer_size == page_buffer_size();
 }
@@ -786,11 +800,10 @@ char *MemoryLimitPool::acquire_slab_buffer() {
   // The header is resident-capable backing too. Keep it charged even after
   // all data pages have been returned or discarded, until slab teardown.
   // Do not evict here while holding allocator locks.
-  if (!try_reserve_committed(page_size)) {
+  if (!try_reserve_allocation(page_size)) {
     return nullptr;
   }
   metadata_used_size_.fetch_add(page_size, std::memory_order_relaxed);
-  used_size_.fetch_add(page_size, std::memory_order_relaxed);
   AlignedSlabMapping mapping = reserve_aligned_slab(page_size);
   if (mapping.base == nullptr) {
     release_metadata(page_size);
@@ -903,7 +916,7 @@ size_t MemoryLimitPool::trim_free_buffers(size_t bytes_needed) {
   return released_bytes;
 }
 
-void MemoryLimitPool::trim_idle_buffers() {
+bool MemoryLimitPool::trim_idle_buffers() {
   // These buffers have no owners and no cached contents. Keep a small reuse
   // reserve, not the historical high-water allocation of a finished build.
   // The counters are only a hint: pop/unmap still obtains exclusive ownership
@@ -923,8 +936,10 @@ void MemoryLimitPool::trim_idle_buffers() {
         std::lock_guard<std::mutex> lock(capacity_mutex_);
       }
       capacity_cv_.notify_all();
+      return true;
     }
   }
+  return false;
 }
 
 int MemoryLimitPool::init(size_t pool_size) {
@@ -1062,6 +1077,7 @@ void MemoryLimitPool::stop_background_evictor() {
 
 void MemoryLimitPool::background_evict_loop() {
   using std::chrono::milliseconds;
+  bool idle_progress = false;
   const auto page_admission_pressure = [this] {
     // Reserved headroom can block page admission below both general
     // watermarks. Keep the background queue progressing at that boundary,
@@ -1072,10 +1088,12 @@ void MemoryLimitPool::background_evict_loop() {
   while (bg_running_.load()) {
     {
       std::unique_lock<std::mutex> lk(bg_mutex_);
-      bg_cv_.wait_for(lk, milliseconds(5), [this, &page_admission_pressure] {
-        return !bg_running_.load() || should_background_reclaim() ||
-               page_admission_pressure();
-      });
+      bg_cv_.wait_for(lk, milliseconds(5),
+                      [this, &page_admission_pressure, &idle_progress] {
+                        return !bg_running_.load() || idle_progress ||
+                               should_background_reclaim() ||
+                               page_admission_pressure();
+                      });
     }
     if (!bg_running_.load()) break;
     if (pool_size_.load(std::memory_order_relaxed) == 0) continue;
@@ -1084,7 +1102,12 @@ void MemoryLimitPool::background_evict_loop() {
     BlockEvictionQueue::get_instance().cleanup_dead_entries(256);
     // Page/entry retirement can leave committed backing resident even when
     // used is far below the eviction watermark. Return only idle backing.
-    trim_idle_buffers();
+    // After the final page owner closes, finish returning idle backing to the
+    // existing reuse reserve without sleeping between every small batch. An
+    // active cache retains its paced maintenance. No progress (including an
+    // OS discard failure) restores the wait, avoiding an idle busy loop.
+    idle_progress = trim_idle_buffers() &&
+                    used_size_.load(std::memory_order_relaxed) == fixed_used();
     const size_t low = low_watermark();
     if (used_size_.load() > low || page_admission_pressure()) {
       bg_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
@@ -1134,7 +1157,7 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
     // size, all currently visible free buffers were already checked above.
     trim_free_buffers(buffer_size);
     if (!try_reserve_committed(buffer_size)) {
-      used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+      release_buffer(nullptr, buffer_size);
       high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
@@ -1144,7 +1167,7 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
                            buffer_size, kMinimumPageBytes));
   if (!buffer) {
     committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
-    used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    release_buffer(nullptr, buffer_size);
     return false;
   }
   alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);
@@ -1192,6 +1215,19 @@ bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
   return try_charge_fixed_with_wait(buffer_size, &metadata_used_size_);
 }
 
+bool MemoryLimitPool::try_charge_metadata_without_reclaim(size_t bytes) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  if (!bytes) return true;
+  if (!try_reserve_allocation(bytes)) {
+    // Discard only idle backing; never call an eviction owner under its lock.
+    trim_free_buffers(bytes);
+    if (!try_reserve_allocation(bytes)) return false;
+  }
+  metadata_used_size_.fetch_add(bytes, std::memory_order_relaxed);
+  bg_cv_.notify_one();
+  return true;
+}
+
 bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
                                                  std::atomic<size_t> *counter) {
   if (try_charge_fixed(buffer_size, counter)) {
@@ -1222,15 +1258,18 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
   }
 
   while (true) {
-    if (try_reserve_committed(buffer_size)) {
+    if (try_reserve_allocation(buffer_size)) {
       counter->fetch_add(buffer_size, std::memory_order_relaxed);
-      used_size_.fetch_add(buffer_size, std::memory_order_relaxed);
       bg_cv_.notify_one();
       return true;
     }
 
-    size_t committed = committed_size_.load(std::memory_order_relaxed);
-    size_t available = committed >= capacity ? 0 : capacity - committed;
+    // Logical admission may fail even with backing headroom while pages are
+    // in flight. Do not spin on committed capacity alone in that case.
+    const size_t reserved =
+        std::max(used_size_.load(std::memory_order_relaxed),
+                 committed_size_.load(std::memory_order_relaxed));
+    size_t available = reserved >= capacity ? 0 : capacity - reserved;
     if (available >= buffer_size) {
       continue;
     }
@@ -1366,8 +1405,7 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
     ++acquired;
   }
   if (acquired < actual_count) {
-    used_size_.fetch_sub((actual_count - acquired) * buffer_size,
-                         std::memory_order_relaxed);
+    release_buffer(nullptr, (actual_count - acquired) * buffer_size);
   }
   return acquired;
 }

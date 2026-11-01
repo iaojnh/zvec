@@ -173,9 +173,49 @@ TEST_F(BufferReadStorageTest, ColdScatterReadKeepsContiguousFallback) {
   ASSERT_EQ(length, segment->read_scatter(0, block, length));
   ASSERT_EQ(1u, block.spans.size());
   EXPECT_EQ(length, block.spans[0].size);
-  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, block.fallback.type_);
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH,
+            block.fallback.type_);
   EXPECT_EQ(nullptr, block.lease);
   EXPECT_EQ(0, std::memcmp(payload_.data(), block.spans[0].data, length));
+}
+
+TEST_F(BufferReadStorageTest, LargeColdReadMappingFollowsLastReader) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  IndexStorage::MemoryBlock retained;
+  const size_t length = 2 * ailego::kVectorPageSize + 1;
+  const size_t rounded = ailego::BudgetedMappedBuffer::mapping_size(
+      (length + 4095) & ~size_t{4095});
+  {
+    auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
+    ASSERT_EQ(0, storage->open(file_path_, false));
+    auto segment = storage->get("payload");
+    ASSERT_NE(nullptr, segment);
+    IndexStorage::MemoryBlock first;
+    ASSERT_EQ(length, segment->read(0, first, length));
+    ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, first.type_);
+    const size_t charged = pool.external_used();
+    EXPECT_GE(charged, rounded);
+    retained = first;
+    EXPECT_EQ(first.data(), retained.data());
+    EXPECT_EQ(charged, pool.external_used());
+    first.reset();
+    EXPECT_EQ(charged, pool.external_used());
+    ASSERT_EQ(length, segment->read(7, first, length));
+    EXPECT_NE(first.data(), retained.data());
+    EXPECT_EQ(0, std::memcmp(payload_.data() + 7, first.data(), length));
+    EXPECT_EQ(0, std::memcmp(payload_.data(), retained.data(), length));
+    segment.reset();
+    ASSERT_EQ(0, storage->close());
+  }
+  // Only the returned mapping and its small, charged control block survive.
+  const size_t charge = pool.external_used();
+  EXPECT_GE(charge, rounded);
+  EXPECT_LT(charge, rounded + 1024);
+  EXPECT_EQ(0, std::memcmp(payload_.data(), retained.data(), length));
+  std::thread reader(
+      [block = std::move(retained)]() mutable { block.reset(); });
+  reader.join();
+  EXPECT_EQ(0u, pool.external_used());
 }
 
 TEST_F(BufferReadStorageTest, RejectsUnknownWarmupMode) {

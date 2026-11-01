@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <vector>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/core/framework/index_error.h>
@@ -488,7 +489,18 @@ class BufferReadStorage : public IndexStorage {
         return 0;
       }
       size_t alloc_size = (len + (kAlign - 1UL)) & ~(kAlign - 1UL);
-      auto owned = MemoryBlock::AllocateOwned(alloc_size, kAlign);
+      MemoryBlock owned;
+      if (alloc_size >= 2 * ailego::kVectorPageSize) {
+        // Large cold posting reads must not leave refunded malloc arenas
+        // behind. Copies retain this mapping until the final reader releases
+        // it; BudgetedMappedBuffer unmaps before refunding the rounded charge.
+        auto buffer = std::allocate_shared<ailego::BudgetedMappedBuffer>(
+            ailego::BudgetedAllocator<ailego::BudgetedMappedBuffer>{},
+            alloc_size);
+        owned = MemoryBlock::MakeSharedView(buffer->data(), buffer);
+      } else {
+        owned = MemoryBlock::AllocateOwned(alloc_size, kAlign);
+      }
       auto *tmp = static_cast<char *>(owned.data_);
       const bool read_ok =
           force_bypass ? handle_->read_range_bypass(abs_offset, len, tmp)

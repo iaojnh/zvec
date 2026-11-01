@@ -277,6 +277,10 @@ class MemoryLimitPool {
   //! Reserve non-evictable buffer-pool metadata capacity.
   bool try_charge_metadata(const size_t buffer_size);
 
+  //! Metadata allocated under a cache lock must not reenter cache eviction.
+  //! On refusal the caller must unlock before reclaiming and retrying.
+  bool try_charge_metadata_without_reclaim(size_t bytes);
+
   //! Non-spillable, reusable backing blocks, independent of VectorPageTable.
   //! Active blocks count toward used(); idle blocks still count toward
   //! committed(). Only successful unmapping refunds their backing budget.
@@ -438,6 +442,7 @@ class MemoryLimitPool {
 
  private:
   friend struct EvictionQueueTraits;
+  friend struct MemoryLimitPoolTestPeer;
   struct ReclaimableSlab;
   struct RetainedBlock;
 
@@ -450,6 +455,7 @@ class MemoryLimitPool {
   bool try_reserve_used(size_t bytes);
   bool try_reserve_page_used(size_t bytes);
   bool try_reserve_committed(size_t bytes);
+  bool try_reserve_allocation(size_t bytes);
   bool try_charge_fixed(size_t bytes, std::atomic<size_t> *counter);
   bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter);
@@ -460,7 +466,7 @@ class MemoryLimitPool {
   bool reclaim_slab_buffer(char *buffer);
   void release_all_slabs_locked();
   size_t trim_free_buffers(size_t bytes_needed);
-  void trim_idle_buffers();
+  bool trim_idle_buffers();
   size_t trim_retained_blocks(size_t bytes_needed);
   size_t pick_shard();
 
@@ -513,6 +519,8 @@ class MemoryLimitPool {
   std::atomic<bool> initialized_{false};
   // Serialize reinitialization with reservations, but not releases.
   mutable std::shared_mutex lifecycle_mutex_;
+  // Includes pending page reservations, not just materialized allocations.
+  // Every admission must reserve this counter before adding backing charges.
   std::atomic<size_t> used_size_{0};
   // Includes free-list buffers so all consumers share the same hard cap.
   std::atomic<size_t> committed_size_{0};

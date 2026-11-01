@@ -25,6 +25,7 @@
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
 
@@ -69,6 +70,7 @@ static ssize_t zvec_pwrite(int fd, const void *buf, size_t count,
   return static_cast<ssize_t>(bytes_written);
 }
 #else
+#include <sys/mman.h>
 #include <unistd.h>
 static inline ssize_t zvec_pread(int fd, void *buf, size_t count,
                                  size_t offset) {
@@ -87,6 +89,23 @@ const size_t kVectorPageSize = MemoryHelper::PageSize();
 
 namespace {
 constexpr size_t kBlockingAioBatchSize = VecBufferPool::kWritebackBatchPages;
+
+// Writable metadata owns anonymous mappings, not malloc storage that can
+// remain resident after free. Refund only backing that was actually unmapped.
+size_t ReleaseWritableMapping(void *data, size_t bytes, const char *kind) {
+  if (data == nullptr) return 0;
+#if defined(_MSC_VER)
+  const bool released = ::VirtualFree(data, 0, MEM_RELEASE) != 0;
+#else
+  const bool released = ::munmap(data, bytes) == 0;
+#endif
+  if (!released) {
+    // Conservatively keep the charge if the OS did not release the mapping.
+    LOG_ERROR("Failed to unmap %zu bytes of %s; keeping charge", bytes, kind);
+    return 0;
+  }
+  return bytes;
+}
 
 // One per-operation buffer, shared across its chunks, not retained in TLS.
 // Shrink the batch under pressure. Even the smallest buffer must be admitted.
@@ -108,6 +127,14 @@ size_t PrepareReadScratch(BudgetedMappedBuffer &scratch, size_t pages) {
 }
 }  // namespace
 
+void VecBufferPool::PageLockDeleter::operator()(
+    std::shared_mutex *data) const noexcept {
+  if (data == nullptr) return;
+  std::destroy_n(data, count);
+  MemoryLimitPool::get_instance().release_metadata(
+      ReleaseWritableMapping(data, mapped_bytes, "page-lock stripes"));
+}
+
 VecBufferPool::~VecBufferPool() {
   // Finish queued writes before page buffers, latches, and descriptors go
   // away. The synchronous pass below catches any prior writeback error.
@@ -118,19 +145,16 @@ VecBufferPool::~VecBufferPool() {
   // paths have drained.
   log_stats();
   page_table_.force_evict_all_loaded();
-  size_t writable_metadata_bytes = block_mutex_metadata_bytes() +
-                                   writeback_staging_size_ +
-                                   writeback_io_staging_charge_;
+  size_t writable_metadata_bytes = writeback_io_staging_charge_;
 #if defined(__linux__) && !defined(__ANDROID__)
   // A live ring owns this reservation, including any quarantined staging.
   if (writeback_io_uring_)
     writable_metadata_bytes -= writeback_io_staging_charge_;
 #endif
   block_mutexes_.reset();
-  if (writeback_staging_ != nullptr) {
-    ailego_free(writeback_staging_);
-    writeback_staging_ = nullptr;
-  }
+  writable_metadata_bytes += ReleaseWritableMapping(
+      writeback_staging_, writeback_staging_size_, "writeback staging");
+  writeback_staging_ = nullptr;
 #if defined(__linux__) && !defined(__ANDROID__)
   writeback_io_uring_.reset();
 #endif
@@ -1042,7 +1066,8 @@ size_t VecBufferPool::metadata_bytes_for_page_count(size_t page_count,
   // maximum up front. Besides avoiding cross-page write contention, this
   // lets a 128-page writeback batch hold distinct stripes after extend_file().
   const size_t mutex_count = writable ? kMutexBucketCount : 0;
-  const size_t mutex_bytes = mutex_count * sizeof(std::shared_mutex);
+  const size_t mutex_bytes = BudgetedMappedBuffer::mapping_size(
+      mutex_count * sizeof(std::shared_mutex));
   const size_t staging_bytes =
       writable ? kBlockingAioBatchSize * kVectorPageSize : 0;
   size_t io_staging_bytes = 0;
@@ -1108,7 +1133,8 @@ int VecBufferPool::init() {
   // lifetime and avoid collapsing future writeback batches onto the few pages
   // present when the file was opened.
   const size_t mutex_count = writable_ ? kMutexBucketCount : 0;
-  const size_t mutex_charge = mutex_count * sizeof(std::shared_mutex);
+  const size_t mutex_charge = BudgetedMappedBuffer::mapping_size(
+      mutex_count * sizeof(std::shared_mutex));
   const size_t staging_charge =
       writable_ ? kBlockingAioBatchSize * kVectorPageSize : 0;
   size_t io_staging_charge = 0;
@@ -1147,27 +1173,42 @@ int VecBufferPool::init() {
         writable_metadata_charge, mutex_count, file_name_.c_str());
     return -1;
   }
-  std::unique_ptr<std::shared_mutex[]> mutexes;
+  PageLockArray mutexes{nullptr, PageLockDeleter{mutex_count, mutex_charge}};
   if (mutex_count != 0) {
-    try {
-      mutexes = std::make_unique<std::shared_mutex[]>(mutex_count);
-    } catch (const std::bad_alloc &) {
+    auto *data =
+        static_cast<std::shared_mutex *>(File::MemoryMap(mutex_charge, 0));
+    if (data == nullptr) {
       MemoryLimitPool::get_instance().release_metadata(
           writable_metadata_charge);
       LOG_ERROR(
-          "VecBufferPool::init: failed to allocate %zu page-lock stripes "
+          "VecBufferPool::init: failed to map %zu bytes of page-lock "
+          "stripes (file=%s)",
+          mutex_charge, file_name_.c_str());
+      return -1;
+    }
+    try {
+      // This algorithm also destroys any constructed prefix if a lock's
+      // constructor throws. The raw mapping still needs explicit release.
+      std::uninitialized_value_construct_n(data, mutex_count);
+    } catch (...) {
+      MemoryLimitPool::get_instance().release_metadata(
+          writable_metadata_charge - mutex_charge +
+          ReleaseWritableMapping(data, mutex_charge, "page-lock stripes"));
+      LOG_ERROR(
+          "VecBufferPool::init: failed to construct %zu page-lock stripes "
           "(file=%s)",
           mutex_count, file_name_.c_str());
       return -1;
     }
+    mutexes.reset(data);
   }
   char *writeback_staging = nullptr;
   if (staging_charge != 0) {
-    writeback_staging = static_cast<char *>(
-        ailego_aligned_malloc(staging_charge, kVectorPageSize));
+    writeback_staging = static_cast<char *>(File::MemoryMap(staging_charge, 0));
     if (writeback_staging == nullptr) {
+      mutexes.reset();
       MemoryLimitPool::get_instance().release_metadata(
-          writable_metadata_charge);
+          writable_metadata_charge - mutex_charge);
       LOG_ERROR(
           "VecBufferPool::init: failed to allocate %zu bytes of writeback "
           "staging (file=%s)",
@@ -1176,10 +1217,12 @@ int VecBufferPool::init() {
     }
   }
   if (!page_table_.init(block_num)) {
-    if (writeback_staging != nullptr) {
-      ailego_free(writeback_staging);
-    }
-    MemoryLimitPool::get_instance().release_metadata(writable_metadata_charge);
+    mutexes.reset();
+    const size_t released_staging = ReleaseWritableMapping(
+        writeback_staging, staging_charge, "writeback staging");
+    MemoryLimitPool::get_instance().release_metadata(
+        writable_metadata_charge - mutex_charge - staging_charge +
+        released_staging);
     LOG_ERROR(
         "VecBufferPool::init: page_table_ init failed for file[%s], "
         "file_size=%zu, block_num=%zu, required_metadata=%zu",
