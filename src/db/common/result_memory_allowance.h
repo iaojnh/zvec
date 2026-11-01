@@ -14,16 +14,18 @@ namespace zvec::detail {
 // This is not an allocator or an RSS measurement. Retain the concurrent high
 // water mark: destroying an object need not return its backing pages to the OS.
 // The production owner lives for the process lifetime; short-lived owners are
-// useful only in isolated tests. Caller-retained results are outside this
-// scope.
+// useful only in isolated tests. Returned payloads can retain a shared Lease;
+// release the materialization slot before transferring it to another thread.
 class ResultMemoryAllowance {
  public:
   class Lease {
    public:
     explicit Lease(ResultMemoryAllowance *owner,
-                   bool serialize_materialization = false)
+                   bool serialize_materialization = false,
+                   size_t backing_quantum = 1)
         : owner_(owner),
-          serialize_materialization_(serialize_materialization) {}
+          serialize_materialization_(serialize_materialization),
+          backing_quantum_(backing_quantum) {}
     Lease(const Lease &) = delete;
     Lease &operator=(const Lease &) = delete;
     ~Lease() {
@@ -33,24 +35,35 @@ class ResultMemoryAllowance {
     bool enabled() const {
       return owner_ != nullptr;
     }
-    void add(size_t bytes) {
-      if (!owner_ || bytes == 0) return;
-      // Take the materialization slot before charging the first chunk, not
-      // after a partially built result has exhausted the shared allowance.
-      // Keep it through every chunk of this API call. Otherwise concurrent
-      // calls can all retain partial results and wait for one another to end.
+    void end_materialization() {
+      // A result may be destroyed on a different caller thread. Never let its
+      // lifetime extend ownership of the producing thread's mutex.
+      if (materialization_.owns_lock()) materialization_.unlock();
+      serialize_materialization_ = false;
+    }
+    void begin_materialization() {
+      if (!owner_) return;
+      // Enter before fetching the first native chunk, not just before Python
+      // conversion. Otherwise waiting calls retain already materialized Docs
+      // and grow ordinary-heap backing despite serializing their conversion.
+      // Keep the slot through every chunk of this API call.
       // Callers must hold neither the GIL nor database locks while waiting.
       if (serialize_materialization_ && !materialization_.owns_lock()) {
         materialization_ =
             std::unique_lock<std::mutex>(owner_->materialization_mutex_);
       }
-      bytes_ += owner_->acquire(bytes);
+    }
+    void add(size_t bytes) {
+      if (!owner_ || bytes == 0) return;
+      begin_materialization();
+      bytes_ += owner_->acquire(bytes, backing_quantum_);
     }
 
    private:
     ResultMemoryAllowance *owner_;
     size_t bytes_{0};
     bool serialize_materialization_;
+    size_t backing_quantum_;
     // Destruction releases active bytes above before allowing the next call.
     std::unique_lock<std::mutex> materialization_;
   };
@@ -66,7 +79,7 @@ class ResultMemoryAllowance {
 
  private:
   friend class MemoryBudgetTestPeer;
-  size_t acquire(size_t bytes) {
+  size_t acquire(size_t bytes, size_t backing_quantum) {
     std::lock_guard<std::mutex> lock(mutex_);
     const size_t capacity = ailego::MemoryLimitPool::get_instance().capacity();
     if (!capacity) return 0;
@@ -79,7 +92,15 @@ class ResultMemoryAllowance {
     if (bytes > max_active || active_ > max_active - bytes) {
       throw std::bad_alloc();
     }
-    const size_t target = (active_ + bytes) * kBackingMultiplier;
+    if (backing_quantum == 0) throw std::bad_alloc();
+    const size_t high_water = active_ + bytes;
+    // Result allocators may retain backing in arenas rather than individual
+    // object-sized pieces. Round each backing equivalent before admission;
+    // otherwise native cache pages can consume an uncharged partial arena.
+    const size_t remainder = high_water % backing_quantum;
+    const size_t padding = remainder ? backing_quantum - remainder : 0;
+    if (padding > max_active - high_water) throw std::bad_alloc();
+    const size_t target = (high_water + padding) * kBackingMultiplier;
     // A failed oversized request must not leave a permanent allowance that
     // consumes the whole cache. Keep at least three quarters for native
     // storage, metadata and decoding; callers can split large result batches.

@@ -15,6 +15,7 @@
 #include <zvec/db/collection.h>
 #include "common/memory_budget_test_helper.h"
 #include "db/common/file_helper.h"
+#include "db/common/global_resource.h"
 #include "db/common/write_buffer_reservation.h"
 #include "db/index/common/version_manager.h"
 #include "db/index/storage/parquet_memory_pool.h"
@@ -28,6 +29,14 @@ constexpr size_t kMiB = 1024 * 1024;
 
 class CollectionWriteBudgetTest : public testing::Test {
  protected:
+  static void SetUpTestSuite() {
+    // These cases resize only the Buffer Pool to test write admission. Publish
+    // immutable shared resources from the normal fixture budget first, so a
+    // rejection case cannot leave a tiny RocksDB/WBM budget for later cases.
+    ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64 * kMiB));
+    ASSERT_EQ(0, GlobalResource::Instance().initialize());
+  }
+
   void SetUp() override {
     ASSERT_TRUE(detail::MemoryBudgetTestPeer::reset_idle_allowances());
     ASSERT_EQ(0, pool_.init(64 * kMiB));

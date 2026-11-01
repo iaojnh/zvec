@@ -31,10 +31,36 @@ namespace zvec {
 
 namespace {
 
+// The supported 64-bit CPython small-object allocator acquires 1 MiB arenas.
+// Retain whole-arena planning headroom, not only rounded Python object bytes.
+constexpr size_t kPythonResultBackingQuantum = 1024 * 1024;
+
 detail::ResultMemoryAllowance &forward_result_allowance();
-void reserve_query_forward_results(const DocPtrList &docs,
-                                   const CollectionSchema &schema,
-                                   detail::ResultMemoryAllowance::Lease &lease);
+void reserve_query_results(const DocPtrList &docs,
+                           const CollectionSchema &schema,
+                           detail::ResultMemoryAllowance::Lease &lease);
+
+void retain_result_memory(
+    const py::object &result,
+    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
+  if (!memory->enabled()) return;
+  using Lease = detail::ResultMemoryAllowance::Lease;
+  auto holder = std::make_unique<std::shared_ptr<Lease>>(memory);
+  py::capsule owner(holder.get(), [](void *p) {
+    delete static_cast<std::shared_ptr<Lease> *>(p);
+  });
+  holder.release();
+  try {
+    py::module_::import("zvec.model._budgeted_result")
+        .attr("_retain_result_memory")(result, owner);
+  } catch (...) {
+    // A Python traceback can retain partially wrapped payloads and owner.
+    // Unlock on this producing thread even when conversion throws.
+    memory->end_materialization();
+    throw;
+  }
+  memory->end_materialization();
+}
 
 // Batch-materialize a DocPtrList into a list of (id, score, fields, vectors)
 // tuples in a single GIL-held section, avoiding per-doc _Doc wrappers and
@@ -106,8 +132,9 @@ template <typename Query>
 py::list execute_for_python(const Collection &collection, const Query &query) {
   const bool budgeted = !unwrap_expected(collection.options()).enable_mmap_ &&
                         ailego::MemoryLimitPool::get_instance().capacity();
-  detail::ResultMemoryAllowance::Lease memory(
-      budgeted ? &forward_result_allowance() : nullptr);
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      budgeted ? &forward_result_allowance() : nullptr,
+      /*serialize_materialization=*/false, kPythonResultBackingQuantum);
   Result<internal::QueryResultSnapshot> result;
   {
     py::gil_scoped_release release;
@@ -115,8 +142,10 @@ py::list execute_for_python(const Collection &collection, const Query &query) {
   }
   // GIL restored, schema read lock already released.
   auto snapshot = unwrap_expected(std::move(result));
-  reserve_query_forward_results(snapshot.docs, *snapshot.schema, memory);
-  return docs_to_tuples(snapshot.docs, *snapshot.schema);
+  reserve_query_results(snapshot.docs, *snapshot.schema, *memory);
+  auto out = docs_to_tuples(snapshot.docs, *snapshot.schema);
+  retain_result_memory(out, memory);
+  return out;
 }
 
 // Transfer ownership of the native buffer without a per-result Python loop.
@@ -173,61 +202,110 @@ void estimate_query_array(const Doc &doc, const std::string &name,
   if constexpr (std::is_same_v<T, std::string>) {
     for (const auto &value : values) estimate.string(value);
   } else {
-    estimate.add(64, values.size());
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
+                  std::is_same_v<T, ailego::Float16>) {
+      // PyFloatObject is 24 bytes on 64-bit CPython, at most 32 after
+      // allocator rounding. List slots were charged separately above.
+      // Keep the backing multiplier in ResultMemoryAllowance unchanged.
+      estimate.add(std::max<size_t>(32, sizeof(PyFloatObject)), values.size());
+    } else {
+      estimate.add(64, values.size());
+    }
   }
 }
 
-void reserve_query_forward_results(
-    const DocPtrList &docs, const CollectionSchema &schema,
-    detail::ResultMemoryAllowance::Lease &lease) {
+template <typename T>
+void estimate_sparse_result(const Doc &doc, const std::string &name,
+                            PythonResultEstimate &estimate) {
+  const auto &values =
+      doc.get_ref<std::pair<std::vector<uint32_t>, std::vector<T>>>(name);
+  estimate.add(256);
+  // Python dict slots plus separately boxed keys and values, not native bytes.
+  estimate.add(192, values.first.size());
+}
+
+void estimate_document_fields(const Doc &doc, const FieldSchemaPtrList &fields,
+                              PythonResultEstimate &estimate) {
+  for (const auto &field : fields) {
+    const auto &name = field->name();
+    if (!doc.has_value(name)) continue;
+    estimate.string(name);
+    estimate.add(64);
+    switch (field->data_type()) {
+      case DataType::STRING:
+      case DataType::BINARY:
+        estimate.string(doc.get_ref<std::string>(name));
+        break;
+      case DataType::ARRAY_STRING:
+      case DataType::ARRAY_BINARY:
+        estimate_query_array<std::string>(doc, name, estimate);
+        break;
+      case DataType::ARRAY_BOOL:
+        estimate_query_array<bool>(doc, name, estimate);
+        break;
+      case DataType::ARRAY_INT32:
+        estimate_query_array<int32_t>(doc, name, estimate);
+        break;
+      case DataType::ARRAY_INT64:
+        estimate_query_array<int64_t>(doc, name, estimate);
+        break;
+      case DataType::ARRAY_UINT32:
+        estimate_query_array<uint32_t>(doc, name, estimate);
+        break;
+      case DataType::ARRAY_UINT64:
+        estimate_query_array<uint64_t>(doc, name, estimate);
+        break;
+      case DataType::ARRAY_FLOAT:
+      case DataType::VECTOR_FP32:
+        estimate_query_array<float>(doc, name, estimate);
+        break;
+      case DataType::ARRAY_DOUBLE:
+      case DataType::VECTOR_FP64:
+        estimate_query_array<double>(doc, name, estimate);
+        break;
+      case DataType::VECTOR_FP16:
+        estimate_query_array<ailego::Float16>(doc, name, estimate);
+        break;
+      case DataType::VECTOR_INT8:
+        estimate_query_array<int8_t>(doc, name, estimate);
+        break;
+      case DataType::SPARSE_VECTOR_FP16:
+        estimate_sparse_result<ailego::Float16>(doc, name, estimate);
+        break;
+      case DataType::SPARSE_VECTOR_FP32:
+        estimate_sparse_result<float>(doc, name, estimate);
+        break;
+      default:
+        estimate.add(64);
+        break;
+    }
+  }
+}
+
+void estimate_python_document(const Doc &doc,
+                              const FieldSchemaPtrList &forward_fields,
+                              const FieldSchemaPtrList &vector_fields,
+                              PythonResultEstimate &estimate) {
+  estimate.add(512);
+  estimate.string(doc.pk_ref());
+  estimate_document_fields(doc, forward_fields, estimate);
+  estimate_document_fields(doc, vector_fields, estimate);
+}
+
+void reserve_query_results(const DocPtrList &docs,
+                           const CollectionSchema &schema,
+                           detail::ResultMemoryAllowance::Lease &lease) {
   if (!lease.enabled()) return;
   try {
     py::gil_scoped_release release;
     PythonResultEstimate estimate;
-    const auto fields = schema.forward_fields();
+    const auto forward_fields = schema.forward_fields();
+    const auto vector_fields = schema.vector_fields();
     for (const auto &doc : docs) {
-      estimate.add(512);
-      if (!doc) continue;
-      estimate.string(doc->pk_ref());
-      for (const auto &field : fields) {
-        const auto &name = field->name();
-        if (!doc->has_value(name)) continue;
-        estimate.string(name);
-        estimate.add(64);
-        switch (field->data_type()) {
-          case DataType::STRING:
-          case DataType::BINARY:
-            estimate.string(doc->get_ref<std::string>(name));
-            break;
-          case DataType::ARRAY_STRING:
-          case DataType::ARRAY_BINARY:
-            estimate_query_array<std::string>(*doc, name, estimate);
-            break;
-          case DataType::ARRAY_BOOL:
-            estimate_query_array<bool>(*doc, name, estimate);
-            break;
-          case DataType::ARRAY_INT32:
-            estimate_query_array<int32_t>(*doc, name, estimate);
-            break;
-          case DataType::ARRAY_INT64:
-            estimate_query_array<int64_t>(*doc, name, estimate);
-            break;
-          case DataType::ARRAY_UINT32:
-            estimate_query_array<uint32_t>(*doc, name, estimate);
-            break;
-          case DataType::ARRAY_UINT64:
-            estimate_query_array<uint64_t>(*doc, name, estimate);
-            break;
-          case DataType::ARRAY_FLOAT:
-            estimate_query_array<float>(*doc, name, estimate);
-            break;
-          case DataType::ARRAY_DOUBLE:
-            estimate_query_array<double>(*doc, name, estimate);
-            break;
-          default:
-            estimate.add(64);
-            break;
-        }
+      if (doc) {
+        estimate_python_document(*doc, forward_fields, vector_fields, estimate);
+      } else {
+        estimate.add(sizeof(void *));
       }
     }
     lease.add(estimate.bytes());
@@ -235,6 +313,34 @@ void reserve_query_forward_results(
     PyErr_SetString(PyExc_MemoryError,
                     "Insufficient shared budget for Python query results; "
                     "reduce topk or output fields");
+    throw py::error_already_set();
+  }
+}
+
+void reserve_fetch_results(const DocPtrMap &docs,
+                           const CollectionSchema &schema,
+                           detail::ResultMemoryAllowance::Lease &lease) {
+  if (!lease.enabled()) return;
+  try {
+    // Admission can wait for the shared materialization slot or evict pages.
+    // The snapshot no longer holds database locks; never wait with the GIL.
+    py::gil_scoped_release release;
+    PythonResultEstimate estimate;
+    const auto forward_fields = schema.forward_fields();
+    const auto vector_fields = schema.vector_fields();
+    for (const auto &entry : docs) {
+      if (entry.second)
+        estimate_python_document(*entry.second, forward_fields, vector_fields,
+                                 estimate);
+    }
+    // Accumulate every chunk before conversion. Native Doc admission alone
+    // does not cover Python floats/list slots, nor Python results of old
+    // chunks.
+    lease.add(estimate.bytes());
+  } catch (const std::bad_alloc &) {
+    PyErr_SetString(PyExc_MemoryError,
+                    "Insufficient shared budget for Python fetch results; "
+                    "reduce fetch batch bytes or concurrent requests");
     throw py::error_already_set();
   }
 }
@@ -413,6 +519,7 @@ void fetch_chunk_for_python(
     forward_to_tuples(*snapshot.forward, out);
     return;
   }
+  reserve_fetch_results(snapshot.docs, schema, allowance);
   const auto forward_fields = schema.forward_fields();
   const auto vector_fields = schema.vector_fields();
   while (!snapshot.docs.empty()) {
@@ -427,12 +534,12 @@ void fetch_chunk_for_python(
 
 }  // namespace
 
-// Only one bounded native result batch is alive at a time. The final Python
-// values belong to the caller; a high-water allowance covers materialization,
-// not arbitrary caller retention. Release all database locks before taking the
-// GIL, including on error/DDL paths. Native reads may run concurrently, but
-// only one budgeted call accumulates Python results at a time. Waiting calls
-// retain at most their bounded native chunk, not growing Python dictionaries.
+// Only one bounded native result batch is alive at a time. Returned Python
+// payloads keep the allowance alive, without keeping the materialization slot.
+// Release all database locks before taking the
+// GIL, including on error/DDL paths. Budgeted calls acquire the materialization
+// slot before reading a native chunk, so waiting calls retain neither Docs
+// nor partially accumulated Python dictionaries. Mmap reads remain concurrent.
 py::dict fetch_for_python(
     const Collection &collection, const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
@@ -440,12 +547,15 @@ py::dict fetch_for_python(
   auto initial = fetch_snapshot_for_python(collection, {}, output_fields,
                                            include_vector, nullptr);
   const auto schema = std::move(initial.schema);
-  const bool budgeted = initial.forward &&
-                        !unwrap_expected(collection.options()).enable_mmap_ &&
+  const bool budgeted = !unwrap_expected(collection.options()).enable_mmap_ &&
                         ailego::MemoryLimitPool::get_instance().capacity();
-  detail::ResultMemoryAllowance::Lease allowance(
+  auto allowance = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       budgeted ? &forward_result_allowance() : nullptr,
-      /*serialize_materialization=*/true);
+      /*serialize_materialization=*/true, kPythonResultBackingQuantum);
+  {
+    py::gil_scoped_release release;
+    allowance->begin_materialization();
+  }
   py::dict out;
   // Columnar results remain charged; don't shrink them to Doc-sized chunks.
   const size_t batch_rows = initial.forward ? 256 : 32;
@@ -461,8 +571,9 @@ py::dict fetch_for_python(
       }
     }
     fetch_chunk_for_python(collection, batch, output_fields, include_vector,
-                           *schema, out, allowance);
+                           *schema, out, *allowance);
   } while (begin < pks.size());
+  retain_result_memory(out, allowance);
   return out;
 }
 

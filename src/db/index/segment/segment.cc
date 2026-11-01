@@ -1738,8 +1738,8 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
           return nullptr;
         }
         const auto &vector_buffer = fetch_result.value();
-        auto status =
-            ConvertVectorDataBufferToDocField(field, vector_buffer, doc.get());
+        auto status = ConvertVectorDataBufferToDocField(
+            field, vector_buffer, doc.get(), memory.get());
         if (!status.ok()) {
           LOG_ERROR("convert vector data buffer to doc field failed %s",
                     status.message().c_str());
@@ -1779,8 +1779,8 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
             continue;
           }
           const auto &vector_buffer = fetch_result.value();
-          auto status = ConvertVectorDataBufferToDocField(field, vector_buffer,
-                                                          doc.get());
+          auto status = ConvertVectorDataBufferToDocField(
+              field, vector_buffer, doc.get(), memory.get());
           if (!status.ok()) {
             LOG_ERROR("convert vector data buffer to doc field failed %s",
                       status.message().c_str());

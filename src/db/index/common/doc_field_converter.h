@@ -24,6 +24,7 @@
 #include <zvec/db/doc.h>
 #include <zvec/db/schema.h>
 #include <zvec/db/status.h>
+#include "db/common/result_memory_allowance.h"
 #include "db/index/column/vector_column/vector_column_params.h"
 
 namespace zvec {
@@ -42,10 +43,12 @@ std::vector<T> ExtractTypedArrayValues(const ArrowArrayT *values) {
 }
 
 //! Convert a VectorDataBuffer (dense or sparse) fetched from a vector indexer
-//! into the corresponding Doc vector field.
+//! into the corresponding Doc vector field. If supplied, memory admits the
+//! destination copy before allocation and must be retained by the Doc owner.
 Status ConvertVectorDataBufferToDocField(
     const FieldSchema::Ptr &field,
-    const vector_column_params::VectorDataBuffer &buf, Doc *doc);
+    const vector_column_params::VectorDataBuffer &buf, Doc *doc,
+    detail::ResultMemoryAllowance::Lease *memory = nullptr);
 
 //! Convert every row of an Arrow array into the docs starting at `doc_it`
 //! (one doc per row). Type dispatch and null checks happen once per column

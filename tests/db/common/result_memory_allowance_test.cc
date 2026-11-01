@@ -12,6 +12,7 @@
 #include "db/common/query_result_memory.h"
 #include "db/index/column/fts_column/fts_memory.h"
 #include "db/index/column/inverted_column/inverted_search_result.h"
+#include "db/index/common/doc_field_converter.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::detail {
@@ -65,6 +66,86 @@ TEST_F(ResultMemoryAllowanceTest, ConcurrentCallsShareOneHighWaterAllowance) {
   for (auto &thread : threads) thread.join();
   EXPECT_EQ(0u, allowance.active_bytes());
   EXPECT_EQ(8 * kMiB, pool_.external_used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, RoundsEachBackingEquivalentBeforeAdmission) {
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease lease(&allowance, false, kMiB);
+    lease.add(kMiB + 1);
+    EXPECT_EQ(kMiB + 1, allowance.active_bytes());
+    EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
+  }
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
+  {
+    ResultMemoryAllowance::Lease lease(&allowance, false, kMiB);
+    lease.add(1);
+    EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
+  }
+  EXPECT_EQ(4 * kMiB, pool_.external_used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, NativeAndQuantizedLeasesShareOneReservation) {
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease native(&allowance);
+  native.add(kMiB + 1);
+  EXPECT_EQ(2 * (kMiB + 1), allowance.reserved_bytes());
+  ResultMemoryAllowance::Lease python(&allowance, false, kMiB);
+  python.add(1);
+  EXPECT_EQ(kMiB + 2, allowance.active_bytes());
+  EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
+  EXPECT_EQ(4 * kMiB, pool_.external_used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, RoundedQuarterLimitRejectsWithoutPoisoning) {
+  auto &actual = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, actual.init(66 * kMiB));
+  ASSERT_EQ(66 * kMiB, actual.capacity());
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease lease(&allowance, false, kMiB);
+  // Byte-only accounting fits the 16.5 MiB quarter, but its whole arenas do
+  // not.
+  EXPECT_THROW(lease.add(8 * kMiB + 1), std::bad_alloc);
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  EXPECT_EQ(0u, pool_.external_used());
+  lease.add(8 * kMiB);
+  EXPECT_EQ(8 * kMiB, allowance.active_bytes());
+  EXPECT_EQ(16 * kMiB, allowance.reserved_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest, QuantumOverflowDoesNotConsumeBudget) {
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease enormous(&allowance, false,
+                                        std::numeric_limits<size_t>::max());
+  EXPECT_THROW(enormous.add(1), std::bad_alloc);
+  ResultMemoryAllowance::Lease invalid(&allowance, false, 0);
+  EXPECT_THROW(invalid.add(1), std::bad_alloc);
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  EXPECT_EQ(0u, pool_.external_used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, ReturnedLeaseDoesNotKeepMaterializationLock) {
+  ResultMemoryAllowance allowance;
+  auto held = std::make_shared<ResultMemoryAllowance::Lease>(&allowance, true);
+  held->add(kMiB);
+  held->end_materialization();
+  auto next = std::async(std::launch::async, [&] {
+    ResultMemoryAllowance::Lease lease(&allowance, true);
+    lease.add(kMiB);
+    return allowance.active_bytes();
+  });
+  ASSERT_EQ(std::future_status::ready, next.wait_for(std::chrono::seconds(2)));
+  EXPECT_EQ(2 * kMiB, next.get());
+  EXPECT_EQ(kMiB, allowance.active_bytes());
+  auto release =
+      std::async(std::launch::async,
+                 [owner = std::move(held)]() mutable { owner.reset(); });
+  release.get();
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
 }
 
 TEST_F(ResultMemoryAllowanceTest, RejectedGrowthLeavesLeaseAndChargeUnchanged) {
@@ -151,6 +232,99 @@ TEST_F(ResultMemoryAllowanceTest, FailedMaterializerUnblocksNextCall) {
   next.get();
   EXPECT_EQ(0u, allowance.active_bytes());
   EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest, MaterializerWaitsBeforeNativePreparation) {
+  ResultMemoryAllowance allowance;
+  auto first = std::make_unique<ResultMemoryAllowance::Lease>(&allowance, true);
+  first->begin_materialization();
+  // Entering the slot alone does not fabricate a byte charge.
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  std::promise<void> entered;
+  std::atomic<bool> prepared{false};
+  auto waiting = std::async(std::launch::async, [&] {
+    ResultMemoryAllowance::Lease second(&allowance, true);
+    entered.set_value();
+    second.begin_materialization();
+    prepared = true;
+    second.add(kMiB);
+  });
+  entered.get_future().wait();
+  EXPECT_EQ(std::future_status::timeout,
+            waiting.wait_for(std::chrono::milliseconds(20)));
+  EXPECT_FALSE(prepared.load());
+  // Exception/empty-result paths must also release a slot with no charge.
+  first.reset();
+  EXPECT_EQ(std::future_status::ready,
+            waiting.wait_for(std::chrono::seconds(5)));
+  waiting.get();
+  EXPECT_TRUE(prepared.load());
+  EXPECT_EQ(0u, allowance.active_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest, DenseVectorCopyKeepsItsOwnAdmission) {
+  ResultMemoryAllowance allowance;
+  auto memory = std::make_shared<ResultMemoryAllowance::Lease>(&allowance);
+  auto doc = MakeQueryDocument(memory);
+  auto field = std::make_shared<FieldSchema>("vector", DataType::VECTOR_FP32);
+  const std::vector<float> values{1.0f, 2.0f, -3.0f};
+  const size_t expected =
+      192 + field->name().size() * 2 + values.size() * sizeof(float);
+  {
+    vector_column_params::VectorDataBuffer source;
+    auto &buffer =
+        std::get<vector_column_params::DenseVectorBuffer>(source.vector_buffer);
+    buffer.reserve(values.size() * sizeof(float));
+    buffer.data.assign(reinterpret_cast<const char *>(values.data()),
+                       values.size() * sizeof(float));
+    ASSERT_TRUE(ConvertVectorDataBufferToDocField(field, source, doc.get(),
+                                                  memory.get())
+                    .ok());
+    EXPECT_EQ(expected, allowance.active_bytes());
+  }
+  memory.reset();
+  EXPECT_EQ(values, doc->get_ref<std::vector<float>>("vector"));
+  EXPECT_EQ(expected, allowance.active_bytes());
+  auto held = doc;
+  doc.reset();
+  EXPECT_EQ(expected, allowance.active_bytes());
+  held.reset();
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(expected * 2, allowance.reserved_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest, SparseCopyRejectsBeforeMutatingAndCanRetry) {
+  ResultMemoryAllowance allowance;
+  auto memory = std::make_shared<ResultMemoryAllowance::Lease>(&allowance);
+  auto doc = MakeQueryDocument(memory);
+  auto field =
+      std::make_shared<FieldSchema>("vector", DataType::SPARSE_VECTOR_FP32);
+  const std::vector<uint32_t> indices{1, 5};
+  const std::vector<float> values{2.0f, -3.0f};
+  vector_column_params::SparseVectorBuffer buffer;
+  buffer.indices.assign(reinterpret_cast<const char *>(indices.data()),
+                        indices.size() * sizeof(uint32_t));
+  buffer.values.assign(reinterpret_cast<const char *>(values.data()),
+                       values.size() * sizeof(float));
+  const size_t expected = 192 + field->name().size() * 2 +
+                          buffer.indices.size() + buffer.values.size();
+  vector_column_params::VectorDataBuffer source{std::move(buffer)};
+  const size_t pressure = pool_.capacity() - pool_.used();
+  ASSERT_TRUE(pool_.try_charge_external(pressure));
+  EXPECT_THROW(
+      ConvertVectorDataBufferToDocField(field, source, doc.get(), memory.get()),
+      std::bad_alloc);
+  EXPECT_FALSE(doc->has("vector"));
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  pool_.release_external(pressure);
+  ASSERT_TRUE(
+      ConvertVectorDataBufferToDocField(field, source, doc.get(), memory.get())
+          .ok());
+  using Sparse = std::pair<std::vector<uint32_t>, std::vector<float>>;
+  EXPECT_EQ(Sparse(indices, values), doc->get_ref<Sparse>("vector"));
+  EXPECT_EQ(expected, allowance.active_bytes());
 }
 
 TEST_F(ResultMemoryAllowanceTest, OversizedCallDoesNotExhaustFutureCacheSpace) {

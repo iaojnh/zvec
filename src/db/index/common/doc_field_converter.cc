@@ -15,6 +15,7 @@
 #include "doc_field_converter.h"
 #include <string>
 #include <vector>
+#include "db/common/query_result_memory.h"
 
 namespace zvec {
 
@@ -23,9 +24,17 @@ namespace {
 template <typename T>
 Status DenseVectorDataConverter(
     const FieldSchema::Ptr &field,
-    const vector_column_params::DenseVectorBuffer &buffer, Doc *doc) {
+    const vector_column_params::DenseVectorBuffer &buffer, Doc *doc,
+    detail::ResultMemoryAllowance::Lease *memory) {
   const T *data_ptr = reinterpret_cast<const T *>(buffer.data.data());
   size_t data_size = buffer.data.size() / sizeof(T);
+  if (memory) {
+    detail::QueryResultEstimate estimate;
+    estimate.add(192);
+    estimate.add(field->name().size(), 2);
+    estimate.add(sizeof(T), data_size);
+    memory->add(estimate.bytes());
+  }
   std::vector<T> vector_data(data_ptr, data_ptr + data_size);
   doc->set(field->name(), std::move(vector_data));
   return Status::OK();
@@ -34,16 +43,25 @@ Status DenseVectorDataConverter(
 template <typename IndexType, typename ValueType>
 Status SparseVectorDataConverter(
     const FieldSchema::Ptr &field,
-    const vector_column_params::SparseVectorBuffer &buffer, Doc *doc) {
+    const vector_column_params::SparseVectorBuffer &buffer, Doc *doc,
+    detail::ResultMemoryAllowance::Lease *memory) {
   const IndexType *indices_ptr =
       reinterpret_cast<const IndexType *>(buffer.indices.data());
   size_t indices_size = buffer.indices.size() / sizeof(IndexType);
+  const size_t values_size = buffer.values.size() / sizeof(ValueType);
+  if (memory) {
+    detail::QueryResultEstimate estimate;
+    estimate.add(192);
+    estimate.add(field->name().size(), 2);
+    estimate.add(sizeof(IndexType), indices_size);
+    estimate.add(sizeof(ValueType), values_size);
+    memory->add(estimate.bytes());
+  }
   std::vector<IndexType> indices_vector(indices_ptr,
                                         indices_ptr + indices_size);
 
   const ValueType *values_ptr =
       reinterpret_cast<const ValueType *>(buffer.values.data());
-  size_t values_size = buffer.values.size() / sizeof(ValueType);
   std::vector<ValueType> values_vector(values_ptr, values_ptr + values_size);
 
   std::pair<std::vector<IndexType>, std::vector<ValueType>> sparse_vector_pair(
@@ -102,26 +120,34 @@ Status SetListColumn(const arrow::Array *array, const std::string &name,
 
 Status ConvertVectorDataBufferToDocField(
     const FieldSchema::Ptr &field,
-    const vector_column_params::VectorDataBuffer &buf, Doc *doc) {
+    const vector_column_params::VectorDataBuffer &buf, Doc *doc,
+    detail::ResultMemoryAllowance::Lease *memory) {
   if (std::holds_alternative<vector_column_params::DenseVectorBuffer>(
           buf.vector_buffer)) {
     const auto &dense_buffer =
         std::get<vector_column_params::DenseVectorBuffer>(buf.vector_buffer);
     switch (field->data_type()) {
       case DataType::VECTOR_BINARY32:
-        return DenseVectorDataConverter<uint32_t>(field, dense_buffer, doc);
+        return DenseVectorDataConverter<uint32_t>(field, dense_buffer, doc,
+                                                  memory);
       case DataType::VECTOR_BINARY64:
-        return DenseVectorDataConverter<uint64_t>(field, dense_buffer, doc);
+        return DenseVectorDataConverter<uint64_t>(field, dense_buffer, doc,
+                                                  memory);
       case DataType::VECTOR_FP16:
-        return DenseVectorDataConverter<float16_t>(field, dense_buffer, doc);
+        return DenseVectorDataConverter<float16_t>(field, dense_buffer, doc,
+                                                   memory);
       case DataType::VECTOR_FP32:
-        return DenseVectorDataConverter<float>(field, dense_buffer, doc);
+        return DenseVectorDataConverter<float>(field, dense_buffer, doc,
+                                               memory);
       case DataType::VECTOR_FP64:
-        return DenseVectorDataConverter<double>(field, dense_buffer, doc);
+        return DenseVectorDataConverter<double>(field, dense_buffer, doc,
+                                                memory);
       case DataType::VECTOR_INT8:
-        return DenseVectorDataConverter<int8_t>(field, dense_buffer, doc);
+        return DenseVectorDataConverter<int8_t>(field, dense_buffer, doc,
+                                                memory);
       case DataType::VECTOR_INT16:
-        return DenseVectorDataConverter<int16_t>(field, dense_buffer, doc);
+        return DenseVectorDataConverter<int16_t>(field, dense_buffer, doc,
+                                                 memory);
       default:
         return Status::InvalidArgument(
             "Unsupported dense vector element type: ", field->data_type());
@@ -133,10 +159,10 @@ Status ConvertVectorDataBufferToDocField(
     switch (field->data_type()) {
       case DataType::SPARSE_VECTOR_FP16:
         return SparseVectorDataConverter<uint32_t, float16_t>(
-            field, sparse_buffer, doc);
+            field, sparse_buffer, doc, memory);
       case DataType::SPARSE_VECTOR_FP32:
         return SparseVectorDataConverter<uint32_t, float>(field, sparse_buffer,
-                                                          doc);
+                                                          doc, memory);
       default:
         return Status::InvalidArgument(
             "Unsupported sparse vector element type: ", field->data_type());
