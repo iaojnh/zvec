@@ -84,6 +84,14 @@ class FlatStreamer : public IndexStreamer {
                      uint32_t count, Context::UPointer &context) const override;
 
   //! Linear search by primary keys
+  int search_bf_by_keys_impl(const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const override {
+    return search_bf_by_key_rows(query, &keys, qmeta, 1, context);
+  }
+
+  //! Linear search by primary keys
   int search_bf_by_p_keys_impl(const void *query,
                                const std::vector<std::vector<uint64_t>> &p_keys,
                                const IndexQueryMeta &qmeta,
@@ -196,6 +204,16 @@ class FlatStreamer : public IndexStreamer {
   }
 
  private:
+  // Borrow one or more existing key vectors for this synchronous call.
+  int search_bf_by_key_rows(const void *query,
+                            const std::vector<uint64_t> *p_keys,
+                            const IndexQueryMeta &qmeta, uint32_t count,
+                            Context::Pointer &context) const;
+  int group_by_search_key_rows(const void *query,
+                               const std::vector<uint64_t> *p_keys,
+                               const IndexQueryMeta &qmeta, uint32_t count,
+                               Context::Pointer &context) const;
+
   //! Constants
   static constexpr uint32_t kDefaultBlockVecCount = 32u;
   static constexpr uint32_t kDefaultSegmentSize = 4 * 1024 * 1024u;

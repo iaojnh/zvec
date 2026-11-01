@@ -104,6 +104,14 @@ class FlatSearcher : public IndexSearcher {
                   uint32_t count, Context::Pointer &context) const override;
 
   //! Linear search by primary keys
+  int search_bf_by_keys_impl(const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const override {
+    return search_bf_by_key_rows(query, &keys, qmeta, 1, context);
+  }
+
+  //! Linear search by primary keys
   int search_bf_by_p_keys_impl(const void *query,
                                const std::vector<std::vector<uint64_t>> &p_keys,
                                const IndexQueryMeta &qmeta,
@@ -244,6 +252,11 @@ class FlatSearcher : public IndexSearcher {
   }
 
  private:
+  int search_bf_by_key_rows(const void *query,
+                            const std::vector<uint64_t> *p_keys,
+                            const IndexQueryMeta &qmeta, uint32_t count,
+                            Context::Pointer &context) const;
+
   //! Validate turbo query records, preserving legacy metric assertions.
   int check_query_meta(const IndexQueryMeta &qmeta) const;
 

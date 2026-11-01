@@ -333,18 +333,24 @@ template <size_t BATCH_SIZE>
 int FlatSearcher<BATCH_SIZE>::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
+    Context::Pointer &context) const {
+  if (!container_) return IndexError_NoReady;
+  if (ailego_unlikely(count == 0 || p_keys.size() != count)) {
+    LOG_ERROR("The size of p_keys is not equal to count");
+    return IndexError_InvalidArgument;
+  }
+  return search_bf_by_key_rows(query, p_keys.data(), qmeta, count, context);
+}
+
+template <size_t BATCH_SIZE>
+int FlatSearcher<BATCH_SIZE>::search_bf_by_key_rows(
+    const void *query, const std::vector<uint64_t> *p_keys,
+    const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const try {
   if (!container_) return IndexError_NoReady;
   ailego_assert(query && count && !!context);
   int error_code = this->check_query_meta(qmeta);
-  if (error_code != 0) {
-    return error_code;
-  }
-
-  if (ailego_unlikely(p_keys.size() != count)) {
-    LOG_ERROR("The size of p_keys is not equal to count");
-    return IndexError_InvalidArgument;
-  }
+  if (error_code != 0) return error_code;
 
   FlatSearcherContext<BATCH_SIZE> *bf_context =
       dynamic_cast<FlatSearcherContext<BATCH_SIZE> *>(context.get());
@@ -359,7 +365,7 @@ int FlatSearcher<BATCH_SIZE>::search_bf_by_p_keys_impl(
 
   if (!bf_context->threshold_is_valid()) return IndexError_NoReady;
 
-  return bf_context->search_bf_by_p_keys_impl(query, p_keys, qmeta, count);
+  return bf_context->search_bf_by_key_rows(query, p_keys, qmeta, count);
 } catch (const MetadataReadError &error) {
   return error.status;
 } catch (const std::bad_alloc &) {

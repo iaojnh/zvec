@@ -423,9 +423,18 @@ template <size_t BATCH_SIZE>
 int FlatStreamer<BATCH_SIZE>::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const try {
+    Context::Pointer &context) const {
   if (state_ != STATE_OPENED) return IndexError_NoReady;
   if (count == 0 || count > p_keys.size()) return IndexError_InvalidArgument;
+  return search_bf_by_key_rows(query, p_keys.data(), qmeta, count, context);
+}
+
+template <size_t BATCH_SIZE>
+int FlatStreamer<BATCH_SIZE>::search_bf_by_key_rows(
+    const void *query, const std::vector<uint64_t> *p_keys,
+    const IndexQueryMeta &qmeta, uint32_t count,
+    Context::Pointer &context) const try {
+  if (state_ != STATE_OPENED) return IndexError_NoReady;
   ailego_assert(query && count && !!context);
   ailego_assert(quantizer_ || metric_->is_matched(meta_, qmeta));
 
@@ -447,7 +456,7 @@ int FlatStreamer<BATCH_SIZE>::search_bf_by_p_keys_impl(
   if (!bf_context->threshold_is_valid()) return IndexError_NoReady;
 
   if (bf_context->group_by_search()) {
-    return group_by_search_p_keys_impl(query, p_keys, qmeta, count, context);
+    return group_by_search_key_rows(query, p_keys, qmeta, count, context);
   }
 
   bf_context->reset_results(count);
@@ -565,6 +574,14 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_p_keys_impl(
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
   if (count == 0 || count > p_keys.size()) return IndexError_InvalidArgument;
+  return group_by_search_key_rows(query, p_keys.data(), qmeta, count, context);
+}
+
+template <size_t BATCH_SIZE>
+int FlatStreamer<BATCH_SIZE>::group_by_search_key_rows(
+    const void *query, const std::vector<uint64_t> *p_keys,
+    const IndexQueryMeta &qmeta, uint32_t count,
+    Context::Pointer &context) const {
   FlatStreamerContext<BATCH_SIZE> *bf_context =
       dynamic_cast<FlatStreamerContext<BATCH_SIZE> *>(context.get());
   if (!bf_context) {

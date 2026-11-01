@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <limits>
 #include <ailego/pattern/defer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include "algorithm/cluster/centroid_trainer.h"
 #include "algorithm/cluster/cluster_params.h"
@@ -875,6 +876,9 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
     return IndexError_Runtime;
   }
 
+  // Keep the backing alive until every submitted task has joined, including
+  // iterator errors and allocation failures while submitting a batch.
+  ailego::BudgetedMappedBuffer vectors;
   size_t id = 0UL;
   AILEGO_DEFER([&]() {
     task_group->wait_finish();
@@ -888,12 +892,11 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
   }
   // Bound copied vectors by bytes, including queued and running batches.
   // A single vector larger than the budget is still allowed to make progress.
-  const size_t window_size =
-      std::max<size_t>(1, kLabelMemoryBudget / elem_size);
+  const size_t window_size = std::min(
+      holder->count(), std::max<size_t>(1, kLabelMemoryBudget / elem_size));
+  vectors.resize(window_size * elem_size);
   size_t window_count = 0;
-  std::shared_ptr<VectorList> vectors = std::make_shared<VectorList>();
-  ivf_assert(vectors, IndexError_NoMemory);
-  vectors->reserve(std::min(kBatchSize, window_size));
+  size_t batch_start = 0;
   for (; iter && iter->is_valid(); iter->next()) {
     ivf_assert(!error_, err_code_);
     if (id >= holder->count() || id >= std::numeric_limits<uint32_t>::max()) {
@@ -906,21 +909,24 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
     if (!data) {
       return IndexError_Runtime;
     }
-    vectors->emplace_back(data, elem_size, id);
+    // Iterator data may be transient. Copy into a single reusable mapping
+    // instead of allocating and freeing a heap string for every vector.
+    std::memcpy(vectors.data() + window_count * elem_size, data, elem_size);
     id++;
     ++window_count;
-    if (vectors->size() == kBatchSize || window_count == window_size ||
+    const size_t batch_count = window_count - batch_start;
+    if (batch_count == kBatchSize || window_count == window_size ||
         id == holder->count()) {
-      auto task = ailego::Closure ::New(const_cast<IVFBuilder *>(this),
-                                        &IVFBuilder::label, vectors);
+      auto task = ailego::Closure::New(
+          this, &IVFBuilder::label, vectors.data() + batch_start * elem_size,
+          elem_size, static_cast<uint32_t>(id - batch_count), batch_count);
       task_group->submit(std::move(task));
-      vectors = std::make_shared<VectorList>();
-      ivf_assert(vectors, IndexError_NoMemory);
-      vectors->reserve(std::min(kBatchSize, window_size));
+      batch_start = window_count;
     }
     if (window_count == window_size) {
       task_group->wait_finish();
       window_count = 0;
+      batch_start = 0;
     }
     if (!(id & 0xFFFFF)) {
       LOG_INFO("Current built count:%zu", id);

@@ -121,7 +121,7 @@ class IVFEntity {
   }
 
   size_t query_workspace_bytes() const {
-    return reformer_.workspace_bytes();
+    return reformer_.workspace_bytes() + query_encoding_.memory.bytes();
   }
 
   //! Retrieve a block of vectors
@@ -422,6 +422,9 @@ class IVFEntity {
   IVFDistanceCalculator::Pointer calculator_{};
   turbo::Quantizer::Pointer quantizer_{};
   // Each context owns its entity clone and therefore its query buffer/LUT.
+  // Keep the legacy quantizer output capacity with that context as well:
+  // repeated queries must not allocate and retire an ordinary heap string.
+  ailego::BudgetedStringWorkspace query_encoding_;
   turbo::DistanceImpl query_distance_{};
   IndexStorage::Pointer container_{};
   IndexStorage::Segment::Pointer inverted_{};

@@ -168,6 +168,85 @@ TEST_F(IVFWorkspaceBudgetTest, RetainedDenseBufferCopyAndMoveKeepCharge) {
   EXPECT_EQ(16384u, first.data.size());
 }
 
+class QueryEncodingEntity : public IVFEntity {
+ public:
+  void set_quantizer(turbo::Quantizer::Pointer quantizer) {
+    quantizer_ = std::move(quantizer);
+  }
+  const char *encoding_data() const {
+    return query_encoding_.value.data();
+  }
+  size_t encoding_charge() const {
+    return query_encoding_.memory.bytes();
+  }
+  bool query_valid() const {
+    return query_distance_.valid();
+  }
+  float distance(const void *candidate) const {
+    return query_distance_(candidate);
+  }
+};
+
+TEST_F(IVFWorkspaceBudgetTest, TurboQueryEncodingReusesChargedCapacity) {
+  auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  IndexMeta meta(IndexMeta::DT_FP32, 768);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  ASSERT_EQ(0, quantizer->init(meta, {}));
+  std::array<float, 768> query{}, candidate{};
+  {
+    QueryEncodingEntity entity;
+    entity.set_quantizer(quantizer);
+    const IndexQueryMeta qmeta(IndexMeta::DT_FP32, query.size());
+    ASSERT_EQ(0, entity.bind_query(query.data(), qmeta));
+    ASSERT_GE(entity.encoding_charge(), sizeof(query));
+    const char *first = entity.encoding_data();
+    const size_t charge = entity.encoding_charge();
+    const size_t used = pool.external_used();
+    // Rebinding may reuse the released distance buffer, but has no room
+    // for another temporary encoding allocation or a replacement overlap.
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    query.fill(1.0f);
+    ASSERT_EQ(0, entity.bind_query(query.data(), qmeta));
+    EXPECT_EQ(first, entity.encoding_data());
+    EXPECT_EQ(charge, entity.encoding_charge());
+    EXPECT_FLOAT_EQ(768.0f, entity.distance(candidate.data()));
+    EXPECT_EQ(used + pressure.bytes(), pool.external_used());
+  }
+  EXPECT_EQ(0u, pool.external_used());
+}
+
+TEST_F(IVFWorkspaceBudgetTest, TurboEncodingRejectsGrowthAndCanRetry) {
+  QueryEncodingEntity entity;
+  auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  IndexMeta meta(IndexMeta::DT_FP32, 768);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  ASSERT_EQ(0, quantizer->init(meta, {}));
+  entity.set_quantizer(quantizer);
+  std::array<float, 1536> query{};
+  ASSERT_EQ(0, entity.bind_query(query.data(), {IndexMeta::DT_FP32, 768}));
+  const char *first = entity.encoding_data();
+  const size_t charge = entity.encoding_charge();
+  meta.set_meta(IndexMeta::DT_FP32, query.size());
+  ASSERT_EQ(0, quantizer->init(meta, {}));
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    EXPECT_THROW(
+        entity.bind_query(query.data(), {IndexMeta::DT_FP32, query.size()}),
+        std::bad_alloc);
+    EXPECT_FALSE(entity.query_valid());
+    EXPECT_EQ(first, entity.encoding_data());
+    EXPECT_EQ(charge, entity.encoding_charge());
+  }
+  ASSERT_EQ(
+      0, entity.bind_query(query.data(), {IndexMeta::DT_FP32, query.size()}));
+  EXPECT_TRUE(entity.query_valid());
+  EXPECT_GE(entity.encoding_charge(), sizeof(query));
+}
+
 TEST_F(IVFWorkspaceBudgetTest, GroupKeysPayForStringCapacity) {
   IvfRabitqContext::GroupTopkHeaps heaps;
   std::string key(4096, 'x');

@@ -28,6 +28,7 @@
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_provider.h>
 #include <zvec/core/framework/index_streamer.h>
+#include "ivf_entity.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
@@ -452,7 +453,7 @@ TEST_F(IVFBuilderTest, LabelQueueIsBoundedForHighDimensionalVectors) {
     SCOPED_TRACE(convert ? "FP16" : "FP32");
     dimension_ = 1024;
     index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);
-    params_.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "1");
+    params_.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "2");
     params_.set(PARAM_IVF_BUILDER_TRAIN_SAMPLE_COUNT, 8u);
     if (convert) {
       params_.set(PARAM_IVF_BUILDER_CONVERTER_CLASS, "HalfFloatConverter");
@@ -492,6 +493,39 @@ TEST_F(IVFBuilderTest, LabelQueueIsBoundedForHighDimensionalVectors) {
     ASSERT_EQ(0, builder.dump(dumper));
     EXPECT_EQ(kVectorCount, builder.stats().dumped_count());
     ASSERT_EQ(0, dumper->close());
+    // Each delayed batch must see its own rows, including the partial batch
+    // at a window boundary. A single centroid cannot detect overwritten rows.
+    auto storage = IndexFactory::CreateStorage("MemoryReadStorage");
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open("label_queue", false));
+    IVFEntity entity;
+    ASSERT_EQ(0, entity.load(storage));
+    std::vector<Float16> half(dimension_);
+    size_t checked = 0;
+    for (size_t centroid = 0; centroid < entity.inverted_list_count();
+         ++centroid) {
+      IndexStorage::MemoryBlock meta_block;
+      const auto *list = entity.inverted_list_meta(centroid, meta_block);
+      ASSERT_NE(nullptr, list);
+      for (size_t row = 0; row < list->vector_count; ++row) {
+        IndexStorage::MemoryBlock vector;
+        ASSERT_EQ(0, entity.get_vector(list->id_offset + row, vector));
+        const void *query = vector.data();
+        if (convert) {
+          const auto *values = static_cast<const float *>(query);
+          for (size_t d = 0; d < dimension_; ++d) half[d] = Float16(values[d]);
+          query = half.data();
+        }
+        uint32_t expected = IVFCentroidIndex::kInvalidID;
+        ASSERT_EQ(0, builder.centroid_index()->search_nearest_centroid(
+                         query, builder.centroid_index()->meta().element_size(),
+                         &expected));
+        ASSERT_EQ(centroid, expected);
+        ++checked;
+      }
+    }
+    EXPECT_EQ(kVectorCount, checked);
   }
 }
 

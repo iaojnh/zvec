@@ -273,34 +273,6 @@ class IVFBuilder : public IndexBuilder {
   };
 
  private:
-  /*! Wrapper of feature
-   */
-  class Vector {
-   public:
-    typedef std::shared_ptr<Vector> Pointer;
-
-    Vector(const void *vec, size_t len, uint32_t idx)
-        : vec_(reinterpret_cast<const char *>(vec), len), id_{idx} {}
-
-    const void *data() const {
-      return vec_.data();
-    }
-
-    size_t size() const {
-      return vec_.size();
-    }
-
-    uint32_t id() const {
-      return id_;
-    }
-
-   private:
-    ailego::BudgetedString vec_{};
-    uint32_t id_{0u};
-  };
-
-  using VectorList = ailego::BudgetedVector<Vector>;
-
   //! Check MajorOrder in meta, and update the major order if needed
   int check_and_update_major_order(IndexMeta &meta);
 
@@ -350,13 +322,13 @@ class IVFBuilder : public IndexBuilder {
   }
 
   //! Select the nearest centroid id for the vector
-  void label(const std::shared_ptr<VectorList> &vecs) try {
-    for (size_t i = 0; i < vecs->size(); ++i) {
-      auto &vec = (*vecs)[i];
-
+  void label(const char *vectors, size_t element_size, uint32_t first_id,
+             size_t count) try {
+    for (size_t i = 0; i < count; ++i) {
+      const uint32_t id = first_id + static_cast<uint32_t>(i);
       uint32_t centroid_idx = IVFCentroidIndex::kInvalidID;
       const int label_ret = centroid_index_->search_nearest_centroid(
-          vec.data(), vec.size(), &centroid_idx);
+          vectors + i * element_size, element_size, &centroid_idx);
       if (label_ret != 0) {
         LOG_ERROR("Failed to search nearest centroid in CentroidIndex");
         if (!error_.exchange(true)) {
@@ -366,9 +338,9 @@ class IVFBuilder : public IndexBuilder {
       }
       ailego_assert_with(centroid_idx < labels_.size(), "Index Overflow");
       if (paged_labels_) {
-        KeyOrderRecord record{centroid_idx, vec.id(), 0};
-        int ret = label_records_.write(size_t{vec.id()} * sizeof(record),
-                                       &record, sizeof(record));
+        KeyOrderRecord record{centroid_idx, id, 0};
+        int ret = label_records_.write(size_t{id} * sizeof(record), &record,
+                                       sizeof(record));
         if (ret != 0) {
           if (!error_.exchange(true)) err_code_ = ret;
           return;
@@ -376,7 +348,7 @@ class IVFBuilder : public IndexBuilder {
         continue;
       }
       std::lock_guard<std::mutex> lock(mutex_);
-      labels_[centroid_idx].emplace_back(vec.id());
+      labels_[centroid_idx].emplace_back(id);
     }
   } catch (const std::bad_alloc &) {
     if (!error_.exchange(true)) err_code_ = IndexError_NoMemory;

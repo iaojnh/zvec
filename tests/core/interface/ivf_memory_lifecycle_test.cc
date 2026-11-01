@@ -165,6 +165,51 @@ TEST_F(IVFMemoryLifecycleTest, ConverterRejectionIsNotReportedAsSuccess) {
                                  std::make_shared<RejectConverter>(), &holder));
 }
 
+TEST_F(IVFMemoryLifecycleTest, FetchedVectorKeepsBudgetAfterIndexCloses) {
+  build();
+  for (auto mode : {StorageOptions::StorageType::kBufferPool,
+                    StorageOptions::StorageType::kMMAP}) {
+    VectorDataBuffer fetched;
+    {
+      Index::Pointer index = make_index();
+      ASSERT_EQ(0, index->open(path, {mode, false, true}));
+      ASSERT_EQ(0, index->fetch(63, &fetched));
+      EXPECT_EQ(core::IndexError_NoExist, index->fetch(64, &fetched));
+      EXPECT_EQ(0, index->close());
+    }
+    const auto &data = std::get<DenseVectorBuffer>(fetched.vector_buffer).data;
+    EXPECT_EQ(
+        std::string(reinterpret_cast<const char *>(row.data()), sizeof(row)),
+        data);
+    EXPECT_GE(pool.external_used(), data.capacity() + 1);
+    EXPECT_GE(pool.used(), data.capacity() + 1);
+  }
+  EXPECT_EQ(0u, pool.used());
+}
+
+TEST_F(IVFMemoryLifecycleTest, FetchBudgetFailurePreservesResultAndCanRetry) {
+  build();
+  Index::Pointer index = make_index();
+  ASSERT_EQ(
+      0, index->open(path, {StorageOptions::StorageType::kMMAP, false, true}));
+  VectorDataBuffer fetched;
+  DenseVectorBuffer original;
+  original.reserve(4);
+  original.data = "kept";
+  fetched.vector_buffer = std::move(original);
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    EXPECT_EQ(core::IndexError_NoMemory, index->fetch(63, &fetched));
+    EXPECT_EQ("kept", std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+  }
+  ASSERT_EQ(0, index->fetch(63, &fetched));
+  EXPECT_EQ(
+      std::string(reinterpret_cast<const char *>(row.data()), sizeof(row)),
+      std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+  EXPECT_EQ(0, index->close());
+}
+
 TEST_F(IVFMemoryLifecycleTest, FailedOpenReleasesPartialStateAndCanRetry) {
   build();
   auto impl = make_index();

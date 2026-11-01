@@ -253,7 +253,14 @@ class FlatSearcherContext : public IndexSearcher::Context {
 
   int search_bf_by_p_keys_impl(const void *query,
                                const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta, uint32_t count);
+                               const IndexQueryMeta &qmeta, uint32_t count) {
+    if (count == 0 || count != p_keys.size()) return IndexError_InvalidArgument;
+    return search_bf_by_key_rows(query, p_keys.data(), qmeta, count);
+  }
+
+  int search_bf_by_key_rows(const void *query,
+                            const std::vector<uint64_t> *p_keys,
+                            const IndexQueryMeta &qmeta, uint32_t count);
 
  protected:
   //! Compute the distance between a stored feature and a query
@@ -1073,8 +1080,8 @@ int FlatSearcherContext<BATCH_SIZE>::group_by_search_impl(
 }
 
 template <size_t BATCH_SIZE>
-int FlatSearcherContext<BATCH_SIZE>::search_bf_by_p_keys_impl(
-    const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
+int FlatSearcherContext<BATCH_SIZE>::search_bf_by_key_rows(
+    const void *query, const std::vector<uint64_t> *p_keys,
     const IndexQueryMeta &qmeta, uint32_t count) {
   auto provider = owner_->create_provider();
   if (!provider) return IndexError_ReadData;

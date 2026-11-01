@@ -757,9 +757,9 @@ int IVFEntity::bind_query(const void *query, const IndexQueryMeta &qmeta) {
     return 0;
   }
   query_distance_ = turbo::DistanceImpl{};
-  ailego::BudgetedStringWorkspace workspace;
-  workspace.reserve(quantizer_->quantized_query_vector_length());
-  auto &encoded = workspace.value;
+  query_encoding_.reserve(quantizer_->quantized_query_vector_length());
+  auto &encoded = query_encoding_.value;
+  encoded.clear();
   IndexQueryMeta encoded_meta;
   int ret = quantizer_->quantize(query, qmeta, &encoded, &encoded_meta);
   ivf_check_with_msg(ret, "Failed to encode Turbo IVF query");
