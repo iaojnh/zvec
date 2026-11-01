@@ -119,21 +119,21 @@ class MergeSourceIndexHolder final : public core::IndexHolder {
       }
       if (source_->quantizer || source_->reformer) {
         decoded_workspace_.reserve(owner_->element_size());
-        auto &decoded_ = decoded_workspace_.value;
+        auto &decoded = decoded_workspace_.value;
         const int ret = source_->quantizer
                             ? source_->quantizer->dequantize(
-                                  data_, source_->stored_meta, &decoded_)
+                                  data_, source_->stored_meta, &decoded)
                             : source_->reformer->revert(
-                                  data_, source_->stored_meta, &decoded_);
+                                  data_, source_->stored_meta, &decoded);
         if (ret != 0) {
           owner_->error_ = ret;
           return;
         }
-        if (decoded_.size() != owner_->element_size()) {
+        if (decoded.size() != owner_->element_size()) {
           owner_->error_ = core::IndexError_Mismatch;
           return;
         }
-        data_ = decoded_.data();
+        data_ = decoded.data();
       }
     }
 

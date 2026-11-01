@@ -19,9 +19,15 @@ endif()
 file(GLOB ALL_TEST_SRCS *_test.cc)
 foreach(CC_SRCS ${ALL_TEST_SRCS})
     get_filename_component(CC_TARGET ${CC_SRCS} NAME_WE)
+    set(TEST_LIBRARY zvec_common)
+    if(CC_TARGET STREQUAL "result_memory_allowance_test")
+        # This regression now exercises Arrow results and Doc conversion,
+        # which need the complete DB target and its transitive dependencies.
+        set(TEST_LIBRARY zvec)
+    endif()
     cc_gmock(
         NAME ${CC_TARGET} STRICT
-        LIBS zvec_common
+        LIBS ${TEST_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
         ${CMAKE_DL_LIBS}
         SRCS ${CC_SRCS}

@@ -51,6 +51,8 @@ class CacheMetadataAllocator {
   using value_type = T;
   using is_always_equal = std::true_type;
   template <typename U>
+  // Required by allocator_traits when rebinding this two-parameter allocator.
+  // NOLINTNEXTLINE(readability-identifier-naming)
   struct rebind {
     using other = CacheMetadataAllocator<U, Reclaim>;
   };
@@ -59,7 +61,10 @@ class CacheMetadataAllocator {
   CacheMetadataAllocator(const CacheMetadataAllocator<U, Reclaim> &) {}
 
   T *allocate(size_t count) {
+    // Hash-table buckets contain pointers; sizeof(T) is their correct stride.
+    // NOLINTNEXTLINE(bugprone-sizeof-expression)
     if (count > (SIZE_MAX - sizeof(Header)) / sizeof(T)) throw std::bad_alloc();
+    // NOLINTNEXTLINE(bugprone-sizeof-expression)
     const size_t bytes = sizeof(Header) + count * sizeof(T);
     auto &pool = MemoryLimitPool::get_instance();
     const size_t charge = pool.capacity() ? bytes : 0;

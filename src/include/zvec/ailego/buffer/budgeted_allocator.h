@@ -25,10 +25,14 @@ class BudgetedAllocator {
   using size_type = size_t;
   using difference_type = ptrdiff_t;
   template <typename U>
+  // The legacy allocator protocol requires this exact spelling.
+  // NOLINTNEXTLINE(readability-identifier-naming)
   struct rebind {
     using other = BudgetedAllocator<U>;
   };
   size_t max_size() const noexcept {
+    // T can be a pointer slot (e.g. a hash bucket), not the pointed-to object.
+    // NOLINTNEXTLINE(bugprone-sizeof-expression)
     return (std::numeric_limits<size_t>::max() - sizeof(Header)) / sizeof(T);
   }
   using is_always_equal = std::true_type;
@@ -39,8 +43,9 @@ class BudgetedAllocator {
     return ptr && (reinterpret_cast<const Header *>(ptr) - 1)->charged != 0;
   }
   T *allocate(size_t n) {
-    if (n > (std::numeric_limits<size_t>::max() - sizeof(Header)) / sizeof(T))
-      throw std::bad_alloc();
+    if (n > max_size()) throw std::bad_alloc();
+    // Count T slots even when T itself is a pointer.
+    // NOLINTNEXTLINE(bugprone-sizeof-expression)
     const size_t bytes = sizeof(Header) + n * sizeof(T);
     auto &pool = MemoryLimitPool::get_instance();
     const size_t charge = pool.capacity() ? bytes : 0;
