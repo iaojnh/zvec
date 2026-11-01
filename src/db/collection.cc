@@ -2704,7 +2704,14 @@ Status CollectionImpl::recover_idmap_and_delete_store() {
   std::string idmap_path =
       FileHelper::MakeFilePath(path_, FileID::ID_FILE, v.id_map_path_suffix());
   auto id_map = std::make_shared<IDMap>(schema_->name());
-  CHECK_RETURN_STATUS(id_map->open(idmap_path, false, options_.read_only_));
+  const auto status = id_map->open(idmap_path, false, options_.read_only_);
+  if (!status.ok()) {
+    return Status(status.code(),
+                  ailego::StringHelper::Concat(
+                      "recovery idmap failed, path: ", idmap_path,
+                      ", reason: ", GetDefaultMessage(status.code()), ": ",
+                      status.message()));
+  }
   id_map_ = std::move(id_map);
 
   // delete store

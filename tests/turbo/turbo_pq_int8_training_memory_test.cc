@@ -397,11 +397,17 @@ TEST_P(PqInt8TrainingMemoryTest, PagedSdcMatchesHeapAndHandleOwnsLifetime) {
     EXPECT_EQ(kChunks * 256u * 256u * sizeof(float),
               PqTestAccess::paged_bytes(quantizer));
     auto handle = quantizer.sym_distance(codes.data(), core::IndexQueryMeta());
+    std::vector<const void *> candidates(expected.size());
+    std::vector<float> batch_distances(expected.size());
+    for (size_t i = 0; i < candidates.size(); ++i)
+      candidates[i] = codes.data() + i * stride;
+    handle.batch(candidates.data(), candidates.size(), batch_distances.data());
     for (size_t i = 0; i < expected.size(); ++i) {
       const void *code = codes.data() + i * stride;
       EXPECT_NEAR(expected[i],
                   quantizer.calc_distance_dp_dp(codes.data(), code), 1e-5f);
       EXPECT_NEAR(expected[i], handle(code), 1e-5f);
+      EXPECT_NEAR(expected[i], batch_distances[i], 1e-5f);
     }
     params.set("build_sdc_table", false);
     ASSERT_EQ(0, quantizer.init(meta, params));

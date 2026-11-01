@@ -232,12 +232,14 @@ int FlatStreamerEntity::close() {
   meta_.header.linear_body_size = 0;
   batch_query_preprocess_ = nullptr;
   extra_values_size_ = 0;
+  meta_dirty_ = false;
 
   return 0;
 }
 
 int FlatStreamerEntity::flush_linear_meta() {
-  if (!storage_) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!storage_ || !meta_dirty_) {
     return 0;
   }
 
@@ -253,6 +255,8 @@ int FlatStreamerEntity::flush_linear_meta() {
     LOG_ERROR("Failed to write segment %s", FLAT_LINEAR_META_SEG_ID.c_str());
     return IndexError_WriteData;
   }
+
+  meta_dirty_ = false;
 
   return 0;
 }
@@ -317,6 +321,7 @@ int FlatStreamerEntity::add(uint64_t key, const void *vec, size_t size) try {
   // function (alloc_block / add_to_block may compete for the same memory).
   head_block.reset(nullptr);
 
+  meta_dirty_ = true;
   if (!this->is_valid_block(block)) {
     int ret = this->alloc_block(block, &block);
     if (ailego_unlikely(ret != 0)) {
@@ -940,6 +945,18 @@ int FlatStreamerEntity::get_vectors_by_key_impl(const uint64_t *keys,
   return IndexError_NoMemory;
 }
 
+int FlatStreamerEntity::retain_stable_data(
+    std::shared_ptr<const void> *lifetime) const {
+  if (!lifetime) return IndexError_InvalidArgument;
+  // MBT_MMAP also describes caller-managed scratch, so its tag alone cannot
+  // establish that iterator data remains valid across reads.
+  if (!storage_ || storage_->name() != "MMapFileStorage") {
+    return IndexError_NotImplemented;
+  }
+  *lifetime = storage_;
+  return 0;
+}
+
 IndexProvider::Iterator::Pointer FlatStreamerEntity::creater_iterator() const {
   // Iteration reads persisted blocks, never the per-key lookup tables.
   auto entity = this->clone_impl(false);
@@ -1031,6 +1048,7 @@ void FlatStreamerEntity::Iterator::read_row() try {
 }
 
 int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
+  meta_dirty_ = true;
   // Init Linear Meta Segment
   meta_.create_time = ailego::Realtime::Seconds();
   stats_.set_create_time(meta_.create_time);
@@ -1243,6 +1261,7 @@ bool FlatStreamerEntity::locate_position(uint64_t id, VectorLocation *loc,
 }
 
 int FlatStreamerEntity::load_storage(IndexStorage::Pointer storage) {
+  meta_dirty_ = false;
   int ret = this->load_linear_meta(storage);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -1502,6 +1521,7 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
   }
 
 
+  meta_dirty_ = true;
   if (id >= vector_count()) {
     IndexStorage::MemoryBlock head_block;
     this->get_head_block(head_block);

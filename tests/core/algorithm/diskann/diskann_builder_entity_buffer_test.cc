@@ -107,12 +107,21 @@ class DiskAnnBuilderEntityBufferTest : public testing::Test {
     ASSERT_EQ(0, entity->init(meta, 8, 16, 0, 2));
     if (buffered)
       ASSERT_EQ(0, entity->enable_buffered_build(directory_ + "/build"));
-    ASSERT_EQ(0, entity->reserve_space(count));
+    auto owned = buffered ? nullptr
+                          : std::make_shared<std::vector<float>>(
+                                static_cast<size_t>(dimension) * count);
+    ASSERT_EQ(0, entity->reserve_space(count, owned));
     std::vector<float> vector(dimension);
     for (uint32_t id = 0; id < count; ++id) {
       for (uint32_t col = 0; col < dimension; ++col)
         vector[col] = id + col * 0.25F;
-      ASSERT_EQ(0, entity->add_vector(id + 17, vector.data()));
+      if (owned) {
+        auto *out = owned->data() + static_cast<size_t>(id) * dimension;
+        std::copy(vector.begin(), vector.end(), out);
+        ASSERT_EQ(0, entity->add_vector(id + 17, out));
+      } else {
+        ASSERT_EQ(0, entity->add_vector(id + 17, vector.data()));
+      }
     }
   }
 

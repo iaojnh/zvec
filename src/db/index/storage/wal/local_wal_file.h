@@ -97,6 +97,7 @@ class LocalWalFile : public WalFile {
 
   bool opened_{false};
   Status read_status_;
+  bool read_only_{false};
 };
 
 

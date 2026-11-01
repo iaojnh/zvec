@@ -25,6 +25,7 @@
 namespace zvec {
 
 int LocalWalFile::append(std::string_view data) {
+  CHECK_STATUS(read_only_, false);
   // Match the reader's limit before writing any part of an invalid record.
   if (data.empty() || data.size() > kMaxRecordSize) return -1;
   const uint32_t crc = ailego::Crc32c::Hash(data.data(), data.size(), 0);
@@ -72,6 +73,10 @@ std::string LocalWalFile::next(const ReadAdmission &admit) try {
 
 int LocalWalFile::open(const WalOptions &wal_option) {
   CHECK_STATUS(opened_, false);
+  if (wal_option.read_only && wal_option.create_new) {
+    WLOG_ERROR("Cannot create a read-only WAL file");
+    return -1;
+  }
   if (wal_option.create_new) {
     if (FileHelper::FileExists(wal_path_)) {
       WLOG_ERROR("Wal open error. file already exist create_new[%d]",
@@ -99,16 +104,17 @@ int LocalWalFile::open(const WalOptions &wal_option) {
       return -1;
     }
 
-    if (!file_.open(wal_path_.c_str(), false)) {
+    if (!file_.open(wal_path_.c_str(), wal_option.read_only)) {
       WLOG_ERROR("Wal open error. create_new[%d]", wal_option.create_new);
       return -1;
     }
 
-    // open default for write
+    // Appends start at the end; prepare_for_read() rewinds readers.
     file_.seek(0, ailego::File::Origin::End);
   }
 
   max_docs_wal_flush_ = wal_option.max_docs_wal_flush;
+  read_only_ = wal_option.read_only;
   opened_ = true;
 
   WLOG_INFO("Wal open success. create_new[%d]", wal_option.create_new);
@@ -124,6 +130,7 @@ int LocalWalFile::close() {
 }
 
 int LocalWalFile::remove() {
+  CHECK_STATUS(read_only_, false);
   if (opened_) {
     close();
   }
@@ -136,6 +143,7 @@ int LocalWalFile::remove() {
 
 int LocalWalFile::flush() {
   CHECK_STATUS(opened_, true);
+  CHECK_STATUS(read_only_, false);
   if (!file_.flush()) {
     WLOG_ERROR("Wal flush error.");
     return -1;

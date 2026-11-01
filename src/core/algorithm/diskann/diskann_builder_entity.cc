@@ -191,7 +191,8 @@ int DiskAnnBuilderEntity::init(const IndexMeta &meta, uint32_t max_degree,
 }
 
 void DiskAnnBuilderEntity::release_vectors() {
-  std::string().swap(vectors_buffer_);
+  ailego::BudgetedVector<const void *>().swap(vector_ptrs_);
+  vector_lifetime_.reset();
   if (buffered_state_) buffered_state_->release_vectors();
 }
 
@@ -226,13 +227,15 @@ int DiskAnnBuilderEntity::prepare_vectors_for_graph() try {
   return IndexError_NoMemory;
 }
 
-int DiskAnnBuilderEntity::reserve_space(uint32_t docs) {
+int DiskAnnBuilderEntity::reserve_space(uint32_t docs,
+                                        std::shared_ptr<const void> lifetime) {
   const size_t count = docs;
   if (count == 0 || doc_cnt() != 0 || reserved_docs_ != 0 ||
       meta_.element_size() == 0 || neighbor_size_ == 0 ||
       count > std::numeric_limits<size_t>::max() / meta_.element_size() ||
       count > std::numeric_limits<size_t>::max() / neighbor_size_ ||
-      count > std::numeric_limits<size_t>::max() / sizeof(diskann_key_t)) {
+      count > std::numeric_limits<size_t>::max() / sizeof(diskann_key_t) ||
+      (!buffered_state_ && !lifetime)) {
     return IndexError_InvalidArgument;
   }
   try {
@@ -276,11 +279,15 @@ int DiskAnnBuilderEntity::reserve_space(uint32_t docs) {
       }
     } else {
       keys_buffer_.reserve(sizeof(diskann_key_t) * count);
-      vectors_buffer_.reserve(meta_.element_size() * count);
+      vector_ptrs_.reserve(count);
       neighbors_buffer_.reserve(static_cast<size_t>(neighbor_size_) * count);
+      vector_lifetime_ = std::move(lifetime);
     }
     reserved_docs_ = docs;
     return 0;
+  } catch (const std::bad_alloc &) {
+    if (buffered_state_) buffered_state_->clear_files();
+    return IndexError_NoMemory;
   } catch (const std::exception &error) {
     if (buffered_state_) buffered_state_->clear_files();
     LOG_ERROR("Failed to reserve DiskANN build storage: %s", error.what());
@@ -309,8 +316,9 @@ int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) try {
     ++*mutable_doc_cnt();
     return 0;
   }
-  vectors_buffer_.append(reinterpret_cast<const char *>(vec),
-                         meta_.element_size());
+  if (!vector_lifetime_) return IndexError_NoReady;
+  if (doc_cnt() >= reserved_docs_) return IndexError_InvalidArgument;
+  vector_ptrs_.push_back(vec);
   keys_buffer_.append(reinterpret_cast<const char *>(&key), sizeof(key));
 
   uint32_t neighbor_cnt = 0;
@@ -327,10 +335,8 @@ int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) try {
 }
 
 const void *DiskAnnBuilderEntity::get_vector(diskann_id_t id) const {
-  if (buffered_state_ || id >= doc_cnt() || vectors_buffer_.empty())
-    return nullptr;
-  size_t offset = (size_t)id * meta_.element_size();
-  return vectors_buffer_.data() + offset;
+  if (buffered_state_ || id >= vector_ptrs_.size()) return nullptr;
+  return vector_ptrs_[id];
 }
 
 int DiskAnnBuilderEntity::read_vector(diskann_id_t id,
