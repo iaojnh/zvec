@@ -167,7 +167,9 @@ cc_library(
     ${ZVEC_TURBO_LIBRARY_OPTIONS}
     SRCS ${ALL_SRCS}
     DEFS ${ZVEC_TURBO_DEFS}
-    LIBS zvec_ailego ${ZVEC_TURBO_RABITQ_LIBS}
+    # Buffered training and serialization use IndexFactory and IndexError.
+    # Keep this dependency transitive for standalone/static Turbo consumers.
+    LIBS zvec_ailego core_framework ${ZVEC_TURBO_RABITQ_LIBS}
     INCS ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/distance ${PROJECT_ROOT_DIR}/src/include
 )
 

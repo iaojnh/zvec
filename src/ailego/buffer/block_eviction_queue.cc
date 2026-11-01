@@ -1238,12 +1238,20 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
   if (fixed > capacity || buffer_size > capacity - fixed) {
     return false;
   }
-  // Dirty eviction may have queued writeback without freeing a page yet.
-  // Mandatory workspace and metadata can wait for that pending reclamation,
-  // then retry the real reservation once. Keep this bounded wait out of
-  // ordinary external-cache admission.
-  return wait_for_available(buffer_size, std::chrono::milliseconds(100)) &&
-         try_charge_fixed(buffer_size, counter);
+  // Dirty eviction may have queued more writes than can finish in one wait.
+  // Retry while reclamation makes real capacity progress, not just until the
+  // first 100 ms expires. Pinned/non-reclaimable memory still fails after one
+  // idle wait, and even progressing reclamation has a finite total bound.
+  // Ordinary external-cache admission never enters this waiting path.
+  size_t previous_available = available();
+  for (size_t attempt = 0; attempt < 50; ++attempt) {
+    (void)wait_for_available(buffer_size, std::chrono::milliseconds(100));
+    if (try_charge_fixed(buffer_size, counter)) return true;
+    const size_t current_available = available();
+    if (current_available <= previous_available) return false;
+    previous_available = current_available;
+  }
+  return false;
 }
 
 bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,

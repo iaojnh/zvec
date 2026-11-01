@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_error.h>
@@ -332,7 +333,9 @@ class BufferStorage : public IndexStorage {
         std::vector<PageUse, ailego::BudgetedAllocator<PageUse>> page_uses;
         std::vector<size_t, ailego::BudgetedAllocator<size_t>> admitted_indices;
         std::shared_ptr<BatchArena> arena;
-        std::vector<char, ailego::BudgetedAllocator<char>> bypass_page;
+        // O_DIRECT must read into this already-reserved page buffer without
+        // allocating another bounce page after the cache has been pinned.
+        ailego::BudgetedMappedBuffer bypass_page;
       };
       // Descriptors scale with request count and touched pages. Own and
       // charge them per operation, rather than retaining each thread's peak.

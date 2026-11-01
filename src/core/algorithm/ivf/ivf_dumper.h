@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
+#include <algorithm>
 #include <core/quantizer/quantizer_params.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_framework.h>
@@ -179,6 +180,7 @@ class IVFDumper {
         block_vector_count_(block_vector_count),
         inverted_lists_meta_(inverted_list_count) {
     block_.init(meta, block_vector_count_);
+    std::fill_n(header_.reserved_, sizeof(header_.reserved_), 0);
     header_.block_vector_count = block_vector_count_;
   }
 
@@ -281,7 +283,9 @@ class IVFDumper {
   uint32_t dumped_feature_count_{0};
   size_t dumped_features_size_{0};
   mutable size_t dumped_size_{0};
-  InvertedIndexHeader header_{};
+  // MSVC cannot aggregate-value-initialize a flexible-array member. Scalar
+  // defaults initialize the fixed header; the constructor clears its padding.
+  InvertedIndexHeader header_;
 };
 
 }  // namespace core

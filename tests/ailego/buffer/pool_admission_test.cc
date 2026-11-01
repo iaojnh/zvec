@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <memory>
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
@@ -118,6 +120,46 @@ TEST_F(PoolAdmissionTest, QueueMetadataRejectsPendingPageReservations) {
   void *allocation = EvictionQueueTraits::malloc(1);
   ASSERT_NE(nullptr, allocation);
   EvictionQueueTraits::free(allocation);
+}
+
+TEST_F(PoolAdmissionTest, MandatoryConsumersWaitWhileCapacityMakesProgress) {
+  for (const bool metadata : {false, true}) {
+    auto first = std::make_unique<PendingReservation>(pool_, page_);
+    ASSERT_TRUE(first->acquired());
+    auto remaining =
+        std::make_unique<PendingReservation>(pool_, pool_.available());
+    ASSERT_TRUE(remaining->acquired());
+    const uint64_t initial_waits = pool_.stats().capacity_waits;
+    std::atomic<bool> observed_second_wait{false};
+    std::thread reclaimer([&] {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (pool_.stats().capacity_waits == initial_waits &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      // Partial progress cannot satisfy the request in the first wait. The
+      // rest is returned only when admission waits again, without I/O sleeps.
+      first.reset();
+      while (pool_.stats().capacity_waits < initial_waits + 2 &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      observed_second_wait = pool_.stats().capacity_waits >= initial_waits + 2;
+      remaining.reset();
+    });
+    const size_t bytes = 3 * page_;
+    const bool charged = metadata ? pool_.try_charge_metadata(bytes)
+                                  : pool_.try_charge_workspace(bytes);
+    reclaimer.join();
+    EXPECT_TRUE(observed_second_wait.load());
+    EXPECT_TRUE(charged);
+    expect_bounded();
+    if (charged) {
+      if (metadata)
+        pool_.release_metadata(bytes);
+      else
+        pool_.release_external(bytes);
+    }
+  }
 }
 
 TEST_F(PoolAdmissionTest, RetainedReuseRejectsPendingPageReservations) {

@@ -25,7 +25,6 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #endif
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -156,12 +155,12 @@ TEST(RocksdbCacheAllocatorTest, DeallocationUnmapsBackingPages) {
   // Unlike Linux, macOS mincore can succeed for an unmapped address. Query
   // the mapping itself, not its residency bits.
   auto is_mapped = [base]() {
-    mach_vm_address_t address = base;
-    mach_vm_size_t size = 0;
+    vm_address_t address = base;
+    vm_size_t size = 0;
     vm_region_basic_info_data_64_t info{};
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object = MACH_PORT_NULL;
-    const auto result = ::mach_vm_region(
+    const auto result = ::vm_region_64(
         ::mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
         reinterpret_cast<vm_region_info_t>(&info), &count, &object);
     if (object != MACH_PORT_NULL) {
