@@ -481,8 +481,9 @@ class MemoryLimitPool {
     const size_t hi = 64UL << 20;  // and at most 64 MB
     if (m < lo) m = lo;
     if (m > hi) m = hi;
-    if (m * 2 >= capacity) m = capacity / 8;  // tiny pools: fall back
-    return m;
+    // The absolute floor must not collapse a small pool's low watermark.
+    // Just above 16 MiB, an 8 MiB margin used to leave almost no cache.
+    return std::min(m, capacity / 8);
   }
   size_t high_watermark() const {
     size_t capacity = pool_size_.load(std::memory_order_relaxed);

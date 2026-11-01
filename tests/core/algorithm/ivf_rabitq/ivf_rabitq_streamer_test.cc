@@ -351,6 +351,11 @@ TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
   NumericalVector<float> query(kDim);
   FillTestVector(37, &query);
   const IndexQueryMeta qmeta(IndexMeta::DT_FP32, kDim);
+  double query_squared_norm = 0.0;
+  for (size_t d = 0; d < kDim; ++d)
+    query_squared_norm += static_cast<double>(query[d]) * query[d];
+  const float cancellation_tolerance = static_cast<float>(
+      8.0 * std::numeric_limits<float>::epsilon() * query_squared_norm);
   for (const char *metric : {"SquaredEuclidean", "InnerProduct"}) {
     for (uint32_t bits : {1u, 4u}) {
       SCOPED_TRACE(metric);
@@ -378,12 +383,25 @@ TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
         ASSERT_EQ(streamers[mode]->init(meta, params), 0);
         ASSERT_EQ(streamers[mode]->open(storage), 0);
       }
-      auto compare = [](const IndexDocumentList &a,
-                        const IndexDocumentList &b) {
+      const bool squared_l2 = std::strcmp(metric, "SquaredEuclidean") == 0;
+      auto compare = [squared_l2, cancellation_tolerance](
+                         const IndexDocumentList &a,
+                         const IndexDocumentList &b) {
         ASSERT_EQ(a.size(), b.size());
         for (size_t i = 0; i < a.size(); ++i) {
           EXPECT_EQ(a[i].key(), b[i].key());
-          EXPECT_FLOAT_EQ(a[i].score(), b[i].score());
+          ASSERT_TRUE(std::isfinite(a[i].score()));
+          ASSERT_TRUE(std::isfinite(b[i].score()));
+          // Near-zero L2 subtracts norm-sized terms. Bound that cancellation,
+          // not ULPs of the near-zero result; keep key order and other scores
+          // strict across the two storage layouts.
+          if (squared_l2 &&
+              std::max(std::abs(a[i].score()), std::abs(b[i].score())) <=
+                  8.0f * cancellation_tolerance) {
+            EXPECT_NEAR(a[i].score(), b[i].score(), cancellation_tolerance);
+          } else {
+            EXPECT_FLOAT_EQ(a[i].score(), b[i].score());
+          }
         }
       };
       for (uint32_t nprobe : {1u, 4u, 16u}) {

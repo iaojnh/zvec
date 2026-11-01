@@ -64,6 +64,7 @@
 #include "db/index/segment/segment_manager.h"
 #include "db/index/storage/fetch_memory.h"
 #include "db/index/storage/parquet_memory_pool.h"
+#include "db/index/storage/wal/wal_file.h"
 #include "db/sqlengine/sqlengine.h"
 #include "zvec/core/interface/index.h"
 
@@ -2629,13 +2630,28 @@ Status CollectionImpl::recovery() {
   bool replays_wal = false;
   if (const auto &meta = v.writing_segment_meta(); meta) {
     if (const auto &block = meta->writing_forward_block(); block.has_value()) {
-      replays_wal = FileHelper::FileExists(
-          FileHelper::MakeWalPath(path_, meta->id(), block->id()));
+      const auto wal_path =
+          FileHelper::MakeWalPath(path_, meta->id(), block->id());
+      replays_wal = FileHelper::FileExists(wal_path);
+      if (options_.read_only_ && replays_wal) {
+        // Inspect without write permission before any stores are opened. A
+        // valid header-only WAL has nothing to replay; existence alone does
+        // not imply that a read-only open needs recovery.
+        WalOptions wal_options;
+        wal_options.read_only = true;
+        WalFilePtr wal;
+        if (WalFile::CreateAndOpen(wal_path, wal_options, &wal) != 0 ||
+            wal->prepare_for_read() != 0) {
+          return Status::InternalError("Failed to inspect WAL for recovery: ",
+                                       wal_path);
+        }
+        replays_wal = wal->has_record();
+      }
     }
   }
   if (options_.read_only_ && replays_wal) {
     return Status::InvalidArgument(
-        "Collection has pending WAL recovery; open with read_only=false "
+        "Collection requires WAL recovery; open with read_only=false "
         "once before read-only access.");
   }
   if (!options_.enable_mmap_ && !options_.read_only_) {

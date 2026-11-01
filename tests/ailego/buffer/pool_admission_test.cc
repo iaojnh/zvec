@@ -13,6 +13,9 @@ namespace zvec::ailego {
 
 // Pause between the real admission steps without sleeps or production hooks.
 struct MemoryLimitPoolTestPeer {
+  static size_t reserve_margin(MemoryLimitPool &pool, size_t capacity) {
+    return pool.reserve_margin(capacity);
+  }
   static bool reserve_page(MemoryLimitPool &pool, size_t bytes) {
     return pool.try_reserve_page_used(bytes);
   }
@@ -78,6 +81,21 @@ class PoolAdmissionTest : public testing::Test {
   const size_t page_ = MemoryLimitPool::page_buffer_size();
   size_t baseline_{0};
 };
+
+TEST_F(PoolAdmissionTest, SmallPoolWatermarksKeepFittingWorkingSets) {
+  const std::array<size_t, 9> capacities{0,          page_,
+                                         1UL << 20,  (16UL << 20) - page_,
+                                         16UL << 20, (16UL << 20) + page_,
+                                         32UL << 20, 64UL << 20,
+                                         1UL << 30};
+  for (size_t capacity : capacities) {
+    SCOPED_TRACE(capacity);
+    const size_t margin =
+        MemoryLimitPoolTestPeer::reserve_margin(pool_, capacity);
+    EXPECT_LE(margin, capacity / 8);
+    EXPECT_GE(capacity - 2 * margin, capacity - capacity / 4);
+  }
+}
 
 TEST_F(PoolAdmissionTest, FixedConsumersRejectPendingPageReservations) {
   using Charge = bool (MemoryLimitPool::*)(size_t);

@@ -11,18 +11,15 @@
 #include "db/common/concurrent_roaring_bitmap.h"
 #include "db/common/doc_id_buffer.h"
 #include "db/index/column/fts_column/posting/posting_build_buffer.h"
-#include "db/index/column/fts_column/tokenizer/jieba_tokenizer.h"
-// Jieba's Windows headers must not rewrite the DB parser enums.
-#if defined(CONST)
-#undef CONST
-#endif
-#if defined(DELETE)
-#undef DELETE
-#endif
 #include "db/index/column/inverted_column/inverted_codec.h"
 #include "db/index/common/doc_id_map.h"
 #include "db/sqlengine/parser/zvec_cached_sql_parser.h"
 #include "../ailego/buffer/pool_payload_budget.h"
+
+// Jieba imports Windows macros such as ERROR/IN/CONST. Parse DB headers first.
+// clang-format off
+#include "db/index/column/fts_column/tokenizer/jieba_tokenizer.h"
+// clang-format on
 
 namespace zvec {
 namespace {

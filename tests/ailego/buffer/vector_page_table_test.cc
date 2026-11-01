@@ -3064,13 +3064,10 @@ TEST_F(BufferPoolTest, BatchAcquireScatteredPagesWithDuplicates) {
 TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   static constexpr size_t kPageCount = 128;
   constexpr size_t kThreadCount = 8;
-  // Independent producers and per-thread I/O staging also need capacity.
-  // This checks single-flight, not behavior under cache pressure.
-  init_vec_pool(/*capacity_pages=*/4096, /*file_pages=*/kPageCount);
   std::string file = new_file(kPageCount);
 
   VecBufferPool pool(file, /*writable=*/false);
-  ASSERT_EQ(pool.init(), 0);
+  // The handle only references the pool; workers wait until init completes.
   auto handle = pool.get_handle();
   std::array<block_id_t, kPageCount> page_ids{};
   for (size_t i = 0; i < kPageCount; ++i) {
@@ -3078,17 +3075,32 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   }
 
   std::atomic<size_t> ready{0};
+  std::atomic<size_t> warmed{0};
   std::atomic<bool> start{false};
+  std::atomic<bool> cancelled{false};
   std::atomic<size_t> succeeded{0};
   std::atomic<size_t> loaded{0};
   std::array<std::thread, kThreadCount> workers;
+  auto join_workers = ScopeGuard::Make([&] {
+    cancelled.store(true, std::memory_order_release);
+    start.store(true, std::memory_order_release);
+    for (auto &worker : workers)
+      if (worker.joinable()) worker.join();
+  });
   for (auto &worker : workers) {
     worker = std::thread([&] {
       std::array<char *, kPageCount> pages{};
+      bool producer_ready = true;
+      auto &queue = BlockEvictionQueue::get_instance();
+      for (size_t i = 0; i < BlockEvictionQueue::kQueueCount; ++i)
+        producer_ready =
+            queue.add_single_block({}, static_cast<int>(i)) && producer_ready;
+      if (producer_ready) warmed.fetch_add(1, std::memory_order_release);
       ready.fetch_add(1, std::memory_order_release);
       while (!start.load(std::memory_order_acquire)) {
         std::this_thread::yield();
       }
+      if (cancelled.load(std::memory_order_acquire)) return;
       const bool acquired =
           handle.acquire_pages(page_ids.data(), page_ids.size(), pages.data());
       if (acquired) {
@@ -3111,13 +3123,22 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   while (ready.load(std::memory_order_acquire) != kThreadCount) {
     std::this_thread::yield();
   }
+  ASSERT_EQ(kThreadCount, warmed.load(std::memory_order_acquire));
+  // Include all live producers in the queue baseline before assigning the
+  // payload allowance. Otherwise lazy producer registration can evict the
+  // first batch between population and pinning, which is valid cache pressure.
+  init_vec_pool(/*capacity_pages=*/4096, /*file_pages=*/kPageCount);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_EQ(pool.init(), 0);
   start.store(true, std::memory_order_release);
   for (auto &worker : workers) {
     worker.join();
   }
 
   EXPECT_EQ(kThreadCount, succeeded.load(std::memory_order_acquire));
-  EXPECT_EQ(kPageCount, pool.stats().miss);
+  const auto stats = pool.stats();
+  EXPECT_EQ(kPageCount, stats.miss);
+  EXPECT_EQ(0u, stats.evict);
 }
 
 TEST_F(BufferPoolTest, BatchMissesRemainProbationUntilLaterReuse) {
