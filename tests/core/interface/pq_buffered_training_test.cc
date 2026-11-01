@@ -50,7 +50,17 @@ class PqBufferedTrainingTest : public ::testing::Test {
     // Identical rows eliminate random cluster initialization as a confounder.
     // A non-batch-aligned count also covers the untransposed tail.
     auto input = std::make_shared<core::MultiPassIndexHolder<Type>>(kDim);
-    for (size_t i = 0; i < 3001; ++i) {
+    // Keep even the FP16 corpus larger than the workspace allowance below.
+    // This still forces paging after reserving enough mandatory scratch for
+    // two workers and 16 KiB-page platforms.
+    const bool fast_opq =
+        opq && std::is_same_v<Quantizer, turbo::PqFastQuantizer>;
+    // FastScan's OPQ path overlaps packed-codebook and rotation workspaces.
+    // Increase its corpus too, rather than turning this into a cached test.
+    const size_t workspace_bytes = (fast_opq ? 512 : 256) * 1024;
+    const size_t row_count = fast_opq ? 20003 : 10001;
+    ASSERT_GT(row_count * kDim * sizeof(T), workspace_bytes);
+    for (size_t i = 0; i < row_count; ++i) {
       ailego::NumericalVector<T> row(kDim);
       for (size_t d = 0; d < kDim; ++d) row[d] = T(float(d + 1) / 32.0f);
       ASSERT_TRUE(input->emplace(i, std::move(row)));
@@ -80,7 +90,7 @@ class PqBufferedTrainingTest : public ::testing::Test {
         ASSERT_EQ(legacy.serialize(&reference), 0);
         const size_t metadata =
             ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
-        ASSERT_EQ(pool.init((opq ? 2 : 1) * metadata + 128 * 1024), 0);
+        ASSERT_EQ(pool.init((opq ? 2 : 1) * metadata + workspace_bytes), 0);
         Quantizer paged;
         ASSERT_EQ(paged.init(meta, params), 0);
         ASSERT_EQ(paged.train(input), 0);
@@ -320,7 +330,7 @@ TEST_F(PqBufferedTrainingTest, MetadataExhaustionDoesNotFallBackToHeap) {
 
 TEST_F(PqBufferedTrainingTest, OpqDistinctRowsMatchAcrossPagedTileBoundaries) {
   static constexpr size_t kDim = 17;
-  static constexpr size_t kRows = 2057;
+  static constexpr size_t kRows = 4099;
   std::vector<float> original(kRows * kDim);
   for (size_t i = 0; i < original.size(); ++i)
     original[i] = float((i * 17 + i / kDim) % 257) / 128.0f - 1.0f;
@@ -346,7 +356,10 @@ TEST_F(PqBufferedTrainingTest, OpqDistinctRowsMatchAcrossPagedTileBoundaries) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t budget =
       2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
-      64 * 1024;
+      // Three row tiles, the rotation solver and at least one I/O page must
+      // coexist. Each full matrix still exceeds this workspace allowance.
+      256 * 1024;
+  static_assert(kRows * kDim * sizeof(float) > 256 * 1024);
   for (size_t capacity : {size_t{0}, budget}) {
     ASSERT_EQ(pool.init(capacity), 0);
     turbo::PqOpq opq;
@@ -374,7 +387,10 @@ TEST_F(PqBufferedTrainingTest, UnevenChunksAndRowTilesPreserveDistinctVectors) {
   auto input =
       std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(
           kDim);
-  for (size_t i = 0; i < 2053; ++i) {
+  constexpr size_t kRows = 4099;
+  constexpr size_t kWorkspaceBytes = 256 * 1024;
+  static_assert(kRows * kDim * sizeof(float) > kWorkspaceBytes);
+  for (size_t i = 0; i < kRows; ++i) {
     ailego::NumericalVector<float> row(kDim);
     for (size_t d = 0; d < kDim; ++d)
       row[d] = float((i % 16) * 32 + d) / 512.0f;
@@ -383,7 +399,7 @@ TEST_F(PqBufferedTrainingTest, UnevenChunksAndRowTilesPreserveDistinctVectors) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t metadata =
       ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
-  ASSERT_EQ(pool.init(metadata + 128 * 1024), 0);
+  ASSERT_EQ(pool.init(metadata + kWorkspaceBytes), 0);
   core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
   meta.set_metric("SquaredEuclidean", 0, ailego::Params());
   ailego::Params params;

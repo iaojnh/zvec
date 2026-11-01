@@ -253,6 +253,9 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       // compete for it, and construction still writes dirty scratch pages.
       ASSERT_EQ(source->flush(), 0);
     }
+    // The merge source remains live throughout training. Its retained key-map
+    // backing is separately charged and STL/platform dependent, not PQ state.
+    const size_t before_training = pool.external_used();
     ASSERT_EQ(
         merge ? target->merge({source}, {}, {2, nullptr}) : target->train(), 0);
     if (pressure) {
@@ -260,7 +263,7 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       // writeback reclaims a page. Assert the fixed reservation and budget,
       // then validate every result, rather than requiring one reclaim path.
       EXPECT_GE(pool.external_used(), reservation + codebook_bytes);
-      EXPECT_LE(pool.external_used(), reservation + model_allowance);
+      EXPECT_LE(pool.external_used(), before_training + model_allowance);
       EXPECT_LE(pool.used(), pool_budget_);
     }
     EXPECT_TRUE(target->is_trained());

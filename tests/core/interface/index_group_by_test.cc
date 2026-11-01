@@ -629,6 +629,14 @@ TEST_F(GroupByInterfaceTest, HnswGraphAndLinearBudgetedGroupsMatchHeapResults) {
           EXPECT_EQ(reference, actual);
         EXPECT_LE(pool.used(), pool.capacity());
       }
+      // Worker exit releases its context, but the index still owns the cached
+      // slot. End that lifetime before changing budgets; thread ids need not
+      // be reused (notably on iOS).
+      ASSERT_EQ(0, index->close());
+      ASSERT_EQ(0u, pool.used());
+      ASSERT_EQ(0, pool.init(0));
+      ASSERT_EQ(0,
+                index->open(path, {StorageOptions::StorageType::kMMAP, false}));
     }
     ASSERT_EQ(0, index->close());
   }

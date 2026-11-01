@@ -12,6 +12,10 @@
 #include "db/common/doc_id_buffer.h"
 #include "db/index/column/fts_column/posting/posting_build_buffer.h"
 #include "db/index/column/fts_column/tokenizer/jieba_tokenizer.h"
+#if defined(_WIN32) && defined(DELETE)
+// Jieba's Windows headers must not rewrite the DB Operator::DELETE enum.
+#undef DELETE
+#endif
 #include "db/index/column/inverted_column/inverted_codec.h"
 #include "db/index/common/doc_id_map.h"
 #include "db/sqlengine/parser/zvec_cached_sql_parser.h"

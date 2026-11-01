@@ -208,6 +208,12 @@ TEST_F(BufferedInputTest, DirectIndexesReleaseUntrainedInputOnClose) {
     EXPECT_EQ(index->add(VectorData{DenseVector{row.data()}}, large),
               core::IndexError_NoReady);
     EXPECT_TRUE(std::filesystem::is_empty(directory_));
+    // Returned vectors outlive the index and keep their own capacity charged.
+    EXPECT_EQ(std::memcmp(
+                  std::get<DenseVectorBuffer>(output.vector_buffer).data.data(),
+                  row.data(), sizeof(row)),
+              0);
+    output = VectorDataBuffer{};
     EXPECT_EQ(ailego::PoolPayloadBudget::get_instance().used(), 0u);
   }
 }

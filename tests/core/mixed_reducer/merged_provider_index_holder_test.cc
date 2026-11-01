@@ -1307,7 +1307,10 @@ TEST(MergedProviderIndexHolderTest, OrdinalReadsDoNotAccumulatePagePins) {
   ASSERT_EQ(
       0, ailego::PoolPayloadBudget::get_instance().init(
              kPageCount * ailego::kVectorPageSize +
-             ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount)));
+             ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount) +
+             // The holder's source directory, ordinal map and reader are
+             // mandatory workspace, not either of the two cached pages.
+             64 * 1024));
   {
     ailego::File file;
     ASSERT_TRUE(

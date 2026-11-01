@@ -31,8 +31,14 @@
 using namespace zvec::fts;
 
 TEST(TokenizerPipelineBudgetTest, ValidationUsesCurrentConfiguration) {
-  auto params = std::make_shared<zvec::FtsIndexParams>("standard");
-  zvec::FieldSchema field("content", zvec::DataType::STRING, false, params);
+  auto original_params = std::make_shared<zvec::FtsIndexParams>("standard");
+  zvec::FieldSchema field("content", zvec::DataType::STRING, false,
+                          original_params);
+  // FieldSchema clones its parameters; mutate the configuration it owns.
+  auto params =
+      std::dynamic_pointer_cast<zvec::FtsIndexParams>(field.index_params());
+  ASSERT_NE(nullptr, params);
+  ASSERT_NE(original_params.get(), params.get());
   ASSERT_TRUE(field.validate().ok());
   auto first = zvec::detail::AcquireFtsPipeline(*params);
   ASSERT_TRUE(first.has_value());
@@ -44,6 +50,7 @@ TEST(TokenizerPipelineBudgetTest, ValidationUsesCurrentConfiguration) {
   ASSERT_TRUE(changed.has_value());
   EXPECT_NE(first.value(), changed.value());
   EXPECT_EQ(1u, changed.value()->process("hello-world").size());
+  EXPECT_EQ("standard", original_params->tokenizer_name());
 }
 
 TEST(TokenizerPipelineBudgetTest, FailedInitializationCanRetrySameParams) {

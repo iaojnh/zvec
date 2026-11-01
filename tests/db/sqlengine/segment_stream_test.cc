@@ -203,6 +203,15 @@ TEST(SegmentStreamTest, DistinctBuffersAreBoundedAndReleased) {
     EXPECT_LE(memory.max_memory(), 5 * kBytes + kValidityBytes);
   }
   EXPECT_TRUE(expires(weak));
+  // Releasing the source lease can precede destruction of the worker's last
+  // completed Future (and its batch). Wait for that asynchronous cleanup too;
+  // neither the peak-byte bound nor the required zero live bytes changes.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (memory.bytes_allocated() != 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   EXPECT_EQ(0, memory.bytes_allocated());
 }
 

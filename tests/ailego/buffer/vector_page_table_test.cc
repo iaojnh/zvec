@@ -1783,6 +1783,9 @@ TEST_F(BufferPoolTest, BackgroundCleansRetiredExternalEntriesBelowWatermark) {
 }
 
 TEST_F(BufferPoolTest, RetirementCleanupReachesOlderProducerStreams) {
+  // This exercises queue traversal, not unconfigured/failed admission. Give
+  // all producer streams an explicit, bounded metadata budget.
+  init_pool(/*capacity_pages=*/256);
   class Owner : public EvictableBlockOwner {
    public:
     Owner() {
@@ -3075,6 +3078,7 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   std::atomic<size_t> ready{0};
   std::atomic<bool> start{false};
   std::atomic<size_t> succeeded{0};
+  std::atomic<size_t> loaded{0};
   std::array<std::thread, kThreadCount> workers;
   for (auto &worker : workers) {
     worker = std::thread([&] {
@@ -3083,19 +3087,23 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
       while (!start.load(std::memory_order_acquire)) {
         std::this_thread::yield();
       }
-      if (!handle.acquire_pages(page_ids.data(), page_ids.size(),
-                                pages.data())) {
-        return;
+      const bool acquired =
+          handle.acquire_pages(page_ids.data(), page_ids.size(), pages.data());
+      if (acquired) {
+        bool valid = true;
+        for (size_t i = 0; i < kPageCount; ++i) {
+          valid = valid && pages[i] != nullptr &&
+                  pages[i][0] == static_cast<char>(i & 0xff);
+        }
+        if (valid) succeeded.fetch_add(1, std::memory_order_release);
       }
-      bool valid = true;
-      for (size_t i = 0; i < kPageCount; ++i) {
-        valid = valid && pages[i] != nullptr &&
-                pages[i][0] == static_cast<char>(i & 0xff);
+      loaded.fetch_add(1, std::memory_order_release);
+      // Keep the shared pages pinned until every caller has finished loading.
+      // Eviction after an early release is valid, but not a single-flight bug.
+      while (loaded.load(std::memory_order_acquire) != kThreadCount) {
+        std::this_thread::yield();
       }
-      if (valid) {
-        succeeded.fetch_add(1, std::memory_order_release);
-      }
-      handle.release_pages(page_ids.data(), page_ids.size());
+      if (acquired) handle.release_pages(page_ids.data(), page_ids.size());
     });
   }
   while (ready.load(std::memory_order_acquire) != kThreadCount) {

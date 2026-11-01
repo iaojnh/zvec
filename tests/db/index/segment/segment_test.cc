@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>  // NOLINT(misc-include-cleaner): protects <sstream> from the private/public test macro below.
 #include "../../../ailego/buffer/pool_payload_budget.h"
@@ -785,7 +786,9 @@ TEST_P(SegmentTest, DocCount) {
 // }
 
 TEST_P(SegmentTest, CombinedVectorColumnIndexer) {
-  options_.max_buffer_size_ = 10 * 1024;
+  // Exercise multiple persisted blocks without creating hundreds of tiny
+  // per-field indexes whose mandatory metadata exhausts the 100 MiB fixture.
+  options_.max_buffer_size_ = 512 * 1024;
 
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
@@ -794,7 +797,19 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexer) {
 
 
   uint64_t max_doc = 1000;
-  test::TestHelper::SegmentInsertDoc(segment, *schema_, 0, max_doc);
+  // Make the mixed disk/memory coverage independent of Doc's size estimate.
+  for (uint64_t first : {uint64_t{0}, max_doc / 2}) {
+    ASSERT_TRUE(test::TestHelper::SegmentInsertDoc(segment, *schema_, first,
+                                                   first + max_doc / 2)
+                    .ok());
+    ASSERT_TRUE(segment->flush().ok());
+  }
+  const auto &blocks = segment->meta()->persisted_blocks();
+  ASSERT_GT(std::count_if(blocks.begin(), blocks.end(),
+                          [](const auto &block) {
+                            return block.type() == BlockType::SCALAR;
+                          }),
+            1);
 
   Doc new_doc = test::TestHelper::CreateDoc(1000, *schema_);
   auto status = segment->insert(new_doc);
@@ -845,7 +860,7 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexer) {
 }
 
 TEST_P(SegmentTest, CombinedVectorColumnIndexerWithQuantVectorIndex) {
-  options_.max_buffer_size_ = 10 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
 
   auto tmp_schema = test::TestHelper::CreateSchemaWithVectorIndex(
       false, "demo",
@@ -859,7 +874,18 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexerWithQuantVectorIndex) {
 
 
   uint64_t max_doc = 1000;
-  test::TestHelper::SegmentInsertDoc(segment, *schema_, 0, max_doc);
+  for (uint64_t first : {uint64_t{0}, max_doc / 2}) {
+    ASSERT_TRUE(test::TestHelper::SegmentInsertDoc(segment, *schema_, first,
+                                                   first + max_doc / 2)
+                    .ok());
+    ASSERT_TRUE(segment->flush().ok());
+  }
+  const auto &blocks = segment->meta()->persisted_blocks();
+  ASSERT_GT(std::count_if(blocks.begin(), blocks.end(),
+                          [](const auto &block) {
+                            return block.type() == BlockType::SCALAR;
+                          }),
+            1);
 
   Doc new_doc = test::TestHelper::CreateDoc(1000, *schema_);
   auto status = segment->insert(new_doc);

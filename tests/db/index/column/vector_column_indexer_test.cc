@@ -2411,8 +2411,9 @@ TEST(VectorColumnIndexerTest, Failure) {
     // Fetch non-existent doc_id should fail
     auto fetch_result = indexer->fetch(99999);
     ASSERT_FALSE(fetch_result.has_value());
+    EXPECT_EQ(StatusCode::INTERNAL_ERROR, fetch_result.error().code());
     ASSERT_EQ(fetch_result.error().message(),
-              "Failed to fetch vector from index");
+              "Failed to fetch vector from index: No exist");
 
     indexer->destroy();
   }

@@ -97,9 +97,11 @@ class RabitqTrainingMemoryTest : public ::testing::TestWithParam<bool> {
     ASSERT_EQ(
         pool.init(
             GetParam()
-                ? 2 * ailego::VecBufferPool::metadata_bytes_for_page_count(
+                // Returned cluster centroids can retain their backing while
+                // both original and rotated centroid stores are created.
+                ? 3 * ailego::VecBufferPool::metadata_bytes_for_page_count(
                           4096, true) +
-                      64 * 1024
+                      128 * 1024
                 : 0),
         0);
   }

@@ -14,6 +14,7 @@
 
 #include "utility/graph_segment_writer.h"
 #include <ailego/pattern/defer.h>
+#include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include "../../ailego/buffer/pool_payload_budget.h"
@@ -90,7 +91,11 @@ TEST(GraphSegmentWriterTest,
   });
   const size_t budget =
       2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
-      128 * 1024;
+      // One generation tile plus the three merge-sort tiles coexist. Reserve
+      // their capacity, a bounded I/O window per file (including alignment
+      // scratch), mapping headers and allocator/control-block overhead.
+      4 * 64 * 1024 + 2 * std::max(size_t{64 * 1024}, ailego::kVectorPageSize) +
+      2 * ailego::MemoryHelper::PageSize() + 16 * 1024;
   for (size_t count : {size_t{0}, size_t{1}, size_t{4097}, size_t{32769}}) {
     auto key = [](size_t i) { return static_cast<uint64_t>((i * 313) % 997); };
     std::vector<uint32_t> reference(count);
