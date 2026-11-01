@@ -39,6 +39,7 @@
 #include <zvec/ailego/buffer/external_cache.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include <zvec/ailego/io/file.h>
 #include "pool_payload_budget.h"
 
 #if defined(_MSC_VER)
@@ -431,17 +432,47 @@ TEST_F(BufferPoolTest, BulkReadDoesNotAdmitFirstTouchScanUnderPressure) {
   // path while the pool is under pressure.
   char *pinned = pool.acquire_buffer(/*block_id=*/0, 10);
   ASSERT_NE(nullptr, pinned);
+  auto release_pin = ScopeGuard::Make(
+      [&pool] { pool.page_table_.release_block(/*block_id=*/0); });
 
-  std::vector<char> data(4 * kVectorPageSize);
-  ASSERT_TRUE(handle.read_range(kVectorPageSize, data.size(), data.data()));
+  // This test supplies its own destination: align it for Linux O_DIRECT so
+  // reading does not require a second, budgeted page while the only cache
+  // page is pinned. Scope guards also release both resources on ASSERT exit.
+  const size_t bytes = 4 * kVectorPageSize;
+  char *data = static_cast<char *>(File::MemoryMap(bytes, 0));
+  ASSERT_NE(nullptr, data);
+  auto unmap = ScopeGuard::Make([&] { File::MemoryUnmap(data, bytes); });
+  ASSERT_TRUE(handle.read_range(kVectorPageSize, bytes, data));
   for (size_t page = 1; page < kFilePages; ++page) {
-    ExpectPageContent(data.data() + (page - 1) * kVectorPageSize, page);
+    ExpectPageContent(data + (page - 1) * kVectorPageSize, page);
     EXPECT_FALSE(pool.is_page_resident(page));
   }
 
   const auto stats = pool.stats();
   EXPECT_EQ(4u, stats.admission_rejected);
-  pool.page_table_.release_block(/*block_id=*/0);
+}
+
+TEST_F(BufferPoolTest, UnalignedBypassRefusesUnbudgetedScratch) {
+  init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/2);
+  VecBufferPool pool(new_file(/*num_pages=*/2), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  if (!pool.requires_aligned_io()) {
+    GTEST_SKIP() << "The active file backend does not require aligned reads";
+  }
+
+  char *pinned = pool.acquire_buffer(/*block_id=*/0, 10);
+  ASSERT_NE(nullptr, pinned);
+  auto release_pin = ScopeGuard::Make(
+      [&pool] { pool.page_table_.release_block(/*block_id=*/0); });
+  const auto before = MemoryLimitPool::get_instance().stats();
+  std::array<char, 64> data{};
+  EXPECT_FALSE(
+      pool.read_range_bypass(kVectorPageSize + 1, data.size(), data.data()));
+  EXPECT_EQ(before.external_used,
+            MemoryLimitPool::get_instance().stats().external_used);
+  EXPECT_TRUE(pool.is_page_resident(0));
+  EXPECT_FALSE(pool.is_page_resident(1));
+  ExpectPageContent(pinned, /*page=*/0);
 }
 
 TEST_F(BufferPoolTest, WritableBypassPreservesDirtyPagesWithoutAdmission) {
