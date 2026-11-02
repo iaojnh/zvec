@@ -53,7 +53,9 @@ class PagedBuildBuffer {
         try {
           if (pool.capacity() != 0) {
             candidate.charge_ = std::make_unique<ExternalCharge>();
-            if (!pool.try_charge_external(bytes)) return IndexError_NoMemory;
+            // Inline build scratch is mandatory, not optional cache admission.
+            // A first reclaim pass may only start writeback or age CLOCK bits.
+            if (!pool.try_charge_workspace(bytes)) return IndexError_NoMemory;
             candidate.charge_->bytes = bytes;
           }
           candidate.memory_.resize(bytes);

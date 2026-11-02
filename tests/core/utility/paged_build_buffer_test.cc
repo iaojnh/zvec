@@ -14,7 +14,9 @@
 
 #include "utility/paged_build_buffer.h"
 #include <array>
+#include <chrono>
 #include <future>
+#include <thread>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/core/framework/index_memory.h>
@@ -154,6 +156,38 @@ TEST_F(PagedBuildBufferTest, SmallInlineBuffersAreChargedUntilReleased) {
   ASSERT_EQ(pool.init(1), 0);
   EXPECT_EQ(data.init(1024, 4096), IndexError_NoMemory);
   EXPECT_EQ(pool.used(), 0u);
+}
+
+TEST_F(PagedBuildBufferTest, InlineWorkspaceWaitsForInFlightPageRelease) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t page_bytes = ailego::MemoryLimitPool::page_buffer_size();
+  char *page = nullptr;
+  ASSERT_TRUE(pool.try_acquire_buffer(page_bytes, page));
+  // Account the remaining capacity as non-reclaimable work. Only the page
+  // currently owned by the reclaimer can make this inline workspace fit.
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.used());
+  const auto waits = pool.stats().capacity_waits;
+  std::thread reclaimer([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (pool.stats().capacity_waits == waits &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    pool.release_buffer(page, page_bytes);
+  });
+  PagedBuildBuffer data;
+  const int status = data.init(page_bytes, page_bytes);
+  reclaimer.join();
+  ASSERT_EQ(status, 0);
+  EXPECT_GT(pool.stats().capacity_waits, waits);
+  EXPECT_FALSE(data.paged());
+  EXPECT_LE(pool.used(), pool.capacity());
+  const uint64_t expected = 123;
+  uint64_t actual = 0;
+  ASSERT_EQ(data.write(0, &expected, sizeof(expected)), 0);
+  ASSERT_EQ(data.read(0, &actual, sizeof(actual)), 0);
+  EXPECT_EQ(actual, expected);
 }
 
 }  // namespace
