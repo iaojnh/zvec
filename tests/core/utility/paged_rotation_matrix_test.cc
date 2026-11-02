@@ -32,15 +32,15 @@ TEST_F(PagedRotationMatrixTest, MatrixLargerThanPoolRotatesAndReleases) {
   {
     constexpr size_t dim = 1024;
     PagedRotationMatrix matrix;
-    ASSERT_EQ(0,
-              matrix.load(dim, dim, [](size_t offset, void *out, size_t bytes) {
-                auto *values = static_cast<float *>(out);
-                EXPECT_TRUE(ailego::BudgetedAllocator<float>::charged(values));
-                const size_t row = offset / sizeof(float) / dim;
-                std::fill(values, values + bytes / sizeof(float), 0.0f);
-                values[(row + 1) % dim] = 1;
-                return 0;
-              }));
+    ASSERT_EQ(
+        0, matrix.load(dim, dim, [=](size_t offset, void *out, size_t bytes) {
+          auto *values = static_cast<float *>(out);
+          EXPECT_TRUE(ailego::BudgetedAllocator<float>::charged(values));
+          const size_t row = offset / sizeof(float) / dim;
+          std::fill(values, values + bytes / sizeof(float), 0.0f);
+          values[(row + 1) % dim] = 1;
+          return 0;
+        }));
     ASSERT_TRUE(matrix.paged());
     std::vector<float> input(dim), rotated(dim), restored(dim);
     for (size_t i = 0; i < dim; ++i) input[i] = static_cast<float>(i);
