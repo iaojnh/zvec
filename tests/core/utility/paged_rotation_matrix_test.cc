@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "utility/paged_rotation_matrix.h"
 #include <array>
+#include <chrono>
+#include <thread>
 #include <gtest/gtest.h>
 #include "utility/storage_segment_dumper.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
@@ -124,10 +126,25 @@ TEST_F(PagedRotationMatrixTest, ApplyBudgetFailureAndInPlaceInverse) {
   PagedRotationMatrix matrix;
   ASSERT_EQ(0, matrix.generate(64, 64));
   std::vector<float> input(64, 0.25f), output(64);
+  // This case tests apply's scratch admission, not dirty-page writeback.
+  // Drain generated pages before calculating exact remaining headroom:
+  // reclaiming them can create writeback queue metadata after that snapshot.
+  auto &actual_pool = ailego::MemoryLimitPool::get_instance();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (actual_pool.stats().page_used != 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(64);
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(0u, actual_pool.stats().page_used);
   {
     ailego::MemoryReservation pressure;
-    pressure.add(pool_.capacity() - pool_.metadata_used() -
-                 pool_.external_used());
+    const auto fixed = actual_pool.stats();
+    // Slab headers remain charged until the pool is reset, even after all
+    // data pages have been discarded. Keep them in the fixed-size deduction.
+    pressure.add(fixed.pool_size - fixed.metadata_used - fixed.external_used);
+    ASSERT_EQ(actual_pool.capacity(), actual_pool.used());
     EXPECT_THROW(matrix.apply(input.data(), output.data()), std::bad_alloc);
   }
   matrix.apply(input.data(), output.data());
