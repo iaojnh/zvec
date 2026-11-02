@@ -22,6 +22,12 @@ class CandidateAllocationScope {
   explicit CandidateAllocationScope(size_t bytes) {
     observed_allocations = 0;
     observed_size = bytes;
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    // MSVC's large-vector path asks operator new for alignment padding too.
+    // Observe the actual request instead of missing every legacy copy.
+    if (bytes >= std::_Big_allocation_threshold)
+      observed_size += std::_Non_user_size;
+#endif
   }
   ~CandidateAllocationScope() {
     observed_size = 0;
@@ -153,6 +159,21 @@ TEST(FlatBorrowedKeysTest, StreamerAndSearcherBorrowWithoutAdapterCopies) {
     ASSERT_EQ(0, streamer->add_impl(i, row.data(), qmeta, context));
   }
   check_borrowed(*streamer, std::move(context));
+  {
+    auto provider = streamer->create_provider();
+    ASSERT_NE(nullptr, provider);
+    {
+      ailego::MemoryReservation pressure;
+      pressure.add(pool.capacity() - pool.used());
+      EXPECT_THROW(provider->create_iterator(), std::bad_alloc);
+    }
+    auto iterator = provider->create_iterator();
+    ASSERT_NE(nullptr, iterator);
+    size_t count = 0;
+    for (; iterator->is_valid(); iterator->next()) ++count;
+    EXPECT_EQ(64u, count);
+    EXPECT_EQ(0, iterator->status());
+  }
   auto dumper = IndexFactory::CreateDumper("FileDumper");
   ASSERT_EQ(0, dumper->create(dumped));
   ASSERT_EQ(0, streamer->dump(dumper));

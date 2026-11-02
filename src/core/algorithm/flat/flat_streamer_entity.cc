@@ -507,7 +507,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone() const {
 }
 
 FlatStreamerEntity::Pointer FlatStreamerEntity::clone_impl(
-    bool copy_key_map) const try {
+    bool copy_key_map, bool propagate_oom) const try {
   ailego::BudgetedVector<IndexStorage::Segment::Pointer> segments;
   ailego::BudgetedVector<uint64_t> first_ids;
   {
@@ -527,6 +527,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone_impl(
       new (std::nothrow) FlatStreamerEntity(stats_));
   if (!entity) {
     LOG_ERROR("Failed to New FlatStreamerEntity object");
+    if (propagate_oom) throw std::bad_alloc();
     return nullptr;
   }
   entity->index_meta_ = this->index_meta_;
@@ -547,6 +548,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone_impl(
   entity->vec_cols_ = this->vec_cols_;
   return FlatStreamerEntity::Pointer(std::move(entity));
 } catch (const std::bad_alloc &) {
+  if (propagate_oom) throw;
   return nullptr;
 }
 
@@ -959,7 +961,9 @@ int FlatStreamerEntity::retain_stable_data(
 
 IndexProvider::Iterator::Pointer FlatStreamerEntity::creater_iterator() const {
   // Iteration reads persisted blocks, never the per-key lookup tables.
-  auto entity = this->clone_impl(false);
+  // Iteration callers preserve bad_alloc as NoMemory. Returning nullptr here
+  // would turn a retryable budget refusal into an opaque runtime failure.
+  auto entity = this->clone_impl(false, true);
   if (!entity) {
     LOG_ERROR("Failed to clone entity");
     return nullptr;

@@ -94,10 +94,13 @@ TEST(GroupTopKCandidatesTest, ManyGroupsSpillReferencesAndChargeNames) {
 TEST(GroupTopKCandidatesTest, BudgetDenialDoesNotLeakWorkspace) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   pool.init(1024 * 1024);
-  const size_t charge = pool.capacity() - pool.used();
-  ASSERT_TRUE(pool.try_charge_external(charge));
+  size_t charge = 0;
   {
+    // MSVC may allocate map/set sentinel nodes in the constructor. Saturate
+    // the budget after constructing the object whose offer() is under test.
     GroupTopKCandidates groups(1, 1, false);
+    charge = pool.capacity() - pool.used();
+    ASSERT_TRUE(pool.try_charge_external(charge));
     EXPECT_THROW(groups.offer("a", {0, 0, 0, 1.0f}), std::bad_alloc);
   }
   EXPECT_EQ(charge, pool.external_used());

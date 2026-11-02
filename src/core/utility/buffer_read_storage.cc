@@ -25,6 +25,7 @@
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include <zvec/ailego/container/lazy_map.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
@@ -375,11 +376,11 @@ class BufferReadStorage : public IndexStorage {
         thread_scratch_registry_alive() = false;
       }
 
-      std::unordered_map<
+      ailego::LazyMap<std::unordered_map<
           const ScratchOwner *, ThreadScratchRef,
           std::hash<const ScratchOwner *>, std::equal_to<const ScratchOwner *>,
           ailego::BudgetedAllocator<
-              std::pair<const ScratchOwner *const, ThreadScratchRef>>>
+              std::pair<const ScratchOwner *const, ThreadScratchRef>>>>
           scratches;
       const ScratchOwner *last_key{nullptr};
       std::weak_ptr<ScratchOwner> last_owner;
@@ -403,7 +404,7 @@ class BufferReadStorage : public IndexStorage {
       if (registry.scratches.empty()) {
         // erase() releases nodes, not the budgeted bucket array. Do not keep
         // an empty registry charged for the lifetime of a worker thread.
-        decltype(registry.scratches){}.swap(registry.scratches);
+        registry.scratches.reset();
         registry.last_key = nullptr;
         registry.last_scratch = nullptr;
         registry.last_owner.reset();

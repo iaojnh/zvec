@@ -625,11 +625,18 @@ bool MergedProviderIndexHolder::multipass() const {
   return true;
 }
 
-IndexHolder::Iterator::Pointer MergedProviderIndexHolder::create_iterator() {
+IndexHolder::Iterator::Pointer
+MergedProviderIndexHolder::create_iterator() try {
   if (!initialized_ || this->status() != 0) {
     return IndexHolder::Iterator::Pointer();
   }
-  return IndexHolder::Iterator::Pointer(new (std::nothrow) Iterator(this));
+  auto result =
+      IndexHolder::Iterator::Pointer(new (std::nothrow) Iterator(this));
+  if (!result) set_status(IndexError_NoMemory);
+  return result;
+} catch (const std::bad_alloc &) {
+  set_status(IndexError_NoMemory);
+  return nullptr;
 }
 
 size_t MergedProviderIndexHolder::filtered_count() const {

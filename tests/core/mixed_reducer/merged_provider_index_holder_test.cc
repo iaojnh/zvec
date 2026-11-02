@@ -289,7 +289,7 @@ IndexStreamer::Pointer MakeStreamer(
   return MakeStreamer(docs, std::make_shared<ProviderLifetimeStats>());
 }
 
-enum class IteratorFailureOperation { kValidity, kKey, kData };
+enum class IteratorFailureOperation { kValidity, kKey, kData, kConstruction };
 
 struct IteratorReadFailure {
   IteratorFailureOperation operation{IteratorFailureOperation::kValidity};
@@ -312,6 +312,9 @@ class FailingIteratorProvider final
   }
 
   IndexHolder::Iterator::Pointer create_iterator() override {
+    if (failure_->enabled &&
+        failure_->operation == IteratorFailureOperation::kConstruction)
+      throw std::bad_alloc();
     return std::make_unique<FailingIterator>(
         MultiPassIndexProvider::create_iterator(), failure_);
   }
@@ -444,6 +447,28 @@ TEST(MergedProviderIndexHolderTest, PlanningPreservesVectorReadError) {
       {MakeSource(MakeFailingIteratorStreamer(failure, 3))});
   EXPECT_EQ(IndexError_ReadData, holder.init({}));
   EXPECT_EQ(IndexError_ReadData, holder.status());
+}
+
+TEST(MergedProviderIndexHolderTest, IteratorConstructionPreservesNoMemory) {
+  auto failure = std::make_shared<IteratorReadFailure>();
+  failure->operation = IteratorFailureOperation::kConstruction;
+  failure->enabled = false;
+  auto source = MakeSource(MakeFailingIteratorStreamer(failure, 3));
+  MergedProviderIndexHolder holder(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension), {source});
+  ASSERT_EQ(0, holder.init({}));
+  failure->enabled = true;
+  EXPECT_EQ(nullptr, holder.create_iterator());
+  EXPECT_EQ(IndexError_NoMemory, holder.status());
+  EXPECT_EQ(nullptr, holder.create_iterator());
+  failure->enabled = false;
+  MergedProviderIndexHolder retry(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension), {source});
+  ASSERT_EQ(0, retry.init({}));
+  auto iterator = retry.create_iterator();
+  ASSERT_NE(nullptr, iterator);
+  EXPECT_TRUE(iterator->is_valid());
+  EXPECT_EQ(0, iterator->status());
 }
 
 TEST(MergedProviderIndexHolderTest, SequentialPassPreservesIteratorReadError) {

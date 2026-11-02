@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,9 +40,18 @@ constexpr char kDictEnv[] = "ZVEC_JIEBA_DICT_DIR";
 const std::string kDictDir{JIEBA_DICT_DIR};
 
 TEST(JiebaDictionaryBudget, EmbeddedSizesMatchUncompressedResources) {
-  EXPECT_EQ(std::filesystem::file_size(kDictDir + "/jieba.dict.utf8"),
+  // The embedded resources contain LF; Git may check out CRLF on Windows.
+  // Text-mode input applies the same native newline normalization as parsing.
+  const auto text_size = [](const std::string &path) {
+    std::ifstream input(path);
+    EXPECT_TRUE(input.good());
+    return static_cast<size_t>(
+        std::distance(std::istreambuf_iterator<char>(input),
+                      std::istreambuf_iterator<char>()));
+  };
+  EXPECT_EQ(text_size(kDictDir + "/jieba.dict.utf8"),
             zvec::fts::embedded_jieba_dict_bytes());
-  EXPECT_EQ(std::filesystem::file_size(kDictDir + "/hmm_model.utf8"),
+  EXPECT_EQ(text_size(kDictDir + "/hmm_model.utf8"),
             zvec::fts::embedded_jieba_hmm_model_bytes());
 }
 
@@ -342,11 +352,13 @@ TEST_F(JiebaEmbeddedTokenizerTest, ExternalResourcesAreRequiredOnlyByMode) {
   ASSERT_FALSE(error) << error.message();
   ASSERT_TRUE(std::filesystem::copy_file(
       std::filesystem::u8path(kDictDir) / "jieba.dict.utf8",
-      dict_only / "jieba.dict.utf8", error));
+      dict_only / "jieba.dict.utf8", error))
+      << error.message();
   ASSERT_FALSE(error) << error.message();
   ASSERT_TRUE(std::filesystem::copy_file(
       std::filesystem::u8path(kDictDir) / "hmm_model.utf8",
-      model_only / "hmm_model.utf8", error));
+      model_only / "hmm_model.utf8", error))
+      << error.message();
   ASSERT_FALSE(error) << error.message();
 
   const std::string text = "中文分词技术星河咕噜引擎";

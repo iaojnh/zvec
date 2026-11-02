@@ -180,6 +180,7 @@ TEST_F(HnswStreamerTest, InterruptedBuildReleasesEveryCandidateHeap) {
   IndexStreamer::Stats stats;
   auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
   HnswContext context(dim, nullptr, entity);
+  const size_t context_metadata = pool.used();
   for (uint32_t i = 0; i < 3; ++i) {
     context.candidates().emplace(i, 1.0f);
     context.update_heap().emplace(i, 1.0f);
@@ -189,7 +190,7 @@ TEST_F(HnswStreamerTest, InterruptedBuildReleasesEveryCandidateHeap) {
         IndexStorage::MemoryBlock::AllocateOwned(1024));
     EXPECT_GT(pool.used(), 0u);
     context.release_build_workspace();
-    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(context_metadata, pool.used());
     EXPECT_TRUE(context.candidates().empty());
     EXPECT_TRUE(context.update_heap().empty());
     EXPECT_TRUE(context.level_topk(0).empty());

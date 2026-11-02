@@ -1,6 +1,7 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
 #include "utility/group_candidate_collector.h"
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "utility/group_topk_heap.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
@@ -60,11 +61,16 @@ TEST_F(GroupCandidateCollectorTest, TiesEmptyAndFailureAreExplicit) {
     ASSERT_EQ(1u, result.size());
     EXPECT_EQ("a", result.begin()->first);
   }
-  ASSERT_EQ(0, pool_.init(1));
+  ASSERT_EQ(0, pool_.init(1024 * 1024));
   {
     GroupCandidateCollector groups(2, 3);
+    const size_t baseline = pool_.used();
+    const size_t pressure = pool_.capacity() - baseline - 1;
+    ASSERT_TRUE(pool_.try_charge_external(pressure));
+    auto release =
+        ailego::ScopeGuard::Make([&] { pool_.release_external(pressure); });
     EXPECT_EQ(IndexError_NoMemory, groups.add("first", 0, 1));
-    EXPECT_EQ(0u, pool_.used());
+    EXPECT_EQ(baseline + pressure, pool_.used());
     std::map<std::string, IndexCandidateHeap> result;
     EXPECT_NE(0, groups.finish_heaps(result, 3));
     EXPECT_TRUE(result.empty());

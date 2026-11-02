@@ -1507,6 +1507,37 @@ TEST_F(BufferPoolTest, RejectsReinitializationWhileMemoryIsActive) {
   EXPECT_EQ(8 * kVectorPageSize, memory_pool.capacity());
 }
 
+TEST_F(BufferPoolTest, LazyDirectoriesReleaseSentinelsWithoutAllocating) {
+  // Model MSVC's allocating empty map on every platform, so the cleanup
+  // regression does not depend on the standard library used by this build.
+  struct AllocatingEmptyMap : std::unordered_map<size_t, size_t> {
+    AllocatingEmptyMap()
+        : sentinel(CacheMetadataAllocator<char>{}.allocate(1)) {}
+    ~AllocatingEmptyMap() {
+      CacheMetadataAllocator<char>{}.deallocate(sentinel, 1);
+    }
+    char *sentinel;
+  };
+  auto &pool = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, pool.init(4096));
+  LazyMap<AllocatingEmptyMap> directory;
+  EXPECT_TRUE(directory.empty());
+  EXPECT_EQ(directory.end(), directory.find(7));
+  EXPECT_EQ(directory.begin(), directory.end());
+  directory.reset();
+  EXPECT_EQ(0u, pool.used());
+  directory.try_emplace(7, 9);
+  ASSERT_GT(pool.metadata_used(), 0u);
+  const size_t pressure = pool.capacity() - pool.used();
+  ASSERT_TRUE(pool.try_charge_external(pressure));
+  auto release = ScopeGuard::Make([&] { pool.release_external(pressure); });
+  // reset() must destroy, not replace, the map under a saturated budget.
+  directory.reset();
+  EXPECT_TRUE(directory.empty());
+  EXPECT_EQ(pressure, pool.used());
+  EXPECT_EQ(0u, pool.metadata_used());
+}
+
 TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
   auto &memory_pool = PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory_pool.init(2 * kVectorPageSize));

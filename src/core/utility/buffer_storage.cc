@@ -28,6 +28,7 @@
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include <zvec/ailego/container/lazy_map.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
@@ -1587,7 +1588,7 @@ class BufferStorage : public IndexStorage {
     AllShardsExclusiveLatch latch(mapping_shards_);
     flush_index_locked();
     file_name_.clear();
-    decltype(segments_)().swap(segments_);
+    segments_.reset();
     decltype(meta_chains_)().swap(meta_chains_);
     buffer_pool_handle_.reset();
     buffer_pool_.reset();
@@ -1946,7 +1947,7 @@ class BufferStorage : public IndexStorage {
       std::equal_to<std::string_view>,
       ailego::BudgetedAllocator<
           std::pair<const std::string_view, IndexMapping::SegmentInfo>>>;
-  SegmentMap segments_{};
+  ailego::LazyMap<SegmentMap> segments_;
 
   ailego::VecBufferPool::Pointer buffer_pool_{nullptr};
   bool cache_enabled_{false};

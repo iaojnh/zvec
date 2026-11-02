@@ -388,7 +388,7 @@ class FlatStreamerEntity {
   bool locate_position(uint64_t id, VectorLocation *loc,
                        size_t *key_offset = nullptr) const;
 
-  Pointer clone_impl(bool copy_key_map) const;
+  Pointer clone_impl(bool copy_key_map, bool propagate_oom = false) const;
 
   //! Load index from storage
   int load_storage(IndexStorage::Pointer storage);

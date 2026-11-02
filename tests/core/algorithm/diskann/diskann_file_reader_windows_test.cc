@@ -268,11 +268,11 @@ TEST(DiskAnnFileReaderWindowsTest, BufferPoolReadsCachedAndBypassedPages) {
   ASSERT_TRUE(file.valid());
   ASSERT_TRUE(file.write_pages());
   auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
-  ASSERT_EQ(
-      memory_pool.init(native_page_size +
-                       ailego::VecBufferPool::metadata_bytes_for_page_count(
-                           native_page_count)),
-      0);
+  ASSERT_EQ(memory_pool.init(
+                native_page_size + ailego::MemoryLimitPool::page_buffer_size() +
+                ailego::VecBufferPool::metadata_bytes_for_page_count(
+                    native_page_count)),
+            0);
   auto pool = std::make_shared<ailego::VecBufferPool>(file.path(), false);
   ASSERT_EQ(pool->init(), 0);
   ailego::block_id_t pinned_page = 0;

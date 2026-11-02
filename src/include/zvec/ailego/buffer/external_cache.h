@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/container/lazy_map.h>
 
 namespace zvec {
 namespace ailego {
@@ -588,10 +589,10 @@ class ExternalCache : public EvictableBlockOwner {
 
   void release_empty_buckets() {
     if (!table_.empty()) return;
-    // Empty singleton caches must not retain unbounded historical buckets.
-    // Swapping default empty maps does not allocate or enter reclamation.
-    Table{}.swap(table_);
-    decltype(owner_keys_){}.swap(owner_keys_);
+    // Destroy both directories. Constructing a replacement empty map can
+    // allocate sentinel nodes on MSVC, including while the cache is locked.
+    table_.reset();
+    owner_keys_.reset();
   }
 
   Value acquire_loaded(Entry &entry) {
@@ -756,11 +757,11 @@ class ExternalCache : public EvictableBlockOwner {
   static constexpr int kRecycleAttempts = 5;
 
   Loader loader_{};
-  Table table_;
-  std::unordered_map<
+  LazyMap<Table> table_;
+  LazyMap<std::unordered_map<
       eviction_key_t, Key, std::hash<eviction_key_t>,
       std::equal_to<eviction_key_t>,
-      CacheMetadataAllocator<std::pair<const eviction_key_t, Key>>>
+      CacheMetadataAllocator<std::pair<const eviction_key_t, Key>>>>
       owner_keys_;
   eviction_key_t next_owner_key_{1};
   size_t active_loads_{0};

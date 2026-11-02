@@ -125,6 +125,9 @@ TEST(DiskAnnQueryScratch, CandidatePayloadIsOptionalSharedAndBudgeted) {
   DiskAnnContext ctx(meta, metric, entity);
   DiskAnnIndexer indexer(meta);
   const std::string source(meta.element_size(), 'x');
+  // An otherwise empty context can own MSVC map sentinel nodes. They remain
+  // charged until context destruction, independently of candidate payloads.
+  const size_t baseline = pool.used();
   auto &heap = ctx.topk_heap();
   heap.limit(1);
   indexer.emplace_candidate(&ctx, heap, 7, 1, source.data());
@@ -148,12 +151,14 @@ TEST(DiskAnnQueryScratch, CandidatePayloadIsOptionalSharedAndBudgeted) {
     EXPECT_EQ(source, result.vector_string());
   }
   heap.release();
-  EXPECT_EQ(0u, pool.used());
-  ASSERT_EQ(0, pool.init(128));
+  EXPECT_EQ(baseline, pool.used());
+  const size_t pressure = pool.capacity() - pool.used() - 128;
+  ASSERT_TRUE(pool.try_charge_external(pressure));
+  AILEGO_DEFER([&] { pool.release_external(pressure); });
   EXPECT_THROW(indexer.emplace_candidate(&ctx, heap, 1, 0, source.data()),
                std::bad_alloc);
   EXPECT_TRUE(heap.empty());
-  EXPECT_EQ(0u, pool.used());
+  EXPECT_EQ(baseline + pressure, pool.used());
   ctx.set_fetch_vector(false);
   EXPECT_NO_THROW(indexer.emplace_candidate(&ctx, heap, 1, 0, source.data()));
   heap.release();
