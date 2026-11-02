@@ -17,6 +17,39 @@
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
+// Use composition: IVFEntity contains a flexible-array index header and is
+// therefore not a valid base class under MSVC.
+class IVFEntityTestPeer {
+ public:
+  void set_quantizer(turbo::Quantizer::Pointer quantizer) {
+    entity_.quantizer_ = std::move(quantizer);
+  }
+  int bind_query(const void *query, const IndexQueryMeta &meta) {
+    return entity_.bind_query(query, meta);
+  }
+  const char *encoding_data() const {
+    return entity_.query_encoding_.value.data();
+  }
+  size_t encoding_charge() const {
+    return entity_.query_encoding_.memory.bytes();
+  }
+  bool query_valid() const {
+    return entity_.query_distance_.valid();
+  }
+  float distance(const void *candidate) const {
+    return entity_.query_distance_(candidate);
+  }
+  void set_scale(IndexStorage::Segment::Pointer segment) {
+    entity_.integer_quantizer_params_ = std::move(segment);
+  }
+  int inverted_list_normalize_value(size_t id, float *value) const {
+    return entity_.inverted_list_normalize_value(id, value);
+  }
+
+ private:
+  IVFEntity entity_;
+};
+
 namespace {
 class IVFWorkspaceBudgetTest : public testing::Test {
  protected:
@@ -168,25 +201,6 @@ TEST_F(IVFWorkspaceBudgetTest, RetainedDenseBufferCopyAndMoveKeepCharge) {
   EXPECT_EQ(16384u, first.data.size());
 }
 
-class QueryEncodingEntity : public IVFEntity {
- public:
-  void set_quantizer(turbo::Quantizer::Pointer quantizer) {
-    quantizer_ = std::move(quantizer);
-  }
-  const char *encoding_data() const {
-    return query_encoding_.value.data();
-  }
-  size_t encoding_charge() const {
-    return query_encoding_.memory.bytes();
-  }
-  bool query_valid() const {
-    return query_distance_.valid();
-  }
-  float distance(const void *candidate) const {
-    return query_distance_(candidate);
-  }
-};
-
 TEST_F(IVFWorkspaceBudgetTest, TurboQueryEncodingReusesChargedCapacity) {
   auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
   ASSERT_NE(nullptr, quantizer);
@@ -195,7 +209,7 @@ TEST_F(IVFWorkspaceBudgetTest, TurboQueryEncodingReusesChargedCapacity) {
   ASSERT_EQ(0, quantizer->init(meta, {}));
   std::array<float, 768> query{}, candidate{};
   {
-    QueryEncodingEntity entity;
+    IVFEntityTestPeer entity;
     entity.set_quantizer(quantizer);
     const IndexQueryMeta qmeta(IndexMeta::DT_FP32, query.size());
     ASSERT_EQ(0, entity.bind_query(query.data(), qmeta));
@@ -221,7 +235,7 @@ TEST_F(IVFWorkspaceBudgetTest, TurboQueryEncodingReusesChargedCapacity) {
 }
 
 TEST_F(IVFWorkspaceBudgetTest, TurboEncodingRejectsGrowthAndCanRetry) {
-  QueryEncodingEntity entity;
+  IVFEntityTestPeer entity;
   auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
   ASSERT_NE(nullptr, quantizer);
   IndexMeta meta(IndexMeta::DT_FP32, 768);
@@ -385,12 +399,7 @@ class ScaleFaultSegment : public IndexStorage::Segment {
   }
 };
 TEST_F(IVFWorkspaceBudgetTest, QuantizationScaleReadErrorsAreNotDefaultValues) {
-  class Entity : public IVFEntity {
-   public:
-    void set_scale(IndexStorage::Segment::Pointer segment) {
-      integer_quantizer_params_ = std::move(segment);
-    }
-  } entity;
+  IVFEntityTestPeer entity;
   auto segment = std::make_shared<ScaleFaultSegment>();
   entity.set_scale(segment);
   float value = -1.0f;

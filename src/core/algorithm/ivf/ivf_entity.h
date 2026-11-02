@@ -26,6 +26,9 @@ namespace core {
 /*! IVF Entity
  */
 class IVFEntity {
+  // MSVC cannot derive a test fixture from the flexible-array index header.
+  friend class IVFEntityTestPeer;
+
  public:
   typedef std::shared_ptr<IVFEntity> Pointer;
 

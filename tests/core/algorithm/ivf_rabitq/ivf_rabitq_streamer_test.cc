@@ -392,12 +392,12 @@ TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
           EXPECT_EQ(a[i].key(), b[i].key());
           ASSERT_TRUE(std::isfinite(a[i].score()));
           ASSERT_TRUE(std::isfinite(b[i].score()));
-          // Near-zero L2 subtracts norm-sized terms. Bound that cancellation,
-          // not ULPs of the near-zero result; keep key order and other scores
-          // strict across the two storage layouts.
-          if (squared_l2 &&
-              std::max(std::abs(a[i].score()), std::abs(b[i].score())) <=
-                  8.0f * cancellation_tolerance) {
+          // The mmap single-probe seeker uses Turbo while the bounded
+          // Buffer scan uses the metric kernel. Their residual norms have
+          // different FP32 reduction orders; RaBitQ combines norm-sized
+          // terms even when the final L2 score is not near zero. Bound that
+          // absolute error, not ULPs of the result. Keys/order stay strict.
+          if (squared_l2) {
             EXPECT_NEAR(a[i].score(), b[i].score(), cancellation_tolerance);
           } else {
             EXPECT_FLOAT_EQ(a[i].score(), b[i].score());
@@ -405,8 +405,11 @@ TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
         }
       };
       for (uint32_t nprobe : {1u, 4u, 16u}) {
+        SCOPED_TRACE(nprobe);
         for (bool grouped : {false, true}) {
+          SCOPED_TRACE(grouped);
           for (bool by_key : {false, true}) {
+            SCOPED_TRACE(by_key);
             IndexStreamer::Context::Pointer contexts[2];
             for (size_t mode = 0; mode < 2; ++mode) {
               auto ctx = streamers[mode]->create_context();
