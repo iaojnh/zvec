@@ -788,6 +788,7 @@ class ZVEC_AILEGO_API VecBufferPool {
                            uint8_t priority);
   bool load_pages_aio(const block_id_t *page_ids, size_t count,
                       uint8_t priority);
+  bool read_ranges_bypass_aio(const ReadRange *ranges, size_t count);
   bool enqueue_writeback(block_id_t page_id);
   void start_writeback();
   void stop_writeback();

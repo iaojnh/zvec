@@ -2014,7 +2014,9 @@ bool VecBufferPool::read_ranges_bypass(const ReadRange *ranges, size_t count) {
         (range.length != 0 && !range.buffer))
       return false;
   }
-#if defined(__APPLE__)
+#if defined(__linux__) && !defined(__ANDROID__)
+  if (!writable_ && read_ranges_bypass_aio(ranges, count)) return true;
+#elif defined(__APPLE__)
   if (!writable_) {
     // Read only requested fragments, without admitting a cold page or adding
     // another staging allocation. The caller owns and budgets destinations.
@@ -2882,6 +2884,13 @@ struct ThreadLocalBlockingAioCtx
   char *quarantined[kBlockingAioBatchSize]{};
   size_t quarantined_count{0};
 
+  bool ensure() {
+    // A failed destroy leaves kernel-owned pages quarantined. Do not reuse
+    // that context or accumulate another batch behind the outstanding I/O.
+    return quarantined_count == 0 &&
+           ThreadLocalAioContext<kBlockingAioBatchSize>::ensure();
+  }
+
   void quarantine(char **buffers, size_t count) {
     for (size_t i = 0; i < count; ++i) {
       if (buffers[i]) {
@@ -2911,6 +2920,119 @@ static thread_local ThreadLocalIoUringContext<kBlockingAioBatchSize>
 static thread_local ThreadLocalBlockingAioCtx tl_blocking_aio;
 }  // namespace
 #endif
+
+bool VecBufferPool::read_ranges_bypass_aio(const ReadRange *ranges,
+                                           size_t count) {
+#if defined(__linux__) && !defined(__ANDROID__)
+  if (!aio_enabled_ || count < 2) return false;
+  // BufferStorage supplies aligned cold-page ranges. Other callers retain
+  // the scalar path, including partial reads at EOF and unaligned fragments.
+  for (size_t i = 0; i < count; ++i) {
+    if (ranges[i].length == 0 || ranges[i].length > kVectorPageSize ||
+        ranges[i].offset % 512 != 0 || ranges[i].length % 512 != 0)
+      return false;
+  }
+  bool use_io_uring = io_backend_type_ == IOBackendType::kIoUring &&
+                      tl_blocking_io_uring.ensure();
+  if (!use_io_uring && !tl_blocking_aio.ensure()) return false;
+
+  static constexpr size_t kBatchSize = 16;
+  for (size_t begin = 0; begin < count; begin += kBatchSize) {
+    const size_t batch = std::min(kBatchSize, count - begin);
+    if (use_io_uring) {
+      std::array<IoUringRead, kBatchSize> requests{};
+      for (size_t i = 0; i < batch; ++i) {
+        const auto &range = ranges[begin + i];
+        requests[i] =
+            IoUringRead(range.offset, range.length, range.buffer, range.length);
+      }
+      if (tl_blocking_io_uring.ring.execute(fd_, requests.data(), batch) == 0) {
+        aio_pages_submitted_.fetch_add(batch, std::memory_order_relaxed);
+        for (size_t i = 0; i < batch; ++i)
+          record_bypass_read(ranges[begin + i].length);
+        continue;
+      }
+      // execute() never gives caller memory to the kernel. A drained ring
+      // failure can therefore safely fall back to the libaio staging below.
+      if (!tl_blocking_aio.ensure()) return false;
+      use_io_uring = false;
+    }
+
+    auto &pool = MemoryLimitPool::get_instance();
+    std::array<char *, kBatchSize> buffers{};
+    AILEGO_DEFER([&] {
+      for (char *buffer : buffers) {
+        if (buffer) pool.release_buffer(buffer, kVectorPageSize);
+      }
+    });
+    size_t allocated =
+        pool.batch_acquire_buffers(kVectorPageSize, buffers.data(), batch);
+    if (allocated < batch) {
+      const size_t shortage = batch - allocated;
+      BlockEvictionQueue::get_instance().batch_recycle(shortage);
+      allocated += pool.batch_acquire_buffers(
+          kVectorPageSize, buffers.data() + allocated, shortage);
+    }
+    if (allocated != batch) return false;
+
+    std::array<struct iocb, kBatchSize> requests{};
+    std::array<struct iocb *, kBatchSize> pointers{};
+    for (size_t i = 0; i < batch; ++i) {
+      const auto &range = ranges[begin + i];
+      io_prep_pread(&requests[i], fd_, buffers[i], range.length,
+                    static_cast<long long>(range.offset));
+      requests[i].data = reinterpret_cast<void *>(i);
+      pointers[i] = &requests[i];
+    }
+    int submitted;
+    do {
+      submitted = LibAioLoader::Instance().io_submit(
+          tl_blocking_aio.ctx, static_cast<long>(batch), pointers.data());
+    } while (submitted == -EINTR);
+    if (submitted <= 0 || static_cast<size_t>(submitted) > batch) return false;
+    const size_t accepted = static_cast<size_t>(submitted);
+    aio_pages_submitted_.fetch_add(accepted, std::memory_order_relaxed);
+
+    std::array<struct io_event, kBatchSize> events{};
+    size_t completed = 0;
+    while (completed < accepted) {
+      const long remaining = static_cast<long>(accepted - completed);
+      const int result = LibAioLoader::Instance().io_getevents(
+          tl_blocking_aio.ctx, remaining, remaining, events.data() + completed,
+          nullptr);
+      if (result == -EINTR) continue;
+      if (result <= 0 || result > remaining) {
+        // Never let failed AIO keep writing into a caller's returned buffer.
+        // Staging remains charged until io_destroy establishes quiescence.
+        if (!tl_blocking_aio.destroy_context("ThreadLocalBlockingAioCtx"))
+          tl_blocking_aio.quarantine(buffers.data(), accepted);
+        return false;
+      }
+      completed += static_cast<size_t>(result);
+    }
+    if (accepted != batch) return false;
+    std::array<bool, kBatchSize> seen{};
+    for (size_t i = 0; i < completed; ++i) {
+      const size_t index = reinterpret_cast<size_t>(events[i].data);
+      if (index >= batch || seen[index] || events[i].res2 != 0 ||
+          static_cast<ssize_t>(events[i].res) !=
+              static_cast<ssize_t>(ranges[begin + index].length))
+        return false;
+      seen[index] = true;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+      const auto &range = ranges[begin + i];
+      std::memcpy(range.buffer, buffers[i], range.length);
+      record_bypass_read(range.length);
+    }
+  }
+  return true;
+#else
+  (void)ranges;
+  (void)count;
+  return false;
+#endif
+}
 
 void VecBufferPool::prefetch_pages_aio(block_id_t first_page, size_t page_count,
                                        uint8_t priority) {
