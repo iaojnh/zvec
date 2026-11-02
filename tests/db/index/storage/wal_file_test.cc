@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "db/index/storage/wal/wal_file.h"
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -25,7 +26,6 @@
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include "db/common/file_helper.h"
-#include "db/index/storage/wal/wal_file.h"
 #include "tests/test_util.h"
 
 #if defined(__GNUC__) || defined(__GNUG__)
