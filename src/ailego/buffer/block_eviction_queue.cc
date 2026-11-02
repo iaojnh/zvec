@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 
@@ -681,11 +682,7 @@ bool MemoryLimitPool::try_reserve_used(size_t bytes) {
 }
 
 bool MemoryLimitPool::try_reserve_page_used(size_t bytes) {
-  const size_t capacity = pool_size_.load(std::memory_order_relaxed);
-  const size_t reserve = page_admission_reserve();
-  const size_t external = external_used_size_.load(std::memory_order_relaxed);
-  const size_t remaining_reserve = reserve > external ? reserve - external : 0;
-  const size_t page_limit = capacity - remaining_reserve;
+  const size_t page_limit = page_admission_limit();
   size_t used = used_size_.load(std::memory_order_relaxed);
   while (used <= page_limit && bytes <= page_limit - used) {
     if (used_size_.compare_exchange_weak(used, used + bytes,
@@ -1176,13 +1173,19 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
 
 bool MemoryLimitPool::wait_for_available(const size_t buffer_size,
                                          std::chrono::milliseconds timeout) {
+  return wait_for_available_impl(buffer_size, timeout, true);
+}
+
+bool MemoryLimitPool::wait_for_available_impl(size_t buffer_size,
+                                              std::chrono::milliseconds timeout,
+                                              bool page_admission) {
   if (buffer_size == 0) {
     return true;
   }
   capacity_waits_.fetch_add(1, std::memory_order_relaxed);
   std::unique_lock<std::mutex> lock(capacity_mutex_);
   const bool available =
-      capacity_cv_.wait_for(lock, timeout, [this, buffer_size] {
+      capacity_cv_.wait_for(lock, timeout, [this, buffer_size, page_admission] {
         const size_t capacity = pool_size_.load(std::memory_order_relaxed);
         const size_t used = used_size_.load(std::memory_order_relaxed);
         if (capacity < used || buffer_size > capacity - used) {
@@ -1192,7 +1195,8 @@ bool MemoryLimitPool::wait_for_available(const size_t buffer_size,
         // cache headroom is not available to page admission. Use the same
         // page-limit predicate as eviction instead of turning backpressure
         // into immediate successful waits while pages still cannot fit.
-        if (!is_cacheable_buffer_size(buffer_size)) return true;
+        if (!page_admission || !is_cacheable_buffer_size(buffer_size))
+          return true;
         if (is_page_full()) return false;
         for (const auto &shard : free_shards_)
           if (shard.count.load(std::memory_order_relaxed) != 0) return true;
@@ -1258,6 +1262,21 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
   if (fixed > capacity || buffer_size > capacity - fixed) {
     return false;
   }
+  size_t waiting = workspace_waiting_size_.load(std::memory_order_relaxed);
+  do {
+    if (buffer_size > std::numeric_limits<size_t>::max() - waiting)
+      return false;
+  } while (!workspace_waiting_size_.compare_exchange_weak(
+      waiting, waiting + buffer_size, std::memory_order_relaxed));
+  auto release_priority = ScopeGuard::Make([this, buffer_size] {
+    workspace_waiting_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    capacity_cv_.notify_all();
+  });
+  bg_cv_.notify_one();
+  // Establish priority before another reclaim pass. A cache page may already
+  // have won the preceding race, but cannot repeatedly consume the released
+  // headroom while this mandatory consumer is waiting.
+  if (try_charge_fixed(buffer_size, counter)) return true;
   // Dirty writeback and CLOCK aging can need more than one bounded pass.
   // A zero-page batch is not proof that the queue is unreclaimable: it may
   // only have cleared reference bits or demoted recently used entries.
@@ -1266,7 +1285,8 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
   // Ordinary external-cache admission never enters this waiting path.
   size_t previous_available = available();
   for (size_t attempt = 0; attempt < 50; ++attempt) {
-    (void)wait_for_available(buffer_size, std::chrono::milliseconds(100));
+    (void)wait_for_available_impl(buffer_size, std::chrono::milliseconds(100),
+                                  false);
     if (try_charge_fixed(buffer_size, counter)) return true;
     const size_t current_available = available();
     if (current_available <= previous_available) {
@@ -1391,10 +1411,7 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
   if (count == 0 || buffer_size == 0) return 0;
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   const bool cacheable = is_cacheable_buffer_size(buffer_size);
-  const size_t reserve = cacheable ? page_admission_reserve() : 0;
-  const size_t external = external_used_size_.load(std::memory_order_relaxed);
-  const size_t remaining_reserve = reserve > external ? reserve - external : 0;
-  const size_t admission_limit = capacity - remaining_reserve;
+  const size_t admission_limit = cacheable ? page_admission_limit() : capacity;
   size_t total_size = 0;
   size_t actual_count = count;
   size_t expected, desired;

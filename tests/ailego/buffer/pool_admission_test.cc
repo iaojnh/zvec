@@ -77,6 +77,7 @@ class PoolAdmissionTest : public testing::Test {
     EXPECT_LE(pool_.used(), pool_.capacity());
     EXPECT_LE(pool_.committed(), pool_.capacity());
   }
+  void expect_workspace_priority(bool bulk);
   MemoryLimitPool &pool_ = MemoryLimitPool::get_instance();
   const size_t page_ = MemoryLimitPool::page_buffer_size();
   size_t baseline_{0};
@@ -219,6 +220,118 @@ TEST_F(PoolAdmissionTest, RetainedReuseRejectsPendingPageReservations) {
   block = pool_.acquire_retained_block(1);
   ASSERT_NE(nullptr, block);
   pool_.release_retained_block(block);
+}
+
+void PoolAdmissionTest::expect_workspace_priority(bool bulk) {
+  if (bulk) {
+    // Reuse existing backing so a missing priority check cannot be masked by
+    // a separate slab-header allocation failing in the competing reader.
+    char *buffer = nullptr;
+    ASSERT_TRUE(pool_.try_acquire_buffer(page_, buffer));
+    pool_.release_buffer(buffer, page_);
+  }
+  for (const bool metadata : {false, true}) {
+    auto first = std::make_unique<PendingReservation>(pool_, page_);
+    ASSERT_TRUE(first->acquired());
+    auto remaining =
+        std::make_unique<PendingReservation>(pool_, pool_.available());
+    ASSERT_TRUE(remaining->acquired());
+    const auto initial_waits = pool_.stats().capacity_waits;
+    std::atomic<bool> page_readmitted{false};
+    std::atomic<bool> saw_wait{false};
+    std::thread reclaimer([&] {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (pool_.stats().capacity_waits == initial_waits &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      saw_wait = pool_.stats().capacity_waits != initial_waits;
+      first.reset();
+      // The mandatory consumer needs three pages and cannot win yet. Model
+      // a page reader racing to reuse the first reclaimed page instead.
+      if (bulk) {
+        char *buffer = nullptr;
+        page_readmitted = pool_.batch_acquire_buffers(page_, &buffer, 1) != 0;
+        if (buffer) pool_.release_buffer(buffer, page_);
+      } else {
+        PendingReservation competing_page(pool_, page_);
+        page_readmitted = competing_page.acquired();
+      }
+      while (pool_.stats().capacity_waits < initial_waits + 2 &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      remaining.reset();
+    });
+    const size_t bytes = 3 * page_;
+    const bool charged = metadata ? pool_.try_charge_metadata(bytes)
+                                  : pool_.try_charge_workspace(bytes);
+    reclaimer.join();
+    EXPECT_TRUE(saw_wait.load());
+    EXPECT_FALSE(page_readmitted.load());
+    EXPECT_TRUE(charged);
+    expect_bounded();
+    if (charged) {
+      if (metadata)
+        pool_.release_metadata(bytes);
+      else
+        pool_.release_external(bytes);
+    }
+    // Priority must disappear on success so later page admission still works.
+    PendingReservation next_page(pool_, page_);
+    EXPECT_TRUE(next_page.acquired());
+  }
+}
+
+TEST_F(PoolAdmissionTest, MandatoryConsumersKeepReclaimedHeadroom) {
+  expect_workspace_priority(false);
+}
+
+TEST_F(PoolAdmissionTest,
+       MandatoryConsumersKeepReclaimedHeadroomFromBulkReads) {
+  expect_workspace_priority(true);
+}
+
+TEST_F(PoolAdmissionTest, SinglePageWorkspaceWaitIgnoresPageAdmissionLimit) {
+  auto first = std::make_unique<PendingReservation>(pool_, page_);
+  ASSERT_TRUE(first->acquired());
+  PendingReservation remaining(pool_, pool_.available());
+  ASSERT_TRUE(remaining.acquired());
+  const auto before = pool_.stats();
+  std::thread reclaimer([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (pool_.stats().capacity_waits == before.capacity_waits &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    first.reset();
+  });
+  const bool charged = pool_.try_charge_workspace(page_);
+  reclaimer.join();
+  EXPECT_TRUE(charged);
+  EXPECT_EQ(before.capacity_wait_timeouts,
+            pool_.stats().capacity_wait_timeouts);
+  if (charged) pool_.release_external(page_);
+}
+
+TEST_F(PoolAdmissionTest, MandatoryConsumersReleasePriorityAfterFailure) {
+  for (const bool metadata : {false, true}) {
+    {
+      PendingReservation pinned(pool_, pool_.available());
+      ASSERT_TRUE(pinned.acquired());
+      const bool charged = metadata ? pool_.try_charge_metadata(page_)
+                                    : pool_.try_charge_workspace(page_);
+      EXPECT_FALSE(charged);
+      if (charged) {
+        if (metadata)
+          pool_.release_metadata(page_);
+        else
+          pool_.release_external(page_);
+      }
+    }
+    PendingReservation next_pages(pool_, pool_.available());
+    EXPECT_TRUE(next_pages.acquired());
+    expect_bounded();
+  }
 }
 
 TEST_F(PoolAdmissionTest, SlabHeaderRejectsPendingPageReservations) {

@@ -270,7 +270,7 @@ class MemoryLimitPool {
   bool try_charge_external(const size_t buffer_size);
 
   //! Reserve mandatory non-evictable workspace capacity. Unlike optional cache
-  //! admission, allow pending page reclamation up to 100 ms to release space.
+  //! admission, wait for progressing page reclamation with a finite bound.
   //! Successful reservations must be paired with release_external().
   bool try_charge_workspace(const size_t buffer_size);
 
@@ -306,11 +306,7 @@ class MemoryLimitPool {
     if (capacity == 0) {
       return used != 0;
     }
-    const size_t reserve = page_admission_reserve();
-    const size_t external = external_used_size_.load(std::memory_order_relaxed);
-    const size_t remaining_reserve =
-        reserve > external ? reserve - external : 0;
-    const size_t limit = capacity - remaining_reserve;
+    const size_t limit = page_admission_limit();
     return used >= limit || limit - used < page_buffer_size();
   }
 
@@ -456,6 +452,17 @@ class MemoryLimitPool {
   bool try_reserve_page_used(size_t bytes);
   bool try_reserve_committed(size_t bytes);
   bool try_reserve_allocation(size_t bytes);
+  bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,
+                               bool page_admission);
+  size_t page_admission_limit() const {
+    const size_t capacity = pool_size_.load(std::memory_order_relaxed);
+    const size_t reserve = page_admission_reserve();
+    const size_t external = external_used_size_.load(std::memory_order_relaxed);
+    const size_t remaining = reserve > external ? reserve - external : 0;
+    const size_t waiting =
+        workspace_waiting_size_.load(std::memory_order_relaxed);
+    return capacity - std::min(capacity, std::max(remaining, waiting));
+  }
   bool try_charge_fixed(size_t bytes, std::atomic<size_t> *counter);
   bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter);
@@ -527,6 +534,9 @@ class MemoryLimitPool {
   std::atomic<size_t> committed_size_{0};
   std::atomic<size_t> external_used_size_{0};
   std::atomic<size_t> metadata_used_size_{0};
+  // Logical priority only, not an allocation: waiting mandatory consumers
+  // must be able to claim reclaimed bytes before optional page readmission.
+  std::atomic<size_t> workspace_waiting_size_{0};
 
   // Serialize queue allocation with budget adoption/reinitialization. These
   // hooks never acquire lifecycle_mutex_ or call an eviction/reclaim path.
