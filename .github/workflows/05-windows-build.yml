@@ -38,6 +38,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           submodules: recursive
+          ref: c63da2a833b118020da0927c57287014caf7e34d
 
       - name: Cleanup left marker files
         run: |
@@ -89,6 +90,7 @@ jobs:
           $env:CMAKE_BUILD_PARALLEL_LEVEL = "$env:NPROC"
           python -m pip install -v . `
             --no-build-isolation `
+            --config-settings='build.targets=_zvec' `
             --config-settings='cmake.define.BUILD_TOOLS=OFF' `
             --config-settings='cmake.define.ENABLE_WERROR=ON' `
             --config-settings='cmake.define.CMAKE_C_COMPILER_LAUNCHER=sccache' `
