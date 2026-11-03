@@ -27,7 +27,8 @@ import zvec
 
 @pytest.fixture(scope="module", autouse=True)
 def initialize():
-    zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2)
+    zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2,
+              log_type=zvec.LogType.CONSOLE, log_level=zvec.LogLevel.INFO)
 
 
 def _schema(kind="flat"):
@@ -95,15 +96,22 @@ def _crash_writer(path, enable_mmap, kind, operation):
 
 def _assert_docs(collection, expected):
     fetched = collection.fetch(["a", "b", "c"])
-    assert {key: doc.fields["value"] for key, doc in fetched.items()} == expected
+    actual = {key: doc.fields["value"] for key, doc in fetched.items()}
+    if actual != expected:
+        print("Failed path:", collection.path, flush=True)
+        print("Scalar-only fetch:", collection.fetch(["a", "b", "c"], include_vector=False), flush=True)
+        print("Stats:", collection.stats, flush=True)
+        print("Full fetch:", fetched, flush=True)
+    assert actual == expected
     assert collection.stats.doc_count == len(expected)
     assert {doc.id for doc in collection.iter_docs()} == set(expected)
 
 
+@pytest.mark.parametrize("iteration", range(200))
 @pytest.mark.parametrize("enable_mmap", [True, False])
 @pytest.mark.parametrize("kind", ["flat", "sparse", "scalar"])
 @pytest.mark.parametrize("operation", ["insert", "update", "upsert", "delete"])
-def test_pending_wal_requires_writable_recovery(tmp_path, enable_mmap, kind, operation):
+def test_pending_wal_requires_writable_recovery(tmp_path, enable_mmap, kind, operation, iteration):
     path = tmp_path / "collection"
     _crash_writer(path, enable_mmap, kind, operation)
     before = _snapshot(path)
@@ -228,7 +236,8 @@ def test_wal_inspection_does_not_require_write_permission(tmp_path, operation):
 
 if __name__ == "__main__":
     path, mmap, kind, operation = sys.argv[1:]
-    zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2)
+    zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2,
+              log_type=zvec.LogType.CONSOLE, log_level=zvec.LogLevel.INFO)
     collection = zvec.create_and_open(
         path, _schema(kind), zvec.CollectionOption(enable_mmap=bool(int(mmap)))
     )

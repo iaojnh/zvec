@@ -1,6 +1,8 @@
-name: Windows Build
+name: Windows WAL Diagnostics
 
 on:
+  push:
+    branches: [codex/diagnose-windows-wal]
   workflow_call:
   workflow_dispatch:
 
@@ -17,17 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-2022
-            msvc_arch: x64
-            python_version: '3.10'
           - platform: windows-2025
             msvc_arch: x64
             python_version: '3.10'
-          # Windows ARM64: Python 3.10 has no official ARM64 installer;
-          # 3.11 is the first CPython release with a Windows-on-ARM build.
-          - platform: windows-11-arm
-            msvc_arch: arm64
-            python_version: '3.11'
 
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -95,7 +89,7 @@ jobs:
           $env:CMAKE_BUILD_PARALLEL_LEVEL = "$env:NPROC"
           python -m pip install -v . `
             --no-build-isolation `
-            --config-settings='cmake.define.BUILD_TOOLS=ON' `
+            --config-settings='cmake.define.BUILD_TOOLS=OFF' `
             --config-settings='cmake.define.ENABLE_WERROR=ON' `
             --config-settings='cmake.define.CMAKE_C_COMPILER_LAUNCHER=sccache' `
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache'
@@ -107,74 +101,17 @@ jobs:
         run: sccache --show-stats
         shell: powershell
 
-      - name: Run C++ Tests
-        run: |
-          cd "$env:GITHUB_WORKSPACE\build"
-          cmake --build . --target unittest --config Release --parallel $env:NPROC
-        shell: powershell
-
-      - name: Show sccache statistics after tests
-        if: always()
-        continue-on-error: true
-        run: sccache --show-stats
-        shell: powershell
-
       - name: Run Python Tests
         run: |
           cd "$env:GITHUB_WORKSPACE"
-          python -m pytest python/tests/ --basetemp=./.pytest_tmp
+          python -m pytest python/tests/test_readonly_storage.py -k "update and flat and False" -n 4 -v --basetemp=./.pytest_tmp
         shell: powershell
 
-      - name: Run C++ Examples
-        run: |
-          cd "$env:GITHUB_WORKSPACE\examples\c++"
-          mkdir build
-          cd build
-          # These small examples do not need a remote compiler cache. Clear
-          # both launchers so a cache outage cannot block their smoke tests.
-          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER_LAUNCHER= `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build . --config Release --parallel $env:NPROC
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # Copy zvec DLLs next to the example executables so Windows can find them.
-          # CMake places DLLs in bin/ (RUNTIME output) and import libs in lib/.
-          $buildDir = "$env:GITHUB_WORKSPACE\build"
-          foreach ($dllName in @("zvec.dll", "zvec_core.dll", "zvec_ailego.dll")) {
-            $found = $false
-            foreach ($sub in @("$buildDir\bin", "$buildDir\bin\Release", "$buildDir\lib", "$buildDir\lib\Release")) {
-              $dllPath = Join-Path $sub $dllName
-              if (Test-Path $dllPath) {
-                Copy-Item $dllPath -Destination . -Force
-                Write-Host "Copied $dllName from $sub"
-                $found = $true
-                break
-              }
-            }
-            if (-not $found) {
-              Write-Host "WARNING: $dllName not found, searching recursively..."
-              $dll = Get-ChildItem -Path $buildDir -Filter $dllName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($dll) {
-                Copy-Item $dll.FullName -Destination . -Force
-                Write-Host "Copied $dllName from $($dll.DirectoryName)"
-              } else {
-                Write-Error "$dllName not found anywhere under $buildDir"
-              }
-            }
-          }
-
-          .\db-example.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\core-example.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\ailego-example.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        shell: powershell
-
-      - name: Show sccache statistics
-        if: always()
-        continue-on-error: true
-        run: sccache --show-stats
-        shell: powershell
+      - name: Preserve failed recovery stores
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-wal-recovery
+          path: .pytest_tmp
+          include-hidden-files: true
+          retention-days: 2
