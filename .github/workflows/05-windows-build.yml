@@ -14,6 +14,7 @@ jobs:
   build-and-test-windows:
     name: Build & Test (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
 
     strategy:
       fail-fast: false
@@ -88,14 +89,23 @@ jobs:
           cd "$env:GITHUB_WORKSPACE"
           $env:CMAKE_GENERATOR = "Ninja"
           $env:CMAKE_BUILD_PARALLEL_LEVEL = "$env:NPROC"
-          python -m pip install -v . `
+          python -m pip wheel -v . --no-deps --wheel-dir diagnostics-wheel `
             --no-build-isolation `
             --config-settings='build.targets=_zvec' `
             --config-settings='cmake.define.BUILD_TOOLS=OFF' `
             --config-settings='cmake.define.ENABLE_WERROR=ON' `
             --config-settings='cmake.define.CMAKE_C_COMPILER_LAUNCHER=sccache' `
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install (Get-ChildItem diagnostics-wheel\*.whl).FullName
         shell: powershell
+
+      - name: Preserve Windows Python runtime
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-wal-runtime
+          path: diagnostics-wheel/*.whl
+          retention-days: 2
 
       - name: Show sccache statistics after pip install
         if: always()
@@ -106,14 +116,44 @@ jobs:
       - name: Run Python Tests
         run: |
           cd "$env:GITHUB_WORKSPACE"
-          python -m pytest python/tests/test_readonly_storage.py -k "update and flat and False" -n 4 -v --basetemp=./.pytest_tmp
+          @'
+          def pytest_collection_modifyitems(config, items):
+              selected = []
+              dropped = []
+              for item in items:
+                  params = getattr(getattr(item, "callspec", None), "params", {})
+                  if getattr(item, "originalname", None) == "test_pending_wal_requires_writable_recovery":
+                      keep = params["iteration"] == 0 or (
+                          params["operation"] == "update"
+                          and params["kind"] == "flat"
+                          and params["enable_mmap"] is False
+                      )
+                  else:
+                      keep = True
+                  (selected if keep else dropped).append(item)
+              items[:] = selected
+              config.hook.pytest_deselected(items=dropped)
+          '@ | Set-Content -Encoding utf8 wal_diag_plugin.py
+          @'
+          from pathlib import Path
+          p = Path("python/tests/test_readonly_storage.py")
+          s = p.read_text()
+          s = s.replace('zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2,\n              log_type=zvec.LogType.CONSOLE, log_level=zvec.LogLevel.INFO)', 'zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2)')
+          assert s.count('    _assert_docs(reader, expected)') == 1
+          p.write_text(s.replace('    _assert_docs(reader, expected)', '    try:\n        _assert_docs(reader, expected)\n    except AssertionError:\n        for name, (data, _, _) in before.items():\n            saved = tmp_path / "before_recovery" / name\n            saved.parent.mkdir(parents=True, exist_ok=True)\n            saved.write_bytes(data)\n        raise', 1))
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest python/tests/ -p wal_diag_plugin -n 4 -v --basetemp=./.pytest_tmp
         shell: powershell
 
       - name: Preserve failed recovery stores
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: windows-wal-recovery
-          path: .pytest_tmp
+          name: windows-wal-recovery-full
+          path: |
+            .pytest_tmp/**/test_pending_wal_requires_writ*/**
+            logs/**
+            log/**
           include-hidden-files: true
           retention-days: 2
