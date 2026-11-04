@@ -24,7 +24,11 @@
 #include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/db/config.h>
+#include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 
 using namespace zvec;
 
@@ -165,6 +169,106 @@ TEST_P(GlobalResourceDeathTest,
 INSTANTIATE_TEST_SUITE_P(PoolInitialization, GlobalResourceDeathTest,
                          ::testing::Values(false, true));
 
+#if defined(__linux__)
+TEST(NativeImageMemory, CountsResidentCapacityNotFileSizeOrSegmentGaps) {
+  ElfW(Phdr) headers[4]{};
+  headers[0].p_type = PT_LOAD;
+  headers[0].p_vaddr = 0x1003;
+  headers[0].p_filesz = 16;
+  headers[0].p_memsz = 0x1800;
+  headers[1].p_type = PT_LOAD;
+  headers[1].p_vaddr = 0x2f00;
+  headers[1].p_memsz = 0x300;
+  headers[2].p_type = PT_TLS;
+  headers[2].p_memsz = 0x100000;
+  headers[3].p_type = PT_LOAD;
+  headers[3].p_vaddr = 0x8001;
+  headers[3].p_memsz = 1;
+  size_t bytes = 0;
+  ASSERT_TRUE(detail::ElfLoadImageBytes(headers, 4, 4096, &bytes));
+  EXPECT_EQ(4u * 4096, bytes);
+  ASSERT_TRUE(detail::ElfLoadImageBytes(headers, 4, 16384, &bytes));
+  EXPECT_EQ(2u * 16384, bytes);
+}
+
+TEST(NativeImageMemory, RejectsInvalidRangesWithoutPublishingPartialResult) {
+  ElfW(Phdr) headers[2]{};
+  size_t bytes = 73;
+  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
+  EXPECT_FALSE(detail::ElfLoadImageBytes(nullptr, 2, 4096, &bytes));
+  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 0, &bytes));
+  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, nullptr));
+  headers[0].p_type = PT_LOAD;
+  headers[0].p_vaddr = std::numeric_limits<uintptr_t>::max() - 1;
+  headers[0].p_memsz = 4;
+  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
+  headers[0].p_memsz = 1;
+  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
+  headers[0].p_vaddr = 0x2000;
+  headers[1].p_type = PT_LOAD;
+  headers[1].p_vaddr = 0x1000;
+  headers[1].p_memsz = 1;
+  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
+  EXPECT_EQ(73u, bytes);
+}
+
+TEST(NativeImageMemory, ResolvesSharedOwnerAndExcludesCallerExecutable) {
+  static const char caller_anchor = 0;
+  EXPECT_EQ(0u, detail::NativeImageBytesForAddress(&caller_anchor));
+  // A non-PIE main executable may expose a function's canonical PLT address
+  // through RTLD_DEFAULT. RTLD_NEXT excludes that executable so this tests the
+  // actual shared image.
+  auto *symbol = dlsym(RTLD_NEXT, "malloc");
+  ASSERT_NE(nullptr, symbol);
+  const auto bytes = detail::NativeImageBytesForAddress(symbol);
+  EXPECT_GT(bytes, 0u);
+  EXPECT_EQ(0u, bytes % static_cast<size_t>(sysconf(_SC_PAGESIZE)));
+  EXPECT_THROW(detail::NativeImageBytesForAddress(nullptr), std::bad_alloc);
+  const char stack_anchor = 0;
+  EXPECT_THROW(detail::NativeImageBytesForAddress(&stack_anchor), std::bad_alloc);
+}
+
+TEST(NativeImageMemoryDeathTest, ReservesBeforeAdmissionAndDoesNotRefundLiveImage) {
+#if GTEST_HAS_DEATH_TEST
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto &pool = ailego::MemoryLimitPool::get_instance();
+        if (pool.init(128u * 1024 * 1024) != 0) std::_Exit(1);
+        auto *symbol = dlsym(RTLD_NEXT, "malloc");
+        const auto bytes = detail::NativeImageBytesForAddress(symbol);
+        if (!bytes) std::_Exit(5);
+        const auto before = pool.stats();
+        detail::ReserveNativeImage(symbol);
+        const auto after = pool.stats();
+        if (after.external_used != before.external_used + bytes ||
+            after.committed != before.committed + bytes ||
+            detail::NativeImageReservation().bytes() != bytes)
+          std::_Exit(2);
+        detail::ReserveNativeImage(symbol);
+        if (pool.stats().committed != after.committed) std::_Exit(3);
+        // Reject a reservation beyond available capacity without changing
+        // ownership of the existing image reservation.
+        bool rejected = false;
+        try {
+          detail::NativeImageReservation().add(pool.capacity());
+        } catch (const std::bad_alloc &) {
+          rejected = true;
+        }
+        if (!rejected || detail::NativeImageReservation().bytes() != bytes ||
+            pool.stats().committed != after.committed)
+          std::_Exit(4);
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+#else
+  GTEST_SKIP() << "Process-isolated tests are not supported on this platform";
+#endif
+}
+#endif
+
 TEST(GlobalResource, ReservesFifteenPercentForRocksDb) {
   constexpr uint64_t kOneHundredMiB = 100ULL * 1024 * 1024;
   constexpr uint64_t kTwoGiB = 2ULL * 1024 * 1024 * 1024;
@@ -297,6 +401,12 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
   EXPECT_EQ(0, GlobalResource::Instance().initialize());
   EXPECT_EQ(reserved, detail::NativeWorkerStackReservation().bytes());
 #endif
+
+  const auto image_reserved = detail::NativeImageReservation().bytes();
+  EXPECT_GE(ailego::MemoryLimitPool::get_instance().external_used(),
+            image_reserved);
+  EXPECT_EQ(0, GlobalResource::Instance().initialize());
+  EXPECT_EQ(image_reserved, detail::NativeImageReservation().bytes());
 
   const auto rocksdb_cache = GlobalResource::Instance().rocksdb_block_cache();
   const auto write_buffer_manager =

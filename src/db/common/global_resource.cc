@@ -20,6 +20,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
+#include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
 #include "db/common/rocksdb_block_cache.h"
 #include "db/common/rocksdb_cache_allocator.h"
@@ -180,6 +181,11 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     }
 
     if (!preserve_existing_pool) {
+      // Locate the image with an anchor in a product translation unit so the
+      // caller's main executable is not charged. Shared-library code, read-only
+      // data, and BSS outlive collection.close; reserve them before publishing.
+      static const char image_anchor = 0;
+      detail::ReserveNativeImage(&image_anchor);
       // Explicit process budgets cover zvec-owned worker stacks before any
       // resource handle is published or collection can populate the cache.
       // A preconfigured standalone/core cache is not a DB process budget.
