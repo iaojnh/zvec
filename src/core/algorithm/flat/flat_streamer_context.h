@@ -132,7 +132,7 @@ class FlatStreamerContext : public IndexStreamer::Context {
       }
 
       key_t key = result_heap_[i].key();
-      if (fetch_vector_) {
+      if (fetch_vector_ && !owner_->use_external_vector()) {
         IndexStorage::MemoryBlock block;
         int ret = owner_->get_vector_by_key(key, block);
         if (ret != 0) throw FlatStreamerEntity::ReadError{ret};
@@ -218,9 +218,18 @@ class FlatStreamerContext : public IndexStreamer::Context {
     group_topk_heaps_.clear();
   }
 
+  void set_vector_source(const VectorSource *source) {
+    vector_source_ = source;
+  }
+
+  const VectorSource *vector_source() const {
+    return vector_source_;
+  }
+
   void reset() override {
     result_heap_.release();
     group_topk_heaps_.clear();
+    vector_source_ = nullptr;
     for (auto &it : results_) {
       it.clear();
       if (it.capacity() > 4096) IndexDocumentList().swap(it);
@@ -232,7 +241,9 @@ class FlatStreamerContext : public IndexStreamer::Context {
 
   //! Reset the context
   void reset(const FlatStreamer<BATCH_SIZE> *owner) {
+    const auto *source = vector_source_;
     this->reset();
+    vector_source_ = source;
     magic_ = owner->magic();
     feature_size_ = owner->meta().element_size();
 
@@ -267,6 +278,7 @@ class FlatStreamerContext : public IndexStreamer::Context {
 
  private:
   const FlatStreamer<BATCH_SIZE> *owner_{nullptr};
+  const VectorSource *vector_source_{nullptr};
   FlatSearchScratch search_scratch_{};
   ailego::BudgetedVector<Stats> stats_vec_{};
   uint32_t magic_{0};

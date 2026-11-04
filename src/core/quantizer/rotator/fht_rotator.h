@@ -15,9 +15,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
-#include <ailego/math/fht.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <memory>
+#include <turbo/preprocessor/fht_rotator/fht_rotator.h>
 #include "rotator.h"
 
 namespace zvec {
@@ -49,10 +49,18 @@ class FhtRotator : public Rotator {
   void load_blob(const char *data) override;
 
  private:
-  ailego::BudgetedVector<uint8_t> flip;
-  size_t flip_offset_{0};  // bytes per round: ceil(dim / 8)
-  size_t trunc_dim{0};
-  float fac{0};
+  void init_context(size_t dim);
+
+  turbo::FhtCtx *context() {
+    return reinterpret_cast<turbo::FhtCtx *>(context_.data());
+  }
+  const turbo::FhtCtx *context() const {
+    return reinterpret_cast<const turbo::FhtCtx *>(context_.data());
+  }
+
+  // Preserve the legacy flip-only payload while using Turbo's kernel context.
+  ailego::BudgetedVector<uint8_t> context_{};
+  turbo::RotatorKernels kernels_{};
 
   static constexpr size_t kByteLen = 8;
 };

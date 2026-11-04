@@ -18,7 +18,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include "preprocessor/preprocessor.h"
+#include <turbo/preprocessor/preprocessor.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 
 namespace zvec {
 namespace turbo {
@@ -109,6 +110,8 @@ class FhtRotator : public Preprocessor {
   RotatorKernels kernels_{};
 
   //! FHT state (flip_offset, trunc_dim, fac, flip[]) -- single allocation.
+  // The reservation is destroyed after the destructor frees the context.
+  ailego::MemoryReservation context_memory_;
   FhtCtx *fht_ctx_{nullptr};
 
   static constexpr size_t kByteLen = 8;

@@ -22,9 +22,9 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
-#include <ailego/algorithm/kmeans.h>
-#include <ailego/math/normalizer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <turbo/algorithm/kmeans.h>
+#include <turbo/norm/normalizer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_threads.h>
 #include "quantizer/common/pq_buffered_training.h"
@@ -210,7 +210,7 @@ void PqInt8Quantizer::train_chunk(const T *data, size_t num, size_t stride,
 
   // Non-spherical L2 KMeans: the PQ codebook must minimize L2 reconstruction
   // error, so centroids are the true (magnitude-preserving) means.
-  ailego::NumericalKmeans<T, SingleQueueIndexThreads> algorithm(k, d);
+  turbo::NumericalKmeans<T, SingleQueueIndexThreads> algorithm(k, d);
 
   // Append sub-vectors (NumericalKmeans handles transpose internally)
   for (size_t i = 0; i < num; ++i) {
@@ -225,8 +225,8 @@ void PqInt8Quantizer::train_chunk(const T *data, size_t num, size_t stride,
   auto local_threads = std::make_shared<SingleQueueIndexThreads>(1, false);
 
   // KMC2 centroid initialization.
-  ailego::Kmc2CentroidsGenerator<
-      ailego::NumericalKmeans<T, SingleQueueIndexThreads>,
+  turbo::Kmc2CentroidsGenerator<
+      turbo::NumericalKmeans<T, SingleQueueIndexThreads>,
       SingleQueueIndexThreads>
       gen;
   gen.set_chain_length(markov_chain_length_);
@@ -1328,8 +1328,9 @@ int PqInt8Quantizer::deserialize(const void *data, size_t len) try {
   int opq_ret = opq_.deserialize(payload.rotate_type, original_dim_, ptr,
                                  static_cast<size_t>(preprocessor_bytes));
   if (opq_ret != 0) return opq_ret;
-  // dist_table_ is intentionally not restored: SDC is only needed during
-  // offline build, not after deserialization (search uses ADC).
+  // ADC search only needs the codebook and a query LUT. Release the SDC table;
+  // prepare_build() restores it before graph construction or inserts into a
+  // reopened writable index.
   std::vector<float>().swap(dist_table_);
   paged_dist_table_.reset();
 
@@ -1382,7 +1383,7 @@ template <typename T>
 void PqInt8Quantizer::normalize(T *data, size_t num) const {
   for (size_t i = 0; i < num; ++i) {
     float norm = 0.0f;
-    ailego::Normalizer<T>::L2(data + i * original_dim_, original_dim_, &norm);
+    turbo::Normalizer<T>::L2(data + i * original_dim_, original_dim_, &norm);
   }
 }
 
@@ -1409,7 +1410,7 @@ void PqInt8Quantizer::compute_and_subtract_center(T *data, size_t num) {
 template <typename T>
 void PqInt8Quantizer::normalize(T *vec, float *norm_out) const {
   float norm = 0.0f;
-  ailego::Normalizer<T>::L2(vec, original_dim_, &norm);
+  turbo::Normalizer<T>::L2(vec, original_dim_, &norm);
   if (norm_out) {
     *norm_out = norm;
   }

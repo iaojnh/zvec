@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <ailego/algorithm/integer_quantizer.h>
-#include <ailego/math/norm2_matrix.h>
-#include <ailego/math/normalizer.h>
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <turbo/norm/norm2_matrix.h>
+#include <turbo/norm/normalizer.h>
+#include <turbo/quantizer/entropy_integer_quantizer/integer_quantizer.h>
 #include <zvec/core/framework/index_factory.h>
 #include "rotator/rotator.h"
 #include "record_quantizer.h"
@@ -514,7 +514,7 @@ class IntegerStreamingReformer : public IndexReformer {
                    float *normalized) const {
     memcpy(normalized, query, qmeta.element_size());
     float norm = 0.0;
-    ailego::Normalizer<float>::L2(normalized, qmeta.dimension(), &norm);
+    turbo::Normalizer<float>::L2(normalized, qmeta.dimension(), &norm);
     return normalized;
   }
 
@@ -559,11 +559,11 @@ class IntegerStreamingReformer : public IndexReformer {
 
 INDEX_FACTORY_REGISTER_REFORMER_ALIAS(
     Int8QuantizerReformer,
-    IntegerQuantizerReformer<ailego::EntropyInt8Quantizer>,
+    IntegerQuantizerReformer<turbo::EntropyInt8Quantizer>,
     IndexMeta::DataType::DT_INT8);
 INDEX_FACTORY_REGISTER_REFORMER_ALIAS(
     Int4QuantizerReformer,
-    IntegerQuantizerReformer<ailego::EntropyInt4Quantizer>,
+    IntegerQuantizerReformer<turbo::EntropyInt4Quantizer>,
     IndexMeta::DataType::DT_INT4);
 INDEX_FACTORY_REGISTER_REFORMER_ALIAS(Int8StreamingReformer,
                                       IntegerStreamingReformer,

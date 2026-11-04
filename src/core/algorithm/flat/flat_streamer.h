@@ -17,6 +17,7 @@
 #include <memory>
 #include <ailego/parallel/lock.h>
 #include <zvec/core/framework/index_streamer.h>
+#include <zvec/core/interface/vector_source.h>
 #include "flat_streamer_entity.h"
 #include "flat_utility.h"
 
@@ -147,6 +148,10 @@ class FlatStreamer : public IndexStreamer {
     return *entity_;
   }
 
+  bool use_external_vector() const {
+    return use_external_vector_;
+  }
+
   //! Retrieve the turbo quantizer
   const std::shared_ptr<zvec::turbo::Quantizer> &quantizer() const {
     return quantizer_;
@@ -213,6 +218,10 @@ class FlatStreamer : public IndexStreamer {
                                const std::vector<uint64_t> *p_keys,
                                const IndexQueryMeta &qmeta, uint32_t count,
                                Context::Pointer &context) const;
+  int search_external(const void *query, const IndexQueryMeta &qmeta,
+                      uint32_t count,
+                      const std::vector<uint64_t> *keys,
+                      Context::Pointer &context) const;
 
   //! Constants
   static constexpr uint32_t kDefaultBlockVecCount = 32u;
@@ -236,6 +245,7 @@ class FlatStreamer : public IndexStreamer {
   bool use_key_info_map_{true};
   uint32_t read_block_size_{0};
   bool use_contiguous_memory_{false};
+  bool use_external_vector_{false};
   std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};
   std::unique_ptr<FlatStreamerEntity> entity_{};
 };

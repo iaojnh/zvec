@@ -15,6 +15,7 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -43,6 +44,7 @@ struct FlatSearchScratch {
   ailego::BudgetedVector<uint64_t> vector_keys{};
   ailego::BudgetedVector<float> distances{};
   ailego::BudgetedVector<uint8_t> query_buffer{};
+  ailego::BudgetedVector<uint8_t> key_presence{};
 };
 
 /*! Flat Streamer Entity
@@ -178,8 +180,48 @@ class FlatStreamerEntity {
   }
 
   void set_use_key_info_map(bool use_id_map) {
-    use_key_info_map_ = use_id_map;
+    use_key_info_map_ = use_id_map || use_external_vector_;
     LOG_DEBUG("use_key_info_map_: %d", (int)use_key_info_map_);
+  }
+
+  void set_use_external_vector(bool enabled) {
+    use_external_vector_ = enabled;
+    // External IDs are compactly persisted and need membership lookup even
+    // when the caller disables the embedded direct-ID map.
+    if (enabled) use_key_info_map_ = true;
+    // Persist the physical layout independently of the logical vector meta.
+    meta_.header.reserved_[0] = enabled ? 1 : 0;
+  }
+
+  // A null keys pointer denotes consecutive IDs starting at first_key.
+  template <typename Allocator>
+  void key_presence(const uint32_t *keys, size_t count, uint32_t first_key,
+                    std::vector<uint8_t, Allocator> *present) const {
+    present->resize(count);
+    ailego::ReadLock lock(*key_info_map_lock_);
+    std::lock_guard<ailego::ReadLock> guard(lock);
+    for (size_t i = 0; i < count; ++i) {
+      const auto key = keys ? keys[i] : first_key + i;
+      (*present)[i] = key_info_map_.find(key) != key_info_map_.end();
+    }
+  }
+
+  size_t registered_key_count() const {
+    ailego::ReadLock lock(*key_info_map_lock_);
+    std::lock_guard<ailego::ReadLock> guard(lock);
+    return external_keys_.size();
+  }
+
+  // Copy a bounded batch so source callbacks never run under the key lock.
+  template <typename Allocator>
+  void get_registered_keys(size_t offset, size_t count,
+                           std::vector<uint64_t, Allocator> *keys) const {
+    ailego::ReadLock lock(*key_info_map_lock_);
+    std::lock_guard<ailego::ReadLock> guard(lock);
+    offset = std::min(offset, external_keys_.size());
+    count = std::min(count, external_keys_.size() - offset);
+    auto begin = external_keys_.begin() + offset;
+    keys->assign(begin, begin + count);
   }
 
   //! Set params
@@ -424,6 +466,10 @@ class FlatStreamerEntity {
                    size_t size);
 
  private:
+  size_t stored_vector_size() const {
+    return use_external_vector_ ? 0 : index_meta_.element_size();
+  }
+
   size_t get_block_offset(uint32_t block_index) const {
     return block_index * linear_block_size();
   }
@@ -440,14 +486,14 @@ class FlatStreamerEntity {
   size_t get_block_key_offset(uint32_t block_index,
                               uint32_t vector_index) const {
     return get_block_offset(block_index) +
-           block_vector_count() * index_meta_.element_size() +
+           block_vector_count() * stored_vector_size() +
            sizeof(uint64_t) * vector_index;
   }
 
   size_t get_block_vector_offset(uint32_t block_index,
                                  uint32_t vector_index) const {
     return this->get_block_offset(block_index) +
-           vector_index * index_meta_.element_size();
+           vector_index * stored_vector_size();
   }
 
   //! Get header block of an linear list
@@ -533,7 +579,10 @@ class FlatStreamerEntity {
   // Distance loops repeatedly read this metadata. Keep it off the cache line
   // written by segment-cache locking in concurrent queries.
   alignas(AILEGO_CACHE_LINE_SIZE) IndexMeta index_meta_{};
+  bool use_external_vector_{false};
   IndexStorage::Pointer storage_{};
+  // Distance callbacks may capture the metric's state (for example MIPS).
+  IndexMetric::Pointer metric_{};
   IndexMetric::MatrixDistance row_distance_{}, column_distance_{};
   IndexMetric::MatrixBatchDistance batch_distance_{};
   std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};
@@ -548,6 +597,10 @@ class FlatStreamerEntity {
                          ailego::RetainedBlockAllocator<
                              std::pair<const uint64_t, VectorLocation>>>;
   KeyMap key_info_map_{};
+  // Only external sources need an ordered directory for bounded random reads.
+  // Mapped backing stays charged until the directory storage is released.
+  std::vector<uint64_t, ailego::RetainedBlockAllocator<uint64_t>> external_keys_{
+      key_info_map_.get_allocator()};
 
   // Reserve both bucket capacity and the node before publishing vector bytes.
   // Failed admission leaves the lookup table unchanged and releases the node.
@@ -555,6 +608,8 @@ class FlatStreamerEntity {
     if (!use_key_info_map_) return {};
     std::unique_lock<ailego::SharedMutex> lock(*key_info_map_lock_);
     if (key_info_map_.find(key) != key_info_map_.end()) return {};
+    if (use_external_vector_ && external_keys_.size() == external_keys_.capacity())
+      external_keys_.reserve(std::max(size_t{8}, external_keys_.size() * 2));
     if (key_info_map_.size() + 1 >
         key_info_map_.bucket_count() * key_info_map_.max_load_factor())
       key_info_map_.reserve(std::max(size_t{8}, key_info_map_.size() * 2));
@@ -569,6 +624,8 @@ class FlatStreamerEntity {
     if (pending) {
       pending.mapped() = loc;
       key_info_map_.insert(std::move(pending));
+      // prepare_key admitted capacity before the persistent write.
+      if (use_external_vector_) external_keys_.push_back(key);
     } else {
       key_info_map_.find(key)->second = loc;
     }

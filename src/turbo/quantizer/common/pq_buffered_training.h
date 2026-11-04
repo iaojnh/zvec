@@ -22,8 +22,8 @@
 #include <limits>
 #include <type_traits>
 #include <vector>
-#include <ailego/algorithm/kmeans.h>
-#include <ailego/math/normalizer.h>
+#include <turbo/algorithm/kmeans.h>
+#include <turbo/norm/normalizer.h>
 #include <zvec/core/framework/index_threads.h>
 #include "core/utility/temporary_buffer_storage.h"
 #include "pq_quantizer/pq_opq.h"
@@ -115,7 +115,7 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
     if (ret != 0) return ret;
     if (options.normalize) {
       float norm = 0.0f;
-      ailego::Normalizer<T>::L2(row.data(), options.dimension, &norm);
+      Normalizer<T>::L2(row.data(), options.dimension, &norm);
       ret = file->write(i * row_bytes, row.data(), row_bytes);
       if (ret != 0) return ret;
     }
@@ -174,7 +174,7 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
       const size_t width = chunk_dim(m);
       const size_t offset = offsets[m] * num * sizeof(T);
       const size_t bytes = num * width * sizeof(T);
-      ailego::NumericalKmeans<T, core::SingleQueueIndexThreads> algorithm(
+      NumericalKmeans<T, core::SingleQueueIndexThreads> algorithm(
           options.centroid_count, width);
       algorithm.set_feature_matrix_storage(std::make_shared<PqMatrixSlice>(
           file, 2 * samples_bytes + offset, bytes));
@@ -192,8 +192,8 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
         if (algorithm.matrix_status() != 0) return algorithm.matrix_status();
       }
       core::SingleQueueIndexThreads local_threads(1, false);
-      ailego::Kmc2CentroidsGenerator<decltype(algorithm),
-                                     core::SingleQueueIndexThreads>
+      Kmc2CentroidsGenerator<decltype(algorithm),
+                             core::SingleQueueIndexThreads>
           gen;
       gen.set_chain_length(options.chain_length);
       gen.set_assumption_free(false);

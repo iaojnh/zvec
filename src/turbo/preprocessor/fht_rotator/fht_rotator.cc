@@ -51,6 +51,11 @@ FhtRotator::Pointer FhtRotator::create(int dim) {
   const size_t flip_size = 4 * r->flip_offset_;
 
   // Single allocation: FhtCtx header + trailing flip data.
+  try {
+    r->context_memory_.add(sizeof(FhtCtx) + flip_size);
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
   r->fht_ctx_ = static_cast<FhtCtx *>(std::malloc(sizeof(FhtCtx) + flip_size));
   if (r->fht_ctx_ == nullptr) {
     // Allocation failed: bail out before dereferencing. Returning nullptr lets
@@ -197,6 +202,12 @@ int FhtRotator::deserialize(const void *data, size_t len) {
   const size_t trunc_dim = floor_pow2(static_cast<size_t>(new_in_dim));
   const float fac = 1.0f / std::sqrt(static_cast<float>(trunc_dim));
 
+  ailego::MemoryReservation new_memory;
+  try {
+    new_memory.add(sizeof(FhtCtx) + expected_flip_size);
+  } catch (const std::bad_alloc &) {
+    return kErrRuntime;
+  }
   FhtCtx *new_ctx =
       static_cast<FhtCtx *>(std::malloc(sizeof(FhtCtx) + expected_flip_size));
   if (new_ctx == nullptr) return kErrRuntime;
@@ -210,6 +221,7 @@ int FhtRotator::deserialize(const void *data, size_t len) {
   // All allocations succeeded: commit new state and free the old context.
   std::free(fht_ctx_);
   fht_ctx_ = new_ctx;
+  context_memory_.swap(new_memory);
   in_dim_ = new_in_dim;
   out_dim_ = new_out_dim;
   flip_offset_ = new_flip_offset;

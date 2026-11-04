@@ -14,8 +14,8 @@
 
 #pragma once
 
-#include <ailego/math/inner_product_matrix.h>
 #include <ailego/pattern/scope_guard.h>
+#include <utility/sparse_utility.h>
 #include "flat_sparse_context.h"
 
 namespace zvec {

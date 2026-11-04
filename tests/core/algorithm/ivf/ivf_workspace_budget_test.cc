@@ -5,8 +5,8 @@
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
-#include "ailego/algorithm/integer_quantizer.h"
-#include "ailego/algorithm/kmeans.h"
+#include "turbo/quantizer/entropy_integer_quantizer/integer_quantizer.h"
+#include "turbo/algorithm/kmeans.h"
 #include "ailego/container/vector_array.h"
 #include "ailego/pattern/defer.h"
 #include "algorithm/ivf/ivf_dumper.h"
@@ -14,6 +14,7 @@
 #include "algorithm/ivf/ivf_searcher_context.h"
 #include "algorithm/ivf_rabitq/ivf_rabitq_context.h"
 #include "quantizer/rotator/rotator.h"
+#include "turbo/preprocessor/fht_rotator/fht_rotator.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
@@ -79,6 +80,31 @@ TEST_F(IVFWorkspaceBudgetTest, FhtMasksAreAdmittedAndReleasedWithRotator) {
   EXPECT_EQ(0u, pool.external_used());
 }
 
+TEST_F(IVFWorkspaceBudgetTest, TurboFhtContextRetainsChargeAndRejectsReplacement) {
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    EXPECT_EQ(nullptr, turbo::FhtRotator::create(4096));
+  }
+  auto rotator = turbo::FhtRotator::create(4096);
+  ASSERT_NE(nullptr, rotator);
+  const size_t charged = pool.external_used();
+  EXPECT_GE(charged, sizeof(turbo::FhtCtx) + 2048);
+  std::string original;
+  ASSERT_EQ(0, rotator->serialize(&original));
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    EXPECT_NE(0, rotator->deserialize(original.data(), original.size()));
+    std::string retained;
+    ASSERT_EQ(0, rotator->serialize(&retained));
+    EXPECT_EQ(original, retained);
+  }
+  EXPECT_EQ(charged, pool.external_used());
+  rotator.reset();
+  EXPECT_EQ(0u, pool.external_used());
+}
+
 TEST_F(IVFWorkspaceBudgetTest, TrainingAndMetadataRejectBeforeAllocation) {
   ailego::NumericalVectorArray<float> centers(1536);
   IndexMeta meta(IndexMeta::DT_FP32, 32);
@@ -93,7 +119,7 @@ TEST_F(IVFWorkspaceBudgetTest, TrainingAndMetadataRejectBeforeAllocation) {
 }
 
 TEST_F(IVFWorkspaceBudgetTest, WorkerBudgetRejectionDoesNotEscapeThread) {
-  using Algorithm = ailego::NumericalKmeans<float, IndexThreads>;
+  using Algorithm = turbo::NumericalKmeans<float, IndexThreads>;
   class WorkerProbe : public Algorithm {
    public:
     WorkerProbe() : Algorithm(1, 1536) {}
@@ -133,7 +159,7 @@ TEST_F(IVFWorkspaceBudgetTest, BlockTransposeChargesOldAndNewBuffers) {
 }
 
 TEST_F(IVFWorkspaceBudgetTest, HistogramIsChargedAndReleasedAfterTraining) {
-  class Quantizer : public ailego::EntropyInt8Quantizer {
+  class Quantizer : public turbo::EntropyInt8Quantizer {
    public:
     size_t capacity() const {
       return histogram_.capacity();

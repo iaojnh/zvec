@@ -148,13 +148,14 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
 
   key_info_map_lock_ = std::make_shared<ailego::SharedMutex>();
   key_info_map_.clear();
+  external_keys_.clear();
   segment_first_id_.clear();
 
   vec_unit_size_ = IndexMeta::AlignSizeof(index_meta_.data_type());
   vec_cols_ = index_meta_.element_size() / vec_unit_size_;
   meta_.header.block_size =
       ailego_align(sizeof(BlockHeader) + sizeof(DeletionMap) +
-                       (index_meta_.element_size() + sizeof(uint64_t)) *
+                       (stored_vector_size() + sizeof(uint64_t)) *
                            meta_.header.block_vector_count,
                    32);
 
@@ -201,6 +202,7 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
                 index_meta_.element_size(), extra_values_size_);
       return IndexError_InvalidArgument;
     }
+    metric_ = std::move(metric);
   }
 
   LOG_DEBUG("Open storage %s done, metric=%s", storage_->name().c_str(),
@@ -213,6 +215,7 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
   segments_.clear();
   segment_first_id_.clear();
   key_info_map_.clear();
+  external_keys_.clear();
   storage_.reset();
   return IndexError_NoMemory;
 }
@@ -222,6 +225,7 @@ int FlatStreamerEntity::close() {
   storage_.reset();
   key_info_map_lock_.reset();
   key_info_map_.clear();
+  external_keys_.clear();
   segment_first_id_.clear();
   meta_.create_time = 0;
   meta_.update_time = 0;
@@ -230,7 +234,11 @@ int FlatStreamerEntity::close() {
   meta_.header.block_count = 0;
   meta_.header.block_size = 0;
   meta_.header.linear_body_size = 0;
+  row_distance_ = nullptr;
+  column_distance_ = nullptr;
+  batch_distance_ = nullptr;
   batch_query_preprocess_ = nullptr;
+  metric_.reset();
   extra_values_size_ = 0;
   meta_dirty_ = false;
 
@@ -359,6 +367,7 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
                                IndexContext::Stats *context_stats,
                                FlatSearchScratch *scratch,
                                size_t /*batch_size*/) const {
+  if (use_external_vector_) return IndexError_Unsupported;
   FlatSearchScratch local_scratch;
   if (!scratch) scratch = &local_scratch;
   scratch->distances.resize(block_vector_count());
@@ -413,6 +422,7 @@ int FlatStreamerEntity::search_by_p_keys(const void *query,
                                          IndexCandidateHeap *heap,
                                          FlatSearchScratch * /*scratch*/,
                                          size_t /*batch_size*/) const {
+  if (use_external_vector_) return IndexError_Unsupported;
   for (uint64_t key : p_keys) {
     if (filter.is_valid() && filter(key)) {
       continue;
@@ -530,6 +540,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone_impl(
     if (propagate_oom) throw std::bad_alloc();
     return nullptr;
   }
+  entity->use_external_vector_ = this->use_external_vector_;
   entity->index_meta_ = this->index_meta_;
   entity->storage_ = this->storage_;
   // entity->reformer_ = this->reformer_;
@@ -540,6 +551,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone_impl(
   if (copy_key_map) {
     std::shared_lock<ailego::SharedMutex> lock(*key_info_map_lock_);
     entity->key_info_map_ = this->key_info_map_;
+    entity->external_keys_ = this->external_keys_;
   }
   entity->segment_first_id_ = std::move(first_ids);
   entity->use_key_info_map_ = this->use_key_info_map_;
@@ -835,6 +847,7 @@ const void *FlatContiguousStreamerEntity::get_vector_ptr(
 }
 
 const void *FlatStreamerEntity::get_vector_by_key(uint64_t key) const {
+  if (use_external_vector_) return nullptr;
   // Keep the legacy pointer valid until the next call on this thread.
   static thread_local LegacyReadBuffer buffer;
   IndexStorage::MemoryBlock block;
@@ -846,6 +859,7 @@ const void *FlatStreamerEntity::get_vector_by_key(uint64_t key) const {
 int FlatStreamerEntity::get_vector_by_key(
     const uint64_t key, IndexStorage::MemoryBlock &block) const {
   block.reset();
+  if (use_external_vector_) return IndexError_Unsupported;
   VectorLocation loc{};
   key_info_map_lock_->lock_shared();
   if (use_key_info_map_) {
@@ -891,6 +905,7 @@ template <typename Blocks>
 int FlatStreamerEntity::get_vectors_by_key_impl(const uint64_t *keys,
                                                 uint32_t count,
                                                 Blocks &blocks) const try {
+  if (use_external_vector_) return IndexError_Unsupported;
   ailego::BudgetedVector<VectorLocation> locations(count);
   key_info_map_lock_->lock_shared();
   if (use_key_info_map_) {
@@ -960,6 +975,8 @@ int FlatStreamerEntity::retain_stable_data(
 }
 
 IndexProvider::Iterator::Pointer FlatStreamerEntity::creater_iterator() const {
+  // An external scan requires a request-bound source.
+  if (use_external_vector_) return nullptr;
   // Iteration reads persisted blocks, never the per-key lookup tables.
   // Iteration callers preserve bad_alloc as NoMemory. Returning nullptr here
   // would turn a retryable budget refusal into an opaque runtime failure.
@@ -1154,6 +1171,10 @@ int FlatStreamerEntity::load_linear_meta(IndexStorage::Pointer storage) {
     return IndexError_InvalidFormat;
   }
   auto *mt = reinterpret_cast<const decltype(meta_) *>(data_block.data());
+  if (mt->header.reserved_[0] != meta_.header.reserved_[0]) {
+    LOG_ERROR("Unmatched Flat external-vector storage mode");
+    return IndexError_Mismatch;
+  }
   if (mt->header.block_vector_count != meta_.header.block_vector_count) {
     LOG_ERROR("Unmatched BlockVecCount Setting, Index %u vs Setting %u",
               mt->header.block_vector_count, meta_.header.block_vector_count);
@@ -1237,6 +1258,9 @@ int FlatStreamerEntity::load_segment_keys_to_map(BlockLocation block) {
       }
       size_t vector_off =
           this->get_block_vector_offset(block.block_index, vector_index);
+      if (use_external_vector_ &&
+          key_info_map_.find(keys[vector_index]) == key_info_map_.end())
+        external_keys_.push_back(keys[vector_index]);
       key_info_map_[keys[vector_index]] =
           VectorLocation(block.segment_id, false, vector_off);
     }
@@ -1505,7 +1529,11 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
   const IndexStorage::SegmentData writes[] = {{vector_off, size, data},
                                               {key_off, sizeof(key), &key},
                                               {hd_off, sizeof(hd), &hd}};
-  if (!segment->write_batch(writes, 3)) return IndexError_WriteData;
+  // External vectors belong to the source. Persist only IDs and the header;
+  // internal vectors keep the atomic batched write including their payload.
+  if (!segment->write_batch(writes + (use_external_vector_ ? 1 : 0),
+                             use_external_vector_ ? 2 : 3))
+    return IndexError_WriteData;
 
   VectorLocation loc(block.segment_id, false, vector_off);
   publish_key(key, loc, std::move(pending_key));
@@ -1516,6 +1544,11 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
 
 int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
                                            const uint32_t size) try {
+  if (use_external_vector_) {
+    // Keep sparse external IDs compact. Updates belong to the source.
+    int ret = add(id, query, size);
+    return ret == IndexError_Duplicate ? 0 : ret;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (size != static_cast<size_t>(index_meta_.element_size())) {
