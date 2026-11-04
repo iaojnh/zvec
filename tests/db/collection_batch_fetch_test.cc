@@ -474,7 +474,7 @@ TEST_F(CollectionBatchFetchPressureTest, BatchesDecodeOnceUnderCachePressure) {
   EXPECT_GT(single_allocations, batch_allocations * 4);
 }
 
-TEST_F(CollectionBatchFetchPressureTest, FullPoolDoesNotReturnPartialDocs) {
+TEST_F(CollectionBatchFetchPressureTest, FullPoolReportsExhaustionAndRecovers) {
   CollectionSchema schema("batch_fetch_failure");
   ASSERT_TRUE(
       schema.add_field(std::make_shared<FieldSchema>("value", DataType::INT64))
@@ -505,13 +505,11 @@ TEST_F(CollectionBatchFetchPressureTest, FullPoolDoesNotReturnPartialDocs) {
     ScopedPoolReservation reservation;
     ASSERT_TRUE(reservation.reserve(pool.available()));
     auto single = collection_->fetch({"0"}, std::nullopt, false);
-    ASSERT_TRUE(single.has_value());
-    ASSERT_EQ(nullptr, single->at("0"));
+    ASSERT_FALSE(single.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, single.error().code());
     auto batch = collection_->fetch({"0", "1"}, std::nullopt, false);
-    ASSERT_TRUE(batch.has_value());
-    ASSERT_EQ(2U, batch->size());
-    EXPECT_EQ(nullptr, batch->at("0"));
-    EXPECT_EQ(nullptr, batch->at("1"));
+    ASSERT_FALSE(batch.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, batch.error().code());
     auto columns = internal::fetch_result_snapshot(
         *collection_, {"0", "1"}, std::nullopt, false, nullptr, true);
     EXPECT_FALSE(columns.has_value());

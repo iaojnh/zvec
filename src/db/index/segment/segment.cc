@@ -3136,6 +3136,10 @@ TablePtr SegmentImpl::fetch_unsafe(const std::vector<std::string> &columns,
                                    arrow::MemoryPool *memory_pool) const {
   auto result = fetch_checked(columns, segment_doc_ids, strict, memory_pool);
   if (!result.ok()) {
+    // A global allocation failure is not a missing document. Per-batch
+    // workspaces retain the nullable path so fetch_docs can shrink its batch.
+    if (memory_pool == nullptr && result.status().IsOutOfMemory())
+      throw std::bad_alloc();
     LOG_ERROR("Segment forward fetch failed: %s",
               result.status().ToString().c_str());
     return nullptr;

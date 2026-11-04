@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/cache.h>
+#include "db/common/rocksdb_block_cache.h"
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -92,6 +93,100 @@ void DeleteCachedBlock(void *value, rocksdb::MemoryAllocator *allocator) {
 
 const rocksdb::Cache::CacheItemHelper kMappedCacheBlockHelper{
     rocksdb::CacheEntryRole::kMisc, DeleteCachedBlock};
+
+void DeleteChargeTestValue(void *, rocksdb::MemoryAllocator *) {}
+
+const rocksdb::Cache::CacheItemHelper kFilterChargeHelper{
+    rocksdb::CacheEntryRole::kFilterBlock, DeleteChargeTestValue};
+const rocksdb::Cache::CacheItemHelper kDataChargeHelper{
+    rocksdb::CacheEntryRole::kDataBlock, DeleteChargeTestValue};
+
+std::shared_ptr<RocksdbBlockCache> CreateChargeTestCache(size_t capacity) {
+  return std::make_shared<RocksdbBlockCache>(
+      rocksdb::NewLRUCache(capacity, 0, true, 0.5, nullptr, false,
+                           rocksdb::kDontChargeCacheMetadata));
+}
+
+TEST(RocksdbBlockCacheTest, ChargesOnlyFilterMetadata) {
+  auto cache = CreateChargeTestCache(4096);
+  int value = 0;
+  rocksdb::Cache::Handle *filter = nullptr;
+  rocksdb::Cache::Handle *data = nullptr;
+  ASSERT_TRUE(
+      cache->Insert("filter", &value, &kFilterChargeHelper, 64, &filter).ok());
+  ASSERT_TRUE(
+      cache->Insert("data", &value, &kDataChargeHelper, 64, &data).ok());
+  EXPECT_EQ(64u + RocksdbBlockCache::kFilterMetadataCharge,
+            cache->GetCharge(filter));
+  EXPECT_EQ(64u, cache->GetCharge(data));
+  EXPECT_EQ(128u + RocksdbBlockCache::kFilterMetadataCharge, cache->GetUsage());
+  cache->Release(filter);
+  cache->Release(data);
+}
+
+TEST(RocksdbBlockCacheTest, ErasedPinnedFilterKeepsChargeUntilFinalRelease) {
+  auto cache = CreateChargeTestCache(4096);
+  int value = 0;
+  rocksdb::Cache::Handle *handle = nullptr;
+  ASSERT_TRUE(
+      cache->Insert("filter", &value, &kFilterChargeHelper, 64, &handle).ok());
+  const size_t charge = cache->GetUsage();
+  ASSERT_TRUE(cache->Ref(handle));
+  cache->Erase("filter");
+  EXPECT_EQ(charge, cache->GetUsage());
+  EXPECT_FALSE(cache->Release(handle));
+  EXPECT_EQ(charge, cache->GetUsage());
+  EXPECT_TRUE(cache->Release(handle));
+  EXPECT_EQ(0u, cache->GetUsage());
+}
+
+TEST(RocksdbBlockCacheTest, RejectsFilterWhenOnlyMetadataExceedsCapacity) {
+  auto cache = CreateChargeTestCache(RocksdbBlockCache::kFilterMetadataCharge);
+  int value = 0;
+  rocksdb::Cache::Handle *handle = nullptr;
+  const auto status =
+      cache->Insert("filter", &value, &kFilterChargeHelper, 1, &handle);
+  EXPECT_TRUE(status.IsMemoryLimit());
+  EXPECT_EQ(nullptr, handle);
+  EXPECT_EQ(0u, cache->GetUsage());
+  ASSERT_TRUE(
+      cache->Insert("data", &value, &kDataChargeHelper, 1, &handle).ok());
+  cache->Release(handle);
+}
+
+TEST(RocksdbBlockCacheTest, StandaloneFilterCannotEscapeCharge) {
+  auto cache = CreateChargeTestCache(4096);
+  int value = 0;
+  auto *handle =
+      cache->CreateStandalone("filter", &value, &kFilterChargeHelper, 64, true);
+  ASSERT_NE(nullptr, handle);
+  EXPECT_EQ(64u + RocksdbBlockCache::kFilterMetadataCharge, cache->GetUsage());
+  EXPECT_TRUE(cache->Release(handle));
+  EXPECT_EQ(0u, cache->GetUsage());
+  cache->SetCapacity(1);
+  EXPECT_EQ(nullptr, cache->CreateStandalone("rejected", &value,
+                                             &kFilterChargeHelper, 1, true));
+  EXPECT_EQ(0u, cache->GetUsage());
+}
+
+TEST(RocksdbBlockCacheTest, RejectsOverflowAndPreservesMappedAllocatorHook) {
+  auto allocator = std::make_shared<RocksdbCacheAllocator>();
+  auto cache = std::make_shared<RocksdbBlockCache>(
+      rocksdb::NewLRUCache(4096, 0, true, 0.5, allocator));
+  EXPECT_EQ(allocator.get(), cache->memory_allocator());
+  EXPECT_TRUE(cache->HasStrictCapacityLimit());
+  int value = 0;
+  rocksdb::Cache::Handle *handle = nullptr;
+  EXPECT_TRUE(cache
+                  ->Insert("overflow", &value, &kFilterChargeHelper,
+                           std::numeric_limits<size_t>::max(), &handle)
+                  .IsMemoryLimit());
+  EXPECT_EQ(nullptr, handle);
+  EXPECT_EQ(nullptr,
+            cache->CreateStandalone("overflow", &value, &kFilterChargeHelper,
+                                    std::numeric_limits<size_t>::max(), true));
+  EXPECT_EQ(0u, cache->GetUsage());
+}
 
 TEST(RocksdbCacheAllocatorTest,
      StrictCacheChargesMappedSizeAndReleasesOnErase) {

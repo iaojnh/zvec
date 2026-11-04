@@ -42,6 +42,8 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
   IndexStorage::Pointer vector_storage;
   IndexStorage::Pointer graph_storage;
   IndexStorage::Segment::Pointer vectors;
+  size_t vector_stride{0};
+  size_t vector_prefix{0};
   IndexStorage::Segment::Pointer graph;
   IndexStorage::Segment::Pointer keys;
   mutable ailego::File codes;
@@ -78,6 +80,8 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
     if (vector_storage) vector_storage->close();
     vector_storage.reset();
     vectors_sealed = false;
+    vector_stride = 0;
+    vector_prefix = 0;
     if (!vector_path.empty()) ailego::File::Delete(vector_path);
   }
 
@@ -255,10 +259,28 @@ int DiskAnnBuilderEntity::reserve_space(uint32_t docs,
         return *segment ? 0 : IndexError_Runtime;
       };
       auto &state = *buffered_state_;
+      const size_t page = ailego::kVectorPageSize;
+      const size_t vector_size = meta_.element_size();
+      // A near-page-sized vector otherwise straddles two pages on most reads.
+      // Pad only these temporary rows: each vector then fits in one cache page,
+      // with at most one-third extra scratch space. Small/multi-page vectors
+      // and the final index format stay unchanged.
+      const bool aligned = vector_size >= page - page / 4 && vector_size < page;
+      const size_t stride = aligned ? page : vector_size;
+      const size_t prefix_room = aligned ? page - 1 : 0;
+      if (count > (std::numeric_limits<size_t>::max() - prefix_room) / stride) {
+        return IndexError_InvalidArgument;
+      }
+      state.vector_stride = stride;
+      state.vector_prefix = 0;
       int ret = state.ensure_directory();
       if (ret == 0) {
-        ret = open(state.vector_path, meta_.element_size() * count,
+        ret = open(state.vector_path, stride * count + prefix_room,
                    &state.vector_storage, &state.vectors);
+        if (ret == 0 && aligned) {
+          state.vector_prefix =
+              (page - state.vectors->data_offset() % page) % page;
+        }
       }
       if (ret == 0) {
         ret =
@@ -304,8 +326,9 @@ int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) try {
     }
     const size_t vector_size = meta_.element_size();
     const uint32_t neighbor_count = 0;
-    if (state.vectors->write(doc_cnt() * vector_size, vec, vector_size) !=
-            vector_size ||
+    if (state.vectors->write(
+            state.vector_prefix + doc_cnt() * state.vector_stride, vec,
+            vector_size) != vector_size ||
         state.graph->write(doc_cnt() * neighbor_size_, &neighbor_count,
                            sizeof(neighbor_count)) != sizeof(neighbor_count)) {
       return IndexError_WriteData;
@@ -348,8 +371,10 @@ int DiskAnnBuilderEntity::read_vector(diskann_id_t id,
   const auto &segment = buffered_state_->vectors;
   const size_t size = meta_.element_size();
   if (!segment ||
-      segment->read_immutable(static_cast<size_t>(id) * size, block, size) !=
-          size ||
+      segment->read_immutable(
+          buffered_state_->vector_prefix +
+              static_cast<size_t>(id) * buffered_state_->vector_stride,
+          block, size) != size ||
       !block.data()) {
     block.reset();
     return IndexError_ReadData;
@@ -377,8 +402,11 @@ int DiskAnnBuilderEntity::read_vectors(const diskann_id_t *ids,
   std::array<IndexStorage::Segment::BorrowedRead, kVectorReadBatchSize> reads;
   const size_t size = meta_.element_size();
   for (size_t i = 0; i < count; ++i) {
-    reads[i] = {segment.get(), static_cast<size_t>(ids[i]) * size, size,
-                &blocks[i]};
+    reads[i] = {
+        segment.get(),
+        buffered_state_->vector_prefix +
+            static_cast<size_t>(ids[i]) * buffered_state_->vector_stride,
+        size, &blocks[i]};
   }
   if (!segment->read_borrowed_batch_immutable(reads.data(), count)) {
     for (size_t i = 0; i < count; ++i) blocks[i].reset();

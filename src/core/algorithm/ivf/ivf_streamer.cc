@@ -165,6 +165,15 @@ int IVFStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
   return search_bf(query, qmeta, count, context, nullptr);
 }
 
+int IVFStreamer::search_bf_by_keys_impl(const void *query,
+                                        const std::vector<uint64_t> &keys,
+                                        const IndexQueryMeta &qmeta,
+                                        Context::Pointer &context) const {
+  // The generic IndexRunner adapter copies keys into a batch. This search is
+  // synchronous, so borrow the caller-owned list through the complete scan.
+  return search_bf(query, qmeta, 1, context, nullptr, &keys);
+}
+
 int IVFStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
@@ -176,10 +185,10 @@ int IVFStreamer::search_bf_by_p_keys_impl(
   return search_bf(query, qmeta, count, context, &p_keys);
 }
 
-int IVFStreamer::search_bf(
-    const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context,
-    const std::vector<std::vector<uint64_t>> *p_keys) const try {
+int IVFStreamer::search_bf(const void *query, const IndexQueryMeta &qmeta,
+                           uint32_t count, Context::Pointer &context,
+                           const std::vector<std::vector<uint64_t>> *p_keys,
+                           const std::vector<uint64_t> *single_keys) const try {
   bool completed = false;
   AILEGO_DEFER([&] {
     if (!completed && context) context->reset();
@@ -220,9 +229,10 @@ int IVFStreamer::search_bf(
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
-    if (p_keys) {
-      ret = entity->search_by_p_keys(query, (*p_keys)[q], filter, &heap,
-                                     &context_stats);
+    const auto *keys = single_keys ? single_keys : p_keys ? &(*p_keys)[q] : nullptr;
+    if (keys) {
+      ret =
+          entity->search_by_p_keys(query, *keys, filter, &heap, &context_stats);
     } else if (!filter.is_valid()) {
       ret = entity->search(query, &heap, &context_stats);
     } else {
@@ -231,7 +241,7 @@ int IVFStreamer::search_bf(
     ivf_check_with_msg(ret, "Failed to search in entity for %s",
                        IndexError::What(ret));
     heap.sort();  // sort the results
-    if (!p_keys && !filter.is_valid()) {
+    if (!keys && !filter.is_valid()) {
       // mapping the local id to key if query without filter
       ret = entity->retrieve_keys(&heap);
       ivf_check_error_code(ret);

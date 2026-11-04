@@ -365,6 +365,7 @@ Result<IndexResults::Ptr> CombinedVectorColumnIndexer::search(
     // subsequent synchronous handoff. Preserve the caller's key order.
     ailego::MemoryReservation keys_memory;
     std::vector<uint64_t> block_keys;
+    const std::vector<uint64_t> *block_keys_view = nullptr;
     if (keys) {
       const uint64_t begin = block_offsets_[i];
       const uint64_t end = begin + blocks_[i].doc_count_;
@@ -373,10 +374,17 @@ Result<IndexResults::Ptr> CombinedVectorColumnIndexer::search(
       };
       const size_t n = std::count_if(keys->begin(), keys->end(), belongs);
       if (!n) continue;
-      keys_memory.add_array(n, sizeof(uint64_t));
-      block_keys.reserve(n);
-      for (uint64_t key : *keys)
-        if (belongs(key)) block_keys.push_back(key - begin);
+      if (begin == 0 && n == keys->size()) {
+        // No filtering or ID translation is needed. The caller keeps this
+        // already-budgeted list alive through the synchronous block search.
+        block_keys_view = keys;
+      } else {
+        keys_memory.add_array(n, sizeof(uint64_t));
+        block_keys.reserve(n);
+        for (uint64_t key : *keys)
+          if (belongs(key)) block_keys.push_back(key - begin);
+        block_keys_view = &block_keys;
+      }
     }
     zvec::Result<zvec::IndexResults::Ptr> result{nullptr};
     float scale_factor{};
@@ -432,7 +440,7 @@ Result<IndexResults::Ptr> CombinedVectorColumnIndexer::search(
                     : nullptr,
         query_params.extra_params};
 
-    if (keys) modified_query_params.bf_pks_view = &block_keys;
+    if (keys) modified_query_params.bf_pks_view = block_keys_view;
 
     result = indexers_[i]->search(vector_data, modified_query_params);
     if (!result) {

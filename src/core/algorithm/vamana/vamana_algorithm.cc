@@ -736,11 +736,22 @@ void VamanaAlgorithm<EntityType>::robust_prune(node_id_t id,
   // Pre-cache all candidate vectors at once
   auto &vec_cache = ctx->prune_vec_cache();
   vec_cache.resize(n);
+  ailego::MemoryReservation vector_blocks_memory;
+  vector_blocks_memory.add_array(n, sizeof(IndexStorage::MemoryBlock));
   std::vector<IndexStorage::MemoryBlock> vector_blocks(n);
-  for (size_t i = 0; i < n; ++i) {
-    CheckGraphStorage(
-        entity_.get_vector(candidates[i].first, vector_blocks[i]));
-    vec_cache[i] = vector_blocks[i].data();
+  if constexpr (std::is_same_v<EntityType, VamanaBufferPoolStreamerEntity>) {
+    auto &ids = ctx->search_neighbor_ids_buf();
+    ids.resize(n);
+    for (size_t i = 0; i < n; ++i) ids[i] = candidates[i].first;
+    CheckGraphStorage(entity_.get_vector_typed(
+        ids.data(), static_cast<uint32_t>(n), vector_blocks));
+    for (size_t i = 0; i < n; ++i) vec_cache[i] = vector_blocks[i].data();
+  } else {
+    for (size_t i = 0; i < n; ++i) {
+      CheckGraphStorage(
+          entity_.get_vector(candidates[i].first, vector_blocks[i]));
+      vec_cache[i] = vector_blocks[i].data();
+    }
   }
 
   // occlude_factor: tracks the maximum occlusion ratio for each candidate

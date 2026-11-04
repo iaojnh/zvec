@@ -208,6 +208,95 @@ static void CheckKeyedBruteForce(
                                                context));
 }
 
+// A single borrowed query must not use IndexRunner's copying batch adapter.
+template <typename Parent>
+class RejectKeyBatchAdapter : public Parent {
+ public:
+  using Parent::search_bf_by_p_keys_impl;
+  int search_bf_by_p_keys_impl(const void *,
+                               const std::vector<std::vector<uint64_t>> &,
+                               const IndexQueryMeta &, uint32_t,
+                               IndexRunner::Context::Pointer &) const override {
+    return IndexError_NotImplemented;
+  }
+};
+
+static void CheckBorrowedSingleKeys(IndexRunner *searcher, const void *query,
+                                    const IndexQueryMeta &meta) {
+  auto context = searcher->create_context();
+  auto baseline = searcher->create_context();
+  ASSERT_NE(nullptr, context);
+  ASSERT_NE(nullptr, baseline);
+  context->set_topk(4);
+  baseline->set_topk(4);
+  std::vector<uint64_t> keys{102, 107, 108, kInvalidKey};
+  for (uint64_t i = keys.size(); i < 25000; ++i) keys.push_back(100000 + i);
+  const auto *original = keys.data();
+  for (bool filtered : {false, true}) {
+    context->set_filter(
+        [filtered](uint64_t key) { return filtered && key % 2 == 0; });
+    ASSERT_EQ(0, searcher->search_bf_by_keys_impl(query, keys, meta, context));
+    EXPECT_EQ(original, keys.data());
+    baseline->set_filter([&](uint64_t key) {
+      return (filtered && key % 2 == 0) ||
+             std::find(keys.begin(), keys.end(), key) == keys.end();
+    });
+    ASSERT_EQ(0, searcher->search_bf_impl(query, meta, baseline));
+    const auto &expected = baseline->result();
+    const auto &actual = context->result();
+    ASSERT_EQ(expected.size(), actual.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(expected[i].key(), actual[i].key());
+      EXPECT_FLOAT_EQ(expected[i].score(), actual[i].score());
+    }
+  }
+  const std::vector<uint64_t> empty;
+  ASSERT_EQ(0, searcher->search_bf_by_keys_impl(query, empty, meta, context));
+  EXPECT_TRUE(context->result().empty());
+  EXPECT_EQ(IndexError_InvalidArgument,
+            searcher->search_bf_by_keys_impl(nullptr, keys, meta, context));
+  IndexQueryMeta wrong(meta.data_type(), meta.dimension() + 1);
+  EXPECT_EQ(IndexError_InvalidArgument,
+            searcher->search_bf_by_keys_impl(query, keys, wrong, context));
+  IndexRunner::Context::Pointer missing;
+  EXPECT_EQ(IndexError_InvalidArgument,
+            searcher->search_bf_by_keys_impl(query, keys, meta, missing));
+}
+
+TEST_F(IVFSearcherTest, BorrowedSingleKeysDoNotUseCopyingBatchAdapter) {
+  threads_ = std::make_shared<SingleQueueIndexThreads>();
+  IVFBuilder builder;
+  ASSERT_EQ(0, builder.init(index_meta_, params_));
+  prepare_index_holder(100, 64);
+  ASSERT_EQ(0, builder.train(threads_, holder_));
+  ASSERT_EQ(0, builder.build(threads_, holder_));
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, dumper);
+  ASSERT_EQ(0, dumper->create(index_path_));
+  ASSERT_EQ(0, builder.dump(dumper));
+  ASSERT_EQ(0, dumper->close());
+  const std::vector<float> query(dimension_, 7.0f);
+  const IndexQueryMeta meta(IndexMeta::DT_FP32, dimension_);
+  for (const char *name :
+       {"FileReadStorage", "MMapFileReadStorage", "BufferReadStorage"}) {
+    SCOPED_TRACE(name);
+    auto storage = IndexFactory::CreateStorage(name);
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open(index_path_, false));
+    RejectKeyBatchAdapter<IVFSearcher> searcher;
+    ASSERT_EQ(0, searcher.init(Params()));
+    ASSERT_EQ(0, searcher.load(storage, IndexMetric::Pointer()));
+    CheckBorrowedSingleKeys(&searcher, query.data(), meta);
+    ASSERT_EQ(0, searcher.unload());
+    RejectKeyBatchAdapter<IVFStreamer> streamer;
+    ASSERT_EQ(0, streamer.init(index_meta_, Params()));
+    ASSERT_EQ(0, streamer.open(storage));
+    CheckBorrowedSingleKeys(&streamer, query.data(), meta);
+    ASSERT_EQ(0, streamer.close());
+  }
+}
+
 void IVFSearcherTest::SetUp() {
   dimension_ = 8U;
 

@@ -163,6 +163,13 @@ int IVFSearcher::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
   return search_batch(query, qmeta, count, context, true);
 }
 
+int IVFSearcher::search_bf_by_keys_impl(const void *query,
+                                        const std::vector<uint64_t> &keys,
+                                        const IndexQueryMeta &qmeta,
+                                        Context::Pointer &context) const {
+  return search_batch(query, qmeta, 1, context, true, nullptr, &keys);
+}
+
 int IVFSearcher::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
@@ -185,10 +192,12 @@ int IVFSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
                       entity_->vector_count() <= bruteforce_threshold_);
 }
 
-int IVFSearcher::search_batch(
-    const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context, bool brute,
-    const std::vector<std::vector<uint64_t>> *p_keys) const try {
+int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
+                              uint32_t count, Context::Pointer &context,
+                              bool brute,
+                              const std::vector<std::vector<uint64_t>> *p_keys,
+                              const std::vector<uint64_t> *single_keys) const
+    try {
   bool completed = false;
   AILEGO_DEFER([&] {
     if (!completed && context) context->reset();
@@ -243,8 +252,10 @@ int IVFSearcher::search_batch(
       auto &stats = ctx->mutable_stats(base + q);
       auto &heap = ctx->mutable_result_heap();
       heap.clear();
-      if (p_keys) {
-        ret = entity->search_by_p_keys(one, (*p_keys)[base + q], filter, &heap,
+      const auto *keys = single_keys ? single_keys
+                                   : p_keys ? &(*p_keys)[base + q] : nullptr;
+      if (keys) {
+        ret = entity->search_by_p_keys(one, *keys, filter, &heap,
                                        &stats);
         ivf_check_error_code(ret);
       } else if (brute) {
@@ -265,7 +276,7 @@ int IVFSearcher::search_batch(
         }
       }
       heap.sort();
-      if (!p_keys && !filter.is_valid()) {
+      if (!keys && !filter.is_valid()) {
         ret = entity->retrieve_keys(&heap);
         ivf_check_error_code(ret);
       }

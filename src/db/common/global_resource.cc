@@ -21,6 +21,7 @@
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
 #include "db/common/native_worker_memory.h"
+#include "db/common/rocksdb_block_cache.h"
 #include "db/common/rocksdb_cache_allocator.h"
 
 namespace zvec {
@@ -166,6 +167,8 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       LOG_ERROR("Failed to create the process-wide RocksDB block cache");
       return -1;
     }
+    rocksdb_block_cache =
+        std::make_shared<RocksdbBlockCache>(std::move(rocksdb_block_cache));
     auto rocksdb_write_buffer_manager =
         std::make_shared<rocksdb::WriteBufferManager>(
             static_cast<size_t>(

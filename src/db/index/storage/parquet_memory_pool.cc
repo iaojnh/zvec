@@ -294,6 +294,47 @@ arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
   if (old_size == new_size) {
     return arrow::Status::OK();
   }
+#if !defined(_WIN32)
+  // Shrinking a mapping must not copy its live prefix into a second mapping.
+  // Keep the address/alignment and return only complete trailing OS pages.
+  // Windows MEM_RELEASE cannot release just the tail of a reservation.
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  if (old_size >= kMappedAllocationThreshold &&
+      new_size >= kMappedAllocationThreshold && new_size < old_size &&
+      reinterpret_cast<uintptr_t>(*ptr) % alignment == 0) {
+    auto *header =
+        reinterpret_cast<MappingHeader *>(*ptr - sizeof(MappingHeader));
+    // An allocation made before budgeting was enabled needs fresh admission.
+    if (header->kind == BackingKind::Mapping &&
+        !(enforce_budget_ && budget.capacity() && !header->charged)) {
+      const size_t page_size = SystemPageSize();
+      if (page_size == 0) {
+        return arrow::Status::IOError("Cannot determine OS page size");
+      }
+      const size_t needed =
+          static_cast<size_t>(*ptr - static_cast<uint8_t *>(header->base)) +
+          new_size;
+      const size_t mapped_size =
+          ((needed + page_size - 1) / page_size) * page_size;
+      const size_t released = header->size - mapped_size;
+      if (released) {
+        auto *tail = static_cast<uint8_t *>(header->base) + mapped_size;
+        if (!UnmapMemory(tail, released)) {
+          return arrow::Status::IOError("Cannot shrink Parquet mapping");
+        }
+        // Refund backing only after it has actually been unmapped.
+        const size_t refund = header->charged ? released : 0;
+        header->size = mapped_size;
+        header->charged -= refund;
+        mapped_bytes_.fetch_sub(released, std::memory_order_relaxed);
+        charged_bytes_.fetch_sub(refund, std::memory_order_relaxed);
+        budget.release_external(refund);
+      }
+      stats_.DidReallocateBytes(old_size, new_size);
+      return arrow::Status::OK();
+    }
+  }
+#endif
   if (!enforce_budget_ && old_size != 0 &&
       old_size < kMappedAllocationThreshold &&
       new_size < kMappedAllocationThreshold) {

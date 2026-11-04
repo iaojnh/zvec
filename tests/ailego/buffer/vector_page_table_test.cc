@@ -485,6 +485,166 @@ TEST_F(BufferPoolTest, UnalignedBypassRefusesUnbudgetedScratch) {
   ExpectPageContent(pinned, /*page=*/0);
 }
 
+TEST_F(BufferPoolTest, WritableOptionalPinDoesNotWaitForCacheAdmission) {
+  auto &memory = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, memory.init(256UL << 20));
+  VecBufferPool pool(new_file(2), /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  auto handle = pool.get_handle();
+  char *dirty = pool.acquire_buffer(0, 0);
+  ASSERT_NE(nullptr, dirty);
+  auto release_pin =
+      ScopeGuard::Make([&] { pool.page_table_.release_block(0); });
+  std::memset(dirty + kVectorPageSize - 32, 'X', 32);
+  pool.page_table_.mark_dirty(0);
+  constexpr size_t kWorkspace = 64UL << 10;
+  ASSERT_GT(memory.available(), kWorkspace);
+  const size_t pressure = memory.available() - kWorkspace;
+  ASSERT_TRUE(memory.try_charge_metadata(pressure));
+  auto release_pressure =
+      ScopeGuard::Make([&] { memory.release_metadata(pressure); });
+  ASSERT_TRUE(memory.is_page_full());
+  const auto before = memory.stats();
+  size_t page_id = 0;
+  EXPECT_EQ(nullptr, handle.get_single_page(kVectorPageSize, 32, page_id));
+  EXPECT_EQ(before.capacity_waits, memory.stats().capacity_waits);
+  EXPECT_FALSE(pool.is_page_resident(1));
+  std::array<char, 64> result{};
+  ASSERT_TRUE(handle.read_range_bypass(kVectorPageSize - 32, result.size(),
+                                       result.data()));
+  EXPECT_EQ(std::string(32, 'X'), std::string(result.data(), 32));
+  EXPECT_EQ(std::string(32, '\1'), std::string(result.data() + 32, 32));
+  EXPECT_FALSE(pool.is_page_resident(1));
+}
+
+TEST_F(BufferPoolTest, WritableOptionalBatchPinDoesNotWaitForCacheAdmission) {
+  auto &memory = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, memory.init(256UL << 20));
+  VecBufferPool pool(new_file(2), /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  auto handle = pool.get_handle();
+  char *dirty = pool.acquire_buffer(0, 0);
+  ASSERT_NE(nullptr, dirty);
+  auto release_pin =
+      ScopeGuard::Make([&] { pool.page_table_.release_block(0); });
+  std::memset(dirty + kVectorPageSize - 32, 'B', 32);
+  pool.page_table_.mark_dirty(0);
+  constexpr size_t kWorkspace = 64UL << 10;
+  ASSERT_GT(memory.available(), kWorkspace);
+  const size_t pressure = memory.available() - kWorkspace;
+  ASSERT_TRUE(memory.try_charge_metadata(pressure));
+  auto release_pressure =
+      ScopeGuard::Make([&] { memory.release_metadata(pressure); });
+  ASSERT_TRUE(memory.is_page_full());
+  const auto before = memory.stats();
+  const block_id_t ids[] = {0, 1};
+  char *pages[2]{};
+  EXPECT_FALSE(handle.acquire_pages(ids, 2, pages));
+  EXPECT_EQ(nullptr, pages[0]);
+  EXPECT_EQ(nullptr, pages[1]);
+  EXPECT_EQ(before.capacity_waits, memory.stats().capacity_waits);
+  EXPECT_FALSE(pool.is_page_resident(1));
+  // Failure rolls back only this batch's pins, not the caller's dirty pin.
+  EXPECT_FALSE(pool.page_table_.is_released(0));
+  EXPECT_TRUE(pool.page_table_.is_block_dirty(0));
+  std::array<char, 64> result{};
+  ASSERT_TRUE(handle.read_range_bypass(kVectorPageSize - 32, result.size(),
+                                       result.data()));
+  EXPECT_EQ(std::string(32, 'B'), std::string(result.data(), 32));
+  EXPECT_EQ(std::string(32, '\1'), std::string(result.data() + 32, 32));
+}
+
+TEST_F(BufferPoolTest, WritableRequiredBatchPinStillWaitsForCapacity) {
+  auto &memory = PoolPayloadBudget::get_instance();
+  init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/1, /*writable=*/true);
+  VecBufferPool pool(new_file(1), /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  char *held = nullptr;
+  ASSERT_TRUE(memory.try_acquire_buffer(kVectorPageSize, held));
+  const auto before = memory.stats();
+  std::atomic<bool> observed_wait{false};
+  std::thread releaser([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (memory.stats().capacity_waits == before.capacity_waits &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    observed_wait.store(memory.stats().capacity_waits != before.capacity_waits);
+    memory.release_buffer(held, kVectorPageSize);
+  });
+  const block_id_t id = 0;
+  char *page = nullptr;
+  const bool acquired = pool.acquire_pages(&id, 1, &page);
+  releaser.join();
+  EXPECT_TRUE(observed_wait.load());
+  ASSERT_TRUE(acquired);
+  ASSERT_NE(nullptr, page);
+  ExpectPageContent(page, 0);
+  pool.release_pages(&id, 1);
+}
+
+TEST_F(BufferPoolTest, WritableImmutableCacheMissDoesNotWaitBeforeBypass) {
+  auto &memory = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, memory.init(256UL << 20));
+  VecBufferPool pool(new_file(2), /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  auto handle = pool.get_handle();
+  char *dirty = pool.acquire_buffer(0, 0);
+  ASSERT_NE(nullptr, dirty);
+  auto release_pin =
+      ScopeGuard::Make([&] { pool.page_table_.release_block(0); });
+  std::memset(dirty + kVectorPageSize - 32, 'Y', 32);
+  pool.page_table_.mark_dirty(0);
+  constexpr size_t kWorkspace = 64UL << 10;
+  ASSERT_GT(memory.available(), kWorkspace);
+  const size_t pressure = memory.available() - kWorkspace;
+  ASSERT_TRUE(memory.try_charge_metadata(pressure));
+  auto release_pressure =
+      ScopeGuard::Make([&] { memory.release_metadata(pressure); });
+  ASSERT_TRUE(memory.is_page_full());
+  const auto before = memory.stats();
+  std::array<char, 64> result{};
+  EXPECT_FALSE(handle.read_range_immutable(kVectorPageSize - 32, result.size(),
+                                           result.data()));
+  EXPECT_EQ(before.capacity_waits, memory.stats().capacity_waits);
+  ASSERT_TRUE(handle.read_range_bypass(kVectorPageSize - 32, result.size(),
+                                       result.data()));
+  EXPECT_EQ(std::string(32, 'Y'), std::string(result.data(), 32));
+  EXPECT_EQ(std::string(32, '\1'), std::string(result.data() + 32, 32));
+  EXPECT_FALSE(pool.is_page_resident(1));
+}
+
+TEST_F(BufferPoolTest,
+       WritableOptionalPinKeepsResidentDirtyBytesUnderPressure) {
+  auto &memory = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, memory.init(256UL << 20));
+  VecBufferPool pool(new_file(1), /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  auto handle = pool.get_handle();
+  char *dirty = pool.acquire_buffer(0, 0);
+  ASSERT_NE(nullptr, dirty);
+  auto release_pin =
+      ScopeGuard::Make([&] { pool.page_table_.release_block(0); });
+  std::memset(dirty, 'Z', 32);
+  pool.page_table_.mark_dirty(0);
+  constexpr size_t kWorkspace = 64UL << 10;
+  ASSERT_GT(memory.available(), kWorkspace);
+  const size_t pressure = memory.available() - kWorkspace;
+  ASSERT_TRUE(memory.try_charge_metadata(pressure));
+  auto release_pressure =
+      ScopeGuard::Make([&] { memory.release_metadata(pressure); });
+  ASSERT_TRUE(memory.is_page_full());
+  const auto before = memory.stats();
+  size_t page_id = 0;
+  char *page = handle.get_single_page(0, 32, page_id);
+  ASSERT_NE(nullptr, page);
+  EXPECT_EQ(std::string(32, 'Z'), std::string(page, 32));
+  handle.release_one(page_id);
+  EXPECT_EQ(before.capacity_waits, memory.stats().capacity_waits);
+  EXPECT_TRUE(pool.page_table_.is_block_dirty(0));
+}
+
 TEST_F(BufferPoolTest, WritableBypassPreservesDirtyPagesWithoutAdmission) {
   init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true);
   VecBufferPool pool(new_file(/*num_pages=*/2), /*writable=*/true);
@@ -3607,4 +3767,61 @@ TEST_F(BufferPoolTest, CrossPageWriteAdmissionFailurePreservesAllBytes) {
   ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize - 16, actual.size(),
                                      actual.data()));
   EXPECT_EQ(value, actual);
+}
+
+TEST_F(BufferPoolTest, RequiredCrossPageWriteWaitsPastFirstIdleInterval) {
+  constexpr size_t kPages = 3;
+  init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/kPages,
+                /*writable=*/true);
+  auto &memory = PoolPayloadBudget::get_instance();
+  VecBufferPool pool(new_file(kPages), /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  char *first = pool.acquire_buffer(/*page_id=*/0, /*retry=*/0);
+  ASSERT_NE(nullptr, first);
+
+  MemoryReservation pressure;
+  pressure.add(memory.capacity() - memory.used() - 1024);
+  const auto before = memory.stats();
+  std::atomic<bool> observed_second_wait{false};
+  std::thread releaser([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto current = memory.stats();
+      if (current.capacity_waits >= before.capacity_waits + 2 &&
+          current.capacity_wait_timeouts > before.capacity_wait_timeouts) {
+        observed_second_wait.store(true, std::memory_order_release);
+        break;
+      }
+      std::this_thread::yield();
+    }
+    // A mandatory write must survive one idle interval. Release only after
+    // it starts another wait, or after the old implementation has failed.
+    pressure.retain_at_most(0);
+  });
+
+  std::array<char, 32> value;
+  value.fill('X');
+  const VecBufferWriteFragment writes[] = {
+      {kVectorPageSize - 16, value.size(), value.data()},
+      {2 * kVectorPageSize, 16, value.data()}};
+  const int result = pool.write_fragments(writes, 2);
+  releaser.join();
+  EXPECT_TRUE(observed_second_wait.load(std::memory_order_acquire));
+  EXPECT_EQ(0, result);
+  EXPECT_LE(memory.used(), memory.capacity());
+  EXPECT_LE(memory.committed(), memory.capacity());
+  EXPECT_EQ(0, first[kVectorPageSize - 17]);
+  pool.page_table_.release_block(0);
+  if (result == 0) {
+    std::array<char, 32> actual;
+    ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize - 16, actual.size(),
+                                       actual.data()));
+    EXPECT_EQ(value, actual);
+    std::array<char, 16> last;
+    ASSERT_TRUE(
+        pool.read_range_bypass(2 * kVectorPageSize, last.size(), last.data()));
+    EXPECT_TRUE(std::all_of(last.begin(), last.end(),
+                            [](char byte) { return byte == 'X'; }));
+  }
 }

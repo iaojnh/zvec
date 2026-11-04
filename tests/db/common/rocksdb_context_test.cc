@@ -14,11 +14,16 @@
 
 #include "db/common/rocksdb_context.h"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstring>
 #include <filesystem>
+#include <thread>
 #include <gtest/gtest.h>
 #include <rocksdb/convenience.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/memtablerep.h>
+#include <rocksdb/merge_operator.h>
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
@@ -65,6 +70,102 @@ class RocksdbContextMemoryTest : public ::testing::Test {
     FileHelper::RemoveDirectory(kTestPath);
   }
 };
+
+class CountingSumMerge final : public rocksdb::MergeOperator {
+ public:
+  const char *Name() const override {
+    return "CountingSumMerge";
+  }
+  bool FullMergeV2(const MergeOperationInput &input,
+                   MergeOperationOutput *output) const override {
+    size_t previous = max_operands_.load();
+    while (previous < input.operand_list.size() &&
+           !max_operands_.compare_exchange_weak(previous,
+                                               input.operand_list.size())) {
+    }
+    uint64_t sum = 0;
+    if (input.existing_value) {
+      if (input.existing_value->size() != sizeof(sum)) return false;
+      std::memcpy(&sum, input.existing_value->data(), sizeof(sum));
+    }
+    for (const auto &operand : input.operand_list) {
+      uint64_t value = 0;
+      if (operand.size() != sizeof(value)) return false;
+      std::memcpy(&value, operand.data(), sizeof(value));
+      sum += value;
+    }
+    output->new_value.assign(reinterpret_cast<const char *>(&sum), sizeof(sum));
+    return true;
+  }
+  mutable std::atomic<size_t> max_operands_{0};
+};
+
+TEST_F(RocksdbContextMemoryTest, PerColumnMergeChainsStayBoundedAcrossReopen) {
+  auto merge = std::make_shared<CountingSumMerge>();
+  const RocksdbContext::Args args{kTestPath,
+                                  {"postings"},
+                                  nullptr,
+                                  {{"postings", merge}, {"later", merge}}};
+  RocksdbContext writer;
+  ASSERT_TRUE(writer.create(args).ok());
+  ASSERT_TRUE(writer.create_cf("later").ok());
+  EXPECT_FALSE(writer.db_->GetDBOptions().allow_concurrent_memtable_write);
+  auto *postings = writer.get_cf("postings");
+  auto *later = writer.get_cf("later");
+  ASSERT_NE(nullptr, postings);
+  ASSERT_NE(nullptr, later);
+  for (auto *cf : {postings, later}) {
+    EXPECT_EQ(100u, writer.db_->GetOptions(cf).max_successive_merges);
+  }
+  const uint64_t one = 1;
+  const rocksdb::Slice operand(reinterpret_cast<const char *>(&one),
+                               sizeof(one));
+  auto append = [&](size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      EXPECT_TRUE(writer.merge(postings, "hot", operand).ok());
+    }
+  };
+  append(256);
+  auto *snapshot = writer.db_->GetSnapshot();
+  ASSERT_NE(nullptr, snapshot);
+  append(256);
+  rocksdb::ReadOptions historical;
+  historical.snapshot = snapshot;
+  std::string value;
+  ASSERT_TRUE(writer.db_->Get(historical, postings, "hot", &value).ok());
+  ASSERT_EQ(sizeof(uint64_t), value.size());
+  uint64_t count = 0;
+  std::memcpy(&count, value.data(), sizeof(count));
+  EXPECT_EQ(256u, count);
+  writer.db_->ReleaseSnapshot(snapshot);
+  std::array<std::thread, 4> threads;
+  for (auto &thread : threads) {
+    thread = std::thread([&] {
+      for (size_t i = 0; i < 256; ++i) {
+        EXPECT_TRUE(writer.merge(later, "hot", operand).ok());
+      }
+    });
+  }
+  for (auto &thread : threads) thread.join();
+  ASSERT_TRUE(writer.flush().ok());
+  ASSERT_TRUE(writer.close().ok());
+  RocksdbContext reopened;
+  ASSERT_TRUE(reopened.open(args, false).ok());
+  EXPECT_FALSE(reopened.db_->GetDBOptions().allow_concurrent_memtable_write);
+  for (const auto &item :
+       {std::make_pair("postings", 512u), std::make_pair("later", 1024u)}) {
+    auto *cf = reopened.get_cf(item.first);
+    ASSERT_NE(nullptr, cf);
+    EXPECT_EQ(100u, reopened.db_->GetOptions(cf).max_successive_merges);
+    ASSERT_TRUE(reopened.db_->Get(reopened.read_opts_, cf, "hot", &value).ok());
+    ASSERT_EQ(sizeof(count), value.size());
+    std::memcpy(&count, value.data(), sizeof(count));
+    EXPECT_EQ(item.second, count);
+  }
+  EXPECT_LE(merge->max_operands_.load(), 100u);
+  EXPECT_GT(merge->max_operands_.load(), 1u);
+  ASSERT_TRUE(reopened.close().ok());
+}
 
 TEST_F(RocksdbContextMemoryTest, BackgroundWorkersRespectOptimizeConcurrency) {
   RocksdbContext writer;
@@ -125,7 +226,7 @@ TEST_F(RocksdbContextMemoryTest, SharesWriteBudgetWithoutFtsIteratorCopies) {
 TEST_F(RocksdbContextMemoryTest, BufferedWritesSurviveFlushAndWritableReopen) {
   RocksdbContext writer;
   ASSERT_TRUE(writer.create(kTestPath).ok());
-#if defined(__APPLE__)
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
   EXPECT_EQ(0u, writer.create_opts_.writable_file_max_buffer_size);
   EXPECT_FALSE(writer.create_opts_.use_direct_io_for_flush_and_compaction);
 #endif
@@ -139,7 +240,7 @@ TEST_F(RocksdbContextMemoryTest, BufferedWritesSurviveFlushAndWritableReopen) {
 
   RocksdbContext reopened;
   ASSERT_TRUE(reopened.open(kTestPath, false).ok());
-#if defined(__APPLE__)
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
   EXPECT_EQ(0u, reopened.create_opts_.writable_file_max_buffer_size);
 #endif
   ASSERT_TRUE(reopened.db_->Put(reopened.write_opts_, "updated", value).ok());
@@ -161,6 +262,29 @@ TEST_F(RocksdbContextMemoryTest, BufferedWritesSurviveFlushAndWritableReopen) {
   EXPECT_EQ(value, actual);
   ASSERT_TRUE(reader.close().ok());
 }
+
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+TEST_F(RocksdbContextMemoryTest, DirectWritesKeepAlignedStagingBuffer) {
+  RocksdbContext writer;
+  writer.create_opts_.use_direct_io_for_flush_and_compaction = true;
+  ASSERT_TRUE(writer.create(kTestPath).ok());
+  EXPECT_EQ(rocksdb::DBOptions().writable_file_max_buffer_size,
+            writer.create_opts_.writable_file_max_buffer_size);
+  EXPECT_GT(writer.create_opts_.writable_file_max_buffer_size, 0u);
+  EXPECT_TRUE(writer.create_opts_.use_direct_io_for_flush_and_compaction);
+  const std::string value(128 * 1024, 'x');
+  ASSERT_TRUE(writer.db_->Put(writer.write_opts_, "key", value).ok());
+  ASSERT_TRUE(writer.flush().ok());
+  ASSERT_TRUE(writer.close().ok());
+
+  RocksdbContext reader;
+  ASSERT_TRUE(reader.open(kTestPath, true).ok());
+  std::string actual;
+  ASSERT_TRUE(reader.db_->Get(reader.read_opts_, "key", &actual).ok());
+  EXPECT_EQ(value, actual);
+  ASSERT_TRUE(reader.close().ok());
+}
+#endif
 
 TEST_F(RocksdbContextMemoryTest, MetadataAdmissionRejectsBeforeCreatingFiles) {
   ASSERT_TRUE(detail::MemoryBudgetTestPeer::reset_idle_allowances());

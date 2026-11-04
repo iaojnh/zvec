@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <thread>
 #include <ailego/pattern/defer.h>
@@ -209,6 +211,82 @@ TEST_F(DiskAnnBuilderEntityBufferTest, SealingRequiresCompleteVectorStaging) {
   IndexStorage::MemoryBlock block;
   ASSERT_EQ(0, entity.read_vector(1, block));
   EXPECT_EQ(0, std::memcmp(block.data(), vector, sizeof(vector)));
+}
+
+TEST_F(DiskAnnBuilderEntityBufferTest,
+       TemporaryVectorsRespectPageBoundariesAndPreserveValues) {
+  const uint32_t page_elements = ailego::kVectorPageSize / sizeof(float);
+  const uint32_t threshold = page_elements - page_elements / 4;
+  const std::array<uint32_t, 5> dimensions{{threshold - 1, threshold,
+                                            page_elements - 1, page_elements,
+                                            page_elements + 1}};
+  constexpr uint32_t kCount = 32;
+  for (uint32_t dimension : dimensions) {
+    SCOPED_TRACE(dimension);
+    DiskAnnBuilderEntity entity;
+    initialize(&entity, dimension, kCount);
+    ASSERT_EQ(0, entity.prepare_vectors_for_graph());
+
+    // Inspect the owned scratch file without opening another BufferStorage or
+    // changing the pool allowance. Locate row zero by its unique float prefix.
+    std::string vector_path;
+    for (const auto &entry :
+         std::filesystem::recursive_directory_iterator(directory_)) {
+      if (entry.path().filename() == "vectors")
+        vector_path = entry.path().string();
+    }
+    ASSERT_FALSE(vector_path.empty());
+    ailego::File file;
+    ASSERT_TRUE(file.open(vector_path, true));
+    std::vector<char> prefix(
+        std::min(file.size(), 8 * ailego::kVectorPageSize));
+    ASSERT_EQ(prefix.size(), file.read(0, prefix.data(), prefix.size()));
+    const std::array<float, 8> signature{
+        {0, 0.25F, 0.5F, 0.75F, 1, 1.25F, 1.5F, 1.75F}};
+    size_t first = prefix.size();
+    for (size_t offset = 0; offset + sizeof(signature) <= prefix.size();
+         offset += sizeof(float)) {
+      if (std::memcmp(prefix.data() + offset, signature.data(),
+                      sizeof(signature)) == 0) {
+        first = offset;
+        break;
+      }
+    }
+    ASSERT_LT(first, prefix.size());
+    const size_t vector_size = dimension * sizeof(float);
+    const bool aligned = dimension >= threshold && dimension < page_elements;
+    const size_t stride = aligned ? ailego::kVectorPageSize : vector_size;
+    if (aligned) {
+      EXPECT_EQ(0U, first % ailego::kVectorPageSize);
+    }
+    std::vector<float> raw(dimension);
+    for (uint32_t id : {0U, 1U, kCount - 1}) {
+      ASSERT_EQ(vector_size,
+                file.read(first + id * stride, raw.data(), vector_size));
+      for (uint32_t d = 0; d < dimension; ++d)
+        ASSERT_FLOAT_EQ(id + d * 0.25F, raw[d]);
+    }
+    file.close();
+
+    const std::array<diskann_id_t, 5> ids{{31, 1, 0, 1, 16}};
+    std::array<IndexStorage::MemoryBlock, 5> blocks;
+    ASSERT_EQ(0, entity.read_vectors(ids.data(), blocks.data(), ids.size()));
+    for (uint32_t id = 0; id < kCount; ++id) {
+      IndexStorage::MemoryBlock block;
+      ASSERT_EQ(0, entity.read_vector(id, block));
+      const auto *data = static_cast<const float *>(block.data());
+      ASSERT_NE(nullptr, data);
+      EXPECT_FLOAT_EQ(static_cast<float>(id), data[0]);
+      EXPECT_FLOAT_EQ(id + (dimension - 1) * 0.25F, data[dimension - 1]);
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+      const auto *data = static_cast<const float *>(blocks[i].data());
+      ASSERT_NE(nullptr, data);
+      for (uint32_t d = 0; d < dimension; ++d)
+        ASSERT_FLOAT_EQ(ids[i] + d * 0.25F, data[d]);
+      EXPECT_EQ(ids[i] + 17U, entity.get_key(ids[i]));
+    }
+  }
 }
 
 TEST_F(DiskAnnBuilderEntityBufferTest,

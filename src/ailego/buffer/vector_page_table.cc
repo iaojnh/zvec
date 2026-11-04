@@ -123,6 +123,12 @@ size_t PrepareReadScratch(BudgetedMappedBuffer &scratch, size_t pages) {
       pages /= 2;
     }
   }
+  const auto stats = budget.stats();
+  LOG_ERROR(
+      "Read alignment workspace unavailable: capacity=%zu used=%zu "
+      "committed=%zu external=%zu metadata=%zu free_buffers=%zu",
+      budget.capacity(), stats.used, stats.committed, stats.external_used,
+      stats.metadata_used, stats.free_buffers);
   return 0;
 }
 }  // namespace
@@ -1695,18 +1701,18 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
             "committed[%zu], free_buffers[%zu]",
             file_name_.c_str(), page_id, error, memory_stats.used,
             memory_stats.committed, memory_stats.free_buffers);
-      } else if (writable_) {
+      } else if (writable_ && retry > 0) {
         const auto queue_stats = BlockEvictionQueue::get_instance().stats();
         LOG_ERROR(
             "Buffer pool allocation made no progress: file[%s], "
-            "page_id[%zu], capacity[%zu], used[%zu], "
+            "page_id[%zu], retry[%d], capacity[%zu], used[%zu], "
             "committed[%zu], metadata_used[%zu], "
             "external_used[%zu], page_reserve[%zu], free_buffers[%zu], "
             "evict[%llu], second_chance[%llu], writeback_requests[%llu], "
             "writeback_pending[%llu], "
             "bg_evict_rounds[%llu], bg_evicted_buffers[%llu], "
             "queue_sizes[%zu,%zu,%zu]",
-            file_name_.c_str(), page_id, memory_stats.pool_size,
+            file_name_.c_str(), page_id, retry, memory_stats.pool_size,
             memory_stats.used, memory_stats.committed,
             memory_stats.metadata_used, memory_stats.external_used,
             MemoryLimitPool::get_instance().page_admission_reserve(),
@@ -1796,6 +1802,15 @@ bool VecBufferPool::try_acquire_resident_pages(const block_id_t *page_ids,
 
 bool VecBufferPool::acquire_pages(const block_id_t *page_ids, size_t count,
                                   char **pages) {
+  // Required multi-page writes cannot use the storage reader's bypass.
+  // Match write_range()'s bounded wait instead of failing on the first idle
+  // writeback interval. Optional handle acquisitions keep their own policy.
+  return acquire_pages_impl(page_ids, count, pages,
+                            /*retry=*/writable_ ? 50 : 1);
+}
+
+bool VecBufferPool::acquire_pages_impl(const block_id_t *page_ids, size_t count,
+                                       char **pages, int retry) {
   if (count == 0) return true;
   if (!page_ids || !pages) return false;
 
@@ -1836,7 +1851,7 @@ bool VecBufferPool::acquire_pages(const block_id_t *page_ids, size_t count,
     // A batch caller can roll back and use its direct-I/O fallback. Keep only
     // one bounded foreground reclaim attempt here so a capacity miss does not
     // leave the page in kLoadingRefCount while scanning the global queue.
-    pages[i] = acquire_buffer(page_ids[i], 1, /*record_reuse=*/false);
+    pages[i] = acquire_buffer(page_ids[i], retry, /*record_reuse=*/false);
     if (!pages[i]) {
       for (size_t j = 0; j < count; ++j) {
         if (pages[j]) {
@@ -1991,6 +2006,11 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
     if (read_bytes <= 0 ||
         (direct_destination ? copy_size : within_page + copy_size) >
             static_cast<size_t>(read_bytes)) {
+      LOG_ERROR(
+          "Bypass pread failed: file[%s] offset=%zu length=%zu got=%zd "
+          "errno=%d within_page=%zu copy_size=%zu",
+          file_name_.c_str(), direct_destination ? absolute : page_offset,
+          read_size, read_bytes, errno, within_page, copy_size);
       ok = false;
       break;
     }
@@ -2360,7 +2380,10 @@ char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
   size_t first_page = file_offset / kVectorPageSize;
   assert(len == 0 || len <= kVectorPageSize - (file_offset % kVectorPageSize));
   out_page_id = first_page;
-  char *page = pool_.acquire_buffer(first_page, 50);
+  // Writable pinning is optional: the storage caller can copy dirty resident
+  // bytes or read disk through its synchronized bypass. Do not wait for the
+  // writeback budget merely to obtain a zero-copy cache hit.
+  char *page = pool_.acquire_buffer(first_page, pool_.writable_ ? 0 : 50);
   if (!page) {
     LOG_DEBUG(
         "VecBufferPoolHandle::get_single_page: acquire_buffer failed, "
@@ -2373,7 +2396,12 @@ char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
 
 bool VecBufferPoolHandle::acquire_pages(const block_id_t *page_ids,
                                         size_t count, char **pages) {
-  return pool_.acquire_pages(page_ids, count, pages);
+  // Storage reads can roll back these optional pins and use dirty-safe bypass.
+  // Do not wait for writable cache admission while earlier batch hits are
+  // pinned. Read-only acquisition and the pool's required write path stay
+  // unchanged.
+  return pool_.acquire_pages_impl(page_ids, count, pages,
+                                  /*retry=*/pool_.writable_ ? 0 : 1);
 }
 
 bool VecBufferPoolHandle::try_acquire_resident_pages(const block_id_t *page_ids,
@@ -2583,7 +2611,10 @@ bool VecBufferPoolHandle::read_range_immutable(size_t file_offset, size_t len,
   size_t remaining = len;
   size_t dst_cursor = 0;
   for (size_t pg = first_page; pg <= last_page; ++pg) {
-    char *page = pool_.acquire_buffer(static_cast<block_id_t>(pg), 50);
+    // Like single-page pinning, immutable cache population is optional for a
+    // writable pool. Its caller retries through the dirty-safe bypass path.
+    char *page = pool_.acquire_buffer(static_cast<block_id_t>(pg),
+                                      pool_.writable_ ? 0 : 50);
     if (page == nullptr) {
       return false;
     }

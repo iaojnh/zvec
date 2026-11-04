@@ -222,6 +222,88 @@ TEST(CombinedResultMemory, CandidateKeysAreTranslatedOneBlockAtATime) {
   EXPECT_EQ(0u, pool.used());
 }
 
+class IdentityKeyViewIndexer : public VectorColumnIndexer {
+ public:
+  explicit IdentityKeyViewIndexer(const std::vector<uint64_t> *keys,
+                                  size_t charge)
+      : keys_(keys), charge_(charge) {}
+  Result<IndexResults::Ptr> search(
+      const vector_column_params::VectorData &,
+      const vector_column_params::QueryParams &params) override {
+    EXPECT_TRUE(params.bf_pks.empty());
+    EXPECT_EQ(keys_, params.bf_pks_view);
+    EXPECT_EQ(charge_, ailego::PoolPayloadBudget::get_instance().used());
+    IndexResults::Ptr result = std::make_shared<VectorIndexResults>(
+        false, core::IndexDocumentList{}, std::vector<std::string>{},
+        std::vector<std::string>{});
+    return result;
+  }
+
+ private:
+  const std::vector<uint64_t> *keys_;
+  size_t charge_;
+};
+
+TEST(CombinedResultMemory, IdentityCandidateKeysBorrowCallerBudgetAndStorage) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    pool.init(previous);
+  });
+  ASSERT_EQ(0, pool.init(256 * 1024));
+  ailego::MemoryReservation memory;
+  memory.add_array(25000, sizeof(uint64_t));
+  std::vector<uint64_t> keys(25000);
+  for (size_t i = 0; i < keys.size(); ++i) keys[i] = i;
+  keys[3] = keys[1];  // Borrowing also preserves duplicates and order.
+  const auto *original = keys.data();
+  auto indexer =
+      std::make_shared<IdentityKeyViewIndexer>(&keys, memory.bytes());
+  FieldSchema schema("test", DataType::VECTOR_FP32, 4u, false);
+  std::vector<BlockMeta> blocks{
+      BlockMeta(0, BlockType::VECTOR_INDEX, 0, 29999, 30000, {"test"})};
+  CombinedVectorColumnIndexer combined({indexer}, {}, schema, SegmentMeta{},
+                                       blocks, MetricType::IP);
+  vector_column_params::QueryParams params;
+  params.bf_pks_view = &keys;
+  auto result = combined.search(vector_column_params::VectorData{}, params);
+  // The caller's 200 KiB fits, a second 200 KiB copy would be rejected.
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(original, keys.data());
+  ASSERT_EQ(25000u, keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    EXPECT_EQ(i == 3 ? 1u : i, keys[i]);
+  }
+  EXPECT_EQ(memory.bytes(), pool.used());
+}
+
+TEST(CombinedResultMemory, ZeroOffsetStillFiltersOutOfBlockCandidateKeys) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    pool.init(previous);
+  });
+  ASSERT_EQ(0, pool.init(1024));
+  auto indexer = std::make_shared<KeyViewIndexer>();
+  FieldSchema schema("test", DataType::VECTOR_FP32, 4u, false);
+  std::vector<BlockMeta> blocks{
+      BlockMeta(0, BlockType::VECTOR_INDEX, 0, 9, 10, {"test"})};
+  CombinedVectorColumnIndexer combined({indexer}, {}, schema, SegmentMeta{},
+                                       blocks, MetricType::IP);
+  const std::vector<uint64_t> keys{9, 10, 0};
+  vector_column_params::QueryParams params;
+  params.bf_pks_view = &keys;
+  auto result = combined.search(vector_column_params::VectorData{}, params);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(1u, indexer->calls);
+  EXPECT_EQ((std::vector<uint64_t>{9, 10, 0}), keys);
+  EXPECT_EQ(0u, pool.used());
+}
+
 class ReenteringGroupIndexer : public VectorColumnIndexer {
  public:
   explicit ReenteringGroupIndexer(size_t block) : block_(block) {}

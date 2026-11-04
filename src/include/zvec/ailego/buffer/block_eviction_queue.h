@@ -382,7 +382,8 @@ class MemoryLimitPool {
     return queue_charged_size_.load(std::memory_order_relaxed);
   }
 
-  //! Retained queue allocation bytes, including when the pool is disabled.
+  //! Queue backing bytes, including unused slots in a live mapped slab and
+  //! allocations made while the pool is disabled. Refund only after unmapping.
   size_t queue_allocated() const {
     return queue_allocated_size_.load(std::memory_order_relaxed);
   }
@@ -441,6 +442,8 @@ class MemoryLimitPool {
   friend struct MemoryLimitPoolTestPeer;
   struct ReclaimableSlab;
   struct RetainedBlock;
+  struct QueueAllocationHeader;
+  struct QueueMemorySlab;
 
   MemoryLimitPool() = default;
   ~MemoryLimitPool();
@@ -543,6 +546,10 @@ class MemoryLimitPool {
   std::mutex queue_memory_mutex_;
   std::atomic<size_t> queue_allocated_size_{0};
   std::atomic<size_t> queue_charged_size_{0};
+  // Only non-full slabs are linked here. Every slot retains its slab owner,
+  // so a full slab can rejoin its size class on the first object release.
+  std::array<QueueMemorySlab *, 4096 / alignof(std::max_align_t)>
+      queue_small_slabs_{};
 
   std::mutex retained_mutex_;
   RetainedBlock *retained_free_{nullptr};

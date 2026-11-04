@@ -279,9 +279,10 @@ class BufferStorage : public IndexStorage {
         return false;
       }
 
-      // Mutable reads from writable pools retain snapshot ownership rules.
-      if (!owner_->cache_enabled_ ||
-          (owner_->buffer_pool_->writable() && !immutable)) {
+      // Mutable reads still publish owned snapshots, not writable page pins.
+      const bool mutable_snapshot =
+          owner_->buffer_pool_->writable() && !immutable;
+      if (!owner_->cache_enabled_) {
         return immutable
                    ? IndexStorage::Segment::read_borrowed_batch_immutable(reads,
                                                                           count)
@@ -294,7 +295,9 @@ class BufferStorage : public IndexStorage {
       static constexpr size_t kMaxArenaBytes = 2UL
                                                << 20;  // 2 MiB shared / batch
       static constexpr size_t kArenaAlign = AILEGO_CACHE_LINE_SIZE;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+      // Both read-only backends can submit cold ranges together. A one-page
+      // window would prevent Linux's batch AIO path from ever being reached.
       static constexpr size_t kBypassBatchPages = 16;
 #else
       static constexpr size_t kBypassBatchPages = 1;
@@ -565,11 +568,10 @@ class BufferStorage : public IndexStorage {
         return static_cast<size_t>(it - scratch.unique_page_ids.begin());
       };
 
-      // Cross-page values always need a contiguous copy. A single-page value
-      // only needs one when that page is on the bypass side of the hybrid
-      // batch; resident single-page values keep their normal zero-copy pin.
+      // Mutable values always own a snapshot. Immutable single-page values
+      // retain a zero-copy pin when resident; other values need a copy.
       for (BatchState &state : scratch.states) {
-        state.copy_result = state.page_count > 1;
+        state.copy_result = mutable_snapshot || state.page_count > 1;
         for (size_t j = 0; j < state.page_count && !state.copy_result; ++j) {
           const size_t unique_index =
               unique_index_for(scratch.page_ids[state.first_page_index + j]);
@@ -688,8 +690,8 @@ class BufferStorage : public IndexStorage {
           if (source == nullptr) {
             const size_t page_offset =
                 scratch.unique_page_ids[unique_index] * ailego::kVectorPageSize;
-            // F_NOCACHE needs only requested fragments. O_DIRECT retains its
-            // whole-page alignment and existing synchronous scratch handling.
+            // F_NOCACHE needs only requested fragments. O_DIRECT retains
+            // whole-page-aligned ranges, including when batch AIO is used.
             if (owner_->buffer_pool_->requires_aligned_io()) {
               first_byte = 0;
               end_byte =
@@ -750,6 +752,13 @@ class BufferStorage : public IndexStorage {
       buffer_storage_read_error = IndexError_NoMemory;
       for (size_t i = 0; reads && i < count; ++i) {
         if (reads[i].block) reads[i].block->reset();
+      }
+      if (!immutable && owner_->buffer_pool_ != nullptr &&
+          owner_->buffer_pool_->writable()) {
+        // Batch descriptors are optional. Their pins and allocations have
+        // already unwound, so retain the original scalar snapshot fallback.
+        buffer_storage_read_error = IndexError_ReadData;
+        return IndexStorage::Segment::read_borrowed_batch(reads, count);
       }
       return false;
     }

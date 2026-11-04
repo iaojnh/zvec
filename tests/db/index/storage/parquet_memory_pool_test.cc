@@ -155,11 +155,52 @@ TEST(ParquetMemoryPoolTest,
   ASSERT_TRUE(
       pool.Reallocate(kThreshold * 2, kThreshold, alignment, &buffer).ok());
   EXPECT_EQ(41, buffer[kThreshold - 1]);
+#if defined(_WIN32)
   EXPECT_EQ(3, pool.num_mapped_allocations());
+#else
+  EXPECT_EQ(2, pool.num_mapped_allocations());
+#endif
   pool.Free(buffer, kThreshold, alignment);
   EXPECT_EQ(0, pool.bytes_allocated());
   EXPECT_EQ(0, pool.mapped_bytes());
 }
+
+#if !defined(_WIN32)
+TEST(ParquetMemoryPoolTest, MappedShrinkKeepsAddressAlignmentAndPrefix) {
+  ParquetMemoryPool pool;
+  for (const int64_t alignment : {64, 4096, 65536}) {
+    SCOPED_TRACE(alignment);
+    uint8_t *buffer = nullptr;
+    ASSERT_TRUE(pool.Allocate(4 * kThreshold, alignment, &buffer).ok());
+    std::memset(buffer, 37, 4 * kThreshold);
+    auto *original = buffer;
+    const auto mapped = pool.mapped_bytes();
+    const auto allocations = pool.num_mapped_allocations();
+    const auto total = pool.total_mapped_bytes_allocated();
+    ASSERT_TRUE(
+        pool.Reallocate(4 * kThreshold, kThreshold + 100, alignment, &buffer)
+            .ok());
+    EXPECT_EQ(original, buffer);
+    EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(buffer) % alignment);
+    EXPECT_TRUE(std::all_of(buffer, buffer + kThreshold + 100,
+                            [](uint8_t byte) { return byte == 37; }));
+    EXPECT_LT(pool.mapped_bytes(), mapped);
+    EXPECT_EQ(allocations, pool.num_mapped_allocations());
+    EXPECT_EQ(total, pool.total_mapped_bytes_allocated());
+    // Logical accounting changes even when no complete OS page can be freed.
+    const auto retained = pool.mapped_bytes();
+    ASSERT_TRUE(
+        pool.Reallocate(kThreshold + 100, kThreshold + 99, alignment, &buffer)
+            .ok());
+    EXPECT_EQ(original, buffer);
+    EXPECT_EQ(retained, pool.mapped_bytes());
+    EXPECT_EQ(kThreshold + 99, pool.bytes_allocated());
+    pool.Free(buffer, kThreshold + 99, alignment);
+    EXPECT_EQ(0, pool.mapped_bytes());
+    EXPECT_EQ(0, pool.bytes_allocated());
+  }
+}
+#endif
 
 TEST(ParquetMemoryPoolTest, SmallReallocationUsesFallback) {
   arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
@@ -674,6 +715,74 @@ TEST_F(ParquetBudgetTest,
   EXPECT_EQ(0u, budget_.external_used());
   pool.Free(buffer, 0);
 }
+
+#if !defined(_WIN32)
+TEST_F(ParquetBudgetTest, MappedShrinkNeedsNoOverlapBudget) {
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  uint8_t *buffer = nullptr;
+  ASSERT_TRUE(pool.Allocate(2 * kThreshold, &buffer).ok());
+  std::memset(buffer, 43, 2 * kThreshold);
+  auto *original = buffer;
+  const auto mapped = pool.mapped_bytes();
+  const auto remaining = budget_.capacity() - budget_.used();
+  ASSERT_TRUE(budget_.try_charge_external(remaining));
+  auto refund =
+      ailego::ScopeGuard::Make([&] { budget_.release_external(remaining); });
+  ASSERT_TRUE(pool.Reallocate(2 * kThreshold, kThreshold, &buffer).ok());
+  EXPECT_EQ(original, buffer);
+  EXPECT_EQ(43, buffer[kThreshold - 1]);
+  EXPECT_EQ(1, pool.num_mapped_allocations());
+  EXPECT_EQ(2 * kThreshold, pool.max_memory());
+  EXPECT_LT(pool.mapped_bytes(), mapped);
+  EXPECT_EQ(pool.mapped_bytes(), pool.charged_bytes());
+  EXPECT_EQ(remaining + pool.charged_bytes(), budget_.external_used());
+  EXPECT_EQ(pool.charged_bytes() + remaining, budget_.committed());
+  pool.Free(buffer, kThreshold);
+  EXPECT_EQ(0u, pool.charged_bytes());
+  EXPECT_EQ(remaining, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, MappedShrinkWithinPageRetainsBackingCharge) {
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  uint8_t *buffer = nullptr;
+  ASSERT_TRUE(pool.Allocate(kThreshold + 100, &buffer).ok());
+  auto *original = buffer;
+  const auto mapped = pool.mapped_bytes();
+  ASSERT_TRUE(pool.Reallocate(kThreshold + 100, kThreshold + 99, &buffer).ok());
+  EXPECT_EQ(original, buffer);
+  EXPECT_EQ(mapped, pool.mapped_bytes());
+  EXPECT_EQ(mapped, pool.charged_bytes());
+  EXPECT_EQ(mapped, budget_.external_used());
+  EXPECT_EQ(kThreshold + 99, pool.bytes_allocated());
+  pool.Free(buffer, kThreshold + 99);
+  EXPECT_EQ(0u, budget_.external_used());
+  EXPECT_EQ(0u, budget_.committed());
+}
+
+TEST_F(ParquetBudgetTest, MappedShrinkAdmitsPreBudgetAllocation) {
+  ASSERT_EQ(0, budget_.init(0));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  uint8_t *buffer = nullptr;
+  ASSERT_TRUE(pool.Allocate(2 * kThreshold, &buffer).ok());
+  std::memset(buffer, 47, 2 * kThreshold);
+  auto *original = buffer;
+  ASSERT_EQ(0u, pool.charged_bytes());
+  ASSERT_EQ(0, budget_.init(1024 * 1024));
+  ASSERT_TRUE(budget_.try_charge_external(budget_.capacity()));
+  EXPECT_TRUE(
+      pool.Reallocate(2 * kThreshold, kThreshold, &buffer).IsOutOfMemory());
+  EXPECT_EQ(original, buffer);
+  EXPECT_EQ(47, buffer[kThreshold - 1]);
+  budget_.release_external(budget_.capacity());
+  ASSERT_TRUE(pool.Reallocate(2 * kThreshold, kThreshold, &buffer).ok());
+  EXPECT_NE(original, buffer);
+  EXPECT_EQ(47, buffer[kThreshold - 1]);
+  EXPECT_EQ(pool.mapped_bytes(), pool.charged_bytes());
+  EXPECT_EQ(pool.charged_bytes(), budget_.external_used());
+  pool.Free(buffer, kThreshold);
+  EXPECT_EQ(0u, budget_.used());
+}
+#endif
 
 TEST_F(ParquetBudgetTest, FreeUsesRecordedChargeAcrossBudgetInitialization) {
   ASSERT_EQ(0, budget_.init(0));

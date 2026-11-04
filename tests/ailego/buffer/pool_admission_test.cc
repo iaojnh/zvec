@@ -352,14 +352,6 @@ TEST_F(PoolAdmissionTest, SlabHeaderRejectsPendingPageReservations) {
 }
 
 TEST_F(PoolAdmissionTest, MandatoryConsumersWaitThroughClockOnlyPasses) {
-  // Warm producer metadata before measuring the deliberately small payload.
-  ASSERT_EQ(0, pool_.init(0));
-  auto &queue = BlockEvictionQueue::get_instance();
-  ASSERT_TRUE(queue.add_single_block({}, 0));
-  BlockEvictionQueue::BlockType stale;
-  while (queue.evict_single_block(stale)) {
-  }
-  baseline_ = pool_.queue_allocated();
   ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
   // Advance CLOCK on this thread only; the reclaimer controls the release.
   // This also avoids unrelated producer metadata allocation under pressure.

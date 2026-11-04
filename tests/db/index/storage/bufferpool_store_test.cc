@@ -1306,7 +1306,7 @@ TEST_F(BufferPoolScanBudgetTest, FullPoolRejectsDecodeAndRecoversAfterRelease) {
   auto fetch = store.fetch_checked({"value"}, {0, 1},
                                    detail::GetParquetMemoryPool().get());
   EXPECT_TRUE(fetch.status().IsOutOfMemory()) << fetch.status().ToString();
-  EXPECT_EQ(nullptr, store.fetch({"value"}, 0));
+  EXPECT_THROW(store.fetch({"value"}, 0), std::bad_alloc);
   // Opening a lazy reader may now reuse the store's immutable key without
   // allocating. Admission must still reject its first actual decode.
   auto denied_scan = store.scan({GLOBAL_DOC_ID, "value"});

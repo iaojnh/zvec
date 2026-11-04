@@ -428,17 +428,60 @@ inline int VamanaStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
     const node_id_t *ids, uint32_t count,
     std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
+  if (count == 0) {
+    return 0;
+  }
+
+  const auto first_loc = get_vector_chunk_loc(ids[0]);
+  ailego_assert_with(first_loc.first < node_chunks_.size(),
+                     "invalid chunk idx");
+  ailego_assert_with(
+      first_loc.second < node_chunks_[first_loc.first]->data_size(),
+      "invalid chunk offset");
+  if (!node_chunks_[first_loc.first]->prefer_borrowed_batch_for(
+          vector_size())) {
+    const size_t read_size = vector_size();
+    for (auto i = 0U; i < count; ++i) {
+      auto loc = get_vector_chunk_loc(ids[i]);
+      ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+      ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
+                         "invalid chunk offset");
+      IndexStorage::MemoryBlock mem_block;
+      const size_t ret = node_chunks_[loc.first]->read_borrowed(
+          loc.second, mem_block, read_size);
+      if (ailego_unlikely(ret != read_size)) {
+        LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
+                  loc.second, read_size, ret);
+        return node_chunks_[loc.first]->read_error();
+      }
+      vec_blocks[i] = std::move(mem_block);
+    }
+    return 0;
+  }
+
+  // Keep common request batches on the stack. Vamana node ids span many
+  // storage chunks, so the batch deliberately crosses Segment boundaries;
+  // BufferStorage can then deduplicate misses and submit cold pages together.
+  constexpr size_t kInlineReads = 128;
+  IndexStorage::Segment::BorrowedRead inline_reads[kInlineReads];
+  ailego::BudgetedVector<IndexStorage::Segment::BorrowedRead> overflow_reads;
+  if (count > kInlineReads) overflow_reads.resize(count);
+  auto *batch_reads =
+      count > kInlineReads ? overflow_reads.data() : inline_reads;
+  const size_t read_size = vector_size();
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
-    IndexStorage::MemoryBlock mem_block;
-    size_t ret = node_chunks_[loc.first]->read_borrowed(loc.second, mem_block,
-                                                        vector_size());
-    if (ailego_unlikely(ret != vector_size())) {
-      LOG_ERROR("Read vector failed, ret=%zu", ret);
-      return node_chunks_[loc.first]->read_error();
-    }
-    vec_blocks[i] = std::move(mem_block);
+    ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
+                       "invalid chunk offset");
+    batch_reads[i] = IndexStorage::Segment::BorrowedRead(
+        node_chunks_[loc.first].get(), loc.second, read_size, &vec_blocks[i]);
+  }
+  if (ailego_unlikely(
+          !batch_reads[0].segment->read_borrowed_batch(batch_reads, count))) {
+    LOG_ERROR("Batch read vectors failed, count=%u, read size=%zu", count,
+              read_size);
+    return batch_reads[0].segment->read_error();
   }
   return 0;
 }

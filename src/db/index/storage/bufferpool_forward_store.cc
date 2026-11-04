@@ -358,7 +358,7 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
 }
 
 ExecBatchPtr BufferPoolForwardStore::fetch(
-    const std::vector<std::string> &columns, int index) try {
+    const std::vector<std::string> &columns, int index) {
   if (!validate(columns) || index < 0 || index >= num_rows_) {
     return nullptr;
   }
@@ -380,8 +380,15 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   for (size_t i = 0; i < col_indices.size(); ++i) {
     int col_idx = col_indices[i];
     auto buffer_id = ParquetBufferID(file_path_, col_idx, rg_id, metadata_id_);
-    auto buffer_handle =
-        ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+    auto acquired =
+        ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
+    if (!acquired.ok()) {
+      if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+      LOG_ERROR("Failed to acquire parquet scalar: %s",
+                acquired.status().ToString().c_str());
+      return nullptr;
+    }
+    auto buffer_handle = std::move(acquired).ValueOrDie();
     std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
         buffer_handle.data();
 
@@ -398,6 +405,7 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
     const int64_t local_index = index - offset;
     auto scalar_result = col_chunked_array->GetScalar(local_index);
     if (!scalar_result.ok()) {
+      if (scalar_result.status().IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("Failed to get scalar for row %zu status: %s",
                 static_cast<size_t>(local_index),
                 scalar_result.status().ToString().c_str());
@@ -408,9 +416,6 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   }
 
   return std::make_shared<arrow::compute::ExecBatch>(std::move(scalars), 1);
-} catch (const std::bad_alloc &) {
-  LOG_ERROR("Forward scalar fetch metadata budget exhausted");
-  return nullptr;
 }
 
 RecordBatchReaderPtr BufferPoolForwardStore::scan(

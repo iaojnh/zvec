@@ -311,7 +311,7 @@ Status RocksdbContext::validate_and_set_db_path(const std::string &db_path,
 
 void RocksdbContext::prepare_options(
     std::shared_ptr<rocksdb::MergeOperator> merge_op, bool writable) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
   // Buffered file writes already use the OS cache. Avoid another growable
   // malloc-backed copy whose freed buffers can remain resident after build.
   // A zero capacity selects RocksDB's direct-to-file buffered-I/O path; direct
@@ -369,8 +369,20 @@ void RocksdbContext::prepare_options(
   // Merge operator
   if (merge_op) {
     create_opts_.merge_operator = merge_op;
-    create_opts_.max_successive_merges = 100;
     create_opts_.write_buffer_size = 8 << 20;
+  }
+  // FTS installs its merge operator per column family, not on create_opts_.
+  // Apply the same operand-chain limit before any CF options are copied.
+  // Otherwise hot terms accumulate unbounded MergeHelper arrays at flush.
+  const bool has_merge_operator =
+      merge_op ||
+      std::any_of(per_cf_merge_ops_.begin(), per_cf_merge_ops_.end(),
+                  [](const auto &entry) { return entry.second != nullptr; });
+  if (has_merge_operator) {
+    create_opts_.max_successive_merges = 100;
+    // RocksDB's eager merge issues Get while inserting into the memtable;
+    // it must use the serialized insertion path, including grouped writers.
+    create_opts_.allow_concurrent_memtable_write = false;
   }
 
   // All RocksDB-backed features (ID map, scalar inverted indexes and FTS)

@@ -44,9 +44,31 @@ constexpr size_t kSlabBytes = MemoryLimitPool::slab_size();
 constexpr size_t kSlabAlignment = MemoryLimitPool::slab_alignment();
 constexpr size_t kMaxSlabDataPages = kSlabBytes / kMinimumPageBytes - 1;
 
-struct alignas(std::max_align_t) QueueAllocationHeader {
-  size_t bytes;
-};
+constexpr size_t kQueueSmallBytes = 4096;
+constexpr size_t kQueueSlabBytes = 64UL << 10;
+constexpr size_t kQueueAlignment = alignof(std::max_align_t);
+static_assert(kQueueSmallBytes % kQueueAlignment == 0,
+              "queue size classes must preserve maximum alignment");
+
+void *map_queue_memory(size_t bytes) {
+#if defined(_WIN32)
+  return ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
+                        PAGE_READWRITE);
+#else
+  void *data = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return data == MAP_FAILED ? nullptr : data;
+#endif
+}
+
+bool unmap_queue_memory(void *data, size_t bytes) {
+#if defined(_WIN32)
+  (void)bytes;
+  return ::VirtualFree(data, 0, MEM_RELEASE) != 0;
+#else
+  return ::munmap(data, bytes) == 0;
+#endif
+}
 
 static_assert((kSlabAlignment & (kSlabAlignment - 1)) == 0,
               "slab alignment must be a power of two");
@@ -141,6 +163,48 @@ bool discard_slab_page(char *page, size_t page_size) {
 
 }  // namespace
 
+struct alignas(std::max_align_t) MemoryLimitPool::QueueAllocationHeader {
+  size_t bytes{0};
+  union {
+    QueueMemorySlab *owner;
+    QueueAllocationHeader *next_free;
+  };
+};
+
+struct MemoryLimitPool::QueueMemorySlab {
+  QueueMemorySlab(size_t allocation_size, size_t region_bytes)
+      : slot_size(allocation_size),
+        mapping_bytes(region_bytes),
+        next_unused((sizeof(QueueMemorySlab) + kQueueAlignment - 1) &
+                    ~(kQueueAlignment - 1)) {}
+
+  bool has_space() const {
+    return free_head != nullptr || slot_size <= mapping_bytes - next_unused;
+  }
+  void link(QueueMemorySlab *&head) {
+    previous = nullptr;
+    next = head;
+    if (head) head->previous = this;
+    head = this;
+  }
+  void unlink(QueueMemorySlab *&head) {
+    if (previous)
+      previous->next = next;
+    else
+      head = next;
+    if (next) next->previous = previous;
+    previous = next = nullptr;
+  }
+
+  QueueMemorySlab *previous{nullptr};
+  QueueMemorySlab *next{nullptr};
+  size_t slot_size;
+  size_t mapping_bytes;
+  size_t next_unused;
+  size_t live_slots{0};
+  QueueAllocationHeader *free_head{nullptr};
+};
+
 void *EvictionQueueTraits::malloc(size_t bytes) {
   return MemoryLimitPool::get_instance().allocate_queue_memory(bytes);
 }
@@ -150,40 +214,95 @@ void EvictionQueueTraits::free(void *ptr) {
 }
 
 void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
-  if (bytes >
-      std::numeric_limits<size_t>::max() - sizeof(QueueAllocationHeader)) {
+  if (bytes > std::numeric_limits<size_t>::max() -
+                  sizeof(QueueAllocationHeader) - (kQueueAlignment - 1)) {
     return nullptr;
   }
-  const size_t total = sizeof(QueueAllocationHeader) + bytes;
+  const size_t total =
+      (sizeof(QueueAllocationHeader) + bytes + kQueueAlignment - 1) &
+      ~(kQueueAlignment - 1);
   std::lock_guard<std::mutex> lock(queue_memory_mutex_);
-  const size_t allocated =
-      queue_allocated_size_.load(std::memory_order_relaxed);
-  if (total > std::numeric_limits<size_t>::max() - allocated) {
-    return nullptr;
-  }
   const bool charged = pool_size_.load(std::memory_order_relaxed) != 0;
-  if (charged && !try_reserve_allocation(total)) {
+  const auto reserve = [this, charged](size_t size) {
+    if (size > std::numeric_limits<size_t>::max() -
+                   queue_allocated_size_.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    if (charged && !try_reserve_allocation(size)) return false;
+    if (charged) {
+      metadata_used_size_.fetch_add(size, std::memory_order_relaxed);
+      queue_charged_size_.fetch_add(size, std::memory_order_relaxed);
+    }
+    return true;
+  };
+  const auto rollback = [this, charged](size_t size) {
+    if (charged) {
+      queue_charged_size_.fetch_sub(size, std::memory_order_relaxed);
+      release_metadata(size);
+    }
+  };
+  const auto denied = [this]() -> void * {
     // Do not call try_charge_metadata here: that can recurse into this same
     // queue with owner/lifecycle locks held. Existing enqueue-failure recovery
     // retries registration after capacity becomes available.
     high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
     bg_cv_.notify_one();
     return nullptr;
-  }
-  if (charged) {
-    metadata_used_size_.fetch_add(total, std::memory_order_relaxed);
-    queue_charged_size_.fetch_add(total, std::memory_order_relaxed);
-  }
-  void *raw = std::malloc(total);
-  if (!raw) {
-    if (charged) {
-      queue_charged_size_.fetch_sub(total, std::memory_order_relaxed);
-      release_metadata(total);
+  };
+  const size_t page = page_buffer_size();
+  if (total <= kQueueSmallBytes) {
+    const size_t index = total / kQueueAlignment - 1;
+    auto *slab = queue_small_slabs_[index];
+    if (!slab) {
+      const size_t slab_header =
+          (sizeof(QueueMemorySlab) + kQueueAlignment - 1) &
+          ~(kQueueAlignment - 1);
+      const size_t minimum = (slab_header + total + page - 1) & ~(page - 1);
+      size_t region_bytes = std::max(kQueueSlabBytes, page);
+      if (!reserve(region_bytes)) {
+        region_bytes = minimum;
+        if (region_bytes >= std::max(kQueueSlabBytes, page) ||
+            !reserve(region_bytes)) {
+          return denied();
+        }
+      }
+      void *raw = map_queue_memory(region_bytes);
+      if (!raw) {
+        rollback(region_bytes);
+        return nullptr;
+      }
+      slab = new (raw) QueueMemorySlab(total, region_bytes);
+      slab->link(queue_small_slabs_[index]);
+      queue_allocated_size_.fetch_add(region_bytes, std::memory_order_relaxed);
     }
+    QueueAllocationHeader *header = slab->free_head;
+    if (header) {
+      slab->free_head = header->next_free;
+    } else {
+      header = new (reinterpret_cast<char *>(slab) + slab->next_unused)
+          QueueAllocationHeader{};
+      slab->next_unused += total;
+    }
+    header->bytes = total;
+    header->owner = slab;
+    ++slab->live_slots;
+    if (!slab->has_space()) slab->unlink(queue_small_slabs_[index]);
+    return header + 1;
+  }
+  if (total > std::numeric_limits<size_t>::max() - (page - 1)) {
     return nullptr;
   }
-  auto *header = new (raw) QueueAllocationHeader{total};
-  queue_allocated_size_.fetch_add(total, std::memory_order_relaxed);
+  const size_t region_bytes = (total + page - 1) & ~(page - 1);
+  if (!reserve(region_bytes)) return denied();
+  void *raw = map_queue_memory(region_bytes);
+  if (!raw) {
+    rollback(region_bytes);
+    return nullptr;
+  }
+  auto *header = new (raw) QueueAllocationHeader{};
+  header->bytes = region_bytes;
+  header->owner = nullptr;
+  queue_allocated_size_.fetch_add(region_bytes, std::memory_order_relaxed);
   return header + 1;
 }
 
@@ -192,9 +311,40 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
     return;
   }
   auto *header = static_cast<QueueAllocationHeader *>(ptr) - 1;
-  const size_t bytes = header->bytes;
   std::lock_guard<std::mutex> lock(queue_memory_mutex_);
-  std::free(header);
+  size_t bytes = header->bytes;
+  if (auto *slab = header->owner) {
+    const size_t index = slab->slot_size / kQueueAlignment - 1;
+    const bool was_full = !slab->has_space();
+    if (--slab->live_slots != 0) {
+      header->next_free = slab->free_head;
+      slab->free_head = header;
+      if (was_full) slab->link(queue_small_slabs_[index]);
+      return;
+    }
+    bytes = slab->mapping_bytes;
+    auto *previous = slab->previous;
+    auto *next = slab->next;
+    // Save links before unmapping; do not access any slab/header byte after
+    // releasing the region. Other live neighbors always retain the charge.
+    if (!unmap_queue_memory(slab, bytes)) {
+      header->next_free = slab->free_head;
+      slab->free_head = header;
+      if (was_full) slab->link(queue_small_slabs_[index]);
+      LOG_ERROR("Failed to unmap queue slab; backing remains charged");
+      return;
+    }
+    if (!was_full) {
+      if (previous)
+        previous->next = next;
+      else
+        queue_small_slabs_[index] = next;
+      if (next) next->previous = previous;
+    }
+  } else if (!unmap_queue_memory(header, bytes)) {
+    LOG_ERROR("Failed to unmap queue allocation; backing remains charged");
+    return;
+  }
   queue_allocated_size_.fetch_sub(bytes, std::memory_order_relaxed);
   if (pool_size_.load(std::memory_order_relaxed) != 0) {
     queue_charged_size_.fetch_sub(bytes, std::memory_order_relaxed);
@@ -295,11 +445,33 @@ void MemoryLimitPool::release_retained_block(void *data) {
     const size_t bytes = block->bytes;
     auto *counter =
         block->metadata ? &metadata_used_size_ : &external_used_size_;
-    block->next = retained_free_;
-    retained_free_ = block;
-    retained_idle_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    // Retained mappings share the idle reserve with free data pages. Returning
+    // a burst of Arrow chunks must not leave excess backing resident until
+    // paced background maintenance catches up. The owner has relinquished
+    // this entire block; live/pinned allocations are never reclaimed here.
+    const size_t committed = committed_size_.load(std::memory_order_relaxed);
+    const size_t used = used_size_.load(std::memory_order_relaxed);
+    const size_t idle = committed > used ? committed - used : 0;
+    const size_t reserve = reserve_margin(capacity());
+    bool unmapped = false;
+    if (idle > reserve || bytes > reserve - idle) {
+#if defined(_WIN32)
+      unmapped = ::VirtualFree(block, 0, MEM_RELEASE) != 0;
+#else
+      unmapped = ::munmap(block, bytes) == 0;
+#endif
+    }
+    if (unmapped) {
+      retained_block_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+      committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    } else {
+      // A failed physical release keeps the backing and its committed charge.
+      block->next = retained_free_;
+      retained_free_ = block;
+      retained_idle_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
     counter->fetch_sub(bytes, std::memory_order_relaxed);
-    // Publish the idle block before allowing init() to observe no owners.
+    // Publish idle backing or finish unmapping before init() sees no owners.
     used_size_.fetch_sub(bytes, std::memory_order_relaxed);
   }
   { std::lock_guard<std::mutex> lock(capacity_mutex_); }
@@ -1362,13 +1534,41 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
     capacity_cv_.notify_one();
     return;
   }
-  push_free_buffer(buffer, pick_shard());
-  // Publish the free buffer before releasing its logical budget slot.
+  // Owner retirement can return hundreds of MiB before the paced background
+  // maintenance catches up. Keep the existing small reuse reserve, but do
+  // not publish excess idle backing only to discard it several seconds later.
+  // The returning page is exclusively owned here; cached/pinned pages are
+  // never touched. Concurrent returns may overshoot the hint by one page per
+  // returner. A discard failure keeps both the backing and its charge.
+  const size_t reserve = reserve_margin(capacity());
+  size_t committed = committed_size_.load(std::memory_order_relaxed);
+  size_t used = used_size_.load(std::memory_order_relaxed);
+  size_t released_retained = 0;
+  if (committed > used && committed - used >= reserve &&
+      retained_idle_bytes_.load(std::memory_order_relaxed) != 0) {
+    // Idle mappings and free pages share one reserve. Prefer retiring an
+    // exclusively idle mapping before discarding a page in an active reuse
+    // cycle; otherwise old mappings can force a discard/refault on every
+    // cache eviction. Unmapping still precedes any backing-budget refund.
+    released_retained = trim_retained_blocks(buffer_size);
+    committed = committed_size_.load(std::memory_order_relaxed);
+    used = used_size_.load(std::memory_order_relaxed);
+  }
+  const bool discarded = committed > used && committed - used >= reserve &&
+                         reclaim_slab_buffer(buffer);
+  if (!discarded) {
+    push_free_buffer(buffer, pick_shard());
+  }
+  // Publish reusable backing or physically discard it before releasing used.
   size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
   (void)prev;
   assert(prev >= buffer_size);
   { std::lock_guard<std::mutex> lock(capacity_mutex_); }
-  capacity_cv_.notify_one();
+  if (released_retained != 0) {
+    capacity_cv_.notify_all();
+  } else {
+    capacity_cv_.notify_one();
+  }
 }
 
 void MemoryLimitPool::release_external(const size_t buffer_size) {
