@@ -17,4 +17,10 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
       CC_TARGET STREQUAL "diskann_linux_io_diagnostic_test"))
     target_link_libraries(${CC_TARGET} proc)
   endif()
+  if(DISKANN_CONTROLLED_IO_BENCHMARK AND
+     (CC_TARGET STREQUAL "diskann_platform_benchmark_test" OR
+      CC_TARGET STREQUAL "diskann_controlled_io_test"))
+    target_compile_definitions(${CC_TARGET} PRIVATE
+        ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK=1)
+  endif()
 endforeach()

@@ -33,6 +33,7 @@
 #endif
 
 #include "diskann_benchmark_counters.h"
+#include "diskann_controlled_io.h"
 #if defined(__APPLE__)
 #include "../../apple_io_phase_gate.h"
 #endif
@@ -120,6 +121,20 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   const std::string mode = Env("ZVEC_BENCH_MODE");
   ASSERT_TRUE(algorithm == "diskann" || algorithm == "hnsw");
   ASSERT_TRUE(mode == "build" || mode == "query");
+  const bool controlled_io = Env("ZVEC_BENCH_CONTROLLED_IO") == "1";
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+  std::unique_ptr<zvec::core::benchmark::IOModel> io_model;
+  std::unique_ptr<zvec::core::benchmark::ControlledScope> controlled_scope;
+  if (controlled_io && algorithm == "diskann" && mode == "query") {
+    io_model = std::make_unique<zvec::core::benchmark::IOModel>(
+        std::stoull(Env("ZVEC_BENCH_IO_LATENCY_NS", "200000")),
+        std::stoul(Env("ZVEC_BENCH_IO_QUEUE_DEPTH", "8")),
+        std::stoull(Env("ZVEC_BENCH_IO_BYTES_PER_SECOND", "1048576000")));
+    controlled_scope = std::make_unique<zvec::core::benchmark::ControlledScope>(*io_model);
+  }
+#else
+  ASSERT_FALSE(controlled_io) << "Rebuild with DISKANN_CONTROLLED_IO_BENCHMARK=ON";
+#endif
   const auto base_header = ReadMatrix<float>(root + "/base.fbin", true);
   const auto dimension = base_header.columns;
   const auto index_path = root + "/" + algorithm + ".index";
@@ -254,14 +269,29 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   uint64_t correct = 0;
   double elapsed_ms = 0;
   std::vector<double> latencies;
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+  std::vector<double> model_latencies;
+  uint64_t model_reads = 0, model_bytes = 0, model_batches = 0;
+#endif
   for (uint32_t round = 0; round < repetitions; ++round) {
     for (uint32_t q = calibration_count; q < queries.rows; ++q) {
       SearchResult result;
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+      if (io_model) io_model->reset();
+#endif
       const auto start = Clock::now();
       const int ret = search(q, budget, &result);
       const double ms = Milliseconds(start);
       ASSERT_EQ(0, ret);
       ASSERT_EQ(10U, result.doc_list_.size());
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+      if (io_model) {
+        model_latencies.push_back(io_model->now_ns() / 1000000.0);
+        model_reads += io_model->requests();
+        model_bytes += io_model->bytes();
+        model_batches += io_model->batches();
+      }
+#endif
       latencies.push_back(ms);
       elapsed_ms += ms;
       correct += hits(q, result);
@@ -308,7 +338,30 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   record << ",\"timed_cpu_seconds\":"
          << after_timing.cpu_seconds - before_timing.cpu_seconds
          << ",\"timed_major_faults\":"
-         << after_timing.major_faults - before_timing.major_faults << "}}";
+         << after_timing.major_faults - before_timing.major_faults << "}";
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+  if (io_model) {
+    const auto reader = zvec::core::benchmark::ActiveReader().lock();
+    ASSERT_NE(nullptr, reader) << "Controlled reader was not installed";
+    ASSERT_GT(model_reads, 0U);
+    double model_ms = 0;
+    for (double value : model_latencies) model_ms += value;
+    record << ",\"controlled_io\":{\"kind\":\"discrete-event-no-cache\""
+           << ",\"latency_ns\":" << io_model->latency_ns()
+           << ",\"queue_depth\":" << io_model->queue_depth()
+           << ",\"bytes_per_second\":" << io_model->bytes_per_second()
+           << ",\"resident_backing_bytes\":" << reader->image_bytes()
+           << ",\"reads\":" << model_reads << ",\"bytes\":" << model_bytes
+           << ",\"batches\":" << model_batches
+           << ",\"io_only_p50_ms\":" << Percentile(model_latencies, 0.50)
+           << ",\"io_only_p95_ms\":" << Percentile(model_latencies, 0.95)
+           << ",\"io_only_p99_ms\":" << Percentile(model_latencies, 0.99)
+           << ",\"io_only_qps\":" << model_latencies.size() * 1000.0 / model_ms
+           << ",\"memory_is_product_rss\":false"
+           << ",\"wall_qps_is_native_disk_qps\":false}";
+  }
+#endif
+  record << "}";
   ASSERT_EQ(0, index->close());
   BenchmarkEmit(record, Env("ZVEC_BENCH_RESULT_PATH"));
 #endif

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "diskann_indexer.h"
+#include "diskann_benchmark_hook.h"
 #include <algorithm>
 #include <exception>
 #include <iostream>
@@ -28,6 +29,15 @@
 
 namespace zvec {
 namespace core {
+
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+namespace benchmark {
+ReaderFactory &ControlledReaderFactory() {
+  static thread_local ReaderFactory factory = nullptr;
+  return factory;
+}
+}  // namespace benchmark
+#endif
 
 namespace {
 
@@ -250,6 +260,16 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
     cached_file.reset();
   }
 
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+  if (benchmark::ControlledReaderFactory()) {
+    auto controlled = benchmark::ControlledReaderFactory()(file_path);
+    if (!controlled) {
+      return IndexError_Runtime;
+    }
+    reader_->close();
+    reader_ = std::move(controlled);
+  }
+#endif
   if (reader_->requires_io_context()) {
     ret = setup_io_ctx(init_ctx_);
     if (ret != 0) {

@@ -1,0 +1,245 @@
+name: DiskANN Controlled Storage Model
+
+on:
+  push:
+    branches: [codex/diskann-controlled-io]
+  workflow_dispatch:
+    inputs:
+      vectors:
+        description: SIFT vector count
+        default: '100000'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diskann-controlled-io-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '3'
+  OPENBLAS_NUM_THREADS: '2'
+
+jobs:
+  fixture:
+    name: Canonical trained indexes and queries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1 numpy h5py
+      - run: python -m unittest discover -s scripts/tests -p test_diskann_controlled_io.py -v
+      - name: Build benchmark and model regression tests
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DENABLE_WERROR=ON \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DDISKANN_CONTROLLED_IO_BENCHMARK=ON
+          cmake --build build --target diskann_platform_benchmark_test diskann_controlled_io_test --parallel 3
+          build/bin/diskann_controlled_io_test
+      - name: Prepare data, train once and freeze query budgets
+        env:
+          VECTOR_COUNT: ${{ inputs.vectors || '100000' }}
+        run: |
+          python scripts/prepare_diskann_platform_data.py --output benchmark-data --count "$VECTOR_COUNT"
+          python scripts/benchmark_diskann_controlled_io.py --binary build/bin/diskann_platform_benchmark_test \
+            --data benchmark-data --output fixture-results --label canonical-linux-x86_64 --prepare-fixture
+      - uses: actions/upload-artifact@v7
+        with:
+          name: diskann-controlled-fixture
+          path: benchmark-data/
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: controlled-canonical-results
+          path: fixture-results/
+
+  desktop:
+    needs: fixture
+    name: Controlled model (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: linux-x86_64, runner: ubuntu-24.04}
+          - {label: linux-arm64, runner: ubuntu-24.04-arm}
+          - {label: windows-x86_64, runner: windows-2025, msvc: x64}
+          - {label: windows-arm64, runner: windows-11-arm, msvc: arm64}
+          - {label: macos-arm64, runner: macos-15}
+          - {label: macos-x86_64, runner: macos-15-intel}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.msvc }}
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build controlled benchmark
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DENABLE_WERROR=ON \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DDISKANN_CONTROLLED_IO_BENCHMARK=ON
+          cmake --build build --target diskann_platform_benchmark_test diskann_controlled_io_test --parallel 3
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-controlled-fixture
+          path: benchmark-data
+      - name: Replay identical indexes under identical storage costs
+        shell: bash
+        env:
+          LABEL: ${{ matrix.label }}
+          HOST_OS: ${{ runner.os }}
+        run: |
+          suffix=""
+          if [[ "$HOST_OS" == Windows ]]; then suffix=.exe; fi
+          "build/bin/diskann_controlled_io_test$suffix"
+          python scripts/benchmark_diskann_controlled_io.py --binary "build/bin/diskann_platform_benchmark_test$suffix" \
+            --data benchmark-data --output controlled-results --label "$LABEL"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: controlled-${{ matrix.label }}
+          path: controlled-results/
+          retention-days: 30
+
+  summary:
+    needs: [desktop, android, ios]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: controlled-*
+          path: all-results
+      - name: Verify common fixture/model and summarize all eight environments
+        run: python scripts/summarize_diskann_controlled_io.py --results all-results --output summary/controlled-comparison.md
+      - name: Publish summary
+        if: always()
+        run: |
+          if test -f summary/controlled-comparison.md; then
+            cat summary/controlled-comparison.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-controlled-summary
+          path: summary/
+
+  android:
+    needs: fixture
+    name: Controlled model (Android x86_64 emulator)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Build controlled Android benchmark
+        run: |
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          sdkmanager --install 'ndk;26.1.10909125' 'platforms;android-34'
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/26.1.10909125/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=x86_64 -DANDROID_NATIVE_API_LEVEL=34 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_NATIVE=OFF -DAUTO_DETECT_ARCH=OFF -DENABLE_WERROR=ON \
+            -DDISKANN_CONTROLLED_IO_BENCHMARK=ON
+          cmake --build build --target diskann_platform_benchmark_test --parallel 3
+          sudo chmod 666 /dev/kvm
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-controlled-fixture
+          path: benchmark-data
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: python scripts/benchmark_diskann_controlled_io.py --binary build/bin/diskann_platform_benchmark_test --data benchmark-data --output controlled-results --label android-x86_64-emulator --transport android
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: controlled-android-emulator
+          path: controlled-results/
+          retention-days: 30
+
+  ios:
+    needs: fixture
+    name: Controlled model (iOS ARM64 simulator)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build controlled iOS benchmark
+        run: |
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          cmake -S . -B build -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DIOS=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_WERROR=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DDISKANN_CONTROLLED_IO_BENCHMARK=ON
+          cmake --build build --target diskann_platform_benchmark_test --parallel 3
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-controlled-fixture
+          path: benchmark-data
+      - name: Replay in simulator
+        run: |
+          device=$(xcrun simctl list devices available -j | python -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          print(next(x["udid"] for r,ds in d["devices"].items() if "iOS" in r for x in ds if "iPhone" in x["name"]))')
+          echo "CONTROLLED_IO_DEVICE=$device" >> "$GITHUB_ENV"
+          xcrun simctl boot "$device"
+          xcrun simctl bootstatus "$device" -b
+          python scripts/benchmark_diskann_controlled_io.py --binary build/bin/diskann_platform_benchmark_test.app \
+            --data benchmark-data --output controlled-results --label ios-arm64-simulator \
+            --transport ios --device "$device"
+      - name: Shutdown simulator
+        if: always() && env.CONTROLLED_IO_DEVICE != ''
+        run: xcrun simctl shutdown "$CONTROLLED_IO_DEVICE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: controlled-ios-simulator
+          path: controlled-results/
+          retention-days: 30
