@@ -137,7 +137,9 @@ TEST(DiskAnnNativePacing, SplitsNativeBatchesAndPreservesCompletionIndices) {
 TEST(DiskAnnNativePacing, ConcurrentWorkersShareOneRateAndDepthBudget) {
   for (const auto config : {PaceConfig{1000, 0, 8}, PaceConfig{0, 4096000, 8}, PaceConfig{0, 0, 8}}) {
   auto native = std::make_shared<ImmediateNativeReader>();
-  native->pause_ms = 2;
+  // Slow native I/O is only needed for depth contention. Ordinary OS sleep
+  // can coalesce beyond the rate interval, hiding a correctly idle limiter.
+  native->pause_ms = (config.iops || config.bytes_per_second) ? 0 : 2;
   NativeRateLimiter limiter(config);
   RateLimitedReader reader(native, limiter);
   ConcurrentQueryWorkers workers(8);
