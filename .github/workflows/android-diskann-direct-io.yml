@@ -1,0 +1,95 @@
+name: DiskANN Android Direct I/O
+
+on:
+  push:
+    branches: [codex/test-diskann-platform-metrics]
+    paths:
+      - '.github/workflows/android-diskann-direct-io.yml'
+      - 'scripts/verify_android_diskann_io.py'
+      - 'src/core/algorithm/diskann/diskann_file_reader.*'
+      - 'tests/core/algorithm/diskann/diskann_android_io_test.cc'
+      - 'tests/core/algorithm/diskann/CMakeLists.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diskann-android-direct-io-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android direct I/O (${{ matrix.abi }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [x86_64, arm64-v8a]
+    env:
+      NDK_VERSION: '26.1.10909125'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install build tools and NDK
+        run: |
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          sdkmanager --install "ndk;$NDK_VERSION" "platforms;android-34"
+      - name: Build production reader, regression tests, and query benchmark
+        env:
+          ANDROID_ABI_NAME: ${{ matrix.abi }}
+        run: |
+          cmake -S . -B build-android-io -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ANDROID_ABI_NAME" -DANDROID_NATIVE_API_LEVEL=34 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_NATIVE=OFF -DAUTO_DETECT_ARCH=OFF -DENABLE_WERROR=ON
+          cmake --build build-android-io --target diskann_android_io_test diskann_mobile_compat_test diskann_platform_benchmark_test --parallel 3
+      - uses: actions/download-artifact@v8
+        if: matrix.abi == 'x86_64'
+        with:
+          name: diskann-platform-dataset
+          run-id: 41970844265
+          github-token: ${{ github.token }}
+          path: benchmark-data
+      - name: Enable KVM
+        if: matrix.abi == 'x86_64'
+        run: sudo chmod 666 /dev/kvm
+      - name: Run production cache probes, fallback regressions, and actual queries
+        if: matrix.abi == 'x86_64'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          ram-size: 4096M
+          heap-size: 1024M
+          disable-animations: true
+          script: python scripts/verify_android_diskann_io.py --binaries build-android-io/bin --data benchmark-data --output android-io-results
+      - name: Publish verification summary
+        if: always() && matrix.abi == 'x86_64'
+        run: |
+          if test -f android-io-results/verification.md; then
+            cat android-io-results/verification.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-android-direct-io-${{ matrix.abi }}
+          path: android-io-results/
+          if-no-files-found: warn
+          retention-days: 30

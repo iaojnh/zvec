@@ -298,7 +298,9 @@ int destroy_io_ctx(IOContext &ctx) {
 }
 
 #if !defined(_WIN32) && !defined(_WIN64)
-static int execute_one_pread(int fd, const AlignedRead &req) {
+static int execute_one_pread(int fd, const AlignedRead &req,
+                             int *io_errno = nullptr) {
+  if (io_errno != nullptr) *io_errno = 0;
   auto *buf = static_cast<uint8_t *>(req.buf);
   uint64_t offset = req.offset;
   uint64_t remaining = req.len;
@@ -321,8 +323,13 @@ static int execute_one_pread(int fd, const AlignedRead &req) {
       continue;
     }
 
-    LOG_ERROR("pread failed; errno=%d, %s, offset=%llu, len=%llu", errno,
-              ::strerror(errno), (unsigned long long)offset,
+    const int read_errno = errno;
+    if (io_errno != nullptr) {
+      *io_errno = read_errno;
+      return IndexError_Runtime;
+    }
+    LOG_ERROR("pread failed; errno=%d, %s, offset=%llu, len=%llu", read_errno,
+              ::strerror(read_errno), (unsigned long long)offset,
               (unsigned long long)remaining);
     return IndexError_Runtime;
   }
@@ -526,7 +533,15 @@ int execute_io(IOContext ctx, int fd, std::vector<AlignedRead> &read_reqs,
 }
 
 LinuxAlignedFileReader::LinuxAlignedFileReader(int file_desc) {
+#if defined(__ANDROID__)
+  this->file_desc = -1;
+  if (file_desc >= 0) {
+    (void)open_android_from_handle("(owned descriptor)", file_desc);
+    ::close(file_desc);
+  }
+#else
   this->file_desc = file_desc;
+#endif
 }
 
 LinuxAlignedFileReader::LinuxAlignedFileReader() {
@@ -534,10 +549,7 @@ LinuxAlignedFileReader::LinuxAlignedFileReader() {
 }
 
 LinuxAlignedFileReader::~LinuxAlignedFileReader() {
-  if (file_desc >= 0) {
-    ::close(file_desc);
-    file_desc = -1;
-  }
+  close();
 }
 
 static int duplicate_file_descriptor(int source_fd) {
@@ -555,8 +567,8 @@ static int duplicate_file_descriptor(int source_fd) {
 #endif
 }
 
-#if defined(__linux__) && !defined(__ANDROID__)
-static int reopen_file_descriptor_with_direct_io(int source_fd) {
+#if defined(__linux__)
+static int reopen_linux_file_descriptor(int source_fd, int extra_flags) {
   // dup()/F_DUPFD_CLOEXEC shares one open-file description with source_fd, so
   // changing O_DIRECT through F_SETFL would also change the caller's buffered
   // FileReadStorage handle. Reopening the procfs descriptor gives DiskAnn an
@@ -572,11 +584,55 @@ static int reopen_file_descriptor_with_direct_io(int source_fd) {
     return -1;
   }
 
-  int flags = O_RDONLY | O_DIRECT | O_LARGEFILE;
+  int flags = O_RDONLY | O_LARGEFILE | extra_flags;
 #if defined(O_CLOEXEC)
   flags |= O_CLOEXEC;
 #endif
   return ::open(fd_path, flags);
+}
+
+static int reopen_file_descriptor_with_direct_io(int source_fd) {
+  return reopen_linux_file_descriptor(source_fd, O_DIRECT);
+}
+#endif
+
+#if defined(__ANDROID__)
+int LinuxAlignedFileReader::open_android_from_handle(const std::string &fname,
+                                                    int source_fd) {
+  const int source_flags = ::fcntl(source_fd, F_GETFL);
+  if (source_flags < 0) {
+    LOG_ERROR("DiskAnn Android: invalid source descriptor for %s (errno=%d)",
+              fname.c_str(), errno);
+    return IndexError_OpenFile;
+  }
+  // Never change F_SETFL on a dup(): that would also change the caller's
+  // metadata handle. Capture a buffered fallback for the same inode before
+  // attempting an independent direct-I/O descriptor.
+  const int buffered_fd = (source_flags & O_DIRECT)
+                              ? reopen_linux_file_descriptor(source_fd, 0)
+                              : duplicate_file_descriptor(source_fd);
+  if (buffered_fd < 0) {
+    LOG_ERROR("DiskAnn Android: cannot capture fallback for %s (errno=%d: %s)",
+              fname.c_str(), errno, ::strerror(errno));
+    return IndexError_OpenFile;
+  }
+  const int direct_fd = reopen_file_descriptor_with_direct_io(source_fd);
+  if (direct_fd < 0) {
+    const int direct_errno = errno;
+    file_desc = buffered_fd;
+    android_fallback_errno_.store(direct_errno, std::memory_order_relaxed);
+    LOG_WARN("DiskAnn Android: O_DIRECT open failed for %s (errno=%d: %s); "
+             "falling back to buffered pread; OS file cache may be used",
+             fname.c_str(), direct_errno, ::strerror(direct_errno));
+  } else {
+    file_desc = direct_fd;
+    android_buffered_fd_ = buffered_fd;
+    android_direct_active_.store(true, std::memory_order_release);
+    LOG_INFO("DiskAnn Android: O_DIRECT requested for %s; using synchronous "
+             "pread (cache bypass still depends on the filesystem)",
+             fname.c_str());
+  }
+  return 0;
 }
 #endif
 
@@ -645,6 +701,18 @@ static void configure_macos_reader(int file_desc, const std::string &fname) {
 #endif
 
 void LinuxAlignedFileReader::open(const std::string &fname) {
+  close();
+#if defined(__ANDROID__)
+  const int source_fd = ::open(fname.c_str(), O_RDONLY | O_CLOEXEC);
+  if (source_fd < 0) {
+    LOG_ERROR("DiskAnn Android: open failed for %s (errno=%d: %s)",
+              fname.c_str(), errno, ::strerror(errno));
+    return;
+  }
+  (void)open_android_from_handle(fname, source_fd);
+  ::close(source_fd);
+  return;
+#else
   int flags = O_RDONLY;
 
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -677,6 +745,7 @@ void LinuxAlignedFileReader::open(const std::string &fname) {
 #endif
 
   LOG_INFO("Opened file : %s", fname.c_str());
+#endif
 }
 
 int LinuxAlignedFileReader::open_from_handle(const std::string &fname,
@@ -686,6 +755,10 @@ int LinuxAlignedFileReader::open_from_handle(const std::string &fname,
     LOG_ERROR("Cannot capture DiskAnn file from an invalid descriptor");
     return IndexError_InvalidArgument;
   }
+
+#if defined(__ANDROID__)
+  return open_android_from_handle(fname, source_fd);
+#else
 
   int duplicate_fd = -1;
   bool has_independent_file_description = false;
@@ -739,9 +812,18 @@ int LinuxAlignedFileReader::open_from_handle(const std::string &fname,
   file_desc = duplicate_fd;
   LOG_INFO("Captured open DiskAnn file object: %s", fname.c_str());
   return 0;
+#endif
 }
 
 void LinuxAlignedFileReader::close() {
+#if defined(__ANDROID__)
+  android_direct_active_.store(false, std::memory_order_relaxed);
+  android_fallback_errno_.store(0, std::memory_order_relaxed);
+  if (android_buffered_fd_ >= 0) {
+    ::close(android_buffered_fd_);
+    android_buffered_fd_ = -1;
+  }
+#endif
   if (file_desc >= 0) {
     ::close(file_desc);
     file_desc = -1;
@@ -759,9 +841,38 @@ int LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
     return IndexError_Runtime;
   }
 
-  int ret = execute_io(ctx, this->file_desc, read_reqs);
-
-  return ret;
+#if defined(__ANDROID__)
+  (void)ctx;
+  if (android_direct_active_.load(std::memory_order_acquire)) {
+    for (const auto &request : read_reqs) {
+      int read_errno = 0;
+      const int ret = execute_one_pread(file_desc, request, &read_errno);
+      if (ret == 0) continue;
+      if (read_errno != EINVAL && read_errno != EOPNOTSUPP &&
+          read_errno != ENOSYS) {
+        LOG_ERROR("DiskAnn Android: direct pread failed (errno=%d: %s); "
+                  "not masking EOF or storage errors with a fallback",
+                  read_errno, ::strerror(read_errno));
+        return ret;
+      }
+      android_fallback_errno_.store(read_errno, std::memory_order_relaxed);
+      if (android_direct_active_.exchange(false, std::memory_order_acq_rel)) {
+        LOG_WARN("DiskAnn Android: direct pread rejected (errno=%d: %s); "
+                 "falling back to buffered pread; OS file cache may be used",
+                 read_errno, ::strerror(read_errno));
+      }
+      // Retry the complete batch on the captured inode, not the pathname.
+      // Both descriptors stay alive for any concurrent direct readers.
+      return execute_io_pread(android_buffered_fd_, read_reqs);
+    }
+    return 0;
+  }
+  const int buffered_fd = android_buffered_fd_ >= 0 ? android_buffered_fd_
+                                                   : file_desc;
+  return execute_io_pread(buffered_fd, read_reqs);
+#else
+  return execute_io(ctx, this->file_desc, read_reqs);
+#endif
 }
 
 #endif  // POSIX reader declarations

@@ -17,6 +17,9 @@
 
 #include <fcntl.h>
 #include <array>
+#if defined(__ANDROID__)
+#include <atomic>
+#endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <ailego/io/iouring_loader.h>  // raw-syscall io_uring wrapper (IoUringRing)
@@ -164,6 +167,14 @@ class AlignedFileReader {
 class LinuxAlignedFileReader : public AlignedFileReader {
  private:
   int file_desc;
+#if defined(__ANDROID__)
+  // Keep both descriptors alive until close(): other threads may still have
+  // direct reads in flight when one caller switches to the buffered fallback.
+  int android_buffered_fd_{-1};
+  std::atomic<bool> android_direct_active_{false};
+  std::atomic<int> android_fallback_errno_{0};
+  int open_android_from_handle(const std::string &fname, int source_fd);
+#endif
 
  public:
   LinuxAlignedFileReader();
@@ -177,6 +188,15 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   // Duplicate an already-open descriptor so metadata and graph reads stay on
   // the same file object even if fname is atomically replaced.
   int open_from_handle(const std::string &fname, int source_fd);
+#if defined(__ANDROID__)
+  // A successfully requested flag is not proof of physical-device I/O.
+  bool direct_io_requested() const {
+    return android_direct_active_.load(std::memory_order_acquire);
+  }
+  int direct_io_fallback_errno() const {
+    return android_fallback_errno_.load(std::memory_order_relaxed);
+  }
+#endif
   void close() override;
 
   int read(std::vector<AlignedRead> &read_reqs, IOContext &ctx,

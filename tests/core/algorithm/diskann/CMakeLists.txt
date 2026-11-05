@@ -6,10 +6,14 @@ file(GLOB_RECURSE ALL_TEST_SRCS *_test.cc)
 # for desktop CI. Mobile CI runs a focused compatibility test that covers the
 # portable I/O path, failure recovery, concurrency, and an end-to-end
 # build/dump/load/search cycle.
-if(ANDROID OR IOS)
+if(ANDROID)
+  list(FILTER ALL_TEST_SRCS INCLUDE REGEX
+       "diskann_(mobile_compat|android_io)_test\\.cc$")
+elseif(IOS)
   # Mobile CI runs the focused portable-I/O and end-to-end compatibility test.
   list(FILTER ALL_TEST_SRCS INCLUDE REGEX "diskann_mobile_compat_test\\.cc$")
 else()
+  list(FILTER ALL_TEST_SRCS EXCLUDE REGEX "/diskann_android_io_test\\.cc$")
   if(WIN32)
     list(FILTER ALL_TEST_SRCS EXCLUDE REGEX
          "/diskann_file_reader_test\\.cc$|/diskann_mobile_compat_test\\.cc$")
@@ -37,4 +41,8 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
       SRCS ${CC_SRCS}
       INCS . ${PROJECT_ROOT_DIR}/src/core ${PROJECT_ROOT_DIR}/src/core/algorithm/diskann ${PROJECT_ROOT_DIR}/src/turbo
     )
+  if(ANDROID AND CC_TARGET STREQUAL "diskann_android_io_test")
+    set_property(TARGET ${CC_TARGET} APPEND_STRING PROPERTY LINK_FLAGS
+      " -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=__open_2 -Wl,--wrap=__open64_2 -Wl,--wrap=pread -Wl,--wrap=pread64")
+  endif()
 endforeach()
