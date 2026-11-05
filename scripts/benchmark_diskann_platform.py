@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
 
@@ -87,6 +89,11 @@ def measure(args, remote, algorithm, phase):
         "ZVEC_BENCH_REPETITIONS": str(args.repetitions),
         "ZVEC_BENCH_TARGET_RECALL": str(args.target_recall),
     }
+    variables.update(getattr(args, "query_env", {}))
+    native_result = None
+    if args.transport == "ios":
+        native_result = Path(remote) / ("result-" + uuid.uuid4().hex)
+        variables["ZVEC_BENCH_RESULT_PATH"] = str(native_result)
     env = os.environ.copy()
     if args.transport == "native":
         env.update(variables)
@@ -97,7 +104,7 @@ def measure(args, remote, algorithm, phase):
                    "--gtest_filter=DiskAnnPlatformBenchmark.Measure"]
     else:
         env.update({"SIMCTL_CHILD_" + key: value for key, value in variables.items()})
-        command = ["xcrun", "simctl", "launch", "--console", args.device,
+        command = ["xcrun", "simctl", "launch", "--console", "--terminate-running-process", args.device,
                    "com.zvec.diskann_platform_benchmark_test",
                    "--gtest_filter=DiskAnnPlatformBenchmark.Measure"]
     log_path = args.output / f"{algorithm}-{phase}.log"
@@ -107,15 +114,29 @@ def measure(args, remote, algorithm, phase):
                                    text=True, timeout=5400)
     log_text = log_path.read_text(errors="replace")
     matches = re.findall(r"ZVEC_BENCH_RESULT (\{[^\r\n]+\})", log_text)
+    if native_result is not None and not matches and completed.returncode in (0, 3):
+        deadline = time.monotonic() + (1800 if phase == "build" else 300)
+        while time.monotonic() < deadline:
+            if native_result.exists():
+                native_text = native_result.read_text(errors="replace")
+                matches = re.findall(r"ZVEC_BENCH_RESULT (\{[^\r\n]+\})", native_text)
+                if len(matches) == 1:
+                    log_text += "\nRecovered from durable native result:\n" + native_text
+                    log_path.write_text(log_text)
+                    break
+            time.sleep(0.25)
     # simctl may report FrontBoard code 3 after a short app has already exited.
     # Accept only that documented race with a complete, passing benchmark log.
     launch_race = (args.transport == "ios" and completed.returncode == 3
                    and "FBSOpenApplicationServiceErrorDomain" in log_text
-                   and re.search(r"\[  PASSED  \]\s+1 test\.", log_text))
+                   and (re.search(r"\[  PASSED  \]\s+1 test\.", log_text)
+                        or (native_result is not None and native_result.exists() and len(matches) == 1)))
     if (completed.returncode != 0 and not launch_race) or len(matches) != 1 or "[  FAILED  ]" in log_text:
         print(log_text[-18000:])
         raise RuntimeError(f"{algorithm} {phase} failed, exit={completed.returncode}")
     result = json.loads(matches[0])
+    if result.get("phase") != phase or result.get("index") != algorithm:
+        raise ValueError("Result does not match benchmark invocation")
     if phase == "query" and not (0 <= result["recall_at_10"] <= 1):
         raise ValueError("Invalid recall")
     (args.output / f"{algorithm}-{phase}.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -133,6 +154,7 @@ def main():
     parser.add_argument("--device", default="booted")
     parser.add_argument("--target-recall", type=float, default=0.95)
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--cache-comparison", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     report = {
@@ -144,7 +166,7 @@ def main():
             "api": "C++ core index interface; not Python or full Collection overhead",
             "memory": "warm query process RSS/working set, decimal MB; build process excluded",
             "concurrency": 1,
-            "cache": "warm; entire evaluation set searched once before measurement",
+            "cache": "query workload prewarmed; OS page-cache hits are not guaranteed for direct readers",
             "qps": "single-thread search-only throughput, excludes harness/recall/RSS sampling",
             "target_calibration_recall": args.target_recall,
             "held_out_recall_required": args.target_recall - 0.02,
@@ -155,6 +177,7 @@ def main():
         },
     }
     remote = setup_transport(args)
+    report["measurement"]["data_path"] = remote
     for algorithm in ("hnsw", "diskann"):
         report[algorithm] = {"build": measure(args, remote, algorithm, "build"),
                              "query": measure(args, remote, algorithm, "query")}
@@ -174,6 +197,9 @@ def main():
     print(json.dumps(report, indent=2))
     if not report["comparable_recall"]:
         raise RuntimeError("Recall differs too much; result retained but not eligible for publication table")
+    if args.cache_comparison:
+        import compare_diskann_query_cache
+        compare_diskann_query_cache.compare(args, remote, report)
 
 
 if __name__ == "__main__":

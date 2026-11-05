@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@
 #include <zvec/core/interface/index.h>
 #include <zvec/core/interface/index_factory.h>
 #include <zvec/core/interface/index_param_builders.h>
+#include <zvec/ailego/io/io_backend.h>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -29,6 +31,8 @@
 #else
 #include <unistd.h>
 #endif
+
+#include "diskann_benchmark_counters.h"
 
 namespace zvec::core_interface {
 namespace {
@@ -152,9 +156,11 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
     const double build_ms = Milliseconds(start);
     ASSERT_EQ(base.rows, index->get_doc_count());
     ASSERT_EQ(0, index->close());
-    std::cout << "ZVEC_BENCH_RESULT {\"phase\":\"build\",\"index\":\""
+    std::ostringstream record;
+    record << "{\"phase\":\"build\",\"index\":\""
               << algorithm << "\",\"build_seconds\":" << build_ms / 1000.0
-              << "}" << std::endl;
+              << "}";
+    BenchmarkEmit(record, Env("ZVEC_BENCH_RESULT_PATH"));
     return;
   }
 
@@ -165,11 +171,15 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   ASSERT_EQ(queries.rows, truth.rows);
   ASSERT_EQ(10U, truth.columns);
   const uint64_t baseline_rss = RssBytes();
+  const auto before_open = BenchmarkSnapshot();
+  const auto open_start = Clock::now();
   auto index = IndexFactory::CreateAndInitIndex(*param);
   ASSERT_NE(nullptr, index);
   ASSERT_EQ(0, index->open(index_path,
                            {StorageOptions::StorageType::kMMAP, false, true}));
   ASSERT_EQ(base_header.rows, index->get_doc_count());
+  const auto index_open_ms = Milliseconds(open_start);
+  const auto after_open = BenchmarkSnapshot();
   const uint32_t repetitions = std::stoul(Env("ZVEC_BENCH_REPETITIONS", "3"));
   ASSERT_GT(repetitions, 0U);
   const uint32_t calibration_count = std::min(200U, queries.rows);
@@ -204,25 +214,36 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   // target recall, then report all remaining queries (no tuning on test queries).
   uint32_t budget = 0;
   double calibration_recall = 0;
-  for (uint32_t candidate : {32U, 48U, 64U, 96U, 128U, 192U, 256U, 384U,
-                             512U, 768U, 1024U, 1536U, 2048U}) {
-    uint64_t correct = 0;
-    for (uint32_t q = 0; q < calibration_count; ++q) {
-      SearchResult result;
-      ASSERT_EQ(0, search(q, candidate, &result));
-      correct += hits(q, result);
+  const auto fixed_budget = Env("ZVEC_BENCH_FIXED_BUDGET");
+  if (!fixed_budget.empty()) {
+    budget = std::stoul(fixed_budget);
+    ASSERT_GT(budget, 0U);
+  } else {
+    for (uint32_t candidate : {32U, 48U, 64U, 96U, 128U, 192U, 256U, 384U,
+                               512U, 768U, 1024U, 1536U, 2048U}) {
+      uint64_t correct = 0;
+      for (uint32_t q = 0; q < calibration_count; ++q) {
+        SearchResult result;
+        ASSERT_EQ(0, search(q, candidate, &result));
+        correct += hits(q, result);
+      }
+      calibration_recall = double(correct) / (calibration_count * 10);
+      budget = candidate;
+      if (calibration_recall >= target) break;
     }
-    calibration_recall = double(correct) / (calibration_count * 10);
-    budget = candidate;
-    if (calibration_recall >= target) break;
+    ASSERT_GE(calibration_recall, target) << "Calibration recall target not reached";
   }
-  ASSERT_GE(calibration_recall, target) << "Calibration recall target not reached";
   ASSERT_GT(queries.rows, calibration_count);
-  // Warm up using the held-out query set before collecting warm-cache metrics.
-  for (uint32_t q = calibration_count; q < queries.rows; ++q) {
-    SearchResult result;
-    ASSERT_EQ(0, search(q, budget, &result));
+  const bool warmup = Env("ZVEC_BENCH_WARMUP", "1") == "1";
+  const auto before_warmup = BenchmarkSnapshot();
+  // Query-workload warmup does not imply OS cache hits for direct readers.
+  if (warmup) {
+    for (uint32_t q = calibration_count; q < queries.rows; ++q) {
+      SearchResult result;
+      ASSERT_EQ(0, search(q, budget, &result));
+    }
   }
+  const auto before_timing = BenchmarkSnapshot();
   uint64_t peak_query_rss = RssBytes();
   uint64_t correct = 0;
   double elapsed_ms = 0;
@@ -241,15 +262,23 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
       if (q % 50 == 0) peak_query_rss = std::max(peak_query_rss, RssBytes());
     }
   }
+  const auto after_timing = BenchmarkSnapshot();
   peak_query_rss = std::max(peak_query_rss, RssBytes());
   const auto steady_rss = RssBytes();
-  std::cout << "ZVEC_BENCH_RESULT {\"phase\":\"query\",\"index\":\""
+  std::ostringstream record;
+  record << std::setprecision(12)
+            << "{\"phase\":\"query\",\"index\":\""
             << algorithm << "\",\"vectors\":" << base_header.rows
             << ",\"dimension\":" << dimension
             << ",\"queries\":" << queries.rows - calibration_count
             << ",\"repetitions\":" << repetitions
             << ",\"budget\":" << budget
-            << ",\"calibration_recall_at_10\":" << calibration_recall
+            << ",\"fixed_budget\":" << (fixed_budget.empty() ? "false" : "true")
+            << ",\"workload_warmup\":" << (warmup ? "true" : "false")
+            << ",\"index_open_ms\":" << index_open_ms
+            << ",\"io_backend_type\":" << static_cast<int>(ailego::current_io_backend_type())
+            << ",\"calibration_recall_at_10\":"
+            << (fixed_budget.empty() ? std::to_string(calibration_recall) : "null")
             << ",\"recall_at_10\":" << double(correct) / (latencies.size() * 10)
             << ",\"p50_ms\":" << Percentile(latencies, 0.50)
             << ",\"p95_ms\":" << Percentile(latencies, 0.95)
@@ -260,8 +289,19 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
             << ",\"sampled_peak_query_rss_bytes\":" << peak_query_rss
             << ",\"index_rss_delta_bytes\":"
             << (steady_rss > baseline_rss ? steady_rss - baseline_rss : 0)
-            << "}" << std::endl;
+            << ",\"io\":{\"source\":\"" << after_timing.source
+            << "\",\"open_read_bytes\":";
+  BenchmarkBytes(record, before_open, after_open);
+  record << ",\"warmup_read_bytes\":";
+  BenchmarkBytes(record, before_warmup, before_timing);
+  record << ",\"timed_read_bytes\":";
+  BenchmarkBytes(record, before_timing, after_timing);
+  record << ",\"timed_cpu_seconds\":"
+         << after_timing.cpu_seconds - before_timing.cpu_seconds
+         << ",\"timed_major_faults\":"
+         << after_timing.major_faults - before_timing.major_faults << "}}";
   ASSERT_EQ(0, index->close());
+  BenchmarkEmit(record, Env("ZVEC_BENCH_RESULT_PATH"));
 #endif
 }
 

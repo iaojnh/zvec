@@ -6,7 +6,11 @@ on:
     paths:
       - '.github/workflows/diskann-platform-benchmark.yml'
       - 'scripts/*diskann_platform*.py'
+      - 'scripts/compare_diskann_query_cache.py'
+      - 'scripts/prepare_iops_nvme.ps1'
       - 'tests/core/interface/diskann_platform_benchmark_test.cc'
+      - 'tests/core/interface/diskann_benchmark_counters.h'
+      - 'tests/core/interface/CMakeLists.txt'
       - 'CMakeLists.txt'
   workflow_dispatch:
     inputs:
@@ -97,6 +101,10 @@ jobs:
         with:
           name: diskann-platform-dataset
           path: benchmark-data
+      - name: Prepare verified blank local NVMe on Windows ARM64
+        if: matrix.label == 'windows-arm64'
+        shell: pwsh
+        run: ./scripts/prepare_iops_nvme.ps1 -OutputDirectory benchmark-results/nvme-setup
       - name: Measure HNSW and DiskANN in isolated processes
         shell: bash
         env:
@@ -105,9 +113,14 @@ jobs:
         run: |
           binary=build-benchmark/bin/diskann_platform_benchmark_test
           if [[ "$RUNNER_OS_NAME" == Windows ]]; then binary="$binary.exe"; fi
+          data=benchmark-data
+          if [[ -n "${IOPS_NVME_ROOT:-}" ]]; then
+            data="$IOPS_NVME_ROOT/query-data"
+            python -c 'import shutil,sys; shutil.copytree(sys.argv[1],sys.argv[2],dirs_exist_ok=True)' benchmark-data "$data"
+          fi
           python scripts/benchmark_diskann_platform.py \
-            --binary "$binary" --data benchmark-data \
-            --output benchmark-results --label "$BENCH_LABEL"
+            --binary "$binary" --data "$data" \
+            --output benchmark-results --label "$BENCH_LABEL" --cache-comparison
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -165,7 +178,7 @@ jobs:
           ram-size: 4096M
           heap-size: 1024M
           disable-animations: true
-          script: python scripts/benchmark_diskann_platform.py --binary build-benchmark/bin/diskann_platform_benchmark_test --data benchmark-data --output benchmark-results --label android-x86_64-emulator --transport android
+          script: python scripts/benchmark_diskann_platform.py --binary build-benchmark/bin/diskann_platform_benchmark_test --data benchmark-data --output benchmark-results --label android-x86_64-emulator --transport android --cache-comparison
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -217,7 +230,7 @@ jobs:
           python scripts/benchmark_diskann_platform.py \
             --binary build-benchmark/bin/diskann_platform_benchmark_test.app \
             --data benchmark-data --output benchmark-results --label ios-arm64-simulator \
-            --transport ios --device "$BENCH_DEVICE"
+            --transport ios --device "$BENCH_DEVICE" --cache-comparison
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -246,6 +259,9 @@ jobs:
         run: |
           python scripts/summarize_diskann_platform.py --input all-results --output benchmark-summary
           cat benchmark-summary/comparison.md >> "$GITHUB_STEP_SUMMARY"
+          if test -f benchmark-summary/cache-comparison.md; then
+            cat benchmark-summary/cache-comparison.md >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: diskann-platform-summary

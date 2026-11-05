@@ -41,7 +41,7 @@ def main():
             table.append(f"| {system} | {arch} | | | | | |")
     (args.output / "publication_table.md").write_text("\n".join(table) + "\n")
     text = ["# DiskANN platform benchmark", "", *table, "",
-            "CI hosts are virtualized runner machines. These are warm-cache C++ core-index measurements, not full Collection or Python timings.",
+            "CI hosts are virtualized runner machines. These are C++ core-index measurements after query-workload warmup, not full Collection or Python timings. Workload warmup does not guarantee OS page-cache hits; I/O backends and storage/cache states differ between platforms. Do not use these rows to rank operating systems.",
             "Memory is total query-process RSS/Windows working set (decimal MB), including mapped resident pages. Build runs in a separate process. Index-only RSS deltas are included in JSON.",
             "Recall calibration uses 200 queries; the remaining 1,000 queries are held out and measured three times. Each algorithm chooses its smallest budget reaching 0.95 calibration Recall@10.",
             "Rows require held-out Recall@10 >= 0.93 and a pairwise recall gap <= 0.02. Ineligible measurements remain in the full comparison below.",
@@ -64,6 +64,11 @@ def main():
         text.extend([f'### {report["platform"]}', "", "```json", json.dumps(details, indent=2), "```", ""])
     (args.output / "comparison.md").write_text("\n".join(text))
     (args.output / "results.json").write_text(json.dumps(reports, indent=2) + "\n")
+    cache_reports = [json.loads(path.read_text()) for path in sorted(args.input.rglob("cache-comparison.json"))]
+    if cache_reports:
+        import compare_diskann_query_cache
+        compare_diskann_query_cache.summarize(cache_reports, args.output / "cache-comparison.md")
+        (args.output / "cache-comparison.json").write_text(json.dumps(cache_reports, indent=2) + "\n")
     print("\n".join(table))
 
 

@@ -39,16 +39,46 @@ Exact top-10 ground truth is recomputed for the selected subset.
   leave its publication row empty. Do not imply perfectly identical recall.
 - QPS is the inverse aggregate native search time at concurrency 1; it is not a
   saturated throughput measurement or full Collection/Python API performance.
-- Warm caches can include operating-system file cache. Results must not be
-  described as cold-disk timings. CI runner virtualization, CPU, memory, storage,
-  and image information are recorded; these are not consumer-device guarantees.
+- Query-workload warmup does not guarantee OS page-cache hits. Direct readers
+  may continue performing storage I/O; Apple no-cache hints can still hit
+  existing pages. CI runner virtualization, CPU, memory, storage, and image
+  information are recorded; these are not consumer-device guarantees or an
+  operating-system performance ranking. RSS excludes kernel file cache that
+  is not mapped into the query process; RSS savings are not total-memory savings.
+
+## Query-cache controls
+
+CI also enables `--cache-comparison`. Each platform builds each index once and
+reuses its calibrated budget without performing any calibration in the replay
+workers. Index and query SHA-256 hashes and identical recall are checked.
+Three fresh-process trials run for each index and state:
+
+- **First pass:** attempt a cache reset before opening the index, omit query
+  warmup, and time one held-out pass. This warms naturally during the pass; it
+  does not make every query cold. Linux uses a host cache reset; Apple uses
+  host `purge`; Android attempts a guest-only reset. Windows has no verified
+  reset here and is explicitly labeled as an uncontrolled first-pass cache state.
+- **Steady:** search the held-out workload once, then time three passes.
+
+Cache resets are restricted to ephemeral GitHub-hosted VMs, never a developer's
+computer or physical phone. Record command success separately from evidence of
+actual I/O. The benchmark records index-open, warmup and timed read bytes, open
+time, timed CPU time and major page faults. Linux/macOS counters are OS storage
+accounting, Windows bytes are logical transfers, and iOS has no disk-byte counter
+used here. Guest/hypervisor caches remain separate concerns. The comparison
+table reports medians across trials, not pooled latency percentiles.
+
+Windows ARM64 uses the unique verified blank local NVMe scratch disk when
+available; the provisioning metadata and actual data path are retained.
 
 ## Outputs
 
 Each platform uploads build/query logs, raw JSON, and `result.json`.
 The `diskann-platform-summary` artifact contains `publication_table.md`,
 `comparison.md` (including both algorithms, simulators, and test conditions),
-and `results.json`. Missing/failed/non-comparable platforms keep blank cells.
+and `results.json`. Cache controls additionally produce `cache-comparison.md`
+and full `cache-comparison.json`, plus per-trial logs/JSON in each platform
+artifact. Missing/failed/non-comparable platforms keep blank cells.
 The benchmark GTest skips unless `ZVEC_BENCH_MODE` is set, so normal unit-test
 runs do not perform this benchmark.
 

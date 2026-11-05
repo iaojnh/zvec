@@ -12,4 +12,9 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
       SRCS ${CC_SRCS}
       INCS . ${PROJECT_ROOT_DIR}/src/core ${PROJECT_ROOT_DIR}/src/core/algorithm
     )
+  if(APPLE AND NOT IOS AND
+     (CC_TARGET STREQUAL "diskann_platform_benchmark_test" OR
+      CC_TARGET STREQUAL "diskann_linux_io_diagnostic_test"))
+    target_link_libraries(${CC_TARGET} proc)
+  endif()
 endforeach()
