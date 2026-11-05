@@ -1,0 +1,200 @@
+name: DiskANN Cross-platform Storage IOPS
+
+on:
+  push:
+    branches: [codex/test-diskann-platform-metrics]
+    paths:
+      - '.github/workflows/storage-iops.yml'
+      - 'benchmarks/storage_iops/**'
+      - 'scripts/run_storage_iops.py'
+      - 'scripts/prepare_iops_nvme.ps1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-iops-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: IOPS (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-24.04
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+          - label: macos-arm64
+            runner: macos-15
+          - label: macos-x86_64
+            runner: macos-15-intel
+          - label: windows-x86_64
+            runner: windows-2025
+            msvc: x64
+          - label: windows-arm64
+            runner: windows-11-arm
+            msvc: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.msvc }}
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build standalone native probe
+        run: |
+          cmake -S benchmarks/storage_iops -B build-iops -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-iops --parallel 3
+      - name: Measure on the actual workspace filesystem
+        shell: bash
+        env:
+          IOPS_LABEL: ${{ matrix.label }}
+          IOPS_RUNNER_OS: ${{ runner.os }}
+        run: |
+          binary=build-iops/bin/storage_iops
+          if [[ "$IOPS_RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
+          python scripts/run_storage_iops.py --binary "$binary" \
+            --data iops-data/system --output iops-results/system --label "$IOPS_LABEL"
+      - name: Prepare verified blank local NVMe scratch disk when available
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/prepare_iops_nvme.ps1
+      - name: Measure on the separate local NVMe filesystem
+        if: runner.os == 'Windows' && env.IOPS_NVME_ROOT != ''
+        shell: pwsh
+        env:
+          IOPS_LABEL: ${{ matrix.label }}
+        run: |
+          python scripts/run_storage_iops.py --binary build-iops/bin/storage_iops.exe --data "$env:IOPS_NVME_ROOT" --output iops-results/nvme --label "${env:IOPS_LABEL}-nvme"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: storage-iops-${{ matrix.label }}
+          path: iops-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  android:
+    name: IOPS (Android x86_64 emulator)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NDK_VERSION: '26.1.10909125'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install NDK and build tools
+        run: |
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          sdkmanager --install "ndk;$NDK_VERSION" "platforms;android-34"
+      - name: Build standalone Android probe
+        run: |
+          cmake -S benchmarks/storage_iops -B build-iops -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=x86_64 -DANDROID_NATIVE_API_LEVEL=34 \
+            -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-iops --parallel 3
+      - name: Enable KVM
+        run: sudo chmod 666 /dev/kvm
+      - name: Measure inside Android guest
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          ram-size: 4096M
+          disable-animations: true
+          script: python scripts/run_storage_iops.py --binary build-iops/bin/storage_iops --output iops-results/android --label android-x86_64-emulator --transport android
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: storage-iops-android-emulator
+          path: iops-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  ios:
+    name: IOPS (iOS ARM64 simulator)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build standalone iOS simulator app
+        run: |
+          cmake -S benchmarks/storage_iops -B build-iops -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-iops --parallel 3
+          codesign --force --sign - --timestamp=none build-iops/bin/storage_iops.app
+      - name: Boot simulator
+        run: |
+          device=$(xcrun simctl list devices available -j | python -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          print(next(d["udid"] for runtime, devices in data["devices"].items()
+                     if "iOS" in runtime for d in devices if "iPhone" in d["name"]))')
+          xcrun simctl boot "$device"
+          xcrun simctl bootstatus "$device" -b
+          echo "IOPS_DEVICE=$device" >> "$GITHUB_ENV"
+      - name: Measure inside iOS simulator app
+        run: |
+          python scripts/run_storage_iops.py --binary build-iops/bin/storage_iops.app \
+            --output iops-results/ios --label ios-arm64-simulator \
+            --transport ios --device "$IOPS_DEVICE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: storage-iops-ios-simulator
+          path: iops-results/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Shutdown simulator
+        if: always() && env.IOPS_DEVICE != ''
+        run: xcrun simctl shutdown "$IOPS_DEVICE"
+
+  summary:
+    if: always()
+    needs: [native, android, ios]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: storage-iops-*
+          path: all-iops
+      - name: Summarize all measured platforms and cache policies
+        run: |
+          python scripts/run_storage_iops.py --summarize all-iops --output iops-summary
+          cat iops-summary/iops.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: storage-iops-summary
+          path: iops-summary/
+          retention-days: 30
