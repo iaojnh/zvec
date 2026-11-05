@@ -1,8 +1,6 @@
 name: DiskANN Controlled Storage Model
 
 on:
-  push:
-    branches: [codex/diskann-controlled-io]
   workflow_dispatch:
     inputs:
       vectors:

@@ -34,6 +34,7 @@
 
 #include "diskann_benchmark_counters.h"
 #include "diskann_controlled_io.h"
+#include "diskann_paced_io.h"
 #if defined(__APPLE__)
 #include "../../apple_io_phase_gate.h"
 #endif
@@ -122,9 +123,21 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   ASSERT_TRUE(algorithm == "diskann" || algorithm == "hnsw");
   ASSERT_TRUE(mode == "build" || mode == "query");
   const bool controlled_io = Env("ZVEC_BENCH_CONTROLLED_IO") == "1";
+  const bool paced_io = Env("ZVEC_BENCH_PACED_IO") == "1";
+  ASSERT_FALSE(controlled_io && paced_io);
 #if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
   std::unique_ptr<zvec::core::benchmark::IOModel> io_model;
   std::unique_ptr<zvec::core::benchmark::ControlledScope> controlled_scope;
+  std::unique_ptr<zvec::core::benchmark::NativeRateLimiter> limiter;
+  std::unique_ptr<zvec::core::benchmark::PacedScope> paced_scope;
+  if (paced_io && algorithm == "diskann" && mode == "query") {
+    zvec::core::benchmark::PaceConfig config;
+    config.iops = std::stoull(Env("ZVEC_BENCH_IOPS", "2000"));
+    config.bytes_per_second = std::stoull(Env("ZVEC_BENCH_PACE_BPS", "16777216"));
+    config.depth = static_cast<uint32_t>(std::stoul(Env("ZVEC_BENCH_PACE_DEPTH", "8")));
+    limiter = std::make_unique<zvec::core::benchmark::NativeRateLimiter>(config);
+    paced_scope = std::make_unique<zvec::core::benchmark::PacedScope>(*limiter);
+  }
   if (controlled_io && algorithm == "diskann" && mode == "query") {
     io_model = std::make_unique<zvec::core::benchmark::IOModel>(
         std::stoull(Env("ZVEC_BENCH_IO_LATENCY_NS", "200000")),
@@ -134,6 +147,7 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   }
 #else
   ASSERT_FALSE(controlled_io) << "Rebuild with DISKANN_CONTROLLED_IO_BENCHMARK=ON";
+  ASSERT_FALSE(paced_io) << "Rebuild with DISKANN_CONTROLLED_IO_BENCHMARK=ON";
 #endif
   const auto base_header = ReadMatrix<float>(root + "/base.fbin", true);
   const auto dimension = base_header.columns;
@@ -272,7 +286,9 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
 #if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
   std::vector<double> model_latencies;
   uint64_t model_reads = 0, model_bytes = 0, model_batches = 0;
+  const auto pace_before = limiter ? limiter->stats() : zvec::core::benchmark::PaceStats{};
 #endif
+  const auto block_start = Clock::now();
   for (uint32_t round = 0; round < repetitions; ++round) {
     for (uint32_t q = calibration_count; q < queries.rows; ++q) {
       SearchResult result;
@@ -298,6 +314,7 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
       if (q % 50 == 0) peak_query_rss = std::max(peak_query_rss, RssBytes());
     }
   }
+  const double timed_block_ms = Milliseconds(block_start);
   const auto after_timing = BenchmarkSnapshot();
 #if defined(__APPLE__)
   testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", "query", "after");
@@ -322,7 +339,9 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
             << ",\"p50_ms\":" << Percentile(latencies, 0.50)
             << ",\"p95_ms\":" << Percentile(latencies, 0.95)
             << ",\"p99_ms\":" << Percentile(latencies, 0.99)
-            << ",\"qps\":" << latencies.size() * 1000.0 / elapsed_ms
+            << ",\"qps\":" << latencies.size() * 1000.0 / (paced_io ? timed_block_ms : elapsed_ms)
+            << ",\"search_only_qps\":" << latencies.size() * 1000.0 / elapsed_ms
+            << ",\"timed_block_wall_ms\":" << timed_block_ms
             << ",\"baseline_rss_bytes\":" << baseline_rss
             << ",\"steady_rss_bytes\":" << steady_rss
             << ",\"sampled_peak_query_rss_bytes\":" << peak_query_rss
@@ -340,6 +359,23 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
          << ",\"timed_major_faults\":"
          << after_timing.major_faults - before_timing.major_faults << "}";
 #if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+  if (limiter) {
+    const auto reader = zvec::core::benchmark::ActivePacedReader().lock();
+    ASSERT_NE(nullptr, reader);
+    const auto after = limiter->stats();
+    const auto reads = after.reads - pace_before.reads;
+    record << ",\"native_pacing\":{\"kind\":\"real-time-native-file-io\""
+           << ",\"iops_limit\":" << limiter->config().iops
+           << ",\"bytes_per_second_limit\":" << limiter->config().bytes_per_second
+           << ",\"max_in_flight\":" << limiter->config().depth
+           << ",\"reads\":" << reads
+           << ",\"bytes\":" << after.bytes - pace_before.bytes
+           << ",\"batches\":" << after.batches - pace_before.batches
+           << ",\"actual_wait_ns\":" << after.wait_ns - pace_before.wait_ns
+           << ",\"achieved_iops\":" << reads * 1000.0 / timed_block_ms
+           << ",\"resident_backing_bytes\":0,\"cache_policy\":\"" << reader->cache_policy()
+           << "\",\"timer\":\"" << limiter->timer_kind() << "\"}";
+  }
   if (io_model) {
     const auto reader = zvec::core::benchmark::ActiveReader().lock();
     ASSERT_NE(nullptr, reader) << "Controlled reader was not installed";
@@ -366,6 +402,92 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
   BenchmarkEmit(record, Env("ZVEC_BENCH_RESULT_PATH"));
 #endif
 }
+
+#if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK) && DISKANN_SUPPORTED
+TEST(DiskAnnPacedIOProbe, Measure) {
+  if (Env("ZVEC_BENCH_MODE") != "probe") GTEST_SKIP() << "Opt-in native pacing probe";
+  using namespace zvec::core;
+  using namespace zvec::core::benchmark;
+  const auto path = Env("ZVEC_BENCH_DATA") + "/diskann.index";
+  std::ifstream size_input(path, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(size_input.good());
+  const uint64_t sectors = static_cast<uint64_t>(size_input.tellg()) / 4096;
+  ASSERT_GT(sectors, 0U);
+  size_input.close();
+  PaceConfig target;
+  target.iops = std::stoull(Env("ZVEC_BENCH_IOPS", "2000"));
+  target.bytes_per_second = std::stoull(Env("ZVEC_BENCH_PACE_BPS", "16777216"));
+  target.depth = static_cast<uint32_t>(std::stoul(Env("ZVEC_BENCH_PACE_DEPTH", "8")));
+  const uint32_t operations = 2048;
+  std::ostringstream record;
+  record << std::setprecision(12) << "{\"phase\":\"probe\",\"index\":\"diskann\",\"cases\":[";
+  for (int case_index = 0; case_index < 4; ++case_index) {
+    const bool buffered = case_index == 0;
+    const std::string name = buffered ? "buffered-warm" : case_index == 1 ? "native-unlimited" :
+                             case_index == 2 ? "paced-target" : "paced-half";
+    PaceConfig config = target;
+    if (case_index < 2) { config.iops = 0; config.bytes_per_second = 0; }
+    if (case_index == 3) { config.iops = std::max<uint64_t>(1, target.iops / 2);
+                          config.bytes_per_second = std::max<uint64_t>(1, target.bytes_per_second / 2); }
+    NativeRateLimiter rate(config);
+    std::shared_ptr<RateLimitedReader> reader;
+    std::ifstream input;
+    IOContext ctx = nullptr;
+    if (buffered) {
+      input.open(path, std::ios::binary);
+      ASSERT_TRUE(input.good());
+    } else {
+      auto native = std::make_shared<PlatformAlignedFileReader>();
+      native->open(path);
+      reader = std::make_shared<RateLimitedReader>(std::move(native), rate);
+      ASSERT_EQ(0, setup_io_ctx(ctx));
+    }
+    std::vector<char> allocation(size_t(target.depth) * 4096 + 4096);
+    auto buffer = reinterpret_cast<char *>((reinterpret_cast<uintptr_t>(allocation.data()) + 4095) & ~uintptr_t(4095));
+#if defined(__APPLE__)
+    testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", name, "before");
+#endif
+    const auto before = BenchmarkSnapshot();
+    const auto start = Clock::now();
+    uint64_t checksum = 1469598103934665603ULL;
+    for (uint32_t first = 0; first < operations; first += target.depth) {
+      const uint32_t count = std::min(target.depth, operations - first);
+      std::vector<AlignedRead> requests;
+      for (uint32_t n = 0; n < count; ++n) {
+        const uint64_t offset = ((uint64_t(first + n) * 104729 + 17) % sectors) * 4096;
+        requests.emplace_back(offset, 4096, buffer + size_t(n) * 4096);
+        if (buffered) {
+          input.seekg(static_cast<std::streamoff>(offset));
+          input.read(buffer + size_t(n) * 4096, 4096);
+          ASSERT_TRUE(input.good());
+        }
+      }
+      if (reader) ASSERT_EQ(0, reader->read(requests, ctx));
+      for (size_t n = 0; n < size_t(count) * 4096; ++n) {
+        checksum ^= static_cast<unsigned char>(buffer[n]);
+        checksum *= 1099511628211ULL;
+      }
+    }
+    const double seconds = Milliseconds(start) / 1000;
+    const auto after = BenchmarkSnapshot();
+#if defined(__APPLE__)
+    testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", name, "after");
+#endif
+    if (case_index) record << ',';
+    record << "{\"state\":\"" << name << "\",\"operations\":" << operations
+           << ",\"requested_bytes\":" << uint64_t(operations) * 4096
+           << ",\"seconds\":" << seconds << ",\"achieved_iops\":" << operations / seconds
+           << ",\"iops_limit\":" << config.iops << ",\"actual_wait_ns\":" << rate.stats().wait_ns
+           << ",\"checksum\":\"" << checksum << "\",\"cache_policy\":\""
+           << (reader ? reader->cache_policy() : "buffered-file-control") << "\",\"read_bytes\":";
+    BenchmarkBytes(record, before, after);
+    record << ",\"counter_source\":\"" << after.source << "\"}";
+    if (reader) { reader->release_io_ctx(ctx); reader->close(); ASSERT_EQ(0, destroy_io_ctx(ctx)); }
+  }
+  record << "]}";
+  BenchmarkEmit(record, Env("ZVEC_BENCH_RESULT_PATH"));
+}
+#endif
 
 }  // namespace
 }  // namespace zvec::core_interface

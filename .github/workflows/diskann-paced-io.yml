@@ -1,0 +1,246 @@
+name: DiskANN Paced Native I/O
+
+on:
+  push:
+    branches: [codex/diskann-controlled-io]
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: 'IOPS ceilings, including common tier 2000 and unlimited 0'
+        default: '2000,10000,20000,0'
+        type: string
+      fixture_run_id:
+        description: 'Successful run containing diskann-controlled-fixture'
+        default: '41981765549'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diskann-paced-io-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '3'
+  OPENBLAS_NUM_THREADS: '2'
+  PACE_PROFILES: ${{ inputs.profiles || '2000,10000,20000,0' }}
+
+jobs:
+  fixture:
+    name: Reuse verified canonical indexes and queries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s scripts/tests -p 'test_diskann*io.py' -v
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-controlled-fixture
+          run-id: ${{ inputs.fixture_run_id || '41981765549' }}
+          github-token: ${{ github.token }}
+          path: benchmark-data
+      - name: Verify byte-identical trained indexes and data
+        run: python -c "import sys; from pathlib import Path; sys.path.insert(0,'scripts'); from benchmark_diskann_controlled_io import verify_fixture; verify_fixture(Path('benchmark-data'))"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: diskann-paced-fixture
+          path: benchmark-data/
+          retention-days: 30
+
+  desktop:
+    needs: fixture
+    name: Paced native I/O (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: linux-x86_64, runner: ubuntu-24.04}
+          - {label: linux-arm64, runner: ubuntu-24.04-arm}
+          - {label: windows-x86_64, runner: windows-2025, msvc: x64}
+          - {label: windows-arm64, runner: windows-11-arm, msvc: arm64}
+          - {label: macos-arm64, runner: macos-15}
+          - {label: macos-x86_64, runner: macos-15-intel}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.msvc }}
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build native pacing benchmark
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DENABLE_WERROR=ON \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DDISKANN_CONTROLLED_IO_BENCHMARK=ON
+          cmake --build build --target diskann_platform_benchmark_test diskann_controlled_io_test --parallel 3
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-paced-fixture
+          path: benchmark-data
+      - name: Prepare verified local NVMe on Windows ARM64
+        if: matrix.label == 'windows-arm64'
+        shell: pwsh
+        run: ./scripts/prepare_iops_nvme.ps1 -OutputDirectory paced-results/nvme-setup
+      - name: Measure native reads, verified limits and real wall time
+        shell: bash
+        env:
+          LABEL: ${{ matrix.label }}
+          HOST_OS: ${{ runner.os }}
+        run: |
+          suffix=""
+          if [[ "$HOST_OS" == Windows ]]; then suffix=.exe; fi
+          "build/bin/diskann_controlled_io_test$suffix"
+          data=benchmark-data
+          if [[ -n "${IOPS_NVME_ROOT:-}" ]]; then
+            data="$IOPS_NVME_ROOT/paced-data"
+            python -c 'import shutil,sys; shutil.copytree(sys.argv[1],sys.argv[2],dirs_exist_ok=True)' benchmark-data "$data"
+          fi
+          python scripts/benchmark_diskann_paced_io.py --binary "build/bin/diskann_platform_benchmark_test$suffix" \
+            --data "$data" --output paced-results --label "$LABEL" --profiles "$PACE_PROFILES"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: paced-${{ matrix.label }}
+          path: paced-results/
+          retention-days: 30
+
+  summary:
+    needs: [desktop, android, ios]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: paced-*
+          path: all-results
+      - name: Verify actual limits and summarize all eight environments
+        run: python scripts/summarize_diskann_paced_io.py --results all-results --output summary
+      - name: Publish summary
+        if: always()
+        run: |
+          if test -f summary/publication-comparison.md; then
+            cat summary/publication-comparison.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-paced-summary
+          path: summary/
+
+  android:
+    needs: fixture
+    name: Paced native I/O (Android x86_64 emulator)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Build native pacing Android benchmark
+        run: |
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          sdkmanager --install 'ndk;26.1.10909125' 'platforms;android-34'
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/26.1.10909125/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=x86_64 -DANDROID_NATIVE_API_LEVEL=34 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_NATIVE=OFF -DAUTO_DETECT_ARCH=OFF -DENABLE_WERROR=ON \
+            -DDISKANN_CONTROLLED_IO_BENCHMARK=ON
+          cmake --build build --target diskann_platform_benchmark_test --parallel 3
+          sudo chmod 666 /dev/kvm
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-paced-fixture
+          path: benchmark-data
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          ram-size: 4096M
+          heap-size: 1024M
+          disable-animations: true
+          script: python scripts/benchmark_diskann_paced_io.py --binary build/bin/diskann_platform_benchmark_test --data benchmark-data --output paced-results --label android-x86_64-emulator --transport android --profiles "$PACE_PROFILES"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: paced-android-emulator
+          path: paced-results/
+          retention-days: 30
+
+  ios:
+    needs: fixture
+    name: Paced native I/O (iOS ARM64 simulator)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build native pacing iOS benchmark
+        run: |
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          cmake -S . -B build -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DIOS=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_WERROR=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DDISKANN_CONTROLLED_IO_BENCHMARK=ON
+          cmake --build build --target diskann_platform_benchmark_test --parallel 3
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-paced-fixture
+          path: benchmark-data
+      - name: Replay in simulator
+        run: |
+          device=$(xcrun simctl list devices available -j | python -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          print(next(x["udid"] for r,ds in d["devices"].items() if "iOS" in r for x in ds if "iPhone" in x["name"]))')
+          echo "CONTROLLED_IO_DEVICE=$device" >> "$GITHUB_ENV"
+          xcrun simctl boot "$device"
+          xcrun simctl bootstatus "$device" -b
+          python scripts/benchmark_diskann_paced_io.py --binary build/bin/diskann_platform_benchmark_test.app \
+            --data benchmark-data --output paced-results --label ios-arm64-simulator \
+            --transport ios --device "$device" --profiles "$PACE_PROFILES"
+      - name: Shutdown simulator
+        if: always() && env.CONTROLLED_IO_DEVICE != ''
+        run: xcrun simctl shutdown "$CONTROLLED_IO_DEVICE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: paced-ios-simulator
+          path: paced-results/
+          retention-days: 30

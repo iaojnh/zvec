@@ -4,6 +4,7 @@
 #include <array>
 #include "benchmarks/diskann-controlled-io/io_model.h"
 #include "diskann_controlled_io.h"
+#include "diskann_paced_io.h"
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -46,6 +47,75 @@ TEST(DiskAnnIOModel, RejectInvalidAndOverflowInputs) {
 }
 
 #if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
+TEST(DiskAnnNativePacing, WaitsInRealTimeAndKeepsCreditsAcrossCalls) {
+  NativeRateLimiter limiter(PaceConfig{200, 819200, 1});
+  const auto start = PaceClock::now();
+  for (int i = 0; i < 10; ++i) limiter.admit(1, 4096);
+  const auto ms = std::chrono::duration<double, std::milli>(PaceClock::now() - start).count();
+  EXPECT_GE(ms, 40.0);
+  EXPECT_GE(limiter.stats().wait_ns, 30000000U);
+  EXPECT_EQ(10U, limiter.stats().reads);
+  EXPECT_EQ(40960U, limiter.stats().bytes);
+}
+TEST(DiskAnnNativePacing, EnforcesBandwidthIndependently) {
+  NativeRateLimiter limiter(PaceConfig{0, 409600, 1});
+  const auto start = PaceClock::now();
+  for (int i = 0; i < 5; ++i) limiter.admit(1, 4096);
+  const auto elapsed_ms = std::chrono::duration<double, std::milli>(PaceClock::now() - start).count();
+  EXPECT_GE(elapsed_ms, 35.0);
+  EXPECT_THROW(NativeRateLimiter(PaceConfig{1, 1, 0}), std::invalid_argument);
+  EXPECT_THROW(NativeRateLimiter(PaceConfig{1, 1, 129}), std::invalid_argument);
+}
+class ImmediateNativeReader : public AlignedFileReader {
+ public:
+  size_t largest_batch{0};
+  bool closed{false};
+  void open(const std::string &) override {}
+  void close() override { closed = true; }
+  bool requires_io_context() const override { return false; }
+  void release_io_ctx(IOContext &) override {}
+  int read(std::vector<AlignedRead> &, IOContext &, bool = false) override { return -1; }
+  int submit(PendingBatch &batch, std::vector<AlignedRead> &requests, IOContext &) override {
+    largest_batch = std::max(largest_batch, requests.size());
+    batch.n_submitted = static_cast<uint32_t>(requests.size());
+    batch.n_reaped = 0;
+    for (const auto &r : requests) std::memset(r.buf, static_cast<int>(r.offset % 251), r.len);
+    return 0;
+  }
+  int get_completed(PendingBatch &batch, IOContext &, int, std::vector<uint32_t> &completed) override {
+    completed.clear();
+    while (batch.n_reaped < batch.n_submitted) completed.push_back(batch.n_reaped++);
+    return static_cast<int>(completed.size());
+  }
+};
+TEST(DiskAnnNativePacing, SplitsNativeBatchesAndPreservesCompletionIndices) {
+  auto native = std::make_shared<ImmediateNativeReader>();
+  NativeRateLimiter limiter(PaceConfig{0, 0, 4});
+  RateLimitedReader reader(native, limiter);
+  std::vector<char> allocation(17 * 4096 + 4096);
+  auto data = reinterpret_cast<char *>((reinterpret_cast<uintptr_t>(allocation.data()) + 4095) & ~uintptr_t(4095));
+  std::vector<AlignedRead> requests;
+  for (size_t i = 0; i < 17; ++i) requests.emplace_back(i * 4096, 4096, data + i * 4096);
+  IOContext ctx = nullptr;
+  PendingBatch batch;
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  EXPECT_EQ(-1, reader.submit(batch, requests, ctx));
+  std::vector<uint32_t> seen, completed;
+  while (batch.n_reaped < batch.n_submitted) {
+    ASSERT_GT(reader.get_completed(batch, ctx, 1, completed), 0);
+    seen.insert(seen.end(), completed.begin(), completed.end());
+  }
+  ASSERT_EQ(17U, seen.size());
+  for (size_t i = 0; i < seen.size(); ++i) {
+    EXPECT_EQ(i, seen[i]);
+    EXPECT_EQ(static_cast<char>((i * 4096) % 251), data[i * 4096]);
+  }
+  EXPECT_LE(native->largest_batch, 4U);
+  EXPECT_EQ(17U, limiter.stats().reads);
+  EXPECT_EQ(5U, limiter.stats().batches);
+  reader.close();
+  EXPECT_TRUE(native->closed);
+}
 TEST(DiskAnnIOModel, PayloadCompletionLifecycleAndBounds) {
   const auto path = testing::TempDir() + "zvec-controlled-" + std::to_string(
       std::chrono::steady_clock::now().time_since_epoch().count());

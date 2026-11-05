@@ -85,10 +85,12 @@ inline std::weak_ptr<ControlledReader> &ActiveReader() {
   static thread_local std::weak_ptr<ControlledReader> reader;
   return reader;
 }
-inline std::shared_ptr<AlignedFileReader> MakeControlledReader(const std::string &path) {
+inline std::shared_ptr<AlignedFileReader> MakeControlledReader(
+    const std::string &path, std::shared_ptr<AlignedFileReader> native) {
   if (!ActiveModel()) throw std::runtime_error("Controlled model not configured");
   auto reader = std::make_shared<ControlledReader>(*ActiveModel());
   reader->open(path);
+  native->close();
   ActiveReader() = reader;
   return reader;
 }

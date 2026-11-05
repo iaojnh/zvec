@@ -10,7 +10,8 @@
 #include "diskann_file_reader.h"
 
 namespace zvec::core::benchmark {
-using ReaderFactory = std::shared_ptr<AlignedFileReader> (*)(const std::string &);
+using ReaderFactory = std::shared_ptr<AlignedFileReader> (*)(
+    const std::string &, std::shared_ptr<AlignedFileReader>);
 ReaderFactory &ControlledReaderFactory();
 }  // namespace zvec::core::benchmark
 #endif

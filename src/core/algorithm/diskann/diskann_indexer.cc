@@ -262,11 +262,10 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
 
 #if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK)
   if (benchmark::ControlledReaderFactory()) {
-    auto controlled = benchmark::ControlledReaderFactory()(file_path);
+    auto controlled = benchmark::ControlledReaderFactory()(file_path, reader_);
     if (!controlled) {
       return IndexError_Runtime;
     }
-    reader_->close();
     reader_ = std::move(controlled);
   }
 #endif

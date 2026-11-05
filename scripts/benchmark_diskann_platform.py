@@ -98,22 +98,22 @@ def measure(args, remote, algorithm, phase):
     if args.transport == "ios":
         native_result = Path(remote) / ("result-" + uuid.uuid4().hex)
         variables["ZVEC_BENCH_RESULT_PATH"] = str(native_result)
-        if phase == "query" and getattr(args, "monitor_ios_io", False):
+        if phase in ("query", "probe") and getattr(args, "monitor_ios_io", False):
             io_control = Path(remote) / ("io-control-" + uuid.uuid4().hex)
             variables["ZVEC_BENCH_IO_CONTROL"] = str(io_control)
     env = os.environ.copy()
     if args.transport == "native":
         env.update(variables)
-        command = [str(args.binary.resolve()), "--gtest_filter=DiskAnnPlatformBenchmark.Measure"]
+        command = [str(args.binary.resolve()), "--gtest_filter=" + getattr(args, "gtest_filter", "DiskAnnPlatformBenchmark.Measure")]
     elif args.transport == "android":
         assignments = [f"{key}={value}" for key, value in variables.items()]
         command = ["adb", "shell", "env", *assignments, remote + "/benchmark",
-                   "--gtest_filter=DiskAnnPlatformBenchmark.Measure"]
+                   "--gtest_filter=" + getattr(args, "gtest_filter", "DiskAnnPlatformBenchmark.Measure")]
     else:
         env.update({"SIMCTL_CHILD_" + key: value for key, value in variables.items()})
         command = ["xcrun", "simctl", "launch", "--console", "--terminate-running-process", args.device,
                    "com.zvec.diskann_platform_benchmark_test",
-                   "--gtest_filter=DiskAnnPlatformBenchmark.Measure"]
+                   "--gtest_filter=" + getattr(args, "gtest_filter", "DiskAnnPlatformBenchmark.Measure")]
     log_path = args.output / f"{algorithm}-{phase}.log"
     print(f"Running {args.label}: {algorithm} {phase}", flush=True)
     with log_path.open("w") as log:
@@ -147,11 +147,14 @@ def measure(args, remote, algorithm, phase):
         raise RuntimeError(f"{algorithm} {phase} failed, exit={completed.returncode}")
     result = json.loads(matches[0])
     if io_control is not None:
-        observed = host_io.get("query")
-        if observed is None:
-            raise ValueError("Missing simulator-host query I/O observation")
-        result["io"]["host_timed_read_bytes"] = observed["read_bytes"]
-        result["io"]["host_counter_source"] = observed["source"]
+        if phase == "probe":
+            result["host_probe_io"] = host_io
+        else:
+            observed = host_io.get("query")
+            if observed is None:
+                raise ValueError("Missing simulator-host query I/O observation")
+            result["io"]["host_timed_read_bytes"] = observed["read_bytes"]
+            result["io"]["host_counter_source"] = observed["source"]
     if result.get("phase") != phase or result.get("index") != algorithm:
         raise ValueError("Result does not match benchmark invocation")
     if phase == "query" and not (0 <= result["recall_at_10"] <= 1):

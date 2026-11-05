@@ -17,7 +17,7 @@ file(GLOB_RECURSE ALL_SRCS *.cc *.c)
 # needs no extra backend library.
 set(CORE_KNN_DISKANN_LIBS zvec_ailego core_framework core_knn_cluster)
 option(DISKANN_CONTROLLED_IO_BENCHMARK
-       "Enable the test-only memory-backed DiskANN I/O model (not production)" OFF)
+       "Enable test-only DiskANN I/O models and native pacing instrumentation" OFF)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$")
     list(APPEND CORE_KNN_DISKANN_LIBS ${CMAKE_DL_LIBS})
