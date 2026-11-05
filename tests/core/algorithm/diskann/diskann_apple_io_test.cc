@@ -4,6 +4,7 @@
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -13,6 +14,7 @@
 #endif
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -46,6 +48,12 @@ class FailingInvalidator : public LinuxAlignedFileReader {
 class AppleFile : public ::testing::Test {
  protected:
   void SetUp() override {
+    const char *directory = std::getenv("ZVEC_APPLE_IO_FIXTURE_ROOT");
+    if (directory != nullptr) {
+      const int length = std::snprintf(path_, sizeof(path_), "%s/DiskAnnAppleIO.XXXXXX", directory);
+      ASSERT_GT(length, 0);
+      ASSERT_LT(static_cast<size_t>(length), sizeof(path_));
+    }
     fd_ = ::mkstemp(path_);
     ASSERT_GE(fd_, 0);
     ASSERT_EQ(::posix_memalign(&buffer_, static_cast<size_t>(::sysconf(_SC_PAGESIZE)), 8192), 0);
@@ -65,7 +73,7 @@ class AppleFile : public ::testing::Test {
     }
   }
   int fd_{-1};
-  char path_[64] = "DiskAnnAppleIO.XXXXXX";
+  char path_[PATH_MAX] = "DiskAnnAppleIO.XXXXXX";
   void *buffer_{nullptr};
 };
 
@@ -168,16 +176,60 @@ uint64_t ResidentBytes(int fd, size_t size, bool requested_only = false) {
   return bytes;
 }
 
-void DiskBytes(std::ostream &out) {
 #if !TARGET_OS_IPHONE
+uint64_t NativeDiskBytes() {
   rusage_info_v4 info{};
   if (::proc_pid_rusage(::getpid(), RUSAGE_INFO_V4,
                        reinterpret_cast<rusage_info_t *>(&info)) != 0) {
     throw std::runtime_error("proc_pid_rusage failed");
   }
-  out << info.ri_diskio_bytesread;
+  return info.ri_diskio_bytesread;
+}
+#endif
+
+void DiskBytes(std::ostream &out) {
+#if !TARGET_OS_IPHONE
+  out << NativeDiskBytes();
 #else
   out << "null";  // Simulator host measures the same live process at gates.
+#endif
+}
+
+TEST_F(AppleFile, LateBufferedRefillIsEvictedBeforeEachRead) {
+#if TARGET_OS_IPHONE
+  GTEST_SKIP() << "Per-read counter assertion uses native macOS libproc";
+#else
+  LinuxAlignedFileReader reader;
+  ASSERT_EQ(reader.open_from_handle(path_, fd_), 0);
+  IOContext context = nullptr;
+  std::vector<AlignedRead> requests{AlignedRead(0, kBlock, buffer_)};
+  (void)NativeDiskBytes();
+  ASSERT_EQ(reader.read(requests, context), 0);  // Prime code/counter paths.
+  uint64_t buffered_bytes = 0;
+  uint64_t production_bytes = 0;
+  constexpr size_t kIterations = 128;
+  for (size_t i = 0; i < kIterations; ++i) {
+    // An independent buffered reader repopulates this page before every read.
+    ASSERT_EQ(::pread(fd_, buffer_, kBlock, 0), static_cast<ssize_t>(kBlock));
+    ASSERT_GE(ResidentBytes(fd_, kBlock), kBlock);
+    auto before = NativeDiskBytes();
+    ASSERT_EQ(::pread(fd_, buffer_, kBlock, 0), static_cast<ssize_t>(kBlock));
+    buffered_bytes += NativeDiskBytes() - before;
+    before = NativeDiskBytes();
+    ASSERT_EQ(reader.read(requests, context), 0);
+    const uint64_t actual = NativeDiskBytes() - before;
+    ASSERT_GE(actual, kBlock) << "Production read hit a deliberately refilled page";
+    production_bytes += actual;
+    ASSERT_TRUE(reader.cache_invalidation_requested());
+    ASSERT_EQ(reader.cache_fallback_errno(), 0);
+    ASSERT_EQ(ResidentBytes(fd_, kBlock), 0U);
+    ExpectBytes(0x39);
+  }
+  EXPECT_EQ(buffered_bytes, 0U);
+  RecordProperty("iterations", std::to_string(kIterations));
+  RecordProperty("requested_bytes", std::to_string(kIterations * kBlock));
+  RecordProperty("buffered_read_bytes", std::to_string(buffered_bytes));
+  RecordProperty("production_read_bytes", std::to_string(production_bytes));
 #endif
 }
 

@@ -21,16 +21,17 @@ def run_test(args, binary, name, probe=False):
         benchmark.run(['xcrun', 'simctl', 'install', args.device, str(binary)])
         container = benchmark.run(['xcrun', 'simctl', 'get_app_container', args.device,
                                    identifier, 'data'], capture_output=True).stdout.strip()
-        root = Path(container) / 'Documents' / ('apple-io-' + token)
+        root = Path(container) / 'Documents' / ('apple-io-' + token + '.noindex')
         command = ['xcrun', 'simctl', 'launch', '--console', '--terminate-running-process',
                    args.device, identifier]
     else:
-        root = args.output.resolve() / ('native-' + token)
+        root = args.output.resolve() / ('native-' + token + '.noindex')
         command = [str(binary.resolve())]
     root.mkdir(parents=True, exist_ok=True)
     test_result, result = root / 'gtest.json', root / 'result.txt'
     command += ['--gtest_output=json:' + str(test_result)]
-    variables = {'ZVEC_APPLE_IO_RESULT_PATH': str(result)}
+    variables = {'ZVEC_APPLE_IO_RESULT_PATH': str(result),
+                 'ZVEC_APPLE_IO_FIXTURE_ROOT': str(root)}
     if probe:
         variables['ZVEC_APPLE_IO_PROBE'] = '1'
     control = root / 'control'
@@ -65,6 +66,13 @@ def run_test(args, binary, name, probe=False):
     if len(matches) != 1:
         raise ValueError('Missing durable Apple I/O probe result')
     report = json.loads(matches[0])
+    if args.transport == 'native':
+        refill = next((test for suite in tests['testsuites'] for test in suite['testsuite']
+                       if test['name'] == 'LateBufferedRefillIsEvictedBeforeEachRead'), None)
+        if refill is None or refill['result'] != 'COMPLETED':
+            raise ValueError('Missing native buffered-refill regression')
+        report['refill_control'] = {key: int(refill[key]) for key in
+                                    ('iterations', 'requested_bytes', 'buffered_read_bytes', 'production_read_bytes')}
     for case in report['cases']:
         if args.transport == 'ios':
             measured = observations[case['state']]
@@ -93,9 +101,12 @@ def evaluate(report):
             raise ValueError('Missing successful reads')
         if c['state'].startswith('production'):
             verified = (verified and c['invalidation_requested'] and not c['fallback_errno']
-                        and c['read_bytes'] >= c['requested_bytes'] * .9)
+                        and c['read_bytes'] >= c['requested_bytes']
+                        and c['requested_resident_after'] == 0)
             if c['state'].endswith('warm'):
                 verified = verified and c['resident_before'] >= report['fixture_bytes'] * .9
+            else:
+                verified = verified and c['resident_before'] == 0 and c['resident_after'] == 0
     report['verification'] = {'controls_valid': controls, 'cache_bypass_verified': bool(verified),
                               'method': 'bounded synchronous pre/post cache invalidation; F_NOCACHE where independent',
                               'scope': 'measured file-cache behavior, not an atomic OS O_DIRECT guarantee or phone flash'}
@@ -129,6 +140,12 @@ def main():
                      f'{c["invalidation_requested"]} | {c["fallback_errno"]} |')
     lines += ['', 'Verified measured cache bypass: **' + str(report['verification']['cache_bypass_verified']) + '**', '',
               'iOS observations use the simulator app process disk counter on its macOS host. No physical-phone claim. Other buffered readers can race range invalidation; this is not an OS-level atomic direct-I/O guarantee.', '']
+    if 'refill_control' in report:
+        refill = report['refill_control']
+        lines += [f'Native interleaved refill control: {refill["iterations"]} buffered refills; '
+                  f'{refill["requested_bytes"]} bytes requested from each reader. '
+                  f'Buffered read bytes: {refill["buffered_read_bytes"]}; '
+                  f'production read bytes: {refill["production_read_bytes"]}.', '']
     (args.output / 'verification.md').write_text('\n'.join(lines))
     print('\n'.join(lines), flush=True)
     if not report['verification']['cache_bypass_verified']:

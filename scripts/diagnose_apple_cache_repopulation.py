@@ -12,6 +12,7 @@ import json
 import mmap
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import tempfile
@@ -24,7 +25,7 @@ class Probe:
     reads = 4096
     block = 4096
 
-    def __init__(self, directory, anonymous, held):
+    def __init__(self, directory, anonymous, held, excluded=False):
         self.lib = c.CDLL(None, use_errno=True)
         self.proc = c.CDLL('/usr/lib/libproc.dylib', use_errno=True)
         self.lib.mmap.argtypes = [c.c_void_p, c.c_size_t, c.c_int, c.c_int, c.c_int, c.c_longlong]
@@ -54,7 +55,7 @@ class Probe:
         os.fsync(self.source)
         self.mapping = self.map(0, self.size, 0) if held else None
         self.stats = {}
-        self.result = {'anonymous': anonymous, 'held_mapping': held, 'pid': os.getpid(),
+        self.result = {'anonymous': anonymous, 'held_mapping': held, 'excluded': excluded, 'pid': os.getpid(),
                        'fixture': self.path, 'page_size': self.page, 'cases': []}
 
     def map(self, offset, length, protection):
@@ -187,33 +188,69 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--trace', action='store_true')
+    parser.add_argument('--production-binary', type=Path,
+                        help='Trace the actual C++ probe in a visible directory instead of the reference controls')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     trace = None
     retained = []
+    trace_reads = {}
+    trace_warnings = []
     if args.trace:
         if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted':
             raise RuntimeError('Privileged tracing is restricted to ephemeral GitHub-hosted CI')
         trace = subprocess.Popen(['sudo', '-n', '/usr/bin/fs_usage', '-w', '-f', 'filesys',
-                                  '-f', 'diskio', '-f', 'cachehit', '-t', '120'],
+                                  '-f', 'diskio', '-f', 'cachehit', '-t', '180'],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  errors='replace')
         def collect():
             with (args.output / 'fs-usage-fixture.log').open('w') as out:
                 for line in trace.stdout:
+                    if any(word in line.lower() for word in ('lost event', 'dropped event', 'overflow')):
+                        trace_warnings.append(line.strip())
+                    if 'RdData' in line and ('ZvecCacheFixture' in line or 'DiskAnnAppleIO' in line):
+                        path = re.search(r'(/\S*(?:ZvecCacheFixture|DiskAnnAppleIO)\.\S+)', line)
+                        size = re.search(r'B=0x([0-9a-fA-F]+)', line)
+                        if path and size:
+                            key = (line.split()[-1], path[1])
+                            trace_reads[key] = trace_reads.get(key, 0) + int(size[1], 16)
                     if len(retained) < 30:
                         retained.append(line)
-                    if 'ZvecCache' in line or 'Python.' in line or 'python' in line.lower():
+                    if ('ZvecCache' in line or 'DiskAnnAppleIO' in line or 'diskann_apple' in line
+                            or 'Python.' in line or 'python' in line.lower()):
                         out.write(line)
         reader = threading.Thread(target=collect, daemon=True)
         reader.start()
         time.sleep(1)
     report = {'pid': os.getpid(), 'variants': [], 'trace_requested': args.trace}
     try:
-        for anonymous in (False, True):
+        if args.production_binary:
+            with tempfile.TemporaryDirectory(prefix='ZvecCache.Production.', dir=os.getcwd()) as directory:
+                env = os.environ.copy()
+                result_path = args.output.resolve() / 'production-result.txt'
+                env.update({'ZVEC_APPLE_IO_PROBE': '1',
+                            'ZVEC_APPLE_IO_FIXTURE_ROOT': directory,
+                            'ZVEC_APPLE_IO_RESULT_PATH': str(result_path)})
+                command = [str(args.production_binary.resolve()),
+                           '--gtest_filter=AppleFile.VerifyRealCacheBehavior',
+                           '--gtest_output=json:' + str(args.output.resolve() / 'production-gtest.json')]
+                with (args.output / 'production-baseline.log').open('w') as log:
+                    process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+                    code = process.wait(timeout=180)
+                report['production_baseline'] = {'pid': process.pid, 'directory': directory,
+                                                  'returncode': code, 'purpose': 'visible-file attribution, not acceptance'}
+                if result_path.exists():
+                    match = re.search(r'ZVEC_APPLE_IO_RESULT (\{[^\r\n]+\})', result_path.read_text())
+                    if match:
+                        report['production_baseline']['probe'] = json.loads(match[1])
+                if code:
+                    raise RuntimeError('C++ attribution process failed; inspect retained logs')
+        for mode in (() if args.production_binary else ('linked', 'unlinked', 'noindex')):
+            anonymous, excluded = mode == 'unlinked', mode == 'noindex'
             for held in (False, True):
-                with tempfile.TemporaryDirectory(prefix='ZvecCache.', dir=os.getcwd()) as directory:
-                    probe = Probe(directory, anonymous, held)
+                with tempfile.TemporaryDirectory(prefix='ZvecCache.', suffix='.noindex' if excluded else '',
+                                                 dir=os.getcwd()) as directory:
+                    probe = Probe(directory, anonymous, held, excluded)
                     try:
                         try:
                             result = probe.run()
@@ -226,14 +263,26 @@ def main():
                         (args.output / 'attribution.json').write_text(json.dumps(report, indent=2) + '\n')
                     finally:
                         probe.close()
+        for variant in report['variants']:
+            if variant.get('excluded') or variant['anonymous']:
+                if variant.get('error'):
+                    raise RuntimeError('Isolated cache-attribution variant failed')
+                for case in variant['cases']:
+                    if case['name'] in ('idle-after-eviction', 'invalidation-only', 'hint-only-cold',
+                                        'production-cold', 'production-repeat'):
+                        if any(sample['resident_bytes'] for sample in case['samples']):
+                            raise RuntimeError('Isolated cache-attribution variant unexpectedly repopulated pages')
     finally:
         if trace is not None:
             if trace.poll() is None:
                 subprocess.run(['sudo', '-n', '/bin/kill', '-INT', str(trace.pid)], check=False)
-            trace.wait(timeout=130)
+            trace.wait(timeout=190)
             reader.join(timeout=5)
             report['trace_exit'] = trace.returncode
             report['trace_header'] = retained
+            report['trace_reads'] = [{'process_thread': key[0], 'fixture': key[1], 'bytes': size}
+                                     for key, size in sorted(trace_reads.items())]
+            report['trace_coverage_warnings'] = trace_warnings
         (args.output / 'attribution.json').write_text(json.dumps(report, indent=2) + '\n')
 
 

@@ -16,7 +16,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: diskann-apple-cache-${{ github.ref }}
+  group: diskann-apple-cache-${{ github.ref }}-${{ inputs.diagnostics_only || false }}
   cancel-in-progress: true
 
 jobs:
@@ -66,6 +66,17 @@ jobs:
             -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DENABLE_WERROR=ON \
             -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF
           cmake --build build-apple-cache --target diskann_apple_io_test diskann_file_reader_test diskann_platform_benchmark_test --parallel 3
+      - name: Attribute actual C++ probe reads on Intel before isolating acceptance
+        if: matrix.label == 'macos-intel'
+        run: |
+          python scripts/diagnose_apple_cache_repopulation.py --output production-attribution.noindex \
+            --trace --production-binary build-apple-cache/bin/diskann_apple_io_test
+      - uses: actions/upload-artifact@v7
+        if: always() && matrix.label == 'macos-intel'
+        with:
+          name: intel-production-attribution
+          path: production-attribution.noindex/
+          retention-days: 30
       - uses: actions/download-artifact@v8
         with:
           name: diskann-platform-dataset
@@ -79,18 +90,18 @@ jobs:
           python scripts/verify_apple_diskann_io.py --probe build-apple-cache/bin/diskann_apple_io_test \
             --regression build-apple-cache/bin/diskann_file_reader_test \
             --benchmark build-apple-cache/bin/diskann_platform_benchmark_test \
-            --data benchmark-data --output apple-cache-results --label "$BENCH_LABEL"
+            --data benchmark-data --output apple-cache-results.noindex --label "$BENCH_LABEL"
       - name: Publish cache verification
         if: always()
         run: |
-          if test -f apple-cache-results/verification.md; then
-            cat apple-cache-results/verification.md >> "$GITHUB_STEP_SUMMARY"
+          if test -f apple-cache-results.noindex/verification.md; then
+            cat apple-cache-results.noindex/verification.md >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: apple-cache-${{ matrix.label }}
-          path: apple-cache-results/
+          path: apple-cache-results.noindex/
           retention-days: 30
 
   ios:
@@ -135,19 +146,19 @@ jobs:
           python scripts/verify_apple_diskann_io.py --probe build-apple-cache/bin/diskann_apple_io_test.app \
             --regression build-apple-cache/bin/diskann_mobile_compat_test.app \
             --benchmark build-apple-cache/bin/diskann_platform_benchmark_test.app \
-            --data benchmark-data --output apple-cache-results --label ios-arm64-simulator \
+            --data benchmark-data --output apple-cache-results.noindex --label ios-arm64-simulator \
             --transport ios --device "$APPLE_IO_DEVICE"
       - name: Publish cache verification
         if: always()
         run: |
-          if test -f apple-cache-results/verification.md; then
-            cat apple-cache-results/verification.md >> "$GITHUB_STEP_SUMMARY"
+          if test -f apple-cache-results.noindex/verification.md; then
+            cat apple-cache-results.noindex/verification.md >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: apple-cache-ios-simulator
-          path: apple-cache-results/
+          path: apple-cache-results.noindex/
           retention-days: 30
       - name: Shutdown simulator
         if: always() && env.APPLE_IO_DEVICE != ''

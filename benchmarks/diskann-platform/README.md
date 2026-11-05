@@ -132,6 +132,22 @@ do not measure physical iPhone flash. Results retain each counter's scope.
 The probe resets only its own fixture ranges; the separate first-pass query
 controls can purge the ephemeral CI host cache, and record that condition.
 
+Intel cache-attribution tracing identified Spotlight's `mdworker_shared` reading
+the visible fixture and repopulating about 2 MiB. Buffered follow-up reads hit
+those pages; production follow-ups still issued the full requested storage I/O.
+The same workload on an inode unlinked before its content was written showed
+no repopulation, with either transient or persistent observation mappings.
+The CI therefore places fixtures and query indexes in `.noindex` directories,
+without disabling Spotlight system-wide or changing users' indexing settings.
+Every production probe must leave zero requested-page residency; both cold and
+immediately repeated cases must start and end with zero total residency.
+Native macOS also deliberately refills a page through a buffered descriptor
+before each of 128 production reads and checks per-read storage bytes, payloads,
+fallback status and final residency. An unmodified buffered reader must hit it.
+The optional `diagnostics_only` workflow input retains process-attributed
+`fs_usage` traces and linked/unlinked/excluded-directory controls. These
+diagnostics do not replace actual C++ production-reader acceptance tests.
+
 ## Outputs
 
 Each platform uploads build/query logs, raw JSON, and `result.json`.
