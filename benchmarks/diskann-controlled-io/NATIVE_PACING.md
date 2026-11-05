@@ -81,3 +81,17 @@ runs all eight environments. The old cost-model workflow is now manual-only.
 The summary emits `publication-comparison.md` with both algorithms' RSS,
 Recall@10, P95 and QPS, simulator labels and cache conditions, plus combined
 raw JSON. Raw probe and trial results remain available for audit.
+
+## Resuming and auditing results
+
+`DiskANN Paced Results Audit` reads immutable artifacts from one specified source
+run at one exact benchmark revision. For each platform it selects the earliest
+artifact whose I/O qualification and all three paired query trials completed.
+Selection never ranks QPS or latency. A later unqualified runner cannot replace
+an earlier complete qualified report. All attempts, artifact IDs and report
+SHA-256 values remain in the audit output, including rejected attempts.
+
+The auditor recomputes probe decisions, recall/budget checks, medians, native
+read evidence and QPS from the original timed-block wall time. It fails unless
+all eight platforms satisfy the protocol. The source measurement workflow's
+individual attempt statuses remain unchanged and visible.

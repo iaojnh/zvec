@@ -1,0 +1,643 @@
+{
+  "schema_version": 1,
+  "kind": "paced-native-file-io",
+  "label": "macos-arm64",
+  "host": {
+    "os": "macOS-15.8.2-arm64-arm-64bit",
+    "architecture": "arm64",
+    "logical_cpus": 3,
+    "runner": "GitHub Actions 1000005774",
+    "runner_image": "macos15",
+    "runner_image_version": "20261028.0489.1",
+    "commit": "43a2af9d16b10b258a45a03223136959c16f7466",
+    "run_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997",
+    "cpu": "Apple M1 (Virtual)",
+    "memory_bytes": 7516192768,
+    "storage": "Device Identifier:         disk2s1s1\n   Device Node:               /dev/disk2s1s1\n   Whole:                     No\n   Part of Whole:             disk2\n\n   Volume Name:               Macintosh HD\n   Mounted:                   Yes\n   Mount Point:               /\n\n   Partition Type:            41504653-0000-11AA-AA11-00306543ECAC\n   File System Personality:   APFS\n   Type (Bundle):             apfs\n   Name (User Visible):       APFS\n   Owners:                    Enabled\n\n   OS Can Be Installed:       No\n   Booter Disk:               disk2s2\n   Recovery Disk:             disk2s3\n   Media Type:                \n   Protocol:                  \n   SMART Status:              Not Supported\n   Volume UUID:               8C863AE6-CEC9-4FE4-B8F4-4E8DD726D128\n   Disk / Partition UUID:     8C863AE6-CEC9-4FE4-B8F4-4E8DD726D128\n\n   Disk Size:                 343.1 GB (343073095680 Bytes) (exactly 670064640 512-Byte-Units)\n   Device Block Size:         4096 Bytes\n\n   Volume Used Space:         11.3 GB (11265937408 Bytes) (exactly 22003784 512-Byte-Units)\n   Container Total Space:     343.1 GB (343073095680 Bytes) (exactly 670064640 512-Byte-Units)\n   Container Free Space:      45.8 GB (45772701696 Bytes) (exactly 89399808 512-Byte-Units)\n   Allocation Block Size:     4096 Bytes\n\n   Media OS Use Only:         No\n   Media Read-Only:           Yes\n   Volume Read-Only:          Yes (read-only mount flag set)\n\n   Device Location:           Internal\n   Removable Media:           Fixed\n\n   Solid State:               Yes\n\n   This disk is an APFS Volume Snapshot.  APFS Information:\n   APFS Snapshot Name:        com.apple.os.update-624F4BC7A0EC2C5EBA734EA2307E0510B256421BF0861324585CDEBB770167BB\n   APFS Snapshot UUID:        8C863AE6-CEC9-4FE4-B8F4-4E8DD726D128\n   APFS Container:            disk2\n   APFS Physical Store:       disk0s2\n   Fusion Drive:              No\n   APFS Volume Group:         5DC82524-0912-43FA-B6EB-AB897BD8CC07\n   EFI Driver In macOS:       2332140013704003\n   Encrypted:                 No\n   FileVault:                 No\n   Sealed:                    Yes\n   Locked:                    No\n\n   APFS Snapshots are defined upon this APFS Volume.  Snapshot list:\n   Snapshot UUID:             8C863AE6-CEC9-4FE4-B8F4-4E8DD726D128\n   Name:                      com.apple.os.update-624F4BC7A0EC2C5EBA734EA2307E0510B256421BF0861324585CDEBB770167BB\n   XID:                       2380",
+    "filesystem": "usage(total=343073095680, used=297300393984, free=45772701696)"
+  },
+  "data_path": "/Users/runner/work/zvec/zvec/benchmark-data",
+  "fixture": {
+    "schema_version": 1,
+    "sha256": {
+      "base.fbin": "e50ff1bc34bcc6d1c97dd001023c09a666971cde64605cc06671ed8a8ff1ed12",
+      "dataset.json": "b18063d855fd8d58d0973acc01f3beaf6951bfac922d4371bbe994e2aeed737a",
+      "diskann.index": "34f571c79685c4a99f3ded16b30967649d8d8c7a8836dbf9be888c730486ec19",
+      "hnsw.index": "4bb007e36468207c0348e9896331d22d5a7c160fa2b1eab13eac898b3af5e09b",
+      "neighbors.ibin": "9980c6cac6a5d8d797c185535e0def5e3e3a2679be2e6d4fe2e4f666c5f04c67",
+      "queries.fbin": "f1c5f70ed802ca3e1053e9f176e4a910d1294169ba9f00ef5e651dc548c0b90f"
+    },
+    "budgets": {
+      "hnsw": 32,
+      "diskann": 32
+    },
+    "recall_at_10": {
+      "hnsw": 0.9728,
+      "diskann": 0.9867
+    },
+    "dataset": {
+      "dataset": "SIFT-128 first-N subset",
+      "source": "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
+      "vectors": 100000,
+      "dimension": 128,
+      "dtype": "FP32",
+      "metric": "squared Euclidean",
+      "calibration_queries": 200,
+      "evaluation_queries": 1000,
+      "ground_truth": "exhaustive squared Euclidean, recomputed for this subset",
+      "sha256": {
+        "base.fbin": "e50ff1bc34bcc6d1c97dd001023c09a666971cde64605cc06671ed8a8ff1ed12",
+        "queries.fbin": "f1c5f70ed802ca3e1053e9f176e4a910d1294169ba9f00ef5e651dc548c0b90f",
+        "neighbors.ibin": "9980c6cac6a5d8d797c185535e0def5e3e3a2679be2e6d4fe2e4f666c5f04c67"
+      }
+    }
+  },
+  "common_iops": 2000,
+  "queue_depth": 8,
+  "probe_operations": 8192,
+  "probe_warmup_operations": 8192,
+  "trials": 3,
+  "repetitions": 3,
+  "requested_profiles": [
+    2000,
+    10000,
+    20000,
+    0
+  ],
+  "profiles": {
+    "2000": {
+      "eligible": false,
+      "reasons": [
+        "Native path cannot sustain this IOPS tier within 10%"
+      ]
+    },
+    "10000": {
+      "eligible": false,
+      "reasons": [
+        "Native path cannot sustain this IOPS tier within 10%"
+      ]
+    },
+    "20000": {
+      "eligible": false,
+      "reasons": [
+        "Native path cannot sustain this IOPS tier within 10%"
+      ]
+    },
+    "0": {
+      "eligible": true,
+      "iops_limit": 0,
+      "bytes_per_second_limit": 0,
+      "raw_trials": {
+        "hnsw": [
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 64.835167,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.078333,
+            "p95_ms": 0.274083,
+            "p99_ms": 0.416166,
+            "qps": 9515.44448146,
+            "search_only_qps": 9580.52877857,
+            "timed_block_wall_ms": 315.276917,
+            "baseline_rss_bytes": 7733248,
+            "steady_rss_bytes": 99745792,
+            "sampled_peak_query_rss_bytes": 99745792,
+            "index_rss_delta_bytes": 92012544,
+            "io": {
+              "source": "proc_pid_rusage OS disk-I/O bytes",
+              "open_read_bytes": 0,
+              "warmup_read_bytes": 0,
+              "timed_read_bytes": 0,
+              "timed_cpu_seconds": 0.31054,
+              "timed_major_faults": 0
+            }
+          },
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 67.00475,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.070417,
+            "p95_ms": 0.210708,
+            "p99_ms": 0.267708,
+            "qps": 11877.3544381,
+            "search_only_qps": 11947.6504615,
+            "timed_block_wall_ms": 252.5815,
+            "baseline_rss_bytes": 7733248,
+            "steady_rss_bytes": 99680256,
+            "sampled_peak_query_rss_bytes": 99680256,
+            "index_rss_delta_bytes": 91947008,
+            "io": {
+              "source": "proc_pid_rusage OS disk-I/O bytes",
+              "open_read_bytes": 0,
+              "warmup_read_bytes": 0,
+              "timed_read_bytes": 0,
+              "timed_cpu_seconds": 0.2499,
+              "timed_major_faults": 0
+            }
+          },
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 29.490041,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.061875,
+            "p95_ms": 0.097042,
+            "p99_ms": 0.149167,
+            "qps": 15515.5727865,
+            "search_only_qps": 15625.7728247,
+            "timed_block_wall_ms": 193.354125,
+            "baseline_rss_bytes": 7880704,
+            "steady_rss_bytes": 99942400,
+            "sampled_peak_query_rss_bytes": 99942400,
+            "index_rss_delta_bytes": 92061696,
+            "io": {
+              "source": "proc_pid_rusage OS disk-I/O bytes",
+              "open_read_bytes": 0,
+              "warmup_read_bytes": 0,
+              "timed_read_bytes": 0,
+              "timed_cpu_seconds": 0.192948,
+              "timed_major_faults": 0
+            }
+          }
+        ],
+        "diskann": [
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 78.850125,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 5.462167,
+            "p95_ms": 11.017,
+            "p99_ms": 22.026125,
+            "qps": 161.682496445,
+            "search_only_qps": 161.735619218,
+            "timed_block_wall_ms": 18554.884208,
+            "baseline_rss_bytes": 7897088,
+            "steady_rss_bytes": 19447808,
+            "sampled_peak_query_rss_bytes": 19447808,
+            "index_rss_delta_bytes": 11550720,
+            "io": {
+              "source": "proc_pid_rusage OS disk-I/O bytes",
+              "open_read_bytes": 3854336,
+              "warmup_read_bytes": 210264064,
+              "timed_read_bytes": 630743040,
+              "timed_cpu_seconds": 6.806636,
+              "timed_major_faults": 0
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 0,
+              "bytes_per_second_limit": 0,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 0,
+              "achieved_iops": 8299.16254253,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 5.564,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 3.630417,
+            "p95_ms": 6.689958,
+            "p99_ms": 9.85975,
+            "qps": 234.134010399,
+            "search_only_qps": 234.207288954,
+            "timed_block_wall_ms": 12813.174792,
+            "baseline_rss_bytes": 7749632,
+            "steady_rss_bytes": 19251200,
+            "sampled_peak_query_rss_bytes": 19251200,
+            "index_rss_delta_bytes": 11501568,
+            "io": {
+              "source": "proc_pid_rusage OS disk-I/O bytes",
+              "open_read_bytes": 36864,
+              "warmup_read_bytes": 210247680,
+              "timed_read_bytes": 630743040,
+              "timed_cpu_seconds": 4.861257,
+              "timed_major_faults": 0
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 0,
+              "bytes_per_second_limit": 0,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 0,
+              "achieved_iops": 12018.0987538,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 3.738083,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 3.860583,
+            "p95_ms": 6.822125,
+            "p99_ms": 9.518958,
+            "qps": 229.806706011,
+            "search_only_qps": 229.884838808,
+            "timed_block_wall_ms": 13054.449333,
+            "baseline_rss_bytes": 7749632,
+            "steady_rss_bytes": 19054592,
+            "sampled_peak_query_rss_bytes": 19054592,
+            "index_rss_delta_bytes": 11304960,
+            "io": {
+              "source": "proc_pid_rusage OS disk-I/O bytes",
+              "open_read_bytes": 36864,
+              "warmup_read_bytes": 210247680,
+              "timed_read_bytes": 630743040,
+              "timed_cpu_seconds": 5.103128,
+              "timed_major_faults": 0
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 0,
+              "bytes_per_second_limit": 0,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 0,
+              "achieved_iops": 11795.9782195,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          }
+        ]
+      },
+      "medians": {
+        "hnsw": {
+          "steady_rss_bytes": 99745792,
+          "baseline_rss_bytes": 7733248,
+          "index_rss_delta_bytes": 92012544,
+          "sampled_peak_query_rss_bytes": 99745792,
+          "recall_at_10": 0.9728,
+          "p50_ms": 0.070417,
+          "p95_ms": 0.210708,
+          "p99_ms": 0.267708,
+          "qps": 11877.3544381
+        },
+        "diskann": {
+          "steady_rss_bytes": 19251200,
+          "baseline_rss_bytes": 7749632,
+          "index_rss_delta_bytes": 11501568,
+          "sampled_peak_query_rss_bytes": 19251200,
+          "recall_at_10": 0.9867,
+          "p50_ms": 3.860583,
+          "p95_ms": 6.822125,
+          "p99_ms": 9.85975,
+          "qps": 229.806706011,
+          "achieved_iops": 11795.9782195,
+          "cache_policy": "Apple per-range eviction",
+          "reads_per_query": 51.33
+        }
+      }
+    }
+  },
+  "probes": {
+    "2000": {
+      "raw": {
+        "phase": "probe",
+        "index": "diskann",
+        "cases": [
+          {
+            "state": "buffered-warm",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.018284,
+            "seconds": 0.094369708,
+            "achieved_iops": 86807.5166663,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 94369708,
+            "checksum": "15187674313215887028",
+            "cache_policy": "buffered-file-control",
+            "read_bytes": 0,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 0
+          },
+          {
+            "state": "native-unlimited",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.164427125,
+            "seconds": 1.0201695,
+            "achieved_iops": 8030.03814562,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 1020169500,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-target",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 4.132890083,
+            "seconds": 4.161942,
+            "achieved_iops": 1968.31190824,
+            "iops_limit": 2000,
+            "actual_wait_ns": 2277679496,
+            "non_wait_wall_ns": 1884262504,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-half",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 8.960958625,
+            "seconds": 9.171337,
+            "achieved_iops": 893.217641005,
+            "iops_limit": 1000,
+            "actual_wait_ns": 5866606223,
+            "non_wait_wall_ns": 3304730777,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          }
+        ]
+      },
+      "verification": {
+        "requested_iops": 2000,
+        "cache_verified": true,
+        "ceiling_verified": true,
+        "tier_attainable": false,
+        "eligible": false,
+        "observed_iops": 1968.31190824,
+        "half_rate_iops": 893.217641005,
+        "cache_evidence": "OS storage-read accounting versus buffered warm control",
+        "reasons": [
+          "Native path cannot sustain this IOPS tier within 10%"
+        ]
+      }
+    },
+    "10000": {
+      "raw": {
+        "phase": "probe",
+        "index": "diskann",
+        "cases": [
+          {
+            "state": "buffered-warm",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.8402255,
+            "seconds": 0.066595042,
+            "achieved_iops": 123012.160575,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 66595042,
+            "checksum": "15187674313215887028",
+            "cache_policy": "buffered-file-control",
+            "read_bytes": 0,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 0
+          },
+          {
+            "state": "native-unlimited",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.732174209,
+            "seconds": 0.832106,
+            "achieved_iops": 9844.89956808,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 832106000,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-target",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.916424417,
+            "seconds": 0.939097917,
+            "achieved_iops": 8723.26500965,
+            "iops_limit": 10000,
+            "actual_wait_ns": 102629259,
+            "non_wait_wall_ns": 836468658,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-half",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.825801084,
+            "seconds": 1.755884209,
+            "achieved_iops": 4665.45570489,
+            "iops_limit": 5000,
+            "actual_wait_ns": 377771327,
+            "non_wait_wall_ns": 1378112882,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          }
+        ]
+      },
+      "verification": {
+        "requested_iops": 10000,
+        "cache_verified": true,
+        "ceiling_verified": true,
+        "tier_attainable": false,
+        "eligible": false,
+        "observed_iops": 8723.26500965,
+        "half_rate_iops": 4665.45570489,
+        "cache_evidence": "OS storage-read accounting versus buffered warm control",
+        "reasons": [
+          "Native path cannot sustain this IOPS tier within 10%"
+        ]
+      }
+    },
+    "20000": {
+      "raw": {
+        "phase": "probe",
+        "index": "diskann",
+        "cases": [
+          {
+            "state": "buffered-warm",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.612066792,
+            "seconds": 0.070587375,
+            "achieved_iops": 116054.747751,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 70587375,
+            "checksum": "15187674313215887028",
+            "cache_policy": "buffered-file-control",
+            "read_bytes": 0,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 0
+          },
+          {
+            "state": "native-unlimited",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.857834542,
+            "seconds": 0.929757041,
+            "achieved_iops": 8810.90396604,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 929757041,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-target",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.705303333,
+            "seconds": 0.93965225,
+            "achieved_iops": 8718.11885727,
+            "iops_limit": 20000,
+            "actual_wait_ns": 682248,
+            "non_wait_wall_ns": 938970002,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-half",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.988439875,
+            "seconds": 1.07427475,
+            "achieved_iops": 7625.60974276,
+            "iops_limit": 10000,
+            "actual_wait_ns": 93199421,
+            "non_wait_wall_ns": 981075329,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": 33554432,
+            "counter_source": "proc_pid_rusage OS disk-I/O bytes",
+            "observed_read_bytes": 33554432
+          }
+        ]
+      },
+      "verification": {
+        "requested_iops": 20000,
+        "cache_verified": true,
+        "ceiling_verified": true,
+        "tier_attainable": false,
+        "eligible": false,
+        "observed_iops": 8718.11885727,
+        "half_rate_iops": 7625.60974276,
+        "cache_evidence": "OS storage-read accounting versus buffered warm control",
+        "reasons": [
+          "Native path cannot sustain this IOPS tier within 10%"
+        ]
+      }
+    }
+  },
+  "measurement": {
+    "api": "serial C++ core index search; not Python/full Collection",
+    "qps": "queries / actual complete timed-block wall time, including native I/O and pacing waits",
+    "p95": "median of trial P95 values for real search-call wall latency",
+    "memory": "steady query-process RSS; Windows working set; decimal MB; kernel file cache excluded",
+    "cache": "held-out workload warmed once; HNSW resident; DiskANN native cache policy verified separately",
+    "hardware": "GitHub runner CPU/RAM/storage differ; IOPS limits are verified ceilings, not a hardware match"
+  },
+  "publication_ready": false
+}

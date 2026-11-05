@@ -54,7 +54,7 @@ def build_report(root):
             h, d = profile["medians"]["hnsw"], profile["medians"]["diskann"]
             out.append(f"| {name} | {h['steady_rss_bytes']/1e6:.2f} → {d['steady_rss_bytes']/1e6:.2f} | "
                        f"{h['recall_at_10']:.2%} → {d['recall_at_10']:.2%} | {h['p95_ms']:.3f} → {d['p95_ms']:.3f} | "
-                       f"{h['qps']:,.1f} → {d['qps']:,.1f} | {d['cache_policy']} / {d['achieved_iops']:,.0f} |")
+                       f"{h['qps']:,.2f} → {d['qps']:,.2f} | {d['cache_policy']} / {d['achieved_iops']:,.0f} |")
         return out
     for rate in first["requested_profiles"]:
         lines += [f"## {rate:,} IOPS 上限" if rate else "## 原生不限速参考", ""]

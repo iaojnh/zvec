@@ -1,0 +1,1005 @@
+{
+  "schema_version": 1,
+  "kind": "paced-native-file-io",
+  "label": "ios-arm64-simulator",
+  "host": {
+    "os": "macOS-26.6.2-arm64-arm-64bit",
+    "architecture": "arm64",
+    "logical_cpus": 3,
+    "runner": "GitHub Actions 1000005772",
+    "runner_image": "macos26",
+    "runner_image_version": "20261026.0455.2",
+    "commit": "43a2af9d16b10b258a45a03223136959c16f7466",
+    "run_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997",
+    "cpu": "Apple M1 (Virtual)",
+    "memory_bytes": 7516192768,
+    "storage": "Device Identifier:         disk2s1s1\n   Device Node:               /dev/disk2s1s1\n   Whole:                     No\n   Part of Whole:             disk2\n\n   Volume Name:               Macintosh HD\n   Mounted:                   Yes\n   Mount Point:               /\n\n   Partition Type:            41504653-0000-11AA-AA11-00306543ECAC\n   File System Personality:   APFS\n   Type (Bundle):             apfs\n   Name (User Visible):       APFS\n   Owners:                    Enabled\n\n   OS Can Be Installed:       No\n   Booter Disk:               disk2s2\n   Recovery Disk:             disk2s3\n   Media Type:                \n   Protocol:                  \n   SMART Status:              Not Supported\n   Volume UUID:               A0A55CB3-070F-4970-AE9D-C2CFB5B9121B\n   Disk / Partition UUID:     A0A55CB3-070F-4970-AE9D-C2CFB5B9121B\n\n   Disk Size:                 343.1 GB (343073095680 Bytes) (exactly 670064640 512-Byte-Units)\n   Device Block Size:         4096 Bytes\n\n   Volume Used Space:         12.6 GB (12639047680 Bytes) (exactly 24685640 512-Byte-Units)\n   Container Total Space:     343.1 GB (343073095680 Bytes) (exactly 670064640 512-Byte-Units)\n   Container Free Space:      99.9 GB (99877679104 Bytes) (exactly 195073592 512-Byte-Units)\n   Allocation Block Size:     4096 Bytes\n\n   Media OS Use Only:         No\n   Media Read-Only:           Yes\n   Volume Read-Only:          Yes (read-only mount flag set)\n\n   Device Location:           Internal\n   Removable Media:           Fixed\n\n   Solid State:               Yes\n\n   This disk is an APFS Volume Snapshot.  APFS Information:\n   APFS Snapshot Name:        com.apple.os.update-60587424F5399FC05D957DF05B4D2F65543462495C77AEF520F790FBB57CB212\n   APFS Snapshot UUID:        A0A55CB3-070F-4970-AE9D-C2CFB5B9121B\n   APFS Container:            disk2\n   APFS Physical Store:       disk0s2\n   APFS Volume Group:         FF74119D-8794-4FF2-996D-8C0B0C532DA5\n   EFI Driver In macOS:       2811160007000004\n   Encrypted:                 No\n   FileVault:                 No\n   Sealed:                    Yes\n   Locked:                    No\n\n   APFS Snapshots are defined upon this APFS Volume.  Snapshot list:\n   Snapshot UUID:             A0A55CB3-070F-4970-AE9D-C2CFB5B9121B\n   Name:                      com.apple.os.update-60587424F5399FC05D957DF05B4D2F65543462495C77AEF520F790FBB57CB212\n   XID:                       387",
+    "filesystem": "usage(total=343073095680, used=243195420672, free=99877675008)"
+  },
+  "data_path": "/Users/runner/Library/Developer/CoreSimulator/Devices/7EFC6246-6BDB-4FD4-AE32-9345E3B28BD8/data/Containers/Data/Application/9A806DDF-49E9-4EF3-8E8F-985D4D852327/Documents/benchmark",
+  "fixture": {
+    "schema_version": 1,
+    "sha256": {
+      "base.fbin": "e50ff1bc34bcc6d1c97dd001023c09a666971cde64605cc06671ed8a8ff1ed12",
+      "dataset.json": "b18063d855fd8d58d0973acc01f3beaf6951bfac922d4371bbe994e2aeed737a",
+      "diskann.index": "34f571c79685c4a99f3ded16b30967649d8d8c7a8836dbf9be888c730486ec19",
+      "hnsw.index": "4bb007e36468207c0348e9896331d22d5a7c160fa2b1eab13eac898b3af5e09b",
+      "neighbors.ibin": "9980c6cac6a5d8d797c185535e0def5e3e3a2679be2e6d4fe2e4f666c5f04c67",
+      "queries.fbin": "f1c5f70ed802ca3e1053e9f176e4a910d1294169ba9f00ef5e651dc548c0b90f"
+    },
+    "budgets": {
+      "hnsw": 32,
+      "diskann": 32
+    },
+    "recall_at_10": {
+      "hnsw": 0.9728,
+      "diskann": 0.9867
+    },
+    "dataset": {
+      "dataset": "SIFT-128 first-N subset",
+      "source": "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
+      "vectors": 100000,
+      "dimension": 128,
+      "dtype": "FP32",
+      "metric": "squared Euclidean",
+      "calibration_queries": 200,
+      "evaluation_queries": 1000,
+      "ground_truth": "exhaustive squared Euclidean, recomputed for this subset",
+      "sha256": {
+        "base.fbin": "e50ff1bc34bcc6d1c97dd001023c09a666971cde64605cc06671ed8a8ff1ed12",
+        "queries.fbin": "f1c5f70ed802ca3e1053e9f176e4a910d1294169ba9f00ef5e651dc548c0b90f",
+        "neighbors.ibin": "9980c6cac6a5d8d797c185535e0def5e3e3a2679be2e6d4fe2e4f666c5f04c67"
+      }
+    }
+  },
+  "common_iops": 2000,
+  "queue_depth": 8,
+  "probe_operations": 8192,
+  "probe_warmup_operations": 8192,
+  "trials": 3,
+  "repetitions": 3,
+  "requested_profiles": [
+    2000,
+    10000,
+    20000,
+    0
+  ],
+  "profiles": {
+    "2000": {
+      "eligible": true,
+      "iops_limit": 2000,
+      "bytes_per_second_limit": 16777216,
+      "raw_trials": {
+        "hnsw": [
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 555.149167,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.092,
+            "p95_ms": 0.26675,
+            "p99_ms": 0.318208,
+            "qps": 7617.3782573,
+            "search_only_qps": 7673.41666522,
+            "timed_block_wall_ms": 393.836291,
+            "baseline_rss_bytes": 40501248,
+            "steady_rss_bytes": 132005888,
+            "sampled_peak_query_rss_bytes": 132022272,
+            "index_rss_delta_bytes": 91504640,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 0.393824,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 0,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 378.857708,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.083042,
+            "p95_ms": 0.247959,
+            "p99_ms": 0.328875,
+            "qps": 8604.28052574,
+            "search_only_qps": 8653.20693979,
+            "timed_block_wall_ms": 348.663667,
+            "baseline_rss_bytes": 40615936,
+            "steady_rss_bytes": 132104192,
+            "sampled_peak_query_rss_bytes": 132104192,
+            "index_rss_delta_bytes": 91488256,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 0.347507,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 0,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 524.805209,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.082708,
+            "p95_ms": 0.241458,
+            "p99_ms": 0.325542,
+            "qps": 9262.15488331,
+            "search_only_qps": 9314.07289446,
+            "timed_block_wall_ms": 323.898708,
+            "baseline_rss_bytes": 40599552,
+            "steady_rss_bytes": 131891200,
+            "sampled_peak_query_rss_bytes": 132055040,
+            "index_rss_delta_bytes": 91291648,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 0.321827,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 0,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            }
+          }
+        ],
+        "diskann": [
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 13.862917,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 25.54425,
+            "p95_ms": 30.567458,
+            "p99_ms": 34.823917,
+            "qps": 38.5238358667,
+            "search_only_qps": 38.5296842939,
+            "timed_block_wall_ms": 77873.865167,
+            "baseline_rss_bytes": 40632320,
+            "steady_rss_bytes": 37666816,
+            "sampled_peak_query_rss_bytes": 51003392,
+            "index_rss_delta_bytes": 0,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 11.861181,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 630751232,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 2000,
+              "bytes_per_second_limit": 16777216,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 48570546702,
+              "achieved_iops": 1977.42849504,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 29.437792,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 25.619875,
+            "p95_ms": 31.174125,
+            "p99_ms": 38.291209,
+            "qps": 38.1778983963,
+            "search_only_qps": 38.1836619387,
+            "timed_block_wall_ms": 78579.495625,
+            "baseline_rss_bytes": 40599552,
+            "steady_rss_bytes": 37306368,
+            "sampled_peak_query_rss_bytes": 50987008,
+            "index_rss_delta_bytes": 0,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 12.382229,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 630751232,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 2000,
+              "bytes_per_second_limit": 16777216,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 45828948451,
+              "achieved_iops": 1959.67152468,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 17.226291,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 25.473125,
+            "p95_ms": 29.993917,
+            "p99_ms": 34.392542,
+            "qps": 38.6646503551,
+            "search_only_qps": 38.6703707439,
+            "timed_block_wall_ms": 77590.252917,
+            "baseline_rss_bytes": 40632320,
+            "steady_rss_bytes": 50642944,
+            "sampled_peak_query_rss_bytes": 50921472,
+            "index_rss_delta_bytes": 10010624,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 11.477096,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 630747136,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 2000,
+              "bytes_per_second_limit": 16777216,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 49236408630,
+              "achieved_iops": 1984.65650273,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          }
+        ]
+      },
+      "medians": {
+        "hnsw": {
+          "steady_rss_bytes": 132005888,
+          "baseline_rss_bytes": 40599552,
+          "index_rss_delta_bytes": 91488256,
+          "sampled_peak_query_rss_bytes": 132055040,
+          "recall_at_10": 0.9728,
+          "p50_ms": 0.083042,
+          "p95_ms": 0.247959,
+          "p99_ms": 0.325542,
+          "qps": 8604.28052574
+        },
+        "diskann": {
+          "steady_rss_bytes": 37666816,
+          "baseline_rss_bytes": 40632320,
+          "index_rss_delta_bytes": 0,
+          "sampled_peak_query_rss_bytes": 50987008,
+          "recall_at_10": 0.9867,
+          "p50_ms": 25.54425,
+          "p95_ms": 30.567458,
+          "p99_ms": 34.823917,
+          "qps": 38.5238358667,
+          "achieved_iops": 1977.42849504,
+          "cache_policy": "Apple per-range eviction",
+          "reads_per_query": 51.33
+        }
+      }
+    },
+    "10000": {
+      "eligible": false,
+      "reasons": [
+        "Native path cannot sustain this IOPS tier within 10%"
+      ]
+    },
+    "20000": {
+      "eligible": false,
+      "reasons": [
+        "Real-time IOPS ceiling or actual wait not verified",
+        "Native path cannot sustain this IOPS tier within 10%"
+      ]
+    },
+    "0": {
+      "eligible": true,
+      "iops_limit": 0,
+      "bytes_per_second_limit": 0,
+      "raw_trials": {
+        "hnsw": [
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 359.373833,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.085708,
+            "p95_ms": 0.262792,
+            "p99_ms": 0.380416,
+            "qps": 8396.37219962,
+            "search_only_qps": 8443.82127417,
+            "timed_block_wall_ms": 357.297167,
+            "baseline_rss_bytes": 40566784,
+            "steady_rss_bytes": 132136960,
+            "sampled_peak_query_rss_bytes": 132136960,
+            "index_rss_delta_bytes": 91570176,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 0.357198,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 0,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 534.614583,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.094458,
+            "p95_ms": 0.275875,
+            "p99_ms": 0.36425,
+            "qps": 7695.88760216,
+            "search_only_qps": 7750.4007616,
+            "timed_block_wall_ms": 389.818583,
+            "baseline_rss_bytes": 40599552,
+            "steady_rss_bytes": 132104192,
+            "sampled_peak_query_rss_bytes": 132104192,
+            "index_rss_delta_bytes": 91504640,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 0.387324,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 0,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "hnsw",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 518.730334,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9728,
+            "p50_ms": 0.079333,
+            "p95_ms": 0.252125,
+            "p99_ms": 0.365334,
+            "qps": 9714.23030247,
+            "search_only_qps": 9772.74883126,
+            "timed_block_wall_ms": 308.825291,
+            "baseline_rss_bytes": 40615936,
+            "steady_rss_bytes": 132071424,
+            "sampled_peak_query_rss_bytes": 132071424,
+            "index_rss_delta_bytes": 91455488,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 0.30752,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 0,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            }
+          }
+        ],
+        "diskann": [
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 26.94025,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 5.386292,
+            "p95_ms": 10.215,
+            "p99_ms": 15.512,
+            "qps": 175.788864377,
+            "search_only_qps": 175.867668762,
+            "timed_block_wall_ms": 17065.927416,
+            "baseline_rss_bytes": 40615936,
+            "steady_rss_bytes": 50675712,
+            "sampled_peak_query_rss_bytes": 50790400,
+            "index_rss_delta_bytes": 10059776,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 6.572119,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 630743040,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 0,
+              "bytes_per_second_limit": 0,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 0,
+              "achieved_iops": 9023.24240847,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 29.777417,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 7.2265,
+            "p95_ms": 19.087542,
+            "p99_ms": 37.624333,
+            "qps": 114.719073233,
+            "search_only_qps": 114.763796483,
+            "timed_block_wall_ms": 26150.838875,
+            "baseline_rss_bytes": 40599552,
+            "steady_rss_bytes": 50675712,
+            "sampled_peak_query_rss_bytes": 50675712,
+            "index_rss_delta_bytes": 10076160,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 8.665749,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 630743040,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 0,
+              "bytes_per_second_limit": 0,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 0,
+              "achieved_iops": 5888.53002904,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          },
+          {
+            "phase": "query",
+            "index": "diskann",
+            "vectors": 100000,
+            "dimension": 128,
+            "queries": 1000,
+            "repetitions": 3,
+            "budget": 32,
+            "fixed_budget": true,
+            "workload_warmup": true,
+            "index_open_ms": 17.259667,
+            "io_backend_type": 0,
+            "calibration_recall_at_10": null,
+            "recall_at_10": 0.9867,
+            "p50_ms": 5.711416,
+            "p95_ms": 11.902917,
+            "p99_ms": 20.370792,
+            "qps": 154.623014562,
+            "search_only_qps": 154.685006432,
+            "timed_block_wall_ms": 19402.027625,
+            "baseline_rss_bytes": 40615936,
+            "steady_rss_bytes": 50954240,
+            "sampled_peak_query_rss_bytes": 51200000,
+            "index_rss_delta_bytes": 10338304,
+            "io": {
+              "source": "unavailable in the public iOS SDK",
+              "open_read_bytes": null,
+              "warmup_read_bytes": null,
+              "timed_read_bytes": null,
+              "timed_cpu_seconds": 6.560359,
+              "timed_major_faults": 0,
+              "host_timed_read_bytes": 630743040,
+              "host_counter_source": "simulator-host proc_pid_rusage; not phone flash"
+            },
+            "native_pacing": {
+              "kind": "real-time-native-file-io",
+              "iops_limit": 0,
+              "bytes_per_second_limit": 0,
+              "max_in_flight": 8,
+              "reads": 153990,
+              "bytes": 630743040,
+              "batches": 23427,
+              "actual_wait_ns": 0,
+              "achieved_iops": 7936.79933749,
+              "resident_backing_bytes": 0,
+              "cache_policy": "Apple per-range eviction",
+              "timer": "Apple kqueue NOTE_CRITICAL monotonic timer"
+            }
+          }
+        ]
+      },
+      "medians": {
+        "hnsw": {
+          "steady_rss_bytes": 132104192,
+          "baseline_rss_bytes": 40599552,
+          "index_rss_delta_bytes": 91504640,
+          "sampled_peak_query_rss_bytes": 132104192,
+          "recall_at_10": 0.9728,
+          "p50_ms": 0.085708,
+          "p95_ms": 0.262792,
+          "p99_ms": 0.365334,
+          "qps": 8396.37219962
+        },
+        "diskann": {
+          "steady_rss_bytes": 50675712,
+          "baseline_rss_bytes": 40615936,
+          "index_rss_delta_bytes": 10076160,
+          "sampled_peak_query_rss_bytes": 50790400,
+          "recall_at_10": 0.9867,
+          "p50_ms": 5.711416,
+          "p95_ms": 11.902917,
+          "p99_ms": 20.370792,
+          "qps": 154.623014562,
+          "achieved_iops": 7936.79933749,
+          "cache_policy": "Apple per-range eviction",
+          "reads_per_query": 51.33
+        }
+      }
+    }
+  },
+  "probes": {
+    "2000": {
+      "raw": {
+        "phase": "probe",
+        "index": "diskann",
+        "cases": [
+          {
+            "state": "buffered-warm",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.094439042,
+            "seconds": 0.092677167,
+            "achieved_iops": 88392.861642,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 92677167,
+            "checksum": "15187674313215887028",
+            "cache_policy": "buffered-file-control",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 0
+          },
+          {
+            "state": "native-unlimited",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.365108417,
+            "seconds": 0.967747666,
+            "achieved_iops": 8465.01654079,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 967747666,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-target",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 4.195936625,
+            "seconds": 4.299573083,
+            "achieved_iops": 1905.30544355,
+            "iops_limit": 2000,
+            "actual_wait_ns": 2658603514,
+            "non_wait_wall_ns": 1640969569,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-half",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 8.23778775,
+            "seconds": 8.438658167,
+            "achieved_iops": 970.770451638,
+            "iops_limit": 1000,
+            "actual_wait_ns": 5405556368,
+            "non_wait_wall_ns": 3033101799,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          }
+        ],
+        "host_probe_io": {
+          "buffered-warm": {
+            "read_bytes": 0,
+            "pid": 17704,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "native-unlimited": {
+            "read_bytes": 33554432,
+            "pid": 17704,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "paced-target": {
+            "read_bytes": 33554432,
+            "pid": 17704,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "paced-half": {
+            "read_bytes": 33554432,
+            "pid": 17704,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          }
+        }
+      },
+      "verification": {
+        "requested_iops": 2000,
+        "cache_verified": true,
+        "ceiling_verified": true,
+        "tier_attainable": true,
+        "eligible": true,
+        "observed_iops": 1905.30544355,
+        "half_rate_iops": 970.770451638,
+        "cache_evidence": "OS storage-read accounting versus buffered warm control",
+        "reasons": []
+      }
+    },
+    "10000": {
+      "raw": {
+        "phase": "probe",
+        "index": "diskann",
+        "cases": [
+          {
+            "state": "buffered-warm",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.996773166,
+            "seconds": 0.08466525,
+            "achieved_iops": 96757.5244861,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 84665250,
+            "checksum": "15187674313215887028",
+            "cache_policy": "buffered-file-control",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 0
+          },
+          {
+            "state": "native-unlimited",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.136875625,
+            "seconds": 1.227295333,
+            "achieved_iops": 6674.84001587,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 1227295333,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-target",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.204964208,
+            "seconds": 1.175270417,
+            "achieved_iops": 6970.31073147,
+            "iops_limit": 10000,
+            "actual_wait_ns": 21604036,
+            "non_wait_wall_ns": 1153666381,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-half",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.810292417,
+            "seconds": 1.704875083,
+            "achieved_iops": 4805.04412416,
+            "iops_limit": 5000,
+            "actual_wait_ns": 633519874,
+            "non_wait_wall_ns": 1071355209,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          }
+        ],
+        "host_probe_io": {
+          "buffered-warm": {
+            "read_bytes": 0,
+            "pid": 19138,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "native-unlimited": {
+            "read_bytes": 33554432,
+            "pid": 19138,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "paced-target": {
+            "read_bytes": 33554432,
+            "pid": 19138,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "paced-half": {
+            "read_bytes": 33554432,
+            "pid": 19138,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          }
+        }
+      },
+      "verification": {
+        "requested_iops": 10000,
+        "cache_verified": true,
+        "ceiling_verified": true,
+        "tier_attainable": false,
+        "eligible": false,
+        "observed_iops": 6970.31073147,
+        "half_rate_iops": 4805.04412416,
+        "cache_evidence": "OS storage-read accounting versus buffered warm control",
+        "reasons": [
+          "Native path cannot sustain this IOPS tier within 10%"
+        ]
+      }
+    },
+    "20000": {
+      "raw": {
+        "phase": "probe",
+        "index": "diskann",
+        "cases": [
+          {
+            "state": "buffered-warm",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.802518709,
+            "seconds": 0.07652075,
+            "achieved_iops": 107055.929274,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 76520750,
+            "checksum": "15187674313215887028",
+            "cache_policy": "buffered-file-control",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 0
+          },
+          {
+            "state": "native-unlimited",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 0.835852375,
+            "seconds": 1.106219125,
+            "achieved_iops": 7405.40442202,
+            "iops_limit": 0,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 1106219125,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-target",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.03432325,
+            "seconds": 1.357794084,
+            "achieved_iops": 6033.31543165,
+            "iops_limit": 20000,
+            "actual_wait_ns": 0,
+            "non_wait_wall_ns": 1357794084,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          },
+          {
+            "state": "paced-half",
+            "operations": 8192,
+            "requested_bytes": 33554432,
+            "warmup_operations": 8192,
+            "warmup_seconds": 1.762481,
+            "seconds": 1.276944792,
+            "achieved_iops": 6415.31258933,
+            "iops_limit": 10000,
+            "actual_wait_ns": 22948076,
+            "non_wait_wall_ns": 1253996716,
+            "checksum": "15187674313215887028",
+            "cache_policy": "Apple per-range eviction",
+            "read_bytes": null,
+            "counter_source": "unavailable in the public iOS SDK",
+            "observed_read_bytes": 33554432
+          }
+        ],
+        "host_probe_io": {
+          "buffered-warm": {
+            "read_bytes": 0,
+            "pid": 19506,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "native-unlimited": {
+            "read_bytes": 33554432,
+            "pid": 19506,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "paced-target": {
+            "read_bytes": 33554432,
+            "pid": 19506,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          },
+          "paced-half": {
+            "read_bytes": 33554432,
+            "pid": 19506,
+            "source": "simulator-host proc_pid_rusage; not phone flash"
+          }
+        }
+      },
+      "verification": {
+        "requested_iops": 20000,
+        "cache_verified": true,
+        "ceiling_verified": false,
+        "tier_attainable": false,
+        "eligible": false,
+        "observed_iops": 6033.31543165,
+        "half_rate_iops": 6415.31258933,
+        "cache_evidence": "OS storage-read accounting versus buffered warm control",
+        "reasons": [
+          "Real-time IOPS ceiling or actual wait not verified",
+          "Native path cannot sustain this IOPS tier within 10%"
+        ]
+      }
+    }
+  },
+  "measurement": {
+    "api": "serial C++ core index search; not Python/full Collection",
+    "qps": "queries / actual complete timed-block wall time, including native I/O and pacing waits",
+    "p95": "median of trial P95 values for real search-call wall latency",
+    "memory": "steady query-process RSS; Windows working set; decimal MB; kernel file cache excluded",
+    "cache": "held-out workload warmed once; HNSW resident; DiskANN native cache policy verified separately",
+    "hardware": "GitHub runner CPU/RAM/storage differ; IOPS limits are verified ceilings, not a hardware match"
+  },
+  "publication_ready": true
+}

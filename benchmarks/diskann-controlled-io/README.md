@@ -1,5 +1,10 @@
 # Controlled DiskANN storage costs
 
+For measured native I/O, product RSS and real query wall time, use the
+[native pacing protocol](NATIVE_PACING.md) and the
+[eight-platform results from 2026-11-05](results/2026-11-05/publication-comparison.md).
+The experiment below is the earlier virtual cost model.
+
 This opt-in experiment removes real disk latency from graph/full-vector reads.
 It does **not** make different CPUs, memory systems or operating systems into
 identical physical hardware. Use a fixed physical machine with native multiboot

@@ -1,0 +1,120 @@
+{
+  "source_run": "https://github.com/iaojnh/zvec/actions/runs/41991413997",
+  "benchmark_commit": "43a2af9d16b10b258a45a03223136959c16f7466",
+  "selection_rule": "Earliest artifact per platform with complete qualified trials; never rank by QPS",
+  "selected_artifacts": {
+    "linux-x86_64": 13398783460,
+    "linux-arm64": 13398329784,
+    "android-x86_64-emulator": 13399415503,
+    "windows-arm64": 13398882315,
+    "windows-x86_64": 13399027749,
+    "macos-x86_64": 13399456566,
+    "ios-arm64-simulator": 13398964064,
+    "macos-arm64": 13400665548
+  },
+  "query_process_trials": 108,
+  "all_artifacts": [
+    {
+      "id": 13397824496,
+      "name": "paced-macos-arm64",
+      "created_at": "2026-11-05T08:13:46Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13397824496",
+      "selected": false,
+      "label": "macos-arm64",
+      "report_sha256": "36221878d5f50b2feedcfb8571b6a29f60cf4456466976ead149cd83509fd412",
+      "qualified": false,
+      "reason": "Common tier did not qualify or measurement incomplete"
+    },
+    {
+      "id": 13398783460,
+      "name": "paced-linux-x86_64",
+      "created_at": "2026-11-05T08:15:00Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13398783460",
+      "selected": true,
+      "label": "linux-x86_64",
+      "report_sha256": "de9fbab8145573261e059cdd9a2745e1e44558944bd1f294783c344896700182",
+      "qualified": true
+    },
+    {
+      "id": 13398329784,
+      "name": "paced-linux-arm64",
+      "created_at": "2026-11-05T08:15:15Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13398329784",
+      "selected": true,
+      "label": "linux-arm64",
+      "report_sha256": "58a6b6d66323164172ffcc88a4659f92fee1f8bd7a87a76860e49041254399a1",
+      "qualified": true
+    },
+    {
+      "id": 13399415503,
+      "name": "paced-android-emulator",
+      "created_at": "2026-11-05T08:15:59Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13399415503",
+      "selected": true,
+      "label": "android-x86_64-emulator",
+      "report_sha256": "cb6d804d33e98de2b895a2700ddbb48c74b3fb58652d4ebe36b1eb9e0cc8242c",
+      "qualified": true
+    },
+    {
+      "id": 13398882315,
+      "name": "paced-windows-arm64",
+      "created_at": "2026-11-05T08:16:42Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13398882315",
+      "selected": true,
+      "label": "windows-arm64",
+      "report_sha256": "3ba4aa9ca204528f5d87485e2e1730e639819703d59f468fc5f9c764ac4a5b2e",
+      "qualified": true
+    },
+    {
+      "id": 13399027749,
+      "name": "paced-windows-x86_64",
+      "created_at": "2026-11-05T08:17:29Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13399027749",
+      "selected": true,
+      "label": "windows-x86_64",
+      "report_sha256": "8d1aa974cc45578600e30bdbd8cd1d40814b1bb6584bf026bbe053d8bb1975bb",
+      "qualified": true
+    },
+    {
+      "id": 13399456566,
+      "name": "paced-macos-x86_64",
+      "created_at": "2026-11-05T08:21:39Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13399456566",
+      "selected": true,
+      "label": "macos-x86_64",
+      "report_sha256": "1abad98777427151e226b3bd5090f31741c3541ffd7fe1e01f34a0ced2ec9c4b",
+      "qualified": true
+    },
+    {
+      "id": 13398964064,
+      "name": "paced-ios-simulator",
+      "created_at": "2026-11-05T08:23:56Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13398964064",
+      "selected": true,
+      "label": "ios-arm64-simulator",
+      "report_sha256": "7400a1d5eb670534b4bde8b5e3ad35a6b13686f59ef2dc32e7c4e54f4831cee7",
+      "qualified": true
+    },
+    {
+      "id": 13400665548,
+      "name": "paced-macos-arm64",
+      "created_at": "2026-11-05T08:37:10Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13400665548",
+      "selected": true,
+      "label": "macos-arm64",
+      "report_sha256": "e58a2b9709fb222ec1e7e47649bb3d02969d9ccf0a076c8b5ecd746d774e8f8c",
+      "qualified": true
+    },
+    {
+      "id": 13400595746,
+      "name": "paced-ios-simulator",
+      "created_at": "2026-11-05T08:39:06Z",
+      "artifact_url": "https://github.com/iaojnh/zvec/actions/runs/41991413997/artifacts/13400595746",
+      "selected": false,
+      "label": "ios-arm64-simulator",
+      "report_sha256": "5f7d7bc7a352ee52f841d98d00cd4760079e3b2e4027ab773ad13a0bd0b7632f",
+      "qualified": false,
+      "reason": "Common tier did not qualify or measurement incomplete"
+    }
+  ]
+}

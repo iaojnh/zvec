@@ -1,0 +1,47 @@
+name: DiskANN Paced Results Audit
+
+on:
+  push:
+    branches: [codex/diskann-paced-results-audit]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Native pacing workflow run containing immutable result artifacts'
+        required: true
+        type: string
+      benchmark_commit:
+        description: 'Exact revision used by all eight benchmark environments'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s scripts/tests -p 'test_diskann*io.py'
+      - name: Verify every original trial and select first qualified platform results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run_id || '41991413997' }}
+          BENCHMARK_COMMIT: ${{ inputs.benchmark_commit || '43a2af9d16b10b258a45a03223136959c16f7466' }}
+        run: |
+          python scripts/collect_diskann_paced_results.py --source-run-id "$SOURCE_RUN" \
+            --expected-commit "$BENCHMARK_COMMIT" --output audited-results
+      - name: Publish audited tables
+        if: success()
+        run: cat audited-results/publication-comparison.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-paced-audited-results
+          path: audited-results/
+          retention-days: 30
