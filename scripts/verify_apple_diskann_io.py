@@ -78,7 +78,7 @@ def run_test(args, binary, name, probe=False):
 
 def evaluate(report):
     cases = {c['state']: c for c in report['cases']}
-    if len(cases) != 6 or not report['payload_validated']:
+    if len(cases) != 7 or not report['payload_validated']:
         raise ValueError('Incomplete Apple cache probe')
     cold = cases['production-cold']
     buffered = cases['buffered-cold']
@@ -121,11 +121,12 @@ def main():
     (args.output / 'cache-verification.json').write_text(json.dumps(report, indent=2) + '\n')
     lines = ['# Apple DiskANN cache verification', '',
              '64 MiB nonzero fixture; 4096 aligned 4 KiB reads per case; every byte checked. No system-wide purge.', '',
-             '| Case | Storage read MiB | Cached MiB before | Cached MiB after | Invalidation active | Fallback errno |',
-             '| --- | --- | --- | --- | --- | --- |']
+             '| Case | Storage read MiB | Cached MiB before | Cached MiB after | Requested pages cached MiB after | Production invalidation used | Fallback errno |',
+             '| --- | --- | --- | --- | --- | --- | --- |']
     for c in report['cases']:
         lines.append(f'| {c["state"]} | {c["read_bytes"]/1048576:.3f} | {c["resident_before"]/1048576:.3f} | '
-                     f'{c["resident_after"]/1048576:.3f} | {c["invalidation_requested"]} | {c["fallback_errno"]} |')
+                     f'{c["resident_after"]/1048576:.3f} | {c["requested_resident_after"]/1048576:.3f} | '
+                     f'{c["invalidation_requested"]} | {c["fallback_errno"]} |')
     lines += ['', 'Verified measured cache bypass: **' + str(report['verification']['cache_bypass_verified']) + '**', '',
               'iOS observations use the simulator app process disk counter on its macOS host. No physical-phone claim. Other buffered readers can race range invalidation; this is not an OS-level atomic direct-I/O guarantee.', '']
     (args.output / 'verification.md').write_text('\n'.join(lines))

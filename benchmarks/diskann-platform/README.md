@@ -102,6 +102,36 @@ filesystem support from encrypted userdata fallback. Preparing that directory
 uses root only inside the verified ephemeral CI emulator; no security policy
 is disabled and ordinary app files are not moved to an unencrypted location.
 
+## Apple cache avoidance and verification
+
+On macOS/iOS, the production reader keeps per-descriptor F_NOCACHE/F_RDAHEAD
+hints when it can capture an independent file description. To avoid hits on
+already cached graph/vector pages, it additionally invalidates the requested
+native-page-aligned range before and after pread. Temporary read-only mappings
+are bounded to 1 MiB, independent of index size. MS_SYNC | MS_INVALIDATE
+preserves dirty file data; MS_KILLPAGES and system-wide purging are not used by
+the production reader. Check mincore residency after each invalidation, with
+at most eight attempts and a 50-microsecond pause only while pages remain
+present; persistent residency produces an explicit EBUSY fallback. Captured-inode identity and caller descriptor flags
+remain intact when the path is replaced or a buffered duplicate is needed.
+
+Invalidation failure produces a one-time warning with errno and falls back to
+advisory/buffered reads. This software eviction strategy has a race window if
+another buffered reader repopulates the same file pages, so it is not an
+OS-level atomic O_DIRECT guarantee. Treat successful flags separately from
+measured bypass evidence and include the additional invalidation work in timings.
+
+The **DiskANN Apple Cache Verification** CI runs Intel macOS, Apple Silicon and
+the iOS ARM64 simulator. It checks payloads, cached/cold controls, mincore file
+residency, native disk-read counters, safety regressions and actual warmed
+HNSW/DiskANN queries. The iOS SDK uses no private disk-counter API: a phase
+handshake lets the macOS simulator host observe the same live app process via
+public libproc, including timed queries. These host-observed simulator numbers
+do not measure physical iPhone flash. Results retain each counter's scope.
+
+The probe resets only its own fixture ranges; the separate first-pass query
+controls can purge the ephemeral CI host cache, and record that condition.
+
 ## Outputs
 
 Each platform uploads build/query logs, raw JSON, and `result.json`.

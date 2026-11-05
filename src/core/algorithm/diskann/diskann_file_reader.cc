@@ -39,6 +39,7 @@
 #include <zvec/ailego/utility/file_helper.h>
 #endif
 #if defined(__APPLE__) || defined(__MACH__)
+#include <chrono>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <limits.h>
@@ -733,8 +734,8 @@ static bool configure_macos_reader(int file_desc, const std::string &fname) {
   if (::fcntl(file_desc, F_NOCACHE, 1) == -1) {
     requested = false;
     LOG_WARN(
-        "fcntl(F_NOCACHE) failed for %s (errno=%d: %s); reads will use "
-        "the page cache",
+        "fcntl(F_NOCACHE) failed for %s (errno=%d: %s); "
+        "requested-range cache invalidation will still be attempted",
         fname.c_str(), errno, ::strerror(errno));
   } else {
     LOG_INFO("DiskAnn macOS: F_NOCACHE enabled for %s", fname.c_str());
@@ -753,7 +754,7 @@ void LinuxAlignedFileReader::configure_apple_cache(const std::string &fname,
   // F_NOCACHE/F_RDAHEAD policy; bounded pre/post invalidation can still be used.
   apple_nocache_requested_ = independent && configure_macos_reader(file_desc, fname);
   const long page_size = ::sysconf(_SC_PAGESIZE);
-  if (page_size <= 0 || page_size > 1024 * 1024) {
+  if (page_size < 4096 || page_size > 1024 * 1024) {
     apple_cache_fallback_errno_.store(EINVAL, std::memory_order_relaxed);
     LOG_WARN("DiskAnn Apple: invalid page size; using advisory/buffered reads");
     return;
@@ -781,9 +782,30 @@ int LinuxAlignedFileReader::invalidate_apple_cache_range(
     void *mapping = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, file_desc,
                           static_cast<off_t>(offset));
     if (mapping == MAP_FAILED) return errno;
-    // Preserve dirty data: never use MS_KILLPAGES. No mapped bytes are touched.
-    const int sync_result = ::msync(mapping, length, MS_SYNC | MS_INVALIDATE);
-    const int sync_errno = sync_result == 0 ? 0 : errno;
+    // Success from msync alone is not evidence of eviction on all Apple
+    // kernels. Verify residency without faulting pages in, and retry briefly
+    // if in-flight file I/O leaves pages present. Keep memory and retry time
+    // bounded, including when another buffered reader keeps populating them.
+    std::array<char, kWindow / 4096> residency{};
+    int sync_errno = EBUSY;
+    constexpr size_t kAttempts = 8;
+    for (size_t attempt = 0; attempt < kAttempts; ++attempt) {
+      // Preserve dirty data: never use MS_KILLPAGES. No mapped bytes are touched.
+      if (::msync(mapping, length, MS_SYNC | MS_INVALIDATE) != 0 ||
+          ::mincore(mapping, length, residency.data()) != 0) {
+        sync_errno = errno;
+        break;
+      }
+      const size_t pages = length / page;
+      if (std::none_of(residency.begin(), residency.begin() + pages,
+                       [](char value) { return (value & 1) != 0; })) {
+        sync_errno = 0;
+        break;
+      }
+      if (attempt + 1 < kAttempts) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+    }
     const int unmap_result = ::munmap(mapping, length);
     if (sync_errno != 0) return sync_errno;
     if (unmap_result != 0) return errno;

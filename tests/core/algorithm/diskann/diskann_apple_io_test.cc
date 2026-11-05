@@ -147,7 +147,7 @@ TEST_F(AppleFile, ConcurrentReadsKeepTheirPayloads) {
   EXPECT_TRUE(correct.load());
 }
 
-uint64_t ResidentBytes(int fd, size_t size) {
+uint64_t ResidentBytes(int fd, size_t size, bool requested_only = false) {
   void *mapping = ::mmap(nullptr, size, PROT_NONE, MAP_SHARED, fd, 0);
   if (mapping == MAP_FAILED) throw std::runtime_error("mincore mapping failed");
   const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
@@ -155,8 +155,16 @@ uint64_t ResidentBytes(int fd, size_t size) {
   const int ret = ::mincore(mapping, size, pages.data());
   ::munmap(mapping, size);
   if (ret != 0) throw std::runtime_error("mincore failed");
+  std::vector<bool> requested(pages.size(), !requested_only);
+  if (requested_only) {
+    for (size_t i = 0; i < 4096; ++i) {
+      requested[((i * 1009) % (size / kBlock)) * kBlock / page] = true;
+    }
+  }
   uint64_t bytes = 0;
-  for (auto value : pages) if (value & 1) bytes += page;
+  for (size_t i = 0; i < pages.size(); ++i) {
+    if (requested[i] && (pages[i] & 1)) bytes += page;
+  }
   return bytes;
 }
 
@@ -185,17 +193,20 @@ TEST_F(AppleFile, VerifyRealCacheBehavior) {
     ASSERT_EQ(::pwrite(fd_, buffer_, kBlock, offset), static_cast<ssize_t>(kBlock));
   }
   ASSERT_EQ(::fsync(fd_), 0);
+  // This owned descriptor prepares controls only. Disable its asynchronous
+  // read-ahead so outstanding warmup I/O cannot repopulate the cold fixture.
+  ASSERT_EQ(::fcntl(fd_, F_RDAHEAD, 0), 0);
   ProbeReader control;
   ASSERT_EQ(control.open_from_handle(path_, fd_), 0);
   std::ostringstream cases;
   bool first = true;
   for (const char *label : {"buffered-warm", "hint-warm", "production-path-warm",
-                            "production-handle-warm", "production-cold", "buffered-cold"}) {
+                            "production-handle-warm", "production-cold", "production-repeat", "buffered-cold"}) {
     const std::string state(label);
     const bool production = state.find("production") == 0;
     const bool cold = state.find("cold") != std::string::npos;
     if (cold) ASSERT_EQ(control.Evict(kSize), 0);
-    else {
+    else if (state != "production-repeat") {
       for (size_t offset = 0; offset < kSize; offset += kBlock) {
         ASSERT_EQ(::pread(fd_, buffer_, kBlock, offset), static_cast<ssize_t>(kBlock));
       }
@@ -235,6 +246,7 @@ TEST_F(AppleFile, VerifyRealCacheBehavior) {
     DiskBytes(bytes_after);
     testing_util::AppleIOGate("ZVEC_APPLE_IO_CONTROL", state, "after");
     const auto resident_after = ResidentBytes(fd_, kSize);
+    const auto requested_resident_after = ResidentBytes(fd_, kSize, true);
     ASSERT_EQ(::close(raw), 0);
     if (!first) cases << ',';
     first = false;
@@ -242,8 +254,9 @@ TEST_F(AppleFile, VerifyRealCacheBehavior) {
           << ",\"requested_bytes\":" << kReads * kBlock
           << ",\"io_before\":" << bytes_before.str() << ",\"io_after\":" << bytes_after.str()
           << ",\"resident_before\":" << resident_before << ",\"resident_after\":" << resident_after
-          << ",\"invalidation_requested\":" << (reader.cache_invalidation_requested() ? "true" : "false")
-          << ",\"nocache_requested\":" << (reader.nocache_requested() ? "true" : "false")
+          << ",\"requested_resident_after\":" << requested_resident_after
+          << ",\"invalidation_requested\":" << (production && reader.cache_invalidation_requested() ? "true" : "false")
+          << ",\"nocache_requested\":" << ((production ? reader.nocache_requested() : state == "hint-warm") ? "true" : "false")
           << ",\"fallback_errno\":" << reader.cache_fallback_errno()
           << ",\"seconds\":" << seconds << '}';
   }
