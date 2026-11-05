@@ -444,6 +444,16 @@ TEST(DiskAnnPacedIOProbe, Measure) {
     }
     std::vector<char> allocation(size_t(target.depth) * 4096 + 4096);
     auto buffer = reinterpret_cast<char *>((reinterpret_cast<uintptr_t>(allocation.data()) + 4095) & ~uintptr_t(4095));
+    if (buffered) {
+      // Earlier native probes evict these ranges. Warm this control afresh,
+      // before either the host/OS byte counters or wall clock are sampled.
+      for (uint32_t n = 0; n < operations; ++n) {
+        const uint64_t offset = ((uint64_t(n) * 104729 + 17) % sectors) * 4096;
+        input.seekg(static_cast<std::streamoff>(offset));
+        input.read(buffer, 4096);
+        ASSERT_TRUE(input.good());
+      }
+    }
 #if defined(__APPLE__)
     testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", name, "before");
 #endif

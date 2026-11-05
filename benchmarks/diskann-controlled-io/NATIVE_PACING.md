@@ -7,7 +7,8 @@ The benchmark-only decorator admits native read batches through real-time IOPS
 and byte-rate token buckets, then submits them to the original reader. Native
 read completion, CPU work, pacing waits and timer overshoot all contribute to
 the measured wall time. Windows uses a high-resolution waitable timer when
-available; POSIX uses the monotonic clock and sleep_until. No virtual latency
+available; Apple uses a monotonic kqueue timer with NOTE_CRITICAL to minimize
+timer coalescing, and Linux/Android use monotonic sleep_until. No virtual latency
 is added to the measured QPS or P95.
 
 Credits persist across queries and are bounded to one concurrency-sized burst.
@@ -24,6 +25,8 @@ of 16 MiB/s or twice its 4 KiB request throughput. 2,000 IOPS is a conservative
 common CI tier, not a claim about typical modern-PC SSD performance. The higher
 tiers are measured only where the native path demonstrates sufficient capacity.
 Limiting cannot make a slow disk faster.
+The cap counts native 4 KiB file-read requests; device firmware or virtualization
+may combine or amplify physical operations, so it is not a device-IOPS guarantee.
 
 Each platform first runs 2,048 actual 4 KiB reads through a buffered warm
 control, the unlimited production reader, the target rate, and half that rate.

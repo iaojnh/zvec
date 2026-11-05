@@ -12,6 +12,11 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#if defined(__APPLE__)
+#include <cerrno>
+#include <sys/event.h>
+#include <unistd.h>
+#endif
 #include "algorithm/diskann/diskann_benchmark_hook.h"
 
 namespace zvec::core::benchmark {
@@ -43,11 +48,16 @@ class NativeRateLimiter {
     high_resolution_timer_ = timer_ != nullptr;
     if (!timer_) timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_MODIFY_STATE | SYNCHRONIZE);
     if (!timer_) throw std::runtime_error("Cannot create pacing timer");
+#elif defined(__APPLE__)
+    timer_queue_ = kqueue();
+    if (timer_queue_ < 0) throw std::runtime_error("Cannot create pacing timer queue");
 #endif
   }
   ~NativeRateLimiter() {
 #if defined(_WIN32)
     if (timer_) CloseHandle(timer_);
+#elif defined(__APPLE__)
+    if (timer_queue_ >= 0) ::close(timer_queue_);
 #endif
   }
   NativeRateLimiter(const NativeRateLimiter &) = delete;
@@ -57,6 +67,8 @@ class NativeRateLimiter {
   const char *timer_kind() const {
 #if defined(_WIN32)
     return high_resolution_timer_ ? "Windows high-resolution waitable timer" : "Windows waitable timer";
+#elif defined(__APPLE__)
+    return "Apple kqueue NOTE_CRITICAL monotonic timer";
 #else
     return "steady_clock sleep_until";
 #endif
@@ -105,6 +117,19 @@ class NativeRateLimiter {
       if (!SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE) ||
           WaitForSingleObject(timer_, INFINITE) != WAIT_OBJECT_0)
         throw std::runtime_error("Native pacing timer failed");
+#elif defined(__APPLE__)
+      // Ordinary sleep_until can coalesce millisecond waits by an entire timer
+      // quantum. Request minimal coalescing without spinning or changing QoS.
+      const auto remaining = deadline - Now();
+      if (remaining <= 0) break;
+      struct kevent change{}, event{};
+      EV_SET(&change, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+             NOTE_NSECONDS | NOTE_CRITICAL, remaining, nullptr);
+      int result = kevent(timer_queue_, &change, 1, &event, 1, nullptr);
+      while (result < 0 && errno == EINTR)
+        result = kevent(timer_queue_, nullptr, 0, &event, 1, nullptr);
+      if (result != 1 || (event.flags & EV_ERROR))
+        throw std::runtime_error("Native pacing timer failed");
 #else
       std::this_thread::sleep_until(PaceClock::time_point(
           std::chrono::duration_cast<PaceClock::duration>(std::chrono::nanoseconds(deadline))));
@@ -118,6 +143,8 @@ class NativeRateLimiter {
 #if defined(_WIN32)
   HANDLE timer_{nullptr};
   bool high_resolution_timer_{false};
+#elif defined(__APPLE__)
+  int timer_queue_{-1};
 #endif
 };
 

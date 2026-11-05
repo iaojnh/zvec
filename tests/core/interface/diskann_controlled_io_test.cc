@@ -66,6 +66,15 @@ TEST(DiskAnnNativePacing, EnforcesBandwidthIndependently) {
   EXPECT_THROW(NativeRateLimiter(PaceConfig{1, 1, 0}), std::invalid_argument);
   EXPECT_THROW(NativeRateLimiter(PaceConfig{1, 1, 129}), std::invalid_argument);
 }
+TEST(DiskAnnNativePacing, SustainsCommonRateWithoutTimerQuantumOversleep) {
+  NativeRateLimiter limiter(PaceConfig{2000, 16777216, 8});
+  const auto start = PaceClock::now();
+  for (int i = 0; i < 128; ++i) limiter.admit(8, 32768);
+  const double seconds = std::chrono::duration<double>(PaceClock::now() - start).count();
+  EXPECT_GE(1024 / seconds, 1800.0);
+  EXPECT_LE(1024 / seconds, 2100.0);
+  EXPECT_GT(limiter.stats().wait_ns, 0U);
+}
 class ImmediateNativeReader : public AlignedFileReader {
  public:
   size_t largest_batch{0};
