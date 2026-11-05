@@ -1,0 +1,86 @@
+name: DiskANN Windows I/O Diagnostics
+
+on:
+  push:
+    branches: [codex/test-diskann-platform-metrics]
+    paths:
+      - '.github/workflows/diskann-windows-io-diagnostics.yml'
+      - 'scripts/diagnose_windows_disk_io.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnose:
+    name: Storage (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x86_64
+            runner: windows-2025
+            msvc: x64
+          - label: windows-arm64
+            runner: windows-11-arm
+            msvc: arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-platform-dataset
+          run-id: 41956363918
+          github-token: ${{ github.token }}
+          path: benchmark-data
+      - name: Capture actual CI disks and volumes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force windows-io-diagnostics
+          Get-Disk | Select-Object Number,FriendlyName,BusType,Size,LogicalSectorSize,PhysicalSectorSize | ConvertTo-Json | Out-File windows-io-diagnostics/disks.json
+          Get-PhysicalDisk | Select-Object FriendlyName,MediaType,BusType,Size | ConvertTo-Json | Out-File windows-io-diagnostics/physical-disks.json
+          Get-Partition | Select-Object DiskNumber,PartitionNumber,DriveLetter,Size | ConvertTo-Json | Out-File windows-io-diagnostics/partitions.json
+          Get-Volume | Select-Object DriveLetter,FileSystemLabel,FileSystem,Size,SizeRemaining | ConvertTo-Json | Out-File windows-io-diagnostics/volumes.json
+      - name: Probe buffered versus unbuffered and IOCP reads
+        run: python scripts/diagnose_windows_disk_io.py --file benchmark-data/base.fbin --output windows-io-diagnostics/dataset-probe.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-windows-storage-initial-${{ matrix.label }}
+          path: windows-io-diagnostics/
+          retention-days: 30
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.msvc }}
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build native benchmark
+        shell: bash
+        run: |
+          cmake -S . -B build-diagnostics -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_WERROR=ON
+          cmake --build build-diagnostics --target diskann_platform_benchmark_test --parallel 3
+      - name: Re-run native HNSW and DiskANN on this same CI host
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+        shell: bash
+        run: |
+          python scripts/benchmark_diskann_platform.py \
+            --binary build-diagnostics/bin/diskann_platform_benchmark_test.exe \
+            --data benchmark-data --output windows-io-diagnostics/baseline --label "$BENCH_LABEL"
+      - name: Probe the actual trained DiskANN index
+        run: python scripts/diagnose_windows_disk_io.py --file benchmark-data/diskann.index --output windows-io-diagnostics/index-probe.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-windows-storage-complete-${{ matrix.label }}
+          path: windows-io-diagnostics/
+          retention-days: 30
