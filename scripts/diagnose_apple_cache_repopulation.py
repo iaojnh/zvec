@@ -20,6 +20,46 @@ import threading
 import time
 
 
+def stop_owned_trace(process, pid_file):
+    """Signal fs_usage itself; sudo may interpose a separate monitor process."""
+    if process.poll() is not None:
+        return
+    child = int(pid_file.read_text().strip())
+    if child <= 1:
+        raise RuntimeError('Invalid owned tracer PID')
+    ancestor = child
+    for _ in range(8):
+        if ancestor == process.pid:
+            break
+        parent = subprocess.run(['ps', '-p', str(ancestor), '-o', 'ppid='],
+                                text=True, capture_output=True, check=False).stdout.strip()
+        if not parent:
+            process.wait(timeout=10)
+            return
+        ancestor = int(parent)
+    else:
+        raise RuntimeError('Refusing to signal a tracer outside the owned subprocess tree')
+    name = subprocess.run(['ps', '-p', str(child), '-o', 'comm='],
+                          text=True, capture_output=True, check=False).stdout.strip()
+    if name and Path(name).name != 'fs_usage':
+        raise RuntimeError('Owned tracer PID is not fs_usage')
+    for signal_name in ('-INT', '-TERM', '-KILL'):
+        if process.poll() is not None:
+            return
+        subprocess.run(['sudo', '-n', '/bin/kill', signal_name, str(child)],
+                       capture_output=True, check=False)
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    # The known child is gone; do not leave sudo's own monitor waiting forever.
+    if process.poll() is None:
+        subprocess.run(['sudo', '-n', '/bin/kill', '-KILL', str(process.pid)],
+                       capture_output=True, check=False)
+        process.wait(timeout=5)
+
+
 class Probe:
     size = 64 * 1048576
     reads = 4096
@@ -199,7 +239,14 @@ def main():
     if args.trace:
         if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted':
             raise RuntimeError('Privileged tracing is restricted to ephemeral GitHub-hosted CI')
-        trace = subprocess.Popen(['sudo', '-n', '/usr/bin/fs_usage', '-w', '-f', 'filesys',
+        descriptor, pid_path = tempfile.mkstemp(prefix='fs-usage-', suffix='.pid', dir=args.output.resolve())
+        os.close(descriptor)
+        pid_file = Path(pid_path)
+        # Positional arguments keep the owned PID-file path out of shell code.
+        trace = subprocess.Popen(['sudo', '-n', '/bin/sh', '-c',
+                                  'printf "%s\\n" "$$" > "$1"; shift; exec "$@"',
+                                  'zvec-owned-trace', str(pid_file),
+                                  '/usr/bin/fs_usage', '-w', '-f', 'filesys',
                                   '-f', 'diskio', '-f', 'cachehit', '-t', '180'],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  errors='replace')
@@ -236,7 +283,12 @@ def main():
                            '--gtest_output=json:' + str(args.output.resolve() / 'production-gtest.json')]
                 with (args.output / 'production-baseline.log').open('w') as log:
                     process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
-                    code = process.wait(timeout=180)
+                    try:
+                        code = process.wait(timeout=180)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=5)
                 report['production_baseline'] = {'pid': process.pid, 'directory': directory,
                                                   'returncode': code, 'purpose': 'visible-file attribution, not acceptance'}
                 if result_path.exists():
@@ -273,17 +325,22 @@ def main():
                         if any(sample['resident_bytes'] for sample in case['samples']):
                             raise RuntimeError('Isolated cache-attribution variant unexpectedly repopulated pages')
     finally:
-        if trace is not None:
-            if trace.poll() is None:
-                subprocess.run(['sudo', '-n', '/bin/kill', '-INT', str(trace.pid)], check=False)
-            trace.wait(timeout=190)
-            reader.join(timeout=5)
-            report['trace_exit'] = trace.returncode
-            report['trace_header'] = retained
-            report['trace_reads'] = [{'process_thread': key[0], 'fixture': key[1], 'bytes': size}
-                                     for key, size in sorted(trace_reads.items())]
-            report['trace_coverage_warnings'] = trace_warnings
-        (args.output / 'attribution.json').write_text(json.dumps(report, indent=2) + '\n')
+        try:
+            if trace is not None:
+                stop_owned_trace(trace, pid_file)
+                reader.join(timeout=5)
+                if reader.is_alive():
+                    raise RuntimeError('Tracer output reader did not finish')
+                report['trace_exit'] = trace.returncode
+                report['trace_header'] = retained
+                report['trace_reads'] = [{'process_thread': key[0], 'fixture': key[1], 'bytes': size}
+                                         for key, size in sorted(trace_reads.items())]
+                report['trace_coverage_warnings'] = trace_warnings
+        except Exception as error:
+            report['trace_cleanup_error'] = repr(error)
+            raise
+        finally:
+            (args.output / 'attribution.json').write_text(json.dumps(report, indent=2) + '\n')
 
 
 if __name__ == '__main__':

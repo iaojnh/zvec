@@ -10,13 +10,17 @@ on:
         description: Run only the Intel cache attribution probe without rebuilding Zvec
         type: boolean
         default: false
+      intel_only:
+        description: Rerun Intel attribution and production acceptance only
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: diskann-apple-cache-${{ github.ref }}-${{ inputs.diagnostics_only || false }}
+  group: diskann-apple-cache-${{ github.ref }}-${{ inputs.diagnostics_only || false }}-${{ inputs.intel_only || false }}
   cancel-in-progress: true
 
 jobs:
@@ -47,11 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - label: macos-arm64
-            runner: macos-15
-          - label: macos-intel
-            runner: macos-15-intel
+        include: ${{ fromJSON(inputs.intel_only && '[{"label":"macos-intel","runner":"macos-15-intel"}]' || '[{"label":"macos-arm64","runner":"macos-15"},{"label":"macos-intel","runner":"macos-15-intel"}]') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -105,7 +105,7 @@ jobs:
           retention-days: 30
 
   ios:
-    if: ${{ !inputs.diagnostics_only }}
+    if: ${{ !inputs.diagnostics_only && !inputs.intel_only }}
     name: Apple cache (iOS ARM64 simulator)
     runs-on: macos-26
     timeout-minutes: 75
