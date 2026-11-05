@@ -110,7 +110,9 @@ already cached graph/vector pages, it additionally invalidates the requested
 native-page-aligned range before and after pread. Temporary read-only mappings
 are bounded to 1 MiB, independent of index size. MS_SYNC | MS_INVALIDATE
 preserves dirty file data; MS_KILLPAGES and system-wide purging are not used by
-the production reader. Captured-inode identity and caller descriptor flags
+the production reader. Check mincore residency after each invalidation, with
+at most eight attempts and a 50-microsecond pause only while pages remain
+present; persistent residency produces an explicit EBUSY fallback. Captured-inode identity and caller descriptor flags
 remain intact when the path is replaced or a buffered duplicate is needed.
 
 Invalidation failure produces a one-time warning with errno and falls back to

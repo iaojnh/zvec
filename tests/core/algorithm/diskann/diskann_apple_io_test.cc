@@ -193,6 +193,9 @@ TEST_F(AppleFile, VerifyRealCacheBehavior) {
     ASSERT_EQ(::pwrite(fd_, buffer_, kBlock, offset), static_cast<ssize_t>(kBlock));
   }
   ASSERT_EQ(::fsync(fd_), 0);
+  // This owned descriptor prepares controls only. Disable its asynchronous
+  // read-ahead so outstanding warmup I/O cannot repopulate the cold fixture.
+  ASSERT_EQ(::fcntl(fd_, F_RDAHEAD, 0), 0);
   ProbeReader control;
   ASSERT_EQ(control.open_from_handle(path_, fd_), 0);
   std::ostringstream cases;
@@ -253,7 +256,7 @@ TEST_F(AppleFile, VerifyRealCacheBehavior) {
           << ",\"resident_before\":" << resident_before << ",\"resident_after\":" << resident_after
           << ",\"requested_resident_after\":" << requested_resident_after
           << ",\"invalidation_requested\":" << (production && reader.cache_invalidation_requested() ? "true" : "false")
-          << ",\"nocache_requested\":" << (reader.nocache_requested() ? "true" : "false")
+          << ",\"nocache_requested\":" << ((production ? reader.nocache_requested() : state == "hint-warm") ? "true" : "false")
           << ",\"fallback_errno\":" << reader.cache_fallback_errno()
           << ",\"seconds\":" << seconds << '}';
   }
