@@ -5,6 +5,11 @@ on:
     branches: [codex/test-diskann-platform-metrics]
     paths: ['.github/workflows/apple-diskann-cache.yml']
   workflow_dispatch:
+    inputs:
+      diagnostics_only:
+        description: Run only the Intel cache attribution probe without rebuilding Zvec
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,7 +20,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  attribution:
+    if: ${{ inputs.diagnostics_only }}
+    name: Intel cache repopulation attribution
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Trace file readers and controlled cache repopulation
+        run: python scripts/diagnose_apple_cache_repopulation.py --output attribution-results --trace
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: intel-cache-attribution
+          path: attribution-results/
+          retention-days: 30
+
   macos:
+    if: ${{ !inputs.diagnostics_only }}
     name: Apple cache (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
@@ -69,6 +94,7 @@ jobs:
           retention-days: 30
 
   ios:
+    if: ${{ !inputs.diagnostics_only }}
     name: Apple cache (iOS ARM64 simulator)
     runs-on: macos-26
     timeout-minutes: 75
