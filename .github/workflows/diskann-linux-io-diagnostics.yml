@@ -1,0 +1,98 @@
+name: DiskANN Linux I/O Diagnostics
+
+on:
+  push:
+    branches: [codex/test-diskann-platform-metrics]
+    paths:
+      - '.github/workflows/diskann-linux-io-diagnostics.yml'
+      - 'scripts/diagnose_diskann_linux_io.py'
+      - 'tests/core/interface/diskann_linux_io_diagnostic_test.cc'
+      - 'src/ailego/io/**'
+      - 'src/core/algorithm/diskann/diskann_file_reader*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diskann-linux-io-diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    name: Diagnose (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+          - label: linux-x86_64
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build exact benchmark with Linux I/O diagnostics
+        run: |
+          cmake -S . -B build-diagnostics -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_WERROR=ON
+          cmake --build build-diagnostics --target diskann_linux_io_diagnostic_test --parallel 3
+      - name: Download original dataset (same SHA-256 manifest)
+        uses: actions/download-artifact@v8
+        with:
+          name: diskann-platform-dataset
+          run-id: 41956363918
+          github-token: ${{ github.token }}
+          path: benchmark-data
+      - name: Initial environment and baseline before installing libaio
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+        run: |
+          python scripts/diagnose_diskann_linux_io.py --stage initial \
+            --binary build-diagnostics/bin/diskann_linux_io_diagnostic_test \
+            --data benchmark-data --output io-diagnostics --label "$BENCH_LABEL"
+      - name: Install diagnostic tools and libaio fallback
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fio strace libaio1t64
+      - name: Compare io_uring and libaio, random I/O, and syscall trace
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+        run: |
+          python scripts/diagnose_diskann_linux_io.py --stage async \
+            --binary build-diagnostics/bin/diskann_linux_io_diagnostic_test \
+            --data benchmark-data --output io-diagnostics --label "$BENCH_LABEL"
+      - name: Remove libaio to exercise real synchronous fallback
+        run: sudo apt-get remove -y libaio1t64
+      - name: Compare pread on CI disk versus RAM-backed tmpfs
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+        run: |
+          python scripts/diagnose_diskann_linux_io.py --stage pread \
+            --binary build-diagnostics/bin/diskann_linux_io_diagnostic_test \
+            --data benchmark-data --output io-diagnostics --label "$BENCH_LABEL"
+      - name: Summarize diagnostics
+        if: always()
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+        run: |
+          python scripts/diagnose_diskann_linux_io.py --stage summary \
+            --binary build-diagnostics/bin/diskann_linux_io_diagnostic_test \
+            --data benchmark-data --output io-diagnostics --label "$BENCH_LABEL"
+          cat io-diagnostics/diagnosis.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-io-diagnostics-${{ matrix.label }}
+          path: io-diagnostics/
+          retention-days: 30
