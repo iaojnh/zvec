@@ -28,7 +28,8 @@ def evaluate_probe(probe, label, rate):
     cache_valid = True
     reasons = []
     for name, case in cases.items():
-        if case["operations"] != 2048 or case["requested_bytes"] != 2048 * 4096:
+        if (case["operations"] != 8192 or case["requested_bytes"] != 8192 * 4096 or
+                case.get("warmup_operations") != 8192):
             raise ValueError("Probe I/O volume changed")
         physical = observed_probe(case, probe)
         case["observed_read_bytes"] = physical
@@ -149,6 +150,7 @@ def main():
         "schema_version": 1, "kind": "paced-native-file-io", "label": args.label,
         "host": native.metadata(), "data_path": remote, "fixture": fixture,
         "common_iops": args.common_iops, "queue_depth": args.queue_depth,
+        "probe_operations": 8192, "probe_warmup_operations": 8192,
         "trials": args.trials, "repetitions": args.repetitions,
         "requested_profiles": rates, "profiles": {}, "probes": {},
         "measurement": {

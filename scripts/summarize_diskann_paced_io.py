@@ -18,6 +18,10 @@ def build_report(root):
         if (report["kind"] != "paced-native-file-io" or report["fixture"] != first["fixture"] or
                 report["common_iops"] != first["common_iops"] or report["queue_depth"] != first["queue_depth"] or
                 report["requested_profiles"] != first["requested_profiles"] or
+                report.get("probe_operations") != first.get("probe_operations") or
+                report.get("probe_warmup_operations") != first.get("probe_warmup_operations") or
+                report["host"]["commit"] != first["host"]["commit"] or
+                report["host"]["run_url"] != first["host"]["run_url"] or
                 report["trials"] != first["trials"] or report["repetitions"] != first["repetitions"]):
             raise ValueError("Cannot combine different fixtures or pacing conditions")
     dataset = first["fixture"]["dataset"]
@@ -31,6 +35,10 @@ def build_report(root):
         "RSS 为查询进程内存，Windows 为工作集，单位 MB（十进制）；不包含未映射的系统文件缓存。"
         "CPU、内存和存储仍为各 CI runner 实际配置；受控 IOPS 是已验证的速率上限。"
         "移动端均为模拟器，结果不代表手机真机。", "",
+        f"来源：{first['host']['run_url']}；提交 `{first['host']['commit']}`。"
+        f"每个探针档位先预热 {first.get('probe_warmup_operations', 0):,} 次，再计时读取 "
+        f"{first.get('probe_operations', 2048):,} 次（每次 4 KiB）。IOPS 限制针对原生文件读请求，"
+        "物理设备操作可能被固件或虚拟化层合并或放大。", "",
         "下表所有数值按 **HNSW → DiskANN** 排列。", "",
     ]
     def table(rate, simulator):

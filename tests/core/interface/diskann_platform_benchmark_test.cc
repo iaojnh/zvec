@@ -418,7 +418,7 @@ TEST(DiskAnnPacedIOProbe, Measure) {
   target.iops = std::stoull(Env("ZVEC_BENCH_IOPS", "2000"));
   target.bytes_per_second = std::stoull(Env("ZVEC_BENCH_PACE_BPS", "16777216"));
   target.depth = static_cast<uint32_t>(std::stoul(Env("ZVEC_BENCH_PACE_DEPTH", "8")));
-  const uint32_t operations = 2048;
+  const uint32_t operations = 8192;
   std::ostringstream record;
   record << std::setprecision(12) << "{\"phase\":\"probe\",\"index\":\"diskann\",\"cases\":[";
   for (int case_index = 0; case_index < 4; ++case_index) {
@@ -444,41 +444,43 @@ TEST(DiskAnnPacedIOProbe, Measure) {
     }
     std::vector<char> allocation(size_t(target.depth) * 4096 + 4096);
     auto buffer = reinterpret_cast<char *>((reinterpret_cast<uintptr_t>(allocation.data()) + 4095) & ~uintptr_t(4095));
-    if (buffered) {
-      // Earlier native probes evict these ranges. Warm this control afresh,
-      // before either the host/OS byte counters or wall clock are sampled.
-      for (uint32_t n = 0; n < operations; ++n) {
-        const uint64_t offset = ((uint64_t(n) * 104729 + 17) % sectors) * 4096;
-        input.seekg(static_cast<std::streamoff>(offset));
-        input.read(buffer, 4096);
-        ASSERT_TRUE(input.good());
+    auto read_workload = [&](bool check_payload, uint64_t &checksum) {
+      for (uint32_t first = 0; first < operations; first += target.depth) {
+        const uint32_t count = std::min(target.depth, operations - first);
+        std::vector<AlignedRead> requests;
+        for (uint32_t n = 0; n < count; ++n) {
+          const uint64_t offset = ((uint64_t(first + n) * 104729 + 17) % sectors) * 4096;
+          requests.emplace_back(offset, 4096, buffer + size_t(n) * 4096);
+          if (buffered) {
+            input.seekg(static_cast<std::streamoff>(offset));
+            input.read(buffer + size_t(n) * 4096, 4096);
+            ASSERT_TRUE(input.good());
+          }
+        }
+        if (reader) ASSERT_EQ(0, reader->read(requests, ctx));
+        if (check_payload) {
+          for (size_t n = 0; n < size_t(count) * 4096; ++n) {
+            checksum ^= static_cast<unsigned char>(buffer[n]);
+            checksum *= 1099511628211ULL;
+          }
+        }
       }
-    }
+    };
+    // Match the query protocol: warm each native path at its actual rate,
+    // retaining credits across warmup and timing. Rewarm buffered ranges too.
+    uint64_t checksum = 1469598103934665603ULL;
+    const auto warmup_start = Clock::now();
+    ASSERT_NO_FATAL_FAILURE(read_workload(false, checksum));
+    const double warmup_seconds = Milliseconds(warmup_start) / 1000;
 #if defined(__APPLE__)
     testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", name, "before");
 #endif
     const auto before = BenchmarkSnapshot();
+    const auto wait_before = rate.stats().wait_ns;
     const auto start = Clock::now();
-    uint64_t checksum = 1469598103934665603ULL;
-    for (uint32_t first = 0; first < operations; first += target.depth) {
-      const uint32_t count = std::min(target.depth, operations - first);
-      std::vector<AlignedRead> requests;
-      for (uint32_t n = 0; n < count; ++n) {
-        const uint64_t offset = ((uint64_t(first + n) * 104729 + 17) % sectors) * 4096;
-        requests.emplace_back(offset, 4096, buffer + size_t(n) * 4096);
-        if (buffered) {
-          input.seekg(static_cast<std::streamoff>(offset));
-          input.read(buffer + size_t(n) * 4096, 4096);
-          ASSERT_TRUE(input.good());
-        }
-      }
-      if (reader) ASSERT_EQ(0, reader->read(requests, ctx));
-      for (size_t n = 0; n < size_t(count) * 4096; ++n) {
-        checksum ^= static_cast<unsigned char>(buffer[n]);
-        checksum *= 1099511628211ULL;
-      }
-    }
+    ASSERT_NO_FATAL_FAILURE(read_workload(true, checksum));
     const double seconds = Milliseconds(start) / 1000;
+    const auto wait_ns = rate.stats().wait_ns - wait_before;
     const auto after = BenchmarkSnapshot();
 #if defined(__APPLE__)
     testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", name, "after");
@@ -486,8 +488,10 @@ TEST(DiskAnnPacedIOProbe, Measure) {
     if (case_index) record << ',';
     record << "{\"state\":\"" << name << "\",\"operations\":" << operations
            << ",\"requested_bytes\":" << uint64_t(operations) * 4096
+           << ",\"warmup_operations\":" << operations << ",\"warmup_seconds\":" << warmup_seconds
            << ",\"seconds\":" << seconds << ",\"achieved_iops\":" << operations / seconds
-           << ",\"iops_limit\":" << config.iops << ",\"actual_wait_ns\":" << rate.stats().wait_ns
+           << ",\"iops_limit\":" << config.iops << ",\"actual_wait_ns\":" << wait_ns
+           << ",\"non_wait_wall_ns\":" << std::max<double>(0, seconds * 1e9 - wait_ns)
            << ",\"checksum\":\"" << checksum << "\",\"cache_policy\":\""
            << (reader ? reader->cache_policy() : "buffered-file-control") << "\",\"read_bytes\":";
     BenchmarkBytes(record, before, after);

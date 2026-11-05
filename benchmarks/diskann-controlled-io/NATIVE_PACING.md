@@ -28,8 +28,11 @@ Limiting cannot make a slow disk faster.
 The cap counts native 4 KiB file-read requests; device firmware or virtualization
 may combine or amplify physical operations, so it is not a device-IOPS guarantee.
 
-Each platform first runs 2,048 actual 4 KiB reads through a buffered warm
+Each platform first runs 8,192 actual 4 KiB reads through a buffered warm
 control, the unlimited production reader, the target rate, and half that rate.
+Each case gets a full untimed native/control warmup at its own configured rate,
+matching the warmed-query protocol. Warmup time is recorded separately; the
+longer measured window reduces sensitivity to initial storage-path transients.
 Payload checksums must match. Timed wall throughput must be at most 105% and at
 least 90% of the configured probe rate; target/half-rate scaling must be 1.7–2.3.
 The target must record real waiting. Unsupported higher tiers stay explicitly

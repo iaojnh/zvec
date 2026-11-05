@@ -12,12 +12,13 @@ def valid_probe():
     cases = []
     for state, actual, limit, observed in [
         ("buffered-warm", 100000, 0, 0),
-        ("native-unlimited", 10000, 0, 8388608),
-        ("paced-target", 1995, 2000, 8388608),
-        ("paced-half", 998, 1000, 8388608),
+        ("native-unlimited", 10000, 0, 33554432),
+        ("paced-target", 1995, 2000, 33554432),
+        ("paced-half", 998, 1000, 33554432),
     ]:
-        cases.append({"state": state, "operations": 2048, "requested_bytes": 8388608,
-                      "seconds": 2048 / actual, "achieved_iops": actual, "iops_limit": limit,
+        cases.append({"state": state, "operations": 8192, "requested_bytes": 33554432,
+                      "warmup_operations": 8192,
+                      "seconds": 8192 / actual, "achieved_iops": actual, "iops_limit": limit,
                       "actual_wait_ns": 500000000 if limit else 0, "checksum": "1234567",
                       "cache_policy": "Linux native reader", "read_bytes": observed})
     return {"cases": cases}
@@ -39,6 +40,10 @@ class NativePacingGuards(unittest.TestCase):
         self.assertFalse(evaluate_probe(report, "linux-x86_64", 2000)["tier_attainable"])
         with self.assertRaisesRegex(ValueError, "requested IOPS"):
             evaluate_probe(valid_probe(), "linux-x86_64", 10000)
+        report = valid_probe()
+        del report["cases"][2]["warmup_operations"]
+        with self.assertRaisesRegex(ValueError, "volume changed"):
+            evaluate_probe(report, "linux-x86_64", 2000)
 
     def test_cached_native_reads_and_changed_payload_are_rejected(self):
         report = valid_probe()
