@@ -82,6 +82,10 @@ def main():
             rng = random.Random(20261105)
             latencies = []
             checksum = 0
+            pending_reads = 0
+            inline_reads = 0
+            submit_ns = 0
+            completion_wait_ns = 0
             try:
                 for _ in range(1024):
                     offsets = [rng.randrange(blocks) * 4096 for _ in range(depth)]
@@ -96,6 +100,10 @@ def main():
                                                  ctypes.byref(operations[i]))
                             if not success and ctypes.get_last_error() != 997:
                                 raise ctypes.WinError(ctypes.get_last_error())
+                            if success:
+                                inline_reads += 1
+                            else:
+                                pending_reads += 1
                         else:
                             if not k.SetFilePointerEx(handle, offset, None, 0):
                                 raise ctypes.WinError(ctypes.get_last_error())
@@ -103,6 +111,8 @@ def main():
                                 raise ctypes.WinError(ctypes.get_last_error())
                             if byte_count.value != 4096:
                                 raise RuntimeError("Short synchronous read")
+                    submitted_at = time.perf_counter_ns()
+                    submit_ns += submitted_at - start
                     if async_io:
                         pending = {ctypes.addressof(op) for op in operations}
                         for _ in range(depth):
@@ -116,8 +126,10 @@ def main():
                             if address not in pending or byte_count.value != 4096:
                                 raise RuntimeError("Invalid IOCP completion")
                             pending.remove(address)
-                    latencies.append((time.perf_counter_ns() - start) / 1e6)
-                    checksum += ctypes.c_ubyte.from_address(buffer).value
+                    completed_at = time.perf_counter_ns()
+                    completion_wait_ns += completed_at - submitted_at
+                    latencies.append((completed_at - start) / 1e6)
+                    checksum += ctypes.c_uint32.from_address(buffer).value
             finally:
                 k.CloseHandle(handle)
                 if port:
@@ -128,6 +140,8 @@ def main():
                       "p95_ms": percentile(latencies, 0.95),
                       "p99_ms": percentile(latencies, 0.99),
                       "iops": depth * len(latencies) * 1000 / sum(latencies),
+                      "iocp_pending_reads": pending_reads, "iocp_inline_reads": inline_reads,
+                      "submit_ms": submit_ns / 1e6, "completion_wait_ms": completion_wait_ns / 1e6,
                       "checksum": checksum}
             results.append(result)
             print(json.dumps(result), flush=True)

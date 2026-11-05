@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/diskann-windows-io-diagnostics.yml'
       - 'scripts/diagnose_windows_disk_io.py'
+      - 'scripts/replay_diskann_storage.py'
   workflow_dispatch:
 
 permissions:
@@ -21,9 +22,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: windows-x86_64
-            runner: windows-2025
-            msvc: x64
+          # x86_64 control completed in run 41959880409. Focus the storage
+          # correction on ARM64, where an unused local NVMe disk is present.
           - label: windows-arm64
             runner: windows-11-arm
             msvc: arm64
@@ -44,12 +44,46 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force windows-io-diagnostics
-          Get-Disk | Select-Object Number,FriendlyName,BusType,Size,LogicalSectorSize,PhysicalSectorSize | ConvertTo-Json | Out-File windows-io-diagnostics/disks.json
+          Get-Disk | Select-Object Number,FriendlyName,BusType,Size,LogicalSectorSize,PhysicalSectorSize,PartitionStyle,NumberOfPartitions,IsSystem,IsBoot,IsOffline,IsReadOnly | ConvertTo-Json | Out-File windows-io-diagnostics/disks.json
           Get-PhysicalDisk | Select-Object FriendlyName,MediaType,BusType,Size | ConvertTo-Json | Out-File windows-io-diagnostics/physical-disks.json
           Get-Partition | Select-Object DiskNumber,PartitionNumber,DriveLetter,Size | ConvertTo-Json | Out-File windows-io-diagnostics/partitions.json
           Get-Volume | Select-Object DriveLetter,FileSystemLabel,FileSystem,Size,SizeRemaining | ConvertTo-Json | Out-File windows-io-diagnostics/volumes.json
       - name: Probe buffered versus unbuffered and IOCP reads
         run: python scripts/diagnose_windows_disk_io.py --file benchmark-data/base.fbin --output windows-io-diagnostics/dataset-probe.json
+      - name: Prepare only a verified blank GitHub-hosted local NVMe scratch disk
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'Scratch initialization is restricted to ephemeral GitHub-hosted VMs.'
+          }
+          $candidates = @(Get-Disk | Where-Object {
+            $_.FriendlyName -eq 'Microsoft NVMe Direct Disk v2' -and
+            $_.BusType -eq 'NVMe' -and $_.PartitionStyle -eq 'RAW' -and
+            $_.NumberOfPartitions -eq 0 -and -not $_.IsSystem -and -not $_.IsBoot
+          })
+          if ($candidates.Count -ne 1) {
+            Write-Host 'No unique verified blank local NVMe disk; keeping the original volume.'
+            exit 0
+          }
+          $scratchDisk = $candidates[0]
+          if (@(Get-Partition -DiskNumber $scratchDisk.Number -ErrorAction SilentlyContinue).Count -ne 0) {
+            throw 'Scratch candidate has partitions; refusing to initialize it.'
+          }
+          $scratchDisk | ConvertTo-Json -Depth 3 | Out-File windows-io-diagnostics/scratch-disk-before.json
+          if ($scratchDisk.IsOffline) { Set-Disk -Number $scratchDisk.Number -IsOffline $false }
+          if ($scratchDisk.IsReadOnly) { Set-Disk -Number $scratchDisk.Number -IsReadOnly $false }
+          Initialize-Disk -Number $scratchDisk.Number -PartitionStyle GPT
+          $partition = New-Partition -DiskNumber $scratchDisk.Number -UseMaximumSize -AssignDriveLetter
+          $partition | Format-Volume -FileSystem NTFS -NewFileSystemLabel ZvecCIScratch -Confirm:$false
+          $scratchRoot = "$($partition.DriveLetter):\zvec-io-scratch"
+          New-Item -ItemType Directory -Force $scratchRoot
+          Copy-Item benchmark-data/* $scratchRoot -Recurse -Force
+          "BENCH_NVME_ROOT=$scratchRoot" >> $env:GITHUB_ENV
+          Get-Partition -DiskNumber $scratchDisk.Number | ConvertTo-Json -Depth 3 | Out-File windows-io-diagnostics/scratch-partition.json
+      - name: Probe the same data on local NVMe before rebuilding indexes
+        if: env.BENCH_NVME_ROOT != ''
+        shell: pwsh
+        run: python scripts/diagnose_windows_disk_io.py --file "$env:BENCH_NVME_ROOT/base.fbin" --output windows-io-diagnostics/nvme-dataset-probe.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -78,6 +112,15 @@ jobs:
             --data benchmark-data --output windows-io-diagnostics/baseline --label "$BENCH_LABEL"
       - name: Probe the actual trained DiskANN index
         run: python scripts/diagnose_windows_disk_io.py --file benchmark-data/diskann.index --output windows-io-diagnostics/index-probe.json
+      - name: Replay identical trained indexes on local NVMe
+        if: env.BENCH_NVME_ROOT != ''
+        shell: pwsh
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+        run: |
+          python scripts/replay_diskann_storage.py --binary build-diagnostics/bin/diskann_platform_benchmark_test.exe --source benchmark-data --target "$env:BENCH_NVME_ROOT" --baseline windows-io-diagnostics/baseline/result.json --output windows-io-diagnostics/nvme --label "${env:BENCH_LABEL}-local-nvme"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/diagnose_windows_disk_io.py --file "$env:BENCH_NVME_ROOT/diskann.index" --output windows-io-diagnostics/nvme-index-probe.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
