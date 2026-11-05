@@ -22,13 +22,22 @@ Two cache policies are reported separately:
   Windows, and `F_NOCACHE` plus disabled read-ahead on macOS/iOS. Apple flags
   are advisory. The driver attempts `purge` before Apple no-cache cases only
   inside an ephemeral GitHub-hosted VM, and retains its return status.
+- **Apple warm-hint control:** prewarm the file, then set the identical
+  F_NOCACHE flags without a host purge, to check whether previously cached
+  pages still affect the result.
+- **Android eviction control:** use buffered pread, disable read-ahead, discard
+  the fixture cache before timing, and request per-read cache eviction with
+  POSIX_FADV_DONTNEED. This is separate from the native O_DIRECT experiment;
+  its OS-accounted storage-read bytes are reported to verify the path.
 
 Linux `/proc/self/io` and macOS `proc_pid_rusage` disk-byte accounting are
 recorded to help check cache effects. Windows process transfer counters are
 logical I/O counters. The public iOS SDK has no equivalent counter used here.
 No-cache flags do not guarantee bypassing hypervisor or storage-controller
-caches. Android O_DIRECT bypasses guest caching; emulator host caching may
-remain. Mobile simulator results are not measurements of physical-phone flash.
+caches. An accepted Android O_DIRECT flag can still produce buffered reads,
+so acceptance alone is not labeled proof of physical I/O. Emulator host caching
+may remain even for guest block I/O. Mobile simulator results are not
+measurements of physical-phone flash.
 
 The `storage-iops-summary` artifact contains a comparison table and full JSON;
 each job retains per-case JSON, native logs, cache-command results, and host

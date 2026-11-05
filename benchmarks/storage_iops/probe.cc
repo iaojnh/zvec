@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -71,6 +72,7 @@ std::string Quote(const std::string &value) {
 
 struct Options {
   std::string file;
+  std::string result_file;
   std::string mode{"buffered"};
   unsigned threads{1};
   unsigned seconds{10};
@@ -84,6 +86,7 @@ Options Parse(int argc, char **argv) {
     if (i + 1 == argc) throw std::runtime_error("Missing argument: " + key);
     std::string value = argv[++i];
     if (key == "--file") result.file = value;
+    else if (key == "--result") result.result_file = value;
     else if (key == "--mode") result.mode = value;
     else if (key == "--threads") result.threads = std::stoul(value);
     else if (key == "--seconds") result.seconds = std::stoul(value);
@@ -93,13 +96,13 @@ Options Parse(int argc, char **argv) {
   if (result.file.empty() || !result.threads || result.threads > 32 ||
       !result.seconds || !result.mib || result.mib > 4096 ||
       (result.mode != "prepare" && result.mode != "buffered" &&
-       result.mode != "uncached")) {
+       result.mode != "uncached" && result.mode != "warmhint" && result.mode != "evict")) {
     throw std::runtime_error("Invalid probe options");
   }
   return result;
 }
 
-void Prepare(const Options &options) {
+void Prepare(const Options &options, std::ostream &output_record) {
   const uint64_t bytes = options.mib * 1024 * 1024;
   if (std::filesystem::exists(options.file)) {
     std::ifstream input(options.file, std::ios::binary);
@@ -136,7 +139,7 @@ void Prepare(const Options &options) {
   ::close(fd);
   if (ret != 0) throw std::runtime_error("fsync failed");
 #endif
-  std::cout << "IOPS_RESULT {\"prepared\":true,\"file_bytes\":" << bytes
+  output_record << "IOPS_RESULT {\"prepared\":true,\"file_bytes\":" << bytes
             << ",\"seed\":" << kSeed << "}" << std::endl;
 }
 
@@ -148,32 +151,38 @@ struct Reader {
 #endif
   void *buffer{nullptr};
   std::string policy;
+  bool evict{false};
 
   explicit Reader(const Options &options) {
+    const bool no_cache = options.mode == "uncached" || options.mode == "warmhint";
+    evict = options.mode == "evict";
 #if defined(_WIN32)
+    if (evict) throw Unsupported("Per-read cache eviction is a Linux/Android diagnostic");
     DWORD flags = FILE_ATTRIBUTE_NORMAL;
-    if (options.mode == "uncached") flags |= FILE_FLAG_NO_BUFFERING;
+    if (no_cache) flags |= FILE_FLAG_NO_BUFFERING;
     handle = CreateFileW(std::filesystem::path(options.file).wstring().c_str(),
                          GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                          nullptr, OPEN_EXISTING, flags, nullptr);
     if (handle == INVALID_HANDLE_VALUE) throw std::runtime_error("CreateFileW failed");
     buffer = VirtualAlloc(nullptr, kBlock, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    policy = options.mode == "uncached" ? "ReadFile FILE_FLAG_NO_BUFFERING" : "ReadFile buffered warm";
+    policy = no_cache ? "ReadFile FILE_FLAG_NO_BUFFERING" : "ReadFile buffered warm";
 #else
     int flags = O_RDONLY;
 #if !defined(__APPLE__)
-    if (options.mode == "uncached") flags |= O_DIRECT;
+    if (no_cache) flags |= O_DIRECT;
+#else
+    if (evict) throw Unsupported("Per-read cache eviction is a Linux/Android diagnostic");
 #endif
     fd = ::open(options.file.c_str(), flags);
     if (fd < 0) {
-      if (options.mode == "uncached" && (errno == EINVAL || errno == ENOTSUP)) {
+      if (no_cache && (errno == EINVAL || errno == ENOTSUP)) {
         throw Unsupported("Uncached file open unsupported, errno=" + std::to_string(errno));
       }
       throw std::runtime_error("open failed, errno=" + std::to_string(errno));
     }
     if (posix_memalign(&buffer, kBlock, kBlock) != 0) buffer = nullptr;
 #if defined(__APPLE__)
-    if (options.mode == "uncached") {
+    if (no_cache) {
       if (::fcntl(fd, F_NOCACHE, 1) != 0 || ::fcntl(fd, F_RDAHEAD, 0) != 0) {
         ::close(fd);
         std::free(buffer);
@@ -184,7 +193,16 @@ struct Reader {
       policy = "pread buffered warm";
     }
 #else
-    policy = options.mode == "uncached" ? "pread O_DIRECT" : "pread buffered warm";
+    policy = no_cache ? "pread O_DIRECT" : "pread buffered warm";
+    if (evict) {
+      if (posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM) != 0 ||
+          posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0) {
+        ::close(fd);
+        std::free(buffer);
+        throw Unsupported("Per-file POSIX_FADV_DONTNEED unavailable");
+      }
+      policy = "pread + per-read POSIX_FADV_DONTNEED";
+    }
 #endif
 #endif
     if (!buffer) {
@@ -219,7 +237,12 @@ struct Reader {
     if (::pread(fd, buffer, kBlock, static_cast<off_t>(offset)) !=
         static_cast<ssize_t>(kBlock)) return false;
 #endif
-    return *static_cast<const uint64_t *>(buffer) == Word(offset / 8);
+    const bool valid = *static_cast<const uint64_t *>(buffer) == Word(offset / 8);
+#if defined(__linux__)
+    if (evict && posix_fadvise(fd, static_cast<off_t>(offset), kBlock,
+                               POSIX_FADV_DONTNEED) != 0) return false;
+#endif
+    return valid;
   }
 };
 
@@ -229,7 +252,7 @@ struct Counters {
   std::string source;
 };
 
-Counters ReadCounters() {
+Counters ReadCounters([[maybe_unused]] const char *path = "/proc/self/io") {
   Counters result;
 #if defined(_WIN32)
   IO_COUNTERS counters{};
@@ -247,7 +270,7 @@ Counters ReadCounters() {
   result.source = "No disk-byte counter in the public iOS SDK";
 #endif
 #else
-  std::ifstream input("/proc/self/io");
+  std::ifstream input(path);
   std::string key;
   uint64_t value;
   while (input >> key >> value) {
@@ -261,11 +284,11 @@ Counters ReadCounters() {
   return result;
 }
 
-void Measure(const Options &options) {
+void Measure(const Options &options, std::ostream &output_record) {
   if (std::filesystem::file_size(options.file) != options.mib * 1024 * 1024) {
     throw std::runtime_error("Wrong fixture size");
   }
-  if (options.mode == "buffered") {
+  if (options.mode == "buffered" || options.mode == "warmhint") {
     std::ifstream input(options.file, std::ios::binary);
     std::vector<char> chunk(1024 * 1024);
     while (input.read(chunk.data(), chunk.size()) || input.gcount()) {}
@@ -278,6 +301,8 @@ void Measure(const Options &options) {
   struct Worker {
     uint64_t operations{0};
     bool failed{false};
+    bool io_available{false};
+    uint64_t io_bytes{0};
     std::vector<double> latencies;
   };
   std::vector<Worker> workers(options.threads);
@@ -293,6 +318,9 @@ void Measure(const Options &options) {
       auto &worker = workers[i];
       worker.latencies.reserve(8192);
       uint64_t state = kSeed + i;
+#if defined(__linux__)
+      const auto io_start = ReadCounters("/proc/thread-self/io");
+#endif
       {
         std::unique_lock<std::mutex> lock(mutex);
         cv.wait(lock, [&] { return go; });
@@ -314,6 +342,12 @@ void Measure(const Options &options) {
         }
         ++worker.operations;
       }
+#if defined(__linux__)
+      const auto io_end = ReadCounters("/proc/thread-self/io");
+      worker.io_available = io_start.available && io_end.available &&
+                            io_end.read_bytes >= io_start.read_bytes;
+      if (worker.io_available) worker.io_bytes = io_end.read_bytes - io_start.read_bytes;
+#endif
     });
   }
   const auto before = ReadCounters();
@@ -328,10 +362,14 @@ void Measure(const Options &options) {
   const double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
   const auto after = ReadCounters();
   uint64_t operations = 0;
+  uint64_t worker_io_bytes = 0;
+  bool worker_io_available = true;
   std::vector<double> latencies;
   for (const auto &worker : workers) {
     if (worker.failed) throw std::runtime_error("Read failed or fixture data mismatch");
     operations += worker.operations;
+    worker_io_available = worker_io_available && worker.io_available;
+    worker_io_bytes += worker.io_bytes;
     latencies.insert(latencies.end(), worker.latencies.begin(), worker.latencies.end());
   }
   if (latencies.empty()) throw std::runtime_error("No completed I/O");
@@ -339,7 +377,7 @@ void Measure(const Options &options) {
   auto percentile = [&](double value) {
     return latencies.at(static_cast<size_t>(std::ceil(latencies.size() * value)) - 1);
   };
-  std::cout << std::setprecision(12)
+  output_record << std::setprecision(12)
             << "IOPS_RESULT {\"supported\":true,\"mode\":" << Quote(options.mode)
             << ",\"policy\":" << Quote(readers[0]->policy)
             << ",\"block_bytes\":4096,\"file_bytes\":" << options.mib * 1024 * 1024
@@ -355,23 +393,41 @@ void Measure(const Options &options) {
             << ",\"payload_validated\":true,\"os_read_bytes_source\":" << Quote(after.source)
             << ",\"os_accounted_read_bytes\":";
   if (before.available && after.available && after.read_bytes >= before.read_bytes) {
-    std::cout << after.read_bytes - before.read_bytes;
+    output_record << after.read_bytes - before.read_bytes;
   } else {
-    std::cout << "null";
+    output_record << "null";
   }
-  std::cout << "}" << std::endl;
+  output_record << ",\"worker_accounted_read_bytes\":";
+  if (worker_io_available) output_record << worker_io_bytes;
+  else output_record << "null";
+  output_record << "}" << std::endl;
+}
+
+void Emit(const Options &options, const std::string &record) {
+  if (!options.result_file.empty()) {
+    std::ofstream output(options.result_file, std::ios::binary | std::ios::trunc);
+    output << record;
+    output.close();
+    if (!output) throw std::runtime_error("Cannot write native result file");
+  }
+  std::cout << record << std::flush;
 }
 }  // namespace
 
 int main(int argc, char **argv) {
+  Options options;
   try {
-    const auto options = Parse(argc, argv);
-    if (options.mode == "prepare") Prepare(options);
-    else Measure(options);
+    options = Parse(argc, argv);
+    std::ostringstream record;
+    if (options.mode == "prepare") Prepare(options, record);
+    else Measure(options, record);
+    Emit(options, record.str());
     return 0;
   } catch (const Unsupported &error) {
-    std::cout << "IOPS_RESULT {\"supported\":false,\"reason\":"
-              << Quote(error.what()) << "}" << std::endl;
+    std::ostringstream record;
+    record << "IOPS_RESULT {\"supported\":false,\"reason\":"
+           << Quote(error.what()) << "}" << std::endl;
+    Emit(options, record.str());
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "IOPS_ERROR " << error.what() << std::endl;

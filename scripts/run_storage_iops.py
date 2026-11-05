@@ -9,6 +9,8 @@ import platform
 import re
 import shutil
 import subprocess
+import time
+import uuid
 from pathlib import Path
 
 import benchmark_diskann_platform as existing
@@ -59,20 +61,46 @@ def probe(args, filename, mode, threads=1):
     else:
         command = ["xcrun", "simctl", "launch", "--console", "--terminate-running-process",
                    args.device, "com.zvec.storage_iops", *arguments]
-    cache = purge_ci_cache(args, mode)
     path = args.output / f"{mode}-{threads}.log"
-    with path.open("w") as log:
-        result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                                text=True, timeout=max(180, args.seconds + 90))
-    text = path.read_text(errors="replace")
-    matches = re.findall(r"IOPS_RESULT (\{[^\r\n]+\})", text)
+    attempts = 3 if args.transport == "ios" else 1
+    for attempt in range(1, attempts + 1):
+        cache = purge_ci_cache(args, mode)
+        native_result = None
+        invocation = command
+        if args.transport == "ios":
+            # Unique per attempt; the simulator uses the host filesystem.
+            # A durable record avoids simctl console-attachment races.
+            native_result = Path(filename + ".result-" + uuid.uuid4().hex)
+            invocation = [*command, "--result", str(native_result)]
+        with path.open("w") as log:
+            result = subprocess.run(invocation, stdout=log, stderr=subprocess.STDOUT,
+                                    text=True, timeout=max(180, args.seconds + 90))
+        text = path.read_text(errors="replace")
+        matches = re.findall(r"IOPS_RESULT (\{[^\r\n]+\})", text)
+        if native_result is not None and not matches:
+            deadline = time.monotonic() + args.seconds + 30
+            while time.monotonic() < deadline:
+                if native_result.exists():
+                    native_text = native_result.read_text(errors="replace")
+                    matches = re.findall(r"IOPS_RESULT (\{[^\r\n]+\})", native_text)
+                    if len(matches) == 1:
+                        text += "\nRecovered from native result file:\n" + native_text
+                        path.write_text(text)
+                        break
+                time.sleep(0.25)
+        if matches or "IOPS_ERROR" in text or attempt == attempts:
+            break
+        shutil.copy2(path, args.output / f"{mode}-{threads}-attempt-{attempt}.log")
+        print(f"Retrying iOS launch without a native result ({attempt}/{attempts})", flush=True)
+        time.sleep(3)
     race = (args.transport == "ios" and result.returncode == 3
             and "FBSOpenApplicationServiceErrorDomain" in text and len(matches) == 1)
     if (result.returncode and not race) or len(matches) != 1 or "IOPS_ERROR" in text:
         print(text[-12000:])
         raise RuntimeError(f"Storage probe failed: {mode}, {threads}, exit={result.returncode}")
     record = json.loads(matches[0])
-    record.update({"mode": mode, "threads": threads, "cache_purge": cache})
+    record.update({"mode": mode, "threads": threads, "cache_purge": cache,
+                   "launch_attempts": attempt})
     if mode != "prepare" and record.get("supported"):
         if record["operations"] <= 0 or record["elapsed_seconds"] < args.seconds * 0.9:
             raise ValueError("Insufficient I/O measurements")
@@ -88,7 +116,7 @@ def summarize(source, output):
     lines = ["# Cross-platform storage IOPS", "",
              "4 KiB random reads; deterministic 256 MiB nonzero fixture; 10 seconds per case; native synchronous calls with 1 or 8 worker threads.",
              "Each worker owns a separate file descriptor/handle. Eight threads mean up to eight concurrent reads, not one asynchronous queue of depth eight.", "",
-             "| Environment | Uncached policy | Buffered 1-thread IOPS | Buffered 8-thread IOPS | Uncached 1-thread IOPS | Uncached 8-thread IOPS | Uncached 1-thread P95 ms |",
+             "| Environment | Storage-path policy | Buffered 1-thread IOPS | Buffered 8-thread IOPS | Storage-path 1-thread IOPS | Storage-path 8-thread IOPS | Storage-path 1-thread P95 ms |",
              "| --- | --- | --- | --- | --- | --- | --- |"]
     for report in sorted(reports, key=lambda item: item["platform"]):
         cases = {(c["mode"], c["threads"]): c for c in report["cases"]}
@@ -96,14 +124,26 @@ def summarize(source, output):
             case = cases.get((mode, threads), {})
             value = case.get(name)
             return f"{value:,.{digits}f}" if case.get("supported") and value is not None else "unsupported/missing"
-        uncached = cases.get(("uncached", 1), {})
+        storage_mode = "evict" if ("evict", 1) in cases else "uncached"
+        uncached = cases.get((storage_mode, 1), {})
         label = report["platform"] + (" (SIMULATOR)" if report["transport"] != "native" else "")
         lines.append(f'| {label} | {uncached.get("policy", uncached.get("reason", "missing"))} | '
                      f'{metric("buffered",1,"iops")} | {metric("buffered",8,"iops")} | '
-                     f'{metric("uncached",1,"iops")} | {metric("uncached",8,"iops")} | '
-                     f'{metric("uncached",1,"p95_ms",3)} |')
+                     f'{metric(storage_mode,1,"iops")} | {metric(storage_mode,8,"iops")} | '
+                     f'{metric(storage_mode,1,"p95_ms",3)} |')
+    lines.extend(["", "## Cache-accounting checks", "",
+                  "| Environment | Mode | Threads | IOPS | OS-accounted read bytes / requested bytes | Counter semantics |",
+                  "| --- | --- | --- | --- | --- | --- |"])
+    for report in sorted(reports, key=lambda item: item["platform"]):
+        for case in report["cases"]:
+            if not case.get("supported"):
+                continue
+            value = case.get("os_accounted_read_bytes")
+            ratio = f'{value / (case["operations"] * 4096):.4f}' if value is not None else "unavailable"
+            lines.append(f'| {report["platform"]} | {case["mode"]} | {case["threads"]} | '
+                         f'{case["iops"]:,.0f} | {ratio} | {case["os_read_bytes_source"]} |')
     lines.extend(["", "Apple F_NOCACHE is an advisory per-file policy; the cache-purge command status and available OS disk-byte accounting are retained for checking cache effects.",
-                  "Android O_DIRECT bypasses the guest cache, not necessarily QEMU/host caches. Android and iOS simulator numbers are not physical-phone flash benchmarks.",
+                  "An accepted O_DIRECT flag is not sufficient evidence of disk I/O: some Android filesystem paths can remain buffered. The Android storage-path column uses a separate per-read file-cache eviction control, with OS read-byte accounting retained. Simulator numbers are not physical-phone flash benchmarks.",
                   "Windows process I/O-byte counters are logical; Linux read_bytes and macOS proc_pid_rusage diskio counters have OS-specific accounting semantics.", ""])
     output.mkdir(parents=True, exist_ok=True)
     (output / "iops.md").write_text("\n".join(lines))
@@ -155,7 +195,13 @@ def main():
                          "validation": "first 64-bit word of every read checked against deterministic generator"},
               "cases": []}
     report["prepare"] = probe(args, filename, "prepare")
-    for mode in ("buffered", "uncached"):
+    modes = ["buffered"]
+    if platform.system() == "Darwin" and args.transport != "android":
+        modes.append("warmhint")
+    modes.append("uncached")
+    if args.transport == "android":
+        modes.append("evict")
+    for mode in modes:
         for threads in (1, 8):
             report["cases"].append(probe(args, filename, mode, threads))
             (args.output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
