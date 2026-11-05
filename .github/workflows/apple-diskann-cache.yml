@@ -1,6 +1,9 @@
 name: DiskANN Apple Cache Verification
 
 on:
+  push:
+    branches: [codex/test-diskann-platform-metrics]
+    paths: ['.github/workflows/apple-diskann-cache.yml']
   workflow_dispatch:
 
 permissions:
