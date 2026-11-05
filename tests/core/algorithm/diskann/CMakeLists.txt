@@ -43,6 +43,6 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
     )
   if(ANDROID AND CC_TARGET STREQUAL "diskann_android_io_test")
     set_property(TARGET ${CC_TARGET} APPEND_STRING PROPERTY LINK_FLAGS
-      " -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=__open_2 -Wl,--wrap=__open64_2 -Wl,--wrap=pread -Wl,--wrap=pread64")
+      " -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=__open_2 -Wl,--wrap=__open64_2 -Wl,--wrap=pread -Wl,--wrap=pread64 -Wl,--wrap=__pread_chk -Wl,--wrap=__pread64_chk")
   endif()
 endforeach()

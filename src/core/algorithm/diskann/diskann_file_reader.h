@@ -176,6 +176,12 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   int open_android_from_handle(const std::string &fname, int source_fd);
 #endif
 
+#if defined(__ANDROID__)
+ protected:
+  // A per-file capability check; unknown kernels keep the O_DIRECT attempt.
+  virtual int android_direct_io_support_error(int fd) const;
+#endif
+
  public:
   LinuxAlignedFileReader();
   LinuxAlignedFileReader(int file_desc);

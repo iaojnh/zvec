@@ -71,6 +71,37 @@ table reports medians across trials, not pooled latency percentiles.
 Windows ARM64 uses the unique verified blank local NVMe scratch disk when
 available; the provisioning metadata and actual data path are retained.
 
+## Android direct-I/O validation
+
+Android keeps synchronous pread, but now attempts an independent O_DIRECT
+descriptor for graph/full-vector reads in both open paths. A captured buffered
+descriptor refers to the same inode, leaves metadata-handle flags unchanged,
+and remains available for explicit open/read compatibility fallback. Direct
+read EINVAL/EOPNOTSUPP/ENOSYS triggers a one-time warning and buffered retry;
+EOF and actual storage failures remain errors. Descriptors are retained until
+close so in-flight concurrent readers remain valid during fallback.
+When available, per-file STATX_DIOALIGN also detects a file for which the kernel
+accepts O_DIRECT but reports no direct-I/O support. Unknown capabilities retain
+the direct attempt. The syscall is gated to Android 11+ to preserve older
+Android seccomp compatibility and avoid a newer bionic symbol dependency.
+
+The **DiskANN Android Direct I/O** workflow builds ARM64 and x86_64. The x86_64
+emulator runs deterministic open/read failure, pathname replacement, source
+flags, EOF/storage error, and concurrency regressions, followed by a production
+reader probe and the 100k-vector query/cache benchmark. The standalone probe
+uses a nonzero 64 MiB file and checks all bytes of 4096 aligned 4 KiB reads per
+case. Warm/cold buffered controls establish working storage accounting and
+mincore file-cache residency before assessing the production reader.
+
+Results distinguish **verified direct reads**, **explicit buffered fallback**,
+and **O_DIRECT requested but bypass not verified**. A requested flag alone is
+never a bypass claim. Verification is confined to the Android guest page cache
+and storage accounting, not the emulator host or physical phone flash.
+An additional unencrypted-directory positive control and query run separates
+filesystem support from encrypted userdata fallback. Preparing that directory
+uses root only inside the verified ephemeral CI emulator; no security policy
+is disabled and ordinary app files are not moved to an unencrypted location.
+
 ## Outputs
 
 Each platform uploads build/query logs, raw JSON, and `result.json`.

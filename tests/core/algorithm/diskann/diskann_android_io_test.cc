@@ -7,6 +7,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <linux/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <atomic>
@@ -41,6 +45,10 @@ extern "C" int __real_open(const char *, int, ...);
 extern "C" int __real_open64(const char *, int, ...);
 extern "C" ssize_t __real_pread(int, void *, size_t, off_t);
 extern "C" ssize_t __real_pread64(int, void *, size_t, off64_t);
+#if __ANDROID_API__ >= 23
+extern "C" ssize_t __real___pread_chk(int, void *, size_t, off_t, size_t);
+extern "C" ssize_t __real___pread64_chk(int, void *, size_t, off64_t, size_t);
+#endif
 
 namespace {
 int WrappedOpen(const char *path, int flags, mode_t mode, bool large) {
@@ -100,10 +108,34 @@ extern "C" ssize_t __wrap_pread64(int fd, void *buffer, size_t size, off64_t off
   if (InjectReadFailure(fd)) return -1;
   return __real_pread64(fd, buffer, size, offset);
 }
+#if __ANDROID_API__ >= 23
+extern "C" ssize_t __wrap___pread_chk(int fd, void *buffer, size_t size,
+                                       off_t offset, size_t capacity) {
+  if (InjectReadFailure(fd)) return -1;
+  return __real___pread_chk(fd, buffer, size, offset, capacity);
+}
+extern "C" ssize_t __wrap___pread64_chk(int fd, void *buffer, size_t size,
+                                         off64_t offset, size_t capacity) {
+  if (InjectReadFailure(fd)) return -1;
+  return __real___pread64_chk(fd, buffer, size, offset, capacity);
+}
+#endif
 
 namespace zvec::core {
 namespace {
 constexpr size_t kBlock = 4096;
+
+class AndroidTestReader : public LinuxAlignedFileReader {
+ public:
+  explicit AndroidTestReader(int support_error = 0)
+      : support_error_(support_error) {}
+ protected:
+  int android_direct_io_support_error(int) const override {
+    return support_error_;
+  }
+ private:
+  int support_error_;
+};
 
 class AndroidFile : public ::testing::Test {
  protected:
@@ -140,7 +172,7 @@ class AndroidFile : public ::testing::Test {
 TEST_F(AndroidFile, OpenFailureFallsBackWithoutChangingSourceFlags) {
   const int flags = ::fcntl(fd_, F_GETFL);
   g_open_error.store(EOPNOTSUPP);
-  LinuxAlignedFileReader reader;
+  AndroidTestReader reader;
   ASSERT_EQ(reader.open_from_handle(path_, fd_), 0);
   EXPECT_FALSE(reader.direct_io_requested());
   EXPECT_EQ(reader.direct_io_fallback_errno(), EOPNOTSUPP);
@@ -154,7 +186,7 @@ TEST_F(AndroidFile, OpenFailureFallsBackWithoutChangingSourceFlags) {
 
 TEST_F(AndroidFile, PathOpenAlsoAttemptsDirectBeforeFallback) {
   g_open_error.store(EINVAL);
-  LinuxAlignedFileReader reader;
+  AndroidTestReader reader;
   reader.open(path_);
   EXPECT_FALSE(reader.direct_io_requested());
   EXPECT_EQ(reader.direct_io_fallback_errno(), EINVAL);
@@ -166,7 +198,7 @@ TEST_F(AndroidFile, PathOpenAlsoAttemptsDirectBeforeFallback) {
 
 TEST_F(AndroidFile, ReadFallbackKeepsCapturedInodeAfterPathReplacement) {
   g_simulate_direct_open.store(true);
-  LinuxAlignedFileReader reader;
+  AndroidTestReader reader;
   ASSERT_EQ(reader.open_from_handle(path_, fd_), 0);
   ASSERT_TRUE(reader.direct_io_requested());
   ASSERT_EQ(::unlink(path_), 0);
@@ -190,7 +222,7 @@ TEST_F(AndroidFile, ReadFallbackKeepsCapturedInodeAfterPathReplacement) {
 
 TEST_F(AndroidFile, StorageErrorsAndEofAreNotMaskedByFallback) {
   g_simulate_direct_open.store(true);
-  LinuxAlignedFileReader reader;
+  AndroidTestReader reader;
   ASSERT_EQ(reader.open_from_handle(path_, fd_), 0);
   g_read_error.store(EIO);
   IOContext context = nullptr;
@@ -207,7 +239,7 @@ TEST_F(AndroidFile, StorageErrorsAndEofAreNotMaskedByFallback) {
 
 TEST_F(AndroidFile, ConcurrentReadersSurviveReadFallback) {
   g_simulate_direct_open.store(true);
-  LinuxAlignedFileReader reader;
+  AndroidTestReader reader;
   ASSERT_EQ(reader.open_from_handle(path_, fd_), 0);
   g_read_error.store(EOPNOTSUPP);
   std::atomic<bool> correct{true};
@@ -234,6 +266,18 @@ TEST_F(AndroidFile, ConcurrentReadersSurviveReadFallback) {
   for (auto &thread : threads) thread.join();
   EXPECT_TRUE(correct.load());
   EXPECT_FALSE(reader.direct_io_requested());
+}
+
+TEST_F(AndroidFile, FileCapabilityRejectionAfterSuccessfulOpenIsExplicit) {
+  g_simulate_direct_open.store(true);
+  AndroidTestReader reader(EOPNOTSUPP);
+  ASSERT_EQ(reader.open_from_handle(path_, fd_), 0);
+  EXPECT_FALSE(reader.direct_io_requested());
+  EXPECT_EQ(reader.direct_io_fallback_errno(), EOPNOTSUPP);
+  auto requests = Requests();
+  IOContext context = nullptr;
+  ASSERT_EQ(reader.read(requests, context), 0);
+  ExpectOriginalBytes();
 }
 
 uint64_t AndroidReadBytes() {
@@ -318,7 +362,23 @@ TEST_F(AndroidFile, VerifyRealCacheBehavior) {
           << ",\"read_bytes\":" << read_bytes << ",\"resident_before\":" << resident_before
           << ",\"resident_after\":" << resident_after << ",\"seconds\":" << seconds << '}';
   }
+  int file_flags = 0;
+  const bool has_file_flags = ::ioctl(fd_, FS_IOC_GETFLAGS, &file_flags) == 0;
+  std::ostringstream capabilities;
+  capabilities << "{\"file_flags\":" << (has_file_flags ? std::to_string(file_flags) : "null");
+#if defined(STATX_DIOALIGN) && defined(__NR_statx) && defined(AT_EMPTY_PATH)
+  struct statx attributes {};
+  const long statx_result = ::syscall(__NR_statx, fd_, "", AT_EMPTY_PATH, STATX_DIOALIGN, &attributes);
+  capabilities << ",\"statx_headers\":true,\"statx_result\":" << statx_result
+               << ",\"statx_mask\":" << attributes.stx_mask
+               << ",\"dio_mem_align\":" << attributes.stx_dio_mem_align
+               << ",\"dio_offset_align\":" << attributes.stx_dio_offset_align;
+#else
+  capabilities << ",\"statx_headers\":false";
+#endif
+  capabilities << '}';
   std::cout << "ZVEC_ANDROID_IO_RESULT {\"fixture_bytes\":" << kSize
+            << ",\"file_capabilities\":" << capabilities.str()
             << ",\"payload_validated\":true,\"cases\":[" << cases.str() << "]}" << std::endl;
 }
 

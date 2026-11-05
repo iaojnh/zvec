@@ -64,7 +64,9 @@ def setup_transport(args):
     if args.transport == "native":
         return str(args.data.resolve())
     if args.transport == "android":
-        remote = "/data/local/tmp/zvec-platform-bench"
+        remote = getattr(args, "android_data_root", None) or "/data/local/tmp/zvec-platform-bench"
+        if not re.fullmatch(r"/data/[A-Za-z0-9_./-]+", remote) or ".." in remote.split("/"):
+            raise ValueError("Invalid Android benchmark data root")
         run(["adb", "shell", "mkdir", "-p", remote])
         run(["adb", "push", str(args.binary), remote + "/benchmark"])
         run(["adb", "shell", "chmod", "755", remote + "/benchmark"])
@@ -152,6 +154,7 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--transport", choices=["native", "android", "ios"], default="native")
     parser.add_argument("--device", default="booted")
+    parser.add_argument("--android-data-root")
     parser.add_argument("--target-recall", type=float, default=0.95)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--cache-comparison", action="store_true")

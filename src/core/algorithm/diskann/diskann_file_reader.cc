@@ -25,6 +25,11 @@
 #include <new>
 #include <thread>
 #include <utility>
+#if defined(__ANDROID__)
+#include <linux/stat.h>
+#include <sys/syscall.h>
+#include <sys/system_properties.h>
+#endif
 #include <ailego/io/io_backend_def.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/io_backend.h>
@@ -597,6 +602,31 @@ static int reopen_file_descriptor_with_direct_io(int source_fd) {
 #endif
 
 #if defined(__ANDROID__)
+int LinuxAlignedFileReader::android_direct_io_support_error(int fd) const {
+#if defined(STATX_DIOALIGN) && defined(__NR_statx) && defined(AT_EMPTY_PATH)
+  char sdk[PROP_VALUE_MAX] = {};
+  if (::__system_property_get("ro.build.version.sdk", sdk) <= 0 ||
+      std::strtol(sdk, nullptr, 10) < 30) {
+    // Older Android seccomp policies need not permit the newer statx syscall.
+    return 0;
+  }
+  struct statx info {};
+  // Use the syscall so older Android API levels do not acquire a dependency
+  // on the newer bionic statx symbol. A kernel may accept O_DIRECT on open
+  // while falling back internally for this specific encrypted/verity file.
+  if (::syscall(__NR_statx, fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &info) == 0 &&
+      (info.stx_mask & STATX_DIOALIGN) != 0 &&
+      (info.stx_dio_mem_align == 0 || info.stx_dio_offset_align == 0)) {
+    return EOPNOTSUPP;
+  }
+#else
+  (void)fd;
+#endif
+  // ENOSYS, an absent result mask, or unavailable headers mean unknown, not
+  // unsupported. Actual read-time failures still have an explicit fallback.
+  return 0;
+}
+
 int LinuxAlignedFileReader::open_android_from_handle(const std::string &fname,
                                                     int source_fd) {
   const int source_flags = ::fcntl(source_fd, F_GETFL);
@@ -616,12 +646,17 @@ int LinuxAlignedFileReader::open_android_from_handle(const std::string &fname,
               fname.c_str(), errno, ::strerror(errno));
     return IndexError_OpenFile;
   }
-  const int direct_fd = reopen_file_descriptor_with_direct_io(source_fd);
+  int direct_fd = reopen_file_descriptor_with_direct_io(source_fd);
+  const int direct_errno = direct_fd < 0 ? errno
+                                       : android_direct_io_support_error(direct_fd);
+  if (direct_fd >= 0 && direct_errno != 0) {
+    ::close(direct_fd);
+    direct_fd = -1;
+  }
   if (direct_fd < 0) {
-    const int direct_errno = errno;
     file_desc = buffered_fd;
     android_fallback_errno_.store(direct_errno, std::memory_order_relaxed);
-    LOG_WARN("DiskAnn Android: O_DIRECT open failed for %s (errno=%d: %s); "
+    LOG_WARN("DiskAnn Android: O_DIRECT unavailable for %s (errno=%d: %s); "
              "falling back to buffered pread; OS file cache may be used",
              fname.c_str(), direct_errno, ::strerror(direct_errno));
   } else {
@@ -850,6 +885,7 @@ int LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
       if (ret == 0) continue;
       if (read_errno != EINVAL && read_errno != EOPNOTSUPP &&
           read_errno != ENOSYS) {
+        if (read_errno == 0) return ret;  // EOF was already logged above.
         LOG_ERROR("DiskAnn Android: direct pread failed (errno=%d: %s); "
                   "not masking EOF or storage errors with a fallback",
                   read_errno, ::strerror(read_errno));
