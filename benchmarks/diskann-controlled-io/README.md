@@ -5,6 +5,10 @@ For measured native I/O, product RSS and real query wall time, use the
 [eight-platform results from 2026-11-05](results/2026-11-05/publication-comparison.md).
 The experiment below is the earlier virtual cost model.
 
+The [2/4/8-worker protocol](CONCURRENT_PACING.md) and
+[complete concurrent results](results/2026-11-05-concurrent/concurrent-comparison.md)
+reuse the verified one-worker baseline and share one total I/O budget across workers.
+
 This opt-in experiment removes real disk latency from graph/full-vector reads.
 It does **not** make different CPUs, memory systems or operating systems into
 identical physical hardware. Use a fixed physical machine with native multiboot

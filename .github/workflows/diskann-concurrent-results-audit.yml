@@ -1,0 +1,77 @@
+name: DiskANN Concurrent Results Audit
+
+on:
+  push:
+    branches: [codex/diskann-concurrent-results]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Completed eight-platform concurrent measurement run'
+        default: '42003247275'
+        type: string
+      benchmark_commit:
+        description: 'Exact revision used by every new 2/4/8-worker trial'
+        default: '099cd1c2c14997df581ff1824395388bcd31aeef'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SOURCE_RUN: ${{ inputs.source_run_id || '42003247275' }}
+      BENCHMARK_COMMIT: ${{ inputs.benchmark_commit || '099cd1c2c14997df581ff1824395388bcd31aeef' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s scripts/tests -p 'test_diskann*io.py'
+      - name: Require all eight actual measurement jobs to have passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json,os,urllib.request
+          base='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']
+          headers={'Accept':'application/vnd.github+json','Authorization':'Bearer '+os.environ['GH_TOKEN']}
+          def get(path):
+              with urllib.request.urlopen(urllib.request.Request(base+path,headers=headers),timeout=30) as r:
+                  return json.load(r)
+          run=get('/actions/runs/'+os.environ['SOURCE_RUN'])
+          assert run['head_sha']==os.environ['BENCHMARK_COMMIT'], 'Benchmark revision changed'
+          jobs=get('/actions/runs/'+os.environ['SOURCE_RUN']+'/jobs?per_page=100')['jobs']
+          measured=[j for j in jobs if j['name'].startswith('Concurrent native I/O (')]
+          assert len(measured)==8 and all(j['conclusion']=='success' for j in measured), 'Incomplete/failed platform measurements'
+          PY
+      - uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ env.SOURCE_RUN }}
+          github-token: ${{ github.token }}
+          pattern: concurrent-*
+          path: all-results
+      - name: Verify raw worker counts, shared budgets, clocks, RSS, recall and medians
+        run: |
+          python - <<'PY'
+          import json,os,pathlib
+          expected='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['SOURCE_RUN']
+          for p in pathlib.Path('all-results').rglob('concurrent-results.json'):
+              r=json.loads(p.read_text())
+              assert r['host']['commit']==os.environ['BENCHMARK_COMMIT'] and r['host']['run_url']==expected
+          PY
+          python scripts/summarize_diskann_concurrent_io.py --results all-results --output audited-summary
+      - name: Publish tables
+        if: success()
+        run: cat audited-summary/concurrent-comparison.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-concurrent-audited-results
+          path: |
+            audited-summary/
+            all-results/
+          retention-days: 30

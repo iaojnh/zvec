@@ -31,6 +31,7 @@ def validate_concurrent_query(query, algorithm, fixture, rate, label, workers, b
         if (pace.get("scope") != "process-wide" or
                 not 1 <= pace.get("max_reserved_reads", 0) <= depth or
                 pace["bytes"] != pace["reads"] * 4096 or
+                not math.isclose(pace["achieved_iops"], pace["reads"] * 1000 / wall, rel_tol=1e-9) or
                 pace["actual_wait_ns"] > wall * 1e6 * workers * 1.001):
             raise ValueError("I/O budget/depth was not shared by every worker")
 

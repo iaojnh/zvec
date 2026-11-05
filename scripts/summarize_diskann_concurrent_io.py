@@ -13,12 +13,20 @@ from summarize_diskann_controlled_io import EXPECTED
 BASELINE = Path(__file__).resolve().parents[1] / "benchmarks/diskann-controlled-io/results/2026-11-05/all-platform-results.json"
 
 
+def baseline_file_hashes(payload):
+    # Git may check text files out with CRLF on Windows. Independently require
+    # exact parsed baseline equality below; only these two encodings are valid.
+    normalized = payload.replace(b"\r\n", b"\n")
+    return {hashlib.sha256(normalized).hexdigest(),
+            hashlib.sha256(normalized.replace(b"\n", b"\r\n")).hexdigest()}
+
+
 def validate_report(report):
     baseline_bytes = BASELINE.read_bytes()
     baseline = {r["label"]: r for r in json.loads(baseline_bytes)}
     if (report["kind"] != "concurrent-paced-native-file-io" or report["label"] not in EXPECTED or
             report["new_query_threads"] != [2, 4, 8] or not report["baseline_reused"] or
-            report["baseline_file_sha256"] != hashlib.sha256(baseline_bytes).hexdigest() or
+            report["baseline_file_sha256"] not in baseline_file_hashes(baseline_bytes) or
             report["baseline"] != baseline[report["label"]] or
             report["fixture"] != report["baseline"]["fixture"] or report["queue_depth"] != 8 or
             report["trials"] != 3 or report["repetitions"] != 3):
@@ -43,7 +51,7 @@ def validate_report(report):
             complete = True
             for algorithm in ("hnsw", "diskann"):
                 rows = entry["raw_trials"][algorithm]
-                if len(rows) != 3:
+                if len(rows) != 3 or algorithm not in entry.get("medians", {}):
                     complete = False
                 for query in rows:
                     validate_concurrent_query(query, algorithm, report["fixture"], rate, report["label"],
@@ -51,7 +59,7 @@ def validate_report(report):
                     if query["queries"] != 1000 or query["repetitions"] != 3:
                         raise ValueError("Total held-out workload changed across thread counts")
                     trials += 1
-                if len(rows) == 3 and entry.get("medians", {}).get(algorithm) != aggregate(rows):
+                if algorithm in entry.get("medians", {}) and entry["medians"][algorithm] != aggregate(rows):
                     raise ValueError("Reported concurrent median differs from raw trials")
             if not complete:
                 incomplete.append(f"{report['label']}/{rate}/{workers}")
@@ -109,7 +117,7 @@ def build_report(root):
                     entry = profile.get("threads", {}).get(str(workers), {})
                     name = report["label"] + (" **模拟器**" if mobile else "")
                     worker_name = "1（沿用）" if workers == 1 else str(workers)
-                    if not entry.get("eligible") or not entry.get("medians"):
+                    if not entry.get("eligible") or not {"hnsw", "diskann"}.issubset(entry.get("medians", {})):
                         lines.append(f"| {name} | {worker_name} | — | — | — | — | 未完成或该可选档位未达标 |")
                         continue
                     h, d = entry["medians"]["hnsw"], entry["medians"]["diskann"]

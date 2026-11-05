@@ -1,0 +1,70 @@
+{
+  "measurement_run": "https://github.com/iaojnh/zvec/actions/runs/42003247275",
+  "measurement_commit": "099cd1c2c14997df581ff1824395388bcd31aeef",
+  "new_query_threads": [
+    2,
+    4,
+    8
+  ],
+  "one_worker_reused": true,
+  "verified_new_query_process_trials": 378,
+  "note": "All eight measurement jobs passed. Windows baseline text hashes differ only by LF/CRLF; parsed baseline values are checked for exact equality.",
+  "platforms": [
+    {
+      "label": "android-x86_64-emulator",
+      "artifact_id": 13404603978,
+      "raw_artifact_report_sha256": "f1f3ab52ebf819240e3fbfbc41d7378c8fd2e95b3ca652a216b4647dc1e1ae94",
+      "report_content_sha256": "f453e351b717e4a9d6ccb88317c71a2ee3847ba55152c3d314665c48d78f3b51",
+      "common_host_qualified": true
+    },
+    {
+      "label": "ios-arm64-simulator",
+      "artifact_id": 13406031208,
+      "raw_artifact_report_sha256": "11d23c190ac58ceb733814d2670b6a481c9c25c7a7f99aea8ca546e7755769c3",
+      "report_content_sha256": "da0df8ed6019925e4f5193c23bddb6c693ca22730bf0535b117c37eab6d93241",
+      "common_host_qualified": false
+    },
+    {
+      "label": "linux-arm64",
+      "artifact_id": 13403859978,
+      "raw_artifact_report_sha256": "742708a27b04bc456694340b033f9a3eb3e6e07de4807cf5c74beea77d8c99b1",
+      "report_content_sha256": "c8242ad626a23f1f64b4bebbda84e42dd900283e0483891b69bfde86a1cdc5ac",
+      "common_host_qualified": true
+    },
+    {
+      "label": "linux-x86_64",
+      "artifact_id": 13404324748,
+      "raw_artifact_report_sha256": "271d19856b5c3587462f9842b214a468453c4de01fbb449dbc6a6c4509720c36",
+      "report_content_sha256": "71f888dbe1566f34959ce3b78d20bd339bcf8ee5aa3ee17c4e57dfe62c29db48",
+      "common_host_qualified": true
+    },
+    {
+      "label": "macos-arm64",
+      "artifact_id": 13405376689,
+      "raw_artifact_report_sha256": "76d61ca439a779aa013365a5bab2e5d274a8c6cf2e8772526b0e03979be11388",
+      "report_content_sha256": "7bbf7936036b3e409a5b57d84ed9fbb9d71089f8089a0c0b3d41c8c5851db340",
+      "common_host_qualified": true
+    },
+    {
+      "label": "macos-x86_64",
+      "artifact_id": 13405823901,
+      "raw_artifact_report_sha256": "da829244a5a588d8e60b09dad673a70e104e87478d16344fb84ed9912118d42a",
+      "report_content_sha256": "6c03be22208a7985533e41796a758f766423238f32e0be9fb449ddd3fa60d765",
+      "common_host_qualified": true
+    },
+    {
+      "label": "windows-arm64",
+      "artifact_id": 13405351087,
+      "raw_artifact_report_sha256": "72ce96b3ac1c3c8daa6dcc6215211c96e1410bcfa4238cfe848b9df33a9a7227",
+      "report_content_sha256": "682921ae7192fa9f5e9a34d134650c6b402370164ee6b78ec350dcae518ecfaa",
+      "common_host_qualified": true
+    },
+    {
+      "label": "windows-x86_64",
+      "artifact_id": 13405905602,
+      "raw_artifact_report_sha256": "03d79edb5d55103527292b77c608faef9c0a478e06708697b0d25f552b5f7376",
+      "report_content_sha256": "a059ee78939fb7ad4db938118a25ee297e46e0d81cb2db41b8866ac736f0dea4",
+      "common_host_qualified": true
+    }
+  ]
+}

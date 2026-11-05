@@ -36,3 +36,10 @@ and iOS simulators. Its summary validates worker counts, fixed total queries,
 live-worker RSS sampling, process-wide rate/depth budgets, storage-read evidence,
 frozen budgets/recall and medians. Raw JSON retains each process trial and the
 unchanged one-worker source data and provenance.
+
+The [2026-11-05 result tables](results/2026-11-05-concurrent/concurrent-comparison.md)
+retain all 378 newly measured query-process trials. `DiskANN Concurrent Results
+Audit` additionally requires all eight source measurement jobs to have succeeded
+and verifies the complete artifact set without rerunning queries. The baseline
+text fingerprint accepts Git's LF/CRLF checkout encodings while independently
+requiring exactly equal parsed one-worker data.

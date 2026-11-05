@@ -1,14 +1,24 @@
 """Guard total budgets, real concurrent wall time and live-thread RSS sampling."""
 import copy
+import hashlib
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_diskann_concurrent_io import validate_concurrent_query
+from summarize_diskann_concurrent_io import baseline_file_hashes
 
 
 class ConcurrentNativeGuards(unittest.TestCase):
+    def test_windows_checkout_line_endings_preserve_baseline_identity(self):
+        original = b'[{"recall":0.9867}]\n'
+        windows = original.replace(b'\n', b'\r\n')
+        self.assertEqual(baseline_file_hashes(original), baseline_file_hashes(windows))
+        self.assertIn(hashlib.sha256(windows).hexdigest(), baseline_file_hashes(original))
+        self.assertNotIn(hashlib.sha256(original.replace(b'0.9867', b'0.9999')).hexdigest(),
+                         baseline_file_hashes(original))
+
     def setUp(self):
         self.fixture = {"budgets": {"diskann": 32}, "recall_at_10": {"diskann": 0.9867}}
         self.query = {"fixed_budget": True, "budget": 32, "recall_at_10": 0.9867,
@@ -35,6 +45,14 @@ class ConcurrentNativeGuards(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.validate(query)
 
+    def test_per_worker_iops_average_cannot_hide_total_reads(self):
+        query = copy.deepcopy(self.query)
+        query["native_pacing"]["reads"] *= 8
+        query["native_pacing"]["bytes"] *= 8
+        query["io"]["timed_read_bytes"] *= 8
+        with self.assertRaisesRegex(ValueError, "not shared"):
+            self.validate(query)
+
     def test_increasing_total_work_or_sampling_after_workers_exit_is_rejected(self):
         for key, value in (("worker_queries", [3000] * 8), ("workers_alive_at_rss_sample", 0),
                            ("qps", 320)):
@@ -49,6 +67,8 @@ class ConcurrentNativeGuards(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(query)
         query["native_pacing"]["achieved_iops"] = 1500
+        query["timed_block_wall_ms"] = 100000
+        query["qps"] = 30
         self.validate(query)
 
 
