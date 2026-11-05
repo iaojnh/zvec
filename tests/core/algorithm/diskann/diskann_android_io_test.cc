@@ -10,6 +10,9 @@
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
 #include <linux/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
