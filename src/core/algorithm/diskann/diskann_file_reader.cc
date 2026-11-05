@@ -40,6 +40,8 @@
 #endif
 #if defined(__APPLE__) || defined(__MACH__)
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -544,6 +546,14 @@ LinuxAlignedFileReader::LinuxAlignedFileReader(int file_desc) {
     (void)open_android_from_handle("(owned descriptor)", file_desc);
     ::close(file_desc);
   }
+#elif defined(__APPLE__) || defined(__MACH__)
+  this->file_desc = -1;
+  if (file_desc >= 0) {
+    char path[PATH_MAX] = {};
+    (void)::fcntl(file_desc, F_GETPATH, path);
+    (void)open_from_handle(path, file_desc);
+    ::close(file_desc);
+  }
 #else
   this->file_desc = file_desc;
 #endif
@@ -710,16 +720,18 @@ static int reopen_macos_file_descriptor(const std::string &fname,
   return reopened_fd;
 }
 
-static void configure_macos_reader(int file_desc, const std::string &fname) {
+static bool configure_macos_reader(int file_desc, const std::string &fname) {
   // macOS has no O_DIRECT. F_NOCACHE is its closest per-file equivalent: it
   // asks the kernel to minimize caching for I/O through this descriptor. This
   // is advisory rather than a guarantee that every read reaches the device.
   // Disable read-ahead as well because DiskAnn performs random reads.
   //
-  // Do not mmap the entire index and call msync(MS_INVALIDATE) here. That does
-  // not provide a reliable global cache eviction guarantee and makes open time
-  // and virtual-address usage scale with the size of the index.
+  // This flag alone can still hit pre-existing cached pages. The reader also
+  // invalidates bounded requested ranges, rather than mapping the whole index
+  // or purging unrelated system caches. Invalidation failure is explicit.
+  bool requested = true;
   if (::fcntl(file_desc, F_NOCACHE, 1) == -1) {
+    requested = false;
     LOG_WARN(
         "fcntl(F_NOCACHE) failed for %s (errno=%d: %s); reads will use "
         "the page cache",
@@ -731,6 +743,61 @@ static void configure_macos_reader(int file_desc, const std::string &fname) {
   if (::fcntl(file_desc, F_RDAHEAD, 0) == -1) {
     LOG_WARN("fcntl(F_RDAHEAD, 0) failed for %s (errno=%d: %s)", fname.c_str(),
              errno, ::strerror(errno));
+  }
+  return requested;
+}
+
+void LinuxAlignedFileReader::configure_apple_cache(const std::string &fname,
+                                                   bool independent) {
+  // A dup shares status flags with the metadata handle. Do not change its
+  // F_NOCACHE/F_RDAHEAD policy; bounded pre/post invalidation can still be used.
+  apple_nocache_requested_ = independent && configure_macos_reader(file_desc, fname);
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0 || page_size > 1024 * 1024) {
+    apple_cache_fallback_errno_.store(EINVAL, std::memory_order_relaxed);
+    LOG_WARN("DiskAnn Apple: invalid page size; using advisory/buffered reads");
+    return;
+  }
+  apple_page_size_ = static_cast<size_t>(page_size);
+  apple_invalidation_active_.store(true, std::memory_order_release);
+}
+
+int LinuxAlignedFileReader::invalidate_apple_cache_range(
+    const AlignedRead &request) const {
+  if (request.len == 0) return 0;
+  const uint64_t max_offset = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+  const uint64_t page = apple_page_size_;
+  if (page == 0 || request.offset > max_offset ||
+      request.len > max_offset - request.offset ||
+      request.offset + request.len > max_offset - (page - 1)) {
+    return EOVERFLOW;
+  }
+  uint64_t offset = request.offset - request.offset % page;
+  const uint64_t end = ((request.offset + request.len + page - 1) / page) * page;
+  // Keep virtual-address usage bounded even for large indexes/read requests.
+  constexpr uint64_t kWindow = 1024 * 1024;
+  while (offset < end) {
+    const size_t length = static_cast<size_t>(std::min(kWindow, end - offset));
+    void *mapping = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, file_desc,
+                          static_cast<off_t>(offset));
+    if (mapping == MAP_FAILED) return errno;
+    // Preserve dirty data: never use MS_KILLPAGES. No mapped bytes are touched.
+    const int sync_result = ::msync(mapping, length, MS_SYNC | MS_INVALIDATE);
+    const int sync_errno = sync_result == 0 ? 0 : errno;
+    const int unmap_result = ::munmap(mapping, length);
+    if (sync_errno != 0) return sync_errno;
+    if (unmap_result != 0) return errno;
+    offset += length;
+  }
+  return 0;
+}
+
+void LinuxAlignedFileReader::apple_cache_fallback(int error) {
+  apple_cache_fallback_errno_.store(error, std::memory_order_relaxed);
+  if (apple_invalidation_active_.exchange(false, std::memory_order_acq_rel)) {
+    LOG_WARN("DiskAnn Apple: requested-range cache invalidation failed "
+             "(errno=%d: %s); falling back to advisory/buffered reads; "
+             "OS file cache may be used", error, ::strerror(error));
   }
 }
 #endif
@@ -775,7 +842,7 @@ void LinuxAlignedFileReader::open(const std::string &fname) {
 
 #if defined(__APPLE__) || defined(__MACH__)
   if (this->file_desc != -1) {
-    configure_macos_reader(this->file_desc, fname);
+    configure_apple_cache(fname, true);
   }
 #endif
 
@@ -836,21 +903,26 @@ int LinuxAlignedFileReader::open_from_handle(const std::string &fname,
     return IndexError_OpenFile;
   }
 
-#if defined(__APPLE__) || defined(__MACH__)
-  if (has_independent_file_description) {
-    configure_macos_reader(duplicate_fd, fname);
-  }
-#else
+#if !defined(__APPLE__) && !defined(__MACH__)
   (void)has_independent_file_description;
 #endif
 
   file_desc = duplicate_fd;
+#if defined(__APPLE__) || defined(__MACH__)
+  configure_apple_cache(fname, has_independent_file_description);
+#endif
   LOG_INFO("Captured open DiskAnn file object: %s", fname.c_str());
   return 0;
 #endif
 }
 
 void LinuxAlignedFileReader::close() {
+#if defined(__APPLE__) || defined(__MACH__)
+  apple_invalidation_active_.store(false, std::memory_order_relaxed);
+  apple_cache_fallback_errno_.store(0, std::memory_order_relaxed);
+  apple_nocache_requested_ = false;
+  apple_page_size_ = 0;
+#endif
 #if defined(__ANDROID__)
   android_direct_active_.store(false, std::memory_order_relaxed);
   android_fallback_errno_.store(0, std::memory_order_relaxed);
@@ -906,6 +978,21 @@ int LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
   const int buffered_fd = android_buffered_fd_ >= 0 ? android_buffered_fd_
                                                    : file_desc;
   return execute_io_pread(buffered_fd, read_reqs);
+#elif defined(__APPLE__) || defined(__MACH__)
+  (void)ctx;
+  for (const auto &request : read_reqs) {
+    if (apple_invalidation_active_.load(std::memory_order_acquire)) {
+      const int error = invalidate_apple_cache_range(request);
+      if (error != 0) apple_cache_fallback(error);
+    }
+    const int ret = execute_one_pread(file_desc, request);
+    if (apple_invalidation_active_.load(std::memory_order_acquire)) {
+      const int error = invalidate_apple_cache_range(request);
+      if (error != 0) apple_cache_fallback(error);
+    }
+    if (ret != 0) return ret;
+  }
+  return 0;
 #else
   return execute_io(ctx, this->file_desc, read_reqs);
 #endif

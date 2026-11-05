@@ -33,6 +33,9 @@
 #endif
 
 #include "diskann_benchmark_counters.h"
+#if defined(__APPLE__)
+#include "../../apple_io_phase_gate.h"
+#endif
 
 namespace zvec::core_interface {
 namespace {
@@ -243,6 +246,9 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
       ASSERT_EQ(0, search(q, budget, &result));
     }
   }
+#if defined(__APPLE__)
+  testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", "query", "before");
+#endif
   const auto before_timing = BenchmarkSnapshot();
   uint64_t peak_query_rss = RssBytes();
   uint64_t correct = 0;
@@ -263,6 +269,9 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
     }
   }
   const auto after_timing = BenchmarkSnapshot();
+#if defined(__APPLE__)
+  testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", "query", "after");
+#endif
   peak_query_rss = std::max(peak_query_rss, RssBytes());
   const auto steady_rss = RssBytes();
   std::ostringstream record;

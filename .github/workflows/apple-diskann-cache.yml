@@ -1,0 +1,125 @@
+name: DiskANN Apple Cache Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diskann-apple-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: Apple cache (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64
+            runner: macos-15
+          - label: macos-intel
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build production cache strategy and regression/benchmark targets
+        run: |
+          cmake -S . -B build-apple-cache -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DENABLE_WERROR=ON \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF
+          cmake --build build-apple-cache --target diskann_apple_io_test diskann_file_reader_test diskann_platform_benchmark_test --parallel 3
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-platform-dataset
+          run-id: 41970844265
+          github-token: ${{ github.token }}
+          path: benchmark-data
+      - name: Verify cached/cold reads, safety regressions and warmed queries
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+        run: |
+          python scripts/verify_apple_diskann_io.py --probe build-apple-cache/bin/diskann_apple_io_test \
+            --regression build-apple-cache/bin/diskann_file_reader_test \
+            --benchmark build-apple-cache/bin/diskann_platform_benchmark_test \
+            --data benchmark-data --output apple-cache-results --label "$BENCH_LABEL"
+      - name: Publish cache verification
+        if: always()
+        run: |
+          if test -f apple-cache-results/verification.md; then
+            cat apple-cache-results/verification.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: apple-cache-${{ matrix.label }}
+          path: apple-cache-results/
+          retention-days: 30
+
+  ios:
+    name: Apple cache (iOS ARM64 simulator)
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build production reader and simulator regression/benchmark bundles
+        run: |
+          cmake -S . -B build-apple-cache -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DIOS=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_WERROR=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build-apple-cache --target diskann_apple_io_test diskann_mobile_compat_test diskann_platform_benchmark_test --parallel 3
+      - uses: actions/download-artifact@v8
+        with:
+          name: diskann-platform-dataset
+          run-id: 41970844265
+          github-token: ${{ github.token }}
+          path: benchmark-data
+      - name: Boot simulator
+        run: |
+          device=$(xcrun simctl list devices available -j | python -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          print(next(x["udid"] for r,ds in d["devices"].items() if "iOS" in r for x in ds if "iPhone" in x["name"]))')
+          xcrun simctl boot "$device"
+          xcrun simctl bootstatus "$device" -b
+          echo "APPLE_IO_DEVICE=$device" >> "$GITHUB_ENV"
+      - name: Verify production reads and observe simulator-process query I/O
+        run: |
+          python scripts/verify_apple_diskann_io.py --probe build-apple-cache/bin/diskann_apple_io_test.app \
+            --regression build-apple-cache/bin/diskann_mobile_compat_test.app \
+            --benchmark build-apple-cache/bin/diskann_platform_benchmark_test.app \
+            --data benchmark-data --output apple-cache-results --label ios-arm64-simulator \
+            --transport ios --device "$APPLE_IO_DEVICE"
+      - name: Publish cache verification
+        if: always()
+        run: |
+          if test -f apple-cache-results/verification.md; then
+            cat apple-cache-results/verification.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: apple-cache-ios-simulator
+          path: apple-cache-results/
+          retention-days: 30
+      - name: Shutdown simulator
+        if: always() && env.APPLE_IO_DEVICE != ''
+        run: xcrun simctl shutdown "$APPLE_IO_DEVICE"

@@ -113,7 +113,8 @@ def summarize(reports, path):
                     continue
                 def median(key):
                     return statistics.median(c["query"][key] for c in cases)
-                reads = [c["query"].get("io", {}).get("timed_read_bytes") for c in cases]
+                reads = [c["query"].get("io", {}).get("host_timed_read_bytes",
+                         c["query"].get("io", {}).get("timed_read_bytes")) for c in cases]
                 read_kb = "unavailable"
                 if all(value is not None for value in reads):
                     read_kb = f'{statistics.median(value / (c["query"]["queries"] * c["query"]["repetitions"]) / 1000 for c, value in zip(cases, reads)):.3f}'
@@ -123,7 +124,7 @@ def summarize(reports, path):
                 lines.append(f'| {label} | {algorithm} | {state} | {reset_text} | '
                              f'{median("steady_rss_bytes") / 1e6:.2f} | {median("recall_at_10"):.4f} | '
                              f'{median("p95_ms"):.3f} | {median("qps"):.1f} | {read_kb} | '
-                             f'{cases[0]["query"].get("io", {}).get("source", "unavailable")} |')
+                             f'{cases[0]["query"].get("io", {}).get("host_counter_source", cases[0]["query"].get("io", {}).get("source", "unavailable"))} |')
     lines.extend(["", "Windows transfer counters are logical, not physical-device bytes; its first-pass cache state is uncontrolled. Android reset/counters cover the guest only. iOS has no disk-byte counter in use. No-cache flags and successful reset commands do not exclude hypervisor/storage caches.",
                   "RSS is query-process memory, not total memory including kernel file cache. Index-open time/bytes, warmup bytes, timed bytes, CPU and page faults are retained in JSON. These CI results do not rank operating systems.", ""])
     path.write_text("\n".join(lines))

@@ -17,7 +17,7 @@
 
 #include <fcntl.h>
 #include <array>
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__APPLE__) || defined(__MACH__)
 #include <atomic>
 #endif
 
@@ -175,11 +175,23 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   std::atomic<int> android_fallback_errno_{0};
   int open_android_from_handle(const std::string &fname, int source_fd);
 #endif
+#if defined(__APPLE__) || defined(__MACH__)
+  size_t apple_page_size_{0};
+  bool apple_nocache_requested_{false};
+  std::atomic<bool> apple_invalidation_active_{false};
+  std::atomic<int> apple_cache_fallback_errno_{0};
+  void configure_apple_cache(const std::string &fname, bool independent);
+  void apple_cache_fallback(int error);
+#endif
 
 #if defined(__ANDROID__)
  protected:
   // A per-file capability check; unknown kernels keep the O_DIRECT attempt.
   virtual int android_direct_io_support_error(int fd) const;
+#endif
+#if defined(__APPLE__) || defined(__MACH__)
+ protected:
+  virtual int invalidate_apple_cache_range(const AlignedRead &request) const;
 #endif
 
  public:
@@ -201,6 +213,17 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   }
   int direct_io_fallback_errno() const {
     return android_fallback_errno_.load(std::memory_order_relaxed);
+  }
+#endif
+#if defined(__APPLE__) || defined(__MACH__)
+  bool cache_invalidation_requested() const {
+    return apple_invalidation_active_.load(std::memory_order_acquire);
+  }
+  bool nocache_requested() const {
+    return apple_nocache_requested_;
+  }
+  int cache_fallback_errno() const {
+    return apple_cache_fallback_errno_.load(std::memory_order_relaxed);
   }
 #endif
   void close() override;
