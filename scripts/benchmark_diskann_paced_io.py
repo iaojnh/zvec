@@ -67,7 +67,8 @@ def evaluate_probe(probe, label, rate):
     }
 
 
-def validate_query(query, algorithm, fixture, rate, label, expected_bps=None, expected_depth=None):
+def validate_query(query, algorithm, fixture, rate, label, expected_bps=None, expected_depth=None,
+                   allow_idle_limiter=False):
     if not query["fixed_budget"] or query["budget"] != fixture["budgets"][algorithm]:
         raise ValueError("Frozen query budget changed")
     if abs(query["recall_at_10"] - fixture["recall_at_10"][algorithm]) > 0.0001:
@@ -84,7 +85,8 @@ def validate_query(query, algorithm, fixture, rate, label, expected_bps=None, ex
         raise ValueError("Native bandwidth/depth configuration mismatch")
     if rate and pacing["achieved_iops"] > rate * 1.03:
         raise ValueError("Timed query exceeds configured IOPS ceiling")
-    if rate and pacing["actual_wait_ns"] <= 0:
+    if rate and pacing["actual_wait_ns"] <= 0 and not (
+            allow_idle_limiter and pacing["achieved_iops"] < rate * 0.95):
         raise ValueError("No actual pacing wait during timed queries")
     observed = query["io"].get("host_timed_read_bytes", query["io"].get("timed_read_bytes"))
     if not label.startswith("windows-") and (observed is None or observed < pacing["bytes"] * 0.90):

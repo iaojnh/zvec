@@ -35,6 +35,7 @@
 #include "diskann_benchmark_counters.h"
 #include "diskann_controlled_io.h"
 #include "diskann_paced_io.h"
+#include "diskann_concurrent_queries.h"
 #if defined(__APPLE__)
 #include "../../apple_io_phase_gate.h"
 #endif
@@ -404,6 +405,172 @@ TEST(DiskAnnPlatformBenchmark, Measure) {
 }
 
 #if defined(ZVEC_DISKANN_CONTROLLED_IO_BENCHMARK) && DISKANN_SUPPORTED
+TEST(DiskAnnConcurrentBenchmark, Measure) {
+  if (Env("ZVEC_BENCH_THREADS").empty()) GTEST_SKIP() << "Opt-in concurrent query benchmark";
+  using namespace zvec::core::benchmark;
+  const auto algorithm = Env("ZVEC_BENCH_INDEX");
+  ASSERT_TRUE(algorithm == "hnsw" || algorithm == "diskann");
+  ASSERT_EQ("query", Env("ZVEC_BENCH_MODE"));
+  ASSERT_EQ("1", Env("ZVEC_BENCH_PACED_IO"));
+  ASSERT_NE("1", Env("ZVEC_BENCH_CONTROLLED_IO"));
+  const uint32_t thread_count = static_cast<uint32_t>(std::stoul(Env("ZVEC_BENCH_THREADS")));
+  ASSERT_TRUE(thread_count == 2 || thread_count == 4 || thread_count == 8);
+  const uint32_t repetitions = static_cast<uint32_t>(std::stoul(Env("ZVEC_BENCH_REPETITIONS", "3")));
+  const uint32_t budget = static_cast<uint32_t>(std::stoul(Env("ZVEC_BENCH_FIXED_BUDGET")));
+  ASSERT_GT(repetitions, 0U);
+  ASSERT_GT(budget, 0U);
+  const auto root = Env("ZVEC_BENCH_DATA");
+  const auto base = ReadMatrix<float>(root + "/base.fbin", true);
+  const auto queries = ReadMatrix<float>(root + "/queries.fbin");
+  const auto truth = ReadMatrix<uint32_t>(root + "/neighbors.ibin");
+  const uint32_t calibration_count = 200;
+  ASSERT_GT(queries.rows, calibration_count);
+  ASSERT_EQ(base.columns, queries.columns);
+  ASSERT_EQ(queries.rows, truth.rows);
+  ASSERT_EQ(10U, truth.columns);
+  const uint32_t query_count = queries.rows - calibration_count;
+  const uint64_t total = uint64_t(query_count) * repetitions;
+  PaceConfig config;
+  config.iops = std::stoull(Env("ZVEC_BENCH_IOPS", "2000"));
+  config.bytes_per_second = std::stoull(Env("ZVEC_BENCH_PACE_BPS", "16777216"));
+  config.depth = static_cast<uint32_t>(std::stoul(Env("ZVEC_BENCH_PACE_DEPTH", "8")));
+  std::unique_ptr<NativeRateLimiter> limiter;
+  std::unique_ptr<PacedScope> scope;
+  if (algorithm == "diskann") {
+    limiter = std::make_unique<NativeRateLimiter>(config);
+    scope = std::make_unique<PacedScope>(*limiter);
+  }
+  BaseIndexParam::Pointer param;
+  if (algorithm == "diskann") {
+    param = DiskAnnIndexParamBuilder().with_dimension(base.columns)
+        .with_data_type(DataType::DT_FP32).with_metric_type(MetricType::kL2sq)
+        .with_max_degree(64).with_list_size(100).with_pq_chunk_num(base.columns / 4).build();
+  } else {
+    param = HNSWIndexParamBuilder().with_dimension(base.columns)
+        .with_data_type(DataType::DT_FP32).with_metric_type(MetricType::kL2sq)
+        .with_m(32).with_ef_construction(200).build();
+  }
+  const auto baseline_rss = RssBytes();
+  const auto before_open = BenchmarkSnapshot();
+  const auto open_start = Clock::now();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, index);
+  ASSERT_EQ(0, index->open(root + "/" + algorithm + ".index",
+                          {StorageOptions::StorageType::kMMAP, false, true}));
+  ASSERT_EQ(base.rows, index->get_doc_count());
+  const double open_ms = Milliseconds(open_start);
+  const auto after_open = BenchmarkSnapshot();
+  struct WorkerResult { std::vector<double> latencies; uint64_t correct{0}; };
+  std::vector<WorkerResult> results(thread_count);
+  std::atomic<uint32_t> active{0}, peak_active{0};
+  auto workers = std::make_unique<ConcurrentQueryWorkers>(thread_count);
+  auto workload = [&](uint32_t worker, bool timed) {
+    auto &out = results[worker];
+    if (timed) out.latencies.reserve((total + thread_count - 1) / thread_count);
+    const uint64_t count = timed ? total : query_count;
+    for (uint64_t slot = worker; slot < count; slot += thread_count) {
+      const uint32_t q = calibration_count + static_cast<uint32_t>(slot % query_count);
+      SearchResult result;
+      const auto current = active.fetch_add(1) + 1;
+      auto previous = peak_active.load();
+      while (previous < current && !peak_active.compare_exchange_weak(previous, current)) {}
+      const auto start = Clock::now();
+      int ret;
+      try {
+        BaseIndexQueryParam::Pointer query_param;
+        if (algorithm == "diskann") {
+          auto value = std::make_shared<DiskAnnQueryParam>(); value->list_size = budget; query_param = value;
+        } else {
+          auto value = std::make_shared<HNSWQueryParam>(); value->ef_search = budget; query_param = value;
+        }
+        query_param->topk = 10;
+        ret = index->search(VectorData{DenseVector{queries.values.data() + size_t(q) * base.columns}},
+                            query_param, &result);
+      } catch (...) { active.fetch_sub(1); throw; }
+      const double ms = Milliseconds(start);
+      active.fetch_sub(1);
+      if (ret || result.doc_list_.size() != 10) throw std::runtime_error("Concurrent search failed");
+      if (timed) {
+        out.latencies.push_back(ms);
+        for (const auto &doc : result.doc_list_) {
+          auto begin = truth.values.begin() + size_t(q) * 10;
+          if (std::find(begin, begin + 10, doc.key()) != begin + 10) ++out.correct;
+        }
+      }
+    }
+  };
+  const auto before_warmup = BenchmarkSnapshot();
+  ASSERT_NO_THROW(workers->Run([&](uint32_t worker) { workload(worker, false); }));
+  peak_active.store(0);
+  if (limiter) limiter->reset_peak();
+#if defined(__APPLE__)
+  testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", "query", "before");
+#endif
+  const auto before_timing = BenchmarkSnapshot();
+  const auto pace_before = limiter ? limiter->stats() : PaceStats{};
+  uint64_t peak_rss = RssBytes();
+  const auto block_start = Clock::now();
+  ASSERT_NO_THROW(workers->Run([&](uint32_t worker) { workload(worker, true); },
+                             [&] { peak_rss = std::max(peak_rss, RssBytes()); }));
+  const double wall_ms = Milliseconds(block_start);
+  const auto after_timing = BenchmarkSnapshot();
+#if defined(__APPLE__)
+  testing_util::AppleIOGate("ZVEC_BENCH_IO_CONTROL", "query", "after");
+#endif
+  const auto rss = RssBytes();  // Every worker/TLS context is still alive here.
+  peak_rss = std::max(peak_rss, rss);
+  std::vector<double> latencies;
+  uint64_t correct = 0;
+  for (const auto &out : results) {
+    latencies.insert(latencies.end(), out.latencies.begin(), out.latencies.end());
+    correct += out.correct;
+  }
+  ASSERT_EQ(total, latencies.size());
+  std::ostringstream record;
+  record << std::setprecision(12) << "{\"phase\":\"query\",\"index\":\"" << algorithm
+         << "\",\"vectors\":" << base.rows << ",\"dimension\":" << base.columns
+         << ",\"queries\":" << query_count << ",\"repetitions\":" << repetitions
+         << ",\"query_threads\":" << thread_count << ",\"max_active_queries\":" << peak_active.load()
+         << ",\"worker_queries\":[";
+  for (uint32_t worker = 0; worker < thread_count; ++worker) {
+    if (worker) record << ',';
+    record << results[worker].latencies.size();
+  }
+  record << "],\"fixed_budget\":true,\"budget\":" << budget << ",\"workload_warmup\":true"
+         << ",\"workers_alive_at_rss_sample\":" << thread_count
+         << ",\"index_open_ms\":" << open_ms << ",\"recall_at_10\":" << double(correct) / (total * 10)
+         << ",\"p50_ms\":" << Percentile(latencies, 0.50) << ",\"p95_ms\":" << Percentile(latencies, 0.95)
+         << ",\"p99_ms\":" << Percentile(latencies, 0.99) << ",\"qps\":" << total * 1000.0 / wall_ms
+         << ",\"timed_block_wall_ms\":" << wall_ms << ",\"baseline_rss_bytes\":" << baseline_rss
+         << ",\"steady_rss_bytes\":" << rss << ",\"sampled_peak_query_rss_bytes\":" << peak_rss
+         << ",\"index_rss_delta_bytes\":" << (rss > baseline_rss ? rss - baseline_rss : 0)
+         << ",\"io\":{\"source\":\"" << after_timing.source << "\",\"open_read_bytes\":";
+  BenchmarkBytes(record, before_open, after_open);
+  record << ",\"warmup_read_bytes\":"; BenchmarkBytes(record, before_warmup, before_timing);
+  record << ",\"timed_read_bytes\":"; BenchmarkBytes(record, before_timing, after_timing);
+  record << ",\"timed_cpu_seconds\":" << after_timing.cpu_seconds - before_timing.cpu_seconds
+         << ",\"timed_major_faults\":" << after_timing.major_faults - before_timing.major_faults << '}';
+  if (limiter) {
+    const auto reader = ActivePacedReader().lock();
+    ASSERT_NE(nullptr, reader);
+    const auto after = limiter->stats();
+    record << ",\"native_pacing\":{\"kind\":\"real-time-native-file-io\",\"scope\":\"process-wide\""
+           << ",\"iops_limit\":" << config.iops << ",\"bytes_per_second_limit\":" << config.bytes_per_second
+           << ",\"max_in_flight\":" << config.depth << ",\"max_reserved_reads\":" << after.max_reserved_reads
+           << ",\"reads\":" << after.reads - pace_before.reads << ",\"bytes\":" << after.bytes - pace_before.bytes
+           << ",\"batches\":" << after.batches - pace_before.batches
+           << ",\"actual_wait_ns\":" << after.wait_ns - pace_before.wait_ns
+           << ",\"depth_wait_ns\":" << after.depth_wait_ns - pace_before.depth_wait_ns
+           << ",\"achieved_iops\":" << (after.reads - pace_before.reads) * 1000.0 / wall_ms
+           << ",\"resident_backing_bytes\":0,\"cache_policy\":\"" << reader->cache_policy()
+           << "\",\"timer\":\"" << limiter->timer_kind() << "\"}";
+  }
+  record << '}';
+  workers.reset();
+  ASSERT_EQ(0, index->close());
+  BenchmarkEmit(record, Env("ZVEC_BENCH_RESULT_PATH"));
+}
+
 TEST(DiskAnnPacedIOProbe, Measure) {
   if (Env("ZVEC_BENCH_MODE") != "probe") GTEST_SKIP() << "Opt-in native pacing probe";
   using namespace zvec::core;

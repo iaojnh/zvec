@@ -5,6 +5,7 @@
 #include "benchmarks/diskann-controlled-io/io_model.h"
 #include "diskann_controlled_io.h"
 #include "diskann_paced_io.h"
+#include "diskann_concurrent_queries.h"
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -77,7 +78,9 @@ TEST(DiskAnnNativePacing, SustainsCommonRateWithoutTimerQuantumOversleep) {
 }
 class ImmediateNativeReader : public AlignedFileReader {
  public:
-  size_t largest_batch{0};
+  std::atomic<size_t> largest_batch{0};
+  std::atomic<uint32_t> active_reads{0}, peak_active_reads{0};
+  uint32_t pause_ms{0};
   bool closed{false};
   void open(const std::string &) override {}
   void close() override { closed = true; }
@@ -85,15 +88,21 @@ class ImmediateNativeReader : public AlignedFileReader {
   void release_io_ctx(IOContext &) override {}
   int read(std::vector<AlignedRead> &, IOContext &, bool = false) override { return -1; }
   int submit(PendingBatch &batch, std::vector<AlignedRead> &requests, IOContext &) override {
-    largest_batch = std::max(largest_batch, requests.size());
+    auto previous = largest_batch.load();
+    while (previous < requests.size() && !largest_batch.compare_exchange_weak(previous, requests.size())) {}
     batch.n_submitted = static_cast<uint32_t>(requests.size());
     batch.n_reaped = 0;
+    const auto active = active_reads.fetch_add(batch.n_submitted) + batch.n_submitted;
+    auto peak = peak_active_reads.load();
+    while (peak < active && !peak_active_reads.compare_exchange_weak(peak, active)) {}
+    if (pause_ms) std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
     for (const auto &r : requests) std::memset(r.buf, static_cast<int>(r.offset % 251), r.len);
     return 0;
   }
   int get_completed(PendingBatch &batch, IOContext &, int, std::vector<uint32_t> &completed) override {
     completed.clear();
     while (batch.n_reaped < batch.n_submitted) completed.push_back(batch.n_reaped++);
+    active_reads.fetch_sub(static_cast<uint32_t>(completed.size()));
     return static_cast<int>(completed.size());
   }
 };
@@ -119,11 +128,64 @@ TEST(DiskAnnNativePacing, SplitsNativeBatchesAndPreservesCompletionIndices) {
     EXPECT_EQ(i, seen[i]);
     EXPECT_EQ(static_cast<char>((i * 4096) % 251), data[i * 4096]);
   }
-  EXPECT_LE(native->largest_batch, 4U);
+  EXPECT_LE(native->largest_batch.load(), 4U);
   EXPECT_EQ(17U, limiter.stats().reads);
   EXPECT_EQ(5U, limiter.stats().batches);
   reader.close();
   EXPECT_TRUE(native->closed);
+}
+TEST(DiskAnnNativePacing, ConcurrentWorkersShareOneRateAndDepthBudget) {
+  for (const auto config : {PaceConfig{1000, 0, 8}, PaceConfig{0, 4096000, 8}, PaceConfig{0, 0, 8}}) {
+  auto native = std::make_shared<ImmediateNativeReader>();
+  native->pause_ms = 2;
+  NativeRateLimiter limiter(config);
+  RateLimitedReader reader(native, limiter);
+  ConcurrentQueryWorkers workers(8);
+  std::atomic<uint32_t> successful{0};
+  const auto start = PaceClock::now();
+  workers.Run([&](uint32_t worker) {
+    alignas(4096) std::array<char, 8192> data{};
+    IOContext ctx = nullptr;
+    for (uint32_t i = 0; i < 16; ++i) {
+      std::vector<AlignedRead> requests{
+          AlignedRead(uint64_t(worker * 32 + i * 2) * 4096, 4096, data.data()),
+          AlignedRead(uint64_t(worker * 32 + i * 2 + 1) * 4096, 4096, data.data() + 4096)};
+      if (reader.read(requests, ctx) || data[0] != static_cast<char>(requests[0].offset % 251) ||
+          data[4096] != static_cast<char>(requests[1].offset % 251))
+        throw std::runtime_error("Concurrent native payload/completion mismatch");
+      successful.fetch_add(2);
+    }
+  });
+  const auto seconds = std::chrono::duration<double>(PaceClock::now() - start).count();
+  EXPECT_EQ(256U, successful.load());
+  EXPECT_EQ(256U, limiter.stats().reads);
+  EXPECT_EQ(256U * 4096, limiter.stats().bytes);
+  if (config.iops || config.bytes_per_second)
+    EXPECT_GE(seconds, 0.23);  // Neither rate budget may multiply by eight.
+  EXPECT_LE(limiter.stats().max_reserved_reads, 8U);
+  EXPECT_LE(native->peak_active_reads.load(), 8U);
+  EXPECT_EQ(0U, native->active_reads.load());
+  if (config.iops || config.bytes_per_second) EXPECT_GT(limiter.stats().wait_ns, 0U);
+  reader.close();
+  }
+}
+TEST(DiskAnnConcurrentWorkers, ExecuteTogetherAndRetainThreadsAcrossPhases) {
+  ConcurrentQueryWorkers workers(4);
+  std::mutex mutex;
+  std::condition_variable all_entered;
+  uint32_t entered = 0;
+  std::array<std::thread::id, 4> first{};
+  workers.Run([&](uint32_t worker) {
+    first[worker] = std::this_thread::get_id();
+    std::unique_lock<std::mutex> lock(mutex);
+    ++entered;
+    all_entered.notify_all();
+    if (!all_entered.wait_for(lock, std::chrono::seconds(3), [&] { return entered == 4; }))
+      throw std::runtime_error("Query workers serialized unexpectedly");
+  });
+  std::array<std::thread::id, 4> second{};
+  workers.Run([&](uint32_t worker) { second[worker] = std::this_thread::get_id(); });
+  EXPECT_EQ(first, second);
 }
 TEST(DiskAnnIOModel, PayloadCompletionLifecycleAndBounds) {
   const auto path = testing::TempDir() + "zvec-controlled-" + std::to_string(
