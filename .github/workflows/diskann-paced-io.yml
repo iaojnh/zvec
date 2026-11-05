@@ -19,7 +19,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: diskann-paced-io-${{ github.ref }}
+  group: diskann-paced-io-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 env:
