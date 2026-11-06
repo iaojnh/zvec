@@ -455,6 +455,11 @@ class Collection:
 
         Returns:
             dict[str, Doc]: Mapping from ID to document. Missing IDs are omitted.
+
+        Raises:
+            MemoryError: With mmap disabled, native input copies, temporary
+                workspace, or returned payloads exceed the shared memory
+                budget. Retry with smaller batches or fewer output fields.
         """
         ids = [ids] if isinstance(ids, str) else ids
         docs = self._obj.FetchTuples(ids, output_fields, include_vector)

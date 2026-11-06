@@ -242,6 +242,105 @@ def test_failed_wrapper_does_not_keep_materialization_lock(tmp_path):
     run_worker("exception", path, "VECTOR_FP32", False, 64, 8)
 
 
+def verify_fetch_inputs(path, kind, mmap, dimension, count):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+
+    # Input copies must be admitted even when every lookup misses. Repeating
+    # one Python string also keeps the caller's own heap small in this test.
+    oversized = ["missing"] * 200_000
+    for fetch in (coll.fetch, coll._obj.Fetch):
+        with pytest.raises(MemoryError):
+            fetch(oversized)
+        with pytest.raises(MemoryError):
+            fetch(["0"], output_fields=["payload"] * 200_000)
+        with pytest.raises(MemoryError):
+            fetch(["x" * (8 * 1024 * 1024)])
+        assert fetch(["0", "missing", "0"])["0"] is not None
+
+    for include_vector in (False, True):
+        # These input copies fit. Unique IDs additionally need hash nodes and
+        # bucket growth, whereas duplicates require only one hash entry.
+        assert (
+            coll.fetch(["missing000000"] * 70_000, include_vector=include_vector) == {}
+        )
+        # With the shared allowance nearly full, either the next hash growth
+        # or native batch admission can be the first to reject the request.
+        with pytest.raises(MemoryError):
+            coll.fetch(
+                [f"missing{i:06d}" for i in range(70_000)],
+                include_vector=include_vector,
+            )
+        assert (
+            coll.fetch(
+                [f"missing{i}" for i in range(2_000)], include_vector=include_vector
+            )
+            == {}
+        )
+
+    # Retaining tiny results must not retain each call's large input lease.
+    held = [coll.fetch(["0"] * 10_000) for _ in range(16)]
+    assert all(set(docs) == {"0"} for docs in held)
+    held.clear()
+
+    def recover(_):
+        with pytest.raises(MemoryError):
+            coll.fetch(oversized)
+        return set(coll.fetch(["0", "1", "0"]))
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        assert all(keys == {"0", "1"} for keys in workers.map(recover, range(16)))
+    coll.close()
+
+
+def verify_fetch_iterables(path, kind, mmap, dimension, count):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    for fetch in (coll.fetch, coll._obj.Fetch):
+        docs = fetch(("0", b"1", bytearray(b"0"), "中文🙂\0missing"))
+        assert {key for key, doc in docs.items() if doc is not None} == {"0", "1"}
+        assert set(fetch((str(i % 8) for i in range(1_024)))) == set(map(str, range(8)))
+        assert set(fetch(["0"], output_fields=(name for name in ["payload"]))) == {"0"}
+
+        def reentrant_ids():
+            # Input iteration must not hold the materialization mutex while
+            # executing caller code, which may itself fetch from the database.
+            assert set(fetch(["1"])) == {"1"}
+            yield "0"
+
+        assert set(fetch(reentrant_ids())) == {"0"}
+
+        consumed = 0
+
+        def oversized_ids():
+            nonlocal consumed
+            for _ in range(200_000):
+                consumed += 1
+                yield "missing"
+
+        with pytest.raises(MemoryError):
+            fetch(oversized_ids())
+        assert consumed < 200_000
+
+        def failing_ids():
+            yield "0"
+            raise RuntimeError("injected input iteration failure")
+
+        with pytest.raises(RuntimeError, match="input iteration failure"):
+            fetch(failing_ids())
+        with pytest.raises(TypeError):
+            fetch([object()])
+        assert set(fetch(["0"])) == {"0"}
+    coll.close()
+
+
+@pytest.mark.parametrize("mode", ["inputs", "iterables"])
+def test_fetch_input_and_workspace_admission(tmp_path, mode):
+    path = tmp_path / mode
+    run_worker("build", path, "VECTOR_FP32", False, 64, 8)
+    run_worker(mode, path, "VECTOR_FP32", False, 64, 8)
+
+
 if __name__ == "__main__":
     action, target, vector_kind, use_mmap, dim, rows = sys.argv[1:]
     worker = {
@@ -249,5 +348,7 @@ if __name__ == "__main__":
         "verify": verify,
         "retained": verify_retained,
         "exception": verify_exception,
+        "inputs": verify_fetch_inputs,
+        "iterables": verify_fetch_iterables,
     }[action]
     worker(Path(target), vector_kind, bool(int(use_mmap)), int(dim), int(rows))

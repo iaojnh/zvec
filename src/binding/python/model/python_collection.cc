@@ -26,6 +26,7 @@
 #include "db/collection_query_internal.h"
 #include "db/common/result_memory_allowance.h"
 #include "python_doc.h"
+#include "python_fetch_memory.h"
 
 namespace zvec {
 
@@ -540,15 +541,15 @@ void fetch_chunk_for_python(
 // GIL, including on error/DDL paths. Budgeted calls acquire the materialization
 // slot before reading a native chunk, so waiting calls retain neither Docs
 // nor partially accumulated Python dictionaries. Mmap reads remain concurrent.
-py::dict fetch_for_python(
-    const Collection &collection, const std::vector<std::string> &pks,
-    const std::optional<std::vector<std::string>> &output_fields,
-    bool include_vector) {
-  auto initial = fetch_snapshot_for_python(collection, {}, output_fields,
-                                           include_vector, nullptr);
-  const auto schema = std::move(initial.schema);
+py::dict fetch_for_python(const Collection &collection, py::handle ids,
+                          py::handle fields, bool include_vector) try {
   const bool budgeted = !unwrap_expected(collection.options()).enable_mmap_ &&
                         ailego::MemoryLimitPool::get_instance().capacity();
+  auto *owner = budgeted ? &forward_result_allowance() : nullptr;
+  // Iterables can execute Python (including a nested Fetch). Convert them
+  // before taking the materialization slot; concurrent copies still share
+  // the same admission limit and keep their input leases while waiting.
+  detail::PythonFetchInputs inputs(ids, fields, owner);
   auto allowance = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       budgeted ? &forward_result_allowance() : nullptr,
       /*serialize_materialization=*/true, kPythonResultBackingQuantum);
@@ -556,18 +557,50 @@ py::dict fetch_for_python(
     py::gil_scoped_release release;
     allowance->begin_materialization();
   }
+  const auto &pks = inputs.pks;
+  const auto &output_fields = inputs.output_fields;
+  auto initial = fetch_snapshot_for_python(collection, {}, output_fields,
+                                           include_vector, nullptr);
+  const auto schema = std::move(initial.schema);
   py::dict out;
   // Columnar results remain charged; don't shrink them to Doc-sized chunks.
   const size_t batch_rows = initial.forward ? 256 : 32;
-  std::unordered_set<std::string_view> seen;
+  detail::ResultMemoryAllowance::Lease routing_memory(owner);
+  using SeenAllocator = detail::FetchWorkspaceAllocator<std::string_view>;
+  std::unordered_set<std::string_view, std::hash<std::string_view>,
+                     std::equal_to<std::string_view>, SeenAllocator>
+      seen(0, std::hash<std::string_view>{}, std::equal_to<std::string_view>{},
+           SeenAllocator(&routing_memory));
   size_t begin = 0;
   do {
+    detail::ResultMemoryAllowance::Lease batch_memory(owner);
     std::vector<std::string> batch;
-    batch.reserve(std::min(batch_rows, pks.size() - begin));
-    while (begin < pks.size() && batch.size() < batch_rows) {
-      const auto &pk = pks[begin++];
-      if (seen.emplace(pk).second) {
-        batch.push_back(pk);
+    {
+      // Hash growth and admission may reclaim native cache pages. Hold no
+      // Python or database lock, and keep the full input alive for the views.
+      py::gil_scoped_release release;
+      const size_t rows = std::min(batch_rows, pks.size() - begin);
+      batch_memory.add(detail::FetchMemoryBytes(rows, 3 * sizeof(std::string)));
+      batch.reserve(rows);
+      constexpr size_t kBatchBytes = 1024 * 1024;
+      size_t bytes = 0;
+      while (begin < pks.size() && batch.size() < batch_rows) {
+        const auto &pk = pks[begin];
+        // One wide ID can exceed the batching hint only after admission.
+        if (!batch.empty() &&
+            pk.size() > kBatchBytes - std::min(bytes, kBatchBytes))
+          break;
+        ++begin;
+        // Some unordered_set implementations allocate before checking an
+        // emplaced duplicate. Avoid charging discarded nodes per occurrence.
+        if (seen.find(pk) == seen.end()) {
+          seen.emplace(std::string_view(pk));
+          // Adaptive Arrow splitting keeps the original batch and recursively
+          // copies halves. Their total overlap is less than three batches.
+          batch_memory.add(detail::FetchMemoryBytes(pk.size(), 3, 192));
+          batch.push_back(pk);
+          bytes = detail::FetchMemoryBytes(1, pk.size(), bytes);
+        }
       }
     }
     fetch_chunk_for_python(collection, batch, output_fields, include_vector,
@@ -575,6 +608,12 @@ py::dict fetch_for_python(
   } while (begin < pks.size());
   retain_result_memory(out, allowance);
   return out;
+} catch (const std::bad_alloc &) {
+  PyErr_SetString(
+      PyExc_MemoryError,
+      "Insufficient shared budget for Python fetch inputs or workspace; "
+      "reduce fetch batch bytes or concurrent requests");
+  throw py::error_already_set();
 }
 
 void ZVecPyCollection::Initialize(pybind11::module_ &m) {
@@ -870,13 +909,23 @@ are returned as None.
            })
       .def(
           "Fetch",
-          [](const Collection &self, const std::vector<std::string> &pks,
-             const std::optional<std::vector<std::string>> &output_fields,
+          [](const Collection &self, py::handle pks, py::handle output_fields,
              bool include_vector) {
+            const bool budgeted =
+                !unwrap_expected(self.options()).enable_mmap_ &&
+                ailego::MemoryLimitPool::get_instance().capacity();
+            auto *owner = budgeted ? &forward_result_allowance() : nullptr;
+            detail::PythonFetchInputs inputs(pks, output_fields, owner);
+            detail::ResultMemoryAllowance::Lease materialization(owner, true);
+            {
+              py::gil_scoped_release release;
+              materialization.begin_materialization();
+            }
             Result<DocPtrMap> result;
             {
               py::gil_scoped_release release;
-              result = self.fetch(pks, output_fields, include_vector);
+              result =
+                  self.fetch(inputs.pks, inputs.output_fields, include_vector);
             }
             // return DocPtrMap
             return unwrap_expected(std::move(result));
