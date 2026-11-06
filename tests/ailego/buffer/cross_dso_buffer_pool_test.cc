@@ -13,10 +13,10 @@
 // limitations under the License.
 
 #include <cstddef>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
-#include <zvec/ailego/pattern/scope_guard.h>
 
 extern "C" {
 void *zvec_test_dso_memory_limit_pool();
