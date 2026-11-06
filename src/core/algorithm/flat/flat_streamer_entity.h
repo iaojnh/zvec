@@ -461,7 +461,7 @@ class FlatStreamerEntity {
     const IndexStorage::SegmentData write{0, sizeof(block), &block};
     if (!hd_segment->write_batch(&write, 1)) {
       LOG_ERROR("Failed to write head block location");
-      return IndexError_WriteData;
+      return hd_segment->write_error();
     }
 
     return 0;

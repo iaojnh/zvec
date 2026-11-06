@@ -115,6 +115,16 @@ bool UnmapMemory(void *base, size_t size) {
 #endif
 }
 
+bool ReleaseMappingTail(void *tail, size_t size) {
+#if defined(_WIN32)
+  // The reservation stays intact until Free. Decommitting returns the
+  // physical backing without relocating the live prefix.
+  return ::VirtualFree(tail, size, MEM_DECOMMIT) != 0;
+#else
+  return UnmapMemory(tail, size);
+#endif
+}
+
 }  // namespace
 
 struct alignas(64) ParquetMemoryPool::SmallChunk {
@@ -298,10 +308,9 @@ arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
   if (old_size == new_size) {
     return arrow::Status::OK();
   }
-#if !defined(_WIN32)
-  // Shrinking a mapping must not copy its live prefix into a second mapping.
-  // Keep the address/alignment and return only complete trailing OS pages.
-  // Windows MEM_RELEASE cannot release just the tail of a reservation.
+  // Keep the address and alignment while returning complete trailing pages.
+  // A shrink must be able to make progress under the same pressure that
+  // prevents admitting another mapping.
   auto &budget = ailego::MemoryLimitPool::get_instance();
   if (old_size >= kMappedAllocationThreshold &&
       new_size >= kMappedAllocationThreshold && new_size < old_size &&
@@ -323,7 +332,7 @@ arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
       const size_t released = header->size - mapped_size;
       if (released) {
         auto *tail = static_cast<uint8_t *>(header->base) + mapped_size;
-        if (!UnmapMemory(tail, released)) {
+        if (!ReleaseMappingTail(tail, released)) {
           return arrow::Status::IOError("Cannot shrink Parquet mapping");
         }
         // Refund backing only after it has actually been unmapped.
@@ -338,7 +347,6 @@ arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
       return arrow::Status::OK();
     }
   }
-#endif
   if (!enforce_budget_ && old_size != 0 &&
       old_size < kMappedAllocationThreshold &&
       new_size < kMappedAllocationThreshold) {

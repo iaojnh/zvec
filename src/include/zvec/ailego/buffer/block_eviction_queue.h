@@ -337,7 +337,13 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   // After committing bytes, their owner releases them through the pool.
   class PendingAllocation {
    public:
-    enum class Kind { kExternal, kWorkspace, kMetadata, kLockedMetadata };
+    enum class Kind {
+      kExternal,
+      kWorkspace,
+      kMetadata,
+      kLockedMetadata,
+      kLockedExternal,
+    };
 
     PendingAllocation(MemoryLimitPool &pool, Kind kind);
     PendingAllocation(const PendingAllocation &) = delete;
@@ -553,7 +559,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter,
                                   Backing backing = Backing::kLive,
                                   size_t materialization = 0);
-  bool try_charge_locked_metadata(size_t bytes, Backing backing);
+  bool try_charge_locked(size_t bytes, std::atomic<size_t> *counter,
+                         Backing backing);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter,
                      Backing backing = Backing::kLive);
   bool is_cacheable_buffer_size(size_t buffer_size);

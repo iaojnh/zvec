@@ -42,8 +42,9 @@ class GeneratedHnsw : public Entity {
   int get_vector(const node_id_t *, uint32_t, const void **) const override {
     return IndexError_NotImplemented;
   }
-  int get_vector(const node_id_t *, uint32_t,
-                 std::vector<IndexStorage::MemoryBlock> &) const override {
+  int get_vector(
+      const node_id_t *, uint32_t,
+      ailego::BudgetedVector<IndexStorage::MemoryBlock> &) const override {
     return IndexError_NotImplemented;
   }
   const Neighbors get_neighbors(level_t level, node_id_t id) const override {

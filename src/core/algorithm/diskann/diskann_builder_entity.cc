@@ -330,14 +330,15 @@ int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) try {
     const uint32_t neighbor_count = 0;
     if (state.vectors->write(
             state.vector_prefix + doc_cnt() * state.vector_stride, vec,
-            vector_size) != vector_size ||
-        state.graph->write(doc_cnt() * neighbor_size_, &neighbor_count,
-                           sizeof(neighbor_count)) != sizeof(neighbor_count)) {
-      return IndexError_WriteData;
-    }
-    if (!state.keys || state.keys->write(doc_cnt() * sizeof(key), &key,
-                                         sizeof(key)) != sizeof(key))
-      return IndexError_WriteData;
+            vector_size) != vector_size)
+      return state.vectors->write_error();
+    if (state.graph->write(doc_cnt() * neighbor_size_, &neighbor_count,
+                           sizeof(neighbor_count)) != sizeof(neighbor_count))
+      return state.graph->write_error();
+    if (!state.keys) return IndexError_WriteData;
+    if (state.keys->write(doc_cnt() * sizeof(key), &key, sizeof(key)) !=
+        sizeof(key))
+      return state.keys->write_error();
     ++*mutable_doc_cnt();
     return 0;
   }
@@ -460,7 +461,7 @@ int DiskAnnBuilderEntity::read_neighbors(
   const size_t offset = static_cast<size_t>(id) * neighbor_size_;
   uint32_t count = 0;
   if (segment->fetch(offset, &count, sizeof(count)) != sizeof(count)) {
-    return IndexError_ReadData;
+    return segment->read_error();
   }
   if (count > max_build_degree_) return IndexError_ReadData;
   neighbors->resize(count);
@@ -468,7 +469,7 @@ int DiskAnnBuilderEntity::read_neighbors(
   if (size != 0 &&
       segment->fetch(offset + sizeof(count), neighbors->data(), size) != size) {
     neighbors->clear();
-    return IndexError_ReadData;
+    return segment->read_error();
   }
   if (std::any_of(
           neighbors->begin(), neighbors->end(),
@@ -508,7 +509,7 @@ int DiskAnnBuilderEntity::set_neighbors(
           neighbor_ids.data()},
          {offset, sizeof(count), &count}}};
     if (!segment->write_batch(writes.data(), writes.size()))
-      return IndexError_WriteData;
+      return segment->write_error();
     observe_degree(count);
     return 0;
   }
@@ -532,7 +533,7 @@ int DiskAnnBuilderEntity::add_neighbor(diskann_id_t id,
     const size_t offset = static_cast<size_t>(id) * neighbor_size_;
     uint32_t count = 0;
     if (segment->fetch(offset, &count, sizeof(count)) != sizeof(count)) {
-      return IndexError_ReadData;
+      return segment->read_error();
     }
     if (count >= max_build_degree_) return IndexError_InvalidArgument;
     const uint32_t next_count = count + 1;
@@ -541,7 +542,7 @@ int DiskAnnBuilderEntity::add_neighbor(diskann_id_t id,
           sizeof(neighbor_id), &neighbor_id},
          {offset, sizeof(next_count), &next_count}}};
     if (!segment->write_batch(writes.data(), writes.size()))
-      return IndexError_WriteData;
+      return segment->write_error();
     observe_degree(next_count);
     return 0;
   }

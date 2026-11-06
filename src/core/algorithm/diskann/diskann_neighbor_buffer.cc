@@ -19,6 +19,8 @@
 #include <memory>
 #include <new>
 #include <ailego/utility/memory_helper.h>
+#include <zvec/ailego/io/file.h>
+#include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_error.h>
 
 #if defined(_WIN32)
@@ -28,9 +30,6 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
-#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
-#define MAP_ANONYMOUS MAP_ANON
-#endif
 #endif
 
 namespace zvec {
@@ -51,22 +50,27 @@ DiskAnnNeighborBuffer::~DiskAnnNeighborBuffer() {
 int DiskAnnNeighborBuffer::allocate(size_t bytes) {
   size_t rounded;
   if (!RoundToPages(bytes, &rounded)) return IndexError_Overflow;
-  if (rounded == 0) {
-    clear();
-    return 0;
-  }
-#if defined(_WIN32)
-  void *ptr = ::VirtualAlloc(nullptr, rounded, MEM_RESERVE | MEM_COMMIT,
-                             PAGE_READWRITE);
-  if (!ptr) return IndexError_NoMemory;
-#else
-  void *ptr = ::mmap(nullptr, rounded, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (ptr == MAP_FAILED) return IndexError_NoMemory;
-#endif
-  clear();
-  data_ = static_cast<char *>(ptr);
-  size_ = rounded;
+  if (rounded == 0) return release_mapping() ? 0 : IndexError_Runtime;
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t charge = pool.capacity() ? rounded : 0;
+  using Pending = ailego::MemoryLimitPool::PendingAllocation;
+  // The owning graph may be holding its chunk lock. Reclaim idle backing
+  // only, so admission cannot reenter an eviction owner from under the lock.
+  Pending pending(pool, Pending::Kind::kLockedExternal);
+  if (!pending.reserve(charge)) return IndexError_NoMemory;
+  DiskAnnNeighborBuffer replacement;
+  replacement.data_ = static_cast<char *>(ailego::File::MemoryMap(rounded, 0));
+  if (!replacement.data_) return IndexError_NoMemory;
+  pending.commit();
+  replacement.size_ = rounded;
+  replacement.charged_bytes_ = charge;
+
+  // Keep the old owner intact if its mapping cannot be released.
+  if (!release_mapping()) return IndexError_Runtime;
+  std::swap(data_, replacement.data_);
+  std::swap(size_, replacement.size_);
+  std::swap(charged_bytes_, replacement.charged_bytes_);
   return 0;
 }
 
@@ -75,10 +79,7 @@ int DiskAnnNeighborBuffer::shrink(size_t bytes) {
   if (!RoundToPages(bytes, &rounded)) return IndexError_Overflow;
   if (rounded > size_) return IndexError_InvalidLength;
   if (rounded == size_) return 0;
-  if (rounded == 0) {
-    clear();
-    return 0;
-  }
+  if (rounded == 0) return release_mapping() ? 0 : IndexError_Runtime;
 #if defined(_WIN32)
   // Keep the reservation until clear(); only committed pages consume memory.
   if (!::VirtualFree(data_ + rounded, size_ - rounded, MEM_DECOMMIT)) {
@@ -89,19 +90,28 @@ int DiskAnnNeighborBuffer::shrink(size_t bytes) {
     return IndexError_Runtime;
   }
 #endif
+  const size_t refund = charged_bytes_ ? size_ - rounded : 0;
+  charged_bytes_ -= refund;
   size_ = rounded;
+  if (refund) ailego::MemoryLimitPool::get_instance().release_external(refund);
   return 0;
 }
 
-void DiskAnnNeighborBuffer::clear() {
-  if (!data_) return;
-#if defined(_WIN32)
-  ::VirtualFree(data_, 0, MEM_RELEASE);
-#else
-  ::munmap(data_, size_);
-#endif
+bool DiskAnnNeighborBuffer::release_mapping() {
+  if (!data_) return true;
+  if (!ailego::File::TryMemoryUnmap(data_, size_)) {
+    LOG_ERROR("Failed to unmap DiskANN neighbor backing; size=%zu", size_);
+    return false;
+  }
+  if (charged_bytes_)
+    ailego::MemoryLimitPool::get_instance().release_external(charged_bytes_);
   data_ = nullptr;
-  size_ = 0;
+  size_ = charged_bytes_ = 0;
+  return true;
+}
+
+void DiskAnnNeighborBuffer::clear() {
+  (void)release_mapping();
 }
 
 struct DiskAnnNeighborPool::Row {
@@ -111,7 +121,14 @@ struct DiskAnnNeighborPool::Row {
 };
 
 struct DiskAnnNeighborPool::Chunk {
+  static void destroy(Chunk *chunk) {
+    const size_t charge = chunk->charged_bytes;
+    delete chunk;
+    if (charge) ailego::MemoryLimitPool::get_instance().release_external(charge);
+  }
+
   DiskAnnNeighborBuffer buffer;
+  size_t charged_bytes{0};
   Chunk *prev{nullptr};
   Chunk *next{nullptr};
   Chunk *available_prev{nullptr};
@@ -137,8 +154,8 @@ int DiskAnnNeighborPool::reserve(size_t nodes, uint32_t max_degree) {
           sizeof(uint32_t))
     return IndexError_Overflow;
   if (nodes > rows_.max_size()) return IndexError_Overflow;
-  std::vector<uint8_t *> rows;
-  std::vector<Chunk *> available;
+  ailego::BudgetedVector<uint8_t *> rows;
+  ailego::BudgetedVector<Chunk *> available;
   const size_t classes =
       (static_cast<size_t>(max_degree) - 1) / kCapacityStep + 1;
   try {
@@ -191,8 +208,16 @@ DiskAnnNeighborPool::Row *DiskAnnNeighborPool::acquire(uint32_t id,
   std::lock_guard<std::mutex> lock(mutex_);
   Chunk *chunk = available_[bucket];
   if (!chunk) {
-    std::unique_ptr<Chunk> next(new (std::nothrow) Chunk);
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    const size_t charge = pool.capacity() ? sizeof(Chunk) : 0;
+    using Pending = ailego::MemoryLimitPool::PendingAllocation;
+    Pending pending(pool, Pending::Kind::kLockedExternal);
+    if (!pending.reserve(charge)) return nullptr;
+    std::unique_ptr<Chunk, decltype(&Chunk::destroy)> next(
+        new (std::nothrow) Chunk, &Chunk::destroy);
     if (!next) return nullptr;
+    pending.commit();
+    next->charged_bytes = charge;
     next->bucket = bucket;
     next->capacity = static_cast<uint32_t>(std::min<uint64_t>(
         (uint64_t{bucket} + 1) * kCapacityStep, max_degree_));
@@ -252,7 +277,7 @@ void DiskAnnNeighborPool::release(Row *row) {
     if (chunk->next) chunk->next->prev = chunk->prev;
     mapped_bytes_ -= chunk->buffer.size();
     --chunk_count_;
-    delete chunk;
+    Chunk::destroy(chunk);
   }
 }
 
@@ -361,11 +386,11 @@ void DiskAnnNeighborPool::clear() {
   std::lock_guard<std::mutex> lock(mutex_);
   while (chunks_) {
     Chunk *next = chunks_->next;
-    delete chunks_;
+    Chunk::destroy(chunks_);
     chunks_ = next;
   }
-  std::vector<uint8_t *>().swap(rows_);
-  std::vector<Chunk *>().swap(available_);
+  decltype(rows_)().swap(rows_);
+  decltype(available_)().swap(available_);
   max_degree_ = 0;
   chunk_bytes_ = mapped_bytes_ = chunk_count_ = 0;
   compacted_ = false;

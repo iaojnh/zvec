@@ -792,8 +792,11 @@ class ZVEC_AILEGO_API VecBufferPool {
                        bool *allocation_failed);
   PageWriteStatus write_range_status(size_t file_offset, size_t length,
                                      const char *src);
+  PageWriteStatus write_fragments_status(const VecBufferWriteFragment *fragments,
+                                         size_t count);
   bool acquire_pages_impl(const block_id_t *page_ids, size_t count,
-                          char **pages, int retry);
+                          char **pages, int retry,
+                          bool *allocation_failed = nullptr);
   void prefetch_pages_sync(block_id_t first_page, size_t page_count,
                            uint8_t priority);
   bool load_pages_aio(const block_id_t *page_ids, size_t count,
@@ -929,6 +932,8 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
                                      const char *src);
 
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
+  PageWriteStatus write_fragments_status(const VecBufferWriteFragment *fragments,
+                                         size_t count);
 
   int write_meta(size_t offset, size_t length, const char *buffer);
 

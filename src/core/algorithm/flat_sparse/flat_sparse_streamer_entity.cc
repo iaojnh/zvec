@@ -795,10 +795,8 @@ int FlatSparseStreamerEntity::write_sparse_offset_to_chunk(
   std::memcpy(record + 2 * sizeof(uint64_t), &node_id, sizeof(node_id));
   const IndexStorage::SegmentData write{sparse_offset_chunk_offset,
                                         sizeof(record), record};
-  return sparse_offset_chunks_[sparse_offset_chunk_index]->write_batch(&write,
-                                                                       1)
-             ? 0
-             : IndexError_WriteData;
+  const auto &segment = sparse_offset_chunks_[sparse_offset_chunk_index];
+  return segment->write_batch(&write, 1) ? 0 : segment->write_error();
 }
 
 uint64_t FlatSparseStreamerEntity::get_key(node_id_t node_id) const {

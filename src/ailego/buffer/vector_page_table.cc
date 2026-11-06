@@ -1815,7 +1815,8 @@ bool VecBufferPool::acquire_pages(const block_id_t *page_ids, size_t count,
 }
 
 bool VecBufferPool::acquire_pages_impl(const block_id_t *page_ids, size_t count,
-                                       char **pages, int retry) {
+                                       char **pages, int retry,
+                                       bool *allocation_failed) {
   if (count == 0) return true;
   if (!page_ids || !pages) return false;
 
@@ -1856,7 +1857,8 @@ bool VecBufferPool::acquire_pages_impl(const block_id_t *page_ids, size_t count,
     // A batch caller can roll back and use its direct-I/O fallback. Keep only
     // one bounded foreground reclaim attempt here so a capacity miss does not
     // leave the page in kLoadingRefCount while scanning the global queue.
-    pages[i] = acquire_buffer(page_ids[i], retry, /*record_reuse=*/false);
+    pages[i] = acquire_buffer(page_ids[i], retry, /*record_reuse=*/false,
+                              allocation_failed);
     if (!pages[i]) {
       for (size_t j = 0; j < count; ++j) {
         if (pages[j]) {
@@ -2168,11 +2170,17 @@ PageWriteStatus VecBufferPool::write_range_status(size_t file_offset,
 
 int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
                                    size_t count) {
+  const auto status = write_fragments_status(fragments, count);
+  return status == PageWriteStatus::kOk ? 0 : -1;
+}
+
+PageWriteStatus VecBufferPool::write_fragments_status(
+    const VecBufferWriteFragment *fragments, size_t count) {
   if (!writable_ || (count != 0 && fragments == nullptr)) {
-    return -1;
+    return PageWriteStatus::kError;
   }
   if (count == 0) {
-    return 0;
+    return PageWriteStatus::kOk;
   }
 
   size_t page_id = std::numeric_limits<size_t>::max();
@@ -2185,7 +2193,7 @@ int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
     }
     if (fragment.src == nullptr || fragment.file_offset > file_size_ ||
         fragment.length > file_size_ - fragment.file_offset) {
-      return -1;
+      return PageWriteStatus::kError;
     }
     const size_t fragment_page = fragment.file_offset / kVectorPageSize;
     const size_t offset_in_page = fragment.file_offset % kVectorPageSize;
@@ -2197,7 +2205,7 @@ int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
     has_data = true;
   }
   if (!has_data) {
-    return 0;
+    return PageWriteStatus::kOk;
   }
 
   if (!single_page) try {
@@ -2220,7 +2228,12 @@ int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
         for (size_t i = 0; i < ids.size(); ++i)
           if (pages[i]) page_table_.release_block(ids[i]);
       });
-      if (!acquire_pages(ids.data(), ids.size(), pages.data())) return -1;
+      bool allocation_failed = false;
+      if (!acquire_pages_impl(ids.data(), ids.size(), pages.data(), 50,
+                              &allocation_failed)) {
+        return allocation_failed ? PageWriteStatus::kNoMemory
+                                 : PageWriteStatus::kError;
+      }
       for (size_t i = 0; i < count; ++i) {
         const auto &fragment = fragments[i];
         size_t copied = 0;
@@ -2239,14 +2252,17 @@ int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
           copied += bytes;
         }
       }
-      return 0;
+      return PageWriteStatus::kOk;
     } catch (const std::bad_alloc &) {
-      return -1;
+      return PageWriteStatus::kNoMemory;
     }
 
-  char *page = acquire_buffer(static_cast<block_id_t>(page_id), 50);
+  bool allocation_failed = false;
+  char *page = acquire_buffer(static_cast<block_id_t>(page_id), 50,
+                              /*record_reuse=*/true, &allocation_failed);
   if (page == nullptr) {
-    return -1;
+    return allocation_failed ? PageWriteStatus::kNoMemory
+                             : PageWriteStatus::kError;
   }
   {
     std::unique_lock<std::shared_mutex> page_lock(
@@ -2261,7 +2277,7 @@ int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
     page_table_.mark_dirty(page_id);
   }
   page_table_.release_block(page_id);
-  return 0;
+  return PageWriteStatus::kOk;
 }
 
 int VecBufferPool::write_meta(size_t offset, size_t length,
@@ -2695,6 +2711,11 @@ PageWriteStatus VecBufferPoolHandle::write_range_status(size_t file_offset,
 int VecBufferPoolHandle::write_fragments(
     const VecBufferWriteFragment *fragments, size_t count) {
   return pool_.write_fragments(fragments, count);
+}
+
+PageWriteStatus VecBufferPoolHandle::write_fragments_status(
+    const VecBufferWriteFragment *fragments, size_t count) {
+  return pool_.write_fragments_status(fragments, count);
 }
 
 int VecBufferPoolHandle::write_meta(size_t offset, size_t length,

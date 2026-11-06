@@ -1601,7 +1601,8 @@ int FlatStreamerEntity::alloc_segment() {
   auto meta_segment = storage_->get(FLAT_LINEAR_META_SEG_ID);
   if (!meta_segment) return IndexError_Runtime;
   IndexStorage::SegmentData meta_write{0, sizeof(next_meta), &next_meta};
-  if (!meta_segment->write_batch(&meta_write, 1)) return IndexError_WriteData;
+  if (!meta_segment->write_batch(&meta_write, 1))
+    return meta_segment->write_error();
   // All allocations precede the persisted publication; reserved insertions
   // cannot reject the new directory after the metadata has been written.
   {
@@ -1659,7 +1660,7 @@ int FlatStreamerEntity::alloc_block(const BlockLocation &next,
   const IndexStorage::SegmentData writes[] = {
       {del_off, sizeof(reset_del_map), &reset_del_map},
       {hd_off, sizeof(header), &header}};
-  if (!segment->write_batch(writes, 2)) return IndexError_WriteData;
+  if (!segment->write_batch(writes, 2)) return segment->write_error();
   BlockLocation published;
   published.segment_id = segment_id;
   published.block_index = block_index;
@@ -1710,7 +1711,7 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
   // internal vectors keep the atomic batched write including their payload.
   if (!segment->write_batch(writes + (use_external_vector_ ? 1 : 0),
                             use_external_vector_ ? 2 : 3))
-    return IndexError_WriteData;
+    return segment->write_error();
 
   VectorLocation loc(block.segment_id, false, vector_off);
   publish_key(key, loc, std::move(pending_key));
@@ -1791,7 +1792,7 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
     const uint64_t key = id;
     const IndexStorage::SegmentData writes[] = {{vector_off, size, query},
                                                 {key_off, sizeof(key), &key}};
-    if (!segment->write_batch(writes, 2)) return IndexError_WriteData;
+    if (!segment->write_batch(writes, 2)) return segment->write_error();
     publish_key(key, vector_loc, std::move(pending_key));
   }
   (*stats_.mutable_added_count())++;

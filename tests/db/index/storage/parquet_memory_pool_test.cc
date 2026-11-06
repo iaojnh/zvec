@@ -33,6 +33,12 @@
 #include "db/index/storage/parquet_writer.h"
 #include "db/index/storage/store_helper.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace zvec {
 namespace detail {
@@ -155,17 +161,12 @@ TEST(ParquetMemoryPoolTest,
   ASSERT_TRUE(
       pool.Reallocate(kThreshold * 2, kThreshold, alignment, &buffer).ok());
   EXPECT_EQ(41, buffer[kThreshold - 1]);
-#if defined(_WIN32)
-  EXPECT_EQ(3, pool.num_mapped_allocations());
-#else
   EXPECT_EQ(2, pool.num_mapped_allocations());
-#endif
   pool.Free(buffer, kThreshold, alignment);
   EXPECT_EQ(0, pool.bytes_allocated());
   EXPECT_EQ(0, pool.mapped_bytes());
 }
 
-#if !defined(_WIN32)
 TEST(ParquetMemoryPoolTest, MappedShrinkKeepsAddressAlignmentAndPrefix) {
   ParquetMemoryPool pool;
   for (const int64_t alignment : {64, 4096, 65536}) {
@@ -185,6 +186,11 @@ TEST(ParquetMemoryPoolTest, MappedShrinkKeepsAddressAlignmentAndPrefix) {
     EXPECT_TRUE(std::all_of(buffer, buffer + kThreshold + 100,
                             [](uint8_t byte) { return byte == 37; }));
     EXPECT_LT(pool.mapped_bytes(), mapped);
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION tail{};
+    ASSERT_NE(0u, ::VirtualQuery(buffer + 3 * kThreshold, &tail, sizeof(tail)));
+    EXPECT_EQ(MEM_RESERVE, tail.State);
+#endif
     EXPECT_EQ(allocations, pool.num_mapped_allocations());
     EXPECT_EQ(total, pool.total_mapped_bytes_allocated());
     // Logical accounting changes even when no complete OS page can be freed.
@@ -200,7 +206,6 @@ TEST(ParquetMemoryPoolTest, MappedShrinkKeepsAddressAlignmentAndPrefix) {
     EXPECT_EQ(0, pool.bytes_allocated());
   }
 }
-#endif
 
 TEST(ParquetMemoryPoolTest, SmallReallocationUsesFallback) {
   arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
@@ -723,7 +728,6 @@ TEST_F(ParquetBudgetTest,
   pool.Free(buffer, 0);
 }
 
-#if !defined(_WIN32)
 TEST_F(ParquetBudgetTest, MappedShrinkNeedsNoOverlapBudget) {
   ParquetMemoryPool pool(arrow::default_memory_pool(), true);
   uint8_t *buffer = nullptr;
@@ -789,7 +793,6 @@ TEST_F(ParquetBudgetTest, MappedShrinkAdmitsPreBudgetAllocation) {
   pool.Free(buffer, kThreshold);
   EXPECT_EQ(0u, budget_.used());
 }
-#endif
 
 TEST_F(ParquetBudgetTest, FreeUsesRecordedChargeAcrossBudgetInitialization) {
   ASSERT_EQ(0, budget_.init(0));

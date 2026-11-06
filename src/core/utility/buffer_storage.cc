@@ -822,6 +822,7 @@ class BufferStorage : public IndexStorage {
     }
 
     bool write_batch(const SegmentData *writes, size_t count) override {
+      buffer_storage_write_error = IndexError_WriteData;
       if (count == 0) {
         return true;
       }
@@ -865,9 +866,14 @@ class BufferStorage : public IndexStorage {
         has_data = true;
       }
 
-      if (has_data && owner_->buffer_pool_handle_->write_fragments(
-                          fragments.data(), count) != 0) {
-        return false;
+      if (has_data) {
+        const auto status = owner_->buffer_pool_handle_->write_fragments_status(
+            fragments.data(), count);
+        if (status != ailego::PageWriteStatus::kOk) {
+          if (status == ailego::PageWriteStatus::kNoMemory)
+            buffer_storage_write_error = IndexError_NoMemory;
+          return false;
+        }
       }
       if (write_end > bs_load_acquire(&meta->data_size)) {
         std::lock_guard<std::mutex> meta_latch(meta_mtx_);

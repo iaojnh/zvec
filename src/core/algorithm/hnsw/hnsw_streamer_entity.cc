@@ -497,10 +497,8 @@ void HnswStreamerEntity::add_neighbor(level_t level, node_id_t id,
   writes[0] = {offset, sizeof(neighbor_id), &neighbor_id};
   writes[1] = {loc.second, sizeof(neighbors), &neighbors};
   if (ailego_unlikely(!loc.first->write_batch(writes, 2))) {
-    LOG_ERROR("Append neighbor failed");
+    throw GraphStorageError{loc.first->write_error()};
   }
-
-  return;
 }
 
 int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {

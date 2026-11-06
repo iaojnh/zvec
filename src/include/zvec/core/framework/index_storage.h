@@ -667,7 +667,7 @@ class IndexStorage : public IndexModule {
       return read_size;
     }
 
-    //! Inspect immediately after a failed scalar write on this thread.
+    //! Inspect immediately after a failed write or write_batch on this thread.
     virtual int write_error() const {
       return IndexError_WriteData;
     }

@@ -1561,17 +1561,19 @@ bool MemoryLimitPool::try_charge_metadata(size_t buffer_size,
 
 bool MemoryLimitPool::try_charge_metadata_without_reclaim(size_t bytes) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
-  return try_charge_locked_metadata(bytes, Backing::kLive);
+  return try_charge_locked(bytes, &metadata_used_size_, Backing::kLive);
 }
 
-bool MemoryLimitPool::try_charge_locked_metadata(size_t bytes, Backing backing) {
+bool MemoryLimitPool::try_charge_locked(size_t bytes,
+                                        std::atomic<size_t> *counter,
+                                        Backing backing) {
   if (!bytes) return true;
   if (!try_reserve_allocation(bytes, backing)) {
     // Discard only idle backing; never call an eviction owner under its lock.
     trim_free_buffers(bytes);
     if (!try_reserve_allocation(bytes, backing)) return false;
   }
-  metadata_used_size_.fetch_add(bytes, std::memory_order_relaxed);
+  counter->fetch_add(bytes, std::memory_order_relaxed);
   bg_cv_.notify_one();
   return true;
 }
@@ -1580,9 +1582,9 @@ MemoryLimitPool::PendingAllocation::PendingAllocation(MemoryLimitPool &pool,
                                                       Kind kind)
     : pool_(pool),
       kind_(kind),
-      counter_(kind == Kind::kExternal || kind == Kind::kWorkspace
-                   ? &pool.external_used_size_
-                   : &pool.metadata_used_size_) {}
+      counter_(kind == Kind::kMetadata || kind == Kind::kLockedMetadata
+                   ? &pool.metadata_used_size_
+                   : &pool.external_used_size_) {}
 
 MemoryLimitPool::PendingAllocation::~PendingAllocation() {
   if (bytes_) pool_.release_fixed(bytes_, counter_, Backing::kPending);
@@ -1603,7 +1605,8 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
           pool_.try_charge_fixed_with_wait(bytes, counter_, Backing::kPending);
       break;
     case Kind::kLockedMetadata:
-      reserved = pool_.try_charge_locked_metadata(bytes, Backing::kPending);
+    case Kind::kLockedExternal:
+      reserved = pool_.try_charge_locked(bytes, counter_, Backing::kPending);
       break;
   }
   if (reserved) bytes_ = bytes;

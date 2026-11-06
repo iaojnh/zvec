@@ -570,6 +570,43 @@ TEST_F(BufferStorageWriteTest, WriteOverwrite) {
   EXPECT_EQ(0, storage->close());
 }
 
+TEST_F(BufferStorageWriteTest, WriteBatchReportsBudgetDenialAndCanRetry) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  const size_t page = ailego::kVectorPageSize;
+  ASSERT_EQ(0, storage->append("batch_pressure", 2 * page));
+  auto segment = storage->get("batch_pressure");
+  ASSERT_TRUE(segment);
+  const char original = 'a';
+  ASSERT_EQ(1u, segment->write(0, &original, 1));
+  ASSERT_EQ(1u, segment->write(page, &original, 1));
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  AILEGO_DEFER([&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  const char replacement = 'b';
+  const IndexStorage::SegmentData writes[] = {
+      {0, 1, &replacement}, {page, 1, &replacement}};
+  EXPECT_FALSE(segment->write_batch(writes, 2));
+  EXPECT_EQ(IndexError_NoMemory, segment->write_error());
+  const IndexStorage::SegmentData invalid{2 * page, 1, &replacement};
+  EXPECT_FALSE(segment->write_batch(&invalid, 1));
+  EXPECT_EQ(IndexError_WriteData, segment->write_error());
+
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  char actual = 0;
+  ASSERT_EQ(1u, segment->fetch(0, &actual, 1));
+  EXPECT_EQ(original, actual);
+  ASSERT_EQ(1u, segment->fetch(page, &actual, 1));
+  EXPECT_EQ(original, actual);
+  ASSERT_TRUE(segment->write_batch(writes, 2));
+  ASSERT_EQ(1u, segment->fetch(0, &actual, 1));
+  EXPECT_EQ(replacement, actual);
+  ASSERT_EQ(1u, segment->fetch(page, &actual, 1));
+  EXPECT_EQ(replacement, actual);
+  ASSERT_EQ(0, storage->close());
+}
+
 TEST_F(BufferStorageWriteTest, WriteBatchSamePagePersists) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
