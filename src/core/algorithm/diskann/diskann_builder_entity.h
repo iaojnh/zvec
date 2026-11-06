@@ -17,6 +17,7 @@
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_holder.h>
 #include "diskann_entity.h"
+#include "diskann_neighbor_buffer.h"
 
 namespace zvec {
 namespace turbo {
@@ -107,12 +108,22 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   // Retain the trained state for streaming export, including dump retries.
   // Do not keep another contiguous copy of its codebook / OPQ matrix.
   void set_pq_quantizer(std::shared_ptr<const turbo::Quantizer> quantizer);
+  // Call only after final pruning has joined all graph workers. Packs the
+  // existing chunks in place and makes the adjacency read-only.
+  int compact_neighbors();
+
+  size_t neighbor_memory_size() const {
+    return neighbor_pool_.memory_size();
+  }
+
 
   std::vector<uint8_t> &block_compressed_data() {
     return block_compressed_data_;
   }
 
  private:
+  void observe_degree(uint32_t degree);
+
   uint32_t max_degree_{0};
   uint32_t list_size_{0};
   double memory_limit_{0};
@@ -127,7 +138,6 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   size_t code_bytes_{0};
   size_t code_bytes_written_{0};
 
-  void observe_degree(uint32_t degree);
 
   std::string mem_index_file_{""};
   std::string index_path_prefix_{""};
@@ -135,7 +145,8 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   std::shared_ptr<const void> vector_lifetime_{};
   ailego::BudgetedVector<const void *> vector_ptrs_{};
   std::string keys_buffer_{};
-  std::string neighbors_buffer_{};
+  DiskAnnNeighborPool neighbor_pool_{};
+  bool neighbors_compacted_{false};
   ailego::BudgetedVector<diskann_id_t> entrypoints_{};
 
   IndexMeta meta_;

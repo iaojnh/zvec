@@ -202,7 +202,8 @@ void PqInt8Quantizer::setup_chunk_offsets() {
 
 template <typename T>
 void PqInt8Quantizer::train_chunk(const T *data, size_t num, size_t stride,
-                                  size_t sub_idx, uint32_t max_iters) {
+                                  size_t sub_idx, uint32_t max_iters,
+                                  const void *const *rows) {
   const size_t k = kNumCentroids;
   const size_t d = chunk_dim(sub_idx);
   const size_t offset = chunk_offsets_[sub_idx];
@@ -214,11 +215,11 @@ void PqInt8Quantizer::train_chunk(const T *data, size_t num, size_t stride,
 
   // Append sub-vectors (NumericalKmeans handles transpose internally)
   for (size_t i = 0; i < num; ++i) {
-    const T *sub_vec =
-        reinterpret_cast<const T *>(reinterpret_cast<const uint8_t *>(data) +
-                                    i * stride) +
-        offset;
-    algorithm.append(sub_vec, d);
+    const T *row =
+        rows ? static_cast<const T *>(rows[i])
+             : reinterpret_cast<const T *>(
+                   reinterpret_cast<const uint8_t *>(data) + i * stride);
+    algorithm.append(row + offset, d);
   }
 
   // Single-threaded pool -- parallelism is at the chunk level.
@@ -311,6 +312,22 @@ int PqInt8Quantizer::train(IndexHolder::Pointer holder) try {
     return 0;
   }
 
+  if (!opq_.enabled() && !use_zero_mean_ && meta_.metric_name() != "Cosine") {
+    std::vector<const void *> rows;
+    std::shared_ptr<const void> lifetime;
+    int ret = BorrowPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes,
+                                      &rows, &lifetime);
+    if (ret == 0) {
+      holder.reset();
+      train_all_chunks(nullptr, num, 0, kMaxKmeansIters, rows.data());
+      std::vector<const void *>().swap(rows);
+      lifetime.reset();
+      build_centroid_ptrs_cache();
+      return build_sdc_table_ ? compute_dist_table() : 0;
+    }
+    if (ret != IndexError_NotImplemented) return ret;
+  }
+
   std::vector<uint8_t> all_data;
   if (!CollectPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes,
                                 &all_data)) {
@@ -386,7 +403,8 @@ int PqInt8Quantizer::train(IndexHolder::Pointer holder) try {
 }
 
 void PqInt8Quantizer::train_all_chunks(const void *data, size_t num,
-                                       size_t stride, uint32_t max_iters) {
+                                       size_t stride, uint32_t max_iters,
+                                       const void *const *rows) {
   // Create thread pool.
   auto threads =
       std::make_shared<SingleQueueIndexThreads>(thread_count_, false);
@@ -400,11 +418,11 @@ void PqInt8Quantizer::train_all_chunks(const void *data, size_t num,
     using T = std::remove_const_t<std::remove_pointer_t<decltype(typed_data)>>;
     for (size_t i = 0; i < pool_count; ++i) {
       task_group->submit(
-          ailego::Closure::New([this, typed_data, num, stride, i, pool_count,
-                                max_iters, &finished]() {
+          ailego::Closure::New([this, typed_data, num, stride, rows, i,
+                                pool_count, max_iters, &finished]() {
             for (uint32_t m = static_cast<uint32_t>(i); m < num_chunk_;
                  m += static_cast<uint32_t>(pool_count)) {
-              train_chunk<T>(typed_data, num, stride, m, max_iters);
+              train_chunk<T>(typed_data, num, stride, m, max_iters, rows);
               finished++;
             }
           }));

@@ -152,12 +152,13 @@ void DiskAnnBuilderEntity::clear() {
   num_threads_ = 0;
   max_build_degree_ = 0;
   max_observed_degree_ = 0;
-  neighbor_size_ = 0;
   mem_index_file_.clear();
   index_path_prefix_.clear();
   release_vectors();
   std::string().swap(keys_buffer_);
-  std::string().swap(neighbors_buffer_);
+  neighbor_pool_.clear();
+  neighbors_compacted_ = false;
+  reserved_docs_ = 0;
   entrypoints_.clear();
   meta_.clear();
   pq_quantizer_.reset();
@@ -188,7 +189,6 @@ int DiskAnnBuilderEntity::init(const IndexMeta &meta, uint32_t max_degree,
   }
   // Preserve the original float multiplication/rounding for ordinary inputs.
   max_build_degree_ = max_degree_ * kDefaultGraphSlackFactor;
-
   neighbor_size_ = sizeof(uint32_t) + max_build_degree_ * sizeof(diskann_id_t);
 
   return 0;
@@ -302,7 +302,8 @@ int DiskAnnBuilderEntity::reserve_space(uint32_t docs,
     } else {
       keys_buffer_.reserve(sizeof(diskann_key_t) * count);
       vector_ptrs_.reserve(count);
-      neighbors_buffer_.reserve(static_cast<size_t>(neighbor_size_) * count);
+      int ret = neighbor_pool_.reserve(docs, max_build_degree_);
+      if (ret != 0) return ret;
       vector_lifetime_ = std::move(lifetime);
     }
     reserved_docs_ = docs;
@@ -343,11 +344,6 @@ int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) try {
   if (doc_cnt() >= reserved_docs_) return IndexError_InvalidArgument;
   vector_ptrs_.push_back(vec);
   keys_buffer_.append(reinterpret_cast<const char *>(&key), sizeof(key));
-
-  uint32_t neighbor_cnt = 0;
-  neighbors_buffer_.append(reinterpret_cast<const char *>(&neighbor_cnt),
-                           sizeof(uint32_t));
-  neighbors_buffer_.append(sizeof(diskann_id_t) * max_build_degree_, '\0');
 
   (*mutable_doc_cnt())++;
 
@@ -449,17 +445,7 @@ diskann_id_t DiskAnnBuilderEntity::get_id(diskann_key_t /*key*/) const {
 std::pair<uint32_t, const diskann_id_t *> DiskAnnBuilderEntity::get_neighbors(
     diskann_id_t id) const {
   if (buffered_state_ || id >= doc_cnt()) return {0, nullptr};
-  size_t offset = (size_t)id * neighbor_size_;
-
-  const uint8_t *start_ptr =
-      reinterpret_cast<const uint8_t *>(neighbors_buffer_.data()) + offset;
-
-  uint32_t neighbor_cnt = *(reinterpret_cast<const uint32_t *>(start_ptr));
-
-  const diskann_id_t *neighbors =
-      reinterpret_cast<const diskann_id_t *>(start_ptr + sizeof(uint32_t));
-
-  return std::make_pair(neighbor_cnt, neighbors);
+  return neighbor_pool_.get(id);
 }
 
 int DiskAnnBuilderEntity::read_neighbors(
@@ -525,20 +511,11 @@ int DiskAnnBuilderEntity::set_neighbors(
     observe_degree(count);
     return 0;
   }
-  size_t offset = (size_t)id * neighbor_size_;
-
-  uint8_t *start_ptr =
-      reinterpret_cast<uint8_t *>(&neighbors_buffer_[0]) + offset;
-
-  uint32_t neighbor_cnt = neighbor_ids.size();
-
-  memcpy(start_ptr + sizeof(uint32_t), neighbor_ids.data(),
-         sizeof(diskann_id_t) * neighbor_cnt);
-  memcpy(start_ptr, &neighbor_cnt, sizeof(uint32_t));
-
-  observe_degree(neighbor_cnt);
-
-  return 0;
+  if (neighbors_compacted_) return IndexError_NoReady;
+  const int ret =
+      neighbor_pool_.set(id, neighbor_ids.data(), neighbor_ids.size());
+  if (ret == 0) observe_degree(static_cast<uint32_t>(neighbor_ids.size()));
+  return ret;
 } catch (const std::exception &error) {
   LOG_ERROR("Failed to write DiskANN build adjacency: %s", error.what());
   return IndexError_Runtime;
@@ -567,27 +544,22 @@ int DiskAnnBuilderEntity::add_neighbor(diskann_id_t id,
     observe_degree(next_count);
     return 0;
   }
-  size_t offset = (size_t)id * neighbor_size_;
-
-  uint8_t *start_ptr =
-      reinterpret_cast<uint8_t *>(&neighbors_buffer_[0]) + offset;
-
-  uint32_t neighbor_cnt = *reinterpret_cast<uint32_t *>(start_ptr);
-  if (neighbor_cnt >= max_build_degree_) return IndexError_InvalidArgument;
-
-  memcpy(start_ptr + sizeof(uint32_t) + sizeof(diskann_id_t) * neighbor_cnt,
-         &neighbor_id, sizeof(diskann_id_t));
-
-  neighbor_cnt += 1;
-
-  memcpy(start_ptr, &neighbor_cnt, sizeof(uint32_t));
-
-  observe_degree(neighbor_cnt);
-
-  return 0;
+  if (neighbors_compacted_) return IndexError_NoReady;
+  const int ret = neighbor_pool_.append(id, neighbor_id);
+  if (ret == 0) observe_degree(neighbor_pool_.get(id).first);
+  return ret;
 } catch (const std::exception &error) {
   LOG_ERROR("Failed to append DiskANN build adjacency: %s", error.what());
   return IndexError_Runtime;
+}
+
+int DiskAnnBuilderEntity::compact_neighbors() {
+  // Pageable adjacency already avoids resident capacity for unused edges.
+  if (buffered_state_) return 0;
+  if (neighbors_compacted_) return 0;
+  const int ret = neighbor_pool_.compact(max_degree_);
+  if (ret == 0) neighbors_compacted_ = true;
+  return ret;
 }
 
 int DiskAnnBuilderEntity::prepare_codes(size_t bytes) {

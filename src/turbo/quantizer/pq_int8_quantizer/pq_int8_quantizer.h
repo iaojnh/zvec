@@ -166,12 +166,12 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   //! iterations (the OPQ loop trains with a smaller cap per round).
   template <typename T>
   void train_chunk(const T *data, size_t num, size_t stride, size_t sub_idx,
-                   uint32_t max_iters);
+                   uint32_t max_iters, const void *const *rows);
 
   //! Train every chunk of \p data in parallel (one KMeans per chunk).
   //! This is OPQ step 2: fix the rotation matrix, train the codebook.
   void train_all_chunks(const void *data, size_t num, size_t stride,
-                        uint32_t max_iters);
+                        uint32_t max_iters, const void *const *rows = nullptr);
 
   template <class T>
   int train_buffered(const IndexHolder::Pointer &holder, size_t num);

@@ -741,7 +741,7 @@ zvec_error_code_t zvec_shutdown(void) {
     SET_LAST_ERROR(ZVEC_ERROR_FAILED_PRECONDITION, "Library not initialized");
     return ZVEC_ERROR_FAILED_PRECONDITION;
   }
-  // We're do nothing here for now, 
+  // We're do nothing here for now,
   // but we might add zvec::GlobalConfig::Finalize in the future.
   ZVEC_TRY_RETURN_ERROR("Shutdown failed", g_initialized.store(false);
                         return ZVEC_OK;)
@@ -953,7 +953,7 @@ static std::shared_ptr<zvec::IndexParams> convert_c_index_params_to_cpp(
  * @brief Allocate memory within the library
  * @param size Number of bytes to allocate
  * @return Pointer to allocated memory, or NULL on failure
- * 
+ *
  * @note Use zvec_malloc instead of malloc to ensure memory is managed
  *       consistently within the library. All memory allocated with zvec_malloc
  *       should be freed with zvec_free.
@@ -965,7 +965,7 @@ void* zvec_malloc(size_t size) {
 /**
  * @brief Free memory allocated by zvec_malloc
  * @param ptr Pointer to memory to free (can be NULL)
- * 
+ *
  * @note Use zvec_free instead of free to ensure memory is managed
  *       consistently within the library. This function should be used to free
  *       any memory allocated with zvec_malloc or returned by library functions
@@ -996,9 +996,16 @@ void zvec_free_string(zvec_string_t *str) {
  * @return New string array, or NULL on failure
  */
 zvec_string_array_t *zvec_string_array_create(size_t count) {
+  if (count > SIZE_MAX / sizeof(zvec_string_t)) return nullptr;
+
   zvec_string_array_t *array = (zvec_string_array_t *)malloc(sizeof(zvec_string_array_t));
+  if (!array) return nullptr;
   array->count = count;
   array->strings = (zvec_string_t *)malloc(sizeof(zvec_string_t) * count);
+  if (!array->strings) {
+    free(array);
+    return nullptr;
+  }
   memset(array->strings, 0, sizeof(zvec_string_t) * count);
   return array;
 }
@@ -1015,6 +1022,7 @@ zvec_string_array_t *zvec_string_array_create_from_strings(const char **strings,
     return nullptr;
   }
   zvec_string_array_t *array = zvec_string_array_create(count);
+  if (!array) return nullptr;
   for (size_t i = 0; i < count; ++i) {
     zvec_string_array_add(array, i, strings[i]);
   }
@@ -1029,10 +1037,13 @@ zvec_string_array_t *zvec_string_array_create_from_strings(const char **strings,
  */
 void zvec_string_array_add(zvec_string_array_t *array, size_t idx,
                            const char *str) {
+  if (!array || !str) return;
   if (idx >= array->count) return;
   size_t len = strlen(str);
-  array->strings[idx].data = (char *)malloc(len + 1);
-  memcpy(array->strings[idx].data, str, len + 1);
+  char *buf = (char *)malloc(len + 1);
+  if (!buf) return;
+  memcpy(buf, str, len + 1);
+  array->strings[idx].data = buf;
   array->strings[idx].length = len;
   array->strings[idx].capacity = len + 1;
 }
@@ -2446,7 +2457,7 @@ zvec_error_code_t zvec_collection_schema_set_name(zvec_collection_schema_t *sche
   ZVEC_TRY_RETURN_ERROR(
       "Failed to set collection name",
       auto *cpp_schema = reinterpret_cast<zvec::CollectionSchema *>(schema);
-      cpp_schema->set_name(std::string(name)); 
+      cpp_schema->set_name(std::string(name));
       return ZVEC_OK;)
 }
 
@@ -2603,7 +2614,7 @@ zvec_error_code_t zvec_collection_schema_get_forward_fields(
         // Return non-owning pointers - caller should NOT free these
         (*fields)[i] =
             reinterpret_cast<zvec_field_schema_t *>(forward_fields[i].get());
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -2634,7 +2645,7 @@ zvec_error_code_t zvec_collection_schema_get_forward_fields_with_index(
         // Return non-owning pointers - caller should NOT free these
         (*fields)[i] =
             reinterpret_cast<zvec_field_schema_t *>(fields_with_index[i].get());
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -2663,7 +2674,7 @@ zvec_error_code_t zvec_collection_schema_get_forward_field_names(
       // Copy strings - caller owns the memory and should free
       for (size_t i = 0; i < *count; ++i) {
         (*names)[i] = strdup(forward_names[i].c_str());
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -2693,7 +2704,7 @@ zvec_error_code_t zvec_collection_schema_get_forward_field_names_with_index(
       // Copy strings - caller owns the memory and should free
       for (size_t i = 0; i < *count; ++i) {
         (*names)[i] = strdup(forward_names_with_index[i].c_str());
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -2721,8 +2732,8 @@ zvec_error_code_t zvec_collection_schema_get_all_field_names(
 
       // Copy strings - caller owns the memory and should free
       for (size_t i = 0; i < *count;
-           ++i) { (*names)[i] = strdup(all_names[i].c_str()); 
-      } 
+           ++i) { (*names)[i] = strdup(all_names[i].c_str());
+      }
       return ZVEC_OK;)
 }
 
@@ -2753,7 +2764,7 @@ zvec_error_code_t zvec_collection_schema_get_vector_fields(
         // Return non-owning pointers - caller should NOT free these
         (*fields)[i] =
             reinterpret_cast<zvec_field_schema_t *>(vector_fields[i].get());
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -2775,7 +2786,7 @@ zvec_error_code_t zvec_collection_schema_set_max_doc_count_per_segment(
   ZVEC_TRY_RETURN_ERROR(
       "Failed to set max doc count per segment",
       auto *cpp_schema = reinterpret_cast<zvec::CollectionSchema *>(schema);
-      cpp_schema->set_max_doc_count_per_segment(max_doc_count); 
+      cpp_schema->set_max_doc_count_per_segment(max_doc_count);
       return ZVEC_OK;)
 }
 
@@ -2800,7 +2811,7 @@ zvec_error_code_t zvec_collection_schema_validate(
           *error_msg = zvec_string_create(status.message().c_str());
         }
         return handle_status(status);
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -2839,7 +2850,7 @@ zvec_error_code_t zvec_collection_schema_drop_index(zvec_collection_schema_t *sc
       if (!field) {
         SET_LAST_ERROR(ZVEC_ERROR_NOT_FOUND, "Field not found");
         return ZVEC_ERROR_NOT_FOUND;
-      } 
+      }
       const_cast<zvec::FieldSchema *>(field)
           ->set_index_params(nullptr);
       return ZVEC_OK;)
@@ -4780,7 +4791,7 @@ zvec_error_code_t zvec_doc_deserialize(const uint8_t *data, size_t size,
 
       // Create a new Doc by copying the deserialized content
       auto *new_doc = new zvec::Doc(*deserialized_doc);
-      *doc = reinterpret_cast<zvec_doc_t *>(new_doc); 
+      *doc = reinterpret_cast<zvec_doc_t *>(new_doc);
       return ZVEC_OK;)
 }
 
@@ -7310,7 +7321,7 @@ zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection
 
       auto status = (*coll_ptr)->delete_by_filter(filter); if (!status.ok()) {
         return handle_status(status);
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -7646,7 +7657,7 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
       auto schema_result = (*coll_ptr)->schema();
       if (schema_result.has_value()) {
         normalize_nullable_fields_for_fetch(schema_result.value(), doc_map);
-      } 
+      }
       return convert_fetched_document_results(doc_map, results, doc_count);)
 }
 

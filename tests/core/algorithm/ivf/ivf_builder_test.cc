@@ -1535,6 +1535,686 @@ TEST(IVFTurboConfiguration, RejectsColumnOrderAndLegacyPostingQuantization) {
   }
 }
 
+}  // namespaceclass StableTestHolder : public IndexHolder, public
+   // StableVectorHolder {
+public:
+explicit StableTestHolder(IndexHolder::Pointer delegate)
+    : delegate_(std::move(delegate)) {}
+size_t count() const override {
+  return reported_count ? reported_count : delegate_->count();
+}
+size_t dimension() const override {
+  return delegate_->dimension();
+}
+IndexMeta::DataType data_type() const override {
+  return delegate_->data_type();
+}
+size_t element_size() const override {
+  return delegate_->element_size();
+}
+bool multipass() const override {
+  return true;
+}
+IndexHolder::Iterator::Pointer create_iterator() override {
+  ++iterations;
+  return delegate_->create_iterator();
+}
+int retain_stable_data(std::shared_ptr<const void> *lifetime) override {
+  ++retains;
+  if (retain_error != 0) return retain_error;
+  if (!null_lifetime) *lifetime = delegate_;
+  return 0;
+}
+
+size_t iterations{0};
+size_t retains{0};
+size_t reported_count{0};
+int retain_error{0};
+bool null_lifetime{false};
+
+private:
+IndexHolder::Pointer delegate_;
+};
+
+TEST_F(IVFBuilderTest, StableSourceKeepsOriginalAddressesAndBackingData) {
+  prepare_index_holder(100, 103);
+  auto source = std::make_shared<StableTestHolder>(holder_);
+  std::shared_ptr<const void> lifetime;
+  ASSERT_EQ(0, source->retain_stable_data(&lifetime));
+  IVFBuilder::RandomAccessIndexHolder borrowed(index_meta_,
+                                               std::move(lifetime));
+  borrowed.reserve(source->count());
+  const void *first = nullptr;
+  for (auto iter = source->create_iterator(); iter->is_valid(); iter->next()) {
+    if (!first) first = iter->data();
+    borrowed.emplace(iter->key(), iter->data());
+  }
+  std::weak_ptr<IndexHolder> backing = holder_;
+  source.reset();
+  holder_.reset();
+  ASSERT_FALSE(backing.expired());
+  EXPECT_EQ(103u, borrowed.count());
+  EXPECT_EQ(first, borrowed.element(0));
+  auto iter = borrowed.create_iterator();
+  for (size_t i = 0; i < borrowed.count(); ++i, iter->next()) {
+    ASSERT_TRUE(iter->is_valid());
+    EXPECT_EQ(100u + i, iter->key());
+    EXPECT_EQ(borrowed.element(i), iter->data());
+    EXPECT_EQ(float(i), static_cast<const float *>(iter->data())[0]);
+  }
+  EXPECT_FALSE(iter->is_valid());
+}
+
+TEST_F(IVFBuilderTest, StableSourceSupportsTransformsAndRepeatedDumps) {
+  // Raw postings, centroid conversion, legacy posting conversion, and the
+  // automatic Cosine/IP centroid converters all retain the original data.
+  for (int mode : {0, 1, 2, 3, 4}) {
+    SCOPED_TRACE(mode);
+    auto input =
+        std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(dimension_);
+    // Primary keys deliberately differ from ordinal IDs and arrive unsorted.
+    for (size_t i = 0; i < 103; ++i) {
+      input->emplace(1000 + (103 - i) * 3,
+                     NumericalVector<float>(dimension_, float(i)));
+    }
+    holder_ = std::move(input);
+    auto expected = holder_;
+    auto meta = index_meta_;
+    Params params = params_;
+    params.set(PARAM_IVF_BUILDER_STORE_ORIGINAL_FEATURES, true);
+    if (mode == 1)
+      params.set(PARAM_IVF_BUILDER_CONVERTER_CLASS, "HalfFloatConverter");
+    if (mode == 2)
+      params.set(PARAM_IVF_BUILDER_QUANTIZER_CLASS, "HalfFloatConverter");
+    if (mode == 3) meta.set_metric("Cosine", 0, Params());
+    if (mode == 4) meta.set_metric("InnerProduct", 0, Params());
+    zvec::turbo::Quantizer::Pointer quantizer;
+    if (mode == 3) {
+      meta.set_quantizer("Fp32Quantizer", 0, Params());
+      quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+      ASSERT_NE(nullptr, quantizer);
+      ASSERT_EQ(0, quantizer->init(meta, Params()));
+    }
+    IVFBuilder builder;
+    ASSERT_EQ(0, builder.init(meta, params, quantizer));
+    ASSERT_EQ(0, builder.train(threads_, holder_));
+    auto source = std::make_shared<StableTestHolder>(holder_);
+    ASSERT_EQ(0, builder.build(threads_, source));
+    EXPECT_EQ(1u, source->retains);
+    EXPECT_EQ(1u, source->iterations);
+    std::weak_ptr<IndexHolder> backing = holder_;
+    source.reset();
+    holder_.reset();
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const std::string path = "ivf_stable_source.index";
+      auto dumper = IndexFactory::CreateDumper("FileDumper");
+      ASSERT_EQ(0, dumper->create(path));
+      ASSERT_EQ(0, builder.dump(dumper));
+      ASSERT_EQ(0, dumper->close());
+      auto storage = IndexFactory::CreateStorage("MMapFileReadStorage");
+      ASSERT_EQ(0, storage->init(Params()));
+      ASSERT_EQ(0, storage->open(path, false));
+      auto streamer = IndexFactory::CreateStreamer("IVFStreamer");
+      ASSERT_EQ(0, streamer->init(meta, Params()));
+      ASSERT_EQ(0, streamer->open(storage));
+      auto provider = streamer->create_provider();
+      ASSERT_NE(nullptr, provider);
+      for (auto iter = expected->create_iterator(); iter->is_valid();
+           iter->next()) {
+        const void *actual = provider->get_vector(iter->key());
+        ASSERT_NE(nullptr, actual);
+        EXPECT_EQ(0,
+                  std::memcmp(actual, iter->data(), expected->element_size()));
+      }
+      provider.reset();
+      ASSERT_EQ(0, streamer->close());
+      ASSERT_EQ(0, storage->close());
+      File::RemovePath(path);
+    }
+    expected.reset();
+    EXPECT_FALSE(backing.expired());
+    ASSERT_EQ(0, builder.cleanup());
+    EXPECT_TRUE(backing.expired());
+  }
+}
+
+TEST_F(IVFBuilderTest, StableSourceValidatesLifetimeAndCounts) {
+  for (int mode : {0, 1, 2, 3, 4}) {
+    SCOPED_TRACE(mode);
+    prepare_index_holder(100, 103);
+    IVFBuilder builder;
+    ASSERT_EQ(0, builder.init(index_meta_, params_));
+    ASSERT_EQ(0, builder.train(threads_, holder_));
+    auto source = std::make_shared<StableTestHolder>(holder_);
+    int expected = IndexError_Mismatch;
+    if (mode == 0) {
+      source->retain_error = expected = IndexError_ReadData;
+    } else if (mode == 1) {
+      source->null_lifetime = true;
+      expected = IndexError_Runtime;
+    } else if (mode == 2 || mode == 3) {
+      source->reported_count = mode == 2 ? 104 : 102;
+    } else {
+      source->retain_error = IndexError_NotImplemented;
+      expected = 0;
+    }
+    EXPECT_EQ(expected, builder.build(threads_, source));
+    EXPECT_EQ(mode < 2 ? 0u : 1u, source->iterations);
+  }
+}
+
+TEST_F(IVFBuilderTest, StableSourcePreservesIteratorReadErrors) {
+  prepare_index_holder(100, 103);
+  for (auto operation :
+       {IteratorErrorOperation::kValidity, IteratorErrorOperation::kKey,
+        IteratorErrorOperation::kData}) {
+    IVFBuilder builder;
+    ASSERT_EQ(0, builder.init(index_meta_, params_));
+    ASSERT_EQ(0, builder.train(threads_, holder_));
+    auto failing = std::make_shared<IteratorErrorHolder>(holder_, 3, operation);
+    auto source = std::make_shared<StableTestHolder>(failing);
+    EXPECT_EQ(IndexError_ReadData, builder.build(threads_, source));
+    EXPECT_EQ(1u, source->retains);
+    EXPECT_EQ(1u, source->iterations);
+  }
+}
+
+TEST_F(IVFBuilderTest, TestInitSuccess) {
+  IVFBuilder builder;
+  int ret = builder.init(index_meta_, params_);
+  EXPECT_EQ(0, ret);
+}
+
+TEST_F(IVFBuilderTest, TestInitFailedWithInvalidMetric) {
+  IVFBuilder builder;
+  index_meta_.set_metric("invalid", 0, Params());
+  int ret = builder.init(index_meta_, params_);
+  EXPECT_EQ(IndexError_NoExist, ret);
+}
+
+TEST_F(IVFBuilderTest, TestInitFailedWithInvalidCentroidsNum) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(IndexError_InvalidArgument, ret);
+}
+
+TEST_F(IVFBuilderTest, TestTrainWithHolder1Level) {
+  IVFBuilder builder;
+  int ret = builder.init(index_meta_, params_);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  auto centroid_index = builder.centroid_index();
+  EXPECT_GT(centroid_index->centroids_count(), 0u);
+}
+
+TEST_F(IVFBuilderTest, TestTrainWithHolder2Level) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4*2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  auto centroid_index = builder.centroid_index();
+  EXPECT_EQ(centroid_index->centroids_count(), 8);
+}
+
+TEST_F(IVFBuilderTest, TestTrainWithTrainer2Level) {
+  IndexTrainer::Pointer trainer =
+      IndexFactory::CreateTrainer("StratifiedClusterTrainer");
+  ASSERT_TRUE(!!trainer);
+
+  prepare_index_holder(0, 1000);
+
+  Params params;
+  params.set("zvec.stratified.trainer.cluster_count", "4*2");
+  ASSERT_EQ(0, trainer->init(index_meta_, params));
+  ASSERT_EQ(0, trainer->train(threads_, holder_));
+
+  IVFBuilder builder;
+  int ret = builder.init(index_meta_, params_);
+  EXPECT_EQ(0, ret);
+
+
+  ret = builder.train(trainer);
+  EXPECT_EQ(0, ret);
+
+  auto centroid_index = builder.centroid_index();
+  EXPECT_EQ(centroid_index->centroids_count(), 8);
+}
+
+TEST_F(IVFBuilderTest, TestTrainWithTrainer1Level) {
+  IVFBuilder builder;
+
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster");
+
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  IndexTrainer::Pointer trainer =
+      IndexFactory::CreateTrainer("StratifiedClusterTrainer");
+  ASSERT_TRUE(!!trainer);
+
+  prepare_index_holder(0, 1000);
+
+  Params params1;
+  params1.set("zvec.stratified.trainer.cluster_count", "4");
+  ASSERT_EQ(0, trainer->init(index_meta_, params1));
+  ASSERT_EQ(0, trainer->train(threads_, holder_));
+
+  ret = builder.train(trainer);
+  EXPECT_EQ(0, ret);
+
+  auto centroid_index = builder.centroid_index();
+  EXPECT_EQ(centroid_index->centroids_count(), 4);
+}
+
+TEST_F(IVFBuilderTest, TestBuildWith2Level) {
+  IVFBuilder builder;
+
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4*2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  EXPECT_EQ((size_t)1000, builder.stats().built_count());
+}
+
+TEST_F(IVFBuilderTest, TestBuildWith1Level) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster");
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  EXPECT_EQ((size_t)1000, builder.stats().built_count());
+}
+
+TEST_F(IVFBuilderTest, TestDump) {
+  IVFBuilder builder;
+  int ret = builder.init(index_meta_, params_);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("MemoryDumper");
+  ret = dumper->create("path");
+  EXPECT_EQ(0, ret);
+
+  ret = builder.dump(dumper);
+  EXPECT_EQ((size_t)1000, builder.stats().built_count());
+  EXPECT_EQ((size_t)1000, builder.stats().dumped_count());
+  EXPECT_EQ((size_t)0, builder.stats().discarded_count());
+}
+
+#if 0
+TEST_F(IVFBuilderTest, TestBuildWithNoEnoughMemory)
+{
+    IVFBuilder builder;
+    Params params;
+    params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4*2");
+    params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+
+    dimension_ = 256;
+    index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);
+
+    int ret = builder.init(index_meta_, params);
+    EXPECT_EQ(0, ret);
+
+    prepare_index_holder(0, 1000);
+
+    ret = builder.train(threads_, holder_);
+    EXPECT_EQ(0, ret);
+
+    ret = builder.build(threads_, holder_);
+    EXPECT_EQ(IndexError_IndexFull, ret);
+}
+#endif
+
+TEST_F(IVFBuilderTest, TestBuildWithEnoughMemory) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4*2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+
+  dimension_ = 256;
+  index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);
+
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("MemoryDumper");
+  ret = dumper->create("path");
+  EXPECT_EQ(0, ret);
+
+  ret = builder.dump(dumper);
+  EXPECT_EQ((size_t)1000, builder.stats().built_count());
+  EXPECT_EQ((size_t)1000, builder.stats().dumped_count());
+  EXPECT_EQ((size_t)0, builder.stats().discarded_count());
+}
+
+#if 0
+TEST_F(IVFBuilderTest, TestBuildWithRowMajorAndNoEnoughMemory)
+{
+    IVFBuilder builder;
+    Params params;
+    params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4*2");
+    params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+
+    dimension_ = 256;
+    index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);
+    index_meta_.set_major_order(IndexMeta::MajorOrder::MO_ROW);
+
+    int ret = builder.init(index_meta_, params);
+    EXPECT_EQ(0, ret);
+
+    prepare_index_holder(0, 1000);
+
+    ret = builder.train(threads_, holder_);
+    EXPECT_EQ(0, ret);
+
+    ret = builder.build(threads_, holder_);
+    EXPECT_EQ(IndexError_IndexFull, ret);
+}
+#endif
+
+TEST_F(IVFBuilderTest, TestBuildWithRowMajorAndMemory) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4*2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+
+  dimension_ = 256;
+  index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);
+  index_meta_.set_major_order(IndexMeta::MajorOrder::MO_ROW);
+
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("MemoryDumper");
+  ret = dumper->create("path");
+  EXPECT_EQ(0, ret);
+
+  ret = builder.dump(dumper);
+  EXPECT_EQ((size_t)1000, builder.stats().built_count());
+  EXPECT_EQ((size_t)1000, builder.stats().dumped_count());
+  EXPECT_EQ((size_t)0, builder.stats().discarded_count());
+}
+
+TEST_F(IVFBuilderTest, TestBuildWithEmptyCentroid) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "2*2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+
+  dimension_ = 256;
+  index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);
+  index_meta_.set_major_order(IndexMeta::MajorOrder::MO_ROW);
+
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+  size_t doc_cnt = 10;
+
+  MultiPassIndexHolder<IndexMeta::DataType::DT_FP32> *holder =
+      new MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>(dimension_);
+  for (size_t i = 0; i < doc_cnt; ++i) {
+    NumericalVector<float> vec(dimension_);
+    for (size_t j = 0; j < dimension_; ++j) {
+      vec[j] = 1.0f;
+    }
+    holder->emplace(i, vec);
+  }
+  holder_.reset(holder);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("MemoryDumper");
+  ret = dumper->create("path");
+  EXPECT_EQ(0, ret);
+
+  ret = builder.dump(dumper);
+  EXPECT_EQ((size_t)10, builder.stats().built_count());
+  EXPECT_EQ((size_t)10, builder.stats().dumped_count());
+  EXPECT_EQ((size_t)0, builder.stats().discarded_count());
+}
+
+TEST_F(IVFBuilderTest, TestTrainClusterParams) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "2*2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster");
+  prepare_index_holder(0, 1000);
+  EXPECT_EQ(0, builder.init(index_meta_, params));
+  EXPECT_EQ(0, builder.train(threads_, holder_));
+  EXPECT_EQ(0, builder.build(threads_, holder_));
+
+  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("MemoryDumper");
+  EXPECT_EQ(0, dumper->create("test.index"));
+  EXPECT_EQ(0, builder.dump(dumper));
+}
+
+TEST_F(IVFBuilderTest, TestBuildWithConverterClass) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster");
+  params.set(PARAM_IVF_BUILDER_CONVERTER_CLASS, "HalfFloatConverter");
+
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  auto centroid_index = builder.centroid_index();
+  EXPECT_GT(centroid_index->centroids_count(), 0u);
+
+  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("MemoryDumper");
+  ret = dumper->create("path");
+  EXPECT_EQ(0, ret);
+
+  ret = builder.dump(dumper);
+  EXPECT_EQ((size_t)1000, builder.stats().built_count());
+  EXPECT_EQ((size_t)1000, builder.stats().dumped_count());
+  EXPECT_EQ((size_t)0, builder.stats().discarded_count());
+}
+
+TEST_F(IVFBuilderTest, TestBuildWithConverterClassMultiLevel) {
+  IVFBuilder builder;
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4*2");
+  params.set(PARAM_IVF_BUILDER_CLUSTER_CLASS, "KmeansCluster*KmeansCluster");
+  params.set(PARAM_IVF_BUILDER_CONVERTER_CLASS, "HalfFloatConverter");
+
+  int ret = builder.init(index_meta_, params);
+  EXPECT_EQ(0, ret);
+
+  prepare_index_holder(0, 1000);
+
+  ret = builder.train(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  ret = builder.build(threads_, holder_);
+  EXPECT_EQ(0, ret);
+
+  auto centroid_index = builder.centroid_index();
+  EXPECT_EQ(centroid_index->centroids_count(), 8);
+
+  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("FileDumper");
+  ret = dumper->create("./ivf_converter_test.index");
+  EXPECT_EQ(0, ret);
+
+  ret = builder.dump(dumper);
+  EXPECT_EQ((size_t)1000, builder.stats().built_count());
+  EXPECT_EQ((size_t)1000, builder.stats().dumped_count());
+  EXPECT_EQ((size_t)0, builder.stats().discarded_count());
+  EXPECT_EQ(0, dumper->close());
+  File::RemovePath("./ivf_converter_test.index");
+}
+
+TEST_F(IVFBuilderTest, TestIndexThreads) {
+  IndexBuilder::Pointer builder1 = IndexFactory::CreateBuilder("IVFBuilder");
+  ASSERT_NE(builder1, nullptr);
+  IndexBuilder::Pointer builder2 = IndexFactory::CreateBuilder("IVFBuilder");
+  ASSERT_NE(builder2, nullptr);
+
+  size_t dim = 128UL;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  std::srand(Realtime::MilliSeconds());
+  auto holder =
+      std::make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(dim);
+  size_t doc_cnt = 1000;
+  for (size_t i = 0; i < doc_cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_TRUE(holder->emplace(i, vec));
+  }
+
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "2*2");
+  ASSERT_EQ(0, builder1->init(meta, params));
+  ASSERT_EQ(0, builder2->init(meta, params));
+
+  auto threads =
+      std::make_shared<SingleQueueIndexThreads>(std::rand() % 4, false);
+  auto build_index1 = [&]() {
+    ASSERT_EQ(0, builder1->train(threads, holder));
+    ASSERT_EQ(0, builder1->build(threads, holder));
+  };
+  auto build_index2 = [&]() {
+    ASSERT_EQ(0, builder2->train(threads, holder));
+    ASSERT_EQ(0, builder2->build(threads, holder));
+  };
+
+  auto t1 = std::async(std::launch::async, build_index1);
+  auto t2 = std::async(std::launch::async, build_index2);
+  t1.wait();
+  t2.wait();
+
+
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(dumper, nullptr);
+
+  std::string path = "./hc_index";
+  ASSERT_EQ(0, dumper->create(path));
+  ASSERT_EQ(0, builder1->dump(dumper));
+  ASSERT_EQ(0, dumper->close());
+  ASSERT_EQ(0, dumper->create(path));
+  ASSERT_EQ(0, builder2->dump(dumper));
+  ASSERT_EQ(0, dumper->close());
+
+  auto &stats1 = builder1->stats();
+  ASSERT_EQ(doc_cnt, stats1.built_count());
+  auto &stats2 = builder2->stats();
+  ASSERT_EQ(doc_cnt, stats2.built_count());
+}
+
+namespace zvec {
+namespace core {
+namespace {
+
+TEST(IVFTurboConfiguration, RejectsColumnOrderAndLegacyPostingQuantization) {
+  constexpr uint32_t kDimension = 18;
+  IndexMeta meta;
+  meta.set_meta(IndexMeta::DataType::DT_FP32, kDimension);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  meta.set_quantizer("Int8Quantizer", 0, ailego::Params());
+  auto quantizer = IndexFactory::CreateQuantizer("Int8Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  ASSERT_EQ(0, quantizer->init(meta, ailego::Params()));
+  ailego::Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "4");
+
+  {
+    IVFBuilder builder;
+    auto column_meta = meta;
+    column_meta.set_major_order(IndexMeta::MO_COLUMN);
+    EXPECT_NE(0, builder.init(column_meta, params, quantizer));
+  }
+  {
+    IVFBuilder builder;
+    auto conflicting_params = params;
+    conflicting_params.set(PARAM_IVF_BUILDER_QUANTIZER_CLASS,
+                           "Int8QuantizerConverter");
+    EXPECT_NE(0, builder.init(meta, conflicting_params, quantizer));
+  }
+  {
+    IVFBuilder builder;
+    auto conflicting_params = params;
+    conflicting_params.set(PARAM_IVF_BUILDER_QUANTIZE_BY_CENTROID, true);
+    EXPECT_NE(0, builder.init(meta, conflicting_params, quantizer));
+  }
+}
+
 }  // namespace
 }  // namespace core
 }  // namespace zvec

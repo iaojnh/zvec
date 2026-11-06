@@ -467,6 +467,9 @@ class BasicIndexCandidateHeap : public Base {
     // Do not reserve user-supplied topk before seeing any candidates.
     Base::limit(max, false);
   }
+  size_t limit() const {
+    return Base::limit();
+  }
 
  private:
   float threshold_{std::numeric_limits<float>::max()};

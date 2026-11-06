@@ -18,6 +18,7 @@
 #include <zvec/core/framework/index_meta.h>
 #include "utility/ordinal_access_holder.h"
 #include "utility/paged_record_sort.h"
+#include "utility/stable_vector_holder.h"
 #include "utility/temporary_buffer_storage.h"
 #include "ivf_centroid_index.h"
 
@@ -135,8 +136,10 @@ class IVFBuilder : public IndexBuilder {
     };
 
     //! Constructor
-    RandomAccessIndexHolder(const IndexMeta &meta)
-        : features_(std::make_shared<CompactIndexFeatures>(meta)) {}
+    RandomAccessIndexHolder(const IndexMeta &meta,
+                            std::shared_ptr<const void> lifetime = {})
+        : features_(std::make_shared<CompactIndexFeatures>(meta)),
+          lifetime_(std::move(lifetime)) {}
 
     //! Retrieve count of elements in holder (-1 indicates unknown)
     size_t count() const override {
@@ -171,7 +174,10 @@ class IVFBuilder : public IndexBuilder {
 
     void reserve(size_t elems) {
       if (!storage_) {
-        features_->reserve(elems);
+        if (lifetime_)
+          vectors_.reserve(elems);
+        else
+          features_->reserve(elems);
         keys_.reserve(elems);
       }
     }
@@ -207,7 +213,10 @@ class IVFBuilder : public IndexBuilder {
         try {
           keys_.emplace_back(pkey);
           try {
-            features_->emplace(vec);
+            if (lifetime_)
+              vectors_.emplace_back(vec);
+            else
+              features_->emplace(vec);
           } catch (...) {
             keys_.pop_back();
             throw;
@@ -231,9 +240,16 @@ class IVFBuilder : public IndexBuilder {
         if (ret != 0) return ret;
         *data = buffer->data();
       } else {
-        *data = features_->element(id);
+        *data = lifetime_ ? vectors_[id] : features_->element(id);
       }
       return 0;
+    }
+
+    const void *element(size_t id) const {
+      return lifetime_ ? vectors_.at(id) : features_->element(id);
+    }
+    bool borrowed() const {
+      return lifetime_ != nullptr;
     }
 
     int flush() {
@@ -270,6 +286,8 @@ class IVFBuilder : public IndexBuilder {
     ailego::BudgetedVector<uint64_t> keys_{};
     std::shared_ptr<TemporaryBufferStorage> storage_{};
     size_t count_{0}, capacity_{0}, key_offset_{0};
+    ailego::BudgetedVector<const void *> vectors_;
+    std::shared_ptr<const void> lifetime_;
   };
 
  private:

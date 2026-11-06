@@ -856,6 +856,8 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
     if (ret != 0) return ret;
     LOG_INFO("DiskANN connectivity repair added %zu edges", added_edges);
   }
+  ret = entity_.compact_neighbors();
+  if (ret != 0) return ret;
 
   // All graph workers have joined. Subsequent stages consume holder_, so
   // release the vector copy or borrowed view before allocating PQ buffers.
