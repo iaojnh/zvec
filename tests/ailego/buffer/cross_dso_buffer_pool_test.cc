@@ -16,12 +16,14 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include <zvec/ailego/pattern/scope_guard.h>
 
 extern "C" {
 void *zvec_test_dso_memory_limit_pool();
 void *zvec_test_dso_block_eviction_queue();
 bool zvec_test_dso_charge_external(size_t bytes);
 void zvec_test_dso_release_external(size_t bytes);
+bool zvec_test_dso_rss_pressure();
 }
 
 namespace zvec {
@@ -41,6 +43,22 @@ TEST(CrossDsoBufferPoolTest, SharesAddressesAndAccountingState) {
   EXPECT_EQ(pool.queue_metadata_used() + kVectorPageSize, pool.used());
   zvec_test_dso_release_external(kVectorPageSize);
   EXPECT_EQ(0u, pool.external_used());
+}
+
+TEST(CrossDsoBufferPoolTest, SharesProcessPressureAndRecovery) {
+  auto &pool = MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(4 * kVectorPageSize + pool.queue_allocated()));
+  const size_t previous = pool.process_rss_limit();
+  auto restore = ScopeGuard::Make(
+      [&] { pool.configure_process_rss_limit(previous); });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  ASSERT_TRUE(zvec_test_dso_rss_pressure());
+  EXPECT_FALSE(zvec_test_dso_charge_external(kVectorPageSize));
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  EXPECT_FALSE(zvec_test_dso_rss_pressure());
+  ASSERT_TRUE(zvec_test_dso_charge_external(kVectorPageSize));
+  EXPECT_EQ(kVectorPageSize, pool.external_used());
+  zvec_test_dso_release_external(kVectorPageSize);
 }
 
 }  // namespace ailego

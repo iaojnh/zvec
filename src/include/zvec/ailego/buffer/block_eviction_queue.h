@@ -81,7 +81,7 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
   }
 };
 
-class BlockEvictionQueue {
+class ZVEC_AILEGO_API BlockEvictionQueue {
  public:
   static constexpr size_t kQueueCount = 3;
   static constexpr uint8_t kProbationPriority = 0;
@@ -98,7 +98,8 @@ class BlockEvictionQueue {
       ConcurrentQueue;
 
   static BlockEvictionQueue &get_instance() {
-    // Weak COMDAT storage keeps the singleton shared across loaded images.
+    // ELF/Mach-O coalescing and the Windows DLL interface keep this storage
+    // shared with clients of the same loaded library.
     static std::atomic<BlockEvictionQueue *> instance{nullptr};
     BlockEvictionQueue *current = instance.load(std::memory_order_acquire);
     if (current != nullptr) {
@@ -235,7 +236,7 @@ class BlockEvictionQueue {
   size_t cleanup_next_queue_{0};
 };
 
-class MemoryLimitPool {
+class ZVEC_AILEGO_API MemoryLimitPool {
  public:
   static MemoryLimitPool &get_instance() {
     // Retain process-wide state while any loaded image may reference it.
