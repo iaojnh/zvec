@@ -49,7 +49,9 @@ void FhtRotator::init_context(size_t dim) {
   // use caller-owned output as scratch, so no unbudgeted inverse copy remains.
   ailego::BudgetedVector<uint8_t> replacement(sizeof(turbo::FhtCtx) +
                                               4 * flip_offset);
-  auto *ctx = new (replacement.data()) turbo::FhtCtx{};
+  // The byte buffer is already zeroed. Avoid aggregate initialization of the
+  // trailing flexible array, which MSVC rejects as a zero-sized allocation.
+  auto *ctx = new (replacement.data()) turbo::FhtCtx;
   ctx->flip_offset = flip_offset;
   ctx->trunc_dim = floor_pow2(dim);
   ctx->fac = 1.0f / std::sqrt(static_cast<float>(ctx->trunc_dim));
