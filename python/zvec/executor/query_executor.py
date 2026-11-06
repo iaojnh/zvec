@@ -39,9 +39,21 @@ DTYPE_MAP = {
 }
 
 
+def _query_text(value):
+    # Avoid populating a persistent UTF-8 cache on caller-owned strings. The
+    # transient bytes and native copy are covered by QueryInputMemory.
+    return value.encode("utf-8") if isinstance(value, str) else value
+
+
+def _query_fields(values):
+    if values is None or isinstance(values, (str, bytes, bytearray)):
+        return values
+    return [_query_text(value) for value in values]
+
+
 def convert_to_numpy(vec: Union[list, np.ndarray], dtype: np.dtype) -> np.ndarray:
     if isinstance(vec, np.ndarray):
-        if vec.dtype == dtype and vec.ndim == 1:
+        if vec.dtype == dtype and vec.ndim == 1 and vec.flags.c_contiguous:
             return vec
         return np.asarray(vec, dtype=dtype).flatten()
 
@@ -108,13 +120,14 @@ class QueryExecutor:
         self._schema = schema
 
     def _build_queries(
-        self, ctx: QueryContext, collection: _Collection
+        self, ctx: QueryContext, collection: _Collection, memory=None
     ) -> list[_SearchQuery]:
         """Build query vector list (no validation, conversion only)."""
         if not ctx.queries:
             return [self._build_base_search_query(ctx)]
         return [
-            self._build_search_query(ctx, query, collection) for query in ctx.queries
+            self._build_search_query(ctx, query, collection, memory)
+            for query in ctx.queries
         ]
 
     def execute(self, ctx: QueryContext, collection: _Collection) -> DocList:
@@ -123,7 +136,15 @@ class QueryExecutor:
         A single (or vector-less) query is sent to C++ as a ``_SearchQuery``;
         multiple queries are assembled into a ``_MultiQuery``.
         """
-        queries = self._build_queries(ctx, collection)
+        memory = collection.QueryInputMemory(ctx.queries, ctx.filter, ctx.output_fields)
+        if type(ctx.queries) not in (list, tuple):
+            ctx._queries = memory.queries
+        if ctx.output_fields is not None and type(ctx.output_fields) not in (
+            list,
+            tuple,
+        ):
+            ctx._output_fields = memory.output_fields
+        queries = self._build_queries(ctx, collection, memory)
         if not queries:
             raise ValueError("No query to execute")
 
@@ -181,10 +202,10 @@ class QueryExecutor:
             sub.num_candidates = max(ctx.topk, _DEFAULT_NUM_CANDIDATES)
         multi_query.topk = ctx.topk
         if ctx.filter:
-            multi_query.filter = ctx.filter
+            multi_query.filter = _query_text(ctx.filter)
         multi_query.include_vector = ctx.include_vector
         if ctx.output_fields is not None:
-            multi_query.output_fields = ctx.output_fields
+            multi_query.output_fields = _query_fields(ctx.output_fields)
         # Set rerank strategy via the C++ variant-based API.
         reranker = ctx.reranker
         if isinstance(reranker, RrfReRanker):
@@ -214,21 +235,21 @@ class QueryExecutor:
         search_query.topk = ctx.topk
         search_query.include_vector = ctx.include_vector
         if ctx.filter:
-            search_query.filter = ctx.filter
+            search_query.filter = _query_text(ctx.filter)
         if ctx.output_fields is not None:
-            search_query.output_fields = ctx.output_fields
+            search_query.output_fields = _query_fields(ctx.output_fields)
         return search_query
 
     def _apply_fts(self, query: Query, search_query: _SearchQuery) -> None:
         """Set FTS query on search_query if the query has FTS parameters."""
         if query.has_fts():
             fts = _Fts()
-            fts.query_string = query._fts_query_string()
-            fts.match_string = query._fts_match_string()
+            fts.query_string = _query_text(query._fts_query_string())
+            fts.match_string = _query_text(query._fts_match_string())
             search_query.fts = fts
 
     def set_query_vector(
-        self, query: Query, search_query, collection: _Collection
+        self, query: Query, search_query, collection: _Collection, memory=None
     ) -> None:
         """Resolve a Query vector and set it on a native query object."""
         vector_schema = self._schema.vector(query.field_name)
@@ -238,11 +259,13 @@ class QueryExecutor:
         if query.has_vector():
             vec_data = query.vector
         elif query.has_id():
-            fetched = collection.Fetch([query.id])
+            fetched = collection.FetchTuples([query.id], [], True)
             doc = next(iter(fetched.values()), None)
             if not doc:
                 raise ValueError(f"Document with id '{query.id}' not found")
-            vec_data = doc.get_any(vector_schema.name, vector_schema.data_type)
+            vec_data = doc[3].get(vector_schema.name)
+            if memory is not None:
+                memory.reserve_vector(vec_data)
         else:
             raise ValueError("Group by query requires a vector or document id")
 
@@ -253,11 +276,11 @@ class QueryExecutor:
         )
 
     def _build_search_query(
-        self, ctx: QueryContext, query: Query, collection: _Collection
+        self, ctx: QueryContext, query: Query, collection: _Collection, memory=None
     ) -> _SearchQuery:
         query._validate()
         search_query = self._build_base_search_query(ctx)
-        search_query.field_name = query.field_name
+        search_query.field_name = _query_text(query.field_name)
         if query.param:
             search_query.query_params = query.param
 
@@ -265,5 +288,5 @@ class QueryExecutor:
         self._apply_fts(query, search_query)
 
         if query.has_vector() or query.has_id():
-            self.set_query_vector(query, search_query, collection)
+            self.set_query_vector(query, search_query, collection, memory)
         return search_query

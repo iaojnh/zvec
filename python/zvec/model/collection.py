@@ -24,6 +24,7 @@ from zvec._zvec import _Collection
 from zvec._zvec.param import _GroupByVectorQuery
 
 from ..executor import QueryContext, QueryExecutor
+from ..executor.query_executor import _query_fields, _query_text
 from ..extension import ReRanker
 from ..typing import Status
 from ._validation import explain_utf8_conversion_error
@@ -566,7 +567,8 @@ class Collection:
             raise ValueError(msg)
         _require_positive_integer(topk, "topk")
         ctx = QueryContext(topk=topk, filter=filter, queries=[query])
-        cpp_query = self._querier._build_search_query(ctx, query, self._obj)
+        memory = self._obj.QueryInputMemory(ctx.queries, ctx.filter, ctx.output_fields)
+        cpp_query = self._querier._build_search_query(ctx, query, self._obj, memory)
         return self._obj.QueryInternalIds(cpp_query, return_scores)
 
     def resolve_internal_ids(
@@ -697,6 +699,11 @@ class Collection:
             >>> for group in results:
             ...     print(group.group_by_value, len(group.docs))
         """
+        memory = self._obj.QueryInputMemory(
+            [query], filter, output_fields, group_by_field_name
+        )
+        if output_fields is not None and type(output_fields) not in (list, tuple):
+            output_fields = memory.output_fields
         query._validate()
         if query.has_fts():
             raise ValueError("Group by query does not support FTS")
@@ -707,18 +714,18 @@ class Collection:
         _require_positive_integer(group_count, "group_count")
         _require_positive_integer(topk_per_group, "topk_per_group")
         cpp_query = _GroupByVectorQuery()
-        cpp_query.field_name = query.field_name
-        cpp_query.group_by_field_name = group_by_field_name
+        cpp_query.field_name = _query_text(query.field_name)
+        cpp_query.group_by_field_name = _query_text(group_by_field_name)
         cpp_query.group_count = group_count
         cpp_query.topk_per_group = topk_per_group
         cpp_query.include_vector = include_vector
         if filter:
-            cpp_query.filter = filter
+            cpp_query.filter = _query_text(filter)
         if output_fields is not None:
-            cpp_query.output_fields = output_fields
+            cpp_query.output_fields = _query_fields(output_fields)
         if query.param:
             cpp_query.query_params = query.param
-        self._querier.set_query_vector(query, cpp_query, self._obj)
+        self._querier.set_query_vector(query, cpp_query, self._obj, memory)
 
         raw_results = self._obj.GroupByQuery(cpp_query)
 

@@ -26,7 +26,9 @@ class WriteBufferMemoryAllowance {
   size_t acquire(size_t bytes, size_t backing) {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(backing <= bytes);
-    if (!ailego::MemoryLimitPool::get_instance().capacity()) return 0;
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    if (!pool.capacity()) return 0;
+    if (!pool.materialization_allowed()) throw std::bad_alloc();
     if (bytes > std::numeric_limits<size_t>::max() - active_)
       throw std::bad_alloc();
     const size_t target = active_ + bytes;
@@ -130,6 +132,11 @@ class WriteBufferReservation {
   Status acquire_impl(size_t max_buffer_size, size_t backing) {
     auto &allowance = detail::SharedWriteBufferMemoryAllowance();
     if (bytes_ != 0) {
+      // A live writer reuses its lease between operations, but its ordinary
+      // heap allocations must still obey newly observed host pressure.
+      if (!ailego::MemoryLimitPool::get_instance().materialization_allowed())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "Write buffer materialization blocked by memory pressure");
       backing = std::max(backing_, std::min(backing, bytes_));
       allowance.retain_backing(backing_, backing);
       backing_ = backing;

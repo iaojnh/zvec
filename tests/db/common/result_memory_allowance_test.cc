@@ -46,6 +46,31 @@ TEST_F(ResultMemoryAllowanceTest, RetainsAndReusesBackingAfterCallsFinish) {
   }
 }
 
+TEST_F(ResultMemoryAllowanceTest, ReusedBackingObeysCriticalPressureAndRecovery) {
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease warmup(&allowance);
+    warmup.add(kMiB);
+  }
+  const auto backing = allowance.reserved_bytes();
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  native.set_memory_pressure(Pressure::kCritical);
+  {
+    ResultMemoryAllowance::Lease blocked(&allowance);
+    EXPECT_THROW(blocked.add(kMiB), std::bad_alloc);
+  }
+  // Background still permits mandatory work within an existing reservation.
+  native.set_memory_pressure(Pressure::kBackground);
+  {
+    ResultMemoryAllowance::Lease recovered(&allowance);
+    EXPECT_NO_THROW(recovered.add(kMiB));
+  }
+  native.set_memory_pressure(Pressure::kNormal);
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(backing, allowance.reserved_bytes());
+}
+
 TEST_F(ResultMemoryAllowanceTest, ConcurrentCallsShareOneHighWaterAllowance) {
   ResultMemoryAllowance allowance;
   std::atomic<size_t> ready{0};

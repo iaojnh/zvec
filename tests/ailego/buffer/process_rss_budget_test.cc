@@ -372,5 +372,33 @@ TEST(ProcessRssBudgetTest, HostRecoveryAfterResidentRetirementKeepsMetadata) {
   EXPECT_FALSE(budget.pressure());
   EXPECT_EQ(800 * kMiB, budget.available());
 }
+
+TEST(ProcessRssBudgetTest, ReservedMaterializationObeysObservedLimits) {
+  ProcessRssBudget budget;
+  sampled_rss = 32 * kMiB;
+  native_sample = {64 * kMiB, 64 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  EXPECT_TRUE(budget.materialization_allowed());
+  budget.set_external_pressure(ProcessRssBudget::PressureLevel::kBackground);
+  EXPECT_TRUE(budget.materialization_allowed());
+  budget.set_external_pressure(ProcessRssBudget::PressureLevel::kCritical);
+  EXPECT_FALSE(budget.materialization_allowed());
+  budget.set_external_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  sampled_rss = 128 * kMiB;
+  budget.refresh(true);
+  EXPECT_FALSE(budget.materialization_allowed());
+  sampled_rss = 32 * kMiB;
+  native_sample = {120 * kMiB, 0};
+  budget.refresh(true);
+  EXPECT_FALSE(budget.materialization_allowed());
+  native_sample_valid = false;
+  budget.refresh(true);
+  EXPECT_FALSE(budget.materialization_allowed());
+  native_sample_valid = true;
+  native_sample = {64 * kMiB, 64 * kMiB};
+  budget.refresh(true);
+  EXPECT_TRUE(budget.materialization_allowed());
+}
 }  // namespace
 }  // namespace zvec::ailego

@@ -105,6 +105,15 @@ int main(void) {
   zvec_doc_set_pk(doc, "small");
   assert(zvec_doc_add_field_by_value(doc, "payload", ZVEC_DATA_TYPE_STRING,
                                      "ok", 2) == ZVEC_OK);
+  // Reusing the retained high water must still obey a new host notification.
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  void *blocked = (void *)1;
+  size_t blocked_size = 123;
+  assert(zvec_doc_get_field_value_copy(doc, "payload", ZVEC_DATA_TYPE_STRING,
+                                       &blocked, &blocked_size) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(blocked == NULL && blocked_size == 0);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_BACKGROUND) == ZVEC_OK);
   for (size_t i = 0; i < 100; ++i) {
     void *value = NULL;
     size_t size = 0;
@@ -113,6 +122,7 @@ int main(void) {
     assert(size == 2 && memcmp(value, "ok", 2) == 0);
     zvec_free(value);
   }
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
   const char *pk = zvec_doc_get_pk_copy(doc);
   assert(pk && strcmp(pk, "small") == 0);
   zvec_free((void *)pk);

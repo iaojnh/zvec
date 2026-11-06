@@ -47,6 +47,25 @@ TEST_F(WriteBufferReservationTest, LargeAllowanceIncludesFlushHeadroom) {
   EXPECT_EQ(264 * kMiB, pool_.external_used());
 }
 
+TEST_F(WriteBufferReservationTest, RetainedAndLiveAllowancesObeyHostPressure) {
+  WriteBufferReservation writer;
+  ASSERT_TRUE(writer.acquire(kMiB, true).ok());
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  pool.set_memory_pressure(Pressure::kCritical);
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, writer.acquire(kMiB, true).code());
+  writer.release();
+  const auto backing =
+      detail::SharedWriteBufferMemoryAllowance().reserved_bytes();
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, writer.acquire(kMiB, true).code());
+  EXPECT_EQ(0u, writer.bytes());
+  pool.set_memory_pressure(Pressure::kBackground);
+  EXPECT_TRUE(writer.acquire(kMiB, true).ok());
+  pool.set_memory_pressure(Pressure::kNormal);
+  EXPECT_EQ(backing,
+            detail::SharedWriteBufferMemoryAllowance().reserved_bytes());
+}
+
 TEST_F(WriteBufferReservationTest, CollectionsShareBudgetAndReturnAllowance) {
   pool_.init(528 * kMiB);
   WriteBufferReservation first;

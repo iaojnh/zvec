@@ -28,6 +28,7 @@
 #include "db/common/result_memory_allowance.h"
 #include "python_doc.h"
 #include "python_fetch_memory.h"
+#include "python_query_memory.h"
 #include "python_write_memory.h"
 
 namespace zvec {
@@ -730,6 +731,12 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
 }
 
 void ZVecPyCollection::Initialize(pybind11::module_ &m) {
+  py::class_<detail::PythonQueryMemory,
+             std::shared_ptr<detail::PythonQueryMemory>>(m, "_QueryInputMemory")
+      .def_property_readonly("queries", &detail::PythonQueryMemory::queries)
+      .def_property_readonly("output_fields",
+                             &detail::PythonQueryMemory::output_fields)
+      .def("reserve_vector", &detail::PythonQueryMemory::reserve_vector);
   py::class_<detail::PythonWriteMemory,
              std::shared_ptr<detail::PythonWriteMemory>>(m, "_WriteInputMemory")
       .def("new_doc", &detail::PythonWriteMemory::new_doc)
@@ -962,6 +969,18 @@ void ZVecPyCollection::bind_dml_methods(
 
 void ZVecPyCollection::bind_dql_methods(
     py::class_<Collection, Collection::Ptr> &col) {
+  col.def(
+      "QueryInputMemory",
+      [](const Collection &self, py::handle queries, py::handle filter,
+         py::handle fields, py::handle group_field) {
+        const bool budgeted = !unwrap_expected(self.options()).enable_mmap_;
+        return std::make_shared<detail::PythonQueryMemory>(
+            budgeted ? &forward_result_allowance() : nullptr, queries, filter,
+            fields, group_field);
+      },
+      py::arg("queries"), py::arg("filter") = py::none(),
+      py::arg("output_fields") = py::none(),
+      py::arg("group_field") = py::none());
   // Query with the GIL released, then materialize all hits into
   // (id, score, fields, vectors) tuples in one crossing (see docs_to_tuples).
   // execute_for_python captures the docs and the schema snapshot atomically

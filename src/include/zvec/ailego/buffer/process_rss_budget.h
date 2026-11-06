@@ -107,6 +107,28 @@ class ProcessRssBudget {
     refresh_locked(force);
   }
 
+  // Ordinary-heap allowances retain accounting, not reusable physical buffers.
+  // Reusing their high water still calls malloc/new and must obey a new host
+  // pressure notification or an exhausted observed process/application limit.
+  // Do not charge the reserved backing twice or block mandatory work merely
+  // because optional caches are under BACKGROUND pressure.
+  bool materialization_allowed() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    refresh_locked(false);
+    if (external_pressure_ == PressureLevel::kCritical) return false;
+    const size_t cap = limit();
+    if (!cap) return true;
+    if (rss_.load(std::memory_order_relaxed) >= cap) return false;
+    if (native_reader_) {
+      const size_t native_cap = std::min(cap, native_limit_);
+      const size_t footprint = native_estimate_.sample_;
+      if (footprint >= native_cap ||
+          native_cap - footprint <= headroom(native_cap))
+        return false;
+    }
+    return true;
+  }
+
   size_t limit() const {
     return limit_.load(std::memory_order_relaxed);
   }

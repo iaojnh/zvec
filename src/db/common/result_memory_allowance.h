@@ -89,8 +89,10 @@ class ResultMemoryAllowance {
   friend class MemoryBudgetTestPeer;
   size_t acquire(size_t bytes, size_t backing_quantum) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const size_t capacity = ailego::MemoryLimitPool::get_instance().capacity();
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    const size_t capacity = pool.capacity();
     if (!capacity) return 0;
+    if (!pool.materialization_allowed()) throw std::bad_alloc();
     // One result-equivalent for active objects, another for allocation growth
     // and previously freed backing. This is a conservative planning policy,
     // not a claim that an arbitrary system allocator has bounded fragmentation.
