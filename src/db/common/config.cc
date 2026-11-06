@@ -13,9 +13,11 @@
 // limitations under the License.
 
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/utility/file_helper.h>
 #include <zvec/db/config.h>
 #include <zvec/db/status.h>
 #include "db/common/constants.h"
@@ -49,6 +51,17 @@ GlobalConfig::ConfigData::ConfigData()
       optimize_thread_binding(false) {}
 
 Status GlobalConfig::validate(const ConfigData &config) const {
+  if (!config.temporary_directory.empty()) {
+    std::error_code error;
+    if (config.temporary_directory.find('\0') != std::string::npos ||
+        !std::filesystem::is_directory(
+            ailego::FileHelper::PathFromUtf8(config.temporary_directory),
+            error) ||
+        error) {
+      return Status::InvalidArgument(
+          "temporary_directory must name an existing directory");
+    }
+  }
   const uint64_t minimum = detail::kMobileMemoryPolicy
                                ? detail::kMobileMinimumMemoryLimit
                                : MIN_MEMORY_LIMIT_BYTES;
@@ -202,6 +215,15 @@ Status GlobalConfig::initialize(const ConfigData &config) {
       if (!exit_handler_registered) {
         std::cerr << "Failed to register exit handler" << std::endl;
         result = Status::InternalError("Failed to register exit handler");
+      }
+    }
+
+    if (result.ok()) {
+      if (!ailego::FileHelper::SetTemporaryDirectory(
+              effective_config.temporary_directory)) {
+        result =
+            Status::InvalidArgument("Failed to configure temporary_directory: ",
+                                    ailego::FileHelper::GetLastErrorString());
       }
     }
 

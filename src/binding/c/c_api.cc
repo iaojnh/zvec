@@ -678,6 +678,29 @@ uint32_t zvec_config_data_get_optimize_thread_count(
 // Initialization and cleanup interface implementation
 // =============================================================================
 
+zvec_error_code_t zvec_config_data_set_temporary_directory(
+    zvec_config_data_t *config, const char *directory) {
+  if (!config || !directory) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Config or directory is null");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to set temporary directory",
+      reinterpret_cast<zvec::GlobalConfig::ConfigData *>(config)
+          ->temporary_directory = directory;
+      return ZVEC_OK;)
+}
+
+const char *zvec_config_data_get_temporary_directory(
+    const zvec_config_data_t *config) {
+  if (!config) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Config pointer is null");
+    return nullptr;
+  }
+  return reinterpret_cast<const zvec::GlobalConfig::ConfigData *>(config)
+      ->temporary_directory.c_str();
+}
+
 zvec_error_code_t zvec_initialize(const zvec_config_data_t *config) {
   std::lock_guard<std::mutex> lock(g_init_mutex);
 

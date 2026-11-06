@@ -235,6 +235,8 @@
     zvec_index_type_to_string;
     zvec_initialize;
     zvec_set_memory_pressure;
+    zvec_config_data_set_temporary_directory;
+    zvec_config_data_get_temporary_directory;
     zvec_int64_array_create;
     zvec_int64_array_destroy;
     zvec_is_initialized;

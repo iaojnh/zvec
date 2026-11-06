@@ -69,6 +69,7 @@ int GlobalResource::initialize() {
     return 0;
   }
   std::lock_guard<std::mutex> lock(initialization_mutex_);
+  if (initialization_failed_) return -1;
   if (query_thread_pool_ && optimize_thread_pool_) {
     return 0;
   }
@@ -109,6 +110,7 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
                                       uint32_t optimize_thread_count,
                                       bool optimize_thread_binding,
                                       bool preserve_existing_pool) {
+  if (initialization_failed_) return -1;
   try {
     auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
     const uint64_t rocksdb_memory_capacity =
@@ -176,6 +178,11 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
                 calculate_rocksdb_write_buffer_budget(rocksdb_memory_capacity)),
             rocksdb_block_cache,
             /*allow_stall=*/true);
+    // From here failures can leave a configured pool, native reservations or
+    // an RSS reclaimer behind. Keep all later access failed rather than
+    // mistaking that partial DB state for an independently configured pool.
+    // Incompatible standalone configurations were rejected above, unchanged.
+    initialization_failed_ = true;
     if (memory_pool.init(static_cast<size_t>(buffer_pool_capacity)) != 0) {
       return -1;
     }
@@ -215,6 +222,7 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     this->optimize_thread_pool_ = std::move(optimize_thread_pool);
     rocksdb_block_cache_ = std::move(rocksdb_block_cache);
     rocksdb_write_buffer_manager_ = std::move(rocksdb_write_buffer_manager);
+    initialization_failed_ = false;
     initialized_.store(true, std::memory_order_release);
     LOG_INFO(
         "Managed memory initialized: total=%llu buffer_pool=%llu "

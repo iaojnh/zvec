@@ -156,10 +156,9 @@ int VectorBuildSource::init(IndexHolder::Pointer holder,
     if (buffered && !file_) {
       std::string prefix = scratch_prefix;
       if (prefix.empty()) {
-        std::error_code error;
-        auto dir = std::filesystem::temp_directory_path(error);
-        if (error) return IndexError_OpenFile;
-        prefix = ailego::FileHelper::PathToUtf8(dir / "zvec-build-input");
+        const int ret =
+            TemporaryBufferStorage::DefaultPrefix("zvec-build-input", &prefix);
+        if (ret != 0) return ret;
       }
       int ret = TemporaryBufferStorage::CreateEmpty(prefix, &file_);
       if (ret != 0) return ret;

@@ -15,6 +15,8 @@ namespace zvec {
 namespace {
 
 constexpr size_t kMiB = 1024 * 1024;
+// Exercise the same large-buffer pressure on desktop and mobile targets.
+constexpr size_t kStressBufferBytes = 64 * kMiB;
 
 class WriteBufferReservationTest : public testing::Test {
  protected:
@@ -29,19 +31,19 @@ class WriteBufferReservationTest : public testing::Test {
   ailego::PoolPayloadBudget &pool_ = ailego::PoolPayloadBudget::get_instance();
 };
 
-TEST_F(WriteBufferReservationTest, DefaultAllowanceIncludesFlushHeadroom) {
+TEST_F(WriteBufferReservationTest, LargeAllowanceIncludesFlushHeadroom) {
   WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
   EXPECT_EQ(264 * kMiB, writer.bytes());
   EXPECT_EQ(writer.bytes(), pool_.external_used());
   EXPECT_EQ(writer.bytes(), pool_.used());
   // Further writes to the same live buffer must not reserve another allowance.
-  ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
   EXPECT_EQ(264 * kMiB, pool_.external_used());
   writer.release();
   writer.release();
   EXPECT_EQ(0u, pool_.external_used());
-  ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
   EXPECT_EQ(264 * kMiB, pool_.external_used());
 }
 
@@ -50,14 +52,14 @@ TEST_F(WriteBufferReservationTest, CollectionsShareBudgetAndReturnAllowance) {
   WriteBufferReservation first;
   WriteBufferReservation second;
   WriteBufferReservation third;
-  ASSERT_TRUE(first.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
-  ASSERT_TRUE(second.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(first.acquire(kStressBufferBytes).ok());
+  ASSERT_TRUE(second.acquire(kStressBufferBytes).ok());
   EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
-            third.acquire(DEFAULT_MAX_BUFFER_SIZE).code());
+            third.acquire(kStressBufferBytes).code());
   EXPECT_EQ(0u, third.bytes());
   EXPECT_EQ(528 * kMiB, pool_.external_used());
   first.release();
-  ASSERT_TRUE(third.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(third.acquire(kStressBufferBytes).ok());
   EXPECT_EQ(528 * kMiB, pool_.external_used());
 }
 
@@ -70,7 +72,7 @@ TEST_F(WriteBufferReservationTest, ConcurrentAdmissionCannotOverReserve) {
   for (unsigned i = 0; i < 12; ++i) {
     threads.emplace_back([&] {
       WriteBufferReservation writer;
-      if (writer.acquire(DEFAULT_MAX_BUFFER_SIZE, true).ok()) ++admitted;
+      if (writer.acquire(kStressBufferBytes, true).ok()) ++admitted;
       ++ready;
       while (!release.load()) std::this_thread::yield();
     });
@@ -89,7 +91,7 @@ TEST_F(WriteBufferReservationTest, ActualWritesRetainAndReuseBacking) {
   for (int i = 0; i < 3; ++i) {
     {
       WriteBufferReservation writer;
-      ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE, true).ok());
+      ASSERT_TRUE(writer.acquire(kStressBufferBytes, true).ok());
       EXPECT_EQ(264 * kMiB, allowance.active_bytes());
       EXPECT_EQ(264 * kMiB, pool_.external_used());
       writer.release();
@@ -111,9 +113,9 @@ TEST_F(WriteBufferReservationTest, ManagedWritesRetainOnlyOrdinaryWorkspace) {
   auto &allowance = detail::SharedWriteBufferMemoryAllowance();
   for (int i = 0; i < 3; ++i) {
     WriteBufferReservation writer;
-    ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
-    ASSERT_TRUE(writer.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).ok());
-    ASSERT_TRUE(writer.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).ok());
+    ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
+    ASSERT_TRUE(writer.acquire_managed(kStressBufferBytes).ok());
+    ASSERT_TRUE(writer.acquire_managed(kStressBufferBytes).ok());
     EXPECT_EQ(264 * kMiB, allowance.active_bytes());
     writer.release();
     EXPECT_EQ(0u, allowance.active_bytes());
@@ -126,20 +128,20 @@ TEST_F(WriteBufferReservationTest, ManagedAndReplayBackingAreCountedPerLease) {
   WriteBufferReservation first;
   WriteBufferReservation second;
   WriteBufferReservation admission;
-  ASSERT_TRUE(first.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).ok());
-  ASSERT_TRUE(second.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
-  ASSERT_TRUE(admission.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
-  ASSERT_TRUE(second.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(first.acquire_managed(kStressBufferBytes).ok());
+  ASSERT_TRUE(second.acquire(kStressBufferBytes).ok());
+  ASSERT_TRUE(admission.acquire(kStressBufferBytes).ok());
+  ASSERT_TRUE(second.acquire_managed(kStressBufferBytes).ok());
   auto &allowance = detail::SharedWriteBufferMemoryAllowance();
   admission.release();
   second.release();
   first.release();
   EXPECT_EQ(16 * kMiB, allowance.reserved_bytes());
 
-  ASSERT_TRUE(first.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).ok());
-  ASSERT_TRUE(second.acquire(DEFAULT_MAX_BUFFER_SIZE, true).ok());
+  ASSERT_TRUE(first.acquire_managed(kStressBufferBytes).ok());
+  ASSERT_TRUE(second.acquire(kStressBufferBytes, true).ok());
   // An explicit legacy backing lease must not be downgraded by a later call.
-  ASSERT_TRUE(second.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(second.acquire_managed(kStressBufferBytes).ok());
   second.release();
   first.release();
   EXPECT_EQ(272 * kMiB, allowance.reserved_bytes());
@@ -148,9 +150,9 @@ TEST_F(WriteBufferReservationTest, ManagedAndReplayBackingAreCountedPerLease) {
 TEST_F(WriteBufferReservationTest, RejectedManagedWriterDoesNotRetainBacking) {
   WriteBufferReservation first;
   WriteBufferReservation second;
-  ASSERT_TRUE(first.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(first.acquire_managed(kStressBufferBytes).ok());
   EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
-            second.acquire_managed(DEFAULT_MAX_BUFFER_SIZE).code());
+            second.acquire_managed(kStressBufferBytes).code());
   first.release();
   EXPECT_EQ(8 * kMiB,
             detail::SharedWriteBufferMemoryAllowance().reserved_bytes());
@@ -159,14 +161,14 @@ TEST_F(WriteBufferReservationTest, RejectedManagedWriterDoesNotRetainBacking) {
 TEST_F(WriteBufferReservationTest, TransientAdmissionOnlyReturnsExcess) {
   auto &allowance = detail::SharedWriteBufferMemoryAllowance();
   WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
   writer.release();
   EXPECT_EQ(0u, allowance.reserved_bytes());
 
   // An explicit backing request promotes an admitted lease without charging
   // twice. A later clean-open check must not increase the retained high water.
-  ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
-  ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE, true).ok());
+  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
+  ASSERT_TRUE(writer.acquire(kStressBufferBytes, true).ok());
   EXPECT_EQ(264 * kMiB, pool_.external_used());
   writer.release();
   ASSERT_TRUE(writer.acquire(96 * kMiB).ok());
@@ -180,21 +182,21 @@ TEST_F(WriteBufferReservationTest,
   WriteBufferReservation first;
   WriteBufferReservation second;
   auto &allowance = detail::SharedWriteBufferMemoryAllowance();
-  ASSERT_TRUE(first.acquire(DEFAULT_MAX_BUFFER_SIZE, true).ok());
+  ASSERT_TRUE(first.acquire(kStressBufferBytes, true).ok());
   EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
-            second.acquire(DEFAULT_MAX_BUFFER_SIZE, true).code());
+            second.acquire(kStressBufferBytes, true).code());
   EXPECT_EQ(0u, second.bytes());
   EXPECT_EQ(264 * kMiB, allowance.active_bytes());
   EXPECT_EQ(264 * kMiB, allowance.reserved_bytes());
   EXPECT_FALSE(detail::MemoryBudgetTestPeer::reset_idle_allowances());
   first.release();
-  ASSERT_TRUE(second.acquire(DEFAULT_MAX_BUFFER_SIZE, true).ok());
+  ASSERT_TRUE(second.acquire(kStressBufferBytes, true).ok());
   EXPECT_EQ(264 * kMiB, pool_.external_used());
 }
 
 TEST_F(WriteBufferReservationTest, ReservationLeavesOnlyRemainderForCache) {
   WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
   const auto remainder = pool_.capacity() - writer.bytes();
   ASSERT_TRUE(pool_.try_charge_external(remainder));
   EXPECT_FALSE(pool_.try_charge_external(1));
@@ -211,7 +213,7 @@ TEST_F(WriteBufferReservationTest, OverflowFailsWithoutConsumingBudget) {
 TEST_F(WriteBufferReservationTest, UnconfiguredPoolRetainsLegacyBehavior) {
   pool_.init(0);
   WriteBufferReservation writer;
-  EXPECT_TRUE(writer.acquire(DEFAULT_MAX_BUFFER_SIZE).ok());
+  EXPECT_TRUE(writer.acquire(kStressBufferBytes).ok());
   EXPECT_EQ(0u, writer.bytes());
 }
 

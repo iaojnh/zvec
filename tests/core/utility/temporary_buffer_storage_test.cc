@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <thread>
@@ -24,6 +25,7 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include "utility/paged_build_buffer.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
@@ -153,4 +155,81 @@ TEST_F(TemporaryBufferStorageTest, CreatesUtf8ParentsAndOnlyCleansOwnedFiles) {
   EXPECT_FALSE(std::filesystem::exists(path));
   EXPECT_FALSE(std::filesystem::exists(path.parent_path()));
   EXPECT_TRUE(std::filesystem::is_directory(child));
+}
+
+TEST_F(TemporaryBufferStorageTest,
+       HostDirectoryOverridesUnavailableSystemTemp) {
+  const auto directory = std::filesystem::absolute(
+      ailego::FileHelper::PathFromUtf8(u8"host_scratch_测试"));
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+#if defined(_WIN32)
+  const char *variable = "TMP";
+#else
+  const char *variable = "TMPDIR";
+#endif
+  const char *previous = std::getenv(variable);
+  const bool had_previous = previous != nullptr;
+  const std::string saved = previous ? previous : "";
+  AILEGO_DEFER([&]() {
+    EXPECT_TRUE(ailego::FileHelper::SetTemporaryDirectory(""));
+#if defined(_WIN32)
+    _putenv_s(variable, had_previous ? saved.c_str() : "");
+#else
+    if (had_previous)
+      setenv(variable, saved.c_str(), 1);
+    else
+      unsetenv(variable);
+#endif
+    std::error_code error;
+    std::filesystem::remove(directory, error);
+  });
+  const auto missing = ailego::FileHelper::PathToUtf8(directory / "missing");
+#if defined(_WIN32)
+  ASSERT_EQ(0, _putenv_s(variable, missing.c_str()));
+#else
+  ASSERT_EQ(0, setenv(variable, missing.c_str(), 1));
+#endif
+  ASSERT_TRUE(ailego::FileHelper::SetTemporaryDirectory(""));
+  std::string prefix;
+  EXPECT_EQ(IndexError_OpenFile,
+            TemporaryBufferStorage::DefaultPrefix("probe", &prefix));
+  ASSERT_TRUE(ailego::FileHelper::SetTemporaryDirectory(
+      ailego::FileHelper::PathToUtf8(directory)));
+  ASSERT_EQ(0, TemporaryBufferStorage::DefaultPrefix("probe", &prefix));
+  TemporaryBufferStorage::Pointer storage;
+  ASSERT_EQ(0, TemporaryBufferStorage::Create(prefix, 128, &storage));
+  const auto path = ailego::FileHelper::PathFromUtf8(storage->path());
+  EXPECT_TRUE(
+      std::filesystem::equivalent(directory, path.parent_path().parent_path()));
+  // A rejected reconfiguration cannot discard the host's working directory.
+  EXPECT_FALSE(ailego::FileHelper::SetTemporaryDirectory(missing));
+  EXPECT_FALSE(ailego::FileHelper::SetTemporaryDirectory(storage->path()));
+  PagedBuildBuffer build;
+  ASSERT_EQ(0, build.init(128 * 1024));
+  ASSERT_TRUE(build.paged());
+  const char expected[] = "managed scratch";
+  char actual[sizeof(expected)]{};
+  ASSERT_EQ(0, build.write(8190, expected, sizeof(expected)));
+  ASSERT_EQ(0, build.read(8190, actual, sizeof(actual)));
+  EXPECT_EQ(0, std::memcmp(expected, actual, sizeof(actual)));
+  storage.reset();
+  EXPECT_FALSE(std::filesystem::exists(path));
+  EXPECT_TRUE(std::filesystem::exists(directory));
+}
+
+TEST_F(TemporaryBufferStorageTest, RemovedHostDirectoryDoesNotFallBack) {
+  const auto directory = std::filesystem::absolute("removed_host_scratch");
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  AILEGO_DEFER([&]() {
+    EXPECT_TRUE(ailego::FileHelper::SetTemporaryDirectory(""));
+    std::error_code error;
+    std::filesystem::remove(directory, error);
+  });
+  ASSERT_TRUE(ailego::FileHelper::SetTemporaryDirectory(
+      ailego::FileHelper::PathToUtf8(directory)));
+  ASSERT_TRUE(std::filesystem::remove(directory));
+  std::string prefix = "unchanged";
+  EXPECT_EQ(IndexError_OpenFile,
+            TemporaryBufferStorage::DefaultPrefix("probe", &prefix));
+  EXPECT_EQ("unchanged", prefix);
 }

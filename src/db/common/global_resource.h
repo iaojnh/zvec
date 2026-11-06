@@ -104,6 +104,9 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
 
   std::atomic<bool> initialized_{false};
   std::mutex initialization_mutex_;
+  // Protected by initialization_mutex_. Once DB-owned pool setup starts,
+  // failure is terminal: its partial state must not become a standalone pool.
+  bool initialization_failed_{false};
   uint64_t memory_limit_bytes_{0};
   uint32_t query_thread_count_{0};
   uint32_t optimize_thread_count_{0};

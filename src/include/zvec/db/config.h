@@ -119,6 +119,11 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
     // CPU binding is opt-in at the DB layer.
     bool optimize_thread_binding;
 
+    // Existing writable scratch directory, encoded as UTF-8. Empty uses the
+    // system default. Android hosts can pass Context.getCacheDir() here before
+    // initialization; no process environment changes are required.
+    std::string temporary_directory;
+
     ConfigData();
   };
 

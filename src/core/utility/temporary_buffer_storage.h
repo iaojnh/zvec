@@ -39,9 +39,10 @@ class TemporaryBufferStorage {
 
   static int DefaultPrefix(const std::string &name, std::string *out) {
     if (!out) return IndexError_InvalidArgument;
-    std::error_code error;
-    auto directory = std::filesystem::temp_directory_path(error);
-    if (error) return IndexError_OpenFile;
+    std::string directory_name;
+    if (!ailego::FileHelper::GetTemporaryDirectory(&directory_name))
+      return IndexError_OpenFile;
+    const auto directory = ailego::FileHelper::PathFromUtf8(directory_name);
     *out = ailego::FileHelper::PathToUtf8(directory / name);
     return 0;
   }

@@ -221,6 +221,36 @@ TEST(GlobalResourceStartupDeathTest, HostReleaseRestoresWorkspaceAdmission) {
       ::testing::ExitedWithCode(0), "");
   ::testing::FLAGS_gtest_death_test_style = previous_style;
 }
+
+TEST(GlobalResourceStartupDeathTest,
+     PartialBudgetFailureCannotBecomeStandalone) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto &pool = ailego::MemoryLimitPool::get_instance();
+        constexpr size_t limit = 128UL << 20;
+        if (pool.init(
+                GlobalResource::calculate_buffer_pool_memory_budget(limit)))
+          std::_Exit(1);
+        // Simulate existing mandatory backing exhausting the pool exactly at
+        // native image/worker reservation, after pool setup has succeeded.
+        const size_t occupied = pool.available();
+        if (!pool.try_charge_external(occupied)) std::_Exit(2);
+        GlobalConfig::ConfigData config;
+        config.memory_limit_bytes = limit;
+        config.query_thread_count = config.optimize_thread_count = 1;
+        if (GlobalConfig::Instance().initialize(config).ok()) std::_Exit(3);
+        pool.release_external(occupied);
+        auto &resources = GlobalResource::Instance();
+        if (resources.initialize() == 0 || resources.initialized() ||
+            resources.query_thread_pool() || resources.rocksdb_block_cache())
+          std::_Exit(4);
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
 #endif
 
 #if defined(__linux__)

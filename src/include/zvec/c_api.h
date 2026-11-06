@@ -721,6 +721,22 @@ zvec_config_data_get_optimize_thread_count(const zvec_config_data_t *config);
 // =============================================================================
 
 /**
+ * @brief Set the UTF-8 scratch directory before initialization. It must exist
+ * and be writable by the host. Empty selects the system default. Android
+ * hosts can pass Context.getCacheDir(). All managed build scratch uses it.
+ */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_config_data_set_temporary_directory(zvec_config_data_t *config,
+                                         const char *directory);
+
+/**
+ * @brief Get the configured scratch directory. The returned string belongs to
+ * config and remains valid until it is changed or config is destroyed.
+ */
+ZVEC_EXPORT const char *ZVEC_CALL
+zvec_config_data_get_temporary_directory(const zvec_config_data_t *config);
+
+/**
  * @brief Initialize ZVec library
  * @param config Configuration data (optional, NULL means using default
  * configuration)

@@ -268,6 +268,18 @@ void test_zvec_config() {
   zvec_config_data_t *config_data = zvec_config_data_create();
   TEST_ASSERT(config_data != NULL);
   if (config_data) {
+    TEST_ASSERT(
+        strcmp(zvec_config_data_get_temporary_directory(config_data), "") == 0);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(
+                    config_data, "host-cache") == ZVEC_OK);
+    TEST_ASSERT(strcmp(zvec_config_data_get_temporary_directory(config_data),
+                       "host-cache") == 0);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(config_data, NULL) ==
+                ZVEC_ERROR_INVALID_ARGUMENT);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(NULL, "") ==
+                ZVEC_ERROR_INVALID_ARGUMENT);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(config_data, "") ==
+                ZVEC_OK);
     // Test initial values
     TEST_ASSERT(zvec_config_data_get_log_type(config_data) ==
                 ZVEC_LOG_TYPE_CONSOLE);

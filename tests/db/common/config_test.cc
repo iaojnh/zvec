@@ -15,10 +15,12 @@
 #include "zvec/db/config.h"
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
+#include <zvec/ailego/utility/file_helper.h>
 #include "db/common/global_resource.h"
 #include "zvec/db/status.h"
 
@@ -181,6 +183,44 @@ TEST(ConfigDeathTest, LoggingShutdownPrecedesBrokerStaticDestruction) {
   GTEST_SKIP()
       << "Process-isolated exit tests are not supported on this platform";
 #endif
+}
+
+TEST(ConfigDeathTest, PublishesHostScratchDirectoryBeforeUse) {
+#if GTEST_HAS_DEATH_TEST
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        GlobalConfig::ConfigData config;
+        config.memory_limit_bytes = 128ULL << 20;
+        config.query_thread_count = config.optimize_thread_count = 1;
+        const auto directory = std::filesystem::current_path();
+        config.temporary_directory = ailego::FileHelper::PathToUtf8(directory);
+        if (!GlobalConfig::Instance().initialize(config).ok()) std::_Exit(1);
+        config.temporary_directory = "must-not-be-observed";
+        std::string resolved;
+        if (!ailego::FileHelper::GetTemporaryDirectory(&resolved) ||
+            !std::filesystem::equivalent(
+                directory, ailego::FileHelper::PathFromUtf8(resolved)))
+          std::_Exit(2);
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+#else
+  GTEST_SKIP() << "Process-isolated tests are not supported on this platform";
+#endif
+}
+
+TEST(ConfigValidationTest, RejectsInvalidScratchDirectory) {
+  GlobalConfig::ConfigData config;
+  config.temporary_directory = "missing_zvec_scratch_directory/child";
+  EXPECT_FALSE(GlobalConfig::Instance().validate(config).ok());
+  config.temporary_directory = std::string("valid\0invalid", 13);
+  EXPECT_FALSE(GlobalConfig::Instance().validate(config).ok());
+  config.temporary_directory =
+      ailego::FileHelper::PathToUtf8(std::filesystem::current_path());
+  EXPECT_TRUE(GlobalConfig::Instance().validate(config).ok());
 }
 
 class ConfigTest : public ::testing::Test {

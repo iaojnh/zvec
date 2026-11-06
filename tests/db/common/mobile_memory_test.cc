@@ -1,12 +1,15 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
 #include "db/common/mobile_memory.h"
-#include "db/common/native_image_memory.h"
 #include <limits>
 #include <ailego/utility/mobile_memory.h>
 #include <gtest/gtest.h>
 #include <zvec/db/config.h>
+#include <zvec/db/options.h>
 #include "db/common/cgroup_util.h"
+#include "db/common/global_resource.h"
+#include "db/common/native_image_memory.h"
+#include "db/common/write_buffer_reservation.h"
 
 namespace zvec {
 #if defined(__linux__)
@@ -54,5 +57,30 @@ TEST(MobileMemoryTest, NativeReaderUsesDeviceApplicationMetrics) {
 #else
   EXPECT_EQ(nullptr, reader);
 #endif
+}
+
+TEST(MobileMemoryTest, WriterDefaultsFitConservativeProcessBudgets) {
+  const uint32_t expected = detail::kMobileMemoryPolicy
+                                ? MOBILE_DEFAULT_MAX_BUFFER_SIZE
+                                : 64U * 1024 * 1024;
+  EXPECT_EQ(expected, CollectionOptions().max_buffer_size_);
+  EXPECT_EQ(expected, CollectionOptions(false, false).max_buffer_size_);
+  EXPECT_EQ(expected, (SegmentOptions{false, false}).max_buffer_size_);
+  EXPECT_EQ(
+      64U * 1024 * 1024,
+      CollectionOptions(false, false, 64U * 1024 * 1024).max_buffer_size_);
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  for (const size_t total : {64UL << 20, 128UL << 20}) {
+    ASSERT_EQ(
+        0,
+        pool.init(GlobalResource::calculate_buffer_pool_memory_budget(total)));
+    WriteBufferReservation writer;
+    ASSERT_TRUE(writer.acquire(MOBILE_DEFAULT_MAX_BUFFER_SIZE).ok());
+    EXPECT_EQ(24UL << 20, writer.bytes());
+    // Explicit large requests retain their original rejection semantics.
+    WriteBufferReservation large;
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, large.acquire(64UL << 20).code());
+  }
 }
 }  // namespace zvec
