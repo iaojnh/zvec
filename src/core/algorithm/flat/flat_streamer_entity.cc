@@ -47,7 +47,7 @@ int FlatContiguousStreamerEntity::evaluate_distances(
     const std::vector<uint64_t> *p_keys, const IndexFilter &filter,
     size_t batch_size, FlatSearchScratch *scratch,
     IndexContext::Stats *context_stats, IndexCandidateHeap *heap) const {
-  if (!storage.vector_memory || !query || !scratch || batch_size == 0 ||
+  if (!storage.vector_memory.data() || !query || !scratch || batch_size == 0 ||
       !heap) {
     return IndexError_InvalidArgument;
   }
@@ -822,7 +822,7 @@ int FlatContiguousStreamerEntity::search_by_p_keys_fast(
   // Hold the same immutable generation for pointer lookup and evaluation.
   // A concurrent degrade/add cannot free its rows while this call is active.
   auto storage = load_contiguous_storage();
-  if (!storage || !storage->vector_memory || keys.size() < topk ||
+  if (!storage || !storage->vector_memory.data() || keys.size() < topk ||
       (quantizer() &&
        keys.size() > static_cast<size_t>(std::numeric_limits<int>::max()))) {
     return IndexError_NotImplemented;
@@ -904,18 +904,11 @@ int FlatContiguousStreamerEntity::build_contiguous_memory() try {
   const size_t data_size = count * stride;
   const size_t allocation_size =
       ailego::MemoryHelper::AlignHugePageSize(data_size);
-  auto storage = std::make_shared<ContiguousStorage>();
-  storage->memory.add(allocation_size);
-  char *raw = static_cast<char *>(
-      ailego::MemoryHelper::AllocateHugePage(allocation_size));
-  if (!raw) {
-    LOG_ERROR("Failed to allocate Flat contiguous memory, size=%zu",
-              allocation_size);
-    return IndexError_Runtime;
-  }
-
-  storage->vector_memory =
-      std::shared_ptr<char>(raw, ContiguousDeleter{allocation_size});
+  auto storage = std::allocate_shared<ContiguousStorage>(
+      ailego::BudgetedAllocator<ContiguousStorage>{});
+  storage->vector_memory.resize(allocation_size);
+  storage->vector_memory.advise_huge_pages();
+  char *raw = storage->vector_memory.data();
   storage->vector_stride = stride;
   storage->vector_count = count;
   if (use_key_info_map()) {
@@ -1016,10 +1009,10 @@ const void *FlatContiguousStreamerEntity::get_vector_ptr_by_key(
 
 const void *FlatContiguousStreamerEntity::get_vector_ptr(
     const ContiguousStorage &storage, size_t position) const {
-  if (!storage.vector_memory || position >= storage.vector_count) {
+  if (!storage.vector_memory.data() || position >= storage.vector_count) {
     return nullptr;
   }
-  return storage.vector_memory.get() + position * storage.vector_stride;
+  return storage.vector_memory.data() + position * storage.vector_stride;
 }
 
 const void *FlatStreamerEntity::get_vector_by_key(uint64_t key) const {

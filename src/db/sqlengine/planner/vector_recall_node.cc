@@ -18,6 +18,7 @@
 #include <string>
 #include <arrow/array/builder_binary.h>
 #include <arrow/result.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include <zvec/core/framework/index_meta.h>
@@ -229,8 +230,13 @@ Result<IndexResults::Ptr> VectorRecallNode::prepare() {
 arrow::Result<std::shared_ptr<arrow::RecordBatch>>
 VectorRecallNode::State::collect_batch() {
   // collect a batch
+  ailego::MemoryReservation indices_memory;
   std::vector<int> indices;
-  indices.reserve(self_->batch_size_);
+  try {
+    ailego::ReserveVectorCapacity(indices, indices_memory, self_->batch_size_);
+  } catch (const std::bad_alloc &) {
+    return arrow::Status::OutOfMemory("Vector recall row batch exceeds budget");
+  }
   auto *pool = self_->segment_->query_memory_pool();
   arrow::FloatBuilder builder(pool);
   arrow::StringBuilder group_id_builder(pool);

@@ -14,6 +14,7 @@
 
 #include "db/sqlengine/planner/invert_recall_node.h"
 #include <arrow/api.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/index/segment/segment_fetch_internal.h"
 #include "db/sqlengine/planner/invert_search.h"
@@ -50,8 +51,14 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> InvertRecallNode::gen() {
     }
 
     // collect a batch
+    ailego::MemoryReservation indices_memory;
     std::vector<int> indices;
-    indices.reserve(self->batch_size_);
+    try {
+      ailego::ReserveVectorCapacity(indices, indices_memory, self->batch_size_);
+    } catch (const std::bad_alloc &) {
+      return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+          arrow::Status::OutOfMemory("Invert recall row batch exceeds budget"));
+    }
     for (int i = 0; state.iter_->valid() && i < self->batch_size_;
          state.iter_->next()) {
       if (self->seg_filter_ &&

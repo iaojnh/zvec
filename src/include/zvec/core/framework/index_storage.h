@@ -84,11 +84,11 @@ class IndexStorage : public IndexModule {
       MemoryBlock mb;
       mb.type_ = MemoryBlockType::MBT_HEAP_SCRATCH;
       if (!size) return mb;
-      mb.scratch_charge_.add(size);
-      void *data = alignment ? ailego_aligned_malloc(size, alignment)
+      mb.scratch_charge_.add_for_allocation(size, [&] {
+        mb.data_ = alignment ? ailego_aligned_malloc(size, alignment)
                              : ailego_malloc(size);
-      if (!data && size) throw std::bad_alloc();
-      mb.data_ = data;
+        if (!mb.data_) throw std::bad_alloc();
+      });
       mb.scratch_size_ = size;
       return mb;
     }

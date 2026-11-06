@@ -129,15 +129,6 @@ AlignedSlabMapping reserve_aligned_slab(size_t page_size) {
 #endif
 }
 
-void release_aligned_slab(void *reservation_base, size_t reservation_size) {
-#if defined(_WIN32)
-  (void)reservation_size;
-  ::VirtualFree(reservation_base, 0, MEM_RELEASE);
-#else
-  ::munmap(reservation_base, reservation_size);
-#endif
-}
-
 bool commit_slab_page(char *page, size_t page_size) {
 #if defined(_WIN32)
   return ::VirtualAlloc(page, page_size, MEM_COMMIT, PAGE_READWRITE) == page;
@@ -378,6 +369,24 @@ struct MemoryLimitPool::ReclaimableSlab {
         page_size(system_page_size),
         data_page_count(
             static_cast<uint16_t>(kSlabBytes / system_page_size - 1)) {}
+
+  bool unmap_empty() {
+    assert(committed_pages == 0);
+    auto *pool = owner;
+    auto *following = next;
+    void *base = reservation_base;
+    const size_t bytes = reservation_size;
+    const size_t page = page_size;
+    this->~ReclaimableSlab();
+    if (unmap_queue_memory(base, bytes)) return true;
+
+    // The pages were discarded before teardown. Restore an empty slab so
+    // the old pool can keep using its charged header and address range.
+    auto *restored = new (this) ReclaimableSlab(pool, base, bytes, page);
+    restored->next = following;
+    LOG_ERROR("MemoryLimitPool: failed to unmap an empty slab");
+    return false;
+  }
 
   uint64_t magic{kMagic};
   MemoryLimitPool *owner{nullptr};
@@ -844,18 +853,9 @@ MemoryLimitPool::~MemoryLimitPool() {
   drain_free_list();
 }
 
-void MemoryLimitPool::drain_free_list() {
-  size_t released = 0;
-  for (size_t i = 0; i < kNumFreeShards; ++i) {
-    std::lock_guard<std::mutex> lk(free_shards_[i].mutex);
-    released += free_shards_[i].count.load(std::memory_order_relaxed);
-    free_shards_[i].head = nullptr;
-    free_shards_[i].count.store(0, std::memory_order_relaxed);
-  }
-  release_all_slabs_locked();
-  if (released != 0) {
-    LOG_INFO("MemoryLimitPool: released %zu cached slab pages", released);
-  }
+bool MemoryLimitPool::drain_free_list() {
+  trim_free_buffers(std::numeric_limits<size_t>::max());
+  return release_all_slabs_locked();
 }
 
 size_t MemoryLimitPool::pick_shard() {
@@ -1042,14 +1042,15 @@ char *MemoryLimitPool::acquire_slab_buffer() {
     return page;
   }
 
-  slabs_ = slab->next;
-  allocation_slab_ = nullptr;
-  slab_count_.fetch_sub(1, std::memory_order_relaxed);
-  slab_mapped_bytes_.fetch_sub(mapping.reservation_size,
-                               std::memory_order_relaxed);
-  slab->~ReclaimableSlab();
-  release_aligned_slab(mapping.reservation_base, mapping.reservation_size);
-  release_metadata(page_size);
+  ReclaimableSlab *next = slab->next;
+  if (slab->unmap_empty()) {
+    slabs_ = next;
+    allocation_slab_ = nullptr;
+    slab_count_.fetch_sub(1, std::memory_order_relaxed);
+    slab_mapped_bytes_.fetch_sub(mapping.reservation_size,
+                                 std::memory_order_relaxed);
+    release_metadata(page_size);
+  }
   return nullptr;
 }
 
@@ -1083,32 +1084,22 @@ bool MemoryLimitPool::reclaim_slab_buffer(char *buffer) {
   return true;
 }
 
-void MemoryLimitPool::release_all_slabs_locked() {
+bool MemoryLimitPool::release_all_slabs_locked() {
   std::lock_guard<std::mutex> slabs_lock(slab_mutex_);
-  size_t released_bytes = 0;
-  size_t header_bytes = 0;
-  ReclaimableSlab *slab = slabs_;
-  while (slab != nullptr) {
-    ReclaimableSlab *next = slab->next;
-    released_bytes += (slab->committed_pages + 1) * slab->page_size;
-    header_bytes += slab->page_size;
-    void *reservation_base = slab->reservation_base;
-    size_t reservation_size = slab->reservation_size;
-    slab->~ReclaimableSlab();
-    release_aligned_slab(reservation_base, reservation_size);
-    slab = next;
-  }
-  slabs_ = nullptr;
   allocation_slab_ = nullptr;
-  slab_count_.store(0, std::memory_order_relaxed);
-  slab_mapped_bytes_.store(0, std::memory_order_relaxed);
-  if (released_bytes != 0) {
-    size_t previous = release_committed(released_bytes);
-    (void)previous;
-    assert(previous >= released_bytes);
+  while (slabs_) {
+    ReclaimableSlab *slab = slabs_;
+    if (slab->committed_pages != 0) return false;
+    ReclaimableSlab *next = slab->next;
+    const size_t page = slab->page_size;
+    const size_t bytes = slab->reservation_size;
+    if (!slab->unmap_empty()) return false;
+    slabs_ = next;
+    slab_count_.fetch_sub(1, std::memory_order_relaxed);
+    slab_mapped_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+    release_metadata(page);
   }
-  used_size_.fetch_sub(header_bytes, std::memory_order_relaxed);
-  metadata_used_size_.fetch_sub(header_bytes, std::memory_order_relaxed);
+  return true;
 }
 
 size_t MemoryLimitPool::trim_free_buffers(size_t bytes_needed) {
@@ -1238,36 +1229,31 @@ int MemoryLimitPool::init(size_t pool_size) {
   std::unique_lock<std::mutex> queue_lock(queue_memory_mutex_);
   const size_t queue_bytes =
       queue_allocated_size_.load(std::memory_order_relaxed);
+  auto restart_previous_pool = [&] {
+    queue_lock.unlock();
+    if (was_running) {
+      try {
+        start_background_evictor();
+      } catch (const std::exception &e) {
+        LOG_ERROR("Failed to restart the shared-cache evictor: %s", e.what());
+      } catch (...) {
+        LOG_ERROR("Failed to restart the shared-cache evictor");
+      }
+    }
+    return -1;
+  };
   if (pool_size != 0 && pool_size < queue_bytes) {
     LOG_ERROR(
         "Shared cache budget cannot fit eviction queues: capacity=%zu "
         "queue_bytes=%zu",
         pool_size, queue_bytes);
-    queue_lock.unlock();
-    if (was_running) {
-      try {
-        start_background_evictor();
-      } catch (const std::exception &e) {
-        LOG_ERROR("Failed to restart the shared-cache evictor: %s", e.what());
-      } catch (...) {
-        LOG_ERROR("Failed to restart the shared-cache evictor");
-      }
-    }
-    return -1;
+    return restart_previous_pool();
   }
-  trim_retained_blocks(std::numeric_limits<size_t>::max());
-  if (retained_block_bytes_.load(std::memory_order_relaxed) != 0) {
-    queue_lock.unlock();
-    if (was_running) {
-      try {
-        start_background_evictor();
-      } catch (const std::exception &e) {
-        LOG_ERROR("Failed to restart the shared-cache evictor: %s", e.what());
-      } catch (...) {
-        LOG_ERROR("Failed to restart the shared-cache evictor");
-      }
-    }
-    return -1;
+  // No owner allocations remain. Keep the existing budget active until the
+  // old allocator releases its backing, so failure leaves it usable.
+  if (!drain_free_list() ||
+      retained_block_bytes_.load(std::memory_order_relaxed) != 0) {
+    return restart_previous_pool();
   }
   const size_t old_charge = queue_charged_size_.exchange(0);
   if (old_charge != 0) {
@@ -1276,9 +1262,6 @@ int MemoryLimitPool::init(size_t pool_size) {
   pool_size_.store(0, std::memory_order_relaxed);
   process_rss_.configure(0, nullptr);
   set_process_rss_reclaimer({});
-  // No owner allocations remain. Do not invoke queue recovery here while
-  // holding its allocator lock; stale entries are handled by normal dequeue.
-  drain_free_list();
   pool_size_.store(pool_size, std::memory_order_relaxed);
   if (pool_size != 0) {
     queue_charged_size_.store(queue_bytes, std::memory_order_relaxed);

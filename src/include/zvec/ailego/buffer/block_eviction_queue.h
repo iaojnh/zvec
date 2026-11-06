@@ -532,7 +532,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   MemoryLimitPool() = default;
   ~MemoryLimitPool();
 
-  void drain_free_list();
+  bool drain_free_list();
   void *allocate_queue_memory(size_t bytes);
   void free_queue_memory(void *ptr);
   bool try_reserve_used(size_t bytes);
@@ -569,7 +569,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void push_free_buffer(char *buffer, size_t shard);
   char *acquire_slab_buffer();
   bool reclaim_slab_buffer(char *buffer);
-  void release_all_slabs_locked();
+  bool release_all_slabs_locked();
   size_t trim_free_buffers(size_t bytes_needed);
   bool trim_idle_buffers();
   void reclaim_process_cache();

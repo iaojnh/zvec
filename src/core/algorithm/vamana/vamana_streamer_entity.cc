@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include "vamana_streamer_entity.h"
 #include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
@@ -604,24 +605,13 @@ const VamanaEntity::Pointer VamanaContiguousStreamerEntity::clone() const {
 // VamanaContiguousStreamerEntity implementation
 // ============================================================================
 
-char *VamanaContiguousStreamerEntity::allocate_contiguous(size_t size) {
-  if (size == 0) return nullptr;
-  void *ptr = ailego::MemoryHelper::AllocateHugePage(size);
-  if (!ptr) {
-    LOG_ERROR("AllocateHugePage failed for contiguous memory, size=%zu", size);
-    return nullptr;
-  }
-  return static_cast<char *>(ptr);
-}
-
 std::shared_ptr<char>
 VamanaContiguousStreamerEntity::allocate_budgeted_contiguous(size_t size) {
-  auto memory = std::make_shared<ailego::MemoryReservation>();
-  memory->add(size);
-  char *ptr = allocate_contiguous(size);
-  if (!ptr) throw std::bad_alloc();
-  return std::shared_ptr<char>(
-      ptr, [memory, size](char *data) { ContiguousDeleter{size}(data); });
+  using Buffer = ailego::BudgetedMappedBuffer;
+  auto buffer =
+      std::allocate_shared<Buffer>(ailego::BudgetedAllocator<Buffer>{}, size);
+  buffer->advise_huge_pages();
+  return std::shared_ptr<char>(buffer, buffer->data());
 }
 
 int VamanaContiguousStreamerEntity::build_contiguous_memory() {

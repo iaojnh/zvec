@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "db/sqlengine/planner/doc_filter.h"
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <optional>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/table.h>
@@ -168,8 +169,7 @@ std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
     ailego::MemoryReservation reservation;
     std::vector<uint64_t> ids;
     try {
-      reservation.add_array(match_count, sizeof(uint64_t));
-      ids.reserve(match_count);
+      ailego::ReserveVectorCapacity(ids, reservation, match_count);
       // Widen directly into the sole owned candidate list, without a
       // temporary uint32 list that duplicates all matching document IDs.
       auto iter = invert_result_->create_iterator();

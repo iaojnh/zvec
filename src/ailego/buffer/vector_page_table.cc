@@ -2948,27 +2948,24 @@ struct ThreadLocalIoUringContext {
 template <unsigned QueueDepth>
 struct ThreadLocalAioContext {
   io_context_t ctx{nullptr};
+  size_t mapped_bytes{0};
   bool inited{false};
 
   bool ensure() {
     if (inited) return ctx != nullptr;
-    if (MemoryLimitPool::get_instance().under_process_rss_pressure())
-      return false;
-    inited = true;
-    if (!LibAioLoader::Instance().load() ||
-        !LibAioLoader::Instance().is_available()) {
+    auto &loader = LibAioLoader::Instance();
+    if (!loader.load()) {
+      inited = true;
       return false;
     }
-    if (LibAioLoader::Instance().io_setup(QueueDepth, &ctx) == 0) {
-      return true;
-    }
-    ctx = nullptr;
-    return false;
+    const int result = loader.setup_budgeted(QueueDepth, ctx, mapped_bytes);
+    inited = result != -ENOMEM;
+    return result == 0;
   }
 
   bool destroy_context(const char *context_name) {
     if (!ctx) return true;
-    const int ret = LibAioLoader::Instance().io_destroy(ctx);
+    const int ret = LibAioLoader::Instance().destroy_budgeted(ctx, mapped_bytes);
     if (ret != 0) {
       LOG_ERROR(
           "%s: io_destroy failed, ret=%d; in-flight buffers remain "
@@ -2976,7 +2973,6 @@ struct ThreadLocalAioContext {
           context_name, ret);
       return false;
     }
-    ctx = nullptr;
     return true;
   }
 };

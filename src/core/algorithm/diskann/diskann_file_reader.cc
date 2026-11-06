@@ -267,10 +267,9 @@ int setup_io_ctx(IOContext &ctx) {
 
   // Priority 2: libaio (dlopen — soft dependency).
   if (selected != ailego::IOBackendType::kPread &&
-      !ailego::MemoryLimitPool::get_instance().under_process_rss_pressure() &&
-      LibAioLoader::Instance().load() &&
-      LibAioLoader::Instance().is_available()) {
-    int ret = LibAioLoader::Instance().io_setup(MAX_EVENTS, &ctx->aio_ctx);
+      LibAioLoader::Instance().load()) {
+    const int ret = LibAioLoader::Instance().setup_budgeted(
+        MAX_EVENTS, ctx->aio_ctx, ctx->aio_mapped_bytes);
     if (ret == 0) {
       ctx->type = ailego::IOBackendType::kLibAio;
       log_diskann_io_backend(ctx->type);
@@ -299,7 +298,9 @@ int destroy_io_ctx(IOContext &ctx) {
     ctx->ring.teardown();
   } else if (ctx->type == ailego::IOBackendType::kLibAio &&
              LibAioLoader::Instance().is_available()) {
-    LibAioLoader::Instance().io_destroy(ctx->aio_ctx);
+    const int ret = LibAioLoader::Instance().destroy_budgeted(
+        ctx->aio_ctx, ctx->aio_mapped_bytes);
+    if (ret != 0) LOG_ERROR("io_destroy failed for DiskANN: %d", ret);
   }
   // IoUringRing destructor also calls teardown() — idempotent and safe.
 #endif
@@ -358,12 +359,9 @@ static int execute_io_pread(int fd, std::vector<AlignedRead> &read_reqs) {
 // invalid arguments. If that happens after submission, io_destroy() is the
 // only safe way to quiesce the context before synchronous I/O touches the same
 // destination buffers. Recreate the context so later reads can still use AIO.
-static bool reset_aio_context(io_context_t &ctx) {
+static bool reset_aio_context(io_context_t &ctx, size_t &mapped_bytes) {
   auto &loader = LibAioLoader::Instance();
-  int ret;
-  do {
-    ret = loader.io_destroy(ctx);
-  } while (ret == -EINTR);
+  int ret = loader.destroy_budgeted(ctx, mapped_bytes);
 
   if (ret != 0) {
     LOG_ERROR("io_destroy failed while draining AIO; returned: %d, %s", ret,
@@ -371,23 +369,17 @@ static bool reset_aio_context(io_context_t &ctx) {
     return false;
   }
 
-  ctx = nullptr;
-  if (ailego::MemoryLimitPool::get_instance().under_process_rss_pressure())
-    return true;
-  io_context_t replacement = nullptr;
-  ret = loader.io_setup(MAX_EVENTS, &replacement);
+  ret = loader.setup_budgeted(MAX_EVENTS, ctx, mapped_bytes);
   if (ret != 0) {
     LOG_ERROR(
         "io_setup failed while recreating an AIO context; returned: %d, %s. "
         "this context will use pread",
         ret, ::strerror(-ret));
-    return true;
   }
-  ctx = replacement;
   return true;
 }
 
-int execute_io_libaio(io_context_t &ctx, int fd,
+int execute_io_libaio(io_context_t &ctx, size_t &mapped_bytes, int fd,
                       std::vector<AlignedRead> &read_reqs, uint64_t n_retries) {
   if (ctx == nullptr) return execute_io_pread(fd, read_reqs);
   const size_t batch_size = std::min<size_t>(read_reqs.size(), MAX_EVENTS);
@@ -470,7 +462,7 @@ int execute_io_libaio(io_context_t &ctx, int fd,
           "resetting the AIO context before falling back to pread",
           completed, submitted, ret,
           ret < 0 ? ::strerror(-ret) : "invalid completion count");
-      if (!reset_aio_context(ctx)) {
+      if (!reset_aio_context(ctx, mapped_bytes)) {
         // Do not run pread unless io_destroy confirmed that no request can
         // still write into these buffers.
         return IndexError_Runtime;
@@ -538,7 +530,8 @@ int execute_io(IOContext ctx, int fd, std::vector<AlignedRead> &read_reqs,
   }
 
   if (ctx->type == ailego::IOBackendType::kLibAio) {
-    return execute_io_libaio(ctx->aio_ctx, fd, read_reqs, n_retries);
+    return execute_io_libaio(ctx->aio_ctx, ctx->aio_mapped_bytes, fd, read_reqs,
+                             n_retries);
   }
 
   // NONE backend — synchronous pread.
@@ -1259,7 +1252,7 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
         "submit: io_getevents failed while draining %u in-flight requests; "
         "returned: %d. resetting the AIO context before falling back to pread",
         submitted, ret);
-    if (!reset_aio_context(ctx->aio_ctx)) {
+    if (!reset_aio_context(ctx->aio_ctx, ctx->aio_mapped_bytes)) {
       // Do not run pread unless io_destroy confirmed that no request can
       // still write into these buffers.
       return IndexError_Runtime;
@@ -1277,7 +1270,7 @@ static void quiesce_batch(PendingBatch &batch, IOContext &ctx) {
   // Only the libaio path leaves requests in flight: pread and io_uring
   // batches are complete before submit() returns (used_pread == true).
   if (batch.n_reaped < batch.n_submitted && !batch.used_pread) {
-    if (reset_aio_context(ctx->aio_ctx)) {
+    if (reset_aio_context(ctx->aio_ctx, ctx->aio_mapped_bytes)) {
       batch.n_reaped = batch.n_submitted;
     }
   }

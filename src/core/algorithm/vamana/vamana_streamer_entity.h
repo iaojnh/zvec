@@ -806,16 +806,6 @@ class VamanaContiguousStreamerEntity : public VamanaMmapStreamerEntity {
   }
 
  protected:
-  //! Custom deleter for contiguous memory allocated via
-  //! MemoryHelper::AllocateHugePage. `size` is the (already huge-page-aligned)
-  //! length passed at allocation time, required by the mmap/munmap path.
-  struct ContiguousDeleter {
-    size_t size;
-    void operator()(char *ptr) const {
-      ailego::MemoryHelper::FreeHugePage(ptr, size);
-    }
-  };
-
   //! Flat vector array: vector bodies stored with per-vector stride
   //! padded up to kVectorAlignment to keep each vector's starting
   //! address cache-line aligned. Base is page-aligned by the allocator.
@@ -841,7 +831,6 @@ class VamanaContiguousStreamerEntity : public VamanaMmapStreamerEntity {
   static constexpr size_t kVectorAlignment = AILEGO_CACHE_LINE_SIZE;
 
  private:
-  static char *allocate_contiguous(size_t size);
   static std::shared_ptr<char> allocate_budgeted_contiguous(size_t size);
 
   ailego_force_inline const char *packed_graph_row(node_id_t id) const {

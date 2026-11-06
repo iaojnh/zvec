@@ -4,6 +4,7 @@
 #include <array>
 #include <numeric>
 #include <arrow/compute/api.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "db/sqlengine/common/util.h"
 #include "db/sqlengine/planner/ops/fetch_vector_op.h"
 
@@ -79,11 +80,14 @@ arrow::Status TopKMergeNode::prepare() {
   // backpressure; completed plans are released, including their index results.
   for (size_t end = plans_.size(); end > 0;) {
     const size_t count = std::min(std::max(size_t{1}, pool_->count()), end);
-    std::vector<Result<std::unique_ptr<arrow::RecordBatchReader>>> readers(
-        count);
+    ailego::BudgetedVector<Result<std::unique_ptr<arrow::RecordBatchReader>>>
+        readers(count);
     auto start = [&](size_t i) {
       try {
         readers[i] = plans_[end - 1 - i]->execute_to_reader(64 * 1024);
+      } catch (const std::bad_alloc &) {
+        readers[i] = tl::make_unexpected(Status(
+            StatusCode::RESOURCE_EXHAUSTED, "TopK reader exceeds budget"));
       } catch (const std::exception &error) {
         readers[i] = tl::make_unexpected(Status::InternalError(error.what()));
       }
@@ -104,8 +108,12 @@ arrow::Status TopKMergeNode::prepare() {
     }
     for (size_t i = 0; i < count; ++i) {
       const size_t segment = end - 1 - i;
-      if (!readers[i])
-        return arrow::Status::ExecutionError(readers[i].error().message());
+      if (!readers[i]) {
+        const auto &error = readers[i].error();
+        if (error.code() == StatusCode::RESOURCE_EXHAUSTED)
+          return arrow::Status::OutOfMemory(error.message());
+        return arrow::Status::ExecutionError(error.message());
+      }
       ARROW_RETURN_NOT_OK(collect(segment, readers[i].value().get()));
       readers[i].value().reset();
       plans_[segment].reset();
@@ -158,10 +166,16 @@ TopKMergeNode::materialize() {
     return winners[offset_ + a].segment < winners[offset_ + b].segment;
   });
   std::array<uint32_t, kBatchRows> inverse;
+  ailego::MemoryReservation batch_memory;
+  ailego::MemoryReservation row_memory;
   std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  std::vector<int> rows;
+  ailego::ReserveVectorCapacity(batches, batch_memory,
+                                std::min(count, segments_.size()));
+  ailego::ReserveVectorCapacity(rows, row_memory, count);
   for (size_t begin = 0; begin < count;) {
     const size_t segment = winners[offset_ + order[begin]].segment;
-    std::vector<int> rows;
+    rows.clear();
     arrow::FloatBuilder scores(memory_pool);
     arrow::StringBuilder group_ids(memory_pool);
     size_t end = begin;

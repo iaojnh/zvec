@@ -29,12 +29,13 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 
 namespace zvec {
 namespace core {
-int execute_io_libaio(io_context_t &ctx, int fd,
+int execute_io_libaio(io_context_t &ctx, size_t &mapped_bytes, int fd,
                       std::vector<AlignedRead> &read_reqs,
                       uint64_t n_retries = 0);
 }  // namespace core
@@ -197,6 +198,50 @@ std::vector<uint8_t> make_source() {
 
 }  // namespace
 
+TEST(DiskAnnLinuxAioTest, AdmitsAndReleasesTheNativeCompletionMapping) {
+  auto &loader = LibAioLoader::Instance();
+  if (!loader.load()) GTEST_SKIP() << "libaio is unavailable";
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  io_context_t ctx = nullptr;
+  size_t mapped_bytes = 0;
+  AILEGO_DEFER([&] {
+    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+    if (ctx) EXPECT_EQ(0, loader.destroy_budgeted(ctx, mapped_bytes));
+  });
+
+  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
+  EXPECT_EQ(-ENOMEM, loader.setup_budgeted(128, ctx, mapped_bytes));
+  EXPECT_EQ(nullptr, ctx);
+  EXPECT_EQ(0u, mapped_bytes);
+  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+
+  const int setup = loader.setup_budgeted(128, ctx, mapped_bytes);
+  if (setup == -ENOSYS || setup == -EPERM || setup == -EAGAIN) {
+    GTEST_SKIP() << "Native AIO is unavailable: " << setup;
+  }
+  ASSERT_EQ(0, setup);
+  ASSERT_NE(nullptr, ctx);
+  EXPECT_GE(mapped_bytes, pool.page_buffer_size());
+
+  FILE *maps = std::fopen("/proc/self/maps", "r");
+  ASSERT_NE(nullptr, maps);
+  size_t mapping_size = 0;
+  char line[512];
+  while (std::fgets(line, sizeof(line), maps)) {
+    unsigned long start, end;
+    if (std::sscanf(line, "%lx-%lx", &start, &end) == 2 &&
+        start == reinterpret_cast<uintptr_t>(ctx)) {
+      mapping_size = end - start;
+      break;
+    }
+  }
+  std::fclose(maps);
+  EXPECT_EQ(mapping_size, mapped_bytes);
+  EXPECT_EQ(0, loader.destroy_budgeted(ctx, mapped_bytes));
+  EXPECT_EQ(nullptr, ctx);
+  EXPECT_EQ(0u, mapped_bytes);
+}
+
 TEST(DiskAnnLinuxAioTest, AccumulatesPartialSubmissionsAndCompletions) {
   void *output = allocate_aligned(kBlockSize * kBlockCount);
   ASSERT_NE(output, nullptr);
@@ -209,7 +254,8 @@ TEST(DiskAnnLinuxAioTest, AccumulatesPartialSubmissionsAndCompletions) {
   io_context_t ctx = reinterpret_cast<io_context_t>(static_cast<uintptr_t>(1));
 
   // An invalid fd makes any accidental pread fallback fail the test.
-  EXPECT_EQ(execute_io_libaio(ctx, -1, requests), 0);
+  size_t mapped_bytes = 0;
+  EXPECT_EQ(execute_io_libaio(ctx, mapped_bytes, -1, requests), 0);
   EXPECT_EQ(state.submit_sizes, (std::vector<long>{4, 2}));
   EXPECT_EQ(state.completion_sizes, (std::vector<long>{4, 3, 1}));
   EXPECT_EQ(state.completed, kBlockCount);
@@ -485,7 +531,8 @@ TEST(DiskAnnLinuxAioTest, DrainsPartialSubmissionBeforePreadFallback) {
   FakeAioGuard guard(&state);
   io_context_t ctx = reinterpret_cast<io_context_t>(static_cast<uintptr_t>(1));
 
-  EXPECT_EQ(execute_io_libaio(ctx, file.fd(), requests), 0);
+  size_t mapped_bytes = 0;
+  EXPECT_EQ(execute_io_libaio(ctx, mapped_bytes, file.fd(), requests), 0);
   EXPECT_EQ(state.submit_sizes, (std::vector<long>{4, 2}));
   EXPECT_EQ(state.completion_sizes, (std::vector<long>{2, 1}));
   EXPECT_EQ(state.completed, 2u);
@@ -512,7 +559,8 @@ TEST(DiskAnnLinuxAioTest, DrainsAllCompletionsBeforePreadFallback) {
   FakeAioGuard guard(&state);
   io_context_t ctx = reinterpret_cast<io_context_t>(static_cast<uintptr_t>(1));
 
-  EXPECT_EQ(execute_io_libaio(ctx, file.fd(), requests), 0);
+  size_t mapped_bytes = 0;
+  EXPECT_EQ(execute_io_libaio(ctx, mapped_bytes, file.fd(), requests), 0);
   EXPECT_EQ(state.completion_sizes, (std::vector<long>{4, 3, 2}));
   EXPECT_EQ(state.completed, kBlockCount);
   EXPECT_EQ(std::memcmp(output, source.data(), source.size()), 0);

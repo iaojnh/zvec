@@ -14,6 +14,7 @@
 
 #include "db/sqlengine/planner/fts_recall_node.h"
 #include <arrow/api.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
 #include "db/index/segment/segment_fetch_internal.h"
@@ -69,8 +70,14 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
           std::nullopt);
     }
 
+    ailego::MemoryReservation indices_memory;
     std::vector<int> indices;
-    indices.reserve(self->batch_size_);
+    try {
+      ailego::ReserveVectorCapacity(indices, indices_memory, self->batch_size_);
+    } catch (const std::bad_alloc &) {
+      return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+          arrow::Status::OutOfMemory("Fts recall row batch exceeds budget"));
+    }
     auto *pool = self->segment_->query_memory_pool();
     arrow::FloatBuilder score_builder(pool);
     for (int i = 0; state.iter_->valid() && i < self->batch_size_;

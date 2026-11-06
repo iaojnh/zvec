@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include "hnsw_streamer_entity.h"
 #include <ailego/pattern/defer.h>
 #if defined(__linux__) || defined(__APPLE__)
@@ -1164,56 +1165,13 @@ const HnswEntity::Pointer HnswExternalStreamerEntity::clone() const {
 // HnswContiguousStreamerEntity implementation
 // ============================================================================
 
-char *HnswContiguousStreamerEntity::allocate_contiguous(size_t size) {
-  if (size == 0) {
-    return nullptr;
-  }
-#if defined(__linux__)
-  // Use mmap with MAP_ANONYMOUS for contiguous memory
-  void *ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (ptr == MAP_FAILED) {
-    LOG_ERROR("mmap failed for contiguous memory, size=%zu", size);
-    return nullptr;
-  }
-  // Request transparent huge pages
-  ::madvise(ptr, size, MADV_HUGEPAGE);
-  return static_cast<char *>(ptr);
-#elif defined(__APPLE__)
-  // macOS: use mmap with MAP_ANONYMOUS
-  void *ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (ptr == MAP_FAILED) {
-    LOG_ERROR("mmap failed for contiguous memory, size=%zu", size);
-    return nullptr;
-  }
-  return static_cast<char *>(ptr);
-#elif defined(_WIN32)
-  void *ptr = ::_aligned_malloc(size, ailego::MemoryHelper::PageSize());
-  if (!ptr) {
-    LOG_ERROR("_aligned_malloc failed for contiguous memory, size=%zu", size);
-    return nullptr;
-  }
-  return static_cast<char *>(ptr);
-#else
-  // Fallback: aligned allocation
-  void *ptr = std::aligned_alloc(ailego::MemoryHelper::PageSize(), size);
-  if (!ptr) {
-    LOG_ERROR("aligned_alloc failed for contiguous memory, size=%zu", size);
-    return nullptr;
-  }
-  return static_cast<char *>(ptr);
-#endif
-}
-
 std::shared_ptr<char>
 HnswContiguousStreamerEntity::allocate_budgeted_contiguous(size_t size) {
-  auto memory = std::make_shared<ailego::MemoryReservation>();
-  memory->add(size);
-  char *ptr = allocate_contiguous(size);
-  if (!ptr) throw std::bad_alloc();
-  return std::shared_ptr<char>(
-      ptr, [memory, size](char *data) { ContiguousDeleter{size}(data); });
+  using Buffer = ailego::BudgetedMappedBuffer;
+  auto buffer =
+      std::allocate_shared<Buffer>(ailego::BudgetedAllocator<Buffer>{}, size);
+  buffer->advise_huge_pages();
+  return std::shared_ptr<char>(buffer, buffer->data());
 }
 
 int HnswContiguousStreamerEntity::build_contiguous_memory() {

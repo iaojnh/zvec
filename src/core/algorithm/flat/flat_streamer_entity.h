@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -688,16 +689,8 @@ class FlatContiguousStreamerEntity : public FlatStreamerEntity {
   }
 
  private:
-  struct ContiguousDeleter {
-    size_t size;
-    void operator()(char *ptr) const {
-      ailego::MemoryHelper::FreeHugePage(ptr, size);
-    }
-  };
-
   struct ContiguousStorage {
-    ailego::MemoryReservation memory;
-    std::shared_ptr<char> vector_memory{};
+    ailego::BudgetedMappedBuffer vector_memory;
     size_t vector_stride{0};
     size_t vector_count{0};
     std::unordered_map<

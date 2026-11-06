@@ -1171,22 +1171,6 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
   }
 
  protected:
-  //! Custom deleter for contiguous memory (munmap / _aligned_free / free)
-  //! Used by shared_ptr to properly release mmap'd memory.
-  struct ContiguousDeleter {
-    size_t size;
-    void operator()(char *ptr) const {
-      if (!ptr) return;
-#if defined(__linux__) || defined(__APPLE__)
-      ::munmap(ptr, size);
-#elif defined(_WIN32)
-      ::_aligned_free(ptr);
-#else
-      std::free(ptr);
-#endif
-    }
-  };
-
   //! Flat vector array: vectors stored densely (stride = vector_size).
   std::shared_ptr<char> vector_memory_{};
   char *vector_base_{nullptr};
@@ -1204,8 +1188,6 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
   ailego::BudgetedVector<size_t> upper_chunk_offsets_{};
 
  private:
-  //! Allocate contiguous memory with hugepage/THP support
-  static char *allocate_contiguous(size_t size);
   static std::shared_ptr<char> allocate_budgeted_contiguous(size_t size);
 };
 

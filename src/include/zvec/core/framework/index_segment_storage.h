@@ -87,6 +87,10 @@ class IndexSegmentStorage : public IndexStorage {
       return parent_->fetch(data_offset_ + offset, buf, len);
     }
 
+    int read_error() const override {
+      return parent_->read_error();
+    }
+
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
       return parent_->read(data_offset_ + offset, data, len);
@@ -166,16 +170,19 @@ class IndexSegmentStorage : public IndexStorage {
     }
 
     IndexStorage::MemoryBlock metadata;
-    auto read_data = [this, &metadata](size_t offset, const void **data,
-                                       size_t len) {
+    int read_error = IndexError_ReadData;
+    auto read_data = [this, &metadata, &read_error](
+                         size_t offset, const void **data, size_t len) {
       metadata.reset();
       const auto size = parent_->read(offset, metadata, len);
+      if (size < len) read_error = parent_->read_error();
       *data = metadata.data();
       return size;
     };
 
     IndexUnpacker unpacker;
     if (!unpacker.unpack(read_data, parent_->data_size(), false)) {
+      if (read_error == IndexError_NoMemory) return read_error;
       LOG_ERROR("Failed to unpack segment data");
       return IndexError_UnpackIndex;
     }

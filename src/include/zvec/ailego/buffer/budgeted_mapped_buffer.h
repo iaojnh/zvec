@@ -7,6 +7,9 @@
 #include <utility>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace zvec::ailego {
 
@@ -63,6 +66,12 @@ class BudgetedMappedBuffer {
     }
     swap(replacement);
   }
+  void advise_huge_pages() const {
+#if defined(MADV_HUGEPAGE)
+    if (data_) ::madvise(data_, mapped_size_, MADV_HUGEPAGE);
+#endif
+  }
+
   void clear() noexcept {
     BudgetedMappedBuffer replacement;
     swap(replacement);
