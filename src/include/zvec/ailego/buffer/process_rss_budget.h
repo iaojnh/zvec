@@ -189,6 +189,27 @@ class ProcessRssBudget {
     return true;
   }
 
+  // A reusable mapping can fault in at most one mapping's worth of pages
+  // per sample. Each reader can refresh independently.
+  bool try_materialize_reusable(size_t bytes, MaterializationStamp &stamp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    refresh_locked(false);
+    const bool charge_rss = !stamp.rss_epoch || stamp.rss_epoch != rss_epoch_;
+    const bool charge_native =
+        !stamp.native_epoch || stamp.native_epoch != native_epoch_;
+    if (!materialization_allowed_locked(charge_rss ? bytes : 0,
+                                        charge_native ? bytes : 0))
+      return false;
+    if (limit() && bytes) {
+      if (charge_rss) rss_materialized_ = add_saturated(rss_materialized_, bytes);
+      if (native_reader_ && charge_native)
+        native_materialized_ = add_saturated(native_materialized_, bytes);
+      stamp = {rss_epoch_, native_reader_ ? native_epoch_ : 0};
+      update_available();
+    }
+    return true;
+  }
+
   // Reserve measured headroom across a mapping syscall when the owner
   // already holds the lifetime charge. An intervening sample must not clear
   // the debit before the mapping exists.
@@ -263,6 +284,11 @@ class ProcessRssBudget {
   }
 
   bool materialization_allowed_locked(size_t bytes) const {
+    return materialization_allowed_locked(bytes, bytes);
+  }
+
+  bool materialization_allowed_locked(size_t rss_bytes,
+                                      size_t native_bytes) const {
     if (admission_paused()) {
       return false;
     }
@@ -271,8 +297,9 @@ class ProcessRssBudget {
     // The existing allowance may overlap the RSS estimate even though this
     // operation still needs new pages. Check measured room independently of
     // the lifetime charge, including other backing allocations in flight.
-    const size_t needed = add_saturated(
-        add_saturated(bytes, pending_allocations_), pending_materializations_);
+    const size_t pending =
+        add_saturated(pending_allocations_, pending_materializations_);
+    const size_t needed = add_saturated(rss_bytes, pending);
     const size_t measured = add_saturated(rss(), rss_materialized_);
     if (measured >= cap || needed > cap - measured) return false;
     if (native_reader_) {
@@ -282,7 +309,8 @@ class ProcessRssBudget {
       const size_t reserve = headroom(native_cap);
       if (footprint >= native_cap ||
           native_cap - footprint <= reserve ||
-          needed > native_cap - footprint - reserve)
+          add_saturated(native_bytes, pending) >
+              native_cap - footprint - reserve)
         return false;
     }
     return true;

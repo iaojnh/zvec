@@ -45,6 +45,9 @@ struct MemoryLimitPoolTestPeer {
   static size_t rss_available(MemoryLimitPool &pool) {
     return pool.process_rss_.available();
   }
+  static size_t trim_retained(MemoryLimitPool &pool, size_t bytes) {
+    return pool.trim_retained_blocks(bytes);
+  }
   inline static size_t rss_sample = 0;
 };
 
@@ -533,6 +536,41 @@ TEST_F(PoolAdmissionTest, RetainedBackingReuseObeysMeasuredHeadroom) {
   block = pool_.acquire_retained_block(request);
   ASSERT_NE(nullptr, block);
   pool_.release_retained_block(block);
+}
+
+TEST_F(PoolAdmissionTest, RetainedMappingKeepsOneDebitUntilPhysicalRelease) {
+  constexpr size_t headroom = 32 * (1UL << 20);
+  ASSERT_EQ(0, pool_.init(baseline_ + 2 * headroom));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t rss = baseline_ + headroom;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
+
+  const size_t charge = 2 * page_;
+  const size_t request = charge - MemoryLimitPool::kRetainedBlockHeaderBytes;
+  void *mapping = pool_.acquire_retained_block(request);
+  ASSERT_NE(nullptr, mapping);
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    pool_.release_retained_block(mapping);
+    ASSERT_EQ(charge, pool_.stats().retained_idle_bytes);
+    EXPECT_EQ(headroom - charge, MemoryLimitPoolTestPeer::rss_available(pool_));
+    auto *reused = pool_.acquire_retained_block(request);
+    ASSERT_NE(nullptr, reused);
+    EXPECT_EQ(mapping, reused);
+    mapping = reused;
+    EXPECT_EQ(headroom - charge, MemoryLimitPoolTestPeer::rss_available(pool_));
+  }
+  pool_.release_retained_block(mapping);
+  EXPECT_EQ(charge, MemoryLimitPoolTestPeer::trim_retained(pool_, charge));
+  EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+
+  const size_t large_request =
+      MemoryLimitPoolTestPeer::reserve_margin(pool_, pool_.capacity());
+  mapping = pool_.acquire_retained_block(large_request);
+  ASSERT_NE(nullptr, mapping);
+  pool_.release_retained_block(mapping);
+  EXPECT_EQ(0u, pool_.stats().retained_idle_bytes);
+  EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
 }
 
 TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {

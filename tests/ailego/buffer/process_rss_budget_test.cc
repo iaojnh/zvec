@@ -715,6 +715,29 @@ TEST(ProcessRssBudgetTest, PrepaidMappingDebitSurvivesAnInFlightSample) {
   }
 }
 
+TEST(ProcessRssBudgetTest, ReusableBackingRefreshesEachReaderIndependently) {
+  constexpr size_t bytes = 6 * kMiB;
+  ProcessRssBudget budget;
+  budget.account(bytes);
+  sampled_rss = 112 * kMiB;
+  native_sample = {104 * kMiB, 24 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  ProcessRssBudget::MaterializationStamp stamp{};
+  ASSERT_TRUE(budget.try_materialize_reusable(bytes, stamp));
+  EXPECT_EQ(10 * kMiB, budget.available());
+  ASSERT_TRUE(budget.try_materialize_reusable(bytes, stamp));
+  EXPECT_EQ(10 * kMiB, budget.available());
+
+  native_sample_valid = false;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_materialize_reusable(bytes, stamp));
+  EXPECT_EQ(10 * kMiB, budget.available());
+  budget.release_unmapped(bytes, stamp);
+  EXPECT_EQ(16 * kMiB, budget.available());
+  native_sample_valid = true;
+}
+
 TEST(ProcessRssBudgetTest, UnmappedBackingRefundsOnlyItsOwnProjection) {
   constexpr size_t kLimit = 128 * kMiB;
   for (const bool use_native_sample : {false, true}) {

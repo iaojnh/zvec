@@ -406,6 +406,7 @@ struct MemoryLimitPool::RetainedBlock {
   RetainedBlock *next{nullptr};
   size_t bytes{0};
   bool metadata{false};
+  ProcessRssBudget::MaterializationStamp projection{};
 };
 
 size_t MemoryLimitPool::retained_block_size(size_t bytes) {
@@ -434,7 +435,7 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
       // Backing is already charged, but a pending page may own the logical
       // headroom. Leave the idle block linked until admission succeeds.
       if (!try_reserve_used(charge)) break;
-      if (!process_rss_.try_materialize(charge)) {
+      if (!process_rss_.try_materialize_reusable(charge, block->projection)) {
         release_buffer(nullptr, charge);
         break;
       }
@@ -462,8 +463,8 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     release_fixed(charge, counter, Backing::kPending);
     return nullptr;
   }
-  process_rss_.finish_reservation(charge, true);
-  auto *block = new (raw) RetainedBlock{nullptr, charge, metadata};
+  const auto projection = process_rss_.finish_reservation(charge, true);
+  auto *block = new (raw) RetainedBlock{nullptr, charge, metadata, projection};
   retained_block_bytes_.fetch_add(charge, std::memory_order_relaxed);
   return reinterpret_cast<char *>(block) + kRetainedBlockHeaderBytes;
 }
@@ -475,6 +476,7 @@ void MemoryLimitPool::release_retained_block(void *data) {
   {
     std::lock_guard<std::mutex> lock(retained_mutex_);
     const size_t bytes = block->bytes;
+    const auto projection = block->projection;
     auto *counter =
         block->metadata ? &metadata_used_size_ : &external_used_size_;
     // Retained mappings share the idle reserve with free data pages. Returning
@@ -496,7 +498,7 @@ void MemoryLimitPool::release_retained_block(void *data) {
     }
     if (unmapped) {
       retained_block_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
-      release_committed(bytes);
+      release_committed(bytes, Backing::kLive, projection);
     } else {
       // A failed physical release keeps the backing and its committed charge.
       block->next = retained_free_;
@@ -518,6 +520,7 @@ size_t MemoryLimitPool::trim_retained_blocks(size_t bytes_needed) {
     auto *block = retained_free_;
     auto *next = block->next;
     const size_t bytes = block->bytes;
+    const auto projection = block->projection;
 #if defined(_WIN32)
     const bool unmapped = ::VirtualFree(block, 0, MEM_RELEASE) != 0;
 #else
@@ -531,7 +534,7 @@ size_t MemoryLimitPool::trim_retained_blocks(size_t bytes_needed) {
     retained_free_ = next;
     retained_block_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
     retained_idle_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
-    release_committed(bytes);
+    release_committed(bytes, Backing::kLive, projection);
     released += bytes;
   }
   return released;
