@@ -280,7 +280,16 @@ TEST(ProcessRssBudgetTest, ReleasedResidentBackingDoesNotCoverUntouchedOwners) {
     EXPECT_FALSE(budget.try_acquire(201 * kMiB - reserve));
 
     native_sample_valid = true;
-    sample(300 * kMiB);
+    sample(600 * kMiB);
+    for (int i = 0; i < 3; ++i) {
+      budget.refresh(true);
+      EXPECT_EQ(200 * kMiB - reserve, budget.available());
+      EXPECT_FALSE(budget.try_acquire(201 * kMiB - reserve));
+    }
+    sample(650 * kMiB);  // At most 50 MiB of new backing can be covered.
+    budget.refresh(true);
+    EXPECT_EQ(200 * kMiB - reserve, budget.available());
+    sample(350 * kMiB);
     budget.refresh(true);
     EXPECT_EQ(500 * kMiB - reserve, budget.available());
     budget.release(200 * kMiB);
@@ -302,6 +311,21 @@ TEST(ProcessRssBudgetTest, ReleasingResidentOwnerDoesNotLosePendingGrowth) {
   EXPECT_EQ(400 * kMiB, budget.available());
   budget.release(300 * kMiB);
   EXPECT_EQ(700 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, ReleasedBackingCannotCoverNewBackingBeforeSample) {
+  ProcessRssBudget budget;
+  sampled_rss = 300 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(500 * kMiB));
+  sampled_rss = 600 * kMiB;
+  budget.refresh(true);
+  // Only part of this reservation was touched. The allocator may retain
+  // those pages even after the entire reservation is released.
+  budget.release(500 * kMiB);
+  budget.account(100 * kMiB);
+  EXPECT_EQ(300 * kMiB, budget.available());
+  budget.release(100 * kMiB);
 }
 
 TEST(ProcessRssBudgetTest, BaselineCanRecoverAfterStartupMemoryRetires) {

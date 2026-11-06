@@ -103,8 +103,8 @@ class ProcessRssBudget {
     // Only backing that could have contributed to a successful RSS sample
     // can explain a later RSS decrease. Unsampled allocation/free churn must
     // not accumulate unlimited release credits and hide host-memory recovery.
-    estimate_.release(bytes);
-    native_estimate_.release(bytes);
+    estimate_.release(bytes, backing_);
+    native_estimate_.release(bytes, backing_);
     update_available();
   }
 
@@ -201,14 +201,14 @@ class ProcessRssBudget {
       resident_upper_ = std::min(sample, backing);
       pending_releases_ = 0;
     }
-    void release(size_t bytes) {
+    void release(size_t bytes, size_t backing) {
       const size_t possibly_resident =
           std::min(bytes, resident_upper_ - pending_releases_);
       pending_releases_ += possibly_resident;
-      // The old sample may still include this owner's pages. Until a new
-      // sample can rebase it, those bytes cannot also cover another owner
-      // whose allocation has not yet become resident.
+      // The old sample may still include this owner's pages. Those bytes
+      // cannot also cover another owner that has not yet become resident.
       sampled_backing_ -= std::min(sampled_backing_, possibly_resident);
+      sampled_backing_ = std::min(backing, sampled_backing_);
     }
     size_t usage(size_t backing) const {
       return std::max(projected(baseline_rss_, baseline_backing_, backing),
@@ -259,7 +259,13 @@ class ProcessRssBudget {
           std::min({rss, add_saturated(backing, pending_releases_),
                     add_saturated(resident_upper_, growth)});
       assert(pending_releases_ <= resident_upper_);
-      sampled_backing_ = backing;
+      // While a release can still be part of the sample, only observed
+      // growth can cover more live backing. Repeated unchanged samples do
+      // not prove that retained pages have been reused.
+      sampled_backing_ =
+          pending_releases_
+              ? std::min(backing, add_saturated(sampled_backing_, growth))
+              : backing;
       sample_ = rss;
     }
 
