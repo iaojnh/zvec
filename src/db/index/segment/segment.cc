@@ -5427,6 +5427,8 @@ Result<std::vector<fts::FtsResult>> SegmentImpl::fts_search(
 
   auto ret = indexer->search(ast, params);
   if (!ret.has_value()) {
+    if (ret.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return tl::make_unexpected(ret.error());
     return tl::make_unexpected(Status::InternalError(
         "FTS search failed: ", field_name, " ", ret.error().message()));
   }

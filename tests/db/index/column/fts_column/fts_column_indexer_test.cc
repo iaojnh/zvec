@@ -1324,6 +1324,75 @@ TEST_F(FtsColumnIndexerTest, QueryWorkspaceDenialIsAnErrorAndCanRetry) {
   EXPECT_EQ(7u, retried->front().doc_id);
 }
 
+namespace {
+class DenyFtsReadDB : public rocksdb::StackableDB {
+ public:
+  explicit DenyFtsReadDB(rocksdb::DB *db) : rocksdb::StackableDB(db) {}
+
+  rocksdb::Status Get(const rocksdb::ReadOptions &options,
+                      rocksdb::ColumnFamilyHandle *cf, const rocksdb::Slice &key,
+                      rocksdb::PinnableSlice *value) override {
+    if (cf == denied) return rocksdb::Status::MemoryLimit("injected cache limit");
+    return rocksdb::StackableDB::Get(options, cf, key, value);
+  }
+
+  void MultiGet(const rocksdb::ReadOptions &options, size_t count,
+                rocksdb::ColumnFamilyHandle **cfs, const rocksdb::Slice *keys,
+                rocksdb::PinnableSlice *values, rocksdb::Status *statuses,
+                bool /*sorted_input*/) override {
+    for (size_t i = 0; i < count; ++i) {
+      statuses[i] = Get(options, cfs[i], keys[i], &values[i]);
+    }
+  }
+
+  rocksdb::ColumnFamilyHandle *denied{nullptr};
+};
+}  // namespace
+
+TEST_F(FtsColumnIndexerTest, CacheDenialReachesSearchAndOpen) {
+  auto indexer = make_indexer();
+  ASSERT_TRUE(indexer->insert(7, "common common other"));
+  ASSERT_TRUE(indexer->flush());
+  auto *fault = new DenyFtsReadDB(db_.db_.release());
+  db_.db_.reset(fault);
+  FtsQueryParser parser;
+  auto ast = parser.parse("\"common other\"", make_whitespace_pipeline());
+  ASSERT_TRUE(ast);
+  FtsQueryParams params;
+  params.topk = 10;
+
+  const auto baseline = indexer->search(*ast, params);
+  ASSERT_TRUE(baseline);
+  ASSERT_EQ(1u, baseline->size());
+  for (auto *cf :
+       {postings_cf_, max_tf_cf_, positions_cf_, term_freq_cf_, doc_len_cf_}) {
+    SCOPED_TRACE(cf->GetName());
+    fault->denied = cf;
+    const auto denied = indexer->search(*ast, params);
+    EXPECT_FALSE(denied);
+    if (!denied) EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  }
+  fault->denied = nullptr;
+  const auto retried = indexer->search(*ast, params);
+  ASSERT_TRUE(retried);
+  ASSERT_EQ(1u, retried->size());
+  EXPECT_EQ(7u, retried->front().doc_id);
+  EXPECT_FLOAT_EQ(baseline->front().score, retried->front().score);
+
+  FtsColumnIndexer reopened;
+  auto open = [&] {
+    return reopened.open_reader("content", &db_, postings_cf_, positions_cf_,
+                                term_freq_cf_, max_tf_cf_, doc_len_cf_, stat_cf_);
+  };
+  fault->denied = stat_cf_;
+  const auto denied = open();
+  EXPECT_FALSE(denied);
+  if (!denied) EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  fault->denied = nullptr;
+  EXPECT_TRUE(open());
+  EXPECT_EQ(1u, reopened.total_docs());
+}
+
 // After conversion the search() path must keep working — readers fall through
 // to the BitPacked branch via is_bitpacked_format(), and no longer require the
 // $TF / $DOC_LEN CFs.

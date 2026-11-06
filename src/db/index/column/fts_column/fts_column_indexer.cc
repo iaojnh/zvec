@@ -65,6 +65,23 @@ Result<void> FtsColumnIndexer::open_reader(
         "FtsColumnIndexer already opened. field=", field_name));
   }
 
+  auto scorer = std::make_shared<BM25Scorer>(bm25_params);
+
+  // doc_len_cf == nullptr → immutable path, load persisted stats.
+  // doc_len_cf != nullptr → mutable path, stats maintained in-memory.
+  // Mutable reopen also tries persisted stats first: an existing writing
+  // segment may already have flushed stats, while a brand-new mutable segment
+  // legitimately has no stats yet and falls back to zero below.
+  const auto loaded = scorer->load_segment_stats(field_name, ctx, stat_cf);
+  if (!loaded.ok()) {
+    if (loaded.code() != StatusCode::NOT_FOUND)
+      return tl::make_unexpected(loaded);
+    if (doc_len_cf == nullptr) {
+      return tl::make_unexpected(Status::InternalError(
+          "FtsColumnIndexer failed to load segment stats. field=", field_name));
+    }
+  }
+
   field_name_ = field_name;
   ctx_ = ctx;
   postings_cf_ = postings_cf;
@@ -74,22 +91,7 @@ Result<void> FtsColumnIndexer::open_reader(
   doc_len_cf_ = doc_len_cf;
   stat_cf_ = stat_cf;
 
-  scorer_ = std::make_shared<BM25Scorer>(bm25_params);
-
-  // doc_len_cf == nullptr → immutable path, load persisted stats.
-  // doc_len_cf != nullptr → mutable path, stats maintained in-memory.
-  // Mutable reopen also tries persisted stats first: an existing writing
-  // segment may already have flushed stats, while a brand-new mutable segment
-  // legitimately has no stats yet and falls back to zero below.
-  auto load_stats_ret = scorer_->load_segment_stats(field_name, ctx, stat_cf);
-  if (load_stats_ret != 0) {
-    if (doc_len_cf == nullptr) {
-      return tl::make_unexpected(Status::InternalError(
-          "FtsColumnIndexer failed to load segment stats. field=", field_name));
-    }
-    scorer_->update_stats(0, 0);
-  }
-
+  scorer_ = std::move(scorer);
   const auto stats = scorer_->stats();
   total_docs_.store(stats.total_docs, std::memory_order_release);
   total_tokens_.store(stats.total_tokens, std::memory_order_release);
@@ -262,6 +264,8 @@ Result<std::vector<FtsResult>> FtsColumnIndexer::search(
   }
 
   return results;
+} catch (const FtsReadError &error) {
+  return tl::make_unexpected(error.status());
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
                                     "Insufficient full-text query workspace"));
@@ -399,8 +403,7 @@ Result<DocIteratorPtr> FtsColumnIndexer::build_term_iterator(
     return DocIteratorPtr{nullptr};
   }
   if (!s.ok())
-    return tl::make_unexpected(Status::InternalError(
-        "Failed to read full-text posting: ", s.ToString()));
+    return tl::make_unexpected(FtsReadFailure(s, "Read full-text posting"));
 
   return create_term_iterator_from_raw(term, std::move(raw_data),
                                        term_node.boost);
@@ -428,8 +431,7 @@ Result<DocIteratorPtr> FtsColumnIndexer::build_phrase_iterator(
       return DocIteratorPtr{nullptr};
     }
     if (!status.ok())
-      return tl::make_unexpected(Status::InternalError(
-          "Failed to read phrase posting: ", status.ToString()));
+      return tl::make_unexpected(FtsReadFailure(status, "Read phrase posting"));
     auto iter_result = create_term_iterator_from_raw(terms[i], std::move(raw),
                                                      phrase_node.boost);
     if (!iter_result.has_value()) {
@@ -782,7 +784,8 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
       return {};
     }
     if (!get_ret.ok() && !get_ret.IsNotFound())
-      return tl::make_unexpected(Status::InternalError(get_ret.ToString()));
+      return tl::make_unexpected(
+          FtsReadFailure(get_ret, "Read existing FTS posting"));
     existing.Reset();
     auto packed = postings.encode(postings.size(), *scorer_);
     if (!ctx_->put(postings_cf_, current_term, packed.data).ok()) {

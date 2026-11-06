@@ -286,6 +286,8 @@ Status FtsIndexer::seal(const std::string &field_name) {
 
   ret = indexer->convert_postings_to_bitpacked();
   if (!ret.has_value()) {
+    if (ret.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return ret.error();
     return Status::InternalError("FtsIndexer::seal convert failed: ",
                                  field_name, " ", ret.error().message());
   }
@@ -315,6 +317,8 @@ Status FtsIndexer::seal_all() {
   for (const auto &[name, indexer] : indexers_) {
     auto ret = indexer->convert_postings_to_bitpacked();
     if (!ret.has_value()) {
+      if (ret.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+        return ret.error();
       return Status::InternalError("FtsIndexer::seal_all convert failed: ",
                                    name, " ", ret.error().message());
     }
