@@ -6933,6 +6933,10 @@ zvec_error_code_t zvec_collection_add_column(zvec_collection_t *collection,
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      if (expression)
+        zvec::detail::ReserveCStrings(input_memory, &expression, 1);
       // Deep copy the schema - caller retains ownership
       auto *cpp_schema =
           reinterpret_cast<const zvec::FieldSchema *>(field_schema);

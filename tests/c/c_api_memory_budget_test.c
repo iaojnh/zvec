@@ -81,6 +81,11 @@ int main(void) {
   filter[24 * MIB] = 0;
   assert(zvec_collection_delete_by_filter(collection, filter) ==
          ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  field = zvec_field_schema_create("denied", ZVEC_DATA_TYPE_INT64, false, 0);
+  assert(field);
+  assert(zvec_collection_add_column(collection, field, filter) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  zvec_field_schema_destroy(field);
   free(filter);
 
   // Retaining copies must exhaust a shared active allowance, independent of

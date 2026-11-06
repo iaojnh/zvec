@@ -19,6 +19,9 @@
 #include <thread>
 #include <vector>
 #include <zvec/db/status.h>
+#include "db/common/binding_memory.h"
+#include "db/common/native_worker_memory.h"
+#include "db/common/result_memory_allowance.h"
 #include "db/common/typedef.h"
 
 namespace zvec {
@@ -92,16 +95,28 @@ std::vector<SegmentMeta::Ptr> SegmentManager::get_segments_meta() const {
 
 Status SegmentManager::add_column(const FieldSchema::Ptr &column_schema,
                                   const std::string &expression,
-                                  int concurrency) {
+                                  int concurrency) try {
   if (concurrency <= 0) {
-    concurrency = static_cast<int>(std::thread::hardware_concurrency());
+    concurrency =
+        static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   }
 
+  detail::ResultMemoryAllowance::Lease workers(
+      &detail::SharedResultMemoryAllowance());
   std::vector<std::future<Status>> futures;
   std::vector<std::pair<SegmentID, Segment::Ptr>> segments;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     segments.assign(segments_map_.begin(), segments_map_.end());
+  }
+
+  if (std::any_of(segments.begin(), segments.end(), [](const auto &item) {
+        return item.second->uses_buffer_storage();
+      })) {
+    workers.add(detail::BindingMemoryBytes(
+        std::min(segments.size(), static_cast<size_t>(concurrency)),
+        detail::BindingMemoryBytes(1, detail::DefaultNativeWorkerStackBytes(),
+                                   1024)));
   }
 
   for (size_t i = 0; i < segments.size(); i += concurrency) {
@@ -125,20 +140,35 @@ Status SegmentManager::add_column(const FieldSchema::Ptr &column_schema,
   }
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "DDL worker memory budget exhausted");
 }
 
 Status SegmentManager::alter_column(const std::string &column_name,
                                     const FieldSchema::Ptr &new_column_schema,
-                                    int concurrency) {
+                                    int concurrency) try {
   if (concurrency <= 0) {
-    concurrency = static_cast<int>(std::thread::hardware_concurrency());
+    concurrency =
+        static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   }
 
+  detail::ResultMemoryAllowance::Lease workers(
+      &detail::SharedResultMemoryAllowance());
   std::vector<std::future<Status>> futures;
   std::vector<std::pair<SegmentID, Segment::Ptr>> segments;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     segments.assign(segments_map_.begin(), segments_map_.end());
+  }
+
+  if (std::any_of(segments.begin(), segments.end(), [](const auto &item) {
+        return item.second->uses_buffer_storage();
+      })) {
+    workers.add(detail::BindingMemoryBytes(
+        std::min(segments.size(), static_cast<size_t>(concurrency)),
+        detail::BindingMemoryBytes(1, detail::DefaultNativeWorkerStackBytes(),
+                                   1024)));
   }
 
   for (size_t i = 0; i < segments.size(); i += concurrency) {
@@ -162,6 +192,9 @@ Status SegmentManager::alter_column(const std::string &column_name,
   }
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "DDL worker memory budget exhausted");
 }
 
 Status SegmentManager::drop_column(const std::string &column_name) {

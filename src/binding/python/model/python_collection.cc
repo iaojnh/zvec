@@ -879,11 +879,16 @@ void ZVecPyCollection::bind_ddl_methods(
   // binding column ddl methods
   col.def("AddColumn",
           [](Collection &self, const FieldSchema::Ptr &column_schema,
-             const std::string &expression, const AddColumnOptions &options) {
+             py::handle expression, const AddColumnOptions &options) {
+            const bool budgeted = !unwrap_expected(self.options()).enable_mmap_;
+            detail::PythonFetchInputs inputs(
+                py::make_tuple(expression), py::none(),
+                budgeted ? &forward_result_allowance() : nullptr);
             Status status;
             {
               py::gil_scoped_release release;
-              status = self.add_column(column_schema, expression, options);
+              status =
+                  self.add_column(column_schema, inputs.pks.front(), options);
             }
             throw_if_error(status);
           })

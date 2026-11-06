@@ -35,6 +35,8 @@
 #include "db/common/file_helper.h"
 #include "db/index/common/meta.h"
 #include "chunked_file_writer.h"
+#include "parquet_memory_pool.h"
+#include "parquet_metadata_budget.h"
 
 
 namespace zvec {
@@ -773,8 +775,8 @@ inline arrow::Result<std::shared_ptr<arrow::Array>> SelectArrayByIndices(
 inline arrow::Result<std::shared_ptr<arrow::Table>> ReadBlocksAsTable(
     const std::vector<BlockMeta> &scalar_blocks, const std::string &base_path,
     uint32_t collection_id, bool use_parquet) {
-  auto fs = std::make_shared<arrow::fs::LocalFileSystem>();
-  auto pool = arrow::default_memory_pool();
+  auto pool = use_parquet ? detail::GetParquetMemoryPool().get()
+                          : arrow::default_memory_pool();
 
   if (scalar_blocks.empty()) {
     return arrow::Status::Invalid("No block metadata provided");
@@ -796,26 +798,32 @@ inline arrow::Result<std::shared_ptr<arrow::Table>> ReadBlocksAsTable(
         base_path, collection_id, block.id_, use_parquet);
 
     try {
-      auto file_info = fs->GetFileInfo(filepath).ValueOrDie();
-      auto file = fs->OpenInputFile(file_info.path()).ValueOrDie();
+      std::shared_ptr<arrow::io::RandomAccessFile> file;
+      std::string resolved_path;
+      ARROW_RETURN_NOT_OK(CreateRandomAccessFileByUri(
+          filepath, &file, &resolved_path, /*enable_mmap=*/false, pool));
 
       std::shared_ptr<arrow::Table> table;
 
       if (use_parquet) {
         std::unique_ptr<parquet::arrow::FileReader> reader;
-        reader = parquet::arrow::OpenFile(file, pool).ValueOrDie();
+        ARROW_ASSIGN_OR_RAISE(auto native_reader,
+                              detail::OpenBudgetedParquetReader(
+                                  file, parquet::ReaderProperties(pool)));
+        ARROW_RETURN_NOT_OK(parquet::arrow::FileReader::Make(
+            pool, std::move(native_reader), &reader));
         ARROW_RETURN_NOT_OK(reader->ReadTable(&table));
       } else {
-        auto reader =
-            arrow::ipc::RecordBatchFileReader::Open(file).ValueOrDie();
+        ARROW_ASSIGN_OR_RAISE(auto reader,
+                              arrow::ipc::RecordBatchFileReader::Open(file));
 
         std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
         for (int i = 0; i < reader->num_record_batches(); ++i) {
-          auto batch = reader->ReadRecordBatch(i).ValueOrDie();
+          ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadRecordBatch(i));
           batches.push_back(batch);
         }
 
-        table = arrow::Table::FromRecordBatches(batches).ValueOrDie();
+        ARROW_ASSIGN_OR_RAISE(table, arrow::Table::FromRecordBatches(batches));
       }
 
       if (segments.find(start_row) == segments.end()) {
@@ -830,6 +838,8 @@ inline arrow::Result<std::shared_ptr<arrow::Table>> ReadBlocksAsTable(
 
         segments[start_row][field->name()] = {field, original_chunked_array};
       }
+    } catch (const std::bad_alloc &) {
+      return arrow::Status::OutOfMemory("DDL block read budget exhausted");
     } catch (const std::exception &e) {
       return arrow::Status::IOError("Failed to read block ",
                                     std::to_string(block.id_), ": ", e.what());
@@ -875,7 +885,9 @@ inline arrow::Result<std::shared_ptr<arrow::Table>> ReadBlocksAsTable(
 inline arrow::Result<std::shared_ptr<arrow::Table>> EvaluateExpressionOnTable(
     const std::shared_ptr<arrow::Table> &table,
     const std::string &new_column_name, const arrow::compute::Expression &expr,
-    const std::shared_ptr<arrow::DataType> &expected_type) {
+    const std::shared_ptr<arrow::DataType> &expected_type,
+    arrow::MemoryPool *pool = arrow::default_memory_pool()) {
+  arrow::compute::ExecContext context(pool);
   arrow::compute::CastOptions cast_options;
   cast_options.to_type = expected_type;
   cast_options.allow_int_overflow = true;
@@ -883,7 +895,8 @@ inline arrow::Result<std::shared_ptr<arrow::Table>> EvaluateExpressionOnTable(
   arrow::compute::Expression cast_expr =
       arrow::compute::call("cast", {expr}, cast_options);
 
-  ARROW_ASSIGN_OR_RAISE(auto bound_expr, cast_expr.Bind(*table->schema()));
+  ARROW_ASSIGN_OR_RAISE(auto bound_expr,
+                        cast_expr.Bind(*table->schema(), &context));
 
   auto batches = arrow::TableBatchReader(*table);
   std::vector<std::shared_ptr<arrow::Array>> result_arrays;
@@ -895,13 +908,14 @@ inline arrow::Result<std::shared_ptr<arrow::Table>> EvaluateExpressionOnTable(
 
     arrow::compute::ExecBatch exec_batch(*batch);
     ARROW_ASSIGN_OR_RAISE(auto datum, arrow::compute::ExecuteScalarExpression(
-                                          bound_expr, exec_batch));
+                                          bound_expr, exec_batch, &context));
 
     if (datum.is_array()) {
       result_arrays.push_back(datum.make_array());
     } else if (datum.is_scalar()) {
-      ARROW_ASSIGN_OR_RAISE(auto arr, arrow::MakeArrayFromScalar(
-                                          *datum.scalar(), batch->num_rows()));
+      ARROW_ASSIGN_OR_RAISE(
+          auto arr,
+          arrow::MakeArrayFromScalar(*datum.scalar(), batch->num_rows(), pool));
       result_arrays.push_back(arr);
     } else {
       return arrow::Status::Invalid(

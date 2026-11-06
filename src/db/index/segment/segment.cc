@@ -3615,13 +3615,20 @@ Status SegmentImpl::reopen_invert_indexer(bool read_only) {
 
 Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
                                const std::string &expression,
-                               const AddColumnOptions & /*options*/) {
+                               const AddColumnOptions & /*options*/) try {
   if (memory_store_) {
     return Status::NotSupported(
         "Add column is not supported for segment with memory store");
   }
 
   global_init();
+
+  detail::ResultMemoryAllowance::Lease expression_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  detail::QueryResultEstimate expression_bytes;
+  expression_bytes.add(4096);
+  expression_bytes.add(256, expression.size());
+  expression_memory.add(expression_bytes.bytes());
 
   std::vector<std::shared_ptr<arrow::Field>> fields;
   arrow::Status status =
@@ -3666,8 +3673,12 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
       total_doc_count += block.doc_count_;
     }
     arrow::Result<std::shared_ptr<arrow::Array>> result =
-        arrow::MakeArrayOfNull(expected_type, total_doc_count);
+        arrow::MakeArrayOfNull(expected_type, total_doc_count,
+                               query_memory_pool());
     if (!result.ok()) {
+      if (result.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      result.status().ToString());
       return Status::InternalError("MakeArrayOfNull failed");
     }
     auto array = result.ValueOrDie();
@@ -3678,6 +3689,9 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
     // Parse Simple sql expression
     auto p_result = ParseToExpression(expression, physic_schema);
     if (!p_result.ok()) {
+      if (p_result.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      p_result.status().ToString());
       return Status::InvalidArgument("parse expression failed:",
                                      p_result.status().message());
     }
@@ -3686,12 +3700,18 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
     auto result = ReadBlocksAsTable(scalar_blocks, path_, segment_meta_->id(),
                                     !options_.enable_mmap_);
     if (!result.ok()) {
+      if (result.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      result.status().ToString());
       return Status::InternalError(result.status().message());
     }
     auto table = std::move(result).ValueOrDie();
-    auto eval_result = EvaluateExpressionOnTable(table, column_schema->name(),
-                                                 expr, expected_type);
+    auto eval_result = EvaluateExpressionOnTable(
+        table, column_schema->name(), expr, expected_type, query_memory_pool());
     if (!eval_result.ok()) {
+      if (eval_result.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      eval_result.status().ToString());
       return Status::InternalError("evaluate expression failed:",
                                    eval_result.status().message());
     }
@@ -3709,7 +3729,28 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
       segment_meta_->id(), [this]() { return allocate_block_id(); },
       !options_.enable_mmap_, &new_blocks);
   if (!status.ok()) {
+    if (status.IsOutOfMemory())
+      return Status(StatusCode::RESOURCE_EXHAUSTED, status.ToString());
     return Status::InternalError(status.message());
+  }
+
+  // Open the replacement readers before mutating indexes or deleting old
+  // files. Metadata admission can fail under pressure; preserve the old data
+  // while these readers are still being prepared.
+  std::vector<BaseForwardStore::Ptr> new_stores;
+  new_stores.reserve(new_blocks.size());
+  persist_stores_.reserve(persist_stores_.size() + new_blocks.size());
+  for (const auto &block : new_blocks) {
+    auto forward_path = FileHelper::MakeForwardBlockPath(
+        path_, segment_meta_->id(), block.id_, !options_.enable_mmap_);
+    BaseForwardStore::Ptr store;
+    if (options_.enable_mmap_) {
+      store = std::make_shared<MmapForwardStore>(forward_path);
+    } else {
+      store = std::make_shared<BufferPoolForwardStore>(forward_path);
+    }
+    CHECK_RETURN_STATUS(store->open());
+    new_stores.push_back(std::move(store));
   }
 
   // create persist scalar indexer
@@ -3763,21 +3804,10 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
   }
 
   std::unique_lock<std::shared_mutex> lock(seg_mtx_);
-  // create and append persist scalar indexer
-  for (auto &block : new_blocks) {
-    auto forward_path = FileHelper::MakeForwardBlockPath(
-        path_, segment_meta_->id(), block.id_, !options_.enable_mmap_);
-
-    BaseForwardStore::Ptr forward_store;
-    if (options_.enable_mmap_) {
-      forward_store = std::make_shared<MmapForwardStore>(forward_path);
-    } else {
-      forward_store = std::make_shared<BufferPoolForwardStore>(forward_path);
-    }
-    auto s = forward_store->open();
-    CHECK_RETURN_STATUS(s);
-    persist_stores_.push_back(forward_store);
-    segment_meta_->add_persisted_block(block);
+  // Publish only readers that have already passed metadata admission.
+  for (size_t i = 0; i < new_blocks.size(); ++i) {
+    persist_stores_.push_back(std::move(new_stores[i]));
+    segment_meta_->add_persisted_block(new_blocks[i]);
   }
 
   // collection_schema append new field
@@ -3789,12 +3819,15 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
   fresh_persist_chunked_array();
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Add column memory budget exhausted");
 }
 
 
 Status SegmentImpl::alter_column(const std::string &column_name,
                                  const FieldSchema::Ptr &new_column_schema,
-                                 const AlterColumnOptions & /*options*/) {
+                                 const AlterColumnOptions & /*options*/) try {
   if (memory_store_) {
     return Status::NotSupported(
         "Add column is not supported for segment with memory store");
@@ -3832,15 +3865,21 @@ Status SegmentImpl::alter_column(const std::string &column_name,
   auto result = ReadBlocksAsTable(filter_column_blocks, path_,
                                   segment_meta_->id(), !options_.enable_mmap_);
   if (!result.ok()) {
+    if (result.status().IsOutOfMemory())
+      return Status(StatusCode::RESOURCE_EXHAUSTED, result.status().ToString());
     return Status::InternalError(result.status().message());
   }
   auto table = std::move(result).ValueOrDie();
 
   arrow::compute::Expression expr =
       arrow::compute::field_ref(old_field_schema->name());
-  auto eval_result = EvaluateExpressionOnTable(table, new_column_name, expr,
-                                               new_arrow_field->type());
+  auto eval_result =
+      EvaluateExpressionOnTable(table, new_column_name, expr,
+                                new_arrow_field->type(), query_memory_pool());
   if (!eval_result.ok()) {
+    if (eval_result.status().IsOutOfMemory())
+      return Status(StatusCode::RESOURCE_EXHAUSTED,
+                    eval_result.status().ToString());
     return Status::InternalError("evaluate expression failed:",
                                  eval_result.status().message());
   }
@@ -3857,7 +3896,28 @@ Status SegmentImpl::alter_column(const std::string &column_name,
       segment_meta_->id(), [this]() { return allocate_block_id(); },
       !options_.enable_mmap_, &new_blocks);
   if (!status.ok()) {
+    if (status.IsOutOfMemory())
+      return Status(StatusCode::RESOURCE_EXHAUSTED, status.ToString());
     return Status::InternalError(status.message());
+  }
+
+  // Open the replacement readers before mutating indexes or deleting old
+  // files. Metadata admission can fail under pressure; preserve the old data
+  // while these readers are still being prepared.
+  std::vector<BaseForwardStore::Ptr> new_stores;
+  new_stores.reserve(new_blocks.size());
+  persist_stores_.reserve(persist_stores_.size() + new_blocks.size());
+  for (const auto &block : new_blocks) {
+    auto forward_path = FileHelper::MakeForwardBlockPath(
+        path_, segment_meta_->id(), block.id_, !options_.enable_mmap_);
+    BaseForwardStore::Ptr store;
+    if (options_.enable_mmap_) {
+      store = std::make_shared<MmapForwardStore>(forward_path);
+    } else {
+      store = std::make_shared<BufferPoolForwardStore>(forward_path);
+    }
+    CHECK_RETURN_STATUS(store->open());
+    new_stores.push_back(std::move(store));
   }
 
   if (new_column_schema->has_invert_index()) {
@@ -3987,21 +4047,10 @@ Status SegmentImpl::alter_column(const std::string &column_name,
     }
   }
 
-  // create and append persist scalar indexer
-  for (auto &block : new_blocks) {
-    auto forward_path = FileHelper::MakeForwardBlockPath(
-        path_, segment_meta_->id(), block.id_, !options_.enable_mmap_);
-
-    BaseForwardStore::Ptr forward_store;
-    if (options_.enable_mmap_) {
-      forward_store = std::make_shared<MmapForwardStore>(forward_path);
-    } else {
-      forward_store = std::make_shared<BufferPoolForwardStore>(forward_path);
-    }
-    auto s = forward_store->open();
-    CHECK_RETURN_STATUS(s);
-    persist_stores_.push_back(forward_store);
-    segment_meta_->add_persisted_block(block);
+  // Publish only readers that have already passed metadata admission.
+  for (size_t i = 0; i < new_blocks.size(); ++i) {
+    persist_stores_.push_back(std::move(new_stores[i]));
+    segment_meta_->add_persisted_block(new_blocks[i]);
   }
 
   // collection_schema append new field
@@ -4014,6 +4063,9 @@ Status SegmentImpl::alter_column(const std::string &column_name,
   fresh_persist_chunked_array();
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Alter column memory budget exhausted");
 }
 
 Status SegmentImpl::drop_column(const std::string &column_name) {

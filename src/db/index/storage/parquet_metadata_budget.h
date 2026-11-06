@@ -76,6 +76,8 @@ OpenBudgetedParquetReader(
                                             std::move(owned_metadata));
   } catch (const std::bad_alloc &) {
     return arrow::Status::OutOfMemory("Parquet metadata budget exhausted");
+  } catch (const parquet::ParquetStatusException &error) {
+    return error.status();
   } catch (const parquet::ParquetException &error) {
     return arrow::Status::Invalid(error.what());
   }
