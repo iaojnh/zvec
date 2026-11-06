@@ -13,6 +13,52 @@
 
 #define MIB ((size_t)1024 * 1024)
 
+static void test_write_result_admission(void) {
+  zvec_collection_schema_t *schema = zvec_collection_schema_create("status");
+  zvec_field_schema_t *field =
+      zvec_field_schema_create("value", ZVEC_DATA_TYPE_INT64, false, 0);
+  assert(schema && field);
+  assert(zvec_collection_schema_add_field(schema, field) == ZVEC_OK);
+  zvec_field_schema_destroy(field);
+  zvec_collection_options_t *options = zvec_collection_options_create();
+  assert(zvec_collection_options_set_enable_mmap(options, true) == ZVEC_OK);
+  char path[128];
+  snprintf(path, sizeof(path), "zvec_c_status_%llu_%llu",
+           (unsigned long long)time(NULL), (unsigned long long)clock());
+  zvec_collection_t *collection = NULL;
+  assert(zvec_collection_create_and_open(path, schema, options, &collection) ==
+         ZVEC_OK);
+  zvec_collection_options_destroy(options);
+  zvec_collection_schema_destroy(schema);
+  zvec_doc_t *doc = zvec_doc_create();
+  assert(doc);
+  zvec_doc_set_pk(doc, "protected");
+  int64_t value = 1;
+  assert(zvec_doc_add_field_by_value(doc, "value", ZVEC_DATA_TYPE_INT64, &value,
+                                    sizeof(value)) == ZVEC_OK);
+  const zvec_doc_t *batch[] = {doc};
+  zvec_write_result_t *results = (zvec_write_result_t *)1;
+  size_t count = 123;
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  assert(zvec_collection_insert_with_results(collection, batch, 1, &results,
+                                              &count) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(results == NULL && count == 0);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  assert(zvec_collection_insert_with_results(collection, batch, 1, &results,
+                                              &count) == ZVEC_OK);
+  assert(count == 1 && results[0].code == ZVEC_OK);
+  zvec_write_results_free(results, count);
+  assert(zvec_collection_insert_with_results(collection, batch, 1, &results,
+                                              &count) == ZVEC_OK);
+  assert(count == 1 && results[0].code == ZVEC_ERROR_ALREADY_EXISTS);
+  zvec_doc_destroy(doc);
+  assert(zvec_collection_destroy(collection) == ZVEC_OK);
+  assert(zvec_collection_close(collection) == ZVEC_OK);
+  assert(results[0].message && strstr(results[0].message, "protected"));
+  zvec_write_results_free(results, count);
+}
+
 int main(void) {
   zvec_config_data_t *config = zvec_config_data_create();
   assert(config);
@@ -21,6 +67,7 @@ int main(void) {
   assert(zvec_config_data_set_optimize_thread_count(config, 1) == ZVEC_OK);
   assert(zvec_initialize(config) == ZVEC_OK);
   zvec_config_data_destroy(config);
+  test_write_result_admission();
 
   zvec_collection_schema_t *schema = zvec_collection_schema_create("budget");
   zvec_field_schema_t *field =

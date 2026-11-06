@@ -500,6 +500,41 @@ TEST_F(CollectionWriteBudgetTest, ReadmissionFailureDoesNotMutateAndCanRetry) {
   ASSERT_TRUE(writer.value()->close().ok());
 }
 
+TEST_F(CollectionWriteBudgetTest, UpdateAdmitsFieldCopiesBeforeMerging) {
+  auto writer = Collection::CreateAndOpen(
+      path("update_merge_admission"), schema(), {false, false, kMiB});
+  ASSERT_TRUE(writer) << writer.error().message();
+  auto initial = docs("existing", "before");
+  auto inserted = (*writer)->insert(initial);
+  ASSERT_TRUE(inserted);
+  ASSERT_TRUE(inserted->front().ok());
+  {
+    auto &allowance = detail::SharedResultMemoryAllowance();
+    detail::ResultMemoryAllowance::Lease busy(&allowance);
+    const auto active_limit =
+        ailego::MemoryLimitPool::get_instance().capacity() / 8;
+    busy.add(active_limit - kMiB / 2);
+    auto large = docs("existing", std::string(kMiB, 'x'));
+    auto rejected = (*writer)->update(large);
+    ASSERT_TRUE(rejected);
+    ASSERT_EQ(1u, rejected->size());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, rejected->front().code());
+    EXPECT_EQ("Insufficient memory to merge update fields",
+              rejected->front().message());
+  }
+  {
+    auto fetched = (*writer)->fetch({"existing"});
+    ASSERT_TRUE(fetched);
+    ASSERT_NE(nullptr, fetched->at("existing"));
+    EXPECT_EQ("before", fetched->at("existing")->get<std::string>("payload"));
+  }
+  auto patch = docs("existing", "after");
+  auto updated = (*writer)->update(patch);
+  ASSERT_TRUE(updated);
+  EXPECT_TRUE(updated->front().ok());
+  ASSERT_TRUE((*writer)->close().ok());
+}
+
 TEST_F(CollectionWriteBudgetTest, ForwardAdmissionPrecedesWalAndMutation) {
   const auto collection_path = path("forward_admission");
   auto writer = Collection::CreateAndOpen(collection_path, schema(),

@@ -43,6 +43,7 @@
 #include "db/collection_query_internal.h"
 #include "db/common/constants.h"
 #include "db/common/doc_id_buffer.h"
+#include "db/common/document_memory.h"
 #include "db/common/file_helper.h"
 #include "db/common/global_resource.h"
 #include "db/common/profiler.h"
@@ -1649,11 +1650,22 @@ Status CollectionImpl::handle_upsert(Doc &doc) {
 }
 
 Status CollectionImpl::handle_update(Doc &doc) {
+  detail::ResultMemoryAllowance::Lease merged_fields(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
   Doc::Ptr old_doc{nullptr};
   auto s = internal_fetch_by_doc(doc, &old_doc);
   CHECK_RETURN_STATUS(s);
 
-  old_doc->merge(doc);
+  try {
+    // The fetched document owns its existing fields. The merge can copy a
+    // second payload from the update before forward storage or WAL admission.
+    if (merged_fields.enabled())
+      merged_fields.add(detail::DocumentMemoryAccess::copy_bytes(doc));
+    old_doc->merge(doc);
+  } catch (const std::bad_alloc &) {
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Insufficient memory to merge update fields");
+  }
   return writing_segment_->update(*old_doc);
 }
 

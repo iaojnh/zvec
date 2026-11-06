@@ -48,6 +48,11 @@ class CResultAllocations {
     auto owner = std::make_shared<ResultMemoryAllowance::Lease>(
         &SharedResultMemoryAllowance());
     owner->absorb(admission);
+    return allocate_owned(bytes, owner);
+  }
+
+  // The caller has already admitted the array and its backing owner.
+  void *allocate_owned(size_t bytes, const std::shared_ptr<void> &owner) {
     std::unique_ptr<void, decltype(&std::free)> data(
         std::malloc(bytes ? bytes : 1), &std::free);
     if (!data) throw std::bad_alloc();
@@ -62,7 +67,7 @@ class CResultAllocations {
 
   void free(void *ptr) noexcept {
     if (!ptr) return;
-    std::shared_ptr<ResultMemoryAllowance::Lease> owner;
+    std::shared_ptr<void> owner;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto found = owners_.find(ptr);
@@ -78,8 +83,7 @@ class CResultAllocations {
  private:
   inline static std::atomic<CResultAllocations *> current_{nullptr};
   std::mutex mutex_;
-  std::unordered_map<void *, std::shared_ptr<ResultMemoryAllowance::Lease>>
-      owners_;
+  std::unordered_map<void *, std::shared_ptr<void>> owners_;
 };
 
 inline void *AllocateCResult(size_t bytes) {

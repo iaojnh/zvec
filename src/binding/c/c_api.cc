@@ -882,50 +882,67 @@ static char *copy_string(const std::string &str) {
   return copy;
 }
 
-/**
- * @brief Free write results array returned by DML APIs
- * @param results Results array to free
- * @param result_count Number of results
- */
-static void free_write_results_internal(zvec_write_result_t *results,
-                                        size_t result_count) {
-  if (!results) {
-    return;
+// Allocate the C result array before mutating the collection. Keep native
+// statuses in its registered owner so publishing messages cannot fail due to
+// a new allocation or a pressure transition after the write.
+class CWriteResultBuffer {
+ public:
+  template <typename Input>
+  explicit CWriteResultBuffer(const std::vector<Input> &input) {
+    using zvec::detail::BindingMemoryBytes;
+    size_t key_bytes = 0;
+    for (const auto &item : input)
+      key_bytes = BindingMemoryBytes(2, key_size(item), key_bytes);
+    const size_t array_bytes =
+        BindingMemoryBytes(input.size(), sizeof(zvec_write_result_t));
+    const size_t overhead =
+        BindingMemoryBytes(1, array_bytes, sizeof(Owner) + 256);
+    zvec::detail::ResultMemoryAllowance::Lease admission(
+        &zvec::detail::SharedResultMemoryAllowance());
+    // Duplicate-key and missing-key statuses can include the full key.
+    admission.add(BindingMemoryBytes(input.size(), sizeof(zvec::Status) + 512,
+                                    BindingMemoryBytes(1, key_bytes, overhead)));
+    owner_ = std::make_shared<Owner>();
+    owner_->memory.absorb(admission);
+    results_.reset(static_cast<zvec_write_result_t *>(
+        zvec::detail::CResultAllocations::instance().allocate_owned(
+            array_bytes, owner_)));
   }
-  for (size_t i = 0; i < result_count; ++i) {
-    // pk is not stored (ordered style), only free message
-    if (results[i].message) {
-      zvec_free((void *)results[i].message);
-      results[i].message = nullptr;
-    }
-  }
-  zvec_free(results);
-}
 
-// Helper function: convert per-doc statuses to C API write result array.
-static zvec_error_code_t build_write_results(
-    const std::vector<zvec::Status> &statuses, zvec_write_result_t **results,
-    size_t *result_count) {
-  if (!results || !result_count) return ZVEC_ERROR_INVALID_ARGUMENT;
-  *results = nullptr;
-  *result_count = 0;
-  if (statuses.empty()) return ZVEC_OK;
-  auto cleanup = [&statuses](zvec_write_result_t *ptr) {
-    free_write_results_internal(ptr, statuses.size());
-  };
-  std::unique_ptr<zvec_write_result_t, decltype(cleanup)> converted(
-      static_cast<zvec_write_result_t *>(zvec::detail::AllocateCResultArray(
-          statuses.size(), sizeof(zvec_write_result_t))), cleanup);
-  for (size_t i = 0; i < statuses.size(); ++i) {
-    const auto &message = statuses[i].message();
-    if (!message.empty())
-      converted.get()[i].message = zvec::detail::CopyCResultString(message);
-    converted.get()[i].code = status_to_error_code(statuses[i]);
+  void publish(zvec::WriteResults statuses, zvec_write_result_t **results,
+               size_t *count) {
+    using zvec::detail::BindingMemoryBytes;
+    owner_->statuses = std::move(statuses);
+    const auto &owned = owner_->statuses;
+    size_t bytes = BindingMemoryBytes(
+        owned.capacity(), sizeof(zvec::Status),
+        BindingMemoryBytes(owned.size(), sizeof(zvec_write_result_t),
+                           sizeof(Owner) + 256));
+    for (size_t i = 0; i < owned.size(); ++i) {
+      const auto &status = owned[i];
+      results_.get()[i] = {status_to_error_code(status),
+                          status.message().empty() ? nullptr : status.c_str()};
+      bytes = BindingMemoryBytes(1, status.message().capacity(), bytes);
+    }
+    owner_->memory.retain_at_most(bytes);
+    *count = owned.size();
+    if (!owned.empty()) *results = results_.release();
   }
-  *results = converted.release();
-  *result_count = statuses.size();
-  return ZVEC_OK;
-}
+
+ private:
+  struct Owner {
+    zvec::detail::ResultMemoryAllowance::Lease memory{
+        &zvec::detail::SharedResultMemoryAllowance()};
+    zvec::WriteResults statuses;
+  };
+
+  static size_t key_size(const zvec::Doc &doc) { return doc.pk_ref().size(); }
+  static size_t key_size(const std::string &key) { return key.size(); }
+
+  std::shared_ptr<Owner> owner_;
+  std::unique_ptr<zvec_write_result_t, decltype(&zvec_free)> results_{
+      nullptr, &zvec_free};
+};
 
 // =============================================================================
 // Type conversion helpers
@@ -3050,8 +3067,8 @@ void zvec_docs_free(zvec_doc_t **docs, size_t count) {
   zvec_free(docs);
 }
 
-void zvec_write_results_free(zvec_write_result_t *results, size_t result_count) {
-  free_write_results_internal(results, result_count);
+void zvec_write_results_free(zvec_write_result_t *results, size_t /*result_count*/) {
+  zvec_free(results);
 }
 
 void zvec_doc_set_pk(zvec_doc_t *doc, const char *pk) {
@@ -7094,12 +7111,14 @@ zvec_error_code_t zvec_collection_insert_with_results(zvec_collection_t *collect
       }
       auto &internal_docs = converted_docs.value();
 
+      CWriteResultBuffer output(internal_docs);
       auto result = (*coll_ptr)->insert(internal_docs);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results, result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_update(zvec_collection_t *collection,
@@ -7174,12 +7193,14 @@ zvec_error_code_t zvec_collection_update_with_results(zvec_collection_t *collect
       }
       auto &internal_docs = converted_docs.value();
 
+      CWriteResultBuffer output(internal_docs);
       auto result = (*coll_ptr)->update(internal_docs);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results, result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_upsert(zvec_collection_t *collection,
@@ -7254,12 +7275,14 @@ zvec_error_code_t zvec_collection_upsert_with_results(zvec_collection_t *collect
       }
       auto &internal_docs = converted_docs.value();
 
+      CWriteResultBuffer output(internal_docs);
       auto result = (*coll_ptr)->upsert(internal_docs);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results, result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_delete(zvec_collection_t *collection,
@@ -7313,15 +7336,14 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
                                                   size_t pk_count,
                                                   zvec_write_result_t **results,
                                                   size_t *result_count) {
+  if (results) *results = nullptr;
+  if (result_count) *result_count = 0;
   if (!collection || !pks || pk_count == 0 || !results || !result_count) {
     set_last_error(
         "Invalid arguments: collection, pks, pk_count, results and "
         "result_count cannot be null/zero");
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
-
-  *results = nullptr;
-  *result_count = 0;
 
   ZVEC_TRY_RETURN_ERROR(
       "Exception in zvec_collection_delete_with_results",
@@ -7330,8 +7352,7 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
 
       zvec::detail::ResultMemoryAllowance::Lease input_memory(
           collection_input_allowance(**coll_ptr));
-      zvec::detail::ReserveCStrings(input_memory, pks, pk_count,
-                                   3 * sizeof(zvec::Status) + 512);
+      zvec::detail::ReserveCStrings(input_memory, pks, pk_count);
       std::vector<std::string> primary_keys; primary_keys.reserve(pk_count);
       for (size_t i = 0; i < pk_count; ++i) {
         if (pks[i]) {
@@ -7341,13 +7362,14 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
         }
       }
 
+      CWriteResultBuffer output(primary_keys);
       auto result = (*coll_ptr)->delete_(primary_keys);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results,
-                                  result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection,

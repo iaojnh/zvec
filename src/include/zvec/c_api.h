@@ -3651,7 +3651,7 @@ ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_collection_alter_column(
  */
 typedef struct {
   zvec_error_code_t code; /**< Per-document status code */
-  const char *message;    /**< Per-document status message (allocated by API) */
+  const char *message;    /**< Per-document message owned by the result array */
 } zvec_write_result_t;
 
 // =============================================================================
