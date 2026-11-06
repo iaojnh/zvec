@@ -145,6 +145,25 @@ int main(void) {
   zvec_doc_set_pk(doc, "small");
   assert(zvec_doc_add_field_by_value(doc, "payload", ZVEC_DATA_TYPE_STRING,
                                      "ok", 2) == ZVEC_OK);
+  zvec_doc_t *merged = zvec_doc_create();
+  assert(merged);
+  zvec_doc_set_pk(merged, "before");
+  assert(zvec_doc_set_field_null(merged, "keep") == ZVEC_OK);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  zvec_clear_error();
+  zvec_doc_merge(merged, doc);
+  zvec_error_details_t error;
+  assert(zvec_get_last_error_details(&error) == ZVEC_OK);
+  assert(error.code == ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(strcmp(zvec_doc_get_pk_pointer(merged), "before") == 0);
+  assert(!zvec_doc_has_field(merged, "payload"));
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  zvec_doc_merge(merged, doc);
+  assert(strcmp(zvec_doc_get_pk_pointer(merged), "small") == 0);
+  assert(zvec_doc_has_field(merged, "payload"));
+  assert(zvec_doc_is_field_null(merged, "keep"));
+  zvec_doc_destroy(merged);
+
   // Reusing the retained high water must still obey a new host notification.
   assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
   void *blocked = (void *)1;

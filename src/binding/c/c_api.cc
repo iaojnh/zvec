@@ -4968,11 +4968,23 @@ void zvec_doc_merge(zvec_doc_t *doc, const zvec_doc_t *other) {
     set_last_error("Document pointers are null");
     return;
   }
+  if (doc == other) return;
 
   ZVEC_TRY_BEGIN_VOID
   auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
-  auto *other_ptr = reinterpret_cast<const zvec::Doc *>(other);
-  doc_ptr->merge(*other_ptr);
+  const auto *other_ptr = reinterpret_cast<const zvec::Doc *>(other);
+  using zvec::detail::DocumentMemoryAccess;
+  CInputMutation mutation(*doc_ptr, BindingMemoryBytes(
+      1, DocumentMemoryAccess::copy_bytes(*doc_ptr),
+      DocumentMemoryAccess::copy_bytes(*other_ptr)));
+  // Prepare the merged payload before replacing the live C handle.
+  zvec::Doc merged(*doc_ptr);
+  merged.merge(*other_ptr);
+  *doc_ptr = std::move(merged);
+  mutation.commit();
+  } catch (const std::bad_alloc &) {
+    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
+                   "Document merge budget exhausted");
   ZVEC_CATCH_END_VOID
 }
 

@@ -4336,6 +4336,9 @@ zvec_doc_deserialize(const uint8_t *data, size_t size, zvec_doc_t **doc);
 /**
  * @brief Merge two documents
  *
+ * If the merge exceeds the memory budget, the target is unchanged and
+ * zvec_get_last_error_details reports ZVEC_ERROR_RESOURCE_EXHAUSTED.
+ *
  * @param doc Target document object pointer
  * @param other Source document object pointer
  */

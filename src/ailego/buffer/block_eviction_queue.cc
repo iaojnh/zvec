@@ -500,6 +500,12 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
   return reinterpret_cast<char *>(block) + kRetainedBlockHeaderBytes;
 }
 
+bool MemoryLimitPool::try_materialize_retained_block(void *data) {
+  auto *block = reinterpret_cast<RetainedBlock *>(static_cast<char *>(data) -
+                                                  kRetainedBlockHeaderBytes);
+  return process_rss_.try_materialize_reusable(block->bytes, block->projection);
+}
+
 void MemoryLimitPool::release_retained_block(void *data) {
   if (!data) return;
   auto *block = reinterpret_cast<RetainedBlock *>(static_cast<char *>(data) -

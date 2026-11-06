@@ -385,6 +385,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   //! Active blocks count toward used(); idle blocks still count toward
   //! committed(). Only successful unmapping refunds their backing budget.
   void *acquire_retained_block(size_t bytes, bool metadata = false);
+  // For a retained block shared by multiple allocations. The owner must
+  // keep the block alive and serialize calls that use the same block.
+  bool try_materialize_retained_block(void *data);
   void release_retained_block(void *data);
   static size_t retained_block_size(size_t bytes);
   static constexpr size_t kRetainedBlockHeaderBytes = 64;

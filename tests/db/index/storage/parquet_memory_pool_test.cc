@@ -41,6 +41,24 @@
 #include <windows.h>
 #endif
 
+namespace zvec::ailego {
+
+struct MemoryLimitPoolTestPeer {
+  static bool configure_rss(MemoryLimitPool &pool, size_t limit) {
+    pool.stop_background_evictor();
+    return pool.process_rss_.configure(limit, +[] { return rss; });
+  }
+  static void refresh_rss(MemoryLimitPool &pool) {
+    pool.process_rss_.refresh(true);
+  }
+  static size_t rss_available(MemoryLimitPool &pool) {
+    return pool.process_rss_.available();
+  }
+  static constexpr size_t rss = 32 * 1024 * 1024;
+};
+
+}  // namespace zvec::ailego
+
 namespace zvec {
 namespace detail {
 namespace {
@@ -656,6 +674,29 @@ TEST_F(ParquetBudgetTest, SmallSlotsReuseBackingAndKeepItCharged) {
   ASSERT_TRUE(budget_.try_charge_workspace(budget_.capacity()));
   EXPECT_EQ(0u, budget_.stats().retained_idle_bytes);
   budget_.release_external(budget_.capacity());
+}
+
+TEST_F(ParquetBudgetTest, SmallSlotsShareOneProjectionPerRssSample) {
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  constexpr size_t chunk = 64 * 1024;
+  constexpr size_t headroom = chunk + 4096;
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  ASSERT_TRUE(Peer::configure_rss(native, Peer::rss + headroom));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  uint8_t *anchor = nullptr;
+  ASSERT_TRUE(pool.Allocate(64, &anchor).ok());
+  auto free_anchor = ailego::ScopeGuard::Make([&] { pool.Free(anchor, 64); });
+  for (int sample = 0; sample < 2; ++sample) {
+    if (sample != 0) Peer::refresh_rss(native);
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      uint8_t *slot = nullptr;
+      const auto status = pool.Allocate(64, &slot);
+      ASSERT_TRUE(status.ok()) << status.ToString();
+      pool.Free(slot, 64);
+    }
+    EXPECT_EQ(headroom - chunk, Peer::rss_available(native));
+  }
+  EXPECT_EQ(chunk, pool.charged_bytes());
 }
 
 TEST_F(ParquetBudgetTest, ManagedSmallBuffersHonorAlignmentAndSizeClasses) {
