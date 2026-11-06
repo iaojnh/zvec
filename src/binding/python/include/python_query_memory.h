@@ -43,10 +43,6 @@ class PythonQueryMemory {
         bytes = BindingMemoryBytes(4, text_bytes(name), bytes);
         const auto id = query.attr("id");
         bytes = BindingMemoryBytes(4, text_bytes(id), bytes);
-        const auto vector = query.attr("vector");
-        if (!vector.is_none()) {
-          bytes = BindingMemoryBytes(1, vector_bytes(vector), bytes);
-        }
         const auto fts = query.attr("fts");
         if (!fts.is_none()) {
           bytes = BindingMemoryBytes(4, text_bytes(fts.attr("query_string")),
@@ -69,14 +65,17 @@ class PythonQueryMemory {
     return fields_;
   }
 
-  // ID-based queries discover their vector only after the budgeted Fetch.
-  // Retain its conversion allowance with the rest of this query preparation.
-  void reserve_vector(pybind11::handle value) {
-    if (!memory_.enabled()) return;
+  // Return the admitted snapshot used by NumPy and the native vector caster.
+  // Do not estimate one protocol (__len__/raw list storage), then copy another
+  // (__iter__/__array__) which may expand into an unrelated amount of data.
+  pybind11::object prepare_vector(pybind11::handle value) {
+    if (!memory_.enabled())
+      return pybind11::reinterpret_borrow<pybind11::object>(value);
+    auto normalized = normalize_vector(value);
     size_t admitted = 0;
     while (true) {
-      const auto bytes = vector_bytes(value);
-      if (bytes <= admitted) return;
+      const auto bytes = vector_bytes(normalized);
+      if (bytes <= admitted) return normalized;
       admit(bytes - admitted);
       admitted = bytes;
     }
@@ -102,7 +101,11 @@ class PythonQueryMemory {
     if (pybind11::isinstance<pybind11::array>(value))
       return static_cast<size_t>(
           pybind11::reinterpret_borrow<pybind11::array>(value).size());
-    if (!PyList_Check(value.ptr()) && !PyTuple_Check(value.ptr())) return 1;
+    if (PyObject_CheckBuffer(value.ptr()))
+      return static_cast<size_t>(
+          pybind11::reinterpret_borrow<pybind11::buffer>(value).request().size);
+    if (!PyList_CheckExact(value.ptr()) && !PyTuple_CheckExact(value.ptr()))
+      return 1;
     const auto count = pybind11::len(value);
     size_t elements = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -115,10 +118,83 @@ class PythonQueryMemory {
   }
   static size_t vector_bytes(pybind11::handle value) {
     if (PyDict_Check(value.ptr()))
-      return BindingMemoryBytes(pybind11::len(value), 128, 256);
+      return BindingMemoryBytes(static_cast<size_t>(PyDict_Size(value.ptr())),
+                                128, 256);
     // dtype conversion/flattening plus owned SubQuery/MultiQuery vector data.
     return BindingMemoryBytes(dense_elements(value), 32, 256);
   }
+  pybind11::object normalize_vector(pybind11::handle value, size_t depth = 0) {
+    if (depth > 64)
+      throw pybind11::value_error("Query vector nesting is too deep");
+    auto original = pybind11::reinterpret_borrow<pybind11::object>(value);
+    if (PyDict_Check(value.ptr()) || PyObject_CheckBuffer(value.ptr()) ||
+        pybind11::isinstance<pybind11::array>(value))
+      return original;
+    const bool exact =
+        PyList_CheckExact(value.ptr()) || PyTuple_CheckExact(value.ptr());
+    if (exact) {
+      // Keep the usual flat numeric-list path allocation-free. Its contents
+      // are rechecked by prepare_vector after every admission/GIL release.
+      bool plain_numbers = true;
+      const auto count = pybind11::len(value);
+      for (size_t i = 0; i < count; ++i) {
+        auto *item = PyList_CheckExact(value.ptr())
+                         ? PyList_GET_ITEM(value.ptr(), i)
+                         : PyTuple_GET_ITEM(value.ptr(), i);
+        if (!PyLong_CheckExact(item) && !PyFloat_CheckExact(item) &&
+            !PyBool_Check(item)) {
+          plain_numbers = false;
+          break;
+        }
+      }
+      if (plain_numbers) return original;
+    }
+    // Numbers and strings remain scalar inputs to NumPy. Unknown __array__
+    // implementations can allocate an unbounded array before exposing size;
+    // callers can explicitly create that array before entering the DB API.
+    if (!exact && !PySequence_Check(value.ptr())) {
+      if (depth == 0 || pybind11::hasattr(value, "__array__") ||
+          pybind11::hasattr(value, "__array_interface__") ||
+          pybind11::hasattr(value, "__array_struct__"))
+        throw pybind11::type_error(
+            "Query vector must expose a buffer or numeric sequence");
+      return original;
+    }
+    if (PyUnicode_Check(value.ptr()) || PyBytes_Check(value.ptr()))
+      return original;
+    pybind11::list staged;
+    if (exact) {
+      size_t admitted = 0;
+      while (true) {
+        const auto bytes = BindingMemoryBytes(pybind11::len(value),
+                                              2 * sizeof(PyObject *), 64);
+        if (bytes <= admitted) break;
+        admit(bytes - admitted);
+        admitted = bytes;
+      }
+      // Exact builtins cannot run Python callbacks while taking this shallow
+      // snapshot. Own all references before recursive normalization releases
+      // the GIL; the caller's mutable list may change during admission.
+      staged = pybind11::reinterpret_steal<pybind11::list>(
+          PySequence_List(value.ptr()));
+      if (!staged) throw pybind11::error_already_set();
+      for (size_t i = 0; i < staged.size(); ++i) {
+        auto held = pybind11::reinterpret_borrow<pybind11::object>(staged[i]);
+        staged[i] = normalize_vector(held, depth + 1);
+      }
+    } else {
+      // range, list/tuple subclasses and other sequences must not first
+      // become an unbudgeted NumPy/Python temporary. Never trust their len().
+      for (auto item :
+           pybind11::reinterpret_borrow<pybind11::iterable>(value)) {
+        auto held = pybind11::reinterpret_borrow<pybind11::object>(item);
+        admit(64);
+        staged.append(normalize_vector(held, depth + 1));
+      }
+    }
+    return std::move(staged);
+  }
+
   void admit(size_t bytes) {
     pybind11::gil_scoped_release release;
     memory_.add(bytes);

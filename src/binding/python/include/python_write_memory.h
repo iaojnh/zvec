@@ -41,6 +41,13 @@ class PythonWriteMemory {
     doc.set_pk(PythonFetchInputs::copy_string(value));
   }
 
+  pybind11::bytes field_name(pybind11::handle value) {
+    // Schema lookup itself crosses a string caster before set_any is reached.
+    // Admit that copy too, and avoid a UTF-8 cache on the caller's Unicode key.
+    reserve_value([&] { return PythonFetchInputs::string_bytes(value); });
+    return pybind11::bytes(PythonFetchInputs::copy_string(value));
+  }
+
   bool set_any(Doc &doc, const std::string &field, const FieldSchema &schema,
                pybind11::object value) {
     const auto type = schema.data_type();
@@ -63,9 +70,10 @@ class PythonWriteMemory {
           std::string(pybind11::str(pybind11::type::of(value))));
     }
     // The STL caster otherwise materializes unknown-length iterables before
-    // we can account for them. Stage these incrementally under the same lease.
-    if (!value.is_none() && sequence && !sparse && !PyList_Check(value.ptr()) &&
-        !PyTuple_Check(value.ptr())) {
+    // we can account for them. Subclasses may also override iteration/length;
+    // normalize them once, incrementally, under the same lease.
+    if (!value.is_none() && sequence && !sparse &&
+        !PyList_CheckExact(value.ptr()) && !PyTuple_CheckExact(value.ptr())) {
       pybind11::list staged;
       for (auto item :
            pybind11::reinterpret_borrow<pybind11::iterable>(value)) {
@@ -86,7 +94,11 @@ class PythonWriteMemory {
         return BindingMemoryBytes(1, PythonFetchInputs::string_bytes(value),
                                   bytes);
       if (sequence) {
-        const auto count = pybind11::len(value);
+        // The sparse caster traverses the native dict, ignoring an overridden
+        // __len__. Charge the same entries it will actually copy.
+        const auto count = PyDict_Check(value.ptr())
+                               ? static_cast<size_t>(PyDict_Size(value.ptr()))
+                               : pybind11::len(value);
         bytes = BindingMemoryBytes(count,
                                    sparse    ? 32
                                    : strings ? 64

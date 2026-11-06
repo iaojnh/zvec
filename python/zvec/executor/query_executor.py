@@ -42,7 +42,9 @@ DTYPE_MAP = {
 def _query_text(value):
     # Avoid populating a persistent UTF-8 cache on caller-owned strings. The
     # transient bytes and native copy are covered by QueryInputMemory.
-    return value.encode("utf-8") if isinstance(value, str) else value
+    # Admission measures native Unicode storage, so a subclass must not swap
+    # in an arbitrary expansion through an overridden encode() method.
+    return str.encode(value, "utf-8") if isinstance(value, str) else value
 
 
 def _query_fields(values):
@@ -264,11 +266,11 @@ class QueryExecutor:
             if not doc:
                 raise ValueError(f"Document with id '{query.id}' not found")
             vec_data = doc[3].get(vector_schema.name)
-            if memory is not None:
-                memory.reserve_vector(vec_data)
         else:
             raise ValueError("Group by query requires a vector or document id")
 
+        if memory is not None:
+            vec_data = memory.prepare_vector(vec_data)
         target_dtype = DTYPE_MAP.get(vector_schema.data_type.value)
         search_query.set_vector(
             vector_schema._get_object(),

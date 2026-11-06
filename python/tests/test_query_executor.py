@@ -381,14 +381,32 @@ class TestQueryExecutor:
             "one": ("one", 0.0, {}, {"test": [1.0, 2.0, 3.0]})
         }
         memory = MagicMock()
+        memory.prepare_vector.side_effect = lambda value: value
         query = executor._build_search_query(
             QueryContext(topk=1), Query("test", id="one"), collection, memory
         )
         collection.FetchTuples.assert_called_once_with(["one"], [], True)
-        memory.reserve_vector.assert_called_once_with([1.0, 2.0, 3.0])
+        memory.prepare_vector.assert_called_once_with([1.0, 2.0, 3.0])
         np.testing.assert_array_equal(
             query.get_vector(schema.vector("test")._get_object()), [1.0, 2.0, 3.0]
         )
+
+    def test_query_text_uses_the_admitted_unicode_content(self):
+        class Text(str):
+            def encode(self, *args, **kwargs):
+                raise AssertionError("Must not invoke an unmeasured encoder")
+
+        text = Text("actual")
+        executor = QueryExecutor(CollectionSchema("test_collection"))
+        native = executor._build_search_query(
+            QueryContext(topk=1, filter=text, output_fields=[text]),
+            Query(text, fts=Fts(match_string=text)),
+            MagicMock(),
+        )
+        assert native.field_name == "actual"
+        assert native.filter == "actual"
+        assert native.output_fields == ["actual"]
+        assert native.fts.match_string == "actual"
 
     def test_query_conversion_does_not_retain_utf8_on_caller_strings(self):
         text = "".join(["中文", "🙂"] * 128)

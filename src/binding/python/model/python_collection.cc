@@ -736,11 +736,12 @@ void ZVecPyCollection::Initialize(pybind11::module_ &m) {
       .def_property_readonly("queries", &detail::PythonQueryMemory::queries)
       .def_property_readonly("output_fields",
                              &detail::PythonQueryMemory::output_fields)
-      .def("reserve_vector", &detail::PythonQueryMemory::reserve_vector);
+      .def("prepare_vector", &detail::PythonQueryMemory::prepare_vector);
   py::class_<detail::PythonWriteMemory,
              std::shared_ptr<detail::PythonWriteMemory>>(m, "_WriteInputMemory")
       .def("new_doc", &detail::PythonWriteMemory::new_doc)
       .def("set_pk", &detail::PythonWriteMemory::set_pk)
+      .def("field_name", &detail::PythonWriteMemory::field_name)
       .def("set_any", &detail::PythonWriteMemory::set_any);
 
   py::class_<GroupResult>(m, "_GroupResult")

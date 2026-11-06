@@ -38,7 +38,8 @@ def convert_to_cpp_doc(
 
     # set scalar fields
     for k, v in doc.fields.items():
-        field_schema = collection_schema.field(k)
+        native_name = _memory.field_name(k) if _memory is not None else k
+        field_schema = collection_schema.field(native_name)
         if not field_schema:
             raise ValueError(
                 f"Invalid schema: {format_name_for_error(k)} not found in collection schema"
@@ -46,11 +47,12 @@ def convert_to_cpp_doc(
         if _memory is None:
             _doc.set_any(k, field_schema._get_object(), v)
         else:
-            _memory.set_any(_doc, k, field_schema._get_object(), v)
+            _memory.set_any(_doc, native_name, field_schema._get_object(), v)
 
     # set vector fields
     for k, v in doc.vectors.items():
-        vector_schema = collection_schema.vector(k)
+        native_name = _memory.field_name(k) if _memory is not None else k
+        vector_schema = collection_schema.vector(native_name)
         if not vector_schema:
             raise ValueError(
                 f"Invalid schema: {format_name_for_error(k)} not found in collection schema"
@@ -58,7 +60,7 @@ def convert_to_cpp_doc(
         if _memory is None:
             _doc.set_any(k, vector_schema._get_object(), v)
         else:
-            _memory.set_any(_doc, k, vector_schema._get_object(), v)
+            _memory.set_any(_doc, native_name, vector_schema._get_object(), v)
     return _doc
 
 
