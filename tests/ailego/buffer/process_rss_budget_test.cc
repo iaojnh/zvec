@@ -390,6 +390,42 @@ TEST(ProcessRssBudgetTest, BaselineCanRecoverAfterStartupMemoryRetires) {
   EXPECT_EQ(100 * kMiB, budget.available());
 }
 
+TEST(ProcessRssBudgetTest, TemporaryFreesKeepPermanentStartupOverlap) {
+  constexpr size_t limit = 128 * kMiB;
+  constexpr size_t permanent = 56 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    ProcessRssBudget budget;
+    budget.account(permanent);
+    native_sample_valid = true;
+    auto sample = [&](size_t bytes) {
+      sampled_rss = use_native_sample ? 32 * kMiB : bytes;
+      native_sample = {bytes, limit - bytes};
+      budget.refresh(true);
+    };
+    sample(64 * kMiB);
+    ASSERT_TRUE(budget.configure(limit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr,
+                                 permanent));
+    ASSERT_TRUE(budget.try_acquire(kMiB));
+    sample(96 * kMiB);
+    budget.release(kMiB);
+    for (size_t i = 0; i < 64; ++i) {
+      sample(96 * kMiB);
+      ASSERT_TRUE(budget.try_acquire(kMiB));
+      budget.release(kMiB);
+    }
+
+    const size_t reserve =
+        use_native_sample ? ProcessRssBudget::headroom(limit) : 0;
+    EXPECT_EQ(32 * kMiB - reserve, budget.available());
+    ASSERT_TRUE(budget.try_acquire(16 * kMiB));
+    // Until sampled, a live new owner still consumes its full reservation.
+    EXPECT_EQ(16 * kMiB - reserve, budget.available());
+    budget.release(16 * kMiB);
+  }
+}
+
 TEST(ProcessRssBudgetTest, ReplacingStartupBackingDoesNotRebasePendingOwners) {
   ProcessRssBudget budget;
   budget.account(300 * kMiB);

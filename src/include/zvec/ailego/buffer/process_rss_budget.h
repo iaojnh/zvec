@@ -45,12 +45,21 @@ class ProcessRssBudget {
   }
 
   bool configure(size_t limit, Reader reader,
-                 NativeReader native_reader = nullptr) {
+                 NativeReader native_reader = nullptr,
+                 size_t permanent_backing = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (permanent_backing &&
+        (!limit || this->limit() || permanent_backing > backing_))
+      return false;
     const size_t rss = limit && reader ? reader() : 0;
     if (limit && !rss) return false;
     NativeSample native;
     if (limit && native_reader && !native_reader(&native)) return false;
+    // Process-lifetime startup reservations stay charged to pool capacity.
+    // Their residency is observed in the total process samples. Exclude them
+    // from the reclaimable RSS ledger so later temporary frees cannot consume
+    // their overlap or make an unchanged sample count them twice.
+    backing_ -= permanent_backing;
     // Changing an active limit must not forget live, possibly untouched
     // backing. The initial sample already includes pre-existing allocations.
     if (!limit || !this->limit()) estimate_.reset(rss, backing_);

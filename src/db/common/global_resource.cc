@@ -212,7 +212,11 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
           [cache = std::weak_ptr<rocksdb::Cache>(rocksdb_block_cache)] {
             if (auto owner = cache.lock()) owner->EraseUnRefEntries();
           });
-      if (!memory_pool.configure_process_rss_limit(memory_limit_bytes)) {
+      const size_t permanent_backing =
+          detail::NativeImageReservation().bytes() +
+          detail::NativeWorkerStackReservation().bytes();
+      if (!memory_pool.configure_process_rss_limit(memory_limit_bytes,
+                                                   permanent_backing)) {
         LOG_ERROR("Failed to sample process RSS for memory admission");
         return -1;
       }

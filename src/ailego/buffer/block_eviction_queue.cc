@@ -1148,8 +1148,14 @@ bool MemoryLimitPool::trim_idle_buffers() {
 }
 
 bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
-  const bool configured = process_rss_.configure(
-      bytes, &MemoryHelper::SelfRSS, NativeApplicationMemoryReader());
+  return configure_process_rss_limit(bytes, 0);
+}
+
+bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
+                                                  size_t permanent_backing) {
+  const bool configured =
+      process_rss_.configure(bytes, &MemoryHelper::SelfRSS,
+                             NativeApplicationMemoryReader(), permanent_backing);
   bg_cv_.notify_one();
   return configured;
 }

@@ -264,6 +264,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
 
   // Enabled by the DB process budget, not by standalone page-pool users.
   bool configure_process_rss_limit(size_t bytes);
+  // On initial setup only, permanent_backing is already charged to the pool
+  // and its owners never release it. It stays included in measured RSS.
+  bool configure_process_rss_limit(size_t bytes, size_t permanent_backing);
   // Queues host pressure; reclamation runs on existing maintenance.
   void set_memory_pressure(ProcessRssBudget::PressureLevel level);
   // Invoked by maintenance without any pool/allocator lock held. The callback
