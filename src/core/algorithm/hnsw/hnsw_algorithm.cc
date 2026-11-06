@@ -140,8 +140,8 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
       break;
     }
 
-    std::vector<MemBlockType> neighbor_vec_blocks;
-    std::vector<IndexStorage::MemoryBlock> provider_vec_blocks;
+    ailego::BudgetedVector<MemBlockType> neighbor_vec_blocks;
+    ailego::BudgetedVector<IndexStorage::MemoryBlock> provider_vec_blocks;
     int ret;
     if (ailego_unlikely(use_provider)) {
       ret = dc.get_vector(&neighbors[0], size, provider_vec_blocks);
@@ -339,7 +339,7 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
   ailego::BudgetedVector<node_id_t> neighbor_ids(buf_capacity);
   ailego::BudgetedVector<float> dists(buf_capacity);
   ailego::BudgetedVector<const void *> neighbor_vecs(buf_capacity);
-  std::vector<MemBlockType> neighbor_vec_blocks;
+  ailego::BudgetedVector<MemBlockType> neighbor_vec_blocks;
   neighbor_vec_blocks.reserve(buf_capacity);
   const bool has_extra_values = ctx->has_extra_values();
   ailego::BudgetedVector<const void *> neighbor_extra_values(
@@ -416,9 +416,9 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
 
   uint32_t buf_capacity = entity.max_degree(level);
   ailego::BudgetedVector<node_id_t> neighbor_ids(buf_capacity);
-  std::vector<MemBlockType> neighbor_vec_blocks;
+  ailego::BudgetedVector<MemBlockType> neighbor_vec_blocks;
   neighbor_vec_blocks.reserve(buf_capacity);
-  std::vector<IndexStorage::MemoryBlock> provider_vec_blocks;
+  ailego::BudgetedVector<IndexStorage::MemoryBlock> provider_vec_blocks;
   ailego::BudgetedVector<float> dists(buf_capacity);
   ailego::BudgetedVector<const void *> neighbor_vecs(buf_capacity);
   const bool has_extra_values = ctx->has_extra_values();
@@ -688,7 +688,7 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         continue;
       }
 
-      std::vector<MemBlockType> neighbor_vec_blocks;
+      ailego::BudgetedVector<MemBlockType> neighbor_vec_blocks;
       int ret = entity.get_vector_typed(neighbor_ids.data(), size,
                                         neighbor_vec_blocks);
       if (ailego_unlikely(ctx->debugging())) {

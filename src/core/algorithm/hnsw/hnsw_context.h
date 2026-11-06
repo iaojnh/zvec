@@ -361,7 +361,7 @@ class HnswContext : public IndexContext {
     return prune_ids_;
   }
 
-  inline std::vector<IndexStorage::MemoryBlock> &prune_blocks() {
+  inline ailego::BudgetedVector<IndexStorage::MemoryBlock> &prune_blocks() {
     return prune_blocks_;
   }
 
@@ -473,7 +473,7 @@ class HnswContext : public IndexContext {
   // Allocation failure may interrupt neighbor selection before its usual
   // per-level clear. Never carry those candidates into the next insertion.
   void release_build_workspace() {
-    prune_blocks_.clear();
+    decltype(prune_blocks_)().swap(prune_blocks_);
     candidates_.release();
     update_heap_.release();
     decltype(level_topks_)().swap(level_topks_);
@@ -675,7 +675,7 @@ class HnswContext : public IndexContext {
   SearchHeap search_heap_{};
   TopkHeap update_heap_{};
   ailego::BudgetedVector<node_id_t> prune_ids_{};
-  std::vector<IndexStorage::MemoryBlock> prune_blocks_{};
+  ailego::BudgetedVector<IndexStorage::MemoryBlock> prune_blocks_{};
   ailego::BudgetedVector<size_t> prune_selected_indices_{};
   ailego::BudgetedVector<TopkHeap> level_topks_{};
   CandidateHeap candidates_{};

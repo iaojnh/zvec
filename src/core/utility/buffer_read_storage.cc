@@ -64,12 +64,16 @@ bool ResolveContainerOffset(size_t file_size, int64_t configured_offset,
 
 class BufferPageLease {
  public:
-  BufferPageLease(std::shared_ptr<ailego::VecBufferPoolHandle> handle,
-                  const std::vector<ailego::block_id_t> &page_ids)
-      : handle_(std::move(handle)), page_ids_(page_ids) {}
+  explicit BufferPageLease(std::shared_ptr<ailego::VecBufferPoolHandle> handle)
+      : handle_(std::move(handle)) {}
 
   BufferPageLease(const BufferPageLease &) = delete;
   BufferPageLease &operator=(const BufferPageLease &) = delete;
+
+  // Adopt only after pinning succeeds. All allocations finish before pinning.
+  void adopt(ailego::BudgetedVector<ailego::block_id_t> page_ids) noexcept {
+    page_ids_ = std::move(page_ids);
+  }
 
   ~BufferPageLease() {
     if (handle_ && !page_ids_.empty()) {
@@ -79,7 +83,7 @@ class BufferPageLease {
 
  private:
   std::shared_ptr<ailego::VecBufferPoolHandle> handle_{};
-  std::vector<ailego::block_id_t> page_ids_{};
+  ailego::BudgetedVector<ailego::block_id_t> page_ids_{};
 };
 
 }  // namespace
@@ -201,8 +205,8 @@ class BufferReadStorage : public IndexStorage {
     //! Return independently pinned resident pages without copying. Cold or
     //! partially resident ranges retain the existing contiguous fallback so
     //! cache admission and bypass behavior remain unchanged.
-    size_t read_scatter(size_t offset, ScatterBlock &data,
-                        size_t len) override {
+    size_t read_scatter(size_t offset, ScatterBlock &data, size_t len) override
+        try {
       thread_read_error() = IndexError_ReadData;
       data.reset();
       len = clamp_length(&offset, len);
@@ -217,45 +221,40 @@ class BufferReadStorage : public IndexStorage {
       const size_t first_page = abs_offset / ailego::kVectorPageSize;
       const size_t last_page = (abs_offset + len - 1) / ailego::kVectorPageSize;
       const size_t page_count = last_page - first_page + 1;
-      std::vector<ailego::block_id_t> page_ids(page_count);
-      std::vector<char *> pages(page_count, nullptr);
-      for (size_t i = 0; i < page_count; ++i) {
-        page_ids[i] = static_cast<ailego::block_id_t>(first_page + i);
-      }
-      if (!handle_->try_acquire_resident_pages(page_ids.data(), page_count,
-                                               pages.data())) {
-        return IndexStorage::Segment::read_scatter(offset, data, len);
-      }
-
-      bool pins_owned_by_lease = false;
-      try {
-        std::vector<ReadSpan> spans;
+      {
+        ailego::BudgetedVector<ailego::block_id_t> page_ids(page_count);
+        ailego::BudgetedVector<char *> pages(page_count, nullptr);
+        ScatterBlock::Spans spans;
         spans.reserve(page_count);
-        const size_t range_end = abs_offset + len;
+        auto lease = std::allocate_shared<BufferPageLease>(
+            ailego::BudgetedAllocator<BufferPageLease>{}, handle_);
         for (size_t i = 0; i < page_count; ++i) {
-          const size_t page_begin = (first_page + i) * ailego::kVectorPageSize;
-          const size_t span_begin = std::max(abs_offset, page_begin);
-          const size_t span_end =
-              std::min(range_end, page_begin + ailego::kVectorPageSize);
-          spans.push_back({reinterpret_cast<const uint8_t *>(pages[i]) +
-                               (span_begin - page_begin),
-                           span_end - span_begin});
+          page_ids[i] = static_cast<ailego::block_id_t>(first_page + i);
         }
-        auto lease = std::make_shared<BufferPageLease>(handle_, page_ids);
-        pins_owned_by_lease = true;
-        data.reset_scattered(std::move(spans), std::move(lease), len);
-        return len;
-      } catch (const std::bad_alloc &) {
-        thread_read_error() = IndexError_NoMemory;
-        if (!pins_owned_by_lease) {
-          handle_->release_pages(page_ids.data(), page_ids.size());
+        if (handle_->try_acquire_resident_pages(page_ids.data(), page_count,
+                                                pages.data())) {
+          lease->adopt(std::move(page_ids));
+          const size_t range_end = abs_offset + len;
+          for (size_t i = 0; i < page_count; ++i) {
+            const size_t page_begin =
+                (first_page + i) * ailego::kVectorPageSize;
+            const size_t span_begin = std::max(abs_offset, page_begin);
+            const size_t span_end =
+                std::min(range_end, page_begin + ailego::kVectorPageSize);
+            spans.push_back({reinterpret_cast<const uint8_t *>(pages[i]) +
+                                 (span_begin - page_begin),
+                             span_end - span_begin});
+          }
+          data.reset_scattered(std::move(spans), std::move(lease), len);
+          return len;
         }
-        LOG_ERROR(
-            "BufferReadStorage::Segment::read_scatter allocation failed, "
-            "abs_offset=%zu, len=%zu, pages=%zu",
-            abs_offset, len, page_count);
-        return 0;
       }
+      // Release probe descriptors before admitting the contiguous fallback.
+      return IndexStorage::Segment::read_scatter(offset, data, len);
+    } catch (const std::bad_alloc &) {
+      data.reset();
+      thread_read_error() = IndexError_NoMemory;
+      return 0;
     }
 
     //! Read scattered data (stable until this thread's next pointer read)
@@ -274,8 +273,10 @@ class BufferReadStorage : public IndexStorage {
       ailego_false_if_false(total != 0);
 
       auto scratch = thread_scratch();
-      scratch->buffer.resize(total);
-      uint8_t *buf = scratch->buffer.data();
+      if (scratch->buffer.size() < total) {
+        scratch->buffer.resize(total, AILEGO_CACHE_LINE_SIZE);
+      }
+      auto *buf = static_cast<uint8_t *>(scratch->buffer.data());
       for (size_t i = 0; i < count; ++i) {
         SegmentData *it = &iovec[i];
         ailego_false_if_false(read_bytes(data_offset_ + it->offset, it->length,
@@ -331,7 +332,7 @@ class BufferReadStorage : public IndexStorage {
       ThreadScratch(const ThreadScratch &) = delete;
       ThreadScratch &operator=(const ThreadScratch &) = delete;
 
-      ailego::BudgetedVector<uint8_t> buffer;
+      ailego::BudgetedAlignedBuffer buffer;
     };
 
     struct ScratchOwner {
@@ -609,7 +610,7 @@ class BufferReadStorage : public IndexStorage {
       const size_t container_size = end_offset - candidate_index_offset;
 
       // IndexUnpacker requires a stable pointer until its next callback.
-      ailego::BudgetedVector<uint8_t> scratch;
+      ailego::BudgetedAlignedBuffer scratch;
       auto read_data = [&candidate_handle, &scratch, candidate_index_offset,
                         container_size](size_t offset, const void **data,
                                         size_t len) -> size_t {
@@ -619,7 +620,7 @@ class BufferReadStorage : public IndexStorage {
         } else {
           len = std::min(len, container_size - offset);
         }
-        scratch.resize(len);
+        if (scratch.size() < len) scratch.resize(len, AILEGO_CACHE_LINE_SIZE);
         *data = scratch.data();
         if (len == 0) {
           return 0;

@@ -7,7 +7,7 @@
 #include <limits>
 #include <new>
 #include <zvec/ailego/buffer/memory_reservation.h>
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
 #include <pthread.h>
 #endif
 
@@ -17,19 +17,27 @@ inline uint32_t RocksDbBackgroundThreads(uint32_t optimize_threads) noexcept {
   return std::clamp<uint32_t>(optimize_threads, 2, 16);
 }
 
-// macOS secondary std::threads use the pthread default stack capacity. Reserve
-// that capacity, not an RSS sample or an arbitrary per-worker estimate. Guard
-// pages cannot become resident and are deliberately excluded. Other platforms
-// retain their existing behavior until their native stack policy is covered.
+// Linux reserves a much larger virtual stack than ordinary workers touch.
+// Plan for up to 512 KiB per worker; the process RSS controller covers growth
+// beyond this allowance. macOS retains its full native default-stack charge.
+// This is an admission allowance, not a change to the thread's stack limit.
+inline size_t NativeWorkerStackAllowance(size_t stack_capacity) {
+#if defined(__linux__)
+  return std::min(stack_capacity, size_t{512} << 10);
+#else
+  return stack_capacity;
+#endif
+}
+
 inline size_t DefaultNativeWorkerStackBytes() {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
   pthread_attr_t attributes;
   if (pthread_attr_init(&attributes) != 0) throw std::bad_alloc();
   size_t bytes = 0;
   const int result = pthread_attr_getstacksize(&attributes, &bytes);
   const int destroyed = pthread_attr_destroy(&attributes);
   if (result != 0 || destroyed != 0 || bytes == 0) throw std::bad_alloc();
-  return bytes;
+  return NativeWorkerStackAllowance(bytes);
 #else
   return 0;
 #endif

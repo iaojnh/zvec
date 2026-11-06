@@ -175,8 +175,8 @@ const void *HnswStreamerEntity::get_vector(node_id_t id) const {
 int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
                                    const void **vecs) const {
   // Retain every result independently until the next batch on this thread.
-  static thread_local std::vector<LegacyReadBuffer> buffers;
-  std::vector<IndexStorage::MemoryBlock> blocks;
+  static thread_local ailego::BudgetedVector<LegacyReadBuffer> buffers;
+  ailego::BudgetedVector<IndexStorage::MemoryBlock> blocks;
   int ret = get_vector(ids, count, blocks);
   if (ret != 0) {
     return ret;
@@ -240,7 +240,7 @@ int HnswStreamerEntity::get_vector_borrowed(
 
 int HnswStreamerEntity::get_vector(
     const node_id_t *ids, uint32_t count,
-    std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
+    ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
@@ -271,7 +271,7 @@ int HnswStreamerEntity::get_vector(
 
 int HnswBufferPoolStreamerEntity::get_vector_for_prune(
     const node_id_t *ids, uint32_t count,
-    std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
+    ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
   if (count == 0) {
     return 0;

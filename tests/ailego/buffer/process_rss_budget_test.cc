@@ -1,0 +1,181 @@
+// Copyright 2025-present the zvec project
+// SPDX-License-Identifier: Apache-2.0
+#include <atomic>
+#include <limits>
+#include <thread>
+#include <vector>
+#include <gtest/gtest.h>
+#include <zvec/ailego/buffer/process_rss_budget.h>
+
+namespace zvec::ailego {
+namespace {
+constexpr size_t kMiB = 1UL << 20;
+std::atomic<size_t> sampled_rss{0};
+size_t ReadRss() {
+  return sampled_rss.load();
+}
+
+TEST(ProcessRssBudgetTest, DisabledBudgetPreservesStandaloneAdmission) {
+  ProcessRssBudget budget;
+  EXPECT_TRUE(budget.try_acquire(std::numeric_limits<size_t>::max()));
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_EQ(0u, budget.limit());
+}
+
+TEST(ProcessRssBudgetTest, HostGrowthTriggersPressureWithHysteresis) {
+  ProcessRssBudget budget;
+  sampled_rss = 32 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  EXPECT_FALSE(budget.pressure());
+  sampled_rss = 121 * kMiB;
+  budget.refresh(true);
+  EXPECT_TRUE(budget.pressure());
+  EXPECT_FALSE(budget.try_acquire(8 * kMiB));
+  EXPECT_EQ(7 * kMiB, budget.available());
+  // Mandatory work can use the reserve while optional cache growth stops.
+  EXPECT_TRUE(budget.try_acquire(kMiB));
+  EXPECT_EQ(6 * kMiB, budget.available());
+  sampled_rss = 117 * kMiB;
+  budget.refresh(true);
+  EXPECT_TRUE(budget.pressure());
+  sampled_rss = 110 * kMiB;
+  budget.refresh(true);
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_TRUE(budget.try_acquire(8 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, FailedSamplesDoNotRestoreSpentHeadroom) {
+  ProcessRssBudget budget;
+  sampled_rss = 120 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(6 * kMiB));
+  sampled_rss = 0;
+  budget.refresh(true);
+  EXPECT_EQ(2 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(3 * kMiB));
+  EXPECT_FALSE(budget.configure(256 * kMiB, ReadRss));
+  EXPECT_EQ(128 * kMiB, budget.limit());
+  ASSERT_TRUE(budget.configure(0, nullptr));
+  EXPECT_TRUE(budget.try_acquire(256 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, HeadroomScalesWithoutExhaustingSmallBudgets) {
+  EXPECT_EQ(0u, ProcessRssBudget::headroom(0));
+  EXPECT_EQ(2 * kMiB, ProcessRssBudget::headroom(16 * kMiB));
+  EXPECT_EQ(8 * kMiB, ProcessRssBudget::headroom(128 * kMiB));
+  EXPECT_EQ(64 * kMiB, ProcessRssBudget::headroom(4UL * 1024 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, UntouchedBackingSurvivesSamplesAndLimitChanges) {
+  ProcessRssBudget budget;
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  for (int i = 0; i < 3; ++i) budget.refresh(true);
+  EXPECT_EQ(100 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(300 * kMiB));
+  ASSERT_TRUE(budget.configure(1001 * kMiB, ReadRss));
+  EXPECT_EQ(101 * kMiB, budget.available());
+  // Failed allocations and untouched mappings return their admission charge.
+  budget.release(300 * kMiB);
+  EXPECT_EQ(401 * kMiB, budget.available());
+  EXPECT_TRUE(budget.try_acquire(300 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, ResidentGrowthIsNotCountedTwice) {
+  ProcessRssBudget budget;
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  sampled_rss = 900 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(100 * kMiB, budget.available());
+  budget.release(300 * kMiB);
+  // Releasing a logical charge does not assume malloc immediately returns RSS.
+  EXPECT_EQ(100 * kMiB, budget.available());
+  sampled_rss = 600 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(400 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, ReleasingResidentOwnerDoesNotLosePendingGrowth) {
+  ProcessRssBudget budget;
+  sampled_rss = 300 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  sampled_rss = 600 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  budget.release(300 * kMiB);
+  budget.refresh(true);  // Resident release has not reached RSS yet.
+  sampled_rss = 300 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(400 * kMiB, budget.available());
+  budget.release(300 * kMiB);
+  EXPECT_EQ(700 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, BaselineCanRecoverAfterStartupMemoryRetires) {
+  ProcessRssBudget budget;
+  budget.account(100 * kMiB);  // Already present when the guard is enabled.
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  budget.release(300 * kMiB);
+  budget.release(100 * kMiB);
+  sampled_rss = 200 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(800 * kMiB, budget.available());
+  ASSERT_TRUE(budget.try_acquire(700 * kMiB));
+  budget.refresh(true);
+  EXPECT_EQ(100 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, ReplacingStartupBackingDoesNotRebasePendingOwners) {
+  ProcessRssBudget budget;
+  budget.account(300 * kMiB);
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));  // Still untouched.
+  budget.release(300 * kMiB);  // The older resident owner retires.
+  sampled_rss = 300 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(400 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(500 * kMiB));
+  budget.release(300 * kMiB);
+  budget.refresh(true);
+  EXPECT_EQ(700 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, SeparatelyBudgetedBackingStillTriggersPressure) {
+  ProcessRssBudget budget;
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  budget.account(500 * kMiB);
+  budget.refresh(true);
+  EXPECT_TRUE(budget.pressure());
+  EXPECT_FALSE(budget.try_acquire(1));
+  budget.release(500 * kMiB);
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_EQ(400 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, ConcurrentAdmissionsShareUnmaterializedHeadroom) {
+  ProcessRssBudget budget;
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(700 * kMiB, ReadRss));
+  std::atomic<size_t> acquired{0};
+  std::vector<std::thread> workers;
+  for (int i = 0; i < 12; ++i) {
+    workers.emplace_back([&] {
+      budget.refresh(true);
+      if (budget.try_acquire(10 * kMiB)) acquired.fetch_add(10 * kMiB);
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  EXPECT_EQ(100 * kMiB, acquired.load());
+  budget.release(acquired.load());
+  EXPECT_EQ(100 * kMiB, budget.available());
+}
+}  // namespace
+}  // namespace zvec::ailego

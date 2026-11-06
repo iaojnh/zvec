@@ -22,6 +22,7 @@
 #include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
@@ -2557,7 +2558,7 @@ TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveReadingThreadExit) {
   EXPECT_EQ(0, std::memcmp(payload.data() + offset, copy.data(), 128));
 }
 
-TEST_F(BufferStorageWriteTest, OversizedBatchScratchKeepsOwnedFallback) {
+TEST_F(BufferStorageWriteTest, OversizedBatchScratchKeepsManagedSnapshot) {
   const size_t length = (2UL << 20) + 128;
   std::vector<char> payload(length + 2 * ailego::kVectorPageSize, 'f');
   {
@@ -2580,14 +2581,65 @@ TEST_F(BufferStorageWriteTest, OversizedBatchScratchKeepsOwnedFallback) {
       {segment.get(), 0, length, &retained},
   };
   ASSERT_TRUE(segment->read_borrowed_batch(reads, 1));
-  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, retained.type_);
+  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, retained.type_);
   auto copy = retained;
-  EXPECT_NE(retained.data(), copy.data());
+  EXPECT_EQ(retained.data(), copy.data());
   ASSERT_TRUE(segment->read_borrowed_batch(reads, 1));
+  EXPECT_NE(retained.data(), copy.data());
   EXPECT_EQ(0, std::memcmp(payload.data(), copy.data(), length));
   retained.reset();
   ASSERT_EQ(0, storage->close());
   EXPECT_EQ(0, std::memcmp(payload.data(), copy.data(), length));
+}
+
+TEST_F(BufferStorageWriteTest,
+       LargeMutableSnapshotsKeepBackingUntilLastReader) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t baseline = pool.external_used();
+  const size_t length = ailego::BudgetedAlignedBuffer::kRetainedThreshold;
+  std::vector<char> payload(2 * length, 's');
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("seg", payload.size()));
+  auto segment = storage->get("seg");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(payload.size(), segment->write(0, payload.data(), payload.size()));
+  const size_t before = pool.stats().retained_block_bytes;
+  IndexStorage::MemoryBlock blocks[2];
+  IndexStorage::Segment::BorrowedRead reads[] = {
+      {segment.get(), 0, length, &blocks[0]},
+      {segment.get(), length, length, &blocks[1]},
+  };
+  ASSERT_TRUE(segment->read_borrowed_batch(reads, 2));
+  EXPECT_GE(pool.stats().retained_block_bytes,
+            before + ailego::MemoryLimitPool::retained_block_size(2 * length));
+  for (const auto &block : blocks) {
+    ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, block.type_);
+    EXPECT_EQ(0, std::memcmp(payload.data(), block.data(), length));
+  }
+  IndexStorage::MemoryBlock single;
+  ASSERT_EQ(length, segment->read(0, single, length));
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, single.type_);
+  std::vector<char> replacement(payload.size(), 'x');
+  ASSERT_EQ(replacement.size(),
+            segment->write(0, replacement.data(), replacement.size()));
+  EXPECT_EQ(0, std::memcmp(payload.data(), single.data(), length));
+  single.reset();
+  auto retained = blocks[1];
+  blocks[0].reset();
+  blocks[1].reset();
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  storage.reset();
+  EXPECT_GE(
+      pool.external_used(),
+      baseline + ailego::MemoryLimitPool::retained_block_size(2 * length));
+  std::thread reader([block = std::move(retained), &payload]() mutable {
+    EXPECT_EQ(0, std::memcmp(payload.data(), block.data(), length));
+    block.reset();
+  });
+  reader.join();
+  EXPECT_EQ(baseline, pool.external_used());
 }
 
 TEST_F(BufferStorageWriteTest, MetadataSplitRefusalPreservesDirectoryAndRetry) {

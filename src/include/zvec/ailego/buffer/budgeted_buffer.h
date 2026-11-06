@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstdint>
 #include <limits>
 #include <new>
 #include <string>
@@ -94,7 +95,15 @@ struct BudgetedStringWorkspace {
 // while the old allocation is still charged. Failure preserves the old buffer.
 class BudgetedAlignedBuffer {
  public:
+  // Small workspaces stay on the heap; large opt-in buffers use page-rounded
+  // backing whose idle lifetime and committed charge are controlled by the
+  // pool.
+  static constexpr size_t kRetainedThreshold = 256UL << 10;
+
   BudgetedAlignedBuffer() = default;
+  BudgetedAlignedBuffer(size_t bytes, size_t alignment) {
+    resize(bytes, alignment);
+  }
   BudgetedAlignedBuffer(const BudgetedAlignedBuffer &) = delete;
   BudgetedAlignedBuffer &operator=(const BudgetedAlignedBuffer &) = delete;
   BudgetedAlignedBuffer(BudgetedAlignedBuffer &&rhs) noexcept {
@@ -106,7 +115,11 @@ class BudgetedAlignedBuffer {
     return *this;
   }
   ~BudgetedAlignedBuffer() {
-    if (data_) ::operator delete(data_, std::align_val_t{alignment_});
+    if (retained_base_) {
+      MemoryLimitPool::get_instance().release_retained_block(retained_base_);
+    } else if (data_) {
+      ::operator delete(data_, std::align_val_t{alignment_});
+    }
   }
   void resize(size_t bytes, size_t alignment) {
     if (bytes == size_ && alignment == alignment_) return;
@@ -114,8 +127,27 @@ class BudgetedAlignedBuffer {
       throw std::bad_alloc();
     BudgetedAlignedBuffer replacement;
     if (bytes) {
-      replacement.memory_.add(bytes);
-      replacement.data_ = ::operator new(bytes, std::align_val_t{alignment});
+      auto &pool = MemoryLimitPool::get_instance();
+      if (bytes >= kRetainedThreshold && pool.capacity()) {
+        // Retained blocks provide 64-byte alignment. Larger alignments need
+        // room for an interior pointer; release the original base below.
+        const size_t padding =
+            alignment > MemoryLimitPool::kRetainedBlockHeaderBytes
+                ? alignment - 1
+                : 0;
+        if (bytes > std::numeric_limits<size_t>::max() - padding)
+          throw std::bad_alloc();
+        replacement.retained_base_ =
+            pool.acquire_retained_block(bytes + padding);
+        if (!replacement.retained_base_) throw std::bad_alloc();
+        const auto address =
+            reinterpret_cast<uintptr_t>(replacement.retained_base_);
+        replacement.data_ = reinterpret_cast<void *>(
+            (address + alignment - 1) & ~(uintptr_t{alignment} - 1));
+      } else {
+        replacement.memory_.add(bytes);
+        replacement.data_ = ::operator new(bytes, std::align_val_t{alignment});
+      }
       replacement.size_ = bytes;
       replacement.alignment_ = alignment;
     }
@@ -135,6 +167,7 @@ class BudgetedAlignedBuffer {
   void swap(BudgetedAlignedBuffer &rhs) noexcept {
     memory_.swap(rhs.memory_);
     std::swap(data_, rhs.data_);
+    std::swap(retained_base_, rhs.retained_base_);
     std::swap(size_, rhs.size_);
     std::swap(alignment_, rhs.alignment_);
   }
@@ -142,6 +175,7 @@ class BudgetedAlignedBuffer {
  private:
   MemoryReservation memory_;
   void *data_{nullptr};
+  void *retained_base_{nullptr};
   size_t size_{0};
   size_t alignment_{alignof(void *)};
 };

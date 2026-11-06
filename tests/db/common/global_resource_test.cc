@@ -14,11 +14,13 @@
 
 #include "db/common/global_resource.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <future>
 #include <limits>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/write_buffer_manager.h>
@@ -385,7 +387,7 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
   EXPECT_EQ(expected_buffer_capacity,
             ailego::MemoryLimitPool::get_instance().capacity());
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
   const auto stack_bytes = detail::DefaultNativeWorkerStackBytes();
   const auto native_workers =
       expected_query_workers + expected_optimize_workers +
@@ -407,6 +409,9 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
             image_reserved);
   EXPECT_EQ(0, GlobalResource::Instance().initialize());
   EXPECT_EQ(image_reserved, detail::NativeImageReservation().bytes());
+  EXPECT_EQ(total_capacity,
+            ailego::MemoryLimitPool::get_instance().process_rss_limit());
+  EXPECT_GT(ailego::MemoryLimitPool::get_instance().process_rss(), 0u);
 
   const auto rocksdb_cache = GlobalResource::Instance().rocksdb_block_cache();
   const auto write_buffer_manager =
@@ -425,4 +430,47 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
                 expected_rocksdb_capacity),
             write_buffer_manager->buffer_size());
   EXPECT_TRUE(write_buffer_manager->cost_to_cache());
+}
+
+TEST(GlobalResource, RssPressureReclaimsOnlyUnpinnedRocksDbEntries) {
+  auto &resource = GlobalResource::Instance();
+  ASSERT_EQ(0, resource.initialize());
+  auto cache = resource.rocksdb_block_cache();
+  ASSERT_NE(nullptr, cache);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t original_limit = pool.process_rss_limit();
+  ASSERT_GT(original_limit, 0u);
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { pool.configure_process_rss_limit(original_limit); });
+  rocksdb::Cache::Handle *cold = nullptr;
+  rocksdb::Cache::Handle *pinned = nullptr;
+  auto release = ailego::ScopeGuard::Make([&] {
+    if (cold) cache->Release(cold);
+    if (pinned) cache->Release(pinned);
+  });
+  ASSERT_TRUE(cache
+                  ->Insert("rss-cold", nullptr, &rocksdb::kNoopCacheItemHelper,
+                           4096, &cold)
+                  .ok());
+  ASSERT_TRUE(cache
+                  ->Insert("rss-pinned", nullptr,
+                           &rocksdb::kNoopCacheItemHelper, 4096, &pinned)
+                  .ok());
+  cache->Release(cold);
+  cold = nullptr;
+  const auto pinned_usage = cache->GetPinnedUsage();
+  ASSERT_GT(cache->GetUsage(), pinned_usage);
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  const auto wait_until = [](auto ready) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!ready() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return ready();
+  };
+  ASSERT_TRUE(wait_until([&] { return cache->GetUsage() == pinned_usage; }));
+  EXPECT_EQ(pinned_usage, cache->GetPinnedUsage());
+  cache->Release(pinned);
+  pinned = nullptr;
+  EXPECT_TRUE(wait_until([&] { return cache->GetUsage() == 0; }));
 }

@@ -198,6 +198,36 @@ TEST_F(HnswStreamerTest, InterruptedBuildReleasesEveryCandidateHeap) {
   }
 }
 
+TEST_F(HnswStreamerTest, PruneDescriptorsKeepCapacityChargedUntilRelease) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  auto restore = ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  ASSERT_EQ(0, pool.init(2UL << 20));
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
+  HnswContext context(dim, nullptr, entity);
+  const auto baseline = pool.used();
+  auto &blocks = context.prune_blocks();
+  blocks.resize(128);
+  const size_t charged = pool.used();
+  EXPECT_GE(charged - baseline, blocks.capacity() * sizeof(blocks[0]));
+  blocks.clear();
+  EXPECT_EQ(charged, pool.used());
+  {
+    MemoryReservation pressure;
+    pressure.add(pool.available());
+    EXPECT_THROW(blocks.reserve(4096), std::bad_alloc);
+    EXPECT_EQ(128u, blocks.capacity());
+  }
+  context.release_build_workspace();
+  EXPECT_EQ(0u, blocks.capacity());
+  EXPECT_EQ(baseline, pool.used());
+}
+
 TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
   IndexStreamer::Stats stats;
   HnswBufferPoolStreamerEntity entity(stats);

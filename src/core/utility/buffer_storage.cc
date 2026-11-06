@@ -320,13 +320,7 @@ class BufferStorage : public IndexStorage {
         size_t destination_offset{0};
         size_t length{0};
       };
-      // C++17 allocators preserve this alignment for the arena base as well
-      // as the cache-line-sized slices handed to individual reads.
-      struct alignas(AILEGO_CACHE_LINE_SIZE) ArenaLine {
-        char bytes[AILEGO_CACHE_LINE_SIZE];
-      };
-      using BatchArena =
-          std::vector<ArenaLine, ailego::BudgetedAllocator<ArenaLine>>;
+      using BatchArena = ailego::BudgetedAlignedBuffer;
       struct BatchScratch {
         std::vector<BatchState, ailego::BudgetedAllocator<BatchState>> states;
         std::vector<ailego::block_id_t,
@@ -351,8 +345,8 @@ class BufferStorage : public IndexStorage {
       }
 
       auto cleanup_owned = [&]() {
-        // Arena slices share their backing owner; only malloc buffers are
-        // freed.
+        // Arena slices share their backing owner; individual snapshots
+        // release their own heap allocation or mapped backing.
         for (BatchState &state : scratch.states) {
           if (!batch_arena && state.owned != nullptr) {
             state.owned_block.reset();
@@ -453,8 +447,9 @@ class BufferStorage : public IndexStorage {
       // Reserve bounded fallback space before pinning pages. Otherwise a
       // large batch can pin the entire budget and prevent its own fallback.
       if (copy_upper_bound && copy_upper_bound <= kMaxArenaBytes) {
-        scratch.arena =
-            std::make_shared<BatchArena>(copy_upper_bound / kArenaAlign);
+        scratch.arena = std::allocate_shared<BatchArena>(
+            ailego::BudgetedAllocator<BatchArena>{}, copy_upper_bound,
+            kArenaAlign);
       }
       // Reserve before pinning any cache page, including the bounded cold-read
       // batch. Writable paths still use synchronized scalar bypass reads.
@@ -602,11 +597,11 @@ class BufferStorage : public IndexStorage {
       std::shared_ptr<BatchArena> arena_owner;
       if (batch_arena && total != 0) {
         if (!scratch.arena || scratch.arena.use_count() != 1) {
-          scratch.arena = std::make_shared<BatchArena>();
+          scratch.arena = std::allocate_shared<BatchArena>(
+              ailego::BudgetedAllocator<BatchArena>{});
         }
-        const size_t lines = total / kArenaAlign;
-        if (scratch.arena->size() < lines) {
-          scratch.arena->resize(lines);
+        if (scratch.arena->size() < total) {
+          scratch.arena->resize(total, kArenaAlign);
         }
         arena_owner = scratch.arena;
         size_t off = 0;
@@ -628,8 +623,7 @@ class BufferStorage : public IndexStorage {
           if (!AlignBufferSize(length, &alloc_size)) {
             return fail();
           }
-          state.owned_block =
-              MemoryBlock::AllocateOwned(alloc_size, kBufferAlignment);
+          state.owned_block = allocate_snapshot(alloc_size);
           state.owned_block.scratch_size_ = length;
           state.owned = static_cast<char *>(state.owned_block.data_);
           if (state.owned == nullptr) {
@@ -973,6 +967,16 @@ class BufferStorage : public IndexStorage {
       return data_offset() + offset;
     }
 
+    static MemoryBlock allocate_snapshot(size_t bytes) {
+      if (bytes < ailego::BudgetedAlignedBuffer::kRetainedThreshold) {
+        return MemoryBlock::AllocateOwned(bytes, kBufferAlignment);
+      }
+      auto owner = std::allocate_shared<ailego::BudgetedAlignedBuffer>(
+          ailego::BudgetedAllocator<ailego::BudgetedAlignedBuffer>{}, bytes,
+          kBufferAlignment);
+      return MemoryBlock::MakeSharedView(owner->data(), owner);
+    }
+
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
                              bool borrow_handle, bool immutable) const try {
       buffer_storage_read_error = IndexError_ReadData;
@@ -1009,7 +1013,7 @@ class BufferStorage : public IndexStorage {
         if (ailego_unlikely(!AlignBufferSize(len, &alloc_size))) {
           return 0;
         }
-        owned = MemoryBlock::AllocateOwned(alloc_size, kBufferAlignment);
+        owned = allocate_snapshot(alloc_size);
       }
       auto *tmp = static_cast<char *>(owned.data_);
       if (tmp == nullptr) {

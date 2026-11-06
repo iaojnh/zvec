@@ -84,9 +84,9 @@ class HnswStreamerEntity : public HnswEntity {
   int get_vector_borrowed(const node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
 
-  int get_vector(
-      const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const override;
+  int get_vector(const node_id_t *ids, uint32_t count,
+                 ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks)
+      const override;
 
   //! Get the node id's neighbors on graph level
   //! Note: the neighbors cannot be modified, using the following
@@ -227,8 +227,9 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! Typed batch get_vector: fills vector<MemBlock> without runtime branching
   template <typename MemBlock>
-  inline int get_vector_typed(const node_id_t *ids, uint32_t count,
-                              std::vector<MemBlock> &vec_blocks) const;
+  inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      ailego::BudgetedVector<MemBlock> &vec_blocks) const;
 
   //! Typed get_key: reads key using typed MemBlock
   template <typename MemBlock>
@@ -721,7 +722,7 @@ HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
 template <>
 inline int HnswStreamerEntity::get_vector_typed<MmapMemoryBlock>(
     const node_id_t *ids, uint32_t count,
-    std::vector<MmapMemoryBlock> &vec_blocks) const {
+    ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
@@ -745,7 +746,7 @@ inline int HnswStreamerEntity::get_vector_typed<MmapMemoryBlock>(
 template <>
 inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
     const node_id_t *ids, uint32_t count,
-    std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
+    ailego::BudgetedVector<BufferPoolMemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
   if (count == 0) {
     return 0;
@@ -897,7 +898,7 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
 
   ailego_force_inline int get_vector_typed(
       const node_id_t *ids, uint32_t count,
-      std::vector<MmapMemoryBlock> &vec_blocks) const {
+      ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
     vec_blocks.resize(count);
     for (auto i = 0U; i < count; ++i) {
       uint32_t chunk_idx = ids[i] >> node_index_mask_bits_;
@@ -996,14 +997,14 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
 
   inline int get_vector_typed(
       const node_id_t *ids, uint32_t count,
-      std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
+      ailego::BudgetedVector<BufferPoolMemoryBlock> &vec_blocks) const {
     return HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
         ids, count, vec_blocks);
   }
 
   int get_vector_for_prune(
       const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
+      ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks) const;
 
   inline key_t get_key_typed(node_id_t id) const {
     return HnswStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(id);
@@ -1098,7 +1099,7 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
 
   ailego_force_inline int get_vector_typed(
       const node_id_t *ids, uint32_t count,
-      std::vector<MmapMemoryBlock> &vec_blocks) const {
+      ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
     if (ailego_likely(vector_base_ != nullptr)) {
       vec_blocks.resize(count);
       for (auto i = 0U; i < count; ++i) {
@@ -1207,8 +1208,9 @@ class HnswExternalStreamerEntity : public HnswMmapStreamerEntity {
   //! Typed batch get_vector: zero-copy view into the external vector source.
   //! Hides HnswMmapStreamerEntity::get_vector_typed (non-virtual, used by the
   //! template algorithm via static_cast).
-  inline int get_vector_typed(const node_id_t *ids, uint32_t count,
-                              std::vector<MmapMemoryBlock> &vec_blocks) const {
+  inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
     if (ailego_unlikely(vec_src_ == nullptr)) {
       return IndexError_Runtime;
     }
@@ -1254,9 +1256,9 @@ class HnswExternalStreamerEntity : public HnswMmapStreamerEntity {
     return get_vector(id, block);
   }
 
-  int get_vector(
-      const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const override {
+  int get_vector(const node_id_t *ids, uint32_t count,
+                 ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks)
+      const override {
     if (ailego_unlikely(vec_src_ == nullptr)) {
       return IndexError_Runtime;
     }

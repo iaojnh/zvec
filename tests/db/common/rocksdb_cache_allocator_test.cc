@@ -19,9 +19,15 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/cache.h>
+#include <rocksdb/db.h>
+#include <rocksdb/filter_policy.h>
+#include <rocksdb/table.h>
+#include <rocksdb/write_buffer_manager.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "db/common/rocksdb_block_cache.h"
 
 #if defined(__APPLE__)
@@ -66,6 +72,28 @@ TEST(RocksdbCacheAllocatorTest, RejectsOverflowBeforeMapping) {
   allocator.Deallocate(data);
 }
 
+TEST(RocksdbCacheAllocatorTest,
+     ProcessPressureAllowsNecessaryReadsWithoutLosingOwners) {
+  RocksdbCacheAllocator allocator;
+  void *live = allocator.Allocate(4096);
+  auto release = ailego::ScopeGuard::Make([&] { allocator.Deallocate(live); });
+  std::memset(live, 0x31, 4096);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.process_rss_limit();
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(previous)); });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  void *temporary = nullptr;
+  ASSERT_NO_THROW(temporary = allocator.Allocate(4096));
+  ASSERT_NE(nullptr, temporary);
+  allocator.Deallocate(temporary);
+  EXPECT_EQ(0x31, static_cast<unsigned char *>(live)[4095]);
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  void *retry = allocator.Allocate(4096);
+  ASSERT_NE(nullptr, retry);
+  allocator.Deallocate(retry);
+}
+
 TEST(RocksdbCacheAllocatorTest, SupportsCrossThreadRelease) {
   auto allocator = std::make_shared<RocksdbCacheAllocator>();
   std::array<std::future<void>, 4> workers;
@@ -106,6 +134,138 @@ std::shared_ptr<RocksdbBlockCache> CreateChargeTestCache(size_t capacity) {
       rocksdb::NewLRUCache(capacity, 0, true, 0.5, nullptr, false,
                            rocksdb::kDontChargeCacheMetadata));
 }
+
+void CountDeletedBlock(void *value, rocksdb::MemoryAllocator *) {
+  ++*static_cast<int *>(value);
+}
+const rocksdb::Cache::CacheItemHelper kCountedDataHelper{
+    rocksdb::CacheEntryRole::kDataBlock, CountDeletedBlock};
+const rocksdb::Cache::CacheItemHelper kWriteBufferChargeHelper{
+    rocksdb::CacheEntryRole::kWriteBuffer, DeleteChargeTestValue};
+
+TEST(RocksdbBlockCacheTest, PressureUsesChargedTransientHandles) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.process_rss_limit();
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { pool.configure_process_rss_limit(previous); });
+  auto cache = CreateChargeTestCache(256);
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  int deleted = 0;
+  rocksdb::Cache::Handle *handle = nullptr;
+  ASSERT_TRUE(
+      cache->Insert("read", &deleted, &kCountedDataHelper, 64, &handle).ok());
+  EXPECT_EQ(nullptr, cache->Lookup("read", &kCountedDataHelper, nullptr));
+  EXPECT_EQ(64u, cache->GetUsage());
+  cache->EraseUnRefEntries();
+  EXPECT_EQ(0, deleted);  // Active data must not be reclaimed.
+  rocksdb::Cache::Handle *rejected = nullptr;
+  EXPECT_TRUE(
+      cache->Insert("full", &deleted, &kCountedDataHelper, 256, &rejected)
+          .IsMemoryLimit());
+  EXPECT_EQ(nullptr, rejected);
+  EXPECT_EQ(0, deleted);  // Failed admission leaves ownership with the caller.
+  EXPECT_TRUE(cache->Release(handle));
+  EXPECT_EQ(1, deleted);
+  EXPECT_EQ(0u, cache->GetUsage());
+  ASSERT_TRUE(
+      cache->Insert("prefetch", &deleted, &kCountedDataHelper, 64).ok());
+  EXPECT_EQ(2, deleted);
+  EXPECT_EQ(0u, cache->GetUsage());
+
+  int value = 0;
+  ASSERT_TRUE(
+      cache->Insert("wbm", &value, &kWriteBufferChargeHelper, 64, &handle)
+          .ok());
+  auto *found = cache->Lookup("wbm", &kWriteBufferChargeHelper, nullptr);
+  ASSERT_NE(nullptr, found);  // Write-buffer accounting is not a read cache.
+  cache->Release(found);
+  cache->Release(handle);
+  cache->EraseUnRefEntries();
+
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  ASSERT_TRUE(
+      cache->Insert("recovered", &deleted, &kCountedDataHelper, 64, &handle)
+          .ok());
+  cache->Release(handle);
+  found = cache->Lookup("recovered", &kCountedDataHelper, nullptr);
+  ASSERT_NE(nullptr, found);
+  cache->Release(found);
+  cache->EraseUnRefEntries();
+  EXPECT_EQ(3, deleted);
+}
+
+#if (defined(__linux__) || defined(__APPLE__)) && GTEST_HAS_DEATH_TEST
+void CheckReadsAndBackgroundCompactionUnderPressure() {
+  rocksdb::Options options;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.compression = rocksdb::kNoCompression;
+  auto allocator = std::make_shared<RocksdbCacheAllocator>();
+  auto cache = std::make_shared<RocksdbBlockCache>(
+      rocksdb::NewLRUCache(8UL << 20, 0, true, 0.5, allocator));
+  rocksdb::BlockBasedTableOptions table_options;
+  table_options.block_cache = cache;
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.cache_index_and_filter_blocks_with_high_priority = true;
+  table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+  options.write_buffer_manager =
+      std::make_shared<rocksdb::WriteBufferManager>(4UL << 20, cache, true);
+  options.table_factory.reset(
+      rocksdb::NewBlockBasedTableFactory(table_options));
+  char directory[] = "/tmp/zvec-rss-rocksdb-XXXXXX";
+  ASSERT_NE(nullptr, ::mkdtemp(directory));
+  auto cleanup = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(rocksdb::DestroyDB(directory, options).ok()); });
+  rocksdb::DB *raw = nullptr;
+  ASSERT_TRUE(rocksdb::DB::Open(options, directory, &raw).ok());
+  std::unique_ptr<rocksdb::DB> db(raw);
+  rocksdb::FlushOptions flush;
+  flush.wait = true;
+  for (int round = 0; round < 2; ++round) {
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_TRUE(db->Put(rocksdb::WriteOptions(), std::to_string(i),
+                          std::string(4096, 'a' + round))
+                      .ok());
+    }
+    ASSERT_TRUE(db->Flush(flush).ok());
+  }
+  cache->EraseUnRefEntries();
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  auto restore =
+      ailego::ScopeGuard::Make([&] { pool.configure_process_rss_limit(0); });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  for (bool fill_cache : {false, true}) {
+    rocksdb::ReadOptions read;
+    read.fill_cache = fill_cache;
+    std::string value;
+    ASSERT_TRUE(db->Get(read, "10", &value).ok());
+    EXPECT_EQ(std::string(4096, 'b'), value);
+    std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(read));
+    size_t rows = 0;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) ++rows;
+    EXPECT_TRUE(it->status().ok());
+    EXPECT_EQ(200u, rows);
+  }
+  ASSERT_TRUE(db->Put(rocksdb::WriteOptions(), "new", "value").ok());
+  ASSERT_TRUE(db->Flush(flush).ok());
+  ASSERT_TRUE(
+      db->CompactRange(rocksdb::CompactRangeOptions(), nullptr, nullptr).ok());
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  std::string value;
+  ASSERT_TRUE(db->Get(rocksdb::ReadOptions(), "new", &value).ok());
+  EXPECT_EQ("value", value);
+}
+
+TEST(RocksdbBlockCacheDeathTest, PressureDoesNotEscapeBackgroundThreads) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        CheckReadsAndBackgroundCompactionUnderPressure();
+        std::exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+#endif
 
 TEST(RocksdbBlockCacheTest, ChargesOnlyFilterMetadata) {
   auto cache = CreateChargeTestCache(4096);

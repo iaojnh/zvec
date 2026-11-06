@@ -17,6 +17,7 @@
 #include <memory>
 #include <utility>
 #include <rocksdb/advanced_cache.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 
 namespace zvec {
 
@@ -57,6 +58,21 @@ class RocksdbBlockCache final : public rocksdb::CacheWrapper {
       }
       charge += kFilterMetadataCharge;
     }
+    if (is_read_block(helper) &&
+        ailego::MemoryLimitPool::get_instance().under_process_rss_pressure()) {
+      // Read/compaction must still be able to make progress. Standalone
+      // handles retain the strict cache charge but never enter the LRU;
+      // their payload is released with the last active reader. WBM and
+      // construction reservations keep their original admission semantics.
+      if (handle == nullptr) {
+        if (helper->del_cb) helper->del_cb(value, memory_allocator());
+        return rocksdb::Status::OK();
+      }
+      *handle = target_->CreateStandalone(key, value, helper, charge, false);
+      return *handle ? rocksdb::Status::OK()
+                     : rocksdb::Status::MemoryLimit(
+                           "Active block cache budget exhausted");
+    }
     return target_->Insert(key, value, helper, charge, handle, priority);
   }
 
@@ -76,6 +92,22 @@ class RocksdbBlockCache final : public rocksdb::CacheWrapper {
   }
 
  private:
+  static bool is_read_block(const CacheItemHelper *helper) {
+    if (!helper) return false;
+    switch (helper->role) {
+      case rocksdb::CacheEntryRole::kDataBlock:
+      case rocksdb::CacheEntryRole::kFilterBlock:
+      case rocksdb::CacheEntryRole::kFilterMetaBlock:
+      case rocksdb::CacheEntryRole::kDeprecatedFilterBlock:
+      case rocksdb::CacheEntryRole::kIndexBlock:
+      case rocksdb::CacheEntryRole::kOtherBlock:
+      case rocksdb::CacheEntryRole::kBlobValue:
+        return true;
+      default:
+        return false;
+    }
+  }
+
   static bool is_filter(const CacheItemHelper *helper) {
     return helper != nullptr &&
            helper->role == rocksdb::CacheEntryRole::kFilterBlock;

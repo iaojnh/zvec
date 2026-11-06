@@ -18,6 +18,7 @@
 #include <limits>
 #include <new>
 #include <ailego/pattern/scope_guard.h>
+#include <ailego/utility/memory_helper.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 
@@ -47,6 +48,7 @@ constexpr size_t kMaxSlabDataPages = kSlabBytes / kMinimumPageBytes - 1;
 constexpr size_t kQueueSmallBytes = 4096;
 constexpr size_t kQueueSlabBytes = 64UL << 10;
 constexpr size_t kQueueAlignment = alignof(std::max_align_t);
+
 static_assert(kQueueSmallBytes % kQueueAlignment == 0,
               "queue size classes must preserve maximum alignment");
 
@@ -452,7 +454,8 @@ void MemoryLimitPool::release_retained_block(void *data) {
     const size_t committed = committed_size_.load(std::memory_order_relaxed);
     const size_t used = used_size_.load(std::memory_order_relaxed);
     const size_t idle = committed > used ? committed - used : 0;
-    const size_t reserve = reserve_margin(capacity());
+    const size_t reserve =
+        process_rss_.pressure() ? 0 : reserve_margin(capacity());
     bool unmapped = false;
     if (idle > reserve || bytes > reserve - idle) {
 #if defined(_WIN32)
@@ -463,7 +466,7 @@ void MemoryLimitPool::release_retained_block(void *data) {
     }
     if (unmapped) {
       retained_block_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
-      committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+      release_committed(bytes);
     } else {
       // A failed physical release keeps the backing and its committed charge.
       block->next = retained_free_;
@@ -498,7 +501,7 @@ size_t MemoryLimitPool::trim_retained_blocks(size_t bytes_needed) {
     retained_free_ = next;
     retained_block_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
     retained_idle_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
-    committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    release_committed(bytes);
     released += bytes;
   }
   return released;
@@ -854,6 +857,8 @@ bool MemoryLimitPool::try_reserve_used(size_t bytes) {
 }
 
 bool MemoryLimitPool::try_reserve_page_used(size_t bytes) {
+  process_rss_.refresh();
+  if (process_rss_.pressure()) return false;
   const size_t page_limit = page_admission_limit();
   size_t used = used_size_.load(std::memory_order_relaxed);
   while (used <= page_limit && bytes <= page_limit - used) {
@@ -873,10 +878,23 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes) {
     if (committed_size_.compare_exchange_weak(committed, committed + bytes,
                                               std::memory_order_relaxed,
                                               std::memory_order_relaxed)) {
+      if (!process_rss_.try_acquire(bytes)) {
+        committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+        bg_cv_.notify_one();
+        return false;
+      }
       return true;
     }
   }
   return false;
+}
+
+size_t MemoryLimitPool::release_committed(size_t bytes) {
+  const size_t previous =
+      committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  assert(previous >= bytes);
+  process_rss_.release(bytes);
+  return previous;
 }
 
 bool MemoryLimitPool::try_reserve_allocation(size_t bytes) {
@@ -1024,8 +1042,7 @@ bool MemoryLimitPool::reclaim_slab_buffer(char *buffer) {
 
   assert(slab->committed_pages != 0);
   --slab->committed_pages;
-  size_t previous =
-      committed_size_.fetch_sub(slab->page_size, std::memory_order_relaxed);
+  size_t previous = release_committed(slab->page_size);
   (void)previous;
   assert(previous >= slab->page_size);
   assert(slab->reclaimed_count < slab->data_page_count);
@@ -1054,8 +1071,7 @@ void MemoryLimitPool::release_all_slabs_locked() {
   slab_count_.store(0, std::memory_order_relaxed);
   slab_mapped_bytes_.store(0, std::memory_order_relaxed);
   if (released_bytes != 0) {
-    size_t previous =
-        committed_size_.fetch_sub(released_bytes, std::memory_order_relaxed);
+    size_t previous = release_committed(released_bytes);
     (void)previous;
     assert(previous >= released_bytes);
   }
@@ -1094,7 +1110,8 @@ bool MemoryLimitPool::trim_idle_buffers() {
   for (const auto &shard : free_shards_) {
     idle += shard.count.load(std::memory_order_relaxed) * page_buffer_size();
   }
-  const size_t reserve = reserve_margin(capacity());
+  const size_t reserve =
+      process_rss_.pressure() ? 0 : reserve_margin(capacity());
   if (idle > reserve) {
     // Bound each maintenance pass. A retained mapping is released whole;
     // live pages and live retained blocks are never touched by this path.
@@ -1109,6 +1126,34 @@ bool MemoryLimitPool::trim_idle_buffers() {
     }
   }
   return false;
+}
+
+bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
+  const bool configured = process_rss_.configure(bytes, &MemoryHelper::SelfRSS);
+  bg_cv_.notify_one();
+  return configured;
+}
+
+void MemoryLimitPool::set_process_rss_reclaimer(
+    std::function<void()> reclaimer) {
+  auto callback =
+      reclaimer
+          ? std::make_shared<const std::function<void()>>(std::move(reclaimer))
+          : nullptr;
+  std::lock_guard<std::mutex> lock(process_reclaimer_mutex_);
+  process_reclaimer_ = std::move(callback);
+}
+
+void MemoryLimitPool::reclaim_process_cache() {
+  std::shared_ptr<const std::function<void()>> callback;
+  {
+    std::lock_guard<std::mutex> lock(process_reclaimer_mutex_);
+    callback = process_reclaimer_;
+  }
+  // Copying this owner allocates nothing on the pressure path. It shares the
+  // same pool across DSOs, and no pool lock is held while calling another
+  // cache.
+  if (callback) (*callback)();
 }
 
 int MemoryLimitPool::init(size_t pool_size) {
@@ -1184,6 +1229,8 @@ int MemoryLimitPool::init(size_t pool_size) {
     release_metadata(old_charge);
   }
   pool_size_.store(0, std::memory_order_relaxed);
+  process_rss_.configure(0, nullptr);
+  set_process_rss_reclaimer({});
   // No owner allocations remain. Do not invoke queue recovery here while
   // holding its allocator lock; stale entries are handled by normal dequeue.
   drain_free_list();
@@ -1193,6 +1240,7 @@ int MemoryLimitPool::init(size_t pool_size) {
     metadata_used_size_.fetch_add(queue_bytes, std::memory_order_relaxed);
     used_size_.fetch_add(queue_bytes, std::memory_order_relaxed);
     committed_size_.fetch_add(queue_bytes, std::memory_order_relaxed);
+    process_rss_.account(queue_bytes);
   }
   initialized_.store(true, std::memory_order_release);
   queue_lock.unlock();
@@ -1247,12 +1295,13 @@ void MemoryLimitPool::stop_background_evictor() {
 void MemoryLimitPool::background_evict_loop() {
   using std::chrono::milliseconds;
   bool idle_progress = false;
+  auto last_process_reclaim = std::chrono::steady_clock::time_point{};
   const auto page_admission_pressure = [this] {
     // Reserved headroom can block page admission below both general
     // watermarks. Keep the background queue progressing at that boundary,
     // but do not reclaim when only non-evictable fixed reservations remain.
     return used_size_.load(std::memory_order_relaxed) > fixed_used() &&
-           is_page_full();
+           (is_page_full() || process_rss_.pressure());
   };
   while (bg_running_.load()) {
     {
@@ -1266,6 +1315,17 @@ void MemoryLimitPool::background_evict_loop() {
     }
     if (!bg_running_.load()) break;
     if (pool_size_.load(std::memory_order_relaxed) == 0) continue;
+    process_rss_.refresh();
+    if (process_rss_.limit()) capacity_cv_.notify_all();
+    const auto now = std::chrono::steady_clock::now();
+    if (process_rss_.pressure() &&
+        now - last_process_reclaim >= milliseconds(20)) {
+      // RocksDB has a separate cache budget. Retire its unpinned entries too,
+      // including when vector pages cannot make further reclamation progress.
+      reclaim_process_cache();
+      process_rss_.refresh(true);
+      last_process_reclaim = now;
+    }
     // Flush/compaction can retire many owners without reaching a watermark.
     // Reuse queue blocks before stale memberships cause unbounded growth.
     BlockEvictionQueue::get_instance().cleanup_dead_entries(256);
@@ -1295,6 +1355,10 @@ void MemoryLimitPool::background_evict_loop() {
         break;
       }
       bg_evicted_buffers_.fetch_add(n, std::memory_order_relaxed);
+      if (process_rss_.pressure()) {
+        trim_idle_buffers();
+        process_rss_.refresh(true);
+      }
     }
   }
 }
@@ -1335,7 +1399,7 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
                      : static_cast<char *>(ailego_aligned_malloc(
                            buffer_size, kMinimumPageBytes));
   if (!buffer) {
-    committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    release_committed(buffer_size);
     release_buffer(nullptr, buffer_size);
     return false;
   }
@@ -1363,6 +1427,8 @@ bool MemoryLimitPool::wait_for_available_impl(size_t buffer_size,
         if (capacity < used || buffer_size > capacity - used) {
           return false;
         }
+        if (buffer_size > process_rss_.available()) return false;
+        if (page_admission && process_rss_.pressure()) return false;
         // A page can be denied below the total capacity: unconsumed external
         // cache headroom is not available to page admission. Use the same
         // page-limit predicate as eviction instead of turning backpressure
@@ -1496,11 +1562,13 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
     const size_t reserved =
         std::max(used_size_.load(std::memory_order_relaxed),
                  committed_size_.load(std::memory_order_relaxed));
-    size_t available = reserved >= capacity ? 0 : capacity - reserved;
+    size_t available = std::min(reserved >= capacity ? 0 : capacity - reserved,
+                                process_rss_.available());
     if (available >= buffer_size) {
       continue;
     }
     if (trim_free_buffers(buffer_size - available) != 0) {
+      process_rss_.refresh(true);
       continue;
     }
 
@@ -1508,6 +1576,10 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
     if (BlockEvictionQueue::get_instance().batch_recycle(256) == 0) {
       high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
       return false;
+    }
+    if (process_rss_.limit()) {
+      trim_free_buffers(buffer_size - available);
+      process_rss_.refresh(true);
     }
   }
 }
@@ -1523,8 +1595,7 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
   }
   if (!is_cacheable_buffer_size(buffer_size)) {
     ailego_free(buffer);
-    size_t committed_prev =
-        committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+    size_t committed_prev = release_committed(buffer_size);
     (void)committed_prev;
     assert(committed_prev >= buffer_size);
     size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
@@ -1540,7 +1611,8 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
   // The returning page is exclusively owned here; cached/pinned pages are
   // never touched. Concurrent returns may overshoot the hint by one page per
   // returner. A discard failure keeps both the backing and its charge.
-  const size_t reserve = reserve_margin(capacity());
+  const size_t reserve =
+      process_rss_.pressure() ? 0 : reserve_margin(capacity());
   size_t committed = committed_size_.load(std::memory_order_relaxed);
   size_t used = used_size_.load(std::memory_order_relaxed);
   size_t released_retained = 0;
@@ -1592,8 +1664,7 @@ void MemoryLimitPool::release_fixed(const size_t buffer_size,
       counter->fetch_sub(buffer_size, std::memory_order_relaxed);
   (void)counter_prev;
   assert(counter_prev >= buffer_size);
-  size_t committed_prev =
-      committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+  size_t committed_prev = release_committed(buffer_size);
   (void)committed_prev;
   assert(committed_prev >= buffer_size);
   { std::lock_guard<std::mutex> lock(capacity_mutex_); }
@@ -1612,6 +1683,8 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   const bool cacheable = is_cacheable_buffer_size(buffer_size);
   const size_t admission_limit = cacheable ? page_admission_limit() : capacity;
+  process_rss_.refresh();
+  if (cacheable && process_rss_.pressure()) return 0;
   size_t total_size = 0;
   size_t actual_count = count;
   size_t expected, desired;
@@ -1650,7 +1723,7 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
                               : static_cast<char *>(ailego_aligned_malloc(
                                     buffer_size, kMinimumPageBytes));
     if (!out[acquired]) {
-      committed_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
+      release_committed(buffer_size);
       break;
     }
     alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);

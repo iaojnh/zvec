@@ -192,6 +192,17 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       detail::ReserveNativeWorkerStacks(query_thread_pool->count(),
                                         optimize_thread_pool->count(),
                                         optimize_thread_count);
+      // RSS already includes resident images, stacks, and caller-owned memory.
+      // Use it as a separate admission/eviction signal, never another fixed
+      // reservation that would count those bytes twice.
+      memory_pool.set_process_rss_reclaimer(
+          [cache = std::weak_ptr<rocksdb::Cache>(rocksdb_block_cache)] {
+            if (auto owner = cache.lock()) owner->EraseUnRefEntries();
+          });
+      if (!memory_pool.configure_process_rss_limit(memory_limit_bytes)) {
+        LOG_ERROR("Failed to sample process RSS for memory admission");
+        return -1;
+      }
     }
 
     memory_limit_bytes_ = memory_limit_bytes;
@@ -208,14 +219,17 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     LOG_INFO(
         "Managed memory initialized: total=%llu buffer_pool=%llu "
         "rocksdb=%llu rocksdb_percent=%u rocksdb_write_buffer=%llu "
-        "rocksdb_cache_shard_bits=%d",
+        "rocksdb_cache_shard_bits=%d rss_limit=%llu rss_headroom=%llu",
         static_cast<unsigned long long>(memory_limit_bytes_),
         static_cast<unsigned long long>(buffer_pool_capacity),
         static_cast<unsigned long long>(rocksdb_memory_capacity_),
         detail::kRocksDbMemoryPercent,
         static_cast<unsigned long long>(
             rocksdb_write_buffer_manager_->buffer_size()),
-        calculate_rocksdb_cache_shard_bits(rocksdb_memory_capacity_));
+        calculate_rocksdb_cache_shard_bits(rocksdb_memory_capacity_),
+        static_cast<unsigned long long>(memory_pool.process_rss_limit()),
+        static_cast<unsigned long long>(ailego::ProcessRssBudget::headroom(
+            memory_pool.process_rss_limit())));
     return 0;
   } catch (const std::exception &e) {
     LOG_ERROR("GlobalResource::initialize failed: %s", e.what());

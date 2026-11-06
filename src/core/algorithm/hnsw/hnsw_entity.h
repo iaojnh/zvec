@@ -459,7 +459,7 @@ class HnswEntity {
                          IndexStorage::MemoryBlock &block) const = 0;
   virtual int get_vector(
       const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const = 0;
+      ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks) const = 0;
 
   //! Retrieve a vector using a primary key
   virtual const void *get_vector_by_key(uint64_t /*key*/) const {

@@ -21,12 +21,15 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include <zvec/ailego/buffer/process_rss_budget.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/export.h>
 #include "concurrentqueue.h"
@@ -258,6 +261,28 @@ class MemoryLimitPool {
 
   int init(size_t pool_size);
 
+  // Enabled by the DB process budget, not by standalone page-pool users.
+  bool configure_process_rss_limit(size_t bytes);
+  // Invoked by maintenance without any pool/allocator lock held. The callback
+  // must release only unpinned backing and must not retain its cache owner.
+  void set_process_rss_reclaimer(std::function<void()> reclaimer);
+  size_t process_rss_limit() const {
+    return process_rss_.limit();
+  }
+  size_t process_rss() const {
+    return process_rss_.rss();
+  }
+  bool under_process_rss_pressure() const {
+    return process_rss_.pressure();
+  }
+  // For separately budgeted backing, e.g. the RocksDB cache allocator.
+  void account_process_backing(size_t bytes) {
+    process_rss_.account(bytes);
+  }
+  void release_process_backing(size_t bytes) {
+    process_rss_.release(bytes);
+  }
+
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
 
   //! Wait briefly for another cache owner to release enough logical budget.
@@ -301,6 +326,7 @@ class MemoryLimitPool {
   //! limit. This can become true below the process-wide hard cap because page
   //! storage preserves headroom for external cache consumers.
   bool is_page_full() const {
+    if (process_rss_.pressure()) return true;
     const size_t capacity = pool_size_.load(std::memory_order_relaxed);
     const size_t used = used_size_.load(std::memory_order_relaxed);
     if (capacity == 0) {
@@ -314,6 +340,7 @@ class MemoryLimitPool {
   //! background-reclaim low watermark so admission remains active after a
   //! reclaim pass, and clears once meaningful headroom returns.
   bool under_cache_pressure() const {
+    if (process_rss_.pressure()) return true;
     const size_t capacity = pool_size_.load(std::memory_order_relaxed);
     if (capacity == 0) {
       return false;
@@ -454,6 +481,7 @@ class MemoryLimitPool {
   bool try_reserve_used(size_t bytes);
   bool try_reserve_page_used(size_t bytes);
   bool try_reserve_committed(size_t bytes);
+  size_t release_committed(size_t bytes);
   bool try_reserve_allocation(size_t bytes);
   bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,
                                bool page_admission);
@@ -477,6 +505,7 @@ class MemoryLimitPool {
   void release_all_slabs_locked();
   size_t trim_free_buffers(size_t bytes_needed);
   bool trim_idle_buffers();
+  void reclaim_process_cache();
   size_t trim_retained_blocks(size_t bytes_needed);
   size_t pick_shard();
 
@@ -535,6 +564,9 @@ class MemoryLimitPool {
   std::atomic<size_t> used_size_{0};
   // Includes free-list buffers so all consumers share the same hard cap.
   std::atomic<size_t> committed_size_{0};
+  ProcessRssBudget process_rss_;
+  std::mutex process_reclaimer_mutex_;
+  std::shared_ptr<const std::function<void()>> process_reclaimer_;
   std::atomic<size_t> external_used_size_{0};
   std::atomic<size_t> metadata_used_size_{0};
   // Logical priority only, not an allocation: waiting mandatory consumers

@@ -14,6 +14,7 @@
 #include "rocksdb_cache_allocator.h"
 #include <limits>
 #include <new>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/io/file.h>
 
 #if defined(_WIN32)
@@ -22,6 +23,7 @@
 #endif
 #include <windows.h>
 #else
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -55,8 +57,14 @@ void *RocksdbCacheAllocator::Allocate(size_t size) {
   }
   const size_t bytes =
       (size + sizeof(Header) + page_size_ - 1) / page_size_ * page_size_;
+  // RocksDB also uses this allocator for uncached reads and compaction. A
+  // budget exception here can escape a background thread and terminate the
+  // process. Cache retention is controlled by RocksdbBlockCache instead.
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  pool.account_process_backing(bytes);
   void *mapping = ailego::File::MemoryMap(bytes, 0);
   if (mapping == nullptr) {
+    pool.release_process_backing(bytes);
     throw std::bad_alloc();
   }
   auto *header = new (mapping) Header{bytes};
@@ -66,7 +74,15 @@ void *RocksdbCacheAllocator::Allocate(size_t size) {
 void RocksdbCacheAllocator::Deallocate(void *pointer) {
   if (pointer != nullptr) {
     auto *header = static_cast<Header *>(pointer) - 1;
-    ailego::File::MemoryUnmap(header, header->mapped_bytes);
+    const size_t bytes = header->mapped_bytes;
+#if defined(_WIN32)
+    const bool unmapped = ::VirtualFree(header, 0, MEM_RELEASE) != 0;
+#else
+    const bool unmapped = ::munmap(header, bytes) == 0;
+#endif
+    if (unmapped) {
+      ailego::MemoryLimitPool::get_instance().release_process_backing(bytes);
+    }
   }
 }
 

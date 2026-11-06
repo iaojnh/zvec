@@ -23,7 +23,7 @@ struct MemoryLimitPoolTestPeer {
     return pool.try_reserve_committed(bytes);
   }
   static void release_backing(MemoryLimitPool &pool, size_t bytes) {
-    pool.committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    pool.release_committed(bytes);
   }
   static void stop_background(MemoryLimitPool &pool) {
     pool.stop_background_evictor();

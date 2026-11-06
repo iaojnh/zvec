@@ -18,6 +18,7 @@
 #include <memory>
 #include <new>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/container/params.h>
@@ -405,13 +406,16 @@ class IndexStorage : public IndexModule {
     //! A bounded-lifetime scatter read. Page-backed implementations may
     //! return independently pinned spans; contiguous backends use fallback.
     struct ScatterBlock {
+      using Spans = ailego::BudgetedVector<ReadSpan>;
+
       ScatterBlock() = default;
       ScatterBlock(const ScatterBlock &) = delete;
       ScatterBlock &operator=(const ScatterBlock &) = delete;
       ScatterBlock(ScatterBlock &&) = default;
       ScatterBlock &operator=(ScatterBlock &&) = default;
 
-      std::vector<ReadSpan> spans{};
+      // Capacity remains charged across reset(), which retains it for reuse.
+      Spans spans{};
       std::shared_ptr<void> lease{};
       MemoryBlock fallback{};
       size_t size{0};
@@ -433,8 +437,8 @@ class IndexStorage : public IndexModule {
         }
       }
 
-      void reset_scattered(std::vector<ReadSpan> read_spans,
-                           std::shared_ptr<void> read_lease, size_t length) {
+      void reset_scattered(Spans read_spans, std::shared_ptr<void> read_lease,
+                           size_t length) {
         reset();
         spans = std::move(read_spans);
         lease = std::move(read_lease);
