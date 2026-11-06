@@ -282,6 +282,41 @@ TEST(DiskAnnLinuxAioTest, AccumulatesPartialSubmissionsAndCompletions) {
   std::free(output);
 }
 
+TEST(DiskAnnLinuxAioTest, SynchronousReaderLeavesAnActiveBatchIntact) {
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  auto output = std::unique_ptr<void, decltype(&std::free)>(
+      allocate_aligned(kBlockSize * kBlockCount), &std::free);
+  ASSERT_NE(nullptr, output);
+  auto requests = make_requests(output.get());
+  FakeAioState state;
+  state.submit_results = {kBlockCount};
+  state.completion_results = {kBlockCount};
+  state.destroy_result = 0;
+  FakeAioGuard guard(&state);
+  IOContext ctx = new IoBackend;
+  ctx->type = ailego::IOBackendType::kLibAio;
+  ctx->aio_ctx = reinterpret_cast<io_context_t>(static_cast<uintptr_t>(1));
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, destroy_io_ctx(ctx)); });
+  LinuxAlignedFileReader reader;
+  ASSERT_EQ(0, reader.open_from_handle(file.path(), file.fd()));
+  PendingBatch batch;
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  ASSERT_TRUE(ctx->aio_active);
+
+  BufferPoolAlignedFileReader synchronous(nullptr);
+  std::vector<uint32_t> completed;
+  EXPECT_EQ(IndexError_InvalidArgument,
+            synchronous.get_completed(batch, ctx, kBlockCount, completed));
+  EXPECT_TRUE(completed.empty());
+  EXPECT_EQ(IndexError_InvalidArgument, synchronous.submit(batch, requests, ctx));
+  ASSERT_EQ(kBlockCount, batch.n_submitted);
+  ASSERT_EQ(0u, batch.n_reaped);
+  EXPECT_EQ(kBlockCount, reader.get_completed(batch, ctx, kBlockCount, completed));
+  EXPECT_FALSE(ctx->aio_active);
+}
+
 TEST(DiskAnnBufferPoolFileReaderTest,
      ReadsScatteredRequestsThroughOnePinnedPageBatch) {
   if (ailego::kVectorPageSize != DiskAnnUtil::kSectorSize) {

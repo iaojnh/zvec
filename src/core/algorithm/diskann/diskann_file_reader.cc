@@ -226,6 +226,7 @@ static void close_windows_io_handles(IOContext ctx) {
   }
   ctx->file_path.clear();
   ctx->file_identity = 0;
+  ctx->iocp_batch = nullptr;
   ctx->active_requests.fill(0);
   ctx->outstanding_count = 0;
 }
@@ -1134,6 +1135,7 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
 int BufferPoolAlignedFileReader::submit(PendingBatch &batch,
                                         std::vector<AlignedRead> &read_reqs,
                                         IOContext &ctx) {
+  if (batch.has_async_requests()) return IndexError_InvalidArgument;
   batch.n_submitted = 0;
   batch.n_reaped = 0;
   batch.used_pread = false;
@@ -1158,6 +1160,7 @@ int BufferPoolAlignedFileReader::get_completed(
     PendingBatch &batch, IOContext & /*ctx*/, int /*min_completed*/,
     std::vector<uint32_t> &completed_indices) {
   completed_indices.clear();
+  if (batch.has_async_requests()) return IndexError_InvalidArgument;
   for (uint32_t i = batch.n_reaped; i < batch.n_submitted; ++i) {
     completed_indices.push_back(i);
   }
@@ -1174,8 +1177,7 @@ void BufferPoolAlignedFileReader::release_io_ctx(IOContext &ctx) {
 int LinuxAlignedFileReader::submit(PendingBatch &batch,
                                    std::vector<AlignedRead> &read_reqs,
                                    IOContext &ctx) {
-  if ((ctx && ctx->aio_active) ||
-      (!batch.used_pread && batch.n_submitted > batch.n_reaped))
+  if ((ctx && ctx->aio_active) || batch.has_async_requests())
     return IndexError_InvalidArgument;
   batch.n_submitted = 0;
   batch.n_reaped = 0;
@@ -1713,6 +1715,8 @@ int WindowsAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
 int WindowsAlignedFileReader::submit(PendingBatch &batch,
                                      std::vector<AlignedRead> &read_reqs,
                                      IOContext &ctx) {
+  // A caller may still need this batch to drain its original context.
+  if (batch.has_async_requests()) return IndexError_InvalidArgument;
   batch.n_submitted = 0;
   batch.n_reaped = 0;
   batch.used_pread = false;
@@ -1773,6 +1777,7 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
   }
 
   batch.n_submitted = issued_count;
+  ctx->iocp_batch = &batch;
   return 0;
 }
 
@@ -1783,7 +1788,9 @@ int WindowsAlignedFileReader::get_completed(
   if (batch.n_reaped >= batch.n_submitted) {
     return 0;
   }
-  if (ctx == nullptr || ctx->completion_port == nullptr ||
+  if (!ctx || ctx->iocp_batch != &batch)
+    return IndexError_InvalidArgument;
+  if (ctx->completion_port == nullptr ||
       batch.generation == 0 || batch.generation != ctx->generation ||
       batch.n_submitted > MAX_IO_DEPTH ||
       ctx->outstanding_count != batch.n_submitted - batch.n_reaped) {
@@ -1894,6 +1901,7 @@ int WindowsAlignedFileReader::get_completed(
     }
   }
 
+  if (ctx->outstanding_count == 0) ctx->iocp_batch = nullptr;
   return static_cast<int>(completed_indices.size());
 }
 

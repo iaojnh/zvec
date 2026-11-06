@@ -92,6 +92,7 @@ struct IoBackend {
   HANDLE completion_port{nullptr};
   std::wstring file_path;
   uint64_t file_identity{0};
+  const PendingBatch *iocp_batch{nullptr};
   uint32_t outstanding_count{0};
   uint64_t generation{0};
 #endif
@@ -142,6 +143,10 @@ struct PendingBatch {
   uint32_t n_submitted{0};
   uint32_t n_reaped{0};
   bool used_pread{false};
+
+  bool has_async_requests() const {
+    return !used_pread && n_reaped < n_submitted;
+  }
 };
 
 class AlignedFileReader {

@@ -101,6 +101,19 @@ class PythonFetchResultKeys {
   py::object key_type_;
 };
 
+constexpr size_t kPythonWriteStatusBytes = 3 * sizeof(Status) + 512;
+
+template <typename Input, typename Key>
+size_t write_result_bytes(const std::vector<Input> &input, Key key) {
+  size_t bytes =
+      detail::BindingMemoryBytes(input.size(), kPythonWriteStatusBytes);
+  // Duplicate-key and missing-key statuses can own the complete key even
+  // after the caller and the binding release the original input.
+  for (const auto &item : input)
+    bytes = detail::BindingMemoryBytes(2, key(item).size(), bytes);
+  return bytes;
+}
+
 py::list owned_write_results(
     std::vector<Status> statuses,
     const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
@@ -109,11 +122,16 @@ py::list owned_write_results(
     Status status;
   };
   py::list out(statuses.size());
+  size_t retained =
+      detail::BindingMemoryBytes(statuses.size(), kPythonWriteStatusBytes);
   for (size_t i = 0; i < statuses.size(); ++i) {
+    retained = detail::BindingMemoryBytes(1, statuses[i].message().capacity(),
+                                          retained);
     auto value = std::make_shared<OwnedStatus>(
         OwnedStatus{memory, std::move(statuses[i])});
     out[i] = py::cast(std::shared_ptr<Status>(value, &value->status));
   }
+  memory->retain_at_most(retained);
   return out;
 }
 
@@ -1049,7 +1067,11 @@ void ZVecPyCollection::bind_dml_methods(
       Result<WriteResults> result;
       {
         py::gil_scoped_release release;
-        output_memory->add(detail::BindingMemoryBytes(inputs.docs.size(), 512));
+        if (output_memory->enabled())
+          output_memory->add(write_result_bytes(
+              inputs.docs, [](const Doc &doc) -> const std::string & {
+                return doc.pk_ref();
+              }));
         result = (self.*operation)(inputs.docs);
       }
       return owned_write_results(unwrap_expected(std::move(result)),
@@ -1070,8 +1092,11 @@ void ZVecPyCollection::bind_dml_methods(
             Result<WriteResults> result;
             {
               py::gil_scoped_release release;
-              output_memory->add(detail::BindingMemoryBytes(
-                  inputs.pks.size(), 3 * sizeof(Status) + 512));
+              if (output_memory->enabled())
+                output_memory->add(write_result_bytes(
+                    inputs.pks, [](const std::string &key) -> const std::string & {
+                      return key;
+                    }));
               result = self.delete_(inputs.pks);
             }
             return owned_write_results(unwrap_expected(std::move(result)),

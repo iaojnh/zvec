@@ -94,6 +94,32 @@ def verify_statuses(path):
     coll.close()
 
 
+def verify_long_status_messages(path):
+    zvec.init(memory_limit_mb=256, query_threads=2, optimize_threads=1)
+    options = zvec.CollectionOption.__new__(zvec.CollectionOption)
+    options.__setstate__((False, False, 1024 * 1024))
+    schema = zvec.CollectionSchema(
+        "status_message_budget", fields=[zvec.FieldSchema("value", zvec.DataType.INT64)]
+    )
+    coll = zvec.create_and_open(str(path), schema, option=options)
+    # Reuse one caller string. Each failed delete produces an independently
+    # owned native status message containing the complete key.
+    key = "x" * (1024 * 1024)
+    held = []
+    for _ in range(48):
+        try:
+            held.append(coll.delete(key))
+        except MemoryError:
+            break
+    else:
+        raise AssertionError("Retained native status messages escaped admission")
+    assert held and key in held[0].message()
+    held.clear()
+    gc.collect()
+    assert key in coll.delete(key).message()
+    coll.close()
+
+
 def run_worker(tmp_path, operation, direct=False):
     completed = subprocess.run(
         [sys.executable, __file__, str(tmp_path / "db"), operation, str(int(direct))],
@@ -116,10 +142,16 @@ def test_retained_write_statuses_reject_growth_and_release_for_retry(tmp_path):
     run_worker(tmp_path, "statuses")
 
 
+def test_retained_long_write_status_messages_use_budget(tmp_path):
+    run_worker(tmp_path, "long_status_messages")
+
+
 if __name__ == "__main__":
     if sys.argv[2] == "iterable":
         verify_iterable(Path(sys.argv[1]))
     elif sys.argv[2] == "statuses":
         verify_statuses(Path(sys.argv[1]))
+    elif sys.argv[2] == "long_status_messages":
+        verify_long_status_messages(Path(sys.argv[1]))
     else:
         verify(Path(sys.argv[1]), sys.argv[2], bool(int(sys.argv[3])))
