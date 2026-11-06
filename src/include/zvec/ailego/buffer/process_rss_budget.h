@@ -94,11 +94,13 @@ class ProcessRssBudget {
   // here. Their cache owns admission; still include temporary and live backing
   // in the process estimate so other consumers stop growing under pressure.
   void account(size_t bytes) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    assert(bytes <=
-           std::numeric_limits<size_t>::max() - backing_ - pending_allocations_);
-    backing_ += bytes;
-    update_available();
+    const bool accounted = account(bytes, backing_);
+    assert(accounted);
+    (void)accounted;
+  }
+
+  bool account_pending(size_t bytes) {
+    return account(bytes, pending_allocations_);
   }
 
   void release(size_t bytes) {
@@ -124,7 +126,7 @@ class ProcessRssBudget {
   // pressure notification or an exhausted observed process/application limit.
   // Do not charge the reserved backing twice or block mandatory work merely
   // because optional caches are under BACKGROUND pressure.
-  bool materialization_allowed() {
+  bool materialization_allowed(size_t bytes = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
     if (external_pressure_ == PressureLevel::kCritical ||
@@ -133,12 +135,19 @@ class ProcessRssBudget {
     }
     const size_t cap = limit();
     if (!cap) return true;
-    if (rss_.load(std::memory_order_relaxed) >= cap) return false;
+    // The existing allowance may overlap the RSS estimate even though this
+    // operation still needs new pages. Check measured room independently of
+    // the lifetime charge, including other backing allocations in flight.
+    const size_t needed = add_saturated(bytes, pending_allocations_);
+    const size_t rss = rss_.load(std::memory_order_relaxed);
+    if (rss >= cap || needed > cap - rss) return false;
     if (native_reader_) {
       const size_t native_cap = std::min(cap, native_limit_);
       const size_t footprint = native_estimate_.sample_;
+      const size_t reserve = headroom(native_cap);
       if (footprint >= native_cap ||
-          native_cap - footprint <= headroom(native_cap))
+          native_cap - footprint <= reserve ||
+          needed > native_cap - footprint - reserve)
         return false;
     }
     return true;
@@ -158,6 +167,16 @@ class ProcessRssBudget {
   }
 
  private:
+  bool account(size_t bytes, size_t &counter) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (bytes >
+        std::numeric_limits<size_t>::max() - backing_ - pending_allocations_)
+      return false;
+    counter += bytes;
+    update_available();
+    return true;
+  }
+
   bool try_charge(size_t bytes, size_t &counter) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);

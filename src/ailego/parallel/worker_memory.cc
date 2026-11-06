@@ -19,7 +19,7 @@ class WorkerMemoryBudget {
   void acquire(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto &pool = MemoryLimitPool::get_instance();
-    if (!pool.materialization_allowed() ||
+    if (!pool.materialization_allowed(bytes) ||
         bytes > std::numeric_limits<size_t>::max() - active_)
       throw std::bad_alloc();
     const size_t target = active_ + bytes;

@@ -463,6 +463,27 @@ TEST_F(PoolAdmissionTest, FailedWorkspaceAllocationRestoresRssHeadroom) {
   }
 }
 
+TEST_F(PoolAdmissionTest, RetainedBackingReuseObeysMeasuredHeadroom) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t request = page_ - MemoryLimitPool::kRetainedBlockHeaderBytes;
+  void *block = pool_.acquire_retained_block(request);
+  ASSERT_NE(nullptr, block);
+  pool_.release_retained_block(block);
+  ASSERT_EQ(page_, pool_.stats().retained_idle_bytes);
+
+  const size_t limit = baseline_ + 256 * page_;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, limit, limit - 1));
+  block = pool_.acquire_retained_block(request);
+  EXPECT_EQ(nullptr, block);
+  if (block) pool_.release_retained_block(block);
+
+  MemoryLimitPoolTestPeer::sample_rss(pool_, limit - 16 * page_);
+  block = pool_.acquire_retained_block(request);
+  ASSERT_NE(nullptr, block);
+  pool_.release_retained_block(block);
+}
+
 TEST_F(PoolAdmissionTest, ConcurrentMixedAdmissionStaysWithinBothLimits) {
   ASSERT_EQ(0, pool_.init(baseline_ + 32 * page_));
   std::atomic<bool> stop{false};

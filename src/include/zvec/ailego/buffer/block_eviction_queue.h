@@ -278,12 +278,15 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool under_process_rss_pressure() const {
     return process_rss_.pressure();
   }
-  bool materialization_allowed() {
-    return process_rss_.materialization_allowed();
+  bool materialization_allowed(size_t bytes = 0) {
+    return process_rss_.materialization_allowed(bytes);
   }
   // For separately budgeted backing, e.g. the RocksDB cache allocator.
-  void account_process_backing(size_t bytes) {
-    process_rss_.account(bytes);
+  bool account_pending_process_backing(size_t bytes) {
+    return process_rss_.account_pending(bytes);
+  }
+  void finish_process_backing(size_t bytes, bool allocated) {
+    process_rss_.finish_reservation(bytes, allocated);
   }
   void release_process_backing(size_t bytes) {
     process_rss_.release(bytes);

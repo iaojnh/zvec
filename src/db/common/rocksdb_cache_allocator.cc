@@ -61,10 +61,10 @@ void *RocksdbCacheAllocator::Allocate(size_t size) {
   // budget exception here can escape a background thread and terminate the
   // process. Cache retention is controlled by RocksdbBlockCache instead.
   auto &pool = ailego::MemoryLimitPool::get_instance();
-  pool.account_process_backing(bytes);
+  if (!pool.account_pending_process_backing(bytes)) throw std::bad_alloc();
   void *mapping = ailego::File::MemoryMap(bytes, 0);
+  pool.finish_process_backing(bytes, mapping != nullptr);
   if (mapping == nullptr) {
-    pool.release_process_backing(bytes);
     throw std::bad_alloc();
   }
   auto *header = new (mapping) Header{bytes};

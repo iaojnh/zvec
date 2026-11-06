@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/utility/file_helper.h>
@@ -35,12 +37,16 @@ static void ExitLogHandler() {
   LogUtil::Shutdown();
 }
 
+static uint64_t MaximumMemoryLimit() {
+  return std::min<uint64_t>(CgroupUtil::get_memory_limit(),
+                            (std::numeric_limits<size_t>::max)());
+}
+
 GlobalConfig::ConfigData::ConfigData()
-    : memory_limit_bytes(detail::kMobileMemoryPolicy
-                             ? detail::MobileDefaultMemoryLimit(
-                                   CgroupUtil::get_memory_limit())
-                             : CgroupUtil::get_memory_limit() *
-                                   DEFAULT_MEMORY_LIMIT_RATIO),
+    : memory_limit_bytes(
+          detail::kMobileMemoryPolicy
+              ? detail::MobileDefaultMemoryLimit(MaximumMemoryLimit())
+              : MaximumMemoryLimit() * DEFAULT_MEMORY_LIMIT_RATIO),
       log_config(std::make_shared<ConsoleLogConfig>()),
       query_thread_count(CgroupUtil::get_cpu_limit()),
       query_thread_binding(false),
@@ -70,9 +76,9 @@ Status GlobalConfig::validate(const ConfigData &config) const {
                                    minimum);
   }
 
-  if (config.memory_limit_bytes > CgroupUtil::get_memory_limit()) {
+  if (config.memory_limit_bytes > MaximumMemoryLimit()) {
     return Status::InvalidArgument("memory_limit_bytes must be less than ",
-                                   CgroupUtil::get_memory_limit());
+                                   MaximumMemoryLimit());
   }
 
   // Validate query thread count

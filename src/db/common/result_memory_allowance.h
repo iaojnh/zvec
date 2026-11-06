@@ -92,7 +92,7 @@ class ResultMemoryAllowance {
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t capacity = pool.capacity();
     if (!capacity) return 0;
-    if (!pool.materialization_allowed()) throw std::bad_alloc();
+    if (!pool.materialization_allowed(bytes)) throw std::bad_alloc();
     // One result-equivalent for active objects, another for allocation growth
     // and previously freed backing. This is a conservative planning policy,
     // not a claim that an arbitrary system allocator has bounded fragmentation.

@@ -410,6 +410,9 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     for (auto **link = &retained_free_; *link; link = &(*link)->next) {
       auto *block = *link;
       if (block->bytes != charge) continue;
+      // An idle mapping can contain pages that were never faulted in or were
+      // reclaimed by the OS. Assigning a new owner can make them resident.
+      if (!process_rss_.materialization_allowed(charge)) break;
       // Backing is already charged, but a pending page may own the logical
       // headroom. Leave the idle block linked until admission succeeds.
       if (!try_reserve_used(charge)) break;

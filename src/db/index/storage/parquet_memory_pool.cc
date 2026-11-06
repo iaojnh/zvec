@@ -181,6 +181,8 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
     lock.lock();
     chunk->next = small_chunks_[index];
     small_chunks_[index] = chunk;
+  } else if (!budget.materialization_allowed(needed)) {
+    return arrow::Status::OutOfMemory("Parquet small slot exceeds RSS headroom");
   }
   void *slot = chunk->free_head;
   if (slot) {

@@ -521,18 +521,10 @@ class ExternalCache : public EvictableBlockOwner {
 
   struct LoadState {
     // condition_variable_any implementations allocate a shared mutex outside
-    // the LoadState object. Reserve its implementation/control-block allowance
-    // before constructing cv, and refund only after cv (and all waiters) die.
+    // the LoadState object. claim_load reserves it before constructing cv.
+    // Keep the resulting charge until cv (and all waiters) die.
     struct WaitMemory {
       size_t charged{0};
-      WaitMemory() {
-        auto &pool = MemoryLimitPool::get_instance();
-        if (!pool.capacity()) return;
-        constexpr size_t kAllowance = sizeof(std::mutex) + 128;
-        if (!pool.try_charge_metadata_without_reclaim(kAllowance))
-          throw std::bad_alloc();
-        charged = kAllowance;
-      }
       ~WaitMemory() {
         if (charged) MemoryLimitPool::get_instance().release_metadata(charged);
       }
@@ -567,8 +559,15 @@ class ExternalCache : public EvictableBlockOwner {
                          CacheMetadataAllocator<std::pair<const Key, Entry>>>;
 
   void claim_load(const Key &key, typename Table::iterator &iter) {
+    auto &pool = MemoryLimitPool::get_instance();
+    const size_t charge = pool.capacity() ? sizeof(std::mutex) + 128 : 0;
+    using Pending = MemoryLimitPool::PendingAllocation;
+    Pending pending(pool, Pending::Kind::kLockedMetadata);
+    if (!pending.reserve(charge)) throw std::bad_alloc();
     auto state =
         std::allocate_shared<LoadState>(CacheMetadataAllocator<LoadState>{});
+    pending.commit();
+    state->wait_memory.charged = charge;
     if (iter == table_.end()) {
       iter = table_.try_emplace(key).first;
       iter->second.owner_key = next_owner_key_;

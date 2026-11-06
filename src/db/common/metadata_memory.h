@@ -28,7 +28,7 @@ class RetainedMetadataBudget {
       std::lock_guard<std::mutex> lock(owner_.mutex_);
       auto &pool = ailego::MemoryLimitPool::get_instance();
       if (!pool.capacity()) return;
-      if (bytes && !pool.materialization_allowed()) throw std::bad_alloc();
+      if (bytes && !pool.materialization_allowed(bytes)) throw std::bad_alloc();
       if (bytes > std::numeric_limits<size_t>::max() - owner_.active_)
         throw std::bad_alloc();
       const size_t target = owner_.active_ + bytes;

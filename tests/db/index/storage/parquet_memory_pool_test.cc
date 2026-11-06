@@ -624,6 +624,13 @@ TEST_F(ParquetBudgetTest, SmallSlotsReuseBackingAndKeepItCharged) {
   pool.Free(first, 64);
   EXPECT_EQ(backing, budget_.external_used());
   EXPECT_EQ(backing, pool.charged_bytes());
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  native.set_memory_pressure(Pressure::kCritical);
+  const auto blocked = pool.Allocate(64, &replacement);
+  EXPECT_TRUE(blocked.IsOutOfMemory());
+  if (blocked.ok()) pool.Free(replacement, 64);
+  native.set_memory_pressure(Pressure::kNormal);
   ASSERT_TRUE(pool.Allocate(64, &replacement).ok());
   EXPECT_EQ(first, replacement);
   EXPECT_EQ(backing, budget_.external_used());

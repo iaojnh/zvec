@@ -28,7 +28,7 @@ class WriteBufferMemoryAllowance {
     assert(backing <= bytes);
     auto &pool = ailego::MemoryLimitPool::get_instance();
     if (!pool.capacity()) return 0;
-    if (!pool.materialization_allowed()) throw std::bad_alloc();
+    if (!pool.materialization_allowed(backing)) throw std::bad_alloc();
     if (bytes > std::numeric_limits<size_t>::max() - active_)
       throw std::bad_alloc();
     const size_t target = active_ + bytes;
@@ -134,7 +134,8 @@ class WriteBufferReservation {
     if (bytes_ != 0) {
       // A live writer reuses its lease between operations, but its ordinary
       // heap allocations must still obey newly observed host pressure.
-      if (!ailego::MemoryLimitPool::get_instance().materialization_allowed())
+      if (!ailego::MemoryLimitPool::get_instance().materialization_allowed(
+              std::min(backing, bytes_)))
         return Status(StatusCode::RESOURCE_EXHAUSTED,
                       "Write buffer materialization blocked by memory pressure");
       backing = std::max(backing_, std::min(backing, bytes_));

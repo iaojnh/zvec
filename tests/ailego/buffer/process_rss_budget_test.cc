@@ -166,6 +166,7 @@ TEST(ProcessRssBudgetTest, CriticalRecoveryRequiresBothConfiguredSamples) {
 TEST(ProcessRssBudgetTest, DisabledBudgetPreservesStandaloneAdmission) {
   ProcessRssBudget budget;
   EXPECT_TRUE(budget.try_acquire(std::numeric_limits<size_t>::max()));
+  EXPECT_FALSE(budget.account_pending(1));
   EXPECT_FALSE(budget.pressure());
   EXPECT_EQ(0u, budget.limit());
 }
@@ -349,7 +350,12 @@ TEST(ProcessRssBudgetTest, FailedAllocationAttemptsKeepResidentOverlap) {
         100 * kMiB -
         (use_native_sample ? ProcessRssBudget::headroom(limit) : 0);
     for (int i = 0; i < 20; ++i) {
-      ASSERT_TRUE(budget.try_reserve(request));
+      if (i % 2 == 0) {
+        ASSERT_TRUE(budget.try_reserve(request));
+      } else {
+        // Separately admitted RocksDB block.
+        ASSERT_TRUE(budget.account_pending(request));
+      }
       budget.refresh(true);
       EXPECT_EQ(available - request, budget.available());
       budget.finish_reservation(request, false);
@@ -553,6 +559,26 @@ TEST(ProcessRssBudgetTest, ReservedMaterializationObeysObservedLimits) {
   native_sample = {64 * kMiB, 64 * kMiB};
   budget.refresh(true);
   EXPECT_TRUE(budget.materialization_allowed());
+}
+
+TEST(ProcessRssBudgetTest, ReservedMaterializationRequiresMeasuredRoomForBytes) {
+  ProcessRssBudget budget;
+  sampled_rss = 120 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  EXPECT_TRUE(budget.materialization_allowed(8 * kMiB));
+  EXPECT_FALSE(budget.materialization_allowed(8 * kMiB + 1));
+  ASSERT_TRUE(budget.try_reserve(2 * kMiB));
+  EXPECT_TRUE(budget.materialization_allowed(6 * kMiB));
+  EXPECT_FALSE(budget.materialization_allowed(6 * kMiB + 1));
+  budget.finish_reservation(2 * kMiB, false);
+  EXPECT_TRUE(budget.materialization_allowed(8 * kMiB));
+
+  sampled_rss = 32 * kMiB;
+  native_sample = {100 * kMiB, 28 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  EXPECT_TRUE(budget.materialization_allowed(20 * kMiB));
+  EXPECT_FALSE(budget.materialization_allowed(20 * kMiB + 1));
 }
 }  // namespace
 }  // namespace zvec::ailego

@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "db/common/global_resource.h"
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <arrow/util/thread_pool.h>
 #include <rocksdb/advanced_cache.h>
@@ -112,6 +113,10 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
                                       bool optimize_thread_binding,
                                       bool preserve_existing_pool) {
   if (initialization_failed_) return -1;
+  if (memory_limit_bytes > (std::numeric_limits<size_t>::max)()) {
+    LOG_ERROR("Requested process memory budget exceeds the address space");
+    return -1;
+  }
   try {
     auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
     const uint64_t rocksdb_memory_capacity =
