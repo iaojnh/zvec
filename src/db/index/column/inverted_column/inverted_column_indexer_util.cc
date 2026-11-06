@@ -73,7 +73,7 @@ Status InvertedColumnIndexer::open() {
       }
     } else if (s.code() != rocksdb::Status::kNotFound) {
       LOG_ERROR("Failed to retrieve cdf from %s", id().c_str());
-      return Status::InternalError();
+      return ReadFailure(s);
     }
   }
 
@@ -97,7 +97,7 @@ Status InvertedColumnIndexer::open() {
     }
   } else if (s.code() != rocksdb::Status::kNotFound) {
     LOG_ERROR("Failed to retrieve max id from %s", id().c_str());
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 
   // Get null bitmap if exists
@@ -109,7 +109,7 @@ Status InvertedColumnIndexer::open() {
     }
   } else if (s.code() != rocksdb::Status::kNotFound) {
     LOG_ERROR("Failed to retrieve null bitmap from %s", id().c_str());
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 
   // Get indexer state
@@ -121,7 +121,7 @@ Status InvertedColumnIndexer::open() {
     sealed_ = false;
   } else {
     LOG_ERROR("Failed to retrieve indexer state from %s", id().c_str());
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 
   LOG_INFO("Opened %s", id().c_str());
@@ -131,11 +131,13 @@ Status InvertedColumnIndexer::open() {
 
 InvertedColumnIndexer::Ptr InvertedColumnIndexer::CreateAndOpen(
     const std::string &collection_name, const FieldSchema &field,
-    RocksdbContext &context, bool read_only) {
+    RocksdbContext &context, bool read_only, Status *open_status) {
   auto ptr =
       new InvertedColumnIndexer(collection_name, field, context, read_only);
   auto indexer = std::shared_ptr<InvertedColumnIndexer>(ptr);
-  if (indexer->open().ok()) {
+  const auto status = indexer->open();
+  if (open_status) *open_status = status;
+  if (status.ok()) {
     return indexer;
   } else {
     return nullptr;

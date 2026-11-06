@@ -716,9 +716,9 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
             field_name_));
       }
     }
-    if (!iter->status().ok()) {
-      return tl::make_unexpected(
-          Status::InternalError(iter->status().ToString()));
+    const auto scan_status = iter->status();
+    if (!scan_status.ok()) {
+      return tl::make_unexpected(FtsReadFailure(scan_status, "Validate FTS postings"));
     }
     return {};
   }
@@ -754,9 +754,10 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
       doc_lens.set(local_doc_id, doc_len);
       iter->Next();
     }
-    if (!iter->status().ok())
-      return tl::make_unexpected(
-          Status::InternalError(iter->status().ToString()));
+    const auto scan_status = iter->status();
+    if (!scan_status.ok()) {
+      return tl::make_unexpected(FtsReadFailure(scan_status, "Scan FTS document lengths"));
+    }
   }
 
   // ---------------------------------------------------------------
@@ -828,9 +829,10 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
       postings.append(local_doc_id, tf, doc_lens.get(local_doc_id));
       iter->Next();
     }
-    if (!iter->status().ok())
-      return tl::make_unexpected(
-          Status::InternalError(iter->status().ToString()));
+    const auto scan_status = iter->status();
+    if (!scan_status.ok()) {
+      return tl::make_unexpected(FtsReadFailure(scan_status, "Scan FTS term frequencies"));
+    }
   }
   // Flush the last term.
   auto ret = flush_current_term();

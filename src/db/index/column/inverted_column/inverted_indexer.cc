@@ -70,11 +70,11 @@ Status InvertedIndexer::open(bool create_dir_if_missing, bool read_only) {
 
   for (const auto &field : fields_) {
     auto column_indexer = InvertedColumnIndexer::CreateAndOpen(
-        collection_name_, field, rocksdb_context_, read_only);
+        collection_name_, field, rocksdb_context_, read_only, &s);
     if (column_indexer == nullptr) {
       LOG_ERROR("Failed to create InvertedColumnIndexer[%s]",
                 field.name().c_str());
-      return Status::InternalError();
+      return s;
     }
     indexers_.emplace(field.name(), std::move(column_indexer));
   }
@@ -132,6 +132,7 @@ Status InvertedIndexer::seal() {
     }
     if (s = indexer->seal(); !s.ok()) {
       LOG_ERROR("Failed to seal %s", indexer->id().c_str());
+      return s;
     }
   }
 
@@ -224,13 +225,10 @@ Status InvertedIndexer::create_column_indexer(const FieldSchema &field) {
   }
 
   auto column_indexer = InvertedColumnIndexer::CreateAndOpen(
-      collection_name_, field, rocksdb_context_);
+      collection_name_, field, rocksdb_context_, false, &s);
   if (column_indexer) {
     fields_.emplace_back(field);
     indexers_.emplace(field.name(), std::move(column_indexer));
-    s = Status::OK();
-  } else {
-    s = Status::InternalError();
   }
   return s;
 }

@@ -308,10 +308,10 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
   size_t cdf_slot_doc_count = 0;
 
   // Function to create a CDF slot
-  auto create_cdf_slot = [&]() {
+  auto create_cdf_slot = [&](const std::string &term) {
     ailego::JsonObject json_obj;
     json_obj.set(ailego::JsonString("key").encode(),
-                 ailego::JsonString(iter_term->key().ToString()).encode());
+                 ailego::JsonString(term).encode());
     json_obj.set(ailego::JsonString("doc_count").encode(),
                  ailego::JsonValue(doc_count));
     cdf_json_array.push(json_obj);
@@ -367,7 +367,7 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
     }
     cdf_slot_doc_count += term_doc_count;
     if (cdf_slot_doc_count >= num_doc_per_cdf_slot) {
-      create_cdf_slot();
+      create_cdf_slot(range_end_key);
       cdf_slot_initialized = false;
     }
 
@@ -376,6 +376,10 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
     iter_term->Next();
   }
 
+  const auto scan_status = iter_term->status();
+  if (!scan_status.ok()) {
+    return ReadFailure(scan_status);
+  }
 
   // Finalize
   if (range_slot_initialized) {
@@ -399,8 +403,7 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
   }
 
   if (cdf_slot_initialized) {
-    iter_term->SeekToLast();
-    create_cdf_slot();
+    create_cdf_slot(range_end_key);
   }
   ailego::JsonObject cdf_json_obj;
   cdf_json_obj.set("field_value_histogram", cdf_json_array);

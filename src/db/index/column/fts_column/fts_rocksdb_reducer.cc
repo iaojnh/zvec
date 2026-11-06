@@ -309,9 +309,11 @@ Result<void> FtsRocksdbReducer::collect_effective_stats(
       }
       iter->Next();
     }
-    if (!iter->status().ok())
+    const auto scan_status = iter->status();
+    if (!scan_status.ok()) {
       return tl::make_unexpected(
-          Status::InternalError(iter->status().ToString()));
+          FtsReadFailure(scan_status, "Scan FTS posting statistics"));
+    }
   }
 
   LOG_INFO(
@@ -348,9 +350,11 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
     bool found = false;
     for (auto &c : cursors) {
       if (!c.iter->Valid()) {
-        if (!c.iter->status().ok())
+        const auto scan_status = c.iter->status();
+        if (!scan_status.ok()) {
           return tl::make_unexpected(
-              Status::InternalError(c.iter->status().ToString()));
+              FtsReadFailure(scan_status, "Scan FTS postings during merge"));
+        }
         continue;
       }
       const std::string t = c.iter->key().ToString();
@@ -457,6 +461,11 @@ Result<void> FtsRocksdbReducer::reduce_positions(
       return tl::make_unexpected(Status::InternalError(
           "FtsRocksdbReducer: failed to write positions. field=", field_name_));
     }
+  }
+  const auto scan_status = iter->status();
+  if (!scan_status.ok()) {
+    return tl::make_unexpected(
+        FtsReadFailure(scan_status, "Scan FTS positions during merge"));
   }
 
   return {};
