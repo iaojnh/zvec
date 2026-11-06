@@ -87,20 +87,20 @@ inline size_t EstimateQueryResult(const arrow::RecordBatch &batch) {
   return estimate.bytes();
 }
 
-// Aliasing ownership keeps admission alive even if a C++ caller retains just
-// one document after discarding the list. Destroy Docs before releasing it.
-struct BudgetedQueryDocument {
-  std::shared_ptr<ResultMemoryAllowance::Lease> memory;
-  Doc doc;
+struct DocumentMemoryAccess {
+  static void retain(Doc &doc, std::shared_ptr<void> memory) {
+    doc.memory_owner_ = std::move(memory);
+  }
+  static bool budgeted(const Doc &doc) {
+    return bool(doc.memory_owner_);
+  }
 };
 
 inline Doc::Ptr MakeQueryDocument(
     const std::shared_ptr<ResultMemoryAllowance::Lease> &memory) {
-  if (!memory) return std::make_shared<Doc>();
-  auto owner = std::make_shared<BudgetedQueryDocument>();
-  owner->memory = memory;
-  auto *doc = &owner->doc;
-  return Doc::Ptr(std::move(owner), doc);
+  auto doc = std::make_shared<Doc>();
+  if (memory && memory->enabled()) DocumentMemoryAccess::retain(*doc, memory);
+  return doc;
 }
 
 }  // namespace zvec::detail

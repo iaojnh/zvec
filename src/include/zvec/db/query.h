@@ -133,10 +133,19 @@ inline void QueryTarget::set_sparse_vector(std::string indices,
 }
 
 // Buffers returned by the internal-ID query API.
-struct InternalIdsQueryResult {
+struct ResultMemoryOwner {
+  std::shared_ptr<void> memory_owner;
+};
+
+struct InternalIdsQueryResult : ResultMemoryOwner {
   std::vector<int64_t> ids;
   std::vector<float> scores;
 };
+
+// Preserve the sequence interface while carrying the result's admission.
+// Base destruction releases the vector before its memory owner.
+struct ResolvedIdsResult : ResultMemoryOwner,
+                           std::vector<std::optional<std::string>> {};
 
 struct ZVEC_API SearchQuery {
   QueryTarget target_;
@@ -183,7 +192,14 @@ struct GroupByVectorQuery {
   uint32_t topk_per_group_{3};
 };
 
-struct GroupResult {
+struct GroupResult : ResultMemoryOwner {
+  GroupResult(std::string value, std::vector<Doc> docs,
+              std::shared_ptr<void> memory = {})
+      : ResultMemoryOwner{std::move(memory)},
+        group_by_value_(std::move(value)),
+        docs_(std::move(docs)) {}
+  GroupResult() = default;
+
   std::string group_by_value_;
   std::vector<Doc> docs_;
 };

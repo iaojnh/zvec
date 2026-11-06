@@ -201,6 +201,10 @@ class FlatSearcherContext : public IndexSearcher::Context {
     for (auto &heap : result_heaps_) heap.release();
     decltype(result_heaps_)().swap(result_heaps_);
     decltype(batch_queries_)().swap(batch_queries_);
+    row_topk_.release();
+    row_topks_.clear();
+    row_topks_capacity_ = 0;
+    decltype(row_query_buffer_)().swap(row_query_buffer_);
     group_topk_heaps_.clear();
     group_results_.clear();
   }
@@ -493,6 +497,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
   // until the final selected rows are mapped to primary keys.
   template <bool Filter>
   int search_row_topk(const void *query, const IndexQueryMeta &qmeta) {
+    results_.clear();
     prepare_result_heaps(1);
     auto &heap = result_heaps_[0];
     heap.clear();
@@ -566,6 +571,9 @@ class FlatSearcherContext : public IndexSearcher::Context {
   template <bool Filter>
   int batch_search_row_topk(const void *query, const IndexQueryMeta &qmeta,
                             size_t query_count) {
+    if (!qmeta.element_size() || query_count > SIZE_MAX / qmeta.element_size())
+      return IndexError_InvalidArgument;
+    results_.clear();
     if (query_count > row_topks_capacity_) {
       row_topks_.resize(query_count);
       row_topks_capacity_ = query_count;

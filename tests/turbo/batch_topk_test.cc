@@ -30,8 +30,10 @@
 #include <utility>
 #include <vector>
 #include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/turbo/batch_topk.h>
 #include "topk/batch_topk_internal.h"
+#include "../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec {
 namespace turbo {
@@ -329,6 +331,38 @@ TEST(BatchTopK, OverflowResetPreservesExistingResultsAndContinuation) {
     topk.finish();
     ASSERT_NO_FATAL_FAILURE(Check(topk, input, input.scores.size(), k));
   }
+}
+
+TEST(BatchTopK, BudgetRejectionPreservesResultsAndReleaseAllowsReuse) {
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = zvec::ailego::ScopeGuard::Make(
+      [&] { EXPECT_EQ(0, pool.init(previous)); });
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  const size_t baseline = pool.external_used();
+  for (bool small : {false, true}) {
+    BatchTopK topk;
+    BatchTopKTestAccess::Reset(topk, 1024, kDefaultBound, false,
+                               internal::Isa::kScalar, small);
+    const float distance = 3.0f;
+    const uint64_t id = 17;
+    topk.push_block(&distance, &id, 1);
+    topk.finish();
+    EXPECT_GT(pool.external_used(), baseline);
+    EXPECT_THROW(
+        BatchTopKTestAccess::Reset(topk, 1024 * 1024, kDefaultBound, false,
+                                   internal::Isa::kScalar, small),
+        std::bad_alloc);
+    ASSERT_EQ(1u, topk.size());
+    EXPECT_EQ(id, topk.result(0).id);
+    topk.release();
+    EXPECT_EQ(baseline, pool.external_used());
+    topk.reset(1024);
+    topk.push_block(&distance, &id, 1);
+    topk.finish();
+    EXPECT_EQ(id, topk.result(0).id);
+  }
+  EXPECT_EQ(baseline, pool.external_used());
 }
 
 TEST(BatchTopK, DuplicateIdsRemainIndependentCandidateOccurrences) {

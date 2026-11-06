@@ -28,6 +28,9 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <gtest/gtest.h>
 #include <turbo/quantizer/fp32_quantizer/fp32_quantizer.h>
 #include <turbo/quantizer/quantizer.h>
@@ -69,6 +72,36 @@ void *operator new(std::size_t size) {
   }
   if (void *ptr = std::malloc(size ? size : 1)) return ptr;
   throw std::bad_alloc();
+}
+
+void *operator new(std::size_t size, std::align_val_t alignment) {
+  if ((bulk_alloc_test::countdown && --bulk_alloc_test::countdown == 0) ||
+      (bulk_alloc_test::should_fail && bulk_alloc_test::should_fail())) {
+    bulk_alloc_test::should_fail = nullptr;
+    throw std::bad_alloc();
+  }
+  const size_t align = std::max(static_cast<size_t>(alignment), sizeof(void *));
+#if defined(_WIN32)
+  if (void *ptr = _aligned_malloc(size ? size : 1, align)) return ptr;
+#else
+  void *ptr = nullptr;
+  if (posix_memalign(&ptr, align, size ? size : 1) == 0) return ptr;
+#endif
+  throw std::bad_alloc();
+}
+
+void operator delete(void *ptr, std::align_val_t) noexcept {
+  if (ptr && bulk_alloc_test::on_delete) bulk_alloc_test::on_delete(ptr);
+#if defined(_WIN32)
+  _aligned_free(ptr);
+#else
+  std::free(ptr);
+#endif
+}
+
+void operator delete(void *ptr, std::size_t,
+                     std::align_val_t alignment) noexcept {
+  ::operator delete(ptr, alignment);
 }
 
 void operator delete(void *ptr) noexcept {
@@ -1150,7 +1183,8 @@ TEST(HnswBulkMergeDeathTest, AllocationFailureReleasesLevelPromotionLock) {
       try {
         // The first allocation grows level_topk after acquiring the
         // promotion lock, inside the real insertion implementation.
-        algorithm.add_node(1, 1, contexts[0].get());
+        failed = algorithm.add_node(1, 1, contexts[0].get()) ==
+                 core::IndexError_NoMemory;
       } catch (const std::bad_alloc &) {
         failed = true;
       }

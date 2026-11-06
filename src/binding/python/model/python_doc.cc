@@ -335,8 +335,7 @@ py::object ZVecPyDoc::doc_value_to_py(Doc &self, const std::string &field,
 }
 
 py::tuple ZVecPyDoc::doc_to_tuple(Doc &self, const CollectionSchema &schema) {
-  return doc_to_tuple_with_fields(self, schema.forward_fields(),
-                                  schema.vector_fields());
+  return budgeted_doc_to_tuple(self, schema);
 }
 
 py::tuple ZVecPyDoc::doc_to_tuple_with_fields(

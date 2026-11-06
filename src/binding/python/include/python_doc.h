@@ -20,6 +20,8 @@ namespace py = pybind11;
 
 namespace zvec {
 
+py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema);
+
 class ZVecPyDoc {
  public:
   ZVecPyDoc() = delete;

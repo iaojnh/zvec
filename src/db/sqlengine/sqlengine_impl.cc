@@ -695,7 +695,7 @@ Result<DocPtrList> SQLEngineImpl::fill_result(
 Result<GroupResults> SQLEngineImpl::fill_group_by_result(
     const QueryInfo &query_info, arrow::RecordBatchReader *reader,
     bool budgeted) try {
-  detail::ResultMemoryAllowance::Lease memory(
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       budgeted ? &detail::SharedResultMemoryAllowance() : nullptr);
   const std::vector<FieldAndSchema> &output_fields =
       query_info.select_item_schema_ptrs();
@@ -716,17 +716,16 @@ Result<GroupResults> SQLEngineImpl::fill_group_by_result(
       break;
     }
     if (budgeted) {
-      // GroupResult stores Docs by value and its Python API materializes
-      // another set of field/list/Unicode objects. Admit that overlap here,
-      // before copying Arrow payloads; retained backing remains shared with
-      // ordinary Query/Fetch rather than creating a second cache allowance.
+      // Native Doc containers and grouped keys overlap while assembling the
+      // result. Escaping Docs retain this owner; Python conversion admits its
+      // own boxed values separately before creating them.
       detail::QueryResultEstimate materialization;
-      materialization.add(detail::EstimateQueryResult(*record_batch), 4);
-      memory.add(materialization.bytes());
+      materialization.add(detail::EstimateQueryResult(*record_batch), 2);
+      memory->add(materialization.bytes());
     }
     DocPtrList docs(record_batch->num_rows());
     for (int i = 0; i < record_batch->num_rows(); i++) {
-      docs[i] = std::make_shared<Doc>();
+      docs[i] = detail::MakeQueryDocument(budgeted ? memory : nullptr);
     }
     auto status =
         record_batch_to_doc_list(output_fields, *record_batch, docs.begin());
@@ -752,8 +751,8 @@ Result<GroupResults> SQLEngineImpl::fill_group_by_result(
   }
   GroupResults group_results;
   for (auto &kv : group_to_docs) {
-    group_results.emplace_back(
-        GroupResult{std::move(kv.first), std::move(kv.second)});
+    group_results.emplace_back(GroupResult{kv.first, std::move(kv.second),
+                                           budgeted ? memory : nullptr});
   }
   std::sort(group_results.begin(), group_results.end(),
             [&query_info](GroupResult &a, GroupResult &b) {

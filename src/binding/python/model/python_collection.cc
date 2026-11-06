@@ -24,6 +24,7 @@
 #include <zvec/db/doc_iterator.h>
 #include "db/collection_fetch_internal.h"
 #include "db/collection_query_internal.h"
+#include "db/common/query_result_memory.h"
 #include "db/common/result_memory_allowance.h"
 #include "python_doc.h"
 #include "python_fetch_memory.h"
@@ -41,16 +42,22 @@ void reserve_query_results(const DocPtrList &docs,
                            const CollectionSchema &schema,
                            detail::ResultMemoryAllowance::Lease &lease);
 
-void retain_result_memory(
-    const py::object &result,
+py::capsule result_memory_owner(
     const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
-  if (!memory->enabled()) return;
   using Lease = detail::ResultMemoryAllowance::Lease;
   auto holder = std::make_unique<std::shared_ptr<Lease>>(memory);
   py::capsule owner(holder.get(), [](void *p) {
     delete static_cast<std::shared_ptr<Lease> *>(p);
   });
   holder.release();
+  return owner;
+}
+
+void retain_result_memory(
+    const py::object &result,
+    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
+  if (!memory->enabled()) return;
+  auto owner = result_memory_owner(memory);
   try {
     py::module_::import("zvec.model._budgeted_result")
         .attr("_retain_result_memory")(result, owner);
@@ -151,15 +158,20 @@ py::list execute_for_python(const Collection &collection, const Query &query) {
 
 // Transfer ownership of the native buffer without a per-result Python loop.
 template <typename T>
-py::array_t<T> owned_array(std::vector<T> values) {
-  auto buffer = std::make_unique<std::vector<T>>(std::move(values));
-  const auto size = static_cast<py::ssize_t>(buffer->size());
+py::array_t<T> owned_array(std::vector<T> values,
+                           std::shared_ptr<void> memory) {
+  struct Buffer {
+    std::shared_ptr<void> memory;
+    std::vector<T> values;
+  };
+  auto buffer =
+      std::unique_ptr<Buffer>(new Buffer{std::move(memory), std::move(values)});
+  const auto size = static_cast<py::ssize_t>(buffer->values.size());
   auto *ptr = buffer.get();
-  py::capsule owner(ptr,
-                    [](void *p) { delete static_cast<std::vector<T> *>(p); });
+  py::capsule owner(ptr, [](void *p) { delete static_cast<Buffer *>(p); });
   buffer.release();
   return py::array_t<T>({size}, {static_cast<py::ssize_t>(sizeof(T))},
-                        ptr->data(), owner);
+                        ptr->values.data(), owner);
 }
 
 namespace {
@@ -535,6 +547,90 @@ void fetch_chunk_for_python(
 
 }  // namespace
 
+py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema) {
+  const auto forward_fields = schema.forward_fields();
+  const auto vector_fields = schema.vector_fields();
+  if (!detail::DocumentMemoryAccess::budgeted(doc))
+    return ZVecPyDoc::doc_to_tuple_with_fields(doc, forward_fields,
+                                               vector_fields);
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      &forward_result_allowance(), false, kPythonResultBackingQuantum);
+  {
+    py::gil_scoped_release release;
+    PythonResultEstimate estimate;
+    estimate_python_document(doc, forward_fields, vector_fields, estimate);
+    memory->add(estimate.bytes());
+  }
+  py::list holder;
+  holder.append(
+      ZVecPyDoc::doc_to_tuple_with_fields(doc, forward_fields, vector_fields));
+  retain_result_memory(holder, memory);
+  return py::reinterpret_borrow<py::tuple>(holder[0]);
+}
+
+py::object resolve_ids_for_python(const Collection &self, py::handle source) {
+  const bool budgeted = !unwrap_expected(self.options()).enable_mmap_ &&
+                        ailego::MemoryLimitPool::get_instance().capacity();
+  auto *owner = budgeted ? &forward_result_allowance() : nullptr;
+  detail::ResultMemoryAllowance::Lease input_memory(
+      owner, false, kPythonResultBackingQuantum);
+  std::vector<int64_t> ids;
+  // Do not invoke an automatic vector caster before admission. Iterators may
+  // execute caller code, so no materialization mutex is held here.
+  for (auto value : py::reinterpret_borrow<py::iterable>(source)) {
+    auto held = py::reinterpret_borrow<py::object>(value);
+    {
+      py::gil_scoped_release release;
+      input_memory.add(3 * sizeof(int64_t));
+    }
+    try {
+      ids.push_back(py::cast<int64_t>(held));
+    } catch (const py::cast_error &) {
+      throw py::type_error("Internal IDs must be integers");
+    }
+  }
+  Result<ResolvedIdsResult> result;
+  {
+    py::gil_scoped_release release;
+    result = self.resolve_internal_ids(ids);
+  }
+  auto resolved = unwrap_expected(std::move(result));
+  if (resolved.empty()) return py::list();
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      owner, false, kPythonResultBackingQuantum);
+  {
+    py::gil_scoped_release release;
+    PythonResultEstimate estimate;
+    estimate.add(128);
+    estimate.add(3 * sizeof(void *), resolved.size());
+    for (const auto &key : resolved)
+      if (key) estimate.string(*key);
+    memory->add(estimate.bytes());
+  }
+  py::list out(resolved.size());
+  for (size_t i = 0; i < resolved.size(); ++i)
+    out[i] = resolved[i] ? py::object(py::str(*resolved[i]))
+                         : py::object(py::none());
+  if (!budgeted) return out;
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_retain_id_result_memory")(out, result_memory_owner(memory));
+}
+
+py::object group_value_for_python(const GroupResult &group) {
+  if (!group.memory_owner) return py::str(group.group_by_value_);
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      &forward_result_allowance(), false, kPythonResultBackingQuantum);
+  {
+    py::gil_scoped_release release;
+    PythonResultEstimate estimate;
+    estimate.string(group.group_by_value_);
+    memory->add(estimate.bytes());
+  }
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_ResultString")(py::str(group.group_by_value_),
+                             result_memory_owner(memory));
+}
+
 // Only one bounded native result batch is alive at a time. Returned Python
 // payloads keep the allowance alive, without keeping the materialization slot.
 // Release all database locks before taking the
@@ -618,7 +714,7 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
 
 void ZVecPyCollection::Initialize(pybind11::module_ &m) {
   py::class_<GroupResult>(m, "_GroupResult")
-      .def_readonly("group_by_value", &GroupResult::group_by_value_)
+      .def_property_readonly("group_by_value", &group_value_for_python)
       .def_readonly("docs", &GroupResult::docs_);
 
   bind_iterator(m);
@@ -868,10 +964,11 @@ void ZVecPyCollection::bind_dql_methods(
               result = self.query_internal_ids(query, return_scores);
             }
             auto output = unwrap_expected(std::move(result));
-            auto ids = owned_array(std::move(output.ids));
+            auto ids = owned_array(std::move(output.ids), output.memory_owner);
             if (!return_scores) return ids;
-            return py::make_tuple(std::move(ids),
-                                  owned_array(std::move(output.scores)));
+            return py::make_tuple(
+                std::move(ids),
+                owned_array(std::move(output.scores), output.memory_owner));
           },
           py::arg("query"), py::arg("return_scores") = false,
           R"doc(Execute a single query and return internal numeric IDs.
@@ -882,18 +979,8 @@ refinement. Eligible dense queries use the specialized low-latency path;
 other query shapes use regular Query semantics. Use ResolveInternalIds to
 convert IDs to user primary keys.
 )doc")
-      .def(
-          "ResolveInternalIds",
-          [](const Collection &self, const std::vector<int64_t> &ids) {
-            Result<std::vector<std::optional<std::string>>> result;
-            {
-              py::gil_scoped_release release;
-              result = self.resolve_internal_ids(ids);
-            }
-            return unwrap_expected(std::move(result));
-          },
-          py::arg("ids"),
-          R"doc(Convert internal numeric IDs to user primary keys.
+      .def("ResolveInternalIds", &resolve_ids_for_python, py::arg("ids"),
+           R"doc(Convert internal numeric IDs to user primary keys.
 
 Positions are preserved. Padding ID -1 and IDs that are deleted or unknown
 are returned as None.

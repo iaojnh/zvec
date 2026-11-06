@@ -33,7 +33,7 @@ def vector_for(kind, dimension, row):
     return values
 
 
-def build(path, kind, mmap, dimension, count):
+def build(path, kind, mmap, dimension, count, *, payload_size=0):
     zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=1)
     schema = zvec.CollectionSchema(
         name="result_budget",
@@ -61,7 +61,7 @@ def build(path, kind, mmap, dimension, count):
         docs = [
             zvec.Doc(
                 id=str(i),
-                fields={"payload": "中文🙂" + str(i)},
+                fields={"payload": "x" * payload_size + "中文🙂" + str(i)},
                 vectors={"vector": vector_for(kind, dimension, i)},
             )
             for i in range(first, min(first + 8, count))
@@ -341,14 +341,181 @@ def test_fetch_input_and_workspace_admission(tmp_path, mode):
     run_worker(mode, path, "VECTOR_FP32", False, 64, 8)
 
 
+def verify_id_results(path, kind, mmap, dimension, count):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    with pytest.raises(MemoryError):
+        coll.resolve_internal_ids([-1] * 1_000_000)
+    assert coll.resolve_internal_ids([]) == []
+    assert coll.resolve_internal_ids([-1, 0, 9999]) == [None, "0", None]
+    held = []
+    rejected = False
+    query = zvec.Query("vector", vector=vector_for(kind, dimension, 0))
+    for _ in range(32):
+        try:
+            ids, scores = coll.query_internal_ids(
+                query, topk=100_000, return_scores=True
+            )
+        except MemoryError:
+            rejected = True
+            break
+        # A view of only the scores must retain the shared native owner.
+        held.append(scores[::2])
+        del ids, scores
+    assert rejected, "Caller-held arrays must participate in admission"
+    coll.close()
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    with pytest.raises(MemoryError):
+        coll.query_internal_ids(query, topk=100_000, return_scores=True)
+    held.clear()
+    assert coll.query_internal_ids(query, topk=100_000).shape == (100_000,)
+
+    # The outer sequence needs an owner even when every element is None.
+    held = []
+    rejected = False
+    for _ in range(32):
+        try:
+            held.append(coll.resolve_internal_ids([-1] * 20_000))
+        except MemoryError:
+            rejected = True
+            break
+    assert rejected, "Retained all-missing ID results must consume admission"
+    held.clear()
+    assert coll.resolve_internal_ids([-1] * 20_000) == [None] * 20_000
+    for _ in range(32):
+        try:
+            # An extracted key keeps the admission after its outer list dies.
+            held.append(coll.resolve_internal_ids([0] * 20_000)[0])
+        except MemoryError:
+            break
+    else:
+        pytest.fail("Extracted resolved keys must retain admission")
+    assert all(value == "0" for value in held)
+    held.clear()
+
+    def reentrant_ids():
+        yield coll.query_internal_ids(query, topk=1)[0]
+        yield -1
+
+    assert coll.resolve_internal_ids(reentrant_ids())[1] is None
+    with pytest.raises(TypeError):
+        coll.resolve_internal_ids([object()])
+    assert coll.resolve_internal_ids([0]) == ["0"]
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        assert all(
+            result == ["0", None]
+            for result in workers.map(
+                lambda _: coll.resolve_internal_ids([0, -1]), range(8)
+            )
+        )
+    coll.close()
+
+
+def verify_document_results(path, kind, mmap, dimension, count, *, grouped):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    held = []
+    rejected = False
+
+    def take_results():
+        if grouped:
+            groups = coll.group_by_query(
+                zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
+                "payload",
+                group_count=count,
+                topk_per_group=1,
+                include_vector=True,
+            )
+            return [doc.vector("vector") for group in groups for doc in group.docs]
+        with coll.iter_docs() as docs:
+            return [doc.vector("vector") for doc in docs]
+
+    for _ in range(32):
+        try:
+            held.extend(take_results())
+        except MemoryError:
+            rejected = True
+            break
+    assert rejected, "Escaping Python vectors must retain result admission"
+    assert held
+    coll.close()
+    assert len(held[0]) == dimension
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    with pytest.raises(MemoryError):
+        take_results()
+    held.clear()
+    assert len(take_results()) == count
+    coll.close()
+
+
+def verify_iterator_results(*args):
+    verify_document_results(*args, grouped=False)
+
+
+def verify_group_results(*args):
+    verify_document_results(*args, grouped=True)
+
+
+@pytest.mark.parametrize("mode", ["id_results", "iterator_results", "group_results"])
+def test_remaining_result_paths_hold_and_release_budget(tmp_path, mode):
+    path = tmp_path / mode
+    run_worker("build", path, "VECTOR_FP32", False, 1024, 64)
+    run_worker(mode, path, "VECTOR_FP32", False, 1024, 64)
+
+
+def build_group_keys(*args):
+    build(*args, payload_size=128 * 1024)
+
+
+def verify_group_keys(path, kind, mmap, dimension, count):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+
+    def keys():
+        return [
+            group.group_by_value
+            for group in coll.group_by_query(
+                zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
+                "payload",
+                group_count=count,
+                topk_per_group=1,
+                output_fields=[],
+            )
+        ]
+
+    held = []
+    for _ in range(64):
+        try:
+            held.extend(keys())
+        except MemoryError:
+            break
+    else:
+        pytest.fail("Extracted group keys must retain admission")
+    assert held and all(len(key) >= 128 * 1024 for key in held)
+    held.clear()
+    assert len(keys()) == count
+    coll.close()
+
+
+def test_group_keys_hold_and_release_budget(tmp_path):
+    path = tmp_path / "group_keys"
+    run_worker("build_group_keys", path, "VECTOR_FP32", False, 8, 4)
+    run_worker("group_keys", path, "VECTOR_FP32", False, 8, 4)
+
+
 if __name__ == "__main__":
     action, target, vector_kind, use_mmap, dim, rows = sys.argv[1:]
     worker = {
         "build": build,
+        "build_group_keys": build_group_keys,
+        "group_keys": verify_group_keys,
         "verify": verify,
         "retained": verify_retained,
         "exception": verify_exception,
         "inputs": verify_fetch_inputs,
         "iterables": verify_fetch_iterables,
+        "id_results": verify_id_results,
+        "iterator_results": verify_iterator_results,
+        "group_results": verify_group_results,
     }[action]
     worker(Path(target), vector_kind, bool(int(use_mmap)), int(dim), int(rows))

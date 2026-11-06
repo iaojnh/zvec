@@ -319,6 +319,7 @@ int DiskAnnBuilderEntity::reserve_space(uint32_t docs,
 }
 
 int DiskAnnBuilderEntity::add_vector(diskann_key_t key, const void *vec) try {
+  if (neighbors_compacted_) return IndexError_NoReady;
   if (!vec) return IndexError_ReadData;
   if (buffered_state_) {
     auto &state = *buffered_state_;

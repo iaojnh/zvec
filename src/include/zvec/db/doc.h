@@ -27,6 +27,10 @@
 
 namespace zvec {
 
+namespace detail {
+struct DocumentMemoryAccess;
+}
+
 using float16_t = ailego::Float16;
 
 class ZVEC_API Doc {
@@ -333,6 +337,10 @@ class ZVEC_API Doc {
   struct ValueEqual;
 
  private:
+  friend struct detail::DocumentMemoryAccess;
+  // Keep admission through native result moves, including Docs stored by
+  // value in grouped results. Payload members are destroyed before this owner.
+  std::shared_ptr<void> memory_owner_;
   std::string pk_;
   float score_{0.0f};
   uint64_t doc_id_{0};

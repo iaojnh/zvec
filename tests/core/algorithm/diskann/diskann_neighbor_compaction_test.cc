@@ -147,7 +147,7 @@ class DiskAnnNeighborCompaction : public testing::Test {
     entity.block_compressed_data().assign(count, 0);
   }
 
-  std::vector<diskann_id_t> neighbors(size_t id) const {
+  ailego::BudgetedVector<diskann_id_t> neighbors(size_t id) const {
     auto row = entity.get_neighbors(id);
     return {row.second, row.second + row.first};
   }
@@ -156,7 +156,7 @@ class DiskAnnNeighborCompaction : public testing::Test {
 TEST_F(DiskAnnNeighborCompaction, PreservesOverlappingRowsAndReturnsPages) {
   constexpr size_t count = 8192;
   prepare(count);
-  std::vector<std::vector<diskann_id_t>> expected(count);
+  std::vector<ailego::BudgetedVector<diskann_id_t>> expected(count);
   for (size_t id = 0; id < count; ++id) {
     // Include zero-degree nodes and dense rows to exercise overlapping moves.
     for (size_t j = 0; j < id % 101; ++j) {
@@ -181,7 +181,7 @@ TEST_F(DiskAnnNeighborCompaction, PreservesOverlappingRowsAndReturnsPages) {
   prepare(3, 4);
   ASSERT_EQ(0, entity.set_neighbors(0, {2, 1}));
   ASSERT_EQ(0, entity.compact_neighbors());
-  EXPECT_EQ((std::vector<diskann_id_t>{2, 1}), neighbors(0));
+  EXPECT_EQ((ailego::BudgetedVector<diskann_id_t>{2, 1}), neighbors(0));
 }
 
 TEST_F(DiskAnnNeighborCompaction, ValidatesAllRowsBeforeMovingAnyEdges) {
@@ -191,24 +191,26 @@ TEST_F(DiskAnnNeighborCompaction, ValidatesAllRowsBeforeMovingAnyEdges) {
   const auto *first = entity.get_neighbors(0).second;
   EXPECT_EQ(IndexError_InvalidLength, entity.compact_neighbors());
   EXPECT_EQ(first, entity.get_neighbors(0).second);
-  EXPECT_EQ((std::vector<diskann_id_t>{4, 2, 1}), neighbors(0));
-  EXPECT_EQ((std::vector<diskann_id_t>{0, 1, 2, 3, 4}), neighbors(5));
+  EXPECT_EQ((ailego::BudgetedVector<diskann_id_t>{4, 2, 1}), neighbors(0));
+  EXPECT_EQ((ailego::BudgetedVector<diskann_id_t>{0, 1, 2, 3, 4}),
+            neighbors(5));
   ASSERT_EQ(0, entity.set_neighbors(5, {0, 1, 2, 3}));
   ASSERT_EQ(0, entity.compact_neighbors());
-  EXPECT_EQ((std::vector<diskann_id_t>{0, 1, 2, 3}), neighbors(5));
+  EXPECT_EQ((ailego::BudgetedVector<diskann_id_t>{0, 1, 2, 3}), neighbors(5));
 }
 
 TEST_F(DiskAnnNeighborCompaction, RejectsWritesOutsideReservedRowsAndSlots) {
   prepare(2, 4);
   for (size_t i = 0; i < 5; ++i) ASSERT_EQ(0, entity.add_neighbor(0, 1));
   EXPECT_EQ(IndexError_InvalidLength, entity.add_neighbor(0, 1));
-  EXPECT_EQ(IndexError_InvalidLength,
-            entity.set_neighbors(0, std::vector<diskann_id_t>(6, 1)));
-  EXPECT_EQ(IndexError_InvalidLength, entity.set_neighbors(2, {0}));
-  EXPECT_EQ(IndexError_InvalidLength, entity.add_neighbor(2, 0));
-  EXPECT_EQ(IndexError_InvalidLength, entity.add_vector(6, holder.get()));
+  EXPECT_EQ(
+      IndexError_InvalidArgument,
+      entity.set_neighbors(0, ailego::BudgetedVector<diskann_id_t>(6, 1)));
+  EXPECT_EQ(IndexError_InvalidArgument, entity.set_neighbors(2, {0}));
+  EXPECT_EQ(IndexError_InvalidArgument, entity.add_neighbor(2, 0));
+  EXPECT_EQ(IndexError_InvalidArgument, entity.add_vector(6, holder.get()));
   EXPECT_EQ(2U, entity.doc_cnt());
-  EXPECT_EQ(std::vector<diskann_id_t>(5, 1), neighbors(0));
+  EXPECT_EQ(ailego::BudgetedVector<diskann_id_t>(5, 1), neighbors(0));
   EXPECT_TRUE(neighbors(1).empty());
 }
 
@@ -218,7 +220,7 @@ TEST_F(DiskAnnNeighborCompaction,
   prepare(count);
   const size_t empty_bytes = entity.neighbor_memory_size();
   EXPECT_LT(empty_bytes, 2u * 1024u * 1024u);
-  std::vector<diskann_id_t> expected;
+  ailego::BudgetedVector<diskann_id_t> expected;
   for (uint32_t i = 0; i < 130; ++i) {
     expected.push_back(i + 1);
     ASSERT_EQ(0, entity.add_neighbor(0, expected.back()));
@@ -244,8 +246,8 @@ TEST_F(DiskAnnNeighborCompaction, ConcurrentGrowthShrinkAndChunkReuse) {
     workers.emplace_back([&, thread]() {
       for (size_t iteration = 0; iteration < 30; ++iteration) {
         for (size_t id = thread; id < count; id += 4) {
-          std::vector<diskann_id_t> row((iteration * 17 + id) % 100,
-                                        static_cast<diskann_id_t>(id));
+          ailego::BudgetedVector<diskann_id_t> row(
+              (iteration * 17 + id) % 100, static_cast<diskann_id_t>(id));
           ASSERT_EQ(0, entity.set_neighbors(id, row));
           ASSERT_EQ(0, entity.add_neighbor(id, (id + 1) % count));
           row.push_back((id + 1) % count);
@@ -260,7 +262,7 @@ TEST_F(DiskAnnNeighborCompaction, ConcurrentGrowthShrinkAndChunkReuse) {
       ASSERT_EQ(0, entity.set_neighbors(id, {1, 2, 3}));
     }
   }
-  std::vector<std::vector<diskann_id_t>> expected(count);
+  std::vector<ailego::BudgetedVector<diskann_id_t>> expected(count);
   for (size_t id = 0; id < count; ++id) expected[id] = neighbors(id);
   ASSERT_EQ(0, entity.compact_neighbors());
   for (size_t id = 0; id < count; ++id) ASSERT_EQ(expected[id], neighbors(id));
@@ -270,8 +272,9 @@ class FailedNeighborEntity : public DiskAnnBuilderEntity {
  public:
   bool fail_set{false};
   bool fail_append{false};
-  int set_neighbors(diskann_id_t id,
-                    const std::vector<diskann_id_t> &neighbors) override {
+  int set_neighbors(
+      diskann_id_t id,
+      const ailego::BudgetedVector<diskann_id_t> &neighbors) override {
     return fail_set ? IndexError_NoMemory
                     : DiskAnnBuilderEntity::set_neighbors(id, neighbors);
   }
@@ -314,7 +317,8 @@ TEST(DiskAnnNeighborPoolErrors, AlgorithmPropagatesAllocationFailures) {
 }
 
 TEST_F(DiskAnnNeighborCompaction, HandlesEmptyGraphsAndZeroDegreeNodes) {
-  prepare(0);
+  ASSERT_EQ(0, entity.init(meta, 4, 4, 0, 1));
+  EXPECT_EQ(IndexError_InvalidArgument, entity.reserve_space(0));
   ASSERT_EQ(0, entity.compact_neighbors());
   ASSERT_EQ(0, entity.compact_neighbors());
   prepare(128);
@@ -328,6 +332,15 @@ TEST_F(DiskAnnNeighborCompaction, HandlesEmptyGraphsAndZeroDegreeNodes) {
 
 TEST_F(DiskAnnNeighborCompaction, DumpIsByteIdenticalAndCanRetryAfterFailure) {
   prepare(128, 8);
+  auto quantizer = IndexFactory::CreateQuantizer("PqInt8Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  ailego::Params params;
+  params.set("num_chunk", uint32_t{1});
+  params.set("thread_count", uint32_t{1});
+  params.set("precompute_sdc", false);
+  ASSERT_EQ(0, quantizer->init(meta, params));
+  ASSERT_EQ(0, quantizer->train(holder));
+  entity.set_pq_quantizer(quantizer);
   // Historical build degree must still control sector packing after compaction.
   ASSERT_EQ(0, entity.set_neighbors(0, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
   ASSERT_EQ(0, entity.set_neighbors(0, {10, 8, 6}));
@@ -345,7 +358,7 @@ TEST_F(DiskAnnNeighborCompaction, DumpIsByteIdenticalAndCanRetryAfterFailure) {
   ASSERT_EQ(0, entity.dump(holder, meta, packed));
   EXPECT_EQ(original->bytes, packed->bytes);
   EXPECT_EQ(original->segments, packed->segments);
-  EXPECT_EQ((std::vector<diskann_id_t>{10, 8, 6}), neighbors(0));
+  EXPECT_EQ((ailego::BudgetedVector<diskann_id_t>{10, 8, 6}), neighbors(0));
 }
 
 }  // namespace

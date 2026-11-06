@@ -228,6 +228,7 @@ class FlatStreamerContext : public IndexStreamer::Context {
 
   void reset() override {
     result_heap_.release();
+    search_scratch_.batch_topk.release();
     group_topk_heaps_.clear();
     vector_source_ = nullptr;
     for (auto &it : results_) {

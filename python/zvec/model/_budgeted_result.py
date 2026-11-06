@@ -100,3 +100,13 @@ def _retain_result_memory(results, owner):
     else:
         for index, document in enumerate(results):
             results[index] = _retain_document(document, owner)
+
+
+def _retain_id_result_memory(values, owner):
+    return _ResultList(
+        (
+            _ResultString(value, owner) if value is not None else None
+            for value in values
+        ),
+        owner,
+    )

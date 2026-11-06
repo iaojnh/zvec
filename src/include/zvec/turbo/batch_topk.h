@@ -66,6 +66,21 @@ class BatchTopK {
   // Call before consuming size()/result(); further pushes and repeated finish
   // are valid. result(i) requires i < size() after finish().
   ZVEC_TURBO_API void finish();
+  // Invalidate results and release retained dynamic scratch on context reset.
+  // The next reset() selects and initializes the working layout again.
+  void release() noexcept {
+    decltype(allocated_entries_)().swap(allocated_entries_);
+    decltype(allocated_distances_)().swap(allocated_distances_);
+    decltype(allocated_ids_)().swap(allocated_ids_);
+    decltype(allocated_masks_)().swap(allocated_masks_);
+    allocated_aos_capacity_ = allocated_soa_capacity_ = 0;
+    entries_ = inline_entries_.data();
+    distances_ = inline_distances_.data();
+    ids_ = inline_ids_.data();
+    masks_ = inline_masks_.data();
+    capacity_ = limit_ = size_ = 0;
+    needs_finish_ = false;
+  }
   size_t size() const {
     return size_;
   }

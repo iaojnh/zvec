@@ -147,7 +147,7 @@ class CollectionImpl : public Collection {
   Result<InternalIdsQueryResult> query_internal_ids(
       const SearchQuery &query, bool return_scores) const override;
 
-  Result<std::vector<std::optional<std::string>>> resolve_internal_ids(
+  Result<ResolvedIdsResult> resolve_internal_ids(
       const std::vector<int64_t> &ids) const override;
 
   Result<GroupResults> group_by_query(
@@ -1901,7 +1901,7 @@ void CollectionImpl::prepare_query_internal_ids() {
 }
 
 Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids_fallback(
-    const SearchQuery &query, bool return_scores) const {
+    const SearchQuery &query, bool return_scores) const try {
   SearchQuery fallback = query;
   fallback.include_vector_ = false;
   fallback.include_doc_id_ = true;
@@ -1913,6 +1913,13 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids_fallback(
 
   const size_t topk = static_cast<size_t>(query.topk_);
   InternalIdsQueryResult out;
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  detail::QueryResultEstimate result_bytes;
+  result_bytes.add(256);
+  result_bytes.add(sizeof(int64_t) + sizeof(float), static_cast<size_t>(topk));
+  memory->add(result_bytes.bytes());
+  out.memory_owner = options_.enable_mmap_ ? nullptr : memory;
   out.ids.resize(topk, int64_t{-1});
   if (return_scores) {
     out.scores.resize(topk, std::numeric_limits<float>::quiet_NaN());
@@ -1925,10 +1932,14 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids_fallback(
     if (return_scores) out.scores[i] = doc->score();
   }
   return out;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient shared budget for internal-ID results"));
 }
 
 Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids(
-    const SearchQuery &query, bool return_scores) const {
+    const SearchQuery &query, bool return_scores) const try {
   std::shared_lock lock(schema_handle_mtx_);
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
@@ -1962,6 +1973,13 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids(
   const auto &segments = read_only_segments_;
   const auto &indexers = field->second.indexers;
   InternalIdsQueryResult out;
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  detail::QueryResultEstimate result_bytes;
+  result_bytes.add(256);
+  result_bytes.add(sizeof(int64_t) + sizeof(float), static_cast<size_t>(topk));
+  memory->add(result_bytes.bytes());
+  out.memory_owner = options_.enable_mmap_ ? nullptr : memory;
   out.ids.resize(static_cast<size_t>(topk), int64_t{-1});
   // Segment merging needs scores even when the caller only requests IDs.
   if (return_scores || segments.size() > 1) {
@@ -1989,8 +2007,15 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids(
   vector_column_params::VectorData vector_data;
   vector_data.vector = vector_column_params::DenseVector{query_vector};
 
+  detail::ResultMemoryAllowance::Lease merge_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
   std::vector<std::pair<float, int64_t>> candidates;
   if (segments.size() > 1) {
+    detail::QueryResultEstimate workspace;
+    workspace.add(sizeof(std::pair<float, int64_t>), static_cast<size_t>(topk));
+    detail::QueryResultEstimate all_segments;
+    all_segments.add(workspace.bytes(), segments.size());
+    merge_memory.add(all_segments.bytes());
     candidates.reserve(static_cast<size_t>(topk) * segments.size());
   }
   bool searched = false;
@@ -2043,10 +2068,14 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids(
     out.scores.clear();
   }
   return out;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient shared budget for internal-ID results"));
 }
 
-Result<std::vector<std::optional<std::string>>>
-CollectionImpl::resolve_internal_ids(const std::vector<int64_t> &ids) const {
+Result<ResolvedIdsResult> CollectionImpl::resolve_internal_ids(
+    const std::vector<int64_t> &ids) const try {
   std::shared_lock lock(schema_handle_mtx_);
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS_EXPECTED(closed_, false);
@@ -2055,7 +2084,15 @@ CollectionImpl::resolve_internal_ids(const std::vector<int64_t> &ids) const {
         "resolve_internal_ids requires a read-only collection"));
   }
 
-  std::vector<std::optional<std::string>> resolved;
+  if (ids.empty()) return ResolvedIdsResult{};
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  detail::QueryResultEstimate result_bytes;
+  result_bytes.add(256);
+  result_bytes.add(sizeof(std::optional<std::string>), ids.size());
+  memory->add(result_bytes.bytes());
+  ResolvedIdsResult resolved;
+  resolved.memory_owner = options_.enable_mmap_ ? nullptr : memory;
   resolved.reserve(ids.size());
   const std::optional<std::vector<std::string>> no_fields =
       std::vector<std::string>{};
@@ -2083,9 +2120,17 @@ CollectionImpl::resolve_internal_ids(const std::vector<int64_t> &ids) const {
       resolved.emplace_back(std::nullopt);
       continue;
     }
-    resolved.emplace_back(doc->pk());
+    detail::QueryResultEstimate key_bytes;
+    key_bytes.add(64);
+    key_bytes.add(doc->pk_ref().size());
+    memory->add(key_bytes.bytes());
+    resolved.emplace_back(doc->pk_ref());
   }
   return resolved;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient shared budget for resolved IDs"));
 }
 
 Result<DocPtrList> CollectionImpl::query(const MultiQuery &query) const {

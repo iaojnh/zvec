@@ -63,8 +63,8 @@ Status resolve_reader_columns(DocIterator::Impl *impl,
 // Materialize rows [begin, end) of the current batch column by column.
 // Windows (not batches) bound doc memory, because a Parquet ReadNext
 // returns a whole row group (up to ~1M rows).
-Status materialize_window(DocIterator::Impl *impl, int64_t begin,
-                          int64_t *end) try {
+Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
+                               int64_t *end) try {
   const auto &batch = *impl->current_batch;
   int64_t num_rows = *end - begin;
   impl->batch_docs.clear();
@@ -137,8 +137,8 @@ Status materialize_window(DocIterator::Impl *impl, int64_t begin,
               "vector fetch failed, field: ", field->name(), ": ",
               fetched.error().message());
         }
-        auto s = ConvertVectorDataBufferToDocField(field, fetched.value(),
-                                                   impl->batch_docs[i].get());
+        auto s = ConvertVectorDataBufferToDocField(
+            field, fetched.value(), impl->batch_docs[i].get(), memory.get());
         if (!s.ok()) {
           return s;
         }
@@ -150,6 +150,19 @@ Status materialize_window(DocIterator::Impl *impl, int64_t begin,
 } catch (const std::bad_alloc &) {
   return Status(StatusCode::RESOURCE_EXHAUSTED,
                 "Insufficient shared budget for iterator result window");
+}
+
+Status materialize_window(DocIterator::Impl *impl, int64_t begin,
+                          int64_t *end) {
+  while (true) {
+    auto status = materialize_window_once(impl, begin, end);
+    if (status.code() != StatusCode::RESOURCE_EXHAUSTED || *end - begin <= 1)
+      return status;
+    // Vector payloads are fetched separately from the Arrow columns. Retry
+    // a smaller window only after releasing every partially admitted Doc.
+    impl->batch_docs.clear();
+    *end = begin + (*end - begin) / 2;
+  }
 }
 
 }  // namespace

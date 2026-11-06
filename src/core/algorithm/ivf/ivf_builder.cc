@@ -870,7 +870,7 @@ int IVFBuilder::prepare_trainer_params(ailego::Params &params) {
     auto level_params = cluster_params_[i - 1];
     const std::string scratch =
         params_.get_as_string(PARAM_IVF_BUILDER_BUILD_STORAGE_PATH);
-    if (!scratch.empty() && !holder_->borrowed()) {
+    if (!scratch.empty()) {
       level_params.set(OPTKMEANS_CLUSTER_BUFFERED_STORAGE_PATH,
                        scratch + ".train" + std::to_string(i));
     }

@@ -923,15 +923,23 @@ int FlatContiguousStreamerEntity::build_contiguous_memory() try {
   }
   storage->position_to_key.assign(count, static_cast<uint64_t>(kInvalidKey));
 
+  size_t position = 0;
   for (uint32_t id = 0; id < count; ++id) {
     IndexStorage::MemoryBlock block;
     uint64_t vector_key = kInvalidKey;
     int ret = 0;
     if (use_key_info_map()) {
       vector_key = key(id);
+      // Deleted rows are absent from the rebuilt key map. Keep an invalid
+      // key slot for its established filtering statistics, without reading it.
+      if (vector_key == kInvalidKey) {
+        ++position;
+        continue;
+      }
+      if (!contains_key(vector_key)) continue;
       ret = FlatStreamerEntity::get_vector_by_key(vector_key, block);
       if (ret == 0) {
-        storage->key_to_position[vector_key] = id;
+        storage->key_to_position[vector_key] = position;
       }
     } else {
       ret = get_vector_by_position(id, block);
@@ -943,10 +951,12 @@ int FlatContiguousStreamerEntity::build_contiguous_memory() try {
       LOG_ERROR("Failed to load Flat vector into contiguous memory, id=%u", id);
       return IndexError_ReadData;
     }
-    std::memcpy(raw + static_cast<size_t>(id) * stride, block.data(),
-                vector_size);
-    storage->position_to_key[id] = vector_key;
+    std::memcpy(raw + position * stride, block.data(), vector_size);
+    storage->position_to_key[position++] = vector_key;
   }
+
+  storage->vector_count = position;
+  storage->position_to_key.resize(position);
 
   std::atomic_store_explicit(
       &contiguous_storage_,
@@ -1699,7 +1709,7 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
   // External vectors belong to the source. Persist only IDs and the header;
   // internal vectors keep the atomic batched write including their payload.
   if (!segment->write_batch(writes + (use_external_vector_ ? 1 : 0),
-                             use_external_vector_ ? 2 : 3))
+                            use_external_vector_ ? 2 : 3))
     return IndexError_WriteData;
 
   VectorLocation loc(block.segment_id, false, vector_off);

@@ -208,6 +208,11 @@ class FlatStreamerEntity {
     }
   }
 
+  bool contains_key(uint64_t key) const {
+    std::shared_lock<ailego::SharedMutex> lock(*key_info_map_lock_);
+    return key_info_map_.find(key) != key_info_map_.end();
+  }
+
   size_t registered_key_count() const {
     ailego::ReadLock lock(*key_info_map_lock_);
     std::lock_guard<ailego::ReadLock> guard(lock);
@@ -606,8 +611,8 @@ class FlatStreamerEntity {
   KeyMap key_info_map_{};
   // Only external sources need an ordered directory for bounded random reads.
   // Mapped backing stays charged until the directory storage is released.
-  std::vector<uint64_t, ailego::RetainedBlockAllocator<uint64_t>> external_keys_{
-      key_info_map_.get_allocator()};
+  std::vector<uint64_t, ailego::RetainedBlockAllocator<uint64_t>>
+      external_keys_{key_info_map_.get_allocator()};
 
   // Reserve both bucket capacity and the node before publishing vector bytes.
   // Failed admission leaves the lookup table unchanged and releases the node.
@@ -615,7 +620,8 @@ class FlatStreamerEntity {
     if (!use_key_info_map_) return {};
     std::unique_lock<ailego::SharedMutex> lock(*key_info_map_lock_);
     if (key_info_map_.find(key) != key_info_map_.end()) return {};
-    if (use_external_vector_ && external_keys_.size() == external_keys_.capacity())
+    if (use_external_vector_ &&
+        external_keys_.size() == external_keys_.capacity())
       external_keys_.reserve(std::max(size_t{8}, external_keys_.size() * 2));
     if (key_info_map_.size() + 1 >
         key_info_map_.bucket_count() * key_info_map_.max_load_factor())

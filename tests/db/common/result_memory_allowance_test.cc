@@ -392,6 +392,32 @@ TEST_F(ResultMemoryAllowanceTest, QueryDocumentKeepsAdmissionUntilLastOwner) {
   EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
 }
 
+TEST_F(ResultMemoryAllowanceTest, MovingDocumentByValueRetainsAdmission) {
+  ResultMemoryAllowance allowance;
+  auto memory = std::make_shared<ResultMemoryAllowance::Lease>(&allowance);
+  memory->add(kMiB);
+  auto source = MakeQueryDocument(memory);
+  source->set_pk("grouped");
+  std::vector<Doc> values;
+  values.push_back(std::move(*source));
+  memory.reset();
+  source.reset();
+  EXPECT_EQ(kMiB, allowance.active_bytes());
+  {
+    Doc extracted = std::move(values.front());
+    values.clear();
+    EXPECT_EQ("grouped", extracted.pk_ref());
+    EXPECT_EQ(kMiB, allowance.active_bytes());
+  }
+  EXPECT_EQ(0u, allowance.active_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest,
+       DisabledDocumentLeaseDoesNotEnablePythonBudget) {
+  auto disabled = std::make_shared<ResultMemoryAllowance::Lease>(nullptr);
+  EXPECT_FALSE(DocumentMemoryAccess::budgeted(*MakeQueryDocument(disabled)));
+}
+
 TEST_F(ResultMemoryAllowanceTest, QueryEstimateCountsOnlySelectedStringSlice) {
   arrow::StringBuilder builder;
   ASSERT_TRUE(builder.Append(std::string(4096, 'x')).ok());
