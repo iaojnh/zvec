@@ -11,14 +11,13 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #if defined(__linux__)
 #include <link.h>
+#include <sys/auxv.h>
 #include <unistd.h>
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>
-#if TARGET_OS_OSX
 #include <mach-o/loader.h>
 #include <dlfcn.h>
 #include <unistd.h>
-#endif
 #elif defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -29,6 +28,13 @@
 namespace zvec::detail {
 
 #if defined(__linux__)
+inline bool IsMainElfImage(const dl_phdr_info &image,
+                           const ElfW(Phdr) *main_headers) {
+  // Bionic uses the executable path; glibc normally reports an empty name.
+  return (main_headers && image.dlpi_phdr == main_headers) ||
+         !image.dlpi_name || !*image.dlpi_name;
+}
+
 // Load segments are ordered by virtual address. Count only pages covered by the
 // image, excluding gaps. Overlapping segments on the same page count once;
 // p_memsz includes zero-initialized BSS.
@@ -66,7 +72,7 @@ inline bool ElfLoadImageBytes(const ElfW(Phdr) * headers, size_t count,
 }
 #endif
 
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if defined(__APPLE__)
 // Parse only the bounded header/load-command area. Use memcpy so malformed or
 // unaligned test inputs cannot cause an unaligned structure access. This counts
 // potentially resident image capacity, not an RSS sample or the file's size.
@@ -169,11 +175,13 @@ inline size_t NativeImageBytesForAddress(const void *anchor) {
   struct Search {
     uintptr_t address;
     size_t page_size;
+    const ElfW(Phdr) *main_headers;
     size_t bytes{0};
     bool found{false};
     bool valid{false};
   } search{reinterpret_cast<uintptr_t>(anchor),
-           static_cast<size_t>(native_page_size)};
+           static_cast<size_t>(native_page_size),
+           reinterpret_cast<const ElfW(Phdr) *>(::getauxval(AT_PHDR))};
   dl_iterate_phdr(
       [](dl_phdr_info *info, size_t, void *opaque) noexcept {
         auto &result = *static_cast<Search *>(opaque);
@@ -185,7 +193,7 @@ inline size_t NativeImageBytesForAddress(const void *anchor) {
               relative - header.p_vaddr >= header.p_memsz)
             continue;
           result.found = true;
-          if (!info->dlpi_name || !*info->dlpi_name) {
+          if (IsMainElfImage(*info, result.main_headers)) {
             result.valid = true;
           } else {
             result.valid = ElfLoadImageBytes(info->dlpi_phdr, info->dlpi_phnum,
@@ -198,7 +206,7 @@ inline size_t NativeImageBytesForAddress(const void *anchor) {
       &search);
   if (!search.found || !search.valid) throw std::bad_alloc();
   return search.bytes;
-#elif defined(__APPLE__) && TARGET_OS_OSX
+#elif defined(__APPLE__)
   const long native_page_size = sysconf(_SC_PAGESIZE);
   Dl_info owner{};
   if (!anchor || native_page_size <= 0 || !dladdr(anchor, &owner) ||

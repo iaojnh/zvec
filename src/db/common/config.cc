@@ -15,10 +15,12 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/db/config.h>
 #include <zvec/db/status.h>
 #include "db/common/constants.h"
 #include "db/common/global_resource.h"
+#include "db/common/mobile_memory.h"
 #include "cgroup_util.h"
 #include "global_resource.h"
 #include "glogger.h"
@@ -32,8 +34,11 @@ static void ExitLogHandler() {
 }
 
 GlobalConfig::ConfigData::ConfigData()
-    : memory_limit_bytes(CgroupUtil::get_memory_limit() *
-                         DEFAULT_MEMORY_LIMIT_RATIO),
+    : memory_limit_bytes(detail::kMobileMemoryPolicy
+                             ? detail::MobileDefaultMemoryLimit(
+                                   CgroupUtil::get_memory_limit())
+                             : CgroupUtil::get_memory_limit() *
+                                   DEFAULT_MEMORY_LIMIT_RATIO),
       log_config(std::make_shared<ConsoleLogConfig>()),
       query_thread_count(CgroupUtil::get_cpu_limit()),
       query_thread_binding(false),
@@ -44,9 +49,12 @@ GlobalConfig::ConfigData::ConfigData()
       optimize_thread_binding(false) {}
 
 Status GlobalConfig::validate(const ConfigData &config) const {
-  if (config.memory_limit_bytes < MIN_MEMORY_LIMIT_BYTES) {
+  const uint64_t minimum = detail::kMobileMemoryPolicy
+                               ? detail::kMobileMinimumMemoryLimit
+                               : MIN_MEMORY_LIMIT_BYTES;
+  if (config.memory_limit_bytes < minimum) {
     return Status::InvalidArgument("memory_limit_bytes must be greater than ",
-                                   MIN_MEMORY_LIMIT_BYTES);
+                                   minimum);
   }
 
   if (config.memory_limit_bytes > CgroupUtil::get_memory_limit()) {
@@ -246,6 +254,21 @@ Status GlobalConfig::initialize(const ConfigData &config) {
 
 uint64_t GlobalConfig::memory_limit_bytes() const noexcept {
   return config_snapshot()->memory_limit_bytes;
+}
+
+Status GlobalConfig::set_memory_pressure(MemoryPressure level) {
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  Pressure pressure;
+  switch (level) {
+    case MemoryPressure::kNormal: pressure = Pressure::kNormal; break;
+    case MemoryPressure::kBackground: pressure = Pressure::kBackground; break;
+    case MemoryPressure::kCritical: pressure = Pressure::kCritical; break;
+    default: return Status::InvalidArgument("Invalid memory pressure level");
+  }
+  if (!GlobalResource::Instance().initialized())
+    return Status::FailedPrecondition("Global resources are not initialized");
+  ailego::MemoryLimitPool::get_instance().set_memory_pressure(pressure);
+  return Status::OK();
 }
 
 FACTORY_REGISTER_LOGGER(AppendLogger);

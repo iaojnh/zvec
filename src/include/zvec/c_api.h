@@ -741,6 +741,22 @@ ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_shutdown(void);
  */
 ZVEC_EXPORT bool ZVEC_CALL zvec_is_initialized(void);
 
+typedef enum {
+  ZVEC_MEMORY_PRESSURE_NORMAL = 0,
+  ZVEC_MEMORY_PRESSURE_BACKGROUND = 1,
+  ZVEC_MEMORY_PRESSURE_CRITICAL = 2
+} zvec_memory_pressure_t;
+
+/**
+ * @brief Notify the initialized library of host memory pressure, without
+ * waiting for reclamation. BACKGROUND retires unpinned caches; CRITICAL also
+ * blocks new backing. Send NORMAL when the host permits normal operation.
+ * Call from Android lifecycle/onTrimMemory or iOS lifecycle/memory-warning
+ * handlers. The library does not register application callbacks itself.
+ */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_set_memory_pressure(zvec_memory_pressure_t level);
+
 // =============================================================================
 // I/O Backend Introspection
 // =============================================================================

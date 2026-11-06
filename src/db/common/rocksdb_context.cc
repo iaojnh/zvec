@@ -311,8 +311,7 @@ Status RocksdbContext::validate_and_set_db_path(const std::string &db_path,
 
 void RocksdbContext::prepare_options(
     std::shared_ptr<rocksdb::MergeOperator> merge_op, bool writable) {
-#if defined(_WIN32) || defined(__APPLE__) || \
-    (defined(__linux__) && !defined(__ANDROID__))
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
   // Buffered file writes already use the OS cache. Avoid another growable
   // malloc-backed copy whose freed buffers can remain resident after build.
   // A zero capacity selects RocksDB's direct-to-file buffered-I/O path; direct

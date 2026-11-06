@@ -37,6 +37,13 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
   friend class ailego::Singleton<GlobalConfig>;
 
  public:
+  enum class MemoryPressure : uint8_t { kNormal, kBackground, kCritical };
+
+  // Notify after initialization. Background retires unpinned caches; critical
+  // additionally blocks new backing until the host reports recovery. This
+  // queues maintenance and never waits for reclamation on the calling thread.
+  Status set_memory_pressure(MemoryPressure level);
+
   enum class LogLevel : uint8_t {
     kDebug = 0,
     kInfo,
@@ -90,6 +97,8 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
     // Process-wide managed budget and soft RSS target. Shared by vector storage
     // and RocksDB; measured RSS also triggers cache reclamation and admission
     // backpressure with headroom. Caller allocations can still cause overshoot.
+    // Android/iOS default to min(128 MiB, detected memory / 8). Hosts may set
+    // an explicit process target; iOS device headroom further gates admission.
     uint64_t memory_limit_bytes;
 
     // log

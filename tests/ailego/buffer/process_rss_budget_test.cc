@@ -15,6 +15,105 @@ size_t ReadRss() {
   return sampled_rss.load();
 }
 
+ProcessRssBudget::NativeSample native_sample;
+bool native_sample_valid = true;
+bool ReadNative(ProcessRssBudget::NativeSample *sample) {
+  if (!native_sample_valid) return false;
+  *sample = native_sample;
+  return true;
+}
+
+TEST(ProcessRssBudgetTest, NativeFootprintTracksUntouchedBackingAcrossSamples) {
+  ProcessRssBudget budget;
+  sampled_rss = 32 * kMiB;
+  native_sample = {96 * kMiB, 80 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  EXPECT_EQ(24 * kMiB, budget.available());
+  ASSERT_TRUE(budget.try_acquire(16 * kMiB));
+  for (int i = 0; i < 3; ++i) budget.refresh(true);
+  EXPECT_EQ(8 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(9 * kMiB));
+  native_sample = {112 * kMiB, 64 * kMiB};
+  budget.refresh(true);
+  EXPECT_EQ(8 * kMiB, budget.available());
+  budget.release(16 * kMiB);
+  native_sample = {96 * kMiB, 80 * kMiB};
+  budget.refresh(true);
+  EXPECT_EQ(24 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, NativeLimitCanShrinkAndRecoverBelowConfiguredRss) {
+  ProcessRssBudget budget;
+  sampled_rss = 32 * kMiB;
+  native_sample = {32 * kMiB, 96 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(256 * kMiB, ReadRss, ReadNative));
+  ASSERT_TRUE(budget.try_acquire(64 * kMiB));
+  native_sample.available = 16 * kMiB;
+  budget.refresh(true);
+  EXPECT_TRUE(budget.pressure());
+  EXPECT_EQ(0u, budget.available());
+  EXPECT_FALSE(budget.try_acquire(1));
+  budget.release(64 * kMiB);
+  native_sample.available = 96 * kMiB;
+  budget.refresh(true);
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_EQ(88 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, NativeZeroAndFailedSamplesCannotReplenishBudget) {
+  ProcessRssBudget budget;
+  sampled_rss = 32 * kMiB;
+  native_sample = {32 * kMiB, 16 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  ASSERT_TRUE(budget.try_acquire(8 * kMiB));
+  native_sample_valid = false;
+  sampled_rss = 16 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(2 * kMiB, budget.available());
+  EXPECT_FALSE(budget.configure(256 * kMiB, ReadRss, ReadNative));
+  EXPECT_EQ(128 * kMiB, budget.limit());
+  native_sample_valid = true;
+  native_sample.available = 0;
+  budget.refresh(true);
+  EXPECT_TRUE(budget.pressure());
+  EXPECT_EQ(0u, budget.available());
+  EXPECT_FALSE(budget.try_acquire(1));
+  budget.release(8 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, CompressedFootprintCanBlockDespiteLowRss) {
+  ProcessRssBudget budget;
+  sampled_rss = 16 * kMiB;
+  native_sample = {160 * kMiB, 128 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  EXPECT_TRUE(budget.pressure());
+  EXPECT_FALSE(budget.try_acquire(1));
+}
+
+TEST(ProcessRssBudgetTest, HostPressurePersistsUntilExplicitRecovery) {
+  using Pressure = ProcessRssBudget::PressureLevel;
+  ProcessRssBudget budget;
+  sampled_rss = 16 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  budget.set_external_pressure(Pressure::kBackground);
+  budget.refresh(true);
+  EXPECT_TRUE(budget.pressure());
+  ASSERT_TRUE(budget.try_acquire(kMiB));  // Mandatory work may still progress.
+  budget.set_external_pressure(Pressure::kCritical);
+  budget.refresh(true);
+  EXPECT_EQ(0u, budget.available());
+  EXPECT_FALSE(budget.try_acquire(1));
+  budget.release(kMiB);
+  budget.set_external_pressure(Pressure::kNormal);
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_TRUE(budget.try_acquire(kMiB));
+  budget.release(kMiB);
+}
+
 TEST(ProcessRssBudgetTest, DisabledBudgetPreservesStandaloneAdmission) {
   ProcessRssBudget budget;
   EXPECT_TRUE(budget.try_acquire(std::numeric_limits<size_t>::max()));

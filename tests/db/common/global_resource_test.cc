@@ -526,3 +526,39 @@ TEST(GlobalResource, RssPressureReclaimsOnlyUnpinnedRocksDbEntries) {
   pinned = nullptr;
   EXPECT_TRUE(wait_until([&] { return cache->GetUsage() == 0; }));
 }
+
+TEST(GlobalResource, HostPressureReclaimsCacheWithoutChangingConfiguredLimit) {
+  auto &resource = GlobalResource::Instance();
+  ASSERT_EQ(0, resource.initialize());
+  auto cache = resource.rocksdb_block_cache();
+  ASSERT_NE(nullptr, cache);
+  auto &config = GlobalConfig::Instance();
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t limit = pool.process_rss_limit();
+  using Pressure = GlobalConfig::MemoryPressure;
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { config.set_memory_pressure(Pressure::kNormal); });
+  EXPECT_FALSE(config.set_memory_pressure(static_cast<Pressure>(255)).ok());
+  rocksdb::Cache::Handle *pinned = nullptr;
+  auto release = ailego::ScopeGuard::Make([&] {
+    if (pinned) cache->Release(pinned);
+  });
+  ASSERT_TRUE(cache->Insert("host-cold", nullptr, &rocksdb::kNoopCacheItemHelper,
+                            4096, nullptr).ok());
+  ASSERT_TRUE(cache->Insert("host-pinned", nullptr,
+                            &rocksdb::kNoopCacheItemHelper, 4096, &pinned).ok());
+  ASSERT_TRUE(config.set_memory_pressure(Pressure::kBackground).ok());
+  EXPECT_TRUE(pool.under_process_rss_pressure());
+  EXPECT_EQ(limit, pool.process_rss_limit());
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (cache->GetUsage() > cache->GetPinnedUsage() &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(cache->GetPinnedUsage(), cache->GetUsage());
+  EXPECT_GT(cache->GetPinnedUsage(), 0u);
+  ASSERT_TRUE(config.set_memory_pressure(Pressure::kCritical).ok());
+  EXPECT_FALSE(pool.try_charge_external(4096));
+  ASSERT_TRUE(config.set_memory_pressure(Pressure::kNormal).ok());
+  ASSERT_TRUE(pool.try_charge_external(4096));
+  pool.release_external(4096);
+}

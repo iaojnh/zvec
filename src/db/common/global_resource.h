@@ -50,6 +50,10 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
 
   int initialize();
 
+  bool initialized() const {
+    return initialized_.load(std::memory_order_acquire);
+  }
+
   ailego::ThreadPool *query_thread_pool() {
     if (initialize() != 0) {
       return nullptr;

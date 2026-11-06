@@ -10,7 +10,7 @@
 #include <gtest/gtest.h>
 #include "db/common/native_image_memory.h"
 
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if defined(__APPLE__)
 namespace {
 using namespace zvec;
 
@@ -68,6 +68,7 @@ bool image_bytes(const ImageHeader &image, size_t page_size, size_t *bytes) {
                                     page_size, bytes);
 }
 
+#if TARGET_OS_OSX
 class LoadedImage {
  public:
   explicit LoadedImage(const char *path)
@@ -117,6 +118,8 @@ size_t mapped_capacity(const void *anchor) {
   }
   return bytes;
 }
+
+#endif
 
 TEST(MachONativeImageMemory, CountsUnsortedPageUnionAndZeroFillNotFileBytes) {
   ImageHeader image;
@@ -218,6 +221,15 @@ TEST(MachONativeImageMemory, RejectsOverflowAndImpossibleFileCapacity) {
   EXPECT_EQ(73u, bytes);
 }
 
+TEST(MachONativeImageMemory, ExcludesMainExecutableAndInvalidAnchors) {
+  static const char main_anchor = 0;
+  EXPECT_EQ(0u, detail::NativeImageBytesForAddress(&main_anchor));
+  EXPECT_THROW(detail::NativeImageBytesForAddress(nullptr), std::bad_alloc);
+  const char stack_anchor = 0;
+  EXPECT_THROW(detail::NativeImageBytesForAddress(&stack_anchor), std::bad_alloc);
+}
+
+#if TARGET_OS_OSX
 TEST(MachONativeImageMemory,
      ResolvesDylibAndBundleButExcludesCallerAndInvalidAnchors) {
   for (const char *path :
@@ -276,5 +288,6 @@ TEST(MachONativeImageMemoryDeathTest,
   GTEST_SKIP() << "Process-isolated tests are not supported on this platform";
 #endif
 }
+#endif
 }  // namespace
 #endif

@@ -355,6 +355,9 @@ void test_zvec_config() {
 void test_zvec_initialize() {
   TEST_START();
 
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_BACKGROUND) ==
+              ZVEC_ERROR_FAILED_PRECONDITION);
+
   zvec_config_data_t *config = zvec_config_data_create();
   TEST_ASSERT(config != NULL);
   if (config) {
@@ -363,6 +366,11 @@ void test_zvec_initialize() {
   zvec_error_code_t err = zvec_initialize(config);
   TEST_ASSERT(err == ZVEC_OK);
   TEST_ASSERT(zvec_is_initialized());
+  TEST_ASSERT(zvec_set_memory_pressure((zvec_memory_pressure_t)99) ==
+              ZVEC_ERROR_INVALID_ARGUMENT);
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_BACKGROUND) == ZVEC_OK);
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
 
   TEST_END();
 }

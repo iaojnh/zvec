@@ -226,8 +226,7 @@ TEST_F(RocksdbContextMemoryTest, SharesWriteBudgetWithoutFtsIteratorCopies) {
 TEST_F(RocksdbContextMemoryTest, BufferedWritesSurviveFlushAndWritableReopen) {
   RocksdbContext writer;
   ASSERT_TRUE(writer.create(kTestPath).ok());
-#if defined(_WIN32) || defined(__APPLE__) || \
-    (defined(__linux__) && !defined(__ANDROID__))
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
   EXPECT_EQ(0u, writer.create_opts_.writable_file_max_buffer_size);
   EXPECT_FALSE(writer.create_opts_.use_direct_io_for_flush_and_compaction);
 #endif
@@ -241,8 +240,7 @@ TEST_F(RocksdbContextMemoryTest, BufferedWritesSurviveFlushAndWritableReopen) {
 
   RocksdbContext reopened;
   ASSERT_TRUE(reopened.open(kTestPath, false).ok());
-#if defined(_WIN32) || defined(__APPLE__) || \
-    (defined(__linux__) && !defined(__ANDROID__))
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
   EXPECT_EQ(0u, reopened.create_opts_.writable_file_max_buffer_size);
 #endif
   ASSERT_TRUE(reopened.db_->Put(reopened.write_opts_, "updated", value).ok());
@@ -265,8 +263,7 @@ TEST_F(RocksdbContextMemoryTest, BufferedWritesSurviveFlushAndWritableReopen) {
   ASSERT_TRUE(reader.close().ok());
 }
 
-#if defined(_WIN32) || defined(__APPLE__) || \
-    (defined(__linux__) && !defined(__ANDROID__))
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
 TEST_F(RocksdbContextMemoryTest, DirectWritesKeepAlignedStagingBuffer) {
   RocksdbContext writer;
   writer.create_opts_.use_direct_io_for_flush_and_compaction = true;

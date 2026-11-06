@@ -19,6 +19,7 @@
 #include <new>
 #include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
+#include <ailego/utility/mobile_memory.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 
@@ -1129,9 +1130,16 @@ bool MemoryLimitPool::trim_idle_buffers() {
 }
 
 bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
-  const bool configured = process_rss_.configure(bytes, &MemoryHelper::SelfRSS);
+  const bool configured = process_rss_.configure(
+      bytes, &MemoryHelper::SelfRSS, NativeApplicationMemoryReader());
   bg_cv_.notify_one();
   return configured;
+}
+
+void MemoryLimitPool::set_memory_pressure(ProcessRssBudget::PressureLevel level) {
+  process_rss_.set_external_pressure(level);
+  bg_cv_.notify_one();
+  capacity_cv_.notify_all();
 }
 
 void MemoryLimitPool::set_process_rss_reclaimer(

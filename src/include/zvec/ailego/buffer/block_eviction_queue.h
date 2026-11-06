@@ -264,6 +264,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
 
   // Enabled by the DB process budget, not by standalone page-pool users.
   bool configure_process_rss_limit(size_t bytes);
+  // Queues host pressure; reclamation runs on existing maintenance.
+  void set_memory_pressure(ProcessRssBudget::PressureLevel level);
   // Invoked by maintenance without any pool/allocator lock held. The callback
   // must release only unpinned backing and must not retain its cache owner.
   void set_process_rss_reclaimer(std::function<void()> reclaimer);

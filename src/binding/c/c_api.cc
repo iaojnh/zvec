@@ -728,6 +728,27 @@ bool zvec_is_initialized(void) {
   return g_initialized.load();
 }
 
+zvec_error_code_t zvec_set_memory_pressure(zvec_memory_pressure_t level) {
+  if (level < ZVEC_MEMORY_PRESSURE_NORMAL ||
+      level > ZVEC_MEMORY_PRESSURE_CRITICAL) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Invalid memory pressure level");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  if (!g_initialized.load()) {
+    SET_LAST_ERROR(ZVEC_ERROR_FAILED_PRECONDITION, "Library not initialized");
+    return ZVEC_ERROR_FAILED_PRECONDITION;
+  }
+  ZVEC_TRY_RETURN_ERROR(
+      "Memory pressure notification failed",
+      const auto status = zvec::GlobalConfig::Instance().set_memory_pressure(
+          static_cast<zvec::GlobalConfig::MemoryPressure>(level));
+      if (!status.ok()) {
+        SET_LAST_ERROR(ZVEC_ERROR_FAILED_PRECONDITION, status.message());
+        return ZVEC_ERROR_FAILED_PRECONDITION;
+      }
+      return ZVEC_OK;)
+}
+
 // =============================================================================
 // I/O Backend Introspection
 // =============================================================================

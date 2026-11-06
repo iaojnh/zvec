@@ -30,8 +30,7 @@ endif()
 file(GLOB ALL_TEST_SRCS *_test.cc)
 foreach(CC_SRCS ${ALL_TEST_SRCS})
     get_filename_component(CC_TARGET ${CC_SRCS} NAME_WE)
-    if(CC_TARGET STREQUAL "native_image_memory_macos_test" AND
-       (NOT APPLE OR IOS))
+    if(CC_TARGET STREQUAL "native_image_memory_macos_test" AND NOT APPLE)
         continue()
     endif()
     if(CC_TARGET STREQUAL "native_image_memory_windows_test" AND NOT WIN32)
@@ -56,7 +55,7 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
         INCS .. ../../src
         LDFLAGS ${APPLE_FRAMEWORK_LIBS}
     )
-    if(CC_TARGET STREQUAL "native_image_memory_macos_test")
+    if(CC_TARGET STREQUAL "native_image_memory_macos_test" AND NOT IOS)
         add_dependencies(${CC_TARGET} native_image_memory_macos_fixture
             native_image_memory_macos_bundle)
         target_compile_definitions(${CC_TARGET} PRIVATE
