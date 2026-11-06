@@ -271,8 +271,9 @@ int setup_io_ctx(IOContext &ctx) {
       LibAioLoader::Instance().load()) {
     const int ret = LibAioLoader::Instance().setup_budgeted(
         MAX_EVENTS, ctx->aio_ctx, ctx->aio_mapped_bytes);
-    if (ret == 0) {
+    if (ret == 0 || ctx->aio_ctx) {
       ctx->type = ailego::IOBackendType::kLibAio;
+      ctx->aio_quarantined = ret != 0;
       log_diskann_io_backend(ctx->type);
       return 0;
     }
@@ -383,6 +384,7 @@ static bool reset_aio_context(IoBackend &ctx) {
 
   ret = loader.setup_budgeted(MAX_EVENTS, ctx.aio_ctx, ctx.aio_mapped_bytes);
   if (ret != 0) {
+    ctx.aio_quarantined = ctx.aio_ctx != nullptr;
     LOG_WARN("Cannot recreate DiskANN AIO context (%d); using pread", ret);
   }
   return true;

@@ -288,7 +288,7 @@ int IoUringRing::execute(int fd, const IoUringRead *read_reqs, size_t count) {
   // Reuse across batches of this blocking call, not across a TLS ring's
   // lifetime. execute_impl drains or quarantines all outstanding I/O first.
   auto release = ScopeGuard::Make([&] { release_staging(); });
-  return execute_impl(fd, read_reqs, nullptr, count);
+  return execute_impl(fd, read_reqs, nullptr, count) == 0 ? 0 : -1;
 }
 
 int IoUringRing::execute_writes(int fd, const IoUringWrite *write_reqs,
@@ -311,6 +311,14 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
   if (batch_size == 0) {
     return -1;
   }
+
+  const auto quarantine = [&] {
+    // close() starts asynchronous kernel cancellation. Keep staging and its
+    // reservation alive, and tell a writer that a synchronous retry is unsafe.
+    abandon_staging();
+    teardown();
+    return kQuarantined;
+  };
 
   for (size_t batch_start = 0; batch_start < count; batch_start += batch_size) {
     const size_t n_ops = std::min(batch_size, count - batch_start);
@@ -376,6 +384,7 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
     size_t submitted = 0;
     size_t completed = 0;
     bool all_ok = true;
+    std::array<bool, kIoUringMaxBatch> seen{};
     auto reap_available = [&]() {
       unsigned chead = *cq_head_;
       const unsigned ctail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
@@ -383,11 +392,13 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
       while (chead != ctail) {
         struct io_uring_cqe *cqe = &cqes_[chead & cq_mask];
         const size_t req_idx = static_cast<size_t>(cqe->user_data);
-        if (req_idx < batch_start || req_idx >= batch_start + n_ops) {
-          LOG_WARN("io_uring completion referenced unknown request: %zu",
-                   req_idx);
-          all_ok = false;
+        if (req_idx < batch_start || req_idx >= batch_start + n_ops ||
+            seen[req_idx - batch_start]) {
+          LOG_ERROR("io_uring completion did not identify a new request: %zu",
+                    req_idx);
+          return false;
         } else {
+          seen[req_idx - batch_start] = true;
           const uint64_t offset =
               is_write ? write_reqs[req_idx].offset : read_reqs[req_idx].offset;
           const uint64_t len =
@@ -422,10 +433,11 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
         ++completed;
       }
       __atomic_store_n(cq_head_, chead, __ATOMIC_RELEASE);
+      return true;
     };
 
     while (completed < n_ops) {
-      reap_available();
+      if (!reap_available()) return quarantine();
       if (completed >= n_ops) {
         break;
       }
@@ -435,6 +447,7 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
           __NR_io_uring_enter, ring_fd_, to_submit, 1u, IORING_ENTER_GETEVENTS,
           static_cast<void *>(nullptr), static_cast<size_t>(0)));
       if (ret >= 0) {
+        if (static_cast<unsigned>(ret) > to_submit) return quarantine();
         submitted += static_cast<size_t>(ret);
         continue;
       }
@@ -453,7 +466,7 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
 
       size_t drain_retries = 0;
       while (completed < submitted) {
-        reap_available();
+        if (!reap_available()) return quarantine();
         if (completed >= submitted) {
           break;
         }
@@ -472,9 +485,7 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
             "io_uring drain failed; errno=%d, %s. leaking the staging pool "
             "and disabling io_uring for this context",
             errno, ::strerror(errno));
-        abandon_staging();
-        teardown();
-        return -1;
+        return quarantine();
       }
       return -1;
     }

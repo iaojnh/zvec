@@ -86,6 +86,32 @@ int main(void) {
   assert(zvec_collection_add_column(collection, field, filter) ==
          ZVEC_ERROR_RESOURCE_EXHAUSTED);
   zvec_field_schema_destroy(field);
+  assert(zvec_doc_add_field_by_value(doc, "payload", ZVEC_DATA_TYPE_STRING,
+                                    filter, 24 * MIB) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  zvec_vector_query_t *query = zvec_vector_query_create();
+  zvec_sub_query_t *sub = zvec_sub_query_create();
+  zvec_multi_query_t *multi = zvec_multi_query_create();
+  assert(query && sub && multi);
+  assert(zvec_vector_query_set_filter(query, "original") == ZVEC_OK);
+  assert(zvec_vector_query_set_filter(query, filter) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(strcmp(zvec_vector_query_get_filter(query), "original") == 0);
+  assert(zvec_vector_query_set_query_vector(query, filter, 24 * MIB) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  uint32_t index = 1;
+  float score = 0.5f;
+  assert(zvec_sub_query_set_sparse_vector(sub, &index, &score, 1) == ZVEC_OK);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  assert(zvec_multi_query_add_sub_query(multi, sub) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(zvec_multi_query_get_sub_query_count(multi) == 0);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  assert(zvec_multi_query_add_sub_query(multi, sub) == ZVEC_OK);
+  assert(zvec_multi_query_get_sub_query_count(multi) == 1);
+  zvec_sub_query_destroy(sub);
+  zvec_multi_query_destroy(multi);
+  zvec_vector_query_destroy(query);
   free(filter);
 
   // Retaining copies must exhaust a shared active allowance, independent of

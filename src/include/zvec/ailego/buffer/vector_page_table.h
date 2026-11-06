@@ -811,6 +811,11 @@ class ZVEC_AILEGO_API VecBufferPool {
   int writeback_error() const {
     return writeback_error_.load(std::memory_order_acquire);
   }
+  // Ordinary failures store a positive errno and can be retried.
+  static constexpr int kWritebackQuarantined = -1;
+  bool writeback_quarantined() const {
+    return writeback_error() == kWritebackQuarantined;
+  }
 
   int fd_;       // page-data channel: O_DIRECT or F_NOCACHE when supported
   int meta_fd_;  // metadata channel: always buffered IO

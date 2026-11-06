@@ -140,7 +140,8 @@ class IoUringRing {
 
   // Execute a batch of aligned writes via io_uring. The call blocks until all
   // accepted requests have completed, but the requests execute concurrently
-  // in the kernel. Returns 0 on success and -1 on a safely drained failure.
+  // in the kernel. A quarantined write can still modify the file after return.
+  static constexpr int kQuarantined = -2;
   int execute_writes(int fd, const IoUringWrite *write_reqs, size_t count);
 
   int execute_writes(int fd, const std::vector<IoUringWrite> &write_reqs) {

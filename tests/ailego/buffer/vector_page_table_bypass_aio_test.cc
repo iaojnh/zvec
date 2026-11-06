@@ -28,22 +28,31 @@ struct VecBufferPoolTestPeer {
 namespace {
 
 struct FakeAio {
-  enum class Mode { SUCCESS, PARTIAL, SHORT_READ, WAIT_ERROR, DESTROY_ERROR };
+  enum class Mode {
+    SUCCESS, PARTIAL, SHORT_READ, WAIT_ERROR, DESTROY_ERROR, DUPLICATE,
+    REJECTED_RING
+  };
   static FakeAio *active;
   Mode mode{Mode::SUCCESS};
+  std::array<uint32_t, 8> header{0, 16, 0, 0, 0xa10a10a1, 0, 0, 32};
   std::array<iocb, 16> requests{};
+  std::array<iocb *, 16> request_addresses{};
   size_t submitted{0};
   size_t pending{0};
   size_t submit_calls{0};
   size_t destroy_calls{0};
 
   static int setup(int, io_context_t *context) {
-    *context = reinterpret_cast<io_context_t>(active);
+    if (active->mode == Mode::REJECTED_RING) active->header[4] = 0;
+    *context = reinterpret_cast<io_context_t>(active->header.data());
     return 0;
   }
   static int destroy(io_context_t) {
     ++active->destroy_calls;
-    if (active->mode == Mode::DESTROY_ERROR && active->destroy_calls == 1)
+    if ((active->mode == Mode::DESTROY_ERROR ||
+         active->mode == Mode::DUPLICATE ||
+         active->mode == Mode::REJECTED_RING) &&
+        active->destroy_calls == 1)
       return -EIO;
     active->pending = 0;
     return 0;
@@ -55,7 +64,10 @@ struct FakeAio {
         active->mode == Mode::PARTIAL
             ? std::min<size_t>(2, static_cast<size_t>(count))
             : static_cast<size_t>(count);
-    for (size_t i = 0; i < accepted; ++i) active->requests[i] = *requests[i];
+    for (size_t i = 0; i < accepted; ++i) {
+      active->requests[i] = *requests[i];
+      active->request_addresses[i] = requests[i];
+    }
     active->submitted = active->pending = accepted;
     return static_cast<int>(accepted);
   }
@@ -63,11 +75,15 @@ struct FakeAio {
     if (active->mode == Mode::WAIT_ERROR || active->mode == Mode::DESTROY_ERROR)
       return -EIO;
     // Deliberately return one completion at a time, in reverse request order.
-    const auto &request = active->requests[--active->pending];
+    size_t index = --active->pending;
+    if (active->mode == Mode::DUPLICATE && index == 0)
+      index = active->submitted - 1;
+    const auto &request = active->requests[index];
     const ssize_t bytes = ::pread(request.aio_fildes, request.u.c.buf,
                                   request.u.c.nbytes, request.u.c.offset);
     events[0] = {};
     events[0].data = request.data;
+    events[0].obj = active->request_addresses[index];
     events[0].res = active->mode == Mode::SHORT_READ ? bytes - 512 : bytes;
     return 1;
   }
@@ -147,8 +163,11 @@ class BypassAioTest : public ::testing::Test {
     std::thread worker([&] {
       check_read(pool);
       after = MemoryLimitPool::get_instance().used();
-      if (mode == FakeAio::Mode::DESTROY_ERROR) {
-        EXPECT_EQ(before + 4 * kVectorPageSize, after);
+      if (mode == FakeAio::Mode::DESTROY_ERROR ||
+          mode == FakeAio::Mode::DUPLICATE ||
+          mode == FakeAio::Mode::REJECTED_RING) {
+        EXPECT_EQ(before + (mode == FakeAio::Mode::REJECTED_RING
+                                ? 0 : 4 * kVectorPageSize), after);
         const auto calls = fake_.submit_calls;
         check_read(pool);
         EXPECT_EQ(calls,
@@ -156,11 +175,14 @@ class BypassAioTest : public ::testing::Test {
       }
     });
     worker.join();
-    EXPECT_EQ(1u, fake_.submit_calls);
+    EXPECT_EQ(mode == FakeAio::Mode::REJECTED_RING ? 0u : 1u,
+              fake_.submit_calls);
     EXPECT_EQ(0u, fake_.pending);
     EXPECT_EQ(before, MemoryLimitPool::get_instance().used());
-    EXPECT_EQ(mode == FakeAio::Mode::DESTROY_ERROR ? 2u : 1u,
-              fake_.destroy_calls);
+    const bool retried_destroy = mode == FakeAio::Mode::DESTROY_ERROR ||
+                                 mode == FakeAio::Mode::DUPLICATE ||
+                                 mode == FakeAio::Mode::REJECTED_RING;
+    EXPECT_EQ(retried_destroy ? 2u : 1u, fake_.destroy_calls);
     if (mode == FakeAio::Mode::SUCCESS)
       EXPECT_EQ(4u, pool.stats().aio_pages_submitted);
   }
@@ -187,6 +209,12 @@ TEST_F(BypassAioTest, DestroysFailedContextBeforeFallback) {
 }
 TEST_F(BypassAioTest, QuarantinesUntilDestroyWithoutReusingContext) {
   run(FakeAio::Mode::DESTROY_ERROR);
+}
+TEST_F(BypassAioTest, DuplicateCompletionDoesNotReleaseKernelDestinations) {
+  run(FakeAio::Mode::DUPLICATE);
+}
+TEST_F(BypassAioTest, RejectedRingIsRetainedForTeardownWithoutBeingUsed) {
+  run(FakeAio::Mode::REJECTED_RING);
 }
 
 }  // namespace

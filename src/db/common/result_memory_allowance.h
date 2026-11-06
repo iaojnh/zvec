@@ -73,6 +73,16 @@ class ResultMemoryAllowance {
       bytes_ += std::exchange(other.bytes_, 0);
     }
 
+    size_t bytes() const noexcept {
+      return bytes_;
+    }
+
+    void retain_at_most(size_t bytes) {
+      if (bytes >= bytes_) return;
+      owner_->release_active(bytes_ - bytes);
+      bytes_ = bytes;
+    }
+
    private:
     ResultMemoryAllowance *owner_;
     size_t bytes_{0};

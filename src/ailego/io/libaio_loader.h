@@ -106,7 +106,12 @@ class LibAioLoader {
         LOG_ERROR("libaio: failed to destroy a rejected completion ring");
         const bool accounted =
             !extra || pool.account_pending_process_backing(extra);
-        pool.finish_process_backing(page + (accounted ? extra : 0), true);
+        mapped_bytes = page + (accounted ? extra : 0);
+        pool.finish_process_backing(mapped_bytes, true);
+        // Leave the rejected ring with its owner for teardown. A terminal
+        // error prevents a caller from allocating another ring on every retry.
+        ctx = ring;
+        return -EIO;
       }
       return size == 0 ? -EINVAL : -ENOMEM;
     }

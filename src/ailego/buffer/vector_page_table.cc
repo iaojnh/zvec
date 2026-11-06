@@ -1095,8 +1095,9 @@ int VecBufferPool::init() {
     try {
       int fd = fd_;
       page_table_.set_flush_callback(
-          [fd, &fn = file_name_](block_id_t /*block_id*/, char *buf, size_t sz,
+          [this, fd, &fn = file_name_](block_id_t /*block_id*/, char *buf, size_t sz,
                                  size_t off) -> int {
+            if (writeback_quarantined()) return -1;
             ssize_t w = zvec_pwrite(fd, buf, sz, off);
             if (w != static_cast<ssize_t>(sz)) {
               LOG_ERROR(
@@ -1382,6 +1383,7 @@ void VecBufferPool::writeback_loop() {
 
 bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
                                           char *staging) {
+  if (writeback_quarantined()) return false;
   if (page_ids.empty()) {
     return true;
   }
@@ -1445,6 +1447,12 @@ bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
       if (selected == 0) {
         continue;
       }
+      AILEGO_DEFER([&] {
+        for (size_t i = 0; i < selected; ++i) {
+          locks[i].unlock();
+          page_table_.release_block(selected_pages[i]);
+        }
+      });
 
       std::array<IoUringWrite, kBlockingAioBatchSize> requests{};
       for (size_t i = 0; i < selected; ++i) {
@@ -1455,8 +1463,14 @@ bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
       writeback_batches_.fetch_add(1, std::memory_order_relaxed);
       writeback_aio_batches_.fetch_add(1, std::memory_order_relaxed);
       writeback_aio_pages_.fetch_add(selected, std::memory_order_relaxed);
-      bool aio_ok = writeback_io_uring_->execute_writes(fd_, requests.data(),
-                                                        selected) == 0;
+      const int result = writeback_io_uring_->execute_writes(
+          fd_, requests.data(), selected);
+      if (result == IoUringRing::kQuarantined) {
+        writeback_error_.store(kWritebackQuarantined, std::memory_order_release);
+        writeback_failures_.fetch_add(selected, std::memory_order_relaxed);
+        return false;
+      }
+      const bool aio_ok = result == 0;
       if (!aio_ok) {
         writeback_aio_fallbacks_.fetch_add(1, std::memory_order_relaxed);
       }
@@ -1504,10 +1518,6 @@ bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
         all_ok = false;
       }
 
-      for (size_t i = 0; i < selected; ++i) {
-        locks[i].unlock();
-        page_table_.release_block(selected_pages[i]);
-      }
     }
     return all_ok;
   }
@@ -2108,6 +2118,8 @@ int VecBufferPool::write_range(size_t file_offset, size_t length,
 PageWriteStatus VecBufferPool::write_range_status(size_t file_offset,
                                                   size_t length,
                                                   const char *src) {
+  if (writeback_quarantined())
+    return PageWriteStatus::kError;
   if (!writable_) {
     LOG_ERROR("write_range called on read-only pool: file[%s]",
               file_name_.c_str());
@@ -2161,6 +2173,8 @@ int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
 
 PageWriteStatus VecBufferPool::write_fragments_status(
     const VecBufferWriteFragment *fragments, size_t count) {
+  if (writeback_quarantined())
+    return PageWriteStatus::kError;
   if (!writable_ || (count != 0 && fragments == nullptr)) {
     return PageWriteStatus::kError;
   }
@@ -2267,6 +2281,7 @@ PageWriteStatus VecBufferPool::write_fragments_status(
 
 int VecBufferPool::write_meta(size_t offset, size_t length,
                               const char *buffer) {
+  if (writeback_quarantined()) return -1;
   if (!writable_) {
     LOG_ERROR("write_meta called on read-only pool: file[%s]",
               file_name_.c_str());
@@ -2298,6 +2313,7 @@ int VecBufferPool::flush_all() {
   // callers a deterministic drain point for all previously queued pages.
   drain_writeback();
   std::unique_lock<std::mutex> flush_lock(writeback_flush_mutex_);
+  if (writeback_quarantined()) return -1;
   const size_t total = page_table_.entry_num();
   if (total == 0) {
     return 0;
@@ -2318,6 +2334,7 @@ int VecBufferPool::flush_all() {
       if (!flush_writeback_batch(dirty_pages, writeback_staging_)) {
         rc = -1;
         ++failed_batches;
+        if (writeback_quarantined()) break;
       }
       dirty_pages.clear();
     }
@@ -2340,6 +2357,7 @@ int VecBufferPool::flush_all() {
 }
 
 bool VecBufferPool::extend_file(size_t new_size) {
+  if (writeback_quarantined()) return false;
   if (!writable_) {
     LOG_ERROR("extend_file called on read-only pool: file[%s]",
               file_name_.c_str());
@@ -2935,9 +2953,10 @@ struct ThreadLocalAioContext {
   io_context_t ctx{nullptr};
   size_t mapped_bytes{0};
   bool inited{false};
+  bool usable{false};
 
   bool ensure() {
-    if (inited) return ctx != nullptr;
+    if (inited) return usable && ctx != nullptr;
     auto &loader = LibAioLoader::Instance();
     if (!loader.load()) {
       inited = true;
@@ -2945,7 +2964,8 @@ struct ThreadLocalAioContext {
     }
     const int result = loader.setup_budgeted(QueueDepth, ctx, mapped_bytes);
     inited = result != -ENOMEM;
-    return result == 0;
+    usable = result == 0;
+    return usable;
   }
 
   bool destroy_context(const char *context_name) {
@@ -3002,6 +3022,38 @@ struct ThreadLocalBlockingAioCtx
 static thread_local ThreadLocalIoUringContext<kBlockingAioBatchSize>
     tl_blocking_io_uring;
 static thread_local ThreadLocalBlockingAioCtx tl_blocking_aio;
+
+void retire_blocking_aio(char **buffers, size_t count) {
+  if (!tl_blocking_aio.destroy_context("ThreadLocalBlockingAioCtx"))
+    tl_blocking_aio.quarantine(buffers, count);
+}
+
+bool drain_blocking_aio(const iocb *requests, char **buffers, size_t count,
+                         io_event *events) {
+  std::array<bool, kBlockingAioBatchSize> seen{};
+  size_t completed = 0;
+  while (completed < count) {
+    const long remaining = static_cast<long>(count - completed);
+    const int received = LibAioLoader::Instance().io_getevents(
+        tl_blocking_aio.ctx, remaining, remaining, events + completed, nullptr);
+    if (received == -EINTR) continue;
+    if (received <= 0 || received > remaining) {
+      retire_blocking_aio(buffers, count);
+      return false;
+    }
+    for (int i = 0; i < received; ++i) {
+      const auto &event = events[completed + i];
+      const auto index = reinterpret_cast<uintptr_t>(event.data);
+      if (index >= count || event.obj != &requests[index] || seen[index]) {
+        retire_blocking_aio(buffers, count);
+        return false;
+      }
+      seen[index] = true;
+    }
+    completed += static_cast<size_t>(received);
+  }
+  return true;
+}
 }  // namespace
 #endif
 
@@ -3073,36 +3125,25 @@ bool VecBufferPool::read_ranges_bypass_aio(const ReadRange *ranges,
       submitted = LibAioLoader::Instance().io_submit(
           tl_blocking_aio.ctx, static_cast<long>(batch), pointers.data());
     } while (submitted == -EINTR);
-    if (submitted <= 0 || static_cast<size_t>(submitted) > batch) return false;
+    if (submitted <= 0) return false;
+    if (static_cast<size_t>(submitted) > batch) {
+      retire_blocking_aio(buffers.data(), batch);
+      return false;
+    }
     const size_t accepted = static_cast<size_t>(submitted);
     aio_pages_submitted_.fetch_add(accepted, std::memory_order_relaxed);
 
     std::array<struct io_event, kBatchSize> events{};
-    size_t completed = 0;
-    while (completed < accepted) {
-      const long remaining = static_cast<long>(accepted - completed);
-      const int result = LibAioLoader::Instance().io_getevents(
-          tl_blocking_aio.ctx, remaining, remaining, events.data() + completed,
-          nullptr);
-      if (result == -EINTR) continue;
-      if (result <= 0 || result > remaining) {
-        // Never let failed AIO keep writing into a caller's returned buffer.
-        // Staging remains charged until io_destroy establishes quiescence.
-        if (!tl_blocking_aio.destroy_context("ThreadLocalBlockingAioCtx"))
-          tl_blocking_aio.quarantine(buffers.data(), accepted);
-        return false;
-      }
-      completed += static_cast<size_t>(result);
-    }
-    if (accepted != batch) return false;
-    std::array<bool, kBatchSize> seen{};
-    for (size_t i = 0; i < completed; ++i) {
-      const size_t index = reinterpret_cast<size_t>(events[i].data);
-      if (index >= batch || seen[index] || events[i].res2 != 0 ||
-          static_cast<ssize_t>(events[i].res) !=
+    if (!drain_blocking_aio(requests.data(), buffers.data(), accepted,
+                            events.data()) || accepted != batch)
+      return false;
+    for (size_t i = 0; i < batch; ++i) {
+      const auto &event = events[i];
+      const auto index = reinterpret_cast<uintptr_t>(event.data);
+      if (event.res2 != 0 ||
+          static_cast<ssize_t>(event.res) !=
               static_cast<ssize_t>(ranges[begin + index].length))
         return false;
-      seen[index] = true;
     }
     for (size_t i = 0; i < batch; ++i) {
       const auto &range = ranges[begin + i];
@@ -3315,13 +3356,11 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
     }
     if (allocated == 0) return false;
 
-    auto abandon_claims = [&](size_t abandon_count, bool release_buffers) {
+    auto abandon_claims = [&](size_t abandon_count) {
       for (size_t i = 0; i < abandon_count; ++i) {
         if (buffers[i]) {
-          if (release_buffers) {
-            MemoryLimitPool::get_instance().release_buffer(buffers[i],
-                                                           kVectorPageSize);
-          }
+          MemoryLimitPool::get_instance().release_buffer(buffers[i],
+                                                         kVectorPageSize);
           buffers[i] = nullptr;
         }
         if (!page_table_.cancel_block_load(load_pages[i])) {
@@ -3351,7 +3390,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
         // destination buffers after execute() reports a drained failure.
         use_io_uring = false;
       } else {
-        abandon_claims(allocated, /*release_buffers=*/true);
+        abandon_claims(allocated);
         return false;
       }
     }
@@ -3370,7 +3409,8 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       const int submit_ret = LibAioLoader::Instance().io_submit(
           tl_blocking_aio.ctx, static_cast<long>(allocated), cb_ptrs.data());
       if (submit_ret <= 0 || static_cast<size_t>(submit_ret) > allocated) {
-        abandon_claims(allocated, /*release_buffers=*/true);
+        if (submit_ret > 0) retire_blocking_aio(buffers.data(), allocated);
+        abandon_claims(allocated);
         return false;
       }
 
@@ -3390,42 +3430,14 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       }
 
       std::array<struct io_event, kBlockingAioBatchSize> events{};
-      size_t completed = 0;
-      bool wait_failed = false;
-      while (completed < accepted) {
-        const int get_ret = LibAioLoader::Instance().io_getevents(
-            tl_blocking_aio.ctx, static_cast<long>(accepted - completed),
-            static_cast<long>(accepted - completed), events.data() + completed,
-            nullptr);
-        if (get_ret == -EINTR) continue;
-        if (get_ret <= 0) {
-          LOG_ERROR(
-              "VecBufferPool::load_pages_aio: io_getevents failed, ret=%d",
-              get_ret);
-          wait_failed = true;
-          break;
-        }
-        completed += static_cast<size_t>(get_ret);
-      }
-
-      if (wait_failed) {
-        if (tl_blocking_aio.destroy_context("ThreadLocalBlockingAioCtx")) {
-          abandon_claims(accepted, /*release_buffers=*/true);
-        } else {
-          tl_blocking_aio.quarantine(buffers.data(), accepted);
-          abandon_claims(accepted, /*release_buffers=*/false);
-        }
+      if (!drain_blocking_aio(cbs.data(), buffers.data(), accepted,
+                              events.data())) {
+        abandon_claims(accepted);
         return false;
       }
 
-      std::array<bool, kBlockingAioBatchSize> seen{};
-      for (size_t i = 0; i < completed; ++i) {
-        const size_t idx = reinterpret_cast<size_t>(events[i].data);
-        if (idx >= accepted || seen[idx] || buffers[idx] == nullptr) {
-          batch_ok = false;
-          continue;
-        }
-        seen[idx] = true;
+      for (size_t i = 0; i < accepted; ++i) {
+        const auto idx = reinterpret_cast<uintptr_t>(events[i].data);
         const size_t offset = load_pages[idx] * kVectorPageSize;
         const size_t expected = std::min(kVectorPageSize, file_size_ - offset);
         read_ok[idx] = static_cast<ssize_t>(events[i].res) ==

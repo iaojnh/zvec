@@ -49,6 +49,25 @@ class IoUringStagingTestPeer {
     params.cq_off.cqes = 64;
     return ring.map_control_regions(params);
   }
+  static int execute_with_duplicate_completion(IoUringRing &ring, int fd,
+                                               const IoUringWrite *writes) {
+    std::array<io_uring_sqe, 2> submissions{};
+    std::array<io_uring_cqe, 2> completions{};
+    for (auto &event : completions) event.res = writes[0].len;
+    unsigned indices[] = {0, 1};
+    unsigned sq_tail = 0, cq_head = 0, cq_tail = 2, mask = 1;
+    ring.ring_fd_ = ::dup(fd);
+    ring.sq_entries_ = 2;
+    ring.sq_tail_ = &sq_tail;
+    ring.sq_ring_mask_ = &mask;
+    ring.sq_array_ = indices;
+    ring.sqes_ = submissions.data();
+    ring.cq_head_ = &cq_head;
+    ring.cq_tail_ = &cq_tail;
+    ring.cq_ring_mask_ = &mask;
+    ring.cqes_ = completions.data();
+    return ring.execute_writes(fd, writes, 2);
+  }
 };
 namespace {
 
@@ -198,6 +217,30 @@ class TemporaryFile {
   char path_[64] = "IoUringLoaderTest.XXXXXX";
   int fd_;
 };
+
+TEST_F(IoUringLoaderTest, DuplicateWriteCompletionQuarantinesStaging) {
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  IoUringRing ring;
+  ASSERT_TRUE(ring.ensure_staging(2 * kIoUringStagingAlign));
+  void *staging = IoUringStagingTestPeer::data(ring);
+  const size_t charge = IoUringStagingTestPeer::size(ring);
+  const auto cleanup = ScopeGuard::Make([&] {
+    // The fake completion queue never submitted a kernel operation.
+    if (!IoUringStagingTestPeer::data(ring)) {
+      File::MemoryUnmap(staging, charge);
+      pool_.release_external(charge);
+    }
+  });
+  std::array<char, kBlockSize> data{};
+  IoUringWrite writes[] = {{0, data.size(), data.data()},
+                          {data.size(), data.size(), data.data()}};
+  EXPECT_EQ(IoUringRing::kQuarantined,
+            IoUringStagingTestPeer::execute_with_duplicate_completion(
+                ring, file.fd(), writes));
+  EXPECT_FALSE(ring.is_valid());
+  EXPECT_EQ(charge, pool_.external_used());
+}
 
 TEST_F(IoUringLoaderTest, ControlMappingsObeyProcessBudgetAndCanRetry) {
   const size_t page = PoolPayloadBudget::page_buffer_size();
