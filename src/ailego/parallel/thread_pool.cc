@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/parallel/thread_pool.h>
+#include <zvec/ailego/parallel/worker_memory.h>
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <pthread.h>
@@ -100,12 +101,17 @@ ThreadPool::ThreadPool(uint32_t size, bool binding) {
         size, max_size, safe_size);
   }
 
+  // Global DB pools are created before the RSS target is published and have
+  // their own fixed reservation. Later/local pools (including PQ sub-pools)
+  // must admit additional stacks before starting any worker.
+  auto memory = std::make_shared<WorkerMemoryLease>(safe_size);
   try {
     // Avoid vector reallocations after workers have started. If thread creation
     // still fails, stop and join the workers already created before rethrowing.
     pool_.reserve(safe_size);
     for (uint32_t i = 0u; i < safe_size; ++i) {
-      pool_.emplace_back(&ThreadPool::worker, this);
+      pool_.emplace_back([this, memory] { worker(); });
+      memory->worker_started();
     }
     if (binding) {
       this->bind();

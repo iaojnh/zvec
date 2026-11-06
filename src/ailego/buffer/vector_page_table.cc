@@ -26,6 +26,7 @@
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
+#include <zvec/ailego/parallel/worker_memory.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
 
@@ -1308,13 +1309,17 @@ bool VecBufferPool::enqueue_writeback(block_id_t page_id) {
 }
 
 void VecBufferPool::start_writeback() {
+  // Admission may reclaim dirty pages. Do it before taking the writeback
+  // lock; a refusal follows init()'s synchronous-eviction fallback.
+  auto memory = std::make_shared<WorkerMemoryLease>(1);
   std::lock_guard<std::mutex> lock(writeback_mutex_);
   if (writeback_thread_.joinable()) {
     return;
   }
   writeback_stopping_ = false;
   writeback_error_.store(0, std::memory_order_release);
-  writeback_thread_ = std::thread([this] { writeback_loop(); });
+  writeback_thread_ = std::thread([this, memory] { writeback_loop(); });
+  memory->worker_started();
 }
 
 void VecBufferPool::stop_writeback() {
