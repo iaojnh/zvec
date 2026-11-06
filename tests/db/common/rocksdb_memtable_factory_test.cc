@@ -31,6 +31,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cerrno>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace zvec {
@@ -77,6 +82,15 @@ bool IsMapped(const void *pointer) {
   EXPECT_TRUE(result == 0 || errno == ENOMEM);
   return result == 0;
 }
+#elif defined(_WIN32)
+bool IsMapped(const void *pointer) {
+  MEMORY_BASIC_INFORMATION info{};
+  const auto result = ::VirtualQuery(pointer, &info, sizeof(info));
+  EXPECT_EQ(sizeof(info), result);
+  // Decommitting pages alone leaves a reservation behind. Destruction must
+  // release the entire mapping, so only MEM_FREE counts as unmapped.
+  return result == sizeof(info) && info.State != MEM_FREE;
+}
 #endif
 
 TEST(RocksdbMemtableFactoryTest, HoldsBackingChargeUntilDestruction) {
@@ -104,12 +118,12 @@ TEST(RocksdbMemtableFactoryTest, HoldsBackingChargeUntilDestruction) {
   EXPECT_EQ(0u, manager->mutable_memtable_memory_usage());
   EXPECT_EQ(charge, manager->memory_usage());
   EXPECT_TRUE(table->Contains(data));
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   EXPECT_TRUE(IsMapped(data));
 #endif
   table.reset();
   EXPECT_EQ(0u, manager->memory_usage());
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   EXPECT_FALSE(IsMapped(data));
 #endif
 }

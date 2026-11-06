@@ -25,7 +25,7 @@
 #include <zvec/db/config.h>
 #include "db/common/global_resource.h"
 #include "db/common/native_worker_memory.h"
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 #include "db/common/rocksdb_memtable_factory.h"
 #endif
 
@@ -311,7 +311,8 @@ Status RocksdbContext::validate_and_set_db_path(const std::string &db_path,
 
 void RocksdbContext::prepare_options(
     std::shared_ptr<rocksdb::MergeOperator> merge_op, bool writable) {
-#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+#if defined(_WIN32) || defined(__APPLE__) || \
+    (defined(__linux__) && !defined(__ANDROID__))
   // Buffered file writes already use the OS cache. Avoid another growable
   // malloc-backed copy whose freed buffers can remain resident after build.
   // A zero capacity selects RocksDB's direct-to-file buffered-I/O path; direct
@@ -413,7 +414,7 @@ void RocksdbContext::prepare_options(
   // are evicted as writes grow and writes stall if flushing cannot keep up.
   create_opts_.write_buffer_manager =
       GlobalResource::Instance().rocksdb_write_buffer_manager();
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   // malloc can retain freed MemTable blocks around unrelated live objects.
   // Keep SkipList semantics and WBM accounting, but tie the large backing to
   // a MemTable-owned mapping. Flush does not release pinned iterators' data;
