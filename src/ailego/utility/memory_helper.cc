@@ -13,10 +13,12 @@
 // limitations under the License.
 
 #include "memory_helper.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/ailego/utility/string_helper.h>
 
@@ -44,15 +46,19 @@ bool MemoryHelper::SelfUsage(size_t *vsz, size_t *rss) {
     return false;
   }
 
-  if (fscanf(fp, "%zd %zd", vsz, rss) == EOF) {
-    fclose(fp);
-    return false;
-  }
+  size_t virtual_pages = 0;
+  size_t resident_pages = 0;
+  const int fields = fscanf(fp, "%zu %zu", &virtual_pages, &resident_pages);
   fclose(fp);
 
-  long pagesz = sysconf(_SC_PAGESIZE);
-  *vsz *= (size_t)pagesz;
-  *rss *= (size_t)pagesz;
+  const long pagesz = sysconf(_SC_PAGESIZE);
+  if (fields != 2 || pagesz <= 0 ||
+      std::max(virtual_pages, resident_pages) >
+          std::numeric_limits<size_t>::max() / static_cast<size_t>(pagesz)) {
+    return false;
+  }
+  *vsz = virtual_pages * static_cast<size_t>(pagesz);
+  *rss = resident_pages * static_cast<size_t>(pagesz);
   return true;
 }
 
@@ -62,13 +68,17 @@ size_t MemoryHelper::SelfRSS() {
     return 0;
   }
 
-  size_t rss = 0;
-  if (fscanf(fp, "%*d %zd %*d", &rss) == EOF) {
-    fclose(fp);
+  size_t resident_pages = 0;
+  // The virtual page count can exceed INT_MAX for large reserved mappings.
+  const int fields = fscanf(fp, "%*s %zu", &resident_pages);
+  fclose(fp);
+  const long pagesz = sysconf(_SC_PAGESIZE);
+  if (fields != 1 || pagesz <= 0 ||
+      resident_pages >
+          std::numeric_limits<size_t>::max() / static_cast<size_t>(pagesz)) {
     return 0;
   }
-  fclose(fp);
-  return (rss * sysconf(_SC_PAGESIZE));
+  return resident_pages * static_cast<size_t>(pagesz);
 }
 
 size_t MemoryHelper::SelfPeakRSS() {
