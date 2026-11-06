@@ -16,15 +16,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <limits>
 #include <thread>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
+#include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/io/file.h>
 #include <zvec/db/config.h>
 #include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
@@ -142,6 +145,40 @@ void CheckConcurrentLazyResourceAccess(bool existing_pool) {
   EXPECT_EQ(expected_pool_capacity, pool.capacity());
 }
 
+#if defined(__linux__) || defined(__APPLE__)
+void CheckStartupHostMemoryRecovery() {
+  constexpr size_t kMiB = 1UL << 20;
+  void *host = ailego::File::MemoryMap(128 * kMiB, 0);
+  ASSERT_NE(nullptr, host);
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    if (host) ailego::File::MemoryUnmap(host, 128 * kMiB);
+  });
+  std::memset(host, 0x6a, 128 * kMiB);
+  const size_t rss = ailego::MemoryHelper::SelfRSS();
+  ASSERT_GT(rss, 0u);
+  GlobalConfig::ConfigData config;
+  config.memory_limit_bytes = rss + 4 * kMiB;
+  config.query_thread_count = config.optimize_thread_count = 1;
+  ASSERT_TRUE(GlobalConfig::Instance().initialize(config).ok());
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_GT(pool.queue_metadata_used(), 0u);
+  ASSERT_GT(detail::NativeWorkerStackReservation().bytes(), 0u);
+  ailego::File::MemoryUnmap(host, 128 * kMiB);
+  host = nullptr;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (pool.under_process_rss_pressure() &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_FALSE(pool.under_process_rss_pressure());
+  ASSERT_LT(pool.process_rss() + 16 * kMiB, config.memory_limit_bytes);
+  ASSERT_TRUE(pool.try_charge_workspace(16 * kMiB));
+  pool.release_external(16 * kMiB);
+  // Persistent metadata and worker allowances remain live throughout recovery.
+  EXPECT_GT(pool.committed(), 0u);
+}
+#endif
+
 }  // namespace
 #endif  // GTEST_HAS_DEATH_TEST
 
@@ -170,6 +207,20 @@ TEST_P(GlobalResourceDeathTest,
 // Exercise both a fresh default budget and an existing core-owned pool.
 INSTANTIATE_TEST_SUITE_P(PoolInitialization, GlobalResourceDeathTest,
                          ::testing::Values(false, true));
+
+#if (defined(__linux__) || defined(__APPLE__)) && GTEST_HAS_DEATH_TEST
+TEST(GlobalResourceStartupDeathTest, HostReleaseRestoresWorkspaceAdmission) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        CheckStartupHostMemoryRecovery();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
+#endif
 
 #if defined(__linux__)
 TEST(NativeImageMemory, CountsResidentCapacityNotFileSizeOrSegmentGaps) {

@@ -10,6 +10,7 @@
 #include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/io/file.h>
 #include "pool_payload_budget.h"
 
 namespace zvec::ailego {
@@ -154,6 +155,34 @@ TEST_F(BudgetedAlignedBufferTest, UntouchedMappingKeepsRssReservation) {
       { BudgetedAlignedBuffer second(16UL << 20, 64); }, std::bad_alloc);
   first.resize(0, 64);
   ASSERT_NO_THROW(first.resize(16UL << 20, 64));
+}
+
+TEST_F(BudgetedAlignedBufferTest, HostReleaseRecoversWithLiveQueueMetadata) {
+  ASSERT_EQ(0, pool_.init(64UL << 20));
+  auto &native_pool = MemoryLimitPool::get_instance();
+  ASSERT_GT(native_pool.queue_metadata_used(), 0u);
+  constexpr size_t kHostBytes = 64UL << 20;
+  void *host = File::MemoryMap(kHostBytes, 0);
+  ASSERT_NE(nullptr, host);
+  auto cleanup = ScopeGuard::Make([&] {
+    if (host) File::MemoryUnmap(host, kHostBytes);
+    native_pool.configure_process_rss_limit(0);
+  });
+  std::memset(host, 0x27, kHostBytes);
+  const size_t rss = MemoryHelper::SelfRSS();
+  ASSERT_GT(rss, 0u);
+  ASSERT_TRUE(native_pool.configure_process_rss_limit(rss + (4UL << 20)));
+  ASSERT_TRUE(native_pool.under_process_rss_pressure());
+  File::MemoryUnmap(host, kHostBytes);
+  host = nullptr;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (native_pool.under_process_rss_pressure() &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_FALSE(native_pool.under_process_rss_pressure());
+  ASSERT_NO_THROW({ BudgetedAlignedBuffer buffer(16UL << 20, 64); });
+  EXPECT_GT(native_pool.queue_metadata_used(), 0u);
 }
 }  // namespace
 }  // namespace zvec::ailego

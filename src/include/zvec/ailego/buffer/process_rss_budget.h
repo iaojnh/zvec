@@ -34,6 +34,11 @@ class ProcessRssBudget {
     if (limit && !this->limit()) {
       baseline_rss_ = rss;
       baseline_backing_ = backing_;
+      recovery_floor_ = rss;
+      resident_upper_ = std::min(rss, backing_);
+      pending_releases_ = 0;
+    } else if (!limit) {
+      recovery_floor_ = resident_upper_ = pending_releases_ = 0;
     }
     reader_ = reader;
     limit_.store(limit, std::memory_order_relaxed);
@@ -73,6 +78,10 @@ class ProcessRssBudget {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(bytes <= backing_);
     backing_ -= bytes;
+    // Only backing that could have contributed to a successful RSS sample
+    // can explain a later RSS decrease. Unsampled allocation/free churn must
+    // not accumulate unlimited release credits and hide host-memory recovery.
+    pending_releases_ += std::min(bytes, resident_upper_ - pending_releases_);
     update_available();
   }
 
@@ -107,17 +116,59 @@ class ProcessRssBudget {
   }
 
   void publish(size_t rss) {
-    // Only rebase down with no outstanding backing. A decrease in total
-    // backing alone does not prove which owners retired: resident startup
-    // allocations may have been replaced by untouched mappings of equal size.
-    if (backing_ == 0 && rss < baseline_rss_) {
-      baseline_rss_ = rss;
-      baseline_backing_ = backing_;
-    }
+    if (limit()) reconcile_recovery(rss);
     sampled_backing_ = backing_;
     rss_.store(rss, std::memory_order_relaxed);
     update_available();
     sampled_at_ = std::chrono::steady_clock::now();
+  }
+
+  static size_t add_saturated(size_t left, size_t right) {
+    return left + std::min(right, std::numeric_limits<size_t>::max() - left);
+  }
+
+  void reconcile_recovery(size_t rss) {
+    if (backing_ == 0) {
+      // With no live reservations, any remaining allocator retention belongs
+      // to this new RSS baseline. Later admissions start from zero backing.
+      baseline_rss_ = rss;
+      baseline_backing_ = 0;
+      recovery_floor_ = rss;
+      resident_upper_ = pending_releases_ = 0;
+      return;
+    }
+    const size_t previous = rss_.load(std::memory_order_relaxed);
+    if (rss < previous) {
+      const size_t owned_drop = std::min(previous - rss, pending_releases_);
+      pending_releases_ -= owned_drop;
+      resident_upper_ -= owned_drop;
+
+      // Move the RSS/backing anchor together when a release reaches RSS.
+      // This preserves the charge for another, still untouched owner even
+      // when it replaced resident backing that existed before configure().
+      const size_t retired =
+          std::min({owned_drop, baseline_rss_, baseline_backing_});
+      baseline_rss_ -= retired;
+      baseline_backing_ -= retired;
+
+      // Ignore the return from an RSS excursion above the previous floor:
+      // that growth was already covered by the sampled-RSS gate. Only a new
+      // low, after accounting for owned releases, lowers the host baseline.
+      const size_t floor_after_release =
+          std::min(recovery_floor_, previous - owned_drop);
+      if (rss < floor_after_release) {
+        baseline_rss_ -= std::min(baseline_rss_, floor_after_release - rss);
+      }
+      recovery_floor_ = std::min(floor_after_release, rss);
+    }
+
+    // A live allocation's residency is not individually observable here.
+    // Keep an upper bound rather than assuming all allocated bytes were
+    // touched. RSS growth can increase it; allocation churn alone cannot.
+    const size_t growth = rss > previous ? rss - previous : 0;
+    resident_upper_ = std::min({rss, add_saturated(backing_, pending_releases_),
+                                add_saturated(resident_upper_, growth)});
+    assert(pending_releases_ <= resident_upper_);
   }
 
   static size_t projected(size_t rss, size_t baseline, size_t backing) {
@@ -150,6 +201,9 @@ class ProcessRssBudget {
   size_t baseline_rss_{0};
   size_t baseline_backing_{0};
   size_t sampled_backing_{0};
+  size_t recovery_floor_{0};
+  size_t resident_upper_{0};
+  size_t pending_releases_{0};
   std::chrono::steady_clock::time_point sampled_at_{};
   std::atomic<size_t> limit_{0};
   std::atomic<size_t> available_{std::numeric_limits<size_t>::max()};

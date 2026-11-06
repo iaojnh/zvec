@@ -177,5 +177,101 @@ TEST(ProcessRssBudgetTest, ConcurrentAdmissionsShareUnmaterializedHeadroom) {
   budget.release(acquired.load());
   EXPECT_EQ(100 * kMiB, budget.available());
 }
+
+TEST(ProcessRssBudgetTest, StartupHostMemoryCanRetireWithPermanentBacking) {
+  ProcessRssBudget budget;
+  budget.account(100 * kMiB);
+  sampled_rss = 980 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.pressure());
+  sampled_rss = 100 * kMiB;
+  for (int i = 0; i < 3; ++i) budget.refresh(true);
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_EQ(900 * kMiB, budget.available());
+  EXPECT_TRUE(budget.try_acquire(64 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, HostRecoveryKeepsUntouchedBackingReserved) {
+  ProcessRssBudget budget;
+  budget.account(100 * kMiB);
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  sampled_rss = 200 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(500 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(501 * kMiB));
+  budget.release(300 * kMiB);
+  budget.refresh(true);
+  EXPECT_EQ(800 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, TemporaryHostGrowthDoesNotConsumePendingBacking) {
+  ProcessRssBudget budget;
+  sampled_rss = 300 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  sampled_rss = 700 * kMiB;
+  budget.refresh(true);
+  sampled_rss = 300 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(400 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(401 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, DelayedReleaseDoesNotRefundAnotherPendingOwner) {
+  ProcessRssBudget budget;
+  budget.account(100 * kMiB);
+  sampled_rss = 300 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  sampled_rss = 600 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  budget.release(300 * kMiB);
+  for (int i = 0; i < 3; ++i) budget.refresh(true);
+  sampled_rss = 300 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(400 * kMiB, budget.available());
+  budget.release(300 * kMiB);
+  budget.refresh(true);
+  EXPECT_EQ(700 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, AllocationChurnCannotAccumulateReleaseCredits) {
+  ProcessRssBudget budget;
+  budget.account(10 * kMiB);
+  sampled_rss = 980 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  // These short-lived allocations never contribute to an RSS sample. Their
+  // cumulative size must not hide a later release of caller-owned memory.
+  for (int i = 0; i < 2000; ++i) {
+    ASSERT_TRUE(budget.try_acquire(kMiB));
+    budget.release(kMiB);
+    budget.refresh(true);
+  }
+  sampled_rss = 100 * kMiB;
+  budget.refresh(true);
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_GE(budget.available(), 890 * kMiB);
+  EXPECT_TRUE(budget.try_acquire(64 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, HostRecoveryAfterResidentRetirementKeepsMetadata) {
+  ProcessRssBudget budget;
+  budget.account(100 * kMiB);
+  sampled_rss = 600 * kMiB;
+  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+  sampled_rss = 900 * kMiB;
+  budget.refresh(true);
+  budget.release(300 * kMiB);
+  sampled_rss = 600 * kMiB;
+  budget.refresh(true);
+  sampled_rss = 200 * kMiB;
+  budget.refresh(true);
+  EXPECT_FALSE(budget.pressure());
+  EXPECT_EQ(800 * kMiB, budget.available());
+}
 }  // namespace
 }  // namespace zvec::ailego
