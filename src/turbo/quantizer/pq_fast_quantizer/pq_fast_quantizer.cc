@@ -21,6 +21,7 @@
 #include <limits>
 #include <random>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
@@ -530,7 +531,7 @@ void PqFastQuantizer::compute_float_lut(const void *input, float *lut) const {
 
   // For Cosine: normalize FIRST (Cosine uses an L2 LUT on normalized data),
   // consistent with train() / quantize_data().
-  std::vector<uint8_t> norm_query_storage;
+  ModelVector<uint8_t> norm_query_storage;
   const void *query = input;
 
   if (meta_.metric_name() == "Cosine") {
@@ -551,7 +552,7 @@ void PqFastQuantizer::compute_float_lut(const void *input, float *lut) const {
   }
 
   // Zero-mean centering: subtract centroid before LUT computation.
-  std::vector<uint8_t> centered_query_storage;
+  ModelVector<uint8_t> centered_query_storage;
   if (use_zero_mean_) {
     centered_query_storage.resize(original_dim_ * elem_size);
     std::memcpy(centered_query_storage.data(), query,
@@ -572,7 +573,12 @@ void PqFastQuantizer::compute_float_lut(const void *input, float *lut) const {
   }
 
   // OPQ: rotate last, as quantize_data() does.
+  ailego::MemoryReservation rotation_memory;
   std::vector<float> rotated_query_storage;
+  if (opq_.enabled()) {
+    ailego::ReserveVectorCapacity(rotated_query_storage, rotation_memory,
+                                  original_dim_);
+  }
   query = opq_.apply(query, &rotated_query_storage);
 
   // LUT[m][j] = distance(q_m, c_m[j]) via the metric-aware batch_fn_:
@@ -630,7 +636,7 @@ int PqFastQuantizer::quantize_lut(const float *lut, void *output) const {
   const float delta = std::max(hi - lo, epsilon) / 255.0f;
   const float inv_delta = 1.0f / delta;
 
-  std::vector<uint8_t> u8_lut(lut_size);
+  ModelVector<uint8_t> u8_lut(lut_size);
   for (size_t i = 0; i < lut_size; ++i) {
     // Non-finite entries go to the far end: NaN slips through the clamp
     // untouched and would cast to code 0, i.e. the *smallest* distance.
@@ -654,7 +660,7 @@ int PqFastQuantizer::quantize_lut(const float *lut, void *output) const {
 }
 
 void PqFastQuantizer::quantize_query(const void *input, void *output) const {
-  std::vector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
+  ModelVector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
   compute_float_lut(input, lut.data());
   quantize_lut(lut.data(), output);
 }
@@ -814,7 +820,7 @@ int PqFastQuantizer::merge_query_distance_table(
 
   //! term2 + term3 in the float domain, then affine-quantize once, so the
   //! output keeps the packed-u8 FastScan query format consumed by the scan.
-  std::vector<float> merged(row_floats);
+  ModelVector<float> merged(row_floats);
   const float *qtab = reinterpret_cast<const float *>(query_table);
   const float *ctab = reinterpret_cast<const float *>(centroid_table.data()) +
                       centroid_id * row_floats;

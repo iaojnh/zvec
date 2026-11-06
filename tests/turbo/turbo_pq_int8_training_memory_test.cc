@@ -119,6 +119,58 @@ TEST(PqModelMemoryTest, FastModelsAreChargedAndReinitReleasesThem) {
   check_small_codebook_budget<PqFastQuantizer>();
 }
 
+TEST(PqModelMemoryTest, FastQueryAdmitsBothLookupTableBuffers) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(4 * 1024 * 1024));
+  AILEGO_DEFER([&] { EXPECT_EQ(0, pool.init(previous)); });
+
+  constexpr size_t kDim = 32;
+  constexpr uint32_t kChunks = 8;
+  PqFastQuantizer quantizer;
+  core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  ailego::Params params;
+  params.set("num_chunk", kChunks);
+  params.set("thread_count", 1u);
+  params.set("markov_chain_length", 0u);
+  ASSERT_EQ(0, quantizer.init(meta, params));
+  auto holder =
+      std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(
+          kDim);
+  for (size_t i = 0; i < 64; ++i) {
+    ailego::NumericalVector<float> row(kDim);
+    for (size_t d = 0; d < kDim; ++d) row[d] = float((i * 17 + d) % 31);
+    holder->emplace(i, row);
+  }
+  ASSERT_EQ(0, quantizer.train(holder));
+
+  const std::vector<float> query(kDim, 0.0f);
+  const size_t output_bytes = quantizer.quantized_query_vector_length();
+  std::vector<uint8_t> expected(output_bytes);
+  quantizer.quantize_query(query.data(), expected.data());
+  const size_t baseline = pool.external_used();
+  // First refuse the float table, then leave room for it but refuse the byte
+  // table that overlaps it during packing. The packed output is caller-owned.
+  const size_t float_bytes = kChunks * 16 * sizeof(float);
+  for (size_t remaining : {size_t{1}, float_bytes + 64}) {
+    std::vector<uint8_t> output(output_bytes, 0xa5);
+    const auto untouched = output;
+    {
+      ailego::MemoryReservation pressure;
+      pressure.add(pool.capacity() - pool.used() - remaining);
+      const size_t blocked = pool.external_used();
+      EXPECT_THROW(quantizer.quantize_query(query.data(), output.data()),
+                   std::bad_alloc);
+      EXPECT_EQ(untouched, output);
+      EXPECT_EQ(blocked, pool.external_used());
+    }
+    EXPECT_NO_THROW(quantizer.quantize_query(query.data(), output.data()));
+    EXPECT_EQ(expected, output);
+    EXPECT_EQ(baseline, pool.external_used());
+  }
+}
+
 TEST(PqInt8ModelMemoryTest, CodebookIsChargedAndNormsAreOnlyTemporary) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   pool.init(8 * 1024 * 1024);

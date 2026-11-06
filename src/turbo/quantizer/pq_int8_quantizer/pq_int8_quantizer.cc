@@ -22,6 +22,7 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
@@ -627,7 +628,7 @@ void PqInt8Quantizer::quantize_query(const void *input, void *output) const {
 
   // For Cosine: normalize FIRST (Cosine uses an L2 LUT on normalized data),
   // consistent with train() / quantize_data().
-  std::vector<uint8_t> norm_query_storage;
+  ModelVector<uint8_t> norm_query_storage;
   const void *query = input;
 
   if (meta_.metric_name() == "Cosine") {
@@ -648,7 +649,7 @@ void PqInt8Quantizer::quantize_query(const void *input, void *output) const {
   }
 
   // Zero-mean centering: subtract centroid before LUT computation.
-  std::vector<uint8_t> centered_query_storage;
+  ModelVector<uint8_t> centered_query_storage;
   if (use_zero_mean_) {
     centered_query_storage.resize(original_dim_ * elem_size);
     std::memcpy(centered_query_storage.data(), query,
@@ -669,7 +670,12 @@ void PqInt8Quantizer::quantize_query(const void *input, void *output) const {
   }
 
   // OPQ: rotate last, exactly as quantize_data() does.
+  ailego::MemoryReservation rotation_memory;
   std::vector<float> rotated_query_storage;
+  if (opq_.enabled()) {
+    ailego::ReserveVectorCapacity(rotated_query_storage, rotation_memory,
+                                  original_dim_);
+  }
   query = opq_.apply(query, &rotated_query_storage);
 
   // LUT[m][j] = distance(q_m, c_m[j]) via the metric-aware batch_fn_.
@@ -722,7 +728,7 @@ void PqInt8Quantizer::calc_distance_dp_query_batch(const void *const *dp_list,
 float PqInt8Quantizer::calc_distance_dp_query_unquantized(
     const void *dp, const void *query) const {
   // Build LUT on the fly, then use ADC.
-  std::vector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
+  ModelVector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
   quantize_query(query, lut.data());
   float d = 0.0f;
   adc_fn_(reinterpret_cast<const uint8_t *>(dp), lut.data(), num_chunk_, &d);
@@ -732,7 +738,7 @@ float PqInt8Quantizer::calc_distance_dp_query_unquantized(
 void PqInt8Quantizer::calc_distance_dp_query_batch_unquantized(
     const void *const *dp_list, int dp_num, const void *query,
     float *dist_list) const {
-  std::vector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
+  ModelVector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
   quantize_query(query, lut.data());
   // Use ISA-dispatched batch4 ADC kernel (4-way ILP + SIMD gather).
   // const_cast: see calc_distance_dp_query_batch for rationale.
