@@ -786,6 +786,8 @@ class ZVEC_AILEGO_API VecBufferPool {
  private:
   friend class VecBufferPoolHandle;
   friend struct VecBufferPoolTestPeer;
+  bool read_range_bypass(size_t file_offset, size_t length, char *buffer,
+                         bool &allocation_failed);
   char *acquire_buffer(block_id_t page_id, int retry, bool record_reuse,
                        bool *allocation_failed);
   PageWriteStatus write_range_status(size_t file_offset, size_t length,
@@ -905,6 +907,8 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
   void release_pages(const block_id_t *page_ids, size_t count);
 
   bool read_range(size_t file_offset, size_t len, char *out);
+  bool read_range(size_t file_offset, size_t len, char *out,
+                  bool &allocation_failed);
 
   // Copy a range whose bytes are immutable after publication. Writers may
   // still update disjoint records in the same page, so pages stay pinned for
@@ -912,6 +916,8 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
   bool read_range_immutable(size_t file_offset, size_t len, char *out);
 
   bool read_range_bypass(size_t file_offset, size_t len, char *out);
+  bool read_range_bypass(size_t file_offset, size_t len, char *out,
+                         bool &allocation_failed);
 
   void prefetch_range(size_t file_offset, size_t len,
                       uint8_t priority = VecBufferPool::kLowPriority);

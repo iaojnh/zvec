@@ -21,8 +21,9 @@ fewer workers or read-only operation.
 On iOS devices (iOS 13 or later), admission also considers `phys_footprint` and
 `os_proc_available_memory()`, with a reserve below the application limit. RSS
 and footprint are separate constraints, not summed charges. Untouched backing
-remains charged across samples. A failed sample retains the previous estimate;
-zero available bytes stops new backing. Simulator runs use RSS and host
+remains charged across samples. A failed sample retains the previous estimate.
+Repeated failures pause new managed backing until the reader recovers. Zero
+available bytes also stops new backing. Simulator runs use RSS and host
 notifications because host limits do not describe a device application's limit.
 
 ## Forward host lifecycle and pressure events

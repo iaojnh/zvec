@@ -96,6 +96,8 @@ class IoUringRing {
   // Create an io_uring with `entries` queue slots.  Returns false if the
   // kernel lacks io_uring or setup failed.  In iouring_loader.cc.
   bool setup(uint32_t entries);
+  enum class SetupResult { kReady, kUnavailable, kNoMemory };
+  SetupResult setup_with_status(uint32_t entries);
 
   // munmap all regions, close the ring fd, free staging.  Closing the fd
   // only *starts* asynchronous cancellation of in-flight requests, so call
@@ -147,6 +149,7 @@ class IoUringRing {
 
  private:
   friend class IoUringStagingTestPeer;
+  SetupResult map_control_regions(const io_uring_params &params);
   bool release_staging();
   int execute_impl(int fd, const IoUringRead *read_reqs,
                    const IoUringWrite *write_reqs, size_t count);

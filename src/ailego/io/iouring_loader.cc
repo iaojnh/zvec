@@ -62,6 +62,13 @@ bool IoUringRing::release_staging() {
 }
 
 bool IoUringRing::setup(uint32_t entries) {
+  return setup_with_status(entries) == SetupResult::kReady;
+}
+
+IoUringRing::SetupResult IoUringRing::setup_with_status(uint32_t entries) {
+  if (is_valid()) return SetupResult::kReady;
+  auto &pool = MemoryLimitPool::get_instance();
+  if (pool.under_process_rss_pressure()) return SetupResult::kNoMemory;
   struct io_uring_params params;
   std::memset(&params, 0, sizeof(params));
 
@@ -72,14 +79,12 @@ bool IoUringRing::setup(uint32_t entries) {
     // ENOSYS = kernel doesn't support io_uring.
     // EPERM  = io_uring disabled via sysctl.
     // EINVAL = invalid parameters.
-    if (errno != ENOSYS) {
-      LOG_WARN("io_uring_setup failed; errno=%d, %s", errno, ::strerror(errno));
+    const int error = errno;
+    if (error != ENOSYS) {
+      LOG_WARN("io_uring_setup failed; errno=%d, %s", error, ::strerror(error));
     }
-    return false;
+    return error == ENOMEM ? SetupResult::kNoMemory : SetupResult::kUnavailable;
   }
-
-  sq_entries_ = params.sq_entries;
-  cq_entries_ = params.cq_entries;
 
   // The read path uses IORING_OP_READ (Linux 5.6+).  On older kernels
   // (5.1–5.5) io_uring_setup() succeeds but every read would fail with
@@ -89,46 +94,61 @@ bool IoUringRing::setup(uint32_t entries) {
         "io_uring lacks IORING_OP_READ support (kernel < 5.6); falling "
         "back");
     teardown();
-    return false;
+    return SetupResult::kUnavailable;
   }
 
-  // --- mmap the three shared regions ---
+  bool ready = false;
+  const auto rollback = ScopeGuard::Make([&] {
+    if (!ready) teardown();
+  });
+  const auto result = map_control_regions(params);
+  ready = result == SetupResult::kReady;
+  return result;
+}
 
-  // 1. SQ ring (includes head, tail, mask, entries, flags, dropped, array).
+IoUringRing::SetupResult IoUringRing::map_control_regions(
+    const io_uring_params &params) {
+  sq_entries_ = params.sq_entries;
+  cq_entries_ = params.cq_entries;
   sq_ring_size_ =
       static_cast<size_t>(params.sq_off.array) + sq_entries_ * sizeof(uint32_t);
-  sq_ring_ptr_ = ::mmap(nullptr, sq_ring_size_, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, ring_fd_, IORING_OFF_SQ_RING);
-  if (sq_ring_ptr_ == MAP_FAILED) {
-    LOG_ERROR("mmap SQ ring failed: %s", ::strerror(errno));
-    sq_ring_ptr_ = nullptr;
-    teardown();
-    return false;
-  }
-
-  // 2. SQE array.
   sqes_size_ = sq_entries_ * sizeof(struct io_uring_sqe);
-  sqes_ptr_ = reinterpret_cast<struct io_uring_sqe *>(
-      ::mmap(nullptr, sqes_size_, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd_,
-             IORING_OFF_SQES));
-  if (sqes_ptr_ == MAP_FAILED) {
-    LOG_ERROR("mmap SQEs failed: %s", ::strerror(errno));
-    sqes_ptr_ = nullptr;
-    teardown();
-    return false;
-  }
-
-  // 3. CQ ring (includes head, tail, mask, entries, overflow, cqes[]).
   cq_ring_size_ = static_cast<size_t>(params.cq_off.cqes) +
                   cq_entries_ * sizeof(struct io_uring_cqe);
-  cq_ring_ptr_ = ::mmap(nullptr, cq_ring_size_, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, ring_fd_, IORING_OFF_CQ_RING);
-  if (cq_ring_ptr_ == MAP_FAILED) {
-    LOG_ERROR("mmap CQ ring failed: %s", ::strerror(errno));
-    cq_ring_ptr_ = nullptr;
-    teardown();
-    return false;
-  }
+
+  auto &pool = MemoryLimitPool::get_instance();
+  // A thread-local ring can outlive the storage that first used it. Charge
+  // all mapped views to the process for their lifetime, independently of a
+  // standalone cache's capacity or reinitialization. No eviction is needed
+  // here, since the caller may already hold storage locks.
+  const size_t sq_charge = BudgetedMappedBuffer::mapping_size(sq_ring_size_);
+  const size_t sqes_charge = BudgetedMappedBuffer::mapping_size(sqes_size_);
+  const size_t cq_charge = BudgetedMappedBuffer::mapping_size(cq_ring_size_);
+  size_t pending = sq_charge + sqes_charge + cq_charge;
+  if (!pool.try_reserve_process_backing(pending))
+    return SetupResult::kNoMemory;
+  const auto cancel = ScopeGuard::Make([&] {
+    if (pending) pool.finish_process_backing(pending, false);
+  });
+
+  const auto map_region = [&](size_t size, off_t offset, size_t charge) {
+    void *region = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                          ring_fd_, offset);
+    if (region == MAP_FAILED) {
+      LOG_ERROR("io_uring control mapping failed: %s", ::strerror(errno));
+      return static_cast<void *>(nullptr);
+    }
+    pool.finish_process_backing(charge, true);
+    pending -= charge;
+    return region;
+  };
+  sq_ring_ptr_ = map_region(sq_ring_size_, IORING_OFF_SQ_RING, sq_charge);
+  if (!sq_ring_ptr_) return SetupResult::kUnavailable;
+  sqes_ptr_ = static_cast<struct io_uring_sqe *>(
+      map_region(sqes_size_, IORING_OFF_SQES, sqes_charge));
+  if (!sqes_ptr_) return SetupResult::kUnavailable;
+  cq_ring_ptr_ = map_region(cq_ring_size_, IORING_OFF_CQ_RING, cq_charge);
+  if (!cq_ring_ptr_) return SetupResult::kUnavailable;
 
   // --- Set up typed pointers into the mmap'd regions ---
 
@@ -171,19 +191,22 @@ bool IoUringRing::setup(uint32_t entries) {
     sq_array_[i] = i;
   }
 
-  return true;
+  return SetupResult::kReady;
 }
 
 void IoUringRing::teardown() {
-  if (sq_ring_ptr_ && sq_ring_ptr_ != MAP_FAILED) {
-    ::munmap(sq_ring_ptr_, sq_ring_size_);
-  }
-  if (sqes_ptr_ && sqes_ptr_ != MAP_FAILED) {
-    ::munmap(sqes_ptr_, sqes_size_);
-  }
-  if (cq_ring_ptr_ && cq_ring_ptr_ != MAP_FAILED) {
-    ::munmap(cq_ring_ptr_, cq_ring_size_);
-  }
+  const auto release_region = [](void *region, size_t size) {
+    if (!region) return;
+    if (::munmap(region, size) != 0) {
+      LOG_ERROR("io_uring control unmap failed; size=%zu", size);
+    } else {
+      MemoryLimitPool::get_instance().release_process_backing(
+          BudgetedMappedBuffer::mapping_size(size));
+    }
+  };
+  release_region(sq_ring_ptr_, sq_ring_size_);
+  release_region(sqes_ptr_, sqes_size_);
+  release_region(cq_ring_ptr_, cq_ring_size_);
 
   sq_ring_ptr_ = nullptr;
   sqes_ptr_ = nullptr;

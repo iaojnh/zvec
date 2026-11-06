@@ -38,6 +38,17 @@ class IoUringStagingTestPeer {
   static size_t size(const IoUringRing &ring) {
     return ring.staging_size_;
   }
+  static IoUringRing::SetupResult map_control_regions(IoUringRing &ring,
+                                                       int fd) {
+    ring.ring_fd_ = ::dup(fd);
+    if (ring.ring_fd_ < 0) return IoUringRing::SetupResult::kUnavailable;
+    io_uring_params params{};
+    params.sq_entries = 8;
+    params.cq_entries = 16;
+    params.sq_off.array = 64;
+    params.cq_off.cqes = 64;
+    return ring.map_control_regions(params);
+  }
 };
 namespace {
 
@@ -182,6 +193,31 @@ class TemporaryFile {
   char path_[64] = "IoUringLoaderTest.XXXXXX";
   int fd_;
 };
+
+TEST_F(IoUringLoaderTest, ControlMappingsObeyProcessBudgetAndCanRetry) {
+  const size_t page = PoolPayloadBudget::page_buffer_size();
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  // Exercise the mmap lifecycle on kernels or containers that disallow
+  // io_uring_setup. The three regions are backed by this sparse test file.
+  ASSERT_EQ(0, ::ftruncate(file.fd(), IORING_OFF_SQES + page));
+  IoUringRing ring;
+  using Result = IoUringRing::SetupResult;
+  auto &pool = MemoryLimitPool::get_instance();
+  const auto restore =
+      ScopeGuard::Make([&] { pool.configure_process_rss_limit(0); });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  EXPECT_EQ(Result::kNoMemory,
+            IoUringStagingTestPeer::map_control_regions(ring, file.fd()));
+  ring.teardown();
+
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  ASSERT_EQ(Result::kReady,
+            IoUringStagingTestPeer::map_control_regions(ring, file.fd()));
+  EXPECT_EQ(0, pool_.init(2 * page));
+  ring.teardown();
+  EXPECT_EQ(0u, pool_.used());
+}
 
 void *allocate_aligned(size_t size) {
   void *buffer = nullptr;

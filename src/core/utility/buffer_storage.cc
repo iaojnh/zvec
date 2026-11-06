@@ -1033,8 +1033,7 @@ class BufferStorage : public IndexStorage {
         return 0;
       }
       bool read_ok =
-          force_bypass ? owner_->buffer_pool_handle_->read_range_bypass(
-                             abs_offset, len, tmp)
+          force_bypass ? owner_->read_bypass(abs_offset, len, tmp)
           : immutable ? owner_->buffer_pool_handle_->read_range_immutable(
                             abs_offset, len, tmp)
                       : owner_->read_range(abs_offset, len, tmp);
@@ -1042,8 +1041,7 @@ class BufferStorage : public IndexStorage {
         // A cross-page immutable read can lose a capacity race after choosing
         // the cache path. Retry without admission; writable bypass reads still
         // preserve resident dirty bytes and synchronize with page transitions.
-        read_ok = owner_->buffer_pool_handle_->read_range_bypass(abs_offset,
-                                                                 len, tmp);
+        read_ok = owner_->read_bypass(abs_offset, len, tmp);
       }
       if (!read_ok) {
         LOG_ERROR(
@@ -1926,10 +1924,21 @@ class BufferStorage : public IndexStorage {
   }
 
  private:
+  bool read_bypass(size_t offset, size_t len, char *out) const {
+    bool allocation_failed = false;
+    const bool ok = buffer_pool_handle_->read_range_bypass(
+        offset, len, out, allocation_failed);
+    if (allocation_failed) buffer_storage_read_error = IndexError_NoMemory;
+    return ok;
+  }
+
   bool read_range(size_t offset, size_t len, char *out) const {
-    return cache_enabled_
-               ? buffer_pool_handle_->read_range(offset, len, out)
-               : buffer_pool_handle_->read_range_bypass(offset, len, out);
+    if (!cache_enabled_) return read_bypass(offset, len, out);
+    bool allocation_failed = false;
+    const bool ok =
+        buffer_pool_handle_->read_range(offset, len, out, allocation_failed);
+    if (allocation_failed) buffer_storage_read_error = IndexError_NoMemory;
+    return ok;
   }
 
   std::atomic<bool> index_dirty_{false};

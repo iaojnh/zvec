@@ -1146,27 +1146,9 @@ int VecBufferPool::init() {
       writable_ ? kBlockingAioBatchSize * kVectorPageSize : 0;
   size_t io_staging_charge = 0;
 #if defined(__linux__) && !defined(__ANDROID__)
-  std::unique_ptr<IoUringRing> writeback_io_uring;
   if (writable_ && io_backend_type_ == IOBackendType::kIoUring) {
-    // Keep the estimator and actual reservation stable even if creating this
-    // pool's ring fails and it must fall back to pwrite.
+    // Preserve the existing staging allowance while falling back to pwrite.
     io_staging_charge = kBlockingAioBatchSize * kVectorPageSize;
-    try {
-      writeback_io_uring = std::make_unique<IoUringRing>();
-      if (!writeback_io_uring->setup(kBlockingAioBatchSize)) {
-        writeback_io_uring.reset();
-        LOG_WARN(
-            "VecBufferPool::init: io_uring writeback setup failed for "
-            "file[%s], falling back to pwrite",
-            file_name_.c_str());
-      }
-    } catch (const std::bad_alloc &) {
-      writeback_io_uring.reset();
-      LOG_WARN(
-          "VecBufferPool::init: cannot allocate io_uring writeback context "
-          "for file[%s], falling back to pwrite",
-          file_name_.c_str());
-    }
   }
 #endif
   const size_t writable_metadata_charge =
@@ -1240,9 +1222,20 @@ int VecBufferPool::init() {
   writeback_staging_size_ = staging_charge;
   writeback_io_staging_charge_ = io_staging_charge;
 #if defined(__linux__) && !defined(__ANDROID__)
-  if (writeback_io_uring)
-    writeback_io_uring->adopt_staging_reservation(io_staging_charge);
-  writeback_io_uring_ = std::move(writeback_io_uring);
+  // Admit optional control mappings after the mandatory page table and
+  // writeback memory. A small pool can still use synchronous writeback.
+  if (io_staging_charge) {
+    try {
+      auto ring = std::make_unique<IoUringRing>();
+      if (ring->setup(kBlockingAioBatchSize)) {
+        ring->adopt_staging_reservation(io_staging_charge);
+        writeback_io_uring_ = std::move(ring);
+      }
+    } catch (const std::bad_alloc &) {
+      LOG_WARN("VecBufferPool::init: cannot allocate io_uring for file[%s]",
+               file_name_.c_str());
+    }
+  }
 #endif
   LOG_DEBUG("entry num: %zu, file_size: %zu", page_table_.entry_num(),
             file_size_);
@@ -1939,6 +1932,13 @@ bool VecBufferPool::requires_aligned_io() const {
 
 bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
                                       char *buffer) {
+  bool allocation_failed = false;
+  return read_range_bypass(file_offset, length, buffer, allocation_failed);
+}
+
+bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
+                                      char *buffer, bool &allocation_failed) {
+  allocation_failed = false;
   if (length == 0) {
     return true;
   }
@@ -1976,8 +1976,10 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
       // writer/eviction cannot leave us observing stale file contents.
       char *resident = nullptr;
       while ((resident = page_table_.acquire_block(page_id)) == nullptr) {
-        if (!direct_destination && PrepareReadScratch(scratch, 1) == 0)
+        if (!direct_destination && PrepareReadScratch(scratch, 1) == 0) {
+          allocation_failed = true;
           return false;
+        }
         const auto claim = page_table_.try_claim_block_load(page_id);
         if (claim == VectorPageTable::LoadClaimResult::kClaimed) {
           claimed = true;
@@ -1999,8 +2001,10 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
       }
     }
     if (!writable_ && !direct_destination &&
-        PrepareReadScratch(scratch, 1) == 0)
+        PrepareReadScratch(scratch, 1) == 0) {
+      allocation_failed = true;
       return false;
+    }
     char *page = direct_destination ? buffer + copied : scratch.data();
     const size_t available = file_size_ - page_offset;
     const size_t read_size =
@@ -2440,6 +2444,13 @@ void VecBufferPoolHandle::release_pages(const block_id_t *page_ids,
 
 bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len,
                                      char *out) {
+  bool allocation_failed = false;
+  return read_range(file_offset, len, out, allocation_failed);
+}
+
+bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
+                                     bool &allocation_failed) {
+  allocation_failed = false;
   if (len == 0) {
     return true;
   }
@@ -2455,7 +2466,9 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len,
   // Protect payload copies only for writable pools.
   if (pool_.writable_) {
     for (size_t pg = first_page; pg <= last_page; ++pg) {
-      char *page = pool_.acquire_buffer(static_cast<block_id_t>(pg), 50);
+      char *page = pool_.acquire_buffer(static_cast<block_id_t>(pg), 50,
+                                         /*record_reuse=*/true,
+                                         &allocation_failed);
       if (page == nullptr) {
         return false;
       }
@@ -2522,7 +2535,8 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len,
           std::memcpy(out + dst_cursor, page + intra_offset, chunk);
           pool_.page_table_.release_block(pid);
         } else if (!pool_.read_range_bypass(page_start + intra_offset, chunk,
-                                            out + dst_cursor)) {
+                                            out + dst_cursor,
+                                            allocation_failed)) {
           return false;
         }
         dst_cursor += chunk;
@@ -2553,7 +2567,8 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len,
         std::memcpy(out + dst_cursor, page + intra_offset, chunk);
         pool_.page_table_.release_block(static_cast<block_id_t>(pg));
       } else if (!pool_.read_range_bypass(page_start + intra_offset, chunk,
-                                          out + dst_cursor)) {
+                                          out + dst_cursor,
+                                          allocation_failed)) {
         return false;
       }
       dst_cursor += chunk;
@@ -2655,6 +2670,11 @@ bool VecBufferPoolHandle::read_range_immutable(size_t file_offset, size_t len,
 bool VecBufferPoolHandle::read_range_bypass(size_t file_offset, size_t len,
                                             char *out) {
   return pool_.read_range_bypass(file_offset, len, out);
+}
+
+bool VecBufferPoolHandle::read_range_bypass(size_t file_offset, size_t len,
+                                            char *out, bool &allocation_failed) {
+  return pool_.read_range_bypass(file_offset, len, out, allocation_failed);
 }
 
 int VecBufferPoolHandle::get_meta(size_t offset, size_t length, char *buffer) {
@@ -2897,8 +2917,8 @@ struct ThreadLocalIoUringContext {
 
   bool ensure() {
     if (!inited) {
-      inited = true;
-      ring.setup(QueueDepth);
+      const auto result = ring.setup_with_status(QueueDepth);
+      inited = result != IoUringRing::SetupResult::kNoMemory;
     }
     return ring.is_valid();
   }
@@ -2911,6 +2931,8 @@ struct ThreadLocalAioContext {
 
   bool ensure() {
     if (inited) return ctx != nullptr;
+    if (MemoryLimitPool::get_instance().under_process_rss_pressure())
+      return false;
     inited = true;
     if (!LibAioLoader::Instance().load() ||
         !LibAioLoader::Instance().is_available()) {

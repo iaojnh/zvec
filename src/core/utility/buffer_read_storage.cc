@@ -453,9 +453,16 @@ class BufferReadStorage : public IndexStorage {
       return registry.last_scratch;
     }
 
-    bool read_bytes(size_t abs_offset, size_t len, char *out) const {
-      return cache_enabled_ ? handle_->read_range(abs_offset, len, out)
-                            : handle_->read_range_bypass(abs_offset, len, out);
+    bool read_bytes(size_t abs_offset, size_t len, char *out,
+                    bool force_bypass = false) const {
+      bool allocation_failed = false;
+      const bool ok =
+          force_bypass || !cache_enabled_
+              ? handle_->read_range_bypass(abs_offset, len, out,
+                                           allocation_failed)
+              : handle_->read_range(abs_offset, len, out, allocation_failed);
+      if (allocation_failed) thread_read_error() = IndexError_NoMemory;
+      return ok;
     }
 
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
@@ -504,10 +511,7 @@ class BufferReadStorage : public IndexStorage {
         owned = MemoryBlock::AllocateOwned(alloc_size, kAlign);
       }
       auto *tmp = static_cast<char *>(owned.data_);
-      const bool read_ok =
-          force_bypass ? handle_->read_range_bypass(abs_offset, len, tmp)
-                       : read_bytes(abs_offset, len, tmp);
-      if (!read_ok) {
+      if (!read_bytes(abs_offset, len, tmp, force_bypass)) {
         LOG_ERROR(
             "BufferReadStorage::Segment::read(MemoryBlock&): cross-page "
             "read_range failed, abs_offset=%zu, len=%zu",

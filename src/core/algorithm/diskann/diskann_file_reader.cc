@@ -26,6 +26,7 @@
 #include <thread>
 #include <utility>
 #include <ailego/io/io_backend_def.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/io_backend.h>
 #include <zvec/ailego/logger/logger.h>
@@ -248,14 +249,19 @@ int setup_io_ctx(IOContext &ctx) {
   }
 
   // Priority 1: io_uring (raw kernel syscalls — zero dependency).
-  if (selected == ailego::IOBackendType::kIoUring &&
-      ctx->ring.setup(MAX_EVENTS)) {
-    log_diskann_io_backend(ctx->type);
-    return 0;
+  if (selected == ailego::IOBackendType::kIoUring) {
+    const auto setup = ctx->ring.setup_with_status(MAX_EVENTS);
+    if (setup != ailego::IoUringRing::SetupResult::kUnavailable) {
+      if (setup == ailego::IoUringRing::SetupResult::kNoMemory)
+        ctx->type = ailego::IOBackendType::kPread;
+      log_diskann_io_backend(ctx->type);
+      return 0;
+    }
   }
 
   // Priority 2: libaio (dlopen — soft dependency).
   if (selected != ailego::IOBackendType::kPread &&
+      !ailego::MemoryLimitPool::get_instance().under_process_rss_pressure() &&
       LibAioLoader::Instance().load() &&
       LibAioLoader::Instance().is_available()) {
     int ret = LibAioLoader::Instance().io_setup(MAX_EVENTS, &ctx->aio_ctx);
@@ -359,6 +365,8 @@ static bool reset_aio_context(io_context_t &ctx) {
   }
 
   ctx = nullptr;
+  if (ailego::MemoryLimitPool::get_instance().under_process_rss_pressure())
+    return true;
   io_context_t replacement = nullptr;
   ret = loader.io_setup(MAX_EVENTS, &replacement);
   if (ret != 0) {

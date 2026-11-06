@@ -396,6 +396,7 @@ TEST_F(BufferReadStorageTest, TinyPoolBypassHonorsAlignmentScratchBudget) {
     // unaccounted TLS allocation here; it must now reject instead of bypassing
     // the memory limit. F_NOCACHE can read directly into the destination.
     EXPECT_EQ(0u, segment->fetch(0, actual.data(), actual.size()));
+    EXPECT_EQ(IndexError_NoMemory, segment->read_error());
     return;
   }
   ASSERT_EQ(actual.size(), segment->fetch(0, actual.data(), actual.size()));

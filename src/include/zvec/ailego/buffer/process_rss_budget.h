@@ -7,6 +7,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <mutex>
 
@@ -33,6 +34,9 @@ class ProcessRssBudget {
       // application limit. Keep admission closed until the next fresh sample,
       // without performing a system read in the lifecycle notification.
       recovery_sample_pending_ = true;
+      // Make the first recovery observation immediately eligible. If it
+      // fails, later admissions still use the ordinary sampling interval.
+      sampled_at_ = {};
     }
     external_pressure_ = level;
     update_available();
@@ -73,6 +77,7 @@ class ProcessRssBudget {
     native_reader_ = native_reader;
     reader_ = reader;
     recovery_sample_pending_ = false;
+    rss_sample_failures_ = native_sample_failures_ = 0;
     limit_.store(limit, std::memory_order_relaxed);
     pressure_.store(false, std::memory_order_relaxed);
     publish(rss);
@@ -188,9 +193,15 @@ class ProcessRssBudget {
       native_materialized_ = add_saturated(native_materialized_, bytes);
   }
 
+  bool admission_paused() const {
+    return external_pressure_ == PressureLevel::kCritical ||
+           recovery_sample_pending_ ||
+           rss_sample_failures_ == kMaxSampleFailures ||
+           native_sample_failures_ == kMaxSampleFailures;
+  }
+
   bool materialization_allowed_locked(size_t bytes) const {
-    if (external_pressure_ == PressureLevel::kCritical ||
-        recovery_sample_pending_) {
+    if (admission_paused()) {
       return false;
     }
     const size_t cap = limit();
@@ -245,32 +256,41 @@ class ProcessRssBudget {
   void refresh_locked(bool force) {
     if (!limit()) return;
     const auto now = std::chrono::steady_clock::now();
-    if (!force && !recovery_sample_pending_ &&
-        now - sampled_at_ < std::chrono::milliseconds(20)) {
+    if (!force && now - sampled_at_ < std::chrono::milliseconds(20)) {
       return;
     }
     const size_t rss = reader_ ? reader_() : 0;
-    // A failed sample must not replenish admission headroom. Retry on the
-    // next maintenance pass, keeping the last successful pressure signal.
+    // Keep the last observation across a transient failure. If either
+    // configured reader keeps failing, pause growth until it recovers.
+    rss_sample_failures_ = rss ? 0 : next_sample_failure(rss_sample_failures_);
     bool sampled_native = false;
     if (native_reader_) {
       NativeSample native;
-      if (native_reader_(&native)) {
+      sampled_native = native_reader_(&native);
+      if (sampled_native) {
         native_estimate_.observe(native.footprint, backing_);
         native_materialized_ = 0;
         native_limit_ = add_saturated(native.footprint, native.available);
-        sampled_native = true;
       }
+      native_sample_failures_ =
+          sampled_native ? 0 : next_sample_failure(native_sample_failures_);
     }
     if (rss && (!native_reader_ || sampled_native)) {
       recovery_sample_pending_ = false;
     }
     if (rss) {
       publish(rss);
-    } else if (sampled_native) {
-      update_available();
+    } else {
+      // Throttle unsuccessful reads too, so an OS sampling error does not
+      // put a system call on every admission attempt.
       sampled_at_ = now;
+      update_available();
     }
+  }
+
+  static constexpr uint8_t kMaxSampleFailures = 3;
+  static uint8_t next_sample_failure(uint8_t failures) {
+    return failures < kMaxSampleFailures ? failures + 1 : failures;
   }
 
   void publish(size_t rss) {
@@ -398,10 +418,7 @@ class ProcessRssBudget {
       available =
           std::min(available, remaining > reserve ? remaining - reserve : 0);
     }
-    if (external_pressure_ == PressureLevel::kCritical ||
-        recovery_sample_pending_) {
-      available = 0;
-    }
+    if (admission_paused()) available = 0;
     const size_t margin = headroom(cap);
     const bool pressure = external_pressure_ != PressureLevel::kNormal ||
                           (cap && (pressure_.load(std::memory_order_relaxed)
@@ -421,6 +438,8 @@ class ProcessRssBudget {
   size_t native_limit_{0};
   PressureLevel external_pressure_{PressureLevel::kNormal};
   bool recovery_sample_pending_{false};
+  uint8_t rss_sample_failures_{0};
+  uint8_t native_sample_failures_{0};
   std::chrono::steady_clock::time_point sampled_at_{};
   std::atomic<size_t> limit_{0};
   std::atomic<size_t> available_{std::numeric_limits<size_t>::max()};

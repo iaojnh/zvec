@@ -287,6 +287,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_materialize(size_t bytes) {
     return process_rss_.try_materialize(bytes);
   }
+  // Separately owned backing can still take part in process RSS admission.
+  bool try_reserve_process_backing(size_t bytes) {
+    return process_rss_.try_reserve(bytes);
+  }
   // For separately budgeted backing, e.g. the RocksDB cache allocator.
   bool account_pending_process_backing(size_t bytes) {
     return process_rss_.account_pending(bytes);

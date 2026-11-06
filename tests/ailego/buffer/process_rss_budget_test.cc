@@ -153,10 +153,12 @@ TEST(ProcessRssBudgetTest, CriticalRecoveryRequiresBothConfiguredSamples) {
   EXPECT_FALSE(budget.try_acquire(1));
   native_sample_valid = true;
   sampled_rss = 0;
+  budget.refresh(true);
   EXPECT_FALSE(budget.try_acquire(1));
   EXPECT_EQ(0u, budget.available());
 
   sampled_rss = 24 * kMiB;
+  budget.refresh(true);
   EXPECT_TRUE(budget.materialization_allowed());
   EXPECT_TRUE(budget.pressure());  // Background still blocks cache growth.
   ASSERT_TRUE(budget.try_acquire(kMiB));
@@ -206,6 +208,40 @@ TEST(ProcessRssBudgetTest, FailedSamplesDoNotRestoreSpentHeadroom) {
   EXPECT_EQ(128 * kMiB, budget.limit());
   ASSERT_TRUE(budget.configure(0, nullptr));
   EXPECT_TRUE(budget.try_acquire(256 * kMiB));
+}
+
+TEST(ProcessRssBudgetTest, RepeatedFailurePausesAdmissionUntilReaderRecovers) {
+  for (const bool fail_native : {false, true}) {
+    SCOPED_TRACE(fail_native);
+    ProcessRssBudget budget;
+    sampled_rss = 32 * kMiB;
+    native_sample = {32 * kMiB, 96 * kMiB};
+    native_sample_valid = true;
+    ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss,
+                                 fail_native ? ReadNative : nullptr));
+    ASSERT_TRUE(budget.try_acquire(8 * kMiB));
+    if (fail_native)
+      native_sample_valid = false;
+    else
+      sampled_rss = 0;
+
+    budget.refresh(true);
+    EXPECT_GT(budget.available(), 0u);
+    for (int i = 0; i < 4; ++i) budget.refresh(true);
+    EXPECT_EQ(0u, budget.available());
+    EXPECT_TRUE(budget.pressure());
+    EXPECT_FALSE(budget.try_reserve(1));
+    EXPECT_FALSE(budget.try_materialize(1));
+    budget.release(8 * kMiB);
+    EXPECT_EQ(0u, budget.available());
+
+    sampled_rss = 32 * kMiB;
+    native_sample_valid = true;
+    budget.refresh(true);
+    EXPECT_FALSE(budget.pressure());
+    ASSERT_TRUE(budget.try_acquire(kMiB));
+    budget.release(kMiB);
+  }
 }
 
 TEST(ProcessRssBudgetTest, HeadroomScalesWithoutExhaustingSmallBudgets) {
