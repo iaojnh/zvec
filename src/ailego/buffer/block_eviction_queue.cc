@@ -915,14 +915,15 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
   return false;
 }
 
-size_t MemoryLimitPool::release_committed(size_t bytes, Backing backing) {
+size_t MemoryLimitPool::release_committed(
+    size_t bytes, Backing backing, ProcessRssBudget::MaterializationStamp stamp) {
   const size_t previous =
       committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
   assert(previous >= bytes);
   if (backing == Backing::kPending) {
     process_rss_.finish_reservation(bytes, false);
   } else {
-    process_rss_.release(bytes);
+    process_rss_.release_unmapped(bytes, stamp);
   }
   return previous;
 }
@@ -1597,10 +1598,21 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
 }
 
 void MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
+  (void)finish(bytes);
+}
+
+ProcessRssBudget::MaterializationStamp
+MemoryLimitPool::PendingAllocation::commit_mapping() {
+  return finish(bytes_);
+}
+
+ProcessRssBudget::MaterializationStamp
+MemoryLimitPool::PendingAllocation::finish(size_t bytes) {
   assert(bytes <= bytes_);
-  if (!bytes) return;
-  pool_.process_rss_.finish_reservation(bytes, true);
+  if (!bytes) return {};
+  auto stamp = pool_.process_rss_.finish_reservation(bytes, true);
   bytes_ -= bytes;
+  return stamp;
 }
 
 bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
@@ -1780,13 +1792,18 @@ void MemoryLimitPool::release_external(const size_t buffer_size) {
   release_fixed(buffer_size, &external_used_size_);
 }
 
+void MemoryLimitPool::release_unmapped_external(
+    size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
+  release_fixed(bytes, &external_used_size_, Backing::kLive, stamp);
+}
+
 void MemoryLimitPool::release_metadata(const size_t buffer_size) {
   release_fixed(buffer_size, &metadata_used_size_);
 }
 
-void MemoryLimitPool::release_fixed(const size_t buffer_size,
-                                    std::atomic<size_t> *counter,
-                                    Backing backing) {
+void MemoryLimitPool::release_fixed(
+    size_t buffer_size, std::atomic<size_t> *counter, Backing backing,
+    ProcessRssBudget::MaterializationStamp stamp) {
   if (buffer_size == 0) {
     return;
   }
@@ -1798,7 +1815,7 @@ void MemoryLimitPool::release_fixed(const size_t buffer_size,
       counter->fetch_sub(buffer_size, std::memory_order_relaxed);
   (void)counter_prev;
   assert(counter_prev >= buffer_size);
-  size_t committed_prev = release_committed(buffer_size, backing);
+  size_t committed_prev = release_committed(buffer_size, backing, stamp);
   (void)committed_prev;
   assert(committed_prev >= buffer_size);
   { std::lock_guard<std::mutex> lock(capacity_mutex_); }

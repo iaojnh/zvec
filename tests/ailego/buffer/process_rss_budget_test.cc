@@ -722,6 +722,34 @@ TEST(ProcessRssBudgetTest, UnmappedBackingRefundsOnlyItsOwnProjection) {
   }
 }
 
+TEST(ProcessRssBudgetTest, UnsampledTailsKeepOtherOwnersResident) {
+  constexpr size_t kLimit = 128 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    ProcessRssBudget budget;
+    budget.account(6 * kMiB);
+    sampled_rss = (use_native_sample ? 32 : 120) * kMiB;
+    native_sample = {112 * kMiB, 16 * kMiB};
+    native_sample_valid = true;
+    ASSERT_TRUE(budget.configure(kLimit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr));
+    if (use_native_sample) {
+      native_sample_valid = false;
+    } else {
+      sampled_rss = 0;
+    }
+
+    ASSERT_TRUE(budget.try_reserve(6 * kMiB));
+    const auto stamp = budget.finish_reservation(6 * kMiB, true);
+    EXPECT_EQ(2 * kMiB, budget.available());
+    budget.release_unmapped(4 * kMiB, stamp);
+    EXPECT_EQ(6 * kMiB, budget.available());
+    budget.release_unmapped(2 * kMiB, stamp);
+    EXPECT_EQ(8 * kMiB, budget.available());
+    budget.release(6 * kMiB);
+  }
+}
+
 TEST(ProcessRssBudgetTest, ReuseAndNewBackingShareMeasuredRoomBetweenSamples) {
   using Budget = ProcessRssBudget;
   constexpr size_t limit = 128 * kMiB;

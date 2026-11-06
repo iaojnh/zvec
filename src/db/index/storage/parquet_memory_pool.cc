@@ -44,6 +44,8 @@ constexpr size_t kSmallChunkBytes = 64 * 1024;
 
 enum class BackingKind { Heap, Mapping, Retained, SmallChunk };
 
+using MappingProjection = ailego::ProcessRssBudget::MaterializationStamp;
+
 struct MappingHeader {
   void *base;
   size_t size;
@@ -85,7 +87,8 @@ arrow::Status MappingSize(int64_t size, int64_t alignment, size_t *out) {
   const uint64_t limit = std::min<uint64_t>(
       std::numeric_limits<size_t>::max(), std::numeric_limits<int64_t>::max());
   const uint64_t padding =
-      static_cast<uint64_t>(alignment - 1) + sizeof(MappingHeader);
+      static_cast<uint64_t>(alignment - 1) + sizeof(MappingHeader) +
+      sizeof(MappingProjection);
   if (padding > limit || static_cast<uint64_t>(size) > limit - padding ||
       static_cast<uint64_t>(size) + padding > limit - (page_size - 1)) {
     return arrow::Status::OutOfMemory("Parquet mapping size overflow");
@@ -278,9 +281,11 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
       return arrow::Status::OutOfMemory("Cannot map Parquet buffer of ", size,
                                         " bytes");
     }
-    pending.commit();
-    const uintptr_t start =
-        reinterpret_cast<uintptr_t>(base) + sizeof(MappingHeader);
+    // Keep the stamp at the mapping base without growing the small-buffer
+    // header or its size classes.
+    new (base) MappingProjection(pending.commit_mapping());
+    const uintptr_t start = reinterpret_cast<uintptr_t>(base) +
+                            sizeof(MappingProjection) + sizeof(MappingHeader);
     const uintptr_t aligned = (start + static_cast<uintptr_t>(alignment - 1)) &
                               ~static_cast<uintptr_t>(alignment - 1);
     auto *buffer = reinterpret_cast<uint8_t *>(aligned);
@@ -341,7 +346,8 @@ std::optional<arrow::Status> ParquetMemoryPool::TryReallocateInPlace(
         header->charged -= refund;
         mapped_bytes_.fetch_sub(released, std::memory_order_relaxed);
         charged_bytes_.fetch_sub(refund, std::memory_order_relaxed);
-        budget.release_external(refund);
+        budget.release_unmapped_external(
+            refund, *static_cast<const MappingProjection *>(header->base));
       }
       stats_.DidReallocateBytes(old_size, new_size);
       return arrow::Status::OK();
@@ -393,12 +399,15 @@ void ParquetMemoryPool::Free(uint8_t *buffer, int64_t size, int64_t alignment) {
     const auto header = *reinterpret_cast<const MappingHeader *>(
         buffer - sizeof(MappingHeader));
     if (header.kind == BackingKind::Mapping) {
+      const auto projection =
+          *static_cast<const MappingProjection *>(header.base);
       const bool released = UnmapMemory(header.base, header.size);
       assert(released);
       if (!released) return;
       mapped_bytes_.fetch_sub(static_cast<int64_t>(header.size),
                               std::memory_order_relaxed);
-      ailego::MemoryLimitPool::get_instance().release_external(header.charged);
+      ailego::MemoryLimitPool::get_instance().release_unmapped_external(
+          header.charged, projection);
       charged_bytes_.fetch_sub(header.charged, std::memory_order_relaxed);
     } else if (header.kind == BackingKind::Heap) {
       small_pool_->Free(static_cast<uint8_t *>(header.base), header.size,

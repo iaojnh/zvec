@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
+#include <zvec/ailego/io/file.h>
 
 namespace zvec::ailego {
 
@@ -461,6 +462,32 @@ TEST_F(PoolAdmissionTest, FailedWorkspaceAllocationRestoresRssHeadroom) {
     EXPECT_EQ(committed, pool_.committed());
     EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
   }
+}
+
+TEST_F(PoolAdmissionTest, UnmappedWorkspacePreservesOtherResidentBacking) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  MemoryReservation resident;
+  resident.add(8 * page_);
+  const size_t rss = baseline_ + 128 * page_;
+  const size_t headroom = 4 * page_;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom,
+                                                   rss));
+  // Keep the current observation stable if the worker is descheduled.
+  MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
+
+  const size_t bytes = 2 * page_;
+  MemoryLimitPool::PendingAllocation pending(
+      pool_, MemoryLimitPool::PendingAllocation::Kind::kWorkspace);
+  ASSERT_TRUE(pending.reserve(bytes));
+  void *mapping = File::MemoryMap(bytes, 0);
+  ASSERT_NE(nullptr, mapping);
+  const auto stamp = pending.commit_mapping();
+  EXPECT_EQ(headroom - bytes, MemoryLimitPoolTestPeer::rss_available(pool_));
+  ASSERT_TRUE(File::TryMemoryUnmap(mapping, bytes));
+  pool_.release_unmapped_external(bytes, stamp);
+  EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+  EXPECT_EQ(resident.bytes(), pool_.external_used());
 }
 
 TEST_F(PoolAdmissionTest, RetainedBackingReuseObeysMeasuredHeadroom) {

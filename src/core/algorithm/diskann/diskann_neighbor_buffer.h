@@ -18,6 +18,7 @@
 #include <mutex>
 #include <utility>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/process_rss_budget.h>
 
 namespace zvec {
 namespace core {
@@ -52,6 +53,7 @@ class DiskAnnNeighborBuffer {
   char *data_{nullptr};
   size_t size_{0};
   size_t charged_bytes_{0};
+  ailego::ProcessRssBudget::MaterializationStamp projection_;
 };
 
 // Mutable rows use capacity classes in dedicated mapped chunks. Callers guard

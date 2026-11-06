@@ -43,9 +43,11 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
     while (block != nullptr) {
       auto *next = block->previous;
       const size_t bytes = block->bytes;
+      const auto projection = block->projection;
       block->~Block();
       if (ailego::File::TryMemoryUnmap(block, bytes))
-        ailego::MemoryLimitPool::get_instance().release_process_backing(bytes);
+        ailego::MemoryLimitPool::get_instance().release_unmapped_process_backing(
+            bytes, projection);
       block = next;
     }
     tracker_.FreeMem();
@@ -88,9 +90,10 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
           mapped, !ailego::File::TryMemoryUnmap(memory, mapped));
       throw;
     }
-    pool.finish_process_backing(mapped, true);
+    const auto projection = pool.finish_process_backing(mapped, true);
     auto *block = new (memory)
-        Block{current_.load(std::memory_order_relaxed), mapped, sizeof(Block)};
+        Block{current_.load(std::memory_order_relaxed), mapped, projection,
+              sizeof(Block)};
     allocated_.fetch_add(mapped, std::memory_order_relaxed);
     // Claim our slice before publishing the block to concurrent writers.
     char *result = take(block, aligned);
@@ -114,6 +117,7 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
   struct alignas(std::max_align_t) Block {
     Block *previous;
     size_t bytes;
+    ailego::ProcessRssBudget::MaterializationStamp projection;
     std::atomic<size_t> used;
   };
   static constexpr size_t kBlockBytes = 64 * 1024;

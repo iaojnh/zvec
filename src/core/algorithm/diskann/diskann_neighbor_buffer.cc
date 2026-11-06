@@ -62,7 +62,7 @@ int DiskAnnNeighborBuffer::allocate(size_t bytes) {
   DiskAnnNeighborBuffer replacement;
   replacement.data_ = static_cast<char *>(ailego::File::MemoryMap(rounded, 0));
   if (!replacement.data_) return IndexError_NoMemory;
-  pending.commit();
+  replacement.projection_ = pending.commit_mapping();
   replacement.size_ = rounded;
   replacement.charged_bytes_ = charge;
 
@@ -71,6 +71,7 @@ int DiskAnnNeighborBuffer::allocate(size_t bytes) {
   std::swap(data_, replacement.data_);
   std::swap(size_, replacement.size_);
   std::swap(charged_bytes_, replacement.charged_bytes_);
+  std::swap(projection_, replacement.projection_);
   return 0;
 }
 
@@ -93,7 +94,9 @@ int DiskAnnNeighborBuffer::shrink(size_t bytes) {
   const size_t refund = charged_bytes_ ? size_ - rounded : 0;
   charged_bytes_ -= refund;
   size_ = rounded;
-  if (refund) ailego::MemoryLimitPool::get_instance().release_external(refund);
+  if (refund)
+    ailego::MemoryLimitPool::get_instance().release_unmapped_external(
+        refund, projection_);
   return 0;
 }
 
@@ -104,9 +107,11 @@ bool DiskAnnNeighborBuffer::release_mapping() {
     return false;
   }
   if (charged_bytes_)
-    ailego::MemoryLimitPool::get_instance().release_external(charged_bytes_);
+    ailego::MemoryLimitPool::get_instance().release_unmapped_external(
+        charged_bytes_, projection_);
   data_ = nullptr;
   size_ = charged_bytes_ = 0;
+  projection_ = {};
   return true;
 }
 

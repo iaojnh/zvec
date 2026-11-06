@@ -359,8 +359,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
       commit(bytes_);
     }
     void commit(size_t bytes);
+    // Retain this stamp only for backing the owner can explicitly unmap.
+    ProcessRssBudget::MaterializationStamp commit_mapping();
 
    private:
+    ProcessRssBudget::MaterializationStamp finish(size_t bytes);
+
     MemoryLimitPool &pool_;
     const Kind kind_;
     std::atomic<size_t> *const counter_;
@@ -378,6 +382,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void release_buffer(char *buffer, const size_t buffer_size);
 
   void release_external(const size_t buffer_size);
+  void release_unmapped_external(
+      size_t bytes, ProcessRssBudget::MaterializationStamp stamp);
 
   void release_metadata(const size_t buffer_size);
 
@@ -544,7 +550,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_reserve_page_used(size_t bytes, bool required = false);
   bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive,
                              size_t materialization = 0);
-  size_t release_committed(size_t bytes, Backing backing = Backing::kLive);
+  size_t release_committed(
+      size_t bytes, Backing backing = Backing::kLive,
+      ProcessRssBudget::MaterializationStamp stamp = {});
   bool try_reserve_allocation(size_t bytes, Backing backing = Backing::kLive,
                               size_t materialization = 0);
   bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,
@@ -567,7 +575,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_charge_locked(size_t bytes, std::atomic<size_t> *counter,
                          Backing backing);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter,
-                     Backing backing = Backing::kLive);
+                     Backing backing = Backing::kLive,
+                     ProcessRssBudget::MaterializationStamp stamp = {});
   bool is_cacheable_buffer_size(size_t buffer_size);
   char *pop_free_buffer(size_t start_shard);
   char *pop_reusable_buffer(size_t start_shard, size_t bytes);

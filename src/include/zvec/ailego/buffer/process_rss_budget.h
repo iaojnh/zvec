@@ -140,21 +140,23 @@ class ProcessRssBudget {
     release_unmapped(bytes, {});
   }
 
-  // For a whole mapping that has already been unmapped successfully. Never
-  // refund a different operation's projection or alter the measured RSS.
+  // A stamp is valid only after successful unmapping. A partial release
+  // keeps the same stamp for the remaining bytes. Measured RSS is unchanged.
   void release_unmapped(size_t bytes, MaterializationStamp stamp) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stamp.rss_epoch && stamp.rss_epoch == rss_epoch_)
-      refund_projection(bytes, rss_materialized_);
-    if (stamp.native_epoch && stamp.native_epoch == native_epoch_)
-      refund_projection(bytes, native_materialized_);
+    const bool rss_unsampled =
+        stamp.rss_epoch && stamp.rss_epoch == rss_epoch_;
+    const bool native_unsampled =
+        stamp.native_epoch && stamp.native_epoch == native_epoch_;
+    if (rss_unsampled) refund_projection(bytes, rss_materialized_);
+    if (native_unsampled) refund_projection(bytes, native_materialized_);
     assert(bytes <= backing_);
     backing_ -= bytes;
     // Only backing that could have contributed to a successful RSS sample
     // can explain a later RSS decrease. Unsampled allocation/free churn must
     // not accumulate unlimited release credits and hide host-memory recovery.
-    estimate_.release(bytes, backing_);
-    native_estimate_.release(bytes, backing_);
+    estimate_.release(bytes, backing_, rss_unsampled);
+    native_estimate_.release(bytes, backing_, native_unsampled);
     update_available();
   }
 
@@ -339,9 +341,9 @@ class ProcessRssBudget {
       resident_upper_ = std::min(sample, backing);
       pending_releases_ = 0;
     }
-    void release(size_t bytes, size_t backing) {
+    void release(size_t bytes, size_t backing, bool unsampled) {
       const size_t possibly_resident =
-          std::min(bytes, resident_upper_ - pending_releases_);
+          unsampled ? 0 : std::min(bytes, resident_upper_ - pending_releases_);
       pending_releases_ += possibly_resident;
       // The old sample may still include this owner's pages. Those bytes
       // cannot also cover another owner that has not yet become resident.
