@@ -209,6 +209,8 @@ int LocalWalFile::write_record(std::string_view data, uint32_t crc) {
 int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   CHECK_STATUS(opened_, true);
 
+  const auto record_offset = file_.offset();
+  if (record_offset < 0) return -1;
   int read_size = 0;
   std::string err_msg;
   int ret = -1;
@@ -258,8 +260,14 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
       break;
     }
 
-    if (admit) admit(static_cast<size_t>(record.length_) + 1);
-    record.content_.resize(record.length_);
+    try {
+      if (admit) admit(static_cast<size_t>(record.length_) + 1);
+      record.content_.resize(record.length_);
+    } catch (const std::bad_alloc &) {
+      // A retry must see the same record header rather than payload bytes.
+      if (!file_.seek(record_offset, ailego::File::Origin::Begin)) return -1;
+      throw;
+    }
     read_size = file_.read((void *)const_cast<char *>(record.content_.data()),
                            record.length_);
     if (read_size != (int)record.length_) {

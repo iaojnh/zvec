@@ -268,8 +268,7 @@ TEST_F(WalFileTest, AdmitsActualRecordBytesBeforeReadAndReportsRejection) {
                   .empty());
   EXPECT_EQ(6u, requested);
   EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, wal->read_status().code());
-  // A denied read is not EOF, and rewind/retry still reads the original WAL.
-  ASSERT_EQ(0, wal->prepare_for_read());
+  // Retry directly on the same cursor after restoring admission.
   std::vector<size_t> sizes;
   const WalFile::ReadAdmission admit = [&](size_t bytes) {
     sizes.push_back(bytes);

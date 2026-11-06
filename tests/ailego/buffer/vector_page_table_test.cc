@@ -188,11 +188,15 @@ class BufferPoolTest : public ::testing::Test {
   }
   void init_vec_pool(size_t capacity_pages, size_t file_pages,
                      bool writable = false) {
+    size_t metadata =
+        VecBufferPool::metadata_bytes_for_page_count(file_pages, writable);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (writable && current_io_backend_type() == IOBackendType::kIoUring)
+      metadata += VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+#endif
     ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
                      capacity_pages * kVectorPageSize +
-                     slab_headers_for_pages(capacity_pages) +
-                     VecBufferPool::metadata_bytes_for_page_count(file_pages,
-                                                                  writable)));
+                     slab_headers_for_pages(capacity_pages) + metadata));
   }
   void init_table_pool(size_t capacity_pages, size_t entry_num) {
     ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
@@ -1155,7 +1159,7 @@ TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
     EXPECT_EQ(0u, final_stats.writeback_pending);
     EXPECT_GT(final_stats.evict, 0u);
 #if defined(__linux__)
-    if (current_io_backend_type() == IOBackendType::kIoUring) {
+    if (final_stats.writeback_io_staging_bytes) {
       EXPECT_GT(final_stats.writeback_aio_batches, 0u);
       EXPECT_GT(final_stats.writeback_aio_pages, 0u);
       EXPECT_EQ(0u, final_stats.writeback_aio_fallbacks);
@@ -1256,16 +1260,10 @@ TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
 
   EXPECT_EQ(page_table_bytes, read_only_bytes);
   EXPECT_LT(read_only_bytes, 1UL * 1024UL * 1024UL);
-  size_t expected_writable_bytes =
+  const size_t expected_writable_bytes =
       BudgetedMappedBuffer::mapping_size(VecBufferPool::kMutexBucketCount *
                                          sizeof(std::shared_mutex)) +
       VecBufferPool::kWritebackBatchPages * kVectorPageSize;
-#if defined(__linux__)
-  if (current_io_backend_type() == IOBackendType::kIoUring) {
-    expected_writable_bytes +=
-        VecBufferPool::kWritebackBatchPages * kVectorPageSize;
-  }
-#endif
   EXPECT_EQ(expected_writable_bytes, writable_bytes - read_only_bytes);
 
   init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/1);
@@ -1308,8 +1306,21 @@ TEST_F(BufferPoolTest, WritablePoolReportsPageLockMetadata) {
   EXPECT_EQ(VecBufferPool::metadata_bytes_for_page_count(
                 /*page_count=*/1, /*writable=*/true),
             stats.page_table_metadata_bytes + stats.page_lock_metadata_bytes +
-                stats.writeback_staging_bytes +
-                stats.writeback_io_staging_bytes);
+                stats.writeback_staging_bytes);
+}
+
+TEST_F(BufferPoolTest, WritablePoolCanOpenWithoutOptionalIoStaging) {
+  const size_t required =
+      VectorPageTable::metadata_bytes_for_entries(1) +
+      BudgetedMappedBuffer::mapping_size(VecBufferPool::kMutexBucketCount *
+                                         sizeof(std::shared_mutex)) +
+      VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(required));
+  VecBufferPool pool(new_file(1), /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  EXPECT_EQ(0u, pool.stats().writeback_io_staging_bytes);
+  EXPECT_EQ(VecBufferPool::kWritebackBatchPages * kVectorPageSize,
+            pool.stats().writeback_staging_bytes);
 }
 
 TEST_F(BufferPoolTest, WritebackStagingUnmapsBeforeReservationIsReused) {

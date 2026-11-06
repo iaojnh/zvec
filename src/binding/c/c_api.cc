@@ -43,6 +43,7 @@
 #include "c_memory.h"
 #include "db/common/constants.h"
 #include "db/common/document_memory.h"
+#include "db/index/common/serialized_doc_memory.h"
 
 // Error checking macros - these preserve __LINE__ accuracy
 // Simplified macro for setting error with automatic file/line/function info
@@ -4779,6 +4780,7 @@ zvec_error_code_t zvec_doc_serialize(const zvec_doc_t *doc, uint8_t **data,
 
 zvec_error_code_t zvec_doc_deserialize(const uint8_t *data, size_t size,
                                    zvec_doc_t **doc) {
+  if (doc) *doc = nullptr;
   if (!data || !doc || size == 0) {
     set_last_error("Invalid arguments");
     return ZVEC_ERROR_INVALID_ARGUMENT;
@@ -4786,15 +4788,26 @@ zvec_error_code_t zvec_doc_deserialize(const uint8_t *data, size_t size,
 
   ZVEC_TRY_RETURN_ERROR(
       "Failed to deserialize document",
-      auto deserialized_doc = zvec::Doc::deserialize(data, size);
-      if (!deserialized_doc) {
+      size_t bytes = 0;
+      if (!zvec::detail::EstimateSerializedDocMemory(data, size, &bytes)) {
         set_last_error("Failed to deserialize document");
         return ZVEC_ERROR_INTERNAL_ERROR;
       }
+      using Lease = zvec::detail::ResultMemoryAllowance::Lease;
+      auto &allowance = zvec::detail::SharedResultMemoryAllowance();
+      Lease admission(&allowance);
+      admission.add(zvec::detail::BindingMemoryBytes(1, bytes, sizeof(zvec::Doc) + 128));
+      auto memory = std::make_shared<Lease>(&allowance);
+      memory->absorb(admission);
 
-      // Create a new Doc by copying the deserialized content
-      auto *new_doc = new zvec::Doc(*deserialized_doc);
-      *doc = reinterpret_cast<zvec_doc_t *>(new_doc);
+      auto decoded = zvec::Doc::deserialize(data, size);
+      if (!decoded) {
+        set_last_error("Failed to deserialize document");
+        return ZVEC_ERROR_INTERNAL_ERROR;
+      }
+      auto result = std::make_unique<zvec::Doc>(std::move(*decoded));
+      zvec::detail::DocumentMemoryAccess::retain(*result, std::move(memory));
+      *doc = reinterpret_cast<zvec_doc_t *>(result.release());
       return ZVEC_OK;)
 }
 

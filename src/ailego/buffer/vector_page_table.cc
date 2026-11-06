@@ -1077,19 +1077,9 @@ size_t VecBufferPool::metadata_bytes_for_page_count(size_t page_count,
       mutex_count * sizeof(std::shared_mutex));
   const size_t staging_bytes =
       writable ? kBlockingAioBatchSize * kVectorPageSize : 0;
-  size_t io_staging_bytes = 0;
-#if defined(__linux__) && !defined(__ANDROID__)
-  if (writable &&
-      IOBackend::Instance().available() == IOBackendType::kIoUring) {
-    io_staging_bytes = kBlockingAioBatchSize * kVectorPageSize;
-  }
-#endif
-  if (mutex_bytes > std::numeric_limits<size_t>::max() - staging_bytes ||
-      mutex_bytes + staging_bytes >
-          std::numeric_limits<size_t>::max() - io_staging_bytes) {
+  if (mutex_bytes > std::numeric_limits<size_t>::max() - staging_bytes)
     return std::numeric_limits<size_t>::max();
-  }
-  const size_t writable_bytes = mutex_bytes + staging_bytes + io_staging_bytes;
+  const size_t writable_bytes = mutex_bytes + staging_bytes;
   if (page_table_bytes > std::numeric_limits<size_t>::max() - writable_bytes) {
     return std::numeric_limits<size_t>::max();
   }
@@ -1144,15 +1134,7 @@ int VecBufferPool::init() {
       mutex_count * sizeof(std::shared_mutex));
   const size_t staging_charge =
       writable_ ? kBlockingAioBatchSize * kVectorPageSize : 0;
-  size_t io_staging_charge = 0;
-#if defined(__linux__) && !defined(__ANDROID__)
-  if (writable_ && io_backend_type_ == IOBackendType::kIoUring) {
-    // Preserve the existing staging allowance while falling back to pwrite.
-    io_staging_charge = kBlockingAioBatchSize * kVectorPageSize;
-  }
-#endif
-  const size_t writable_metadata_charge =
-      mutex_charge + staging_charge + io_staging_charge;
+  const size_t writable_metadata_charge = mutex_charge + staging_charge;
   auto &pool = MemoryLimitPool::get_instance();
   using Pending = MemoryLimitPool::PendingAllocation;
   Pending pending(pool, Pending::Kind::kMetadata);
@@ -1220,15 +1202,18 @@ int VecBufferPool::init() {
   block_mutex_count_ = mutex_count;
   writeback_staging_ = writeback_staging;
   writeback_staging_size_ = staging_charge;
-  writeback_io_staging_charge_ = io_staging_charge;
 #if defined(__linux__) && !defined(__ANDROID__)
-  // Admit optional control mappings after the mandatory page table and
-  // writeback memory. A small pool can still use synchronous writeback.
-  if (io_staging_charge) {
+  // Only an available ring needs the optional second staging allowance.
+  // Synchronous writeback uses the mandatory workspace reserved above.
+  if (writable_ && io_backend_type_ == IOBackendType::kIoUring &&
+      !pool.under_process_rss_pressure()) {
     try {
       auto ring = std::make_unique<IoUringRing>();
-      if (ring->setup(kBlockingAioBatchSize)) {
+      const size_t io_staging_charge = kBlockingAioBatchSize * kVectorPageSize;
+      if (ring->setup(kBlockingAioBatchSize) &&
+          pool.try_charge_metadata_without_reclaim(io_staging_charge)) {
         ring->adopt_staging_reservation(io_staging_charge);
+        writeback_io_staging_charge_ = io_staging_charge;
         writeback_io_uring_ = std::move(ring);
       }
     } catch (const std::bad_alloc &) {

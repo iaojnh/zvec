@@ -1257,11 +1257,13 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
 
   // An exception or a paged PQ read error may occur after an asynchronous
   // graph batch has been submitted.
-  // Recreate the context only after destroy_io_ctx has cancelled and waited
-  // for all requests, so the caller can safely reuse or destroy this context.
+  // libaio can retain a quarantined staging buffer in the existing context
+  // and use pread on the next query. Other backends retire their context.
   IOContext &io_ctx = ctx->io_ctx();
-  destroy_io_ctx(io_ctx);
-  if (requires_io_context() && setup_io_ctx(io_ctx) != 0) {
+  if (reader_ && io_ctx && io_ctx->type == ailego::IOBackendType::kLibAio) {
+    reader_->release_io_ctx(io_ctx);
+  } else if (destroy_io_ctx(io_ctx) == 0 && requires_io_context() &&
+             setup_io_ctx(io_ctx) != 0) {
     LOG_ERROR("cached_beam_search: failed to recreate I/O context");
   }
   ctx->set_error_code(error_code);

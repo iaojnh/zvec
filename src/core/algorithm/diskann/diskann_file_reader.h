@@ -17,9 +17,11 @@
 
 #include <fcntl.h>
 #include <array>
+#include <memory>
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <ailego/io/iouring_loader.h>  // raw-syscall io_uring wrapper (IoUringRing)
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <ailego/io/libaio_loader.h>  // dlopen-based libaio wrapper
 #elif defined(_WIN32) || defined(_WIN64)
 #ifndef NOMINMAX
@@ -69,6 +71,8 @@ namespace core {
 // request slots in each I/O context. Keeping completion ports private prevents
 // one context from consuming another context's completions.
 // IOContext is a pointer to IoBackend; nullptr means uninitialised.
+struct PendingBatch;
+
 struct IoBackend {
   ailego::MemoryReservation memory;
   ailego::IOBackendType type{ailego::IOBackendType::kPread};
@@ -77,6 +81,10 @@ struct IoBackend {
   ailego::IoUringRing ring{};
   io_context_t aio_ctx{nullptr};
   size_t aio_mapped_bytes{0};
+  std::unique_ptr<ailego::BudgetedMappedBuffer> aio_staging;
+  const PendingBatch *aio_batch{nullptr};
+  bool aio_active{false};
+  bool aio_quarantined{false};
 #elif defined(_WIN32) || defined(_WIN64)
   std::array<OVERLAPPED, MAX_IO_DEPTH> reqs{};
   std::array<uint8_t, MAX_IO_DEPTH> active_requests{};
@@ -125,6 +133,7 @@ struct PendingBatch {
   ailego::BudgetedVector<struct iocb> cbs;
   ailego::BudgetedVector<struct iocb *> cb_ptrs;
   ailego::BudgetedVector<struct io_event> events;
+  ailego::BudgetedVector<void *> destinations;
 #elif defined(_WIN32) || defined(_WIN64)
   std::array<uint64_t, MAX_IO_DEPTH> expected_lengths;
   std::array<uint8_t, MAX_IO_DEPTH> completed;
@@ -191,7 +200,7 @@ class LinuxAlignedFileReader : public AlignedFileReader {
 
   int get_completed(PendingBatch &batch, IOContext &ctx, int min_completed,
                     std::vector<uint32_t> &completed_indices) override;
-  void release_io_ctx(IOContext & /*ctx*/) override {}
+  void release_io_ctx(IOContext &ctx) override;
 };
 #else
 class WindowsAlignedFileReader : public AlignedFileReader {

@@ -238,6 +238,13 @@ bool IoUringRing::ensure_staging(size_t bytes) {
   } catch (const std::bad_alloc &) {
     return false;
   }
+  auto &pool = MemoryLimitPool::get_instance();
+  if (prepaid_staging_bytes_ && pool.under_process_rss_pressure()) {
+    // The synchronous path can use its existing cached page. Drop the
+    // optional mapping before another writeback batch starts.
+    release_staging();
+    return false;
+  }
   if (staging_size_ >= bytes) {
     return true;
   }
@@ -247,7 +254,6 @@ bool IoUringRing::ensure_staging(size_t bytes) {
     if (bytes > prepaid_staging_bytes_) return false;
     bytes = prepaid_staging_bytes_;
   }
-  auto &pool = MemoryLimitPool::get_instance();
   // The prepaid workspace may be first used long after the pool opened.
   // Respect current RSS pressure before mapping it. Writeback can fall back
   // to pwrite using the existing cached page if staging is denied.

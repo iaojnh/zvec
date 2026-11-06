@@ -4931,20 +4931,14 @@ Status SegmentImpl::recover() try {
 
   std::lock_guard<std::shared_mutex> lock(seg_mtx_);
 
-  // next() admits the actual record length before allocating its ordinary
-  // string. Only one record is live at a time: retain the largest record's
-  // allowance, not the sum of all records or the 4 MiB record-size ceiling.
-  detail::ResultMemoryAllowance::Lease read_memory(
-      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
-  size_t read_high_water = 0;
-  const WalFile::ReadAdmission admit_record = [&](size_t bytes) {
-    if (bytes > read_high_water) {
-      read_memory.add(bytes - read_high_water);
-      read_high_water = bytes;
-    }
-  };
+  // A new record string can touch fresh pages even when the shared
+  // allowance already covers the same size. Claim materialization each time.
   while (true) {
-    std::string buf = recover_wal_file->next(admit_record);
+    detail::ResultMemoryAllowance::Lease read_memory(
+        options_.enable_mmap_ ? nullptr
+                              : &detail::SharedResultMemoryAllowance());
+    std::string buf = recover_wal_file->next(
+        [&](size_t bytes) { read_memory.add(bytes); });
     if (buf.empty()) {
       CHECK_RETURN_STATUS(recover_wal_file->read_status());
       break;

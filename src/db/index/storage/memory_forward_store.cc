@@ -26,6 +26,7 @@
 #include <arrow/record_batch.h>
 #include <arrow/table.h>
 #include <arrow/util/async_generator.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/common/constants.h"
 #include "db/index/storage/base_forward_store.h"
@@ -166,10 +167,13 @@ MemForwardStore::prepare_insert(const Doc &doc, uint64_t doc_id) try {
             sizeof(Doc))
       throw std::bad_alloc();
     const size_t target = prepared->cache_bytes + capacity * sizeof(Doc);
-    if (target > cache_memory_bytes_) {
-      cache_memory_.add(target - cache_memory_bytes_);
-      cache_memory_bytes_ = target;
-    }
+    const size_t new_capacity_bytes =
+        capacity == cache_.capacity() ? 0 : capacity * sizeof(Doc);
+    cache_memory_.add(target > cache_memory_bytes_
+                          ? target - cache_memory_bytes_
+                          : 0,
+                      bytes + new_capacity_bytes);
+    cache_memory_bytes_ = std::max(cache_memory_bytes_, target);
     // The forward schema excludes vectors: copying the complete Doc clones
     // vector payloads that are written separately by the vector indexer.
     // Select by field name, not Value type (scalar arrays can share a vector
@@ -235,16 +239,11 @@ arrow::Result<RecordBatchPtr> MemForwardStore::convert_to_record_batch(
   return batch;
 }
 
-bool MemForwardStore::locate_single_source(const std::vector<int> &indices,
-                                           RecordBatchPtr *source,
-                                           std::vector<int> *local_rows) {
+arrow::Result<bool> MemForwardStore::locate_single_source(
+    const std::vector<int> &indices, RecordBatchPtr *source,
+    std::vector<int> *local_rows, ailego::MemoryReservation &row_memory) {
   if (indices.empty()) {
     return false;
-  }
-  for (int idx : indices) {
-    if (idx < 0) {
-      return false;
-    }
   }
 
   // Row ids run over batches_ in order and then over the not-yet-batched
@@ -257,7 +256,7 @@ bool MemForwardStore::locate_single_source(const std::vector<int> &indices,
           return false;  // spans more than this batch
         }
       }
-      local_rows->clear();
+      ailego::ReserveVectorCapacity(*local_rows, row_memory, indices.size());
       for (int idx : indices) {
         local_rows->push_back(static_cast<int>(idx - base));
       }
@@ -272,24 +271,18 @@ bool MemForwardStore::locate_single_source(const std::vector<int> &indices,
       return false;
     }
   }
-  // Build a batch out of just the requested cache rows.
-  auto rb_builder = create_builder(/*query=*/true);
-  if (rb_builder == nullptr) {
-    return false;
-  }
+  // Only a request spanning different sources may take the full-store
+  // path. Propagate allocation refusal from this smaller, point-fetch path.
+  ailego::ReserveVectorCapacity(*local_rows, row_memory, indices.size());
+  ARROW_ASSIGN_OR_RAISE(
+      auto builder,
+      arrow::RecordBatchBuilder::Make(physic_schema_, query_memory_pool()));
+  RecordBatchBuilderPtr rb_builder = std::move(builder);
   for (int idx : indices) {
-    if (!append_doc_to_builder(cache_[static_cast<size_t>(idx - base)],
-                               rb_builder)
-             .ok()) {
-      return false;
-    }
+    ARROW_RETURN_NOT_OK(append_doc_to_builder(
+        cache_[static_cast<size_t>(idx - base)], rb_builder));
   }
-  auto result = rb_builder->Flush(false);
-  if (!result.ok()) {
-    return false;
-  }
-  *source = result.ValueOrDie();
-  local_rows->clear();
+  ARROW_ASSIGN_OR_RAISE(*source, rb_builder->Flush(false));
   for (size_t i = 0; i < indices.size(); ++i) {
     local_rows->push_back(static_cast<int>(i));
   }
@@ -335,11 +328,19 @@ arrow::Result<TablePtr> MemForwardStore::apply_row_and_column_selection(
 
 arrow::Result<TablePtr> MemForwardStore::convert_to_table(
     const std::vector<std::string> &columns, const std::vector<int> &indices) {
+  for (int row : indices) {
+    if (row < 0 || row >= num_rows_)
+      return arrow::Status::IndexError("Invalid forward row: ", row);
+  }
   // Fast path: when every requested row sits in one source, only that source is
   // materialised, so point fetches do not grow with the store's size.
   RecordBatchPtr single_source;
+  ailego::MemoryReservation row_memory;
   std::vector<int> single_rows;
-  if (locate_single_source(indices, &single_source, &single_rows)) {
+  ARROW_ASSIGN_OR_RAISE(
+      const bool single,
+      locate_single_source(indices, &single_source, &single_rows, row_memory));
+  if (single) {
     ARROW_ASSIGN_OR_RAISE(auto single_table, arrow::Table::FromRecordBatches(
                                                  {std::move(single_source)}));
     return apply_row_and_column_selection(single_table, single_rows, columns);
@@ -576,16 +577,18 @@ TablePtr MemForwardStore::fetch(const std::vector<std::string> &columns,
     std::shared_ptr<arrow::Array> rowid_array;
     arrow::UInt64Builder builder(query_memory_pool());
 
-    std::vector<uint64_t> indices_i64(indices.begin(), indices.end());
-    auto status = builder.AppendValues(indices_i64);
+    auto status = builder.Reserve(indices.size());
 
     if (!status.ok()) {
-      LOG_ERROR("failed to append rowid values: %s", status.ToString().c_str());
+      if (status.IsOutOfMemory()) throw std::bad_alloc();
+      LOG_ERROR("failed to reserve rowid values: %s", status.ToString().c_str());
       return nullptr;
     }
+    for (int row : indices) builder.UnsafeAppend(static_cast<uint64_t>(row));
 
     status = builder.Finish(&rowid_array);
     if (!status.ok()) {
+      if (status.IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("failed to finish rowid array: %s", status.ToString().c_str());
       return nullptr;
     }

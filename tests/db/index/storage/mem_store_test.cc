@@ -683,6 +683,42 @@ TEST_F(MemStoreTest, FetchCheckOrderWithLocalRowIDEnd) {
       << "ID column values don't match expected order";
 }
 
+TEST_F(MemStoreTest, PointFetchReportsDenialBeforeFullStoreFallback) {
+  auto managed = std::make_shared<MemForwardStore>(
+      schema_, "./point-fetch-budget.parquet", FileFormat::PARQUET);
+  const auto remove = ailego::ScopeGuard::Make(
+      [&] { std::filesystem::remove("./point-fetch-budget.parquet"); });
+  ASSERT_TRUE(managed->open().ok());
+  ASSERT_TRUE(managed->insert(CreateDoc(1)).ok());
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+    managed.reset();
+    EXPECT_EQ(0, pool.init(previous));
+  });
+
+  RecordBatchPtr source;
+  std::vector<int> rows;
+  rows.reserve(1);
+  ailego::MemoryReservation row_memory;
+  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
+  auto denied = managed->locate_single_source({0}, &source, &rows, row_memory);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_TRUE(denied.status().IsOutOfMemory());
+  EXPECT_FALSE(source);
+
+  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+  auto recovered =
+      managed->locate_single_source({0}, &source, &rows, row_memory);
+  ASSERT_TRUE(recovered.ok());
+  EXPECT_TRUE(*recovered);
+  ASSERT_TRUE(source);
+  EXPECT_EQ(1, source->num_rows());
+}
+
 TEST_F(MemStoreTest, FetchSingleRow) {
   for (uint64_t i = 0; i < 5; ++i) {
     Doc doc = CreateDoc(i);

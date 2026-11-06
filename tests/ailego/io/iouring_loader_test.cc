@@ -132,6 +132,11 @@ TEST_F(IoUringLoaderTest, PrechargedStagingDefersFirstMappingUnderPressure) {
   ASSERT_TRUE(ring.ensure_staging(bytes));
   EXPECT_NE(nullptr, IoUringStagingTestPeer::data(ring));
   EXPECT_EQ(0u, pool_.external_used());
+
+  pool.set_memory_pressure(Pressure::kCritical);
+  EXPECT_FALSE(ring.ensure_staging(bytes));
+  EXPECT_EQ(nullptr, IoUringStagingTestPeer::data(ring));
+  EXPECT_EQ(bytes, pool_.metadata_used());
 }
 
 TEST_F(IoUringLoaderTest, AbandonedStagingKeepsItsChargeAfterDestruction) {

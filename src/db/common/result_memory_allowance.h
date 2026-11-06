@@ -54,9 +54,15 @@ class ResultMemoryAllowance {
       }
     }
     void add(size_t bytes) {
-      if (!owner_ || bytes == 0) return;
+      add(bytes, bytes);
+    }
+
+    // A retained allowance can cover some of the new allocation's lifetime,
+    // while the entire allocation still consumes RSS room when materialized.
+    void add(size_t bytes, size_t materialization) {
+      if (!owner_ || (!bytes && !materialization)) return;
       begin_materialization();
-      bytes_ += owner_->acquire(bytes, backing_quantum_);
+      bytes_ += owner_->acquire(bytes, backing_quantum_, materialization);
     }
 
     // Transfer admission to an owner allocated only AFTER that admission.
@@ -87,7 +93,8 @@ class ResultMemoryAllowance {
 
  private:
   friend class MemoryBudgetTestPeer;
-  size_t acquire(size_t bytes, size_t backing_quantum) {
+  size_t acquire(size_t bytes, size_t backing_quantum,
+                 size_t materialization) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t capacity = pool.capacity();
@@ -117,8 +124,8 @@ class ResultMemoryAllowance {
     if (target > reservation_.bytes()) {
       // Admission may evict native cache pages. Bindings must release the GIL
       // before calling add(); no Python code executes while this lock is held.
-      reservation_.add(target - reservation_.bytes(), bytes);
-    } else if (!pool.try_materialize(bytes)) {
+      reservation_.add(target - reservation_.bytes(), materialization);
+    } else if (!pool.try_materialize(materialization)) {
       throw std::bad_alloc();
     }
     active_ += bytes;

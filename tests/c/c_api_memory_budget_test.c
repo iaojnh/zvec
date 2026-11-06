@@ -143,7 +143,19 @@ int main(void) {
   uint8_t *serialized = NULL;
   size_t size = 0;
   assert(zvec_doc_serialize(doc, &serialized, &size) == ZVEC_OK && size > 0);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  zvec_doc_t *decoded = (zvec_doc_t *)1;
+  assert(zvec_doc_deserialize(serialized, size, &decoded) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(decoded == NULL);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  assert(zvec_doc_deserialize(serialized, size, &decoded) == ZVEC_OK);
+  assert(decoded);
   zvec_free_uint8_array(serialized);
+  pk = zvec_doc_get_pk_copy(decoded);
+  assert(pk && strcmp(pk, "small") == 0);
+  zvec_free((void *)pk);
+  zvec_doc_destroy(decoded);
   char **names = NULL;
   size_t names_count = 0;
   assert(zvec_doc_get_field_names(doc, &names, &names_count) == ZVEC_OK);

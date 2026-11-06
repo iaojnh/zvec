@@ -21,6 +21,7 @@
 #include <arrow/result.h>
 #include <arrow/status.h>
 #include <parquet/arrow/reader.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/index/storage/store_helper.h"
 #include "fetch_memory.h"
@@ -207,17 +208,18 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
     }
   }
 
-  std::unordered_map<int, std::vector<std::pair<int, uint64_t>>> rg_to_local;
-  std::vector<std::pair<int, int64_t>>
-      local_doc_id_pairs;  // (output_row, global_row)
-
-  int output_row = 0;
+  using RowGroupRows = ailego::BudgetedVector<std::pair<size_t, uint64_t>>;
+  using RowGroupEntry = std::pair<const int, RowGroupRows>;
+  std::unordered_map<int, RowGroupRows, std::hash<int>, std::equal_to<int>,
+                     ailego::BudgetedAllocator<RowGroupEntry>> rg_to_local;
+  size_t output_row = 0;
   for (int global_row : indices) {
     if (global_row < 0 || global_row >= num_rows_) {
       LOG_ERROR("Invalid row index: %d, max: %lld", global_row,
                 static_cast<long long>(num_rows_));
       return arrow::Status::IndexError("Invalid forward row: ", global_row);
     }
+    if (col_indices.empty()) continue;
     int rg_id = find_row_group_for_row(global_row);
     int64_t offset = get_row_group_offset(rg_id);
     if (offset == -1) {
@@ -226,13 +228,7 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
                                     global_row);
     }
     uint64_t local_in_rg = global_row - offset;
-    rg_to_local[rg_id].emplace_back(output_row, local_in_rg);
-
-    if (need_local_doc_id) {
-      local_doc_id_pairs.emplace_back(output_row,
-                                      static_cast<int64_t>(global_row));
-    }
-    ++output_row;
+    rg_to_local[rg_id].emplace_back(output_row++, local_in_rg);
   }
 
   // Copy selected rows directly into budgeted builders. Keeping GetScalar
@@ -245,12 +241,14 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
     ARROW_RETURN_NOT_OK(builder->Reserve(indices.size()));
     builders.push_back(std::move(builder));
   }
-  auto order_result =
-      arrow::AllocateBuffer(indices.size() * sizeof(int64_t), pool);
-  ARROW_RETURN_NOT_OK(order_result.status());
-  std::shared_ptr<arrow::Buffer> order_buffer =
-      std::move(order_result).ValueOrDie();
-  auto *order = reinterpret_cast<int64_t *>(order_buffer->mutable_data());
+  std::unique_ptr<arrow::Buffer> order_buffer;
+  int64_t *order = nullptr;
+  if (!col_indices.empty()) {
+    ARROW_ASSIGN_OR_RAISE(
+        order_buffer, arrow::AllocateBuffer(indices.size() * sizeof(int64_t),
+                                            pool));
+    order = reinterpret_cast<int64_t *>(order_buffer->mutable_data());
+  }
   bool needs_reordering = false;
 
   for (const auto &[rg_id, pairs] : rg_to_local) {
@@ -289,7 +287,8 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
         }
         if (i == 0) {
           order[tmp_output_row] = builders[i]->length();
-          needs_reordering |= order[tmp_output_row] != tmp_output_row;
+          needs_reordering |=
+              order[tmp_output_row] != static_cast<int64_t>(tmp_output_row);
         }
         ARROW_RETURN_NOT_OK(detail::AppendFetchRow(
             builders[i].get(), *col_chunked_array, local_idx));
@@ -315,33 +314,12 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
   }
 
   if (need_local_doc_id) {
-    std::sort(local_doc_id_pairs.begin(), local_doc_id_pairs.end());
-    std::vector<uint64_t> values;
-    values.reserve(local_doc_id_pairs.size());
-    for (const auto &p : local_doc_id_pairs) {
-      values.push_back(p.second);
-    }
-
-    // Create UInt64Array
-    auto buffer_result =
-        arrow::AllocateBuffer(values.size() * sizeof(uint64_t), pool);
-    ARROW_RETURN_NOT_OK(buffer_result.status());
-    auto buffer = std::move(buffer_result.ValueOrDie());
-    std::memcpy(buffer->mutable_data(), values.data(),
-                values.size() * sizeof(uint64_t));
-
-    std::vector<std::shared_ptr<arrow::Buffer>> buffers;
-    buffers.push_back(nullptr);  // no null bitmap
-    buffers.push_back(std::shared_ptr<arrow::Buffer>(buffer.release()));
-
-    auto data = arrow::ArrayData::Make(arrow::uint64(),
-                                       static_cast<uint64_t>(values.size()),
-                                       std::move(buffers), /*null_count=*/0);
-
+    arrow::UInt64Builder rows(pool);
+    ARROW_RETURN_NOT_OK(rows.Reserve(indices.size()));
+    for (int row : indices) rows.UnsafeAppend(static_cast<uint64_t>(row));
+    ARROW_ASSIGN_OR_RAISE(auto row_ids, rows.Finish());
     for (size_t i = 0; i < columns.size(); ++i) {
-      if (columns[i] == LOCAL_ROW_ID) {
-        result_arrays[i] = std::make_shared<arrow::UInt64Array>(data);
-      }
+      if (columns[i] == LOCAL_ROW_ID) result_arrays[i] = row_ids;
     }
   }
 

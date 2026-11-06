@@ -174,9 +174,9 @@ class MemForwardStore : public BaseForwardStore {
   /// \param source Receives a batch containing those rows
   /// \param local_rows Receives their offsets inside that batch
   /// \return true when one source covers all of them, false otherwise
-  bool locate_single_source(const std::vector<int> &indices,
-                            RecordBatchPtr *source,
-                            std::vector<int> *local_rows);
+  arrow::Result<bool> locate_single_source(
+      const std::vector<int> &indices, RecordBatchPtr *source,
+      std::vector<int> *local_rows, ailego::MemoryReservation &row_memory);
 
   /// Apply row filtering and column projection to a table
   /// \param table The table to narrow
