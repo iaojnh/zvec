@@ -779,5 +779,26 @@ TEST_F(CollectionWriteBudgetTest, FilterDeleteStagingFailureDoesNotDeleteDocs) {
   ASSERT_TRUE(writer.value()->close().ok());
 }
 
+TEST_F(CollectionWriteBudgetTest, FilterDeleteAdmitsBeforeCopyingQueryText) {
+  auto writer = Collection::CreateAndOpen(path("delete_input"), schema(),
+                                         {false, false, kMiB});
+  ASSERT_TRUE(writer) << writer.error().message();
+  auto batch = docs("retained", "value");
+  ASSERT_TRUE(writer.value()->insert(batch));
+  const auto rejected =
+      writer.value()->delete_by_filter(std::string(16 * kMiB, ' '));
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, rejected.code());
+  EXPECT_NE(std::string::npos,
+            rejected.message().find("scan preparation budget"));
+  auto fetched = writer.value()->fetch({"retained"});
+  ASSERT_TRUE(fetched);
+  EXPECT_NE(nullptr, fetched->at("retained"));
+  ASSERT_TRUE(writer.value()->delete_by_filter("payload = 'value'").ok());
+  fetched = writer.value()->fetch({"retained"});
+  ASSERT_TRUE(fetched);
+  EXPECT_EQ(nullptr, fetched->at("retained"));
+  ASSERT_TRUE(writer.value()->close().ok());
+}
+
 }  // namespace
 }  // namespace zvec

@@ -74,6 +74,15 @@ int main(void) {
          ZVEC_ERROR_RESOURCE_EXHAUSTED);
   free(ids);
 
+  // C strings are copied to native query objects only after admission.
+  char *filter = (char *)malloc(24 * MIB + 1);
+  assert(filter);
+  memset(filter, ' ', 24 * MIB);
+  filter[24 * MIB] = 0;
+  assert(zvec_collection_delete_by_filter(collection, filter) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  free(filter);
+
   // Retaining copies must exhaust a shared active allowance, independent of
   // the original document's lifetime. Both documented free APIs refund it.
   void *copies[64];

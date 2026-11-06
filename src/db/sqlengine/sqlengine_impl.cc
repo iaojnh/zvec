@@ -74,8 +74,18 @@ Result<DocPtrList> SQLEngineImpl::execute(
 Status SQLEngineImpl::scan_doc_ids(CollectionSchema::Ptr collection,
                                    const std::string &filter,
                                    const std::vector<Segment::Ptr> &segments,
-                                   const DocIdConsumer &consume) {
+                                   const DocIdConsumer &consume) try {
   if (!consume) return Status::InvalidArgument("Missing document ID consumer");
+  if (segments.empty()) return Status::OK();
+  const bool budgeted = std::any_of(
+      segments.begin(), segments.end(),
+      [](const auto &segment) { return segment->uses_buffer_storage(); });
+  detail::ResultMemoryAllowance::Lease input_memory(
+      budgeted ? &detail::SharedResultMemoryAllowance() : nullptr);
+  detail::QueryResultEstimate input_bytes;
+  input_bytes.add(128);
+  input_bytes.add(filter.size());
+  input_memory.add(input_bytes.bytes());
   SearchQuery query;
   query.filter_ = filter;
   query.topk_ = INT32_MAX;
@@ -95,6 +105,8 @@ Status SQLEngineImpl::scan_doc_ids(CollectionSchema::Ptr collection,
         std::shared_ptr<arrow::RecordBatch> batch;
         auto status = reader.value()->ReadNext(&batch);
         if (!status.ok()) {
+          if (status.IsOutOfMemory())
+            return Status(StatusCode::RESOURCE_EXHAUSTED, status.ToString());
           return Status::InternalError("Read document ID batch failed: ",
                                        status.ToString());
         }
@@ -123,6 +135,9 @@ Status SQLEngineImpl::scan_doc_ids(CollectionSchema::Ptr collection,
     }
   }
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient document ID scan preparation budget");
 }
 
 Result<std::unique_ptr<arrow::RecordBatchReader>> SQLEngineImpl::prepare_search(

@@ -7345,6 +7345,9 @@ zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      zvec::detail::ReserveCStrings(input_memory, &filter, 1);
       auto status = (*coll_ptr)->delete_by_filter(filter); if (!status.ok()) {
         return handle_status(status);
       }

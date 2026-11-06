@@ -957,11 +957,15 @@ void ZVecPyCollection::bind_dml_methods(
             return owned_write_results(unwrap_expected(std::move(result)),
                                        output_memory);
           })
-      .def("DeleteByFilter", [](Collection &self, const std::string &filter) {
+      .def("DeleteByFilter", [](Collection &self, py::handle filter) {
+        const bool budgeted = !unwrap_expected(self.options()).enable_mmap_;
+        detail::PythonFetchInputs inputs(
+            py::make_tuple(filter), py::none(),
+            budgeted ? &forward_result_allowance() : nullptr);
         Status status;
         {
           py::gil_scoped_release release;
-          status = self.delete_by_filter(filter);
+          status = self.delete_by_filter(inputs.pks.front());
         }
         throw_if_error(status);
       });
@@ -1074,11 +1078,13 @@ are returned as None.
            py::arg("include_vector") = true)
       .def(
           "CreateIterator",
-          [](Collection &self,
-             const std::optional<std::vector<std::string>> &output_fields,
-             bool include_vector) {
+          [](Collection &self, py::handle output_fields, bool include_vector) {
+            const bool budgeted = !unwrap_expected(self.options()).enable_mmap_;
+            detail::PythonFetchInputs inputs(
+                py::tuple(), output_fields,
+                budgeted ? &forward_result_allowance() : nullptr);
             IteratorOptions options;
-            options.output_fields_ = output_fields;
+            options.output_fields_ = std::move(inputs.output_fields);
             options.include_vector_ = include_vector;
             Result<DocIterator::Ptr> result;
             {
