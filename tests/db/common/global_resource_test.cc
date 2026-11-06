@@ -130,7 +130,7 @@ void CheckConcurrentLazyResourceAccess(bool existing_pool) {
               snapshot.optimize_pool->count());
     EXPECT_EQ(expected_rocksdb_capacity, snapshot.rocksdb_capacity);
     EXPECT_EQ(expected_rocksdb_capacity, snapshot.cache->GetCapacity());
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
     ASSERT_NE(nullptr, snapshot.cache->memory_allocator());
     EXPECT_STREQ("ZvecMappedCacheAllocator",
                  snapshot.cache->memory_allocator()->Name());
@@ -145,7 +145,7 @@ void CheckConcurrentLazyResourceAccess(bool existing_pool) {
   EXPECT_EQ(expected_pool_capacity, pool.capacity());
 }
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 void CheckStartupHostMemoryRecovery() {
   constexpr size_t kMiB = 1UL << 20;
   void *host = ailego::File::MemoryMap(128 * kMiB, 0);
@@ -208,7 +208,8 @@ TEST_P(GlobalResourceDeathTest,
 INSTANTIATE_TEST_SUITE_P(PoolInitialization, GlobalResourceDeathTest,
                          ::testing::Values(false, true));
 
-#if (defined(__linux__) || defined(__APPLE__)) && GTEST_HAS_DEATH_TEST
+#if (defined(__linux__) || defined(__APPLE__) || defined(_WIN32)) && \
+    GTEST_HAS_DEATH_TEST
 TEST(GlobalResourceStartupDeathTest, HostReleaseRestoresWorkspaceAdmission) {
   const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
   ::testing::FLAGS_gtest_death_test_style = "threadsafe";
@@ -438,7 +439,7 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
   EXPECT_EQ(expected_buffer_capacity,
             ailego::MemoryLimitPool::get_instance().capacity());
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
   const auto stack_bytes = detail::DefaultNativeWorkerStackBytes();
   const auto native_workers =
       expected_query_workers + expected_optimize_workers +
@@ -469,7 +470,7 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
       GlobalResource::Instance().rocksdb_write_buffer_manager();
   ASSERT_NE(nullptr, rocksdb_cache);
   ASSERT_NE(nullptr, write_buffer_manager);
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   ASSERT_NE(nullptr, rocksdb_cache->memory_allocator());
   EXPECT_STREQ("ZvecMappedCacheAllocator",
                rocksdb_cache->memory_allocator()->Name());

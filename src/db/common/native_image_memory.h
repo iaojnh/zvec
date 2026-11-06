@@ -15,10 +15,15 @@
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>
 #if TARGET_OS_OSX
-#include <dlfcn.h>
 #include <mach-o/loader.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #endif
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace zvec::detail {
@@ -66,9 +71,8 @@ inline bool ElfLoadImageBytes(const ElfW(Phdr) * headers, size_t count,
 // unaligned test inputs cannot cause an unaligned structure access. This counts
 // potentially resident image capacity, not an RSS sample or the file's size.
 inline bool MachOLoadImageBytes(const void *image, size_t header_bytes,
-                               size_t page_size, size_t *bytes) noexcept {
-  if (!image || !bytes || !page_size ||
-      header_bytes < sizeof(mach_header_64))
+                                size_t page_size, size_t *bytes) noexcept {
+  if (!image || !bytes || !page_size || header_bytes < sizeof(mach_header_64))
     return false;
   mach_header_64 header;
   std::memcpy(&header, image, sizeof(header));
@@ -157,8 +161,7 @@ inline bool MachOLoadImageBytes(const void *image, size_t header_bytes,
 // anchor must belong to the translation unit containing the product
 // implementation, not an inline function supplied by the caller. A statically
 // linked main executable mixes product and caller code, so exclude the entire
-// executable. Keep the existing policy on other platforms. This does not read
-// RSS or touch pages to warm them up.
+// executable. This does not read RSS or touch pages to warm them up.
 inline size_t NativeImageBytesForAddress(const void *anchor) {
 #if defined(__linux__)
   const long native_page_size = sysconf(_SC_PAGESIZE);
@@ -211,8 +214,40 @@ inline size_t NativeImageBytesForAddress(const void *anchor) {
     throw std::bad_alloc();
   size_t bytes = 0;
   if (!MachOLoadImageBytes(owner.dli_fbase, sizeof(header) + command_bytes,
-                          static_cast<size_t>(native_page_size), &bytes))
+                           static_cast<size_t>(native_page_size), &bytes))
     throw std::bad_alloc();
+  return bytes;
+#elif defined(_WIN32)
+  HMODULE image = nullptr;
+  if (!anchor ||
+      !::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(anchor), &image))
+    throw std::bad_alloc();
+  if (image == ::GetModuleHandleW(nullptr)) return 0;
+  // Walk loader mappings, including committed zero-fill sections. Reserved
+  // gaps and discarded/inaccessible sections cannot contribute resident pages.
+  // VirtualQuery reports capacity without faulting in the image's contents.
+  uintptr_t cursor = reinterpret_cast<uintptr_t>(image);
+  size_t bytes = 0;
+  while (true) {
+    MEMORY_BASIC_INFORMATION region{};
+    if (!::VirtualQuery(reinterpret_cast<const void *>(cursor), &region,
+                        sizeof(region)))
+      throw std::bad_alloc();
+    if (region.AllocationBase != image) break;
+    if (!region.RegionSize ||
+        region.RegionSize > std::numeric_limits<uintptr_t>::max() - cursor)
+      throw std::bad_alloc();
+    if (region.State == MEM_COMMIT && region.Type == MEM_IMAGE &&
+        !(region.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+      if (region.RegionSize > std::numeric_limits<size_t>::max() - bytes)
+        throw std::bad_alloc();
+      bytes += region.RegionSize;
+    }
+    cursor += region.RegionSize;
+  }
+  if (!bytes) throw std::bad_alloc();
   return bytes;
 #else
   (void)anchor;

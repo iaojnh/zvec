@@ -152,7 +152,7 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     auto optimize_thread_pool = std::make_unique<ailego::ThreadPool>(
         optimize_thread_count, optimize_thread_binding);
     std::shared_ptr<rocksdb::MemoryAllocator> rocksdb_cache_allocator;
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
     // malloc can retain freed SST blocks around live cache payloads after
     // flush/compaction. On macOS these pages can remain resident even after
     // being marked reusable. Use RocksDB's allocator hook to unmap released

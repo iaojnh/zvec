@@ -38,6 +38,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cerrno>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace zvec {
@@ -194,7 +199,8 @@ TEST(RocksdbBlockCacheTest, PressureUsesChargedTransientHandles) {
   EXPECT_EQ(3, deleted);
 }
 
-#if (defined(__linux__) || defined(__APPLE__)) && GTEST_HAS_DEATH_TEST
+#if (defined(__linux__) || defined(__APPLE__) || defined(_WIN32)) && \
+    GTEST_HAS_DEATH_TEST
 void CheckReadsAndBackgroundCompactionUnderPressure() {
   rocksdb::Options options;
   options.create_if_missing = true;
@@ -212,8 +218,19 @@ void CheckReadsAndBackgroundCompactionUnderPressure() {
       std::make_shared<rocksdb::WriteBufferManager>(4UL << 20, cache, true);
   options.table_factory.reset(
       rocksdb::NewBlockBasedTableFactory(table_options));
+#if defined(_WIN32)
+  char temporary[MAX_PATH + 1]{};
+  const DWORD path_length = ::GetTempPathA(sizeof(temporary), temporary);
+  ASSERT_GT(path_length, 0u);
+  ASSERT_LT(path_length, sizeof(temporary));
+  char directory[MAX_PATH + 1]{};
+  ASSERT_NE(0u, ::GetTempFileNameA(temporary, "zvr", 0, directory));
+  ASSERT_TRUE(::DeleteFileA(directory));
+  ASSERT_TRUE(::CreateDirectoryA(directory, nullptr));
+#else
   char directory[] = "/tmp/zvec-rss-rocksdb-XXXXXX";
   ASSERT_NE(nullptr, ::mkdtemp(directory));
+#endif
   auto cleanup = ailego::ScopeGuard::Make(
       [&] { EXPECT_TRUE(rocksdb::DestroyDB(directory, options).ok()); });
   rocksdb::DB *raw = nullptr;
@@ -385,10 +402,16 @@ TEST(RocksdbCacheAllocatorTest,
   EXPECT_EQ(0u, cache->GetUsage());
 }
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 TEST(RocksdbCacheAllocatorTest, ChargesNativePageRounding) {
   RocksdbCacheAllocator allocator;
+#if defined(_WIN32)
+  SYSTEM_INFO system{};
+  ::GetSystemInfo(&system);
+  const size_t page_size = system.dwPageSize;
+#else
   const auto page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+#endif
   ASSERT_GT(page_size, 0u);
   for (size_t size : {page_size - 1, page_size, page_size + 1}) {
     void *data = allocator.Allocate(size);
@@ -403,6 +426,16 @@ TEST(RocksdbCacheAllocatorTest, ChargesNativePageRounding) {
 TEST(RocksdbCacheAllocatorTest, DeallocationUnmapsBackingPages) {
   RocksdbCacheAllocator allocator;
   void *data = allocator.Allocate(65536);
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION region{};
+  ASSERT_NE(0u, ::VirtualQuery(data, &region, sizeof(region)));
+  ASSERT_EQ(DWORD{MEM_COMMIT}, region.State);
+  ASSERT_EQ(DWORD{MEM_PRIVATE}, region.Type);
+  const void *base = region.AllocationBase;
+  allocator.Deallocate(data);
+  ASSERT_NE(0u, ::VirtualQuery(base, &region, sizeof(region)));
+  EXPECT_EQ(DWORD{MEM_FREE}, region.State);
+#else
   const auto page_size = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
   const uintptr_t base =
       reinterpret_cast<uintptr_t>(data) / page_size * page_size;
@@ -435,6 +468,7 @@ TEST(RocksdbCacheAllocatorTest, DeallocationUnmapsBackingPages) {
   EXPECT_EQ(-1,
             ::mincore(reinterpret_cast<void *>(base), page_size, &resident));
   EXPECT_EQ(ENOMEM, errno);
+#endif
 #endif
 }
 #endif
