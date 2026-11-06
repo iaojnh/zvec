@@ -80,7 +80,12 @@ class LibAioLoader {
     return available_.load(std::memory_order_acquire);
   }
 
-  int setup_budgeted(int maxevents, io_context_t &ctx, size_t &mapped_bytes) {
+  struct RingMemory {
+    size_t bytes{0};
+    zvec::ailego::ProcessRssBudget::MaterializationStamp projection{};
+  };
+
+  int setup_budgeted(int maxevents, io_context_t &ctx, RingMemory &memory) {
     auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
     const size_t page = pool.page_buffer_size();
     // io_setup returns a completion-ring address. Reserve its header page
@@ -106,8 +111,8 @@ class LibAioLoader {
         LOG_ERROR("libaio: failed to destroy a rejected completion ring");
         const bool accounted =
             !extra || pool.account_pending_process_backing(extra);
-        mapped_bytes = page + (accounted ? extra : 0);
-        pool.finish_process_backing(mapped_bytes, true);
+        memory.bytes = page + (accounted ? extra : 0);
+        memory.projection = pool.finish_process_backing(memory.bytes, true);
         // Leave the rejected ring with its owner for teardown. A terminal
         // error prevents a caller from allocating another ring on every retry.
         ctx = ring;
@@ -116,22 +121,21 @@ class LibAioLoader {
       return size == 0 ? -EINVAL : -ENOMEM;
     }
 
-    pool.finish_process_backing(size, true);
+    memory = {size, pool.finish_process_backing(size, true)};
     ctx = ring;
-    mapped_bytes = size;
     return 0;
   }
 
-  int destroy_budgeted(io_context_t &ctx, size_t &mapped_bytes) {
+  int destroy_budgeted(io_context_t &ctx, RingMemory &memory) {
     if (!ctx) return 0;
     const int ret = destroy_ring(ctx);
     if (ret == 0) {
-      if (mapped_bytes) {
-        zvec::ailego::MemoryLimitPool::get_instance().release_process_backing(
-            mapped_bytes);
+      if (memory.bytes) {
+        zvec::ailego::MemoryLimitPool::get_instance()
+            .release_unmapped_process_backing(memory.bytes, memory.projection);
       }
       ctx = nullptr;
-      mapped_bytes = 0;
+      memory = {};
     }
     return ret;
   }

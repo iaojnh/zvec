@@ -867,6 +867,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   struct PageLockDeleter {
     size_t count{0};
     size_t mapped_bytes{0};
+    ProcessRssBudget::MaterializationStamp projection{};
     void operator()(std::shared_mutex *data) const noexcept;
   };
   // The deleter destroys every lock, unmaps its backing, then refunds only
@@ -880,6 +881,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   // Anonymous page mapping: unmap before refunding its metadata reservation.
   char *writeback_staging_{nullptr};
   size_t writeback_staging_size_{0};
+  ProcessRssBudget::MaterializationStamp writeback_staging_projection_{};
   size_t writeback_io_staging_charge_{0};
 #if defined(__linux__) && !defined(__ANDROID__)
   std::unique_ptr<IoUringRing> writeback_io_uring_{};

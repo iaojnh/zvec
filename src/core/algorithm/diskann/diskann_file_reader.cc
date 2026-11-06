@@ -270,7 +270,7 @@ int setup_io_ctx(IOContext &ctx) {
   if (selected != ailego::IOBackendType::kPread &&
       LibAioLoader::Instance().load()) {
     const int ret = LibAioLoader::Instance().setup_budgeted(
-        MAX_EVENTS, ctx->aio_ctx, ctx->aio_mapped_bytes);
+        MAX_EVENTS, ctx->aio_ctx, ctx->aio_memory);
     if (ret == 0 || ctx->aio_ctx) {
       ctx->type = ailego::IOBackendType::kLibAio;
       ctx->aio_quarantined = ret != 0;
@@ -301,7 +301,7 @@ int destroy_io_ctx(IOContext &ctx) {
     ctx->ring.teardown();
   } else if (ctx->type == ailego::IOBackendType::kLibAio && ctx->aio_ctx) {
     const int ret = LibAioLoader::Instance().destroy_budgeted(
-        ctx->aio_ctx, ctx->aio_mapped_bytes);
+        ctx->aio_ctx, ctx->aio_memory);
     if (ret != 0) {
       // The kernel may still own these destinations. Preserve their mapping
       // and its charge even if the context's final owner must go away.
@@ -373,7 +373,7 @@ static void finish_libaio_reads(IoBackend &ctx) {
 
 static bool reset_aio_context(IoBackend &ctx) {
   auto &loader = LibAioLoader::Instance();
-  int ret = loader.destroy_budgeted(ctx.aio_ctx, ctx.aio_mapped_bytes);
+  int ret = loader.destroy_budgeted(ctx.aio_ctx, ctx.aio_memory);
   ctx.aio_quarantined = ret != 0;
   finish_libaio_reads(ctx);
   if (ret != 0) {
@@ -382,7 +382,7 @@ static bool reset_aio_context(IoBackend &ctx) {
     return false;
   }
 
-  ret = loader.setup_budgeted(MAX_EVENTS, ctx.aio_ctx, ctx.aio_mapped_bytes);
+  ret = loader.setup_budgeted(MAX_EVENTS, ctx.aio_ctx, ctx.aio_memory);
   if (ret != 0) {
     ctx.aio_quarantined = ctx.aio_ctx != nullptr;
     LOG_WARN("Cannot recreate DiskANN AIO context (%d); using pread", ret);

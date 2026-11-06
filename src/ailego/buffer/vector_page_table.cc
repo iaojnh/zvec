@@ -71,7 +71,6 @@ static ssize_t zvec_pwrite(int fd, const void *buf, size_t count,
   return static_cast<ssize_t>(bytes_written);
 }
 #else
-#include <sys/mman.h>
 #include <unistd.h>
 static inline ssize_t zvec_pread(int fd, void *buf, size_t count,
                                  size_t offset) {
@@ -93,19 +92,16 @@ constexpr size_t kBlockingAioBatchSize = VecBufferPool::kWritebackBatchPages;
 
 // Writable metadata owns anonymous mappings, not malloc storage that can
 // remain resident after free. Refund only backing that was actually unmapped.
-size_t ReleaseWritableMapping(void *data, size_t bytes, const char *kind) {
-  if (data == nullptr) return 0;
-#if defined(_MSC_VER)
-  const bool released = ::VirtualFree(data, 0, MEM_RELEASE) != 0;
-#else
-  const bool released = ::munmap(data, bytes) == 0;
-#endif
-  if (!released) {
+void ReleaseWritableMapping(void *data, size_t bytes,
+                             ProcessRssBudget::MaterializationStamp projection,
+                             const char *kind) {
+  if (data == nullptr) return;
+  if (!File::TryMemoryUnmap(data, bytes)) {
     // Conservatively keep the charge if the OS did not release the mapping.
     LOG_ERROR("Failed to unmap %zu bytes of %s; keeping charge", bytes, kind);
-    return 0;
+    return;
   }
-  return bytes;
+  MemoryLimitPool::get_instance().release_unmapped_metadata(bytes, projection);
 }
 
 // One per-operation buffer, shared across its chunks, not retained in TLS.
@@ -138,8 +134,7 @@ void VecBufferPool::PageLockDeleter::operator()(
     std::shared_mutex *data) const noexcept {
   if (data == nullptr) return;
   std::destroy_n(data, count);
-  MemoryLimitPool::get_instance().release_metadata(
-      ReleaseWritableMapping(data, mapped_bytes, "page-lock stripes"));
+  ReleaseWritableMapping(data, mapped_bytes, projection, "page-lock stripes");
 }
 
 VecBufferPool::~VecBufferPool() {
@@ -159,8 +154,8 @@ VecBufferPool::~VecBufferPool() {
     writable_metadata_bytes -= writeback_io_staging_charge_;
 #endif
   block_mutexes_.reset();
-  writable_metadata_bytes += ReleaseWritableMapping(
-      writeback_staging_, writeback_staging_size_, "writeback staging");
+  ReleaseWritableMapping(writeback_staging_, writeback_staging_size_,
+                         writeback_staging_projection_, "writeback staging");
   writeback_staging_ = nullptr;
 #if defined(__linux__) && !defined(__ANDROID__)
   writeback_io_uring_.reset();
@@ -1157,23 +1152,25 @@ int VecBufferPool::init() {
           mutex_charge, file_name_.c_str());
       return -1;
     }
-    pending.commit(mutex_charge);
+    const auto projection = pending.commit_mapping(mutex_charge);
     try {
       // This algorithm also destroys any constructed prefix if a lock's
       // constructor throws. The raw mapping still needs explicit release.
       std::uninitialized_value_construct_n(data, mutex_count);
     } catch (...) {
-      pool.release_metadata(
-          ReleaseWritableMapping(data, mutex_charge, "page-lock stripes"));
+      ReleaseWritableMapping(data, mutex_charge, projection,
+                             "page-lock stripes");
       LOG_ERROR(
           "VecBufferPool::init: failed to construct %zu page-lock stripes "
           "(file=%s)",
           mutex_count, file_name_.c_str());
       return -1;
     }
+    mutexes.get_deleter().projection = projection;
     mutexes.reset(data);
   }
   char *writeback_staging = nullptr;
+  ProcessRssBudget::MaterializationStamp staging_projection{};
   if (staging_charge != 0) {
     writeback_staging = static_cast<char *>(File::MemoryMap(staging_charge, 0));
     if (writeback_staging == nullptr) {
@@ -1184,13 +1181,12 @@ int VecBufferPool::init() {
           staging_charge, file_name_.c_str());
       return -1;
     }
-    pending.commit(staging_charge);
+    staging_projection = pending.commit_mapping(staging_charge);
   }
   if (!page_table_.init(block_num)) {
     mutexes.reset();
-    const size_t released_staging = ReleaseWritableMapping(
-        writeback_staging, staging_charge, "writeback staging");
-    pool.release_metadata(released_staging);
+    ReleaseWritableMapping(writeback_staging, staging_charge, staging_projection,
+                           "writeback staging");
     LOG_ERROR(
         "VecBufferPool::init: page_table_ init failed for file[%s], "
         "file_size=%zu, block_num=%zu, required_metadata=%zu",
@@ -1198,11 +1194,11 @@ int VecBufferPool::init() {
         metadata_bytes_for_page_count(block_num, writable_));
     return -1;
   }
-  pending.commit();
   block_mutexes_ = std::move(mutexes);
   block_mutex_count_ = mutex_count;
   writeback_staging_ = writeback_staging;
   writeback_staging_size_ = staging_charge;
+  writeback_staging_projection_ = staging_projection;
 #if defined(__linux__) && !defined(__ANDROID__)
   // Only an available ring needs the optional second staging allowance.
   // Synchronous writeback uses the mandatory workspace reserved above.
@@ -2951,7 +2947,7 @@ struct ThreadLocalIoUringContext {
 template <unsigned QueueDepth>
 struct ThreadLocalAioContext {
   io_context_t ctx{nullptr};
-  size_t mapped_bytes{0};
+  LibAioLoader::RingMemory memory;
   bool inited{false};
   bool usable{false};
 
@@ -2962,7 +2958,7 @@ struct ThreadLocalAioContext {
       inited = true;
       return false;
     }
-    const int result = loader.setup_budgeted(QueueDepth, ctx, mapped_bytes);
+    const int result = loader.setup_budgeted(QueueDepth, ctx, memory);
     inited = result != -ENOMEM;
     usable = result == 0;
     return usable;
@@ -2970,7 +2966,7 @@ struct ThreadLocalAioContext {
 
   bool destroy_context(const char *context_name) {
     if (!ctx) return true;
-    const int ret = LibAioLoader::Instance().destroy_budgeted(ctx, mapped_bytes);
+    const int ret = LibAioLoader::Instance().destroy_budgeted(ctx, memory);
     if (ret != 0) {
       LOG_ERROR(
           "%s: io_destroy failed, ret=%d; in-flight buffers remain "

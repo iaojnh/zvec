@@ -1598,16 +1598,16 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
 }
 
 void MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
-  (void)finish(bytes);
+  (void)commit_mapping(bytes);
 }
 
 ProcessRssBudget::MaterializationStamp
 MemoryLimitPool::PendingAllocation::commit_mapping() {
-  return finish(bytes_);
+  return commit_mapping(bytes_);
 }
 
 ProcessRssBudget::MaterializationStamp
-MemoryLimitPool::PendingAllocation::finish(size_t bytes) {
+MemoryLimitPool::PendingAllocation::commit_mapping(size_t bytes) {
   assert(bytes <= bytes_);
   if (!bytes) return {};
   auto stamp = pool_.process_rss_.finish_reservation(bytes, true);
@@ -1799,6 +1799,11 @@ void MemoryLimitPool::release_unmapped_external(
 
 void MemoryLimitPool::release_metadata(const size_t buffer_size) {
   release_fixed(buffer_size, &metadata_used_size_);
+}
+
+void MemoryLimitPool::release_unmapped_metadata(
+    size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
+  release_fixed(bytes, &metadata_used_size_, Backing::kLive, stamp);
 }
 
 void MemoryLimitPool::release_fixed(

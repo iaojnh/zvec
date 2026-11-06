@@ -80,7 +80,7 @@ struct IoBackend {
 #if defined(__linux__) && !defined(__ANDROID__)
   ailego::IoUringRing ring{};
   io_context_t aio_ctx{nullptr};
-  size_t aio_mapped_bytes{0};
+  LibAioLoader::RingMemory aio_memory;
   std::unique_ptr<ailego::BudgetedMappedBuffer> aio_staging;
   const PendingBatch *aio_batch{nullptr};
   bool aio_active{false};

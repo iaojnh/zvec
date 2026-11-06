@@ -148,8 +148,7 @@ class ProcessRssBudget {
         stamp.rss_epoch && stamp.rss_epoch == rss_epoch_;
     const bool native_unsampled =
         stamp.native_epoch && stamp.native_epoch == native_epoch_;
-    if (rss_unsampled) refund_projection(bytes, rss_materialized_);
-    if (native_unsampled) refund_projection(bytes, native_materialized_);
+    refund_materialization(bytes, stamp);
     assert(bytes <= backing_);
     backing_ -= bytes;
     // Only backing that could have contributed to a successful RSS sample
@@ -190,6 +189,37 @@ class ProcessRssBudget {
     return true;
   }
 
+  // Reserve measured headroom across a mapping syscall when the owner
+  // already holds the lifetime charge. An intervening sample must not clear
+  // the debit before the mapping exists.
+  bool try_reserve_materialization(size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    refresh_locked(false);
+    if (!materialization_allowed_locked(bytes) ||
+        bytes > std::numeric_limits<size_t>::max() - pending_materializations_)
+      return false;
+    pending_materializations_ += bytes;
+    update_available();
+    return true;
+  }
+
+  MaterializationStamp finish_materialization(size_t bytes, bool mapped) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    assert(bytes <= pending_materializations_);
+    pending_materializations_ -= bytes;
+    if (mapped) remember_materialization(bytes);
+    update_available();
+    if (!mapped || !limit()) return {};
+    return {rss_epoch_, native_reader_ ? native_epoch_ : 0};
+  }
+
+  // Unmapping prepaid storage leaves the owner's lifetime charge in place.
+  void release_materialization(size_t bytes, MaterializationStamp stamp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    refund_materialization(bytes, stamp);
+    update_available();
+  }
+
   size_t limit() const {
     return limit_.load(std::memory_order_relaxed);
   }
@@ -209,6 +239,13 @@ class ProcessRssBudget {
     if (projection == std::numeric_limits<size_t>::max()) return;
     assert(bytes <= projection);
     projection -= bytes;
+  }
+
+  void refund_materialization(size_t bytes, MaterializationStamp stamp) {
+    if (stamp.rss_epoch && stamp.rss_epoch == rss_epoch_)
+      refund_projection(bytes, rss_materialized_);
+    if (stamp.native_epoch && stamp.native_epoch == native_epoch_)
+      refund_projection(bytes, native_materialized_);
   }
 
   void remember_materialization(size_t bytes) {
@@ -234,7 +271,8 @@ class ProcessRssBudget {
     // The existing allowance may overlap the RSS estimate even though this
     // operation still needs new pages. Check measured room independently of
     // the lifetime charge, including other backing allocations in flight.
-    const size_t needed = add_saturated(bytes, pending_allocations_);
+    const size_t needed = add_saturated(
+        add_saturated(bytes, pending_allocations_), pending_materializations_);
     const size_t measured = add_saturated(rss(), rss_materialized_);
     if (measured >= cap || needed > cap - measured) return false;
     if (native_reader_) {
@@ -428,15 +466,17 @@ class ProcessRssBudget {
     // Take the larger estimate, never add managed bytes to measured RSS.
     // The lifetime estimate preserves lazy allocations across samples; the
     // latest sample catches host growth and includes subsequent admissions.
-    const size_t measured = add_saturated(rss(), rss_materialized_);
+    const size_t measured = add_saturated(
+        add_saturated(rss(), rss_materialized_), pending_materializations_);
     const size_t usage = add_saturated(
         std::max(estimate_.usage(backing_), measured), pending_allocations_);
     size_t available = cap ? (usage < cap ? cap - usage : 0)
                            : std::numeric_limits<size_t>::max();
     if (cap && native_reader_) {
       const size_t native_cap = std::min(cap, native_limit_);
-      const size_t footprint =
-          add_saturated(native_estimate_.sample_, native_materialized_);
+      const size_t footprint = add_saturated(
+          add_saturated(native_estimate_.sample_, native_materialized_),
+          pending_materializations_);
       const size_t native_usage = add_saturated(
           std::max(native_estimate_.usage(backing_), footprint),
           pending_allocations_);
@@ -461,6 +501,7 @@ class ProcessRssBudget {
   Reader reader_{nullptr};
   size_t backing_{0};
   size_t pending_allocations_{0};
+  size_t pending_materializations_{0};
   Estimate estimate_;
   Estimate native_estimate_;
   NativeReader native_reader_{nullptr};

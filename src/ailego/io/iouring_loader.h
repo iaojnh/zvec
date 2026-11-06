@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <vector>
 #include <ailego/io/iouring_def.h>
+#include <zvec/ailego/buffer/process_rss_budget.h>
 
 namespace zvec {
 namespace ailego {
@@ -122,6 +123,7 @@ class IoUringRing {
     staging_size_ = 0;
     // The allocation has not been freed. Leave its charge quarantined too.
     staging_charge_ = 0;
+    staging_projection_ = {};
     prepaid_staging_bytes_ = 0;
   }
 
@@ -164,6 +166,9 @@ class IoUringRing {
   size_t sq_ring_size_{0};
   size_t sqes_size_{0};
   size_t cq_ring_size_{0};
+  ProcessRssBudget::MaterializationStamp sq_ring_projection_{};
+  ProcessRssBudget::MaterializationStamp sqes_projection_{};
+  ProcessRssBudget::MaterializationStamp cq_ring_projection_{};
 
   // SQ ring field pointers (into sq_ring_ptr_).
   unsigned *sq_head_{nullptr};
@@ -190,6 +195,7 @@ class IoUringRing {
   char *staging_{nullptr};
   size_t staging_size_{0};
   size_t staging_charge_{0};
+  ProcessRssBudget::MaterializationStamp staging_projection_{};
   size_t prepaid_staging_bytes_{0};
 
   unsigned sq_entries_{0};

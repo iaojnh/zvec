@@ -287,6 +287,17 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_materialize(size_t bytes) {
     return process_rss_.try_materialize(bytes);
   }
+  bool try_reserve_materialization(size_t bytes) {
+    return process_rss_.try_reserve_materialization(bytes);
+  }
+  ProcessRssBudget::MaterializationStamp finish_materialization(
+      size_t bytes, bool mapped) {
+    return process_rss_.finish_materialization(bytes, mapped);
+  }
+  void release_materialization(size_t bytes,
+                               ProcessRssBudget::MaterializationStamp stamp) {
+    process_rss_.release_materialization(bytes, stamp);
+  }
   // Separately owned backing can still take part in process RSS admission.
   bool try_reserve_process_backing(size_t bytes) {
     return process_rss_.try_reserve(bytes);
@@ -361,10 +372,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     void commit(size_t bytes);
     // Retain this stamp only for backing the owner can explicitly unmap.
     ProcessRssBudget::MaterializationStamp commit_mapping();
+    ProcessRssBudget::MaterializationStamp commit_mapping(size_t bytes);
 
    private:
-    ProcessRssBudget::MaterializationStamp finish(size_t bytes);
-
     MemoryLimitPool &pool_;
     const Kind kind_;
     std::atomic<size_t> *const counter_;
@@ -386,6 +396,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
       size_t bytes, ProcessRssBudget::MaterializationStamp stamp);
 
   void release_metadata(const size_t buffer_size);
+  void release_unmapped_metadata(
+      size_t bytes, ProcessRssBudget::MaterializationStamp stamp);
 
   bool is_full();
 

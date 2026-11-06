@@ -292,7 +292,8 @@ void IndexMapping::release_meta_mapping(const MetaMapping &mapping) {
     return;
   }
   if (mapping.charge) {
-    ailego::MemoryLimitPool::get_instance().release_external(mapping.charge);
+    ailego::MemoryLimitPool::get_instance().release_unmapped_external(
+        mapping.charge, mapping.projection);
   }
 }
 
@@ -585,8 +586,12 @@ int IndexMapping::init_index_mapping_admitted(
   if (header_addr_map_.find(current_header_start_offset_) !=
       header_addr_map_.end())
     return IndexError_InvalidValue;
-  int opts =
-      copy_on_write_ ? ailego::File::MMAP_POPULATE : ailego::File::MMAP_SHARED;
+  // The managed header already has a pending reservation for the whole view.
+  // MAP_POPULATE would run the separate optional prefault admission again.
+  int opts = ailego::File::MMAP_SHARED;
+  if (copy_on_write_) {
+    opts = pending_node.mapped().charge ? 0 : ailego::File::MMAP_POPULATE;
+  }
   if (huge_page_) {
     opts |= ailego::File::MMAP_HUGE_PAGE;
   }
@@ -601,8 +606,8 @@ int IndexMapping::init_index_mapping_admitted(
   // Unpack header
   header_ = reinterpret_cast<IndexFormat::MetaHeader *>(start);
   pending_node.mapped().header = header_;
+  pending_node.mapped().projection = mapping_memory.commit_mapping();
   header_addr_map_.insert(std::move(pending_node));
-  mapping_memory.commit();
   if (header_->meta_header_size != sizeof(IndexFormat::MetaHeader)) {
     return IndexError_InvalidLength;
   }

@@ -34,7 +34,8 @@ class BudgetedMappedBuffer {
   }
   ~BudgetedMappedBuffer() {
     if (data_ && File::TryMemoryUnmap(data_, mapped_size_) && charge_)
-      MemoryLimitPool::get_instance().release_external(charge_);
+      MemoryLimitPool::get_instance().release_unmapped_external(charge_,
+                                                               projection_);
   }
 
   static size_t mapping_size(size_t bytes) {
@@ -60,7 +61,7 @@ class BudgetedMappedBuffer {
       replacement.data_ =
           static_cast<char *>(File::MemoryMap(replacement.mapped_size_, 0));
       if (!replacement.data_) throw std::bad_alloc();
-      pending.commit();
+      replacement.projection_ = pending.commit_mapping();
       replacement.charge_ = charge;
       replacement.size_ = bytes;
     }
@@ -87,6 +88,7 @@ class BudgetedMappedBuffer {
   }
   void swap(BudgetedMappedBuffer &rhs) noexcept {
     std::swap(charge_, rhs.charge_);
+    std::swap(projection_, rhs.projection_);
     std::swap(data_, rhs.data_);
     std::swap(size_, rhs.size_);
     std::swap(mapped_size_, rhs.mapped_size_);
@@ -94,6 +96,7 @@ class BudgetedMappedBuffer {
 
  private:
   size_t charge_{0};
+  ProcessRssBudget::MaterializationStamp projection_;
   char *data_{nullptr};
   size_t size_{0};
   size_t mapped_size_{0};

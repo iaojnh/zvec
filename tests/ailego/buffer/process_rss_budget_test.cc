@@ -679,6 +679,42 @@ TEST(ProcessRssBudgetTest, GrowingAllowanceChargesFullMaterialization) {
   }
 }
 
+TEST(ProcessRssBudgetTest, PrepaidMappingDebitSurvivesAnInFlightSample) {
+  constexpr size_t limit = 128 * kMiB;
+  constexpr size_t bytes = 6 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    ProcessRssBudget budget;
+    budget.account(bytes);
+    sampled_rss = (use_native_sample ? 32 : 120) * kMiB;
+    native_sample = {112 * kMiB, 16 * kMiB};
+    native_sample_valid = true;
+    ASSERT_TRUE(budget.configure(limit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr));
+
+    ASSERT_TRUE(budget.try_reserve_materialization(bytes));
+    budget.refresh(true);
+    EXPECT_EQ(2 * kMiB, budget.available());
+    EXPECT_FALSE(budget.try_reserve_materialization(3 * kMiB));
+    budget.finish_materialization(bytes, false);
+    EXPECT_EQ(8 * kMiB, budget.available());
+
+    ASSERT_TRUE(budget.try_reserve_materialization(bytes));
+    auto stamp = budget.finish_materialization(bytes, true);
+    EXPECT_EQ(2 * kMiB, budget.available());
+    budget.release_materialization(bytes, stamp);
+    EXPECT_EQ(8 * kMiB, budget.available());
+
+    ASSERT_TRUE(budget.try_reserve_materialization(bytes));
+    stamp = budget.finish_materialization(bytes, true);
+    budget.refresh(true);
+    ASSERT_TRUE(budget.try_materialize(2 * kMiB));
+    budget.release_materialization(bytes, stamp);
+    EXPECT_EQ(6 * kMiB, budget.available());
+    budget.release(bytes);
+  }
+}
+
 TEST(ProcessRssBudgetTest, UnmappedBackingRefundsOnlyItsOwnProjection) {
   constexpr size_t kLimit = 128 * kMiB;
   for (const bool use_native_sample : {false, true}) {

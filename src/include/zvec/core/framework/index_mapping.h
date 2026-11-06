@@ -191,6 +191,7 @@ class IndexMapping {
     IndexFormat::MetaHeader *header;
     size_t length;
     size_t charge;
+    ailego::ProcessRssBudget::MaterializationStamp projection{};
   };
   using HeaderMap = std::map<
       uint64_t, MetaMapping, std::less<uint64_t>,

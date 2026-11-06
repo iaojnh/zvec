@@ -8,8 +8,12 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <ailego/io/iouring_loader.h>
+#endif
 
 namespace zvec::ailego {
 
@@ -477,18 +481,38 @@ TEST_F(PoolAdmissionTest, UnmappedWorkspacePreservesOtherResidentBacking) {
   MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
 
   const size_t bytes = 2 * page_;
-  MemoryLimitPool::PendingAllocation pending(
-      pool_, MemoryLimitPool::PendingAllocation::Kind::kWorkspace);
-  ASSERT_TRUE(pending.reserve(bytes));
-  void *mapping = File::MemoryMap(bytes, 0);
-  ASSERT_NE(nullptr, mapping);
-  const auto stamp = pending.commit_mapping();
-  EXPECT_EQ(headroom - bytes, MemoryLimitPoolTestPeer::rss_available(pool_));
-  ASSERT_TRUE(File::TryMemoryUnmap(mapping, bytes));
-  pool_.release_unmapped_external(bytes, stamp);
-  EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    BudgetedMappedBuffer mapping(bytes);
+    EXPECT_EQ(headroom - bytes, MemoryLimitPoolTestPeer::rss_available(pool_));
+    mapping.clear();
+    EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+  }
   EXPECT_EQ(resident.bytes(), pool_.external_used());
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(PoolAdmissionTest, PrepaidIoUringStagingReturnsHeadroomAfterUnmap) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t bytes = 2 * page_;
+  ASSERT_TRUE(pool_.try_charge_metadata(bytes));
+  const size_t metadata = pool_.metadata_used();
+  IoUringRing ring;
+  ring.adopt_staging_reservation(bytes);
+  const size_t rss = baseline_ + 128 * page_;
+  const size_t headroom = 32 * (1UL << 20);
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
+
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    ASSERT_TRUE(ring.ensure_staging(bytes));
+    EXPECT_EQ(headroom - bytes, MemoryLimitPoolTestPeer::rss_available(pool_));
+    ring.teardown();
+    EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EXPECT_EQ(metadata, pool_.metadata_used());
+  }
+}
+#endif
 
 TEST_F(PoolAdmissionTest, RetainedBackingReuseObeysMeasuredHeadroom) {
   ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));

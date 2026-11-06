@@ -219,25 +219,25 @@ TEST(DiskAnnLinuxAioTest, AdmitsAndReleasesTheNativeCompletionMapping) {
   if (!loader.load()) GTEST_SKIP() << "libaio is unavailable";
   auto &pool = ailego::MemoryLimitPool::get_instance();
   io_context_t ctx = nullptr;
-  size_t mapped_bytes = 0;
+  LibAioLoader::RingMemory memory;
   AILEGO_DEFER([&] {
     pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-    if (ctx) EXPECT_EQ(0, loader.destroy_budgeted(ctx, mapped_bytes));
+    if (ctx) EXPECT_EQ(0, loader.destroy_budgeted(ctx, memory));
   });
 
   pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
-  EXPECT_EQ(-ENOMEM, loader.setup_budgeted(128, ctx, mapped_bytes));
+  EXPECT_EQ(-ENOMEM, loader.setup_budgeted(128, ctx, memory));
   EXPECT_EQ(nullptr, ctx);
-  EXPECT_EQ(0u, mapped_bytes);
+  EXPECT_EQ(0u, memory.bytes);
   pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
 
-  const int setup = loader.setup_budgeted(128, ctx, mapped_bytes);
+  const int setup = loader.setup_budgeted(128, ctx, memory);
   if (setup == -ENOSYS || setup == -EPERM || setup == -EAGAIN) {
     GTEST_SKIP() << "Native AIO is unavailable: " << setup;
   }
   ASSERT_EQ(0, setup);
   ASSERT_NE(nullptr, ctx);
-  EXPECT_GE(mapped_bytes, pool.page_buffer_size());
+  EXPECT_GE(memory.bytes, pool.page_buffer_size());
 
   FILE *maps = std::fopen("/proc/self/maps", "r");
   ASSERT_NE(nullptr, maps);
@@ -252,10 +252,10 @@ TEST(DiskAnnLinuxAioTest, AdmitsAndReleasesTheNativeCompletionMapping) {
     }
   }
   std::fclose(maps);
-  EXPECT_EQ(mapping_size, mapped_bytes);
-  EXPECT_EQ(0, loader.destroy_budgeted(ctx, mapped_bytes));
+  EXPECT_EQ(mapping_size, memory.bytes);
+  EXPECT_EQ(0, loader.destroy_budgeted(ctx, memory));
   EXPECT_EQ(nullptr, ctx);
-  EXPECT_EQ(0u, mapped_bytes);
+  EXPECT_EQ(0u, memory.bytes);
 }
 
 TEST(DiskAnnLinuxAioTest, AccumulatesPartialSubmissionsAndCompletions) {

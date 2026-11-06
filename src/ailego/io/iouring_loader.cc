@@ -49,15 +49,21 @@ void IoUringRing::adopt_staging_reservation(size_t bytes) {
 }
 
 bool IoUringRing::release_staging() {
-  if (staging_ && !File::TryMemoryUnmap(staging_, staging_size_)) {
+  if (!staging_) return true;
+  if (!File::TryMemoryUnmap(staging_, staging_size_)) {
     LOG_ERROR("io_uring staging unmap failed; size=%zu", staging_size_);
     return false;
   }
+  auto &pool = MemoryLimitPool::get_instance();
+  if (staging_charge_) {
+    pool.release_unmapped_external(staging_charge_, staging_projection_);
+  } else if (prepaid_staging_bytes_) {
+    pool.release_materialization(staging_size_, staging_projection_);
+  }
   staging_ = nullptr;
   staging_size_ = 0;
-  if (staging_charge_)
-    MemoryLimitPool::get_instance().release_external(staging_charge_);
   staging_charge_ = 0;
+  staging_projection_ = {};
   return true;
 }
 
@@ -131,24 +137,30 @@ IoUringRing::SetupResult IoUringRing::map_control_regions(
     if (pending) pool.finish_process_backing(pending, false);
   });
 
-  const auto map_region = [&](size_t size, off_t offset, size_t charge) {
+  auto map_failure = SetupResult::kUnavailable;
+  const auto map_region = [&](size_t size, off_t offset, size_t charge,
+                              ProcessRssBudget::MaterializationStamp &stamp) {
     void *region = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
                           ring_fd_, offset);
     if (region == MAP_FAILED) {
-      LOG_ERROR("io_uring control mapping failed: %s", ::strerror(errno));
+      const int error = errno;
+      if (error == ENOMEM) map_failure = SetupResult::kNoMemory;
+      LOG_ERROR("io_uring control mapping failed: %s", ::strerror(error));
       return static_cast<void *>(nullptr);
     }
-    pool.finish_process_backing(charge, true);
+    stamp = pool.finish_process_backing(charge, true);
     pending -= charge;
     return region;
   };
-  sq_ring_ptr_ = map_region(sq_ring_size_, IORING_OFF_SQ_RING, sq_charge);
-  if (!sq_ring_ptr_) return SetupResult::kUnavailable;
+  sq_ring_ptr_ = map_region(sq_ring_size_, IORING_OFF_SQ_RING, sq_charge,
+                            sq_ring_projection_);
+  if (!sq_ring_ptr_) return map_failure;
   sqes_ptr_ = static_cast<struct io_uring_sqe *>(
-      map_region(sqes_size_, IORING_OFF_SQES, sqes_charge));
-  if (!sqes_ptr_) return SetupResult::kUnavailable;
-  cq_ring_ptr_ = map_region(cq_ring_size_, IORING_OFF_CQ_RING, cq_charge);
-  if (!cq_ring_ptr_) return SetupResult::kUnavailable;
+      map_region(sqes_size_, IORING_OFF_SQES, sqes_charge, sqes_projection_));
+  if (!sqes_ptr_) return map_failure;
+  cq_ring_ptr_ = map_region(cq_ring_size_, IORING_OFF_CQ_RING, cq_charge,
+                            cq_ring_projection_);
+  if (!cq_ring_ptr_) return map_failure;
 
   // --- Set up typed pointers into the mmap'd regions ---
 
@@ -195,18 +207,19 @@ IoUringRing::SetupResult IoUringRing::map_control_regions(
 }
 
 void IoUringRing::teardown() {
-  const auto release_region = [](void *region, size_t size) {
+  const auto release_region = [](void *region, size_t size,
+                                  ProcessRssBudget::MaterializationStamp stamp) {
     if (!region) return;
     if (::munmap(region, size) != 0) {
       LOG_ERROR("io_uring control unmap failed; size=%zu", size);
     } else {
-      MemoryLimitPool::get_instance().release_process_backing(
-          BudgetedMappedBuffer::mapping_size(size));
+      MemoryLimitPool::get_instance().release_unmapped_process_backing(
+          BudgetedMappedBuffer::mapping_size(size), stamp);
     }
   };
-  release_region(sq_ring_ptr_, sq_ring_size_);
-  release_region(sqes_ptr_, sqes_size_);
-  release_region(cq_ring_ptr_, cq_ring_size_);
+  release_region(sq_ring_ptr_, sq_ring_size_, sq_ring_projection_);
+  release_region(sqes_ptr_, sqes_size_, sqes_projection_);
+  release_region(cq_ring_ptr_, cq_ring_size_, cq_ring_projection_);
 
   sq_ring_ptr_ = nullptr;
   sqes_ptr_ = nullptr;
@@ -257,15 +270,19 @@ bool IoUringRing::ensure_staging(size_t bytes) {
   // The prepaid workspace may be first used long after the pool opened.
   // Respect current RSS pressure before mapping it. Writeback can fall back
   // to pwrite using the existing cached page if staging is denied.
-  if (prepaid_staging_bytes_ && !pool.try_materialize(bytes)) return false;
   const size_t charge = prepaid_staging_bytes_ || !pool.capacity() ? 0 : bytes;
   // Keep the old allocation charged until the replacement actually exists.
   using Pending = MemoryLimitPool::PendingAllocation;
   Pending pending(pool, Pending::Kind::kWorkspace);
   if (!pending.reserve(charge)) return false;
+  if (prepaid_staging_bytes_ && !pool.try_reserve_materialization(bytes))
+    return false;
   // Anonymous mappings are page-aligned, satisfying the I/O alignment. They
   // bypass malloc arenas, so release_staging() really returns physical pages.
   void *ptr = File::MemoryMap(bytes, 0);
+  const auto prepaid_projection =
+      prepaid_staging_bytes_ ? pool.finish_materialization(bytes, ptr != nullptr)
+                             : ProcessRssBudget::MaterializationStamp{};
   if (!ptr) {
     LOG_WARN("io_uring staging mapping failed; size=%zu", bytes);
     return false;
@@ -274,10 +291,13 @@ bool IoUringRing::ensure_staging(size_t bytes) {
     if (!File::TryMemoryUnmap(ptr, bytes)) {
       LOG_ERROR("io_uring replacement staging unmap failed; size=%zu", bytes);
       pending.commit();
+    } else if (prepaid_staging_bytes_) {
+      pool.release_materialization(bytes, prepaid_projection);
     }
     return false;
   }
-  pending.commit();
+  staging_projection_ =
+      prepaid_staging_bytes_ ? prepaid_projection : pending.commit_mapping();
   staging_ = static_cast<char *>(ptr);
   staging_size_ = bytes;
   staging_charge_ = charge;
