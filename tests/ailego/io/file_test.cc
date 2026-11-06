@@ -31,6 +31,20 @@
 
 using namespace zvec::ailego;
 
+#if defined(MAP_POPULATE)
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static bool configure_rss(MemoryLimitPool &pool, size_t limit) {
+    return pool.process_rss_.configure(limit, +[] { return kSample; });
+  }
+  static size_t rss_available(MemoryLimitPool &pool) {
+    return pool.process_rss_.available();
+  }
+  static constexpr size_t kSample = 32 * 1024 * 1024;
+};
+}  // namespace zvec::ailego
+#endif
+
 namespace {
 
 void ExpectNonInheritable(const File &file) {
@@ -421,6 +435,22 @@ TEST(File, EagerMappingKeepsPagesLazyUnderCriticalPressure) {
   bytes[page] = 'b';
   EXPECT_EQ('a', bytes[0]);
   EXPECT_EQ('b', bytes[page]);
+}
+#endif
+
+#if defined(MAP_POPULATE)
+TEST(File, FailedPopulationLeavesHeadroomForAnotherMapping) {
+  using Peer = MemoryLimitPoolTestPeer;
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t page = pool.page_buffer_size();
+  ASSERT_TRUE(Peer::configure_rss(pool, Peer::kSample + 2 * page));
+  const auto restore = ScopeGuard::Make([&] {
+    EXPECT_TRUE(Peer::configure_rss(pool, 0));
+  });
+  EXPECT_EQ(nullptr, File::MemoryMap(File::InvalidHandle, 0, 2 * page,
+                                    File::MMAP_POPULATE));
+  EXPECT_EQ(EBADF, errno);
+  EXPECT_EQ(2 * page, Peer::rss_available(pool));
 }
 #endif
 

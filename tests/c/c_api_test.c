@@ -40,15 +40,8 @@
 static size_t get_field_count(zvec_collection_schema_t *schema) {
   const char **names = NULL;
   size_t count = 0;
-  zvec_error_code_t err =
-      zvec_collection_schema_get_all_field_names(schema, &names, &count);
-  if (err == ZVEC_OK && names) {
-    size_t i;
-    for (i = 0; i < count; i++) {
-      zvec_free((char *)names[i]);
-    }
-    zvec_free(names);
-  }
+  zvec_collection_schema_get_all_field_names(schema, &names, &count);
+  zvec_free(names);
   return count;
 }
 
@@ -436,7 +429,6 @@ void test_schema_basic_operations(void) {
   TEST_ASSERT(indexed_field != NULL);
   TEST_ASSERT(strcmp(zvec_field_schema_get_name(indexed_field), "id") == 0);
   // Clean up field names
-  for (size_t i = 0; i < field_count; i++) zvec_free((char *)field_names[i]);
   zvec_free(field_names);
 
   // Test 6: Adding multiple fields (use individual add_field calls)
@@ -866,10 +858,6 @@ void test_collection_schema_helpers(void) {
         zvec_collection_schema_get_all_field_names(schema, &names, &name_count);
     TEST_ASSERT(err == ZVEC_OK);
     TEST_ASSERT(name_count == 3);
-    // Free the strings (caller owns them)
-    for (size_t i = 0; i < name_count; i++) {
-      zvec_free((char *)names[i]);
-    }
     zvec_free(names);
 
     // Test get_forward_fields

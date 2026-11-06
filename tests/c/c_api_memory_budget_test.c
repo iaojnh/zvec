@@ -27,6 +27,24 @@ int main(void) {
       zvec_field_schema_create("payload", ZVEC_DATA_TYPE_STRING, false, 0);
   assert(zvec_collection_schema_add_field(schema, field) == ZVEC_OK);
   zvec_field_schema_destroy(field);
+  const char *schema_name = zvec_collection_schema_get_name(schema);
+  assert(schema_name && zvec_collection_schema_get_name(schema) == schema_name);
+  const char **field_names = (const char **)1;
+  size_t field_count = 123;
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  assert(zvec_collection_schema_get_all_field_names(schema, &field_names,
+                                                     &field_count) ==
+         ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(field_names == NULL && field_count == 0);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  assert(zvec_collection_schema_get_all_field_names(schema, &field_names,
+                                                     &field_count) == ZVEC_OK);
+  assert(field_count == 1);
+  const char *field_name = field_names[0];
+  field = zvec_collection_schema_get_field(schema, "payload");
+  assert(field && field_name == zvec_field_schema_get_name(field));
+  zvec_free(field_names);
+  assert(strcmp(field_name, "payload") == 0);
   zvec_collection_options_t *options = zvec_collection_options_create();
   assert(zvec_collection_options_set_enable_mmap(options, false) == ZVEC_OK);
   assert(zvec_collection_options_set_max_buffer_size(options, MIB) == ZVEC_OK);

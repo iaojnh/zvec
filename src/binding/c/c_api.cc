@@ -2439,8 +2439,7 @@ const char *zvec_collection_schema_get_name(
     return nullptr;
   }
   auto *cpp_schema = reinterpret_cast<const zvec::CollectionSchema *>(schema);
-  // Use strdup to create a persistent copy since name() returns by value
-  return strdup(cpp_schema->name().c_str());
+  return cpp_schema->name_ref().c_str();
 }
 
 zvec_error_code_t zvec_collection_schema_set_name(zvec_collection_schema_t *schema,
@@ -2584,185 +2583,91 @@ zvec_field_schema_t *zvec_collection_schema_get_vector_field(
   return nullptr;
 }
 
+enum class SchemaFieldSubset { kAll, kForward, kIndexedForward, kVector };
+
+static const char *borrow_schema_field_name(zvec::FieldSchema *field) {
+  return field->name().c_str();
+}
+
+static zvec_field_schema_t *borrow_schema_field(zvec::FieldSchema *field) {
+  return reinterpret_cast<zvec_field_schema_t *>(field);
+}
+
+template <typename Item>
+static zvec_error_code_t copy_schema_field_pointers(
+    const zvec_collection_schema_t *schema, SchemaFieldSubset subset,
+    Item ***out, size_t *count, Item *(*borrow)(zvec::FieldSchema *)) {
+  if (out) *out = nullptr;
+  if (count) *count = 0;
+  if (!schema || !out || !count) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
+                   "Schema, output array, and count cannot be null");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to get schema fields",
+      const auto *cpp_schema =
+          reinterpret_cast<const zvec::CollectionSchema *>(schema);
+      const auto &fields = cpp_schema->fields_ref();
+      auto matches = [subset](const zvec::FieldSchema::Ptr &field) {
+        switch (subset) {
+          case SchemaFieldSubset::kAll: return true;
+          case SchemaFieldSubset::kForward: return !field->is_vector_field();
+          case SchemaFieldSubset::kIndexedForward:
+            return !field->is_vector_field() && field->index_params() != nullptr;
+          case SchemaFieldSubset::kVector: return field->is_vector_field();
+        }
+        return false;
+      };
+      const size_t size = std::count_if(fields.begin(), fields.end(), matches);
+      if (size == 0) return ZVEC_OK;
+      auto **items = static_cast<Item **>(
+          zvec::detail::AllocateCResultArray(size, sizeof(Item *)));
+      size_t i = 0;
+      for (const auto &field : fields)
+        if (matches(field)) items[i++] = borrow(field.get());
+      *out = items;
+      *count = size;
+      return ZVEC_OK;)
+}
+
 zvec_error_code_t zvec_collection_schema_get_forward_fields(
     const zvec_collection_schema_t *schema, zvec_field_schema_t ***fields,
     size_t *count) {
-  if (!schema || !fields || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, fields, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward fields",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto forward_fields = cpp_schema->forward_fields();
-
-      *count = forward_fields.size();
-      *fields = (zvec_field_schema_t **)zvec_malloc(*count * sizeof(zvec_field_schema_t *));
-      if (!*fields) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      for (size_t i = 0; i < *count; ++i) {
-        // Return non-owning pointers - caller should NOT free these
-        (*fields)[i] =
-            reinterpret_cast<zvec_field_schema_t *>(forward_fields[i].get());
-      }
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kForward,
+                                    fields, count, borrow_schema_field);
 }
 
 zvec_error_code_t zvec_collection_schema_get_forward_fields_with_index(
     const zvec_collection_schema_t *schema, zvec_field_schema_t ***fields,
     size_t *count) {
-  if (!schema || !fields || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, fields, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward fields with index",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto fields_with_index = cpp_schema->forward_fields_with_index();
-
-      *count = fields_with_index.size();
-      *fields = (zvec_field_schema_t **)zvec_malloc(*count * sizeof(zvec_field_schema_t *));
-      if (!*fields) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      for (size_t i = 0; i < *count; ++i) {
-        // Return non-owning pointers - caller should NOT free these
-        (*fields)[i] =
-            reinterpret_cast<zvec_field_schema_t *>(fields_with_index[i].get());
-      }
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kIndexedForward,
+                                    fields, count, borrow_schema_field);
 }
 
 zvec_error_code_t zvec_collection_schema_get_forward_field_names(
     const zvec_collection_schema_t *schema, const char ***names, size_t *count) {
-  if (!schema || !names || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, names, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward field names",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto forward_names = cpp_schema->forward_field_names();
-
-      *count = forward_names.size();
-      *names = (const char **)malloc(*count * sizeof(const char *));
-      if (!*names) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      // Copy strings - caller owns the memory and should free
-      for (size_t i = 0; i < *count; ++i) {
-        (*names)[i] = strdup(forward_names[i].c_str());
-      }
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kForward,
+                                    names, count, borrow_schema_field_name);
 }
 
 zvec_error_code_t zvec_collection_schema_get_forward_field_names_with_index(
     const zvec_collection_schema_t *schema, const char ***names, size_t *count) {
-  if (!schema || !names || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, names, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward field names with index",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto forward_names_with_index =
-          cpp_schema->forward_field_names_with_index();
-
-      *count = forward_names_with_index.size();
-      *names = (const char **)malloc(*count * sizeof(const char *));
-      if (!*names) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      // Copy strings - caller owns the memory and should free
-      for (size_t i = 0; i < *count; ++i) {
-        (*names)[i] = strdup(forward_names_with_index[i].c_str());
-      }
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kIndexedForward,
+                                    names, count, borrow_schema_field_name);
 }
 
 zvec_error_code_t zvec_collection_schema_get_all_field_names(
     const zvec_collection_schema_t *schema, const char ***names, size_t *count) {
-  if (!schema || !names || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, names, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get all field names",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto all_names = cpp_schema->all_field_names();
-
-      *count = all_names.size();
-      *names = (const char **)malloc(*count * sizeof(const char *));
-      if (!*names) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      // Copy strings - caller owns the memory and should free
-      for (size_t i = 0; i < *count;
-           ++i) { (*names)[i] = strdup(all_names[i].c_str());
-      }
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kAll,
+                                    names, count, borrow_schema_field_name);
 }
 
 zvec_error_code_t zvec_collection_schema_get_vector_fields(
     const zvec_collection_schema_t *schema, zvec_field_schema_t ***fields,
     size_t *count) {
-  if (!schema || !fields || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, fields, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get vector fields",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto vector_fields = cpp_schema->vector_fields();
-
-      *count = vector_fields.size();
-      *fields = (zvec_field_schema_t **)malloc(*count * sizeof(zvec_field_schema_t *));
-      if (!*fields) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      for (size_t i = 0; i < *count; ++i) {
-        // Return non-owning pointers - caller should NOT free these
-        (*fields)[i] =
-            reinterpret_cast<zvec_field_schema_t *>(vector_fields[i].get());
-      }
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kVector,
+                                    fields, count, borrow_schema_field);
 }
 
 uint64_t zvec_collection_schema_get_max_doc_count_per_segment(
