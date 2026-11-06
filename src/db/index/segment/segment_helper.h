@@ -326,7 +326,7 @@ class SegmentHelper {
       const IndexFilter::Ptr filter, uint32_t row_id_offset,
       std::shared_ptr<arrow::RecordBatch> *filtered,
       roaring::Roaring *delete_row_id_bitmap, uint64_t *min_doc_id,
-      uint64_t *max_doc_id);
+      uint64_t *max_doc_id, arrow::MemoryPool *pool);
 };
 
 }  // namespace zvec

@@ -199,9 +199,8 @@ Result<Doc::Ptr> DocIterator::next() try {
       bool loaded = false;
       while (impl_->current_segment_index < impl_->segments.size()) {
         if (!impl_->current_reader) {
-          auto scalar_reader =
-              impl_->segments[impl_->current_segment_index]->scan(
-                  impl_->iterator_columns);
+          const auto &segment = impl_->segments[impl_->current_segment_index];
+          auto scalar_reader = segment->scan(impl_->iterator_columns);
           if (!scalar_reader) {
             impl_->error =
                 Status::InternalError("Segment::scan failed during iteration");
@@ -210,8 +209,9 @@ Result<Doc::Ptr> DocIterator::next() try {
           // Deleted rows are filtered only when the snapshot's delete
           // bitmap is non-empty; otherwise read the segment as-is.
           if (impl_->filter) {
-            impl_->current_reader =
-                FilteringReader::Make(std::move(scalar_reader), impl_->filter);
+            impl_->current_reader = FilteringReader::Make(
+                std::move(scalar_reader), impl_->filter,
+                segment->query_memory_pool());
           } else {
             impl_->current_reader = std::move(scalar_reader);
           }

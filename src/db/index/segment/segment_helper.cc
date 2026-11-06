@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <ailego/pattern/defer.h>
 #include <roaring.hh>
 #include <arrow/compute/api_vector.h>
 #include <arrow/type_fwd.h>
@@ -39,6 +40,7 @@
 #include "db/index/common/index_filter.h"
 #include "db/index/common/meta.h"
 #include "db/index/storage/forward_writer.h"
+#include "db/index/storage/parquet_memory_pool.h"
 #include "zvec/ailego/container/params.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_meta.h"
@@ -117,6 +119,10 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
     return Status::InternalError("Create directory failed: %s",
                                  output_segment_path.c_str());
   }
+  bool output_ready = false;
+  AILEGO_DEFER([&] {
+    if (!output_ready) FileHelper::RemoveDirectory(output_segment_path);
+  });
 
   std::function<BlockID()> block_id_generator =
       [block_id = BlockID{0}]() mutable { return block_id++; };
@@ -134,7 +140,6 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
   CHECK_RETURN_STATUS(s);
 
   if (doc_count == 0) {
-    FileHelper::RemoveDirectory(output_segment_path);
     return Status::OK();
   }
 
@@ -168,6 +173,7 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
   }
   new_segment_meta->set_indexed_vector_fields(indexed_vector_fields);
   task.output_segment_meta_ = new_segment_meta;
+  output_ready = true;
 
   return Status::OK();
 }
@@ -221,6 +227,16 @@ Status SegmentHelper::ReduceScalar(
 
   uint32_t row_id_offset{0U};
   *doc_count = 0;
+  auto *pool = forward_use_parquet ? detail::GetParquetMemoryPool().get()
+                                   : arrow::default_memory_pool();
+  auto read_or_write_error = [](const char *operation,
+                               const arrow::Status &status) {
+    if (status.IsOutOfMemory()) {
+      return Status(StatusCode::RESOURCE_EXHAUSTED,
+                    std::string(operation) + status.message());
+    }
+    return Status::InternalError(operation, status.message());
+  };
 
   std::vector<std::string> all_reduce_columns{GLOBAL_DOC_ID, USER_ID};
   for (auto &column : columns) {
@@ -236,8 +252,7 @@ Status SegmentHelper::ReduceScalar(
     while (true) {
       auto batch = reader->Next();
       if (!batch.ok()) {
-        return Status::InternalError("reader next failed: ",
-                                     batch.status().message());
+        return read_or_write_error("reader next failed: ", batch.status());
       }
 
       auto batch_value = batch.ValueOrDie();
@@ -251,10 +266,9 @@ Status SegmentHelper::ReduceScalar(
       std::shared_ptr<arrow::RecordBatch> filtered_batch;
       auto as =
           FilterRecordBatch(batch_value, filter, row_id_offset, &filtered_batch,
-                            delete_row_id_bitmap, min_doc_id, max_doc_id);
+                            delete_row_id_bitmap, min_doc_id, max_doc_id, pool);
       if (!as.ok()) {
-        return Status::InternalError("filter record batch failed: ",
-                                     as.message());
+        return read_or_write_error("filter record batch failed: ", as);
       }
 
       row_id_offset += batch_value->num_rows();
@@ -266,7 +280,7 @@ Status SegmentHelper::ReduceScalar(
       // forward
       as = forward_writer->insert_batch(filtered_batch);
       if (!as.ok()) {
-        return Status::InternalError("writer insert failed: ", as.message());
+        return read_or_write_error("writer insert failed: ", as);
       }
 
       // invert index
@@ -287,7 +301,7 @@ Status SegmentHelper::ReduceScalar(
   // flush forward
   auto as = forward_writer->finalize();
   if (!as.ok()) {
-    return Status::InternalError("writer finalize failed: ", as.message());
+    return read_or_write_error("writer finalize failed: ", as);
   }
 
   BlockMeta forward_meta;
@@ -961,7 +975,7 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     const IndexFilter::Ptr filter, uint32_t row_id_offset,
     std::shared_ptr<arrow::RecordBatch> *filterd,
     roaring::Roaring *delete_row_id_bitmap, uint64_t *min_doc_id,
-    uint64_t *max_doc_id) {
+    uint64_t *max_doc_id, arrow::MemoryPool *pool) {
   if (!filter) {
     *filterd = batch;
     for (int64_t i = 0; i < batch->num_rows(); ++i) {
@@ -978,7 +992,7 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     return arrow::Status::OK();
   }
 
-  std::vector<uint64_t> selected_indices;
+  arrow::UInt64Builder builder(pool);
   for (int64_t i = 0; i < batch->num_rows(); ++i) {
     auto result = batch->column(0)->GetScalar(i);
     if (!result.ok()) {
@@ -987,7 +1001,7 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     uint64_t doc_id =
         std::dynamic_pointer_cast<arrow::UInt64Scalar>(*result)->value;
     if (!filter->is_filtered(doc_id)) {
-      selected_indices.push_back(i);
+      ARROW_RETURN_NOT_OK(builder.Append(i));
       *min_doc_id = std::min(*min_doc_id, doc_id);
       *max_doc_id = std::max(*max_doc_id, doc_id);
     } else {
@@ -995,25 +1009,25 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     }
   }
 
-  if (selected_indices.empty()) {
+  if (builder.length() == 0) {
     return arrow::Status::OK();
   }
 
-  arrow::UInt64Builder builder;
-  ARROW_RETURN_NOT_OK(builder.AppendValues(selected_indices));
   std::shared_ptr<arrow::Array> selection_array;
   ARROW_RETURN_NOT_OK(builder.Finish(&selection_array));
 
   std::vector<std::shared_ptr<arrow::Array>> filtered_columns;
+  arrow::compute::ExecContext ctx(pool);
   for (int i = 0; i < batch->num_columns(); ++i) {
     arrow::Datum out;
     ARROW_ASSIGN_OR_RAISE(
-        out, arrow::compute::Take(batch->column(i), selection_array));
+        out, arrow::compute::Take(batch->column(i), selection_array,
+                                  arrow::compute::TakeOptions::Defaults(), &ctx));
     filtered_columns.push_back(out.make_array());
   }
 
   auto filtered_batch = arrow::RecordBatch::Make(
-      batch->schema(), static_cast<int64_t>(selected_indices.size()),
+      batch->schema(), selection_array->length(),
       filtered_columns);
 
   *filterd = filtered_batch;

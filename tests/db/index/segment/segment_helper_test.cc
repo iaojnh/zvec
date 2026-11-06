@@ -32,6 +32,7 @@
 #include <arrow/result.h>
 #include <arrow/table.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
 #include "db/index/column/vector_column/vector_column_indexer.h"
@@ -323,6 +324,49 @@ TEST_F(SegmentHelperTest, CompactTask_Filter) {
   ASSERT_EQ(seg2->doc_count(), seg1->doc_count() - 10);
 
   ASSERT_TRUE(seg1->destroy().ok());
+}
+
+TEST_F(SegmentHelperTest, CompactTask_FilterBudgetDenialAllowsRetry) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  if (!pool.capacity()) ASSERT_EQ(0, pool.init(128UL << 20));
+  auto schema = test::TestHelper::CreateNormalSchema(false, col_name);
+  auto version_manager = create_version_manager(*schema);
+  auto input = test::TestHelper::CreateSegmentWithDoc(
+      col_path, *schema, 0, 0, id_map, delete_store, version_manager,
+      write_options(), 0, 16);
+  ASSERT_NE(nullptr, input);
+  ASSERT_TRUE(input->flush().ok());
+
+  bool block_filter = true;
+  ailego::MemoryReservation pressure;
+  auto filter = EasyIndexFilter::Create([&](uint64_t id) {
+    // Wait until the reader has returned its input batch, then exhaust the
+    // budget before the selection builder can allocate.
+    if (block_filter && !pressure.bytes()) {
+      pressure.add(pool.capacity() - pool.used());
+    }
+    return id == 0;
+  });
+  const SegmentID output_id = 1;
+  CompactTask compact(col_path, schema, {input}, output_id, filter,
+                      /*forward_use_parquet=*/true, /*enable_mmap=*/true, 1);
+  auto task = SegmentTask::CreateCompactTask(compact);
+  ASSERT_NE(nullptr, task);
+  auto status = SegmentHelper::Execute(task);
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code()) << status.message();
+  EXPECT_EQ(0u, status.message().find("filter record batch failed"));
+  EXPECT_EQ(nullptr, std::get<CompactTask>(task->task_info()).output_segment_meta_);
+  const auto tmp_path = FileHelper::MakeTempSegmentPath(col_path, output_id);
+  EXPECT_FALSE(std::filesystem::exists(tmp_path));
+
+  block_filter = false;
+  pressure = ailego::MemoryReservation{};
+  status = SegmentHelper::Execute(task);
+  ASSERT_TRUE(status.ok()) << status.message();
+  const auto &output = std::get<CompactTask>(task->task_info()).output_segment_meta_;
+  ASSERT_NE(nullptr, output);
+  EXPECT_EQ(15u, output->doc_count());
+  EXPECT_TRUE(FileHelper::RemoveDirectory(tmp_path));
 }
 
 TEST_F(SegmentHelperTest, CompactTask_FilterAll) {

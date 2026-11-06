@@ -10,8 +10,11 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include "ailego/pattern/defer.h"
+#include "db/common/constants.h"
 #include "db/common/global_resource.h"
+#include "db/index/segment/filtering_reader.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #include "db/sqlengine/planner/segment_node.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
@@ -443,6 +446,44 @@ TEST(SegmentStreamTest,
   std::shared_ptr<arrow::RecordBatch> batch;
   ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
   ASSERT_NE(nullptr, batch);
+}
+
+TEST(SegmentStreamTest, IteratorFilterDeniesUnfundedArrowOutput) {
+  ASSERT_TRUE(arrow::compute::Initialize().ok());
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(1024 * 1024));
+  auto restore = ailego::ScopeGuard::Make([&] { pool.init(previous); });
+  auto *arrow_pool = detail::GetParquetMemoryPool().get();
+  const auto baseline = arrow_pool->charged_bytes();
+  auto schema = arrow::schema({arrow::field(GLOBAL_DOC_ID, arrow::uint64())});
+  arrow::UInt64Builder builder;
+  ASSERT_TRUE(builder.AppendValues(std::vector<uint64_t>(16383, 7)).ok());
+  ASSERT_TRUE(builder.Append(8).ok());
+  auto input =
+      arrow::RecordBatch::Make(schema, 16384, {builder.Finish().ValueOrDie()});
+  auto filter = EasyIndexFilter::Create([](uint64_t id) { return id == 8; });
+  auto make_reader = [&] {
+    auto source = arrow::RecordBatchReader::Make({input}, schema).ValueOrDie();
+    return FilteringReader::Make(std::move(source), filter, arrow_pool);
+  };
+  std::shared_ptr<arrow::RecordBatch> output;
+  {
+    auto reader = make_reader();
+    // The bit mask fits in one small Arrow slab. The result needs 128 KiB.
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used() - 96 * 1024);
+    EXPECT_TRUE(reader->ReadNext(&output).IsOutOfMemory());
+    EXPECT_EQ(nullptr, output);
+    EXPECT_EQ(baseline, arrow_pool->charged_bytes());
+  }
+  auto reader = make_reader();
+  ASSERT_TRUE(reader->ReadNext(&output).ok());
+  ASSERT_NE(nullptr, output);
+  EXPECT_EQ(16383, output->num_rows());
+  EXPECT_GE(arrow_pool->charged_bytes(), baseline + 16383 * sizeof(uint64_t));
+  output.reset();
+  EXPECT_EQ(baseline, arrow_pool->charged_bytes());
 }
 }  // namespace
 }  // namespace zvec::sqlengine

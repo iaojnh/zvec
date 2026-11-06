@@ -26,15 +26,16 @@ class FilteringReader : public arrow::RecordBatchReader {
  public:
   static std::shared_ptr<FilteringReader> Make(
       std::shared_ptr<arrow::RecordBatchReader> inner_reader,
-      const IndexFilter::Ptr &filter) {
-    return std::make_shared<FilteringReader>(std::move(inner_reader), filter);
+      const IndexFilter::Ptr &filter, arrow::MemoryPool *pool) {
+    return std::make_shared<FilteringReader>(std::move(inner_reader), filter,
+                                             pool);
   }
 
   // `filter` must be non-null. Resolves and validates the delete-key
   // column once at construction (the reader schema is stable for its
   // lifetime).
   FilteringReader(std::shared_ptr<arrow::RecordBatchReader> inner_reader,
-                  const IndexFilter::Ptr &filter);
+                  const IndexFilter::Ptr &filter, arrow::MemoryPool *pool);
 
   ~FilteringReader() override = default;
 
@@ -47,6 +48,7 @@ class FilteringReader : public arrow::RecordBatchReader {
  private:
   std::shared_ptr<arrow::RecordBatchReader> inner_reader_;
   IndexFilter::Ptr filter_;
+  arrow::MemoryPool *pool_;
   int gdoc_col_{-1};
   arrow::Status schema_error_ = arrow::Status::OK();
 };
