@@ -83,7 +83,13 @@ class ProcessRssBudget {
   // faulted in. Sampling must not repeatedly admit the same unused headroom.
   // Existing backing reused by the pool is already included in this ledger.
   bool try_acquire(size_t bytes) {
-    return try_charge(bytes, backing_);
+    return try_acquire(bytes, 0);
+  }
+
+  // A growing allowance can materialize more than the new lifetime charge
+  // when it also consumes some previously reserved capacity.
+  bool try_acquire(size_t bytes, size_t materialization) {
+    return try_charge(bytes, backing_, materialization);
   }
 
   // Reserve for an OS allocation that has yet to return. Samples cannot
@@ -218,9 +224,11 @@ class ProcessRssBudget {
     return true;
   }
 
-  bool try_charge(size_t bytes, size_t &counter) {
+  bool try_charge(size_t bytes, size_t &counter, size_t materialization = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
+    if (materialization && !materialization_allowed_locked(materialization))
+      return false;
     const size_t ledger_available =
         std::numeric_limits<size_t>::max() - backing_ - pending_allocations_;
     if (bytes > available_.load(std::memory_order_relaxed) ||
@@ -229,6 +237,7 @@ class ProcessRssBudget {
       return false;
     }
     counter += bytes;
+    remember_materialization(materialization);
     update_available();
     return true;
   }

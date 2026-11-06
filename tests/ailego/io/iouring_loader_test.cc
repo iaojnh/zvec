@@ -22,6 +22,7 @@
 #include <cstring>
 #include <vector>
 #include <ailego/io/iouring_loader.h>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
@@ -99,6 +100,27 @@ TEST_F(IoUringLoaderTest, PrechargedWritebackStagingIsNotChargedTwice) {
     EXPECT_EQ(kBytes, pool_.used());
   }
   EXPECT_EQ(0u, pool_.used());
+}
+
+TEST_F(IoUringLoaderTest, PrechargedStagingDefersFirstMappingUnderPressure) {
+  const size_t bytes = 4 * PoolPayloadBudget::page_buffer_size();
+  ASSERT_TRUE(pool_.try_charge_metadata(bytes));
+  IoUringRing ring;
+  ring.adopt_staging_reservation(bytes);
+
+  auto &pool = MemoryLimitPool::get_instance();
+  using Pressure = ProcessRssBudget::PressureLevel;
+  const auto restore = ScopeGuard::Make(
+      [&] { pool.set_memory_pressure(Pressure::kNormal); });
+  pool.set_memory_pressure(Pressure::kCritical);
+  EXPECT_FALSE(ring.ensure_staging(bytes));
+  EXPECT_EQ(nullptr, IoUringStagingTestPeer::data(ring));
+  EXPECT_EQ(bytes, pool_.metadata_used());
+
+  pool.set_memory_pressure(Pressure::kNormal);
+  ASSERT_TRUE(ring.ensure_staging(bytes));
+  EXPECT_NE(nullptr, IoUringStagingTestPeer::data(ring));
+  EXPECT_EQ(0u, pool_.external_used());
 }
 
 TEST_F(IoUringLoaderTest, AbandonedStagingKeepsItsChargeAfterDestruction) {

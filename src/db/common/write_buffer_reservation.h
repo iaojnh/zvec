@@ -32,8 +32,7 @@ class WriteBufferMemoryAllowance {
       throw std::bad_alloc();
     const size_t target = active_ + bytes;
     if (target > reservation_.bytes()) {
-      if (!pool.materialization_allowed(backing)) throw std::bad_alloc();
-      reservation_.add(target - reservation_.bytes());
+      reservation_.add(target - reservation_.bytes(), backing);
     } else if (!pool.try_materialize(backing)) {
       throw std::bad_alloc();
     }

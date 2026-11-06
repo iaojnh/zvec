@@ -35,8 +35,7 @@ class RetainedMetadataBudget {
       // A rejected open must leave existing readers room to decode/query.
       if (target > pool.capacity() / 2) throw std::bad_alloc();
       if (target > owner_.reserved_) {
-        if (!pool.materialization_allowed(bytes) ||
-            !pool.try_charge_metadata(target - owner_.reserved_))
+        if (!pool.try_charge_metadata(target - owner_.reserved_, bytes))
           throw std::bad_alloc();
         owner_.reserved_ = target;
       } else if (bytes && !pool.try_materialize(bytes)) {

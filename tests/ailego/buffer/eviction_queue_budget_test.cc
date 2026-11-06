@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <limits>
 #include <thread>
+#include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 
@@ -184,6 +186,47 @@ TEST_F(EvictionQueueBudgetTest, DynamicBlocksCannotEscapeTheSharedBudget) {
     ASSERT_TRUE(queue.enqueue({}));
   }
   EXPECT_EQ(baseline, pool_.used());
+}
+
+TEST_F(EvictionQueueBudgetTest, OldSlabCannotTouchNewPagesUnderPressure) {
+  const size_t page = MemoryLimitPool::page_buffer_size();
+  if (page >= (64UL << 10)) GTEST_SKIP() << "Queue slabs fit in one page";
+  constexpr size_t bytes = 3001;
+  std::vector<void *> slots;
+  using Pressure = ProcessRssBudget::PressureLevel;
+  const auto cleanup = ScopeGuard::Make([&] {
+    pool_.set_memory_pressure(Pressure::kNormal);
+    for (void *slot : slots) EvictionQueueTraits::free(slot);
+  });
+
+  void *first = EvictionQueueTraits::malloc(bytes);
+  ASSERT_NE(nullptr, first);
+  slots.push_back(first);
+  const size_t committed = pool_.committed();
+  pool_.set_memory_pressure(Pressure::kCritical);
+  bool denied = false;
+  for (size_t i = 0; i < page / bytes + 1; ++i) {
+    void *slot = EvictionQueueTraits::malloc(bytes);
+    if (!slot) {
+      denied = true;
+      break;
+    }
+    slots.push_back(slot);
+  }
+  EXPECT_TRUE(denied);
+  EXPECT_EQ(committed, pool_.committed());
+
+  pool_.set_memory_pressure(Pressure::kNormal);
+  void *slot = EvictionQueueTraits::malloc(bytes);
+  ASSERT_NE(nullptr, slot);
+  slots.push_back(slot);
+  EXPECT_EQ(committed, pool_.committed());
+  EvictionQueueTraits::free(slot);
+  slots.pop_back();
+  pool_.set_memory_pressure(Pressure::kCritical);
+  void *reused = EvictionQueueTraits::malloc(bytes);
+  EXPECT_EQ(slot, reused);
+  if (reused) slots.push_back(reused);
 }
 
 TEST_F(EvictionQueueBudgetTest, ConcurrentAllocationAndCrossThreadFreeBalance) {

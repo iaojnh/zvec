@@ -27,11 +27,14 @@ class MemoryReservation {
     if (bytes_) MemoryLimitPool::get_instance().release_external(bytes_);
   }
   void add(size_t bytes) {
-    if (!bytes) return;
+    add(bytes, 0);
+  }
+  void add(size_t bytes, size_t materialization) {
+    if (!bytes && !materialization) return;
     auto &pool = MemoryLimitPool::get_instance();
     if (!pool.capacity()) return;
     if (bytes > std::numeric_limits<size_t>::max() - bytes_ ||
-        !pool.try_charge_workspace(bytes))
+        !pool.try_charge_workspace(bytes, materialization))
       throw std::bad_alloc();
     bytes_ += bytes;
   }

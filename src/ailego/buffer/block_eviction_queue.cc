@@ -256,6 +256,16 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
   if (total <= kQueueSmallBytes) {
     const size_t index = total / kQueueAlignment - 1;
     auto *slab = queue_small_slabs_[index];
+    if (charged && slab && !slab->free_head) {
+      // Advancing into a new page of an old slab can raise RSS even though
+      // the whole mapping is already charged. Previously used slots remain
+      // available so queue registration can help reclaim pages under pressure.
+      const size_t previous_page = (slab->next_unused - 1) / page;
+      const size_t last_page = (slab->next_unused + total - 1) / page;
+      if (last_page != previous_page &&
+          !process_rss_.try_materialize((last_page - previous_page) * page))
+        return denied();
+    }
     if (!slab) {
       const size_t slab_header =
           (sizeof(QueueMemorySlab) + kQueueAlignment - 1) &
@@ -882,16 +892,18 @@ bool MemoryLimitPool::try_reserve_page_used(size_t bytes, bool required) {
   return false;
 }
 
-bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing) {
+bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
+                                            size_t materialization) {
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   size_t committed = committed_size_.load(std::memory_order_relaxed);
   while (committed <= capacity && bytes <= capacity - committed) {
     if (committed_size_.compare_exchange_weak(committed, committed + bytes,
                                               std::memory_order_relaxed,
                                               std::memory_order_relaxed)) {
-      const bool admitted = backing == Backing::kPending
-                                ? process_rss_.try_reserve(bytes)
-                                : process_rss_.try_acquire(bytes);
+      const bool admitted =
+          backing == Backing::kPending
+              ? process_rss_.try_reserve(bytes)
+              : process_rss_.try_acquire(bytes, materialization);
       if (!admitted) {
         committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
         bg_cv_.notify_one();
@@ -915,13 +927,14 @@ size_t MemoryLimitPool::release_committed(size_t bytes, Backing backing) {
   return previous;
 }
 
-bool MemoryLimitPool::try_reserve_allocation(size_t bytes, Backing backing) {
+bool MemoryLimitPool::try_reserve_allocation(size_t bytes, Backing backing,
+                                             size_t materialization) {
   // Pages reserve logical slots before acquiring backing. Checking only
   // committed capacity here would spend those pending slots a second time.
   // Keep both counters individually bounded without holding a lock across
   // allocation, eviction, or writeback callbacks.
   if (!try_reserve_used(bytes)) return false;
-  if (!try_reserve_committed(bytes, backing)) {
+  if (!try_reserve_committed(bytes, backing, materialization)) {
     release_buffer(nullptr, bytes);
     return false;
   }
@@ -1525,13 +1538,25 @@ bool MemoryLimitPool::try_charge_external(const size_t buffer_size) {
 }
 
 bool MemoryLimitPool::try_charge_workspace(const size_t buffer_size) {
+  return try_charge_workspace(buffer_size, 0);
+}
+
+bool MemoryLimitPool::try_charge_workspace(size_t buffer_size,
+                                        size_t materialization) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
-  return try_charge_fixed_with_wait(buffer_size, &external_used_size_);
+  return try_charge_fixed_with_wait(buffer_size, &external_used_size_,
+                                   Backing::kLive, materialization);
 }
 
 bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
+  return try_charge_metadata(buffer_size, 0);
+}
+
+bool MemoryLimitPool::try_charge_metadata(size_t buffer_size,
+                                        size_t materialization) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
-  return try_charge_fixed_with_wait(buffer_size, &metadata_used_size_);
+  return try_charge_fixed_with_wait(buffer_size, &metadata_used_size_,
+                                   Backing::kLive, materialization);
 }
 
 bool MemoryLimitPool::try_charge_metadata_without_reclaim(size_t bytes) {
@@ -1594,9 +1619,14 @@ void MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
 
 bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
                                                  std::atomic<size_t> *counter,
-                                                 Backing backing) {
-  if (try_charge_fixed(buffer_size, counter, backing)) {
+                                                 Backing backing,
+                                                 size_t materialization) {
+  if (try_charge_fixed(buffer_size, counter, backing, materialization)) {
     return true;
+  }
+  if (materialization &&
+      !process_rss_.materialization_allowed(materialization)) {
+    return false;
   }
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   const size_t fixed = fixed_used();
@@ -1617,7 +1647,8 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
   // Establish priority before another reclaim pass. A cache page may already
   // have won the preceding race, but cannot repeatedly consume the released
   // headroom while this mandatory consumer is waiting.
-  if (try_charge_fixed(buffer_size, counter, backing)) return true;
+  if (try_charge_fixed(buffer_size, counter, backing, materialization))
+    return true;
   // Dirty writeback and CLOCK aging can need more than one bounded pass.
   // A zero-page batch is not proof that the queue is unreclaimable: it may
   // only have cleared reference bits or demoted recently used entries.
@@ -1628,7 +1659,11 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
   for (size_t attempt = 0; attempt < 50; ++attempt) {
     (void)wait_for_available_impl(buffer_size, std::chrono::milliseconds(100),
                                   false);
-    if (try_charge_fixed(buffer_size, counter, backing)) return true;
+    if (try_charge_fixed(buffer_size, counter, backing, materialization))
+      return true;
+    if (materialization &&
+        !process_rss_.materialization_allowed(materialization))
+      return false;
     const size_t current_available = available();
     if (current_available <= previous_available) {
       const auto queues = BlockEvictionQueue::get_instance().stats();
@@ -1644,9 +1679,10 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
 
 bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
                                        std::atomic<size_t> *counter,
-                                       Backing backing) {
+                                       Backing backing,
+                                       size_t materialization) {
   if (buffer_size == 0) {
-    return true;
+    return !materialization || process_rss_.try_materialize(materialization);
   }
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   if (capacity == 0 || buffer_size > capacity) {
@@ -1655,10 +1691,17 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
   }
 
   while (true) {
-    if (try_reserve_allocation(buffer_size, backing)) {
+    if (try_reserve_allocation(buffer_size, backing, materialization)) {
       counter->fetch_add(buffer_size, std::memory_order_relaxed);
       bg_cv_.notify_one();
       return true;
+    }
+
+    // The measured gate can deny a materialization larger than the lifetime
+    // charge. In that case there is no point in spinning on the smaller delta.
+    if (materialization &&
+        !process_rss_.materialization_allowed(materialization)) {
+      return false;
     }
 
     // Logical admission may fail even with backing headroom while pages are

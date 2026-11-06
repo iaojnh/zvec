@@ -225,6 +225,10 @@ bool IoUringRing::ensure_staging(size_t bytes) {
     bytes = prepaid_staging_bytes_;
   }
   auto &pool = MemoryLimitPool::get_instance();
+  // The prepaid workspace may be first used long after the pool opened.
+  // Respect current RSS pressure before mapping it. Writeback can fall back
+  // to pwrite using the existing cached page if staging is denied.
+  if (prepaid_staging_bytes_ && !pool.try_materialize(bytes)) return false;
   const size_t charge = prepaid_staging_bytes_ || !pool.capacity() ? 0 : bytes;
   // Keep the old allocation charged until the replacement actually exists.
   using Pending = MemoryLimitPool::PendingAllocation;

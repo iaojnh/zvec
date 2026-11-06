@@ -617,6 +617,32 @@ TEST(ProcessRssBudgetTest, ReservedMaterializationRequiresMeasuredRoomForBytes) 
   EXPECT_FALSE(budget.materialization_allowed(20 * kMiB + 1));
 }
 
+TEST(ProcessRssBudgetTest, GrowingAllowanceChargesFullMaterialization) {
+  constexpr size_t limit = 128 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    ProcessRssBudget budget;
+    native_sample_valid = true;
+    const size_t reserve =
+        use_native_sample ? ProcessRssBudget::headroom(limit) : 0;
+    sampled_rss = use_native_sample ? 32 * kMiB : limit - 8 * kMiB;
+    native_sample = {limit - 8 * kMiB - reserve, 8 * kMiB + reserve};
+    ASSERT_TRUE(budget.configure(limit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr));
+
+    ASSERT_TRUE(budget.try_acquire(2 * kMiB, 6 * kMiB));
+    EXPECT_EQ(2 * kMiB, budget.available());
+    EXPECT_FALSE(budget.try_acquire(kMiB, 3 * kMiB));
+    EXPECT_FALSE(budget.try_materialize(3 * kMiB));
+    EXPECT_EQ(2 * kMiB, budget.available());
+    ASSERT_TRUE(budget.try_materialize(2 * kMiB));
+    budget.release(2 * kMiB);
+
+    budget.refresh(true);
+    EXPECT_EQ(8 * kMiB, budget.available());
+  }
+}
+
 TEST(ProcessRssBudgetTest, ReuseAndNewBackingShareMeasuredRoomBetweenSamples) {
   using Budget = ProcessRssBudget;
   constexpr size_t limit = 128 * kMiB;

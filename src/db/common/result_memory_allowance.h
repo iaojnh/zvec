@@ -115,10 +115,9 @@ class ResultMemoryAllowance {
     // storage, metadata and decoding; callers can split large result batches.
     if (target > capacity / 4) throw std::bad_alloc();
     if (target > reservation_.bytes()) {
-      if (!pool.materialization_allowed(bytes)) throw std::bad_alloc();
       // Admission may evict native cache pages. Bindings must release the GIL
       // before calling add(); no Python code executes while this lock is held.
-      reservation_.add(target - reservation_.bytes());
+      reservation_.add(target - reservation_.bytes(), bytes);
     } else if (!pool.try_materialize(bytes)) {
       throw std::bad_alloc();
     }

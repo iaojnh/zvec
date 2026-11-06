@@ -316,9 +316,13 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   //! admission, wait for progressing page reclamation with a finite bound.
   //! Successful reservations must be paired with release_external().
   bool try_charge_workspace(const size_t buffer_size);
+  // Also debit the full expected RSS increase when it differs from the
+  // incremental capacity charge. Metadata allowances use the same policy.
+  bool try_charge_workspace(size_t buffer_size, size_t materialization);
 
   //! Reserve non-evictable buffer-pool metadata capacity.
   bool try_charge_metadata(const size_t buffer_size);
+  bool try_charge_metadata(size_t buffer_size, size_t materialization);
 
   //! Metadata allocated under a cache lock must not reenter cache eviction.
   //! On refusal the caller must unlock before reclaiming and retrying.
@@ -523,9 +527,11 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void free_queue_memory(void *ptr);
   bool try_reserve_used(size_t bytes);
   bool try_reserve_page_used(size_t bytes, bool required = false);
-  bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive);
+  bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive,
+                             size_t materialization = 0);
   size_t release_committed(size_t bytes, Backing backing = Backing::kLive);
-  bool try_reserve_allocation(size_t bytes, Backing backing = Backing::kLive);
+  bool try_reserve_allocation(size_t bytes, Backing backing = Backing::kLive,
+                              size_t materialization = 0);
   bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,
                                bool page_admission, bool required = false);
   size_t page_admission_limit() const {
@@ -538,9 +544,11 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     return capacity - std::min(capacity, std::max(remaining, waiting));
   }
   bool try_charge_fixed(size_t bytes, std::atomic<size_t> *counter,
-                        Backing backing = Backing::kLive);
+                        Backing backing = Backing::kLive,
+                        size_t materialization = 0);
   bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter,
-                                  Backing backing = Backing::kLive);
+                                  Backing backing = Backing::kLive,
+                                  size_t materialization = 0);
   bool try_charge_locked_metadata(size_t bytes, Backing backing);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter,
                      Backing backing = Backing::kLive);
