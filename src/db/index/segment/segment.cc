@@ -370,7 +370,8 @@ class SegmentImpl : public Segment,
   Status internal_update(Doc &doc, const detail::FtsWriteAdmission &admission,
                          PreparedForward prepared);
   Status internal_upsert(Doc &doc, const detail::FtsWriteAdmission &admission,
-                         PreparedForward prepared);
+                         PreparedForward prepared,
+                         std::optional<uint64_t> previous_doc_id);
   Status internal_delete(const Doc &doc);
 
   Status recover();
@@ -1095,13 +1096,11 @@ Status SegmentImpl::internal_update(Doc &doc,
   return internal_insert(doc, admission, std::move(prepared));
 }
 
-Status SegmentImpl::internal_upsert(Doc &doc,
-                                    const detail::FtsWriteAdmission &admission,
-                                    PreparedForward prepared) {
-  uint64_t g_doc_id;
-  bool exist = id_map_->has(doc.pk_ref(), &g_doc_id);
-  if (exist) {
-    CHECK_RETURN_STATUS(delete_store_->mark_deleted(g_doc_id));
+Status SegmentImpl::internal_upsert(
+    Doc &doc, const detail::FtsWriteAdmission &admission, PreparedForward prepared,
+    std::optional<uint64_t> previous_doc_id) {
+  if (previous_doc_id) {
+    CHECK_RETURN_STATUS(delete_store_->mark_deleted(*previous_doc_id));
   }
   return internal_insert(doc, admission, std::move(prepared));
 }
@@ -1115,9 +1114,13 @@ Status SegmentImpl::internal_delete(const Doc &doc) {
 Status SegmentImpl::insert(Doc &doc) {
   std::lock_guard lock(seg_mtx_);
 
-  if (id_map_ && id_map_->has(doc.pk_ref())) {
-    return Status::AlreadyExists("insert failed: doc_id[", doc.pk_ref(),
-                                 "] already exists in collection");
+  if (id_map_) {
+    const auto found = id_map_->lookup(doc.pk_ref());
+    if (!found) return found.error();
+    if (*found) {
+      return Status::AlreadyExists("insert failed: doc_id[", doc.pk_ref(),
+                                   "] already exists in collection");
+    }
   }
 
   doc.set_operator(Operator::INSERT);
@@ -1138,7 +1141,9 @@ Status SegmentImpl::insert(Doc &doc) {
 Status SegmentImpl::update(Doc &doc) {
   std::lock_guard lock(seg_mtx_);
   uint64_t g_doc_id;
-  if (!id_map_->has(doc.pk_ref(), &g_doc_id)) {
+  const auto found = id_map_->lookup(doc.pk_ref(), &g_doc_id);
+  if (!found) return found.error();
+  if (!*found) {
     return Status::NotFound("update failed: doc_id[", doc.pk_ref(),
                             "] not found in collection");
   }
@@ -1162,12 +1167,14 @@ Status SegmentImpl::update(Doc &doc) {
 Status SegmentImpl::upsert(Doc &doc) {
   std::lock_guard lock(seg_mtx_);
 
+  uint64_t old_id;
+  const auto found = id_map_->lookup(doc.pk_ref(), &old_id);
+  if (!found) return found.error();
+
   doc.set_operator(Operator::UPSERT);
   detail::FtsWriteAdmission admission(!options_.enable_mmap_);
   CHECK_RETURN_STATUS(admit_fts_write(doc, &admission));
-  uint64_t old_id;
-  if (id_map_->has(doc.pk_ref(), &old_id))
-    CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(old_id));
+  if (*found) CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(old_id));
 
   auto prepared = prepare_forward_write(doc);
   if (!prepared) return prepared.error();
@@ -1176,14 +1183,19 @@ Status SegmentImpl::upsert(Doc &doc) {
   auto s = append_wal(doc);
   CHECK_RETURN_STATUS(s);
 
-  return internal_upsert(doc, admission, std::move(*prepared));
+  // Keep the lookup from before the WAL append. A second disk read could
+  // fail after the update has already been recorded.
+  return internal_upsert(doc, admission, std::move(*prepared),
+                         *found ? std::optional<uint64_t>(old_id) : std::nullopt);
 }
 
 Status SegmentImpl::Delete(const std::string &pk) {
   std::lock_guard lock(seg_mtx_);
 
   uint64_t g_doc_id;
-  if (!id_map_->has(pk, &g_doc_id)) {
+  const auto found = id_map_->lookup(pk, &g_doc_id);
+  if (!found) return found.error();
+  if (!*found) {
     return Status::NotFound("primary key: ", pk, " not found");
   }
   if (delete_store_->is_deleted(g_doc_id)) {
@@ -4984,7 +4996,13 @@ Status SegmentImpl::recover() try {
         break;
       }
       case Operator::UPSERT: {
-        status = internal_upsert(*doc, admission, std::move(prepared));
+        uint64_t old_id;
+        const auto found = id_map_->lookup(doc->pk_ref(), &old_id);
+        status = found ? internal_upsert(
+                             *doc, admission, std::move(prepared),
+                             *found ? std::optional<uint64_t>(old_id)
+                                    : std::nullopt)
+                       : found.error();
         break;
       }
       case Operator::DELETE: {

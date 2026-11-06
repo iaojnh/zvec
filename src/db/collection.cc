@@ -1614,8 +1614,9 @@ Status CollectionImpl::internal_fetch_by_doc(const Doc &doc,
   // Called from handle_update(), i.e. under write_impl()'s write_mtx_.
   auto segments = get_all_segments_unsafe();
   uint64_t doc_id;
-  bool has = id_map_->has(doc.pk_ref(), &doc_id);
-  if (!has) {
+  const auto found = id_map_->lookup(doc.pk_ref(), &doc_id);
+  if (!found) return found.error();
+  if (!*found) {
     return Status::NotFound("Document not found");
   }
   if (delete_store_->is_deleted(doc_id)) {
@@ -2515,8 +2516,9 @@ CollectionImpl::fetch_forward_unsafe(
   std::unordered_map<SegmentID, PendingFetch> pending;
   for (const auto &pk : pks) {
     uint64_t doc_id;
-    if (!id_map_->has(pk, &doc_id) || delete_store_->is_deleted(doc_id))
-      continue;
+    const auto found = id_map_->lookup(pk, &doc_id);
+    if (!found) return tl::make_unexpected(found.error());
+    if (!*found || delete_store_->is_deleted(doc_id)) continue;
     auto segment = local_segment_by_doc_id(doc_id, segments);
     if (!segment) continue;
     auto &batch = pending[segment->id()];
@@ -2568,7 +2570,9 @@ Result<DocPtrMap> CollectionImpl::fetch_unsafe(
           continue;
         }
         uint64_t doc_id;
-        if (!id_map_->has(pk, &doc_id) || delete_store_->is_deleted(doc_id)) {
+        const auto found = id_map_->lookup(pk, &doc_id);
+        if (!found) return tl::make_unexpected(found.error());
+        if (!*found || delete_store_->is_deleted(doc_id)) {
           continue;
         }
         auto segment = local_segment_by_doc_id(doc_id, segments);
@@ -2593,8 +2597,9 @@ Result<DocPtrMap> CollectionImpl::fetch_unsafe(
 
   for (auto &pk : pks) {
     uint64_t doc_id;
-    bool has = id_map_->has(pk, &doc_id);
-    if (!has) {
+    const auto found = id_map_->lookup(pk, &doc_id);
+    if (!found) return tl::make_unexpected(found.error());
+    if (!*found) {
       results.insert({pk, nullptr});
       continue;
     }

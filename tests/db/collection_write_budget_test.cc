@@ -10,11 +10,14 @@
 #include <string>
 #include <thread>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include <rocksdb/advanced_cache.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/collection.h>
 #include "common/memory_budget_test_helper.h"
+#include "db/collection_fetch_internal.h"
 #include "db/common/file_helper.h"
 #include "db/common/global_resource.h"
 #include "db/common/write_buffer_reservation.h"
@@ -90,6 +93,54 @@ class CollectionWriteBudgetTest : public testing::Test {
   ailego::PoolPayloadBudget &pool_ = ailego::PoolPayloadBudget::get_instance();
   std::filesystem::path root_;
 };
+
+TEST_F(CollectionWriteBudgetTest, PrimaryKeyReadDenialIsNotAMiss) {
+  auto collection = Collection::CreateAndOpen(
+      path("pk_read_denial"), schema(), CollectionOptions{false, false, kMiB});
+  ASSERT_TRUE(collection) << collection.error().message();
+  auto initial = docs("existing", "original");
+  auto inserted = (*collection)->insert(initial);
+  ASSERT_TRUE(inserted);
+  ASSERT_EQ(1u, inserted->size());
+  ASSERT_TRUE(inserted->front().ok());
+  ASSERT_TRUE((*collection)->flush().ok());
+
+  auto cache = GlobalResource::Instance().rocksdb_block_cache();
+  ASSERT_TRUE(cache);
+  const auto capacity = cache->GetCapacity();
+  {
+    auto restore = ailego::ScopeGuard::Make([&] { cache->SetCapacity(capacity); });
+    cache->SetCapacity(1);
+    cache->EraseUnRefEntries();
+    auto fetched = (*collection)->fetch({"existing"});
+    ASSERT_FALSE(fetched);
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, fetched.error().code());
+    auto columns = internal::fetch_result_snapshot(
+        **collection, {"existing"}, std::nullopt, false, nullptr, true);
+    ASSERT_FALSE(columns);
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, columns.error().code());
+
+    auto replacement = docs("existing", "replacement");
+    for (const auto write : {&Collection::insert, &Collection::update,
+                             &Collection::upsert}) {
+      auto result = ((**collection).*write)(replacement);
+      ASSERT_TRUE(result);
+      ASSERT_EQ(1u, result->size());
+      EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, result->front().code());
+    }
+    auto removed = (*collection)->delete_({"existing"});
+    ASSERT_TRUE(removed);
+    ASSERT_EQ(1u, removed->size());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, removed->front().code());
+  }
+
+  auto fetched = (*collection)->fetch({"existing", "missing"});
+  ASSERT_TRUE(fetched) << fetched.error().message();
+  ASSERT_TRUE(fetched->at("existing"));
+  EXPECT_EQ("original", fetched->at("existing")->get<std::string>("payload"));
+  EXPECT_FALSE(fetched->at("missing"));
+  ASSERT_TRUE((*collection)->close().ok());
+}
 
 TEST_F(CollectionWriteBudgetTest, RejectsBeforeCreatingCollectionFiles) {
   pool_.init(kMiB);
