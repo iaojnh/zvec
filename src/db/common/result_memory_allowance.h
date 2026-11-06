@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <zvec/ailego/buffer/memory_reservation.h>
 
@@ -101,6 +102,13 @@ class ResultMemoryAllowance {
     return reservation_.bytes();
   }
 
+  void reclaim_idle() {
+    // Background eviction must not wait for an admission that itself needs
+    // cache reclamation to make progress.
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (lock && !active_) reservation_.retain_at_most(0);
+  }
+
  private:
   friend class MemoryBudgetTestPeer;
   size_t acquire(size_t bytes, size_t backing_quantum,
@@ -164,10 +172,15 @@ class ResultMemoryAllowance {
 // All forward-result paths share one high water and one active limit. Separate
 // per-API allowances could each consume a quarter of the pool and leave no
 // room for decoding after alternating Query and Fetch calls.
-inline ResultMemoryAllowance &SharedResultMemoryAllowance() {
+inline const std::shared_ptr<ResultMemoryAllowance> &
+SharedResultMemoryAllowanceOwner() {
   (void)ailego::MemoryLimitPool::get_instance();
-  static ResultMemoryAllowance allowance;
-  return allowance;
+  static const auto owner = std::make_shared<ResultMemoryAllowance>();
+  return owner;
+}
+
+inline ResultMemoryAllowance &SharedResultMemoryAllowance() {
+  return *SharedResultMemoryAllowanceOwner();
 }
 
 }  // namespace zvec::detail

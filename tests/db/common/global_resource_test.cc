@@ -30,8 +30,11 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/db/config.h>
+#include "db/common/metadata_memory.h"
 #include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
+#include "db/common/result_memory_allowance.h"
+#include "db/common/write_buffer_reservation.h"
 #if defined(__linux__)
 #include <dlfcn.h>
 #endif
@@ -610,4 +613,53 @@ TEST(GlobalResource, HostPressureReclaimsCacheWithoutChangingConfiguredLimit) {
   ASSERT_TRUE(config.set_memory_pressure(Pressure::kNormal).ok());
   ASSERT_TRUE(pool.try_charge_external(4096));
   pool.release_external(4096);
+}
+
+
+TEST(GlobalResource, LaterPressureReclaimsIdlePlanningAllowances) {
+  ASSERT_EQ(0, GlobalResource::Instance().initialize());
+  auto &config = GlobalConfig::Instance();
+  auto &results = detail::SharedResultMemoryAllowance();
+  auto &metadata = detail::RetainedMetadataBudget::instance();
+  auto &writers = detail::SharedWriteBufferMemoryAllowance();
+  using Pressure = GlobalConfig::MemoryPressure;
+  constexpr size_t kMiB = 1024 * 1024;
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { config.set_memory_pressure(Pressure::kNormal); });
+  const auto wait_until = [](auto ready) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!ready() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return ready();
+  };
+
+  {
+    detail::RetainedMetadataBudget::Lease open(metadata);
+    open.acquire(kMiB);
+    WriteBufferReservation writer;
+    ASSERT_TRUE(writer.acquire_managed(kMiB).ok());
+  }
+  ASSERT_GT(metadata.reserved(), 0u);
+  ASSERT_GT(writers.reserved_bytes(), 0u);
+  {
+    detail::ResultMemoryAllowance::Lease pinned(&results);
+    pinned.add(kMiB);
+    const size_t reserved = results.reserved_bytes();
+    ASSERT_TRUE(config.set_memory_pressure(Pressure::kBackground).ok());
+    ASSERT_TRUE(wait_until([&] {
+      return metadata.reserved() == 0 && writers.reserved_bytes() == 0;
+    }));
+    EXPECT_EQ(kMiB, results.active_bytes());
+    EXPECT_EQ(reserved, results.reserved_bytes());
+  }
+
+  ASSERT_TRUE(config.set_memory_pressure(Pressure::kNormal).ok());
+  {
+    detail::ResultMemoryAllowance::Lease idle(&results);
+    idle.add(kMiB);
+  }
+  ASSERT_GT(results.reserved_bytes(), 0u);
+  ASSERT_TRUE(config.set_memory_pressure(Pressure::kBackground).ok());
+  EXPECT_TRUE(wait_until([&] { return results.reserved_bytes() == 0; }));
 }

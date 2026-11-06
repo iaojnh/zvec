@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -69,6 +70,13 @@ class WriteBufferMemoryAllowance {
     return reservation_.bytes();
   }
 
+  void reclaim_idle() {
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock || active_) return;
+    retained_ = 0;
+    reservation_.retain_at_most(0);
+  }
+
  private:
   friend class MemoryBudgetTestPeer;
   mutable std::mutex mutex_;
@@ -78,10 +86,15 @@ class WriteBufferMemoryAllowance {
   size_t retained_{0};
 };
 
-inline WriteBufferMemoryAllowance &SharedWriteBufferMemoryAllowance() {
+inline const std::shared_ptr<WriteBufferMemoryAllowance> &
+SharedWriteBufferMemoryAllowanceOwner() {
   (void)ailego::MemoryLimitPool::get_instance();
-  static WriteBufferMemoryAllowance allowance;
-  return allowance;
+  static const auto owner = std::make_shared<WriteBufferMemoryAllowance>();
+  return owner;
+}
+
+inline WriteBufferMemoryAllowance &SharedWriteBufferMemoryAllowance() {
+  return *SharedWriteBufferMemoryAllowanceOwner();
 }
 
 }  // namespace detail
@@ -133,15 +146,18 @@ class WriteBufferReservation {
   Status acquire_impl(size_t max_buffer_size, size_t backing) {
     auto &allowance = detail::SharedWriteBufferMemoryAllowance();
     if (bytes_ != 0) {
-      // A live writer reuses its lease between operations, but its ordinary
-      // heap allocations must still obey newly observed host pressure.
-      if (!ailego::MemoryLimitPool::get_instance().materialization_allowed(
-              std::min(backing, bytes_)))
+      // An admission-only lease has not projected any encoder backing yet.
+      // Debit each promotion once, and still check current pressure when a
+      // writer returns with the same workspace.
+      const size_t next_backing = std::max(backing_, std::min(backing, bytes_));
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      if (!pool.try_materialize(next_backing - backing_))
         return Status(StatusCode::RESOURCE_EXHAUSTED,
                       "Write buffer materialization blocked by memory pressure");
-      backing = std::max(backing_, std::min(backing, bytes_));
-      allowance.retain_backing(backing_, backing);
-      backing_ = backing;
+      if (next_backing != backing_) {
+        allowance.retain_backing(backing_, next_backing);
+        backing_ = next_backing;
+      }
       return Status::OK();
     }
 

@@ -22,10 +22,13 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
+#include "db/common/metadata_memory.h"
 #include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
+#include "db/common/result_memory_allowance.h"
 #include "db/common/rocksdb_block_cache.h"
 #include "db/common/rocksdb_cache_allocator.h"
+#include "db/common/write_buffer_reservation.h"
 
 namespace zvec {
 
@@ -214,8 +217,15 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       // Use it as a separate admission/eviction signal, never another fixed
       // reservation that would count those bytes twice.
       memory_pool.set_process_rss_reclaimer(
-          [cache = std::weak_ptr<rocksdb::Cache>(rocksdb_block_cache)] {
+          [cache = std::weak_ptr<rocksdb::Cache>(rocksdb_block_cache),
+           results = std::weak_ptr(detail::SharedResultMemoryAllowanceOwner()),
+           writers =
+               std::weak_ptr(detail::SharedWriteBufferMemoryAllowanceOwner()),
+           metadata = &detail::RetainedMetadataBudget::instance()] {
             if (auto owner = cache.lock()) owner->EraseUnRefEntries();
+            if (auto owner = results.lock()) owner->reclaim_idle();
+            if (auto owner = writers.lock()) owner->reclaim_idle();
+            metadata->reclaim_idle();
           });
       const size_t permanent_backing =
           detail::NativeImageReservation().bytes() +

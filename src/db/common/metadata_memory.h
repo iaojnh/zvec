@@ -70,6 +70,13 @@ class RetainedMetadataBudget {
     std::lock_guard<std::mutex> lock(mutex_);
     return reserved_;
   }
+  void reclaim_idle() {
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock || active_ || !reserved_) return;
+    ailego::MemoryLimitPool::get_instance().release_metadata(reserved_);
+    reserved_ = 0;
+  }
+
   static RetainedMetadataBudget &instance() {
     static auto *budget = new RetainedMetadataBudget;
     return *budget;

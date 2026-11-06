@@ -6,10 +6,29 @@
 #include <limits>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/db/options.h>
 #include "memory_budget_test_helper.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
+
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static bool configure_rss(MemoryLimitPool &pool, size_t limit, size_t rss) {
+    pool.stop_background_evictor();
+    sample = rss;
+    return pool.process_rss_.configure(limit, +[] { return sample; });
+  }
+
+  static void refresh_rss(MemoryLimitPool &pool, size_t rss) {
+    sample = rss;
+    pool.process_rss_.refresh(true);
+  }
+
+ private:
+  inline static size_t sample = 0;
+};
+}  // namespace zvec::ailego
 
 namespace zvec {
 namespace {
@@ -64,6 +83,31 @@ TEST_F(WriteBufferReservationTest, RetainedAndLiveAllowancesObeyHostPressure) {
   pool.set_memory_pressure(Pressure::kNormal);
   EXPECT_EQ(backing,
             detail::SharedWriteBufferMemoryAllowance().reserved_bytes());
+}
+
+TEST_F(WriteBufferReservationTest, WriterPromotionsShareMeasuredHeadroom) {
+  WriteBufferReservation first;
+  WriteBufferReservation second;
+  ASSERT_TRUE(first.acquire(kMiB).ok());
+  ASSERT_TRUE(second.acquire(kMiB).ok());
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  constexpr size_t kLimit = 128 * kMiB;
+  constexpr size_t kRss = 116 * kMiB;
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
+  ASSERT_TRUE(Peer::configure_rss(pool, kLimit, kRss));
+  // Keep the limiting observation stable if the test is descheduled.
+  Peer::refresh_rss(pool, 0);
+
+  ASSERT_TRUE(first.acquire_managed(kMiB).ok());
+  EXPECT_TRUE(first.acquire_managed(kMiB).ok());
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
+            second.acquire_managed(kMiB).code());
+
+  Peer::refresh_rss(pool, kRss);
+  EXPECT_TRUE(second.acquire_managed(kMiB).ok());
 }
 
 TEST_F(WriteBufferReservationTest, CollectionsShareBudgetAndReturnAllowance) {
