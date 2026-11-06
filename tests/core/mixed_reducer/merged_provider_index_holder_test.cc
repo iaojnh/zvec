@@ -527,6 +527,44 @@ TEST(MergedProviderIndexHolderTest, OrdinalKeyPassPreservesIteratorReadError) {
   }
 }
 
+TEST(MergedProviderIndexHolderTest, StreamerMergeReturnsBudgetDenialAndJoins) {
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = budget.capacity();
+  ASSERT_EQ(0, budget.init(64UL << 20));
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    budget.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+    EXPECT_EQ(0, budget.init(previous));
+  });
+
+  auto source = MakeStreamer({{1, 1.0f}});
+  auto target = MakeStreamer({});
+  ailego::ThreadPool workers(1, false);
+  MixedStreamerReducer reducer;
+  ailego::Params params;
+  params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
+  ASSERT_EQ(0, reducer.init(params));
+  reducer.set_thread_pool(&workers);
+  ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                   nullptr, target, nullptr, nullptr,
+                   IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension)));
+  ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+  const size_t baseline = budget.external_used();
+  IndexFilter pressure;
+  pressure.set([&](uint64_t) {
+    budget.set_memory_pressure(
+        ailego::ProcessRssBudget::PressureLevel::kCritical);
+    return false;
+  });
+  EXPECT_EQ(IndexError_NoMemory, reducer.reduce(pressure));
+  EXPECT_EQ(baseline, budget.external_used());
+
+  budget.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+  IndexFilter skip_all;
+  skip_all.set([](uint64_t) { return true; });
+  EXPECT_EQ(0, reducer.reduce(skip_all));
+  EXPECT_EQ(baseline, budget.external_used());
+}
+
 TEST(MergedProviderIndexHolderTest, StreamerMergePreservesIteratorReadError) {
   for (auto operation :
        {IteratorFailureOperation::kValidity, IteratorFailureOperation::kKey,

@@ -89,16 +89,19 @@ uint32_t SafeWorkerCount() noexcept {
 
 }  // namespace
 
+uint32_t ThreadPool::count_for_request(uint32_t size) noexcept {
+  return std::min(std::max(size, 1u), SafeWorkerCount());
+}
+
 ThreadPool::ThreadPool() : ThreadPool(SafeWorkerCount(), false) {}
 
 ThreadPool::ThreadPool(uint32_t size, bool binding) {
-  const uint32_t max_size = SafeWorkerCount();
-  const uint32_t safe_size = std::min(std::max(size, 1u), max_size);
+  const uint32_t safe_size = count_for_request(size);
   if (safe_size != size) {
     LOG_WARN(
         "ThreadPool worker count[%u] is outside supported range[1, %u], "
         "clamped to %u",
-        size, max_size, safe_size);
+        size, SafeWorkerCount(), safe_size);
   }
 
   // Global DB pools are created before the RSS target is published and have

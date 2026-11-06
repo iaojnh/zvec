@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "opq_rotator.h"
 #include <array>
 #include <cassert>
@@ -167,7 +168,7 @@ void OpqRotator::train(const void * /*data*/, size_t /*num*/,
 
 void OpqRotator::apply(const float *in, float *out) const {
   if (paged_matrix_) {
-    std::vector<float> row(dim_);
+    ailego::BudgetedVector<float> row(dim_);
     for (int i = 0; i < dim_; ++i) {
       if (paged_matrix_->read(static_cast<size_t>(i) * dim_ * sizeof(float),
                               row.data(), row.size() * sizeof(float)) != 0)
@@ -185,7 +186,7 @@ void OpqRotator::apply(const float *in, float *out) const {
 
 void OpqRotator::apply_inverse(const float *in, float *out) const {
   if (paged_matrix_) {
-    std::vector<float> row(dim_);
+    ailego::BudgetedVector<float> row(dim_);
     std::fill(out, out + dim_, 0);
     for (int i = 0; i < dim_; ++i) {
       if (paged_matrix_->read(static_cast<size_t>(i) * dim_ * sizeof(float),

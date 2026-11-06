@@ -274,7 +274,7 @@ int PqFastQuantizer::train(IndexHolder::Pointer holder, int thread_count) try {
     return kErrUnsupported;
 
   if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
-    std::vector<uint32_t> offsets(num_chunk_ + 1);
+    ModelVector<uint32_t> offsets(num_chunk_ + 1);
     for (size_t m = 0; m <= num_chunk_; ++m) offsets[m] = m * sub_dim_;
     const PqBufferedTrainingOptions options{"PqFastQuantizer",
                                             original_dim_,
@@ -435,7 +435,7 @@ void PqFastQuantizer::quantize_data(const void *input, void *output) const {
 
   // For Cosine: normalize FIRST (codebook is trained in normalized space);
   // the original norm is stored after the PQ code for dequantize().
-  std::vector<uint8_t> norm_vec_storage;
+  ModelVector<uint8_t> norm_vec_storage;
   float vec_norm = 0.0f;
   const void *vec = input;
 
@@ -459,7 +459,7 @@ void PqFastQuantizer::quantize_data(const void *input, void *output) const {
   }
 
   // Zero-mean centering: subtract centroid before encoding.
-  std::vector<uint8_t> centered_vec_storage;
+  ModelVector<uint8_t> centered_vec_storage;
   if (use_zero_mean_) {
     centered_vec_storage.resize(original_dim_ * elem_size);
     std::memcpy(centered_vec_storage.data(), vec, original_dim_ * elem_size);
@@ -478,7 +478,7 @@ void PqFastQuantizer::quantize_data(const void *input, void *output) const {
   }
 
   // OPQ: rotate last, mirroring train().
-  std::vector<float> rotated_vec_storage;
+  ModelVector<float> rotated_vec_storage;
   vec = opq_.apply(vec, &rotated_vec_storage);
 
   // Zero the packed code buffer first: nibble packing ORs codes in, and an
@@ -573,12 +573,7 @@ void PqFastQuantizer::compute_float_lut(const void *input, float *lut) const {
   }
 
   // OPQ: rotate last, as quantize_data() does.
-  ailego::MemoryReservation rotation_memory;
-  std::vector<float> rotated_query_storage;
-  if (opq_.enabled()) {
-    ailego::ReserveVectorCapacity(rotated_query_storage, rotation_memory,
-                                  original_dim_);
-  }
+  ModelVector<float> rotated_query_storage;
   query = opq_.apply(query, &rotated_query_storage);
 
   // LUT[m][j] = distance(q_m, c_m[j]) via the metric-aware batch_fn_:
@@ -711,7 +706,8 @@ int PqFastQuantizer::build_centroid_distance_table(const void *centroids,
   //! Mimic faiss precomputed_table_max_bytes: refuse oversized tables so
   //! the caller can fall back to the per-list path.
   const size_t kMaxTableBytes = 1ULL << 30;
-  if (centroid_num * row_floats * sizeof(float) > kMaxTableBytes) {
+  if (!row_floats ||
+      centroid_num > kMaxTableBytes / sizeof(float) / row_floats) {
     return kErrUnsupported;
   }
 
@@ -720,8 +716,8 @@ int PqFastQuantizer::build_centroid_distance_table(const void *centroids,
   table->resize(centroid_num * row_floats * sizeof(float));
   float *tab = reinterpret_cast<float *>(&(*table)[0]);
 
-  std::vector<float> buf(original_dim_);
-  std::vector<float> rotated;
+  ModelVector<float> buf(original_dim_);
+  ModelVector<float> rotated;
   const float *src = reinterpret_cast<const float *>(centroids);
   float dists[kNumCentroids];
   for (size_t i = 0; i < centroid_num; ++i) {
@@ -761,7 +757,7 @@ int PqFastQuantizer::build_centroid_distance_table(const void *centroids,
 int PqFastQuantizer::quantize_precomputed_query(const void *query,
                                                 const IndexQueryMeta &qmeta,
                                                 std::string *out,
-                                                IndexQueryMeta *ometa) const {
+                                                IndexQueryMeta *ometa) const try {
   if (input_data_type_ != DataType::kFp32 ||
       meta_.metric_name() != "SquaredEuclidean") {
     return kErrUnsupported;
@@ -779,7 +775,7 @@ int PqFastQuantizer::quantize_precomputed_query(const void *query,
   //! out above), then build the term3 table.  It stays UNQUANTIZED here:
   //! merge_query_distance_table() adds the per-list term2 row first and
   //! affine-quantizes the merged table once.
-  std::vector<float> prep(original_dim_);
+  ModelVector<float> prep(original_dim_);
   int ret = preprocess_query(query, prep.data());
   if (ret != 0) {
     return ret;
@@ -806,6 +802,8 @@ int PqFastQuantizer::quantize_precomputed_query(const void *query,
   ometa->set_meta(IndexMeta::DataType::DT_FP32, original_dim_,
                   static_cast<uint32_t>(type_), 0);
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int PqFastQuantizer::merge_query_distance_table(
@@ -831,7 +829,7 @@ int PqFastQuantizer::merge_query_distance_table(
   return quantize_lut(merged.data(), &(*out)[0]);
 }
 
-int PqFastQuantizer::preprocess_query(const void *input, float *out) const {
+int PqFastQuantizer::preprocess_query(const void *input, float *out) const try {
   if (input_data_type_ != DataType::kFp32) {
     return kErrNotImplemented;
   }
@@ -848,12 +846,14 @@ int PqFastQuantizer::preprocess_query(const void *input, float *out) const {
     subtract_center(out);
   }
   if (opq_.enabled()) {
-    std::vector<float> rotated(original_dim_);
+    ModelVector<float> rotated(original_dim_);
     opq_.rotate(out, rotated.data());
     std::memcpy(out, rotated.data(),
                 static_cast<size_t>(original_dim_) * sizeof(float));
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int PqFastQuantizer::pack_codes(const void *codes, size_t num, size_t stride,

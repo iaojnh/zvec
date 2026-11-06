@@ -155,10 +155,10 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       return -1;
     }
 
-    auto query_thread_pool = std::make_unique<ailego::ThreadPool>(
-        query_thread_count, query_thread_binding);
-    auto optimize_thread_pool = std::make_unique<ailego::ThreadPool>(
-        optimize_thread_count, optimize_thread_binding);
+    const uint32_t query_workers =
+        ailego::ThreadPool::count_for_request(query_thread_count);
+    const uint32_t optimize_workers =
+        ailego::ThreadPool::count_for_request(optimize_thread_count);
     std::shared_ptr<rocksdb::MemoryAllocator> rocksdb_cache_allocator;
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
     // malloc can retain freed SST blocks around live cache payloads after
@@ -199,12 +199,17 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       // data, and BSS outlive collection.close; reserve them before publishing.
       static const char image_anchor = 0;
       detail::ReserveNativeImage(&image_anchor);
-      // Explicit process budgets cover zvec-owned worker stacks before any
-      // resource handle is published or collection can populate the cache.
-      // A preconfigured standalone/core cache is not a DB process budget.
+      // Admit startup stacks before creating the two worker pools. The
+      // dedicated Arrow pools use the same query worker count.
       detail::ReserveNativeWorkerStacks(
-          query_thread_pool->count(), optimize_thread_pool->count(),
-          optimize_thread_count, 2 * query_thread_pool->count());
+          query_workers, optimize_workers, optimize_thread_count,
+          2 * static_cast<size_t>(query_workers));
+    }
+    auto query_thread_pool = std::make_unique<ailego::ThreadPool>(
+        query_workers, query_thread_binding);
+    auto optimize_thread_pool = std::make_unique<ailego::ThreadPool>(
+        optimize_workers, optimize_thread_binding);
+    if (!preserve_existing_pool) {
       // RSS already includes resident images, stacks, and caller-owned memory.
       // Use it as a separate admission/eviction signal, never another fixed
       // reservation that would count those bytes twice.

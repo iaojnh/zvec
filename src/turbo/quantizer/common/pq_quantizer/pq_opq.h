@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -63,7 +64,7 @@ class PqOpq {
                  const ReconstructSum &reconstruct);
 
   //! Returns input unchanged when disabled, otherwise rotates into buffer.
-  const void *apply(const void *input, std::vector<float> *buffer) const;
+  const void *apply(const void *input, ailego::BudgetedVector<float> *buffer) const;
 
   //! These two operations require enabled() and non-overlapping buffers.
   void rotate(const float *input, float *output) const;

@@ -190,6 +190,7 @@ class IndexMapping {
   struct MetaMapping {
     IndexFormat::MetaHeader *header;
     size_t length;
+    size_t charge;
   };
   using HeaderMap = std::map<
       uint64_t, MetaMapping, std::less<uint64_t>,
@@ -199,9 +200,10 @@ class IndexMapping {
       std::map<std::string_view, SegmentInfo, std::less<>,
                ailego::BudgetedAllocator<
                    std::pair<const std::string_view, SegmentInfo>>>;
-  int init_index_mapping_admitted(size_t len, HeaderMap::node_type node,
-                                  ailego::MemoryReservation memory);
-  ailego::MemoryReservation metadata_memory_;
+  int init_index_mapping_admitted(
+      size_t len, HeaderMap::node_type node,
+      ailego::MemoryLimitPool::PendingAllocation &memory);
+  static void release_meta_mapping(const MetaMapping &mapping);
   //! Members
   uint32_t segment_ids_offset_{0};
   IndexFormat::SegmentMeta *segment_start_{nullptr};

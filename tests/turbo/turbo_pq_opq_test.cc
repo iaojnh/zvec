@@ -139,6 +139,55 @@ TEST(PqOpq, StreamingExportMatchesBlobForAllCodeFormats) {
   }
 }
 
+TEST(PqOpq, EncodingScratchObeysCriticalPressureAndRecovers) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  AILEGO_DEFER([&] {
+    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+    EXPECT_EQ(0, pool.init(previous));
+  });
+
+  for (const char *name :
+       {"PqInt8Quantizer", "PqInt4Quantizer", "PqFastQuantizer"}) {
+    SCOPED_TRACE(name);
+    core::IndexMeta meta;
+    meta.set_meta(core::IndexMeta::DT_FP32, 8);
+    meta.set_metric("Cosine", 0, ailego::Params());
+    ailego::Params params;
+    params.set("num_chunk", uint32_t{2});
+    params.set("max_iter", uint32_t{1});
+    params.set("thread_count", uint32_t{1});
+    params.set("build_sdc_table", false);
+    auto quantizer = core::IndexFactory::CreateQuantizer(name);
+    ASSERT_TRUE(quantizer);
+    ASSERT_EQ(0, quantizer->init(meta, params));
+    auto holder = std::make_shared<
+        core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(8);
+    for (size_t i = 0; i < 256; ++i) {
+      ailego::NumericalVector<float> row(8);
+      for (size_t d = 0; d < 8; ++d)
+        row[d] = static_cast<float>((i * 17 + d * 3) % 251) / 251;
+      holder->emplace(i, row);
+    }
+    ASSERT_EQ(0, quantizer->train(holder));
+    const float input[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<uint8_t> encoded(quantizer->quantized_datapoint_vector_length());
+    quantizer->quantize_data(input, encoded.data());
+    auto expected = encoded;
+    const size_t baseline = pool.external_used();
+
+    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
+    EXPECT_THROW(quantizer->quantize_data(input, encoded.data()),
+                 std::bad_alloc);
+    EXPECT_EQ(baseline, pool.external_used());
+    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+    EXPECT_NO_THROW(quantizer->quantize_data(input, encoded.data()));
+    EXPECT_EQ(expected, encoded);
+    EXPECT_EQ(baseline, pool.external_used());
+  }
+}
+
 TEST(PqOpq, ReconstructionSkipsEmptyCentroidsForBothCodebookSizes) {
   check_reconstruction<16>({2, 2});
   check_reconstruction<256>({2, 2});
@@ -159,7 +208,7 @@ TEST(PqOpq, ReinitializationClearsRotation) {
     EXPECT_FALSE(opq.enabled());
     EXPECT_EQ(0, opq.rotate_type());
     float input[] = {1.0f, 2.0f, 3.0f};
-    std::vector<float> buffer;
+    ailego::BudgetedVector<float> buffer;
     EXPECT_EQ(static_cast<const void *>(input), opq.apply(input, &buffer));
     EXPECT_TRUE(buffer.empty());
     std::string blob("old contents");
@@ -249,7 +298,7 @@ TEST(PqOpq, PreservesRotatorBlobAndRejectsInvalidDimension) {
   float input[] = {1, 2, 3};
   float expected[3];
   rotator->apply(input, expected);
-  std::vector<float> actual;
+  ailego::BudgetedVector<float> actual;
   opq.apply(input, &actual);
   ASSERT_EQ(3u, actual.size());
   for (size_t i = 0; i < actual.size(); ++i) {

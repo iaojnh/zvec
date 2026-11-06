@@ -37,7 +37,7 @@ namespace zvec::turbo {
 struct PqBufferedTrainingOptions {
   const char *name;
   size_t dimension;
-  std::vector<uint32_t> chunk_offsets;
+  ailego::BudgetedVector<uint32_t> chunk_offsets;
   size_t centroid_count;
   size_t sample_limit;
   uint32_t max_iters;

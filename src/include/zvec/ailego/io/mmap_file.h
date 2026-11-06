@@ -96,6 +96,12 @@ class ZVEC_AILEGO_API MMapFile {
     File file;
     ailego_false_if_false(file.open(path, rdonly, false));
 
+    return this->open(file, rdonly, shared);
+  }
+
+  //! Use the same open handle for the view and any positioned reads.
+  bool open(File &file, bool rdonly, bool shared) {
+    ailego_false_if_false(!region_ && file.is_valid());
     size_t len = file.size();
     int opts = 0;
     if (rdonly) {

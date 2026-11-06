@@ -259,7 +259,7 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   IndexMeta meta_{};
   uint32_t original_dim_{0};
   uint32_t num_chunk_{0};
-  std::vector<uint32_t> chunk_offsets_;
+  ailego::BudgetedVector<uint32_t> chunk_offsets_;
 
   //! Centroids stored as raw bytes in the original data type:
   //! consecutive [kNumCentroids][chunk_dim(m)] blocks, totaling

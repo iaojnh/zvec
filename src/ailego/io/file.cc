@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <limits>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/io/file.h>
 #if !defined(_WIN64) && !defined(_WIN32)
@@ -30,6 +32,26 @@
 
 namespace zvec {
 namespace ailego {
+
+namespace {
+
+bool AdmitMappedPages(size_t bytes, size_t page_offset = 0) {
+  if (bytes == 0) return true;
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t page = pool.page_buffer_size();
+  if (bytes > (std::numeric_limits<size_t>::max)() - page_offset - (page - 1))
+    return false;
+  const size_t rounded = ((page_offset + bytes + page - 1) / page) * page;
+  return pool.try_materialize(rounded);
+}
+
+bool AdmitMappedPages(const void *addr, size_t bytes) {
+  return AdmitMappedPages(
+      bytes, reinterpret_cast<uintptr_t>(addr) %
+                 MemoryLimitPool::page_buffer_size());
+}
+
+}  // namespace
 
 #if !defined(_WIN64) && !defined(_WIN32)
 
@@ -318,7 +340,9 @@ void *File::MemoryMap(NativeHandle handle, ssize_t off, size_t len, int opts) {
   int flags = (opts & File::MMAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
 
 #if defined(MAP_POPULATE)
-  if (opts & File::MMAP_POPULATE) {
+  // Populating the mapping is optional. Keep lazy access available when
+  // process pressure leaves no room to fault in the whole extent.
+  if ((opts & File::MMAP_POPULATE) && AdmitMappedPages(len)) {
     flags |= MAP_POPULATE;
   }
 #endif
@@ -332,10 +356,8 @@ void *File::MemoryMap(NativeHandle handle, ssize_t off, size_t len, int opts) {
   void *addr = mmap(nullptr, len, prot, flags, handle, off);
   ailego_null_if_false(addr != MAP_FAILED);
 
-  if (opts & File::MMAP_LOCKED) {
-    mlock(addr, len);
-  }
-  if (opts & File::MMAP_WARMUP) {
+  const bool locked = (opts & File::MMAP_LOCKED) && MemoryLock(addr, len);
+  if (!locked && (opts & File::MMAP_WARMUP)) {
     File::MemoryWarmup(addr, len);
   }
   return addr;
@@ -352,7 +374,7 @@ void *File::MemoryMap(size_t len, int opts) {
   int flags = (opts & File::MMAP_SHARED) ? MAP_SHARED | MAP_ANONYMOUS
                                          : MAP_PRIVATE | MAP_ANONYMOUS;
 #if defined(MAP_POPULATE)
-  if (opts & File::MMAP_POPULATE) {
+  if ((opts & File::MMAP_POPULATE) && AdmitMappedPages(len)) {
     flags |= MAP_POPULATE;
   }
 #endif
@@ -403,7 +425,7 @@ bool File::MemoryFlush(void *addr, size_t len) {
 }
 
 bool File::MemoryLock(void *addr, size_t len) {
-  ailego_false_if_false(addr && len);
+  if (!addr || !len || !AdmitMappedPages(addr, len)) return false;
   return (mlock(addr, len) == 0);
 }
 
@@ -710,10 +732,8 @@ void *File::MemoryMap(NativeHandle handle, ssize_t off, size_t len, int opts) {
 
   ailego_null_if_false(base);
   void *addr = (char *)base + excess;
-  if (opts & File::MMAP_LOCKED) {
-    VirtualLock(addr, len);
-  }
-  if (opts & File::MMAP_WARMUP) {
+  const bool locked = (opts & File::MMAP_LOCKED) && MemoryLock(addr, len);
+  if (!locked && (opts & File::MMAP_WARMUP)) {
     File::MemoryWarmup(addr, len);
   }
   return addr;
@@ -723,10 +743,8 @@ void *File::MemoryMap(size_t len, int opts) {
   void *addr =
       VirtualAlloc(nullptr, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   ailego_null_if_false(addr);
-  if (opts & File::MMAP_LOCKED) {
-    VirtualLock(addr, len);
-  }
-  if (opts & File::MMAP_WARMUP) {
+  const bool locked = (opts & File::MMAP_LOCKED) && MemoryLock(addr, len);
+  if (!locked && (opts & File::MMAP_WARMUP)) {
     File::MemoryWarmup(addr, len);
   }
   return addr;
@@ -754,7 +772,7 @@ bool File::MemoryFlush(void *addr, size_t /*len*/) {
 }
 
 bool File::MemoryLock(void *addr, size_t len) {
-  ailego_false_if_false(addr && len);
+  if (!addr || !len || !AdmitMappedPages(addr, len)) return false;
   return (!!VirtualLock(addr, len));
 }
 
@@ -763,25 +781,19 @@ bool File::MemoryUnlock(void *addr, size_t len) {
   return (!!VirtualUnlock(addr, len));
 }
 
-static inline int getpagesize() {
-  SYSTEM_INFO info;
-  GetSystemInfo(&info);
-  return info.dwPageSize;
-}
 #endif
 
 void File::MemoryWarmup(void *addr, size_t len) {
-  static int page_size = getpagesize();
+  if (!addr || !len || !AdmitMappedPages(addr, len)) return;
 
-  if (addr && len) {
-    uint8_t *p = reinterpret_cast<uint8_t *>(addr);
-    uint8_t *end = p + len;
-    volatile uint8_t tmp = 0;
-
-    while (p < end) {
-      tmp ^= *p;
-      p += page_size;
-    }
+  const size_t page = MemoryLimitPool::page_buffer_size();
+  const auto *bytes = static_cast<const uint8_t *>(addr);
+  size_t step = page - reinterpret_cast<uintptr_t>(addr) % page;
+  volatile uint8_t touched = 0;
+  for (size_t offset = 0;; step = page) {
+    touched ^= bytes[offset];
+    if (len - offset <= step) break;
+    offset += step;
   }
 }
 

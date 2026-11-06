@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/io/mmap_file.h>
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/core/framework/index_factory.h>
@@ -183,7 +184,9 @@ class MMapFileReadStorage : public IndexStorage {
       return IndexError_NoMemory;
     }
 
-    if (!file_ptr_->open(path.c_str(), true, memory_shared_)) {
+    ailego::File file;
+    if (!file.open(path, true, false) ||
+        !file_ptr_->open(file, true, memory_shared_)) {
       LOG_ERROR("Failed to open file %s, %s", path.c_str(),
                 ailego::FileHelper::GetLastErrorString().c_str());
       return IndexError_OpenFile;
@@ -203,16 +206,21 @@ class MMapFileReadStorage : public IndexStorage {
           static_cast<char *>(file_ptr_->region()) + index_offset_, size);
     }
 
-    auto read_data = [this, end_offset](size_t offset, const void **data,
-                                        size_t len) {
-      size_t off = offset + index_offset_;
-      if (off + len > end_offset) {
-        if (off > end_offset) {
-          off = end_offset;
-        }
-        len = end_offset - off;
+    ailego::BudgetedAlignedBuffer checksum_scratch;
+    auto read_data = [this, &file, &checksum_scratch, end_offset](
+                         size_t offset, const void **data, size_t len) {
+      const size_t off = offset + index_offset_;
+      if (off > end_offset) return size_t{0};
+      len = std::min(len, end_offset - off);
+      if (checksum_validation_ && len) {
+        // Validate through positioned reads so a full checksum does not
+        // fault the entire file mapping into the process working set.
+        if (len > checksum_scratch.size())
+          checksum_scratch.resize(len, AILEGO_CACHE_LINE_SIZE);
+        *data = checksum_scratch.data();
+        return file.read(off, checksum_scratch.data(), len);
       }
-      *data = (uint8_t *)file_ptr_->region() + off;
+      *data = static_cast<const uint8_t *>(file_ptr_->region()) + off;
       return len;
     };
 

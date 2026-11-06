@@ -14,8 +14,10 @@
 
 #include <cstring>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/io/file.h>
 #if defined(_WIN64) || defined(_WIN32)
 #include <Windows.h>
@@ -24,6 +26,7 @@
 #endif
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #endif
 
 using namespace zvec::ailego;
@@ -391,6 +394,35 @@ TEST(File, Seek) {
   EXPECT_EQ((ssize_t)file.size(), file.offset());
   file.close();
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST(File, EagerMappingKeepsPagesLazyUnderCriticalPressure) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t page = pool.page_buffer_size();
+  pool.set_memory_pressure(ProcessRssBudget::PressureLevel::kCritical);
+  const auto restore = ScopeGuard::Make([&] {
+    pool.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  });
+
+  void *mapping = File::MemoryMap(2 * page, File::MMAP_POPULATE);
+  ASSERT_NE(nullptr, mapping);
+  const auto unmap = ScopeGuard::Make(
+      [&] { EXPECT_TRUE(File::TryMemoryUnmap(mapping, 2 * page)); });
+  unsigned char resident[2]{};
+  File::MemoryWarmup(static_cast<char *>(mapping) + page - 1, 2);
+  EXPECT_FALSE(File::MemoryLock(mapping, 2 * page));
+  ASSERT_EQ(0, ::mincore(mapping, 2 * page, resident));
+  EXPECT_EQ(0, resident[0] & 1);
+  EXPECT_EQ(0, resident[1] & 1);
+
+  pool.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  auto *bytes = static_cast<char *>(mapping);
+  bytes[0] = 'a';
+  bytes[page] = 'b';
+  EXPECT_EQ('a', bytes[0]);
+  EXPECT_EQ('b', bytes[page]);
+}
+#endif
 
 TEST(File, MemoryWarmup) {
   // Test with null address - should not crash

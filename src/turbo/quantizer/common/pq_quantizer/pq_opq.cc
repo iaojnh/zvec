@@ -72,8 +72,8 @@ int PqOpq::train(void *data, size_t num, const char *name,
   }
   float *rotated = reinterpret_cast<float *>(data);
   const size_t total = num * static_cast<size_t>(preprocessor_->in_dim());
-  std::vector<float> x(rotated, rotated + total);
-  std::vector<float> x_hat(total);
+  ailego::BudgetedVector<float> x(rotated, rotated + total);
+  ailego::BudgetedVector<float> x_hat(total);
   float prev_mse = 0.0f;
 
   for (uint32_t it = 0; it < opq_iter_; ++it) {
@@ -180,7 +180,7 @@ void PqOpq::rotate_batch(const float *input, size_t num, float *output) const {
   }
 }
 
-const void *PqOpq::apply(const void *input, std::vector<float> *buffer) const {
+const void *PqOpq::apply(const void *input, ailego::BudgetedVector<float> *buffer) const {
   if (!enabled()) return input;
   buffer->resize(preprocessor_->out_dim());
   rotate(reinterpret_cast<const float *>(input), buffer->data());

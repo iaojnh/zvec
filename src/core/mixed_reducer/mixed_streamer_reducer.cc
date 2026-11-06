@@ -219,7 +219,7 @@ int MixedStreamerReducer::feed_streamer_with_reformer(
   return 0;
 }
 
-int MixedStreamerReducer::reduce(const IndexFilter &filter) {
+int MixedStreamerReducer::reduce(const IndexFilter &filter) try {
   if (state_ != STATE_FEED) {
     LOG_ERROR("Feed streamers first");
     return IndexError_Uninitialized;
@@ -248,10 +248,10 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     return 0;
   }
 
-  std::vector<int> add_results(num_of_add_threads_, -1);
+  ailego::BudgetedVector<int> add_results(num_of_add_threads_, -1);
   auto add_group = thread_pool_->make_group();
 
-  std::vector<int> read_results(streamers_.size(), -1);
+  ailego::BudgetedVector<int> read_results(streamers_.size(), -1);
   // TODO: use id instead of key
   // When merging into a non-empty target (e.g. reusing one input as base),
   // append new docs after the existing ones instead of overwriting from 0.
@@ -267,49 +267,59 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     }
   }
 
-  if (is_sparse_) {
-    for (size_t i = 0; i < num_of_add_threads_; i++) {
-      add_group->submit(ailego::Closure::New(
-          this, &MixedStreamerReducer::add_sparse_vec, &add_results[i]));
-    }
-
-    for (size_t i = 0; i < streamers_.size(); i++) {
-      // due to filter, producing can't be parallel
-      read_results[i] = read_sparse_vec(i, filter, id_offset, &next_id);
-      id_offset += streamers_[i]->create_sparse_provider()->count();
-    }
-
-    sparse_mt_list_.done();
-  } else {
-    for (size_t i = 0; i < num_of_add_threads_; i++) {
-      add_group->submit(ailego::Closure::New(
-          this, &MixedStreamerReducer::add_vec, &add_results[i]));
-      // add_vec(&add_results[i]);
-    }
-
-    for (size_t i = 0; i < streamers_.size(); i++) {
-      auto provider = streamers_[i]->create_provider();
-      if (!provider) {
-        LOG_ERROR("Failed to create source provider, index=%zu", i);
-        read_results[i] = IndexError_Runtime;
-        break;
+  {
+    AILEGO_DEFER([&] {
+      mt_list_.done();
+      sparse_mt_list_.done();
+      add_group->wait_finish();
+      mt_list_.reset();
+      sparse_mt_list_.reset();
+    });
+    if (is_sparse_) {
+      for (size_t i = 0; i < num_of_add_threads_; i++) {
+        add_group->submit(ailego::Closure::New(
+            this, &MixedStreamerReducer::add_sparse_vec, &add_results[i]));
       }
-      read_results[i] = read_vec(i, provider, filter, id_offset, &next_id);
-      if (read_results[i] != 0) {
-        break;
-      }
-      id_offset += provider->count();
-    }
 
-    mt_list_.done();
+      for (size_t i = 0; i < streamers_.size(); i++) {
+        // due to filter, producing can't be parallel
+        auto provider = streamers_[i]->create_sparse_provider();
+        if (!provider) {
+          read_results[i] = IndexError_Runtime;
+          break;
+        }
+        read_results[i] = read_sparse_vec(i, provider, filter, id_offset,
+                                          &next_id);
+        if (read_results[i] != 0) break;
+        id_offset += provider->count();
+      }
+    } else {
+      for (size_t i = 0; i < num_of_add_threads_; i++) {
+        add_group->submit(ailego::Closure::New(
+            this, &MixedStreamerReducer::add_vec, &add_results[i]));
+        // add_vec(&add_results[i]);
+      }
+
+      for (size_t i = 0; i < streamers_.size(); i++) {
+        auto provider = streamers_[i]->create_provider();
+        if (!provider) {
+          LOG_ERROR("Failed to create source provider, index=%zu", i);
+          read_results[i] = IndexError_Runtime;
+          break;
+        }
+        read_results[i] = read_vec(i, provider, filter, id_offset, &next_id);
+        if (read_results[i] != 0) {
+          break;
+        }
+        id_offset += provider->count();
+      }
+    }
   }
-  add_group->wait_finish();
 
-  auto check_results = [](const std::vector<int> &results) -> bool {
-    return std::all_of(std::begin(results), std::end(results),
-                       [](int item) { return item == 0; });
-  };
-
+  if (std::find(add_results.begin(), add_results.end(), IndexError_NoMemory) !=
+      add_results.end()) {
+    return IndexError_NoMemory;
+  }
   const auto read_error = std::find_if(read_results.begin(), read_results.end(),
                                        [](int item) { return item != 0; });
   if (read_error != read_results.end()) {
@@ -317,7 +327,8 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
     return *read_error;
   }
 
-  if (!check_results(add_results)) {
+  if (std::any_of(add_results.begin(), add_results.end(),
+                  [](int result) { return result != 0; })) {
     LOG_ERROR("add vector failed");
     return IndexError_Runtime;
   }
@@ -328,6 +339,8 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) {
   LOG_INFO("End brute force reduce. cost time: [%zu]s",
            (size_t)timer.seconds());
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int MixedStreamerReducer::dump(const IndexDumper::Pointer &dumper) {
@@ -361,7 +374,7 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
                                    const IndexProvider::Pointer &provider,
                                    const IndexFilter &filter,
                                    const uint32_t id_offset,
-                                   uint32_t *next_id) {
+                                   uint32_t *next_id) try {
   const auto &streamer = streamers_[source_streamer_index];
   const auto &reformer = source_streamers_reformers_[source_streamer_index];
   const auto &quantizer = source_streamers_quantizers_[source_streamer_index];
@@ -439,28 +452,26 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
       return IndexError_ReadData;
     }
 
-    std::vector<uint8_t> bytes;
+    ailego::BudgetedVector<uint8_t> bytes;
     bool needs_convert = false;
     if (quantizer != nullptr && need_encode) {
-      std::string original_vector;
-      if (quantizer->dequantize(vector_data, source_streamer_query_meta,
-                                &original_vector) != 0) {
-        LOG_ERROR("Failed to dequantize the vector, index=%zu key=%zu",
-                  source_streamer_index, static_cast<size_t>(iterator->key()));
-        return IndexError_Runtime;
-      }
-      bytes.resize(original_vector.size());
-      memcpy(bytes.data(), original_vector.data(), bytes.size());
+      ailego::BudgetedStringWorkspace original_vector;
+      original_vector.reserve(
+          std::max<size_t>(original_query_meta_.element_size(),
+                           size_t{source_streamer_query_meta.dimension()} *
+                               sizeof(float)));
+      const int ret = quantizer->dequantize(
+          vector_data, source_streamer_query_meta, &original_vector.value);
+      if (ret != 0) return ret;
+      bytes.assign(original_vector.value.begin(), original_vector.value.end());
       needs_convert = true;
     } else if (need_revert) {
-      std::string new_vector;
-      if (reformer->revert(vector_data, source_streamer_query_meta,
-                           &new_vector) != 0) {
-        LOG_ERROR("Failed to revert the vector");
-        return IndexError_Runtime;
-      }
-      bytes.resize(new_vector.size());
-      memcpy(bytes.data(), new_vector.data(), bytes.size());
+      ailego::BudgetedStringWorkspace new_vector;
+      new_vector.reserve(original_query_meta_.element_size());
+      const int ret = reformer->revert(
+          vector_data, source_streamer_query_meta, &new_vector.value);
+      if (ret != 0) return ret;
+      bytes.assign(new_vector.value.begin(), new_vector.value.end());
       needs_convert = true;
     } else {
       // TODO: eliminate the copy
@@ -488,9 +499,12 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
     iterator->next();
   }
   return iterator->status();
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-void MixedStreamerReducer::add_vec(int *result) {
+void MixedStreamerReducer::add_vec(int *result) try {
+  AILEGO_DEFER([&] { mt_list_.done(); });
   ailego::ElapsedTime timer;
   auto target_streamer_context = target_streamer_->create_context();
   auto target_streamer_query_meta = IndexQueryMeta{
@@ -502,12 +516,8 @@ void MixedStreamerReducer::add_vec(int *result) {
   target_streamer_query_meta.set_extra_meta_size(
       target_streamer_->meta().extra_meta_size());
 
-  AILEGO_DEFER([&]() {
-    // make producer quit
-    mt_list_.done();
-  });
-
   VectorItem vector_item;
+  ailego::BudgetedStringWorkspace new_vector;
   while (mt_list_.consume(&vector_item)) {
     if (stop_flag_ != nullptr && stop_flag_->load(std::memory_order_relaxed)) {
       LOG_DEBUG("add_vec cancelled.");
@@ -515,18 +525,21 @@ void MixedStreamerReducer::add_vec(int *result) {
     }
 
     const void *vector = vector_item.vec_.data();
-    std::string new_vector;
     IndexQueryMeta add_meta = target_streamer_query_meta;
 
     if (vector_item.needs_convert_) {
+      new_vector.value.clear();
       // Bytes are still in the original input format; re-encode them into
       // the target layout. A target without quantizer or reformer stores
       // the original format directly, so no encoding is needed.
       if (target_streamer_quantizer_ != nullptr) {
-        new_vector.resize(
-            target_streamer_quantizer_->quantized_datapoint_vector_length());
-        target_streamer_quantizer_->quantize_data(vector, new_vector.data());
-        vector = new_vector.data();
+        const size_t bytes =
+            target_streamer_quantizer_->quantized_datapoint_vector_length();
+        new_vector.reserve(bytes);
+        new_vector.value.resize(bytes);
+        target_streamer_quantizer_->quantize_data(vector,
+                                                   new_vector.value.data());
+        vector = new_vector.value.data();
         add_meta.set_meta(
             target_streamer_query_meta.data_type(),
             target_streamer_query_meta.dimension(),
@@ -534,13 +547,14 @@ void MixedStreamerReducer::add_vec(int *result) {
             target_streamer_query_meta.extra_meta_size());
       } else if (target_streamer_reformer_ != nullptr) {
         IndexQueryMeta new_meta;
-        if (target_streamer_reformer_->convert(vector, original_query_meta_,
-                                               &new_vector, &new_meta) != 0) {
-          LOG_ERROR("Failed to transform vector");
-          *result = IndexError_Runtime;
+        new_vector.reserve(target_streamer_->meta().element_size());
+        const int ret = target_streamer_reformer_->convert(
+            vector, original_query_meta_, &new_vector.value, &new_meta);
+        if (ret != 0) {
+          *result = ret;
           return;
         }
-        vector = new_vector.data();
+        vector = new_vector.value.data();
       }
     }
 
@@ -558,9 +572,12 @@ void MixedStreamerReducer::add_vec(int *result) {
   *result = 0;
   LOG_DEBUG("add_vec. cost time: [%zu]s", (size_t)timer.seconds());
   return;
+} catch (const std::bad_alloc &) {
+  *result = IndexError_NoMemory;
 }
 
-void MixedStreamerReducer::add_sparse_vec(int *result) {
+void MixedStreamerReducer::add_sparse_vec(int *result) try {
+  AILEGO_DEFER([&] { sparse_mt_list_.done(); });
   ailego::ElapsedTime timer;
   auto target_streamer_context = target_streamer_->create_context();
   auto target_streamer_query_meta = IndexQueryMeta{
@@ -571,12 +588,8 @@ void MixedStreamerReducer::add_sparse_vec(int *result) {
   auto need_convert = !is_target_and_source_same_reformer_ &&
                       target_streamer_reformer_ != nullptr;
 
-  AILEGO_DEFER([&]() {
-    // make producer quit
-    sparse_mt_list_.done();
-  });
-
   SparseVectorItem sparse_vector_item;
+  ailego::BudgetedStringWorkspace converted;
   while (sparse_mt_list_.consume(&sparse_vector_item)) {
     if (stop_flag_ != nullptr && stop_flag_->load(std::memory_order_relaxed)) {
       LOG_DEBUG("add_sparse_vec cancelled.");
@@ -584,19 +597,20 @@ void MixedStreamerReducer::add_sparse_vec(int *result) {
     }
     auto sparse_count = sparse_vector_item.sparse_indices_.size();
     auto indices = sparse_vector_item.sparse_indices_.data();
-    auto values = sparse_vector_item.sparse_values_.data();
+    auto values = sparse_vector_item.sparse_values_.data.data();
 
-    std::string converted_sparse_values_buffer;
     if (need_convert) {
       IndexQueryMeta new_meta;
-      if (target_streamer_reformer_->convert(
-              sparse_count, indices, values, original_query_meta_,
-              &converted_sparse_values_buffer, &new_meta) != 0) {
-        LOG_ERROR("Failed to transform vector");
-        *result = IndexError_Runtime;
+      converted.value.clear();
+      converted.reserve(sparse_count * target_streamer_->meta().unit_size());
+      const int ret = target_streamer_reformer_->convert(
+          sparse_count, indices, values, original_query_meta_,
+          &converted.value, &new_meta);
+      if (ret != 0) {
+        *result = ret;
         return;
       }
-      values = converted_sparse_values_buffer.data();
+      values = converted.value.data();
       target_streamer_query_meta = new_meta;
     }
 
@@ -615,22 +629,22 @@ void MixedStreamerReducer::add_sparse_vec(int *result) {
   *result = 0;
   LOG_DEBUG("add_sparse_vec. cost time: [%zu]s", (size_t)timer.seconds());
   return;
+} catch (const std::bad_alloc &) {
+  *result = IndexError_NoMemory;
 }
 
 
-int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
-                                          const IndexFilter &filter,
-                                          const uint32_t id_offset,
-                                          uint32_t *next_id) {
+int MixedStreamerReducer::read_sparse_vec(
+    size_t source_streamer_index,
+    const IndexStreamer::SparseProvider::Pointer &provider,
+    const IndexFilter &filter, uint32_t id_offset, uint32_t *next_id) try {
   const auto &streamer = streamers_[source_streamer_index];
   const auto &reformer = source_streamers_reformers_[source_streamer_index];
   const bool need_revert =
       !is_target_and_source_same_reformer_ && reformer != nullptr;
 
-  IndexStreamer::SparseProvider::Pointer provider =
-      streamer->create_sparse_provider();
-  IndexStreamer::SparseProvider::Iterator::Pointer iterator =
-      provider->create_iterator();
+  auto iterator = provider->create_iterator();
+  if (!iterator) return IndexError_Runtime;
 
   while (iterator->is_valid()) {
     if (stop_flag_ != nullptr && stop_flag_->load(std::memory_order_relaxed)) {
@@ -643,27 +657,21 @@ int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
       continue;
     }
 
-    auto sparse_count = iterator->sparse_count();
-    std::vector<uint32_t> sparse_indices(sparse_count);
-    std::string sparse_values;
-
+    const size_t sparse_count = iterator->sparse_count();
+    ailego::BudgetedVector<uint32_t> sparse_indices(sparse_count);
+    ailego::BudgetedStringBuffer sparse_values;
     if (need_revert) {
-      std::string new_sparse_values;
-      if (reformer->revert(iterator->sparse_count(), iterator->sparse_indices(),
-                           iterator->sparse_data(),
-                           {
-                               IndexMeta::MetaType::MT_SPARSE,
-                               streamer->meta().data_type(),
-                           },
-                           &new_sparse_values) != 0) {
-        LOG_ERROR("Failed to revert the sparse vector");
-        return IndexError_Runtime;
-      }
-      sparse_values = std::move(new_sparse_values);
+      sparse_values.reserve(sparse_count * original_query_meta_.unit_size());
+      const int ret = reformer->revert(
+          sparse_count, iterator->sparse_indices(), iterator->sparse_data(),
+          {IndexMeta::MetaType::MT_SPARSE, streamer->meta().data_type()},
+          &sparse_values.data);
+      if (ret != 0) return ret;
     } else {
-      sparse_values.resize(sparse_count * streamer->meta().unit_size());
-      memcpy(sparse_values.data(), iterator->sparse_data(),
-             sparse_values.size());
+      const size_t bytes = sparse_count * streamer->meta().unit_size();
+      sparse_values.reserve(bytes);
+      sparse_values.data.assign(static_cast<const char *>(iterator->sparse_data()),
+                                bytes);
     }
 
     // TODO: eliminate the copy
@@ -681,6 +689,8 @@ int MixedStreamerReducer::read_sparse_vec(size_t source_streamer_index,
     iterator->next();
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) try {

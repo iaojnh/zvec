@@ -480,10 +480,15 @@ class FileReadStorage : public IndexStorage {
                 file_path_.c_str(), offset, size);
       return IndexStorage::Segment::Pointer();
     }
-    return std::make_shared<typename T::MMapSegment>(
+    auto unmap = [size](void *addr) {
+      ailego::File::MemoryUnmap(addr, size);
+    };
+    std::unique_ptr<void, decltype(unmap)> mapping(data, unmap);
+    auto result = std::make_shared<typename T::MMapSegment>(
         *(static_cast<const T *>(this)), segment, file_ptr, index_offset_,
-        static_cast<char *>(data) + bias,
-        [=]() { ailego::File::MemoryUnmap(data, size); });
+        static_cast<char *>(data) + bias, [=] { unmap(data); });
+    mapping.release();
+    return result;
   }
 
   //! Retrieve all segments

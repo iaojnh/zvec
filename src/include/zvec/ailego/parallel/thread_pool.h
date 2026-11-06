@@ -164,6 +164,9 @@ class ZVEC_AILEGO_API ThreadPool {
     }
   }
 
+  //! Apply the same worker count limit used by the constructor.
+  static uint32_t count_for_request(uint32_t size) noexcept;
+
   //! Retrieve thread count in pool
   size_t count() const {
     return pool_.size();

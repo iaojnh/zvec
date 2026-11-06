@@ -44,7 +44,7 @@ struct SparseSegmentInfo {
 
 struct VectorItem {
   key_t pkey_{0};
-  std::vector<uint8_t> vec_{};
+  ailego::BudgetedVector<uint8_t> vec_{};
   // TODO: drop support for hybrid vectors
   std::string sparse_buffer_{};
   uint32_t sparse_unit_size_{0};
@@ -53,12 +53,12 @@ struct VectorItem {
   bool needs_convert_{false};
 
   VectorItem() = default;
-  VectorItem(key_t pkey, std::vector<uint8_t> vec)
+  VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec)
       : pkey_(pkey), vec_(std::move(vec)) {}
-  VectorItem(key_t pkey, std::vector<uint8_t> vec, bool needs_convert)
+  VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec, bool needs_convert)
       : pkey_(pkey), vec_(std::move(vec)), needs_convert_{needs_convert} {}
   // TODO: drop support for hybrid vectors
-  VectorItem(key_t pkey, std::vector<uint8_t> vec, std::string sparse_buffer,
+  VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec, std::string sparse_buffer,
              uint32_t sparse_unit_size)
       : pkey_(pkey),
         vec_(std::move(vec)),
@@ -68,12 +68,12 @@ struct VectorItem {
 
 struct SparseVectorItem {
   key_t pkey_{0};
-  std::vector<uint32_t> sparse_indices_{};
-  std::string sparse_values_{};
+  ailego::BudgetedVector<uint32_t> sparse_indices_{};
+  ailego::BudgetedStringBuffer sparse_values_{};
 
   SparseVectorItem() = default;
-  SparseVectorItem(key_t pkey, std::vector<uint32_t> sparse_indices,
-                   std::string sparse_values)
+  SparseVectorItem(key_t pkey, ailego::BudgetedVector<uint32_t> sparse_indices,
+                   ailego::BudgetedStringBuffer sparse_values)
       : pkey_(pkey),
         sparse_indices_(std::move(sparse_indices)),
         sparse_values_(std::move(sparse_values)) {}

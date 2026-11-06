@@ -21,6 +21,7 @@
 #include <numeric>
 #include <ailego/pattern/defer.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_factory.h>
@@ -837,7 +838,7 @@ int DiskAnnBuilderEntity::dump_key_mapping_segment(
     if (ret != 0) return ret;
     return mapping.dump(dumper, kDiskAnnKeyMappingSegmentId, 4096);
   }
-  std::vector<diskann_id_t> mapping(doc_cnt());
+  ailego::BudgetedVector<diskann_id_t> mapping(doc_cnt());
 
   const diskann_key_t *keys = reinterpret_cast<diskann_key_t *>(
       const_cast<char *>(keys_buffer_.data()));
@@ -861,7 +862,7 @@ int DiskAnnBuilderEntity::dump_key_mapping_segment(
 
 int DiskAnnBuilderEntity::dump_entrypoint_segment(
     const IndexDumper::Pointer &dumper) const {
-  std::string entrypoint_buffer;
+  ailego::BudgetedVector<char> entrypoint_buffer;
 
   size_t size = sizeof(uint32_t) + entrypoints_.size() * sizeof(diskann_id_t);
   entrypoint_buffer.resize(size);
@@ -886,7 +887,7 @@ int DiskAnnBuilderEntity::dump_entrypoint_segment(
 }
 
 int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
-                               const IndexDumper::Pointer &dumper) {
+                               const IndexDumper::Pointer &dumper) try {
   if (!holder || holder->count() != this->doc_cnt() ||
       holder->element_size() != meta_.element_size()) {
     return IndexError_Mismatch;
@@ -901,12 +902,18 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
       DiskAnnUtil::kSectorSize /
       max_node_size;  // 0 if max_node_size > DiskAnnUtil::kSectorSize
 
-  std::string node_buf;
-  node_buf.resize(max_node_size);
-
-  diskann_id_t *neighbor_buf =
-      (diskann_id_t *)(node_buf.data() + (meta_.element_size()) +
-                       sizeof(uint32_t));
+  const uint64_t sectors_per_node =
+      DiskAnnUtil::div_round_up(max_node_size, DiskAnnUtil::kSectorSize);
+  if (sectors_per_node >
+      (std::numeric_limits<size_t>::max)() / DiskAnnUtil::kSectorSize) {
+    return IndexError_NoMemory;
+  }
+  const size_t buffer_bytes = sectors_per_node * DiskAnnUtil::kSectorSize;
+  ailego::BudgetedAlignedBuffer sector_storage(buffer_bytes,
+                                               AILEGO_CACHE_LINE_SIZE);
+  auto *sector_buffer = static_cast<char *>(sector_storage.data());
+  ailego::BudgetedVector<diskann_id_t> neighbors;
+  neighbors.reserve(max_observed_degree);
 
   LOG_INFO(
       "Dump Data, medoid: %zu, max node size: %zu, node per sector: %zu, "
@@ -963,148 +970,47 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
     return 0;
   };
 
-  uint64_t index_size = 0;
-  uint32_t neighbor_num;
-  if (node_per_sector > 0) {
-    uint64_t sector_num =
-        DiskAnnUtil::round_up(doc_cnt, node_per_sector) / node_per_sector;
+  auto encode_node = [&](diskann_id_t id, char *out) -> int {
+    int status = read_neighbors(id, &neighbors);
+    if (status != 0) return status;
+    status = read_vector(id, out);
+    if (status != 0) return status;
+    const auto count = static_cast<uint32_t>(neighbors.size());
+    ailego_assert(count > 0 && count <= max_observed_degree);
+    auto *adjacency = out + meta_.element_size();
+    std::memcpy(adjacency, &count, sizeof(count));
+    std::memcpy(adjacency + sizeof(count), neighbors.data(),
+                neighbors.size() * sizeof(diskann_id_t));
+    return 0;
+  };
 
-    diskann_id_t cur_node_id = 0;
-
-    std::string sector_buf;
-    sector_buf.resize(DiskAnnUtil::kSectorSize);
-
-    for (uint64_t sector = 0; sector < sector_num; sector++) {
-      if (sector != 0 && sector % 100000 == 0) {
-        LOG_INFO("Sector #%zu written", (size_t)sector);
-      }
-
-      memset(&(sector_buf[0]), 0, DiskAnnUtil::kSectorSize);
-
-      for (uint64_t sector_node_id = 0;
-           sector_node_id < node_per_sector && cur_node_id < doc_cnt;
-           sector_node_id++) {
-        memset(&(node_buf[0]), 0, max_node_size);
-
-        ailego::BudgetedVector<diskann_id_t> neighbors;
-        ret = read_neighbors(cur_node_id, &neighbors);
-        if (ret != 0) return ret;
-        neighbor_num = static_cast<uint32_t>(neighbors.size());
-
-        ailego_assert(neighbor_num > 0);
-        ailego_assert(neighbor_num <= max_observed_degree);
-
-        memcpy(&(neighbor_buf[0]), neighbors.data(),
-               neighbors.size() * sizeof(diskann_id_t));
-
-        ret = read_vector(cur_node_id, &node_buf[0]);
-        if (ret != 0) return ret;
-
-        // write neighbor num
-        *(uint32_t *)(node_buf.data() + meta_.element_size()) = neighbor_num;
-
-        // write neighbor buffer
-        memcpy(&(node_buf[0]) + meta_.element_size() + sizeof(uint32_t),
-               neighbor_buf, neighbor_num * sizeof(diskann_id_t));
-
-        // get offset into sector_buf
-        char *sector_node_buf = &sector_buf[sector_node_id * max_node_size];
-
-        // copy node buf into sector_node_buf
-        memcpy(sector_node_buf, node_buf.data(), max_node_size);
-
-        cur_node_id++;
-      }
-
-      // flush sector to disk
-      len = dumper->write(sector_buf.data(), DiskAnnUtil::kSectorSize);
-      if (len != DiskAnnUtil::kSectorSize) {
-        LOG_ERROR("Write Vector Error, write=%zu, expect=%zu", len,
-                  (size_t)DiskAnnUtil::kSectorSize);
-
-        return IndexError_WriteData;
-      }
-      write_size += DiskAnnUtil::kSectorSize;
-      crc = ailego::Crc32c::Hash(sector_buf.data(), DiskAnnUtil::kSectorSize,
-                                 crc);
-    }
-
-    LOG_INFO("Total Sector #%zu written", (size_t)sector_num);
-
-    index_size = sector_num * DiskAnnUtil::kSectorSize;
-  } else {
-    // Write multi-sector nodes
-    std::string multisector_buf;
-    multisector_buf.resize(
-        DiskAnnUtil::round_up(max_node_size, DiskAnnUtil::kSectorSize));
-
-    uint64_t sector_num_per_node =
-        DiskAnnUtil::div_round_up(max_node_size, DiskAnnUtil::kSectorSize);
-
-    for (uint64_t i = 0; i < doc_cnt; i++) {
-      if (i != 0 && (i * sector_num_per_node) % 100000 == 0) {
-        LOG_INFO("Sector # %zu written", (size_t)(i * sector_num_per_node));
-      }
-
-      memset(&(multisector_buf[0]), 0,
-             sector_num_per_node * DiskAnnUtil::kSectorSize);
-      memset(&(node_buf[0]), 0, max_node_size);
-
-      ailego::BudgetedVector<diskann_id_t> neighbors;
-      ret = read_neighbors(i, &neighbors);
+  // Pack small nodes into one sector, or give a large node its own aligned
+  // extent. The same pre-admitted buffer covers both layouts.
+  const uint64_t nodes_per_write = node_per_sector ? node_per_sector : 1;
+  for (uint64_t first = 0; first < doc_cnt; first += nodes_per_write) {
+    std::memset(sector_buffer, 0, buffer_bytes);
+    const uint64_t count = std::min(nodes_per_write, doc_cnt - first);
+    for (uint64_t i = 0; i < count; ++i) {
+      ret = encode_node(static_cast<diskann_id_t>(first + i),
+                        sector_buffer + i * max_node_size);
       if (ret != 0) return ret;
-      neighbor_num = static_cast<uint32_t>(neighbors.size());
-
-      ailego_assert(neighbor_num > 0);
-      ailego_assert(neighbor_num <= max_observed_degree);
-
-      // read node's nhood
-      memcpy((char *)neighbor_buf, neighbors.data(),
-             neighbor_num * sizeof(diskann_id_t));
-
-      ret = read_vector(i, &multisector_buf[0]);
-      if (ret != 0) return ret;
-
-      // write neighbor
-      *(uint32_t *)(&(multisector_buf[0]) + meta_.element_size()) =
-          neighbor_num;
-
-      // write nhood next
-      memcpy(&(multisector_buf[0]) + meta_.element_size() + sizeof(uint32_t),
-             neighbor_buf, neighbor_num * sizeof(diskann_id_t));
-
-      // flush sector to disk
-      len = dumper->write(multisector_buf.data(),
-                          sector_num_per_node * DiskAnnUtil::kSectorSize);
-      if (len != sector_num_per_node * DiskAnnUtil::kSectorSize) {
-        LOG_ERROR("Write Vector Error, write=%zu, expect=%zu", len,
-                  (size_t)(sector_num_per_node * DiskAnnUtil::kSectorSize));
-
-        return IndexError_WriteData;
-      }
-
-      write_size += sector_num_per_node * DiskAnnUtil::kSectorSize;
-
-      crc = ailego::Crc32c::Hash(multisector_buf.data(),
-                                 sector_num_per_node * DiskAnnUtil::kSectorSize,
-                                 crc);
     }
+    len = dumper->write(sector_buffer, buffer_bytes);
+    if (len != buffer_bytes) return IndexError_WriteData;
+    write_size += buffer_bytes;
+    crc = ailego::Crc32c::Hash(sector_buffer, buffer_bytes, crc);
+  }
+  const uint64_t index_size = write_size;
 
-    LOG_INFO("Total Sector #%zu written",
-             (size_t)(doc_cnt * sector_num_per_node));
-
-    index_size = doc_cnt * sector_num_per_node * DiskAnnUtil::kSectorSize;
+  const size_t padding_size = AlignSize(write_size) - write_size;
+  const char padding[4096]{};
+  if (padding_size && dumper->write(padding, padding_size) != padding_size) {
+    LOG_ERROR("Append padding failed, size %zu", padding_size);
+    return IndexError_WriteData;
   }
 
-  size_t padding_size = AlignSize(write_size) - write_size;
-  if (padding_size > 0) {
-    std::string padding(padding_size, '\0');
-    if (dumper->write(padding.data(), padding_size) != padding_size) {
-      LOG_ERROR("Append padding failed, size %lu", padding_size);
-      return IndexError_WriteData;
-    }
-  }
-
+  sector_storage = {};
+  decltype(neighbors)().swap(neighbors);
   ret = dumper->append(kDiskAnnVectorSegmentId, write_size, 0UL, crc);
   if (ret != 0) {
     LOG_ERROR("Dump vectors segment failed, ret %d", ret);
@@ -1174,6 +1080,8 @@ int DiskAnnBuilderEntity::dump(IndexHolder::Pointer holder, IndexMeta &meta,
   LOG_INFO("DiskAnn Index File Dumped");
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 }  // namespace core
