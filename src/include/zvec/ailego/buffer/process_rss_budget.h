@@ -202,7 +202,13 @@ class ProcessRssBudget {
       pending_releases_ = 0;
     }
     void release(size_t bytes) {
-      pending_releases_ += std::min(bytes, resident_upper_ - pending_releases_);
+      const size_t possibly_resident =
+          std::min(bytes, resident_upper_ - pending_releases_);
+      pending_releases_ += possibly_resident;
+      // The old sample may still include this owner's pages. Until a new
+      // sample can rebase it, those bytes cannot also cover another owner
+      // whose allocation has not yet become resident.
+      sampled_backing_ -= std::min(sampled_backing_, possibly_resident);
     }
     size_t usage(size_t backing) const {
       return std::max(projected(baseline_rss_, baseline_backing_, backing),

@@ -246,6 +246,47 @@ TEST(ProcessRssBudgetTest, ResidentGrowthIsNotCountedTwice) {
   EXPECT_EQ(400 * kMiB, budget.available());
 }
 
+TEST(ProcessRssBudgetTest, ReleasedResidentBackingDoesNotCoverUntouchedOwners) {
+  constexpr size_t limit = 1000 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    ProcessRssBudget budget;
+    native_sample_valid = true;
+    auto sample = [&](size_t bytes) {
+      sampled_rss = use_native_sample ? 32 * kMiB : bytes;
+      native_sample = {bytes, limit - bytes};
+    };
+    sample(300 * kMiB);
+    ASSERT_TRUE(budget.configure(limit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr));
+    ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+    sample(600 * kMiB);
+    budget.refresh(true);
+    ASSERT_TRUE(budget.try_acquire(200 * kMiB));  // Untouched.
+    budget.release(300 * kMiB);
+
+    // The sampled memory can still include the freed owner (e.g. the heap
+    // retained it). The other owner still needs 200 MiB to become resident.
+    const size_t reserve =
+        use_native_sample ? ProcessRssBudget::headroom(limit) : 0;
+    EXPECT_EQ(200 * kMiB - reserve, budget.available());
+    if (use_native_sample) {
+      native_sample_valid = false;
+    } else {
+      sampled_rss = 0;
+    }
+    budget.refresh(true);
+    EXPECT_EQ(200 * kMiB - reserve, budget.available());
+    EXPECT_FALSE(budget.try_acquire(201 * kMiB - reserve));
+
+    native_sample_valid = true;
+    sample(300 * kMiB);
+    budget.refresh(true);
+    EXPECT_EQ(500 * kMiB - reserve, budget.available());
+    budget.release(200 * kMiB);
+  }
+}
+
 TEST(ProcessRssBudgetTest, ReleasingResidentOwnerDoesNotLosePendingGrowth) {
   ProcessRssBudget budget;
   sampled_rss = 300 * kMiB;
