@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "fts_query_parser.h"
+#include <new>
 #include <zvec/ailego/utility/string_helper.h>
 #include "db/index/column/fts_column/gen/FtsLexer.h"
 #include "db/index/column/fts_column/gen/FtsParser.h"
@@ -406,6 +407,10 @@ FtsAstNodePtr FtsQueryParser::parse(const std::string &query,
     }
     return result;
 
+  } catch (const std::bad_alloc &) {
+    // Preserve resource exhaustion from analyzers/native workspace admission.
+    // The query boundary translates it to RESOURCE_EXHAUSTED, not bad syntax.
+    throw;
   } catch (const std::exception &exception) {
     err_msg_ = "fts parse exception: " + std::string(exception.what());
     return nullptr;

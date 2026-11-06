@@ -26,8 +26,15 @@ using EmbeddedJiebaDict =
     std::shared_ptr<const cppjieba::DictTrie::DictCacheEntry>;
 using EmbeddedJiebaHmmModel = std::shared_ptr<const cppjieba::HMMModel>;
 
+// Split the dictionary's existing 16x planning allowance between its shared
+// parsed entries and each tokenizer's trie/loader workspace. The HMM model is
+// shared in full. These are planning allowances for ordinary heap backing.
+constexpr size_t kEmbeddedJiebaDictionaryMultiplier = 8;
+constexpr size_t kEmbeddedJiebaModelMultiplier = 16;
+
 // Lazily decompress and parse each default resource once. The returned data
-// is immutable and shared; the decompressed text is released after parsing.
+// is immutable and shared and retains its own budget through cache lifetime;
+// the decompressed text is released after parsing.
 Result<EmbeddedJiebaDict> get_embedded_jieba_dict();
 Result<EmbeddedJiebaHmmModel> get_embedded_jieba_hmm_model();
 

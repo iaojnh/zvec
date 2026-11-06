@@ -132,10 +132,11 @@ Status JiebaTokenizer::init(const ailego::JsonObject &config) {
       return Status::OK();
     };
     if (dict_dir.empty()) {
+      // Shared defaults retain their own allowance after this tokenizer dies.
+      // Only trie construction/backing is per instance; the HMM is shared.
       if (needs_dict)
-        dictionary_memory_.add_array(embedded_jieba_dict_bytes(), 16);
-      if (needs_model)
-        dictionary_memory_.add_array(embedded_jieba_hmm_model_bytes(), 16);
+        dictionary_memory_.add_array(embedded_jieba_dict_bytes(),
+                                     kEmbeddedJiebaDictionaryMultiplier);
     } else {
       for (const auto &path : {dict_path, model_path}) {
         if (path.empty()) continue;
@@ -165,8 +166,19 @@ Status JiebaTokenizer::init(const ailego::JsonObject &config) {
         dict_trie_ =
             std::make_unique<cppjieba::DictTrie>(**dict, user_dict_path);
       } else {
+        // The path constructor retains every dictionary in a process-wide
+        // cache. Load through the stream API instead so the final tokenizer
+        // releases external entries together with their instance allowance.
+        std::ifstream stream;
+        cppjieba::OpenInputFile(stream, dict_path);
+        if (!stream.is_open()) {
+          reset();
+          return Status::InvalidArgument("Cannot read Jieba dictionary: ",
+                                         dict_path);
+        }
+        auto entries = cppjieba::DictTrie::LoadDict(stream);
         dict_trie_ =
-            std::make_unique<cppjieba::DictTrie>(dict_path, user_dict_path);
+            std::make_unique<cppjieba::DictTrie>(entries, user_dict_path);
       }
     }
     if (needs_model) {

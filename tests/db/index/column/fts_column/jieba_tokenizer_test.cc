@@ -145,6 +145,116 @@ class JiebaEmbeddedTokenizerTest : public ::testing::Test {
   bool had_env_{false};
 };
 
+TEST(JiebaDictionaryDeathTest, EmbeddedBackingRemainsAdmittedAfterClose) {
+#if GTEST_HAS_DEATH_TEST
+  const auto previous = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  for (const char *mode : {"full", "hmm"}) {
+    EXPECT_EXIT(
+        {
+          if (set_dict_env(nullptr) != 0) std::_Exit(1);
+          auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+          if (pool.init(256UL << 20) != 0) std::_Exit(2);
+          const auto before = pool.external_used();
+          size_t live = 0;
+          {
+            JiebaTokenizer tokenizer;
+            if (!tokenizer.init(make_config(mode)).ok()) std::_Exit(3);
+            live = pool.external_used();
+            if (tokenizer.tokenize("中文分词技术").empty()) std::_Exit(4);
+          }
+          const auto cached = pool.external_used();
+          if (cached <= before || cached >= live) std::_Exit(5);
+          {
+            JiebaTokenizer reopened;
+            if (!reopened.init(make_config(mode)).ok()) std::_Exit(6);
+            if (pool.external_used() != live) std::_Exit(7);
+          }
+          if (pool.external_used() != cached) std::_Exit(8);
+          std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0), "");
+  }
+  ::testing::FLAGS_gtest_death_test_style = previous;
+#else
+  GTEST_SKIP() << "Process isolation is unavailable";
+#endif
+}
+
+TEST(JiebaDictionaryDeathTest, FailedSharedAdmissionCanRetry) {
+#if GTEST_HAS_DEATH_TEST
+  const auto previous = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  for (bool model : {false, true}) {
+    EXPECT_EXIT(
+        {
+          auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+          // Leave enough room for process eviction-queue metadata, but not
+          // either default resource's expanded planning allowance.
+          if (zvec::ailego::PoolPayloadBudget::get_instance().init(1UL << 20) !=
+              0)
+            std::_Exit(1);
+          const auto before = pool.external_used();
+          bool rejected = false;
+          try {
+            if (model)
+              (void)zvec::fts::get_embedded_jieba_hmm_model();
+            else
+              (void)zvec::fts::get_embedded_jieba_dict();
+          } catch (const std::bad_alloc &) {
+            rejected = true;
+          }
+          if (!rejected || pool.external_used() != before) std::_Exit(2);
+          if (pool.init(256UL << 20) != 0) std::_Exit(3);
+          if (model) {
+            const auto first = zvec::fts::get_embedded_jieba_hmm_model();
+            const auto second = zvec::fts::get_embedded_jieba_hmm_model();
+            if (!first || !second || first.value() != second.value())
+              std::_Exit(4);
+          } else {
+            const auto first = zvec::fts::get_embedded_jieba_dict();
+            const auto second = zvec::fts::get_embedded_jieba_dict();
+            if (!first || !second || first.value() != second.value())
+              std::_Exit(5);
+          }
+          if (pool.external_used() <= before) std::_Exit(6);
+          std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0), "");
+  }
+  ::testing::FLAGS_gtest_death_test_style = previous;
+#else
+  GTEST_SKIP() << "Process isolation is unavailable";
+#endif
+}
+
+TEST_F(JiebaEmbeddedTokenizerTest, ExternalDictionaryDoesNotRemainInPathCache) {
+  const auto path = temp_dir_ / "jieba.dict.utf8";
+  {
+    std::ofstream output(path);
+    output << "甲乙丙丁 100 n\n";
+  }
+  const auto config = make_config("full", temp_dir_.string());
+  {
+    JiebaTokenizer first;
+    ASSERT_TRUE(first.init(config).ok());
+    EXPECT_TRUE(contains_token(first.tokenize("甲乙丙丁"), "甲乙丙丁"));
+  }
+  // A closed external dictionary must not survive in cppjieba's process-wide
+  // path cache. Reopening reads the current file, without accumulating an
+  // immortal dictionary for every distinct configured path.
+  {
+    std::ofstream output(path);
+    output << "甲乙 100 n\n丙丁 100 n\n";
+  }
+  JiebaTokenizer reopened;
+  ASSERT_TRUE(reopened.init(config).ok());
+  const auto tokens = reopened.tokenize("甲乙丙丁");
+  EXPECT_FALSE(contains_token(tokens, "甲乙丙丁"));
+  EXPECT_TRUE(contains_token(tokens, "甲乙"));
+  EXPECT_TRUE(contains_token(tokens, "丙丁"));
+}
+
 TEST_F(JiebaEmbeddedTokenizerTest, RejectsInsufficientDictionaryAllowance) {
   auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
   const size_t previous = pool.capacity();

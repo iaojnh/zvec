@@ -19,12 +19,22 @@
 #include <limits>
 #include <streambuf>
 #include <string>
+#include <vector>
+#include <zvec/ailego/buffer/memory_reservation.h>
 
 namespace zvec::fts {
 namespace {
 
 #include "jieba_dict_lz4.inc"
 #include "jieba_hmm_model_lz4.inc"
+
+// The cache outlives tokenizer instances. Destroy the parsed payload before
+// refunding its allowance, including during static teardown and failed loads.
+template <typename T>
+struct CachedResource {
+  ailego::MemoryReservation memory;
+  std::shared_ptr<const T> value;
+};
 
 // Reference the decompressed text without istringstream's C++17 string copy.
 // The caller keeps the text alive until parsing has finished.
@@ -69,14 +79,24 @@ size_t embedded_jieba_hmm_model_bytes() {
 Result<EmbeddedJiebaDict> get_embedded_jieba_dict() {
   static const Result<EmbeddedJiebaDict> dict =
       []() -> Result<EmbeddedJiebaDict> {
+    auto owner =
+        std::make_shared<CachedResource<std::vector<cppjieba::DictUnit>>>();
+    owner->memory.add_array(embedded_jieba_dict_bytes(),
+                            kEmbeddedJiebaDictionaryMultiplier);
     auto text = decompress(kJiebaDictLz4, kJiebaDictLz4OriginalSize);
     if (!text) {
       return tl::make_unexpected(text.error());
     }
     MemoryInputBuffer buffer(*text);
     std::istream stream(&buffer);
+    auto entries = cppjieba::DictTrie::LoadDict(stream);
+    owner->value = std::move(entries.node_infos);
+    // DictTrie retains node_infos, not the DictCacheEntry. Let those aliases
+    // retain admission too, even if a tokenizer outlives static cache teardown.
+    entries.node_infos =
+        decltype(entries.node_infos)(owner, owner->value.get());
     return std::make_shared<const cppjieba::DictTrie::DictCacheEntry>(
-        cppjieba::DictTrie::LoadDict(stream));
+        std::move(entries));
   }();
   return dict;
 }
@@ -84,13 +104,17 @@ Result<EmbeddedJiebaDict> get_embedded_jieba_dict() {
 Result<EmbeddedJiebaHmmModel> get_embedded_jieba_hmm_model() {
   static const Result<EmbeddedJiebaHmmModel> model =
       []() -> Result<EmbeddedJiebaHmmModel> {
+    auto owner = std::make_shared<CachedResource<cppjieba::HMMModel>>();
+    owner->memory.add_array(embedded_jieba_hmm_model_bytes(),
+                            kEmbeddedJiebaModelMultiplier);
     auto text = decompress(kJiebaHmmModelLz4, kJiebaHmmModelLz4OriginalSize);
     if (!text) {
       return tl::make_unexpected(text.error());
     }
     MemoryInputBuffer buffer(*text);
     std::istream stream(&buffer);
-    return std::make_shared<const cppjieba::HMMModel>(stream);
+    owner->value = std::make_shared<const cppjieba::HMMModel>(stream);
+    return EmbeddedJiebaHmmModel(owner, owner->value.get());
   }();
   return model;
 }
