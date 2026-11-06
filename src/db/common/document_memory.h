@@ -8,6 +8,10 @@
 namespace zvec::detail {
 
 struct DocumentMemoryAccess {
+  static const Doc::Value *find_field(const Doc &doc, const std::string &name) {
+    const auto it = doc.fields_.find(name);
+    return it == doc.fields_.end() ? nullptr : &it->second;
+  }
   static void retain(Doc &doc, std::shared_ptr<void> memory) {
     doc.memory_owner_ = std::move(memory);
   }

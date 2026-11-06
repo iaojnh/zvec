@@ -12,6 +12,7 @@
 #include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/collection.h>
 #include "common/memory_budget_test_helper.h"
 #include "db/common/file_helper.h"
@@ -97,6 +98,52 @@ TEST_F(CollectionWriteBudgetTest, RejectsBeforeCreatingCollectionFiles) {
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, result.error().code());
   EXPECT_FALSE(std::filesystem::exists(path("denied")));
+}
+
+TEST_F(CollectionWriteBudgetTest, InvertedArrayDenialPreservesExistingDocument) {
+  CollectionSchema with_terms("array_write_budget");
+  ASSERT_TRUE(with_terms.add_field(std::make_shared<FieldSchema>(
+      "terms", DataType::ARRAY_INT32, false,
+      std::make_shared<InvertIndexParams>(false))).ok());
+  auto writer = Collection::CreateAndOpen(path("terms"), with_terms,
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer) << writer.error().message();
+  std::vector<Doc> batch(1);
+  batch[0].set_pk("existing");
+  const std::vector<int32_t> original{1, 2};
+  batch[0].set("terms", original);
+  auto inserted = writer.value()->insert(batch);
+  ASSERT_TRUE(inserted);
+  ASSERT_TRUE(inserted->front().ok()) << inserted->front().message();
+
+  const std::vector<int32_t> expanded(16384, 3);
+  batch[0].set("terms", expanded);
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool_.capacity() - pool_.used() - 2 * kMiB);
+    auto denied = writer.value()->upsert(batch);
+    ASSERT_TRUE(denied);
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied->front().code());
+    EXPECT_EQ(0u, denied->front().message().find("Insufficient inverted array"));
+  }
+  auto fetched = writer.value()->fetch({"existing"});
+  ASSERT_TRUE(fetched);
+  ASSERT_NE(nullptr, fetched->at("existing"));
+  EXPECT_EQ(original, fetched->at("existing")->get_ref<std::vector<int32_t>>(
+                          "terms"));
+  fetched->clear();
+
+  auto updated = writer.value()->upsert(batch);
+  ASSERT_TRUE(updated);
+  ASSERT_TRUE(updated->front().ok()) << updated->front().message();
+  ASSERT_TRUE(writer.value()->optimize(OptimizeOptions{1}).ok());
+  fetched = writer.value()->fetch({"existing"});
+  ASSERT_TRUE(fetched);
+  ASSERT_NE(nullptr, fetched->at("existing"));
+  EXPECT_EQ(expanded, fetched->at("existing")->get_ref<std::vector<int32_t>>(
+                          "terms"));
+  fetched->clear();
+  ASSERT_TRUE(writer.value()->close().ok());
 }
 
 TEST_F(CollectionWriteBudgetTest, DefaultBufferReturnsManagedPeakAfterFlush) {

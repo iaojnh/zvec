@@ -35,6 +35,7 @@
 #include "db/index/column/fts_column/fts_rocksdb_reducer.h"
 #include "db/index/column/fts_column/fts_types.h"
 #include "db/index/column/inverted_column/inverted_indexer.h"
+#include "db/index/column/inverted_column/inverted_write_memory.h"
 #include "db/index/column/vector_column/engine_helper.hpp"
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/common/index_filter.h"
@@ -285,7 +286,8 @@ Status SegmentHelper::ReduceScalar(
 
       // invert index
       if (invert_indexer) {
-        auto s = ReduceScalarIndex(invert_indexer, filtered_batch, *doc_count);
+        auto s = ReduceScalarIndex(invert_indexer, filtered_batch, *doc_count,
+                                   forward_use_parquet);
         CHECK_RETURN_STATUS(s);
       }
 
@@ -335,7 +337,8 @@ Status SegmentHelper::ReduceScalar(
 
 Status SegmentHelper::ReduceScalarIndex(
     InvertedIndexer::Ptr invert_indexer,
-    const std::shared_ptr<arrow::RecordBatch> &batch, uint32_t doc_id_offset) {
+    const std::shared_ptr<arrow::RecordBatch> &batch, uint32_t doc_id_offset,
+    bool budgeted) try {
   auto a_schema = batch->schema();
   int num_columns = batch->num_columns();
 
@@ -496,6 +499,22 @@ Status SegmentHelper::ReduceScalarIndex(
 
           int32_t start_offset = typed_offsets->Value(j);
           int32_t end_offset = typed_offsets->Value(j + 1);
+          ailego::MemoryReservation workspace;
+          if (budgeted) {
+            const size_t count = end_offset - start_offset;
+            if (value_type_id == arrow::Type::BOOL) {
+              workspace.add((count + 7) / 8 * 3 + 64);
+            } else {
+              size_t bytes = detail::BindingMemoryBytes(count, sizeof(double));
+              if (value_type_id == arrow::Type::STRING) {
+                const auto &strings =
+                    static_cast<const arrow::StringArray &>(*value_array);
+                bytes = strings.value_offset(end_offset) -
+                        strings.value_offset(start_offset);
+              }
+              workspace.add(detail::InvertedArrayWriteBytes(count, bytes));
+            }
+          }
 
           switch (value_type_id) {
             case arrow::Type::BOOL: {
@@ -645,6 +664,9 @@ Status SegmentHelper::ReduceScalarIndex(
   }
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient inverted array compaction workspace budget");
 }
 
 Status SegmentHelper::ReduceVectorIndex(

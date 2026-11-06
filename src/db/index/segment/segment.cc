@@ -38,6 +38,7 @@
 #include <zvec/db/status.h>
 #include <zvec/db/type.h>
 #include "db/common/query_result_memory.h"
+#include "db/common/document_memory.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #if RABITQ_SUPPORTED
 #include "core/algorithm/hnsw_rabitq/rabitq_params.h"
@@ -49,6 +50,7 @@
 #include "db/index/column/fts_column/fts_column_indexer.h"
 #include "db/index/column/fts_column/fts_indexer.h"
 #include "db/index/column/inverted_column/inverted_indexer.h"
+#include "db/index/column/inverted_column/inverted_write_memory.h"
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "db/index/common/doc_field_converter.h"
@@ -358,7 +360,10 @@ class SegmentImpl : public Segment,
   Status insert_fts_indexer(Doc &doc,
                             const detail::FtsWriteAdmission &admission);
   Status insert_vector_indexer(Doc &doc);
-  using PreparedForward = std::unique_ptr<MemForwardStore::PreparedInsert>;
+  struct PreparedForward {
+    ailego::MemoryReservation scalar_memory;
+    std::unique_ptr<MemForwardStore::PreparedInsert> forward;
+  };
   Result<PreparedForward> prepare_forward_write(const Doc &doc);
   Status internal_insert(Doc &doc, const detail::FtsWriteAdmission &admission,
                          PreparedForward prepared);
@@ -747,27 +752,28 @@ template <typename ValueType>
 Status SegmentImpl::insert_scalar(InvertedColumnIndexer::Ptr &indexer,
                                   const Doc &doc,
                                   const FieldSchema::Ptr &field) {
-  auto value = doc.get<ValueType>(field->name());
+  const auto *value = std::get_if<ValueType>(
+      detail::DocumentMemoryAccess::find_field(doc, field->name()));
   auto segment_doc_id = doc_ids_.size();
-  if (value.has_value()) {
+  if (value) {
     if constexpr (std::is_same_v<ValueType, std::vector<bool>>) {
-      return indexer->insert(segment_doc_id, value.value());
+      return indexer->insert(segment_doc_id, *value);
     } else if constexpr (std::is_same_v<ValueType, std::vector<std::string>>) {
-      return indexer->insert(segment_doc_id, value.value());
+      return indexer->insert(segment_doc_id, *value);
     } else if constexpr (IsVector<ValueType>::value) {
-      const auto &vec = value.value();
+      const auto &vec = *value;
       std::string value_str(
           reinterpret_cast<const char *>(vec.data()),
           vec.size() * sizeof(typename ValueType::value_type));
       return indexer->insert(segment_doc_id, value_str);
     } else if constexpr (std::is_same_v<ValueType, std::string>) {
-      const ValueType &val = value.value();
+      const ValueType &val = *value;
       return indexer->insert(segment_doc_id, val);
     } else if constexpr (std::is_same_v<ValueType, bool>) {
-      const ValueType &val = value.value();
+      const ValueType &val = *value;
       return indexer->insert(segment_doc_id, val);
     } else {
-      const ValueType &val = value.value();
+      const ValueType &val = *value;
       std::string value_str(reinterpret_cast<const char *>(&val),
                             sizeof(ValueType));
       return indexer->insert(segment_doc_id, value_str);
@@ -985,6 +991,44 @@ Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
   if (doc.serialized_size() > WalFile::kMaxRecordSize)
     return tl::make_unexpected(
         Status::InvalidArgument("WAL document exceeds record size limit"));
+  PreparedForward prepared;
+  if (uses_buffer_storage()) {
+    try {
+      size_t peak = 0;
+      for (const auto &field : collection_schema_->forward_fields()) {
+        if (field->index_type() != IndexType::INVERT || !field->is_array_type())
+          continue;
+        const auto *value =
+            detail::DocumentMemoryAccess::find_field(doc, field->name());
+        if (!value) continue;
+        const size_t bytes = std::visit(
+            [](const auto &items) -> size_t {
+              using T = std::decay_t<decltype(items)>;
+              if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+                size_t payload = 0;
+                for (const auto &item : items)
+                  payload = detail::BindingMemoryBytes(1, item.size(), payload);
+                return detail::InvertedArrayWriteBytes(items.size(), payload);
+              } else if constexpr (IsVector<T>::value &&
+                                   !std::is_same_v<T, std::vector<bool>>) {
+                return detail::InvertedArrayWriteBytes(
+                    items.size(), detail::BindingMemoryBytes(
+                                      items.size(), sizeof(typename T::value_type)));
+              }
+              return 0;
+            },
+            *value);
+        peak = std::max(peak, bytes);
+      }
+      // Each field finishes its write before the next field starts. Hold the
+      // peak across WAL append and publication so refusal precedes mutation.
+      prepared.scalar_memory.add(peak);
+    } catch (const std::bad_alloc &) {
+      return tl::make_unexpected(Status(
+          StatusCode::RESOURCE_EXHAUSTED,
+          "Insufficient inverted array write workspace budget before mutation"));
+    }
+  }
   if (ready_for_dump_block()) {
     auto status = flush();
     if (!status.ok()) return tl::make_unexpected(status);
@@ -998,7 +1042,10 @@ Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
   if (!status.ok()) return tl::make_unexpected(status);
   // Do not modify doc.doc_id(): UPDATE's WAL still needs the previous ID.
   // Budgeted Arrow allocation must finish before recording/publishing a write.
-  return memory_store_->prepare_insert(doc, next_id);
+  auto forward = memory_store_->prepare_insert(doc, next_id);
+  if (!forward) return tl::make_unexpected(forward.error());
+  prepared.forward = std::move(*forward);
+  return prepared;
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(
       Status(StatusCode::RESOURCE_EXHAUSTED,
@@ -1016,7 +1063,7 @@ Status SegmentImpl::internal_insert(Doc &doc,
   CHECK_RETURN_STATUS(s);
 
   // write forward
-  memory_store_->commit_insert(std::move(prepared));
+  memory_store_->commit_insert(std::move(prepared.forward));
 
   // write scalar index
   s = insert_scalar_indexer(doc);
@@ -2388,6 +2435,11 @@ Status SegmentImpl::create_scalar_index(const std::vector<std::string> &columns,
   std::string new_invert_index_path =
       FileHelper::MakeInvertIndexPath(path_, id(), block_id);
 
+  bool index_ready = false;
+  AILEGO_DEFER([&] {
+    if (!index_ready) FileHelper::RemoveDirectory(new_invert_index_path);
+  });
+
   Status s;
   InvertedIndexer::Ptr new_scalar_indexer{nullptr};
   if (invert_indexers_) {
@@ -2449,7 +2501,7 @@ Status SegmentImpl::create_scalar_index(const std::vector<std::string> &columns,
     }
 
     s = SegmentHelper::ReduceScalarIndex(new_scalar_indexer, batch_value,
-                                         accu_doc_count);
+                                         accu_doc_count, uses_buffer_storage());
     if (!s.ok()) {
       LOG_ERROR("Reduce Scalar Index failed, err: %s", s.message().c_str());
     }
@@ -2469,6 +2521,7 @@ Status SegmentImpl::create_scalar_index(const std::vector<std::string> &columns,
 
   *segment_meta = new_segment_meta;
   *scalar_indexer = new_scalar_indexer;
+  index_ready = true;
 
   return Status::OK();
 }

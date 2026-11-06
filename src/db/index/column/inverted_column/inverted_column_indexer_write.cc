@@ -42,7 +42,7 @@ Status InvertedColumnIndexer::insert(uint32_t id, const std::string &value) {
     std::vector<std::string> encoded_values = encode_array(value);
     std::sort(encoded_values.begin(), encoded_values.end());
     rocksdb::WriteBatch write_batch;
-    for (auto encoded_value : encoded_values) {
+    for (const auto &encoded_value : encoded_values) {
       s = write_batch.Merge(cf_terms_, encoded_value, encoded_id);
       if (!s.ok()) {
         return Status::InternalError();
@@ -97,7 +97,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
 
   std::sort(encoded_values.begin(), encoded_values.end());
   rocksdb::WriteBatch write_batch;
-  for (auto encoded_value : encoded_values) {
+  for (const auto &encoded_value : encoded_values) {
     s = write_batch.Merge(cf_terms_, encoded_value, encoded_id);
     if (!s.ok()) {
       return Status::InternalError();

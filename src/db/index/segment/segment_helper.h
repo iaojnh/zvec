@@ -271,7 +271,8 @@ class SegmentHelper {
 
   static Status ReduceScalarIndex(
       InvertedIndexer::Ptr indexer,
-      const std::shared_ptr<arrow::RecordBatch> &batch, uint32_t doc_id_offset);
+      const std::shared_ptr<arrow::RecordBatch> &batch, uint32_t doc_id_offset,
+      bool budgeted);
 
   static Status ReduceVectorIndex(
       const CollectionSchema::Ptr schema,
