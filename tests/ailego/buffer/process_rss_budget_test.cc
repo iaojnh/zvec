@@ -328,6 +328,46 @@ TEST(ProcessRssBudgetTest, ReleasedBackingCannotCoverNewBackingBeforeSample) {
   budget.release(100 * kMiB);
 }
 
+TEST(ProcessRssBudgetTest, FailedAllocationAttemptsKeepResidentOverlap) {
+  constexpr size_t limit = 1000 * kMiB;
+  constexpr size_t request = 12 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    ProcessRssBudget budget;
+    native_sample_valid = true;
+    auto sample = [&](size_t bytes) {
+      sampled_rss = use_native_sample ? 32 * kMiB : bytes;
+      native_sample = {bytes, limit - bytes};
+    };
+    sample(600 * kMiB);
+    ASSERT_TRUE(budget.configure(limit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr));
+    ASSERT_TRUE(budget.try_acquire(300 * kMiB));
+    sample(900 * kMiB);
+    budget.refresh(true);
+    const size_t available =
+        100 * kMiB -
+        (use_native_sample ? ProcessRssBudget::headroom(limit) : 0);
+    for (int i = 0; i < 20; ++i) {
+      ASSERT_TRUE(budget.try_reserve(request));
+      budget.refresh(true);
+      EXPECT_EQ(available - request, budget.available());
+      budget.finish_reservation(request, false);
+      EXPECT_EQ(available, budget.available());
+    }
+    ASSERT_TRUE(budget.try_reserve(request));
+    budget.finish_reservation(request, true);
+    EXPECT_EQ(available - request, budget.available());
+    sample(900 * kMiB + request);
+    budget.refresh(true);
+    budget.release(request);
+    sample(900 * kMiB);
+    budget.refresh(true);
+    EXPECT_EQ(available, budget.available());
+    budget.release(300 * kMiB);
+  }
+}
+
 TEST(ProcessRssBudgetTest, BaselineCanRecoverAfterStartupMemoryRetires) {
   ProcessRssBudget budget;
   budget.account(100 * kMiB);  // Already present when the guard is enabled.

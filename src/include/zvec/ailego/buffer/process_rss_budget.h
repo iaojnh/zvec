@@ -73,17 +73,21 @@ class ProcessRssBudget {
   // faulted in. Sampling must not repeatedly admit the same unused headroom.
   // Existing backing reused by the pool is already included in this ledger.
   bool try_acquire(size_t bytes) {
+    return try_charge(bytes, backing_);
+  }
+
+  // Reserve for an OS allocation that has yet to return. Samples cannot
+  // assign these bytes to resident backing before the allocation succeeds.
+  bool try_reserve(size_t bytes) {
+    return try_charge(bytes, pending_allocations_);
+  }
+
+  void finish_reservation(size_t bytes, bool allocated) {
     std::lock_guard<std::mutex> lock(mutex_);
-    refresh_locked(false);
-    const size_t available = available_.load(std::memory_order_relaxed);
-    if (bytes > available ||
-        bytes > std::numeric_limits<size_t>::max() - backing_) {
-      if (limit()) pressure_.store(true, std::memory_order_relaxed);
-      return false;
-    }
-    backing_ += bytes;
+    assert(bytes <= pending_allocations_);
+    pending_allocations_ -= bytes;
+    if (allocated) backing_ += bytes;
     update_available();
-    return true;
   }
 
   // Some consumers (RocksDB's block reader) cannot safely reject allocation
@@ -91,7 +95,8 @@ class ProcessRssBudget {
   // in the process estimate so other consumers stop growing under pressure.
   void account(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
-    assert(bytes <= std::numeric_limits<size_t>::max() - backing_);
+    assert(bytes <=
+           std::numeric_limits<size_t>::max() - backing_ - pending_allocations_);
     backing_ += bytes;
     update_available();
   }
@@ -153,6 +158,21 @@ class ProcessRssBudget {
   }
 
  private:
+  bool try_charge(size_t bytes, size_t &counter) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    refresh_locked(false);
+    const size_t ledger_available =
+        std::numeric_limits<size_t>::max() - backing_ - pending_allocations_;
+    if (bytes > available_.load(std::memory_order_relaxed) ||
+        bytes > ledger_available) {
+      if (limit()) pressure_.store(true, std::memory_order_relaxed);
+      return false;
+    }
+    counter += bytes;
+    update_available();
+    return true;
+  }
+
   void refresh_locked(bool force) {
     if (!limit()) return;
     const auto now = std::chrono::steady_clock::now();
@@ -288,12 +308,14 @@ class ProcessRssBudget {
     // Take the larger estimate, never add managed bytes to measured RSS.
     // The lifetime estimate preserves lazy allocations across samples; the
     // latest sample catches host growth and includes subsequent admissions.
-    const size_t usage = estimate_.usage(backing_);
+    const size_t usage =
+        add_saturated(estimate_.usage(backing_), pending_allocations_);
     size_t available = cap ? (usage < cap ? cap - usage : 0)
                            : std::numeric_limits<size_t>::max();
     if (cap && native_reader_) {
       const size_t native_cap = std::min(cap, native_limit_);
-      const size_t native_usage = native_estimate_.usage(backing_);
+      const size_t native_usage =
+          add_saturated(native_estimate_.usage(backing_), pending_allocations_);
       const size_t remaining =
           native_usage < native_cap ? native_cap - native_usage : 0;
       // Keep a reserve below the OS application limit even for mandatory work.
@@ -317,6 +339,7 @@ class ProcessRssBudget {
   std::mutex mutex_;
   Reader reader_{nullptr};
   size_t backing_{0};
+  size_t pending_allocations_{0};
   Estimate estimate_;
   Estimate native_estimate_;
   NativeReader native_reader_{nullptr};

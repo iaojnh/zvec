@@ -477,6 +477,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   struct RetainedBlock;
   struct QueueAllocationHeader;
   struct QueueMemorySlab;
+  enum class Backing { kLive, kPending };
 
   MemoryLimitPool() = default;
   ~MemoryLimitPool();
@@ -486,9 +487,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void free_queue_memory(void *ptr);
   bool try_reserve_used(size_t bytes);
   bool try_reserve_page_used(size_t bytes);
-  bool try_reserve_committed(size_t bytes);
-  size_t release_committed(size_t bytes);
-  bool try_reserve_allocation(size_t bytes);
+  bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive);
+  size_t release_committed(size_t bytes, Backing backing = Backing::kLive);
+  bool try_reserve_allocation(size_t bytes, Backing backing = Backing::kLive);
   bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,
                                bool page_admission);
   size_t page_admission_limit() const {
@@ -500,9 +501,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
         workspace_waiting_size_.load(std::memory_order_relaxed);
     return capacity - std::min(capacity, std::max(remaining, waiting));
   }
-  bool try_charge_fixed(size_t bytes, std::atomic<size_t> *counter);
-  bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter);
-  void release_fixed(size_t bytes, std::atomic<size_t> *counter);
+  bool try_charge_fixed(size_t bytes, std::atomic<size_t> *counter,
+                        Backing backing = Backing::kLive);
+  bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter,
+                                  Backing backing = Backing::kLive);
+  void release_fixed(size_t bytes, std::atomic<size_t> *counter,
+                     Backing backing = Backing::kLive);
   bool is_cacheable_buffer_size(size_t buffer_size);
   char *pop_free_buffer(size_t start_shard);
   void push_free_buffer(char *buffer, size_t shard);
