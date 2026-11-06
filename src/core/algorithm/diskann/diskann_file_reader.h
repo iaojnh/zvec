@@ -46,6 +46,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/io/io_backend.h>
 #include <zvec/core/framework/index_context.h>
 #include "diskann_util.h"
@@ -69,6 +70,7 @@ namespace core {
 // one context from consuming another context's completions.
 // IOContext is a pointer to IoBackend; nullptr means uninitialised.
 struct IoBackend {
+  ailego::MemoryReservation memory;
   ailego::IOBackendType type{ailego::IOBackendType::kPread};
 
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -119,11 +121,12 @@ struct AlignedRead {
 
 struct PendingBatch {
 #if defined(__linux__) && !defined(__ANDROID__)
-  std::vector<struct iocb> cbs;
-  std::vector<struct iocb *> cb_ptrs;
+  ailego::BudgetedVector<struct iocb> cbs;
+  ailego::BudgetedVector<struct iocb *> cb_ptrs;
+  ailego::BudgetedVector<struct io_event> events;
 #elif defined(_WIN32) || defined(_WIN64)
-  std::vector<uint64_t> expected_lengths;
-  std::vector<uint8_t> completed;
+  std::array<uint64_t, MAX_IO_DEPTH> expected_lengths;
+  std::array<uint8_t, MAX_IO_DEPTH> completed;
   uint64_t generation{0};
 #endif
   uint32_t n_submitted{0};

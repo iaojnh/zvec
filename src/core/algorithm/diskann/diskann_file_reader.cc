@@ -232,11 +232,17 @@ static void close_windows_io_handles(IOContext ctx) {
 
 int setup_io_ctx(IOContext &ctx) {
   auto selected = ailego::IOBackend::Instance().available();
-  ctx = new (std::nothrow) IoBackend();
-  if (ctx == nullptr) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ailego::MemoryReservation memory;
+  try {
+    memory.add_for_allocation(pool.process_rss_limit() ? sizeof(IoBackend) : 0,
+                              [&] { ctx = new IoBackend(); });
+  } catch (const std::bad_alloc &) {
+    ctx = nullptr;
     LOG_ERROR("Failed to allocate DiskAnn I/O context");
     return IndexError_NoMemory;
   }
+  ctx->memory = std::move(memory);
   ctx->type = selected;
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -298,6 +304,7 @@ int destroy_io_ctx(IOContext &ctx) {
   // IoUringRing destructor also calls teardown() — idempotent and safe.
 #endif
 
+  auto memory = std::move(ctx->memory);
   delete ctx;
   ctx = nullptr;
   return 0;
@@ -382,15 +389,25 @@ static bool reset_aio_context(io_context_t &ctx) {
 
 int execute_io_libaio(io_context_t &ctx, int fd,
                       std::vector<AlignedRead> &read_reqs, uint64_t n_retries) {
-  uint64_t iters = DiskAnnUtil::div_round_up(read_reqs.size(), MAX_EVENTS);
+  if (ctx == nullptr) return execute_io_pread(fd, read_reqs);
+  const size_t batch_size = std::min<size_t>(read_reqs.size(), MAX_EVENTS);
+  ailego::BudgetedVector<iocb_t *> cbs;
+  ailego::BudgetedVector<io_event_t> evts;
+  ailego::BudgetedVector<struct iocb> cb;
+  ailego::BudgetedVector<uint8_t> seen;
+  try {
+    cbs.resize(batch_size);
+    evts.resize(batch_size);
+    cb.resize(batch_size);
+    seen.resize(batch_size);
+  } catch (const std::bad_alloc &) {
+    return execute_io_pread(fd, read_reqs);
+  }
 
+  const uint64_t iters = DiskAnnUtil::div_round_up(read_reqs.size(), MAX_EVENTS);
   for (uint64_t iter = 0; iter < iters; iter++) {
-    uint64_t n_ops = std::min((uint64_t)read_reqs.size() - (iter * MAX_EVENTS),
-                              (uint64_t)MAX_EVENTS);
-
-    std::vector<iocb_t *> cbs(n_ops, nullptr);
-    std::vector<io_event_t> evts(n_ops);
-    std::vector<struct iocb> cb(n_ops);
+    const size_t n_ops =
+        std::min<size_t>(read_reqs.size() - iter * MAX_EVENTS, MAX_EVENTS);
     for (uint64_t j = 0; j < n_ops; j++) {
       io_prep_pread(cb.data() + j, fd, read_reqs[j + iter * MAX_EVENTS].buf,
                     read_reqs[j + iter * MAX_EVENTS].len,
@@ -464,7 +481,7 @@ int execute_io_libaio(io_context_t &ctx, int fd,
     // Phase 3: verify every harvested event. Completion order is unspecified,
     // so use io_event::obj instead of assuming it matches request order.
     bool all_ok = true;
-    std::vector<bool> seen(submitted, false);
+    std::fill_n(seen.begin(), submitted, 0);
     for (size_t i = 0; i < completed; i++) {
       auto cb_it = std::find(cbs.begin(), cbs.begin() + submitted, evts[i].obj);
       if (cb_it == cbs.begin() + submitted) {
@@ -861,8 +878,9 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
     // one page exceeds its budget. Keep batched direct I/O in this case and
     // never enter page-cache operations that require initialized entries.
     if (!pool_->cache_enabled()) {
-      if (ctx == nullptr && setup_io_ctx(ctx) != 0) {
-        return IndexError_Runtime;
+      if (ctx == nullptr) {
+        const int status = setup_io_ctx(ctx);
+        if (status != 0) return status;
       }
       const int ret = bypass_reader_.read(read_reqs, ctx);
       if (ret == 0) {
@@ -873,6 +891,19 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
       return ret;
     }
 
+    // At most one page entry, occurrence, admission slot and bypass request
+    // per page occurrence. Admit the whole plan before allocating or pinning.
+    ailego::MemoryReservation plan_memory;
+    if (ailego::MemoryLimitPool::get_instance().process_rss_limit()) {
+      constexpr size_t kBytesPerPage =
+          sizeof(UniquePage) + sizeof(PageOccurrence) +
+          sizeof(ailego::block_id_t) + sizeof(size_t) + sizeof(char *) +
+          sizeof(AlignedRead);
+      if (total_pages > std::numeric_limits<size_t>::max() / kBytesPerPage)
+        return IndexError_NoMemory;
+      const size_t bytes = total_pages * kBytesPerPage;
+      plan_memory.add(bytes, bytes);
+    }
     std::vector<UniquePage> unique_pages;
     std::vector<PageOccurrence> occurrences;
     unique_pages.reserve(total_pages);
@@ -1028,8 +1059,9 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
     flush_bypass_run();
 
     if (!bypass_requests.empty()) {
-      if (ctx == nullptr && setup_io_ctx(ctx) != 0) {
-        return IndexError_Runtime;
+      if (ctx == nullptr) {
+        const int status = setup_io_ctx(ctx);
+        if (status != 0) return status;
       }
       const int read_ret = bypass_reader_.read(bypass_requests, ctx);
       if (read_ret != 0) {
@@ -1066,9 +1098,8 @@ int BufferPoolAlignedFileReader::submit(PendingBatch &batch,
 #if defined(__linux__) && !defined(__ANDROID__)
   batch.cbs.clear();
   batch.cb_ptrs.clear();
+  batch.events.clear();
 #elif defined(_WIN32) || defined(_WIN64)
-  batch.expected_lengths.clear();
-  batch.completed.clear();
   batch.generation = 0;
 #endif
 
@@ -1106,6 +1137,7 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
   batch.used_pread = false;
   batch.cbs.clear();
   batch.cb_ptrs.clear();
+  batch.events.clear();
 
   if (this->file_desc == -1) {
     LOG_ERROR("submit: invalid file descriptor");
@@ -1116,17 +1148,19 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
     return 0;
   }
 
-  // If this context has no async I/O backend (null context or explicit pread
-  // backend), use synchronous pread.
-  if (ctx == nullptr || ctx->type == ailego::IOBackendType::kPread) {
-    int pread_ret = execute_io_pread(this->file_desc, read_reqs);
-    if (pread_ret != 0) {
-      return pread_ret;
+  if (read_reqs.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+    return IndexError_InvalidArgument;
+  const auto n_ops = static_cast<uint32_t>(read_reqs.size());
+  const auto read_synchronously = [&] {
+    const int ret = execute_io_pread(this->file_desc, read_reqs);
+    if (ret == 0) {
+      batch.used_pread = true;
+      batch.n_submitted = n_ops;
     }
-    batch.used_pread = true;
-    batch.n_submitted = (uint32_t)read_reqs.size();
-    return 0;
-  }
+    return ret;
+  };
+  if (ctx == nullptr || ctx->type == ailego::IOBackendType::kPread)
+    return read_synchronously();
 
   // io_uring only offers a synchronous batched execute(): the reads are
   // already copied into the caller's buffers when it returns, so report the
@@ -1137,19 +1171,26 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
       // The kernel only ever writes into the ring-owned staging pool, so a
       // pread fallback cannot race with requests still in flight.
       LOG_WARN("submit: io_uring execute failed; falling back to pread");
-      int pread_ret = execute_io_pread(this->file_desc, read_reqs);
-      if (pread_ret != 0) {
-        return pread_ret;
-      }
+      return read_synchronously();
     }
     batch.used_pread = true;
-    batch.n_submitted = (uint32_t)read_reqs.size();
+    batch.n_submitted = n_ops;
     return 0;
   }
 
-  uint32_t n_ops = (uint32_t)read_reqs.size();
-  batch.cbs.resize(n_ops);
-  batch.cb_ptrs.resize(n_ops);
+  if (ctx->aio_ctx == nullptr) return read_synchronously();
+  try {
+    batch.cbs.resize(n_ops);
+    batch.cb_ptrs.resize(n_ops);
+    batch.events.resize(n_ops);
+  } catch (const std::bad_alloc &) {
+    // Nothing has been submitted. Free any partial scratch before falling
+    // back to reading directly into the already admitted destinations.
+    decltype(batch.cbs)().swap(batch.cbs);
+    decltype(batch.cb_ptrs)().swap(batch.cb_ptrs);
+    decltype(batch.events)().swap(batch.events);
+    return read_synchronously();
+  }
 
   for (uint32_t j = 0; j < n_ops; j++) {
     io_prep_pread(&batch.cbs[j], this->file_desc, read_reqs[j].buf,
@@ -1199,15 +1240,14 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
       submitted, n_ops, ret);
 
   // Drain every request already in flight before any synchronous read can
-  // reuse its destination buffer, and before batch.cbs may be reused; the
-  // kernel keeps writing through those iocbs until their events are reaped.
-  std::vector<io_event_t> evts(submitted);
+  // reuse its destination buffer. The completion array was admitted before
+  // submission so memory pressure cannot interrupt this drain.
   uint32_t drained = 0;
   while (drained < submitted) {
     uint32_t remaining = submitted - drained;
     ret = LibAioLoader::Instance().io_getevents(
         ctx->aio_ctx, (int64_t)remaining, (int64_t)remaining,
-        evts.data() + drained, nullptr);
+        batch.events.data() + drained, nullptr);
     if (ret > 0 && (uint32_t)ret <= remaining) {
       drained += (uint32_t)ret;
       continue;
@@ -1227,13 +1267,7 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
     break;
   }
 
-  int pread_ret = execute_io_pread(this->file_desc, read_reqs);
-  if (pread_ret != 0) {
-    return pread_ret;
-  }
-  batch.used_pread = true;
-  batch.n_submitted = n_ops;
-  return 0;
+  return read_synchronously();
 }
 
 // Quiesce any requests of the batch still in flight before reporting an
@@ -1270,7 +1304,12 @@ int LinuxAlignedFileReader::get_completed(
   int min_req = std::min((int)n_remaining, min_completed);
   if (min_req < 1) min_req = 1;
 
-  std::vector<io_event_t> evts(n_remaining);
+  try {
+    completed_indices.reserve(n_remaining);
+  } catch (const std::bad_alloc &) {
+    quiesce_batch(batch, ctx);
+    return IndexError_NoMemory;
+  }
   int ret;
   do {
     // Once requests are in flight, EINTR must be retried: returning here
@@ -1278,7 +1317,7 @@ int LinuxAlignedFileReader::get_completed(
     // or leak completion events into the next batch.
     ret = LibAioLoader::Instance().io_getevents(ctx->aio_ctx, (int64_t)min_req,
                                                 (int64_t)n_remaining,
-                                                evts.data(), nullptr);
+                                                batch.events.data(), nullptr);
   } while (ret == -EINTR);
   if (ret < 0) {
     LOG_ERROR("get_completed: io_getevents failed, ret=%d, %s", ret,
@@ -1288,7 +1327,7 @@ int LinuxAlignedFileReader::get_completed(
   }
 
   for (int i = 0; i < ret; i++) {
-    uint32_t idx = (uint32_t)(uintptr_t)evts[i].data;
+    uint32_t idx = (uint32_t)(uintptr_t)batch.events[i].data;
     if (idx >= batch.n_submitted) {
       LOG_ERROR("get_completed: completion referenced an unknown request %u",
                 idx);
@@ -1296,8 +1335,8 @@ int LinuxAlignedFileReader::get_completed(
       quiesce_batch(batch, ctx);
       return IndexError_Runtime;
     }
-    int64_t res = (int64_t)evts[i].res;
-    int64_t res2 = (int64_t)evts[i].res2;
+    int64_t res = (int64_t)batch.events[i].res;
+    int64_t res2 = (int64_t)batch.events[i].res2;
     int64_t expected = (int64_t)batch.cbs[idx].u.c.nbytes;
     if (res != expected || res2 != 0) {
       // The async read failed, so the destination buffer content is
@@ -1561,7 +1600,7 @@ static int validate_windows_read_requests(
 }
 
 int WindowsAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
-                                   IOContext &ctx, bool async) {
+                                   IOContext &ctx, bool async) try {
   if (async) {
     LOG_WARN(
         "read() waits for completion; use submit()/get_completed() for "
@@ -1572,18 +1611,22 @@ int WindowsAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
     return ret;
   }
 
-  std::vector<uint32_t> completed;
-  try {
-    completed.reserve(MAX_IO_DEPTH);
-  } catch (const std::bad_alloc &) {
-    return IndexError_NoMemory;
+  ailego::MemoryReservation memory;
+  const size_t batch_size = std::min<size_t>(read_reqs.size(), MAX_IO_DEPTH);
+  if (ailego::MemoryLimitPool::get_instance().process_rss_limit()) {
+    const size_t bytes = batch_size * (sizeof(AlignedRead) + sizeof(uint32_t));
+    memory.add(bytes, bytes);
   }
+  std::vector<uint32_t> completed;
+  std::vector<AlignedRead> requests;
+  completed.reserve(batch_size);
+  requests.reserve(batch_size);
 
   for (size_t start = 0; start < read_reqs.size(); start += MAX_IO_DEPTH) {
     const size_t count =
         std::min<size_t>(read_reqs.size() - start, MAX_IO_DEPTH);
-    std::vector<AlignedRead> requests(read_reqs.begin() + start,
-                                      read_reqs.begin() + start + count);
+    requests.assign(read_reqs.begin() + start,
+                    read_reqs.begin() + start + count);
     PendingBatch batch;
     ret = submit(batch, requests, ctx);
     if (ret != 0) {
@@ -1598,6 +1641,8 @@ int WindowsAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
     }
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int WindowsAlignedFileReader::submit(PendingBatch &batch,
@@ -1606,8 +1651,6 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
   batch.n_submitted = 0;
   batch.n_reaped = 0;
   batch.used_pread = false;
-  batch.expected_lengths.clear();
-  batch.completed.clear();
   batch.generation = 0;
 
   if (read_reqs.empty()) {
@@ -1636,16 +1679,7 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
     ++ctx->generation;
   }
   batch.generation = ctx->generation;
-  try {
-    batch.expected_lengths.reserve(read_reqs.size());
-    batch.completed.assign(read_reqs.size(), 0);
-  } catch (const std::bad_alloc &) {
-    LOG_ERROR("Failed to allocate Windows IOCP batch metadata");
-    batch.expected_lengths.clear();
-    batch.completed.clear();
-    batch.generation = 0;
-    return IndexError_NoMemory;
-  }
+  std::fill_n(batch.completed.begin(), read_reqs.size(), 0);
 
   uint32_t issued_count = 0;
   ctx->active_requests.fill(0);
@@ -1663,13 +1697,11 @@ int WindowsAlignedFileReader::submit(PendingBatch &batch,
       LOG_ERROR("Error queuing IOCP read %zu (error=%lu)", i, ::GetLastError());
       ctx->outstanding_count = issued_count;
       reset_io_ctx(ctx);
-      batch.expected_lengths.clear();
-      batch.completed.clear();
       batch.generation = 0;
       return IndexError_Runtime;
     }
 
-    batch.expected_lengths.push_back(req.len);
+    batch.expected_lengths[i] = req.len;
     ctx->active_requests[i] = 1;
     ++issued_count;
     ctx->outstanding_count = issued_count;
@@ -1688,8 +1720,7 @@ int WindowsAlignedFileReader::get_completed(
   }
   if (ctx == nullptr || ctx->completion_port == nullptr ||
       batch.generation == 0 || batch.generation != ctx->generation ||
-      batch.expected_lengths.size() != batch.n_submitted ||
-      batch.completed.size() != batch.n_submitted ||
+      batch.n_submitted > MAX_IO_DEPTH ||
       ctx->outstanding_count != batch.n_submitted - batch.n_reaped) {
     LOG_ERROR("Invalid or stale Windows IOCP batch");
     reset_io_ctx(ctx);

@@ -27,7 +27,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 
 namespace zvec {
@@ -56,6 +58,7 @@ struct FakeAioState {
   size_t completion_call = 0;
   size_t completed = 0;
   size_t short_completion = std::numeric_limits<size_t>::max();
+  bool pressure_after_submit = false;
 };
 
 FakeAioState *g_fake_aio = nullptr;
@@ -77,6 +80,10 @@ int fake_io_submit(io_context_t, long nr, struct iocb *ios[]) {
 
   for (int i = 0; i < ret; ++i) {
     g_fake_aio->submitted.push_back(ios[i]);
+  }
+  if (g_fake_aio->pressure_after_submit) {
+    ailego::MemoryLimitPool::get_instance().set_memory_pressure(
+        ailego::ProcessRssBudget::PressureLevel::kCritical);
   }
   return ret;
 }
@@ -381,6 +388,84 @@ TEST(DiskAnnBufferPoolFileReaderTest, RejectsNonPageAlignedRequests) {
   EXPECT_EQ(reader.read(requests, unused), IndexError_InvalidArgument);
   EXPECT_EQ(unused, nullptr);
   std::free(output);
+}
+
+TEST(DiskAnnLinuxAioTest, DeniedBatchMetadataFallsBackBeforeSubmitting) {
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  auto source = make_source();
+  ASSERT_EQ(static_cast<ssize_t>(source.size()),
+            ::pwrite(file.fd(), source.data(), source.size(), 0));
+  auto output =
+      std::unique_ptr<void, decltype(&std::free)>(allocate_aligned(source.size()),
+                                                 &std::free);
+  ASSERT_NE(nullptr, output);
+  auto requests = make_requests(output.get());
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous_capacity = pool.capacity();
+  const auto restore_pool = ailego::ScopeGuard::Make([&] {
+    ailego::MemoryLimitPool::get_instance().set_memory_pressure(
+        ailego::ProcessRssBudget::PressureLevel::kNormal);
+    EXPECT_EQ(0, pool.init(previous_capacity));
+  });
+  ASSERT_EQ(0, pool.init(1));
+
+  FakeAioState state;
+  state.submit_results = {-EINVAL};
+  FakeAioGuard guard(&state);
+  IoBackend context;
+  context.type = ailego::IOBackendType::kLibAio;
+  context.aio_ctx = reinterpret_cast<io_context_t>(static_cast<uintptr_t>(1));
+  IOContext ctx = &context;
+  LinuxAlignedFileReader reader;
+  ASSERT_EQ(0, reader.open_from_handle(file.path(), file.fd()));
+  PendingBatch batch;
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  EXPECT_TRUE(batch.used_pread);
+  EXPECT_EQ(kBlockCount, batch.n_submitted);
+  EXPECT_EQ(0u, state.submit_call);
+  EXPECT_EQ(0, std::memcmp(output.get(), source.data(), source.size()));
+  EXPECT_EQ(0u, pool.external_used());
+}
+
+TEST(DiskAnnLinuxAioTest, PartialSubmissionDrainsUnderNewMemoryPressure) {
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  auto source = make_source();
+  ASSERT_EQ(static_cast<ssize_t>(source.size()),
+            ::pwrite(file.fd(), source.data(), source.size(), 0));
+  auto output =
+      std::unique_ptr<void, decltype(&std::free)>(allocate_aligned(source.size()),
+                                                 &std::free);
+  ASSERT_NE(nullptr, output);
+  auto requests = make_requests(output.get());
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous_capacity = pool.capacity();
+  const auto restore_pool = ailego::ScopeGuard::Make([&] {
+    ailego::MemoryLimitPool::get_instance().set_memory_pressure(
+        ailego::ProcessRssBudget::PressureLevel::kNormal);
+    EXPECT_EQ(0, pool.init(previous_capacity));
+  });
+  ASSERT_EQ(0, pool.init(16 * ailego::kVectorPageSize));
+
+  FakeAioState state;
+  state.submit_results = {2, -EIO};
+  state.completion_results = {2};
+  state.pressure_after_submit = true;
+  FakeAioGuard guard(&state);
+  IoBackend context;
+  context.type = ailego::IOBackendType::kLibAio;
+  context.aio_ctx = reinterpret_cast<io_context_t>(static_cast<uintptr_t>(1));
+  IOContext ctx = &context;
+  LinuxAlignedFileReader reader;
+  ASSERT_EQ(0, reader.open_from_handle(file.path(), file.fd()));
+  PendingBatch batch;
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  EXPECT_TRUE(batch.used_pread);
+  EXPECT_EQ(2u, state.completed);
+  EXPECT_EQ(kBlockCount, batch.events.size());
+  EXPECT_GT(pool.external_used(), 0u);
+  EXPECT_EQ(0, std::memcmp(output.get(), source.data(), source.size()));
 }
 
 TEST(DiskAnnLinuxAioTest, DrainsPartialSubmissionBeforePreadFallback) {

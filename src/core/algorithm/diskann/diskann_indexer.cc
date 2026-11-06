@@ -1349,6 +1349,10 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
       cached_neighbors;
   cached_neighbors.reserve(2 * effective_beam_width);
 
+  ailego::MemoryReservation completion_memory;
+  completion_memory.add_array(effective_beam_width, sizeof(uint32_t));
+  std::vector<uint32_t> completed;
+  completed.reserve(effective_beam_width);
   PendingBatch pending;
 
   while (candidates.has_unexpanded_node() && num_ios < io_limit_) {
@@ -1448,10 +1452,6 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
     }
 
     if (!frontier.empty()) {
-      ailego::MemoryReservation completion_memory;
-      completion_memory.add_array(pending.n_submitted, sizeof(uint32_t));
-      std::vector<uint32_t> completed;
-      completed.reserve(pending.n_submitted);
       while (pending.n_reaped < pending.n_submitted) {
         completed.clear();
         io_timer.reset();
