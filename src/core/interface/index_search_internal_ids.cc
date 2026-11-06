@@ -97,13 +97,21 @@ int Index::search_internal_ids(const VectorData &vector_data,
                                &query_meta);
   }
 
+  // The public runner accepts standard vectors. Charge their retained
+  // capacity here because it survives both the query and its index context.
+  thread_local ailego::MemoryReservation keys_memory;
   thread_local std::vector<uint64_t> keys;
   std::vector<float> *scores = nullptr;
-  if (output_scores) {
-    thread_local std::vector<float> score_buffer;
-    scores = &score_buffer;
-  }
   if (ret == 0) {
+    keys.clear();
+    ailego::ReserveVectorCapacity(keys, keys_memory, topk);
+    if (output_scores) {
+      thread_local ailego::MemoryReservation scores_memory;
+      thread_local std::vector<float> score_buffer;
+      score_buffer.clear();
+      ailego::ReserveVectorCapacity(score_buffer, scores_memory, topk);
+      scores = &score_buffer;
+    }
     ret = streamer_->search_candidates_impl(query, query_meta, keys, context,
                                             scores);
   }
@@ -186,7 +194,11 @@ int Index::_search_refine_internal_ids(
   // within a thread, as is the existing candidate/context scratch.
   thread_local ailego::BudgetedStringWorkspace coarse_query_storage;
   thread_local ailego::BudgetedStringWorkspace reference_query_storage;
+  thread_local ailego::MemoryReservation keys_memory;
   thread_local std::vector<uint64_t> keys;
+  keys.clear();
+  ailego::ReserveVectorCapacity(keys, keys_memory,
+                                static_cast<size_t>(coarse_topk));
   const void *query = nullptr;
   core::IndexQueryMeta query_meta;
   ret = _prepare_dense_query(vector_data, &coarse_query_storage, &query,
@@ -224,10 +236,10 @@ int Index::_search_refine_internal_ids(
           reference_context->reset();
           std::vector<std::vector<uint64_t>> candidates(1);
           candidates[0].swap(keys);
+          AILEGO_DEFER([&] { candidates[0].swap(keys); });
           thread_local SearchResult result;
           ret = reference->_refine_dense_candidates(vector_data, search_param,
                                                     candidates, &result);
-          candidates[0].swap(keys);
           if (ret == 0) {
             CopySearchResult(result, search_param->topk, output_ids,
                              output_scores);

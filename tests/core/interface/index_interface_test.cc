@@ -148,31 +148,35 @@ TEST(IndexInterface, InternalIdsBudgetDenialReturnsErrorAndCanRetry) {
   });
   ASSERT_EQ(0, pool.init(64UL * 1024 * 1024));
   zvec::test_util::RemoveTestFiles(path);
-  auto param = FlatIndexParamBuilder()
-                   .with_metric_type(MetricType::kL2sq)
-                   .with_data_type(DataType::DT_FP32)
-                   .with_storage_data_type(DataType::DT_FP16)
-                   .with_dimension(128)
-                   .build();
-  auto index = IndexFactory::CreateAndInitIndex(*param);
-  ASSERT_TRUE(index);
-  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
-  std::array<float, 128> values{};
-  const VectorData query{DenseVector{values.data()}};
-  ASSERT_EQ(0, index->add(query, 7));
-  auto search_param = FlatQueryParamBuilder().with_topk(1).build();
-  int64_t id = -1;
-  ASSERT_EQ(0, index->search_internal_ids(query, search_param, &id, nullptr));
-  EXPECT_EQ(7, id);
-  {
-    zvec::ailego::MemoryReservation pressure;
-    pressure.add(pool.capacity() - pool.used());
-    EXPECT_EQ(zvec::core::IndexError_NoMemory,
-              index->search_internal_ids(query, search_param, &id, nullptr));
-  }
-  ASSERT_EQ(0, index->search_internal_ids(query, search_param, &id, nullptr));
-  EXPECT_EQ(7, id);
-  EXPECT_EQ(0, index->close());
+  // Candidate scratch is intentionally retained until the query thread exits.
+  std::thread worker([&] {
+    auto param = FlatIndexParamBuilder()
+                     .with_metric_type(MetricType::kL2sq)
+                     .with_data_type(DataType::DT_FP32)
+                     .with_storage_data_type(DataType::DT_FP16)
+                     .with_dimension(128)
+                     .build();
+    auto index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_TRUE(index);
+    ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
+    std::array<float, 128> values{};
+    const VectorData query{DenseVector{values.data()}};
+    ASSERT_EQ(0, index->add(query, 7));
+    auto search_param = FlatQueryParamBuilder().with_topk(1).build();
+    int64_t id = -1;
+    ASSERT_EQ(0, index->search_internal_ids(query, search_param, &id, nullptr));
+    EXPECT_EQ(7, id);
+    {
+      zvec::ailego::MemoryReservation pressure;
+      pressure.add(pool.capacity() - pool.used());
+      EXPECT_EQ(zvec::core::IndexError_NoMemory,
+                index->search_internal_ids(query, search_param, &id, nullptr));
+    }
+    ASSERT_EQ(0, index->search_internal_ids(query, search_param, &id, nullptr));
+    EXPECT_EQ(7, id);
+    EXPECT_EQ(0, index->close());
+  });
+  worker.join();
 }
 
 TEST(IndexInterface, GraphRefineKeepsLegacyDefaultCandidateCount) {
@@ -4606,7 +4610,7 @@ TEST(IndexInterface, HNSWRabitqGeneral) {
 // yields a working build -> close -> reopen-for-search pipeline. This guards
 // the interface -> streamer param binding introduced for contiguous memory
 // mode.
-TEST(IndexInterface, ContiguousMemoryEndToEnd) {
+static void CheckContiguousMemoryEndToEnd() {
   constexpr uint32_t kDimension = 32;
   constexpr uint32_t kNumDocs = 1200;
   static constexpr int kTopk = 10;
@@ -4761,6 +4765,13 @@ class TestVectorSource : public zvec::core::VectorSource {
   const float *base_;
   uint32_t dim_;
 };
+
+TEST(IndexInterface, ContiguousMemoryEndToEnd) {
+  // Release retained candidate capacity before later tests reconfigure the
+  // process pool. Closing an index alone intentionally does not release it.
+  std::thread worker(CheckContiguousMemoryEndToEnd);
+  worker.join();
+}
 
 TEST(IndexInterface, ExternalVectorEndToEnd) {
   constexpr uint32_t kDimension = 64;
@@ -5156,7 +5167,9 @@ TEST(IndexInterface, BufferPoolOpenPreservesCreationAndMemoryErrors) {
   zvec::test_util::RemoveTestFiles(path);
   auto remove = zvec::ailego::ScopeGuard::Make(
       [&]() { zvec::test_util::RemoveTestFiles(path); });
-  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  // This test constrains payload space; persistent eviction queue metadata
+  // must remain funded before the intended index-open admission failure.
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
   const size_t previous_capacity = pool.capacity();
   auto restore = zvec::ailego::ScopeGuard::Make(
       [&]() { EXPECT_EQ(0, pool.init(previous_capacity)); });

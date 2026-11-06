@@ -186,10 +186,12 @@ class HnswContext : public IndexContext {
   inline void topk_to_keys(std::vector<uint64_t> &keys,
                            std::vector<float> *scores = nullptr) {
     keys.clear();
-    keys.reserve((std::min)(static_cast<size_t>(topk_), search_heap_.size()));
+    const size_t count =
+        (std::min)(static_cast<size_t>(topk_), search_heap_.size());
+    keys.reserve(count);
     if (scores) {
       scores->clear();
-      scores->reserve(keys.capacity());
+      scores->reserve(count);
       collect_search_result([&](node_id_t id, dist_t score) {
         keys.push_back(entity_->get_key(id));
         scores->push_back(score);
