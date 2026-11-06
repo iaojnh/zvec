@@ -109,8 +109,57 @@ TEST(ProcessRssBudgetTest, HostPressurePersistsUntilExplicitRecovery) {
   EXPECT_FALSE(budget.try_acquire(1));
   budget.release(kMiB);
   budget.set_external_pressure(Pressure::kNormal);
-  EXPECT_FALSE(budget.pressure());
   EXPECT_TRUE(budget.try_acquire(kMiB));
+  EXPECT_FALSE(budget.pressure());
+  budget.release(kMiB);
+}
+
+TEST(ProcessRssBudgetTest, HostRecoverySamplesRssBeforeReadmitting) {
+  using Pressure = ProcessRssBudget::PressureLevel;
+  ProcessRssBudget budget;
+  sampled_rss = 16 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  budget.set_external_pressure(Pressure::kBackground);
+  sampled_rss = 128 * kMiB;
+  budget.set_external_pressure(Pressure::kNormal);
+  // The lifecycle notification must not sample synchronously or publish
+  // spendable headroom from the old observation.
+  EXPECT_EQ(16 * kMiB, budget.rss());
+  EXPECT_TRUE(budget.pressure());
+  EXPECT_EQ(0u, budget.available());
+  EXPECT_FALSE(budget.try_acquire(1));
+  EXPECT_EQ(128 * kMiB, budget.rss());
+  EXPECT_FALSE(budget.materialization_allowed());
+
+  sampled_rss = 24 * kMiB;
+  budget.refresh(true);
+  EXPECT_FALSE(budget.pressure());
+  ASSERT_TRUE(budget.try_acquire(kMiB));
+  budget.release(kMiB);
+}
+
+TEST(ProcessRssBudgetTest, CriticalRecoveryRequiresBothConfiguredSamples) {
+  using Pressure = ProcessRssBudget::PressureLevel;
+  ProcessRssBudget budget;
+  sampled_rss = 16 * kMiB;
+  native_sample = {32 * kMiB, 96 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  budget.set_external_pressure(Pressure::kCritical);
+  budget.set_external_pressure(Pressure::kBackground);
+
+  native_sample_valid = false;
+  EXPECT_FALSE(budget.materialization_allowed());
+  EXPECT_FALSE(budget.try_acquire(1));
+  native_sample_valid = true;
+  sampled_rss = 0;
+  EXPECT_FALSE(budget.try_acquire(1));
+  EXPECT_EQ(0u, budget.available());
+
+  sampled_rss = 24 * kMiB;
+  EXPECT_TRUE(budget.materialization_allowed());
+  EXPECT_TRUE(budget.pressure());  // Background still blocks cache growth.
+  ASSERT_TRUE(budget.try_acquire(kMiB));
   budget.release(kMiB);
 }
 

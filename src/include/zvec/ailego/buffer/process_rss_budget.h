@@ -28,6 +28,12 @@ class ProcessRssBudget {
 
   void set_external_pressure(PressureLevel level) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (limit() && level < external_pressure_) {
+      // The host can relax its policy independently of the current RSS or
+      // application limit. Keep admission closed until the next fresh sample,
+      // without performing a system read in the lifecycle notification.
+      recovery_sample_pending_ = true;
+    }
     external_pressure_ = level;
     update_available();
   }
@@ -56,6 +62,7 @@ class ProcessRssBudget {
     }
     native_reader_ = native_reader;
     reader_ = reader;
+    recovery_sample_pending_ = false;
     limit_.store(limit, std::memory_order_relaxed);
     pressure_.store(false, std::memory_order_relaxed);
     publish(rss);
@@ -115,7 +122,10 @@ class ProcessRssBudget {
   bool materialization_allowed() {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
-    if (external_pressure_ == PressureLevel::kCritical) return false;
+    if (external_pressure_ == PressureLevel::kCritical ||
+        recovery_sample_pending_) {
+      return false;
+    }
     const size_t cap = limit();
     if (!cap) return true;
     if (rss_.load(std::memory_order_relaxed) >= cap) return false;
@@ -146,22 +156,28 @@ class ProcessRssBudget {
   void refresh_locked(bool force) {
     if (!limit()) return;
     const auto now = std::chrono::steady_clock::now();
-    if (!force && now - sampled_at_ < std::chrono::milliseconds(20)) return;
+    if (!force && !recovery_sample_pending_ &&
+        now - sampled_at_ < std::chrono::milliseconds(20)) {
+      return;
+    }
     const size_t rss = reader_ ? reader_() : 0;
     // A failed sample must not replenish admission headroom. Retry on the
     // next maintenance pass, keeping the last successful pressure signal.
-    bool sampled = false;
+    bool sampled_native = false;
     if (native_reader_) {
       NativeSample native;
       if (native_reader_(&native)) {
         native_estimate_.observe(native.footprint, backing_);
         native_limit_ = add_saturated(native.footprint, native.available);
-        sampled = true;
+        sampled_native = true;
       }
+    }
+    if (rss && (!native_reader_ || sampled_native)) {
+      recovery_sample_pending_ = false;
     }
     if (rss) {
       publish(rss);
-    } else if (sampled) {
+    } else if (sampled_native) {
       update_available();
       sampled_at_ = now;
     }
@@ -273,7 +289,10 @@ class ProcessRssBudget {
       available =
           std::min(available, remaining > reserve ? remaining - reserve : 0);
     }
-    if (external_pressure_ == PressureLevel::kCritical) available = 0;
+    if (external_pressure_ == PressureLevel::kCritical ||
+        recovery_sample_pending_) {
+      available = 0;
+    }
     const size_t margin = headroom(cap);
     const bool pressure = external_pressure_ != PressureLevel::kNormal ||
                           (cap && (pressure_.load(std::memory_order_relaxed)
@@ -291,6 +310,7 @@ class ProcessRssBudget {
   NativeReader native_reader_{nullptr};
   size_t native_limit_{0};
   PressureLevel external_pressure_{PressureLevel::kNormal};
+  bool recovery_sample_pending_{false};
   std::chrono::steady_clock::time_point sampled_at_{};
   std::atomic<size_t> limit_{0};
   std::atomic<size_t> available_{std::numeric_limits<size_t>::max()};
