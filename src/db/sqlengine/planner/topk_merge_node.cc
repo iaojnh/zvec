@@ -5,6 +5,7 @@
 #include <numeric>
 #include <arrow/compute/api.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include "db/index/segment/segment_fetch_internal.h"
 #include "db/sqlengine/common/util.h"
 #include "db/sqlengine/planner/ops/fetch_vector_op.h"
 
@@ -24,10 +25,12 @@ TopKMergeNode::TopKMergeNode(std::vector<PlanInfo::Ptr> plans,
         output_->group_by()->group_count, output_->group_by()->group_topk,
         descending);
   }
-  auto table = segments_.front()->fetch(
-      output_->get_selected_scalar_field_names(), std::vector<int>{});
-  if (!table) throw std::runtime_error("Cannot resolve topK output schema");
-  schema_ = Util::append_field(*table->schema(), FIELD_SCORE, arrow::float32());
+  auto table = internal::fetch_table(
+      *segments_.front(), output_->get_selected_scalar_field_names(), {});
+  if (table.status().IsOutOfMemory()) throw std::bad_alloc();
+  if (!table.ok()) throw std::runtime_error(table.status().ToString());
+  schema_ =
+      Util::append_field(*(*table)->schema(), FIELD_SCORE, arrow::float32());
   // Match the existing vector-recall output contract. FTS has scalar output.
   if (output_->vector_cond_info() && output_->is_include_vector()) {
     for (const auto &field : output_->selected_vector_fields()) {
@@ -130,10 +133,13 @@ arrow::Status TopKMergeNode::prepare() {
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> TopKMergeNode::fetch(
     size_t segment, const std::vector<int> &rows,
     std::shared_ptr<arrow::Array> scores) const {
-  auto table = segments_[segment]->fetch(
-      output_->get_selected_scalar_field_names(), rows);
-  if (!table) return arrow::Status::ExecutionError("Fetch topK fields failed");
-  ARROW_ASSIGN_OR_RAISE(auto batch, table->CombineChunksToBatch());
+  ARROW_ASSIGN_OR_RAISE(
+      auto table, internal::fetch_table(
+                      *segments_[segment],
+                      output_->get_selected_scalar_field_names(), rows));
+  ARROW_ASSIGN_OR_RAISE(
+      auto batch,
+      table->CombineChunksToBatch(segments_[segment]->query_memory_pool()));
   ARROW_ASSIGN_OR_RAISE(
       batch,
       batch->AddColumn(batch->num_columns(), FIELD_SCORE, std::move(scores)));
@@ -144,8 +150,11 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> TopKMergeNode::fetch(
                               *segments_[segment], field.field_name, rows)
                         : FetchVectorOp::fetch_sparse_vector(
                               *segments_[segment], field.field_name, rows);
-      if (!values)
+      if (!values) {
+        if (values.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+          return arrow::Status::OutOfMemory(values.error().message());
         return arrow::Status::ExecutionError(values.error().message());
+      }
       ARROW_ASSIGN_OR_RAISE(
           batch, batch->AddColumn(batch->num_columns(), field.field_name,
                                   std::move(values.value())));

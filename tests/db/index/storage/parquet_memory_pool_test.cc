@@ -770,6 +770,30 @@ TEST_F(ParquetBudgetTest, MappedShrinkWithinPageRetainsBackingCharge) {
   EXPECT_EQ(0u, budget_.committed());
 }
 
+TEST_F(ParquetBudgetTest, MappedShrinkBelowThresholdReleasesTailUnderPressure) {
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  const auto restore = ailego::ScopeGuard::Make(
+      [&] { native.set_memory_pressure(Pressure::kNormal); });
+  uint8_t *buffer = nullptr;
+  ASSERT_TRUE(pool.Allocate(2 * kThreshold, &buffer).ok());
+  auto *original = buffer;
+  const auto mapped = pool.mapped_bytes();
+  std::memset(buffer, 42, 2 * kThreshold);
+  native.set_memory_pressure(Pressure::kCritical);
+  ASSERT_TRUE(pool.Reallocate(2 * kThreshold, 8192, &buffer).ok());
+  ASSERT_TRUE(pool.Reallocate(8192, 1024, &buffer).ok());
+  EXPECT_EQ(original, buffer);
+  EXPECT_EQ(42, buffer[1023]);
+  EXPECT_EQ(1024, pool.bytes_allocated());
+  EXPECT_LT(pool.mapped_bytes(), mapped);
+  EXPECT_EQ(pool.charged_bytes(), budget_.external_used());
+  pool.Free(buffer, 1024);
+  EXPECT_EQ(0, pool.mapped_bytes());
+  EXPECT_EQ(0u, budget_.external_used());
+}
+
 TEST_F(ParquetBudgetTest, MappedShrinkAdmitsPreBudgetAllocation) {
   ASSERT_EQ(0, budget_.init(0));
   ParquetMemoryPool pool(arrow::default_memory_pool(), true);

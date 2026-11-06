@@ -312,8 +312,8 @@ arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
   // A shrink must be able to make progress under the same pressure that
   // prevents admitting another mapping.
   auto &budget = ailego::MemoryLimitPool::get_instance();
-  if (old_size >= kMappedAllocationThreshold &&
-      new_size >= kMappedAllocationThreshold && new_size < old_size &&
+  if (new_size > 0 && new_size < old_size &&
+      (enforce_budget_ || new_size >= kMappedAllocationThreshold) &&
       reinterpret_cast<uintptr_t>(*ptr) % alignment == 0) {
     auto *header =
         reinterpret_cast<MappingHeader *>(*ptr - sizeof(MappingHeader));
@@ -376,31 +376,27 @@ void ParquetMemoryPool::Free(uint8_t *buffer, int64_t size, int64_t alignment) {
   }
   assert(size >= 0 && alignment > 0 && (alignment & (alignment - 1)) == 0);
   alignment = std::max(alignment, kMinimumAlignment);
-  if (size < kMappedAllocationThreshold) {
-    if (!enforce_budget_ || size == 0) {
-      small_pool_->Free(buffer, size, alignment);
-    } else {
-      const auto header = *reinterpret_cast<const MappingHeader *>(
-          buffer - sizeof(MappingHeader));
-      if (header.kind == BackingKind::Heap) {
-        small_pool_->Free(static_cast<uint8_t *>(header.base), header.size,
-                          alignment);
-      } else {
-        free_small(buffer);
-      }
-    }
+  if (size == 0 || (!enforce_budget_ && size < kMappedAllocationThreshold)) {
+    small_pool_->Free(buffer, size, alignment);
   } else {
+    // A managed mapping can shrink below the initial mapping threshold.
+    // Free it according to its recorded backing, regardless of logical size.
     const auto header = *reinterpret_cast<const MappingHeader *>(
         buffer - sizeof(MappingHeader));
-    const bool released = UnmapMemory(header.base, header.size);
-    assert(released);
-    if (!released) {
-      return;
+    if (header.kind == BackingKind::Mapping) {
+      const bool released = UnmapMemory(header.base, header.size);
+      assert(released);
+      if (!released) return;
+      mapped_bytes_.fetch_sub(static_cast<int64_t>(header.size),
+                              std::memory_order_relaxed);
+      ailego::MemoryLimitPool::get_instance().release_external(header.charged);
+      charged_bytes_.fetch_sub(header.charged, std::memory_order_relaxed);
+    } else if (header.kind == BackingKind::Heap) {
+      small_pool_->Free(static_cast<uint8_t *>(header.base), header.size,
+                        alignment);
+    } else {
+      free_small(buffer);
     }
-    mapped_bytes_.fetch_sub(static_cast<int64_t>(header.size),
-                            std::memory_order_relaxed);
-    ailego::MemoryLimitPool::get_instance().release_external(header.charged);
-    charged_bytes_.fetch_sub(header.charged, std::memory_order_relaxed);
   }
   stats_.DidFreeBytes(size);
 }

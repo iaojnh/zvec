@@ -48,7 +48,7 @@ class SQLEngineImpl : public SQLEngine {
       size_t max_queued_bytes = 0);
 
   Result<DocPtrList> execute(
-      CollectionSchema::Ptr collection, SearchQuery query,
+      CollectionSchema::Ptr collection, const SearchQuery &query,
       const std::vector<Segment::Ptr> &segments) override;
 
   Status scan_doc_ids(CollectionSchema::Ptr collection,

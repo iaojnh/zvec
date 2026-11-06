@@ -914,7 +914,7 @@ Doc::Ptr Doc::deserialize(const uint8_t *data, size_t size) {
 }
 
 Status Doc::validate_and_sanitize(const CollectionSchema::Ptr &schema,
-                                  bool is_update) {
+                                  bool is_update) try {
   if (!schema) {
     return Status::InternalError("schema is null during doc validation");
   }
@@ -1171,6 +1171,9 @@ Status Doc::validate_and_sanitize(const CollectionSchema::Ptr &schema,
     }
   }
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Document validation exceeds memory budget");
 }
 
 size_t Doc::memory_usage() const {

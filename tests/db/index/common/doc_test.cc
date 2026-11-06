@@ -17,6 +17,8 @@
 #include <cstring>
 #include <limits>
 #include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include "db/index/common/serialized_doc_memory.h"
 #include "utils/utils.h"
@@ -66,6 +68,32 @@ TEST_F(DocDetailedTest, CopiesOnlyRequestedFieldWithoutChangingSource) {
   EXPECT_TRUE(test_doc_->has("unselected"));
   EXPECT_EQ("test_pk", test_doc_->pk_ref());
   EXPECT_EQ(12345u, test_doc_->doc_id());
+}
+
+TEST_F(DocDetailedTest, SparseSortDenialLeavesInputAvailableForRetry) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(64 * 1024 * 1024));
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    pool.set_memory_pressure(Pressure::kNormal);
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  auto schema = std::make_shared<CollectionSchema>("sparse_sort");
+  ASSERT_TRUE(schema->add_field(std::make_shared<FieldSchema>(
+      "sparse", DataType::SPARSE_VECTOR_FP32, false,
+      std::make_shared<FlatIndexParams>(MetricType::IP))).ok());
+  using Sparse = std::pair<std::vector<uint32_t>, std::vector<float>>;
+  const Sparse input{{2, 1}, {20.0f, 10.0f}};
+  ASSERT_TRUE(test_doc_->set("sparse", input));
+  pool.set_memory_pressure(Pressure::kCritical);
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
+            test_doc_->validate_and_sanitize(schema).code());
+  EXPECT_EQ(input, test_doc_->get_ref<Sparse>("sparse"));
+  pool.set_memory_pressure(Pressure::kNormal);
+  EXPECT_TRUE(test_doc_->validate_and_sanitize(schema).ok());
+  EXPECT_EQ((Sparse{{1, 2}, {10.0f, 20.0f}}),
+            test_doc_->get_ref<Sparse>("sparse"));
 }
 
 TEST_F(DocDetailedTest, SerializedSizeMatchesEveryValueType) {

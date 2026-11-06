@@ -46,6 +46,7 @@
 #include "db/common/file_helper.h"
 #include "db/common/global_resource.h"
 #include "db/common/profiler.h"
+#include "db/common/query_input_memory.h"
 #include "db/common/query_result_memory.h"
 #include "db/common/typedef.h"
 #include "db/common/utils.h"
@@ -1914,7 +1915,16 @@ void CollectionImpl::prepare_query_internal_ids() {
 
 Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids_fallback(
     const SearchQuery &query, bool return_scores) const try {
-  SearchQuery fallback = query;
+  detail::ResultMemoryAllowance::Lease request_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  if (request_memory.enabled()) {
+    request_memory.add(
+        detail::QueryInputCopyBytes(query.target_, query.filter_, std::nullopt));
+  }
+  SearchQuery fallback;
+  fallback.target_ = query.target_;
+  fallback.filter_ = query.filter_;
+  fallback.topk_ = query.topk_;
   fallback.include_vector_ = false;
   fallback.include_doc_id_ = true;
   fallback.output_fields_ = std::vector<std::string>{};
@@ -2176,7 +2186,7 @@ CollectionImpl::query_result_snapshot_impl(const Query &query) const {
 }
 
 Result<DocPtrList> CollectionImpl::query_unsafe(
-    const SearchQuery &query) const {
+    const SearchQuery &query) const try {
   // When field_name_ is set, use get_field to retrieve the schema uniformly.
   // validate checks that the field type matches the query type
   // (FTS query requires an FTS field, vector query requires a vector field).
@@ -2197,10 +2207,20 @@ Result<DocPtrList> CollectionImpl::query_unsafe(
   }
 
   // Sparse needs sanitization: make a mutable copy and sort indices in place.
+  detail::ResultMemoryAllowance::Lease request_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  if (request_memory.enabled()) {
+    request_memory.add(detail::QueryInputCopyBytes(
+        query.target_, query.filter_, query.output_fields_,
+        /*bytes=*/256, /*materialize_view=*/true));
+  }
   SearchQuery sanitized_query = query;
   auto ss = sanitize_sparse_vector(sanitized_query.target_, field_schema);
   CHECK_RETURN_STATUS_EXPECTED(ss);
-  return sql_engine_->execute(schema_, std::move(sanitized_query), segments);
+  return sql_engine_->execute(schema_, sanitized_query, segments);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Query input exceeds memory budget"));
 }
 
 Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
@@ -2226,6 +2246,16 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
   // documented full-document contract.
   const bool late_fetch =
       !std::holds_alternative<reranker::CallbackParams>(query.rerank);
+  const std::optional<std::vector<std::string>> no_fields{std::in_place};
+  const auto &selected = late_fetch ? no_fields : query.output_fields;
+  detail::ResultMemoryAllowance::Lease request_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  if (request_memory.enabled()) {
+    request_memory.add(detail::BindingMemoryBytes(
+        query.queries.size(), sizeof(SearchQuery) + sizeof(FieldSchema::Ptr) +
+                                  sizeof(Result<DocPtrList>) +
+                                  sizeof(DocPtrList)));
+  }
   std::vector<SearchQuery> pending_queries;
   std::vector<FieldSchema::Ptr> field_schemas;
   pending_queries.reserve(query.queries.size());
@@ -2244,14 +2274,17 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
     auto s = target.validate(field_schema, &need_sanitize);
     CHECK_RETURN_STATUS_EXPECTED(s);
 
+    if (request_memory.enabled()) {
+      request_memory.add(detail::QueryInputCopyBytes(
+          target, query.filter, selected, /*bytes=*/256, need_sanitize));
+    }
     SearchQuery sq;
     sq.target_ = target;
     sq.topk_ = sub.num_candidates_;
     sq.filter_ = query.filter;
     sq.include_vector_ = late_fetch ? false : query.include_vector;
     sq.include_doc_id_ = late_fetch || query.include_doc_id_;
-    sq.output_fields_ =
-        late_fetch ? std::vector<std::string>{} : query.output_fields;
+    sq.output_fields_ = selected;
 
     if (need_sanitize) {
       auto ss = sanitize_sparse_vector(sq.target_, field_schema);
@@ -2261,10 +2294,10 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
     field_schemas.push_back(std::move(field_ptr));
   }
 
-  auto execute_query = [&](SearchQuery &pending) -> Result<DocPtrList> {
+  auto execute_query = [&](const SearchQuery &pending) -> Result<DocPtrList> {
     try {
       auto engine = sqlengine::SQLEngine::create(std::make_shared<Profiler>());
-      return engine->execute(schema_, std::move(pending), segments);
+      return engine->execute(schema_, pending, segments);
     } catch (const std::bad_alloc &) {
       return tl::make_unexpected(
           Status(StatusCode::RESOURCE_EXHAUSTED,
@@ -2282,12 +2315,18 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
       return tl::make_unexpected(
           Status::InternalError("Query thread pool initialization failed"));
     }
-    auto group = pool->make_group();
-    for (size_t i = 0; i < pending_queries.size(); ++i) {
-      group->execute(
-          [&, i]() { results[i] = execute_query(pending_queries[i]); });
+    if (pool->indexof_this() >= 0) {
+      for (size_t i = 0; i < pending_queries.size(); ++i)
+        results[i] = execute_query(pending_queries[i]);
+    } else {
+      auto group = pool->make_group();
+      // A failed submission can leave earlier closures borrowing this state.
+      AILEGO_DEFER([&] { group->wait_finish(); });
+      for (size_t i = 0; i < pending_queries.size(); ++i) {
+        group->execute(
+            [&, i]() { results[i] = execute_query(pending_queries[i]); });
+      }
     }
-    group->wait_finish();
   } else {
     for (size_t i = 0; i < pending_queries.size(); ++i) {
       results[i] = execute_query(pending_queries[i]);
@@ -2352,7 +2391,7 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
 }
 
 Result<GroupResults> CollectionImpl::group_by_query(
-    const GroupByVectorQuery &query) const {
+    const GroupByVectorQuery &query) const try {
   std::shared_lock lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
@@ -2383,10 +2422,21 @@ Result<GroupResults> CollectionImpl::group_by_query(
   }
 
   // Sparse needs sanitization: make a mutable copy and sort indices in place.
+  detail::ResultMemoryAllowance::Lease request_memory(
+      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+  if (request_memory.enabled()) {
+    request_memory.add(detail::QueryInputCopyBytes(
+        query.target_, query.filter_, query.output_fields_,
+        detail::BindingMemoryBytes(1, query.group_by_field_name_.size(), 256),
+        /*materialize_view=*/true));
+  }
   GroupByVectorQuery sanitized_query = query;
   auto ss = sanitize_sparse_vector(sanitized_query.target_, field_schema);
   CHECK_RETURN_STATUS_EXPECTED(ss);
   return sql_engine_->execute_group_by(schema_, sanitized_query, segments);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Group-by query exceeds memory budget"));
 }
 
 Result<DocPtrMap> CollectionImpl::fetch(

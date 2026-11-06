@@ -20,6 +20,7 @@
 #include <zvec/db/index_params.h>
 #include <zvec/db/type.h>
 #include "db/common/constants.h"
+#include "db/common/query_input_memory.h"
 #include "db/common/query_result_memory.h"
 #include "db/index/column/fts_column/fts_ast_rewriter.h"
 #include "db/index/column/fts_column/fts_memory.h"
@@ -59,7 +60,7 @@ SQLEngineImpl::SQLEngineImpl(zvec::Profiler::Ptr profiler)
     : profiler_(std::move(profiler)) {}
 
 Result<DocPtrList> SQLEngineImpl::execute(
-    CollectionSchema::Ptr collection, SearchQuery query,
+    CollectionSchema::Ptr collection, const SearchQuery &query,
     const std::vector<Segment::Ptr> &segments) {
   std::vector<FieldAndSchema> output_fields;
   auto reader = prepare_search(collection, query, segments, &output_fields);
@@ -183,6 +184,8 @@ Result<std::unique_ptr<arrow::RecordBatchReader>> SQLEngineImpl::prepare_search(
   auto reader = search_by_query_info(collection, segments, &query_infos,
                                      max_queued_bytes);
   if (!reader) {
+    if (reader.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return reader;
     return tl::make_unexpected(Status::InternalError(
         "Execute plan failed (query): ", reader.error().c_str()));
   }
@@ -201,15 +204,22 @@ SearchQuery from_group_by(const GroupByVectorQuery &gq) {
 
 Result<GroupResults> SQLEngineImpl::execute_group_by(
     CollectionSchema::Ptr collection, const GroupByVectorQuery &group_by_query,
-    const std::vector<Segment::Ptr> &segments) {
+    const std::vector<Segment::Ptr> &segments) try {
   if (segments.empty()) {
     return GroupResults{};
   }
 
-  SearchQuery query = from_group_by(group_by_query);
   const bool budgeted = std::any_of(
       segments.begin(), segments.end(),
       [](const auto &segment) { return segment->uses_buffer_storage(); });
+  detail::ResultMemoryAllowance::Lease request_memory(
+      budgeted ? &detail::SharedResultMemoryAllowance() : nullptr);
+  if (budgeted) {
+    request_memory.add(detail::QueryInputCopyBytes(
+        group_by_query.target_, group_by_query.filter_,
+        group_by_query.output_fields_));
+  }
+  SearchQuery query = from_group_by(group_by_query);
 
   // Check filter satisfiability once before the loop (result depends only on
   // the query, not on segment data).
@@ -250,11 +260,16 @@ Result<GroupResults> SQLEngineImpl::execute_group_by(
   }
   auto reader = search_by_query_info(collection, segments, &query_infos);
   if (!reader) {
+    if (reader.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return tl::make_unexpected(reader.error());
     return tl::make_unexpected(Status::InternalError(
         "Execute plan failed (group_by): ", reader.error().c_str()));
   }
   return fill_group_by_result(*group_by_query_info, reader.value().get(),
                               budgeted);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Group-by plan exceeds memory budget"));
 }
 
 Result<FtsCondInfo::Ptr> SQLEngineImpl::parse_fts_query(

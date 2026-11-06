@@ -28,7 +28,7 @@ class SQLEngine {
   virtual ~SQLEngine();
 
   virtual Result<DocPtrList> execute(
-      CollectionSchema::Ptr collection, SearchQuery query,
+      CollectionSchema::Ptr collection, const SearchQuery &query,
       const std::vector<Segment::Ptr> &segments) = 0;
 
   // Borrowed ID batches are valid only during the callback. The caller must
