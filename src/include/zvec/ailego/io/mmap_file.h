@@ -48,6 +48,8 @@ class ZVEC_AILEGO_API MMapFile {
 
   //! Assignment
   MMapFile &operator=(MMapFile &&rhs) {
+    if (this == &rhs) return *this;
+    this->close();
     read_only_ = rhs.read_only_;
     region_ = rhs.region_;
     region_size_ = rhs.region_size_;
