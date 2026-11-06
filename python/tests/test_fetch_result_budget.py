@@ -362,6 +362,12 @@ def verify_fetch_dict_results(path, kind, mmap, dimension, count):
     held.clear()
     result = fetch(["0", "missing"])
     assert result["0"] is not None and result["missing"] is None
+    for include_vector in (False, True):
+        docs = coll.fetch(["0"], include_vector=include_vector)
+        key = next(iter(docs))
+        assert type(docs) is dict
+        assert key is docs["0"].id
+        assert key._memory_owner is not None
     coll.close()
 
 

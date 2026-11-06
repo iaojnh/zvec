@@ -79,12 +79,14 @@ def _retain_fields(fields, owner):
     )
 
 
-def _retain_document(document, owner):
+def _retain_document(document, owner, key=None):
     if document is None:
         return None
     pk, score, fields, vectors = document
+    if not isinstance(key, _ResultString) or key._memory_owner is not owner or key != pk:
+        key = _ResultString(pk, owner)
     return (
-        _ResultString(pk, owner),
+        key,
         score,
         _retain_fields(fields, owner),
         _retain_fields(vectors, owner),
@@ -96,7 +98,7 @@ def _retain_result_memory(results, owner):
     # Replace each batch entry progressively to bound overlapping list slots.
     if isinstance(results, dict):
         for key, document in results.items():
-            results[key] = _retain_document(document, owner)
+            results[key] = _retain_document(document, owner, key)
     else:
         for index, document in enumerate(results):
             results[index] = _retain_document(document, owner)

@@ -58,9 +58,12 @@ py::capsule result_memory_owner(
 
 void retain_result_memory(
     const py::object &result,
-    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
+    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory,
+    py::handle existing_owner = {}) {
   if (!memory->enabled()) return;
-  auto owner = result_memory_owner(memory);
+  py::object owner = existing_owner
+                         ? py::reinterpret_borrow<py::object>(existing_owner)
+                         : result_memory_owner(memory);
   try {
     py::module_::import("zvec.model._budgeted_result")
         .attr("_retain_result_memory")(result, owner);
@@ -72,6 +75,31 @@ void retain_result_memory(
   }
   memory->end_materialization();
 }
+
+class PythonFetchResultKeys {
+ public:
+  explicit PythonFetchResultKeys(
+      const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
+    if (memory->enabled()) {
+      owner_ = result_memory_owner(memory);
+      key_type_ = py::module_::import("zvec.model._budgeted_result")
+                      .attr("_ResultString");
+    }
+  }
+
+  py::object wrap(py::object key) const {
+    if (key_type_) return key_type_(std::move(key), owner_);
+    return key;
+  }
+
+  py::handle owner() const {
+    return owner_;
+  }
+
+ private:
+  py::object owner_;
+  py::object key_type_;
+};
 
 py::list owned_write_results(
     std::vector<Status> statuses,
@@ -361,9 +389,11 @@ void reserve_fetch_results(const DocPtrMap &docs,
     const auto forward_fields = schema.forward_fields();
     const auto vector_fields = schema.vector_fields();
     for (const auto &entry : docs) {
-      if (entry.second)
+      if (entry.second) {
+        estimate.string(entry.first);
         estimate_python_document(*entry.second, forward_fields, vector_fields,
                                  estimate);
+      }
     }
     // Accumulate every chunk before conversion. Native Doc admission alone
     // does not cover Python floats/list slots, nor Python results of old
@@ -410,6 +440,7 @@ void reserve_forward_results(const internal::ForwardFetchResult &forward,
   try {
     py::gil_scoped_release release;
     PythonResultEstimate estimate;
+    size_t largest_key = 0;
     for (const auto &table : forward.tables) {
       // Doc/tuple/outer-dict entries, then field-dict slots. Include the
       // wrapper objects created after FetchTuples returns, not only payloads.
@@ -420,13 +451,24 @@ void reserve_forward_results(const internal::ForwardFetchResult &forward,
           estimate.add(64, static_cast<size_t>(table->num_rows()));
         }
         for (const auto &chunk : table->column(c)->chunks()) {
-          for (int64_t row = 0; row < chunk->length(); ++row)
+          for (int64_t row = 0; row < chunk->length(); ++row) {
             estimate_forward_value(*chunk, row, estimate);
+            if (c == 1 && chunk->type_id() == arrow::Type::STRING &&
+                !chunk->IsNull(row)) {
+              const auto key =
+                  static_cast<const arrow::StringArray &>(*chunk).GetView(row);
+              largest_key = std::max(largest_key, key.size());
+            }
+          }
         }
       }
     }
     // Reserve the entire native chunk before creating any Python values.
     // The lease accumulates all chunks of this API call, including split ones.
+    if (largest_key) {
+      estimate.add(128);
+      estimate.add(4, largest_key);
+    }
     lease.add(estimate.bytes());
   } catch (const std::bad_alloc &) {
     PyErr_SetString(PyExc_MemoryError,
@@ -493,7 +535,8 @@ py::object forward_value_to_python(const arrow::ChunkedArray &column,
   throw std::runtime_error("Invalid forward fetch row");
 }
 
-void forward_to_tuples(internal::ForwardFetchResult &forward, py::dict &out) {
+void forward_to_tuples(internal::ForwardFetchResult &forward, py::dict &out,
+                       const PythonFetchResultKeys &keys) {
   for (auto &table : forward.tables) {
     std::vector<py::str> names;
     for (int c = 2; c < table->num_columns(); ++c) {
@@ -502,6 +545,7 @@ void forward_to_tuples(internal::ForwardFetchResult &forward, py::dict &out) {
     for (int64_t row = 0; row < table->num_rows(); ++row) {
       auto key = forward_value_to_python(*table->column(1), row);
       if (key.is_none()) throw std::runtime_error("Missing forward fetch key");
+      key = keys.wrap(std::move(key));
       py::dict fields;
       for (int c = 2; c < table->num_columns(); ++c) {
         bool is_null;
@@ -539,6 +583,7 @@ py::dict fetch_docs_for_python(const Collection &collection, py::handle ids,
   detail::PythonFetchInputs inputs(ids, fields, owner);
   auto allowance = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       owner, /*serialize_materialization=*/true, kPythonResultBackingQuantum);
+  const PythonFetchResultKeys keys(allowance);
   auto release_slot =
       ailego::ScopeGuard::Make([&] { allowance->end_materialization(); });
   {
@@ -567,13 +612,11 @@ py::dict fetch_docs_for_python(const Collection &collection, py::handle ids,
     allowance->add(estimate.bytes());
   }
 
-  auto wrappers = py::module_::import("zvec.model._budgeted_result");
-  auto token = result_memory_owner(allowance);
-  auto make_key = wrappers.attr("_ResultString");
   auto out = py::reinterpret_borrow<py::dict>(
-      wrappers.attr("_ResultDict")(py::dict(), token));
+      py::module_::import("zvec.model._budgeted_result")
+          .attr("_ResultDict")(py::dict(), keys.owner()));
   for (auto &[key, doc] : snapshot.docs) {
-    out[make_key(py::str(key), token)] = py::cast(std::move(doc));
+    out[keys.wrap(py::str(key))] = py::cast(std::move(doc));
   }
   return out;
 }
@@ -582,6 +625,7 @@ void fetch_chunk_for_python(
     const Collection &collection, const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
     bool include_vector, const CollectionSchema &schema, py::dict &out,
+    const PythonFetchResultKeys &keys,
     detail::ResultMemoryAllowance::Lease &allowance,
     detail::ResultMemoryAllowance::Lease &batch_memory) {
   auto snapshot = fetch_snapshot_for_python(collection, pks, output_fields,
@@ -604,7 +648,7 @@ void fetch_chunk_for_python(
           batch_memory.add(0, backing);
         }
         fetch_chunk_for_python(collection, {begin, end}, output_fields,
-                               include_vector, schema, out, allowance,
+                               include_vector, schema, out, keys, allowance,
                                batch_memory);
       };
       fetch_half(pks.begin(), middle);
@@ -612,7 +656,7 @@ void fetch_chunk_for_python(
       return;
     }
     reserve_forward_results(*snapshot.forward, allowance);
-    forward_to_tuples(*snapshot.forward, out);
+    forward_to_tuples(*snapshot.forward, out, keys);
     return;
   }
   reserve_fetch_results(snapshot.docs, schema, allowance);
@@ -621,7 +665,7 @@ void fetch_chunk_for_python(
   while (!snapshot.docs.empty()) {
     auto it = snapshot.docs.begin();
     if (it->second) {
-      out[py::str(it->first)] = ZVecPyDoc::doc_to_tuple_with_fields(
+      out[keys.wrap(py::str(it->first))] = ZVecPyDoc::doc_to_tuple_with_fields(
           *it->second, forward_fields, vector_fields);
     }
     snapshot.docs.erase(it);
@@ -732,6 +776,9 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
   auto allowance = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       budgeted ? &forward_result_allowance() : nullptr,
       /*serialize_materialization=*/true, kPythonResultBackingQuantum);
+  const PythonFetchResultKeys keys(allowance);
+  auto release_slot =
+      ailego::ScopeGuard::Make([&] { allowance->end_materialization(); });
   {
     py::gil_scoped_release release;
     allowance->begin_materialization();
@@ -785,9 +832,9 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
       }
     }
     fetch_chunk_for_python(collection, batch, output_fields, include_vector,
-                           *schema, out, *allowance, batch_memory);
+                           *schema, out, keys, *allowance, batch_memory);
   } while (begin < pks.size());
-  retain_result_memory(out, allowance);
+  retain_result_memory(out, allowance, keys.owner());
   return out;
 } catch (const std::bad_alloc &) {
   PyErr_SetString(
