@@ -20,6 +20,7 @@
 #include <roaring.hh>
 #include <arrow/compute/api_vector.h>
 #include <arrow/type_fwd.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
 #include <zvec/db/status.h>
@@ -83,19 +84,56 @@ Status SegmentHelper::Execute(SegmentTask::Ptr &task) {
   return s;
 }
 
-class RowIdFilter : public IndexFilter {
+class SegmentHelper::CompactionDeleteRows : public IndexFilter {
  public:
-  // Copies the bitmap so callers can keep using it (e.g. share with FTS
-  // reduce).
-  explicit RowIdFilter(const roaring::Roaring &delete_row_id_bitmap)
-      : delete_row_id_bitmap_(delete_row_id_bitmap) {}
+  // Scan order is increasing, so only the current high-16-bit container can
+  // grow. Keep the previous containers charged while building the next one.
+  void add(uint32_t position) {
+    const uint32_t group = position >> 16;
+    if (group != group_) {
+      if (rows_ <= kArrayRows) {
+        active_.retain_at_most(kContainerOverhead +
+                               2 * sizeof(uint16_t) * admitted_rows_);
+      }
+      previous_.absorb(std::move(active_));
+      active_.add(kContainerOverhead);
+      group_ = group;
+      rows_ = 0;
+      admitted_rows_ = 0;
+    }
+    if (rows_ == admitted_rows_ && admitted_rows_ < kArrayRows) {
+      const uint32_t next = admitted_rows_ ? 2 * admitted_rows_ : 8;
+      // Charge both allocations during array growth and leave room for the
+      // eventual conversion from an array to a bitset.
+      active_.add_array(next - admitted_rows_, 4 * sizeof(uint16_t));
+      admitted_rows_ = next;
+    }
+    bitmap_.add(position);
+    if (++rows_ == kArrayRows + 1) {
+      active_.retain_at_most(kContainerOverhead + kBitsetBytes);
+    }
+  }
 
   bool is_filtered(uint64_t id) const override {
-    return delete_row_id_bitmap_.contains(id);
+    return id <= UINT32_MAX && bitmap_.contains(static_cast<uint32_t>(id));
+  }
+
+  const roaring::Roaring &bitmap() const {
+    return bitmap_;
   }
 
  private:
-  roaring::Roaring delete_row_id_bitmap_;
+  // CRoaring inserts into an array up to 4096 entries, then uses a 64K-bit
+  // bitset. The overhead includes container objects and directory growth.
+  static constexpr uint32_t kArrayRows = 4096;
+  static constexpr size_t kBitsetBytes = (1UL << 16) / 8;
+  static constexpr size_t kContainerOverhead = 256;
+  ailego::MemoryReservation previous_;
+  ailego::MemoryReservation active_;
+  roaring::Roaring bitmap_;
+  uint32_t group_ = UINT32_MAX;
+  uint32_t rows_ = 0;
+  uint32_t admitted_rows_ = 0;
 };
 
 Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
@@ -129,14 +167,14 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
       [block_id = BlockID{0}]() mutable { return block_id++; };
 
   // iterate every doc, build forward and invert indexer
-  roaring::Roaring delete_row_id_bitmap;
+  auto delete_rows = std::make_shared<CompactionDeleteRows>();
   uint64_t min_doc_id{std::numeric_limits<uint64_t>::max()};
   uint64_t max_doc_id{0};
   uint32_t doc_count{0};
   std::vector<BlockMeta> block_metas;
   Status s = ReduceScalar(schema, input_segments, output_segment_path, columns,
                           filter, task.forward_use_parquet_, block_id_generator,
-                          &delete_row_id_bitmap, &block_metas, &min_doc_id,
+                          delete_rows.get(), &block_metas, &min_doc_id,
                           &max_doc_id, &doc_count);
   CHECK_RETURN_STATUS(s);
 
@@ -146,10 +184,8 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
 
   // An empty bitmap means forward rows were retained. Leave the filter null
   // so vector merging can skip delete checks and reuse compatible indexes.
-  std::shared_ptr<RowIdFilter> row_id_filter;
-  if (!delete_row_id_bitmap.isEmpty()) {
-    row_id_filter = std::make_shared<RowIdFilter>(delete_row_id_bitmap);
-  }
+  IndexFilter::Ptr row_id_filter =
+      delete_rows->bitmap().isEmpty() ? nullptr : delete_rows;
 
   s = ReduceVectorIndex(schema, input_segments, output_segment_path,
                         row_id_filter, block_id_generator, min_doc_id,
@@ -160,7 +196,7 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
   LOG_INFO("Compacted vector index");
 
   s = ReduceFts(schema, input_segments, output_segment_path,
-                delete_row_id_bitmap, block_id_generator, &block_metas);
+                delete_rows->bitmap(), block_id_generator, &block_metas);
   CHECK_RETURN_STATUS(s);
 
   LOG_INFO("Compacted fts index");
@@ -185,7 +221,7 @@ Status SegmentHelper::ReduceScalar(
     const std::string &output_segment_path,
     const std::vector<std::string> &columns, const IndexFilter::Ptr &filter,
     bool forward_use_parquet, std::function<BlockID()> &block_id_generator,
-    roaring::Roaring *delete_row_id_bitmap,
+    CompactionDeleteRows *delete_rows,
     std::vector<BlockMeta> *output_block_metas, uint64_t *min_doc_id,
     uint64_t *max_doc_id, uint32_t *doc_count) {
   // forward
@@ -263,11 +299,14 @@ Status SegmentHelper::ReduceScalar(
       }
 
       if (batch_value->num_rows() == 0) continue;
+      if (batch_value->num_rows() > UINT32_MAX - row_id_offset) {
+        return Status::InvalidArgument("Too many rows in a compacted segment");
+      }
 
       std::shared_ptr<arrow::RecordBatch> filtered_batch;
       auto as =
           FilterRecordBatch(batch_value, filter, row_id_offset, &filtered_batch,
-                            delete_row_id_bitmap, min_doc_id, max_doc_id, pool);
+                            delete_rows, min_doc_id, max_doc_id, pool);
       if (!as.ok()) {
         return read_or_write_error("filter record batch failed: ", as);
       }
@@ -996,7 +1035,7 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     const std::shared_ptr<arrow::RecordBatch> &batch,
     const IndexFilter::Ptr filter, uint32_t row_id_offset,
     std::shared_ptr<arrow::RecordBatch> *filterd,
-    roaring::Roaring *delete_row_id_bitmap, uint64_t *min_doc_id,
+    CompactionDeleteRows *delete_rows, uint64_t *min_doc_id,
     uint64_t *max_doc_id, arrow::MemoryPool *pool) {
   if (!filter) {
     *filterd = batch;
@@ -1027,7 +1066,12 @@ arrow::Status SegmentHelper::FilterRecordBatch(
       *min_doc_id = std::min(*min_doc_id, doc_id);
       *max_doc_id = std::max(*max_doc_id, doc_id);
     } else {
-      delete_row_id_bitmap->add(i + row_id_offset);
+      try {
+        delete_rows->add(i + row_id_offset);
+      } catch (const std::bad_alloc &) {
+        return arrow::Status::OutOfMemory(
+            "Compaction deletion bitmap exceeds budget");
+      }
     }
   }
 

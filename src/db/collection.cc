@@ -27,6 +27,7 @@
 #include <variant>
 #include <vector>
 #include <ailego/io/file_lock.h>
+#include <ailego/pattern/defer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
@@ -1043,6 +1044,17 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
   auto tasks =
       build_compact_task(schema_, persist_segments, options.concurrency_,
                          delete_store_clone->make_filter());
+  AILEGO_DEFER([&] {
+    // A later task can fail admission after an earlier one finished writing.
+    // Discard all remaining temporary outputs from this optimize attempt.
+    for (const auto &task : tasks) {
+      const auto *compact = std::get_if<CompactTask>(&task->task_info());
+      if (compact && compact->output_segment_meta_) {
+        FileHelper::RemoveDirectory(
+            FileHelper::MakeTempSegmentPath(path_, compact->output_segment_id_));
+      }
+    }
+  });
   auto s = execute_compact_task(tasks);
   CHECK_RETURN_STATUS(s);
 

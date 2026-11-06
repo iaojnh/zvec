@@ -246,6 +246,8 @@ class SegmentHelper {
   static Status Execute(SegmentTask::Ptr &task);
 
  private:
+  class CompactionDeleteRows;
+
   static Status ExecuteCompactTask(CompactTask &task);
 
   static Status ExecuteCreateVectorIndexTask(CreateVectorIndexTask &task);
@@ -256,7 +258,6 @@ class SegmentHelper {
 
   static Status ExecuteDropScalarIndexTask(DropScalarIndexTask &task);
 
- public:
   static Status ReduceScalar(const CollectionSchema::Ptr schema,
                              const std::vector<Segment::Ptr> &input_segments,
                              const std::string &output_segment_path,
@@ -264,11 +265,12 @@ class SegmentHelper {
                              const IndexFilter::Ptr &filter,
                              bool forward_use_parquet,
                              std::function<BlockID()> &block_id_generator,
-                             roaring::Roaring *delete_row_id_bitmap,
+                             CompactionDeleteRows *delete_rows,
                              std::vector<BlockMeta> *output_block_metas,
                              uint64_t *min_doc_id, uint64_t *max_doc_id,
                              uint32_t *doc_count);
 
+ public:
   static Status ReduceScalarIndex(
       InvertedIndexer::Ptr indexer,
       const std::shared_ptr<arrow::RecordBatch> &batch, uint32_t doc_id_offset,
@@ -326,7 +328,7 @@ class SegmentHelper {
       const std::shared_ptr<arrow::RecordBatch> &batch,
       const IndexFilter::Ptr filter, uint32_t row_id_offset,
       std::shared_ptr<arrow::RecordBatch> *filtered,
-      roaring::Roaring *delete_row_id_bitmap, uint64_t *min_doc_id,
+      CompactionDeleteRows *delete_rows, uint64_t *min_doc_id,
       uint64_t *max_doc_id, arrow::MemoryPool *pool);
 };
 

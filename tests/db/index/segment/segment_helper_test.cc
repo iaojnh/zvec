@@ -337,12 +337,12 @@ TEST_F(SegmentHelperTest, CompactTask_FilterBudgetDenialAllowsRetry) {
   ASSERT_NE(nullptr, input);
   ASSERT_TRUE(input->flush().ok());
 
-  bool block_filter = true;
+  uint64_t block_at = UINT64_MAX;
   ailego::MemoryReservation pressure;
   auto filter = EasyIndexFilter::Create([&](uint64_t id) {
-    // Wait until the reader has returned its input batch, then exhaust the
-    // budget before the selection builder can allocate.
-    if (block_filter && !pressure.bytes()) {
+    // Exhaust the budget after reading the batch, before either the first
+    // deleted row or the first selected row is recorded.
+    if (id == block_at) {
       pressure.add(pool.capacity() - pool.used());
     }
     return id == 0;
@@ -352,16 +352,23 @@ TEST_F(SegmentHelperTest, CompactTask_FilterBudgetDenialAllowsRetry) {
                       /*forward_use_parquet=*/true, /*enable_mmap=*/true, 1);
   auto task = SegmentTask::CreateCompactTask(compact);
   ASSERT_NE(nullptr, task);
-  auto status = SegmentHelper::Execute(task);
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code()) << status.message();
-  EXPECT_EQ(0u, status.message().find("filter record batch failed"));
-  EXPECT_EQ(nullptr, std::get<CompactTask>(task->task_info()).output_segment_meta_);
   const auto tmp_path = FileHelper::MakeTempSegmentPath(col_path, output_id);
-  EXPECT_FALSE(std::filesystem::exists(tmp_path));
+  for (const uint64_t id : {0, 1}) {
+    block_at = id;
+    auto status = SegmentHelper::Execute(task);
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code()) << status.message();
+    EXPECT_EQ(0u, status.message().find("filter record batch failed"));
+    EXPECT_EQ(id == 0,
+              status.message().find("Compaction deletion bitmap") !=
+                  std::string::npos);
+    EXPECT_EQ(nullptr,
+              std::get<CompactTask>(task->task_info()).output_segment_meta_);
+    EXPECT_FALSE(std::filesystem::exists(tmp_path));
+    pressure = ailego::MemoryReservation{};
+  }
 
-  block_filter = false;
-  pressure = ailego::MemoryReservation{};
-  status = SegmentHelper::Execute(task);
+  block_at = UINT64_MAX;
+  auto status = SegmentHelper::Execute(task);
   ASSERT_TRUE(status.ok()) << status.message();
   const auto &output = std::get<CompactTask>(task->task_info()).output_segment_meta_;
   ASSERT_NE(nullptr, output);
