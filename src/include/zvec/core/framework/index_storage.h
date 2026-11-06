@@ -666,6 +666,11 @@ class IndexStorage : public IndexModule {
       }
       return read_size;
     }
+
+    //! Inspect immediately after a failed scalar write on this thread.
+    virtual int write_error() const {
+      return IndexError_WriteData;
+    }
   };
 
   //! Destructor

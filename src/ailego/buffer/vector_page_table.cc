@@ -1618,6 +1618,12 @@ bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
 
 char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
                                     bool record_reuse) {
+  return acquire_buffer(page_id, retry, record_reuse, nullptr);
+}
+
+char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
+                                    bool record_reuse,
+                                    bool *allocation_failed) {
   assert(page_id < page_table_.entry_num());
   while (true) {
     char *buffer = page_table_.acquire_block(page_id, record_reuse);
@@ -1699,6 +1705,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
       const auto memory_stats = MemoryLimitPool::get_instance().stats();
       const auto page_stats = page_table_.stats();
       const int error = writeback_error();
+      if (allocation_failed) *allocation_failed = (error == 0);
       if (error != 0) {
         LOG_ERROR(
             "Buffer pool allocation stopped after writeback failure: "
@@ -2102,13 +2109,21 @@ bool VecBufferPool::read_ranges_bypass(const ReadRange *ranges, size_t count) {
 
 int VecBufferPool::write_range(size_t file_offset, size_t length,
                                const char *src) {
+  return write_range_status(file_offset, length, src) == PageWriteStatus::kOk
+             ? 0
+             : -1;
+}
+
+PageWriteStatus VecBufferPool::write_range_status(size_t file_offset,
+                                                  size_t length,
+                                                  const char *src) {
   if (!writable_) {
     LOG_ERROR("write_range called on read-only pool: file[%s]",
               file_name_.c_str());
-    return -1;
+    return PageWriteStatus::kError;
   }
   if (length == 0) {
-    return 0;
+    return PageWriteStatus::kOk;
   }
   if (src == nullptr || file_offset > file_size_ ||
       length > file_size_ - file_offset) {
@@ -2116,7 +2131,7 @@ int VecBufferPool::write_range(size_t file_offset, size_t length,
         "write_range exceeds file bounds: file[%s], offset[%zu], "
         "length[%zu], file_size[%zu]",
         file_name_.c_str(), file_offset, length, file_size_);
-    return -1;
+    return PageWriteStatus::kError;
   }
   size_t first_page = file_offset / kVectorPageSize;
   size_t last_page = (file_offset + length - 1) / kVectorPageSize;
@@ -2124,11 +2139,14 @@ int VecBufferPool::write_range(size_t file_offset, size_t length,
   size_t src_cursor = 0;
   for (size_t pg = first_page; pg <= last_page; ++pg) {
     // Load partial pages before modifying them.
-    char *page = this->acquire_buffer(pg, 50);
+    bool allocation_failed = false;
+    char *page = acquire_buffer(pg, 50, /*record_reuse=*/true,
+                                &allocation_failed);
     if (!page) {
       LOG_ERROR("write_range acquire failed: file[%s], page[%zu]",
                 file_name_.c_str(), pg);
-      return -1;
+      return allocation_failed ? PageWriteStatus::kNoMemory
+                               : PageWriteStatus::kError;
     }
     std::unique_lock<std::shared_mutex> page_lock(
         block_mutexes_[pg % block_mutex_count_]);
@@ -2141,7 +2159,7 @@ int VecBufferPool::write_range(size_t file_offset, size_t length,
     src_cursor += chunk;
     remaining -= chunk;
   }
-  return 0;
+  return PageWriteStatus::kOk;
 }
 
 int VecBufferPool::write_fragments(const VecBufferWriteFragment *fragments,
@@ -2646,6 +2664,12 @@ int VecBufferPoolHandle::get_meta(size_t offset, size_t length, char *buffer) {
 int VecBufferPoolHandle::write_range(size_t file_offset, size_t len,
                                      const char *src) {
   return pool_.write_range(file_offset, len, src);
+}
+
+PageWriteStatus VecBufferPoolHandle::write_range_status(size_t file_offset,
+                                                       size_t len,
+                                                       const char *src) {
+  return pool_.write_range_status(file_offset, len, src);
 }
 
 int VecBufferPoolHandle::write_fragments(

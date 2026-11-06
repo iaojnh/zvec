@@ -15,6 +15,7 @@
 #include "utility/appendable_build_buffer.h"
 #include <array>
 #include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
 #include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
@@ -63,6 +64,28 @@ TEST_F(AppendableBuildBufferTest, GrowsAcrossChunksWithoutLosingEarlierData) {
     EXPECT_EQ(0, moved.read(size - 1, row.data(), 1));
     EXPECT_LE(pool_.used(), pool_.capacity());
   }
+}
+
+TEST_F(AppendableBuildBufferTest, ReportsWriteBudgetDenialAndRecovers) {
+  ASSERT_EQ(0, pool_.init(4 * 1024 * 1024));
+  AppendableBuildBuffer buffer;
+  ASSERT_EQ(0, buffer.init(1024 * 1024));
+  ASSERT_TRUE(buffer.paged());
+
+  auto &memory = ailego::MemoryLimitPool::get_instance();
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(memory.configure_process_rss_limit(0));
+  });
+  ASSERT_TRUE(memory.configure_process_rss_limit(1));
+  const size_t offset = buffer.size() - 1;
+  const char marker = 'm';
+  EXPECT_EQ(IndexError_NoMemory, buffer.write(offset, &marker, 1));
+
+  ASSERT_TRUE(memory.configure_process_rss_limit(0));
+  ASSERT_EQ(0, buffer.write(offset, &marker, 1));
+  char read_back = 0;
+  ASSERT_EQ(0, buffer.read(offset, &read_back, 1));
+  EXPECT_EQ(marker, read_back);
 }
 
 TEST_F(AppendableBuildBufferTest, FailedAdmissionDoesNotFallBackToHeap) {

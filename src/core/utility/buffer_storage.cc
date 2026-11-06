@@ -42,6 +42,7 @@ namespace {
 
 constexpr size_t kBufferAlignment = 4096UL;
 thread_local int buffer_storage_read_error = IndexError_ReadData;
+thread_local int buffer_storage_write_error = IndexError_WriteData;
 
 inline bool AlignBufferSize(size_t size, size_t *aligned_size) {
   if (size > std::numeric_limits<size_t>::max() - (kBufferAlignment - 1)) {
@@ -757,9 +758,14 @@ class BufferStorage : public IndexStorage {
       return false;
     }
 
+    int write_error() const override {
+      return buffer_storage_write_error;
+    }
+
     //! Write data into the storage with offset. The shard latch excludes
     //! flush; meta_mtx_ serializes metadata changes within this segment.
     size_t write(size_t offset, const void *data, size_t len) override {
+      buffer_storage_write_error = IndexError_WriteData;
       std::shared_lock<std::shared_mutex> latch(
           owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
       if (ailego_unlikely(!owner_->buffer_pool_handle_ ||
@@ -791,8 +797,11 @@ class BufferStorage : public IndexStorage {
                           segment_info_->segment_header->content_offset +
                           meta->data_index + offset;
       // Publish data_size only after the page bytes are visible to readers.
-      if (owner_->buffer_pool_handle_->write_range(
-              abs_offset, len, static_cast<const char *>(data)) != 0) {
+      const auto status = owner_->buffer_pool_handle_->write_range_status(
+          abs_offset, len, static_cast<const char *>(data));
+      if (status != ailego::PageWriteStatus::kOk) {
+        if (status == ailego::PageWriteStatus::kNoMemory)
+          buffer_storage_write_error = IndexError_NoMemory;
         LOG_ERROR("write() page-cache write_range failed at abs_offset=%zu",
                   abs_offset);
         return 0;

@@ -514,6 +514,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
 class VecBufferPool;
 class VecBufferPoolHandle;
 
+enum class PageWriteStatus { kOk, kError, kNoMemory };
+
 struct VecBufferWriteFragment {
   size_t file_offset;
   size_t length;
@@ -784,6 +786,10 @@ class ZVEC_AILEGO_API VecBufferPool {
  private:
   friend class VecBufferPoolHandle;
   friend struct VecBufferPoolTestPeer;
+  char *acquire_buffer(block_id_t page_id, int retry, bool record_reuse,
+                       bool *allocation_failed);
+  PageWriteStatus write_range_status(size_t file_offset, size_t length,
+                                     const char *src);
   bool acquire_pages_impl(const block_id_t *page_ids, size_t count,
                           char **pages, int retry);
   void prefetch_pages_sync(block_id_t first_page, size_t page_count,
@@ -913,6 +919,8 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
   int get_meta(size_t offset, size_t length, char *buffer);
 
   int write_range(size_t file_offset, size_t len, const char *src);
+  PageWriteStatus write_range_status(size_t file_offset, size_t len,
+                                     const char *src);
 
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
 

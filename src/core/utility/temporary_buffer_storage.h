@@ -109,7 +109,7 @@ class TemporaryBufferStorage {
     try {
       return bytes == 0 || segment_->fetch(offset, out, bytes) == bytes
                  ? 0
-                 : IndexError_ReadData;
+                 : segment_->read_error();
     } catch (const std::bad_alloc &) {
       return IndexError_NoMemory;
     } catch (const std::exception &) {
@@ -124,7 +124,7 @@ class TemporaryBufferStorage {
     try {
       return bytes == 0 || segment_->write(offset, data, bytes) == bytes
                  ? 0
-                 : IndexError_WriteData;
+                 : segment_->write_error();
     } catch (const std::bad_alloc &) {
       return IndexError_NoMemory;
     } catch (const std::exception &) {

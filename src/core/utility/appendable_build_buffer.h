@@ -85,8 +85,9 @@ class AppendableBuildBuffer {
     auto *dest = static_cast<char *>(out);
     while (bytes) {
       size_t n = std::min(bytes, kChunk - offset % kChunk);
-      if (segments_[offset / kChunk]->fetch(offset % kChunk, dest, n) != n)
-        return IndexError_ReadData;
+      const auto &segment = segments_[offset / kChunk];
+      if (segment->fetch(offset % kChunk, dest, n) != n)
+        return segment->read_error();
       bytes -= n;
       offset += n;
       dest += n;
@@ -109,8 +110,9 @@ class AppendableBuildBuffer {
     const auto *src = static_cast<const char *>(data);
     while (bytes) {
       size_t n = std::min(bytes, kChunk - offset % kChunk);
-      if (segments_[offset / kChunk]->write(offset % kChunk, src, n) != n)
-        return IndexError_WriteData;
+      const auto &segment = segments_[offset / kChunk];
+      if (segment->write(offset % kChunk, src, n) != n)
+        return segment->write_error();
       bytes -= n;
       offset += n;
       src += n;
