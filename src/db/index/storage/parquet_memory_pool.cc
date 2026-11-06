@@ -297,8 +297,8 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
   return arrow::Status::OK();
 }
 
-arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
-                                            int64_t alignment, uint8_t **ptr) {
+std::optional<arrow::Status> ParquetMemoryPool::TryReallocateInPlace(
+    int64_t old_size, int64_t new_size, int64_t alignment, uint8_t **ptr) {
   if (ptr == nullptr || (old_size != 0 && *ptr == nullptr)) {
     return arrow::Status::Invalid("Null Parquet reallocation input");
   }
@@ -347,6 +347,15 @@ arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
       return arrow::Status::OK();
     }
   }
+  return std::nullopt;
+}
+
+arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
+                                            int64_t alignment, uint8_t **ptr) {
+  if (auto status = TryReallocateInPlace(old_size, new_size, alignment, ptr)) {
+    return *status;
+  }
+  alignment = std::max(alignment, kMinimumAlignment);
   if (!enforce_budget_ && old_size != 0 &&
       old_size < kMappedAllocationThreshold &&
       new_size < kMappedAllocationThreshold) {

@@ -25,6 +25,12 @@ class ProcessRssBudget {
     size_t available{0};
   };
   using NativeReader = bool (*)(NativeSample *);
+  // A mapping can refund its projection only until the corresponding reader
+  // has taken another sample. RSS and native footprint can refresh separately.
+  struct MaterializationStamp {
+    uint64_t rss_epoch{0};
+    uint64_t native_epoch{0};
+  };
   enum class PressureLevel { kNormal, kBackground, kCritical };
 
   void set_external_pressure(PressureLevel level) {
@@ -70,9 +76,7 @@ class ProcessRssBudget {
     if (limit && native_reader) {
       if (!this->limit() || native_reader_ != native_reader)
         native_estimate_.reset(native.footprint, backing_);
-      native_estimate_.observe(native.footprint, backing_);
-      native_materialized_ = 0;
-      native_limit_ = add_saturated(native.footprint, native.available);
+      publish_native(native);
     }
     native_reader_ = native_reader;
     reader_ = reader;
@@ -103,7 +107,7 @@ class ProcessRssBudget {
     return try_charge(bytes, pending_allocations_);
   }
 
-  void finish_reservation(size_t bytes, bool allocated) {
+  MaterializationStamp finish_reservation(size_t bytes, bool allocated) {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(bytes <= pending_allocations_);
     pending_allocations_ -= bytes;
@@ -115,6 +119,8 @@ class ProcessRssBudget {
       remember_materialization(bytes);
     }
     update_available();
+    if (!allocated || !limit()) return {};
+    return {rss_epoch_, native_reader_ ? native_epoch_ : 0};
   }
 
   // Some consumers (RocksDB's block reader) cannot safely reject allocation
@@ -131,7 +137,17 @@ class ProcessRssBudget {
   }
 
   void release(size_t bytes) {
+    release_unmapped(bytes, {});
+  }
+
+  // For a whole mapping that has already been unmapped successfully. Never
+  // refund a different operation's projection or alter the measured RSS.
+  void release_unmapped(size_t bytes, MaterializationStamp stamp) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stamp.rss_epoch && stamp.rss_epoch == rss_epoch_)
+      refund_projection(bytes, rss_materialized_);
+    if (stamp.native_epoch && stamp.native_epoch == native_epoch_)
+      refund_projection(bytes, native_materialized_);
     assert(bytes <= backing_);
     backing_ -= bytes;
     // Only backing that could have contributed to a successful RSS sample
@@ -186,6 +202,13 @@ class ProcessRssBudget {
   }
 
  private:
+  static void refund_projection(size_t bytes, size_t &projection) {
+    // Keep saturated projections conservative until the next sample.
+    if (projection == std::numeric_limits<size_t>::max()) return;
+    assert(bytes <= projection);
+    projection -= bytes;
+  }
+
   void remember_materialization(size_t bytes) {
     if (!limit()) return;
     rss_materialized_ = add_saturated(rss_materialized_, bytes);
@@ -267,11 +290,7 @@ class ProcessRssBudget {
     if (native_reader_) {
       NativeSample native;
       sampled_native = native_reader_(&native);
-      if (sampled_native) {
-        native_estimate_.observe(native.footprint, backing_);
-        native_materialized_ = 0;
-        native_limit_ = add_saturated(native.footprint, native.available);
-      }
+      if (sampled_native) publish_native(native);
       native_sample_failures_ =
           sampled_native ? 0 : next_sample_failure(native_sample_failures_);
     }
@@ -293,9 +312,17 @@ class ProcessRssBudget {
     return failures < kMaxSampleFailures ? failures + 1 : failures;
   }
 
+  void publish_native(const NativeSample &native) {
+    native_estimate_.observe(native.footprint, backing_);
+    native_materialized_ = 0;
+    ++native_epoch_;
+    native_limit_ = add_saturated(native.footprint, native.available);
+  }
+
   void publish(size_t rss) {
     if (limit()) estimate_.observe(rss, backing_);
     rss_materialized_ = 0;
+    ++rss_epoch_;
     rss_.store(rss, std::memory_order_relaxed);
     update_available();
     sampled_at_ = std::chrono::steady_clock::now();
@@ -447,5 +474,7 @@ class ProcessRssBudget {
   std::atomic<bool> pressure_{false};
   size_t rss_materialized_{0};
   size_t native_materialized_{0};
+  uint64_t rss_epoch_{0};
+  uint64_t native_epoch_{0};
 };
 }  // namespace zvec::ailego

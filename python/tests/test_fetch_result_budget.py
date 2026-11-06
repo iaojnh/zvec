@@ -341,6 +341,36 @@ def test_fetch_input_and_workspace_admission(tmp_path, mode):
     run_worker(mode, path, "VECTOR_FP32", False, 64, 8)
 
 
+def verify_fetch_dict_results(path, kind, mmap, dimension, count):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    fetch = coll._obj.Fetch
+    missing = [f"missing{i:06d}" for i in range(2_048)]
+    held = []
+    for _ in range(64):
+        try:
+            result = fetch(missing)
+        except MemoryError:
+            break
+        assert len(result) == len(missing)
+        assert all(doc is None for doc in result.values())
+        held.append(tuple(result))
+        del result
+    else:
+        pytest.fail("Keys extracted from missing-ID results must retain admission")
+    assert held
+    held.clear()
+    result = fetch(["0", "missing"])
+    assert result["0"] is not None and result["missing"] is None
+    coll.close()
+
+
+def test_fetch_dict_keys_hold_and_release_budget(tmp_path):
+    path = tmp_path / "fetch_dict"
+    run_worker("build", path, "VECTOR_FP32", False, 64, 8)
+    run_worker("fetch_dict", path, "VECTOR_FP32", False, 64, 8)
+
+
 def verify_id_results(path, kind, mmap, dimension, count):
     zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
     coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
@@ -514,6 +544,7 @@ if __name__ == "__main__":
         "exception": verify_exception,
         "inputs": verify_fetch_inputs,
         "iterables": verify_fetch_iterables,
+        "fetch_dict": verify_fetch_dict_results,
         "id_results": verify_id_results,
         "iterator_results": verify_iterator_results,
         "group_results": verify_group_results,

@@ -295,11 +295,16 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool account_pending_process_backing(size_t bytes) {
     return process_rss_.account_pending(bytes);
   }
-  void finish_process_backing(size_t bytes, bool allocated) {
-    process_rss_.finish_reservation(bytes, allocated);
+  ProcessRssBudget::MaterializationStamp finish_process_backing(
+      size_t bytes, bool allocated) {
+    return process_rss_.finish_reservation(bytes, allocated);
   }
   void release_process_backing(size_t bytes) {
     process_rss_.release(bytes);
+  }
+  void release_unmapped_process_backing(
+      size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
+    process_rss_.release_unmapped(bytes, stamp);
   }
 
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);

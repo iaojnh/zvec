@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <rocksdb/memory_allocator.h>
+#include <zvec/ailego/buffer/process_rss_budget.h>
 
 namespace zvec {
 
@@ -40,6 +41,7 @@ class RocksdbCacheAllocator final : public rocksdb::MemoryAllocator {
  private:
   struct alignas(std::max_align_t) Header {
     size_t mapped_bytes;
+    ailego::ProcessRssBudget::MaterializationStamp projection;
   };
 
   const size_t page_size_;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -17,6 +18,13 @@ inline size_t FetchMemoryBytes(size_t count, size_t width, size_t extra = 0) {
   if (width && count > (std::numeric_limits<size_t>::max() - extra) / width)
     throw std::bad_alloc();
   return count * width + extra;
+}
+
+// Account for the allocation rounding of native string payloads. Short
+// strings fit inside the vector's slots, including on other STL backends.
+inline size_t FetchStringBackingBytes(size_t bytes) {
+  static const size_t inline_capacity = std::string{}.capacity();
+  return bytes > inline_capacity ? FetchMemoryBytes(1, bytes, 32) : 0;
 }
 
 // Admit native input copies before pybind's automatic vector/string caster
@@ -47,9 +55,13 @@ class PythonFetchInputs {
     }
   }
 
- public:
   static size_t string_bytes(pybind11::handle value) {
-    size_t bytes;
+    // Allow for native storage, transient UTF-8 and allocator rounding.
+    return FetchMemoryBytes(utf8_size_bound(value), 2, 64);
+  }
+
+ private:
+  static size_t utf8_size_bound(pybind11::handle value) {
     if (PyUnicode_Check(value.ptr())) {
       const auto length = PyUnicode_GetLength(value.ptr());
       if (length < 0) throw pybind11::error_already_set();
@@ -58,21 +70,26 @@ class PythonFetchInputs {
           : PyUnicode_KIND(value.ptr()) == PyUnicode_1BYTE_KIND ? 2
           : PyUnicode_KIND(value.ptr()) == PyUnicode_2BYTE_KIND ? 3
                                                                 : 4;
-      bytes = FetchMemoryBytes(static_cast<size_t>(length), width);
-    } else if (PyBytes_Check(value.ptr())) {
-      bytes = static_cast<size_t>(PyBytes_GET_SIZE(value.ptr()));
-    } else if (PyByteArray_Check(value.ptr())) {
-      bytes = static_cast<size_t>(PyByteArray_GET_SIZE(value.ptr()));
-    } else {
-      throw pybind11::type_error("Fetch IDs and output fields must be strings");
+      return FetchMemoryBytes(static_cast<size_t>(length), width);
     }
-    // Native string plus transient UTF-8 bytes, terminators and allocator
-    // rounding. Do not populate a persistent UTF-8 cache on caller strings.
-    return FetchMemoryBytes(bytes, 2, 64);
+    if (PyBytes_Check(value.ptr())) {
+      return static_cast<size_t>(PyBytes_GET_SIZE(value.ptr()));
+    }
+    if (PyByteArray_Check(value.ptr())) {
+      return static_cast<size_t>(PyByteArray_GET_SIZE(value.ptr()));
+    }
+    throw pybind11::type_error("Fetch IDs and output fields must be strings");
   }
 
+ public:
   static std::string copy_string(pybind11::handle value) {
     if (PyUnicode_Check(value.ptr())) {
+      if (PyUnicode_IS_ASCII(value.ptr())) {
+        const auto *data =
+            reinterpret_cast<const char *>(PyUnicode_1BYTE_DATA(value.ptr()));
+        return {data, static_cast<size_t>(PyUnicode_GET_LENGTH(value.ptr()))};
+      }
+      // Avoid populating a persistent UTF-8 cache on caller strings.
       auto encoded = pybind11::reinterpret_steal<pybind11::object>(
           PyUnicode_AsUTF8String(value.ptr()));
       if (!encoded) throw pybind11::error_already_set();
@@ -108,14 +125,33 @@ class PythonFetchInputs {
                     : PyTuple_GET_ITEM(source.ptr(), i);
       };
       size_t admitted = 0;
+      size_t backing_admitted = 0;
       while (true) {
         const auto size = count();
         size_t needed = FetchMemoryBytes(static_cast<size_t>(size), kSlotBytes);
-        for (Py_ssize_t i = 0; i < size; ++i)
-          needed = FetchMemoryBytes(1, string_bytes(item(i)), needed);
-        if (needed > admitted) {
-          admit(needed - admitted);
+        size_t backing =
+            FetchMemoryBytes(static_cast<size_t>(size), sizeof(std::string));
+        for (Py_ssize_t i = 0; i < size; ++i) {
+          const auto value = item(i);
+          const size_t utf8 = utf8_size_bound(value);
+          const size_t allowance = FetchMemoryBytes(utf8, 2, 64);
+          needed = FetchMemoryBytes(1, allowance, needed);
+          // Keep room for transient encoder backing for non-ASCII inputs.
+          // ASCII and bytes copy directly into the native string.
+          const bool encodes =
+              PyUnicode_Check(value.ptr()) && !PyUnicode_IS_ASCII(value.ptr());
+          backing = FetchMemoryBytes(
+              1, encodes ? allowance : FetchStringBackingBytes(utf8), backing);
+        }
+        if (needed > admitted || backing > backing_admitted) {
+          needed = std::max(needed, admitted);
+          backing = std::max(backing, backing_admitted);
+          {
+            pybind11::gil_scoped_release release;
+            memory_.add(needed - admitted, backing - backing_admitted);
+          }
           admitted = needed;
+          backing_admitted = backing;
           // Admission releases the GIL. Recheck mutable lists/bytearrays
           // before copying, then hold the GIL through the entire conversion.
           continue;

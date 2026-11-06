@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 #include <arrow/memory_pool.h>
@@ -52,6 +53,11 @@ class ParquetMemoryPool final : public arrow::MemoryPool {
   arrow::Status Reallocate(int64_t old_size, int64_t new_size,
                            int64_t alignment, uint8_t **ptr) override;
   void Free(uint8_t *buffer, int64_t size, int64_t alignment) override;
+
+  // A disengaged result requires the general reallocation path. This call
+  // never allocates a replacement, even if budget configuration changes.
+  std::optional<arrow::Status> TryReallocateInPlace(
+      int64_t old_size, int64_t new_size, int64_t alignment, uint8_t **ptr);
 
   int64_t bytes_allocated() const override {
     return stats_.bytes_allocated();

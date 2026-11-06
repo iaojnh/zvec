@@ -679,6 +679,49 @@ TEST(ProcessRssBudgetTest, GrowingAllowanceChargesFullMaterialization) {
   }
 }
 
+TEST(ProcessRssBudgetTest, UnmappedBackingRefundsOnlyItsOwnProjection) {
+  constexpr size_t kLimit = 128 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    ProcessRssBudget budget;
+    const size_t initial_rss = (use_native_sample ? 32 : 120) * kMiB;
+    sampled_rss = initial_rss;
+    native_sample = {112 * kMiB, 16 * kMiB};
+    native_sample_valid = true;
+    ASSERT_TRUE(budget.configure(kLimit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr));
+    // Keep the limiting sample stable across a scheduler delay.
+    auto fail_limiting_reader = [&] {
+      if (use_native_sample) {
+        native_sample_valid = false;
+      } else {
+        sampled_rss = 0;
+      }
+    };
+    fail_limiting_reader();
+
+    ASSERT_TRUE(budget.try_materialize(2 * kMiB));
+    ASSERT_TRUE(budget.account_pending(6 * kMiB));
+    auto stamp = budget.finish_reservation(6 * kMiB, true);
+    EXPECT_FALSE(budget.try_materialize(1));
+    budget.release_unmapped(6 * kMiB, stamp);
+    EXPECT_EQ(6 * kMiB, budget.available());
+    EXPECT_FALSE(budget.try_materialize(7 * kMiB));
+
+    ASSERT_TRUE(budget.account_pending(3 * kMiB));
+    stamp = budget.finish_reservation(3 * kMiB, true);
+    sampled_rss = initial_rss;
+    native_sample_valid = true;
+    budget.refresh(true);
+    fail_limiting_reader();
+
+    ASSERT_TRUE(budget.try_materialize(5 * kMiB));
+    budget.release_unmapped(3 * kMiB, stamp);
+    EXPECT_EQ(3 * kMiB, budget.available());
+    EXPECT_FALSE(budget.try_materialize(4 * kMiB));
+  }
+}
+
 TEST(ProcessRssBudgetTest, ReuseAndNewBackingShareMeasuredRoomBetweenSamples) {
   using Budget = ProcessRssBudget;
   constexpr size_t limit = 128 * kMiB;

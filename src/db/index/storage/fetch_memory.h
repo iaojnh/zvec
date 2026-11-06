@@ -3,6 +3,7 @@
 #pragma once
 
 #include <arrow/api.h>
+#include "parquet_memory_pool.h"
 
 namespace zvec::detail {
 
@@ -25,7 +26,17 @@ class FetchMemoryPool final : public arrow::MemoryPool {
   }
   arrow::Status Reallocate(int64_t old_size, int64_t new_size,
                            int64_t alignment, uint8_t **ptr) override {
-    // The parent may allocate-and-copy; count both buffers at the peak.
+    // A managed mapping can shrink in place even when the batch is full.
+    // All other reallocations must leave room for a second buffer.
+    if (auto *parquet = dynamic_cast<ParquetMemoryPool *>(parent_)) {
+      if (auto status =
+              parquet->TryReallocateInPlace(old_size, new_size, alignment, ptr)) {
+        if (status->ok() && old_size != new_size) {
+          stats_.DidReallocateBytes(old_size, new_size);
+        }
+        return *status;
+      }
+    }
     if (new_size < 0 || new_size > limit_ - stats_.bytes_allocated()) {
       exceeded_ = true;
       return arrow::Status::OutOfMemory("Fetch batch byte limit exceeded");

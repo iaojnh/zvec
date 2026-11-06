@@ -63,25 +63,26 @@ void *RocksdbCacheAllocator::Allocate(size_t size) {
   auto &pool = ailego::MemoryLimitPool::get_instance();
   if (!pool.account_pending_process_backing(bytes)) throw std::bad_alloc();
   void *mapping = ailego::File::MemoryMap(bytes, 0);
-  pool.finish_process_backing(bytes, mapping != nullptr);
+  const auto projection = pool.finish_process_backing(bytes, mapping != nullptr);
   if (mapping == nullptr) {
     throw std::bad_alloc();
   }
-  auto *header = new (mapping) Header{bytes};
+  auto *header = new (mapping) Header{bytes, projection};
   return header + 1;
 }
 
 void RocksdbCacheAllocator::Deallocate(void *pointer) {
   if (pointer != nullptr) {
     auto *header = static_cast<Header *>(pointer) - 1;
-    const size_t bytes = header->mapped_bytes;
+    const auto [bytes, projection] = *header;
 #if defined(_WIN32)
     const bool unmapped = ::VirtualFree(header, 0, MEM_RELEASE) != 0;
 #else
     const bool unmapped = ::munmap(header, bytes) == 0;
 #endif
     if (unmapped) {
-      ailego::MemoryLimitPool::get_instance().release_process_backing(bytes);
+      ailego::MemoryLimitPool::get_instance().release_unmapped_process_backing(
+          bytes, projection);
     }
   }
 }

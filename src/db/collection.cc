@@ -2456,7 +2456,7 @@ CollectionImpl::fetch_result_snapshot_impl(
     const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
     bool include_vector, const CollectionSchema *expected_schema,
-    bool prefer_columns) const {
+    bool prefer_columns) const try {
   std::shared_lock lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
@@ -2469,13 +2469,30 @@ CollectionImpl::fetch_result_snapshot_impl(
   if (prefer_columns && (!include_vector || schema_->vector_fields().empty())) {
     auto forward = fetch_forward_unsafe(pks, output_fields);
     if (!forward) return tl::make_unexpected(forward.error());
-    return internal::FetchResultSnapshot{{}, schema_, std::move(*forward)};
+    return internal::FetchResultSnapshot{{}, {}, schema_, std::move(*forward)};
+  }
+  std::shared_ptr<detail::ResultMemoryAllowance::Lease> routing_memory;
+  if (!options_.enable_mmap_ && !pks.empty() &&
+      ailego::MemoryLimitPool::get_instance().capacity()) {
+    detail::ResultMemoryAllowance::Lease pending(
+        &detail::SharedResultMemoryAllowance());
+    detail::QueryResultEstimate estimate;
+    estimate.add(128, pks.size());
+    for (const auto &pk : pks) estimate.add(pk.size());
+    pending.add(estimate.bytes());
+    routing_memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+        &detail::SharedResultMemoryAllowance());
+    routing_memory->absorb(pending);
   }
   auto docs = fetch_unsafe(pks, output_fields, include_vector);
   if (!docs) {
     return tl::make_unexpected(docs.error());
   }
-  return internal::FetchResultSnapshot{std::move(*docs), schema_, nullptr};
+  return internal::FetchResultSnapshot{std::move(routing_memory),
+                                       std::move(*docs), schema_, nullptr};
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient native fetch result budget"));
 }
 
 Result<std::shared_ptr<internal::ForwardFetchResult>>
@@ -2483,6 +2500,7 @@ CollectionImpl::fetch_forward_unsafe(
     const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields) const try {
   auto result = std::make_shared<internal::ForwardFetchResult>();
+  if (pks.empty()) return result;
   if (!options_.enable_mmap_) result->parent = detail::GetParquetMemoryPool();
   auto workspace = std::make_shared<detail::FetchMemoryPool>(
       result->parent ? result->parent.get() : arrow::default_memory_pool(),
@@ -2527,18 +2545,9 @@ Result<DocPtrMap> CollectionImpl::fetch_unsafe(
     const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
     bool include_vector) const try {
-  auto segments = get_all_segments();
-
-  detail::ResultMemoryAllowance::Lease routing_memory(
-      options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
-  if (routing_memory.enabled()) {
-    detail::QueryResultEstimate estimate;
-    estimate.add(128, pks.size());
-    for (const auto &pk : pks) estimate.add(pk.size());
-    routing_memory.add(estimate.bytes());
-  }
-
   DocPtrMap results;
+  if (pks.empty()) return results;
+  auto segments = get_all_segments();
 
   if (!options_.enable_mmap_ && pks.size() > 1) {
     struct PendingFetch {

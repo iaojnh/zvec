@@ -17,6 +17,7 @@
 #include <limits>
 #include <string_view>
 #include <unordered_set>
+#include <ailego/pattern/scope_guard.h>
 #include <arrow/api.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -518,21 +519,71 @@ void forward_to_tuples(internal::ForwardFetchResult &forward, py::dict &out) {
 internal::FetchResultSnapshot fetch_snapshot_for_python(
     const Collection &collection, const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
-    bool include_vector, const CollectionSchema *schema) {
+    bool include_vector, const CollectionSchema *schema,
+    bool prefer_columns = true) {
   Result<internal::FetchResultSnapshot> result;
   {
     py::gil_scoped_release release;
     result = internal::fetch_result_snapshot(collection, pks, output_fields,
-                                             include_vector, schema, true);
+                                             include_vector, schema,
+                                             prefer_columns);
   }
   return unwrap_expected(std::move(result));
+}
+
+py::dict fetch_docs_for_python(const Collection &collection, py::handle ids,
+                               py::handle fields, bool include_vector) {
+  const bool budgeted = !unwrap_expected(collection.options()).enable_mmap_ &&
+                        ailego::MemoryLimitPool::get_instance().capacity();
+  auto *owner = budgeted ? &forward_result_allowance() : nullptr;
+  detail::PythonFetchInputs inputs(ids, fields, owner);
+  auto allowance = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      owner, /*serialize_materialization=*/true, kPythonResultBackingQuantum);
+  auto release_slot =
+      ailego::ScopeGuard::Make([&] { allowance->end_materialization(); });
+  {
+    py::gil_scoped_release release;
+    allowance->begin_materialization();
+  }
+  auto snapshot = fetch_snapshot_for_python(
+      collection, inputs.pks, inputs.output_fields, include_vector, nullptr,
+      /*prefer_columns=*/false);
+  if (!budgeted || snapshot.docs.empty()) {
+    return py::cast<py::dict>(py::cast(std::move(snapshot.docs)));
+  }
+  {
+    py::gil_scoped_release release;
+    PythonResultEstimate estimate;
+    estimate.add(512);
+    estimate.add(128, snapshot.docs.size());
+    size_t largest_key = 0;
+    for (const auto &[key, doc] : snapshot.docs) {
+      estimate.string(key);
+      largest_key = std::max(largest_key, key.size());
+    }
+    // Wrapping one key can briefly retain the plain Python string too.
+    estimate.add(128);
+    estimate.add(4, largest_key);
+    allowance->add(estimate.bytes());
+  }
+
+  auto wrappers = py::module_::import("zvec.model._budgeted_result");
+  auto token = result_memory_owner(allowance);
+  auto make_key = wrappers.attr("_ResultString");
+  auto out = py::reinterpret_borrow<py::dict>(
+      wrappers.attr("_ResultDict")(py::dict(), token));
+  for (auto &[key, doc] : snapshot.docs) {
+    out[make_key(py::str(key), token)] = py::cast(std::move(doc));
+  }
+  return out;
 }
 
 void fetch_chunk_for_python(
     const Collection &collection, const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
     bool include_vector, const CollectionSchema &schema, py::dict &out,
-    detail::ResultMemoryAllowance::Lease &allowance) {
+    detail::ResultMemoryAllowance::Lease &allowance,
+    detail::ResultMemoryAllowance::Lease &batch_memory) {
   auto snapshot = fetch_snapshot_for_python(collection, pks, output_fields,
                                             include_vector, &schema);
   if (snapshot.forward) {
@@ -540,10 +591,24 @@ void fetch_chunk_for_python(
       snapshot.forward.reset();
       if (pks.size() <= 1) throw std::runtime_error("Fetch allocation failed");
       const auto middle = pks.begin() + pks.size() / 2;
-      fetch_chunk_for_python(collection, {pks.begin(), middle}, output_fields,
-                             include_vector, schema, out, allowance);
-      fetch_chunk_for_python(collection, {middle, pks.end()}, output_fields,
-                             include_vector, schema, out, allowance);
+      const auto fetch_half = [&](auto begin, auto end) {
+        {
+          py::gil_scoped_release release;
+          size_t backing =
+              detail::FetchMemoryBytes(end - begin, sizeof(std::string));
+          for (auto it = begin; it != end; ++it) {
+            backing = detail::FetchMemoryBytes(
+                1, detail::FetchStringBackingBytes(it->size()), backing);
+          }
+          // The original batch already holds the logical allowance for splits.
+          batch_memory.add(0, backing);
+        }
+        fetch_chunk_for_python(collection, {begin, end}, output_fields,
+                               include_vector, schema, out, allowance,
+                               batch_memory);
+      };
+      fetch_half(pks.begin(), middle);
+      fetch_half(middle, pks.end());
       return;
     }
     reserve_forward_results(*snapshot.forward, allowance);
@@ -694,7 +759,8 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
       // Python or database lock, and keep the full input alive for the views.
       py::gil_scoped_release release;
       const size_t rows = std::min(batch_rows, pks.size() - begin);
-      batch_memory.add(detail::FetchMemoryBytes(rows, 3 * sizeof(std::string)));
+      batch_memory.add(detail::FetchMemoryBytes(rows, 3 * sizeof(std::string)),
+                       detail::FetchMemoryBytes(rows, sizeof(std::string)));
       batch.reserve(rows);
       constexpr size_t kBatchBytes = 1024 * 1024;
       size_t bytes = 0;
@@ -711,14 +777,15 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
           seen.emplace(std::string_view(pk));
           // Adaptive Arrow splitting keeps the original batch and recursively
           // copies halves. Their total overlap is less than three batches.
-          batch_memory.add(detail::FetchMemoryBytes(pk.size(), 3, 192));
+          batch_memory.add(detail::FetchMemoryBytes(pk.size(), 3, 192),
+                           detail::FetchStringBackingBytes(pk.size()));
           batch.push_back(pk);
           bytes = detail::FetchMemoryBytes(1, pk.size(), bytes);
         }
       }
     }
     fetch_chunk_for_python(collection, batch, output_fields, include_vector,
-                           *schema, out, *allowance);
+                           *schema, out, *allowance, batch_memory);
   } while (begin < pks.size());
   retain_result_memory(out, allowance);
   return out;
@@ -1054,31 +1121,9 @@ are returned as None.
              }
              return unwrap_expected(std::move(result));
            })
-      .def(
-          "Fetch",
-          [](const Collection &self, py::handle pks, py::handle output_fields,
-             bool include_vector) {
-            const bool budgeted =
-                !unwrap_expected(self.options()).enable_mmap_ &&
-                ailego::MemoryLimitPool::get_instance().capacity();
-            auto *owner = budgeted ? &forward_result_allowance() : nullptr;
-            detail::PythonFetchInputs inputs(pks, output_fields, owner);
-            detail::ResultMemoryAllowance::Lease materialization(owner, true);
-            {
-              py::gil_scoped_release release;
-              materialization.begin_materialization();
-            }
-            Result<DocPtrMap> result;
-            {
-              py::gil_scoped_release release;
-              result =
-                  self.fetch(inputs.pks, inputs.output_fields, include_vector);
-            }
-            // return DocPtrMap
-            return unwrap_expected(std::move(result));
-          },
-          py::arg("pks"), py::arg("output_fields") = py::none(),
-          py::arg("include_vector") = true)
+      .def("Fetch", &fetch_docs_for_python, py::arg("pks"),
+           py::arg("output_fields") = py::none(),
+           py::arg("include_vector") = true)
       .def("FetchTuples", &fetch_for_python, py::arg("pks"),
            py::arg("output_fields") = py::none(),
            py::arg("include_vector") = true)

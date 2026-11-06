@@ -30,6 +30,7 @@
 #include <parquet/statistics.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "db/index/storage/chunked_file_writer.h"
+#include "db/index/storage/fetch_memory.h"
 #include "db/index/storage/parquet_writer.h"
 #include "db/index/storage/store_helper.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
@@ -751,6 +752,34 @@ TEST_F(ParquetBudgetTest, MappedShrinkNeedsNoOverlapBudget) {
   pool.Free(buffer, kThreshold);
   EXPECT_EQ(0u, pool.charged_bytes());
   EXPECT_EQ(remaining, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, FetchBatchCanShrinkMappedBufferAtItsLimit) {
+  ParquetMemoryPool parent(arrow::default_memory_pool(), true);
+  FetchMemoryPool pool(&parent, 2 * kThreshold);
+  uint8_t *buffer = nullptr;
+  constexpr int64_t kAlignment = 64;
+  ASSERT_TRUE(pool.Allocate(2 * kThreshold, kAlignment, &buffer).ok());
+  auto *original = buffer;
+  const auto mapped = parent.mapped_bytes();
+  constexpr int64_t kNewSize = 8192;
+  std::memset(buffer, 41, kNewSize);
+  ASSERT_TRUE(
+      pool.Reallocate(2 * kThreshold, kNewSize, kAlignment, &buffer).ok());
+  EXPECT_FALSE(pool.exceeded());
+  EXPECT_EQ(original, buffer);
+  EXPECT_EQ(41, buffer[kNewSize - 1]);
+  EXPECT_EQ(kNewSize, pool.bytes_allocated());
+  EXPECT_EQ(2 * kThreshold, pool.max_memory());
+  EXPECT_LT(parent.mapped_bytes(), mapped);
+  EXPECT_TRUE(
+      pool.Reallocate(kNewSize, 2 * kThreshold, kAlignment, &buffer)
+          .IsOutOfMemory());
+  EXPECT_TRUE(pool.exceeded());
+  EXPECT_EQ(original, buffer);
+  pool.Free(buffer, kNewSize, kAlignment);
+  EXPECT_EQ(0, pool.bytes_allocated());
+  EXPECT_EQ(0u, budget_.external_used());
 }
 
 TEST_F(ParquetBudgetTest, MappedShrinkWithinPageRetainsBackingCharge) {

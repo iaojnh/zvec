@@ -41,6 +41,8 @@ struct ForwardFetchResult {
 // can convert and release one small batch before fetching the next. Never run
 // language-runtime callbacks while holding collection/segment locks.
 struct FetchResultSnapshot {
+  // The routing allowance outlives the native map during binding conversion.
+  std::shared_ptr<void> routing_memory;
   DocPtrMap docs;
   std::shared_ptr<const CollectionSchema> schema;
   std::shared_ptr<ForwardFetchResult> forward;

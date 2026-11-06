@@ -42,6 +42,7 @@
 #include <zvec/db/stats.h>
 #include "c_input_memory.h"
 #include "c_memory.h"
+#include "db/collection_fetch_internal.h"
 #include "db/common/constants.h"
 #include "db/common/document_memory.h"
 #include "db/index/common/serialized_doc_memory.h"
@@ -7457,10 +7458,26 @@ zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection
 // Data query interface implementation
 // =============================================================================
 
-static zvec_doc_t *copy_result_document(const zvec::Doc &doc) {
-  auto copy = CInput<zvec::Doc>::make(
-      zvec::detail::DocumentMemoryAccess::copy_bytes(doc), doc);
+static zvec_doc_t *copy_result_document(
+    const zvec::Doc &doc, const zvec::CollectionSchema *fetch_schema = nullptr) {
+  size_t bytes = zvec::detail::DocumentMemoryAccess::copy_bytes(doc);
+  if (fetch_schema) {
+    for (const auto &field : fetch_schema->fields()) {
+      if (field && field->nullable() && !doc.has(field->name())) {
+        bytes = BindingMemoryBytes(
+            1, BindingMemoryBytes(1, field->name().size(), 256), bytes);
+      }
+    }
+  }
+  auto copy = CInput<zvec::Doc>::make(bytes, doc);
   zvec::detail::DocumentMemoryAccess::retain(*copy, {});
+  if (fetch_schema) {
+    for (const auto &field : fetch_schema->fields()) {
+      if (field && field->nullable() && !doc.has(field->name())) {
+        copy->set_null(field->name());
+      }
+    }
+  }
   return release_c_input<zvec_doc_t>(std::move(copy));
 }
 
@@ -7483,38 +7500,10 @@ zvec_error_code_t convert_document_results(
   return ZVEC_OK;
 }
 
-// Helper function to convert fetched document results to C API format
-static void normalize_nullable_fields_for_fetch(
-    const zvec::CollectionSchema &schema, zvec::DocPtrMap &doc_map) {
-  std::vector<std::string> nullable_fields;
-  nullable_fields.reserve(schema.fields().size());
-
-  for (const auto &field : schema.fields()) {
-    if (field && field->nullable()) {
-      nullable_fields.push_back(field->name());
-    }
-  }
-
-  if (nullable_fields.empty()) {
-    return;
-  }
-
-  for (auto &[_, doc_ptr] : doc_map) {
-    if (!doc_ptr) {
-      continue;
-    }
-
-    for (const auto &field_name : nullable_fields) {
-      if (!doc_ptr->has(field_name)) {
-        doc_ptr->set_null(field_name);
-      }
-    }
-  }
-}
-
-zvec_error_code_t convert_fetched_document_results(const zvec::DocPtrMap &doc_map,
-                                                zvec_doc_t ***results,
-                                                size_t *doc_count) {
+zvec_error_code_t convert_fetched_document_results(
+    const zvec::internal::FetchResultSnapshot &snapshot, zvec_doc_t ***results,
+    size_t *doc_count) {
+  const auto &doc_map = snapshot.docs;
   *results = nullptr;
   *doc_count = 0;
   size_t count = 0;
@@ -7526,7 +7515,8 @@ zvec_error_code_t convert_fetched_document_results(const zvec::DocPtrMap &doc_ma
           count, sizeof(zvec_doc_t *))), cleanup);
   size_t i = 0;
   for (const auto &[pk, doc] : doc_map)
-    if (doc) converted.get()[i++] = copy_result_document(*doc);
+    if (doc)
+      converted.get()[i++] = copy_result_document(*doc, snapshot.schema.get());
   *results = converted.release();
   *doc_count = count;
   return ZVEC_OK;
@@ -7728,18 +7718,12 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
         cpp_output_fields = std::move(fields);
       }
 
-      // Call C++ fetch method
-      auto result = (*coll_ptr)->fetch(pk_vector, cpp_output_fields, include_vector);
+      auto result = zvec::internal::fetch_result_snapshot(
+          **coll_ptr, pk_vector, cpp_output_fields, include_vector);
       if (!result.has_value()) {
         return handle_status(result.error());
       }
-
-      auto doc_map = std::move(result.value());
-      auto schema_result = (*coll_ptr)->schema();
-      if (schema_result.has_value()) {
-        normalize_nullable_fields_for_fetch(schema_result.value(), doc_map);
-      }
-      return convert_fetched_document_results(doc_map, results, doc_count);)
+      return convert_fetched_document_results(*result, results, doc_count);)
 }
 
 // =============================================================================
