@@ -3215,7 +3215,7 @@ Result<std::unique_ptr<DocIterator::Impl>> CollectionImpl::prepare_iterate(
 }
 
 Result<DocIterator::Ptr> CollectionImpl::create_iterator(
-    const IteratorOptions &options) {
+    const IteratorOptions &options) try {
   // Iterators and maintenance operations are mutually exclusive (see the
   // contract in collection.h); fail fast instead of blocking here.
   std::unique_lock maintenance_lock(maintenance_mtx_, std::try_to_lock);
@@ -3233,13 +3233,17 @@ Result<DocIterator::Ptr> CollectionImpl::create_iterator(
     return tl::make_unexpected(impl_result.error());
   }
   auto impl = std::move(impl_result.value());
-  // Assign before incrementing: the assignment can throw (std::function
-  // heap allocation), and a count bump without a working release_slot
-  // would never drain.
-  impl->release_slot = [this] { decrement_active_iterators(); };
+  auto *state = impl.get();
+  auto iterator = std::make_shared<DocIterator>(std::move(impl));
+  // Finish allocations before publishing the active slot. If construction
+  // fails here, no destructor may try to reacquire schema_handle_mtx_.
+  state->release_slot = [this] { decrement_active_iterators(); };
   ++active_iterators_;
 
-  return std::make_shared<DocIterator>(std::move(impl));
+  return iterator;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient iterator owner budget"));
 }
 
 void CollectionImpl::decrement_active_iterators() {

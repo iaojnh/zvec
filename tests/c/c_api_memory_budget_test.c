@@ -191,7 +191,30 @@ int main(void) {
   assert(zvec_collection_insert(collection, batch, 1, &success, &errors) ==
          ZVEC_OK);
   assert(success == 1 && errors == 0);
+  zvec_doc_set_pk(doc, "second");
+  assert(zvec_collection_insert(collection, batch, 1, &success, &errors) ==
+         ZVEC_OK);
+  assert(success == 1 && errors == 0);
   zvec_doc_destroy(doc);
+
+  // The first read materializes both rows. A later C result-copy refusal
+  // must leave the already decoded second row available to the caller.
+  zvec_doc_iterator_t *iter = NULL;
+  assert(zvec_collection_create_iterator(collection, NULL, &iter) == ZVEC_OK);
+  zvec_doc_t *row = NULL;
+  assert(zvec_doc_iterator_next(iter, &row) == ZVEC_OK);
+  assert(row && strcmp(zvec_doc_get_pk_pointer(row), "small") == 0);
+  zvec_doc_destroy(row);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  assert(zvec_doc_iterator_next(iter, &row) == ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  assert(row == NULL);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  assert(zvec_doc_iterator_next(iter, &row) == ZVEC_OK);
+  assert(row && strcmp(zvec_doc_get_pk_pointer(row), "second") == 0);
+  zvec_doc_destroy(row);
+  assert(zvec_doc_iterator_next(iter, &row) == ZVEC_OK && row == NULL);
+  zvec_doc_iterator_close(iter);
+
   const char *small_id = "small";
   docs = NULL;
   found = 0;

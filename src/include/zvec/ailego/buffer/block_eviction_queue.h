@@ -549,6 +549,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   struct ReclaimableSlab;
   struct RetainedBlock;
   struct QueueAllocationHeader;
+  struct QueueMappingHeader;
   struct QueueMemorySlab;
   enum class Backing { kLive, kPending };
 
@@ -564,7 +565,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                              size_t materialization = 0);
   size_t release_committed(
       size_t bytes, Backing backing = Backing::kLive,
-      ProcessRssBudget::MaterializationStamp stamp = {});
+      ProcessRssBudget::MappingProjection projection = {});
   bool try_reserve_allocation(size_t bytes, Backing backing = Backing::kLive,
                               size_t materialization = 0);
   bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,
@@ -588,7 +589,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                          Backing backing);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter,
                      Backing backing = Backing::kLive,
-                     ProcessRssBudget::MaterializationStamp stamp = {});
+                     ProcessRssBudget::MappingProjection projection = {});
   bool is_cacheable_buffer_size(size_t buffer_size);
   char *pop_free_buffer(size_t start_shard);
   char *pop_reusable_buffer(size_t start_shard, size_t bytes);

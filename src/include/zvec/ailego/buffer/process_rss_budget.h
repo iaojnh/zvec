@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -30,6 +31,82 @@ class ProcessRssBudget {
   struct MaterializationStamp {
     uint64_t rss_epoch{0};
     uint64_t native_epoch{0};
+  };
+  struct MappingProjection {
+    struct Sample {
+      uint64_t epoch{0};
+      size_t bytes{0};
+      // Existing backing may have been resident in the last sample even
+      // when another owner has since reserved headroom to reuse it.
+      size_t unsampled{0};
+
+      Sample for_epoch(uint64_t current) const {
+        return epoch && epoch == current ? *this : Sample{};
+      }
+    };
+
+    static MappingProjection Full(size_t bytes, MaterializationStamp stamp) {
+      return ForReuse(bytes, stamp, stamp);
+    }
+
+    static MappingProjection ForReuse(size_t bytes, MaterializationStamp stamp,
+                                      MaterializationStamp creation) {
+      return {{stamp.rss_epoch, bytes,
+               stamp.rss_epoch == creation.rss_epoch ? bytes : 0},
+              {stamp.native_epoch, bytes,
+               stamp.native_epoch == creation.native_epoch ? bytes : 0}};
+    }
+
+    Sample rss{};
+    Sample native{};
+  };
+
+  // One stamp per projected page, compressed into the slab's existing
+  // header page. All access uses the RSS accounting mutex, including reuse
+  // across different free-list shards.
+  template <size_t PageCount>
+  class ReusablePages {
+    friend class ProcessRssBudget;
+    struct SamplePages {
+      void record(size_t slot, uint64_t sample_epoch, bool new_backing) {
+        if (epoch != sample_epoch) {
+          projected.reset();
+          unsampled.reset();
+          epoch = sample_epoch;
+        }
+        projected[slot] = sample_epoch != 0;
+        if (new_backing) unsampled[slot] = sample_epoch != 0;
+      }
+
+      uint64_t epoch{0};
+      std::bitset<PageCount> projected;
+      std::bitset<PageCount> unsampled;
+    };
+
+    MaterializationStamp stamp(size_t slot) const {
+      return {rss_.projected[slot] ? rss_.epoch : 0,
+              native_.projected[slot] ? native_.epoch : 0};
+    }
+
+    void record(size_t slot, MaterializationStamp stamp, bool new_backing) {
+      rss_.record(slot, stamp.rss_epoch, new_backing);
+      native_.record(slot, stamp.native_epoch, new_backing);
+    }
+
+    MappingProjection take(size_t slot, size_t bytes) {
+      const MaterializationStamp projected = stamp(slot);
+      const MaterializationStamp creation{
+          rss_.unsampled[slot] ? rss_.epoch : 0,
+          native_.unsampled[slot] ? native_.epoch : 0};
+      rss_.projected[slot] = false;
+      native_.projected[slot] = false;
+      rss_.unsampled[slot] = false;
+      native_.unsampled[slot] = false;
+      return MappingProjection::ForReuse(bytes, projected, creation);
+    }
+
+    SamplePages rss_;
+    SamplePages native_;
   };
   enum class PressureLevel { kNormal, kBackground, kCritical };
 
@@ -109,18 +186,15 @@ class ProcessRssBudget {
 
   MaterializationStamp finish_reservation(size_t bytes, bool allocated) {
     std::lock_guard<std::mutex> lock(mutex_);
-    assert(bytes <= pending_allocations_);
-    pending_allocations_ -= bytes;
-    if (allocated) {
-      backing_ += bytes;
-      // Transfer the in-flight debit into the measured projection until it
-      // can be sampled. Other reuses must not get that headroom back merely
-      // because the allocation has returned.
-      remember_materialization(bytes);
-    }
-    update_available();
-    if (!allocated || !limit()) return {};
-    return {rss_epoch_, native_reader_ ? native_epoch_ : 0};
+    return finish_reservation_locked(bytes, allocated);
+  }
+
+  template <size_t PageCount>
+  void commit_reusable_page(size_t bytes, ReusablePages<PageCount> &pages,
+                            size_t slot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pages.record(slot, finish_reservation_locked(bytes, true),
+                 /*new_backing=*/true);
   }
 
   // Some consumers (RocksDB's block reader) cannot safely reject allocation
@@ -143,20 +217,19 @@ class ProcessRssBudget {
   // A stamp is valid only after successful unmapping. A partial release
   // keeps the same stamp for the remaining bytes. Measured RSS is unchanged.
   void release_unmapped(size_t bytes, MaterializationStamp stamp) {
+    release_projected_mapping(bytes, MappingProjection::Full(bytes, stamp));
+  }
+
+  void release_projected_mapping(size_t bytes, MappingProjection projection) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const bool rss_unsampled =
-        stamp.rss_epoch && stamp.rss_epoch == rss_epoch_;
-    const bool native_unsampled =
-        stamp.native_epoch && stamp.native_epoch == native_epoch_;
-    refund_materialization(bytes, stamp);
-    assert(bytes <= backing_);
-    backing_ -= bytes;
-    // Only backing that could have contributed to a successful RSS sample
-    // can explain a later RSS decrease. Unsampled allocation/free churn must
-    // not accumulate unlimited release credits and hide host-memory recovery.
-    estimate_.release(bytes, backing_, rss_unsampled);
-    native_estimate_.release(bytes, backing_, native_unsampled);
-    update_available();
+    release_projected_mapping_locked(bytes, projection);
+  }
+
+  template <size_t PageCount>
+  void release_reusable_page(size_t bytes, ReusablePages<PageCount> &pages,
+                             size_t slot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_projected_mapping_locked(bytes, pages.take(slot, bytes));
   }
 
   void refresh(bool force = false) {
@@ -193,18 +266,50 @@ class ProcessRssBudget {
   // per sample. Each reader can refresh independently.
   bool try_materialize_reusable(size_t bytes, MaterializationStamp &stamp) {
     std::lock_guard<std::mutex> lock(mutex_);
+    return try_materialize_reusable_locked(bytes, stamp);
+  }
+
+  template <size_t PageCount>
+  bool try_materialize_reusable_page(size_t bytes,
+                                     ReusablePages<PageCount> &pages,
+                                     size_t slot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!limit()) return !admission_paused();
+    const auto previous = pages.stamp(slot);
+    auto stamp = previous;
+    if (!try_materialize_reusable_locked(bytes, stamp)) return false;
+    if (stamp.rss_epoch != previous.rss_epoch ||
+        stamp.native_epoch != previous.native_epoch) {
+      pages.record(slot, stamp, /*new_backing=*/false);
+    }
+    return true;
+  }
+
+  // A partially used mapping can advance into fresh pages. Within each
+  // reader's current sample, its projection cannot exceed the whole mapping.
+  bool try_extend_mapping(size_t bytes, size_t mapping_bytes,
+                          MappingProjection &projection) {
+    std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
-    const bool charge_rss = !stamp.rss_epoch || stamp.rss_epoch != rss_epoch_;
-    const bool charge_native =
-        !stamp.native_epoch || stamp.native_epoch != native_epoch_;
-    if (!materialization_allowed_locked(charge_rss ? bytes : 0,
-                                        charge_native ? bytes : 0))
+    const auto rss = projection.rss.for_epoch(rss_epoch_);
+    const auto native = projection.native.for_epoch(native_epoch_);
+    assert(rss.bytes <= mapping_bytes && native.bytes <= mapping_bytes);
+    const size_t rss_growth = std::min(bytes, mapping_bytes - rss.bytes);
+    const size_t native_growth =
+        std::min(bytes, mapping_bytes - native.bytes);
+    if (!materialization_allowed_locked(rss_growth, native_growth))
       return false;
-    if (limit() && bytes) {
-      if (charge_rss) rss_materialized_ = add_saturated(rss_materialized_, bytes);
-      if (native_reader_ && charge_native)
-        native_materialized_ = add_saturated(native_materialized_, bytes);
-      stamp = {rss_epoch_, native_reader_ ? native_epoch_ : 0};
+    if (limit()) {
+      rss_materialized_ = add_saturated(rss_materialized_, rss_growth);
+      if (native_reader_) {
+        native_materialized_ =
+            add_saturated(native_materialized_, native_growth);
+      }
+      projection.rss = {rss_epoch_, rss.bytes + rss_growth,
+                        rss.unsampled + rss_growth};
+      projection.native = {native_reader_ ? native_epoch_ : 0,
+                           native.bytes + native_growth,
+                           native.unsampled + native_growth};
       update_available();
     }
     return true;
@@ -255,6 +360,56 @@ class ProcessRssBudget {
   }
 
  private:
+  MaterializationStamp finish_reservation_locked(size_t bytes, bool allocated) {
+    assert(bytes <= pending_allocations_);
+    pending_allocations_ -= bytes;
+    if (allocated) {
+      backing_ += bytes;
+      // Keep the in-flight debit until a successful sample can observe it.
+      remember_materialization(bytes);
+    }
+    update_available();
+    if (!allocated || !limit()) return {};
+    return {rss_epoch_, native_reader_ ? native_epoch_ : 0};
+  }
+
+  void release_projected_mapping_locked(size_t bytes,
+                                         const MappingProjection &projection) {
+    const auto rss = projection.rss.for_epoch(rss_epoch_);
+    const auto native = projection.native.for_epoch(native_epoch_);
+    assert(rss.unsampled <= rss.bytes && rss.bytes <= bytes);
+    assert(native.unsampled <= native.bytes && native.bytes <= bytes);
+    refund_projection(rss.bytes, rss_materialized_);
+    refund_projection(native.bytes, native_materialized_);
+    assert(bytes <= backing_);
+    backing_ -= bytes;
+    // Only backing that could have contributed to a successful RSS sample
+    // can explain a later RSS decrease.
+    estimate_.release(bytes - rss.unsampled, backing_);
+    native_estimate_.release(bytes - native.unsampled, backing_);
+    update_available();
+  }
+
+  bool try_materialize_reusable_locked(size_t bytes,
+                                       MaterializationStamp &stamp) {
+    refresh_locked(false);
+    const bool charge_rss = stamp.rss_epoch != rss_epoch_ || !stamp.rss_epoch;
+    const bool charge_native =
+        native_reader_ &&
+        (stamp.native_epoch != native_epoch_ || !stamp.native_epoch);
+    if (!materialization_allowed_locked(charge_rss ? bytes : 0,
+                                        charge_native ? bytes : 0))
+      return false;
+    if (limit() && bytes && (charge_rss || charge_native)) {
+      if (charge_rss) rss_materialized_ = add_saturated(rss_materialized_, bytes);
+      if (charge_native)
+        native_materialized_ = add_saturated(native_materialized_, bytes);
+      stamp = {rss_epoch_, native_reader_ ? native_epoch_ : 0};
+      update_available();
+    }
+    return true;
+  }
+
   static void refund_projection(size_t bytes, size_t &projection) {
     // Keep saturated projections conservative until the next sample.
     if (projection == std::numeric_limits<size_t>::max()) return;
@@ -407,9 +562,9 @@ class ProcessRssBudget {
       resident_upper_ = std::min(sample, backing);
       pending_releases_ = 0;
     }
-    void release(size_t bytes, size_t backing, bool unsampled) {
+    void release(size_t bytes, size_t backing) {
       const size_t possibly_resident =
-          unsampled ? 0 : std::min(bytes, resident_upper_ - pending_releases_);
+          std::min(bytes, resident_upper_ - pending_releases_);
       pending_releases_ += possibly_resident;
       // The old sample may still include this owner's pages. Those bytes
       // cannot also cover another owner that has not yet become resident.

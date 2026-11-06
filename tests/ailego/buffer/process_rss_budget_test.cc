@@ -733,9 +733,53 @@ TEST(ProcessRssBudgetTest, ReusableBackingRefreshesEachReaderIndependently) {
   budget.refresh(true);
   ASSERT_TRUE(budget.try_materialize_reusable(bytes, stamp));
   EXPECT_EQ(10 * kMiB, budget.available());
-  budget.release_unmapped(bytes, stamp);
+  budget.release_projected_mapping(
+      bytes, ProcessRssBudget::MappingProjection::ForReuse(bytes, stamp, {}));
   EXPECT_EQ(16 * kMiB, budget.available());
   native_sample_valid = true;
+}
+
+TEST(ProcessRssBudgetTest, PartialMappingRefundsEachReadersProjection) {
+  constexpr size_t bytes = 8 * kMiB;
+  ProcessRssBudget budget;
+  sampled_rss = 112 * kMiB;
+  native_sample = {104 * kMiB, 24 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  ASSERT_TRUE(budget.try_reserve(bytes));
+  auto projection = ProcessRssBudget::MappingProjection::Full(
+      bytes, budget.finish_reservation(bytes, true));
+  ASSERT_TRUE(budget.try_materialize(3 * kMiB));
+  ASSERT_TRUE(budget.try_extend_mapping(2 * kMiB, bytes, projection));
+  EXPECT_EQ(5 * kMiB, budget.available());
+
+  native_sample_valid = false;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_extend_mapping(2 * kMiB, bytes, projection));
+  EXPECT_EQ(5 * kMiB, budget.available());
+  budget.release_projected_mapping(bytes, projection);
+  EXPECT_EQ(13 * kMiB, budget.available());
+  native_sample_valid = true;
+}
+
+TEST(ProcessRssBudgetTest, ReuseDoesNotHideResidentBackingFromRelease) {
+  constexpr size_t bytes = 8 * kMiB;
+  ProcessRssBudget budget;
+  budget.account(bytes);
+  sampled_rss = 120 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+
+  ProcessRssBudget::MaterializationStamp reuse{};
+  ASSERT_TRUE(budget.try_materialize_reusable(bytes, reuse));
+  budget.release_projected_mapping(
+      bytes, ProcessRssBudget::MappingProjection::ForReuse(bytes, reuse, {}));
+  ASSERT_TRUE(budget.try_acquire(bytes));
+  budget.refresh(true);
+  EXPECT_EQ(0u, budget.available());
+  sampled_rss = 112 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(bytes, budget.available());
+  budget.release(bytes);
 }
 
 TEST(ProcessRssBudgetTest, UnmappedBackingRefundsOnlyItsOwnProjection) {

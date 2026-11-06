@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <limits>
 #include <new>
@@ -165,6 +166,11 @@ struct alignas(std::max_align_t) MemoryLimitPool::QueueAllocationHeader {
   };
 };
 
+struct MemoryLimitPool::QueueMappingHeader {
+  ProcessRssBudget::MaterializationStamp stamp{};
+  QueueAllocationHeader allocation{};
+};
+
 struct MemoryLimitPool::QueueMemorySlab {
   QueueMemorySlab(size_t allocation_size, size_t region_bytes)
       : slot_size(allocation_size),
@@ -197,6 +203,7 @@ struct MemoryLimitPool::QueueMemorySlab {
   size_t next_unused;
   size_t live_slots{0};
   QueueAllocationHeader *free_head{nullptr};
+  ProcessRssBudget::MappingProjection projection{};
 };
 
 void *EvictionQueueTraits::malloc(size_t bytes) {
@@ -254,7 +261,9 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
       const size_t previous_page = (slab->next_unused - 1) / page;
       const size_t last_page = (slab->next_unused + total - 1) / page;
       if (last_page != previous_page &&
-          !process_rss_.try_materialize((last_page - previous_page) * page))
+          !process_rss_.try_extend_mapping((last_page - previous_page) * page,
+                                            slab->mapping_bytes,
+                                            slab->projection))
         return denied();
     }
     if (!slab) {
@@ -275,8 +284,11 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
         rollback(region_bytes);
         return nullptr;
       }
-      if (charged) process_rss_.finish_reservation(region_bytes, true);
       slab = new (raw) QueueMemorySlab(total, region_bytes);
+      if (charged) {
+        slab->projection = ProcessRssBudget::MappingProjection::Full(
+            region_bytes, process_rss_.finish_reservation(region_bytes, true));
+      }
       slab->link(queue_small_slabs_[index]);
       queue_allocated_size_.fetch_add(region_bytes, std::memory_order_relaxed);
     }
@@ -294,18 +306,23 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
     if (!slab->has_space()) slab->unlink(queue_small_slabs_[index]);
     return header + 1;
   }
-  if (total > std::numeric_limits<size_t>::max() - (page - 1)) {
+  static_assert(offsetof(QueueMappingHeader, allocation) +
+                    sizeof(QueueAllocationHeader) == sizeof(QueueMappingHeader));
+  constexpr size_t prefix = offsetof(QueueMappingHeader, allocation);
+  if (total > std::numeric_limits<size_t>::max() - prefix - (page - 1)) {
     return nullptr;
   }
-  const size_t region_bytes = (total + page - 1) & ~(page - 1);
+  const size_t region_bytes = (prefix + total + page - 1) & ~(page - 1);
   if (!reserve(region_bytes)) return denied();
   void *raw = map_queue_memory(region_bytes);
   if (!raw) {
     rollback(region_bytes);
     return nullptr;
   }
-  if (charged) process_rss_.finish_reservation(region_bytes, true);
-  auto *header = new (raw) QueueAllocationHeader{};
+  auto *mapping = new (raw) QueueMappingHeader{};
+  if (charged)
+    mapping->stamp = process_rss_.finish_reservation(region_bytes, true);
+  auto *header = &mapping->allocation;
   header->bytes = region_bytes;
   header->owner = nullptr;
   queue_allocated_size_.fetch_add(region_bytes, std::memory_order_relaxed);
@@ -319,6 +336,7 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
   auto *header = static_cast<QueueAllocationHeader *>(ptr) - 1;
   std::lock_guard<std::mutex> lock(queue_memory_mutex_);
   size_t bytes = header->bytes;
+  ProcessRssBudget::MappingProjection projection;
   if (auto *slab = header->owner) {
     const size_t index = slab->slot_size / kQueueAlignment - 1;
     const bool was_full = !slab->has_space();
@@ -329,6 +347,7 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
       return;
     }
     bytes = slab->mapping_bytes;
+    projection = slab->projection;
     auto *previous = slab->previous;
     auto *next = slab->next;
     // Save links before unmapping; do not access any slab/header byte after
@@ -347,14 +366,20 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
         queue_small_slabs_[index] = next;
       if (next) next->previous = previous;
     }
-  } else if (!unmap_queue_memory(header, bytes)) {
-    LOG_ERROR("Failed to unmap queue allocation; backing remains charged");
-    return;
+  } else {
+    auto *mapping = reinterpret_cast<QueueMappingHeader *>(
+        reinterpret_cast<char *>(header) -
+        offsetof(QueueMappingHeader, allocation));
+    projection = ProcessRssBudget::MappingProjection::Full(bytes, mapping->stamp);
+    if (!unmap_queue_memory(mapping, bytes)) {
+      LOG_ERROR("Failed to unmap queue allocation; backing remains charged");
+      return;
+    }
   }
   queue_allocated_size_.fetch_sub(bytes, std::memory_order_relaxed);
   if (pool_size_.load(std::memory_order_relaxed) != 0) {
     queue_charged_size_.fetch_sub(bytes, std::memory_order_relaxed);
-    release_metadata(bytes);
+    release_fixed(bytes, &metadata_used_size_, Backing::kLive, projection);
   }
 }
 
@@ -377,6 +402,7 @@ struct MemoryLimitPool::ReclaimableSlab {
     void *base = reservation_base;
     const size_t bytes = reservation_size;
     const size_t page = page_size;
+    const auto projection = header_projection;
     this->~ReclaimableSlab();
     if (unmap_queue_memory(base, bytes)) return true;
 
@@ -384,6 +410,7 @@ struct MemoryLimitPool::ReclaimableSlab {
     // the old pool can keep using its charged header and address range.
     auto *restored = new (this) ReclaimableSlab(pool, base, bytes, page);
     restored->next = following;
+    restored->header_projection = projection;
     LOG_ERROR("MemoryLimitPool: failed to unmap an empty slab");
     return false;
   }
@@ -400,6 +427,8 @@ struct MemoryLimitPool::ReclaimableSlab {
   uint16_t data_page_count{0};
   size_t committed_pages{0};
   uint16_t reclaimed_pages[kMaxSlabDataPages]{};
+  ProcessRssBudget::ReusablePages<kMaxSlabDataPages> projections;
+  ProcessRssBudget::MaterializationStamp header_projection{};
 };
 
 struct MemoryLimitPool::RetainedBlock {
@@ -407,6 +436,7 @@ struct MemoryLimitPool::RetainedBlock {
   size_t bytes{0};
   bool metadata{false};
   ProcessRssBudget::MaterializationStamp projection{};
+  ProcessRssBudget::MaterializationStamp creation{};
 };
 
 size_t MemoryLimitPool::retained_block_size(size_t bytes) {
@@ -464,7 +494,8 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     return nullptr;
   }
   const auto projection = process_rss_.finish_reservation(charge, true);
-  auto *block = new (raw) RetainedBlock{nullptr, charge, metadata, projection};
+  auto *block =
+      new (raw) RetainedBlock{nullptr, charge, metadata, projection, projection};
   retained_block_bytes_.fetch_add(charge, std::memory_order_relaxed);
   return reinterpret_cast<char *>(block) + kRetainedBlockHeaderBytes;
 }
@@ -476,7 +507,8 @@ void MemoryLimitPool::release_retained_block(void *data) {
   {
     std::lock_guard<std::mutex> lock(retained_mutex_);
     const size_t bytes = block->bytes;
-    const auto projection = block->projection;
+    const auto projection = ProcessRssBudget::MappingProjection::ForReuse(
+        bytes, block->projection, block->creation);
     auto *counter =
         block->metadata ? &metadata_used_size_ : &external_used_size_;
     // Retained mappings share the idle reserve with free data pages. Returning
@@ -520,7 +552,8 @@ size_t MemoryLimitPool::trim_retained_blocks(size_t bytes_needed) {
     auto *block = retained_free_;
     auto *next = block->next;
     const size_t bytes = block->bytes;
-    const auto projection = block->projection;
+    const auto projection = ProcessRssBudget::MappingProjection::ForReuse(
+        bytes, block->projection, block->creation);
 #if defined(_WIN32)
     const bool unmapped = ::VirtualFree(block, 0, MEM_RELEASE) != 0;
 #else
@@ -919,14 +952,14 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
 }
 
 size_t MemoryLimitPool::release_committed(
-    size_t bytes, Backing backing, ProcessRssBudget::MaterializationStamp stamp) {
+    size_t bytes, Backing backing, ProcessRssBudget::MappingProjection projection) {
   const size_t previous =
       committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
   assert(previous >= bytes);
   if (backing == Backing::kPending) {
     process_rss_.finish_reservation(bytes, false);
   } else {
-    process_rss_.release_unmapped(bytes, stamp);
+    process_rss_.release_projected_mapping(bytes, projection);
   }
   return previous;
 }
@@ -976,7 +1009,7 @@ char *MemoryLimitPool::acquire_slab_buffer() {
                 "slab metadata must fit in its header page");
 
   std::lock_guard<std::mutex> slabs_lock(slab_mutex_);
-  auto acquire_from = [](ReclaimableSlab *slab) -> char * {
+  auto acquire_from = [this](ReclaimableSlab *slab) -> char * {
     std::lock_guard<std::mutex> slab_lock(slab->mutex);
     uint16_t page_index = 0;
     bool reclaimed = false;
@@ -1000,6 +1033,8 @@ char *MemoryLimitPool::acquire_slab_buffer() {
       return nullptr;
     }
     ++slab->committed_pages;
+    process_rss_.commit_reusable_page(slab->page_size, slab->projections,
+                                      page_index - 1);
     return page;
   };
 
@@ -1032,9 +1067,9 @@ char *MemoryLimitPool::acquire_slab_buffer() {
     LOG_ERROR("MemoryLimitPool: failed to reserve an aligned slab");
     return nullptr;
   }
-  process_rss_.finish_reservation(page_size, true);
   ReclaimableSlab *slab = new (mapping.base) ReclaimableSlab(
       this, mapping.reservation_base, mapping.reservation_size, page_size);
+  slab->header_projection = process_rss_.finish_reservation(page_size, true);
   slab->next = slabs_;
   slabs_ = slab;
   allocation_slab_ = slab;
@@ -1047,13 +1082,14 @@ char *MemoryLimitPool::acquire_slab_buffer() {
   }
 
   ReclaimableSlab *next = slab->next;
+  const auto projection = slab->header_projection;
   if (slab->unmap_empty()) {
     slabs_ = next;
     allocation_slab_ = nullptr;
     slab_count_.fetch_sub(1, std::memory_order_relaxed);
     slab_mapped_bytes_.fetch_sub(mapping.reservation_size,
                                  std::memory_order_relaxed);
-    release_metadata(page_size);
+    release_unmapped_metadata(page_size, projection);
   }
   return nullptr;
 }
@@ -1079,9 +1115,12 @@ bool MemoryLimitPool::reclaim_slab_buffer(char *buffer) {
 
   assert(slab->committed_pages != 0);
   --slab->committed_pages;
-  size_t previous = release_committed(slab->page_size);
+  const size_t previous =
+      committed_size_.fetch_sub(slab->page_size, std::memory_order_relaxed);
   (void)previous;
   assert(previous >= slab->page_size);
+  process_rss_.release_reusable_page(slab->page_size, slab->projections,
+                                     page_index - 1);
   assert(slab->reclaimed_count < slab->data_page_count);
   slab->reclaimed_pages[slab->reclaimed_count++] = page_index;
   slab_reclaimed_pages_.fetch_add(1, std::memory_order_relaxed);
@@ -1097,11 +1136,12 @@ bool MemoryLimitPool::release_all_slabs_locked() {
     ReclaimableSlab *next = slab->next;
     const size_t page = slab->page_size;
     const size_t bytes = slab->reservation_size;
+    const auto projection = slab->header_projection;
     if (!slab->unmap_empty()) return false;
     slabs_ = next;
     slab_count_.fetch_sub(1, std::memory_order_relaxed);
     slab_mapped_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
-    release_metadata(page);
+    release_unmapped_metadata(page, projection);
   }
   return true;
 }
@@ -1397,11 +1437,16 @@ void MemoryLimitPool::background_evict_loop() {
 
 char *MemoryLimitPool::pop_reusable_buffer(size_t shard, size_t bytes) {
   char *buffer = pop_free_buffer(shard);
-  if (buffer && !process_rss_.try_materialize(bytes)) {
-    push_free_buffer(buffer, shard);
-    return nullptr;
-  }
-  return buffer;
+  if (!buffer) return nullptr;
+  const uintptr_t address = reinterpret_cast<uintptr_t>(buffer);
+  const uintptr_t slab_address = address & ~(kSlabAlignment - 1);
+  auto *slab = reinterpret_cast<ReclaimableSlab *>(slab_address);
+  const size_t page_index = (address - slab_address) / bytes;
+  if (process_rss_.try_materialize_reusable_page(bytes, slab->projections,
+                                                 page_index - 1))
+    return buffer;
+  push_free_buffer(buffer, shard);
+  return nullptr;
 }
 
 bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
@@ -1450,7 +1495,7 @@ bool MemoryLimitPool::try_acquire_buffer(size_t buffer_size, char *&buffer,
     release_buffer(nullptr, buffer_size);
     return false;
   }
-  process_rss_.finish_reservation(buffer_size, true);
+  if (!cacheable) process_rss_.finish_reservation(buffer_size, true);
   alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
@@ -1797,7 +1842,8 @@ void MemoryLimitPool::release_external(const size_t buffer_size) {
 
 void MemoryLimitPool::release_unmapped_external(
     size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
-  release_fixed(bytes, &external_used_size_, Backing::kLive, stamp);
+  release_fixed(bytes, &external_used_size_, Backing::kLive,
+                ProcessRssBudget::MappingProjection::Full(bytes, stamp));
 }
 
 void MemoryLimitPool::release_metadata(const size_t buffer_size) {
@@ -1806,12 +1852,13 @@ void MemoryLimitPool::release_metadata(const size_t buffer_size) {
 
 void MemoryLimitPool::release_unmapped_metadata(
     size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
-  release_fixed(bytes, &metadata_used_size_, Backing::kLive, stamp);
+  release_fixed(bytes, &metadata_used_size_, Backing::kLive,
+                ProcessRssBudget::MappingProjection::Full(bytes, stamp));
 }
 
 void MemoryLimitPool::release_fixed(
     size_t buffer_size, std::atomic<size_t> *counter, Backing backing,
-    ProcessRssBudget::MaterializationStamp stamp) {
+    ProcessRssBudget::MappingProjection projection) {
   if (buffer_size == 0) {
     return;
   }
@@ -1823,7 +1870,7 @@ void MemoryLimitPool::release_fixed(
       counter->fetch_sub(buffer_size, std::memory_order_relaxed);
   (void)counter_prev;
   assert(counter_prev >= buffer_size);
-  size_t committed_prev = release_committed(buffer_size, backing, stamp);
+  size_t committed_prev = release_committed(buffer_size, backing, projection);
   (void)committed_prev;
   assert(committed_prev >= buffer_size);
   { std::lock_guard<std::mutex> lock(capacity_mutex_); }
@@ -1885,7 +1932,7 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
       release_committed(buffer_size, Backing::kPending);
       break;
     }
-    process_rss_.finish_reservation(buffer_size, true);
+    if (!cacheable) process_rss_.finish_reservation(buffer_size, true);
     alloc_from_slab_.fetch_add(1, std::memory_order_relaxed);
     ++acquired;
   }

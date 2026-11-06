@@ -7730,6 +7730,15 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
 // Document Iterator Interface implementation
 // =============================================================================
 
+namespace {
+
+struct CDocIterator {
+  zvec::DocIterator::Ptr iterator;
+  zvec::Doc::Ptr pending;
+};
+
+}  // namespace
+
 zvec_iterator_options_t *zvec_iterator_options_create(void) {
   ZVEC_TRY_RETURN_NULL(
       "Failed to create zvec_iterator_options_t",
@@ -7775,6 +7784,7 @@ zvec_error_code_t zvec_collection_create_iterator(
                              "Collection handle is null");
   ZVEC_CHECK_NOTNULL_ERRCODE(out_iter, ZVEC_ERROR_INVALID_ARGUMENT,
                              "out_iter pointer is null");
+  *out_iter = nullptr;
 
   ZVEC_TRY_RETURN_ERROR(
       "Exception in zvec_collection_create_iterator",
@@ -7783,12 +7793,12 @@ zvec_error_code_t zvec_collection_create_iterator(
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      zvec::IteratorOptions iter_options;
-      if (options) {
-        iter_options =
-            *reinterpret_cast<const zvec::IteratorOptions *>(options);
-      }
+      const zvec::IteratorOptions defaults;
+      const auto &iter_options =
+          options ? *reinterpret_cast<const zvec::IteratorOptions *>(options)
+                  : defaults;
 
+      auto handle = std::make_unique<CDocIterator>();
       auto result = (*coll_ptr)->create_iterator(iter_options);
       if (!result.has_value()) {
         zvec_error_code_t code = status_to_error_code(result.error());
@@ -7797,8 +7807,8 @@ zvec_error_code_t zvec_collection_create_iterator(
         return code;
       }
 
-      *out_iter = reinterpret_cast<zvec_doc_iterator_t *>(
-          new std::shared_ptr<zvec::DocIterator>(std::move(result.value())));
+      handle->iterator = std::move(result.value());
+      *out_iter = reinterpret_cast<zvec_doc_iterator_t *>(handle.release());
       return ZVEC_OK;)
 }
 
@@ -7813,32 +7823,27 @@ zvec_error_code_t zvec_doc_iterator_next(zvec_doc_iterator_t *iter,
 
   ZVEC_TRY_RETURN_ERROR(
       "Exception in zvec_doc_iterator_next",
-      auto iter_ptr =
-          reinterpret_cast<std::shared_ptr<zvec::DocIterator> *>(iter);
-
-      auto result = (*iter_ptr)->next();
-      if (!result.has_value()) {
-        zvec_error_code_t code = status_to_error_code(result.error());
-        SET_LAST_ERROR(code,
-                       "Iterator next failed: " + result.error().message());
-        return code;
+      auto *handle = reinterpret_cast<CDocIterator *>(iter);
+      if (!handle->pending) {
+        auto result = handle->iterator->next();
+        if (!result.has_value()) {
+          zvec_error_code_t code = status_to_error_code(result.error());
+          SET_LAST_ERROR(code,
+                         "Iterator next failed: " + result.error().message());
+          return code;
+        }
+        handle->pending = std::move(result.value());
       }
 
-      // EOF: value() is nullptr → leave *out_doc = NULL, return OK.
-      auto doc = result.value();
-      if (doc == nullptr) {
-        return ZVEC_OK;
+      // A rejected C copy must not advance past a document the caller has
+      // never received. The native document keeps its result lease on retry.
+      if (handle->pending) {
+        *out_doc = copy_result_document(*handle->pending);
+        handle->pending.reset();
       }
-
-      // Copy into a heap Doc owned by the caller (freed via zvec_doc_destroy).
-      *out_doc = copy_result_document(*doc);
       return ZVEC_OK;)
 }
 
 void zvec_doc_iterator_close(zvec_doc_iterator_t *iter) {
-  if (iter) {
-    // Deleting the shared_ptr wrapper releases the DocIterator (whose
-    // destructor calls close() and releases segments/delete_store).
-    delete reinterpret_cast<std::shared_ptr<zvec::DocIterator> *>(iter);
-  }
+  delete reinterpret_cast<CDocIterator *>(iter);
 }

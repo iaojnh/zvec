@@ -266,7 +266,9 @@ Result<Doc::Ptr> DocIterator::next() try {
     impl_->current_row = 0;
   }
 
-  return impl_->batch_docs[impl_->current_row++];
+  // The caller owns the returned document. Keep only unread documents in
+  // the window if the caller releases its row before asking for another.
+  return std::move(impl_->batch_docs[impl_->current_row++]);
 } catch (const std::bad_alloc &) {
   impl_->batch_docs.clear();
   impl_->error = Status(StatusCode::RESOURCE_EXHAUSTED,

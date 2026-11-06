@@ -48,6 +48,9 @@ struct MemoryLimitPoolTestPeer {
   static size_t trim_retained(MemoryLimitPool &pool, size_t bytes) {
     return pool.trim_retained_blocks(bytes);
   }
+  static size_t trim_free(MemoryLimitPool &pool, size_t bytes) {
+    return pool.trim_free_buffers(bytes);
+  }
   inline static size_t rss_sample = 0;
 };
 
@@ -592,6 +595,79 @@ TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
   pool_.set_memory_pressure(Pressure::kCritical);
   EXPECT_FALSE(pool_.try_acquire_buffer(page_, buffer, /*required=*/true));
   pool_.set_memory_pressure(Pressure::kNormal);
+}
+
+TEST_F(PoolAdmissionTest, SlabPageReuseAndDiscardKeepOneProjection) {
+  constexpr size_t headroom = 32UL << 20;
+  ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t rss = baseline_ + headroom;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
+
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    char *page = nullptr;
+    if (attempt % 2 == 0) {
+      ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
+    } else {
+      ASSERT_EQ(1u, pool_.batch_acquire_buffers(page_, &page, 1));
+    }
+    EXPECT_EQ(headroom - 2 * page_, MemoryLimitPoolTestPeer::rss_available(pool_));
+    pool_.release_buffer(page, page_);
+    EXPECT_EQ(headroom - 2 * page_, MemoryLimitPoolTestPeer::rss_available(pool_));
+    char *reused = nullptr;
+    ASSERT_TRUE(pool_.try_acquire_buffer(page_, reused));
+    EXPECT_EQ(page, reused);
+    EXPECT_EQ(headroom - 2 * page_, MemoryLimitPoolTestPeer::rss_available(pool_));
+    pool_.release_buffer(reused, page_);
+    EXPECT_EQ(page_, MemoryLimitPoolTestPeer::trim_free(pool_, page_));
+    EXPECT_EQ(headroom - page_, MemoryLimitPoolTestPeer::rss_available(pool_));
+  }
+}
+
+TEST_F(PoolAdmissionTest, QueueMappingsRefundHeadroomOnUnmap) {
+  constexpr size_t headroom = 32UL << 20;
+  ASSERT_EQ(0, pool_.init(baseline_ + headroom));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t rss = baseline_ + headroom;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
+
+  for (size_t bytes : {3776UL, 128UL << 10, 3776UL, 128UL << 10}) {
+    SCOPED_TRACE(bytes);
+    const size_t before = pool_.queue_allocated();
+    void *data = EvictionQueueTraits::malloc(bytes);
+    ASSERT_NE(nullptr, data);
+    const size_t charge = pool_.queue_allocated() - before;
+    EXPECT_GT(charge, 0u);
+    EXPECT_EQ(headroom - charge, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EvictionQueueTraits::free(data);
+    EXPECT_EQ(before, pool_.queue_allocated());
+    EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+  }
+}
+
+TEST_F(PoolAdmissionTest, QueueSlabGrowthUsesTheExistingProjection) {
+  constexpr size_t headroom = 32UL << 20;
+  ASSERT_EQ(0, pool_.init(baseline_ + headroom));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t rss = baseline_ + headroom;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
+
+  const size_t before = pool_.queue_allocated();
+  using Slot = std::unique_ptr<void, decltype(&EvictionQueueTraits::free)>;
+  std::vector<Slot> slots;
+  for (int i = 0; i < 8; ++i) {
+    slots.emplace_back(EvictionQueueTraits::malloc(3776),
+                       &EvictionQueueTraits::free);
+    ASSERT_NE(nullptr, slots.back());
+    const size_t charge = pool_.queue_allocated() - before;
+    EXPECT_EQ(headroom - charge, MemoryLimitPoolTestPeer::rss_available(pool_));
+  }
+  slots.clear();
+  EXPECT_EQ(before, pool_.queue_allocated());
+  EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
 }
 
 TEST_F(PoolAdmissionTest, ConcurrentMixedAdmissionStaysWithinBothLimits) {
