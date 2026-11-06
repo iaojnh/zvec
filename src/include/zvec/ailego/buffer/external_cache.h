@@ -69,16 +69,12 @@ class CacheMetadataAllocator {
     const size_t bytes = sizeof(Header) + count * sizeof(T);
     auto &pool = MemoryLimitPool::get_instance();
     const size_t charge = pool.capacity() ? bytes : 0;
-    if (charge && !(Reclaim ? pool.try_charge_metadata(charge)
-                            : pool.try_charge_metadata_without_reclaim(charge)))
-      throw std::bad_alloc();
-    void *raw = nullptr;
-    try {
-      raw = ::operator new(bytes, std::align_val_t{alignof(Header)});
-    } catch (...) {
-      if (charge) pool.release_metadata(charge);
-      throw;
-    }
+    using Pending = MemoryLimitPool::PendingAllocation;
+    Pending pending(pool, Reclaim ? Pending::Kind::kMetadata
+                                  : Pending::Kind::kLockedMetadata);
+    if (!pending.reserve(charge)) throw std::bad_alloc();
+    void *raw = ::operator new(bytes, std::align_val_t{alignof(Header)});
+    pending.commit();
     return reinterpret_cast<T *>(new (raw) Header{charge} + 1);
   }
 

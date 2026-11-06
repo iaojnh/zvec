@@ -225,17 +225,21 @@ struct IndexCluster : public IndexModule {
           if (!stored_->ready.load(std::memory_order_relaxed)) {
             auto &pool = ailego::MemoryLimitPool::get_instance();
             const size_t charge = pool.capacity() ? stored_->bytes : 0;
-            if (charge && !pool.try_charge_external(charge))
-              throw std::bad_alloc();
+            using Pending = ailego::MemoryLimitPool::PendingAllocation;
+            Pending pending(pool, Pending::Kind::kExternal);
+            if (!pending.reserve(charge)) throw std::bad_alloc();
+            bool allocated = false;
             try {
               std::string row(stored_->bytes, '\0');
+              pending.commit();
+              allocated = true;
               if (read_feature(row.data(), row.size()) != 0)
                 throw std::runtime_error("Failed to read stored centroid");
               stored_->materialized = std::move(row);
               stored_->charged = charge;
               stored_->ready.store(true, std::memory_order_release);
             } catch (...) {
-              if (charge) pool.release_external(charge);
+              if (allocated && charge) pool.release_external(charge);
               throw;
             }
           }

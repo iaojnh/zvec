@@ -1500,15 +1500,60 @@ bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
 
 bool MemoryLimitPool::try_charge_metadata_without_reclaim(size_t bytes) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  return try_charge_locked_metadata(bytes, Backing::kLive);
+}
+
+bool MemoryLimitPool::try_charge_locked_metadata(size_t bytes, Backing backing) {
   if (!bytes) return true;
-  if (!try_reserve_allocation(bytes)) {
+  if (!try_reserve_allocation(bytes, backing)) {
     // Discard only idle backing; never call an eviction owner under its lock.
     trim_free_buffers(bytes);
-    if (!try_reserve_allocation(bytes)) return false;
+    if (!try_reserve_allocation(bytes, backing)) return false;
   }
   metadata_used_size_.fetch_add(bytes, std::memory_order_relaxed);
   bg_cv_.notify_one();
   return true;
+}
+
+MemoryLimitPool::PendingAllocation::PendingAllocation(MemoryLimitPool &pool,
+                                                      Kind kind)
+    : pool_(pool),
+      kind_(kind),
+      counter_(kind == Kind::kExternal || kind == Kind::kWorkspace
+                   ? &pool.external_used_size_
+                   : &pool.metadata_used_size_) {}
+
+MemoryLimitPool::PendingAllocation::~PendingAllocation() {
+  if (bytes_) pool_.release_fixed(bytes_, counter_, Backing::kPending);
+}
+
+bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
+  assert(bytes_ == 0);
+  if (!bytes) return true;
+  std::shared_lock<std::shared_mutex> lifecycle_lock(pool_.lifecycle_mutex_);
+  bool reserved = false;
+  switch (kind_) {
+    case Kind::kExternal:
+      reserved = pool_.try_charge_fixed(bytes, counter_, Backing::kPending);
+      break;
+    case Kind::kWorkspace:
+    case Kind::kMetadata:
+      reserved =
+          pool_.try_charge_fixed_with_wait(bytes, counter_, Backing::kPending);
+      break;
+    case Kind::kLockedMetadata:
+      reserved = pool_.try_charge_locked_metadata(bytes, Backing::kPending);
+      break;
+  }
+  if (reserved) bytes_ = bytes;
+  return reserved;
+}
+
+void MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
+  assert(bytes <= bytes_);
+  if (!bytes) return;
+  pool_.process_rss_.finish_reservation(bytes, true);
+  bytes_ -= bytes;
 }
 
 bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,

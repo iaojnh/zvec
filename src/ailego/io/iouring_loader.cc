@@ -223,15 +223,17 @@ bool IoUringRing::ensure_staging(size_t bytes) {
   auto &pool = MemoryLimitPool::get_instance();
   const size_t charge = prepaid_staging_bytes_ || !pool.capacity() ? 0 : bytes;
   // Keep the old allocation charged until the replacement actually exists.
-  if (charge && !pool.try_charge_workspace(charge)) return false;
+  using Pending = MemoryLimitPool::PendingAllocation;
+  Pending pending(pool, Pending::Kind::kWorkspace);
+  if (!pending.reserve(charge)) return false;
   // Anonymous mappings are page-aligned, satisfying the I/O alignment. They
   // bypass malloc arenas, so release_staging() really returns physical pages.
   void *ptr = File::MemoryMap(bytes, 0);
   if (!ptr) {
-    if (charge) pool.release_external(charge);
     LOG_WARN("io_uring staging mapping failed; size=%zu", bytes);
     return false;
   }
+  pending.commit();
   release_staging();
   staging_ = static_cast<char *>(ptr);
   staging_size_ = bytes;

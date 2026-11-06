@@ -75,14 +75,14 @@ int DiskAnnContext::ensure_sector_buffer(size_t sectors) {
   if (sector_buffer_size_ == required_size) return 0;
   auto &pool = ailego::MemoryLimitPool::get_instance();
   const size_t charge = pool.capacity() ? required_size : 0;
-  if (charge && !pool.try_charge_external(charge)) return IndexError_NoMemory;
+  using Pending = ailego::MemoryLimitPool::PendingAllocation;
+  Pending pending(pool, Pending::Kind::kExternal);
+  if (!pending.reserve(charge)) return IndexError_NoMemory;
   void *replacement = nullptr;
   DiskAnnUtil::alloc_aligned(&replacement, required_size,
                              DiskAnnUtil::kSectorSize);
-  if (!replacement) {
-    if (charge) pool.release_external(charge);
-    return IndexError_NoMemory;
-  }
+  if (!replacement) return IndexError_NoMemory;
+  pending.commit();
   // An earlier error may have left reads outstanding. Cancel and join them
   // before moving their destinations, including when shrinking after a query.
   if (sector_buffer_ && io_initialized_) {

@@ -1171,9 +1171,10 @@ int VecBufferPool::init() {
 #endif
   const size_t writable_metadata_charge =
       mutex_charge + staging_charge + io_staging_charge;
-  if (writable_metadata_charge != 0 &&
-      !MemoryLimitPool::get_instance().try_charge_metadata(
-          writable_metadata_charge)) {
+  auto &pool = MemoryLimitPool::get_instance();
+  using Pending = MemoryLimitPool::PendingAllocation;
+  Pending pending(pool, Pending::Kind::kMetadata);
+  if (!pending.reserve(writable_metadata_charge)) {
     LOG_ERROR(
         "VecBufferPool::init: shared memory budget cannot reserve %zu bytes "
         "for %zu page-lock stripes and writeback staging (file=%s)",
@@ -1185,21 +1186,19 @@ int VecBufferPool::init() {
     auto *data =
         static_cast<std::shared_mutex *>(File::MemoryMap(mutex_charge, 0));
     if (data == nullptr) {
-      MemoryLimitPool::get_instance().release_metadata(
-          writable_metadata_charge);
       LOG_ERROR(
           "VecBufferPool::init: failed to map %zu bytes of page-lock "
           "stripes (file=%s)",
           mutex_charge, file_name_.c_str());
       return -1;
     }
+    pending.commit(mutex_charge);
     try {
       // This algorithm also destroys any constructed prefix if a lock's
       // constructor throws. The raw mapping still needs explicit release.
       std::uninitialized_value_construct_n(data, mutex_count);
     } catch (...) {
-      MemoryLimitPool::get_instance().release_metadata(
-          writable_metadata_charge - mutex_charge +
+      pool.release_metadata(
           ReleaseWritableMapping(data, mutex_charge, "page-lock stripes"));
       LOG_ERROR(
           "VecBufferPool::init: failed to construct %zu page-lock stripes "
@@ -1214,22 +1213,19 @@ int VecBufferPool::init() {
     writeback_staging = static_cast<char *>(File::MemoryMap(staging_charge, 0));
     if (writeback_staging == nullptr) {
       mutexes.reset();
-      MemoryLimitPool::get_instance().release_metadata(
-          writable_metadata_charge - mutex_charge);
       LOG_ERROR(
           "VecBufferPool::init: failed to allocate %zu bytes of writeback "
           "staging (file=%s)",
           staging_charge, file_name_.c_str());
       return -1;
     }
+    pending.commit(staging_charge);
   }
   if (!page_table_.init(block_num)) {
     mutexes.reset();
     const size_t released_staging = ReleaseWritableMapping(
         writeback_staging, staging_charge, "writeback staging");
-    MemoryLimitPool::get_instance().release_metadata(
-        writable_metadata_charge - mutex_charge - staging_charge +
-        released_staging);
+    pool.release_metadata(released_staging);
     LOG_ERROR(
         "VecBufferPool::init: page_table_ init failed for file[%s], "
         "file_size=%zu, block_num=%zu, required_metadata=%zu",
@@ -1237,6 +1233,7 @@ int VecBufferPool::init() {
         metadata_bytes_for_page_count(block_num, writable_));
     return -1;
   }
+  pending.commit();
   block_mutexes_ = std::move(mutexes);
   block_mutex_count_ = mutex_count;
   writeback_staging_ = writeback_staging;

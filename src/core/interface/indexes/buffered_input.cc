@@ -40,17 +40,16 @@ class InputAllocator {
       throw std::bad_alloc();
     const size_t bytes = n * sizeof(T);
     auto &pool = ailego::MemoryLimitPool::get_instance();
-    if (!pool.try_charge_external(bytes) &&
+    using Pending = ailego::MemoryLimitPool::PendingAllocation;
+    Pending pending(pool, Pending::Kind::kExternal);
+    if (!pending.reserve(bytes) &&
         !(pool.wait_for_available(bytes, std::chrono::milliseconds(100)) &&
-          pool.try_charge_external(bytes))) {
+          pending.reserve(bytes))) {
       throw std::bad_alloc();
     }
-    try {
-      return std::allocator<T>{}.allocate(n);
-    } catch (...) {
-      pool.release_external(bytes);
-      throw;
-    }
+    T *data = std::allocator<T>{}.allocate(n);
+    pending.commit();
+    return data;
   }
   void deallocate(T *p, size_t n) {
     std::allocator<T>{}.deallocate(p, n);

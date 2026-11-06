@@ -8,6 +8,7 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 
 namespace zvec::ailego {
 
@@ -28,6 +29,18 @@ struct MemoryLimitPoolTestPeer {
   static void stop_background(MemoryLimitPool &pool) {
     pool.stop_background_evictor();
   }
+  static bool configure_rss(MemoryLimitPool &pool, size_t limit, size_t rss) {
+    rss_sample = rss;
+    return pool.process_rss_.configure(limit, +[] { return rss_sample; });
+  }
+  static void sample_rss(MemoryLimitPool &pool, size_t rss) {
+    rss_sample = rss;
+    pool.process_rss_.refresh(true);
+  }
+  static size_t rss_available(MemoryLimitPool &pool) {
+    return pool.process_rss_.available();
+  }
+  inline static size_t rss_sample = 0;
 };
 
 namespace {
@@ -415,6 +428,39 @@ TEST_F(PoolAdmissionTest, BackingRefusalRollsBackUsedReservation) {
   }
   ASSERT_TRUE(pool_.try_charge_external(page_));
   pool_.release_external(page_);
+}
+
+TEST_F(PoolAdmissionTest, FailedWorkspaceAllocationRestoresRssHeadroom) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t initial_rss = baseline_ + 128 * page_;
+  const size_t resident_bytes = 32 * page_;
+  const size_t current_rss = initial_rss + resident_bytes;
+  const size_t headroom = 4 * page_;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(
+      pool_, current_rss + headroom, initial_rss));
+  MemoryReservation resident;
+  resident.add(resident_bytes);
+  MemoryLimitPoolTestPeer::sample_rss(pool_, current_rss);
+  const size_t used = pool_.used();
+  const size_t committed = pool_.committed();
+  for (int i = 0; i < 10; ++i) {
+    bool attempted = false;
+    MemoryReservation workspace;
+    EXPECT_THROW(workspace.add_for_allocation(page_, [&] {
+                   attempted = true;
+                   MemoryLimitPoolTestPeer::sample_rss(pool_, current_rss);
+                   EXPECT_EQ(headroom - page_,
+                             MemoryLimitPoolTestPeer::rss_available(pool_));
+                   throw std::bad_alloc();
+                 }),
+                 std::bad_alloc);
+    ASSERT_TRUE(attempted);
+    EXPECT_EQ(0u, workspace.bytes());
+    EXPECT_EQ(used, pool_.used());
+    EXPECT_EQ(committed, pool_.committed());
+    EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+  }
 }
 
 TEST_F(PoolAdmissionTest, ConcurrentMixedAdmissionStaysWithinBothLimits) {

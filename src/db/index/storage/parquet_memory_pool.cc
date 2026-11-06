@@ -254,17 +254,19 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
     ARROW_RETURN_NOT_OK(MappingSize(size, alignment, &mapped_size));
     const size_t charge =
         enforce_budget_ && budget.capacity() ? mapped_size : 0;
-    if (charge && !budget.try_charge_workspace(charge)) {
+    using Pending = ailego::MemoryLimitPool::PendingAllocation;
+    Pending pending(budget, Pending::Kind::kWorkspace);
+    if (!pending.reserve(charge)) {
       return arrow::Status::OutOfMemory(
           "Parquet decode exceeds shared budget: requested=", charge,
           " used=", budget.used(), " capacity=", budget.capacity());
     }
     void *base = MapMemory(mapped_size);
     if (base == nullptr) {
-      budget.release_external(charge);
       return arrow::Status::OutOfMemory("Cannot map Parquet buffer of ", size,
                                         " bytes");
     }
+    pending.commit();
     const uintptr_t start =
         reinterpret_cast<uintptr_t>(base) + sizeof(MappingHeader);
     const uintptr_t aligned = (start + static_cast<uintptr_t>(alignment - 1)) &

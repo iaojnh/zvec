@@ -23,11 +23,11 @@ using BudgetedString =
 inline void ReserveStringCapacity(std::string &value, MemoryReservation &memory,
                                   size_t bytes) {
   if (bytes <= value.capacity()) return;
-  if (bytes == SIZE_MAX) throw std::bad_alloc();
+  if (bytes >= SIZE_MAX / 2) throw std::bad_alloc();
   MemoryReservation replacement_memory;
-  replacement_memory.add_array(bytes + 1, 2);
   std::string replacement;
-  replacement.reserve(bytes);
+  replacement_memory.add_for_allocation((bytes + 1) * 2,
+                                         [&] { replacement.reserve(bytes); });
   replacement.assign(value);
   const size_t actual = replacement.capacity() + 1;
   if (actual > replacement_memory.bytes())
@@ -43,10 +43,11 @@ template <typename T>
 inline void ReserveVectorCapacity(std::vector<T> &value,
                                   MemoryReservation &memory, size_t count) {
   if (count <= value.capacity()) return;
+  if (count > SIZE_MAX / sizeof(T)) throw std::bad_alloc();
   MemoryReservation replacement_memory;
-  replacement_memory.add_array(count, sizeof(T));
   std::vector<T> replacement;
-  replacement.reserve(count);
+  replacement_memory.add_for_allocation(count * sizeof(T),
+                                         [&] { replacement.reserve(count); });
   const size_t actual = replacement.capacity() * sizeof(T);
   if (actual > replacement_memory.bytes())
     replacement_memory.add(actual - replacement_memory.bytes());
@@ -145,8 +146,10 @@ class BudgetedAlignedBuffer {
         replacement.data_ = reinterpret_cast<void *>(
             (address + alignment - 1) & ~(uintptr_t{alignment} - 1));
       } else {
-        replacement.memory_.add(bytes);
-        replacement.data_ = ::operator new(bytes, std::align_val_t{alignment});
+        replacement.memory_.add_for_allocation(bytes, [&] {
+          replacement.data_ =
+              ::operator new(bytes, std::align_val_t{alignment});
+        });
       }
       replacement.size_ = bytes;
       replacement.alignment_ = alignment;

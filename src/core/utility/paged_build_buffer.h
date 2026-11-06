@@ -51,14 +51,17 @@ class PagedBuildBuffer {
         if (ret != 0) return ret;
       } else {
         try {
+          using Pending = ailego::MemoryLimitPool::PendingAllocation;
+          Pending pending(pool, Pending::Kind::kWorkspace);
           if (pool.capacity() != 0) {
             candidate.charge_ = std::make_unique<ExternalCharge>();
             // Inline build scratch is mandatory, not optional cache admission.
             // A first reclaim pass may only start writeback or age CLOCK bits.
-            if (!pool.try_charge_workspace(bytes)) return IndexError_NoMemory;
-            candidate.charge_->bytes = bytes;
+            if (!pending.reserve(bytes)) return IndexError_NoMemory;
           }
           candidate.memory_.resize(bytes);
+          pending.commit();
+          if (candidate.charge_) candidate.charge_->bytes = bytes;
         } catch (const std::bad_alloc &) {
           return IndexError_NoMemory;
         } catch (const std::exception &) {

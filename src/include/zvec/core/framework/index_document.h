@@ -127,14 +127,11 @@ class IndexDocument {
       if (size == SIZE_MAX) throw std::bad_alloc();
       auto &pool = ailego::MemoryLimitPool::get_instance();
       charge_ = pool.capacity() ? size + 1 : 0;
-      if (charge_ && !pool.try_charge_workspace(charge_))
-        throw std::bad_alloc();
-      try {
-        data.assign(static_cast<const char *>(src), size);
-      } catch (...) {
-        if (charge_) pool.release_external(charge_);
-        throw;
-      }
+      using Pending = ailego::MemoryLimitPool::PendingAllocation;
+      Pending pending(pool, Pending::Kind::kWorkspace);
+      if (!pending.reserve(charge_)) throw std::bad_alloc();
+      data.assign(static_cast<const char *>(src), size);
+      pending.commit();
     }
     ~VectorPayload() {
       // Release the backing string before making its budget available again.

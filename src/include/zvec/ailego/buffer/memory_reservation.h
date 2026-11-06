@@ -41,6 +41,21 @@ class MemoryReservation {
       throw std::bad_alloc();
     add(count * element_size);
   }
+  // Allocate may throw before obtaining backing. Only transfer a successful
+  // allocation into this owner's lifetime accounting.
+  template <typename Allocate>
+  void add_for_allocation(size_t bytes, Allocate allocate) {
+    auto &pool = MemoryLimitPool::get_instance();
+    const size_t charge = pool.capacity() ? bytes : 0;
+    using Pending = MemoryLimitPool::PendingAllocation;
+    Pending pending(pool, Pending::Kind::kWorkspace);
+    if (charge > std::numeric_limits<size_t>::max() - bytes_ ||
+        !pending.reserve(charge))
+      throw std::bad_alloc();
+    allocate();
+    pending.commit();
+    bytes_ += charge;
+  }
   void swap(MemoryReservation &rhs) noexcept {
     std::swap(bytes_, rhs.bytes_);
   }

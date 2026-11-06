@@ -312,6 +312,30 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   //! On refusal the caller must unlock before reclaiming and retrying.
   bool try_charge_metadata_without_reclaim(size_t bytes);
 
+  // For backing that is being allocated. A failed attempt refunds the
+  // reservation without recording a release of potentially resident pages.
+  // After committing bytes, their owner releases them through the pool.
+  class PendingAllocation {
+   public:
+    enum class Kind { kExternal, kWorkspace, kMetadata, kLockedMetadata };
+
+    PendingAllocation(MemoryLimitPool &pool, Kind kind);
+    PendingAllocation(const PendingAllocation &) = delete;
+    PendingAllocation &operator=(const PendingAllocation &) = delete;
+    ~PendingAllocation();
+    bool reserve(size_t bytes);
+    void commit() {
+      commit(bytes_);
+    }
+    void commit(size_t bytes);
+
+   private:
+    MemoryLimitPool &pool_;
+    const Kind kind_;
+    std::atomic<size_t> *const counter_;
+    size_t bytes_{0};
+  };
+
   //! Non-spillable, reusable backing blocks, independent of VectorPageTable.
   //! Active blocks count toward used(); idle blocks still count toward
   //! committed(). Only successful unmapping refunds their backing budget.
@@ -505,6 +529,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                         Backing backing = Backing::kLive);
   bool try_charge_fixed_with_wait(size_t bytes, std::atomic<size_t> *counter,
                                   Backing backing = Backing::kLive);
+  bool try_charge_locked_metadata(size_t bytes, Backing backing);
   void release_fixed(size_t bytes, std::atomic<size_t> *counter,
                      Backing backing = Backing::kLive);
   bool is_cacheable_buffer_size(size_t buffer_size);

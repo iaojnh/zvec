@@ -49,10 +49,11 @@ class BudgetedMappedBuffer {
     BudgetedMappedBuffer replacement;
     if (bytes) {
       replacement.mapped_size_ = mapping_size(bytes);
-      replacement.memory_.add(replacement.mapped_size_);
-      replacement.data_ =
-          static_cast<char *>(File::MemoryMap(replacement.mapped_size_, 0));
-      if (!replacement.data_) throw std::bad_alloc();
+      replacement.memory_.add_for_allocation(replacement.mapped_size_, [&] {
+        replacement.data_ =
+            static_cast<char *>(File::MemoryMap(replacement.mapped_size_, 0));
+        if (!replacement.data_) throw std::bad_alloc();
+      });
       replacement.size_ = bytes;
     }
     swap(replacement);
