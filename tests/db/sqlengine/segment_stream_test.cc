@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <thread>
 #include <arrow/api.h>
 #include <arrow/compute/initialize.h>
+#include <arrow/io/api.h>
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "ailego/pattern/defer.h"
+#include "db/common/global_resource.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #include "db/sqlengine/planner/segment_node.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
@@ -300,6 +303,84 @@ TEST(SegmentStreamTest, ReadsSegmentsLazilyWithOneCpuWorker) {
   EXPECT_GT(last->load(), 0);
   EXPECT_LE(last->load(), 2);
 }
+TEST(SegmentStreamTest, ManagedPlansDoNotDependOnHostExecutors) {
+  // These executor tests configure a standalone payload pool; process-budget
+  // startup and stack reservations are covered in global_resource_test.
+  ASSERT_EQ(0, ailego::MemoryLimitPool::get_instance().init(128UL << 20));
+  auto &resources = GlobalResource::Instance();
+  auto *cpu = resources.arrow_query_thread_pool();
+  auto *io = resources.arrow_io_thread_pool();
+  ASSERT_NE(nullptr, cpu);
+  ASSERT_NE(nullptr, io);
+  const auto cpu_count = cpu->GetCapacity();
+  const auto io_count = io->GetCapacity();
+  ASSERT_TRUE(cpu->SetCapacity(1).ok());
+  ASSERT_TRUE(io->SetCapacity(1).ok());
+  auto restore_managed = ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(cpu->SetCapacity(cpu_count).ok());
+    EXPECT_TRUE(io->SetCapacity(io_count).ok());
+  });
+  auto *host = arrow::internal::GetCpuThreadPool();
+  const auto capacity = host->GetCapacity();
+  ASSERT_TRUE(host->SetCapacity(1).ok());
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(host->SetCapacity(capacity).ok()); });
+  host->WaitForIdle();
+  const auto io_capacity = arrow::io::GetIOThreadPoolCapacity();
+  ASSERT_TRUE(arrow::io::SetIOThreadPoolCapacity(1).ok());
+  auto restore_io = ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(arrow::io::SetIOThreadPoolCapacity(io_capacity).ok());
+  });
+  std::promise<void> io_started, started, release;
+  auto gate = release.get_future().share();
+  auto blocker = host->Submit([&started, gate] {
+    started.set_value();
+    gate.wait();
+  });
+  ASSERT_TRUE(blocker.ok());
+  auto io_blocker =
+      arrow::io::default_io_context().executor()->Submit([&io_started, gate] {
+        io_started.set_value();
+        gate.wait();
+      });
+  bool released = false;
+  auto unblock = ailego::ScopeGuard::Make([&] {
+    if (!released) release.set_value();
+    blocker->Wait();
+    if (io_blocker.ok()) io_blocker->Wait();
+  });
+  ASSERT_TRUE(io_blocker.ok());
+  started.get_future().wait();
+  io_started.get_future().wait();
+  auto run = std::async(std::launch::async, [] {
+    auto schema = arrow::schema({arrow::field("row", arrow::int32())});
+    auto source = arrow::RecordBatchReader::Make(
+        std::vector<std::shared_ptr<arrow::RecordBatch>>{}, schema);
+    if (!source.ok()) return false;
+    PlanInfo plan({"record_batch_reader_source",
+                   arrow::acero::RecordBatchReaderSourceNodeOptions{*source}},
+                  schema, /*budgeted=*/true);
+    auto reader = plan.execute_to_reader();
+    if (!reader) return false;
+    std::shared_ptr<arrow::RecordBatch> batch;
+    if (!(*reader)->ReadNext(&batch).ok() || batch) return false;
+    auto stream = plan.execute_to_generator(8192);
+    if (!stream) return false;
+    auto end = (*stream)().result();
+    return end.ok() && !end->has_value();
+  });
+  const auto ready = run.wait_for(std::chrono::seconds(3));
+  // Release before joining even on failure, so a regression fails rather
+  // than hanging behind the intentionally occupied process-global worker.
+  release.set_value();
+  blocker->Wait();
+  io_blocker->Wait();
+  released = true;
+  EXPECT_EQ(std::future_status::ready, ready);
+  EXPECT_TRUE(run.get());
+  EXPECT_EQ(1, host->GetCapacity());
+}
+
 TEST(SegmentStreamTest,
      BufferPlanAccountsKernelOutputAndDeniesBeforeAllocation) {
   ASSERT_TRUE(arrow::compute::Initialize().ok());

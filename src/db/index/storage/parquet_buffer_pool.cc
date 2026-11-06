@@ -281,8 +281,7 @@ arrow::Status detail::ParquetBufferLoader::load_checked(
   parquet::ReaderProperties read_properties(mem_pool);
   read_properties.enable_buffered_stream();
   read_properties.set_buffer_size(64 * 1024);
-  parquet::ArrowReaderProperties arrow_properties;
-  arrow_properties.set_pre_buffer(false);
+  auto arrow_properties = BudgetedParquetArrowProperties();
   // Bound output-builder growth even while retaining the resulting chunks
   // for cache publication. Individual dictionary/data pages still need a
   // contiguous decode workspace and are subject to allocation admission.

@@ -20,6 +20,10 @@
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/pattern/singleton.h>
 
+namespace arrow::internal {
+class ThreadPool;
+}
+
 namespace zvec {
 
 class GlobalConfig;
@@ -66,6 +70,18 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
       return nullptr;
     }
     return optimize_thread_pool_.get();
+  }
+
+  // Managed Acero plans use a separately budgeted executor instead of the
+  // host application's process-global Arrow pool.
+  arrow::internal::ThreadPool *arrow_query_thread_pool() {
+    if (initialize() != 0) return nullptr;
+    return arrow_query_thread_pool_.get();
+  }
+
+  arrow::internal::ThreadPool *arrow_io_thread_pool() {
+    if (initialize() != 0) return nullptr;
+    return arrow_io_thread_pool_.get();
   }
 
   std::shared_ptr<rocksdb::Cache> rocksdb_block_cache() {
@@ -117,6 +133,8 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
   std::unique_ptr<ailego::ThreadPool> optimize_thread_pool_;
   std::shared_ptr<rocksdb::Cache> rocksdb_block_cache_;
   std::shared_ptr<rocksdb::WriteBufferManager> rocksdb_write_buffer_manager_;
+  std::shared_ptr<arrow::internal::ThreadPool> arrow_query_thread_pool_;
+  std::shared_ptr<arrow::internal::ThreadPool> arrow_io_thread_pool_;
 };
 
 }  // namespace zvec

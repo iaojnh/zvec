@@ -78,13 +78,13 @@ TEST(NativeWorkerMemoryDeathTest, AdmissionIsIdempotentAndOverflowSafe) {
         auto &pool = ailego::MemoryLimitPool::get_instance();
         if (pool.init(32UL << 20) != 0) std::_Exit(1);
         const auto before = pool.external_used();
-        ReserveNativeWorkerStacks(2, 1, 1);
-        const size_t expected = (2 + 1 + RocksDbBackgroundThreads(1) + 2) *
+        ReserveNativeWorkerStacks(2, 1, 1, 3);
+        const size_t expected = (2 + 1 + RocksDbBackgroundThreads(1) + 2 + 3) *
                                 DefaultNativeWorkerStackBytes();
         if (NativeWorkerStackReservation().bytes() != expected ||
             pool.external_used() != before + expected)
           std::_Exit(2);
-        ReserveNativeWorkerStacks(2, 1, 1);
+        ReserveNativeWorkerStacks(2, 1, 1, 3);
         if (pool.external_used() != before + expected) std::_Exit(3);
         bool overflow = false;
         try {
@@ -94,6 +94,15 @@ TEST(NativeWorkerMemoryDeathTest, AdmissionIsIdempotentAndOverflowSafe) {
         }
         if (!overflow || pool.external_used() != before + expected)
           std::_Exit(4);
+        overflow = false;
+        try {
+          ReserveNativeWorkerStacks(2, 1, 1,
+                                    std::numeric_limits<size_t>::max());
+        } catch (const std::bad_alloc &) {
+          overflow = true;
+        }
+        if (!overflow || pool.external_used() != before + expected)
+          std::_Exit(6);
         bool rejected = false;
         try {
           ReserveNativeWorkerStacks(1024, 1024, 16);

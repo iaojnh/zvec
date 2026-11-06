@@ -16,7 +16,9 @@
 #include <optional>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/table.h>
+#include <arrow/util/thread_pool.h>
 #include <zvec/ailego/logger/logger.h>
+#include "db/common/global_resource.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #include "db/sqlengine/planner/invert_search.h"
 
@@ -38,8 +40,21 @@ Status DocFilter::compute_filter() {
     auto *pool = segment_->uses_buffer_storage()
                      ? detail::GetParquetMemoryPool().get()
                      : arrow::default_memory_pool();
+    arrow::acero::QueryOptions options;
+    options.memory_pool = pool;
+    if (segment_->uses_buffer_storage()) {
+      // This nested filter can run on a managed CPU worker. Run its CPU
+      // continuations on the caller to avoid waiting on the same pool, and
+      // send blocking reads to the separately admitted I/O workers.
+      options.use_threads = false;
+      options.custom_io_executor =
+          GlobalResource::Instance().arrow_io_thread_pool();
+      if (!options.custom_io_executor)
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "Managed Arrow I/O executor unavailable");
+    }
     auto forward_result =
-        arrow::acero::DeclarationToTable(*forward_plan_, true, pool);
+        arrow::acero::DeclarationToTable(*forward_plan_, options);
     if (!forward_result.ok()) {
       if (forward_result.status().IsOutOfMemory())
         return Status(StatusCode::RESOURCE_EXHAUSTED,
@@ -63,8 +78,15 @@ Status DocFilter::compute_filter() {
     if (!table) {
       return Status::InternalError("Fetch forward failed");
     }
-    auto bind_res = forward_filter_expr_->Bind(*table->schema());
+    auto *pool = segment_->uses_buffer_storage()
+                     ? detail::GetParquetMemoryPool().get()
+                     : arrow::default_memory_pool();
+    arrow::compute::ExecContext context(pool);
+    auto bind_res = forward_filter_expr_->Bind(*table->schema(), &context);
     if (!bind_res.ok()) {
+      if (bind_res.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      bind_res.status().ToString());
       return Status::InternalError("Bind forward filter expression failed",
                                    bind_res.status().ToString());
     }

@@ -22,11 +22,28 @@
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include "db/common/error_code.h"
+#include "db/common/global_resource.h"
 #include "db/index/storage/parquet_memory_pool.h"
 
 namespace zvec::sqlengine {
 
 namespace {
+arrow::Result<arrow::acero::QueryOptions> QueryOptions(arrow::MemoryPool *pool,
+                                                       bool budgeted) {
+  arrow::acero::QueryOptions options;
+  options.memory_pool = pool;
+  if (budgeted) {
+    auto &resources = GlobalResource::Instance();
+    options.custom_cpu_executor = resources.arrow_query_thread_pool();
+    options.custom_io_executor = resources.arrow_io_thread_pool();
+    if (!options.custom_cpu_executor || !options.custom_io_executor)
+      return arrow::Status::OutOfMemory("Managed Arrow executors unavailable");
+  } else {
+    options.custom_cpu_executor = arrow::internal::GetCpuThreadPool();
+  }
+  return options;
+}
+
 // Arrow's generic source queues delivery tasks before the sink can pause it.
 // A ready generator can therefore enqueue its entire scan. Deliver one batch
 // before pulling another and await backpressure without blocking an executor.
@@ -177,7 +194,8 @@ class BoundedSource : public arrow::acero::ExecNode {
 };
 
 arrow::Result<arrow::acero::Declaration> bound_sources(
-    arrow::acero::Declaration plan) {
+    arrow::acero::Declaration plan,
+    arrow::internal::Executor *managed_io = nullptr) {
   static const auto registered =
       arrow::acero::default_exec_factory_registry()->AddFactory(
           "zvec_bounded_source",
@@ -200,9 +218,8 @@ arrow::Result<arrow::acero::Declaration> bound_sources(
     if (!options || !options->reader)
       return arrow::Status::Invalid("Missing source reader");
     auto reader = options->reader;
-    auto *executor = options->io_executor
-                         ? options->io_executor
-                         : arrow::io::default_io_context().executor();
+    auto *executor = managed_io ? managed_io : options->io_executor;
+    if (!executor) executor = arrow::io::default_io_context().executor();
     arrow::AsyncGenerator<BoundedSource::Batch> generator =
         [reader, executor]() -> arrow::Future<BoundedSource::Batch> {
       auto future =
@@ -230,7 +247,7 @@ arrow::Result<arrow::acero::Declaration> bound_sources(
   if (plan.factory_name == "source") plan.factory_name = "zvec_bounded_source";
   for (auto &input : plan.inputs) {
     if (auto *child = std::get_if<arrow::acero::Declaration>(&input)) {
-      ARROW_ASSIGN_OR_RAISE(*child, bound_sources(*child));
+      ARROW_ASSIGN_OR_RAISE(*child, bound_sources(*child, managed_io));
     }
   }
   return plan;
@@ -259,11 +276,13 @@ class BoundedPlanReader : public arrow::RecordBatchReader {
  public:
   static arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Make(
       const arrow::acero::Declaration &declaration, size_t max_queued_bytes,
-      arrow::MemoryPool *pool) {
-    arrow::compute::ExecContext context(pool,
-                                        arrow::internal::GetCpuThreadPool());
-    ARROW_ASSIGN_OR_RAISE(auto plan, arrow::acero::ExecPlan::Make(context));
-    ARROW_ASSIGN_OR_RAISE(auto source, bound_sources(declaration));
+      arrow::MemoryPool *pool, bool budgeted) {
+    ARROW_ASSIGN_OR_RAISE(auto options, QueryOptions(pool, budgeted));
+    arrow::compute::ExecContext context(pool, options.custom_cpu_executor);
+    ARROW_ASSIGN_OR_RAISE(auto plan,
+                          arrow::acero::ExecPlan::Make(options, context));
+    ARROW_ASSIGN_OR_RAISE(
+        auto source, bound_sources(declaration, options.custom_io_executor));
     arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> generator;
     std::shared_ptr<arrow::Schema> schema;
     auto with_sink = arrow::acero::Declaration::Sequence(
@@ -330,12 +349,14 @@ PlanInfo::execute_to_generator(size_t max_queued_bytes) {
   auto make =
       [&]() -> arrow::Result<arrow::AsyncGenerator<AsyncPlanStream::Batch>> {
     auto stream = std::make_shared<AsyncPlanStream>();
-    ARROW_ASSIGN_OR_RAISE(auto source, bound_sources(plan_));
     auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
                            : arrow::default_memory_pool();
-    arrow::compute::ExecContext context(pool,
-                                        arrow::internal::GetCpuThreadPool());
-    ARROW_ASSIGN_OR_RAISE(stream->plan, arrow::acero::ExecPlan::Make(context));
+    ARROW_ASSIGN_OR_RAISE(auto options, QueryOptions(pool, budgeted_));
+    ARROW_ASSIGN_OR_RAISE(auto source,
+                          bound_sources(plan_, options.custom_io_executor));
+    arrow::compute::ExecContext context(pool, options.custom_cpu_executor);
+    ARROW_ASSIGN_OR_RAISE(stream->plan,
+                          arrow::acero::ExecPlan::Make(options, context));
     auto with_sink = arrow::acero::Declaration::Sequence(
         {source,
          {"sink", arrow::acero::SinkNodeOptions{
@@ -358,9 +379,13 @@ PlanInfo::execute_to_generator(size_t max_queued_bytes) {
     });
   };
   auto result = make();
-  if (!result.ok())
+  if (!result.ok()) {
+    if (result.status().IsOutOfMemory())
+      return tl::make_unexpected(
+          Status(StatusCode::RESOURCE_EXHAUSTED, result.status().ToString()));
     return tl::make_unexpected(
         Status::InternalError(result.status().ToString()));
+  }
   return std::move(*result);
 }
 
@@ -369,9 +394,10 @@ Result<std::unique_ptr<arrow::RecordBatchReader>> PlanInfo::execute_to_reader(
   auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
                          : arrow::default_memory_pool();
   if (budgeted_ && !max_queued_bytes) max_queued_bytes = 64 * 1024;
-  auto res = max_queued_bytes
-                 ? BoundedPlanReader::Make(plan_, max_queued_bytes, pool)
-                 : arrow::acero::DeclarationToReader(plan_, true, pool);
+  auto res =
+      max_queued_bytes
+          ? BoundedPlanReader::Make(plan_, max_queued_bytes, pool, budgeted_)
+          : arrow::acero::DeclarationToReader(plan_, true, pool);
   if (!res.ok()) {
     if (res.status().IsOutOfMemory())
       return tl::make_unexpected(

@@ -14,6 +14,7 @@
 #include "db/common/global_resource.h"
 #include <exception>
 #include <mutex>
+#include <arrow/util/thread_pool.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/cache.h>
 #include <rocksdb/write_buffer_manager.h>
@@ -196,9 +197,9 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       // Explicit process budgets cover zvec-owned worker stacks before any
       // resource handle is published or collection can populate the cache.
       // A preconfigured standalone/core cache is not a DB process budget.
-      detail::ReserveNativeWorkerStacks(query_thread_pool->count(),
-                                        optimize_thread_pool->count(),
-                                        optimize_thread_count);
+      detail::ReserveNativeWorkerStacks(
+          query_thread_pool->count(), optimize_thread_pool->count(),
+          optimize_thread_count, 2 * query_thread_pool->count());
       // RSS already includes resident images, stacks, and caller-owned memory.
       // Use it as a separate admission/eviction signal, never another fixed
       // reservation that would count those bytes twice.
@@ -212,6 +213,24 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       }
     }
 
+    // MakeEternal supports singleton destruction late at process exit. Its
+    // lazy workers are admitted above before any plan can start using them.
+    auto arrow_pool = arrow::internal::ThreadPool::MakeEternal(
+        static_cast<int>(query_thread_pool->count()));
+    if (!arrow_pool.ok()) {
+      LOG_ERROR("Failed to create managed Arrow executor: %s",
+                arrow_pool.status().ToString().c_str());
+      return -1;
+    }
+
+    auto arrow_io_pool = arrow::internal::ThreadPool::MakeEternal(
+        static_cast<int>(query_thread_pool->count()));
+    if (!arrow_io_pool.ok()) {
+      LOG_ERROR("Failed to create managed Arrow I/O executor: %s",
+                arrow_io_pool.status().ToString().c_str());
+      return -1;
+    }
+
     memory_limit_bytes_ = memory_limit_bytes;
     rocksdb_memory_capacity_ = rocksdb_memory_capacity;
     query_thread_count_ = query_thread_count;
@@ -220,6 +239,8 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     optimize_thread_binding_ = optimize_thread_binding;
     this->query_thread_pool_ = std::move(query_thread_pool);
     this->optimize_thread_pool_ = std::move(optimize_thread_pool);
+    arrow_query_thread_pool_ = std::move(*arrow_pool);
+    arrow_io_thread_pool_ = std::move(*arrow_io_pool);
     rocksdb_block_cache_ = std::move(rocksdb_block_cache);
     rocksdb_write_buffer_manager_ = std::move(rocksdb_write_buffer_manager);
     initialization_failed_ = false;

@@ -811,7 +811,8 @@ inline arrow::Result<std::shared_ptr<arrow::Table>> ReadBlocksAsTable(
                               detail::OpenBudgetedParquetReader(
                                   file, parquet::ReaderProperties(pool)));
         ARROW_RETURN_NOT_OK(parquet::arrow::FileReader::Make(
-            pool, std::move(native_reader), &reader));
+            pool, std::move(native_reader),
+            detail::BudgetedParquetArrowProperties(), &reader));
         ARROW_RETURN_NOT_OK(reader->ReadTable(&table));
       } else {
         ARROW_ASSIGN_OR_RAISE(auto reader,

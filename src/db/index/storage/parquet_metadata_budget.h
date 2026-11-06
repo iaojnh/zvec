@@ -15,6 +15,14 @@
 
 namespace zvec::detail {
 
+inline parquet::ArrowReaderProperties BudgetedParquetArrowProperties() {
+  // Managed reads already have bounded caching/streaming. Avoid the global
+  // Arrow I/O executor and whole-column prefetch outside that scheduling.
+  parquet::ArrowReaderProperties properties(/*use_threads=*/false);
+  properties.set_pre_buffer(false);
+  return properties;
+}
+
 // Thrift metadata uses standard containers, not Arrow's MemoryPool. This is
 // an explicit planning allowance, not exact allocator accounting or an RSS
 // limit. Keep the concurrent high water charged after close: free() need not

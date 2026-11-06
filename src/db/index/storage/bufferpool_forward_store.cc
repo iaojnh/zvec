@@ -83,7 +83,8 @@ arrow::Status BufferPoolForwardStore::open_parquet(
       detail::OpenBudgetedParquetReader(
           file, parquet::ReaderProperties(memory_pool.get())));
   ARROW_RETURN_NOT_OK(parquet::arrow::FileReader::Make(
-      memory_pool.get(), std::move(parquet_file_reader), &parquet_reader_));
+      memory_pool.get(), std::move(parquet_file_reader),
+      detail::BudgetedParquetArrowProperties(), &parquet_reader_));
 
   auto parquet_metadata = parquet_reader_->parquet_reader()->metadata();
   metadata_id_.metadata = parquet_metadata;
@@ -434,8 +435,7 @@ RecordBatchReaderPtr BufferPoolForwardStore::scan(
   read_properties.set_buffer_size(64 * 1024);
   auto parquet_file_reader = parquet::ParquetFileReader::Open(
       file_, read_properties, parquet_reader_->parquet_reader()->metadata());
-  parquet::ArrowReaderProperties arrow_properties;
-  arrow_properties.set_pre_buffer(false);
+  auto arrow_properties = detail::BudgetedParquetArrowProperties();
   arrow_properties.set_batch_size(8192);
   auto status = parquet::arrow::FileReader::Make(
       memory_pool.get(), std::move(parquet_file_reader), arrow_properties,

@@ -105,18 +105,22 @@ inline ailego::MemoryReservation &NativeWorkerStackReservation() {
 
 inline void ReserveNativeWorkerStacks(size_t query_workers,
                                       size_t optimize_workers,
-                                      uint32_t optimize_threads) {
+                                      uint32_t optimize_threads,
+                                      size_t arrow_workers = 0) {
   const size_t stack_bytes = DefaultNativeWorkerStackBytes();
   if (stack_bytes == 0) return;
-  // Besides the two zvec pools: RocksDB's low-priority pool, its one high-
-  // priority flush worker and the shared BufferPool eviction worker. Caller-
+  // Include the dedicated Arrow CPU/I/O executors, the two zvec pools,
+  // RocksDB's low-priority pool, its high-priority flush worker and the shared
+  // BufferPool eviction worker. Caller-
   // owned Python/application threads are not charged here.
   const size_t other_workers = RocksDbBackgroundThreads(optimize_threads) + 2;
   constexpr size_t kMax = std::numeric_limits<size_t>::max();
   if (query_workers > kMax - optimize_workers ||
-      query_workers + optimize_workers > kMax - other_workers)
+      query_workers + optimize_workers > kMax - other_workers ||
+      arrow_workers > kMax - query_workers - optimize_workers - other_workers)
     throw std::bad_alloc();
-  const size_t workers = query_workers + optimize_workers + other_workers;
+  const size_t workers =
+      query_workers + optimize_workers + other_workers + arrow_workers;
   if (workers > kMax / stack_bytes) throw std::bad_alloc();
   const size_t bytes = workers * stack_bytes;
   auto &reservation = NativeWorkerStackReservation();

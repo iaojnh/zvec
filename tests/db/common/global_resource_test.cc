@@ -23,6 +23,7 @@
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
+#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/write_buffer_manager.h>
@@ -43,6 +44,7 @@ namespace {
 struct ResourceSnapshot {
   ailego::ThreadPool *query_pool{nullptr};
   ailego::ThreadPool *optimize_pool{nullptr};
+  arrow::internal::ThreadPool *arrow_pool{nullptr};
   std::shared_ptr<rocksdb::Cache> cache;
   std::shared_ptr<rocksdb::WriteBufferManager> write_buffer_manager;
   uint64_t rocksdb_capacity{0};
@@ -53,11 +55,12 @@ ResourceSnapshot ReadPublishedResources(GlobalResource &resource) {
   ResourceSnapshot snapshot;
   snapshot.query_pool = resource.query_thread_pool();
   snapshot.optimize_pool = resource.optimize_thread_pool();
+  snapshot.arrow_pool = resource.arrow_query_thread_pool();
   snapshot.cache = resource.rocksdb_block_cache();
   snapshot.write_buffer_manager = resource.rocksdb_write_buffer_manager();
   snapshot.rocksdb_capacity = resource.rocksdb_memory_capacity();
   if (!snapshot.query_pool || !snapshot.optimize_pool || !snapshot.cache ||
-      !snapshot.write_buffer_manager) {
+      !snapshot.write_buffer_manager || !snapshot.arrow_pool) {
     return snapshot;
   }
 
@@ -65,6 +68,7 @@ ResourceSnapshot ReadPublishedResources(GlobalResource &resource) {
     if (resource.initialize() != 0 ||
         resource.query_thread_pool() != snapshot.query_pool ||
         resource.optimize_thread_pool() != snapshot.optimize_pool ||
+        resource.arrow_query_thread_pool() != snapshot.arrow_pool ||
         resource.rocksdb_block_cache() != snapshot.cache ||
         resource.rocksdb_write_buffer_manager() !=
             snapshot.write_buffer_manager ||
@@ -121,6 +125,8 @@ void CheckConcurrentLazyResourceAccess(bool existing_pool) {
     ASSERT_TRUE(snapshot.consistent);
     EXPECT_EQ(snapshots.front().query_pool, snapshot.query_pool);
     EXPECT_EQ(snapshots.front().optimize_pool, snapshot.optimize_pool);
+    EXPECT_EQ(snapshots.front().arrow_pool, snapshot.arrow_pool);
+    EXPECT_EQ(snapshot.query_pool->count(), snapshot.arrow_pool->GetCapacity());
     EXPECT_EQ(snapshots.front().cache, snapshot.cache);
     EXPECT_EQ(snapshots.front().write_buffer_manager,
               snapshot.write_buffer_manager);
@@ -460,6 +466,19 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
             GlobalResource::Instance().query_thread_pool()->count());
   EXPECT_EQ(expected_optimize_workers,
             GlobalResource::Instance().optimize_thread_pool()->count());
+  auto *arrow_pool = GlobalResource::Instance().arrow_query_thread_pool();
+  ASSERT_NE(nullptr, arrow_pool);
+  EXPECT_EQ(expected_query_workers, arrow_pool->GetCapacity());
+  EXPECT_NE(arrow::internal::GetCpuThreadPool(), arrow_pool);
+  auto *io_pool = GlobalResource::Instance().arrow_io_thread_pool();
+  ASSERT_NE(nullptr, io_pool);
+  EXPECT_EQ(expected_query_workers, io_pool->GetCapacity());
+  EXPECT_NE(arrow_pool, io_pool);
+  auto task =
+      arrow_pool->Submit([arrow_pool] { return arrow_pool->OwnsThisThread(); });
+  ASSERT_TRUE(task.ok());
+  ASSERT_TRUE(task->result().ok());
+  EXPECT_TRUE(*task->result());
 
   const uint64_t total_capacity = config.memory_limit_bytes;
   const uint64_t expected_rocksdb_capacity =
@@ -472,7 +491,7 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
 #if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
   const auto stack_bytes = detail::DefaultNativeWorkerStackBytes();
   const auto native_workers =
-      expected_query_workers + expected_optimize_workers +
+      3 * expected_query_workers + expected_optimize_workers +
       detail::RocksDbBackgroundThreads(config.optimize_thread_count) + 2;
   EXPECT_GT(stack_bytes, 0u);
   EXPECT_EQ(native_workers * stack_bytes,

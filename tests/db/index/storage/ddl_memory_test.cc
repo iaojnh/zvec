@@ -3,8 +3,12 @@
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <arrow/compute/initialize.h>
+#include <arrow/io/api.h>
+#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
+#include "ailego/pattern/scope_guard.h"
 #include "db/index/storage/store_helper.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 #include "../../common/memory_budget_test_helper.h"
@@ -77,7 +81,34 @@ TEST(DdlMemoryTest, BlockReadsUseManagedBuffersAndReturnOutOfMemory) {
   const auto memory = detail::GetParquetMemoryPool();
   const auto before = memory->bytes_allocated();
   {
-    auto result = ReadBlocksAsTable(blocks, root.string(), 0, true);
+    const auto capacity = arrow::io::GetIOThreadPoolCapacity();
+    ASSERT_TRUE(arrow::io::SetIOThreadPoolCapacity(1).ok());
+    auto restore = ailego::ScopeGuard::Make([&] {
+      EXPECT_TRUE(arrow::io::SetIOThreadPoolCapacity(capacity).ok());
+    });
+    std::promise<void> started, release;
+    auto gate = release.get_future().share();
+    auto blocker =
+        arrow::io::default_io_context().executor()->Submit([&started, gate] {
+          started.set_value();
+          gate.wait();
+        });
+    ASSERT_TRUE(blocker.ok());
+    started.get_future().wait();
+    bool released = false;
+    auto unblock = ailego::ScopeGuard::Make([&] {
+      if (!released) release.set_value();
+      blocker->Wait();
+    });
+    auto read = std::async(std::launch::async, [&] {
+      return ReadBlocksAsTable(blocks, root.string(), 0, true);
+    });
+    const auto ready = read.wait_for(std::chrono::seconds(3));
+    release.set_value();
+    blocker->Wait();
+    released = true;
+    EXPECT_EQ(std::future_status::ready, ready);
+    auto result = read.get();
     ASSERT_TRUE(result.ok()) << result.status();
     EXPECT_EQ(kRows, (*result)->num_rows());
     EXPECT_GT(memory->bytes_allocated(), before);
