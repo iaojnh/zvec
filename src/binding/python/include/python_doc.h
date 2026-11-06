@@ -10,7 +10,8 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
-// limitations under the License.#pragma once
+// limitations under the License.
+#pragma once
 
 #include <pybind11/pybind11.h>
 #include <zvec/db/doc.h>
@@ -28,6 +29,9 @@ class ZVecPyDoc {
 
  public:
   static void Initialize(py::module_ &m);
+
+  static bool set_field(Doc &doc, const std::string &field,
+                        const FieldSchema &schema, const py::object &value);
 
   // Materialize a single doc into (id, score, fields, vectors) following the
   // collection schema. Shared by the per-doc `get_all` binding and the batch

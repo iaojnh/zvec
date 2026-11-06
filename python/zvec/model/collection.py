@@ -348,8 +348,12 @@ class Collection:
         """
         is_single = isinstance(docs, Doc)
         doc_list = [docs] if is_single else docs
+        memory = self._obj.WriteInputMemory(
+            len(doc_list) if isinstance(doc_list, (list, tuple)) else 0
+        )
+        schema = self.schema
         results = self._obj.Insert(
-            [convert_to_cpp_doc(doc, self.schema) for doc in doc_list]
+            [convert_to_cpp_doc(doc, schema, _memory=memory) for doc in doc_list]
         )
         return results[0] if is_single else results
 
@@ -373,8 +377,12 @@ class Collection:
         """
         is_single = isinstance(docs, Doc)
         doc_list = [docs] if is_single else docs
+        memory = self._obj.WriteInputMemory(
+            len(doc_list) if isinstance(doc_list, (list, tuple)) else 0
+        )
+        schema = self.schema
         results = self._obj.Upsert(
-            [convert_to_cpp_doc(doc, self.schema) for doc in doc_list]
+            [convert_to_cpp_doc(doc, schema, _memory=memory) for doc in doc_list]
         )
         return results[0] if is_single else results
 
@@ -400,8 +408,12 @@ class Collection:
         """
         is_single = isinstance(docs, Doc)
         doc_list = [docs] if is_single else docs
+        memory = self._obj.WriteInputMemory(
+            len(doc_list) if isinstance(doc_list, (list, tuple)) else 0
+        )
+        schema = self.schema
         results = self._obj.Update(
-            [convert_to_cpp_doc(doc, self.schema) for doc in doc_list]
+            [convert_to_cpp_doc(doc, schema, _memory=memory) for doc in doc_list]
         )
         return results[0] if is_single else results
 

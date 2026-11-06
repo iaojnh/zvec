@@ -28,6 +28,7 @@
 #include "db/common/result_memory_allowance.h"
 #include "python_doc.h"
 #include "python_fetch_memory.h"
+#include "python_write_memory.h"
 
 namespace zvec {
 
@@ -68,6 +69,22 @@ void retain_result_memory(
     throw;
   }
   memory->end_materialization();
+}
+
+py::list owned_write_results(
+    std::vector<Status> statuses,
+    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
+  struct OwnedStatus {
+    std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+    Status status;
+  };
+  py::list out(statuses.size());
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    auto value = std::make_shared<OwnedStatus>(
+        OwnedStatus{memory, std::move(statuses[i])});
+    out[i] = py::cast(std::shared_ptr<Status>(value, &value->status));
+  }
+  return out;
 }
 
 // Batch-materialize a DocPtrList into a list of (id, score, fields, vectors)
@@ -713,6 +730,12 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
 }
 
 void ZVecPyCollection::Initialize(pybind11::module_ &m) {
+  py::class_<detail::PythonWriteMemory,
+             std::shared_ptr<detail::PythonWriteMemory>>(m, "_WriteInputMemory")
+      .def("new_doc", &detail::PythonWriteMemory::new_doc)
+      .def("set_pk", &detail::PythonWriteMemory::set_pk)
+      .def("set_any", &detail::PythonWriteMemory::set_any);
+
   py::class_<GroupResult>(m, "_GroupResult")
       .def_property_readonly("group_by_value", &group_value_for_python)
       .def_readonly("docs", &GroupResult::docs_);
@@ -882,43 +905,51 @@ void ZVecPyCollection::bind_ddl_methods(
 
 void ZVecPyCollection::bind_dml_methods(
     py::class_<Collection, Collection::Ptr> &col) {
-  // bind collection upsert/insert/update/delete methods
-  col.def("Insert",
-          [](Collection &self, std::vector<Doc> &docs) {
+  col.def("WriteInputMemory", [](const Collection &self, size_t count) {
+    const bool budgeted = !unwrap_expected(self.options()).enable_mmap_;
+    return std::make_shared<detail::PythonWriteMemory>(
+        budgeted ? &forward_result_allowance() : nullptr, count);
+  });
+  const auto bind_write = [&](const char *name, auto operation) {
+    col.def(name, [operation](Collection &self, py::handle docs) {
+      const bool budgeted = !unwrap_expected(self.options()).enable_mmap_;
+      detail::PythonWriteInputs inputs(
+          docs, budgeted ? &forward_result_allowance() : nullptr);
+      auto output_memory =
+          std::make_shared<detail::ResultMemoryAllowance::Lease>(
+              budgeted ? &forward_result_allowance() : nullptr, false,
+              kPythonResultBackingQuantum);
+      Result<WriteResults> result;
+      {
+        py::gil_scoped_release release;
+        output_memory->add(detail::BindingMemoryBytes(inputs.docs.size(), 512));
+        result = (self.*operation)(inputs.docs);
+      }
+      return owned_write_results(unwrap_expected(std::move(result)),
+                                 output_memory);
+    });
+  };
+  bind_write("Insert", &Collection::insert);
+  bind_write("Update", &Collection::update);
+  bind_write("Upsert", &Collection::upsert);
+  col.def("Delete",
+          [](Collection &self, py::handle pks) {
+            const bool budgeted = !unwrap_expected(self.options()).enable_mmap_;
+            auto *owner = budgeted ? &forward_result_allowance() : nullptr;
+            detail::PythonFetchInputs inputs(pks, py::none(), owner);
+            auto output_memory =
+                std::make_shared<detail::ResultMemoryAllowance::Lease>(
+                    owner, false, kPythonResultBackingQuantum);
             Result<WriteResults> result;
             {
               py::gil_scoped_release release;
-              result = self.insert(docs);
+              output_memory->add(detail::BindingMemoryBytes(
+                  inputs.pks.size(), 3 * sizeof(Status) + 512));
+              result = self.delete_(inputs.pks);
             }
-            return unwrap_expected(result);
+            return owned_write_results(unwrap_expected(std::move(result)),
+                                       output_memory);
           })
-      .def("Update",
-           [](Collection &self, std::vector<Doc> &docs) {
-             Result<WriteResults> result;
-             {
-               py::gil_scoped_release release;
-               result = self.update(docs);
-             }
-             return unwrap_expected(result);
-           })
-      .def("Upsert",
-           [](Collection &self, std::vector<Doc> &docs) {
-             Result<WriteResults> result;
-             {
-               py::gil_scoped_release release;
-               result = self.upsert(docs);
-             }
-             return unwrap_expected(result);
-           })
-      .def("Delete",
-           [](Collection &self, const std::vector<std::string> &pks) {
-             Result<WriteResults> result;
-             {
-               py::gil_scoped_release release;
-               result = self.delete_(pks);
-             }
-             return unwrap_expected(result);
-           })
       .def("DeleteByFilter", [](Collection &self, const std::string &filter) {
         Status status;
         {

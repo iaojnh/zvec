@@ -6,6 +6,7 @@
 #include <memory>
 #include <arrow/api.h>
 #include <zvec/db/doc.h>
+#include "document_memory.h"
 #include "result_memory_allowance.h"
 
 namespace zvec::detail {
@@ -86,15 +87,6 @@ inline size_t EstimateQueryResult(const arrow::RecordBatch &batch) {
   }
   return estimate.bytes();
 }
-
-struct DocumentMemoryAccess {
-  static void retain(Doc &doc, std::shared_ptr<void> memory) {
-    doc.memory_owner_ = std::move(memory);
-  }
-  static bool budgeted(const Doc &doc) {
-    return bool(doc.memory_owner_);
-  }
-};
 
 inline Doc::Ptr MakeQueryDocument(
     const std::shared_ptr<ResultMemoryAllowance::Lease> &memory) {

@@ -47,7 +47,7 @@ class PythonFetchInputs {
     }
   }
 
- private:
+ public:
   static size_t string_bytes(pybind11::handle value) {
     size_t bytes;
     if (PyUnicode_Check(value.ptr())) {
@@ -86,6 +86,7 @@ class PythonFetchInputs {
             static_cast<size_t>(PyByteArray_GET_SIZE(value.ptr()))};
   }
 
+ private:
   void admit(size_t bytes) {
     pybind11::gil_scoped_release release;
     memory_.add(bytes);

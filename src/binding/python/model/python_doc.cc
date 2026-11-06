@@ -93,145 +93,7 @@ void ZVecPyDoc::bind_doc(py::module_ &m) {
           }));
 
 
-  // binding doc set field
-  doc.def(
-      "set_any",
-      [](Doc &self, const std::string &field, const FieldSchema &field_schema,
-         const py::object &obj) -> bool {
-        if (obj.is_none()) {
-          if (field_schema.nullable()) {
-            self.set_null(field);
-            return true;
-          }
-          throw py::value_error("Field '" + field +
-                                "': expected non-nullable type");
-        }
-        switch (field_schema.data_type()) {
-          // base datatypes
-          case DataType::STRING:
-            return self.set(field,
-                            checked_cast<std::string>(obj, field, "STRING"));
-          case DataType::BOOL:
-            return self.set(field, checked_cast<bool>(obj, field, "BOOL"));
-          case DataType::INT32:
-            return self.set(field, checked_cast<int32_t>(obj, field, "INT32"));
-          case DataType::INT64:
-            return self.set(field, checked_cast<int64_t>(obj, field, "INT64"));
-          case DataType::UINT32:
-            return self.set(field,
-                            checked_cast<uint32_t>(obj, field, "UINT32"));
-          case DataType::UINT64:
-            return self.set(field,
-                            checked_cast<uint64_t>(obj, field, "UINT64"));
-          case DataType::FLOAT:
-            return self.set(field, checked_cast<float>(obj, field, "FLOAT"));
-          case DataType::DOUBLE:
-            return self.set(field, checked_cast<double>(obj, field, "DOUBLE"));
-
-          // array datatypes
-          case DataType::ARRAY_STRING:
-            return self.set(field, checked_cast<std::vector<std::string>>(
-                                       obj, field, "ARRAY_STRING"));
-          case DataType::ARRAY_BOOL:
-            return self.set(field, checked_cast<std::vector<bool>>(
-                                       obj, field, "ARRAY_BOOL"));
-          case DataType::ARRAY_INT32:
-            return self.set(field, checked_cast<std::vector<int32_t>>(
-                                       obj, field, "ARRAY_INT32"));
-          case DataType::ARRAY_UINT32:
-            return self.set(field, checked_cast<std::vector<uint32_t>>(
-                                       obj, field, "ARRAY_UINT32"));
-          case DataType::ARRAY_INT64:
-            return self.set(field, checked_cast<std::vector<int64_t>>(
-                                       obj, field, "ARRAY_INT64"));
-          case DataType::ARRAY_UINT64:
-            return self.set(field, checked_cast<std::vector<uint64_t>>(
-                                       obj, field, "ARRAY_UINT64"));
-          case DataType::ARRAY_FLOAT:
-            return self.set(field, checked_cast<std::vector<float>>(
-                                       obj, field, "ARRAY_FLOAT"));
-          case DataType::ARRAY_DOUBLE:
-            return self.set(field, checked_cast<std::vector<double>>(
-                                       obj, field, "ARRAY_DOUBLE"));
-
-          // dense vector datatypes
-          case DataType::VECTOR_FP16: {
-            const auto value = checked_cast<py::list>(
-                obj, field, "VECTOR_FP16 (list of numbers)");
-            std::vector<ailego::Float16> new_value;
-            new_value.reserve(value.size());
-            for (const auto &item : value) {
-              try {
-                new_value.emplace_back(item.cast<float>());
-              } catch (const py::cast_error &e) {
-                throw py::type_error("Vector '" + field +
-                                     "': expected VECTOR_FP16, got " +
-                                     std::string(py::str(py::type::of(obj))));
-              }
-            }
-            return self.set(field, new_value);
-          }
-          case DataType::VECTOR_FP32:
-            return self.set(field, checked_cast<std::vector<float>>(
-                                       obj, field, "VECTOR_FP32"));
-          case DataType::VECTOR_FP64:
-            return self.set(field, checked_cast<std::vector<double>>(
-                                       obj, field, "VECTOR_FP64"));
-          case DataType::VECTOR_INT8:
-            return self.set(field, checked_cast<std::vector<int8_t>>(
-                                       obj, field, "VECTOR_INT8"));
-
-          // sparse vector datatypes
-          case DataType::SPARSE_VECTOR_FP32: {
-            const auto sparse_dict =
-                checked_cast<py::dict>(obj, field, "SPARSE_VECTOR_FP32 (dict)");
-            std::vector<uint32_t> indices;
-            std::vector<float> values;
-            for (const auto &item : sparse_dict) {
-              try {
-                indices.push_back(item.first.cast<uint32_t>());
-                values.push_back(item.second.cast<float>());
-              } catch (const py::cast_error &e) {
-                throw py::type_error(
-                    "Vector '" + field +
-                    "': sparse vector key/value must be (uint32, float), "
-                    "got key=" +
-                    std::string(py::str(py::type::of(item.first))) +
-                    ", value=" +
-                    std::string(py::str(py::type::of(item.second))));
-              }
-            }
-            const std::pair<std::vector<uint32_t>, std::vector<float>>
-                sparse_vector{std::move(indices), std::move(values)};
-            return self.set(field, sparse_vector);
-          }
-          case DataType::SPARSE_VECTOR_FP16: {
-            const auto sparse_dict =
-                checked_cast<py::dict>(obj, field, "SPARSE_VECTOR_FP16 (dict)");
-            std::vector<uint32_t> indices;
-            std::vector<ailego::Float16> values;
-            for (const auto &item : sparse_dict) {
-              try {
-                indices.push_back(item.first.cast<uint32_t>());
-                values.push_back(ailego::Float16(item.second.cast<float>()));
-              } catch (const py::cast_error &e) {
-                throw py::type_error(
-                    "Field '" + field +
-                    "': sparse vector key/value must be (uint32, float), "
-                    "got key=" +
-                    std::string(py::str(py::type::of(item.first))) +
-                    ", value=" +
-                    std::string(py::str(py::type::of(item.second))));
-              }
-            }
-            const std::pair<std::vector<uint32_t>, std::vector<ailego::Float16>>
-                sparse_vector{std::move(indices), std::move(values)};
-            return self.set(field, sparse_vector);
-          }
-          default:
-            throw py::type_error("Unsupported type for field: " + field);
-        }
-      });
+  doc.def("set_any", &ZVecPyDoc::set_field);
 
   // binding doc get field
   doc.def("get_any",
@@ -241,6 +103,138 @@ void ZVecPyDoc::bind_doc(py::module_ &m) {
           "Get all fields and vectors as a tuple: (id, score, fields, "
           "vectors). Dense vectors are returned as lists, sparse vectors as "
           "{index: value} dicts.");
+}
+
+bool ZVecPyDoc::set_field(Doc &self, const std::string &field,
+                          const FieldSchema &field_schema,
+                          const py::object &obj) {
+  if (obj.is_none()) {
+    if (field_schema.nullable()) {
+      self.set_null(field);
+      return true;
+    }
+    throw py::value_error("Field '" + field + "': expected non-nullable type");
+  }
+  switch (field_schema.data_type()) {
+    // base datatypes
+    case DataType::STRING:
+      return self.set(field, checked_cast<std::string>(obj, field, "STRING"));
+    case DataType::BOOL:
+      return self.set(field, checked_cast<bool>(obj, field, "BOOL"));
+    case DataType::INT32:
+      return self.set(field, checked_cast<int32_t>(obj, field, "INT32"));
+    case DataType::INT64:
+      return self.set(field, checked_cast<int64_t>(obj, field, "INT64"));
+    case DataType::UINT32:
+      return self.set(field, checked_cast<uint32_t>(obj, field, "UINT32"));
+    case DataType::UINT64:
+      return self.set(field, checked_cast<uint64_t>(obj, field, "UINT64"));
+    case DataType::FLOAT:
+      return self.set(field, checked_cast<float>(obj, field, "FLOAT"));
+    case DataType::DOUBLE:
+      return self.set(field, checked_cast<double>(obj, field, "DOUBLE"));
+
+    // array datatypes
+    case DataType::ARRAY_STRING:
+      return self.set(field, checked_cast<std::vector<std::string>>(
+                                 obj, field, "ARRAY_STRING"));
+    case DataType::ARRAY_BOOL:
+      return self.set(
+          field, checked_cast<std::vector<bool>>(obj, field, "ARRAY_BOOL"));
+    case DataType::ARRAY_INT32:
+      return self.set(
+          field, checked_cast<std::vector<int32_t>>(obj, field, "ARRAY_INT32"));
+    case DataType::ARRAY_UINT32:
+      return self.set(field, checked_cast<std::vector<uint32_t>>(
+                                 obj, field, "ARRAY_UINT32"));
+    case DataType::ARRAY_INT64:
+      return self.set(
+          field, checked_cast<std::vector<int64_t>>(obj, field, "ARRAY_INT64"));
+    case DataType::ARRAY_UINT64:
+      return self.set(field, checked_cast<std::vector<uint64_t>>(
+                                 obj, field, "ARRAY_UINT64"));
+    case DataType::ARRAY_FLOAT:
+      return self.set(
+          field, checked_cast<std::vector<float>>(obj, field, "ARRAY_FLOAT"));
+    case DataType::ARRAY_DOUBLE:
+      return self.set(
+          field, checked_cast<std::vector<double>>(obj, field, "ARRAY_DOUBLE"));
+
+    // dense vector datatypes
+    case DataType::VECTOR_FP16: {
+      const auto value =
+          checked_cast<py::list>(obj, field, "VECTOR_FP16 (list of numbers)");
+      std::vector<ailego::Float16> new_value;
+      new_value.reserve(value.size());
+      for (const auto &item : value) {
+        try {
+          new_value.emplace_back(item.cast<float>());
+        } catch (const py::cast_error &e) {
+          throw py::type_error("Vector '" + field +
+                               "': expected VECTOR_FP16, got " +
+                               std::string(py::str(py::type::of(obj))));
+        }
+      }
+      return self.set(field, std::move(new_value));
+    }
+    case DataType::VECTOR_FP32:
+      return self.set(
+          field, checked_cast<std::vector<float>>(obj, field, "VECTOR_FP32"));
+    case DataType::VECTOR_FP64:
+      return self.set(
+          field, checked_cast<std::vector<double>>(obj, field, "VECTOR_FP64"));
+    case DataType::VECTOR_INT8:
+      return self.set(
+          field, checked_cast<std::vector<int8_t>>(obj, field, "VECTOR_INT8"));
+
+    // sparse vector datatypes
+    case DataType::SPARSE_VECTOR_FP32: {
+      const auto sparse_dict =
+          checked_cast<py::dict>(obj, field, "SPARSE_VECTOR_FP32 (dict)");
+      std::vector<uint32_t> indices;
+      std::vector<float> values;
+      for (const auto &item : sparse_dict) {
+        try {
+          indices.push_back(item.first.cast<uint32_t>());
+          values.push_back(item.second.cast<float>());
+        } catch (const py::cast_error &e) {
+          throw py::type_error(
+              "Vector '" + field +
+              "': sparse vector key/value must be (uint32, float), "
+              "got key=" +
+              std::string(py::str(py::type::of(item.first))) +
+              ", value=" + std::string(py::str(py::type::of(item.second))));
+        }
+      }
+      std::pair<std::vector<uint32_t>, std::vector<float>> sparse_vector{
+          std::move(indices), std::move(values)};
+      return self.set(field, std::move(sparse_vector));
+    }
+    case DataType::SPARSE_VECTOR_FP16: {
+      const auto sparse_dict =
+          checked_cast<py::dict>(obj, field, "SPARSE_VECTOR_FP16 (dict)");
+      std::vector<uint32_t> indices;
+      std::vector<ailego::Float16> values;
+      for (const auto &item : sparse_dict) {
+        try {
+          indices.push_back(item.first.cast<uint32_t>());
+          values.push_back(ailego::Float16(item.second.cast<float>()));
+        } catch (const py::cast_error &e) {
+          throw py::type_error(
+              "Field '" + field +
+              "': sparse vector key/value must be (uint32, float), "
+              "got key=" +
+              std::string(py::str(py::type::of(item.first))) +
+              ", value=" + std::string(py::str(py::type::of(item.second))));
+        }
+      }
+      std::pair<std::vector<uint32_t>, std::vector<ailego::Float16>>
+          sparse_vector{std::move(indices), std::move(values)};
+      return self.set(field, std::move(sparse_vector));
+    }
+    default:
+      throw py::type_error("Unsupported type for field: " + field);
+  }
 }
 
 py::object ZVecPyDoc::doc_value_to_py(Doc &self, const std::string &field,

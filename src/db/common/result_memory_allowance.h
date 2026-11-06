@@ -59,6 +59,14 @@ class ResultMemoryAllowance {
       bytes_ += owner_->acquire(bytes, backing_quantum_);
     }
 
+    // Transfer admission to an owner allocated only AFTER that admission.
+    // Both leases refer to the same allowance and hold no materialization lock.
+    void absorb(Lease &other) noexcept {
+      assert(owner_ == other.owner_);
+      assert(!materialization_.owns_lock() && !other.materialization_.owns_lock());
+      bytes_ += std::exchange(other.bytes_, 0);
+    }
+
    private:
     ResultMemoryAllowance *owner_;
     size_t bytes_{0};
