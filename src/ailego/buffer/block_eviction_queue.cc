@@ -412,10 +412,13 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
       if (block->bytes != charge) continue;
       // An idle mapping can contain pages that were never faulted in or were
       // reclaimed by the OS. Assigning a new owner can make them resident.
-      if (!process_rss_.materialization_allowed(charge)) break;
       // Backing is already charged, but a pending page may own the logical
       // headroom. Leave the idle block linked until admission succeeds.
       if (!try_reserve_used(charge)) break;
+      if (!process_rss_.try_materialize(charge)) {
+        release_buffer(nullptr, charge);
+        break;
+      }
       *link = block->next;
       block->next = nullptr;
       block->metadata = metadata;
@@ -864,9 +867,9 @@ bool MemoryLimitPool::try_reserve_used(size_t bytes) {
   return false;
 }
 
-bool MemoryLimitPool::try_reserve_page_used(size_t bytes) {
+bool MemoryLimitPool::try_reserve_page_used(size_t bytes, bool required) {
   process_rss_.refresh();
-  if (process_rss_.pressure()) return false;
+  if (!required && process_rss_.pressure()) return false;
   const size_t page_limit = page_admission_limit();
   size_t used = used_size_.load(std::memory_order_relaxed);
   while (used <= page_limit && bytes <= page_limit - used) {
@@ -1386,13 +1389,28 @@ void MemoryLimitPool::background_evict_loop() {
   }
 }
 
+char *MemoryLimitPool::pop_reusable_buffer(size_t shard, size_t bytes) {
+  char *buffer = pop_free_buffer(shard);
+  if (buffer && !process_rss_.try_materialize(bytes)) {
+    push_free_buffer(buffer, shard);
+    return nullptr;
+  }
+  return buffer;
+}
+
 bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
                                          char *&buffer) {
+  return try_acquire_buffer(buffer_size, buffer, false);
+}
+
+bool MemoryLimitPool::try_acquire_buffer(size_t buffer_size, char *&buffer,
+                                         bool required) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   buffer = nullptr;
   const bool cacheable = is_cacheable_buffer_size(buffer_size);
-  if (buffer_size == 0 || !(cacheable ? try_reserve_page_used(buffer_size)
-                                      : try_reserve_used(buffer_size))) {
+  if (buffer_size == 0 ||
+      !(cacheable ? try_reserve_page_used(buffer_size, required)
+                  : try_reserve_used(buffer_size))) {
     // Out of budget: wake the background evictor so the next attempt is
     // more likely to find a free buffer without inline eviction.
     high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -1401,7 +1419,7 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
   }
 
   if (cacheable) {
-    buffer = pop_free_buffer(pick_shard());
+    buffer = pop_reusable_buffer(pick_shard(), buffer_size);
     if (buffer) {
       alloc_from_freelist_.fetch_add(1, std::memory_order_relaxed);
       return true;
@@ -1433,33 +1451,42 @@ bool MemoryLimitPool::try_acquire_buffer(const size_t buffer_size,
 
 bool MemoryLimitPool::wait_for_available(const size_t buffer_size,
                                          std::chrono::milliseconds timeout) {
-  return wait_for_available_impl(buffer_size, timeout, true);
+  return wait_for_available(buffer_size, timeout, false);
+}
+
+bool MemoryLimitPool::wait_for_available(size_t buffer_size,
+                                         std::chrono::milliseconds timeout,
+                                         bool required) {
+  return wait_for_available_impl(buffer_size, timeout, true, required);
 }
 
 bool MemoryLimitPool::wait_for_available_impl(size_t buffer_size,
                                               std::chrono::milliseconds timeout,
-                                              bool page_admission) {
+                                              bool page_admission,
+                                              bool required) {
   if (buffer_size == 0) {
     return true;
   }
   capacity_waits_.fetch_add(1, std::memory_order_relaxed);
   std::unique_lock<std::mutex> lock(capacity_mutex_);
   const bool available =
-      capacity_cv_.wait_for(lock, timeout, [this, buffer_size, page_admission] {
+      capacity_cv_.wait_for(lock, timeout, [this, buffer_size, page_admission,
+                                           required] {
         const size_t capacity = pool_size_.load(std::memory_order_relaxed);
         const size_t used = used_size_.load(std::memory_order_relaxed);
         if (capacity < used || buffer_size > capacity - used) {
           return false;
         }
         if (buffer_size > process_rss_.available()) return false;
-        if (page_admission && process_rss_.pressure()) return false;
+        if (page_admission && !required && process_rss_.pressure()) return false;
         // A page can be denied below the total capacity: unconsumed external
         // cache headroom is not available to page admission. Use the same
         // page-limit predicate as eviction instead of turning backpressure
         // into immediate successful waits while pages still cannot fit.
         if (!page_admission || !is_cacheable_buffer_size(buffer_size))
           return true;
-        if (is_page_full()) return false;
+        const size_t limit = page_admission_limit();
+        if (used >= limit || buffer_size > limit - used) return false;
         for (const auto &shard : free_shards_)
           if (shard.count.load(std::memory_order_relaxed) != 0) return true;
         const size_t committed =
@@ -1775,7 +1802,7 @@ size_t MemoryLimitPool::batch_acquire_buffers(size_t buffer_size, char **out,
   size_t s = pick_shard();
   if (cacheable) {
     while (acquired < actual_count) {
-      out[acquired] = pop_free_buffer(s);
+      out[acquired] = pop_reusable_buffer(s, buffer_size);
       if (!out[acquired]) {
         break;
       }

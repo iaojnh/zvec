@@ -8,6 +8,7 @@
 #include <limits>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "db/common/query_result_memory.h"
 #include "db/index/column/fts_column/fts_memory.h"
@@ -69,6 +70,30 @@ TEST_F(ResultMemoryAllowanceTest, ReusedBackingObeysCriticalPressureAndRecovery)
   native.set_memory_pressure(Pressure::kNormal);
   EXPECT_EQ(0u, allowance.active_bytes());
   EXPECT_EQ(backing, allowance.reserved_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest, PressureRetiresOnlyIdleResultAllowance) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  ASSERT_TRUE(native.configure_process_rss_limit(
+      std::numeric_limits<size_t>::max() / 2));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    native.set_memory_pressure(Pressure::kNormal);
+    EXPECT_TRUE(native.configure_process_rss_limit(0));
+  });
+  ResultMemoryAllowance allowance;
+  auto pinned = std::make_unique<ResultMemoryAllowance::Lease>(&allowance);
+  pinned->add(kMiB);
+  {
+    ResultMemoryAllowance::Lease second(&allowance);
+    second.add(kMiB);
+    native.set_memory_pressure(Pressure::kCritical);
+  }
+  EXPECT_EQ(kMiB, allowance.active_bytes());
+  EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
+  pinned.reset();
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  EXPECT_EQ(0u, pool_.external_used());
 }
 
 TEST_F(ResultMemoryAllowanceTest, ConcurrentCallsShareOneHighWaterAllowance) {

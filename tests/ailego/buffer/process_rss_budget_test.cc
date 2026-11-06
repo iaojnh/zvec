@@ -580,5 +580,46 @@ TEST(ProcessRssBudgetTest, ReservedMaterializationRequiresMeasuredRoomForBytes) 
   EXPECT_TRUE(budget.materialization_allowed(20 * kMiB));
   EXPECT_FALSE(budget.materialization_allowed(20 * kMiB + 1));
 }
+
+TEST(ProcessRssBudgetTest, ReuseAndNewBackingShareMeasuredRoomBetweenSamples) {
+  using Budget = ProcessRssBudget;
+  constexpr size_t limit = 128 * kMiB;
+  for (const bool use_native_sample : {false, true}) {
+    SCOPED_TRACE(use_native_sample);
+    Budget budget;
+    sampled_rss = (use_native_sample ? 32 : 120) * kMiB;
+    native_sample = {112 * kMiB, 16 * kMiB};
+    native_sample_valid = true;
+    ASSERT_TRUE(budget.configure(limit, ReadRss,
+                                 use_native_sample ? ReadNative : nullptr));
+    // Keep the limiting observation unchanged even if a worker is delayed.
+    if (use_native_sample) {
+      native_sample_valid = false;
+    } else {
+      sampled_rss = 0;
+    }
+    std::atomic<int> admitted{0};
+    auto reuse = [&] {
+      if (budget.try_materialize(6 * kMiB)) ++admitted;
+    };
+    std::thread first(reuse);
+    std::thread second(reuse);
+    first.join();
+    second.join();
+    EXPECT_EQ(1, admitted.load());
+    EXPECT_EQ(2 * kMiB, budget.available());
+    ASSERT_TRUE(budget.try_reserve(2 * kMiB));
+    budget.finish_reservation(2 * kMiB, true);
+    EXPECT_EQ(0u, budget.available());
+    EXPECT_FALSE(budget.try_materialize(1));
+    budget.release(2 * kMiB);
+
+    sampled_rss = (use_native_sample ? 32 : 120) * kMiB;
+    native_sample_valid = true;
+    budget.refresh(true);
+    EXPECT_EQ(8 * kMiB, budget.available());
+    EXPECT_TRUE(budget.try_materialize(8 * kMiB));
+  }
+}
 }  // namespace
 }  // namespace zvec::ailego

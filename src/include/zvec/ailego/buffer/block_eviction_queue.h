@@ -281,6 +281,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool materialization_allowed(size_t bytes = 0) {
     return process_rss_.materialization_allowed(bytes);
   }
+  bool try_materialize(size_t bytes) {
+    return process_rss_.try_materialize(bytes);
+  }
   // For separately budgeted backing, e.g. the RocksDB cache allocator.
   bool account_pending_process_backing(size_t bytes) {
     return process_rss_.account_pending(bytes);
@@ -293,12 +296,15 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   }
 
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
+  bool try_acquire_buffer(size_t buffer_size, char *&buffer, bool required);
 
   //! Wait briefly for another cache owner to release enough logical budget.
   //! This is used as writable-cache backpressure after eviction has been
   //! requested; it never reserves the returned capacity.
   bool wait_for_available(const size_t buffer_size,
                           std::chrono::milliseconds timeout);
+  bool wait_for_available(size_t buffer_size, std::chrono::milliseconds timeout,
+                          bool required);
 
   //! Reserve bounded capacity outside the page cache, evicting if needed.
   bool try_charge_external(const size_t buffer_size);
@@ -513,12 +519,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void *allocate_queue_memory(size_t bytes);
   void free_queue_memory(void *ptr);
   bool try_reserve_used(size_t bytes);
-  bool try_reserve_page_used(size_t bytes);
+  bool try_reserve_page_used(size_t bytes, bool required = false);
   bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive);
   size_t release_committed(size_t bytes, Backing backing = Backing::kLive);
   bool try_reserve_allocation(size_t bytes, Backing backing = Backing::kLive);
   bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,
-                               bool page_admission);
+                               bool page_admission, bool required = false);
   size_t page_admission_limit() const {
     const size_t capacity = pool_size_.load(std::memory_order_relaxed);
     const size_t reserve = page_admission_reserve();
@@ -537,6 +543,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                      Backing backing = Backing::kLive);
   bool is_cacheable_buffer_size(size_t buffer_size);
   char *pop_free_buffer(size_t start_shard);
+  char *pop_reusable_buffer(size_t start_shard, size_t bytes);
   void push_free_buffer(char *buffer, size_t shard);
   char *acquire_slab_buffer();
   bool reclaim_slab_buffer(char *buffer);

@@ -92,7 +92,6 @@ class ResultMemoryAllowance {
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t capacity = pool.capacity();
     if (!capacity) return 0;
-    if (!pool.materialization_allowed(bytes)) throw std::bad_alloc();
     // One result-equivalent for active objects, another for allocation growth
     // and previously freed backing. This is a conservative planning policy,
     // not a claim that an arbitrary system allocator has bounded fragmentation.
@@ -116,9 +115,12 @@ class ResultMemoryAllowance {
     // storage, metadata and decoding; callers can split large result batches.
     if (target > capacity / 4) throw std::bad_alloc();
     if (target > reservation_.bytes()) {
+      if (!pool.materialization_allowed(bytes)) throw std::bad_alloc();
       // Admission may evict native cache pages. Bindings must release the GIL
       // before calling add(); no Python code executes while this lock is held.
       reservation_.add(target - reservation_.bytes());
+    } else if (!pool.try_materialize(bytes)) {
+      throw std::bad_alloc();
     }
     active_ += bytes;
     return bytes;
@@ -128,7 +130,13 @@ class ResultMemoryAllowance {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(active_ >= bytes);
     active_ -= bytes;
-    // Do not refund reservation_: later calls reuse this high-water allowance.
+    // Normally keep the high water for reuse. Under process pressure an
+    // entirely idle result allowance must yield to mandatory I/O and decode.
+    // Retained heap pages still count in the process's measured RSS.
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    if (!active_ && pool.process_rss_limit() &&
+        pool.under_process_rss_pressure())
+      reservation_.retain_at_most(0);
   }
 
   mutable std::mutex mutex_;

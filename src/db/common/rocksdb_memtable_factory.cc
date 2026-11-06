@@ -18,6 +18,7 @@
 #include <mutex>
 #include <new>
 #include <utility>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/io/file.h>
 // RocksDB 8.1 exposes the allocator hook in MemTableRepFactory but only
 // forward-declares its type in the public header. Keep this version-pinned
@@ -43,7 +44,8 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
       auto *next = block->previous;
       const size_t bytes = block->bytes;
       block->~Block();
-      ailego::File::MemoryUnmap(block, bytes);
+      if (ailego::File::TryMemoryUnmap(block, bytes))
+        ailego::MemoryLimitPool::get_instance().release_process_backing(bytes);
       block = next;
     }
     tracker_.FreeMem();
@@ -70,14 +72,23 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
         (aligned + sizeof(Block) + kBlockBytes - 1) / kBlockBytes * kBlockBytes;
     if (mapped > kMax - allocated_.load(std::memory_order_relaxed))
       throw std::bad_alloc();
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    // WBM owns admission, but RSS also needs to see backing before pages
+    // are faulted in. Do not reject mandatory memtable work on RSS pressure.
+    if (!pool.account_pending_process_backing(mapped)) throw std::bad_alloc();
     void *memory = ailego::File::MemoryMap(mapped, 0);
-    if (memory == nullptr) throw std::bad_alloc();
+    if (memory == nullptr) {
+      pool.finish_process_backing(mapped, false);
+      throw std::bad_alloc();
+    }
     try {
       tracker_.Allocate(mapped);
     } catch (...) {
-      ailego::File::MemoryUnmap(memory, mapped);
+      pool.finish_process_backing(
+          mapped, !ailego::File::TryMemoryUnmap(memory, mapped));
       throw;
     }
+    pool.finish_process_backing(mapped, true);
     auto *block = new (memory)
         Block{current_.load(std::memory_order_relaxed), mapped, sizeof(Block)};
     allocated_.fetch_add(mapped, std::memory_order_relaxed);

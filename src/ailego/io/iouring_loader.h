@@ -147,7 +147,7 @@ class IoUringRing {
 
  private:
   friend class IoUringStagingTestPeer;
-  void release_staging();
+  bool release_staging();
   int execute_impl(int fd, const IoUringRead *read_reqs,
                    const IoUringWrite *write_reqs, size_t count);
 

@@ -38,7 +38,7 @@ static constexpr size_t kIoUringDrainRetries = 10000;
 
 IoUringRing::~IoUringRing() {
   teardown();
-  if (prepaid_staging_bytes_)
+  if (prepaid_staging_bytes_ && !staging_)
     MemoryLimitPool::get_instance().release_metadata(prepaid_staging_bytes_);
 }
 
@@ -48,13 +48,17 @@ void IoUringRing::adopt_staging_reservation(size_t bytes) {
   prepaid_staging_bytes_ = bytes;
 }
 
-void IoUringRing::release_staging() {
-  if (staging_) File::MemoryUnmap(staging_, staging_size_);
+bool IoUringRing::release_staging() {
+  if (staging_ && !File::TryMemoryUnmap(staging_, staging_size_)) {
+    LOG_ERROR("io_uring staging unmap failed; size=%zu", staging_size_);
+    return false;
+  }
   staging_ = nullptr;
   staging_size_ = 0;
   if (staging_charge_)
     MemoryLimitPool::get_instance().release_external(staging_charge_);
   staging_charge_ = 0;
+  return true;
 }
 
 bool IoUringRing::setup(uint32_t entries) {
@@ -233,8 +237,14 @@ bool IoUringRing::ensure_staging(size_t bytes) {
     LOG_WARN("io_uring staging mapping failed; size=%zu", bytes);
     return false;
   }
+  if (!release_staging()) {
+    if (!File::TryMemoryUnmap(ptr, bytes)) {
+      LOG_ERROR("io_uring replacement staging unmap failed; size=%zu", bytes);
+      pending.commit();
+    }
+    return false;
+  }
   pending.commit();
-  release_staging();
   staging_ = static_cast<char *>(ptr);
   staging_size_ = bytes;
   staging_charge_ = charge;

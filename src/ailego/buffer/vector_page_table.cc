@@ -1640,9 +1640,12 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
       continue;
     }
 
+    // A required writable page may use remaining RSS headroom while optional
+    // cache growth is paused. The backing admission still enforces the limit.
+    const bool required = writable_ && retry > 0;
     bool found = MemoryLimitPool::get_instance().try_acquire_buffer(
-        kVectorPageSize, buffer);
-    if (!found && writable_ && retry > 0) {
+        kVectorPageSize, buffer, required);
+    if (!found && required) {
       int no_progress_waits = 0;
       uint64_t completed = writeback_pages_.load(std::memory_order_relaxed);
       while (!found && no_progress_waits < retry) {
@@ -1650,7 +1653,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
         // disk I/O belongs to the writeback worker.
         (void)BlockEvictionQueue::get_instance().batch_recycle(64);
         found = MemoryLimitPool::get_instance().try_acquire_buffer(
-            kVectorPageSize, buffer);
+            kVectorPageSize, buffer, required);
         if (found || writeback_error() != 0) {
           break;
         }
@@ -1658,7 +1661,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
         writeback_waits_.fetch_add(1, std::memory_order_relaxed);
         const auto wait_start = std::chrono::steady_clock::now();
         (void)MemoryLimitPool::get_instance().wait_for_available(
-            kVectorPageSize, std::chrono::milliseconds(100));
+            kVectorPageSize, std::chrono::milliseconds(100), required);
         const auto wait_end = std::chrono::steady_clock::now();
         writeback_wait_us_.fetch_add(
             static_cast<uint64_t>(
@@ -1670,7 +1673,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
         // Recheck admission before spending that retry, including when a
         // different pool (rather than this pool's writeback) released a page.
         found = MemoryLimitPool::get_instance().try_acquire_buffer(
-            kVectorPageSize, buffer);
+            kVectorPageSize, buffer, required);
         if (found) {
           break;
         }

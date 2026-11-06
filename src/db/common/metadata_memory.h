@@ -28,7 +28,6 @@ class RetainedMetadataBudget {
       std::lock_guard<std::mutex> lock(owner_.mutex_);
       auto &pool = ailego::MemoryLimitPool::get_instance();
       if (!pool.capacity()) return;
-      if (bytes && !pool.materialization_allowed(bytes)) throw std::bad_alloc();
       if (bytes > std::numeric_limits<size_t>::max() - owner_.active_)
         throw std::bad_alloc();
       const size_t target = owner_.active_ + bytes;
@@ -36,9 +35,12 @@ class RetainedMetadataBudget {
       // A rejected open must leave existing readers room to decode/query.
       if (target > pool.capacity() / 2) throw std::bad_alloc();
       if (target > owner_.reserved_) {
-        if (!pool.try_charge_metadata(target - owner_.reserved_))
+        if (!pool.materialization_allowed(bytes) ||
+            !pool.try_charge_metadata(target - owner_.reserved_))
           throw std::bad_alloc();
         owner_.reserved_ = target;
+      } else if (bytes && !pool.try_materialize(bytes)) {
+        throw std::bad_alloc();
       }
       owner_.active_ = target;
       bytes_ += bytes;

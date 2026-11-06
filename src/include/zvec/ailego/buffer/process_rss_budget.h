@@ -58,6 +58,7 @@ class ProcessRssBudget {
       if (!this->limit() || native_reader_ != native_reader)
         native_estimate_.reset(native.footprint, backing_);
       native_estimate_.observe(native.footprint, backing_);
+      native_materialized_ = 0;
       native_limit_ = add_saturated(native.footprint, native.available);
     }
     native_reader_ = native_reader;
@@ -86,7 +87,13 @@ class ProcessRssBudget {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(bytes <= pending_allocations_);
     pending_allocations_ -= bytes;
-    if (allocated) backing_ += bytes;
+    if (allocated) {
+      backing_ += bytes;
+      // Transfer the in-flight debit into the measured projection until it
+      // can be sampled. Other reuses must not get that headroom back merely
+      // because the allocation has returned.
+      remember_materialization(bytes);
+    }
     update_available();
   }
 
@@ -129,26 +136,18 @@ class ProcessRssBudget {
   bool materialization_allowed(size_t bytes = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
-    if (external_pressure_ == PressureLevel::kCritical ||
-        recovery_sample_pending_) {
-      return false;
-    }
-    const size_t cap = limit();
-    if (!cap) return true;
-    // The existing allowance may overlap the RSS estimate even though this
-    // operation still needs new pages. Check measured room independently of
-    // the lifetime charge, including other backing allocations in flight.
-    const size_t needed = add_saturated(bytes, pending_allocations_);
-    const size_t rss = rss_.load(std::memory_order_relaxed);
-    if (rss >= cap || needed > cap - rss) return false;
-    if (native_reader_) {
-      const size_t native_cap = std::min(cap, native_limit_);
-      const size_t footprint = native_estimate_.sample_;
-      const size_t reserve = headroom(native_cap);
-      if (footprint >= native_cap ||
-          native_cap - footprint <= reserve ||
-          needed > native_cap - footprint - reserve)
-        return false;
+    return materialization_allowed_locked(bytes);
+  }
+
+  // Reuses of already-charged backing share the measured headroom until
+  // the corresponding reader supplies its next successful observation.
+  bool try_materialize(size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    refresh_locked(false);
+    if (!materialization_allowed_locked(bytes)) return false;
+    if (limit() && bytes) {
+      remember_materialization(bytes);
+      update_available();
     }
     return true;
   }
@@ -167,6 +166,39 @@ class ProcessRssBudget {
   }
 
  private:
+  void remember_materialization(size_t bytes) {
+    if (!limit()) return;
+    rss_materialized_ = add_saturated(rss_materialized_, bytes);
+    if (native_reader_)
+      native_materialized_ = add_saturated(native_materialized_, bytes);
+  }
+
+  bool materialization_allowed_locked(size_t bytes) const {
+    if (external_pressure_ == PressureLevel::kCritical ||
+        recovery_sample_pending_) {
+      return false;
+    }
+    const size_t cap = limit();
+    if (!cap) return true;
+    // The existing allowance may overlap the RSS estimate even though this
+    // operation still needs new pages. Check measured room independently of
+    // the lifetime charge, including other backing allocations in flight.
+    const size_t needed = add_saturated(bytes, pending_allocations_);
+    const size_t measured = add_saturated(rss(), rss_materialized_);
+    if (measured >= cap || needed > cap - measured) return false;
+    if (native_reader_) {
+      const size_t native_cap = std::min(cap, native_limit_);
+      const size_t footprint =
+          add_saturated(native_estimate_.sample_, native_materialized_);
+      const size_t reserve = headroom(native_cap);
+      if (footprint >= native_cap ||
+          native_cap - footprint <= reserve ||
+          needed > native_cap - footprint - reserve)
+        return false;
+    }
+    return true;
+  }
+
   bool account(size_t bytes, size_t &counter) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (bytes >
@@ -207,6 +239,7 @@ class ProcessRssBudget {
       NativeSample native;
       if (native_reader_(&native)) {
         native_estimate_.observe(native.footprint, backing_);
+        native_materialized_ = 0;
         native_limit_ = add_saturated(native.footprint, native.available);
         sampled_native = true;
       }
@@ -224,6 +257,7 @@ class ProcessRssBudget {
 
   void publish(size_t rss) {
     if (limit()) estimate_.observe(rss, backing_);
+    rss_materialized_ = 0;
     rss_.store(rss, std::memory_order_relaxed);
     update_available();
     sampled_at_ = std::chrono::steady_clock::now();
@@ -327,14 +361,18 @@ class ProcessRssBudget {
     // Take the larger estimate, never add managed bytes to measured RSS.
     // The lifetime estimate preserves lazy allocations across samples; the
     // latest sample catches host growth and includes subsequent admissions.
-    const size_t usage =
-        add_saturated(estimate_.usage(backing_), pending_allocations_);
+    const size_t measured = add_saturated(rss(), rss_materialized_);
+    const size_t usage = add_saturated(
+        std::max(estimate_.usage(backing_), measured), pending_allocations_);
     size_t available = cap ? (usage < cap ? cap - usage : 0)
                            : std::numeric_limits<size_t>::max();
     if (cap && native_reader_) {
       const size_t native_cap = std::min(cap, native_limit_);
-      const size_t native_usage =
-          add_saturated(native_estimate_.usage(backing_), pending_allocations_);
+      const size_t footprint =
+          add_saturated(native_estimate_.sample_, native_materialized_);
+      const size_t native_usage = add_saturated(
+          std::max(native_estimate_.usage(backing_), footprint),
+          pending_allocations_);
       const size_t remaining =
           native_usage < native_cap ? native_cap - native_usage : 0;
       // Keep a reserve below the OS application limit even for mandatory work.
@@ -370,5 +408,7 @@ class ProcessRssBudget {
   std::atomic<size_t> available_{std::numeric_limits<size_t>::max()};
   std::atomic<size_t> rss_{0};
   std::atomic<bool> pressure_{false};
+  size_t rss_materialized_{0};
+  size_t native_materialized_{0};
 };
 }  // namespace zvec::ailego

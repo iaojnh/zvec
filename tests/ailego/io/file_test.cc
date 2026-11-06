@@ -335,6 +335,14 @@ TEST(File, MemoryMap) {
 #endif
 }
 
+TEST(File, CheckedAnonymousUnmap) {
+  const size_t page = MemoryHelper::PageSize();
+  EXPECT_FALSE(File::TryMemoryUnmap(nullptr, page));
+  void *mapping = File::MemoryMap(page, 0);
+  ASSERT_NE(nullptr, mapping);
+  EXPECT_TRUE(File::TryMemoryUnmap(mapping, page));
+}
+
 TEST(File, Append) {
   const char *file_path = "file_append_testing.tmp";
   File file;

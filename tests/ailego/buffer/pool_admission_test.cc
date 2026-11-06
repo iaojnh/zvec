@@ -484,6 +484,27 @@ TEST_F(PoolAdmissionTest, RetainedBackingReuseObeysMeasuredHeadroom) {
   pool_.release_retained_block(block);
 }
 
+TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const size_t limit = baseline_ + 256 * page_;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(
+      pool_, limit, limit - 4 * page_));
+  ASSERT_TRUE(pool_.under_process_rss_pressure());
+  const auto timeout = std::chrono::milliseconds(1);
+  char *buffer = nullptr;
+  EXPECT_FALSE(pool_.try_acquire_buffer(page_, buffer));
+  EXPECT_FALSE(pool_.wait_for_available(page_, timeout));
+  EXPECT_TRUE(pool_.wait_for_available(page_, timeout, /*required=*/true));
+  ASSERT_TRUE(pool_.try_acquire_buffer(page_, buffer, /*required=*/true));
+  pool_.release_buffer(buffer, page_);
+
+  using Pressure = ProcessRssBudget::PressureLevel;
+  pool_.set_memory_pressure(Pressure::kCritical);
+  EXPECT_FALSE(pool_.try_acquire_buffer(page_, buffer, /*required=*/true));
+  pool_.set_memory_pressure(Pressure::kNormal);
+}
+
 TEST_F(PoolAdmissionTest, ConcurrentMixedAdmissionStaysWithinBothLimits) {
   ASSERT_EQ(0, pool_.init(baseline_ + 32 * page_));
   std::atomic<bool> stop{false};

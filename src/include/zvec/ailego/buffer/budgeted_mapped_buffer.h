@@ -30,8 +30,8 @@ class BudgetedMappedBuffer {
     return *this;
   }
   ~BudgetedMappedBuffer() {
-    if (data_) File::MemoryUnmap(data_, mapped_size_);
-    // memory_ refunds only after the mapping is gone.
+    if (data_ && File::TryMemoryUnmap(data_, mapped_size_) && charge_)
+      MemoryLimitPool::get_instance().release_external(charge_);
   }
 
   static size_t mapping_size(size_t bytes) {
@@ -49,11 +49,16 @@ class BudgetedMappedBuffer {
     BudgetedMappedBuffer replacement;
     if (bytes) {
       replacement.mapped_size_ = mapping_size(bytes);
-      replacement.memory_.add_for_allocation(replacement.mapped_size_, [&] {
-        replacement.data_ =
-            static_cast<char *>(File::MemoryMap(replacement.mapped_size_, 0));
-        if (!replacement.data_) throw std::bad_alloc();
-      });
+      auto &pool = MemoryLimitPool::get_instance();
+      const size_t charge = pool.capacity() ? replacement.mapped_size_ : 0;
+      using Pending = MemoryLimitPool::PendingAllocation;
+      Pending pending(pool, Pending::Kind::kWorkspace);
+      if (!pending.reserve(charge)) throw std::bad_alloc();
+      replacement.data_ =
+          static_cast<char *>(File::MemoryMap(replacement.mapped_size_, 0));
+      if (!replacement.data_) throw std::bad_alloc();
+      pending.commit();
+      replacement.charge_ = charge;
       replacement.size_ = bytes;
     }
     swap(replacement);
@@ -72,14 +77,14 @@ class BudgetedMappedBuffer {
     return mapped_size_;
   }
   void swap(BudgetedMappedBuffer &rhs) noexcept {
-    memory_.swap(rhs.memory_);
+    std::swap(charge_, rhs.charge_);
     std::swap(data_, rhs.data_);
     std::swap(size_, rhs.size_);
     std::swap(mapped_size_, rhs.mapped_size_);
   }
 
  private:
-  MemoryReservation memory_;
+  size_t charge_{0};
   char *data_{nullptr};
   size_t size_{0};
   size_t mapped_size_{0};

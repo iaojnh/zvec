@@ -18,12 +18,14 @@
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/db.h>
 #include <rocksdb/merge_operator.h>
 #include <rocksdb/options.h>
 #include <rocksdb/write_batch.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -37,6 +39,23 @@
 #endif
 #include <windows.h>
 #endif
+
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static bool configure_test_rss(MemoryLimitPool &pool) {
+    return pool.process_rss_.configure(128 * 1024 * 1024,
+                                       +[]() -> size_t {
+                                         return 64 * 1024 * 1024;
+                                       });
+  }
+  static size_t available(MemoryLimitPool &pool) {
+    return pool.process_rss_.available();
+  }
+  static void sample(MemoryLimitPool &pool) {
+    pool.process_rss_.refresh(true);
+  }
+};
+}  // namespace zvec::ailego
 
 namespace zvec {
 namespace {
@@ -94,6 +113,12 @@ bool IsMapped(const void *pointer) {
 #endif
 
 TEST(RocksdbMemtableFactoryTest, HoldsBackingChargeUntilDestruction) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  using Budget = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Budget::configure_test_rss(pool));
+  auto restore_rss = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
+  const size_t initial_headroom = Budget::available(pool);
   auto cache = rocksdb::NewLRUCache(4 * 1024 * 1024, 0, true);
   auto manager = std::make_shared<rocksdb::WriteBufferManager>(2 * 1024 * 1024,
                                                                cache, true);
@@ -104,11 +129,12 @@ TEST(RocksdbMemtableFactoryTest, HoldsBackingChargeUntilDestruction) {
   factory.reset();  // Each table owns the resources needed for its lifetime.
   char *data = nullptr;
   auto handle = table->Allocate(512 * 1024, &data);
+  const size_t charge = manager->memory_usage();
+  EXPECT_EQ(initial_headroom - charge, Budget::available(pool));
   std::memset(data, 'a', 512 * 1024 - 1);
   data[512 * 1024 - 1] = '\0';
   EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(data) % alignof(void *));
   ASSERT_TRUE(table->InsertKey(handle));
-  const size_t charge = manager->memory_usage();
   EXPECT_GE(charge, 512u * 1024);
   EXPECT_EQ(charge, table->ApproximateMemoryUsage());
   EXPECT_EQ(charge, manager->mutable_memtable_memory_usage());
@@ -122,6 +148,8 @@ TEST(RocksdbMemtableFactoryTest, HoldsBackingChargeUntilDestruction) {
   EXPECT_TRUE(IsMapped(data));
 #endif
   table.reset();
+  Budget::sample(pool);
+  EXPECT_EQ(initial_headroom, Budget::available(pool));
   EXPECT_EQ(0u, manager->memory_usage());
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   EXPECT_FALSE(IsMapped(data));

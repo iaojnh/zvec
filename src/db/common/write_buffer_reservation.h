@@ -28,12 +28,14 @@ class WriteBufferMemoryAllowance {
     assert(backing <= bytes);
     auto &pool = ailego::MemoryLimitPool::get_instance();
     if (!pool.capacity()) return 0;
-    if (!pool.materialization_allowed(backing)) throw std::bad_alloc();
     if (bytes > std::numeric_limits<size_t>::max() - active_)
       throw std::bad_alloc();
     const size_t target = active_ + bytes;
     if (target > reservation_.bytes()) {
+      if (!pool.materialization_allowed(backing)) throw std::bad_alloc();
       reservation_.add(target - reservation_.bytes());
+    } else if (!pool.try_materialize(backing)) {
+      throw std::bad_alloc();
     }
     active_ = target;
     active_backing_ += backing;
