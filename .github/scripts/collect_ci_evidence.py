@@ -17,13 +17,23 @@ from pathlib import Path
 
 def collect(build, output, extra_logs=None):
     output.mkdir(parents=True, exist_ok=True)
+    repository = Path(__file__).resolve().parents[2]
     environment = {
         "os": platform.platform(),
         "machine": platform.machine(),
         "python": sys.version,
         "cpu_count": os.cpu_count(),
         "commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
+            [
+                "git",
+                "-c",
+                f"safe.directory={repository}",
+                "-C",
+                str(repository),
+                "rev-parse",
+                "HEAD",
+            ],
+            text=True,
         ).strip(),
         "packages": {},
     }

@@ -292,6 +292,27 @@ jobs:
             --output-junit /work/ci-evidence/native.xml
         shell: bash
 
+      - name: Capture shutdown crash stack
+        if: failure()
+        timeout-minutes: 5
+        run: |
+          # Preserve the original CTest failure; this bounded diagnostic does
+          # not replace the result or accept a retry as a passing test.
+          docker exec "$MUSL_CONTAINER" apk add --no-cache gdb
+          docker exec -w /work/build/test_tmp/invert_recall_test \
+            "$MUSL_CONTAINER" sh -c '
+              timeout 180 gdb --batch --return-child-result \
+                -ex "set pagination off" \
+                -ex "set disable-randomization off" \
+                -ex run -ex "thread apply all backtrace 24" \
+                --args /work/build/bin/invert_recall_test \
+                > /work/ci-evidence/invert-recall-stack.log 2>&1
+              result=$?
+              echo "Shutdown diagnostic exit: $result"
+              tail -n 180 /work/ci-evidence/invert-recall-stack.log
+            '
+        shell: bash
+
       - name: Run Python Tests
         run: |
           mkdir -p ci-evidence

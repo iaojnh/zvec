@@ -124,3 +124,15 @@ def test_diagnostics_keep_reports_without_runner_secrets(tmp_path):
     assert (output / "LastTest.log").read_text() == "failed native test"
     assert "PRIVATE_TOKEN" not in (output / "build-config.txt").read_text()
     assert json.loads((output / "environment.json").read_text())["commit"]
+
+
+def test_diagnostics_find_checkout_without_changing_global_git_config(
+    tmp_path, monkeypatch
+):
+    global_config = tmp_path / "global-git-config"
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "evidence"
+    collect(tmp_path / "missing-build", output)
+    assert json.loads((output / "environment.json").read_text())["commit"]
+    assert not global_config.exists()

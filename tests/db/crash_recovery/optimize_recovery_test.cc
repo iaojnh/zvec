@@ -156,7 +156,7 @@ TEST_F(OptimizeRecoveryTest, CrashDuringOptimize) {
       auto write_result = collection->insert(docs);
       ASSERT_TRUE(write_result);
       for (auto &s : write_result.value()) {
-        ASSERT_TRUE(s.ok());
+        ASSERT_TRUE(s.ok()) << s.message();
       }
     }
 

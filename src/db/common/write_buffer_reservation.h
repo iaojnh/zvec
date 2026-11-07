@@ -23,6 +23,46 @@ namespace detail {
 // allowance before requesting more. This remains a planning estimate, not
 // allocator-level ownership or a hard RSS guarantee.
 class WriteBufferMemoryAllowance {
+  // The flush plan includes Arrow buffers with their own allocator charges.
+  // Only this allowance's ordinary-heap backing belongs in the RSS ledger.
+  class BackingReservation {
+   public:
+    ~BackingReservation() {
+      retain_at_most(0);
+    }
+    size_t bytes() const {
+      return bytes_;
+    }
+    void acquire(size_t target, size_t rss_target, size_t materialization) {
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      const size_t growth = target > bytes_ ? target - bytes_ : 0;
+      const size_t rss_growth =
+          rss_target > rss_bytes_ ? rss_target - rss_bytes_ : 0;
+      if (growth && !pool.try_charge_workspace_plan(growth))
+        throw std::bad_alloc();
+      if (!pool.try_materialize(0) || !pool.try_charge_process_backing(
+                                          rss_growth, materialization, false)) {
+        if (growth) pool.release_workspace_plan(growth);
+        throw std::bad_alloc();
+      }
+      bytes_ += growth;
+      rss_bytes_ += rss_growth;
+    }
+    void retain_at_most(size_t bytes, size_t rss = 0) noexcept {
+      bytes = std::min(bytes, bytes_);
+      rss = std::min(rss, rss_bytes_);
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      if (rss_bytes_ > rss) pool.release_process_backing(rss_bytes_ - rss);
+      if (bytes_ > bytes) pool.release_workspace_plan(bytes_ - bytes);
+      bytes_ = bytes;
+      rss_bytes_ = rss;
+    }
+
+   private:
+    size_t bytes_{0};
+    size_t rss_bytes_{0};
+  };
+
  public:
   size_t acquire(size_t bytes, size_t backing) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -32,23 +72,23 @@ class WriteBufferMemoryAllowance {
     if (bytes > std::numeric_limits<size_t>::max() - active_)
       throw std::bad_alloc();
     const size_t target = active_ + bytes;
-    if (target > reservation_.bytes()) {
-      reservation_.add(target - reservation_.bytes(), backing);
-    } else if (!pool.try_materialize(backing)) {
-      throw std::bad_alloc();
-    }
+    const size_t retained = std::max(retained_, active_backing_ + backing);
+    reservation_.acquire(target, retained, backing);
     active_ = target;
     active_backing_ += backing;
-    retained_ = std::max(retained_, active_backing_);
+    retained_ = retained;
     return bytes;
   }
 
   void retain_backing(size_t previous, size_t backing) {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(backing >= previous);
-    active_backing_ += backing - previous;
-    assert(active_backing_ <= active_);
-    retained_ = std::max(retained_, active_backing_);
+    const size_t target = active_backing_ + backing - previous;
+    assert(target <= active_);
+    const size_t retained = std::max(retained_, target);
+    reservation_.acquire(reservation_.bytes(), retained, backing - previous);
+    active_backing_ = target;
+    retained_ = retained;
   }
 
   void release(size_t bytes, size_t backing) noexcept {
@@ -57,7 +97,7 @@ class WriteBufferMemoryAllowance {
     assert(active_backing_ >= backing);
     active_ -= bytes;
     active_backing_ -= backing;
-    reservation_.retain_at_most(std::max(active_, retained_));
+    reservation_.retain_at_most(std::max(active_, retained_), retained_);
   }
 
   size_t active_bytes() const {
@@ -80,7 +120,7 @@ class WriteBufferMemoryAllowance {
  private:
   friend class MemoryBudgetTestPeer;
   mutable std::mutex mutex_;
-  ailego::MemoryReservation reservation_;
+  BackingReservation reservation_;
   size_t active_{0};
   size_t active_backing_{0};
   size_t retained_{0};
@@ -150,14 +190,14 @@ class WriteBufferReservation {
       // Debit each promotion once, and still check current pressure when a
       // writer returns with the same workspace.
       const size_t next_backing = std::max(backing_, std::min(backing, bytes_));
-      auto &pool = ailego::MemoryLimitPool::get_instance();
-      if (!pool.try_materialize(next_backing - backing_))
-        return Status(StatusCode::RESOURCE_EXHAUSTED,
-                      "Write buffer materialization blocked by memory pressure");
-      if (next_backing != backing_) {
+      try {
         allowance.retain_backing(backing_, next_backing);
-        backing_ = next_backing;
+      } catch (const std::bad_alloc &) {
+        return Status(
+            StatusCode::RESOURCE_EXHAUSTED,
+            "Write buffer materialization blocked by memory pressure");
       }
+      backing_ = next_backing;
       return Status::OK();
     }
 

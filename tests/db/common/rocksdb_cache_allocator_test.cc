@@ -228,7 +228,9 @@ void CheckReadsAndBackgroundCompactionUnderPressure() {
   ASSERT_TRUE(::DeleteFileA(directory));
   ASSERT_TRUE(::CreateDirectoryA(directory, nullptr));
 #else
-  char directory[] = "/tmp/zvec-rss-rocksdb-XXXXXX";
+  // CTest/device runners provide a writable working directory; Android does
+  // not provide the desktop /tmp directory.
+  char directory[] = "./zvec-rss-rocksdb-XXXXXX";
   ASSERT_NE(nullptr, ::mkdtemp(directory));
 #endif
   auto cleanup = ailego::ScopeGuard::Make(

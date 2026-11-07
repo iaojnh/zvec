@@ -57,6 +57,21 @@ struct MemoryLimitPoolTestPeer {
 
 namespace {
 
+class FtsBudgetEnvironment : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // Configure this analyzer suite before death-test parents can publish
+      // the mobile default pool. Jieba's complete dictionary needs the same
+      // standalone payload budget in every suite and re-executed child.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+};
+
+[[maybe_unused]] const auto *const kFtsBudgetEnvironment =
+    ::testing::AddGlobalTestEnvironment(new FtsBudgetEnvironment);
+
 // Build a transient FieldSchema for FTS unit tests.
 // When fts_params is provided, it is attached as the field's index_params
 // so that FtsColumnIndexer::open() can retrieve the tokenizer configuration.
@@ -151,17 +166,6 @@ static const std::string kStatCf{zvec::kFtsStatCfName};
 
 class FtsColumnIndexerTest : public ::testing::Test {
  protected:
-  static void SetUpTestSuite() {
-    if constexpr (detail::kMobileMemoryPolicy) {
-      // This analyzer-correctness suite loads the complete embedded Jieba
-      // dictionary, including shared parsed entries and a per-tokenizer trie.
-      // Its admitted workspace exceeds the mobile startup default. Use an
-      // explicit standalone payload budget, as other allocator unit tests do;
-      // process RSS and mobile defaults have dedicated acceptance tests.
-      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
-    }
-  }
-
   void SetUp() override {
     zvec::FileHelper::RemoveDirectory(kDbPath);
 
