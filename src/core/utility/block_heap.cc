@@ -37,14 +37,20 @@ namespace zvec {
 namespace core {
 
 void BlockHeap::reset(int32_t capacity, int32_t block_size) {
+  if (capacity < 0 || block_size < 0) throw std::bad_alloc();
   ef_ = capacity;
   block_size_ = block_size;
   data_.clear();
   const size_t reserve_cnt =
       static_cast<size_t>(std::max(capacity, block_size)) +
       static_cast<size_t>(block_size);
+  if (data_.capacity() > 4096 && data_.capacity() / 2 > reserve_cnt)
+    decltype(data_)().swap(data_);
   data_.reserve(reserve_cnt);
   tmp_.clear();
+  if (tmp_.capacity() > 4096 &&
+      tmp_.capacity() / 2 > static_cast<size_t>(block_size))
+    decltype(tmp_)().swap(tmp_);
   tmp_.reserve(static_cast<size_t>(block_size));
   cur_ = 0;
 }

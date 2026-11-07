@@ -74,6 +74,19 @@ class HnswSparseSearcher : public IndexSearcher {
                      Context::Pointer &context) const override;
 
   //! Linear search by primary keys
+  int search_bf_key_batch(const uint32_t *sparse_count, const uint32_t *indices,
+                          const void *query, IndexKeyBatchView keys,
+                          const IndexQueryMeta &meta, uint32_t count,
+                          Context::Pointer &context) const;
+  int search_bf_by_keys_impl(uint32_t sparse_count, const uint32_t *indices,
+                             const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &meta,
+                             Context::Pointer &context) const override {
+    return search_bf_key_batch(&sparse_count, indices, query,
+                               IndexKeyBatchView(keys), meta, 1, context);
+  }
+
   int search_bf_by_p_keys_impl(const uint32_t sparse_count,
                                const uint32_t *sparse_indices,
                                const void *sparse_query,

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
@@ -91,6 +92,12 @@ TEST_F(IteratorTest, BasicIteration) {
     auto int32_val = doc->get<int32_t>("int32");
     EXPECT_TRUE(int32_val.has_value())
         << "int32 field missing for doc " << doc->pk();
+    if (count == 0) {
+      std::weak_ptr<Doc> consumed = doc;
+      doc.reset();
+      r.value().reset();
+      EXPECT_TRUE(consumed.expired());
+    }
     count++;
   }
 

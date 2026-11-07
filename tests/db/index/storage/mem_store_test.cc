@@ -18,6 +18,7 @@
 #include "db/index/storage/memory_forward_store.h"
 #undef private
 #undef protected
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -25,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <arrow/array.h>
 #include <arrow/io/file.h>
 #include <arrow/ipc/reader.h>
@@ -96,7 +98,173 @@ class MemStoreTest : public testing::Test {
   std::shared_ptr<MemForwardStore> store_;
 };
 
+TEST_F(MemStoreTest, ForwardCacheOmitsVectorsButKeepsScalarArraysAndNulls) {
+  auto schema = GetCollectionSchema();
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "embedding", DataType::VECTOR_FP32, uint32_t{768}, false))
+                  .ok());
+  ASSERT_TRUE(
+      schema
+          ->add_field(std::make_shared<FieldSchema>(
+              "sparse", DataType::SPARSE_VECTOR_FP32, uint32_t{0}, false))
+          .ok());
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "samples", DataType::ARRAY_FLOAT, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "note", DataType::STRING, true))
+                  .ok());
+  ASSERT_TRUE(schema
+                  ->add_field(std::make_shared<FieldSchema>(
+                      "missing", DataType::STRING, true))
+                  .ok());
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("zvec_forward_projection_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto cleanup =
+      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+  MemForwardStore store(schema, path.string(), FileFormat::IPC);
+  ASSERT_TRUE(store.open().ok());
+  Doc doc = CreateDoc(10);
+  ASSERT_TRUE(doc.set("embedding", std::vector<float>(768, 3.0f)));
+  ASSERT_TRUE(
+      doc.set("sparse", std::make_pair(std::vector<uint32_t>{1, 5},
+                                       std::vector<float>{2.0f, 4.0f})));
+  ASSERT_TRUE(doc.set("samples", std::vector<float>{1.0f, 2.0f, 3.0f}));
+  doc.set_null("note");
+  doc.set_score(0.5f);
+  doc.set_operator(Operator::UPDATE);
+  const auto *vector = doc.get_ref<std::vector<float>>("embedding").data();
+  auto prepared = store.prepare_insert(doc, 123);
+  ASSERT_TRUE(prepared.has_value()) << prepared.error().message();
+  const auto &projected = (*prepared)->doc;
+  EXPECT_FALSE(projected.has("embedding"));
+  EXPECT_FALSE(projected.has("sparse"));
+  EXPECT_TRUE(projected.has("samples"));
+  EXPECT_EQ(doc.get_ref<std::vector<float>>("samples"),
+            projected.get_ref<std::vector<float>>("samples"));
+  EXPECT_TRUE(projected.is_null("note"));
+  EXPECT_FALSE(projected.has("missing"));
+  EXPECT_EQ(doc.pk_ref(), projected.pk_ref());
+  EXPECT_EQ(123u, projected.doc_id());
+  EXPECT_EQ(doc.score(), projected.score());
+  EXPECT_EQ(doc.get_operator(), projected.get_operator());
+  EXPECT_LT(projected.memory_usage(), doc.memory_usage());
+  // Admission and fullness remain conservative; no newly freed budget is
+  // consumed by larger batches in the same change.
+  EXPECT_EQ(doc.memory_usage(), (*prepared)->cache_bytes);
+  store.commit_insert(std::move(*prepared));
+  EXPECT_EQ(vector, doc.get_ref<std::vector<float>>("embedding").data());
+  EXPECT_EQ(10u, doc.doc_id());
+  ASSERT_EQ(1u, store.cache_.size());
+  EXPECT_FALSE(store.cache_.front().has("embedding"));
+  // Force the next row through the existing cache-to-Arrow batch boundary.
+  store.max_cache_size_ = 1;
+  Doc next = CreateDoc(11);
+  ASSERT_TRUE(next.set("embedding", std::vector<float>(768, 5.0f)));
+  ASSERT_TRUE(next.set("samples", std::vector<float>{4.0f, 5.0f}));
+  ASSERT_TRUE(store.insert(next).ok());
+  EXPECT_TRUE(store.cache_.empty());
+  ASSERT_EQ(1u, store.batches_.size());
+  auto table = store.get_table();
+  ASSERT_NE(nullptr, table);
+  ASSERT_EQ(2, table->num_rows());
+  EXPECT_EQ(nullptr, table->GetColumnByName("embedding"));
+  EXPECT_EQ(nullptr, table->GetColumnByName("sparse"));
+  auto ids = std::static_pointer_cast<arrow::UInt64Array>(
+      table->GetColumnByName(GLOBAL_DOC_ID)->chunk(0));
+  EXPECT_EQ(123u, ids->Value(0));
+  EXPECT_EQ(11u, ids->Value(1));
+  auto lists = std::static_pointer_cast<arrow::ListArray>(
+      table->GetColumnByName("samples")->chunk(0));
+  auto first =
+      std::static_pointer_cast<arrow::FloatArray>(lists->value_slice(0));
+  auto second =
+      std::static_pointer_cast<arrow::FloatArray>(lists->value_slice(1));
+  ASSERT_EQ(3, first->length());
+  ASSERT_EQ(2, second->length());
+  EXPECT_FLOAT_EQ(3.0f, first->Value(2));
+  EXPECT_FLOAT_EQ(5.0f, second->Value(1));
+  EXPECT_EQ(2, table->GetColumnByName("note")->null_count());
+  EXPECT_EQ(2, table->GetColumnByName("missing")->null_count());
+  ASSERT_TRUE(store.close().ok());
+}
+
 // Test constructor
+TEST_F(MemStoreTest, ProjectsBeforeCopyingSelectedRows) {
+  arrow::UInt64Builder ids;
+  arrow::StringBuilder payload;
+  std::vector<int> rows;
+  for (int i = 0; i < 32; ++i) {
+    ASSERT_TRUE(ids.Append(i).ok());
+    ASSERT_TRUE(payload.Append(std::string(16384, 'x')).ok());
+    rows.push_back(i);
+  }
+  auto id_array = ids.Finish().ValueOrDie();
+  auto payload_array = payload.Finish().ValueOrDie();
+  auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("id", arrow::uint64()),
+                     arrow::field("payload", arrow::utf8())}),
+      {id_array, payload_array});
+  const auto before = arrow::default_memory_pool()->total_bytes_allocated();
+  auto result = store_->apply_row_and_column_selection(table, rows, {"id"});
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(1, (*result)->num_columns());
+  EXPECT_EQ(32, (*result)->num_rows());
+  EXPECT_LT(arrow::default_memory_pool()->total_bytes_allocated() - before,
+            64 * 1024);
+}
+
+TEST_F(MemStoreTest, MissingBuilderReturnsAllocationError) {
+  RecordBatchBuilderPtr builder;
+  EXPECT_TRUE(store_->convert_to_builder(builder).IsOutOfMemory());
+}
+
+TEST_F(MemStoreTest, ArrayPayloadParticipatesInBufferFullness) {
+  auto array_schema = std::make_shared<CollectionSchema>(
+      "arrays", std::vector<FieldSchema::Ptr>{std::make_shared<FieldSchema>(
+                    "values", DataType::ARRAY_INT32, false, nullptr)});
+  const std::string file = "./array_payload.block.0";
+  {
+    MemForwardStore store(array_schema, file, FileFormat::IPC, 16384);
+    ASSERT_TRUE(store.open().ok());
+    Doc doc;
+    doc.set_pk("array");
+    ASSERT_TRUE(
+        doc.set<std::vector<int32_t>>("values", std::vector<int32_t>(8192, 7)));
+    ASSERT_TRUE(store.insert(doc).ok());
+    EXPECT_GE(store.total_bytes(), 8192u * sizeof(int32_t));
+    EXPECT_TRUE(store.is_full());
+    ASSERT_TRUE(store.close().ok());
+  }
+  std::filesystem::remove(file);
+}
+
+TEST_F(MemStoreTest, UnpublishedPreparationLeavesRowsUnchanged) {
+  Doc doc = CreateDoc(10);
+  {
+    auto prepared = store_->prepare_insert(doc, 123);
+    ASSERT_TRUE(prepared.has_value()) << prepared.error().message();
+    EXPECT_EQ(0u, store_->num_rows());
+    EXPECT_EQ(10u, doc.doc_id());
+  }
+  EXPECT_EQ(0u, store_->num_rows());
+  auto prepared = store_->prepare_insert(doc, 123);
+  ASSERT_TRUE(prepared.has_value());
+  store_->commit_insert(std::move(*prepared));
+  EXPECT_EQ(1u, store_->num_rows());
+  auto result = store_->get_table();
+  ASSERT_NE(nullptr, result);
+  EXPECT_EQ(123u, std::static_pointer_cast<arrow::UInt64Array>(
+                      result->column(0)->chunk(0))
+                      ->Value(0));
+}
+
 TEST_F(MemStoreTest, ConstructorTest) {
   auto schema = GetCollectionSchema();
   MemForwardStore store(schema, "./scalar.block.0", FileFormat::IPC);
@@ -515,6 +683,42 @@ TEST_F(MemStoreTest, FetchCheckOrderWithLocalRowIDEnd) {
       << "ID column values don't match expected order";
 }
 
+TEST_F(MemStoreTest, PointFetchReportsDenialBeforeFullStoreFallback) {
+  auto managed = std::make_shared<MemForwardStore>(
+      schema_, "./point-fetch-budget.parquet", FileFormat::PARQUET);
+  const auto remove = ailego::ScopeGuard::Make(
+      [&] { std::filesystem::remove("./point-fetch-budget.parquet"); });
+  ASSERT_TRUE(managed->open().ok());
+  ASSERT_TRUE(managed->insert(CreateDoc(1)).ok());
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+    managed.reset();
+    EXPECT_EQ(0, pool.init(previous));
+  });
+
+  RecordBatchPtr source;
+  std::vector<int> rows;
+  rows.reserve(1);
+  ailego::MemoryReservation row_memory;
+  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
+  auto denied = managed->locate_single_source({0}, &source, &rows, row_memory);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_TRUE(denied.status().IsOutOfMemory());
+  EXPECT_FALSE(source);
+
+  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+  auto recovered =
+      managed->locate_single_source({0}, &source, &rows, row_memory);
+  ASSERT_TRUE(recovered.ok());
+  EXPECT_TRUE(*recovered);
+  ASSERT_TRUE(source);
+  EXPECT_EQ(1, source->num_rows());
+}
+
 TEST_F(MemStoreTest, FetchSingleRow) {
   for (uint64_t i = 0; i < 5; ++i) {
     Doc doc = CreateDoc(i);
@@ -808,9 +1012,9 @@ TEST_F(MemStoreTest, ThreadSafety) {
 
   for (int t = 0; t < num_threads; ++t) {
     futures.push_back(
-        std::async(std::launch::async, [this, t, inserts_per_thread]() {
-          for (int i = 0; i < inserts_per_thread; ++i) {
-            uint64_t doc_id = t * inserts_per_thread + i;
+        std::async(std::launch::async, [this, t, count = inserts_per_thread]() {
+          for (int i = 0; i < count; ++i) {
+            uint64_t doc_id = t * count + i;
             store_->insert(CreateDoc(doc_id));
           }
         }));

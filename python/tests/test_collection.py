@@ -426,6 +426,105 @@ class TestCollectionOptimize:
 # ----------------------------
 @pytest.mark.usefixtures("test_collection")
 class TestCollectionFetch:
+    def test_fetch_reuses_materialized_fields_without_schema_lookup(self):
+        fields = {"payload": "content"}
+        vectors = {"vector": [1.0, 2.0]}
+
+        class NativeCollection:
+            def FetchTuples(self, ids, output_fields, include_vector):
+                assert ids == ["one", "missing"]
+                assert output_fields == ["payload"]
+                assert include_vector
+                return {"one": ("one", 0.0, fields, vectors)}
+
+        collection = Collection(NativeCollection())
+        result = collection.fetch(
+            ["one", "missing"],
+            output_fields=["payload"],
+            include_vector=True,
+        )
+        assert list(result) == ["one"]
+        assert result["one"].fields is fields
+        assert result["one"].vectors["vector"] is vectors["vector"]
+
+    def test_empty_fetch_does_not_require_schema(self):
+        native = MagicMock()
+        native.FetchTuples.return_value = {}
+        assert Collection(native).fetch([]) == {}
+
+    def test_fetch_across_native_batches(self, test_collection, single_doc):
+        docs = [single_doc._replace(id=f"batch-{i}") for i in range(97)]
+        assert all(status.ok() for status in test_collection.insert(docs))
+        ids = [doc.id for doc in reversed(docs)]
+        ids.insert(32, "missing")
+        ids.extend([docs[0].id, docs[-1].id, "missing"])
+        fetched = test_collection.fetch(ids)
+        assert len(fetched) == len(docs)
+        for expected in docs:
+            actual = fetched[expected.id]
+            assert actual.fields == expected.fields
+            assert actual.vectors.keys() == expected.vectors.keys()
+        projected = test_collection.fetch(ids, output_fields=[], include_vector=False)
+        assert len(projected) == len(docs)
+        assert all(not doc.fields and not doc.vectors for doc in projected.values())
+        test_collection.close()
+        assert fetched[docs[0].id].fields == docs[0].fields
+
+    @pytest.mark.parametrize("enable_mmap", [False, True])
+    def test_columnar_fetch_types_and_updates(self, tmp_path, enable_mmap):
+        values = {
+            "text": (DataType.STRING, "中文\x00value😀"),
+            "boolean": (DataType.BOOL, True),
+            "i32": (DataType.INT32, -17),
+            "i64": (DataType.INT64, -(2**40)),
+            "u32": (DataType.UINT32, 2**31 + 3),
+            "u64": (DataType.UINT64, 2**63 + 7),
+            "f32": (DataType.FLOAT, 1.25),
+            "f64": (DataType.DOUBLE, -3.125),
+            "strings": (DataType.ARRAY_STRING, ["", "中文", "a\x00b", "ascii😀"]),
+            "booleans": (DataType.ARRAY_BOOL, [False, True]),
+            "ints32": (DataType.ARRAY_INT32, [-1, 7]),
+            "ints64": (DataType.ARRAY_INT64, [-(2**40), 2**40]),
+            "uints32": (DataType.ARRAY_UINT32, [0, 2**31 + 3]),
+            "uints64": (DataType.ARRAY_UINT64, [0, 2**63 + 7]),
+            "floats": (DataType.ARRAY_FLOAT, [1.25, -2.5]),
+            "doubles": (DataType.ARRAY_DOUBLE, [1.25, -2.5]),
+            "empty": (DataType.ARRAY_STRING, []),
+        }
+        schema = zvec.CollectionSchema(
+            name="columnar_fetch",
+            fields=[FieldSchema(name, kind) for name, (kind, _) in values.items()]
+            + [FieldSchema("nullable", DataType.STRING, nullable=True)],
+        )
+        collection = zvec.create_and_open(
+            str(tmp_path / "columnar"),
+            schema,
+            option=CollectionOption(enable_mmap=enable_mmap),
+        )
+        try:
+            expected = {name: value for name, (_, value) in values.items()}
+            docs = [Doc(id=f"row-{i}", fields=expected) for i in range(270)]
+            assert all(status.ok() for status in collection.insert(docs))
+            ids = [doc.id for doc in docs] + ["row-1", "missing"]
+            assert all(doc.fields == expected for doc in collection.fetch(ids).values())
+            collection.flush()
+            assert collection.update(Doc(id="row-1", fields={"text": "updated"})).ok()
+            assert collection.delete("row-2").ok()
+            collection.flush()
+            fetched = collection.fetch(ids)
+            assert len(fetched) == 269
+            assert fetched["row-1"].field("text") == "updated"
+            assert fetched["row-0"].fields == expected
+            projected = collection.fetch(ids, output_fields=["strings", "nullable"])
+            assert all(
+                doc.fields == {"strings": expected["strings"]}
+                for doc in projected.values()
+            )
+            collection.close()
+            assert fetched["row-0"].fields == expected
+        finally:
+            collection.close()
+
     def test_collection_fetch(
         self, collection_with_single_doc: Collection, single_doc: Doc
     ):

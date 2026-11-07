@@ -13,14 +13,37 @@
 // limitations under the License
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <gtest/gtest.h>
+#include "db/sqlengine/planner/doc_filter.h"
 #include "db/sqlengine/sqlengine.h"
 #include "recall_base.h"
 
 namespace zvec::sqlengine {
 
 class VectorRecallTest : public RecallTest {};
+
+TEST_F(VectorRecallTest, FailedForwardLookupDoesNotSilentlyAcceptDocument) {
+  ASSERT_FALSE(segments_.empty());
+  auto info = std::make_shared<QueryInfo>();
+  info->add_forward_filter_schema_ptr("id",
+                                      collection_schema_->get_field("id"));
+  DocFilter no_forward(segments_.front(), info, nullptr, nullptr);
+  EXPECT_FALSE(no_forward.is_filtered(0));
+  EXPECT_TRUE(no_forward.status().ok());
+  DocFilter filtered(segments_.front(), info, nullptr,
+                     std::make_unique<arrow::compute::Expression>(
+                         arrow::compute::literal(true)));
+  ASSERT_TRUE(filtered.compute_filter().ok());
+  EXPECT_FALSE(filtered.is_filtered(0));
+  EXPECT_TRUE(filtered.status().ok());
+  // The boolean callback must reject the row and preserve an error for the
+  // recall node, not reinterpret a failed lookup as "no forward predicate".
+  EXPECT_TRUE(filtered.is_filtered(std::numeric_limits<int>::max()));
+  EXPECT_FALSE(filtered.status().ok());
+  EXPECT_TRUE(filtered.is_filtered(0));
+}
 
 TEST_F(VectorRecallTest, Basic) {
   SearchQuery query;

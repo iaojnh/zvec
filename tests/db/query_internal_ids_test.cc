@@ -14,11 +14,13 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <random>
 #include <thread>
 #include <utility>
 #include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/db/collection.h>
 #include "db/common/file_helper.h"
@@ -41,6 +43,66 @@ SearchQuery MakeSearchQuery(const std::string &field,
 }
 
 }  // namespace
+
+#if GTEST_HAS_DEATH_TEST
+namespace {
+
+void CheckNativeHybridCopyBudget() {
+  constexpr size_t kMiB = 1024 * 1024;
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(96 * kMiB));
+  const std::string path = "test_native_hybrid_input_budget";
+  FileHelper::RemoveDirectory(path);
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { FileHelper::RemoveDirectory(path); });
+  constexpr uint32_t kDimension = 16384;
+  CollectionSchema schema("hybrid_input_budget");
+  ASSERT_TRUE(schema.add_field(std::make_shared<FieldSchema>(
+      "vector", DataType::VECTOR_FP32, kDimension, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
+  auto created =
+      Collection::CreateAndOpen(path, schema, {false, false, kMiB});
+  ASSERT_TRUE(created) << created.error().message();
+  auto collection = std::move(created.value());
+  std::vector<Doc> docs(1);
+  docs.front().set_pk("one");
+  docs.front().set("vector", std::vector<float>(kDimension, 1.0f));
+  auto inserted = collection->insert(docs);
+  ASSERT_TRUE(inserted) << inserted.error().message();
+  ASSERT_TRUE(inserted->front().ok()) << inserted->front().message();
+
+  MultiQuery query;
+  SubQuery sub;
+  sub.target_ =
+      MakeSearchQuery("vector", docs.front().get_ref<std::vector<float>>("vector"),
+                       nullptr, 1).target_;
+  sub.num_candidates_ = 1;
+  query.queries.assign(224, sub);
+  auto denied = collection->query(query);
+  ASSERT_FALSE(denied);
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  query.queries.resize(2);
+  auto retried = collection->query(query);
+  ASSERT_TRUE(retried) << retried.error().message();
+  ASSERT_EQ(1u, retried->size());
+  EXPECT_EQ("one", retried->front()->pk_ref());
+  ASSERT_TRUE(collection->close().ok());
+}
+
+}  // namespace
+
+TEST(QueryInternalIdsDeathTest, NativeHybridCopiesShareOneBudget) {
+  // Global resources can retain backing after close. Use an isolated process
+  // for the smaller pool so later tests can publish their normal budget.
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckNativeHybridCopyBudget();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+#endif
 
 TEST(QueryInternalIdsTest, NativeTopkMatchesQueryBounds) {
   const std::string path = "test_query_internal_ids_topk_bounds";

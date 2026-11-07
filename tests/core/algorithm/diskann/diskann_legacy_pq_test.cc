@@ -16,10 +16,12 @@
 #include <limits>
 #include <random>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/turbo/turbo.h>
 #include "diskann_util.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec {
 namespace core {
@@ -70,6 +72,75 @@ IndexMeta make_meta(size_t dim) {
 }
 
 }  // namespace
+
+TEST(DiskAnnLegacyPq, RepackChargesMappingAndRetriesAfterBudgetFailure) {
+  constexpr size_t kDim = 17;
+  constexpr uint32_t kChunks = 4;
+  const size_t pivot_bytes = kClusterNum * kDim * sizeof(float);
+  const std::vector<uint32_t> offsets{0, 5, 9, 13, 17};
+  const auto pivots = make_random_pivots(kDim);
+  const auto payload =
+      make_legacy_payload(pivots, std::vector<float>(kDim, 0.0f), offsets);
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t old = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(old));
+  });
+  ASSERT_EQ(0, pool.init(pivot_bytes - 1));
+  ailego::BudgetedMappedBuffer output;
+  EXPECT_EQ(IndexError_NoMemory,
+            DiskAnnUtil::legacy_pq_codebook_to_centroids(
+                payload, make_meta(kDim), kChunks, &output));
+  EXPECT_EQ(0u, output.size());
+  EXPECT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(4 * pivot_bytes));
+  ASSERT_EQ(0, DiskAnnUtil::legacy_pq_codebook_to_centroids(
+                   payload, make_meta(kDim), kChunks, &output));
+  EXPECT_EQ(pool.external_used(), output.mapped_size());
+  for (size_t m = 0; m < kChunks; ++m) {
+    const size_t width = offsets[m + 1] - offsets[m];
+    for (size_t c = 0; c < kClusterNum; ++c) {
+      EXPECT_EQ(
+          0, std::memcmp(
+                 output.data() +
+                     (kClusterNum * offsets[m] + c * width) * sizeof(float),
+                 pivots.data() + c * kDim + offsets[m], width * sizeof(float)));
+    }
+  }
+  output.clear();
+  EXPECT_EQ(0u, pool.used());
+}
+
+TEST(DiskAnnLegacyPq, LoadRejectsCodebookOverlapWithoutLeaking) {
+  constexpr size_t kDim = 32;
+  constexpr uint32_t kChunks = 8;
+  const size_t pivot_bytes = kClusterNum * kDim * sizeof(float);
+  auto payload = make_legacy_payload(make_random_pivots(kDim),
+                                     std::vector<float>(kDim, 0.0f),
+                                     make_uniform_offsets(kDim, kChunks));
+  const auto original = payload;
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t old = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(old));
+  });
+  // One codebook fits; the simultaneous reordered copy does not.
+  ASSERT_EQ(0, pool.init(pivot_bytes + pivot_bytes / 2));
+  EXPECT_FALSE(DiskAnnUtil::create_quantizer_from_meta_buffer(
+      payload, make_meta(kDim), kChunks, true));
+  EXPECT_EQ(original, payload);
+  EXPECT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(16UL * 1024UL * 1024UL));
+  auto quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
+      payload, make_meta(kDim), kChunks, true);
+  ASSERT_TRUE(quantizer);
+  quantizer.reset();
+  EXPECT_EQ(0u, pool.used());
+}
 
 //! The repacked codebook has to be the one the index was built with, otherwise
 //! the stored codes decode to different vectors.  Encoding through the

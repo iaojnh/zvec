@@ -699,8 +699,7 @@ class Recall {
     }
     knn_context->set_topk(topk);
 
-    auto cal_recall = [&, this](const std::vector<IndexDocument> &knn_res,
-                                size_t idx) {
+    auto cal_recall = [&, this](const IndexDocumentList &knn_res, size_t idx) {
       vector<IndexDocument> linear_res;
 
       size_t result_size = std::min(topk, gt_[idx].size());
@@ -1413,8 +1412,7 @@ class SparseRecall {
     }
     knn_context->set_topk(topk);
 
-    auto cal_recall = [&, this](const std::vector<IndexDocument> &knn_res,
-                                size_t idx) {
+    auto cal_recall = [&, this](const IndexDocumentList &knn_res, size_t idx) {
       vector<IndexDocument> linear_res;
 
       size_t result_size = std::min(topk, gt_[idx].size());

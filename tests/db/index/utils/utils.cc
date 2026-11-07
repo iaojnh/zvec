@@ -416,7 +416,7 @@ Status TestHelper::SegmentInsertDoc(const Segment::Ptr &segment,
                                     const CollectionSchema &schema,
                                     const uint64_t start_doc_id,
                                     const uint64_t end_doc_id, bool nullable,
-                                    bool upsert, bool batch) {
+                                    bool upsert, bool /*batch*/) {
   for (auto doc_id = start_doc_id; doc_id < end_doc_id; doc_id++) {
     if (segment) {
       Doc new_doc;

@@ -51,11 +51,13 @@ FhtRotator::Pointer FhtRotator::create(int dim) {
   const size_t flip_size = 4 * r->flip_offset_;
 
   // Single allocation: FhtCtx header + trailing flip data.
-  r->fht_ctx_ = static_cast<FhtCtx *>(std::malloc(sizeof(FhtCtx) + flip_size));
-  if (r->fht_ctx_ == nullptr) {
-    // Allocation failed: bail out before dereferencing. Returning nullptr lets
-    // the smart Pointer clean up the partially-built object (~FhtRotator frees
-    // the null fht_ctx_ safely).
+  const size_t bytes = sizeof(FhtCtx) + flip_size;
+  try {
+    r->context_memory_.add_for_allocation(bytes, [&] {
+      r->fht_ctx_ = static_cast<FhtCtx *>(std::malloc(bytes));
+      if (!r->fht_ctx_) throw std::bad_alloc();
+    });
+  } catch (const std::bad_alloc &) {
     return nullptr;
   }
   r->fht_ctx_->flip_offset = r->flip_offset_;
@@ -197,9 +199,17 @@ int FhtRotator::deserialize(const void *data, size_t len) {
   const size_t trunc_dim = floor_pow2(static_cast<size_t>(new_in_dim));
   const float fac = 1.0f / std::sqrt(static_cast<float>(trunc_dim));
 
-  FhtCtx *new_ctx =
-      static_cast<FhtCtx *>(std::malloc(sizeof(FhtCtx) + expected_flip_size));
-  if (new_ctx == nullptr) return kErrRuntime;
+  ailego::MemoryReservation new_memory;
+  FhtCtx *new_ctx = nullptr;
+  const size_t bytes = sizeof(FhtCtx) + expected_flip_size;
+  try {
+    new_memory.add_for_allocation(bytes, [&] {
+      new_ctx = static_cast<FhtCtx *>(std::malloc(bytes));
+      if (!new_ctx) throw std::bad_alloc();
+    });
+  } catch (const std::bad_alloc &) {
+    return kErrRuntime;
+  }
   new_ctx->flip_offset = new_flip_offset;
   new_ctx->trunc_dim = trunc_dim;
   new_ctx->fac = fac;
@@ -210,6 +220,7 @@ int FhtRotator::deserialize(const void *data, size_t len) {
   // All allocations succeeded: commit new state and free the old context.
   std::free(fht_ctx_);
   fht_ctx_ = new_ctx;
+  context_memory_.swap(new_memory);
   in_dim_ = new_in_dim;
   out_dim_ = new_out_dim;
   flip_offset_ = new_flip_offset;

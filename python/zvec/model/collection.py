@@ -24,6 +24,7 @@ from zvec._zvec import _Collection
 from zvec._zvec.param import _GroupByVectorQuery
 
 from ..executor import QueryContext, QueryExecutor
+from ..executor.query_executor import _query_fields, _query_text
 from ..extension import ReRanker
 from ..typing import Status
 from ._validation import explain_utf8_conversion_error
@@ -74,27 +75,37 @@ class DocIterator(Iterator[Doc], contextlib.AbstractContextManager["DocIterator"
         self._core_iterator = core_iterator
         self._schema = schema
         self._closed = False
+        self._pending = None
 
     def __next__(self) -> Doc:
         if self._closed:
             raise StopIteration
 
-        try:
-            while True:
-                core_doc = next(self._core_iterator)
-                py_doc = convert_to_py_doc(core_doc, self._schema)
-                if py_doc is not None:
-                    return py_doc
-        except BaseException:
-            # StopIteration is a BaseException subclass, so this also covers
-            # normal exhaustion; always release the slot before propagating.
-            self.close()
-            raise
+        while True:
+            if self._pending is None:
+                try:
+                    self._pending = next(self._core_iterator)
+                except BaseException:
+                    self.close()
+                    raise
+
+            try:
+                py_doc = convert_to_py_doc(self._pending, self._schema)
+            except MemoryError:
+                # A caller can release earlier results and retry this row.
+                raise
+            except BaseException:
+                self.close()
+                raise
+            self._pending = None
+            if py_doc is not None:
+                return py_doc
 
     def close(self):
         """Release the underlying iterator (idempotent)."""
         if not self._closed:
             self._closed = True
+            self._pending = None
             self._core_iterator.close()
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -348,8 +359,12 @@ class Collection:
         """
         is_single = isinstance(docs, Doc)
         doc_list = [docs] if is_single else docs
+        memory = self._obj.WriteInputMemory(
+            len(doc_list) if isinstance(doc_list, (list, tuple)) else 0
+        )
+        schema = self.schema
         results = self._obj.Insert(
-            [convert_to_cpp_doc(doc, self.schema) for doc in doc_list]
+            [convert_to_cpp_doc(doc, schema, _memory=memory) for doc in doc_list]
         )
         return results[0] if is_single else results
 
@@ -373,8 +388,12 @@ class Collection:
         """
         is_single = isinstance(docs, Doc)
         doc_list = [docs] if is_single else docs
+        memory = self._obj.WriteInputMemory(
+            len(doc_list) if isinstance(doc_list, (list, tuple)) else 0
+        )
+        schema = self.schema
         results = self._obj.Upsert(
-            [convert_to_cpp_doc(doc, self.schema) for doc in doc_list]
+            [convert_to_cpp_doc(doc, schema, _memory=memory) for doc in doc_list]
         )
         return results[0] if is_single else results
 
@@ -400,8 +419,12 @@ class Collection:
         """
         is_single = isinstance(docs, Doc)
         doc_list = [docs] if is_single else docs
+        memory = self._obj.WriteInputMemory(
+            len(doc_list) if isinstance(doc_list, (list, tuple)) else 0
+        )
+        schema = self.schema
         results = self._obj.Update(
-            [convert_to_cpp_doc(doc, self.schema) for doc in doc_list]
+            [convert_to_cpp_doc(doc, schema, _memory=memory) for doc in doc_list]
         )
         return results[0] if is_single else results
 
@@ -455,14 +478,19 @@ class Collection:
 
         Returns:
             dict[str, Doc]: Mapping from ID to document. Missing IDs are omitted.
+
+        Raises:
+            MemoryError: With mmap disabled, native input copies, temporary
+                workspace, or returned payloads exceed the shared memory
+                budget. Retry with smaller batches or fewer output fields.
         """
         ids = [ids] if isinstance(ids, str) else ids
-        docs = self._obj.Fetch(ids, output_fields, include_vector)
-        return {
-            doc_id: py_doc
-            for doc_id, core_doc in docs.items()
-            if (py_doc := convert_to_py_doc(core_doc, self.schema)) is not None
-        }
+        docs = self._obj.FetchTuples(ids, output_fields, include_vector)
+        # The binding already captured the schema with each native batch and
+        # released its C++ documents. Reuse the Python payloads without copying.
+        for doc_id, value in docs.items():
+            docs[doc_id] = Doc._from_tuple(value)
+        return docs
 
     # ========== Collection DQL-Iterator Methods ==========
     def iter_docs(
@@ -549,7 +577,8 @@ class Collection:
             raise ValueError(msg)
         _require_positive_integer(topk, "topk")
         ctx = QueryContext(topk=topk, filter=filter, queries=[query])
-        cpp_query = self._querier._build_search_query(ctx, query, self._obj)
+        memory = self._obj.QueryInputMemory(ctx.queries, ctx.filter, ctx.output_fields)
+        cpp_query = self._querier._build_search_query(ctx, query, self._obj, memory)
         return self._obj.QueryInternalIds(cpp_query, return_scores)
 
     def resolve_internal_ids(
@@ -680,6 +709,11 @@ class Collection:
             >>> for group in results:
             ...     print(group.group_by_value, len(group.docs))
         """
+        memory = self._obj.QueryInputMemory(
+            [query], filter, output_fields, group_by_field_name
+        )
+        if output_fields is not None and type(output_fields) not in (list, tuple):
+            output_fields = memory.output_fields
         query._validate()
         if query.has_fts():
             raise ValueError("Group by query does not support FTS")
@@ -690,18 +724,18 @@ class Collection:
         _require_positive_integer(group_count, "group_count")
         _require_positive_integer(topk_per_group, "topk_per_group")
         cpp_query = _GroupByVectorQuery()
-        cpp_query.field_name = query.field_name
-        cpp_query.group_by_field_name = group_by_field_name
+        cpp_query.field_name = _query_text(query.field_name)
+        cpp_query.group_by_field_name = _query_text(group_by_field_name)
         cpp_query.group_count = group_count
         cpp_query.topk_per_group = topk_per_group
         cpp_query.include_vector = include_vector
         if filter:
-            cpp_query.filter = filter
+            cpp_query.filter = _query_text(filter)
         if output_fields is not None:
-            cpp_query.output_fields = output_fields
+            cpp_query.output_fields = _query_fields(output_fields)
         if query.param:
             cpp_query.query_params = query.param
-        self._querier.set_query_vector(query, cpp_query, self._obj)
+        self._querier.set_query_vector(query, cpp_query, self._obj, memory)
 
         raw_results = self._obj.GroupByQuery(cpp_query)
 

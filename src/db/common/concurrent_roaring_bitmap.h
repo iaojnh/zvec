@@ -19,6 +19,7 @@
 #include <roaring.hh>
 #include <roaring64map.hh>
 #include <roaring/roaring.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
@@ -157,17 +158,23 @@ class ConcurrentRoaringBitmap64 {
                                                      std::defer_lock);
       std::lock(lock, other_lock);
 
-      name_ = other.name_;
-      is_32bit_ = other.is_32bit_;
-      identifier_ = other.identifier_;
-
+      ailego::MemoryReservation memory;
+      const bool empty = other.is_32bit_ ? other.bitmap32_->isEmpty()
+                                         : other.bitmap64_->isEmpty();
+      if (!empty) memory.add(memory_allowance(other.encoded_size()));
+      std::unique_ptr<roaring::Roaring> bitmap32;
+      std::unique_ptr<roaring::Roaring64Map> bitmap64;
       if (other.is_32bit_) {
-        bitmap32_ = std::make_unique<roaring::Roaring>(*other.bitmap32_);
-        bitmap64_.reset();
+        bitmap32 = std::make_unique<roaring::Roaring>(*other.bitmap32_);
       } else {
-        bitmap64_ = std::make_unique<roaring::Roaring64Map>(*other.bitmap64_);
-        bitmap32_.reset();
+        bitmap64 = std::make_unique<roaring::Roaring64Map>(*other.bitmap64_);
       }
+      name_ = other.name_;
+      identifier_ = other.identifier_;
+      bitmap32_ = std::move(bitmap32);
+      bitmap64_ = std::move(bitmap64);
+      is_32bit_ = other.is_32bit_;
+      memory_ = std::move(memory);
     }
     return *this;
   }
@@ -195,7 +202,8 @@ class ConcurrentRoaringBitmap64 {
   bool contains(size_t pos) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     if (is_32bit_) {
-      return bitmap32_->contains(static_cast<uint32_t>(pos));
+      return pos <= std::numeric_limits<uint32_t>::max() &&
+             bitmap32_->contains(static_cast<uint32_t>(pos));
     } else {
       return bitmap64_->contains(static_cast<uint64_t>(pos));
     }
@@ -222,7 +230,9 @@ class ConcurrentRoaringBitmap64 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     uint64_t max_rank{0}, min_rank{0};
     if (is_32bit_) {
-      max_rank = bitmap32_->rank(max_doc_id);
+      if (min_doc_id > std::numeric_limits<uint32_t>::max()) return 0;
+      max_rank = bitmap32_->rank(
+          std::min<uint64_t>(max_doc_id, std::numeric_limits<uint32_t>::max()));
       min_rank = min_doc_id <= 0 ? 0 : bitmap32_->rank(min_doc_id - 1);
     } else {
       max_rank = bitmap64_->rank(max_doc_id);
@@ -232,35 +242,57 @@ class ConcurrentRoaringBitmap64 {
   }
 
 
-  void add(size_t pos) {
+  // Writers call this before appending their WAL record. The allowance is
+  // retained through mutation so admission failure cannot publish a deletion.
+  Status prepare_add(size_t pos) try {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    if ((is_32bit_ && pos <= std::numeric_limits<uint32_t>::max() &&
+         bitmap32_->contains(pos)) ||
+        (!is_32bit_ && bitmap64_->contains(static_cast<uint64_t>(pos))))
+      return Status::OK();
+    reserve_memory();
+    return Status::OK();
+  } catch (const std::bad_alloc &) {
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Insufficient deletion bitmap budget");
+  }
+
+  Status add(size_t pos) try {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    reserve_memory();
     if (ailego_unlikely(pos > std::numeric_limits<uint32_t>::max() &&
                         is_32bit_)) {
       upgrade_from_32_to_64();
     }
     if (is_32bit_) {
-      return bitmap32_->add(static_cast<uint32_t>(pos));
+      bitmap32_->add(static_cast<uint32_t>(pos));
     } else {
-      return bitmap64_->add(static_cast<uint64_t>(pos));
+      bitmap64_->add(static_cast<uint64_t>(pos));
     }
+    return Status::OK();
+  } catch (const std::bad_alloc &) {
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Insufficient deletion bitmap budget");
   }
 
 
   void clear() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    bitmap32_.reset();
-    bitmap64_.reset();
     if (is_32bit_) {
       bitmap32_ = std::make_unique<roaring::Roaring>();
+      bitmap64_.reset();
     } else {
       bitmap64_ = std::make_unique<roaring::Roaring64Map>();
+      bitmap32_.reset();
     }
+    memory_.retain_at_most(0);
   }
 
 
   //! Remove all values in the closed interval [min, max]
   void remove_range_closed(uint64_t min, uint64_t max) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    reserve_memory();
     if (!is_32bit_) {
       return bitmap64_->removeRangeClosed(min, max);
     }
@@ -287,6 +319,28 @@ class ConcurrentRoaringBitmap64 {
  private:
   using FILE = ailego::File;
 
+  size_t encoded_size() const {
+    return is_32bit_ ? bitmap32_->getSizeInBytes()
+                     : bitmap64_->getSizeInBytes();
+  }
+
+  // Roaring's allocator is not replaceable per bitmap. Reserve conservatively
+  // for its container capacities, map nodes and a one-container mutation or
+  // 32->64 conversion, before calling into it. This is an allowance, not a
+  // measurement of allocated bytes or RSS. Retain the high-water reservation
+  // after removals because Roaring can keep container capacity.
+  static size_t memory_allowance(size_t encoded) {
+    constexpr size_t kSlack = 64 * 1024;
+    if (encoded > (std::numeric_limits<size_t>::max() - kSlack) / 16)
+      throw std::bad_alloc();
+    return encoded * 16 + kSlack;
+  }
+
+  void reserve_memory() {
+    const size_t needed = memory_allowance(encoded_size());
+    if (needed > memory_.bytes()) memory_.add(needed - memory_.bytes());
+  }
+
 
   template <typename... Args>
   std::string debug_str(Args &&...args) {
@@ -302,11 +356,14 @@ class ConcurrentRoaringBitmap64 {
       LOG_WARN("%s: bitmap is already 64-bit", identifier_.c_str());
       return;
     }
-    bitmap64_ = std::make_unique<roaring::Roaring64Map>(
-        roaring::Roaring64Map{std::move(*bitmap32_)});
+    // Build the replacement without consuming the old bitmap: allocation
+    // failure must not discard previously committed deletions.
+    auto upgraded = std::make_unique<roaring::Roaring64Map>(*bitmap32_);
+    auto identifier = "Roaring bitmap[" + name_ + ", 64-bit]";
+    bitmap64_ = std::move(upgraded);
     is_32bit_ = false;
     bitmap32_.reset();
-    identifier_ = "Roaring bitmap[" + name_ + ", 64-bit]";
+    identifier_ = std::move(identifier);
     LOG_DEBUG("%s: upgraded to 64-bit", identifier_.c_str());
   }
 
@@ -314,6 +371,7 @@ class ConcurrentRoaringBitmap64 {
   std::string name_;
   bool is_32bit_;
   std::string identifier_;
+  ailego::MemoryReservation memory_;
   std::unique_ptr<roaring::Roaring> bitmap32_{nullptr};
   std::unique_ptr<roaring::Roaring64Map> bitmap64_{nullptr};
   mutable std::shared_mutex mutex_;

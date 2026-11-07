@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "id_map.h"
+#include <cstring>
 #include <zvec/ailego/logger/logger.h>
 #include "db/common/constants.h"
 
@@ -100,7 +101,7 @@ Status IDMap::upsert(const std::string &key, uint64_t doc_id) {
   }
 
   rocksdb::Slice value((const char *)&doc_id, sizeof(uint64_t));
-  auto s = rocksdb_context_.db_->Put(rocksdb_context_.write_opts_, key, value);
+  auto s = rocksdb_context_.put(key, value);
   if (s.ok()) {
     return Status::OK();
   } else {
@@ -113,24 +114,28 @@ Status IDMap::upsert(const std::string &key, uint64_t doc_id) {
 
 
 void IDMap::remove(const std::string &key) {
-  rocksdb_context_.db_->Delete(rocksdb_context_.write_opts_, key);
+  rocksdb_context_.remove(key);
 }
 
 
-bool IDMap::has(const std::string &key, uint64_t *doc_id) const {
+Result<bool> IDMap::lookup(const std::string &key, uint64_t *doc_id) const {
+  if (doc_id) *doc_id = INVALID_DOC_ID;
   std::string value;
-  auto s = rocksdb_context_.db_->Get(rocksdb_context_.read_opts_, key, &value);
-  if (s.ok()) {
-    if (doc_id) {
-      *doc_id = *(uint64_t *)(value.data());
-    }
-    return true;
-  } else {
-    if (doc_id) {
-      *doc_id = INVALID_DOC_ID;
-    }
-    return false;
+  const auto status =
+      rocksdb_context_.db_->Get(rocksdb_context_.read_opts_, key, &value);
+  if (status.IsNotFound()) return false;
+  if (!status.ok()) {
+    const auto code = status.IsMemoryLimit() ? StatusCode::RESOURCE_EXHAUSTED
+                                              : StatusCode::INTERNAL_ERROR;
+    return tl::make_unexpected(
+        Status(code, "ID map lookup failed: " + status.ToString()));
   }
+  if (value.size() != sizeof(uint64_t)) {
+    return tl::make_unexpected(
+        Status::InternalError("Invalid document ID in primary-key map"));
+  }
+  if (doc_id) std::memcpy(doc_id, value.data(), sizeof(*doc_id));
+  return true;
 }
 
 

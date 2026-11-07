@@ -15,8 +15,10 @@
 #include "fht_rotator.h"
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <random>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_error.h>
 
 namespace zvec {
@@ -28,7 +30,7 @@ namespace {
 size_t floor_pow2(size_t n) {
   if (n == 0) return 0;
   size_t p = 1;
-  while (p * 2 <= n) p *= 2;
+  while (p <= n / 2) p *= 2;
   return p;
 }
 
@@ -39,14 +41,21 @@ size_t floor_pow2(size_t n) {
 // ============================================================================
 
 void FhtRotator::init_context(size_t dim) {
-  const size_t flip_offset = (dim + kByteLen - 1) / kByteLen;
-  auto *ctx = static_cast<turbo::FhtCtx *>(
-      std::malloc(sizeof(turbo::FhtCtx) + 4 * flip_offset));
-  if (!ctx) throw std::bad_alloc();
-  context_.reset(ctx);
+  const size_t flip_offset = dim / kByteLen + (dim % kByteLen != 0);
+  if (flip_offset >
+      (std::numeric_limits<size_t>::max() - sizeof(turbo::FhtCtx)) / 4)
+    throw std::bad_alloc();
+  // Admit replacement while the old context is still live. Turbo's kernels
+  // use caller-owned output as scratch, so no unbudgeted inverse copy remains.
+  ailego::BudgetedVector<uint8_t> replacement(sizeof(turbo::FhtCtx) +
+                                              4 * flip_offset);
+  // The byte buffer is already zeroed. Avoid aggregate initialization of the
+  // trailing flexible array, which MSVC rejects as a zero-sized allocation.
+  auto *ctx = new (replacement.data()) turbo::FhtCtx;
   ctx->flip_offset = flip_offset;
   ctx->trunc_dim = floor_pow2(dim);
   ctx->fac = 1.0f / std::sqrt(static_cast<float>(ctx->trunc_dim));
+  context_.swap(replacement);
   kernels_ = turbo::get_rotator_kernels(turbo::RotateType::kFht);
 }
 
@@ -59,17 +68,19 @@ int FhtRotator::init_impl(size_t dim) {
   std::mt19937 gen(rd());
   std::uniform_int_distribution<int> dist(0, 255);
   for (size_t i = 0; i < blob_bytes(); ++i) {
-    context_->flip[i] = static_cast<uint8_t>(dist(gen));
+    context()->flip[i] = static_cast<uint8_t>(dist(gen));
   }
   return 0;
 }
 
 void FhtRotator::rotate(const float *in, float *out) const {
-  kernels_.rotate(in, out, dimension_, dimension_, context_.get());
+  kernels_.rotate(in, out, dimension_, dimension_,
+                   const_cast<turbo::FhtCtx *>(context()));
 }
 
 void FhtRotator::unrotate(const float *in, float *out) const {
-  kernels_.unrotate(in, out, dimension_, dimension_, context_.get());
+  kernels_.unrotate(in, out, dimension_, dimension_,
+                     const_cast<turbo::FhtCtx *>(context()));
 }
 
 RotatorType FhtRotator::rotator_type() const {
@@ -77,16 +88,16 @@ RotatorType FhtRotator::rotator_type() const {
 }
 
 void FhtRotator::save_blob(char *data) const {
-  std::memcpy(data, context_->flip, blob_bytes());
+  std::memcpy(data, context()->flip, blob_bytes());
 }
 
 void FhtRotator::load_blob(const char *data) {
   init_context(dimension_);
-  std::memcpy(context_->flip, data, blob_bytes());
+  std::memcpy(context()->flip, data, blob_bytes());
 }
 
 size_t FhtRotator::blob_bytes() const {
-  return context_ ? 4 * context_->flip_offset : 0;
+  return context_.empty() ? 0 : 4 * context()->flip_offset;
 }
 
 }  // namespace core

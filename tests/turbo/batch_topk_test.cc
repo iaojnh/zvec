@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include <zvec/turbo/batch_topk.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -31,7 +30,10 @@
 #include <utility>
 #include <vector>
 #include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
+#include <zvec/turbo/batch_topk.h>
 #include "topk/batch_topk_internal.h"
+#include "../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec {
 namespace turbo {
@@ -331,6 +333,38 @@ TEST(BatchTopK, OverflowResetPreservesExistingResultsAndContinuation) {
   }
 }
 
+TEST(BatchTopK, BudgetRejectionPreservesResultsAndReleaseAllowsReuse) {
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = zvec::ailego::ScopeGuard::Make(
+      [&] { EXPECT_EQ(0, pool.init(previous)); });
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  const size_t baseline = pool.external_used();
+  for (bool small : {false, true}) {
+    BatchTopK topk;
+    BatchTopKTestAccess::Reset(topk, 1024, kDefaultBound, false,
+                               internal::Isa::kScalar, small);
+    const float distance = 3.0f;
+    const uint64_t id = 17;
+    topk.push_block(&distance, &id, 1);
+    topk.finish();
+    EXPECT_GT(pool.external_used(), baseline);
+    EXPECT_THROW(
+        BatchTopKTestAccess::Reset(topk, 1024 * 1024, kDefaultBound, false,
+                                   internal::Isa::kScalar, small),
+        std::bad_alloc);
+    ASSERT_EQ(1u, topk.size());
+    EXPECT_EQ(id, topk.result(0).id);
+    topk.release();
+    EXPECT_EQ(baseline, pool.external_used());
+    topk.reset(1024);
+    topk.push_block(&distance, &id, 1);
+    topk.finish();
+    EXPECT_EQ(id, topk.result(0).id);
+  }
+  EXPECT_EQ(baseline, pool.external_used());
+}
+
 TEST(BatchTopK, DuplicateIdsRemainIndependentCandidateOccurrences) {
   std::vector<float> scores;
   std::vector<uint64_t> ids;
@@ -439,21 +473,24 @@ TEST(BatchTopK, CollectionInsideSimdGroupRefreshesItsBoundSafely) {
 }
 
 // Run an optimized build with --gtest_also_run_disabled_tests
-// --gtest_filter=BatchTopK.DISABLED_IsaBenchmark. AVX2/AVX512 comparisons require
-// a native x86 machine supporting both; unavailable implementations are skipped.
+// --gtest_filter=BatchTopK.DISABLED_IsaBenchmark. AVX2/AVX512 comparisons
+// require a native x86 machine supporting both; unavailable implementations are
+// skipped.
 TEST(BatchTopK, DISABLED_IsaBenchmark) {
   using Clock = std::chrono::steady_clock;
   constexpr size_t kCount = 65536;
-  constexpr double kMinimumTimeNs = 100e6;  // 100 ms per ISA/configuration/round.
+  constexpr double kMinimumTimeNs =
+      100e6;  // 100 ms per ISA/configuration/round.
   constexpr size_t kRounds = 6;
   struct Implementation {
     internal::Isa isa;
     const char *name;
   };
-  const Implementation candidates[] = {
-      {internal::Isa::kScalar, "scalar"}, {internal::Isa::kSSE2, "sse2"},
-      {internal::Isa::kAVX2, "avx2"},     {internal::Isa::kAVX512, "avx512"},
-      {internal::Isa::kNEON, "neon"}};
+  const Implementation candidates[] = {{internal::Isa::kScalar, "scalar"},
+                                       {internal::Isa::kSSE2, "sse2"},
+                                       {internal::Isa::kAVX2, "avx2"},
+                                       {internal::Isa::kAVX512, "avx512"},
+                                       {internal::Isa::kNEON, "neon"}};
   std::vector<Implementation> implementations;
   for (const auto &candidate : candidates) {
     if (internal::Supported(candidate.isa)) {
@@ -463,8 +500,9 @@ TEST(BatchTopK, DISABLED_IsaBenchmark) {
     }
   }
   const Input input(Scores(kCount, 4, 719));
-  std::printf("isa,k,batch_size,batch_count,count,repetitions,round,"
-              "insert_ns_per_batch,finish_export_ns_per_query,checksum\n");
+  std::printf(
+      "isa,k,batch_size,batch_count,count,repetitions,round,"
+      "insert_ns_per_batch,finish_export_ns_per_query,checksum\n");
   for (size_t k : {10U, 64U, 65U, 1000U}) {
     for (size_t batch_size : {32U, 128U, 512U}) {
       const size_t batch_count = (kCount + batch_size - 1) / batch_size;
@@ -493,11 +531,13 @@ TEST(BatchTopK, DISABLED_IsaBenchmark) {
             insert();
             const auto inserted = Clock::now();
             topk.finish();
-            for (size_t i = 0; i < topk.size(); ++i) exported[i] = topk.result(i);
+            for (size_t i = 0; i < topk.size(); ++i)
+              exported[i] = topk.result(i);
             std::atomic_signal_fence(std::memory_order_seq_cst);
             const auto finished = Clock::now();
             insert_ns +=
-                std::chrono::duration<double, std::nano>(inserted - begin).count();
+                std::chrono::duration<double, std::nano>(inserted - begin)
+                    .count();
             finish_export_ns +=
                 std::chrono::duration<double, std::nano>(finished - inserted)
                     .count();

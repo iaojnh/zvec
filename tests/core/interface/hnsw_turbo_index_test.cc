@@ -28,6 +28,9 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <gtest/gtest.h>
 #include <turbo/quantizer/fp32_quantizer/fp32_quantizer.h>
 #include <turbo/quantizer/quantizer.h>
@@ -38,6 +41,7 @@
 #include <zvec/core/interface/index_factory.h>
 #include <zvec/core/interface/index_param_builders.h>
 #include "algorithm/hnsw/hnsw_algorithm.h"
+#include "algorithm/hnsw/hnsw_bulk_builder.h"
 #include "algorithm/hnsw/hnsw_build_dumper.h"
 #include "algorithm/hnsw/hnsw_context.h"
 #include "algorithm/hnsw/hnsw_params.h"
@@ -69,6 +73,36 @@ void *operator new(std::size_t size) {
   }
   if (void *ptr = std::malloc(size ? size : 1)) return ptr;
   throw std::bad_alloc();
+}
+
+void *operator new(std::size_t size, std::align_val_t alignment) {
+  if ((bulk_alloc_test::countdown && --bulk_alloc_test::countdown == 0) ||
+      (bulk_alloc_test::should_fail && bulk_alloc_test::should_fail())) {
+    bulk_alloc_test::should_fail = nullptr;
+    throw std::bad_alloc();
+  }
+  const size_t align = std::max(static_cast<size_t>(alignment), sizeof(void *));
+#if defined(_WIN32)
+  if (void *ptr = _aligned_malloc(size ? size : 1, align)) return ptr;
+#else
+  void *ptr = nullptr;
+  if (posix_memalign(&ptr, align, size ? size : 1) == 0) return ptr;
+#endif
+  throw std::bad_alloc();
+}
+
+void operator delete(void *ptr, std::align_val_t) noexcept {
+  if (ptr && bulk_alloc_test::on_delete) bulk_alloc_test::on_delete(ptr);
+#if defined(_WIN32)
+  _aligned_free(ptr);
+#else
+  std::free(ptr);
+#endif
+}
+
+void operator delete(void *ptr, std::size_t,
+                     std::align_val_t alignment) noexcept {
+  ::operator delete(ptr, alignment);
 }
 
 void operator delete(void *ptr) noexcept {
@@ -1150,7 +1184,8 @@ TEST(HnswBulkMergeDeathTest, AllocationFailureReleasesLevelPromotionLock) {
       try {
         // The first allocation grows level_topk after acquiring the
         // promotion lock, inside the real insertion implementation.
-        algorithm.add_node(1, 1, contexts[0].get());
+        failed = algorithm.add_node(1, 1, contexts[0].get()) ==
+                 core::IndexError_NoMemory;
       } catch (const std::bad_alloc &) {
         failed = true;
       }
@@ -1330,6 +1365,37 @@ TEST(HnswBulkMergeTest, PreparesAllContextsBeforeWritesAndPropagatesFailure) {
     EXPECT_EQ(0, target->close());
     EXPECT_EQ(0, source->close());
   }
+}
+
+TEST(HnswBulkMergeTest, BorrowedVectorRoutingObeysPoolAdmission) {
+  namespace ailego = zvec::ailego;
+  auto &memory = ailego::MemoryLimitPool::get_instance();
+  const auto previous = memory.capacity();
+  ASSERT_EQ(0, memory.init(128UL * 1024 * 1024));
+  AILEGO_DEFER([&] {
+    memory.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+    EXPECT_EQ(0, memory.init(previous));
+  });
+  const std::string path = "hnsw_bulk_budget_source.index";
+  AILEGO_DEFER([&] { zvec::test_util::RemoveTestFiles(path); });
+  auto param = FlatIndexParamBuilder()
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(kDimension)
+                   .with_metric_type(MetricType::kL2sq)
+                   .build();
+  auto source = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, source);
+  ASSERT_EQ(0, source->open(path, {StorageOptions::StorageType::kMMAP, true}));
+  AddVectors(source.get(), RandomVectors());
+
+  zvec::core::HnswBulkBuilder builder({}, {}, nullptr, {});
+  ASSERT_EQ(0, builder.add_source(source->create_index_provider()));
+  memory.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
+  EXPECT_EQ(zvec::core::IndexError_NoMemory, builder.prepare(IndexFilter()));
+  EXPECT_TRUE(builder.empty());
+  memory.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+  EXPECT_EQ(0, builder.prepare(IndexFilter()));
+  EXPECT_FALSE(builder.empty());
 }
 
 TEST(HnswBulkMergeTest, TaskAllocationFailureWaitsBeforeDestroyingContexts) {

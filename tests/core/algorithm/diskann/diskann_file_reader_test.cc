@@ -20,8 +20,10 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
 
@@ -185,9 +187,9 @@ TEST(DiskAnnFileReaderTest, BufferPoolReadsSectorSlicesFromNativePages) {
   ASSERT_TRUE(file.write_all(source.data(), source.size()));
   file.close();
 
-  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
-      memory_pool.init(native_page_size +
+      memory_pool.init(2 * native_page_size +
                        ailego::VecBufferPool::metadata_bytes_for_page_count(2)),
       0);
   auto pool =
@@ -243,9 +245,9 @@ TEST(DiskAnnFileReaderTest,
   original.close();
   replacement.close();
 
-  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
-      memory_pool.init(native_page_size +
+      memory_pool.init(2 * native_page_size +
                        ailego::VecBufferPool::metadata_bytes_for_page_count(2)),
       0);
   auto pool = std::make_shared<ailego::VecBufferPool>(original.path(), false);
@@ -279,6 +281,44 @@ TEST(DiskAnnFileReaderTest,
   EXPECT_EQ(memory_pool.metadata_used(), 0U);
 }
 
+TEST(DiskAnnFileReaderTest, ReadPlanHonorsProcessBudgetAndCanRetry) {
+  namespace ailego = zvec::ailego;
+  const size_t page_size = ailego::kVectorPageSize;
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  std::vector<uint8_t> source(page_size, 0x79);
+  ASSERT_TRUE(file.write_all(source.data(), source.size()));
+  file.close();
+
+  auto &payload = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, payload.init(
+                   4 * page_size +
+                   ailego::VecBufferPool::metadata_bytes_for_page_count(1)));
+  auto pool = std::make_shared<ailego::VecBufferPool>(file.path(), false);
+  ASSERT_EQ(0, pool->init());
+  BufferPoolAlignedFileReader reader(pool);
+  ASSERT_EQ(0, reader.open_from_pool(file.path()));
+  AlignedBuffer output = make_aligned_buffer(page_size);
+  ASSERT_NE(nullptr, output);
+  std::vector<AlignedRead> requests{{0, page_size, output.get()}};
+  IOContext ctx{};
+  auto &memory = ailego::MemoryLimitPool::get_instance();
+  const auto cleanup = ailego::ScopeGuard::Make([&] {
+    destroy_io_ctx(ctx);
+    memory.configure_process_rss_limit(0);
+  });
+
+  ASSERT_TRUE(memory.configure_process_rss_limit(1));
+  const size_t external = payload.external_used();
+  EXPECT_EQ(IndexError_NoMemory, reader.read(requests, ctx));
+  EXPECT_EQ(external, payload.external_used());
+  EXPECT_EQ(nullptr, ctx);
+
+  ASSERT_TRUE(memory.configure_process_rss_limit(0));
+  ASSERT_EQ(0, reader.read(requests, ctx));
+  EXPECT_EQ(0, std::memcmp(output.get(), source.data(), page_size));
+}
+
 TEST(DiskAnnFileReaderTest, BufferPoolWithoutPageTableUsesBypassOnly) {
   namespace ailego = zvec::ailego;
   TemporaryFile file;
@@ -288,7 +328,7 @@ TEST(DiskAnnFileReaderTest, BufferPoolWithoutPageTableUsesBypassOnly) {
               ailego::kVectorPageSize);
   ASSERT_TRUE(file.write_all(source.data(), source.size()));
   file.close();
-  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(memory_pool.init(1), 0);
   auto pool = std::make_shared<ailego::VecBufferPool>(file.path(), false);
 
@@ -357,7 +397,7 @@ TEST(DiskAnnFileReaderTest, BufferPoolRejectsUnalignedRequestsAfterOpen) {
   std::vector<uint8_t> source(2 * ailego::kVectorPageSize, 0x5a);
   ASSERT_TRUE(file.write_all(source.data(), source.size()));
   file.close();
-  auto &memory_pool = ailego::MemoryLimitPool::get_instance();
+  auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(
       memory_pool.init(16 * ailego::kVectorPageSize +
                        ailego::VecBufferPool::metadata_bytes_for_page_count(2)),
@@ -370,10 +410,12 @@ TEST(DiskAnnFileReaderTest, BufferPoolRejectsUnalignedRequestsAfterOpen) {
   ASSERT_NE(output, nullptr);
 
   IOContext ctx{};
-  std::vector<AlignedRead> bad_offset{{1, sector_size, output.get()}};
+  std::vector<AlignedRead> bad_offset{{0, sector_size, output.get()}};
+  bad_offset.front().offset = 1;
   EXPECT_EQ(reader.read(bad_offset, ctx), IndexError_InvalidArgument);
   EXPECT_EQ(ctx, nullptr);
-  std::vector<AlignedRead> bad_length{{0, sector_size - 1, output.get()}};
+  std::vector<AlignedRead> bad_length{{0, sector_size, output.get()}};
+  bad_length.front().len = sector_size - 1;
   EXPECT_EQ(reader.read(bad_length, ctx), IndexError_InvalidArgument);
   EXPECT_EQ(ctx, nullptr);
 

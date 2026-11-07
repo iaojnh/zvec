@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_holder.h>
 #include "stable_vector_holder.h"
@@ -30,7 +31,7 @@ class OwnedVectorHolder final : public IndexHolder, public StableVectorHolder {
  public:
   using Pointer = std::shared_ptr<OwnedVectorHolder>;
 
-  static int CopyFrom(const IndexHolder::Pointer &source, Pointer *output) {
+  static int CopyFrom(const IndexHolder::Pointer &source, Pointer *output) try {
     if (!source || !output || source->element_size() == 0) {
       return IndexError_InvalidArgument;
     }
@@ -61,6 +62,8 @@ class OwnedVectorHolder final : public IndexHolder, public StableVectorHolder {
     if (storage.keys.size() != count) return IndexError_Mismatch;
     *output = std::move(snapshot);
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   size_t count() const override {
@@ -89,8 +92,8 @@ class OwnedVectorHolder final : public IndexHolder, public StableVectorHolder {
 
  private:
   struct Storage {
-    std::string values;
-    std::vector<uint64_t> keys;
+    ailego::BudgetedString values;
+    ailego::BudgetedVector<uint64_t> keys;
   };
 
   class Iterator : public IndexHolder::Iterator {

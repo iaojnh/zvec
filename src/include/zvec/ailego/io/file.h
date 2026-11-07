@@ -174,6 +174,7 @@ class ZVEC_AILEGO_API File {
 
   //! Unmap a mapping region
   static void MemoryUnmap(void *addr, size_t len);
+  static bool TryMemoryUnmap(void *addr, size_t len);
 
   //! Synchronize a memory map
   static bool MemoryFlush(void *addr, size_t len);

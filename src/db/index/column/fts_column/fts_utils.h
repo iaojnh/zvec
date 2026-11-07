@@ -16,9 +16,34 @@
 
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <string>
+#include <utility>
+#include <zvec/db/status.h>
+
+namespace rocksdb {
+class Status;
+}
 
 namespace zvec::fts {
+
+Status FtsReadFailure(const rocksdb::Status &status, const char *operation);
+
+// The iterator interface returns scores and booleans directly. Preserve the
+// read status until the owning search returns it to the query engine.
+class FtsReadError final : public std::exception {
+ public:
+  explicit FtsReadError(Status status) : status_(std::move(status)) {}
+  const char *what() const noexcept override {
+    return status_.c_str();
+  }
+  const Status &status() const noexcept {
+    return status_;
+  }
+
+ private:
+  Status status_;
+};
 
 // Big-endian uint32 encoding/decoding.
 inline uint32_t decode_uint32_big_endian(const char *data) {

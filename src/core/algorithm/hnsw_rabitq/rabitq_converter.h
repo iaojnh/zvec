@@ -16,6 +16,7 @@
 #include <memory>
 #include <vector>
 #include <rabitqlib/core/rotator.hpp>
+#include "utility/paged_build_buffer.h"
 #include "zvec/core/framework/index_cluster.h"
 #include "zvec/core/framework/index_converter.h"
 #include "zvec/core/framework/index_reformer.h"
@@ -58,6 +59,7 @@ class RabitqConverter : public IndexConverter {
 
   //! Dump centroids and config into storage
   int dump(const IndexDumper::Pointer &dumper) override;
+  int training_storage(IndexStorage::Pointer *storage);
 
   //! Retrieve statistics
   const Stats &stats() const override {
@@ -94,9 +96,9 @@ class RabitqConverter : public IndexConverter {
   size_t padded_dim_{0};
 
   // Original centroids: num_clusters * dimension (for LinearSeeker query)
-  std::vector<float> centroids_;
+  PagedBuildBuffer centroids_;
   // Rotated centroids: num_clusters * padded_dim (for quantization)
-  std::vector<float> rotated_centroids_;
+  PagedBuildBuffer rotated_centroids_;
 
   // Rotator for vector transformation
   rabitqlib::RotatorType rotator_type_{rabitqlib::RotatorType::FhtKacRotator};

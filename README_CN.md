@@ -84,6 +84,8 @@ Python 需 64 位 Python 3.10–3.14；Java 需 Java 8+。
 
 **Linux · macOS · Windows · Android · iOS**
 
+Android/iOS 的内存预算配置与宿主压力通知接入见[移动端内存说明](docs/mobile-memory.md)。
+
 Zvec 提供全平台支持，覆盖服务器、桌面和移动设备。<br>
 如需了解更多细节，请查阅[平台支持文档](https://zvec.org/zh/docs/db/platforms/)。
 

@@ -21,6 +21,7 @@
 #include <parquet/arrow/writer.h>
 #include "db/index/common/index_filter.h"
 #include "forward_writer.h"
+#include "parquet_write_batch.h"
 
 namespace zvec {
 
@@ -49,6 +50,7 @@ class ParquetWriter : public ForwardWriter {
 
   std::shared_ptr<arrow::io::FileOutputStream> outfile_;
   std::unique_ptr<parquet::arrow::FileWriter> writer_;
+  detail::ParquetBatchWriter batch_writer_;
   bool finalized_ = false;
 };
 

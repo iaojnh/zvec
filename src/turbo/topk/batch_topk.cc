@@ -281,27 +281,27 @@ void BatchTopK::reset_impl(size_t k, float threshold, bool strict,
     throw std::length_error("BatchTopK allocation size overflow");
   if (small) {
     if (capacity > kInlineCapacity && capacity > allocated_aos_capacity_) {
-      allocated_entries_.reset(new Candidate[capacity]);
+      allocated_entries_.resize(capacity);
       allocated_aos_capacity_ = capacity;
     }
     entries_ = capacity <= kInlineCapacity ? inline_entries_.data()
-                                           : allocated_entries_.get();
+                                           : allocated_entries_.data();
   } else {
     if (capacity > kInlineCapacity && capacity > allocated_soa_capacity_) {
-      std::unique_ptr<float[]> distances(new float[capacity]);
-      std::unique_ptr<uint64_t[]> ids(new uint64_t[capacity]);
-      std::unique_ptr<uint32_t[]> masks(new uint32_t[capacity / 32]);
+      ailego::BudgetedVector<float> distances(capacity);
+      ailego::BudgetedVector<uint64_t> ids(capacity);
+      ailego::BudgetedVector<uint32_t> masks(capacity / 32);
       allocated_distances_ = std::move(distances);
       allocated_ids_ = std::move(ids);
       allocated_masks_ = std::move(masks);
       allocated_soa_capacity_ = capacity;
     }
     distances_ = capacity <= kInlineCapacity ? inline_distances_.data()
-                                             : allocated_distances_.get();
-    ids_ =
-        capacity <= kInlineCapacity ? inline_ids_.data() : allocated_ids_.get();
+                                             : allocated_distances_.data();
+    ids_ = capacity <= kInlineCapacity ? inline_ids_.data()
+                                       : allocated_ids_.data();
     masks_ = capacity <= kInlineCapacity ? inline_masks_.data()
-                                         : allocated_masks_.get();
+                                         : allocated_masks_.data();
   }
   capacity_ = capacity;
   limit_ = k;

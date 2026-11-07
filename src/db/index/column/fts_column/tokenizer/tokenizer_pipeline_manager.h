@@ -58,7 +58,8 @@ class TokenizerPipelineManager
    * \param params  FTS index parameters
    * \return        Shared pipeline pointer, or nullptr on failure
    */
-  TokenizerPipelinePtr acquire(const FtsIndexParams &params);
+  TokenizerPipelinePtr acquire(const FtsIndexParams &params,
+                               Status *status = nullptr);
 
   /*!
    * Release a previously acquired pipeline identified by its FtsIndexParams.

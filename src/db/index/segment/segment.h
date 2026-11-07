@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -64,6 +65,11 @@ class Segment {
   virtual SegmentID id() const = 0;
 
   virtual SegmentMeta::Ptr meta() const = 0;
+
+  virtual bool uses_buffer_storage() const {
+    return false;
+  }
+  arrow::MemoryPool *query_memory_pool() const;
 
   // Doc-id bounds for routing, read under the shared segment lock. Concurrent
   // callers must use this instead of min/max_doc_id() off meta(), which
@@ -166,6 +172,21 @@ class Segment {
                          const std::optional<std::vector<std::string>>
                              &output_fields = std::nullopt,
                          bool include_vector = true) = 0;
+
+  // Bound intermediate forward tables independently of the caller's PK count.
+  static constexpr size_t kMaxFetchBatchSize = 256;
+
+  virtual std::vector<Doc::Ptr> fetch_docs(
+      const std::vector<uint64_t> &g_doc_ids,
+      const std::optional<std::vector<std::string>> &output_fields,
+      bool include_vector) {
+    std::vector<Doc::Ptr> docs;
+    docs.reserve(g_doc_ids.size());
+    for (uint64_t doc_id : g_doc_ids) {
+      docs.push_back(fetch(doc_id, output_fields, include_vector));
+    }
+    return docs;
+  }
 
   virtual TablePtr fetch(const std::vector<std::string> &columns,
                          const std::vector<int> &segment_doc_ids) const = 0;

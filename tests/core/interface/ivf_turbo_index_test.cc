@@ -19,8 +19,10 @@
 #include <map>
 #include <random>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
 #include <turbo/quantizer/quantizer.h>
@@ -31,6 +33,7 @@
 #include "algorithm/ivf/ivf_builder.h"
 #include "algorithm/ivf/ivf_searcher.h"
 #include "tests/test_util.h"
+#include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core_interface {
 namespace {
@@ -446,6 +449,11 @@ using PqCase = std::tuple<int, bool, MetricType, bool>;
 class IVFPqTest : public testing::TestWithParam<PqCase> {
  protected:
   void SetUp() override {
+    auto &pool = ailego::PoolPayloadBudget::get_instance();
+    previous_capacity_ = pool.capacity();
+    ASSERT_EQ(0u, pool.used());
+    ASSERT_EQ(0, pool.init(64UL << 20));
+
     path_ = std::string("ivf_pq_") +
             testing::UnitTest::GetInstance()->current_test_info()->name();
     std::replace(path_.begin(), path_.end(), '/', '_');
@@ -457,6 +465,10 @@ class IVFPqTest : public testing::TestWithParam<PqCase> {
     }
   }
   void TearDown() override {
+    auto &pool = ailego::PoolPayloadBudget::get_instance();
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous_capacity_));
+
     for (const auto &suffix : {"", ".fine", ".merge"})
       test_util::RemoveTestFiles(path_ + suffix);
   }
@@ -507,6 +519,7 @@ class IVFPqTest : public testing::TestWithParam<PqCase> {
       EXPECT_FLOAT_EQ(entry.second, found->second);
     }
   }
+  size_t previous_capacity_{0};
   std::string path_;
   std::vector<std::vector<float>> vectors_;
 };
@@ -536,9 +549,15 @@ TEST_P(IVFPqTest, ScoresPersistenceCandidatesAndRefinement) {
   // The merged internal-ID API must preserve PQ/OPQ/FastScan score semantics.
   std::vector<int64_t> internal_ids(kPqCount);
   std::vector<float> internal_scores(kPqCount);
-  ASSERT_EQ(0,
-            index->search_internal_ids(query, query_param, internal_ids.data(),
-                                       internal_scores.data()));
+  // Candidate scratch is retained by the calling thread and remains charged
+  // until that thread exits. Use a worker so each case can restore its pool.
+  int internal_status = core::IndexError_Runtime;
+  std::thread worker([&] {
+    internal_status = index->search_internal_ids(
+        query, query_param, internal_ids.data(), internal_scores.data());
+  });
+  worker.join();
+  ASSERT_EQ(0, internal_status);
   for (size_t i = 0; i < all.doc_list_.size(); ++i) {
     EXPECT_EQ(all.doc_list_[i].key(), static_cast<uint64_t>(internal_ids[i]));
     EXPECT_FLOAT_EQ(all.doc_list_[i].score(), internal_scores[i]);
@@ -726,6 +745,15 @@ INSTANTIATE_TEST_SUITE_P(
                      testing::Bool()));
 
 TEST(IVFPqStorage, PackedBlocksAcrossPages) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+
   const std::string path = "ivf_pq_cross_page.index";
   struct Cleanup {
     std::string path;

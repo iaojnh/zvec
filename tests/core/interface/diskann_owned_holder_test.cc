@@ -26,6 +26,30 @@
 namespace zvec::core_interface {
 namespace {
 
+TEST(DiskAnnOwnedHolder, DirectAddCacheRetainsStableVectorsWithoutCopying) {
+  auto cache = std::make_shared<DocCacheHolder::Cache>();
+  std::vector<float> data(16, 3.0F);
+  cache->emplace_back(
+      42U, ailego::BudgetedString(reinterpret_cast<const char *>(data.data()),
+                                  data.size() * sizeof(float)));
+  auto holder = std::make_shared<DocCacheHolder>(
+      core::IndexQueryMeta(core::IndexMeta::DT_FP32, 16), cache);
+  std::shared_ptr<const void> lifetime;
+  ASSERT_EQ(0, holder->retain_stable_data(&lifetime));
+  auto iter = holder->create_iterator();
+  ASSERT_TRUE(iter->is_valid());
+  const void *values = iter->data();
+  EXPECT_EQ(cache->front().second.data(), values);
+  std::weak_ptr<DocCacheHolder::Cache> weak = cache;
+  cache.reset();
+  holder.reset();
+  iter.reset();
+  EXPECT_FALSE(weak.expired());
+  EXPECT_EQ(0, std::memcmp(values, data.data(), data.size() * sizeof(float)));
+  lifetime.reset();
+  EXPECT_TRUE(weak.expired());
+}
+
 TEST(DiskAnnOwnedHolder, OwnedVectorsSurviveCacheHolderAndIteratorRelease) {
   constexpr size_t kDimension = 16;
   std::vector<std::pair<uint64_t, std::string>> cache;

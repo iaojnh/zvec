@@ -55,6 +55,12 @@ class InvertedSearchResult
 
   explicit InvertedSearchResult(roaring_bitmap_t *bitmap) : bitmap_(bitmap) {}
 
+  // The query acquires this allowance before decoding postings. Keep it on
+  // the result itself so iterators and filters also retain the budget.
+  void keep_memory(std::shared_ptr<void> owner) {
+    memory_owner_ = std::move(owner);
+  }
+
 
   ~InvertedSearchResult() override {
     destroy_bitmap();
@@ -196,6 +202,7 @@ class InvertedSearchResult
 
 
  private:
+  std::shared_ptr<void> memory_owner_;
   roaring_bitmap_t *bitmap_{nullptr};
 };
 

@@ -14,6 +14,7 @@
 #pragma once
 
 #include <utility>
+#include <zvec/ailego/buffer/budgeted_heap.h>
 #include <zvec/core/framework/index_framework.h>
 
 namespace zvec {
@@ -27,13 +28,17 @@ constexpr diskann_id_t kInvalidId = static_cast<diskann_id_t>(-1);
 constexpr diskann_key_t kInvalidKey = static_cast<diskann_key_t>(-1);
 
 struct VectorInfo {
+  using Payload = IndexDocument::VectorPayload;
   float dist_;
-  std::string vec_;
+  std::shared_ptr<Payload> vec_;
 
   VectorInfo() = default;
-  VectorInfo(float dist, const std::string &vec) : dist_{dist}, vec_{vec} {}
-  VectorInfo(float dist, std::string &&vec)
-      : dist_{dist}, vec_{std::move(vec)} {}
+  VectorInfo(float dist) : dist_{dist} {}
+  VectorInfo(float dist, const void *src, size_t size) : dist_{dist} {
+    if (src)
+      vec_ = std::allocate_shared<Payload>(ailego::BudgetedAllocator<Payload>{},
+                                           src, size);
+  }
 };
 
 /*! Key Value Vecotr Heap Comparer
@@ -51,8 +56,12 @@ struct KeyValueVectorHeapComparer {
 
 /*! Key Value Vector Heap
  */
-using TopkHeap = ailego::Heap<std::pair<diskann_id_t, VectorInfo>,
-                              KeyValueVectorHeapComparer>;
+using TopkHeap = ailego::BudgetedHeap<std::pair<diskann_id_t, VectorInfo>,
+                                      KeyValueVectorHeapComparer>;
+
+inline bool AcceptsCandidate(const TopkHeap &heap, float distance) {
+  return !heap.full() || distance < heap.front().second.dist_;
+}
 
 struct DiskAnnMetaHeader {
  public:
@@ -153,13 +162,71 @@ class DiskAnnEntity {
     return nullptr;
   }
 
+  //! Keep paged or temporary vector data alive for the caller's whole read.
+  //! Legacy entities expose stable storage and need no owning handle.
+  virtual int read_vector(diskann_id_t id,
+                          IndexStorage::MemoryBlock &block) const {
+    block = IndexStorage::MemoryBlock();
+    const void *vector = get_vector(id);
+    if (vector == nullptr) {
+      return IndexError_ReadData;
+    }
+    block =
+        IndexStorage::MemoryBlock::MakeBorrowedView(const_cast<void *>(vector));
+    return 0;
+  }
+
+  // A bounded neighbor batch. All returned handles remain valid together;
+  // failure releases every handle, including those filled before the error.
+  static constexpr size_t kVectorReadBatchSize = 32;
+  virtual bool prefer_vector_batch() const {
+    return false;
+  }
+  virtual int read_vectors(const diskann_id_t *ids,
+                           IndexStorage::MemoryBlock *blocks,
+                           size_t count) const {
+    if (count == 0) return 0;
+    if (!ids || !blocks || count > kVectorReadBatchSize)
+      return IndexError_InvalidArgument;
+    for (size_t i = 0; i < count; ++i) blocks[i].reset();
+    for (size_t i = 0; i < count; ++i) {
+      const int ret = read_vector(ids[i], blocks[i]);
+      if (ret != 0) {
+        for (size_t j = 0; j < count; ++j) blocks[j].reset();
+        return ret;
+      }
+    }
+    return 0;
+  }
+
   virtual std::pair<uint32_t, const diskann_id_t *> get_neighbors(
       diskann_id_t /*id*/) const {
     return std::make_pair(0, nullptr);
   }
 
+  //! Snapshot adjacency before releasing a page or changing another node.
+  virtual int read_neighbors(
+      diskann_id_t id, ailego::BudgetedVector<diskann_id_t> *neighbors) const
+      try {
+    if (neighbors == nullptr) {
+      return IndexError_InvalidArgument;
+    }
+    neighbors->clear();
+    const auto view = get_neighbors(id);
+    if (view.first != 0) {
+      if (view.second == nullptr) {
+        return IndexError_ReadData;
+      }
+      neighbors->assign(view.second, view.second + view.first);
+    }
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  }
+
   virtual int set_neighbors(
-      diskann_id_t /*id*/, const std::vector<diskann_id_t> & /*neighbor_ids*/) {
+      diskann_id_t /*id*/,
+      const ailego::BudgetedVector<diskann_id_t> & /*neighbor_ids*/) {
     return IndexError_NotImplemented;
   }
 
@@ -172,6 +239,18 @@ class DiskAnnEntity {
 
   //! Get primary key of the node id
   virtual diskann_key_t get_key(diskann_id_t id) const = 0;
+
+  // Checked accessors distinguish pageable-metadata I/O errors from a miss.
+  virtual int read_key(diskann_id_t id, diskann_key_t *key) const {
+    if (!key || id >= doc_cnt()) return IndexError_InvalidArgument;
+    *key = get_key(id);
+    return 0;
+  }
+  virtual int find_id(diskann_key_t key, diskann_id_t *id) const {
+    if (!id) return IndexError_InvalidArgument;
+    *id = get_id(key);
+    return 0;
+  }
 
  public:
   uint64_t max_node_size() const {

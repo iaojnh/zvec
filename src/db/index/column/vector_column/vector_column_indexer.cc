@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "vector_column_indexer.h"
 #include <zvec/ailego/pattern/expected.hpp>
+#include <zvec/core/framework/index_error.h>
 #include <zvec/core/interface/index_factory.h>
 #include <zvec/db/status.h>
 #include "engine_helper.hpp"
@@ -155,9 +156,14 @@ Result<vector_column_params::VectorDataBuffer> VectorColumnIndexer::fetch(
 
   auto vector_data_buffer = core_interface::VectorDataBuffer();
 
-  if (0 != index->fetch(doc_id, &vector_data_buffer)) {
+  const int fetch_error = index->fetch(doc_id, &vector_data_buffer);
+  if (fetch_error != 0) {
     return tl::make_unexpected(
-        Status::InternalError("Failed to fetch vector from index"));
+        Status(fetch_error == core::IndexError_NoMemory
+                   ? StatusCode::RESOURCE_EXHAUSTED
+                   : StatusCode::INTERNAL_ERROR,
+               std::string("Failed to fetch vector from index: ") +
+                   core::IndexError::What(fetch_error)));
   }
   return ProximaEngineHelper::move_from_engine_vector_buffer(
              std::move(vector_data_buffer), is_sparse_)
@@ -185,17 +191,23 @@ Result<IndexResults::Ptr> VectorColumnIndexer::search(
     LOG_ERROR("bf_pks size > 1 is not supported");
     return tl::make_unexpected(
         Status::InvalidArgument("bf_pks size > 1 is not supported"));
+  } else if (query_params.bf_pks_view) {
+    engine_query_param->borrowed_bf_pks = query_params.bf_pks_view;
   } else if (query_params.bf_pks.size() == 1) {
-    auto &bf_pks = query_params.bf_pks[0];
-    engine_query_param->bf_pks =
-        std::make_shared<std::vector<uint64_t>>(std::move(bf_pks));
+    engine_query_param->borrowed_bf_pks = &query_params.bf_pks[0];
   } else {
     engine_query_param->bf_pks = nullptr;
   }
-  if (0 != index->search(engine_vector_data.value(),
-                         std::move(engine_query_param), &search_result)) {
+  const int search_error =
+      index->search(engine_vector_data.value(), std::move(engine_query_param),
+                    &search_result);
+  if (search_error != 0) {
     return tl::make_unexpected(
-        Status::InternalError("Failed to search vector"));
+        Status(search_error == core::IndexError_NoMemory
+                   ? StatusCode::RESOURCE_EXHAUSTED
+                   : StatusCode::INTERNAL_ERROR,
+               std::string("Failed to search vector: ") +
+                   core::IndexError::What(search_error)));
   }
 
   // Return grouped results when group_by is active
@@ -203,14 +215,16 @@ Result<IndexResults::Ptr> VectorColumnIndexer::search(
     auto result = std::make_shared<GroupVectorIndexResults>(
         std::move(search_result.group_doc_list_),
         std::move(search_result.group_reverted_vector_list_),
-        std::move(search_result.group_reverted_sparse_values_list_));
+        std::move(search_result.group_reverted_sparse_values_list_),
+        search_result.take_reverted_memory());
     return result;
   }
 
   auto result = std::make_shared<VectorIndexResults>(
       is_sparse_, std::move(search_result.doc_list_),
       std::move(search_result.reverted_vector_list_),
-      std::move(search_result.reverted_sparse_values_list_));
+      std::move(search_result.reverted_sparse_values_list_),
+      search_result.take_reverted_memory());
   return result;
 }
 

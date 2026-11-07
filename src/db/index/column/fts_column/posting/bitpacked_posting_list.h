@@ -16,7 +16,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include "bitpacked_simd_dispatch.h"
 #include "../bm25_scorer.h"
 
@@ -72,6 +74,19 @@ class BitPackedPostingList {
                             const uint32_t *doc_lens, size_t count, uint64_t df,
                             const BM25Scorer &scorer);
 
+  // Reader fills at most DOCS_PER_BLOCK entries. It is replayed twice, in
+  // ascending block order: first to size the result, then to encode it. Input
+  // must remain stable; failures throw and no partial result is published.
+  using BlockReader =
+      std::function<void(size_t, size_t, uint32_t *, uint32_t *, uint32_t *)>;
+  struct EncodedPosting {
+    ailego::MemoryReservation reservation;
+    std::string data;
+  };
+  static EncodedPosting encode_blocks(size_t count, uint64_t df,
+                                      const BM25Scorer &scorer,
+                                      const BlockReader &reader);
+
   /// Check if raw data starts with the BitPacked magic number.
   static bool is_bitpacked_format(const char *data, size_t size) {
     if (size < sizeof(uint32_t)) return false;
@@ -108,6 +123,12 @@ class BitPackedPostingList {
   static size_t simd_packed_byte_size(uint8_t bitwidth) {
     return static_cast<size_t>(bitwidth) * 16;
   }
+
+ private:
+  static std::string encode_impl(size_t count, uint64_t df,
+                                 const BM25Scorer &scorer,
+                                 const BlockReader &reader,
+                                 ailego::MemoryReservation *reservation);
 };
 
 // ============================================================

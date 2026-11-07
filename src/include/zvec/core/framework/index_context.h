@@ -13,9 +13,9 @@
 // limitations under the License.
 
 #pragma once
-
 #include <memory>
 #include <string>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_document.h>
 #include <zvec/core/framework/index_error.h>
@@ -271,6 +271,11 @@ class IndexContext {
   }
 
   //! Retrieve reusable storage for a transformed query.
+  std::string *mutable_features(size_t bytes) {
+    ailego::ReserveStringCapacity(features_, features_memory_, bytes);
+    return &features_;
+  }
+
   std::string *mutable_features() {
     return &features_;
   }
@@ -333,6 +338,7 @@ class IndexContext {
   bool threshold_set_{false};
   bool threshold_uses_quantizer_{false};
   std::weak_ptr<turbo::Quantizer> index_quantizer_{};
+  ailego::MemoryReservation features_memory_;
   std::string features_{};
 
   Profiler profiler_{};

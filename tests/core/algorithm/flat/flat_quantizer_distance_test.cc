@@ -13,10 +13,12 @@
 // limitations under the License.
 #include <cmath>
 #include <set>
+#include <thread>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_factory.h>
 #include "flat/flat_distance_matrix.h"
 #include "quantizer/distance_quantizer.h"
+#include "tests/ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
 using namespace zvec::core;
@@ -102,6 +104,47 @@ TEST(FlatQuantizerDistance, Fp16Matrices) {
   for (const auto *name : {"SquaredEuclidean", "InnerProduct", "Cosine"}) {
     CheckMatrices<ailego::Float16>(IndexMeta::DT_FP16, name);
   }
+}
+
+TEST(FlatQuantizerDistance,
+     RetainedScratchRejectsGrowthAndRefundsAtThreadExit) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  const size_t baseline = pool.external_used();
+  std::thread worker([&] {
+    IndexMeta meta(IndexMeta::DT_FP32, 128);
+    meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+    auto quantizer = CreateDistanceQuantizer(meta);
+    ASSERT_NE(nullptr, quantizer);
+    std::vector<float> columns(64 * 128, 1.0f), query(128, 0.0f), scores(64);
+    const size_t before = pool.external_used();
+    auto search = [&](size_t rows) {
+      QuantizedFlatMatrixDistance<float>(*quantizer, columns.data(),
+                                         query.data(), rows, 1, scores.data());
+    };
+    search(32);
+    const size_t retained = pool.external_used();
+    EXPECT_GE(retained - before,
+              (32 * 128 + 128) * sizeof(float) + 32 * sizeof(void *));
+    search(32);
+    EXPECT_EQ(retained, pool.external_used());
+    {
+      ailego::MemoryReservation pressure;
+      pressure.add(pool.capacity() - pool.used() - 1);
+      const size_t blocked = pool.external_used();
+      EXPECT_THROW(search(64), std::bad_alloc);
+      EXPECT_EQ(blocked, pool.external_used());
+      EXPECT_NO_THROW(search(32));  // Reuse requires no new admission.
+      EXPECT_THROW(search(SIZE_MAX), std::bad_alloc);
+    }
+    EXPECT_NO_THROW(search(64));
+    EXPECT_GT(pool.external_used(), retained);
+    for (float score : scores) EXPECT_FLOAT_EQ(128.0f, score);
+  });
+  worker.join();
+  EXPECT_EQ(baseline, pool.external_used());
+  EXPECT_EQ(0, pool.init(previous));
 }
 TEST(FlatQuantizerDistance, UnsupportedRepresentationRetainsLegacyPath) {
   IndexMeta meta;

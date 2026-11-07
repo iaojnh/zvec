@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <zvec/ailego/utility/file_helper.h>
@@ -50,6 +51,16 @@ namespace ailego {
 namespace {
 
 thread_local std::error_code g_last_fs_error;
+
+struct TemporaryDirectoryState {
+  std::mutex mutex;
+  fs::path path;
+};
+
+TemporaryDirectoryState &TemporaryDirectory() {
+  static TemporaryDirectoryState state;
+  return state;
+}
 
 void ClearFsError() {
   g_last_fs_error.clear();
@@ -323,6 +334,53 @@ bool FileHelper::GetWorkingDirectory(std::string *path) {
   }
   *path = PathToUtf8(cwd);
   return !path->empty();
+}
+
+bool FileHelper::SetTemporaryDirectory(const std::string &path) {
+  ClearFsError();
+  fs::path resolved;
+  if (!path.empty()) {
+    if (path.find('\0') != std::string::npos) {
+      SetFsError(std::make_error_code(std::errc::invalid_argument));
+      return false;
+    }
+    std::error_code error;
+    resolved = fs::canonical(PathFromUtf8(path), error);
+    if (!error && !fs::is_directory(resolved, error) && !error)
+      error = std::make_error_code(std::errc::not_a_directory);
+    if (error) {
+      SetFsError(error);
+      return false;
+    }
+  }
+  auto &state = TemporaryDirectory();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.path = std::move(resolved);
+  return true;
+}
+
+bool FileHelper::GetTemporaryDirectory(std::string *path) {
+  ClearFsError();
+  if (!path) {
+    SetFsError(std::make_error_code(std::errc::invalid_argument));
+    return false;
+  }
+  fs::path directory;
+  {
+    auto &state = TemporaryDirectory();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    directory = state.path;
+  }
+  std::error_code error;
+  if (directory.empty()) directory = fs::temp_directory_path(error);
+  if (!error && !fs::is_directory(directory, error) && !error)
+    error = std::make_error_code(std::errc::not_a_directory);
+  if (error) {
+    SetFsError(error);
+    return false;
+  }
+  *path = PathToUtf8(directory);
+  return true;
 }
 
 bool FileHelper::GetFileSize(const char *path, size_t *psz) {

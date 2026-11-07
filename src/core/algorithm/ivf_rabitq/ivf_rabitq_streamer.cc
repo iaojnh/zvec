@@ -20,6 +20,7 @@
 #include <vector>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/time_helper.h>
+#include "ailego/pattern/defer.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_helper.h"
@@ -81,7 +82,7 @@ int IvfRabitqStreamer::init(const IndexMeta &meta,
 // --------------------------------------------------------------------------
 // open
 // --------------------------------------------------------------------------
-int IvfRabitqStreamer::open(IndexStorage::Pointer storage) {
+int IvfRabitqStreamer::open(IndexStorage::Pointer storage) try {
   if (!storage) {
     LOG_ERROR("Invalid storage");
     return IndexError_InvalidArgument;
@@ -91,6 +92,10 @@ int IvfRabitqStreamer::open(IndexStorage::Pointer storage) {
     return IndexError_NoReady;
   }
 
+  bool loaded = false;
+  AILEGO_DEFER([&] {
+    if (!loaded) unload();
+  });
   int ret = IndexHelper::DeserializeFromStorage(storage.get(), &meta_);
   if (ret != 0) {
     LOG_ERROR("Failed to deserialize meta from storage");
@@ -110,7 +115,10 @@ int IvfRabitqStreamer::open(IndexStorage::Pointer storage) {
   }
 
   state_ = STATE_LOADED;
+  loaded = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 // --------------------------------------------------------------------------
@@ -272,7 +280,11 @@ int IvfRabitqStreamer::search_impl_internal(const void *query,
                                             const IndexQueryMeta &qmeta,
                                             uint32_t count,
                                             Context::Pointer &context,
-                                            bool force_brute_force) const {
+                                            bool force_brute_force) const try {
+  bool completed = false;
+  AILEGO_DEFER([&] {
+    if (!completed && context) context->reset();
+  });
   if (!query) {
     LOG_ERROR("Null query");
     return IndexError_InvalidArgument;
@@ -355,7 +367,7 @@ int IvfRabitqStreamer::search_impl_internal(const void *query,
     }
 
     // Use context heap for online dist-k gated pruning
-    IndexDocumentHeap &heap = ctx->mutable_result_heap();
+    IndexCandidateHeap &heap = ctx->mutable_result_heap();
     heap.clear();
     heap.limit(topk);
     const auto &filter = ctx->filter();
@@ -371,7 +383,7 @@ int IvfRabitqStreamer::search_impl_internal(const void *query,
       if (ret != 0) {
         LOG_ERROR("Failed to prepare for cluster %zu, ret=%d", (size_t)cid,
                   ret);
-        continue;
+        return ret;
       }
 
       // Scan cluster with 1-bit lower-bound pruning before extra-bit boosting
@@ -384,7 +396,7 @@ int IvfRabitqStreamer::search_impl_internal(const void *query,
       }
       if (ret != 0) {
         LOG_ERROR("Failed to search cluster %zu, ret=%d", (size_t)cid, ret);
-        continue;
+        return ret;
       }
 
       scanned += entity_->cluster_meta(cid).vector_count;
@@ -394,12 +406,20 @@ int IvfRabitqStreamer::search_impl_internal(const void *query,
     ctx->topk_to_result(q);
   }
 
+  completed = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 int IvfRabitqStreamer::search_group_by_impl_internal(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context, bool force_brute_force) const {
+    Context::Pointer &context, bool force_brute_force) const try {
+  bool completed = false;
+  AILEGO_DEFER([&] {
+    if (!completed && context) context->reset();
+  });
   if (!query) {
     LOG_ERROR("Null query");
     return IndexError_InvalidArgument;
@@ -464,6 +484,7 @@ int IvfRabitqStreamer::search_group_by_impl_internal(
 
     auto &heaps = ctx->group_topk_heaps();
     heaps.clear();
+    GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
     const auto &filter = ctx->filter();
     uint32_t scanned = 0;
     for (const auto &probe : probe_centroids) {
@@ -475,35 +496,60 @@ int IvfRabitqStreamer::search_group_by_impl_internal(
       if (ret != 0) {
         LOG_ERROR("Failed to prepare for cluster %zu, ret=%d",
                   (size_t)cluster_id, ret);
-        continue;
+        return ret;
       }
 
       if (filter.is_valid()) {
         ret = entity_->search_cluster_group_by(
             cluster_id, query_state, padded_dim, ex_bits, filter,
-            ctx->group_by(), ctx->group_topk(), ctx->threshold(), &heaps);
+            ctx->group_by(), ctx->group_topk(), ctx->threshold(), &groups);
       } else {
         ret = entity_->search_cluster_group_by(
             cluster_id, query_state, padded_dim, ex_bits, ctx->group_by(),
-            ctx->group_topk(), ctx->threshold(), &heaps);
+            ctx->group_topk(), ctx->threshold(), &groups);
       }
       if (ret != 0) {
         LOG_ERROR("Failed to search cluster %zu, ret=%d", (size_t)cluster_id,
                   ret);
-        continue;
+        return ret;
       }
       scanned += entity_->cluster_meta(cluster_id).vector_count;
     }
+    ret = groups.finish_heaps(heaps, ctx->group_topk());
+    if (ret != 0) return ret;
     ctx->topk_to_group_result(q);
   }
+  completed = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 int IvfRabitqStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
-  if (!query || p_keys.size() != count) {
+  if (p_keys.size() != count) return IndexError_InvalidArgument;
+  return search_keys(query, p_keys.data(), qmeta, count, context);
+}
+
+int IvfRabitqStreamer::search_bf_by_keys_impl(const void *query,
+                                              const std::vector<uint64_t> &keys,
+                                              const IndexQueryMeta &qmeta,
+                                              Context::Pointer &context) const {
+  return search_keys(query, &keys, qmeta, 1, context);
+}
+
+int IvfRabitqStreamer::search_keys(const void *query,
+                                   const std::vector<uint64_t> *p_keys,
+                                   const IndexQueryMeta &qmeta, uint32_t count,
+                                   Context::Pointer &context) const try {
+  bool completed = false;
+  AILEGO_DEFER([&] {
+    if (!completed && context) context->reset();
+  });
+  if (!query || (!p_keys && count)) {
     return IndexError_InvalidArgument;
   }
   if (!reformer_ || !reformer_->loaded() || !entity_) {
@@ -543,22 +589,6 @@ int IvfRabitqStreamer::search_bf_by_p_keys_impl(
       return ret;
     }
 
-    std::map<uint32_t, std::vector<uint32_t>> cluster_ids;
-    for (uint64_t key : p_keys[q]) {
-      if (filter.is_valid() && filter(key)) {
-        continue;
-      }
-      const uint32_t id = entity_->key_to_id(key);
-      if (id == std::numeric_limits<uint32_t>::max()) {
-        continue;
-      }
-      const uint32_t cluster_id = entity_->get_cluster_id(id);
-      if (cluster_id == std::numeric_limits<uint32_t>::max()) {
-        continue;
-      }
-      cluster_ids[cluster_id].push_back(id);
-    }
-
     auto &result_heap = ctx->mutable_result_heap();
     if (!has_group_by) {
       result_heap.clear();
@@ -568,40 +598,71 @@ int IvfRabitqStreamer::search_bf_by_p_keys_impl(
       ctx->group_topk_heaps().clear();
     }
 
-    for (const auto &entry : cluster_ids) {
-      const uint32_t cluster_id = entry.first;
-      ret = reformer_->prepare_for_cluster(cluster_id, &query_state);
-      if (ret != 0) {
-        return ret;
-      }
-      IndexDocumentList documents;
-      ret = entity_->compute_distances(cluster_id, entry.second, query_state,
-                                       padded_dim, ex_bits, &documents);
-      if (ret != 0) {
-        return ret;
-      }
-      for (const auto &document : documents) {
-        if (!has_group_by) {
-          result_heap.emplace(document.key(), document.score());
+    GroupCandidateCollector groups(ctx->group_num(), ctx->group_topk());
+    // Bound scratch independently of the total candidate count. Result
+    // heaps persist across batches, including group-by and radius filtering.
+    constexpr size_t kCandidateBatchSize = 4096;
+    for (size_t first = 0; first < p_keys[q].size();) {
+      const size_t last =
+          first + std::min(kCandidateBatchSize, p_keys[q].size() - first);
+      using IdList = ailego::BudgetedVector<uint32_t>;
+      std::map<uint32_t, IdList, std::less<uint32_t>,
+               ailego::BudgetedAllocator<std::pair<const uint32_t, IdList>>>
+          cluster_ids;
+      for (size_t k = first; k < last; ++k) {
+        const uint64_t key = p_keys[q][k];
+        if (filter.is_valid() && filter(key)) {
           continue;
         }
-        const std::string group_id = ctx->group_by()(document.key());
-        auto &heap = ctx->group_topk_heaps()[group_id];
-        if (heap.empty()) {
-          heap.limit(ctx->group_topk());
-          heap.set_threshold(ctx->threshold());
+        uint32_t id = 0;
+        ret = entity_->find_id(key, &id);
+        if (ret != 0) return ret;
+        if (id == std::numeric_limits<uint32_t>::max()) {
+          continue;
         }
-        heap.emplace(document.key(), document.score());
+        const uint32_t cluster_id = entity_->get_cluster_id(id);
+        if (cluster_id == std::numeric_limits<uint32_t>::max()) {
+          continue;
+        }
+        cluster_ids[cluster_id].push_back(id);
       }
+
+      for (auto &entry : cluster_ids) {
+        const uint32_t cluster_id = entry.first;
+        ret = reformer_->prepare_for_cluster(cluster_id, &query_state);
+        if (ret != 0) {
+          return ret;
+        }
+        ret = entity_->compute_distances(
+            cluster_id, entry.second, query_state, padded_dim, ex_bits,
+            [&](uint64_t key, float distance) {
+              if (!has_group_by) {
+                result_heap.emplace(key, distance);
+                return;
+              }
+              const std::string group_id = ctx->group_by()(key);
+              if (distance <= ctx->threshold())
+                groups.add(group_id, key, distance);
+            });
+        if (ret != 0) return ret;
+        if (groups.status() != 0) return groups.status();
+      }
+      first = last;
     }
 
     if (has_group_by) {
+      ret = groups.finish_heaps(ctx->group_topk_heaps(), ctx->group_topk());
+      if (ret != 0) return ret;
       ctx->topk_to_group_result(q);
     } else {
       ctx->topk_to_result(q);
     }
   }
+  completed = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 int IvfRabitqStreamer::unload() {

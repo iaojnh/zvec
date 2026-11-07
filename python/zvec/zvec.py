@@ -99,6 +99,15 @@ def init(
         memory_limit_mb (Optional[int], optional):
             Soft memory cap in MB. Zvec may throttle or fail operations
             approaching this limit.
+            Linux and macOS shared-library builds reserve page-rounded
+            capacity for the product image's loadable segments. This
+            process-lifetime reservation reduces available cache capacity and
+            is not released when a collection closes. A statically linked
+            caller's main executable is excluded. This parameter is still not
+            a hard RSS limit for the entire process. Zvec also samples process
+            RSS and preserves headroom by reclaiming cache and limiting new
+            allocations under pressure. Host allocations and sampling delays
+            can still cause RSS to exceed the target.
             If ``None``, inferred from cgroup memory limit * 0.8 (e.g., in Docker).
             Must be > 0 if provided.
 

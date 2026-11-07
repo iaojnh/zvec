@@ -17,11 +17,13 @@
 #include <memory>
 #include <vector>
 #include <rabitqlib/core/query.hpp>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 namespace zvec::core {
 
 struct HnswRabitqQueryEntity {
-  std::vector<float> rotated_query;
-  std::vector<float> q_to_centroids;
+  ailego::MemoryReservation wrapper_memory;
+  ailego::BudgetedVector<float> rotated_query;
+  ailego::BudgetedVector<float> q_to_centroids;
   std::unique_ptr<rabitqlib::SplitSingleQuery<float>> query_wrapper;
 };
 

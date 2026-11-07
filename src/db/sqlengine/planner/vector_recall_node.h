@@ -30,7 +30,7 @@ class VectorRecallNode : public std::enable_shared_from_this<VectorRecallNode> {
   using Ptr = std::shared_ptr<VectorRecallNode>;
   VectorRecallNode(Segment::Ptr segment, QueryInfo::Ptr query_info,
                    DocFilter::Ptr doc_filter, int batch_size,
-                   bool single_stage_search);
+                   bool single_stage_search, bool rank_only = false);
 
   //! get schema
   std::shared_ptr<arrow::Schema> schema() const {
@@ -61,6 +61,7 @@ class VectorRecallNode : public std::enable_shared_from_this<VectorRecallNode> {
   QueryInfo::Ptr query_info_;
   DocFilter::Ptr doc_filter_;
   int batch_size_;
+  bool rank_only_;
   const std::vector<std::string> &fetched_columns_;
   std::shared_ptr<arrow::Schema> schema_;
 };

@@ -15,7 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <memory>
 #include <turbo/preprocessor/fht_rotator/fht_rotator.h>
 #include "rotator.h"
@@ -51,9 +51,15 @@ class FhtRotator : public Rotator {
  private:
   void init_context(size_t dim);
 
+  turbo::FhtCtx *context() {
+    return reinterpret_cast<turbo::FhtCtx *>(context_.data());
+  }
+  const turbo::FhtCtx *context() const {
+    return reinterpret_cast<const turbo::FhtCtx *>(context_.data());
+  }
+
   // Preserve the legacy flip-only payload while using Turbo's kernel context.
-  std::unique_ptr<turbo::FhtCtx, decltype(&std::free)> context_{nullptr,
-                                                                &std::free};
+  ailego::BudgetedVector<uint8_t> context_{};
   turbo::RotatorKernels kernels_{};
 
   static constexpr size_t kByteLen = 8;

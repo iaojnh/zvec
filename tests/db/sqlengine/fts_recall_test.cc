@@ -17,8 +17,11 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include <rocksdb/utilities/stackable_db.h>
 #include "db/common/file_helper.h"
+#include "db/index/column/fts_column/fts_column_indexer.h"
 #include "db/index/common/version_manager.h"
 #include "db/index/segment/segment.h"
 #include "db/sqlengine/sqlengine.h"
@@ -216,6 +219,36 @@ class FtsRecallTest : public ::testing::Test {
 // ============================================================
 // Basic FTS search tests
 // ============================================================
+
+TEST_F(FtsRecallTest, PositionReadDenialSurfacesAsQueryBudgetError) {
+  struct DenyPositionReads final : rocksdb::StackableDB {
+    using rocksdb::StackableDB::StackableDB;
+
+    void MultiGet(const rocksdb::ReadOptions &, size_t count,
+                  rocksdb::ColumnFamilyHandle **, const rocksdb::Slice *,
+                  rocksdb::PinnableSlice *, rocksdb::Status *statuses,
+                  bool) override {
+      for (size_t i = 0; i < count; ++i)
+        statuses[i] = rocksdb::Status::MemoryLimit("injected position budget");
+    }
+  };
+  auto *ctx = segments_.front()->get_fts_indexer("content")->ctx();
+  const std::string phrase = "\"apple banana\"";
+  {
+    auto original = std::move(ctx->db_);
+    auto restore = ailego::ScopeGuard::Make([&] { ctx->db_ = std::move(original); });
+    auto borrowed = std::shared_ptr<rocksdb::DB>(original.get(), [](auto *) {});
+    ctx->db_ = std::make_unique<DenyPositionReads>(std::move(borrowed));
+    auto denied = fts_search(phrase);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  }
+
+  auto retried = fts_search(phrase);
+  ASSERT_TRUE(retried) << retried.error().message();
+  ASSERT_EQ(1u, retried->size());
+  EXPECT_EQ("pk_0", retried->front()->pk());
+}
 
 // "apple" matches docs 0, 3, 5
 TEST_F(FtsRecallTest, BasicSingleTerm) {

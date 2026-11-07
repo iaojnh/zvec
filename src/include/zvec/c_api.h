@@ -592,18 +592,19 @@ ZVEC_EXPORT zvec_config_data_t *ZVEC_CALL zvec_config_data_create(void);
 ZVEC_EXPORT void ZVEC_CALL zvec_config_data_destroy(zvec_config_data_t *config);
 
 /**
- * @brief Set memory limit in configuration data
+ * @brief Set the process-wide managed cache budget in configuration data
  * @param config Configuration data pointer
- * @param memory_limit_bytes Memory limit in bytes
+ * @param memory_limit_bytes Managed cache budget in bytes; not a hard RSS
+ * limit
  * @return zvec_error_code_t Error code
  */
 ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_config_data_set_memory_limit(
     zvec_config_data_t *config, uint64_t memory_limit_bytes);
 
 /**
- * @brief Get memory limit from configuration data
+ * @brief Get the process-wide managed cache budget from configuration data
  * @param config Configuration data pointer
- * @return uint64_t Memory limit in bytes
+ * @return uint64_t Managed cache budget in bytes
  */
 ZVEC_EXPORT uint64_t ZVEC_CALL
 zvec_config_data_get_memory_limit(const zvec_config_data_t *config);
@@ -720,6 +721,22 @@ zvec_config_data_get_optimize_thread_count(const zvec_config_data_t *config);
 // =============================================================================
 
 /**
+ * @brief Set the UTF-8 scratch directory before initialization. It must exist
+ * and be writable by the host. Empty selects the system default. Android
+ * hosts can pass Context.getCacheDir(). All managed build scratch uses it.
+ */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_config_data_set_temporary_directory(zvec_config_data_t *config,
+                                         const char *directory);
+
+/**
+ * @brief Get the configured scratch directory. The returned string belongs to
+ * config and remains valid until it is changed or config is destroyed.
+ */
+ZVEC_EXPORT const char *ZVEC_CALL
+zvec_config_data_get_temporary_directory(const zvec_config_data_t *config);
+
+/**
  * @brief Initialize ZVec library
  * @param config Configuration data (optional, NULL means using default
  * configuration)
@@ -739,6 +756,22 @@ ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_shutdown(void);
  * @return true if initialized, false otherwise
  */
 ZVEC_EXPORT bool ZVEC_CALL zvec_is_initialized(void);
+
+typedef enum {
+  ZVEC_MEMORY_PRESSURE_NORMAL = 0,
+  ZVEC_MEMORY_PRESSURE_BACKGROUND = 1,
+  ZVEC_MEMORY_PRESSURE_CRITICAL = 2
+} zvec_memory_pressure_t;
+
+/**
+ * @brief Notify the initialized library of host memory pressure, without
+ * waiting for reclamation. BACKGROUND retires unpinned caches; CRITICAL also
+ * blocks new backing. Send NORMAL when the host permits normal operation.
+ * Call from Android lifecycle/onTrimMemory or iOS lifecycle/memory-warning
+ * handlers. The library does not register application callbacks itself.
+ */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_set_memory_pressure(zvec_memory_pressure_t level);
 
 // =============================================================================
 // I/O Backend Introspection
@@ -3188,8 +3221,8 @@ zvec_collection_schema_destroy(zvec_collection_schema_t *schema);
  * @return const char* Collection name string pointer
  *
  * @note Returns a pointer to internal memory. Caller does NOT own the memory
- *       and should NOT free it. The pointer is valid as long as the schema
- *       exists.
+ *       and should NOT free it. The pointer is valid until the schema name is
+ *       changed or the schema is destroyed.
  */
 ZVEC_EXPORT const char *ZVEC_CALL
 zvec_collection_schema_get_name(const zvec_collection_schema_t *schema);
@@ -3618,7 +3651,7 @@ ZVEC_EXPORT zvec_error_code_t ZVEC_CALL zvec_collection_alter_column(
  */
 typedef struct {
   zvec_error_code_t code; /**< Per-document status code */
-  const char *message;    /**< Per-document status message (allocated by API) */
+  const char *message;    /**< Per-document message owned by the result array */
 } zvec_write_result_t;
 
 // =============================================================================
@@ -4302,6 +4335,9 @@ zvec_doc_deserialize(const uint8_t *data, size_t size, zvec_doc_t **doc);
 
 /**
  * @brief Merge two documents
+ *
+ * If the merge exceeds the memory budget, the target is unchanged and
+ * zvec_get_last_error_details reports ZVEC_ERROR_RESOURCE_EXHAUSTED.
  *
  * @param doc Target document object pointer
  * @param other Source document object pointer

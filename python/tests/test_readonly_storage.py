@@ -27,7 +27,9 @@ import zvec
 
 @pytest.fixture(scope="module", autouse=True)
 def initialize():
-    zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2)
+    # Other modules in an xdist worker may already have opened a collection.
+    # Reuse the suite defaults; this module tests file permissions, not RSS.
+    zvec.init()
 
 
 def _schema(kind="flat"):
@@ -149,6 +151,32 @@ def test_header_only_wal_can_be_opened_readonly(tmp_path, enable_mmap):
     )
     _assert_docs(reader, {"a": 1, "b": 2})
     reader.close()
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("enable_mmap", [True, False])
+@pytest.mark.parametrize("damage", ["truncated", "unsupported_version"])
+def test_invalid_wal_header_is_rejected_without_modification(
+    tmp_path, enable_mmap, damage
+):
+    path = tmp_path / "collection"
+    _crash_writer(path, enable_mmap, "flat", "empty")
+    wal = next(path.rglob("*.wal"))
+    header = wal.read_bytes()
+    assert len(header) == 64
+    wal.write_bytes(
+        header[:8]
+        if damage == "truncated"
+        else (1).to_bytes(8, byteorder=sys.byteorder) + header[8:]
+    )
+    before = _snapshot(path)
+    with pytest.raises(
+        (ValueError, RuntimeError), match="Failed to inspect WAL for recovery"
+    ):
+        zvec.open(
+            str(path),
+            zvec.CollectionOption(read_only=True, enable_mmap=enable_mmap),
+        )
     assert _snapshot(path) == before
 
 

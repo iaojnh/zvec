@@ -181,7 +181,7 @@ int FlatSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
                                  const uint32_t *sparse_indices,
                                  const void *sparse_query,
                                  const IndexQueryMeta &qmeta,
-                                 Context::Pointer &context) {
+                                 Context::Pointer &context) try {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to add_impl, open streamer first!");
     (*stats_.mutable_discarded_count())++;
@@ -219,7 +219,7 @@ int FlatSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
   AILEGO_DEFER([&]() { shared_mutex_.unlock_shared(); });
 
   // convert to sparse format and add to entity
-  std::string sparse_query_buffer;
+  ailego::BudgetedString sparse_query_buffer;
   SparseUtility::TransSparseFormat(sparse_count, sparse_indices, sparse_query,
                                    meta_.unit_size(), sparse_query_buffer);
 
@@ -233,6 +233,10 @@ int FlatSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
 
   (*stats_.mutable_added_count())++;
   return 0;
+} catch (const FlatSparseEntity::ReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int FlatSparseStreamer::add_with_id_impl(uint32_t pkey,
@@ -240,7 +244,7 @@ int FlatSparseStreamer::add_with_id_impl(uint32_t pkey,
                                          const uint32_t *sparse_indices,
                                          const void *sparse_query,
                                          const IndexQueryMeta &qmeta,
-                                         Context::Pointer &context) {
+                                         Context::Pointer &context) try {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to add_with_id_impl, open streamer first!");
     (*stats_.mutable_discarded_count())++;
@@ -278,7 +282,7 @@ int FlatSparseStreamer::add_with_id_impl(uint32_t pkey,
   AILEGO_DEFER([&]() { shared_mutex_.unlock_shared(); });
 
   // convert to sparse format and add to entity
-  std::string sparse_query_buffer;
+  ailego::BudgetedString sparse_query_buffer;
   SparseUtility::TransSparseFormat(sparse_count, sparse_indices, sparse_query,
                                    meta_.unit_size(), sparse_query_buffer);
 
@@ -292,6 +296,10 @@ int FlatSparseStreamer::add_with_id_impl(uint32_t pkey,
 
   (*stats_.mutable_added_count())++;
   return 0;
+} catch (const FlatSparseEntity::ReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
@@ -355,36 +363,48 @@ int FlatSparseStreamer::search_bf_by_p_keys_impl(
 }
 
 //! Fetch sparse vector by key
+int FlatSparseStreamer::get_sparse_vector(uint64_t key,
+                                          IndexSparseDocument &result) const {
+  if (state_ != STATE_OPENED) return IndexError_NoReady;
+  return entity_.decode_sparse_vector(key, result);
+}
+
 int FlatSparseStreamer::get_sparse_vector(
     uint64_t key, uint32_t *sparse_count, std::string *sparse_indices_buffer,
-    std::string *sparse_values_buffer) const {
+    std::string *sparse_values_buffer) const try {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to get_sparse_vector, open streamer first!");
     return IndexError_NoReady;
   }
 
-  std::string sparse_data;
+  IndexStorage::MemoryBlock sparse_data;
+  uint32_t sparse_length = 0;
 
-  int ret = entity_.get_sparse_vector_by_key(key, &sparse_data);
+  int ret =
+      entity_.get_sparse_vector_ptr_by_key(key, sparse_data, &sparse_length);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to get sparse vector, key=%zu, ret=%s", (size_t)key,
               IndexError::What(ret));
     return ret;
   }
 
-  SparseUtility::ReverseSparseFormat(sparse_data, sparse_count,
-                                     sparse_indices_buffer,
-                                     sparse_values_buffer, meta_.unit_size());
+  SparseUtility::ReverseSparseFormatToExternal(
+      sparse_data.data(), sparse_count, sparse_indices_buffer,
+      sparse_values_buffer, meta_.unit_size());
 
   return 0;
+} catch (const FlatSparseEntity::ReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int FlatSparseStreamer::do_search(
-    const uint32_t *sparse_count, const uint32_t *sparse_indices,
-    const void *sparse_query, bool with_p_keys,
-    const std::vector<std::vector<uint64_t>> &p_keys,
-    const IndexQueryMeta &qmeta, uint32_t count,
-    ContextPointer &context) const {
+int FlatSparseStreamer::do_search(const uint32_t *sparse_count,
+                                  const uint32_t *sparse_indices,
+                                  const void *sparse_query, bool with_p_keys,
+                                  IndexKeyBatchView p_keys,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  ContextPointer &context) const {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to do_search, open streamer first!");
     return IndexError_NoReady;

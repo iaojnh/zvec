@@ -91,6 +91,12 @@ class IvfRabitqStreamer : public IndexStreamer {
                                const IndexQueryMeta &qmeta, uint32_t count,
                                Context::Pointer &context) const override;
 
+  //! Search a borrowed single-query candidate list.
+  int search_bf_by_keys_impl(const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const override;
+
   //! Fetch vector by key
   const void *get_vector(uint64_t key) const override;
 
@@ -108,6 +114,10 @@ class IvfRabitqStreamer : public IndexStreamer {
   }
 
  private:
+  int search_keys(const void *query, const std::vector<uint64_t> *keys,
+                  const IndexQueryMeta &qmeta, uint32_t count,
+                  Context::Pointer &context) const;
+
   //! Load index from storage
   int load_index(IndexStorage::Pointer storage);
 

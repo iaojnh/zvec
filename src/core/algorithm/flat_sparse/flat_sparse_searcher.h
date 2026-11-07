@@ -101,6 +101,15 @@ class FlatSparseSearcher : public IndexSearcher {
                      Context::Pointer &context) const override;
 
   //! Linear search by primary keys
+  int search_bf_by_keys_impl(uint32_t sparse_count, const uint32_t *indices,
+                             const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &meta,
+                             Context::Pointer &context) const override {
+    return do_search(&sparse_count, indices, query, true,
+                     IndexKeyBatchView(keys), meta, 1, context);
+  }
+
   int search_bf_by_p_keys_impl(const uint32_t sparse_count,
                                const uint32_t *sparse_indices,
                                const void *sparse_query,
@@ -120,6 +129,9 @@ class FlatSparseSearcher : public IndexSearcher {
                                ContextPointer &context) const override;
 
   //! Fetch sparser vector by key
+  int get_sparse_vector(uint64_t key,
+                        IndexSparseDocument &result) const override;
+
   int get_sparse_vector(uint64_t key, uint32_t *sparse_count,
                         std::string *sparse_indices_buffer,
                         std::string *sparse_values_buffer) const override;
@@ -165,9 +177,8 @@ class FlatSparseSearcher : public IndexSearcher {
 
   int do_search(const uint32_t *sparse_count, const uint32_t *sparse_indices,
                 const void *sparse_query, bool with_p_keys,
-                const std::vector<std::vector<uint64_t>> &p_keys,
-                const IndexQueryMeta &qmeta, uint32_t count,
-                ContextPointer &context) const;
+                IndexKeyBatchView p_keys, const IndexQueryMeta &qmeta,
+                uint32_t count, ContextPointer &context) const;
 
  private:
   enum State { STATE_INIT = 0, STATE_INITED = 1, STATE_LOADED = 2 };

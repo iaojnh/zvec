@@ -20,10 +20,13 @@
 #include <limits>
 #include <random>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_threads.h>
+#include "quantizer/common/pq_buffered_training.h"
 
 namespace zvec {
 namespace turbo {
@@ -94,8 +97,13 @@ int PqInt4Quantizer::setup_functions() {
   return 0;
 }
 
-int PqInt4Quantizer::init(const IndexMeta &meta, const ailego::Params &params) {
+int PqInt4Quantizer::init(const IndexMeta &meta,
+                          const ailego::Params &params) try {
   initialized_ = false;
+  ModelVector<ModelVector<const void *>>().swap(centroid_ptrs_cache_);
+  ModelVector<uint8_t>().swap(centroids_);
+  ModelVector<float>().swap(centroid_);
+  ModelVector<float>().swap(dist_table_);
   meta_ = meta;
 
   // Map core IndexMeta::DataType to turbo DataType.
@@ -148,6 +156,8 @@ int PqInt4Quantizer::init(const IndexMeta &meta, const ailego::Params &params) {
   meta_.set_extra_meta_size(extra_meta_size_);
   initialized_ = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,44 +234,61 @@ void PqInt4Quantizer::train_subquantizer(const T *data, size_t num,
   }
 }
 
-int PqInt4Quantizer::train(IndexHolder::Pointer holder) {
+int PqInt4Quantizer::train(IndexHolder::Pointer holder) try {
   if (!holder) {
     return kErrUnsupported;
   }
 
-  size_t num = holder->count();
+  const size_t input_count = holder->count();
   const uint32_t elem_size = element_size();
+  const size_t vec_bytes = static_cast<size_t>(original_dim_) * elem_size;
+  if (!input_count || holder->dimension() != original_dim_ ||
+      holder->element_size() != vec_bytes ||
+      holder->data_type() != (input_data_type_ == DataType::kFp16
+                                  ? IndexMeta::DataType::DT_FP16
+                                  : IndexMeta::DataType::DT_FP32)) {
+    return kErrUnsupported;
+  }
+  const size_t num =
+      std::min(input_count, static_cast<size_t>(kMaxTrainVectors));
+  if (num > std::numeric_limits<size_t>::max() / vec_bytes)
+    return kErrUnsupported;
 
-  // Collect all data into a contiguous byte buffer (original data type).
-  auto iter = holder->create_iterator();
-  std::vector<uint8_t> all_data(num * original_dim_ * elem_size);
-  size_t row = 0;
-  for (; iter->is_valid(); iter->next(), ++row) {
-    std::memcpy(all_data.data() + row * original_dim_ * elem_size, iter->data(),
-                original_dim_ * elem_size);
+  if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+    ModelVector<uint32_t> offsets(num_chunk_ + 1);
+    for (size_t m = 0; m <= num_chunk_; ++m) offsets[m] = m * sub_dim_;
+    const PqBufferedTrainingOptions options{
+        "PqInt4Quantizer",  original_dim_,
+        std::move(offsets), kNumCentroids,
+        kMaxTrainVectors,   kMaxKmeansIters,
+        thread_count_,      markov_chain_length_,
+        epsilon_,           meta_.metric_name() == "Cosine",
+        use_zero_mean_};
+    const auto refresh = [this]() { build_centroid_ptrs_cache(); };
+    const auto reconstruct = [this](const float *rows, size_t count,
+                                    float *out) {
+      double error = 0.0;
+      encode_reconstruct_batch(rows, count, out, &error);
+      return error;
+    };
+    const int ret =
+        input_data_type_ == DataType::kFp16
+            ? TrainPqBuffered<ailego::Float16>(holder, num, options, centroids_,
+                                               centroid_, opq_, refresh,
+                                               reconstruct)
+            : TrainPqBuffered<float>(holder, num, options, centroids_,
+                                     centroid_, opq_, refresh, reconstruct);
+    if (ret != 0) return ret;
+    build_centroid_ptrs_cache();
+    compute_dist_table();
+    return 0;
   }
 
-  // Subsample if the dataset exceeds the training limit (aligned with
-  // faiss/vsag: 256 centroids * 256 max_points_per_centroid ~= 65535).
-  if (num > kMaxTrainVectors) {
-    std::mt19937 rng(42);
-    // Fisher-Yates partial shuffle: randomly place kMaxTrainVectors vectors
-    // at the front of the buffer.
-    for (size_t i = 0; i < kMaxTrainVectors; ++i) {
-      std::uniform_int_distribution<size_t> dist(i, num - 1);
-      size_t j = dist(rng);
-      if (i != j) {
-        // Swap full vectors (dim-sized chunks in bytes).
-        size_t vec_bytes = original_dim_ * elem_size;
-        for (size_t b = 0; b < vec_bytes; ++b) {
-          std::swap(all_data[i * vec_bytes + b], all_data[j * vec_bytes + b]);
-        }
-      }
-    }
-    num = kMaxTrainVectors;
-    all_data.resize(num * original_dim_ * elem_size);
-    all_data.shrink_to_fit();
-  }
+  // Preserve the seeded partial Fisher-Yates sample order without copying
+  // the full corpus before sampling.
+  std::vector<uint8_t> all_data;
+  if (!CollectPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes, &all_data))
+    return kErrUnsupported;
 
   size_t data_stride = original_dim_ * elem_size;
 
@@ -299,7 +326,7 @@ int PqInt4Quantizer::train(IndexHolder::Pointer holder) {
     }
   }
 
-  opq_.train(
+  const int opq_status = opq_.train(
       all_data.data(), num, "PqInt4Quantizer",
       [&](uint32_t max_iters) {
         train_all_chunks(all_data.data(), num, data_stride, max_iters);
@@ -307,7 +334,13 @@ int PqInt4Quantizer::train(IndexHolder::Pointer holder) {
       },
       [this](const float *rotated, size_t count, float *x_hat) {
         return encode_reconstruct_batch(rotated, count, x_hat);
+      },
+      [this](const float *rotated, size_t count, float *x_hat) {
+        double error = 0.0;
+        encode_reconstruct_batch(rotated, count, x_hat, &error);
+        return error;
       });
+  if (opq_status != 0) return opq_status;
 
   train_all_chunks(all_data.data(), num, data_stride, kMaxKmeansIters);
 
@@ -317,9 +350,9 @@ int PqInt4Quantizer::train(IndexHolder::Pointer holder) {
   // Pre-compute SDC dist_table.
   compute_dist_table();
 
-  // Pre-compute sub-centroid norms for the precomputed residual table.
-  compute_sub_centroid_norms();
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 void PqInt4Quantizer::train_all_chunks(const void *data, size_t num,
@@ -362,11 +395,11 @@ void PqInt4Quantizer::train_all_chunks(const void *data, size_t num,
 }
 
 float PqInt4Quantizer::encode_reconstruct_batch(const float *rotated,
-                                                size_t num,
-                                                float *x_hat) const {
+                                                size_t num, float *x_hat,
+                                                double *sum_error) const {
   return pq_reconstruct_batch<kNumCentroids>(
       rotated, num, original_dim_, centroid_ptrs_cache_, l2_batch_fn_,
-      [this](size_t) { return sub_dim_; }, x_hat);
+      [this](size_t) { return sub_dim_; }, x_hat, sum_error);
 }
 
 void PqInt4Quantizer::compute_dist_table() {
@@ -395,18 +428,17 @@ void PqInt4Quantizer::compute_dist_table() {
   }
 }
 
-void PqInt4Quantizer::compute_sub_centroid_norms() {
+void PqInt4Quantizer::compute_sub_centroid_norms(float *norms) const {
   const size_t k = kNumCentroids;
-  sub_centroid_norms_.resize(static_cast<size_t>(num_chunk_) * k);
 
   // ||c_m[j]||^2 = dist(zero, c_m[j]): reuse the L2 batch kernel with a
   // zero query vector instead of hand-rolling a norm loop.
-  std::vector<uint8_t> zero(static_cast<size_t>(sub_dim_) * element_size(), 0);
+  ModelVector<uint8_t> zero(static_cast<size_t>(sub_dim_) * element_size(), 0);
   for (uint32_t m = 0; m < num_chunk_; ++m) {
     const auto &centroid_ptrs = centroid_ptrs_cache_[m];
     // const_cast: see compute_dist_table for rationale.
     l2_batch_fn_(const_cast<const void **>(centroid_ptrs.data()), zero.data(),
-                 k, sub_dim_, sub_centroid_norms_.data() + m * k, nullptr);
+                 k, sub_dim_, norms + m * k, nullptr);
   }
 }
 
@@ -416,7 +448,7 @@ void PqInt4Quantizer::quantize_data(const void *input, void *output) const {
 
   // For Cosine: normalize FIRST (codebook is trained in normalized space);
   // the original norm is stored after the PQ code for dequantize().
-  std::vector<uint8_t> norm_vec_storage;
+  ModelVector<uint8_t> norm_vec_storage;
   float vec_norm = 0.0f;
   const void *vec = input;
 
@@ -439,7 +471,7 @@ void PqInt4Quantizer::quantize_data(const void *input, void *output) const {
   }
 
   // Zero-mean centering: subtract centroid before encoding.
-  std::vector<uint8_t> centered_vec_storage;
+  ModelVector<uint8_t> centered_vec_storage;
   if (use_zero_mean_) {
     centered_vec_storage.resize(original_dim_ * elem_size);
     std::memcpy(centered_vec_storage.data(), vec, original_dim_ * elem_size);
@@ -458,7 +490,7 @@ void PqInt4Quantizer::quantize_data(const void *input, void *output) const {
   }
 
   // OPQ: rotate last, mirroring train().
-  std::vector<float> rotated_vec_storage;
+  ModelVector<float> rotated_vec_storage;
   vec = opq_.apply(vec, &rotated_vec_storage);
 
   // Zero the packed code buffer first: nibble packing ORs codes in, and an
@@ -510,7 +542,7 @@ void PqInt4Quantizer::quantize_query(const void *input, void *output) const {
 
   // For Cosine: normalize FIRST (Cosine uses an L2 LUT on normalized data),
   // consistent with train() / quantize_data().
-  std::vector<uint8_t> norm_query_storage;
+  ModelVector<uint8_t> norm_query_storage;
   const void *query = input;
 
   if (meta_.metric_name() == "Cosine") {
@@ -531,7 +563,7 @@ void PqInt4Quantizer::quantize_query(const void *input, void *output) const {
   }
 
   // Zero-mean centering: subtract centroid before LUT computation.
-  std::vector<uint8_t> centered_query_storage;
+  ModelVector<uint8_t> centered_query_storage;
   if (use_zero_mean_) {
     centered_query_storage.resize(original_dim_ * elem_size);
     std::memcpy(centered_query_storage.data(), query,
@@ -552,7 +584,7 @@ void PqInt4Quantizer::quantize_query(const void *input, void *output) const {
   }
 
   // OPQ: rotate last, as quantize_data() does.
-  std::vector<float> rotated_query_storage;
+  ModelVector<float> rotated_query_storage;
   query = opq_.apply(query, &rotated_query_storage);
 
   // LUT[m][j] = distance(q_m, c_m[j]) via the metric-aware batch_fn_:
@@ -605,7 +637,7 @@ void PqInt4Quantizer::calc_distance_dp_query_batch(const void *const *dp_list,
 float PqInt4Quantizer::calc_distance_dp_query_unquantized(
     const void *dp, const void *query) const {
   // Build LUT on the fly, then use ADC.
-  std::vector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
+  ModelVector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
   quantize_query(query, lut.data());
   float d = 0.0f;
   adc_fn_(reinterpret_cast<const uint8_t *>(dp), lut.data(), num_chunk_, &d);
@@ -615,7 +647,7 @@ float PqInt4Quantizer::calc_distance_dp_query_unquantized(
 void PqInt4Quantizer::calc_distance_dp_query_batch_unquantized(
     const void *const *dp_list, int dp_num, const void *query,
     float *dist_list) const {
-  std::vector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
+  ModelVector<float> lut(static_cast<size_t>(num_chunk_) * kNumCentroids);
   quantize_query(query, lut.data());
   // Use ISA-dispatched batch4 ADC kernel (4-way ILP + SIMD gather).
   // const_cast: see calc_distance_dp_query_batch for rationale.
@@ -662,7 +694,8 @@ int PqInt4Quantizer::quantize(const void *query, const IndexQueryMeta &qmeta,
 
 int PqInt4Quantizer::build_centroid_distance_table(const void *centroids,
                                                    size_t centroid_num,
-                                                   std::string *table) const {
+                                                   std::string *table) const
+    try {
   //! The three-term decomposition below is pure L2 algebra.  IVF forces the
   //! residual meta's metric to L2 on both the build and the restore side, so
   //! any other metric here means that contract was broken.
@@ -676,7 +709,8 @@ int PqInt4Quantizer::build_centroid_distance_table(const void *centroids,
     return kErrUnsupported;
   }
   if (centroids == nullptr || centroid_num == 0 || table == nullptr ||
-      num_chunk_ == 0 || centroids_.empty() || sub_centroid_norms_.empty()) {
+      num_chunk_ == 0 || centroids_.empty() ||
+      centroid_ptrs_cache_.size() != num_chunk_) {
     return kErrInvalidArgument;
   }
 
@@ -684,18 +718,21 @@ int PqInt4Quantizer::build_centroid_distance_table(const void *centroids,
   //! Mimic faiss precomputed_table_max_bytes: refuse oversized tables so
   //! the caller can fall back to the per-list path.
   const size_t kMaxTableBytes = 1ULL << 30;
-  if (centroid_num * row_floats * sizeof(float) > kMaxTableBytes) {
+  if (!row_floats ||
+      centroid_num > kMaxTableBytes / sizeof(float) / row_floats) {
     return kErrUnsupported;
   }
 
+  ModelVector<float> norms(row_floats);
+  compute_sub_centroid_norms(norms.data());
   table->resize(centroid_num * row_floats * sizeof(float));
   float *tab = reinterpret_cast<float *>(&(*table)[0]);
   const uint32_t elem_size = element_size();
 
   auto build_for_type = [&](auto *typed_dummy) {
     using T = std::remove_pointer_t<decltype(typed_dummy)>;
-    std::vector<T> buf(original_dim_);
-    std::vector<float> rotated;
+    ModelVector<T> buf(original_dim_);
+    ModelVector<float> rotated;
     float dists[kNumCentroids];
     const T *src = reinterpret_cast<const T *>(centroids);
     for (size_t i = 0; i < centroid_num; ++i) {
@@ -721,7 +758,7 @@ int PqInt4Quantizer::build_centroid_distance_table(const void *centroids,
         ip_batch_fn_(const_cast<const void **>(centroid_ptrs.data()),
                      buf_bytes + static_cast<size_t>(m) * sub_dim_ * elem_size,
                      kNumCentroids, sub_dim_, dists, nullptr);
-        const float *rn = sub_centroid_norms_.data() + m * kNumCentroids;
+        const float *rn = norms.data() + m * kNumCentroids;
         float *out_m = row + m * kNumCentroids;
         for (uint32_t j = 0; j < kNumCentroids; ++j) {
           out_m[j] = rn[j] - 2.0f * dists[j];
@@ -741,12 +778,14 @@ int PqInt4Quantizer::build_centroid_distance_table(const void *centroids,
       return kErrUnsupported;
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int PqInt4Quantizer::quantize_precomputed_query(const void *query,
                                                 const IndexQueryMeta &qmeta,
                                                 std::string *out,
-                                                IndexQueryMeta *ometa) const {
+                                                IndexQueryMeta *ometa) const try {
   //! Same L2-only contract as build_centroid_distance_table().
   if (meta_.metric_name() != "SquaredEuclidean") {
     return kErrUnsupported;
@@ -778,7 +817,7 @@ int PqInt4Quantizer::quantize_precomputed_query(const void *query,
   //! Preprocessing mirrors quantize_query() so the query lands in the same
   //! space as the codebook: Cosine normalization only (inert on the residual
   //! path, whose metric is intrinsically L2); zero-mean is gated out above.
-  std::vector<uint8_t> norm_query_storage;
+  ModelVector<uint8_t> norm_query_storage;
   const void *prep = query;
   if (meta_.metric_name() == "Cosine") {
     norm_query_storage.resize(original_dim_ * elem_size);
@@ -797,7 +836,7 @@ int PqInt4Quantizer::quantize_precomputed_query(const void *query,
     prep = norm_query_storage.data();
   }
 
-  std::vector<uint8_t> centered_query_storage;
+  ModelVector<uint8_t> centered_query_storage;
   if (use_zero_mean_) {
     centered_query_storage.resize(original_dim_ * elem_size);
     std::memcpy(centered_query_storage.data(), prep, original_dim_ * elem_size);
@@ -818,7 +857,7 @@ int PqInt4Quantizer::quantize_precomputed_query(const void *query,
 
   //! Rotation closes the preprocessing chain here as well, keeping this path
   //! in lockstep with quantize_query().
-  std::vector<float> rotated_query_storage;
+  ModelVector<float> rotated_query_storage;
   prep = opq_.apply(prep, &rotated_query_storage);
 
   //! term3 LUT: -2<q^m, c_m[j]>.  The IP kernel returns the negated inner
@@ -846,6 +885,8 @@ int PqInt4Quantizer::quantize_precomputed_query(const void *query,
   ometa->set_meta(IndexMeta::DataType::DT_FP32, original_dim_,
                   static_cast<uint32_t>(type_), 0);
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int PqInt4Quantizer::merge_query_distance_table(
@@ -871,7 +912,7 @@ int PqInt4Quantizer::merge_query_distance_table(
 }
 
 int PqInt4Quantizer::dequantize(const void *in, const IndexQueryMeta &qmeta,
-                                std::string *out) const {
+                                std::string *out) const try {
   (void)qmeta;
   const uint8_t *code = reinterpret_cast<const uint8_t *>(in);
   size_t byte_size = static_cast<size_t>(original_dim_) * sizeof(float);
@@ -909,7 +950,7 @@ int PqInt4Quantizer::dequantize(const void *in, const IndexQueryMeta &qmeta,
 
   // Undo the rotation first: codes live in the rotated space.
   if (opq_.enabled()) {
-    std::vector<float> rotated(result, result + original_dim_);
+    ModelVector<float> rotated(result, result + original_dim_);
     opq_.rotate_inverse(rotated.data(), result);
   }
 
@@ -931,6 +972,8 @@ int PqInt4Quantizer::dequantize(const void *in, const IndexQueryMeta &qmeta,
     }
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 DistanceImpl PqInt4Quantizer::distance(const void *query,
@@ -946,7 +989,8 @@ DistanceImpl PqInt4Quantizer::distance(const void *query,
 
   // The query is already quantized (LUT) by the caller; copy it directly.
   size_t lut_bytes = quantized_query_vector_length();
-  std::string lut_storage(static_cast<const char *>(query), lut_bytes);
+  ailego::BudgetedString lut_storage(static_cast<const char *>(query),
+                                     lut_bytes);
 
   return DistanceImpl(std::move(adc_func), std::move(batch_func),
                       std::move(lut_storage), static_cast<size_t>(num_chunk_));
@@ -966,7 +1010,8 @@ DistanceImpl PqInt4Quantizer::sym_distance(const void *query,
   // The query is a packed PQ code, NOT a LUT: SDC compares two PQ codes via
   // the centroid-to-centroid dist_table_.
   size_t code_bytes = quantized_datapoint_vector_length();
-  std::string code_storage(static_cast<const char *>(query), code_bytes);
+  ailego::BudgetedString code_storage(static_cast<const char *>(query),
+                                      code_bytes);
 
   BatchDistanceFunc batch_func;
   if (batch_sdc_fn_) {
@@ -985,8 +1030,18 @@ DistanceImpl PqInt4Quantizer::sym_distance(const void *query,
 // Serialization
 // ---------------------------------------------------------------------------
 int PqInt4Quantizer::serialize(std::string *out) const {
-  if (!out) return kErrUnsupported;
+  return serialize(out, nullptr);
+}
 
+size_t PqInt4Quantizer::serialized_size() const {
+  return sizeof(QuantizerSerHeader) + sizeof(PqInt4SerPayload) +
+         centroids_.size() +
+         (use_zero_mean_ ? centroid_.size() * sizeof(float) : 0) +
+         opq_.serialized_size();
+}
+
+int PqInt4Quantizer::serialize_to(const SerializationSink &sink) const {
+  if (!sink) return kErrUnsupported;
   QuantizerSerHeader hdr{};
   hdr.magic = kQuantizerMagic;
   hdr.version = kQuantizerSerVersion;
@@ -1004,40 +1059,29 @@ int PqInt4Quantizer::serialize(std::string *out) const {
   payload.input_data_type = static_cast<uint8_t>(input_data_type_);
   payload.rotate_type = opq_.rotate_type();
 
-  // The rotator blob is self-describing (RotatorSerHeader + matrix), so the
-  // payload only needs the type tag to know whether one follows.
-  std::string preprocessor_blob;
-  int opq_ret = opq_.serialize(&preprocessor_blob);
-  if (opq_ret != 0) return opq_ret;
 
-  size_t centroids_bytes = centroids_.size();  // already byte buffer
-  size_t centroid_bytes = use_zero_mean_ ? centroid_.size() * sizeof(float) : 0;
-  hdr.payload_size =
-      static_cast<uint32_t>(sizeof(payload) + centroids_bytes + centroid_bytes +
-                            preprocessor_blob.size());
-
-  out->clear();
-  out->append(reinterpret_cast<const char *>(&hdr), sizeof(hdr));
-  out->append(reinterpret_cast<const char *>(&payload), sizeof(payload));
-  out->append(reinterpret_cast<const char *>(centroids_.data()),
-              centroids_bytes);
-  // Append zero-mean centroid for centering support.
-  if (use_zero_mean_) {
-    out->append(reinterpret_cast<const char *>(centroid_.data()),
-                centroid_bytes);
-  }
-  out->append(preprocessor_blob);
-  // dist_table_ is NOT serialized: it is a build-phase-only derivative of the
-  // codebook (used by SDC), recomputable on demand and unneeded after
-  // deserialization (search uses ADC).
-  return 0;
+  const size_t centroids_bytes = centroids_.size();
+  const size_t centroid_bytes =
+      use_zero_mean_ ? centroid_.size() * sizeof(float) : 0;
+  const uint64_t payload_bytes = uint64_t{sizeof(payload)} + centroids_bytes +
+                                 centroid_bytes + opq_.serialized_size();
+  if (payload_bytes > std::numeric_limits<uint32_t>::max())
+    return kErrUnsupported;
+  hdr.payload_size = static_cast<uint32_t>(payload_bytes);
+  int ret = sink(&hdr, sizeof(hdr));
+  if (ret == 0) ret = sink(&payload, sizeof(payload));
+  if (ret == 0) ret = WriteSerialized(sink, centroids_.data(), centroids_bytes);
+  if (ret == 0 && centroid_bytes)
+    ret = WriteSerialized(sink, centroid_.data(), centroid_bytes);
+  if (ret == 0) ret = opq_.serialize_to(sink);
+  return ret;
 }
 
 int PqInt4Quantizer::deserialize(std::string &in) {
   return deserialize(in.data(), in.size());
 }
 
-int PqInt4Quantizer::deserialize(const void *data, size_t len) {
+int PqInt4Quantizer::deserialize(const void *data, size_t len) try {
   if (!initialized_) return kErrUnsupported;
   if (len < sizeof(QuantizerSerHeader) + sizeof(PqInt4SerPayload)) {
     return kErrUnsupported;
@@ -1083,6 +1127,7 @@ int PqInt4Quantizer::deserialize(const void *data, size_t len) {
   }
 
   // Restore centroids (raw bytes in original data type).
+  initialized_ = false;
   size_t centroids_bytes = static_cast<size_t>(num_chunk_) * kNumCentroids *
                            sub_dim_ * element_size();
   size_t centroid_bytes =
@@ -1127,10 +1172,10 @@ int PqInt4Quantizer::deserialize(const void *data, size_t len) {
   // Pre-build centroid pointer cache for fast encode/search.
   build_centroid_ptrs_cache();
 
-  // Pre-compute sub-centroid norms for the precomputed residual table.
-  compute_sub_centroid_norms();
-
+  initialized_ = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_QUANTIZER(PqInt4Quantizer);

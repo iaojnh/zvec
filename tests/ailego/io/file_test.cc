@@ -14,8 +14,10 @@
 
 #include <cstring>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/io/file.h>
 #if defined(_WIN64) || defined(_WIN32)
 #include <Windows.h>
@@ -24,9 +26,24 @@
 #endif
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #endif
 
 using namespace zvec::ailego;
+
+#if defined(MAP_POPULATE)
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static bool configure_rss(MemoryLimitPool &pool, size_t limit) {
+    return pool.process_rss_.configure(limit, +[] { return kSample; });
+  }
+  static size_t rss_available(MemoryLimitPool &pool) {
+    return pool.process_rss_.available();
+  }
+  static constexpr size_t kSample = 32 * 1024 * 1024;
+};
+}  // namespace zvec::ailego
+#endif
 
 namespace {
 
@@ -335,6 +352,14 @@ TEST(File, MemoryMap) {
 #endif
 }
 
+TEST(File, CheckedAnonymousUnmap) {
+  const size_t page = MemoryHelper::PageSize();
+  EXPECT_FALSE(File::TryMemoryUnmap(nullptr, page));
+  void *mapping = File::MemoryMap(page, 0);
+  ASSERT_NE(nullptr, mapping);
+  EXPECT_TRUE(File::TryMemoryUnmap(mapping, page));
+}
+
 TEST(File, Append) {
   const char *file_path = "file_append_testing.tmp";
   File file;
@@ -383,6 +408,51 @@ TEST(File, Seek) {
   EXPECT_EQ((ssize_t)file.size(), file.offset());
   file.close();
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST(File, EagerMappingKeepsPagesLazyUnderCriticalPressure) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t page = pool.page_buffer_size();
+  pool.set_memory_pressure(ProcessRssBudget::PressureLevel::kCritical);
+  const auto restore = ScopeGuard::Make([&] {
+    pool.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  });
+
+  void *mapping = File::MemoryMap(2 * page, File::MMAP_POPULATE);
+  ASSERT_NE(nullptr, mapping);
+  const auto unmap = ScopeGuard::Make(
+      [&] { EXPECT_TRUE(File::TryMemoryUnmap(mapping, 2 * page)); });
+  unsigned char resident[2]{};
+  File::MemoryWarmup(static_cast<char *>(mapping) + page - 1, 2);
+  EXPECT_FALSE(File::MemoryLock(mapping, 2 * page));
+  ASSERT_EQ(0, ::mincore(mapping, 2 * page, resident));
+  EXPECT_EQ(0, resident[0] & 1);
+  EXPECT_EQ(0, resident[1] & 1);
+
+  pool.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  auto *bytes = static_cast<char *>(mapping);
+  bytes[0] = 'a';
+  bytes[page] = 'b';
+  EXPECT_EQ('a', bytes[0]);
+  EXPECT_EQ('b', bytes[page]);
+}
+#endif
+
+#if defined(MAP_POPULATE)
+TEST(File, FailedPopulationLeavesHeadroomForAnotherMapping) {
+  using Peer = MemoryLimitPoolTestPeer;
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t page = pool.page_buffer_size();
+  ASSERT_TRUE(Peer::configure_rss(pool, Peer::kSample + 2 * page));
+  const auto restore = ScopeGuard::Make([&] {
+    EXPECT_TRUE(Peer::configure_rss(pool, 0));
+  });
+  EXPECT_EQ(nullptr, File::MemoryMap(File::InvalidHandle, 0, 2 * page,
+                                    File::MMAP_POPULATE));
+  EXPECT_EQ(EBADF, errno);
+  EXPECT_EQ(2 * page, Peer::rss_available(pool));
+}
+#endif
 
 TEST(File, MemoryWarmup) {
   // Test with null address - should not crash

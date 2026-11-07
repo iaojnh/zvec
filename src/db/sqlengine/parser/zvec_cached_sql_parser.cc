@@ -15,6 +15,7 @@
 #include "zvec_cached_sql_parser.h"
 #include <exception>
 #include <typeinfo>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include "atn/ParserATNSimulator.h"
@@ -33,14 +34,92 @@ using namespace atn;
 
 namespace zvec::sqlengine {
 
+namespace {
+// Parser caches are optional and configuration-sized, not corpus storage.
+// Cap each input and reserve an AST/key allowance. This is deliberately a
+// planning estimate, not an allocator-level bound for the parser itself.
+constexpr size_t kMaxCachedSqlBytes = 32 * 1024;
+template <typename T>
+std::shared_ptr<T> admit_cached_tree(std::shared_ptr<T> tree, size_t bytes) {
+  if (bytes > kMaxCachedSqlBytes) return nullptr;
+  struct Owner {
+    ailego::MemoryReservation memory;
+    std::shared_ptr<T> tree;
+  };
+  try {
+    auto owner = std::make_shared<Owner>();
+    owner->memory.add(4096 + bytes * 128);
+    owner->tree = std::move(tree);
+    auto *value = owner->tree.get();
+    return std::shared_ptr<T>(std::move(owner), value);
+  } catch (const std::bad_alloc &) {
+    // A cache miss must not change query results or fail a valid query.
+    return nullptr;
+  }
+}
+}  // namespace
+
 std::unordered_map<std::string, SQLInfo::Ptr>
     ZVecCachedSQLParser::sql_info_map_{};
 std::unordered_map<std::string, Node::Ptr> ZVecCachedSQLParser::filter_map_;
-uint32_t ZVecCachedSQLParser::hit{0};
-uint32_t ZVecCachedSQLParser::miss{0};
+std::atomic<uint32_t> ZVecCachedSQLParser::hit{0};
+std::atomic<uint32_t> ZVecCachedSQLParser::miss{0};
+
+// Optional parser caches participate in the same pressure eviction as pages.
+// Trees already returned to callers keep their allowance through aliasing
+// shared ownership, even after the cache drops its reference.
+class ZVecCachedSQLParser::CacheReclaimer : public ailego::EvictableBlockOwner {
+ public:
+  CacheReclaimer() {
+    ailego::BlockEvictionQueue::get_instance().set_valid(this);
+  }
+  ~CacheReclaimer() override {
+    ailego::BlockEvictionQueue::get_instance().set_invalid(this);
+  }
+  bool is_dead_block(size_t, size_t version) override {
+    std::shared_lock guard(shared_mutex_);
+    return version != generation_ ||
+           (sql_info_map_.empty() && filter_map_.empty());
+  }
+  bool evict_block(size_t) override {
+    std::unique_lock guard(shared_mutex_);
+    queued_ = false;
+    const auto before = ailego::MemoryLimitPool::get_instance().external_used();
+    sql_info_map_.clear();
+    filter_map_.clear();
+    return ailego::MemoryLimitPool::get_instance().external_used() < before;
+  }
+  size_t recover_eviction_queue() override {
+    std::unique_lock guard(shared_mutex_);
+    return enqueue_locked() ? 1 : 0;
+  }
+  void eviction_requeue_failed(size_t, size_t version) override {
+    std::unique_lock guard(shared_mutex_);
+    if (generation_ == version) queued_ = false;
+  }
+  bool enqueue_locked() {
+    if (queued_ || (sql_info_map_.empty() && filter_map_.empty())) return false;
+    auto &queue = ailego::BlockEvictionQueue::get_instance();
+    generation_ = queue.next_version();
+    queued_ = queue.add_single_block({0, generation_, this}, 0);
+    return queued_;
+  }
+
+ private:
+  size_t generation_{0};
+  bool queued_{false};
+};
+
+ZVecCachedSQLParser::CacheReclaimer &ZVecCachedSQLParser::cache_reclaimer() {
+  // Constructed after the static maps; unregisters before their destruction.
+  static CacheReclaimer reclaimer;
+  return reclaimer;
+}
 
 ZVecCachedSQLParser::ZVecCachedSQLParser(uint32_t cache_count)
-    : cache_count_(cache_count) {}
+    : cache_count_(cache_count) {
+  cache_reclaimer();
+}
 
 ZVecCachedSQLParser::~ZVecCachedSQLParser() = default;
 
@@ -59,7 +138,13 @@ SQLInfo::Ptr ZVecCachedSQLParser::parse(const std::string &query,
     return nullptr;
   }
 
-  put_into_cache(query_cache_key, new_sql_info);
+  if (cache_count_ && !query_cache_key.empty()) {
+    auto cached = admit_cached_tree(new_sql_info, query.size());
+    if (cached) {
+      put_into_cache(query_cache_key, cached);
+      return cached;
+    }
+  }
 
   return new_sql_info;
 }
@@ -74,6 +159,7 @@ void ZVecCachedSQLParser::put_into_cache(const std::string &query_cache_key,
       hit = miss = 0;
     }
     sql_info_map_.emplace(query_cache_key, new_sql_info);
+    cache_reclaimer().enqueue_locked();
   }
 
   LOG_DEBUG("cache emplaced. [%s] [%s] ", query_cache_key.c_str(),
@@ -84,6 +170,7 @@ void ZVecCachedSQLParser::put_into_cache(const std::string &query_cache_key,
 
 SQLInfo::Ptr ZVecCachedSQLParser::get_from_cache(const std::string &query,
                                                  std::string *query_cache_key) {
+  if (!cache_count_ || query.size() > kMaxCachedSqlBytes) return nullptr;
   // find [ and ], must only one occurrence.
   std::string::size_type left_pos, right_pos;
   left_pos = query.find("[");
@@ -207,7 +294,7 @@ int ZVecCachedSQLParser::traverse_to_replace(Node::Ptr ptr,
 
 Node::Ptr ZVecCachedSQLParser::parse_filter(const std::string &filter,
                                             bool need_formatted_tree) {
-  {
+  if (cache_count_ && filter.size() <= kMaxCachedSqlBytes) {
     std::shared_lock guard(shared_mutex_);
     auto iter = filter_map_.find(filter);
     if (iter != filter_map_.end()) {
@@ -219,14 +306,18 @@ Node::Ptr ZVecCachedSQLParser::parse_filter(const std::string &filter,
   auto node = real_parser_.parse_filter(filter, need_formatted_tree);
   err_msg_ = real_parser_.err_msg();
   formatted_tree_ = real_parser_.formatted_tree();
-  if (node != nullptr) {
+  auto cached =
+      cache_count_ && node ? admit_cached_tree(node, filter.size()) : nullptr;
+  if (cached != nullptr) {
     std::unique_lock guard(shared_mutex_);
     if (filter_map_.size() >= cache_count_) {
       // clear cache if full
       filter_map_.clear();
       hit = miss = 0;
     }
-    filter_map_.emplace(filter, node);
+    filter_map_.emplace(filter, cached);
+    cache_reclaimer().enqueue_locked();
+    return cached;
   }
   return node;
 }
