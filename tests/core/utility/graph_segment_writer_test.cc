@@ -90,7 +90,7 @@ TEST(GraphSegmentWriterTest,
     EXPECT_EQ(0, pool.init(old));
   });
   const size_t budget =
-      2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      2 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
       // One generation tile plus the three merge-sort tiles coexist. Reserve
       // their capacity, a bounded I/O window per file (including alignment
       // scratch), mapping headers and allocator/control-block overhead.

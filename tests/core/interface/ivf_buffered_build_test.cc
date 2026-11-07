@@ -55,7 +55,7 @@ class IVFBufferedBuildTest : public ::testing::Test {
     capacity_ = pool.capacity();
     ASSERT_EQ(pool.used(), 0u);
     writable_metadata_ =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+        ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
     // Two scratch stores may coexist with a writable Flat source. The data
     // headroom is smaller than either FP32 matrix, without starving metadata.
     ASSERT_EQ(pool.init(3 * writable_metadata_ + 128 * 1024), 0);

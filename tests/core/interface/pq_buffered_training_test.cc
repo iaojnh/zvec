@@ -91,7 +91,7 @@ class PqBufferedTrainingTest : public ::testing::Test {
         std::string reference;
         ASSERT_EQ(legacy.serialize(&reference), 0);
         const size_t metadata =
-            ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+            ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
         ASSERT_EQ(pool.init((opq ? 2 : 1) * metadata + workspace_bytes), 0);
         Quantizer paged;
         ASSERT_EQ(paged.init(meta, params), 0);
@@ -226,7 +226,7 @@ template <class Quantizer>
 void CheckSampledTraining(bool fail) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t budget =
-      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
       // This test selects 65,536 ordinals. Its mandatory shuffled-ordinal
       // workspace is now charged too, unlike evictable vector sample pages.
       8 * 1024 * 1024;
@@ -357,7 +357,7 @@ TEST_F(PqBufferedTrainingTest, OpqDistinctRowsMatchAcrossPagedTileBoundaries) {
   size_t reference_rounds = 0;
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t budget =
-      2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      2 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
       // Three row tiles, the rotation solver and at least one I/O page must
       // coexist. Each full matrix still exceeds this workspace allowance.
       256 * 1024;
@@ -400,7 +400,7 @@ TEST_F(PqBufferedTrainingTest, UnevenChunksAndRowTilesPreserveDistinctVectors) {
   }
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t metadata =
-      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+      ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
   ASSERT_EQ(pool.init(metadata + kWorkspaceBytes), 0);
   core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
   meta.set_metric("SquaredEuclidean", 0, ailego::Params());

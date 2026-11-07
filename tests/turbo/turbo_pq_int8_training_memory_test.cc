@@ -212,6 +212,13 @@ TEST(PqInt8ModelMemoryTest, BudgetDenialIsReportedAndDoesNotLeak) {
     params.set("num_chunk", 384u);
     EXPECT_EQ(core::IndexError_NoMemory, quantizer.init(meta, params));
     EXPECT_EQ(0u, pool.external_used());
+    ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+    params.set("build_sdc_table", std::string("invalid"));
+    EXPECT_NE(0, quantizer.init(meta, params));
+    EXPECT_EQ(0u, pool.external_used());
+    params.set("build_sdc_table", false);
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    EXPECT_GE(pool.external_used(), 768u * 256 * sizeof(float));
   }
   pool.init(0);
 }
@@ -441,7 +448,7 @@ TEST_P(PqInt8TrainingMemoryTest, PagedSdcMatchesHeapAndHandleOwnsLifetime) {
     // Account for platform-dependent writable metadata (16 KiB macOS pages),
     // but leave fewer resident pages than the 1 MiB SDC table needs.
     const size_t budget =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(256, true) +
+        ailego::PoolPayloadBudget::storage_metadata_bytes(256) +
         32 * ailego::kVectorPageSize;
     ASSERT_EQ(0, pool.init(budget));
     ASSERT_EQ(0, PqTestAccess::compute_dist_table(quantizer));

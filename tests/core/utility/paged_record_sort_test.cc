@@ -27,7 +27,7 @@ TEST(PagedRecordSortTest, KeyMappingHandlesMergeBoundariesAndDuplicateKeys) {
     EXPECT_EQ(pool.init(old), 0);
   });
   const size_t metadata =
-      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+      ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
   // Mapping retains its 64 KiB input tile alongside three sort tiles.
   for (size_t budget : {size_t{0}, 2 * metadata + (128 + 256) * 1024}) {
     ASSERT_EQ(pool.init(budget), 0);
@@ -85,7 +85,7 @@ TEST(PagedRecordSortTest, MergeScratchSharesOnePageTable) {
     EXPECT_EQ(pool.init(old), 0);
   });
   const size_t metadata =
-      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+      ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
   // One page table, 64 KiB for pages, three 64 KiB sort tiles, and headers.
   ASSERT_EQ(pool.init(metadata + (64 + 192 + 8) * 1024), 0);
   for (size_t count : {size_t{0}, size_t{1}, size_t{4096}, size_t{4097},
