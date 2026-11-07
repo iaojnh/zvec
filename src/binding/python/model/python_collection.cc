@@ -47,16 +47,7 @@ void reserve_query_results(const DocPtrList &docs,
                            const CollectionSchema &schema,
                            detail::ResultMemoryAllowance::Lease &lease);
 
-py::capsule result_memory_owner(
-    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
-  using Lease = detail::ResultMemoryAllowance::Lease;
-  auto holder = std::make_unique<std::shared_ptr<Lease>>(memory);
-  py::capsule owner(holder.get(), [](void *p) {
-    delete static_cast<std::shared_ptr<Lease> *>(p);
-  });
-  holder.release();
-  return owner;
-}
+using detail::result_memory_owner;
 
 void retain_result_memory(
     const py::object &result,

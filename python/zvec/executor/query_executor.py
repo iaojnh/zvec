@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+from itertools import islice
 from typing import Optional, Union
 
 import numpy as np
@@ -213,7 +214,13 @@ class QueryExecutor:
         if isinstance(reranker, RrfReRanker):
             multi_query.set_rerank_rrf(reranker.rank_constant)
         elif isinstance(reranker, WeightedReRanker):
-            multi_query.set_rerank_weighted(reranker.weights)
+            # QueryInputMemory covers staging proportional to the routes.
+            # Reject excess weights before handing them to the native caster.
+            count = len(queries)
+            weights = list(islice(reranker.weights, count + 1))
+            if len(weights) != count:
+                raise ValueError("Weighted reranking requires one weight per query")
+            multi_query.set_rerank_weighted(weights)
         elif isinstance(reranker, CallbackReRanker):
             multi_query.set_rerank_callback(reranker._callback)
         return multi_query

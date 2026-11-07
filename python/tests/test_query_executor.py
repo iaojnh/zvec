@@ -252,6 +252,20 @@ class TestQueryExecutor:
         assert core_vector.filter == "f"
         assert core_vector.include_vector is True
 
+    def test_build_multi_query_stops_at_first_excess_weight(self):
+        class ExcessWeights(WeightedReRanker):
+            @property
+            def weights(self):
+                yield 1.0
+                yield 1.0
+                yield 1.0
+                pytest.fail("Weights beyond the route count were consumed")
+
+        executor = QueryExecutor(MockCollectionSchema())
+        ctx = QueryContext(topk=5, reranker=ExcessWeights([]))
+        with pytest.raises(ValueError, match="one weight per query"):
+            executor._build_multi_query(ctx, [_SearchQuery(), _SearchQuery()])
+
     def test_do_merge_rerank_results_single_without_reranker(self):
         # A single result list without a reranker is returned as-is.
         schema = MockCollectionSchema()

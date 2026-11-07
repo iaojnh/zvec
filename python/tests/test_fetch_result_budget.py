@@ -297,6 +297,57 @@ def test_native_doc_state_holds_and_releases_budget(tmp_path):
     run_worker("native_doc_state", path, "VECTOR_FP32", False, 8, 1)
 
 
+def verify_rerank_budget(path, kind, mmap, dimension, count):
+    from zvec._zvec import _Doc, _reranker_rerank, _RrfParams
+    from zvec.extension import RrfReRanker, WeightedReRanker
+
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    field = zvec.VectorSchema(
+        "vector",
+        zvec.DataType.VECTOR_FP32,
+        dimension=8,
+        index_param=zvec.FlatIndexParam(metric_type=zvec.MetricType.IP),
+    )
+    doc = zvec.Doc(id="k" * 1024, fields={"source": "first"})
+    duplicate = zvec.Doc(id=doc.id, fields={"source": "second"})
+    for reranker, fields in (
+        (RrfReRanker(), None),
+        (WeightedReRanker([1.0]), [field]),
+    ):
+        with pytest.raises(MemoryError):
+            reranker.rerank([[doc] * 24_000], topn=1, fields=fields)
+        result = reranker.rerank([[doc, duplicate]], topn=1, fields=fields)[0]
+        assert result.id == doc.id
+        assert result.fields == doc.fields
+        assert doc.score is None
+
+    native = _Doc()
+    native.set_pk("native")
+    native.set_score(0.5)
+    with pytest.raises(MemoryError):
+        _reranker_rerank(_RrfParams(), [[native] * 400_000], (), 1)
+    assert native.score() == 0.5
+    assert _reranker_rerank(_RrfParams(), [[native]], (), 1)[0].pk() == "native"
+
+    reranker = RrfReRanker()
+    wide = zvec.Doc(id="wide", fields={str(i): i for i in range(1024)})
+    held = []
+    for _ in range(96):
+        try:
+            held.append(reranker.rerank([[wide]], topn=1)[0].fields)
+        except MemoryError:
+            break
+    else:
+        pytest.fail("Extracted reranked fields must retain result admission")
+    assert held and held[0] == wide.fields
+    held.clear()
+    assert reranker.rerank([[wide]], topn=1)[0].fields == wide.fields
+
+
+def test_standalone_rerank_admission_and_recovery(tmp_path):
+    run_worker("rerank_budget", tmp_path, "VECTOR_FP32", False, 8, 1)
+
+
 def verify_exception(path, kind, mmap, dimension, count):
     from zvec.model import _budgeted_result
 
@@ -639,6 +690,7 @@ if __name__ == "__main__":
         "native_fields": verify_native_fields,
         "build_native_doc_state": build_native_doc_state,
         "native_doc_state": verify_native_doc_state,
+        "rerank_budget": verify_rerank_budget,
         "exception": verify_exception,
         "inputs": verify_fetch_inputs,
         "iterables": verify_fetch_iterables,

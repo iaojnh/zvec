@@ -14,6 +14,17 @@
 
 namespace zvec::detail {
 
+inline pybind11::capsule result_memory_owner(
+    const std::shared_ptr<ResultMemoryAllowance::Lease> &memory) {
+  using Lease = ResultMemoryAllowance::Lease;
+  auto holder = std::make_unique<std::shared_ptr<Lease>>(memory);
+  pybind11::capsule owner(holder.get(), [](void *p) {
+    delete static_cast<std::shared_ptr<Lease> *>(p);
+  });
+  holder.release();
+  return owner;
+}
+
 inline size_t FetchMemoryBytes(size_t count, size_t width, size_t extra = 0) {
   if (width && count > (std::numeric_limits<size_t>::max() - extra) / width)
     throw std::bad_alloc();

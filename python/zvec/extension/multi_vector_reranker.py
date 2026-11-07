@@ -18,8 +18,7 @@ from typing import TYPE_CHECKING
 
 from zvec._zvec import (
     _CallbackParams,
-    _Doc,
-    _reranker_rerank,
+    _rerank_python_docs,
     _RrfParams,
     _WeightedParams,
 )
@@ -29,39 +28,6 @@ from .rerank_function import RerankFunction
 
 if TYPE_CHECKING:
     from ..model.schema import FieldSchema, VectorSchema
-
-
-def _to_cpp_doc_lists(
-    query_results: list[list[Doc]],
-) -> tuple[list[list], dict[str, Doc]]:
-    """Convert Python Doc lists to C++ _Doc lists for reranker input."""
-    id_to_doc: dict[str, Doc] = {}
-    cpp_results: list[list] = []
-    for query_result in query_results:
-        cpp_list: list = []
-        for doc in query_result:
-            _doc = _Doc()
-            _doc.set_pk(doc.id)
-            _doc.set_score(doc.score if doc.score is not None else 0.0)
-            cpp_list.append(_doc)
-            if doc.id not in id_to_doc:
-                id_to_doc[doc.id] = doc
-        cpp_results.append(cpp_list)
-    return cpp_results, id_to_doc
-
-
-def _from_cpp_docs(cpp_docs: list, id_to_doc: dict[str, Doc]) -> DocList:
-    """Convert C++ rerank result _Doc list back to Python DocList."""
-    results: DocList = []
-    for _doc in cpp_docs:
-        doc_id = _doc.pk()
-        new_score = _doc.score()
-        original = id_to_doc.get(doc_id)
-        if original is not None:
-            results.append(original._replace(score=new_score))
-        else:
-            results.append(Doc(id=doc_id, score=new_score))
-    return results
 
 
 class RrfReRanker(RerankFunction):
@@ -100,9 +66,7 @@ class RrfReRanker(RerankFunction):
         fields: list[FieldSchema | VectorSchema] | None = None,  # noqa: ARG002
     ) -> DocList:
         """Apply RRF to combine multiple query results via C++ reranker."""
-        cpp_results, id_to_doc = _to_cpp_doc_lists(query_results)
-        cpp_docs = _reranker_rerank(self._to_cpp_params(), cpp_results, [], topn)
-        return _from_cpp_docs(cpp_docs, id_to_doc)
+        return _rerank_python_docs(self._to_cpp_params(), query_results, (), topn)
 
 
 class WeightedReRanker(RerankFunction):
@@ -155,12 +119,9 @@ class WeightedReRanker(RerankFunction):
                 "WeightedReRanker.rerank() requires 'fields' for score normalization. "
                 "Pass field schemas via fields= parameter."
             )
-        cpp_fields = [f._get_object() for f in fields]
-        cpp_results, id_to_doc = _to_cpp_doc_lists(query_results)
-        cpp_docs = _reranker_rerank(
-            self._to_cpp_params(), cpp_results, cpp_fields, topn
+        return _rerank_python_docs(
+            self._weights, query_results, (f._get_object() for f in fields), topn
         )
-        return _from_cpp_docs(cpp_docs, id_to_doc)
 
 
 class CallbackReRanker(RerankFunction):
