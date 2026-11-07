@@ -62,6 +62,37 @@ TEST(ProcessRssBudgetTest, NativeLimitCanShrinkAndRecoverBelowConfiguredRss) {
   EXPECT_EQ(88 * kMiB, budget.available());
 }
 
+TEST(ProcessRssBudgetTest, AdmissionResamplesReleasedCallerInputBeforeDenying) {
+  ProcessRssBudget budget;
+  sampled_rss = 128 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  EXPECT_FALSE(budget.try_acquire(kMiB));
+  sampled_rss = 32 * kMiB;
+  ASSERT_TRUE(budget.try_acquire(kMiB));
+  EXPECT_EQ(32 * kMiB, budget.rss());
+  budget.release(kMiB);
+}
+
+TEST(ProcessRssBudgetTest, MaterializationResamplesCompletedCopiesButKeepsPending) {
+  for (const bool reserve : {false, true}) {
+    SCOPED_TRACE(reserve);
+    ProcessRssBudget budget;
+    sampled_rss = 32 * kMiB;
+    ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+    ASSERT_TRUE(budget.try_reserve_materialization(80 * kMiB));
+    EXPECT_FALSE(budget.try_materialize(32 * kMiB));
+    budget.finish_materialization(80 * kMiB, true);
+    // The completed copies may have reused heap pages or been destroyed.
+    // A fresh sample replaces their projection without a timing dependency.
+    if (reserve) {
+      ASSERT_TRUE(budget.try_reserve_materialization(32 * kMiB));
+      budget.finish_materialization(32 * kMiB, false);
+    } else {
+      ASSERT_TRUE(budget.try_materialize(32 * kMiB));
+    }
+  }
+}
+
 TEST(ProcessRssBudgetTest, NativeZeroAndFailedSamplesCannotReplenishBudget) {
   ProcessRssBudget budget;
   sampled_rss = 32 * kMiB;
@@ -668,12 +699,19 @@ TEST(ProcessRssBudgetTest, GrowingAllowanceChargesFullMaterialization) {
 
     ASSERT_TRUE(budget.try_acquire(2 * kMiB, 6 * kMiB));
     EXPECT_EQ(2 * kMiB, budget.available());
+    // A denial now refreshes the observation even within the sample interval.
+    // Keep the completed materialization resident in that observation.
+    sampled_rss += 6 * kMiB;
+    native_sample.footprint += 6 * kMiB;
+    native_sample.available -= 6 * kMiB;
     EXPECT_FALSE(budget.try_acquire(kMiB, 3 * kMiB));
     EXPECT_FALSE(budget.try_materialize(3 * kMiB));
     EXPECT_EQ(2 * kMiB, budget.available());
     ASSERT_TRUE(budget.try_materialize(2 * kMiB));
     budget.release(2 * kMiB);
 
+    sampled_rss = use_native_sample ? 32 * kMiB : limit - 8 * kMiB;
+    native_sample = {limit - 8 * kMiB - reserve, 8 * kMiB + reserve};
     budget.refresh(true);
     EXPECT_EQ(8 * kMiB, budget.available());
   }

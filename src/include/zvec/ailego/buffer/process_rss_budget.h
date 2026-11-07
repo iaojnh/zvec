@@ -245,7 +245,11 @@ class ProcessRssBudget {
   // because optional caches are under BACKGROUND pressure.
   bool materialization_allowed(size_t bytes = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
-    refresh_locked(false);
+    if (bytes) {
+      refresh_for_materialization_locked(bytes);
+    } else {
+      refresh_locked(false);
+    }
     return materialization_allowed_locked(bytes);
   }
 
@@ -253,7 +257,7 @@ class ProcessRssBudget {
   // the corresponding reader supplies its next successful observation.
   bool try_materialize(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
-    refresh_locked(false);
+    refresh_for_materialization_locked(bytes);
     if (!materialization_allowed_locked(bytes)) return false;
     if (limit() && bytes) {
       remember_materialization(bytes);
@@ -320,7 +324,7 @@ class ProcessRssBudget {
   // An intervening sample must not clear a debit for work still in flight.
   bool try_reserve_materialization(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
-    refresh_locked(false);
+    refresh_for_materialization_locked(bytes);
     if (!materialization_allowed_locked(bytes) ||
         bytes > std::numeric_limits<size_t>::max() - pending_materializations_)
       return false;
@@ -492,6 +496,9 @@ class ProcessRssBudget {
   bool try_charge(size_t bytes, size_t &counter, size_t materialization = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
+    if (bytes > available_.load(std::memory_order_relaxed) ||
+        (materialization && !materialization_allowed_locked(materialization)))
+      refresh_after_denial_locked();
     if (materialization && !materialization_allowed_locked(materialization))
       return false;
     const size_t ledger_available =
@@ -505,6 +512,23 @@ class ProcessRssBudget {
     remember_materialization(materialization);
     update_available();
     return true;
+  }
+
+  void refresh_for_materialization_locked(size_t bytes) {
+    refresh_locked(false);
+    if (!materialization_allowed_locked(bytes)) refresh_after_denial_locked();
+  }
+
+  void refresh_after_denial_locked() {
+    // A caller can free a rejected input or completed result and retry within
+    // the normal sampling interval. Before denying that retry, observe its
+    // current RSS instead of retaining a transient peak or copy projection.
+    // Pending allocations/copies remain charged across this observation.
+    // Failed readers keep their sampling backoff, and host critical pressure
+    // cannot be relaxed by an RSS observation.
+    if (!rss_sample_failures_ && !native_sample_failures_ &&
+        external_pressure_ != PressureLevel::kCritical)
+      refresh_locked(true);
   }
 
   void refresh_locked(bool force) {
