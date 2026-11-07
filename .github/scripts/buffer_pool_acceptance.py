@@ -24,6 +24,7 @@ from typing import ClassVar
 
 import numpy as np
 from buffer_pool_metrics import calibration, stability
+from buffer_pool_rss_monitor import ProcessRssMonitor
 
 import zvec
 
@@ -523,7 +524,10 @@ if __name__ == "__main__":
         parser.error("soak requires a writable workload and a nonnegative duration")
     if args.vector_only and not args.read_only:
         parser.error("vector-only is the separate read-only capacity-boundary profile")
-    with args.evidence.open("x") as evidence:
+    with (
+        args.evidence.open("x") as evidence,
+        ProcessRssMonitor(evidence, args.budget_mib * 1024),
+    ):
         run(
             args.index,
             args.collection,

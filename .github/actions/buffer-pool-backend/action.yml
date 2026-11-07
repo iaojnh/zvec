@@ -1,0 +1,49 @@
+name: Buffer Pool backend contracts
+description: Verify the active Linux backend and execute shared native, C and Python paths
+inputs:
+  backend:
+    required: true
+  platform:
+    required: true
+  native-bin:
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Select and verify I/O prerequisites
+      shell: bash
+      env:
+        EXPECTED_BACKEND: ${{ inputs.backend }}
+      run: |
+        set -euo pipefail
+        case "$EXPECTED_BACKEND" in
+          io_uring) ;;
+          libaio)
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends libaio1t64
+            sudo sysctl -w kernel.io_uring_disabled=2
+            ;;
+          pread)
+            sudo sysctl -w kernel.io_uring_disabled=2
+            if dpkg-query -W libaio1t64 >/dev/null 2>&1; then sudo apt-get remove -y libaio1t64; fi
+            if dpkg-query -W libaio1 >/dev/null 2>&1; then sudo apt-get remove -y libaio1; fi
+            ;;
+          *) echo "Unknown backend: $EXPECTED_BACKEND"; exit 1 ;;
+        esac
+    - name: Run shared path contracts
+      shell: bash
+      env:
+        EXPECTED_BACKEND: ${{ inputs.backend }}
+        PLATFORM: ${{ inputs.platform }}
+        NATIVE_BIN: ${{ inputs.native-bin }}
+      run: |
+        python .github/scripts/buffer_pool_backend_tests.py \
+          --backend "$EXPECTED_BACKEND" --platform "$PLATFORM" \
+          --native-bin "$NATIVE_BIN" --evidence "backend-evidence-$EXPECTED_BACKEND"
+    - uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: buffer-pool-backends-${{ inputs.platform }}-${{ inputs.backend }}
+        path: backend-evidence-${{ inputs.backend }}/
+        if-no-files-found: error
+        retention-days: 14

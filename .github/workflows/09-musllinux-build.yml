@@ -118,13 +118,16 @@ jobs:
       - name: Run C++ Tests
         run: |
           cd "$GITHUB_WORKSPACE/build"
-          cmake --build . --target unittest --parallel $NPROC
+          mkdir -p "$GITHUB_WORKSPACE/ci-evidence"
+          ctest --output-on-failure --no-tests=error --parallel "$NPROC" \
+            --output-junit "$GITHUB_WORKSPACE/ci-evidence/native.xml"
         shell: sh
 
       - name: Run Python Tests
         run: |
           cd "$GITHUB_WORKSPACE"
-          python -m pytest python/tests/
+          mkdir -p ci-evidence
+          python -m pytest python/tests/ --junitxml=ci-evidence/python.xml
         shell: sh
 
       - name: Run C++ Examples
@@ -186,6 +189,12 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           python -m pytest python/tests/test_hnsw_contiguous_memory.py -v
         shell: sh
+
+      - name: Preserve native and Python test diagnostics
+        if: always()
+        uses: ./.github/actions/ci-evidence
+        with:
+          name: native-tests-musllinux-x64
 
   # arm64 mirrors the linux-arm64 instance of 03-macos-linux-build.yml: the
   # subproject-integration check and the whole libaio/DiskAnn round are
@@ -277,13 +286,17 @@ jobs:
 
       - name: Run C++ Tests
         run: |
+          mkdir -p ci-evidence
           docker exec -w /work/build "$MUSL_CONTAINER" \
-            cmake --build . --target unittest --parallel "$NPROC"
+            ctest --output-on-failure --no-tests=error --parallel "$NPROC" \
+            --output-junit /work/ci-evidence/native.xml
         shell: bash
 
       - name: Run Python Tests
         run: |
-          docker exec "$MUSL_CONTAINER" python -m pytest python/tests/
+          mkdir -p ci-evidence
+          docker exec "$MUSL_CONTAINER" python -m pytest python/tests/ \
+            --junitxml=/work/ci-evidence/python.xml
         shell: bash
 
       - name: Run C++ Examples
@@ -328,3 +341,9 @@ jobs:
             chown -R "$(id -u):$(id -g)" /work/.ccache || true
           docker rm -f "$MUSL_CONTAINER" || true
         shell: bash
+
+      - name: Preserve native and Python test diagnostics
+        if: always()
+        uses: ./.github/actions/ci-evidence
+        with:
+          name: native-tests-musllinux-arm64

@@ -81,18 +81,13 @@ jobs:
             scikit-build-core setuptools_scm
           python -m pip wheel . --no-deps --no-build-isolation --wheel-dir candidate \
             -C cmake.define.AUTO_DETECT_ARCH=OFF \
-            -C cmake.define.BUILD_C_BINDINGS=OFF \
+            -C cmake.define.BUILD_C_BINDINGS=ON \
             -C cmake.define.BUILD_ZVEC_SHARED=OFF \
             -C cmake.define.BUILD_ZVEC_AILEGO_SHARED=OFF \
             -C cmake.define.BUILD_ZVEC_CORE_SHARED=OFF \
             -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
             -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
-          targets=(process_rss_budget_test pool_admission_test result_memory_allowance_test
-                   retained_block_allocator_test budgeted_mapped_buffer_test
-                   eviction_queue_budget_test slab_backing_budget_test budgeted_aligned_buffer_test
-                   vector_page_table_test vector_page_table_bypass_aio_test
-                   buffer_read_storage_test buffer_storage_write_test
-                   ivf_workspace_budget_test diskann_file_reader_aio_test)
+          read -r -a targets <<< "$(python .github/scripts/buffer_pool_backend_tests.py --print-targets)"
           cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target unittest.build "${targets[@]}"
           python .github/scripts/buffer_pool_native_bundle.py build candidate/native-tests.tar.gz "${targets[@]}"
           git rev-parse HEAD > candidate/commit.txt
@@ -175,7 +170,7 @@ jobs:
       - name: Exercise public API memory denial and recovery
         if: matrix.shard == 'budget'
         run: |
-          python -m pytest -n 0 .github/scripts/test_buffer_pool_ci.py --junitxml=evidence/acceptance-gates.xml
+          python -m pytest -n 0 .github/scripts/test_buffer_pool_ci.py .github/scripts/test_buffer_pool_ci_tools.py --junitxml=evidence/acceptance-gates.xml
           python -m pytest -n 0 python/tests/test_fetch_result_budget.py \
             -k 'large_vector_result_admission_and_recovery or large_query_result_copy_admission_and_recovery or retained_vectors_reject_growth_and_release_for_retry' \
             --junitxml=evidence/public-budget.xml
@@ -194,6 +189,39 @@ jobs:
           name: buffer-pool-evidence-${{ matrix.shard }}
           path: evidence/
           retention-days: 14
+
+  io-backends:
+    name: Linux x64 shared paths (${{ matrix.backend }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [io_uring, libaio, pread]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Verify and install the exact candidate
+        run: |
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          tar -xzf candidate/native-tests.tar.gz -C candidate
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/candidate/lib" >> "$GITHUB_ENV"
+          python -m pip install candidate/*.whl pytest pytest-xdist
+      - uses: ./.github/actions/buffer-pool-backend
+        with:
+          backend: ${{ matrix.backend }}
+          platform: linux-x64
+          native-bin: ${{ github.workspace }}/candidate/bin
 
   public-suite:
     name: Public API mutations, FTS, quantizers and recovery
@@ -280,7 +308,7 @@ jobs:
         run: |
           python -m pip install pybind11==3.0 cmake==3.30.0 ninja==1.11.1 scikit-build-core setuptools_scm
           python -m pip wheel . --no-deps --no-build-isolation --wheel-dir ../baseline \
-            -C cmake.define.AUTO_DETECT_ARCH=OFF -C cmake.define.BUILD_C_BINDINGS=OFF \
+            -C cmake.define.AUTO_DETECT_ARCH=OFF -C cmake.define.BUILD_C_BINDINGS=ON \
             -C cmake.define.BUILD_ZVEC_SHARED=OFF -C cmake.define.BUILD_ZVEC_AILEGO_SHARED=OFF \
             -C cmake.define.BUILD_ZVEC_CORE_SHARED=OFF \
             -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -454,7 +482,7 @@ jobs:
 
   production:
     name: Cohere 1M baseline and candidate (${{ matrix.index }}, ${{ matrix.storage }})
-    needs: [build, baseline-build, linux-scale, soak, external-limit, desktop, windows, android, ios, musllinux]
+    needs: [build, baseline-build, linux-scale, soak, external-limit, desktop, windows, android, ios, musllinux, io-backends]
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     strategy:
@@ -550,7 +578,7 @@ jobs:
   summary:
     name: Acceptance summary
     if: always()
-    needs: [build, acceptance, public-suite, baseline-build, desktop, windows, android, ios, musllinux, linux-scale, soak, external-limit, production]
+    needs: [build, acceptance, public-suite, baseline-build, desktop, windows, android, ios, musllinux, io-backends, linux-scale, soak, external-limit, production]
     runs-on: ubuntu-24.04
     env:
       RESULTS: ${{ toJSON(needs) }}

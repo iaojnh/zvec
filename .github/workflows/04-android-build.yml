@@ -118,7 +118,7 @@ jobs:
           if [ "${{ matrix.abi }}" = "arm64-v8a" ]; then
             echo "Building focused ARM64 index tests and public C++ examples..."
             cmake --build "$BUILD_DIR" \
-              --target diskann_mobile_compat_test diskann_mobile_collection_test \
+              --target mobile_pressure_lifecycle_test diskann_mobile_compat_test diskann_mobile_collection_test \
                 hnsw_rabitq_streamer_test ivf_rabitq_streamer_test zvec_cpp_examples \
               --parallel
             exit 0
@@ -152,7 +152,7 @@ jobs:
             exit 1
           fi
 
-          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+          for required_test in mobile_pressure_lifecycle_test diskann_mobile_compat_test diskann_mobile_collection_test; do
             found=0
             for name in "${TEST_NAMES[@]}"; do
               if [ "$name" = "$required_test" ]; then
@@ -161,7 +161,7 @@ jobs:
               fi
             done
             if [ "$found" -ne 1 ]; then
-              echo "ERROR: Required Android DiskAnn test target was not discovered: $required_test"
+              echo "ERROR: Required Android test target was not discovered: $required_test"
               exit 1
             fi
           done
@@ -169,10 +169,10 @@ jobs:
           echo "Building ${#TEST_NAMES[@]} test executables..."
           ninja -C "$BUILD_DIR" -j$(nproc) "${TEST_NAMES[@]}"
 
-          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+          for required_test in mobile_pressure_lifecycle_test diskann_mobile_compat_test diskann_mobile_collection_test; do
             required_binary="$BUILD_DIR/bin/$required_test"
             if [ ! -x "$required_binary" ]; then
-              echo "ERROR: Missing required Android DiskAnn test binary: $required_binary"
+              echo "ERROR: Missing required Android test binary: $required_binary"
               exit 1
             fi
           done
@@ -331,7 +331,7 @@ jobs:
             exit 1
           fi
 
-          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+          for required_test in mobile_pressure_lifecycle_test diskann_mobile_compat_test diskann_mobile_collection_test; do
             found=0
             for name in "${TEST_NAMES[@]}"; do
               if [ "$name" = "$required_test" ]; then
@@ -340,7 +340,7 @@ jobs:
               fi
             done
             if [ "$found" -ne 1 ]; then
-              echo "ERROR: Required Android DiskAnn test target was not discovered: $required_test"
+              echo "ERROR: Required Android test target was not discovered: $required_test"
               exit 1
             fi
           done
@@ -357,10 +357,10 @@ jobs:
             fi
           done
 
-          for required_test in diskann_mobile_compat_test diskann_mobile_collection_test; do
+          for required_test in mobile_pressure_lifecycle_test diskann_mobile_compat_test diskann_mobile_collection_test; do
             required_binary="$BUILD_DIR/bin/$required_test"
             if [ ! -x "$required_binary" ]; then
-              echo "ERROR: Missing required Android DiskAnn test binary: $required_binary"
+              echo "ERROR: Missing required Android test binary: $required_binary"
               exit 1
             fi
           done
@@ -414,11 +414,16 @@ jobs:
             # Extract exit code from the output
             EXIT_CODE=$(printf '%s\n' "$OUTPUT" | grep -o 'EXIT_CODE=[0-9]*' | tail -1 | cut -d= -f2 || true)
 
+            mkdir -p ci-evidence
+            printf '%s\n' "$OUTPUT" > "ci-evidence/android-$test_name.log"
             # Print test output (without the EXIT_CODE marker)
             echo "$OUTPUT" | grep -v 'EXIT_CODE=' | sed 's/^/  /' || true
 
             EXPECTED_COUNT=""
             case "$test_name" in
+              mobile_pressure_lifecycle_test)
+                EXPECTED_COUNT=3
+                ;;
               diskann_mobile_compat_test)
                 EXPECTED_COUNT=7
                 ;;
@@ -551,6 +556,7 @@ jobs:
           READELF="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
 
           for binary in \
+            mobile_pressure_lifecycle_test \
             diskann_mobile_compat_test \
             diskann_mobile_collection_test \
             ailego-example \
@@ -587,3 +593,10 @@ jobs:
           if [ -n "$EMULATOR_PID" ]; then
             kill "$EMULATOR_PID" 2>/dev/null || true
           fi
+
+      - name: Preserve Android test diagnostics
+        if: always()
+        uses: ./.github/actions/ci-evidence
+        with:
+          build: build_android_${{ matrix.abi }}
+          name: native-tests-android-${{ matrix.abi }}

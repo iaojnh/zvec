@@ -96,6 +96,7 @@ jobs:
       - name: Build from source
         run: |
           cd "$env:GITHUB_WORKSPACE"
+          New-Item -ItemType Directory -Force ci-evidence | Out-Null
           $env:CMAKE_GENERATOR = "Ninja"
           $env:CMAKE_BUILD_PARALLEL_LEVEL = "$env:NPROC"
           python -m pip install -v . `
@@ -103,12 +104,16 @@ jobs:
             --config-settings='cmake.define.BUILD_TOOLS=ON' `
             --config-settings='cmake.define.ENABLE_WERROR=ON' `
             --config-settings='cmake.define.CMAKE_C_COMPILER_LAUNCHER=sccache' `
-            --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache'
+            --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache' `
+            2>&1 | Tee-Object -FilePath ci-evidence/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         shell: powershell
 
       - name: Compile C++ test targets
         run: |
-          cmake --build "$env:GITHUB_WORKSPACE\build" --target unittest.build --config Release --parallel $env:NPROC
+          New-Item -ItemType Directory -Force ci-evidence | Out-Null
+          cmake --build "$env:GITHUB_WORKSPACE\build" --target unittest.build --config Release --parallel $env:NPROC `
+            2>&1 | Tee-Object -FilePath ci-evidence/native-build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "C++ test compilation passed (${{ matrix.platform }})." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
         shell: powershell
@@ -128,7 +133,9 @@ jobs:
       - name: Run C++ Tests
         run: |
           cd "$env:GITHUB_WORKSPACE\build"
-          cmake --build . --target unittest --config Release --parallel $env:NPROC
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/ci-evidence" | Out-Null
+          ctest --output-on-failure --no-tests=error -C Release --parallel $env:NPROC `
+            --output-junit "$env:GITHUB_WORKSPACE/ci-evidence/native.xml"
         shell: powershell
 
       - name: Show sccache statistics after tests
@@ -140,7 +147,8 @@ jobs:
       - name: Run Python Tests
         run: |
           cd "$env:GITHUB_WORKSPACE"
-          python -m pytest python/tests/ --basetemp=./.pytest_tmp
+          New-Item -ItemType Directory -Force ci-evidence | Out-Null
+          python -m pytest python/tests/ --basetemp=./.pytest_tmp --junitxml=ci-evidence/python.xml
         shell: powershell
 
       - name: Run C++ Examples
@@ -198,3 +206,9 @@ jobs:
         continue-on-error: true
         run: sccache --show-stats
         shell: powershell
+
+      - name: Preserve native and Python test diagnostics
+        if: always()
+        uses: ./.github/actions/ci-evidence
+        with:
+          name: native-tests-${{ matrix.platform }}

@@ -16,7 +16,9 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from buffer_pool_backend_tests import BACKENDS, NATIVE_TARGETS, PYTHON_TESTS
 from buffer_pool_metrics import POLICY
+from buffer_pool_rss_monitor import validate_soft_rss
 
 
 def rows(path):
@@ -27,6 +29,16 @@ def rows(path):
     assert any(
         row["phase"] == "calibration" and len(row["controls"]) == 3 for row in values
     ), f"missing calibration: {path}"
+    reference = any(
+        row.get("role") == "baseline" or row.get("storage") == "mmap" for row in values
+    )
+    if not reference:
+        traces = [row for row in values if row["phase"] == "rss_soft_limit"]
+        assert len(traces) == 1, f"missing independent RSS observation: {path}"
+        validate_soft_rss(traces[0])
+        starts = [row for row in values if row["phase"] == "start"]
+        if starts:
+            assert traces[0]["target_rss_kib"] == starts[0]["budget_mib"] * 1024
     return values
 
 
@@ -136,6 +148,36 @@ def native_results(root):
     return verified, unsupported
 
 
+def backend_results(root):
+    verified = []
+    candidate_commit = (
+        (root / "buffer-pool-candidate" / "commit.txt").read_text().strip()
+    )
+    assert candidate_commit, "missing candidate revision"
+    for platform in ("linux-x64", "linux-arm64"):
+        for backend, expected in BACKENDS.items():
+            directory = root / f"buffer-pool-backends-{platform}-{backend}"
+            record = json.loads((directory / "backend.json").read_text())
+            assert record["commit"] == candidate_commit, (
+                "backend evidence is from another revision"
+            )
+            assert record["passed"] and record["actual_backend"] == expected
+            assert (
+                record["expected_backend"] == backend and record["platform"] == platform
+            )
+            assert set(record["native_targets"]) == set(NATIVE_TARGETS)
+            assert set(record["python_tests"]) == set(PYTHON_TESTS)
+            for name in ("native.xml", "python.xml"):
+                cases = list(ET.parse(directory / name).getroot().iter("testcase"))
+                assert cases and any(case.find("skipped") is None for case in cases)
+                assert not any(
+                    case.find("failure") is not None or case.find("error") is not None
+                    for case in cases
+                )
+            verified.append(f"{platform}-{backend}-shared-paths")
+    return verified
+
+
 def summary(root, needs):
     assert set(needs) == set(POLICY["required_stages"]), (
         "a required CI stage was omitted"
@@ -144,6 +186,7 @@ def summary(root, needs):
         "some CI stages failed, skipped or were cancelled"
     )
     verified, unsupported = native_results(root)
+    verified.extend(backend_results(root))
     benchmarks = []
     suite = root / "buffer-pool-public-suite" / "public.xml"
     testcases = list(ET.parse(suite).getroot().iter("testcase"))

@@ -13,6 +13,7 @@ import math
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from time import perf_counter
@@ -21,6 +22,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from buffer_pool_acceptance import sample
 from buffer_pool_metrics import POLICY, calibration
+from buffer_pool_rss_monitor import ProcessRssMonitor
 
 import zvec
 
@@ -401,4 +403,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     with args.evidence.open("x") as evidence:
-        run(args.index, args.storage, args.data, args.collection, evidence, args.role)
+        monitor = (
+            ProcessRssMonitor(evidence, BUDGET_MIB[args.index] * 1024)
+            if args.role == "candidate" and args.storage == "buffer"
+            else nullcontext()
+        )
+        with monitor:
+            run(
+                args.index,
+                args.storage,
+                args.data,
+                args.collection,
+                evidence,
+                args.role,
+            )

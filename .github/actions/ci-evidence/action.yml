@@ -1,0 +1,29 @@
+name: Preserve CI diagnostics
+description: Archive test reports, CTest logs and a bounded environment manifest
+inputs:
+  build:
+    default: build
+  name:
+    required: true
+  extra-logs:
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Collect test diagnostics
+      shell: bash
+      env:
+        BUILD_FOLDER: ${{ inputs.build }}
+        EXTRA_LOGS: ${{ inputs.extra-logs }}
+      run: |
+        args=()
+        if [[ -n "$EXTRA_LOGS" ]]; then args+=(--extra-logs "$EXTRA_LOGS"); fi
+        python .github/scripts/collect_ci_evidence.py \
+          --build "$BUILD_FOLDER" --output ci-evidence "${args[@]}"
+    - uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: ${{ inputs.name }}
+        path: ci-evidence/
+        if-no-files-found: error
+        retention-days: 14

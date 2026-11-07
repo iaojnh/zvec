@@ -1,12 +1,27 @@
 {
-  "schema_version": 1,
-  "required_stages": ["build", "acceptance", "public-suite", "baseline-build", "desktop", "windows", "android", "ios", "musllinux", "linux-scale", "soak", "external-limit", "production"],
+  "schema_version": 2,
+  "required_stages": [
+    "build",
+    "acceptance",
+    "public-suite",
+    "baseline-build",
+    "desktop",
+    "windows",
+    "android",
+    "ios",
+    "musllinux",
+    "linux-scale",
+    "soak",
+    "external-limit",
+    "production",
+    "io-backends"
+  ],
   "baseline_commit": "30d662db4d2467937d843443074b34743bcc9baa",
-  "minimum_qps_ratio": 0.80,
+  "minimum_qps_ratio": 0.8,
   "maximum_p99_ratio": 1.25,
   "maximum_read_bytes_ratio": 1.25,
   "read_bytes_noise_allowance": 1048576,
-  "minimum_recall_at_10": 0.90,
+  "minimum_recall_at_10": 0.9,
   "performance_trials": 3,
   "soak_seconds": 3600,
   "minimum_lifecycle_rounds": 36,
@@ -16,6 +31,12 @@
     "full_memory_and_performance": "Linux glibc x64; synthetic 20K/100K/200K/400K and Cohere Medium 1M; IVF/DiskANN; fixed parameters in the harness; 128/512/1024 MiB capacity matrix returns IDs/scores only, full field/vector lifecycle starts at 512 MiB",
     "desktop_lifecycle": "Linux ARM64, macOS ARM64/x64, Windows x64/ARM64; 20K IVF/DiskANN plus the platform test suites",
     "compatibility_only": "musl x64/ARM64; Android x86_64 emulator/ARM64 compile; iOS ARM64 simulator/device SDK compile",
-    "excluded": "Physical Android/iOS devices, hour-long and million-scale runs outside Linux x64, arbitrary host allocations and request sizes"
-  }
+    "excluded": "Physical Android/iOS devices, hour-long and million-scale runs outside Linux x64, arbitrary host allocations and request sizes",
+    "optional_physical_device": "Manual Android ARM64 / iOS device pressure, denial and recovery; requires provisioned hardware and signing. Injected SDK host-pressure notifications, not OS memory-warning delivery."
+  },
+  "rss_sampling_interval_seconds": 0.1,
+  "maximum_rss_sampling_gap_seconds": 1.0,
+  "maximum_rss_over_target_fraction": 0.01,
+  "maximum_rss_over_target_seconds": 2.0,
+  "maximum_rss_recovery_seconds": 5.0
 }

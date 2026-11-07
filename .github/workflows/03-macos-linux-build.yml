@@ -126,6 +126,8 @@ jobs:
       - name: Build from source
         run: |
           cd "$GITHUB_WORKSPACE"
+          mkdir -p ci-evidence
+          set -o pipefail
 
           CMAKE_GENERATOR="Ninja" \
           CMAKE_BUILD_PARALLEL_LEVEL="$NPROC" \
@@ -135,13 +137,16 @@ jobs:
             --config-settings='cmake.define.ENABLE_WERROR=ON' \
             --config-settings='cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache' \
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache' \
-            ${{ matrix.arch_flag }}
+            ${{ matrix.arch_flag }} 2>&1 | tee ci-evidence/build.log
         shell: bash
 
       - name: Compile C++ test targets
         if: matrix.platform != 'macos-x64'
         run: |
-          cmake --build "$GITHUB_WORKSPACE/build" --target unittest.build --parallel "$NPROC"
+          mkdir -p ci-evidence
+          set -o pipefail
+          cmake --build "$GITHUB_WORKSPACE/build" --target unittest.build --parallel "$NPROC" \
+            2>&1 | tee ci-evidence/native-build.log
           echo "C++ test compilation passed (${{ matrix.platform }})." >> "$GITHUB_STEP_SUMMARY"
         shell: bash
 
@@ -155,7 +160,9 @@ jobs:
         if: matrix.platform != 'macos-x64'
         run: |
           cd "$GITHUB_WORKSPACE/build"
-          cmake --build . --target unittest --parallel $NPROC
+          mkdir -p "$GITHUB_WORKSPACE/ci-evidence"
+          ctest --output-on-failure --no-tests=error --parallel "$NPROC" \
+            --output-junit "$GITHUB_WORKSPACE/ci-evidence/native.xml"
         shell: bash
 
       - name: Run macOS x64 C++ compatibility tests
@@ -180,14 +187,17 @@ jobs:
           ')
           read -r -a targets <<< "$test_targets"
           cmake --build . --target "${targets[@]}" --parallel "$NPROC"
-          ctest --output-on-failure --no-tests=error -R "$test_regex" --parallel 1
+          mkdir -p "$GITHUB_WORKSPACE/ci-evidence"
+          ctest --output-on-failure --no-tests=error -R "$test_regex" --parallel 1 \
+            --output-junit "$GITHUB_WORKSPACE/ci-evidence/native.xml"
         shell: bash
 
       - name: Run Python Tests
         if: matrix.platform != 'macos-x64'
         run: |
           cd "$GITHUB_WORKSPACE"
-          python -m pytest python/tests/
+          mkdir -p ci-evidence
+          python -m pytest python/tests/ --junitxml=ci-evidence/python.xml
         shell: bash
 
       - name: Run macOS x64 Python compatibility smoke test
@@ -274,6 +284,30 @@ jobs:
           "
         shell: bash
 
+      - name: Buffer Pool shared contracts (io_uring)
+        if: runner.os == 'Linux' && inputs.buffer_pool_acceptance
+        uses: ./.github/actions/buffer-pool-backend
+        with:
+          backend: io_uring
+          platform: ${{ inputs.platform }}
+          native-bin: ${{ github.workspace }}/build/bin
+
+      - name: Buffer Pool shared contracts (libaio)
+        if: runner.os == 'Linux' && inputs.buffer_pool_acceptance
+        uses: ./.github/actions/buffer-pool-backend
+        with:
+          backend: libaio
+          platform: ${{ inputs.platform }}
+          native-bin: ${{ github.workspace }}/build/bin
+
+      - name: Buffer Pool shared contracts (pread)
+        if: runner.os == 'Linux' && inputs.buffer_pool_acceptance
+        uses: ./.github/actions/buffer-pool-backend
+        with:
+          backend: pread
+          platform: ${{ inputs.platform }}
+          native-bin: ${{ github.workspace }}/build/bin
+
       # ------------------------------------------------------------------ #
       # DiskAnn libaio round: disable io_uring via sysctl (kernel 6.6+,
       # makes io_uring_setup() fail with -EPERM), install libaio, and
@@ -338,3 +372,9 @@ jobs:
           cd "$GITHUB_WORKSPACE/build"
           ctest -R diskann --output-on-failure --parallel $NPROC
         shell: bash
+
+      - name: Preserve native and Python test diagnostics
+        if: always()
+        uses: ./.github/actions/ci-evidence
+        with:
+          name: native-tests-${{ inputs.platform }}-${{ inputs.os }}-${{ inputs.compiler || 'default' }}

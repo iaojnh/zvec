@@ -12,12 +12,15 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
+from buffer_pool_backend_tests import BACKENDS, NATIVE_TARGETS, PYTHON_TESTS
 from buffer_pool_metrics import POLICY, stability
 from buffer_pool_native_bundle import bundle
 from buffer_pool_report import performance, rows, summary
+from buffer_pool_rss_monitor import ProcessRssMonitor, RssTrace, validate_soft_rss
 from buffer_pool_system_limit import snapshot
 
 
@@ -25,6 +28,13 @@ def write_rows(path, values):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in values))
     return path
+
+
+def soft_rss():
+    trace = RssTrace(128 * 1024)
+    trace.add(0, 64 * 1024)
+    trace.add(1, 64 * 1024)
+    return trace.result(0)
 
 
 def benchmark(qps=100, p99=10, reads=1024**2):
@@ -44,7 +54,12 @@ def benchmark(qps=100, p99=10, reads=1024**2):
                         "read_bytes": reads,
                     }
                 )
-    return [*values, {"phase": "million_mutations_recovered"}, {"phase": "complete"}]
+    return [
+        *values,
+        soft_rss(),
+        {"phase": "million_mutations_recovered"},
+        {"phase": "complete"},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -128,6 +143,7 @@ def test_cgroup_requires_numeric_applied_limits(tmp_path):
 def complete_artifacts(tmp_path):
     complete = [
         {"phase": "calibration", "controls": [{}, {}, {}]},
+        soft_rss(),
         {"phase": "wal_recovered"},
         {"phase": "compaction_verified"},
         {"phase": "complete", "rounds": 36, "elapsed_seconds": POLICY["soak_seconds"]},
@@ -180,6 +196,29 @@ def complete_artifacts(tmp_path):
             directory = tmp_path / f"buffer-pool-evidence-cohere-{index}-{storage}"
             for role in ("baseline", "candidate"):
                 write_rows(directory / f"{role}.jsonl", benchmark())
+    (tmp_path / "buffer-pool-candidate").mkdir()
+    (tmp_path / "buffer-pool-candidate" / "commit.txt").write_text("test-revision")
+    for platform in ("linux-x64", "linux-arm64"):
+        for backend, expected in BACKENDS.items():
+            directory = tmp_path / f"buffer-pool-backends-{platform}-{backend}"
+            directory.mkdir()
+            (directory / "backend.json").write_text(
+                json.dumps(
+                    {
+                        "platform": platform,
+                        "expected_backend": backend,
+                        "actual_backend": expected,
+                        "passed": True,
+                        "commit": "test-revision",
+                        "native_targets": list(NATIVE_TARGETS),
+                        "python_tests": list(PYTHON_TESTS),
+                    }
+                )
+            )
+            for name in ("native.xml", "python.xml"):
+                (directory / name).write_text(
+                    '<testsuite><testcase name="executed"/></testsuite>'
+                )
     return tmp_path
 
 
@@ -337,3 +376,70 @@ def test_compile_gate_builds_without_running_the_test(tmp_path):
         capture_output=True,
     )
     assert len(list(build.rglob("executed.txt"))) == 1
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "target", "duration", "fraction", "gap", "recovery"]
+)
+def test_soft_rss_observation_fails_closed(tmp_path, damage):
+    values = benchmark()
+    trace = next(row for row in values if row["phase"] == "rss_soft_limit")
+    if damage == "missing":
+        values.remove(trace)
+    else:
+        key = {
+            "target": "target_rss_kib",
+            "duration": "longest_over_target_seconds",
+            "fraction": "over_target_fraction",
+            "gap": "sampling_max_gap_seconds",
+            "recovery": "recovery_seconds",
+        }[damage]
+        trace[key] = -1 if damage == "target" else 100
+    with pytest.raises(AssertionError):
+        rows(write_rows(tmp_path / "rss.jsonl", values))
+
+
+def test_soft_rss_checks_time_and_continuous_excess():
+    trace = RssTrace(100)
+    trace.add(0, 90)
+    trace.add(99, 101)
+    trace.add(100, 90)
+    result = trace.result(0)
+    assert result["over_target_fraction"] == pytest.approx(0.01)
+    assert result["longest_over_target_seconds"] == 1
+    # Sparse sampling must not masquerade as continuous observation.
+    with pytest.raises(AssertionError, match="sampling stalled"):
+        validate_soft_rss(result)
+
+
+def test_rss_observer_is_an_independent_process(tmp_path):
+    path = tmp_path / "observed.jsonl"
+    with path.open("w") as evidence, ProcessRssMonitor(evidence, 4 * 1024**2):
+        time.sleep(0.15)
+    observed = json.loads(path.read_text())
+    assert observed["observer"] == "independent_process"
+    assert observed["samples"] >= 2
+    validate_soft_rss(observed)
+
+
+@pytest.mark.parametrize("damage", ["backend", "missing_path", "empty", "failure"])
+def test_backend_shared_path_evidence_is_required(complete_artifacts, damage):
+    directory = complete_artifacts / "buffer-pool-backends-linux-arm64-libaio"
+    if damage == "backend":
+        record = json.loads((directory / "backend.json").read_text())
+        record["actual_backend"] = 0
+        (directory / "backend.json").write_text(json.dumps(record))
+    elif damage == "missing_path":
+        record = json.loads((directory / "backend.json").read_text())
+        record["native_targets"].remove("buffer_storage_write_test")
+        (directory / "backend.json").write_text(json.dumps(record))
+    else:
+        content = (
+            "<testsuite/>"
+            if damage == "empty"
+            else '<testsuite><testcase name="failed"><failure/></testcase></testsuite>'
+        )
+        (directory / "native.xml").write_text(content)
+    needs = {stage: {"result": "success"} for stage in POLICY["required_stages"]}
+    with pytest.raises(AssertionError):
+        summary(complete_artifacts, needs)

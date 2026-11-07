@@ -1,0 +1,67 @@
+# Scheduled workflows must be present on the repository default branch.
+# The checkout below independently selects the Buffer Pool source revision;
+# it does not add push/PR triggers to the integration branch.
+name: Buffer Pool memory and concurrency checks
+on:
+  schedule:
+    # 00:45 Asia/Shanghai. Keep this entry point on the default branch.
+    - cron: '45 16 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source revision to validate
+        default: test/buffer-pool-acceptance
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: test/buffer-pool-acceptance
+
+permissions:
+  contents: read
+
+jobs:
+  sanitizers:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: ['address,undefined', thread]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || 'test/buffer-pool-acceptance' }}
+          persist-credentials: false
+      - name: Install sanitizer toolchain
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends gcc g++ cmake ninja-build libgtest-dev
+      - name: Build instrumented pool and asynchronous I/O tests
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          mkdir -p ci-evidence
+          set -o pipefail
+          cmake -S .github/cmake/buffer-pool-sanitizers -B build-sanitizer -G Ninja \
+            -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE" -DZVEC_SANITIZER="$SANITIZER" \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            2>&1 | tee ci-evidence/configure.log
+          cmake --build build-sanitizer --parallel 2 2>&1 | tee ci-evidence/build.log
+      - name: Exercise memory lifetime and concurrent reclamation
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:log_path=${{ github.workspace }}/ci-evidence/asan
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:log_path=${{ github.workspace }}/ci-evidence/ubsan
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:log_path=${{ github.workspace }}/ci-evidence/tsan
+        run: |
+          set -o pipefail
+          ctest --test-dir build-sanitizer --output-on-failure --no-tests=error \
+            --repeat until-fail:3 --parallel 1 --output-junit "$GITHUB_WORKSPACE/ci-evidence/native.xml" \
+            2>&1 | tee ci-evidence/tests.log
+      - name: Preserve sanitizer diagnostics
+        if: always()
+        uses: ./.github/actions/ci-evidence
+        with:
+          build: build-sanitizer
+          name: buffer-pool-sanitizer-${{ matrix.sanitizer }}

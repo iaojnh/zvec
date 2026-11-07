@@ -1,0 +1,91 @@
+# Requires a provisioned physical device runner. iOS signing is configured on
+# that runner with ZVEC_IOS_DEVELOPMENT_TEAM and ZVEC_IOS_SIGNING_IDENTITY;
+# Android uses ANDROID_NDK_HOME. The mobile-device-tests environment protection
+# is retained. No device credentials or provisioning permissions are created.
+# This validates injected SDK host pressure on real hardware, not delivery of
+# operating-system memory-warning callbacks. Simulator results do not qualify.
+# GitHub exposes manual dispatch after this entry point is on the default branch.
+name: Buffer Pool physical device pressure
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source revision to validate
+        type: string
+        default: test/buffer-pool-acceptance
+      platform:
+        type: choice
+        options: [android, ios]
+        required: true
+      runner-label:
+        description: Label of the already provisioned self-hosted device runner
+        type: string
+        required: true
+        default: zvec-mobile-device
+      device:
+        description: Explicit adb serial or devicectl device identifier
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  pressure:
+    runs-on: [self-hosted, '${{ inputs.runner-label }}']
+    timeout-minutes: 120
+    environment: mobile-device-tests
+    concurrency:
+      group: mobile-device-${{ inputs.platform }}-${{ inputs.device }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Build the required device test
+        shell: bash
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci-evidence
+          set -o pipefail
+          args=(-DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_C_BINDINGS=OFF
+                -DBUILD_TOOLS=OFF -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF
+                -DBUILD_ZVEC_CORE_SHARED=OFF -DAUTO_DETECT_ARCH=OFF)
+          if [[ "$PLATFORM" == android ]]; then
+            : "${ANDROID_NDK_HOME:?Configure the runner NDK path}"
+            cmake -S . -B build-device -G Ninja "${args[@]}" \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-34 -DANDROID_STL=c++_static \
+              2>&1 | tee ci-evidence/configure.log
+          else
+            : "${ZVEC_IOS_DEVELOPMENT_TEAM:?Configure the runner signing team}"
+            : "${ZVEC_IOS_SIGNING_IDENTITY:?Configure the runner signing identity}"
+            cmake -S . -B build-device -G Xcode "${args[@]}" -DIOS=ON \
+              -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+              -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM="$ZVEC_IOS_DEVELOPMENT_TEAM" \
+              -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="$ZVEC_IOS_SIGNING_IDENTITY" \
+              -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_STYLE=Automatic \
+              2>&1 | tee ci-evidence/configure.log
+          fi
+          cmake --build build-device --config Release --parallel 2 \
+            --target mobile_pressure_lifecycle_test 2>&1 | tee ci-evidence/build.log
+      - name: Run device pressure, denial and recovery
+        shell: bash
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          DEVICE: ${{ inputs.device }}
+        run: |
+          python .github/scripts/run_mobile_pressure.py --platform "$PLATFORM" \
+            --device "$DEVICE" --build build-device --evidence ci-evidence
+      - name: Preserve device evidence
+        if: always()
+        uses: ./.github/actions/ci-evidence
+        with:
+          build: build-device
+          name: buffer-pool-physical-${{ inputs.platform }}
