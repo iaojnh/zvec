@@ -16,7 +16,12 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from buffer_pool_backend_tests import BACKENDS, NATIVE_TARGETS, PYTHON_TESTS
+from buffer_pool_backend_tests import (
+    BACKENDS,
+    NATIVE_TARGETS,
+    PYTHON_TESTS,
+    verify_page_cycles,
+)
 from buffer_pool_metrics import POLICY
 from buffer_pool_rss_monitor import validate_soft_rss
 
@@ -218,6 +223,8 @@ def native_results(root):
                 unsupported.append(
                     {"suite": shard, "test": test.get("name"), "reason": reason}
                 )
+        if shard == "budget":
+            verify_page_cycles(tests)
         if shard == "storage":
             for name in (
                 "WritableOpenReclaimsOtherStoresCleanPages",
@@ -259,6 +266,8 @@ def backend_results(root):
                     case.find("failure") is not None or case.find("error") is not None
                     for case in cases
                 )
+                if name == "native.xml":
+                    verify_page_cycles(cases)
             verified.append(f"{platform}-{backend}-shared-paths")
     return verified
 

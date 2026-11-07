@@ -53,6 +53,22 @@ PYTHON_TESTS = (
     "test_fetch_result_budget.py",
 )
 BACKENDS = {"pread": 0, "libaio": 1, "io_uring": 2}
+PAGE_CYCLE_TESTS = (
+    "EvictedReadOnlyPageReloadsFromDisk",
+    "EvictedDirtyPageReloadsPersistedBytes",
+)
+
+
+def verify_page_cycles(tests):
+    for name in PAGE_CYCLE_TESTS:
+        matching = [
+            test
+            for test in tests
+            if test.get("classname") == "BufferPoolTest" and test.get("name") == name
+        ]
+        assert len(matching) == 1 and all(
+            matching[0].find(tag) is None for tag in ("skipped", "failure", "error")
+        ), f"missing successful page eviction/reload: {name}"
 
 
 def verify_backend(platform_name, backend, actual, system, machine):
@@ -80,6 +96,8 @@ def verify_native_result(target, output, xml):
     assert not any(
         t.find("failure") is not None or t.find("error") is not None for t in tests
     )
+    if target == "vector_page_table_test":
+        verify_page_cycles(tests)
     return root
 
 

@@ -13,10 +13,16 @@ import subprocess
 import sys
 import tarfile
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
-from buffer_pool_backend_tests import BACKENDS, NATIVE_TARGETS, PYTHON_TESTS
+from buffer_pool_backend_tests import (
+    BACKENDS,
+    NATIVE_TARGETS,
+    PAGE_CYCLE_TESTS,
+    PYTHON_TESTS,
+)
 from buffer_pool_metrics import POLICY, stability
 from buffer_pool_native_bundle import bundle
 from buffer_pool_report import build_memory_results, performance, rows, summary
@@ -35,6 +41,13 @@ def soft_rss(budget_mib=128):
     trace.add(0, 64 * 1024)
     trace.add(1, 64 * 1024)
     return trace.result(0)
+
+
+def page_cycle_xml():
+    return "".join(
+        f'<testcase classname="BufferPoolTest" name="{name}"/>'
+        for name in PAGE_CYCLE_TESTS
+    )
 
 
 def benchmark(qps=100, p99=10, reads=1024**2):
@@ -153,7 +166,9 @@ def complete_artifacts(tmp_path):
         path.parent.mkdir()
         path.write_text(
             '<testsuite><testcase name="WritableOpenReclaimsOtherStoresCleanPages"/>'
-            '<testcase name="WritableOpenWaitsForOtherStoresDirtyPages"/></testsuite>'
+            '<testcase name="WritableOpenWaitsForOtherStoresDirtyPages"/>'
+            + (page_cycle_xml() if shard == "budget" else "")
+            + "</testsuite>"
         )
     public = tmp_path / "buffer-pool-public-suite" / "public.xml"
     public.parent.mkdir()
@@ -269,7 +284,9 @@ def complete_artifacts(tmp_path):
             )
             for name in ("native.xml", "python.xml"):
                 (directory / name).write_text(
-                    '<testsuite><testcase name="executed"/></testsuite>'
+                    '<testsuite><testcase name="executed"/>'
+                    + (page_cycle_xml() if name == "native.xml" else "")
+                    + "</testsuite>"
                 )
     return tmp_path
 
@@ -337,11 +354,39 @@ def test_required_aio_skip_blocks_acceptance(complete_artifacts):
         summary(complete_artifacts, needs)
 
 
+@pytest.mark.parametrize("location", ["budget", "backend"])
+@pytest.mark.parametrize("name", PAGE_CYCLE_TESTS)
+@pytest.mark.parametrize("damage", ["missing", "skipped", "duplicate"])
+def test_page_cycle_evidence_cannot_be_omitted_or_skipped(
+    complete_artifacts, location, name, damage
+):
+    directory = (
+        "buffer-pool-evidence-budget"
+        if location == "budget"
+        else "buffer-pool-backends-linux-arm64-libaio"
+    )
+    path = complete_artifacts / directory / "native.xml"
+    tree = ET.parse(path)
+    root = tree.getroot()
+    case = next(test for test in root.iter("testcase") if test.get("name") == name)
+    if damage == "missing":
+        root.remove(case)
+    elif damage == "skipped":
+        ET.SubElement(case, "skipped")
+    else:
+        root.append(copy.deepcopy(case))
+    tree.write(path)
+    needs = {stage: {"result": "success"} for stage in POLICY["required_stages"]}
+    with pytest.raises(AssertionError, match="page eviction/reload"):
+        summary(complete_artifacts, needs)
+
+
 def test_optional_native_skip_is_reported_as_unsupported(complete_artifacts):
     native = complete_artifacts / "buffer-pool-evidence-budget" / "native.xml"
-    native.write_text(
-        '<testsuite><testcase name="optional"><skipped message="kernel rejects io_uring"/></testcase></testsuite>'
-    )
+    tree = ET.parse(native)
+    optional = ET.SubElement(tree.getroot(), "testcase", name="optional")
+    ET.SubElement(optional, "skipped", message="kernel rejects io_uring")
+    tree.write(native)
     needs = {stage: {"result": "success"} for stage in POLICY["required_stages"]}
     result = summary(complete_artifacts, needs)
     assert result["unsupported"] == [

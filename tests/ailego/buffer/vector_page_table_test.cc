@@ -224,6 +224,47 @@ class BufferPoolTest : public ::testing::Test {
     files_.push_back(MakeBackingFile(num_pages));
     return files_.back();
   }
+  void check_page_eviction_reload(bool writable) {
+    init_vec_pool(/*capacity_pages=*/256, /*file_pages=*/1, writable);
+    VecBufferPool pool(new_file(1), writable);
+    ASSERT_EQ(0, pool.init());
+    ASSERT_TRUE(pool.cache_enabled());
+    ASSERT_FALSE(pool.is_page_resident(0));
+
+    char *first = pool.acquire_buffer(0);
+    ASSERT_NE(nullptr, first);
+    ASSERT_TRUE(pool.is_page_resident(0));
+    ExpectPageContent(first, 0);
+    std::vector<char> expected(first, first + kVectorPageSize);
+    if (writable) {
+      for (size_t i = 0; i < expected.size(); ++i)
+        expected[i] = static_cast<char>((i * 17 + 73) % 251);
+      ASSERT_EQ(0, pool.write_range(0, expected.size(), expected.data()));
+      ASSERT_TRUE(pool.page_table_.is_block_dirty(0));
+    }
+    // Keep this deterministic state transition below background pressure.
+    // Separate working-set tests exercise budget-driven eviction.
+    ASSERT_FALSE(PoolPayloadBudget::get_instance().under_cache_pressure());
+    ASSERT_FALSE(pool.page_table_.force_evict_block(0));  // still pinned
+    ASSERT_TRUE(pool.is_page_resident(0));
+    pool.page_table_.release_block(0);
+    const auto before = pool.stats();
+    ASSERT_TRUE(pool.page_table_.force_evict_block(0));
+    ASSERT_FALSE(pool.is_page_resident(0));
+    ASSERT_FALSE(pool.page_table_.is_block_dirty(0));
+    EXPECT_EQ(before.evict + 1, pool.stats().evict);
+    EXPECT_EQ(before.dirty_flush + (writable ? 1 : 0), pool.stats().dirty_flush);
+    EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
+
+    // Reload the same file offset through cache admission, not a bypass read.
+    char *reloaded = pool.acquire_buffer(0);
+    ASSERT_NE(nullptr, reloaded);
+    ASSERT_TRUE(pool.is_page_resident(0));
+    EXPECT_EQ(before.miss + 1, pool.stats().miss);
+    EXPECT_EQ(before.bypass_reads, pool.stats().bypass_reads);
+    EXPECT_EQ(0, std::memcmp(expected.data(), reloaded, expected.size()));
+    pool.page_table_.release_block(0);
+  }
   std::vector<std::string> files_;
 };
 
@@ -906,11 +947,16 @@ TEST_F(BufferPoolTest, ResidentOnlyAcquirePreservesTransitionStates) {
   pool.page_table_.release_block(/*block_id=*/0);
 }
 
-// ---------------------------------------------------------------------------
-// 1. Data stays correct when the working set far exceeds pool capacity, which
-//    forces the CLOCK evictor to run repeatedly. Also asserts the observability
-//    counters get populated (hits, misses, evictions).
-// ---------------------------------------------------------------------------
+TEST_F(BufferPoolTest, EvictedReadOnlyPageReloadsFromDisk) {
+  check_page_eviction_reload(false);
+}
+
+TEST_F(BufferPoolTest, EvictedDirtyPageReloadsPersistedBytes) {
+  check_page_eviction_reload(true);
+}
+
+// Reads remain correct across a working set larger than the cache, including
+// first-touch bypasses. The independent cases above require cache reloading.
 TEST_F(BufferPoolTest, DataCorrectUnderEviction) {
   const size_t num_pages = 64;
   init_vec_pool(/*capacity_pages=*/16,
