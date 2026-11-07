@@ -1,0 +1,49 @@
+name: Upload CI evidence with bounded retries
+description: Retry artifact service failures while requiring a successful upload
+
+inputs:
+  name:
+    required: true
+    description: Unique artifact name for this job
+  path:
+    required: true
+    description: Files or directories to archive
+  retention-days:
+    default: '14'
+    description: Number of days to retain the artifact
+  if-no-files-found:
+    default: error
+    description: Behavior when no evidence files exist
+
+runs:
+  using: composite
+  steps:
+    # Earlier transfer failures allow another attempt; the final one is strict.
+    - id: first
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      continue-on-error: true
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        overwrite: true
+    - id: second
+      if: ${{ always() && steps.first.outcome != 'success' }}
+      uses: actions/upload-artifact@v7
+      continue-on-error: true
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        overwrite: true
+    - if: ${{ always() && steps.first.outcome != 'success' && steps.second.outcome != 'success' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        overwrite: true

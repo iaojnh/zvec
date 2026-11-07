@@ -118,7 +118,7 @@ jobs:
           assert not any(t.find("failure") is not None or t.find("error") is not None for t in tests)
           PY
           (cd candidate && sha256sum close-persistence.xml >> SHA256SUMS)
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         with:
           name: buffer-pool-candidate
           path: candidate/
@@ -176,7 +176,7 @@ jobs:
             "$python_path" -X faulthandler .github/scripts/buffer_pool_build_memory.py \
             "$INDEX" "$RUNNER_TEMP/build-memory-collection" evidence/build.jsonl \
             2>&1 | tee evidence/build.log
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-evidence-build-${{ matrix.index }}
@@ -265,7 +265,7 @@ jobs:
           python -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
             "$RUNNER_TEMP/collection" "evidence/$INDEX-rss.jsonl" \
             2>&1 | tee "evidence/$INDEX.log"
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-evidence-${{ matrix.shard }}
@@ -342,7 +342,7 @@ jobs:
             python/tests/test_sequence_input_budget.py \
             python/tests/test_fetch_result_budget.py \
             --junitxml=evidence/public.xml
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-public-suite
@@ -413,7 +413,7 @@ jobs:
         run: |
           python -m pip install baseline/*.whl
           python .github/scripts/buffer_pool_distance_sanity.py
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         with:
           name: buffer-pool-baseline
           path: baseline/
@@ -481,7 +481,7 @@ jobs:
             "$RUNNER_TEMP/collection" evidence/rss.jsonl --rows "$ROWS" \
             --dimension 384 --budget-mib "$BUDGET_MIB" --workers "$WORKERS" "${args[@]}" \
             2>&1 | tee evidence/stress.log
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-evidence-${{ matrix.scenario }}
@@ -522,7 +522,7 @@ jobs:
           python -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
             "$RUNNER_TEMP/collection" evidence/rss.jsonl --workers 8 --soak-seconds "$seconds" \
             2>&1 | tee evidence/soak.log
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-evidence-soak-${{ matrix.index }}
@@ -569,7 +569,7 @@ jobs:
             "$python_path" -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
             "$RUNNER_TEMP/collection" evidence/rss.jsonl --rows 100000 --workers 4 \
             2>&1 | tee evidence/external-limit.log
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-evidence-cgroup-${{ matrix.index }}
@@ -664,7 +664,7 @@ jobs:
           done
           python .github/scripts/buffer_pool_report.py performance evidence/baseline.jsonl \
             evidence/candidate.jsonl evidence/performance.json
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-evidence-cohere-${{ matrix.index }}-${{ matrix.storage }}
@@ -723,7 +723,7 @@ jobs:
                   print(f"\nUnsupported native observation: {item['suite']}/{item['test']} — {item['reason']}")
           PY
           exit "$check_rc"
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/upload-evidence
         if: always()
         with:
           name: buffer-pool-acceptance-report

@@ -40,7 +40,7 @@ runs:
         python .github/scripts/buffer_pool_backend_tests.py \
           --backend "$EXPECTED_BACKEND" --platform "$PLATFORM" \
           --native-bin "$NATIVE_BIN" --evidence "backend-evidence-$EXPECTED_BACKEND"
-    - uses: actions/upload-artifact@v7
+    - uses: ./.github/actions/upload-evidence
       if: always()
       with:
         name: buffer-pool-backends-${{ inputs.platform }}-${{ inputs.backend }}
