@@ -92,12 +92,6 @@ def verify(path, kind, mmap, dimension, count):
         # result allowance and must fail before accumulating all chunks.
         with pytest.raises(MemoryError, match="Python fetch results"):
             coll.fetch(ids)
-        with pytest.raises(MemoryError, match="Python query results"):
-            coll.query(
-                zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
-                topk=count,
-                include_vector=True,
-            )
     else:
         assert len(coll.fetch(ids)) == count
     assert len(coll.fetch(ids, include_vector=False)) == count
@@ -144,6 +138,35 @@ def test_large_vector_result_admission_and_recovery(tmp_path, mmap):
     path = tmp_path / "large"
     run_worker("build", path, "VECTOR_FP32", mmap, 1024, 512)
     run_worker("verify", path, "VECTOR_FP32", mmap, 1024, 512)
+
+
+def verify_query_result_copy(path, kind, mmap, dimension, count):
+    # Give native decoding enough headroom so this test reaches Python-copy
+    # admission on each allocator/platform, rather than a prior native denial.
+    zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), zvec.CollectionOption(read_only=True, enable_mmap=mmap))
+    try:
+        with pytest.raises(MemoryError, match="Python query results"):
+            coll.query(
+                zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
+                topk=count,
+                include_vector=True,
+            )
+        hits = coll.query(
+            zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
+            topk=1,
+            include_vector=True,
+        )
+        assert len(hits) == 1
+        assert hits[0].vector("vector") == vector_for(kind, dimension, int(hits[0].id))
+    finally:
+        coll.close()
+
+
+def test_large_query_result_copy_admission_and_recovery(tmp_path):
+    path = tmp_path / "large_query"
+    run_worker("build", path, "VECTOR_FP32", False, 4096, 2048)
+    run_worker("query_copy", path, "VECTOR_FP32", False, 4096, 2048)
 
 
 class Owner:
@@ -279,9 +302,11 @@ def verify_native_doc_state(path, kind, mmap, dimension, count):
         return doc
 
     assert hold_until_rejected(restore).pk() == key
-    assert pickle.loads(pickle.dumps(native)).get_any(
-        "payload", zvec.DataType.STRING
-    ).endswith("中文🙂0")
+    assert (
+        pickle.loads(pickle.dumps(native))
+        .get_any("payload", zvec.DataType.STRING)
+        .endswith("中文🙂0")
+    )
     assert key._memory_owner is not None
     assert field_name._memory_owner is not None
     coll.close()
@@ -384,13 +409,9 @@ def verify_multi_query_routes(path, kind, mmap, dimension, count):
 
     zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
     query = _MultiQuery()
-    field = zvec.VectorSchema(
-        "vector", zvec.DataType.VECTOR_FP32, dimension=262_144
-    )
+    field = zvec.VectorSchema("vector", zvec.DataType.VECTOR_FP32, dimension=262_144)
     search = _SearchQuery()
-    search.set_vector(
-        field._get_object(), np.zeros(field.dimension, dtype=np.float32)
-    )
+    search.set_vector(field._get_object(), np.zeros(field.dimension, dtype=np.float32))
     route = _SubQuery.from_search_query(search)
     route.num_candidates = 17
     query.queries = [route]
@@ -930,6 +951,7 @@ if __name__ == "__main__":
         "build_group_keys": build_group_keys,
         "group_keys": verify_group_keys,
         "verify": verify,
+        "query_copy": verify_query_result_copy,
         "retained": verify_retained,
         "native_fields": verify_native_fields,
         "build_native_doc_state": build_native_doc_state,
