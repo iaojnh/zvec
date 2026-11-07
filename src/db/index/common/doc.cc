@@ -731,9 +731,8 @@ Doc::Value Doc::deserialize_value(const uint8_t *&data) {
       v.reserve(len);
       for (uint32_t i = 0; i < len; ++i) {
         uint32_t str_len = read_value_from_buffer<uint32_t>(data);
-        std::string s(reinterpret_cast<const char *>(data), str_len);
+        v.emplace_back(reinterpret_cast<const char *>(data), str_len);
         data += str_len;
-        v.push_back(s);
       }
       return v;
     }
@@ -885,9 +884,8 @@ Doc::Ptr Doc::deserialize(const uint8_t *data, size_t size) {
   Doc::Ptr doc = std::make_shared<Doc>();
 
   uint32_t pk_len = read_value_from_buffer<uint32_t>(ptr);
-  std::string pk(reinterpret_cast<const char *>(ptr), pk_len);
+  doc->set_pk(std::string(reinterpret_cast<const char *>(ptr), pk_len));
   ptr += pk_len;
-  doc->set_pk(pk);
 
   float score = read_value_from_buffer<float>(ptr);
   doc->set_score(score);

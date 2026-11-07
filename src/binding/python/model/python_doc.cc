@@ -72,25 +72,13 @@ void ZVecPyDoc::bind_doc(py::module_ &m) {
 
   doc.def(py::init([]() { return std::make_shared<Doc>(); }))
       .def("set_pk", &Doc::set_pk)
-      .def("pk", &Doc::pk_ref)
+      .def("pk", &budgeted_doc_pk)
       .def("set_score", &Doc::set_score)
       .def("score", &Doc::score)
       .def("has_field", &Doc::has)
-      .def("field_names", &Doc::field_names)
-      .def(py::pickle(
-          [](const Doc &d) {
-            std::vector<uint8_t> data = d.serialize();
-            return py::bytes(reinterpret_cast<const char *>(data.data()),
-                             data.size());
-          },
-          [](py::bytes b) {
-            py::buffer_info info(py::buffer(b).request());
-            const uint8_t *buf = reinterpret_cast<const uint8_t *>(info.ptr);
-            size_t size = static_cast<size_t>(info.size);
-            Doc::Ptr d = Doc::deserialize(buf, size);
-            if (!d) throw std::runtime_error("Failed to unpickle Doc");
-            return d;
-          }));
+      .def("field_names", &budgeted_doc_field_names)
+      .def(py::pickle(&budgeted_doc_pickle_state,
+                      &budgeted_doc_from_pickle_state));
 
 
   doc.def("set_any", &ZVecPyDoc::set_field);

@@ -45,9 +45,21 @@ class _ResultString(str):
         return str, (str(self),)
 
 
+class _ResultBytes(bytes):
+    def __new__(cls, value, owner):
+        result = super().__new__(cls, value)
+        result._memory_owner = owner
+        return result
+
+    def __reduce_ex__(self, protocol):
+        return bytes, (bytes(self),)
+
+
 def _retain_field(value, owner):
     if isinstance(value, str):
         return _ResultString(value, owner)
+    if isinstance(value, bytes):
+        return _ResultBytes(value, owner)
     if isinstance(value, list):
         # Schema arrays are homogeneous. Avoid a Python call per numeric
         # element; only strings require their own owner when extracted.

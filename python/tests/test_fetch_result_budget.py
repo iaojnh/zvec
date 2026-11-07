@@ -239,6 +239,64 @@ def test_native_field_copies_hold_and_release_budget(tmp_path):
     run_worker("native_fields", path, "VECTOR_FP32", False, 8192, 2)
 
 
+def verify_native_doc_state(path, kind, mmap, dimension, count):
+    from zvec._zvec import _Doc
+
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    native = coll._obj.Fetch(["0"])["0"]
+    key = native.pk()
+    names = native.field_names()
+    assert isinstance(key, str) and key == "0"
+    assert isinstance(names, list) and "vector" in names
+    field_name = next(name for name in names if name == "vector")
+    del names
+
+    def hold_until_rejected(copy):
+        held = []
+        for _ in range(96):
+            try:
+                held.append(copy())
+            except MemoryError:
+                break
+        else:
+            pytest.fail("Native document copies must retain admission")
+        assert held
+        with pytest.raises(MemoryError):
+            copy()
+        held.clear()
+        return copy()
+
+    state = hold_until_rejected(native.__getstate__)
+    assert isinstance(state, bytes) and len(state) >= 256 * 1024
+    assert pickle.loads(pickle.dumps(state)) == state
+    plain_state = bytes(state)
+    del state
+
+    def restore():
+        doc = _Doc.__new__(_Doc)
+        doc.__setstate__(plain_state)
+        return doc
+
+    assert hold_until_rejected(restore).pk() == key
+    assert pickle.loads(pickle.dumps(native)).get_any(
+        "payload", zvec.DataType.STRING
+    ).endswith("中文🙂0")
+    assert key._memory_owner is not None
+    assert field_name._memory_owner is not None
+    coll.close()
+
+
+def build_native_doc_state(path, kind, mmap, dimension, count):
+    build(path, kind, mmap, dimension, count, payload_size=256 * 1024)
+
+
+def test_native_doc_state_holds_and_releases_budget(tmp_path):
+    path = tmp_path / "native_doc_state"
+    run_worker("build_native_doc_state", path, "VECTOR_FP32", False, 8, 1)
+    run_worker("native_doc_state", path, "VECTOR_FP32", False, 8, 1)
+
+
 def verify_exception(path, kind, mmap, dimension, count):
     from zvec.model import _budgeted_result
 
@@ -579,6 +637,8 @@ if __name__ == "__main__":
         "verify": verify,
         "retained": verify_retained,
         "native_fields": verify_native_fields,
+        "build_native_doc_state": build_native_doc_state,
+        "native_doc_state": verify_native_doc_state,
         "exception": verify_exception,
         "inputs": verify_fetch_inputs,
         "iterables": verify_fetch_iterables,

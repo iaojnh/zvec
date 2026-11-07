@@ -25,8 +25,10 @@
 #include <zvec/db/doc_iterator.h>
 #include "db/collection_fetch_internal.h"
 #include "db/collection_query_internal.h"
+#include "db/common/document_memory.h"
 #include "db/common/query_result_memory.h"
 #include "db/common/result_memory_allowance.h"
+#include "db/index/common/serialized_doc_memory.h"
 #include "python_doc.h"
 #include "python_fetch_memory.h"
 #include "python_query_memory.h"
@@ -717,14 +719,24 @@ static void admit_python_doc_copy(detail::ResultMemoryAllowance::Lease &memory,
   }
 }
 
-py::object budgeted_doc_field_to_python(Doc &doc, const std::string &field,
-                                        DataType type) {
-  if (!detail::DocumentMemoryAccess::budgeted(doc) || !doc.has_value(field))
-    return ZVecPyDoc::doc_value_to_py(doc, field, type);
+template <typename Estimate, typename Convert>
+static py::object budgeted_python_doc_value(
+    const Doc &doc, Estimate estimate, Convert convert,
+    size_t materialization_copies = 2) {
+  if (!detail::DocumentMemoryAccess::budgeted(doc)) return convert();
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       &forward_result_allowance(), false, kPythonResultBackingQuantum);
-  // The plain value may coexist briefly with the owner-backed wrapper.
-  admit_python_doc_copy(*memory, /*materialization_copies=*/2, [&] {
+  // Conversion can temporarily keep both the plain value and the wrapper.
+  admit_python_doc_copy(*memory, materialization_copies, estimate);
+  auto value = convert();
+  if (!memory->bytes()) return value;
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_retain_field")(std::move(value), result_memory_owner(memory));
+}
+
+py::object budgeted_doc_field_to_python(Doc &doc, const std::string &field,
+                                        DataType type) {
+  auto estimate_bytes = [&] {
     if (!doc.has_value(field)) return size_t{0};
     PythonResultEstimate estimate;
     try {
@@ -734,11 +746,63 @@ py::object budgeted_doc_field_to_python(Doc &doc, const std::string &field,
       return size_t{0};
     }
     return estimate.bytes();
+  };
+  return budgeted_python_doc_value(doc, estimate_bytes, [&] {
+    return ZVecPyDoc::doc_value_to_py(doc, field, type);
   });
-  auto value = ZVecPyDoc::doc_value_to_py(doc, field, type);
-  if (!memory->bytes()) return value;
-  return py::module_::import("zvec.model._budgeted_result")
-      .attr("_retain_field")(std::move(value), result_memory_owner(memory));
+}
+
+py::object budgeted_doc_pk(const Doc &doc) {
+  auto estimate_bytes = [&] {
+    PythonResultEstimate estimate;
+    estimate.string(doc.pk_ref());
+    return estimate.bytes();
+  };
+  return budgeted_python_doc_value(doc, estimate_bytes,
+                                  [&] { return py::str(doc.pk_ref()); });
+}
+
+py::object budgeted_doc_field_names(const Doc &doc) {
+  auto estimate_bytes = [&] {
+    // Cover UCS-4 names, their Python objects, and the temporary name vector.
+    return detail::BindingMemoryBytes(
+        5, detail::DocumentMemoryAccess::field_names_bytes(doc), 128);
+  };
+  return budgeted_python_doc_value(doc, estimate_bytes,
+                                  [&] { return py::cast(doc.field_names()); });
+}
+
+py::bytes budgeted_doc_pickle_state(const Doc &doc) {
+  return py::bytes(budgeted_python_doc_value(
+      doc,
+      [&] { return detail::BindingMemoryBytes(1, doc.serialized_size(), 128); },
+      [&] {
+        const auto data = doc.serialize();
+        return py::bytes(reinterpret_cast<const char *>(data.data()),
+                         data.size());
+      },
+      // Freed vector backing may remain resident while the wrapper is made.
+      /*materialization_copies=*/3));
+}
+
+Doc::Ptr budgeted_doc_from_pickle_state(const py::bytes &state) {
+  const auto *data =
+      reinterpret_cast<const uint8_t *>(PyBytes_AS_STRING(state.ptr()));
+  const size_t size = PyBytes_GET_SIZE(state.ptr());
+  std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  if (ailego::MemoryLimitPool::get_instance().capacity()) {
+    size_t bytes = 0;
+    if (!detail::EstimateSerializedDocMemory(data, size, &bytes))
+      throw std::runtime_error("Failed to unpickle Doc");
+    memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+        &forward_result_allowance(), false, kPythonResultBackingQuantum);
+    py::gil_scoped_release release;
+    memory->add(bytes);
+  }
+  auto doc = Doc::deserialize(data, size);
+  if (!doc) throw std::runtime_error("Failed to unpickle Doc");
+  if (memory) detail::DocumentMemoryAccess::retain(*doc, std::move(memory));
+  return doc;
 }
 
 py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema) {

@@ -24,6 +24,10 @@ namespace zvec {
 py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema);
 py::object budgeted_doc_field_to_python(Doc &doc, const std::string &field,
                                         DataType type);
+py::object budgeted_doc_pk(const Doc &doc);
+py::object budgeted_doc_field_names(const Doc &doc);
+py::bytes budgeted_doc_pickle_state(const Doc &doc);
+Doc::Ptr budgeted_doc_from_pickle_state(const py::bytes &state);
 
 class ZVecPyDoc {
  public:
