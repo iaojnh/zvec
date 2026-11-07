@@ -307,6 +307,7 @@ bool Index::is_trained() const {
 }
 
 uint32_t Index::get_doc_count() const {
+  if (buffered_input_ && !is_trained_) return buffered_input_->count();
   if (pending_quantizer_training_) return 0;
   if (streamer_ == nullptr) {
     return -1;

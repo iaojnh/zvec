@@ -465,6 +465,9 @@ jobs:
                  grep -Eq '^Passed: [1-9][0-9]*[[:space:]]*$' <<< "$OUTPUT" && \
                  grep -Eq '^Failed: 0[[:space:]]*$' <<< "$OUTPUT"; then
               : # c_api_test uses a custom test framework.
+            elif [ "$test_name" = "c_api_memory_budget_test" ] && \
+                 grep -Fxq 'C API memory admission and recovery passed' <<< "$OUTPUT"; then
+              : # This C test returns nonzero on any failed contract.
             else
               echo "  >>> FAILED (no recognisable non-empty passing test summary)"
               TEST_PASSED=0

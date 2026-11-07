@@ -85,6 +85,10 @@ class BoundedSource : public arrow::acero::ExecNode {
           options);
     }).AddCallback([this, done](const arrow::Result<int> &result) mutable {
       auto status = result.status();
+      // Release the input owner before publishing completion. In particular,
+      // dropping a SegmentNode cancels its child stream; retaining it until
+      // ExecPlan destruction can defer Segment::close() into process teardown.
+      generator_ = {};
       if (status.ok()) status = output_->InputFinished(this, *result);
       done.MarkFinished(status);
     });

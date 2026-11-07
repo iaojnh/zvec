@@ -21,7 +21,7 @@
   "index_build": {
     "budget_mib": 512,
     "system_limit_mib": 768,
-    "rows": 200000,
+    "rows": 400000,
     "dimension": 768,
     "build_workers": 4
   },

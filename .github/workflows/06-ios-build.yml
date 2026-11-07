@@ -198,6 +198,9 @@ jobs:
                 SUMMARY_FOUND=1
               elif [ "$TEST_NAME" = "c_api_test" ] && grep -Eq '^Failed: [0-9]+[[:space:]]*$' "$LOG_FILE"; then
                 SUMMARY_FOUND=1
+              elif [ "$TEST_NAME" = "c_api_memory_budget_test" ] && \
+                   grep -Fxq 'C API memory admission and recovery passed' "$LOG_FILE"; then
+                SUMMARY_FOUND=1
               fi
 
               RETRY_REASON=""
@@ -271,6 +274,9 @@ jobs:
                  grep -Eq '^Passed: [1-9][0-9]*[[:space:]]*$' "$LOG_FILE" && \
                  grep -Eq '^Failed: 0[[:space:]]*$' "$LOG_FILE"; then
               # c_api_test uses a custom test framework (not GTest)
+              PASSED=$((PASSED + 1))
+            elif [ "$TEST_NAME" = "c_api_memory_budget_test" ] && \
+                 grep -Fxq 'C API memory admission and recovery passed' "$LOG_FILE"; then
               PASSED=$((PASSED + 1))
             else
               echo "::error::${TEST_NAME} produced no recognisable passing test summary"

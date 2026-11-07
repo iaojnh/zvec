@@ -224,8 +224,13 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
           (fp16 ? sizeof(uint16_t) : sizeof(float));
       ASSERT_GT(values.size() * sizeof(float) + resident_vector_bytes,
                 256UL * 1024UL);
-      ASSERT_LT(available, pool_budget_);
-      const size_t requested = pool_budget_ - available;
+      // Opening the target may grow the shared eviction allocator. Its
+      // retained metadata is excluded by PoolPayloadBudget::capacity(), so
+      // derive this competing payload charge from the current capacity too.
+      // Using the initial total subtracts that metadata a second time from
+      // the promised 256 KiB page/workspace allowance (notably on Windows).
+      ASSERT_LT(available, pool.capacity());
+      const size_t requested = pool.capacity() - available;
       ASSERT_TRUE(pool.try_charge_external(requested));
       reservation = requested;
     }
@@ -318,6 +323,20 @@ TEST_F(DiskAnnBufferedBuildTest, DirectAndMergedFp16AndFp32RoundTrip) {
 }
 
 TEST_F(DiskAnnBufferedBuildTest, MergedBuildSurvivesPagePressure) {
+  for (bool fp16 : {false, true}) {
+    SCOPED_TRACE(fp16);
+    ASSERT_NO_FATAL_FAILURE(run_lifecycle(fp16, true, true));
+  }
+}
+
+TEST_F(DiskAnnBufferedBuildTest, PagePressureAccountsForQueueAllocatorGrowth) {
+  // Model a platform/scheduling-dependent eviction-queue expansion after
+  // SetUp. It remains part of the same hard total, outside payload capacity.
+  void *queue_growth = ailego::EvictionQueueTraits::malloc(1UL << 20);
+  ASSERT_NE(nullptr, queue_growth);
+  auto release_queue = ailego::ScopeGuard::Make(
+      [queue_growth] { ailego::EvictionQueueTraits::free(queue_growth); });
+  ASSERT_LT(ailego::PoolPayloadBudget::get_instance().capacity(), pool_budget_);
   for (bool fp16 : {false, true}) {
     SCOPED_TRACE(fp16);
     ASSERT_NO_FATAL_FAILURE(run_lifecycle(fp16, true, true));

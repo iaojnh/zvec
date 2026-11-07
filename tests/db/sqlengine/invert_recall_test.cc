@@ -120,6 +120,52 @@ TEST(DocIdScanPlanTest, BoundedReaderPropagatesSourceFailure) {
   EXPECT_TRUE(reader.value()->Close().ok());
 }
 
+TEST(DocIdScanPlanTest, BoundedSourceReleasesInputBeforeCompletion) {
+  arrow::UInt64Builder builder;
+  ASSERT_TRUE(builder.Append(123).ok());
+  std::shared_ptr<arrow::Array> ids;
+  ASSERT_TRUE(builder.Finish(&ids).ok());
+  auto schema = arrow::schema({arrow::field("id", arrow::uint64())});
+  auto batch = arrow::RecordBatch::Make(schema, 1, {ids});
+  for (bool early_close : {false, true}) {
+    auto owner = std::make_shared<int>(123);
+    std::weak_ptr<int> input = owner;
+    auto reader = [&] {
+      auto remaining = std::make_shared<size_t>(early_close ? 2048 : 1);
+      PlanInfo plan(
+          {"source",
+           arrow::acero::SourceNodeOptions{
+               schema,
+               [owner, batch, remaining]()
+                   -> arrow::Future<std::optional<arrow::compute::ExecBatch>> {
+                 if (*owner != 123)
+                   return arrow::Status::Invalid("Invalid input");
+                 using Future =
+                     arrow::Future<std::optional<arrow::compute::ExecBatch>>;
+                 if (*remaining == 0) return Future::MakeFinished(std::nullopt);
+                 --*remaining;
+                 return Future::MakeFinished(arrow::compute::ExecBatch(*batch));
+               }}},
+          schema);
+      return plan.execute_to_reader(64);
+    }();
+    ASSERT_TRUE(reader);
+    owner.reset();
+    std::shared_ptr<arrow::RecordBatch> result;
+    ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
+    ASSERT_NE(nullptr, result);
+    if (early_close) {
+      ASSERT_TRUE(reader.value()->Close().ok());
+    } else {
+      ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
+      ASSERT_EQ(nullptr, result);
+    }
+    // Completion must release the producer even while the result reader is
+    // still alive. A later executor callback must not own the last Segment.
+    EXPECT_TRUE(input.expired());
+  }
+}
+
 TEST_F(InvertRecallTest, StreamedDocIdsMatchMaterializedResults) {
   auto engine = SQLEngine::create(std::make_shared<Profiler>());
   for (const auto &filter :
