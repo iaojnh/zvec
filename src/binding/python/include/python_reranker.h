@@ -14,11 +14,13 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
-#include <zvec/db/reranker.h>
+#include <zvec/db/query.h>
 
 namespace py = pybind11;
 
 namespace zvec {
+
+std::shared_ptr<SubQuery> python_subquery_from_search(const SearchQuery &query);
 
 class ZVecPyReranker {
  public:

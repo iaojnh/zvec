@@ -18,7 +18,10 @@
 #include <zvec/core/interface/constants.h>
 #include <zvec/db/index_params.h>
 #include <zvec/db/query.h>
+#include "db/common/binding_memory.h"
 #include "python_doc.h"
+#include "python_fetch_memory.h"
+#include "python_reranker.h"
 
 namespace zvec {
 
@@ -140,10 +143,14 @@ std::pair<std::string, std::string> serialize_sparse_vector(
 
   size_t i = 0;
   for (const auto &[py_key, py_val] : sparse_dict) {
-    indices_ptr[i] = checked_cast<uint32_t>(py_key, "Sparse indices", "UINT32");
-    values_ptr[i] = value_caster(py_val, i);
+    if (i == n) throw py::value_error("Sparse vector changed during conversion");
+    auto key = py::reinterpret_borrow<py::object>(py_key);
+    auto value = py::reinterpret_borrow<py::object>(py_val);
+    indices_ptr[i] = checked_cast<uint32_t>(key, "Sparse indices", "UINT32");
+    values_ptr[i] = value_caster(value, i);
     ++i;
   }
+  if (i != n) throw py::value_error("Sparse vector changed during conversion");
   return {std::move(indices_buf), std::move(values_buf)};
 }
 
@@ -2405,6 +2412,92 @@ void set_query_vector(QueryTarget &target, const FieldSchema &field_schema,
                        field_schema.name());
 }
 
+namespace {
+
+struct PythonVectorSource {
+  py::object dense_source;
+  std::shared_ptr<detail::ResultMemoryAllowance::Lease> sparse_memory;
+};
+
+using QueryVectorLease = detail::ResultMemoryAllowance::Lease;
+
+std::shared_ptr<QueryVectorLease> admit_query_vector_copy(
+    const SearchQuery &query, DataType type) {
+  if (!ailego::MemoryLimitPool::get_instance().capacity()) return {};
+  auto memory = std::make_shared<QueryVectorLease>(
+      &detail::SharedResultMemoryAllowance(), false, 1024 * 1024);
+  size_t admitted = 0;
+  while (true) {
+    const auto view = query.target_.get_vector_view();
+    if (!view) break;
+    const size_t bytes =
+        FieldSchema::is_dense_vector_field(type)
+            ? detail::BindingMemoryBytes(1, view->query_vector_.size(), 512)
+            : detail::BindingMemoryBytes(
+                  view->sparse_indices_.size() / sizeof(uint32_t), 160, 512);
+    if (bytes <= admitted) break;
+    py::gil_scoped_release release;
+    memory->add(bytes - admitted);
+    admitted = bytes;
+  }
+  return memory;
+}
+
+py::array retain_query_array(py::array value,
+                            const std::shared_ptr<QueryVectorLease> &memory) {
+  if (!memory || !memory->bytes()) return value;
+  struct ArrayCopy {
+    std::shared_ptr<QueryVectorLease> memory;
+    py::array value;
+  };
+  auto copy = std::make_unique<ArrayCopy>(ArrayCopy{memory, std::move(value)});
+  auto *held = copy.get();
+  py::capsule owner(held, [](void *p) { delete static_cast<ArrayCopy *>(p); });
+  copy.release();
+  // Views of the returned NumPy array also keep this owner alive.
+  return py::array(held->value.dtype(), {held->value.shape(0)},
+                   {held->value.strides(0)}, held->value.mutable_data(), owner);
+}
+
+py::object retain_query_sparse(py::dict value,
+                               const std::shared_ptr<QueryVectorLease> &memory) {
+  if (!memory || !memory->bytes()) return value;
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_ResultDict")(std::move(value), detail::result_memory_owner(memory));
+}
+
+// Destroy the native target before releasing its borrowed NumPy buffer.
+template <typename Query>
+struct PythonVectorQuery : PythonVectorSource, Query {};
+
+template <typename Query>
+void replace_query_vector(PythonVectorQuery<Query> &query,
+                          const FieldSchema &schema, const py::object &source) {
+  std::shared_ptr<QueryVectorLease> memory;
+  if (schema.is_sparse_vector() && PyDict_Check(source.ptr()) &&
+      ailego::MemoryLimitPool::get_instance().capacity()) {
+    memory = std::make_shared<QueryVectorLease>(
+        &detail::SharedResultMemoryAllowance(), false, 1024 * 1024);
+    size_t admitted = 0;
+    while (true) {
+      const size_t count = PyDict_Size(source.ptr());
+      const size_t bytes = detail::BindingMemoryBytes(
+          count, sizeof(uint32_t) + sizeof(float), 128);
+      if (bytes <= admitted) break;
+      py::gil_scoped_release release;
+      memory->add(bytes - admitted);
+      admitted = bytes;
+    }
+  }
+  set_query_vector(query.target_, schema, source);
+  auto previous_source = std::move(query.dense_source);
+  query.dense_source =
+      query.target_.get_vector_view_clause() ? source : py::object{};
+  query.sparse_memory = std::move(memory);
+}
+
+}  // namespace
+
 void ZVecPyParams::bind_vector_query(py::module_ &m) {
   // bind Fts
   py::class_<FtsClause>(m, "_Fts")
@@ -2425,32 +2518,21 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
           }));
 
   // Bind SubQuery (used by MultiQuery)
-  py::class_<SubQuery>(m, "_SubQuery")
+  py::class_<SubQuery, std::shared_ptr<SubQuery>>(m, "_SubQuery")
       .def(py::init<>())
       .def_readwrite("num_candidates", &SubQuery::num_candidates_)
       .def_static(
           "from_search_query",
-          [](const SearchQuery &sq) {
-            SubQuery sub;
-            sub.num_candidates_ = sq.topk_;
-            sub.target_ = sq.target_;
-            // SubQuery is copied by value into MultiQuery.  Materialize
-            // non-owning vector views so the copied SubQuery does not depend on
-            // the original _SearchQuery keep-alive relationship.
-            if (auto *vvc = sub.target_.get_vector_view_clause()) {
-              VectorClause vc{std::string(vvc->query_vector_),
-                              std::string(vvc->sparse_indices_),
-                              std::string(vvc->sparse_values_)};
-              sub.target_.clause_ = std::move(vc);
-            }
-            return sub;
-          },
+          &python_subquery_from_search,
           py::arg("search_query"),
           "Create a SubQuery from a single-target search query.");
 
   // _SearchQuery is the Python class name; it wraps the
   // single-target SearchQuery so external Python code keeps working unchanged.
-  py::class_<SearchQuery>(m, "_SearchQuery")
+  using PythonSearchQuery = PythonVectorQuery<SearchQuery>;
+  py::class_<SearchQuery>(m, "_SearchQueryValue");
+  py::class_<PythonSearchQuery, SearchQuery>(m, "_SearchQuery",
+                                           py::multiple_inheritance())
       .def(py::init<>())
       // properties
       .def_readwrite("topk", &SearchQuery::topk_)
@@ -2478,22 +2560,21 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
             }
             return py::none();
           },
-          [](SearchQuery &self, const py::object &obj) {
+          [](PythonSearchQuery &self, const py::object &obj) {
             if (obj.is_none()) {
               // Clearing FTS resets the target to an empty vector clause.
               self.target_.clause_ = VectorClause{};
             } else {
               self.target_.clause_ = obj.cast<FtsClause>();
             }
+            auto previous_source = std::move(self.dense_source);
+            self.sparse_memory.reset();
           })
       // vector
       .def(
           "set_vector",
-          [](SearchQuery &self, const FieldSchema &field_schema,
-             const py::object &obj) {
-            set_query_vector(self.target_, field_schema, obj);
-          },
-          py::arg("field_schema"), py::arg("obj"), py::keep_alive<1, 3>(),
+          &replace_query_vector<SearchQuery>,
+          py::arg("field_schema"), py::arg("obj"),
           "Set query vector. Dense vector source data must not be modified "
           "until the query finishes.")
       .def(
@@ -2501,6 +2582,7 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
           [](const SearchQuery &self,
              const FieldSchema &field_schema) -> py::object {
             DataType data_type = field_schema.data_type();
+            auto memory = admit_query_vector_copy(self, data_type);
             // get_vector_view() works for both VectorClause and
             // VectorViewClause.
             auto vv = self.target_.get_vector_view();
@@ -2519,8 +2601,10 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
                         "Invalid buffer size for VECTOR_FP32");
                   }
                   size_t dim = byte_size / sizeof(float);
-                  return py::array_t<float>({dim}, {sizeof(float)},
-                                            static_cast<const float *>(data));
+                  return retain_query_array(
+                      py::array_t<float>({dim}, {sizeof(float)},
+                                         static_cast<const float *>(data)),
+                      memory);
                 }
                 case DataType::VECTOR_FP64: {
                   if (byte_size % sizeof(double) != 0) {
@@ -2528,8 +2612,10 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
                         "Invalid buffer size for VECTOR_FP64");
                   }
                   size_t dim = byte_size / sizeof(double);
-                  return py::array_t<double>({dim}, {sizeof(double)},
-                                             static_cast<const double *>(data));
+                  return retain_query_array(
+                      py::array_t<double>({dim}, {sizeof(double)},
+                                          static_cast<const double *>(data)),
+                      memory);
                 }
                 case DataType::VECTOR_INT8: {
                   if (byte_size % sizeof(int8_t) != 0) {
@@ -2537,8 +2623,10 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
                         "Invalid buffer size for VECTOR_INT8");
                   }
                   size_t dim = byte_size / sizeof(int8_t);
-                  return py::array_t<int8_t>({dim}, {sizeof(int8_t)},
-                                             static_cast<const int8_t *>(data));
+                  return retain_query_array(
+                      py::array_t<int8_t>({dim}, {sizeof(int8_t)},
+                                          static_cast<const int8_t *>(data)),
+                      memory);
                 }
                 case DataType::VECTOR_FP16: {
                   if (byte_size % 2 != 0) {
@@ -2546,7 +2634,8 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
                         "Invalid buffer size for VECTOR_FP16");
                   }
                   size_t dim = byte_size / 2;
-                  return py::array(py::dtype("float16"), {dim}, {2}, data);
+                  return retain_query_array(
+                      py::array(py::dtype("float16"), {dim}, {2}, data), memory);
                 }
 
                 default:
@@ -2583,7 +2672,7 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
                   for (size_t i = 0; i < n; ++i) {
                     result[py::int_(indices[i])] = py::float_(values[i]);
                   }
-                  return result;
+                  return retain_query_sparse(std::move(result), memory);
                 }
                 case DataType::SPARSE_VECTOR_FP16: {
                   if (vv->sparse_values_.size() != n * sizeof(uint16_t)) {
@@ -2597,7 +2686,7 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
                     float f = ailego::FloatHelper::ToFP32(raw_bits[i]);
                     result[py::int_(indices[i])] = py::float_(f);
                   }
-                  return result;
+                  return retain_query_sparse(std::move(result), memory);
                 }
                 default:
                   throw py::type_error("Unsupported sparse vector type...");
@@ -2628,7 +2717,7 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
             if (t.size() != 10)
               throw std::runtime_error("Invalid pickle data for _SearchQuery");
 
-            SearchQuery obj{};
+            PythonSearchQuery obj{};
             obj.topk_ = t[0].cast<int>();
             obj.target_.field_name_ = t[1].cast<std::string>();
             // A vector clause and an FTS clause are mutually exclusive in the
@@ -2653,7 +2742,10 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
           }));
 
   // _GroupByVectorQuery
-  py::class_<GroupByVectorQuery>(m, "_GroupByVectorQuery")
+  using PythonGroupQuery = PythonVectorQuery<GroupByVectorQuery>;
+  py::class_<GroupByVectorQuery>(m, "_GroupByVectorQueryValue");
+  py::class_<PythonGroupQuery, GroupByVectorQuery>(
+      m, "_GroupByVectorQuery", py::multiple_inheritance())
       .def(py::init<>())
       .def_property(
           "field_name",
@@ -2676,11 +2768,8 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
           })
       .def(
           "set_vector",
-          [](GroupByVectorQuery &self, const FieldSchema &field_schema,
-             const py::object &obj) {
-            set_query_vector(self.target_, field_schema, obj);
-          },
-          py::arg("field_schema"), py::arg("obj"), py::keep_alive<1, 3>(),
+          &replace_query_vector<GroupByVectorQuery>,
+          py::arg("field_schema"), py::arg("obj"),
           "Set query vector. Dense vector source data must not be modified "
           "until the query finishes.");
 }

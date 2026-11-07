@@ -348,6 +348,155 @@ def test_standalone_rerank_admission_and_recovery(tmp_path):
     run_worker("rerank_budget", tmp_path, "VECTOR_FP32", False, 8, 1)
 
 
+def verify_multi_query_weights(path, kind, mmap, dimension, count):
+    from zvec._zvec import _MultiQuery, _WeightedParams
+
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    query = _MultiQuery()
+    query.set_rerank_weighted([1.0])
+    oversized = [0.5] * 2_500_000
+    with pytest.raises(MemoryError):
+        query.set_rerank_weighted(oversized)
+    with pytest.raises(MemoryError):
+        _WeightedParams(oversized)
+    del oversized
+    query.set_rerank_rrf()
+
+    moderate = [0.5] * 350_000
+    query.set_rerank_weighted(moderate)
+    weighted = _WeightedParams(moderate)
+    with pytest.raises(MemoryError):
+        _WeightedParams(moderate)
+    query.set_rerank_rrf()
+    weighted.weights = [2.0]
+    result = weighted.weights
+    assert result == [2.0] and result._memory_owner is not None
+    del weighted
+    assert result == [2.0]
+    _WeightedParams(moderate)
+    del moderate, result
+
+
+def verify_multi_query_routes(path, kind, mmap, dimension, count):
+    import numpy as np
+    from zvec._zvec import _MultiQuery
+    from zvec._zvec.param import _SearchQuery, _SubQuery
+
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    query = _MultiQuery()
+    field = zvec.VectorSchema(
+        "vector", zvec.DataType.VECTOR_FP32, dimension=262_144
+    )
+    search = _SearchQuery()
+    search.set_vector(
+        field._get_object(), np.zeros(field.dimension, dtype=np.float32)
+    )
+    route = _SubQuery.from_search_query(search)
+    route.num_candidates = 17
+    query.queries = [route]
+    with pytest.raises(MemoryError):
+        query.queries = [route] * 24
+    assert [sub.num_candidates for sub in query.queries] == [17]
+
+    query.queries = [route] * 8
+    held = query.queries[0]
+    held.num_candidates = 19
+    assert query.queries[0].num_candidates == 19
+    query.queries = []
+    assert held.num_candidates == 19
+    with pytest.raises(MemoryError):
+        query.queries = [route] * 5
+    del held
+    query.queries = [route] * 5
+    held = query.queries[0]
+    del query
+    assert held.num_candidates == 17
+    del held
+
+    query = _MultiQuery()
+    query.filter = "x" * 128_000 + "🙂"
+    query.output_fields = ["name", "颜色"]
+    copied_filter = query.filter
+    name = query.output_fields[1]
+    query.filter = ""
+    query.output_fields = None
+    assert query.output_fields is None
+    assert copied_filter.endswith("🙂") and copied_filter._memory_owner is not None
+    assert name == "颜色" and name._memory_owner is not None
+
+
+@pytest.mark.parametrize("mode", ["multi_query_weights", "multi_query_routes"])
+def test_native_multi_query_inputs_hold_budget(tmp_path, mode):
+    run_worker(mode, tmp_path, "VECTOR_FP32", False, 8, 1)
+
+
+def verify_query_vector_replacement(path, kind, mmap, dimension, count):
+    import numpy as np
+    from zvec._zvec.param import _Fts, _GroupByVectorQuery, _SearchQuery
+
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    dense_field = zvec.VectorSchema(
+        "dense", zvec.DataType.VECTOR_FP32, dimension=8
+    )._get_object()
+    sparse_field = zvec.VectorSchema(
+        "sparse", zvec.DataType.SPARSE_VECTOR_FP32
+    )._get_object()
+    for query_type in (_SearchQuery, _GroupByVectorQuery):
+        query = query_type()
+        first = np.ones(8, dtype=np.float32)
+        first_ref = weakref.ref(first)
+        query.set_vector(dense_field, first)
+        del first
+        assert first_ref() is not None
+        replacement = np.zeros(8, dtype=np.float32)
+        replacement_ref = weakref.ref(replacement)
+        query.set_vector(dense_field, replacement)
+        del replacement
+        assert first_ref() is None and replacement_ref() is not None
+        if isinstance(query, _SearchQuery):
+            query.fts = _Fts()
+            assert replacement_ref() is None
+        del query
+        assert replacement_ref() is None
+
+    sparse = dict.fromkeys(range(128 * 1024), 1.0)
+    held = []
+    for _ in range(24):
+        query = _SearchQuery()
+        try:
+            query.set_vector(sparse_field, sparse)
+        except MemoryError:
+            break
+        held.append(query)
+    else:
+        pytest.fail("Native sparse query vectors must retain their admission")
+    assert held
+    empty = np.zeros(8, dtype=np.float32)
+    for query in held:
+        query.set_vector(dense_field, empty)
+    query.set_vector(sparse_field, sparse)
+
+    wide_field = zvec.VectorSchema(
+        "wide", zvec.DataType.VECTOR_FP32, dimension=262_144
+    )._get_object()
+    query.set_vector(wide_field, np.ones(262_144, dtype=np.float32))
+    views = []
+    for _ in range(24):
+        try:
+            views.append(query.get_vector(wide_field)[1:])
+        except MemoryError:
+            break
+    else:
+        pytest.fail("NumPy views must keep the copied vector's admission")
+    assert views and views[0][0] == 1
+    views.clear()
+    assert query.get_vector(wide_field)[0] == 1
+
+
+def test_native_query_vector_replacement_releases_budget(tmp_path):
+    run_worker("query_vector_replacement", tmp_path, "VECTOR_FP32", False, 8, 1)
+
+
 def verify_exception(path, kind, mmap, dimension, count):
     from zvec.model import _budgeted_result
 
@@ -691,6 +840,9 @@ if __name__ == "__main__":
         "build_native_doc_state": build_native_doc_state,
         "native_doc_state": verify_native_doc_state,
         "rerank_budget": verify_rerank_budget,
+        "multi_query_weights": verify_multi_query_weights,
+        "multi_query_routes": verify_multi_query_routes,
+        "query_vector_replacement": verify_query_vector_replacement,
         "exception": verify_exception,
         "inputs": verify_fetch_inputs,
         "iterables": verify_fetch_iterables,

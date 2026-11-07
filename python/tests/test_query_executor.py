@@ -266,6 +266,15 @@ class TestQueryExecutor:
         with pytest.raises(ValueError, match="one weight per query"):
             executor._build_multi_query(ctx, [_SearchQuery(), _SearchQuery()])
 
+    def test_build_multi_query_stores_candidate_floor(self):
+        executor = QueryExecutor(MockCollectionSchema())
+        ctx = QueryContext(topk=2, reranker=RrfReRanker())
+        queries = [_SearchQuery(), _SearchQuery()]
+        for query in queries:
+            query.topk = 2
+        combined = executor._build_multi_query(ctx, queries)
+        assert [query.num_candidates for query in combined.queries] == [10, 10]
+
     def test_do_merge_rerank_results_single_without_reranker(self):
         # A single result list without a reranker is returned as-is.
         schema = MockCollectionSchema()

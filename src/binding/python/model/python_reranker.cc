@@ -27,6 +27,11 @@ namespace {
 using RerankLease = detail::ResultMemoryAllowance::Lease;
 constexpr size_t kPythonArena = 1024 * 1024;
 
+std::shared_ptr<RerankLease> new_query_lease() {
+  return std::make_shared<RerankLease>(&detail::SharedResultMemoryAllowance(),
+                                       false, kPythonArena);
+}
+
 void admit(RerankLease &memory, size_t bytes) {
   if (!bytes || !ailego::MemoryLimitPool::get_instance().capacity()) return;
   py::gil_scoped_release release;
@@ -55,6 +60,170 @@ std::vector<T> stage_values(py::iterable source, RerankLease &memory) {
   return values;
 }
 
+struct PythonWeightedParams {
+  explicit PythonWeightedParams(py::iterable source) {
+    set_weights(source);
+  }
+
+  void set_weights(py::iterable source) {
+    auto next = new_query_lease();
+    auto values = stage_values<double>(source, *next);
+    next->retain_at_most(
+        detail::BindingMemoryBytes(values.capacity(), sizeof(double)));
+    weights = std::move(values);
+    memory = std::move(next);
+  }
+
+  std::shared_ptr<RerankLease> memory;
+  std::vector<double> weights;
+};
+
+struct RouteStorage {
+  std::shared_ptr<RerankLease> memory;
+  std::vector<SubQuery> retired;
+};
+
+// The native query is destroyed before any lease for its input fields.
+struct MultiQueryMemory {
+  std::shared_ptr<RouteStorage> routes;
+  std::shared_ptr<RerankLease> filter_memory;
+  std::shared_ptr<RerankLease> fields;
+  std::shared_ptr<RerankLease> weights;
+};
+
+struct PythonMultiQuery : MultiQueryMemory, MultiQuery {
+  ~PythonMultiQuery() {
+    retire_routes();
+  }
+
+  void retire_routes() {
+    // Moving the vector preserves references already exported to Python.
+    if (routes && routes.use_count() > 1)
+      routes->retired = std::move(queries);
+  }
+};
+
+size_t target_copy_bytes(const QueryTarget &target) {
+  const auto add_string = [](size_t bytes, std::string_view text) {
+    return detail::BindingMemoryBytes(1, text.size(), bytes);
+  };
+  size_t bytes = add_string(128, target.field_name_);
+  if (auto vector = target.get_vector_view()) {
+    bytes = add_string(bytes, vector->query_vector_);
+    bytes = add_string(bytes, vector->sparse_indices_);
+    return add_string(bytes, vector->sparse_values_);
+  }
+  const auto &fts = *target.get_fts_clause();
+  return add_string(add_string(bytes, fts.query_string_), fts.match_string_);
+}
+
+size_t python_string_bytes(std::string_view value) {
+  const bool ascii = std::all_of(value.begin(), value.end(),
+                                 [](unsigned char c) { return c < 128; });
+  // Account for both the plain Python string and its owner-backed copy.
+  return detail::BindingMemoryBytes(value.size(), ascii ? 2 : 8, 256);
+}
+
+std::shared_ptr<SubQuery> make_subquery(
+    const QueryTarget &target, int count,
+    const std::shared_ptr<RerankLease> &memory) {
+  struct SubQueryCopy {
+    std::shared_ptr<RerankLease> memory;
+    SubQuery value;
+  };
+  auto copy = std::make_shared<SubQueryCopy>();
+  copy->memory = memory;
+  copy->value = SubQuery{target, count};
+  // Keep copied subqueries independent of the original Python buffer.
+  if (const auto *view = target.get_vector_view_clause()) {
+    copy->value.target_.clause_ =
+        VectorClause{std::string(view->query_vector_),
+                     std::string(view->sparse_indices_),
+                     std::string(view->sparse_values_)};
+  }
+  return std::shared_ptr<SubQuery>(copy, &copy->value);
+}
+
+template <typename Estimate, typename Convert>
+py::object copy_query_value(Estimate estimate, Convert convert) {
+  auto memory = new_query_lease();
+  admit_current(*memory, estimate);
+  auto value = convert();
+  if (!memory->bytes()) return value;
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_retain_field")(std::move(value), detail::result_memory_owner(memory));
+}
+
+void set_multi_routes(PythonMultiQuery &query, py::iterable source) {
+  auto next = std::make_shared<RouteStorage>();
+  next->memory = new_query_lease();
+  std::vector<SubQuery> values;
+  for (auto item : source) {
+    auto held = py::reinterpret_borrow<py::object>(item);
+    const auto &route = held.cast<const SubQuery &>();
+    admit_current(*next->memory, [&] {
+      return detail::BindingMemoryBytes(
+          1, target_copy_bytes(route.target_), 3 * sizeof(SubQuery));
+    });
+    values.push_back(route);
+  }
+  query.retire_routes();
+  query.queries = std::move(values);
+  query.routes = std::move(next);
+}
+
+py::object multi_route_handles(PythonMultiQuery &query) {
+  auto memory = new_query_lease();
+  admit_current(*memory, [&] {
+    return detail::BindingMemoryBytes(query.queries.size(), 256);
+  });
+  struct RouteExport {
+    std::shared_ptr<RerankLease> memory;
+    std::shared_ptr<RouteStorage> storage;
+  };
+  auto owner = std::make_shared<RouteExport>(
+      RouteExport{memory, query.routes});
+  py::list out;
+  for (auto &route : query.queries)
+    out.append(std::shared_ptr<SubQuery>(owner, &route));
+  if (!memory->bytes()) return out;
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_ResultList")(out, detail::result_memory_owner(memory));
+}
+
+void set_multi_filter(PythonMultiQuery &query, py::object source) {
+  auto next = new_query_lease();
+  admit_current(*next,
+                [&] { return detail::PythonFetchInputs::string_bytes(source); });
+  auto value = detail::PythonFetchInputs::copy_string(source);
+  next->retain_at_most(detail::BindingMemoryBytes(1, value.capacity(), 32));
+  query.filter = std::move(value);
+  query.filter_memory = std::move(next);
+}
+
+void set_multi_fields(PythonMultiQuery &query, py::object source) {
+  if (source.is_none()) {
+    query.output_fields.reset();
+    query.fields.reset();
+    return;
+  }
+  if (PyUnicode_Check(source.ptr()) || PyBytes_Check(source.ptr()) ||
+      PyByteArray_Check(source.ptr()))
+    throw py::type_error("Output fields must be a sequence of strings");
+  auto next = new_query_lease();
+  std::vector<std::string> values;
+  for (auto item : py::reinterpret_borrow<py::iterable>(source)) {
+    auto held = py::reinterpret_borrow<py::object>(item);
+    admit_current(*next, [&] {
+      return detail::BindingMemoryBytes(
+          1, detail::PythonFetchInputs::string_bytes(held), 3 * sizeof(std::string));
+    });
+    values.push_back(detail::PythonFetchInputs::copy_string(held));
+  }
+  query.output_fields = std::move(values);
+  query.fields = std::move(next);
+}
+
 template <typename StageDoc>
 std::vector<DocPtrList> stage_routes(py::iterable source, RerankLease &memory,
                                       StageDoc stage_doc) {
@@ -73,12 +242,12 @@ std::vector<DocPtrList> stage_routes(py::iterable source, RerankLease &memory,
 reranker::RerankParams stage_strategy(py::handle params, RerankLease &memory) {
   if (py::isinstance<reranker::RrfParams>(params))
     return params.cast<reranker::RrfParams>();
-  if (py::isinstance<reranker::WeightedParams>(params)) {
-    const auto &weights = params.cast<const reranker::WeightedParams &>();
+  if (py::isinstance<PythonWeightedParams>(params)) {
+    const auto &weights = params.cast<const PythonWeightedParams &>().weights;
     admit_current(memory, [&] {
-      return detail::BindingMemoryBytes(weights.weights.size(), sizeof(double));
+      return detail::BindingMemoryBytes(weights.size(), sizeof(double));
     });
-    return weights;
+    return reranker::WeightedParams{weights};
   }
   if (py::isinstance<reranker::CallbackParams>(params))
     return params.cast<reranker::CallbackParams>();
@@ -210,6 +379,15 @@ py::list rerank_python_docs(py::object params, py::iterable source,
 
 }  // namespace
 
+std::shared_ptr<SubQuery> python_subquery_from_search(const SearchQuery &query) {
+  auto memory = new_query_lease();
+  admit_current(*memory, [&] {
+    return detail::BindingMemoryBytes(
+        1, target_copy_bytes(query.target_), sizeof(SubQuery));
+  });
+  return make_subquery(query.target_, query.topk_, memory);
+}
+
 void ZVecPyReranker::Initialize(py::module_ &m) {
   // Bind RrfParams
   py::class_<reranker::RrfParams>(m, "_RrfParams")
@@ -217,9 +395,16 @@ void ZVecPyReranker::Initialize(py::module_ &m) {
       .def_readwrite("rank_constant", &reranker::RrfParams::rank_constant);
 
   // Bind WeightedParams
-  py::class_<reranker::WeightedParams>(m, "_WeightedParams")
-      .def(py::init<std::vector<double>>(), py::arg("weights"))
-      .def_readwrite("weights", &reranker::WeightedParams::weights);
+  py::class_<PythonWeightedParams>(m, "_WeightedParams")
+      .def(py::init<py::iterable>(), py::arg("weights"))
+      .def_property(
+          "weights",
+          [](const PythonWeightedParams &params) {
+            return copy_query_value(
+                [&] { return detail::BindingMemoryBytes(params.weights.size(), 80); },
+                [&] { return py::cast(params.weights); });
+          },
+          &PythonWeightedParams::set_weights);
 
   // Bind CallbackParams
   py::class_<reranker::CallbackParams>(m, "_CallbackParams")
@@ -232,29 +417,57 @@ void ZVecPyReranker::Initialize(py::module_ &m) {
         py::arg("results"), py::arg("fields"), py::arg("topn"));
 
   // Bind MultiQuery struct
-  py::class_<MultiQuery>(m, "_MultiQuery")
+  py::class_<MultiQuery>(m, "_MultiQueryValue");
+  py::class_<PythonMultiQuery, MultiQuery>(m, "_MultiQuery",
+                                         py::multiple_inheritance())
       .def(py::init<>())
-      .def_readwrite("queries", &MultiQuery::queries)
+      .def_property("queries", &multi_route_handles, &set_multi_routes)
       .def_readwrite("topk", &MultiQuery::topk)
-      .def_readwrite("filter", &MultiQuery::filter)
+      .def_property(
+          "filter",
+          [](const PythonMultiQuery &query) {
+            return copy_query_value(
+                [&] { return python_string_bytes(query.filter); },
+                [&] { return py::str(query.filter); });
+          },
+          &set_multi_filter)
       .def_readwrite("include_vector", &MultiQuery::include_vector)
-      .def_readwrite("output_fields", &MultiQuery::output_fields)
+      .def_property(
+          "output_fields",
+          [](const PythonMultiQuery &query) {
+            return copy_query_value(
+                [&] {
+                  if (!query.output_fields) return size_t{0};
+                  size_t bytes = detail::BindingMemoryBytes(
+                      query.output_fields->size(), 2 * sizeof(void *), 256);
+                  for (const auto &field : *query.output_fields)
+                    bytes = detail::BindingMemoryBytes(
+                        1, python_string_bytes(field), bytes);
+                  return bytes;
+                },
+                [&] { return py::cast(query.output_fields); });
+          },
+          &set_multi_fields)
       .def(
           "set_rerank_rrf",
-          [](MultiQuery &q, int rank_constant) {
+          [](PythonMultiQuery &q, int rank_constant) {
             q.rerank = reranker::RrfParams{rank_constant};
+            q.weights.reset();
           },
           py::arg("rank_constant") = 60)
       .def(
           "set_rerank_weighted",
-          [](MultiQuery &q, std::vector<double> weights) {
-            q.rerank = reranker::WeightedParams{std::move(weights)};
+          [](PythonMultiQuery &q, py::iterable weights) {
+            PythonWeightedParams staged(weights);
+            q.rerank = reranker::WeightedParams{std::move(staged.weights)};
+            q.weights = std::move(staged.memory);
           },
           py::arg("weights"))
       .def(
           "set_rerank_callback",
-          [](MultiQuery &q, reranker::CallbackParams::Callback callback) {
+          [](PythonMultiQuery &q, reranker::CallbackParams::Callback callback) {
             q.rerank = reranker::CallbackParams{std::move(callback)};
+            q.weights.reset();
           },
           py::arg("callback"));
 }

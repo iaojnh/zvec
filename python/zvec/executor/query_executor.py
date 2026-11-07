@@ -196,13 +196,14 @@ class QueryExecutor:
     ) -> _MultiQuery:
         """Assemble a C++ ``_MultiQuery`` from per-route ``_SearchQuery`` objects."""
         multi_query = _MultiQuery()
-        multi_query.queries = [_SubQuery.from_search_query(query) for query in queries]
         # num_candidates controls per-sub-query candidate count for reranking pool.
         # It must NOT be limited to the final output topk; use at least the C++
         # SubQuery default of 10 to ensure sufficient candidates for reranking.
         _DEFAULT_NUM_CANDIDATES = 10
-        for sub in multi_query.queries:
+        subqueries = [_SubQuery.from_search_query(query) for query in queries]
+        for sub in subqueries:
             sub.num_candidates = max(ctx.topk, _DEFAULT_NUM_CANDIDATES)
+        multi_query.queries = subqueries
         multi_query.topk = ctx.topk
         if ctx.filter:
             multi_query.filter = _query_text(ctx.filter)
