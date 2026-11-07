@@ -549,13 +549,11 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
     std::string scratch =
         params_.get_as_string(PARAM_IVF_BUILDER_BUILD_STORAGE_PATH);
     if (scratch.empty() && ailego::MemoryLimitPool::get_instance().capacity()) {
-      const int ret =
-          TemporaryBufferStorage::DefaultPrefix("zvec-ivf", &scratch);
+      ret = TemporaryBufferStorage::DefaultPrefix("zvec-ivf", &scratch);
       if (ret != 0) return ret;
     }
     if (!scratch.empty() && !holder_->borrowed()) {
-      const int ret = holder_->enable_buffered_storage(scratch + ".vectors",
-                                                       holder->count());
+      ret = holder_->enable_buffered_storage(scratch + ".vectors", holder->count());
       if (ret != 0) return ret;
     }
     if (holder->count() > 0) {
@@ -582,7 +580,7 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
       if (holder_->count() >= holder->count()) {
         return IndexError_Mismatch;
       }
-      const int ret = holder_->emplace(key, data);
+      ret = holder_->emplace(key, data);
       if (ret != 0) return ret;
     }
     if (iter->status() != 0) {

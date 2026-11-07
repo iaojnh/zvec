@@ -222,7 +222,9 @@ TEST(DiskAnnLinuxAioTest, AdmitsAndReleasesTheNativeCompletionMapping) {
   LibAioLoader::RingMemory memory;
   AILEGO_DEFER([&] {
     pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-    if (ctx) EXPECT_EQ(0, loader.destroy_budgeted(ctx, memory));
+    if (ctx) {
+      EXPECT_EQ(0, loader.destroy_budgeted(ctx, memory));
+    }
   });
 
   pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
