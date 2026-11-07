@@ -110,6 +110,15 @@ jobs:
         # PowerShell 7 keeps native stderr progress messages in the log pipeline.
         shell: pwsh
 
+      - name: Compile Buffer Pool regressions with MSVC first
+        if: inputs.buffer_pool_acceptance
+        run: |
+          New-Item -ItemType Directory -Force ci-evidence | Out-Null
+          cmake --build "$env:GITHUB_WORKSPACE\build" --target diskann_filtered_beam_test flat_streamer_buffer_test --config Release --parallel $env:NPROC `
+            2>&1 | Tee-Object -FilePath ci-evidence/buffer-pool-regression-build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        shell: pwsh
+
       - name: Compile C++ test targets
         run: |
           New-Item -ItemType Directory -Force ci-evidence | Out-Null

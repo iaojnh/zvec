@@ -88,7 +88,9 @@ TEST_P(DiskAnnFilteredBeamTest, DeletedCopiesLeaveRoomForTheLiveVector) {
   ASSERT_NE(context, nullptr);
   context->set_topk(1);
   context->set_filter(
-      [](uint64_t key) { return key >= count - copies && key != target; });
+      [first_deleted = count - copies, live_target = target](uint64_t key) {
+        return key >= first_deleted && key != live_target;
+      });
   IndexQueryMeta query_meta(IndexMeta::DT_FP32, dimension);
   ASSERT_EQ(0, searcher->search_impl(query.data(), query_meta, context));
   ASSERT_EQ(1u, context->result().size());
