@@ -103,7 +103,7 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     // table and mutexes. In particular, 16 KiB host pages require 2 MiB of
     // staging per store, so a fixed 8 MiB total is not portable.
     writable_metadata_ =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+        ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
     pool_budget_ = std::max<size_t>(
         8UL * 1024UL * 1024UL, 3 * writable_metadata_ + 2UL * 1024UL * 1024UL);
     ASSERT_EQ(pool.used(), 0u);

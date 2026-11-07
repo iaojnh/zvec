@@ -15,7 +15,6 @@
 #pragma once
 
 #include <array>
-#include <deque>
 #include <memory>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
@@ -197,16 +196,14 @@ class FlatSearcherContext : public IndexSearcher::Context {
   }
 
   void reset() override {
-    results_.clear();
+    decltype(results_)().swap(results_);
     for (auto &heap : result_heaps_) heap.release();
     decltype(result_heaps_)().swap(result_heaps_);
     decltype(batch_queries_)().swap(batch_queries_);
     row_topk_.release();
-    row_topks_.clear();
-    row_topks_capacity_ = 0;
     decltype(row_query_buffer_)().swap(row_query_buffer_);
     group_topk_heaps_.clear();
-    group_results_.clear();
+    decltype(group_results_)().swap(group_results_);
   }
 
   //! Reset the context
@@ -574,90 +571,99 @@ class FlatSearcherContext : public IndexSearcher::Context {
     if (!qmeta.element_size() || query_count > SIZE_MAX / qmeta.element_size())
       return IndexError_InvalidArgument;
     results_.clear();
-    if (query_count > row_topks_capacity_) {
-      row_topks_.resize(query_count);
-      row_topks_capacity_ = query_count;
-    }
-    auto &topks = row_topks_;
     prepare_result_heaps(query_count);
-    for (size_t q = 0; q < query_count; ++q) {
-      auto &heap = result_heaps_[q];
+    for (auto &heap : result_heaps_) {
       heap.clear();
       heap.limit(topk_);
       heap.set_threshold(this->threshold());
-      topks[q].reset(heap.limit(), this->threshold());
     }
     const auto *queries = static_cast<const char *>(query);
-    const void *batch_queries = query;
-    if (row_query_preprocess_) {
-      row_query_buffer_.resize(query_count * qmeta.element_size());
-      std::memcpy(row_query_buffer_.data(), query, row_query_buffer_.size());
-      for (size_t q = 0; q < query_count; ++q) {
-        row_query_preprocess_(
-            row_query_buffer_.data() + q * qmeta.element_size(),
-            qmeta.dimension());
-      }
-      batch_queries = row_query_buffer_.data();
-    }
-    size_t feature_index = 0;
-    size_t pending = 0;
-    auto flush = [&]() {
-      if (pending == 0) return;
-      for (size_t q = 0; q < query_count; ++q) {
-        const size_t query_offset = q * qmeta.element_size();
-        if (quantizer_) {
-          quantizer_->calc_distance_dp_query_batch(
-              row_batch_pointers_.data(), static_cast<int>(pending),
-              queries + query_offset, scores_);
-        } else {
-          row_batch_distance_(
-              row_batch_pointers_.data(),
-              static_cast<const char *>(batch_queries) + query_offset, pending,
-              qmeta.dimension(), scores_,
-              row_extra_size_ ? row_batch_extras_.data() : nullptr);
-        }
-        topks[q].push_block(scores_, row_batch_indices_.data(), pending);
-      }
-      pending = 0;
-    };
+    // Keep only compact candidates per query. A BatchTopK embeds several KiB
+    // of SIMD scratch even for k=1; retaining one per query makes small-budget
+    // batches needlessly fail. Reuse one engine for each resident feature span
+    // and carry its candidates in the already-budgeted result heaps.
+    ailego::BudgetedVector<size_t> accepted_rows;
     for (size_t offset = 0; offset < features_segment_->data_size();) {
       const size_t size = std::min(size_t{actual_read_size_},
                                    features_segment_->data_size() - offset);
       IndexStorage::MemoryBlock data;
-      if (features_segment_->read(offset, data, size) != size || !data.data()) {
-        LOG_ERROR("Failed to read data (%zu bytes) from features segment",
-                  size);
+      if (features_segment_->read(offset, data, size) != size || !data.data())
         return IndexError_ReadData;
-      }
       const auto *rows = static_cast<const char *>(data.data());
-      for (size_t row_offset = 0; row_offset < size;
-           row_offset += feature_size_, ++feature_index) {
-        if constexpr (Filter) {
-          if (this->filter()(owner_->key(feature_index))) continue;
-        }
-        row_batch_pointers_[pending] = rows + row_offset;
-        if (row_extra_size_) {
-          row_batch_extras_[pending] =
-              rows + row_offset + feature_size_ - row_extra_size_;
-        }
-        row_batch_indices_[pending] = feature_index;
-        if (++pending == BATCH_SIZE) flush();
+      if constexpr (Filter) {
+        accepted_rows.clear();
+        accepted_rows.reserve(size / feature_size_);
+        const size_t first = offset / feature_size_;
+        for (size_t i = 0; i < size / feature_size_; ++i)
+          if (!this->filter()(owner_->key(first + i)))
+            accepted_rows.push_back(i);
       }
-      // Consume this span for every query while its pointers remain valid.
-      flush();
+      for (size_t q = 0; q < query_count; ++q) {
+        auto &heap = result_heaps_[q];
+        row_topk_.reset(heap.limit(), this->threshold());
+        size_t pending = 0;
+        for (const auto &candidate : heap.container()) {
+          scores_[pending] = candidate.score();
+          row_batch_indices_[pending] = candidate.index();
+          if (++pending == BATCH_SIZE) {
+            row_topk_.push_block(scores_, row_batch_indices_.data(), pending);
+            pending = 0;
+          }
+        }
+        row_topk_.push_block(scores_, row_batch_indices_.data(), pending);
+        const void *current_query = queries + q * qmeta.element_size();
+        if (row_query_preprocess_) {
+          row_query_buffer_.resize(qmeta.element_size());
+          std::memcpy(row_query_buffer_.data(), current_query,
+                      qmeta.element_size());
+          row_query_preprocess_(row_query_buffer_.data(), qmeta.dimension());
+          current_query = row_query_buffer_.data();
+        }
+        pending = 0;
+        auto flush = [&] {
+          if (!pending) return;
+          if (quantizer_) {
+            quantizer_->calc_distance_dp_query_batch(
+                row_batch_pointers_.data(), static_cast<int>(pending),
+                current_query, scores_);
+          } else {
+            row_batch_distance_(
+                row_batch_pointers_.data(), current_query, pending,
+                qmeta.dimension(), scores_,
+                row_extra_size_ ? row_batch_extras_.data() : nullptr);
+          }
+          row_topk_.push_block(scores_, row_batch_indices_.data(), pending);
+          pending = 0;
+        };
+        const size_t row_count = Filter ? accepted_rows.size()
+                                        : size / feature_size_;
+        for (size_t i = 0; i < row_count; ++i) {
+          const size_t row = Filter ? accepted_rows[i] : i;
+          const size_t row_offset = row * feature_size_;
+          const size_t feature_index = offset / feature_size_ + row;
+          row_batch_pointers_[pending] = rows + row_offset;
+          if (row_extra_size_)
+            row_batch_extras_[pending] =
+                rows + row_offset + feature_size_ - row_extra_size_;
+          row_batch_indices_[pending] = feature_index;
+          if (++pending == BATCH_SIZE) flush();
+        }
+        flush();
+        row_topk_.finish();
+        auto &documents = heap.mutable_container();
+        documents.clear();
+        documents.reserve(row_topk_.size());
+        for (size_t i = 0; i < row_topk_.size(); ++i) {
+          const auto candidate = row_topk_.result(i);
+          documents.emplace_back(0, candidate.score,
+                                 static_cast<uint32_t>(candidate.id));
+        }
+      }
       offset += size;
     }
-    for (size_t q = 0; q < query_count; ++q) {
-      auto &topk = topks[q];
-      topk.finish();
-      auto &heap = result_heaps_[q];
-      auto &documents = heap.mutable_container();
-      documents.reserve(topk.size());
-      for (size_t i = 0; i < topk.size(); ++i) {
-        const auto candidate = topk.result(i);
-        const auto index = static_cast<uint32_t>(candidate.id);
-        documents.emplace_back(owner_->key(index), candidate.score, index);
-      }
+    for (auto &heap : result_heaps_) {
+      for (auto &document : heap.mutable_container())
+        document.set_key(owner_->key(document.index()));
       heap.sort();
     }
     return 0;
@@ -731,9 +737,6 @@ class FlatSearcherContext : public IndexSearcher::Context {
   uint32_t group_num_{0}, group_topk_{0};
   GroupTopkMap<node_id_t, dist_t> group_topk_heaps_{};
   ailego::BudgetedVector<IndexGroupDocumentList> group_results_{};
-  std::deque<turbo::BatchTopK, ailego::BudgetedAllocator<turbo::BatchTopK>>
-      row_topks_;
-  size_t row_topks_capacity_{0};
 };
 
 template <size_t BATCH_SIZE>

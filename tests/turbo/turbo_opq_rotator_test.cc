@@ -87,8 +87,8 @@ TEST_F(PagedOpqRotatorTest,
         sizeof(one));
   }
   const size_t budget =
-      zvec::ailego::VecBufferPool::metadata_bytes_for_page_count(
-          hdr.payload_size / zvec::ailego::kVectorPageSize + 8, true) +
+      zvec::ailego::PoolPayloadBudget::storage_metadata_bytes(
+          hdr.payload_size / zvec::ailego::kVectorPageSize + 8) +
       64 * zvec::ailego::kVectorPageSize;
   ASSERT_LT(budget, hdr.payload_size);
   ASSERT_EQ(0, pool_.init(budget));
@@ -207,8 +207,7 @@ TEST_F(PagedOpqRotatorTest, InsufficientBudgetDoesNotAllocateHeapFallback) {
 TEST_F(PagedOpqRotatorTest, LargeWorkspaceCompletesUnderPagePressure) {
   constexpr size_t dim = 321;
   const size_t budget =
-      3 * zvec::ailego::VecBufferPool::metadata_bytes_for_page_count(1024,
-                                                                     true) +
+      3 * zvec::ailego::PoolPayloadBudget::storage_metadata_bytes(1024) +
       32 * zvec::ailego::kVectorPageSize;
   ASSERT_EQ(0, pool_.init(budget));
   zvec::turbo::RotatorSerHeader header{};

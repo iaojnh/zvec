@@ -90,10 +90,12 @@ class BufferStorageWriteTest : public ::testing::Test {
     const size_t resident_pages = writable_metadata / page_size / 2;
     ASSERT_GT(resident_pages, 8U);
     const size_t donor_metadata =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(resident_pages,
-                                                             dirty);
-    ASSERT_EQ(0, memory_pool.init(donor_metadata + writable_metadata +
-                                  8 * page_size));
+        ailego::PoolPayloadBudget::storage_metadata_bytes(resident_pages,
+                                                          dirty);
+    ASSERT_EQ(0, memory_pool.init(
+                     donor_metadata +
+                     ailego::PoolPayloadBudget::storage_metadata_bytes(1) +
+                     8 * page_size));
 
     // Prior cases leave dead queue entries. No stores are open here, so remove
     // them before testing the foreground reservation's finite scan budget.
@@ -241,8 +243,17 @@ class BufferStorageWriteTest : public ::testing::Test {
     }
     const auto after = pool->stats();
     EXPECT_EQ(kRequests, after.bypass_reads - before.bypass_reads);
-    EXPECT_EQ(block_io_staging ? 0U : kRequests,
-              after.aio_pages_submitted - before.aio_pages_submitted);
+    const auto submitted =
+        after.aio_pages_submitted - before.aio_pages_submitted;
+    if (block_io_staging &&
+        pool->io_backend_type() == ailego::IOBackendType::kIoUring) {
+      // io_uring uses separately charged metadata staging, so blocking cache
+      // page admission need not force scalar I/O. Either bounded path is valid.
+      EXPECT_LE(submitted, kRequests);
+    } else {
+      EXPECT_EQ(block_io_staging ? 0U : kRequests, submitted);
+    }
+    EXPECT_LE(memory.used(), memory.capacity());
     blocks.clear();
     EXPECT_EQ(0, reader->close());
   }
@@ -1736,7 +1747,7 @@ TEST_F(BufferStorageWriteTest, ReadOnlyColdBatchUsesBypassAio) {
 }
 
 TEST_F(BufferStorageWriteTest,
-       ReadOnlyColdBatchFallsBackWhenAioStagingIsBlocked) {
+       ReadOnlyColdBatchPreservesBudgetUnderMetadataPressure) {
   check_read_only_cold_batch(true);
 }
 #endif

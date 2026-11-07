@@ -216,7 +216,7 @@ class StratifiedClusterStorageTest : public ::testing::Test {
     capacity_ = pool.capacity();
     ASSERT_EQ(0u, pool.used());
     budget_ =
-        3 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+        3 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
         256 * 1024;
     ASSERT_EQ(0, pool.init(budget_));
     calls = {};
@@ -290,7 +290,7 @@ TEST_F(StratifiedClusterStorageTest,
        CorpusLargerThanPoolOnlyMountsBoundedBatches) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t metadata_bytes =
-      ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+      ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
   // Two 256 KiB label batches overlap while replacing the mounted batch.
   // Keep room for their directory, row scratch, and page reads as well.
   ASSERT_EQ(0, pool.init(2 * metadata_bytes + 768 * 1024));

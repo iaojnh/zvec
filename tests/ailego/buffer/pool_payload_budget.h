@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 
 namespace zvec::ailego {
 
@@ -29,6 +30,25 @@ class PoolPayloadBudget {
     return MemoryLimitPool::slab_alignment();
   }
   using PoolStats = MemoryLimitPool::PoolStats;
+
+  // Workload budgets need room for optional writeback staging too. The
+  // production metadata estimator intentionally reports only the mandatory
+  // minimum: opening can succeed with synchronous I/O. On io_uring hosts a
+  // second, prepaid batch is retained for each writable store, and otherwise
+  // consumes the headroom these tests reserved for rows and training tiles.
+  static size_t storage_metadata_bytes(size_t pages, bool writable = true) {
+    size_t bytes = VecBufferPool::metadata_bytes_for_page_count(pages, writable);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (writable && current_io_backend_type() == IOBackendType::kIoUring) {
+      const size_t staging = VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+      if (bytes > std::numeric_limits<size_t>::max() - staging)
+        return std::numeric_limits<size_t>::max();
+      bytes += staging;
+    }
+#endif
+    return bytes;
+  }
+
 
   int init(size_t bytes) {
     auto &pool = actual();
