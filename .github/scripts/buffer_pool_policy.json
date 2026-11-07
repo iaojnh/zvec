@@ -2,6 +2,7 @@
   "schema_version": 2,
   "required_stages": [
     "build",
+    "build-memory",
     "acceptance",
     "public-suite",
     "baseline-build",
@@ -17,6 +18,13 @@
     "io-backends"
   ],
   "baseline_commit": "30d662db4d2467937d843443074b34743bcc9baa",
+  "index_build": {
+    "budget_mib": 512,
+    "system_limit_mib": 768,
+    "rows": 200000,
+    "dimension": 768,
+    "build_workers": 4
+  },
   "minimum_qps_ratio": 0.8,
   "maximum_p99_ratio": 1.25,
   "maximum_read_bytes_ratio": 1.25,

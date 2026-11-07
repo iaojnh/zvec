@@ -31,6 +31,7 @@ NATIVE_TARGETS = (
     "ivf_workspace_budget_test",
     "diskann_file_reader_aio_test",
     "diskann_filtered_beam_test",
+    "index_build_admission_test",
     "c_api_memory_budget_test",
     "internal_ids_memory_test",
     "flat_flow_workspace_test",

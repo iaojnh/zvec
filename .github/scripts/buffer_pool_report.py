@@ -110,6 +110,91 @@ def performance(baseline, candidate):
     }
 
 
+def build_memory_results(root):
+    results = []
+    config = POLICY["index_build"]
+    for index in ("ivf", "diskann"):
+        directory = root / f"buffer-pool-evidence-build-{index}"
+        values = rows(directory / "build.jsonl")
+        phases = {row["phase"]: row for row in values}
+        for phase in (
+            "start",
+            "insert_finished",
+            "flush_finished",
+            "build_started",
+            "build_finished",
+            "closed_after_build",
+            "reopened_verified",
+            "complete",
+        ):
+            assert sum(row["phase"] == phase for row in values) == 1, (
+                f"missing/duplicate index build phase: {index}/{phase}"
+            )
+        complete = phases["complete"]
+        assert complete["index"] == index
+        for key in ("rows", "dimension", "budget_mib", "build_workers"):
+            assert complete[key] == config[key], f"wrong build control: {index}/{key}"
+        vector_bytes = complete["rows"] * complete["dimension"] * 4
+        assert complete["input_vector_bytes"] == vector_bytes
+        assert vector_bytes > complete["budget_mib"] * 1024**2, (
+            "build corpus must exceed memory budget"
+        )
+        assert phases["start"]["max_buffer_mib"] == 1
+        assert phases["build_finished"]["indexed_rows"] == complete["rows"]
+        assert phases["reopened_verified"]["indexed_rows"] == complete["rows"]
+        trace = next(row for row in values if row["phase"] == "rss_soft_limit")
+        assert trace["target_rss_kib"] == complete["budget_mib"] * 1024
+        start = phases["build_started"]["monotonic_seconds"]
+        end = phases["build_finished"]["monotonic_seconds"]
+        assert end > start
+        samples = [
+            json.loads(line)
+            for line in (directory / "build.samples.jsonl").read_text().splitlines()
+        ]
+        build_samples = [
+            row for row in samples if start <= row["monotonic_seconds"] <= end
+        ]
+        assert len(build_samples) >= 2, "missing independently observed build RSS"
+        tests = list(ET.parse(directory / "native.xml").getroot().iter("testcase"))
+        prefix = "Ivf" if index == "ivf" else "Diskann"
+        for precision in ("Fp16", "Fp32"):
+            matching = [
+                test
+                for test in tests
+                if test.get("name", "").endswith("/" + prefix + precision)
+            ]
+            assert len(matching) == 1 and all(
+                matching[0].find(tag) is None for tag in ("skipped", "failure", "error")
+            ), f"missing successful build denial/retry: {index}/{precision}"
+        cgroup = [
+            json.loads(line)
+            for line in (directory / "cgroup.jsonl").read_text().splitlines()
+        ]
+        assert len(cgroup) == 2 and cgroup[0]["phase"] == "cgroup_start"
+        assert (
+            cgroup[-1]["phase"] == "cgroup_complete" and cgroup[-1]["returncode"] == 0
+        )
+        for row in cgroup:
+            assert row["memory.max"] == config["system_limit_mib"] * 1024**2
+            assert row["memory.swap.max"] == row["memory.swap.current"] == 0
+        for event in ("oom", "oom_kill", "oom_group_kill"):
+            assert int(cgroup[-1]["memory.events"].get(event, 0)) == int(
+                cgroup[0]["memory.events"].get(event, 0)
+            ), f"index build OOM: {index}/{event}"
+        results.append(
+            {
+                "index": index,
+                "budget_mib": complete["budget_mib"],
+                "input_vector_bytes": vector_bytes,
+                "build_workers": complete["build_workers"],
+                "build_seconds": end - start,
+                "build_peak_rss_kib": max(row["rss_kib"] for row in build_samples),
+                "overall_peak_rss_kib": trace["peak_rss_kib"],
+            }
+        )
+    return results
+
+
 def native_results(root):
     verified = []
     unsupported = []
@@ -186,6 +271,8 @@ def summary(root, needs):
         "some CI stages failed, skipped or were cancelled"
     )
     verified, unsupported = native_results(root)
+    builds = build_memory_results(root)
+    verified.extend(f"build-memory-{row['index']}" for row in builds)
     verified.extend(backend_results(root))
     benchmarks = []
     suite = root / "buffer-pool-public-suite" / "public.xml"
@@ -262,6 +349,7 @@ def summary(root, needs):
         "verified": verified,
         "unsupported": unsupported,
         "benchmarks": benchmarks,
+        "builds": builds,
         "scope": POLICY["scope"],
         "policy": POLICY,
     }

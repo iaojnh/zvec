@@ -19,7 +19,7 @@ import pytest
 from buffer_pool_backend_tests import BACKENDS, NATIVE_TARGETS, PYTHON_TESTS
 from buffer_pool_metrics import POLICY, stability
 from buffer_pool_native_bundle import bundle
-from buffer_pool_report import performance, rows, summary
+from buffer_pool_report import build_memory_results, performance, rows, summary
 from buffer_pool_rss_monitor import ProcessRssMonitor, RssTrace, validate_soft_rss
 from buffer_pool_system_limit import snapshot
 
@@ -30,8 +30,8 @@ def write_rows(path, values):
     return path
 
 
-def soft_rss():
-    trace = RssTrace(128 * 1024)
+def soft_rss(budget_mib=128):
+    trace = RssTrace(budget_mib * 1024)
     trace.add(0, 64 * 1024)
     trace.add(1, 64 * 1024)
     return trace.result(0)
@@ -198,6 +198,58 @@ def complete_artifacts(tmp_path):
                 write_rows(directory / f"{role}.jsonl", benchmark())
     (tmp_path / "buffer-pool-candidate").mkdir()
     (tmp_path / "buffer-pool-candidate" / "commit.txt").write_text("test-revision")
+    config = POLICY["index_build"]
+    for index in ("ivf", "diskann"):
+        directory = tmp_path / f"buffer-pool-evidence-build-{index}"
+        phases = [
+            {"phase": "calibration", "controls": [{}, {}, {}]},
+            {"phase": "start", **config, "max_buffer_mib": 1},
+            {"phase": "insert_finished"},
+            {"phase": "flush_finished"},
+            {"phase": "build_started", "monotonic_seconds": 4},
+            {
+                "phase": "build_finished",
+                "monotonic_seconds": 5,
+                "indexed_rows": config["rows"],
+            },
+            {"phase": "closed_after_build"},
+            {"phase": "reopened_verified", "indexed_rows": config["rows"]},
+            {
+                "phase": "complete",
+                "index": index,
+                **config,
+                "input_vector_bytes": config["rows"] * config["dimension"] * 4,
+            },
+            soft_rss(config["budget_mib"]),
+        ]
+        write_rows(directory / "build.jsonl", phases)
+        write_rows(
+            directory / "build.samples.jsonl",
+            [{"monotonic_seconds": t, "rss_kib": 64 * 1024} for t in (4.1, 4.5, 4.9)],
+        )
+        prefix = "Ivf" if index == "ivf" else "Diskann"
+        (directory / "native.xml").write_text(
+            "<testsuite>"
+            + "".join(
+                f'<testcase name="RejectsExhaustedBudgetAndRetries/{prefix}{precision}"/>'
+                for precision in ("Fp16", "Fp32")
+            )
+            + "</testsuite>"
+        )
+        write_rows(
+            directory / "cgroup.jsonl",
+            [
+                {
+                    "phase": phase,
+                    "returncode": 0,
+                    "memory.max": config["system_limit_mib"] * 1024**2,
+                    "memory.swap.max": 0,
+                    "memory.swap.current": 0,
+                    "memory.events": {"oom": "0", "oom_kill": "0"},
+                }
+                for phase in ("cgroup_start", "cgroup_complete")
+            ],
+        )
     for platform in ("linux-x64", "linux-arm64"):
         for backend, expected in BACKENDS.items():
             directory = tmp_path / f"buffer-pool-backends-{platform}-{backend}"
@@ -245,6 +297,34 @@ def test_summary_never_accepts_an_unexecuted_stage(tmp_path, result):
 def test_missing_required_stage_is_not_implicitly_waived(tmp_path):
     with pytest.raises(AssertionError, match="omitted"):
         summary(tmp_path, {"build": {"result": "success"}})
+
+
+@pytest.mark.parametrize("damage", ["phase", "samples", "denial", "oom", "size"])
+def test_build_memory_evidence_rejects_missing_or_invalid_proof(
+    complete_artifacts, damage
+):
+    directory = complete_artifacts / "buffer-pool-evidence-build-ivf"
+    if damage == "phase":
+        path = directory / "build.jsonl"
+        values = [json.loads(line) for line in path.read_text().splitlines()]
+        write_rows(path, [r for r in values if r["phase"] != "build_finished"])
+    elif damage == "samples":
+        (directory / "build.samples.jsonl").write_text("")
+    elif damage == "denial":
+        path = directory / "native.xml"
+        path.write_text(path.read_text().replace("/>", "><skipped/></testcase>", 1))
+    elif damage == "oom":
+        path = directory / "cgroup.jsonl"
+        values = [json.loads(line) for line in path.read_text().splitlines()]
+        values[-1]["memory.events"]["oom_kill"] = "1"
+        write_rows(path, values)
+    else:
+        path = directory / "build.jsonl"
+        values = [json.loads(line) for line in path.read_text().splitlines()]
+        next(r for r in values if r["phase"] == "complete")["input_vector_bytes"] = 1
+        write_rows(path, values)
+    with pytest.raises(AssertionError):
+        build_memory_results(complete_artifacts)
 
 
 def test_required_aio_skip_blocks_acceptance(complete_artifacts):

@@ -125,6 +125,63 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-memory:
+    name: Index build memory control (${{ matrix.index }}, 512 MiB)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {index: ivf, native_filter: '*/Ivf*'}
+          - {index: diskann, native_filter: '*/Diskann*'}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Verify build admission and retry after rejection
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/candidate/lib
+          NATIVE_FILTER: ${{ matrix.native_filter }}
+        run: |
+          mkdir -p evidence
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python -m pip install candidate/*.whl
+          tar -xzf candidate/native-tests.tar.gz -C candidate
+          candidate/bin/index_build_admission_test --gtest_color=no \
+            --gtest_filter="$NATIVE_FILTER" --gtest_output=xml:evidence/native.xml
+      - name: Build a larger-than-budget corpus without swap
+        env:
+          INDEX: ${{ matrix.index }}
+        run: |
+          set -o pipefail
+          python_path=$(command -v python)
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit="index-build-${{ matrix.index }}-${{ github.run_id }}" \
+            --property=MemoryMax=768M --property=MemorySwapMax=0 \
+            --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+            --setenv=OPENBLAS_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
+            "$python_path" .github/scripts/buffer_pool_system_limit.py 805306368 evidence/cgroup.jsonl \
+            "$python_path" -X faulthandler .github/scripts/buffer_pool_build_memory.py \
+            "$INDEX" "$RUNNER_TEMP/build-memory-collection" evidence/build.jsonl \
+            2>&1 | tee evidence/build.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-evidence-build-${{ matrix.index }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
+
   acceptance:
     name: Acceptance (${{ matrix.shard }})
     needs: build
@@ -520,7 +577,7 @@ jobs:
 
   production:
     name: Cohere 1M baseline and candidate (${{ matrix.index }}, ${{ matrix.storage }})
-    needs: [build, baseline-build, linux-scale, soak, external-limit, desktop, windows, android, ios, musllinux, io-backends]
+    needs: [build, build-memory, baseline-build, linux-scale, soak, external-limit, desktop, windows, android, ios, musllinux, io-backends]
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     strategy:
@@ -616,7 +673,7 @@ jobs:
   summary:
     name: Acceptance summary
     if: always()
-    needs: [build, acceptance, public-suite, baseline-build, desktop, windows, android, ios, musllinux, io-backends, linux-scale, soak, external-limit, production]
+    needs: [build, build-memory, acceptance, public-suite, baseline-build, desktop, windows, android, ios, musllinux, io-backends, linux-scale, soak, external-limit, production]
     runs-on: ubuntu-24.04
     env:
       RESULTS: ${{ toJSON(needs) }}
@@ -650,6 +707,11 @@ jobs:
               print(result["reason"])
           else:
               print(f"Verified {len(result['verified'])} mandatory evidence groups. QPS >= 80%; P99 <= 125% of the pinned baseline.\n")
+              print("| Index build | Input MiB | Budget MiB | Build peak RSS MiB | Seconds | Workers |")
+              print("|---|---:|---:|---:|---:|---:|")
+              for build in result["builds"]:
+                  print(f"| {build['index']} | {build['input_vector_bytes'] / 1024**2:.1f} | {build['budget_mib']} | {build['build_peak_rss_kib'] / 1024:.1f} | {build['build_seconds']:.1f} | {build['build_workers']} |")
+              print()
               print("| Index | Storage | Distribution | Cache | QPS / baseline | P99 / baseline |")
               print("|---|---|---|---|---:|---:|")
               for benchmark in result["benchmarks"]:
