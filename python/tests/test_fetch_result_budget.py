@@ -208,6 +208,37 @@ def test_retained_vectors_reject_growth_and_release_for_retry(tmp_path):
     run_worker("retained", path, "VECTOR_FP32", False, 1024, 64)
 
 
+def verify_native_fields(path, kind, mmap, dimension, count):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    native = coll._obj.Fetch(["0"])["0"]
+    data_type = getattr(zvec.DataType, kind)
+    held = []
+    for _ in range(64):
+        try:
+            held.append(native.get_any("vector", data_type))
+        except MemoryError:
+            break
+    else:
+        raise AssertionError("Native field copies must retain Python admission")
+    assert held and held[0] == vector_for(kind, dimension, 0)
+    del native
+    coll.close()
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    native = coll._obj.Fetch(["0"])["0"]
+    with pytest.raises(MemoryError):
+        native.get_any("vector", data_type)
+    held.clear()
+    assert native.get_any("vector", data_type) == vector_for(kind, dimension, 0)
+    coll.close()
+
+
+def test_native_field_copies_hold_and_release_budget(tmp_path):
+    path = tmp_path / "native_fields"
+    run_worker("build", path, "VECTOR_FP32", False, 8192, 2)
+    run_worker("native_fields", path, "VECTOR_FP32", False, 8192, 2)
+
+
 def verify_exception(path, kind, mmap, dimension, count):
     from zvec.model import _budgeted_result
 
@@ -547,6 +578,7 @@ if __name__ == "__main__":
         "group_keys": verify_group_keys,
         "verify": verify,
         "retained": verify_retained,
+        "native_fields": verify_native_fields,
         "exception": verify_exception,
         "inputs": verify_fetch_inputs,
         "iterables": verify_fetch_iterables,

@@ -96,9 +96,7 @@ void ZVecPyDoc::bind_doc(py::module_ &m) {
   doc.def("set_any", &ZVecPyDoc::set_field);
 
   // binding doc get field
-  doc.def("get_any",
-          [](Doc &self, const std::string &field, const DataType &type)
-              -> py::object { return doc_value_to_py(self, field, type); });
+  doc.def("get_any", &budgeted_doc_field_to_python);
   doc.def("get_all", &ZVecPyDoc::doc_to_tuple, py::arg("schema"),
           "Get all fields and vectors as a tuple: (id, score, fields, "
           "vectors). Dense vectors are returned as lists, sparse vectors as "

@@ -297,7 +297,8 @@ class ProcessRssBudget {
     const size_t rss_growth = std::min(bytes, mapping_bytes - rss.bytes);
     const size_t native_growth =
         std::min(bytes, mapping_bytes - native.bytes);
-    if (!materialization_allowed_locked(rss_growth, native_growth))
+    if (!materialization_allowed_locked(rss_growth, native_growth,
+                                        /*allow_at_limit=*/true))
       return false;
     if (limit()) {
       rss_materialized_ = add_saturated(rss_materialized_, rss_growth);
@@ -315,9 +316,8 @@ class ProcessRssBudget {
     return true;
   }
 
-  // Reserve measured headroom across a mapping syscall when the owner
-  // already holds the lifetime charge. An intervening sample must not clear
-  // the debit before the mapping exists.
+  // Reserve measured headroom until mapping or prefaulting completes.
+  // An intervening sample must not clear a debit for work still in flight.
   bool try_reserve_materialization(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
@@ -398,7 +398,8 @@ class ProcessRssBudget {
         native_reader_ &&
         (stamp.native_epoch != native_epoch_ || !stamp.native_epoch);
     if (!materialization_allowed_locked(charge_rss ? bytes : 0,
-                                        charge_native ? bytes : 0))
+                                        charge_native ? bytes : 0,
+                                        /*allow_at_limit=*/true))
       return false;
     if (limit() && bytes && (charge_rss || charge_native)) {
       if (charge_rss) rss_materialized_ = add_saturated(rss_materialized_, bytes);
@@ -439,11 +440,13 @@ class ProcessRssBudget {
   }
 
   bool materialization_allowed_locked(size_t bytes) const {
-    return materialization_allowed_locked(bytes, bytes);
+    return materialization_allowed_locked(bytes, bytes,
+                                          /*allow_at_limit=*/false);
   }
 
   bool materialization_allowed_locked(size_t rss_bytes,
-                                      size_t native_bytes) const {
+                                      size_t native_bytes,
+                                      bool allow_at_limit) const {
     if (admission_paused()) {
       return false;
     }
@@ -456,16 +459,21 @@ class ProcessRssBudget {
         add_saturated(pending_allocations_, pending_materializations_);
     const size_t needed = add_saturated(rss_bytes, pending);
     const size_t measured = add_saturated(rss(), rss_materialized_);
-    if (measured >= cap || needed > cap - measured) return false;
+    if (measured > cap) return false;
+    const size_t room = cap - measured;
+    // A mapping already covered by this sample may reuse that debit even
+    // when no room remains. A new projection still needs its full headroom.
+    if ((!allow_at_limit && room == 0) || needed > room) return false;
     if (native_reader_) {
       const size_t native_cap = std::min(cap, native_limit_);
       const size_t footprint =
           add_saturated(native_estimate_.sample_, native_materialized_);
       const size_t reserve = headroom(native_cap);
-      if (footprint >= native_cap ||
-          native_cap - footprint <= reserve ||
-          add_saturated(native_bytes, pending) >
-              native_cap - footprint - reserve)
+      if (footprint > native_cap) return false;
+      const size_t native_room = native_cap - footprint;
+      if (native_room < reserve ||
+          (!allow_at_limit && native_room == reserve) ||
+          add_saturated(native_bytes, pending) > native_room - reserve)
         return false;
     }
     return true;

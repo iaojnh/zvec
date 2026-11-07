@@ -302,6 +302,58 @@ void estimate_sparse_result(const Doc &doc, const std::string &name,
   estimate.add(192, values.first.size());
 }
 
+void estimate_document_value(const Doc &doc, const std::string &name,
+                              DataType type, PythonResultEstimate &estimate) {
+  switch (type) {
+    case DataType::STRING:
+    case DataType::BINARY:
+      estimate.string(doc.get_ref<std::string>(name));
+      break;
+    case DataType::ARRAY_STRING:
+    case DataType::ARRAY_BINARY:
+      estimate_query_array<std::string>(doc, name, estimate);
+      break;
+    case DataType::ARRAY_BOOL:
+      estimate_query_array<bool>(doc, name, estimate);
+      break;
+    case DataType::ARRAY_INT32:
+      estimate_query_array<int32_t>(doc, name, estimate);
+      break;
+    case DataType::ARRAY_INT64:
+      estimate_query_array<int64_t>(doc, name, estimate);
+      break;
+    case DataType::ARRAY_UINT32:
+      estimate_query_array<uint32_t>(doc, name, estimate);
+      break;
+    case DataType::ARRAY_UINT64:
+      estimate_query_array<uint64_t>(doc, name, estimate);
+      break;
+    case DataType::ARRAY_FLOAT:
+    case DataType::VECTOR_FP32:
+      estimate_query_array<float>(doc, name, estimate);
+      break;
+    case DataType::ARRAY_DOUBLE:
+    case DataType::VECTOR_FP64:
+      estimate_query_array<double>(doc, name, estimate);
+      break;
+    case DataType::VECTOR_FP16:
+      estimate_query_array<ailego::Float16>(doc, name, estimate);
+      break;
+    case DataType::VECTOR_INT8:
+      estimate_query_array<int8_t>(doc, name, estimate);
+      break;
+    case DataType::SPARSE_VECTOR_FP16:
+      estimate_sparse_result<ailego::Float16>(doc, name, estimate);
+      break;
+    case DataType::SPARSE_VECTOR_FP32:
+      estimate_sparse_result<float>(doc, name, estimate);
+      break;
+    default:
+      estimate.add(64);
+      break;
+  }
+}
+
 void estimate_document_fields(const Doc &doc, const FieldSchemaPtrList &fields,
                               PythonResultEstimate &estimate) {
   for (const auto &field : fields) {
@@ -309,54 +361,7 @@ void estimate_document_fields(const Doc &doc, const FieldSchemaPtrList &fields,
     if (!doc.has_value(name)) continue;
     estimate.string(name);
     estimate.add(64);
-    switch (field->data_type()) {
-      case DataType::STRING:
-      case DataType::BINARY:
-        estimate.string(doc.get_ref<std::string>(name));
-        break;
-      case DataType::ARRAY_STRING:
-      case DataType::ARRAY_BINARY:
-        estimate_query_array<std::string>(doc, name, estimate);
-        break;
-      case DataType::ARRAY_BOOL:
-        estimate_query_array<bool>(doc, name, estimate);
-        break;
-      case DataType::ARRAY_INT32:
-        estimate_query_array<int32_t>(doc, name, estimate);
-        break;
-      case DataType::ARRAY_INT64:
-        estimate_query_array<int64_t>(doc, name, estimate);
-        break;
-      case DataType::ARRAY_UINT32:
-        estimate_query_array<uint32_t>(doc, name, estimate);
-        break;
-      case DataType::ARRAY_UINT64:
-        estimate_query_array<uint64_t>(doc, name, estimate);
-        break;
-      case DataType::ARRAY_FLOAT:
-      case DataType::VECTOR_FP32:
-        estimate_query_array<float>(doc, name, estimate);
-        break;
-      case DataType::ARRAY_DOUBLE:
-      case DataType::VECTOR_FP64:
-        estimate_query_array<double>(doc, name, estimate);
-        break;
-      case DataType::VECTOR_FP16:
-        estimate_query_array<ailego::Float16>(doc, name, estimate);
-        break;
-      case DataType::VECTOR_INT8:
-        estimate_query_array<int8_t>(doc, name, estimate);
-        break;
-      case DataType::SPARSE_VECTOR_FP16:
-        estimate_sparse_result<ailego::Float16>(doc, name, estimate);
-        break;
-      case DataType::SPARSE_VECTOR_FP32:
-        estimate_sparse_result<float>(doc, name, estimate);
-        break;
-      default:
-        estimate.add(64);
-        break;
-    }
+    estimate_document_value(doc, name, field->data_type(), estimate);
   }
 }
 
@@ -692,6 +697,50 @@ void fetch_chunk_for_python(
 
 }  // namespace
 
+template <typename Estimate>
+static void admit_python_doc_copy(detail::ResultMemoryAllowance::Lease &memory,
+                                  size_t materialization_copies,
+                                  Estimate estimate) {
+  size_t admitted = 0;
+  while (true) {
+    // A Python caller can share and mutate a native Doc. Estimate and copy
+    // under the GIL, and recheck after admission drops it.
+    const size_t bytes = estimate();
+    if (bytes <= admitted) return;
+    {
+      py::gil_scoped_release release;
+      const size_t growth = bytes - admitted;
+      memory.add(growth,
+                 detail::BindingMemoryBytes(materialization_copies, growth));
+    }
+    admitted = bytes;
+  }
+}
+
+py::object budgeted_doc_field_to_python(Doc &doc, const std::string &field,
+                                        DataType type) {
+  if (!detail::DocumentMemoryAccess::budgeted(doc) || !doc.has_value(field))
+    return ZVecPyDoc::doc_value_to_py(doc, field, type);
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      &forward_result_allowance(), false, kPythonResultBackingQuantum);
+  // The plain value may coexist briefly with the owner-backed wrapper.
+  admit_python_doc_copy(*memory, /*materialization_copies=*/2, [&] {
+    if (!doc.has_value(field)) return size_t{0};
+    PythonResultEstimate estimate;
+    try {
+      estimate_document_value(doc, field, type, estimate);
+    } catch (const std::runtime_error &) {
+      // A type mismatch follows the native getter's existing conversion.
+      return size_t{0};
+    }
+    return estimate.bytes();
+  });
+  auto value = ZVecPyDoc::doc_value_to_py(doc, field, type);
+  if (!memory->bytes()) return value;
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_retain_field")(std::move(value), result_memory_owner(memory));
+}
+
 py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema) {
   const auto forward_fields = schema.forward_fields();
   const auto vector_fields = schema.vector_fields();
@@ -700,12 +749,11 @@ py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema) {
                                                vector_fields);
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       &forward_result_allowance(), false, kPythonResultBackingQuantum);
-  {
-    py::gil_scoped_release release;
+  admit_python_doc_copy(*memory, /*materialization_copies=*/1, [&] {
     PythonResultEstimate estimate;
     estimate_python_document(doc, forward_fields, vector_fields, estimate);
-    memory->add(estimate.bytes());
-  }
+    return estimate.bytes();
+  });
   py::list holder;
   holder.append(
       ZVecPyDoc::doc_to_tuple_with_fields(doc, forward_fields, vector_fields));

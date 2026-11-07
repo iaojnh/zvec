@@ -679,7 +679,7 @@ TEST_F(ParquetBudgetTest, SmallSlotsReuseBackingAndKeepItCharged) {
 TEST_F(ParquetBudgetTest, SmallSlotsShareOneProjectionPerRssSample) {
   using Peer = ailego::MemoryLimitPoolTestPeer;
   constexpr size_t chunk = 64 * 1024;
-  constexpr size_t headroom = chunk + 4096;
+  constexpr size_t headroom = chunk;
   auto &native = ailego::MemoryLimitPool::get_instance();
   ASSERT_TRUE(Peer::configure_rss(native, Peer::rss + headroom));
   ParquetMemoryPool pool(arrow::default_memory_pool(), true);

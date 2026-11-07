@@ -739,6 +739,33 @@ TEST(ProcessRssBudgetTest, ReusableBackingRefreshesEachReaderIndependently) {
   native_sample_valid = true;
 }
 
+TEST(ProcessRssBudgetTest, CoveredMappingsCanReuseTheLastAvailableByte) {
+  using Budget = ProcessRssBudget;
+  constexpr size_t limit = 128 * kMiB;
+  constexpr size_t bytes = 8 * kMiB;
+  for (bool native : {false, true}) {
+    SCOPED_TRACE(native);
+    Budget budget;
+    sampled_rss = (native ? 32 : 120) * kMiB;
+    native_sample = {112 * kMiB, 16 * kMiB};
+    native_sample_valid = true;
+    ASSERT_TRUE(
+        budget.configure(limit, ReadRss, native ? ReadNative : nullptr));
+    ASSERT_TRUE(budget.try_reserve(bytes));
+    auto stamp = budget.finish_reservation(bytes, true);
+    auto projection = Budget::MappingProjection::Full(bytes, stamp);
+    EXPECT_EQ(0u, budget.available());
+    EXPECT_FALSE(budget.materialization_allowed());
+    EXPECT_TRUE(budget.try_materialize_reusable(bytes, stamp));
+    EXPECT_TRUE(budget.try_extend_mapping(1, bytes, projection));
+    auto uncovered = Budget::MaterializationStamp{};
+    EXPECT_FALSE(budget.try_materialize_reusable(1, uncovered));
+    budget.set_external_pressure(Budget::PressureLevel::kCritical);
+    EXPECT_FALSE(budget.try_materialize_reusable(bytes, stamp));
+    budget.release_projected_mapping(bytes, projection);
+  }
+}
+
 TEST(ProcessRssBudgetTest, PartialMappingRefundsEachReadersProjection) {
   constexpr size_t bytes = 8 * kMiB;
   ProcessRssBudget budget;

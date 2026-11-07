@@ -22,6 +22,8 @@ namespace py = pybind11;
 namespace zvec {
 
 py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema);
+py::object budgeted_doc_field_to_python(Doc &doc, const std::string &field,
+                                        DataType type);
 
 class ZVecPyDoc {
  public:
