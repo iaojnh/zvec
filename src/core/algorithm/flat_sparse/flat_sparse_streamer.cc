@@ -129,7 +129,7 @@ int FlatSparseStreamer::flush(uint64_t checkpoint) {
   return entity_.flush(checkpoint);
 }
 
-int FlatSparseStreamer::dump(const IndexDumper::Pointer &dumper) {
+int FlatSparseStreamer::do_dump(const IndexDumper::Pointer &dumper) {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to dump, open streamer first!");
     return IndexError_NoReady;
@@ -151,7 +151,8 @@ int FlatSparseStreamer::dump(const IndexDumper::Pointer &dumper) {
   return entity_.dump(dumper);
 }
 
-FlatSparseStreamer::ContextPointer FlatSparseStreamer::create_context() const {
+FlatSparseStreamer::ContextPointer FlatSparseStreamer::do_create_context()
+    const {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to create Context, open streamer first!");
     return Context::UPointer();
@@ -177,11 +178,11 @@ FlatSparseStreamer::create_sparse_provider() const {
           entity, meta_, "FlatSparseStreamerProvider"));
 }
 
-int FlatSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
-                                 const uint32_t *sparse_indices,
-                                 const void *sparse_query,
-                                 const IndexQueryMeta &qmeta,
-                                 Context::Pointer &context) try {
+int FlatSparseStreamer::do_add(uint64_t pkey, const uint32_t sparse_count,
+                               const uint32_t *sparse_indices,
+                               const void *sparse_query,
+                               const IndexQueryMeta &qmeta,
+                               Context::Pointer &context) try {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to add_impl, open streamer first!");
     (*stats_.mutable_discarded_count())++;
@@ -239,12 +240,12 @@ int FlatSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
   return IndexError_NoMemory;
 }
 
-int FlatSparseStreamer::add_with_id_impl(uint32_t pkey,
-                                         const uint32_t sparse_count,
-                                         const uint32_t *sparse_indices,
-                                         const void *sparse_query,
-                                         const IndexQueryMeta &qmeta,
-                                         Context::Pointer &context) try {
+int FlatSparseStreamer::do_add_with_id(uint32_t pkey,
+                                       const uint32_t sparse_count,
+                                       const uint32_t *sparse_indices,
+                                       const void *sparse_query,
+                                       const IndexQueryMeta &qmeta,
+                                       Context::Pointer &context) try {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to add_with_id_impl, open streamer first!");
     (*stats_.mutable_discarded_count())++;
@@ -303,37 +304,37 @@ int FlatSparseStreamer::add_with_id_impl(uint32_t pkey,
 }
 
 //! Similarity search with sparse inputs
-int FlatSparseStreamer::search_impl(const uint32_t sparse_count,
-                                    const uint32_t *sparse_indices,
-                                    const void *sparse_query,
-                                    const IndexQueryMeta &qmeta,
-                                    Context::Pointer &context) const {
+int FlatSparseStreamer::do_search(const uint32_t sparse_count,
+                                  const uint32_t *sparse_indices,
+                                  const void *sparse_query,
+                                  const IndexQueryMeta &qmeta,
+                                  Context::Pointer &context) const {
   return search_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                      context);
 }
 
 //! Similarity search with sparse inputs
-int FlatSparseStreamer::search_impl(const uint32_t *sparse_count,
-                                    const uint32_t *sparse_indices,
-                                    const void *sparse_query,
-                                    const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const {
+int FlatSparseStreamer::do_search(const uint32_t *sparse_count,
+                                  const uint32_t *sparse_indices,
+                                  const void *sparse_query,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  Context::Pointer &context) const {
   return search_bf_impl(sparse_count, sparse_indices, sparse_query, qmeta,
                         count, context);
 }
 
 //! Similarity brute force search with sparse inputs
-int FlatSparseStreamer::search_bf_impl(const uint32_t sparse_count,
-                                       const uint32_t *sparse_indices,
-                                       const void *sparse_query,
-                                       const IndexQueryMeta &qmeta,
-                                       Context::Pointer &context) const {
+int FlatSparseStreamer::do_search_bf(const uint32_t sparse_count,
+                                     const uint32_t *sparse_indices,
+                                     const void *sparse_query,
+                                     const IndexQueryMeta &qmeta,
+                                     Context::Pointer &context) const {
   return search_bf_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                         context);
 }
 
 //! Linear search by primary keys
-int FlatSparseStreamer::search_bf_by_p_keys_impl(
+int FlatSparseStreamer::do_search_bf_by_p_keys(
     const uint32_t sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, ContextPointer &context) const {
@@ -342,24 +343,24 @@ int FlatSparseStreamer::search_bf_by_p_keys_impl(
 }
 
 //! Similarity brute force search with sparse inputs
-int FlatSparseStreamer::search_bf_impl(const uint32_t *sparse_count,
-                                       const uint32_t *sparse_indices,
-                                       const void *sparse_query,
-                                       const IndexQueryMeta &qmeta,
-                                       uint32_t count,
-                                       Context::Pointer &context) const {
-  return do_search(sparse_count, sparse_indices, sparse_query, false, {}, qmeta,
-                   count, context);
+int FlatSparseStreamer::do_search_bf(const uint32_t *sparse_count,
+                                     const uint32_t *sparse_indices,
+                                     const void *sparse_query,
+                                     const IndexQueryMeta &qmeta,
+                                     uint32_t count,
+                                     Context::Pointer &context) const {
+  return search_batch(sparse_count, sparse_indices, sparse_query, false, {},
+                      qmeta, count, context);
 }
 
 //! Linear search by primary keys with sparse inputs
-int FlatSparseStreamer::search_bf_by_p_keys_impl(
+int FlatSparseStreamer::do_search_bf_by_p_keys(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     ContextPointer &context) const {
-  return do_search(sparse_count, sparse_indices, sparse_query, true, p_keys,
-                   qmeta, count, context);
+  return search_batch(sparse_count, sparse_indices, sparse_query, true, p_keys,
+                      qmeta, count, context);
 }
 
 //! Fetch sparse vector by key
@@ -399,12 +400,13 @@ int FlatSparseStreamer::get_sparse_vector(
   return IndexError_NoMemory;
 }
 
-int FlatSparseStreamer::do_search(const uint32_t *sparse_count,
-                                  const uint32_t *sparse_indices,
-                                  const void *sparse_query, bool with_p_keys,
-                                  IndexKeyBatchView p_keys,
-                                  const IndexQueryMeta &qmeta, uint32_t count,
-                                  ContextPointer &context) const {
+int FlatSparseStreamer::search_batch(const uint32_t *sparse_count,
+                                     const uint32_t *sparse_indices,
+                                     const void *sparse_query, bool with_p_keys,
+                                     IndexKeyBatchView p_keys,
+                                     const IndexQueryMeta &qmeta,
+                                     uint32_t count,
+                                     ContextPointer &context) const {
   if (state_ != STATE_OPENED) {
     LOG_ERROR("Failed to do_search, open streamer first!");
     return IndexError_NoReady;

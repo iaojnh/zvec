@@ -50,44 +50,43 @@ class IVFStreamer : public IndexStreamer {
   int unload() override;
 
   //! Similarity brute force search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     Context::Pointer &context) const override;
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   Context::Pointer &context) const override;
 
   //! Similarity brute force search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     uint32_t count, Context::Pointer &context) const override;
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   uint32_t count, Context::Pointer &context) const override;
 
   //! Similarity brute force search restricted to primary keys.
-  int search_bf_by_keys_impl(const void *query,
-                             const std::vector<uint64_t> &keys,
-                             const IndexQueryMeta &qmeta,
-                             Context::Pointer &context) const override;
+  int do_search_bf_by_keys(const void *query, const std::vector<uint64_t> &keys,
+                           const IndexQueryMeta &qmeta,
+                           Context::Pointer &context) const override;
 
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta,
-                               Context::Pointer &context) const override {
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const override {
     return search_bf_by_p_keys_impl(query, p_keys, qmeta, 1, context);
   }
 
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta, uint32_t count,
-                               Context::Pointer &context) const override;
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta, uint32_t count,
+                             Context::Pointer &context) const override;
 
   //! Similarity search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta,
+                Context::Pointer &context) const override;
 
   //! Similarity search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  uint32_t count, Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
+                Context::Pointer &context) const override;
 
   //! Retrieve statistics
   const Stats &stats() const override;
 
   //! Create a searcher context
-  Context::Pointer create_context() const override;
+  Context::Pointer do_create_context() const override;
 
   //! Create a new iterator
   IndexProvider::Pointer create_provider() const override;

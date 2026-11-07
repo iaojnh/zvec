@@ -36,6 +36,14 @@ class IndexStorage : public IndexModule {
   //! Index Storage Pointer
   typedef std::shared_ptr<IndexStorage> Pointer;
 
+  class Temporary;
+  class Buffer;
+
+  // Carry storage failures through helpers that cannot return a status.
+  struct Exception {
+    int code;
+  };
+
   struct OpenOptions {
     bool create_if_missing{false};
     bool read_only{true};

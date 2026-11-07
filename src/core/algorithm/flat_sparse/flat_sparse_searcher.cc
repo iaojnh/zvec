@@ -85,23 +85,23 @@ int FlatSparseSearcher::unload() {
   return 0;
 }
 
-int FlatSparseSearcher::search_bf_impl(const uint32_t *sparse_count,
-                                       const uint32_t *sparse_indices,
-                                       const void *sparse_query,
-                                       const IndexQueryMeta &qmeta,
-                                       uint32_t count,
-                                       Context::Pointer &context) const {
-  return do_search(sparse_count, sparse_indices, sparse_query, false, {}, qmeta,
-                   count, context);
+int FlatSparseSearcher::do_search_bf(const uint32_t *sparse_count,
+                                     const uint32_t *sparse_indices,
+                                     const void *sparse_query,
+                                     const IndexQueryMeta &qmeta,
+                                     uint32_t count,
+                                     Context::Pointer &context) const {
+  return search_batch(sparse_count, sparse_indices, sparse_query, false, {},
+                      qmeta, count, context);
 }
 
-int FlatSparseSearcher::search_bf_by_p_keys_impl(
+int FlatSparseSearcher::do_search_bf_by_p_keys(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     ContextPointer &context) const {
-  return do_search(sparse_count, sparse_indices, sparse_query, true, p_keys,
-                   qmeta, count, context);
+  return search_batch(sparse_count, sparse_indices, sparse_query, true, p_keys,
+                      qmeta, count, context);
 }
 
 int FlatSparseSearcher::get_sparse_vector(uint64_t key,
@@ -140,7 +140,8 @@ int FlatSparseSearcher::get_sparse_vector(
   return IndexError_NoMemory;
 }
 
-FlatSparseSearcher::ContextPointer FlatSparseSearcher::create_context() const {
+FlatSparseSearcher::ContextPointer FlatSparseSearcher::do_create_context()
+    const {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Failed to create Context, load container first!");
     return Context::UPointer();
@@ -167,12 +168,13 @@ FlatSparseSearcher::create_sparse_provider() const {
           entity, meta_, "FlatSparseSearcher"));
 }
 
-int FlatSparseSearcher::do_search(const uint32_t *sparse_count,
-                                  const uint32_t *sparse_indices,
-                                  const void *sparse_query, bool with_p_keys,
-                                  IndexKeyBatchView p_keys,
-                                  const IndexQueryMeta &qmeta, uint32_t count,
-                                  ContextPointer &context) const {
+int FlatSparseSearcher::search_batch(const uint32_t *sparse_count,
+                                     const uint32_t *sparse_indices,
+                                     const void *sparse_query, bool with_p_keys,
+                                     IndexKeyBatchView p_keys,
+                                     const IndexQueryMeta &qmeta,
+                                     uint32_t count,
+                                     ContextPointer &context) const {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Failed to do search, load container first!");
     return IndexError_NoIndexLoaded;

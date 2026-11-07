@@ -1,7 +1,6 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
-#include <zvec/core/framework/index_build_partitions.h>
-
+#include "utility/index_build_partitions.h"
 #include <thread>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/memory_reservation.h>

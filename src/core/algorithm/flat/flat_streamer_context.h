@@ -98,9 +98,7 @@ class FlatStreamerContext : public IndexStreamer::Context {
   inline uint32_t group_num() const {
     return group_num_;
   }
-  using GroupHeaps =
-      std::map<GroupKey, TopkHeap, std::less<>,
-               ailego::BudgetedAllocator<std::pair<const GroupKey, TopkHeap>>>;
+  using GroupHeaps = ailego::BudgetedMap<GroupKey, TopkHeap, std::less<>>;
   inline GroupHeaps &group_topk_heaps() {
     return group_topk_heaps_;
   }

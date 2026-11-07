@@ -337,8 +337,8 @@ int DiskAnnBuilder::build_internal(IndexThreads::Pointer threads) {
 
   std::atomic<uint64_t> finished{0};
   for (size_t i = 0; i < threads->count(); ++i) {
-    task_group->submit(ailego::Closure ::New(this, &DiskAnnBuilder::do_build, i,
-                                             threads->count(), &finished));
+    task_group->execute(this, &DiskAnnBuilder::build_graph_range, i,
+                        threads->count(), &finished);
   }
 
   {
@@ -376,8 +376,8 @@ int DiskAnnBuilder::prune_internal(IndexThreads::Pointer threads) {
 
   std::atomic<uint64_t> finished{0};
   for (size_t i = 0; i < threads->count(); ++i) {
-    task_group->submit(ailego::Closure ::New(this, &DiskAnnBuilder::do_prune, i,
-                                             threads->count(), &finished));
+    task_group->execute(this, &DiskAnnBuilder::do_prune, i, threads->count(),
+                        &finished);
   }
 
   {
@@ -513,10 +513,9 @@ int DiskAnnBuilder::generate_quantized_data(IndexThreads::Pointer threads) {
         if (begin >= end) {
           break;
         }
-        task_group->submit(
-            ailego::Closure::New(this, &DiskAnnBuilder::encode_pq_batch,
-                                 static_cast<const uint8_t *>(buffer.input()),
-                                 buffer.codes(), begin, end));
+        task_group->execute(this, &DiskAnnBuilder::encode_pq_batch,
+                            static_cast<const uint8_t *>(buffer.input()),
+                            buffer.codes(), begin, end);
       }
       task_group->wait_finish();
     } else {
@@ -550,8 +549,8 @@ void DiskAnnBuilder::encode_pq_batch(const uint8_t *block_data,
   }
 }
 
-void DiskAnnBuilder::do_build(uint64_t idx, size_t step_size,
-                              std::atomic<uint64_t> *finished) {
+void DiskAnnBuilder::build_graph_range(uint64_t idx, size_t step_size,
+                                       std::atomic<uint64_t> *finished) {
   AILEGO_DEFER([&]() {
     std::lock_guard<std::mutex> latch(mutex_);
     cond_.notify_one();
@@ -644,7 +643,7 @@ void DiskAnnBuilder::do_prune(uint64_t idx, size_t step_size,
   }
 }
 
-int DiskAnnBuilder::train(const IndexTrainer::Pointer & /*trainer*/) {
+int DiskAnnBuilder::do_train(const IndexTrainer::Pointer & /*trainer*/) {
   if (state_ != BUILD_STATE_INITED) {
     LOG_ERROR("Init the builder before DiskAnnBuilder::train");
     return IndexError_NoReady;
@@ -661,8 +660,8 @@ int DiskAnnBuilder::train(const IndexTrainer::Pointer & /*trainer*/) {
   return 0;
 }
 
-int DiskAnnBuilder::train(IndexThreads::Pointer threads,
-                          IndexHolder::Pointer holder) {
+int DiskAnnBuilder::do_train(IndexThreads::Pointer threads,
+                             IndexHolder::Pointer holder) {
   if (state_ != BUILD_STATE_INITED) {
     LOG_ERROR("Init the builder before DiskAnnBuilder::train");
     return IndexError_NoReady;
@@ -725,8 +724,8 @@ int DiskAnnBuilder::do_norm(const void *data_ptr, std::string *norm_data) {
   return 0;
 }
 
-int DiskAnnBuilder::build(IndexThreads::Pointer threads,
-                          IndexHolder::Pointer holder) try {
+int DiskAnnBuilder::do_build(IndexThreads::Pointer threads,
+                             IndexHolder::Pointer holder) {
   if (state_ != BUILD_STATE_TRAINED) {
     LOG_ERROR("Train the builder before DiskAnnBuilder::build");
     return IndexError_NoReady;
@@ -877,11 +876,9 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   LOG_INFO("End DiskAnnBuilder::build");
 
   return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int DiskAnnBuilder::dump(const IndexDumper::Pointer &dumper) {
+int DiskAnnBuilder::do_dump(const IndexDumper::Pointer &dumper) {
   if (state_ != BUILD_STATE_BUILT) {
     LOG_INFO("Build the index before DiskAnnBuilder::dump");
     return IndexError_NoReady;

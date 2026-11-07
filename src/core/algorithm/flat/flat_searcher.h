@@ -84,46 +84,45 @@ class FlatSearcher : public IndexSearcher {
   }
 
   //! Similarity brute force search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     Context::Pointer &context) const override {
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   Context::Pointer &context) const override {
     return this->search_impl(query, qmeta, context);
   }
 
   //! Similarity brute force search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     uint32_t count, Context::Pointer &context) const override {
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   uint32_t count, Context::Pointer &context) const override {
     return this->search_impl(query, qmeta, count, context);
   }
 
   //! Similarity search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta,
+                Context::Pointer &context) const override;
 
   //! Similarity search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  uint32_t count, Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
+                Context::Pointer &context) const override;
 
   //! Linear search by primary keys
-  int search_bf_by_keys_impl(const void *query,
-                             const std::vector<uint64_t> &keys,
-                             const IndexQueryMeta &qmeta,
-                             Context::Pointer &context) const override {
+  int do_search_bf_by_keys(const void *query, const std::vector<uint64_t> &keys,
+                           const IndexQueryMeta &qmeta,
+                           Context::Pointer &context) const override {
     return search_bf_by_key_rows(query, &keys, qmeta, 1, context);
   }
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta,
-                               Context::Pointer &context) const override {
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const override {
     return search_bf_by_p_keys_impl(query, p_keys, qmeta, 1, context);
   }
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta, uint32_t count,
-                               Context::Pointer &context) const override;
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta, uint32_t count,
+                             Context::Pointer &context) const override;
 
   //! Retrieve statistics
   const IndexSearcher::Stats &stats() const override {
@@ -141,7 +140,7 @@ class FlatSearcher : public IndexSearcher {
   }
 
   //! Create a searcher context
-  IndexSearcher::Context::Pointer create_context() const override;
+  IndexSearcher::Context::Pointer do_create_context() const override;
 
   //! Create a searcher provider
   IndexProvider::Pointer create_provider() const override;

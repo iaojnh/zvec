@@ -39,8 +39,8 @@ class LabelFilteredIndexHolder : public IndexHolder {
     typedef std::unique_ptr<Iterator> Pointer;
 
     //! Constructor
-    Iterator(const VectorBuildSource::Pointer &holder,
-             size_t count, ReadId read)
+    Iterator(const VectorBuildSource::Pointer &holder, size_t count,
+             ReadId read)
         : holder_(holder), count_(count), read_(std::move(read)) {
       status_ = holder_->create_ordinal_reader(&reader_);
     }
@@ -92,9 +92,8 @@ class LabelFilteredIndexHolder : public IndexHolder {
   };
 
   //! Constructor
-  LabelFilteredIndexHolder(
-      const VectorBuildSource::Pointer &holder, size_t count,
-      ReadId read)
+  LabelFilteredIndexHolder(const VectorBuildSource::Pointer &holder,
+                           size_t count, ReadId read)
       : holder_(holder), count_(count), read_(std::move(read)) {}
 
   //! Retrieve count of elements in holder (-1 indicates unknown)
@@ -309,8 +308,8 @@ int IVFBuilder::cleanup() {
   return 0;
 }
 
-int IVFBuilder::train(IndexThreads::Pointer threads,
-                      IndexHolder::Pointer holder) try {
+int IVFBuilder::do_train(IndexThreads::Pointer threads,
+                         IndexHolder::Pointer holder) {
   LOG_INFO("Begin IVFBuilder::train with holder");
   if (state_ != INITED) {
     LOG_ERROR("IVFBuilder train failed, wrong state=%d", state_);
@@ -367,11 +366,9 @@ int IVFBuilder::train(IndexThreads::Pointer threads,
 
   state_ = TRAINED;
   return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int IVFBuilder::train(const IndexTrainer::Pointer &trainer) try {
+int IVFBuilder::do_train(const IndexTrainer::Pointer &trainer) {
   LOG_DEBUG("Begin IVFBuilder::train by trainer");
   ailego::ElapsedTime timer;
 
@@ -463,12 +460,10 @@ int IVFBuilder::train(const IndexTrainer::Pointer &trainer) try {
 
   state_ = TRAINED;
   return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int IVFBuilder::build(IndexThreads::Pointer threads,
-                      IndexHolder::Pointer holder) try {
+int IVFBuilder::do_build(IndexThreads::Pointer threads,
+                         IndexHolder::Pointer holder) {
   LOG_INFO("Begin IVFBuilder::build!");
 
   if (state_ != TRAINED) {
@@ -524,7 +519,8 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
                      converted_holder->count());
   ivf_check_error_code(ret);
   ret = this->build_label_index(threads.get(), converted_holder);
-  ivf_check_with_msg(ret, "Failed to build index for %s", IndexError::What(ret));
+  ivf_check_with_msg(ret, "Failed to build index for %s",
+                     IndexError::What(ret));
   ret = labels_.finish();
   ivf_check_error_code(ret);
 
@@ -537,11 +533,9 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
 
   state_ = BUILT;
   return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int IVFBuilder::dump(const IndexDumper::Pointer &dumper) try {
+int IVFBuilder::do_dump(const IndexDumper::Pointer &dumper) {
   LOG_INFO("Begin IVFBuilder::dump");
 
   if (state_ != BUILT) {
@@ -576,8 +570,6 @@ int IVFBuilder::dump(const IndexDumper::Pointer &dumper) try {
   LOG_INFO("End IVFBuilder::dump");
 
   return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 int IVFBuilder::check_and_update_major_order(IndexMeta &meta) {
@@ -785,7 +777,7 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
   ailego::BudgetedMappedBuffer vectors;
   size_t id = 0UL;
   AILEGO_DEFER([&]() {
-    task_group->wait_finish();
+    task_group->wait_finish_no_throw();
     stats_.set_built_count(id);
     LOG_INFO("Finished building, total=%zu", id);
   });
@@ -864,7 +856,8 @@ IndexHolder::Pointer IVFBuilder::label_holder(size_t centroid) const {
 }
 
 int IVFBuilder::read_vector(size_t id, uint64_t *key, const void **data) {
-  return source_reader_ ? source_reader_->read(id, key, data) : IndexError_NoReady;
+  return source_reader_ ? source_reader_->read(id, key, data)
+                        : IndexError_NoReady;
 }
 
 int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
@@ -1037,8 +1030,7 @@ int IVFBuilder::dump_index(const IndexDumper::Pointer &dumper) {
 int IVFBuilder::prepare_quantizer(IndexThreads *threads) {
   if (turbo_quantizer_) {
     if (turbo_quantizer_->require_train()) {
-      int ret = turbo_quantizer_->train(
-          holder_, thread_count_);
+      int ret = turbo_quantizer_->train(holder_, thread_count_);
       ivf_check_with_msg(ret, "Failed to train Turbo IVF posting quantizer");
     }
     quantized_meta_ = turbo_quantizer_->meta();
@@ -1138,13 +1130,13 @@ int IVFBuilder::prepare_quantizer(IndexThreads *threads) {
     return IndexError_Runtime;
   }
 
-  AILEGO_DEFER([&] { task_group->wait_finish(); });
+  AILEGO_DEFER([&] { task_group->wait_finish_no_throw(); });
   for (size_t i = 0; i < quantizers_.size(); ++i) {
     if (error_) {
       task_group->wait_finish();
       return err_code_;
     }
-    task_group->submit(ailego::Closure ::New(train_data, i));
+    task_group->execute(train_data, i);
   }
 
   task_group->wait_finish();

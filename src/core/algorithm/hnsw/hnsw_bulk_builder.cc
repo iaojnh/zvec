@@ -126,6 +126,7 @@ int HnswBulkBuilder::build(const std::string &target_path,
     pool = local_pool.get();
   }
   const uint32_t workers = std::min<uint32_t>(write_concurrency, pool->count());
+  if (!workers) return IndexError_InvalidArgument;
   // clone() traverses the main entity's chunk containers. Finish every clone
   // before the first insertion can grow those containers on a worker thread.
   ailego::BudgetedVector<IndexStreamer::Context::Pointer> contexts(workers);
@@ -133,41 +134,15 @@ int HnswBulkBuilder::build(const std::string &target_path,
     context = build->create_context();
     if (!context) return IndexError_NoMemory;
   }
-  std::atomic<size_t> next{0};
-  std::atomic<int> status{0};
-  auto group = pool->make_group();
-  bool joined = false;
-  // Keep contexts, counters and graph storage alive if task creation or
-  // submission throws after earlier workers have already started.
-  AILEGO_DEFER([&]() {
-    if (!joined) {
-      status.store(IndexError_Runtime);
-      group->wait_finish();
-    }
-  });
-  for (uint32_t worker = 0; worker < workers; ++worker) {
-    group->submit(ailego::Closure::New([&, worker]() {
-      try {
-        auto &context = contexts[worker];
-        while (status.load() == 0) {
-          const size_t id = next.fetch_add(1);
-          if (id >= vectors_.size()) break;
-          const int result =
-              build->add_with_id_impl(id, vectors_[id], vector_meta_, context);
-          if (result != 0) {
-            int expected = 0;
-            status.compare_exchange_strong(expected, result);
-          }
-        }
-      } catch (const std::bad_alloc &) {
-        int expected = 0;
-        status.compare_exchange_strong(expected, IndexError_NoMemory);
-      }
-    }));
-  }
-  group->wait_finish();
-  joined = true;
-  if (status.load() != 0) return status.load();
+  BorrowedSingleQueueIndexThreads threads(*pool);
+  ret = threads.parallel_for(
+      vectors_.size(),
+      [&](size_t id, size_t worker) {
+        return build->add_with_id_impl(id, vectors_[id], vector_meta_,
+                                       contexts[worker]);
+      },
+      workers);
+  if (ret != 0) return ret;
 
   auto dumper =
       std::make_shared<HnswBuildDumper>(graph->packed_segment_count());

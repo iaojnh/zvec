@@ -186,8 +186,8 @@ int HnswSparseBuilder::cleanup() try {
   return IndexError_NoMemory;
 }
 
-int HnswSparseBuilder::train(IndexThreads::Pointer,
-                             IndexSparseHolder::Pointer /*holder*/) try {
+int HnswSparseBuilder::do_train(IndexThreads::Pointer,
+                                IndexSparseHolder::Pointer /*holder*/) {
   if (state_ != BUILD_STATE_INITED) {
     LOG_ERROR("Init the builder before HnswSparseBuilder::train");
     return IndexError_NoReady;
@@ -200,13 +200,9 @@ int HnswSparseBuilder::train(IndexThreads::Pointer,
   LOG_INFO("End HnswSparseBuilder::train");
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int HnswSparseBuilder::train(const IndexTrainer::Pointer & /*trainer*/) try {
+int HnswSparseBuilder::do_train(const IndexTrainer::Pointer & /*trainer*/) {
   if (state_ != BUILD_STATE_INITED) {
     LOG_ERROR("Init the builder before HnswSparseBuilder::train");
     return IndexError_NoReady;
@@ -221,14 +217,10 @@ int HnswSparseBuilder::train(const IndexTrainer::Pointer & /*trainer*/) try {
   LOG_INFO("End HnswSparseBuilder::train by trainer");
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int HnswSparseBuilder::build(IndexThreads::Pointer threads,
-                             IndexSparseHolder::Pointer holder) try {
+int HnswSparseBuilder::do_build(IndexThreads::Pointer threads,
+                                IndexSparseHolder::Pointer holder) {
   if (!holder) {
     LOG_ERROR("Input holder is nullptr while building index");
     return IndexError_InvalidArgument;
@@ -313,10 +305,6 @@ int HnswSparseBuilder::build(IndexThreads::Pointer threads,
 
   LOG_INFO("End HnswSparseBuilder::build");
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 int HnswSparseBuilder::build_graph(IndexThreads::Pointer threads,
@@ -328,8 +316,8 @@ int HnswSparseBuilder::build_graph(IndexThreads::Pointer threads,
   }
 
   for (size_t i = 0; i < threads->count(); ++i) {
-    task_group->submit(ailego::Closure ::New(this, &HnswSparseBuilder::do_build,
-                                             i, threads->count(), &finished));
+    task_group->execute(this, &HnswSparseBuilder::build_graph_range, i,
+                        threads->count(), &finished);
   }
 
   {
@@ -359,8 +347,8 @@ int HnswSparseBuilder::build_graph(IndexThreads::Pointer threads,
   return IndexError_NoMemory;
 }
 
-void HnswSparseBuilder::do_build(node_id_t idx, size_t step_size,
-                                 std::atomic<node_id_t> *finished) {
+void HnswSparseBuilder::build_graph_range(node_id_t idx, size_t step_size,
+                                          std::atomic<node_id_t> *finished) {
   AILEGO_DEFER([&]() {
     std::lock_guard<std::mutex> latch(mutex_);
     cond_.notify_one();
@@ -412,7 +400,7 @@ void HnswSparseBuilder::do_build(node_id_t idx, size_t step_size,
   }
 }
 
-int HnswSparseBuilder::dump(const IndexDumper::Pointer &dumper) try {
+int HnswSparseBuilder::do_dump(const IndexDumper::Pointer &dumper) {
   if (state_ != BUILD_STATE_BUILT) {
     LOG_INFO("Build the index before HnswSparseBuilder::dump");
     return IndexError_NoReady;
@@ -441,33 +429,25 @@ int HnswSparseBuilder::dump(const IndexDumper::Pointer &dumper) try {
 
   LOG_INFO("EndHnswSparseBuilder::dump");
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int HnswSparseBuilder::build(IndexThreads::Pointer threads, size_t count,
-                             const uint64_t *keys,
-                             const uint64_t *sparse_indptr,
-                             const uint32_t *sparse_indices,
-                             const void *sparse_data) try {
+int HnswSparseBuilder::do_build(IndexThreads::Pointer threads, size_t count,
+                                const uint64_t *keys,
+                                const uint64_t *sparse_indptr,
+                                const uint32_t *sparse_indices,
+                                const void *sparse_data) {
   IndexQueryMeta qmeta(meta_.data_type());
 
   return build(threads, qmeta, count, keys, sparse_indptr, sparse_indices,
                sparse_data);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int HnswSparseBuilder::build(IndexThreads::Pointer threads,
-                             const IndexQueryMeta &qmeta, size_t count,
-                             const uint64_t *keys,
-                             const uint64_t *sparse_indptr,
-                             const uint32_t *sparse_indices,
-                             const void *sparse_data) try {
+int HnswSparseBuilder::do_build(IndexThreads::Pointer threads,
+                                const IndexQueryMeta &qmeta, size_t count,
+                                const uint64_t *keys,
+                                const uint64_t *sparse_indptr,
+                                const uint32_t *sparse_indices,
+                                const void *sparse_data) {
   if (!threads) {
     threads = std::make_shared<SingleQueueIndexThreads>(thread_cnt_, false);
     if (!threads) {
@@ -561,10 +541,6 @@ int HnswSparseBuilder::build(IndexThreads::Pointer threads,
 
   LOG_INFO("End HnswSparseBuilder::build");
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_BUILDER(HnswSparseBuilder);

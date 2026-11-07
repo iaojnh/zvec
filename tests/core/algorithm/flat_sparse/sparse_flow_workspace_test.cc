@@ -48,12 +48,12 @@ class SparseFlowSearcher : public IndexSearcher {
   int load(IndexStorage::Pointer storage, IndexMetric::Pointer) override {
     return IndexHelper::DeserializeFromStorage(storage.get(), &meta_);
   }
-  Context::Pointer create_context() const override {
+  Context::Pointer do_create_context() const override {
     return std::make_unique<SparseFlowContext>();
   }
-  int search_impl(const uint32_t *counts, const uint32_t *, const void *query,
-                  const IndexQueryMeta &meta, uint32_t count,
-                  Context::Pointer &context) const override {
+  int do_search(const uint32_t *counts, const uint32_t *, const void *query,
+                const IndexQueryMeta &meta, uint32_t count,
+                Context::Pointer &context) const override {
     ++batches;
     last_input = query;
     if (meta.data_type() != IndexMeta::DT_FP16 || meta.unit_size() != 2)
@@ -69,19 +69,19 @@ class SparseFlowSearcher : public IndexSearcher {
     }
     return 0;
   }
-  int search_bf_impl(const uint32_t *counts, const uint32_t *indices,
-                     const void *query, const IndexQueryMeta &meta,
-                     uint32_t count, Context::Pointer &ctx) const override {
+  int do_search_bf(const uint32_t *counts, const uint32_t *indices,
+                   const void *query, const IndexQueryMeta &meta,
+                   uint32_t count, Context::Pointer &ctx) const override {
     return search_impl(counts, indices, query, meta, count, ctx);
   }
-  int search_impl(uint32_t count, const uint32_t *indices, const void *query,
-                  const IndexQueryMeta &meta,
-                  Context::Pointer &ctx) const override {
+  int do_search(uint32_t count, const uint32_t *indices, const void *query,
+                const IndexQueryMeta &meta,
+                Context::Pointer &ctx) const override {
     return search_impl(&count, indices, query, meta, 1, ctx);
   }
-  int search_bf_impl(uint32_t count, const uint32_t *indices, const void *query,
-                     const IndexQueryMeta &meta,
-                     Context::Pointer &ctx) const override {
+  int do_search_bf(uint32_t count, const uint32_t *indices, const void *query,
+                   const IndexQueryMeta &meta,
+                   Context::Pointer &ctx) const override {
     return search_impl(&count, indices, query, meta, 1, ctx);
   }
   mutable size_t batches{0};

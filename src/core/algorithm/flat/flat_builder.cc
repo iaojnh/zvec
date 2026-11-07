@@ -107,8 +107,8 @@ int FlatBuilder<BATCH_SIZE>::init(
 }
 
 template <size_t BATCH_SIZE>
-int FlatBuilder<BATCH_SIZE>::build(IndexThreads::Pointer,
-                                   IndexHolder::Pointer holder) {
+int FlatBuilder<BATCH_SIZE>::do_build(IndexThreads::Pointer,
+                                      IndexHolder::Pointer holder) {
   ailego::ElapsedTime stamp;
   if (!holder->is_matched(meta_)) {
     LOG_ERROR("The holder is unmatched with initialized meta.");
@@ -122,7 +122,7 @@ int FlatBuilder<BATCH_SIZE>::build(IndexThreads::Pointer,
 }
 
 template <size_t BATCH_SIZE>
-int FlatBuilder<BATCH_SIZE>::dump(const IndexDumper::Pointer &dumper) try {
+int FlatBuilder<BATCH_SIZE>::do_dump(const IndexDumper::Pointer &dumper) {
   ailego::ElapsedTime stamp;
   if (!holder_) {
     return IndexError_NoReady;
@@ -159,8 +159,6 @@ int FlatBuilder<BATCH_SIZE>::dump(const IndexDumper::Pointer &dumper) try {
   stats_.set_dumped_count(keys.size());
   stats_.set_dumped_costtime(stamp.milli_seconds());
   return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 template <size_t BATCH_SIZE>

@@ -33,27 +33,30 @@ class HnswSparseBuilder : public IndexBuilder {
   int cleanup() override;
 
   //! Train the data
-  int train(IndexThreads::Pointer, IndexSparseHolder::Pointer holder) override;
+  int do_train(IndexThreads::Pointer,
+               IndexSparseHolder::Pointer holder) override;
 
   //! Train the data
-  int train(const IndexTrainer::Pointer &trainer) override;
+  int do_train(const IndexTrainer::Pointer &trainer) override;
 
   //! Build the index
-  int build(IndexThreads::Pointer threads,
-            IndexSparseHolder::Pointer holder) override;
+  int do_build(IndexThreads::Pointer threads,
+               IndexSparseHolder::Pointer holder) override;
 
   //! Build the index with indptr format
-  int build(IndexThreads::Pointer threads, const IndexQueryMeta &qmeta,
-            size_t count, const uint64_t *keys, const uint64_t *sparse_indptr,
-            const uint32_t *sparse_indices, const void *sparse_data) override;
+  int do_build(IndexThreads::Pointer threads, const IndexQueryMeta &qmeta,
+               size_t count, const uint64_t *keys,
+               const uint64_t *sparse_indptr, const uint32_t *sparse_indices,
+               const void *sparse_data) override;
 
   //! Build the index with indptr format
-  int build(IndexThreads::Pointer threads, size_t count, const uint64_t *keys,
-            const uint64_t *sparse_indptr, const uint32_t *sparse_indices,
-            const void *sparse_data) override;
+  int do_build(IndexThreads::Pointer threads, size_t count,
+               const uint64_t *keys, const uint64_t *sparse_indptr,
+               const uint32_t *sparse_indices,
+               const void *sparse_data) override;
 
   //! Dump index into storage
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   //! Retrieve statistics
   const Stats &stats() const override {
@@ -63,8 +66,8 @@ class HnswSparseBuilder : public IndexBuilder {
  private:
   int build_graph(IndexThreads::Pointer threads,
                   std::atomic<node_id_t> &finished);
-  void do_build(node_id_t idx, size_t step_size,
-                std::atomic<node_id_t> *finished);
+  void build_graph_range(node_id_t idx, size_t step_size,
+                         std::atomic<node_id_t> *finished);
 
   constexpr static uint32_t kDefaultLogIntervalSecs = 15U;
   constexpr static uint32_t kMaxNeighborCnt = 65535;

@@ -39,27 +39,28 @@ class FlatSparseBuilder : public IndexBuilder {
   int cleanup() override;
 
   //! Train the data
-  int train(IndexThreads::Pointer, IndexSparseHolder::Pointer holder) override;
+  int do_train(IndexThreads::Pointer,
+               IndexSparseHolder::Pointer holder) override;
 
   //! Train the data
-  int train(const IndexTrainer::Pointer &trainer) override;
+  int do_train(const IndexTrainer::Pointer &trainer) override;
 
-  int train(IndexThreads::Pointer /*threads*/,
-            IndexHolder::Pointer /*holder*/) override {
+  int do_train(IndexThreads::Pointer /*threads*/,
+               IndexHolder::Pointer /*holder*/) override {
     return IndexError_NotImplemented;
   }
 
-  int build(IndexThreads::Pointer /*threads*/,
-            IndexHolder::Pointer /*holder*/) override {
+  int do_build(IndexThreads::Pointer /*threads*/,
+               IndexHolder::Pointer /*holder*/) override {
     return IndexError_NotImplemented;
   }
 
   //! Build the index
-  int build(IndexThreads::Pointer threads,
-            IndexSparseHolder::Pointer holder) override;
+  int do_build(IndexThreads::Pointer threads,
+               IndexSparseHolder::Pointer holder) override;
 
   //! Dump index into storage
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   //! Retrieve statistics
   const Stats &stats() const override {

@@ -419,8 +419,14 @@ class IndexRunner : public IndexModule {
   virtual void print_debug_info() {};
 
   //! Create a searcher context
-  virtual Context::Pointer create_context() const {
-    return Context::Pointer();
+  virtual Context::Pointer create_context() const final {
+    try {
+      return do_create_context();
+    } catch (const std::bad_alloc &) {
+      return nullptr;
+    } catch (const IndexStorage::Exception &) {
+      return nullptr;
+    }
   }
 
   //! Create a searcher provider
@@ -492,24 +498,23 @@ class IndexRunner : public IndexModule {
   }
 
   //! Add a vector into index
-  virtual int add_impl(uint64_t /*key*/, const void * /*query*/,
-                       const IndexQueryMeta & /*qmeta*/,
-                       Context::Pointer & /*context*/) {
-    return IndexError_NotImplemented;
+  virtual int add_impl(uint64_t key, const void *query,
+                       const IndexQueryMeta &qmeta,
+                       Context::Pointer &context) final {
+    return Invoke([&] { return do_add(key, query, qmeta, context); });
   }
 
   //! Add a vector with id into index
-  virtual int add_with_id_impl(uint32_t /*id*/, const void * /*query*/,
-                               const IndexQueryMeta & /*qmeta*/,
-                               Context::Pointer & /*context*/) {
-    return IndexError_NotImplemented;
+  virtual int add_with_id_impl(uint32_t id, const void *query,
+                               const IndexQueryMeta &qmeta,
+                               Context::Pointer &context) final {
+    return Invoke([&] { return do_add_with_id(id, query, qmeta, context); });
   }
 
   //! Similarity search
-  virtual int search_impl(const void * /*query*/,
-                          const IndexQueryMeta & /*qmeta*/,
-                          Context::Pointer & /*context*/) const {
-    return IndexError_NotImplemented;
+  virtual int search_impl(const void *query, const IndexQueryMeta &qmeta,
+                          Context::Pointer &context) const final {
+    return Invoke([&] { return do_search(query, qmeta, context); });
   }
 
   //! Search one ungrouped dense query, preserving search_impl's primary keys
@@ -520,7 +525,345 @@ class IndexRunner : public IndexModule {
   virtual int search_candidates_impl(
       const void *query, const IndexQueryMeta &qmeta,
       std::vector<uint64_t> &keys, Context::Pointer &context,
-      std::vector<float> *scores = nullptr) const {
+      std::vector<float> *scores = nullptr) const final {
+    return Invoke([&] {
+      return do_search_candidates(query, qmeta, keys, context, scores);
+    });
+  }
+  //! Similarity search
+  virtual int search_impl(const void *query, const IndexQueryMeta &qmeta,
+                          uint32_t count,
+                          Context::Pointer &context) const final {
+    return Invoke([&] { return do_search(query, qmeta, count, context); });
+  }
+
+  virtual int search_impl(const uint32_t *sparse_count,
+                          const uint32_t *sparse_indices,
+                          const void *sparse_query, const IndexQueryMeta &qmeta,
+                          uint32_t count,
+                          Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search(sparse_count, sparse_indices, sparse_query, qmeta, count,
+                       context);
+    });
+  }
+
+  //! Similarity search with sparse inputs
+  virtual int search_impl(const uint32_t sparse_count,
+                          const uint32_t *sparse_indices,
+                          const void *sparse_query, const IndexQueryMeta &qmeta,
+                          Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search(sparse_count, sparse_indices, sparse_query, qmeta,
+                       context);
+    });
+  }
+
+  //! Similarity brute force search
+  virtual int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const final {
+    return Invoke([&] { return do_search_bf(query, qmeta, context); });
+  }
+  //! Similarity brute force search
+  virtual int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                             uint32_t count,
+                             Context::Pointer &context) const final {
+    return Invoke([&] { return do_search_bf(query, qmeta, count, context); });
+  }
+
+  //! Add a vector into index with dense and sparse inputs
+  virtual int add_impl(uint64_t pkey, const uint32_t sparse_count,
+                       const uint32_t *sparse_indices, const void *sparse_query,
+                       const IndexQueryMeta &qmeta,
+                       Context::Pointer &context) final {
+    return Invoke([&] {
+      return do_add(pkey, sparse_count, sparse_indices, sparse_query, qmeta,
+                    context);
+    });
+  }
+
+  //! Add a vector with id into index
+  virtual int add_with_id_impl(uint32_t id, const uint32_t sparse_count,
+                               const uint32_t *sparse_indices,
+                               const void *sparse_query,
+                               const IndexQueryMeta &qmeta,
+                               Context::Pointer &context) final {
+    return Invoke([&] {
+      return do_add_with_id(id, sparse_count, sparse_indices, sparse_query,
+                            qmeta, context);
+    });
+  }
+
+  //! Bruteforce search with sparse inputs
+  virtual int search_bf_impl(const uint32_t *sparse_count,
+                             const uint32_t *sparse_indices,
+                             const void *sparse_query,
+                             const IndexQueryMeta &qmeta, uint32_t count,
+                             Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf(sparse_count, sparse_indices, sparse_query, qmeta,
+                          count, context);
+    });
+  }
+
+  //! Bruteforce search with sparse inputs
+  virtual int search_bf_impl(const uint32_t sparse_count,
+                             const uint32_t *sparse_indices,
+                             const void *sparse_query,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf(sparse_count, sparse_indices, sparse_query, qmeta,
+                          context);
+    });
+  }
+
+  //! Single-query entry point allowing implementations to borrow candidate
+  //! keys without copying them into a batch container.
+  virtual int search_bf_by_keys_impl(const void *query,
+                                     const std::vector<uint64_t> &keys,
+                                     const IndexQueryMeta &qmeta,
+                                     Context::Pointer &context) const final {
+    return Invoke(
+        [&] { return do_search_bf_by_keys(query, keys, qmeta, context); });
+  }
+
+  //! Similarity brute force search by primary keys
+  virtual int search_bf_by_p_keys_impl(
+      const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
+      const IndexQueryMeta &qmeta, Context::Pointer &context) const final {
+    return Invoke(
+        [&] { return do_search_bf_by_p_keys(query, p_keys, qmeta, context); });
+  }
+
+  //! Similarity brute force search by primary keys
+  virtual int search_bf_by_p_keys_impl(
+      const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
+      const IndexQueryMeta &qmeta, uint32_t count,
+      Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf_by_p_keys(query, p_keys, qmeta, count, context);
+    });
+  }
+
+  //! Linear search by primary keys with dense and sparse inputs
+  virtual int search_bf_by_keys_impl(uint32_t sparse_count,
+                                     const uint32_t *sparse_indices,
+                                     const void *sparse_query,
+                                     const std::vector<uint64_t> &keys,
+                                     const IndexQueryMeta &qmeta,
+                                     Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf_by_keys(sparse_count, sparse_indices, sparse_query,
+                                  keys, qmeta, context);
+    });
+  }
+
+  //! Linear search by primary keys with dense and sparse inputs
+  virtual int search_bf_by_p_keys_impl(
+      const uint32_t sparse_count, const uint32_t *sparse_indices,
+      const void *sparse_query,
+      const std::vector<std::vector<uint64_t>> &p_keys,
+      const IndexQueryMeta &qmeta, Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf_by_p_keys(sparse_count, sparse_indices, sparse_query,
+                                    p_keys, qmeta, context);
+    });
+  }
+
+  //! Linear search by primary keys with dense and sparse inputs
+  virtual int search_bf_by_p_keys_impl(
+      const uint32_t *sparse_count, const uint32_t *sparse_indices,
+      const void *sparse_query,
+      const std::vector<std::vector<uint64_t>> &p_keys,
+      const IndexQueryMeta &qmeta, uint32_t count,
+      Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf_by_p_keys(sparse_count, sparse_indices, sparse_query,
+                                    p_keys, qmeta, count, context);
+    });
+  }
+
+  //! Linear search by primary keys with dense and sparse inputs
+  virtual int search_bf_by_p_keys_impl(
+      const void *dense_query, const uint32_t sparse_count,
+      const uint32_t *sparse_indices, const void *sparse_query,
+      const std::vector<std::vector<uint64_t>> &p_keys,
+      const IndexQueryMeta &qmeta, Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf_by_p_keys(dense_query, sparse_count, sparse_indices,
+                                    sparse_query, p_keys, qmeta, context);
+    });
+  }
+
+  //! Linear search by primary keys with dense and sparse inputs
+  virtual int search_bf_by_p_keys_impl(
+      const void *dense_query, const uint32_t *sparse_count,
+      const uint32_t *sparse_indices, const void *sparse_query,
+      const std::vector<std::vector<uint64_t>> &p_keys,
+      const IndexQueryMeta &qmeta, uint32_t count,
+      Context::Pointer &context) const final {
+    return Invoke([&] {
+      return do_search_bf_by_p_keys(dense_query, sparse_count, sparse_indices,
+                                    sparse_query, p_keys, qmeta, count,
+                                    context);
+    });
+  }
+
+  //! Update the vector in index
+  virtual int update_impl(uint64_t key, const void *query,
+                          const IndexQueryMeta &qmeta,
+                          Context::Pointer &context) final {
+    return Invoke([&] { return do_update(key, query, qmeta, context); });
+  }
+
+  //! Delete the vector in index
+  virtual int remove_impl(uint64_t key, Context::Pointer &context) final {
+    return Invoke([&] { return do_remove(key, context); });
+  }
+
+  //! Optimize the index
+  virtual int optimize_impl(IndexThreads::Pointer threads) final {
+    return Invoke([&] { return do_optimize(threads); });
+  }
+
+  //! Delete the vector in index
+  int remove(uint64_t key, Context::Pointer &context) {
+    return this->remove_impl(key, context);
+  }
+
+  //! Optimize the index
+  int optimize(IndexThreads::Pointer threads) {
+    return this->optimize_impl(threads);
+  }
+
+  //! Train the data
+  virtual int train(IndexHolder::Pointer holder) final {
+    return Invoke([&] { return do_train(holder); });
+  }
+
+  //! Train the data
+  virtual int train(IndexThreads::Pointer threads,
+                    IndexHolder::Pointer holder) final {
+    return Invoke([&] { return do_train(threads, holder); });
+  }
+
+  //! Train the data
+  virtual int train(const IndexTrainer::Pointer &trainer) final {
+    return Invoke([&] { return do_train(trainer); });
+  }
+
+  //! Train the data
+  virtual int train(IndexSparseHolder::Pointer holder) final {
+    return Invoke([&] { return do_train(holder); });
+  }
+
+  //! Train the data
+  virtual int train(IndexThreads::Pointer threads,
+                    IndexSparseHolder::Pointer holder) final {
+    return Invoke([&] { return do_train(threads, holder); });
+  }
+
+  //! Build the index
+  virtual int build(IndexHolder::Pointer holder) final {
+    return Invoke([&] { return do_build(holder); });
+  }
+
+  //! Build the index
+  virtual int build(IndexThreads::Pointer threads,
+                    IndexHolder::Pointer holder) final {
+    return Invoke([&] { return do_build(threads, holder); });
+  }
+
+  //! Build the index
+  virtual int build(IndexSparseHolder::Pointer holder) final {
+    return Invoke([&] { return do_build(holder); });
+  }
+
+  //! Build the index
+  virtual int build(IndexThreads::Pointer threads,
+                    IndexSparseHolder::Pointer holder) final {
+    return Invoke([&] { return do_build(threads, holder); });
+  }
+
+  //! Build the index with indptr format
+  virtual int build(size_t count, const uint64_t *keys,
+                    const uint64_t *sparse_indptr,
+                    const uint32_t *sparse_indices,
+                    const void *sparse_data) final {
+    return Invoke([&] {
+      return do_build(count, keys, sparse_indptr, sparse_indices, sparse_data);
+    });
+  }
+
+  virtual int build(const IndexQueryMeta &qmeta, size_t count,
+                    const uint64_t *keys, const uint64_t *sparse_indptr,
+                    const uint32_t *sparse_indices,
+                    const void *sparse_data) final {
+    return Invoke([&] {
+      return do_build(qmeta, count, keys, sparse_indptr, sparse_indices,
+                      sparse_data);
+    });
+  }
+
+  //! Build the index with indptr format
+  virtual int build(IndexThreads::Pointer threads, size_t count,
+                    const uint64_t *keys, const uint64_t *sparse_indptr,
+                    const uint32_t *sparse_indices,
+                    const void *sparse_data) final {
+    return Invoke([&] {
+      return do_build(threads, count, keys, sparse_indptr, sparse_indices,
+                      sparse_data);
+    });
+  }
+
+  //! Build the index with indptr format
+  virtual int build(IndexThreads::Pointer threads, const IndexQueryMeta &qmeta,
+                    size_t count, const uint64_t *keys,
+                    const uint64_t *sparse_indptr,
+                    const uint32_t *sparse_indices,
+                    const void *sparse_data) final {
+    return Invoke([&] {
+      return do_build(threads, qmeta, count, keys, sparse_indptr,
+                      sparse_indices, sparse_data);
+    });
+  }
+
+  //! Dump index into storage
+  virtual int dump(const IndexDumper::Pointer &dumper) final {
+    return Invoke([&] { return do_dump(dumper); });
+  }
+
+ protected:
+  virtual Context::Pointer do_create_context() const {
+    return nullptr;
+  }
+
+  // Algorithms implement these hooks. Public operations always translate
+  // managed allocation and storage failures to the established status codes.
+  virtual int do_add(uint64_t /*key*/, const void * /*query*/,
+                     const IndexQueryMeta & /*qmeta*/,
+                     Context::Pointer & /*context*/) {
+    return IndexError_NotImplemented;
+  }
+
+  virtual int do_add_with_id(uint32_t /*id*/, const void * /*query*/,
+                             const IndexQueryMeta & /*qmeta*/,
+                             Context::Pointer & /*context*/) {
+    return IndexError_NotImplemented;
+  }
+
+  virtual int do_search(const void * /*query*/,
+                        const IndexQueryMeta & /*qmeta*/,
+                        Context::Pointer & /*context*/) const {
+    return IndexError_NotImplemented;
+  }
+
+  virtual int do_search_candidates(const void *query,
+                                   const IndexQueryMeta &qmeta,
+                                   std::vector<uint64_t> &keys,
+                                   Context::Pointer &context,
+                                   std::vector<float> *scores = nullptr) const {
     keys.clear();
     if (scores) scores->clear();
     const int ret = search_impl(query, qmeta, 1, context);
@@ -538,100 +881,88 @@ class IndexRunner : public IndexModule {
     }
     return 0;
   }
-  //! Similarity search
-  virtual int search_impl(const void * /*query*/,
-                          const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
-                          Context::Pointer & /*context*/) const {
+
+  virtual int do_search(const void * /*query*/,
+                        const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
+                        Context::Pointer & /*context*/) const {
     return IndexError_NotImplemented;
   }
 
-  virtual int search_impl(const uint32_t * /*sparse_count*/,
-                          const uint32_t * /*sparse_indices*/,
-                          const void * /*sparse_query*/,
-                          const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
-                          Context::Pointer & /*context*/) const {
+  virtual int do_search(const uint32_t * /*sparse_count*/,
+                        const uint32_t * /*sparse_indices*/,
+                        const void * /*sparse_query*/,
+                        const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
+                        Context::Pointer & /*context*/) const {
     return IndexError_NotImplemented;
   }
 
-  //! Similarity search with sparse inputs
-  virtual int search_impl(const uint32_t /*sparse_count*/,
-                          const uint32_t * /*sparse_indices*/,
-                          const void * /*sparse_query*/,
-                          const IndexQueryMeta & /*qmeta*/,
-                          Context::Pointer & /*context*/) const {
+  virtual int do_search(const uint32_t /*sparse_count*/,
+                        const uint32_t * /*sparse_indices*/,
+                        const void * /*sparse_query*/,
+                        const IndexQueryMeta & /*qmeta*/,
+                        Context::Pointer & /*context*/) const {
     return IndexError_NotImplemented;
   }
 
-  //! Similarity brute force search
-  virtual int search_bf_impl(const void * /*query*/,
-                             const IndexQueryMeta & /*qmeta*/,
-                             Context::Pointer & /*context*/) const {
-    return IndexError_NotImplemented;
-  }
-  //! Similarity brute force search
-  virtual int search_bf_impl(const void * /*query*/,
-                             const IndexQueryMeta & /*qmeta*/,
-                             uint32_t /*count*/,
-                             Context::Pointer & /*context*/) const {
+  virtual int do_search_bf(const void * /*query*/,
+                           const IndexQueryMeta & /*qmeta*/,
+                           Context::Pointer & /*context*/) const {
     return IndexError_NotImplemented;
   }
 
-  //! Add a vector into index with dense and sparse inputs
-  virtual int add_impl(uint64_t /* pkey */, const uint32_t /* sparse_count*/,
-                       const uint32_t * /* sparse_indices */,
-                       const void * /* sparse_query */,
-                       const IndexQueryMeta & /* qmeta */,
-                       Context::Pointer & /* context */) {
+  virtual int do_search_bf(const void * /*query*/,
+                           const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
+                           Context::Pointer & /*context*/) const {
     return IndexError_NotImplemented;
   }
 
-  //! Add a vector with id into index
-  virtual int add_with_id_impl(uint32_t /* id */,
-                               const uint32_t /* sparse_count*/,
-                               const uint32_t * /* sparse_indices */,
-                               const void * /* sparse_query */,
-                               const IndexQueryMeta & /* qmeta */,
-                               Context::Pointer & /* context */) {
+  virtual int do_add(uint64_t /* pkey */, const uint32_t /* sparse_count*/,
+                     const uint32_t * /* sparse_indices */,
+                     const void * /* sparse_query */,
+                     const IndexQueryMeta & /* qmeta */,
+                     Context::Pointer & /* context */) {
     return IndexError_NotImplemented;
   }
 
-  //! Bruteforce search with sparse inputs
-  virtual int search_bf_impl(const uint32_t * /*sparse_count*/,
-                             const uint32_t * /*sparse_indices*/,
-                             const void * /*sparse_query*/,
-                             const IndexQueryMeta & /*qmeta*/,
-                             uint32_t /*count*/,
-                             Context::Pointer & /*context*/) const {
+  virtual int do_add_with_id(uint32_t /* id */,
+                             const uint32_t /* sparse_count*/,
+                             const uint32_t * /* sparse_indices */,
+                             const void * /* sparse_query */,
+                             const IndexQueryMeta & /* qmeta */,
+                             Context::Pointer & /* context */) {
     return IndexError_NotImplemented;
   }
 
-  //! Bruteforce search with sparse inputs
-  virtual int search_bf_impl(const uint32_t /*sparse_count*/,
-                             const uint32_t * /*sparse_indices*/,
-                             const void * /*sparse_query*/,
-                             const IndexQueryMeta & /*qmeta*/,
-                             Context::Pointer & /*context*/) const {
+  virtual int do_search_bf(const uint32_t * /*sparse_count*/,
+                           const uint32_t * /*sparse_indices*/,
+                           const void * /*sparse_query*/,
+                           const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
+                           Context::Pointer & /*context*/) const {
     return IndexError_NotImplemented;
   }
 
-  //! Single-query entry point allowing implementations to borrow candidate
-  //! keys without copying them into a batch container.
-  virtual int search_bf_by_keys_impl(const void *query,
-                                     const std::vector<uint64_t> &keys,
-                                     const IndexQueryMeta &qmeta,
-                                     Context::Pointer &context) const {
+  virtual int do_search_bf(const uint32_t /*sparse_count*/,
+                           const uint32_t * /*sparse_indices*/,
+                           const void * /*sparse_query*/,
+                           const IndexQueryMeta & /*qmeta*/,
+                           Context::Pointer & /*context*/) const {
+    return IndexError_NotImplemented;
+  }
+
+  virtual int do_search_bf_by_keys(const void *query,
+                                   const std::vector<uint64_t> &keys,
+                                   const IndexQueryMeta &qmeta,
+                                   Context::Pointer &context) const {
     return search_bf_by_p_keys_impl(query, {keys}, qmeta, 1, context);
   }
 
-  //! Similarity brute force search by primary keys
-  virtual int search_bf_by_p_keys_impl(
+  virtual int do_search_bf_by_p_keys(
       const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
       const IndexQueryMeta &qmeta, Context::Pointer &context) const {
     return search_bf_by_p_keys_impl(query, p_keys, qmeta, 1, context);
   }
 
-  //! Similarity brute force search by primary keys
-  virtual int search_bf_by_p_keys_impl(
+  virtual int do_search_bf_by_p_keys(
       const void * /*query*/,
       const std::vector<std::vector<uint64_t>> & /*p_keys*/,
       const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
@@ -639,19 +970,17 @@ class IndexRunner : public IndexModule {
     return IndexError_NotImplemented;
   }
 
-  //! Linear search by primary keys with dense and sparse inputs
-  virtual int search_bf_by_keys_impl(uint32_t sparse_count,
-                                     const uint32_t *sparse_indices,
-                                     const void *sparse_query,
-                                     const std::vector<uint64_t> &keys,
-                                     const IndexQueryMeta &qmeta,
-                                     Context::Pointer &context) const {
+  virtual int do_search_bf_by_keys(uint32_t sparse_count,
+                                   const uint32_t *sparse_indices,
+                                   const void *sparse_query,
+                                   const std::vector<uint64_t> &keys,
+                                   const IndexQueryMeta &qmeta,
+                                   Context::Pointer &context) const {
     return search_bf_by_p_keys_impl(sparse_count, sparse_indices, sparse_query,
                                     {keys}, qmeta, context);
   }
 
-  //! Linear search by primary keys with dense and sparse inputs
-  virtual int search_bf_by_p_keys_impl(
+  virtual int do_search_bf_by_p_keys(
       const uint32_t /* sparse_count */, const uint32_t * /* sparse_indices */,
       const void * /* sparse_query */,
       const std::vector<std::vector<uint64_t>> & /* p_keys */,
@@ -660,8 +989,7 @@ class IndexRunner : public IndexModule {
     return IndexError_NotImplemented;
   }
 
-  //! Linear search by primary keys with dense and sparse inputs
-  virtual int search_bf_by_p_keys_impl(
+  virtual int do_search_bf_by_p_keys(
       const uint32_t * /* sparse_count */,
       const uint32_t * /* sparse_indices */, const void * /* sparse_query */,
       const std::vector<std::vector<uint64_t>> & /*p_keys */,
@@ -670,8 +998,7 @@ class IndexRunner : public IndexModule {
     return IndexError_NotImplemented;
   }
 
-  //! Linear search by primary keys with dense and sparse inputs
-  virtual int search_bf_by_p_keys_impl(
+  virtual int do_search_bf_by_p_keys(
       const void * /*dense_query*/, const uint32_t /*sparse_count*/,
       const uint32_t * /*sparse_indices*/, const void * /*sparse_query*/,
       const std::vector<std::vector<uint64_t>> & /*p_keys*/,
@@ -679,8 +1006,7 @@ class IndexRunner : public IndexModule {
     return IndexError_NotImplemented;
   }
 
-  //! Linear search by primary keys with dense and sparse inputs
-  virtual int search_bf_by_p_keys_impl(
+  virtual int do_search_bf_by_p_keys(
       const void * /*dense_query*/, const uint32_t * /*sparse_count*/,
       const uint32_t * /*sparse_indices*/, const void * /*sparse_query*/,
       const std::vector<std::vector<uint64_t>> & /*p_keys*/,
@@ -689,119 +1015,107 @@ class IndexRunner : public IndexModule {
     return IndexError_NotImplemented;
   }
 
-  //! Update the vector in index
-  virtual int update_impl(uint64_t /*key*/, const void * /*query*/,
-                          const IndexQueryMeta & /*qmeta*/,
-                          Context::Pointer & /*context*/) {
+  virtual int do_update(uint64_t /*key*/, const void * /*query*/,
+                        const IndexQueryMeta & /*qmeta*/,
+                        Context::Pointer & /*context*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Delete the vector in index
-  virtual int remove_impl(uint64_t /*key*/, Context::Pointer & /*context*/) {
+  virtual int do_remove(uint64_t /*key*/, Context::Pointer & /*context*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Optimize the index
-  virtual int optimize_impl(IndexThreads::Pointer) {
+  virtual int do_optimize(IndexThreads::Pointer) {
     return IndexError_NotImplemented;
   }
 
-  //! Delete the vector in index
-  int remove(uint64_t key, Context::Pointer &context) {
-    return this->remove_impl(key, context);
-  }
-
-  //! Optimize the index
-  int optimize(IndexThreads::Pointer threads) {
-    return this->optimize_impl(threads);
-  }
-
-  //! Train the data
-  virtual int train(IndexHolder::Pointer holder) {
+  virtual int do_train(IndexHolder::Pointer holder) {
     return this->train(nullptr, std::move(holder));
   }
 
-  //! Train the data
-  virtual int train(IndexThreads::Pointer /*threads*/,
-                    IndexHolder::Pointer /*holder*/) {
+  virtual int do_train(IndexThreads::Pointer /*threads*/,
+                       IndexHolder::Pointer /*holder*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Train the data
-  virtual int train(const IndexTrainer::Pointer & /*trainer*/) {
+  virtual int do_train(const IndexTrainer::Pointer & /*trainer*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Train the data
-  virtual int train(IndexSparseHolder::Pointer holder) {
+  virtual int do_train(IndexSparseHolder::Pointer holder) {
     return this->train(nullptr, std::move(holder));
   }
 
-  //! Train the data
-  virtual int train(IndexThreads::Pointer /*threads*/,
-                    IndexSparseHolder::Pointer /*holder*/) {
+  virtual int do_train(IndexThreads::Pointer /*threads*/,
+                       IndexSparseHolder::Pointer /*holder*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Build the index
-  virtual int build(IndexHolder::Pointer holder) {
+  virtual int do_build(IndexHolder::Pointer holder) {
     return this->build(nullptr, std::move(holder));
   }
 
-  //! Build the index
-  virtual int build(IndexThreads::Pointer /*threads*/,
-                    IndexHolder::Pointer /*holder*/) {
+  virtual int do_build(IndexThreads::Pointer /*threads*/,
+                       IndexHolder::Pointer /*holder*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Build the index
-  virtual int build(IndexSparseHolder::Pointer holder) {
+  virtual int do_build(IndexSparseHolder::Pointer holder) {
     return this->build(nullptr, std::move(holder));
   }
 
-  //! Build the index
-  virtual int build(IndexThreads::Pointer /*threads*/,
-                    IndexSparseHolder::Pointer /*holder*/) {
+  virtual int do_build(IndexThreads::Pointer /*threads*/,
+                       IndexSparseHolder::Pointer /*holder*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Build the index with indptr format
-  virtual int build(size_t count, const uint64_t *keys,
-                    const uint64_t *sparse_indptr,
-                    const uint32_t *sparse_indices, const void *sparse_data) {
+  virtual int do_build(size_t count, const uint64_t *keys,
+                       const uint64_t *sparse_indptr,
+                       const uint32_t *sparse_indices,
+                       const void *sparse_data) {
     return this->build(nullptr, count, keys, sparse_indptr, sparse_indices,
                        sparse_data);
   }
 
-  virtual int build(const IndexQueryMeta &qmeta, size_t count,
-                    const uint64_t *keys, const uint64_t *sparse_indptr,
-                    const uint32_t *sparse_indices, const void *sparse_data) {
+  virtual int do_build(const IndexQueryMeta &qmeta, size_t count,
+                       const uint64_t *keys, const uint64_t *sparse_indptr,
+                       const uint32_t *sparse_indices,
+                       const void *sparse_data) {
     return this->build(nullptr, qmeta, count, keys, sparse_indptr,
                        sparse_indices, sparse_data);
   }
 
-  //! Build the index with indptr format
-  virtual int build(IndexThreads::Pointer /*threads*/, size_t /*count*/,
-                    const uint64_t * /*keys*/,
-                    const uint64_t * /*sparse_indptr*/,
-                    const uint32_t * /*sparse_indices*/,
-                    const void * /*sparse_data*/) {
+  virtual int do_build(IndexThreads::Pointer /*threads*/, size_t /*count*/,
+                       const uint64_t * /*keys*/,
+                       const uint64_t * /*sparse_indptr*/,
+                       const uint32_t * /*sparse_indices*/,
+                       const void * /*sparse_data*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Build the index with indptr format
-  virtual int build(IndexThreads::Pointer /*threads*/,
-                    const IndexQueryMeta & /*qmeta*/, size_t /*count*/,
-                    const uint64_t * /*keys*/,
-                    const uint64_t * /*sparse_indptr*/,
-                    const uint32_t * /*sparse_indices*/,
-                    const void * /*sparse_data*/) {
+  virtual int do_build(IndexThreads::Pointer /*threads*/,
+                       const IndexQueryMeta & /*qmeta*/, size_t /*count*/,
+                       const uint64_t * /*keys*/,
+                       const uint64_t * /*sparse_indptr*/,
+                       const uint32_t * /*sparse_indices*/,
+                       const void * /*sparse_data*/) {
     return IndexError_NotImplemented;
   }
 
-  //! Dump index into storage
-  virtual int dump(const IndexDumper::Pointer & /*dumper*/) {
+  virtual int do_dump(const IndexDumper::Pointer & /*dumper*/) {
     return IndexError_NotImplemented;
+  }
+
+ private:
+  template <typename Operation>
+  static int Invoke(Operation &&operation) {
+    try {
+      return operation();
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    } catch (const IndexStorage::Exception &error) {
+      return error.code;
+    }
   }
 };
 

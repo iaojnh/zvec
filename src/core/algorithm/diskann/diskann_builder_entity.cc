@@ -25,6 +25,7 @@
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_factory.h>
+#include <zvec/core/framework/index_storage_temporary.h>
 #include "utility/immutable_segment_view.h"
 #include "utility/ordinal_access_holder.h"
 #include "utility/paged_record_sort.h"
@@ -36,7 +37,7 @@ namespace core {
 
 struct DiskAnnBuilderEntity::BufferedBuildState {
   std::string prefix;
-  std::string directory;
+  IndexStorage::Temporary::Pointer scratch;
   std::string vector_path;
   std::string graph_path;
   std::string code_path;
@@ -51,29 +52,20 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
   bool vectors_sealed{false};
 
   int ensure_directory() {
-    if (!directory.empty()) return 0;
-    static std::atomic<uint64_t> sequence{0};
-    const auto stamp =
-        std::chrono::steady_clock::now().time_since_epoch().count();
-    for (size_t attempt = 0; attempt < 64; ++attempt) {
-      std::string candidate =
-          prefix + ".diskann-build-" + std::to_string(stamp) + "-" +
-          std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
-      // Prepare all potentially allocating strings before owning a directory.
-      std::string vectors_candidate = candidate + "/vectors";
-      std::string graph_candidate = candidate + "/graph";
-      std::string codes_candidate = candidate + "/codes";
-      std::error_code error;
-      if (std::filesystem::create_directory(candidate, error)) {
-        directory = std::move(candidate);
-        vector_path = std::move(vectors_candidate);
-        graph_path = std::move(graph_candidate);
-        code_path = std::move(codes_candidate);
-        return 0;
-      }
-      if (error && error != std::errc::file_exists) return IndexError_OpenFile;
-    }
-    return IndexError_OpenFile;
+    if (scratch) return 0;
+    IndexStorage::Temporary::Pointer owner;
+    int ret = IndexStorage::Temporary::CreateDirectory(prefix, &owner);
+    if (ret != 0) return ret;
+    std::string vectors_file, graph_file, codes_file;
+    ret = owner->reserve_file("vectors", &vectors_file);
+    if (ret == 0) ret = owner->reserve_file("graph", &graph_file);
+    if (ret == 0) ret = owner->reserve_file("codes", &codes_file);
+    if (ret != 0) return ret;
+    vector_path = std::move(vectors_file);
+    graph_path = std::move(graph_file);
+    code_path = std::move(codes_file);
+    scratch = std::move(owner);
+    return 0;
   }
 
   void release_vectors() {
@@ -93,14 +85,7 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
     if (graph_storage) graph_storage->close();
     graph_storage.reset();
     codes.close();
-    if (!graph_path.empty()) ailego::File::Delete(graph_path);
-    if (!code_path.empty()) ailego::File::Delete(code_path);
-    // Never recursively remove a caller-supplied directory or unknown files.
-    if (!directory.empty()) {
-      std::error_code error;
-      std::filesystem::remove(directory, error);
-    }
-    directory.clear();
+    scratch.reset();
     vector_path.clear();
     graph_path.clear();
     code_path.clear();

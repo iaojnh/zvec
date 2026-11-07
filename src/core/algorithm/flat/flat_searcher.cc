@@ -257,9 +257,9 @@ int FlatSearcher<BATCH_SIZE>::check_query_meta(
 }
 
 template <size_t BATCH_SIZE>
-int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
-                                          const IndexQueryMeta &qmeta,
-                                          Context::Pointer &context) const try {
+int FlatSearcher<BATCH_SIZE>::do_search(const void *query,
+                                        const IndexQueryMeta &qmeta,
+                                        Context::Pointer &context) const try {
   if (!container_) return IndexError_NoReady;
   ailego_assert(query && !!context);
   int error_code = this->check_query_meta(qmeta);
@@ -292,10 +292,10 @@ int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
 }
 
 template <size_t BATCH_SIZE>
-int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
-                                          const IndexQueryMeta &qmeta,
-                                          uint32_t count,
-                                          Context::Pointer &context) const try {
+int FlatSearcher<BATCH_SIZE>::do_search(const void *query,
+                                        const IndexQueryMeta &qmeta,
+                                        uint32_t count,
+                                        Context::Pointer &context) const try {
   if (!container_) return IndexError_NoReady;
   ailego_assert(query && count && !!context);
   int error_code = this->check_query_meta(qmeta);
@@ -330,7 +330,7 @@ int FlatSearcher<BATCH_SIZE>::search_impl(const void *query,
 }
 
 template <size_t BATCH_SIZE>
-int FlatSearcher<BATCH_SIZE>::search_bf_by_p_keys_impl(
+int FlatSearcher<BATCH_SIZE>::do_search_bf_by_p_keys(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
@@ -374,7 +374,7 @@ int FlatSearcher<BATCH_SIZE>::search_bf_by_key_rows(
 }
 
 template <size_t BATCH_SIZE>
-IndexSearcher::Context::Pointer FlatSearcher<BATCH_SIZE>::create_context()
+IndexSearcher::Context::Pointer FlatSearcher<BATCH_SIZE>::do_create_context()
     const {
   if (!container_) return nullptr;
   return IndexSearcher::Context::Pointer(

@@ -372,7 +372,7 @@ int HnswSparseStreamer::flush(uint64_t checkpoint) try {
   return IndexError_NoMemory;
 }
 
-int HnswSparseStreamer::dump(const IndexDumper::Pointer &dumper) try {
+int HnswSparseStreamer::do_dump(const IndexDumper::Pointer &dumper) {
   if (entity_.failed_build()) return IndexError_NoReady;
   LOG_INFO("HnswSparseStreamer dump");
 
@@ -388,13 +388,9 @@ int HnswSparseStreamer::dump(const IndexDumper::Pointer &dumper) try {
     return ret;
   }
   return entity_.dump(dumper);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-IndexStreamer::Context::Pointer HnswSparseStreamer::create_context() const {
+IndexStreamer::Context::Pointer HnswSparseStreamer::do_create_context() const {
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
     return Context::Pointer();
@@ -464,12 +460,11 @@ int HnswSparseStreamer::update_context(HnswSparseContext *ctx) const try {
 }
 
 //! Add a vector with id  into index with sparse inputs
-int HnswSparseStreamer::add_with_id_impl(uint32_t id,
-                                         const uint32_t sparse_count,
-                                         const uint32_t *sparse_indices,
-                                         const void *sparse_query,
-                                         const IndexQueryMeta &qmeta,
-                                         Context::Pointer &context) try {
+int HnswSparseStreamer::do_add_with_id(uint32_t id, const uint32_t sparse_count,
+                                       const uint32_t *sparse_indices,
+                                       const void *sparse_query,
+                                       const IndexQueryMeta &qmeta,
+                                       Context::Pointer &context) {
   if (entity_.failed_build()) return IndexError_NoReady;
   int ret = check_params(qmeta);
   if (ailego_unlikely(ret != 0)) {
@@ -559,18 +554,14 @@ int HnswSparseStreamer::add_with_id_impl(uint32_t id,
 
   complete = true;
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Add a vector into index with sparse inputs
-int HnswSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
-                                 const uint32_t *sparse_indices,
-                                 const void *sparse_query,
-                                 const IndexQueryMeta &qmeta,
-                                 Context::Pointer &context) try {
+int HnswSparseStreamer::do_add(uint64_t pkey, const uint32_t sparse_count,
+                               const uint32_t *sparse_indices,
+                               const void *sparse_query,
+                               const IndexQueryMeta &qmeta,
+                               Context::Pointer &context) {
   if (entity_.failed_build()) return IndexError_NoReady;
   int ret = check_params(qmeta);
   if (ailego_unlikely(ret != 0)) {
@@ -660,31 +651,23 @@ int HnswSparseStreamer::add_impl(uint64_t pkey, const uint32_t sparse_count,
 
   complete = true;
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
-int HnswSparseStreamer::search_impl(
+int HnswSparseStreamer::do_search(
     const uint32_t sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) const try {
+    IndexStreamer::Context::Pointer &context) const {
   if (entity_.failed_build()) return IndexError_NoReady;
   return search_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                      context);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
-int HnswSparseStreamer::search_impl(
+int HnswSparseStreamer::do_search(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const try {
+    IndexStreamer::Context::Pointer &context) const {
   if (entity_.failed_build()) return IndexError_NoReady;
   int ret = check_params(qmeta);
   if (ailego_unlikely(ret != 0)) {
@@ -771,31 +754,23 @@ int HnswSparseStreamer::search_impl(
   }
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
-int HnswSparseStreamer::search_bf_impl(
+int HnswSparseStreamer::do_search_bf(
     const uint32_t sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) const try {
+    IndexStreamer::Context::Pointer &context) const {
   if (entity_.failed_build()) return IndexError_NoReady;
   return search_bf_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                         context);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
-int HnswSparseStreamer::search_bf_impl(
+int HnswSparseStreamer::do_search_bf(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const try {
+    IndexStreamer::Context::Pointer &context) const {
   if (entity_.failed_build()) return IndexError_NoReady;
   int ret = check_params(qmeta);
   if (ailego_unlikely(ret != 0)) {
@@ -907,39 +882,27 @@ int HnswSparseStreamer::search_bf_impl(
   }
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Linear search by primary keys
-int HnswSparseStreamer::search_bf_by_p_keys_impl(
+int HnswSparseStreamer::do_search_bf_by_p_keys(
     const uint32_t sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
-    const IndexQueryMeta &qmeta, ContextPointer &context) const try {
+    const IndexQueryMeta &qmeta, ContextPointer &context) const {
   if (entity_.failed_build()) return IndexError_NoReady;
   return search_bf_by_p_keys_impl(&sparse_count, sparse_indices, sparse_query,
                                   p_keys, qmeta, 1, context);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Linear search by primary keys with sparse inputs
-int HnswSparseStreamer::search_bf_by_p_keys_impl(
+int HnswSparseStreamer::do_search_bf_by_p_keys(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const try {
+    Context::Pointer &context) const {
   if (entity_.failed_build()) return IndexError_NoReady;
   return search_bf_key_batch(sparse_count, sparse_indices, sparse_query, p_keys,
                              qmeta, count, context);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 int HnswSparseStreamer::search_bf_key_batch(

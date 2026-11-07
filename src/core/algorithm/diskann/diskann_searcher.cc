@@ -241,9 +241,9 @@ int DiskAnnSearcher::ensure_compatible_context(ContextPointer &context,
   return 0;
 }
 
-int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                                 uint32_t count,
-                                 Context::Pointer &context) const try {
+int DiskAnnSearcher::do_search(const void *query, const IndexQueryMeta &qmeta,
+                               uint32_t count, Context::Pointer &context) const
+    try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -306,9 +306,9 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
   return IndexError_NoMemory;
 }
 
-int DiskAnnSearcher::search_bf_impl(const void *query,
-                                    const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const try {
+int DiskAnnSearcher::do_search_bf(const void *query,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -369,7 +369,7 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
   return IndexError_NoMemory;
 }
 
-int DiskAnnSearcher::search_bf_by_p_keys_impl(
+int DiskAnnSearcher::do_search_bf_by_p_keys(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const try {
@@ -469,7 +469,7 @@ int DiskAnnSearcher::get_vector(uint64_t key, Context::Pointer &context,
   return diskann_indexer_->get_vector(id, context, vector);
 }
 
-IndexSearcher::Context::Pointer DiskAnnSearcher::create_context() const {
+IndexSearcher::Context::Pointer DiskAnnSearcher::do_create_context() const {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Load DiskAnnSearcher before creating a context");
     return Context::Pointer();

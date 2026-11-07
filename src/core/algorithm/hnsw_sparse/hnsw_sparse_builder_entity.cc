@@ -16,106 +16,32 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/hash/crc32c.h>
+#include <zvec/core/framework/index_storage_buffer.h>
 #include "utility/sparse_utility.h"
 #include "utility/temporary_buffer_storage.h"
 
 namespace zvec {
 namespace core {
 
-// All six growing arrays share one writable page table. Segment directories
-// grow per MiB, not per document. Only ingestion appends; graph workers update
-// existing rows under the algorithm's node locks.
+// Algorithm-specific stream layout; growth, paging and owned row reads are
+// shared with every other builder through IndexStorage::Buffer.
 struct HnswSparseBuilderEntity::PagedState {
   enum Buffer { Meta, Keys, Level0, Upper, Payload, Levels, Count };
-  static constexpr size_t kChunkSize = 1024 * 1024;
-  struct Stream {
-    size_t size{0};
-    ailego::BudgetedVector<IndexStorage::Segment::Pointer> chunks;
-  };
   TemporaryBufferStorage::Pointer file;
-  std::array<Stream, Count> streams;
-
+  std::array<IndexStorage::Buffer, Count> streams;
   int append(Buffer which, const void *data, size_t bytes) {
-    auto &stream = streams[which];
-    if (bytes > SIZE_MAX - stream.size) return IndexError_InvalidArgument;
-    const size_t end = stream.size + bytes;
-    try {
-      while (stream.chunks.size() <
-             end / kChunkSize + (end % kChunkSize != 0)) {
-        auto name =
-            std::to_string(which) + "." + std::to_string(stream.chunks.size());
-        int ret = file->storage()->append(name, kChunkSize);
-        if (ret != 0) return ret;
-        auto segment = file->storage()->get(name);
-        if (!segment) return IndexError_WriteData;
-        stream.chunks.push_back(std::move(segment));
-      }
-      // Publish length only after successful writes. A failed append poisons
-      // the entity; it is never silently retried against partial records.
-      int ret =
-          transfer(which, stream.size, const_cast<void *>(data), bytes, true);
-      if (ret == 0) stream.size = end;
-      return ret;
-    } catch (const std::bad_alloc &) {
-      return IndexError_NoMemory;
-    } catch (const std::exception &) {
-      return IndexError_WriteData;
-    }
+    return streams[which].append(data, bytes);
   }
-
   int transfer(Buffer which, size_t offset, void *data, size_t bytes,
                bool write) const {
-    const auto &stream = streams[which];
-    if ((!data && bytes) ||
-        (!write && (offset > stream.size || bytes > stream.size - offset)))
-      return IndexError_InvalidArgument;
-    auto *ptr = static_cast<char *>(data);
-    try {
-      while (bytes) {
-        size_t chunk = offset / kChunkSize;
-        size_t in_chunk = offset % kChunkSize;
-        size_t length = std::min(bytes, kChunkSize - in_chunk);
-        if (chunk >= stream.chunks.size()) return IndexError_InvalidArgument;
-        const auto &segment = stream.chunks[chunk];
-        size_t done = write ? segment->write(in_chunk, ptr, length)
-                            : segment->fetch(in_chunk, ptr, length);
-        if (done != length)
-          return write ? IndexError_WriteData : IndexError_ReadData;
-        offset += length;
-        ptr += length;
-        bytes -= length;
-      }
-      return 0;
-    } catch (const std::bad_alloc &) {
-      return IndexError_NoMemory;
-    } catch (const std::exception &) {
-      return write ? IndexError_WriteData : IndexError_ReadData;
-    }
+    if (write)
+      return const_cast<IndexStorage::Buffer &>(streams[which])
+          .write(offset, data, bytes);
+    return streams[which].read(offset, data, bytes);
   }
-
   int read(Buffer which, size_t offset, size_t bytes,
            IndexStorage::MemoryBlock &block) const {
-    block = {};
-    const auto &stream = streams[which];
-    if (offset > stream.size || bytes > stream.size - offset)
-      return IndexError_InvalidArgument;
-    try {
-      // A row may span pages/chunks. Copy only this row; no escaping pins and
-      // no thread-local alias shared by two distance operands.
-      // Metadata and neighbor rows are usually much smaller than an OS page.
-      // Account their actual capacity instead of allocating a mapped page for
-      // each distance operand, which would exhaust small concurrent budgets.
-      using Row = ailego::BudgetedVector<uint64_t>;
-      auto row = std::allocate_shared<Row>(
-          ailego::BudgetedAllocator<Row>{},
-          bytes / sizeof(uint64_t) + (bytes % sizeof(uint64_t) != 0));
-      int ret = transfer(which, offset, row->data(), bytes, false);
-      if (ret == 0)
-        block = IndexStorage::MemoryBlock::MakeSharedView(row->data(), row);
-      return ret;
-    } catch (const std::bad_alloc &) {
-      return IndexError_NoMemory;
-    }
+    return streams[which].read(offset, bytes, block);
   }
 };
 
@@ -184,6 +110,8 @@ int HnswSparseBuilderEntity::init() {
     if (ret == 0)
       ret = TemporaryBufferStorage::CreateEmpty(prefix, &candidate->file);
     if (ret != 0) return record_error(ret);
+    for (auto &stream : candidate->streams)
+      stream = IndexStorage::Buffer(candidate->file);
     paged_ = std::move(candidate);
   }
 
@@ -228,22 +156,22 @@ int HnswSparseBuilderEntity::add_vector(level_t level, key_t key,
     return IndexError_InvalidValue;
   }
 
-  std::string sparse_buffer;
+  ailego::BudgetedString sparse_buffer;
   SparseUtility::TransSparseFormat(sparse_count, sparse_indices, sparse_vec,
                                    sparse_unit_size(), sparse_buffer);
 
   uint32_t sparse_len = sparse_buffer.size();
 
   if (paged_) {
-    std::vector<char> meta(node_size(), 0);
+    ailego::BudgetedVector<char> meta(node_size(), 0);
     std::memcpy(meta.data() + vector_size(), &sparse_data_offset_,
                 sizeof(uint64_t));
     std::memcpy(meta.data() + vector_size() + sizeof(uint64_t), &sparse_len,
                 sizeof(sparse_len));
-    const SparseNeighborIndex index(paged_->streams[PagedState::Upper].size,
+    const SparseNeighborIndex index(paged_->streams[PagedState::Upper].size(),
                                     level);
-    std::vector<char> zeros(std::max(neighbors_size_, upper_neighbors_size_),
-                            0);
+    ailego::BudgetedVector<char> zeros(
+        std::max(neighbors_size_, upper_neighbors_size_), 0);
     int ret = paged_->append(PagedState::Meta, meta.data(), meta.size());
     if (!ret) ret = paged_->append(PagedState::Keys, &key, sizeof(key));
     if (!ret)

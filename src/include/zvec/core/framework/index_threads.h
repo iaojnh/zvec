@@ -15,10 +15,13 @@
 #pragma once
 
 #include <algorithm>
+#include <exception>
 #include <thread>
 #include <utility>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/pattern/closure.h>
+#include <zvec/core/framework/index_storage.h>
 
 namespace zvec {
 namespace core {
@@ -48,8 +51,38 @@ class IndexThreads {
     //! Check if the group is finished
     virtual bool is_finished() const = 0;
 
+    // A failed group stops accepting useful work. Running operations must
+    // cooperate with cancellation; wait_finish still joins every worker.
+    virtual bool cancelled() const {
+      return false;
+    }
+
     //! Wait until all tasks in group finished
     virtual void wait_finish() = 0;
+
+    // Keep closure construction inside the same failure boundary as submission.
+    template <typename... Arguments>
+    void execute(Arguments &&...arguments) {
+      try {
+        submit(ailego::Closure::New(std::forward<Arguments>(arguments)...));
+      } catch (...) {
+        cancel_pending();
+        wait_finish_no_throw();
+        throw;
+      }
+    }
+
+    // Cleanup joins cannot replace the original failure or throw from a
+    // destructor. Successful paths use wait_finish() to observe worker errors.
+    void wait_finish_no_throw() noexcept {
+      try {
+        wait_finish();
+      } catch (...) {
+      }
+    }
+
+   protected:
+    virtual void cancel_pending() {}
   };
 
   //! Destructor
@@ -69,6 +102,48 @@ class IndexThreads {
 
   //! Get the current work thread index
   virtual int indexof_this() const = 0;
+  // Run bounded workers with private workspace slots. The callback returns
+  // an index status for (ordinal, worker). Errors cancel remaining iterations
+  // and all workers are joined before returning, including failed submission.
+  template <typename Operation>
+  int parallel_for(size_t records, Operation &&operation,
+                   size_t max_workers = 0) try {
+    if (!records) return 0;
+    const size_t workers = std::min(
+        records, max_workers ? std::min(max_workers, count()) : count());
+    if (!workers) return IndexError_InvalidArgument;
+    if (records > SIZE_MAX - workers) return IndexError_Overflow;
+    std::atomic<size_t> next{0};
+    std::atomic<int> result{0};
+    auto group = make_group();
+    if (!group) return IndexError_NoMemory;
+    try {
+      for (size_t worker = 0; worker < workers; ++worker) {
+        group->execute([&, worker] {
+          while (!result.load(std::memory_order_acquire) &&
+                 !group->cancelled()) {
+            const size_t ordinal = next.fetch_add(1, std::memory_order_relaxed);
+            if (ordinal >= records) break;
+            const int ret = operation(ordinal, worker);
+            if (ret != 0) {
+              int expected = 0;
+              result.compare_exchange_strong(expected, ret);
+            }
+          }
+        });
+      }
+      group->wait_finish();
+    } catch (...) {
+      result.store(IndexError_Runtime, std::memory_order_release);
+      group->wait_finish_no_throw();
+      throw;
+    }
+    return result.load();
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  } catch (const IndexStorage::Exception &error) {
+    return error.code;
+  }
 };
 
 /*! Single Queue Index Threads
@@ -84,14 +159,45 @@ class SingleQueueIndexThreads : public IndexThreads {
     //! Constructor
     explicit SingleQueueTaskGroup(
         ailego::ThreadPool::TaskGroup::Pointer task_group)
-        : task_group_(std::move(task_group)) {}
+        : task_group_(std::move(task_group)),
+          state_(
+              std::allocate_shared<State>(ailego::BudgetedAllocator<State>{})) {
+    }
+
+    ~SingleQueueTaskGroup() override {
+      if (std::uncaught_exceptions())
+        state_->cancelled.store(true, std::memory_order_release);
+      // Never leave workers using a caller's stack after the group is released.
+      task_group_->wait_finish();
+    }
 
     //! Submit a task to be executed asynchronous
     void submit(ailego::ClosureHandler &&task) override {
       while (task_group_->pending_count() >= kMaxQueueSize) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      task_group_->enqueue_and_wake(std::move(task));
+      try {
+        auto state = state_;
+        task_group_->enqueue_and_wake(
+            ailego::Closure::New([state, task = std::move(task)]() {
+              if (state->cancelled.load(std::memory_order_acquire)) return;
+              try {
+                task->run();
+              } catch (...) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->error) state->error = std::current_exception();
+                state->cancelled.store(true, std::memory_order_release);
+              }
+            }));
+      } catch (...) {
+        state_->cancelled.store(true, std::memory_order_release);
+        task_group_->wait_finish();
+        throw;
+      }
+    }
+
+    bool cancelled() const override {
+      return state_->cancelled.load(std::memory_order_acquire);
     }
 
     //! Check if the group is finished
@@ -101,12 +207,28 @@ class SingleQueueIndexThreads : public IndexThreads {
 
     //! Wait until all tasks in group finished
     void wait_finish() override {
-      return task_group_->wait_finish();
+      task_group_->wait_finish();
+      std::exception_ptr error;
+      {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        error = state_->error;
+      }
+      if (error) std::rethrow_exception(error);
     }
 
    private:
+    void cancel_pending() override {
+      state_->cancelled.store(true, std::memory_order_release);
+    }
+
     //! Members
+    struct State {
+      std::atomic<bool> cancelled{false};
+      std::mutex mutex;
+      std::exception_ptr error;
+    };
     ailego::ThreadPool::TaskGroup::Pointer task_group_{};
+    std::shared_ptr<State> state_;
   };
 
   //! Constructor

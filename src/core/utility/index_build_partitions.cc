@@ -1,7 +1,6 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
-#include <zvec/core/framework/index_build_partitions.h>
-
+#include "utility/index_build_partitions.h"
 #include <algorithm>
 #include <atomic>
 #include <exception>
@@ -130,9 +129,9 @@ int IndexBuildPartitions::read(size_t partition, size_t offset,
     return 0;
   }
   KeyOrderRecord record;
-  int ret = state_->data.read(
-      (state_->offsets[partition] + offset) * sizeof(record), &record,
-      sizeof(record));
+  int ret =
+      state_->data.read((state_->offsets[partition] + offset) * sizeof(record),
+                        &record, sizeof(record));
   if (ret != 0) return ret;
   if (record.key != partition) return IndexError_InvalidFormat;
   *ordinal = record.id;

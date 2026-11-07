@@ -46,15 +46,15 @@ class IvfRabitqBuilder : public IndexBuilder {
   int cleanup() override;
 
   //! Train the data (KMeans clustering + rotator)
-  int train(IndexThreads::Pointer threads,
-            IndexHolder::Pointer holder) override;
+  int do_train(IndexThreads::Pointer threads,
+               IndexHolder::Pointer holder) override;
 
   //! Build the index (assign vectors to centroids, quantize)
-  int build(IndexThreads::Pointer threads,
-            IndexHolder::Pointer holder) override;
+  int do_build(IndexThreads::Pointer threads,
+               IndexHolder::Pointer holder) override;
 
   //! Dump index into file system
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   //! Retrieve statistics
   const Stats &stats() const override {

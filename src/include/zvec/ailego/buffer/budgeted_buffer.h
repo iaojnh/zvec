@@ -4,8 +4,11 @@
 
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <new>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
@@ -18,6 +21,31 @@ using BudgetedVector = std::vector<T, BudgetedAllocator<T>>;
 using BudgetedString =
     std::basic_string<char, std::char_traits<char>, BudgetedAllocator<char>>;
 
+namespace detail {
+template <typename Key>
+struct BudgetedKeyHash {
+  using Type = std::hash<Key>;
+};
+template <>
+struct BudgetedKeyHash<BudgetedString> {
+  struct Type {
+    size_t operator()(const BudgetedString &key) const noexcept {
+      return std::hash<std::string_view>{}({key.data(), key.size()});
+    }
+  };
+};
+}  // namespace detail
+
+template <typename Key, typename Value, typename Compare = std::less<Key>>
+using BudgetedMap = std::map<Key, Value, Compare,
+                             BudgetedAllocator<std::pair<const Key, Value>>>;
+template <typename Key, typename Value,
+          typename Hash = typename detail::BudgetedKeyHash<Key>::Type,
+          typename Equal = std::equal_to<Key>>
+using BudgetedUnorderedMap =
+    std::unordered_map<Key, Value, Hash, Equal,
+                       BudgetedAllocator<std::pair<const Key, Value>>>;
+
 // Reserve standard-string outputs before passing them to legacy conversion
 // APIs. Replacing a buffer charges the overlap and preserves it on rejection.
 inline void ReserveStringCapacity(std::string &value, MemoryReservation &memory,
@@ -27,7 +55,7 @@ inline void ReserveStringCapacity(std::string &value, MemoryReservation &memory,
   MemoryReservation replacement_memory;
   std::string replacement;
   replacement_memory.add_for_allocation((bytes + 1) * 2,
-                                         [&] { replacement.reserve(bytes); });
+                                        [&] { replacement.reserve(bytes); });
   replacement.assign(value);
   const size_t actual = replacement.capacity() + 1;
   if (actual > replacement_memory.bytes())
@@ -47,7 +75,7 @@ inline void ReserveVectorCapacity(std::vector<T> &value,
   MemoryReservation replacement_memory;
   std::vector<T> replacement;
   replacement_memory.add_for_allocation(count * sizeof(T),
-                                         [&] { replacement.reserve(count); });
+                                        [&] { replacement.reserve(count); });
   const size_t actual = replacement.capacity() * sizeof(T);
   if (actual > replacement_memory.bytes())
     replacement_memory.add(actual - replacement_memory.bytes());

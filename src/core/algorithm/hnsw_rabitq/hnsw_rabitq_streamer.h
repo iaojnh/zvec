@@ -63,49 +63,49 @@ class HnswRabitqStreamer : public IndexStreamer {
   int cleanup() override;
 
   //! Create a context
-  Context::Pointer create_context() const override;
+  Context::Pointer do_create_context() const override;
 
   //! Create a new iterator
   IndexProvider::Pointer create_provider() const override;
 
   //! Add a vector into index
-  int add_impl(uint64_t pkey, const void *query, const IndexQueryMeta &qmeta,
-               Context::Pointer &context) override;
+  int do_add(uint64_t pkey, const void *query, const IndexQueryMeta &qmeta,
+             Context::Pointer &context) override;
 
   //! Add a vector with id into index
-  int add_with_id_impl(uint32_t id, const void *query,
-                       const IndexQueryMeta &qmeta,
-                       Context::Pointer &context) override;
+  int do_add_with_id(uint32_t id, const void *query,
+                     const IndexQueryMeta &qmeta,
+                     Context::Pointer &context) override;
 
   //! Similarity search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta,
+                Context::Pointer &context) const override;
 
   //! Similarity search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  uint32_t count, Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
+                Context::Pointer &context) const override;
 
   //! Similarity brute force search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     Context::Pointer &context) const override;
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   Context::Pointer &context) const override;
 
   //! Similarity brute force search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     uint32_t count, Context::Pointer &context) const override;
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   uint32_t count, Context::Pointer &context) const override;
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta,
-                               ContextPointer &context) const override {
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta,
+                             ContextPointer &context) const override {
     return search_bf_by_p_keys_impl(query, p_keys, qmeta, 1, context);
   }
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta, uint32_t count,
-                               ContextPointer &context) const override;
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta, uint32_t count,
+                             ContextPointer &context) const override;
 
   //! Fetch vector by key
   const void *get_vector(uint64_t key) const override {
@@ -137,7 +137,7 @@ class HnswRabitqStreamer : public IndexStreamer {
   int flush(uint64_t checkpoint) override;
 
   //! Dump index into storage
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   //! Retrieve statistics
   const Stats &stats() const override {

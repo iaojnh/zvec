@@ -14,9 +14,9 @@
 #pragma once
 #include <limits>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
-#include <zvec/core/framework/index_build_partitions.h>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_meta.h>
+#include "utility/index_build_partitions.h"
 #include "utility/vector_build_source.h"
 #include "ivf_centroid_index.h"
 
@@ -52,18 +52,18 @@ class IVFBuilder : public IndexBuilder {
   int cleanup() override;
 
   //! Train the data
-  int train(IndexThreads::Pointer threads,
-            IndexHolder::Pointer holder) override;
+  int do_train(IndexThreads::Pointer threads,
+               IndexHolder::Pointer holder) override;
 
   //! Train the data
-  int train(const IndexTrainer::Pointer &trainer) override;
+  int do_train(const IndexTrainer::Pointer &trainer) override;
 
   //! Build the index
-  int build(IndexThreads::Pointer threads,
-            IndexHolder::Pointer holder) override;
+  int do_build(IndexThreads::Pointer threads,
+               IndexHolder::Pointer holder) override;
 
   //! Dump index into file system
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   //! Retrieve statistics
   const Stats &stats() const override {

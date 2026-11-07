@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -27,6 +26,7 @@
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/retained_block_allocator.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/core/framework/index_context.h>
@@ -693,10 +693,7 @@ class FlatContiguousStreamerEntity : public FlatStreamerEntity {
     ailego::BudgetedMappedBuffer vector_memory;
     size_t vector_stride{0};
     size_t vector_count{0};
-    std::unordered_map<
-        uint64_t, uint32_t, std::hash<uint64_t>, std::equal_to<uint64_t>,
-        ailego::BudgetedAllocator<std::pair<const uint64_t, uint32_t>>>
-        key_to_position{};
+    ailego::BudgetedUnorderedMap<uint64_t, uint32_t> key_to_position{};
     ailego::BudgetedVector<uint64_t> position_to_key{};
   };
 
