@@ -40,6 +40,7 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
+#include <zvec/ailego/parallel/worker_memory.h>
 #include "pool_payload_budget.h"
 
 #if defined(_MSC_VER)
@@ -61,11 +62,22 @@ using namespace zvec::ailego;
 namespace zvec::ailego {
 
 struct VecBufferPoolTestPeer {
+  static bool has_writeback_worker(const VecBufferPool &pool) {
+    return pool.writeback_thread_.joinable();
+  }
   static char *writeback_staging(const VecBufferPool &pool) {
     return pool.writeback_staging_;
   }
   static std::shared_mutex *page_locks(const VecBufferPool &pool) {
     return pool.block_mutexes_.get();
+  }
+};
+
+struct MemoryLimitPoolTestPeer {
+  inline static size_t rss = 0;
+  static bool configure(MemoryLimitPool &pool, size_t limit, size_t sample) {
+    rss = sample;
+    return pool.process_rss_.configure(limit, +[] { return rss; });
   }
 };
 
@@ -730,6 +742,36 @@ TEST_F(BufferPoolTest, BatchedBypassReadsFragmentsWithoutAdmission) {
   ranges[1].offset = pool.file_size();
   EXPECT_FALSE(pool.read_ranges_bypass(ranges.data(), 2));
   EXPECT_EQ('X', outputs[0][0]);  // Validate the whole batch before any I/O.
+}
+
+TEST_F(BufferPoolTest, RefusedWritebackWorkerFallsBackAndPersistsDirtyPages) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto &memory = MemoryLimitPool::get_instance();
+  const auto file = new_file(1);
+  const size_t stack = DefaultNativeWorkerStackBytes();
+  ASSERT_GT(stack, 0u);
+  constexpr size_t limit = 128UL << 20;
+  const size_t metadata =
+      VecBufferPool::metadata_bytes_for_page_count(1, true);
+  ASSERT_LT(metadata + stack / 2, limit);
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure(
+      memory, limit, limit - metadata - stack / 2));
+  auto restore = ScopeGuard::Make(
+      [&] { EXPECT_TRUE(memory.configure_process_rss_limit(0)); });
+  const std::string changed(64, 'W');
+  {
+    VecBufferPool pool(file, true);
+    ASSERT_EQ(0, pool.init());
+    ASSERT_FALSE(VecBufferPoolTestPeer::has_writeback_worker(pool));
+    ASSERT_EQ(0, pool.write_range(0, changed.size(), changed.data()));
+    ASSERT_EQ(0, pool.flush_all());
+  }
+  ASSERT_TRUE(memory.configure_process_rss_limit(0));
+  VecBufferPool reader(file, false);
+  ASSERT_EQ(0, reader.init());
+  std::array<char, 64> actual{};
+  ASSERT_TRUE(reader.get_handle().read_range(0, actual.size(), actual.data()));
+  EXPECT_EQ(changed, std::string(actual.data(), actual.size()));
 }
 
 TEST_F(BufferPoolTest, BatchedWritableBypassKeepsDirtyBytes) {

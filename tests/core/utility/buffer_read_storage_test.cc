@@ -318,6 +318,15 @@ TEST_F(BufferReadStorageTest, HostRssPressureReclaimsCacheAndRecovers) {
            pool.stats().page_used == ailego::kVectorPageSize;
   }));
   EXPECT_EQ(0, std::memcmp(payload_.data(), pinned.data(), 32));
+  // Pressure starts below the hard limit. The OS may return unrelated idle
+  // heap pages during this test, so the host mapping does not guarantee that
+  // baseline + 32 MiB is exhausted. Establish an actually exhausted target
+  // from a fresh observation before asserting refusal; unmapping the host
+  // allocation must still recover without changing that target again.
+  const size_t pressured_rss = ailego::MemoryHelper::SelfRSS();
+  ASSERT_GT(pressured_rss, size_t{1} << 20);
+  ASSERT_TRUE(pool.configure_process_rss_limit(
+      std::min(baseline + (32UL << 20), pressured_rss - (1UL << 20))));
   EXPECT_FALSE(pool.try_charge_external(1UL << 20));
   ailego::File::MemoryUnmap(host, kHostBytes);
   host = nullptr;

@@ -27,6 +27,7 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/index_params.h>
 #include "db/common/file_helper.h"
+#include "db/common/mobile_memory.h"
 #include "db/index/common/index_filter.h"
 #include "../../../../ailego/buffer/pool_payload_budget.h"
 // FtsQueryParams defined below
@@ -150,6 +151,17 @@ static const std::string kStatCf{zvec::kFtsStatCfName};
 
 class FtsColumnIndexerTest : public ::testing::Test {
  protected:
+  static void SetUpTestSuite() {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // This analyzer-correctness suite loads the complete embedded Jieba
+      // dictionary, including shared parsed entries and a per-tokenizer trie.
+      // Its admitted workspace exceeds the mobile startup default. Use an
+      // explicit standalone payload budget, as other allocator unit tests do;
+      // process RSS and mobile defaults have dedicated acceptance tests.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+
   void SetUp() override {
     zvec::FileHelper::RemoveDirectory(kDbPath);
 
@@ -836,7 +848,7 @@ TEST_F(FtsColumnIndexerTest, OpenWithJiebaTokenizerSucceedsWithoutDictDir) {
   params.tokenizer_name = "jieba";
   params.filters.clear();
   auto pipeline = TokenizerFactory::create(params);
-  ASSERT_TRUE(pipeline.has_value());
+  ASSERT_TRUE(pipeline.has_value()) << pipeline.error().message();
   const auto tokens = pipeline.value()->process("中文分词技术");
   ASSERT_EQ(tokens.size(), 3u);
   EXPECT_EQ(tokens[0].text, "中文");

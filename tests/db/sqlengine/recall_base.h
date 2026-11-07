@@ -23,6 +23,7 @@
 #include <arrow/ipc/api.h>
 #include <gtest/gtest.h>
 #include "db/common/file_helper.h"
+#include "db/common/mobile_memory.h"
 #include "db/index/common/version_manager.h"
 #include "db/index/segment/segment.h"
 #include "zvec/db/index_params.h"
@@ -253,7 +254,11 @@ inline Segment::Ptr RecallTest::create_segment() {
   SegmentOptions options;
   options.read_only_ = false;
   options.enable_mmap_ = true;
-  options.max_buffer_size_ = 256 * 1024;
+  // Hundreds of tiny writable index blocks each retain a writeback worker and
+  // staging area. Keep this 10,000-row SQL fixture within the mobile process
+  // target while still producing multiple persisted blocks.
+  options.max_buffer_size_ =
+      detail::kMobileMemoryPolicy ? 1024 * 1024 : 256 * 1024;
 
   auto result =
       Segment::CreateAndOpen(GetPath(), *collection_schema_, 0, 0, id_map,
