@@ -40,7 +40,7 @@
 namespace zvec {
 namespace ailego {
 
-extern const size_t kVectorPageSize;
+extern ZVEC_AILEGO_API const size_t kVectorPageSize;
 
 #if defined(__linux__) && !defined(__ANDROID__)
 class IoUringRing;

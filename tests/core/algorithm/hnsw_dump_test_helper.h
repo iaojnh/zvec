@@ -19,7 +19,9 @@
 #include "tests/core/algorithm/graph_dump_test_helper.h"
 
 namespace zvec::core::testing {
-template <typename Entity>
+template <typename Entity,
+          typename VectorBlocks =
+              ailego::BudgetedVector<IndexStorage::MemoryBlock>>
 class GeneratedHnsw : public Entity {
  public:
   explicit GeneratedHnsw(uint32_t count) {
@@ -42,9 +44,7 @@ class GeneratedHnsw : public Entity {
   int get_vector(const node_id_t *, uint32_t, const void **) const override {
     return IndexError_NotImplemented;
   }
-  int get_vector(
-      const node_id_t *, uint32_t,
-      ailego::BudgetedVector<IndexStorage::MemoryBlock> &) const override {
+  int get_vector(const node_id_t *, uint32_t, VectorBlocks &) const override {
     return IndexError_NotImplemented;
   }
   const Neighbors get_neighbors(level_t level, node_id_t id) const override {
@@ -63,11 +63,12 @@ class GeneratedHnsw : public Entity {
   mutable std::array<node_id_t, 2> neighbors_{};
 };
 
-template <typename Entity>
+template <typename Entity, typename VectorBlocks = ailego::BudgetedVector<
+                               IndexStorage::MemoryBlock>>
 void CheckStreamingGraphDump() {
   for (uint32_t count : {0u, 1u, 8193u}) {
     SCOPED_TRACE(count);
-    GeneratedHnsw<Entity> entity(count);
+    GeneratedHnsw<Entity, VectorBlocks> entity(count);
     auto capture = std::make_shared<testing::GraphDumpCapture>();
     ASSERT_GE(entity.export_segments(capture), 0);
     EXPECT_EQ(9u, capture->segments.size());
@@ -113,9 +114,10 @@ void CheckStreamingGraphDump() {
   }
 }
 
-template <typename Entity>
+template <typename Entity, typename VectorBlocks = ailego::BudgetedVector<
+                               IndexStorage::MemoryBlock>>
 void CheckGraphDumpReadError() {
-  GeneratedHnsw<Entity> entity(3);
+  GeneratedHnsw<Entity, VectorBlocks> entity(3);
   entity.fail_level = true;
   auto capture = std::make_shared<testing::GraphDumpCapture>();
   EXPECT_EQ(IndexError_ReadData, entity.export_segments(capture));

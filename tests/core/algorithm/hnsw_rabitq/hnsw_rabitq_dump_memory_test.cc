@@ -17,10 +17,12 @@
 
 namespace zvec::core {
 TEST(HnswRabitqEntityDumpMemoryTest, StreamingMetadataMatchesNeighborData) {
-  testing::CheckStreamingGraphDump<HnswRabitqEntity>();
+  testing::CheckStreamingGraphDump<HnswRabitqEntity,
+                                   std::vector<IndexStorage::MemoryBlock>>();
 }
 TEST(HnswRabitqEntityDumpMemoryTest,
      UpperIndexReadErrorDoesNotProduceEmptyLevel) {
-  testing::CheckGraphDumpReadError<HnswRabitqEntity>();
+  testing::CheckGraphDumpReadError<HnswRabitqEntity,
+                                   std::vector<IndexStorage::MemoryBlock>>();
 }
 }  // namespace zvec::core
