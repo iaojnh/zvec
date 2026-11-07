@@ -7,6 +7,12 @@ on:
 permissions:
   contents: read
 
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_NUM_THREADS: '1'
+
 jobs:
   desktop:
     name: Desktop compatibility (${{ matrix.platform }})
@@ -74,12 +80,17 @@ jobs:
             -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
             -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
           targets=(process_rss_budget_test pool_admission_test result_memory_allowance_test
+                   retained_block_allocator_test budgeted_mapped_buffer_test
+                   eviction_queue_budget_test slab_backing_budget_test budgeted_aligned_buffer_test
+                   vector_page_table_test vector_page_table_bypass_aio_test
                    buffer_read_storage_test buffer_storage_write_test
                    ivf_workspace_budget_test diskann_file_reader_aio_test)
           cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target "${targets[@]}"
           for i in "${!targets[@]}"; do targets[$i]="bin/${targets[$i]}"; done
           tar -czf candidate/native-tests.tar.gz -C build "${targets[@]}"
           git rev-parse HEAD > candidate/commit.txt
+          git submodule status --recursive > candidate/submodules.txt
+          rg '^(AUTO_DETECT_ARCH|BUILD_.*SHARED|CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_FLAGS|GENERATOR)):' build/CMakeCache.txt > candidate/build-config.txt
           (cd candidate && sha256sum ./*.whl ./native-tests.tar.gz > SHA256SUMS)
       - uses: actions/upload-artifact@v7
         with:
@@ -98,7 +109,7 @@ jobs:
       matrix:
         include:
           - shard: budget
-            native: process_rss_budget_test pool_admission_test result_memory_allowance_test
+            native: process_rss_budget_test pool_admission_test result_memory_allowance_test retained_block_allocator_test budgeted_mapped_buffer_test eviction_queue_budget_test slab_backing_budget_test budgeted_aligned_buffer_test vector_page_table_test vector_page_table_bypass_aio_test
           - shard: storage
             native: buffer_read_storage_test buffer_storage_write_test
           - shard: ivf
@@ -120,6 +131,10 @@ jobs:
           (cd candidate && sha256sum -c SHA256SUMS)
           cp candidate/commit.txt candidate/SHA256SUMS evidence/
           tar -xzf candidate/native-tests.tar.gz -C candidate
+      - name: Install Linux asynchronous I/O runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libaio1t64 liburing2
       - name: Run native tests
         env:
           NATIVE_TESTS: ${{ matrix.native }}
@@ -151,6 +166,7 @@ jobs:
       - name: Exercise public API memory denial and recovery
         if: matrix.shard == 'budget'
         run: |
+          python -m pytest -n 0 .github/scripts/test_buffer_pool_ci.py --junitxml=evidence/acceptance-gates.xml
           python -m pytest -n 0 python/tests/test_fetch_result_budget.py \
             -k 'large_vector_result_admission_and_recovery or retained_vectors_reject_growth_and_release_for_retry' \
             --junitxml=evidence/public-budget.xml
@@ -170,23 +186,126 @@ jobs:
           path: evidence/
           retention-days: 14
 
+  public-suite:
+    name: Public API mutations, FTS, quantizers and recovery
+    needs: [build, acceptance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Verify and install candidate
+        run: |
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python -m pip install candidate/*.whl pytest pytest-xdist
+      - name: Run public interface contracts
+        run: |
+          mkdir -p evidence
+          python -m pytest -n 0 \
+            python/tests/test_readonly_storage.py \
+            python/tests/test_quantized_collection_mutations.py \
+            python/tests/test_collection_fts.py \
+            python/tests/test_collection_fts_vector_hybrid.py \
+            python/tests/test_arrow_executor_budget.py \
+            python/tests/test_ddl_input_budget.py \
+            python/tests/test_query_input_budget.py \
+            python/tests/test_write_input_budget.py \
+            python/tests/test_scan_input_budget.py \
+            python/tests/test_sequence_input_budget.py \
+            python/tests/test_fetch_result_budget.py \
+            --junitxml=evidence/public.xml
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-public-suite
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  baseline-build:
+    name: Build pinned pre-change baseline
+    needs: public-suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read pinned baseline
+        id: baseline
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          policy = json.loads(Path(".github/scripts/buffer_pool_policy.json").read_text())
+          print("commit=" + policy["baseline_commit"])
+          PY
+      - uses: actions/checkout@v7
+        with:
+          repository: iaojnh/zvec
+          ref: ${{ steps.baseline.outputs.commit }}
+          path: baseline-source
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: buffer-pool-baseline-linux-x64
+          max-size: 1G
+      - name: Build baseline with the same toolchain and flags
+        working-directory: baseline-source
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+        run: |
+          python -m pip install pybind11==3.0 cmake==3.30.0 ninja==1.11.1 scikit-build-core setuptools_scm
+          python -m pip wheel . --no-deps --no-build-isolation --wheel-dir ../baseline \
+            -C cmake.define.AUTO_DETECT_ARCH=OFF -C cmake.define.BUILD_C_BINDINGS=OFF \
+            -C cmake.define.BUILD_ZVEC_SHARED=OFF -C cmake.define.BUILD_ZVEC_AILEGO_SHARED=OFF \
+            -C cmake.define.BUILD_ZVEC_CORE_SHARED=OFF \
+            -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
+            -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          git rev-parse HEAD > ../baseline/commit.txt
+          git submodule status --recursive > ../baseline/submodules.txt
+          (cd ../baseline && sha256sum ./*.whl > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: buffer-pool-baseline
+          path: baseline/
+          if-no-files-found: error
+          retention-days: 14
+
   linux-scale:
     name: Linux scale (${{ matrix.scenario }})
-    needs: build
+    needs: [build, public-suite]
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Three concurrent writers each reserve 264 MiB before encoding.
-          - {scenario: mixed-100k, index: ivf, rows: 100000, budget: 1280, mixed: true}
-          - {scenario: ivf-400k, index: ivf, rows: 400000, budget: 1024}
-          - {scenario: diskann-200k, index: diskann, rows: 200000, budget: 1024}
-          - {scenario: cohere-ivf-buffer, index: ivf, storage: buffer}
-          - {scenario: cohere-ivf-mmap, index: ivf, storage: mmap}
-          - {scenario: cohere-diskann-buffer, index: diskann, storage: buffer}
-          - {scenario: cohere-diskann-mmap, index: diskann, storage: mmap}
+          - {scenario: mixed-100k, index: ivf, rows: 100000, budget: 1280, workers: 4, mixed: true}
+          - {scenario: ivf-400k, index: ivf, rows: 400000, budget: 1024, workers: 1}
+          - {scenario: diskann-200k, index: diskann, rows: 200000, budget: 1024, workers: 4}
+          # Same ~600 MiB vector working set across capacity boundary and concurrency.
+          # Prepare under 1024 MiB; compare vector-only reads at all three budgets.
+          # Scalar/vector result-copy coverage remains in the full lifecycle jobs.
+          # 128 MiB is a positive read-only case, not an
+          # underfunded writer reclassified after it fails.
+          - {scenario: boundary-128-1, index: ivf, rows: 400000, budget: 128, workers: 1, boundary: true}
+          - {scenario: boundary-512-4, index: ivf, rows: 400000, budget: 512, workers: 4, boundary: true}
+          - {scenario: boundary-1024-8, index: ivf, rows: 400000, budget: 1024, workers: 8, boundary: true}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -206,31 +325,175 @@ jobs:
           cp candidate/commit.txt candidate/SHA256SUMS evidence/
           python -m pip install candidate/*.whl
       - name: Run bounded stress and lifecycle
-        if: matrix.rows
         env:
           INDEX: ${{ matrix.index }}
           ROWS: ${{ matrix.rows }}
           BUDGET_MIB: ${{ matrix.budget }}
+          WORKERS: ${{ matrix.workers }}
           MIXED: ${{ matrix.mixed }}
+          BOUNDARY: ${{ matrix.boundary }}
+        shell: bash
         run: |
+          set -o pipefail
           args=()
           if [[ "$MIXED" == true ]]; then args+=(--mixed); fi
+          if [[ "$BOUNDARY" == true ]]; then
+            python -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
+              "$RUNNER_TEMP/collection" evidence/preparation.jsonl --rows "$ROWS" \
+              --dimension 384 --budget-mib 1024 2>&1 | tee evidence/preparation.log
+            args+=(--read-only --vector-only)
+          fi
           python -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
             "$RUNNER_TEMP/collection" evidence/rss.jsonl --rows "$ROWS" \
-            --dimension 384 --budget-mib "$BUDGET_MIB" "${args[@]}" \
+            --dimension 384 --budget-mib "$BUDGET_MIB" --workers "$WORKERS" "${args[@]}" \
             2>&1 | tee evidence/stress.log
-        shell: bash
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-evidence-${{ matrix.scenario }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  soak:
+    name: One-hour mixed lifecycle (${{ matrix.index }})
+    needs: [build, linux-scale]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [ivf, diskann]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Run fixed-size corpus with writes, reads and reopen for an hour
+        env:
+          INDEX: ${{ matrix.index }}
+        run: |
+          set -o pipefail
+          mkdir -p evidence
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python -m pip install candidate/*.whl
+          seconds=$(python -c 'import json; print(json.load(open(".github/scripts/buffer_pool_policy.json"))["soak_seconds"])')
+          python -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
+            "$RUNNER_TEMP/collection" evidence/rss.jsonl --workers 8 --soak-seconds "$seconds" \
+            2>&1 | tee evidence/soak.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-evidence-soak-${{ matrix.index }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  external-limit:
+    name: cgroup hard memory limit and no swap (${{ matrix.index }})
+    needs: [build, linux-scale]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [ivf, diskann]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Verify candidate and run under system memory enforcement
+        env:
+          INDEX: ${{ matrix.index }}
+        run: |
+          set -o pipefail
+          mkdir -p evidence
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python -m pip install candidate/*.whl
+          python_path=$(command -v python)
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit="buffer-pool-${{ matrix.index }}-${{ github.run_id }}" \
+            --property=MemoryMax=1536M --property=MemorySwapMax=0 \
+            --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+            --setenv=OPENBLAS_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
+            "$python_path" .github/scripts/buffer_pool_system_limit.py 1610612736 evidence/cgroup.jsonl \
+            "$python_path" -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
+            "$RUNNER_TEMP/collection" evidence/rss.jsonl --rows 100000 --workers 4 \
+            2>&1 | tee evidence/external-limit.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-evidence-cgroup-${{ matrix.index }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  production:
+    name: Cohere 1M baseline and candidate (${{ matrix.index }}, ${{ matrix.storage }})
+    needs: [build, baseline-build, linux-scale, soak, external-limit, desktop, windows, android, ios, musllinux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [ivf, diskann]
+        storage: [buffer, mmap]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-baseline
+          path: baseline
+      - name: Verify provenance and isolate both packages
+        run: |
+          mkdir -p evidence
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          cmp <(python -c 'import json; print(json.load(open(".github/scripts/buffer_pool_policy.json"))["baseline_commit"])') baseline/commit.txt
+          for role in baseline candidate; do
+            (cd "$role" && sha256sum -c SHA256SUMS)
+            cp "$role/commit.txt" "evidence/$role-commit.txt"
+            cp "$role/SHA256SUMS" "evidence/$role-SHA256SUMS"
+            python -m venv "$RUNNER_TEMP/$role-venv"
+            "$RUNNER_TEMP/$role-venv/bin/python" -m pip install "$role"/*.whl pyarrow
+            "$RUNNER_TEMP/$role-venv/bin/python" -m pip freeze > "evidence/$role-packages.txt"
+          done
+          uname -a > evidence/environment.txt
+          lscpu >> evidence/environment.txt
+          lsblk >> evidence/environment.txt
+          free -m >> evidence/environment.txt
+          df -h >> evidence/environment.txt
       - name: Fetch versioned public Cohere 1M inputs
-        if: matrix.storage
         run: |
           data_dir="$RUNNER_TEMP/cohere"
           mkdir -p "$data_dir"
-          # VectorDBBench Cohere Medium: train, query and exact top-k files.
           while read -r name size etag; do
             curl --fail --silent --show-error --location --retry 2 --max-time 1200 \
               --header "If-Match: \"$etag\"" --max-filesize "$size" \
-              "https://assets.zilliz.com/benchmark/cohere_medium_1m/$name" \
-              --output "$data_dir/$name"
+              "https://assets.zilliz.com/benchmark/cohere_medium_1m/$name" --output "$data_dir/$name"
             test "$(stat -c %s "$data_dir/$name")" -eq "$size"
           done <<'DATASET'
           shuffle_train.parquet 3134418448 aa5dee664dc87b3e416c9863723a0ba4-374
@@ -238,68 +501,96 @@ jobs:
           neighbors.parquet 3704127 d1aca052763a292b10e80bbda964f55d
           DATASET
           (cd "$data_dir" && sha256sum ./*.parquet) > evidence/dataset-sha256.txt
-          df -h "$RUNNER_TEMP"
-      - name: Run production-scale build and query benchmark
-        if: matrix.storage
+      - name: Compare both versions under identical external limits
         env:
           INDEX: ${{ matrix.index }}
           STORAGE: ${{ matrix.storage }}
         run: |
-          python -m pip install pyarrow
-          python -X faulthandler .github/scripts/buffer_pool_cohere.py "$INDEX" "$STORAGE" \
-            "$RUNNER_TEMP/cohere" "$RUNNER_TEMP/collection" evidence/rss.jsonl \
-            2>&1 | tee evidence/cohere.log
-        shell: bash
+          set -o pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libaio1t64 liburing2
+          # Build and remove one index at a time, on this same runner. This avoids
+          # keeping two copies of the million-row index or benchmarking two CPUs.
+          limit_mib=6144
+          if [[ "$INDEX" == diskann ]]; then limit_mib=8192; fi
+          for role in baseline candidate; do
+            test "$(df --output=avail -k "$RUNNER_TEMP" | tail -1)" -gt 6291456
+            python_path="$RUNNER_TEMP/$role-venv/bin/python"
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --unit="cohere-$role-${{ github.run_id }}" \
+              --property="MemoryMax=${limit_mib}M" --property=MemorySwapMax=0 \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              --setenv=OPENBLAS_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
+              "$python_path" .github/scripts/buffer_pool_system_limit.py \
+              "$((limit_mib * 1024 * 1024))" "evidence/$role-cgroup.jsonl" \
+              "$python_path" -X faulthandler .github/scripts/buffer_pool_cohere.py "$INDEX" "$STORAGE" \
+              "$RUNNER_TEMP/cohere" "$RUNNER_TEMP/collection-$role" "evidence/$role.jsonl" --role "$role" \
+              2>&1 | tee "evidence/$role.log"
+            rm -rf -- "$RUNNER_TEMP/collection-$role"
+          done
+          python .github/scripts/buffer_pool_report.py performance evidence/baseline.jsonl \
+            evidence/candidate.jsonl evidence/performance.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: buffer-pool-evidence-${{ matrix.scenario }}
+          name: buffer-pool-evidence-cohere-${{ matrix.index }}-${{ matrix.storage }}
           path: evidence/
+          if-no-files-found: error
           retention-days: 14
 
   summary:
     name: Acceptance summary
     if: always()
-    needs: [build, acceptance, desktop, windows, android, ios, musllinux, linux-scale]
+    needs: [build, acceptance, public-suite, baseline-build, desktop, windows, android, ios, musllinux, linux-scale, soak, external-limit, production]
     runs-on: ubuntu-24.04
     env:
       RESULTS: ${{ toJSON(needs) }}
     steps:
-      - name: Report stage results
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Report stages and fixed support scope
         run: |
-          printf '## Buffer Pool acceptance\n\nCandidate: `%s`\n\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
-          jq -r 'to_entries[] | "- **\(.key)** — \(.value.result)"' <<< "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$RESULTS" > needs.json
+          printf '## Buffer Pool acceptance\n\nCandidate: %s\n\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          jq -r 'to_entries[] | "- **\(.key)** — \(.value.result)"' needs.json >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.scope | to_entries[] | "- **\(.key)**: \(.value)"' .github/scripts/buffer_pool_policy.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/download-artifact@v8
-        if: needs.linux-scale.result != 'skipped'
         continue-on-error: true
         with:
-          pattern: buffer-pool-evidence-cohere-*
-          path: cohere-results
-      - name: Compare Cohere 1M benchmark results
-        if: needs.linux-scale.result != 'skipped'
+          pattern: buffer-pool-*
+          path: evidence
+      - name: Require all stages and mandatory evidence
         run: |
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          check_rc=0
+          python .github/scripts/buffer_pool_report.py summary evidence needs.json acceptance.json \
+            | tee evidence-check.log || check_rc=$?
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           from pathlib import Path
-          from statistics import median
-
-          print("\n## Cohere 1M\n")
-          print("Peak RSS is the full lifecycle peak. Other metrics are medians of three query trials.\n")
-          print("| Index | Storage | Peak RSS (MiB) | Recall@10 | QPS | P99 (ms) | Physical reads (MiB/trial) |")
-          print("|---|---|---:|---:|---:|---:|---:|")
-          for index in ("ivf", "diskann"):
-              for storage in ("buffer", "mmap"):
-                  path = Path("cohere-results", f"buffer-pool-evidence-cohere-{index}-{storage}", "rss.jsonl")
-                  rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-                  trials = [row for row in rows if row["phase"] == "query_trial"]
-                  if len(trials) != 3:
-                      print(f"| {index} | {storage} | Incomplete ({len(trials)}/3) | | | | |")
-                      continue
-                  peak = max(row["peak_kib"] for row in rows) / 1024
-                  recall, qps, p99, reads = (median(row[key] for row in trials) for key in
-                                             ("recall_at_10", "qps", "p99_ms", "read_bytes"))
-                  print(f"| {index} | {storage} | {peak:.1f} | {recall:.3f} | {qps:.1f} | {p99:.2f} | {reads / 1024**2:.1f} |")
+          result = json.loads(Path("acceptance.json").read_text())
+          print("\n**Verdict: " + ("PASS" if result["passed"] else "FAIL") + "**\n")
+          if not result["passed"]:
+              print(result["reason"])
+          else:
+              print(f"Verified {len(result['verified'])} mandatory evidence groups. QPS >= 80%; P99 <= 125% of the pinned baseline.\n")
+              print("| Index | Storage | Distribution | Cache | QPS / baseline | P99 / baseline |")
+              print("|---|---|---|---|---:|---:|")
+              for benchmark in result["benchmarks"]:
+                  for case in benchmark["cases"]:
+                      print(f"| {benchmark['index']} | {benchmark['storage']} | {case['distribution']} | {case['cache']} | {case['qps_ratio']:.3f} | {case['p99_ratio']:.3f} |")
+              for item in result["unsupported"]:
+                  print(f"\nUnsupported native observation: {item['suite']}/{item['test']} — {item['reason']}")
           PY
-      - name: Require each stage to pass
-        run: |
-          jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+          exit "$check_rc"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-acceptance-report
+          path: |
+            acceptance.json
+            needs.json
+            .github/scripts/buffer_pool_policy.json
+          if-no-files-found: error
+          retention-days: 14

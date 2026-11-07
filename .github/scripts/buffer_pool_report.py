@@ -1,0 +1,249 @@
+# Copyright 2025-present the zvec project
+# SPDX-License-Identifier: Apache-2.0
+
+"""Fail-closed acceptance evidence validation and performance gates."""
+
+# Standalone report assertions and printed JSON are the command-line contract.
+# ruff: noqa: T201, PT018
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import statistics
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from buffer_pool_metrics import POLICY
+
+
+def rows(path):
+    values = [json.loads(line) for line in path.read_text().splitlines()]
+    assert sum(row["phase"] == "complete" for row in values) == 1, (
+        f"incomplete workload: {path}"
+    )
+    assert any(
+        row["phase"] == "calibration" and len(row["controls"]) == 3 for row in values
+    ), f"missing calibration: {path}"
+    return values
+
+
+def performance(baseline, candidate):
+    def cases(path):
+        result = {}
+        for row in rows(path):
+            if row["phase"] != "query_trial":
+                continue
+            key = (row["distribution"], row["cache"])
+            assert row["trial"] not in {r["trial"] for r in result.get(key, [])}, (
+                "duplicate trial"
+            )
+            for metric in ("qps", "p99_ms", "recall_at_10", "read_bytes"):
+                assert math.isfinite(row[metric]) and row[metric] >= 0, (
+                    f"invalid {metric}"
+                )
+            assert row["qps"] > 0 and row["p99_ms"] > 0
+            assert row["recall_at_10"] >= POLICY["minimum_recall_at_10"]
+            if row["cache"] == "cold":
+                assert row["read_bytes"] > 0, "cold cache has no physical-read evidence"
+            result.setdefault(key, []).append(row)
+        expected = {
+            (d, c)
+            for d in ("uniform", "hot_80_20", "zipf", "repeat_90_10")
+            for c in ("cold", "hot")
+        }
+        assert set(result) == expected, "missing distribution/cache case"
+        for trial_rows in result.values():
+            assert {r["trial"] for r in trial_rows} == set(
+                range(1, POLICY["performance_trials"] + 1)
+            ), "missing trials"
+        return result
+
+    old, new = cases(baseline), cases(candidate)
+    reports = []
+    for key in sorted(old):
+        medians = [
+            {
+                metric: statistics.median(r[metric] for r in data[key])
+                for metric in ("qps", "p99_ms", "read_bytes")
+            }
+            for data in (old, new)
+        ]
+        a, b = medians
+        checks = {
+            "qps": b["qps"] >= a["qps"] * POLICY["minimum_qps_ratio"],
+            "p99": b["p99_ms"] <= a["p99_ms"] * POLICY["maximum_p99_ratio"],
+            "physical_reads": b["read_bytes"]
+            <= a["read_bytes"] * POLICY["maximum_read_bytes_ratio"]
+            + POLICY["read_bytes_noise_allowance"],
+        }
+        reports.append(
+            {
+                "distribution": key[0],
+                "cache": key[1],
+                "baseline": a,
+                "candidate": b,
+                "qps_ratio": b["qps"] / a["qps"],
+                "p99_ratio": b["p99_ms"] / a["p99_ms"],
+                "checks": checks,
+                "passed": all(checks.values()),
+            }
+        )
+    return {
+        "baseline_commit": POLICY["baseline_commit"],
+        "cases": reports,
+        "passed": all(row["passed"] for row in reports),
+    }
+
+
+def native_results(root):
+    verified = []
+    unsupported = []
+    for shard in ("budget", "storage", "ivf", "diskann"):
+        directory = root / f"buffer-pool-evidence-{shard}"
+        xml_files = list(directory.glob("*.xml"))
+        assert xml_files, f"missing native/public results: {shard}"
+        tests = []
+        for path in xml_files:
+            tests += list(ET.parse(path).getroot().iter("testcase"))
+        assert tests and not any(
+            t.find("failure") is not None or t.find("error") is not None for t in tests
+        )
+        for test in tests:
+            skipped = test.find("skipped")
+            if skipped is not None:
+                reason = skipped.get("message", skipped.text or "")
+                assert not re.search(
+                    r"libaio|no asynchronous|AIO backend|Native AIO", reason, re.I
+                ), f"required Linux AIO runtime unavailable: {reason}"
+                unsupported.append(
+                    {"suite": shard, "test": test.get("name"), "reason": reason}
+                )
+        if shard == "storage":
+            for name in (
+                "WritableOpenReclaimsOtherStoresCleanPages",
+                "WritableOpenWaitsForOtherStoresDirtyPages",
+            ):
+                executed = [
+                    t
+                    for t in tests
+                    if t.get("name") == name and t.find("skipped") is None
+                ]
+                assert len(executed) == 1, f"missing actual eviction witness: {name}"
+        verified.append(f"native-{shard}")
+    return verified, unsupported
+
+
+def summary(root, needs):
+    assert set(needs) == set(POLICY["required_stages"]), (
+        "a required CI stage was omitted"
+    )
+    assert needs and all(job["result"] == "success" for job in needs.values()), (
+        "some CI stages failed, skipped or were cancelled"
+    )
+    verified, unsupported = native_results(root)
+    benchmarks = []
+    suite = root / "buffer-pool-public-suite" / "public.xml"
+    testcases = list(ET.parse(suite).getroot().iter("testcase"))
+    assert testcases and not any(
+        t.find("failure") is not None or t.find("error") is not None for t in testcases
+    )
+    assert any(
+        t.get("name") == "test_optimize_rebuilds_fts" and t.find("skipped") is None
+        for t in testcases
+    ), "missing FTS compaction contract"
+    verified.append("public-mutations-FTS-sparse-quantized-WAL")
+    for name in (
+        "mixed-100k",
+        "ivf-400k",
+        "diskann-200k",
+        "boundary-128-1",
+        "boundary-512-4",
+        "boundary-1024-8",
+    ):
+        values = rows(root / f"buffer-pool-evidence-{name}" / "rss.jsonl")
+        complete = next(r for r in values if r["phase"] == "complete")
+        assert complete["rounds"] >= POLICY["minimum_lifecycle_rounds"]
+        if name == "boundary-128-1":
+            log = (root / f"buffer-pool-evidence-{name}" / "stress.log").read_text()
+            assert any(int(n) > 0 for n in re.findall(r"\bevict=(\d+)", log)), (
+                "working-set boundary did not trigger actual eviction"
+            )
+        if name == "mixed-100k":
+            log = (root / f"buffer-pool-evidence-{name}" / "stress.log").read_text()
+            assert "Compacted vector index" in log and "Compacted fts index" in log, (
+                "missing physical compaction witness"
+            )
+            assert any(r["phase"] == "compaction_verified" for r in values)
+        verified.append(name)
+    for index in ("ivf", "diskann"):
+        soak = rows(root / f"buffer-pool-evidence-soak-{index}" / "rss.jsonl")
+        complete = next(r for r in soak if r["phase"] == "complete")
+        assert complete["elapsed_seconds"] >= POLICY["soak_seconds"]
+        assert any(r["phase"] == "wal_recovered" for r in soak)
+        external = root / f"buffer-pool-evidence-cgroup-{index}"
+        rows(external / "rss.jsonl")
+        cgroup = [
+            json.loads(line)
+            for line in (external / "cgroup.jsonl").read_text().splitlines()
+        ]
+        assert (
+            len(cgroup) == 2
+            and cgroup[-1]["phase"] == "cgroup_complete"
+            and cgroup[-1]["returncode"] == 0
+        )
+        assert cgroup[-1]["memory.swap.current"] == 0
+        assert cgroup[0]["memory.max"] == cgroup[-1]["memory.max"] == 1536 * 1024**2
+        assert cgroup[-1]["memory.swap.max"] == 0
+        for event in ("oom", "oom_kill", "oom_group_kill"):
+            assert int(cgroup[-1]["memory.events"].get(event, 0)) == int(
+                cgroup[0]["memory.events"].get(event, 0)
+            ), "OOM event"
+        for storage in ("buffer", "mmap"):
+            directory = root / f"buffer-pool-evidence-cohere-{index}-{storage}"
+            result = performance(
+                directory / "baseline.jsonl", directory / "candidate.jsonl"
+            )
+            assert result["passed"], f"performance regression: {index}/{storage}"
+            benchmarks.append({"index": index, "storage": storage, **result})
+            assert any(
+                r["phase"] == "million_mutations_recovered"
+                for r in rows(directory / "candidate.jsonl")
+            )
+            verified.append(f"cohere-{index}-{storage}")
+        verified += [f"soak-{index}", f"cgroup-{index}"]
+    return {
+        "passed": True,
+        "verified": verified,
+        "unsupported": unsupported,
+        "benchmarks": benchmarks,
+        "scope": POLICY["scope"],
+        "policy": POLICY,
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    compare = sub.add_parser("performance")
+    compare.add_argument("baseline", type=Path)
+    compare.add_argument("candidate", type=Path)
+    compare.add_argument("output", type=Path)
+    report = sub.add_parser("summary")
+    report.add_argument("artifacts", type=Path)
+    report.add_argument("needs", type=Path)
+    report.add_argument("output", type=Path)
+    args = parser.parse_args()
+    try:
+        result = (
+            performance(args.baseline, args.candidate)
+            if args.command == "performance"
+            else summary(args.artifacts, json.loads(args.needs.read_text()))
+        )
+    except (AssertionError, OSError, ValueError, KeyError, ET.ParseError) as error:
+        result = {"passed": False, "reason": str(error)}
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result, indent=2))
+    sys.exit(0 if result["passed"] else 1)
