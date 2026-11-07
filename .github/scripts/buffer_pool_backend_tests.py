@@ -34,6 +34,7 @@ NATIVE_TARGETS = (
     "c_api_memory_budget_test",
     "internal_ids_memory_test",
     "flat_flow_workspace_test",
+    "flat_streamer_buffer_test",
     "turbo_pq_int8_training_memory_test",
     "ivf_buffered_build_test",
     "search_heap_test",

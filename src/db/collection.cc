@@ -2824,12 +2824,15 @@ Status CollectionImpl::recover_idmap_and_delete_store() {
   // delete store
   std::string delete_store_path = FileHelper::MakeFilePath(
       path_, FileID::DELETE_FILE, v.delete_snapshot_path_suffix());
-  delete_store_ =
-      DeleteStore::CreateAndLoad(schema_->name(), delete_store_path);
-  if (!delete_store_) {
-    return Status::InternalError("recovery delete store failed, path: ",
-                                 delete_store_path);
+  auto delete_store = std::make_shared<DeleteStore>(schema_->name());
+  const auto delete_status = delete_store->load(delete_store_path);
+  if (!delete_status.ok()) {
+    return Status(delete_status.code(),
+                  ailego::StringHelper::Concat(
+                      "recovery delete store failed, path: ", delete_store_path,
+                      ", reason: ", delete_status.message()));
   }
+  delete_store_ = std::move(delete_store);
 
   return Status::OK();
 }

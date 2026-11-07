@@ -259,8 +259,9 @@ class FlatStreamerEntity {
   inline uint64_t key(uint32_t id) const {
     uint64_t result = kInvalidKey;
     if (id >= vector_count()) return kInvalidKey;
-    if (get_key_by_position(id, &result) != 0)
-      throw ReadError{IndexError_ReadData};
+    const int ret = get_key_by_position(id, &result);
+    if (ret != 0)
+      throw ReadError{ret == IndexError_NoMemory ? ret : IndexError_ReadData};
     return result;
   }
 
@@ -509,6 +510,15 @@ class FlatStreamerEntity {
            vector_index * stored_vector_size();
   }
 
+  static void check_read_budget(
+      const IndexStorage::Segment::Pointer &segment) {
+    // The legacy block helpers return a short-read marker. Preserve budget
+    // refusal before that marker becomes a generic read/format error; public
+    // streamer entry points translate bad_alloc to IndexError_NoMemory.
+    if (segment && segment->read_error() == IndexError_NoMemory)
+      throw std::bad_alloc();
+  }
+
   //! Get header block of an linear list
   int get_head_block(IndexStorage::MemoryBlock &header_block) const {
     auto hd_segment = get_segment(0);
@@ -518,6 +528,7 @@ class FlatStreamerEntity {
     if (hd_segment->read(0, header_block, sizeof(BlockLocation)) !=
         sizeof(BlockLocation)) {
       LOG_ERROR("Failed to read head block location");
+      check_read_budget(hd_segment);
       return -1;
     }
     return 0;
@@ -533,6 +544,7 @@ class FlatStreamerEntity {
     if (segment->read(off, header_block, sizeof(BlockHeader)) !=
         sizeof(BlockHeader)) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
@@ -546,6 +558,7 @@ class FlatStreamerEntity {
     if (segment->read(off, deletion_map_block, sizeof(DeletionMap)) !=
         sizeof(DeletionMap)) {
       LOG_ERROR("Failed to read deletion map, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
@@ -560,6 +573,7 @@ class FlatStreamerEntity {
                       block_vector_count() * sizeof(uint64_t)) !=
         block_vector_count() * sizeof(uint64_t)) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
@@ -574,6 +588,7 @@ class FlatStreamerEntity {
                       block_vector_count() * index_meta_.element_size()) !=
         block_vector_count() * index_meta_.element_size()) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
