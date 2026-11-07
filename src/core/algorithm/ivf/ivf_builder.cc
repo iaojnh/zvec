@@ -39,7 +39,7 @@ class LabelFilteredIndexHolder : public IndexHolder {
     typedef std::unique_ptr<Iterator> Pointer;
 
     //! Constructor
-    Iterator(const IndexBuildSource::Pointer &holder,
+    Iterator(const VectorBuildSource::Pointer &holder,
              size_t count, ReadId read)
         : holder_(holder), count_(count), read_(std::move(read)) {
       status_ = holder_->create_ordinal_reader(&reader_);
@@ -83,7 +83,7 @@ class LabelFilteredIndexHolder : public IndexHolder {
 
    private:
     //! Members
-    const IndexBuildSource::Pointer holder_{nullptr};
+    const VectorBuildSource::Pointer holder_{nullptr};
     size_t count_{0};
     ReadId read_;
     size_t index_{0};
@@ -93,7 +93,7 @@ class LabelFilteredIndexHolder : public IndexHolder {
 
   //! Constructor
   LabelFilteredIndexHolder(
-      const IndexBuildSource::Pointer &holder, size_t count,
+      const VectorBuildSource::Pointer &holder, size_t count,
       ReadId read)
       : holder_(holder), count_(count), read_(std::move(read)) {}
 
@@ -130,7 +130,7 @@ class LabelFilteredIndexHolder : public IndexHolder {
 
  private:
   //! Members
-  const IndexBuildSource::Pointer holder_{};
+  const VectorBuildSource::Pointer holder_{};
   size_t count_{0};
   ReadId read_;
 };
@@ -503,7 +503,7 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
   error_ = false;
   err_code_ = 0;
 
-  int ret = IndexBuildSource::Create(
+  int ret = VectorBuildSource::Create(
       holder, &holder_,
       params_.get_as_string(PARAM_IVF_BUILDER_BUILD_STORAGE_PATH));
   if (ret == IndexError_InvalidLength) ret = IndexError_Mismatch;

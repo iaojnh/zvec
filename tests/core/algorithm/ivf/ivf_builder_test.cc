@@ -30,6 +30,7 @@
 #include <zvec/core/framework/index_streamer.h>
 #include "ivf_entity.h"
 #include "utility/stable_vector_holder.h"
+#include "utility/vector_build_source.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
@@ -1529,8 +1530,8 @@ TEST_F(IVFBuilderTest, StableSourceKeepsOriginalAddressesAndBackingData) {
   prepare_index_holder(100, 103);
   auto source = std::make_shared<StableTestHolder>(holder_);
   const void *first = holder_->create_iterator()->data();
-  IndexBuildSource::Pointer borrowed;
-  ASSERT_EQ(0, IndexBuildSource::Create(source, &borrowed));
+  VectorBuildSource::Pointer borrowed;
+  ASSERT_EQ(0, VectorBuildSource::Create(source, &borrowed));
   std::weak_ptr<IndexHolder> backing = holder_;
   source.reset();
   holder_.reset();

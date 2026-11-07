@@ -15,9 +15,9 @@
 #include <limits>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_build_partitions.h>
-#include <zvec/core/framework/index_build_source.h>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_meta.h>
+#include "utility/vector_build_source.h"
 #include "ivf_centroid_index.h"
 
 namespace zvec {
@@ -171,7 +171,7 @@ class IVFBuilder : public IndexBuilder {
   IndexBuildPartitions labels_;
   IVFCentroidIndex::Pointer centroid_index_{};
   IVFCentroidIndex::Pointer searcher_centroid_index_{};
-  IndexBuildSource::Pointer holder_{};
+  VectorBuildSource::Pointer holder_{};
   // Keep the immutable source alive through dump, including repeated dumps.
   // The reader owns only a key map and at most one provider, never all vectors.
   OrdinalAccessHolder::Reader::Pointer source_reader_{};

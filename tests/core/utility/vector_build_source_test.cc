@@ -73,6 +73,48 @@ TEST(VectorBuildSourceTest, NumericalProvidersBorrowAllPrecisionsByOrdinal) {
   CheckBorrowedNumericalInput<IndexMeta::DT_INT16, int16_t>();
 }
 
+TEST(VectorBuildSourceTest, OrdinalOnlyInputSupportsIndependentIterations) {
+  class OrdinalOnlyInput : public MultiPassIndexProvider<IndexMeta::DT_FP32> {
+   public:
+    OrdinalOnlyInput() : MultiPassIndexProvider<IndexMeta::DT_FP32>(3) {}
+    bool multipass() const override {
+      return false;
+    }
+    IndexHolder::Iterator::Pointer create_iterator() override {
+      return nullptr;
+    }
+  };
+  auto input = std::make_shared<OrdinalOnlyInput>();
+  for (size_t i = 0; i < 5; ++i) {
+    ASSERT_TRUE(input->emplace(
+        i % 2, ailego::NumericalVector<float>(3, float(i))));
+  }
+  VectorBuildSource::Pointer source;
+  ASSERT_EQ(0, VectorBuildSource::Create(input, &source));
+  EXPECT_TRUE(source->multipass());
+  auto first = source->create_iterator();
+  auto second = source->create_iterator();
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  std::weak_ptr<IndexHolder> backing = input;
+  input.reset();
+  source.reset();
+  EXPECT_FALSE(backing.expired());
+  for (auto *iter : {first.get(), second.get()}) {
+    for (size_t i = 0; i < 5; ++i, iter->next()) {
+      ASSERT_TRUE(iter->is_valid());
+      EXPECT_EQ(i % 2, iter->key());
+      ASSERT_NE(nullptr, iter->data());
+      EXPECT_FLOAT_EQ(float(i), static_cast<const float *>(iter->data())[0]);
+    }
+    EXPECT_FALSE(iter->is_valid());
+    EXPECT_EQ(0, iter->status());
+  }
+  first.reset();
+  second.reset();
+  EXPECT_TRUE(backing.expired());
+}
+
 // One-pass source reusing the same row buffer on every data() call. No test
 // retains a full input corpus in memory, including the larger-than-pool case.
 class StreamingInput : public IndexHolder {
