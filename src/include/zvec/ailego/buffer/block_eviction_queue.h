@@ -303,11 +303,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     return process_rss_.try_reserve(bytes);
   }
   bool try_charge_process_backing(size_t bytes, size_t materialization,
-                                  bool pending_copy) {
-    return pending_copy ? process_rss_.try_acquire_with_pending_copy(
-                              bytes, materialization)
-                        : process_rss_.try_acquire(bytes, materialization);
-  }
+                                  bool pending_copy);
   // For separately budgeted backing, e.g. the RocksDB cache allocator.
   bool account_pending_process_backing(size_t bytes) {
     return process_rss_.account_pending(bytes);
@@ -318,6 +314,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   }
   void release_process_backing(size_t bytes) {
     process_rss_.release(bytes);
+    capacity_cv_.notify_all();
   }
   void release_unmapped_process_backing(
       size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {

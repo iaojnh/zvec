@@ -1613,6 +1613,55 @@ bool MemoryLimitPool::try_charge_workspace(size_t buffer_size,
                                     Backing::kLive, materialization);
 }
 
+bool MemoryLimitPool::try_charge_process_backing(size_t bytes,
+                                                 size_t materialization,
+                                                 bool pending_copy) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto admit = [&] {
+    return pending_copy ? process_rss_.try_acquire_with_pending_copy(
+                              bytes, materialization)
+                        : process_rss_.try_acquire(bytes, materialization);
+  };
+  if (admit()) return true;
+  if ((process_rss_.limit() && bytes > process_rss_.limit()) ||
+      !process_rss_.materialization_allowed(materialization))
+    return false;
+  size_t waiting = workspace_waiting_size_.load(std::memory_order_relaxed);
+  do {
+    if (bytes > std::numeric_limits<size_t>::max() - waiting) return false;
+  } while (!workspace_waiting_size_.compare_exchange_weak(
+      waiting, waiting + bytes, std::memory_order_relaxed));
+  auto release_priority = ScopeGuard::Make([this, bytes] {
+    workspace_waiting_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    capacity_cv_.notify_all();
+  });
+  bg_cv_.notify_one();
+  if (admit()) return true;
+  // Planning quota is already charged. Wait on RSS room independently of
+  // logical capacity, giving cache eviction and competing calls time to yield.
+  size_t previous_available = process_rss_.available();
+  for (size_t attempt = 0; attempt < 50; ++attempt) {
+    {
+      std::unique_lock<std::mutex> lock(capacity_mutex_);
+      capacity_cv_.wait_for(
+          lock, std::chrono::milliseconds(100),
+          [this, bytes] { return bytes <= process_rss_.available(); });
+    }
+    if (admit()) return true;
+    if (!process_rss_.materialization_allowed(materialization)) return false;
+    const size_t current_available = process_rss_.available();
+    if (current_available <= previous_available) {
+      const auto queues = BlockEvictionQueue::get_instance().stats();
+      if (std::all_of(queues.approximate_queue_sizes.begin(),
+                      queues.approximate_queue_sizes.end(),
+                      [](size_t depth) { return depth == 0; }))
+        return false;
+    }
+    previous_available = current_available;
+  }
+  return false;
+}
+
 bool MemoryLimitPool::try_charge_workspace_plan(size_t bytes) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   return try_charge_fixed_with_wait(bytes, &external_used_size_,

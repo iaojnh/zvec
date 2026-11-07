@@ -140,6 +140,26 @@ TEST_F(ResultMemoryAllowanceTest,
   }
 }
 
+TEST_F(ResultMemoryAllowanceTest, PendingCopyWaitsForCompetingRssBacking) {
+  ASSERT_EQ(0, pool_.init(128 * kMiB));
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 48 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ASSERT_TRUE(native.try_charge_process_backing(8 * kMiB, 0, false));
+  auto release = std::async(std::launch::async, [&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    native.release_process_backing(8 * kMiB);
+  });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease lease(&allowance, false, kMiB);
+  ResultMemoryAllowance::PendingCopy pending;
+  EXPECT_NO_THROW(lease.add_pending(12 * kMiB, kMiB, pending));
+  release.get();
+  EXPECT_EQ(12 * kMiB, allowance.active_bytes());
+}
+
 TEST_F(ResultMemoryAllowanceTest,
        ReusedBackingObeysCriticalPressureAndRecovery) {
   ResultMemoryAllowance allowance;
