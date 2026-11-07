@@ -139,7 +139,9 @@ def run(args):
                 suite = ET.SubElement(combined, "testsuite", name=target)
                 case = ET.SubElement(suite, "testcase", name="execution")
                 ET.SubElement(case, "failure").text = str(error)
-            print(target, "complete", flush=True)
+                print(target, "FAILED:", str(error), flush=True)
+            else:
+                print(target, "passed", flush=True)
     ET.ElementTree(combined).write(evidence / "native.xml", encoding="unicode")
     command = [
         sys.executable,

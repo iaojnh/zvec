@@ -88,7 +88,9 @@ jobs:
             -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
             -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
           read -r -a targets <<< "$(python .github/scripts/buffer_pool_backend_tests.py --print-targets)"
-          cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target unittest.build "${targets[@]}"
+          # These targets are bundled and executed below. Desktop compatibility
+          # jobs separately compile the full native test suite.
+          cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target "${targets[@]}"
           python .github/scripts/buffer_pool_native_bundle.py build candidate/native-tests.tar.gz "${targets[@]}"
           git rev-parse HEAD > candidate/commit.txt
           git submodule status --recursive > candidate/submodules.txt
