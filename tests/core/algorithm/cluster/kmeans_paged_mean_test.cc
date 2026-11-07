@@ -41,8 +41,8 @@ class KmeansPagedMeanTest : public ::testing::Test {
 TEST_F(KmeansPagedMeanTest,
        ExactStateSurvivesEvictionForNumericAndPackedMeans) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
-  ASSERT_EQ(pool.init(ailego::VecBufferPool::metadata_bytes_for_page_count(
-                          4096, true) +
+  ASSERT_EQ(pool.init(ailego::PoolPayloadBudget::storage_metadata_bytes(
+                          4096) +
                       64 * 1024),
             0);
   std::vector<std::shared_ptr<VectorMean>> means{
@@ -97,7 +97,7 @@ TEST_F(KmeansPagedMeanTest, FixedCentroidsMatchHeapAndReleasePool) {
     IndexCluster::CentroidList reference;
     auto &pool = ailego::PoolPayloadBudget::get_instance();
     const size_t budget_bytes =
-        2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+        2 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
         // Keep 64 KiB for pages after admitting the newly charged worker
         // rows and initialization tile; the means still exceed resident pages.
         64 * 1024 + (kDimension * 40 + 256) + 64 * 1024 +

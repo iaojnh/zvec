@@ -295,7 +295,7 @@ TEST_P(HolderTrainingTest, BufferedTrainingMatchesMemoryAndCleansScratch) {
 
   const auto &param = GetParam();
   const size_t metadata =
-      VecBufferPool::metadata_bytes_for_page_count(1024, true);
+      PoolPayloadBudget::storage_metadata_bytes(1024);
   // Caller-owned reference features and seed/output copies remain live
   // alongside the bounded 64 KiB training page workspace.
   const size_t row_bytes =
@@ -340,7 +340,7 @@ TEST(OptKmeansCluster, BufferedTrainingUnderPagePressure) {
   auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
 
   const size_t metadata =
-      VecBufferPool::metadata_bytes_for_page_count(4096, true);
+      PoolPayloadBudget::storage_metadata_bytes(4096);
   // Training and exported centers need two page tables. Initial/canonical
   // centers and bounded output growth overlap; all stay billed until freed.
   const size_t center_workspace =
@@ -392,7 +392,7 @@ TEST(OptKmeansCluster, BufferedCreationAndDeferredReadFailuresDoNotPublish) {
   auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
 
   const size_t metadata =
-      VecBufferPool::metadata_bytes_for_page_count(1024, true);
+      PoolPayloadBudget::storage_metadata_bytes(1024);
   PoolPayloadBudget::get_instance().init(metadata + 64u * 1024u);
   TemporaryTrainingDirectory directory;
   auto holder = std::make_shared<StreamingTestHolder>(7, 259);
@@ -690,7 +690,7 @@ TEST(OptKmeansCluster, TrainerStreamsOrFallsBackAsAppropriate) {
   // Two-level streaming may have input, permutation and training matrix
   // stores live together. Do not inherit a previous test's single-store pool.
   const size_t metadata =
-      VecBufferPool::metadata_bytes_for_page_count(4096, true);
+      PoolPayloadBudget::storage_metadata_bytes(4096);
   ASSERT_EQ(0, pool.init(3 * metadata + 256u * 1024u));
   auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
   for (int mode = 0; mode < 6; ++mode) {

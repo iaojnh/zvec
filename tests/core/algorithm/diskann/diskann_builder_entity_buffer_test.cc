@@ -81,7 +81,7 @@ class DiskAnnBuilderEntityBufferTest : public testing::Test {
     // Leave only 1 MiB for resident data across our two temporary storages,
     // irrespective of the platform's page size and metadata requirements.
     const size_t metadata =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true);
+        ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
     ailego::PoolPayloadBudget::get_instance().init(2 * metadata +
                                                    1024UL * 1024UL);
   }

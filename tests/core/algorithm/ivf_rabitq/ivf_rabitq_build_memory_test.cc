@@ -105,8 +105,8 @@ class IvfRabitqBuildMemoryTest : public ::testing::TestWithParam<bool> {
                 // Trained state plus the two encoded-output stores coexist.
                 // Include their fixed writable metadata and worker scratch;
                 // this case checks borrowed-input lifetime, not minimum RSS.
-                ? 3 * ailego::VecBufferPool::metadata_bytes_for_page_count(
-                          4096, true) +
+                ? 3 * ailego::PoolPayloadBudget::storage_metadata_bytes(
+                          4096) +
                       1024 * 1024
                 : 0),
         0);

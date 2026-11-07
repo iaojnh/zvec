@@ -22,6 +22,7 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <turbo/algorithm/kmeans.h>
@@ -110,9 +111,19 @@ int PqInt8Quantizer::setup_functions() {
 int PqInt8Quantizer::init(const IndexMeta &meta,
                           const ailego::Params &params) try {
   initialized_ = false;
-  ModelVector<ModelVector<const void *>>().swap(centroid_ptrs_cache_);
-  ModelVector<uint8_t>().swap(centroids_);
-  ModelVector<float>().swap(centroid_);
+  auto clear_model = [this] {
+    ModelVector<ModelVector<const void *>>().swap(centroid_ptrs_cache_);
+    ModelVector<uint8_t>().swap(centroids_);
+    ModelVector<float>().swap(centroid_);
+    decltype(chunk_offsets_)().swap(chunk_offsets_);
+    std::vector<float>().swap(dist_table_);
+    paged_dist_table_.reset();
+    opq_ = PqOpq{};
+  };
+  clear_model();
+  auto rollback = ailego::ScopeGuard::Make([&] {
+    if (!initialized_) clear_model();
+  });
   meta_ = meta;
 
   // Map core IndexMeta::DataType to turbo DataType.

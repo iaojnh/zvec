@@ -31,7 +31,7 @@ TEST(FlatSparseMemoryTest, DirectIdsHolesUpdatesAndReopen) {
     EXPECT_EQ(0, pool.init(previous));
   });
   const size_t budget =
-      2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      2 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
       64 * ailego::kVectorPageSize;
   ASSERT_EQ(0, pool.init(budget));
   for (const auto *mode : {"MMapFileStorage", "BufferStorage"}) {
@@ -142,7 +142,7 @@ TEST(FlatSparseMemoryTest, PagedDumpPreservesAllLegacySegments) {
   // writeback metadata plus the explicitly enabled arbitrary-key map.
   // Allow up to 128 bytes per map entry, then 64 pages for the dump.
   const size_t budget =
-      2 * ailego::VecBufferPool::metadata_bytes_for_page_count(4096, true) +
+      2 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
       64 * ailego::kVectorPageSize + count * 128;
   for (int mode = 0; mode < 4; ++mode) {
     SCOPED_TRACE(mode);
