@@ -130,17 +130,19 @@ inline char *CopyCResultString(std::string_view value) {
 // Used before C arrays become vectors, including all-missing Fetch requests.
 // No payload allocation is allowed before the complete estimate is admitted.
 inline void ReserveCStrings(ResultMemoryAllowance::Lease &memory,
+                            ResultMemoryAllowance::PendingCopy &pending,
                             const char *const *strings, size_t count,
                             size_t extra_per_item = 0) {
-  memory.add(
-      BindingMemoryBytes(count, 3 * sizeof(std::string) + extra_per_item));
+  memory.add_pending(
+      BindingMemoryBytes(count, 3 * sizeof(std::string) + extra_per_item),
+      pending);
   size_t bytes = 0;
   for (size_t i = 0; i < count; ++i) {
     if (strings[i])
       bytes = BindingMemoryBytes(1, std::strlen(strings[i]),
                                  BindingMemoryBytes(1, bytes, 32));
   }
-  memory.add(bytes);
+  memory.add_pending(bytes, pending);
 }
 
 }  // namespace zvec::detail

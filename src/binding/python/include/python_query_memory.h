@@ -68,17 +68,30 @@ class PythonQueryMemory {
   // Return the admitted snapshot used by NumPy and the native vector caster.
   // Do not estimate one protocol (__len__/raw list storage), then copy another
   // (__iter__/__array__) which may expand into an unrelated amount of data.
-  pybind11::object prepare_vector(pybind11::handle value) {
-    if (!memory_.enabled())
-      return pybind11::reinterpret_borrow<pybind11::object>(value);
+  pybind11::object prepare_vector(pybind11::handle value,
+                                  const pybind11::object &convert,
+                                  pybind11::handle dtype) {
+    if (!memory_.enabled()) {
+      return convert.is_none()
+                 ? pybind11::reinterpret_borrow<pybind11::object>(value)
+                 : convert(value, dtype);
+    }
     auto normalized = normalize_vector(value);
+    ResultMemoryAllowance::PendingCopy pending;
     size_t admitted = 0;
     while (true) {
       const auto bytes = vector_bytes(normalized);
-      if (bytes <= admitted) return normalized;
-      admit(bytes - admitted);
+      if (bytes <= admitted) break;
+      if (convert.is_none()) {
+        admit(bytes - admitted);
+      } else {
+        reserve(bytes - admitted, pending);
+      }
       admitted = bytes;
     }
+    if (convert.is_none()) return normalized;
+    pending.start();
+    return convert(normalized, dtype);
   }
 
  private:
@@ -164,20 +177,23 @@ class PythonQueryMemory {
       return original;
     pybind11::list staged;
     if (exact) {
+      ResultMemoryAllowance::PendingCopy pending;
       size_t admitted = 0;
       while (true) {
         const auto bytes = BindingMemoryBytes(pybind11::len(value),
                                               2 * sizeof(PyObject *), 64);
         if (bytes <= admitted) break;
-        admit(bytes - admitted);
+        reserve(bytes - admitted, pending);
         admitted = bytes;
       }
       // Exact builtins cannot run Python callbacks while taking this shallow
       // snapshot. Own all references before recursive normalization releases
       // the GIL; the caller's mutable list may change during admission.
+      pending.start();
       staged = pybind11::reinterpret_steal<pybind11::list>(
           PySequence_List(value.ptr()));
       if (!staged) throw pybind11::error_already_set();
+      pending.finish();
       for (size_t i = 0; i < staged.size(); ++i) {
         auto held = pybind11::reinterpret_borrow<pybind11::object>(staged[i]);
         staged[i] = normalize_vector(held, depth + 1);
@@ -188,8 +204,11 @@ class PythonQueryMemory {
       for (auto item :
            pybind11::reinterpret_borrow<pybind11::iterable>(value)) {
         auto held = pybind11::reinterpret_borrow<pybind11::object>(item);
-        admit(64);
-        staged.append(normalize_vector(held, depth + 1));
+        ResultMemoryAllowance::PendingCopy pending;
+        reserve(64, pending);
+        auto normalized = normalize_vector(held, depth + 1);
+        pending.start();
+        staged.append(normalized);
       }
     }
     return std::move(staged);
@@ -198,6 +217,10 @@ class PythonQueryMemory {
   void admit(size_t bytes) {
     pybind11::gil_scoped_release release;
     memory_.add(bytes);
+  }
+  void reserve(size_t bytes, ResultMemoryAllowance::PendingCopy &pending) {
+    pybind11::gil_scoped_release release;
+    memory_.add_pending(bytes, pending);
   }
   pybind11::object sequence(pybind11::handle value, bool fields) {
     if (value.is_none())
@@ -215,7 +238,9 @@ class PythonQueryMemory {
     for (auto item : pybind11::reinterpret_borrow<pybind11::iterable>(value)) {
       auto held = pybind11::reinterpret_borrow<pybind11::object>(item);
       if (fields && out.size() == kMaxOutputFieldSize) too_many_fields();
-      admit(64);
+      ResultMemoryAllowance::PendingCopy pending;
+      reserve(64, pending);
+      pending.start();
       out.append(held);
     }
     return out;

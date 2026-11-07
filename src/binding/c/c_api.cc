@@ -6795,8 +6795,10 @@ zvec_error_code_t zvec_collection_add_column(zvec_collection_t *collection,
 
       zvec::detail::ResultMemoryAllowance::Lease input_memory(
           collection_input_allowance(**coll_ptr));
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
       if (expression)
-        zvec::detail::ReserveCStrings(input_memory, &expression, 1);
+        zvec::detail::ReserveCStrings(input_memory, pending, &expression, 1);
+      pending.start();
       // Deep copy the schema - caller retains ownership
       auto *cpp_schema =
           reinterpret_cast<const zvec::FieldSchema *>(field_schema);
@@ -6804,6 +6806,7 @@ zvec_error_code_t zvec_collection_add_column(zvec_collection_t *collection,
           std::make_shared<zvec::FieldSchema>(*cpp_schema);
 
       std::string expr = expression ? expression : "";
+      pending.finish();
       zvec::Status status = (*coll_ptr)->add_column(schema, expr);
 
       return handle_status(status);)
@@ -7134,8 +7137,10 @@ zvec_error_code_t zvec_collection_delete(zvec_collection_t *collection,
 
       zvec::detail::ResultMemoryAllowance::Lease input_memory(
           collection_input_allowance(**coll_ptr));
-      zvec::detail::ReserveCStrings(input_memory, pks, pk_count,
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, pks, pk_count,
                                    3 * sizeof(zvec::Status) + 512);
+      pending.start();
       std::vector<std::string> primary_keys; primary_keys.reserve(pk_count);
       for (size_t i = 0; i < pk_count; ++i) {
         if (pks[i]) {
@@ -7143,6 +7148,7 @@ zvec_error_code_t zvec_collection_delete(zvec_collection_t *collection,
         }
       }
 
+      pending.finish();
       auto result = (*coll_ptr)->delete_(primary_keys);
       zvec_error_code_t error_code = handle_expected_result(result);
 
@@ -7182,7 +7188,9 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
 
       zvec::detail::ResultMemoryAllowance::Lease input_memory(
           collection_input_allowance(**coll_ptr));
-      zvec::detail::ReserveCStrings(input_memory, pks, pk_count);
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, pks, pk_count);
+      pending.start();
       std::vector<std::string> primary_keys; primary_keys.reserve(pk_count);
       for (size_t i = 0; i < pk_count; ++i) {
         if (pks[i]) {
@@ -7192,6 +7200,7 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
         }
       }
 
+      pending.finish();
       CWriteResultBuffer output(primary_keys);
       auto result = (*coll_ptr)->delete_(primary_keys);
       zvec_error_code_t error_code = handle_expected_result(result);
@@ -7216,8 +7225,13 @@ zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection
 
       zvec::detail::ResultMemoryAllowance::Lease input_memory(
           collection_input_allowance(**coll_ptr));
-      zvec::detail::ReserveCStrings(input_memory, &filter, 1);
-      auto status = (*coll_ptr)->delete_by_filter(filter); if (!status.ok()) {
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, &filter, 1);
+      pending.start();
+      const std::string expression(filter);
+      pending.finish();
+      auto status = (*coll_ptr)->delete_by_filter(expression);
+      if (!status.ok()) {
         return handle_status(status);
       }
       return ZVEC_OK;)
@@ -7457,9 +7471,12 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
 
       zvec::detail::ResultMemoryAllowance::Lease input_memory(
           collection_input_allowance(**coll_ptr));
-      zvec::detail::ReserveCStrings(input_memory, pks, pk_count);
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, pks, pk_count);
       if (output_fields)
-        zvec::detail::ReserveCStrings(input_memory, output_fields, output_field_count);
+        zvec::detail::ReserveCStrings(input_memory, pending, output_fields,
+                                     output_field_count);
+      pending.start();
       // Convert C array to C++ vector
       std::vector<std::string> pk_vector; pk_vector.reserve(pk_count);
       for (size_t i = 0; i < pk_count; ++i) {
@@ -7487,6 +7504,7 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
         cpp_output_fields = std::move(fields);
       }
 
+      pending.finish();
       auto result = zvec::internal::fetch_result_snapshot(
           **coll_ptr, pk_vector, cpp_output_fields, include_vector);
       if (!result.has_value()) {

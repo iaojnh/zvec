@@ -33,7 +33,6 @@
 #include <unistd.h>
 #elif defined(_WIN32) || defined(_WIN64)
 #define PLATFORM_WINDOWS 1
-#include <windows.h>
 #endif
 
 namespace zvec {

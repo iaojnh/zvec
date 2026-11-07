@@ -277,13 +277,14 @@ class QueryExecutor:
         else:
             raise ValueError("Group by query requires a vector or document id")
 
-        if memory is not None:
-            vec_data = memory.prepare_vector(vec_data)
         target_dtype = DTYPE_MAP.get(vector_schema.data_type.value)
-        search_query.set_vector(
-            vector_schema._get_object(),
-            convert_to_numpy(vec_data, target_dtype) if target_dtype else vec_data,
-        )
+        if memory is not None:
+            vec_data = memory.prepare_vector(
+                vec_data, convert_to_numpy if target_dtype else None, target_dtype
+            )
+        elif target_dtype:
+            vec_data = convert_to_numpy(vec_data, target_dtype)
+        search_query.set_vector(vector_schema._get_object(), vec_data)
 
     def _build_search_query(
         self, ctx: QueryContext, query: Query, collection: _Collection, memory=None

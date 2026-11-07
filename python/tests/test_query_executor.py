@@ -404,12 +404,16 @@ class TestQueryExecutor:
             "one": ("one", 0.0, {}, {"test": [1.0, 2.0, 3.0]})
         }
         memory = MagicMock()
-        memory.prepare_vector.side_effect = lambda value: value
+        memory.prepare_vector.side_effect = (
+            lambda value, convert, dtype: convert(value, dtype)
+        )
         query = executor._build_search_query(
             QueryContext(topk=1), Query("test", id="one"), collection, memory
         )
         collection.FetchTuples.assert_called_once_with(["one"], [], True)
-        memory.prepare_vector.assert_called_once_with([1.0, 2.0, 3.0])
+        memory.prepare_vector.assert_called_once_with(
+            [1.0, 2.0, 3.0], convert_to_numpy, np.float32
+        )
         np.testing.assert_array_equal(
             query.get_vector(schema.vector("test")._get_object()), [1.0, 2.0, 3.0]
         )
