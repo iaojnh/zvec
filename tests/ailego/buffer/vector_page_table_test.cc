@@ -445,6 +445,25 @@ TEST_F(BufferPoolTest, AdmissionControlRejectsFirstColdMissAfterPressure) {
   EXPECT_EQ(stats.admission_admitted, 1u);
 }
 
+TEST_F(BufferPoolTest, ShortTailReadReleasesBulkScratch) {
+  init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/6);
+  VecBufferPool pool(new_file(6), false);
+  ASSERT_EQ(0, pool.init());
+  auto handle = pool.get_handle();
+  // The unaligned cold range fills the available bulk workspace before its
+  // final short run. That workspace must not starve the tail's page read.
+  constexpr size_t offset = 64;
+  std::vector<char> output(5 * kVectorPageSize);
+  bool allocation_failed = false;
+  ASSERT_TRUE(handle.read_range(offset, output.size(), output.data(),
+                                allocation_failed));
+  EXPECT_FALSE(allocation_failed);
+  for (size_t i = 0; i < output.size(); ++i) {
+    ASSERT_EQ(static_cast<char>((offset + i) / kVectorPageSize), output[i])
+        << i;
+  }
+}
+
 TEST_F(BufferPoolTest, BulkReadDoesNotAdmitFirstTouchScanUnderPressure) {
   constexpr size_t kFilePages = 5;
   init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/kFilePages);

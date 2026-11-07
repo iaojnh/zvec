@@ -164,11 +164,27 @@ TEST(FlatPagedMetadataTest, LazyKeysMappingQueriesAndReadErrors) {
       SCOPED_TRACE(mode);
       SCOPED_TRACE(static_cast<int>(order));
       // The bypass path still needs charged metadata reads/query scratch.
-      // This is below page-table metadata admission, not a zero-byte reader.
-      ASSERT_EQ(0, pool.init(mode == 2 ? 64 * 1024 : 2 * 1024 * 1024));
-      if (mode == 2)
-        ASSERT_LT(pool.capacity(),
+      // A copied query tile and aligned input scratch need at least eight
+      // physical pages when the host uses 16 KiB pages.
+      const size_t query_budget =
+          std::max<size_t>(64 * 1024, 8 * pool.page_buffer_size());
+      ASSERT_EQ(0, pool.init(mode == 2 ? query_budget : 2 * 1024 * 1024));
+      size_t admission_pressure = 0;
+      AILEGO_DEFER([&] {
+        if (admission_pressure != 0) pool.release_external(admission_pressure);
+      });
+      if (mode == 2) {
+        // Leave room to decode the small container directory, but not to
+        // admit even a compact page table. Release this pressure after open
+        // so the bounded query/scratch allowance remains available.
+        const size_t directory_allowance = pool.page_buffer_size();
+        ASSERT_GT(pool.available(), directory_allowance);
+        const size_t requested = pool.available() - directory_allowance;
+        ASSERT_TRUE(pool.try_charge_external(requested));
+        admission_pressure = requested;
+        ASSERT_LT(pool.available(),
                   ailego::VecBufferPool::metadata_bytes_for_page_count(1));
+      }
       auto source = IndexFactory::CreateStorage(mode ? "BufferReadStorage"
                                                      : "MMapFileReadStorage");
       ailego::Params params;
@@ -176,6 +192,14 @@ TEST(FlatPagedMetadataTest, LazyKeysMappingQueriesAndReadErrors) {
                  BUFFER_READ_STORAGE_WARMUP_NONE);
       ASSERT_EQ(0, source->init(params));
       ASSERT_EQ(0, source->open(path, false));
+      if (mode != 0) {
+        ASSERT_NE(nullptr, source->vec_buffer_pool());
+        ASSERT_EQ(mode == 1, source->vec_buffer_pool()->cache_enabled());
+      }
+      if (admission_pressure != 0) {
+        pool.release_external(admission_pressure);
+        admission_pressure = 0;
+      }
       auto storage = std::make_shared<WatchedStorage>(source);
       auto searcher_owner = IndexFactory::CreateSearcher("FlatSearcher");
       ASSERT_NE(nullptr, searcher_owner);

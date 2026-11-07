@@ -2550,6 +2550,9 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
     size_t run_pages = run_end - run_start;
 
     if (run_pages <= 3) {
+      // Previous bulk bytes are already copied. Short cache/bypass reads
+      // need their own page, so release unused bulk workspace first.
+      scratch.clear();
       for (size_t j = 0; j < run_pages; ++j) {
         block_id_t pid = static_cast<block_id_t>(run_start + j);
         // Once a sparse resident set breaks a cold range into short holes,

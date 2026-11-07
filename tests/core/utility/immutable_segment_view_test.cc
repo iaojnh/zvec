@@ -41,6 +41,11 @@ TEST(ImmutableSegmentViewTest, BoundedReadsOwnTheirLifetimeUnderPressure) {
   ASSERT_EQ(dumper->write(bytes.data(), bytes.size()), bytes.size());
   ASSERT_EQ(dumper->append("payload", bytes.size(), 0, 0), 0);
   ASSERT_EQ(dumper->close(), 0);
+  const size_t file_pages =
+      (std::filesystem::file_size(path) - 1) / ailego::kVectorPageSize + 1;
+  const size_t cache_metadata =
+      ailego::VecBufferPool::metadata_bytes_for_page_count(file_pages) +
+      pool.page_buffer_size();  // Header of the first page-buffer slab.
   // Also cover the bypass-only open: no cache page fits, but load must still
   // avoid materializing the complete segment on the heap.
   for (size_t mode_index = 0; mode_index < 3; ++mode_index) {
@@ -48,15 +53,25 @@ TEST(ImmutableSegmentViewTest, BoundedReadsOwnTheirLifetimeUnderPressure) {
         mode_index == 0 ? "MMapFileReadStorage" : "BufferReadStorage";
     SCOPED_TRACE(mode);
     SCOPED_TRACE(mode_index);
-    // Admit the small segment directory and load scratch, but not a data
-    // page table or the 8193-byte result requested below.
-    ASSERT_EQ(pool.init(mode_index == 2 ? 4096 : 128 * 1024), 0);
+    // Keep 128 KiB for reads/copies independently of the cache's mandatory
+    // metadata and allocator header (rounded to the host page size). The
+    // bypass-only case admits the directory but cannot return an owned
+    // 8193-byte range.
+    const size_t budget =
+        mode_index == 2 ? 4096
+                        : 128 * 1024 + (mode_index == 1 ? cache_metadata : 0);
+    ASSERT_LT(budget, bytes.size());
+    ASSERT_EQ(pool.init(budget), 0);
     auto storage = IndexFactory::CreateStorage(mode);
     ailego::Params params;
     params.set(BUFFER_READ_STORAGE_WARMUP_MODE,
                BUFFER_READ_STORAGE_WARMUP_NONE);
     ASSERT_EQ(storage->init(params), 0);
     ASSERT_EQ(storage->open(path, false), 0);
+    if (mode_index != 0) {
+      ASSERT_NE(nullptr, storage->vec_buffer_pool());
+      ASSERT_EQ(mode_index == 1, storage->vec_buffer_pool()->cache_enabled());
+    }
     ImmutableSegmentView view;
     ASSERT_EQ(view.load(storage, "payload", 0, bytes.size()), 0);
     EXPECT_EQ(view.data() == nullptr, storage->vec_buffer_pool() != nullptr);

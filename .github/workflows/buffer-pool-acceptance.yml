@@ -129,7 +129,8 @@ jobs:
     name: Index build memory control (${{ matrix.index }}, 512 MiB)
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # The 400K x 768 DiskANN graph also runs on ordinary shared CI CPUs.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
