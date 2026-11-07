@@ -664,16 +664,17 @@ def verify_fetch_inputs(path, kind, mmap, dimension, count):
         assert fetch(["0", "missing", "0"])["0"] is not None
 
     for include_vector in (False, True):
-        # These input copies fit. Unique IDs additionally need hash nodes and
-        # bucket growth, whereas duplicates require only one hash entry.
+        # Inline ASCII payloads live in the native string slots. With the
+        # corrected accounting, 100k duplicates fit; the same number of unique
+        # IDs additionally needs enough hash nodes/buckets to exceed admission.
         assert (
-            coll.fetch(["missing000000"] * 70_000, include_vector=include_vector) == {}
+            coll.fetch(["missing000000"] * 100_000, include_vector=include_vector) == {}
         )
         # With the shared allowance nearly full, either the next hash growth
         # or native batch admission can be the first to reject the request.
         with pytest.raises(MemoryError):
             coll.fetch(
-                [f"missing{i:06d}" for i in range(70_000)],
+                [f"missing{i:06d}" for i in range(100_000)],
                 include_vector=include_vector,
             )
         assert (

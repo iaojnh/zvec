@@ -178,6 +178,12 @@ class ProcessRssBudget {
     return try_charge(bytes, backing_, materialization);
   }
 
+  // Admit a planning allowance and its in-flight copy as one operation.
+  // They cover overlapping bytes, and refusal must leave both unchanged.
+  bool try_acquire_with_pending_copy(size_t bytes, size_t materialization) {
+    return try_charge(bytes, backing_, materialization, true);
+  }
+
   // Reserve for an OS allocation that has yet to return. Samples cannot
   // assign these bytes to resident backing before the allocation succeeds.
   bool try_reserve(size_t bytes) {
@@ -492,7 +498,8 @@ class ProcessRssBudget {
     return true;
   }
 
-  bool try_charge(size_t bytes, size_t &counter, size_t materialization = 0) {
+  bool try_charge(size_t bytes, size_t &counter, size_t materialization = 0,
+                  bool pending_copy = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
     if (bytes > available_.load(std::memory_order_relaxed) ||
@@ -503,12 +510,18 @@ class ProcessRssBudget {
     const size_t ledger_available =
         std::numeric_limits<size_t>::max() - backing_ - pending_allocations_;
     if (bytes > available_.load(std::memory_order_relaxed) ||
-        bytes > ledger_available) {
+        bytes > ledger_available ||
+        (pending_copy && materialization > std::numeric_limits<size_t>::max() -
+                                               pending_materializations_)) {
       if (limit()) pressure_.store(true, std::memory_order_relaxed);
       return false;
     }
     counter += bytes;
-    remember_materialization(materialization);
+    if (pending_copy) {
+      pending_materializations_ += materialization;
+    } else {
+      remember_materialization(materialization);
+    }
     update_available();
     return true;
   }

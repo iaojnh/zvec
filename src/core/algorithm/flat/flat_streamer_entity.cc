@@ -1051,7 +1051,7 @@ int FlatStreamerEntity::get_vector_by_key(
       segment->read(loc.offset, block, index_meta_.element_size()) !=
           index_meta_.element_size()) {
     LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-    return IndexError_ReadData;
+    return segment ? segment->read_error() : IndexError_ReadData;
   }
   return 0;
 }
@@ -1123,7 +1123,7 @@ int FlatStreamerEntity::get_vectors_by_key_impl(const uint64_t *keys,
         segment->read(loc.offset, blocks[i], index_meta_.element_size()) !=
             index_meta_.element_size()) {
       LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-      return -1;
+      return segment ? segment->read_error() : IndexError_ReadData;
     }
   }
   return 0;

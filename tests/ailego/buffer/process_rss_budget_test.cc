@@ -94,6 +94,35 @@ TEST(ProcessRssBudgetTest,
   }
 }
 
+TEST(ProcessRssBudgetTest, RejectedCopyGrowthKeepsOtherOwnersResident) {
+  ProcessRssBudget budget;
+  budget.account(16 * kMiB);
+  sampled_rss = 96 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    EXPECT_FALSE(budget.try_acquire_with_pending_copy(4 * kMiB, 33 * kMiB));
+    budget.refresh(true);
+    EXPECT_EQ(32 * kMiB, budget.available());
+  }
+  budget.release(16 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest,
+     CopyGrowthSharesBackingAndKeepsPendingAcrossSamples) {
+  ProcessRssBudget budget;
+  sampled_rss = 112 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire_with_pending_copy(8 * kMiB, 12 * kMiB));
+  EXPECT_EQ(4 * kMiB, budget.available());
+  budget.refresh(true);
+  EXPECT_EQ(4 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_reserve_materialization(5 * kMiB));
+  budget.finish_materialization(12 * kMiB, false);
+  EXPECT_EQ(8 * kMiB, budget.available());
+  budget.release(8 * kMiB);
+  EXPECT_EQ(16 * kMiB, budget.available());
+}
+
 TEST(ProcessRssBudgetTest, NativeZeroAndFailedSamplesCannotReplenishBudget) {
   ProcessRssBudget budget;
   sampled_rss = 32 * kMiB;

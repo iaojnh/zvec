@@ -71,6 +71,16 @@ class PythonFetchInputs {
     return FetchMemoryBytes(utf8_size_bound(value), 2, 64);
   }
 
+  static size_t sequence_string_bytes(pybind11::handle value, size_t utf8) {
+    // Direct short strings live inside the already charged vector slots.
+    // ASCII/bytes need no transient UTF-8 encoding object either.
+    const bool direct =
+        !PyUnicode_Check(value.ptr()) || PyUnicode_IS_ASCII(value.ptr());
+    return direct && utf8 <= std::string{}.capacity()
+               ? 0
+               : FetchMemoryBytes(utf8, 2, 64);
+  }
+
   static size_t utf8_size_bound(pybind11::handle value) {
     if (PyUnicode_Check(value.ptr())) {
       const auto length = PyUnicode_GetLength(value.ptr());
@@ -140,7 +150,7 @@ class PythonFetchInputs {
         for (Py_ssize_t i = 0; i < size; ++i) {
           const auto value = item(i);
           const size_t utf8 = utf8_size_bound(value);
-          const size_t allowance = FetchMemoryBytes(utf8, 2, 64);
+          const size_t allowance = sequence_string_bytes(value, utf8);
           needed = FetchMemoryBytes(1, allowance, needed);
           // Keep room for transient encoder backing for non-ASCII inputs.
           // ASCII and bytes copy directly into the native string.
@@ -178,8 +188,8 @@ class PythonFetchInputs {
       auto held = pybind11::reinterpret_borrow<pybind11::object>(value);
       size_t admitted = 0;
       while (true) {
-        const size_t needed =
-            FetchMemoryBytes(1, string_bytes(held), kSlotBytes);
+        const size_t needed = FetchMemoryBytes(
+            1, sequence_string_bytes(held, utf8_size_bound(held)), kSlotBytes);
         if (needed <= admitted) break;
         pybind11::gil_scoped_release release;
         memory.add_pending(needed - admitted, pending);

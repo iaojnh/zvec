@@ -28,9 +28,13 @@ class ResultMemoryAllowance {
     PendingCopy() = default;
     PendingCopy(const PendingCopy &) = delete;
     PendingCopy &operator=(const PendingCopy &) = delete;
-    ~PendingCopy() { finish(); }
+    ~PendingCopy() {
+      finish();
+    }
 
-    void start() noexcept { started_ = true; }
+    void start() noexcept {
+      started_ = true;
+    }
     void finish() {
       if (const size_t bytes = std::exchange(bytes_, 0))
         ailego::MemoryLimitPool::get_instance().finish_materialization(
@@ -41,11 +45,18 @@ class ResultMemoryAllowance {
    private:
     friend class ResultMemoryAllowance;
 
-    bool reserve(ailego::MemoryLimitPool &pool, size_t bytes) {
-      if (!bytes) return true;
-      if (bytes > std::numeric_limits<size_t>::max() - bytes_ ||
-          !pool.try_reserve_materialization(bytes))
+    bool reserve(ailego::MemoryLimitPool &pool, size_t bytes,
+                 ailego::MemoryReservation &backing, size_t growth) {
+      if (bytes > std::numeric_limits<size_t>::max() - bytes_) return false;
+      if (growth) {
+        try {
+          backing.add_with_pending_copy(growth, bytes);
+        } catch (const std::bad_alloc &) {
+          return false;
+        }
+      } else if (bytes && !pool.try_reserve_materialization(bytes)) {
         return false;
+      }
       bytes_ += bytes;
       return true;
     }
@@ -98,7 +109,8 @@ class ResultMemoryAllowance {
     void add(size_t bytes, size_t materialization) {
       if (!owner_ || (!bytes && !materialization)) return;
       begin_materialization();
-      bytes_ += owner_->acquire(bytes, backing_quantum_, materialization, nullptr);
+      bytes_ +=
+          owner_->acquire(bytes, backing_quantum_, materialization, nullptr);
     }
 
     void add_pending(size_t bytes, PendingCopy &pending) {
@@ -109,15 +121,16 @@ class ResultMemoryAllowance {
                      PendingCopy &pending) {
       if (!owner_ || (!bytes && !materialization)) return;
       begin_materialization();
-      bytes_ += owner_->acquire(bytes, backing_quantum_, materialization,
-                                &pending);
+      bytes_ +=
+          owner_->acquire(bytes, backing_quantum_, materialization, &pending);
     }
 
     // Transfer admission to an owner allocated only AFTER that admission.
     // Both leases refer to the same allowance and hold no materialization lock.
     void absorb(Lease &other) noexcept {
       assert(owner_ == other.owner_);
-      assert(!materialization_.owns_lock() && !other.materialization_.owns_lock());
+      assert(!materialization_.owns_lock() &&
+             !other.materialization_.owns_lock());
       bytes_ += std::exchange(other.bytes_, 0);
     }
 
@@ -158,8 +171,8 @@ class ResultMemoryAllowance {
 
  private:
   friend class MemoryBudgetTestPeer;
-  size_t acquire(size_t bytes, size_t backing_quantum,
-                 size_t materialization, PendingCopy *pending) {
+  size_t acquire(size_t bytes, size_t backing_quantum, size_t materialization,
+                 PendingCopy *pending) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t capacity = pool.capacity();
@@ -188,15 +201,10 @@ class ResultMemoryAllowance {
     if (target > capacity / 4) throw std::bad_alloc();
     const size_t previous = reservation_.bytes();
     if (pending) {
-      // Lifetime backing and measured headroom can cover the same bytes.
-      // Grow the backing first without projecting a second materialization.
-      if (target > previous) {
-        if (materialization && !pool.materialization_allowed(materialization))
-          throw std::bad_alloc();
-        reservation_.add(target - previous);
-      }
-      if (!pending->reserve(pool, materialization)) {
-        reservation_.retain_at_most(previous);
+      // Reject before changing backing. Rolling an unmaterialized growth
+      // back as a resident release can retire another owner's RSS overlap.
+      if (!pending->reserve(pool, materialization, reservation_,
+                            target > previous ? target - previous : 0)) {
         throw std::bad_alloc();
       }
     } else if (target > previous) {

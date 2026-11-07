@@ -290,8 +290,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_reserve_materialization(size_t bytes) {
     return process_rss_.try_reserve_materialization(bytes);
   }
-  ProcessRssBudget::MaterializationStamp finish_materialization(
-      size_t bytes, bool mapped) {
+  ProcessRssBudget::MaterializationStamp finish_materialization(size_t bytes,
+                                                                bool mapped) {
     return process_rss_.finish_materialization(bytes, mapped);
   }
   void release_materialization(size_t bytes,
@@ -339,6 +339,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   // Also debit the full expected RSS increase when it differs from the
   // incremental capacity charge. Metadata allowances use the same policy.
   bool try_charge_workspace(size_t buffer_size, size_t materialization);
+  // Atomically admit overlapping lifetime backing and an in-flight copy.
+  // The caller must finish_materialization() after consuming this headroom.
+  bool try_charge_workspace_with_pending_copy(size_t bytes,
+                                              size_t materialization);
 
   //! Reserve non-evictable buffer-pool metadata capacity.
   bool try_charge_metadata(const size_t buffer_size);
@@ -395,12 +399,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void release_buffer(char *buffer, const size_t buffer_size);
 
   void release_external(const size_t buffer_size);
-  void release_unmapped_external(
-      size_t bytes, ProcessRssBudget::MaterializationStamp stamp);
+  void release_unmapped_external(size_t bytes,
+                                 ProcessRssBudget::MaterializationStamp stamp);
 
   void release_metadata(const size_t buffer_size);
-  void release_unmapped_metadata(
-      size_t bytes, ProcessRssBudget::MaterializationStamp stamp);
+  void release_unmapped_metadata(size_t bytes,
+                                 ProcessRssBudget::MaterializationStamp stamp);
 
   bool is_full();
 
@@ -554,7 +558,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   struct QueueAllocationHeader;
   struct QueueMappingHeader;
   struct QueueMemorySlab;
-  enum class Backing { kLive, kPending };
+  enum class Backing { kLive, kPending, kPendingCopy };
 
   MemoryLimitPool() = default;
   ~MemoryLimitPool();
@@ -566,9 +570,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_reserve_page_used(size_t bytes, bool required = false);
   bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive,
                              size_t materialization = 0);
-  size_t release_committed(
-      size_t bytes, Backing backing = Backing::kLive,
-      ProcessRssBudget::MappingProjection projection = {});
+  size_t release_committed(size_t bytes, Backing backing = Backing::kLive,
+                           ProcessRssBudget::MappingProjection projection = {});
   bool try_reserve_allocation(size_t bytes, Backing backing = Backing::kLive,
                               size_t materialization = 0);
   bool wait_for_available_impl(size_t bytes, std::chrono::milliseconds timeout,

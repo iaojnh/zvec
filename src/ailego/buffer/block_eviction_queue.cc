@@ -229,7 +229,8 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
                    queue_allocated_size_.load(std::memory_order_relaxed)) {
       return false;
     }
-    if (charged && !try_reserve_allocation(size, Backing::kPending)) return false;
+    if (charged && !try_reserve_allocation(size, Backing::kPending))
+      return false;
     if (charged) {
       metadata_used_size_.fetch_add(size, std::memory_order_relaxed);
       queue_charged_size_.fetch_add(size, std::memory_order_relaxed);
@@ -262,8 +263,8 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
       const size_t last_page = (slab->next_unused + total - 1) / page;
       if (last_page != previous_page &&
           !process_rss_.try_extend_mapping((last_page - previous_page) * page,
-                                            slab->mapping_bytes,
-                                            slab->projection))
+                                           slab->mapping_bytes,
+                                           slab->projection))
         return denied();
     }
     if (!slab) {
@@ -307,7 +308,8 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
     return header + 1;
   }
   static_assert(offsetof(QueueMappingHeader, allocation) +
-                    sizeof(QueueAllocationHeader) == sizeof(QueueMappingHeader));
+                    sizeof(QueueAllocationHeader) ==
+                sizeof(QueueMappingHeader));
   constexpr size_t prefix = offsetof(QueueMappingHeader, allocation);
   if (total > std::numeric_limits<size_t>::max() - prefix - (page - 1)) {
     return nullptr;
@@ -370,7 +372,8 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
     auto *mapping = reinterpret_cast<QueueMappingHeader *>(
         reinterpret_cast<char *>(header) -
         offsetof(QueueMappingHeader, allocation));
-    projection = ProcessRssBudget::MappingProjection::Full(bytes, mapping->stamp);
+    projection =
+        ProcessRssBudget::MappingProjection::Full(bytes, mapping->stamp);
     if (!unmap_queue_memory(mapping, bytes)) {
       LOG_ERROR("Failed to unmap queue allocation; backing remains charged");
       return;
@@ -494,8 +497,8 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     return nullptr;
   }
   const auto projection = process_rss_.finish_reservation(charge, true);
-  auto *block =
-      new (raw) RetainedBlock{nullptr, charge, metadata, projection, projection};
+  auto *block = new (raw)
+      RetainedBlock{nullptr, charge, metadata, projection, projection};
   retained_block_bytes_.fetch_add(charge, std::memory_order_relaxed);
   return reinterpret_cast<char *>(block) + kRetainedBlockHeaderBytes;
 }
@@ -833,7 +836,7 @@ size_t BlockEvictionQueue::cleanup_dead_entries(size_t max_attempts) {
     budgets[kProtectedPriority] = std::max<size_t>(1, max_attempts / 8);
     budgets[kExplicitHotPriority] = std::max<size_t>(1, max_attempts / 16);
     budgets[kProbationPriority] = max_attempts - budgets[kProtectedPriority] -
-                                 budgets[kExplicitHotPriority];
+                                  budgets[kExplicitHotPriority];
     first_queue = kProbationPriority;
   }
   // Spend unused shares in priority order. The snapshot remaining counts
@@ -955,10 +958,15 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
     if (committed_size_.compare_exchange_weak(committed, committed + bytes,
                                               std::memory_order_relaxed,
                                               std::memory_order_relaxed)) {
-      const bool admitted =
-          backing == Backing::kPending
-              ? process_rss_.try_reserve(bytes)
-              : process_rss_.try_acquire(bytes, materialization);
+      bool admitted;
+      if (backing == Backing::kPending) {
+        admitted = process_rss_.try_reserve(bytes);
+      } else if (backing == Backing::kPendingCopy) {
+        admitted =
+            process_rss_.try_acquire_with_pending_copy(bytes, materialization);
+      } else {
+        admitted = process_rss_.try_acquire(bytes, materialization);
+      }
       if (!admitted) {
         committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
         bg_cv_.notify_one();
@@ -971,7 +979,8 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
 }
 
 size_t MemoryLimitPool::release_committed(
-    size_t bytes, Backing backing, ProcessRssBudget::MappingProjection projection) {
+    size_t bytes, Backing backing,
+    ProcessRssBudget::MappingProjection projection) {
   const size_t previous =
       committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
   assert(previous >= bytes);
@@ -1220,14 +1229,15 @@ bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
 
 bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
                                                   size_t permanent_backing) {
-  const bool configured =
-      process_rss_.configure(bytes, &MemoryHelper::SelfRSS,
-                             NativeApplicationMemoryReader(), permanent_backing);
+  const bool configured = process_rss_.configure(
+      bytes, &MemoryHelper::SelfRSS, NativeApplicationMemoryReader(),
+      permanent_backing);
   bg_cv_.notify_one();
   return configured;
 }
 
-void MemoryLimitPool::set_memory_pressure(ProcessRssBudget::PressureLevel level) {
+void MemoryLimitPool::set_memory_pressure(
+    ProcessRssBudget::PressureLevel level) {
   process_rss_.set_external_pressure(level);
   bg_cv_.notify_one();
   capacity_cv_.notify_all();
@@ -1431,8 +1441,7 @@ void MemoryLimitPool::background_evict_loop() {
     const bool trimmed = trim_idle_buffers();
     idle_progress =
         retired != 0 ||
-        (trimmed &&
-         used_size_.load(std::memory_order_relaxed) == fixed_used());
+        (trimmed && used_size_.load(std::memory_order_relaxed) == fixed_used());
     const size_t low = low_watermark();
     if (used_size_.load() > low || page_admission_pressure()) {
       bg_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
@@ -1544,16 +1553,16 @@ bool MemoryLimitPool::wait_for_available_impl(size_t buffer_size,
   }
   capacity_waits_.fetch_add(1, std::memory_order_relaxed);
   std::unique_lock<std::mutex> lock(capacity_mutex_);
-  const bool available =
-      capacity_cv_.wait_for(lock, timeout, [this, buffer_size, page_admission,
-                                           required] {
+  const bool available = capacity_cv_.wait_for(
+      lock, timeout, [this, buffer_size, page_admission, required] {
         const size_t capacity = pool_size_.load(std::memory_order_relaxed);
         const size_t used = used_size_.load(std::memory_order_relaxed);
         if (capacity < used || buffer_size > capacity - used) {
           return false;
         }
         if (buffer_size > process_rss_.available()) return false;
-        if (page_admission && !required && process_rss_.pressure()) return false;
+        if (page_admission && !required && process_rss_.pressure())
+          return false;
         // A page can be denied below the total capacity: unconsumed external
         // cache headroom is not available to page admission. Use the same
         // page-limit predicate as eviction instead of turning backpressure
@@ -1598,10 +1607,17 @@ bool MemoryLimitPool::try_charge_workspace(const size_t buffer_size) {
 }
 
 bool MemoryLimitPool::try_charge_workspace(size_t buffer_size,
-                                        size_t materialization) {
+                                           size_t materialization) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   return try_charge_fixed_with_wait(buffer_size, &external_used_size_,
-                                   Backing::kLive, materialization);
+                                    Backing::kLive, materialization);
+}
+
+bool MemoryLimitPool::try_charge_workspace_with_pending_copy(
+    size_t bytes, size_t materialization) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  return try_charge_fixed_with_wait(bytes, &external_used_size_,
+                                    Backing::kPendingCopy, materialization);
 }
 
 bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
@@ -1609,10 +1625,10 @@ bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
 }
 
 bool MemoryLimitPool::try_charge_metadata(size_t buffer_size,
-                                        size_t materialization) {
+                                          size_t materialization) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   return try_charge_fixed_with_wait(buffer_size, &metadata_used_size_,
-                                   Backing::kLive, materialization);
+                                    Backing::kLive, materialization);
 }
 
 bool MemoryLimitPool::try_charge_metadata_without_reclaim(size_t bytes) {
@@ -1752,7 +1768,10 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
                                        Backing backing,
                                        size_t materialization) {
   if (buffer_size == 0) {
-    return !materialization || process_rss_.try_materialize(materialization);
+    return !materialization ||
+           (backing == Backing::kPendingCopy
+                ? process_rss_.try_reserve_materialization(materialization)
+                : process_rss_.try_materialize(materialization));
   }
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   if (capacity == 0 || buffer_size > capacity) {
