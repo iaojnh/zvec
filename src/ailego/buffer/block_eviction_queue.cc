@@ -824,12 +824,25 @@ size_t BlockEvictionQueue::cleanup_dead_entries(size_t max_attempts) {
 
   size_t attempts = 0;
   size_t cleaned = 0;
-  const size_t per_queue = std::max<size_t>(1, max_attempts / kQueueCount);
-  const size_t first_queue = cleanup_next_queue_;
+  std::array<size_t, kQueueCount> budgets{1, 1, 1};
+  size_t first_queue = cleanup_next_queue_;
   cleanup_next_queue_ = (cleanup_next_queue_ + 1) % kQueueCount;
-  for (size_t i = 0; i < kQueueCount && attempts < max_attempts; ++i) {
+  if (max_attempts >= kQueueCount) {
+    // Most retired pages accumulate in probation. Reserve smaller shares for
+    // protected/hot entries while giving probation the first and largest scan.
+    budgets[kProtectedPriority] = std::max<size_t>(1, max_attempts / 8);
+    budgets[kExplicitHotPriority] = std::max<size_t>(1, max_attempts / 16);
+    budgets[kProbationPriority] = max_attempts - budgets[kProtectedPriority] -
+                                 budgets[kExplicitHotPriority];
+    first_queue = kProbationPriority;
+  }
+  // Spend unused shares in priority order. The snapshot remaining counts
+  // prevent live requeued entries from being scanned twice in this pass.
+  for (size_t i = 0; i < 2 * kQueueCount && attempts < max_attempts; ++i) {
     const size_t priority = (first_queue + i) % kQueueCount;
-    size_t remaining = std::min(per_queue, cleanup_scan_remaining_[priority]);
+    const size_t budget =
+        i < kQueueCount ? budgets[priority] : max_attempts - attempts;
+    size_t remaining = std::min(budget, cleanup_scan_remaining_[priority]);
     while (remaining != 0 && attempts < max_attempts) {
       // Tokenless dequeue favors a few producer streams. Requeuing live
       // entries onto the cleaner's stream can then hide old producer streams
@@ -1406,15 +1419,20 @@ void MemoryLimitPool::background_evict_loop() {
     }
     // Flush/compaction can retire many owners without reaching a watermark.
     // Reuse queue blocks before stale memberships cause unbounded growth.
-    BlockEvictionQueue::get_instance().cleanup_dead_entries(256);
+    const size_t retired =
+        BlockEvictionQueue::get_instance().cleanup_dead_entries(256);
     // Page/entry retirement can leave committed backing resident even when
     // used is far below the eviction watermark. Return only idle backing.
     // After the final page owner closes, finish returning idle backing to the
     // existing reuse reserve without sleeping between every small batch. An
-    // active cache retains its paced maintenance. No progress (including an
-    // OS discard failure) restores the wait, avoiding an idle busy loop.
-    idle_progress = trim_idle_buffers() &&
-                    used_size_.load(std::memory_order_relaxed) == fixed_used();
+    // active cache retains its paced page maintenance. Keep removing retired
+    // memberships while cleanup makes progress, even below the watermarks.
+    // No progress (including an OS discard failure) restores the wait.
+    const bool trimmed = trim_idle_buffers();
+    idle_progress =
+        retired != 0 ||
+        (trimmed &&
+         used_size_.load(std::memory_order_relaxed) == fixed_used());
     const size_t low = low_watermark();
     if (used_size_.load() > low || page_admission_pressure()) {
       bg_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
