@@ -148,6 +148,54 @@ const rocksdb::Cache::CacheItemHelper kCountedDataHelper{
 const rocksdb::Cache::CacheItemHelper kWriteBufferChargeHelper{
     rocksdb::CacheEntryRole::kWriteBuffer, DeleteChargeTestValue};
 
+TEST(RocksdbBlockCacheTest, LastContextReleasesUnpinnedBlocks) {
+  auto cache = CreateChargeTestCache(4096);
+  auto first = RocksdbBlockCache::AcquireContext(cache);
+  auto second = RocksdbBlockCache::AcquireContext(cache);
+  int deleted = 0;
+  ASSERT_TRUE(
+      cache->Insert("closed-db", &deleted, &kCountedDataHelper, 64).ok());
+  first.reset();
+  EXPECT_EQ(0, deleted);
+  EXPECT_EQ(64u, cache->GetUsage());
+  second.reset();
+  EXPECT_EQ(1, deleted);
+  EXPECT_EQ(0u, cache->GetUsage());
+}
+
+TEST(RocksdbBlockCacheTest, PinnedBlockSurvivesCloseAndFreesOnFinalRelease) {
+  auto cache = CreateChargeTestCache(4096);
+  auto context = RocksdbBlockCache::AcquireContext(cache);
+  int deleted = 0;
+  rocksdb::Cache::Handle *handle = nullptr;
+  ASSERT_TRUE(
+      cache->Insert("held", &deleted, &kCountedDataHelper, 64, &handle).ok());
+  ASSERT_TRUE(cache->Ref(handle));
+  context.reset();
+  EXPECT_EQ(0, deleted);
+  EXPECT_EQ(&deleted, cache->Value(handle));
+  EXPECT_EQ(64u, cache->GetUsage());
+  EXPECT_FALSE(cache->Release(handle));
+  EXPECT_EQ(0, deleted);
+  EXPECT_TRUE(cache->Release(handle));
+  EXPECT_EQ(1, deleted);
+  EXPECT_EQ(0u, cache->GetUsage());
+}
+
+TEST(RocksdbBlockCacheTest, RepeatedContextsDoNotAccumulateClosedDbBlocks) {
+  auto cache = CreateChargeTestCache(4096);
+  int deleted = 0;
+  for (int cycle = 0; cycle < 100; ++cycle) {
+    auto context = RocksdbBlockCache::AcquireContext(cache);
+    ASSERT_TRUE(
+        cache->Insert(std::to_string(cycle), &deleted, &kCountedDataHelper, 64)
+            .ok());
+    context.reset();
+    EXPECT_EQ(cycle + 1, deleted);
+    EXPECT_EQ(0u, cache->GetUsage());
+  }
+}
+
 TEST(RocksdbBlockCacheTest, PressureUsesChargedTransientHandles) {
   auto &pool = ailego::MemoryLimitPool::get_instance();
   const size_t previous = pool.process_rss_limit();

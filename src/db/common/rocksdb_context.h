@@ -37,6 +37,9 @@ struct RocksdbContext {
   // Declare first: DB handles and options must die before releasing active
   // ownership. The process-wide backing high water is retained for reuse.
   std::unique_ptr<detail::RetainedMetadataBudget::Lease> metadata_memory_;
+  // DB handles and options are destroyed before the final cache activity
+  // lease releases unpinned blocks from completed collection lifecycles.
+  std::shared_ptr<void> cache_activity_;
 
  public:
   struct Args {
@@ -164,8 +167,8 @@ struct RocksdbContext {
   Status validate_and_set_db_path(const std::string &db_path,
                                   bool should_exist);
 
-  void prepare_options(std::shared_ptr<rocksdb::MergeOperator> merge_op,
-                       bool writable);
+  std::shared_ptr<void> prepare_options(
+      std::shared_ptr<rocksdb::MergeOperator> merge_op, bool writable);
 
   Status flush_unlocked();
   rocksdb::Status finish_write(rocksdb::Status status);
