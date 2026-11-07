@@ -144,32 +144,49 @@ TEST_F(PoolAdmissionTest, WaitIncludesHeaderWhenEverySlabSlotIsOccupied) {
 }
 
 TEST_F(PoolAdmissionTest, FixedConsumersRejectPendingPageReservations) {
-  using Charge = bool (MemoryLimitPool::*)(size_t);
-  using Release = void (MemoryLimitPool::*)(size_t);
+  // Plain function wrappers also work under ARM64 UBSan's indirect-call
+  // instrumentation; the test still exercises each real reservation API.
+  using Charge = bool (*)(MemoryLimitPool &, size_t);
+  using Release = void (*)(MemoryLimitPool &, size_t);
   struct Consumer {
     Charge charge;
     Release release;
   };
-  const std::array<Consumer, 4> consumers{
-      {{&MemoryLimitPool::try_charge_external,
-        &MemoryLimitPool::release_external},
-       {&MemoryLimitPool::try_charge_workspace,
-        &MemoryLimitPool::release_external},
-       {&MemoryLimitPool::try_charge_metadata,
-        &MemoryLimitPool::release_metadata},
-       {&MemoryLimitPool::try_charge_metadata_without_reclaim,
-        &MemoryLimitPool::release_metadata}}};
+  const auto release_external = +[](MemoryLimitPool &pool, size_t bytes) {
+    pool.release_external(bytes);
+  };
+  const auto release_metadata = +[](MemoryLimitPool &pool, size_t bytes) {
+    pool.release_metadata(bytes);
+  };
+  const std::array<Consumer, 4> consumers{{
+      {+[](MemoryLimitPool &pool, size_t bytes) {
+         return pool.try_charge_external(bytes);
+       },
+       release_external},
+      {+[](MemoryLimitPool &pool, size_t bytes) {
+         return pool.try_charge_workspace(bytes);
+       },
+       release_external},
+      {+[](MemoryLimitPool &pool, size_t bytes) {
+         return pool.try_charge_metadata(bytes);
+       },
+       release_metadata},
+      {+[](MemoryLimitPool &pool, size_t bytes) {
+         return pool.try_charge_metadata_without_reclaim(bytes);
+       },
+       release_metadata},
+  }};
   for (const auto &consumer : consumers) {
     {
       PendingReservation pending(pool_, pool_.available());
       ASSERT_TRUE(pending.acquired());
-      const bool charged = (pool_.*consumer.charge)(page_);
+      const bool charged = consumer.charge(pool_, page_);
       EXPECT_FALSE(charged) << "Pending logical page budget was reused";
       expect_bounded();
-      if (charged) (pool_.*consumer.release)(page_);
+      if (charged) consumer.release(pool_, page_);
     }
-    ASSERT_TRUE((pool_.*consumer.charge)(page_));
-    (pool_.*consumer.release)(page_);
+    ASSERT_TRUE(consumer.charge(pool_, page_));
+    consumer.release(pool_, page_);
     EXPECT_EQ(baseline_, pool_.used());
     EXPECT_EQ(baseline_, pool_.committed());
   }
