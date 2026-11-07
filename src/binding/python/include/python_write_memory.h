@@ -29,7 +29,9 @@ class PythonWriteMemory {
       throw pybind11::value_error(
           "Too many docs: exceeds max write batch size of " +
           std::to_string(kMaxWriteBatchSize));
-    admit(sizeof(Doc) + 256);
+    ResultMemoryAllowance::PendingCopy pending;
+    reserve(sizeof(Doc) + 256, pending);
+    pending.start();
     auto doc = std::make_shared<Doc>();
     if (memory_->enabled()) DocumentMemoryAccess::retain(*doc, memory_);
     ++created_;
@@ -37,14 +39,18 @@ class PythonWriteMemory {
   }
 
   void set_pk(Doc &doc, pybind11::handle value) {
-    reserve_value([&] { return PythonFetchInputs::string_bytes(value); });
+    ResultMemoryAllowance::PendingCopy pending;
+    reserve_value(pending, [&] { return PythonFetchInputs::string_bytes(value); });
+    pending.start();
     doc.set_pk(PythonFetchInputs::copy_string(value));
   }
 
   pybind11::bytes field_name(pybind11::handle value) {
     // Schema lookup itself crosses a string caster before set_any is reached.
     // Admit that copy too, and avoid a UTF-8 cache on the caller's Unicode key.
-    reserve_value([&] { return PythonFetchInputs::string_bytes(value); });
+    ResultMemoryAllowance::PendingCopy pending;
+    reserve_value(pending, [&] { return PythonFetchInputs::string_bytes(value); });
+    pending.start();
     return pybind11::bytes(PythonFetchInputs::copy_string(value));
   }
 
@@ -78,16 +84,19 @@ class PythonWriteMemory {
       for (auto item :
            pybind11::reinterpret_borrow<pybind11::iterable>(value)) {
         auto held = pybind11::reinterpret_borrow<pybind11::object>(item);
-        reserve_value([&] {
+        ResultMemoryAllowance::PendingCopy pending;
+        reserve_value(pending, [&] {
           return strings ? BindingMemoryBytes(
                                1, PythonFetchInputs::string_bytes(held), 128)
                          : size_t{128};
         });
+        pending.start();
         staged.append(held);
       }
       value = std::move(staged);
     }
-    reserve_value([&] {
+    ResultMemoryAllowance::PendingCopy pending;
+    reserve_value(pending, [&] {
       size_t bytes = BindingMemoryBytes(1, field.size(), 256);
       if (value.is_none()) return bytes;
       if (type == DataType::STRING)
@@ -118,6 +127,7 @@ class PythonWriteMemory {
       }
       return bytes;
     });
+    pending.start();
     // Avoid pybind's persistent UTF-8 cache on caller-owned Unicode objects:
     // such a cache could outlive the staging lease after every write.
     if (type == DataType::STRING && !value.is_none())
@@ -137,13 +147,18 @@ class PythonWriteMemory {
     pybind11::gil_scoped_release release;
     memory_->add(bytes);
   }
+  void reserve(size_t bytes, ResultMemoryAllowance::PendingCopy &pending) {
+    pybind11::gil_scoped_release release;
+    memory_->add_pending(bytes, pending);
+  }
   template <typename Estimate>
-  void reserve_value(Estimate estimate) {
+  void reserve_value(ResultMemoryAllowance::PendingCopy &pending,
+                     Estimate estimate) {
     size_t admitted = 0;
     while (true) {
       const size_t needed = estimate();
       if (needed <= admitted) return;
-      admit(needed - admitted);
+      reserve(needed - admitted, pending);
       admitted = needed;
     }
   }
@@ -164,6 +179,7 @@ class PythonWriteInputs {
             "Too many docs: exceeds max write batch size of " +
             std::to_string(kMaxWriteBatchSize));
       const auto &doc = pybind11::cast<const Doc &>(held);
+      ResultMemoryAllowance::PendingCopy pending;
       size_t admitted = 0;
       while (true) {
         const auto needed = BindingMemoryBytes(
@@ -171,10 +187,11 @@ class PythonWriteInputs {
         if (needed <= admitted) break;
         {
           pybind11::gil_scoped_release release;
-          memory_.add(needed - admitted);
+          memory_.add_pending(needed - admitted, pending);
         }
         admitted = needed;
       }
+      pending.start();
       docs.push_back(doc);
     }
   }
