@@ -548,7 +548,9 @@ TEST_F(BufferReadStorageTest, MemoryBlockPinsUntilReset) {
   const bool copied_ok = segment->read(&copied, 1);
   // The batch-copy scratch must also be admitted while the page stays pinned.
   EXPECT_FALSE(copied_ok);
-  if (copied_ok) EXPECT_EQ(0, std::memcmp(payload_.data(), copied.data, 64));
+  if (copied_ok) {
+    EXPECT_EQ(0, std::memcmp(payload_.data(), copied.data, 64));
+  }
   EXPECT_EQ(0, std::memcmp(payload_.data(), data.data(), 64));
   data.reset();
   bool charged_after_pin_release = false;
