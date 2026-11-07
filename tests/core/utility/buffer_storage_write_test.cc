@@ -2382,10 +2382,13 @@ TEST_F(BufferStorageWriteTest, BatchBorrowedReadAcrossSegments) {
 
 TEST_F(BufferStorageWriteTest, CR_ReadOnlyMetadataPressureFallsBackToBypass) {
   const std::string expected = "bypass";
+  // A compact read-only page table must still exceed the metadata allowance.
+  // The sparse segment's extent supplies pressure without resident data pages.
+  const size_t segment_bytes = 16384 * ailego::kVectorPageSize;
   {
     auto storage = open_writable();
     ASSERT_TRUE(storage);
-    ASSERT_EQ(0, storage->append("seg1", 4096));
+    ASSERT_EQ(0, storage->append("seg1", segment_bytes));
     auto seg = storage->get("seg1");
     ASSERT_TRUE(seg);
     ASSERT_EQ(expected.size(), seg->write(0, expected.data(), expected.size()));
@@ -2400,7 +2403,8 @@ TEST_F(BufferStorageWriteTest, CR_ReadOnlyMetadataPressureFallsBackToBypass) {
   const size_t metadata_budget =
       std::max<size_t>(2 * ailego::kVectorPageSize, 256UL << 10);
   ASSERT_LT(metadata_budget,
-            ailego::VecBufferPool::metadata_bytes_for_page_count(1, false));
+            ailego::VecBufferPool::metadata_bytes_for_page_count(
+                segment_bytes / ailego::kVectorPageSize, false));
   ASSERT_EQ(0, pool.init(metadata_budget));
   {
     auto storage = open_read_only();

@@ -178,7 +178,8 @@ version_t VectorPageTable::next_owner_version() {
   return BlockEvictionQueue::get_instance().next_version();
 }
 
-size_t VectorPageTable::metadata_bytes_for_entries(size_t entry_num) {
+size_t VectorPageTable::metadata_bytes_for_entries(size_t entry_num,
+                                                   bool extensible) {
   if (entry_num > kMaxEntries) {
     return std::numeric_limits<size_t>::max();
   }
@@ -187,24 +188,37 @@ size_t VectorPageTable::metadata_bytes_for_entries(size_t entry_num) {
   if (segment_count == 0) {
     return 0;
   }
+  const size_t directory_count = extensible ? kMaxSegments : segment_count;
   const size_t directories =
-      MemoryLimitPool::retained_block_size(kMaxSegments * sizeof(Entry *)) +
-      MemoryLimitPool::retained_block_size(kMaxSegments *
+      MemoryLimitPool::retained_block_size(directory_count * sizeof(Entry *)) +
+      MemoryLimitPool::retained_block_size(directory_count *
                                            sizeof(MetadataEntry *));
   const size_t segment_bytes =
       MemoryLimitPool::retained_block_size(kSegmentSize * sizeof(Entry)) +
       MemoryLimitPool::retained_block_size(kSegmentSize *
                                            sizeof(MetadataEntry));
-  if (segment_count >
+  const size_t full_segments = extensible ? segment_count : segment_count - 1;
+  if (full_segments >
       (std::numeric_limits<size_t>::max() - directories) / segment_bytes) {
     return std::numeric_limits<size_t>::max();
   }
-  return directories + segment_count * segment_bytes;
+  size_t bytes = directories + full_segments * segment_bytes;
+  if (!extensible) {
+    const size_t tail = (entry_num - 1) % kSegmentSize + 1;
+    const size_t tail_bytes =
+        MemoryLimitPool::retained_block_size(tail * sizeof(Entry)) +
+        MemoryLimitPool::retained_block_size(tail * sizeof(MetadataEntry));
+    if (tail_bytes > std::numeric_limits<size_t>::max() - bytes)
+      return std::numeric_limits<size_t>::max();
+    bytes += tail_bytes;
+  }
+  return bytes;
 }
 
 void VectorPageTable::initialize_segment(Entry *entries,
-                                         MetadataEntry *metadata_entries) {
-  for (size_t i = 0; i < kSegmentSize; ++i) {
+                                         MetadataEntry *metadata_entries,
+                                         size_t count) {
+  for (size_t i = 0; i < count; ++i) {
     entries[i].buffer.store(nullptr, std::memory_order_relaxed);
     entries[i].ref_count.store(kUnloadedRefCount, std::memory_order_relaxed);
     entries[i].in_evict_queue.store(false, std::memory_order_relaxed);
@@ -265,7 +279,7 @@ bool VectorPageTable::should_admit_miss(block_id_t block_id, uint32_t epoch) {
   }
 }
 
-bool VectorPageTable::init(size_t entry_num) {
+bool VectorPageTable::init(size_t entry_num, bool extensible) {
   if (entry_num > kMaxEntries) {
     LOG_ERROR(
         "VectorPageTable::init: entry_num=%zu exceeds capacity "
@@ -288,7 +302,7 @@ bool VectorPageTable::init(size_t entry_num) {
   }
   const size_t need_segments =
       entry_num == 0 ? 0 : (entry_num - 1) / kSegmentSize + 1;
-  const size_t charge = metadata_bytes_for_entries(entry_num);
+  const size_t charge = metadata_bytes_for_entries(entry_num, extensible);
   if (charge == std::numeric_limits<size_t>::max()) {
     LOG_ERROR("VectorPageTable::init: metadata size overflow for %zu entries",
               entry_num);
@@ -300,17 +314,23 @@ bool VectorPageTable::init(size_t entry_num) {
   RetainedMetadataArray<MetadataEntry *> new_metadata_segment_directory;
   try {
     if (need_segments != 0) {
-      new_segment_directory = MakeRetainedMetadataArray<Entry *>(kMaxSegments);
+      const size_t directory_count = extensible ? kMaxSegments : need_segments;
+      new_segment_directory =
+          MakeRetainedMetadataArray<Entry *>(directory_count);
       new_metadata_segment_directory =
-          MakeRetainedMetadataArray<MetadataEntry *>(kMaxSegments);
+          MakeRetainedMetadataArray<MetadataEntry *>(directory_count);
     }
     new_segments.reserve(need_segments);
     new_metadata_segments.reserve(need_segments);
     for (size_t s = 0; s < need_segments; ++s) {
-      auto entries = MakeRetainedMetadataArray<Entry>(kSegmentSize);
-      auto metadata_entries =
-          MakeRetainedMetadataArray<MetadataEntry>(kSegmentSize);
-      initialize_segment(entries.get(), metadata_entries.get());
+      // Read-only storage has a fixed extent: neither a full last segment nor
+      // a directory for future growth needs to stay resident for every file.
+      const size_t count =
+          extensible ? kSegmentSize
+                     : std::min(kSegmentSize, entry_num - s * kSegmentSize);
+      auto entries = MakeRetainedMetadataArray<Entry>(count);
+      auto metadata_entries = MakeRetainedMetadataArray<MetadataEntry>(count);
+      initialize_segment(entries.get(), metadata_entries.get(), count);
       new_segments.push_back(std::move(entries));
       new_metadata_segments.push_back(std::move(metadata_entries));
     }
@@ -328,6 +348,7 @@ bool VectorPageTable::init(size_t entry_num) {
   segments_ = std::move(new_segment_directory);
   metadata_segments_ = std::move(new_metadata_segment_directory);
   // Publish segments before the externally visible entry count.
+  extensible_ = extensible;
   segment_count_.store(need_segments, std::memory_order_release);
   entry_num_.store(entry_num, std::memory_order_release);
   return true;
@@ -338,6 +359,7 @@ bool VectorPageTable::extend(size_t new_entry_num) {
   if (new_entry_num <= entry_num_.load(std::memory_order_relaxed)) {
     return true;
   }
+  if (!extensible_) return false;
   if (new_entry_num > kMaxEntries) {
     LOG_ERROR(
         "VectorPageTable::extend: new_entry_num=%zu exceeds capacity "
@@ -415,6 +437,7 @@ bool VectorPageTable::rollback_extend(size_t old_entry_num) {
   if (old_entry_num == current_entry_num) {
     return true;
   }
+  if (!extensible_) return false;
   for (size_t i = old_entry_num; i < current_entry_num; ++i) {
     if (entry_at(i).buffer.load(std::memory_order_relaxed) != nullptr ||
         entry_at(i).ref_count.load(std::memory_order_relaxed) !=
@@ -1059,7 +1082,7 @@ VecBufferPool::VecBufferPool(const std::string &filename, bool writable) {
 size_t VecBufferPool::metadata_bytes_for_page_count(size_t page_count,
                                                     bool writable) {
   const size_t page_table_bytes =
-      VectorPageTable::metadata_bytes_for_entries(page_count);
+      VectorPageTable::metadata_bytes_for_entries(page_count, writable);
   if (page_table_bytes == std::numeric_limits<size_t>::max()) {
     return page_table_bytes;
   }
@@ -1183,7 +1206,7 @@ int VecBufferPool::init() {
     }
     staging_projection = pending.commit_mapping(staging_charge);
   }
-  if (!page_table_.init(block_num)) {
+  if (!page_table_.init(block_num, writable_)) {
     mutexes.reset();
     ReleaseWritableMapping(writeback_staging, staging_charge, staging_projection,
                            "writeback staging");

@@ -107,9 +107,7 @@ def run(index, path, evidence, rows, dimension, budget_mib, build_workers):
             docs = []
             for row, vector in enumerate(vectors, start):
                 key = str(row)
-                # A unique central probe makes the build/persistence check
-                # independent of approximate-search recall on random vectors.
-                values = [0.0] * dimension if row == PROBE_IDS[0] else vector.tolist()
+                values = vector.tolist()
                 if row in PROBE_IDS:
                     probes[key] = values
                 docs.append(

@@ -120,7 +120,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   VectorPageTable &operator=(VectorPageTable &&) = delete;
 
   //! Initialize up to kMaxEntries entries without partial publication.
-  bool init(size_t entry_num);
+  //! Fixed tables allocate only their current extent and reject growth.
+  bool init(size_t entry_num, bool extensible = true);
 
   //! Extend without moving existing entries or partial publication.
   bool extend(size_t new_entry_num);
@@ -293,7 +294,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   }
 
   size_t metadata_bytes() const {
-    return metadata_bytes_for_entries(entry_num());
+    return metadata_bytes_for_entries(entry_num(), extensible_);
   }
 
   //! Cache observability counters (monotonic, relaxed atomics).
@@ -393,12 +394,14 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   static constexpr size_t kMaxEntries = kMaxSegments * kSegmentSize;
 
   //! Charged backing bytes (including mapping headers/alignment).
-  static size_t metadata_bytes_for_entries(size_t entry_num);
+  static size_t metadata_bytes_for_entries(size_t entry_num,
+                                           bool extensible = true);
 
  private:
   // Release/acquire publication makes initialized segment slots visible.
   std::atomic<size_t> entry_num_{0};
   std::atomic<size_t> segment_count_{0};
+  bool extensible_{true};
   RetainedMetadataArray<Entry *> segments_{};
   RetainedMetadataArray<MetadataEntry *> metadata_segments_{};
   static constexpr size_t kInvalidLoadedBlock =
@@ -433,7 +436,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
 
   // `force` bypasses CLOCK second chance.
   static void initialize_segment(Entry *entries,
-                                 MetadataEntry *metadata_entries);
+                                 MetadataEntry *metadata_entries,
+                                 size_t count = kSegmentSize);
   bool do_evict_block(block_id_t block_id, bool force);
   static version_t next_owner_version();
 

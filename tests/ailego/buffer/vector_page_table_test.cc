@@ -1294,7 +1294,7 @@ TEST_F(BufferPoolTest, MetadataIsCountedAndReleasedWithPool) {
 TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
   constexpr size_t kOneSegmentPages = 16UL * 1024UL;
   const size_t page_table_bytes =
-      VectorPageTable::metadata_bytes_for_entries(kOneSegmentPages);
+      VectorPageTable::metadata_bytes_for_entries(kOneSegmentPages, false);
   const size_t read_only_bytes =
       VecBufferPool::metadata_bytes_for_page_count(kOneSegmentPages);
   const size_t writable_bytes = VecBufferPool::metadata_bytes_for_page_count(
@@ -1306,16 +1306,63 @@ TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
       BudgetedMappedBuffer::mapping_size(VecBufferPool::kMutexBucketCount *
                                          sizeof(std::shared_mutex)) +
       VecBufferPool::kWritebackBatchPages * kVectorPageSize;
-  EXPECT_EQ(expected_writable_bytes, writable_bytes - read_only_bytes);
+  EXPECT_EQ(expected_writable_bytes +
+                VectorPageTable::metadata_bytes_for_entries(kOneSegmentPages),
+            writable_bytes);
 
   init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/1);
   std::string file = new_file(/*num_pages=*/1);
   VecBufferPool pool(file, /*writable=*/false);
   ASSERT_EQ(pool.init(), 0);
   const auto stats = pool.stats();
-  EXPECT_EQ(VectorPageTable::metadata_bytes_for_entries(1),
+  EXPECT_EQ(VectorPageTable::metadata_bytes_for_entries(1, false),
             stats.page_table_metadata_bytes);
   EXPECT_EQ(0u, stats.page_lock_metadata_bytes);
+}
+
+TEST_F(BufferPoolTest, ReadOnlyPageTablesFitManySmallFiles) {
+  constexpr size_t count = 100;
+  const size_t per_store =
+      VecBufferPool::metadata_bytes_for_page_count(8, false);
+  // A small immutable file must not reserve the growing table's 128M-entry
+  // directory and a whole 16K-entry segment for just eight pages.
+  ASSERT_LE(per_store, 16 * PoolPayloadBudget::page_buffer_size());
+  EXPECT_EQ(size_t{128} * 1024 * 1024, VectorPageTable::kMaxEntries);
+  auto &budget = PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, budget.init(count * per_store + 128 * kVectorPageSize));
+  std::vector<std::unique_ptr<VecBufferPool>> pools;
+  for (size_t i = 0; i < count; ++i) {
+    auto pool = std::make_unique<VecBufferPool>(new_file(8), false);
+    ASSERT_EQ(0, pool->init());
+    EXPECT_EQ(per_store, pool->stats().page_table_metadata_bytes);
+    pools.push_back(std::move(pool));
+  }
+  for (const auto &pool : pools) {
+    std::array<char, 32> output{};
+    auto handle = pool->get_handle();
+    ASSERT_TRUE(
+        handle.read_range(7 * kVectorPageSize, output.size(), output.data()));
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(),
+                            [](char value) { return value == 7; }));
+  }
+  EXPECT_LE(budget.used(), budget.capacity());
+}
+
+TEST_F(BufferPoolTest, ReadOnlyPartialLastSegmentPreservesFinalPage) {
+  for (size_t pages : {size_t{1}, size_t{1024}, size_t{16385}}) {
+    SCOPED_TRACE(pages);
+    init_vec_pool(32, pages, false);
+    VecBufferPool pool(new_file(pages), false);
+    ASSERT_EQ(0, pool.init());
+    EXPECT_EQ(VecBufferPool::metadata_bytes_for_page_count(pages, false),
+              pool.stats().page_table_metadata_bytes);
+    std::array<char, 32> output{};
+    auto handle = pool.get_handle();
+    ASSERT_TRUE(handle.read_range((pages - 1) * kVectorPageSize, output.size(),
+                                  output.data()));
+    const char expected = static_cast<char>((pages - 1) & 0xff);
+    for (char value : output) EXPECT_EQ(expected, value);
+  }
 }
 
 TEST_F(BufferPoolTest, EmptyPageTableChargesDirectoryOnFirstExtend) {
