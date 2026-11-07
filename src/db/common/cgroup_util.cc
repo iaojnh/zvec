@@ -22,6 +22,13 @@
 #include <system_error>
 #include "db/common/cgroup_memory.h"
 
+#if defined(PLATFORM_WINDOWS)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace zvec {
 
 // Static member definitions

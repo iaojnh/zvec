@@ -51,24 +51,16 @@ void reserve_query_results(const DocPtrList &docs,
 
 using detail::result_memory_owner;
 
+void retain_result_memory(const py::object &result, py::handle owner) {
+  py::module_::import("zvec.model._budgeted_result")
+      .attr("_retain_result_memory")(result, owner);
+}
+
 void retain_result_memory(
     const py::object &result,
-    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory,
-    py::handle existing_owner = {}) {
-  if (!memory->enabled()) return;
-  py::object owner = existing_owner
-                         ? py::reinterpret_borrow<py::object>(existing_owner)
-                         : result_memory_owner(memory);
-  try {
-    py::module_::import("zvec.model._budgeted_result")
-        .attr("_retain_result_memory")(result, owner);
-  } catch (...) {
-    // A Python traceback can retain partially wrapped payloads and owner.
-    // Unlock on this producing thread even when conversion throws.
-    memory->end_materialization();
-    throw;
-  }
-  memory->end_materialization();
+    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &memory) {
+  if (memory->enabled())
+    retain_result_memory(result, result_memory_owner(memory));
 }
 
 class PythonFetchResultKeys {
@@ -466,7 +458,7 @@ void reserve_forward_results(const internal::ForwardFetchResult &forward,
     size_t largest_key = 0;
     for (const auto &table : forward.tables) {
       // Doc/tuple/outer-dict entries, then field-dict slots. Include the
-      // wrapper objects created after FetchTuples returns, not only payloads.
+      // ownership wrappers as well as the underlying payloads.
       estimate.add(512, static_cast<size_t>(table->num_rows()));
       for (int c = 1; c < table->num_columns(); ++c) {
         if (c >= 2) {
@@ -619,6 +611,7 @@ py::dict fetch_docs_for_python(const Collection &collection, py::handle ids,
   if (!budgeted || snapshot.docs.empty()) {
     return py::cast<py::dict>(py::cast(std::move(snapshot.docs)));
   }
+  PendingResultCopy pending;
   {
     py::gil_scoped_release release;
     PythonResultEstimate estimate;
@@ -632,9 +625,10 @@ py::dict fetch_docs_for_python(const Collection &collection, py::handle ids,
     // Wrapping one key can briefly retain the plain Python string too.
     estimate.add(128);
     estimate.add(4, largest_key);
-    allowance->add(estimate.bytes());
+    allowance->add_pending(estimate.bytes(), pending);
   }
 
+  pending.start();
   auto out = py::reinterpret_borrow<py::dict>(
       py::module_::import("zvec.model._budgeted_result")
           .attr("_ResultDict")(py::dict(), keys.owner()));
@@ -653,49 +647,59 @@ void fetch_chunk_for_python(
     detail::ResultMemoryAllowance::Lease &batch_memory) {
   auto snapshot = fetch_snapshot_for_python(collection, pks, output_fields,
                                             include_vector, &schema);
-  if (snapshot.forward) {
-    if (snapshot.forward->batch_exceeded) {
-      snapshot.forward.reset();
-      if (pks.size() <= 1) throw std::runtime_error("Fetch allocation failed");
-      const auto middle = pks.begin() + pks.size() / 2;
-      const auto fetch_half = [&](auto begin, auto end) {
-        {
-          py::gil_scoped_release release;
-          size_t backing =
-              detail::FetchMemoryBytes(end - begin, sizeof(std::string));
-          for (auto it = begin; it != end; ++it) {
-            backing = detail::FetchMemoryBytes(
-                1, detail::FetchStringBackingBytes(it->size()), backing);
-          }
-          // The original batch already holds the logical allowance for splits.
-          batch_memory.add(0, backing);
+  if (snapshot.forward && snapshot.forward->batch_exceeded) {
+    snapshot.forward.reset();
+    if (pks.size() <= 1) throw std::runtime_error("Fetch allocation failed");
+    const auto middle = pks.begin() + pks.size() / 2;
+    const auto fetch_half = [&](auto begin, auto end) {
+      PendingResultCopy pending;
+      {
+        py::gil_scoped_release release;
+        size_t backing =
+            detail::FetchMemoryBytes(end - begin, sizeof(std::string));
+        for (auto it = begin; it != end; ++it) {
+          backing = detail::FetchMemoryBytes(
+              1, detail::FetchStringBackingBytes(it->size()), backing);
         }
-        fetch_chunk_for_python(collection, {begin, end}, output_fields,
-                               include_vector, schema, out, keys, allowance,
-                               batch_memory);
-      };
-      fetch_half(pks.begin(), middle);
-      fetch_half(middle, pks.end());
-      return;
-    }
-    PendingResultCopy pending;
-    reserve_forward_results(*snapshot.forward, allowance, pending);
-    pending.start();
-    forward_to_tuples(*snapshot.forward, out, keys);
+        // The original batch already holds the logical allowance for splits.
+        batch_memory.add_pending(0, backing, pending);
+      }
+      pending.start();
+      std::vector<std::string> half(begin, end);
+      pending.finish();
+      fetch_chunk_for_python(collection, half, output_fields, include_vector,
+                             schema, out, keys, allowance, batch_memory);
+    };
+    fetch_half(pks.begin(), middle);
+    fetch_half(middle, pks.end());
     return;
   }
   PendingResultCopy pending;
-  reserve_fetch_results(snapshot.docs, schema, allowance, pending);
-  pending.start();
-  const auto forward_fields = schema.forward_fields();
-  const auto vector_fields = schema.vector_fields();
-  while (!snapshot.docs.empty()) {
-    auto it = snapshot.docs.begin();
-    if (it->second) {
-      out[keys.wrap(py::str(it->first))] = ZVecPyDoc::doc_to_tuple_with_fields(
-          *it->second, forward_fields, vector_fields);
+  const auto owner = keys.owner();
+  py::dict chunk = owner ? py::dict() : out;
+  if (snapshot.forward) {
+    reserve_forward_results(*snapshot.forward, allowance, pending);
+    pending.start();
+    forward_to_tuples(*snapshot.forward, chunk, keys);
+  } else {
+    reserve_fetch_results(snapshot.docs, schema, allowance, pending);
+    pending.start();
+    const auto forward_fields = schema.forward_fields();
+    const auto vector_fields = schema.vector_fields();
+    while (!snapshot.docs.empty()) {
+      auto it = snapshot.docs.begin();
+      if (it->second) {
+        chunk[keys.wrap(py::str(it->first))] =
+            ZVecPyDoc::doc_to_tuple_with_fields(*it->second, forward_fields,
+                                               vector_fields);
+      }
+      snapshot.docs.erase(it);
     }
-    snapshot.docs.erase(it);
+  }
+  if (owner && !chunk.empty()) {
+    retain_result_memory(chunk, owner);
+    if (PyDict_Update(out.ptr(), chunk.ptr()) != 0)
+      throw py::error_already_set();
   }
 }
 
@@ -948,9 +952,13 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
       // Python or database lock, and keep the full input alive for the views.
       py::gil_scoped_release release;
       const size_t rows = std::min(batch_rows, pks.size() - begin);
-      batch_memory.add(detail::FetchMemoryBytes(rows, 3 * sizeof(std::string)),
-                       detail::FetchMemoryBytes(rows, sizeof(std::string)));
+      PendingResultCopy pending;
+      batch_memory.add_pending(
+          detail::FetchMemoryBytes(rows, 3 * sizeof(std::string)),
+          detail::FetchMemoryBytes(rows, sizeof(std::string)), pending);
+      pending.start();
       batch.reserve(rows);
+      pending.finish();
       constexpr size_t kBatchBytes = 1024 * 1024;
       size_t bytes = 0;
       while (begin < pks.size() && batch.size() < batch_rows) {
@@ -966,9 +974,12 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
           seen.emplace(std::string_view(pk));
           // Adaptive Arrow splitting keeps the original batch and recursively
           // copies halves. Their total overlap is less than three batches.
-          batch_memory.add(detail::FetchMemoryBytes(pk.size(), 3, 192),
-                           detail::FetchStringBackingBytes(pk.size()));
+          batch_memory.add_pending(detail::FetchMemoryBytes(pk.size(), 3, 192),
+                                   detail::FetchStringBackingBytes(pk.size()),
+                                   pending);
+          pending.start();
           batch.push_back(pk);
+          pending.finish();
           bytes = detail::FetchMemoryBytes(1, pk.size(), bytes);
         }
       }
@@ -976,7 +987,6 @@ py::dict fetch_for_python(const Collection &collection, py::handle ids,
     fetch_chunk_for_python(collection, batch, output_fields, include_vector,
                            *schema, out, keys, *allowance, batch_memory);
   } while (begin < pks.size());
-  retain_result_memory(out, allowance, keys.owner());
   return out;
 } catch (const std::bad_alloc &) {
   PyErr_SetString(
@@ -992,7 +1002,9 @@ void ZVecPyCollection::Initialize(pybind11::module_ &m) {
       .def_property_readonly("queries", &detail::PythonQueryMemory::queries)
       .def_property_readonly("output_fields",
                              &detail::PythonQueryMemory::output_fields)
-      .def("prepare_vector", &detail::PythonQueryMemory::prepare_vector);
+      .def("prepare_vector", &detail::PythonQueryMemory::prepare_vector,
+           py::arg("value"), py::arg("convert") = py::none(),
+           py::arg("dtype") = py::none());
   py::class_<detail::PythonWriteMemory,
              std::shared_ptr<detail::PythonWriteMemory>>(m, "_WriteInputMemory")
       .def("new_doc", &detail::PythonWriteMemory::new_doc)
