@@ -404,8 +404,8 @@ class TestQueryExecutor:
             "one": ("one", 0.0, {}, {"test": [1.0, 2.0, 3.0]})
         }
         memory = MagicMock()
-        memory.prepare_vector.side_effect = (
-            lambda value, convert, dtype: convert(value, dtype)
+        memory.prepare_vector.side_effect = lambda value, convert, dtype: convert(
+            value, dtype
         )
         query = executor._build_search_query(
             QueryContext(topk=1), Query("test", id="one"), collection, memory
