@@ -657,9 +657,10 @@ int FlatStreamer<BATCH_SIZE>::search_external(
     } else {
       ailego::BudgetedVector<uint32_t> ids;
       ids.reserve(batch_limit);
-      auto &pointers = std::get<PointerBatch>(batch);
-      ailego::ReserveVectorCapacity(pointers.ids, batch_memory, batch_limit);
-      ailego::ReserveVectorCapacity(pointers.vectors, batch_memory, batch_limit);
+      auto &pointer_batch = std::get<PointerBatch>(batch);
+      ailego::ReserveVectorCapacity(pointer_batch.ids, batch_memory, batch_limit);
+      ailego::ReserveVectorCapacity(pointer_batch.vectors, batch_memory,
+                                    batch_limit);
       auto read_batch = [&]() -> int {
         if (ids.empty()) return 0;
         if (keys) {
