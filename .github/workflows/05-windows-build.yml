@@ -2,6 +2,10 @@ name: Windows Build
 
 on:
   workflow_call:
+    inputs:
+      buffer_pool_acceptance:
+        type: boolean
+        default: false
   workflow_dispatch:
 
 permissions:
@@ -101,6 +105,12 @@ jobs:
             --config-settings='cmake.define.CMAKE_C_COMPILER_LAUNCHER=sccache' `
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache'
         shell: powershell
+
+      - name: Run Buffer Pool lifecycle and RSS acceptance
+        if: inputs.buffer_pool_acceptance
+        uses: ./.github/actions/buffer-pool-lifecycle
+        with:
+          platform: ${{ matrix.platform }}
 
       - name: Show sccache statistics after pip install
         if: always()

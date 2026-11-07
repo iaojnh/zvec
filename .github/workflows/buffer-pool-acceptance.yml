@@ -8,6 +8,39 @@ permissions:
   contents: read
 
 jobs:
+  desktop:
+    name: Desktop compatibility (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: linux-arm64, os: ubuntu-24.04-arm}
+          - {platform: macos-arm64, os: macos-15}
+          - {platform: macos-x64, os: macos-15-intel}
+    uses: ./.github/workflows/03-macos-linux-build.yml
+    with:
+      platform: ${{ matrix.platform }}
+      os: ${{ matrix.os }}
+      buffer_pool_acceptance: true
+
+  windows:
+    name: Windows x64 and ARM64 compatibility
+    uses: ./.github/workflows/05-windows-build.yml
+    with:
+      buffer_pool_acceptance: true
+
+  android:
+    name: Android emulator and device ABI compatibility
+    uses: ./.github/workflows/04-android-build.yml
+
+  ios:
+    name: iOS simulator and device SDK compatibility
+    uses: ./.github/workflows/06-ios-build.yml
+
+  musllinux:
+    name: Linux musl compatibility
+    uses: ./.github/workflows/09-musllinux-build.yml
+
   build:
     name: Build Linux x64 candidate
     runs-on: ubuntu-24.04
@@ -136,3 +169,137 @@ jobs:
           name: buffer-pool-evidence-${{ matrix.shard }}
           path: evidence/
           retention-days: 14
+
+  linux-scale:
+    name: Linux scale (${{ matrix.scenario }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Three concurrent writers each reserve 264 MiB before encoding.
+          - {scenario: mixed-100k, index: ivf, rows: 100000, budget: 1280, mixed: true}
+          - {scenario: ivf-400k, index: ivf, rows: 400000, budget: 1024}
+          - {scenario: diskann-200k, index: diskann, rows: 200000, budget: 1024}
+          - {scenario: cohere-ivf-buffer, index: ivf, storage: buffer}
+          - {scenario: cohere-ivf-mmap, index: ivf, storage: mmap}
+          - {scenario: cohere-diskann-buffer, index: diskann, storage: buffer}
+          - {scenario: cohere-diskann-mmap, index: diskann, storage: mmap}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Install verified candidate
+        run: |
+          mkdir -p evidence
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          cp candidate/commit.txt candidate/SHA256SUMS evidence/
+          python -m pip install candidate/*.whl
+      - name: Run bounded stress and lifecycle
+        if: matrix.rows
+        env:
+          INDEX: ${{ matrix.index }}
+          ROWS: ${{ matrix.rows }}
+          BUDGET_MIB: ${{ matrix.budget }}
+          MIXED: ${{ matrix.mixed }}
+        run: |
+          args=()
+          if [[ "$MIXED" == true ]]; then args+=(--mixed); fi
+          python -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
+            "$RUNNER_TEMP/collection" evidence/rss.jsonl --rows "$ROWS" \
+            --dimension 384 --budget-mib "$BUDGET_MIB" "${args[@]}" \
+            2>&1 | tee evidence/stress.log
+        shell: bash
+      - name: Fetch versioned public Cohere 1M inputs
+        if: matrix.storage
+        run: |
+          data_dir="$RUNNER_TEMP/cohere"
+          mkdir -p "$data_dir"
+          # VectorDBBench Cohere Medium: train, query and exact top-k files.
+          while read -r name size etag; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 1200 \
+              --header "If-Match: \"$etag\"" --max-filesize "$size" \
+              "https://assets.zilliz.com/benchmark/cohere_medium_1m/$name" \
+              --output "$data_dir/$name"
+            test "$(stat -c %s "$data_dir/$name")" -eq "$size"
+          done <<'DATASET'
+          shuffle_train.parquet 3134418448 aa5dee664dc87b3e416c9863723a0ba4-374
+          test.parquet 3133165 c63a0efd0e611d9f35345af1fc6f7966
+          neighbors.parquet 3704127 d1aca052763a292b10e80bbda964f55d
+          DATASET
+          (cd "$data_dir" && sha256sum ./*.parquet) > evidence/dataset-sha256.txt
+          df -h "$RUNNER_TEMP"
+      - name: Run production-scale build and query benchmark
+        if: matrix.storage
+        env:
+          INDEX: ${{ matrix.index }}
+          STORAGE: ${{ matrix.storage }}
+        run: |
+          python -m pip install pyarrow
+          python -X faulthandler .github/scripts/buffer_pool_cohere.py "$INDEX" "$STORAGE" \
+            "$RUNNER_TEMP/cohere" "$RUNNER_TEMP/collection" evidence/rss.jsonl \
+            2>&1 | tee evidence/cohere.log
+        shell: bash
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-evidence-${{ matrix.scenario }}
+          path: evidence/
+          retention-days: 14
+
+  summary:
+    name: Acceptance summary
+    if: always()
+    needs: [build, acceptance, desktop, windows, android, ios, musllinux, linux-scale]
+    runs-on: ubuntu-24.04
+    env:
+      RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Report stage results
+        run: |
+          printf '## Buffer Pool acceptance\n\nCandidate: `%s`\n\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          jq -r 'to_entries[] | "- **\(.key)** — \(.value.result)"' <<< "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/download-artifact@v8
+        if: needs.linux-scale.result != 'skipped'
+        continue-on-error: true
+        with:
+          pattern: buffer-pool-evidence-cohere-*
+          path: cohere-results
+      - name: Compare Cohere 1M benchmark results
+        if: needs.linux-scale.result != 'skipped'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          from statistics import median
+
+          print("\n## Cohere 1M\n")
+          print("Peak RSS is the full lifecycle peak. Other metrics are medians of three query trials.\n")
+          print("| Index | Storage | Peak RSS (MiB) | Recall@10 | QPS | P99 (ms) | Physical reads (MiB/trial) |")
+          print("|---|---|---:|---:|---:|---:|---:|")
+          for index in ("ivf", "diskann"):
+              for storage in ("buffer", "mmap"):
+                  path = Path("cohere-results", f"buffer-pool-evidence-cohere-{index}-{storage}", "rss.jsonl")
+                  rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                  trials = [row for row in rows if row["phase"] == "query_trial"]
+                  if len(trials) != 3:
+                      print(f"| {index} | {storage} | Incomplete ({len(trials)}/3) | | | | |")
+                      continue
+                  peak = max(row["peak_kib"] for row in rows) / 1024
+                  recall, qps, p99, reads = (median(row[key] for row in trials) for key in
+                                             ("recall_at_10", "qps", "p99_ms", "read_bytes"))
+                  print(f"| {index} | {storage} | {peak:.1f} | {recall:.3f} | {qps:.1f} | {p99:.2f} | {reads / 1024**2:.1f} |")
+          PY
+      - name: Require each stage to pass
+        run: |
+          jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"

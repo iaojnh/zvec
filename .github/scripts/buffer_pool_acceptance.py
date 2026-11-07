@@ -1,12 +1,17 @@
 # Copyright 2025-present the zvec project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded Linux Buffer Pool acceptance for a single index and process."""
+"""Bounded Buffer Pool acceptance for a single index and process."""
 
 import argparse
 import json
 import math
 import statistics
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from functools import partial
+from hashlib import shake_256
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +30,16 @@ PAYLOAD = "buffer-pool " * 64
 
 
 def rss_kib():
+    if sys.platform != "linux":
+        import psutil
+
+        memory = psutil.Process().memory_info()
+        if sys.platform == "win32":
+            return memory.rss // 1024, memory.peak_wset // 1024
+        import resource
+
+        return memory.rss // 1024, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+
     values = {}
     for line in Path("/proc/self/status").read_text().splitlines():
         key, _, value = line.partition(":")
@@ -33,19 +48,19 @@ def rss_kib():
     return values["VmRSS"], values["VmHWM"]
 
 
-def sample(evidence, phase, **details):
+def sample(evidence, phase, *, limit_kib=RSS_LIMIT_KIB, **details):
     rss, peak = rss_kib()
     print(
         json.dumps({"phase": phase, "rss_kib": rss, "peak_kib": peak, **details}),
         file=evidence,
         flush=True,
     )
-    assert peak <= RSS_LIMIT_KIB, f"{phase}: peak {peak} KiB exceeds {RSS_LIMIT_KIB} KiB"
+    assert peak <= limit_kib, f"{phase}: peak {peak} KiB exceeds {limit_kib} KiB"
     return rss
 
 
-def check_reads(collection, probes, query_param, topk):
-    assert collection.stats.doc_count == ROWS
+def check_reads(collection, probes, query_param, topk, rows):
+    assert collection.stats.doc_count == rows
     doc_ids = [str(i) for i in PROBE_IDS]
     docs = collection.fetch(doc_ids)
     assert set(docs) == set(doc_ids)
@@ -65,12 +80,60 @@ def check_reads(collection, probes, query_param, topk):
     return docs
 
 
-def run(kind, path, evidence):
-    sample(
-        evidence, "start", index=kind, rows=ROWS, budget_mib=BUDGET_MIB,
-        rss_limit_kib=RSS_LIMIT_KIB, rounds=ROUNDS,
+def check_competing_collections(path, primary, read_primary, observe):
+    schema = zvec.CollectionSchema(
+        name="buffer_pool_competing",
+        fields=[zvec.FieldSchema("payload", zvec.DataType.STRING)],
     )
-    zvec.init(memory_limit_mb=BUDGET_MIB, query_threads=2, optimize_threads=1)
+    options = zvec.CollectionOption(enable_mmap=False)
+
+    def write_batch(collection, cycle):
+        docs = [
+            zvec.Doc(id=str(i), fields={"payload": f"{cycle}:{i}:" + "v" * (i * 128)})
+            for i in range(32)
+        ]
+        statuses = collection.update(docs)
+        assert len(statuses) == len(docs) and all(status.ok() for status in statuses)
+        collection.flush()
+        assert collection.fetch(["0"])["0"].field("payload") == f"{cycle}:0:"
+        if cycle % 4 == 0:
+            collection.optimize()
+
+    with ExitStack() as cleanup, ThreadPoolExecutor(max_workers=4) as workers:
+        competing = []
+        for shard in range(3):
+            collection = zvec.create_and_open(f"{path}-shared-{shard}", schema, options)
+            cleanup.callback(collection.close)
+            competing.append(collection)
+            for start in range(0, 1024, BATCH_SIZE):
+                docs = [
+                    zvec.Doc(
+                        id=str(i),
+                        fields={"payload": shake_256(str(i).encode()).hexdigest(2048)},
+                    )
+                    for i in range(start, start + BATCH_SIZE)
+                ]
+                assert all(status.ok() for status in collection.insert(docs))
+            collection.flush()
+
+        for cycle in range(1, 13):
+            tasks = [workers.submit(read_primary, primary, topk=32)]
+            tasks += [workers.submit(write_batch, collection, cycle) for collection in competing]
+            for task in tasks:
+                task.result()
+            observe("shared_collections", cycle=cycle, collections=4, workers=4)
+
+
+def run(
+    kind, path, evidence, *, rows=ROWS, dimension=DIMENSION, budget_mib=BUDGET_MIB, mixed=False
+):
+    limit_kib = (budget_mib + 64) * 1024
+    observe = partial(sample, evidence, limit_kib=limit_kib)
+    observe(
+        "start", index=kind, rows=rows, dimension=dimension, budget_mib=budget_mib,
+        rss_limit_kib=limit_kib, rounds=ROUNDS,
+    )
+    zvec.init(memory_limit_mb=budget_mib, query_threads=2, optimize_threads=1)
     if kind == "ivf":
         index_param = zvec.IVFIndexParam(
             metric_type=zvec.MetricType.L2, n_list=32, n_iters=5
@@ -87,20 +150,21 @@ def run(kind, path, evidence):
         fields=[zvec.FieldSchema("payload", zvec.DataType.STRING)],
         vectors=[
             zvec.VectorSchema(
-                "embedding", zvec.DataType.VECTOR_FP32, dimension=DIMENSION,
+                "embedding", zvec.DataType.VECTOR_FP32, dimension=dimension,
                 index_param=index_param,
             )
         ],
     )
     probes = {}
+    read = partial(check_reads, probes=probes, query_param=query_param, rows=rows)
     rng = np.random.default_rng(2026)
     collection = zvec.create_and_open(
         path, schema, zvec.CollectionOption(enable_mmap=False)
     )
     try:
-        for start in range(0, ROWS, BATCH_SIZE):
-            count = min(BATCH_SIZE, ROWS - start)
-            vectors = rng.standard_normal((count, DIMENSION), dtype=np.float32)
+        for start in range(0, rows, BATCH_SIZE):
+            count = min(BATCH_SIZE, rows - start)
+            vectors = rng.standard_normal((count, dimension), dtype=np.float32)
             docs = []
             for row, vector in enumerate(vectors, start):
                 doc_id = str(row)
@@ -117,38 +181,43 @@ def run(kind, path, evidence):
             assert len(statuses) == count and all(status.ok() for status in statuses)
         del docs, statuses, vectors
         collection.flush()
-        sample(evidence, "inserted")
+        observe("inserted")
         collection.optimize()
         assert collection.stats.index_completeness["embedding"] == 1
-        sample(evidence, "optimized")
+        observe("optimized")
         update = zvec.Doc(id=str(PROBE_IDS[0]), fields={"payload": "updated"})
         assert collection.update(update).ok()
         collection.flush()
-        check_reads(collection, probes, query_param, topk=32)
+        read(collection, topk=32)
     finally:
         collection.close()
-    sample(evidence, "closed_after_build")
+    observe("closed_after_build")
+
+    options = zvec.CollectionOption(read_only=True, enable_mmap=False)
+    if mixed:
+        primary = zvec.open(path, options)
+        try:
+            check_competing_collections(path, primary, read, observe)
+        finally:
+            primary.close()
 
     closed_rss = []
-    options = zvec.CollectionOption(read_only=True, enable_mmap=False)
     for cycle in range(1, ROUNDS + 1):
         collection = zvec.open(path, options)
         try:
-            retained = check_reads(
-                collection, probes, query_param, topk=32 if cycle % 2 else 1
-            )
-            sample(evidence, "results_held", cycle=cycle)
+            retained = read(collection, topk=32 if cycle % 2 else 1)
+            observe("results_held", cycle=cycle)
         finally:
             collection.close()
         assert retained[str(PROBE_IDS[0])].field("payload") == "updated"
         del retained, collection
-        closed_rss.append(sample(evidence, "closed", cycle=cycle))
+        closed_rss.append(observe("closed", cycle=cycle))
 
     # Allow 12 warm-up rounds, then compare two equally sized windows.
     prior_median = statistics.median(closed_rss[12:24])
     late_median = statistics.median(closed_rss[24:])
     drift_kib = late_median - prior_median
-    sample(evidence, "complete", closed_rss_drift_kib=drift_kib)
+    observe("complete", closed_rss_drift_kib=drift_kib)
     assert drift_kib <= 8 * 1024, f"close RSS median grew by {drift_kib:.0f} KiB"
     assert max(closed_rss[24:]) <= prior_median + 16 * 1024, (
         "late close RSS exceeds stable band"
@@ -164,6 +233,15 @@ if __name__ == "__main__":
     parser.add_argument("index", choices=("ivf", "diskann"))
     parser.add_argument("collection")
     parser.add_argument("evidence", type=Path)
+    parser.add_argument("--rows", type=int, default=ROWS)
+    parser.add_argument("--dimension", type=int, default=DIMENSION)
+    parser.add_argument("--budget-mib", type=int, default=BUDGET_MIB)
+    parser.add_argument("--mixed", action="store_true")
     args = parser.parse_args()
+    if args.rows <= max(PROBE_IDS) or args.dimension <= 0 or args.budget_mib <= 0:
+        parser.error("rows must cover all probes, and dimension and budget must be positive")
     with args.evidence.open("x") as evidence:
-        run(args.index, args.collection, evidence)
+        run(
+            args.index, args.collection, evidence, rows=args.rows,
+            dimension=args.dimension, budget_mib=args.budget_mib, mixed=args.mixed,
+        )

@@ -16,6 +16,9 @@ on:
         required: false
         type: string
         default: ''
+      buffer_pool_acceptance:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -135,6 +138,12 @@ jobs:
             ${{ matrix.arch_flag }}
         shell: bash
 
+      - name: Run Buffer Pool lifecycle and RSS acceptance
+        if: inputs.buffer_pool_acceptance
+        uses: ./.github/actions/buffer-pool-lifecycle
+        with:
+          platform: ${{ matrix.platform }}
+
       - name: Run C++ Tests
         if: matrix.platform != 'macos-x64'
         run: |
@@ -149,6 +158,9 @@ jobs:
           df -h /
           cd "$GITHUB_WORKSPACE/build"
           test_regex='^(shared_api_test|c_api_test|diskann_.*_test)$'
+          if [[ '${{ inputs.buffer_pool_acceptance }}' == 'true' ]]; then
+            test_regex='^(shared_api_test|c_api(_memory_budget)?_test|diskann_.*_test|process_rss_budget_test|pool_admission_test|result_memory_allowance_test|buffer_(read_storage|storage_write)_test|ivf_workspace_budget_test)$'
+          fi
           # Build the same targets CTest will run, including tests added on main.
           test_targets=$(ctest --show-only=json-v1 -R "$test_regex" | python -c '
           import json
