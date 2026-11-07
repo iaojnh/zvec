@@ -1966,6 +1966,55 @@ TEST_F(BufferPoolTest, RetirementCleanupIsBoundedAndPreservesLiveMembership) {
   EXPECT_EQ(0u, owner.evictions);
 }
 
+TEST_F(BufferPoolTest, RetirementCleanupFavorsProbationWithoutStarvingOtherTiers) {
+  auto &queue = BlockEvictionQueue::get_instance();
+  constexpr size_t kEntries = 512;
+  for (size_t priority = 0; priority < BlockEvictionQueue::kQueueCount;
+       ++priority) {
+    for (size_t entry = 0; entry < kEntries; ++entry)
+      ASSERT_TRUE(queue.add_single_block({}, static_cast<int>(priority)));
+  }
+  queue.request_dead_entry_cleanup();
+  const auto before = queue.stats();
+  EXPECT_EQ(256u, queue.cleanup_dead_entries(256));
+  const auto after = queue.stats();
+  EXPECT_EQ(256u, after.cleanup_attempts - before.cleanup_attempts);
+  EXPECT_EQ(kEntries - 208, after.approximate_queue_sizes[0]);
+  EXPECT_EQ(kEntries - 32, after.approximate_queue_sizes[1]);
+  EXPECT_EQ(kEntries - 16, after.approximate_queue_sizes[2]);
+}
+
+TEST_F(BufferPoolTest, RetirementCleanupSpendsUnusedSharesOnNonemptyTiers) {
+  auto &queue = BlockEvictionQueue::get_instance();
+  for (size_t priority = 0; priority < BlockEvictionQueue::kQueueCount;
+       ++priority) {
+    SCOPED_TRACE(priority);
+    for (size_t entry = 0; entry < 256; ++entry)
+      ASSERT_TRUE(queue.add_single_block({}, static_cast<int>(priority)));
+    queue.request_dead_entry_cleanup();
+    const auto before = queue.stats();
+    EXPECT_EQ(256u, queue.cleanup_dead_entries(256));
+    const auto after = queue.stats();
+    EXPECT_EQ(256u, after.cleanup_attempts - before.cleanup_attempts);
+    for (const size_t depth : after.approximate_queue_sizes)
+      EXPECT_EQ(0u, depth);
+  }
+}
+
+TEST_F(BufferPoolTest, RetirementCleanupRotatesSingleEntryBudgets) {
+  auto &queue = BlockEvictionQueue::get_instance();
+  for (size_t priority = 0; priority < BlockEvictionQueue::kQueueCount;
+       ++priority) {
+    for (size_t entry = 0; entry < 4; ++entry)
+      ASSERT_TRUE(queue.add_single_block({}, static_cast<int>(priority)));
+  }
+  queue.request_dead_entry_cleanup();
+  for (size_t scan = 0; scan < 12; ++scan)
+    EXPECT_EQ(1u, queue.cleanup_dead_entries(1));
+  for (const size_t depth : queue.stats().approximate_queue_sizes)
+    EXPECT_EQ(0u, depth);
+}
+
 TEST_F(BufferPoolTest, BackgroundCleansRetiredExternalEntriesBelowWatermark) {
   init_pool(/*capacity_pages=*/64);
   SizedExternalCache cache;
