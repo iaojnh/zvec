@@ -18,6 +18,7 @@ NATIVE_TARGETS = (
     "process_rss_budget_test",
     "pool_admission_test",
     "result_memory_allowance_test",
+    "write_buffer_reservation_test",
     "retained_block_allocator_test",
     "budgeted_mapped_buffer_test",
     "eviction_queue_budget_test",

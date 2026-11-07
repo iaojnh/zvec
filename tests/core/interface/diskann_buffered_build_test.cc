@@ -256,8 +256,12 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     // The merge source remains live throughout training. Its retained key-map
     // backing is separately charged and STL/platform dependent, not PQ state.
     const size_t before_training = pool.external_used();
-    ASSERT_EQ(
-        merge ? target->merge({source}, {}, {2, nullptr}) : target->train(), 0);
+    const int training_result =
+        merge ? target->merge({source}, {}, {2, nullptr}) : target->train();
+    ASSERT_EQ(training_result, 0)
+        << "used=" << pool.used() << " capacity=" << pool.capacity()
+        << " external=" << pool.external_used()
+        << " metadata=" << pool.metadata_used();
     if (pressure) {
       // Timing determines whether foreground admission or background
       // writeback reclaims a page. Assert the fixed reservation and budget,

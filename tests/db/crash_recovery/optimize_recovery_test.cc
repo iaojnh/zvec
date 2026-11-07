@@ -131,6 +131,8 @@ void RunOptimizerAndCrash(const std::string &path, int seconds) {
 class OptimizeRecoveryTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    const auto status = InitializeOptimizeRecoveryResources();
+    ASSERT_TRUE(status.ok()) << status.message();
     zvec::test_util::RemoveTestPath("./optimize_recovery_test_db");
     ASSERT_NO_THROW(optimizer_bin = LocateOptimizeGenerator());
   }

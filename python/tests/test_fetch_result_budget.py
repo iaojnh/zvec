@@ -854,7 +854,10 @@ def verify_id_results(path, kind, mmap, dimension, count):
 
 
 def verify_document_results(path, kind, mmap, dimension, count, *, grouped):
-    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    # This tests escaping owners and their release, including across reopen.
+    # Keep RSS headroom so allocator retention cannot replace the intended
+    # result-quota denial with a failed open or decode of the tiny corpus.
+    zvec.init(memory_limit_mb=256, query_threads=2, optimize_threads=1)
     coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
     held = []
     rejected = False
@@ -898,10 +901,31 @@ def verify_group_results(*args):
     verify_document_results(*args, grouped=True)
 
 
+def verify_single_group_result(path, kind, mmap, dimension, count):
+    # Keep the small-budget functional check independent of deliberately
+    # retaining batches until exhaustion and its allocator high water.
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    groups = coll.group_by_query(
+        zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
+        "payload",
+        group_count=count,
+        topk_per_group=1,
+        include_vector=True,
+    )
+    assert sum(len(group.docs) for group in groups) == count
+    assert all(
+        len(doc.vector("vector")) == dimension for group in groups for doc in group.docs
+    )
+    coll.close()
+
+
 @pytest.mark.parametrize("mode", ["id_results", "iterator_results", "group_results"])
 def test_remaining_result_paths_hold_and_release_budget(tmp_path, mode):
     path = tmp_path / mode
     run_worker("build", path, "VECTOR_FP32", False, 1024, 64)
+    if mode == "group_results":
+        run_worker("single_group_result", path, "VECTOR_FP32", False, 1024, 64)
     run_worker(mode, path, "VECTOR_FP32", False, 1024, 64)
 
 
@@ -970,5 +994,6 @@ if __name__ == "__main__":
         "id_results": verify_id_results,
         "iterator_results": verify_iterator_results,
         "group_results": verify_group_results,
+        "single_group_result": verify_single_group_result,
     }[action]
     worker(Path(target), vector_kind, bool(int(use_mmap)), int(dim), int(rows))

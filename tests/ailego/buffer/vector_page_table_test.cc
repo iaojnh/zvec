@@ -1726,6 +1726,9 @@ TEST_F(BufferPoolTest, LazyDirectoriesReleaseSentinelsWithoutAllocating) {
   struct AllocatingEmptyMap : std::unordered_map<size_t, size_t> {
     AllocatingEmptyMap()
         : sentinel(CacheMetadataAllocator<char>{}.allocate(1)) {}
+    AllocatingEmptyMap(AllocatingEmptyMap &&rhs) : AllocatingEmptyMap() {
+      this->swap(rhs);
+    }
     ~AllocatingEmptyMap() {
       CacheMetadataAllocator<char>{}.deallocate(sentinel, 1);
     }
@@ -1744,9 +1747,19 @@ TEST_F(BufferPoolTest, LazyDirectoriesReleaseSentinelsWithoutAllocating) {
   const size_t pressure = pool.capacity() - pool.used();
   ASSERT_TRUE(pool.try_charge_external(pressure));
   auto release = ScopeGuard::Make([&] { pool.release_external(pressure); });
-  // reset() must destroy, not replace, the map under a saturated budget.
-  directory.reset();
+  // Moving an active directory must transfer its owner without constructing
+  // an empty replacement sentinel under the exhausted budget.
+  LazyMap<AllocatingEmptyMap> moved(std::move(directory));
   EXPECT_TRUE(directory.empty());
+  ASSERT_NE(moved.end(), moved.find(7));
+  EXPECT_EQ(9u, moved.find(7)->second);
+  LazyMap<AllocatingEmptyMap> assigned;
+  assigned = std::move(moved);
+  EXPECT_TRUE(moved.empty());
+  EXPECT_EQ(9u, assigned.find(7)->second);
+  // reset() must destroy, not replace, the map under a saturated budget.
+  assigned.reset();
+  EXPECT_TRUE(assigned.empty());
   EXPECT_EQ(pressure, pool.used());
   EXPECT_EQ(0u, pool.metadata_used());
 }

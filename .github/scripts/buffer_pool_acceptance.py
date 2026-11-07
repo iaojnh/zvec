@@ -241,7 +241,10 @@ def check_reads(collection, probes, query_param, topk, rows, vector_only=False):
             output_fields=[],
             include_vector=False,
         )
-        assert len(hits) == topk and hits[0].id == doc_ids[0]
+        assert len(hits) == topk and hits[0].id == doc_ids[0], (
+            doc_ids[0],
+            [(hit.id, hit.score) for hit in hits[:3]],
+        )
         assert all(math.isfinite(hit.score) for hit in hits)
         return {hits[0].id: hits[0]}
     docs = collection.fetch(doc_ids)
@@ -257,7 +260,10 @@ def check_reads(collection, probes, query_param, topk, rows, vector_only=False):
         include_vector=True,
     )
     assert len(hits) == topk
-    assert hits[0].id == doc_ids[0] and hits[0].field("payload") == "updated"
+    assert hits[0].id == doc_ids[0] and hits[0].field("payload") == "updated", (
+        doc_ids[0],
+        [(hit.id, hit.score, hit.field("payload")) for hit in hits[:3]],
+    )
     assert all(math.isfinite(hit.score) for hit in hits)
     return docs
 

@@ -36,6 +36,7 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
+#include "db/common/mobile_memory.h"
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "db/index/column/vector_column/vector_index_results.h"
@@ -48,8 +49,25 @@
 #include "zvec/db/options.h"
 #include "zvec/db/query_params.h"
 #include "zvec/db/schema.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
+
+namespace {
+class SegmentHelperBudgetEnvironment : public testing::Environment {
+ public:
+  void SetUp() override {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // The merge-correctness cases keep ten segments and five vector stores
+      // per segment open together. Their non-evictable storage metadata alone
+      // exceeds the mobile startup default; use an explicit suite budget.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+};
+[[maybe_unused]] const auto *const kSegmentHelperBudgetEnvironment =
+    testing::AddGlobalTestEnvironment(new SegmentHelperBudgetEnvironment);
+}  // namespace
 
 class SegmentHelperTest : public testing::Test {
  protected:

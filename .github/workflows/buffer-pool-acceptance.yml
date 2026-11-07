@@ -101,6 +101,10 @@ jobs:
           printf '%s\n' "$CMAKE_BUILD_PARALLEL_LEVEL" > candidate/compiler-parallelism.txt
           grep -E '^(AUTO_DETECT_ARCH|BUILD_.*SHARED|CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_FLAGS|GENERATOR)):' build/CMakeCache.txt > candidate/build-config.txt
           (cd candidate && sha256sum ./*.whl ./native-tests.tar.gz > SHA256SUMS)
+      - name: Verify portable distance kernels
+        run: |
+          python -m pip install candidate/*.whl
+          python .github/scripts/buffer_pool_distance_sanity.py
       - name: Verify shutdown persistence without reopening readers
         run: |
           cmake --build build --parallel 2 --target segment_test
@@ -312,6 +316,16 @@ jobs:
           path: baseline-source
           submodules: recursive
           persist-credentials: false
+      - name: Apply baseline runtime-kernel build compatibility
+        run: |
+          # The pinned source disables per-kernel ISA flags with a portable
+          # package baseline, producing no-op AVX kernels. Apply only those
+          # two CMake guards; preserve algorithms and record the exact patch.
+          patch="$GITHUB_WORKSPACE/.github/patches/baseline-portable-x86-kernels.patch"
+          git -C baseline-source apply --check "$patch"
+          git -C baseline-source apply "$patch"
+          mkdir -p baseline
+          cp "$patch" baseline/build-compatibility.patch
       - uses: actions/setup-python@v7
         with:
           python-version: '3.10'
@@ -334,7 +348,12 @@ jobs:
             -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
           git rev-parse HEAD > ../baseline/commit.txt
           git submodule status --recursive > ../baseline/submodules.txt
-          (cd ../baseline && sha256sum ./*.whl > SHA256SUMS)
+          grep -E '^(AUTO_DETECT_ARCH|BUILD_.*SHARED|CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_FLAGS|GENERATOR)):' build/CMakeCache.txt > ../baseline/build-config.txt
+          (cd ../baseline && sha256sum ./*.whl ./build-compatibility.patch > SHA256SUMS)
+      - name: Verify baseline distance kernels
+        run: |
+          python -m pip install baseline/*.whl
+          python .github/scripts/buffer_pool_distance_sanity.py
       - uses: actions/upload-artifact@v7
         with:
           name: buffer-pool-baseline
