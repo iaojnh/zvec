@@ -316,6 +316,12 @@ endif()
 # Enable unit testing
 enable_testing()
 
+# Build-only entry point for CI compilation gates. Keep test execution on the
+# existing unittest target so producing binaries never starts long test runs.
+if(NOT TARGET unittest.build)
+  add_custom_target(unittest.build)
+endif()
+
 # Add unittest target
 if(NOT TARGET unittest)
   if(IOS)
@@ -339,6 +345,7 @@ if(NOT TARGET unittest)
       )
   endif()
 endif()
+add_dependencies(unittest unittest.build)
 
 # Directories of target output
 if(NOT CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
@@ -1225,7 +1232,7 @@ function(cc_test)
       DEPS "${CC_ARGS_DEPS}"
       "${CC_ARGS_UNPARSED_ARGUMENTS}"
     )
-  add_dependencies(unittest ${CC_ARGS_NAME})
+  add_dependencies(unittest.build ${CC_ARGS_NAME})
   set(TEST_WORKING_DIR "${CMAKE_BINARY_DIR}/test_tmp/${CC_ARGS_NAME}")
   file(MAKE_DIRECTORY "${TEST_WORKING_DIR}")
   add_custom_target(
@@ -2044,7 +2051,7 @@ function(cuda_test)
       DEPS "${CUDA_ARGS_DEPS}"
       "${CUDA_ARGS_UNPARSED_ARGUMENTS}"
     )
-  add_dependencies(unittest ${CUDA_ARGS_NAME})
+  add_dependencies(unittest.build ${CUDA_ARGS_NAME})
   set(TEST_WORKING_DIR "${CMAKE_BINARY_DIR}/test_tmp/${CUDA_ARGS_NAME}")
   file(MAKE_DIRECTORY "${TEST_WORKING_DIR}")
   add_custom_target(
