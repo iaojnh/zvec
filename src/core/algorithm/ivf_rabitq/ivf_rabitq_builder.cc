@@ -28,7 +28,7 @@
 #include "algorithm/hnsw_rabitq/rabitq_converter.h"
 #include "algorithm/hnsw_rabitq/rabitq_params.h"
 #include "utility/paged_record_sort.h"
-#include "utility/vector_build_source.h"
+#include <zvec/core/framework/index_build_source.h>
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_memory.h"
@@ -83,8 +83,8 @@ int BuildIvfRabitqData(const std::shared_ptr<IvfRabitqReformer> &reformer,
       holder->element_size() < dimension * sizeof(float)) {
     return IndexError_Mismatch;
   }
-  VectorBuildSource::Pointer source;
-  int ret = VectorBuildSource::Create(holder, &source);
+  IndexBuildSource::Pointer source;
+  int ret = IndexBuildSource::Create(holder, &source);
   if (ret != 0) return ret;
   size_t total_count = source->count();
   if (total_count == 0) {

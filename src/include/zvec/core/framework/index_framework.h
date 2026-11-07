@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <zvec/core/framework/index_build_partitions.h>
+#include <zvec/core/framework/index_build_source.h>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_bundle.h>
 #include <zvec/core/framework/index_cluster.h>

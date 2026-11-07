@@ -14,12 +14,10 @@
 #pragma once
 #include <limits>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/core/framework/index_build_partitions.h>
+#include <zvec/core/framework/index_build_source.h>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_meta.h>
-#include "utility/ordinal_access_holder.h"
-#include "utility/paged_record_sort.h"
-#include "utility/stable_vector_holder.h"
-#include "utility/temporary_buffer_storage.h"
 #include "ivf_centroid_index.h"
 
 namespace zvec {
@@ -75,220 +73,6 @@ class IVFBuilder : public IndexBuilder {
   IVFCentroidIndex::Pointer centroid_index() const {
     return centroid_index_;
   }
-
- public:
-  /*! Random Access Index Holder
-   */
-  class RandomAccessIndexHolder : public IndexHolder {
-   public:
-    //! Index Holder Iterator Pointer
-    typedef std::shared_ptr<RandomAccessIndexHolder> Pointer;
-
-    /*! Random Access Index Holder Iterator
-     */
-    class Iterator : public IndexHolder::Iterator {
-     public:
-      //! Index Holder Iterator Pointer
-      typedef std::unique_ptr<Iterator> Pointer;
-
-      //! Constructor
-      Iterator(RandomAccessIndexHolder *owner) : holder_(owner) {}
-
-      //! Destructor
-      ~Iterator() override = default;
-
-      //! Retrieve pointer of data
-      const void *data() const override {
-        const void *data = nullptr;
-        if (status_ == 0) {
-          status_ = holder_->read_element(id_, &buffer_, &data);
-        }
-        return data;
-      }
-
-      //! Test if the iterator is valid
-      bool is_valid() const override {
-        return status_ == 0 && id_ < holder_->count();
-      }
-
-      int status() const override {
-        return status_;
-      }
-
-      //! Retrieve primary key
-      uint64_t key() const override {
-        uint64_t key = std::numeric_limits<uint64_t>::max();
-        if (status_ == 0) status_ = holder_->read_key(id_, &key);
-        return key;
-      }
-
-      //! Next iterator
-      void next() override {
-        ++id_;
-      }
-
-     private:
-      //! Members
-      RandomAccessIndexHolder *holder_{nullptr};
-      uint32_t id_{0};
-      mutable ailego::BudgetedString buffer_{};
-      mutable int status_{0};
-    };
-
-    //! Constructor
-    RandomAccessIndexHolder(const IndexMeta &meta,
-                            std::shared_ptr<const void> lifetime = {})
-        : features_(std::make_shared<CompactIndexFeatures>(meta)),
-          lifetime_(std::move(lifetime)) {}
-
-    //! Retrieve count of elements in holder (-1 indicates unknown)
-    size_t count() const override {
-      return count_;
-    }
-
-    //! Retrieve dimension
-    size_t dimension() const override {
-      return features_->dimension();
-    }
-
-    //! Retrieve type information
-    IndexMeta::DataType data_type() const override {
-      return features_->data_type();
-    }
-
-    //! Retrieve element size in bytes
-    size_t element_size() const override {
-      return features_->element_size();
-    }
-
-    //! Retrieve if it can multi-pass
-    bool multipass() const override {
-      return true;
-    }
-
-    //! Create a new iterator
-    IndexHolder::Iterator::Pointer create_iterator() override {
-      return IndexHolder::Iterator::Pointer(
-          new RandomAccessIndexHolder::Iterator(this));
-    }
-
-    void reserve(size_t elems) {
-      if (!storage_) {
-        if (lifetime_)
-          vectors_.reserve(elems);
-        else
-          features_->reserve(elems);
-        keys_.reserve(elems);
-      }
-    }
-
-    int enable_buffered_storage(const std::string &prefix, size_t elems) {
-      if (count_ != 0 || element_size() == 0 ||
-          element_size() >
-              std::numeric_limits<size_t>::max() - sizeof(uint64_t) ||
-          elems > std::numeric_limits<size_t>::max() /
-                      (element_size() + sizeof(uint64_t))) {
-        return IndexError_InvalidArgument;
-      }
-      const int ret = TemporaryBufferStorage::Create(
-          prefix, elems * (element_size() + sizeof(uint64_t)), &storage_);
-      if (ret == 0) {
-        capacity_ = elems;
-        key_offset_ = elems * element_size();
-      }
-      return ret;
-    }
-
-    //! Append an element into holder
-    int emplace(uint64_t pkey, const void *vec) {
-      if (!vec) return IndexError_InvalidArgument;
-      if (storage_) {
-        if (count_ >= capacity_) return IndexError_OutOfRange;
-        int ret = storage_->write(count_ * element_size(), vec, element_size());
-        if (ret == 0)
-          ret = storage_->write(key_offset_ + count_ * sizeof(pkey), &pkey,
-                                sizeof(pkey));
-        if (ret != 0) return ret;
-      } else {
-        try {
-          keys_.emplace_back(pkey);
-          try {
-            if (lifetime_)
-              vectors_.emplace_back(vec);
-            else
-              features_->emplace(vec);
-          } catch (...) {
-            keys_.pop_back();
-            throw;
-          }
-        } catch (const std::bad_alloc &) {
-          return IndexError_NoMemory;
-        }
-      }
-      ++count_;
-      return 0;
-    }
-
-    int read_element(size_t id, ailego::BudgetedString *buffer,
-                     const void **data) const {
-      *data = nullptr;
-      if (id >= count()) return IndexError_OutOfRange;
-      if (storage_) {
-        buffer->resize(element_size());
-        int ret =
-            storage_->read(id * element_size(), buffer->data(), element_size());
-        if (ret != 0) return ret;
-        *data = buffer->data();
-      } else {
-        *data = lifetime_ ? vectors_[id] : features_->element(id);
-      }
-      return 0;
-    }
-
-    const void *element(size_t id) const {
-      return lifetime_ ? vectors_.at(id) : features_->element(id);
-    }
-    bool borrowed() const {
-      return lifetime_ != nullptr;
-    }
-
-    int flush() {
-      return storage_ ? storage_->flush() : 0;
-    }
-
-    //! Retrieve key via local id
-    int read_key(size_t id, uint64_t *key) const {
-      if (!key || id >= count_) return IndexError_OutOfRange;
-      if (storage_)
-        return storage_->read(key_offset_ + id * sizeof(*key), key,
-                              sizeof(*key));
-      *key = keys_[id];
-      return 0;
-    }
-
-    uint64_t key(size_t id) const {
-      uint64_t result = std::numeric_limits<uint64_t>::max();
-      (void)read_key(id, &result);
-      return result;
-    }
-
-    size_t resident_key_capacity() const {
-      return keys_.capacity();
-    }
-
-   public:
-    //! Disable them
-    RandomAccessIndexHolder() = delete;
-
-   private:
-    //! Members
-    CompactIndexFeatures::Pointer features_{};
-    ailego::BudgetedVector<uint64_t> keys_{};
-    std::shared_ptr<TemporaryBufferStorage> storage_{};
-    size_t count_{0}, capacity_{0}, key_offset_{0};
-    ailego::BudgetedVector<const void *> vectors_;
-    std::shared_ptr<const void> lifetime_;
-  };
 
  private:
   //! Check MajorOrder in meta, and update the major order if needed
@@ -354,19 +138,11 @@ class IVFBuilder : public IndexBuilder {
         }
         return;
       }
-      ailego_assert_with(centroid_idx < labels_.size(), "Index Overflow");
-      if (paged_labels_) {
-        KeyOrderRecord record{centroid_idx, id, 0};
-        int ret = label_records_.write(size_t{id} * sizeof(record), &record,
-                                       sizeof(record));
-        if (ret != 0) {
-          if (!error_.exchange(true)) err_code_ = ret;
-          return;
-        }
-        continue;
+      const int ret = labels_.assign(id, centroid_idx);
+      if (ret != 0) {
+        if (!error_.exchange(true)) err_code_ = ret;
+        return;
       }
-      std::lock_guard<std::mutex> lock(mutex_);
-      labels_[centroid_idx].emplace_back(id);
     }
   } catch (const std::bad_alloc &) {
     if (!error_.exchange(true)) err_code_ = IndexError_NoMemory;
@@ -392,19 +168,13 @@ class IVFBuilder : public IndexBuilder {
   std::string converter_class_{};
   std::vector<ailego::Params> cluster_params_{};
 
-  ailego::BudgetedVector<ailego::BudgetedVector<uint32_t>> labels_{};
-  bool paged_labels_{false};
-  PagedBuildBuffer label_records_;
-  ailego::BudgetedVector<size_t> label_offsets_;
-  std::mutex mutex_{};
+  IndexBuildPartitions labels_;
   IVFCentroidIndex::Pointer centroid_index_{};
   IVFCentroidIndex::Pointer searcher_centroid_index_{};
-  RandomAccessIndexHolder::Pointer holder_{};
+  IndexBuildSource::Pointer holder_{};
   // Keep the immutable source alive through dump, including repeated dumps.
   // The reader owns only a key map and at most one provider, never all vectors.
-  IndexHolder::Pointer source_holder_{};
   OrdinalAccessHolder::Reader::Pointer source_reader_{};
-  ailego::BudgetedString read_buffer_{};
   IndexMeta converted_meta_{};
   IndexConverter::Pointer converter_{};
   IndexMeta quantized_meta_{};
