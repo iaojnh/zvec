@@ -120,6 +120,7 @@ class PythonFetchInputs {
       throw pybind11::type_error("Fetch expects a sequence of strings");
     constexpr size_t kSlotBytes = 3 * sizeof(std::string);
     if (PyList_CheckExact(source.ptr()) || PyTuple_CheckExact(source.ptr())) {
+      ResultMemoryAllowance::PendingCopy pending;
       const bool list = PyList_CheckExact(source.ptr());
       const auto count = [&] {
         return list ? PyList_GET_SIZE(source.ptr())
@@ -153,7 +154,8 @@ class PythonFetchInputs {
           backing = std::max(backing, backing_admitted);
           {
             pybind11::gil_scoped_release release;
-            memory.add(needed - admitted, backing - backing_admitted);
+            memory.add_pending(needed - admitted, backing - backing_admitted,
+                               pending);
           }
           admitted = needed;
           backing_admitted = backing;
@@ -161,6 +163,7 @@ class PythonFetchInputs {
           // before copying, then hold the GIL through the entire conversion.
           continue;
         }
+        pending.start();
         out->reserve(static_cast<size_t>(size));
         for (Py_ssize_t i = 0; i < size; ++i)
           out->push_back(copy_string(item(i)));
@@ -171,6 +174,7 @@ class PythonFetchInputs {
     // Consume incrementally; rejection may leave an iterator partially read.
     for (auto value :
          pybind11::reinterpret_borrow<pybind11::iterable>(source)) {
+      ResultMemoryAllowance::PendingCopy pending;
       auto held = pybind11::reinterpret_borrow<pybind11::object>(value);
       size_t admitted = 0;
       while (true) {
@@ -178,9 +182,10 @@ class PythonFetchInputs {
             FetchMemoryBytes(1, string_bytes(held), kSlotBytes);
         if (needed <= admitted) break;
         pybind11::gil_scoped_release release;
-        memory.add(needed - admitted);
+        memory.add_pending(needed - admitted, pending);
         admitted = needed;
       }
+      pending.start();
       out->push_back(copy_string(held));
     }
   }

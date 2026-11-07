@@ -703,7 +703,10 @@ Result<DocPtrList> SQLEngineImpl::fill_result(
       break;
     }
     size_t cur_size = docs.size();
-    if (memory) memory->add(detail::EstimateQueryResult(*record_batch));
+    detail::ResultMemoryAllowance::PendingCopy pending;
+    if (memory) memory->add_pending(detail::EstimateQueryResult(*record_batch),
+                                     pending);
+    pending.start();
     docs.resize(docs.size() + record_batch->num_rows());
     for (int i = 0; i < record_batch->num_rows(); i++) {
       docs[cur_size + i] = detail::MakeQueryDocument(memory);
@@ -745,14 +748,16 @@ Result<GroupResults> SQLEngineImpl::fill_group_by_result(
     if (record_batch == nullptr) {
       break;
     }
+    detail::ResultMemoryAllowance::PendingCopy pending;
     if (budgeted) {
       // Native Doc containers and grouped keys overlap while assembling the
       // result. Escaping Docs retain this owner; Python conversion admits its
       // own boxed values separately before creating them.
       detail::QueryResultEstimate materialization;
       materialization.add(detail::EstimateQueryResult(*record_batch), 2);
-      memory->add(materialization.bytes());
+      memory->add_pending(materialization.bytes(), pending);
     }
+    pending.start();
     DocPtrList docs(record_batch->num_rows());
     for (int i = 0; i < record_batch->num_rows(); i++) {
       docs[i] = detail::MakeQueryDocument(budgeted ? memory : nullptr);

@@ -41,11 +41,13 @@ namespace {
 // The supported 64-bit CPython small-object allocator acquires 1 MiB arenas.
 // Retain whole-arena planning headroom, not only rounded Python object bytes.
 constexpr size_t kPythonResultBackingQuantum = 1024 * 1024;
+using PendingResultCopy = detail::ResultMemoryAllowance::PendingCopy;
 
 detail::ResultMemoryAllowance &forward_result_allowance();
 void reserve_query_results(const DocPtrList &docs,
                            const CollectionSchema &schema,
-                           detail::ResultMemoryAllowance::Lease &lease);
+                           detail::ResultMemoryAllowance::Lease &lease,
+                           PendingResultCopy &pending);
 
 using detail::result_memory_owner;
 
@@ -208,7 +210,9 @@ py::list execute_for_python(const Collection &collection, const Query &query) {
   }
   // GIL restored, schema read lock already released.
   auto snapshot = unwrap_expected(std::move(result));
-  reserve_query_results(snapshot.docs, *snapshot.schema, *memory);
+  PendingResultCopy pending;
+  reserve_query_results(snapshot.docs, *snapshot.schema, *memory, pending);
+  pending.start();
   auto out = docs_to_tuples(snapshot.docs, *snapshot.schema);
   retain_result_memory(out, memory);
   return out;
@@ -370,7 +374,8 @@ void estimate_python_document(const Doc &doc,
 
 void reserve_query_results(const DocPtrList &docs,
                            const CollectionSchema &schema,
-                           detail::ResultMemoryAllowance::Lease &lease) {
+                           detail::ResultMemoryAllowance::Lease &lease,
+                           PendingResultCopy &pending) {
   if (!lease.enabled()) return;
   try {
     py::gil_scoped_release release;
@@ -384,7 +389,7 @@ void reserve_query_results(const DocPtrList &docs,
         estimate.add(sizeof(void *));
       }
     }
-    lease.add(estimate.bytes());
+    lease.add_pending(estimate.bytes(), pending);
   } catch (const std::bad_alloc &) {
     PyErr_SetString(PyExc_MemoryError,
                     "Insufficient shared budget for Python query results; "
@@ -395,7 +400,8 @@ void reserve_query_results(const DocPtrList &docs,
 
 void reserve_fetch_results(const DocPtrMap &docs,
                            const CollectionSchema &schema,
-                           detail::ResultMemoryAllowance::Lease &lease) {
+                           detail::ResultMemoryAllowance::Lease &lease,
+                           PendingResultCopy &pending) {
   if (!lease.enabled()) return;
   try {
     // Admission can wait for the shared materialization slot or evict pages.
@@ -414,7 +420,7 @@ void reserve_fetch_results(const DocPtrMap &docs,
     // Accumulate every chunk before conversion. Native Doc admission alone
     // does not cover Python floats/list slots, nor Python results of old
     // chunks.
-    lease.add(estimate.bytes());
+    lease.add_pending(estimate.bytes(), pending);
   } catch (const std::bad_alloc &) {
     PyErr_SetString(PyExc_MemoryError,
                     "Insufficient shared budget for Python fetch results; "
@@ -451,7 +457,8 @@ void estimate_forward_value(const arrow::Array &array, int64_t row,
 }
 
 void reserve_forward_results(const internal::ForwardFetchResult &forward,
-                             detail::ResultMemoryAllowance::Lease &lease) {
+                             detail::ResultMemoryAllowance::Lease &lease,
+                             PendingResultCopy &pending) {
   if (!lease.enabled()) return;
   try {
     py::gil_scoped_release release;
@@ -485,7 +492,7 @@ void reserve_forward_results(const internal::ForwardFetchResult &forward,
       estimate.add(128);
       estimate.add(4, largest_key);
     }
-    lease.add(estimate.bytes());
+    lease.add_pending(estimate.bytes(), pending);
   } catch (const std::bad_alloc &) {
     PyErr_SetString(PyExc_MemoryError,
                     "Insufficient shared budget for Python fetch results; "
@@ -671,11 +678,15 @@ void fetch_chunk_for_python(
       fetch_half(middle, pks.end());
       return;
     }
-    reserve_forward_results(*snapshot.forward, allowance);
+    PendingResultCopy pending;
+    reserve_forward_results(*snapshot.forward, allowance, pending);
+    pending.start();
     forward_to_tuples(*snapshot.forward, out, keys);
     return;
   }
-  reserve_fetch_results(snapshot.docs, schema, allowance);
+  PendingResultCopy pending;
+  reserve_fetch_results(snapshot.docs, schema, allowance, pending);
+  pending.start();
   const auto forward_fields = schema.forward_fields();
   const auto vector_fields = schema.vector_fields();
   while (!snapshot.docs.empty()) {
@@ -692,6 +703,7 @@ void fetch_chunk_for_python(
 
 template <typename Estimate>
 static void admit_python_doc_copy(detail::ResultMemoryAllowance::Lease &memory,
+                                  PendingResultCopy &pending,
                                   size_t materialization_copies,
                                   Estimate estimate) {
   size_t admitted = 0;
@@ -703,8 +715,9 @@ static void admit_python_doc_copy(detail::ResultMemoryAllowance::Lease &memory,
     {
       py::gil_scoped_release release;
       const size_t growth = bytes - admitted;
-      memory.add(growth,
-                 detail::BindingMemoryBytes(materialization_copies, growth));
+      memory.add_pending(
+          growth, detail::BindingMemoryBytes(materialization_copies, growth),
+          pending);
     }
     admitted = bytes;
   }
@@ -717,8 +730,10 @@ static py::object budgeted_python_doc_value(
   if (!detail::DocumentMemoryAccess::budgeted(doc)) return convert();
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       &forward_result_allowance(), false, kPythonResultBackingQuantum);
+  PendingResultCopy pending;
   // Conversion can temporarily keep both the plain value and the wrapper.
-  admit_python_doc_copy(*memory, materialization_copies, estimate);
+  admit_python_doc_copy(*memory, pending, materialization_copies, estimate);
+  pending.start();
   auto value = convert();
   if (!memory->bytes()) return value;
   return py::module_::import("zvec.model._budgeted_result")
@@ -781,6 +796,7 @@ Doc::Ptr budgeted_doc_from_pickle_state(const py::bytes &state) {
       reinterpret_cast<const uint8_t *>(PyBytes_AS_STRING(state.ptr()));
   const size_t size = PyBytes_GET_SIZE(state.ptr());
   std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  PendingResultCopy pending;
   if (ailego::MemoryLimitPool::get_instance().capacity()) {
     size_t bytes = 0;
     if (!detail::EstimateSerializedDocMemory(data, size, &bytes))
@@ -788,8 +804,9 @@ Doc::Ptr budgeted_doc_from_pickle_state(const py::bytes &state) {
     memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
         &forward_result_allowance(), false, kPythonResultBackingQuantum);
     py::gil_scoped_release release;
-    memory->add(bytes);
+    memory->add_pending(bytes, pending);
   }
+  pending.start();
   auto doc = Doc::deserialize(data, size);
   if (!doc) throw std::runtime_error("Failed to unpickle Doc");
   if (memory) detail::DocumentMemoryAccess::retain(*doc, std::move(memory));
@@ -804,11 +821,13 @@ py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema) {
                                                vector_fields);
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       &forward_result_allowance(), false, kPythonResultBackingQuantum);
-  admit_python_doc_copy(*memory, /*materialization_copies=*/1, [&] {
+  PendingResultCopy pending;
+  admit_python_doc_copy(*memory, pending, /*materialization_copies=*/1, [&] {
     PythonResultEstimate estimate;
     estimate_python_document(doc, forward_fields, vector_fields, estimate);
     return estimate.bytes();
   });
+  pending.start();
   py::list holder;
   holder.append(
       ZVecPyDoc::doc_to_tuple_with_fields(doc, forward_fields, vector_fields));
@@ -846,6 +865,7 @@ py::object resolve_ids_for_python(const Collection &self, py::handle source) {
   if (resolved.empty()) return py::list();
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       owner, false, kPythonResultBackingQuantum);
+  PendingResultCopy pending;
   {
     py::gil_scoped_release release;
     PythonResultEstimate estimate;
@@ -853,8 +873,9 @@ py::object resolve_ids_for_python(const Collection &self, py::handle source) {
     estimate.add(3 * sizeof(void *), resolved.size());
     for (const auto &key : resolved)
       if (key) estimate.string(*key);
-    memory->add(estimate.bytes());
+    memory->add_pending(estimate.bytes(), pending);
   }
+  pending.start();
   py::list out(resolved.size());
   for (size_t i = 0; i < resolved.size(); ++i)
     out[i] = resolved[i] ? py::object(py::str(*resolved[i]))

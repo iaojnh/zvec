@@ -4138,13 +4138,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         case ZVEC_DATA_TYPE_BINARY:
         case ZVEC_DATA_TYPE_STRING: {
           const std::string &val = doc_ptr->get_ref<std::string>(field_name);
-          void *buffer = zvec::detail::AllocateCResult(val.length());
-          if (!buffer) {
-            set_last_error("Memory allocation failed for string/binary");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), val.length());
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), val.length());
           *value_size = val.length();
           break;
         }
@@ -4154,13 +4148,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<uint32_t> &val =
               doc_ptr->get_ref<std::vector<uint32_t>>(field_name);
           size_t total_size = val.size() * sizeof(uint32_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint32 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4168,13 +4156,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<uint64_t> &val =
               doc_ptr->get_ref<std::vector<uint64_t>>(field_name);
           size_t total_size = val.size() * sizeof(uint64_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint64 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4182,13 +4164,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<zvec::float16_t> &val =
               doc_ptr->get_ref<std::vector<zvec::float16_t>>(field_name);
           size_t total_size = val.size() * sizeof(zvec::float16_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for fp16 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4196,13 +4172,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<float> &val =
               doc_ptr->get_ref<std::vector<float>>(field_name);
           size_t total_size = val.size() * sizeof(float);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for fp32 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4210,13 +4180,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<double> &val =
               doc_ptr->get_ref<std::vector<double>>(field_name);
           size_t total_size = val.size() * sizeof(double);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for fp64 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4225,13 +4189,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<int8_t> &val =
               doc_ptr->get_ref<std::vector<int8_t>>(field_name);
           size_t total_size = val.size() * sizeof(int8_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int8 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4239,13 +4197,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<int16_t> &val =
               doc_ptr->get_ref<std::vector<int16_t>>(field_name);
           size_t total_size = val.size() * sizeof(int16_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int16 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4259,26 +4211,20 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           size_t nnz = sparse_vec.first.size();
           size_t total_size = sizeof(size_t) + nnz * (sizeof(uint32_t) +
                                                       sizeof(zvec::float16_t));
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for sparse vector FP16");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            *reinterpret_cast<size_t *>(ptr) = nnz;
+            ptr += sizeof(size_t);
 
-          char *ptr = static_cast<char *>(buffer);
-          *reinterpret_cast<size_t *>(ptr) = nnz;
-          ptr += sizeof(size_t);
-
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
-            ptr += sizeof(uint32_t);
-          }
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<zvec::float16_t *>(ptr) = sparse_vec.second[i];
-            ptr += sizeof(zvec::float16_t);
-          }
-
-          *value = buffer;
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
+              ptr += sizeof(uint32_t);
+            }
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<zvec::float16_t *>(ptr) = sparse_vec.second[i];
+              ptr += sizeof(zvec::float16_t);
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4290,26 +4236,20 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           size_t nnz = sparse_vec.first.size();
           size_t total_size =
               sizeof(size_t) + nnz * (sizeof(uint32_t) + sizeof(float));
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for sparse vector FP32");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            *reinterpret_cast<size_t *>(ptr) = nnz;
+            ptr += sizeof(size_t);
 
-          char *ptr = static_cast<char *>(buffer);
-          *reinterpret_cast<size_t *>(ptr) = nnz;
-          ptr += sizeof(size_t);
-
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
-            ptr += sizeof(uint32_t);
-          }
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<float *>(ptr) = sparse_vec.second[i];
-            ptr += sizeof(float);
-          }
-
-          *value = buffer;
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
+              ptr += sizeof(uint32_t);
+            }
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<float *>(ptr) = sparse_vec.second[i];
+              ptr += sizeof(float);
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4324,19 +4264,13 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
             total_size += bin_val.length();
           }
 
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for binary array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          char *ptr = static_cast<char *>(buffer);
-          for (const auto &bin_val : array_vals) {
-            memcpy(ptr, bin_val.data(), bin_val.length());
-            ptr += bin_val.length();
-          }
-
-          *value = buffer;
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            for (const auto &bin_val : array_vals) {
+              memcpy(ptr, bin_val.data(), bin_val.length());
+              ptr += bin_val.length();
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4349,21 +4283,15 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
             total_size += str_val.length() + 1;  // +1 for null terminator
           }
 
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for string array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          char *ptr = static_cast<char *>(buffer);
-          for (const auto &str_val : array_vals) {
-            memcpy(ptr, str_val.c_str(), str_val.length());
-            ptr += str_val.length();
-            *ptr = '\0';
-            ptr++;
-          }
-
-          *value = buffer;
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            for (const auto &str_val : array_vals) {
+              memcpy(ptr, str_val.c_str(), str_val.length());
+              ptr += str_val.length();
+              *ptr = '\0';
+              ptr++;
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4371,22 +4299,16 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           using BoolArray = std::vector<bool>;
           const BoolArray &array_vals = doc_ptr->get_ref<BoolArray>(field_name);
           size_t byte_count = (array_vals.size() + 7) / 8;
-          void *buffer = zvec::detail::AllocateCResult(byte_count);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for bool array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
+          *value = zvec::detail::AllocateCResult(byte_count, [&](void *buffer) {
+            uint8_t *bytes = static_cast<uint8_t *>(buffer);
+            memset(bytes, 0, byte_count);
 
-          uint8_t *bytes = static_cast<uint8_t *>(buffer);
-          memset(bytes, 0, byte_count);
-
-          for (size_t i = 0; i < array_vals.size(); ++i) {
-            if (array_vals[i]) {
-              bytes[i / 8] |= (1 << (i % 8));
+            for (size_t i = 0; i < array_vals.size(); ++i) {
+              if (array_vals[i]) {
+                bytes[i / 8] |= (1 << (i % 8));
+              }
             }
-          }
-
-          *value = buffer;
+          });
           *value_size = byte_count;
           break;
         }
@@ -4395,14 +4317,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const Int32Array &array_vals =
               doc_ptr->get_ref<Int32Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(int32_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int32 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4411,14 +4326,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const Int64Array &array_vals =
               doc_ptr->get_ref<Int64Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(int64_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int64 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4427,14 +4335,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const UInt32Array &array_vals =
               doc_ptr->get_ref<UInt32Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(uint32_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint32 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4443,14 +4344,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const UInt64Array &array_vals =
               doc_ptr->get_ref<UInt64Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(uint64_t);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint64 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4459,14 +4353,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const FloatArray &array_vals =
               doc_ptr->get_ref<FloatArray>(field_name);
           size_t total_size = array_vals.size() * sizeof(float);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for float array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4475,14 +4362,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const DoubleArray &array_vals =
               doc_ptr->get_ref<DoubleArray>(field_name);
           size_t total_size = array_vals.size() * sizeof(double);
-          void *buffer = zvec::detail::AllocateCResult(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for double array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4780,8 +4660,14 @@ zvec_error_code_t zvec_doc_serialize(const zvec_doc_t *doc, uint8_t **data,
       auto doc_ptr = reinterpret_cast<const zvec::Doc *>(doc);
       zvec::detail::ResultMemoryAllowance::Lease workspace(
           &zvec::detail::SharedResultMemoryAllowance());
-      workspace.add(zvec::detail::BindingMemoryBytes(1, doc_ptr->serialized_size(), 64));
-      std::vector<uint8_t> serialized_data = doc_ptr->serialize();
+      const auto serialized_data = [&] {
+        zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+        workspace.add_pending(
+            zvec::detail::BindingMemoryBytes(1, doc_ptr->serialized_size(), 64),
+            pending);
+        pending.start();
+        return doc_ptr->serialize();
+      }();
 
       const size_t bytes = serialized_data.size();
       if (bytes == 0) {
@@ -4789,13 +4675,8 @@ zvec_error_code_t zvec_doc_serialize(const zvec_doc_t *doc, uint8_t **data,
         return ZVEC_OK;
       }
 
-      *data = static_cast<uint8_t *>(zvec::detail::AllocateCResult(bytes));
-      if (!*data) {
-        set_last_error("Failed to allocate memory for serialized data");
-        return ZVEC_ERROR_INTERNAL_ERROR;
-      }
-
-      memcpy(*data, serialized_data.data(), bytes);
+      *data = static_cast<uint8_t *>(
+          zvec::detail::CopyCResultBuffer(serialized_data.data(), bytes));
       *size = bytes;
       return ZVEC_OK;)
 }
@@ -4818,7 +4699,11 @@ zvec_error_code_t zvec_doc_deserialize(const uint8_t *data, size_t size,
       using Lease = zvec::detail::ResultMemoryAllowance::Lease;
       auto &allowance = zvec::detail::SharedResultMemoryAllowance();
       Lease admission(&allowance);
-      admission.add(zvec::detail::BindingMemoryBytes(1, bytes, sizeof(zvec::Doc) + 128));
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      admission.add_pending(
+          zvec::detail::BindingMemoryBytes(1, bytes, sizeof(zvec::Doc) + 128),
+          pending);
+      pending.start();
       auto decoded = zvec::Doc::deserialize(data, size);
       if (!decoded) {
         set_last_error("Failed to deserialize document");

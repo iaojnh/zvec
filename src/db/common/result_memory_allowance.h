@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <zvec/ailego/buffer/memory_reservation.h>
 
 namespace zvec::detail {
@@ -19,6 +20,40 @@ namespace zvec::detail {
 // release the materialization slot before transferring it to another thread.
 class ResultMemoryAllowance {
  public:
+  // Keep measured headroom while the producer is between admission and copy.
+  // Cancel unused admission. After starting, a failed partial copy can still
+  // leave resident allocator backing, so keep its projection until a sample.
+  class PendingCopy {
+   public:
+    PendingCopy() = default;
+    PendingCopy(const PendingCopy &) = delete;
+    PendingCopy &operator=(const PendingCopy &) = delete;
+    ~PendingCopy() { finish(); }
+
+    void start() noexcept { started_ = true; }
+    void finish() {
+      if (const size_t bytes = std::exchange(bytes_, 0))
+        ailego::MemoryLimitPool::get_instance().finish_materialization(
+            bytes, started_);
+      started_ = false;
+    }
+
+   private:
+    friend class ResultMemoryAllowance;
+
+    bool reserve(ailego::MemoryLimitPool &pool, size_t bytes) {
+      if (!bytes) return true;
+      if (bytes > std::numeric_limits<size_t>::max() - bytes_ ||
+          !pool.try_reserve_materialization(bytes))
+        return false;
+      bytes_ += bytes;
+      return true;
+    }
+
+    size_t bytes_{0};
+    bool started_{false};
+  };
+
   class Lease {
    public:
     explicit Lease(ResultMemoryAllowance *owner,
@@ -63,7 +98,19 @@ class ResultMemoryAllowance {
     void add(size_t bytes, size_t materialization) {
       if (!owner_ || (!bytes && !materialization)) return;
       begin_materialization();
-      bytes_ += owner_->acquire(bytes, backing_quantum_, materialization);
+      bytes_ += owner_->acquire(bytes, backing_quantum_, materialization, nullptr);
+    }
+
+    void add_pending(size_t bytes, PendingCopy &pending) {
+      add_pending(bytes, bytes, pending);
+    }
+
+    void add_pending(size_t bytes, size_t materialization,
+                     PendingCopy &pending) {
+      if (!owner_ || (!bytes && !materialization)) return;
+      begin_materialization();
+      bytes_ += owner_->acquire(bytes, backing_quantum_, materialization,
+                                &pending);
     }
 
     // Transfer admission to an owner allocated only AFTER that admission.
@@ -112,7 +159,7 @@ class ResultMemoryAllowance {
  private:
   friend class MemoryBudgetTestPeer;
   size_t acquire(size_t bytes, size_t backing_quantum,
-                 size_t materialization) {
+                 size_t materialization, PendingCopy *pending) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t capacity = pool.capacity();
@@ -139,10 +186,23 @@ class ResultMemoryAllowance {
     // consumes the whole cache. Keep at least three quarters for native
     // storage, metadata and decoding; callers can split large result batches.
     if (target > capacity / 4) throw std::bad_alloc();
-    if (target > reservation_.bytes()) {
+    const size_t previous = reservation_.bytes();
+    if (pending) {
+      // Lifetime backing and measured headroom can cover the same bytes.
+      // Grow the backing first without projecting a second materialization.
+      if (target > previous) {
+        if (materialization && !pool.materialization_allowed(materialization))
+          throw std::bad_alloc();
+        reservation_.add(target - previous);
+      }
+      if (!pending->reserve(pool, materialization)) {
+        reservation_.retain_at_most(previous);
+        throw std::bad_alloc();
+      }
+    } else if (target > previous) {
       // Admission may evict native cache pages. Bindings must release the GIL
       // before calling add(); no Python code executes while this lock is held.
-      reservation_.add(target - reservation_.bytes(), materialization);
+      reservation_.add(target - previous, materialization);
     } else if (!pool.try_materialize(materialization)) {
       throw std::bad_alloc();
     }

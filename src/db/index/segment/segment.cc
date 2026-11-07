@@ -1596,6 +1596,7 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
   }
 
   std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  detail::ResultMemoryAllowance::PendingCopy pending;
   if (!options_.enable_mmap_) {
     detail::QueryResultEstimate estimate;
     estimate.add(sizeof(Doc) + 256);
@@ -1606,8 +1607,9 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
     }
     memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
         &detail::SharedResultMemoryAllowance());
-    memory->add(estimate.bytes());
+    memory->add_pending(estimate.bytes(), pending);
   }
+  pending.start();
   auto doc = detail::MakeQueryDocument(memory);
 
   // column 0 is the global doc_id
@@ -1765,6 +1767,7 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
     }
   }
 
+  pending.finish();
   // fetch vector
   if (!include_vector) {
     return doc;

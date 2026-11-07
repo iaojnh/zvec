@@ -41,15 +41,21 @@ class CResultAllocations {
       std::free(ptr);
   }
 
-  void *allocate(size_t bytes) {
+  template <typename Populate>
+  void *allocate(size_t bytes, Populate populate) {
     // Charge payload, registry node/bucket growth and shared ownership before
     // allocating any of them. Retained heap backing uses the common high water.
     ResultMemoryAllowance::Lease admission(&SharedResultMemoryAllowance());
-    admission.add(BindingMemoryBytes(1, bytes, 256));
+    ResultMemoryAllowance::PendingCopy pending;
+    admission.add_pending(BindingMemoryBytes(1, bytes, 256), pending);
+    pending.start();
     auto owner = std::make_shared<ResultMemoryAllowance::Lease>(
         &SharedResultMemoryAllowance());
     owner->absorb(admission);
-    return allocate_owned(bytes, owner);
+    std::unique_ptr<void, decltype(&release)> data(
+        allocate_owned(bytes, owner), &release);
+    populate(data.get());
+    return data.release();
   }
 
   // The caller has already admitted the array and its backing owner.
@@ -88,7 +94,12 @@ class CResultAllocations {
 };
 
 inline void *AllocateCResult(size_t bytes) {
-  return CResultAllocations::instance().allocate(bytes);
+  return CResultAllocations::instance().allocate(bytes, [](void *) {});
+}
+
+template <typename Populate>
+void *AllocateCResult(size_t bytes, Populate populate) {
+  return CResultAllocations::instance().allocate(bytes, populate);
 }
 
 inline void FreeCResult(void *ptr) noexcept {
@@ -97,17 +108,23 @@ inline void FreeCResult(void *ptr) noexcept {
 
 inline void *AllocateCResultArray(size_t count, size_t width) {
   const size_t bytes = BindingMemoryBytes(count, width);
-  auto *data = AllocateCResult(bytes);
-  std::memset(data, 0, bytes);
-  return data;
+  return AllocateCResult(bytes,
+                         [bytes](void *data) { std::memset(data, 0, bytes); });
+}
+
+inline void *CopyCResultBuffer(const void *source, size_t bytes) {
+  return AllocateCResult(bytes, [source, bytes](void *data) {
+    if (bytes) std::memcpy(data, source, bytes);
+  });
 }
 
 inline char *CopyCResultString(std::string_view value) {
-  auto *data = static_cast<char *>(
-      AllocateCResult(BindingMemoryBytes(1, value.size(), 1)));
-  if (!value.empty()) std::memcpy(data, value.data(), value.size());
-  data[value.size()] = '\0';
-  return data;
+  return static_cast<char *>(
+      AllocateCResult(BindingMemoryBytes(1, value.size(), 1), [value](void *data) {
+        auto *text = static_cast<char *>(data);
+        if (!value.empty()) std::memcpy(text, value.data(), value.size());
+        text[value.size()] = '\0';
+      }));
 }
 
 // Used before C arrays become vectors, including all-missing Fetch requests.

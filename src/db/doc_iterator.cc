@@ -69,6 +69,7 @@ Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
   int64_t num_rows = *end - begin;
   impl->batch_docs.clear();
   std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  detail::ResultMemoryAllowance::PendingCopy pending;
   if (impl->segments[impl->current_segment_index]->uses_buffer_storage()) {
     // Row limits alone do not bound string/list copies. Choose a window by
     // byte admission before materializing Docs, and retain the lease with
@@ -77,7 +78,8 @@ Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
         &detail::SharedResultMemoryAllowance());
     while (true) {
       try {
-        memory->add(detail::EstimateQueryResult(*batch.Slice(begin, num_rows)));
+        memory->add_pending(
+            detail::EstimateQueryResult(*batch.Slice(begin, num_rows)), pending);
         break;
       } catch (const std::bad_alloc &) {
         if (num_rows <= 1) throw;
@@ -86,6 +88,7 @@ Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
     }
     *end = begin + num_rows;
   }
+  pending.start();
   impl->batch_docs.reserve(num_rows);
   for (int64_t i = 0; i < num_rows; i++) {
     impl->batch_docs.push_back(detail::MakeQueryDocument(memory));
@@ -109,6 +112,7 @@ Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
     }
   }
 
+  pending.finish();
   if (impl->row_id_col >= 0) {
     const auto *row_ids = static_cast<const arrow::UInt64Array *>(
         batch.columns()[impl->row_id_col].get());

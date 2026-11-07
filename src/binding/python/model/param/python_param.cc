@@ -2416,6 +2416,7 @@ void set_query_vector(QueryTarget &target, const FieldSchema &field_schema,
 namespace {
 
 using QueryVectorLease = detail::ResultMemoryAllowance::Lease;
+using PendingQueryCopy = detail::ResultMemoryAllowance::PendingCopy;
 
 struct PythonVectorSource {
   py::object dense_source;
@@ -2434,7 +2435,8 @@ struct FtsMemory {
 struct PythonFts : FtsMemory, FtsClause {};
 
 template <typename Estimate>
-std::shared_ptr<QueryVectorLease> admit_query_copy(Estimate estimate) {
+std::shared_ptr<QueryVectorLease> admit_query_copy(PendingQueryCopy &pending,
+                                                  Estimate estimate) {
   if (!ailego::MemoryLimitPool::get_instance().capacity()) return {};
   auto memory = std::make_shared<QueryVectorLease>(
       &detail::SharedResultMemoryAllowance(), false, 1024 * 1024);
@@ -2443,7 +2445,7 @@ std::shared_ptr<QueryVectorLease> admit_query_copy(Estimate estimate) {
     const size_t bytes = estimate();
     if (bytes <= admitted) break;
     py::gil_scoped_release release;
-    memory->add(bytes - admitted);
+    memory->add_pending(bytes - admitted, pending);
     admitted = bytes;
   }
   return memory;
@@ -2467,7 +2469,9 @@ size_t output_fields_copy_bytes(
 
 template <typename Estimate, typename Convert>
 py::object copy_query_value(Estimate estimate, Convert convert) {
-  auto memory = admit_query_copy(estimate);
+  PendingQueryCopy pending;
+  auto memory = admit_query_copy(pending, estimate);
+  pending.start();
   auto value = convert();
   if (!memory || !memory->bytes()) return value;
   return py::module_::import("zvec.model._budgeted_result")
@@ -2487,8 +2491,10 @@ void replace_query_text(std::string &value,
                ? detail::PythonFetchInputs::string_bytes(source)
                : size_t{0};
   };
-  auto memory = admit_query_copy(estimate);
+  PendingQueryCopy pending;
+  auto memory = admit_query_copy(pending, estimate);
   if (!memory) (void)estimate();  // Validate the type even without a pool.
+  pending.start();
   auto copy = detail::PythonFetchInputs::copy_string(source);
   if (memory)
     memory->retain_at_most(detail::BindingMemoryBytes(1, copy.capacity(), 32));
@@ -2533,8 +2539,8 @@ PythonFts copy_fts(const FtsClause &fts,
 }
 
 std::shared_ptr<QueryVectorLease> admit_query_vector_copy(
-    const SearchQuery &query, DataType type) {
-  return admit_query_copy([&] {
+    const SearchQuery &query, DataType type, PendingQueryCopy &pending) {
+  return admit_query_copy(pending, [&] {
     const auto view = query.target_.get_vector_view();
     if (!view) return size_t{0};
     return FieldSchema::is_dense_vector_field(type)
@@ -2580,7 +2586,9 @@ void replace_fts(PythonSearchQuery &query, py::handle source) {
     query.target_.clause_ = VectorClause{};
   } else {
     const auto &fts = source.cast<const FtsClause &>();
-    memory = admit_query_copy([&] { return fts_copy_bytes(fts); });
+    PendingQueryCopy pending;
+    memory = admit_query_copy(pending, [&] { return fts_copy_bytes(fts); });
+    pending.start();
     auto copy = fts;
     query.target_.clause_ = std::move(copy);
   }
@@ -2591,22 +2599,14 @@ void replace_fts(PythonSearchQuery &query, py::handle source) {
 template <typename Query>
 void replace_query_vector(PythonVectorQuery<Query> &query,
                           const FieldSchema &schema, const py::object &source) {
+  PendingQueryCopy pending;
   std::shared_ptr<QueryVectorLease> memory;
-  if (schema.is_sparse_vector() && PyDict_Check(source.ptr()) &&
-      ailego::MemoryLimitPool::get_instance().capacity()) {
-    memory = std::make_shared<QueryVectorLease>(
-        &detail::SharedResultMemoryAllowance(), false, 1024 * 1024);
-    size_t admitted = 0;
-    while (true) {
-      const size_t count = PyDict_Size(source.ptr());
-      const size_t bytes = detail::BindingMemoryBytes(
-          count, sizeof(uint32_t) + sizeof(float), 128);
-      if (bytes <= admitted) break;
-      py::gil_scoped_release release;
-      memory->add(bytes - admitted);
-      admitted = bytes;
-    }
-  }
+  if (schema.is_sparse_vector() && PyDict_Check(source.ptr()))
+    memory = admit_query_copy(pending, [&] {
+      return detail::BindingMemoryBytes(
+          PyDict_Size(source.ptr()), sizeof(uint32_t) + sizeof(float), 128);
+    });
+  pending.start();
   set_query_vector(query.target_, schema, source);
   auto previous_source = std::move(query.dense_source);
   query.dense_source =
@@ -2630,7 +2630,8 @@ void retain_state_fields(py::tuple &state,
 }
 
 py::tuple search_query_state(const SearchQuery &query) {
-  auto memory = admit_query_copy([&] {
+  PendingQueryCopy pending;
+  auto memory = admit_query_copy(pending, [&] {
     size_t bytes = detail::BindingMemoryBytes(
         1, query_text_copy_bytes(query.target_.field_name_), 512);
     bytes = detail::BindingMemoryBytes(1, query_text_copy_bytes(query.filter_),
@@ -2646,6 +2647,7 @@ py::tuple search_query_state(const SearchQuery &query) {
     return detail::BindingMemoryBytes(1, fts_copy_bytes(*query.target_.get_fts_clause()),
                                        bytes);
   });
+  pending.start();
   const auto vector = query.target_.get_vector_view().value_or(VectorViewClause{});
   const auto *fts = query.target_.get_fts_clause();
   const auto bytes = [](std::string_view value) {
@@ -2677,9 +2679,11 @@ PythonSearchQuery restore_search_query(py::tuple state) {
             1, detail::PythonFetchInputs::string_bytes(state[i]), bytes);
       return bytes;
     };
-    query.target_memory = admit_query_copy(estimate);
+    PendingQueryCopy pending;
+    query.target_memory = admit_query_copy(pending, estimate);
     if (!query.target_memory) (void)estimate();
     // Accept the legacy Unicode vector slots as well as binary pickle slots.
+    pending.start();
     query.target_.clause_ = VectorClause{
         detail::PythonFetchInputs::copy_string(state[2]),
         detail::PythonFetchInputs::copy_string(state[3]),
@@ -2714,11 +2718,13 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
           })
       .def(py::pickle(
           [](const FtsClause &self) {
-            auto memory = admit_query_copy([&] {
+            PendingQueryCopy pending;
+            auto memory = admit_query_copy(pending, [&] {
               return detail::BindingMemoryBytes(
                   1, query_text_copy_bytes(self.query_string_),
                   query_text_copy_bytes(self.match_string_));
             });
+            pending.start();
             auto state = py::make_tuple(self.query_string_, self.match_string_);
             retain_state_fields(state, memory, {0, 1});
             return state;
@@ -2775,10 +2781,12 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
       .def_property(
           "fts",
           [](const SearchQuery &self) -> py::object {
-            auto memory = admit_query_copy([&] {
+            PendingQueryCopy pending;
+            auto memory = admit_query_copy(pending, [&] {
               const auto *fts = self.target_.get_fts_clause();
               return fts ? fts_copy_bytes(*fts) : 0;
             });
+            pending.start();
             const auto *fts = self.target_.get_fts_clause();
             return fts ? py::cast(copy_fts(*fts, memory)) : py::none();
           },
@@ -2795,10 +2803,12 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
           [](const SearchQuery &self,
              const FieldSchema &field_schema) -> py::object {
             DataType data_type = field_schema.data_type();
-            auto memory = admit_query_vector_copy(self, data_type);
+            PendingQueryCopy pending;
+            auto memory = admit_query_vector_copy(self, data_type, pending);
             // get_vector_view() works for both VectorClause and
             // VectorViewClause.
             auto vv = self.target_.get_vector_view();
+            pending.start();
             if (FieldSchema::is_dense_vector_field(data_type)) {
               if (!vv || vv->query_vector_.empty()) {
                 throw std::runtime_error("No dense vector has been set");

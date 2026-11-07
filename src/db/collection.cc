@@ -1953,12 +1953,15 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids_fallback(
   detail::QueryResultEstimate result_bytes;
   result_bytes.add(256);
   result_bytes.add(sizeof(int64_t) + sizeof(float), static_cast<size_t>(topk));
-  memory->add(result_bytes.bytes());
+  detail::ResultMemoryAllowance::PendingCopy pending;
+  memory->add_pending(result_bytes.bytes(), pending);
   out.memory_owner = options_.enable_mmap_ ? nullptr : memory;
+  pending.start();
   out.ids.resize(topk, int64_t{-1});
   if (return_scores) {
     out.scores.resize(topk, std::numeric_limits<float>::quiet_NaN());
   }
+  pending.finish();
   const size_t count = std::min(topk, docs->size());
   for (size_t i = 0; i < count; ++i) {
     const auto &doc = (*docs)[i];
@@ -2013,14 +2016,17 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids(
   detail::QueryResultEstimate result_bytes;
   result_bytes.add(256);
   result_bytes.add(sizeof(int64_t) + sizeof(float), static_cast<size_t>(topk));
-  memory->add(result_bytes.bytes());
+  detail::ResultMemoryAllowance::PendingCopy pending;
+  memory->add_pending(result_bytes.bytes(), pending);
   out.memory_owner = options_.enable_mmap_ ? nullptr : memory;
+  pending.start();
   out.ids.resize(static_cast<size_t>(topk), int64_t{-1});
   // Segment merging needs scores even when the caller only requests IDs.
   if (return_scores || segments.size() > 1) {
     out.scores.resize(static_cast<size_t>(topk),
                       std::numeric_limits<float>::quiet_NaN());
   }
+  pending.finish();
   const bool refine = query_params && query_params->is_using_refiner();
   if (field->second.primary && (!refine || field->second.reference)) {
     const core_interface::VectorData vector{
@@ -2125,10 +2131,13 @@ Result<ResolvedIdsResult> CollectionImpl::resolve_internal_ids(
   detail::QueryResultEstimate result_bytes;
   result_bytes.add(256);
   result_bytes.add(sizeof(std::optional<std::string>), ids.size());
-  memory->add(result_bytes.bytes());
+  detail::ResultMemoryAllowance::PendingCopy pending;
+  memory->add_pending(result_bytes.bytes(), pending);
   ResolvedIdsResult resolved;
   resolved.memory_owner = options_.enable_mmap_ ? nullptr : memory;
+  pending.start();
   resolved.reserve(ids.size());
+  pending.finish();
   const std::optional<std::vector<std::string>> no_fields =
       std::vector<std::string>{};
   for (const auto id : ids) {
@@ -2158,7 +2167,9 @@ Result<ResolvedIdsResult> CollectionImpl::resolve_internal_ids(
     detail::QueryResultEstimate key_bytes;
     key_bytes.add(64);
     key_bytes.add(doc->pk_ref().size());
-    memory->add(key_bytes.bytes());
+    detail::ResultMemoryAllowance::PendingCopy key_copy;
+    memory->add_pending(key_bytes.bytes(), key_copy);
+    key_copy.start();
     resolved.emplace_back(doc->pk_ref());
   }
   return resolved;

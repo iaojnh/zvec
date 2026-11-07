@@ -16,6 +16,24 @@
 #include "db/index/common/doc_field_converter.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
+namespace zvec::ailego {
+
+struct MemoryLimitPoolTestPeer {
+  static bool configure(MemoryLimitPool &pool, size_t limit, size_t rss) {
+    sample_ = rss;
+    return pool.process_rss_.configure(limit, +[] { return sample_.load(); });
+  }
+
+  static void sample(MemoryLimitPool &pool, size_t rss) {
+    sample_ = rss;
+    pool.process_rss_.refresh(true);
+  }
+
+  inline static std::atomic<size_t> sample_{0};
+};
+
+}  // namespace zvec::ailego
+
 namespace zvec::detail {
 namespace {
 
@@ -45,6 +63,46 @@ TEST_F(ResultMemoryAllowanceTest, RetainsAndReusesBackingAfterCallsFinish) {
     EXPECT_EQ(0u, allowance.active_bytes());
     EXPECT_EQ(6 * kMiB, pool_.external_used());
   }
+}
+
+TEST_F(ResultMemoryAllowanceTest, PendingCopyRetainsHeadroomAcrossSamples) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 16 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease warmup(&allowance);
+    ASSERT_NO_THROW(warmup.add(8 * kMiB));
+  }
+  ASSERT_EQ(16 * kMiB, allowance.reserved_bytes());
+  Peer::sample(native, 57 * kMiB);
+  ResultMemoryAllowance::Lease first(&allowance), next(&allowance);
+  {
+    ResultMemoryAllowance::PendingCopy pending;
+    ASSERT_NO_THROW(first.add_pending(4 * kMiB, pending));
+    Peer::sample(native, 57 * kMiB);
+    EXPECT_THROW(next.add(4 * kMiB), std::bad_alloc);
+    EXPECT_EQ(4 * kMiB, allowance.active_bytes());
+    // The producer abandons the copy before touching the destination.
+  }
+  EXPECT_NO_THROW(next.add(4 * kMiB));
+}
+
+TEST_F(ResultMemoryAllowanceTest, RejectedPendingCopyLeavesBackingUnchanged) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  ASSERT_TRUE(ailego::MemoryLimitPoolTestPeer::configure(
+      native, 64 * kMiB, 60 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease lease(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  EXPECT_THROW(lease.add_pending(kMiB, 5 * kMiB, pending), std::bad_alloc);
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  EXPECT_NO_THROW(lease.add_pending(kMiB, pending));
 }
 
 TEST_F(ResultMemoryAllowanceTest, ReusedBackingObeysCriticalPressureAndRecovery) {

@@ -25,6 +25,7 @@ namespace zvec {
 namespace {
 
 using RerankLease = detail::ResultMemoryAllowance::Lease;
+using PendingRerankCopy = detail::ResultMemoryAllowance::PendingCopy;
 constexpr size_t kPythonArena = 1024 * 1024;
 
 std::shared_ptr<RerankLease> new_query_lease() {
@@ -39,12 +40,19 @@ void admit(RerankLease &memory, size_t bytes) {
 }
 
 template <typename Estimate>
-void admit_current(RerankLease &memory, Estimate estimate) {
+void admit_current(RerankLease &memory, PendingRerankCopy &pending,
+                    Estimate estimate) {
   size_t admitted = 0;
   while (true) {
     const size_t bytes = estimate();
-    if (bytes <= admitted) return;
-    admit(memory, bytes - admitted);
+    if (bytes <= admitted) {
+      pending.start();
+      return;
+    }
+    if (ailego::MemoryLimitPool::get_instance().capacity()) {
+      py::gil_scoped_release release;
+      memory.add_pending(bytes - admitted, pending);
+    }
     admitted = bytes;
   }
 }
@@ -147,7 +155,8 @@ std::shared_ptr<SubQuery> make_subquery(
 template <typename Estimate, typename Convert>
 py::object copy_query_value(Estimate estimate, Convert convert) {
   auto memory = new_query_lease();
-  admit_current(*memory, estimate);
+  PendingRerankCopy pending;
+  admit_current(*memory, pending, estimate);
   auto value = convert();
   if (!memory->bytes()) return value;
   return py::module_::import("zvec.model._budgeted_result")
@@ -161,7 +170,8 @@ void set_multi_routes(PythonMultiQuery &query, py::iterable source) {
   for (auto item : source) {
     auto held = py::reinterpret_borrow<py::object>(item);
     const auto &route = held.cast<const SubQuery &>();
-    admit_current(*next->memory, [&] {
+    PendingRerankCopy pending;
+    admit_current(*next->memory, pending, [&] {
       return detail::BindingMemoryBytes(
           1, target_copy_bytes(route.target_), 3 * sizeof(SubQuery));
     });
@@ -174,7 +184,8 @@ void set_multi_routes(PythonMultiQuery &query, py::iterable source) {
 
 py::object multi_route_handles(PythonMultiQuery &query) {
   auto memory = new_query_lease();
-  admit_current(*memory, [&] {
+  PendingRerankCopy pending;
+  admit_current(*memory, pending, [&] {
     return detail::BindingMemoryBytes(query.queries.size(), 256);
   });
   struct RouteExport {
@@ -193,8 +204,12 @@ py::object multi_route_handles(PythonMultiQuery &query) {
 
 void set_multi_filter(PythonMultiQuery &query, py::object source) {
   auto next = new_query_lease();
-  admit_current(*next,
-                [&] { return detail::PythonFetchInputs::string_bytes(source); });
+  PendingRerankCopy pending;
+  admit_current(*next, pending, [&] {
+    return detail::PythonFetchInputs::utf8_size_bound(source)
+               ? detail::PythonFetchInputs::string_bytes(source)
+               : size_t{0};
+  });
   auto value = detail::PythonFetchInputs::copy_string(source);
   next->retain_at_most(detail::BindingMemoryBytes(1, value.capacity(), 32));
   query.filter = std::move(value);
@@ -234,7 +249,8 @@ reranker::RerankParams stage_strategy(py::handle params, RerankLease &memory) {
     return params.cast<reranker::RrfParams>();
   if (py::isinstance<PythonWeightedParams>(params)) {
     const auto &weights = params.cast<const PythonWeightedParams &>().weights;
-    admit_current(memory, [&] {
+    PendingRerankCopy pending;
+    admit_current(memory, pending, [&] {
       return detail::BindingMemoryBytes(weights.size(), sizeof(double));
     });
     return reranker::WeightedParams{weights};
@@ -319,7 +335,8 @@ py::list rerank_python_docs(py::object params, py::iterable source,
   auto routes = stage_routes(source, workspace, [&](py::object original) {
     py::object key = original.attr("id");
     py::object score = original.attr("score");
-    admit_current(workspace, [&] {
+    PendingRerankCopy pending;
+    admit_current(workspace, pending, [&] {
       return detail::BindingMemoryBytes(
           1, detail::PythonFetchInputs::string_bytes(key),
           sizeof(Doc) + 3 * (sizeof(Doc::Ptr) + sizeof(py::object)) + 128);
@@ -345,7 +362,8 @@ py::list rerank_python_docs(py::object params, py::iterable source,
   py::list out;
   for (const auto &doc : ranked) {
     const auto &original = originals.at(doc->doc_id());
-    admit_current(*memory, [&] {
+    PendingRerankCopy pending;
+    admit_current(*memory, pending, [&] {
       // _replace stages shallow copies before normalization/wrapping.
       const size_t fields = mapping_size(original.attr("fields"));
       const size_t vectors = mapping_size(original.attr("vectors"));
@@ -371,7 +389,8 @@ py::list rerank_python_docs(py::object params, py::iterable source,
 
 std::shared_ptr<SubQuery> python_subquery_from_search(const SearchQuery &query) {
   auto memory = new_query_lease();
-  admit_current(*memory, [&] {
+  PendingRerankCopy pending;
+  admit_current(*memory, pending, [&] {
     return detail::BindingMemoryBytes(
         1, target_copy_bytes(query.target_), sizeof(SubQuery));
   });

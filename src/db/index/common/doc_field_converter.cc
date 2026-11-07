@@ -28,13 +28,15 @@ Status DenseVectorDataConverter(
     detail::ResultMemoryAllowance::Lease *memory) {
   const T *data_ptr = reinterpret_cast<const T *>(buffer.data.data());
   size_t data_size = buffer.data.size() / sizeof(T);
+  detail::ResultMemoryAllowance::PendingCopy pending;
   if (memory) {
     detail::QueryResultEstimate estimate;
     estimate.add(192);
     estimate.add(field->name().size(), 2);
     estimate.add(sizeof(T), data_size);
-    memory->add(estimate.bytes());
+    memory->add_pending(estimate.bytes(), pending);
   }
+  pending.start();
   std::vector<T> vector_data(data_ptr, data_ptr + data_size);
   doc->set(field->name(), std::move(vector_data));
   return Status::OK();
@@ -49,14 +51,16 @@ Status SparseVectorDataConverter(
       reinterpret_cast<const IndexType *>(buffer.indices.data());
   size_t indices_size = buffer.indices.size() / sizeof(IndexType);
   const size_t values_size = buffer.values.size() / sizeof(ValueType);
+  detail::ResultMemoryAllowance::PendingCopy pending;
   if (memory) {
     detail::QueryResultEstimate estimate;
     estimate.add(192);
     estimate.add(field->name().size(), 2);
     estimate.add(sizeof(IndexType), indices_size);
     estimate.add(sizeof(ValueType), values_size);
-    memory->add(estimate.bytes());
+    memory->add_pending(estimate.bytes(), pending);
   }
+  pending.start();
   std::vector<IndexType> indices_vector(indices_ptr,
                                         indices_ptr + indices_size);
 

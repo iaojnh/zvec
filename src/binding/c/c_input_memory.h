@@ -104,7 +104,9 @@ struct CInput final : CInputMemory, T {
   template <typename... Args>
   static std::unique_ptr<CInput> make(size_t bytes, Args &&...args) {
     ResultMemoryAllowance::Lease admission(&SharedResultMemoryAllowance());
-    admission.add(bytes);
+    ResultMemoryAllowance::PendingCopy pending;
+    admission.add_pending(bytes, pending);
+    pending.start();
     auto result = std::make_unique<CInput>(std::forward<Args>(args)...);
     result->lease.absorb(admission);
     return result;
@@ -122,7 +124,9 @@ class CInputMutation {
     const size_t before = input_.bytes();
     const size_t tracked = input_.lease.bytes();
     const size_t existing = before > tracked ? before - tracked : 0;
-    admission_.add(BindingMemoryBytes(1, existing, bytes), bytes);
+    admission_.add_pending(BindingMemoryBytes(1, existing, bytes), bytes,
+                           pending_);
+    pending_.start();
   }
 
   void commit() {
@@ -133,6 +137,7 @@ class CInputMutation {
  private:
   CInput<T> &input_;
   ResultMemoryAllowance::Lease admission_{&SharedResultMemoryAllowance()};
+  ResultMemoryAllowance::PendingCopy pending_;
 };
 
 }  // namespace zvec::detail
