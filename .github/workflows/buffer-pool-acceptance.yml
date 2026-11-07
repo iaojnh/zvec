@@ -101,6 +101,19 @@ jobs:
           printf '%s\n' "$CMAKE_BUILD_PARALLEL_LEVEL" > candidate/compiler-parallelism.txt
           grep -E '^(AUTO_DETECT_ARCH|BUILD_.*SHARED|CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_FLAGS|GENERATOR)):' build/CMakeCache.txt > candidate/build-config.txt
           (cd candidate && sha256sum ./*.whl ./native-tests.tar.gz > SHA256SUMS)
+      - name: Verify shutdown persistence without reopening readers
+        run: |
+          cmake --build build --parallel 2 --target segment_test
+          ./build/bin/segment_test --gtest_color=no \
+            --gtest_filter='*FlushForClosePersistsVectorsAndForwardRows*' \
+            --gtest_output=xml:candidate/close-persistence.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          tests = list(ET.parse("candidate/close-persistence.xml").iter("testcase"))
+          assert tests and any(t.find("skipped") is None for t in tests)
+          assert not any(t.find("failure") is not None or t.find("error") is not None for t in tests)
+          PY
+          (cd candidate && sha256sum close-persistence.xml >> SHA256SUMS)
       - uses: actions/upload-artifact@v7
         with:
           name: buffer-pool-candidate

@@ -21,7 +21,7 @@ namespace zvec::detail {
 class ResultMemoryAllowance {
   // Scoped copies provide their physical size independently of planning quota.
   // Retain that payload as RSS backing across samples and page-out/refault.
-  // Work without a scoped copy keeps the full conservative projection.
+  // Work without a scoped copy keeps two conservative payload equivalents.
   class BackingReservation {
    public:
     ~BackingReservation() {
@@ -136,7 +136,8 @@ class ResultMemoryAllowance {
     void add(size_t bytes, size_t materialization) {
       if (!owner_ || (!bytes && !materialization)) return;
       begin_materialization();
-      if (owner_->acquire(bytes, backing_quantum_, materialization, nullptr)) {
+      if (owner_->acquire(bytes, backing_quantum_, materialization, nullptr,
+                          0)) {
         bytes_ += bytes;
         native_bytes_ += bytes;
       }
@@ -148,11 +149,19 @@ class ResultMemoryAllowance {
 
     void add_pending(size_t bytes, size_t materialization,
                      PendingCopy &pending) {
-      if (!owner_ || (!bytes && !materialization)) return;
+      add_pending(bytes, materialization, materialization, pending);
+    }
+
+    void add_pending(size_t bytes, size_t materialization, size_t retained_copy,
+                     PendingCopy &pending) {
+      // Temporary copies consume headroom until PendingCopy finishes; only
+      // the surviving payload must retain lifetime RSS ownership afterwards.
+      if (!owner_ || (!bytes && !materialization && !retained_copy)) return;
       begin_materialization();
-      if (owner_->acquire(bytes, backing_quantum_, materialization, &pending)) {
+      if (owner_->acquire(bytes, backing_quantum_, materialization, &pending,
+                          retained_copy)) {
         bytes_ += bytes;
-        copy_bytes_ += materialization;
+        copy_bytes_ += retained_copy;
       }
     }
 
@@ -212,23 +221,29 @@ class ResultMemoryAllowance {
     // that result can pin a previous large request's entire planning allowance
     // and prevent mandatory index metadata from being admitted.
     const size_t target = rounded(active_, backing_quantum_) * 2;
-    const size_t native =
-        std::min(target, rounded(native_active_, backing_quantum_) * 2);
+    const size_t native = std::min(
+        target, rounded(native_active_, rss_quantum(backing_quantum_)) * 2);
     const size_t rss =
-        native +
-        std::min(rounded(copy_active_, backing_quantum_), target - native);
+        native + std::min(rounded(copy_active_, rss_quantum(backing_quantum_)),
+                          target - native);
     reservation_.retain_at_most(target, rss);
   }
 
  private:
   friend class MemoryBudgetTestPeer;
+  static size_t rss_quantum(size_t planning_quantum) {
+    // Arena slack belongs to the logical plan. Only live copy payload pages
+    // can fault back in; a tiny result does not own an entire untouched arena.
+    return std::min(planning_quantum,
+                    ailego::MemoryLimitPool::page_buffer_size());
+  }
   static size_t rounded(size_t bytes, size_t quantum) {
     const size_t remainder = bytes % quantum;
     return bytes + (remainder ? quantum - remainder : 0);
   }
 
   bool acquire(size_t bytes, size_t backing_quantum, size_t materialization,
-               PendingCopy *pending) {
+               PendingCopy *pending, size_t retained_copy) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t capacity = pool.capacity();
@@ -256,17 +271,18 @@ class ResultMemoryAllowance {
     // storage, metadata and decoding; callers can split large result batches.
     if (target > capacity / 4) throw std::bad_alloc();
     const size_t native_high_water = native_active_ + (pending ? 0 : bytes);
-    const size_t native_remainder = native_high_water % backing_quantum;
+    const size_t physical_quantum = rss_quantum(backing_quantum);
+    const size_t native_remainder = native_high_water % physical_quantum;
     const size_t native_padding =
-        native_remainder ? backing_quantum - native_remainder : 0;
+        native_remainder ? physical_quantum - native_remainder : 0;
     if (native_padding > max_active - native_high_water) throw std::bad_alloc();
-    const size_t copy_growth = pending ? materialization : 0;
+    const size_t copy_growth = pending ? retained_copy : 0;
     if (copy_growth > max_active || copy_active_ > max_active - copy_growth)
       throw std::bad_alloc();
     const size_t copy_high_water = copy_active_ + copy_growth;
-    const size_t copy_remainder = copy_high_water % backing_quantum;
+    const size_t copy_remainder = copy_high_water % physical_quantum;
     const size_t copy_padding =
-        copy_remainder ? backing_quantum - copy_remainder : 0;
+        copy_remainder ? physical_quantum - copy_remainder : 0;
     if (copy_padding > max_active - copy_high_water) throw std::bad_alloc();
     const size_t native_target = (native_high_water + native_padding) * 2;
     const size_t rss_target =

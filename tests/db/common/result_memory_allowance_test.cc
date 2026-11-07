@@ -140,6 +140,54 @@ TEST_F(ResultMemoryAllowanceTest,
   }
 }
 
+TEST_F(ResultMemoryAllowanceTest,
+       TinyCopyDoesNotRequireAnUntouchedPythonArena) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 64 * kMiB - kMiB / 2));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease copy(&allowance, false, kMiB);
+  ResultMemoryAllowance::PendingCopy pending;
+  ASSERT_NO_THROW(copy.add_pending(kMiB, kMiB / 8, pending));
+  EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
+  EXPECT_FALSE(native.try_charge_process_backing(kMiB / 2, 0, false));
+}
+
+TEST_F(ResultMemoryAllowanceTest, TinyNativeWorkDoesNotOwnArenaSlack) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 64 * kMiB - kMiB / 2));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease work(&allowance, false, kMiB);
+  ASSERT_NO_THROW(work.add(kMiB / 8));
+  EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
+  EXPECT_FALSE(native.try_charge_process_backing(kMiB / 2, 0, false));
+}
+
+TEST_F(ResultMemoryAllowanceTest, CopyPeakAndPayloadHaveSeparateLifetimes) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 60 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease copy(&allowance, false, kMiB);
+  ResultMemoryAllowance::PendingCopy pending;
+  ASSERT_NO_THROW(copy.add_pending(kMiB, 4 * kMiB, kMiB, pending));
+  Peer::sample(native, 60 * kMiB);
+  EXPECT_FALSE(native.try_materialize(1));
+  pending.start();
+  pending.finish();
+  Peer::sample(native, 61 * kMiB);
+  const size_t extra = 5 * kMiB / 2;
+  ASSERT_TRUE(native.try_charge_process_backing(extra, 0, false));
+  native.release_process_backing(extra);
+}
+
 TEST_F(ResultMemoryAllowanceTest, TrimmingCopyOnlyLeaseReleasesItsProjection) {
   auto &native = ailego::MemoryLimitPool::get_instance();
   using Peer = ailego::MemoryLimitPoolTestPeer;
