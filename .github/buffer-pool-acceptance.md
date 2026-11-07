@@ -8,6 +8,9 @@ branch. A green summary applies only to the scope recorded in
 ## Required stages
 
 1. Build a candidate wheel and compile the complete Linux native test suite.
+   Use `unittest.build` for the compilation gate; `unittest` also executes the
+   entire suite and must not hold up candidate artifact publication. Platform
+   workflows report compilation separately before running lifecycle/tests.
    Package a fingerprinted native test archive, including
    all build-local transitive shared libraries. Verify relocation before upload
    and set the extracted library directory in each native test job.

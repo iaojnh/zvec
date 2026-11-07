@@ -69,6 +69,14 @@ jobs:
           CMAKE_GENERATOR: Ninja
           CMAKE_BUILD_PARALLEL_LEVEL: '2'
         run: |
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(python - <<'PY'
+          import os
+          from pathlib import Path
+          memory = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+          available_kib = int(memory["MemAvailable"].split()[0])
+          print(max(1, min(4, os.cpu_count() or 1, available_kib // (2 * 1024**2))))
+          PY
+          )
           python -m pip install pybind11==3.0 cmake==3.30.0 ninja==1.11.1 \
             scikit-build-core setuptools_scm
           python -m pip wheel . --no-deps --no-build-isolation --wheel-dir candidate \
@@ -85,10 +93,11 @@ jobs:
                    vector_page_table_test vector_page_table_bypass_aio_test
                    buffer_read_storage_test buffer_storage_write_test
                    ivf_workspace_budget_test diskann_file_reader_aio_test)
-          cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target unittest "${targets[@]}"
+          cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target unittest.build "${targets[@]}"
           python .github/scripts/buffer_pool_native_bundle.py build candidate/native-tests.tar.gz "${targets[@]}"
           git rev-parse HEAD > candidate/commit.txt
           git submodule status --recursive > candidate/submodules.txt
+          printf '%s\n' "$CMAKE_BUILD_PARALLEL_LEVEL" > candidate/compiler-parallelism.txt
           rg '^(AUTO_DETECT_ARCH|BUILD_.*SHARED|CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_FLAGS|GENERATOR)):' build/CMakeCache.txt > candidate/build-config.txt
           (cd candidate && sha256sum ./*.whl ./native-tests.tar.gz > SHA256SUMS)
       - uses: actions/upload-artifact@v7

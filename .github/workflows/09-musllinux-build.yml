@@ -109,6 +109,12 @@ jobs:
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache'
         shell: sh
 
+      - name: Compile C++ test targets
+        run: |
+          cmake --build "$GITHUB_WORKSPACE/build" --target unittest.build --parallel "$NPROC"
+          echo "C++ test compilation passed (musllinux-x64)." >> "$GITHUB_STEP_SUMMARY"
+        shell: sh
+
       - name: Run C++ Tests
         run: |
           cd "$GITHUB_WORKSPACE/build"
@@ -260,6 +266,13 @@ jobs:
             --config-settings='cmake.define.ENABLE_WERROR=ON' \
             --config-settings='cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache' \
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache'
+        shell: bash
+
+      - name: Compile C++ test targets
+        run: |
+          docker exec -w /work/build "$MUSL_CONTAINER" \
+            cmake --build . --target unittest.build --parallel "$NPROC"
+          echo "C++ test compilation passed (musllinux-arm64)." >> "$GITHUB_STEP_SUMMARY"
         shell: bash
 
       - name: Run C++ Tests

@@ -106,6 +106,13 @@ jobs:
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache'
         shell: powershell
 
+      - name: Compile C++ test targets
+        run: |
+          cmake --build "$env:GITHUB_WORKSPACE\build" --target unittest.build --config Release --parallel $env:NPROC
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "C++ test compilation passed (${{ matrix.platform }})." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+        shell: powershell
+
       - name: Run Buffer Pool lifecycle and RSS acceptance
         if: inputs.buffer_pool_acceptance
         uses: ./.github/actions/buffer-pool-lifecycle

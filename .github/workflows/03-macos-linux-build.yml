@@ -138,6 +138,13 @@ jobs:
             ${{ matrix.arch_flag }}
         shell: bash
 
+      - name: Compile C++ test targets
+        if: matrix.platform != 'macos-x64'
+        run: |
+          cmake --build "$GITHUB_WORKSPACE/build" --target unittest.build --parallel "$NPROC"
+          echo "C++ test compilation passed (${{ matrix.platform }})." >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
       - name: Run Buffer Pool lifecycle and RSS acceptance
         if: inputs.buffer_pool_acceptance
         uses: ./.github/actions/buffer-pool-lifecycle

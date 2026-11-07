@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 
 import pytest
 from buffer_pool_metrics import POLICY, stability
@@ -301,3 +302,38 @@ def test_native_archive_includes_transitive_runtime_libraries(tmp_path):
     )
     assert rejected.returncode != 0
     assert b"libfront.so" in rejected.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="standalone Unix compiler smoke")
+def test_compile_gate_builds_without_running_the_test(tmp_path):
+    project = Path(__file__).resolve().parents[2]
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(compile_gate_smoke LANGUAGES CXX)\n"
+        f'set(PROJECT_ROOT_DIR "{project}")\n'
+        'include("${PROJECT_ROOT_DIR}/cmake/bazel.cmake")\n'
+        "cc_test(NAME compile_probe SRCS probe.cc)\n"
+    )
+    (tmp_path / "probe.cc").write_text(
+        "#include <cstdio>\n"
+        'int main() { auto *f = std::fopen("executed.txt", "w"); '
+        "if (!f) return 1; return std::fclose(f); }\n"
+    )
+    build = tmp_path / "build"
+    subprocess.run(
+        ["cmake", "-S", str(tmp_path), "-B", str(build), "-G", "Unix Makefiles"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["cmake", "--build", str(build), "--target", "unittest.build"],
+        check=True,
+        capture_output=True,
+    )
+    assert not list(build.rglob("executed.txt"))
+    subprocess.run(
+        ["cmake", "--build", str(build), "--target", "unittest"],
+        check=True,
+        capture_output=True,
+    )
+    assert len(list(build.rglob("executed.txt"))) == 1
