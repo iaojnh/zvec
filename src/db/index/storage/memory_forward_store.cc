@@ -329,7 +329,7 @@ arrow::Result<TablePtr> MemForwardStore::apply_row_and_column_selection(
 arrow::Result<TablePtr> MemForwardStore::convert_to_table(
     const std::vector<std::string> &columns, const std::vector<int> &indices) {
   for (int row : indices) {
-    if (row < 0 || row >= num_rows_)
+    if (row < 0 || static_cast<uint32_t>(row) >= num_rows_)
       return arrow::Status::IndexError("Invalid forward row: ", row);
   }
   // Fast path: when every requested row sits in one source, only that source is

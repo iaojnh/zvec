@@ -365,10 +365,10 @@ py::list rerank_python_docs(py::object params, py::iterable source,
     PendingRerankCopy pending;
     admit_current(*memory, pending, [&] {
       // _replace stages shallow copies before normalization/wrapping.
-      const size_t fields = mapping_size(original.attr("fields"));
+      const size_t field_count = mapping_size(original.attr("fields"));
       const size_t vectors = mapping_size(original.attr("vectors"));
       return detail::BindingMemoryBytes(
-          vectors, 256, detail::BindingMemoryBytes(fields, 256, 512));
+          vectors, 256, detail::BindingMemoryBytes(field_count, 256, 512));
     });
     auto copy = original.attr("_replace")(py::arg("score") = doc->score());
     if (memory->bytes()) {

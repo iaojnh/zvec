@@ -211,7 +211,7 @@ class PythonQueryMemory {
         staged.append(normalized);
       }
     }
-    return std::move(staged);
+    return staged;
   }
 
   void admit(size_t bytes) {
