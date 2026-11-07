@@ -14,6 +14,7 @@
 
 #include "diskann_algorithm.h"
 #include <algorithm>
+#include <random>
 #include <set>
 #include <ailego/pattern/defer.h>
 #include <zvec/core/framework/index_holder.h>
@@ -43,6 +44,34 @@ DiskAnnAlgorithm::DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree,
       count /= 2;
     }
   }
+}
+
+int DiskAnnAlgorithm::initialize_graph() try {
+  const uint64_t count = entity_.doc_cnt();
+  if (count == 0) return 0;
+  if (count > kInvalidId || max_degree_ == 0) return IndexError_InvalidArgument;
+  const size_t degree = std::min<uint64_t>(max_degree_, count - 1);
+  ailego::BudgetedVector<diskann_id_t> neighbors;
+  neighbors.reserve(degree);
+  std::mt19937_64 random(0);
+  std::uniform_int_distribution<diskann_id_t> pick(
+      0, static_cast<diskann_id_t>(count - 1));
+  // Only one row is retained in workspace; buffered entities keep the graph
+  // itself pageable. Seed edges span the full corpus before insertion begins.
+  for (uint64_t id = 0; id < count; ++id) {
+    neighbors.clear();
+    while (neighbors.size() < degree) {
+      const auto neighbor = pick(random);
+      if (neighbor != id && std::find(neighbors.begin(), neighbors.end(),
+                                      neighbor) == neighbors.end())
+        neighbors.push_back(neighbor);
+    }
+    const int ret = entity_.set_neighbors(id, neighbors);
+    if (ret != 0) return ret;
+  }
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 ailego::BudgetedVector<diskann_id_t> DiskAnnAlgorithm::get_init_ids(
@@ -489,6 +518,24 @@ int DiskAnnAlgorithm::search_neighbor_and_prune(
   }
 
   auto &pool = ctx->expanded_nodes();
+  ailego::BudgetedVector<diskann_id_t> existing;
+  {
+    auto lock = lock_for(id);
+    ret = entity_.read_neighbors(id, &existing);
+  }
+  if (ret != 0) return ret;
+  for (const auto neighbor : existing) {
+    if (neighbor == id || std::any_of(pool.begin(), pool.end(),
+                                      [neighbor](const auto &candidate) {
+                                        return candidate.id == neighbor;
+                                      }))
+      continue;
+    const float distance = ctx->dist_calculator().dist(neighbor);
+    if (ctx->dist_calculator().error())
+      return ctx->dist_calculator().error_code();
+    CollectPruneCandidate(pool, Neighbor(neighbor, distance), id,
+                          max_candidate_size_);
+  }
   pool.erase(std::remove_if(pool.begin(), pool.end(),
                             [id](const auto &node) { return node.id == id; }),
              pool.end());

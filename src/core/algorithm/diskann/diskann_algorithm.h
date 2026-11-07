@@ -34,6 +34,7 @@ class DiskAnnAlgorithm {
   }
 
  public:
+  int initialize_graph();
   int add_node(diskann_id_t id, DiskAnnContext *ctx);
   int prune_node(diskann_id_t id, DiskAnnContext *ctx);
 

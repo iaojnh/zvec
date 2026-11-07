@@ -828,9 +828,18 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   algo_ = std::make_unique<DiskAnnAlgorithm>(entity_, max_degree_,
                                              threads->count());
   AILEGO_DEFER([&] { algo_.reset(); });
-  ret = build_internal(threads);
-  if (ret != 0) {
-    return ret;
+  ret = algo_->initialize_graph();
+  if (ret != 0) return ret;
+  // Revisit every node after the first round refines the seed graph. Early
+  // nodes must see later neighborhood improvements as well as their initial
+  // candidates. Worker groups join between passes, reusing the same budgeted
+  // graph storage.
+  for (unsigned pass = 0; pass < 2; ++pass) {
+    LOG_INFO("DiskANN graph build pass %u/2", pass + 1);
+    ret = build_internal(threads);
+    if (ret != 0) {
+      return ret;
+    }
   }
 
   LOG_INFO("Start final cleanup..");

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "diskann_graph_connectivity.h"
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <vector>
@@ -42,6 +43,11 @@ class ConnectivityEntity : public DiskAnnEntity {
       const ailego::BudgetedVector<diskann_id_t> &value) override {
     if (fail_write) return IndexError_WriteData;
     graph.at(id) = value;
+    ++writes;
+    return 0;
+  }
+  int add_neighbor(diskann_id_t id, diskann_id_t neighbor) override {
+    graph.at(id).push_back(neighbor);
     ++writes;
     return 0;
   }
@@ -230,6 +236,66 @@ TEST_F(DiskAnnGraphConnectivityTest, AdmitsWorkspaceBeforeMutationAndCanRetry) {
   EXPECT_EQ(0u, entity_->writes);
   ASSERT_EQ(0, algorithm.repair_connectivity(context_.get()));
   expect_reachable(1);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphHasDistinctBoundedNonSelfEdges) {
+  initialize(64, 8);
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.initialize_graph());
+  for (size_t id = 0; id < entity_->graph.size(); ++id) {
+    const auto &neighbors = entity_->graph[id];
+    ASSERT_EQ(8u, neighbors.size());
+    std::array<bool, 64> seen{};
+    for (const auto neighbor : neighbors) {
+      ASSERT_LT(neighbor, seen.size());
+      EXPECT_NE(id, neighbor);
+      EXPECT_FALSE(seen[neighbor]);
+      seen[neighbor] = true;
+    }
+  }
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphHandlesSingleton) {
+  initialize(1, 8);
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.initialize_graph());
+  EXPECT_TRUE(entity_->graph[0].empty());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphPropagatesWriteFailure) {
+  initialize(4, 2);
+  entity_->fail_write = true;
+  DiskAnnAlgorithm algorithm(*entity_, 2);
+  EXPECT_EQ(IndexError_WriteData, algorithm.initialize_graph());
+  EXPECT_EQ(0u, entity_->writes);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphAdmitsWorkspaceBeforeMutation) {
+  initialize(4, 2);
+  DiskAnnAlgorithm algorithm(*entity_, 2);
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t charge = pool.available();
+  ASSERT_TRUE(pool.try_charge_external(charge));
+  const int ret = algorithm.initialize_graph();
+  pool.release_external(charge);
+  EXPECT_EQ(IndexError_NoMemory, ret);
+  EXPECT_EQ(0u, entity_->writes);
+  ASSERT_EQ(0, algorithm.initialize_graph());
+  EXPECT_EQ(4u, entity_->writes);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, InsertionPreservesUnsearchedExistingEdge) {
+  initialize(4, 2, 4);
+  entity_->vectors[1].fill(10.0f);
+  entity_->vectors[3].fill(10.1f);
+  entity_->graph[1] = {3};
+  // The medoid cannot reach node 3 yet. It is a valid reciprocal edge added
+  // before node 1's own insertion, and must participate in robust pruning.
+  DiskAnnAlgorithm algorithm(*entity_, 2);
+  ASSERT_EQ(0, algorithm.add_node(1, context_.get()));
+  const auto &neighbors = entity_->graph[1];
+  EXPECT_NE(neighbors.end(), std::find(neighbors.begin(), neighbors.end(), 3));
+  EXPECT_LE(neighbors.size(), 2u);
 }
 
 TEST_F(DiskAnnGraphConnectivityTest, WorkspaceIsChargedAndReleasedWithMapping) {
