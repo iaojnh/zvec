@@ -108,7 +108,7 @@ class LibAioLoader {
       if (destroy_ring(ring) == 0) {
         pool.finish_process_backing(page, false);
       } else {
-        LOG_ERROR("libaio: failed to destroy a rejected completion ring");
+        LOG_ERROR("%s", "libaio: failed to destroy a rejected completion ring");
         const bool accounted =
             !extra || pool.account_pending_process_backing(extra);
         memory.bytes = page + (accounted ? extra : 0);

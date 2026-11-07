@@ -442,7 +442,7 @@ Args:
           }));
 
   // binding QuantizerParam
-  py::class_<QuantizerParam, std::shared_ptr<QuantizerParam>> quantizer_param(
+  py::class_<QuantizerParam, std::shared_ptr<QuantizerParam>> quantizer_binding(
       m, "QuantizerParam", R"pbdoc(
 Parameters for quantizer configuration.
 
@@ -463,7 +463,7 @@ Examples:
     >>> print(qp.enable_rotate)
     True
 )pbdoc");
-  quantizer_param
+  quantizer_binding
       .def(py::init<bool, int, int, bool, uint32_t, uint32_t>(),
            py::arg("enable_rotate") = false, py::arg("num_chunk") = 8,
            py::arg("num_bits") = 8, py::arg("fast_scan") = false,
@@ -622,13 +622,13 @@ Examples:
     {'metric_type': 'IP', 'm': 16, 'ef_construction': 200, 'quantize_type': 'INT8', 'use_contiguous_memory': True}
 )pbdoc");
   hnsw_params
-      .def(py::init([](MetricType metric_type, int m, int ef_construction,
+      .def(py::init([](MetricType metric_type, int max_degree, int ef_construction,
                        QuantizeType quantize_type, bool use_contiguous_memory,
                        QuantizerParam quantizer_param,
                        bool use_flat_contiguous_memory,
                        DataType flat_data_type) {
              return std::make_shared<HnswIndexParams>(
-                 metric_type, m, ef_construction, quantize_type,
+                 metric_type, max_degree, ef_construction, quantize_type,
                  use_contiguous_memory, quantizer_param,
                  use_flat_contiguous_memory, flat_data_type);
            }),
