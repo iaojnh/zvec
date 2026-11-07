@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -19,6 +20,7 @@ from functools import partial
 from hashlib import shake_256
 from pathlib import Path
 from time import perf_counter
+from typing import ClassVar
 
 import numpy as np
 from buffer_pool_metrics import calibration, stability
@@ -33,6 +35,51 @@ BUDGET_MIB = 512
 RSS_LIMIT_KIB = BUDGET_MIB * 1024
 PROBE_IDS = (17, 101, 143)
 PAYLOAD = "buffer-pool " * 64
+
+
+class Mallinfo2(ctypes.Structure):
+    _fields_: ClassVar[list[tuple[str, type]]] = [
+        (name, ctypes.c_size_t)
+        for name in (
+            "arena",
+            "ordblks",
+            "smblks",
+            "hblks",
+            "hblkhd",
+            "usmblks",
+            "fsmblks",
+            "uordblks",
+            "fordblks",
+            "keepcost",
+        )
+    ]
+
+
+_mallinfo2 = (
+    getattr(ctypes.CDLL(None), "mallinfo2", None) if sys.platform == "linux" else None
+)
+if _mallinfo2 is not None:
+    _mallinfo2.restype = Mallinfo2
+
+
+def memory_details():
+    details = {}
+    if sys.platform == "linux":
+        for line in Path("/proc/self/status").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in ("RssAnon", "RssFile", "VmSwap", "Threads"):
+                details[key] = int(value.split()[0])
+        if _mallinfo2 is not None:
+            info = _mallinfo2()
+            details["glibc_heap_bytes"] = {
+                name: getattr(info, name)
+                for name in ("arena", "hblkhd", "uordblks", "fordblks")
+            }
+    arrow = sys.modules.get("pyarrow")
+    if arrow is not None:
+        details["python_arrow_bytes"] = arrow.total_allocated_bytes()
+        details["python_arrow_allocator"] = arrow.default_memory_pool().backend_name
+    return details
 
 
 def rss_kib():
@@ -58,11 +105,20 @@ def rss_kib():
 
 def sample(evidence, phase, *, limit_kib=RSS_LIMIT_KIB, **details):
     rss, peak = rss_kib()
+    row = {
+        "phase": phase,
+        "rss_kib": rss,
+        "peak_kib": peak,
+        **memory_details(),
+        **details,
+    }
     print(
-        json.dumps({"phase": phase, "rss_kib": rss, "peak_kib": peak, **details}),
+        json.dumps(row),
         file=evidence,
         flush=True,
     )
+    if phase == "closed" and details.get("cycle", 0) % 6 == 0:
+        print("MEMORY_DIAGNOSTIC " + json.dumps(row), flush=True)
     if limit_kib is not None:
         assert peak <= limit_kib, f"{phase}: peak {peak} KiB exceeds {limit_kib} KiB"
     return rss
@@ -406,6 +462,7 @@ def run(
                     for _ in range(workers)
                 ]
                 results = [task.result() for task in tasks]
+            del tasks
             retained = results[0]
             del results
             observe("results_held", cycle=cycle)

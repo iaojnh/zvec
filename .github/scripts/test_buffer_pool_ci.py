@@ -7,9 +7,15 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
 
 import pytest
 from buffer_pool_metrics import POLICY, stability
+from buffer_pool_native_bundle import bundle
 from buffer_pool_report import performance, rows, summary
 from buffer_pool_system_limit import snapshot
 
@@ -221,3 +227,77 @@ def test_optional_native_skip_is_reported_as_unsupported(complete_artifacts):
     assert result["unsupported"] == [
         {"suite": "budget", "test": "optional", "reason": "kernel rejects io_uring"}
     ]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux native relocation contract")
+def test_native_archive_includes_transitive_runtime_libraries(tmp_path):
+    build = tmp_path / "build"
+    (build / "bin").mkdir(parents=True)
+    (build / "lib").mkdir()
+    (tmp_path / "base.c").write_text("int base(void) { return 42; }\n")
+    (tmp_path / "front.c").write_text(
+        "int base(void); int answer(void) { return base(); }\n"
+    )
+    (tmp_path / "main.c").write_text(
+        "int answer(void); int main(void) { return answer() == 42 ? 0 : 1; }\n"
+    )
+    subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            str(tmp_path / "base.c"),
+            "-o",
+            str(build / "lib/libbase.so"),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            str(tmp_path / "front.c"),
+            "-L" + str(build / "lib"),
+            "-lbase",
+            "-Wl,-rpath,$ORIGIN",
+            "-o",
+            str(build / "lib/libfront.so"),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "cc",
+            str(tmp_path / "main.c"),
+            "-L" + str(build / "lib"),
+            "-lfront",
+            "-Wl,-rpath,$ORIGIN/../lib",
+            "-o",
+            str(build / "bin/native_smoke"),
+        ],
+        check=True,
+    )
+    archive = tmp_path / "native.tar.gz"
+    bundle(build, archive, ["native_smoke"])
+    build.rename(tmp_path / "original-build-unavailable")
+    relocated = tmp_path / "relocated"
+    with tarfile.open(archive) as packed:
+        packed.extractall(relocated, filter="data")
+    env = {**os.environ, "LD_LIBRARY_PATH": str(relocated / "lib")}
+    subprocess.run([str(relocated / "bin/native_smoke")], env=env, check=True)
+    assert set(json.loads((relocated / "native-libraries.json").read_text())) == {
+        "libfront.so",
+        "libbase.so",
+    }
+    bare = tmp_path / "bare/bin"
+    bare.mkdir(parents=True)
+    shutil.copy2(relocated / "bin/native_smoke", bare / "native_smoke")
+    rejected = subprocess.run(
+        [str(bare / "native_smoke")],
+        env={**os.environ, "LD_LIBRARY_PATH": ""},
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert b"libfront.so" in rejected.stderr

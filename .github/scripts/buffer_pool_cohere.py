@@ -43,19 +43,25 @@ def io_bytes():
 
 
 def workload(data):
-    test = pq.ParquetFile(data / "test.parquet")
+    test = pq.ParquetFile(
+        data / "test.parquet", buffer_size=64 * 1024, pre_buffer=False
+    )
     batch = next(test.iter_batches(batch_size=QUERY_COUNT, columns=["id", "emb"]))
     queries = dict(
         zip(batch.column(0).to_pylist(), batch.column(1).to_pylist(), strict=True)
     )
-    truth = pq.read_table(data / "neighbors.parquet", columns=["id", "neighbors_id"])
-    neighbors = {
-        query_id: {str(value) for value in ids[:TOPK]}
+    truth = pq.ParquetFile(
+        data / "neighbors.parquet", buffer_size=64 * 1024, pre_buffer=False
+    )
+    neighbors = {}
+    for batch in truth.iter_batches(
+        batch_size=32, columns=["id", "neighbors_id"], use_threads=False
+    ):
         for query_id, ids in zip(
-            truth["id"].to_pylist(), truth["neighbors_id"].to_pylist(), strict=True
-        )
-        if query_id in queries
-    }
+            batch.column(0).to_pylist(), batch.column(1).to_pylist(), strict=True
+        ):
+            if query_id in queries:
+                neighbors[query_id] = {str(value) for value in ids[:TOPK]}
     assert len(queries) == len(neighbors) == QUERY_COUNT
     assert all(len(query) == DIMENSION for query in queries.values())
     assert all(len(ids) == TOPK for ids in neighbors.values())
@@ -74,7 +80,9 @@ def build(path, train, options, index_param, observe):
             )
         ],
     )
-    parquet = pq.ParquetFile(train)
+    # The public file has ~1 GiB compressed column chunks. A small output
+    # batch alone does not prevent Arrow from reading that entire chunk.
+    parquet = pq.ParquetFile(train, buffer_size=64 * 1024, pre_buffer=False)
     assert parquet.metadata.num_rows == ROWS
     collection = zvec.create_and_open(path, schema, options)
     probes = {}

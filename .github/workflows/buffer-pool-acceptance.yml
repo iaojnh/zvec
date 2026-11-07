@@ -85,9 +85,8 @@ jobs:
                    vector_page_table_test vector_page_table_bypass_aio_test
                    buffer_read_storage_test buffer_storage_write_test
                    ivf_workspace_budget_test diskann_file_reader_aio_test)
-          cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target "${targets[@]}"
-          for i in "${!targets[@]}"; do targets[$i]="bin/${targets[$i]}"; done
-          tar -czf candidate/native-tests.tar.gz -C build "${targets[@]}"
+          cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target unittest "${targets[@]}"
+          python .github/scripts/buffer_pool_native_bundle.py build candidate/native-tests.tar.gz "${targets[@]}"
           git rev-parse HEAD > candidate/commit.txt
           git submodule status --recursive > candidate/submodules.txt
           rg '^(AUTO_DETECT_ARCH|BUILD_.*SHARED|CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_FLAGS|GENERATOR)):' build/CMakeCache.txt > candidate/build-config.txt
@@ -131,6 +130,7 @@ jobs:
           (cd candidate && sha256sum -c SHA256SUMS)
           cp candidate/commit.txt candidate/SHA256SUMS evidence/
           tar -xzf candidate/native-tests.tar.gz -C candidate
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/candidate/lib" >> "$GITHUB_ENV"
       - name: Install Linux asynchronous I/O runtimes
         run: |
           sudo apt-get update
@@ -168,7 +168,7 @@ jobs:
         run: |
           python -m pytest -n 0 .github/scripts/test_buffer_pool_ci.py --junitxml=evidence/acceptance-gates.xml
           python -m pytest -n 0 python/tests/test_fetch_result_budget.py \
-            -k 'large_vector_result_admission_and_recovery or retained_vectors_reject_growth_and_release_for_retry' \
+            -k 'large_vector_result_admission_and_recovery or large_query_result_copy_admission_and_recovery or retained_vectors_reject_growth_and_release_for_retry' \
             --junitxml=evidence/public-budget.xml
       - name: Run public lifecycle and measure RSS
         if: matrix.shard == 'ivf' || matrix.shard == 'diskann'

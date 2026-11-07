@@ -7,7 +7,10 @@ branch. A green summary applies only to the scope recorded in
 
 ## Required stages
 
-1. Build one fingerprinted candidate wheel and native test archive.
+1. Build a candidate wheel and compile the complete Linux native test suite.
+   Package a fingerprinted native test archive, including
+   all build-local transitive shared libraries. Verify relocation before upload
+   and set the extracted library directory in each native test job.
 2. Run native budget, ownership, eviction, writeback, failure/retry and lifecycle
    regressions in four independent jobs. Run the gate's own negative tests.
 3. Run public API mutation, sparse/quantized, FTS/hybrid, result lifetime,
@@ -55,6 +58,9 @@ allowance is twice its largest uncompressed row group; its query fixture is
 bounded separately. Managed result copies are not added as outside overhead.
 The components, package hash, platform, page size, selected I/O backend,
 current RSS and native process high-water mark are retained in JSONL.
+Linux also records anonymous/file RSS, swap, thread count and glibc live/free
+heap bytes. Python Arrow allocation is recorded when that input reader is
+loaded. Every sixth close sample is echoed in the job log for diagnosis.
 
 All RSS samples, including warm-up, must respect the ceiling. The final two
 steady windows may grow by at most 8 MiB; hour-long runs also require a fitted
@@ -71,6 +77,8 @@ to both storage modes and both compared revisions.
 The immutable baseline SHA is in the policy (initially upstream commit
 `30d662db4d2467937d843443074b34743bcc9baa`). Changing it is an explicit policy
 change, rather than silently comparing against a moving branch.
+The Cohere reader uses a 64 KiB input buffer with prebuffering disabled: a
+256-row output batch alone otherwise reads a ~1 GiB compressed column chunk.
 
 Each distribution/cache point has three trials, with the median gated:
 
