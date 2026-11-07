@@ -26,8 +26,8 @@ endif()
 # Runtime-dispatched x86 kernels need their own ISA flags even when the
 # package baseline is explicitly selected with AUTO_DETECT_ARCH=OFF. Otherwise
 # the AVX translation units contain no-op stubs that CPU dispatch can select.
-if(NOT ANDROID AND
-   _TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
+# The probes use the target compiler, including Android cross builds.
+if(_TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
   setup_compiler_march_for_x86(
     TURBO_MARCH_FLAG_SSE2
     TURBO_MARCH_FLAG_AVX2
@@ -96,8 +96,7 @@ file(GLOB_RECURSE ALL_SRCS *.cc *.c *.h)
 # set_source_files_properties is directory-scoped, so it must be called in the
 # same directory that adds the sources to a target (i.e. here, not in a
 # subdirectory).
-if(NOT ANDROID AND
-   _TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
+if(_TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
     # Compile sparse dispatch at the target baseline. Advertise the kernels
     # separately: compiling dispatch with the strongest ISA can emit illegal
     # instructions before the runtime CPU check on older machines.

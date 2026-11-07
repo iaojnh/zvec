@@ -73,7 +73,8 @@ TEST(ProcessRssBudgetTest, AdmissionResamplesReleasedCallerInputBeforeDenying) {
   budget.release(kMiB);
 }
 
-TEST(ProcessRssBudgetTest, MaterializationResamplesCompletedCopiesButKeepsPending) {
+TEST(ProcessRssBudgetTest,
+     MaterializationResamplesCompletedCopiesButKeepsPending) {
   for (const bool reserve : {false, true}) {
     SCOPED_TRACE(reserve);
     ProcessRssBudget budget;
@@ -471,9 +472,8 @@ TEST(ProcessRssBudgetTest, TemporaryFreesKeepPermanentStartupOverlap) {
       budget.refresh(true);
     };
     sample(64 * kMiB);
-    ASSERT_TRUE(budget.configure(limit, ReadRss,
-                                 use_native_sample ? ReadNative : nullptr,
-                                 permanent));
+    ASSERT_TRUE(budget.configure(
+        limit, ReadRss, use_native_sample ? ReadNative : nullptr, permanent));
     ASSERT_TRUE(budget.try_acquire(kMiB));
     sample(96 * kMiB);
     budget.release(kMiB);
@@ -664,7 +664,8 @@ TEST(ProcessRssBudgetTest, ReservedMaterializationObeysObservedLimits) {
   EXPECT_TRUE(budget.materialization_allowed());
 }
 
-TEST(ProcessRssBudgetTest, ReservedMaterializationRequiresMeasuredRoomForBytes) {
+TEST(ProcessRssBudgetTest,
+     ReservedMaterializationRequiresMeasuredRoomForBytes) {
   ProcessRssBudget budget;
   sampled_rss = 120 * kMiB;
   ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));

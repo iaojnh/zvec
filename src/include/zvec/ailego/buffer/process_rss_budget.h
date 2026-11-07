@@ -299,8 +299,7 @@ class ProcessRssBudget {
     const auto native = projection.native.for_epoch(native_epoch_);
     assert(rss.bytes <= mapping_bytes && native.bytes <= mapping_bytes);
     const size_t rss_growth = std::min(bytes, mapping_bytes - rss.bytes);
-    const size_t native_growth =
-        std::min(bytes, mapping_bytes - native.bytes);
+    const size_t native_growth = std::min(bytes, mapping_bytes - native.bytes);
     if (!materialization_allowed_locked(rss_growth, native_growth,
                                         /*allow_at_limit=*/true))
       return false;
@@ -378,7 +377,7 @@ class ProcessRssBudget {
   }
 
   void release_projected_mapping_locked(size_t bytes,
-                                         const MappingProjection &projection) {
+                                        const MappingProjection &projection) {
     const auto rss = projection.rss.for_epoch(rss_epoch_);
     const auto native = projection.native.for_epoch(native_epoch_);
     assert(rss.unsampled <= rss.bytes && rss.bytes <= bytes);
@@ -406,7 +405,8 @@ class ProcessRssBudget {
                                         /*allow_at_limit=*/true))
       return false;
     if (limit() && bytes && (charge_rss || charge_native)) {
-      if (charge_rss) rss_materialized_ = add_saturated(rss_materialized_, bytes);
+      if (charge_rss)
+        rss_materialized_ = add_saturated(rss_materialized_, bytes);
       if (charge_native)
         native_materialized_ = add_saturated(native_materialized_, bytes);
       stamp = {rss_epoch_, native_reader_ ? native_epoch_ : 0};
@@ -448,8 +448,7 @@ class ProcessRssBudget {
                                           /*allow_at_limit=*/false);
   }
 
-  bool materialization_allowed_locked(size_t rss_bytes,
-                                      size_t native_bytes,
+  bool materialization_allowed_locked(size_t rss_bytes, size_t native_bytes,
                                       bool allow_at_limit) const {
     if (admission_paused()) {
       return false;
@@ -692,9 +691,9 @@ class ProcessRssBudget {
       const size_t footprint = add_saturated(
           add_saturated(native_estimate_.sample_, native_materialized_),
           pending_materializations_);
-      const size_t native_usage = add_saturated(
-          std::max(native_estimate_.usage(backing_), footprint),
-          pending_allocations_);
+      const size_t native_usage =
+          add_saturated(std::max(native_estimate_.usage(backing_), footprint),
+                        pending_allocations_);
       const size_t remaining =
           native_usage < native_cap ? native_cap - native_usage : 0;
       // Keep a reserve below the OS application limit even for mandatory work.
