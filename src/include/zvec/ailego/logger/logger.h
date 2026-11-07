@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdarg>
 #include <memory>
 #include <zvec/ailego/container/params.h>
@@ -128,44 +129,50 @@ class ZVEC_AILEGO_API LoggerBroker {
  public:
   //! Register Logger
   static Logger::Pointer Register(Logger::Pointer logger) {
-    Logger::Pointer ret = std::move(LoggerInstance());
-    LoggerInstance() = std::move(logger);
-    return ret;
+    return std::atomic_exchange_explicit(&LoggerInstance(), std::move(logger),
+                                         std::memory_order_acq_rel);
   }
 
   //! Register Logger with init params
   static int Register(Logger::Pointer logger, const ailego::Params &params) {
-    //! Cleanup the previous, before initizlizing the new one
-    if (LoggerInstance()) {
-      LoggerInstance()->cleanup();
-    }
-    LoggerInstance() = std::move(logger);
-    return LoggerInstance()->init(params);
+    auto previous = Register(nullptr);
+    if (previous) previous->cleanup();
+    const int result = logger->init(params);
+    Register(std::move(logger));
+    return result;
   }
 
   //! Unregister Logger
   static void Unregister() {
-    LoggerInstance() = nullptr;
+    std::atomic_store_explicit(&LoggerInstance(), Logger::Pointer{},
+                               std::memory_order_release);
   }
 
   //! Set Level of Logger
   static void SetLevel(int level) {
-    LoggerLevel() = level;
+    LoggerLevel().store(level, std::memory_order_relaxed);
   }
 
   //! Check if log level is enabled
   static bool IsLevelEnabled(int level) {
-    return LoggerLevel() <= level && LoggerInstance();
+    return LoggerLevel().load(std::memory_order_relaxed) <= level &&
+           std::atomic_load_explicit(&LoggerInstance(),
+                                     std::memory_order_acquire);
   }
 
   //! Log Message
   AILEGO_PRINTF_FORMAT(4, 5)
   static void Log(int level, const char *file, int line, const char *format,
                   ...) {
-    if (IsLevelEnabled(level)) {
+    if (LoggerLevel().load(std::memory_order_relaxed) > level) return;
+    // A concurrent shutdown can unregister the sink after the macro's level
+    // check. Own one snapshot through the entire call, including sink code.
+    auto logger =
+        std::atomic_load_explicit(&LoggerInstance(), std::memory_order_acquire);
+    if (logger) {
       va_list args;
       va_start(args, format);
-      LoggerInstance()->log(level, file, line, format, args);
+      logger->log(level, file, line, format, args);
       va_end(args);
     }
   }
@@ -176,18 +183,16 @@ class ZVEC_AILEGO_API LoggerBroker {
   LoggerBroker(LoggerBroker &&) = delete;
 
  private:
-  //! Accessors of logger state (Meyers singleton to avoid multiple
-  //! __cxa_atexit registrations when logger.cc is compiled into multiple
-  //! shared libraries via --whole-archive; the guard variable is shared
-  //! across all modules through .dynsym, ensuring initialization and
-  //! destruction happen exactly once)
-  static int &LoggerLevel() {
-    static int logger_level = Logger::LEVEL_WARN;
+  // Background maintenance can outlive normal static destruction. Keep the
+  // publication slot alive until process exit; Unregister still releases its
+  // sink as soon as the final in-flight log call has finished.
+  static std::atomic<int> &LoggerLevel() {
+    static std::atomic<int> logger_level{Logger::LEVEL_WARN};
     return logger_level;
   }
   static Logger::Pointer &LoggerInstance() {
-    static Logger::Pointer instance = MakeDefaultLogger();
-    return instance;
+    static auto *instance = new Logger::Pointer(MakeDefaultLogger());
+    return *instance;
   }
 
   //! Factory for the default logger used to initialize the Meyers singleton.

@@ -37,6 +37,7 @@ NATIVE_TARGETS = (
     "search_heap_test",
     "fts_column_indexer_test",
     "bitpacked_posting_list_test",
+    "logger_test",
 )
 PYTHON_TESTS = (
     "test_arrow_executor_budget.py",
