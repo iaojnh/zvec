@@ -13,6 +13,53 @@
 
 #define MIB ((size_t)1024 * 1024)
 
+static void test_owned_helpers(void) {
+  zvec_string_array_t *strings = zvec_string_array_create(1);
+  assert(strings);
+  zvec_string_array_add(strings, 0, "original");
+  const char *original = strings->strings[0].data;
+  assert(original && strcmp(original, "original") == 0);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  assert(zvec_string_create("denied") == NULL);
+  assert(zvec_float_array_create(4) == NULL);
+  assert(zvec_int64_array_create(4) == NULL);
+  zvec_string_array_add(strings, 0, "denied");
+  assert(strings->strings[0].data == original);
+  assert(strcmp(original, "original") == 0);
+  assert(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+
+  char *payload = (char *)malloc(MIB + 1);
+  assert(payload);
+  memset(payload, 'x', MIB);
+  payload[MIB] = '\0';
+  for (size_t i = 0; i < 20; ++i) {
+    payload[0] = (char)('a' + i);
+    zvec_string_array_add(strings, 0, payload);
+    assert(strings->strings[0].length == MIB);
+    assert(strings->strings[0].data[0] == payload[0]);
+  }
+  zvec_string_array_add(strings, 0, strings->strings[0].data);
+  assert(strcmp(strings->strings[0].data, payload) == 0);
+  free(payload);
+  zvec_string_array_destroy(strings);
+
+  const uint8_t binary[] = {1, 0, 2};
+  zvec_string_t *string = zvec_bin_create(binary, sizeof(binary));
+  assert(string && string->length == sizeof(binary));
+  assert(memcmp(string->data, binary, sizeof(binary)) == 0);
+  zvec_free_string(string);
+
+  zvec_mutable_byte_array_t *bytes = zvec_byte_array_create(8 * MIB);
+  assert(bytes && bytes->capacity == 8 * MIB && bytes->data[8 * MIB - 1] == 0);
+  assert(zvec_byte_array_create(8 * MIB) == NULL);
+  zvec_byte_array_destroy(bytes);
+  bytes = zvec_byte_array_create(8 * MIB);
+  assert(bytes);
+  zvec_byte_array_destroy(bytes);
+  assert(zvec_float_array_create(SIZE_MAX) == NULL);
+  assert(zvec_int64_array_create(SIZE_MAX) == NULL);
+}
+
 static void test_write_result_admission(void) {
   zvec_collection_schema_t *schema = zvec_collection_schema_create("status");
   zvec_field_schema_t *field =
@@ -67,6 +114,7 @@ int main(void) {
   assert(zvec_config_data_set_optimize_thread_count(config, 1) == ZVEC_OK);
   assert(zvec_initialize(config) == ZVEC_OK);
   zvec_config_data_destroy(config);
+  test_owned_helpers();
   test_write_result_admission();
 
   zvec_collection_schema_t *schema = zvec_collection_schema_create("budget");

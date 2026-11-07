@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "python_param.h"
+#include <algorithm>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <zvec/core/interface/constants.h>
@@ -2414,33 +2415,133 @@ void set_query_vector(QueryTarget &target, const FieldSchema &field_schema,
 
 namespace {
 
-struct PythonVectorSource {
-  py::object dense_source;
-  std::shared_ptr<detail::ResultMemoryAllowance::Lease> sparse_memory;
-};
-
 using QueryVectorLease = detail::ResultMemoryAllowance::Lease;
 
-std::shared_ptr<QueryVectorLease> admit_query_vector_copy(
-    const SearchQuery &query, DataType type) {
+struct PythonVectorSource {
+  py::object dense_source;
+  std::shared_ptr<QueryVectorLease> target_memory;
+  std::shared_ptr<QueryVectorLease> field_memory;
+  std::shared_ptr<QueryVectorLease> filter_memory;
+  std::shared_ptr<QueryVectorLease> output_fields_memory;
+  std::shared_ptr<QueryVectorLease> group_field_memory;
+};
+
+struct FtsMemory {
+  std::shared_ptr<QueryVectorLease> query_memory;
+  std::shared_ptr<QueryVectorLease> match_memory;
+};
+
+struct PythonFts : FtsMemory, FtsClause {};
+
+template <typename Estimate>
+std::shared_ptr<QueryVectorLease> admit_query_copy(Estimate estimate) {
   if (!ailego::MemoryLimitPool::get_instance().capacity()) return {};
   auto memory = std::make_shared<QueryVectorLease>(
       &detail::SharedResultMemoryAllowance(), false, 1024 * 1024);
   size_t admitted = 0;
   while (true) {
-    const auto view = query.target_.get_vector_view();
-    if (!view) break;
-    const size_t bytes =
-        FieldSchema::is_dense_vector_field(type)
-            ? detail::BindingMemoryBytes(1, view->query_vector_.size(), 512)
-            : detail::BindingMemoryBytes(
-                  view->sparse_indices_.size() / sizeof(uint32_t), 160, 512);
+    const size_t bytes = estimate();
     if (bytes <= admitted) break;
     py::gil_scoped_release release;
     memory->add(bytes - admitted);
     admitted = bytes;
   }
   return memory;
+}
+
+size_t query_text_copy_bytes(std::string_view text) {
+  if (text.empty()) return 0;
+  const bool ascii = std::all_of(text.begin(), text.end(),
+                                [](unsigned char byte) { return byte < 128; });
+  return detail::BindingMemoryBytes(text.size(), ascii ? 2 : 8, 256);
+}
+
+size_t output_fields_copy_bytes(
+    const std::optional<std::vector<std::string>> &fields) {
+  if (!fields) return 0;
+  size_t bytes = detail::BindingMemoryBytes(fields->size(), 2 * sizeof(void *), 256);
+  for (const auto &field : *fields)
+    bytes = detail::BindingMemoryBytes(1, query_text_copy_bytes(field), bytes);
+  return bytes;
+}
+
+template <typename Estimate, typename Convert>
+py::object copy_query_value(Estimate estimate, Convert convert) {
+  auto memory = admit_query_copy(estimate);
+  auto value = convert();
+  if (!memory || !memory->bytes()) return value;
+  return py::module_::import("zvec.model._budgeted_result")
+      .attr("_retain_field")(std::move(value), detail::result_memory_owner(memory));
+}
+
+py::object query_text_copy(const std::string &value) {
+  return copy_query_value([&] { return query_text_copy_bytes(value); },
+                          [&] { return py::str(value); });
+}
+
+void replace_query_text(std::string &value,
+                        std::shared_ptr<QueryVectorLease> &owner,
+                        py::handle source) {
+  const auto estimate = [&] {
+    return detail::PythonFetchInputs::utf8_size_bound(source)
+               ? detail::PythonFetchInputs::string_bytes(source)
+               : size_t{0};
+  };
+  auto memory = admit_query_copy(estimate);
+  if (!memory) (void)estimate();  // Validate the type even without a pool.
+  auto copy = detail::PythonFetchInputs::copy_string(source);
+  if (memory)
+    memory->retain_at_most(detail::BindingMemoryBytes(1, copy.capacity(), 32));
+  value = std::move(copy);
+  owner = std::move(memory);
+}
+
+template <typename Query>
+void replace_output_fields(Query &query, py::handle source) {
+  if (source.is_none()) {
+    query.output_fields_.reset();
+    query.output_fields_memory.reset();
+    return;
+  }
+  auto memory = std::make_shared<QueryVectorLease>(
+      &detail::SharedResultMemoryAllowance(), false, 1024 * 1024);
+  std::vector<std::string> fields;
+  detail::PythonFetchInputs::read_strings(source, &fields, *memory);
+  query.output_fields_ = std::move(fields);
+  query.output_fields_memory = std::move(memory);
+}
+
+py::object copy_output_fields(
+    const std::optional<std::vector<std::string>> &fields) {
+  return copy_query_value([&] { return output_fields_copy_bytes(fields); },
+                          [&] { return py::cast(fields); });
+}
+
+size_t fts_copy_bytes(const FtsClause &fts) {
+  return detail::BindingMemoryBytes(
+      1, fts.query_string_.size(), detail::BindingMemoryBytes(
+                                      1, fts.match_string_.size(), 256));
+}
+
+PythonFts copy_fts(const FtsClause &fts,
+                   const std::shared_ptr<QueryVectorLease> &memory) {
+  PythonFts copy;
+  static_cast<FtsClause &>(copy) = fts;
+  if (!fts.query_string_.empty()) copy.query_memory = memory;
+  if (!fts.match_string_.empty()) copy.match_memory = memory;
+  return copy;
+}
+
+std::shared_ptr<QueryVectorLease> admit_query_vector_copy(
+    const SearchQuery &query, DataType type) {
+  return admit_query_copy([&] {
+    const auto view = query.target_.get_vector_view();
+    if (!view) return size_t{0};
+    return FieldSchema::is_dense_vector_field(type)
+               ? detail::BindingMemoryBytes(1, view->query_vector_.size(), 512)
+               : detail::BindingMemoryBytes(
+                     view->sparse_indices_.size() / sizeof(uint32_t), 160, 512);
+  });
 }
 
 py::array retain_query_array(py::array value,
@@ -2470,6 +2571,23 @@ py::object retain_query_sparse(py::dict value,
 template <typename Query>
 struct PythonVectorQuery : PythonVectorSource, Query {};
 
+using PythonSearchQuery = PythonVectorQuery<SearchQuery>;
+using PythonGroupQuery = PythonVectorQuery<GroupByVectorQuery>;
+
+void replace_fts(PythonSearchQuery &query, py::handle source) {
+  std::shared_ptr<QueryVectorLease> memory;
+  if (source.is_none()) {
+    query.target_.clause_ = VectorClause{};
+  } else {
+    const auto &fts = source.cast<const FtsClause &>();
+    memory = admit_query_copy([&] { return fts_copy_bytes(fts); });
+    auto copy = fts;
+    query.target_.clause_ = std::move(copy);
+  }
+  auto previous_source = std::move(query.dense_source);
+  query.target_memory = std::move(memory);
+}
+
 template <typename Query>
 void replace_query_vector(PythonVectorQuery<Query> &query,
                           const FieldSchema &schema, const py::object &source) {
@@ -2493,27 +2611,124 @@ void replace_query_vector(PythonVectorQuery<Query> &query,
   auto previous_source = std::move(query.dense_source);
   query.dense_source =
       query.target_.get_vector_view_clause() ? source : py::object{};
-  query.sparse_memory = std::move(memory);
+  query.target_memory = std::move(memory);
+}
+
+void retain_state_fields(py::tuple &state,
+                         const std::shared_ptr<QueryVectorLease> &memory,
+                         std::initializer_list<size_t> fields) {
+  if (!memory || !memory->bytes()) return;
+  auto owner = detail::result_memory_owner(memory);
+  auto wrap = py::module_::import("zvec.model._budgeted_result")
+                  .attr("_retain_field");
+  for (size_t field : fields) {
+    auto value = wrap(state[field], owner);
+    // The tuple is still private to this producer.
+    if (PyTuple_SetItem(state.ptr(), field, value.release().ptr()) != 0)
+      throw py::error_already_set();
+  }
+}
+
+py::tuple search_query_state(const SearchQuery &query) {
+  auto memory = admit_query_copy([&] {
+    size_t bytes = detail::BindingMemoryBytes(
+        1, query_text_copy_bytes(query.target_.field_name_), 512);
+    bytes = detail::BindingMemoryBytes(1, query_text_copy_bytes(query.filter_),
+                                       bytes);
+    bytes = detail::BindingMemoryBytes(
+        1, output_fields_copy_bytes(query.output_fields_), bytes);
+    if (auto vector = query.target_.get_vector_view()) {
+      // Python bytes and the owner-backed bytes can coexist briefly.
+      bytes = detail::BindingMemoryBytes(2, vector->query_vector_.size(), bytes);
+      bytes = detail::BindingMemoryBytes(2, vector->sparse_indices_.size(), bytes);
+      return detail::BindingMemoryBytes(2, vector->sparse_values_.size(), bytes);
+    }
+    return detail::BindingMemoryBytes(1, fts_copy_bytes(*query.target_.get_fts_clause()),
+                                       bytes);
+  });
+  const auto vector = query.target_.get_vector_view().value_or(VectorViewClause{});
+  const auto *fts = query.target_.get_fts_clause();
+  const auto bytes = [](std::string_view value) {
+    return py::bytes(value.data(), value.size());
+  };
+  py::tuple state = py::make_tuple(
+      query.topk_, query.target_.field_name_, bytes(vector.query_vector_),
+      bytes(vector.sparse_indices_), bytes(vector.sparse_values_), query.filter_,
+      query.include_vector_, query.output_fields_,
+      query.target_.query_params_ ? py::cast(query.target_.query_params_) : py::none(),
+      fts ? py::cast(copy_fts(*fts, memory)) : py::none());
+  retain_state_fields(state, memory, {1, 2, 3, 4, 5, 7});
+  return state;
+}
+
+PythonSearchQuery restore_search_query(py::tuple state) {
+  if (state.size() != 10)
+    throw std::runtime_error("Invalid pickle data for _SearchQuery");
+  PythonSearchQuery query;
+  query.topk_ = state[0].cast<int>();
+  replace_query_text(query.target_.field_name_, query.field_memory, state[1]);
+  if (!state[9].is_none()) {
+    replace_fts(query, state[9]);
+  } else {
+    const auto estimate = [&] {
+      size_t bytes = 128;
+      for (size_t i : {2, 3, 4})
+        bytes = detail::BindingMemoryBytes(
+            1, detail::PythonFetchInputs::string_bytes(state[i]), bytes);
+      return bytes;
+    };
+    query.target_memory = admit_query_copy(estimate);
+    if (!query.target_memory) (void)estimate();
+    // Accept the legacy Unicode vector slots as well as binary pickle slots.
+    query.target_.clause_ = VectorClause{
+        detail::PythonFetchInputs::copy_string(state[2]),
+        detail::PythonFetchInputs::copy_string(state[3]),
+        detail::PythonFetchInputs::copy_string(state[4])};
+  }
+  replace_query_text(query.filter_, query.filter_memory, state[5]);
+  query.include_vector_ = state[6].cast<bool>();
+  replace_output_fields(query, state[7]);
+  if (!state[8].is_none())
+    query.target_.query_params_ = state[8].cast<QueryParams::Ptr>();
+  return query;
 }
 
 }  // namespace
 
 void ZVecPyParams::bind_vector_query(py::module_ &m) {
   // bind Fts
-  py::class_<FtsClause>(m, "_Fts")
+  py::class_<FtsClause>(m, "_FtsValue");
+  py::class_<PythonFts, FtsClause>(m, "_Fts", py::multiple_inheritance())
       .def(py::init<>())
-      .def_readwrite("query_string", &FtsClause::query_string_)
-      .def_readwrite("match_string", &FtsClause::match_string_)
+      .def_property(
+          "query_string",
+          [](const FtsClause &fts) { return query_text_copy(fts.query_string_); },
+          [](PythonFts &fts, py::handle source) {
+            replace_query_text(fts.query_string_, fts.query_memory, source);
+          })
+      .def_property(
+          "match_string",
+          [](const FtsClause &fts) { return query_text_copy(fts.match_string_); },
+          [](PythonFts &fts, py::handle source) {
+            replace_query_text(fts.match_string_, fts.match_memory, source);
+          })
       .def(py::pickle(
           [](const FtsClause &self) {
-            return py::make_tuple(self.query_string_, self.match_string_);
+            auto memory = admit_query_copy([&] {
+              return detail::BindingMemoryBytes(
+                  1, query_text_copy_bytes(self.query_string_),
+                  query_text_copy_bytes(self.match_string_));
+            });
+            auto state = py::make_tuple(self.query_string_, self.match_string_);
+            retain_state_fields(state, memory, {0, 1});
+            return state;
           },
           [](py::tuple t) {
             if (t.size() != 2)
               throw std::runtime_error("Invalid pickle data for Fts");
-            FtsClause obj{};
-            obj.query_string_ = t[0].cast<std::string>();
-            obj.match_string_ = t[1].cast<std::string>();
+            PythonFts obj;
+            replace_query_text(obj.query_string_, obj.query_memory, t[0]);
+            replace_query_text(obj.match_string_, obj.match_memory, t[1]);
             return obj;
           }));
 
@@ -2529,7 +2744,6 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
 
   // _SearchQuery is the Python class name; it wraps the
   // single-target SearchQuery so external Python code keeps working unchanged.
-  using PythonSearchQuery = PythonVectorQuery<SearchQuery>;
   py::class_<SearchQuery>(m, "_SearchQueryValue");
   py::class_<PythonSearchQuery, SearchQuery>(m, "_SearchQuery",
                                            py::multiple_inheritance())
@@ -2538,11 +2752,15 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
       .def_readwrite("topk", &SearchQuery::topk_)
       .def_property(
           "field_name",
-          [](const SearchQuery &s) { return s.target_.field_name_; },
-          [](SearchQuery &s, std::string v) {
-            s.target_.field_name_ = std::move(v);
+          [](const SearchQuery &s) { return query_text_copy(s.target_.field_name_); },
+          [](PythonSearchQuery &s, py::handle value) {
+            replace_query_text(s.target_.field_name_, s.field_memory, value);
           })
-      .def_readwrite("filter", &SearchQuery::filter_)
+      .def_property(
+          "filter", [](const SearchQuery &s) { return query_text_copy(s.filter_); },
+          [](PythonSearchQuery &s, py::handle value) {
+            replace_query_text(s.filter_, s.filter_memory, value);
+          })
       .def_readwrite("include_vector", &SearchQuery::include_vector_)
       .def_property(
           "query_params",
@@ -2550,26 +2768,21 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
           [](SearchQuery &s, QueryParams::Ptr p) {
             s.target_.query_params_ = std::move(p);
           })
-      .def_readwrite("output_fields", &SearchQuery::output_fields_)
+      .def_property(
+          "output_fields",
+          [](const SearchQuery &s) { return copy_output_fields(s.output_fields_); },
+          &replace_output_fields<PythonSearchQuery>)
       .def_property(
           "fts",
           [](const SearchQuery &self) -> py::object {
-            const auto *fc = self.target_.get_fts_clause();
-            if (fc != nullptr) {
-              return py::cast(*fc);
-            }
-            return py::none();
+            auto memory = admit_query_copy([&] {
+              const auto *fts = self.target_.get_fts_clause();
+              return fts ? fts_copy_bytes(*fts) : 0;
+            });
+            const auto *fts = self.target_.get_fts_clause();
+            return fts ? py::cast(copy_fts(*fts, memory)) : py::none();
           },
-          [](PythonSearchQuery &self, const py::object &obj) {
-            if (obj.is_none()) {
-              // Clearing FTS resets the target to an empty vector clause.
-              self.target_.clause_ = VectorClause{};
-            } else {
-              self.target_.clause_ = obj.cast<FtsClause>();
-            }
-            auto previous_source = std::move(self.dense_source);
-            self.sparse_memory.reset();
-          })
+          &replace_fts)
       // vector
       .def(
           "set_vector",
@@ -2698,66 +2911,42 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
                                  field_schema.name());
           },
           py::arg("field_schema"))
-      .def(py::pickle(
-          [](const SearchQuery &self) {
-            auto vv = self.target_.get_vector_view();
-            const auto *fc = self.target_.get_fts_clause();
-            return py::make_tuple(
-                self.topk_, self.target_.field_name_,
-                vv ? std::string(vv->query_vector_) : std::string(),
-                vv ? std::string(vv->sparse_indices_) : std::string(),
-                vv ? std::string(vv->sparse_values_) : std::string(),
-                self.filter_, self.include_vector_, self.output_fields_,
-                self.target_.query_params_
-                    ? py::cast(self.target_.query_params_)
-                    : py::none(),
-                fc ? py::cast(*fc) : py::none());
-          },
-          [](py::tuple t) {
-            if (t.size() != 10)
-              throw std::runtime_error("Invalid pickle data for _SearchQuery");
-
-            PythonSearchQuery obj{};
-            obj.topk_ = t[0].cast<int>();
-            obj.target_.field_name_ = t[1].cast<std::string>();
-            // A vector clause and an FTS clause are mutually exclusive in the
-            // variant target; restore whichever the pickle carried.
-            if (!t[9].is_none()) {
-              obj.target_.clause_ = t[9].cast<FtsClause>();
-            } else {
-              obj.target_.clause_ = VectorClause{t[2].cast<std::string>(),
-                                                 t[3].cast<std::string>(),
-                                                 t[4].cast<std::string>()};
-            }
-            obj.filter_ = t[5].cast<std::string>();
-            obj.include_vector_ = t[6].cast<bool>();
-
-            if (!t[7].is_none()) {
-              obj.output_fields_ = t[7].cast<std::vector<std::string>>();
-            }
-            if (!t[8].is_none()) {
-              obj.target_.query_params_ = t[8].cast<QueryParams::Ptr>();
-            }
-            return obj;
-          }));
+      .def(py::pickle(&search_query_state, &restore_search_query));
 
   // _GroupByVectorQuery
-  using PythonGroupQuery = PythonVectorQuery<GroupByVectorQuery>;
   py::class_<GroupByVectorQuery>(m, "_GroupByVectorQueryValue");
   py::class_<PythonGroupQuery, GroupByVectorQuery>(
       m, "_GroupByVectorQuery", py::multiple_inheritance())
       .def(py::init<>())
       .def_property(
           "field_name",
-          [](const GroupByVectorQuery &q) { return q.target_.field_name_; },
-          [](GroupByVectorQuery &q, std::string v) {
-            q.target_.field_name_ = std::move(v);
+          [](const GroupByVectorQuery &q) {
+            return query_text_copy(q.target_.field_name_);
+          },
+          [](PythonGroupQuery &q, py::handle value) {
+            replace_query_text(q.target_.field_name_, q.field_memory, value);
           })
-      .def_readwrite("filter", &GroupByVectorQuery::filter_)
+      .def_property(
+          "filter",
+          [](const GroupByVectorQuery &q) { return query_text_copy(q.filter_); },
+          [](PythonGroupQuery &q, py::handle value) {
+            replace_query_text(q.filter_, q.filter_memory, value);
+          })
       .def_readwrite("include_vector", &GroupByVectorQuery::include_vector_)
-      .def_readwrite("output_fields", &GroupByVectorQuery::output_fields_)
-      .def_readwrite("group_by_field_name",
-                     &GroupByVectorQuery::group_by_field_name_)
+      .def_property(
+          "output_fields",
+          [](const GroupByVectorQuery &q) {
+            return copy_output_fields(q.output_fields_);
+          },
+          &replace_output_fields<PythonGroupQuery>)
+      .def_property(
+          "group_by_field_name",
+          [](const GroupByVectorQuery &q) {
+            return query_text_copy(q.group_by_field_name_);
+          },
+          [](PythonGroupQuery &q, py::handle value) {
+            replace_query_text(q.group_by_field_name_, q.group_field_memory, value);
+          })
       .def_readwrite("group_count", &GroupByVectorQuery::group_count_)
       .def_readwrite("topk_per_group", &GroupByVectorQuery::topk_per_group_)
       .def_property(

@@ -59,10 +59,10 @@ class PythonFetchInputs {
       }
       return;
     }
-    read_strings(ids, &pks);
+    read_strings(ids, &pks, memory_);
     if (!fields.is_none()) {
       output_fields.emplace();
-      read_strings(fields, &*output_fields);
+      read_strings(fields, &*output_fields, memory_);
     }
   }
 
@@ -71,7 +71,6 @@ class PythonFetchInputs {
     return FetchMemoryBytes(utf8_size_bound(value), 2, 64);
   }
 
- private:
   static size_t utf8_size_bound(pybind11::handle value) {
     if (PyUnicode_Check(value.ptr())) {
       const auto length = PyUnicode_GetLength(value.ptr());
@@ -92,7 +91,6 @@ class PythonFetchInputs {
     throw pybind11::type_error("Fetch IDs and output fields must be strings");
   }
 
- public:
   static std::string copy_string(pybind11::handle value) {
     if (PyUnicode_Check(value.ptr())) {
       if (PyUnicode_IS_ASCII(value.ptr())) {
@@ -114,13 +112,9 @@ class PythonFetchInputs {
             static_cast<size_t>(PyByteArray_GET_SIZE(value.ptr()))};
   }
 
- private:
-  void admit(size_t bytes) {
-    pybind11::gil_scoped_release release;
-    memory_.add(bytes);
-  }
-
-  void read_strings(pybind11::handle source, std::vector<std::string> *out) {
+  static void read_strings(pybind11::handle source,
+                           std::vector<std::string> *out,
+                           ResultMemoryAllowance::Lease &memory) {
     if (PyUnicode_Check(source.ptr()) || PyBytes_Check(source.ptr()) ||
         PyByteArray_Check(source.ptr()))
       throw pybind11::type_error("Fetch expects a sequence of strings");
@@ -159,7 +153,7 @@ class PythonFetchInputs {
           backing = std::max(backing, backing_admitted);
           {
             pybind11::gil_scoped_release release;
-            memory_.add(needed - admitted, backing - backing_admitted);
+            memory.add(needed - admitted, backing - backing_admitted);
           }
           admitted = needed;
           backing_admitted = backing;
@@ -183,13 +177,15 @@ class PythonFetchInputs {
         const size_t needed =
             FetchMemoryBytes(1, string_bytes(held), kSlotBytes);
         if (needed <= admitted) break;
-        admit(needed - admitted);
+        pybind11::gil_scoped_release release;
+        memory.add(needed - admitted);
         admitted = needed;
       }
       out->push_back(copy_string(held));
     }
   }
 
+ private:
   ResultMemoryAllowance::Lease memory_;
 
  public:

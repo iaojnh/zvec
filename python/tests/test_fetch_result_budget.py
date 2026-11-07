@@ -497,6 +497,101 @@ def test_native_query_vector_replacement_releases_budget(tmp_path):
     run_worker("query_vector_replacement", tmp_path, "VECTOR_FP32", False, 8, 1)
 
 
+def hold_query_copies(make_copy):
+    copies = []
+    for _ in range(24):
+        try:
+            copies.append(make_copy())
+        except MemoryError:
+            assert copies
+            return copies
+    pytest.fail("Native query copies must retain their admission")
+
+
+def verify_query_pickle_vectors(path, kind, mmap, dimension, count):
+    import numpy as np
+    from zvec._zvec.param import _SearchQuery
+
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    field = zvec.VectorSchema(
+        "vector", zvec.DataType.VECTOR_FP32, dimension=262_144
+    )._get_object()
+    vector = np.full(262_144, -1.25, dtype=np.float32)
+    query = _SearchQuery()
+    query.set_vector(field, vector)
+    query.field_name = "vector"
+    query.output_fields = ["颜色"]
+    restored = pickle.loads(pickle.dumps(query))
+    assert restored.output_fields == ["颜色"]
+    assert np.array_equal(restored.get_vector(field), vector)
+    del restored
+
+    held = hold_query_copies(lambda: query.__getstate__()[2])
+    assert isinstance(held[0], bytes) and len(held[0]) == vector.nbytes
+    held.clear()
+    state = query.__getstate__()
+
+    def restore(state):
+        restored = _SearchQuery.__new__(_SearchQuery)
+        restored.__setstate__(state)
+        return restored
+
+    held = hold_query_copies(lambda: restore(state))
+    for copy in held:
+        copy.set_vector(field, vector)
+    assert np.array_equal(restore(state).get_vector(field), vector)
+
+    legacy_state = list(state)
+    legacy_state[2] = "\0" * vector.nbytes
+    legacy_state[3] = legacy_state[4] = ""
+    held.clear()
+    assert not np.any(restore(tuple(legacy_state)).get_vector(field))
+
+
+def verify_query_pickle_fts(path, kind, mmap, dimension, count):
+    from zvec._zvec.param import _Fts, _GroupByVectorQuery, _SearchQuery
+
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    text = "search " * (128 * 1024)
+    fts = _Fts()
+    fts.match_string = text
+    query = _SearchQuery()
+    query.fts = fts
+    restored = pickle.loads(pickle.dumps(query))
+    assert restored.fts.match_string == text
+    del restored
+
+    held = hold_query_copies(lambda: query.__getstate__()[9])
+    held.clear()
+    assert query.__getstate__()[9].match_string == text
+
+    state = (text, "")
+
+    def restore_fts():
+        restored = _Fts.__new__(_Fts)
+        restored.__setstate__(state)
+        return restored
+
+    held = hold_query_copies(restore_fts)
+    for copy in held:
+        copy.query_string = ""
+    assert restore_fts().query_string == text
+
+    group = _GroupByVectorQuery()
+    for native in (query, group):
+        native.filter = "x"
+        with pytest.raises(MemoryError):
+            native.filter = text * 16
+        assert native.filter == "x"
+        native.output_fields = (field for field in ["中文"])
+        assert native.output_fields == ["中文"]
+
+
+@pytest.mark.parametrize("mode", ["query_pickle_vectors", "query_pickle_fts"])
+def test_native_query_pickle_holds_budget(tmp_path, mode):
+    run_worker(mode, tmp_path, "VECTOR_FP32", False, 8, 1)
+
+
 def verify_exception(path, kind, mmap, dimension, count):
     from zvec.model import _budgeted_result
 
@@ -843,6 +938,8 @@ if __name__ == "__main__":
         "multi_query_weights": verify_multi_query_weights,
         "multi_query_routes": verify_multi_query_routes,
         "query_vector_replacement": verify_query_vector_replacement,
+        "query_pickle_vectors": verify_query_pickle_vectors,
+        "query_pickle_fts": verify_query_pickle_fts,
         "exception": verify_exception,
         "inputs": verify_fetch_inputs,
         "iterables": verify_fetch_iterables,

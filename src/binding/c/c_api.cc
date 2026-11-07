@@ -233,6 +233,22 @@ int zvec_get_version_patch(void) {
 // String management functions implementation
 // =============================================================================
 
+template <typename T>
+static auto allocate_c_result_header() {
+  return std::unique_ptr<T, decltype(&zvec_free)>(
+      static_cast<T *>(zvec::detail::AllocateCResult(sizeof(T))), &zvec_free);
+}
+
+static zvec_string_t *create_c_string(std::string_view value) {
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate string",
+      auto result = allocate_c_result_header<zvec_string_t>();
+      result->data = zvec::detail::CopyCResultString(value);
+      result->length = value.size();
+      result->capacity = value.size() + 1;
+      return result.release();)
+}
+
 zvec_string_t *zvec_string_create(const char *str) {
   if (!str) {
     SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
@@ -240,27 +256,7 @@ zvec_string_t *zvec_string_create(const char *str) {
     return nullptr;
   }
 
-  size_t len = strlen(str);
-  zvec_string_t *zstr = static_cast<zvec_string_t *>(malloc(sizeof(zvec_string_t)));
-  if (!zstr) {
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for zvec_string_t");
-    return nullptr;
-  }
-
-  char *data_buffer = static_cast<char *>(malloc(len + 1));
-  if (!data_buffer) {
-    zvec_free(zstr);
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for string data");
-    return nullptr;
-  }
-
-  memcpy(data_buffer, str, len + 1);
-  zstr->data = data_buffer;
-  zstr->length = len;
-  zstr->capacity = len + 1;
-  return zstr;
+  return create_c_string(str);
 }
 
 zvec_string_t *zvec_string_create_from_view(const zvec_string_view_t *view) {
@@ -270,28 +266,7 @@ zvec_string_t *zvec_string_create_from_view(const zvec_string_view_t *view) {
     return nullptr;
   }
 
-  zvec_string_t *zstr = static_cast<zvec_string_t *>(malloc(sizeof(zvec_string_t)));
-  if (!zstr) {
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for zvec_string_t");
-    return nullptr;
-  }
-
-  char *data_buffer = static_cast<char *>(malloc(view->length + 1));
-  if (!data_buffer) {
-    zvec_free(zstr);
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for string data");
-    return nullptr;
-  }
-
-  memcpy(data_buffer, view->data, view->length);
-  data_buffer[view->length] = '\0';
-  zstr->data = data_buffer;
-  zstr->length = view->length;
-  zstr->capacity = view->length + 1;
-
-  return zstr;
+  return create_c_string({view->data, view->length});
 }
 
 zvec_string_t *zvec_bin_create(const uint8_t *data, size_t length) {
@@ -301,28 +276,7 @@ zvec_string_t *zvec_bin_create(const uint8_t *data, size_t length) {
     return nullptr;
   }
 
-  zvec_string_t *zstr = static_cast<zvec_string_t *>(malloc(sizeof(zvec_string_t)));
-  if (!zstr) {
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for zvec_string_t");
-    return nullptr;
-  }
-
-  char *data_buffer = static_cast<char *>(malloc(length + 1));
-  if (!data_buffer) {
-    zvec_free(zstr);
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for binary data");
-    return nullptr;
-  }
-
-  memcpy(data_buffer, data, length);
-  data_buffer[length] = '\0';
-  zstr->data = data_buffer;
-  zstr->length = length;
-  zstr->capacity = length + 1;
-
-  return zstr;
+  return create_c_string({reinterpret_cast<const char *>(data), length});
 }
 
 zvec_string_t *zvec_string_copy(const zvec_string_t *str) {
@@ -1009,19 +963,24 @@ void zvec_free_string(zvec_string_t *str) {
  * @param count Number of strings in the array
  * @return New string array, or NULL on failure
  */
-zvec_string_array_t *zvec_string_array_create(size_t count) {
-  if (count > SIZE_MAX / sizeof(zvec_string_t)) return nullptr;
-
-  zvec_string_array_t *array = (zvec_string_array_t *)malloc(sizeof(zvec_string_array_t));
-  if (!array) return nullptr;
+static zvec_string_array_t *create_c_string_array(size_t count) {
+  auto array = allocate_c_result_header<zvec_string_array_t>();
+  array->strings = static_cast<zvec_string_t *>(
+      zvec::detail::AllocateCResultArray(count, sizeof(zvec_string_t)));
   array->count = count;
-  array->strings = (zvec_string_t *)malloc(sizeof(zvec_string_t) * count);
-  if (!array->strings) {
-    zvec_free(array);
-    return nullptr;
-  }
-  memset(array->strings, 0, sizeof(zvec_string_t) * count);
-  return array;
+  return array.release();
+}
+
+zvec_string_array_t *zvec_string_array_create(size_t count) {
+  ZVEC_TRY_RETURN_NULL("Failed to allocate string array",
+                       return create_c_string_array(count);)
+}
+
+static void replace_c_array_string(zvec_string_t &slot, std::string_view value) {
+  // Copy before releasing the previous slot, including when value aliases it.
+  auto *data = zvec::detail::CopyCResultString(value);
+  zvec_free(const_cast<char *>(slot.data));
+  slot = {data, value.size(), value.size() + 1};
 }
 
 /**
@@ -1035,12 +994,14 @@ zvec_string_array_t *zvec_string_array_create_from_strings(const char **strings,
   if (!strings || count == 0) {
     return nullptr;
   }
-  zvec_string_array_t *array = zvec_string_array_create(count);
-  if (!array) return nullptr;
-  for (size_t i = 0; i < count; ++i) {
-    zvec_string_array_add(array, i, strings[i]);
-  }
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to copy string array",
+      std::unique_ptr<zvec_string_array_t, decltype(&zvec_string_array_destroy)>
+          array(create_c_string_array(count), &zvec_string_array_destroy);
+      for (size_t i = 0; i < count; ++i) {
+        if (strings[i]) replace_c_array_string(array->strings[i], strings[i]);
+      }
+      return array.release();)
 }
 
 /**
@@ -1053,13 +1014,14 @@ void zvec_string_array_add(zvec_string_array_t *array, size_t idx,
                            const char *str) {
   if (!array || !str) return;
   if (idx >= array->count) return;
-  size_t len = strlen(str);
-  char *buf = (char *)malloc(len + 1);
-  if (!buf) return;
-  memcpy(buf, str, len + 1);
-  array->strings[idx].data = buf;
-  array->strings[idx].length = len;
-  array->strings[idx].capacity = len + 1;
+  try {
+    replace_c_array_string(array->strings[idx], str);
+  } catch (const std::bad_alloc &) {
+    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
+                   "Failed to replace string array entry");
+  } catch (const std::exception &error) {
+    SET_LAST_ERROR(ZVEC_ERROR_INTERNAL_ERROR, error.what());
+  }
 }
 
 /**
@@ -1085,20 +1047,14 @@ void zvec_string_array_destroy(zvec_string_array_t *array) {
  */
 // Byte array helper functions
 zvec_mutable_byte_array_t *zvec_byte_array_create(size_t capacity) {
-  zvec_mutable_byte_array_t *array =
-      (zvec_mutable_byte_array_t *)malloc(sizeof(zvec_mutable_byte_array_t));
-  if (!array) return nullptr;
-
-  array->data = (uint8_t *)malloc(capacity);
-  if (!array->data) {
-    zvec_free(array);
-    return nullptr;
-  }
-
-  array->length = 0;
-  array->capacity = capacity;
-  memset(array->data, 0, capacity);
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate byte array",
+      auto array = allocate_c_result_header<zvec_mutable_byte_array_t>();
+      array->data = static_cast<uint8_t *>(
+          zvec::detail::AllocateCResultArray(capacity, sizeof(uint8_t)));
+      array->length = 0;
+      array->capacity = capacity;
+      return array.release();)
 }
 
 /**
@@ -1120,18 +1076,13 @@ void zvec_byte_array_destroy(zvec_mutable_byte_array_t *array) {
  */
 // Float array helper functions
 zvec_float_array_t *zvec_float_array_create(size_t count) {
-  zvec_float_array_t *array = (zvec_float_array_t *)malloc(sizeof(zvec_float_array_t));
-  if (!array) return nullptr;
-
-  array->data = (const float *)malloc(sizeof(float) * count);
-  if (!array->data) {
-    zvec_free(array);
-    return nullptr;
-  }
-
-  array->length = count;
-  memset((void *)array->data, 0, sizeof(float) * count);
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate float array",
+      auto array = allocate_c_result_header<zvec_float_array_t>();
+      array->data = static_cast<float *>(
+          zvec::detail::AllocateCResultArray(count, sizeof(float)));
+      array->length = count;
+      return array.release();)
 }
 
 /**
@@ -1148,18 +1099,13 @@ void zvec_float_array_destroy(zvec_float_array_t *array) {
 
 // Int64 array helper functions
 zvec_int64_array_t *zvec_int64_array_create(size_t count) {
-  zvec_int64_array_t *array = (zvec_int64_array_t *)malloc(sizeof(zvec_int64_array_t));
-  if (!array) return nullptr;
-
-  array->data = (const int64_t *)malloc(sizeof(int64_t) * count);
-  if (!array->data) {
-    zvec_free(array);
-    return nullptr;
-  }
-
-  array->length = count;
-  memset((void *)array->data, 0, sizeof(int64_t) * count);
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate int64 array",
+      auto array = allocate_c_result_header<zvec_int64_array_t>();
+      array->data = static_cast<int64_t *>(
+          zvec::detail::AllocateCResultArray(count, sizeof(int64_t)));
+      array->length = count;
+      return array.release();)
 }
 
 void zvec_int64_array_destroy(zvec_int64_array_t *array) {
@@ -2109,6 +2055,7 @@ zvec_error_code_t zvec_index_params_set_fts_params(
 zvec_error_code_t zvec_index_params_get_fts_params(
     const zvec_index_params_t *params, const char **out_tokenizer_name,
     zvec_string_array_t **out_filters, const char **out_extra_params) {
+  if (out_filters) *out_filters = nullptr;
   if (!params) {
     SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
                    "Invalid params or not FTS index type");
@@ -2128,17 +2075,15 @@ zvec_error_code_t zvec_index_params_get_fts_params(
     *out_extra_params = fts_params->extra_params().c_str();
   }
   if (out_filters) {
-    const auto &filters = fts_params->filters();
-    zvec_string_array_t *arr = zvec_string_array_create(filters.size());
-    if (!arr) {
-      SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                     "Failed to allocate filters string array");
-      return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-    }
-    for (size_t i = 0; i < filters.size(); ++i) {
-      zvec_string_array_add(arr, i, filters[i].c_str());
-    }
-    *out_filters = arr;
+    ZVEC_TRY_RETURN_ERROR(
+        "Failed to copy filters string array",
+        const auto &filters = fts_params->filters();
+        std::unique_ptr<zvec_string_array_t, decltype(&zvec_string_array_destroy)>
+            array(create_c_string_array(filters.size()), &zvec_string_array_destroy);
+        for (size_t i = 0; i < filters.size(); ++i)
+          replace_c_array_string(array->strings[i], filters[i]);
+        *out_filters = array.release();
+        return ZVEC_OK;)
   }
   return ZVEC_OK;
 }

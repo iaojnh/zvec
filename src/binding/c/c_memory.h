@@ -7,6 +7,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include "db/common/binding_memory.h"
 #include "db/common/result_memory_allowance.h"
@@ -101,10 +102,11 @@ inline void *AllocateCResultArray(size_t count, size_t width) {
   return data;
 }
 
-inline char *CopyCResultString(const std::string &value) {
+inline char *CopyCResultString(std::string_view value) {
   auto *data = static_cast<char *>(
       AllocateCResult(BindingMemoryBytes(1, value.size(), 1)));
-  std::memcpy(data, value.c_str(), value.size() + 1);
+  if (!value.empty()) std::memcpy(data, value.data(), value.size());
+  data[value.size()] = '\0';
   return data;
 }
 

@@ -207,19 +207,9 @@ void set_multi_fields(PythonMultiQuery &query, py::object source) {
     query.fields.reset();
     return;
   }
-  if (PyUnicode_Check(source.ptr()) || PyBytes_Check(source.ptr()) ||
-      PyByteArray_Check(source.ptr()))
-    throw py::type_error("Output fields must be a sequence of strings");
   auto next = new_query_lease();
   std::vector<std::string> values;
-  for (auto item : py::reinterpret_borrow<py::iterable>(source)) {
-    auto held = py::reinterpret_borrow<py::object>(item);
-    admit_current(*next, [&] {
-      return detail::BindingMemoryBytes(
-          1, detail::PythonFetchInputs::string_bytes(held), 3 * sizeof(std::string));
-    });
-    values.push_back(detail::PythonFetchInputs::copy_string(held));
-  }
+  detail::PythonFetchInputs::read_strings(source, &values, *next);
   query.output_fields = std::move(values);
   query.fields = std::move(next);
 }
