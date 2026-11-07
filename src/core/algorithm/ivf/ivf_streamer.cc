@@ -154,27 +154,26 @@ int IVFStreamer::unload() {
   return 0;
 }
 
-int IVFStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                                Context::Pointer &context) const {
+int IVFStreamer::do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                              Context::Pointer &context) const {
   return search_bf_impl(query, qmeta, 1, context);
 }
 
-int IVFStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                                uint32_t count,
-                                Context::Pointer &context) const {
+int IVFStreamer::do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                              uint32_t count, Context::Pointer &context) const {
   return search_bf(query, qmeta, count, context, nullptr);
 }
 
-int IVFStreamer::search_bf_by_keys_impl(const void *query,
-                                        const std::vector<uint64_t> &keys,
-                                        const IndexQueryMeta &qmeta,
-                                        Context::Pointer &context) const {
+int IVFStreamer::do_search_bf_by_keys(const void *query,
+                                      const std::vector<uint64_t> &keys,
+                                      const IndexQueryMeta &qmeta,
+                                      Context::Pointer &context) const {
   // The generic IndexRunner adapter copies keys into a batch. This search is
   // synchronous, so borrow the caller-owned list through the complete scan.
   return search_bf(query, qmeta, 1, context, nullptr, &keys);
 }
 
-int IVFStreamer::search_bf_by_p_keys_impl(
+int IVFStreamer::do_search_bf_by_p_keys(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
@@ -229,7 +228,9 @@ int IVFStreamer::search_bf(const void *query, const IndexQueryMeta &qmeta,
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
-    const auto *keys = single_keys ? single_keys : p_keys ? &(*p_keys)[q] : nullptr;
+    const auto *keys = single_keys ? single_keys
+                       : p_keys    ? &(*p_keys)[q]
+                                   : nullptr;
     if (keys) {
       ret =
           entity->search_by_p_keys(query, *keys, filter, &heap, &context_stats);
@@ -259,13 +260,13 @@ int IVFStreamer::search_bf(const void *query, const IndexQueryMeta &qmeta,
   return IndexError_NoMemory;
 }
 
-int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                             Context::Pointer &context) const {
+int IVFStreamer::do_search(const void *query, const IndexQueryMeta &qmeta,
+                           Context::Pointer &context) const {
   return this->search_impl(query, qmeta, 1, context);
 }
 
-int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                             uint32_t count, Context::Pointer &context) const
+int IVFStreamer::do_search(const void *query, const IndexQueryMeta &qmeta,
+                           uint32_t count, Context::Pointer &context) const
     try {
   if (searcher_state_ != STATE_LOADED) return IndexError_Runtime;
   bool completed = false;
@@ -354,7 +355,7 @@ const IndexSearcher::Stats &IVFStreamer::stats() const {
   return stats_;
 }
 
-IndexSearcher::Context::Pointer IVFStreamer::create_context() const {
+IndexSearcher::Context::Pointer IVFStreamer::do_create_context() const {
   if (searcher_state_ != STATE_LOADED) {
     LOG_ERROR("Load the index first before create context");
     return nullptr;

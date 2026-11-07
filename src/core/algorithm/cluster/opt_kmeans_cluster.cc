@@ -414,7 +414,7 @@ void OptKmeansAlgorithm::update_clusters(
   // Initilize containers
   this->init_features_containers(threads->count() * cents.size());
   auto task_group = threads->make_group();
-  AILEGO_DEFER([&] { task_group->wait_finish(); });
+  AILEGO_DEFER([&] { task_group->wait_finish_no_throw(); });
 
   size_t features_count = features_->count();
   size_t shard_count = std::max<size_t>(
@@ -429,9 +429,8 @@ void OptKmeansAlgorithm::update_clusters(
     }
 
     // Process in work thread·
-    task_group->submit(
-        ailego::Closure::New(this, &OptKmeansAlgorithm::update_cluster_thread,
-                             index, next_index, threads, cents));
+    task_group->execute(this, &OptKmeansAlgorithm::update_cluster_thread, index,
+                        next_index, threads, cents);
 
     // Next index
     index = next_index;
@@ -498,11 +497,11 @@ void OptKmeansAlgorithm::init_features_containers(size_t shard_count) {
 void OptKmeansAlgorithm::update_features(IndexThreads *threads,
                                          IndexCluster::CentroidList &cents) {
   auto task_group = threads->make_group();
-  AILEGO_DEFER([&] { task_group->wait_finish(); });
+  AILEGO_DEFER([&] { task_group->wait_finish_no_throw(); });
   for (size_t i = 0; i < cents.size(); ++i) {
     // Process in work thread
-    task_group->submit(ailego::Closure::New(
-        this, &OptKmeansAlgorithm::update_features_thread, i, &cents));
+    task_group->execute(this, &OptKmeansAlgorithm::update_features_thread, i,
+                        &cents);
   }
   task_group->wait_finish();
 }
@@ -515,7 +514,7 @@ void OptKmeansAlgorithm::update_labels(
       static_cast<size_t>(std::ceil(threads->count() * shard_factor_)), 1u);
   size_t fregment_count = (features_count + shard_count - 1) / shard_count;
   auto task_group = threads->make_group();
-  AILEGO_DEFER([&] { task_group->wait_finish(); });
+  AILEGO_DEFER([&] { task_group->wait_finish_no_throw(); });
 
   // Prepare buffer
   labels->resize(features_count);
@@ -528,9 +527,8 @@ void OptKmeansAlgorithm::update_labels(
     }
 
     // Process in work thread
-    task_group->submit(
-        ailego::Closure::New(this, &OptKmeansAlgorithm::update_labels_thread,
-                             index, next_index, labels, cents));
+    task_group->execute(this, &OptKmeansAlgorithm::update_labels_thread, index,
+                        next_index, labels, cents);
 
     // Next index
     index = next_index;
@@ -975,7 +973,7 @@ class NibbleKmeansAlgorithm : public OptKmeansAlgorithm {
 
   //! update centroids
   int update_centroids(IndexCluster::CentroidList &cents,
-                        const turbo::NibbleKmeans<T, IndexThreads> &algorithm);
+                       const turbo::NibbleKmeans<T, IndexThreads> &algorithm);
 };
 
 template <typename T>

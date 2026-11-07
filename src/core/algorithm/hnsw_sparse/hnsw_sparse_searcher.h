@@ -46,64 +46,61 @@ class HnswSparseSearcher : public IndexSearcher {
   int unload() override;
 
   //! Similarity search with sparse inputs
-  int search_impl(const uint32_t sparse_count, const uint32_t *sparse_indices,
-                  const void *sparse_query, const IndexQueryMeta &qmeta,
-                  Context::Pointer &context) const override {
+  int do_search(const uint32_t sparse_count, const uint32_t *sparse_indices,
+                const void *sparse_query, const IndexQueryMeta &qmeta,
+                Context::Pointer &context) const override {
     return search_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                        context);
   }
 
   //! Similarity search with sparse inputs
-  int search_impl(const uint32_t *sparse_count, const uint32_t *sparse_indices,
-                  const void *sparse_query, const IndexQueryMeta &qmeta,
-                  uint32_t count, Context::Pointer &context) const override;
+  int do_search(const uint32_t *sparse_count, const uint32_t *sparse_indices,
+                const void *sparse_query, const IndexQueryMeta &qmeta,
+                uint32_t count, Context::Pointer &context) const override;
 
   //! Similarity brute force search with sparse inputs
-  int search_bf_impl(const uint32_t sparse_count,
-                     const uint32_t *sparse_indices, const void *sparse_query,
-                     const IndexQueryMeta &qmeta,
-                     Context::Pointer &context) const override {
+  int do_search_bf(const uint32_t sparse_count, const uint32_t *sparse_indices,
+                   const void *sparse_query, const IndexQueryMeta &qmeta,
+                   Context::Pointer &context) const override {
     return search_bf_impl(&sparse_count, sparse_indices, sparse_query, qmeta, 1,
                           context);
   }
 
   //! Similarity brute force search with sparse inputs
-  int search_bf_impl(const uint32_t *sparse_count,
-                     const uint32_t *sparse_indices, const void *sparse_query,
-                     const IndexQueryMeta &qmeta, uint32_t count,
-                     Context::Pointer &context) const override;
+  int do_search_bf(const uint32_t *sparse_count, const uint32_t *sparse_indices,
+                   const void *sparse_query, const IndexQueryMeta &qmeta,
+                   uint32_t count, Context::Pointer &context) const override;
 
   //! Linear search by primary keys
   int search_bf_key_batch(const uint32_t *sparse_count, const uint32_t *indices,
                           const void *query, IndexKeyBatchView keys,
                           const IndexQueryMeta &meta, uint32_t count,
                           Context::Pointer &context) const;
-  int search_bf_by_keys_impl(uint32_t sparse_count, const uint32_t *indices,
-                             const void *query,
-                             const std::vector<uint64_t> &keys,
-                             const IndexQueryMeta &meta,
-                             Context::Pointer &context) const override {
+  int do_search_bf_by_keys(uint32_t sparse_count, const uint32_t *indices,
+                           const void *query, const std::vector<uint64_t> &keys,
+                           const IndexQueryMeta &meta,
+                           Context::Pointer &context) const override {
     return search_bf_key_batch(&sparse_count, indices, query,
                                IndexKeyBatchView(keys), meta, 1, context);
   }
 
-  int search_bf_by_p_keys_impl(const uint32_t sparse_count,
-                               const uint32_t *sparse_indices,
-                               const void *sparse_query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta,
-                               ContextPointer &context) const override {
+  int do_search_bf_by_p_keys(const uint32_t sparse_count,
+                             const uint32_t *sparse_indices,
+                             const void *sparse_query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta,
+                             ContextPointer &context) const override {
     return search_bf_by_p_keys_impl(&sparse_count, sparse_indices, sparse_query,
                                     p_keys, qmeta, 1, context);
   }
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const uint32_t *sparse_count,
-                               const uint32_t *sparse_indices,
-                               const void *sparse_query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta, uint32_t count,
-                               ContextPointer &context) const override;
+  int do_search_bf_by_p_keys(const uint32_t *sparse_count,
+                             const uint32_t *sparse_indices,
+                             const void *sparse_query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta, uint32_t count,
+                             ContextPointer &context) const override;
 
   //! Fetch sparser vector by key
   int get_sparse_vector(uint64_t key, uint32_t *sparse_count,
@@ -111,7 +108,7 @@ class HnswSparseSearcher : public IndexSearcher {
                         std::string *sparse_values_buffer) const override;
 
   //! Create a searcher context
-  ContextPointer create_context() const override;
+  ContextPointer do_create_context() const override;
 
   //! Create a new iterator
   IndexSearcher::SparseProvider::Pointer create_sparse_provider()

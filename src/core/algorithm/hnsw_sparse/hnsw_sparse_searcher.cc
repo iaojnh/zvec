@@ -236,11 +236,11 @@ int HnswSparseSearcher::update_context(HnswSparseContext *ctx) const try {
 }
 
 //! Similarity search with sparse inputs
-int HnswSparseSearcher::search_impl(const uint32_t *sparse_count,
-                                    const uint32_t *sparse_indices,
-                                    const void *sparse_query,
-                                    const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const try {
+int HnswSparseSearcher::do_search(const uint32_t *sparse_count,
+                                  const uint32_t *sparse_indices,
+                                  const void *sparse_query,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  Context::Pointer &context) const {
   if (ailego_unlikely(!context)) {
     LOG_ERROR("The context is not created by this searcher");
     return IndexError_Mismatch;
@@ -315,17 +315,13 @@ int HnswSparseSearcher::search_impl(const uint32_t *sparse_count,
   }
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
-int HnswSparseSearcher::search_bf_impl(
+int HnswSparseSearcher::do_search_bf(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const IndexQueryMeta &qmeta, uint32_t count,
-    IndexStreamer::Context::Pointer &context) const try {
+    IndexStreamer::Context::Pointer &context) const {
   if (ailego_unlikely(!context)) {
     LOG_ERROR("The context is not created by this searcher");
     return IndexError_Mismatch;
@@ -427,24 +423,16 @@ int HnswSparseSearcher::search_bf_impl(
   }
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Similarity search with sparse inputs
-int HnswSparseSearcher::search_bf_by_p_keys_impl(
+int HnswSparseSearcher::do_search_bf_by_p_keys(
     const uint32_t *sparse_count, const uint32_t *sparse_indices,
     const void *sparse_query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const try {
+    Context::Pointer &context) const {
   return search_bf_key_batch(sparse_count, sparse_indices, sparse_query, p_keys,
                              qmeta, count, context);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 int HnswSparseSearcher::search_bf_key_batch(
@@ -563,7 +551,7 @@ int HnswSparseSearcher::search_bf_key_batch(
   return IndexError_NoMemory;
 }
 
-IndexSearcher::Context::Pointer HnswSparseSearcher::create_context() const {
+IndexSearcher::Context::Pointer HnswSparseSearcher::do_create_context() const {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load the index first before create context");
     return Context::Pointer();

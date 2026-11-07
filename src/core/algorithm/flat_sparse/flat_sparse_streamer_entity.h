@@ -219,9 +219,7 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
 
 
  private:
-  using KeyMap =
-      std::map<uint64_t, node_id_t, std::less<uint64_t>,
-               ailego::BudgetedAllocator<std::pair<const uint64_t, node_id_t>>>;
+  using KeyMap = ailego::BudgetedMap<uint64_t, node_id_t>;
   KeyMap::node_type prepare_key(uint64_t key, node_id_t id) {
     if (!use_id_map_) return {};
     std::shared_lock<ailego::SharedMutex> lock(*keys_map_lock_);

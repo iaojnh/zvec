@@ -840,7 +840,7 @@ int HnswStreamer::flush(uint64_t checkpoint) try {
   return IndexError_NoMemory;
 }
 
-int HnswStreamer::dump(const IndexDumper::Pointer &dumper) try {
+int HnswStreamer::do_dump(const IndexDumper::Pointer &dumper) {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   LOG_INFO("HnswStreamer dump");
 
@@ -868,13 +868,9 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) try {
     if (ret != 0) return ret;
   }
   return entity_->dump(dumper);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
+IndexStreamer::Context::Pointer HnswStreamer::do_create_context() const {
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
     return Context::Pointer();
@@ -978,9 +974,9 @@ void HnswStreamer::bind_search_dist_space(HnswContext *ctx) const {
 }
 
 //! Add a vector with id into index
-int HnswStreamer::add_with_id_impl(
-    uint32_t id, const void *query, const IndexQueryMeta &qmeta,
-    IndexStreamer::Context::Pointer &context) try {
+int HnswStreamer::do_add_with_id(uint32_t id, const void *query,
+                                 const IndexQueryMeta &qmeta,
+                                 IndexStreamer::Context::Pointer &context) {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   if (read_only_) return IndexError_Unsupported;
   int ret = check_params(query, qmeta);
@@ -1085,16 +1081,12 @@ int HnswStreamer::add_with_id_impl(
 
   complete = true;
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Add a vector into index
-int HnswStreamer::add_impl(uint64_t pkey, const void *query,
-                           const IndexQueryMeta &qmeta,
-                           IndexStreamer::Context::Pointer &context) try {
+int HnswStreamer::do_add(uint64_t pkey, const void *query,
+                         const IndexQueryMeta &qmeta,
+                         IndexStreamer::Context::Pointer &context) {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   if (read_only_) return IndexError_Unsupported;
   int ret = check_params(query, qmeta);
@@ -1199,29 +1191,19 @@ int HnswStreamer::add_impl(uint64_t pkey, const void *query,
 
   complete = true;
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 
-int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                              IndexStreamer::Context::Pointer &context) const
-    try {
+int HnswStreamer::do_search(const void *query, const IndexQueryMeta &qmeta,
+                            IndexStreamer::Context::Pointer &context) const {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   return search_impl(query, qmeta, 1, context);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 //! Similarity search
-int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                              uint32_t count,
-                              IndexStreamer::Context::Pointer &context) const
-    try {
+int HnswStreamer::do_search(const void *query, const IndexQueryMeta &qmeta,
+                            uint32_t count,
+                            IndexStreamer::Context::Pointer &context) const {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta, true);
   if (ailego_unlikely(ret != 0)) {
@@ -1277,16 +1259,13 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int HnswStreamer::search_candidates_impl(
-    const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
-    IndexStreamer::Context::Pointer &context, std::vector<float> *scores) const
-    try {
+int HnswStreamer::do_search_candidates(const void *query,
+                                       const IndexQueryMeta &qmeta,
+                                       std::vector<uint64_t> &keys,
+                                       IndexStreamer::Context::Pointer &context,
+                                       std::vector<float> *scores) const {
   keys.clear();
   if (scores) scores->clear();
   int ret = check_params(query, qmeta, true);
@@ -1303,8 +1282,8 @@ int HnswStreamer::search_candidates_impl(
   }
 
   if (entity_->doc_cnt() <= ctx->get_bruteforce_threshold()) {
-    return IndexRunner::search_candidates_impl(query, qmeta, keys, context,
-                                               scores);
+    return IndexRunner::do_search_candidates(query, qmeta, keys, context,
+                                             scores);
   }
 
   if (ctx->magic() != magic_) {
@@ -1337,10 +1316,6 @@ int HnswStreamer::search_candidates_impl(
     return IndexError_Runtime;
   }
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 void HnswStreamer::print_debug_info() {
@@ -1365,21 +1340,15 @@ void HnswStreamer::print_debug_info() {
   // entity_->print_key_map();
 }
 
-int HnswStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                                 IndexStreamer::Context::Pointer &context) const
-    try {
+int HnswStreamer::do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                               IndexStreamer::Context::Pointer &context) const {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   return search_bf_impl(query, qmeta, 1, context);
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int HnswStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                                 uint32_t count,
-                                 IndexStreamer::Context::Pointer &context) const
-    try {
+int HnswStreamer::do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                               uint32_t count,
+                               IndexStreamer::Context::Pointer &context) const {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta, true);
   if (ailego_unlikely(ret != 0)) {
@@ -1480,16 +1449,12 @@ int HnswStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
-int HnswStreamer::search_bf_by_p_keys_impl(
+int HnswStreamer::do_search_bf_by_p_keys(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const try {
+    Context::Pointer &context) const {
   if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta, true);
   if (ailego_unlikely(ret != 0)) {
@@ -1595,10 +1560,6 @@ int HnswStreamer::search_bf_by_p_keys_impl(
   }
 
   return 0;
-} catch (const GraphStorageError &error) {
-  return error.code;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 

@@ -38,21 +38,21 @@ class BatchCountingFlatSearcher : public IndexSearcher {
            IndexMetric::Pointer metric) override {
     return inner_->load(std::move(storage), std::move(metric));
   }
-  Context::Pointer create_context() const override {
+  Context::Pointer do_create_context() const override {
     return inner_->create_context();
   }
-  int search_impl(const void *query, const IndexQueryMeta &meta,
-                  Context::Pointer &context) const override {
+  int do_search(const void *query, const IndexQueryMeta &meta,
+                Context::Pointer &context) const override {
     return inner_->search_impl(query, meta, context);
   }
-  int search_impl(const void *query, const IndexQueryMeta &meta, uint32_t count,
-                  Context::Pointer &context) const override {
+  int do_search(const void *query, const IndexQueryMeta &meta, uint32_t count,
+                Context::Pointer &context) const override {
     ++batches;
     last_count = count;
     return inner_->search_impl(query, meta, count, context);
   }
-  int search_bf_impl(const void *query, const IndexQueryMeta &meta,
-                     uint32_t count, Context::Pointer &context) const override {
+  int do_search_bf(const void *query, const IndexQueryMeta &meta,
+                   uint32_t count, Context::Pointer &context) const override {
     ++batches;
     last_count = count;
     return inner_->search_bf_impl(query, meta, count, context);

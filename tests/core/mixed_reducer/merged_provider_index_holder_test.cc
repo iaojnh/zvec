@@ -638,14 +638,14 @@ class RetainingTestBuilder : public IndexBuilder {
       : expected_pool_(expected_pool) {
     set_name(name);
   }
-  int train(IndexThreads::Pointer threads, IndexHolder::Pointer) override {
+  int do_train(IndexThreads::Pointer threads, IndexHolder::Pointer) override {
     ++train_calls;
     train_thread_count = threads ? threads->count() : 0;
     train_used_expected_pool = uses_expected_pool(threads);
     return 0;
   }
-  int build(IndexThreads::Pointer threads,
-            IndexHolder::Pointer input) override {
+  int do_build(IndexThreads::Pointer threads,
+               IndexHolder::Pointer input) override {
     build_thread_count = threads ? threads->count() : 0;
     build_used_expected_pool = uses_expected_pool(threads);
     holder = std::move(input);
@@ -917,13 +917,13 @@ TEST(MergedProviderIndexHolderTest, RabitqMergePropagatesDeferredReadFailures) {
    public:
     explicit ReadingBuilder(bool fail_in_train)
         : RetainingTestBuilder("IvfRabitqBuilder"), in_train(fail_in_train) {}
-    int train(IndexThreads::Pointer threads,
-              IndexHolder::Pointer input) override {
-      RetainingTestBuilder::train(std::move(threads), input);
+    int do_train(IndexThreads::Pointer threads,
+                 IndexHolder::Pointer input) override {
+      RetainingTestBuilder::do_train(std::move(threads), input);
       if (in_train) consume(input);
       return 0;
     }
-    int build(IndexThreads::Pointer, IndexHolder::Pointer input) override {
+    int do_build(IndexThreads::Pointer, IndexHolder::Pointer input) override {
       consume(input);
       return 0;
     }

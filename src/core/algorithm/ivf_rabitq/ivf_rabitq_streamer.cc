@@ -183,7 +183,7 @@ int IvfRabitqStreamer::load_index(IndexStorage::Pointer storage) {
 // --------------------------------------------------------------------------
 // create_context
 // --------------------------------------------------------------------------
-IndexStreamer::Context::Pointer IvfRabitqStreamer::create_context() const {
+IndexStreamer::Context::Pointer IvfRabitqStreamer::do_create_context() const {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Load the index first before create context");
     return Context::Pointer();
@@ -233,9 +233,9 @@ int IvfRabitqStreamer::get_vector(const uint64_t /*key*/,
 // --------------------------------------------------------------------------
 // search_bf_impl (brute force - search all clusters, single query)
 // --------------------------------------------------------------------------
-int IvfRabitqStreamer::search_bf_impl(const void *query,
-                                      const IndexQueryMeta &qmeta,
-                                      Context::Pointer &context) const {
+int IvfRabitqStreamer::do_search_bf(const void *query,
+                                    const IndexQueryMeta &qmeta,
+                                    Context::Pointer &context) const {
   if (context && context->group_by().is_valid()) {
     return search_group_by_impl_internal(query, qmeta, 1, context, true);
   }
@@ -245,10 +245,9 @@ int IvfRabitqStreamer::search_bf_impl(const void *query,
 // --------------------------------------------------------------------------
 // search_bf_impl (brute force - search all clusters, multi query)
 // --------------------------------------------------------------------------
-int IvfRabitqStreamer::search_bf_impl(const void *query,
-                                      const IndexQueryMeta &qmeta,
-                                      uint32_t count,
-                                      Context::Pointer &context) const {
+int IvfRabitqStreamer::do_search_bf(const void *query,
+                                    const IndexQueryMeta &qmeta, uint32_t count,
+                                    Context::Pointer &context) const {
   if (context && context->group_by().is_valid()) {
     return search_group_by_impl_internal(query, qmeta, count, context, true);
   }
@@ -258,18 +257,17 @@ int IvfRabitqStreamer::search_bf_impl(const void *query,
 // --------------------------------------------------------------------------
 // search_impl (single query)
 // --------------------------------------------------------------------------
-int IvfRabitqStreamer::search_impl(const void *query,
-                                   const IndexQueryMeta &qmeta,
-                                   Context::Pointer &context) const {
+int IvfRabitqStreamer::do_search(const void *query, const IndexQueryMeta &qmeta,
+                                 Context::Pointer &context) const {
   return search_impl(query, qmeta, 1, context);
 }
 
 // --------------------------------------------------------------------------
 // search_impl
 // --------------------------------------------------------------------------
-int IvfRabitqStreamer::search_impl(const void *query,
-                                   const IndexQueryMeta &qmeta, uint32_t count,
-                                   Context::Pointer &context) const {
+int IvfRabitqStreamer::do_search(const void *query, const IndexQueryMeta &qmeta,
+                                 uint32_t count,
+                                 Context::Pointer &context) const {
   if (context && context->group_by().is_valid()) {
     return search_group_by_impl_internal(query, qmeta, count, context, false);
   }
@@ -526,7 +524,7 @@ int IvfRabitqStreamer::search_group_by_impl_internal(
   return IndexError_NoMemory;
 }
 
-int IvfRabitqStreamer::search_bf_by_p_keys_impl(
+int IvfRabitqStreamer::do_search_bf_by_p_keys(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
@@ -534,10 +532,10 @@ int IvfRabitqStreamer::search_bf_by_p_keys_impl(
   return search_keys(query, p_keys.data(), qmeta, count, context);
 }
 
-int IvfRabitqStreamer::search_bf_by_keys_impl(const void *query,
-                                              const std::vector<uint64_t> &keys,
-                                              const IndexQueryMeta &qmeta,
-                                              Context::Pointer &context) const {
+int IvfRabitqStreamer::do_search_bf_by_keys(const void *query,
+                                            const std::vector<uint64_t> &keys,
+                                            const IndexQueryMeta &qmeta,
+                                            Context::Pointer &context) const {
   return search_keys(query, &keys, qmeta, 1, context);
 }
 

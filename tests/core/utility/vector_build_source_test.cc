@@ -73,6 +73,48 @@ TEST(VectorBuildSourceTest, NumericalProvidersBorrowAllPrecisionsByOrdinal) {
   CheckBorrowedNumericalInput<IndexMeta::DT_INT16, int16_t>();
 }
 
+TEST(VectorBuildSourceTest, OrdinalOnlyInputSupportsIndependentIterations) {
+  class OrdinalOnlyInput : public MultiPassIndexProvider<IndexMeta::DT_FP32> {
+   public:
+    OrdinalOnlyInput() : MultiPassIndexProvider<IndexMeta::DT_FP32>(3) {}
+    bool multipass() const override {
+      return false;
+    }
+    IndexHolder::Iterator::Pointer create_iterator() override {
+      return nullptr;
+    }
+  };
+  auto input = std::make_shared<OrdinalOnlyInput>();
+  for (size_t i = 0; i < 5; ++i) {
+    ASSERT_TRUE(input->emplace(
+        i % 2, ailego::NumericalVector<float>(3, float(i))));
+  }
+  VectorBuildSource::Pointer source;
+  ASSERT_EQ(0, VectorBuildSource::Create(input, &source));
+  EXPECT_TRUE(source->multipass());
+  auto first = source->create_iterator();
+  auto second = source->create_iterator();
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  std::weak_ptr<IndexHolder> backing = input;
+  input.reset();
+  source.reset();
+  EXPECT_FALSE(backing.expired());
+  for (auto *iter : {first.get(), second.get()}) {
+    for (size_t i = 0; i < 5; ++i, iter->next()) {
+      ASSERT_TRUE(iter->is_valid());
+      EXPECT_EQ(i % 2, iter->key());
+      ASSERT_NE(nullptr, iter->data());
+      EXPECT_FLOAT_EQ(float(i), static_cast<const float *>(iter->data())[0]);
+    }
+    EXPECT_FALSE(iter->is_valid());
+    EXPECT_EQ(0, iter->status());
+  }
+  first.reset();
+  second.reset();
+  EXPECT_TRUE(backing.expired());
+}
+
 // One-pass source reusing the same row buffer on every data() call. No test
 // retains a full input corpus in memory, including the larger-than-pool case.
 class StreamingInput : public IndexHolder {
@@ -83,15 +125,16 @@ class StreamingInput : public IndexHolder {
   bool null_data{false};
   size_t iterators{0};
   static constexpr size_t kDim = 257;
+  size_t width{kDim};
 
   size_t count() const override {
     return reported_count;
   }
   size_t dimension() const override {
-    return kDim;
+    return width;
   }
   size_t element_size() const override {
-    return kDim * sizeof(float);
+    return width * sizeof(float);
   }
   IndexMeta::DataType data_type() const override {
     return IndexMeta::DT_FP32;
@@ -228,6 +271,31 @@ TEST_F(BuildVectorSpoolTest, BudgetFailureNeverFallsBackToUnmanagedCopy) {
   EXPECT_EQ(VectorBuildSource::Create(input, &source, prefix()),
             IndexError_NoMemory);
   EXPECT_EQ(source, nullptr);
+}
+
+TEST_F(BuildVectorSpoolTest, KeysLargerThanBudgetStayInSharedVectorStorage) {
+  auto input = std::make_shared<StreamingInput>();
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  input->width = 8;
+  input->rows = input->reported_count = pool.capacity() / sizeof(uint64_t) + 503;
+  VectorBuildSource::Pointer source;
+  ASSERT_EQ(0, VectorBuildSource::Create(input, &source, prefix()));
+  ASSERT_EQ(input->rows, source->count());
+  EXPECT_EQ(input->width, source->dimension());
+  EXPECT_EQ(IndexMeta::DT_FP32, source->data_type());
+  EXPECT_TRUE(source->multipass());
+  EXPECT_LT(pool.used(), input->rows * sizeof(uint64_t));
+  auto iter = source->create_iterator();
+  source.reset();
+  size_t count = 0;
+  for (; iter->is_valid(); iter->next(), ++count) {
+    EXPECT_EQ((uint64_t{1} << 40) + count % 7, iter->key());
+    ASSERT_EQ(0, iter->status());
+    if (count % 513 == 0)
+      EXPECT_FLOAT_EQ(float(count), static_cast<const float *>(iter->data())[0]);
+  }
+  EXPECT_EQ(input->rows, count);
+  EXPECT_EQ(0, iter->status());
 }
 
 class FailingOrdinalInput : public StreamingInput, public OrdinalAccessHolder {

@@ -500,7 +500,7 @@ int StratifiedCluster::cluster(IndexThreads::Pointer threads,
 
   std::atomic<int> cluster_error{0};
   auto task_group = threads->make_group();
-  AILEGO_DEFER([&] { task_group->wait_finish(); });
+  AILEGO_DEFER([&] { task_group->wait_finish_no_throw(); });
   // The second clustering
   for (size_t i = 0; i < cents.size(); ++i) {
     if (cents[i].similars().empty()) {
@@ -510,7 +510,7 @@ int StratifiedCluster::cluster(IndexThreads::Pointer threads,
     IndexThreads::Pointer &curr_threads =
         threads_cluster[i % (threads_cluster.size())];
 
-    task_group->submit(ailego::Closure::New(
+    task_group->execute(
         [this, curr_threads, total_cluster_count, &cents,
          &cluster_error](size_t index) {
           try {
@@ -562,7 +562,7 @@ int StratifiedCluster::cluster(IndexThreads::Pointer threads,
                                                   IndexError_ReadData);
           }
         },
-        i));
+        i);
   }
   task_group->wait_finish();
   return cluster_error.load();

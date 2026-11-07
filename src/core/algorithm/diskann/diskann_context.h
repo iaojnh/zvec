@@ -299,9 +299,7 @@ class DiskAnnContext : public IndexContext,
     reset_group_by();
   }
 
-  using GroupHeaps = std::map<
-      std::string, TopkHeap, std::less<std::string>,
-      ailego::BudgetedAllocator<std::pair<const std::string, TopkHeap>>>;
+  using GroupHeaps = ailego::BudgetedMap<std::string, TopkHeap>;
   inline GroupHeaps &group_topk_heaps() {
     return group_topk_heaps_;
   }

@@ -58,8 +58,8 @@ int FlatSparseBuilder::cleanup() {
   return 0;
 }
 
-int FlatSparseBuilder::train(IndexThreads::Pointer,
-                             IndexSparseHolder::Pointer /*holder*/) {
+int FlatSparseBuilder::do_train(IndexThreads::Pointer,
+                                IndexSparseHolder::Pointer /*holder*/) {
   if (state_ != BUILD_STATE_INITED) {
     LOG_ERROR("Init the builder before FlatSparseBuilder::train");
     return IndexError_NoReady;
@@ -76,7 +76,7 @@ int FlatSparseBuilder::train(IndexThreads::Pointer,
   return 0;
 }
 
-int FlatSparseBuilder::train(const IndexTrainer::Pointer & /*trainer*/) {
+int FlatSparseBuilder::do_train(const IndexTrainer::Pointer & /*trainer*/) {
   if (state_ != BUILD_STATE_INITED) {
     LOG_ERROR("Init the builder before FlatSparseBuilder::train");
     return IndexError_NoReady;
@@ -93,8 +93,8 @@ int FlatSparseBuilder::train(const IndexTrainer::Pointer & /*trainer*/) {
   return 0;
 }
 
-int FlatSparseBuilder::build(IndexThreads::Pointer,
-                             IndexSparseHolder::Pointer holder) {
+int FlatSparseBuilder::do_build(IndexThreads::Pointer,
+                                IndexSparseHolder::Pointer holder) {
   LOG_INFO("Begin FlatSparseBuilder::build");
 
   ailego::ElapsedTime stamp;
@@ -118,7 +118,7 @@ int FlatSparseBuilder::build(IndexThreads::Pointer,
   return 0;
 }
 
-int FlatSparseBuilder::dump(const IndexDumper::Pointer &dumper) try {
+int FlatSparseBuilder::do_dump(const IndexDumper::Pointer &dumper) {
   if (state_ != BUILD_STATE_BUILT || !holder_) {
     LOG_INFO("Build the index before FlatSparseBuilder::dump");
     return IndexError_NoReady;
@@ -147,8 +147,6 @@ int FlatSparseBuilder::dump(const IndexDumper::Pointer &dumper) try {
 
   LOG_INFO("End FlatSparseBuilder::dump");
   return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 int FlatSparseBuilder::do_dump(const IndexDumper::Pointer &dumper,

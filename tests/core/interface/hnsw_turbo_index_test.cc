@@ -1260,11 +1260,12 @@ class CheckedBulkStreamer : public zvec::core::HnswStreamer {
     return ret;
   }
 
-  zvec::core::IndexStreamer::Context::Pointer create_context() const override {
-    if (!borrowed_build_) return HnswStreamer::create_context();
+  zvec::core::IndexStreamer::Context::Pointer do_create_context()
+      const override {
+    if (!borrowed_build_) return HnswStreamer::do_create_context();
     const auto call = state_->context_calls.fetch_add(1);
     if (state_->fail_first && call == 0) return nullptr;
-    auto context = HnswStreamer::create_context();
+    auto context = HnswStreamer::do_create_context();
     if (context) {
       state_->context_ptrs[call] = context.get();
       const auto ready = state_->contexts_ready.fetch_add(1) + 1;
@@ -1277,7 +1278,7 @@ class CheckedBulkStreamer : public zvec::core::HnswStreamer {
     return context;
   }
 
-  int add_with_id_impl(
+  int do_add_with_id(
       uint32_t id, const void *data, const zvec::core::IndexQueryMeta &meta,
       zvec::core::IndexStreamer::Context::Pointer &context) override {
     if (state_->contexts_ready.load() != state_->workers) {
@@ -1291,7 +1292,7 @@ class CheckedBulkStreamer : public zvec::core::HnswStreamer {
       state_->active_adds.fetch_sub(1);
       return zvec::core::IndexError_Runtime;
     }
-    return HnswStreamer::add_with_id_impl(id, data, meta, context);
+    return HnswStreamer::do_add_with_id(id, data, meta, context);
   }
 
  private:

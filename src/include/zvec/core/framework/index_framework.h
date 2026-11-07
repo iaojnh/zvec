@@ -29,4 +29,5 @@
 #include <zvec/core/framework/index_plugin.h>
 #include <zvec/core/framework/index_runner.h>
 #include <zvec/core/framework/index_searcher.h>
+#include <zvec/core/framework/index_storage_buffer.h>
 #include <zvec/core/framework/index_trainer.h>

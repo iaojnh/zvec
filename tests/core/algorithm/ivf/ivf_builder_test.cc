@@ -29,62 +29,13 @@
 #include <zvec/core/framework/index_provider.h>
 #include <zvec/core/framework/index_streamer.h>
 #include "ivf_entity.h"
+#include "utility/stable_vector_holder.h"
+#include "utility/vector_build_source.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
 using namespace std;
-
-TEST(IVFBufferedKeysTest, KeysShareVectorStorageWithoutResidentArray) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  auto restore = ScopeGuard::Make([&] {
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  // Writable stores also reserve writeback staging and lock metadata. Keep
-  // only a few data pages, and make the keys alone larger than the budget.
-  const size_t budget =
-      VecBufferPool::metadata_bytes_for_page_count(4096, true) +
-      16 * kVectorPageSize;
-  ASSERT_EQ(0, pool.init(budget));
-  IndexMeta meta;
-  meta.set_meta(IndexMeta::DT_FP32, 8);
-  std::string prefix;
-  ASSERT_EQ(0, TemporaryBufferStorage::DefaultPrefix("ivf-keys-test", &prefix));
-  const size_t count = budget / sizeof(uint64_t) + 503;
-  IVFBuilder::RandomAccessIndexHolder holder(meta);
-  ASSERT_EQ(0, holder.enable_buffered_storage(prefix, count));
-  holder.reserve(count);
-  EXPECT_EQ(0u, holder.resident_key_capacity());
-  for (size_t i = 0; i < count; ++i) {
-    const float row[8] = {static_cast<float>(i)};
-    ASSERT_EQ(0, holder.emplace((uint64_t{1} << 40) + count - i, row));
-  }
-  ASSERT_EQ(0, holder.flush());
-  ASSERT_EQ(count, holder.count());
-  EXPECT_EQ(0u, holder.resident_key_capacity());
-  EXPECT_LT(pool.used(), count * sizeof(uint64_t));
-  uint64_t key = 0;
-  EXPECT_EQ(IndexError_OutOfRange, holder.read_key(count, &key));
-  auto iter = holder.create_iterator();
-  size_t i = 0;
-  for (; iter->is_valid(); iter->next(), ++i) {
-    EXPECT_EQ((uint64_t{1} << 40) + count - i, iter->key());
-    ASSERT_EQ(0, iter->status());
-    if (i % 513 == 0) {
-      const auto *row = static_cast<const float *>(iter->data());
-      ASSERT_NE(nullptr, row);
-      EXPECT_EQ(static_cast<float>(i), row[0]);
-    }
-  }
-  EXPECT_EQ(count, i);
-  EXPECT_EQ(0, iter->status());
-  const float row[8] = {};
-  EXPECT_EQ(IndexError_OutOfRange, holder.emplace(0, row));
-  EXPECT_EQ(count, holder.count());
-}
 
 class IVFBuilderTest : public testing::Test {
  protected:
@@ -784,7 +735,7 @@ TEST_F(IVFBuilderTest, HalfFloatOrdinalSourceIsBorrowedAndDumpCanRetry) {
     source->create_error = 0;
     source->reader_creations = 0;
     ASSERT_EQ(0, builder.build(threads_, converted));
-    EXPECT_EQ(1u, source->reader_creations);
+    EXPECT_EQ(2u, source->reader_creations);
     EXPECT_EQ(1u, source->iterations);  // Labels only, no materialization pass.
     EXPECT_EQ(0u, source->reads);
 
@@ -861,7 +812,7 @@ TEST_F(IVFBuilderTest, OrdinalSourceIsReadAtDumpAndRetainedForRepeatedDumps) {
       auto source = std::make_shared<OrdinalTestHolder>(holder_);
       std::weak_ptr<OrdinalTestHolder> weak = source;
       ASSERT_EQ(0, builder.build(threads_, source));
-      EXPECT_EQ(1u, source->reader_creations);
+      EXPECT_EQ(2u, source->reader_creations);
       EXPECT_EQ(1u, source->iterations);
       EXPECT_EQ(0u, source->reads);
       source.reset();
@@ -938,7 +889,7 @@ TEST_F(IVFBuilderTest, OrdinalSourceFallsBackForUnsupportedTransforms) {
     source->create_error = IndexError_NotImplemented;
     std::weak_ptr<OrdinalTestHolder> weak = source;
     ASSERT_EQ(0, builder.build(threads_, source));
-    EXPECT_EQ(mode == 0 ? 1u : 0u, source->reader_creations);
+    EXPECT_EQ(1u, source->reader_creations);
     source.reset();
     EXPECT_TRUE(weak.expired());
     auto dumper = IndexFactory::CreateDumper("MemoryDumper");
@@ -1578,27 +1529,19 @@ class StableTestHolder : public IndexHolder, public StableVectorHolder {
 TEST_F(IVFBuilderTest, StableSourceKeepsOriginalAddressesAndBackingData) {
   prepare_index_holder(100, 103);
   auto source = std::make_shared<StableTestHolder>(holder_);
-  std::shared_ptr<const void> lifetime;
-  ASSERT_EQ(0, source->retain_stable_data(&lifetime));
-  IVFBuilder::RandomAccessIndexHolder borrowed(index_meta_,
-                                               std::move(lifetime));
-  borrowed.reserve(source->count());
-  const void *first = nullptr;
-  for (auto iter = source->create_iterator(); iter->is_valid(); iter->next()) {
-    if (!first) first = iter->data();
-    borrowed.emplace(iter->key(), iter->data());
-  }
+  const void *first = holder_->create_iterator()->data();
+  VectorBuildSource::Pointer borrowed;
+  ASSERT_EQ(0, VectorBuildSource::Create(source, &borrowed));
   std::weak_ptr<IndexHolder> backing = holder_;
   source.reset();
   holder_.reset();
   ASSERT_FALSE(backing.expired());
-  EXPECT_EQ(103u, borrowed.count());
-  EXPECT_EQ(first, borrowed.element(0));
-  auto iter = borrowed.create_iterator();
-  for (size_t i = 0; i < borrowed.count(); ++i, iter->next()) {
+  EXPECT_EQ(103u, borrowed->count());
+  auto iter = borrowed->create_iterator();
+  for (size_t i = 0; i < borrowed->count(); ++i, iter->next()) {
     ASSERT_TRUE(iter->is_valid());
     EXPECT_EQ(100u + i, iter->key());
-    EXPECT_EQ(borrowed.element(i), iter->data());
+    if (i == 0) EXPECT_EQ(first, iter->data());
     EXPECT_EQ(float(i), static_cast<const float *>(iter->data())[0]);
   }
   EXPECT_FALSE(iter->is_valid());

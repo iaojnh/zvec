@@ -814,9 +814,8 @@ int KmeansCluster::split_clusters(IndexThreads *threads,
     }
 
     // Process in work thread
-    task_group->submit(
-        ailego::Closure::New(this, &KmeansCluster::split_clusters_thread, index,
-                             next_index, threads));
+    task_group->execute(this, &KmeansCluster::split_clusters_thread, index,
+                        next_index, threads);
 
     // Next index
     index = next_index;
@@ -829,8 +828,8 @@ void KmeansCluster::update_centroids(IndexThreads *threads,
                                      IndexCluster::CentroidList &cents) {
   auto task_group = threads->make_group();
   for (size_t i = 0; i < cents.size(); ++i) {
-    task_group->submit(ailego::Closure::New(
-        this, &KmeansCluster::update_centroid_thread, i, &cents));
+    task_group->execute(this, &KmeansCluster::update_centroid_thread, i,
+                        &cents);
   }
   task_group->wait_finish();
 }
@@ -853,9 +852,8 @@ void KmeansCluster::update_clusters(IndexThreads *threads,
       next_index = features_count;
     }
     // Process in work thread
-    task_group->submit(
-        ailego::Closure::New(this, &KmeansCluster::update_cluster_thread, index,
-                             next_index, threads));
+    task_group->execute(this, &KmeansCluster::update_cluster_thread, index,
+                        next_index, threads);
 
     // Next index
     index = next_index;
@@ -868,8 +866,8 @@ void KmeansCluster::update_features(IndexThreads *threads,
   auto task_group = threads->make_group();
   for (size_t i = 0; i < cents.size(); ++i) {
     // Process in work thread
-    task_group->submit(ailego::Closure::New(
-        this, &KmeansCluster::update_features_thread, i, &cents));
+    task_group->execute(this, &KmeansCluster::update_features_thread, i,
+                        &cents);
   }
   task_group->wait_finish();
 }
@@ -893,8 +891,8 @@ void KmeansCluster::update_labels(IndexThreads *threads,
     }
 
     // Process in work thread
-    task_group->submit(ailego::Closure::New(
-        this, &KmeansCluster::update_labels_thread, index, next_index, labels));
+    task_group->execute(this, &KmeansCluster::update_labels_thread, index,
+                        next_index, labels);
 
     // Next index
     index = next_index;

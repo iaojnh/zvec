@@ -250,9 +250,9 @@ int DiskAnnStreamer::ensure_compatible_context(ContextPointer &context,
   return 0;
 }
 
-int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                                 uint32_t count,
-                                 Context::Pointer &context) const try {
+int DiskAnnStreamer::do_search(const void *query, const IndexQueryMeta &qmeta,
+                               uint32_t count, Context::Pointer &context) const
+    try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Open DiskAnnStreamer before searching");
     return IndexError_NoReady;
@@ -315,9 +315,9 @@ int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   return IndexError_NoMemory;
 }
 
-int DiskAnnStreamer::search_bf_impl(const void *query,
-                                    const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const try {
+int DiskAnnStreamer::do_search_bf(const void *query,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Open DiskAnnStreamer before searching");
     return IndexError_NoReady;
@@ -378,7 +378,7 @@ int DiskAnnStreamer::search_bf_impl(const void *query,
   return IndexError_NoMemory;
 }
 
-int DiskAnnStreamer::search_bf_by_p_keys_impl(
+int DiskAnnStreamer::do_search_bf_by_p_keys(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const try {
@@ -546,7 +546,7 @@ IndexSearcher::Provider::Pointer DiskAnnStreamer::create_provider() const {
   return IndexProvider::Pointer(provider.release());
 }
 
-IndexSearcher::Context::Pointer DiskAnnStreamer::create_context() const {
+IndexSearcher::Context::Pointer DiskAnnStreamer::do_create_context() const {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Open DiskAnnStreamer before creating a context");
     return Context::Pointer();

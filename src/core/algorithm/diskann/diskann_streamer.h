@@ -53,52 +53,52 @@ class DiskAnnStreamer : public IndexStreamer {
   int unload() override;
 
   //! KNN Search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  ContextPointer &context) const override {
+  int do_search(const void *query, const IndexQueryMeta &qmeta,
+                ContextPointer &context) const override {
     return search_impl(query, qmeta, 1, context);
   }
 
   //! KNN Search
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  uint32_t count, ContextPointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
+                ContextPointer &context) const override;
 
   //! Linear Search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     ContextPointer &context) const override {
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   ContextPointer &context) const override {
     return search_bf_impl(query, qmeta, 1, context);
   }
 
   //! Linear Search
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     uint32_t count, ContextPointer &context) const override;
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   uint32_t count, ContextPointer &context) const override;
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta,
-                               ContextPointer &context) const override {
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta,
+                             ContextPointer &context) const override {
     return search_bf_by_p_keys_impl(query, p_keys, qmeta, 1, context);
   }
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta, uint32_t count,
-                               ContextPointer &context) const override;
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta, uint32_t count,
+                             ContextPointer &context) const override;
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(const void *query, const uint32_t sparse_count,
-                               const uint32_t *sparse_indices,
-                               const void *sparse_query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta,
-                               ContextPointer &context) const override {
+  int do_search_bf_by_p_keys(const void *query, const uint32_t sparse_count,
+                             const uint32_t *sparse_indices,
+                             const void *sparse_query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta,
+                             ContextPointer &context) const override {
     return search_bf_by_p_keys_impl(query, &sparse_count, sparse_indices,
                                     sparse_query, p_keys, qmeta, 1, context);
   }
 
   //! Linear search by primary keys
-  int search_bf_by_p_keys_impl(
+  int do_search_bf_by_p_keys(
       const void * /*query*/, const uint32_t * /*sparse_count*/,
       const uint32_t * /*sparse_indices*/, const void * /*sparse_query*/,
       const std::vector<std::vector<uint64_t>> & /*p_keys*/,
@@ -119,7 +119,7 @@ class DiskAnnStreamer : public IndexStreamer {
                        IndexStorage::MemoryBlock &block) const override;
 
   //! Create a searcher context
-  ContextPointer create_context() const override;
+  ContextPointer do_create_context() const override;
 
   //! Create a vector iterator backed by the aligned DiskAnn file reader.
   //! Used by the merge code path (``MixedStreamerReducer``) to walk every

@@ -97,13 +97,13 @@ class CountingHnswStreamer : public zvec::core::HnswStreamer {
  public:
   using HnswStreamer::init;
 
-  int search_candidates_impl(
+  int do_search_candidates(
       const void *query, const zvec::core::IndexQueryMeta &meta,
       std::vector<uint64_t> &keys, Context::Pointer &context,
       std::vector<float> *scores = nullptr) const override {
     ++candidate_search_count;
-    return HnswStreamer::search_candidates_impl(query, meta, keys, context,
-                                                scores);
+    return HnswStreamer::do_search_candidates(query, meta, keys, context,
+                                              scores);
   }
 
   mutable size_t candidate_search_count{0};
@@ -2185,18 +2185,18 @@ class FailOnceIVFBuilder : public zvec::core::IndexBuilder {
  public:
   explicit FailOnceIVFBuilder(Pointer delegate)
       : delegate_(std::move(delegate)) {}
-  int train(zvec::core::IndexThreads::Pointer threads,
-            zvec::core::IndexHolder::Pointer holder) override {
+  int do_train(zvec::core::IndexThreads::Pointer threads,
+               zvec::core::IndexHolder::Pointer holder) override {
     ++train_calls;
     return delegate_->train(std::move(threads), std::move(holder));
   }
-  int build(zvec::core::IndexThreads::Pointer threads,
-            zvec::core::IndexHolder::Pointer holder) override {
+  int do_build(zvec::core::IndexThreads::Pointer threads,
+               zvec::core::IndexHolder::Pointer holder) override {
     ++build_calls;
     if (std::exchange(fail_build, false)) return zvec::core::IndexError_Runtime;
     return delegate_->build(std::move(threads), std::move(holder));
   }
-  int dump(const zvec::core::IndexDumper::Pointer &dumper) override {
+  int do_dump(const zvec::core::IndexDumper::Pointer &dumper) override {
     ++dump_calls;
     if (std::exchange(fail_dump, false))
       return zvec::core::IndexError_WriteData;

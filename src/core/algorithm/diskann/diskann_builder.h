@@ -42,18 +42,18 @@ class DiskAnnBuilder : public IndexBuilder {
   int cleanup() override;
 
   //! Train the data
-  int train(IndexThreads::Pointer threads,
-            IndexHolder::Pointer holder) override;
+  int do_train(IndexThreads::Pointer threads,
+               IndexHolder::Pointer holder) override;
 
   //! Train the data
-  int train(const IndexTrainer::Pointer &trainer) override;
+  int do_train(const IndexTrainer::Pointer &trainer) override;
 
   //! Build the index
-  int build(IndexThreads::Pointer threads,
-            IndexHolder::Pointer holder) override;
+  int do_build(IndexThreads::Pointer threads,
+               IndexHolder::Pointer holder) override;
 
   //! Dump index into storage
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   //! Retrieve statistics
   const Stats &stats() const override {
@@ -75,8 +75,8 @@ class DiskAnnBuilder : public IndexBuilder {
   int build_internal(IndexThreads::Pointer threads);
   int prune_internal(IndexThreads::Pointer threads);
 
-  void do_build(uint64_t idx, size_t step_size,
-                std::atomic<uint64_t> *finished);
+  void build_graph_range(uint64_t idx, size_t step_size,
+                         std::atomic<uint64_t> *finished);
 
   void do_prune(uint64_t idx, size_t step_size,
                 std::atomic<uint64_t> *finished);

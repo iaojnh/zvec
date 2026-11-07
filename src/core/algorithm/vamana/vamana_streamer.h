@@ -42,45 +42,45 @@ class VamanaStreamer : public IndexStreamer {
 
   int cleanup() override;
 
-  Context::Pointer create_context() const override;
+  Context::Pointer do_create_context() const override;
 
   IndexProvider::Pointer create_provider() const override;
 
-  int add_impl(uint64_t pkey, const void *query, const IndexQueryMeta &qmeta,
-               Context::Pointer &context) override;
+  int do_add(uint64_t pkey, const void *query, const IndexQueryMeta &qmeta,
+             Context::Pointer &context) override;
 
-  int add_with_id_impl(uint32_t id, const void *query,
-                       const IndexQueryMeta &qmeta,
-                       Context::Pointer &context) override;
+  int do_add_with_id(uint32_t id, const void *query,
+                     const IndexQueryMeta &qmeta,
+                     Context::Pointer &context) override;
 
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta,
+                Context::Pointer &context) const override;
 
-  int search_impl(const void *query, const IndexQueryMeta &qmeta,
-                  uint32_t count, Context::Pointer &context) const override;
+  int do_search(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
+                Context::Pointer &context) const override;
 
-  int search_candidates_impl(
-      const void *query, const IndexQueryMeta &qmeta,
-      std::vector<uint64_t> &keys, Context::Pointer &context,
-      std::vector<float> *scores = nullptr) const override;
+  int do_search_candidates(const void *query, const IndexQueryMeta &qmeta,
+                           std::vector<uint64_t> &keys,
+                           Context::Pointer &context,
+                           std::vector<float> *scores = nullptr) const override;
 
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     Context::Pointer &context) const override;
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   Context::Pointer &context) const override;
 
-  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                     uint32_t count, Context::Pointer &context) const override;
+  int do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                   uint32_t count, Context::Pointer &context) const override;
 
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta,
-                               ContextPointer &context) const override {
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta,
+                             ContextPointer &context) const override {
     return search_bf_by_p_keys_impl(query, p_keys, qmeta, 1, context);
   }
 
-  int search_bf_by_p_keys_impl(const void *query,
-                               const std::vector<std::vector<uint64_t>> &p_keys,
-                               const IndexQueryMeta &qmeta, uint32_t count,
-                               ContextPointer &context) const override;
+  int do_search_bf_by_p_keys(const void *query,
+                             const std::vector<std::vector<uint64_t>> &p_keys,
+                             const IndexQueryMeta &qmeta, uint32_t count,
+                             ContextPointer &context) const override;
 
   const void *get_vector(uint64_t key) const override {
     return entity_->get_vector_by_key(key);
@@ -106,7 +106,7 @@ class VamanaStreamer : public IndexStreamer {
 
   int flush(uint64_t checkpoint) override;
 
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   const Stats &stats() const override {
     return stats_;

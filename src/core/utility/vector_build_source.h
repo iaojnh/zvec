@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #pragma once
 
 #include <memory>
@@ -22,35 +23,59 @@
 
 namespace zvec::core {
 
-// Immutable vector build input. Borrow an ordinal-capable holder rather than
-// copying it. Otherwise spool each row once, retaining keys by ordinal
-// (including duplicates). With a configured Buffer Pool the spool is pageable;
-// callers without a pool retain the legacy in-memory fallback. Never fall back
-// to the heap after an I/O or budget error. Each spooled reader owns at most
-// one row.
+// Internal build input for algorithms that need ordinal access. Borrow an
+// ordinal-capable holder or stable data; otherwise spool each row once using
+// pageable storage when a memory limit is configured. Preserve input order
+// and duplicate keys, and propagate budget and I/O errors without heap fallback.
 class VectorBuildSource
-    : public OrdinalAccessHolder,
+    : public IndexHolder,
+      public OrdinalAccessHolder,
       public std::enable_shared_from_this<VectorBuildSource> {
  public:
   using Pointer = std::shared_ptr<VectorBuildSource>;
   VectorBuildSource(const VectorBuildSource &) = delete;
   VectorBuildSource &operator=(const VectorBuildSource &) = delete;
+
+  // On failure, output is unchanged. Keep the input immutable while this
+  // object or any of its readers is in use.
   static int Create(IndexHolder::Pointer holder, Pointer *out,
                     const std::string &scratch_prefix = "");
 
-  size_t count() const {
+  size_t count() const override {
     return count_;
   }
+  size_t dimension() const override {
+    return dimension_;
+  }
+  IndexMeta::DataType data_type() const override {
+    return data_type_;
+  }
+  size_t element_size() const override {
+    return element_bytes_;
+  }
+  bool multipass() const override {
+    return true;
+  }
+  IndexHolder::Iterator::Pointer create_iterator() override;
+  // Each reader retains its backing and is single-threaded. Returned data
+  // remains valid until that reader's next read/reset or destruction.
   int create_ordinal_reader(Reader::Pointer *out) override;
 
  private:
   VectorBuildSource() = default;
+  class Cursor;
+  class StableReader;
   class SpoolReader;
   int init(IndexHolder::Pointer holder, const std::string &scratch_prefix);
   int append(uint64_t key, const void *data);
 
   IndexHolder::Pointer holder_;
+  std::shared_ptr<const void> lifetime_;
+  ailego::BudgetedVector<uint64_t> keys_;
+  ailego::BudgetedVector<const void *> vectors_;
   size_t count_{0};
+  size_t dimension_{0};
+  IndexMeta::DataType data_type_{IndexMeta::DT_UNDEFINED};
   size_t element_bytes_{0};
   size_t record_words_{0};
   size_t rows_per_chunk_{0};

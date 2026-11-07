@@ -44,24 +44,24 @@ class FlatBuilder : public IndexBuilder {
   }
 
   //! Train the data
-  int train(IndexThreads::Pointer, IndexHolder::Pointer) override {
+  int do_train(IndexThreads::Pointer, IndexHolder::Pointer) override {
     stats_.set_trained_count(0u);
     stats_.set_trained_costtime(0u);
     return 0;
   }
 
   //! Train the data
-  int train(const IndexTrainer::Pointer &) override {
+  int do_train(const IndexTrainer::Pointer &) override {
     stats_.set_trained_count(0u);
     stats_.set_trained_costtime(0u);
     return 0;
   }
 
   //! Build the index
-  int build(IndexThreads::Pointer, IndexHolder::Pointer holder) override;
+  int do_build(IndexThreads::Pointer, IndexHolder::Pointer holder) override;
 
   //! Dump index into storage
-  int dump(const IndexDumper::Pointer &dumper) override;
+  int do_dump(const IndexDumper::Pointer &dumper) override;
 
   //! Retrieve statistics
   const IndexBuilder::Stats &stats() const override {

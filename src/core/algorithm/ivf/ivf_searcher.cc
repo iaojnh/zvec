@@ -152,25 +152,24 @@ int IVFSearcher::unload() {
   return 0;
 }
 
-int IVFSearcher::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                                Context::Pointer &context) const {
+int IVFSearcher::do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                              Context::Pointer &context) const {
   return search_bf_impl(query, qmeta, 1, context);
 }
 
-int IVFSearcher::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
-                                uint32_t count,
-                                Context::Pointer &context) const {
+int IVFSearcher::do_search_bf(const void *query, const IndexQueryMeta &qmeta,
+                              uint32_t count, Context::Pointer &context) const {
   return search_batch(query, qmeta, count, context, true);
 }
 
-int IVFSearcher::search_bf_by_keys_impl(const void *query,
-                                        const std::vector<uint64_t> &keys,
-                                        const IndexQueryMeta &qmeta,
-                                        Context::Pointer &context) const {
+int IVFSearcher::do_search_bf_by_keys(const void *query,
+                                      const std::vector<uint64_t> &keys,
+                                      const IndexQueryMeta &qmeta,
+                                      Context::Pointer &context) const {
   return search_batch(query, qmeta, 1, context, true, nullptr, &keys);
 }
 
-int IVFSearcher::search_bf_by_p_keys_impl(
+int IVFSearcher::do_search_bf_by_p_keys(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
@@ -181,13 +180,13 @@ int IVFSearcher::search_bf_by_p_keys_impl(
   return search_batch(query, qmeta, count, context, true, &p_keys);
 }
 
-int IVFSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                             Context::Pointer &context) const {
+int IVFSearcher::do_search(const void *query, const IndexQueryMeta &qmeta,
+                           Context::Pointer &context) const {
   return search_impl(query, qmeta, 1, context);
 }
 
-int IVFSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                             uint32_t count, Context::Pointer &context) const {
+int IVFSearcher::do_search(const void *query, const IndexQueryMeta &qmeta,
+                           uint32_t count, Context::Pointer &context) const {
   return search_batch(query, qmeta, count, context,
                       entity_->vector_count() <= bruteforce_threshold_);
 }
@@ -253,10 +252,10 @@ int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
       auto &heap = ctx->mutable_result_heap();
       heap.clear();
       const auto *keys = single_keys ? single_keys
-                                   : p_keys ? &(*p_keys)[base + q] : nullptr;
+                         : p_keys    ? &(*p_keys)[base + q]
+                                     : nullptr;
       if (keys) {
-        ret = entity->search_by_p_keys(one, *keys, filter, &heap,
-                                       &stats);
+        ret = entity->search_by_p_keys(one, *keys, filter, &heap, &stats);
         ivf_check_error_code(ret);
       } else if (brute) {
         ret = !filter.is_valid() ? entity->search(one, &heap, &stats)
@@ -296,7 +295,7 @@ const IndexSearcher::Stats &IVFSearcher::stats() const {
   return stats_;
 }
 
-IndexSearcher::Context::Pointer IVFSearcher::create_context() const {
+IndexSearcher::Context::Pointer IVFSearcher::do_create_context() const {
   if (searcher_state_ != STATE_LOADED) {
     LOG_ERROR("Load the index first before create context");
     return nullptr;

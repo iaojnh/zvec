@@ -196,9 +196,8 @@ int MultiChunkClusterAlgorithm::cluster(IndexThreads::Pointer threads,
   std::atomic<size_t> finished{0};
 
   for (size_t i = 0; i < threads->count(); ++i) {
-    task_group->submit(
-        ailego::Closure::New(this, &MultiChunkClusterAlgorithm::do_cluster, i,
-                             threads->count(), &cents, &finished));
+    task_group->execute(this, &MultiChunkClusterAlgorithm::do_cluster, i,
+                        threads->count(), &cents, &finished);
   }
 
   {
@@ -288,9 +287,8 @@ int MultiChunkClusterAlgorithm::label(IndexThreads::Pointer threads,
   std::atomic<size_t> finished{0};
 
   for (size_t i = 0; i < threads->count(); ++i) {
-    task_group->submit(
-        ailego::Closure::New(this, &MultiChunkClusterAlgorithm::do_label, i,
-                             threads->count(), cents, out, &finished));
+    task_group->execute(this, &MultiChunkClusterAlgorithm::do_label, i,
+                        threads->count(), cents, out, &finished);
   }
 
   {
