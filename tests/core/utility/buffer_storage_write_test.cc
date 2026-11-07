@@ -596,8 +596,8 @@ TEST_F(BufferStorageWriteTest, WriteBatchReportsBudgetDenialAndCanRetry) {
   AILEGO_DEFER([&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
   ASSERT_TRUE(pool.configure_process_rss_limit(1));
   const char replacement = 'b';
-  const IndexStorage::SegmentData writes[] = {
-      {0, 1, &replacement}, {page, 1, &replacement}};
+  const IndexStorage::SegmentData writes[] = {{0, 1, &replacement},
+                                              {page, 1, &replacement}};
   EXPECT_FALSE(segment->write_batch(writes, 2));
   EXPECT_EQ(IndexError_NoMemory, segment->write_error());
   const IndexStorage::SegmentData invalid{2 * page, 1, &replacement};
@@ -2682,10 +2682,11 @@ TEST_F(BufferStorageWriteTest,
   EXPECT_GE(
       pool.external_used(),
       baseline + ailego::MemoryLimitPool::retained_block_size(2 * length));
-  std::thread reader([block = std::move(retained), &payload]() mutable {
-    EXPECT_EQ(0, std::memcmp(payload.data(), block.data(), length));
-    block.reset();
-  });
+  std::thread reader(
+      [block = std::move(retained), &payload, length = length]() mutable {
+        EXPECT_EQ(0, std::memcmp(payload.data(), block.data(), length));
+        block.reset();
+      });
   reader.join();
   EXPECT_EQ(baseline, pool.external_used());
 }

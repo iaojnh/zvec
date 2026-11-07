@@ -19,6 +19,48 @@ namespace zvec::detail {
 // useful only in isolated tests. Returned payloads can retain a shared Lease;
 // release the materialization slot before transferring it to another thread.
 class ResultMemoryAllowance {
+  // Keep one payload-equivalent as lifetime RSS backing: live heap pages may
+  // be paged out and faulted back in. The second planning equivalent covers
+  // copy/allocator headroom, not a second untouched allocation. Work without
+  // a scoped copy keeps that extra RSS projection too.
+  class BackingReservation {
+   public:
+    ~BackingReservation() {
+      retain_at_most(0);
+    }
+    size_t bytes() const {
+      return bytes_;
+    }
+    void acquire(size_t target, size_t rss_target, size_t materialization,
+                 bool pending_copy) {
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      const size_t growth = target > bytes_ ? target - bytes_ : 0;
+      const size_t rss_growth =
+          rss_target > rss_bytes_ ? rss_target - rss_bytes_ : 0;
+      if (growth && !pool.try_charge_workspace_plan(growth))
+        throw std::bad_alloc();
+      if (!pool.try_charge_process_backing(rss_growth, materialization,
+                                           pending_copy)) {
+        if (growth) pool.release_workspace_plan(growth);
+        throw std::bad_alloc();
+      }
+      bytes_ += growth;
+      rss_bytes_ += rss_growth;
+    }
+    void retain_at_most(size_t bytes) {
+      if (bytes >= bytes_) return;
+      assert(bytes == 0);
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      if (rss_bytes_) pool.release_process_backing(rss_bytes_);
+      pool.release_workspace_plan(bytes_);
+      bytes_ = rss_bytes_ = 0;
+    }
+
+   private:
+    size_t bytes_{0};
+    size_t rss_bytes_{0};
+  };
+
  public:
   // Keep measured headroom while the producer is between admission and copy.
   // Cancel unused admission. After starting, a failed partial copy can still
@@ -45,22 +87,6 @@ class ResultMemoryAllowance {
    private:
     friend class ResultMemoryAllowance;
 
-    bool reserve(ailego::MemoryLimitPool &pool, size_t bytes,
-                 ailego::MemoryReservation &backing, size_t growth) {
-      if (bytes > std::numeric_limits<size_t>::max() - bytes_) return false;
-      if (growth) {
-        try {
-          backing.add_with_pending_copy(growth, bytes);
-        } catch (const std::bad_alloc &) {
-          return false;
-        }
-      } else if (bytes && !pool.try_reserve_materialization(bytes)) {
-        return false;
-      }
-      bytes_ += bytes;
-      return true;
-    }
-
     size_t bytes_{0};
     bool started_{false};
   };
@@ -76,7 +102,7 @@ class ResultMemoryAllowance {
     Lease(const Lease &) = delete;
     Lease &operator=(const Lease &) = delete;
     ~Lease() {
-      if (bytes_ != 0) owner_->release_active(bytes_);
+      if (bytes_ != 0) owner_->release_active(bytes_, native_bytes_);
     }
 
     bool enabled() const {
@@ -109,8 +135,10 @@ class ResultMemoryAllowance {
     void add(size_t bytes, size_t materialization) {
       if (!owner_ || (!bytes && !materialization)) return;
       begin_materialization();
-      bytes_ +=
+      const size_t admitted =
           owner_->acquire(bytes, backing_quantum_, materialization, nullptr);
+      bytes_ += admitted;
+      native_bytes_ += admitted;
     }
 
     void add_pending(size_t bytes, PendingCopy &pending) {
@@ -132,6 +160,7 @@ class ResultMemoryAllowance {
       assert(!materialization_.owns_lock() &&
              !other.materialization_.owns_lock());
       bytes_ += std::exchange(other.bytes_, 0);
+      native_bytes_ += std::exchange(other.native_bytes_, 0);
     }
 
     size_t bytes() const noexcept {
@@ -140,13 +169,16 @@ class ResultMemoryAllowance {
 
     void retain_at_most(size_t bytes) {
       if (bytes >= bytes_) return;
-      owner_->release_active(bytes_ - bytes);
+      const size_t native = std::min(native_bytes_, bytes);
+      owner_->release_active(bytes_ - bytes, native_bytes_ - native);
       bytes_ = bytes;
+      native_bytes_ = native;
     }
 
    private:
     ResultMemoryAllowance *owner_;
     size_t bytes_{0};
+    size_t native_bytes_{0};
     bool serialize_materialization_;
     size_t backing_quantum_;
     // Destruction releases active bytes above before allowing the next call.
@@ -199,29 +231,30 @@ class ResultMemoryAllowance {
     // consumes the whole cache. Keep at least three quarters for native
     // storage, metadata and decoding; callers can split large result batches.
     if (target > capacity / 4) throw std::bad_alloc();
-    const size_t previous = reservation_.bytes();
-    if (pending) {
-      // Reject before changing backing. Rolling an unmaterialized growth
-      // back as a resident release can retire another owner's RSS overlap.
-      if (!pending->reserve(pool, materialization, reservation_,
-                            target > previous ? target - previous : 0)) {
-        throw std::bad_alloc();
-      }
-    } else if (target > previous) {
-      // Admission may evict native cache pages. Bindings must release the GIL
-      // before calling add(); no Python code executes while this lock is held.
-      reservation_.add(target - previous, materialization);
-    } else if (!pool.try_materialize(materialization)) {
+    const size_t native_high_water = native_active_ + (pending ? 0 : bytes);
+    const size_t native_remainder = native_high_water % backing_quantum;
+    const size_t native_padding =
+        native_remainder ? backing_quantum - native_remainder : 0;
+    if (native_padding > max_active - native_high_water) throw std::bad_alloc();
+    const size_t rss_target =
+        high_water + padding + native_high_water + native_padding;
+    if (pending &&
+        materialization > std::numeric_limits<size_t>::max() - pending->bytes_)
       throw std::bad_alloc();
-    }
+    reservation_.acquire(target, rss_target, materialization,
+                         pending != nullptr);
+    if (pending) pending->bytes_ += materialization;
     active_ += bytes;
+    if (!pending) native_active_ += bytes;
     return bytes;
   }
 
-  void release_active(size_t bytes) {
+  void release_active(size_t bytes, size_t native) {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(active_ >= bytes);
     active_ -= bytes;
+    assert(native_active_ >= native);
+    native_active_ -= native;
     // Normally keep the high water for reuse. Under process pressure an
     // entirely idle result allowance must yield to mandatory I/O and decode.
     // Retained heap pages still count in the process's measured RSS.
@@ -233,8 +266,9 @@ class ResultMemoryAllowance {
 
   mutable std::mutex mutex_;
   std::mutex materialization_mutex_;
-  ailego::MemoryReservation reservation_;
+  BackingReservation reservation_;
   size_t active_{0};
+  size_t native_active_{0};
 };
 
 // All forward-result paths share one high water and one active limit. Separate

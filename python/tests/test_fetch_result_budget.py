@@ -664,11 +664,11 @@ def verify_fetch_inputs(path, kind, mmap, dimension, count):
         assert fetch(["0", "missing", "0"])["0"] is not None
 
     for include_vector in (False, True):
-        # Inline ASCII payloads live in the native string slots. With the
-        # corrected accounting, 100k duplicates fit; the same number of unique
-        # IDs additionally needs enough hash nodes/buckets to exceed admission.
+        # Inline ASCII payloads live in the native string slots. The original
+        # 70k duplicate-ID batch fits; a larger unique-ID batch also needs
+        # enough hash nodes and buckets to exceed the shared allowance.
         assert (
-            coll.fetch(["missing000000"] * 100_000, include_vector=include_vector) == {}
+            coll.fetch(["missing000000"] * 70_000, include_vector=include_vector) == {}
         )
         # With the shared allowance nearly full, either the next hash growth
         # or native batch admission can be the first to reject the request.

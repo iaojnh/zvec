@@ -961,9 +961,8 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
       bool admitted;
       if (backing == Backing::kPending) {
         admitted = process_rss_.try_reserve(bytes);
-      } else if (backing == Backing::kPendingCopy) {
-        admitted =
-            process_rss_.try_acquire_with_pending_copy(bytes, materialization);
+      } else if (backing == Backing::kPlan) {
+        admitted = true;
       } else {
         admitted = process_rss_.try_acquire(bytes, materialization);
       }
@@ -986,7 +985,7 @@ size_t MemoryLimitPool::release_committed(
   assert(previous >= bytes);
   if (backing == Backing::kPending) {
     process_rss_.finish_reservation(bytes, false);
-  } else {
+  } else if (backing != Backing::kPlan) {
     process_rss_.release_projected_mapping(bytes, projection);
   }
   return previous;
@@ -1419,7 +1418,8 @@ void MemoryLimitPool::background_evict_loop() {
     process_rss_.refresh();
     if (process_rss_.limit()) capacity_cv_.notify_all();
     const auto now = std::chrono::steady_clock::now();
-    if (process_rss_.pressure() &&
+    if ((process_rss_.pressure() ||
+         workspace_waiting_size_.load(std::memory_order_relaxed) != 0) &&
         now - last_process_reclaim >= milliseconds(20)) {
       // RocksDB has a separate cache budget. Retire its unpinned entries too,
       // including when vector pages cannot make further reclamation progress.
@@ -1613,11 +1613,14 @@ bool MemoryLimitPool::try_charge_workspace(size_t buffer_size,
                                     Backing::kLive, materialization);
 }
 
-bool MemoryLimitPool::try_charge_workspace_with_pending_copy(
-    size_t bytes, size_t materialization) {
+bool MemoryLimitPool::try_charge_workspace_plan(size_t bytes) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   return try_charge_fixed_with_wait(bytes, &external_used_size_,
-                                    Backing::kPendingCopy, materialization);
+                                    Backing::kPlan);
+}
+
+void MemoryLimitPool::release_workspace_plan(size_t bytes) {
+  release_fixed(bytes, &external_used_size_, Backing::kPlan);
 }
 
 bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
@@ -1715,8 +1718,7 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
     return false;
   }
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
-  const size_t fixed = fixed_used();
-  if (fixed > capacity || buffer_size > capacity - fixed) {
+  if (buffer_size > capacity) {
     return false;
   }
   size_t waiting = workspace_waiting_size_.load(std::memory_order_relaxed);
@@ -1747,6 +1749,10 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
                                   false);
     if (try_charge_fixed(buffer_size, counter, backing, materialization))
       return true;
+    // One maintenance pass can release idle planning allowances. If fixed
+    // live reservations still cannot fit, page eviction cannot help further.
+    const size_t fixed = fixed_used();
+    if (fixed > capacity || buffer_size > capacity - fixed) return false;
     if (materialization &&
         !process_rss_.materialization_allowed(materialization))
       return false;
@@ -1768,10 +1774,7 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
                                        Backing backing,
                                        size_t materialization) {
   if (buffer_size == 0) {
-    return !materialization ||
-           (backing == Backing::kPendingCopy
-                ? process_rss_.try_reserve_materialization(materialization)
-                : process_rss_.try_materialize(materialization));
+    return !materialization || process_rss_.try_materialize(materialization);
   }
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
   if (capacity == 0 || buffer_size > capacity) {

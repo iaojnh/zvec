@@ -302,6 +302,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool try_reserve_process_backing(size_t bytes) {
     return process_rss_.try_reserve(bytes);
   }
+  bool try_charge_process_backing(size_t bytes, size_t materialization,
+                                  bool pending_copy) {
+    return pending_copy ? process_rss_.try_acquire_with_pending_copy(
+                              bytes, materialization)
+                        : process_rss_.try_acquire(bytes, materialization);
+  }
   // For separately budgeted backing, e.g. the RocksDB cache allocator.
   bool account_pending_process_backing(size_t bytes) {
     return process_rss_.account_pending(bytes);
@@ -339,10 +345,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   // Also debit the full expected RSS increase when it differs from the
   // incremental capacity charge. Metadata allowances use the same policy.
   bool try_charge_workspace(size_t buffer_size, size_t materialization);
-  // Atomically admit overlapping lifetime backing and an in-flight copy.
-  // The caller must finish_materialization() after consuming this headroom.
-  bool try_charge_workspace_with_pending_copy(size_t bytes,
-                                              size_t materialization);
+  // Logical quota for a heap-copy plan. The copy separately reserves measured
+  // RSS headroom; unused planning capacity is not an allocated lazy mapping.
+  bool try_charge_workspace_plan(size_t bytes);
+  void release_workspace_plan(size_t bytes);
 
   //! Reserve non-evictable buffer-pool metadata capacity.
   bool try_charge_metadata(const size_t buffer_size);
@@ -558,7 +564,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   struct QueueAllocationHeader;
   struct QueueMappingHeader;
   struct QueueMemorySlab;
-  enum class Backing { kLive, kPending, kPendingCopy };
+  enum class Backing { kLive, kPending, kPlan };
 
   MemoryLimitPool() = default;
   ~MemoryLimitPool();

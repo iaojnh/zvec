@@ -44,14 +44,6 @@ class MemoryReservation {
       throw std::bad_alloc();
     add(count * element_size);
   }
-  void add_with_pending_copy(size_t bytes, size_t materialization) {
-    auto &pool = MemoryLimitPool::get_instance();
-    if (!pool.capacity()) return;
-    if (bytes > std::numeric_limits<size_t>::max() - bytes_ ||
-        !pool.try_charge_workspace_with_pending_copy(bytes, materialization))
-      throw std::bad_alloc();
-    bytes_ += bytes;
-  }
   // Allocate may throw before obtaining backing. Only transfer a successful
   // allocation into this owner's lifetime accounting.
   template <typename Allocate>

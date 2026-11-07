@@ -92,8 +92,8 @@ TEST_F(ResultMemoryAllowanceTest, PendingCopyRetainsHeadroomAcrossSamples) {
 
 TEST_F(ResultMemoryAllowanceTest, RejectedPendingCopyLeavesBackingUnchanged) {
   auto &native = ailego::MemoryLimitPool::get_instance();
-  ASSERT_TRUE(ailego::MemoryLimitPoolTestPeer::configure(
-      native, 64 * kMiB, 60 * kMiB));
+  ASSERT_TRUE(
+      ailego::MemoryLimitPoolTestPeer::configure(native, 64 * kMiB, 60 * kMiB));
   auto restore = ailego::ScopeGuard::Make(
       [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
   ResultMemoryAllowance allowance;
@@ -105,7 +105,43 @@ TEST_F(ResultMemoryAllowanceTest, RejectedPendingCopyLeavesBackingUnchanged) {
   EXPECT_NO_THROW(lease.add_pending(kMiB, pending));
 }
 
-TEST_F(ResultMemoryAllowanceTest, ReusedBackingObeysCriticalPressureAndRecovery) {
+TEST_F(ResultMemoryAllowanceTest,
+       CopyPlanSlackDoesNotBecomeUntouchedRssBacking) {
+  ASSERT_EQ(0, pool_.init(128 * kMiB));
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 128 * kMiB, 112 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease copy(&allowance, false, kMiB);
+    ResultMemoryAllowance::PendingCopy pending;
+    ASSERT_NO_THROW(copy.add_pending(12 * kMiB, kMiB, pending));
+    EXPECT_EQ(24 * kMiB, allowance.reserved_bytes());
+    Peer::sample(native, 112 * kMiB);
+    EXPECT_FALSE(native.try_materialize(16 * kMiB));
+    pending.start();
+  }
+  Peer::sample(native, 113 * kMiB);
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  {
+    // Work without a scoped copy still reserves its possibly untouched
+    // physical backing, independently of the existing logical copy plan.
+    ResultMemoryAllowance::Lease unscoped(&allowance, false, kMiB);
+    EXPECT_THROW(unscoped.add(12 * kMiB, kMiB), std::bad_alloc);
+    EXPECT_EQ(0u, allowance.active_bytes());
+    EXPECT_EQ(0u, allowance.reserved_bytes());
+  }
+  {
+    ResultMemoryAllowance::Lease retry(&allowance, false, kMiB);
+    ResultMemoryAllowance::PendingCopy pending;
+    EXPECT_NO_THROW(retry.add_pending(12 * kMiB, kMiB, pending));
+  }
+}
+
+TEST_F(ResultMemoryAllowanceTest,
+       ReusedBackingObeysCriticalPressureAndRecovery) {
   ResultMemoryAllowance allowance;
   {
     ResultMemoryAllowance::Lease warmup(&allowance);
