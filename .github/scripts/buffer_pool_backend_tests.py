@@ -34,6 +34,8 @@ NATIVE_TARGETS = (
     "flat_flow_workspace_test",
     "turbo_pq_int8_training_memory_test",
     "ivf_buffered_build_test",
+    "search_heap_test",
+    "fts_column_indexer_test",
 )
 PYTHON_TESTS = (
     "test_arrow_executor_budget.py",

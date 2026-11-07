@@ -109,7 +109,8 @@ TEST_F(CollectionWriteBudgetTest, PrimaryKeyReadDenialIsNotAMiss) {
   ASSERT_TRUE(cache);
   const auto capacity = cache->GetCapacity();
   {
-    auto restore = ailego::ScopeGuard::Make([&] { cache->SetCapacity(capacity); });
+    auto restore =
+        ailego::ScopeGuard::Make([&] { cache->SetCapacity(capacity); });
     cache->SetCapacity(1);
     cache->EraseUnRefEntries();
     auto fetched = (*collection)->fetch({"existing"});
@@ -121,8 +122,8 @@ TEST_F(CollectionWriteBudgetTest, PrimaryKeyReadDenialIsNotAMiss) {
     EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, columns.error().code());
 
     auto replacement = docs("existing", "replacement");
-    for (const auto write : {&Collection::insert, &Collection::update,
-                             &Collection::upsert}) {
+    for (const auto write :
+         {&Collection::insert, &Collection::update, &Collection::upsert}) {
       auto result = ((**collection).*write)(replacement);
       ASSERT_TRUE(result);
       ASSERT_EQ(1u, result->size());
@@ -151,11 +152,14 @@ TEST_F(CollectionWriteBudgetTest, RejectsBeforeCreatingCollectionFiles) {
   EXPECT_FALSE(std::filesystem::exists(path("denied")));
 }
 
-TEST_F(CollectionWriteBudgetTest, InvertedArrayDenialPreservesExistingDocument) {
+TEST_F(CollectionWriteBudgetTest,
+       InvertedArrayDenialPreservesExistingDocument) {
   CollectionSchema with_terms("array_write_budget");
-  ASSERT_TRUE(with_terms.add_field(std::make_shared<FieldSchema>(
-      "terms", DataType::ARRAY_INT32, false,
-      std::make_shared<InvertIndexParams>(false))).ok());
+  ASSERT_TRUE(with_terms
+                  .add_field(std::make_shared<FieldSchema>(
+                      "terms", DataType::ARRAY_INT32, false,
+                      std::make_shared<InvertIndexParams>(false)))
+                  .ok());
   auto writer = Collection::CreateAndOpen(path("terms"), with_terms,
                                           {false, false, kMiB});
   ASSERT_TRUE(writer) << writer.error().message();
@@ -175,13 +179,14 @@ TEST_F(CollectionWriteBudgetTest, InvertedArrayDenialPreservesExistingDocument) 
     auto denied = writer.value()->upsert(batch);
     ASSERT_TRUE(denied);
     EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied->front().code());
-    EXPECT_EQ(0u, denied->front().message().find("Insufficient inverted array"));
+    EXPECT_EQ(0u,
+              denied->front().message().find("Insufficient inverted array"));
   }
   auto fetched = writer.value()->fetch({"existing"});
   ASSERT_TRUE(fetched);
   ASSERT_NE(nullptr, fetched->at("existing"));
-  EXPECT_EQ(original, fetched->at("existing")->get_ref<std::vector<int32_t>>(
-                          "terms"));
+  EXPECT_EQ(original,
+            fetched->at("existing")->get_ref<std::vector<int32_t>>("terms"));
   fetched->clear();
 
   auto updated = writer.value()->upsert(batch);
@@ -191,8 +196,8 @@ TEST_F(CollectionWriteBudgetTest, InvertedArrayDenialPreservesExistingDocument) 
   fetched = writer.value()->fetch({"existing"});
   ASSERT_TRUE(fetched);
   ASSERT_NE(nullptr, fetched->at("existing"));
-  EXPECT_EQ(expanded, fetched->at("existing")->get_ref<std::vector<int32_t>>(
-                          "terms"));
+  EXPECT_EQ(expanded,
+            fetched->at("existing")->get_ref<std::vector<int32_t>>("terms"));
   fetched->clear();
   ASSERT_TRUE(writer.value()->close().ok());
 }
@@ -207,7 +212,8 @@ TEST_F(CollectionWriteBudgetTest, DefaultBufferReturnsManagedPeakAfterFlush) {
   auto inserted = writer.value()->insert(batch);
   ASSERT_TRUE(inserted.has_value());
   ASSERT_TRUE(inserted->front().ok());
-  EXPECT_EQ(264 * kMiB, external_without_forward());
+  EXPECT_EQ(4 * size_t{DEFAULT_MAX_BUFFER_SIZE} + 8 * kMiB,
+            external_without_forward());
   ASSERT_TRUE(writer.value()->flush().ok());
   EXPECT_LT(external_without_forward(), kMiB);
   EXPECT_EQ(8 * kMiB,
@@ -501,8 +507,8 @@ TEST_F(CollectionWriteBudgetTest, ReadmissionFailureDoesNotMutateAndCanRetry) {
 }
 
 TEST_F(CollectionWriteBudgetTest, UpdateAdmitsFieldCopiesBeforeMerging) {
-  auto writer = Collection::CreateAndOpen(
-      path("update_merge_admission"), schema(), {false, false, kMiB});
+  auto writer = Collection::CreateAndOpen(path("update_merge_admission"),
+                                          schema(), {false, false, kMiB});
   ASSERT_TRUE(writer) << writer.error().message();
   auto initial = docs("existing", "before");
   auto inserted = (*writer)->insert(initial);
@@ -914,7 +920,7 @@ TEST_F(CollectionWriteBudgetTest, FilterDeleteStagingFailureDoesNotDeleteDocs) {
 
 TEST_F(CollectionWriteBudgetTest, FilterDeleteAdmitsBeforeCopyingQueryText) {
   auto writer = Collection::CreateAndOpen(path("delete_input"), schema(),
-                                         {false, false, kMiB});
+                                          {false, false, kMiB});
   ASSERT_TRUE(writer) << writer.error().message();
   auto batch = docs("retained", "value");
   ASSERT_TRUE(writer.value()->insert(batch));

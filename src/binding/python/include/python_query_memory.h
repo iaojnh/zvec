@@ -175,6 +175,21 @@ class PythonQueryMemory {
     }
     if (PyUnicode_Check(value.ptr()) || PyBytes_Check(value.ptr()))
       return original;
+    if (PyRange_Check(value.ptr())) {
+      // range is immutable and cannot be subclassed. Its native length is
+      // reliable, unlike arbitrary sequence protocols. Reject the complete
+      // expansion before constructing hundreds of thousands of Python ints
+      // whose allocator backing may remain resident after a refused request.
+      const auto count = PyObject_Length(value.ptr());
+      if (count < 0) throw pybind11::error_already_set();
+      ResultMemoryAllowance::PendingCopy pending;
+      reserve(BindingMemoryBytes(static_cast<size_t>(count), 64, 64), pending);
+      pending.start();
+      auto staged = pybind11::reinterpret_steal<pybind11::list>(
+          PySequence_List(value.ptr()));
+      if (!staged) throw pybind11::error_already_set();
+      return staged;
+    }
     pybind11::list staged;
     if (exact) {
       ResultMemoryAllowance::PendingCopy pending;

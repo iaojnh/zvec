@@ -1780,6 +1780,13 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
   if (buffer_size > capacity) {
     return false;
   }
+  const size_t fixed = fixed_used();
+  if (fixed > capacity || buffer_size > capacity - fixed) {
+    // Only a registered cache reclaimer can release idle fixed allowances.
+    // Waiting for page eviction cannot free live external reservations.
+    std::lock_guard<std::mutex> lock(process_reclaimer_mutex_);
+    if (!process_reclaimer_) return false;
+  }
   size_t waiting = workspace_waiting_size_.load(std::memory_order_relaxed);
   do {
     if (buffer_size > std::numeric_limits<size_t>::max() - waiting)

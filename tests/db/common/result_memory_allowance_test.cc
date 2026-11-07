@@ -29,6 +29,10 @@ struct MemoryLimitPoolTestPeer {
     pool.process_rss_.refresh(true);
   }
 
+  static bool workspace_waiting(MemoryLimitPool &pool) {
+    return pool.workspace_waiting_size_.load(std::memory_order_relaxed) != 0;
+  }
+
   inline static std::atomic<size_t> sample_{0};
 };
 
@@ -231,10 +235,18 @@ TEST_F(ResultMemoryAllowanceTest, PendingCopyWaitsForCompetingRssBacking) {
   auto restore = ailego::ScopeGuard::Make(
       [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
   ASSERT_TRUE(native.try_charge_process_backing(8 * kMiB, 0, false));
+  std::promise<void> ready;
+  auto started = ready.get_future();
   auto release = std::async(std::launch::async, [&] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    ready.set_value();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!Peer::workspace_waiting(native) &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
     native.release_process_backing(8 * kMiB);
   });
+  started.wait();
   ResultMemoryAllowance allowance;
   ResultMemoryAllowance::Lease lease(&allowance, false, kMiB);
   ResultMemoryAllowance::PendingCopy pending;
