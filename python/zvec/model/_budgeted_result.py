@@ -95,7 +95,11 @@ def _retain_document(document, owner, key=None):
     if document is None:
         return None
     pk, score, fields, vectors = document
-    if not isinstance(key, _ResultString) or key._memory_owner is not owner or key != pk:
+    if (
+        not isinstance(key, _ResultString)
+        or key._memory_owner is not owner
+        or key != pk
+    ):
         key = _ResultString(pk, owner)
     return (
         key,

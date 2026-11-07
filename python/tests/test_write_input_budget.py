@@ -41,8 +41,9 @@ def verify(path, operation, direct):
     assert getattr(coll, operation)([small])[0].ok() == (operation != "insert")
     assert coll.fetch("small")["small"].field("payload") == "中文🙂"
     # Streaming Python document inputs must also retain incremental admission.
-    assert coll.insert(zvec.Doc("stream" + str(i), fields={"payload": "ok"})
-                       for i in range(3))
+    assert coll.insert(
+        zvec.Doc("stream" + str(i), fields={"payload": "ok"}) for i in range(3)
+    )
     coll.close()
 
 
@@ -123,7 +124,9 @@ def verify_long_status_messages(path):
 def run_worker(tmp_path, operation, direct=False):
     completed = subprocess.run(
         [sys.executable, __file__, str(tmp_path / "db"), operation, str(int(direct))],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
