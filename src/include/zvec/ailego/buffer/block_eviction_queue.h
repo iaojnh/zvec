@@ -191,6 +191,8 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
   }
 
  private:
+  bool dequeue_priority(size_t priority, BlockType &item);
+
   bool evict_single_block(
       BlockType &item, bool age_protected,
       std::array<size_t, kQueueCount> *scan_remaining = nullptr);

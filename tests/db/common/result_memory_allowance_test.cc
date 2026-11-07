@@ -110,7 +110,7 @@ TEST_F(ResultMemoryAllowanceTest,
   ASSERT_EQ(0, pool_.init(128 * kMiB));
   auto &native = ailego::MemoryLimitPool::get_instance();
   using Peer = ailego::MemoryLimitPoolTestPeer;
-  ASSERT_TRUE(Peer::configure(native, 128 * kMiB, 112 * kMiB));
+  ASSERT_TRUE(Peer::configure(native, 128 * kMiB, 124 * kMiB));
   auto restore = ailego::ScopeGuard::Make(
       [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
   ResultMemoryAllowance allowance;
@@ -119,11 +119,11 @@ TEST_F(ResultMemoryAllowanceTest,
     ResultMemoryAllowance::PendingCopy pending;
     ASSERT_NO_THROW(copy.add_pending(12 * kMiB, kMiB, pending));
     EXPECT_EQ(24 * kMiB, allowance.reserved_bytes());
-    Peer::sample(native, 112 * kMiB);
-    EXPECT_FALSE(native.try_materialize(16 * kMiB));
+    Peer::sample(native, 124 * kMiB);
+    EXPECT_FALSE(native.try_materialize(4 * kMiB));
     pending.start();
   }
-  Peer::sample(native, 113 * kMiB);
+  Peer::sample(native, 125 * kMiB);
   EXPECT_EQ(0u, allowance.reserved_bytes());
   {
     // Work without a scoped copy still reserves its possibly untouched
@@ -138,6 +138,41 @@ TEST_F(ResultMemoryAllowanceTest,
     ResultMemoryAllowance::PendingCopy pending;
     EXPECT_NO_THROW(retry.add_pending(12 * kMiB, kMiB, pending));
   }
+}
+
+TEST_F(ResultMemoryAllowanceTest, TrimmingCopyOnlyLeaseReleasesItsProjection) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 63 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease copy(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  ASSERT_NO_THROW(copy.add_pending(0, kMiB, pending));
+  copy.retain_at_most(0);
+  pending.finish();
+  Peer::sample(native, 64 * kMiB);
+  ResultMemoryAllowance::Lease planning(&allowance);
+  ResultMemoryAllowance::PendingCopy no_copy;
+  EXPECT_NO_THROW(planning.add_pending(kMiB, 0, no_copy));
+}
+
+TEST_F(ResultMemoryAllowanceTest, ReclaimsUnusedHighWaterWithLiveSmallLease) {
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease warmup(&allowance, false, kMiB);
+    warmup.add(6 * kMiB);
+  }
+  ResultMemoryAllowance::Lease live(&allowance, false, kMiB);
+  live.add(1);
+  ASSERT_EQ(12 * kMiB, allowance.reserved_bytes());
+  allowance.reclaim_idle();
+  EXPECT_EQ(1u, allowance.active_bytes());
+  EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
+  EXPECT_EQ(2 * kMiB, pool_.external_used());
+  EXPECT_NO_THROW(live.add(kMiB));
+  EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
 }
 
 TEST_F(ResultMemoryAllowanceTest, PendingCopyWaitsForCompetingRssBacking) {
@@ -155,7 +190,7 @@ TEST_F(ResultMemoryAllowanceTest, PendingCopyWaitsForCompetingRssBacking) {
   ResultMemoryAllowance allowance;
   ResultMemoryAllowance::Lease lease(&allowance, false, kMiB);
   ResultMemoryAllowance::PendingCopy pending;
-  EXPECT_NO_THROW(lease.add_pending(12 * kMiB, kMiB, pending));
+  EXPECT_NO_THROW(lease.add_pending(12 * kMiB, 12 * kMiB, pending));
   release.get();
   EXPECT_EQ(12 * kMiB, allowance.active_bytes());
 }

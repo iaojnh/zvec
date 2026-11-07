@@ -616,6 +616,50 @@ TEST_F(PoolAdmissionTest, MandatoryWorkspaceReclaimsIdleFixedAllowance) {
   pool_.release_workspace_plan(8 * page_);
 }
 
+TEST_F(PoolAdmissionTest, PinnedRequeuesDoNotStarveOlderProducer) {
+  ASSERT_EQ(0, pool_.init(baseline_ + (4UL << 20)));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  auto &queue = BlockEvictionQueue::get_instance();
+  BlockEvictionQueue::BlockType stale;
+  while (queue.evict_single_block(stale)) {
+  }
+  class Owner : public EvictableBlockOwner {
+   public:
+    Owner() {
+      BlockEvictionQueue::get_instance().set_valid(this);
+    }
+    ~Owner() override {
+      BlockEvictionQueue::get_instance().set_invalid(this);
+    }
+    bool is_dead_block(eviction_key_t key, version_t) override {
+      return key == 1 && evicted;
+    }
+    bool evict_block(eviction_key_t key) override {
+      if (key == 1) {
+        evicted = true;
+        return true;
+      }
+      enqueue(0);
+      return false;
+    }
+    void enqueue(eviction_key_t key) {
+      BlockEvictionQueue::BlockType item;
+      item.owner = this;
+      item.owner_key = key;
+      EXPECT_TRUE(BlockEvictionQueue::get_instance().add_single_block(item, 0));
+    }
+    bool evicted{false};
+  } owner;
+  owner.enqueue(1);
+  std::thread consumer([&] {
+    owner.enqueue(0);
+    for (size_t attempt = 0; attempt < 512 && !owner.evicted; ++attempt)
+      queue.batch_recycle(1);
+  });
+  consumer.join();
+  EXPECT_TRUE(owner.evicted);
+}
+
 TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
   ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));
   MemoryLimitPoolTestPeer::stop_background(pool_);

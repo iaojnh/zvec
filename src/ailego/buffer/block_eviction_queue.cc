@@ -597,6 +597,21 @@ size_t MemoryLimitPool::page_buffer_size() {
   return page_size;
 }
 
+bool BlockEvictionQueue::dequeue_priority(size_t priority, BlockType &item) {
+  // Tokenless dequeue can repeatedly choose the reclaiming thread's own
+  // requeued pinned page and starve older producer streams forever. Consumer
+  // tokens rotate across producers without allocating on the pressure path.
+  thread_local std::array<std::optional<ConcurrentQueue::consumer_token_t>,
+                          kQueueCount>
+      consumers;
+  if (!consumers[priority])
+    consumers[priority].emplace(evict_queues_[priority]);
+  if (!evict_queues_[priority].try_dequeue(*consumers[priority], item))
+    return false;
+  approximate_queue_sizes_[priority].fetch_sub(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool BlockEvictionQueue::evict_single_block(BlockType &item) {
   return evict_single_block(item, /*age_protected=*/false);
 }
@@ -617,10 +632,8 @@ bool BlockEvictionQueue::evict_single_block(
             : (probation + 1) * kProtectedDominanceRatio;
     if (protected_pages > dominance_threshold &&
         (!scan_remaining || (*scan_remaining)[kProtectedPriority] != 0) &&
-        evict_queues_[kProtectedPriority].try_dequeue(item)) {
+        dequeue_priority(kProtectedPriority, item)) {
       if (scan_remaining) --(*scan_remaining)[kProtectedPriority];
-      approximate_queue_sizes_[kProtectedPriority].fetch_sub(
-          1, std::memory_order_relaxed);
       protected_aging_dequeues_.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
@@ -628,9 +641,8 @@ bool BlockEvictionQueue::evict_single_block(
 
   for (size_t i = 0; i < kQueueCount; i++) {
     if (scan_remaining && (*scan_remaining)[i] == 0) continue;
-    if (evict_queues_[i].try_dequeue(item)) {
+    if (dequeue_priority(i, item)) {
       if (scan_remaining) --(*scan_remaining)[i];
-      approximate_queue_sizes_[i].fetch_sub(1, std::memory_order_relaxed);
       return true;
     }
   }
@@ -718,9 +730,7 @@ size_t BlockEvictionQueue::recycle_inactive(size_t max_attempts) {
   const size_t attempts = std::min(max_attempts, items.size());
   size_t found = 0;
   for (; found < attempts; ++found) {
-    if (!evict_queues_[kExplicitHotPriority].try_dequeue(items[found])) break;
-    approximate_queue_sizes_[kExplicitHotPriority].fetch_sub(
-        1, std::memory_order_relaxed);
+    if (!dequeue_priority(kExplicitHotPriority, items[found])) break;
   }
   size_t evicted = 0;
   for (size_t i = 0; i < found; ++i) {
