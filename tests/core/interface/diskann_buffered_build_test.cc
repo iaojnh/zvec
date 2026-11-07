@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -27,6 +28,7 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include <zvec/ailego/logger/logger.h>
 #include <zvec/core/interface/index.h>
 #include <zvec/core/interface/index_factory.h>
 #include <zvec/core/interface/index_param_builders.h>
@@ -97,6 +99,7 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
   size_t pool_budget_{0};
 
   void SetUp() override {
+    ailego::LoggerBroker::SetLevel(ailego::Logger::LEVEL_DEBUG);
     auto &pool = ailego::PoolPayloadBudget::get_instance();
     previous_capacity_ = pool.capacity();
     // A writable store owns 128 writeback pages in addition to its page
@@ -189,7 +192,8 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     }
   }
 
-  void run_lifecycle(bool fp16, bool merge, bool pressure) {
+  void run_lifecycle(bool fp16, bool merge, bool pressure,
+                     bool reconcile_source = false) {
     const uint32_t dimension = pressure ? 512 : 32;
     const auto values = BuildValues(kDocCount, dimension);
     const auto path = (directory_ / "target.index").string();
@@ -233,6 +237,10 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       const size_t requested = pool.capacity() - available;
       ASSERT_TRUE(pool.try_charge_external(requested));
       reservation = requested;
+      std::cerr << "DIAG pressure fp16=" << fp16
+                << " writable_metadata=" << writable_metadata_
+                << " allowance=" << available << " reservation=" << reservation
+                << " capacity=" << pool.capacity() << std::endl;
     }
 
     Index::Pointer source;
@@ -258,9 +266,34 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       // compete for it, and construction still writes dirty scratch pages.
       ASSERT_EQ(source->flush(), 0);
     }
+    if (pressure && reconcile_source) {
+      const size_t source_external = pool.external_used() - reservation;
+      const size_t available =
+          3 * writable_metadata_ + model_allowance + 256UL * 1024UL;
+      ASSERT_GT(pool.capacity(), available + source_external);
+      const size_t requested = pool.capacity() - available - source_external;
+      std::cerr << "DIAG reconcile fp16=" << fp16
+                << " old_reservation=" << reservation
+                << " new_reservation=" << requested
+                << " source_external=" << source_external
+                << " capacity=" << pool.capacity() << std::endl;
+      if (requested < reservation) {
+        pool.release_external(reservation - requested);
+      } else {
+        ASSERT_TRUE(pool.try_charge_external(requested - reservation));
+      }
+      reservation = requested;
+    }
     // The merge source remains live throughout training. Its retained key-map
     // backing is separately charged and STL/platform dependent, not PQ state.
     const size_t before_training = pool.external_used();
+    const auto before = pool.stats();
+    std::cerr << "DIAG before training fp16=" << fp16
+              << " capacity=" << pool.capacity() << " used=" << before.used
+              << " committed=" << before.committed
+              << " metadata=" << before.metadata_used
+              << " external=" << before.external_used
+              << " queue=" << before.queue_allocated << std::endl;
     const int training_result =
         merge ? target->merge({source}, {}, {2, nullptr}) : target->train();
     ASSERT_EQ(training_result, 0)
@@ -340,6 +373,17 @@ TEST_F(DiskAnnBufferedBuildTest, PagePressureAccountsForQueueAllocatorGrowth) {
   for (bool fp16 : {false, true}) {
     SCOPED_TRACE(fp16);
     ASSERT_NO_FATAL_FAILURE(run_lifecycle(fp16, true, true));
+  }
+}
+
+TEST_F(DiskAnnBufferedBuildTest, DiagnosticReconcilesMandatorySourceMemory) {
+  void *queue_growth = ailego::EvictionQueueTraits::malloc(1UL << 20);
+  ASSERT_NE(nullptr, queue_growth);
+  auto release_queue = ailego::ScopeGuard::Make(
+      [queue_growth] { ailego::EvictionQueueTraits::free(queue_growth); });
+  for (bool fp16 : {false, true}) {
+    SCOPED_TRACE(fp16);
+    ASSERT_NO_FATAL_FAILURE(run_lifecycle(fp16, true, true, true));
   }
 }
 

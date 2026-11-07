@@ -1744,6 +1744,17 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
       break;
   }
   if (reserved) bytes_ = bytes;
+  if (!reserved) {
+    const auto s = pool_.stats();
+    LOG_ERROR(
+        "DIAG reserve denied bytes=%zu kind=%d capacity=%zu used=%zu "
+        "committed=%zu pages=%zu external=%zu metadata=%zu queue=%zu "
+        "idle=%zu rss_limit=%zu rss_available=%zu",
+        bytes, static_cast<int>(kind_), s.pool_size, s.used, s.committed,
+        s.page_used, s.external_used, s.metadata_used, s.queue_allocated,
+        s.retained_idle_bytes, pool_.process_rss_.limit(),
+        pool_.process_rss_.available());
+  }
   return reserved;
 }
 
