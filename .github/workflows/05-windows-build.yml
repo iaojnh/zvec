@@ -107,7 +107,8 @@ jobs:
             --config-settings='cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache' `
             2>&1 | Tee-Object -FilePath ci-evidence/build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        shell: powershell
+        # PowerShell 7 keeps native stderr progress messages in the log pipeline.
+        shell: pwsh
 
       - name: Compile C++ test targets
         run: |
@@ -116,7 +117,7 @@ jobs:
             2>&1 | Tee-Object -FilePath ci-evidence/native-build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "C++ test compilation passed (${{ matrix.platform }})." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-        shell: powershell
+        shell: pwsh
 
       - name: Run Buffer Pool lifecycle and RSS acceptance
         if: inputs.buffer_pool_acceptance
