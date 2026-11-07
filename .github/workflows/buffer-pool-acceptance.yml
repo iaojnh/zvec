@@ -1,0 +1,138 @@
+name: Buffer Pool Acceptance
+
+on:
+  push:
+    branches: [test/buffer-pool-acceptance]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux x64 candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: buffer-pool-acceptance-linux-x64
+          max-size: 1G
+      - name: Build wheel and native test executables
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+        run: |
+          python -m pip install pybind11==3.0 cmake==3.30.0 ninja==1.11.1 \
+            scikit-build-core setuptools_scm
+          python -m pip wheel . --no-deps --no-build-isolation --wheel-dir candidate \
+            -C cmake.define.AUTO_DETECT_ARCH=OFF \
+            -C cmake.define.BUILD_C_BINDINGS=OFF \
+            -C cmake.define.BUILD_ZVEC_SHARED=OFF \
+            -C cmake.define.BUILD_ZVEC_AILEGO_SHARED=OFF \
+            -C cmake.define.BUILD_ZVEC_CORE_SHARED=OFF \
+            -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
+            -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          targets=(process_rss_budget_test pool_admission_test result_memory_allowance_test
+                   buffer_read_storage_test buffer_storage_write_test
+                   ivf_workspace_budget_test diskann_file_reader_aio_test)
+          cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target "${targets[@]}"
+          for i in "${!targets[@]}"; do targets[$i]="bin/${targets[$i]}"; done
+          tar -czf candidate/native-tests.tar.gz -C build "${targets[@]}"
+          git rev-parse HEAD > candidate/commit.txt
+          (cd candidate && sha256sum ./*.whl ./native-tests.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: buffer-pool-candidate
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 14
+
+  acceptance:
+    name: Acceptance (${{ matrix.shard }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: budget
+            native: process_rss_budget_test pool_admission_test result_memory_allowance_test
+          - shard: storage
+            native: buffer_read_storage_test buffer_storage_write_test
+          - shard: ivf
+            native: ivf_workspace_budget_test
+          - shard: diskann
+            native: diskann_file_reader_aio_test
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Verify candidate provenance
+        run: |
+          mkdir -p evidence
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          cp candidate/commit.txt candidate/SHA256SUMS evidence/
+          tar -xzf candidate/native-tests.tar.gz -C candidate
+      - name: Run native tests
+        env:
+          NATIVE_TESTS: ${{ matrix.native }}
+        run: |
+          set -o pipefail
+          read -r -a targets <<< "$NATIVE_TESTS"
+          for target in "${targets[@]}"; do
+            mkdir -p "$RUNNER_TEMP/$target"
+            (cd "$RUNNER_TEMP/$target" && "$GITHUB_WORKSPACE/candidate/bin/$target" \
+              --gtest_color=no --gtest_output="xml:$GITHUB_WORKSPACE/evidence/$target.xml") \
+              2>&1 | tee "evidence/$target.log"
+          done
+      - name: Repeat storage reopen and retry in one process
+        if: matrix.shard == 'storage'
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/buffer_storage_write_test"
+          "$GITHUB_WORKSPACE/candidate/bin/buffer_storage_write_test" --gtest_color=no \
+            --gtest_filter='*WritableReopenWithoutCreationPersistsChanges:*WritableReopenNeedsCacheAndAllowsRetry:*WriteBatchReportsBudgetDenialAndCanRetry:*MutableBatchSnapshotsSurviveOverwriteAndClose' \
+            --gtest_repeat=36 2>&1 | tee "$GITHUB_WORKSPACE/evidence/storage-reopen.log"
+          test "$(grep -Fc '[  PASSED  ] 4 tests.' "$GITHUB_WORKSPACE/evidence/storage-reopen.log")" -eq 36
+      - uses: actions/setup-python@v7
+        if: matrix.shard != 'storage'
+        with:
+          python-version: '3.10'
+      - name: Install candidate wheel
+        if: matrix.shard != 'storage'
+        run: python -m pip install candidate/*.whl pytest pytest-xdist
+      - name: Exercise public API memory denial and recovery
+        if: matrix.shard == 'budget'
+        run: |
+          python -m pytest -n 0 python/tests/test_fetch_result_budget.py \
+            -k 'large_vector_result_admission_and_recovery or retained_vectors_reject_growth_and_release_for_retry' \
+            --junitxml=evidence/public-budget.xml
+      - name: Run public lifecycle and measure RSS
+        if: matrix.shard == 'ivf' || matrix.shard == 'diskann'
+        env:
+          INDEX: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          python -X faulthandler .github/scripts/buffer_pool_acceptance.py "$INDEX" \
+            "$RUNNER_TEMP/collection" "evidence/$INDEX-rss.jsonl" \
+            2>&1 | tee "evidence/$INDEX.log"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: buffer-pool-evidence-${{ matrix.shard }}
+          path: evidence/
+          retention-days: 14
