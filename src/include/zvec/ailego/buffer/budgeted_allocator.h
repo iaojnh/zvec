@@ -10,9 +10,11 @@ namespace zvec::ailego {
 // pressure explicitly; never silently allocate beyond the configured pool.
 template <typename T>
 class BudgetedAllocator {
-  struct alignas(alignof(T) > alignof(size_t) ? alignof(T)
-                                              : alignof(size_t)) Header {
+  struct alignas(alignof(T) > alignof(ProcessRssBudget::MaterializationStamp)
+                     ? alignof(T)
+                     : alignof(ProcessRssBudget::MaterializationStamp)) Header {
     size_t charged;
+    ProcessRssBudget::MaterializationStamp creation;
   };
 
  public:
@@ -53,16 +55,20 @@ class BudgetedAllocator {
     Pending pending(pool, Pending::Kind::kWorkspace);
     if (!pending.reserve(charge)) throw std::bad_alloc();
     void *raw = ::operator new(bytes, std::align_val_t{alignof(Header)});
-    pending.commit();
-    auto *header = new (raw) Header{charge};
+    const auto creation = pending.commit();
+    auto *header = new (raw) Header{charge, creation};
     return reinterpret_cast<T *>(header + 1);
   }
   void deallocate(T *ptr, size_t) noexcept {
     if (!ptr) return;
     auto *header = reinterpret_cast<Header *>(ptr) - 1;
     const size_t charged = header->charged;
+    const auto creation = header->creation;
     ::operator delete(header, std::align_val_t{alignof(Header)});
-    if (charged) MemoryLimitPool::get_instance().release_external(charged);
+    if (charged) {
+      MemoryLimitPool::get_instance().release_heap_external(
+          charged, ProcessRssBudget::HeapProjection::Full(charged, creation));
+    }
   }
   template <typename U>
   bool operator==(const BudgetedAllocator<U> &) const {

@@ -26,11 +26,54 @@ class ProcessRssBudget {
     size_t available{0};
   };
   using NativeReader = bool (*)(NativeSample *);
-  // A mapping can refund its projection only until the corresponding reader
-  // has taken another sample. RSS and native footprint can refresh separately.
+  // Allocation age is relative to each reader's successful observations.
+  // RSS and native footprint can refresh separately.
   struct MaterializationStamp {
     uint64_t rss_epoch{0};
     uint64_t native_epoch{0};
+  };
+  // Heap owners can contain allocations from several observations. Only
+  // bytes created after a reader's last sample are certainly absent from it.
+  struct HeapProjection {
+    struct Sample {
+      uint64_t epoch{0};
+      size_t bytes{0};
+
+      void append(Sample rhs) {
+        if (rhs.epoch > epoch) {
+          *this = rhs;
+        } else if (rhs.epoch == epoch) {
+          bytes += rhs.bytes;
+        }
+      }
+      Sample take(size_t total, size_t released) {
+        // Without individual allocation identities, retire potentially
+        // observed bytes first. Never assign more new bytes than are certain.
+        const size_t observed = total - bytes;
+        const size_t transferred =
+            released > observed ? released - observed : 0;
+        bytes -= transferred;
+        return {epoch, transferred};
+      }
+      size_t for_epoch(uint64_t current) const {
+        return epoch && epoch == current ? bytes : 0;
+      }
+    };
+
+    static HeapProjection Full(size_t bytes, MaterializationStamp stamp) {
+      return {{stamp.rss_epoch, stamp.rss_epoch ? bytes : 0},
+              {stamp.native_epoch, stamp.native_epoch ? bytes : 0}};
+    }
+    void append(HeapProjection rhs) {
+      rss.append(rhs.rss);
+      native.append(rhs.native);
+    }
+    HeapProjection take(size_t total, size_t released) {
+      return {rss.take(total, released), native.take(total, released)};
+    }
+
+    Sample rss{};
+    Sample native{};
   };
   struct MappingProjection {
     struct Sample {
@@ -218,6 +261,22 @@ class ProcessRssBudget {
 
   void release(size_t bytes) {
     release_unmapped(bytes, {});
+  }
+
+  void release_heap(size_t bytes, HeapProjection projection) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t rss_unsampled = projection.rss.for_epoch(rss_epoch_);
+    const size_t native_unsampled = projection.native.for_epoch(native_epoch_);
+    assert(rss_unsampled <= bytes && native_unsampled <= bytes);
+    assert(bytes <= backing_);
+    backing_ -= bytes;
+    // Unlike unmapping, free() may leave every page resident in the allocator.
+    // Keep its materialization debit until a successful sample observes it.
+    // A new allocation absent from that sample cannot retire the sample's
+    // overlap with a different, still-live owner.
+    estimate_.release(bytes - rss_unsampled, backing_);
+    native_estimate_.release(bytes - native_unsampled, backing_);
+    update_available();
   }
 
   // A stamp is valid only after successful unmapping. A partial release

@@ -18,13 +18,16 @@ class MemoryReservation {
     add(rhs.bytes_);
   }
   MemoryReservation(MemoryReservation &&rhs) noexcept
-      : bytes_(std::exchange(rhs.bytes_, 0)) {}
+      : bytes_(std::exchange(rhs.bytes_, 0)),
+        projection_(std::exchange(rhs.projection_, {})) {}
   MemoryReservation &operator=(MemoryReservation rhs) {
     swap(rhs);
     return *this;
   }
   ~MemoryReservation() {
-    if (bytes_) MemoryLimitPool::get_instance().release_external(bytes_);
+    if (bytes_)
+      MemoryLimitPool::get_instance().release_heap_external(bytes_,
+                                                            projection_);
   }
   void add(size_t bytes) {
     add(bytes, 0);
@@ -56,19 +59,24 @@ class MemoryReservation {
         !pending.reserve(charge))
       throw std::bad_alloc();
     allocate();
-    pending.commit();
+    projection_.append(
+        ProcessRssBudget::HeapProjection::Full(charge, pending.commit()));
     bytes_ += charge;
   }
   void swap(MemoryReservation &rhs) noexcept {
     std::swap(bytes_, rhs.bytes_);
+    std::swap(projection_, rhs.projection_);
   }
   // Transfer already charged payloads across a merge without charging twice.
   void absorb(MemoryReservation &&rhs) noexcept {
     bytes_ += std::exchange(rhs.bytes_, 0);
+    projection_.append(std::exchange(rhs.projection_, {}));
   }
   void retain_at_most(size_t bytes) noexcept {
     if (bytes < bytes_) {
-      MemoryLimitPool::get_instance().release_external(bytes_ - bytes);
+      const size_t released = bytes_ - bytes;
+      MemoryLimitPool::get_instance().release_heap_external(
+          released, projection_.take(bytes_, released));
       bytes_ = bytes;
     }
   }
@@ -79,11 +87,13 @@ class MemoryReservation {
   MemoryReservation take(size_t bytes) noexcept {
     MemoryReservation result;
     result.bytes_ = std::min(bytes, bytes_);
+    result.projection_ = projection_.take(bytes_, result.bytes_);
     bytes_ -= result.bytes_;
     return result;
   }
 
  private:
   size_t bytes_{0};
+  ProcessRssBudget::HeapProjection projection_{};
 };
 }  // namespace zvec::ailego

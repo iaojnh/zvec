@@ -9,6 +9,7 @@
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
@@ -514,6 +515,44 @@ TEST_F(PoolAdmissionTest, UnmappedWorkspacePreservesOtherResidentBacking) {
     EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
   }
   EXPECT_EQ(resident.bytes(), pool_.external_used());
+}
+
+TEST_F(PoolAdmissionTest, HeapWorkspaceChurnKeepsLiveRssOverlap) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  MemoryReservation resident;
+  resident.add(8 * page_);
+  const size_t rss = baseline_ + 128 * page_;
+  const size_t headroom = 16 * page_;
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  const size_t used = pool_.used();
+  const size_t committed = pool_.committed();
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    SCOPED_TRACE(attempt);
+    {
+      std::vector<char, BudgetedAllocator<char>> scratch(page_, 'x');
+      EXPECT_EQ('x', scratch.back());
+    }
+    MemoryLimitPoolTestPeer::sample_rss(pool_, rss);
+    ASSERT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+    {
+      MemoryReservation first;
+      first.add_for_allocation(3 * page_, [] {});
+      MemoryReservation moved(std::move(first));
+      EXPECT_EQ(0u, first.bytes());
+      auto part = moved.take(page_);
+      MemoryReservation swapped;
+      swapped.swap(part);
+      swapped.absorb(std::move(moved));
+      EXPECT_EQ(3 * page_, swapped.bytes());
+      swapped.retain_at_most(page_);
+    }
+    MemoryLimitPoolTestPeer::sample_rss(pool_, rss);
+    ASSERT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EXPECT_EQ(used, pool_.used());
+    EXPECT_EQ(committed, pool_.committed());
+  }
 }
 
 #if defined(__linux__) && !defined(__ANDROID__)
