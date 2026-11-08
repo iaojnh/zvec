@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "plan_info.h"
+#include <algorithm>
 #include <mutex>
 #include <arrow/acero/query_context.h>
 #include <arrow/api.h>
@@ -28,6 +29,16 @@
 namespace zvec::sqlengine {
 
 namespace {
+arrow::acero::BackpressureOptions SourceBackpressure(size_t max_queued_bytes) {
+  if (!max_queued_bytes) return {};
+  // Arrow pauses strictly above its watermark. Pause when the byte limit is
+  // reached, before another whole batch can overlap consumer-held buffers and
+  // completed Futures still forwarding earlier batches.
+  const auto resume = std::max<size_t>(1, max_queued_bytes / 2);
+  const auto pause = std::max<size_t>(resume, max_queued_bytes - 1);
+  return {resume, pause};
+}
+
 arrow::Result<arrow::acero::QueryOptions> QueryOptions(arrow::MemoryPool *pool,
                                                        bool budgeted) {
   arrow::acero::QueryOptions options;
@@ -314,10 +325,9 @@ class BoundedPlanReader : public arrow::RecordBatchReader {
     std::shared_ptr<arrow::Schema> schema;
     auto with_sink = arrow::acero::Declaration::Sequence(
         {source,
-         {"sink", arrow::acero::SinkNodeOptions{
-                      &generator, &schema,
-                      arrow::acero::BackpressureOptions{max_queued_bytes / 2,
-                                                        max_queued_bytes}}}});
+         {"sink",
+          arrow::acero::SinkNodeOptions{
+              &generator, &schema, SourceBackpressure(max_queued_bytes)}}});
     ARROW_RETURN_NOT_OK(with_sink.AddToPlan(plan.get()));
     ARROW_RETURN_NOT_OK(plan->Validate());
     auto reader =
@@ -386,8 +396,7 @@ Result<PlanStream> PlanInfo::execute_to_generator(size_t max_queued_bytes) {
         {source,
          {"sink", arrow::acero::SinkNodeOptions{
                       &stream->generator, nullptr,
-                      arrow::acero::BackpressureOptions{max_queued_bytes / 2,
-                                                        max_queued_bytes}}}});
+                      SourceBackpressure(max_queued_bytes)}}});
     ARROW_RETURN_NOT_OK(with_sink.AddToPlan(stream->plan.get()));
     ARROW_RETURN_NOT_OK(stream->plan->Validate());
     stream->started = true;
