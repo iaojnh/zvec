@@ -2804,3 +2804,117 @@ TEST_F(BufferStorageWriteTest, MappingAdmissionAndMoveKeepMetadataOwned) {
   assigned.close();
   EXPECT_EQ(baseline, pool.used());
 }
+
+TEST_F(BufferStorageWriteTest, ResidentImmutableBatchNeedsNoWorkspace) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  const size_t page = ailego::kVectorPageSize;
+  ASSERT_EQ(0, storage->append("resident_batch", 4 * page));
+  auto segment = storage->get("resident_batch");
+  ASSERT_TRUE(segment);
+  std::vector<char> bytes(4 * page);
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = i % 251;
+  ASSERT_EQ(bytes.size(), segment->write(0, bytes.data(), bytes.size()));
+  const size_t first = (page - segment->data_offset() % page) % page + 16;
+  IndexStorage::MemoryBlock pins[2], blocks[4];
+  ASSERT_EQ(128u, segment->read_immutable(first, pins[0], 128));
+  ASSERT_EQ(128u, segment->read_immutable(first + page, pins[1], 128));
+  IndexStorage::Segment::BorrowedRead reads[] = {
+      {segment.get(), first, 128, &blocks[0]},
+      {segment.get(), first + page, 128, &blocks[1]},
+      {segment.get(), first, 128, &blocks[2]},
+      {segment.get(), bytes.size(), 0, &blocks[3]},
+  };
+  auto resident = storage->vec_buffer_pool();
+  ASSERT_TRUE(resident);
+  std::vector<ailego::block_id_t> held;
+  const size_t pages = (resident->file_size() + page - 1) / page;
+  for (size_t id = 0; id < pages; ++id)
+    if (resident->try_acquire_buffer(id)) held.push_back(id);
+  AILEGO_DEFER([&] { resident->release_pages(held.data(), held.size()); });
+  const auto evictions = resident->stats().evict;
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ailego::MemoryReservation pressure;
+  ASSERT_NO_THROW(pressure.add(pool.available()));
+  const size_t charged = pool.external_used();
+  ASSERT_TRUE(segment->read_borrowed_batch_immutable(reads, 4));
+  EXPECT_EQ(charged, pool.external_used());
+  EXPECT_EQ(evictions, resident->stats().evict);
+  EXPECT_EQ(pins[0].data(), blocks[0].data());
+  EXPECT_EQ(pins[1].data(), blocks[1].data());
+  EXPECT_EQ(pins[0].data(), blocks[2].data());
+  EXPECT_EQ(nullptr, blocks[3].data());
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, blocks[0].type_);
+  EXPECT_EQ(0, std::memcmp(blocks[1].data(), bytes.data() + first + page, 128));
+}
+
+TEST_F(BufferStorageWriteTest, ResidentImmutableBatchSupportsAliasedOutputs) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  const size_t page = ailego::kVectorPageSize;
+  ASSERT_EQ(0, storage->append("aliased_batch", 4 * page));
+  auto segment = storage->get("aliased_batch");
+  ASSERT_TRUE(segment);
+  std::vector<char> bytes(4 * page);
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (i * 7) % 251;
+  ASSERT_EQ(bytes.size(), segment->write(0, bytes.data(), bytes.size()));
+  const size_t first = (page - segment->data_offset() % page) % page;
+  IndexStorage::MemoryBlock pins[2], output, duplicate;
+  ASSERT_EQ(64u, segment->read_immutable(first, pins[0], 64));
+  ASSERT_EQ(64u, segment->read_immutable(first + page, pins[1], 64));
+  IndexStorage::Segment::BorrowedRead reads[] = {
+      {segment.get(), first, 64, &output},
+      {segment.get(), first + page, 64, &output},
+      {segment.get(), first, 64, &duplicate},
+  };
+  ASSERT_TRUE(segment->read_borrowed_batch_immutable(reads, 3));
+  EXPECT_EQ(pins[1].data(), output.data());
+  EXPECT_EQ(pins[0].data(), duplicate.data());
+  EXPECT_EQ(0, std::memcmp(output.data(), bytes.data() + first + page, 64));
+  output.reset();
+  duplicate.reset();
+  // A miss after successful probes must release its temporary pins before
+  // the original multi-page path takes over.
+  reads[0] = {segment.get(), first + page - 16, 64, &output};
+  ASSERT_TRUE(segment->read_borrowed_batch_immutable(reads, 1));
+  EXPECT_EQ(0, std::memcmp(output.data(), bytes.data() + first + page - 16, 64));
+}
+
+TEST_F(BufferStorageWriteTest, ResidentReadOnlyBatchNeedsNoWorkspace) {
+  const size_t page = ailego::kVectorPageSize;
+  std::vector<char> bytes(3 * page, 'r');
+  {
+    auto writer = open_writable();
+    ASSERT_TRUE(writer);
+    ASSERT_EQ(0, writer->append("read_only_batch", bytes.size()));
+    auto segment = writer->get("read_only_batch");
+    ASSERT_TRUE(segment);
+    ASSERT_EQ(bytes.size(), segment->write(0, bytes.data(), bytes.size()));
+    ASSERT_EQ(0, writer->close());
+  }
+  auto storage = open_read_only();
+  ASSERT_TRUE(storage);
+  auto segment = storage->get("read_only_batch");
+  ASSERT_TRUE(segment);
+  const size_t offset = (page - segment->data_offset() % page) % page;
+  IndexStorage::MemoryBlock pin, blocks[2];
+  ASSERT_EQ(64u, segment->read_immutable(offset, pin, 64));
+  auto resident = storage->vec_buffer_pool();
+  std::vector<ailego::block_id_t> held;
+  for (size_t id = 0; id < (resident->file_size() + page - 1) / page; ++id)
+    if (resident->try_acquire_buffer(id)) held.push_back(id);
+  AILEGO_DEFER([&] { resident->release_pages(held.data(), held.size()); });
+  IndexStorage::Segment::BorrowedRead reads[] = {
+      {segment.get(), offset, 32, &blocks[0]},
+      {segment.get(), offset + 32, 32, &blocks[1]},
+  };
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ailego::MemoryReservation pressure;
+  ASSERT_NO_THROW(pressure.add(pool.available()));
+  const size_t charged = pool.external_used();
+  ASSERT_TRUE(segment->read_borrowed_batch(reads, 2));
+  EXPECT_EQ(charged, pool.external_used());
+  EXPECT_EQ(pin.data(), blocks[0].data());
+  EXPECT_EQ(static_cast<const char *>(pin.data()) + 32, blocks[1].data());
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, blocks[1].type_);
+}
