@@ -19,11 +19,11 @@
 #include <map>
 #include <random>
 #include <string>
-#include <thread>
 #include <tuple>
+#include <thread>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/core/framework/index_framework.h>

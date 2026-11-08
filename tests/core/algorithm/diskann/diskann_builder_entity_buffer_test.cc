@@ -21,7 +21,9 @@
 #include <thread>
 #include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
+#include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
 #include "diskann_builder_entity.h"
@@ -249,6 +251,87 @@ TEST_F(DiskAnnBuilderEntityBufferTest, SealingRequiresCompleteVectorStaging) {
   IndexStorage::MemoryBlock block;
   ASSERT_EQ(0, entity.read_vector(1, block));
   EXPECT_EQ(0, std::memcmp(block.data(), vector, sizeof(vector)));
+}
+
+TEST_F(DiskAnnBuilderEntityBufferTest,
+       GraphCodesRequireCompleteInputAndRemainPageableAfterRetry) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t original_capacity = pool.capacity();
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(original_capacity));
+  });
+  // This build owns vector, graph, and code files. Preserve the fixture's
+  // 1 MiB payload headroom after accounting for all three files' metadata.
+  const size_t metadata = ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
+  ASSERT_EQ(0, pool.init(3 * metadata + 1024UL * 1024UL));
+  DiskAnnBuilderEntity entity;
+  constexpr uint32_t count = 4096;
+  constexpr uint32_t chunks = 384;
+  constexpr size_t code_bytes = static_cast<size_t>(count) * chunks;
+  initialize(&entity, 768, count);
+  EXPECT_EQ(IndexError_NoReady, entity.prepare_graph_quantization());
+  auto quantizer = IndexFactory::CreateQuantizer("PqInt8Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  IndexMeta meta(IndexMeta::DT_FP32, 768);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  ailego::Params params;
+  params.set("num_chunk", chunks);
+  params.set("precompute_sdc", false);
+  ASSERT_EQ(0, quantizer->init(meta, params));
+  entity.set_pq_quantizer(quantizer);
+  entity.mutable_pq_meta()->chunk_num = chunks;
+  std::vector<uint8_t> bytes(code_bytes);
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = i % 251;
+  ASSERT_EQ(0, entity.prepare_codes(code_bytes));
+  ASSERT_EQ(0, entity.append_codes(bytes.data(), code_bytes / 2));
+  EXPECT_EQ(IndexError_NoReady, entity.prepare_graph_quantization());
+  ASSERT_EQ(0, entity.append_codes(bytes.data() + code_bytes / 2, code_bytes / 2));
+
+  {
+    // Free logical capacity excludes evictable pages and optional I/O staging;
+    // reserving that snapshot need not exhaust admission after reclamation.
+    // An RSS ceiling below the live process deterministically refuses the
+    // new code store without relying on background eviction timing.
+    auto &actual = ailego::MemoryLimitPool::get_instance();
+    const size_t previous_rss_limit = actual.process_rss_limit();
+    actual.configure_process_rss_limit(1);
+    AILEGO_DEFER([&] { actual.configure_process_rss_limit(previous_rss_limit); });
+    EXPECT_EQ(IndexError_NoMemory, entity.prepare_graph_quantization());
+  }
+  EXPECT_EQ(nullptr, entity.graph_quantization().quantizer);
+  // Retry the identical codes in the same total budget. Only cache metadata
+  // remains fixed; code pages share the pool with the graph and vectors.
+  ASSERT_EQ(0, entity.prepare_vectors_for_graph());
+
+  const size_t before = pool.external_used() + pool.metadata_used();
+  ASSERT_EQ(0, entity.prepare_graph_quantization());
+  EXPECT_LT(pool.external_used() + pool.metadata_used(),
+            before + code_bytes / 2);
+  {
+    const auto guidance = entity.graph_quantization();
+    EXPECT_EQ(quantizer.get(), guidance.quantizer);
+    EXPECT_EQ(nullptr, guidance.codes);
+    ASSERT_NE(nullptr, guidance.paged_codes);
+    EXPECT_EQ(chunks, guidance.code_size);
+    std::array<uint8_t, 4096> scratch;
+    for (size_t offset = 0; offset < code_bytes;) {
+      const size_t count = std::min(scratch.size(), code_bytes - offset);
+      ASSERT_EQ(count,
+                guidance.paged_codes->fetch(offset, scratch.data(), count));
+      EXPECT_EQ(0, std::memcmp(bytes.data() + offset, scratch.data(), count));
+      offset += count;
+    }
+    ASSERT_EQ(scratch.size(),
+              guidance.paged_codes->fetch(0, scratch.data(), scratch.size()));
+    EXPECT_EQ(0, std::memcmp(bytes.data(), scratch.data(), scratch.size()));
+    EXPECT_LE(pool.used(), pool.capacity());
+    EXPECT_LE(pool.committed(), pool.capacity());
+  }
+  entity.release_vectors();
+  EXPECT_EQ(nullptr, entity.graph_quantization().quantizer);
+  EXPECT_EQ(nullptr, entity.graph_quantization().codes);
+  EXPECT_EQ(nullptr, entity.graph_quantization().paged_codes);
 }
 
 TEST_F(DiskAnnBuilderEntityBufferTest,

@@ -238,6 +238,11 @@ class Segment {
   // ---- Persistence and lifecycle -----------------------------------------
   virtual Status flush() = 0;
 
+  // Persist for shutdown without allocating readers for the completed blocks.
+  virtual Status flush_for_close() {
+    return flush();
+  }
+
   virtual Status dump() = 0;
 
   // Drops the writing forward block under the exclusive segment lock. Callers

@@ -16,6 +16,7 @@
 #include <map>
 #include <string_view>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/container/lazy_map.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_format.h>
@@ -209,9 +210,9 @@ class IndexMapping {
   uint32_t segment_ids_offset_{0};
   IndexFormat::SegmentMeta *segment_start_{nullptr};
   IndexFormat::MetaHeader *header_{nullptr};
-  HeaderMap header_addr_map_{};
+  ailego::LazyMap<HeaderMap> header_addr_map_{};
   IndexFormat::MetaFooter *footer_{nullptr};
-  SegmentMap segments_{};
+  ailego::LazyMap<SegmentMap> segments_{};
   size_t index_size_{0u};
   ailego::File file_{};
   std::string path_;

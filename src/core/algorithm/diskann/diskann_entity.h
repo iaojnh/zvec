@@ -18,6 +18,9 @@
 #include <zvec/core/framework/index_framework.h>
 
 namespace zvec {
+namespace turbo {
+class Quantizer;
+}
 namespace core {
 
 using dist_t = float;
@@ -135,6 +138,18 @@ static_assert(sizeof(DiskAnnLegacyPqMeta) == sizeof(DiskAnnPqMeta),
 
 class DiskAnnEntity {
  public:
+  struct GraphQuantization {
+    const turbo::Quantizer *quantizer{nullptr};
+    const uint8_t *codes{nullptr};
+    uint32_t code_size{0};
+    IndexStorage::Segment::Pointer paged_codes;
+  };
+
+  // Optional, build-only guidance. Final pruning still uses original vectors.
+  virtual GraphQuantization graph_quantization() const {
+    return {};
+  }
+
   class VectorReader {
    public:
     virtual ~VectorReader() = default;

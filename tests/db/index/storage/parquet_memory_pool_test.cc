@@ -386,8 +386,8 @@ TEST_F(ParquetBudgetTest, ScalarConversionAdmitsBeforeAllocationAndCanRetry) {
 TEST_F(ParquetBudgetTest, ReservesBackingCapacityBeforeAllocation) {
   arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
   ParquetMemoryPool pool(&fallback, true);
-  uint8_t *small = nullptr, *large = nullptr, *denied = nullptr;
-  ASSERT_TRUE(pool.Allocate(1024, &small).ok());
+  uint8_t *small_buffer = nullptr, *large = nullptr, *denied = nullptr;
+  ASSERT_TRUE(pool.Allocate(1024, &small_buffer).ok());
   EXPECT_EQ(0, fallback.bytes_allocated());
   const auto small_backing = budget_.external_used();
   EXPECT_GT(budget_.external_used(), 1024u);
@@ -399,7 +399,7 @@ TEST_F(ParquetBudgetTest, ReservesBackingCapacityBeforeAllocation) {
   EXPECT_EQ(nullptr, denied);
   EXPECT_EQ(allocations, pool.num_allocations());
   pool.Free(large, kThreshold, 65536);
-  pool.Free(small, 1024);
+  pool.Free(small_buffer, 1024);
   EXPECT_EQ(0u, pool.charged_bytes());
 }
 
@@ -891,12 +891,12 @@ TEST_F(ParquetBudgetTest, MappedShrinkAdmitsPreBudgetAllocation) {
 TEST_F(ParquetBudgetTest, FreeUsesRecordedChargeAcrossBudgetInitialization) {
   ASSERT_EQ(0, budget_.init(0));
   ParquetMemoryPool pool(arrow::default_memory_pool(), true);
-  uint8_t *small = nullptr, *large = nullptr;
-  ASSERT_TRUE(pool.Allocate(1024, &small).ok());
+  uint8_t *small_buffer = nullptr, *large = nullptr;
+  ASSERT_TRUE(pool.Allocate(1024, &small_buffer).ok());
   ASSERT_TRUE(pool.Allocate(kThreshold, &large).ok());
   EXPECT_EQ(0u, pool.charged_bytes());
   ASSERT_EQ(0, budget_.init(1024 * 1024));
-  pool.Free(small, 1024);
+  pool.Free(small_buffer, 1024);
   pool.Free(large, kThreshold);
   EXPECT_EQ(0u, budget_.external_used());
 }

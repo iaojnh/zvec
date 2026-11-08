@@ -664,8 +664,9 @@ def verify_fetch_inputs(path, kind, mmap, dimension, count):
         assert fetch(["0", "missing", "0"])["0"] is not None
 
     for include_vector in (False, True):
-        # These input copies fit. Unique IDs additionally need hash nodes and
-        # bucket growth, whereas duplicates require only one hash entry.
+        # Inline ASCII payloads live in the native string slots. The original
+        # 70k duplicate-ID batch fits; a larger unique-ID batch also needs
+        # enough hash nodes and buckets to exceed the shared allowance.
         assert (
             coll.fetch(["missing000000"] * 70_000, include_vector=include_vector) == {}
         )
@@ -673,7 +674,7 @@ def verify_fetch_inputs(path, kind, mmap, dimension, count):
         # or native batch admission can be the first to reject the request.
         with pytest.raises(MemoryError):
             coll.fetch(
-                [f"missing{i:06d}" for i in range(70_000)],
+                [f"missing{i:06d}" for i in range(100_000)],
                 include_vector=include_vector,
             )
         assert (
@@ -783,7 +784,9 @@ def test_fetch_dict_keys_hold_and_release_budget(tmp_path):
 
 
 def verify_id_results(path, kind, mmap, dimension, count):
-    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    # Keep physical RSS headroom while exhausting logical result ownership,
+    # including reopening with the original result owners still alive.
+    zvec.init(memory_limit_mb=256, query_threads=2, optimize_threads=1)
     coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
     with pytest.raises(MemoryError):
         coll.resolve_internal_ids([-1] * 1_000_000)
@@ -792,7 +795,7 @@ def verify_id_results(path, kind, mmap, dimension, count):
     held = []
     rejected = False
     query = zvec.Query("vector", vector=vector_for(kind, dimension, 0))
-    for _ in range(32):
+    for _ in range(512):
         try:
             ids, scores = coll.query_internal_ids(
                 query, topk=100_000, return_scores=True
@@ -814,7 +817,7 @@ def verify_id_results(path, kind, mmap, dimension, count):
     # The outer sequence needs an owner even when every element is None.
     held = []
     rejected = False
-    for _ in range(32):
+    for _ in range(512):
         try:
             held.append(coll.resolve_internal_ids([-1] * 20_000))
         except MemoryError:
@@ -823,7 +826,7 @@ def verify_id_results(path, kind, mmap, dimension, count):
     assert rejected, "Retained all-missing ID results must consume admission"
     held.clear()
     assert coll.resolve_internal_ids([-1] * 20_000) == [None] * 20_000
-    for _ in range(32):
+    for _ in range(512):
         try:
             # An extracted key keeps the admission after its outer list dies.
             held.append(coll.resolve_internal_ids([0] * 20_000)[0])
@@ -853,7 +856,10 @@ def verify_id_results(path, kind, mmap, dimension, count):
 
 
 def verify_document_results(path, kind, mmap, dimension, count, *, grouped):
-    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    # This tests escaping owners and their release, including across reopen.
+    # Keep RSS headroom so allocator retention cannot replace the intended
+    # result-quota denial with a failed open or decode of the tiny corpus.
+    zvec.init(memory_limit_mb=256, query_threads=2, optimize_threads=1)
     coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
     held = []
     rejected = False
@@ -897,10 +903,47 @@ def verify_group_results(*args):
     verify_document_results(*args, grouped=True)
 
 
+def verify_single_group_result(path, kind, mmap, dimension, count):
+    # Keep the small-budget functional check independent of deliberately
+    # retaining batches until exhaustion and its allocator high water.
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    groups = coll.group_by_query(
+        zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
+        "payload",
+        group_count=count,
+        topk_per_group=1,
+        include_vector=True,
+    )
+    assert sum(len(group.docs) for group in groups) == count
+    assert all(
+        len(doc.vector("vector")) == dimension for group in groups for doc in group.docs
+    )
+    coll.close()
+
+
+def verify_single_id_result(path, kind, mmap, dimension, count):
+    zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
+    coll = zvec.open(str(path), option=zvec.CollectionOption(read_only=True))
+    ids, scores = coll.query_internal_ids(
+        zvec.Query("vector", vector=vector_for(kind, dimension, 0)),
+        topk=count,
+        return_scores=True,
+    )
+    assert ids.shape == scores.shape == (count,)
+    assert set(coll.resolve_internal_ids(ids)) == {str(i) for i in range(count)}
+    assert coll.resolve_internal_ids([-1, 0, 9999]) == [None, "0", None]
+    coll.close()
+
+
 @pytest.mark.parametrize("mode", ["id_results", "iterator_results", "group_results"])
 def test_remaining_result_paths_hold_and_release_budget(tmp_path, mode):
     path = tmp_path / mode
     run_worker("build", path, "VECTOR_FP32", False, 1024, 64)
+    if mode == "group_results":
+        run_worker("single_group_result", path, "VECTOR_FP32", False, 1024, 64)
+    if mode == "id_results":
+        run_worker("single_id_result", path, "VECTOR_FP32", False, 1024, 64)
     run_worker(mode, path, "VECTOR_FP32", False, 1024, 64)
 
 
@@ -969,5 +1012,7 @@ if __name__ == "__main__":
         "id_results": verify_id_results,
         "iterator_results": verify_iterator_results,
         "group_results": verify_group_results,
+        "single_group_result": verify_single_group_result,
+        "single_id_result": verify_single_id_result,
     }[action]
     worker(Path(target), vector_kind, bool(int(use_mmap)), int(dim), int(rows))

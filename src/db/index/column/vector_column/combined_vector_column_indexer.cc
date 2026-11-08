@@ -18,6 +18,7 @@
 #include <numeric>
 #include <unordered_map>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
+#include <zvec/ailego/container/lazy_map.h>
 
 namespace zvec {
 
@@ -302,10 +303,10 @@ class GroupResultAccumulator {
  private:
   ailego::MemoryReservation reverted_memory_;
   ailego::MemoryReservation group_keys_memory_;
-  std::unordered_map<
+  ailego::LazyMap<std::unordered_map<
       std::string, ResultDocs, std::hash<std::string>,
       std::equal_to<std::string>,
-      ailego::BudgetedAllocator<std::pair<const std::string, ResultDocs>>>
+      ailego::BudgetedAllocator<std::pair<const std::string, ResultDocs>>>>
       docs_by_group_;
   size_t payload_bytes_{0};
 };

@@ -4,6 +4,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
@@ -628,6 +629,8 @@ namespace {
 struct FlatWriteFailure {
   size_t remaining_writes{0};
   size_t failure_count{0};
+  size_t remaining_reads{0};
+  int read_error{IndexError_ReadData};
 };
 
 class FailingFlatSegment : public IndexStorage::Segment {
@@ -652,7 +655,18 @@ class FailingFlatSegment : public IndexStorage::Segment {
   }
   size_t read(size_t offset, IndexStorage::MemoryBlock &block,
               size_t length) override {
+    injected_read_failure_ = false;
+    if (failure_->remaining_reads != 0 && --failure_->remaining_reads == 0) {
+      ++failure_->failure_count;
+      injected_read_failure_ = true;
+      block.reset();
+      return 0;
+    }
     return segment_->read(offset, block, length);
+  }
+  int read_error() const override {
+    return injected_read_failure_ ? failure_->read_error
+                                  : segment_->read_error();
   }
   size_t write(size_t offset, const void *data, size_t length) override {
     if (failure_->remaining_writes != 0 && --failure_->remaining_writes == 0) {
@@ -676,6 +690,7 @@ class FailingFlatSegment : public IndexStorage::Segment {
  private:
   Pointer segment_;
   std::shared_ptr<FlatWriteFailure> failure_;
+  bool injected_read_failure_{false};
 };
 
 class FailingFlatStorage : public IndexStorage {
@@ -725,6 +740,10 @@ class FailingFlatStorage : public IndexStorage {
   void fail_write(size_t ordinal) {
     failure_->remaining_writes = ordinal;
   }
+  void fail_read(size_t ordinal, int error) {
+    failure_->remaining_reads = ordinal;
+    failure_->read_error = error;
+  }
   size_t failure_count() const {
     return failure_->failure_count;
   }
@@ -733,6 +752,52 @@ class FailingFlatStorage : public IndexStorage {
   IndexStorage::Pointer storage_;
   std::shared_ptr<FlatWriteFailure> failure_;
 };
+
+TEST_F(FlatStreamerTest, ReadBudgetRefusalKeepsItsErrorAndCanRetry) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto restore = zvec::ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
+  auto backing = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(nullptr, backing);
+  auto storage = std::make_shared<FailingFlatStorage>(backing);
+  ASSERT_EQ(0, storage->init(Params()));
+  ASSERT_EQ(0, storage->open(dir_ + "/read-errors", true));
+  auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+  ASSERT_NE(nullptr, streamer);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, Params()));
+  ASSERT_EQ(0, streamer->open(storage));
+  auto context = streamer->create_context();
+  ASSERT_NE(nullptr, context);
+  IndexQueryMeta query_meta(IndexMeta::DT_FP32, dim);
+  std::array<float, dim> query{};
+  ASSERT_EQ(0, streamer->add_impl(0, query.data(), query_meta, context));
+  for (int error : {IndexError_NoMemory, IndexError_ReadData}) {
+    for (size_t read = 1; read <= 5; ++read) {
+      SCOPED_TRACE(error);
+      SCOPED_TRACE(read);
+      context->set_topk(4);  // Include every vector through the block scan.
+      const size_t failures = storage->failure_count();
+      storage->fail_read(read, error);
+      EXPECT_EQ(error, streamer->search_bf_impl(query.data(), query_meta,
+                                               context));
+      EXPECT_EQ(failures + 1, storage->failure_count());
+      context->set_topk(4);
+      ASSERT_EQ(0, streamer->search_bf_impl(query.data(), query_meta, context));
+      ASSERT_EQ(1u, context->result().size());
+      EXPECT_EQ(0u, context->result()[0].key());
+      EXPECT_FLOAT_EQ(0, context->result()[0].score());
+    }
+  }
+  ASSERT_EQ(0, streamer->close());
+  streamer.reset();
+  context.reset();
+  ASSERT_EQ(0, storage->close());
+}
 
 class FlatStreamerWriteFailureTest
     : public testing::TestWithParam<std::tuple<uint32_t, size_t>> {

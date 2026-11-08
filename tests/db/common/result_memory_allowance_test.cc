@@ -29,6 +29,10 @@ struct MemoryLimitPoolTestPeer {
     pool.process_rss_.refresh(true);
   }
 
+  static bool workspace_waiting(MemoryLimitPool &pool) {
+    return pool.workspace_waiting_size_.load(std::memory_order_relaxed) != 0;
+  }
+
   inline static std::atomic<size_t> sample_{0};
 };
 
@@ -92,8 +96,8 @@ TEST_F(ResultMemoryAllowanceTest, PendingCopyRetainsHeadroomAcrossSamples) {
 
 TEST_F(ResultMemoryAllowanceTest, RejectedPendingCopyLeavesBackingUnchanged) {
   auto &native = ailego::MemoryLimitPool::get_instance();
-  ASSERT_TRUE(ailego::MemoryLimitPoolTestPeer::configure(
-      native, 64 * kMiB, 60 * kMiB));
+  ASSERT_TRUE(
+      ailego::MemoryLimitPoolTestPeer::configure(native, 64 * kMiB, 60 * kMiB));
   auto restore = ailego::ScopeGuard::Make(
       [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
   ResultMemoryAllowance allowance;
@@ -105,7 +109,154 @@ TEST_F(ResultMemoryAllowanceTest, RejectedPendingCopyLeavesBackingUnchanged) {
   EXPECT_NO_THROW(lease.add_pending(kMiB, pending));
 }
 
-TEST_F(ResultMemoryAllowanceTest, ReusedBackingObeysCriticalPressureAndRecovery) {
+TEST_F(ResultMemoryAllowanceTest,
+       CopyPlanSlackDoesNotBecomeUntouchedRssBacking) {
+  ASSERT_EQ(0, pool_.init(128 * kMiB));
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 128 * kMiB, 124 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease copy(&allowance, false, kMiB);
+    ResultMemoryAllowance::PendingCopy pending;
+    ASSERT_NO_THROW(copy.add_pending(12 * kMiB, kMiB, pending));
+    EXPECT_EQ(24 * kMiB, allowance.reserved_bytes());
+    Peer::sample(native, 124 * kMiB);
+    EXPECT_FALSE(native.try_materialize(4 * kMiB));
+    pending.start();
+  }
+  Peer::sample(native, 125 * kMiB);
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  {
+    // Work without a scoped copy still reserves its possibly untouched
+    // physical backing, independently of the existing logical copy plan.
+    ResultMemoryAllowance::Lease unscoped(&allowance, false, kMiB);
+    EXPECT_THROW(unscoped.add(12 * kMiB, kMiB), std::bad_alloc);
+    EXPECT_EQ(0u, allowance.active_bytes());
+    EXPECT_EQ(0u, allowance.reserved_bytes());
+  }
+  {
+    ResultMemoryAllowance::Lease retry(&allowance, false, kMiB);
+    ResultMemoryAllowance::PendingCopy pending;
+    EXPECT_NO_THROW(retry.add_pending(12 * kMiB, kMiB, pending));
+  }
+}
+
+TEST_F(ResultMemoryAllowanceTest,
+       TinyCopyDoesNotRequireAnUntouchedPythonArena) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 64 * kMiB - kMiB / 2));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease copy(&allowance, false, kMiB);
+  ResultMemoryAllowance::PendingCopy pending;
+  ASSERT_NO_THROW(copy.add_pending(kMiB, kMiB / 8, pending));
+  EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
+  EXPECT_FALSE(native.try_charge_process_backing(kMiB / 2, 0, false));
+}
+
+TEST_F(ResultMemoryAllowanceTest, TinyNativeWorkDoesNotOwnArenaSlack) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 64 * kMiB - kMiB / 2));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease work(&allowance, false, kMiB);
+  ASSERT_NO_THROW(work.add(kMiB / 8));
+  EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
+  EXPECT_FALSE(native.try_charge_process_backing(kMiB / 2, 0, false));
+}
+
+TEST_F(ResultMemoryAllowanceTest, CopyPeakAndPayloadHaveSeparateLifetimes) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 60 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease copy(&allowance, false, kMiB);
+  ResultMemoryAllowance::PendingCopy pending;
+  ASSERT_NO_THROW(copy.add_pending(kMiB, 4 * kMiB, kMiB, pending));
+  Peer::sample(native, 60 * kMiB);
+  EXPECT_FALSE(native.try_materialize(1));
+  pending.start();
+  pending.finish();
+  Peer::sample(native, 61 * kMiB);
+  const size_t extra = 5 * kMiB / 2;
+  ASSERT_TRUE(native.try_charge_process_backing(extra, 0, false));
+  native.release_process_backing(extra);
+}
+
+TEST_F(ResultMemoryAllowanceTest, TrimmingCopyOnlyLeaseReleasesItsProjection) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 63 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease copy(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  ASSERT_NO_THROW(copy.add_pending(0, kMiB, pending));
+  copy.retain_at_most(0);
+  pending.finish();
+  Peer::sample(native, 64 * kMiB);
+  ResultMemoryAllowance::Lease planning(&allowance);
+  ResultMemoryAllowance::PendingCopy no_copy;
+  EXPECT_NO_THROW(planning.add_pending(kMiB, 0, no_copy));
+}
+
+TEST_F(ResultMemoryAllowanceTest, ReclaimsUnusedHighWaterWithLiveSmallLease) {
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease warmup(&allowance, false, kMiB);
+    warmup.add(6 * kMiB);
+  }
+  ResultMemoryAllowance::Lease live(&allowance, false, kMiB);
+  live.add(1);
+  ASSERT_EQ(12 * kMiB, allowance.reserved_bytes());
+  allowance.reclaim_idle();
+  EXPECT_EQ(1u, allowance.active_bytes());
+  EXPECT_EQ(2 * kMiB, allowance.reserved_bytes());
+  EXPECT_EQ(2 * kMiB, pool_.external_used());
+  EXPECT_NO_THROW(live.add(kMiB));
+  EXPECT_EQ(4 * kMiB, allowance.reserved_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest, PendingCopyWaitsForCompetingRssBacking) {
+  ASSERT_EQ(0, pool_.init(128 * kMiB));
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  ASSERT_TRUE(Peer::configure(native, 64 * kMiB, 48 * kMiB));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.configure_process_rss_limit(0)); });
+  ASSERT_TRUE(native.try_charge_process_backing(8 * kMiB, 0, false));
+  std::promise<void> ready;
+  auto started = ready.get_future();
+  auto release = std::async(std::launch::async, [&] {
+    ready.set_value();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!Peer::workspace_waiting(native) &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    native.release_process_backing(8 * kMiB);
+  });
+  started.wait();
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease lease(&allowance, false, kMiB);
+  ResultMemoryAllowance::PendingCopy pending;
+  EXPECT_NO_THROW(lease.add_pending(12 * kMiB, 12 * kMiB, pending));
+  release.get();
+  EXPECT_EQ(12 * kMiB, allowance.active_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest,
+       ReusedBackingObeysCriticalPressureAndRecovery) {
   ResultMemoryAllowance allowance;
   {
     ResultMemoryAllowance::Lease warmup(&allowance);

@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -170,7 +171,7 @@ TEST_F(TemporaryBufferStorageTest,
   const char *previous = std::getenv(variable);
   const bool had_previous = previous != nullptr;
   const std::string saved = previous ? previous : "";
-  AILEGO_DEFER([&]() {
+  auto cleanup = ailego::ScopeGuard::Make([&]() {
     EXPECT_TRUE(ailego::FileHelper::SetTemporaryDirectory(""));
 #if defined(_WIN32)
     _putenv_s(variable, had_previous ? saved.c_str() : "");

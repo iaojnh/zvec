@@ -27,6 +27,7 @@ static DispatchTable init_dispatch() {
   DispatchTable t{};
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
     defined(_M_IX86)
+#if defined(ZVEC_FTS_HAVE_AVX2) && defined(ZVEC_FTS_HAVE_SSE41)
   if (zvec::ailego::internal::CpuFeatures::static_flags_.AVX2) {
     t.max_128 = avx2_max_128;
     t.pack_uint32_128 = avx2_pack_uint32_128;
@@ -35,6 +36,8 @@ static DispatchTable init_dispatch() {
     t.find_first_ge = avx2_find_first_ge;
     return t;
   }
+#endif
+#if defined(ZVEC_FTS_HAVE_SSE41)
   if (zvec::ailego::internal::CpuFeatures::static_flags_.SSE4_1) {
     t.max_128 = sse41_max_128;
     t.pack_uint32_128 = sse41_pack_uint32_128;
@@ -43,6 +46,7 @@ static DispatchTable init_dispatch() {
     t.find_first_ge = sse41_find_first_ge;
     return t;
   }
+#endif
 #endif
   t.max_128 = scalar_max_128;
   t.pack_uint32_128 = scalar_pack_uint32_128;

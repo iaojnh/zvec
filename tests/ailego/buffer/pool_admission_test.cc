@@ -2,17 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <ailego/pattern/scope_guard.h>
+#include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
 #if defined(__linux__) && !defined(__ANDROID__)
+#include <sys/mman.h>
 #include <ailego/io/iouring_loader.h>
 #endif
 
@@ -45,6 +51,17 @@ struct MemoryLimitPoolTestPeer {
   }
   static size_t rss_available(MemoryLimitPool &pool) {
     return pool.process_rss_.available();
+  }
+  static ProcessRssBudget::ResidentSample slab_resident_sample() {
+    return MemoryLimitPool::read_slab_resident_sample();
+  }
+  static ProcessRssBudget::ResidentSample sample_with_slab_lock(
+      MemoryLimitPool &pool) {
+    std::lock_guard<std::mutex> lock(pool.slab_mutex_);
+    return pool.read_slab_resident_sample();
+  }
+  static void refresh_rss(MemoryLimitPool &pool) {
+    pool.process_rss_.refresh(true);
   }
   static size_t trim_retained(MemoryLimitPool &pool, size_t bytes) {
     return pool.trim_retained_blocks(bytes);
@@ -476,13 +493,15 @@ TEST_F(PoolAdmissionTest, FailedWorkspaceAllocationRestoresRssHeadroom) {
   for (int i = 0; i < 10; ++i) {
     bool attempted = false;
     MemoryReservation workspace;
-    EXPECT_THROW(workspace.add_for_allocation(page_, [&] {
-                   attempted = true;
-                   MemoryLimitPoolTestPeer::sample_rss(pool_, current_rss);
-                   EXPECT_EQ(headroom - page_,
-                             MemoryLimitPoolTestPeer::rss_available(pool_));
-                   throw std::bad_alloc();
-                 }),
+    EXPECT_THROW(workspace.add_for_allocation(
+                     page_,
+                     [&] {
+                       attempted = true;
+                       MemoryLimitPoolTestPeer::sample_rss(pool_, current_rss);
+                       EXPECT_EQ(headroom - page_,
+                                 MemoryLimitPoolTestPeer::rss_available(pool_));
+                       throw std::bad_alloc();
+                     }),
                  std::bad_alloc);
     ASSERT_TRUE(attempted);
     EXPECT_EQ(0u, workspace.bytes());
@@ -499,8 +518,8 @@ TEST_F(PoolAdmissionTest, UnmappedWorkspacePreservesOtherResidentBacking) {
   resident.add(8 * page_);
   const size_t rss = baseline_ + 128 * page_;
   const size_t headroom = 4 * page_;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom,
-                                                   rss));
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
   // Keep the current observation stable if the worker is descheduled.
   MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
 
@@ -514,6 +533,120 @@ TEST_F(PoolAdmissionTest, UnmappedWorkspacePreservesOtherResidentBacking) {
   EXPECT_EQ(resident.bytes(), pool_.external_used());
 }
 
+TEST_F(PoolAdmissionTest, HeapWorkspaceChurnKeepsLiveRssOverlap) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  MemoryReservation resident;
+  resident.add(8 * page_);
+  const size_t rss = baseline_ + 128 * page_;
+  const size_t headroom = 16 * page_;
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  const size_t used = pool_.used();
+  const size_t committed = pool_.committed();
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    SCOPED_TRACE(attempt);
+    {
+      std::vector<char, BudgetedAllocator<char>> scratch(page_, 'x');
+      EXPECT_EQ('x', scratch.back());
+    }
+    MemoryLimitPoolTestPeer::sample_rss(pool_, rss);
+    ASSERT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+    {
+      MemoryReservation first;
+      first.add_for_allocation(3 * page_, [] {});
+      MemoryReservation moved(std::move(first));
+      EXPECT_EQ(0u, first.bytes());
+      auto part = moved.take(page_);
+      MemoryReservation swapped;
+      swapped.swap(part);
+      swapped.absorb(std::move(moved));
+      EXPECT_EQ(3 * page_, swapped.bytes());
+      swapped.retain_at_most(page_);
+    }
+    MemoryLimitPoolTestPeer::sample_rss(pool_, rss);
+    ASSERT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EXPECT_EQ(used, pool_.used());
+    EXPECT_EQ(committed, pool_.committed());
+  }
+}
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(PoolAdmissionTest, SlabResidencyExcludesUntouchedAndSharedZeroPages) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  char *page = nullptr;
+  ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
+  ASSERT_NE(nullptr, page);
+  AILEGO_DEFER([&] { pool_.release_buffer(page, page_); });
+  auto *base = reinterpret_cast<char *>(reinterpret_cast<uintptr_t>(page) &
+                                        ~(pool_.slab_alignment() - 1));
+  ASSERT_EQ(0, ::madvise(base, pool_.slab_size(), MADV_NOHUGEPAGE));
+  ASSERT_EQ(0, ::madvise(page, page_, MADV_DONTNEED));
+  const auto untouched = MemoryLimitPoolTestPeer::slab_resident_sample();
+  volatile char zero = page[0];
+  (void)zero;
+  const auto shared_zero = MemoryLimitPoolTestPeer::slab_resident_sample();
+  EXPECT_EQ(untouched.owned_resident, shared_zero.owned_resident);
+  // Mimic resident THP neighbors without charging them as cache backing.
+  char *uncommitted = base + 3 * page_;
+  std::memset(uncommitted, 1, page_);
+  EXPECT_EQ(shared_zero.owned_resident,
+            MemoryLimitPoolTestPeer::slab_resident_sample().owned_resident);
+  ASSERT_EQ(0, ::madvise(uncommitted, page_, MADV_DONTNEED));
+  std::memset(page, 0, page_);
+  errno = EDOM;
+  const auto written = MemoryLimitPoolTestPeer::slab_resident_sample();
+  EXPECT_EQ(EDOM, errno);
+  EXPECT_EQ(shared_zero.owned_resident + page_, written.owned_resident);
+  EXPECT_GE(written.rss, written.owned_resident);
+  const auto busy = MemoryLimitPoolTestPeer::sample_with_slab_lock(pool_);
+  EXPECT_EQ(0u, busy.owned_resident);
+  EXPECT_GT(busy.rss, 0u);
+}
+
+TEST_F(PoolAdmissionTest, RealPageReplacementPreservesMeasuredRssHeadroom) {
+  constexpr size_t kMiB = 1UL << 20;
+  ASSERT_EQ(0, pool_.init(baseline_ + 16 * kMiB));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  std::vector<char *> pages;
+  pages.reserve(8 * kMiB / page_);
+  AILEGO_DEFER([&] {
+    for (auto *page : pages) pool_.release_buffer(page, page_);
+    pool_.configure_process_rss_limit(0);
+  });
+  const size_t rss = MemoryHelper::SelfRSS();
+  const size_t allowance =
+      std::max(64 * kMiB, 2 * ProcessRssBudget::headroom(rss + 128 * kMiB));
+  ASSERT_TRUE(pool_.configure_process_rss_limit(rss + allowance));
+  for (size_t i = 0; i < 8 * kMiB / page_; ++i) {
+    char *page = nullptr;
+    ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
+    ASSERT_NE(nullptr, page);
+    pages.push_back(page);
+    std::memset(page, 1, page_);
+  }
+  MemoryLimitPoolTestPeer::refresh_rss(pool_);
+  for (size_t cycle = 0; cycle < 8; ++cycle) {
+    SCOPED_TRACE(cycle);
+    for (size_t i = 0; i < kMiB / page_; ++i) {
+      char *page = pages.back();
+      pages.pop_back();
+      pool_.release_buffer(page, page_);
+      ASSERT_GE(MemoryLimitPoolTestPeer::trim_free(pool_, page_), page_);
+      page = nullptr;
+      ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
+      ASSERT_NE(nullptr, page);
+      pages.push_back(page);
+      std::memset(page, 1, page_);
+    }
+    MemoryLimitPoolTestPeer::refresh_rss(pool_);
+    EXPECT_GE(MemoryLimitPoolTestPeer::rss_available(pool_),
+              allowance - 10 * kMiB);
+  }
+}
+#endif
+
 #if defined(__linux__) && !defined(__ANDROID__)
 TEST_F(PoolAdmissionTest, PrepaidIoUringStagingReturnsHeadroomAfterUnmap) {
   ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
@@ -525,7 +658,8 @@ TEST_F(PoolAdmissionTest, PrepaidIoUringStagingReturnsHeadroomAfterUnmap) {
   ring.adopt_staging_reservation(bytes);
   const size_t rss = baseline_ + 128 * page_;
   const size_t headroom = 32 * (1UL << 20);
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
   MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
 
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -564,7 +698,8 @@ TEST_F(PoolAdmissionTest, RetainedMappingKeepsOneDebitUntilPhysicalRelease) {
   ASSERT_EQ(0, pool_.init(baseline_ + 2 * headroom));
   MemoryLimitPoolTestPeer::stop_background(pool_);
   const size_t rss = baseline_ + headroom;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
   MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
 
   const size_t charge = 2 * page_;
@@ -592,6 +727,68 @@ TEST_F(PoolAdmissionTest, RetainedMappingKeepsOneDebitUntilPhysicalRelease) {
   pool_.release_retained_block(mapping);
   EXPECT_EQ(0u, pool_.stats().retained_idle_bytes);
   EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
+}
+
+TEST_F(PoolAdmissionTest, MandatoryWorkspaceReclaimsIdleFixedAllowance) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 16 * page_));
+  auto idle = std::make_shared<std::atomic<size_t>>(12 * page_);
+  ASSERT_TRUE(pool_.try_charge_workspace_plan(idle->load()));
+  pool_.set_process_rss_reclaimer([idle, &pool = pool_] {
+    if (const auto bytes = idle->exchange(0))
+      pool.release_workspace_plan(bytes);
+  });
+  auto restore = ScopeGuard::Make([&] {
+    pool_.set_process_rss_reclaimer(nullptr);
+    if (const auto bytes = idle->exchange(0))
+      pool_.release_workspace_plan(bytes);
+  });
+  ASSERT_TRUE(pool_.try_charge_workspace_plan(8 * page_));
+  EXPECT_EQ(0u, idle->load());
+  pool_.release_workspace_plan(8 * page_);
+}
+
+TEST_F(PoolAdmissionTest, PinnedRequeuesDoNotStarveOlderProducer) {
+  ASSERT_EQ(0, pool_.init(baseline_ + (4UL << 20)));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  auto &queue = BlockEvictionQueue::get_instance();
+  BlockEvictionQueue::BlockType stale;
+  while (queue.evict_single_block(stale)) {
+  }
+  class Owner : public EvictableBlockOwner {
+   public:
+    Owner() {
+      BlockEvictionQueue::get_instance().set_valid(this);
+    }
+    ~Owner() override {
+      BlockEvictionQueue::get_instance().set_invalid(this);
+    }
+    bool is_dead_block(eviction_key_t key, version_t) override {
+      return key == 1 && evicted;
+    }
+    bool evict_block(eviction_key_t key) override {
+      if (key == 1) {
+        evicted = true;
+        return true;
+      }
+      enqueue(0);
+      return false;
+    }
+    void enqueue(eviction_key_t key) {
+      BlockEvictionQueue::BlockType item;
+      item.owner = this;
+      item.owner_key = key;
+      EXPECT_TRUE(BlockEvictionQueue::get_instance().add_single_block(item, 0));
+    }
+    bool evicted{false};
+  } owner;
+  owner.enqueue(1);
+  std::thread consumer([&] {
+    owner.enqueue(0);
+    for (size_t attempt = 0; attempt < 512 && !owner.evicted; ++attempt)
+      queue.batch_recycle(1);
+  });
+  consumer.join();
+  EXPECT_TRUE(owner.evicted);
 }
 
 TEST_F(PoolAdmissionTest, SmallWorkspaceDoesNotDiscardTheWholeCache) {
@@ -651,8 +848,8 @@ TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
   ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));
   MemoryLimitPoolTestPeer::stop_background(pool_);
   const size_t limit = baseline_ + 256 * page_;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(
-      pool_, limit, limit - 4 * page_));
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, limit, limit - 4 * page_));
   ASSERT_TRUE(pool_.under_process_rss_pressure());
   const auto timeout = std::chrono::milliseconds(1);
   char *buffer = nullptr;
@@ -673,7 +870,8 @@ TEST_F(PoolAdmissionTest, SlabPageReuseAndDiscardKeepOneProjection) {
   ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));
   MemoryLimitPoolTestPeer::stop_background(pool_);
   const size_t rss = baseline_ + headroom;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
   MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
 
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -683,13 +881,16 @@ TEST_F(PoolAdmissionTest, SlabPageReuseAndDiscardKeepOneProjection) {
     } else {
       ASSERT_EQ(1u, pool_.batch_acquire_buffers(page_, &page, 1));
     }
-    EXPECT_EQ(headroom - 2 * page_, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EXPECT_EQ(headroom - 2 * page_,
+              MemoryLimitPoolTestPeer::rss_available(pool_));
     pool_.release_buffer(page, page_);
-    EXPECT_EQ(headroom - 2 * page_, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EXPECT_EQ(headroom - 2 * page_,
+              MemoryLimitPoolTestPeer::rss_available(pool_));
     char *reused = nullptr;
     ASSERT_TRUE(pool_.try_acquire_buffer(page_, reused));
     EXPECT_EQ(page, reused);
-    EXPECT_EQ(headroom - 2 * page_, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EXPECT_EQ(headroom - 2 * page_,
+              MemoryLimitPoolTestPeer::rss_available(pool_));
     pool_.release_buffer(reused, page_);
     EXPECT_EQ(page_, MemoryLimitPoolTestPeer::trim_free(pool_, page_));
     EXPECT_EQ(headroom - page_, MemoryLimitPoolTestPeer::rss_available(pool_));
@@ -701,7 +902,8 @@ TEST_F(PoolAdmissionTest, QueueMappingsRefundHeadroomOnUnmap) {
   ASSERT_EQ(0, pool_.init(baseline_ + headroom));
   MemoryLimitPoolTestPeer::stop_background(pool_);
   const size_t rss = baseline_ + headroom;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
   MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
 
   for (size_t bytes : {3776UL, 128UL << 10, 3776UL, 128UL << 10}) {
@@ -723,7 +925,8 @@ TEST_F(PoolAdmissionTest, QueueSlabGrowthUsesTheExistingProjection) {
   ASSERT_EQ(0, pool_.init(baseline_ + headroom));
   MemoryLimitPoolTestPeer::stop_background(pool_);
   const size_t rss = baseline_ + headroom;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
+  ASSERT_TRUE(
+      MemoryLimitPoolTestPeer::configure_rss(pool_, rss + headroom, rss));
   MemoryLimitPoolTestPeer::sample_rss(pool_, 0);
 
   const size_t before = pool_.queue_allocated();

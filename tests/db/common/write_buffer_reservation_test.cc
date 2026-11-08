@@ -107,6 +107,14 @@ TEST_F(WriteBufferReservationTest, WriterPromotionsShareMeasuredHeadroom) {
             second.acquire_managed(kMiB).code());
 
   Peer::refresh_rss(pool, kRss);
+  // An unchanged RSS sample does not prove that either newly retained
+  // ordinary workspace is resident. Keep its lifetime charge until reclaimed.
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
+            second.acquire_managed(kMiB).code());
+  first.release();
+  second.release();
+  detail::SharedWriteBufferMemoryAllowance().reclaim_idle();
+  Peer::refresh_rss(pool, kRss);
   EXPECT_TRUE(second.acquire_managed(kMiB).ok());
 }
 
@@ -124,6 +132,43 @@ TEST_F(WriteBufferReservationTest, CollectionsShareBudgetAndReturnAllowance) {
   first.release();
   ASSERT_TRUE(third.acquire(kStressBufferBytes).ok());
   EXPECT_EQ(528 * kMiB, pool_.external_used());
+}
+
+TEST_F(WriteBufferReservationTest, ManagedPlanLeavesRssRoomForArrowBacking) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
+  ASSERT_TRUE(Peer::configure_rss(pool, 512 * kMiB, 128 * kMiB));
+  Peer::refresh_rss(pool, 0);
+
+  WriteBufferReservation writer;
+  ASSERT_TRUE(writer.acquire_managed(kStressBufferBytes).ok());
+  EXPECT_EQ(264 * kMiB, writer.bytes());
+  // Arrow's separately charged buffers must fit beside the 8 MiB ordinary
+  // workspace, even before another RSS sample. The 264 MiB plan is not backing.
+  ASSERT_TRUE(pool.try_charge_workspace(192 * kMiB, 192 * kMiB));
+  pool.release_external(192 * kMiB);
+  EXPECT_EQ(264 * kMiB, pool_.external_used());
+}
+
+TEST_F(WriteBufferReservationTest, RejectedPromotionDoesNotAcquireRssBacking) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  using Peer = ailego::MemoryLimitPoolTestPeer;
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
+  ASSERT_TRUE(Peer::configure_rss(pool, 128 * kMiB, 124 * kMiB));
+  Peer::refresh_rss(pool, 0);
+
+  WriteBufferReservation writer;
+  ASSERT_TRUE(writer.acquire(kMiB).ok());
+  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
+            writer.acquire_managed(kMiB).code());
+  EXPECT_EQ(12 * kMiB, writer.bytes());
+  writer.release();
+  EXPECT_EQ(0u, pool_.external_used());
+  ASSERT_TRUE(pool.try_charge_process_backing(kMiB, kMiB, false));
+  pool.release_process_backing(kMiB);
 }
 
 TEST_F(WriteBufferReservationTest, ConcurrentAdmissionCannotOverReserve) {

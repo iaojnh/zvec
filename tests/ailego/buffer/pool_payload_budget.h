@@ -49,6 +49,7 @@ class PoolPayloadBudget {
     return bytes;
   }
 
+
   int init(size_t bytes) {
     auto &pool = actual();
     if (bytes != 0 && pool.used() == pool.queue_metadata_used() +

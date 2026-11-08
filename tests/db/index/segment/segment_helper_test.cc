@@ -22,6 +22,7 @@
 #include <set>
 #include <thread>
 #include <variant>
+#include <ailego/pattern/scope_guard.h>
 #if !defined(_WIN32)
 #include <sys/stat.h>
 #endif
@@ -35,6 +36,7 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
+#include "db/common/mobile_memory.h"
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "db/index/column/vector_column/vector_index_results.h"
@@ -47,8 +49,25 @@
 #include "zvec/db/options.h"
 #include "zvec/db/query_params.h"
 #include "zvec/db/schema.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
+
+namespace {
+class SegmentHelperBudgetEnvironment : public testing::Environment {
+ public:
+  void SetUp() override {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // The merge-correctness cases keep ten segments and five vector stores
+      // per segment open together. Their non-evictable storage metadata alone
+      // exceeds the mobile startup default; use an explicit suite budget.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+};
+[[maybe_unused]] const auto *const kSegmentHelperBudgetEnvironment =
+    testing::AddGlobalTestEnvironment(new SegmentHelperBudgetEnvironment);
+}  // namespace
 
 class SegmentHelperTest : public testing::Test {
  protected:
@@ -338,12 +357,20 @@ TEST_F(SegmentHelperTest, CompactTask_FilterBudgetDenialAllowsRetry) {
   ASSERT_TRUE(input->flush().ok());
 
   uint64_t block_at = UINT64_MAX;
-  ailego::MemoryReservation pressure;
+  size_t pressure = 0;
+  auto release_pressure = ailego::ScopeGuard::Make([&] {
+    if (pressure) pool.release_workspace_plan(pressure);
+  });
   auto filter = EasyIndexFilter::Create([&](uint64_t id) {
     // Exhaust the budget after reading the batch, before either the first
     // deleted row or the first selected row is recorded.
     if (id == block_at) {
-      pressure.add(pool.capacity() - pool.used());
+      // Inject logical quota exhaustion, not an untouched allocation of all
+      // remaining process RSS (which can itself fail on mobile before the
+      // filter's allocation is reached).
+      const size_t bytes = pool.capacity() - pool.used();
+      if (!pool.try_charge_workspace_plan(bytes)) throw std::bad_alloc();
+      pressure += bytes;
     }
     return id == 0;
   });
@@ -356,21 +383,23 @@ TEST_F(SegmentHelperTest, CompactTask_FilterBudgetDenialAllowsRetry) {
   for (const uint64_t id : {0, 1}) {
     block_at = id;
     auto status = SegmentHelper::Execute(task);
-    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code()) << status.message();
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code())
+        << status.message();
     EXPECT_EQ(0u, status.message().find("filter record batch failed"));
-    EXPECT_EQ(id == 0,
-              status.message().find("Compaction deletion bitmap") !=
-                  std::string::npos);
+    EXPECT_EQ(id == 0, status.message().find("Compaction deletion bitmap") !=
+                           std::string::npos);
     EXPECT_EQ(nullptr,
               std::get<CompactTask>(task->task_info()).output_segment_meta_);
     EXPECT_FALSE(std::filesystem::exists(tmp_path));
-    pressure = ailego::MemoryReservation{};
+    pool.release_workspace_plan(pressure);
+    pressure = 0;
   }
 
   block_at = UINT64_MAX;
   auto status = SegmentHelper::Execute(task);
   ASSERT_TRUE(status.ok()) << status.message();
-  const auto &output = std::get<CompactTask>(task->task_info()).output_segment_meta_;
+  const auto &output =
+      std::get<CompactTask>(task->task_info()).output_segment_meta_;
   ASSERT_NE(nullptr, output);
   EXPECT_EQ(15u, output->doc_count());
   EXPECT_TRUE(FileHelper::RemoveDirectory(tmp_path));

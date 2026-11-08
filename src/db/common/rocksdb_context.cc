@@ -25,6 +25,7 @@
 #include <zvec/db/config.h>
 #include "db/common/global_resource.h"
 #include "db/common/native_worker_memory.h"
+#include "db/common/rocksdb_block_cache.h"
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 #include "db/common/rocksdb_memtable_factory.h"
 #endif
@@ -103,7 +104,7 @@ Status RocksdbContext::create(Args args) {
   }
   auto metadata = ReserveRocksMetadata(column_family_count);
   if (!metadata) return metadata.error();
-  prepare_options(std::move(args.merge_op), true);
+  auto cache_activity = prepare_options(std::move(args.merge_op), true);
 
   rocksdb::DB *db;
   rocksdb::Status s = rocksdb::DB::Open(create_opts_, args.db_path, &db);
@@ -144,6 +145,7 @@ Status RocksdbContext::create(Args args) {
   }
 
   read_only_ = false;
+  cache_activity_ = std::move(cache_activity);
   metadata_memory_ = std::move(*metadata);
   write_opts_.disableWAL = true;
   LOG_DEBUG("Created RocksDB[%s] with Args", args.db_path.c_str());
@@ -182,7 +184,7 @@ Status RocksdbContext::open(Args args, bool read_only) {
   create_opts_.create_if_missing = false;
   auto metadata = ReserveRocksMetadata(1);
   if (!metadata) return metadata.error();
-  prepare_options(std::move(args.merge_op), !read_only);
+  auto cache_activity = prepare_options(std::move(args.merge_op), !read_only);
 
   rocksdb::Status s;
   std::vector<std::string> existing_cf_names{};
@@ -266,6 +268,7 @@ Status RocksdbContext::open(Args args, bool read_only) {
 
   db_.reset(db);
   read_only_ = read_only;
+  cache_activity_ = std::move(cache_activity);
   metadata_memory_ = std::move(*metadata);
   write_opts_.disableWAL = true;
   LOG_DEBUG("Opened RocksDB[%s] with Args", args.db_path.c_str());
@@ -309,7 +312,7 @@ Status RocksdbContext::validate_and_set_db_path(const std::string &db_path,
 }
 
 
-void RocksdbContext::prepare_options(
+std::shared_ptr<void> RocksdbContext::prepare_options(
     std::shared_ptr<rocksdb::MergeOperator> merge_op, bool writable) {
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
   // Buffered file writes already use the OS cache. Avoid another growable
@@ -438,6 +441,7 @@ void RocksdbContext::prepare_options(
     // iterator. Keep the default ordered SkipList, whose nodes are already
     // covered by WBM, rather than allocating a second copy at flush time.
   }
+  return RocksdbBlockCache::AcquireContext(table_options.block_cache);
 }
 
 
@@ -462,6 +466,7 @@ Status RocksdbContext::close() {
   if (auto s = db_->Close(); s.ok()) {
     LOG_DEBUG("Closed RocksDB[%s]", db_path_.c_str());
     db_.reset();
+    cache_activity_.reset();
     metadata_memory_.reset();
     return Status::OK();
   } else {

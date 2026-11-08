@@ -14,6 +14,7 @@
 
 #include "quantizer/pq_int8_quantizer/pq_int8_quantizer.h"
 #include <algorithm>
+#include <ailego/pattern/scope_guard.h>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -22,7 +23,6 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <turbo/algorithm/kmeans.h>

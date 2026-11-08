@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "diskann_graph_connectivity.h"
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <vector>
 #include <gtest/gtest.h>
+#include "utility/temporary_buffer_storage.h"
 #include "diskann_algorithm.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
@@ -62,6 +64,14 @@ class ConnectivityEntity : public DiskAnnEntity {
     ++writes;
     return 0;
   }
+  int add_neighbor(diskann_id_t id, diskann_id_t neighbor) override {
+    graph.at(id).push_back(neighbor);
+    ++writes;
+    return 0;
+  }
+  GraphQuantization graph_quantization() const override {
+    return guidance;
+  }
 
   std::vector<std::array<float, 4>> vectors;
   std::vector<ailego::BudgetedVector<diskann_id_t>> graph;
@@ -69,6 +79,7 @@ class ConnectivityEntity : public DiskAnnEntity {
   diskann_id_t failed_read{kInvalidId};
   bool fail_write{false};
   size_t writes{0};
+  GraphQuantization guidance;
   bool batch_vectors{false};
   int batch_error{0};
   mutable size_t vector_reads{0};
@@ -292,6 +303,66 @@ TEST_F(DiskAnnGraphConnectivityTest, AdmitsWorkspaceBeforeMutationAndCanRetry) {
   expect_reachable(1);
 }
 
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphHasDistinctBoundedNonSelfEdges) {
+  initialize(64, 8);
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.initialize_graph());
+  for (size_t id = 0; id < entity_->graph.size(); ++id) {
+    const auto &neighbors = entity_->graph[id];
+    ASSERT_EQ(8u, neighbors.size());
+    std::array<bool, 64> seen{};
+    for (const auto neighbor : neighbors) {
+      ASSERT_LT(neighbor, seen.size());
+      EXPECT_NE(id, neighbor);
+      EXPECT_FALSE(seen[neighbor]);
+      seen[neighbor] = true;
+    }
+  }
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphHandlesSingleton) {
+  initialize(1, 8);
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.initialize_graph());
+  EXPECT_TRUE(entity_->graph[0].empty());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphPropagatesWriteFailure) {
+  initialize(4, 2);
+  entity_->fail_write = true;
+  DiskAnnAlgorithm algorithm(*entity_, 2);
+  EXPECT_EQ(IndexError_WriteData, algorithm.initialize_graph());
+  EXPECT_EQ(0u, entity_->writes);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, SeedGraphAdmitsWorkspaceBeforeMutation) {
+  initialize(4, 2);
+  DiskAnnAlgorithm algorithm(*entity_, 2);
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t charge = pool.available();
+  ASSERT_TRUE(pool.try_charge_external(charge));
+  const int ret = algorithm.initialize_graph();
+  pool.release_external(charge);
+  EXPECT_EQ(IndexError_NoMemory, ret);
+  EXPECT_EQ(0u, entity_->writes);
+  ASSERT_EQ(0, algorithm.initialize_graph());
+  EXPECT_EQ(4u, entity_->writes);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, InsertionPreservesUnsearchedExistingEdge) {
+  initialize(4, 2, 4);
+  entity_->vectors[1].fill(10.0f);
+  entity_->vectors[3].fill(10.1f);
+  entity_->graph[1] = {3};
+  // The medoid cannot reach node 3 yet. It is a valid reciprocal edge added
+  // before node 1's own insertion, and must participate in robust pruning.
+  DiskAnnAlgorithm algorithm(*entity_, 2);
+  ASSERT_EQ(0, algorithm.add_node(1, context_.get()));
+  const auto &neighbors = entity_->graph[1];
+  EXPECT_NE(neighbors.end(), std::find(neighbors.begin(), neighbors.end(), 3));
+  EXPECT_LE(neighbors.size(), 2u);
+}
+
 TEST_F(DiskAnnGraphConnectivityTest, WorkspaceIsChargedAndReleasedWithMapping) {
   initialize(4, 1);
   auto &pool = ailego::PoolPayloadBudget::get_instance();
@@ -302,6 +373,77 @@ TEST_F(DiskAnnGraphConnectivityTest, WorkspaceIsChargedAndReleasedWithMapping) {
               pool.external_used());
   }
   EXPECT_EQ(before, pool.external_used());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       QuantizedTraversalRestoresExactPruneDistancesAndReadErrors) {
+  initialize(128, 8, 128);
+  for (diskann_id_t id = 1; id < 128; ++id) entity_->graph[0].push_back(id);
+  const auto original = entity_->graph;
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.add_node(65, context_.get()));
+  const auto expected = entity_->graph;
+
+  IndexMeta meta(IndexMeta::DT_FP32, 4);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto quantizer = IndexFactory::CreateQuantizer("PqInt8Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  ailego::Params params;
+  params.set("num_chunk", uint32_t{2});
+  params.set("thread_count", uint32_t{1});
+  params.set("precompute_sdc", false);
+  ASSERT_EQ(0, quantizer->init(meta, params));
+  auto holder = std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(4);
+  for (size_t id = 0; id < 128; ++id)
+    ASSERT_TRUE(holder->emplace(id, ailego::NumericalVector<float>(4, id)));
+  ASSERT_EQ(0, quantizer->train(holder));
+  std::vector<uint8_t> codes(128 * 2);
+  // Deliberately give traversal wrong scores. Its beam still visits this whole
+  // star, so exact refinement must recover the original pruning and graph.
+  for (size_t id = 0; id < 128; ++id)
+    quantizer->quantize_data(entity_->vectors[127 - id].data(),
+                             codes.data() + id * 2);
+  turbo::DistanceImpl approximate;
+  ASSERT_EQ(0, quantizer->prepare_distance(entity_->vectors[65].data(),
+                                           &approximate));
+  ASSERT_GT(approximate(codes.data() + 65 * 2), 0.0f);
+
+  for (const bool paged : {false, true}) {
+    SCOPED_TRACE(paged);
+    TemporaryBufferStorage::Pointer code_storage;
+    context_->clear();
+    entity_->graph = original;
+    entity_->failed_vector = kInvalidId;
+    entity_->guidance = {quantizer.get(), codes.data(), 2};
+    if (paged) {
+      std::string prefix;
+      ASSERT_EQ(0, TemporaryBufferStorage::DefaultPrefix(
+                       "zvec-diskann-graph-codes-test", &prefix));
+      ASSERT_EQ(0, TemporaryBufferStorage::Create(prefix, codes.size(),
+                                                  &code_storage));
+      ASSERT_EQ(0, code_storage->write(0, codes.data(), codes.size()));
+      entity_->guidance.codes = nullptr;
+      entity_->guidance.paged_codes = code_storage->storage()->get("data");
+      ASSERT_NE(nullptr, entity_->guidance.paged_codes);
+    }
+    ASSERT_EQ(0, algorithm.add_node(65, context_.get()));
+    EXPECT_EQ(expected, entity_->graph);
+    ASSERT_EQ(127u, context_->expanded_nodes().size());
+    for (const auto &candidate : context_->expanded_nodes()) {
+      const float difference = static_cast<float>(candidate.id) - 65.0f;
+      EXPECT_FLOAT_EQ(4.0f * difference * difference, candidate.distance);
+    }
+
+    context_->clear();
+    entity_->graph = original;
+    entity_->failed_vector = 64;
+    entity_->writes = 0;
+    EXPECT_EQ(IndexError_IO, algorithm.add_node(65, context_.get()));
+    EXPECT_EQ(original, entity_->graph);
+    EXPECT_EQ(0u, entity_->writes);
+    context_->clear();
+    entity_->guidance = {};
+  }
 }
 
 TEST_F(DiskAnnGraphConnectivityTest,

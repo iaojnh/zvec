@@ -292,7 +292,7 @@ void estimate_sparse_result(const Doc &doc, const std::string &name,
 }
 
 void estimate_document_value(const Doc &doc, const std::string &name,
-                              DataType type, PythonResultEstimate &estimate) {
+                             DataType type, PythonResultEstimate &estimate) {
   switch (type) {
     case DataType::STRING:
     case DataType::BINARY:
@@ -583,9 +583,8 @@ internal::FetchResultSnapshot fetch_snapshot_for_python(
   Result<internal::FetchResultSnapshot> result;
   {
     py::gil_scoped_release release;
-    result = internal::fetch_result_snapshot(collection, pks, output_fields,
-                                             include_vector, schema,
-                                             prefer_columns);
+    result = internal::fetch_result_snapshot(
+        collection, pks, output_fields, include_vector, schema, prefer_columns);
   }
   return unwrap_expected(std::move(result));
 }
@@ -691,7 +690,7 @@ void fetch_chunk_for_python(
       if (it->second) {
         chunk[keys.wrap(py::str(it->first))] =
             ZVecPyDoc::doc_to_tuple_with_fields(*it->second, forward_fields,
-                                               vector_fields);
+                                                vector_fields);
       }
       snapshot.docs.erase(it);
     }
@@ -721,16 +720,16 @@ static void admit_python_doc_copy(detail::ResultMemoryAllowance::Lease &memory,
       const size_t growth = bytes - admitted;
       memory.add_pending(
           growth, detail::BindingMemoryBytes(materialization_copies, growth),
-          pending);
+          growth, pending);
     }
     admitted = bytes;
   }
 }
 
 template <typename Estimate, typename Convert>
-static py::object budgeted_python_doc_value(
-    const Doc &doc, Estimate estimate, Convert convert,
-    size_t materialization_copies = 2) {
+static py::object budgeted_python_doc_value(const Doc &doc, Estimate estimate,
+                                            Convert convert,
+                                            size_t materialization_copies = 2) {
   if (!detail::DocumentMemoryAccess::budgeted(doc)) return convert();
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       &forward_result_allowance(), false, kPythonResultBackingQuantum);
@@ -769,7 +768,7 @@ py::object budgeted_doc_pk(const Doc &doc) {
     return estimate.bytes();
   };
   return budgeted_python_doc_value(doc, estimate_bytes,
-                                  [&] { return py::str(doc.pk_ref()); });
+                                   [&] { return py::str(doc.pk_ref()); });
 }
 
 py::object budgeted_doc_field_names(const Doc &doc) {
@@ -779,7 +778,7 @@ py::object budgeted_doc_field_names(const Doc &doc) {
         5, detail::DocumentMemoryAccess::field_names_bytes(doc), 128);
   };
   return budgeted_python_doc_value(doc, estimate_bytes,
-                                  [&] { return py::cast(doc.field_names()); });
+                                   [&] { return py::cast(doc.field_names()); });
 }
 
 py::bytes budgeted_doc_pickle_state(const Doc &doc) {
@@ -893,12 +892,17 @@ py::object group_value_for_python(const GroupResult &group) {
   if (!group.memory_owner) return py::str(group.group_by_value_);
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       &forward_result_allowance(), false, kPythonResultBackingQuantum);
+  PendingResultCopy pending;
   {
     py::gil_scoped_release release;
     PythonResultEstimate estimate;
     estimate.string(group.group_by_value_);
-    memory->add(estimate.bytes());
+    // The temporary base string and its owner-backed subclass coexist.
+    memory->add_pending(estimate.bytes(),
+                        detail::FetchMemoryBytes(2, estimate.bytes()),
+                        estimate.bytes(), pending);
   }
+  pending.start();
   return py::module_::import("zvec.model._budgeted_result")
       .attr("_ResultString")(py::str(group.group_by_value_),
                              result_memory_owner(memory));
@@ -1230,7 +1234,8 @@ void ZVecPyCollection::bind_dml_methods(
               py::gil_scoped_release release;
               if (output_memory->enabled())
                 output_memory->add(write_result_bytes(
-                    inputs.pks, [](const std::string &key) -> const std::string & {
+                    inputs.pks,
+                    [](const std::string &key) -> const std::string & {
                       return key;
                     }));
               result = self.delete_(inputs.pks);

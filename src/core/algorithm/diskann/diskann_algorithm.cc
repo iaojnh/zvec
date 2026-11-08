@@ -14,6 +14,7 @@
 
 #include "diskann_algorithm.h"
 #include <algorithm>
+#include <random>
 #include <set>
 #include <ailego/pattern/defer.h>
 #include <zvec/core/framework/index_holder.h>
@@ -43,6 +44,34 @@ DiskAnnAlgorithm::DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree,
       count /= 2;
     }
   }
+}
+
+int DiskAnnAlgorithm::initialize_graph() try {
+  const uint64_t count = entity_.doc_cnt();
+  if (count == 0) return 0;
+  if (count > kInvalidId || max_degree_ == 0) return IndexError_InvalidArgument;
+  const size_t degree = std::min<uint64_t>(max_degree_, count - 1);
+  ailego::BudgetedVector<diskann_id_t> neighbors;
+  neighbors.reserve(degree);
+  std::mt19937_64 random(0);
+  std::uniform_int_distribution<diskann_id_t> pick(
+      0, static_cast<diskann_id_t>(count - 1));
+  // Only one row is retained in workspace; buffered entities keep the graph
+  // itself pageable. Seed edges span the full corpus before insertion begins.
+  for (uint64_t id = 0; id < count; ++id) {
+    neighbors.clear();
+    while (neighbors.size() < degree) {
+      const auto neighbor = pick(random);
+      if (neighbor != id && std::find(neighbors.begin(), neighbors.end(),
+                                      neighbor) == neighbors.end())
+        neighbors.push_back(neighbor);
+    }
+    const int ret = entity_.set_neighbors(id, neighbors);
+    if (ret != 0) return ret;
+  }
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 ailego::BudgetedVector<diskann_id_t> DiskAnnAlgorithm::get_init_ids(
@@ -303,8 +332,29 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
 
   best_list_nodes.reserve(ctx->list_size());
 
+  const auto guidance = entity_.graph_quantization();
+  bool quantized = guidance.quantizer != nullptr;
+  if (quantized) {
+    if ((!guidance.codes && !guidance.paged_codes) || guidance.code_size == 0)
+      return IndexError_NoReady;
+    dc.bind_quantizer(guidance.quantizer, guidance.codes, guidance.code_size,
+                      guidance.paged_codes);
+    const int ret = dc.quantize_query(ctx->query());
+    if (ret == IndexError_NoMemory) {
+      dc.clear();
+      quantized = false;
+    } else if (ret != 0) {
+      return ret;
+    }
+  }
+
   for (auto id : init_ids) {
-    float distance = dc.dist(id);
+    float distance;
+    if (quantized) {
+      dc.quantized_dist(&id, 1, &distance);
+    } else {
+      distance = dc.dist(id);
+    }
     if (dc.error()) {
       return dc.error_code();
     }
@@ -338,12 +388,26 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
       }
     }
 
-    if (!entity_.prefer_vector_batch()) {
+    if (!quantized && !entity_.prefer_vector_batch()) {
       // Keep the in-memory builder's scalar fast path unchanged.
       for (diskann_id_t id : id_scratch) {
         const float distance = dc.dist(id);
         if (dc.error()) return dc.error_code();
         best_list_nodes.insert(Neighbor(id, distance));
+      }
+      continue;
+    }
+    if (quantized) {
+      for (size_t begin = 0; begin < id_scratch.size();
+           begin += DiskAnnEntity::kVectorReadBatchSize) {
+        const size_t count = std::min(DiskAnnEntity::kVectorReadBatchSize,
+                                      id_scratch.size() - begin);
+        std::array<dist_t, DiskAnnEntity::kVectorReadBatchSize> distances;
+        dc.quantized_dist(id_scratch.data() + begin,
+                          static_cast<uint32_t>(count), distances.data());
+        if (dc.error()) return dc.error_code();
+        for (size_t i = 0; i < count; ++i)
+          best_list_nodes.insert(Neighbor(id_scratch[begin + i], distances[i]));
       }
       continue;
     }
@@ -359,6 +423,24 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
           return 0;
         });
     if (ret) return ret;
+  }
+
+  // Approximate scores guide traversal only. Restore exact query distances
+  // and heap order before existing-neighbor union, robust pruning or repair.
+  if (quantized) {
+    for (size_t begin = 0; begin < expanded_nodes.size();
+         begin += DiskAnnEntity::kVectorReadBatchSize) {
+      const size_t count = std::min(DiskAnnEntity::kVectorReadBatchSize,
+                                    expanded_nodes.size() - begin);
+      std::array<diskann_id_t, DiskAnnEntity::kVectorReadBatchSize> ids;
+      std::array<dist_t, DiskAnnEntity::kVectorReadBatchSize> distances;
+      for (size_t i = 0; i < count; ++i) ids[i] = expanded_nodes[begin + i].id;
+      dc.dist_batch(ids.data(), count, distances.data());
+      if (dc.error()) return dc.error_code();
+      for (size_t i = 0; i < count; ++i)
+        expanded_nodes[begin + i].distance = distances[i];
+    }
+    std::make_heap(expanded_nodes.begin(), expanded_nodes.end());
   }
 
   return 0;

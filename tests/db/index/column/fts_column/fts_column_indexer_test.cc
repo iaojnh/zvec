@@ -21,11 +21,13 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rocksdb/utilities/stackable_db.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/index_params.h>
 #include "db/common/file_helper.h"
+#include "db/common/mobile_memory.h"
 #include "db/index/common/index_filter.h"
 #include "../../../../ailego/buffer/pool_payload_budget.h"
 // FtsQueryParams defined below
@@ -42,7 +44,33 @@
 using namespace zvec;
 using namespace zvec::fts;
 
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static void stop_reclaim(MemoryLimitPool &pool) {
+    pool.stop_background_evictor();
+  }
+  static void start_reclaim(MemoryLimitPool &pool) {
+    pool.start_background_evictor();
+  }
+};
+}  // namespace zvec::ailego
+
 namespace {
+
+class FtsBudgetEnvironment : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // Configure this analyzer suite before death-test parents can publish
+      // the mobile default pool. Jieba's complete dictionary needs the same
+      // standalone payload budget in every suite and re-executed child.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+};
+
+[[maybe_unused]] const auto *const kFtsBudgetEnvironment =
+    ::testing::AddGlobalTestEnvironment(new FtsBudgetEnvironment);
 
 // Build a transient FieldSchema for FTS unit tests.
 // When fts_params is provided, it is attached as the field's index_params
@@ -824,7 +852,7 @@ TEST_F(FtsColumnIndexerTest, OpenWithJiebaTokenizerSucceedsWithoutDictDir) {
   params.tokenizer_name = "jieba";
   params.filters.clear();
   auto pipeline = TokenizerFactory::create(params);
-  ASSERT_TRUE(pipeline.has_value());
+  ASSERT_TRUE(pipeline.has_value()) << pipeline.error().message();
   const auto tokens = pipeline.value()->process("中文分词技术");
   ASSERT_EQ(tokens.size(), 3u);
   EXPECT_EQ(tokens[0].text, "中文");
@@ -1311,6 +1339,18 @@ TEST_F(FtsColumnIndexerTest, QueryWorkspaceDenialIsAnErrorAndCanRetry) {
   ASSERT_TRUE(ast);
   FtsQueryParams params;
   params.topk = 10;
+  {
+    auto initial = indexer->search(*ast, params);
+    ASSERT_TRUE(initial) << initial.error().message();
+    ASSERT_EQ(1u, initial->size());
+  }
+  // Exhaust a stable logical budget. Background maintenance can otherwise
+  // release the preceding insert's idle planning allowance during search.
+  // The production reclaimer is tested separately; this case verifies error
+  // propagation from an unreclaimable workspace and retry after its release.
+  ailego::MemoryLimitPoolTestPeer::stop_reclaim(pool);
+  auto restore_reclaim = ailego::ScopeGuard::Make(
+      [&] { ailego::MemoryLimitPoolTestPeer::start_reclaim(pool); });
   zvec::ailego::MemoryReservation pressure;
   ASSERT_GT(pool.capacity(), pool.used());
   ASSERT_NO_THROW(pressure.add(pool.capacity() - pool.used()));
@@ -1330,9 +1370,11 @@ class DenyFtsReadDB : public rocksdb::StackableDB {
   explicit DenyFtsReadDB(rocksdb::DB *db) : rocksdb::StackableDB(db) {}
 
   rocksdb::Status Get(const rocksdb::ReadOptions &options,
-                      rocksdb::ColumnFamilyHandle *cf, const rocksdb::Slice &key,
+                      rocksdb::ColumnFamilyHandle *cf,
+                      const rocksdb::Slice &key,
                       rocksdb::PinnableSlice *value) override {
-    if (cf == denied) return rocksdb::Status::MemoryLimit("injected cache limit");
+    if (cf == denied)
+      return rocksdb::Status::MemoryLimit("injected cache limit");
     return rocksdb::StackableDB::Get(options, cf, key, value);
   }
 
@@ -1370,7 +1412,8 @@ TEST_F(FtsColumnIndexerTest, CacheDenialReachesSearchAndOpen) {
     fault->denied = cf;
     const auto denied = indexer->search(*ast, params);
     EXPECT_FALSE(denied);
-    if (!denied) EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+    if (!denied)
+      EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
   }
   fault->denied = nullptr;
   const auto retried = indexer->search(*ast, params);
@@ -1382,7 +1425,8 @@ TEST_F(FtsColumnIndexerTest, CacheDenialReachesSearchAndOpen) {
   FtsColumnIndexer reopened;
   auto open = [&] {
     return reopened.open_reader("content", &db_, postings_cf_, positions_cf_,
-                                term_freq_cf_, max_tf_cf_, doc_len_cf_, stat_cf_);
+                                term_freq_cf_, max_tf_cf_, doc_len_cf_,
+                                stat_cf_);
   };
   fault->denied = stat_cf_;
   const auto denied = open();

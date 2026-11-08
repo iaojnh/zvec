@@ -17,6 +17,7 @@
 #include <map>
 #include <string_view>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/container/lazy_map.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/type_helper.h>
 #include <zvec/core/framework/index_error.h>
@@ -73,10 +74,10 @@ class IndexUnpacker {
       return a < b;
     }
   };
-  using SegmentMap =
+  using SegmentMap = ailego::LazyMap<
       std::map<ailego::BudgetedString, SegmentMeta, SegmentNameLess,
                ailego::BudgetedAllocator<
-                   std::pair<const ailego::BudgetedString, SegmentMeta>>>;
+                   std::pair<const ailego::BudgetedString, SegmentMeta>>>>;
 
   //! Reset the unpacker
   void reset() {

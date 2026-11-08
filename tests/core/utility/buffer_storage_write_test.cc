@@ -92,10 +92,10 @@ class BufferStorageWriteTest : public ::testing::Test {
     const size_t donor_metadata =
         ailego::PoolPayloadBudget::storage_metadata_bytes(resident_pages,
                                                           dirty);
-    const size_t receiver_metadata =
-        ailego::PoolPayloadBudget::storage_metadata_bytes(1);
-    ASSERT_EQ(0, memory_pool.init(donor_metadata + receiver_metadata +
-                                  8 * page_size));
+    ASSERT_EQ(0, memory_pool.init(
+                     donor_metadata +
+                     ailego::PoolPayloadBudget::storage_metadata_bytes(1) +
+                     8 * page_size));
 
     // Prior cases leave dead queue entries. No stores are open here, so remove
     // them before testing the foreground reservation's finite scan budget.
@@ -596,8 +596,8 @@ TEST_F(BufferStorageWriteTest, WriteBatchReportsBudgetDenialAndCanRetry) {
   AILEGO_DEFER([&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
   ASSERT_TRUE(pool.configure_process_rss_limit(1));
   const char replacement = 'b';
-  const IndexStorage::SegmentData writes[] = {
-      {0, 1, &replacement}, {page, 1, &replacement}};
+  const IndexStorage::SegmentData writes[] = {{0, 1, &replacement},
+                                              {page, 1, &replacement}};
   EXPECT_FALSE(segment->write_batch(writes, 2));
   EXPECT_EQ(IndexError_NoMemory, segment->write_error());
   const IndexStorage::SegmentData invalid{2 * page, 1, &replacement};
@@ -2382,10 +2382,13 @@ TEST_F(BufferStorageWriteTest, BatchBorrowedReadAcrossSegments) {
 
 TEST_F(BufferStorageWriteTest, CR_ReadOnlyMetadataPressureFallsBackToBypass) {
   const std::string expected = "bypass";
+  // A compact read-only page table must still exceed the metadata allowance.
+  // The sparse segment's extent supplies pressure without resident data pages.
+  const size_t segment_bytes = 16384 * ailego::kVectorPageSize;
   {
     auto storage = open_writable();
     ASSERT_TRUE(storage);
-    ASSERT_EQ(0, storage->append("seg1", 4096));
+    ASSERT_EQ(0, storage->append("seg1", segment_bytes));
     auto seg = storage->get("seg1");
     ASSERT_TRUE(seg);
     ASSERT_EQ(expected.size(), seg->write(0, expected.data(), expected.size()));
@@ -2400,7 +2403,8 @@ TEST_F(BufferStorageWriteTest, CR_ReadOnlyMetadataPressureFallsBackToBypass) {
   const size_t metadata_budget =
       std::max<size_t>(2 * ailego::kVectorPageSize, 256UL << 10);
   ASSERT_LT(metadata_budget,
-            ailego::VecBufferPool::metadata_bytes_for_page_count(1, false));
+            ailego::VecBufferPool::metadata_bytes_for_page_count(
+                segment_bytes / ailego::kVectorPageSize, false));
   ASSERT_EQ(0, pool.init(metadata_budget));
   {
     auto storage = open_read_only();
@@ -2682,10 +2686,11 @@ TEST_F(BufferStorageWriteTest,
   EXPECT_GE(
       pool.external_used(),
       baseline + ailego::MemoryLimitPool::retained_block_size(2 * length));
-  std::thread reader([block = std::move(retained), &payload]() mutable {
-    EXPECT_EQ(0, std::memcmp(payload.data(), block.data(), length));
-    block.reset();
-  });
+  std::thread reader(
+      [block = std::move(retained), &payload, length = length]() mutable {
+        EXPECT_EQ(0, std::memcmp(payload.data(), block.data(), length));
+        block.reset();
+      });
   reader.join();
   EXPECT_EQ(baseline, pool.external_used());
 }

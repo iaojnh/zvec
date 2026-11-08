@@ -79,7 +79,8 @@ Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
     while (true) {
       try {
         memory->add_pending(
-            detail::EstimateQueryResult(*batch.Slice(begin, num_rows)), pending);
+            detail::EstimateQueryResult(*batch.Slice(begin, num_rows)),
+            pending);
         break;
       } catch (const std::bad_alloc &) {
         if (num_rows <= 1) throw;
@@ -127,6 +128,8 @@ Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
         auto fetched =
             indexer->fetch(static_cast<uint32_t>(row_ids->Value(begin + i)));
         if (!fetched.has_value()) {
+          if (fetched.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+            return fetched.error();
           // Docs without a value for a vector field are accepted by insert
           // (the write path only warns and skips them, regardless of the
           // schema's nullable flag) — no placeholder, no presence bitmap,
@@ -213,9 +216,9 @@ Result<Doc::Ptr> DocIterator::next() try {
           // Deleted rows are filtered only when the snapshot's delete
           // bitmap is non-empty; otherwise read the segment as-is.
           if (impl_->filter) {
-            impl_->current_reader = FilteringReader::Make(
-                std::move(scalar_reader), impl_->filter,
-                segment->query_memory_pool());
+            impl_->current_reader =
+                FilteringReader::Make(std::move(scalar_reader), impl_->filter,
+                                      segment->query_memory_pool());
           } else {
             impl_->current_reader = std::move(scalar_reader);
           }

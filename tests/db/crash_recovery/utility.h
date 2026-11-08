@@ -23,10 +23,22 @@
 #include <string>
 #include <vector>
 #include <zvec/db/collection.h>
+#include <zvec/db/config.h>
 #include <zvec/db/doc.h>
 
 
 namespace zvec {
+
+// The recovery workload keeps 75k documents, dense and sparse HNSW indexes,
+// and seven scalar columns. Give the parent and exec'ed optimizer the same
+// explicit functional-test budget instead of the mobile startup default.
+inline Status InitializeOptimizeRecoveryResources() {
+  GlobalConfig::ConfigData config;
+  config.memory_limit_bytes = uint64_t{512} << 20;
+  config.query_thread_count = 2;
+  config.optimize_thread_count = 2;
+  return GlobalConfig::Instance().initialize(config);
+}
 
 /**
  * @brief Create a test schema with deterministic field definitions.

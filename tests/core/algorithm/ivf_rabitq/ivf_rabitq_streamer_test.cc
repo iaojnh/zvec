@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <string>
@@ -369,7 +370,14 @@ TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
       const std::string path = dir_ + "/buffer_compare";
       BuildIndexFile(meta, holder, params, path);
       ASSERT_FALSE(HasFatalFailure());
-      ASSERT_EQ(pool.init(128 * 1024), 0);
+      // Reserve the read-only cache's metadata and first slab header apart
+      // from the 128 KiB query allowance, including 16 KiB page rounding.
+      const size_t file_pages =
+          (std::filesystem::file_size(path) - 1) / ailego::kVectorPageSize + 1;
+      const size_t cache_metadata =
+          ailego::VecBufferPool::metadata_bytes_for_page_count(file_pages) +
+          pool.page_buffer_size();
+      ASSERT_EQ(pool.init(128 * 1024 + cache_metadata), 0);
       IndexStreamer::Pointer streamers[2];
       for (size_t mode = 0; mode < 2; ++mode) {
         auto storage = IndexFactory::CreateStorage(
@@ -379,6 +387,10 @@ TEST_F(IvfRabitqStreamerTest, BufferMatchesMmapForFilteredGroupedAndKeySearch) {
                     BUFFER_READ_STORAGE_WARMUP_NONE);
         ASSERT_EQ(storage->init(options), 0);
         ASSERT_EQ(storage->open(path, false), 0);
+        if (mode != 0) {
+          ASSERT_NE(nullptr, storage->vec_buffer_pool());
+          ASSERT_TRUE(storage->vec_buffer_pool()->cache_enabled());
+        }
         streamers[mode] = std::make_shared<IvfRabitqStreamer>();
         ASSERT_EQ(streamers[mode]->init(meta, params), 0);
         ASSERT_EQ(streamers[mode]->open(storage), 0);

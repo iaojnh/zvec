@@ -207,7 +207,7 @@ class CollectionImpl : public Collection {
   Status close_locked();
   Status close_unsafe();
 
-  Status flush_unsafe();
+  Status flush_unsafe(bool for_close = false);
 
   // Requires write_mtx_ or exclusive schema_handle_mtx_.
   Status acquire_write_buffer();
@@ -526,20 +526,22 @@ Status CollectionImpl::close_locked() {
 Status CollectionImpl::close_unsafe() {
   Status result = Status::OK();
 
+  // Readers cannot run under the exclusive schema lock. Return their caches
+  // before the final write needs any serialization workspace.
+  query_internal_ids_fields_.clear();
+  read_only_segments_.clear();
+  segment_manager_.reset();
+
   // flush
   if (!options_.read_only_) {
-    auto s = flush_unsafe();
+    auto s = flush_unsafe(true);
     if (!s.ok()) {
       result = s;
     }
   }
 
-  query_internal_ids_fields_.clear();
-  read_only_segments_.clear();
-
   // always release resources regardless of flush outcome
   writing_segment_.reset();
-  segment_manager_.reset();
   version_manager_.reset();
   id_map_.reset();
   delete_store_.reset();
@@ -587,12 +589,13 @@ Status CollectionImpl::flush() {
   return flush_unsafe();
 }
 
-Status CollectionImpl::flush_unsafe() {
+Status CollectionImpl::flush_unsafe(bool for_close) {
   if (!writing_segment_) {
     return Status::InternalError(
         "flush writing segment failed because writing segment is nullptr");
   }
-  auto s = writing_segment_->flush();
+  auto s = for_close ? writing_segment_->flush_for_close()
+                     : writing_segment_->flush();
   // A failed flush may retain Arrow batches and its retry workspace. End the
   // active lease only once those components are finished; backing stays
   // charged.
@@ -1052,8 +1055,8 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
     for (const auto &task : tasks) {
       const auto *compact = std::get_if<CompactTask>(&task->task_info());
       if (compact && compact->output_segment_meta_) {
-        FileHelper::RemoveDirectory(
-            FileHelper::MakeTempSegmentPath(path_, compact->output_segment_id_));
+        FileHelper::RemoveDirectory(FileHelper::MakeTempSegmentPath(
+            path_, compact->output_segment_id_));
       }
     }
   });
@@ -1931,8 +1934,8 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids_fallback(
   detail::ResultMemoryAllowance::Lease request_memory(
       options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
   if (request_memory.enabled()) {
-    request_memory.add(
-        detail::QueryInputCopyBytes(query.target_, query.filter_, std::nullopt));
+    request_memory.add(detail::QueryInputCopyBytes(query.target_, query.filter_,
+                                                   std::nullopt));
   }
   SearchQuery fallback;
   fallback.target_ = query.target_;
@@ -2209,8 +2212,8 @@ CollectionImpl::query_result_snapshot_impl(const Query &query) const {
                                        std::move(schema_snapshot)};
 }
 
-Result<DocPtrList> CollectionImpl::query_unsafe(
-    const SearchQuery &query) const try {
+Result<DocPtrList> CollectionImpl::query_unsafe(const SearchQuery &query) const
+    try {
   // When field_name_ is set, use get_field to retrieve the schema uniformly.
   // validate checks that the field type matches the query type
   // (FTS query requires an FTS field, vector query requires a vector field).
@@ -2821,12 +2824,15 @@ Status CollectionImpl::recover_idmap_and_delete_store() {
   // delete store
   std::string delete_store_path = FileHelper::MakeFilePath(
       path_, FileID::DELETE_FILE, v.delete_snapshot_path_suffix());
-  delete_store_ =
-      DeleteStore::CreateAndLoad(schema_->name(), delete_store_path);
-  if (!delete_store_) {
-    return Status::InternalError("recovery delete store failed, path: ",
-                                 delete_store_path);
+  auto delete_store = std::make_shared<DeleteStore>(schema_->name());
+  const auto delete_status = delete_store->load(delete_store_path);
+  if (!delete_status.ok()) {
+    return Status(delete_status.code(),
+                  ailego::StringHelper::Concat(
+                      "recovery delete store failed, path: ", delete_store_path,
+                      ", reason: ", delete_status.message()));
   }
+  delete_store_ = std::move(delete_store);
 
   return Status::OK();
 }

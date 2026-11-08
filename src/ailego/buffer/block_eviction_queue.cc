@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -32,6 +34,11 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <sys/auxv.h>
+#include <fcntl.h>
+#include <pthread.h>
+#endif
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
 #endif
@@ -229,7 +236,8 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
                    queue_allocated_size_.load(std::memory_order_relaxed)) {
       return false;
     }
-    if (charged && !try_reserve_allocation(size, Backing::kPending)) return false;
+    if (charged && !try_reserve_allocation(size, Backing::kPending))
+      return false;
     if (charged) {
       metadata_used_size_.fetch_add(size, std::memory_order_relaxed);
       queue_charged_size_.fetch_add(size, std::memory_order_relaxed);
@@ -262,8 +270,8 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
       const size_t last_page = (slab->next_unused + total - 1) / page;
       if (last_page != previous_page &&
           !process_rss_.try_extend_mapping((last_page - previous_page) * page,
-                                            slab->mapping_bytes,
-                                            slab->projection))
+                                           slab->mapping_bytes,
+                                           slab->projection))
         return denied();
     }
     if (!slab) {
@@ -307,7 +315,8 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
     return header + 1;
   }
   static_assert(offsetof(QueueMappingHeader, allocation) +
-                    sizeof(QueueAllocationHeader) == sizeof(QueueMappingHeader));
+                    sizeof(QueueAllocationHeader) ==
+                sizeof(QueueMappingHeader));
   constexpr size_t prefix = offsetof(QueueMappingHeader, allocation);
   if (total > std::numeric_limits<size_t>::max() - prefix - (page - 1)) {
     return nullptr;
@@ -370,7 +379,8 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
     auto *mapping = reinterpret_cast<QueueMappingHeader *>(
         reinterpret_cast<char *>(header) -
         offsetof(QueueMappingHeader, allocation));
-    projection = ProcessRssBudget::MappingProjection::Full(bytes, mapping->stamp);
+    projection =
+        ProcessRssBudget::MappingProjection::Full(bytes, mapping->stamp);
     if (!unmap_queue_memory(mapping, bytes)) {
       LOG_ERROR("Failed to unmap queue allocation; backing remains charged");
       return;
@@ -430,6 +440,92 @@ struct MemoryLimitPool::ReclaimableSlab {
   ProcessRssBudget::ReusablePages<kMaxSlabDataPages> projections;
   ProcessRssBudget::MaterializationStamp header_projection{};
 };
+
+ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
+#if defined(__linux__) && !defined(__ANDROID__)
+  const int saved_errno = errno;
+  auto restore_errno = ScopeGuard::Make([&] { errno = saved_errno; });
+  auto &pool = get_instance();
+  // Allocators can enter RSS accounting while holding these locks. A sample
+  // must never wait for the reverse order; absence of a witness stays safe.
+  // POSIX try-lock also safely refuses a mutex already held by this thread;
+  // std::mutex::try_lock has a stricter ownership precondition.
+  if (::pthread_mutex_trylock(pool.slab_mutex_.native_handle()) != 0)
+    return {MemoryHelper::SelfRSS(), 0};
+  auto unlock_pool = ScopeGuard::Make(
+      [&] { ::pthread_mutex_unlock(pool.slab_mutex_.native_handle()); });
+  ReclaimableSlab *first_unlocked = pool.slabs_;
+  auto unlock = ScopeGuard::Make([&] {
+    for (auto *slab = pool.slabs_; slab != first_unlocked; slab = slab->next)
+      ::pthread_mutex_unlock(slab->mutex.native_handle());
+  });
+  for (auto *slab = pool.slabs_; slab; slab = slab->next) {
+    if (::pthread_mutex_trylock(slab->mutex.native_handle()) != 0)
+      return {MemoryHelper::SelfRSS(), 0};
+    first_unlocked = slab->next;
+  }
+
+  // The kernel page size also remains correct in logical-page-size tests.
+  const size_t native_page = ::getauxval(AT_PAGESZ);
+  if (native_page < kMinimumPageBytes || native_page > kSlabBytes ||
+      kSlabBytes % native_page != 0)
+    return {MemoryHelper::SelfRSS(), 0};
+  const int fd = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return {MemoryHelper::SelfRSS(), 0};
+  auto close = ScopeGuard::Make([&] { ::close(fd); });
+  const size_t before = MemoryHelper::SelfRSS();
+  if (!before) return {};
+  size_t resident = 0;
+  std::array<uint64_t, kSlabBytes / kMinimumPageBytes> entries;
+  constexpr uint64_t kPrivatePresent =
+      (uint64_t{1} << 63) | (uint64_t{1} << 56);
+  for (auto *slab = pool.slabs_; slab; slab = slab->next) {
+    if (slab->page_size < native_page || slab->page_size % native_page != 0)
+      return {MemoryHelper::SelfRSS(), 0};
+    const size_t count =
+        (slab->committed_pages ? kSlabBytes : slab->page_size) / native_page;
+    std::array<bool, kMaxSlabDataPages + 1> charged{};
+    charged[0] = true;
+    if (slab->committed_pages) {
+      for (size_t i = 1; i < slab->next_unused; ++i) charged[i] = true;
+      for (size_t i = 0; i < slab->reclaimed_count; ++i)
+        charged[slab->reclaimed_pages[i]] = false;
+    }
+    const uintptr_t index = reinterpret_cast<uintptr_t>(slab) / native_page;
+    if (index > static_cast<uintptr_t>(std::numeric_limits<off_t>::max()) /
+                    sizeof(uint64_t))
+      return {MemoryHelper::SelfRSS(), 0};
+    const off_t offset = static_cast<off_t>(index * sizeof(uint64_t));
+    const size_t bytes = count * sizeof(uint64_t);
+    size_t done = 0;
+    while (done < bytes) {
+      const ssize_t got =
+          ::pread(fd, reinterpret_cast<char *>(entries.data()) + done,
+                  bytes - done, offset + static_cast<off_t>(done));
+      if (got < 0 && errno == EINTR) continue;
+      if (got <= 0) return {MemoryHelper::SelfRSS(), 0};
+      done += static_cast<size_t>(got);
+    }
+    // PFNs are deliberately unused. Unprivileged readers can see these
+    // status bits. Shared/zero pages and swapped/untouched pages give no
+    // credit; only private resident pages in our exact slab ranges do.
+    for (size_t i = 0; i < count; ++i) {
+      // THP can populate uncharged neighbors of a requested page. Their RSS
+      // must not become overlap credit for a different, untouched owner.
+      if (charged[i * native_page / slab->page_size] &&
+          (entries[i] & kPrivatePresent) == kPrivatePresent)
+        resident += native_page;
+    }
+  }
+  const size_t rss = MemoryHelper::SelfRSS();
+  if (!rss) return {};
+  // Be conservative if unrelated process memory retired during this read.
+  if (rss < before) resident -= std::min(resident, before - rss);
+  return {rss, std::min(resident, rss)};
+#else
+  return {MemoryHelper::SelfRSS(), 0};
+#endif
+}
 
 struct MemoryLimitPool::RetainedBlock {
   RetainedBlock *next{nullptr};
@@ -494,8 +590,8 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     return nullptr;
   }
   const auto projection = process_rss_.finish_reservation(charge, true);
-  auto *block =
-      new (raw) RetainedBlock{nullptr, charge, metadata, projection, projection};
+  auto *block = new (raw)
+      RetainedBlock{nullptr, charge, metadata, projection, projection};
   retained_block_bytes_.fetch_add(charge, std::memory_order_relaxed);
   return reinterpret_cast<char *>(block) + kRetainedBlockHeaderBytes;
 }
@@ -594,6 +690,21 @@ size_t MemoryLimitPool::page_buffer_size() {
   return page_size;
 }
 
+bool BlockEvictionQueue::dequeue_priority(size_t priority, BlockType &item) {
+  // Tokenless dequeue can repeatedly choose the reclaiming thread's own
+  // requeued pinned page and starve older producer streams forever. Consumer
+  // tokens rotate across producers without allocating on the pressure path.
+  thread_local std::array<std::optional<ConcurrentQueue::consumer_token_t>,
+                          kQueueCount>
+      consumers;
+  if (!consumers[priority])
+    consumers[priority].emplace(evict_queues_[priority]);
+  if (!evict_queues_[priority].try_dequeue(*consumers[priority], item))
+    return false;
+  approximate_queue_sizes_[priority].fetch_sub(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool BlockEvictionQueue::evict_single_block(BlockType &item) {
   return evict_single_block(item, /*age_protected=*/false);
 }
@@ -614,10 +725,8 @@ bool BlockEvictionQueue::evict_single_block(
             : (probation + 1) * kProtectedDominanceRatio;
     if (protected_pages > dominance_threshold &&
         (!scan_remaining || (*scan_remaining)[kProtectedPriority] != 0) &&
-        evict_queues_[kProtectedPriority].try_dequeue(item)) {
+        dequeue_priority(kProtectedPriority, item)) {
       if (scan_remaining) --(*scan_remaining)[kProtectedPriority];
-      approximate_queue_sizes_[kProtectedPriority].fetch_sub(
-          1, std::memory_order_relaxed);
       protected_aging_dequeues_.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
@@ -625,9 +734,8 @@ bool BlockEvictionQueue::evict_single_block(
 
   for (size_t i = 0; i < kQueueCount; i++) {
     if (scan_remaining && (*scan_remaining)[i] == 0) continue;
-    if (evict_queues_[i].try_dequeue(item)) {
+    if (dequeue_priority(i, item)) {
       if (scan_remaining) --(*scan_remaining)[i];
-      approximate_queue_sizes_[i].fetch_sub(1, std::memory_order_relaxed);
       return true;
     }
   }
@@ -715,9 +823,7 @@ size_t BlockEvictionQueue::recycle_inactive(size_t max_attempts) {
   const size_t attempts = std::min(max_attempts, items.size());
   size_t found = 0;
   for (; found < attempts; ++found) {
-    if (!evict_queues_[kExplicitHotPriority].try_dequeue(items[found])) break;
-    approximate_queue_sizes_[kExplicitHotPriority].fetch_sub(
-        1, std::memory_order_relaxed);
+    if (!dequeue_priority(kExplicitHotPriority, items[found])) break;
   }
   size_t evicted = 0;
   for (size_t i = 0; i < found; ++i) {
@@ -847,7 +953,7 @@ size_t BlockEvictionQueue::cleanup_dead_entries(size_t max_attempts) {
     budgets[kProtectedPriority] = std::max<size_t>(1, max_attempts / 8);
     budgets[kExplicitHotPriority] = std::max<size_t>(1, max_attempts / 16);
     budgets[kProbationPriority] = max_attempts - budgets[kProtectedPriority] -
-                                 budgets[kExplicitHotPriority];
+                                  budgets[kExplicitHotPriority];
     first_queue = kProbationPriority;
   }
   // Spend unused shares in priority order. The snapshot remaining counts
@@ -969,10 +1075,14 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
     if (committed_size_.compare_exchange_weak(committed, committed + bytes,
                                               std::memory_order_relaxed,
                                               std::memory_order_relaxed)) {
-      const bool admitted =
-          backing == Backing::kPending
-              ? process_rss_.try_reserve(bytes)
-              : process_rss_.try_acquire(bytes, materialization);
+      bool admitted;
+      if (backing == Backing::kPending) {
+        admitted = process_rss_.try_reserve(bytes);
+      } else if (backing == Backing::kPlan) {
+        admitted = true;
+      } else {
+        admitted = process_rss_.try_acquire(bytes, materialization);
+      }
       if (!admitted) {
         committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
         bg_cv_.notify_one();
@@ -985,13 +1095,14 @@ bool MemoryLimitPool::try_reserve_committed(size_t bytes, Backing backing,
 }
 
 size_t MemoryLimitPool::release_committed(
-    size_t bytes, Backing backing, ProcessRssBudget::MappingProjection projection) {
+    size_t bytes, Backing backing,
+    ProcessRssBudget::MappingProjection projection) {
   const size_t previous =
       committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
   assert(previous >= bytes);
   if (backing == Backing::kPending) {
     process_rss_.finish_reservation(bytes, false);
-  } else {
+  } else if (backing != Backing::kPlan) {
     process_rss_.release_projected_mapping(bytes, projection);
   }
   return previous;
@@ -1234,14 +1345,15 @@ bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
 
 bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
                                                   size_t permanent_backing) {
-  const bool configured =
-      process_rss_.configure(bytes, &MemoryHelper::SelfRSS,
-                             NativeApplicationMemoryReader(), permanent_backing);
+  const bool configured = process_rss_.configure(
+      bytes, &MemoryHelper::SelfRSS, NativeApplicationMemoryReader(),
+      permanent_backing, &MemoryLimitPool::read_slab_resident_sample);
   bg_cv_.notify_one();
   return configured;
 }
 
-void MemoryLimitPool::set_memory_pressure(ProcessRssBudget::PressureLevel level) {
+void MemoryLimitPool::set_memory_pressure(
+    ProcessRssBudget::PressureLevel level) {
   process_rss_.set_external_pressure(level);
   bg_cv_.notify_one();
   capacity_cv_.notify_all();
@@ -1423,7 +1535,8 @@ void MemoryLimitPool::background_evict_loop() {
     process_rss_.refresh();
     if (process_rss_.limit()) capacity_cv_.notify_all();
     const auto now = std::chrono::steady_clock::now();
-    if (process_rss_.pressure() &&
+    if ((process_rss_.pressure() ||
+         workspace_waiting_size_.load(std::memory_order_relaxed) != 0) &&
         now - last_process_reclaim >= milliseconds(20)) {
       // RocksDB has a separate cache budget. Retire its unpinned entries too,
       // including when vector pages cannot make further reclamation progress.
@@ -1445,8 +1558,7 @@ void MemoryLimitPool::background_evict_loop() {
     const bool trimmed = trim_idle_buffers();
     idle_progress =
         retired != 0 ||
-        (trimmed &&
-         used_size_.load(std::memory_order_relaxed) == fixed_used());
+        (trimmed && used_size_.load(std::memory_order_relaxed) == fixed_used());
     const size_t low = low_watermark();
     if (used_size_.load() > low || page_admission_pressure()) {
       bg_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
@@ -1558,16 +1670,16 @@ bool MemoryLimitPool::wait_for_available_impl(size_t buffer_size,
   }
   capacity_waits_.fetch_add(1, std::memory_order_relaxed);
   std::unique_lock<std::mutex> lock(capacity_mutex_);
-  const bool available =
-      capacity_cv_.wait_for(lock, timeout, [this, buffer_size, page_admission,
-                                           required] {
+  const bool available = capacity_cv_.wait_for(
+      lock, timeout, [this, buffer_size, page_admission, required] {
         const size_t capacity = pool_size_.load(std::memory_order_relaxed);
         const size_t used = used_size_.load(std::memory_order_relaxed);
         if (capacity < used || buffer_size > capacity - used) {
           return false;
         }
         if (buffer_size > process_rss_.available()) return false;
-        if (page_admission && !required && process_rss_.pressure()) return false;
+        if (page_admission && !required && process_rss_.pressure())
+          return false;
         // A page can be denied below the total capacity: unconsumed external
         // cache headroom is not available to page admission. Use the same
         // page-limit predicate as eviction instead of turning backpressure
@@ -1612,10 +1724,69 @@ bool MemoryLimitPool::try_charge_workspace(const size_t buffer_size) {
 }
 
 bool MemoryLimitPool::try_charge_workspace(size_t buffer_size,
-                                        size_t materialization) {
+                                           size_t materialization) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   return try_charge_fixed_with_wait(buffer_size, &external_used_size_,
-                                   Backing::kLive, materialization);
+                                    Backing::kLive, materialization);
+}
+
+bool MemoryLimitPool::try_charge_process_backing(size_t bytes,
+                                                 size_t materialization,
+                                                 bool pending_copy) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto admit = [&] {
+    return pending_copy ? process_rss_.try_acquire_with_pending_copy(
+                              bytes, materialization)
+                        : process_rss_.try_acquire(bytes, materialization);
+  };
+  if (admit()) return true;
+  if ((process_rss_.limit() && bytes > process_rss_.limit()) ||
+      !process_rss_.materialization_allowed(materialization))
+    return false;
+  size_t waiting = workspace_waiting_size_.load(std::memory_order_relaxed);
+  do {
+    if (bytes > std::numeric_limits<size_t>::max() - waiting) return false;
+  } while (!workspace_waiting_size_.compare_exchange_weak(
+      waiting, waiting + bytes, std::memory_order_relaxed));
+  auto release_priority = ScopeGuard::Make([this, bytes] {
+    workspace_waiting_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    capacity_cv_.notify_all();
+  });
+  bg_cv_.notify_one();
+  if (admit()) return true;
+  // Planning quota is already charged. Wait on RSS room independently of
+  // logical capacity, giving cache eviction and competing calls time to yield.
+  size_t previous_available = process_rss_.available();
+  for (size_t attempt = 0; attempt < 50; ++attempt) {
+    {
+      std::unique_lock<std::mutex> lock(capacity_mutex_);
+      capacity_cv_.wait_for(
+          lock, std::chrono::milliseconds(100),
+          [this, bytes] { return bytes <= process_rss_.available(); });
+    }
+    if (admit()) return true;
+    if (!process_rss_.materialization_allowed(materialization)) return false;
+    const size_t current_available = process_rss_.available();
+    if (current_available <= previous_available) {
+      const auto queues = BlockEvictionQueue::get_instance().stats();
+      if (std::all_of(queues.approximate_queue_sizes.begin(),
+                      queues.approximate_queue_sizes.end(),
+                      [](size_t depth) { return depth == 0; }))
+        return false;
+    }
+    previous_available = current_available;
+  }
+  return false;
+}
+
+bool MemoryLimitPool::try_charge_workspace_plan(size_t bytes) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  return try_charge_fixed_with_wait(bytes, &external_used_size_,
+                                    Backing::kPlan);
+}
+
+void MemoryLimitPool::release_workspace_plan(size_t bytes) {
+  release_fixed(bytes, &external_used_size_, Backing::kPlan);
 }
 
 bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
@@ -1623,10 +1794,10 @@ bool MemoryLimitPool::try_charge_metadata(const size_t buffer_size) {
 }
 
 bool MemoryLimitPool::try_charge_metadata(size_t buffer_size,
-                                        size_t materialization) {
+                                          size_t materialization) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   return try_charge_fixed_with_wait(buffer_size, &metadata_used_size_,
-                                   Backing::kLive, materialization);
+                                    Backing::kLive, materialization);
 }
 
 bool MemoryLimitPool::try_charge_metadata_without_reclaim(size_t bytes) {
@@ -1683,8 +1854,9 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
   return reserved;
 }
 
-void MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
-  (void)commit_mapping(bytes);
+ProcessRssBudget::MaterializationStamp
+MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
+  return commit_mapping(bytes);
 }
 
 ProcessRssBudget::MaterializationStamp
@@ -1713,9 +1885,15 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
     return false;
   }
   const size_t capacity = pool_size_.load(std::memory_order_relaxed);
-  const size_t fixed = fixed_used();
-  if (fixed > capacity || buffer_size > capacity - fixed) {
+  if (buffer_size > capacity) {
     return false;
+  }
+  const size_t initial_fixed = fixed_used();
+  if (initial_fixed > capacity || buffer_size > capacity - initial_fixed) {
+    // Only a registered cache reclaimer can release idle fixed allowances.
+    // Waiting for page eviction cannot free live external reservations.
+    std::lock_guard<std::mutex> lock(process_reclaimer_mutex_);
+    if (!process_reclaimer_) return false;
   }
   size_t waiting = workspace_waiting_size_.load(std::memory_order_relaxed);
   do {
@@ -1745,6 +1923,10 @@ bool MemoryLimitPool::try_charge_fixed_with_wait(const size_t buffer_size,
                                   false);
     if (try_charge_fixed(buffer_size, counter, backing, materialization))
       return true;
+    // One maintenance pass can release idle planning allowances. If fixed
+    // live reservations still cannot fit, page eviction cannot help further.
+    const size_t fixed = fixed_used();
+    if (fixed > capacity || buffer_size > capacity - fixed) return false;
     if (materialization &&
         !process_rss_.materialization_allowed(materialization))
       return false;
@@ -1877,6 +2059,23 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
 
 void MemoryLimitPool::release_external(const size_t buffer_size) {
   release_fixed(buffer_size, &external_used_size_);
+}
+
+void MemoryLimitPool::release_heap_external(
+    size_t bytes, ProcessRssBudget::HeapProjection projection) {
+  if (!bytes) return;
+  const size_t used = used_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  const size_t external =
+      external_used_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  const size_t committed =
+      committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  assert(used >= bytes && external >= bytes && committed >= bytes);
+  (void)used;
+  (void)external;
+  (void)committed;
+  process_rss_.release_heap(bytes, projection);
+  { std::lock_guard<std::mutex> lock(capacity_mutex_); }
+  capacity_cv_.notify_all();
 }
 
 void MemoryLimitPool::release_unmapped_external(

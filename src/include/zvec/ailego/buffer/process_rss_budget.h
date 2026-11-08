@@ -20,17 +20,67 @@ namespace zvec::ailego {
 class ProcessRssBudget {
  public:
   using Reader = size_t (*)();
+  struct ResidentSample {
+    size_t rss{0};
+    // A lower bound observed in live, owned mappings in this RSS snapshot.
+    // Reserved virtual pages and pending OS allocations must be excluded.
+    size_t owned_resident{0};
+  };
+  using ResidentReader = ResidentSample (*)();
   struct NativeSample {
     size_t footprint{0};
     // Zero is a valid exhausted limit, not a failed sample.
     size_t available{0};
   };
   using NativeReader = bool (*)(NativeSample *);
-  // A mapping can refund its projection only until the corresponding reader
-  // has taken another sample. RSS and native footprint can refresh separately.
+  // Allocation age is relative to each reader's successful observations.
+  // RSS and native footprint can refresh separately.
   struct MaterializationStamp {
     uint64_t rss_epoch{0};
     uint64_t native_epoch{0};
+  };
+  // Heap owners can contain allocations from several observations. Only
+  // bytes created after a reader's last sample are certainly absent from it.
+  struct HeapProjection {
+    struct Sample {
+      uint64_t epoch{0};
+      size_t bytes{0};
+
+      void append(Sample rhs) {
+        if (rhs.epoch > epoch) {
+          *this = rhs;
+        } else if (rhs.epoch == epoch) {
+          bytes += rhs.bytes;
+        }
+      }
+      Sample take(size_t total, size_t released) {
+        // Without individual allocation identities, retire potentially
+        // observed bytes first. Never assign more new bytes than are certain.
+        const size_t observed = total - bytes;
+        const size_t transferred =
+            released > observed ? released - observed : 0;
+        bytes -= transferred;
+        return {epoch, transferred};
+      }
+      size_t for_epoch(uint64_t current) const {
+        return epoch && epoch == current ? bytes : 0;
+      }
+    };
+
+    static HeapProjection Full(size_t bytes, MaterializationStamp stamp) {
+      return {{stamp.rss_epoch, stamp.rss_epoch ? bytes : 0},
+              {stamp.native_epoch, stamp.native_epoch ? bytes : 0}};
+    }
+    void append(HeapProjection rhs) {
+      rss.append(rhs.rss);
+      native.append(rhs.native);
+    }
+    HeapProjection take(size_t total, size_t released) {
+      return {rss.take(total, released), native.take(total, released)};
+    }
+
+    Sample rss{};
+    Sample native{};
   };
   struct MappingProjection {
     struct Sample {
@@ -133,12 +183,17 @@ class ProcessRssBudget {
 
   bool configure(size_t limit, Reader reader,
                  NativeReader native_reader = nullptr,
-                 size_t permanent_backing = 0) {
+                 size_t permanent_backing = 0,
+                 ResidentReader resident_reader = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (permanent_backing &&
         (!limit || this->limit() || permanent_backing > backing_))
       return false;
-    const size_t rss = limit && reader ? reader() : 0;
+    const auto resident =
+        limit && resident_reader
+            ? resident_reader()
+            : ResidentSample{limit && reader ? reader() : 0, 0};
+    const size_t rss = resident.rss;
     if (limit && !rss) return false;
     NativeSample native;
     if (limit && native_reader && !native_reader(&native)) return false;
@@ -157,11 +212,12 @@ class ProcessRssBudget {
     }
     native_reader_ = native_reader;
     reader_ = reader;
+    resident_reader_ = resident_reader;
     recovery_sample_pending_ = false;
     rss_sample_failures_ = native_sample_failures_ = 0;
     limit_.store(limit, std::memory_order_relaxed);
     pressure_.store(false, std::memory_order_relaxed);
-    publish(rss);
+    publish(rss, resident.owned_resident);
     return true;
   }
 
@@ -176,6 +232,12 @@ class ProcessRssBudget {
   // when it also consumes some previously reserved capacity.
   bool try_acquire(size_t bytes, size_t materialization) {
     return try_charge(bytes, backing_, materialization);
+  }
+
+  // Admit a planning allowance and its in-flight copy as one operation.
+  // They cover overlapping bytes, and refusal must leave both unchanged.
+  bool try_acquire_with_pending_copy(size_t bytes, size_t materialization) {
+    return try_charge(bytes, backing_, materialization, true);
   }
 
   // Reserve for an OS allocation that has yet to return. Samples cannot
@@ -214,6 +276,22 @@ class ProcessRssBudget {
     release_unmapped(bytes, {});
   }
 
+  void release_heap(size_t bytes, HeapProjection projection) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t rss_unsampled = projection.rss.for_epoch(rss_epoch_);
+    const size_t native_unsampled = projection.native.for_epoch(native_epoch_);
+    assert(rss_unsampled <= bytes && native_unsampled <= bytes);
+    assert(bytes <= backing_);
+    backing_ -= bytes;
+    // Unlike unmapping, free() may leave every page resident in the allocator.
+    // Keep its materialization debit until a successful sample observes it.
+    // A new allocation absent from that sample cannot retire the sample's
+    // overlap with a different, still-live owner.
+    estimate_.release(bytes - rss_unsampled, backing_);
+    native_estimate_.release(bytes - native_unsampled, backing_);
+    update_available();
+  }
+
   // A stamp is valid only after successful unmapping. A partial release
   // keeps the same stamp for the remaining bytes. Measured RSS is unchanged.
   void release_unmapped(size_t bytes, MaterializationStamp stamp) {
@@ -245,7 +323,11 @@ class ProcessRssBudget {
   // because optional caches are under BACKGROUND pressure.
   bool materialization_allowed(size_t bytes = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
-    refresh_locked(false);
+    if (bytes) {
+      refresh_for_materialization_locked(bytes);
+    } else {
+      refresh_locked(false);
+    }
     return materialization_allowed_locked(bytes);
   }
 
@@ -253,7 +335,7 @@ class ProcessRssBudget {
   // the corresponding reader supplies its next successful observation.
   bool try_materialize(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
-    refresh_locked(false);
+    refresh_for_materialization_locked(bytes);
     if (!materialization_allowed_locked(bytes)) return false;
     if (limit() && bytes) {
       remember_materialization(bytes);
@@ -295,8 +377,7 @@ class ProcessRssBudget {
     const auto native = projection.native.for_epoch(native_epoch_);
     assert(rss.bytes <= mapping_bytes && native.bytes <= mapping_bytes);
     const size_t rss_growth = std::min(bytes, mapping_bytes - rss.bytes);
-    const size_t native_growth =
-        std::min(bytes, mapping_bytes - native.bytes);
+    const size_t native_growth = std::min(bytes, mapping_bytes - native.bytes);
     if (!materialization_allowed_locked(rss_growth, native_growth,
                                         /*allow_at_limit=*/true))
       return false;
@@ -320,7 +401,7 @@ class ProcessRssBudget {
   // An intervening sample must not clear a debit for work still in flight.
   bool try_reserve_materialization(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
-    refresh_locked(false);
+    refresh_for_materialization_locked(bytes);
     if (!materialization_allowed_locked(bytes) ||
         bytes > std::numeric_limits<size_t>::max() - pending_materializations_)
       return false;
@@ -374,7 +455,7 @@ class ProcessRssBudget {
   }
 
   void release_projected_mapping_locked(size_t bytes,
-                                         const MappingProjection &projection) {
+                                        const MappingProjection &projection) {
     const auto rss = projection.rss.for_epoch(rss_epoch_);
     const auto native = projection.native.for_epoch(native_epoch_);
     assert(rss.unsampled <= rss.bytes && rss.bytes <= bytes);
@@ -402,7 +483,8 @@ class ProcessRssBudget {
                                         /*allow_at_limit=*/true))
       return false;
     if (limit() && bytes && (charge_rss || charge_native)) {
-      if (charge_rss) rss_materialized_ = add_saturated(rss_materialized_, bytes);
+      if (charge_rss)
+        rss_materialized_ = add_saturated(rss_materialized_, bytes);
       if (charge_native)
         native_materialized_ = add_saturated(native_materialized_, bytes);
       stamp = {rss_epoch_, native_reader_ ? native_epoch_ : 0};
@@ -444,8 +526,7 @@ class ProcessRssBudget {
                                           /*allow_at_limit=*/false);
   }
 
-  bool materialization_allowed_locked(size_t rss_bytes,
-                                      size_t native_bytes,
+  bool materialization_allowed_locked(size_t rss_bytes, size_t native_bytes,
                                       bool allow_at_limit) const {
     if (admission_paused()) {
       return false;
@@ -489,22 +570,49 @@ class ProcessRssBudget {
     return true;
   }
 
-  bool try_charge(size_t bytes, size_t &counter, size_t materialization = 0) {
+  bool try_charge(size_t bytes, size_t &counter, size_t materialization = 0,
+                  bool pending_copy = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(false);
+    if (bytes > available_.load(std::memory_order_relaxed) ||
+        (materialization && !materialization_allowed_locked(materialization)))
+      refresh_after_denial_locked();
     if (materialization && !materialization_allowed_locked(materialization))
       return false;
     const size_t ledger_available =
         std::numeric_limits<size_t>::max() - backing_ - pending_allocations_;
     if (bytes > available_.load(std::memory_order_relaxed) ||
-        bytes > ledger_available) {
+        bytes > ledger_available ||
+        (pending_copy && materialization > std::numeric_limits<size_t>::max() -
+                                               pending_materializations_)) {
       if (limit()) pressure_.store(true, std::memory_order_relaxed);
       return false;
     }
     counter += bytes;
-    remember_materialization(materialization);
+    if (pending_copy) {
+      pending_materializations_ += materialization;
+    } else {
+      remember_materialization(materialization);
+    }
     update_available();
     return true;
+  }
+
+  void refresh_for_materialization_locked(size_t bytes) {
+    refresh_locked(false);
+    if (!materialization_allowed_locked(bytes)) refresh_after_denial_locked();
+  }
+
+  void refresh_after_denial_locked() {
+    // A caller can free a rejected input or completed result and retry within
+    // the normal sampling interval. Before denying that retry, observe its
+    // current RSS instead of retaining a transient peak or copy projection.
+    // Pending allocations/copies remain charged across this observation.
+    // Failed readers keep their sampling backoff, and host critical pressure
+    // cannot be relaxed by an RSS observation.
+    if (!rss_sample_failures_ && !native_sample_failures_ &&
+        external_pressure_ != PressureLevel::kCritical)
+      refresh_locked(true);
   }
 
   void refresh_locked(bool force) {
@@ -513,7 +621,10 @@ class ProcessRssBudget {
     if (!force && now - sampled_at_ < std::chrono::milliseconds(20)) {
       return;
     }
-    const size_t rss = reader_ ? reader_() : 0;
+    const auto resident = resident_reader_
+                              ? resident_reader_()
+                              : ResidentSample{reader_ ? reader_() : 0, 0};
+    const size_t rss = resident.rss;
     // Keep the last observation across a transient failure. If either
     // configured reader keeps failing, pause growth until it recovers.
     rss_sample_failures_ = rss ? 0 : next_sample_failure(rss_sample_failures_);
@@ -529,7 +640,7 @@ class ProcessRssBudget {
       recovery_sample_pending_ = false;
     }
     if (rss) {
-      publish(rss);
+      publish(rss, resident.owned_resident);
     } else {
       // Throttle unsuccessful reads too, so an OS sampling error does not
       // put a system call on every admission attempt.
@@ -550,8 +661,8 @@ class ProcessRssBudget {
     native_limit_ = add_saturated(native.footprint, native.available);
   }
 
-  void publish(size_t rss) {
-    if (limit()) estimate_.observe(rss, backing_);
+  void publish(size_t rss, size_t owned_resident = 0) {
+    if (limit()) estimate_.observe(rss, backing_, owned_resident);
     rss_materialized_ = 0;
     ++rss_epoch_;
     rss_.store(rss, std::memory_order_relaxed);
@@ -583,7 +694,7 @@ class ProcessRssBudget {
       return std::max(projected(baseline_rss_, baseline_backing_, backing),
                       projected(sample_, sampled_backing_, backing));
     }
-    void observe(size_t rss, size_t backing) {
+    void observe(size_t rss, size_t backing, size_t owned_resident = 0) {
       if (backing == 0) {
         // With no live reservations, any remaining allocator retention belongs
         // to this new RSS baseline. Later admissions start from zero backing.
@@ -635,6 +746,17 @@ class ProcessRssBudget {
           pending_releases_
               ? std::min(backing, add_saturated(sampled_backing_, growth))
               : backing;
+      // A fresh ownership/residency snapshot can prove overlap even when
+      // evictions and refaults leave total RSS unchanged. It cannot cover
+      // untouched owners, pending allocations, or more than this sample.
+      const size_t witnessed = std::min({owned_resident, backing, rss});
+      // Live witnessed pages and retired pages cannot occupy the same RSS.
+      // Keep their bounds disjoint so a later witness retirement still
+      // removes its own credit, rather than covering an untouched owner.
+      pending_releases_ = std::min(pending_releases_, rss - witnessed);
+      resident_upper_ =
+          std::max(resident_upper_, witnessed + pending_releases_);
+      sampled_backing_ = std::max(sampled_backing_, witnessed);
       sample_ = rss;
     }
 
@@ -668,9 +790,9 @@ class ProcessRssBudget {
       const size_t footprint = add_saturated(
           add_saturated(native_estimate_.sample_, native_materialized_),
           pending_materializations_);
-      const size_t native_usage = add_saturated(
-          std::max(native_estimate_.usage(backing_), footprint),
-          pending_allocations_);
+      const size_t native_usage =
+          add_saturated(std::max(native_estimate_.usage(backing_), footprint),
+                        pending_allocations_);
       const size_t remaining =
           native_usage < native_cap ? native_cap - native_usage : 0;
       // Keep a reserve below the OS application limit even for mandatory work.
@@ -690,6 +812,7 @@ class ProcessRssBudget {
 
   std::mutex mutex_;
   Reader reader_{nullptr};
+  ResidentReader resident_reader_{nullptr};
   size_t backing_{0};
   size_t pending_allocations_{0};
   size_t pending_materializations_{0};

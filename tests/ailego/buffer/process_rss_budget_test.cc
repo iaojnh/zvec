@@ -15,6 +15,11 @@ size_t ReadRss() {
   return sampled_rss.load();
 }
 
+size_t sampled_owned_resident = 0;
+ProcessRssBudget::ResidentSample ReadResident() {
+  return {sampled_rss.load(), sampled_owned_resident};
+}
+
 ProcessRssBudget::NativeSample native_sample;
 bool native_sample_valid = true;
 bool ReadNative(ProcessRssBudget::NativeSample *sample) {
@@ -43,6 +48,197 @@ TEST(ProcessRssBudgetTest, NativeFootprintTracksUntouchedBackingAcrossSamples) {
   EXPECT_EQ(24 * kMiB, budget.available());
 }
 
+TEST(ProcessRssBudgetTest, ObservedResidentPagesKeepCreditAcrossReplacement) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(200 * kMiB));
+  budget.finish_reservation(200 * kMiB, true);
+  sampled_rss = 264 * kMiB;
+  sampled_owned_resident = 200 * kMiB;
+  budget.refresh(true);
+  for (int i = 0; i < 64; ++i) {
+    SCOPED_TRACE(i);
+    // Old pages were discarded, and their replacements are now resident.
+    // Total RSS stays constant while the cache turns over.
+    budget.release(4 * kMiB);
+    ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+    budget.finish_reservation(4 * kMiB, true);
+    budget.refresh(true);
+    ASSERT_EQ(248 * kMiB, budget.available());
+    ASSERT_FALSE(budget.pressure());
+  }
+  budget.release(200 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, ResidentWitnessDoesNotCoverUntouchedOwners) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(128 * kMiB));
+  budget.finish_reservation(128 * kMiB, true);
+  sampled_rss = 192 * kMiB;
+  sampled_owned_resident = 128 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_acquire(256 * kMiB));
+  budget.release(128 * kMiB);
+  // A caller can keep total RSS unchanged after the managed owner retires.
+  // The other 256 MiB remains untouched and needs its full future headroom.
+  sampled_owned_resident = 0;
+  budget.refresh(true);
+  EXPECT_EQ(64 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(65 * kMiB));
+  budget.release(256 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, ResidentWitnessRetirementPreservesLazyOwnerCharge) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(200 * kMiB));
+  budget.finish_reservation(200 * kMiB, true);
+  sampled_rss = 264 * kMiB;
+  sampled_owned_resident = 200 * kMiB;
+  budget.refresh(true);
+  for (int i = 0; i < 64; ++i) {
+    budget.release(4 * kMiB);
+    ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+    budget.finish_reservation(4 * kMiB, true);
+    budget.refresh(true);
+  }
+  ASSERT_TRUE(budget.try_acquire(100 * kMiB));
+  budget.release(200 * kMiB);
+  sampled_owned_resident = 0;
+  // The old sample may retain freed memory while this owner is untouched.
+  budget.refresh(true);
+  EXPECT_EQ(148 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(149 * kMiB));
+  budget.release(100 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, ResidentWitnessCannotCreditPendingOsAllocations) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(128 * kMiB));
+  budget.finish_reservation(128 * kMiB, true);
+  sampled_rss = 192 * kMiB;
+  sampled_owned_resident = 128 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_reserve(64 * kMiB));
+  budget.refresh(true);
+  EXPECT_EQ(256 * kMiB, budget.available());
+  budget.finish_reservation(64 * kMiB, false);
+  EXPECT_EQ(320 * kMiB, budget.available());
+  budget.release(128 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, UnsampledHeapChurnPreservesLiveResidentOverlap) {
+  constexpr size_t limit = 512 * kMiB;
+  for (const bool use_native : {false, true}) {
+    SCOPED_TRACE(use_native);
+    ProcessRssBudget budget;
+    native_sample_valid = true;
+    auto sample = [&](size_t bytes) {
+      sampled_rss = use_native ? 32 * kMiB : bytes;
+      native_sample = {bytes, limit - bytes};
+    };
+    sample(64 * kMiB);
+    ASSERT_TRUE(
+        budget.configure(limit, ReadRss, use_native ? ReadNative : nullptr));
+    ASSERT_TRUE(budget.try_reserve(230 * kMiB));
+    budget.finish_reservation(230 * kMiB, true);
+    sample(294 * kMiB);
+    budget.refresh(true);
+    const size_t available = budget.available();
+    for (int i = 0; i < 64; ++i) {
+      SCOPED_TRACE(i);
+      ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+      const auto stamp = budget.finish_reservation(4 * kMiB, true);
+      budget.release_heap(
+          4 * kMiB, ProcessRssBudget::HeapProjection::Full(4 * kMiB, stamp));
+      budget.refresh(true);
+      ASSERT_EQ(available, budget.available());
+      ASSERT_FALSE(budget.pressure());
+    }
+    budget.release(230 * kMiB);
+  }
+}
+
+TEST(ProcessRssBudgetTest, HeapFreeKeepsUnsampledAllocatorRetentionCharged) {
+  ProcessRssBudget budget;
+  sampled_rss = 480 * kMiB;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_reserve(16 * kMiB));
+  const auto stamp = budget.finish_reservation(16 * kMiB, true);
+  budget.release_heap(16 * kMiB,
+                      ProcessRssBudget::HeapProjection::Full(16 * kMiB, stamp));
+  EXPECT_EQ(16 * kMiB, budget.available());
+  sampled_rss = 496 * kMiB;  // malloc kept the freed pages resident.
+  budget.refresh(true);
+  EXPECT_EQ(16 * kMiB, budget.available());
+  sampled_rss = 480 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(32 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, MixedAgeHeapReleaseKeepsUntouchedOwnersCharged) {
+  using Projection = ProcessRssBudget::HeapProjection;
+  ProcessRssBudget budget;
+  budget.account(8 * kMiB);
+  sampled_rss = 96 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+  auto projection =
+      Projection::Full(4 * kMiB, budget.finish_reservation(4 * kMiB, true));
+  sampled_rss = 100 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_reserve(6 * kMiB));
+  projection.append(
+      Projection::Full(6 * kMiB, budget.finish_reservation(6 * kMiB, true)));
+
+  budget.release_heap(4 * kMiB, projection.take(10 * kMiB, 4 * kMiB));
+  budget.refresh(true);
+  // The old 4 MiB can still be resident, and the live 6 MiB is untouched.
+  EXPECT_EQ(22 * kMiB, budget.available());
+  budget.release_heap(6 * kMiB, projection);
+  budget.refresh(true);
+  // After another sample, the 6 MiB may itself be retained in the heap.
+  // Do not promise its refund while another live owner remains untouched.
+  EXPECT_LE(budget.available(), 28 * kMiB);
+  budget.release(8 * kMiB);
+  sampled_rss = 96 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(32 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, HeapAgeUsesEachReadersSuccessfulSample) {
+  ProcessRssBudget budget;
+  budget.account(8 * kMiB);
+  sampled_rss = 64 * kMiB;
+  native_sample = {96 * kMiB, 32 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  ASSERT_EQ(24 * kMiB, budget.available());
+  ASSERT_TRUE(budget.try_reserve(8 * kMiB));
+  const auto stamp = budget.finish_reservation(8 * kMiB, true);
+  sampled_rss = 72 * kMiB;
+  native_sample_valid = false;
+  budget.refresh(true);
+  budget.release_heap(
+      8 * kMiB, ProcessRssBudget::HeapProjection::Full(8 * kMiB, stamp));
+  EXPECT_EQ(16 * kMiB, budget.available());
+  sampled_rss = 64 * kMiB;
+  native_sample_valid = true;
+  budget.refresh(true);
+  EXPECT_EQ(24 * kMiB, budget.available());
+  budget.release(8 * kMiB);
+}
+
 TEST(ProcessRssBudgetTest, NativeLimitCanShrinkAndRecoverBelowConfiguredRss) {
   ProcessRssBudget budget;
   sampled_rss = 32 * kMiB;
@@ -60,6 +256,67 @@ TEST(ProcessRssBudgetTest, NativeLimitCanShrinkAndRecoverBelowConfiguredRss) {
   budget.refresh(true);
   EXPECT_FALSE(budget.pressure());
   EXPECT_EQ(88 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, AdmissionResamplesReleasedCallerInputBeforeDenying) {
+  ProcessRssBudget budget;
+  sampled_rss = 128 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  EXPECT_FALSE(budget.try_acquire(kMiB));
+  sampled_rss = 32 * kMiB;
+  ASSERT_TRUE(budget.try_acquire(kMiB));
+  EXPECT_EQ(32 * kMiB, budget.rss());
+  budget.release(kMiB);
+}
+
+TEST(ProcessRssBudgetTest,
+     MaterializationResamplesCompletedCopiesButKeepsPending) {
+  for (const bool reserve : {false, true}) {
+    SCOPED_TRACE(reserve);
+    ProcessRssBudget budget;
+    sampled_rss = 32 * kMiB;
+    ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+    ASSERT_TRUE(budget.try_reserve_materialization(80 * kMiB));
+    EXPECT_FALSE(budget.try_materialize(32 * kMiB));
+    budget.finish_materialization(80 * kMiB, true);
+    // The completed copies may have reused heap pages or been destroyed.
+    // A fresh sample replaces their projection without a timing dependency.
+    if (reserve) {
+      ASSERT_TRUE(budget.try_reserve_materialization(32 * kMiB));
+      budget.finish_materialization(32 * kMiB, false);
+    } else {
+      ASSERT_TRUE(budget.try_materialize(32 * kMiB));
+    }
+  }
+}
+
+TEST(ProcessRssBudgetTest, RejectedCopyGrowthKeepsOtherOwnersResident) {
+  ProcessRssBudget budget;
+  budget.account(16 * kMiB);
+  sampled_rss = 96 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    EXPECT_FALSE(budget.try_acquire_with_pending_copy(4 * kMiB, 33 * kMiB));
+    budget.refresh(true);
+    EXPECT_EQ(32 * kMiB, budget.available());
+  }
+  budget.release(16 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest,
+     CopyGrowthSharesBackingAndKeepsPendingAcrossSamples) {
+  ProcessRssBudget budget;
+  sampled_rss = 112 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_acquire_with_pending_copy(8 * kMiB, 12 * kMiB));
+  EXPECT_EQ(4 * kMiB, budget.available());
+  budget.refresh(true);
+  EXPECT_EQ(4 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_reserve_materialization(5 * kMiB));
+  budget.finish_materialization(12 * kMiB, false);
+  EXPECT_EQ(8 * kMiB, budget.available());
+  budget.release(8 * kMiB);
+  EXPECT_EQ(16 * kMiB, budget.available());
 }
 
 TEST(ProcessRssBudgetTest, NativeZeroAndFailedSamplesCannotReplenishBudget) {
@@ -440,9 +697,8 @@ TEST(ProcessRssBudgetTest, TemporaryFreesKeepPermanentStartupOverlap) {
       budget.refresh(true);
     };
     sample(64 * kMiB);
-    ASSERT_TRUE(budget.configure(limit, ReadRss,
-                                 use_native_sample ? ReadNative : nullptr,
-                                 permanent));
+    ASSERT_TRUE(budget.configure(
+        limit, ReadRss, use_native_sample ? ReadNative : nullptr, permanent));
     ASSERT_TRUE(budget.try_acquire(kMiB));
     sample(96 * kMiB);
     budget.release(kMiB);
@@ -633,7 +889,8 @@ TEST(ProcessRssBudgetTest, ReservedMaterializationObeysObservedLimits) {
   EXPECT_TRUE(budget.materialization_allowed());
 }
 
-TEST(ProcessRssBudgetTest, ReservedMaterializationRequiresMeasuredRoomForBytes) {
+TEST(ProcessRssBudgetTest,
+     ReservedMaterializationRequiresMeasuredRoomForBytes) {
   ProcessRssBudget budget;
   sampled_rss = 120 * kMiB;
   ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
@@ -668,12 +925,19 @@ TEST(ProcessRssBudgetTest, GrowingAllowanceChargesFullMaterialization) {
 
     ASSERT_TRUE(budget.try_acquire(2 * kMiB, 6 * kMiB));
     EXPECT_EQ(2 * kMiB, budget.available());
+    // A denial now refreshes the observation even within the sample interval.
+    // Keep the completed materialization resident in that observation.
+    sampled_rss += 6 * kMiB;
+    native_sample.footprint += 6 * kMiB;
+    native_sample.available -= 6 * kMiB;
     EXPECT_FALSE(budget.try_acquire(kMiB, 3 * kMiB));
     EXPECT_FALSE(budget.try_materialize(3 * kMiB));
     EXPECT_EQ(2 * kMiB, budget.available());
     ASSERT_TRUE(budget.try_materialize(2 * kMiB));
     budget.release(2 * kMiB);
 
+    sampled_rss = use_native_sample ? 32 * kMiB : limit - 8 * kMiB;
+    native_sample = {limit - 8 * kMiB - reserve, 8 * kMiB + reserve};
     budget.refresh(true);
     EXPECT_EQ(8 * kMiB, budget.available());
   }

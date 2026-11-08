@@ -210,6 +210,8 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     // The live PQ model is mandatory workspace, not evictable vector pages.
     // Include four chunks' centroid pointers and allocation headers as well.
     const size_t model_allowance = codebook_bytes + 16 * 1024;
+    const size_t training_allowance =
+        3 * writable_metadata_ + model_allowance + 256UL * 1024UL;
     auto release = ailego::ScopeGuard::Make([&]() {
       if (reservation != 0) pool.release_external(reservation);
     });
@@ -217,15 +219,18 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       // Keep room for all three writable page tables (Flat source + vectors +
       // graph) and the charged PQ model, but not the source plus build vector
       // working set. Only 256 KiB remains for pages and graph workspaces.
-      const size_t available =
-          3 * writable_metadata_ + model_allowance + 256UL * 1024UL;
       const size_t resident_vector_bytes =
           static_cast<size_t>(kDocCount) * dimension *
           (fp16 ? sizeof(uint16_t) : sizeof(float));
       ASSERT_GT(values.size() * sizeof(float) + resident_vector_bytes,
                 256UL * 1024UL);
-      ASSERT_LT(available, pool_budget_);
-      const size_t requested = pool_budget_ - available;
+      // Opening the target may grow the shared eviction allocator. Its
+      // retained metadata is excluded by PoolPayloadBudget::capacity(), so
+      // derive this competing payload charge from the current capacity too.
+      // Using the initial total subtracts that metadata a second time from
+      // the promised 256 KiB page/workspace allowance (notably on Windows).
+      ASSERT_LT(training_allowance, pool.capacity());
+      const size_t requested = pool.capacity() - training_allowance;
       ASSERT_TRUE(pool.try_charge_external(requested));
       reservation = requested;
     }
@@ -253,11 +258,32 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       // compete for it, and construction still writes dirty scratch pages.
       ASSERT_EQ(source->flush(), 0);
     }
+    if (pressure) {
+      // Ingestion retains its key map and may grow queue/slab metadata. Do
+      // not charge those mandatory bytes against the promised 256 KiB page
+      // and graph workspace allowance a second time.
+      ASSERT_GE(pool.external_used(), reservation);
+      const size_t input_external = pool.external_used() - reservation;
+      const size_t training_capacity = pool.capacity();
+      ASSERT_LT(training_allowance + input_external, training_capacity);
+      const size_t requested =
+          training_capacity - training_allowance - input_external;
+      if (requested < reservation) {
+        pool.release_external(reservation - requested);
+      } else if (requested > reservation) {
+        ASSERT_TRUE(pool.try_charge_external(requested - reservation));
+      }
+      reservation = requested;
+    }
     // The merge source remains live throughout training. Its retained key-map
     // backing is separately charged and STL/platform dependent, not PQ state.
     const size_t before_training = pool.external_used();
-    ASSERT_EQ(
-        merge ? target->merge({source}, {}, {2, nullptr}) : target->train(), 0);
+    const int training_result =
+        merge ? target->merge({source}, {}, {2, nullptr}) : target->train();
+    ASSERT_EQ(training_result, 0)
+        << "used=" << pool.used() << " capacity=" << pool.capacity()
+        << " external=" << pool.external_used()
+        << " metadata=" << pool.metadata_used();
     if (pressure) {
       // Timing determines whether foreground admission or background
       // writeback reclaims a page. Assert the fixed reservation and budget,
@@ -314,6 +340,20 @@ TEST_F(DiskAnnBufferedBuildTest, DirectAndMergedFp16AndFp32RoundTrip) {
 }
 
 TEST_F(DiskAnnBufferedBuildTest, MergedBuildSurvivesPagePressure) {
+  for (bool fp16 : {false, true}) {
+    SCOPED_TRACE(fp16);
+    ASSERT_NO_FATAL_FAILURE(run_lifecycle(fp16, true, true));
+  }
+}
+
+TEST_F(DiskAnnBufferedBuildTest, PagePressureAccountsForQueueAllocatorGrowth) {
+  // Model a platform/scheduling-dependent eviction-queue expansion after
+  // SetUp. It remains part of the same hard total, outside payload capacity.
+  void *queue_growth = ailego::EvictionQueueTraits::malloc(1UL << 20);
+  ASSERT_NE(nullptr, queue_growth);
+  auto release_queue = ailego::ScopeGuard::Make(
+      [queue_growth] { ailego::EvictionQueueTraits::free(queue_growth); });
+  ASSERT_LT(ailego::PoolPayloadBudget::get_instance().capacity(), pool_budget_);
   for (bool fp16 : {false, true}) {
     SCOPED_TRACE(fp16);
     ASSERT_NO_FATAL_FAILURE(run_lifecycle(fp16, true, true));

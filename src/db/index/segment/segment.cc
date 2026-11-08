@@ -37,8 +37,8 @@
 #include <zvec/db/schema.h>
 #include <zvec/db/status.h>
 #include <zvec/db/type.h>
-#include "db/common/query_result_memory.h"
 #include "db/common/document_memory.h"
+#include "db/common/query_result_memory.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #if RABITQ_SUPPORTED
 #include "core/algorithm/hnsw_rabitq/rabitq_params.h"
@@ -280,6 +280,8 @@ class SegmentImpl : public Segment,
 
   Status flush() override;
 
+  Status flush_for_close() override;
+
   Status destroy() override;
 
   TablePtr fetch(const std::vector<std::string> &columns,
@@ -322,7 +324,8 @@ class SegmentImpl : public Segment,
   Status load_scalar_index_blocks(bool create = false);
   Status load_vector_index_blocks();
   Status init_memory_components();
-  Status finish_memory_components();
+  Status finish_memory_components(bool reopen_for_serving = true);
+  Status flush_impl(bool for_close);
 
   void fresh_persist_block_offset();
   void calculate_block_offsets();
@@ -671,7 +674,7 @@ Status SegmentImpl::close() {
   // Exclusive: flush() below rewrites the stores readers read; destroy()
   // reaches here without the lock.
   std::lock_guard<std::shared_mutex> lock(seg_mtx_);
-  flush();
+  flush_for_close();
   if (invert_indexers_) {
     invert_indexers_.reset();
   }
@@ -1013,8 +1016,9 @@ Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
               } else if constexpr (IsVector<T>::value &&
                                    !std::is_same_v<T, std::vector<bool>>) {
                 return detail::InvertedArrayWriteBytes(
-                    items.size(), detail::BindingMemoryBytes(
-                                      items.size(), sizeof(typename T::value_type)));
+                    items.size(),
+                    detail::BindingMemoryBytes(items.size(),
+                                               sizeof(typename T::value_type)));
               }
               return 0;
             },
@@ -1025,9 +1029,9 @@ Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
       // peak across WAL append and publication so refusal precedes mutation.
       prepared.scalar_memory.add(peak);
     } catch (const std::bad_alloc &) {
-      return tl::make_unexpected(Status(
-          StatusCode::RESOURCE_EXHAUSTED,
-          "Insufficient inverted array write workspace budget before mutation"));
+      return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                        "Insufficient inverted array write "
+                                        "workspace budget before mutation"));
     }
   }
   if (ready_for_dump_block()) {
@@ -1096,9 +1100,10 @@ Status SegmentImpl::internal_update(Doc &doc,
   return internal_insert(doc, admission, std::move(prepared));
 }
 
-Status SegmentImpl::internal_upsert(
-    Doc &doc, const detail::FtsWriteAdmission &admission, PreparedForward prepared,
-    std::optional<uint64_t> previous_doc_id) {
+Status SegmentImpl::internal_upsert(Doc &doc,
+                                    const detail::FtsWriteAdmission &admission,
+                                    PreparedForward prepared,
+                                    std::optional<uint64_t> previous_doc_id) {
   if (previous_doc_id) {
     CHECK_RETURN_STATUS(delete_store_->mark_deleted(*previous_doc_id));
   }
@@ -1185,8 +1190,9 @@ Status SegmentImpl::upsert(Doc &doc) {
 
   // Keep the lookup from before the WAL append. A second disk read could
   // fail after the update has already been recorded.
-  return internal_upsert(doc, admission, std::move(*prepared),
-                         *found ? std::optional<uint64_t>(old_id) : std::nullopt);
+  return internal_upsert(
+      doc, admission, std::move(*prepared),
+      *found ? std::optional<uint64_t>(old_id) : std::nullopt);
 }
 
 Status SegmentImpl::Delete(const std::string &pk) {
@@ -2680,6 +2686,14 @@ void SegmentImpl::remove_writing_forward_block() {
 }
 
 Status SegmentImpl::flush() {
+  return flush_impl(false);
+}
+
+Status SegmentImpl::flush_for_close() {
+  return flush_impl(true);
+}
+
+Status SegmentImpl::flush_impl(bool for_close) {
   // Requires seg_mtx_ (Insert's buffer-full path, dump, close) or the
   // collection's exclusive schema lock (CollectionImpl::flush): finish_/
   // init_memory_components() below do not lock.
@@ -2755,7 +2769,7 @@ Status SegmentImpl::flush() {
 
   if (memory_store_) {
     // update segment meta with memory components
-    s = finish_memory_components();
+    s = finish_memory_components(!for_close);
     CHECK_RETURN_STATUS(s);
 
     // set a new mem block
@@ -3531,9 +3545,10 @@ arrow::Status SegmentImpl::CombinedRecordBatchReader::ReadNext(
       ARROW_RETURN_NOT_OK(builder.Finish(&segment_row_id_array));
 
       ARROW_ASSIGN_OR_RAISE(
-          input, input->AddColumn(segment_row_id_output_col_index_,
-                                  projected_schema_->GetFieldByName(LOCAL_ROW_ID),
-                                  std::move(segment_row_id_array)));
+          input,
+          input->AddColumn(segment_row_id_output_col_index_,
+                           projected_schema_->GetFieldByName(LOCAL_ROW_ID),
+                           std::move(segment_row_id_array)));
       next_segment_row_id_to_emit_ += num_rows;
     }
 
@@ -4952,8 +4967,8 @@ Status SegmentImpl::recover() try {
     detail::ResultMemoryAllowance::Lease read_memory(
         options_.enable_mmap_ ? nullptr
                               : &detail::SharedResultMemoryAllowance());
-    std::string buf = recover_wal_file->next(
-        [&](size_t bytes) { read_memory.add(bytes); });
+    std::string buf =
+        recover_wal_file->next([&](size_t bytes) { read_memory.add(bytes); });
     if (buf.empty()) {
       CHECK_RETURN_STATUS(recover_wal_file->read_status());
       break;
@@ -5001,11 +5016,11 @@ Status SegmentImpl::recover() try {
       case Operator::UPSERT: {
         uint64_t old_id;
         const auto found = id_map_->lookup(doc->pk_ref(), &old_id);
-        status = found ? internal_upsert(
-                             *doc, admission, std::move(prepared),
-                             *found ? std::optional<uint64_t>(old_id)
-                                    : std::nullopt)
-                       : found.error();
+        status = found
+                     ? internal_upsert(*doc, admission, std::move(prepared),
+                                       *found ? std::optional<uint64_t>(old_id)
+                                              : std::nullopt)
+                     : found.error();
         break;
       }
       case Operator::DELETE: {
@@ -5136,7 +5151,7 @@ Status SegmentImpl::append_wal(const Doc &doc) try {
                 "Insufficient memory for WAL serialization");
 }
 
-Status SegmentImpl::finish_memory_components() {
+Status SegmentImpl::finish_memory_components(bool reopen_for_serving) {
   // Caller holds seg_mtx_ exclusively, or the collection's exclusive schema
   // lock (via CollectionImpl::flush()).
 
@@ -5147,21 +5162,22 @@ Status SegmentImpl::finish_memory_components() {
   CHECK_RETURN_STATUS(s);
   memory_store_.reset();
 
-  // load forward store
-  auto persist_forward_store_path = FileHelper::MakeForwardBlockPath(
-      path_, segment_meta_->id(), block.id_, !options_.enable_mmap_);
-
-  BaseForwardStore::Ptr persist_store;
-  if (options_.enable_mmap_) {
-    persist_store =
-        std::make_shared<MmapForwardStore>(persist_forward_store_path);
-  } else {
-    persist_store =
-        std::make_shared<BufferPoolForwardStore>(persist_forward_store_path);
+  // A closing segment publishes the same metadata without loading readers.
+  if (reopen_for_serving) {
+    const auto persist_forward_store_path = FileHelper::MakeForwardBlockPath(
+        path_, segment_meta_->id(), block.id_, !options_.enable_mmap_);
+    BaseForwardStore::Ptr persist_store;
+    if (options_.enable_mmap_) {
+      persist_store =
+          std::make_shared<MmapForwardStore>(persist_forward_store_path);
+    } else {
+      persist_store =
+          std::make_shared<BufferPoolForwardStore>(persist_forward_store_path);
+    }
+    s = persist_store->open();
+    CHECK_RETURN_STATUS(s);
+    persist_stores_.push_back(persist_store);
   }
-  s = persist_store->open();
-  CHECK_RETURN_STATUS(s);
-  persist_stores_.push_back(persist_store);
 
   BlockMeta b{block.id_,         block.type_,      block.min_doc_id_,
               block.max_doc_id_, block.doc_count_, block.columns_};
@@ -5169,38 +5185,52 @@ Status SegmentImpl::finish_memory_components() {
 
   // remove indexer from memory to persist
   for (auto &[column_name, indexer] : memory_vector_indexers_) {
-    s = reopen_vector_indexer_for_serving(indexer);
-    CHECK_RETURN_STATUS(s);
+    if (reopen_for_serving) {
+      s = reopen_vector_indexer_for_serving(indexer);
+      CHECK_RETURN_STATUS(s);
+    } else {
+      s = indexer->close();
+      CHECK_RETURN_STATUS(s);
+    }
     auto block_id = memory_vector_block_ids_[column_name];
     BlockMeta vb =
         BlockMeta{block_id,          BlockType::VECTOR_INDEX, block.min_doc_id_,
                   block.max_doc_id_, block.doc_count_,        {column_name}};
-    auto it = vector_indexers_.find(column_name);
-    if (it == vector_indexers_.end()) {
-      std::vector<VectorColumnIndexer::Ptr> vector_indexers{indexer};
-      vector_indexers_.emplace(column_name, std::move(vector_indexers));
-    } else {
-      it->second.push_back(indexer);
+    if (reopen_for_serving) {
+      auto it = vector_indexers_.find(column_name);
+      if (it == vector_indexers_.end()) {
+        std::vector<VectorColumnIndexer::Ptr> vector_indexers{indexer};
+        vector_indexers_.emplace(column_name, std::move(vector_indexers));
+      } else {
+        it->second.push_back(indexer);
+      }
     }
     segment_meta_->add_persisted_block(vb);
   }
 
   // remove quant indexer from memory to persist
   for (auto &[column_name, indexer] : quant_memory_vector_indexers_) {
-    s = reopen_vector_indexer_for_serving(indexer);
-    CHECK_RETURN_STATUS(s);
+    if (reopen_for_serving) {
+      s = reopen_vector_indexer_for_serving(indexer);
+      CHECK_RETURN_STATUS(s);
+    } else {
+      s = indexer->close();
+      CHECK_RETURN_STATUS(s);
+    }
     auto block_id = quant_memory_vector_block_ids_[column_name];
     BlockMeta block_meta(block_id, BlockType::VECTOR_INDEX_QUANTIZE,
                          block.min_doc_id_, block.max_doc_id_, block.doc_count_,
                          {column_name});
 
-    auto it = quant_vector_indexers_.find(column_name);
-    if (it == quant_vector_indexers_.end()) {
-      std::vector<VectorColumnIndexer::Ptr> vector_indexers;
-      vector_indexers.push_back(indexer);
-      quant_vector_indexers_.emplace(column_name, std::move(vector_indexers));
-    } else {
-      it->second.push_back(indexer);
+    if (reopen_for_serving) {
+      auto it = quant_vector_indexers_.find(column_name);
+      if (it == quant_vector_indexers_.end()) {
+        std::vector<VectorColumnIndexer::Ptr> vector_indexers;
+        vector_indexers.push_back(indexer);
+        quant_vector_indexers_.emplace(column_name, std::move(vector_indexers));
+      } else {
+        it->second.push_back(indexer);
+      }
     }
     segment_meta_->add_persisted_block(block_meta);
   }
@@ -5211,7 +5241,7 @@ Status SegmentImpl::finish_memory_components() {
   memory_vector_block_ids_.clear();
   quant_memory_vector_block_ids_.clear();
 
-  fresh_persist_block_offset();
+  if (reopen_for_serving) fresh_persist_block_offset();
   return Status::OK();
 }
 

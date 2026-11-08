@@ -699,6 +699,30 @@ TEST_P(SegmentTest, Flush) {
   EXPECT_TRUE(status.ok()) << "Flush failed: " << status.message();
 }
 
+TEST_P(SegmentTest, FlushForClosePersistsVectorsAndForwardRows) {
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 10);
+  ASSERT_NE(nullptr, segment);
+  const auto status = segment->flush_for_close();
+  ASSERT_TRUE(status.ok()) << status.message();
+  const auto meta = *segment->meta();
+  segment.reset();
+  auto read_options = options_;
+  read_options.read_only_ = true;
+  auto reopened = Segment::Open(col_path_, *schema_, meta, id_map_,
+                                delete_store_, version_manager_, read_options);
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  for (uint64_t id = 0; id < 10; ++id) {
+    auto doc = reopened.value()->fetch(id);
+    ASSERT_NE(nullptr, doc);
+    const auto expected = test::TestHelper::CreateDoc(id, *schema_);
+    EXPECT_EQ(expected.get<std::string>("name"), doc->get<std::string>("name"));
+    EXPECT_EQ(expected.get<std::vector<float>>("dense_fp32"),
+              doc->get<std::vector<float>>("dense_fp32"));
+  }
+}
+
 TEST_P(SegmentTest, FlushAfterInsert) {
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,

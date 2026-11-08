@@ -5,6 +5,7 @@ import gc
 from pathlib import Path
 import subprocess
 import sys
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -78,6 +79,9 @@ def verify(path, case):
         else:
             vector = range(4_000_000)
         query = zvec.Query(field, vector=vector)
+        measure_range = case in ("normal", "internal", "group")
+        if measure_range:
+            tracemalloc.start()
         with pytest.raises(MemoryError):
             if case == "internal":
                 coll.query_internal_ids(query)
@@ -85,6 +89,10 @@ def verify(path, case):
                 coll.group_by_query(query, group_by_field_name="group")
             else:
                 coll.query(query)
+        if measure_range:
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            assert peak < 1024 * 1024  # Reject before expanding the range.
         del query, vector
     gc.collect()
     assert coll.stats.doc_count == 0

@@ -543,7 +543,7 @@ int FlatStreamerEntity::search_batch_rows(
     const uint8_t *body = base ? base + offset : nullptr;
     if (!body) {
       if (segment->read(offset, data, block_size) != block_size || !data.data())
-        return IndexError_ReadData;
+        return segment->read_error();
       body = static_cast<const uint8_t *>(data.data());
     }
     BlockHeader header;
@@ -740,7 +740,7 @@ int FlatStreamerEntity::get_vector_by_position(
           index_meta_.element_size()) {
     LOG_ERROR("Failed to read vector by position, id=%u size=%u", id,
               index_meta_.element_size());
-    return -1;
+    return segment ? segment->read_error() : IndexError_ReadData;
   }
   return 0;
 }
@@ -755,7 +755,7 @@ int FlatStreamerEntity::get_key_by_position(uint32_t id, uint64_t *key) const {
       segment->read(key_offset, key_block, sizeof(*key)) != sizeof(*key) ||
       !key_block.data()) {
     LOG_ERROR("Failed to read Flat key by position, id=%u", id);
-    return -1;
+    return segment ? segment->read_error() : IndexError_ReadData;
   }
   std::memcpy(key, key_block.data(), sizeof(*key));
   return 0;
@@ -1051,7 +1051,7 @@ int FlatStreamerEntity::get_vector_by_key(
       segment->read(loc.offset, block, index_meta_.element_size()) !=
           index_meta_.element_size()) {
     LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-    return IndexError_ReadData;
+    return segment ? segment->read_error() : IndexError_ReadData;
   }
   return 0;
 }
@@ -1123,7 +1123,7 @@ int FlatStreamerEntity::get_vectors_by_key_impl(const uint64_t *keys,
         segment->read(loc.offset, blocks[i], index_meta_.element_size()) !=
             index_meta_.element_size()) {
       LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-      return -1;
+      return segment ? segment->read_error() : IndexError_ReadData;
     }
   }
   return 0;
@@ -1179,14 +1179,14 @@ void FlatStreamerEntity::Iterator::read_next_block() {
     if (entity_->storage_->vec_buffer_pool()) {
       if (segment->fetch(off + block_size - sizeof(header), &header,
                          sizeof(header)) != sizeof(header)) {
-        status_ = IndexError_ReadData;
+        status_ = segment->read_error();
         break;
       }
     } else {
       block_.reset();
       if (segment->read(off, block_, block_size) != block_size) {
         LOG_ERROR("Failed to read block, off=%zu", off);
-        status_ = IndexError_ReadData;
+        status_ = segment->read_error();
         break;
       }
       data_ = block_.data();
@@ -1338,6 +1338,7 @@ int FlatStreamerEntity::load_linear_meta(IndexStorage::Pointer storage) {
   if (segment->read(0, data_block, segment->data_size()) !=
       segment->data_size()) {
     LOG_ERROR("Failed to read storage, size=%zu", segment->data_size());
+    check_read_budget(segment);
     return IndexError_InvalidFormat;
   }
   auto *mt = reinterpret_cast<const decltype(meta_) *>(data_block.data());

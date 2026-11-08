@@ -1435,6 +1435,9 @@ TEST_F(BufferPoolScanBudgetTest, UncachedDefaultPreservesRowGroupBoundaries) {
     EXPECT_TRUE(reader.ReadNext(&batch).ok());
     EXPECT_EQ(nullptr, batch);
   }
+  // Arrow's default prefetch can retain the file after reader destruction.
+  // Close the owned input before Windows removes the fixture in TearDown.
+  ASSERT_TRUE((*input)->Close().ok());
 }
 
 TEST_F(BufferPoolScanBudgetTest, DefaultCacheFailureKeepsStreamingAcrossCalls) {
