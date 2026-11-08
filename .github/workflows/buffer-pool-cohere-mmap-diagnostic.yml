@@ -1,0 +1,120 @@
+name: Buffer Pool Cohere mmap reference check
+
+on:
+  push:
+    branches: [test/buffer-pool-cohere-mmap-fix-20261108]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: buffer-pool-cohere-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_NUM_THREADS: '1'
+
+jobs:
+  production:
+    name: Cohere 1M baseline and candidate (${{ matrix.index }}, ${{ matrix.storage }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [ivf, diskann]
+        storage: [mmap]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+          run-id: 42421287928
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-baseline
+          path: baseline
+          run-id: 42421287928
+          github-token: ${{ github.token }}
+      - name: Verify provenance and isolate both packages
+        run: |
+          mkdir -p evidence
+          python -c 'import json; from pathlib import Path; Path("evidence/diagnostic-source.json").write_text(json.dumps({"diagnostic_only": True, "source_workflow_run": 42421287928, "candidate_commit": "90fe7cfde41dd2a2ecd4e9bbe409d780a8713d83"}, indent=2))'
+          git rev-parse HEAD > evidence/harness-commit.txt
+          cmp <(printf '%s\n' 90fe7cfde41dd2a2ecd4e9bbe409d780a8713d83) candidate/commit.txt
+          cmp <(python -c 'import json; print(json.load(open(".github/scripts/buffer_pool_policy.json"))["baseline_commit"])') baseline/commit.txt
+          for role in baseline candidate; do
+            (cd "$role" && sha256sum -c SHA256SUMS)
+            cp "$role/commit.txt" "evidence/$role-commit.txt"
+            cp "$role/SHA256SUMS" "evidence/$role-SHA256SUMS"
+            python -m venv "$RUNNER_TEMP/$role-venv"
+            "$RUNNER_TEMP/$role-venv/bin/python" -m pip install "$role"/*.whl pyarrow
+            "$RUNNER_TEMP/$role-venv/bin/python" -m pip freeze > "evidence/$role-packages.txt"
+          done
+          uname -a > evidence/environment.txt
+          lscpu >> evidence/environment.txt
+          lsblk >> evidence/environment.txt
+          free -m >> evidence/environment.txt
+          df -h >> evidence/environment.txt
+      - name: Fetch versioned public Cohere 1M inputs
+        run: |
+          data_dir="$RUNNER_TEMP/cohere"
+          mkdir -p "$data_dir"
+          while read -r name size etag; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 1200 \
+              --header "If-Match: \"$etag\"" --max-filesize "$size" \
+              "https://assets.zilliz.com/benchmark/cohere_medium_1m/$name" --output "$data_dir/$name"
+            test "$(stat -c %s "$data_dir/$name")" -eq "$size"
+          done <<'DATASET'
+          shuffle_train.parquet 3134418448 aa5dee664dc87b3e416c9863723a0ba4-374
+          test.parquet 3133165 c63a0efd0e611d9f35345af1fc6f7966
+          neighbors.parquet 3704127 d1aca052763a292b10e80bbda964f55d
+          DATASET
+          (cd "$data_dir" && sha256sum ./*.parquet) > evidence/dataset-sha256.txt
+      - name: Compare both versions under identical external limits
+        env:
+          INDEX: ${{ matrix.index }}
+          STORAGE: ${{ matrix.storage }}
+        run: |
+          set -o pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libaio1t64 liburing2
+          # Build and remove one index at a time, on this same runner. This avoids
+          # keeping two copies of the million-row index or benchmarking two CPUs.
+          limit_mib=6144
+          if [[ "$INDEX" == diskann ]]; then limit_mib=8192; fi
+          for role in baseline candidate; do
+            test "$(df --output=avail -k "$RUNNER_TEMP" | tail -1)" -gt 6291456
+            python_path="$RUNNER_TEMP/$role-venv/bin/python"
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --unit="cohere-$role-${{ github.run_id }}" \
+              --property="MemoryMax=${limit_mib}M" --property=MemorySwapMax=0 \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              --setenv=OPENBLAS_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
+              "$python_path" .github/scripts/buffer_pool_system_limit.py \
+              "$((limit_mib * 1024 * 1024))" "evidence/$role-cgroup.jsonl" \
+              "$python_path" -X faulthandler .github/scripts/buffer_pool_cohere.py "$INDEX" "$STORAGE" \
+              "$RUNNER_TEMP/cohere" "$RUNNER_TEMP/collection-$role" "evidence/$role.jsonl" --role "$role" \
+              2>&1 | tee "evidence/$role.log"
+            rm -rf -- "$RUNNER_TEMP/collection-$role"
+          done
+          python .github/scripts/buffer_pool_report.py performance evidence/baseline.jsonl \
+            evidence/candidate.jsonl evidence/performance.json
+      - uses: ./.github/actions/upload-evidence
+        if: always()
+        with:
+          name: buffer-pool-evidence-cohere-${{ matrix.index }}-${{ matrix.storage }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
