@@ -257,6 +257,16 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       // Keep the same 256 KiB page allowance: source and build pages still
       // compete for it, and construction still writes dirty scratch pages.
       ASSERT_EQ(source->flush(), 0);
+      // Establish the merge input's retained scalar-read workspace before
+      // measuring input_external below. Its growth from metadata-sized reads
+      // to a vector snapshot belongs to the source, not to the PQ model.
+      // Rebalancing the competing reservation accounts for the actual charge
+      // while preserving the same 256 KiB page/workspace allowance.
+      VectorDataBuffer input;
+      ASSERT_EQ(source->fetch(0, &input), 0);
+      const auto &bytes = std::get<DenseVectorBuffer>(input.vector_buffer).data;
+      ASSERT_EQ(bytes.size(), static_cast<size_t>(dimension) * sizeof(float));
+      ASSERT_EQ(std::memcmp(bytes.data(), values.data(), bytes.size()), 0);
     }
     if (pressure) {
       // Ingestion retains its key map and may grow queue/slab metadata. Do
@@ -275,8 +285,8 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
       }
       reservation = requested;
     }
-    // The merge source remains live throughout training. Its retained key-map
-    // backing is separately charged and STL/platform dependent, not PQ state.
+    // The merge source remains live throughout training. Its retained key map
+    // and read workspace are separately charged input state, not PQ state.
     const size_t before_training = pool.external_used();
     const int training_result =
         merge ? target->merge({source}, {}, {2, nullptr}) : target->train();
