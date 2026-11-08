@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
-import math
 import os
 import subprocess
 import sys
@@ -24,6 +23,7 @@ from typing import ClassVar
 
 import numpy as np
 from buffer_pool_metrics import calibration, stability
+from buffer_pool_query_contract import verify_ann_hits, verify_l2_results
 from buffer_pool_rss_monitor import ProcessRssMonitor
 
 import zvec
@@ -241,12 +241,8 @@ def check_reads(collection, probes, query_param, topk, rows, vector_only=False):
             output_fields=[],
             include_vector=False,
         )
-        assert len(hits) == topk and hits[0].id == doc_ids[0], (
-            doc_ids[0],
-            [(hit.id, hit.score) for hit in hits[:3]],
-        )
-        assert all(math.isfinite(hit.score) for hit in hits)
-        return {hits[0].id: hits[0]}
+        verify_ann_hits(hits, topk, rows)
+        return {hit.id: hit for hit in hits}
     docs = collection.fetch(doc_ids)
     assert set(docs) == set(doc_ids)
     for doc_id in doc_ids:
@@ -259,12 +255,12 @@ def check_reads(collection, probes, query_param, topk, rows, vector_only=False):
         topk=topk,
         include_vector=True,
     )
-    assert len(hits) == topk
-    assert hits[0].id == doc_ids[0] and hits[0].field("payload") == "updated", (
-        doc_ids[0],
-        [(hit.id, hit.score, hit.field("payload")) for hit in hits[:3]],
-    )
-    assert all(math.isfinite(hit.score) for hit in hits)
+    # An ANN query need not return its exact nearest neighbor, even when that
+    # neighbor is the input itself. Keep persistence/update and result-integrity
+    # assertions here; Cohere ground truth separately gates aggregate recall.
+    verify_ann_hits(hits, topk, rows)
+    returned = collection.fetch([hit.id for hit in hits])
+    verify_l2_results(hits, probes[doc_ids[0]], returned)
     return docs
 
 

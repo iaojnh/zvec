@@ -22,6 +22,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from buffer_pool_acceptance import sample
 from buffer_pool_metrics import POLICY, calibration
+from buffer_pool_query_contract import verify_ann_hits
 from buffer_pool_rss_monitor import ProcessRssMonitor
 from buffer_pool_system_limit import current_cgroup
 
@@ -243,7 +244,7 @@ def mutations_and_recovery(
                 topk=1,
                 output_fields=[],
             )
-            assert hits[0].id == key
+            verify_ann_hits(hits, 1, ROWS)
     finally:
         reader.close()
     fixture.unlink()

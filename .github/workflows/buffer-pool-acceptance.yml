@@ -252,7 +252,7 @@ jobs:
       - name: Exercise public API memory denial and recovery
         if: matrix.shard == 'budget'
         run: |
-          python -m pytest -n 0 .github/scripts/test_buffer_pool_ci.py .github/scripts/test_buffer_pool_ci_tools.py --junitxml=evidence/acceptance-gates.xml
+          python -m pytest -n 0 .github/scripts/test_buffer_pool_ci.py .github/scripts/test_buffer_pool_ci_tools.py .github/scripts/test_buffer_pool_query_contract.py --junitxml=evidence/acceptance-gates.xml
           python -m pytest -n 0 python/tests/test_fetch_result_budget.py \
             -k 'large_vector_result_admission_and_recovery or large_query_result_copy_admission_and_recovery or retained_vectors_reject_growth_and_release_for_retry' \
             --junitxml=evidence/public-budget.xml
