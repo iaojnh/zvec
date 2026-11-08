@@ -30,13 +30,17 @@ def snapshot(group):
     return result
 
 
-def run(limit, evidence, command):
+def current_cgroup(membership=Path("/proc/self/cgroup"), mount=Path("/sys/fs/cgroup")):
     relative = next(
         line.split(":", 2)[2]
-        for line in Path("/proc/self/cgroup").read_text().splitlines()
+        for line in membership.read_text().splitlines()
         if line.startswith("0::")
     )
-    group = Path("/sys/fs/cgroup") / relative.lstrip("/")
+    return mount / relative.lstrip("/")
+
+
+def run(limit, evidence, command):
+    group = current_cgroup()
     before = snapshot(group)
     assert before["memory.max"] == limit, "external memory limit was not applied"
     assert before["memory.swap.max"] == before["memory.swap.current"] == 0, (
