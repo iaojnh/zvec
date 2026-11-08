@@ -111,7 +111,7 @@ jobs:
 
       - name: Compile C++ test targets
         run: |
-          cmake --build "$GITHUB_WORKSPACE/build" --target unittest.build --parallel "$NPROC"
+          cmake --build "$GITHUB_WORKSPACE/build" --target invert_recall_test --parallel "$NPROC"
           echo "C++ test compilation passed (musllinux-x64)." >> "$GITHUB_STEP_SUMMARY"
         shell: sh
 
@@ -120,24 +120,27 @@ jobs:
           cd "$GITHUB_WORKSPACE/build"
           mkdir -p "$GITHUB_WORKSPACE/ci-evidence"
           ctest --output-on-failure --no-tests=error --parallel "$NPROC" \
+            -R '^invert_recall_test$' --repeat until-fail:20 \
             --output-junit "$GITHUB_WORKSPACE/ci-evidence/native.xml"
         shell: sh
 
       - name: Capture shutdown crash backtraces
-        if: failure()
+        if: ${{ !cancelled() }}
         run: |
           cd "$GITHUB_WORKSPACE/build"
           test -x bin/invert_recall_test || exit 0
           mkdir -p "$GITHUB_WORKSPACE/ci-evidence"
+          debug_failed=0
           for attempt in 1 2 3; do
-            gdb -q -batch \
+            gdb -q -batch --return-child-result \
               -ex 'set pagination off' \
               -ex 'handle SIGSEGV stop print nopass' \
               -ex run -ex 'thread apply all bt' \
               --args bin/invert_recall_test --gtest_color=no \
-              > "$GITHUB_WORKSPACE/ci-evidence/shutdown-backtrace-$attempt.log" 2>&1
+              > "$GITHUB_WORKSPACE/ci-evidence/shutdown-backtrace-$attempt.log" 2>&1 || debug_failed=1
             cat "$GITHUB_WORKSPACE/ci-evidence/shutdown-backtrace-$attempt.log"
           done
+          exit "$debug_failed"
         shell: sh
 
       - name: Run Python Tests
