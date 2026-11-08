@@ -15,11 +15,13 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 #if defined(__linux__)
 #include <glog/logging.h>
 #endif
 #include "db/sqlengine/planner/plan_info.h"
+#include "db/sqlengine/planner/segment_node.h"
 #include "db/sqlengine/sqlengine.h"
 #include "db/sqlengine/sqlengine_impl.h"
 #include "zvec/db/schema.h"
@@ -163,6 +165,70 @@ TEST(DocIdScanPlanTest, BoundedSourceReleasesInputBeforeCompletion) {
     // Completion must release the producer even while the result reader is
     // still alive. A later executor callback must not own the last Segment.
     EXPECT_TRUE(input.expired());
+  }
+}
+
+TEST(DocIdScanPlanTest, NestedReaderReleasesChildBeforeCompletion) {
+  struct RestoreCapacity {
+    int capacity = arrow::GetCpuThreadPoolCapacity();
+    ~RestoreCapacity() {
+      static_cast<void>(arrow::SetCpuThreadPoolCapacity(capacity));
+    }
+  } restore;
+  // Cancellation has to compose asynchronously: blocking a parent source here
+  // would deadlock its child on the sole CPU worker.
+  ASSERT_TRUE(arrow::SetCpuThreadPoolCapacity(1).ok());
+  auto schema = arrow::schema({arrow::field("id", arrow::uint64())});
+  arrow::UInt64Builder builder;
+  ASSERT_TRUE(builder.Append(123).ok());
+  std::shared_ptr<arrow::Array> values;
+  ASSERT_TRUE(builder.Finish(&values).ok());
+  auto batch = arrow::RecordBatch::Make(schema, 1, {values});
+  for (bool early_close : {false, true}) {
+    for (size_t queue_limit : {size_t{0}, size_t{64}}) {
+      auto owner = std::make_shared<int>(1);
+      std::weak_ptr<int> input = owner;
+      auto reader = [&] {
+        auto produced = std::make_shared<size_t>(0);
+        arrow::acero::Declaration child{
+            "source", arrow::acero::SourceNodeOptions{
+                          schema, [owner, produced, batch] {
+                            using Batch =
+                                std::optional<arrow::compute::ExecBatch>;
+                            return arrow::Future<Batch>::MakeFinished(
+                                (*produced)++ < 10000
+                                    ? Batch{arrow::compute::ExecBatch(*batch)}
+                                    : Batch{});
+                          }}};
+        auto plan = std::make_shared<PlanInfo>(std::move(child), schema);
+        auto node = std::make_shared<SegmentNode>(
+            std::vector<PlanInfo::Ptr>{plan}, nullptr);
+        arrow::acero::Declaration parent{
+            "source", AsyncSourceNodeOptions{schema, node->gen(), [node] {
+                                               return node->finish();
+                                             }}};
+        if (!early_close)
+          parent =
+              arrow::acero::Declaration{"fetch",
+                                        {std::move(parent)},
+                                        arrow::acero::FetchNodeOptions{0, 1}};
+        return PlanInfo(std::move(parent), schema)
+            .execute_to_reader(queue_limit);
+      }();
+      ASSERT_TRUE(reader);
+      owner.reset();
+      std::shared_ptr<arrow::RecordBatch> result;
+      ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
+      ASSERT_NE(nullptr, result);
+      if (early_close) {
+        ASSERT_TRUE(reader.value()->Close().ok());
+      } else {
+        ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
+        ASSERT_EQ(nullptr, result);
+      }
+      EXPECT_TRUE(input.expired())
+          << "early_close=" << early_close << " queue_limit=" << queue_limit;
+    }
   }
 }
 
@@ -1015,11 +1081,13 @@ TEST_F(InvertRecallTest, MultiSegment) {
   auto engine = SQLEngine::create(std::make_shared<Profiler>());
   std::vector<Segment::Ptr> segments = segments_;
   segments.push_back(segments_[0]);
+  const auto owners_before = segments_[0].use_count();
   auto ret = engine->execute(collection_schema_, query, segments);
   if (!ret) {
     LOG_ERROR("execute failed: [%s]", ret.error().c_str());
   }
   ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  EXPECT_EQ(owners_before, segments_[0].use_count());
   auto docs = ret.value();
   EXPECT_EQ(docs.size(), query.topk_);
   for (int i = 0; i < query.topk_; i++) {
