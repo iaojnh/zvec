@@ -408,6 +408,13 @@ class IndexStorage : public IndexModule {
     struct ScatterBlock {
       using Spans = ailego::BudgetedVector<ReadSpan>;
 
+      // Backends may retain charged descriptors without retaining page pins.
+      // A separately copied lease must keep its pins until its last owner dies.
+      struct Workspace {
+        virtual ~Workspace() = default;
+        virtual void reset() noexcept = 0;
+      };
+
       ScatterBlock() = default;
       ScatterBlock(const ScatterBlock &) = delete;
       ScatterBlock &operator=(const ScatterBlock &) = delete;
@@ -419,10 +426,18 @@ class IndexStorage : public IndexModule {
       std::shared_ptr<void> lease{};
       MemoryBlock fallback{};
       size_t size{0};
+      std::shared_ptr<Workspace> workspace{};
 
       void reset() {
         spans.clear();
         lease.reset();
+        if (workspace) {
+          if (workspace.use_count() == 1) {
+            workspace->reset();
+          } else {
+            workspace.reset();
+          }
+        }
         fallback.reset();
         size = 0;
       }

@@ -554,6 +554,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     uint64_t alloc_from_slab{0};      // cold page acquisitions from slabs
     uint64_t slab_reclaimed_pages{0};  // pages decommitted under pressure
     uint64_t bg_evict_rounds{0};       // background reclaim passes
+    uint64_t bg_charge_notifications{0};  // successful charges needing reclaim
     uint64_t bg_evicted_buffers{0};    // buffers reclaimed by background thread
     uint64_t bg_no_progress_sleeps{0};  // backoffs after zero-page reclaim
     uint64_t high_watermark_hits{0};  // foreground acquire hit the capacity cap
@@ -718,6 +719,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<uint64_t> alloc_from_slab_{0};
   std::atomic<uint64_t> slab_reclaimed_pages_{0};
   std::atomic<uint64_t> bg_evict_rounds_{0};
+  std::atomic<uint64_t> bg_charge_notifications_{0};
   std::atomic<uint64_t> bg_evicted_buffers_{0};
   std::atomic<uint64_t> bg_no_progress_sleeps_{0};
   std::atomic<uint64_t> high_watermark_hits_{0};

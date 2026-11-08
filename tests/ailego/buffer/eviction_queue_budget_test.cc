@@ -103,6 +103,21 @@ TEST_F(EvictionQueueBudgetTest, InsufficientInitializationPreservesOldBudget) {
   EXPECT_EQ(0, pool_.init(64UL << 20));
 }
 
+TEST_F(EvictionQueueBudgetTest, SuccessfulChargesOnlyNotifyUnderPressure) {
+  const auto before = pool_.stats().bg_charge_notifications;
+  for (size_t i = 0; i < 64; ++i) {
+    MemoryLimitPool::PendingAllocation allocation(
+        pool_, MemoryLimitPool::PendingAllocation::Kind::kWorkspace);
+    ASSERT_TRUE(allocation.reserve(64));
+  }
+  EXPECT_EQ(before, pool_.stats().bg_charge_notifications);
+  const size_t remaining = pool_.available();
+  ASSERT_TRUE(pool_.try_charge_external(remaining));
+  EXPECT_GT(pool_.stats().bg_charge_notifications, before);
+  EXPECT_FALSE(pool_.try_charge_external(1));
+  pool_.release_external(remaining);
+}
+
 TEST_F(EvictionQueueBudgetTest,
        DisabledAndReinitializedPoolAdoptsRetainedQueues) {
   const size_t queue = pool_.queue_allocated();

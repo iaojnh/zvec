@@ -1959,7 +1959,14 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
   while (true) {
     if (try_reserve_allocation(buffer_size, backing, materialization)) {
       counter->fetch_add(buffer_size, std::memory_order_relaxed);
-      bg_cv_.notify_one();
+      // Successful tiny workspace reservations must not wake the evictor
+      // while there is ample headroom. Foreground denial/wait paths retain
+      // their unconditional notifications.
+      if (should_background_reclaim() || is_page_full() ||
+          workspace_waiting_size_.load(std::memory_order_relaxed) != 0) {
+        bg_charge_notifications_.fetch_add(1, std::memory_order_relaxed);
+        bg_cv_.notify_one();
+      }
       return true;
     }
 
@@ -2209,6 +2216,8 @@ MemoryLimitPool::PoolStats MemoryLimitPool::stats() const {
   s.slab_reclaimed_pages =
       slab_reclaimed_pages_.load(std::memory_order_relaxed);
   s.bg_evict_rounds = bg_evict_rounds_.load(std::memory_order_relaxed);
+  s.bg_charge_notifications =
+      bg_charge_notifications_.load(std::memory_order_relaxed);
   s.bg_evicted_buffers = bg_evicted_buffers_.load(std::memory_order_relaxed);
   s.bg_no_progress_sleeps =
       bg_no_progress_sleeps_.load(std::memory_order_relaxed);
@@ -2230,6 +2239,7 @@ void MemoryLimitPool::log_stats() const {
       "alloc_from_freelist=%llu alloc_from_slab=%llu "
       "slab_reclaimed_pages=%llu "
       "bg_evict_rounds=%llu bg_evicted_buffers=%llu "
+      "bg_charge_notifications=%llu "
       "bg_no_progress_sleeps=%llu "
       "high_watermark_hits=%llu capacity_waits=%llu "
       "capacity_wait_timeouts=%llu",
@@ -2250,6 +2260,7 @@ void MemoryLimitPool::log_stats() const {
       static_cast<unsigned long long>(s.slab_reclaimed_pages),
       static_cast<unsigned long long>(s.bg_evict_rounds),
       static_cast<unsigned long long>(s.bg_evicted_buffers),
+      static_cast<unsigned long long>(s.bg_charge_notifications),
       static_cast<unsigned long long>(s.bg_no_progress_sleeps),
       static_cast<unsigned long long>(s.high_watermark_hits),
       static_cast<unsigned long long>(s.capacity_waits),
