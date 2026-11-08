@@ -130,14 +130,15 @@ jobs:
     name: Index build memory control (${{ matrix.index }}, 512 MiB)
     needs: build
     runs-on: ubuntu-24.04
-    # The 400K x 768 DiskANN graph also runs on ordinary shared CI CPUs.
-    timeout-minutes: 240
+    # Allow the 400K x 768 DiskANN build to dump and reopen on shared CI CPUs.
+    # Elapsed time is reported alongside the fixed corpus and memory controls.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {index: ivf, native_filter: '*/Ivf*'}
-          - {index: diskann, native_filter: '*/Diskann*'}
+          - {index: ivf, native_filter: '*/Ivf*', timeout_minutes: 240}
+          - {index: diskann, native_filter: '*/Diskann*', timeout_minutes: 350}
     steps:
       - uses: actions/checkout@v7
         with:
