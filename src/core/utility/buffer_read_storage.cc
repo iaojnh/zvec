@@ -31,6 +31,7 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_format.h>
 #include <zvec/core/framework/index_unpacker.h>
+#include "reusable_read_scratch.h"
 #include "utility_params.h"
 
 namespace zvec {
@@ -532,8 +533,7 @@ class BufferReadStorage : public IndexStorage {
                       bool force_bypass) const try {
       // Heap scratch is exclusive (copies are deep copies). Reusing it does
       // not alter an independently retained block or require another charge.
-      if (data.type_ == MemoryBlock::MBT_HEAP_SCRATCH &&
-          data.scratch_size_ >= len) {
+      if (data.can_reuse_scratch(len, 4096UL)) {
         if (!read_bytes(abs_offset, len, static_cast<char *>(data.data_),
                         force_bypass)) {
           data.reset();
@@ -552,18 +552,25 @@ class BufferReadStorage : public IndexStorage {
         return 0;
       }
       size_t alloc_size = (len + (kAlign - 1UL)) & ~(kAlign - 1UL);
-      MemoryBlock owned;
-      if (alloc_size >= 2 * ailego::kVectorPageSize) {
-        // Large cold posting reads must not leave refunded malloc arenas
-        // behind. Copies retain this mapping until the final reader releases
-        // it; BudgetedMappedBuffer unmaps before refunding the rounded charge.
-        auto buffer = std::allocate_shared<ailego::BudgetedMappedBuffer>(
-            ailego::BudgetedAllocator<ailego::BudgetedMappedBuffer>{},
-            alloc_size);
-        owned = MemoryBlock::MakeSharedView(buffer->data(), buffer);
-      } else {
-        owned = MemoryBlock::AllocateOwned(alloc_size, kAlign);
-      }
+      auto allocate = [&]() -> MemoryBlock {
+        if (alloc_size >= 2 * ailego::kVectorPageSize) {
+          // Large cold posting reads must not leave refunded malloc arenas
+          // behind. Copies retain this mapping until the final reader releases
+          // it; BudgetedMappedBuffer unmaps before refunding the rounded
+          // charge.
+          auto buffer = std::allocate_shared<ailego::BudgetedMappedBuffer>(
+              ailego::BudgetedAllocator<ailego::BudgetedMappedBuffer>{},
+              alloc_size);
+          return MemoryBlock::MakeSharedView(buffer->data(), buffer);
+        }
+        return MemoryBlock::AllocateOwned(alloc_size, kAlign);
+      };
+      MemoryBlock owned =
+          cache_enabled_
+              ? read_scratch_.acquire(alloc_size, kAlign,
+                                      alloc_size < 2 * ailego::kVectorPageSize,
+                                      allocate)
+              : allocate();
       auto *tmp = static_cast<char *>(owned.data_);
       if (!read_bytes(abs_offset, len, tmp, force_bypass)) {
         LOG_ERROR(
@@ -588,6 +595,7 @@ class BufferReadStorage : public IndexStorage {
     }
 
     size_t data_offset_{0u};
+    mutable ReusableReadScratch read_scratch_;
     size_t data_size_{0u};
     size_t padding_size_{0u};
     size_t region_size_{0u};
