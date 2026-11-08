@@ -1802,8 +1802,20 @@ TEST_F(BufferStorageWriteTest, ReadOnlyBatchPreservesSharedCacheReserve) {
     reads.emplace_back(segment.get(), first + i * page_size, 1, &blocks[i]);
   }
 
+  const auto before = ailego::MemoryLimitPool::get_instance().stats();
   ASSERT_TRUE(
       segment->read_borrowed_batch_immutable(reads.data(), reads.size()));
+  const auto after = ailego::MemoryLimitPool::get_instance().stats();
+  SCOPED_TRACE(::testing::Message()
+               << "pages=" << count << " reserve=" << shared_reserve
+               << " available=" << available_before << "->"
+               << memory_pool.available()
+               << " metadata=" << before.metadata_used << "->"
+               << after.metadata_used << " queue=" << before.queue_metadata_used
+               << "->" << after.queue_metadata_used << " slab_headers="
+               << before.slab_header_bytes << "->" << after.slab_header_bytes
+               << " external=" << before.external_used << "->"
+               << after.external_used);
   const size_t external = memory_pool.external_used();
   const size_t remaining_reserve =
       shared_reserve > external ? shared_reserve - external : 0;
