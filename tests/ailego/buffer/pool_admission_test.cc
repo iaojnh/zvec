@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <ailego/pattern/scope_guard.h>
+#include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
@@ -14,6 +18,7 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
 #if defined(__linux__) && !defined(__ANDROID__)
+#include <sys/mman.h>
 #include <ailego/io/iouring_loader.h>
 #endif
 
@@ -46,6 +51,17 @@ struct MemoryLimitPoolTestPeer {
   }
   static size_t rss_available(MemoryLimitPool &pool) {
     return pool.process_rss_.available();
+  }
+  static ProcessRssBudget::ResidentSample slab_resident_sample() {
+    return MemoryLimitPool::read_slab_resident_sample();
+  }
+  static ProcessRssBudget::ResidentSample sample_with_slab_lock(
+      MemoryLimitPool &pool) {
+    std::lock_guard<std::mutex> lock(pool.slab_mutex_);
+    return pool.read_slab_resident_sample();
+  }
+  static void refresh_rss(MemoryLimitPool &pool) {
+    pool.process_rss_.refresh(true);
   }
   static size_t trim_retained(MemoryLimitPool &pool, size_t bytes) {
     return pool.trim_retained_blocks(bytes);
@@ -554,6 +570,82 @@ TEST_F(PoolAdmissionTest, HeapWorkspaceChurnKeepsLiveRssOverlap) {
     EXPECT_EQ(committed, pool_.committed());
   }
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(PoolAdmissionTest, SlabResidencyExcludesUntouchedAndSharedZeroPages) {
+  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  char *page = nullptr;
+  ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
+  ASSERT_NE(nullptr, page);
+  AILEGO_DEFER([&] { pool_.release_buffer(page, page_); });
+  auto *base = reinterpret_cast<char *>(reinterpret_cast<uintptr_t>(page) &
+                                        ~(pool_.slab_alignment() - 1));
+  ASSERT_EQ(0, ::madvise(base, pool_.slab_size(), MADV_NOHUGEPAGE));
+  ASSERT_EQ(0, ::madvise(page, page_, MADV_DONTNEED));
+  const auto untouched = MemoryLimitPoolTestPeer::slab_resident_sample();
+  volatile char zero = page[0];
+  (void)zero;
+  const auto shared_zero = MemoryLimitPoolTestPeer::slab_resident_sample();
+  EXPECT_EQ(untouched.owned_resident, shared_zero.owned_resident);
+  // Mimic resident THP neighbors without charging them as cache backing.
+  char *uncommitted = base + 3 * page_;
+  std::memset(uncommitted, 1, page_);
+  EXPECT_EQ(shared_zero.owned_resident,
+            MemoryLimitPoolTestPeer::slab_resident_sample().owned_resident);
+  ASSERT_EQ(0, ::madvise(uncommitted, page_, MADV_DONTNEED));
+  std::memset(page, 0, page_);
+  errno = EDOM;
+  const auto written = MemoryLimitPoolTestPeer::slab_resident_sample();
+  EXPECT_EQ(EDOM, errno);
+  EXPECT_EQ(shared_zero.owned_resident + page_, written.owned_resident);
+  EXPECT_GE(written.rss, written.owned_resident);
+  const auto busy = MemoryLimitPoolTestPeer::sample_with_slab_lock(pool_);
+  EXPECT_EQ(0u, busy.owned_resident);
+  EXPECT_GT(busy.rss, 0u);
+}
+
+TEST_F(PoolAdmissionTest, RealPageReplacementPreservesMeasuredRssHeadroom) {
+  constexpr size_t kMiB = 1UL << 20;
+  ASSERT_EQ(0, pool_.init(baseline_ + 16 * kMiB));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  std::vector<char *> pages;
+  pages.reserve(8 * kMiB / page_);
+  AILEGO_DEFER([&] {
+    for (auto *page : pages) pool_.release_buffer(page, page_);
+    pool_.configure_process_rss_limit(0);
+  });
+  const size_t rss = MemoryHelper::SelfRSS();
+  const size_t allowance =
+      std::max(64 * kMiB, 2 * ProcessRssBudget::headroom(rss + 128 * kMiB));
+  ASSERT_TRUE(pool_.configure_process_rss_limit(rss + allowance));
+  for (size_t i = 0; i < 8 * kMiB / page_; ++i) {
+    char *page = nullptr;
+    ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
+    ASSERT_NE(nullptr, page);
+    pages.push_back(page);
+    std::memset(page, 1, page_);
+  }
+  MemoryLimitPoolTestPeer::refresh_rss(pool_);
+  for (size_t cycle = 0; cycle < 8; ++cycle) {
+    SCOPED_TRACE(cycle);
+    for (size_t i = 0; i < kMiB / page_; ++i) {
+      char *page = pages.back();
+      pages.pop_back();
+      pool_.release_buffer(page, page_);
+      ASSERT_GE(MemoryLimitPoolTestPeer::trim_free(pool_, page_), page_);
+      page = nullptr;
+      ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
+      ASSERT_NE(nullptr, page);
+      pages.push_back(page);
+      std::memset(page, 1, page_);
+    }
+    MemoryLimitPoolTestPeer::refresh_rss(pool_);
+    EXPECT_GE(MemoryLimitPoolTestPeer::rss_available(pool_),
+              allowance - 10 * kMiB);
+  }
+}
+#endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
 TEST_F(PoolAdmissionTest, PrepaidIoUringStagingReturnsHeadroomAfterUnmap) {

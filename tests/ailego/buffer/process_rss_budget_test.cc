@@ -15,6 +15,11 @@ size_t ReadRss() {
   return sampled_rss.load();
 }
 
+size_t sampled_owned_resident = 0;
+ProcessRssBudget::ResidentSample ReadResident() {
+  return {sampled_rss.load(), sampled_owned_resident};
+}
+
 ProcessRssBudget::NativeSample native_sample;
 bool native_sample_valid = true;
 bool ReadNative(ProcessRssBudget::NativeSample *sample) {
@@ -41,6 +46,95 @@ TEST(ProcessRssBudgetTest, NativeFootprintTracksUntouchedBackingAcrossSamples) {
   native_sample = {96 * kMiB, 80 * kMiB};
   budget.refresh(true);
   EXPECT_EQ(24 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, ObservedResidentPagesKeepCreditAcrossReplacement) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(200 * kMiB));
+  budget.finish_reservation(200 * kMiB, true);
+  sampled_rss = 264 * kMiB;
+  sampled_owned_resident = 200 * kMiB;
+  budget.refresh(true);
+  for (int i = 0; i < 64; ++i) {
+    SCOPED_TRACE(i);
+    // Old pages were discarded, and their replacements are now resident.
+    // Total RSS stays constant while the cache turns over.
+    budget.release(4 * kMiB);
+    ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+    budget.finish_reservation(4 * kMiB, true);
+    budget.refresh(true);
+    ASSERT_EQ(248 * kMiB, budget.available());
+    ASSERT_FALSE(budget.pressure());
+  }
+  budget.release(200 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, ResidentWitnessDoesNotCoverUntouchedOwners) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(128 * kMiB));
+  budget.finish_reservation(128 * kMiB, true);
+  sampled_rss = 192 * kMiB;
+  sampled_owned_resident = 128 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_acquire(256 * kMiB));
+  budget.release(128 * kMiB);
+  // A caller can keep total RSS unchanged after the managed owner retires.
+  // The other 256 MiB remains untouched and needs its full future headroom.
+  sampled_owned_resident = 0;
+  budget.refresh(true);
+  EXPECT_EQ(64 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(65 * kMiB));
+  budget.release(256 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, ResidentWitnessRetirementPreservesLazyOwnerCharge) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(200 * kMiB));
+  budget.finish_reservation(200 * kMiB, true);
+  sampled_rss = 264 * kMiB;
+  sampled_owned_resident = 200 * kMiB;
+  budget.refresh(true);
+  for (int i = 0; i < 64; ++i) {
+    budget.release(4 * kMiB);
+    ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+    budget.finish_reservation(4 * kMiB, true);
+    budget.refresh(true);
+  }
+  ASSERT_TRUE(budget.try_acquire(100 * kMiB));
+  budget.release(200 * kMiB);
+  sampled_owned_resident = 0;
+  // The old sample may retain freed memory while this owner is untouched.
+  budget.refresh(true);
+  EXPECT_EQ(148 * kMiB, budget.available());
+  EXPECT_FALSE(budget.try_acquire(149 * kMiB));
+  budget.release(100 * kMiB);
+}
+
+TEST(ProcessRssBudgetTest, ResidentWitnessCannotCreditPendingOsAllocations) {
+  ProcessRssBudget budget;
+  sampled_rss = 64 * kMiB;
+  sampled_owned_resident = 0;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
+  ASSERT_TRUE(budget.try_reserve(128 * kMiB));
+  budget.finish_reservation(128 * kMiB, true);
+  sampled_rss = 192 * kMiB;
+  sampled_owned_resident = 128 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_reserve(64 * kMiB));
+  budget.refresh(true);
+  EXPECT_EQ(256 * kMiB, budget.available());
+  budget.finish_reservation(64 * kMiB, false);
+  EXPECT_EQ(320 * kMiB, budget.available());
+  budget.release(128 * kMiB);
 }
 
 TEST(ProcessRssBudgetTest, UnsampledHeapChurnPreservesLiveResidentOverlap) {

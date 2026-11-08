@@ -566,6 +566,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   struct QueueAllocationHeader;
   struct QueueMappingHeader;
   struct QueueMemorySlab;
+  static ProcessRssBudget::ResidentSample read_slab_resident_sample();
   enum class Backing { kLive, kPending, kPlan };
 
   MemoryLimitPool() = default;

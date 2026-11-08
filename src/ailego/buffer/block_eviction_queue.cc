@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -32,6 +34,11 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <sys/auxv.h>
+#include <fcntl.h>
+#include <pthread.h>
+#endif
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
 #endif
@@ -433,6 +440,92 @@ struct MemoryLimitPool::ReclaimableSlab {
   ProcessRssBudget::ReusablePages<kMaxSlabDataPages> projections;
   ProcessRssBudget::MaterializationStamp header_projection{};
 };
+
+ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
+#if defined(__linux__) && !defined(__ANDROID__)
+  const int saved_errno = errno;
+  auto restore_errno = ScopeGuard::Make([&] { errno = saved_errno; });
+  auto &pool = get_instance();
+  // Allocators can enter RSS accounting while holding these locks. A sample
+  // must never wait for the reverse order; absence of a witness stays safe.
+  // POSIX try-lock also safely refuses a mutex already held by this thread;
+  // std::mutex::try_lock has a stricter ownership precondition.
+  if (::pthread_mutex_trylock(pool.slab_mutex_.native_handle()) != 0)
+    return {MemoryHelper::SelfRSS(), 0};
+  auto unlock_pool = ScopeGuard::Make(
+      [&] { ::pthread_mutex_unlock(pool.slab_mutex_.native_handle()); });
+  ReclaimableSlab *first_unlocked = pool.slabs_;
+  auto unlock = ScopeGuard::Make([&] {
+    for (auto *slab = pool.slabs_; slab != first_unlocked; slab = slab->next)
+      ::pthread_mutex_unlock(slab->mutex.native_handle());
+  });
+  for (auto *slab = pool.slabs_; slab; slab = slab->next) {
+    if (::pthread_mutex_trylock(slab->mutex.native_handle()) != 0)
+      return {MemoryHelper::SelfRSS(), 0};
+    first_unlocked = slab->next;
+  }
+
+  // The kernel page size also remains correct in logical-page-size tests.
+  const size_t native_page = ::getauxval(AT_PAGESZ);
+  if (native_page < kMinimumPageBytes || native_page > kSlabBytes ||
+      kSlabBytes % native_page != 0)
+    return {MemoryHelper::SelfRSS(), 0};
+  const int fd = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return {MemoryHelper::SelfRSS(), 0};
+  auto close = ScopeGuard::Make([&] { ::close(fd); });
+  const size_t before = MemoryHelper::SelfRSS();
+  if (!before) return {};
+  size_t resident = 0;
+  std::array<uint64_t, kSlabBytes / kMinimumPageBytes> entries;
+  constexpr uint64_t kPrivatePresent =
+      (uint64_t{1} << 63) | (uint64_t{1} << 56);
+  for (auto *slab = pool.slabs_; slab; slab = slab->next) {
+    if (slab->page_size < native_page || slab->page_size % native_page != 0)
+      return {MemoryHelper::SelfRSS(), 0};
+    const size_t count =
+        (slab->committed_pages ? kSlabBytes : slab->page_size) / native_page;
+    std::array<bool, kMaxSlabDataPages + 1> charged{};
+    charged[0] = true;
+    if (slab->committed_pages) {
+      for (size_t i = 1; i < slab->next_unused; ++i) charged[i] = true;
+      for (size_t i = 0; i < slab->reclaimed_count; ++i)
+        charged[slab->reclaimed_pages[i]] = false;
+    }
+    const uintptr_t index = reinterpret_cast<uintptr_t>(slab) / native_page;
+    if (index > static_cast<uintptr_t>(std::numeric_limits<off_t>::max()) /
+                    sizeof(uint64_t))
+      return {MemoryHelper::SelfRSS(), 0};
+    const off_t offset = static_cast<off_t>(index * sizeof(uint64_t));
+    const size_t bytes = count * sizeof(uint64_t);
+    size_t done = 0;
+    while (done < bytes) {
+      const ssize_t got =
+          ::pread(fd, reinterpret_cast<char *>(entries.data()) + done,
+                  bytes - done, offset + static_cast<off_t>(done));
+      if (got < 0 && errno == EINTR) continue;
+      if (got <= 0) return {MemoryHelper::SelfRSS(), 0};
+      done += static_cast<size_t>(got);
+    }
+    // PFNs are deliberately unused. Unprivileged readers can see these
+    // status bits. Shared/zero pages and swapped/untouched pages give no
+    // credit; only private resident pages in our exact slab ranges do.
+    for (size_t i = 0; i < count; ++i) {
+      // THP can populate uncharged neighbors of a requested page. Their RSS
+      // must not become overlap credit for a different, untouched owner.
+      if (charged[i * native_page / slab->page_size] &&
+          (entries[i] & kPrivatePresent) == kPrivatePresent)
+        resident += native_page;
+    }
+  }
+  const size_t rss = MemoryHelper::SelfRSS();
+  if (!rss) return {};
+  // Be conservative if unrelated process memory retired during this read.
+  if (rss < before) resident -= std::min(resident, before - rss);
+  return {rss, std::min(resident, rss)};
+#else
+  return {MemoryHelper::SelfRSS(), 0};
+#endif
+}
 
 struct MemoryLimitPool::RetainedBlock {
   RetainedBlock *next{nullptr};
@@ -1240,7 +1333,7 @@ bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
                                                   size_t permanent_backing) {
   const bool configured = process_rss_.configure(
       bytes, &MemoryHelper::SelfRSS, NativeApplicationMemoryReader(),
-      permanent_backing);
+      permanent_backing, &MemoryLimitPool::read_slab_resident_sample);
   bg_cv_.notify_one();
   return configured;
 }
