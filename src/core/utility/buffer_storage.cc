@@ -46,11 +46,12 @@ constexpr size_t kBufferAlignment = 4096UL;
 thread_local int buffer_storage_read_error = IndexError_ReadData;
 thread_local int buffer_storage_write_error = IndexError_WriteData;
 
-inline bool AlignBufferSize(size_t size, size_t *aligned_size) {
-  if (size > std::numeric_limits<size_t>::max() - (kBufferAlignment - 1)) {
+inline bool AlignBufferSize(size_t size, size_t *aligned_size,
+                            size_t alignment = kBufferAlignment) {
+  if (size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
     return false;
   }
-  *aligned_size = (size + (kBufferAlignment - 1)) & ~(kBufferAlignment - 1);
+  *aligned_size = (size + (alignment - 1)) & ~(alignment - 1);
   return true;
 }
 
@@ -1040,13 +1041,14 @@ class BufferStorage : public IndexStorage {
       return data_offset() + offset;
     }
 
-    static MemoryBlock allocate_snapshot(size_t bytes) {
+    static MemoryBlock allocate_snapshot(size_t bytes,
+                                         size_t alignment = kBufferAlignment) {
       if (bytes < ailego::BudgetedAlignedBuffer::kRetainedThreshold) {
-        return MemoryBlock::AllocateOwned(bytes, kBufferAlignment);
+        return MemoryBlock::AllocateOwned(bytes, alignment);
       }
       auto owner = std::allocate_shared<ailego::BudgetedAlignedBuffer>(
           ailego::BudgetedAllocator<ailego::BudgetedAlignedBuffer>{}, bytes,
-          kBufferAlignment);
+          alignment);
       return MemoryBlock::MakeSharedView(owner->data(), owner);
     }
 
@@ -1075,14 +1077,18 @@ class BufferStorage : public IndexStorage {
       // Mutable graph snapshots are typically only a few hundred bytes. They
       // are copied from cached pages and are never submitted to O_DIRECT, so a
       // page-aligned allocation only adds allocator and RSS overhead. Keep
-      // alignment for larger/vector snapshots whose distance kernels benefit
-      // from it, but let the allocator's thread cache handle small objects.
+      // SIMD alignment for small vector snapshots; sub-page destinations are
+      // copied through the I/O layer's aligned staging buffer on cache misses.
+      // Whole-page destinations retain their direct-I/O alignment.
       static constexpr size_t kSmallSnapshotBytes = 512;
       size_t alloc_size = len;
       const size_t alignment =
-          !immutable && len <= kSmallSnapshotBytes ? 0 : kBufferAlignment;
+          !immutable && len <= kSmallSnapshotBytes
+              ? 0
+              : (len < kBufferAlignment ? AILEGO_CACHE_LINE_SIZE
+                                       : kBufferAlignment);
       if (alignment) {
-        if (ailego_unlikely(!AlignBufferSize(len, &alloc_size))) {
+        if (ailego_unlikely(!AlignBufferSize(len, &alloc_size, alignment))) {
           return 0;
         }
       }
@@ -1090,7 +1096,7 @@ class BufferStorage : public IndexStorage {
       MemoryBlock owned;
       if (!reuse) {
         auto allocate = [&] {
-          return alignment ? allocate_snapshot(alloc_size)
+          return alignment ? allocate_snapshot(alloc_size, alignment)
                            : MemoryBlock::AllocateOwned(alloc_size);
         };
         owned = owner_->cache_enabled_

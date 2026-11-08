@@ -6,20 +6,24 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <zvec/ailego/internal/platform.h>
 #include <zvec/core/framework/index_storage.h>
 
 namespace zvec::core {
 
-// Small scalar snapshots keep one charged allocation per worker. Retention is
-// bounded per storage, and close releases idle buffers even on live workers.
+// Workers keep a bounded set of charged snapshots so overlapping reads can
+// reuse their backing after the last reader releases it. Close drops idle data.
 // Live results own their slot independently of the storage and reading thread.
 class ReusableReadScratch {
  public:
   static constexpr size_t kMaxBytes = 64UL << 10;
   static constexpr size_t kMaxWorkers = 16;
+  static constexpr size_t kMaxSlots = 64;
+  static_assert(kMaxSlots == 64, "slot masks must cover the entire cache");
   using Block = IndexStorage::MemoryBlock;
 
   ReusableReadScratch() : generation_(next_generation()) {}
+  ~ReusableReadScratch() { clear(); }
   ReusableReadScratch(const ReusableReadScratch &) = delete;
   ReusableReadScratch &operator=(const ReusableReadScratch &) = delete;
 
@@ -37,7 +41,7 @@ class ReusableReadScratch {
     static thread_local size_t next = 0;
     for (const auto &hit : recent) {
       if (hit.generation == generation_) {
-        return hit.entry->slot->acquire(hit.entry->slot, bytes, alignment,
+        return hit.entry->worker->acquire(hit.entry->worker, bytes, alignment,
                                         deep_copy, allocate);
       }
     }
@@ -46,13 +50,13 @@ class ReusableReadScratch {
     const auto thread = std::this_thread::get_id();
     Entry *empty = nullptr;
     for (auto &entry : entries_) {
-      if (entry.slot && entry.thread == thread) {
+      if (entry.worker && entry.thread == thread) {
         recent[next++ % recent.size()] = {generation_, &entry};
         lock.unlock();
-        return entry.slot->acquire(entry.slot, bytes, alignment, deep_copy,
-                                   allocate);
+        return entry.worker->acquire(entry.worker, bytes, alignment, deep_copy,
+                                     allocate);
       }
-      if (!entry.slot && !empty) empty = &entry;
+      if (!entry.worker && !empty) empty = &entry;
     }
     if (!empty) {
       lock.unlock();
@@ -65,24 +69,24 @@ class ReusableReadScratch {
     const bool first = metadata_.bytes() == 0;
     try {
       if (first) metadata_.add(sizeof(entries_));
-      auto slot = std::allocate_shared<Slot>(ailego::BudgetedAllocator<Slot>{},
-                                             std::move(backing), bytes);
+      auto worker = std::allocate_shared<Worker>(
+          ailego::BudgetedAllocator<Worker>{}, std::move(backing), bytes);
       empty->thread = thread;
-      empty->slot = std::move(slot);
+      empty->worker = std::move(worker);
       recent[next++ % recent.size()] = {generation_, empty};
     } catch (const std::bad_alloc &) {
       if (first) metadata_.retain_at_most(0);
       return backing;
     }
     lock.unlock();
-    return empty->slot->acquire(empty->slot, bytes, alignment, deep_copy,
+    return empty->worker->acquire(empty->worker, bytes, alignment, deep_copy,
                                 allocate);
   } catch (const std::bad_alloc &) {
     // Idle cache backing is optional. Return it before retrying a required
     // allocation; never discard a buffer still referenced by a result.
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto &entry : entries_) {
-      if (entry.slot) entry.slot->discard_idle();
+      if (entry.worker) entry.worker->discard_idle();
     }
     return allocate();
   }
@@ -91,72 +95,160 @@ class ReusableReadScratch {
   void clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     generation_ = next_generation();
-    for (auto &entry : entries_) entry = {};
+    for (auto &entry : entries_) {
+      if (entry.worker) entry.worker->discard_idle();
+      entry = {};
+    }
     metadata_.retain_at_most(0);
   }
 
  private:
-  class Slot : public Block::ScratchLease {
+  class Worker {
    public:
-    Slot(Block backing, size_t capacity)
-        : backing_(std::move(backing)), capacity_(capacity) {}
+    Worker(Block backing, size_t capacity) : retained_(capacity) {
+      first_.worker = this;
+      first_.backing = std::move(backing);
+      first_.capacity = capacity;
+      allocated_ = 1;
+    }
 
     template <typename Allocate>
-    Block acquire(const std::shared_ptr<Slot> &self, size_t bytes,
+    Block acquire(const std::shared_ptr<Worker> &self, size_t bytes,
                   size_t alignment, bool deep_copy, Allocate allocate) {
       std::unique_lock<std::mutex> lock(mutex_);
-      if (readers_) {
+      uint64_t idle = allocated_ & ~busy_;
+      while (idle) {
+        const size_t index = first_slot(idle);
+        auto &cached = slot(index);
+        if (cached.fits(bytes, alignment)) {
+          return borrow(self, index, deep_copy);
+        }
+        idle &= idle - 1;
+      }
+
+      // Shared mapped results can outlive their source for a long time. Keep
+      // their compact single-slot cache instead of attaching an overflow table
+      // and unrelated mappings to one retained result.
+      if (!deep_copy && busy_) {
         lock.unlock();
         return allocate();
       }
-      if (!fits(bytes, alignment)) {
-        // Replacement remains charged alongside old backing until success.
-        auto replacement = allocate();
-        backing_ = std::move(replacement);
-        capacity_ = bytes;
-      }
-      readers_ = 1;
-      return Block::MakeReusedScratch(const_cast<void *>(backing_.data()), self,
-                                      deep_copy);
-    }
 
-    void retain() noexcept override {
-      std::lock_guard<std::mutex> lock(mutex_);
-      ++readers_;
-    }
-    void release() noexcept override {
-      std::lock_guard<std::mutex> lock(mutex_);
-      assert(readers_ != 0);
-      --readers_;
-    }
-    bool reusable(size_t bytes, size_t alignment) const noexcept override {
-      std::lock_guard<std::mutex> lock(mutex_);
-      return readers_ == 1 && fits(bytes, alignment);
+      // Retain at most 64 KiB of payload per worker, including every live
+      // cached result. Additional slot metadata is optional and lazy, keeping
+      // the scalar-only path's footprint small.
+      const uint64_t empty = ~allocated_;
+      idle = allocated_ & ~busy_;
+      if (!empty && !idle) {
+        lock.unlock();
+        return allocate();
+      }
+      const size_t index = first_slot(idle ? idle : empty);
+      const size_t previous = (allocated_ & (uint64_t{1} << index))
+                                  ? slot(index).capacity
+                                  : 0;
+      if (bytes > kMaxBytes - (retained_ - previous)) {
+        lock.unlock();
+        return allocate();
+      }
+      // Admission keeps the previous backing charged until replacement
+      // succeeds. Failure unwinds the lock before the outer idle-cache trim.
+      auto replacement = allocate();
+      if (index && !overflow_) {
+        try {
+          overflow_ = std::allocate_shared<Overflow>(
+              ailego::BudgetedAllocator<Overflow>{}, this);
+        } catch (const std::bad_alloc &) {
+          // Required data already fits; optional pooling must not reject it.
+          return replacement;
+        }
+      }
+      auto &cached = slot(index);
+      retained_ = retained_ - previous + bytes;
+      cached.backing = std::move(replacement);
+      cached.capacity = bytes;
+      allocated_ |= uint64_t{1} << index;
+      return borrow(self, index, deep_copy);
     }
 
     void discard_idle() {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (!readers_) {
-        backing_.reset();
-        capacity_ = 0;
+      uint64_t idle = allocated_ & ~busy_;
+      while (idle) {
+        const size_t index = first_slot(idle);
+        auto &cached = slot(index);
+        cached.backing.reset();
+        retained_ -= cached.capacity;
+        cached.capacity = 0;
+        allocated_ &= ~(uint64_t{1} << index);
+        idle &= idle - 1;
       }
+      if (!(allocated_ & ~uint64_t{1})) overflow_.reset();
     }
 
    private:
-    bool fits(size_t bytes, size_t alignment) const {
-      return capacity_ >= bytes &&
-             (!alignment ||
-              reinterpret_cast<uintptr_t>(backing_.data()) % alignment == 0);
+    struct Slot : Block::ScratchLease {
+      void retain() noexcept override {
+        std::lock_guard<std::mutex> lock(worker->mutex_);
+        assert(readers);
+        ++readers;
+      }
+      void release() noexcept override {
+        std::lock_guard<std::mutex> lock(worker->mutex_);
+        assert(readers);
+        if (--readers == 0) worker->busy_ &= ~(uint64_t{1} << index);
+      }
+      bool reusable(size_t bytes, size_t alignment) const noexcept override {
+        std::lock_guard<std::mutex> lock(worker->mutex_);
+        return readers == 1 && fits(bytes, alignment);
+      }
+      bool fits(size_t bytes, size_t alignment) const {
+        return capacity >= bytes &&
+               (!alignment ||
+                reinterpret_cast<uintptr_t>(backing.data()) % alignment == 0);
+      }
+      Worker *worker{nullptr};
+      size_t index{0}, readers{0}, capacity{0};
+      Block backing;
+    };
+    struct Overflow {
+      explicit Overflow(Worker *worker) {
+        for (size_t i = 0; i < slots.size(); ++i) {
+          slots[i].worker = worker;
+          slots[i].index = i + 1;
+        }
+      }
+      std::array<Slot, kMaxSlots - 1> slots;
+    };
+    Slot &slot(size_t index) {
+      return index ? overflow_->slots[index - 1] : first_;
+    }
+    static size_t first_slot(uint64_t mask) {
+      assert(mask);
+      return static_cast<size_t>(ailego_ctz64(mask));
+    }
+    Block borrow(const std::shared_ptr<Worker> &self, size_t index,
+                 bool deep_copy) {
+      auto &cached = slot(index);
+      assert(!cached.readers);
+      cached.readers = 1;
+      busy_ |= uint64_t{1} << index;
+      // Aliasing ownership keeps all slot addresses stable across close and
+      // cross-thread destruction without allocating a control block per read.
+      return Block::MakeReusedScratch(
+          const_cast<void *>(cached.backing.data()),
+          std::shared_ptr<Block::ScratchLease>(self, &cached), deep_copy);
     }
     mutable std::mutex mutex_;
-    size_t readers_{0};
-    Block backing_;
-    size_t capacity_{0};
+    size_t retained_{0};
+    uint64_t allocated_{0}, busy_{0};
+    Slot first_;
+    std::shared_ptr<Overflow> overflow_;
   };
 
   struct Entry {
     std::thread::id thread;
-    std::shared_ptr<Slot> slot;
+    std::shared_ptr<Worker> worker;
   };
   static uint64_t next_generation() {
     static std::atomic<uint64_t> next{1};
