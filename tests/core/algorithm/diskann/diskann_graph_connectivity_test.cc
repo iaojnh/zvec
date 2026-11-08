@@ -565,7 +565,10 @@ TEST_F(DiskAnnGraphConnectivityTest,
   const auto comparisons = context_->dist_calculator().compare_cnt();
   entity_->batch_vectors = true;
   auto &pool = ailego::PoolPayloadBudget::get_instance();
-  for (size_t remaining = 2048; remaining <= 8192; remaining += 256) {
+  std::vector<size_t> limits{1440};
+  for (size_t remaining = 2048; remaining <= 8192; remaining += 256)
+    limits.push_back(remaining);
+  for (const size_t remaining : limits) {
     SCOPED_TRACE(remaining);
     entity_->graph[0] = original;
     ailego::BudgetedVector<float>().swap(context_->occlude_factor());

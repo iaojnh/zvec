@@ -1,0 +1,69 @@
+name: Buffer Pool Windows workspace diagnostics
+
+on:
+  push:
+    branches: [test/buffer-pool-win-pressure-20261108]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native pressure contracts (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-2022
+            arch: x64
+          - platform: windows-2025
+            arch: x64
+          - platform: windows-11-arm
+            arch: arm64
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          disable_annotations: true
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.arch }}
+      - name: Configure native contracts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ci-evidence | Out-Null
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF `
+            -DENABLE_WERROR=ON `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            2>&1 | Tee-Object -FilePath ci-evidence/configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build both failing programs
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 4 `
+            --target diskann_graph_connectivity_test buffer_storage_write_test `
+            2>&1 | Tee-Object -FilePath ci-evidence/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run unchanged assertions with allocator diagnostics
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure --no-tests=error `
+            -R '^(diskann_graph_connectivity_test|buffer_storage_write_test)$' `
+            --output-junit "$env:GITHUB_WORKSPACE/ci-evidence/native.xml" `
+            2>&1 | Tee-Object -FilePath ci-evidence/tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload native evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-pressure-${{ matrix.platform }}
+          path: ci-evidence

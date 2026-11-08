@@ -450,6 +450,19 @@ int DiskAnnAlgorithm::collect_prune_candidates(
     diskann_id_t center, const ailego::BudgetedVector<diskann_id_t> &neighbors,
     PruneCandidates &pool, DiskAnnContext *ctx, PruneVectorCache *cache) {
   auto &dc = ctx->dist_calculator();
+  if (std::none_of(neighbors.begin(), neighbors.end(),
+                   [center](diskann_id_t id) { return id != center; }))
+    return 0;
+
+  // Allocate the bounded candidate workspace before optional vector retention.
+  // Incremental growth temporarily charges both old and new allocations and
+  // can reject a working set that fits, depending on the STL growth policy.
+  // Duplicates may make the actual candidate set smaller than this bound, so
+  // retain incremental growth when the upper bound cannot be reserved.
+  try {
+    pool.reserve(std::min(neighbors.size(), size_t(max_candidate_size_)));
+  } catch (const std::bad_alloc &) {
+  }
   std::set<diskann_id_t> visited;
   const bool batch_reads = entity_.prefer_vector_batch();
   if (!batch_reads) {
@@ -463,9 +476,6 @@ int DiskAnnAlgorithm::collect_prune_candidates(
     return 0;
   }
 
-  if (std::none_of(neighbors.begin(), neighbors.end(),
-                   [center](diskann_id_t id) { return id != center; }))
-    return 0;
   IndexStorage::MemoryBlock center_block;
   const int center_ret = entity_.read_vector(center, center_block);
   if (center_ret != 0) return center_ret;
