@@ -4,6 +4,7 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#include <utility>
 #include <arrow/api.h>
 #include <arrow/compute/initialize.h>
 #include <arrow/io/api.h>
@@ -104,26 +105,31 @@ TEST(SegmentStreamTest, ReadySourceHonorsPressureBeforePullingMore) {
   ASSERT_TRUE(arrow::SetCpuThreadPoolCapacity(1).ok());
   auto restore = ailego::ScopeGuard::Make(
       [&] { EXPECT_TRUE(arrow::SetCpuThreadPoolCapacity(capacity).ok()); });
-  auto calls = std::make_shared<std::atomic<int>>(0);
-  auto plan = make_source(calls, std::make_shared<int>(1), false);
-  auto stream = plan->execute_to_generator(8192);
-  ASSERT_TRUE(stream);
-  auto barrier = arrow::internal::GetCpuThreadPool()->Submit([] {});
-  ASSERT_TRUE(barrier.ok());
-  barrier->Wait();
-  // Each source batch is 4 KiB. The one crossing the 8 KiB watermark is
-  // allowed, but no subsequent source read or delivery task may be queued.
-  EXPECT_LE(calls->load(), 3);
-  EXPECT_GT(calls->load(), 0);
-  size_t rows = 0;
-  for (;;) {
-    auto batch = (*stream)().result();
-    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
-    if (!*batch) break;
-    rows += (*batch)->length;
+  for (const auto &[limit, max_calls] :
+       {std::pair<size_t, int>{1, 1}, std::pair<size_t, int>{8192, 2}}) {
+    SCOPED_TRACE(limit);
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    auto plan = make_source(calls, std::make_shared<int>(1), false);
+    auto stream = plan->execute_to_generator(limit);
+    ASSERT_TRUE(stream);
+    auto barrier = arrow::internal::GetCpuThreadPool()->Submit([] {});
+    ASSERT_TRUE(barrier.ok());
+    barrier->Wait();
+    // Each batch is 4 KiB: pause at exactly two batches for an 8 KiB limit.
+    // A single oversized batch is allowed, and even a one-byte limit must
+    // resume after consumption so the entire scan can finish.
+    EXPECT_LE(calls->load(), max_calls);
+    EXPECT_GT(calls->load(), 0);
+    size_t rows = 0;
+    for (;;) {
+      auto batch = (*stream)().result();
+      ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+      if (!*batch) break;
+      rows += (*batch)->length;
+    }
+    EXPECT_EQ(200u * 1024, rows);
+    EXPECT_EQ(201, calls->load());
   }
-  EXPECT_EQ(200u * 1024, rows);
-  EXPECT_EQ(201, calls->load());
 }
 
 TEST(SegmentStreamTest, ReaderSourceDoesNotPrefetchPastPressure) {
@@ -201,10 +207,10 @@ TEST(SegmentStreamTest, DistinctBuffersAreBoundedAndReleased) {
       rows += (*batch)->length;
     }
     EXPECT_EQ(200 * kRows, rows);
-    // Up to three sink batches (including the watermark-crossing batch),
-    // one consumer-held batch and one in-progress builder. The builder also
+    // Up to two queued batches, one consumer-held batch, one completed Future
+    // still forwarding a batch, and one in-progress builder. The builder also
     // owns a validity bitmap until Finish(), even though these rows are all
-    // valid. Do not confuse that transient bitmap with another data batch.
+    // valid. Keep the same peak-byte bound while accounting for that lifetime.
     constexpr int64_t kValidityBytes = (kRows + 7) / 8;
     EXPECT_LE(memory.max_memory(), 5 * kBytes + kValidityBytes);
   }
