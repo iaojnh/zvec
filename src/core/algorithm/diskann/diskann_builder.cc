@@ -818,6 +818,31 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   graph_holder.reset();
   LOG_INFO("Finished saving vector");
 
+  bool codes_generated = false;
+  // FP32 L2 buffered builds otherwise perform thousands of random full-vector
+  // reads for every insertion. Reuse this index's existing PQ model and codes
+  // for traversal, then refine its bounded candidate set with exact distances.
+  // Externally supplied data quantizers retain their original distance path.
+  if (entity_.buffered_build() && !data_quantizer_ &&
+      build_meta_.data_type() == IndexMeta::DT_FP32 &&
+      build_meta_.metric_name() == "SquaredEuclidean" &&
+      pq_chunk_num_ < build_meta_.element_size()) {
+    try {
+      ret = generate_quantized_data(threads);
+    } catch (const std::bad_alloc &) {
+      ret = IndexError_NoMemory;
+    }
+    if (ret != 0 && ret != IndexError_NoMemory) return ret;
+    codes_generated = ret == 0;
+    if (codes_generated) {
+      ret = entity_.prepare_graph_quantization();
+      if (ret != 0 && ret != IndexError_NoMemory) return ret;
+    }
+    LOG_INFO(
+        "DiskANN graph PQ guidance: %s",
+        entity_.graph_quantization().quantizer ? "enabled" : "exact fallback");
+  }
+
   LOG_INFO("Start to calculate entrypoint");
   ret = calculate_entry_point();
   if (ailego_unlikely(ret != 0)) {
@@ -873,7 +898,7 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   algo_.reset();
   entity_.release_vectors();
   LOG_INFO("Start to generate quantized data");
-  ret = generate_quantized_data(threads);
+  ret = codes_generated ? 0 : generate_quantized_data(threads);
   if (ailego_unlikely(ret != 0)) {
     return ret;
   }

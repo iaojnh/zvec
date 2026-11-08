@@ -352,8 +352,27 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
 
   best_list_nodes.reserve(ctx->list_size());
 
+  const auto guidance = entity_.graph_quantization();
+  bool quantized = guidance.quantizer != nullptr;
+  if (quantized) {
+    if (!guidance.codes || guidance.code_size == 0) return IndexError_NoReady;
+    dc.bind_quantizer(guidance.quantizer, guidance.codes, guidance.code_size);
+    const int ret = dc.quantize_query(ctx->query());
+    if (ret == IndexError_NoMemory) {
+      dc.clear();
+      quantized = false;
+    } else if (ret != 0) {
+      return ret;
+    }
+  }
+
   for (auto id : init_ids) {
-    float distance = dc.dist(id);
+    float distance;
+    if (quantized) {
+      dc.quantized_dist(&id, 1, &distance);
+    } else {
+      distance = dc.dist(id);
+    }
     if (dc.error()) {
       return dc.error_code();
     }
@@ -387,7 +406,7 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
       }
     }
 
-    if (!entity_.prefer_vector_batch()) {
+    if (!quantized && !entity_.prefer_vector_batch()) {
       // Keep the in-memory builder's scalar fast path unchanged.
       for (diskann_id_t id : id_scratch) {
         const float distance = dc.dist(id);
@@ -401,7 +420,12 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
       const size_t count = std::min(DiskAnnEntity::kVectorReadBatchSize,
                                     id_scratch.size() - begin);
       std::array<dist_t, DiskAnnEntity::kVectorReadBatchSize> distances;
-      dc.dist_batch(id_scratch.data() + begin, count, distances.data());
+      if (quantized) {
+        dc.quantized_dist(id_scratch.data() + begin,
+                          static_cast<uint32_t>(count), distances.data());
+      } else {
+        dc.dist_batch(id_scratch.data() + begin, count, distances.data());
+      }
       if (dc.error()) {
         return dc.error_code();
       }
@@ -410,6 +434,24 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
         best_list_nodes.insert(Neighbor(id_scratch[begin + i], distances[i]));
       }
     }
+  }
+
+  // Approximate scores guide traversal only. Restore exact query distances
+  // and heap order before existing-neighbor union, robust pruning or repair.
+  if (quantized) {
+    for (size_t begin = 0; begin < expanded_nodes.size();
+         begin += DiskAnnEntity::kVectorReadBatchSize) {
+      const size_t count = std::min(DiskAnnEntity::kVectorReadBatchSize,
+                                    expanded_nodes.size() - begin);
+      std::array<diskann_id_t, DiskAnnEntity::kVectorReadBatchSize> ids;
+      std::array<dist_t, DiskAnnEntity::kVectorReadBatchSize> distances;
+      for (size_t i = 0; i < count; ++i) ids[i] = expanded_nodes[begin + i].id;
+      dc.dist_batch(ids.data(), count, distances.data());
+      if (dc.error()) return dc.error_code();
+      for (size_t i = 0; i < count; ++i)
+        expanded_nodes[begin + i].distance = distances[i];
+    }
+    std::make_heap(expanded_nodes.begin(), expanded_nodes.end());
   }
 
   return 0;

@@ -196,6 +196,7 @@ int DiskAnnBuilderEntity::init(const IndexMeta &meta, uint32_t max_degree,
 }
 
 void DiskAnnBuilderEntity::release_vectors() {
+  graph_codes_.clear();
   ailego::BudgetedVector<const void *>().swap(vector_ptrs_);
   vector_lifetime_.reset();
   if (buffered_state_) buffered_state_->release_vectors();
@@ -608,6 +609,31 @@ int DiskAnnBuilderEntity::append_codes(const void *data, size_t bytes) {
   }
   code_bytes_written_ += bytes;
   return 0;
+}
+
+int DiskAnnBuilderEntity::prepare_graph_quantization() try {
+  graph_codes_.clear();
+  if (!buffered_state_ || !pq_quantizer_ || doc_cnt() == 0 ||
+      pq_meta_.chunk_num == 0 ||
+      pq_meta_.chunk_num > std::numeric_limits<uint32_t>::max() ||
+      pq_quantizer_->quantized_datapoint_vector_length() != pq_meta_.chunk_num ||
+      doc_cnt() > std::numeric_limits<size_t>::max() / pq_meta_.chunk_num ||
+      code_bytes_ != doc_cnt() * pq_meta_.chunk_num ||
+      code_bytes_written_ != code_bytes_ || !buffered_state_->codes.is_valid())
+    return IndexError_NoReady;
+  ailego::BudgetedMappedBuffer codes(code_bytes_);
+  // Touch only the prepaid mapping, without another corpus-sized heap copy.
+  for (size_t offset = 0; offset < code_bytes_;) {
+    const size_t bytes = std::min<size_t>(1UL << 20, code_bytes_ - offset);
+    if (buffered_state_->codes.read(static_cast<ssize_t>(offset),
+                                    codes.data() + offset, bytes) != bytes)
+      return IndexError_ReadData;
+    offset += bytes;
+  }
+  graph_codes_.swap(codes);
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int64_t DiskAnnBuilderEntity::dump_segment(const IndexDumper::Pointer &dumper,

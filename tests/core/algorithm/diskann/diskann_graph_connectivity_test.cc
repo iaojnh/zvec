@@ -51,6 +51,9 @@ class ConnectivityEntity : public DiskAnnEntity {
     ++writes;
     return 0;
   }
+  GraphQuantization graph_quantization() const override {
+    return guidance;
+  }
 
   std::vector<std::array<float, 4>> vectors;
   std::vector<ailego::BudgetedVector<diskann_id_t>> graph;
@@ -58,6 +61,7 @@ class ConnectivityEntity : public DiskAnnEntity {
   diskann_id_t failed_read{kInvalidId};
   bool fail_write{false};
   size_t writes{0};
+  GraphQuantization guidance;
 };
 
 class DiskAnnGraphConnectivityTest : public testing::Test {
@@ -308,6 +312,59 @@ TEST_F(DiskAnnGraphConnectivityTest, WorkspaceIsChargedAndReleasedWithMapping) {
               pool.external_used());
   }
   EXPECT_EQ(before, pool.external_used());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       QuantizedTraversalRestoresExactPruneDistancesAndReadErrors) {
+  initialize(128, 8, 128);
+  for (diskann_id_t id = 1; id < 128; ++id) entity_->graph[0].push_back(id);
+  const auto original = entity_->graph;
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.add_node(65, context_.get()));
+  const auto expected = entity_->graph;
+
+  IndexMeta meta(IndexMeta::DT_FP32, 4);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto quantizer = IndexFactory::CreateQuantizer("PqInt8Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  ailego::Params params;
+  params.set("num_chunk", uint32_t{2});
+  params.set("thread_count", uint32_t{1});
+  params.set("precompute_sdc", false);
+  ASSERT_EQ(0, quantizer->init(meta, params));
+  auto holder = std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(4);
+  for (size_t id = 0; id < 128; ++id)
+    ASSERT_TRUE(holder->emplace(id, ailego::NumericalVector<float>(4, id)));
+  ASSERT_EQ(0, quantizer->train(holder));
+  std::vector<uint8_t> codes(128 * 2);
+  // Deliberately give traversal wrong scores. Its beam still visits this whole
+  // star, so exact refinement must recover the original pruning and graph.
+  for (size_t id = 0; id < 128; ++id)
+    quantizer->quantize_data(entity_->vectors[127 - id].data(),
+                             codes.data() + id * 2);
+  turbo::DistanceImpl approximate;
+  ASSERT_EQ(0, quantizer->prepare_distance(entity_->vectors[65].data(),
+                                           &approximate));
+  ASSERT_GT(approximate(codes.data() + 65 * 2), 0.0f);
+
+  context_->clear();
+  entity_->graph = original;
+  entity_->guidance = {quantizer.get(), codes.data(), 2};
+  ASSERT_EQ(0, algorithm.add_node(65, context_.get()));
+  EXPECT_EQ(expected, entity_->graph);
+  ASSERT_EQ(127u, context_->expanded_nodes().size());
+  for (const auto &candidate : context_->expanded_nodes()) {
+    const float difference = static_cast<float>(candidate.id) - 65.0f;
+    EXPECT_FLOAT_EQ(4.0f * difference * difference, candidate.distance);
+  }
+
+  context_->clear();
+  entity_->graph = original;
+  entity_->failed_vector = 64;
+  entity_->writes = 0;
+  EXPECT_EQ(IndexError_IO, algorithm.add_node(65, context_.get()));
+  EXPECT_EQ(original, entity_->graph);
+  EXPECT_EQ(0u, entity_->writes);
 }
 
 }  // namespace

@@ -21,6 +21,7 @@
 #include <thread>
 #include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
+#include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
@@ -211,6 +212,54 @@ TEST_F(DiskAnnBuilderEntityBufferTest, SealingRequiresCompleteVectorStaging) {
   IndexStorage::MemoryBlock block;
   ASSERT_EQ(0, entity.read_vector(1, block));
   EXPECT_EQ(0, std::memcmp(block.data(), vector, sizeof(vector)));
+}
+
+TEST_F(DiskAnnBuilderEntityBufferTest,
+       GraphCodesRequireCompleteInputAndChargeMappingBeforeAllocation) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  DiskAnnBuilderEntity entity;
+  constexpr uint32_t count = 4096;
+  constexpr uint32_t chunks = 384;
+  constexpr size_t code_bytes = static_cast<size_t>(count) * chunks;
+  initialize(&entity, 768, count);
+  EXPECT_EQ(IndexError_NoReady, entity.prepare_graph_quantization());
+  auto quantizer = IndexFactory::CreateQuantizer("PqInt8Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  IndexMeta meta(IndexMeta::DT_FP32, 768);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  ailego::Params params;
+  params.set("num_chunk", chunks);
+  params.set("precompute_sdc", false);
+  ASSERT_EQ(0, quantizer->init(meta, params));
+  entity.set_pq_quantizer(quantizer);
+  entity.mutable_pq_meta()->chunk_num = chunks;
+  std::vector<uint8_t> bytes(code_bytes);
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = i % 251;
+  ASSERT_EQ(0, entity.prepare_codes(code_bytes));
+  ASSERT_EQ(0, entity.append_codes(bytes.data(), code_bytes / 2));
+  EXPECT_EQ(IndexError_NoReady, entity.prepare_graph_quantization());
+  ASSERT_EQ(0, entity.append_codes(bytes.data() + code_bytes / 2, code_bytes / 2));
+
+  // The fixture admits only 1 MiB beyond mandatory writable metadata. A
+  // 1.5 MiB non-pageable code mapping cannot be admitted by evicting pages.
+  EXPECT_EQ(IndexError_NoMemory, entity.prepare_graph_quantization());
+  EXPECT_EQ(nullptr, entity.graph_quantization().quantizer);
+  // Sealing releases writable staging and metadata. Retry the identical
+  // codes within the same total budget, without raising its capacity.
+  ASSERT_EQ(0, entity.prepare_vectors_for_graph());
+
+  const size_t before = pool.external_used();
+  ASSERT_EQ(0, entity.prepare_graph_quantization());
+  EXPECT_EQ(before + ailego::BudgetedMappedBuffer::mapping_size(code_bytes),
+            pool.external_used());
+  const auto guidance = entity.graph_quantization();
+  EXPECT_EQ(quantizer.get(), guidance.quantizer);
+  ASSERT_NE(nullptr, guidance.codes);
+  EXPECT_EQ(chunks, guidance.code_size);
+  EXPECT_EQ(0, std::memcmp(bytes.data(), guidance.codes, code_bytes));
+  entity.release_vectors();
+  EXPECT_EQ(nullptr, entity.graph_quantization().quantizer);
+  EXPECT_EQ(nullptr, entity.graph_quantization().codes);
 }
 
 TEST_F(DiskAnnBuilderEntityBufferTest,

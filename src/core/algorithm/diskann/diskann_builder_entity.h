@@ -14,6 +14,7 @@
 #pragma once
 
 #include <atomic>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_holder.h>
 #include "diskann_entity.h"
@@ -98,6 +99,16 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   int prepare_codes(size_t bytes);
   int append_codes(const void *data, size_t bytes);
 
+  // Admit the already-generated PQ codes before graph workers start. The
+  // caller may keep the exact traversal if this optional mapping cannot fit.
+  int prepare_graph_quantization();
+  GraphQuantization graph_quantization() const override {
+    if (graph_codes_.size() == 0) return {};
+    return {pq_quantizer_.get(),
+            reinterpret_cast<const uint8_t *>(graph_codes_.data()),
+            static_cast<uint32_t>(pq_meta_.chunk_num)};
+  }
+
   // Graph construction is the only consumer of these vectors. PQ encoding
   // and dump read the retained source holder instead.
   void release_vectors();
@@ -137,6 +148,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   std::unique_ptr<BufferedBuildState> buffered_state_;
   size_t code_bytes_{0};
   size_t code_bytes_written_{0};
+  ailego::BudgetedMappedBuffer graph_codes_;
 
 
   std::string mem_index_file_{""};
