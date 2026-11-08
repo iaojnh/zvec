@@ -72,6 +72,7 @@ namespace core {
 // one context from consuming another context's completions.
 // IOContext is a pointer to IoBackend; nullptr means uninitialised.
 struct PendingBatch;
+struct BufferReadBatch;
 
 struct IoBackend {
   ailego::MemoryReservation memory;
@@ -85,6 +86,7 @@ struct IoBackend {
   const PendingBatch *aio_batch{nullptr};
   bool aio_active{false};
   bool aio_quarantined{false};
+  const PendingBatch *ring_batch{nullptr};
 #elif defined(_WIN32) || defined(_WIN64)
   std::array<OVERLAPPED, MAX_IO_DEPTH> reqs{};
   std::array<uint8_t, MAX_IO_DEPTH> active_requests{};
@@ -130,6 +132,7 @@ struct AlignedRead {
 #endif
 
 struct PendingBatch {
+  std::shared_ptr<BufferReadBatch> buffer;
 #if defined(__linux__) && !defined(__ANDROID__)
   ailego::BudgetedVector<struct iocb> cbs;
   ailego::BudgetedVector<struct iocb *> cb_ptrs;

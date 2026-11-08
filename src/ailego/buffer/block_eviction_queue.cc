@@ -850,18 +850,32 @@ size_t BlockEvictionQueue::recycle_inactive(size_t max_attempts) {
 }
 
 size_t BlockEvictionQueue::batch_recycle(size_t count) {
+  return batch_recycle_impl(count, count, count >= kProtectedAgingMinBatch);
+}
+
+size_t BlockEvictionQueue::reclaim_for_allocation(size_t bytes) {
+  if (!bytes) return 0;
+  const size_t page = MemoryLimitPool::page_buffer_size();
+  const size_t count =
+      std::min<size_t>(256, bytes / page + (bytes % page != 0));
+  // Keep the old mandatory-admission scan and protected aging behavior.
+  return batch_recycle_impl(count, 256, true);
+}
+
+size_t BlockEvictionQueue::batch_recycle_impl(size_t count, size_t scan_count,
+                                              bool age_protected) {
   // Small foreground reservations preserve the existing cost preference.
   // Larger pressure batches give inactive decoded payloads bounded CLOCK
   // attention, rather than letting them monopolize the pool indefinitely.
-  size_t evicted = count >= kProtectedAgingMinBatch ? recycle_inactive(8) : 0;
+  size_t evicted =
+      age_protected ? recycle_inactive(std::min<size_t>(8, count)) : 0;
   // Bound work when no page is currently evictable.
   const size_t max_attempts =
-      count > (std::numeric_limits<size_t>::max() - 16) / 4
+      scan_count > (std::numeric_limits<size_t>::max() - 16) / 4
           ? std::numeric_limits<size_t>::max()
-          : count * 4 + 16;
+          : scan_count * 4 + 16;
   size_t attempts = 0;
   bool recovered = false;
-  bool age_protected = count >= kProtectedAgingMinBatch;
   // Pinned entries are requeued. Do not spend the whole bounded scan on
   // those same low-priority entries while reclaimable decoded columns wait
   // in a higher-priority queue. Snapshot each tier and reserve scan work for
@@ -1972,7 +1986,8 @@ bool MemoryLimitPool::try_charge_fixed(const size_t buffer_size,
     }
 
     // Reclaim until the reservation fits or eviction stops making progress.
-    if (BlockEvictionQueue::get_instance().batch_recycle(256) == 0) {
+    if (BlockEvictionQueue::get_instance().reclaim_for_allocation(
+            buffer_size - available) == 0) {
       high_watermark_hits_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }

@@ -28,6 +28,7 @@
 #include "utility/ordinal_access_holder.h"
 #include "utility/paged_record_sort.h"
 #include "diskann_algorithm.h"
+#include "diskann_file_reader.h"
 #include "diskann_util.h"
 
 namespace zvec {
@@ -435,6 +436,125 @@ int DiskAnnBuilderEntity::read_vectors(const diskann_id_t *ids,
 } catch (const std::exception &) {
   for (size_t i = 0; i < count; ++i) blocks[i].reset();
   return IndexError_ReadData;
+}
+
+namespace {
+class BufferedVectorReader : public DiskAnnEntity::VectorReader {
+ public:
+  BufferedVectorReader(std::shared_ptr<ailego::VecBufferPool> pool,
+                       const std::string &path, size_t offset, size_t stride,
+                       size_t rows, ailego::MemoryReservation memory)
+      : memory_(std::move(memory)),
+        pool_(pool),
+        reader_(std::move(pool)),
+        offset_(offset),
+        stride_(stride),
+        rows_(rows) {
+    const int ret = reader_.open_from_pool(path);
+    if (ret) throw std::bad_alloc();
+  }
+  ~BufferedVectorReader() override {
+    reset();
+  }
+  int submit(const diskann_id_t *ids, size_t count) override try {
+    if (backing_ || !ids || !count ||
+        count > DiskAnnEntity::kVectorReadBatchSize)
+      return IndexError_InvalidArgument;
+    for (size_t i = 0; i < count; ++i)
+      if (ids[i] >= rows_) return IndexError_InvalidArgument;
+    bool resident = pool_->cache_enabled();
+    for (size_t i = 0; i < count && resident; ++i) {
+      const size_t first =
+          (offset_ + ids[i] * stride_) / ailego::kVectorPageSize;
+      for (size_t j = 0; j < stride_ / ailego::kVectorPageSize; ++j)
+        resident = resident && pool_->is_page_resident(first + j);
+    }
+    // A hot batch can be borrowed directly by read_vectors(). Do not replace
+    // that zero-copy path with an owned read-ahead arena and extra memcpy.
+    if (resident) return IndexError_NotImplemented;
+    ailego::MemoryReservation metadata;
+    metadata.add(sizeof(Backing) + 64);
+    backing_ = std::make_shared<Backing>();
+    backing_->memory.swap(metadata);
+    backing_->data.resize(count * stride_);
+    ailego::ReserveVectorCapacity(requests_, request_memory_, count);
+    ailego::ReserveVectorCapacity(completed_, request_memory_, count);
+    requests_.clear();
+    for (size_t i = 0; i < count; ++i)
+      requests_.emplace_back(offset_ + ids[i] * stride_, stride_,
+                             backing_->data.data() + i * stride_);
+    count_ = count;
+    const int ret = reader_.submit(batch_, requests_, ctx_);
+    if (ret) reset();
+    return ret;
+  } catch (const std::bad_alloc &) {
+    reset();
+    return IndexError_NoMemory;
+  }
+  int finish(IndexStorage::MemoryBlock *blocks, size_t count) override {
+    if (!backing_ || count != count_ || !blocks)
+      return IndexError_InvalidArgument;
+    while (batch_.n_reaped < batch_.n_submitted) {
+      const int ret = reader_.get_completed(batch_, ctx_, 1, completed_);
+      if (ret < 0) {
+        reset();
+        return ret;
+      }
+    }
+    for (size_t i = 0; i < count; ++i)
+      blocks[i] = IndexStorage::MemoryBlock::MakeSharedView(
+          backing_->data.data() + i * stride_, backing_);
+    backing_.reset();
+    batch_ = PendingBatch{};
+    return 0;
+  }
+
+ private:
+  void reset() {
+    reader_.release_io_ctx(ctx_);
+    destroy_io_ctx(ctx_);
+    batch_ = PendingBatch{};
+    backing_.reset();
+  }
+  struct Backing {
+    ailego::MemoryReservation memory;
+    ailego::BudgetedMappedBuffer data;
+  };
+  ailego::MemoryReservation memory_, request_memory_;
+  std::shared_ptr<ailego::VecBufferPool> pool_;
+  BufferPoolAlignedFileReader reader_;
+  IOContext ctx_{nullptr};
+  PendingBatch batch_;
+  std::shared_ptr<Backing> backing_;
+  std::vector<AlignedRead> requests_;
+  std::vector<uint32_t> completed_;
+  size_t offset_, stride_, rows_, count_{0};
+};
+}  // namespace
+
+std::unique_ptr<DiskAnnEntity::VectorReader>
+DiskAnnBuilderEntity::create_vector_reader() const try {
+  if (!buffered_state_ || !buffered_state_->vectors_sealed) return nullptr;
+  const auto &state = *buffered_state_;
+  const size_t page = ailego::kVectorPageSize;
+  const size_t offset = state.vectors->data_offset() + state.vector_prefix;
+  if (offset % page || state.vector_stride % page ||
+      state.vector_stride / page > MAX_IO_DEPTH / kVectorReadBatchSize)
+    return nullptr;
+  auto pool = state.vector_storage->vec_buffer_pool();
+  if (!pool) return nullptr;
+#if defined(__linux__) && !defined(__ANDROID__)
+  if (pool->io_backend_type() == ailego::IOBackendType::kPread) return nullptr;
+#elif !defined(_WIN32) && !defined(_WIN64)
+  return nullptr;
+#endif
+  ailego::MemoryReservation memory;
+  memory.add(sizeof(BufferedVectorReader));
+  return std::make_unique<BufferedVectorReader>(
+      std::move(pool), state.vector_path, offset, state.vector_stride,
+      doc_cnt(), std::move(memory));
+} catch (const std::bad_alloc &) {
+  return nullptr;
 }
 
 diskann_key_t DiskAnnBuilderEntity::get_key(diskann_id_t id) const {

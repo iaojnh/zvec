@@ -58,6 +58,7 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   bool prefer_vector_batch() const override {
     return buffered_build();
   }
+  std::unique_ptr<VectorReader> create_vector_reader() const override;
   int read_neighbors(
       diskann_id_t id,
       ailego::BudgetedVector<diskann_id_t> *neighbors) const override;

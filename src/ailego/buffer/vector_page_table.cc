@@ -1828,6 +1828,44 @@ bool VecBufferPool::acquire_pages(const block_id_t *page_ids, size_t count,
                             /*retry=*/writable_ ? 50 : 1);
 }
 
+VecBufferPool::ReadPageClaim VecBufferPool::claim_read_page(block_id_t id,
+                                                            char *&buffer) {
+  buffer = nullptr;
+  if (writable_ || !initialized_ || id >= page_table_.entry_num())
+    return ReadPageClaim::kBypass;
+  const auto claim = page_table_.try_claim_block_load(id);
+  if (claim != VectorPageTable::LoadClaimResult::kClaimed)
+    return ReadPageClaim::kJoin;
+  auto &memory = MemoryLimitPool::get_instance();
+  if (!memory.try_acquire_buffer(kVectorPageSize, buffer)) {
+    BlockEvictionQueue::get_instance().batch_recycle(1);
+    (void)memory.try_acquire_buffer(kVectorPageSize, buffer);
+  }
+  if (!buffer) {
+    (void)page_table_.cancel_block_load(id);
+    return ReadPageClaim::kBypass;
+  }
+  miss_count_.fetch_add(1, std::memory_order_relaxed);
+  return ReadPageClaim::kClaimed;
+}
+
+void VecBufferPool::cancel_read_page(block_id_t id, char *buffer) {
+  if (buffer)
+    MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize);
+  (void)page_table_.cancel_block_load(id);
+}
+
+void VecBufferPool::complete_read_page(block_id_t id, char *buffer,
+                                       const char *data) {
+  std::memcpy(buffer, data, kVectorPageSize);
+  char *page =
+      page_table_.publish_claimed_block(id, buffer, id * kVectorPageSize);
+  if (page)
+    page_table_.release_block(id);
+  else
+    cancel_read_page(id, buffer);
+}
+
 bool VecBufferPool::acquire_pages_impl(const block_id_t *page_ids, size_t count,
                                        char **pages, int retry,
                                        bool *allocation_failed) {
