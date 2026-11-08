@@ -1,0 +1,54 @@
+name: Buffer Pool IO diagnostic
+
+on:
+  push:
+    branches: [test/buffer-pool-io-diagnostic-20261108]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install fio and record runner storage
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fio
+          mkdir -p evidence
+          {
+            /usr/bin/fio --version
+            lscpu
+            df -hT "$RUNNER_TEMP" /mnt
+            lsblk -o NAME,KNAME,TYPE,FSTYPE,SIZE,ROTA,MOUNTPOINTS
+          } > evidence/environment.txt
+      - name: Compare page reads under the original hard memory limit
+        run: |
+          set -euo pipefail
+          root_dir="$RUNNER_TEMP/zvec-io-${{ github.run_id }}"
+          mounted_dir="/mnt/zvec-io-${{ github.run_id }}"
+          mkdir -p "$root_dir"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" "$mounted_dir"
+          python_path=$(command -v python3)
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit="zvec-io-diagnostic-${{ github.run_id }}" \
+            --property=MemoryMax=768M --property=MemorySwapMax=0 \
+            --property=LimitNOFILE=65536 \
+            --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+            "$python_path" .github/scripts/buffer_pool_system_limit.py \
+            805306368 evidence/cgroup.jsonl \
+            "$python_path" .github/scripts/buffer_pool_io_diagnostic.py \
+            "$root_dir" "$mounted_dir" "$GITHUB_WORKSPACE/evidence" \
+            2>&1 | tee evidence/diagnostic.log
+      - uses: ./.github/actions/upload-evidence
+        if: always()
+        with:
+          name: buffer-pool-io-diagnostic
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
