@@ -1,0 +1,12 @@
+name: Buffer Pool musl shutdown investigation
+
+on:
+  push:
+    branches: [test/buffer-pool-musl-shutdown-20261108]
+
+permissions:
+  contents: read
+
+jobs:
+  musllinux:
+    uses: ./.github/workflows/09-musllinux-build.yml

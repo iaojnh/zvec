@@ -40,7 +40,7 @@ jobs:
       # and ccache replaces hendrikmuhs/ccache-action, which ships a
       # glibc-linked binary that cannot run here.
       - name: Install system packages
-        run: apk add --no-cache ccache zstd
+        run: apk add --no-cache ccache zstd gdb
         shell: sh
 
       - name: Setup ccache
@@ -121,6 +121,23 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/ci-evidence"
           ctest --output-on-failure --no-tests=error --parallel "$NPROC" \
             --output-junit "$GITHUB_WORKSPACE/ci-evidence/native.xml"
+        shell: sh
+
+      - name: Capture shutdown crash backtraces
+        if: failure()
+        run: |
+          cd "$GITHUB_WORKSPACE/build"
+          test -x bin/invert_recall_test || exit 0
+          mkdir -p "$GITHUB_WORKSPACE/ci-evidence"
+          for attempt in 1 2 3; do
+            gdb -q -batch \
+              -ex 'set pagination off' \
+              -ex 'handle SIGSEGV stop print nopass' \
+              -ex run -ex 'thread apply all bt' \
+              --args bin/invert_recall_test --gtest_color=no \
+              > "$GITHUB_WORKSPACE/ci-evidence/shutdown-backtrace-$attempt.log" 2>&1
+            cat "$GITHUB_WORKSPACE/ci-evidence/shutdown-backtrace-$attempt.log"
+          done
         shell: sh
 
       - name: Run Python Tests
