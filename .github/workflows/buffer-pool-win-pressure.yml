@@ -65,13 +65,24 @@ jobs:
             --target diskann_graph_connectivity_test buffer_storage_write_test `
             2>&1 | Tee-Object -FilePath ci-evidence/build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run unchanged assertions with allocator diagnostics
+      - name: Run native contracts with allocator diagnostics
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force ci-evidence/gtest | Out-Null
+          $env:GTEST_OUTPUT = "xml:$env:GITHUB_WORKSPACE/ci-evidence/gtest/"
           ctest --test-dir build -C Release --output-on-failure --no-tests=error `
             -R '^(diskann_graph_connectivity_test|buffer_storage_write_test)$' `
             --output-junit "$env:GITHUB_WORKSPACE/ci-evidence/native.xml" `
             2>&1 | Tee-Object -FilePath ci-evidence/tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Repeat shared reserve contracts
+        shell: pwsh
+        run: |
+          & .\build\bin\buffer_storage_write_test.exe `
+            '--gtest_filter=BufferStorageWriteTest.ReadOnlyBatchPreserves*SharedCacheReserve' `
+            --gtest_repeat=20 --gtest_color=no `
+            "--gtest_output=xml:$env:GITHUB_WORKSPACE/ci-evidence/reserve-repeat.xml" `
+            2>&1 | Tee-Object -FilePath ci-evidence/reserve-repeat.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload native evidence
         if: always()
