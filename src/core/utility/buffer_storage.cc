@@ -35,6 +35,7 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_mapping.h>
 #include <zvec/core/framework/index_version.h>
+#include "reusable_read_scratch.h"
 #include "utility_params.h"
 
 namespace zvec {
@@ -280,9 +281,8 @@ class BufferStorage : public IndexStorage {
       std::array<char *, kResidentBatch> pages;
       std::array<size_t, kResidentBatch> indices, offsets;
       size_t pinned = 0;
-      AILEGO_DEFER([&] {
-        owner_->buffer_pool_->release_pages(ids.data(), pinned);
-      });
+      AILEGO_DEFER(
+          [&] { owner_->buffer_pool_->release_pages(ids.data(), pinned); });
       for (size_t i = 0; i < count; ++i) {
         const auto &request = reads[i];
         auto *segment = dynamic_cast<WrappedSegment *>(request.segment);
@@ -1079,16 +1079,26 @@ class BufferStorage : public IndexStorage {
       // from it, but let the allocator's thread cache handle small objects.
       static constexpr size_t kSmallSnapshotBytes = 512;
       size_t alloc_size = len;
-      MemoryBlock owned;
-      if (!immutable && len <= kSmallSnapshotBytes) {
-        owned = MemoryBlock::AllocateOwned(len);
-      } else {
+      const size_t alignment =
+          !immutable && len <= kSmallSnapshotBytes ? 0 : kBufferAlignment;
+      if (alignment) {
         if (ailego_unlikely(!AlignBufferSize(len, &alloc_size))) {
           return 0;
         }
-        owned = allocate_snapshot(alloc_size);
       }
-      auto *tmp = static_cast<char *>(owned.data_);
+      const bool reuse = data.can_reuse_scratch(len, alignment);
+      MemoryBlock owned;
+      if (!reuse) {
+        auto allocate = [&] {
+          return alignment ? allocate_snapshot(alloc_size)
+                           : MemoryBlock::AllocateOwned(alloc_size);
+        };
+        owned = owner_->cache_enabled_
+                    ? owner_->read_scratch_.acquire(alloc_size, alignment, true,
+                                                    allocate)
+                    : allocate();
+      }
+      auto *tmp = static_cast<char *>(reuse ? data.data_ : owned.data_);
       if (tmp == nullptr) {
         LOG_ERROR(
             "WrappedSegment::read: owned buffer allocation failed, file[%s], "
@@ -1096,11 +1106,11 @@ class BufferStorage : public IndexStorage {
             owner_->file_name_.c_str(), segment_id_->data(), abs_offset, len);
         return 0;
       }
-      bool read_ok =
-          force_bypass ? owner_->read_bypass(abs_offset, len, tmp)
-          : immutable ? owner_->buffer_pool_handle_->read_range_immutable(
-                            abs_offset, len, tmp)
-                      : owner_->read_range(abs_offset, len, tmp);
+      bool read_ok = force_bypass ? owner_->read_bypass(abs_offset, len, tmp)
+                     : immutable
+                         ? owner_->buffer_pool_handle_->read_range_immutable(
+                               abs_offset, len, tmp)
+                         : owner_->read_range(abs_offset, len, tmp);
       if (!read_ok && immutable && !force_bypass) {
         // A cross-page immutable read can lose a capacity race after choosing
         // the cache path. Retry without admission; writable bypass reads still
@@ -1108,14 +1118,15 @@ class BufferStorage : public IndexStorage {
         read_ok = owner_->read_bypass(abs_offset, len, tmp);
       }
       if (!read_ok) {
+        if (reuse) data.reset();
         LOG_ERROR(
             "WrappedSegment::read: owned read failed, file[%s], id[%s], "
             "abs_offset=%zu, len=%zu",
             owner_->file_name_.c_str(), segment_id_->data(), abs_offset, len);
         return 0;
       }
-      owned.scratch_size_ = len;
-      data = std::move(owned);
+      if (!reuse) data = std::move(owned);
+      data.scratch_size_ = len;
       return len;
     } catch (const std::bad_alloc &) {
       buffer_storage_read_error = IndexError_NoMemory;
@@ -1192,6 +1203,7 @@ class BufferStorage : public IndexStorage {
           std::make_shared<ailego::VecBufferPool>(path, writable);
       auto candidate_handle =
           std::make_shared<ailego::VecBufferPoolHandle>(candidate_pool);
+      read_scratch_.clear();
       file_name_ = path;
       buffer_pool_ = std::move(candidate_pool);
       buffer_pool_handle_ = std::move(candidate_handle);
@@ -1212,8 +1224,8 @@ class BufferStorage : public IndexStorage {
     const size_t page_count =
         file_size == 0 ? 0 : (file_size - 1) / ailego::kVectorPageSize + 1;
     const size_t metadata_bytes =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(
-            page_count, writable);
+        ailego::VecBufferPool::metadata_bytes_for_page_count(page_count,
+                                                             writable);
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t available = pool.available();
     size_t cache_budget = available;
@@ -1677,6 +1689,7 @@ class BufferStorage : public IndexStorage {
     // the page table reset under it, dropping the modification).
     AllShardsExclusiveLatch latch(mapping_shards_);
     flush_index_locked();
+    read_scratch_.clear();
     file_name_.clear();
     segments_.reset();
     decltype(meta_chains_)().swap(meta_chains_);
@@ -1990,8 +2003,8 @@ class BufferStorage : public IndexStorage {
  private:
   bool read_bypass(size_t offset, size_t len, char *out) const {
     bool allocation_failed = false;
-    const bool ok = buffer_pool_handle_->read_range_bypass(
-        offset, len, out, allocation_failed);
+    const bool ok = buffer_pool_handle_->read_range_bypass(offset, len, out,
+                                                           allocation_failed);
     if (allocation_failed) buffer_storage_read_error = IndexError_NoMemory;
     return ok;
   }
@@ -2006,6 +2019,7 @@ class BufferStorage : public IndexStorage {
   }
 
   std::atomic<bool> index_dirty_{false};
+  ReusableReadScratch read_scratch_;
   std::atomic<uint64_t> pending_check_point_{0};
   // Raised after an unrecoverable rollback; blocks writes until close.
   std::atomic<bool> corrupted_{false};
