@@ -5,8 +5,6 @@
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
-#include "turbo/quantizer/entropy_integer_quantizer/integer_quantizer.h"
-#include "turbo/algorithm/kmeans.h"
 #include "ailego/container/vector_array.h"
 #include "ailego/pattern/defer.h"
 #include "algorithm/ivf/ivf_dumper.h"
@@ -14,7 +12,9 @@
 #include "algorithm/ivf/ivf_searcher_context.h"
 #include "algorithm/ivf_rabitq/ivf_rabitq_context.h"
 #include "quantizer/rotator/rotator.h"
+#include "turbo/algorithm/kmeans.h"
 #include "turbo/preprocessor/fht_rotator/fht_rotator.h"
+#include "turbo/quantizer/entropy_integer_quantizer/integer_quantizer.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
@@ -22,6 +22,12 @@ namespace zvec::core {
 // therefore not a valid base class under MSVC.
 class IVFEntityTestPeer {
  public:
+  IVFEntity &entity() {
+    return entity_;
+  }
+  IndexStorage::Segment::Pointer &postings() {
+    return entity_.inverted_;
+  }
   void set_quantizer(turbo::Quantizer::Pointer quantizer) {
     entity_.quantizer_ = std::move(quantizer);
   }
@@ -52,6 +58,56 @@ class IVFEntityTestPeer {
 };
 
 namespace {
+// A real persisted list is bounded by the next list's recorded offset. Reject
+// reads crossing that boundary even when they are still inside the segment.
+class ListBoundedSegment : public IndexStorage::Segment {
+ public:
+  ListBoundedSegment(Pointer base, size_t end)
+      : base_(std::move(base)), end_(end) {}
+  size_t bytes{0};
+  size_t data_size() const override {
+    return base_->data_size();
+  }
+  size_t capacity() const override {
+    return base_->capacity();
+  }
+  size_t padding_size() const override {
+    return base_->padding_size();
+  }
+  uint32_t data_crc() const override {
+    return base_->data_crc();
+  }
+  size_t fetch(size_t off, void *out, size_t length) const override {
+    return base_->fetch(off, out, length);
+  }
+  size_t read(size_t off, IndexStorage::MemoryBlock &out,
+              size_t length) override {
+    bytes += length;
+    return off <= end_ && length <= end_ - off ? base_->read(off, out, length)
+                                               : 0;
+  }
+  size_t read_scatter(size_t off, ScatterBlock &out, size_t length) override {
+    bytes += length;
+    return off <= end_ && length <= end_ - off
+               ? base_->read_scatter(off, out, length)
+               : 0;
+  }
+  size_t write(size_t, const void *, size_t) override {
+    return 0;
+  }
+  size_t resize(size_t) override {
+    return 0;
+  }
+  void update_data_crc(uint32_t) override {}
+  Pointer clone() override {
+    return std::make_shared<ListBoundedSegment>(base_->clone(), end_);
+  }
+
+ private:
+  Pointer base_;
+  size_t end_;
+};
+
 class IVFWorkspaceBudgetTest : public testing::Test {
  protected:
   void SetUp() override {
@@ -65,6 +121,93 @@ class IVFWorkspaceBudgetTest : public testing::Test {
   ailego::PoolPayloadBudget &pool = ailego::PoolPayloadBudget::get_instance();
   size_t previous_{0};
 };
+
+TEST_F(IVFWorkspaceBudgetTest, PostingBatchesStopAtShortListTail) {
+  const auto path = (std::filesystem::temp_directory_path() /
+                     "zvec-ivf-short-list-read-test.index")
+                        .string();
+  AILEGO_DEFER([&] { std::filesystem::remove(path); });
+  for (auto order : {IndexMeta::MO_ROW, IndexMeta::MO_COLUMN}) {
+    for (uint32_t dimension : {5, 8}) {
+      // Cover a partial batch and a tail after a complete 16-block batch.
+      for (uint32_t count : {33, 545}) {
+        SCOPED_TRACE(testing::Message()
+                     << order << '/' << dimension << '/' << count);
+        IndexMeta meta(IndexMeta::DT_FP32, dimension);
+        meta.set_major_order(order);
+        meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+        {
+          auto file = IndexFactory::CreateDumper("FileDumper");
+          ASSERT_NE(nullptr, file);
+          ASSERT_EQ(0, file->init({}));
+          ASSERT_EQ(0, file->create(path));
+          IVFDumper dumper(meta, file, 2, 32);
+          ASSERT_EQ(0, dumper.reserve_keys(count + 65));
+          for (uint32_t key = 0; key < count + 65; ++key) {
+            std::vector<float> vector(dimension, static_cast<float>(key));
+            ASSERT_EQ(0, dumper.dump_inverted_vector(key < count ? 0 : 1, key,
+                                                     vector.data()));
+          }
+          ASSERT_EQ(0, dumper.dump_inverted_vector_finished());
+          ASSERT_EQ(0, file->close());
+        }
+        for (const char *name :
+             {"FileReadStorage", "MMapFileReadStorage", "BufferReadStorage"}) {
+          SCOPED_TRACE(name);
+          auto storage = IndexFactory::CreateStorage(name);
+          ASSERT_NE(nullptr, storage);
+          ASSERT_EQ(0, storage->init({}));
+          ASSERT_EQ(0, storage->open(path, false));
+          IVFEntityTestPeer peer;
+          auto &entity = peer.entity();
+          ASSERT_EQ(0, entity.load(storage));
+          IndexStorage::MemoryBlock first_block, next_block;
+          const auto *first = entity.inverted_list_meta(0, first_block);
+          const auto *next = entity.inverted_list_meta(1, next_block);
+          ASSERT_NE(nullptr, first);
+          ASSERT_NE(nullptr, next);
+          auto bounded = std::make_shared<ListBoundedSegment>(peer.postings(),
+                                                              next->offset);
+          peer.postings() = bounded;
+          const std::vector<float> query(dimension,
+                                         static_cast<float>(count - 1));
+          ASSERT_EQ(0, entity.bind_query(
+                           query.data(),
+                           IndexQueryMeta(IndexMeta::DT_FP32, dimension)));
+          IndexFilter filter;
+          filter.set([count](uint64_t key) { return key == count - 2; });
+          for (bool filtered : {false, true}) {
+            IndexCandidateHeap heap(3);
+            IndexContext::Stats stats;
+            uint32_t scanned = 0;
+            bounded->bytes = 0;
+            ASSERT_EQ(0, filtered ? entity.search(0, query.data(), filter,
+                                                  &scanned, &heap, &stats)
+                                  : entity.search(0, query.data(), &scanned,
+                                                  &heap, &stats))
+                << "postings_read_bytes=" << bounded->bytes
+                << ", list_end=" << next->offset;
+            EXPECT_EQ(count, scanned);
+            EXPECT_EQ(next->offset - first->offset, bounded->bytes);
+            std::vector<uint64_t> keys;
+            for (const auto &hit : heap.mutable_container()) {
+              keys.push_back(hit.key());
+              const float difference =
+                  static_cast<float>(count - 1 - hit.key());
+              EXPECT_FLOAT_EQ(dimension * difference * difference, hit.score());
+            }
+            std::sort(keys.begin(), keys.end());
+            const std::vector<uint64_t> expected =
+                filtered
+                    ? std::vector<uint64_t>{count - 4, count - 3, count - 1}
+                    : std::vector<uint64_t>{count - 3, count - 2, count - 1};
+            EXPECT_EQ(expected, keys);
+          }
+        }
+      }
+    }
+  }
+}
 
 TEST_F(IVFWorkspaceBudgetTest, FhtMasksAreAdmittedAndReleasedWithRotator) {
   std::shared_ptr<Rotator> rotator;
@@ -80,7 +223,8 @@ TEST_F(IVFWorkspaceBudgetTest, FhtMasksAreAdmittedAndReleasedWithRotator) {
   EXPECT_EQ(0u, pool.external_used());
 }
 
-TEST_F(IVFWorkspaceBudgetTest, TurboFhtContextRetainsChargeAndRejectsReplacement) {
+TEST_F(IVFWorkspaceBudgetTest,
+       TurboFhtContextRetainsChargeAndRejectsReplacement) {
   {
     ailego::MemoryReservation pressure;
     pressure.add(pool.capacity() - pool.used());
