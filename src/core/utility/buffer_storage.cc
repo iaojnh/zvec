@@ -25,6 +25,7 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -269,6 +270,59 @@ class BufferStorage : public IndexStorage {
       return read_borrowed_batch_impl(reads, count, /*immutable=*/true);
     }
 
+    bool try_read_resident_immutable(BorrowedRead *reads, size_t count) {
+      // The common DiskANN batch fits in bounded stack scratch. Retain the
+      // unique source pins until every output has acquired its own pin, so
+      // duplicate pages and aliased output blocks remain safe.
+      static constexpr size_t kResidentBatch = 32;
+      if (count > kResidentBatch) return false;
+      std::array<ailego::block_id_t, kResidentBatch> ids;
+      std::array<char *, kResidentBatch> pages;
+      std::array<size_t, kResidentBatch> indices, offsets;
+      size_t pinned = 0;
+      AILEGO_DEFER([&] {
+        owner_->buffer_pool_->release_pages(ids.data(), pinned);
+      });
+      for (size_t i = 0; i < count; ++i) {
+        const auto &request = reads[i];
+        auto *segment = dynamic_cast<WrappedSegment *>(request.segment);
+        if (!segment || segment->owner_ != owner_ || !request.block ||
+            request.offset > segment->data_size() ||
+            request.length > segment->data_size() - request.offset)
+          return false;
+        indices[i] = kResidentBatch;
+        if (!request.length) continue;
+        const size_t start = segment->data_offset();
+        if (request.offset > std::numeric_limits<size_t>::max() - start)
+          return false;
+        const size_t absolute = start + request.offset;
+        const size_t offset = absolute % ailego::kVectorPageSize;
+        if (request.length > ailego::kVectorPageSize - offset) return false;
+        const auto id = absolute / ailego::kVectorPageSize;
+        size_t index = 0;
+        while (index < pinned && ids[index] != id) ++index;
+        if (index == pinned) {
+          char *page = owner_->buffer_pool_->try_acquire_buffer(id);
+          if (!page) return false;
+          ids[pinned] = id;
+          pages[pinned++] = page;
+        }
+        indices[i] = index;
+        offsets[i] = offset;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        const size_t index = indices[i];
+        if (index == kResidentBatch) {
+          reads[i].block->reset();
+          continue;
+        }
+        owner_->buffer_pool_handle_->acquire_one(ids[index]);
+        reads[i].block->reset(owner_->buffer_pool_handle_.get(), ids[index],
+                              pages[index] + offsets[i]);
+      }
+      return true;
+    }
+
     bool read_borrowed_batch_impl(BorrowedRead *reads, size_t count,
                                   bool immutable) try {
       buffer_storage_read_error = IndexError_ReadData;
@@ -289,6 +343,10 @@ class BufferStorage : public IndexStorage {
                                                                           count)
                    : IndexStorage::Segment::read_borrowed_batch(reads, count);
       }
+
+      if ((immutable || !owner_->buffer_pool_->writable()) &&
+          try_read_resident_immutable(reads, count))
+        return true;
 
       // Copied results share one bounded allocation. Only returned slices
       // retain its budget; an idle thread must not keep result bytes alive.
