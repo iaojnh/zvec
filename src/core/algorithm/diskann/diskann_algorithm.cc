@@ -355,8 +355,10 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
   const auto guidance = entity_.graph_quantization();
   bool quantized = guidance.quantizer != nullptr;
   if (quantized) {
-    if (!guidance.codes || guidance.code_size == 0) return IndexError_NoReady;
-    dc.bind_quantizer(guidance.quantizer, guidance.codes, guidance.code_size);
+    if ((!guidance.codes && !guidance.paged_codes) || guidance.code_size == 0)
+      return IndexError_NoReady;
+    dc.bind_quantizer(guidance.quantizer, guidance.codes, guidance.code_size,
+                      guidance.paged_codes);
     const int ret = dc.quantize_query(ctx->query());
     if (ret == IndexError_NoMemory) {
       dc.clear();

@@ -7,6 +7,7 @@
 #include <memory>
 #include <vector>
 #include <gtest/gtest.h>
+#include "utility/temporary_buffer_storage.h"
 #include "diskann_algorithm.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
@@ -347,24 +348,42 @@ TEST_F(DiskAnnGraphConnectivityTest,
                                            &approximate));
   ASSERT_GT(approximate(codes.data() + 65 * 2), 0.0f);
 
-  context_->clear();
-  entity_->graph = original;
-  entity_->guidance = {quantizer.get(), codes.data(), 2};
-  ASSERT_EQ(0, algorithm.add_node(65, context_.get()));
-  EXPECT_EQ(expected, entity_->graph);
-  ASSERT_EQ(127u, context_->expanded_nodes().size());
-  for (const auto &candidate : context_->expanded_nodes()) {
-    const float difference = static_cast<float>(candidate.id) - 65.0f;
-    EXPECT_FLOAT_EQ(4.0f * difference * difference, candidate.distance);
-  }
+  for (const bool paged : {false, true}) {
+    SCOPED_TRACE(paged);
+    TemporaryBufferStorage::Pointer code_storage;
+    context_->clear();
+    entity_->graph = original;
+    entity_->failed_vector = kInvalidId;
+    entity_->guidance = {quantizer.get(), codes.data(), 2};
+    if (paged) {
+      std::string prefix;
+      ASSERT_EQ(0, TemporaryBufferStorage::DefaultPrefix(
+                       "zvec-diskann-graph-codes-test", &prefix));
+      ASSERT_EQ(0, TemporaryBufferStorage::Create(prefix, codes.size(),
+                                                  &code_storage));
+      ASSERT_EQ(0, code_storage->write(0, codes.data(), codes.size()));
+      entity_->guidance.codes = nullptr;
+      entity_->guidance.paged_codes = code_storage->storage()->get("data");
+      ASSERT_NE(nullptr, entity_->guidance.paged_codes);
+    }
+    ASSERT_EQ(0, algorithm.add_node(65, context_.get()));
+    EXPECT_EQ(expected, entity_->graph);
+    ASSERT_EQ(127u, context_->expanded_nodes().size());
+    for (const auto &candidate : context_->expanded_nodes()) {
+      const float difference = static_cast<float>(candidate.id) - 65.0f;
+      EXPECT_FLOAT_EQ(4.0f * difference * difference, candidate.distance);
+    }
 
-  context_->clear();
-  entity_->graph = original;
-  entity_->failed_vector = 64;
-  entity_->writes = 0;
-  EXPECT_EQ(IndexError_IO, algorithm.add_node(65, context_.get()));
-  EXPECT_EQ(original, entity_->graph);
-  EXPECT_EQ(0u, entity_->writes);
+    context_->clear();
+    entity_->graph = original;
+    entity_->failed_vector = 64;
+    entity_->writes = 0;
+    EXPECT_EQ(IndexError_IO, algorithm.add_node(65, context_.get()));
+    EXPECT_EQ(original, entity_->graph);
+    EXPECT_EQ(0u, entity_->writes);
+    context_->clear();
+    entity_->guidance = {};
+  }
 }
 
 }  // namespace
