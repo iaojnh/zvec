@@ -983,8 +983,19 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     //! Read vectors after keys. A resident scatter read pins no pages while a
     //! second segment is faulted into a small buffer pool.
     const size_t off = list_meta->offset + i * block_size;
+    if (items <= (blocks - 1) * block_vecs) {
+      return IndexError_InvalidFormat;
+    }
+    // Plain posting tails contain only their live vectors and 32-byte
+    // padding. Reading a full stride here would fault pages of the next list.
+    // Packed quantizers intentionally persist a full final block.
+    const size_t tail_vectors = items - (blocks - 1) * block_vecs;
+    const size_t serialized_bytes =
+        (blocks - 1) * block_size +
+        (packed_quantizer_ ? block_size
+                           : ailego_align(tail_vectors * element_size, 32));
     const size_t size =
-        std::min(blocks * block_size,
+        std::min(serialized_bytes,
                  static_cast<size_t>(header_.inverted_body_size - off));
     IndexStorage::Segment::ScatterBlock scatter_data;
     if (row_major) {
@@ -1112,8 +1123,19 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
 
     //! Read vectors after keys so scatter-page pins cover computation only.
     const size_t off = list_meta->offset + i * block_size;
+    if (items <= (blocks - 1) * block_vecs) {
+      return IndexError_InvalidFormat;
+    }
+    // Plain posting tails contain only their live vectors and 32-byte
+    // padding. Reading a full stride here would fault pages of the next list.
+    // Packed quantizers intentionally persist a full final block.
+    const size_t tail_vectors = items - (blocks - 1) * block_vecs;
+    const size_t serialized_bytes =
+        (blocks - 1) * block_size +
+        (packed_quantizer_ ? block_size
+                           : ailego_align(tail_vectors * element_size, 32));
     const size_t size =
-        std::min(blocks * block_size,
+        std::min(serialized_bytes,
                  static_cast<size_t>(header_.inverted_body_size - off));
     IndexStorage::Segment::ScatterBlock scatter_data;
     if (row_major) {
