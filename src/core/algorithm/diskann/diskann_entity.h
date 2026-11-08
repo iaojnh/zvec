@@ -150,6 +150,14 @@ class DiskAnnEntity {
     return {};
   }
 
+  class VectorReader {
+   public:
+    virtual ~VectorReader() = default;
+    // NotImplemented requests the normal borrowed read (e.g. a hot batch).
+    // NoMemory requests a smaller synchronous working set.
+    virtual int submit(const diskann_id_t *ids, size_t count) = 0;
+    virtual int finish(IndexStorage::MemoryBlock *blocks, size_t count) = 0;
+  };
   DiskAnnEntity() = default;
   virtual ~DiskAnnEntity() = default;
 
@@ -308,6 +316,11 @@ class DiskAnnEntity {
   virtual const DiskAnnEntity::Pointer clone() const {
     LOG_ERROR("Update neighbors not implemented");
     return DiskAnnEntity::Pointer();
+  }
+
+  // Optional bounded read-ahead. Unsupported layouts keep read_vectors().
+  virtual std::unique_ptr<VectorReader> create_vector_reader() const {
+    return nullptr;
   }
 
  public:

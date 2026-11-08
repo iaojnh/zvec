@@ -48,6 +48,7 @@ class DistCalculator {
   void update(const DiskAnnEntity *entity, const IndexMeta &meta,
               const IndexMetric::Pointer &measure,
               const turbo::Quantizer::Pointer &data_quantizer = nullptr) {
+    vector_reader_.reset();
     entity_ = entity;
     bind_distance(meta, measure, data_quantizer);
     dim_ = meta.dimension();
@@ -121,6 +122,64 @@ class DistCalculator {
     return dist(lhs_block.data(), rhs_block.data());
   }
 
+  inline dist_t dist(const IndexStorage::MemoryBlock &lhs,
+                     const IndexStorage::MemoryBlock &rhs) {
+    compare_cnt_++;
+    return dist(lhs.data(), rhs.data());
+  }
+
+  // Compare one center with a bounded neighbor batch. Keeping the center
+  // alive avoids re-reading it, and cold neighbors can share one I/O submit.
+  // Optional batch scratch must not make a two-vector operation fail.
+  void dist_batch(diskann_id_t center, const diskann_id_t *ids, size_t count,
+                  dist_t *distances,
+                  IndexStorage::MemoryBlock *retained = nullptr,
+                  const IndexStorage::MemoryBlock *retained_center = nullptr) {
+    if (count == 0) return;
+    if (!ids || !distances || count > DiskAnnEntity::kVectorReadBatchSize) {
+      error_code_ = IndexError_InvalidArgument;
+      return;
+    }
+    IndexStorage::MemoryBlock center_block;
+    error_code_ =
+        retained_center ? 0 : entity_->read_vector(center, center_block);
+    if (error_code_ != 0) return;
+    const auto &anchor = retained_center ? *retained_center : center_block;
+    if (!anchor.data()) {
+      error_code_ = IndexError_ReadData;
+      return;
+    }
+
+    std::array<IndexStorage::MemoryBlock, DiskAnnEntity::kVectorReadBatchSize>
+        scratch;
+    auto *blocks = retained ? retained : scratch.data();
+    try {
+      error_code_ = entity_->read_vectors(ids, blocks, count);
+    } catch (const std::bad_alloc &) {
+      error_code_ = IndexError_NoMemory;
+    }
+    if (error_code_ == IndexError_NoMemory) {
+      for (size_t i = 0; i < count; ++i) blocks[i].reset();
+      // Drop earlier optional cache entries before retrying with two vectors.
+      // No distances have been computed for this batch yet.
+      if (retained) return;
+      error_code_ = 0;
+      for (size_t i = 0; i < count; ++i) {
+        IndexStorage::MemoryBlock block;
+        error_code_ = entity_->read_vector(ids[i], block);
+        if (error_code_ != 0) return;
+        distances[i] = dist(anchor, block);
+        if (error()) return;
+      }
+      return;
+    }
+    if (error()) return;
+    for (size_t i = 0; i < count; ++i) {
+      distances[i] = dist(anchor, blocks[i]);
+      if (error()) return;
+    }
+  }
+
   void dist_batch(const diskann_id_t *ids, size_t count, dist_t *distances) {
     std::array<IndexStorage::MemoryBlock, DiskAnnEntity::kVectorReadBatchSize>
         blocks;
@@ -130,6 +189,74 @@ class DistCalculator {
       distances[i] = dist(blocks[i].data());
       if (error()) return;
     }
+  }
+
+  // Prefetch only the next known batch while the consumer calculates the
+  // current one. Preserve visit/comparison order and a bounded working set.
+  template <class Consume>
+  int visit_vector_batches(const diskann_id_t *ids, size_t total,
+                           Consume consume) {
+    if (!total) return 0;
+    if (!ids) return error_code_ = IndexError_InvalidArgument;
+    if (!vector_reader_ && total > DiskAnnEntity::kVectorReadBatchSize) {
+      try {
+        vector_reader_ = entity_->create_vector_reader();
+      } catch (const std::bad_alloc &) {
+        vector_reader_.reset();
+      }
+    }
+    bool pending = false;
+    const auto cancel = ailego::ScopeGuard::Make([&] {
+      if (pending) vector_reader_.reset();
+    });
+    std::array<IndexStorage::MemoryBlock, DiskAnnEntity::kVectorReadBatchSize>
+        blocks;
+    for (size_t begin = 0; begin < total;) {
+      const size_t count = std::min(blocks.size(), total - begin);
+      int ret;
+      if (pending) {
+        ret = vector_reader_->finish(blocks.data(), count);
+        pending = false;
+      } else {
+        try {
+          ret = entity_->read_vectors(ids + begin, blocks.data(), count);
+        } catch (const std::bad_alloc &) {
+          ret = IndexError_NoMemory;
+        }
+      }
+      if (ret == IndexError_NoMemory) {
+        vector_reader_.reset();
+        for (auto &block : blocks) block.reset();
+        // Optional buffering must yield to the original one-vector read.
+        for (size_t i = 0; i < count; ++i) {
+          IndexStorage::MemoryBlock block;
+          ret = entity_->read_vector(ids[begin + i], block);
+          if (ret) return error_code_ = ret;
+          ret = consume(ids + begin + i, &block, size_t{1});
+          if (ret) return error_code_ = ret;
+        }
+        begin += count;
+        continue;
+      }
+      if (ret) return error_code_ = ret;
+      const size_t next = begin + count;
+      if (vector_reader_ && next < total) {
+        const size_t size = std::min(blocks.size(), total - next);
+        ret = vector_reader_->submit(ids + next, size);
+        if (ret == IndexError_NoMemory)
+          vector_reader_.reset();
+        else if (ret == IndexError_NotImplemented) {
+        } else if (ret)
+          return error_code_ = ret;
+        else
+          pending = true;
+      }
+      ret = consume(ids + begin, blocks.data(), count);
+      if (ret) return error_code_ = ret;
+      for (auto &block : blocks) block.reset();
+      begin = next;
+    }
+    return 0;
   }
 
   dist_t operator()(const void *vec) {
@@ -325,6 +452,7 @@ class DistCalculator {
 
  private:
   const DiskAnnEntity *entity_;
+  std::unique_ptr<DiskAnnEntity::VectorReader> vector_reader_;
 
   turbo::Quantizer::Pointer data_quantizer_{};
 

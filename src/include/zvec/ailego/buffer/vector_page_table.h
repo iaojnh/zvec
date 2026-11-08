@@ -650,6 +650,13 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Pin scattered pages; roll back all pins on failure.
   bool acquire_pages(const block_id_t *page_ids, size_t count, char **pages);
 
+  // Optional read-only cache installation for an external asynchronous read.
+  // A claimed buffer is charged and not visible until complete_read_page().
+  enum class ReadPageClaim { kClaimed, kJoin, kBypass };
+  ReadPageClaim claim_read_page(block_id_t page_id, char *&buffer);
+  void complete_read_page(block_id_t page_id, char *buffer, const char *data);
+  void cancel_read_page(block_id_t page_id, char *buffer);
+
   //! Release one pin per page id acquired by acquire_pages().
   void release_pages(const block_id_t *page_ids, size_t count);
 

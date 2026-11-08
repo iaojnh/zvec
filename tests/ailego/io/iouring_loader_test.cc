@@ -14,9 +14,11 @@
 
 #if (defined(__linux) || defined(__linux__)) && !defined(__ANDROID__)
 
+#include <fcntl.h>
 #include <unistd.h>
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +34,23 @@ namespace zvec {
 namespace ailego {
 class IoUringStagingTestPeer {
  public:
+  static void bind_async(IoUringRing &ring, int fd, io_uring_sqe *submissions,
+                         io_uring_cqe *completions, unsigned *indices,
+                         unsigned *sq_tail, unsigned *cq_head,
+                         unsigned *cq_tail, unsigned *mask,
+                         int (*enter)(int, unsigned, unsigned, unsigned)) {
+    ring.ring_fd_ = ::dup(fd);
+    ring.sq_entries_ = 4;
+    ring.sq_tail_ = sq_tail;
+    ring.sq_ring_mask_ = mask;
+    ring.sq_array_ = indices;
+    ring.sqes_ = submissions;
+    ring.cq_head_ = cq_head;
+    ring.cq_tail_ = cq_tail;
+    ring.cq_ring_mask_ = mask;
+    ring.cqes_ = completions;
+    ring.enter_override_ = enter;
+  }
   static void *data(const IoUringRing &ring) {
     return ring.staging_;
   }
@@ -88,6 +107,108 @@ class IoUringLoaderTest : public testing::Test {
   PoolPayloadBudget &pool_ = PoolPayloadBudget::get_instance();
   size_t old_capacity_{0};
 };
+
+struct FakeAsyncRing {
+  std::array<io_uring_sqe, 4> submissions{};
+  std::array<io_uring_cqe, 4> completions{};
+  unsigned indices[4]{0, 1, 2, 3};
+  unsigned tail{0}, head{0}, complete_tail{0}, mask{3}, accepted{0};
+  bool partial_failure{false}, short_read{false};
+  static FakeAsyncRing *active;
+  static int enter(int, unsigned count, unsigned minimum, unsigned) {
+    auto &queue = *active;
+    if (count) {
+      if (queue.partial_failure && queue.accepted) {
+        errno = EIO;
+        return -1;
+      }
+      const unsigned submitted = queue.partial_failure ? 1 : count;
+      queue.accepted += submitted;
+      return submitted;
+    }
+    if (minimum && queue.complete_tail == 0) {
+      // Deliberately complete in reverse order. submit() never waits here.
+      for (unsigned n = 0; n < queue.accepted; ++n) {
+        const unsigned i = queue.accepted - n - 1;
+        const auto &request = queue.submissions[i];
+        std::memset(reinterpret_cast<void *>(request.addr),
+                    0x31 + request.off / 512, request.len);
+        queue.completions[n].user_data = request.user_data;
+        queue.completions[n].res =
+            queue.short_read && n == 0 ? request.len - 1 : request.len;
+      }
+      queue.complete_tail = queue.accepted;
+    }
+    return 0;
+  }
+  void bind(IoUringRing &ring, int fd) {
+    active = this;
+    IoUringStagingTestPeer::bind_async(ring, fd, submissions.data(),
+                                       completions.data(), indices, &tail,
+                                       &head, &complete_tail, &mask, enter);
+  }
+};
+FakeAsyncRing *FakeAsyncRing::active = nullptr;
+
+TEST_F(IoUringLoaderTest, AsyncSubmissionDefersCopiesAndReportsCompletionIds) {
+  const int fd = ::open("/dev/null", O_RDONLY);
+  ASSERT_GE(fd, 0);
+  const auto close_fd = ScopeGuard::Make([&] { ::close(fd); });
+  FakeAsyncRing queue;
+  IoUringRing ring;
+  queue.bind(ring, fd);
+  alignas(4096) std::array<unsigned char, 1024> output{};
+  const std::array<IoUringRead, 2> reads{
+      {{0, 512, output.data()}, {512, 512, output.data() + 512}}};
+  ASSERT_EQ(0, ring.submit_reads(fd, reads.data(), reads.size()));
+  EXPECT_TRUE(ring.has_pending_reads());
+  EXPECT_EQ(0u, queue.complete_tail);
+  EXPECT_EQ(0, output[0]);
+  EXPECT_FALSE(ring.ensure_staging(8192));
+  EXPECT_NE(0, ring.execute(fd, reads.data(), reads.size()));
+  EXPECT_NE(0, ring.submit_reads(fd, reads.data(), reads.size()));
+  std::array<uint32_t, 2> completed{};
+  EXPECT_EQ(0, ring.get_completed_reads(0, completed.data(), completed.size()));
+  ASSERT_EQ(2, ring.get_completed_reads(1, completed.data(), completed.size()));
+  EXPECT_EQ((std::array<uint32_t, 2>{{1, 0}}), completed);
+  EXPECT_EQ(0x31, output[0]);
+  EXPECT_EQ(0x32, output[512]);
+  EXPECT_FALSE(ring.has_pending_reads());
+  EXPECT_EQ(0u, pool_.used());
+}
+
+TEST_F(IoUringLoaderTest, AsyncCancellationAndShortReadsReleaseAllBacking) {
+  const int fd = ::open("/dev/null", O_RDONLY);
+  ASSERT_GE(fd, 0);
+  const auto close_fd = ScopeGuard::Make([&] { ::close(fd); });
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    FakeAsyncRing queue;
+    queue.partial_failure = mode == 1;
+    queue.short_read = mode == 2;
+    IoUringRing ring;
+    queue.bind(ring, fd);
+    alignas(4096) std::array<unsigned char, 1024> output{};
+    const std::array<IoUringRead, 2> reads{
+        {{0, 512, output.data()}, {512, 512, output.data() + 512}}};
+    const int submitted = ring.submit_reads(fd, reads.data(), reads.size());
+    if (mode == 1)
+      EXPECT_NE(0, submitted);
+    else {
+      ASSERT_EQ(0, submitted);
+      if (mode == 0)
+        ring.cancel_reads();
+      else {
+        std::array<uint32_t, 2> completed{};
+        EXPECT_LT(ring.get_completed_reads(1, completed.data(), 2), 0);
+      }
+    }
+    EXPECT_FALSE(ring.has_pending_reads());
+    EXPECT_EQ(0, output[0]);
+    EXPECT_EQ(0, output[512]);
+    EXPECT_EQ(0u, pool_.used());
+  }
+}
 
 TEST_F(IoUringLoaderTest, StagingGrowthChargesOverlapAndCanRetry) {
   const size_t kPage = PoolPayloadBudget::page_buffer_size();
