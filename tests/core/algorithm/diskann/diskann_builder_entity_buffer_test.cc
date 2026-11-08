@@ -251,8 +251,14 @@ TEST_F(DiskAnnBuilderEntityBufferTest,
   ASSERT_EQ(0, entity.append_codes(bytes.data() + code_bytes / 2, code_bytes / 2));
 
   {
-    ailego::MemoryReservation pressure;
-    pressure.add(pool.capacity() - pool.used());
+    // Free logical capacity excludes evictable pages and optional I/O staging;
+    // reserving that snapshot need not exhaust admission after reclamation.
+    // An RSS ceiling below the live process deterministically refuses the
+    // new code store without relying on background eviction timing.
+    auto &actual = ailego::MemoryLimitPool::get_instance();
+    const size_t previous_rss_limit = actual.process_rss_limit();
+    actual.configure_process_rss_limit(1);
+    AILEGO_DEFER([&] { actual.configure_process_rss_limit(previous_rss_limit); });
     EXPECT_EQ(IndexError_NoMemory, entity.prepare_graph_quantization());
   }
   EXPECT_EQ(nullptr, entity.graph_quantization().quantizer);
