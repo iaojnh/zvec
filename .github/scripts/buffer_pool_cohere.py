@@ -280,6 +280,7 @@ def run(kind, storage, data, path, evidence, role="candidate"):
         else None
     )
     observe = partial(sample, evidence, limit_kib=limit_kib)
+    configured_memory_mib = budget_mib if storage == "buffer" else None
     observe("calibration", **control, role=role)
     observe(
         "start",
@@ -288,10 +289,16 @@ def run(kind, storage, data, path, evidence, role="candidate"):
         rows=ROWS,
         dimension=DIMENSION,
         budget_mib=budget_mib,
+        configured_memory_limit_mb=configured_memory_mib,
         rss_limit_kib=limit_kib,
         min_recall=MIN_RECALL,
     )
-    zvec.init(memory_limit_mb=budget_mib, query_threads=4, optimize_threads=1)
+    # Apply the Buffer Pool target only to its measured path. For the mmap
+    # reference, both versions auto-size within the same external cgroup cap.
+    # Its mapped-file RSS is outside the Buffer Pool RSS acceptance contract.
+    zvec.init(
+        memory_limit_mb=configured_memory_mib, query_threads=4, optimize_threads=1
+    )
     queries, neighbors = workload(data)
     mmap = storage == "mmap"
     probes = build(
@@ -380,7 +387,11 @@ def run(kind, storage, data, path, evidence, role="candidate"):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "_crash":
         path, mmap, fixture, budget, limit, output = sys.argv[2:]
-        zvec.init(memory_limit_mb=int(budget), query_threads=4, optimize_threads=1)
+        zvec.init(
+            memory_limit_mb=None if bool(int(mmap)) else int(budget),
+            query_threads=4,
+            optimize_threads=1,
+        )
         probes = json.loads(Path(fixture).read_text())
         first = next(iter(probes))
         writer = zvec.open(path, zvec.CollectionOption(enable_mmap=bool(int(mmap))))
