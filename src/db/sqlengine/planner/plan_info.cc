@@ -56,7 +56,10 @@ class BoundedSource : public arrow::acero::ExecNode {
                 const arrow::acero::SourceNodeOptions &options)
       : ExecNode(plan, {}, {}, options.output_schema),
         generator_(options.generator),
-        ordering_(options.ordering) {}
+        ordering_(options.ordering) {
+    if (auto *async = dynamic_cast<const AsyncSourceNodeOptions *>(&options))
+      finish_ = async->finish;
+  }
   const char *kind_name() const override {
     return "ZvecBoundedSource";
   }
@@ -85,12 +88,20 @@ class BoundedSource : public arrow::acero::ExecNode {
           options);
     }).AddCallback([this, done](const arrow::Result<int> &result) mutable {
       auto status = result.status();
-      // Release the input owner before publishing completion. In particular,
-      // dropping a SegmentNode cancels its child stream; retaining it until
-      // ExecPlan destruction can defer Segment::close() into process teardown.
-      generator_ = {};
-      if (status.ok()) status = output_->InputFinished(this, *result);
-      done.MarkFinished(status);
+      auto finished = finish_ ? finish_() : arrow::Future<>::MakeFinished();
+      finished.AddCallback(
+          [this, done, status, count = result.ok() ? *result : 0](
+              const arrow::Status &cleanup) mutable {
+            // Child cancellation is part of this source's external task.
+            // Releasing a child generator without awaiting it lets
+            // Segment::close() race with global Arrow/RocksDB destruction after
+            // the caller has returned.
+            generator_ = {};
+            finish_ = {};
+            if (status.ok()) status = cleanup;
+            if (status.ok()) status = output_->InputFinished(this, count);
+            done.MarkFinished(status);
+          });
     });
     return arrow::Status::OK();
   }
@@ -189,6 +200,7 @@ class BoundedSource : public arrow::acero::ExecNode {
     return output_->InputReceived(this, std::move(batch));
   }
   arrow::AsyncGenerator<Batch> generator_;
+  std::function<arrow::Future<>()> finish_;
   arrow::compute::Ordering ordering_;
   std::mutex mutex_;
   bool stopped_{false};
@@ -273,6 +285,17 @@ class AsyncPlanStream {
   bool started{false};
 };
 
+bool has_async_source(const arrow::acero::Declaration &plan) {
+  if (dynamic_cast<const AsyncSourceNodeOptions *>(plan.options.get()))
+    return true;
+  for (const auto &input : plan.inputs) {
+    if (auto *child = std::get_if<arrow::acero::Declaration>(&input)) {
+      if (has_async_source(*child)) return true;
+    }
+  }
+  return false;
+}
+
 // DeclarationToReader's sink has no backpressure in our Arrow version. Use an
 // explicit sink for potentially unbounded scans. This limits queued output, not
 // an individual batch, in-flight I/O, or memory held by upstream operators.
@@ -348,10 +371,8 @@ class BoundedPlanReader : public arrow::RecordBatchReader {
 };
 }  // namespace
 
-Result<arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>>>
-PlanInfo::execute_to_generator(size_t max_queued_bytes) {
-  auto make =
-      [&]() -> arrow::Result<arrow::AsyncGenerator<AsyncPlanStream::Batch>> {
+Result<PlanStream> PlanInfo::execute_to_generator(size_t max_queued_bytes) {
+  auto make = [&]() -> arrow::Result<PlanStream> {
     auto stream = std::make_shared<AsyncPlanStream>();
     auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
                            : arrow::default_memory_pool();
@@ -371,7 +392,8 @@ PlanInfo::execute_to_generator(size_t max_queued_bytes) {
     ARROW_RETURN_NOT_OK(stream->plan->Validate());
     stream->started = true;
     stream->plan->StartProducing();
-    return arrow::AsyncGenerator<AsyncPlanStream::Batch>([stream] {
+    PlanStream result;
+    result.generator = [stream] {
       return stream->generator().Then(
           [stream](const AsyncPlanStream::Batch &batch)
               -> arrow::Future<AsyncPlanStream::Batch> {
@@ -380,7 +402,12 @@ PlanInfo::execute_to_generator(size_t max_queued_bytes) {
             return stream->plan->finished().Then(
                 [] { return AsyncPlanStream::Batch{}; });
           });
-    });
+    };
+    result.close = [stream] {
+      stream->plan->StopProducing();
+      return stream->plan->finished();
+    };
+    return result;
   };
   auto result = make();
   if (!result.ok()) {
@@ -398,8 +425,11 @@ Result<std::unique_ptr<arrow::RecordBatchReader>> PlanInfo::execute_to_reader(
   auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
                          : arrow::default_memory_pool();
   if (budgeted_ && !max_queued_bytes) max_queued_bytes = 64 * 1024;
+  // An unbudgeted parent reaching its limit must also await cancellation of
+  // nested segment streams. Arrow's generic source cannot run our finalizer.
+  // A zero queue limit retains the existing unbounded sink behavior.
   auto res =
-      max_queued_bytes
+      max_queued_bytes || has_async_source(plan_)
           ? BoundedPlanReader::Make(plan_, max_queued_bytes, pool, budgeted_)
           : arrow::acero::DeclarationToReader(plan_, true, pool);
   if (!res.ok()) {

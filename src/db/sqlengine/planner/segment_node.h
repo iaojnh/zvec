@@ -39,11 +39,12 @@ class SegmentNode : public std::enable_shared_from_this<SegmentNode> {
   }
 
   arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> gen();
+  arrow::Future<> finish();
 
  private:
   std::vector<PlanInfo::Ptr> segment_plans_;
   std::shared_ptr<arrow::Schema> schema_;
-  arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> current_;
+  PlanStream current_;
 };
 
 }  // namespace zvec::sqlengine

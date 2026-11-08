@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
@@ -24,6 +25,29 @@
 #include <zvec/db/status.h>
 
 namespace zvec::sqlengine {
+
+// A composed source must finish cancelling its child plans before the parent
+// publishes completion. Destroying an asynchronous generator alone cannot wait
+// for cancellation when it runs on the same executor as the child.
+struct AsyncSourceNodeOptions : arrow::acero::SourceNodeOptions {
+  AsyncSourceNodeOptions(
+      std::shared_ptr<arrow::Schema> schema,
+      arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> generator,
+      std::function<arrow::Future<>()> finish)
+      : SourceNodeOptions(std::move(schema), std::move(generator),
+                          arrow::compute::Ordering::Implicit()),
+        finish(std::move(finish)) {}
+  std::function<arrow::Future<>()> finish;
+};
+
+struct PlanStream {
+  arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> generator;
+  std::function<arrow::Future<>()> close;
+
+  arrow::Future<std::optional<arrow::compute::ExecBatch>> operator()() const {
+    return generator();
+  }
+};
 
 class PlanInfo {
  public:
@@ -43,8 +67,7 @@ class PlanInfo {
   }
 
   // Non-blocking pull interface for composing plans on Arrow's own executor.
-  Result<arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>>>
-  execute_to_generator(size_t max_queued_bytes);
+  Result<PlanStream> execute_to_generator(size_t max_queued_bytes);
 
  private:
   arrow::acero::Declaration plan_;

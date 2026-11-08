@@ -31,7 +31,7 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> SegmentNode::gen() {
     // block the CPU executor waiting for a child plan on that same executor.
     return arrow::Loop([self]() -> arrow::Future<arrow::ControlFlow<Batch>> {
       try {
-        if (!self->current_) {
+        if (!self->current_.generator) {
           if (self->segment_plans_.empty()) return arrow::Break(Batch{});
           auto result =
               self->segment_plans_.back()->execute_to_generator(64 * 1024);
@@ -40,7 +40,7 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> SegmentNode::gen() {
           self->current_ = std::move(*result);
           self->segment_plans_.pop_back();
         }
-        return self->current_().Then(
+        return self->current_.generator().Then(
             [self](const Batch &batch) -> arrow::ControlFlow<Batch> {
               if (batch) return arrow::Break(batch);
               self->current_ = {};
@@ -53,6 +53,17 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> SegmentNode::gen() {
       }
     });
   };
+}
+
+arrow::Future<> SegmentNode::finish() {
+  segment_plans_.clear();
+  if (!current_.close) return arrow::Future<>::MakeFinished();
+  return current_.close().Then(
+      [self = shared_from_this()] { self->current_ = {}; },
+      [self = shared_from_this()](const arrow::Status &status) {
+        self->current_ = {};
+        return status.IsCancelled() ? arrow::Status::OK() : status;
+      });
 }
 
 }  // namespace zvec::sqlengine

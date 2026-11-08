@@ -468,8 +468,8 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
   auto recall_node =
       std::make_shared<SegmentNode>(std::move(segment_plans), pool);
   auto source_node_options =
-      arrow::acero::SourceNodeOptions{recall_node->schema(), recall_node->gen(),
-                                      arrow::compute::Ordering::Implicit()};
+      AsyncSourceNodeOptions{recall_node->schema(), recall_node->gen(),
+                             [recall_node] { return recall_node->finish(); }};
   ac::Declaration node{"source", source_node_options};
 
   if (has_vector) {
