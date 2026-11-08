@@ -341,7 +341,10 @@ TEST(KmeansCluster, HolderTrainingIsPageableAndPreservesExistingMount) {
   auto &pool = PoolPayloadBudget::get_instance();
   const size_t previous = pool.capacity();
   auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
-  ASSERT_EQ(0, pool.init(2 * 1024 * 1024));
+  // Writable page-table, lock and writeback metadata varies with the native
+  // page size. Keep a bounded training allowance beyond that mandatory cost.
+  const size_t metadata = PoolPayloadBudget::storage_metadata_bytes(4096);
+  ASSERT_EQ(0, pool.init(metadata + 512 * 1024));
   {
     auto holder = std::make_shared<StreamingTestHolder>(768, 4099);
     auto mounted_holder = std::make_shared<StreamingTestHolder>(768, 17);
