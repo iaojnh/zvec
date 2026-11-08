@@ -285,6 +285,7 @@ jobs:
         shell: bash
 
       - name: Run C++ Tests
+        id: native_tests
         run: |
           mkdir -p ci-evidence
           docker exec -w /work/build "$MUSL_CONTAINER" \
@@ -293,7 +294,7 @@ jobs:
         shell: bash
 
       - name: Capture shutdown crash stack
-        if: failure()
+        if: failure() && steps.native_tests.conclusion == 'failure'
         timeout-minutes: 5
         run: |
           # Preserve the original CTest failure; this bounded diagnostic does

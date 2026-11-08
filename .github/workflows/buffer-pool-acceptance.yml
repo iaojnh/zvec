@@ -83,6 +83,7 @@ jobs:
           )
           python -m pip install pybind11==3.0 cmake==3.30.0 ninja==1.11.1 \
             scikit-build-core setuptools_scm
+          python .github/scripts/test_arrow_download_fallback.py
           python -m pip wheel . --no-deps --no-build-isolation --wheel-dir candidate \
             -C cmake.define.AUTO_DETECT_ARCH=OFF \
             -C cmake.define.BUILD_C_BINDINGS=ON \
