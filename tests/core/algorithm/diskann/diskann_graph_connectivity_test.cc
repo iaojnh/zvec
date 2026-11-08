@@ -565,10 +565,42 @@ TEST_F(DiskAnnGraphConnectivityTest,
   const auto comparisons = context_->dist_calculator().compare_cnt();
   entity_->batch_vectors = true;
   auto &pool = ailego::PoolPayloadBudget::get_instance();
-  for (size_t remaining = 2048; remaining <= 8192; remaining += 256) {
+  std::vector<size_t> limits{1440};
+  for (size_t remaining = 2048; remaining <= 8192; remaining += 256)
+    limits.push_back(remaining);
+  for (const size_t remaining : limits) {
     SCOPED_TRACE(remaining);
     entity_->graph[0] = original;
     ailego::BudgetedVector<float>().swap(context_->occlude_factor());
+    ASSERT_GT(pool.available(), remaining);
+    const auto charge = pool.available() - remaining;
+    ASSERT_TRUE(pool.try_charge_external(charge));
+    const int ret = algorithm.prune_node(0, context_.get());
+    pool.release_external(charge);
+    ASSERT_EQ(0, ret);
+    EXPECT_EQ(expected, entity_->graph[0]);
+    EXPECT_EQ(comparisons, context_->dist_calculator().compare_cnt());
+  }
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       DuplicateCandidateUpperBoundDoesNotRejectFittingWorkspace) {
+  initialize(4, 1);
+  entity_->graph[0].assign(64, 1);
+  entity_->graph[0].push_back(2);
+  entity_->graph[0].push_back(3);
+  const auto original = entity_->graph[0];
+  DiskAnnAlgorithm algorithm(*entity_, 1);
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  const auto expected = entity_->graph[0];
+  const auto comparisons = context_->dist_calculator().compare_cnt();
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch);
+    entity_->batch_vectors = batch;
+    entity_->graph[0] = original;
+    ailego::BudgetedVector<float>().swap(context_->occlude_factor());
+    constexpr size_t remaining = 512;
     ASSERT_GT(pool.available(), remaining);
     const auto charge = pool.available() - remaining;
     ASSERT_TRUE(pool.try_charge_external(charge));
