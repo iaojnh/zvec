@@ -37,6 +37,7 @@ NATIVE_TARGETS = (
     "flat_flow_workspace_test",
     "flat_streamer_buffer_test",
     "turbo_pq_int8_training_memory_test",
+    "pq_buffered_training_test",
     "ivf_buffered_build_test",
     "opt_kmeans_cluster_test",
     "stratified_cluster_storage_test",
