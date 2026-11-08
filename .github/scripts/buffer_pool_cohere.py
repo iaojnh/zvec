@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 from buffer_pool_acceptance import sample
 from buffer_pool_metrics import POLICY, calibration
 from buffer_pool_rss_monitor import ProcessRssMonitor
+from buffer_pool_system_limit import current_cgroup
 
 import zvec
 
@@ -33,6 +34,15 @@ QUERY_COUNT = 200
 MIN_RECALL = POLICY["minimum_recall_at_10"]
 TRIALS = POLICY["performance_trials"]
 BUDGET_MIB = {"ivf": 2048, "diskann": 4096}
+
+
+def mmap_reference_budget_mib():
+    # The reference is governed by the same external cap for both versions.
+    # None would infer an additional 80% RSS target in the candidate, while
+    # the older baseline does not enforce that target for mapped files.
+    cap = int((current_cgroup() / "memory.max").read_text())
+    assert cap > 0 and cap % 1024**2 == 0
+    return cap // 1024**2
 
 
 def io_bytes():
@@ -128,6 +138,9 @@ def build(path, train, options, index_param, observe):
             key: doc.vector("embedding")
             for key, doc in collection.fetch(list(probes)).items()
         }
+    except Exception:
+        observe("build_failed")
+        raise
     finally:
         collection.close()
     observe("closed_after_build")
@@ -280,7 +293,9 @@ def run(kind, storage, data, path, evidence, role="candidate"):
         else None
     )
     observe = partial(sample, evidence, limit_kib=limit_kib)
-    configured_memory_mib = budget_mib if storage == "buffer" else None
+    configured_memory_mib = (
+        budget_mib if storage == "buffer" else mmap_reference_budget_mib()
+    )
     observe("calibration", **control, role=role)
     observe(
         "start",
@@ -294,7 +309,7 @@ def run(kind, storage, data, path, evidence, role="candidate"):
         min_recall=MIN_RECALL,
     )
     # Apply the Buffer Pool target only to its measured path. For the mmap
-    # reference, both versions auto-size within the same external cgroup cap.
+    # reference, both versions use the actual external cgroup cap as target.
     # Its mapped-file RSS is outside the Buffer Pool RSS acceptance contract.
     zvec.init(
         memory_limit_mb=configured_memory_mib, query_threads=4, optimize_threads=1
@@ -388,7 +403,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "_crash":
         path, mmap, fixture, budget, limit, output = sys.argv[2:]
         zvec.init(
-            memory_limit_mb=None if bool(int(mmap)) else int(budget),
+            memory_limit_mb=(
+                mmap_reference_budget_mib() if bool(int(mmap)) else int(budget)
+            ),
             query_threads=4,
             optimize_threads=1,
         )

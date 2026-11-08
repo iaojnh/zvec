@@ -27,7 +27,7 @@ from buffer_pool_metrics import POLICY, stability
 from buffer_pool_native_bundle import bundle
 from buffer_pool_report import build_memory_results, performance, rows, summary
 from buffer_pool_rss_monitor import ProcessRssMonitor, RssTrace, validate_soft_rss
-from buffer_pool_system_limit import snapshot
+from buffer_pool_system_limit import current_cgroup, snapshot
 
 
 def write_rows(path, values):
@@ -133,6 +133,14 @@ def test_hour_duration_and_slow_leak():
         stability(stable[:-1], 3600)
     with pytest.raises(AssertionError, match="RSS slope"):
         stability([(t, rss + t * 10_000 / 3600) for t, rss in stable], 3600)
+
+
+@pytest.mark.parametrize("relative", ["/", "/system.slice/cohere.service"])
+def test_current_cgroup_resolves_root_and_systemd_services(tmp_path, relative):
+    membership = tmp_path / "membership"
+    membership.write_text("4:pids:/legacy\n0::" + relative + "\n")
+    mount = tmp_path / "cgroup"
+    assert current_cgroup(membership, mount) == mount / relative.lstrip("/")
 
 
 def test_cgroup_requires_numeric_applied_limits(tmp_path):
