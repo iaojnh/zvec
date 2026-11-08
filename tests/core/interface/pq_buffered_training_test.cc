@@ -81,7 +81,7 @@ class PqBufferedTrainingTest : public ::testing::Test {
   }
   template <core::IndexMeta::DataType Type, class T,
             class Quantizer = turbo::PqInt8Quantizer, size_t Dimension = 17>
-  void compare(bool opq = false) {
+  void compare(bool opq = false, size_t workspace_limit = 0) {
     constexpr size_t kDim = Dimension;
     // Identical rows eliminate random cluster initialization as a confounder.
     // A non-batch-aligned count also covers the untransposed tail.
@@ -95,7 +95,8 @@ class PqBufferedTrainingTest : public ::testing::Test {
         opq && (fast_opq || std::is_same_v<Quantizer, turbo::PqInt8Quantizer>);
     // OPQ overlaps rotation tiles with two Lloyd workers' centroid scratch.
     // Keep the corpus larger than this mandatory workspace allowance.
-    const size_t workspace_bytes = (wide_opq ? 512 : 256) * 1024;
+    const size_t workspace_bytes =
+        workspace_limit != 0 ? workspace_limit : (wide_opq ? 512 : 256) * 1024;
     const size_t row_count = fast_opq ? 20003 : 10001;
     ASSERT_GT(row_count * kDim * sizeof(T), workspace_bytes);
     for (size_t i = 0; i < row_count; ++i) {
@@ -332,6 +333,11 @@ TEST_F(PqBufferedTrainingTest, FastFP16MatchesHeapTrainingUnderPressure) {
 }
 TEST_F(PqBufferedTrainingTest, OpqFP32MatchesHeapTrainingUnderPressure) {
   compare<core::IndexMeta::DT_FP32, float>(true);
+}
+TEST_F(PqBufferedTrainingTest, OpqFP32MatchesHeapTrainingWithReducedWorkspace) {
+  // Keep both workers and every result check, with less workspace than the
+  // existing 512 KiB case while the corpus still requires paging.
+  compare<core::IndexMeta::DT_FP32, float>(true, 320 * 1024);
 }
 TEST_F(PqBufferedTrainingTest, OpqInt4MatchesHeapTrainingUnderPressure) {
   compare<core::IndexMeta::DT_FP32, float, turbo::PqInt4Quantizer, 16>(true);

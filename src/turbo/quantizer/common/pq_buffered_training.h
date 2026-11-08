@@ -191,6 +191,10 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
           algorithm.append(rows.data() + i * width, width);
         if (algorithm.matrix_status() != 0) return algorithm.matrix_status();
       }
+      // append() has copied every row into the paged Lloyd matrix. Release
+      // the import tile before centroid scratch overlaps the OPQ tiles; two
+      // retained 64 KiB tiles can otherwise consume the last I/O pages.
+      Workspace().swap(rows);
       core::SingleQueueIndexThreads local_threads(1, false);
       Kmc2CentroidsGenerator<decltype(algorithm),
                              core::SingleQueueIndexThreads>
