@@ -43,6 +43,108 @@ TEST(ProcessRssBudgetTest, NativeFootprintTracksUntouchedBackingAcrossSamples) {
   EXPECT_EQ(24 * kMiB, budget.available());
 }
 
+TEST(ProcessRssBudgetTest, UnsampledHeapChurnPreservesLiveResidentOverlap) {
+  constexpr size_t limit = 512 * kMiB;
+  for (const bool use_native : {false, true}) {
+    SCOPED_TRACE(use_native);
+    ProcessRssBudget budget;
+    native_sample_valid = true;
+    auto sample = [&](size_t bytes) {
+      sampled_rss = use_native ? 32 * kMiB : bytes;
+      native_sample = {bytes, limit - bytes};
+    };
+    sample(64 * kMiB);
+    ASSERT_TRUE(
+        budget.configure(limit, ReadRss, use_native ? ReadNative : nullptr));
+    ASSERT_TRUE(budget.try_reserve(230 * kMiB));
+    budget.finish_reservation(230 * kMiB, true);
+    sample(294 * kMiB);
+    budget.refresh(true);
+    const size_t available = budget.available();
+    for (int i = 0; i < 64; ++i) {
+      SCOPED_TRACE(i);
+      ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+      const auto stamp = budget.finish_reservation(4 * kMiB, true);
+      budget.release_heap(
+          4 * kMiB, ProcessRssBudget::HeapProjection::Full(4 * kMiB, stamp));
+      budget.refresh(true);
+      ASSERT_EQ(available, budget.available());
+      ASSERT_FALSE(budget.pressure());
+    }
+    budget.release(230 * kMiB);
+  }
+}
+
+TEST(ProcessRssBudgetTest, HeapFreeKeepsUnsampledAllocatorRetentionCharged) {
+  ProcessRssBudget budget;
+  sampled_rss = 480 * kMiB;
+  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_reserve(16 * kMiB));
+  const auto stamp = budget.finish_reservation(16 * kMiB, true);
+  budget.release_heap(16 * kMiB,
+                      ProcessRssBudget::HeapProjection::Full(16 * kMiB, stamp));
+  EXPECT_EQ(16 * kMiB, budget.available());
+  sampled_rss = 496 * kMiB;  // malloc kept the freed pages resident.
+  budget.refresh(true);
+  EXPECT_EQ(16 * kMiB, budget.available());
+  sampled_rss = 480 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(32 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, MixedAgeHeapReleaseKeepsUntouchedOwnersCharged) {
+  using Projection = ProcessRssBudget::HeapProjection;
+  ProcessRssBudget budget;
+  budget.account(8 * kMiB);
+  sampled_rss = 96 * kMiB;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
+  ASSERT_TRUE(budget.try_reserve(4 * kMiB));
+  auto projection =
+      Projection::Full(4 * kMiB, budget.finish_reservation(4 * kMiB, true));
+  sampled_rss = 100 * kMiB;
+  budget.refresh(true);
+  ASSERT_TRUE(budget.try_reserve(6 * kMiB));
+  projection.append(
+      Projection::Full(6 * kMiB, budget.finish_reservation(6 * kMiB, true)));
+
+  budget.release_heap(4 * kMiB, projection.take(10 * kMiB, 4 * kMiB));
+  budget.refresh(true);
+  // The old 4 MiB can still be resident, and the live 6 MiB is untouched.
+  EXPECT_EQ(22 * kMiB, budget.available());
+  budget.release_heap(6 * kMiB, projection);
+  budget.refresh(true);
+  // After another sample, the 6 MiB may itself be retained in the heap.
+  // Do not promise its refund while another live owner remains untouched.
+  EXPECT_LE(budget.available(), 28 * kMiB);
+  budget.release(8 * kMiB);
+  sampled_rss = 96 * kMiB;
+  budget.refresh(true);
+  EXPECT_EQ(32 * kMiB, budget.available());
+}
+
+TEST(ProcessRssBudgetTest, HeapAgeUsesEachReadersSuccessfulSample) {
+  ProcessRssBudget budget;
+  budget.account(8 * kMiB);
+  sampled_rss = 64 * kMiB;
+  native_sample = {96 * kMiB, 32 * kMiB};
+  native_sample_valid = true;
+  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
+  ASSERT_EQ(24 * kMiB, budget.available());
+  ASSERT_TRUE(budget.try_reserve(8 * kMiB));
+  const auto stamp = budget.finish_reservation(8 * kMiB, true);
+  sampled_rss = 72 * kMiB;
+  native_sample_valid = false;
+  budget.refresh(true);
+  budget.release_heap(
+      8 * kMiB, ProcessRssBudget::HeapProjection::Full(8 * kMiB, stamp));
+  EXPECT_EQ(16 * kMiB, budget.available());
+  sampled_rss = 64 * kMiB;
+  native_sample_valid = true;
+  budget.refresh(true);
+  EXPECT_EQ(24 * kMiB, budget.available());
+  budget.release(8 * kMiB);
+}
+
 TEST(ProcessRssBudgetTest, NativeLimitCanShrinkAndRecoverBelowConfiguredRss) {
   ProcessRssBudget budget;
   sampled_rss = 32 * kMiB;

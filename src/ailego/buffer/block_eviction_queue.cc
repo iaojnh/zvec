@@ -1747,8 +1747,9 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
   return reserved;
 }
 
-void MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
-  (void)commit_mapping(bytes);
+ProcessRssBudget::MaterializationStamp
+MemoryLimitPool::PendingAllocation::commit(size_t bytes) {
+  return commit_mapping(bytes);
 }
 
 ProcessRssBudget::MaterializationStamp
@@ -1950,6 +1951,23 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
 
 void MemoryLimitPool::release_external(const size_t buffer_size) {
   release_fixed(buffer_size, &external_used_size_);
+}
+
+void MemoryLimitPool::release_heap_external(
+    size_t bytes, ProcessRssBudget::HeapProjection projection) {
+  if (!bytes) return;
+  const size_t used = used_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  const size_t external =
+      external_used_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  const size_t committed =
+      committed_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  assert(used >= bytes && external >= bytes && committed >= bytes);
+  (void)used;
+  (void)external;
+  (void)committed;
+  process_rss_.release_heap(bytes, projection);
+  { std::lock_guard<std::mutex> lock(capacity_mutex_); }
+  capacity_cv_.notify_all();
 }
 
 void MemoryLimitPool::release_unmapped_external(

@@ -375,11 +375,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     PendingAllocation &operator=(const PendingAllocation &) = delete;
     ~PendingAllocation();
     bool reserve(size_t bytes);
-    void commit() {
-      commit(bytes_);
+    ProcessRssBudget::MaterializationStamp commit() {
+      return commit(bytes_);
     }
-    void commit(size_t bytes);
-    // Retain this stamp only for backing the owner can explicitly unmap.
+    ProcessRssBudget::MaterializationStamp commit(size_t bytes);
+    // Heap and mapping owners retain the same creation stamp but release it
+    // differently: only a successful unmapping refunds unsampled residency.
     ProcessRssBudget::MaterializationStamp commit_mapping();
     ProcessRssBudget::MaterializationStamp commit_mapping(size_t bytes);
 
@@ -404,6 +405,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void release_buffer(char *buffer, const size_t buffer_size);
 
   void release_external(const size_t buffer_size);
+  void release_heap_external(size_t bytes,
+                             ProcessRssBudget::HeapProjection projection);
   void release_unmapped_external(size_t bytes,
                                  ProcessRssBudget::MaterializationStamp stamp);
 
