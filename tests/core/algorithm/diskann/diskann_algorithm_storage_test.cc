@@ -235,8 +235,16 @@ TEST(DiskAnnPruneWorkspace, LocksScaleDownAndStayChargedUntilDestruction) {
     pool.init(old);
   });
   TransientEntity entity;
-  ASSERT_EQ(0, pool.init(2 * sizeof(std::mutex) + alignof(std::mutex) - 1 +
-                         sizeof(size_t)));
+  ASSERT_EQ(0, pool.init(4096));
+  size_t two_lock_bytes;
+  {
+    // Include the allocator's headers and platform-specific charge rounding.
+    // This test exercises lock-count fallback, not an allocation-size formula.
+    ailego::BudgetedVector<std::mutex> locks(2);
+    two_lock_bytes = pool.used();
+  }
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(two_lock_bytes));
   {
     DiskAnnAlgorithm algorithm(entity, 2, 128);
     EXPECT_EQ(2u, algorithm.lock_count());

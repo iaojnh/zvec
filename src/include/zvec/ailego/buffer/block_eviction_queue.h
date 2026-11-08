@@ -163,6 +163,9 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
   void recycle();
 
   size_t batch_recycle(size_t count);
+  // Small workspace requests retain a broad scan without discarding a large
+  // fixed batch of otherwise useful cache pages.
+  size_t reclaim_for_allocation(size_t bytes);
 
   struct Stats {
     std::array<size_t, kQueueCount> approximate_queue_sizes{};
@@ -202,6 +205,8 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
   size_t recover_owner_queues();
 
   size_t recycle_inactive(size_t max_attempts);
+  size_t batch_recycle_impl(size_t count, size_t scan_count,
+                            bool age_protected);
 
   BlockEvictionQueue() {
     for (size_t i = 0; i < kQueueCount; ++i) {

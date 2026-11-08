@@ -131,6 +131,44 @@ class DiskAnnBuilderEntityBufferTest : public testing::Test {
 };
 
 TEST_F(DiskAnnBuilderEntityBufferTest,
+       ReadAheadKeepsCurrentBatchAliveAndReleasesAllWorkspace) {
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = budget.capacity();
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, budget.used());
+    EXPECT_EQ(0, budget.init(previous));
+  });
+  ASSERT_EQ(0, budget.init(8UL << 20));
+  DiskAnnBuilderEntity entity;
+  initialize(&entity, 768, 96);
+  EXPECT_EQ(nullptr, entity.create_vector_reader());
+  ASSERT_EQ(0, entity.prepare_vectors_for_graph());
+  auto reader = entity.create_vector_reader();
+  if (!reader)
+    GTEST_SKIP()
+        << "The active backend/layout has no asynchronous vector reader";
+  std::array<diskann_id_t, 32> ids;
+  for (size_t i = 0; i < ids.size(); ++i) ids[i] = (i * 17) % 96;
+  std::array<IndexStorage::MemoryBlock, 32> first, second;
+  ASSERT_EQ(0, reader->submit(ids.data(), ids.size()));
+  ASSERT_EQ(0, reader->finish(first.data(), first.size()));
+  for (auto &id : ids) id = (id + 1) % 96;
+  ASSERT_EQ(0, reader->submit(ids.data(), ids.size()));
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const auto *data = static_cast<const float *>(first[i].data());
+    EXPECT_FLOAT_EQ((i * 17) % 96 + 767 * 0.25F, data[767]);
+  }
+  ASSERT_EQ(0, reader->finish(second.data(), second.size()));
+  EXPECT_EQ(IndexError_NotImplemented, reader->submit(ids.data(), ids.size()));
+  reader.reset();
+  entity.clear();
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const auto *data = static_cast<const float *>(second[i].data());
+    EXPECT_FLOAT_EQ(ids[i] + 767 * 0.25F, data[767]);
+  }
+}
+
+TEST_F(DiskAnnBuilderEntityBufferTest,
        StagedVectorsSurvivePressureAndOtherReads) {
   DiskAnnBuilderEntity entity;
   constexpr uint32_t kDimension = 257;

@@ -593,6 +593,59 @@ TEST_F(PoolAdmissionTest, RetainedMappingKeepsOneDebitUntilPhysicalRelease) {
   EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
 }
 
+TEST_F(PoolAdmissionTest, SmallWorkspaceDoesNotDiscardTheWholeCache) {
+  ASSERT_EQ(0, pool_.init(baseline_ + (4UL << 20)));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  auto &queue = BlockEvictionQueue::get_instance();
+  BlockEvictionQueue::BlockType stale;
+  while (queue.evict_single_block(stale)) {
+  }
+  class Cache : public EvictableBlockOwner {
+   public:
+    explicit Cache(MemoryLimitPool &pool) : pool_(pool) {
+      BlockEvictionQueue::get_instance().set_valid(this);
+      live.fill(true);
+    }
+    ~Cache() override {
+      BlockEvictionQueue::get_instance().set_invalid(this);
+      pool_.release_external(charged);
+    }
+    bool is_dead_block(eviction_key_t key, version_t) override {
+      return key >= live.size() || !live[key];
+    }
+    bool evict_block(eviction_key_t key) override {
+      if (is_dead_block(key, 0)) return false;
+      live[key] = false;
+      const size_t page = MemoryLimitPool::page_buffer_size();
+      charged -= page;
+      pool_.release_external(page);
+      ++evicted;
+      return true;
+    }
+    MemoryLimitPool &pool_;
+    std::array<bool, 256> live;
+    size_t charged{0}, evicted{0};
+  } cache(pool_);
+  for (size_t key = 0; key < cache.live.size(); ++key) {
+    BlockEvictionQueue::BlockType item;
+    item.owner = &cache;
+    item.owner_key = key;
+    ASSERT_TRUE(queue.add_single_block(item, 0));
+  }
+  const size_t cache_bytes = cache.live.size() * page_;
+  ASSERT_TRUE(pool_.try_charge_external(cache_bytes));
+  cache.charged = cache_bytes;
+  const size_t filler = pool_.available();
+  ASSERT_TRUE(pool_.try_charge_external(filler));
+  const auto release =
+      ScopeGuard::Make([&] { pool_.release_external(filler); });
+  MemoryReservation workspace;
+  ASSERT_NO_THROW(workspace.add(64));
+  EXPECT_GT(cache.evicted, 0u);
+  EXPECT_LT(cache.evicted, cache.live.size() / 8);
+  expect_bounded();
+}
+
 TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
   ASSERT_EQ(0, pool_.init(baseline_ + 128 * page_));
   MemoryLimitPoolTestPeer::stop_background(pool_);

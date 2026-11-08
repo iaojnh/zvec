@@ -95,7 +95,7 @@ int fake_io_submit(io_context_t, long nr, struct iocb *ios[]) {
 
 int fake_io_getevents(io_context_t, long min_nr, long nr,
                       struct io_event *events, struct timespec *) {
-  if (g_fake_aio == nullptr || min_nr != nr ||
+  if (g_fake_aio == nullptr || min_nr < 0 || min_nr > nr ||
       g_fake_aio->completion_call >= g_fake_aio->completion_results.size()) {
     return -EINVAL;
   }
@@ -374,6 +374,120 @@ TEST(DiskAnnBufferPoolFileReaderTest,
 
   pool->page_table_.force_evict_all_loaded();
   std::free(output);
+}
+
+TEST(DiskAnnBufferPoolFileReaderTest,
+     SubmitDefersColdReadsAndFansOutCompletionToOriginalRequests) {
+  const size_t page = ailego::kVectorPageSize;
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  std::vector<uint8_t> source(4 * page, 0x19);
+  ASSERT_EQ(static_cast<ssize_t>(source.size()),
+            ::pwrite(file.fd(), source.data(), source.size(), 0));
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = budget.capacity();
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, budget.used());
+    EXPECT_EQ(0, budget.init(previous));
+  });
+  ASSERT_EQ(0, budget.init(4UL << 20));
+  auto pool = std::make_shared<ailego::VecBufferPool>(file.path(), false);
+  ASSERT_EQ(0, pool->init());
+  BufferPoolAlignedFileReader reader(pool), other(pool);
+  ASSERT_EQ(0, reader.open_from_pool(file.path()));
+  auto output = std::unique_ptr<void, decltype(&std::free)>(
+      allocate_aligned(3 * page), &std::free);
+  ASSERT_NE(nullptr, output);
+  std::vector<AlignedRead> requests{
+      {3 * page, page, output.get()},
+      {page, page, static_cast<char *>(output.get()) + page},
+      {3 * page, page, static_cast<char *>(output.get()) + 2 * page}};
+  FakeAioState state;
+  state.submit_results = {2};
+  state.completion_results = {1, 1};
+  state.destroy_result = 0;
+  FakeAioGuard guard(&state);
+  IOContext ctx = new IoBackend;
+  ctx->type = ailego::IOBackendType::kLibAio;
+  ctx->aio_ctx = reinterpret_cast<io_context_t>(uintptr_t{1});
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, destroy_io_ctx(ctx)); });
+  PendingBatch batch;
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  ASSERT_TRUE(batch.has_async_requests());
+  EXPECT_EQ(1u, state.submit_call);
+  EXPECT_EQ(0u, state.completion_call);
+  EXPECT_EQ(0, static_cast<unsigned char *>(output.get())[0]);
+  PendingBatch second_batch;
+  EXPECT_EQ(IndexError_InvalidArgument,
+            reader.submit(second_batch, requests, ctx));
+  EXPECT_EQ(1u, state.submit_call);
+  ASSERT_EQ(2u, state.kernel_buffers.size());
+  EXPECT_NE(requests[0].buf, state.kernel_buffers[1]);
+  EXPECT_FALSE(pool->is_page_resident(1));
+  std::vector<uint32_t> completed;
+  EXPECT_EQ(IndexError_InvalidArgument,
+            other.get_completed(batch, ctx, 1, completed));
+  ASSERT_EQ(1, reader.get_completed(batch, ctx, 1, completed));
+  EXPECT_EQ((std::vector<uint32_t>{1}), completed);
+  EXPECT_TRUE(pool->is_page_resident(1));
+  EXPECT_EQ(0xa5, static_cast<unsigned char *>(output.get())[page]);
+  EXPECT_EQ(0, static_cast<unsigned char *>(output.get())[0]);
+  ASSERT_EQ(2, reader.get_completed(batch, ctx, 1, completed));
+  EXPECT_EQ((std::vector<uint32_t>{0, 2}), completed);
+  EXPECT_EQ(0, std::memcmp(output.get(),
+                           static_cast<char *>(output.get()) + 2 * page, page));
+  EXPECT_TRUE(pool->is_page_resident(3));
+  EXPECT_FALSE(batch.has_async_requests());
+  EXPECT_FALSE(batch.buffer);
+  EXPECT_EQ(2u, pool->stats().miss);
+  // A second query now completes from cached pages without another I/O.
+  const size_t charge = budget.available();
+  ASSERT_TRUE(budget.try_charge_external(charge));
+  const auto release =
+      ailego::ScopeGuard::Make([&] { budget.release_external(charge); });
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  EXPECT_TRUE(batch.used_pread);
+  EXPECT_FALSE(batch.buffer);
+  EXPECT_EQ(3, reader.get_completed(batch, ctx, 1, completed));
+  EXPECT_EQ(1u, state.submit_call);
+}
+
+TEST(DiskAnnBufferPoolFileReaderTest,
+     DeniedAsyncPlanFallsBackWithoutLosingDataOrRetainingClaims) {
+  const size_t page = ailego::kVectorPageSize;
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  std::vector<uint8_t> source(4 * page, 0x39);
+  ASSERT_EQ(static_cast<ssize_t>(source.size()),
+            ::pwrite(file.fd(), source.data(), source.size(), 0));
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = budget.capacity();
+  const auto restore =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, budget.init(previous)); });
+  ASSERT_EQ(0, budget.init(4UL << 20));
+  auto pool = std::make_shared<ailego::VecBufferPool>(file.path(), false);
+  ASSERT_EQ(0, pool->init());
+  BufferPoolAlignedFileReader reader(pool);
+  ASSERT_EQ(0, reader.open_from_pool(file.path()));
+  auto output = std::unique_ptr<void, decltype(&std::free)>(
+      allocate_aligned(page), &std::free);
+  ASSERT_NE(nullptr, output);
+  std::vector<AlignedRead> requests{{page, page, output.get()}};
+  const size_t charge = budget.available() - 128;
+  ASSERT_TRUE(budget.try_charge_external(charge));
+  const auto release =
+      ailego::ScopeGuard::Make([&] { budget.release_external(charge); });
+  IoBackend context;
+  context.type = ailego::IOBackendType::kPread;
+  IOContext ctx = &context;
+  PendingBatch batch;
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  EXPECT_TRUE(batch.used_pread);
+  EXPECT_EQ(0, std::memcmp(output.get(), source.data() + page, page));
+  std::vector<uint32_t> completed;
+  EXPECT_EQ(1, reader.get_completed(batch, ctx, 1, completed));
+  EXPECT_FALSE(batch.buffer);
 }
 
 TEST(DiskAnnBufferPoolFileReaderTest,

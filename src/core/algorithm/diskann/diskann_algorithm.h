@@ -42,6 +42,17 @@ class DiskAnnAlgorithm {
   int repair_connectivity(DiskAnnContext *ctx, size_t *added_edges = nullptr);
 
  private:
+  struct PruneVectorCache {
+    ailego::BudgetedVector<diskann_id_t> ids;
+    ailego::BudgetedVector<IndexStorage::MemoryBlock> blocks;
+    bool complete{false};
+    void clear() {
+      decltype(blocks)().swap(blocks);
+      decltype(ids)().swap(ids);
+      complete = false;
+    }
+  };
+
   int search_neighbor_and_prune(
       diskann_id_t id, ailego::BudgetedVector<diskann_id_t> &pruned_list,
       DiskAnnContext *ctx);
@@ -50,13 +61,17 @@ class DiskAnnAlgorithm {
       diskann_id_t excluded, DiskAnnContext *ctx);
   int prune_neighbors(diskann_id_t id, PruneCandidates &pool,
                       ailego::BudgetedVector<diskann_id_t> &pruned_list,
-                      DiskAnnContext *ctx);
+                      DiskAnnContext *ctx, PruneVectorCache *cache = nullptr);
+  int collect_prune_candidates(
+      diskann_id_t center,
+      const ailego::BudgetedVector<diskann_id_t> &neighbors,
+      PruneCandidates &pool, DiskAnnContext *ctx, PruneVectorCache *cache);
   int inter_insert(diskann_id_t id,
                    ailego::BudgetedVector<diskann_id_t> &pruned_list,
                    DiskAnnContext *ctx);
   int occlude_list(diskann_id_t id, PruneCandidates &pool,
                    ailego::BudgetedVector<diskann_id_t> &result,
-                   DiskAnnContext *ctx);
+                   DiskAnnContext *ctx, PruneVectorCache *cache);
 
   ailego::BudgetedVector<diskann_id_t> get_init_ids(DiskAnnContext *ctx);
 

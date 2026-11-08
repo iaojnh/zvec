@@ -26,10 +26,27 @@ class ConnectivityEntity : public DiskAnnEntity {
   }
   int read_vector(diskann_id_t id,
                   IndexStorage::MemoryBlock &block) const override {
+    ++vector_reads;
     if (id == failed_vector) return IndexError_IO;
     block = IndexStorage::MemoryBlock::MakeBorrowedView(
         const_cast<float *>(vectors.at(id).data()));
     return 0;
+  }
+  bool prefer_vector_batch() const override {
+    return batch_vectors;
+  }
+  int read_vectors(const diskann_id_t *ids, IndexStorage::MemoryBlock *blocks,
+                   size_t count) const override {
+    ++vector_batches;
+    if (batch_error) return batch_error;
+    if (vector_batches == fail_batch_at) {
+      if (count) {
+        const int ret = read_vector(ids[0], blocks[0]);
+        if (ret != 0) return ret;
+      }
+      return IndexError_NoMemory;
+    }
+    return DiskAnnEntity::read_vectors(ids, blocks, count);
   }
   int read_neighbors(diskann_id_t id,
                      ailego::BudgetedVector<diskann_id_t> *out) const override {
@@ -52,6 +69,49 @@ class ConnectivityEntity : public DiskAnnEntity {
   diskann_id_t failed_read{kInvalidId};
   bool fail_write{false};
   size_t writes{0};
+  bool batch_vectors{false};
+  int batch_error{0};
+  mutable size_t vector_reads{0};
+  mutable size_t vector_batches{0};
+  size_t fail_batch_at{0};
+};
+
+class ReadAheadEntity : public ConnectivityEntity {
+ public:
+  using ConnectivityEntity::ConnectivityEntity;
+  class Reader : public VectorReader {
+   public:
+    explicit Reader(const ReadAheadEntity &entity) : entity_(entity) {}
+    ~Reader() override {
+      if (entity_.active) ++entity_.cancelled;
+      entity_.active = false;
+    }
+    int submit(const diskann_id_t *ids, size_t count) override {
+      if (entity_.submit_error) return entity_.submit_error;
+      std::copy_n(ids, count, ids_.data());
+      count_ = count;
+      entity_.active = true;
+      return 0;
+    }
+    int finish(IndexStorage::MemoryBlock *blocks, size_t count) override {
+      EXPECT_TRUE(entity_.active);
+      EXPECT_EQ(count_, count);
+      entity_.active = false;
+      if (entity_.finish_error) return entity_.finish_error;
+      return entity_.read_vectors(ids_.data(), blocks, count);
+    }
+
+   private:
+    const ReadAheadEntity &entity_;
+    std::array<diskann_id_t, kVectorReadBatchSize> ids_;
+    size_t count_{0};
+  };
+  std::unique_ptr<VectorReader> create_vector_reader() const override {
+    return std::make_unique<Reader>(*this);
+  }
+  mutable bool active{false};
+  mutable size_t cancelled{0};
+  int submit_error{0}, finish_error{0};
 };
 
 class DiskAnnGraphConnectivityTest : public testing::Test {
@@ -242,6 +302,230 @@ TEST_F(DiskAnnGraphConnectivityTest, WorkspaceIsChargedAndReleasedWithMapping) {
               pool.external_used());
   }
   EXPECT_EQ(before, pool.external_used());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       BufferedPruningReusesCandidateVectorsAndPreservesNeighbors) {
+  initialize(65, 8);
+  for (size_t id = 0; id < entity_->vectors.size(); ++id) {
+    for (size_t d = 0; d < 4; ++d) {
+      entity_->vectors[id][d] = static_cast<float>((id * (17 + d * 13)) % 101);
+    }
+  }
+  for (diskann_id_t id = 1; id < 65; ++id) entity_->graph[0].push_back(id);
+  const auto original = entity_->graph[0];
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  const auto expected = entity_->graph[0];
+  const auto scalar_reads = entity_->vector_reads;
+  const auto scalar_comparisons = context_->dist_calculator().compare_cnt();
+  ASSERT_FALSE(expected.empty());
+  entity_->graph[0] = original;
+  entity_->vector_reads = 0;
+  entity_->batch_vectors = true;
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  EXPECT_EQ(expected, entity_->graph[0]);
+  EXPECT_EQ(scalar_comparisons, context_->dist_calculator().compare_cnt());
+  EXPECT_EQ(original.size() + 1u, entity_->vector_reads);
+  EXPECT_LT(entity_->vector_reads, scalar_reads);
+  EXPECT_EQ(2u, entity_->vector_batches);
+
+  // Fail after retaining the first batch and partially filling the second.
+  entity_->graph[0] = original;
+  entity_->fail_batch_at = entity_->vector_batches + 2;
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  EXPECT_EQ(expected, entity_->graph[0]);
+  EXPECT_EQ(scalar_comparisons, context_->dist_calculator().compare_cnt());
+  entity_->fail_batch_at = 0;
+
+  entity_->graph[0] = original;
+  entity_->batch_error = IndexError_NoMemory;
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  EXPECT_EQ(expected, entity_->graph[0]);
+  EXPECT_EQ(scalar_comparisons, context_->dist_calculator().compare_cnt());
+
+  entity_->graph[0] = original;
+  entity_->batch_error = 0;
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  constexpr size_t remaining = 2048;
+  ASSERT_GT(original.size() * sizeof(IndexStorage::MemoryBlock), remaining);
+  ASSERT_GT(budget.available(), remaining);
+  const auto charge = budget.available() - remaining;
+  ASSERT_TRUE(budget.try_charge_external(charge));
+  const auto batches_before = entity_->vector_batches;
+  const int ret = algorithm.prune_node(0, context_.get());
+  budget.release_external(charge);
+  EXPECT_EQ(0, ret);
+  EXPECT_EQ(expected, entity_->graph[0]);
+  EXPECT_GT(entity_->vector_batches, batches_before);
+  EXPECT_EQ(scalar_comparisons, context_->dist_calculator().compare_cnt());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, BufferedPruningPropagatesReadFailure) {
+  initialize(12, 2);
+  entity_->graph[0] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+  const auto original = entity_->graph;
+  entity_->batch_vectors = true;
+  entity_->batch_error = IndexError_IO;
+  DiskAnnAlgorithm algorithm(*entity_, 2);
+  EXPECT_EQ(IndexError_IO, algorithm.prune_node(0, context_.get()));
+  EXPECT_EQ(original, entity_->graph);
+  EXPECT_EQ(0u, entity_->writes);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       CenterBatchPreservesDistanceOrientationAndFallsBackOnMemoryPressure) {
+  initialize(40, 8);
+  auto &dc = context_->dist_calculator();
+  dc.update_distance([](const void *lhs, const void *rhs, size_t, float *out) {
+    *out = 3.0f * static_cast<const float *>(lhs)[0] +
+           static_cast<const float *>(rhs)[0];
+  });
+  const std::array<diskann_id_t, 5> ids{{1, 7, 13, 2, 39}};
+  std::array<dist_t, 5> expected, actual;
+  for (size_t i = 0; i < ids.size(); ++i) expected[i] = dc.dist(3, ids[i]);
+  dc.clear();
+  dc.dist_batch(3, ids.data(), ids.size(), actual.data());
+  ASSERT_FALSE(dc.error());
+  EXPECT_EQ(expected, actual);
+  EXPECT_EQ(ids.size(), dc.compare_cnt());
+  dc.clear();
+  entity_->batch_error = IndexError_NoMemory;
+  dc.dist_batch(3, ids.data(), ids.size(), actual.data());
+  ASSERT_FALSE(dc.error());
+  EXPECT_EQ(expected, actual);
+  EXPECT_EQ(ids.size(), dc.compare_cnt());
+  dc.clear();
+  entity_->batch_error = IndexError_IO;
+  dc.dist_batch(3, ids.data(), ids.size(), actual.data());
+  EXPECT_EQ(IndexError_IO, dc.error_code());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest, BufferedSelfOnlyPruningNeedsNoVectorRead) {
+  initialize(4, 1);
+  entity_->graph[0] = {0, 0, 0};
+  entity_->batch_vectors = true;
+  entity_->failed_vector = 0;
+  DiskAnnAlgorithm algorithm(*entity_, 1);
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  EXPECT_TRUE(entity_->graph[0].empty());
+  EXPECT_EQ(0u, entity_->vector_reads);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       OptionalCandidatePinsYieldToSmallWorkspace) {
+  initialize(65, 8);
+  for (diskann_id_t id = 1; id < 65; ++id) entity_->graph[0].push_back(id);
+  const auto original = entity_->graph[0];
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  const auto expected = entity_->graph[0];
+  const auto comparisons = context_->dist_calculator().compare_cnt();
+  entity_->batch_vectors = true;
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  for (size_t remaining = 2048; remaining <= 8192; remaining += 256) {
+    SCOPED_TRACE(remaining);
+    entity_->graph[0] = original;
+    ailego::BudgetedVector<float>().swap(context_->occlude_factor());
+    ASSERT_GT(pool.available(), remaining);
+    const auto charge = pool.available() - remaining;
+    ASSERT_TRUE(pool.try_charge_external(charge));
+    const int ret = algorithm.prune_node(0, context_.get());
+    pool.release_external(charge);
+    ASSERT_EQ(0, ret);
+    EXPECT_EQ(expected, entity_->graph[0]);
+    EXPECT_EQ(comparisons, context_->dist_calculator().compare_cnt());
+  }
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       BufferedPruningKeepsDuplicateAndSelfFilteringAcrossBatchBoundaries) {
+  initialize(80, 8);
+  for (diskann_id_t id = 1; id < 80; ++id) {
+    entity_->graph[0].push_back(id);
+    if (id % 7 == 0) entity_->graph[0].push_back(id);
+    if (id % 11 == 0) entity_->graph[0].push_back(0);
+  }
+  const auto original = entity_->graph[0];
+  DiskAnnAlgorithm algorithm(*entity_, 8);
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  const auto expected = entity_->graph[0];
+  const auto comparisons = context_->dist_calculator().compare_cnt();
+  entity_->graph[0] = original;
+  entity_->batch_vectors = true;
+  ASSERT_EQ(0, algorithm.prune_node(0, context_.get()));
+  EXPECT_EQ(expected, entity_->graph[0]);
+  EXPECT_EQ(comparisons, context_->dist_calculator().compare_cnt());
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       ReadAheadOverlapsNextBatchAndPreservesScoresAndComparisonOrder) {
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, 4);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto metric = IndexFactory::CreateMetric(meta.metric_name());
+  ASSERT_EQ(0, metric->init(meta, ailego::Params()));
+  ReadAheadEntity entity(100);
+  DistCalculator dc(&entity, meta, metric);
+  dc.reset_query(entity.vectors[0].data());
+  std::array<diskann_id_t, 96> ids;
+  std::array<float, 96> expected, actual;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    ids[i] = (i * 37) % 99 + 1;
+    expected[i] = dc.dist(ids[i]);
+  }
+  std::vector<bool> overlapped;
+  const auto run = [&] {
+    dc.clear();
+    size_t offset = 0;
+    const int ret = dc.visit_vector_batches(
+        ids.data(), ids.size(),
+        [&](const diskann_id_t *batch, IndexStorage::MemoryBlock *blocks,
+            size_t count) {
+          overlapped.push_back(entity.active);
+          for (size_t i = 0; i < count; ++i) {
+            EXPECT_EQ(ids[offset], batch[i]);
+            actual[offset++] = dc.dist(blocks[i].data());
+          }
+          return 0;
+        });
+    EXPECT_EQ(0, ret);
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(ids.size(), dc.compare_cnt());
+  };
+  run();
+  EXPECT_EQ((std::vector<bool>{true, true, false}), overlapped);
+  entity.submit_error = IndexError_NoMemory;
+  overlapped.clear();
+  run();
+  EXPECT_FALSE(entity.active);
+  EXPECT_EQ(0u, entity.cancelled);
+}
+
+TEST_F(DiskAnnGraphConnectivityTest,
+       ReadAheadCancelsOnConsumerExceptionAndPropagatesReadFailure) {
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, 4);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto metric = IndexFactory::CreateMetric(meta.metric_name());
+  ASSERT_EQ(0, metric->init(meta, ailego::Params()));
+  ReadAheadEntity entity(100);
+  DistCalculator dc(&entity, meta, metric);
+  std::array<diskann_id_t, 64> ids;
+  for (size_t i = 0; i < ids.size(); ++i) ids[i] = i;
+  EXPECT_THROW(dc.visit_vector_batches(
+                   ids.data(), ids.size(),
+                   [](const diskann_id_t *, IndexStorage::MemoryBlock *,
+                      size_t) -> int { throw std::bad_alloc(); }),
+               std::bad_alloc);
+  EXPECT_FALSE(entity.active);
+  EXPECT_EQ(1u, entity.cancelled);
+  entity.finish_error = IndexError_IO;
+  EXPECT_EQ(IndexError_IO,
+            dc.visit_vector_batches(
+                ids.data(), ids.size(),
+                [](const diskann_id_t *, IndexStorage::MemoryBlock *, size_t) {
+                  return 0;
+                }));
+  EXPECT_FALSE(entity.active);
 }
 
 }  // namespace

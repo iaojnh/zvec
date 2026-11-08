@@ -561,6 +561,7 @@ int execute_io(IOContext ctx, int fd, std::vector<AlignedRead> &read_reqs,
   }
   // Dispatch based on the active backend.
   if (ctx->type == ailego::IOBackendType::kIoUring) {
+    if (ctx->ring.has_pending_reads()) return IndexError_InvalidArgument;
     int ret = ctx->ring.execute(fd, read_reqs);
     if (ret == 0) {
       return 0;
@@ -826,6 +827,10 @@ int LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
 
 void LinuxAlignedFileReader::release_io_ctx(IOContext &ctx) {
 #if defined(__linux__) && !defined(__ANDROID__)
+  if (ctx && ctx->type == ailego::IOBackendType::kIoUring) {
+    ctx->ring.cancel_reads();
+    ctx->ring_batch = nullptr;
+  }
   if (ctx && ctx->aio_active) reset_aio_context(*ctx);
 #else
   (void)ctx;
@@ -1132,40 +1137,313 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
   }
 }
 
+// Per-operation state owns cache-load claims, not the caller's output buffers.
+// Kernel destinations belong to the native reader's charged I/O context.
+struct BufferReadBatch {
+  ailego::MemoryReservation memory;
+  std::shared_ptr<ailego::VecBufferPool> pool;
+  const BufferPoolAlignedFileReader *owner{nullptr};
+  PendingBatch native;
+  struct Page {
+    ailego::block_id_t id;
+    char *destination;
+    char *claimed{nullptr};
+    bool done{false};
+  };
+  struct Piece {
+    size_t page, request;
+    char *destination;
+  };
+  ailego::BudgetedVector<Page> pages;
+  ailego::BudgetedVector<Piece> pieces;
+  ailego::BudgetedVector<size_t> remaining, order, ends;
+  ailego::BudgetedVector<uint32_t> ready;
+  ailego::MemoryReservation io_memory;
+  std::vector<AlignedRead> reads;
+  std::vector<uint32_t> completed;
+
+  ~BufferReadBatch() {
+    for (auto &page : pages)
+      if (page.claimed) pool->cancel_read_page(page.id, page.claimed);
+  }
+  void finish(size_t index) {
+    auto &page = pages[index];
+    if (page.claimed) {
+      pool->complete_read_page(page.id, page.claimed, page.destination);
+      page.claimed = nullptr;
+    }
+    page.done = true;
+    for (const auto &piece : pieces) {
+      if (piece.page != index) continue;
+      if (piece.destination != page.destination)
+        std::memcpy(piece.destination, page.destination,
+                    ailego::kVectorPageSize);
+      if (--remaining[piece.request] == 0) ready.push_back(piece.request);
+    }
+  }
+};
+
 int BufferPoolAlignedFileReader::submit(PendingBatch &batch,
-                                        std::vector<AlignedRead> &read_reqs,
+                                        std::vector<AlignedRead> &requests,
                                         IOContext &ctx) {
   if (batch.has_async_requests()) return IndexError_InvalidArgument;
-  batch.n_submitted = 0;
-  batch.n_reaped = 0;
-  batch.used_pread = false;
 #if defined(__linux__) && !defined(__ANDROID__)
-  batch.cbs.clear();
-  batch.cb_ptrs.clear();
-  batch.events.clear();
+  if (ctx && (ctx->aio_active || ctx->ring.has_pending_reads()))
+    return IndexError_InvalidArgument;
 #elif defined(_WIN32) || defined(_WIN64)
-  batch.generation = 0;
+  if (ctx && ctx->outstanding_count) return IndexError_InvalidArgument;
 #endif
-
-  const int ret = read(read_reqs, ctx);
-  if (ret != 0) {
-    return ret;
+  batch.buffer.reset();
+  batch.n_submitted = batch.n_reaped = 0;
+  batch.used_pread = false;
+  if (!pool_ || !opened_) return IndexError_Runtime;
+  if (requests.empty()) return 0;
+  if (requests.size() > std::numeric_limits<uint32_t>::max())
+    return IndexError_InvalidArgument;
+  // Mutable and sub-page reads retain the synchronized storage path. DiskANN
+  // frontier reads normally consist of complete native pages.
+  const size_t page_size = ailego::kVectorPageSize;
+#if defined(_WIN32) || defined(_WIN64)
+  constexpr size_t alignment = 4096;
+#else
+  constexpr size_t alignment = 512;
+#endif
+  size_t occurrences = 0;
+  bool full_pages = !pool_->writable();
+  for (const auto &request : requests) {
+    if (!request.buf || !request.len || request.offset > pool_->file_size() ||
+        request.len > pool_->file_size() - request.offset)
+      return IndexError_InvalidArgument;
+    if (request.offset % page_size || request.len % page_size ||
+        reinterpret_cast<uintptr_t>(request.buf) % alignment)
+      full_pages = false;
+    if (request.len / page_size >
+        MAX_IO_DEPTH - std::min<size_t>(MAX_IO_DEPTH, occurrences))
+      full_pages = false;
+    occurrences = std::min<size_t>(
+        MAX_IO_DEPTH + 1,
+        occurrences +
+            std::min<uint64_t>(request.len / page_size, MAX_IO_DEPTH + 1));
   }
-  batch.used_pread = true;
-  batch.n_submitted = static_cast<uint32_t>(read_reqs.size());
+  for (size_t i = 0; i < requests.size() && full_pages; ++i) {
+    const auto begin = reinterpret_cast<uintptr_t>(requests[i].buf);
+    if (requests[i].len > UINTPTR_MAX - begin)
+      return IndexError_InvalidArgument;
+    for (size_t j = 0; j < i; ++j) {
+      const auto other = reinterpret_cast<uintptr_t>(requests[j].buf);
+      if (begin < other + requests[j].len && other < begin + requests[i].len)
+        full_pages = false;
+    }
+  }
+  const auto synchronous = [&] {
+    const int ret = read(requests, ctx);
+    if (!ret) {
+      batch.used_pread = true;
+      batch.n_submitted = requests.size();
+    }
+    return ret;
+  };
+  if (!full_pages || occurrences > MAX_IO_DEPTH) return synchronous();
+  if (pool_->cache_enabled()) {
+    // The all-resident path needs neither a heap plan nor I/O staging. Pin
+    // the bounded set before copying, including duplicate page requests.
+    std::array<ailego::block_id_t, MAX_IO_DEPTH> ids;
+    std::array<char *, MAX_IO_DEPTH> pages;
+    size_t count = 0;
+    bool resident = true;
+    for (const auto &request : requests) {
+      for (size_t offset = 0; offset < request.len && resident;
+           offset += page_size) {
+        const auto id = (request.offset + offset) / page_size;
+        size_t index = 0;
+        while (index < count && ids[index] != id) ++index;
+        if (index != count) continue;
+        char *page = pool_->try_acquire_buffer(id);
+        if (!page)
+          resident = false;
+        else {
+          ids[count] = id;
+          pages[count++] = page;
+        }
+      }
+      if (!resident) break;
+    }
+    if (resident) {
+      for (const auto &request : requests)
+        for (size_t offset = 0; offset < request.len; offset += page_size) {
+          const auto id = (request.offset + offset) / page_size;
+          const auto found = std::find(ids.begin(), ids.begin() + count, id);
+          std::memcpy(static_cast<char *>(request.buf) + offset,
+                      pages[found - ids.begin()], page_size);
+        }
+    }
+    pool_->release_pages(ids.data(), count);
+    if (resident) {
+      batch.used_pread = true;
+      batch.n_submitted = requests.size();
+      return 0;
+    }
+  }
+#if defined(__linux__) && !defined(__ANDROID__)
+  if ((ctx && ctx->type == ailego::IOBackendType::kPread) ||
+      (!ctx && pool_->cache_enabled() &&
+       pool_->io_backend_type() == ailego::IOBackendType::kPread))
+    return synchronous();
+#elif !defined(_WIN32) && !defined(_WIN64)
+  // In particular, preserve Darwin's native batched cache loader instead of
+  // replacing it with the portable file reader's scalar pread fallback.
+  return synchronous();
+#endif
+  std::shared_ptr<BufferReadBatch> plan;
+  try {
+    ailego::MemoryReservation memory;
+    memory.add(sizeof(BufferReadBatch) + 64);
+    plan = std::make_shared<BufferReadBatch>();
+    plan->memory.swap(memory);
+    plan->pool = pool_;
+    plan->owner = this;
+    plan->pages.reserve(occurrences);
+    plan->pieces.reserve(occurrences);
+    plan->order.reserve(occurrences);
+    plan->ends.reserve(occurrences);
+    plan->ready.reserve(requests.size());
+    plan->remaining.resize(requests.size());
+    ailego::ReserveVectorCapacity(plan->reads, plan->io_memory, occurrences);
+    ailego::ReserveVectorCapacity(plan->completed, plan->io_memory,
+                                  occurrences);
+    for (size_t r = 0; r < requests.size(); ++r) {
+      const auto &request = requests[r];
+      plan->remaining[r] = request.len / page_size;
+      for (size_t offset = 0; offset < request.len; offset += page_size) {
+        const auto id = (request.offset + offset) / page_size;
+        auto *destination = static_cast<char *>(request.buf) + offset;
+        size_t index = 0;
+        while (index < plan->pages.size() && plan->pages[index].id != id)
+          ++index;
+        if (index == plan->pages.size())
+          plan->pages.push_back({id, destination, nullptr, false});
+        plan->pieces.push_back({index, r, destination});
+      }
+    }
+    for (size_t i = 0; i < plan->pages.size(); ++i) {
+      auto &page = plan->pages[i];
+      if (pool_->cache_enabled()) {
+        if (char *cached = pool_->try_acquire_buffer(page.id)) {
+          std::memcpy(page.destination, cached, page_size);
+          pool_->release_pages(&page.id, 1);
+          plan->finish(i);
+          continue;
+        }
+        if (pool_->should_admit_page(page.id)) {
+          const auto claim = pool_->claim_read_page(page.id, page.claimed);
+          if (claim == ailego::VecBufferPool::ReadPageClaim::kJoin) {
+            // Join the existing page load; do not issue duplicate disk I/O.
+            plan.reset();
+            return synchronous();
+          }
+        }
+      }
+      plan->order.push_back(i);
+    }
+    // Preserve result/comparison order while presenting scattered cold pages
+    // in file order, coalescing adjacent source and destination ranges.
+    std::sort(plan->order.begin(), plan->order.end(), [&](size_t a, size_t b) {
+      return plan->pages[a].id < plan->pages[b].id;
+    });
+    for (size_t n = 0; n < plan->order.size(); ++n) {
+      const auto &page = plan->pages[plan->order[n]];
+      if (!plan->reads.empty() &&
+          plan->reads.back().offset + plan->reads.back().len ==
+              page.id * page_size &&
+          static_cast<char *>(plan->reads.back().buf) +
+                  plan->reads.back().len ==
+              page.destination) {
+        plan->reads.back().len += page_size;
+#if defined(__linux__) && !defined(__ANDROID__)
+        plan->reads.back().expected_len += page_size;
+#endif
+        plan->ends.back() = n + 1;
+      } else {
+        plan->reads.emplace_back(page.id * page_size, page_size,
+                                 page.destination);
+        plan->ends.push_back(n + 1);
+      }
+    }
+  } catch (const std::bad_alloc &) {
+    plan.reset();
+    return synchronous();
+  }
+  if (!plan->reads.empty()) {
+    if (!ctx) {
+      const int ret = setup_io_ctx(ctx);
+      if (ret) return ret;
+    }
+    const int ret = bypass_reader_.submit(plan->native, plan->reads, ctx);
+    if (ret) return ret;
+  } else {
+    plan->native.used_pread = true;
+  }
+  batch.used_pread = plan->native.used_pread;
+  batch.n_submitted = requests.size();
+  batch.buffer = std::move(plan);
   return 0;
 }
 
 int BufferPoolAlignedFileReader::get_completed(
-    PendingBatch &batch, IOContext & /*ctx*/, int /*min_completed*/,
+    PendingBatch &batch, IOContext &ctx, int minimum,
     std::vector<uint32_t> &completed_indices) {
   completed_indices.clear();
-  if (batch.has_async_requests()) return IndexError_InvalidArgument;
-  for (uint32_t i = batch.n_reaped; i < batch.n_submitted; ++i) {
-    completed_indices.push_back(i);
+  auto plan = batch.buffer;
+  if (!plan) {
+    if (batch.has_async_requests()) return IndexError_InvalidArgument;
+    try {
+      completed_indices.reserve(batch.n_submitted - batch.n_reaped);
+      for (uint32_t i = batch.n_reaped; i < batch.n_submitted; ++i)
+        completed_indices.push_back(i);
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    }
+    batch.n_reaped = batch.n_submitted;
+    return completed_indices.size();
   }
-  batch.n_reaped = batch.n_submitted;
-  return static_cast<int>(completed_indices.size());
+  if (plan->owner != this) return IndexError_InvalidArgument;
+  try {
+    completed_indices.reserve(batch.n_submitted - batch.n_reaped);
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  }
+  const size_t required = std::min<size_t>(std::max(0, minimum),
+                                           batch.n_submitted - batch.n_reaped);
+  while (plan->native.n_reaped < plan->native.n_submitted &&
+         (plan->ready.size() < required ||
+          (minimum <= 0 && plan->ready.empty()))) {
+    const int count = bypass_reader_.get_completed(
+        plan->native, ctx, minimum > 0 ? 1 : 0, plan->completed);
+    if (count < 0) {
+      if (count != IndexError_NoMemory && count != IndexError_InvalidArgument) {
+        bypass_reader_.release_io_ctx(ctx);
+        batch.n_reaped = batch.n_submitted;
+        batch.used_pread = true;
+        batch.buffer.reset();
+      }
+      return count;
+    }
+    for (const uint32_t index : plan->completed) {
+      const size_t begin = index ? plan->ends[index - 1] : 0;
+      for (size_t i = begin; i < plan->ends[index]; ++i) {
+        auto &page = plan->pages[plan->order[i]];
+        if (!page.claimed)
+          plan->pool->record_bypass_read(ailego::kVectorPageSize);
+        plan->finish(plan->order[i]);
+      }
+    }
+    if (minimum <= 0 || count == 0) break;
+  }
+  completed_indices.assign(plan->ready.begin(), plan->ready.end());
+  plan->ready.clear();
+  batch.n_reaped += completed_indices.size();
+  if (batch.n_reaped == batch.n_submitted) batch.buffer.reset();
+  return completed_indices.size();
 }
 
 void BufferPoolAlignedFileReader::release_io_ctx(IOContext &ctx) {
@@ -1177,7 +1455,8 @@ void BufferPoolAlignedFileReader::release_io_ctx(IOContext &ctx) {
 int LinuxAlignedFileReader::submit(PendingBatch &batch,
                                    std::vector<AlignedRead> &read_reqs,
                                    IOContext &ctx) {
-  if ((ctx && ctx->aio_active) || batch.has_async_requests())
+  if ((ctx && (ctx->aio_active || ctx->ring.has_pending_reads())) ||
+      batch.has_async_requests())
     return IndexError_InvalidArgument;
   batch.n_submitted = 0;
   batch.n_reaped = 0;
@@ -1210,18 +1489,14 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
   if (ctx == nullptr || ctx->type == ailego::IOBackendType::kPread)
     return read_synchronously();
 
-  // io_uring only offers a synchronous batched execute(): the reads are
-  // already copied into the caller's buffers when it returns, so report the
-  // batch as complete the same way the pread path does.
   if (ctx->type == ailego::IOBackendType::kIoUring) {
-    int ring_ret = ctx->ring.execute(this->file_desc, read_reqs);
+    int ring_ret = ctx->ring.submit_reads(this->file_desc, read_reqs.data(),
+                                          read_reqs.size());
     if (ring_ret != 0) {
-      // The kernel only ever writes into the ring-owned staging pool, so a
-      // pread fallback cannot race with requests still in flight.
-      LOG_WARN("submit: io_uring execute failed; falling back to pread");
+      LOG_WARN("submit: io_uring submission failed; falling back to pread");
       return read_synchronously();
     }
-    batch.used_pread = true;
+    ctx->ring_batch = &batch;
     batch.n_submitted = n_ops;
     return 0;
   }
@@ -1360,6 +1635,27 @@ int LinuxAlignedFileReader::get_completed(
     }
     batch.n_reaped = batch.n_submitted;
     return (int)completed_indices.size();
+  }
+
+  if (ctx && ctx->type == ailego::IOBackendType::kIoUring) {
+    if (ctx->ring_batch != &batch) return IndexError_InvalidArgument;
+    try {
+      completed_indices.reserve(batch.n_submitted - batch.n_reaped);
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    }
+    std::array<uint32_t, ailego::kIoUringMaxBatch> indices{};
+    const int count = ctx->ring.get_completed_reads(
+        std::max(0, min_completed), indices.data(), indices.size());
+    if (count < 0) {
+      ctx->ring_batch = nullptr;
+      batch.n_reaped = batch.n_submitted;
+      return IndexError_ReadData;
+    }
+    completed_indices.assign(indices.begin(), indices.begin() + count);
+    batch.n_reaped += count;
+    if (batch.n_reaped == batch.n_submitted) ctx->ring_batch = nullptr;
+    return count;
   }
 
   if (!ctx || !ctx->aio_active || ctx->aio_batch != &batch)
