@@ -441,16 +441,32 @@ TEST(DiskAnnBufferPoolFileReaderTest,
   EXPECT_FALSE(batch.has_async_requests());
   EXPECT_FALSE(batch.buffer);
   EXPECT_EQ(2u, pool->stats().miss);
-  // A second query now completes from cached pages without another I/O.
+  // Keep the all-resident precondition stable while filling the remaining
+  // budget: that charge can wake background eviction before submit() runs.
+  // Page leases preserve the same zero-headroom/no-plan contract under reclaim.
+  const ailego::block_id_t resident_ids[] = {1, 3};
+  char *resident_pages[2] = {};
+  ASSERT_TRUE(
+      pool->try_acquire_resident_pages(resident_ids, 2, resident_pages));
+  const auto unpin =
+      ailego::ScopeGuard::Make([&] { pool->release_pages(resident_ids, 2); });
   const size_t charge = budget.available();
   ASSERT_TRUE(budget.try_charge_external(charge));
   const auto release =
       ailego::ScopeGuard::Make([&] { budget.release_external(charge); });
+  EXPECT_EQ(0u, budget.available());
+  EXPECT_FALSE(pool->page_table_.reclaim_clean_block(1));
+  EXPECT_FALSE(pool->page_table_.reclaim_clean_block(3));
+  std::memset(output.get(), 0, 3 * page);
   ASSERT_EQ(0, reader.submit(batch, requests, ctx));
   EXPECT_TRUE(batch.used_pread);
   EXPECT_FALSE(batch.buffer);
   EXPECT_EQ(3, reader.get_completed(batch, ctx, 1, completed));
   EXPECT_EQ(1u, state.submit_call);
+  const auto *bytes = static_cast<const uint8_t *>(output.get());
+  EXPECT_TRUE(std::all_of(bytes, bytes + 3 * page,
+                          [](uint8_t value) { return value == 0xa5; }));
+  EXPECT_EQ(2u, pool->stats().miss);
 }
 
 TEST(DiskAnnBufferPoolFileReaderTest,
