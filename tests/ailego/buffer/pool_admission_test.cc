@@ -6,6 +6,7 @@
 #include <memory>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
