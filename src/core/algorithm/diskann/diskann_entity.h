@@ -142,6 +142,7 @@ class DiskAnnEntity {
     const turbo::Quantizer *quantizer{nullptr};
     const uint8_t *codes{nullptr};
     uint32_t code_size{0};
+    IndexStorage::Segment::Pointer paged_codes;
   };
 
   // Optional, build-only guidance. Final pruning still uses original vectors.

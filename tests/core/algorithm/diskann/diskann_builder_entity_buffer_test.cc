@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
 #include "diskann_builder_entity.h"
@@ -215,8 +216,17 @@ TEST_F(DiskAnnBuilderEntityBufferTest, SealingRequiresCompleteVectorStaging) {
 }
 
 TEST_F(DiskAnnBuilderEntityBufferTest,
-       GraphCodesRequireCompleteInputAndChargeMappingBeforeAllocation) {
+       GraphCodesRequireCompleteInputAndRemainPageableAfterRetry) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t original_capacity = pool.capacity();
+  AILEGO_DEFER([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(original_capacity));
+  });
+  // This build owns vector, graph, and code files. Preserve the fixture's
+  // 1 MiB payload headroom after accounting for all three files' metadata.
+  const size_t metadata = ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
+  ASSERT_EQ(0, pool.init(3 * metadata + 1024UL * 1024UL));
   DiskAnnBuilderEntity entity;
   constexpr uint32_t count = 4096;
   constexpr uint32_t chunks = 384;
@@ -240,26 +250,44 @@ TEST_F(DiskAnnBuilderEntityBufferTest,
   EXPECT_EQ(IndexError_NoReady, entity.prepare_graph_quantization());
   ASSERT_EQ(0, entity.append_codes(bytes.data() + code_bytes / 2, code_bytes / 2));
 
-  // The fixture admits only 1 MiB beyond mandatory writable metadata. A
-  // 1.5 MiB non-pageable code mapping cannot be admitted by evicting pages.
-  EXPECT_EQ(IndexError_NoMemory, entity.prepare_graph_quantization());
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    EXPECT_EQ(IndexError_NoMemory, entity.prepare_graph_quantization());
+  }
   EXPECT_EQ(nullptr, entity.graph_quantization().quantizer);
-  // Sealing releases writable staging and metadata. Retry the identical
-  // codes within the same total budget, without raising its capacity.
+  // Retry the identical codes in the same total budget. Only cache metadata
+  // remains fixed; code pages share the pool with the graph and vectors.
   ASSERT_EQ(0, entity.prepare_vectors_for_graph());
 
-  const size_t before = pool.external_used();
+  const size_t before = pool.external_used() + pool.metadata_used();
   ASSERT_EQ(0, entity.prepare_graph_quantization());
-  EXPECT_EQ(before + ailego::BudgetedMappedBuffer::mapping_size(code_bytes),
-            pool.external_used());
-  const auto guidance = entity.graph_quantization();
-  EXPECT_EQ(quantizer.get(), guidance.quantizer);
-  ASSERT_NE(nullptr, guidance.codes);
-  EXPECT_EQ(chunks, guidance.code_size);
-  EXPECT_EQ(0, std::memcmp(bytes.data(), guidance.codes, code_bytes));
+  EXPECT_LT(pool.external_used() + pool.metadata_used(),
+            before + code_bytes / 2);
+  {
+    const auto guidance = entity.graph_quantization();
+    EXPECT_EQ(quantizer.get(), guidance.quantizer);
+    EXPECT_EQ(nullptr, guidance.codes);
+    ASSERT_NE(nullptr, guidance.paged_codes);
+    EXPECT_EQ(chunks, guidance.code_size);
+    std::array<uint8_t, 4096> scratch;
+    for (size_t offset = 0; offset < code_bytes;) {
+      const size_t count = std::min(scratch.size(), code_bytes - offset);
+      ASSERT_EQ(count,
+                guidance.paged_codes->fetch(offset, scratch.data(), count));
+      EXPECT_EQ(0, std::memcmp(bytes.data() + offset, scratch.data(), count));
+      offset += count;
+    }
+    ASSERT_EQ(scratch.size(),
+              guidance.paged_codes->fetch(0, scratch.data(), scratch.size()));
+    EXPECT_EQ(0, std::memcmp(bytes.data(), scratch.data(), scratch.size()));
+    EXPECT_LE(pool.used(), pool.capacity());
+    EXPECT_LE(pool.committed(), pool.capacity());
+  }
   entity.release_vectors();
   EXPECT_EQ(nullptr, entity.graph_quantization().quantizer);
   EXPECT_EQ(nullptr, entity.graph_quantization().codes);
+  EXPECT_EQ(nullptr, entity.graph_quantization().paged_codes);
 }
 
 TEST_F(DiskAnnBuilderEntityBufferTest,
