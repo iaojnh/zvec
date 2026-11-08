@@ -39,7 +39,7 @@ jobs:
         with:
           name: buffer-pool-candidate
           path: candidate
-          run-id: 42448658886
+          run-id: 42450103273
           github-token: ${{ github.token }}
       - uses: actions/download-artifact@v8
         with:
@@ -50,9 +50,9 @@ jobs:
       - name: Verify provenance and isolate both packages
         run: |
           mkdir -p evidence
-          python -c 'import json; from pathlib import Path; Path("evidence/diagnostic-source.json").write_text(json.dumps({"diagnostic_only": True, "source_workflow_run": 42448658886, "baseline_workflow_run": 42441676699, "candidate_commit": "7a9eb84e4532cf2b20703cf1c0be81f12fa7bcea"}, indent=2))'
+          python -c 'import json; from pathlib import Path; Path("evidence/diagnostic-source.json").write_text(json.dumps({"diagnostic_only": True, "source_workflow_run": 42450103273, "baseline_workflow_run": 42441676699, "candidate_commit": "6ee1b1733098b90cf2b9d227256dfa1af3a328d7"}, indent=2))'
           git rev-parse HEAD > evidence/harness-commit.txt
-          cmp <(printf '%s\n' 7a9eb84e4532cf2b20703cf1c0be81f12fa7bcea) candidate/commit.txt
+          cmp <(printf '%s\n' 6ee1b1733098b90cf2b9d227256dfa1af3a328d7) candidate/commit.txt
           cmp <(python -c 'import json; print(json.load(open(".github/scripts/buffer_pool_policy.json"))["baseline_commit"])') baseline/commit.txt
           for role in baseline candidate; do
             (cd "$role" && sha256sum -c SHA256SUMS)
