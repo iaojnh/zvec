@@ -351,7 +351,7 @@ TEST_F(StratifiedClusterStorageTest,
     ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(
                      pooled ? 8 * 1024 * 1024 : 0));
     auto cluster = IndexFactory::CreateCluster("StratifiedCluster");
-    ASSERT_EQ(0, cluster->init(meta(), params(pooled ? "KmeansCluster"
+    ASSERT_EQ(0, cluster->init(meta(), params(pooled ? "RejectingSecondCluster"
                                                      : "OptKmeansCluster")));
     auto source = std::make_shared<GeneratedStratifiedHolder>(meta(), 32);
     IndexCluster::CentroidList cents;
@@ -361,6 +361,36 @@ TEST_F(StratifiedClusterStorageTest,
     EXPECT_EQ(0u, source->iterations);
     EXPECT_TRUE(cents.empty());
   }
+}
+
+TEST_F(StratifiedClusterStorageTest,
+       GenericKmeansTrainsOnePassSourceLargerThanPool) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(
+      0, pool.init(4 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
+                   768 * 1024));
+  auto metadata = meta(IndexMeta::DT_FP32, 137);
+  auto source = std::make_shared<GeneratedStratifiedHolder>(
+      metadata, pool.capacity() * 2 / metadata.element_size() + 1);
+  auto cluster = IndexFactory::CreateCluster("StratifiedCluster");
+  auto options = params("KmeansCluster");
+  Params child;
+  child.set(KMEANS_CLUSTER_MAX_ITERATIONS, 2u);
+  options.set(STRATIFIED_CLUSTER_FIRST_PARAMS, child);
+  options.set(STRATIFIED_CLUSTER_SECOND_PARAMS, child);
+  ASSERT_EQ(0, cluster->init(metadata, options));
+  IndexCluster::CentroidList cents;
+  auto *streaming = dynamic_cast<HolderCluster *>(cluster.get());
+  ASSERT_NE(nullptr, streaming);
+  ASSERT_EQ(0, streaming->cluster_holder(threads, source, cents));
+  EXPECT_GT(source->count() * source->element_size(), pool.capacity());
+  EXPECT_EQ(1u, source->iterations);
+  size_t follows = 0;
+  for (const auto &centroid : cents) {
+    EXPECT_TRUE(centroid.feature_stored());
+    follows += centroid.follows();
+  }
+  EXPECT_EQ(source->count(), follows);
 }
 
 TEST_F(StratifiedClusterStorageTest,

@@ -38,6 +38,8 @@ NATIVE_TARGETS = (
     "flat_streamer_buffer_test",
     "turbo_pq_int8_training_memory_test",
     "ivf_buffered_build_test",
+    "opt_kmeans_cluster_test",
+    "stratified_cluster_storage_test",
     "search_heap_test",
     "fts_column_indexer_test",
     "bitpacked_posting_list_test",

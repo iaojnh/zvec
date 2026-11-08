@@ -288,6 +288,142 @@ TEST_P(HolderTrainingTest, MatchesMountedFeatures) {
   }
 }
 
+TEST_P(HolderTrainingTest, GenericKmeansHolderMatchesMountedFeatures) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  const auto &param = GetParam();
+  auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
+  for (bool batch : {false, true}) {
+    for (const size_t count : {1u, 17u, 259u}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "batch=" << batch << " count=" << count);
+      auto holder = std::make_shared<StreamingTestHolder>(
+          param.dimension, count, param.type, param.metric);
+      auto features = Materialize(*holder);
+      auto mounted = IndexFactory::CreateCluster("KmeansCluster");
+      auto streamed = IndexFactory::CreateCluster("KmeansCluster");
+      Params params;
+      params.set(KMEANS_CLUSTER_BATCH, batch);
+      params.set(KMEANS_CLUSTER_MAX_ITERATIONS, 3u);
+      const bool supported =
+          param.type != IndexMeta::DT_FP64 && param.type != IndexMeta::DT_INT16;
+      const int expected_init = supported ? 0 : IndexError_Unsupported;
+      ASSERT_EQ(expected_init, mounted->init(holder->meta_, params));
+      ASSERT_EQ(expected_init, streamed->init(holder->meta_, params));
+      if (!supported) continue;
+      ASSERT_EQ(0, mounted->mount(features));
+      auto *fast = dynamic_cast<HolderCluster *>(streamed.get());
+      ASSERT_NE(nullptr, fast);
+      IndexCluster::CentroidList seeds;
+      const size_t seed_count = std::min({size_t{3}, count, param.dimension});
+      for (size_t i = 0; i < seed_count; ++i)
+        seeds.emplace_back(features->element(i), features->element_size());
+      auto expected = seeds;
+      ASSERT_EQ(0, mounted->cluster(threads, expected));
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        auto actual = seeds;
+        ASSERT_EQ(0, fast->cluster_holder(threads, holder, actual));
+        ExpectSameCentroids(expected, actual);
+        EXPECT_EQ(0u, holder->live_iterators);
+      }
+      EXPECT_EQ(3u, holder->iterations);
+      EXPECT_EQ(count * 3, holder->reads);
+      auto actual = seeds;
+      EXPECT_EQ(IndexError_NoReady, streamed->cluster(threads, actual));
+    }
+  }
+  EXPECT_EQ(0u, pool.used());
+}
+
+TEST(KmeansCluster, HolderTrainingIsPageableAndPreservesExistingMount) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
+  ASSERT_EQ(0, pool.init(2 * 1024 * 1024));
+  {
+    auto holder = std::make_shared<StreamingTestHolder>(768, 4099);
+    auto mounted_holder = std::make_shared<StreamingTestHolder>(768, 17);
+    auto features = Materialize(*mounted_holder);
+    auto cluster = IndexFactory::CreateCluster("KmeansCluster");
+    Params params;
+    params.set(KMEANS_CLUSTER_MAX_ITERATIONS, 2u);
+    ASSERT_EQ(0, cluster->init(holder->meta_, params));
+    ASSERT_EQ(0, cluster->mount(features));
+    auto *fast = dynamic_cast<HolderCluster *>(cluster.get());
+    ASSERT_NE(nullptr, fast);
+    auto threads = std::make_shared<SingleQueueIndexThreads>(2, false);
+    IndexCluster::CentroidList seeds;
+    for (size_t i = 0; i < 3; ++i)
+      seeds.emplace_back(features->element(i), features->element_size());
+    auto expected = seeds;
+    ASSERT_EQ(0, cluster->cluster(threads, expected));
+    holder->offset = 1000;
+    auto streamed = seeds;
+    ASSERT_EQ(0, fast->cluster_holder(threads, holder, streamed));
+    EXPECT_GT(holder->count() * holder->element_size(), pool.capacity());
+    EXPECT_EQ(1u, holder->iterations);
+    EXPECT_EQ(holder->count(), holder->reads);
+    size_t follows = 0;
+    for (const auto &centroid : streamed) {
+      EXPECT_TRUE(centroid.feature_stored());
+      follows += centroid.follows();
+    }
+    EXPECT_EQ(holder->count(), follows);
+    auto actual = seeds;
+    ASSERT_EQ(0, cluster->cluster(threads, actual));
+    ExpectSameCentroids(expected, actual);
+    cluster.reset();
+    std::vector<float> row(768);
+    ASSERT_EQ(0, streamed.front().read_feature(row.data(),
+                                               row.size() * sizeof(float)));
+  }
+  EXPECT_EQ(0u, pool.used());
+}
+
+TEST(KmeansCluster, HolderFailuresLeaveCentroidsAndMountAvailableForRetry) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
+  ASSERT_EQ(0, pool.init(2 * PoolPayloadBudget::storage_metadata_bytes(1024) +
+                         256 * 1024));
+  {
+    auto holder = std::make_shared<StreamingTestHolder>(7, 17);
+    auto features = Materialize(*holder);
+    auto cluster = IndexFactory::CreateCluster("KmeansCluster");
+    ASSERT_EQ(0, cluster->init(holder->meta_, Params()));
+    ASSERT_EQ(0, cluster->mount(features));
+    auto *fast = dynamic_cast<HolderCluster *>(cluster.get());
+    ASSERT_NE(nullptr, fast);
+    auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
+    IndexCluster::CentroidList seed{
+        IndexCluster::Centroid(features->element(0), features->element_size())};
+    for (int fault = 0; fault < 6; ++fault) {
+      holder->fail_iterator = fault == 0;
+      holder->null_at = fault == 1 ? 3 : std::numeric_limits<size_t>::max();
+      holder->reported_count = fault == 2 ? 16 : (fault == 3 ? 18 : 17);
+      holder->error_at = fault == 4 ? 16 : std::numeric_limits<size_t>::max();
+      holder->fail_at_end = fault == 5;
+      auto actual = seed;
+      EXPECT_NE(0, fast->cluster_holder(threads, holder, actual));
+      ExpectSameCentroids(seed, actual);
+      EXPECT_EQ(0u, holder->live_iterators);
+    }
+    holder->fail_at_end = false;
+    holder->reported_count = std::numeric_limits<size_t>::max();
+    const size_t before = holder->iterations;
+    auto actual = seed;
+    EXPECT_EQ(IndexError_NotImplemented,
+              fast->cluster_holder(threads, holder, actual));
+    EXPECT_EQ(before, holder->iterations);
+    holder->reported_count = 17;
+    ASSERT_EQ(0, fast->cluster_holder(threads, holder, actual));
+    ASSERT_EQ(0, cluster->cluster(threads, actual));
+  }
+  EXPECT_EQ(0u, pool.used());
+}
+
 TEST_P(HolderTrainingTest, BufferedTrainingMatchesMemoryAndCleansScratch) {
   auto &pool = PoolPayloadBudget::get_instance();
   const size_t previous = pool.capacity();
