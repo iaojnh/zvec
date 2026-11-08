@@ -259,6 +259,8 @@ class BufferStorageWriteTest : public ::testing::Test {
   }
 #endif
 
+  void check_shared_cache_reserve(size_t capacity);
+
   std::string file_path_;
 };
 
@@ -1752,9 +1754,9 @@ TEST_F(BufferStorageWriteTest,
 }
 #endif
 
-TEST_F(BufferStorageWriteTest, ReadOnlyBatchPreservesSharedCacheReserve) {
+void BufferStorageWriteTest::check_shared_cache_reserve(size_t capacity) {
   auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
-  ASSERT_EQ(0, memory_pool.init(256UL << 20));
+  ASSERT_EQ(0, memory_pool.init(capacity));
   size_t metadata_charge = 0;
   AILEGO_DEFER([&] {
     memory_pool.release_metadata(metadata_charge);
@@ -1792,7 +1794,9 @@ TEST_F(BufferStorageWriteTest, ReadOnlyBatchPreservesSharedCacheReserve) {
   const size_t available_before = memory_pool.available();
   ASSERT_GT(shared_reserve, page_size);
   ASSERT_GT(available_before, shared_reserve);
-  const size_t count = (available_before - shared_reserve) / page_size + 1;
+  // Request substantially more pages than page admission permits. A one-page
+  // excess combined with a one-page tolerance cannot detect a missing reserve.
+  const size_t count = (available_before - shared_reserve / 2) / page_size + 1;
   ASSERT_LT(first + count * page_size, segment->data_size());
 
   std::vector<IndexStorage::MemoryBlock> blocks(count);
@@ -1816,13 +1820,40 @@ TEST_F(BufferStorageWriteTest, ReadOnlyBatchPreservesSharedCacheReserve) {
                << before.slab_header_bytes << "->" << after.slab_header_bytes
                << " external=" << before.external_used << "->"
                << after.external_used);
-  const size_t external = memory_pool.external_used();
+  const size_t external = after.external_used;
   const size_t remaining_reserve =
       shared_reserve > external ? shared_reserve - external : 0;
+  const size_t allocator_before =
+      before.queue_metadata_used + before.slab_header_bytes;
+  const size_t allocator_after =
+      after.queue_metadata_used + after.slab_header_bytes;
+  const size_t allocator_growth =
+      allocator_after - std::min(allocator_after, allocator_before);
+  // New queue mappings and slab headers are non-page consumers too. Account
+  // for their measured growth rather than attributing it to cached pages.
   EXPECT_GT(remaining_reserve, 0u);
-  EXPECT_GE(memory_pool.available() + page_size, remaining_reserve);
+  const size_t available_after =
+      after.pool_size - std::min(after.pool_size, after.used);
+  RecordProperty("shared_reserve_bytes", std::to_string(shared_reserve));
+  RecordProperty("allocator_growth_bytes", std::to_string(allocator_growth));
+  RecordProperty("available_after_bytes", std::to_string(available_after));
+  RecordProperty("external_after_bytes", std::to_string(external));
+  EXPECT_GE(available_after + allocator_growth, remaining_reserve);
+  EXPECT_LE(after.used, after.pool_size);
   blocks.clear();
   EXPECT_EQ(0, storage->close());
+}
+
+TEST_F(BufferStorageWriteTest, ReadOnlyBatchPreservesSharedCacheReserve) {
+  check_shared_cache_reserve(256UL << 20);
+}
+
+TEST_F(BufferStorageWriteTest,
+       ReadOnlyBatchPreservesSaturatedSharedCacheReserve) {
+  // Metadata pressure still leaves only 64 MiB of real headroom. The saturated
+  // 32 MiB shared reserve is larger than the ordinary reclaim watermark, so
+  // this case independently checks the page-specific admission policy.
+  check_shared_cache_reserve(512UL << 20);
 }
 
 // Writable reads own independent snapshots and release them with each block.
