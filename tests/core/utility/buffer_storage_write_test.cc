@@ -39,6 +39,17 @@
 using namespace zvec;
 using namespace zvec::core;
 
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static void stop_background(MemoryLimitPool &pool) {
+    pool.stop_background_evictor();
+  }
+  static void start_background(MemoryLimitPool &pool) {
+    pool.start_background_evictor();
+  }
+};
+}  // namespace zvec::ailego
+
 namespace zvec::core {
 struct ReusableReadScratchTestPeer {
   static ailego::version_t fail_membership(ReusableReadScratch &source,
@@ -2292,6 +2303,14 @@ TEST_F(BufferStorageWriteTest, CachedScalarScratchWorksAtFullBudget) {
 
 TEST_F(BufferStorageWriteTest,
        OverlappingSnapshotsRecycleAfterCrossThreadReleaseAtFullBudget) {
+  // Exact address and charge reuse requires the idle slots to stay cached.
+  // Filling the quota otherwise lets background eviction reclaim those slots
+  // before the foreground read, as the pressure-reclamation tests require.
+  auto &actual_pool = ailego::MemoryLimitPool::get_instance();
+  ailego::MemoryLimitPoolTestPeer::stop_background(actual_pool);
+  AILEGO_DEFER([&] {
+    ailego::MemoryLimitPoolTestPeer::start_background(actual_pool);
+  });
   auto storage = open_writable();
   ASSERT_TRUE(storage);
   ASSERT_EQ(0, storage->append("overlap", 2 * ailego::kVectorPageSize));
@@ -2321,8 +2340,8 @@ TEST_F(BufferStorageWriteTest,
     auto cache = storage->vec_buffer_pool();
     ASSERT_TRUE(cache);
     ASSERT_EQ(0, cache->flush_all());
-    // Filling the quota wakes background eviction. Keep source pages resident
-    // so readmission cannot be mistaken for a new snapshot allocation.
+    // Keep source pages resident so readmission cannot be mistaken for a new
+    // snapshot allocation.
     const auto first = segment->data_offset() / ailego::kVectorPageSize;
     const auto last =
         (segment->data_offset() + before.size() - 1) / ailego::kVectorPageSize;
@@ -2339,7 +2358,9 @@ TEST_F(BufferStorageWriteTest,
         ailego::kVectorPageSize;
     for (size_t page = 0; page < file_pages; ++page) {
       const bool reclaimed = cache->page_table_.reclaim_clean_block(page);
-      if (page >= first && page <= last) EXPECT_FALSE(reclaimed);
+      if (page >= first && page <= last) {
+        EXPECT_FALSE(reclaimed);
+      }
     }
     pressure.add(pool.available());
     ASSERT_EQ(0u, pool.available());
@@ -2609,7 +2630,7 @@ TEST_F(BufferStorageWriteTest, IdleScratchIsReleasedForRequiredGrowth) {
 TEST_F(BufferStorageWriteTest, IdleSnapshotsYieldBudgetAcrossLiveSources) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const auto baseline = pool.external_used();
-  constexpr size_t kBytes = 16UL << 10;
+  static constexpr size_t kBytes = 16UL << 10;
   std::vector<std::unique_ptr<ReusableReadScratch>> sources;
   for (size_t i = 0; i < 24; ++i) {
     sources.emplace_back(std::make_unique<ReusableReadScratch>());
