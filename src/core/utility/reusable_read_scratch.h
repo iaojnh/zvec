@@ -6,6 +6,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/core/framework/index_storage.h>
 
@@ -70,7 +71,10 @@ class ReusableReadScratch {
     try {
       if (first) metadata_.add(sizeof(entries_));
       auto worker = std::allocate_shared<Worker>(
-          ailego::BudgetedAllocator<Worker>{}, std::move(backing), bytes);
+          ailego::BudgetedAllocator<Worker>{});
+      // Optional owner registration may allocate. Keep the required backing
+      // outside the worker until construction succeeds so refusal can return it.
+      worker->initialize(std::move(backing), bytes);
       empty->thread = thread;
       empty->worker = std::move(worker);
       recent[next++ % recent.size()] = {generation_, empty};
@@ -103,12 +107,24 @@ class ReusableReadScratch {
   }
 
  private:
-  class Worker {
+  class Worker : public ailego::EvictableBlockOwner {
    public:
-    Worker(Block backing, size_t capacity) : retained_(capacity) {
+    Worker() {
       first_.worker = this;
+      ailego::BlockEvictionQueue::get_instance().set_valid(this);
+    }
+
+    ~Worker() override {
+      // Queue callbacks hold the owner registry's shared lock. Unregister
+      // before destroying slots or their mutex, including cross-thread release.
+      ailego::BlockEvictionQueue::get_instance().set_invalid(this);
+    }
+
+    void initialize(Block backing, size_t capacity) {
+      std::lock_guard<std::mutex> lock(mutex_);
       first_.backing = std::move(backing);
       first_.capacity = capacity;
+      retained_ = capacity;
       allocated_ = 1;
     }
 
@@ -153,7 +169,14 @@ class ReusableReadScratch {
       }
       // Admission keeps the previous backing charged until replacement
       // succeeds. Failure unwinds the lock before the outer idle-cache trim.
+      AllocationScope allocating(this);
       auto replacement = allocate();
+      if (!enqueue_locked()) {
+        // The read already fits. Failed optional queue metadata must neither
+        // reject it nor leave idle backing outside the pressure reclaim path.
+        discard_idle_locked();
+        return replacement;
+      }
       if (index && !overflow_) {
         try {
           overflow_ = std::allocate_shared<Overflow>(
@@ -173,6 +196,102 @@ class ReusableReadScratch {
 
     void discard_idle() {
       std::lock_guard<std::mutex> lock(mutex_);
+      discard_idle_locked();
+    }
+
+    bool is_dead_block(size_t key, size_t version) override {
+      return key != version ||
+             membership_.load(std::memory_order_relaxed) != version;
+    }
+
+    uint8_t eviction_priority(size_t) const override {
+      return ailego::BlockEvictionQueue::kExplicitHotPriority;
+    }
+
+    bool evict_inactive_block(size_t key) override {
+      return reclaim(key, true);
+    }
+
+    bool evict_block(size_t key) override {
+      return reclaim(key, false);
+    }
+
+    void eviction_requeue_failed(size_t, size_t version) override {
+      membership_.compare_exchange_strong(version, 0, std::memory_order_relaxed);
+    }
+
+    size_t recover_eviction_queue() override {
+      if (allocating_ == this) return 0;
+      std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+      if (!lock || !retained_ || membership_.load(std::memory_order_relaxed))
+        return 0;
+      return enqueue_locked() ? 1 : 0;
+    }
+
+   private:
+    // Required allocation can synchronously call the eviction queue while
+    // holding mutex_. Avoid even try_lock on a mutex owned by this thread;
+    // std::mutex does not define that operation. Cache hits need no TLS write.
+    struct AllocationScope {
+      explicit AllocationScope(Worker *worker) : previous(allocating_) {
+        allocating_ = worker;
+      }
+      ~AllocationScope() { allocating_ = previous; }
+      Worker *previous;
+    };
+    inline static thread_local Worker *allocating_{nullptr};
+
+    // Called with mutex_ held. A hot reuse only reads the existing membership;
+    // insertion and its optional allocations happen once per retained cache.
+    ailego_force_inline bool enqueue_locked() {
+      if (ailego_likely(membership_.load(std::memory_order_relaxed))) return true;
+      return enqueue_slow_locked();
+    }
+
+    bool enqueue_slow_locked() {
+      auto &queue = ailego::BlockEvictionQueue::get_instance();
+      const auto version = queue.next_version();
+      membership_.store(version, std::memory_order_relaxed);
+      if (queue.add_single_block({version, version, this}, eviction_priority(0)))
+        return true;
+      eviction_requeue_failed(version, version);
+      return false;
+    }
+
+    void requeue(size_t version) {
+      if (membership_.load(std::memory_order_relaxed) != version) return;
+      auto &queue = ailego::BlockEvictionQueue::get_instance();
+      if (!queue.add_single_block({version, version, this}, eviction_priority(0)))
+        eviction_requeue_failed(version, version);
+    }
+
+    bool reclaim(size_t version, bool second_chance) {
+      // Allocation can enter reclamation while this worker is already locked.
+      // Never wait on it from the eviction queue (or its owner registry lock).
+      if (allocating_ == this) {
+        if (!second_chance) requeue(version);
+        return false;
+      }
+      std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+      if (!lock) {
+        if (!second_chance) requeue(version);
+        return false;
+      }
+      if (membership_.load(std::memory_order_relaxed) != version) return false;
+      if (second_chance && referenced_) {
+        referenced_ = false;
+        return false;  // The inactive-sampling caller requeues this membership.
+      }
+      const auto before = retained_;
+      discard_idle_locked();
+      const bool reclaimed = retained_ < before;
+      // A remaining live reader keeps its own backing and queue membership.
+      // Inactive sampling requeues a failed probe itself; other pops do not.
+      if (retained_ && (!second_chance || reclaimed)) requeue(version);
+      return reclaimed;
+    }
+
+    void discard_idle_locked() {
       uint64_t idle = allocated_ & ~busy_;
       while (idle) {
         const size_t index = first_slot(idle);
@@ -184,9 +303,10 @@ class ReusableReadScratch {
         idle &= idle - 1;
       }
       if (!(allocated_ & ~uint64_t{1})) overflow_.reset();
+      if (!retained_ && membership_.exchange(0, std::memory_order_relaxed))
+        ailego::BlockEvictionQueue::get_instance().request_dead_entry_cleanup();
     }
 
-   private:
     struct Slot : Block::ScratchLease {
       void retain() noexcept override {
         std::lock_guard<std::mutex> lock(worker->mutex_);
@@ -194,9 +314,17 @@ class ReusableReadScratch {
         ++readers;
       }
       void release() noexcept override {
-        std::lock_guard<std::mutex> lock(worker->mutex_);
+        auto *owner = worker;
+        std::lock_guard<std::mutex> lock(owner->mutex_);
         assert(readers);
-        if (--readers == 0) worker->busy_ &= ~(uint64_t{1} << index);
+        if (--readers == 0) {
+          owner->busy_ &= ~(uint64_t{1} << index);
+          // Failed requeues must not leave newly idle backing unreclaimable.
+          // This may drop the overflow table containing this slot; no slot
+          // fields are accessed afterward, and the lease still owns Worker.
+          if (!owner->membership_.load(std::memory_order_relaxed))
+            owner->discard_idle_locked();
+        }
       }
       bool reusable(size_t bytes, size_t alignment) const noexcept override {
         std::lock_guard<std::mutex> lock(worker->mutex_);
@@ -231,6 +359,15 @@ class ReusableReadScratch {
                  bool deep_copy) {
       auto &cached = slot(index);
       assert(!cached.readers);
+      if (!enqueue_locked()) {
+        auto backing = std::move(cached.backing);
+        retained_ -= cached.capacity;
+        cached.capacity = 0;
+        allocated_ &= ~(uint64_t{1} << index);
+        discard_idle_locked();
+        return backing;
+      }
+      referenced_ = true;
       cached.readers = 1;
       busy_ |= uint64_t{1} << index;
       // Aliasing ownership keeps all slot addresses stable across close and
@@ -240,6 +377,8 @@ class ReusableReadScratch {
           std::shared_ptr<Block::ScratchLease>(self, &cached), deep_copy);
     }
     mutable std::mutex mutex_;
+    std::atomic<ailego::version_t> membership_{0};
+    bool referenced_{false};
     size_t retained_{0};
     uint64_t allocated_{0}, busy_{0};
     Slot first_;
