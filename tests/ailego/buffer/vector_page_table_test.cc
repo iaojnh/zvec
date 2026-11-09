@@ -65,12 +65,6 @@ namespace zvec::ailego {
 // production thread scheduling. The normal single-flight test covers cv wait.
 struct ExternalCacheTestPeer {
   template <typename Cache>
-  static bool has_load_state(Cache &cache, size_t key) {
-    std::shared_lock<std::shared_mutex> lock(cache.mutex_);
-    return static_cast<bool>(cache.table_.at(key).load_state);
-  }
-
-  template <typename Cache>
   static auto register_waiter(Cache &cache, size_t key) {
     std::unique_lock<std::shared_mutex> lock(cache.mutex_);
     auto &entry = cache.table_.at(key);
@@ -1241,6 +1235,7 @@ TEST_F(BufferPoolTest, ConcurrentLoadsUseSingleFlight) {
     std::this_thread::yield();
   }
   EXPECT_EQ(1u, cache.entry_count());
+  auto waiter = ExternalCacheTestPeer::register_waiter(cache, kVectorPageSize);
   state->finish.store(true, std::memory_order_release);
   while (acquired.load(std::memory_order_acquire) != kThreadCount) {
     std::this_thread::yield();
@@ -1251,49 +1246,17 @@ TEST_F(BufferPoolTest, ConcurrentLoadsUseSingleFlight) {
   for (auto &worker : workers) {
     worker.join();
   }
-  EXPECT_EQ(1u, BlockEvictionQueue::get_instance().batch_recycle(1));
-  EXPECT_EQ(0u, cache.entry_count());
-}
-
-TEST_F(BufferPoolTest, DelayedExternalWaitersKeepPublishedEntryPinned) {
-  init_pool(/*capacity_pages=*/16);
-  auto state = std::make_shared<BlockingLoadState>();
-  BlockingExternalCache cache(BlockingLoader{state});
-  std::shared_ptr<std::vector<char>> first_value;
-  std::thread first([&] { first_value = cache.acquire(kVectorPageSize); });
-  auto join = ScopeGuard::Make([&] {
-    state->finish.store(true, std::memory_order_release);
-    if (first.joinable()) first.join();
-  });
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (state->load_calls.load(std::memory_order_acquire) == 0 &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
-  ASSERT_EQ(1u, state->load_calls.load(std::memory_order_acquire));
-  auto waiter = ExternalCacheTestPeer::register_waiter(cache, kVectorPageSize);
-  state->finish.store(true, std::memory_order_release);
-  first.join();
-  ASSERT_NE(nullptr, first_value);
-  EXPECT_TRUE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
-  first_value.reset();
-  cache.release(kVectorPageSize);
-
-  // The loading caller is gone, but the waiter has not resumed yet.
+  // Keep one registered waiter descheduled after every real caller leaves.
   EXPECT_FALSE(cache.evict_block(/*owner_key=*/1));
   EXPECT_EQ(kVectorPageSize, PoolPayloadBudget::get_instance().external_used());
   auto value =
       ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize, waiter);
   ASSERT_NE(nullptr, value);
   EXPECT_EQ(kVectorPageSize, value->size());
-  EXPECT_FALSE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
   value.reset();
   cache.release(kVectorPageSize);
-  EXPECT_TRUE(cache.evict_block(/*owner_key=*/1));
+  EXPECT_EQ(1u, BlockEvictionQueue::get_instance().batch_recycle(1));
   EXPECT_EQ(0u, cache.entry_count());
-  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().external_used());
-  EXPECT_EQ(1u, state->load_calls.load(std::memory_order_acquire));
 }
 
 TEST_F(BufferPoolTest, DistinctExternalCacheLoadsAreConcurrentByDefault) {

@@ -1,7 +1,6 @@
 #include <future>
 #include <memory>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 #include <ailego/utility/math_helper.h>
@@ -737,8 +736,7 @@ class FailingFlatStorage : public IndexStorage {
   std::shared_ptr<FlatWriteFailure> failure_;
 };
 
-class FlatStreamerWriteFailureTest
-    : public testing::TestWithParam<std::tuple<uint32_t, size_t>> {
+class FlatStreamerWriteFailureTest : public ::testing::Test {
  protected:
   void SetUp() override {
     auto &pool = PoolPayloadBudget::get_instance();
@@ -783,9 +781,9 @@ class FlatStreamerWriteFailureTest
   std::unique_ptr<FlatStreamerEntity> entity_;
 };
 
-TEST_P(FlatStreamerWriteFailureTest, PropagatesShortWritesAndRetriesSameId) {
-  const uint32_t id = std::get<0>(GetParam());
-  const size_t failed_write = std::get<1>(GetParam());
+TEST_F(FlatStreamerWriteFailureTest, PropagatesShortWritesAndRetriesSameId) {
+  constexpr uint32_t id = 3;
+  constexpr size_t failed_write = 3;
   const std::vector<float> first{1.0f, 2.0f, 3.0f, 4.0f};
   const std::vector<float> added{5.0f, 6.0f, 7.0f, 8.0f};
   const uint32_t bytes = static_cast<uint32_t>(first.size() * sizeof(float));
@@ -825,9 +823,6 @@ TEST_P(FlatStreamerWriteFailureTest, PropagatesShortWritesAndRetriesSameId) {
     EXPECT_EQ(kInvalidKey, entity_->key(hole));
   }
 }
-
-INSTANTIATE_TEST_SUITE_P(AppendAndIdHole, FlatStreamerWriteFailureTest,
-                         testing::Values(std::tuple{3u, size_t{3}}));
 
 }  // namespace
 
