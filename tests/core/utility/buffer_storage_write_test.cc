@@ -2301,13 +2301,40 @@ TEST_F(BufferStorageWriteTest,
   receiver.join();
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   {
+    auto cache = storage->vec_buffer_pool();
+    ASSERT_TRUE(cache);
+    ASSERT_EQ(0, cache->flush_all());
+    // Filling the quota wakes background eviction. Keep source pages resident
+    // so readmission cannot be mistaken for a new snapshot allocation.
+    const auto first = segment->data_offset() / ailego::kVectorPageSize;
+    const auto last =
+        (segment->data_offset() + before.size() - 1) / ailego::kVectorPageSize;
+    const ailego::block_id_t source_ids[] = {first, last};
+    const size_t source_count = first == last ? 1 : 2;
+    char *source_pages[2] = {};
+    ASSERT_TRUE(cache->try_acquire_resident_pages(source_ids, source_count,
+                                                  source_pages));
+    AILEGO_DEFER([&]() { cache->release_pages(source_ids, source_count); });
     ailego::MemoryReservation pressure;
     pressure.add(pool.available());
+    const size_t file_pages =
+        (cache->file_size() + ailego::kVectorPageSize - 1) /
+        ailego::kVectorPageSize;
+    for (size_t page = 0; page < file_pages; ++page) {
+      const bool reclaimed = cache->page_table_.reclaim_clean_block(page);
+      if (page >= first && page <= last) EXPECT_FALSE(reclaimed);
+    }
+    pressure.add(pool.available());
+    ASSERT_EQ(0u, pool.available());
     const size_t used = pool.used();
+    const size_t external = pool.external_used();
+    const size_t misses = cache->stats().miss;
     for (size_t i = 0; i < retained.size() / 2; ++i) {
       ASSERT_EQ(after.size(), segment->read(0, retained[i], after.size()));
       EXPECT_EQ(addresses[i], retained[i].data());
       EXPECT_EQ(used, pool.used());
+      EXPECT_EQ(external, pool.external_used());
+      EXPECT_EQ(misses, cache->stats().miss);
     }
   }
   ASSERT_EQ(0, storage->close());
