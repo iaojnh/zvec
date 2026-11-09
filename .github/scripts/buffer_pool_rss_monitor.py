@@ -126,11 +126,21 @@ def observe(args):
     trace = RssTrace(args.target_kib)
     recovery_start = None
     recovery = None
+    resources = None
+    state_path = os.environ.get("ZVEC_BUILD_RESOURCE_STATE")
+    if state_path:
+        from buffer_pool_build_resources import ResourceCollector
+
+        resources = ResourceCollector(
+            args.pid, state_path, args.samples.with_suffix(".resources.jsonl")
+        )
     with args.samples.open("x") as output:
         while True:
             now = time.monotonic()
             rss = read_rss(args.pid)
             trace.add(now, rss)
+            if resources:
+                resources.sample(now, force=args.stop.exists())
             print(
                 json.dumps({"monotonic_seconds": now, "rss_kib": rss}),
                 file=output,
@@ -148,6 +158,8 @@ def observe(args):
                     break
             time.sleep(POLICY["rss_sampling_interval_seconds"])
     args.output.write_text(json.dumps(trace.result(recovery)))
+    if resources:
+        resources.close()
 
 
 class ProcessRssMonitor:
@@ -180,7 +192,10 @@ class ProcessRssMonitor:
             "--samples",
             str(samples),
         ]
-        self.process = subprocess.Popen(command, stdout=subprocess.DEVNULL)
+        self.process = subprocess.Popen(
+            command,
+            stdout=None if os.environ.get("ZVEC_BUILD_RESOURCE_STATE") else subprocess.DEVNULL,
+        )
         deadline = time.monotonic() + 15
         try:
             while not self.ready.exists():

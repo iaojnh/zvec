@@ -1,0 +1,129 @@
+name: Buffer Pool build resource profile
+
+on:
+  push:
+    branches: [codex/ci-build-resource-profile-20261109]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-resource-profile-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_NUM_THREADS: '1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: buffer-pool-acceptance-linux-x64
+          max-size: 1G
+      - name: Build unchanged product and bounded diagnostic helpers
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+          ZVEC_PROFILE_SYMBOLS: ${{ runner.temp }}/profile-symbols
+        run: |
+          chmod +x .github/scripts/buffer_pool_profile_strip.py
+          python -m pip install pybind11==3.0 cmake==3.30.0 ninja==1.11.1 scikit-build-core setuptools_scm
+          python -m pip wheel . --no-deps --no-build-isolation --wheel-dir profile-artifact \
+            -C cmake.define.AUTO_DETECT_ARCH=OFF \
+            -C cmake.define.BUILD_C_BINDINGS=ON \
+            -C cmake.define.BUILD_ZVEC_SHARED=OFF \
+            -C cmake.define.BUILD_ZVEC_AILEGO_SHARED=OFF \
+            -C cmake.define.BUILD_ZVEC_CORE_SHARED=OFF \
+            -C "cmake.define.CMAKE_STRIP=$PWD/.github/scripts/buffer_pool_profile_strip.py" \
+            -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
+            -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          python .github/scripts/buffer_pool_build_profile_prepare.py profile-artifact
+          c++ -std=c++17 -O2 .github/scripts/test_buffer_pool_build_probe.cc -pthread -ldl -o profile-artifact/probe-test
+          LD_PRELOAD="$PWD/profile-artifact/build-wait-probe.so" profile-artifact/probe-test "$RUNNER_TEMP/probe-selftest.shared"
+          python .github/scripts/test_buffer_pool_build_resources.py
+          python -m pip install profile-artifact/*.whl
+          LD_PRELOAD="$PWD/profile-artifact/build-wait-probe.so" python .github/scripts/buffer_pool_build_profile_smoke.py \
+            profile-artifact/probe-manifest.json "$RUNNER_TEMP/probe-wheel-smoke"
+          (cd profile-artifact && sha256sum ./*.whl ./build-wait-probe.so ./probe-manifest.json > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-profile-runtime
+          path: |
+            profile-artifact/*.whl
+            profile-artifact/build-wait-probe.so
+            profile-artifact/probe-manifest.json
+            profile-artifact/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  profile:
+    needs: prepare
+    name: DiskANN 400K resources (${{ matrix.budget }} MiB)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {budget: 512, cap: 768}
+          - {budget: 1024, cap: 1536}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-profile-runtime
+          path: profile-artifact
+      - name: Run identical corpus and parameters with CPU, IO and budget wait observation
+        env:
+          PROFILE_BUDGET: ${{ matrix.budget }}
+          PROFILE_CAP: ${{ matrix.cap }}
+        run: |
+          set -o pipefail
+          (cd profile-artifact && sha256sum -c SHA256SUMS)
+          python -m pip install profile-artifact/*.whl
+          mkdir -p evidence
+          cp profile-artifact/probe-manifest.json evidence/
+          test "$(df --output=avail -k "$RUNNER_TEMP" | tail -1)" -gt 6291456
+          python_path=$(command -v python)
+          limit_bytes=$((PROFILE_CAP * 1024 * 1024))
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit="build-profile-${PROFILE_BUDGET}-${{ github.run_id }}" \
+            --property="MemoryMax=${PROFILE_CAP}M" --property=MemorySwapMax=0 \
+            --property=LimitNOFILE=65536 --uid="$(id -u)" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --setenv=OPENBLAS_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
+            --setenv="ZVEC_BUILD_PROFILE_LOG=$GITHUB_WORKSPACE/evidence/build.log" \
+            --setenv="LD_PRELOAD=$GITHUB_WORKSPACE/profile-artifact/build-wait-probe.so" \
+            "$python_path" .github/scripts/buffer_pool_system_limit.py "$limit_bytes" evidence/cgroup.jsonl \
+            "$python_path" -u .github/scripts/buffer_pool_build_profile.py \
+            "$RUNNER_TEMP/profile-collection" "$GITHUB_WORKSPACE/evidence/workload" \
+            "$GITHUB_WORKSPACE/profile-artifact/probe-manifest.json" \
+            --budget-mib "$PROFILE_BUDGET" --system-limit-mib "$PROFILE_CAP" \
+            2>&1 | tee evidence/build.log
+          python .github/scripts/buffer_pool_build_profile_report.py evidence/workload
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: build-resources-${{ matrix.budget }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
