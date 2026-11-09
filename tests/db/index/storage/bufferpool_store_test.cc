@@ -13,6 +13,7 @@
 // limitations under the License.
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -209,6 +210,54 @@ TEST_F(BufferPoolStoreTest, MetadataHintRequiresMatchingFileIdentity) {
 
   reader.reset();
   EXPECT_TRUE(hinted.metadata.expired());
+}
+
+TEST_F(BufferPoolStoreTest, MultiColumnFetchRefreshesIdentityBetweenCalls) {
+  const auto write_rows = [&](int64_t start) {
+    arrow::Int64Builder first, second;
+    ASSERT_TRUE(first.AppendValues({start, start + 1}).ok());
+    ASSERT_TRUE(second.AppendValues({start + 100, start + 101}).ok());
+    std::shared_ptr<arrow::Array> a, b;
+    ASSERT_TRUE(first.Finish(&a).ok());
+    ASSERT_TRUE(second.Finish(&b).ok());
+    auto schema = arrow::schema(
+        {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+    auto output = arrow::io::FileOutputStream::Open(parquet_path);
+    ASSERT_TRUE(output.ok());
+    ASSERT_TRUE(parquet::arrow::WriteTable(*arrow::Table::Make(schema, {a, b}),
+                                           arrow::default_memory_pool(),
+                                           *output, 1)
+                    .ok());
+    ASSERT_TRUE((*output)->Close().ok());
+  };
+  ASSERT_NO_FATAL_FAILURE(write_rows(10));
+  const auto original_mtime = std::filesystem::last_write_time(parquet_path);
+  BufferPoolForwardStore store(parquet_path);
+  ASSERT_TRUE(store.open().ok());
+  const auto check_rows = [&](int64_t start) {
+    auto batch = store.fetch({"b", "a", "b"}, std::vector<int>{1, 0, 1});
+    ASSERT_NE(nullptr, batch);
+    for (int column = 0; column < 3; ++column) {
+      const int64_t base = start + (column == 1 ? 0 : 100);
+      EXPECT_EQ(std::to_string(base + 1),
+                batch->column(column)->GetScalar(0).ValueOrDie()->ToString());
+      EXPECT_EQ(std::to_string(base),
+                batch->column(column)->GetScalar(1).ValueOrDie()->ToString());
+    }
+    auto scalar = store.fetch({"a", "b"}, 1);
+    ASSERT_NE(nullptr, scalar);
+    EXPECT_EQ(start + 1, std::static_pointer_cast<arrow::Int64Scalar>(
+                             scalar->values[0].scalar())
+                             ->value);
+    EXPECT_EQ(start + 101, std::static_pointer_cast<arrow::Int64Scalar>(
+                               scalar->values[1].scalar())
+                               ->value);
+  };
+  ASSERT_NO_FATAL_FAILURE(check_rows(10));
+  ASSERT_NO_FATAL_FAILURE(write_rows(30));
+  std::filesystem::last_write_time(parquet_path,
+                                   original_mtime + std::chrono::seconds(2));
+  ASSERT_NO_FATAL_FAILURE(check_rows(30));
 }
 
 TEST_F(BufferPoolStoreTest, CacheKeyCopiesShareBudgetUntilLastOwner) {
