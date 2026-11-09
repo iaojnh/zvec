@@ -1580,6 +1580,7 @@ void MemoryLimitPool::stop_background_evictor() {
 void MemoryLimitPool::background_evict_loop() {
   using std::chrono::milliseconds;
   bool idle_progress = false;
+  bool reclaim_to_low = false;
   auto last_process_reclaim = std::chrono::steady_clock::time_point{};
   const auto page_admission_pressure = [this] {
     // Reserved headroom can block page admission below both general
@@ -1605,6 +1606,7 @@ void MemoryLimitPool::background_evict_loop() {
     const size_t requested =
         cache_reclaim_requested_.exchange(0, std::memory_order_relaxed);
     if (requested && (used() > low_watermark() || process_rss_.pressure())) {
+      reclaim_to_low = true;
       const size_t n = BlockEvictionQueue::get_instance()
                            .reclaim_for_allocation(requested);
       bg_evicted_buffers_.fetch_add(n, std::memory_order_relaxed);
@@ -1637,12 +1639,19 @@ void MemoryLimitPool::background_evict_loop() {
         retired != 0 ||
         (trimmed && used_size_.load(std::memory_order_relaxed) == fixed_used());
     const size_t low = low_watermark();
-    if (used_size_.load() > low || page_admission_pressure()) {
+    // The low watermark is a stopping target, not an independent trigger.
+    // A maintenance timeout must leave a fitting working set between the
+    // two watermarks resident. Remember real pressure across no-progress
+    // passes so a high-watermark reclaim still completes to the low mark.
+    reclaim_to_low = reclaim_to_low || should_background_reclaim() ||
+                     page_admission_pressure();
+    if (reclaim_to_low &&
+        (used_size_.load() > low || page_admission_pressure())) {
       bg_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
     }
     // Reclaim to the low watermark and make room for page admission so the
     // foreground path finds ready buffers without a deep inline queue walk.
-    while (bg_running_.load() &&
+    while (bg_running_.load() && reclaim_to_low &&
            (used_size_.load() > low || page_admission_pressure())) {
       size_t n = evictable_cache_used() != 0
                      ? BlockEvictionQueue::get_instance().reclaim_for_allocation(
@@ -1664,6 +1673,8 @@ void MemoryLimitPool::background_evict_loop() {
         process_rss_.refresh(true);
       }
     }
+    if (used_size_.load() <= low && !page_admission_pressure())
+      reclaim_to_low = false;
   }
 }
 
