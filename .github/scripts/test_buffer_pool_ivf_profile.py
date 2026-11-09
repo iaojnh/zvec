@@ -78,7 +78,10 @@ def evidence(tmp_path):
                 "write_operations": 1536 * config["mixed"]["cycles"],
                 "reader_queries": 12,
                 "reader_queries_during_writes": 12,
+                "write_visibility_checks": config["mixed"]["cycles"]
+                * config["mixed"]["batches"],
                 "fields_and_vectors_verified": True,
+                "new_vector_query_verified": True,
                 "post_build_query_verified": True,
                 "recall": 1.0,
             }
@@ -279,6 +282,16 @@ def test_profile_cannot_be_qualified_from_incomplete_or_mixed_results(evidence, 
 
         change(path, mutate)
     with pytest.raises((AssertionError, FileNotFoundError)):
+        evaluate(profile, root)
+
+
+def test_unchecked_write_visibility_cannot_qualify(evidence):
+    profile, root = evidence
+    change(
+        root / "buffer-mixed-1.json",
+        lambda value: value.update(write_visibility_checks=0),
+    )
+    with pytest.raises(AssertionError, match="not checked for search visibility"):
         evaluate(profile, root)
 
 

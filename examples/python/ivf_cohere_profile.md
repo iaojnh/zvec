@@ -37,6 +37,10 @@ runs while the reader remains active. Exact truth incorporates the new vectors;
 the final live count is 1,002,048. A fresh process verifies queries, fields,
 vectors and last-update payloads. Build also tests reopen/query before its own
 process exits, covering retained build-time heap at the transition.
+After each flushed batch, the writer searches the new vector and requires its
+ID at top-1 before optimization, while the background reader remains active.
+The fresh-process check repeats that search after reopen. Thus mixed validation
+can briefly have two query callers; `readers=1` is the background worker count.
 
 ## Prepare input and run
 

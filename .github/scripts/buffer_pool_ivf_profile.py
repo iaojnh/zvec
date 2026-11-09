@@ -174,8 +174,13 @@ def validate_lifecycle(config, evidence, digest, storage):
             )
             assert value["reader_queries"] > 0
             assert value["reader_queries_during_writes"] > 0
+            assert (
+                value["write_visibility_checks"]
+                == config["mixed"]["cycles"] * config["mixed"]["batches"]
+            ), "flushed writes were not checked for search visibility"
         if stage == "verify":
             assert value["fields_and_vectors_verified"] is True
+            assert value["new_vector_query_verified"] is True
             assert value["recall"] >= config["acceptance"]["minimum_recall"]
     return values
 

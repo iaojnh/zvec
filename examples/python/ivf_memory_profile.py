@@ -145,6 +145,14 @@ def check_statuses(statuses, count):
         raise AssertionError(f"write failed: {statuses!r}")
 
 
+def check_searchable(config, collection, expected_id, vector):
+    hits = query(config, collection, vector.tolist())
+    check_hits(hits, [expected_id], config["query"]["topk"])
+    if hits[0].id != expected_id:
+        raise AssertionError(f"written vector {expected_id} is not searchable at top-1")
+    return 1
+
+
 def documents(config, start, batch, cycle=0):
     return [
         zvec.Doc(
@@ -320,7 +328,7 @@ def mixed(config, root, storage):
             read_counts[reader] += 1
 
     started = time.monotonic()
-    writes = cycles = 0
+    writes = cycles = visibility_checks = 0
     try:
         with ThreadPoolExecutor(max_workers=len(read_counts)) as executor:
             readers = [executor.submit(read_loop, i) for i in range(len(read_counts))]
@@ -338,6 +346,14 @@ def mixed(config, root, storage):
                         check_statuses(collection.upsert(docs), len(docs))
                         writes += len(docs)
                         collection.flush()
+                        # A flushed write must be searchable before optimize,
+                        # while the background reader continues serving queries.
+                        visibility_checks += check_searchable(
+                            config,
+                            collection,
+                            str(document_ids(config, start, 1)[0]),
+                            batch[0],
+                        )
                         # Pace identical operation counts over the declared
                         # write interval. Faster storage must not accumulate
                         # more obsolete vector versions before the comparison.
@@ -385,6 +401,7 @@ def mixed(config, root, storage):
         "write_operations": writes,
         "reader_queries": sum(read_counts),
         "reader_queries_during_writes": reads_during_writes,
+        "write_visibility_checks": visibility_checks,
         "cycles": cycles,
         "write_phase_seconds": write_phase_seconds,
         "seconds": elapsed,
@@ -434,12 +451,16 @@ def verify(config, root, storage, after_mixed=True):
                 rtol=1e-6,
                 atol=1e-7,
             )
+            check_searchable(
+                config, collection, new_id, vectors(config, config["rows"], 1)[0]
+            )
     finally:
         collection.close()
     return {
         "rows": fixture["rows"],
         "recall": float(np.mean(recalls)),
         "fields_and_vectors_verified": True,
+        "new_vector_query_verified": after_mixed,
     }
 
 
