@@ -1,6 +1,9 @@
 include(${PROJECT_ROOT_DIR}/cmake/bazel.cmake)
 include(${PROJECT_ROOT_DIR}/cmake/option.cmake)
 
+option(ZVEC_BUILD_ACCEPTANCE_TESTS
+  "Build resource-intensive buffer and training acceptance tests" OFF)
+
 # TODO(windows): this is for test_util.h, should be removed
 include_directories(${PROJECT_ROOT_DIR})
 
@@ -13,4 +16,8 @@ if(BUILD_ZVEC_SHARED AND NOT IOS AND NOT ANDROID)
 endif()
 if(BUILD_C_BINDINGS)
     cc_directories(c)
+endif()
+
+if(ZVEC_BUILD_ACCEPTANCE_TESTS)
+    cc_directories(acceptance)
 endif()

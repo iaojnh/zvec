@@ -63,35 +63,35 @@ TEST_F(BudgetedMappedBufferTest, FailedGrowthPreservesOldMappingAndCanRetry) {
   EXPECT_EQ(3 * page_, pool_.used());
 }
 
-TEST_F(BudgetedMappedBufferTest, MoveAssignmentReleasesDestinationOnly) {
+TEST_F(BudgetedMappedBufferTest, MovesAndCrossThreadReleaseKeepOwnership) {
   static_assert(std::is_nothrow_move_constructible_v<BudgetedMappedBuffer>);
   static_assert(std::is_nothrow_move_assignable_v<BudgetedMappedBuffer>);
-  BudgetedMappedBuffer source(2 * page_);
-  BudgetedMappedBuffer destination(page_);
-  char *data = source.data();
-  data[0] = 'x';
-  destination = std::move(source);
-  EXPECT_EQ(nullptr, source.data());
-  EXPECT_EQ(0u, source.mapped_size());
-  EXPECT_EQ(data, destination.data());
-  EXPECT_EQ('x', destination.data()[0]);
-  EXPECT_EQ(2 * page_, pool_.used());
-  BudgetedMappedBuffer moved(std::move(destination));
-  EXPECT_EQ(nullptr, destination.data());
-  EXPECT_EQ(data, moved.data());
-  EXPECT_EQ(2 * page_, pool_.used());
-}
-
-TEST_F(BudgetedMappedBufferTest, ChargeFollowsCrossThreadOwnership) {
-  BudgetedMappedBuffer buffer(page_);
-  std::thread worker([owned = std::move(buffer)]() mutable {
-    EXPECT_EQ(owned.mapped_size(),
-              PoolPayloadBudget::get_instance().external_used());
-    owned.clear();
-  });
-  worker.join();
-  EXPECT_EQ(nullptr, buffer.data());
-  EXPECT_EQ(0u, pool_.used());
+  for (size_t bytes : {page_, 2 * page_}) {
+    SCOPED_TRACE(bytes);
+    BudgetedMappedBuffer source(bytes);
+    BudgetedMappedBuffer destination(page_);
+    char *data = source.data();
+    data[0] = 'x';
+    destination = std::move(source);
+    EXPECT_EQ(nullptr, source.data());
+    EXPECT_EQ(0u, source.mapped_size());
+    EXPECT_EQ(data, destination.data());
+    EXPECT_EQ('x', destination.data()[0]);
+    EXPECT_EQ(bytes, pool_.used());
+    BudgetedMappedBuffer moved(std::move(destination));
+    EXPECT_EQ(nullptr, destination.data());
+    EXPECT_EQ(data, moved.data());
+    EXPECT_EQ(bytes, pool_.used());
+    std::thread worker([owned = std::move(moved)]() mutable {
+      EXPECT_EQ(owned.mapped_size(),
+                PoolPayloadBudget::get_instance().external_used());
+      EXPECT_EQ('x', owned.data()[0]);
+      owned.clear();
+    });
+    worker.join();
+    EXPECT_EQ(nullptr, moved.data());
+    EXPECT_EQ(0u, pool_.used());
+  }
 }
 
 TEST_F(BudgetedMappedBufferTest, RejectsRoundingOverflowWithoutChangingBuffer) {

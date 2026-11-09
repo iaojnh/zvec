@@ -146,11 +146,17 @@ TEST(ParquetMemoryPoolTest, PreservesSmallAndLargeAlignment) {
   EXPECT_EQ(0, pool.mapped_bytes());
 }
 
-TEST(ParquetMemoryPoolTest, ReallocationCrossesThresholdInBothDirections) {
+TEST(ParquetMemoryPoolTest, ReallocationPreservesDataAcrossHeapAndMapping) {
   arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
   ParquetMemoryPool pool(&fallback);
   uint8_t *buffer = nullptr;
-  ASSERT_TRUE(pool.Allocate(4096, &buffer).ok());
+  ASSERT_TRUE(pool.Allocate(1024, &buffer).ok());
+  std::memset(buffer, 29, 1024);
+  ASSERT_TRUE(pool.Reallocate(1024, 4096, &buffer).ok());
+  EXPECT_EQ(4096, pool.bytes_allocated());
+  EXPECT_EQ(4096, fallback.bytes_allocated());
+  EXPECT_EQ(0, pool.num_mapped_allocations());
+  EXPECT_EQ(29, buffer[1023]);
   std::memset(buffer, 29, 4096);
   ASSERT_TRUE(pool.Reallocate(4096, kThreshold, &buffer).ok());
   EXPECT_EQ(0, fallback.bytes_allocated());
@@ -168,7 +174,7 @@ TEST(ParquetMemoryPoolTest, ReallocationCrossesThresholdInBothDirections) {
   pool.Free(buffer, 8192);
   EXPECT_EQ(0, pool.bytes_allocated());
   EXPECT_EQ(0, fallback.bytes_allocated());
-  EXPECT_EQ(3, pool.num_allocations());
+  EXPECT_EQ(4, pool.num_allocations());
 }
 
 TEST(ParquetMemoryPoolTest,
@@ -233,21 +239,6 @@ TEST(ParquetMemoryPoolTest, MappedShrinkKeepsAddressAlignmentAndPrefix) {
     EXPECT_EQ(0, pool.mapped_bytes());
     EXPECT_EQ(0, pool.bytes_allocated());
   }
-}
-
-TEST(ParquetMemoryPoolTest, SmallReallocationUsesFallback) {
-  arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
-  ParquetMemoryPool pool(&fallback);
-  uint8_t *buffer = nullptr;
-  ASSERT_TRUE(pool.Allocate(1024, &buffer).ok());
-  std::memset(buffer, 19, 1024);
-  ASSERT_TRUE(pool.Reallocate(1024, 8192, &buffer).ok());
-  EXPECT_EQ(8192, pool.bytes_allocated());
-  EXPECT_EQ(8192, fallback.bytes_allocated());
-  EXPECT_EQ(0, pool.num_mapped_allocations());
-  EXPECT_EQ(19, buffer[1023]);
-  pool.Free(buffer, 8192);
-  EXPECT_EQ(0, pool.bytes_allocated());
 }
 
 TEST(ParquetMemoryPoolTest, ZeroAllocationAndReallocationAreSafe) {
