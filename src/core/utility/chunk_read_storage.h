@@ -8,7 +8,7 @@
 namespace zvec {
 namespace core {
 
-// Experimental, opt-in read-only storage. All payload capacity is charged to
+// Read-only storage for immutable files. All payload capacity is charged to
 // MemoryLimitPool before allocation. Cache replacement reuses charged slots;
 // execution slots remain available when every cache slot is pinned.
 class ZVEC_CORE_API ChunkReadStorage : public IndexStorage {
@@ -47,7 +47,7 @@ class ZVEC_CORE_API ChunkReadStorage : public IndexStorage {
   size_t workspace_count_{8};
   size_t wait_ms_{100};
   int64_t header_offset_{0}, footer_offset_{0};
-  bool checksum_{false}, direct_io_{true};
+  bool checksum_{false}, direct_io_{true}, adaptive_{false};
 };
 
 // Factory name: ChunkReadStorage. Existing BufferReadStorage parameters for
@@ -64,5 +64,9 @@ inline constexpr const char *CHUNK_READ_STORAGE_WAIT_MS =
     "proxima.chunk_read_storage.wait_ms";
 inline constexpr const char *CHUNK_READ_STORAGE_DIRECT_IO =
     "proxima.chunk_read_storage.direct_io";
+// Size initial workspaces/cache to the file and shared budget. Larger reads
+// may grow a leased execution slot through normal workspace admission.
+inline constexpr const char *CHUNK_READ_STORAGE_ADAPTIVE =
+    "proxima.chunk_read_storage.adaptive";
 }  // namespace core
 }  // namespace zvec

@@ -22,6 +22,7 @@
 #include "algorithm/ivf/ivf_streamer.h"
 #include "buffered_input.h"
 #include "holder_builder.h"
+#include "utility/chunk_read_storage.h"
 
 namespace zvec::core_interface {
 
@@ -197,19 +198,21 @@ int IVFIndex::open(const std::string &file_path,
       break;
     }
     case StorageOptions::StorageType::kBufferPool: {
-      // FileDumper emits the immutable IndexFormat consumed by this reader.
-      // Opening an index must not prewarm the entire file or displace other
-      // collections' cached pages. Populate the cache on demand instead.
-      storage_params.set("proxima.buffer.read_storage.warmup_mode", "none");
-      storage_ = core::IndexFactory::CreateStorage("BufferReadStorage");
+      // Train/dump and reopen share this reader for immutable IVF postings.
+      // Size its cache and execution slots at open against the shared budget.
+      storage_params.set(core::CHUNK_READ_STORAGE_ADAPTIVE, true);
+      storage_params.set(core::CHUNK_READ_STORAGE_MAX_READ_BYTES,
+                         size_t{1UL << 20});
+      storage_params.set(core::CHUNK_READ_STORAGE_WORKSPACE_COUNT, size_t{64});
+      storage_ = core::IndexFactory::CreateStorage("ChunkReadStorage");
       if (storage_ == nullptr) {
-        LOG_ERROR("Failed to create BufferReadStorage for IVF");
+        LOG_ERROR("Failed to create ChunkReadStorage for IVF");
         return core::IndexError_Runtime;
       }
       int ret = storage_->init(storage_params);
       if (ret != 0) {
         LOG_ERROR(
-            "Failed to init BufferReadStorage for IVF, path: %s, "
+            "Failed to init ChunkReadStorage for IVF, path: %s, "
             "err: %s",
             file_path_.c_str(), core::IndexError::What(ret));
         return ret;

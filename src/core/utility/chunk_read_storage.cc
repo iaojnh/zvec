@@ -109,7 +109,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner {
   }
 
   bool initialize(const std::string &file_path, size_t chunk, size_t cache,
-                  size_t max_read, size_t count, size_t wait, bool direct) {
+                  size_t max_read, size_t count, size_t wait, bool direct,
+                  bool adapt) {
     if (!meta_file.open(file_path, true, false)) return false;
     if (!data_file.open(file_path, true, direct)) {
       if (!direct || !data_file.open(file_path, true, false)) return false;
@@ -128,6 +129,25 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner {
         a.nFileIndexLow != b.nFileIndexLow) return false;
 #endif
     file_size = meta_file.size();
+    adaptive = adapt;
+    if (adaptive) {
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      const size_t fixed = pool.metadata_used() + pool.external_used();
+      const size_t budget = pool.capacity() == 0
+                                ? cache + count * (max_read + 2 * chunk)
+                                : pool.capacity() -
+                                      std::min(pool.capacity(), fixed);
+      const size_t page = ailego::MemoryHelper::PageSize();
+      // Keep many small leases available for concurrent IVF metadata, key
+      // and posting reads. Grow only the slots that actually read postings.
+      count = std::min(count, std::max<size_t>(4, budget / (8 * 3 * page)));
+      max_read = std::max(page, std::min(
+          {max_read, file_size, budget / (count * 16)}));
+      max_read = (max_read + page - 1) / page * page;
+      while (chunk > page && chunk > max_read / 4) chunk /= 2;
+      const size_t file_chunks = file_size / chunk + (file_size % chunk != 0);
+      cache = std::min({cache, file_chunks * chunk, budget / 2});
+    }
     chunk_bytes = chunk;
     max_read_bytes = max_read;
     wait_ms = wait;
@@ -156,7 +176,15 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner {
       views.emplace_back(std::move(view));
     }
     for (size_t i = 0; i < slots_count; ++i) {
-      slots.emplace_back(std::make_shared<ChargedBuffer>(chunk, metadata_owner));
+      try {
+        slots.emplace_back(
+            std::make_shared<ChargedBuffer>(chunk, metadata_owner));
+      } catch (const std::bad_alloc &) {
+        if (!adaptive) throw;
+        // Cache capacity is optional; prepaid execution slots still permit
+        // queries when other consumers hold the remaining shared budget.
+        break;
+      }
       ready.emplace_back(i);
     }
     return true;
@@ -228,20 +256,56 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner {
     for (auto &view : views)
       if (view.use_count() == 1) view->pins.clear();
   }
-  std::shared_ptr<View> acquire_view() {
+  std::shared_ptr<View> acquire_view(size_t bytes) {
     std::unique_lock<std::mutex> lock(mutex);
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(wait_ms);
     for (;;) {
+      std::shared_ptr<View> fit, fallback;
       for (auto &view : views) {
         if (view.use_count() == 1) {
-          view->pins.clear();
-          return view;
+          if (!adaptive) {
+            view->pins.clear();
+            return view;
+          }
+          const size_t capacity = view->workspace ? view->workspace->bytes : 0;
+          if (capacity >= bytes &&
+              (!fit || capacity < fit->workspace->bytes)) fit = view;
+          if (!fallback || capacity > (fallback->workspace
+                                          ? fallback->workspace->bytes : 0))
+            fallback = view;
         }
+      }
+      if (fit || fallback) {
+        auto result = fit ? std::move(fit) : std::move(fallback);
+        result->pins.clear();
+        return result;
       }
       workspace_waits.fetch_add(1, std::memory_order_relaxed);
       if (stopping || std::chrono::steady_clock::now() >= deadline) return {};
       changed.wait_for(lock, std::chrono::milliseconds(1));
+    }
+  }
+
+  bool ensure_workspace(const std::shared_ptr<View> &view, size_t bytes) {
+    if (view->workspace && view->workspace->bytes >= bytes) return true;
+    if (!adaptive) return false;
+    // Only this reader owns the leased View. Release its smaller backing
+    // before admission; never call the global reclaimer under our mutex.
+    std::shared_ptr<ChargedBuffer> previous;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      previous = std::move(view->workspace);
+    }
+    previous.reset();
+    try {
+      auto replacement =
+          std::make_shared<ChargedBuffer>(bytes, metadata_owner, true);
+      std::lock_guard<std::mutex> lock(mutex);
+      view->workspace = std::move(replacement);
+      return true;
+    } catch (const std::bad_alloc &) {
+      return false;
     }
   }
 
@@ -323,7 +387,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner {
     out.reset();
     if (!len) return 0;
     if (offset > file_size || len > file_size - offset ||
-        len > max_read_bytes) return 0;
+        len > (adaptive ? (1UL << 30) : max_read_bytes)) return 0;
     const size_t first = offset / chunk_bytes;
     const size_t last = (offset + len - 1) / chunk_bytes;
     const size_t count = last - first + 1;
@@ -337,8 +401,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner {
         return len;
       }
     }
-    auto view = acquire_view();
+    auto view = acquire_view(len + 2 * chunk_bytes);
     if (!view) return 0;
+    if (!ensure_workspace(view, len + 2 * chunk_bytes)) return 0;
     out.lease = view;
     out.spans.reserve(count);
     size_t run_first = 0, run_count = 0;
@@ -468,7 +533,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner {
   std::vector<size_t> ready;
   std::array<uint8_t, 4096> frequencies{};
   std::thread worker;
-  bool stopping{false}, registered{false}, age_requested{false};
+  bool stopping{false}, registered{false}, age_requested{false}, adaptive{false};
   ailego::version_t version{0};
   std::atomic<uint64_t> hits{0}, misses{0}, fills{0}, replacements{0};
   std::atomic<uint64_t> io_calls{0}, io_bytes{0}, copied{0}, workspace_waits{0};
@@ -557,6 +622,7 @@ int ChunkReadStorage::init(const ailego::Params &params) {
   params.get(CHUNK_READ_STORAGE_WORKSPACE_COUNT, &workspace_count_);
   params.get(CHUNK_READ_STORAGE_WAIT_MS, &wait_ms_);
   params.get(CHUNK_READ_STORAGE_DIRECT_IO, &direct_io_);
+  params.get(CHUNK_READ_STORAGE_ADAPTIVE, &adaptive_);
   params.get(BUFFER_READ_STORAGE_HEADER_OFFSET, &header_offset_);
   params.get(BUFFER_READ_STORAGE_FOOTER_OFFSET, &footer_offset_);
   params.get(BUFFER_READ_STORAGE_CHECKSUM_VALIDATION, &checksum_);
@@ -574,7 +640,7 @@ int ChunkReadStorage::open(const std::string &path, bool) {
     auto candidate = std::make_shared<State>();
     if (!candidate->initialize(path, chunk_bytes_, cache_bytes_,
                                max_read_bytes_, workspace_count_, wait_ms_,
-                               direct_io_))
+                               direct_io_, adaptive_))
       return IndexError_OpenFile;
     size_t end = 0;
     if (!ResolveOffset(candidate->file_size, header_offset_, false,
@@ -582,14 +648,14 @@ int ChunkReadStorage::open(const std::string &path, bool) {
         !ResolveOffset(candidate->file_size, footer_offset_, true, &end) ||
         candidate->index_offset >= end) return IndexError_InvalidArgument;
     const size_t container_size = end - candidate->index_offset;
-    auto scratch = candidate->views.front()->workspace;
+    auto view = candidate->views.front();
     auto read = [&](size_t offset, const void **data, size_t length) {
       if (offset > container_size || length > container_size - offset ||
-          length > scratch->bytes) return size_t{0};
-      *data = scratch->data;
+          !candidate->ensure_workspace(view, length)) return size_t{0};
+      *data = view->workspace->data;
       return candidate->meta_file.read(
           static_cast<ssize_t>(candidate->index_offset + offset),
-          scratch->data, length);
+          view->workspace->data, length);
     };
     IndexUnpacker unpacker;
     if (!unpacker.unpack(read, container_size, checksum_))
@@ -672,7 +738,7 @@ ChunkReadStorage::Stats ChunkReadStorage::stats() const {
   for (const auto &slot : s.slots)
     if (slot) result.cache_bytes += slot->bytes;
   for (const auto &view : s.views)
-    result.workspace_bytes += view->workspace->bytes;
+    if (view->workspace) result.workspace_bytes += view->workspace->bytes;
   result.metadata_bytes = s.metadata_charge;
   return result;
 }
