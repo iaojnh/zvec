@@ -341,9 +341,16 @@ TEST_F(IVFMemoryLifecycleTest, LowMemoryQueryPreservesCauseAndCanRetry) {
                                   false, true}));
   auto query = std::make_shared<IVFQueryParam>();
   query->topk = 1;
+  // Open may have admitted reclaimable Chunk backing. Remove it before
+  // reserving the remaining budget so a query cannot recover headroom by
+  // evicting that cache instead of exercising workspace admission failure.
+  auto &queue = ailego::BlockEvictionQueue::get_instance();
+  while (queue.reclaim_for_allocation(pool.capacity()) != 0) {
+  }
   {
     ailego::MemoryReservation pressure;
-    pressure.add(pool.capacity() - pool.used());
+    pressure.add(pool.available());
+    ASSERT_EQ(0u, pool.available());
     EXPECT_EQ(core::IndexError_NoMemory, search(index, query));
   }
   EXPECT_EQ(0, search(index, query));
