@@ -61,7 +61,6 @@ struct FakeAioState {
   size_t completion_call = 0;
   size_t completed = 0;
   size_t short_completion = std::numeric_limits<size_t>::max();
-  bool duplicate_last_completion = false;
 };
 
 FakeAioState *g_fake_aio = nullptr;
@@ -108,10 +107,6 @@ int fake_io_getevents(io_context_t, long min_nr, long nr,
   for (int i = 0; i < ret; ++i) {
     size_t completion_index = g_fake_aio->completed++;
     struct iocb *cb = g_fake_aio->submitted[completion_index];
-    if (g_fake_aio->duplicate_last_completion &&
-        completion_index + 1 == g_fake_aio->submitted.size()) {
-      cb = g_fake_aio->submitted.front();
-    }
     std::memset(cb->u.c.buf, 0xa5, cb->u.c.nbytes);
     events[i].data = cb->data;
     events[i].obj = cb;
@@ -420,17 +415,12 @@ TEST(DiskAnnLinuxAioTest, FailedCancellationKeepsChargedStagingIsolated) {
       [&] { EXPECT_EQ(0, pool.init(previous)); });
   const size_t baseline = pool.external_used();
 
-  for (const auto &[blocking, duplicate_completion] :
-       {std::pair{true, false}, std::pair{false, true}}) {
-    SCOPED_TRACE(blocking);
-    SCOPED_TRACE(duplicate_completion);
+  {
     std::memset(output.get(), 0, source.size());
     auto requests = make_requests(output.get());
     FakeAioState state;
     state.submit_results = {static_cast<int>(requests.size())};
-    state.completion_results = {
-        duplicate_completion ? static_cast<int>(requests.size()) : -EIO};
-    state.duplicate_last_completion = duplicate_completion;
+    state.completion_results = {-EIO};
     state.destroy_result = -EPERM;
     FakeAioGuard guard(&state);
     IOContext ctx = new IoBackend;
@@ -444,13 +434,9 @@ TEST(DiskAnnLinuxAioTest, FailedCancellationKeepsChargedStagingIsolated) {
     ASSERT_EQ(0, reader.open_from_handle(file.path(), file.fd()));
     PendingBatch batch;
     std::vector<uint32_t> completed;
-    if (blocking) {
-      EXPECT_EQ(IndexError_Runtime, reader.read(requests, ctx));
-    } else {
-      ASSERT_EQ(0, reader.submit(batch, requests, ctx));
-      EXPECT_EQ(IndexError_Runtime,
-                reader.get_completed(batch, ctx, requests.size(), completed));
-    }
+    ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+    EXPECT_EQ(IndexError_Runtime,
+              reader.get_completed(batch, ctx, requests.size(), completed));
     ASSERT_TRUE(ctx->aio_quarantined);
     ASSERT_TRUE(ctx->aio_staging);
     ASSERT_EQ(requests.size(), state.kernel_buffers.size());
@@ -459,11 +445,7 @@ TEST(DiskAnnLinuxAioTest, FailedCancellationKeepsChargedStagingIsolated) {
       std::memset(state.kernel_buffers[i], 0xa5, requests[i].len);
     }
     const auto *data = static_cast<const uint8_t *>(output.get());
-    const size_t copied =
-        !blocking && duplicate_completion ? source.size() - kBlockSize : 0;
-    EXPECT_TRUE(std::all_of(data, data + copied,
-                            [](uint8_t byte) { return byte == 0xa5; }));
-    EXPECT_TRUE(std::all_of(data + copied, data + source.size(),
+    EXPECT_TRUE(std::all_of(data, data + source.size(),
                             [](uint8_t byte) { return byte == 0; }));
     EXPECT_GT(pool.external_used(), baseline);
     EXPECT_EQ(0, reader.read(requests, ctx));

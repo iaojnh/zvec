@@ -2,7 +2,6 @@
 #include <string>
 #include <type_traits>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
 #include <algorithm/hnsw/hnsw_algorithm.h>
@@ -52,39 +51,6 @@ void HnswStreamerTest::SetUp() {
 
 void HnswStreamerTest::TearDown() {
   zvec::test_util::RemoveTestPath(dir_);
-}
-
-TEST_F(HnswStreamerTest, FailedVisitGrowthKeepsCapacityAndCanBeRetried) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  auto restore = ScopeGuard::Make([&] {
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  ASSERT_EQ(0, pool.init(1UL << 20));
-  IndexStreamer::Stats stats;
-  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
-  HnswContext context(dim, nullptr, entity);
-  context.set_filter_mode(VisitFilter::BitMap);
-  ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
-  auto &filter = context.visit_filter();
-  filter.set_visited(17);
-  ASSERT_GT(pool.available(), 4096u);
-  const size_t pressure = pool.available() - 4096;
-  ASSERT_TRUE(pool.try_charge_external(pressure));
-  {
-    auto release = ScopeGuard::Make([&] { pool.release_external(pressure); });
-    const size_t charged = pool.used();
-    // Both attempts must fail: a failed reset must not publish the new size.
-    EXPECT_FALSE(context.check_need_adjuct_ctx(1000000));
-    EXPECT_FALSE(context.check_need_adjuct_ctx(1000000));
-    EXPECT_EQ(charged, pool.used());
-    EXPECT_TRUE(filter.visited(17));
-  }
-  ASSERT_TRUE(context.check_need_adjuct_ctx(1000000));
-  filter.set_visited(999999);
-  EXPECT_TRUE(filter.visited(999999));
 }
 
 TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
@@ -317,6 +283,20 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
     SCOPED_TRACE(static_cast<int>(mode));
     ASSERT_EQ(0,
               hnsw_ctx->visit_filter().init(mode, kDocCount, kDocCount, 1e-9f));
+    if (mode == VisitFilter::BitMap) {
+      auto &filter = hnsw_ctx->visit_filter();
+      filter.set_visited(17);
+      {
+        MemoryReservation pressure;
+        pressure.add(PoolPayloadBudget::get_instance().available());
+        EXPECT_FALSE(hnsw_ctx->check_need_adjuct_ctx(1000000));
+        EXPECT_FALSE(hnsw_ctx->check_need_adjuct_ctx(1000000));
+        EXPECT_TRUE(filter.visited(17));
+      }
+      ASSERT_TRUE(hnsw_ctx->check_need_adjuct_ctx(1000000));
+      filter.set_visited(999999);
+      EXPECT_TRUE(filter.visited(999999));
+    }
     // Use the same context for pool -> filtered heap -> pool, ensuring both
     // query-boundary dispatch and result export retain the chosen backend.
     for (int phase = 0; phase < 3; ++phase) {

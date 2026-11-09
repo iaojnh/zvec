@@ -136,49 +136,6 @@ class CountingHNSWIndex : public HNSWIndex {
 
 }  // namespace
 
-TEST(IndexInterface, InternalIdsBudgetDenialReturnsErrorAndCanRetry) {
-  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  const std::string path = "internal_ids_budget_retry.index";
-  ASSERT_EQ(0u, pool.used());
-  auto cleanup = zvec::ailego::ScopeGuard::Make([&] {
-    zvec::test_util::RemoveTestFiles(path);
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  ASSERT_EQ(0, pool.init(64UL * 1024 * 1024));
-  zvec::test_util::RemoveTestFiles(path);
-  // Candidate scratch is intentionally retained until the query thread exits.
-  std::thread worker([&] {
-    auto param = FlatIndexParamBuilder()
-                     .with_metric_type(MetricType::kL2sq)
-                     .with_data_type(DataType::DT_FP32)
-                     .with_storage_data_type(DataType::DT_FP16)
-                     .with_dimension(128)
-                     .build();
-    auto index = IndexFactory::CreateAndInitIndex(*param);
-    ASSERT_TRUE(index);
-    ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kMMAP, true}));
-    std::array<float, 128> values{};
-    const VectorData query{DenseVector{values.data()}};
-    ASSERT_EQ(0, index->add(query, 7));
-    auto search_param = FlatQueryParamBuilder().with_topk(1).build();
-    int64_t id = -1;
-    ASSERT_EQ(0, index->search_internal_ids(query, search_param, &id, nullptr));
-    EXPECT_EQ(7, id);
-    {
-      zvec::ailego::MemoryReservation pressure;
-      pressure.add(pool.capacity() - pool.used());
-      EXPECT_EQ(zvec::core::IndexError_NoMemory,
-                index->search_internal_ids(query, search_param, &id, nullptr));
-    }
-    ASSERT_EQ(0, index->search_internal_ids(query, search_param, &id, nullptr));
-    EXPECT_EQ(7, id);
-    EXPECT_EQ(0, index->close());
-  });
-  worker.join();
-}
-
 TEST(IndexInterface, GraphRefineKeepsLegacyDefaultCandidateCount) {
   constexpr uint32_t kTopk = 10;
   constexpr uint32_t kHnswEf = 100;

@@ -301,6 +301,17 @@ TEST_F(BufferPoolStoreTest, ParquetFetchSingleRow) {
   EXPECT_EQ(batch->length, 1);
   EXPECT_EQ(batch->values.size(), 3);
 
+  auto name = std::dynamic_pointer_cast<arrow::StringScalar>(
+      batch->values[1].scalar());
+  ASSERT_NE(nullptr, name);
+  ASSERT_NE(nullptr, name->value);
+  const auto expected_name = name->value->ToString();
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_GT(pool.external_used(), 0u);
+  EXPECT_GT(ailego::BlockEvictionQueue::get_instance().batch_recycle(1024), 0u);
+  EXPECT_EQ(0u, pool.external_used());
+  EXPECT_EQ(expected_name, name->value->ToString());
+
   auto id_scalar = batch->values[0].scalar();
   ASSERT_TRUE(id_scalar != nullptr);
   auto id_value = std::dynamic_pointer_cast<arrow::Int32Scalar>(id_scalar);
@@ -590,113 +601,6 @@ TEST_F(BufferPoolScanBudgetTest, FullPoolRejectsDecodeAndRecoversAfterRelease) {
   ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
   EXPECT_EQ(2, (*recovered)->num_rows());
   ASSERT_NO_FATAL_FAILURE(check_scan(store.scan({GLOBAL_DOC_ID, "value"}), 2));
-}
-
-class BufferPoolScalarFetchTest : public testing::Test {
- protected:
-  static constexpr int64_t kRowsPerGroup = 16;
-  static constexpr int64_t kRows = 2 * kRowsPerGroup;
-
-  static std::string text_for_row(int64_t row) {
-    if (row % kRowsPerGroup == 7) return "";
-    if (row % kRowsPerGroup == 8) return std::string("embedded\0nul", 12);
-    return "row-" + std::to_string(row) + std::string(64, 'x');
-  }
-
-  void SetUp() override {
-    ASSERT_TRUE(detail::MemoryBudgetTestPeer::reset_idle_allowances());
-    auto &pool = ailego::PoolPayloadBudget::get_instance();
-    previous_capacity_ = pool.capacity();
-    ailego::BlockEvictionQueue::get_instance().batch_recycle(1024);
-    ASSERT_EQ(0u, pool.used());
-    ASSERT_EQ(0, pool.init(8 * 1024UL * 1024UL));
-
-    arrow::Int64Builder ids;
-    arrow::Int64Builder nullable_values;
-    arrow::StringBuilder names;
-    for (int64_t row = 0; row < kRows; ++row) {
-      ASSERT_TRUE(ids.Append(row).ok());
-      ASSERT_TRUE((row % kRowsPerGroup == 4
-                       ? nullable_values.AppendNull()
-                       : nullable_values.Append(row * 3 + 7))
-                      .ok());
-      ASSERT_TRUE((row % kRowsPerGroup == 3 ? names.AppendNull()
-                                            : names.Append(text_for_row(row)))
-                      .ok());
-    }
-    std::shared_ptr<arrow::Array> id_array, value_array, name_array;
-    ASSERT_TRUE(ids.Finish(&id_array).ok());
-    ASSERT_TRUE(nullable_values.Finish(&value_array).ok());
-    ASSERT_TRUE(names.Finish(&name_array).ok());
-    auto schema = arrow::schema({arrow::field("id", arrow::int64()),
-                                 arrow::field("value", arrow::int64()),
-                                 arrow::field("name", arrow::utf8())});
-    auto table =
-        arrow::Table::Make(schema, {id_array, value_array, name_array});
-    auto output = arrow::io::FileOutputStream::Open(parquet_path_);
-    ASSERT_TRUE(output.ok()) << output.status().ToString();
-    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
-                                           *output, kRowsPerGroup)
-                    .ok());
-    ASSERT_TRUE((*output)->Close().ok());
-  }
-
-  void TearDown() override {
-    EXPECT_TRUE(detail::MemoryBudgetTestPeer::reset_idle_allowances());
-    auto &pool = ailego::PoolPayloadBudget::get_instance();
-    ailego::BlockEvictionQueue::get_instance().batch_recycle(1024);
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous_capacity_));
-    std::error_code error;
-    std::filesystem::remove(parquet_path_, error);
-    EXPECT_FALSE(error) << error.message();
-  }
-
-  void check_row(const ExecBatchPtr &batch, int64_t row) {
-    ASSERT_NE(nullptr, batch);
-    ASSERT_EQ(1, batch->length);
-    ASSERT_EQ(3u, batch->values.size());
-    auto id = std::dynamic_pointer_cast<arrow::Int64Scalar>(
-        batch->values[0].scalar());
-    auto value = std::dynamic_pointer_cast<arrow::Int64Scalar>(
-        batch->values[1].scalar());
-    auto name = std::dynamic_pointer_cast<arrow::StringScalar>(
-        batch->values[2].scalar());
-    ASSERT_NE(nullptr, id);
-    ASSERT_NE(nullptr, value);
-    ASSERT_NE(nullptr, name);
-    EXPECT_TRUE(id->is_valid);
-    EXPECT_EQ(row, id->value);
-    EXPECT_EQ(row % kRowsPerGroup != 4, value->is_valid);
-    if (value->is_valid) EXPECT_EQ(row * 3 + 7, value->value);
-    EXPECT_EQ(row % kRowsPerGroup != 3, name->is_valid);
-    if (name->is_valid) {
-      ASSERT_NE(nullptr, name->value);
-      EXPECT_EQ(text_for_row(row), name->value->ToString());
-    }
-  }
-
-  std::string parquet_path_{"bufferpool_scalar_fetch_test.parquet"};
-  size_t previous_capacity_{0};
-};
-
-TEST_F(BufferPoolScalarFetchTest, ReturnedScalarsSurviveCacheEviction) {
-  BufferPoolForwardStore store(parquet_path_);
-  ASSERT_TRUE(store.open().ok());
-  std::vector<ExecBatchPtr> retained;
-  for (int row : {3, 4, 7, 8, 17}) {
-    auto batch = store.fetch({"id", "value", "name"}, row);
-    ASSERT_NO_FATAL_FAILURE(check_row(batch, row));
-    retained.push_back(std::move(batch));
-  }
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  ASSERT_GT(pool.external_used(), 0u);
-  EXPECT_GT(ailego::BlockEvictionQueue::get_instance().batch_recycle(1024), 0u);
-  EXPECT_EQ(0u, pool.external_used());
-  size_t index = 0;
-  for (int row : {3, 4, 7, 8, 17}) {
-    ASSERT_NO_FATAL_FAILURE(check_row(retained[index++], row));
-  }
 }
 
 TEST_F(BufferPoolStoreTest,

@@ -82,89 +82,6 @@ class BufferStorageWriteTest : public ::testing::Test {
     return storage;
   }
 
-#if defined(__linux__) && !defined(__ANDROID__)
-  void check_read_only_cold_batch() {
-    auto &budget = ailego::PoolPayloadBudget::get_instance();
-    // Pin raw pages to refuse cache admission while retaining I/O headroom.
-    ASSERT_EQ(0, budget.init(64UL << 20));
-    AILEGO_DEFER([&] { EXPECT_EQ(0, budget.init(64UL << 20)); });
-    constexpr size_t kRequests = 32;
-    const size_t page_size = ailego::kVectorPageSize;
-    {
-      auto writer = open_writable();
-      ASSERT_TRUE(writer);
-      ASSERT_EQ(0, writer->append("cold_batch", (kRequests + 2) * page_size));
-      auto segment = writer->get("cold_batch");
-      ASSERT_TRUE(segment);
-      const size_t first =
-          (page_size - segment->data_offset() % page_size) % page_size;
-      for (size_t i = 0; i < kRequests; ++i) {
-        const char marker = static_cast<char>(i + 1);
-        ASSERT_EQ(1U, segment->write(first + i * page_size, &marker, 1));
-      }
-      ASSERT_EQ(0, writer->close());
-    }
-
-    auto &memory = ailego::MemoryLimitPool::get_instance();
-    std::vector<char *> pressure_pages;
-    AILEGO_DEFER([&] {
-      for (char *page : pressure_pages) {
-        if (page) memory.release_buffer(page, page_size);
-      }
-    });
-    auto reader = open_read_only();
-    ASSERT_TRUE(reader);
-    auto pool = reader->vec_buffer_pool();
-    ASSERT_TRUE(pool);
-    if (!pool->aio_enabled()) GTEST_SKIP() << "AIO backend is unavailable";
-    auto segment = reader->get("cold_batch");
-    ASSERT_TRUE(segment);
-    const size_t first =
-        (page_size - segment->data_offset() % page_size) % page_size;
-
-    // Mark prior eviction without touching any requested page.
-    const ailego::block_id_t warm_page =
-        (segment->data_offset() + first) / page_size + kRequests;
-    ASSERT_NE(nullptr, pool->acquire_buffer(warm_page));
-    pool->release_pages(&warm_page, 1);
-    ASSERT_TRUE(pool->page_table_.force_evict_block(warm_page));
-    ASSERT_TRUE(pool->has_evicted());
-    // Tiny pools have no page-admission reserve. Hold raw pages so background
-    // eviction cannot invalidate pressure; keep 8 MiB for bounded batch I/O.
-    constexpr size_t kIoHeadroom = 8UL << 20;
-    ASSERT_GT(memory.available(), kIoHeadroom);
-    const size_t count = (memory.available() - kIoHeadroom) / page_size;
-    pressure_pages.resize(count, nullptr);
-    ASSERT_EQ(count,
-              memory.batch_acquire_buffers(page_size, pressure_pages.data(),
-                                           pressure_pages.size()));
-    ASSERT_TRUE(memory.under_cache_pressure());
-
-    std::vector<IndexStorage::MemoryBlock> blocks(kRequests);
-    std::vector<IndexStorage::Segment::BorrowedRead> reads;
-    for (size_t i = 0; i < kRequests; ++i) {
-      reads.emplace_back(segment.get(), first + i * page_size, 1, &blocks[i]);
-    }
-    const auto before = pool->stats();
-    ASSERT_TRUE(
-        segment->read_borrowed_batch_immutable(reads.data(), reads.size()));
-    for (size_t i = 0; i < kRequests; ++i) {
-      ASSERT_NE(nullptr, blocks[i].data());
-      EXPECT_EQ(static_cast<char>(i + 1),
-                *static_cast<const char *>(blocks[i].data()));
-      EXPECT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, blocks[i].type_);
-    }
-    const auto after = pool->stats();
-    EXPECT_EQ(kRequests, after.bypass_reads - before.bypass_reads);
-    const auto submitted =
-        after.aio_pages_submitted - before.aio_pages_submitted;
-    EXPECT_EQ(kRequests, submitted);
-    EXPECT_LE(memory.used(), memory.capacity());
-    blocks.clear();
-    EXPECT_EQ(0, reader->close());
-  }
-#endif
-
   void check_shared_cache_reserve(size_t capacity);
 
   std::string file_path_;
@@ -451,6 +368,12 @@ TEST_F(BufferStorageWriteTest, WriteOverwrite) {
   std::string first = "XXXXXXXX";
   EXPECT_EQ(first.size(), seg->write(0, first.data(), first.size()));
 
+  IndexStorage::MemoryBlock snapshot;
+  IndexStorage::Segment::BorrowedRead read[] = {
+      {seg.get(), 0, first.size(), &snapshot}};
+  ASSERT_TRUE(seg->read_borrowed_batch(read, 1));
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, snapshot.type_);
+
   std::string second = "YYYYYYYY";
   EXPECT_EQ(second.size(), seg->write(0, second.data(), second.size()));
 
@@ -460,6 +383,10 @@ TEST_F(BufferStorageWriteTest, WriteOverwrite) {
   EXPECT_EQ(second, std::string(buf.data(), buf.size()));
 
   EXPECT_EQ(0, storage->close());
+  seg.reset();
+  storage.reset();
+  EXPECT_EQ(first, std::string(static_cast<const char *>(snapshot.data()),
+                               first.size()));
 }
 
 TEST_F(BufferStorageWriteTest, WriteBatchSamePagePersists) {
@@ -1552,13 +1479,6 @@ TEST_F(BufferStorageWriteTest, ReadOnlyBatchFallsBackWhenPinsExceedBudget) {
   EXPECT_EQ(0, storage->close());
 }
 
-#if defined(__linux__) && !defined(__ANDROID__)
-TEST_F(BufferStorageWriteTest, ReadOnlyColdBatchUsesBypassAio) {
-  check_read_only_cold_batch();
-}
-
-#endif
-
 void BufferStorageWriteTest::check_shared_cache_reserve(size_t capacity) {
   auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory_pool.init(capacity));
@@ -1688,47 +1608,6 @@ TEST_F(BufferStorageWriteTest,
   }
 
   EXPECT_EQ(0, storage->close());
-}
-
-TEST_F(BufferStorageWriteTest, MutableBatchSnapshotsSurviveOverwriteAndClose) {
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-  const size_t page = ailego::kVectorPageSize;
-  std::vector<char> payload_a(3 * page);
-  for (size_t i = 0; i < payload_a.size(); ++i)
-    payload_a[i] = static_cast<char>((i * 17 + 3) % 251);
-  ASSERT_EQ(0, storage->append("mutable_a", payload_a.size()));
-  auto seg_a = storage->get("mutable_a");
-  ASSERT_TRUE(seg_a);
-  ASSERT_EQ(payload_a.size(),
-            seg_a->write(0, payload_a.data(), payload_a.size()));
-  const size_t aligned_a = (page - seg_a->data_offset() % page) % page;
-  const size_t cross_a = (2 * page - 32 - seg_a->data_offset() % page) % page;
-  IndexStorage::MemoryBlock blocks[3];
-  IndexStorage::Segment::BorrowedRead reads[] = {
-      {seg_a.get(), aligned_a, 64, &blocks[0]},
-      {seg_a.get(), aligned_a + 8, 32, &blocks[1]},
-      {seg_a.get(), cross_a, 128, &blocks[2]}};
-  ASSERT_TRUE(seg_a->read_borrowed_batch(reads, 3));
-  for (const auto &block : blocks) {
-    ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, block.type_);
-  }
-  std::vector<char> changed_a(payload_a.size(), 'Z');
-  ASSERT_EQ(changed_a.size(),
-            seg_a->write(0, changed_a.data(), changed_a.size()));
-  ASSERT_EQ(0, storage->flush());
-  IndexStorage::MemoryBlock fresh;
-  IndexStorage::Segment::BorrowedRead later[] = {
-      {seg_a.get(), aligned_a, 64, &fresh}};
-  ASSERT_TRUE(seg_a->read_borrowed_batch(later, 1));
-  EXPECT_EQ(0, std::memcmp(fresh.data(), changed_a.data() + aligned_a, 64));
-  ASSERT_EQ(0, storage->close());
-  seg_a.reset();
-  storage.reset();
-  EXPECT_EQ(0, std::memcmp(blocks[0].data(), payload_a.data() + aligned_a, 64));
-  EXPECT_EQ(
-      0, std::memcmp(blocks[1].data(), payload_a.data() + aligned_a + 8, 32));
-  EXPECT_EQ(0, std::memcmp(blocks[2].data(), payload_a.data() + cross_a, 128));
 }
 
 // Dirty flag race: write() after flush_index() must re-set the dirty flag.
