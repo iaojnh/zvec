@@ -85,7 +85,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     std::atomic<bool> queued{false}, referenced{false};
     std::atomic<uint8_t> priority{0};
     std::atomic<uint32_t> requests{0};
-    bool valid{false}, ever_loaded{false};
+    bool valid{false}, ever_loaded{false}, filter_readmission{false};
     size_t offset{0}, bytes{0};
     Pool::CacheBuffer *buffer{nullptr};
     std::atomic<size_t> capacity{0};
@@ -302,6 +302,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     item.buffer = nullptr;
     item.data.store(nullptr, std::memory_order_relaxed);
     item.capacity.store(0, std::memory_order_relaxed);
+    item.requests.store(0, std::memory_order_relaxed);
     cache_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     return true;
   }
@@ -333,6 +334,13 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     if (!item->refs.compare_exchange_strong(expected, kLoading,
                                               std::memory_order_acq_rel))
       return nullptr;  // Another loader/evictor owns this residency cycle.
+    // A just-evicted posting batch must demonstrate reuse before spending
+    // cache backing again. One-pass reads still execute in reserved scratch.
+    // Metadata and the first residency are admitted immediately.
+    if (item->filter_readmission && item->ever_loaded && requests == 0) {
+      item->refs.store(kUnloaded, std::memory_order_release);
+      return nullptr;
+    }
     const size_t physical = item->offset / io_alignment * io_alignment;
     const size_t requested =
         (item->offset + item->bytes - physical + io_alignment - 1) /
@@ -651,6 +659,7 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     for (size_t i = 0; i < chunks.size(); ++i) {
       layout->entries[i].offset = offset_ + chunks[i].offset;
       layout->entries[i].bytes = chunks[i].size;
+      layout->entries[i].filter_readmission = true;
     }
     std::lock_guard<std::mutex> lock(state_->table_mutex);
     const size_t charged = layout->charge.bytes;
