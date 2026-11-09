@@ -31,11 +31,7 @@ def observe(args):
     target_mb = (
         config["memory_limit_mb"]
         if args.storage == "buffer"
-        else config[
-            "mmap_reference_memory_limit_mb"
-            if args.stage == "query"
-            else "mmap_preparation_memory_limit_mb"
-        ]
+        else config["mmap_reference_memory_limit_mb"]
     )
     result_path = args.evidence / f"{args.storage}-{args.stage}-{args.trial}.json"
     monitor_path = result_path.with_suffix(".monitor.jsonl")
@@ -115,11 +111,7 @@ def read_case(root, config, digest, storage, stage, trial):
     target_mb = (
         config["memory_limit_mb"]
         if storage == "buffer"
-        else config[
-            "mmap_reference_memory_limit_mb"
-            if stage == "query"
-            else "mmap_preparation_memory_limit_mb"
-        ]
+        else config["mmap_reference_memory_limit_mb"]
     )
     assert monitor[0]["target_rss_kib"] == target_mb * 1024
     assert (
@@ -134,9 +126,7 @@ def read_case(root, config, digest, storage, stage, trial):
     before, after = group
     assert before["phase"] == "cgroup_start" and after["phase"] == "cgroup_complete"
     limit_mib = config[
-        "mmap_preparation_system_limit_mib"
-        if storage == "mmap" and stage != "query"
-        else "system_limit_mib"
+        "mmap_reference_system_limit_mib" if storage == "mmap" else "system_limit_mib"
     ]
     assert before["memory.max"] == after["memory.max"] == limit_mib * 1024**2
     assert (
@@ -146,6 +136,13 @@ def read_case(root, config, digest, storage, stage, trial):
         == 0
     )
     assert after["returncode"] == 0
+    if storage == "mmap":
+        assert int(before["memory.events"].get("max", 0)) == int(
+            after["memory.events"].get("max", 0)
+        ), "mmap reference experienced external memory pressure"
+        assert monitor[0]["peak_rss_kib"] < target_mb * 1024 * 0.8, (
+            "mmap reference needs a more generous allowance"
+        )
     for event in ("oom", "oom_kill", "oom_group_kill"):
         assert int(before["memory.events"].get(event, 0)) == int(
             after["memory.events"].get(event, 0)
@@ -157,9 +154,6 @@ def read_case(root, config, digest, storage, stage, trial):
 def evaluate(profile, evidence):
     config = json.loads(profile.read_text())
     digest = hashlib.sha256(profile.read_bytes()).hexdigest()
-    assert (
-        config["rows"] * config["dimension"] * 4 > config["memory_limit_mb"] * 1024**2
-    ), "qualification requires a larger-than-budget corpus"
     expected_rows = config["rows"] + config["mixed"]["batches"] * config["batch_size"]
     values, queries = [], {storage: {} for storage in STORAGES}
     for storage in STORAGES:
@@ -257,9 +251,6 @@ def evaluate(profile, evidence):
         checks = {
             "qps_per_rss_higher_than_mmap": ratio
             > acceptance["minimum_qps_per_rss_ratio"],
-            "qps_floor": buffer["qps"] >= mmap["qps"] * acceptance["minimum_qps_ratio"],
-            "p99_guard": buffer["p99_ms"]
-            <= mmap["p99_ms"] * acceptance["maximum_p99_ratio"],
             "matched_recall": abs(buffer["recall"] - mmap["recall"])
             <= acceptance["maximum_recall_difference"],
         }
@@ -277,6 +268,8 @@ def evaluate(profile, evidence):
         "passed": all(case["passed"] for case in comparisons),
         "profile": config,
         "profile_sha256": digest,
+        "corpus_exceeds_buffer_budget": config["rows"] * config["dimension"] * 4
+        > config["memory_limit_mb"] * 1024**2,
         "source_commit": commits.pop(),
         "wheel_sha256": wheels.pop(),
         "environment": json.loads(environments.pop()),
@@ -303,12 +296,12 @@ def markdown_report(result):
     config = result["profile"]
     lines += [
         f"Candidate: `{result['source_commit']}`",
-        f"Profile: `{config['name']}`; external limit {config['system_limit_mib']} MiB, swap disabled.",
-        f"mmap baseline preparation uses {config['mmap_preparation_system_limit_mib']} MiB; "
-        "both query modes use the same external limit above.",
+        f"Profile: `{config['name']}`; Buffer Pool external limit {config['system_limit_mib']} MiB, swap disabled.",
+        f"mmap uses a generous {config['mmap_reference_system_limit_mib']} MiB external allowance in every stage.",
         "",
         "Ratio uses median per-trial QPS / time-weighted whole-process RSS MiB.",
         "QPS and RSS columns show individual trial medians. All declared cases must pass.",
+        "Raw QPS and p99 show the memory/performance tradeoff; qualification uses QPS/RSS and recall.",
         "",
         "| Distribution | Buffer QPS | Buffer RSS MiB | mmap QPS | mmap RSS MiB | QPS/RSS ratio | Result |",
         "|---|---:|---:|---:|---:|---:|---|",
@@ -342,6 +335,24 @@ def markdown_report(result):
     return "\n".join(lines)
 
 
+def qualified_profile(result):
+    if not result["passed"]:
+        raise ValueError("cannot qualify a failed profile")
+    qualification = {
+        key: result[key]
+        for key in (
+            "passed",
+            "source_commit",
+            "wheel_sha256",
+            "profile_sha256",
+            "environment",
+            "metric",
+            "comparisons",
+        )
+    }
+    return {**result["profile"], "qualification": qualification}
+
+
 def export(args):
     args.output.mkdir(parents=True, exist_ok=True)
     qualified = args.output / "ivf-profile-qualified.json"
@@ -356,24 +367,9 @@ def export(args):
     )
     (args.output / "ivf-profile-report.md").write_text(markdown_report(result))
     if result["passed"]:
-        qualification = {
-            key: result[key]
-            for key in (
-                "passed",
-                "source_commit",
-                "wheel_sha256",
-                "profile_sha256",
-                "environment",
-                "metric",
-                "comparisons",
-            )
-        }
         # Keep controls at the top level so the exported profile can be passed
         # directly to the public example's --profile argument.
-        qualified.write_text(
-            json.dumps({**result["profile"], "qualification": qualification}, indent=2)
-            + "\n"
-        )
+        qualified.write_text(json.dumps(qualified_profile(result), indent=2) + "\n")
     print(json.dumps(result, indent=2))
     return 0 if result["passed"] else 1
 

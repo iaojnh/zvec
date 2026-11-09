@@ -371,6 +371,10 @@ def query_trials(config, root, storage, trial):
                     "recall": recall_sum / len(latencies),
                 }
             )
+            print(
+                json.dumps({"stage": "query_case", "storage": storage, **cases[-1]}),
+                flush=True,
+            )
             time.sleep(0.15)  # Let the independent observer bracket the window.
     finally:
         collection.close()
@@ -414,11 +418,7 @@ def main():
         zvec.init(
             memory_limit_mb=config["memory_limit_mb"]
             if args.storage == "buffer"
-            else config[
-                "mmap_reference_memory_limit_mb"
-                if args.stage == "query"
-                else "mmap_preparation_memory_limit_mb"
-            ],
+            else config["mmap_reference_memory_limit_mb"],
             query_threads=config["query_threads"],
             optimize_threads=config["optimize_threads"],
             log_level=zvec.LogLevel.INFO,

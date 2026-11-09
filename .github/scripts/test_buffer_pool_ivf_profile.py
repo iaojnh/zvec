@@ -115,22 +115,19 @@ def evidence(tmp_path):
                         "target_rss_kib": config[
                             "memory_limit_mb"
                             if storage == "buffer"
-                            else (
-                                "mmap_reference_memory_limit_mb"
-                                if stage == "query"
-                                else "mmap_preparation_memory_limit_mb"
-                            )
+                            else "mmap_reference_memory_limit_mb"
                         ]
                         * 1024,
                         "samples": 9,
+                        "peak_rss_kib": 400 * 1024,
                         "sampling_max_gap_seconds": 0.5,
                     }
                 )
             )
             group = {
                 "memory.max": config[
-                    "mmap_preparation_system_limit_mib"
-                    if storage == "mmap" and stage != "query"
+                    "mmap_reference_system_limit_mib"
+                    if storage == "mmap"
                     else "system_limit_mib"
                 ]
                 * 1024**2,
@@ -177,6 +174,8 @@ def test_build_requires_same_process_query_before_restart(evidence):
         "different_commit",
         "oom",
         "swap",
+        "mmap_pressure",
+        "mmap_not_generous",
         "failed_write",
         "no_concurrent_reads",
         "short_write_run",
@@ -195,13 +194,24 @@ def test_profile_cannot_be_qualified_from_incomplete_or_mixed_results(evidence, 
         (root / "buffer-mixed-1.json").unlink()
     elif damage == "missing_trial":
         (root / "mmap-query-3.json").unlink()
-    elif damage in {"oom", "swap"}:
-        path = root / "buffer-build-1.cgroup.jsonl"
+    elif damage == "mmap_not_generous":
+        change(
+            root / "mmap-query-1.monitor.jsonl",
+            lambda value: value.update(peak_rss_kib=8192 * 1024),
+        )
+    elif damage in {"oom", "swap", "mmap_pressure"}:
+        path = root / (
+            "mmap-query-1.cgroup.jsonl"
+            if damage == "mmap_pressure"
+            else "buffer-build-1.cgroup.jsonl"
+        )
         groups = [json.loads(line) for line in path.read_text().splitlines()]
         if damage == "oom":
             groups[-1]["memory.events"]["oom"] = "1"
-        else:
+        elif damage == "swap":
             groups[-1]["memory.swap.current"] = 1
+        else:
+            groups[-1]["memory.events"]["max"] = "1"
         path.write_text("\n".join(json.dumps(row) for row in groups))
     else:
         path = root / "buffer-mixed-1.json"
@@ -244,12 +254,12 @@ def test_profile_cannot_be_qualified_from_incomplete_or_mixed_results(evidence, 
         evaluate(profile, root)
 
 
-def test_mmap_query_cannot_use_larger_preparation_allowance(evidence):
+def test_mmap_query_requires_the_declared_generous_allowance(evidence):
     profile, root = evidence
     path = root / "mmap-query-1.cgroup.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     for row in rows:
-        row["memory.max"] = 4096 * 1024**2
+        row["memory.max"] = 768 * 1024**2
     path.write_text("\n".join(json.dumps(row) for row in rows))
     with pytest.raises(AssertionError):
         evaluate(profile, root)

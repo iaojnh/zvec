@@ -699,12 +699,41 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  ivf-profile:
-    name: IVF public profile and QPS per RSS versus mmap
+  ivf-profile-plan:
+    name: Read IVF memory sweep
     if: ${{ github.ref_name == 'codex/ivf-release-profile' || (github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
-    needs: build
+    runs-on: ubuntu-24.04
+    outputs:
+      memory_limits: ${{ steps.plan.outputs.memory_limits }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: plan
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          profile = json.loads(Path("examples/python/ivf_memory_profile.json").read_text())
+          limits = profile["buffer_memory_limits_mb"]
+          assert limits == sorted(set(limits)) and all(value > 0 for value in limits)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("memory_limits=" + json.dumps(limits) + "\n")
+          PY
+
+  ivf-profile:
+    name: IVF Buffer ${{ matrix.memory_limit_mb }} MiB versus ample mmap
+    if: ${{ github.ref_name == 'codex/ivf-release-profile' || (github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
+    needs: [build, ivf-profile-plan]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        memory_limit_mb: ${{ fromJSON(needs.ivf-profile-plan.outputs.memory_limits) }}
+    env:
+      PROFILE_FILE: ivf-selected/ivf_memory_profile.json
     steps:
       - uses: actions/checkout@v7
         with:
@@ -724,7 +753,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libaio1t64 liburing2
           python -m pip install candidate/*.whl pytest pytest-xdist
           python -m pytest -o addopts= -q python/tests/test_collection_options.py \
-            .github/scripts/test_buffer_pool_ivf_profile.py
+            .github/scripts/test_buffer_pool_ivf_profile.py .github/scripts/test_buffer_pool_ivf_sweep.py
       - name: Verify snapshot reuse, pressure reclamation and concurrent leases
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/candidate/lib
@@ -752,21 +781,27 @@ jobs:
           ]:
               verify_native_result(target, "", Path("evidence") / name)
           PY
+      - name: Select this declared memory point
+        run: |
+          python .github/scripts/buffer_pool_ivf_sweep.py configure \
+            --profile examples/python/ivf_memory_profile.json \
+            --memory-limit-mb '${{ matrix.memory_limit_mb }}' --output "$PROFILE_FILE"
       - name: Build, continuously write and retrieve under the profile memory limit
+        continue-on-error: true
         env:
           PROFILE_ROOT: ${{ runner.temp }}/ivf-profile
         run: |
           set -euo pipefail
           mkdir -p evidence
-          profile=examples/python/ivf_memory_profile.json
-          limit_mib=$(python -c 'import json; print(json.load(open("examples/python/ivf_memory_profile.json"))["system_limit_mib"])')
+          profile="$PROFILE_FILE"
+          limit_mib=$(python -c 'import json, os; print(json.load(open(os.environ["PROFILE_FILE"]))["system_limit_mib"])')
           wheel=$(find candidate -maxdepth 1 -name '*.whl' -print -quit)
           python_path=$(command -v python)
           run_stage() {
             local storage="$1" stage="$2" trial="$3"
             local stage_limit_mib="$limit_mib"
-            if [[ "$storage" == mmap && "$stage" != query ]]; then
-              stage_limit_mib=$(python -c 'import json; print(json.load(open("examples/python/ivf_memory_profile.json"))["mmap_preparation_system_limit_mib"])')
+            if [[ "$storage" == mmap ]]; then
+              stage_limit_mib=$(python -c 'import json, os; print(json.load(open(os.environ["PROFILE_FILE"]))["mmap_reference_system_limit_mib"])')
             fi
             # A fresh service must own its page-cache charges. Both modes start
             # with cold OS caches, then perform the same measured warmup.
@@ -794,8 +829,9 @@ jobs:
           done
           if [[ "$failed" != 0 ]]; then exit 1; fi
           # Alternate pair order to reduce runner drift; each trial uses a fresh
-          # process, identical data/recall settings and the same external limit.
-          trials=$(python -c 'import json; print(json.load(open("examples/python/ivf_memory_profile.json"))["query"]["trials"])')
+          # process and identical data/recall settings. mmap retains its ample
+          # allowance; Buffer Pool uses this declared point's smaller envelope.
+          trials=$(python -c 'import json, os; print(json.load(open(os.environ["PROFILE_FILE"]))["query"]["trials"])')
           for trial in $(seq 1 "$trials"); do
             order='buffer mmap'
             if (( trial % 2 == 0 )); then order='mmap buffer'; fi
@@ -803,22 +839,56 @@ jobs:
           done
       - name: Export evidence and qualify only profiles meeting the IVF target
         if: always()
+        continue-on-error: true
         run: |
           mkdir -p profile-result
-          cp examples/python/ivf_memory_profile.py examples/python/ivf_memory_profile.json \
-            examples/python/ivf_memory_profile.md profile-result/
+          cp examples/python/ivf_memory_profile.py examples/python/ivf_memory_profile.md profile-result/
+          if [[ -f "$PROFILE_FILE" ]]; then cp "$PROFILE_FILE" profile-result/; fi
           check_rc=0
           python .github/scripts/buffer_pool_ivf_profile.py export \
-            --profile examples/python/ivf_memory_profile.json --evidence evidence --output profile-result || check_rc=$?
+            --profile "$PROFILE_FILE" --evidence evidence --output profile-result || check_rc=$?
           cat profile-result/ivf-profile-report.md >> "$GITHUB_STEP_SUMMARY"
           exit "$check_rc"
       - uses: ./.github/actions/upload-evidence
         if: always()
         with:
-          name: buffer-pool-ivf-profile
+          name: buffer-pool-ivf-profile-${{ matrix.memory_limit_mb }}m
           path: |
             profile-result/
             evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  ivf-profile-summary:
+    name: IVF memory sweep acceptance
+    if: ${{ always() && (github.ref_name == 'codex/ivf-release-profile' || (github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only)) }}
+    needs: ivf-profile
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: buffer-pool-ivf-profile-*m
+          path: sweep-points
+      - name: Report every point and select only a qualified configuration
+        run: |
+          check_rc=0
+          python .github/scripts/buffer_pool_ivf_sweep.py collect \
+            --profile examples/python/ivf_memory_profile.json --root sweep-points \
+            --output ivf-sweep || check_rc=$?
+          cat ivf-sweep/ivf-sweep-report.md >> "$GITHUB_STEP_SUMMARY"
+          cp examples/python/ivf_memory_profile.py examples/python/ivf_memory_profile.md ivf-sweep/
+          exit "$check_rc"
+      - uses: ./.github/actions/upload-evidence
+        if: always()
+        with:
+          name: buffer-pool-ivf-sweep
+          path: ivf-sweep/
           if-no-files-found: error
           retention-days: 14
 

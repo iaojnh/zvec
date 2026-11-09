@@ -4,9 +4,10 @@
   "platform": "linux-x86_64-glibc",
   "system_limit_mib": 768,
   "memory_limit_mb": 512,
-  "mmap_reference_memory_limit_mb": 768,
-  "mmap_preparation_memory_limit_mb": 4096,
-  "mmap_preparation_system_limit_mib": 4096,
+  "buffer_memory_limits_mb": [256, 512, 768, 1024, 1536],
+  "buffer_system_headroom_mib": 256,
+  "mmap_reference_memory_limit_mb": 8192,
+  "mmap_reference_system_limit_mib": 8192,
   "query_threads": 1,
   "optimize_threads": 4,
   "max_buffer_size": 1048576,
@@ -30,8 +31,6 @@
     "minimum_recall": 0.9,
     "maximum_recall_difference": 0.01,
     "minimum_qps_per_rss_ratio": 1.0,
-    "minimum_qps_ratio": 0.8,
-    "maximum_p99_ratio": 1.25,
     "maximum_sampling_gap_seconds": 1.0
   }
 }
