@@ -897,16 +897,20 @@ size_t BlockEvictionQueue::reclaim_for_allocation(size_t bytes) {
   const size_t count =
       std::min<size_t>(256, bytes / page + (bytes % page != 0));
   // Keep the old mandatory-admission scan and protected aging behavior.
-  return batch_recycle_impl(count, 256, true);
+  return batch_recycle_impl(count, 256, true, bytes);
 }
 
 size_t BlockEvictionQueue::batch_recycle_impl(size_t count, size_t scan_count,
-                                              bool age_protected) {
+                                              bool age_protected,
+                                              size_t bytes) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const size_t before = pool.used();
   // Small foreground reservations preserve the existing cost preference.
   // Larger pressure batches give inactive decoded payloads bounded CLOCK
   // attention, rather than letting them monopolize the pool indefinitely.
   size_t evicted =
-      age_protected ? recycle_inactive(std::min<size_t>(8, count)) : 0;
+      age_protected ? recycle_inactive(std::min<size_t>(bytes ? 1 : 8, count)) : 0;
+  size_t reclaimed = before - std::min(before, pool.used());
   // Bound work when no page is currently evictable.
   const size_t max_attempts =
       scan_count > (std::numeric_limits<size_t>::max() - 16) / 4
@@ -931,6 +935,7 @@ size_t BlockEvictionQueue::batch_recycle_impl(size_t count, size_t scan_count,
   };
   reset_scan();
   while (evicted < count && attempts < max_attempts) {
+    if (bytes && reclaimed >= bytes) break;
     BlockType item;
     if (!evict_block(item, attempts, max_attempts, age_protected,
                      &scan_remaining)) {
@@ -947,9 +952,12 @@ size_t BlockEvictionQueue::batch_recycle_impl(size_t count, size_t scan_count,
     std::shared_lock<std::shared_mutex> lock(valid_owners_mutex_);
     if (item.owner != nullptr &&
         valid_owners_.find(item.owner) != valid_owners_.end() &&
-        !item.owner->is_dead_block(item.owner_key, item.version) &&
-        item.owner->evict_block(item.owner_key)) {
-      ++evicted;
+        !item.owner->is_dead_block(item.owner_key, item.version)) {
+      const size_t payload = bytes ? item.owner->eviction_bytes(item.owner_key) : 0;
+      if (item.owner->evict_block(item.owner_key)) {
+        ++evicted;
+        reclaimed += payload ? payload : MemoryLimitPool::page_buffer_size();
+      }
     }
   }
   return evicted;
@@ -1581,11 +1589,20 @@ void MemoryLimitPool::background_evict_loop() {
                       [this, &page_admission_pressure, &idle_progress] {
                         return !bg_running_.load() || idle_progress ||
                                should_background_reclaim() ||
+                               cache_reclaim_requested_.load(
+                                   std::memory_order_relaxed) != 0 ||
                                page_admission_pressure();
                       });
     }
     if (!bg_running_.load()) break;
     if (pool_size_.load(std::memory_order_relaxed) == 0) continue;
+    const size_t requested =
+        cache_reclaim_requested_.exchange(0, std::memory_order_relaxed);
+    if (requested && (used() > low_watermark() || process_rss_.pressure())) {
+      const size_t n = BlockEvictionQueue::get_instance()
+                           .reclaim_for_allocation(requested);
+      bg_evicted_buffers_.fetch_add(n, std::memory_order_relaxed);
+    }
     process_rss_.refresh();
     if (process_rss_.limit()) capacity_cv_.notify_all();
     const auto now = std::chrono::steady_clock::now();
@@ -1621,7 +1638,12 @@ void MemoryLimitPool::background_evict_loop() {
     // foreground path finds ready buffers without a deep inline queue walk.
     while (bg_running_.load() &&
            (used_size_.load() > low || page_admission_pressure())) {
-      size_t n = BlockEvictionQueue::get_instance().batch_recycle(64);
+      size_t n = evictable_cache_used() != 0
+                     ? BlockEvictionQueue::get_instance().reclaim_for_allocation(
+                           std::min<size_t>(64 * page_buffer_size(),
+                               std::max<size_t>(page_buffer_size(),
+                                   used() - std::min(used(), low))))
+                     : BlockEvictionQueue::get_instance().batch_recycle(64);
       if (n == 0) {
         // Back off when pressure remains but eviction makes no progress.
         bg_no_progress_sleeps_.fetch_add(1, std::memory_order_relaxed);
@@ -1882,6 +1904,8 @@ MemoryLimitPool::PendingAllocation::PendingAllocation(MemoryLimitPool &pool,
                    : &pool.external_used_size_) {}
 
 MemoryLimitPool::PendingAllocation::~PendingAllocation() {
+  if (bytes_ && kind_ == Kind::kEvictableCache)
+    pool_.evictable_cache_size_.fetch_sub(bytes_, std::memory_order_relaxed);
   if (bytes_) pool_.release_fixed(bytes_, counter_, Backing::kPending);
 }
 
@@ -1903,6 +1927,18 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
     case Kind::kLockedExternal:
       reserved = pool_.try_charge_locked(bytes, counter_, Backing::kPending);
       break;
+    case Kind::kEvictableCache: {
+      const size_t used = pool_.used();
+      const size_t limit = pool_.high_watermark();
+      if (pool_.workspace_waiting_size_.load(std::memory_order_relaxed) == 0 &&
+          used <= limit && bytes <= limit - used &&
+          pool_.try_reserve_allocation(bytes, Backing::kPending)) {
+        counter_->fetch_add(bytes, std::memory_order_relaxed);
+        pool_.evictable_cache_size_.fetch_add(bytes, std::memory_order_relaxed);
+        reserved = true;
+      }
+      break;
+    }
   }
   if (reserved) bytes_ = bytes;
   return reserved;
@@ -2143,6 +2179,24 @@ void MemoryLimitPool::release_unmapped_external(
     size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
   release_fixed(bytes, &external_used_size_, Backing::kLive,
                 ProcessRssBudget::MappingProjection::Full(bytes, stamp));
+}
+
+void MemoryLimitPool::release_unmapped_cache(
+    size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
+  const size_t previous =
+      evictable_cache_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  assert(previous >= bytes);
+  (void)previous;
+  release_unmapped_external(bytes, stamp);
+}
+
+void MemoryLimitPool::request_cache_reclaim(size_t bytes) {
+  if (!bytes || evictable_cache_used() == 0) return;
+  size_t previous = cache_reclaim_requested_.load(std::memory_order_relaxed);
+  while (previous < bytes &&
+         !cache_reclaim_requested_.compare_exchange_weak(
+             previous, bytes, std::memory_order_relaxed)) {}
+  bg_cv_.notify_one();
 }
 
 void MemoryLimitPool::release_metadata(const size_t buffer_size) {

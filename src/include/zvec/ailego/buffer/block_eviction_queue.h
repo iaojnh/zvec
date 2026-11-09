@@ -58,6 +58,10 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
   //! Evict a block; return true only when memory was reclaimed.
   virtual bool evict_block(eviction_key_t owner_key) = 0;
 
+  // Payload released by a successful eviction, when known by the owner.
+  // Zero retains the existing page-sized fallback for legacy owners.
+  virtual size_t eviction_bytes(eviction_key_t /*owner_key*/) const { return 0; }
+
   //! Opportunistically reclaim an inactive costly payload. The queue owns
   //! the popped membership and requeues it when this returns false. Ordinary
   //! explicit-hot pages do not opt in and retain their priority semantics.
@@ -208,7 +212,7 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
 
   size_t recycle_inactive(size_t max_attempts);
   size_t batch_recycle_impl(size_t count, size_t scan_count,
-                            bool age_protected);
+                            bool age_protected, size_t bytes = 0);
 
   BlockEvictionQueue() {
     for (size_t i = 0; i < kQueueCount; ++i) {
@@ -373,6 +377,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
       kMetadata,
       kLockedMetadata,
       kLockedExternal,
+      // Optional, globally evictable mappings. Admission never walks owners.
+      kEvictableCache,
     };
 
     PendingAllocation(MemoryLimitPool &pool, Kind kind);
@@ -414,6 +420,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                              ProcessRssBudget::HeapProjection projection);
   void release_unmapped_external(size_t bytes,
                                  ProcessRssBudget::MaterializationStamp stamp);
+  void release_unmapped_cache(size_t bytes,
+                              ProcessRssBudget::MaterializationStamp stamp);
+  void request_cache_reclaim(size_t bytes);
 
   void release_metadata(const size_t buffer_size);
   void release_unmapped_metadata(size_t bytes,
@@ -496,6 +505,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   //! such as decoded or application-level cache entries.
   size_t external_used() const {
     return external_used_size_.load(std::memory_order_relaxed);
+  }
+  // Subset of external_used(), excluded from non-evictable watermarks.
+  size_t evictable_cache_used() const {
+    return evictable_cache_size_.load(std::memory_order_relaxed);
   }
 
   size_t metadata_used() const {
@@ -652,7 +665,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     return fixed + page_capacity - reserve_margin(page_capacity) * 2;
   }
   size_t fixed_used() const {
-    return external_used_size_.load(std::memory_order_relaxed) +
+    const size_t external = external_used_size_.load(std::memory_order_relaxed);
+    return external - std::min(external, evictable_cache_used()) +
            metadata_used_size_.load(std::memory_order_relaxed);
   }
   bool should_background_reclaim() const {
@@ -683,6 +697,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::mutex process_reclaimer_mutex_;
   std::shared_ptr<const std::function<void()>> process_reclaimer_;
   std::atomic<size_t> external_used_size_{0};
+  std::atomic<size_t> evictable_cache_size_{0};
+  std::atomic<size_t> cache_reclaim_requested_{0};
   std::atomic<size_t> metadata_used_size_{0};
   // Logical priority only, not an allocation: waiting mandatory consumers
   // must be able to claim reclaimed bytes before optional page readmission.

@@ -3,14 +3,15 @@
 #pragma once
 
 #include <memory>
+#include <limits>
 #include <zvec/core/framework/index_storage.h>
 
 namespace zvec {
 namespace core {
 
 // Read-only storage for immutable files. All payload capacity is charged to
-// MemoryLimitPool before allocation. Cache replacement reuses charged slots;
-// execution slots remain available when every cache slot is pinned.
+// MemoryLimitPool before allocation. Atomic chunk pins protect readers while
+// the process-wide BlockEvictionQueue controls cache residency.
 class ZVEC_CORE_API ChunkReadStorage : public IndexStorage {
  public:
   struct Stats {
@@ -42,7 +43,7 @@ class ZVEC_CORE_API ChunkReadStorage : public IndexStorage {
   class ReadSegment;
   std::shared_ptr<State> state_;
   size_t chunk_bytes_{256UL << 10};
-  size_t cache_bytes_{64UL << 20};
+  size_t cache_bytes_{std::numeric_limits<size_t>::max()};
   size_t max_read_bytes_{4UL << 20};
   size_t workspace_count_{8};
   size_t wait_ms_{100};
@@ -64,7 +65,7 @@ inline constexpr const char *CHUNK_READ_STORAGE_WAIT_MS =
     "proxima.chunk_read_storage.wait_ms";
 inline constexpr const char *CHUNK_READ_STORAGE_DIRECT_IO =
     "proxima.chunk_read_storage.direct_io";
-// Size initial workspaces/cache to the file and shared budget. Larger reads
+// Size initial workspaces to the file and shared budget. Larger reads
 // may grow a leased execution slot through normal workspace admission.
 inline constexpr const char *CHUNK_READ_STORAGE_ADAPTIVE =
     "proxima.chunk_read_storage.adaptive";
