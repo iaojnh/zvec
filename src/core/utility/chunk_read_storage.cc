@@ -20,7 +20,12 @@
 #include <zvec/core/framework/index_unpacker.h>
 #include "utility_params.h"
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
 #include <sys/stat.h>
 #endif
 
