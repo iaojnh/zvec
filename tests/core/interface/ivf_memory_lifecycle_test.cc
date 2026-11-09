@@ -105,11 +105,11 @@ class IVFMemoryLifecycleTest : public testing::Test {
     EXPECT_EQ(0, index->initialize(*param));
     return index;
   }
-  void build() {
+  void build(uint32_t count = 64) {
     Index::Pointer index = make_index();
     ASSERT_EQ(
         0, index->open(path, {StorageOptions::StorageType::kBufferPool, true}));
-    for (uint32_t i = 0; i < 64; ++i) {
+    for (uint32_t i = 0; i < count; ++i) {
       row[i % row.size()] += 0.1f;
       ASSERT_EQ(0, index->add(VectorData{DenseVector{row.data()}}, i));
     }
@@ -335,25 +335,41 @@ TEST_F(IVFMemoryLifecycleTest, SwitchingIndexesAndWorkerExitReleaseReaders) {
 }
 
 TEST_F(IVFMemoryLifecycleTest, LowMemoryQueryPreservesCauseAndCanRetry) {
-  build();
+  constexpr uint32_t kCount = 512;
+  build(kCount);
   Index::Pointer index = make_index();
   ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
                                   false, true}));
   auto query = std::make_shared<IVFQueryParam>();
-  query->topk = 1;
-  // Open may have admitted reclaimable Chunk backing. Remove it before
-  // reserving the remaining budget so a query cannot recover headroom by
-  // evicting that cache instead of exercising workspace admission failure.
+  query->topk = kCount;
+  query->nprobe = 8;
+  // Open can retain pinned Chunk metadata which the first query releases.
+  // Reclaim idle backing, then request enough real results that releasing
+  // those metadata pages cannot satisfy the query's result allocation, even
+  // on platforms with 16 KiB pages.
   auto &queue = ailego::BlockEvictionQueue::get_instance();
   while (queue.reclaim_for_allocation(pool.capacity()) != 0) {
   }
+  ASSERT_GT(kCount * sizeof(core::IndexDocument),
+            ailego::MemoryLimitPool::get_instance().evictable_cache_used());
+  SearchResult result;
   {
     ailego::MemoryReservation pressure;
-    pressure.add(pool.available());
-    ASSERT_EQ(0u, pool.available());
-    EXPECT_EQ(core::IndexError_NoMemory, search(index, query));
+    // The background evictor may finish releasing backing during admission.
+    // Fill any newly available bytes before checking the exhaustion snapshot.
+    size_t remaining = pool.available();
+    for (size_t attempt = 0; attempt < 32 && remaining != 0; ++attempt) {
+      pressure.add(remaining);
+      remaining = pool.available();
+    }
+    ASSERT_EQ(0u, remaining);
+    EXPECT_EQ(core::IndexError_NoMemory,
+              index->search(VectorData{DenseVector{row.data()}}, query, &result));
+    EXPECT_TRUE(result.doc_list_.empty());
   }
-  EXPECT_EQ(0, search(index, query));
+  ASSERT_EQ(0, index->search(VectorData{DenseVector{row.data()}}, query, &result));
+  EXPECT_EQ(kCount, result.doc_list_.size());
+  result.clear();
   EXPECT_EQ(0, index->close());
 }
 }  // namespace
