@@ -211,8 +211,7 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
   using RowGroupRows = ailego::BudgetedVector<std::pair<size_t, uint64_t>>;
   using RowGroupEntry = std::pair<const int, RowGroupRows>;
   std::unordered_map<int, RowGroupRows, std::hash<int>, std::equal_to<int>,
-                     ailego::BudgetedAllocator<RowGroupEntry>>
-      rg_to_local;
+                     ailego::BudgetedAllocator<RowGroupEntry>> rg_to_local;
   size_t output_row = 0;
   for (int global_row : indices) {
     if (global_row < 0 || global_row >= num_rows_) {
@@ -246,26 +245,17 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
   int64_t *order = nullptr;
   if (!col_indices.empty()) {
     ARROW_ASSIGN_OR_RAISE(
-        order_buffer,
-        arrow::AllocateBuffer(indices.size() * sizeof(int64_t), pool));
+        order_buffer, arrow::AllocateBuffer(indices.size() * sizeof(int64_t),
+                                            pool));
     order = reinterpret_cast<int64_t *>(order_buffer->mutable_data());
   }
   bool needs_reordering = false;
 
-  // Validate the file identity once for this fetch. All column/row-group
-  // keys share that checked snapshot; the next fetch still revalidates it
-  // so replacement or rewriting of the path cannot reuse stale columns.
-  ParquetBufferID checked_file;
-  if (!col_indices.empty()) {
-    checked_file = ParquetBufferID(file_path_, 0, 0, metadata_id_);
-  }
-
   for (const auto &[rg_id, pairs] : rg_to_local) {
     for (size_t i = 0; i < col_indices.size(); ++i) {
       int col_idx = col_indices[i];
-      auto buffer_id = checked_file;
-      buffer_id.column = col_idx;
-      buffer_id.row_group = rg_id;
+      auto buffer_id =
+          ParquetBufferID(file_path_, col_idx, rg_id, metadata_id_);
       ARROW_ASSIGN_OR_RAISE(
           auto buffer_handle,
           ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id));
@@ -366,12 +356,9 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   int64_t offset = get_row_group_offset(rg_id);
 
   std::vector<arrow::Datum> scalars;
-  const auto checked_file = ParquetBufferID(file_path_, 0, 0, metadata_id_);
   for (size_t i = 0; i < col_indices.size(); ++i) {
     int col_idx = col_indices[i];
-    auto buffer_id = checked_file;
-    buffer_id.column = col_idx;
-    buffer_id.row_group = rg_id;
+    auto buffer_id = ParquetBufferID(file_path_, col_idx, rg_id, metadata_id_);
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
     if (!acquired.ok()) {
