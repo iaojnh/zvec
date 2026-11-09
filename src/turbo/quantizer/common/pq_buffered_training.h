@@ -167,6 +167,9 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
   auto threads = std::make_shared<core::SingleQueueIndexThreads>(
       options.thread_count, false);
   auto train_chunks = [&](uint32_t max_iters) -> int {
+    // OPQ's publish callback reuses this buffer across row tiles. Once the
+    // rotated subspaces are written, Lloyd training only reads their file.
+    Workspace().swap(subspace);
     auto group = threads->make_group();
     if (!group) return core::IndexError_Runtime;
     std::atomic<int> error{0};
@@ -196,8 +199,7 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
       // retained 64 KiB tiles can otherwise consume the last I/O pages.
       Workspace().swap(rows);
       core::SingleQueueIndexThreads local_threads(1, false);
-      Kmc2CentroidsGenerator<decltype(algorithm),
-                             core::SingleQueueIndexThreads>
+      Kmc2CentroidsGenerator<decltype(algorithm), core::SingleQueueIndexThreads>
           gen;
       gen.set_chain_length(options.chain_length);
       gen.set_assumption_free(false);

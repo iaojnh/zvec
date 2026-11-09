@@ -120,9 +120,9 @@ int PqOpq::train_rows(size_t num, const char *name,
   // Reserve backing metadata first, then shrink tiles under budget pressure.
   const size_t tile =
       TrainingTileRows(std::min<size_t>(num, 1024), row_bytes, 3);
-  std::vector<float, ailego::BudgetedAllocator<float>> original(tile * dim),
-      rotated(original.size()), reconstructed(original.size());
+  using Workspace = std::vector<float, ailego::BudgetedAllocator<float>>;
   auto publish_rotation = [&]() -> int {
+    Workspace original(tile * dim), rotated(original.size());
     for (size_t first = 0; first < num; first += tile) {
       const size_t count = std::min(tile, num - first);
       int status = read_original(first, count, original.data());
@@ -140,15 +140,21 @@ int PqOpq::train_rows(size_t num, const char *name,
     ret = train_codebook(opq_pq_iter_);
     if (ret != 0) return ret;
     double error = 0.0;
-    for (size_t first = 0; first < num; first += tile) {
-      const size_t count = std::min(tile, num - first);
-      ret = read_original(first, count, original.data());
-      if (ret != 0) return ret;
-      rotate_batch(original.data(), count, rotated.data());
-      error += reconstruct(rotated.data(), count, reconstructed.data());
-      ret = reconstruction.write(first * row_bytes, reconstructed.data(),
-                                 count * row_bytes);
-      if (ret != 0) return ret;
+    {
+      // These row tiles are only needed while reconstructing. Codebook
+      // training and the rotation solver own separate scratch and I/O pages.
+      Workspace original(tile * dim), rotated(original.size()),
+          reconstructed(original.size());
+      for (size_t first = 0; first < num; first += tile) {
+        const size_t count = std::min(tile, num - first);
+        ret = read_original(first, count, original.data());
+        if (ret != 0) return ret;
+        rotate_batch(original.data(), count, rotated.data());
+        error += reconstruct(rotated.data(), count, reconstructed.data());
+        ret = reconstruction.write(first * row_bytes, reconstructed.data(),
+                                   count * row_bytes);
+        if (ret != 0) return ret;
+      }
     }
     const float mse = static_cast<float>(error / num);
     LOG_INFO("%s OPQ round %u/%u: reconstruction mse=%f", name, iter + 1,
@@ -180,7 +186,8 @@ void PqOpq::rotate_batch(const float *input, size_t num, float *output) const {
   }
 }
 
-const void *PqOpq::apply(const void *input, ailego::BudgetedVector<float> *buffer) const {
+const void *PqOpq::apply(const void *input,
+                         ailego::BudgetedVector<float> *buffer) const {
   if (!enabled()) return input;
   buffer->resize(preprocessor_->out_dim());
   rotate(reinterpret_cast<const float *>(input), buffer->data());
