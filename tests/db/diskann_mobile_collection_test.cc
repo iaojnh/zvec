@@ -53,9 +53,8 @@ static_assert(DISKANN_SUPPORTED == 1,
 
 #if (defined(__APPLE__) && TARGET_OS_OSX && defined(__x86_64__)) || \
     (defined(_WIN32) && defined(_M_ARM64))
-static_assert(
-    DISKANN_SUPPORTED == 1,
-    "Intel macOS and Windows ARM64 must compile real DiskAnn support");
+static_assert(DISKANN_SUPPORTED == 1,
+              "Intel macOS and Windows ARM64 must compile real DiskAnn support");
 #endif
 
 #if DISKANN_SUPPORTED

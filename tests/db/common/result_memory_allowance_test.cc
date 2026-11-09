@@ -15,6 +15,8 @@
 #include "db/index/column/inverted_column/inverted_search_result.h"
 #include "db/index/common/doc_field_converter.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
+#include "binding/c/c_memory.h"
+#include "db/common/metadata_memory.h"
 
 namespace zvec::ailego {
 
@@ -709,4 +711,60 @@ TEST_F(ResultMemoryAllowanceTest, QueryEstimateCountsNestedStringsAndNulls) {
 }
 
 }  // namespace
+}  // namespace zvec::detail
+
+TEST(CMemoryOwnerTest, CopiesKeepAdmissionUntilCrossThreadFree) {
+  using namespace zvec::detail;
+  constexpr size_t kMiB = 1024 * 1024;
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(64 * kMiB));
+  auto &allowance = SharedResultMemoryAllowance();
+  const auto initial = allowance.active_bytes();
+  auto *copy = AllocateCResult(kMiB);
+  ASSERT_NE(nullptr, copy);
+  EXPECT_GE(allowance.active_bytes() - initial, kMiB);
+  const auto backing = allowance.reserved_bytes();
+  std::async(std::launch::async, [copy] { FreeCResult(copy); }).get();
+  EXPECT_EQ(initial, allowance.active_bytes());
+  EXPECT_EQ(backing, allowance.reserved_bytes());
+  copy = AllocateCResult(kMiB);
+  EXPECT_EQ(backing, allowance.reserved_bytes());
+  FreeCResult(copy);
+  EXPECT_EQ(initial, allowance.active_bytes());
+  EXPECT_THROW(AllocateCResult(64 * kMiB), std::bad_alloc);
+  EXPECT_EQ(initial, allowance.active_bytes());
+  EXPECT_THROW(AllocateCResultArray(SIZE_MAX, sizeof(void *)), std::bad_alloc);
+  // Existing C allocations remain valid inputs to the public free path.
+  FreeCResult(std::malloc(17));
+  FreeCResult(nullptr);
+}
+
+namespace zvec::detail {
+
+TEST(RetainedMetadataMemoryTest, ReusedAllowanceObeysHostPressure) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  constexpr size_t kMiB = 1024 * 1024;
+  ASSERT_EQ(0, pool.init(64 * kMiB));
+  RetainedMetadataBudget budget;
+  {
+    RetainedMetadataBudget::Lease warmup(budget);
+    warmup.acquire(kMiB);
+  }
+  const auto backing = budget.reserved();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  pool.set_memory_pressure(Pressure::kCritical);
+  {
+    RetainedMetadataBudget::Lease blocked(budget);
+    EXPECT_THROW(blocked.acquire(kMiB), std::bad_alloc);
+    EXPECT_EQ(0u, blocked.bytes());
+  }
+  pool.set_memory_pressure(Pressure::kBackground);
+  {
+    RetainedMetadataBudget::Lease recovered(budget);
+    EXPECT_NO_THROW(recovered.acquire(kMiB));
+  }
+  pool.set_memory_pressure(Pressure::kNormal);
+  EXPECT_EQ(backing, budget.reserved());
+}
+
 }  // namespace zvec::detail

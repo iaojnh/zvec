@@ -290,7 +290,7 @@ void CheckStreamer() {
               return excluded.count(Id(key)) != 0;
             });
           ASSERT_EQ(0, streamer->search_bf_impl(data.data(), qmeta, kQueryCount,
-                                                context));
+                                              context));
           // Batch scans call the filter once per live, valid row per query,
           // including rows rejected by the filter and the partial last block.
           // The legacy K>=N block path retains its original callback order.

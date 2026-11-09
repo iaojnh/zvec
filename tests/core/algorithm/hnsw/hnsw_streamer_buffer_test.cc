@@ -16,6 +16,8 @@
 #include "tests/core/algorithm/flat/flat_fault_storage.h"
 #include "tests/test_util.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
+#include "algorithm/hnsw/hnsw_entity.h"
+#include "tests/core/algorithm/hnsw_dump_test_helper.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -28,7 +30,7 @@ using namespace std;
 
 constexpr size_t static dim = 16;
 
-class HnswStreamerTest : public testing::Test {
+class HnswStreamerTest : public ::testing::Test {
  protected:
   void SetUp() override;
   void TearDown() override;
@@ -1112,3 +1114,12 @@ TEST_F(HnswStreamerTest, TestHnswSearchMMap) {
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic pop
 #endif
+
+namespace zvec::core {
+TEST(HnswEntityDumpMemoryTest, StreamingMetadataMatchesNeighborData) {
+  testing::CheckStreamingGraphDump<HnswEntity>();
+}
+TEST(HnswEntityDumpMemoryTest, UpperIndexReadErrorDoesNotProduceEmptyLevel) {
+  testing::CheckGraphDumpReadError<HnswEntity>();
+}
+}  // namespace zvec::core

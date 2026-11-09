@@ -1045,8 +1045,8 @@ TEST(CollectionSchemaTest, Validate) {
                                              DataType::VECTOR_FP32, 1024);
       fields.emplace_back(f);
     }
-    CollectionSchema oversized_schema("c5", fields);
-    s = oversized_schema.validate();
+    CollectionSchema c5("c5", fields);
+    s = c5.validate();
     ASSERT_FALSE(s.ok());
     ASSERT_EQ(s.code(), StatusCode::INVALID_ARGUMENT);
 

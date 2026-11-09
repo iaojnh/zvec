@@ -24,9 +24,6 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/utility/file_helper.h>
-#if defined(__linux__) || defined(__APPLE__)
-#include <glog/logging.h>
-#endif
 #include "index/utils/utils.h"
 #include "zvec/db/collection.h"
 
@@ -94,12 +91,6 @@ void Note(ReaderResult *r, const std::string &msg) {
 
 class ConcurrentReadTest : public ::testing::Test {
  protected:
-#if defined(__linux__) || defined(__APPLE__)
-  static void SetUpTestSuite() {
-    // Keep a native stack when a platform-only race fails in hosted CI.
-    google::InstallFailureSignalHandler();
-  }
-#endif
   void SetUp() override {
     zvec::ailego::MemoryLimitPool::get_instance().init(4 * 1024ll * 1024ll *
                                                        1024ll);
@@ -200,7 +191,6 @@ TEST_F(ConcurrentReadTest, FetchReturnsCorrectContentUnderConcurrency) {
       if (!problem.empty()) {
         std::printf("  first problem: %s\n", problem.c_str());
       }
-      std::fflush(stdout);
 
       EXPECT_GT(total, 0);
       EXPECT_EQ(nulls, 0) << problem;
