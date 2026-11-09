@@ -155,10 +155,21 @@ jobs:
         shell: powershell
 
       - name: Run Python Tests
+        id: python-tests
         run: |
           cd "$env:GITHUB_WORKSPACE"
           New-Item -ItemType Directory -Force ci-evidence | Out-Null
-          python -m pytest python/tests/ --basetemp=./.pytest_tmp --junitxml=ci-evidence/python.xml
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE/.github/scripts" + [IO.Path]::PathSeparator + $env:PYTHONPATH
+          python -m pytest python/tests/ --basetemp=./.pytest_tmp --junitxml=ci-evidence/python.xml `
+            -p wal_recovery_diagnostics --wal-diagnostics-dir=ci-evidence/wal-recovery
+        shell: powershell
+
+      - name: Diagnose recovered scalar WAL close and readonly reopen
+        if: ${{ !cancelled() && inputs.buffer_pool_acceptance && matrix.platform == 'windows-11-arm' && steps.python-tests.outcome != 'skipped' }}
+        run: |
+          python .github/scripts/wal_recovery_diagnostics.py --attempts 50 `
+            --output ci-evidence/wal-recovery/probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         shell: powershell
 
       - name: Run C++ Examples
