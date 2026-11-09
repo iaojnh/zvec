@@ -16,6 +16,8 @@
 #include <limits>
 #include <vector>
 #include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
+#include "../ailego/buffer/pool_payload_budget.h"
 #include "preprocessor/opq_rotator/opq_rotator.h"
 #include "quantizer/common/pq_quantizer/pq_opq.h"
 
@@ -137,6 +139,14 @@ TEST(PqOpq, DisabledAndEmptyTrainingSkipCallbacks) {
 }
 
 TEST(PqOpq, TrainingAppliesFinalMatrixAndStopsOnPlateau) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0u, pool.used());
+  ASSERT_EQ(0, pool.init(4UL << 20));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous));
+  });
   for (uint32_t rounds : {1u, 4u}) {
     PqOpq opq;
     auto params = opq_params();
@@ -163,6 +173,7 @@ TEST(PqOpq, TrainingAppliesFinalMatrixAndStopsOnPlateau) {
           ++reconstructed;
           return 1.0f;  // Constant error triggers the plateau condition.
         });
+    EXPECT_GT(pool.used(), 0u);
     EXPECT_EQ(rounds == 1 ? 1u : 2u, trained);
     EXPECT_EQ(trained, reconstructed);
     for (size_t i = 0; i < data.size(); ++i) {

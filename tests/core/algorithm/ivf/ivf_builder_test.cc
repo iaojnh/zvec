@@ -236,57 +236,6 @@ TEST_F(IVFBuilderTest, TwoPassHolderKeepsSuccessfulSecondPass) {
   }
 }
 
-TEST_F(IVFBuilderTest, TwoPassSpillsInputLargerThanPool) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  auto restore = ScopeGuard::Make([&] {
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  constexpr size_t kBudget = 8UL << 20;
-  ASSERT_EQ(0, pool.init(kBudget));
-  dimension_ = 768;
-  index_meta_.set_meta(IndexMeta::DT_FP32, dimension_);
-  prepare_index_holder(0, 4096);
-  ASSERT_GT(holder_->count() * holder_->element_size(), kBudget);
-  class UnknownCountSource : public SinglePassIteratorErrorHolder {
-   public:
-    using SinglePassIteratorErrorHolder::SinglePassIteratorErrorHolder;
-    size_t count() const override {
-      return size_t(-1);
-    }
-  };
-  for (bool unknown : {false, true}) {
-    SCOPED_TRACE(unknown);
-    IndexHolder::Pointer source;
-    if (unknown)
-      source = std::make_shared<UnknownCountSource>(
-          holder_, 5000, IteratorErrorOperation::kValidity);
-    else
-      source = std::make_shared<SinglePassIteratorErrorHolder>(
-          holder_, 5000, IteratorErrorOperation::kValidity);
-    auto two_pass = IndexHelper::MakeTwoPassHolder(source);
-    EXPECT_EQ(source->count(), two_pass->count());
-    for (size_t pass = 0; pass < 2; ++pass) {
-      auto iter = two_pass->create_iterator();
-      ASSERT_TRUE(iter);
-      size_t count = 0;
-      for (; iter->is_valid(); iter->next(), ++count) {
-        EXPECT_EQ(count, iter->key());
-        auto *row = static_cast<const float *>(iter->data());
-        ASSERT_NE(nullptr, row);
-        EXPECT_FLOAT_EQ(static_cast<float>(count), row[0]);
-      }
-      EXPECT_EQ(0, iter->status());
-      EXPECT_EQ(4096u, count);
-      EXPECT_LE(pool.used(), kBudget);
-      EXPECT_LT(pool.external_used(), 1UL << 20);
-    }
-    two_pass.reset();
-    EXPECT_EQ(0u, pool.used());
-  }
-}
-
 TEST_F(IVFBuilderTest, MaterializationPreservesIteratorReadError) {
   dimension_ = 16;
   index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);

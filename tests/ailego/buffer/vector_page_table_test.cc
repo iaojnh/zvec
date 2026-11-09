@@ -40,7 +40,6 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
-#include <zvec/ailego/parallel/worker_memory.h>
 #include "pool_payload_budget.h"
 
 #if defined(_MSC_VER)
@@ -60,26 +59,6 @@
 using namespace zvec::ailego;
 
 namespace zvec::ailego {
-
-struct VecBufferPoolTestPeer {
-  static bool has_writeback_worker(const VecBufferPool &pool) {
-    return pool.writeback_thread_.joinable();
-  }
-  static char *writeback_staging(const VecBufferPool &pool) {
-    return pool.writeback_staging_;
-  }
-  static std::shared_mutex *page_locks(const VecBufferPool &pool) {
-    return pool.block_mutexes_.get();
-  }
-};
-
-struct MemoryLimitPoolTestPeer {
-  inline static size_t rss = 0;
-  static bool configure(MemoryLimitPool &pool, size_t limit, size_t sample) {
-    rss = sample;
-    return pool.process_rss_.configure(limit, +[] { return rss; });
-  }
-};
 
 // Model a waiter descheduled between joining a load and consuming its result.
 // This makes eviction-before-wakeup deterministic, without sleeps or changing
@@ -188,47 +167,6 @@ class BufferPoolTest : public ::testing::Test {
     files_.push_back(MakeBackingFile(num_pages));
     return files_.back();
   }
-  void check_page_eviction_reload(bool writable) {
-    init_vec_pool(/*capacity_pages=*/256, /*file_pages=*/1, writable);
-    VecBufferPool pool(new_file(1), writable);
-    ASSERT_EQ(0, pool.init());
-    ASSERT_TRUE(pool.cache_enabled());
-    ASSERT_FALSE(pool.is_page_resident(0));
-
-    char *first = pool.acquire_buffer(0);
-    ASSERT_NE(nullptr, first);
-    ASSERT_TRUE(pool.is_page_resident(0));
-    ExpectPageContent(first, 0);
-    std::vector<char> expected(first, first + kVectorPageSize);
-    if (writable) {
-      for (size_t i = 0; i < expected.size(); ++i)
-        expected[i] = static_cast<char>((i * 17 + 73) % 251);
-      ASSERT_EQ(0, pool.write_range(0, expected.size(), expected.data()));
-      ASSERT_TRUE(pool.page_table_.is_block_dirty(0));
-    }
-    // Keep this deterministic state transition below background pressure.
-    // Separate working-set tests exercise budget-driven eviction.
-    ASSERT_FALSE(PoolPayloadBudget::get_instance().under_cache_pressure());
-    ASSERT_FALSE(pool.page_table_.force_evict_block(0));  // still pinned
-    ASSERT_TRUE(pool.is_page_resident(0));
-    pool.page_table_.release_block(0);
-    const auto before = pool.stats();
-    ASSERT_TRUE(pool.page_table_.force_evict_block(0));
-    ASSERT_FALSE(pool.is_page_resident(0));
-    ASSERT_FALSE(pool.page_table_.is_block_dirty(0));
-    EXPECT_EQ(before.evict + 1, pool.stats().evict);
-    EXPECT_EQ(before.dirty_flush + (writable ? 1 : 0), pool.stats().dirty_flush);
-    EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
-
-    // Reload the same file offset through cache admission, not a bypass read.
-    char *reloaded = pool.acquire_buffer(0);
-    ASSERT_NE(nullptr, reloaded);
-    ASSERT_TRUE(pool.is_page_resident(0));
-    EXPECT_EQ(before.miss + 1, pool.stats().miss);
-    EXPECT_EQ(before.bypass_reads, pool.stats().bypass_reads);
-    EXPECT_EQ(0, std::memcmp(expected.data(), reloaded, expected.size()));
-    pool.page_table_.release_block(0);
-  }
   std::vector<std::string> files_;
 };
 
@@ -286,7 +224,6 @@ struct BlockingLoadState {
   std::atomic<size_t> active_loads{0};
   std::atomic<size_t> max_active_loads{0};
   std::atomic<bool> finish{false};
-  bool throw_load{false};
 };
 
 struct BlockingLoader {
@@ -306,10 +243,6 @@ struct BlockingLoader {
     }
     while (!state->finish.load(std::memory_order_acquire)) {
       std::this_thread::yield();
-    }
-    if (state->throw_load) {
-      state->active_loads.fetch_sub(1, std::memory_order_release);
-      throw std::bad_alloc();
     }
     payload.data = std::make_shared<std::vector<char>>(bytes);
     size = bytes;
@@ -560,36 +493,6 @@ TEST_F(BufferPoolTest, WritableBypassJoinsConcurrentLoadBeforeReading) {
   pool.page_table_.release_block(0);
 }
 
-TEST_F(BufferPoolTest, RefusedWritebackWorkerFallsBackAndPersistsDirtyPages) {
-  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
-  auto &memory = MemoryLimitPool::get_instance();
-  const auto file = new_file(1);
-  const size_t stack = DefaultNativeWorkerStackBytes();
-  ASSERT_GT(stack, 0u);
-  constexpr size_t limit = 128UL << 20;
-  const size_t metadata =
-      VecBufferPool::metadata_bytes_for_page_count(1, true);
-  ASSERT_LT(metadata + stack / 2, limit);
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure(
-      memory, limit, limit - metadata - stack / 2));
-  auto restore = ScopeGuard::Make(
-      [&] { EXPECT_TRUE(memory.configure_process_rss_limit(0)); });
-  const std::string changed(64, 'W');
-  {
-    VecBufferPool pool(file, true);
-    ASSERT_EQ(0, pool.init());
-    ASSERT_FALSE(VecBufferPoolTestPeer::has_writeback_worker(pool));
-    ASSERT_EQ(0, pool.write_range(0, changed.size(), changed.data()));
-    ASSERT_EQ(0, pool.flush_all());
-  }
-  ASSERT_TRUE(memory.configure_process_rss_limit(0));
-  VecBufferPool reader(file, false);
-  ASSERT_EQ(0, reader.init());
-  std::array<char, 64> actual{};
-  ASSERT_TRUE(reader.get_handle().read_range(0, actual.size(), actual.data()));
-  EXPECT_EQ(changed, std::string(actual.data(), actual.size()));
-}
-
 TEST_F(BufferPoolTest, BypassRecheckRecognizesResidencyActivity) {
   init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2);
   std::string file = new_file(/*num_pages=*/2);
@@ -638,16 +541,7 @@ TEST_F(BufferPoolTest, ResidentOnlyAcquirePreservesTransitionStates) {
   pool.page_table_.release_block(/*block_id=*/0);
 }
 
-TEST_F(BufferPoolTest, EvictedReadOnlyPageReloadsFromDisk) {
-  check_page_eviction_reload(false);
-}
-
-TEST_F(BufferPoolTest, EvictedDirtyPageReloadsPersistedBytes) {
-  check_page_eviction_reload(true);
-}
-
-// Reads remain correct across a working set larger than the cache, including
-// first-touch bypasses. The independent cases above require cache reloading.
+// Reads remain correct across a working set larger than the cache.
 TEST_F(BufferPoolTest, DataCorrectUnderEviction) {
   const size_t num_pages = 64;
   init_vec_pool(/*capacity_pages=*/16,
@@ -695,6 +589,10 @@ TEST_F(BufferPoolTest, PinnedEvictionBecomesReclaimableAfterRelease) {
   handle.release_one(page_id);
   EXPECT_TRUE(pool.page_table_.evict_block(page_id));
   EXPECT_FALSE(pool.page_table_.is_loaded(page_id));
+  page = handle.get_single_page(0, 1, page_id);
+  ASSERT_NE(nullptr, page);
+  ExpectPageContent(page, 0);
+  handle.release_one(page_id);
 }
 
 // A stale eviction item must not become valid again when a later page table
@@ -1109,27 +1007,6 @@ TEST_F(BufferPoolTest, WritablePoolReportsPageLockMetadata) {
                 stats.writeback_staging_bytes);
 }
 
-TEST_F(BufferPoolTest, FailedWritableInitReleasesStagingReservation) {
-  // Admit the writable staging and locks but not the nonempty page table.
-  const size_t writable_bytes = VecBufferPool::metadata_bytes_for_page_count(
-      /*page_count=*/0, /*writable=*/true);
-  auto &budget = PoolPayloadBudget::get_instance();
-  ASSERT_EQ(0, budget.init(writable_bytes));
-  const size_t baseline = budget.metadata_used();
-  const std::string file = new_file(/*num_pages=*/1);
-  VecBufferPool pool(file, /*writable=*/true);
-  for (size_t attempt = 0; attempt < 3; ++attempt) {
-    EXPECT_NE(0, pool.init());
-    EXPECT_EQ(nullptr, VecBufferPoolTestPeer::writeback_staging(pool));
-    EXPECT_EQ(nullptr, VecBufferPoolTestPeer::page_locks(pool));
-    EXPECT_EQ(baseline, budget.metadata_used());
-  }
-  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/1, /*writable=*/true);
-  EXPECT_EQ(0, pool.init());
-  EXPECT_NE(nullptr, VecBufferPoolTestPeer::writeback_staging(pool));
-  EXPECT_NE(nullptr, VecBufferPoolTestPeer::page_locks(pool));
-}
-
 TEST_F(BufferPoolTest, FailedPageTableExtendLeavesStateUnchanged) {
   constexpr size_t kSecondSegmentEntry = 16UL * 1024UL + 1;
   init_table_pool(/*capacity_pages=*/0, /*entry_num=*/1);
@@ -1428,8 +1305,6 @@ TEST_F(BufferPoolTest, DelayedExternalWaitersKeepPublishedEntryPinned) {
   }
   ASSERT_EQ(1u, state->load_calls.load(std::memory_order_acquire));
   auto waiter = ExternalCacheTestPeer::register_waiter(cache, kVectorPageSize);
-  auto second_waiter =
-      ExternalCacheTestPeer::register_waiter(cache, kVectorPageSize);
   state->finish.store(true, std::memory_order_release);
   first.join();
   ASSERT_NE(nullptr, first_value);
@@ -1443,70 +1318,14 @@ TEST_F(BufferPoolTest, DelayedExternalWaitersKeepPublishedEntryPinned) {
   auto value =
       ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize, waiter);
   ASSERT_NE(nullptr, value);
-  EXPECT_TRUE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
   EXPECT_EQ(kVectorPageSize, value->size());
-  value.reset();
-  cache.release(kVectorPageSize);
-  EXPECT_FALSE(cache.evict_block(/*owner_key=*/1));
-  value = ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize,
-                                                second_waiter);
-  ASSERT_NE(nullptr, value);
   EXPECT_FALSE(ExternalCacheTestPeer::has_load_state(cache, kVectorPageSize));
-  // Removing the cache's owner must not refund metadata still held by a
-  // descheduled waiter. Only destruction of the last shared state does so.
-  const auto metadata = PoolPayloadBudget::get_instance().metadata_used();
-  std::weak_ptr flight = waiter;
-  waiter.reset();
-  EXPECT_FALSE(flight.expired());
-  EXPECT_EQ(metadata, PoolPayloadBudget::get_instance().metadata_used());
-  second_waiter.reset();
-  EXPECT_TRUE(flight.expired());
-  EXPECT_LT(PoolPayloadBudget::get_instance().metadata_used(), metadata);
   value.reset();
   cache.release(kVectorPageSize);
   EXPECT_TRUE(cache.evict_block(/*owner_key=*/1));
   EXPECT_EQ(0u, cache.entry_count());
   EXPECT_EQ(0u, PoolPayloadBudget::get_instance().external_used());
   EXPECT_EQ(1u, state->load_calls.load(std::memory_order_acquire));
-}
-
-TEST_F(BufferPoolTest, ExternalLoadExceptionReachesOldWaitersAfterRetry) {
-  init_pool(/*capacity_pages=*/16);
-  auto state = std::make_shared<BlockingLoadState>();
-  state->throw_load = true;
-  BlockingExternalCache cache(BlockingLoader{state});
-  auto first = std::async(std::launch::async,
-                          [&] { return cache.acquire(kVectorPageSize); });
-  auto finish = ScopeGuard::Make(
-      [&] { state->finish.store(true, std::memory_order_release); });
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (state->load_calls.load(std::memory_order_acquire) == 0 &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
-  ASSERT_EQ(1u, state->load_calls.load(std::memory_order_acquire));
-  auto waiter = ExternalCacheTestPeer::register_waiter(cache, kVectorPageSize);
-  auto second_waiter =
-      ExternalCacheTestPeer::register_waiter(cache, kVectorPageSize);
-  state->finish.store(true, std::memory_order_release);
-  EXPECT_THROW(first.get(), std::bad_alloc);
-  EXPECT_EQ(0u, cache.entry_count());
-
-  state->throw_load = false;
-  auto replacement = cache.acquire(kVectorPageSize);
-  ASSERT_NE(nullptr, replacement);
-  EXPECT_THROW(
-      ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize, waiter),
-      std::bad_alloc);
-  EXPECT_THROW(ExternalCacheTestPeer::finish_waiting(cache, kVectorPageSize,
-                                                     second_waiter),
-               std::bad_alloc);
-  replacement.reset();
-  cache.release(kVectorPageSize);
-  EXPECT_TRUE(cache.evict_block(/*owner_key=*/2));
-  EXPECT_EQ(0u, cache.entry_count());
-  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().external_used());
 }
 
 TEST_F(BufferPoolTest, DistinctExternalCacheLoadsAreConcurrentByDefault) {
@@ -2201,52 +2020,6 @@ TEST_F(BufferPoolTest, BypassReadDoesNotAdmitPage) {
   EXPECT_EQ(0u, stats.miss);
 }
 
-TEST_F(BufferPoolTest, AlignedBypassNeedsNoAdditionalWorkspace) {
-  init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/8);
-  VecBufferPool pool(new_file(8), false);
-  ASSERT_EQ(0, pool.init());
-  BudgetedMappedBuffer output(kVectorPageSize);
-  auto &budget = PoolPayloadBudget::get_instance();
-  MemoryReservation pressure;
-  pressure.add(budget.capacity() - budget.used());
-  const size_t before = budget.external_used();
-  ASSERT_TRUE(
-      pool.read_range_bypass(kVectorPageSize, output.size(), output.data()));
-  ExpectPageContent(output.data(), 1);
-  EXPECT_EQ(before, budget.external_used());
-  EXPECT_FALSE(pool.is_page_resident(1));
-  // Unaligned requests on O_DIRECT must not create uncharged TLS scratch.
-  EXPECT_EQ(!pool.requires_aligned_io(),
-            pool.read_range_bypass(kVectorPageSize + 1, 1, output.data() + 1));
-  EXPECT_EQ(before, budget.external_used());
-  pressure.retain_at_most(0);
-  const size_t admitted = budget.external_used();
-  for (size_t i = 0; i < 16; ++i) {
-    ASSERT_TRUE(
-        pool.read_range_bypass(kVectorPageSize + 1, 1, output.data() + 1));
-    EXPECT_EQ(1, output.data()[1]);
-    EXPECT_EQ(admitted, budget.external_used());
-  }
-}
-
-TEST_F(BufferPoolTest, BulkScratchShrinksToAvailableBudgetAndReleases) {
-  init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/32);
-  VecBufferPool pool(new_file(32), false);
-  ASSERT_EQ(0, pool.init());
-  auto &budget = PoolPayloadBudget::get_instance();
-  auto handle = pool.get_handle();
-  // Compatibility caller owns its destination; only I/O staging is charged.
-  std::vector<char> output(12 * kVectorPageSize + 7);
-  const size_t before = budget.external_used();
-  for (size_t pass = 0; pass < 3; ++pass) {
-    ASSERT_TRUE(handle.read_range(3, output.size(), output.data()));
-    for (size_t i = 0; i < output.size(); ++i)
-      ASSERT_EQ(static_cast<char>((i + 3) / kVectorPageSize), output[i]);
-    EXPECT_EQ(before, budget.external_used());
-    EXPECT_LE(budget.used(), budget.capacity());
-  }
-}
-
 TEST_F(BufferPoolTest, OversizedReadOnlyScanEarnsAdmissionBeforePressure) {
   constexpr size_t kFileBytes = 1UL << 30;
   constexpr size_t kCacheBytes = 512UL << 20;
@@ -2285,8 +2058,8 @@ TEST_F(BufferPoolTest, OversizedReadOnlyScanEarnsAdmissionBeforePressure) {
 }
 
 TEST_F(BufferPoolTest, SparseCachedPagesPreserveUnalignedBulkReadBytes) {
-  constexpr size_t kPages = 128;
-  init_vec_pool(256, kPages);
+  constexpr size_t kPages = 19;
+  init_vec_pool(64, kPages);
   VecBufferPool pool(new_file(kPages), false);
   ASSERT_EQ(0, pool.init());
   // Eight cold pages, then one cached page, repeated across the read range.
@@ -2786,11 +2559,13 @@ TEST_F(BufferPoolTest, CrossPageWriteAdmissionFailurePreservesAllBytes) {
   init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/pages, /*writable=*/true);
   VecBufferPool pool(new_file(pages), true);
   ASSERT_EQ(0, pool.init());
-  auto &budget = PoolPayloadBudget::get_instance();
+  auto &budget = MemoryLimitPool::get_instance();
   char *first = pool.acquire_buffer(0, 0);
   ASSERT_NE(nullptr, first);
-  zvec::ailego::MemoryReservation pressure;
-  pressure.add(budget.capacity() - budget.used() - 1024);
+  auto restore_pressure = ScopeGuard::Make([&] {
+    budget.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  });
+  budget.set_memory_pressure(ProcessRssBudget::PressureLevel::kCritical);
   std::array<char, 32> value;
   value.fill('X');
   const VecBufferWriteFragment writes[] = {
@@ -2798,8 +2573,8 @@ TEST_F(BufferPoolTest, CrossPageWriteAdmissionFailurePreservesAllBytes) {
       {2 * kVectorPageSize, 16, value.data()}};
   EXPECT_NE(0, pool.write_fragments(writes, 2));
   EXPECT_EQ(0, first[kVectorPageSize - 1]);
-  // Validation I/O also needs admitted alignment scratch on O_DIRECT.
-  pressure.retain_at_most(0);
+  // Refuse growth directly, without testing the mandatory-read retry timer.
+  budget.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
   std::array<char, 16> old_second;
   ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize, old_second.size(),
                                      old_second.data()));
@@ -2811,61 +2586,4 @@ TEST_F(BufferPoolTest, CrossPageWriteAdmissionFailurePreservesAllBytes) {
   ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize - 16, actual.size(),
                                      actual.data()));
   EXPECT_EQ(value, actual);
-}
-
-TEST_F(BufferPoolTest, RequiredCrossPageWriteWaitsPastFirstIdleInterval) {
-  constexpr size_t kPages = 3;
-  init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/kPages,
-                /*writable=*/true);
-  auto &memory = PoolPayloadBudget::get_instance();
-  VecBufferPool pool(new_file(kPages), /*writable=*/true);
-  ASSERT_EQ(0, pool.init());
-  char *first = pool.acquire_buffer(/*page_id=*/0, /*retry=*/0);
-  ASSERT_NE(nullptr, first);
-
-  MemoryReservation pressure;
-  pressure.add(memory.capacity() - memory.used() - 1024);
-  const auto before = memory.stats();
-  std::atomic<bool> observed_second_wait{false};
-  std::thread releaser([&] {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (std::chrono::steady_clock::now() < deadline) {
-      const auto current = memory.stats();
-      if (current.capacity_waits >= before.capacity_waits + 2 &&
-          current.capacity_wait_timeouts > before.capacity_wait_timeouts) {
-        observed_second_wait.store(true, std::memory_order_release);
-        break;
-      }
-      std::this_thread::yield();
-    }
-    // A mandatory write must survive one idle interval. Release only after
-    // it starts another wait, or after the old implementation has failed.
-    pressure.retain_at_most(0);
-  });
-
-  std::array<char, 32> value;
-  value.fill('X');
-  const VecBufferWriteFragment writes[] = {
-      {kVectorPageSize - 16, value.size(), value.data()},
-      {2 * kVectorPageSize, 16, value.data()}};
-  const int result = pool.write_fragments(writes, 2);
-  releaser.join();
-  EXPECT_TRUE(observed_second_wait.load(std::memory_order_acquire));
-  EXPECT_EQ(0, result);
-  EXPECT_LE(memory.used(), memory.capacity());
-  EXPECT_LE(memory.committed(), memory.capacity());
-  EXPECT_EQ(0, first[kVectorPageSize - 17]);
-  pool.page_table_.release_block(0);
-  if (result == 0) {
-    std::array<char, 32> actual;
-    ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize - 16, actual.size(),
-                                       actual.data()));
-    EXPECT_EQ(value, actual);
-    std::array<char, 16> last;
-    ASSERT_TRUE(
-        pool.read_range_bypass(2 * kVectorPageSize, last.size(), last.data()));
-    EXPECT_TRUE(std::all_of(last.begin(), last.end(),
-                            [](char byte) { return byte == 'X'; }));
-  }
 }

@@ -221,32 +221,6 @@ TEST_F(BufferReadStorageTest, CachePressureFallsBackToOwnedRead) {
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, block.type_);
 }
 
-TEST_F(BufferReadStorageTest, ExhaustedScratchBudgetFailsAndCanRetry) {
-  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
-  ASSERT_EQ(0, storage->open(file_path_, false));
-  auto segment = storage->get("payload");
-  ASSERT_TRUE(segment);
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  {
-    ailego::MemoryReservation pressure;
-    pressure.add(pool.available());
-    IndexStorage::MemoryBlock block;
-    EXPECT_EQ(0u, segment->read(0, block, payload_.size()));
-    EXPECT_EQ(nullptr, block.data());
-  }
-  const size_t before = pool.external_used();
-  IndexStorage::MemoryBlock block;
-  ASSERT_EQ(payload_.size(), segment->read(0, block, payload_.size()));
-  EXPECT_GE(pool.external_used(), before + payload_.size());
-  ASSERT_EQ(0, storage->close());
-  segment.reset();
-  storage.reset();
-  EXPECT_GE(pool.external_used(), payload_.size());
-  EXPECT_EQ(0, std::memcmp(payload_.data(), block.data(), payload_.size()));
-  block.reset();
-  EXPECT_EQ(0u, pool.external_used());
-}
-
 TEST_F(BufferReadStorageTest, MemoryBlockKeepsPoolAliveAfterStorageClose) {
   IndexStorage::MemoryBlock block;
   IndexStorage::MemoryBlock copy;

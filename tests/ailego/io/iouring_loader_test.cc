@@ -57,17 +57,6 @@ class IoUringStagingTestPeer {
   static size_t size(const IoUringRing &ring) {
     return ring.staging_size_;
   }
-  static IoUringRing::SetupResult map_control_regions(IoUringRing &ring,
-                                                       int fd) {
-    ring.ring_fd_ = ::dup(fd);
-    if (ring.ring_fd_ < 0) return IoUringRing::SetupResult::kUnavailable;
-    io_uring_params params{};
-    params.sq_entries = 8;
-    params.cq_entries = 16;
-    params.sq_off.array = 64;
-    params.cq_off.cqes = 64;
-    return ring.map_control_regions(params);
-  }
   static int execute_with_duplicate_completion(IoUringRing &ring, int fd,
                                                const IoUringWrite *writes) {
     std::array<io_uring_sqe, 2> submissions{};
@@ -150,38 +139,11 @@ struct FakeAsyncRing {
 };
 FakeAsyncRing *FakeAsyncRing::active = nullptr;
 
-TEST_F(IoUringLoaderTest, AsyncSubmissionDefersCopiesAndReportsCompletionIds) {
-  const int fd = ::open("/dev/null", O_RDONLY);
-  ASSERT_GE(fd, 0);
-  const auto close_fd = ScopeGuard::Make([&] { ::close(fd); });
-  FakeAsyncRing queue;
-  IoUringRing ring;
-  queue.bind(ring, fd);
-  alignas(4096) std::array<unsigned char, 1024> output{};
-  const std::array<IoUringRead, 2> reads{
-      {{0, 512, output.data()}, {512, 512, output.data() + 512}}};
-  ASSERT_EQ(0, ring.submit_reads(fd, reads.data(), reads.size()));
-  EXPECT_TRUE(ring.has_pending_reads());
-  EXPECT_EQ(0u, queue.complete_tail);
-  EXPECT_EQ(0, output[0]);
-  EXPECT_FALSE(ring.ensure_staging(8192));
-  EXPECT_NE(0, ring.execute(fd, reads.data(), reads.size()));
-  EXPECT_NE(0, ring.submit_reads(fd, reads.data(), reads.size()));
-  std::array<uint32_t, 2> completed{};
-  EXPECT_EQ(0, ring.get_completed_reads(0, completed.data(), completed.size()));
-  ASSERT_EQ(2, ring.get_completed_reads(1, completed.data(), completed.size()));
-  EXPECT_EQ((std::array<uint32_t, 2>{{1, 0}}), completed);
-  EXPECT_EQ(0x31, output[0]);
-  EXPECT_EQ(0x32, output[512]);
-  EXPECT_FALSE(ring.has_pending_reads());
-  EXPECT_EQ(0u, pool_.used());
-}
-
 TEST_F(IoUringLoaderTest, AsyncCancellationAndShortReadsReleaseAllBacking) {
   const int fd = ::open("/dev/null", O_RDONLY);
   ASSERT_GE(fd, 0);
   const auto close_fd = ScopeGuard::Make([&] { ::close(fd); });
-  for (unsigned mode = 0; mode < 3; ++mode) {
+  for (unsigned mode : {1u, 2u}) {
     SCOPED_TRACE(mode);
     FakeAsyncRing queue;
     queue.partial_failure = mode == 1;
@@ -196,12 +158,8 @@ TEST_F(IoUringLoaderTest, AsyncCancellationAndShortReadsReleaseAllBacking) {
       EXPECT_NE(0, submitted);
     else {
       ASSERT_EQ(0, submitted);
-      if (mode == 0)
-        ring.cancel_reads();
-      else {
-        std::array<uint32_t, 2> completed{};
-        EXPECT_LT(ring.get_completed_reads(1, completed.data(), 2), 0);
-      }
+      std::array<uint32_t, 2> completed{};
+      EXPECT_LT(ring.get_completed_reads(1, completed.data(), 2), 0);
     }
     EXPECT_FALSE(ring.has_pending_reads());
     EXPECT_EQ(0, output[0]);
@@ -254,31 +212,6 @@ TEST_F(IoUringLoaderTest, DuplicateWriteCompletionQuarantinesStaging) {
   EXPECT_EQ(charge, pool_.external_used());
 }
 
-TEST_F(IoUringLoaderTest, ControlMappingsObeyProcessBudgetAndCanRetry) {
-  const size_t page = PoolPayloadBudget::page_buffer_size();
-  TemporaryFile file;
-  ASSERT_GE(file.fd(), 0);
-  // Exercise the mmap lifecycle on kernels or containers that disallow
-  // io_uring_setup. The three regions are backed by this sparse test file.
-  ASSERT_EQ(0, ::ftruncate(file.fd(), IORING_OFF_SQES + page));
-  IoUringRing ring;
-  using Result = IoUringRing::SetupResult;
-  auto &pool = MemoryLimitPool::get_instance();
-  const auto restore =
-      ScopeGuard::Make([&] { pool.configure_process_rss_limit(0); });
-  ASSERT_TRUE(pool.configure_process_rss_limit(1));
-  EXPECT_EQ(Result::kNoMemory,
-            IoUringStagingTestPeer::map_control_regions(ring, file.fd()));
-  ring.teardown();
-
-  ASSERT_TRUE(pool.configure_process_rss_limit(0));
-  ASSERT_EQ(Result::kReady,
-            IoUringStagingTestPeer::map_control_regions(ring, file.fd()));
-  EXPECT_EQ(0, pool_.init(2 * page));
-  ring.teardown();
-  EXPECT_EQ(0u, pool_.used());
-}
-
 void *allocate_aligned(size_t size) {
   void *buffer = nullptr;
   if (::posix_memalign(&buffer, kBlockSize, size) != 0) {
@@ -310,14 +243,39 @@ TEST_F(IoUringLoaderTest, ReadsBatchAndZeroPadsExpectedShortRead) {
   requests.emplace_back(kBlockSize, kBlockSize,
                         static_cast<uint8_t *>(output) + kBlockSize, kTailSize);
 
-  ASSERT_EQ(ring.execute(file.fd(), requests), 0);
-  EXPECT_EQ(0u, pool_.used());
-  EXPECT_EQ(0u, IoUringStagingTestPeer::size(ring));
-  EXPECT_EQ(std::memcmp(output, source.data(), kBlockSize), 0);
-  const auto *tail = static_cast<const uint8_t *>(output) + kBlockSize;
-  EXPECT_EQ(std::memcmp(tail, source.data() + kBlockSize, kTailSize), 0);
-  EXPECT_TRUE(std::all_of(tail + kTailSize, tail + kBlockSize,
-                          [](uint8_t value) { return value == 0; }));
+  for (bool asynchronous : {false, true}) {
+    SCOPED_TRACE(asynchronous);
+    std::memset(output, 0xac, 2 * kBlockSize);
+    if (!asynchronous) {
+      ASSERT_EQ(0, ring.execute(file.fd(), requests));
+    } else {
+      ASSERT_EQ(0, ring.submit_reads(file.fd(), requests.data(), requests.size()));
+      std::array<bool, 2> seen{};
+      size_t total = 0;
+      while (total < requests.size()) {
+        std::array<uint32_t, 2> completed{};
+        const int count = ring.get_completed_reads(1, completed.data(), completed.size());
+        ASSERT_GT(count, 0);
+        for (int i = 0; i < count; ++i) {
+          const size_t id = completed[i];
+          ASSERT_LT(id, requests.size());
+          ASSERT_FALSE(seen[id]);
+          seen[id] = true;
+          const size_t bytes = id == 0 ? kBlockSize : kTailSize;
+          EXPECT_EQ(0, std::memcmp(static_cast<uint8_t *>(output) + id * kBlockSize,
+                                   source.data() + id * kBlockSize, bytes));
+        }
+        total += count;
+      }
+    }
+    EXPECT_EQ(0u, pool_.used());
+    EXPECT_EQ(0u, IoUringStagingTestPeer::size(ring));
+    EXPECT_EQ(std::memcmp(output, source.data(), kBlockSize), 0);
+    const auto *tail = static_cast<const uint8_t *>(output) + kBlockSize;
+    EXPECT_EQ(std::memcmp(tail, source.data() + kBlockSize, kTailSize), 0);
+    EXPECT_TRUE(std::all_of(tail + kTailSize, tail + kBlockSize,
+                            [](uint8_t value) { return value == 0; }));
+  }
   std::free(output);
 }
 

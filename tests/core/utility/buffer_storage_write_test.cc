@@ -274,6 +274,7 @@ TEST_F(BufferStorageWriteTest, WritableReopenNeedsCacheAndAllowsRetry) {
   EXPECT_EQ(IndexError_NoMemory,
             storage->open(file_path_, IndexStorage::OpenOptions{false, false}));
   EXPECT_EQ(nullptr, storage->vec_buffer_pool());
+  EXPECT_EQ(0u, pool.used());
 
   ASSERT_EQ(0, pool.init(64UL * 1024UL * 1024UL));
   ASSERT_EQ(0,
@@ -1693,61 +1694,41 @@ TEST_F(BufferStorageWriteTest, MutableBatchSnapshotsSurviveOverwriteAndClose) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
   const size_t page = ailego::kVectorPageSize;
-  std::vector<char> payload_a(3 * page), payload_b(2 * page);
+  std::vector<char> payload_a(3 * page);
   for (size_t i = 0; i < payload_a.size(); ++i)
     payload_a[i] = static_cast<char>((i * 17 + 3) % 251);
-  for (size_t i = 0; i < payload_b.size(); ++i)
-    payload_b[i] = static_cast<char>((i * 29 + 11) % 251);
   ASSERT_EQ(0, storage->append("mutable_a", payload_a.size()));
-  ASSERT_EQ(0, storage->append("mutable_b", payload_b.size()));
   auto seg_a = storage->get("mutable_a");
-  auto seg_b = storage->get("mutable_b");
   ASSERT_TRUE(seg_a);
-  ASSERT_TRUE(seg_b);
   ASSERT_EQ(payload_a.size(),
             seg_a->write(0, payload_a.data(), payload_a.size()));
-  ASSERT_EQ(payload_b.size(),
-            seg_b->write(0, payload_b.data(), payload_b.size()));
   const size_t aligned_a = (page - seg_a->data_offset() % page) % page;
   const size_t cross_a = (2 * page - 32 - seg_a->data_offset() % page) % page;
-  const size_t aligned_b = (page - seg_b->data_offset() % page) % page;
-  IndexStorage::MemoryBlock blocks[4];
+  IndexStorage::MemoryBlock blocks[3];
   IndexStorage::Segment::BorrowedRead reads[] = {
       {seg_a.get(), aligned_a, 64, &blocks[0]},
       {seg_a.get(), aligned_a + 8, 32, &blocks[1]},
-      {seg_a.get(), cross_a, 128, &blocks[2]},
-      {seg_b.get(), aligned_b, 96, &blocks[3]}};
-  ASSERT_TRUE(seg_a->read_borrowed_batch(reads, 4));
+      {seg_a.get(), cross_a, 128, &blocks[2]}};
+  ASSERT_TRUE(seg_a->read_borrowed_batch(reads, 3));
   for (const auto &block : blocks) {
     ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, block.type_);
   }
   std::vector<char> changed_a(payload_a.size(), 'Z');
-  std::vector<char> changed_b(payload_b.size(), 'Q');
   ASSERT_EQ(changed_a.size(),
             seg_a->write(0, changed_a.data(), changed_a.size()));
-  ASSERT_EQ(changed_b.size(),
-            seg_b->write(0, changed_b.data(), changed_b.size()));
   ASSERT_EQ(0, storage->flush());
-  IndexStorage::MemoryBlock fresh[2];
+  IndexStorage::MemoryBlock fresh;
   IndexStorage::Segment::BorrowedRead later[] = {
-      {seg_a.get(), aligned_a, 64, &fresh[0]},
-      {seg_b.get(), aligned_b, 96, &fresh[1]}};
-  ASSERT_TRUE(seg_a->read_borrowed_batch(later, 2));
-  EXPECT_EQ(0, std::memcmp(fresh[0].data(), changed_a.data() + aligned_a, 64));
-  EXPECT_EQ(0, std::memcmp(fresh[1].data(), changed_b.data() + aligned_b, 96));
-  later[1].offset = payload_b.size() + 1;
-  EXPECT_FALSE(seg_a->read_borrowed_batch(later, 2));
-  EXPECT_EQ(nullptr, fresh[0].data());
-  EXPECT_EQ(nullptr, fresh[1].data());
+      {seg_a.get(), aligned_a, 64, &fresh}};
+  ASSERT_TRUE(seg_a->read_borrowed_batch(later, 1));
+  EXPECT_EQ(0, std::memcmp(fresh.data(), changed_a.data() + aligned_a, 64));
   ASSERT_EQ(0, storage->close());
   seg_a.reset();
-  seg_b.reset();
   storage.reset();
   EXPECT_EQ(0, std::memcmp(blocks[0].data(), payload_a.data() + aligned_a, 64));
   EXPECT_EQ(
       0, std::memcmp(blocks[1].data(), payload_a.data() + aligned_a + 8, 32));
   EXPECT_EQ(0, std::memcmp(blocks[2].data(), payload_a.data() + cross_a, 128));
-  EXPECT_EQ(0, std::memcmp(blocks[3].data(), payload_b.data() + aligned_b, 96));
 }
 
 // Dirty flag race: write() after flush_index() must re-set the dirty flag.

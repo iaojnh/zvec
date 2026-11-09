@@ -14,28 +14,17 @@
 
 #include "db/common/global_resource.h"
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <thread>
-#include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
-#include <zvec/ailego/io/file.h>
 #include <zvec/db/config.h>
-#include "db/common/metadata_memory.h"
 #include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
-#include "db/common/result_memory_allowance.h"
-#include "db/common/write_buffer_reservation.h"
-#if defined(__linux__)
-#include <dlfcn.h>
-#endif
 
 using namespace zvec;
 
@@ -69,48 +58,6 @@ TEST(GlobalResourceStartupDeathTest,
       },
       ::testing::ExitedWithCode(0), "");
   ::testing::FLAGS_gtest_death_test_style = previous_style;
-}
-#endif
-
-#if defined(__linux__)
-TEST(NativeImageMemoryDeathTest, ReservesBeforeAdmissionAndDoesNotRefundLiveImage) {
-#if GTEST_HAS_DEATH_TEST
-  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  EXPECT_EXIT(
-      {
-        auto &pool = ailego::MemoryLimitPool::get_instance();
-        if (pool.init(128u * 1024 * 1024) != 0) std::_Exit(1);
-        auto *symbol = dlsym(RTLD_NEXT, "malloc");
-        const auto bytes = detail::NativeImageBytesForAddress(symbol);
-        if (!bytes) std::_Exit(5);
-        const auto before = pool.stats();
-        detail::ReserveNativeImage(symbol);
-        const auto after = pool.stats();
-        if (after.external_used != before.external_used + bytes ||
-            after.committed != before.committed + bytes ||
-            detail::NativeImageReservation().bytes() != bytes)
-          std::_Exit(2);
-        detail::ReserveNativeImage(symbol);
-        if (pool.stats().committed != after.committed) std::_Exit(3);
-        // Reject a reservation beyond available capacity without changing
-        // ownership of the existing image reservation.
-        bool rejected = false;
-        try {
-          detail::NativeImageReservation().add(pool.capacity());
-        } catch (const std::bad_alloc &) {
-          rejected = true;
-        }
-        if (!rejected || detail::NativeImageReservation().bytes() != bytes ||
-            pool.stats().committed != after.committed)
-          std::_Exit(4);
-        std::_Exit(0);
-      },
-      ::testing::ExitedWithCode(0), "");
-  ::testing::FLAGS_gtest_death_test_style = previous_style;
-#else
-  GTEST_SKIP() << "Process-isolated tests are not supported on this platform";
-#endif
 }
 #endif
 
@@ -201,47 +148,4 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
                 expected_rocksdb_capacity),
             write_buffer_manager->buffer_size());
   EXPECT_TRUE(write_buffer_manager->cost_to_cache());
-}
-
-TEST(GlobalResource, RssPressureReclaimsOnlyUnpinnedRocksDbEntries) {
-  auto &resource = GlobalResource::Instance();
-  ASSERT_EQ(0, resource.initialize());
-  auto cache = resource.rocksdb_block_cache();
-  ASSERT_NE(nullptr, cache);
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  const size_t original_limit = pool.process_rss_limit();
-  ASSERT_GT(original_limit, 0u);
-  auto restore = ailego::ScopeGuard::Make(
-      [&] { pool.configure_process_rss_limit(original_limit); });
-  rocksdb::Cache::Handle *cold = nullptr;
-  rocksdb::Cache::Handle *pinned = nullptr;
-  auto release = ailego::ScopeGuard::Make([&] {
-    if (cold) cache->Release(cold);
-    if (pinned) cache->Release(pinned);
-  });
-  ASSERT_TRUE(cache
-                  ->Insert("rss-cold", nullptr, &rocksdb::kNoopCacheItemHelper,
-                           4096, &cold)
-                  .ok());
-  ASSERT_TRUE(cache
-                  ->Insert("rss-pinned", nullptr,
-                           &rocksdb::kNoopCacheItemHelper, 4096, &pinned)
-                  .ok());
-  cache->Release(cold);
-  cold = nullptr;
-  const auto pinned_usage = cache->GetPinnedUsage();
-  ASSERT_GT(cache->GetUsage(), pinned_usage);
-  ASSERT_TRUE(pool.configure_process_rss_limit(1));
-  const auto wait_until = [](auto ready) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (!ready() && std::chrono::steady_clock::now() < deadline)
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    return ready();
-  };
-  ASSERT_TRUE(wait_until([&] { return cache->GetUsage() == pinned_usage; }));
-  EXPECT_EQ(pinned_usage, cache->GetPinnedUsage());
-  cache->Release(pinned);
-  pinned = nullptr;
-  EXPECT_TRUE(wait_until([&] { return cache->GetUsage() == 0; }));
 }

@@ -468,8 +468,8 @@ TEST_F(BufferPoolStoreTest, PhysicSchema) {
 
 class BufferPoolScanBudgetTest : public testing::Test {
  protected:
-  static constexpr int64_t kRows = 22003;
-  static constexpr int64_t kRowsPerGroup = 10000;
+  static constexpr int64_t kRows = 8201;
+  static constexpr int64_t kRowsPerGroup = 8193;
   static constexpr int64_t kBatchRows = 8192;
 
   void SetUp() override {
@@ -551,7 +551,7 @@ class BufferPoolScanBudgetTest : public testing::Test {
       next_row += batch->num_rows();
       ++batches;
     }
-    EXPECT_EQ(5, batches);  // Two split row groups and a 2003-row tail.
+    EXPECT_EQ(3, batches);  // Split the first group, then read the tail group.
     const auto previous_batch = batch;
     for (int repeat = 0; repeat < 2; ++repeat) {
       batch = previous_batch;

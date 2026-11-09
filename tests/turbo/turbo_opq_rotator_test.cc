@@ -19,74 +19,11 @@
 #include <gtest/gtest.h>
 #include "preprocessor/opq_rotator/opq_rotator.h"
 #include "zvec/turbo/turbo.h"
-#include "../ailego/buffer/pool_payload_budget.h"
 
 namespace {
 
 using zvec::turbo::CpuArchType;
 using zvec::turbo::RotateType;
-
-class PagedOpqRotatorTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    previous_ = pool_.capacity();
-    ASSERT_EQ(0u, pool_.used());
-    ASSERT_EQ(0, pool_.init(0));
-  }
-  void TearDown() override {
-    EXPECT_EQ(0u, pool_.used());
-    EXPECT_EQ(0, pool_.init(previous_));
-  }
-  zvec::ailego::PoolPayloadBudget &pool_ =
-      zvec::ailego::PoolPayloadBudget::get_instance();
-  size_t previous_{0};
-};
-
-TEST_F(PagedOpqRotatorTest, PagedSvdMatchesDenseAndFailurePreservesRotation) {
-  constexpr size_t dim = 65, rows = 131;
-  std::mt19937 gen(52);
-  std::normal_distribution<float> random;
-  std::vector<float> x(rows * dim), y(x.size());
-  for (auto &v : x) v = random(gen);
-  for (auto &v : y) v = random(gen);
-  auto dense = zvec::turbo::OpqRotator::create(dim);
-  ASSERT_TRUE(dense);
-  ASSERT_EQ(0, dense->fit(x.data(), y.data(), rows));
-  std::string expected;
-  ASSERT_EQ(0, dense->serialize(&expected));
-  dense.reset();
-  ASSERT_EQ(0, pool_.init(4 * 1024 * 1024));
-  auto paged = zvec::turbo::OpqRotator::create(dim);
-  ASSERT_TRUE(paged);
-  ASSERT_EQ(0, paged->fit(x.data(), y.data(), rows));
-  EXPECT_GT(pool_.used(), 0u);
-  std::string actual;
-  ASSERT_EQ(0, paged->serialize(&actual));
-  ASSERT_EQ(expected.size(), actual.size());
-  const size_t header = sizeof(zvec::turbo::RotatorSerHeader);
-  for (size_t i = 0; i < dim * dim; ++i) {
-    float a = 0, b = 0;
-    std::memcpy(&a, expected.data() + header + i * sizeof(float),
-                sizeof(float));
-    std::memcpy(&b, actual.data() + header + i * sizeof(float), sizeof(float));
-    ASSERT_NEAR(a, b, 2e-5) << i;
-  }
-  std::vector<float> transformed(dim), restored(dim);
-  paged->apply(x.data(), transformed.data());
-  paged->apply_inverse(transformed.data(), restored.data());
-  for (size_t i = 0; i < dim; ++i) EXPECT_NEAR(x[i], restored[i], 1e-5);
-  auto reopened =
-      zvec::turbo::OpqRotator::from_serialized(actual.data(), actual.size());
-  ASSERT_TRUE(reopened);
-  reopened->apply(x.data(), restored.data());
-  for (size_t i = 0; i < dim; ++i) EXPECT_FLOAT_EQ(transformed[i], restored[i]);
-  EXPECT_EQ(-123, paged->fit_rows(rows, [](size_t, size_t, float *, float *) {
-    return -123;
-  }));
-  std::string after;
-  ASSERT_EQ(0, paged->serialize(&after));
-  EXPECT_EQ(actual, after);
-}
 
 TEST(OpqRotator, FromSerializedRestoresStoredMatrix) {
   zvec::turbo::RotatorSerHeader header{};

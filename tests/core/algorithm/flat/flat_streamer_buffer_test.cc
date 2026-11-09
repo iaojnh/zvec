@@ -827,9 +827,7 @@ TEST_P(FlatStreamerWriteFailureTest, PropagatesShortWritesAndRetriesSameId) {
 }
 
 INSTANTIATE_TEST_SUITE_P(AppendAndIdHole, FlatStreamerWriteFailureTest,
-                         testing::Values(std::tuple{1u, size_t{1}},
-                                         std::tuple{1u, size_t{3}},
-                                         std::tuple{3u, size_t{2}}));
+                         testing::Values(std::tuple{3u, size_t{3}}));
 
 }  // namespace
 

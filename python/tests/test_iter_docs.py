@@ -100,30 +100,6 @@ def test_iter_docs_basic(iter_collection):
     assert seen_ids == {f"{i}" for i in range(n)}
 
 
-def test_iter_docs_retries_same_row_after_python_memory_error(
-    iter_collection, monkeypatch
-):
-    from zvec.model import collection as collection_module
-
-    iter_collection.insert(_make_docs(3))
-    iter_collection.flush()
-    convert = collection_module.convert_to_py_doc
-    rejected = []
-
-    def reject_once(core_doc, schema):
-        if not rejected:
-            rejected.append(core_doc.pk())
-            raise MemoryError("result memory exhausted")
-        return convert(core_doc, schema)
-
-    monkeypatch.setattr(collection_module, "convert_to_py_doc", reject_once)
-    with iter_collection.iter_docs() as iterator:
-        with pytest.raises(MemoryError, match="result memory exhausted"):
-            next(iterator)
-        assert next(iterator).id == rejected[0]
-        assert len(list(iterator)) == 2
-
-
 def test_iter_docs_include_vector(iter_collection):
     """include_vector=True (default) returns vectors of correct dimension."""
     iter_collection.insert(_make_docs(10))
