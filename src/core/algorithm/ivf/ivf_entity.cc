@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <utility>
+#include <ailego/pattern/scope_guard.h>
 #include <core/quantizer/distance_quantizer.h>
 #include <core/quantizer/quantizer_params.h>
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
@@ -924,6 +925,38 @@ int IVFEntity::load(const IndexStorage::Pointer &container) try {
     return IndexError_InvalidFormat;
   }
 
+  if (inverted_->supports_read_chunks()) {
+    IndexStorage::Segment::ReadChunks chunks;
+    const size_t block_vecs = header_.block_vector_count;
+    const size_t block_size = header_.block_size;
+    for (size_t list_id = 0; list_id < header_.inverted_list_count; ++list_id) {
+      IndexStorage::MemoryBlock meta_block;
+      const auto *list = inverted_list_meta(list_id, meta_block);
+      if (!list) return inverted_meta_->read_error();
+      if (list->block_count !=
+          (size_t(list->vector_count) + block_vecs - 1) / block_vecs)
+        return IndexError_InvalidFormat;
+      for (size_t i = 0; i < list->block_count; i += kBatchBlocks) {
+        const size_t blocks = std::min(kBatchBlocks, list->block_count - i);
+        const size_t items = std::min(blocks * block_vecs,
+                                      list->vector_count - i * block_vecs);
+        const size_t tail = items - (blocks - 1) * block_vecs;
+        const size_t offset = list->offset + i * block_size;
+        const size_t bytes = (blocks - 1) * block_size +
+            (packed_quantizer_ ? block_size
+                              : ailego_align(tail * meta_.element_size(), 32));
+        if (offset > header_.inverted_body_size ||
+            bytes > header_.inverted_body_size - offset)
+          return IndexError_InvalidFormat;
+        chunks.push_back({offset, bytes});
+      }
+    }
+    std::sort(chunks.begin(), chunks.end(),
+              [](const auto &a, const auto &b) { return a.offset < b.offset; });
+    ret = inverted_->set_read_chunks(chunks);
+    ivf_check_error_code(ret);
+  }
+
   LOG_DEBUG(
       "Load inverted index done, docs=%u invertedListCnt=%u "
       "elementSize=%u metric=%s reformer=%s",
@@ -997,7 +1030,8 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     const size_t size =
         std::min(serialized_bytes,
                  static_cast<size_t>(header_.inverted_body_size - off));
-    IndexStorage::Segment::ScatterBlock scatter_data;
+    auto &scatter_data = scatter_data_;
+    auto release_scatter = ailego::ScopeGuard::Make([&] { scatter_data.reset(); });
     if (row_major) {
       if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);
@@ -1137,7 +1171,8 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     const size_t size =
         std::min(serialized_bytes,
                  static_cast<size_t>(header_.inverted_body_size - off));
-    IndexStorage::Segment::ScatterBlock scatter_data;
+    auto &scatter_data = scatter_data_;
+    auto release_scatter = ailego::ScopeGuard::Make([&] { scatter_data.reset(); });
     if (row_major) {
       if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);

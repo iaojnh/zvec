@@ -288,6 +288,7 @@ class ProcessRssBudget {
     // A new allocation absent from that sample cannot retire the sample's
     // overlap with a different, still-live owner.
     estimate_.release(bytes - rss_unsampled, backing_);
+    if (bytes != rss_unsampled) ++resident_release_generation_;
     native_estimate_.release(bytes - native_unsampled, backing_);
     update_available();
   }
@@ -440,6 +441,13 @@ class ProcessRssBudget {
     return pressure_.load(std::memory_order_relaxed);
   }
 
+  bool needs_resident_confirmation() const {
+    return resident_confirmation_.load(std::memory_order_relaxed);
+  }
+  uint64_t resident_release_generation() const {
+    return resident_release_generation_.load(std::memory_order_relaxed);
+  }
+
  private:
   MaterializationStamp finish_reservation_locked(size_t bytes, bool allocated) {
     assert(bytes <= pending_allocations_);
@@ -467,6 +475,7 @@ class ProcessRssBudget {
     // Only backing that could have contributed to a successful RSS sample
     // can explain a later RSS decrease.
     estimate_.release(bytes - rss.unsampled, backing_);
+    if (bytes != rss.unsampled) ++resident_release_generation_;
     native_estimate_.release(bytes - native.unsampled, backing_);
     update_available();
   }
@@ -808,6 +817,22 @@ class ProcessRssBudget {
                                        : available <= margin));
     available_.store(available, std::memory_order_relaxed);
     pressure_.store(pressure, std::memory_order_relaxed);
+    // A retired mapping may still be included in RSS while its replacement
+    // is already resident. Ask the ownership sampler to confirm that overlap
+    // before this conservative projection drives cache reclamation. Preserve
+    // the lifetime reservation and every pending allocation/materialization.
+    const size_t confirmed_usage = add_saturated(
+        std::max(Estimate::projected(estimate_.baseline_rss_,
+                                    estimate_.baseline_backing_, backing_),
+                 measured),
+        pending_allocations_);
+    resident_confirmation_.store(
+        pressure && cap && resident_reader_ && !native_reader_ &&
+            external_pressure_ == PressureLevel::kNormal &&
+            !admission_paused() && estimate_.pending_releases_ &&
+            confirmed_usage < usage && confirmed_usage < cap &&
+            cap - confirmed_usage >= 2 * margin,
+        std::memory_order_relaxed);
   }
 
   std::mutex mutex_;
@@ -833,5 +858,7 @@ class ProcessRssBudget {
   size_t native_materialized_{0};
   uint64_t rss_epoch_{0};
   uint64_t native_epoch_{0};
+  std::atomic<bool> resident_confirmation_{false};
+  std::atomic<uint64_t> resident_release_generation_{0};
 };
 }  // namespace zvec::ailego

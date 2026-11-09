@@ -58,6 +58,10 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
   //! Evict a block; return true only when memory was reclaimed.
   virtual bool evict_block(eviction_key_t owner_key) = 0;
 
+  // Payload released by a successful eviction, when known by the owner.
+  // Zero retains the existing page-sized fallback for legacy owners.
+  virtual size_t eviction_bytes(eviction_key_t /*owner_key*/) const { return 0; }
+
   //! Opportunistically reclaim an inactive costly payload. The queue owns
   //! the popped membership and requeues it when this returns false. Ordinary
   //! explicit-hot pages do not opt in and retain their priority semantics.
@@ -208,7 +212,7 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
 
   size_t recycle_inactive(size_t max_attempts);
   size_t batch_recycle_impl(size_t count, size_t scan_count,
-                            bool age_protected);
+                            bool age_protected, size_t bytes = 0);
 
   BlockEvictionQueue() {
     for (size_t i = 0; i < kQueueCount; ++i) {
@@ -373,6 +377,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
       kMetadata,
       kLockedMetadata,
       kLockedExternal,
+      // Optional, globally evictable mappings. Admission never walks owners.
+      kEvictableCache,
     };
 
     PendingAllocation(MemoryLimitPool &pool, Kind kind);
@@ -414,6 +420,24 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                              ProcessRssBudget::HeapProjection projection);
   void release_unmapped_external(size_t bytes,
                                  ProcessRssBudget::MaterializationStamp stamp);
+  void release_unmapped_cache(size_t bytes,
+                              ProcessRssBudget::MaterializationStamp stamp);
+  // Variable-sized, page-aligned cache backing. Returning a buffer releases
+  // logical occupancy; idle backing remains committed until physically freed.
+  struct CacheBuffer {
+    uint8_t *data{nullptr};
+    size_t bytes{0};
+    CacheBuffer *next{nullptr};
+    ProcessRssBudget::MaterializationStamp stamp{};
+    ProcessRssBudget::MaterializationStamp creation{};
+    // Separate from the idle-bin link: live and idle mappings both retain
+    // backing charges and must remain visible to RSS overlap sampling.
+    CacheBuffer *mapped_prev{nullptr};
+    CacheBuffer *mapped_next{nullptr};
+  };
+  CacheBuffer *try_acquire_cache_buffer(size_t bytes);
+  void release_cache_buffer(CacheBuffer *buffer);
+  void request_cache_reclaim(size_t bytes);
 
   void release_metadata(const size_t buffer_size);
   void release_unmapped_metadata(size_t bytes,
@@ -496,6 +520,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   //! such as decoded or application-level cache entries.
   size_t external_used() const {
     return external_used_size_.load(std::memory_order_relaxed);
+  }
+  // Subset of external_used(), excluded from non-evictable watermarks.
+  size_t evictable_cache_used() const {
+    return evictable_cache_size_.load(std::memory_order_relaxed);
   }
 
   size_t metadata_used() const {
@@ -622,6 +650,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool trim_idle_buffers();
   void reclaim_process_cache();
   size_t trim_retained_blocks(size_t bytes_needed);
+  size_t trim_cache_buffers(size_t bytes_needed);
+  void register_cache_mapping(CacheBuffer *buffer);
+  bool unmap_cache_mapping(CacheBuffer *buffer);
   size_t pick_shard();
 
   // Reclaim in the background to keep eviction off foreground allocations.
@@ -652,7 +683,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     return fixed + page_capacity - reserve_margin(page_capacity) * 2;
   }
   size_t fixed_used() const {
-    return external_used_size_.load(std::memory_order_relaxed) +
+    const size_t external = external_used_size_.load(std::memory_order_relaxed);
+    return external - std::min(external, evictable_cache_used()) +
            metadata_used_size_.load(std::memory_order_relaxed);
   }
   bool should_background_reclaim() const {
@@ -683,6 +715,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::mutex process_reclaimer_mutex_;
   std::shared_ptr<const std::function<void()>> process_reclaimer_;
   std::atomic<size_t> external_used_size_{0};
+  std::atomic<size_t> evictable_cache_size_{0};
+  std::atomic<size_t> cache_reclaim_requested_{0};
   std::atomic<size_t> metadata_used_size_{0};
   // Logical priority only, not an allocation: waiting mandatory consumers
   // must be able to claim reclaimed bytes before optional page readmission.
@@ -703,6 +737,13 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<size_t> retained_block_bytes_{0};
   std::atomic<size_t> retained_idle_bytes_{0};
   std::atomic<uint64_t> retained_block_reuses_{0};
+
+  struct CacheBufferBin {
+    std::mutex mutex;
+    CacheBuffer *head{nullptr};
+  };
+  std::array<CacheBufferBin, 64> cache_buffer_bins_{};
+  std::atomic<size_t> cache_idle_bytes_{0};
 
   FreeShard free_shards_[kNumFreeShards];
   std::atomic<size_t> shard_seq_{0};
@@ -733,6 +774,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<bool> bg_running_{false};
   std::mutex bg_mutex_;
   std::condition_variable bg_cv_;
+
+  // Address-ordered, allocation-free registry of committed Chunk mappings.
+  // No RSS-budget operation may run while this mutex is held. The sampler
+  // takes it with try-lock while holding the RSS accounting mutex.
+  std::mutex cache_mapping_mutex_;
+  CacheBuffer *cache_mappings_{nullptr};
 };
 
 }  // namespace ailego
