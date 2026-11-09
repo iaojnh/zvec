@@ -120,6 +120,7 @@ jobs:
         shell: pwsh
 
       - name: Compile C++ test targets
+        id: native-build
         run: |
           New-Item -ItemType Directory -Force ci-evidence | Out-Null
           cmake --build "$env:GITHUB_WORKSPACE\build" --target unittest.build --config Release --parallel $env:NPROC `
@@ -156,6 +157,9 @@ jobs:
 
       - name: Run Python Tests
         id: python-tests
+        # Keep collecting the independent WAL failure even when a compiled
+        # C++ test fails; that earlier failure still keeps the job red.
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         run: |
           cd "$env:GITHUB_WORKSPACE"
           New-Item -ItemType Directory -Force ci-evidence | Out-Null
