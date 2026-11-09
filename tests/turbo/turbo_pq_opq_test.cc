@@ -162,8 +162,9 @@ TEST(PqOpq, EncodingScratchObeysCriticalPressureAndRecovers) {
     auto quantizer = core::IndexFactory::CreateQuantizer(name);
     ASSERT_TRUE(quantizer);
     ASSERT_EQ(0, quantizer->init(meta, params));
-    auto holder = std::make_shared<
-        core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(8);
+    auto holder =
+        std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(
+            8);
     for (size_t i = 0; i < 256; ++i) {
       ailego::NumericalVector<float> row(8);
       for (size_t d = 0; d < 8; ++d)
@@ -172,12 +173,14 @@ TEST(PqOpq, EncodingScratchObeysCriticalPressureAndRecovers) {
     }
     ASSERT_EQ(0, quantizer->train(holder));
     const float input[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    std::vector<uint8_t> encoded(quantizer->quantized_datapoint_vector_length());
+    std::vector<uint8_t> encoded(
+        quantizer->quantized_datapoint_vector_length());
     quantizer->quantize_data(input, encoded.data());
     auto expected = encoded;
     const size_t baseline = pool.external_used();
 
-    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
+    pool.set_memory_pressure(
+        ailego::ProcessRssBudget::PressureLevel::kCritical);
     EXPECT_THROW(quantizer->quantize_data(input, encoded.data()),
                  std::bad_alloc);
     EXPECT_EQ(baseline, pool.external_used());
@@ -331,7 +334,9 @@ TEST(PqOpq, StreamedTilesAreByteBoundedChargedAndReleasedOnFailure) {
     ++reads;
     EXPECT_EQ(0u, first);
     EXPECT_EQ(256u * 1024 / (kDimension * sizeof(float)), count);
-    EXPECT_GE(pool.external_used(), baseline + 3 * 256u * 1024);
+    // Publishing needs two charged tiles; reconstruction is not active yet.
+    EXPECT_GE(pool.external_used(), baseline + 2 * 256u * 1024);
+    EXPECT_LT(pool.external_used(), baseline + 3 * 256u * 1024);
     return -123;
   };
   auto write = [](size_t, size_t, const float *) { return 0; };
@@ -340,6 +345,31 @@ TEST(PqOpq, StreamedTilesAreByteBoundedChargedAndReleasedOnFailure) {
   EXPECT_EQ(-123, opq.train_rows(kRows, "budget-test", read, write, train,
                                  reconstruct));
   EXPECT_EQ(1u, reads);
+  EXPECT_EQ(baseline, pool.external_used());
+
+  size_t codebook_calls = 0, reconstruction_reads = 0;
+  auto read_until_reconstruction = [&](size_t, size_t count, float *out) {
+    if (codebook_calls) {
+      ++reconstruction_reads;
+      EXPECT_GE(pool.external_used(), baseline + 3 * 256u * 1024);
+      EXPECT_LT(pool.external_used(), baseline + 4 * 256u * 1024);
+      return -124;
+    }
+    std::fill(out, out + count * kDimension, 1.0f);
+    return 0;
+  };
+  auto train_without_row_tiles = [&](uint32_t) {
+    ++codebook_calls;
+    // Fixed storage headers may remain, but no full row tile may overlap
+    // the codebook's own workspace and I/O pages.
+    EXPECT_LT(pool.external_used(), baseline + 256u * 1024);
+    return 0;
+  };
+  EXPECT_EQ(-124,
+            opq.train_rows(kRows, "budget-test", read_until_reconstruction,
+                           write, train_without_row_tiles, reconstruct));
+  EXPECT_EQ(1u, codebook_calls);
+  EXPECT_EQ(1u, reconstruction_reads);
   EXPECT_EQ(baseline, pool.external_used());
 
   // Mandatory backing metadata and even the smallest tiles must both fit.
