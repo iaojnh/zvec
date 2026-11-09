@@ -18,9 +18,11 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <thread>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include "turbo/algorithm/kmeans.h"
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -1299,6 +1301,25 @@ TEST_F(IVFBuilderTest, TestBuildWithConverterClassMultiLevel) {
 }
 
 TEST_F(IVFBuilderTest, TestIndexThreads) {
+  // A refused worker allocation must return an error, never escape the
+  // thread and terminate the process. Normal threaded builds follow below.
+  {
+    auto &pool = PoolPayloadBudget::get_instance();
+    const size_t previous = pool.capacity();
+    ASSERT_EQ(0, pool.init(32UL << 20));
+    auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
+    using Algorithm = zvec::turbo::NumericalKmeans<float, IndexThreads>;
+    class WorkerProbe : public Algorithm {
+     public:
+      WorkerProbe() : Algorithm(1, 1536) {}
+      using Algorithm::cluster_matrix_features;
+    } algorithm;
+    MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    std::thread denied([&] { algorithm.cluster_matrix_features(0, 1); });
+    denied.join();
+    EXPECT_EQ(Algorithm::kWorkspaceNoMemory, algorithm.matrix_status());
+  }
   IndexBuilder::Pointer builder1 = IndexFactory::CreateBuilder("IVFBuilder");
   ASSERT_NE(builder1, nullptr);
   IndexBuilder::Pointer builder2 = IndexFactory::CreateBuilder("IVFBuilder");

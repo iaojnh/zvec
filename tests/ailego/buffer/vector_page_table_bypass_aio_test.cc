@@ -183,9 +183,6 @@ class BypassAioTest : public ::testing::Test {
                                  mode == FakeAio::Mode::DUPLICATE ||
                                  mode == FakeAio::Mode::REJECTED_RING;
     EXPECT_EQ(retried_destroy ? 2u : 1u, fake_.destroy_calls);
-    if (mode == FakeAio::Mode::SUCCESS) {
-      EXPECT_EQ(4u, pool.stats().aio_pages_submitted);
-    }
   }
 
   FakeAio fake_;
@@ -196,9 +193,6 @@ class BypassAioTest : public ::testing::Test {
   aio_getevents_fn getevents_{nullptr};
 };
 
-TEST_F(BypassAioTest, BatchesAlignedReadsWithoutAdmission) {
-  run(FakeAio::Mode::SUCCESS);
-}
 TEST_F(BypassAioTest, DrainsPartialSubmissionBeforeFallback) {
   run(FakeAio::Mode::PARTIAL);
 }

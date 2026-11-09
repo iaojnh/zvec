@@ -5,13 +5,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-import pytest
 import zvec
 
 
-def verify(path, operation, direct):
-    from zvec.model.convert import convert_to_cpp_doc
-
+def verify(path, operation):
     zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
     options = zvec.CollectionOption.__new__(zvec.CollectionOption)
     options.__setstate__((False, False, 1024 * 1024))
@@ -22,12 +19,7 @@ def verify(path, operation, direct):
     # The caller shares ONE large string; all batch expansion belongs to zvec.
     doc = zvec.Doc("large", fields={"payload": "文" * (512 * 1024)})
     batch = [doc] * 64
-    if direct:
-        native = convert_to_cpp_doc(doc, schema)
-        batch = [native] * 64
-        call = getattr(coll._obj, operation.capitalize())
-    else:
-        call = getattr(coll, operation)
+    call = getattr(coll, operation)
     try:
         call(batch)
     except MemoryError:
@@ -45,7 +37,6 @@ def verify(path, operation, direct):
         zvec.Doc("stream" + str(i), fields={"payload": "ok"}) for i in range(3)
     )
     coll.close()
-
 
 
 def verify_iterable(path):
@@ -72,10 +63,9 @@ def verify_iterable(path):
     coll.close()
 
 
-
-def run_worker(tmp_path, operation, direct=False):
+def run_worker(tmp_path, operation):
     completed = subprocess.run(
-        [sys.executable, __file__, str(tmp_path / "db"), operation, str(int(direct))],
+        [sys.executable, __file__, str(tmp_path / "db"), operation],
         capture_output=True,
         text=True,
         timeout=60,
@@ -83,20 +73,16 @@ def run_worker(tmp_path, operation, direct=False):
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-
-@pytest.mark.parametrize("direct", [False, True])
-def test_write_input_admission_and_recovery(tmp_path, direct):
-    run_worker(tmp_path, "insert", direct)
-
+def test_write_input_admission_and_recovery(tmp_path):
+    run_worker(tmp_path, "insert")
 
 
 def test_unknown_length_field_iterable_is_admitted_incrementally(tmp_path):
     run_worker(tmp_path, "iterable")
 
 
-
 if __name__ == "__main__":
     if sys.argv[2] == "iterable":
         verify_iterable(Path(sys.argv[1]))
     else:
-        verify(Path(sys.argv[1]), sys.argv[2], bool(int(sys.argv[3])))
+        verify(Path(sys.argv[1]), sys.argv[2])

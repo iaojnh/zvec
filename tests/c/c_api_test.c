@@ -375,7 +375,19 @@ void test_zvec_initialize() {
               ZVEC_ERROR_INVALID_ARGUMENT);
   TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_BACKGROUND) == ZVEC_OK);
   TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  zvec_float_array_t *denied = zvec_float_array_create(4);
+  const bool rejected = denied == NULL;
+  zvec_error_details_t details = {0};
+  zvec_error_code_t detail_status = zvec_get_last_error_details(&details);
+  const zvec_error_code_t allocation_error = details.code;
   TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  if (denied) zvec_float_array_destroy(denied);
+  TEST_ASSERT(rejected);
+  TEST_ASSERT(detail_status == ZVEC_OK);
+  TEST_ASSERT(allocation_error == ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  zvec_float_array_t *retried = zvec_float_array_create(4);
+  TEST_ASSERT(retried != NULL);
+  zvec_float_array_destroy(retried);
 
   TEST_END();
 }
@@ -854,6 +866,14 @@ void test_collection_schema_helpers(void) {
     // Test get_all_field_names
     const char **names = NULL;
     size_t name_count = 0;
+    TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+    names = (const char **)1;
+    name_count = 123;
+    zvec_error_code_t denied =
+        zvec_collection_schema_get_all_field_names(schema, &names, &name_count);
+    TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+    TEST_ASSERT(denied == ZVEC_ERROR_RESOURCE_EXHAUSTED);
+    TEST_ASSERT(names == NULL && name_count == 0);
     zvec_error_code_t err =
         zvec_collection_schema_get_all_field_names(schema, &names, &name_count);
     TEST_ASSERT(err == ZVEC_OK);
