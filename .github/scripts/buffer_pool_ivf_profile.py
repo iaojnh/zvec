@@ -31,7 +31,11 @@ def observe(args):
     target_mb = (
         config["memory_limit_mb"]
         if args.storage == "buffer"
-        else config["mmap_reference_memory_limit_mb"]
+        else config[
+            "mmap_reference_memory_limit_mb"
+            if args.stage == "query"
+            else "mmap_preparation_memory_limit_mb"
+        ]
     )
     result_path = args.evidence / f"{args.storage}-{args.stage}-{args.trial}.json"
     monitor_path = result_path.with_suffix(".monitor.jsonl")
@@ -95,7 +99,9 @@ def rss_window(samples, start, end, maximum_gap):
 def read_case(root, config, digest, storage, stage, trial):
     path = root / f"{storage}-{stage}-{trial}.json"
     value = json.loads(path.read_text())
-    assert value["passed"] is True, f"workload failed: {path}"
+    assert value["passed"] is True, (
+        f"{storage} {stage} failed: {value.get('error', path)}"
+    )
     assert value["profile_sha256"] == digest and value["profile"] == config
     assert (value["storage"], value["stage"], value["trial"]) == (storage, stage, trial)
     assert value["environment"]["system"] == "Linux"
@@ -109,7 +115,11 @@ def read_case(root, config, digest, storage, stage, trial):
     target_mb = (
         config["memory_limit_mb"]
         if storage == "buffer"
-        else config["mmap_reference_memory_limit_mb"]
+        else config[
+            "mmap_reference_memory_limit_mb"
+            if stage == "query"
+            else "mmap_preparation_memory_limit_mb"
+        ]
     )
     assert monitor[0]["target_rss_kib"] == target_mb * 1024
     assert (
@@ -123,11 +133,12 @@ def read_case(root, config, digest, storage, stage, trial):
     assert len(group) == 2
     before, after = group
     assert before["phase"] == "cgroup_start" and after["phase"] == "cgroup_complete"
-    assert (
-        before["memory.max"]
-        == after["memory.max"]
-        == config["system_limit_mib"] * 1024**2
-    )
+    limit_mib = config[
+        "mmap_preparation_system_limit_mib"
+        if storage == "mmap" and stage != "query"
+        else "system_limit_mib"
+    ]
+    assert before["memory.max"] == after["memory.max"] == limit_mib * 1024**2
     assert (
         before["memory.swap.max"]
         == after["memory.swap.max"]
@@ -163,14 +174,19 @@ def evaluate(profile, evidence):
             if stage == "mixed":
                 assert value["seconds"] >= config["mixed"]["minimum_seconds"]
                 assert (
-                    value["cycles"] >= 1
-                    and value["write_operations"] >= expected_rows - config["rows"]
+                    value["write_phase_seconds"] >= config["mixed"]["minimum_seconds"]
+                )
+                assert (
+                    value["cycles"] == config["mixed"]["cycles"]
+                    and value["write_operations"]
+                    == (expected_rows - config["rows"]) * config["mixed"]["cycles"]
                 )
                 assert value["reader_queries"] > 0
                 assert value["reader_queries_during_writes"] > 0
             if stage == "verify":
                 assert value["fields_and_vectors_verified"] is True
                 assert value["recall"] >= config["acceptance"]["minimum_recall"]
+    for storage in STORAGES:
         for trial in range(1, config["query"]["trials"] + 1):
             value = read_case(evidence, config, digest, storage, "query", trial)
             values.append(value)
@@ -190,7 +206,7 @@ def evaluate(profile, evidence):
                 seen.add(distribution)
                 assert case["trial"] == trial and case["cache"] == "warm"
                 assert case["end"] - case["start"] >= config["query"]["minimum_seconds"]
-                assert case["queries"] > 0
+                assert case["queries"] >= config["query"]["minimum_queries"]
                 for metric in ("qps", "p99_ms", "recall"):
                     assert math.isfinite(case[metric]) and case[metric] > 0
                 assert math.isclose(
@@ -288,6 +304,8 @@ def markdown_report(result):
     lines += [
         f"Candidate: `{result['source_commit']}`",
         f"Profile: `{config['name']}`; external limit {config['system_limit_mib']} MiB, swap disabled.",
+        f"mmap baseline preparation uses {config['mmap_preparation_system_limit_mib']} MiB; "
+        "both query modes use the same external limit above.",
         "",
         "Ratio uses median per-trial QPS / time-weighted whole-process RSS MiB.",
         "QPS and RSS columns show individual trial medians. All declared cases must pass.",

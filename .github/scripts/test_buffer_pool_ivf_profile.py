@@ -73,8 +73,9 @@ def evidence(tmp_path):
                 },
                 "rows": config["rows"] if stage == "build" else config["rows"] + 1536,
                 "seconds": 60,
-                "cycles": 1,
-                "write_operations": 1536,
+                "write_phase_seconds": 60,
+                "cycles": config["mixed"]["cycles"],
+                "write_operations": 1536 * config["mixed"]["cycles"],
                 "reader_queries": 12,
                 "reader_queries_during_writes": 12,
                 "fields_and_vectors_verified": True,
@@ -114,7 +115,11 @@ def evidence(tmp_path):
                         "target_rss_kib": config[
                             "memory_limit_mb"
                             if storage == "buffer"
-                            else "mmap_reference_memory_limit_mb"
+                            else (
+                                "mmap_reference_memory_limit_mb"
+                                if stage == "query"
+                                else "mmap_preparation_memory_limit_mb"
+                            )
                         ]
                         * 1024,
                         "samples": 9,
@@ -123,7 +128,12 @@ def evidence(tmp_path):
                 )
             )
             group = {
-                "memory.max": 768 * 1024**2,
+                "memory.max": config[
+                    "mmap_preparation_system_limit_mib"
+                    if storage == "mmap" and stage != "query"
+                    else "system_limit_mib"
+                ]
+                * 1024**2,
                 "memory.swap.max": 0,
                 "memory.swap.current": 0,
                 "memory.events": {"oom": "0", "oom_kill": "0"},
@@ -170,10 +180,13 @@ def test_build_requires_same_process_query_before_restart(evidence):
         "failed_write",
         "no_concurrent_reads",
         "short_write_run",
+        "short_write_phase",
+        "different_write_count",
         "missing_trial",
         "low_recall",
         "wrong_qps",
         "duplicate_distribution",
+        "too_few_queries",
     ],
 )
 def test_profile_cannot_be_qualified_from_incomplete_or_mixed_results(evidence, damage):
@@ -192,7 +205,12 @@ def test_profile_cannot_be_qualified_from_incomplete_or_mixed_results(evidence, 
         path.write_text("\n".join(json.dumps(row) for row in groups))
     else:
         path = root / "buffer-mixed-1.json"
-        if damage in {"low_recall", "wrong_qps", "duplicate_distribution"}:
+        if damage in {
+            "low_recall",
+            "wrong_qps",
+            "duplicate_distribution",
+            "too_few_queries",
+        }:
             path = root / "buffer-query-1.json"
 
         def mutate(value):
@@ -208,15 +226,45 @@ def test_profile_cannot_be_qualified_from_incomplete_or_mixed_results(evidence, 
                 value["reader_queries_during_writes"] = 0
             elif damage == "short_write_run":
                 value["seconds"] = 1
+            elif damage == "short_write_phase":
+                value["write_phase_seconds"] = 1
+            elif damage == "different_write_count":
+                value["write_operations"] += 128
             elif damage == "low_recall":
                 value["cases"][0]["recall"] = 0.5
             elif damage == "wrong_qps":
                 value["cases"][0]["qps"] = 1000
+            elif damage == "too_few_queries":
+                value["cases"][0]["queries"] = 1
             else:
                 value["cases"][1]["distribution"] = value["cases"][0]["distribution"]
 
         change(path, mutate)
     with pytest.raises((AssertionError, FileNotFoundError)):
+        evaluate(profile, root)
+
+
+def test_mmap_query_cannot_use_larger_preparation_allowance(evidence):
+    profile, root = evidence
+    path = root / "mmap-query-1.cgroup.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in rows:
+        row["memory.max"] = 4096 * 1024**2
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    with pytest.raises(AssertionError):
+        evaluate(profile, root)
+
+
+def test_failed_mmap_build_is_reported_before_missing_queries(evidence):
+    profile, root = evidence
+    (root / "buffer-query-1.json").unlink()
+    change(
+        root / "mmap-build-1.json",
+        lambda value: value.update(passed=False, error="training budget denied"),
+    )
+    with pytest.raises(
+        AssertionError, match="mmap build failed: training budget denied"
+    ):
         evaluate(profile, root)
 
 

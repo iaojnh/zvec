@@ -5,6 +5,8 @@
   "system_limit_mib": 768,
   "memory_limit_mb": 512,
   "mmap_reference_memory_limit_mb": 768,
+  "mmap_preparation_memory_limit_mb": 4096,
+  "mmap_preparation_system_limit_mib": 4096,
   "query_threads": 1,
   "optimize_threads": 4,
   "max_buffer_size": 1048576,
@@ -17,12 +19,13 @@
   "query": {
     "topk": 10,
     "query_count": 16,
-    "warmup_queries": 16,
+    "warmup_queries": 4,
     "trials": 3,
     "minimum_seconds": 3.0,
+    "minimum_queries": 16,
     "distributions": ["uniform", "hot_80_20", "zipf", "repeat_90_10"]
   },
-  "mixed": {"minimum_seconds": 60.0, "batches": 12, "readers": 1},
+  "mixed": {"minimum_seconds": 60.0, "cycles": 2, "batches": 12, "readers": 1},
   "acceptance": {
     "minimum_recall": 0.9,
     "maximum_recall_difference": 0.01,

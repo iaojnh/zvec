@@ -173,6 +173,12 @@ def extended_truth(config, fixture):
     return best_ids, best_distances
 
 
+def pace_write(settings, started, completed):
+    total_batches = settings["cycles"] * settings["batches"]
+    deadline = started + settings["minimum_seconds"] * completed / total_batches
+    time.sleep(max(0.0, deadline - time.monotonic()))
+
+
 def mixed(config, root, storage):
     fixture = json.loads((root / "fixture.json").read_text())
     best_ids, best_distances = extended_truth(config, fixture)
@@ -197,10 +203,7 @@ def mixed(config, root, storage):
             readers = [executor.submit(read_loop, i) for i in range(len(read_counts))]
             reads_before_writes = sum(read_counts)
             try:
-                while (
-                    cycles == 0
-                    or time.monotonic() - started < config["mixed"]["minimum_seconds"]
-                ):
+                for _ in range(config["mixed"]["cycles"]):
                     for i in range(config["mixed"]["batches"]):
                         for reader in readers:
                             if reader.done():
@@ -212,7 +215,16 @@ def mixed(config, root, storage):
                         check_statuses(collection.upsert(docs), len(docs))
                         writes += len(docs)
                         collection.flush()
+                        # Pace identical operation counts over the declared
+                        # write interval. Faster storage must not accumulate
+                        # more obsolete vector versions before the comparison.
+                        pace_write(
+                            config["mixed"],
+                            started,
+                            cycles * config["mixed"]["batches"] + i + 1,
+                        )
                     cycles += 1
+                write_phase_seconds = time.monotonic() - started
                 reads_during_writes = sum(read_counts) - reads_before_writes
                 assert reads_during_writes > 0, (
                     "no queries completed during sustained writes"
@@ -251,6 +263,7 @@ def mixed(config, root, storage):
         "reader_queries": sum(read_counts),
         "reader_queries_during_writes": reads_during_writes,
         "cycles": cycles,
+        "write_phase_seconds": write_phase_seconds,
         "seconds": elapsed,
         "writes_per_second": writes / elapsed,
     }
@@ -312,27 +325,29 @@ def query_trials(config, root, storage, trial):
         "repeat_90_10": np.asarray([0.9, *([0.1 / (count - 1)] * (count - 1))]),
     }
     try:
+        # The corpus, projection and search parameters are identical in every
+        # case. Check the complete fixed query set once per fresh process;
+        # measured queries also validate their own results below.
+        for i, vector in enumerate(fixture["queries"]):
+            assert (
+                check_hits(
+                    query(config, collection, vector),
+                    [str(x) for x in fixture["truth"][i]],
+                    config["query"]["topk"],
+                )
+                >= config["acceptance"]["minimum_recall"]
+            )
         for distribution in config["query"]["distributions"]:
             weights = distributions[distribution]
             sequence = rng.choice(count, size=1024, p=weights / weights.sum()).tolist()
             # Each case gets the same fixed warmup, outside its measured window.
             for i in range(config["query"]["warmup_queries"]):
                 query(config, collection, fixture["queries"][sequence[i]])
-            for i, vector in enumerate(fixture["queries"]):
-                hits = query(config, collection, vector)
-                assert (
-                    check_hits(
-                        hits,
-                        [str(x) for x in fixture["truth"][i]],
-                        config["query"]["topk"],
-                    )
-                    >= config["acceptance"]["minimum_recall"]
-                )
             latencies = []
             recall_sum = 0.0
             started = time.monotonic()
             while (
-                not latencies
+                len(latencies) < config["query"]["minimum_queries"]
                 or time.monotonic() - started < config["query"]["minimum_seconds"]
             ):
                 i = sequence[len(latencies) % len(sequence)]
@@ -378,6 +393,8 @@ def main():
     assert config["rows"] % config["batch_size"] == 0
     assert 2 <= config["query"]["query_count"] <= config["batch_size"]
     assert config["query"]["topk"] < config["rows"]
+    assert config["mixed"]["cycles"] > 0
+    assert config["query"]["minimum_queries"] > 0
     args.root.mkdir(parents=True, exist_ok=True)
     result = {
         "stage": args.stage,
@@ -397,7 +414,11 @@ def main():
         zvec.init(
             memory_limit_mb=config["memory_limit_mb"]
             if args.storage == "buffer"
-            else config["mmap_reference_memory_limit_mb"],
+            else config[
+                "mmap_reference_memory_limit_mb"
+                if args.stage == "query"
+                else "mmap_preparation_memory_limit_mb"
+            ],
             query_threads=config["query_threads"],
             optimize_threads=config["optimize_threads"],
             log_level=zvec.LogLevel.INFO,

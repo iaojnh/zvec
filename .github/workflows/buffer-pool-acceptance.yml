@@ -764,17 +764,21 @@ jobs:
           python_path=$(command -v python)
           run_stage() {
             local storage="$1" stage="$2" trial="$3"
+            local stage_limit_mib="$limit_mib"
+            if [[ "$storage" == mmap && "$stage" != query ]]; then
+              stage_limit_mib=$(python -c 'import json; print(json.load(open("examples/python/ivf_memory_profile.json"))["mmap_preparation_system_limit_mib"])')
+            fi
             # A fresh service must own its page-cache charges. Both modes start
             # with cold OS caches, then perform the same measured warmup.
             sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
             sudo systemd-run --quiet --wait --pipe --collect \
               --unit="ivf-profile-$storage-$stage-$trial-${{ github.run_id }}-${{ github.run_attempt }}" \
-              --property="MemoryMax=${limit_mib}M" --property=MemorySwapMax=0 \
+              --property="MemoryMax=${stage_limit_mib}M" --property=MemorySwapMax=0 \
               --property=LimitNOFILE=65536 \
               --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
               --setenv=OPENBLAS_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
               "$python_path" .github/scripts/buffer_pool_system_limit.py \
-              "$((limit_mib * 1024 * 1024))" "evidence/$storage-$stage-$trial.cgroup.jsonl" \
+              "$((stage_limit_mib * 1024 * 1024))" "evidence/$storage-$stage-$trial.cgroup.jsonl" \
               "$python_path" -X faulthandler .github/scripts/buffer_pool_ivf_profile.py observe \
               --profile "$profile" --root "$PROFILE_ROOT/$storage" --evidence evidence \
               --wheel "$wheel" --storage "$storage" --stage "$stage" --trial "$trial" \

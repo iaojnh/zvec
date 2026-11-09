@@ -13,17 +13,28 @@ uses Linux glibc x86_64, 400,000 FP32 vectors of dimension 768, L2 IVF with
 data with a fixed seed; 16 fixed queries have independently computed exact
 top-10 ground truth. These results do not establish performance on other data.
 
-Both storage modes run under a 768 MiB cgroup limit with swap disabled. Buffer
-Pool uses a 512 MiB managed budget/RSS soft target. The mmap reference uses a
-768 MiB soft target, following the existing CI convention that file-backed RSS
-must not cause artificial admission failures at the Buffer Pool target. Both
-values are recorded; the external hardware allowance is identical.
+Buffer Pool runs every stage under a 768 MiB cgroup limit with swap disabled,
+using a 512 MiB managed budget/RSS soft target. Both storage modes use that same
+768 MiB external limit for the actual query comparison. The mmap query reference
+uses a 768 MiB soft target, following the existing CI convention that file-backed
+RSS must not cause artificial admission failures at the Buffer Pool target.
+All values are recorded; actual whole-process RSS is the metric denominator.
+
+The first trial at commit `85830989` passed all Buffer Pool lifecycle stages,
+but mmap training returned `Not enough space` under the 768 MiB allowance.
+Consequently mmap baseline preparation (build/mixed/verify) explicitly uses a
+separate 4096 MiB external limit and soft target. It then exits; query trials
+start fresh at the shared 768 MiB external limit. This allowance prepares a
+performance reference; it does not claim mmap can build within the Buffer Pool
+deployment envelope. The initial failed run remains available as evidence.
 
 All stages use a 1 MiB write buffer, batch size 128, one query worker and four
 optimization workers. The mixed stage inserts 1,536 additional vectors, then
-updates those same IDs for at least 60 seconds while a reader runs. It flushes
-each batch, optimizes, checks the resulting count and verifies the last update.
-The fixed data size permits comparable query and ground-truth verification.
+updates those same IDs once while a reader runs. Its 24 batches are paced across
+at least 60 seconds. It flushes each batch, optimizes, checks the resulting count
+and verifies the last update. Identical 3,072 write operations keep both live rows
+and obsolete vector versions comparable across modes. Slower operations may
+exceed 60 seconds.
 The build stage also closes, reopens and queries before its process exits, so
 retained build-time heap memory is included in the transition check.
 
@@ -64,7 +75,9 @@ storage order and use identical warmup, query sequences and recall parameters.
 
 For each of uniform, hot-80/20, Zipf and repeat-90/10 query distributions:
 
-* Run three trials, each measuring for at least three seconds after warmup.
+* Run three trials, each measuring at least 16 queries and three seconds after
+  four warmup queries. Each fresh process also checks all 16 oracle queries
+  before its cases; every measured query checks its own recall again.
 * Require recall at least 0.9, and Buffer Pool/mmap recall difference at most 0.01.
 * Compute whole-process RSS from a separate process at 100 ms intervals. Integrate
   RSS over the exact query measurement window; do not subtract a baseline or
@@ -74,7 +87,8 @@ For each of uniform, hot-80/20, Zipf and repeat-90/10 query distributions:
 * Keep the existing guardrails: QPS at least 80% of mmap and p99 at most 125%.
 * Require successful build, concurrent writes/readers and fresh-process
   verification for this same profile, wheel and source commit, with no OOM
-  events or swap use.
+  events or swap use. Buffer Pool lifecycle stages use its deployment envelope;
+  mmap preparation uses its separately declared allowance above.
 
 RSS exceeding 512 MiB is recorded rather than judged against a universal
 overshoot amplitude/duration promise. The complete workload must still succeed
