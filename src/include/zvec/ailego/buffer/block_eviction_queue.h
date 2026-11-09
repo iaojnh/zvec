@@ -430,6 +430,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     CacheBuffer *next{nullptr};
     ProcessRssBudget::MaterializationStamp stamp{};
     ProcessRssBudget::MaterializationStamp creation{};
+    // Separate from the idle-bin link: live and idle mappings both retain
+    // backing charges and must remain visible to RSS overlap sampling.
+    CacheBuffer *mapped_prev{nullptr};
+    CacheBuffer *mapped_next{nullptr};
   };
   CacheBuffer *try_acquire_cache_buffer(size_t bytes);
   void release_cache_buffer(CacheBuffer *buffer);
@@ -647,6 +651,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void reclaim_process_cache();
   size_t trim_retained_blocks(size_t bytes_needed);
   size_t trim_cache_buffers(size_t bytes_needed);
+  void register_cache_mapping(CacheBuffer *buffer);
+  bool unmap_cache_mapping(CacheBuffer *buffer);
   size_t pick_shard();
 
   // Reclaim in the background to keep eviction off foreground allocations.
@@ -768,6 +774,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<bool> bg_running_{false};
   std::mutex bg_mutex_;
   std::condition_variable bg_cv_;
+
+  // Address-ordered, allocation-free registry of committed Chunk mappings.
+  // No RSS-budget operation may run while this mutex is held. The sampler
+  // takes it with try-lock while holding the RSS accounting mutex.
+  std::mutex cache_mapping_mutex_;
+  CacheBuffer *cache_mappings_{nullptr};
 };
 
 }  // namespace ailego
