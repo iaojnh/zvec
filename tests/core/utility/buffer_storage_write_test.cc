@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
@@ -32,10 +33,26 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_mapping.h>
+#include "utility/reusable_read_scratch.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
 using namespace zvec::core;
+
+namespace zvec::core {
+struct ReusableReadScratchTestPeer {
+  static ailego::version_t fail_membership(ReusableReadScratch &source,
+                                           ailego::version_t stale = 0) {
+    for (auto &entry : source.entries_) {
+      if (!entry.worker) continue;
+      const auto version = stale ? stale : entry.worker->membership_.load();
+      entry.worker->eviction_requeue_failed(version, version);
+      return version;
+    }
+    return 0;
+  }
+};
+}  // namespace zvec::core
 
 class BufferStorageWriteTest : public ::testing::Test {
  protected:
@@ -2394,7 +2411,8 @@ TEST_F(BufferStorageWriteTest, OverlappingSnapshotsRespectSlotAndByteLimits) {
   EXPECT_EQ(0, storage->close());
   for (auto &block : small) block.reset();
   overflow.reset();
-  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().stats().external_used);
+  EXPECT_EQ(0u,
+            ailego::PoolPayloadBudget::get_instance().stats().external_used);
 }
 
 TEST_F(BufferStorageWriteTest,
@@ -2512,7 +2530,8 @@ TEST_F(BufferStorageWriteTest, OverlappingSnapshotsRecycleDuringRemoteRelease) {
   receiver.join();
   EXPECT_FALSE(failed.load());
   EXPECT_EQ(0, storage->close());
-  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().stats().external_used);
+  EXPECT_EQ(0u,
+            ailego::PoolPayloadBudget::get_instance().stats().external_used);
 }
 
 TEST_F(BufferStorageWriteTest, RecycledSnapshotsSeeWholeConcurrentWrites) {
@@ -2585,6 +2604,229 @@ TEST_F(BufferStorageWriteTest, IdleScratchIsReleasedForRequiredGrowth) {
   pin.reset();
   EXPECT_EQ(0, storage->close());
   EXPECT_EQ(0u, pool.stats().external_used);
+}
+
+TEST_F(BufferStorageWriteTest, IdleSnapshotsYieldBudgetAcrossLiveSources) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto baseline = pool.external_used();
+  constexpr size_t kBytes = 16UL << 10;
+  std::vector<std::unique_ptr<ReusableReadScratch>> sources;
+  for (size_t i = 0; i < 24; ++i) {
+    sources.emplace_back(std::make_unique<ReusableReadScratch>());
+    auto block = sources.back()->acquire(kBytes, 64, true, [] {
+      return IndexStorage::MemoryBlock::AllocateOwned(kBytes, 64);
+    });
+    std::memset(block.data_, static_cast<int>(i + 1), kBytes);
+  }
+  // One live result must survive reclamation of the other source caches.
+  auto retained = sources.front()->acquire(kBytes, 64, true, [] {
+    return IndexStorage::MemoryBlock::AllocateOwned(kBytes, 64);
+  });
+  retained.scratch_size_ = kBytes;
+  const auto before = pool.external_used();
+  ASSERT_GE(before, baseline + sources.size() * kBytes);
+  const auto charge = pool.available() + 8 * kBytes;
+  const bool admitted = pool.try_charge_external(charge);
+  EXPECT_TRUE(admitted);
+  if (admitted) {
+    EXPECT_LE(pool.external_used() - charge, before - 8 * kBytes);
+    EXPECT_EQ(0, std::memcmp(retained.data(),
+                             std::vector<char>(kBytes, 1).data(), kBytes));
+    pool.release_external(charge);
+  }
+  sources.clear();
+  EXPECT_EQ(0, std::memcmp(retained.data(), std::vector<char>(kBytes, 1).data(),
+                           kBytes));
+  retained.reset();
+  EXPECT_EQ(baseline, pool.external_used());
+}
+
+TEST_F(BufferStorageWriteTest, PressureKeepsMappedSnapshotLeasesAcrossClose) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto baseline = pool.external_used();
+  const auto length = 2 * ailego::kVectorPageSize;
+  auto allocate = [&] {
+    auto backing = std::allocate_shared<ailego::BudgetedMappedBuffer>(
+        ailego::BudgetedAllocator<ailego::BudgetedMappedBuffer>{}, length);
+    std::memset(backing->data(), 'M', length);
+    return IndexStorage::MemoryBlock::MakeSharedView(backing->data(), backing);
+  };
+  IndexStorage::MemoryBlock retained;
+  {
+    ReusableReadScratch source;
+    auto first = source.acquire(length, 4096, false, allocate);
+    first.scratch_size_ = length;
+    retained = first;
+    first.reset();
+    for (size_t i = 0; i < 16; ++i)
+      ailego::BlockEvictionQueue::get_instance().batch_recycle(8);
+    EXPECT_EQ('M', static_cast<const char *>(retained.data())[length - 1]);
+    source.clear();
+  }
+  std::thread receiver([block = std::move(retained), length] {
+    EXPECT_EQ('M', static_cast<const char *>(block.data())[0]);
+    EXPECT_EQ('M', static_cast<const char *>(block.data())[length - 1]);
+  });
+  receiver.join();
+  EXPECT_EQ(baseline, pool.external_used());
+}
+
+TEST_F(BufferStorageWriteTest,
+       QueueRequeueFailurePreservesLeasesAndNewGenerations) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto baseline = pool.external_used();
+  constexpr size_t kBytes = 512;
+  size_t allocations = 0;
+  auto allocate = [&] {
+    ++allocations;
+    return IndexStorage::MemoryBlock::AllocateOwned(kBytes, 64);
+  };
+  {
+    ReusableReadScratch source;
+    auto block = source.acquire(kBytes, 64, false, allocate);
+    block.scratch_size_ = kBytes;
+    std::memset(block.data_, 'R', kBytes);
+    auto copy = block;
+    const auto old_version =
+        ReusableReadScratchTestPeer::fail_membership(source);
+    ASSERT_NE(0u, old_version);
+    block.reset();
+    EXPECT_EQ('R', static_cast<const char *>(copy.data())[kBytes - 1]);
+    copy.reset();
+    auto fresh = source.acquire(kBytes, 64, false, allocate);
+    EXPECT_EQ(2u, allocations);  // Failed membership released the idle payload.
+    auto *address = fresh.data();
+    ReusableReadScratchTestPeer::fail_membership(source, old_version);
+    fresh.reset();
+    auto reused = source.acquire(kBytes, 64, false, allocate);
+    EXPECT_EQ(address, reused.data());
+    EXPECT_EQ(2u, allocations);  // An old callback cannot revoke a new token.
+  }
+  EXPECT_EQ(baseline, pool.external_used());
+}
+
+TEST_F(BufferStorageWriteTest, InitialLeaseSurvivesConcurrentReclamation) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto baseline = pool.external_used();
+  std::atomic<bool> finished{false}, failed{false};
+  std::thread evictor([&] {
+    while (!finished.load(std::memory_order_acquire)) {
+      ailego::BlockEvictionQueue::get_instance().batch_recycle(64);
+      std::this_thread::yield();
+    }
+  });
+  std::vector<std::thread> readers;
+  for (size_t thread = 0; thread < 4; ++thread) {
+    readers.emplace_back([&] {
+      for (size_t i = 0; i < 128; ++i) {
+        ReusableReadScratch source;
+        size_t allocations = 0;
+        try {
+          auto block = source.acquire(512, 64, true, [&] {
+            if (++allocations != 1) throw std::bad_alloc();
+            return IndexStorage::MemoryBlock::AllocateOwned(512, 64);
+          });
+          if (!block.data() || allocations != 1) failed = true;
+        } catch (const std::bad_alloc &) {
+          failed = true;
+        }
+      }
+    });
+  }
+  for (auto &reader : readers) reader.join();
+  finished.store(true, std::memory_order_release);
+  evictor.join();
+  EXPECT_FALSE(failed.load());
+  EXPECT_EQ(baseline, pool.external_used());
+}
+
+TEST_F(BufferStorageWriteTest, ReclaimedSnapshotsRejoinPressureQueue) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto baseline = pool.external_used();
+  constexpr size_t kBytes = 512;
+  size_t allocations = 0;
+  auto allocate = [&] {
+    ++allocations;
+    return IndexStorage::MemoryBlock::AllocateOwned(kBytes, 64);
+  };
+  auto reclaim = [] {
+    for (size_t i = 0; i < 16; ++i)
+      ailego::BlockEvictionQueue::get_instance().batch_recycle(64);
+  };
+  {
+    ReusableReadScratch source;
+    for (size_t cycle = 0; cycle < 3; ++cycle) {
+      auto block = source.acquire(kBytes, 64, true, allocate);
+      block.scratch_size_ = kBytes;
+      EXPECT_EQ(cycle + 1, allocations);
+      auto *address = block.data();
+      std::memset(block.data_, 'Q', kBytes);
+      reclaim();  // A live lease must survive every pressure pass.
+      EXPECT_EQ('Q', static_cast<const char *>(block.data())[kBytes - 1]);
+      block.reset();
+      auto reused = source.acquire(kBytes, 64, true, allocate);
+      EXPECT_EQ(address, reused.data());
+      EXPECT_EQ(cycle + 1, allocations);
+      reused.reset();
+      reclaim();  // Releasing idle backing must permit a fresh enrollment.
+    }
+  }
+  EXPECT_EQ(baseline, pool.external_used());
+}
+
+TEST_F(BufferStorageWriteTest, SnapshotReclamationRacesWithReuseAndClose) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto baseline = pool.external_used();
+  constexpr size_t kBytes = 512;
+  ReusableReadScratch source;
+  std::array<std::array<IndexStorage::MemoryBlock, 4>, 4> retained;
+  std::array<std::array<char, 4>, 4> expected{};
+  std::atomic<bool> finished{false}, failed{false};
+  std::thread evictor([&] {
+    while (!finished.load(std::memory_order_acquire)) {
+      ailego::BlockEvictionQueue::get_instance().batch_recycle(8);
+      std::this_thread::yield();
+    }
+  });
+  std::vector<std::thread> readers;
+  for (size_t thread = 0; thread < retained.size(); ++thread) {
+    readers.emplace_back([&, thread] {
+      for (size_t i = 0; i < 256; ++i) {
+        const size_t slot = i % retained[thread].size();
+        auto &previous = retained[thread][slot];
+        if (previous.data() &&
+            std::memcmp(
+                previous.data(),
+                std::vector<char>(kBytes, expected[thread][slot]).data(),
+                kBytes)) {
+          failed = true;
+        }
+        previous.reset();
+        auto block = source.acquire(kBytes, 0, true, [kBytes] {
+          return IndexStorage::MemoryBlock::AllocateOwned(kBytes);
+        });
+        block.scratch_size_ = kBytes;
+        expected[thread][slot] = static_cast<char>((i + thread) % 127 + 1);
+        std::memset(block.data_, expected[thread][slot], kBytes);
+        previous = std::move(block);
+      }
+    });
+  }
+  for (auto &reader : readers) reader.join();
+  source.clear();  // Live results and queue callbacks can outlive the storage.
+  finished.store(true, std::memory_order_release);
+  evictor.join();
+  EXPECT_FALSE(failed.load());
+  for (size_t thread = 0; thread < retained.size(); ++thread) {
+    for (size_t slot = 0; slot < retained[thread].size(); ++slot) {
+      EXPECT_EQ(0, std::memcmp(
+                       retained[thread][slot].data(),
+                       std::vector<char>(kBytes, expected[thread][slot]).data(),
+                       kBytes));
+      retained[thread][slot].reset();
+    }
+  }
+  EXPECT_EQ(baseline, pool.external_used());
 }
 
 TEST_F(BufferStorageWriteTest, CR_MemoryBlockOutlivesReadOnlyStorage) {
