@@ -21,6 +21,7 @@
 #include <limits>
 #include <random>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
@@ -389,6 +390,9 @@ void PqFastQuantizer::train_all_chunks(const void *data, size_t num,
 
   // Distribute sub-quantizers across threads.
   std::atomic<size_t> finished{0};
+  std::atomic<bool> no_memory{false};
+  // Join already submitted workers if a later task submission fails.
+  AILEGO_DEFER([&] { task_group->wait_finish(); });
   size_t pool_count = threads->count();
 
   auto submit_training = [&](const auto *typed_data) {
@@ -396,11 +400,16 @@ void PqFastQuantizer::train_all_chunks(const void *data, size_t num,
     for (size_t i = 0; i < pool_count; ++i) {
       task_group->submit(
           ailego::Closure::New([this, typed_data, num, stride, i, pool_count,
-                                max_iters, &finished]() {
-            for (uint32_t m = static_cast<uint32_t>(i); m < num_chunk_;
-                 m += static_cast<uint32_t>(pool_count)) {
-              train_subquantizer<T>(typed_data, num, stride, m, max_iters);
-              finished++;
+                                max_iters, &finished, &no_memory]() {
+            try {
+              for (uint32_t m = static_cast<uint32_t>(i); m < num_chunk_;
+                   m += static_cast<uint32_t>(pool_count)) {
+                if (no_memory.load(std::memory_order_relaxed)) break;
+                train_subquantizer<T>(typed_data, num, stride, m, max_iters);
+                finished++;
+              }
+            } catch (const std::bad_alloc &) {
+              no_memory.store(true, std::memory_order_relaxed);
             }
           }));
     }
@@ -417,6 +426,7 @@ void PqFastQuantizer::train_all_chunks(const void *data, size_t num,
       break;
   }
   task_group->wait_finish();
+  if (no_memory.load(std::memory_order_relaxed)) throw std::bad_alloc();
 }
 
 float PqFastQuantizer::encode_reconstruct_batch(const float *rotated,

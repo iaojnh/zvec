@@ -22,6 +22,7 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
+#include <ailego/pattern/defer.h>
 #include <ailego/pattern/scope_guard.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
@@ -432,6 +433,9 @@ void PqInt8Quantizer::train_all_chunks(const void *data, size_t num,
 
   // Distribute chunks across threads, dispatched by data type.
   std::atomic<size_t> finished{0};
+  std::atomic<bool> no_memory{false};
+  // Join already submitted workers if a later task submission fails.
+  AILEGO_DEFER([&] { task_group->wait_finish(); });
   size_t pool_count = threads->count();
 
   auto submit_training = [&](const auto *typed_data) {
@@ -439,11 +443,16 @@ void PqInt8Quantizer::train_all_chunks(const void *data, size_t num,
     for (size_t i = 0; i < pool_count; ++i) {
       task_group->submit(
           ailego::Closure::New([this, typed_data, num, stride, rows, i,
-                                pool_count, max_iters, &finished]() {
-            for (uint32_t m = static_cast<uint32_t>(i); m < num_chunk_;
-                 m += static_cast<uint32_t>(pool_count)) {
-              train_chunk<T>(typed_data, num, stride, m, max_iters, rows);
-              finished++;
+                                pool_count, max_iters, &finished, &no_memory]() {
+            try {
+              for (uint32_t m = static_cast<uint32_t>(i); m < num_chunk_;
+                   m += static_cast<uint32_t>(pool_count)) {
+                if (no_memory.load(std::memory_order_relaxed)) break;
+                train_chunk<T>(typed_data, num, stride, m, max_iters, rows);
+                finished++;
+              }
+            } catch (const std::bad_alloc &) {
+              no_memory.store(true, std::memory_order_relaxed);
             }
           }));
     }
@@ -461,6 +470,7 @@ void PqInt8Quantizer::train_all_chunks(const void *data, size_t num,
   }
 
   task_group->wait_finish();
+  if (no_memory.load(std::memory_order_relaxed)) throw std::bad_alloc();
 }
 
 float PqInt8Quantizer::encode_reconstruct_batch(const float *rotated,

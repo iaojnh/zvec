@@ -119,6 +119,55 @@ TEST(PqModelMemoryTest, FastModelsAreChargedAndReinitReleasesThem) {
   check_small_codebook_budget<PqFastQuantizer>();
 }
 
+template <typename QuantizerType>
+void check_legacy_training_budget_failure() {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(4UL << 20));
+  AILEGO_DEFER([&] { EXPECT_EQ(0, pool.init(previous)); });
+  auto holder =
+      std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(32);
+  for (size_t i = 0; i < 512; ++i) {
+    ailego::NumericalVector<float> row(32);
+    for (size_t d = 0; d < 32; ++d) row[d] = float((i * 17 + d) % 31);
+    holder->emplace(i, row);
+  }
+  QuantizerType quantizer;
+  core::IndexMeta meta(core::IndexMeta::DT_FP32, 32);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  ailego::Params params;
+  params.set("num_chunk", 8u);
+  params.set("thread_count", 2u);
+  params.set("markov_chain_length", 0u);
+  params.set("precompute_sdc", false);
+  params.set("build_sdc_table", false);
+  ASSERT_EQ(0, quantizer.init(meta, params));
+  quantizer.set_buffered_training(false);
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used() - 256);
+    const size_t blocked = pool.external_used();
+    // The model is initialized and samples are available; deny the chunk
+    // workers' KMeans workspace, then retry after releasing pressure.
+    EXPECT_EQ(core::IndexError_NoMemory, quantizer.train(holder));
+    EXPECT_EQ(blocked, pool.external_used());
+  }
+  ASSERT_EQ(0, quantizer.train(holder));
+  std::string model;
+  EXPECT_EQ(0, quantizer.serialize(&model));
+  EXPECT_FALSE(model.empty());
+}
+
+TEST(PqModelMemoryTest, LegacyInt8WorkerBudgetFailureCanRetry) {
+  check_legacy_training_budget_failure<PqInt8Quantizer>();
+}
+TEST(PqModelMemoryTest, LegacyInt4WorkerBudgetFailureCanRetry) {
+  check_legacy_training_budget_failure<PqInt4Quantizer>();
+}
+TEST(PqModelMemoryTest, LegacyFastWorkerBudgetFailureCanRetry) {
+  check_legacy_training_budget_failure<PqFastQuantizer>();
+}
+
 TEST(PqModelMemoryTest, FastQueryAdmitsBothLookupTableBuffers) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t previous = pool.capacity();
