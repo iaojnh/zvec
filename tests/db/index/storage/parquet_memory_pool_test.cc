@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <system_error>
 #include <thread>
 #include <ailego/pattern/scope_guard.h>
 #include <arrow/api.h>
@@ -64,6 +65,14 @@ namespace detail {
 namespace {
 
 constexpr int64_t kThreshold = ParquetMemoryPool::kMappedAllocationThreshold;
+
+void RemoveTemporaryParquetFile(const std::filesystem::path &path) {
+  // ScopeGuard's destructor must not throw when Windows still has a file open.
+  // Report cleanup failures through gtest instead of terminating the process.
+  std::error_code error;
+  std::filesystem::remove(path, error);
+  EXPECT_FALSE(error) << "Cannot remove " << path << ": " << error.message();
+}
 
 class RejectingMemoryPool : public arrow::ProxyMemoryPool {
  public:
@@ -412,7 +421,7 @@ TEST_F(ParquetBudgetTest,
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
   auto cleanup =
-      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+      ailego::ScopeGuard::Make([&] { RemoveTemporaryParquetFile(path); });
   auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
   arrow::BinaryBuilder builder;
   for (int i = 0; i < 1024; ++i)
@@ -462,7 +471,7 @@ TEST_F(ParquetBudgetTest, SmallBatchesShareBoundedRowGroups) {
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
   auto cleanup =
-      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+      ailego::ScopeGuard::Make([&] { RemoveTemporaryParquetFile(path); });
   auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
   arrow::BinaryBuilder builder;
   for (int i = 0; i < 64; ++i)
@@ -486,11 +495,14 @@ TEST_F(ParquetBudgetTest, SmallBatchesShareBoundedRowGroups) {
   ASSERT_EQ(2, file->metadata()->num_row_groups());
   EXPECT_EQ(8192, file->metadata()->RowGroup(0)->num_rows());
   EXPECT_EQ(8192, file->metadata()->RowGroup(1)->num_rows());
+  file.reset();
   auto input = arrow::io::ReadableFile::Open(path.string()).ValueOrDie();
   auto reader = parquet::arrow::OpenFile(input, arrow::default_memory_pool())
                     .ValueOrDie();
   std::shared_ptr<arrow::Table> actual;
   ASSERT_TRUE(reader->ReadTable(&actual).ok());
+  reader.reset();
+  ASSERT_TRUE(input->Close().ok());
   auto expected =
       arrow::Table::FromRecordBatches(
           std::vector<std::shared_ptr<arrow::RecordBatch>>(256, batch))
@@ -506,7 +518,7 @@ TEST_F(ParquetBudgetTest, SlicedBatchesUseReferencedBytesAndExplicitRowLimit) {
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
   auto cleanup =
-      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+      ailego::ScopeGuard::Make([&] { RemoveTemporaryParquetFile(path); });
   auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
   arrow::BinaryBuilder builder;
   for (int i = 0; i < 8192; ++i)
@@ -529,11 +541,14 @@ TEST_F(ParquetBudgetTest, SlicedBatchesUseReferencedBytesAndExplicitRowLimit) {
   ASSERT_EQ(3, file->metadata()->num_row_groups());
   for (int i = 0; i < 3; ++i)
     EXPECT_LE(file->metadata()->RowGroup(i)->num_rows(), 1000);
+  file.reset();
   auto input = arrow::io::ReadableFile::Open(path.string()).ValueOrDie();
   auto reader = parquet::arrow::OpenFile(input, arrow::default_memory_pool())
                     .ValueOrDie();
   std::shared_ptr<arrow::Table> actual;
   ASSERT_TRUE(reader->ReadTable(&actual).ok());
+  reader.reset();
+  ASSERT_TRUE(input->Close().ok());
   auto expected =
       arrow::Table::FromRecordBatches(expected_batches).ValueOrDie();
   EXPECT_TRUE(actual->Equals(*expected));
@@ -547,7 +562,7 @@ TEST_F(ParquetBudgetTest, FailedBufferedWriteDoesNotResumeOrReportSuccess) {
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
   auto cleanup =
-      ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+      ailego::ScopeGuard::Make([&] { RemoveTemporaryParquetFile(path); });
   auto schema = arrow::schema({arrow::field("payload", arrow::binary())});
   arrow::BinaryBuilder builder;
   ASSERT_TRUE(builder.Append(std::string(4096, 'x')).ok());
@@ -592,7 +607,7 @@ TEST_F(ParquetBudgetTest,
          std::to_string(
              std::chrono::steady_clock::now().time_since_epoch().count()));
     auto cleanup =
-        ailego::ScopeGuard::Make([&] { std::filesystem::remove(path); });
+        ailego::ScopeGuard::Make([&] { RemoveTemporaryParquetFile(path); });
     if (entry == 0) {
       auto writer =
           ChunkedFileWriter::Open(path.string(), schema, FileFormat::PARQUET);
@@ -628,11 +643,14 @@ TEST_F(ParquetBudgetTest,
         EXPECT_TRUE(chunk->statistics()->HasMinMax());
       }
     }
+    file.reset();
     auto input = arrow::io::ReadableFile::Open(path.string()).ValueOrDie();
     auto reader = parquet::arrow::OpenFile(input, arrow::default_memory_pool())
                       .ValueOrDie();
     std::shared_ptr<arrow::Table> actual;
     ASSERT_TRUE(reader->ReadTable(&actual).ok());
+    reader.reset();
+    ASSERT_TRUE(input->Close().ok());
     EXPECT_TRUE(actual->Equals(*expected));
   }
 }
