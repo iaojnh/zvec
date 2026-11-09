@@ -995,11 +995,16 @@ TEST(IndexInterface, IvfBufferPoolDefersWarmupUntilReads) {
                    .with_n_iters(4)
                    .build();
   auto verify_lazy_reads = [&](const Index::Pointer &index) {
-    const size_t open_page_bytes = memory_pool.stats().page_used;
+    const auto cached_payload_bytes = [&]() {
+      return memory_pool.stats().page_used +
+             zvec::ailego::MemoryLimitPool::get_instance().evictable_cache_used();
+    };
+    const size_t open_cache_bytes = cached_payload_bytes();
     ASSERT_GT(memory_pool.metadata_used(), 0u);
-    // Opening may read headers and centroids, but not all posting-list pages.
+    // Count both page and Chunk caches, excluding prepaid execution workspace.
+    // Opening may read headers and centroids, but not all posting-list payloads.
     // The pool fits the entire index, so eviction cannot hide eager warmup.
-    ASSERT_LT(open_page_bytes, kVectorBytes / 2);
+    ASSERT_LT(open_cache_bytes, kVectorBytes / 2);
 
     for (uint32_t id : {0U, 127U, 511U, 895U, 1023U}) {
       VectorDataBuffer fetched;
@@ -1011,7 +1016,7 @@ TEST(IndexInterface, IvfBufferPoolDefersWarmupUntilReads) {
         ASSERT_FLOAT_EQ(static_cast<float>(id), values[dim]);
       }
     }
-    EXPECT_GT(memory_pool.stats().page_used, open_page_bytes);
+    EXPECT_GT(cached_payload_bytes(), open_cache_bytes);
 
     std::vector<float> vector(kDimension, 511.0f);
     VectorData query{DenseVector{vector.data()}};
