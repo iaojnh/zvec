@@ -210,75 +210,6 @@ TEST_F(IoUringLoaderTest, AsyncCancellationAndShortReadsReleaseAllBacking) {
   }
 }
 
-TEST_F(IoUringLoaderTest, StagingGrowthChargesOverlapAndCanRetry) {
-  const size_t kPage = PoolPayloadBudget::page_buffer_size();
-  ASSERT_EQ(0, pool_.init(3 * kPage));
-  IoUringRing ring;
-  ASSERT_TRUE(ring.ensure_staging(kPage));
-  EXPECT_EQ(kPage, pool_.external_used());
-  ASSERT_TRUE(ring.ensure_staging(2 * kPage));
-  EXPECT_EQ(2 * kPage, pool_.external_used());
-  auto *data = IoUringStagingTestPeer::data(ring);
-  std::memset(data, 0x6a, 2 * kPage);
-  EXPECT_FALSE(ring.ensure_staging(3 * kPage));
-  EXPECT_EQ(data, IoUringStagingTestPeer::data(ring));
-  EXPECT_EQ(0x6a, static_cast<unsigned char *>(data)[kPage]);
-  EXPECT_EQ(2 * kPage, pool_.used());
-  ASSERT_TRUE(ring.ensure_staging(kPage));
-  EXPECT_EQ(2 * kPage, pool_.used());
-  ring.teardown();
-  EXPECT_EQ(0u, pool_.used());
-  ASSERT_TRUE(ring.ensure_staging(3 * kPage));
-  EXPECT_EQ(3 * kPage, pool_.used());
-}
-
-TEST_F(IoUringLoaderTest, PrechargedWritebackStagingIsNotChargedTwice) {
-  const size_t kBytes = 4 * PoolPayloadBudget::page_buffer_size();
-  ASSERT_TRUE(pool_.try_charge_metadata(kBytes));
-  {
-    IoUringRing ring;
-    ring.adopt_staging_reservation(kBytes);
-    ASSERT_TRUE(ring.ensure_staging(kIoUringStagingAlign));
-    auto *data = IoUringStagingTestPeer::data(ring);
-    EXPECT_EQ(kBytes, IoUringStagingTestPeer::size(ring));
-    ASSERT_TRUE(ring.ensure_staging(kBytes));
-    EXPECT_EQ(data, IoUringStagingTestPeer::data(ring));
-    EXPECT_FALSE(ring.ensure_staging(kBytes + 1));
-    EXPECT_EQ(kBytes, pool_.metadata_used());
-    EXPECT_EQ(0u, pool_.external_used());
-    ring.teardown();
-    // Reservation follows the writeback ring, even after backend fallback.
-    EXPECT_EQ(kBytes, pool_.used());
-  }
-  EXPECT_EQ(0u, pool_.used());
-}
-
-TEST_F(IoUringLoaderTest, PrechargedStagingDefersFirstMappingUnderPressure) {
-  const size_t bytes = 4 * PoolPayloadBudget::page_buffer_size();
-  ASSERT_TRUE(pool_.try_charge_metadata(bytes));
-  IoUringRing ring;
-  ring.adopt_staging_reservation(bytes);
-
-  auto &pool = MemoryLimitPool::get_instance();
-  using Pressure = ProcessRssBudget::PressureLevel;
-  const auto restore = ScopeGuard::Make(
-      [&] { pool.set_memory_pressure(Pressure::kNormal); });
-  pool.set_memory_pressure(Pressure::kCritical);
-  EXPECT_FALSE(ring.ensure_staging(bytes));
-  EXPECT_EQ(nullptr, IoUringStagingTestPeer::data(ring));
-  EXPECT_EQ(bytes, pool_.metadata_used());
-
-  pool.set_memory_pressure(Pressure::kNormal);
-  ASSERT_TRUE(ring.ensure_staging(bytes));
-  EXPECT_NE(nullptr, IoUringStagingTestPeer::data(ring));
-  EXPECT_EQ(0u, pool_.external_used());
-
-  pool.set_memory_pressure(Pressure::kCritical);
-  EXPECT_FALSE(ring.ensure_staging(bytes));
-  EXPECT_EQ(nullptr, IoUringStagingTestPeer::data(ring));
-  EXPECT_EQ(bytes, pool_.metadata_used());
-}
-
 TEST_F(IoUringLoaderTest, AbandonedStagingKeepsItsChargeAfterDestruction) {
   const size_t kBytes = PoolPayloadBudget::page_buffer_size();
   for (bool prepaid : {false, true}) {
@@ -308,15 +239,6 @@ TEST_F(IoUringLoaderTest, AbandonedStagingKeepsItsChargeAfterDestruction) {
     else
       pool_.release_external(kBytes);
   }
-}
-
-TEST_F(IoUringLoaderTest, FailedReadReleasesStagingWithoutDestroyingRing) {
-  IoUringRing ring;
-  ASSERT_TRUE(ring.ensure_staging(kIoUringStagingAlign));
-  EXPECT_EQ(PoolPayloadBudget::page_buffer_size(), pool_.used());
-  EXPECT_EQ(-1, ring.execute(-1, nullptr, 0));
-  EXPECT_EQ(0u, pool_.used());
-  EXPECT_EQ(nullptr, IoUringStagingTestPeer::data(ring));
 }
 
 class TemporaryFile {

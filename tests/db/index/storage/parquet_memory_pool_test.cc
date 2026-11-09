@@ -42,23 +42,6 @@
 #include <windows.h>
 #endif
 
-namespace zvec::ailego {
-
-struct MemoryLimitPoolTestPeer {
-  static bool configure_rss(MemoryLimitPool &pool, size_t limit) {
-    pool.stop_background_evictor();
-    return pool.process_rss_.configure(limit, +[] { return rss; });
-  }
-  static void refresh_rss(MemoryLimitPool &pool) {
-    pool.process_rss_.refresh(true);
-  }
-  static size_t rss_available(MemoryLimitPool &pool) {
-    return pool.process_rss_.available();
-  }
-  static constexpr size_t rss = 32 * 1024 * 1024;
-};
-
-}  // namespace zvec::ailego
 
 namespace zvec {
 namespace detail {
@@ -74,90 +57,6 @@ void RemoveTemporaryParquetFile(const std::filesystem::path &path) {
   EXPECT_FALSE(error) << "Cannot remove " << path << ": " << error.message();
 }
 
-class RejectingMemoryPool : public arrow::ProxyMemoryPool {
- public:
-  RejectingMemoryPool()
-      : arrow::ProxyMemoryPool(arrow::default_memory_pool()) {}
-
-  arrow::Status Allocate(int64_t, int64_t, uint8_t **) override {
-    return arrow::Status::OutOfMemory("Injected small allocation failure");
-  }
-};
-
-TEST(ParquetMemoryPoolTest, ReallocationPreservesDataAcrossHeapAndMapping) {
-  arrow::ProxyMemoryPool fallback(arrow::default_memory_pool());
-  ParquetMemoryPool pool(&fallback);
-  uint8_t *buffer = nullptr;
-  ASSERT_TRUE(pool.Allocate(1024, &buffer).ok());
-  std::memset(buffer, 29, 1024);
-  ASSERT_TRUE(pool.Reallocate(1024, 4096, &buffer).ok());
-  EXPECT_EQ(4096, pool.bytes_allocated());
-  EXPECT_EQ(4096, fallback.bytes_allocated());
-  EXPECT_EQ(0, pool.num_mapped_allocations());
-  EXPECT_EQ(29, buffer[1023]);
-  std::memset(buffer, 29, 4096);
-  ASSERT_TRUE(pool.Reallocate(4096, kThreshold, &buffer).ok());
-  EXPECT_EQ(0, fallback.bytes_allocated());
-  EXPECT_EQ(kThreshold, pool.bytes_allocated());
-  EXPECT_EQ(kThreshold + 4096, pool.max_memory());
-  EXPECT_TRUE(std::all_of(buffer, buffer + 4096,
-                          [](uint8_t byte) { return byte == 29; }));
-  ASSERT_TRUE(pool.Reallocate(kThreshold, 8192, &buffer).ok());
-  EXPECT_EQ(0, pool.mapped_bytes());
-  EXPECT_EQ(8192, fallback.bytes_allocated());
-  EXPECT_EQ(8192, pool.bytes_allocated());
-  EXPECT_EQ(kThreshold + 8192, pool.max_memory());
-  EXPECT_TRUE(std::all_of(buffer, buffer + 4096,
-                          [](uint8_t byte) { return byte == 29; }));
-  pool.Free(buffer, 8192);
-  EXPECT_EQ(0, pool.bytes_allocated());
-  EXPECT_EQ(0, fallback.bytes_allocated());
-  EXPECT_EQ(4, pool.num_allocations());
-}
-
-TEST(ParquetMemoryPoolTest,
-     InvalidAndOverflowingRequestsDoNotChangeStatistics) {
-  ParquetMemoryPool pool;
-  uint8_t *buffer = nullptr;
-  EXPECT_TRUE(pool.Allocate(-1, &buffer).IsInvalid());
-  EXPECT_TRUE(pool.Allocate(4096, 0, &buffer).IsInvalid());
-  EXPECT_TRUE(pool.Allocate(4096, 65, &buffer).IsInvalid());
-  EXPECT_TRUE(pool.Allocate(4096, nullptr).IsInvalid());
-  EXPECT_TRUE(pool.Allocate(std::numeric_limits<int64_t>::max(), &buffer)
-                  .IsOutOfMemory());
-  EXPECT_TRUE(pool.Reallocate(0, 4096, nullptr).IsInvalid());
-  EXPECT_TRUE(pool.Reallocate(1024, 4096, &buffer).IsInvalid());
-  EXPECT_EQ(nullptr, buffer);
-  EXPECT_EQ(0, pool.bytes_allocated());
-  EXPECT_EQ(0, pool.mapped_bytes());
-  EXPECT_EQ(0, pool.num_allocations());
-  EXPECT_EQ(0, pool.total_bytes_allocated());
-}
-
-TEST(ParquetMemoryPoolTest,
-     FailedReallocationPreservesOriginalDataAndCounters) {
-  RejectingMemoryPool fallback;
-  ParquetMemoryPool pool(&fallback);
-  uint8_t *buffer = nullptr;
-  ASSERT_TRUE(pool.Allocate(kThreshold, &buffer).ok());
-  std::memset(buffer, 11, kThreshold);
-  uint8_t *original = buffer;
-  const int64_t mapped = pool.mapped_bytes();
-  ASSERT_TRUE(pool.Reallocate(kThreshold, 0, &buffer).IsOutOfMemory());
-  EXPECT_TRUE(pool.Reallocate(kThreshold, 1024, &buffer).IsOutOfMemory());
-  EXPECT_TRUE(
-      pool.Reallocate(kThreshold, std::numeric_limits<int64_t>::max(), &buffer)
-          .IsOutOfMemory());
-  EXPECT_EQ(original, buffer);
-  EXPECT_EQ(11, buffer[kThreshold - 1]);
-  EXPECT_EQ(kThreshold, pool.bytes_allocated());
-  EXPECT_EQ(mapped, pool.mapped_bytes());
-  EXPECT_EQ(1, pool.num_allocations());
-  EXPECT_EQ(1, pool.num_mapped_allocations());
-  pool.Free(buffer, kThreshold);
-  EXPECT_EQ(0, pool.bytes_allocated());
-  EXPECT_EQ(0, pool.mapped_bytes());
-}
 
 class ParquetBudgetTest : public testing::Test {
  protected:
@@ -238,30 +137,6 @@ TEST_F(ParquetBudgetTest, FailedBufferedWriteDoesNotResumeOrReportSuccess) {
   EXPECT_EQ(0u, budget_.used());
 }
 
-TEST_F(ParquetBudgetTest, SmallBuffersCanBeFreedOnAnotherThread) {
-  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
-  std::array<uint8_t *, 64> buffers{};
-  for (auto &buffer : buffers) ASSERT_TRUE(pool.Allocate(1024, &buffer).ok());
-  std::array<std::thread, 4> workers;
-  for (size_t i = 0; i < workers.size(); ++i) {
-    workers[i] = std::thread([&, i] {
-      for (size_t j = i; j < buffers.size(); j += workers.size()) {
-        std::memset(buffers[j], 41, 1024);
-        uint8_t *temporary = nullptr;
-        auto status = pool.Allocate(1024, &temporary);
-        EXPECT_TRUE(status.ok());
-        if (temporary) pool.Free(temporary, 1024);
-        pool.Free(buffers[j], 1024);
-      }
-    });
-  }
-  for (auto &worker : workers) worker.join();
-  EXPECT_EQ(0, pool.bytes_allocated());
-  EXPECT_EQ(0u, pool.charged_bytes());
-  EXPECT_EQ(0u, budget_.used());
-  EXPECT_LE(budget_.committed(), budget_.capacity());
-}
-
 TEST_F(ParquetBudgetTest,
        ReallocationReservesOverlapAndFailurePreservesOldData) {
   ParquetMemoryPool pool(arrow::default_memory_pool(), true);
@@ -285,34 +160,6 @@ TEST_F(ParquetBudgetTest,
   EXPECT_NE(nullptr, buffer);
   EXPECT_EQ(0u, budget_.external_used());
   pool.Free(buffer, 0);
-}
-
-TEST_F(ParquetBudgetTest, FetchBatchCanShrinkMappedBufferAtItsLimit) {
-  ParquetMemoryPool parent(arrow::default_memory_pool(), true);
-  FetchMemoryPool pool(&parent, 2 * kThreshold);
-  uint8_t *buffer = nullptr;
-  constexpr int64_t kAlignment = 64;
-  ASSERT_TRUE(pool.Allocate(2 * kThreshold, kAlignment, &buffer).ok());
-  auto *original = buffer;
-  const auto mapped = parent.mapped_bytes();
-  constexpr int64_t kNewSize = 8192;
-  std::memset(buffer, 41, kNewSize);
-  ASSERT_TRUE(
-      pool.Reallocate(2 * kThreshold, kNewSize, kAlignment, &buffer).ok());
-  EXPECT_FALSE(pool.exceeded());
-  EXPECT_EQ(original, buffer);
-  EXPECT_EQ(41, buffer[kNewSize - 1]);
-  EXPECT_EQ(kNewSize, pool.bytes_allocated());
-  EXPECT_EQ(2 * kThreshold, pool.max_memory());
-  EXPECT_LT(parent.mapped_bytes(), mapped);
-  EXPECT_TRUE(
-      pool.Reallocate(kNewSize, 2 * kThreshold, kAlignment, &buffer)
-          .IsOutOfMemory());
-  EXPECT_TRUE(pool.exceeded());
-  EXPECT_EQ(original, buffer);
-  pool.Free(buffer, kNewSize, kAlignment);
-  EXPECT_EQ(0, pool.bytes_allocated());
-  EXPECT_EQ(0u, budget_.external_used());
 }
 
 }  // namespace

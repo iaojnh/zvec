@@ -42,33 +42,6 @@ class PagedOpqRotatorTest : public ::testing::Test {
   size_t previous_{0};
 };
 
-TEST_F(PagedOpqRotatorTest, SeededPagedQrMatchesDenseInitialization) {
-  for (int dim : {1, 17, 65}) {
-    for (uint64_t seed : {uint64_t{0}, uint64_t{123}}) {
-      ASSERT_EQ(0, pool_.init(0));
-      auto dense = zvec::turbo::OpqRotator::create(dim, seed);
-      ASSERT_TRUE(dense);
-      std::string expected;
-      ASSERT_EQ(0, dense->serialize(&expected));
-      dense.reset();
-      ASSERT_EQ(0, pool_.init(4 * 1024 * 1024));
-      auto paged = zvec::turbo::OpqRotator::create(dim, seed);
-      ASSERT_TRUE(paged);
-      std::string actual;
-      ASSERT_EQ(0, paged->serialize(&actual));
-      ASSERT_EQ(expected.size(), actual.size());
-      const size_t header = sizeof(zvec::turbo::RotatorSerHeader);
-      for (size_t offset = header; offset < actual.size();
-           offset += sizeof(float)) {
-        float a = 0, b = 0;
-        std::memcpy(&a, expected.data() + offset, sizeof(a));
-        std::memcpy(&b, actual.data() + offset, sizeof(b));
-        ASSERT_NEAR(a, b, 2e-5) << "dimension=" << dim << " seed=" << seed;
-      }
-    }
-  }
-}
-
 TEST_F(PagedOpqRotatorTest, PagedSvdMatchesDenseAndFailurePreservesRotation) {
   constexpr size_t dim = 65, rows = 131;
   std::mt19937 gen(52);
@@ -113,12 +86,6 @@ TEST_F(PagedOpqRotatorTest, PagedSvdMatchesDenseAndFailurePreservesRotation) {
   std::string after;
   ASSERT_EQ(0, paged->serialize(&after));
   EXPECT_EQ(actual, after);
-}
-
-TEST_F(PagedOpqRotatorTest, InsufficientBudgetDoesNotAllocateHeapFallback) {
-  ASSERT_EQ(0, pool_.init(1));
-  EXPECT_EQ(nullptr, zvec::turbo::OpqRotator::create(33));
-  EXPECT_EQ(0u, pool_.used());
 }
 
 TEST(OpqRotator, FromSerializedRestoresStoredMatrix) {

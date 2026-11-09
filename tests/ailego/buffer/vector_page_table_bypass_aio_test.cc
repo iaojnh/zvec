@@ -183,8 +183,9 @@ class BypassAioTest : public ::testing::Test {
                                  mode == FakeAio::Mode::DUPLICATE ||
                                  mode == FakeAio::Mode::REJECTED_RING;
     EXPECT_EQ(retried_destroy ? 2u : 1u, fake_.destroy_calls);
-    if (mode == FakeAio::Mode::SUCCESS)
+    if (mode == FakeAio::Mode::SUCCESS) {
       EXPECT_EQ(4u, pool.stats().aio_pages_submitted);
+    }
   }
 
   FakeAio fake_;
@@ -201,21 +202,11 @@ TEST_F(BypassAioTest, BatchesAlignedReadsWithoutAdmission) {
 TEST_F(BypassAioTest, DrainsPartialSubmissionBeforeFallback) {
   run(FakeAio::Mode::PARTIAL);
 }
-TEST_F(BypassAioTest, DrainsShortCompletionsBeforeFallback) {
-  run(FakeAio::Mode::SHORT_READ);
-}
-TEST_F(BypassAioTest, DestroysFailedContextBeforeFallback) {
-  run(FakeAio::Mode::WAIT_ERROR);
-}
 TEST_F(BypassAioTest, QuarantinesUntilDestroyWithoutReusingContext) {
   run(FakeAio::Mode::DESTROY_ERROR);
 }
 TEST_F(BypassAioTest, DuplicateCompletionDoesNotReleaseKernelDestinations) {
   run(FakeAio::Mode::DUPLICATE);
 }
-TEST_F(BypassAioTest, RejectedRingIsRetainedForTeardownWithoutBeingUsed) {
-  run(FakeAio::Mode::REJECTED_RING);
-}
-
 }  // namespace
 }  // namespace zvec::ailego

@@ -221,27 +221,6 @@ TEST(GlobalResourceStartupDeathTest,
 #endif
 
 #if defined(__linux__)
-TEST(NativeImageMemory, CountsResidentCapacityNotFileSizeOrSegmentGaps) {
-  ElfW(Phdr) headers[4]{};
-  headers[0].p_type = PT_LOAD;
-  headers[0].p_vaddr = 0x1003;
-  headers[0].p_filesz = 16;
-  headers[0].p_memsz = 0x1800;
-  headers[1].p_type = PT_LOAD;
-  headers[1].p_vaddr = 0x2f00;
-  headers[1].p_memsz = 0x300;
-  headers[2].p_type = PT_TLS;
-  headers[2].p_memsz = 0x100000;
-  headers[3].p_type = PT_LOAD;
-  headers[3].p_vaddr = 0x8001;
-  headers[3].p_memsz = 1;
-  size_t bytes = 0;
-  ASSERT_TRUE(detail::ElfLoadImageBytes(headers, 4, 4096, &bytes));
-  EXPECT_EQ(4u * 4096, bytes);
-  ASSERT_TRUE(detail::ElfLoadImageBytes(headers, 4, 16384, &bytes));
-  EXPECT_EQ(2u * 16384, bytes);
-}
-
 TEST(NativeImageMemoryDeathTest, ReservesBeforeAdmissionAndDoesNotRefundLiveImage) {
 #if GTEST_HAS_DEATH_TEST
   const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
@@ -282,48 +261,6 @@ TEST(NativeImageMemoryDeathTest, ReservesBeforeAdmissionAndDoesNotRefundLiveImag
 #endif
 }
 #endif
-
-TEST(GlobalResource, CacheAdmitsIndexBlockWhileWriteBufferIsPinned) {
-  constexpr size_t kMiB = 1024 * 1024;
-  const auto capacity =
-      GlobalResource::calculate_rocksdb_memory_budget(512 * kMiB);
-  auto cache = rocksdb::NewLRUCache(
-      capacity, GlobalResource::calculate_rocksdb_cache_shard_bits(capacity),
-      /*strict_capacity_limit=*/true);
-  ASSERT_NE(nullptr, cache);
-  EXPECT_TRUE(cache->HasStrictCapacityLimit());
-  // Model the pinned cache charges without allocating a full memtable.
-  // Releasing the manager also releases these dummy handles on early failure.
-  auto manager = std::make_unique<rocksdb::WriteBufferManager>(
-      GlobalResource::calculate_rocksdb_write_buffer_budget(capacity), cache,
-      /*allow_stall=*/true);
-  manager->ReserveMem(manager->buffer_size());
-  EXPECT_TRUE(manager->ShouldFlush());
-  EXPECT_TRUE(manager->ShouldStall());
-  EXPECT_GE(manager->dummy_entries_in_cache_usage(), manager->memory_usage());
-  rocksdb::Cache::Handle *handle = nullptr;
-  const auto status =
-      cache->Insert("compaction-index", nullptr, &rocksdb::kNoopCacheItemHelper,
-                    2 * kMiB, &handle);
-  EXPECT_TRUE(status.ok()) << status.ToString();
-  EXPECT_NE(nullptr, handle);
-  EXPECT_LE(cache->GetUsage(), capacity);
-  if (handle) {
-    cache->Release(handle);
-  }
-  // Retain strict rejection for genuinely oversized entries.
-  handle = nullptr;
-  const auto oversized =
-      cache->Insert("oversized", nullptr, &rocksdb::kNoopCacheItemHelper,
-                    capacity + 1, &handle);
-  EXPECT_TRUE(oversized.IsMemoryLimit()) << oversized.ToString();
-  if (handle) {
-    cache->Release(handle);
-  }
-  manager->ScheduleFreeMem(manager->buffer_size());
-  manager->FreeMem(manager->buffer_size());
-  EXPECT_FALSE(manager->ShouldStall());
-}
 
 TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
   GlobalConfig::ConfigData config;

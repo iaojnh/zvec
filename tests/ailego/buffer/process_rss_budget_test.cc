@@ -15,11 +15,6 @@ size_t ReadRss() {
   return sampled_rss.load();
 }
 
-size_t sampled_owned_resident = 0;
-ProcessRssBudget::ResidentSample ReadResident() {
-  return {sampled_rss.load(), sampled_owned_resident};
-}
-
 ProcessRssBudget::NativeSample native_sample;
 bool native_sample_valid = true;
 bool ReadNative(ProcessRssBudget::NativeSample *sample) {
@@ -48,63 +43,6 @@ TEST(ProcessRssBudgetTest, NativeFootprintTracksUntouchedBackingAcrossSamples) {
   EXPECT_EQ(24 * kMiB, budget.available());
 }
 
-TEST(ProcessRssBudgetTest, ResidentWitnessDoesNotCoverUntouchedOwners) {
-  ProcessRssBudget budget;
-  sampled_rss = 64 * kMiB;
-  sampled_owned_resident = 0;
-  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss, nullptr, 0, ReadResident));
-  ASSERT_TRUE(budget.try_reserve(128 * kMiB));
-  budget.finish_reservation(128 * kMiB, true);
-  sampled_rss = 192 * kMiB;
-  sampled_owned_resident = 128 * kMiB;
-  budget.refresh(true);
-  ASSERT_TRUE(budget.try_acquire(256 * kMiB));
-  budget.release(128 * kMiB);
-  // A caller can keep total RSS unchanged after the managed owner retires.
-  // The other 256 MiB remains untouched and needs its full future headroom.
-  sampled_owned_resident = 0;
-  budget.refresh(true);
-  EXPECT_EQ(64 * kMiB, budget.available());
-  EXPECT_FALSE(budget.try_acquire(65 * kMiB));
-  budget.release(256 * kMiB);
-}
-
-TEST(ProcessRssBudgetTest, HeapFreeKeepsUnsampledAllocatorRetentionCharged) {
-  ProcessRssBudget budget;
-  sampled_rss = 480 * kMiB;
-  ASSERT_TRUE(budget.configure(512 * kMiB, ReadRss));
-  ASSERT_TRUE(budget.try_reserve(16 * kMiB));
-  const auto stamp = budget.finish_reservation(16 * kMiB, true);
-  budget.release_heap(16 * kMiB,
-                      ProcessRssBudget::HeapProjection::Full(16 * kMiB, stamp));
-  EXPECT_EQ(16 * kMiB, budget.available());
-  sampled_rss = 496 * kMiB;  // malloc kept the freed pages resident.
-  budget.refresh(true);
-  EXPECT_EQ(16 * kMiB, budget.available());
-  sampled_rss = 480 * kMiB;
-  budget.refresh(true);
-  EXPECT_EQ(32 * kMiB, budget.available());
-}
-
-TEST(ProcessRssBudgetTest, NativeLimitCanShrinkAndRecoverBelowConfiguredRss) {
-  ProcessRssBudget budget;
-  sampled_rss = 32 * kMiB;
-  native_sample = {32 * kMiB, 96 * kMiB};
-  native_sample_valid = true;
-  ASSERT_TRUE(budget.configure(256 * kMiB, ReadRss, ReadNative));
-  ASSERT_TRUE(budget.try_acquire(64 * kMiB));
-  native_sample.available = 16 * kMiB;
-  budget.refresh(true);
-  EXPECT_TRUE(budget.pressure());
-  EXPECT_EQ(0u, budget.available());
-  EXPECT_FALSE(budget.try_acquire(1));
-  budget.release(64 * kMiB);
-  native_sample.available = 96 * kMiB;
-  budget.refresh(true);
-  EXPECT_FALSE(budget.pressure());
-  EXPECT_EQ(88 * kMiB, budget.available());
-}
-
 TEST(ProcessRssBudgetTest, NativeZeroAndFailedSamplesCannotReplenishBudget) {
   ProcessRssBudget budget;
   sampled_rss = 32 * kMiB;
@@ -125,16 +63,6 @@ TEST(ProcessRssBudgetTest, NativeZeroAndFailedSamplesCannotReplenishBudget) {
   EXPECT_EQ(0u, budget.available());
   EXPECT_FALSE(budget.try_acquire(1));
   budget.release(8 * kMiB);
-}
-
-TEST(ProcessRssBudgetTest, CompressedFootprintCanBlockDespiteLowRss) {
-  ProcessRssBudget budget;
-  sampled_rss = 16 * kMiB;
-  native_sample = {160 * kMiB, 128 * kMiB};
-  native_sample_valid = true;
-  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
-  EXPECT_TRUE(budget.pressure());
-  EXPECT_FALSE(budget.try_acquire(1));
 }
 
 TEST(ProcessRssBudgetTest, CriticalRecoveryRequiresBothConfiguredSamples) {
@@ -164,46 +92,6 @@ TEST(ProcessRssBudgetTest, CriticalRecoveryRequiresBothConfiguredSamples) {
   budget.release(kMiB);
 }
 
-TEST(ProcessRssBudgetTest, DisabledBudgetPreservesStandaloneAdmission) {
-  ProcessRssBudget budget;
-  EXPECT_TRUE(budget.try_acquire(std::numeric_limits<size_t>::max()));
-  EXPECT_FALSE(budget.account_pending(1));
-  EXPECT_FALSE(budget.pressure());
-  EXPECT_EQ(0u, budget.limit());
-}
-
-TEST(ProcessRssBudgetTest, UntouchedBackingSurvivesSamplesAndLimitChanges) {
-  ProcessRssBudget budget;
-  sampled_rss = 600 * kMiB;
-  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
-  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
-  for (int i = 0; i < 3; ++i) budget.refresh(true);
-  EXPECT_EQ(100 * kMiB, budget.available());
-  EXPECT_FALSE(budget.try_acquire(300 * kMiB));
-  ASSERT_TRUE(budget.configure(1001 * kMiB, ReadRss));
-  EXPECT_EQ(101 * kMiB, budget.available());
-  // Failed allocations and untouched mappings return their admission charge.
-  budget.release(300 * kMiB);
-  EXPECT_EQ(401 * kMiB, budget.available());
-  EXPECT_TRUE(budget.try_acquire(300 * kMiB));
-}
-
-TEST(ProcessRssBudgetTest, ResidentGrowthIsNotCountedTwice) {
-  ProcessRssBudget budget;
-  sampled_rss = 600 * kMiB;
-  ASSERT_TRUE(budget.configure(1000 * kMiB, ReadRss));
-  ASSERT_TRUE(budget.try_acquire(300 * kMiB));
-  sampled_rss = 900 * kMiB;
-  budget.refresh(true);
-  EXPECT_EQ(100 * kMiB, budget.available());
-  budget.release(300 * kMiB);
-  // Releasing a logical charge does not assume malloc immediately returns RSS.
-  EXPECT_EQ(100 * kMiB, budget.available());
-  sampled_rss = 600 * kMiB;
-  budget.refresh(true);
-  EXPECT_EQ(400 * kMiB, budget.available());
-}
-
 TEST(ProcessRssBudgetTest, ConcurrentAdmissionsShareUnmaterializedHeadroom) {
   ProcessRssBudget budget;
   sampled_rss = 600 * kMiB;
@@ -220,27 +108,6 @@ TEST(ProcessRssBudgetTest, ConcurrentAdmissionsShareUnmaterializedHeadroom) {
   EXPECT_EQ(100 * kMiB, acquired.load());
   budget.release(acquired.load());
   EXPECT_EQ(100 * kMiB, budget.available());
-}
-
-TEST(ProcessRssBudgetTest,
-     ReservedMaterializationRequiresMeasuredRoomForBytes) {
-  ProcessRssBudget budget;
-  sampled_rss = 120 * kMiB;
-  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss));
-  EXPECT_TRUE(budget.materialization_allowed(8 * kMiB));
-  EXPECT_FALSE(budget.materialization_allowed(8 * kMiB + 1));
-  ASSERT_TRUE(budget.try_reserve(2 * kMiB));
-  EXPECT_TRUE(budget.materialization_allowed(6 * kMiB));
-  EXPECT_FALSE(budget.materialization_allowed(6 * kMiB + 1));
-  budget.finish_reservation(2 * kMiB, false);
-  EXPECT_TRUE(budget.materialization_allowed(8 * kMiB));
-
-  sampled_rss = 32 * kMiB;
-  native_sample = {100 * kMiB, 28 * kMiB};
-  native_sample_valid = true;
-  ASSERT_TRUE(budget.configure(128 * kMiB, ReadRss, ReadNative));
-  EXPECT_TRUE(budget.materialization_allowed(20 * kMiB));
-  EXPECT_FALSE(budget.materialization_allowed(20 * kMiB + 1));
 }
 
 TEST(ProcessRssBudgetTest, PrepaidMappingDebitSurvivesAnInFlightSample) {

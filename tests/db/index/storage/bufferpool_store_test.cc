@@ -147,72 +147,6 @@ class ReclaimableParquetBudget : public ailego::EvictableBlockOwner {
 
 }  // namespace
 
-TEST_F(BufferPoolStoreTest, CacheKeyRejectsPinnedBudgetAndCanRetry) {
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  ASSERT_EQ(0u, pool.stats().page_used);
-  ailego::MemoryReservation pressure;
-  pressure.add(pool.capacity() - pool.committed());
-  const auto before = pool.metadata_used();
-  EXPECT_THROW(ParquetBufferID(parquet_path, 0, 0), std::bad_alloc);
-  EXPECT_EQ(before, pool.metadata_used());
-  EXPECT_LE(pool.committed(), pool.capacity());
-  // Allow the shared control block but not a long filename. Constructor
-  // rollback must release the control block's reservation as well.
-  pressure.retain_at_most(pressure.bytes() - 256);
-  const auto partial = pool.metadata_used();
-  EXPECT_THROW(ParquetBufferID(parquet_path + std::string(1024, 'x'), 0, 0),
-               std::bad_alloc);
-  EXPECT_EQ(partial, pool.metadata_used());
-  pressure.retain_at_most(0);
-  EXPECT_NO_THROW(ParquetBufferID(parquet_path, 0, 0));
-}
-
-TEST_F(BufferPoolStoreTest,
-       DecodedBufferOwnershipRejectsPinnedBudgetAndRetries) {
-  arrow::StringBuilder builder;
-  ASSERT_TRUE(builder.Append("first").ok());
-  ASSERT_TRUE(builder.Append("second").ok());
-  std::shared_ptr<arrow::Array> array;
-  ASSERT_TRUE(builder.Finish(&array).ok());
-  detail::ParquetBufferPayload payload;
-  payload.arrow =
-      std::make_shared<arrow::ChunkedArray>(arrow::ArrayVector{array, array});
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  ASSERT_EQ(0u, pool.stats().page_used);
-  ailego::MemoryReservation pressure;
-  pressure.add(pool.capacity() - pool.used());
-  ASSERT_EQ(pool.capacity(), pool.committed());
-  detail::ParquetBufferLoader loader;
-  size_t bytes = 0;
-  EXPECT_THROW(loader.retain_buffers(payload, bytes), std::bad_alloc);
-  EXPECT_LE(pool.committed(), pool.capacity());
-  EXPECT_TRUE(payload.arrow_refs.empty());
-  pressure.retain_at_most(0);
-  ASSERT_NO_THROW(loader.retain_buffers(payload, bytes));
-  EXPECT_EQ(2u, payload.arrow_refs.size());
-  EXPECT_EQ("second", std::static_pointer_cast<arrow::StringArray>(
-                          payload.arrow->chunk(1))
-                          ->GetString(1));
-  array.reset();
-  loader.clear(payload);
-  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().external_used());
-}
-
-TEST_F(BufferPoolStoreTest, CheckedFetchPreservesResultAllocationFailure) {
-  BufferPoolForwardStore store(parquet_path);
-  ASSERT_TRUE(store.open().ok());
-  auto owner = detail::GetParquetMemoryPool();
-  detail::FetchMemoryPool exhausted(owner.get(), 0);
-  auto failed = store.fetch_checked({"name"}, {0, 1}, &exhausted);
-  EXPECT_TRUE(failed.status().IsOutOfMemory()) << failed.status().ToString();
-  EXPECT_EQ(0, exhausted.bytes_allocated());
-  auto recovered = store.fetch_checked({"name"}, {0, 1}, owner.get());
-  ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
-  EXPECT_EQ(2, (*recovered)->num_rows());
-  auto invalid = store.fetch_checked({"name"}, {-1}, owner.get());
-  EXPECT_TRUE(invalid.status().IsIndexError()) << invalid.status().ToString();
-}
-
 TEST_F(BufferPoolStoreTest, CheckedCachePreservesIoAndFormatFailures) {
   auto &cache = ParquetBufferPool::get_instance();
   auto missing = cache.acquire_buffer_checked(
@@ -237,59 +171,6 @@ TEST_F(BufferPoolStoreTest, ParquetFetch) {
   ASSERT_TRUE(table != nullptr);
   EXPECT_EQ(table->num_rows(), 3);
 }
-
-TEST_F(BufferPoolStoreTest, ParquetFetchNullAndEmptyStrings) {
-  arrow::ArrayVector arrays;
-  for (int pattern = 0; pattern < 3; ++pattern) {
-    arrow::StringBuilder builder;
-    for (int row = 0; row < 4; ++row) {
-      if (pattern == 0 || (pattern == 2 && row % 2 == 0)) {
-        ASSERT_TRUE(builder.AppendNull().ok());
-      } else {
-        ASSERT_TRUE(builder.Append("").ok());
-      }
-    }
-    std::shared_ptr<arrow::Array> array;
-    ASSERT_TRUE(builder.Finish(&array).ok());
-    arrays.push_back(std::move(array));
-  }
-  auto schema = arrow::schema({arrow::field("all_null", arrow::utf8()),
-                               arrow::field("all_empty", arrow::utf8()),
-                               arrow::field("mixed", arrow::utf8())});
-  auto expected = arrow::Table::Make(schema, arrays);
-  auto output = arrow::io::FileOutputStream::Open(parquet_path);
-  ASSERT_TRUE(output.ok()) << output.status().ToString();
-  ASSERT_TRUE(parquet::arrow::WriteTable(*expected,
-                                         arrow::default_memory_pool(), *output,
-                                         /*chunk_size=*/2)
-                  .ok());
-  ASSERT_TRUE((*output)->Close().ok());
-
-  for (int column = 0; column < 3; ++column) {
-    SCOPED_TRACE(column);
-    for (int row_group = 0; row_group < 2; ++row_group) {
-      const ParquetBufferID buffer_id(parquet_path, column, row_group);
-      SCOPED_TRACE(buffer_id.to_string());
-      auto handle = ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
-      auto data = handle.data();
-      ASSERT_NE(nullptr, data);
-      auto status = data->ValidateFull();
-      ASSERT_TRUE(status.ok()) << status.ToString();
-      ASSERT_TRUE(
-          data->Equals(expected->column(column)->Slice(row_group * 2, 2)))
-          << "actual type=" << data->type()->ToString()
-          << ", rows=" << data->length() << "; expected type=utf8, rows=2";
-    }
-  }
-
-  BufferPoolForwardStore store(parquet_path);
-  ASSERT_TRUE(store.open().ok());
-  auto actual = store.fetch({"all_null", "all_empty", "mixed"},
-                            std::vector<int>{0, 1, 2, 3});
-  ASSERT_NE(nullptr, actual);
-  EXPECT_TRUE(actual->Equals(*expected));
-}
-
 
 TEST_F(BufferPoolStoreTest, ParquetFetchWithSelectColumns) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);

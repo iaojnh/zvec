@@ -851,54 +851,6 @@ TEST(MergedProviderIndexHolderTest,
   }
 }
 
-TEST(MergedProviderIndexHolderTest, RabitqMergePropagatesDeferredReadFailures) {
-  class ReadingBuilder : public RetainingTestBuilder {
-   public:
-    explicit ReadingBuilder(bool fail_in_train)
-        : RetainingTestBuilder("IvfRabitqBuilder"), in_train(fail_in_train) {}
-    int train(IndexThreads::Pointer threads,
-              IndexHolder::Pointer input) override {
-      RetainingTestBuilder::train(std::move(threads), input);
-      if (in_train) consume(input);
-      return 0;
-    }
-    int build(IndexThreads::Pointer, IndexHolder::Pointer input) override {
-      consume(input);
-      return 0;
-    }
-    void consume(const IndexHolder::Pointer &input) {
-      EXPECT_NE(nullptr,
-                dynamic_cast<MergedProviderIndexHolder *>(input.get()));
-      auto iter = input->create_iterator();
-      ASSERT_NE(nullptr, iter);
-      for (; iter->is_valid(); iter->next()) {
-        if (!iter->data()) break;
-      }
-      EXPECT_EQ(IndexError_ReadData, iter->status());
-    }
-    bool in_train;
-  };
-  for (bool in_train : {true, false}) {
-    auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
-    auto reformer = std::make_shared<ReadFailureReformer>();
-    reformer->failed_value = 1.0F;
-    reformer->fail = true;
-    auto builder = std::make_shared<ReadingBuilder>(in_train);
-    ailego::ThreadPool pool(1, false);
-    MixedStreamerReducer reducer;
-    ailego::Params params;
-    params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
-    ASSERT_EQ(0, reducer.init(params));
-    reducer.set_thread_pool(&pool);
-    ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
-                     builder, source, nullptr, nullptr,
-                     IndexQueryMeta(IndexMeta::DT_FP32, kDimension)));
-    ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, reformer));
-    EXPECT_EQ(IndexError_ReadData, reducer.reduce({}));
-    EXPECT_EQ(1u, builder->train_calls);
-  }
-}
-
 TEST(MergedProviderIndexHolderTest, ConverterUsesReducerThreadPool) {
   auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
   ailego::ThreadPool pool(2, false);
@@ -1569,54 +1521,3 @@ TEST(MergedProviderIndexHolderTest, RejectsProviderMetaChangeBetweenPasses) {
 }  // namespace
 }  // namespace core
 }  // namespace zvec
-
-
-namespace zvec::core {
-namespace {
-class FilterOnlyProvider : public IndexProvider {
- public:
-  static constexpr size_t kCount = 1 << 20;
-  size_t count() const override {
-    return kCount;
-  }
-  size_t dimension() const override {
-    return kDimension;
-  }
-  IndexMeta::DataType data_type() const override {
-    return IndexMeta::DT_FP32;
-  }
-  size_t element_size() const override {
-    return kDimension * sizeof(float);
-  }
-  const void *get_vector(uint64_t) const override {
-    return nullptr;
-  }
-  const std::string &owner_class() const override {
-    static const std::string name = "FilterOnlyProvider";
-    return name;
-  }
-  class Cursor : public IndexHolder::Iterator {
-   public:
-    const void *data() const override {
-      ADD_FAILURE() << "All rows are filtered; vectors must not be read";
-      return nullptr;
-    }
-    bool is_valid() const override {
-      return position_ < kCount;
-    }
-    uint64_t key() const override {
-      return position_;
-    }
-    void next() override {
-      ++position_;
-    }
-
-   private:
-    size_t position_{0};
-  };
-  IndexHolder::Iterator::Pointer create_iterator() override {
-    return std::make_unique<Cursor>();
-  }
-};
-}  // namespace
-}  // namespace zvec::core

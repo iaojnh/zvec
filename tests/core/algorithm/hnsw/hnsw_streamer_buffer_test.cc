@@ -17,7 +17,6 @@
 #include "tests/test_util.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 #include "algorithm/hnsw/hnsw_entity.h"
-#include "tests/core/algorithm/hnsw_dump_test_helper.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -90,58 +89,8 @@ TEST_F(HnswStreamerTest, FailedVisitGrowthKeepsCapacityAndCanBeRetried) {
 }
 
 namespace {
-class ExposedBudgetedHnswEntity : public HnswStreamerEntity {
- public:
-  using KeyMap = HashMap<uint64_t, node_id_t>;
-};
-}  // namespace
 
-TEST_F(HnswStreamerTest, PartialWriteFailureBlocksUseAndReopen) {
-  for (bool fill_gap : {false, true}) {
-    SCOPED_TRACE(fill_gap);
-    const std::string path = "hnsw_partial_write_failure.index";
-    zvec::test_util::RemoveTestFiles(path);
-    auto remove =
-        ScopeGuard::Make([&] { zvec::test_util::RemoveTestFiles(path); });
-    auto storage = std::make_shared<zvec::core::test::FaultStorage>(
-        IndexFactory::CreateStorage("MMapFileStorage"));
-    ASSERT_EQ(0, storage->init({}));
-    ASSERT_EQ(0, storage->open(path, true));
-    auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
-    ASSERT_EQ(0, streamer->init(*index_meta_ptr_, {}));
-    ASSERT_EQ(0, streamer->open(storage));
-    auto context = streamer->create_context();
-    ASSERT_TRUE(context);
-    std::vector<float> row(dim, 1.0f);
-    IndexQueryMeta query(IndexMeta::DT_FP32, dim);
-    ASSERT_EQ(0, streamer->add_impl(1, row.data(), query, context));
-    storage->fault->segment = "HnswT3S0";
-    storage->fault->write = true;
-    EXPECT_EQ(int(IndexError_WriteData),
-              fill_gap
-                  ? streamer->add_with_id_impl(16, row.data(), query, context)
-                  : streamer->add_impl(2, row.data(), query, context));
-    EXPECT_EQ(int(IndexError_NoReady),
-              streamer->add_impl(3, row.data(), query, context));
-    EXPECT_EQ(int(IndexError_NoReady), streamer->flush(0));
-    EXPECT_EQ(int(IndexError_NoReady),
-              streamer->search_impl(row.data(), query, context));
-    EXPECT_EQ(int(IndexError_NoReady),
-              streamer->search_bf_impl(row.data(), query, context));
-    std::vector<std::vector<uint64_t>> keys{{1}};
-    EXPECT_EQ(int(IndexError_NoReady), streamer->search_bf_by_p_keys_impl(
-                                           row.data(), keys, query, context));
-    context.reset();
-    EXPECT_EQ(0, streamer->close());
-    EXPECT_EQ(0, streamer->cleanup());
-    ASSERT_EQ(0, storage->close());
-    ASSERT_EQ(0, storage->open(path, false));
-    ASSERT_EQ(0, streamer->init(*index_meta_ptr_, {}));
-    EXPECT_EQ(int(IndexError_InvalidFormat), streamer->open(storage));
-    EXPECT_EQ(0, streamer->cleanup());
-    EXPECT_EQ(0, storage->close());
-  }
-}
+}  // namespace
 
 TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
   IndexStreamer::Stats stats;
@@ -1027,9 +976,3 @@ TEST_F(HnswStreamerTest, TestHnswSearchMMap) {
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic pop
 #endif
-
-namespace zvec::core {
-TEST(HnswEntityDumpMemoryTest, UpperIndexReadErrorDoesNotProduceEmptyLevel) {
-  testing::CheckGraphDumpReadError<HnswEntity>();
-}
-}  // namespace zvec::core

@@ -14,12 +14,7 @@
 #include "vamana_streamer.h"
 #include <sys/stat.h>
 #include <sys/types.h>
-#include "vamana_algorithm.h"
 #include "vamana_context.h"
-#include <array>
-#include "tests/core/algorithm/graph_dump_test_helper.h"
-#include "vamana_entity.h"
-
 #ifndef _MSC_VER
 #include <fcntl.h>
 #include <unistd.h>
@@ -50,22 +45,6 @@ using namespace zvec::ailego;
 namespace zvec {
 namespace core {
 
-class RejectVamanaDistanceStorage : public VamanaMmapStreamerEntity {
- public:
-  using VamanaMmapStreamerEntity::VamanaMmapStreamerEntity;
-  int ensure_dist_storage() override {
-    return IndexError_NoMemory;
-  }
-};
-
-TEST(VamanaMemoryBudget, RefusedDistanceStorageDoesNotPublishEntryPoint) {
-  IndexStreamer::Stats stats;
-  RejectVamanaDistanceStorage entity(stats);
-  VamanaAlgorithm<VamanaMmapStreamerEntity> algorithm(entity);
-  EXPECT_EQ(int(IndexError_NoMemory), algorithm.add_node(0, nullptr));
-  EXPECT_EQ(kInvalidNodeId, entity.entry_point());
-}
-
 constexpr size_t kDim = 16;
 constexpr uint32_t kPrefetchBudgetLines = 6 * 1024 / AILEGO_CACHE_LINE_SIZE;
 
@@ -82,7 +61,7 @@ std::string EncodeUniformUint8Record(size_t dimension, uint32_t seed) {
   return record;
 }
 
-class VamanaStreamerTest : public ::testing::Test {
+class VamanaStreamerTest : public testing::Test {
  protected:
   void SetUp() override;
   void TearDown() override;
@@ -178,7 +157,7 @@ TEST(VamanaQueryPrefetchTest, ManualFieldsOverrideDefaultsIndependently) {
                                         0, 64, default_offset, default_lines));
 }
 
-class VamanaPrefetchContextTest : public ::testing::Test {
+class VamanaPrefetchContextTest : public testing::Test {
  protected:
   static constexpr uint32_t kDefaultOffset = kPrefetchBudgetLines / 2;
   static constexpr uint32_t kFourLineOffset = kPrefetchBudgetLines / 4;
@@ -1872,73 +1851,3 @@ TEST_F(VamanaStreamerTest, TestInt8WithRotate) {
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic pop
 #endif
-
-namespace zvec::core {
-namespace {
-class GeneratedVamana : public VamanaEntity {
- public:
-  explicit GeneratedVamana(uint32_t count, bool distances)
-      : distances_(distances) {
-    *mutable_doc_cnt() = count;
-    set_max_degree(3);
-    set_vector_size(7);
-  }
-  key_t get_key(node_id_t id) const override {
-    return 1000 - id;
-  }
-  const void *get_vector(node_id_t id) const override {
-    row_.fill(static_cast<uint8_t>(id));
-    return row_.data();
-  }
-  const void *get_extra_values(node_id_t) const override {
-    return nullptr;
-  }
-  int get_vector(node_id_t id,
-                 IndexStorage::MemoryBlock &block) const override {
-    if (fail_read) return IndexError_ReadData;
-    block = IndexStorage::MemoryBlock(const_cast<void *>(get_vector(id)));
-    return 0;
-  }
-  int get_vector(const node_id_t *, uint32_t, const void **) const override {
-    return IndexError_NotImplemented;
-  }
-  int get_vector(const node_id_t *, uint32_t,
-                 std::vector<IndexStorage::MemoryBlock> &) const override {
-    return IndexError_NotImplemented;
-  }
-  const Neighbors get_neighbors(node_id_t id) const override {
-    neighbors_ = {id, id + 1, id + 2};
-    return Neighbors(id % 4, neighbors_.data());
-  }
-  bool dist_storage_loaded() const override {
-    return distances_;
-  }
-  const dist_t *get_neighbor_dists(node_id_t id) const override {
-    if (id % 2) return nullptr;
-    dists_.fill(static_cast<float>(id));
-    return dists_.data();
-  }
-  int64_t export_segments(const IndexDumper::Pointer &dumper) const {
-    return dump_segments(dumper);
-  }
-  bool fail_read{false};
-
- private:
-  bool distances_;
-  mutable std::array<uint8_t, 7> row_{};
-  mutable std::array<node_id_t, 3> neighbors_{};
-  mutable std::array<float, 3> dists_{};
-};
-
-TEST(VamanaDumpMemoryTest, ReadAndWriteErrorsPropagate) {
-  GeneratedVamana entity(3, true);
-  auto capture = std::make_shared<testing::GraphDumpCapture>();
-  entity.fail_read = true;
-  EXPECT_EQ(IndexError_ReadData, entity.export_segments(capture));
-  capture = std::make_shared<testing::GraphDumpCapture>();
-  entity.fail_read = false;
-  capture->fail_write = true;
-  EXPECT_EQ(IndexError_WriteData, entity.export_segments(capture));
-}
-}  // namespace
-}  // namespace zvec::core

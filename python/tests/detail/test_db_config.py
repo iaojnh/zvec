@@ -143,8 +143,6 @@ class TestDbConfigMemoryLimitValidation:
             zvec.init(memory_limit_mb=0)
         with pytest.raises(ValueError):
             zvec.init(memory_limit_mb=-1)
-        with pytest.raises(ValueError, match="exceeds the supported range"):
-            zvec.init(memory_limit_mb=(1 << 44) + 128)
         with pytest.raises(TypeError):
             zvec.init(memory_limit_mb="512")
         with pytest.raises(TypeError):

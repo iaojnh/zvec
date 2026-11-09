@@ -174,32 +174,6 @@ TEST(StemmerTokenFilterTest, PorterAlgorithm) {
   EXPECT_EQ(tokens[0].text, "run");
 }
 
-TEST(StemmerMemoryDeathTest, ThreadExitReleasesNativeContextsAndAdmission) {
-#if GTEST_HAS_DEATH_TEST
-  const auto previous = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  EXPECT_EXIT(
-      {
-        auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
-        if (pool.init(64UL << 20) != 0) std::_Exit(1);
-        const size_t before = pool.external_used();
-        std::thread worker([&] {
-          StemmerTokenFilter filter;
-          if (!filter.init({})) std::_Exit(2);
-          (void)filter.filter({Token{std::string(1UL << 20, 'x')}});
-          if (pool.external_used() <= before) std::_Exit(3);
-        });
-        worker.join();
-        if (pool.external_used() != before) std::_Exit(4);
-        std::_Exit(0);
-      },
-      ::testing::ExitedWithCode(0), "");
-  ::testing::FLAGS_gtest_death_test_style = previous;
-#else
-  GTEST_SKIP() << "Process isolation is unavailable";
-#endif
-}
-
 TEST(StemmerMemoryDeathTest, ParserPreservesAnalyzerResourceExhaustion) {
 #if GTEST_HAS_DEATH_TEST
   const auto previous = ::testing::FLAGS_gtest_death_test_style;

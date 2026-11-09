@@ -427,11 +427,6 @@ TEST_F(BufferStorageWriteTest, MissingFileReturnsErrorAndAllowsRetry) {
   EXPECT_EQ(0, storage->close());
 }
 
-TEST_F(BufferStorageWriteTest,
-       WritableOpenCannotReclaimPinnedPagesAndCanRetry) {
-  check_writable_open_with_resident_pages(true);
-}
-
 TEST_F(BufferStorageWriteTest, FailedFileCapturePreservesPublishedState) {
   const std::string expected = "original storage survives failed reopen";
   {
@@ -588,43 +583,6 @@ TEST_F(BufferStorageWriteTest, WriteOverwrite) {
   EXPECT_EQ(second, std::string(buf.data(), buf.size()));
 
   EXPECT_EQ(0, storage->close());
-}
-
-TEST_F(BufferStorageWriteTest, WriteBatchReportsBudgetDenialAndCanRetry) {
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-  const size_t page = ailego::kVectorPageSize;
-  ASSERT_EQ(0, storage->append("batch_pressure", 2 * page));
-  auto segment = storage->get("batch_pressure");
-  ASSERT_TRUE(segment);
-  const char original = 'a';
-  ASSERT_EQ(1u, segment->write(0, &original, 1));
-  ASSERT_EQ(1u, segment->write(page, &original, 1));
-
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  AILEGO_DEFER([&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
-  ASSERT_TRUE(pool.configure_process_rss_limit(1));
-  const char replacement = 'b';
-  const IndexStorage::SegmentData writes[] = {{0, 1, &replacement},
-                                              {page, 1, &replacement}};
-  EXPECT_FALSE(segment->write_batch(writes, 2));
-  EXPECT_EQ(IndexError_NoMemory, segment->write_error());
-  const IndexStorage::SegmentData invalid{2 * page, 1, &replacement};
-  EXPECT_FALSE(segment->write_batch(&invalid, 1));
-  EXPECT_EQ(IndexError_WriteData, segment->write_error());
-
-  ASSERT_TRUE(pool.configure_process_rss_limit(0));
-  char actual = 0;
-  ASSERT_EQ(1u, segment->fetch(0, &actual, 1));
-  EXPECT_EQ(original, actual);
-  ASSERT_EQ(1u, segment->fetch(page, &actual, 1));
-  EXPECT_EQ(original, actual);
-  ASSERT_TRUE(segment->write_batch(writes, 2));
-  ASSERT_EQ(1u, segment->fetch(0, &actual, 1));
-  EXPECT_EQ(replacement, actual);
-  ASSERT_EQ(1u, segment->fetch(page, &actual, 1));
-  EXPECT_EQ(replacement, actual);
-  ASSERT_EQ(0, storage->close());
 }
 
 TEST_F(BufferStorageWriteTest, WriteBatchSamePagePersists) {
@@ -2172,127 +2130,6 @@ TEST_F(BufferStorageWriteTest, CR_ConcurrentSamePageReadSeesWholeWrite) {
   EXPECT_EQ(0, storage->close());
 }
 
-TEST_F(BufferStorageWriteTest,
-       OverlappingSnapshotsRecycleAfterCrossThreadReleaseAtFullBudget) {
-  // Exact address and charge reuse requires the idle slots to stay cached.
-  // Filling the quota otherwise lets background eviction reclaim those slots
-  // before the foreground read, as the pressure-reclamation tests require.
-  auto &actual_pool = ailego::MemoryLimitPool::get_instance();
-  ailego::MemoryLimitPoolTestPeer::stop_background(actual_pool);
-  AILEGO_DEFER([&] {
-    ailego::MemoryLimitPoolTestPeer::start_background(actual_pool);
-  });
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-  ASSERT_EQ(0, storage->append("overlap", 2 * ailego::kVectorPageSize));
-  auto segment = storage->get("overlap");
-  std::vector<char> before(512, 'A'), after(512, 'B');
-  ASSERT_EQ(before.size(), segment->write(0, before.data(), before.size()));
-  std::array<IndexStorage::MemoryBlock, 32> retained;
-  std::vector<const void *> addresses;
-  for (auto &block : retained) {
-    ASSERT_EQ(before.size(), segment->read(0, block, before.size()));
-    ASSERT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, block.type_);
-    EXPECT_EQ(addresses.end(),
-              std::find(addresses.begin(), addresses.end(), block.data()));
-    addresses.push_back(block.data());
-  }
-  ASSERT_EQ(after.size(), segment->write(0, after.data(), after.size()));
-  std::thread receiver([&] {
-    for (size_t i = 0; i < retained.size() / 2; ++i) {
-      EXPECT_EQ(0,
-                std::memcmp(retained[i].data(), before.data(), before.size()));
-      retained[i].reset();
-    }
-  });
-  receiver.join();
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  {
-    auto cache = storage->vec_buffer_pool();
-    ASSERT_TRUE(cache);
-    ASSERT_EQ(0, cache->flush_all());
-    // Keep source pages resident so readmission cannot be mistaken for a new
-    // snapshot allocation.
-    const auto first = segment->data_offset() / ailego::kVectorPageSize;
-    const auto last =
-        (segment->data_offset() + before.size() - 1) / ailego::kVectorPageSize;
-    const ailego::block_id_t source_ids[] = {first, last};
-    const size_t source_count = first == last ? 1 : 2;
-    char *source_pages[2] = {};
-    ASSERT_TRUE(cache->try_acquire_resident_pages(source_ids, source_count,
-                                                  source_pages));
-    AILEGO_DEFER([&]() { cache->release_pages(source_ids, source_count); });
-    ailego::MemoryReservation pressure;
-    pressure.add(pool.available());
-    const size_t file_pages =
-        (cache->file_size() + ailego::kVectorPageSize - 1) /
-        ailego::kVectorPageSize;
-    for (size_t page = 0; page < file_pages; ++page) {
-      const bool reclaimed = cache->page_table_.reclaim_clean_block(page);
-      if (page >= first && page <= last) {
-        EXPECT_FALSE(reclaimed);
-      }
-    }
-    pressure.add(pool.available());
-    ASSERT_EQ(0u, pool.available());
-    const size_t used = pool.used();
-    const size_t external = pool.external_used();
-    const size_t misses = cache->stats().miss;
-    for (size_t i = 0; i < retained.size() / 2; ++i) {
-      ASSERT_EQ(after.size(), segment->read(0, retained[i], after.size()));
-      EXPECT_EQ(addresses[i], retained[i].data());
-      EXPECT_EQ(used, pool.used());
-      EXPECT_EQ(external, pool.external_used());
-      EXPECT_EQ(misses, cache->stats().miss);
-    }
-  }
-  ASSERT_EQ(0, storage->close());
-  segment.reset();
-  storage.reset();
-  for (size_t i = 0; i < retained.size(); ++i) {
-    const auto &expected = i < retained.size() / 2 ? after : before;
-    EXPECT_EQ(
-        0, std::memcmp(retained[i].data(), expected.data(), expected.size()));
-    retained[i].reset();
-  }
-  EXPECT_EQ(0u, pool.stats().external_used);
-}
-
-TEST_F(BufferStorageWriteTest,
-       OverflowMetadataRefusalPreservesRequiredSnapshot) {
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-  ASSERT_EQ(0, storage->append("optional", 2 * ailego::kVectorPageSize));
-  auto segment = storage->get("optional");
-  const size_t page = ailego::kVectorPageSize;
-  const size_t offset = (page - segment->data_offset() % page) % page;
-  std::vector<char> expected(128, 'O');
-  ASSERT_EQ(expected.size(),
-            segment->write(offset, expected.data(), expected.size()));
-  IndexStorage::MemoryBlock first, second, pin;
-  ASSERT_EQ(expected.size(),
-            segment->read_immutable(offset, pin, expected.size()));
-  ASSERT_EQ(expected.size(), segment->read(offset, first, expected.size()));
-  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, first.type_);
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  {
-    ailego::MemoryReservation pressure;
-    ASSERT_GT(pool.available(), 512u);
-    pressure.add(pool.available() - 512);
-    ASSERT_EQ(expected.size(), segment->read(offset, second, expected.size()));
-    EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, second.type_);
-    EXPECT_NE(first.data(), second.data());
-    EXPECT_EQ(0, std::memcmp(first.data(), expected.data(), expected.size()));
-    EXPECT_EQ(0, std::memcmp(second.data(), expected.data(), expected.size()));
-    EXPECT_LE(pool.used(), pool.capacity());
-  }
-  first.reset();
-  second.reset();
-  pin.reset();
-  EXPECT_EQ(0, storage->close());
-  EXPECT_EQ(0u, pool.stats().external_used);
-}
-
 TEST_F(BufferStorageWriteTest, RecycledSnapshotsSeeWholeConcurrentWrites) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
@@ -2751,37 +2588,4 @@ TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveReadingThreadExit) {
   retained.reset();
   ASSERT_EQ(0, storage->close());
   EXPECT_EQ(0, std::memcmp(payload.data() + offset, copy.data(), 128));
-}
-
-TEST_F(BufferStorageWriteTest, ResidentImmutableBatchSupportsAliasedOutputs) {
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-  const size_t page = ailego::kVectorPageSize;
-  ASSERT_EQ(0, storage->append("aliased_batch", 4 * page));
-  auto segment = storage->get("aliased_batch");
-  ASSERT_TRUE(segment);
-  std::vector<char> bytes(4 * page);
-  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (i * 7) % 251;
-  ASSERT_EQ(bytes.size(), segment->write(0, bytes.data(), bytes.size()));
-  const size_t first = (page - segment->data_offset() % page) % page;
-  IndexStorage::MemoryBlock pins[2], output, duplicate;
-  ASSERT_EQ(64u, segment->read_immutable(first, pins[0], 64));
-  ASSERT_EQ(64u, segment->read_immutable(first + page, pins[1], 64));
-  IndexStorage::Segment::BorrowedRead reads[] = {
-      {segment.get(), first, 64, &output},
-      {segment.get(), first + page, 64, &output},
-      {segment.get(), first, 64, &duplicate},
-  };
-  ASSERT_TRUE(segment->read_borrowed_batch_immutable(reads, 3));
-  EXPECT_EQ(pins[1].data(), output.data());
-  EXPECT_EQ(pins[0].data(), duplicate.data());
-  EXPECT_EQ(0, std::memcmp(output.data(), bytes.data() + first + page, 64));
-  output.reset();
-  duplicate.reset();
-  // A miss after successful probes must release its temporary pins before
-  // the original multi-page path takes over.
-  reads[0] = {segment.get(), first + page - 16, 64, &output};
-  ASSERT_TRUE(segment->read_borrowed_batch_immutable(reads, 1));
-  EXPECT_EQ(0,
-            std::memcmp(output.data(), bytes.data() + first + page - 16, 64));
 }

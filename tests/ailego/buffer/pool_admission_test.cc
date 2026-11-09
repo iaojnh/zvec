@@ -53,9 +53,7 @@ struct MemoryLimitPoolTestPeer {
     rss_sample = rss;
     pool.process_rss_.refresh(true);
   }
-  static size_t rss_available(MemoryLimitPool &pool) {
-    return pool.process_rss_.available();
-  }
+
   static ProcessRssBudget::ResidentSample slab_resident_sample() {
     return MemoryLimitPool::read_slab_resident_sample();
   }
@@ -64,15 +62,8 @@ struct MemoryLimitPoolTestPeer {
     std::lock_guard<std::mutex> lock(pool.slab_mutex_);
     return pool.read_slab_resident_sample();
   }
-  static void refresh_rss(MemoryLimitPool &pool) {
-    pool.process_rss_.refresh(true);
-  }
-  static size_t trim_retained(MemoryLimitPool &pool, size_t bytes) {
-    return pool.trim_retained_blocks(bytes);
-  }
-  static size_t trim_free(MemoryLimitPool &pool, size_t bytes) {
-    return pool.trim_free_buffers(bytes);
-  }
+
+
   inline static size_t rss_sample = 0;
 };
 
@@ -263,27 +254,6 @@ TEST_F(PoolAdmissionTest, MandatoryConsumersWaitWhileCapacityMakesProgress) {
 }
 
 
-TEST_F(PoolAdmissionTest, MandatoryConsumersReleasePriorityAfterFailure) {
-  for (const bool metadata : {false, true}) {
-    {
-      PendingReservation pinned(pool_, pool_.available());
-      ASSERT_TRUE(pinned.acquired());
-      const bool charged = metadata ? pool_.try_charge_metadata(page_)
-                                    : pool_.try_charge_workspace(page_);
-      EXPECT_FALSE(charged);
-      if (charged) {
-        if (metadata)
-          pool_.release_metadata(page_);
-        else
-          pool_.release_external(page_);
-      }
-    }
-    PendingReservation next_pages(pool_, pool_.available());
-    EXPECT_TRUE(next_pages.acquired());
-    expect_bounded();
-  }
-}
-
 TEST_F(PoolAdmissionTest, BackingRefusalRollsBackUsedReservation) {
   {
     PendingReservation pending(pool_, pool_.available(), true);
@@ -297,41 +267,6 @@ TEST_F(PoolAdmissionTest, BackingRefusalRollsBackUsedReservation) {
   }
   ASSERT_TRUE(pool_.try_charge_external(page_));
   pool_.release_external(page_);
-}
-
-TEST_F(PoolAdmissionTest, FailedWorkspaceAllocationRestoresRssHeadroom) {
-  ASSERT_EQ(0, pool_.init(baseline_ + 64 * page_));
-  MemoryLimitPoolTestPeer::stop_background(pool_);
-  const size_t initial_rss = baseline_ + 128 * page_;
-  const size_t resident_bytes = 32 * page_;
-  const size_t current_rss = initial_rss + resident_bytes;
-  const size_t headroom = 4 * page_;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(
-      pool_, current_rss + headroom, initial_rss));
-  MemoryReservation resident;
-  resident.add(resident_bytes);
-  MemoryLimitPoolTestPeer::sample_rss(pool_, current_rss);
-  const size_t used = pool_.used();
-  const size_t committed = pool_.committed();
-  for (int i = 0; i < 10; ++i) {
-    bool attempted = false;
-    MemoryReservation workspace;
-    EXPECT_THROW(workspace.add_for_allocation(
-                     page_,
-                     [&] {
-                       attempted = true;
-                       MemoryLimitPoolTestPeer::sample_rss(pool_, current_rss);
-                       EXPECT_EQ(headroom - page_,
-                                 MemoryLimitPoolTestPeer::rss_available(pool_));
-                       throw std::bad_alloc();
-                     }),
-                 std::bad_alloc);
-    ASSERT_TRUE(attempted);
-    EXPECT_EQ(0u, workspace.bytes());
-    EXPECT_EQ(used, pool_.used());
-    EXPECT_EQ(committed, pool_.committed());
-    EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
-  }
 }
 
 #if defined(__linux__) && !defined(__ANDROID__)

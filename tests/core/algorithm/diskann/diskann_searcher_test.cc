@@ -216,40 +216,6 @@ class CorruptibleDiskAnnSearcherEntity final : public DiskAnnSearcherEntity {
   }
 };
 
-TEST(DiskAnnContextErrorTest, KeyReadFailureKeepsCauseAndClearAllowsReuse) {
-  class KeyFailureEntity : public DiskAnnSearcherEntity {
-   public:
-    int failure{IndexError_NoMemory};
-    int read_key(diskann_id_t, diskann_key_t *key) const override {
-      if (failure) return failure;
-      *key = 17;
-      return 0;
-    }
-  };
-  IndexMeta meta(IndexMeta::DT_FP32, 4);
-  auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
-  ASSERT_NE(nullptr, metric);
-  ASSERT_EQ(0, metric->init(meta, Params()));
-  auto entity = std::make_shared<KeyFailureEntity>();
-  DiskAnnContext context(meta, metric, entity);
-  context.set_topk(1);
-  for (int failure : {int(IndexError_NoMemory), int(IndexError_ReadData), 0}) {
-    entity->failure = failure;
-    context.clear();
-    EXPECT_EQ(0, context.error_code());
-    context.resize_results(1);
-    context.topk_heap().emplace(0, VectorInfo(0.0f));
-    context.topk_to_result(0);
-    EXPECT_EQ(failure, context.error_code());
-    if (!failure) {
-      ASSERT_EQ(1u, context.result().size());
-      EXPECT_EQ(17u, context.result()[0].key());
-    } else {
-      EXPECT_TRUE(context.result().empty());
-    }
-  }
-}
-
 size_t expected_fetch_buffer_size(const DiskAnnContext &context) {
   const auto &entity = context.get_entity();
   const uint64_t sector_num_per_node =

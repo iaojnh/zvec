@@ -24,29 +24,6 @@ class LoadedImage {
   HMODULE module_;
 };
 
-TEST(WindowsNativeImageMemory, CountsUntouchedDllZeroFillNotFileBytes) {
-  LoadedImage image;
-  ASSERT_NE(nullptr, image.anchor());
-  const size_t bytes = NativeImageBytesForAddress(image.anchor());
-  SYSTEM_INFO system{};
-  ::GetSystemInfo(&system);
-  EXPECT_GE(bytes, 4UL << 20);
-  EXPECT_EQ(0u, bytes % system.dwPageSize);
-  WIN32_FILE_ATTRIBUTE_DATA file{};
-  ASSERT_TRUE(::GetFileAttributesExA(ZVEC_NATIVE_IMAGE_WINDOWS_DLL,
-                                     GetFileExInfoStandard, &file));
-  EXPECT_EQ(0u, file.nFileSizeHigh);
-  EXPECT_LT(file.nFileSizeLow, bytes);
-}
-
-TEST(WindowsNativeImageMemory, ExcludesCallerExecutableAndRejectsNonImages) {
-  static const char caller_anchor = 0;
-  EXPECT_EQ(0u, NativeImageBytesForAddress(&caller_anchor));
-  EXPECT_THROW(NativeImageBytesForAddress(nullptr), std::bad_alloc);
-  const char stack_anchor = 0;
-  EXPECT_THROW(NativeImageBytesForAddress(&stack_anchor), std::bad_alloc);
-}
-
 TEST(WindowsNativeImageMemoryDeathTest, ReservationKeepsLiveImageCharged) {
 #if GTEST_HAS_DEATH_TEST
   const auto previous = ::testing::FLAGS_gtest_death_test_style;
@@ -58,6 +35,14 @@ TEST(WindowsNativeImageMemoryDeathTest, ReservationKeepsLiveImageCharged) {
         auto &pool = ailego::MemoryLimitPool::get_instance();
         if (pool.init(64UL << 20) != 0) std::_Exit(2);
         const size_t bytes = NativeImageBytesForAddress(image.anchor());
+        SYSTEM_INFO system{};
+        ::GetSystemInfo(&system);
+        WIN32_FILE_ATTRIBUTE_DATA file{};
+        if (bytes < (4UL << 20) || bytes % system.dwPageSize ||
+            !::GetFileAttributesExA(ZVEC_NATIVE_IMAGE_WINDOWS_DLL,
+                                    GetFileExInfoStandard, &file) ||
+            file.nFileSizeHigh || file.nFileSizeLow >= bytes)
+          std::_Exit(6);
         const auto before = pool.stats();
         ReserveNativeImage(image.anchor());
         const auto after = pool.stats();

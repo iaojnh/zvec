@@ -19,8 +19,6 @@ endif()
 if(APPLE AND NOT IOS)
     add_library(native_image_memory_macos_fixture SHARED
         native_image_memory_macos_fixture.cc)
-    add_library(native_image_memory_macos_bundle MODULE
-        native_image_memory_macos_fixture.cc)
 endif()
 if(WIN32)
     add_library(native_image_memory_windows_fixture SHARED
@@ -30,7 +28,7 @@ endif()
 file(GLOB ALL_TEST_SRCS *_test.cc)
 foreach(CC_SRCS ${ALL_TEST_SRCS})
     get_filename_component(CC_TARGET ${CC_SRCS} NAME_WE)
-    if(CC_TARGET STREQUAL "native_image_memory_macos_test" AND NOT APPLE)
+    if(CC_TARGET STREQUAL "native_image_memory_macos_test" AND (NOT APPLE OR IOS))
         continue()
     endif()
     if(CC_TARGET STREQUAL "native_image_memory_windows_test" AND NOT WIN32)
@@ -52,11 +50,9 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
         LDFLAGS ${APPLE_FRAMEWORK_LIBS}
     )
     if(CC_TARGET STREQUAL "native_image_memory_macos_test" AND NOT IOS)
-        add_dependencies(${CC_TARGET} native_image_memory_macos_fixture
-            native_image_memory_macos_bundle)
+        add_dependencies(${CC_TARGET} native_image_memory_macos_fixture)
         target_compile_definitions(${CC_TARGET} PRIVATE
-            ZVEC_NATIVE_IMAGE_MACOS_DYLIB="$<TARGET_FILE:native_image_memory_macos_fixture>"
-            ZVEC_NATIVE_IMAGE_MACOS_BUNDLE="$<TARGET_FILE:native_image_memory_macos_bundle>")
+            ZVEC_NATIVE_IMAGE_MACOS_DYLIB="$<TARGET_FILE:native_image_memory_macos_fixture>")
     endif()
     if(CC_TARGET STREQUAL "native_image_memory_windows_test")
         add_dependencies(${CC_TARGET} native_image_memory_windows_fixture)

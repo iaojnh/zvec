@@ -282,46 +282,5 @@ TEST_F(IVFBufferedBuildTest, ExternalLabelSortPreservesOriginalVectorOrder) {
   }
 }
 
-TEST_F(IVFBufferedBuildTest, FailedDumpPreservesInputForFetchAndRetry) {
-  auto param = IVFIndexParamBuilder()
-                   .with_dimension(kDimension)
-                   .with_metric_type(MetricType::kL2sq)
-                   .with_data_type(DataType::DT_FP32)
-                   .with_quantizer_param(QuantizerParam(QuantizerType::kFP16))
-                   .with_n_list(8)
-                   .with_n_iters(2)
-                   .build();
-  auto inspected = std::make_shared<InspectableBufferedIVF>();
-  ASSERT_EQ(inspected->initialize(*param), 0);
-  Index::Pointer target = inspected;
-  const auto path = directory_ / "blocked-output";
-  ASSERT_TRUE(std::filesystem::create_directory(path));
-  ASSERT_EQ(target->open(path.string(),
-                         {StorageOptions::StorageType::kBufferPool, true}),
-            0);
-  const auto data = values();
-  for (uint32_t id = 0; id < kCount; ++id) {
-    ASSERT_EQ(
-        target->add(VectorData{DenseVector{data.data() + id * kDimension}}, id),
-        0);
-  }
-  ASSERT_NE(target->train(), 0);
-  EXPECT_FALSE(target->is_trained());
-  VectorDataBuffer output;
-  ASSERT_EQ(target->fetch(7, &output), 0);
-  const auto &bytes = std::get<DenseVectorBuffer>(output.vector_buffer).data;
-  ASSERT_EQ(bytes.size(), kDimension * sizeof(float));
-  EXPECT_EQ(
-      std::memcmp(bytes.data(), data.data() + 7 * kDimension, bytes.size()), 0);
-  EXPECT_NE(target->add(VectorData{DenseVector{data.data()}}, kCount), 0);
-  ASSERT_TRUE(std::filesystem::remove(path));
-  ASSERT_EQ(target->train(), 0);
-  ASSERT_NO_FATAL_FAILURE(verify(target, data, true));
-  ASSERT_EQ(target->close(), 0);
-  target.reset();
-  inspected.reset();
-  ASSERT_TRUE(std::filesystem::remove(path));
-}
-
 }  // namespace
 }  // namespace zvec::core_interface

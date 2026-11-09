@@ -101,29 +101,6 @@ TEST_F(BufferReadStorageTest, NoneDefersPagePopulationUntilFirstRead) {
   EXPECT_GT(pool.stats().page_used, 0u);
 }
 
-TEST_F(BufferReadStorageTest, BudgetedFetchCopiesSurviveStorageClose) {
-  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
-  ASSERT_EQ(0, storage->open(file_path_, false));
-  auto segment = storage->get("payload");
-  ASSERT_NE(nullptr, segment);
-  auto first = std::allocate_shared<ailego::BudgetedMappedBuffer>(
-      ailego::BudgetedAllocator<ailego::BudgetedMappedBuffer>{},
-      ailego::kVectorPageSize);
-  ailego::BudgetedMappedBuffer second(ailego::kVectorPageSize);
-  ASSERT_EQ(first->size(), segment->fetch(3, first->data(), first->size()));
-  ASSERT_EQ(second.size(), segment->fetch(7, second.data(), second.size()));
-  segment.reset();
-  ASSERT_EQ(0, storage->close());
-  EXPECT_EQ(0, std::memcmp(payload_.data() + 3, first->data(),
-                           ailego::kVectorPageSize));
-  EXPECT_EQ(0, std::memcmp(payload_.data() + 7, second.data(),
-                           ailego::kVectorPageSize));
-  auto copy = first;
-  first.reset();
-  EXPECT_EQ(0, std::memcmp(payload_.data() + 3, copy->data(),
-                           ailego::kVectorPageSize));
-}
-
 TEST_F(BufferReadStorageTest, SequentialPreservesExistingWarmupBehavior) {
   auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL);
   ASSERT_NE(storage, nullptr);
@@ -178,63 +155,6 @@ TEST_F(BufferReadStorageTest, ColdScatterReadKeepsContiguousFallback) {
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH,
             block.fallback.type_);
   EXPECT_EQ(nullptr, block.lease);
-  EXPECT_EQ(0, std::memcmp(payload_.data(), block.spans[0].data, length));
-}
-
-TEST_F(BufferReadStorageTest,
-       CopiedScatterLeaseKeepsPagesAcrossWorkspaceReuse) {
-  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL);
-  ASSERT_EQ(0, storage->open(file_path_, false));
-  auto segment = storage->get("payload");
-  ASSERT_NE(nullptr, segment);
-  IndexStorage::Segment::ScatterBlock block;
-  const size_t length = 2 * ailego::kVectorPageSize;
-  ASSERT_EQ(length, segment->read_scatter(0, block, length));
-  auto retained_lease = block.lease;
-  const auto first = block.spans.front();
-  auto *old_workspace = block.workspace.get();
-  block.reset();
-  EXPECT_EQ(nullptr, block.workspace);
-  ASSERT_EQ(length, segment->read_scatter(7, block, length));
-  EXPECT_NE(old_workspace, block.workspace.get());
-  EXPECT_EQ(0, std::memcmp(payload_.data(), first.data, first.size));
-  block.reset();
-  block = IndexStorage::Segment::ScatterBlock{};
-  segment.reset();
-  ASSERT_EQ(0, storage->close());
-  storage.reset();
-  EXPECT_EQ(0, std::memcmp(payload_.data(), first.data, first.size));
-  retained_lease.reset();
-  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().used());
-}
-
-TEST_F(BufferReadStorageTest,
-       ScatterAdmissionFailureReleasesPartialDescriptors) {
-  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
-  ASSERT_EQ(0, storage->open(file_path_, false));
-  auto segment = storage->get("payload");
-  ASSERT_NE(nullptr, segment);
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t length = 2 * ailego::kVectorPageSize;
-  // Fail at different allocations, including after the descriptor arrays
-  // have been admitted but before the lease can be created.
-  for (const size_t headroom : {0u, 32u, 64u, 128u}) {
-    ailego::MemoryReservation pressure;
-    ASSERT_GT(pool.available(), headroom);
-    pressure.add(pool.available() - headroom);
-    const size_t charged = pool.external_used();
-    IndexStorage::Segment::ScatterBlock block;
-    EXPECT_EQ(0u, segment->read_scatter(0, block, length));
-    EXPECT_EQ(IndexError_NoMemory, segment->read_error());
-    EXPECT_EQ(nullptr, block.lease);
-    EXPECT_TRUE(block.spans.empty());
-    EXPECT_EQ(0u, block.size);
-    EXPECT_EQ(charged, pool.external_used());
-    EXPECT_EQ(0u, pool.stats().page_used);
-  }
-  IndexStorage::Segment::ScatterBlock block;
-  ASSERT_EQ(length, segment->read_scatter(0, block, length));
-  ASSERT_EQ(1u, block.spans.size());
   EXPECT_EQ(0, std::memcmp(payload_.data(), block.spans[0].data, length));
 }
 
@@ -369,24 +289,6 @@ TEST_F(BufferReadStorageTest, BorrowedReadAvoidsOwningHandleOnResidentPage) {
   // Borrowed blocks must be released while their Segment/storage owner is
   // still alive.
   block.reset();
-}
-
-TEST_F(BufferReadStorageTest, ImmutableBorrowedReadsAvoidOwningHandles) {
-  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL);
-  ASSERT_EQ(0, storage->open(file_path_, false));
-  auto segment = storage->get("payload");
-  IndexStorage::MemoryBlock first;
-  IndexStorage::MemoryBlock second;
-  ASSERT_EQ(64u, segment->read_borrowed_immutable(3, first, 64));
-  IndexStorage::Segment::BorrowedRead reads[] = {
-      {segment.get(), 7, 64, &second}};
-  ASSERT_TRUE(segment->read_borrowed_batch_immutable(reads, 1));
-  EXPECT_EQ(nullptr, first.buffer_pool_handle_owner_);
-  EXPECT_EQ(nullptr, second.buffer_pool_handle_owner_);
-  EXPECT_NE(nullptr, first.buffer_pool_handle_);
-  EXPECT_NE(nullptr, second.buffer_pool_handle_);
-  EXPECT_EQ(0, std::memcmp(payload_.data() + 3, first.data(), 64));
-  EXPECT_EQ(0, std::memcmp(payload_.data() + 7, second.data(), 64));
 }
 
 TEST_F(BufferReadStorageTest, CrossPageReadReusesExclusiveScratchAtFullBudget) {

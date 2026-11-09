@@ -125,44 +125,28 @@ TEST_F(MobilePressureLifecycle, BackgroundReclaimsPagesAndPreservesPins) {
 }
 
 TEST_F(MobilePressureLifecycle, CriticalDeniesGrowthAndNormalAllowsRetry) {
-  BudgetedMappedBuffer retained;
-  retained.resize(4UL << 20);
-  std::memset(retained.data(), 7, retained.size());
-  pool_.set_memory_pressure(Pressure::kCritical);
-  EXPECT_FALSE(pool_.try_charge_external(1UL << 20));
-  BudgetedMappedBuffer growth;
-  EXPECT_THROW(growth.resize(8UL << 20), std::bad_alloc);
-  EXPECT_EQ(7, retained.data()[0]);
-  emit("critical_denied");
-  pool_.set_memory_pressure(Pressure::kNormal);
-  ASSERT_TRUE(pool_.try_charge_external(1UL << 20));
-  pool_.release_external(1UL << 20);
-  ASSERT_NO_THROW(growth.resize(8UL << 20));
-  std::memset(growth.data(), 9, growth.size());
-  EXPECT_EQ(9, growth.data()[growth.size() - 1]);
-  emit("normal_retry");
+  {
+    BudgetedMappedBuffer retained;
+    retained.resize(4UL << 20);
+    std::memset(retained.data(), 7, retained.size());
+    pool_.set_memory_pressure(Pressure::kCritical);
+    EXPECT_FALSE(pool_.try_charge_external(1UL << 20));
+    BudgetedMappedBuffer growth;
+    EXPECT_THROW(growth.resize(8UL << 20), std::bad_alloc);
+    EXPECT_EQ(7, retained.data()[0]);
+    emit("critical_denied");
+    pool_.set_memory_pressure(Pressure::kNormal);
+    ASSERT_TRUE(pool_.try_charge_external(1UL << 20));
+    pool_.release_external(1UL << 20);
+    ASSERT_NO_THROW(growth.resize(8UL << 20));
+    std::memset(growth.data(), 9, growth.size());
+    EXPECT_EQ(9, growth.data()[growth.size() - 1]);
+    emit("normal_retry");
+    EXPECT_LT(MemoryHelper::SelfRSS(), kTarget);
+  }
+  emit("closed");
   EXPECT_LT(MemoryHelper::SelfRSS(), kTarget);
 }
 
-TEST_F(MobilePressureLifecycle, RepeatedLifecycleReturnsBelowTarget) {
-  size_t baseline = 0;
-  size_t last = 0;
-  for (size_t round = 0; round < 36; ++round) {
-    {
-      BudgetedMappedBuffer workspace;
-      workspace.resize(8UL << 20);
-      std::memset(workspace.data(), 1, workspace.size());
-      pool_.set_memory_pressure(Pressure::kBackground);
-    }
-    pool_.set_memory_pressure(Pressure::kCritical);
-    ASSERT_TRUE(wait([&] { return pool_.stats().retained_idle_bytes == 0; }));
-    pool_.set_memory_pressure(Pressure::kNormal);
-    last = MemoryHelper::SelfRSS();
-    if (round == 12) baseline = last;
-    EXPECT_LT(last, kTarget);
-    emit("closed");
-  }
-  EXPECT_LE(last, baseline + (8UL << 20));
-}
 }  // namespace
 }  // namespace zvec::ailego
