@@ -266,6 +266,9 @@ void PqInt8Quantizer::train_chunk(const T *data, size_t num, size_t stride,
     }
   }
 
+  // Workspace failures in nested KMeans tasks are recorded instead of thrown.
+  if (algorithm.matrix_status() != 0) throw std::bad_alloc();
+
   // Extract centroids into the flat centroids_ byte buffer
   const auto &cents = algorithm.centroids();
   for (size_t c = 0; c < cents.count(); ++c) {
