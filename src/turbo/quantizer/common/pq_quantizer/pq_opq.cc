@@ -40,13 +40,14 @@ int PqOpq::init(uint32_t dim, DataType data_type,
 int PqOpq::train(void *data, size_t num, const char *name,
                  const TrainCodebook &train_codebook,
                  const Reconstruct &reconstruct,
-                 const ReconstructSum &reconstruct_sum) try {
+                 const ReconstructSum &reconstruct_sum,
+                 bool buffered_training) try {
   if (!enabled() || num == 0) return 0;
   if (!data) return kErrInvalidArgument;
   const size_t dim = static_cast<size_t>(preprocessor_->in_dim());
   if (!dim || num > std::numeric_limits<size_t>::max() / sizeof(float) / dim)
     return kErrInvalidArgument;
-  if (reconstruct_sum &&
+  if (buffered_training && reconstruct_sum &&
       ailego::MemoryLimitPool::get_instance().capacity() != 0) {
     core::PagedBuildBuffer original;
     const size_t row_bytes = dim * sizeof(float);

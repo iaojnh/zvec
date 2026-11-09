@@ -14,7 +14,6 @@
 
 #include "quantizer/pq_int8_quantizer/pq_int8_quantizer.h"
 #include <algorithm>
-#include <ailego/pattern/scope_guard.h>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -23,10 +22,11 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
-#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <ailego/pattern/scope_guard.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_threads.h>
 #include "quantizer/common/pq_buffered_training.h"
@@ -164,6 +164,11 @@ int PqInt8Quantizer::init(const IndexMeta &meta,
   params.get("markov_chain_length", &markov_chain_length_);
   params.get("epsilon", &epsilon_);
   params.get("use_zero_mean", &use_zero_mean_);
+  buffered_training_ = true;
+  if (params.has("buffered_training") &&
+      !params.get<bool>("buffered_training", &buffered_training_)) {
+    return kErrUnsupported;
+  }
   build_sdc_table_ = true;
   // Accept main's option and the existing build-storage option. Both select
   // the same derivative; keep only one state and one allocation.
@@ -309,9 +314,11 @@ int PqInt8Quantizer::train(IndexHolder::Pointer holder) try {
     return kErrUnsupported;
   }
 
-  // Both plain PQ and OPQ keep sample-sized matrices in shared pageable
-  // storage. Failed backing I/O must not retry with full heap allocations.
-  if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+  // Buffered builds retain bounded, pageable matrices. Mmap DiskANN builds
+  // explicitly keep the upstream borrowed-sample/in-memory chunk path even
+  // when another collection has initialized the process-wide memory pool.
+  if (buffered_training_ &&
+      ailego::MemoryLimitPool::get_instance().capacity() != 0) {
     int ret = input_data_type_ == DataType::kFp16
                   ? train_buffered<ailego::Float16>(holder, num)
                   : train_buffered<float>(holder, num);
@@ -391,7 +398,8 @@ int PqInt8Quantizer::train(IndexHolder::Pointer holder) try {
       },
       [this](const float *rotated, size_t count, float *x_hat) {
         return encode_reconstruct_batch(rotated, count, x_hat);
-      });
+      },
+      {}, buffered_training_);
   if (opq_status != 0) return opq_status;
 
   train_all_chunks(all_data.data(), num, data_stride, kMaxKmeansIters);
@@ -898,7 +906,8 @@ int PqInt8Quantizer::build_centroid_distance_table(const void *centroids,
 int PqInt8Quantizer::quantize_precomputed_query(const void *query,
                                                 const IndexQueryMeta &qmeta,
                                                 std::string *out,
-                                                IndexQueryMeta *ometa) const try {
+                                                IndexQueryMeta *ometa) const
+    try {
   //! Same L2-only contract as build_centroid_distance_table().
   if (meta_.metric_name() != "SquaredEuclidean") {
     return kErrUnsupported;

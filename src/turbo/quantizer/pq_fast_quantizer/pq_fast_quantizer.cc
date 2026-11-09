@@ -21,10 +21,10 @@
 #include <limits>
 #include <random>
 #include <vector>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
-#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_threads.h>
 #include "common/fast_scan_common.h"
@@ -273,7 +273,8 @@ int PqFastQuantizer::train(IndexHolder::Pointer holder, int thread_count) try {
   if (num > std::numeric_limits<size_t>::max() / vec_bytes)
     return kErrUnsupported;
 
-  if (ailego::MemoryLimitPool::get_instance().capacity() != 0) {
+  if (buffered_training_ &&
+      ailego::MemoryLimitPool::get_instance().capacity() != 0) {
     ModelVector<uint32_t> offsets(num_chunk_ + 1);
     for (size_t m = 0; m <= num_chunk_; ++m) offsets[m] = m * sub_dim_;
     const PqBufferedTrainingOptions options{"PqFastQuantizer",
@@ -363,7 +364,8 @@ int PqFastQuantizer::train(IndexHolder::Pointer holder, int thread_count) try {
         double error = 0.0;
         encode_reconstruct_batch(rotated, count, x_hat, &error);
         return error;
-      });
+      },
+      buffered_training_);
   if (opq_status != 0) return opq_status;
 
   train_all_chunks(all_data.data(), num, data_stride, kMaxKmeansIters,
@@ -757,7 +759,8 @@ int PqFastQuantizer::build_centroid_distance_table(const void *centroids,
 int PqFastQuantizer::quantize_precomputed_query(const void *query,
                                                 const IndexQueryMeta &qmeta,
                                                 std::string *out,
-                                                IndexQueryMeta *ometa) const try {
+                                                IndexQueryMeta *ometa) const
+    try {
   if (input_data_type_ != DataType::kFp32 ||
       meta_.metric_name() != "SquaredEuclidean") {
     return kErrUnsupported;
