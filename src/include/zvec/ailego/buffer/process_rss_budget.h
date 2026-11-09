@@ -27,6 +27,10 @@ class ProcessRssBudget {
     size_t owned_resident{0};
   };
   using ResidentReader = ResidentSample (*)();
+  struct ResidentSampleToken {
+    uint64_t configuration{0};
+    size_t retired_bytes{0};
+  };
   struct NativeSample {
     size_t footprint{0};
     // Zero is a valid exhausted limit, not a failed sample.
@@ -213,6 +217,8 @@ class ProcessRssBudget {
     native_reader_ = native_reader;
     reader_ = reader;
     resident_reader_ = resident_reader;
+    ++resident_configuration_;
+    resident_retired_bytes_ = 0;
     recovery_sample_pending_ = false;
     rss_sample_failures_ = native_sample_failures_ = 0;
     limit_.store(limit, std::memory_order_relaxed);
@@ -283,11 +289,13 @@ class ProcessRssBudget {
     assert(rss_unsampled <= bytes && native_unsampled <= bytes);
     assert(bytes <= backing_);
     backing_ -= bytes;
+    remember_resident_retirement(bytes);
     // Unlike unmapping, free() may leave every page resident in the allocator.
     // Keep its materialization debit until a successful sample observes it.
     // A new allocation absent from that sample cannot retire the sample's
     // overlap with a different, still-live owner.
     estimate_.release(bytes - rss_unsampled, backing_);
+    if (bytes != rss_unsampled) ++resident_release_generation_;
     native_estimate_.release(bytes - native_unsampled, backing_);
     update_available();
   }
@@ -314,6 +322,43 @@ class ProcessRssBudget {
     if (!limit()) return;
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_locked(force);
+  }
+
+  // Native ownership scans may run without the budget mutex. Their provider
+  // must snapshot only owned, precharged mapping ranges. Retirements (including
+  // cancelled pending allocations) invalidate the corresponding credit even
+  // when an address is unmapped and reused during the scan.
+  ResidentSampleToken begin_resident_sample() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!limit() || !reader_ || native_reader_ ||
+        resident_retired_bytes_ == std::numeric_limits<size_t>::max()) return {};
+    return {resident_configuration_, resident_retired_bytes_};
+  }
+
+  bool publish_resident_sample(ResidentSampleToken token,
+                                ResidentSample sample) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!token.configuration || token.configuration != resident_configuration_ ||
+        !limit() || !reader_ || native_reader_ || !sample.rss ||
+        resident_retired_bytes_ == std::numeric_limits<size_t>::max())
+      return false;
+    const size_t rss = reader_();
+    rss_sample_failures_ = rss ? 0 : next_sample_failure(rss_sample_failures_);
+    if (!rss) {
+      sampled_at_ = std::chrono::steady_clock::now();
+      update_available();
+      return false;
+    }
+    size_t credit = sample.owned_resident;
+    const size_t retired = resident_retired_bytes_ - token.retired_bytes;
+    credit -= std::min(credit, retired);
+    // A sampled page may belong to an allocation whose OS call has not
+    // committed its backing debit yet. It cannot cover another live owner.
+    credit -= std::min(credit, pending_allocations_);
+    if (rss < sample.rss) credit -= std::min(credit, sample.rss - rss);
+    recovery_sample_pending_ = false;
+    publish(rss, credit);
+    return true;
   }
 
   // Ordinary-heap allowances retain accounting, not reusable physical buffers.
@@ -440,6 +485,13 @@ class ProcessRssBudget {
     return pressure_.load(std::memory_order_relaxed);
   }
 
+  bool needs_resident_confirmation() const {
+    return resident_confirmation_.load(std::memory_order_relaxed);
+  }
+  uint64_t resident_release_generation() const {
+    return resident_release_generation_.load(std::memory_order_relaxed);
+  }
+
  private:
   MaterializationStamp finish_reservation_locked(size_t bytes, bool allocated) {
     assert(bytes <= pending_allocations_);
@@ -448,6 +500,8 @@ class ProcessRssBudget {
       backing_ += bytes;
       // Keep the in-flight debit until a successful sample can observe it.
       remember_materialization(bytes);
+    } else {
+      remember_resident_retirement(bytes);
     }
     update_available();
     if (!allocated || !limit()) return {};
@@ -464,9 +518,11 @@ class ProcessRssBudget {
     refund_projection(native.bytes, native_materialized_);
     assert(bytes <= backing_);
     backing_ -= bytes;
+    remember_resident_retirement(bytes);
     // Only backing that could have contributed to a successful RSS sample
     // can explain a later RSS decrease.
     estimate_.release(bytes - rss.unsampled, backing_);
+    if (bytes != rss.unsampled) ++resident_release_generation_;
     native_estimate_.release(bytes - native.unsampled, backing_);
     update_available();
   }
@@ -498,6 +554,10 @@ class ProcessRssBudget {
     if (projection == std::numeric_limits<size_t>::max()) return;
     assert(bytes <= projection);
     projection -= bytes;
+  }
+
+  void remember_resident_retirement(size_t bytes) {
+    resident_retired_bytes_ = add_saturated(resident_retired_bytes_, bytes);
   }
 
   void refund_materialization(size_t bytes, MaterializationStamp stamp) {
@@ -808,6 +868,22 @@ class ProcessRssBudget {
                                        : available <= margin));
     available_.store(available, std::memory_order_relaxed);
     pressure_.store(pressure, std::memory_order_relaxed);
+    // A retired mapping may still be included in RSS while its replacement
+    // is already resident. Ask the ownership sampler to confirm that overlap
+    // before this conservative projection drives cache reclamation. Preserve
+    // the lifetime reservation and every pending allocation/materialization.
+    const size_t confirmed_usage = add_saturated(
+        std::max(Estimate::projected(estimate_.baseline_rss_,
+                                    estimate_.baseline_backing_, backing_),
+                 measured),
+        pending_allocations_);
+    resident_confirmation_.store(
+        pressure && cap && resident_reader_ && !native_reader_ &&
+            external_pressure_ == PressureLevel::kNormal &&
+            !admission_paused() && estimate_.pending_releases_ &&
+            confirmed_usage < usage && confirmed_usage < cap &&
+            cap - confirmed_usage >= 2 * margin,
+        std::memory_order_relaxed);
   }
 
   std::mutex mutex_;
@@ -833,5 +909,9 @@ class ProcessRssBudget {
   size_t native_materialized_{0};
   uint64_t rss_epoch_{0};
   uint64_t native_epoch_{0};
+  std::atomic<bool> resident_confirmation_{false};
+  std::atomic<uint64_t> resident_release_generation_{0};
+  uint64_t resident_configuration_{0};
+  size_t resident_retired_bytes_{0};
 };
 }  // namespace zvec::ailego

@@ -16,6 +16,9 @@ from pathlib import Path
 
 NATIVE_TARGETS = (
     "process_rss_budget_test",
+    "cache_mapping_rss_test",
+    "resident_sample_publish_test",
+    "chunk_read_lease_reuse_test",
     "pool_admission_test",
     "result_memory_allowance_test",
     "write_buffer_reservation_test",

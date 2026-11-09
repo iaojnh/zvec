@@ -249,7 +249,14 @@ bool VectorPageTable::should_admit_miss(block_id_t block_id, uint32_t epoch) {
 
   MetadataEntry &metadata = metadata_entry_at(block_id);
   static constexpr uint32_t kEpochMask = (uint32_t{1} << 24) - 1;
-  static constexpr uint8_t kAdmissionThreshold = 2;
+  const auto &budget = MemoryLimitPool::get_instance();
+  const bool oversized_cache = adaptive_priority_enabled_ &&
+                               budget.page_admission_reserve() != 0 &&
+                               entry_num_.load(std::memory_order_relaxed) >
+                                   budget.capacity() / kVectorPageSize;
+  // Oversized scans need more than an incidental second observation. Three
+  // observations within cache-sized windows identify repeatable reuse.
+  const uint8_t kAdmissionThreshold = oversized_cache ? 3 : 2;
   epoch &= kEpochMask;
 
   uint32_t state = metadata.admission_state.load(std::memory_order_relaxed);
@@ -1937,17 +1944,28 @@ bool VecBufferPool::should_admit_page(block_id_t page_id) {
   if (page_id >= page_table_.entry_num()) {
     return false;
   }
-  if (writable_ || !MemoryLimitPool::get_instance().under_cache_pressure()) {
+  auto &budget = MemoryLimitPool::get_instance();
+  // A scan larger than the cache must earn admission even between reclaim
+  // passes. Otherwise pressure clearing briefly admits the entire cold scan
+  // again, displacing useful pages and repeatedly materializing new backing.
+  const bool oversized_scan = budget.page_admission_reserve() != 0 &&
+                              file_size_ > budget.capacity();
+  if (writable_ || (!oversized_scan && !budget.under_cache_pressure())) {
     return true;
   }
 
-  // Move the aging epoch every 64K evaluated cold misses. Exact per-page
-  // counters live in existing page-table padding, so this adds no side hash.
-  static constexpr uint64_t kObservationsPerEpoch = uint64_t{1} << 16;
+  // Measure reuse against the cache capacity, rather than the entire file.
+  // Pages revisited only after more than a cache's worth of misses must earn
+  // admission again instead of continuously replacing the useful working set.
+  // Tiny standalone pools retain their historical observation window.
+  const uint64_t observations_per_epoch =
+      oversized_scan
+          ? std::max<uint64_t>(1, budget.capacity() / kVectorPageSize)
+          : uint64_t{1} << 16;
   const uint64_t observation =
       admission_observations_.fetch_add(1, std::memory_order_relaxed);
   const uint32_t epoch =
-      static_cast<uint32_t>(observation / kObservationsPerEpoch);
+      static_cast<uint32_t>(observation / observations_per_epoch);
   const bool admitted = page_table_.should_admit_miss(page_id, epoch);
   if (admitted) {
     admission_admitted_.fetch_add(1, std::memory_order_relaxed);
@@ -2564,6 +2582,7 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
   }
 
   static constexpr size_t kMaxRunPages = 1024;  // Native pages per bulk read
+  static constexpr size_t kMaxGapPages = 16;
   BudgetedMappedBuffer scratch;
 
   for (size_t pg = first_page; pg <= last_page; ++pg) {
@@ -2581,9 +2600,36 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
 
     size_t run_start = pg;
     size_t run_end = pg + 1;
-    while (run_end <= last_page && !pool_.page_table_.is_loaded(run_end) &&
-           (run_end - run_start) < kMaxRunPages) {
-      ++run_end;
+    size_t cold_pages = 1;
+    size_t reread_pages = 0;
+    while (run_end <= last_page && (run_end - run_start) < kMaxRunPages) {
+      if (!pool_.page_table_.is_loaded(run_end)) {
+        ++cold_pages;
+        ++run_end;
+        continue;
+      }
+      // Read-only bytes are immutable. Bridge short resident runs followed
+      // by another miss. Bound rereads to half the cold pages, with a 16-page
+      // floor so isolated holes do not force tiny synchronous I/Os.
+      size_t next_miss = run_end;
+      while (next_miss <= last_page &&
+             next_miss - run_start < kMaxRunPages &&
+             next_miss - run_end < kMaxGapPages &&
+             pool_.page_table_.is_loaded(next_miss)) {
+        ++next_miss;
+      }
+      const size_t gap = next_miss - run_end;
+      if (gap == 0) {
+        ++cold_pages;
+        ++run_end;
+        continue;
+      }
+      if (next_miss > last_page || next_miss - run_start >= kMaxRunPages ||
+          pool_.page_table_.is_loaded(next_miss) ||
+          reread_pages + gap > std::max(kMaxGapPages, cold_pages / 2))
+        break;
+      reread_pages += gap;
+      run_end = next_miss;
     }
     size_t run_pages = run_end - run_start;
 
@@ -2666,12 +2712,21 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
       return false;
     }
     size_t actually_read = static_cast<size_t>(got);
-    // Account for pages populated outside acquire_buffer().
+    // Account for pages populated outside acquire_buffer(), excluding
+    // resident pages that were deliberately reread to coalesce the request.
     size_t pages_read = (actually_read + kVectorPageSize - 1) / kVectorPageSize;
-    pool_.miss_count_.fetch_add(pages_read, std::memory_order_relaxed);
+    size_t read_misses = 0;
 
     for (size_t j = 0; j < run_pages; ++j) {
       block_id_t pid = static_cast<block_id_t>(run_start + j);
+      char *resident = pool_.page_table_.is_loaded(pid)
+                           ? pool_.page_table_.acquire_block(pid)
+                           : nullptr;
+      if (resident) {
+        pool_.page_table_.release_block(pid);
+      } else if (j < pages_read) {
+        ++read_misses;
+      }
       size_t page_start = pid * kVectorPageSize;
       size_t intra_offset =
           (pid == first_page) ? (file_offset - page_start) : 0;
@@ -2687,12 +2742,16 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
       // populate every cold page once the shared cache is under pressure.
       // Reuse the same compact frequency admission policy as batched random
       // reads so first-touch scan pages bypass while repeated pages can enter.
-      if (page_end_in_buf <= actually_read &&
-          !pool_.page_table_.is_loaded(pid) && pool_.should_admit_page(pid)) {
+      if (!resident && page_end_in_buf <= actually_read &&
+          pool_.should_admit_page(pid)) {
         char *page_buf = nullptr;
-        bool found = MemoryLimitPool::get_instance().try_acquire_buffer(
-            kVectorPageSize, page_buf);
-        if (!found) {
+        auto &budget = MemoryLimitPool::get_instance();
+        bool found = budget.try_acquire_buffer(kVectorPageSize, page_buf);
+        // Admission is optional for immutable scans. Let background reclaim
+        // make room instead of cycling one victim for every scanned page.
+        const bool oversized_scan = budget.page_admission_reserve() != 0 &&
+                                    pool_.file_size_ > budget.capacity();
+        if (!found && !oversized_scan) {
           BlockEvictionQueue::get_instance().recycle();
           found = MemoryLimitPool::get_instance().try_acquire_buffer(
               kVectorPageSize, page_buf);
@@ -2708,6 +2767,7 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
         }
       }
     }
+    pool_.miss_count_.fetch_add(read_misses, std::memory_order_relaxed);
     pg = run_end - 1;
   }
   return true;
