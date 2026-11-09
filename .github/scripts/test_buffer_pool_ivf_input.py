@@ -129,3 +129,24 @@ def test_appended_ids_update_exact_truth_without_reusing_dataset_row_numbers(pre
         query, query, 12, old_ids, old_distances, 3, public.document_ids(runtime, 12, 1)
     )
     assert ids[0, 0] == 1078
+
+
+@pytest.mark.parametrize(("second_matches", "passes"), [(10, True), (8, False)])
+def test_ann_recall_uses_the_fixed_query_set_mean(
+    prepared, monkeypatch, second_matches, passes
+):
+    public, _, _, _, _, _ = prepared
+    hits = []
+    for matches in (8, second_matches):
+        keys = [*range(matches), *range(100, 110 - matches)]
+        hits.append([SimpleNamespace(id=str(key), score=1.0) for key in keys])
+    returned = iter(hits)
+    monkeypatch.setattr(public, "query", lambda *_: next(returned))
+    config = {"query": {"topk": 10}, "acceptance": {"minimum_recall": 0.9}}
+    if passes:
+        assert public.verify_queries(
+            config, None, [[0], [1]], [list(range(10))] * 2
+        ) == pytest.approx(0.9)
+    else:
+        with pytest.raises(AssertionError, match="mean recall@10"):
+            public.verify_queries(config, None, [[0], [1]], [list(range(10))] * 2)

@@ -153,6 +153,23 @@ def check_searchable(config, collection, expected_id, vector):
     return 1
 
 
+def verify_queries(config, collection, queries, truth):
+    recalls = [
+        check_hits(
+            query(config, collection, vector),
+            [str(key) for key in nearest],
+            config["query"]["topk"],
+        )
+        for vector, nearest in zip(queries, truth, strict=True)
+    ]
+    recall = float(np.mean(recalls))
+    if recall < config["acceptance"]["minimum_recall"]:
+        raise AssertionError(
+            f"mean recall@{config['query']['topk']} {recall:.4f} is below {config['acceptance']['minimum_recall']}"
+        )
+    return recall
+
+
 def documents(config, start, batch, cycle=0):
     return [
         zvec.Doc(
@@ -414,20 +431,9 @@ def verify(config, root, storage, after_mixed=True):
     collection = zvec.open(str(root / "collection"), option(config, storage, True))
     try:
         assert collection.stats.doc_count == fixture["rows"]
-        probe_count = len(fixture["queries"]) if after_mixed else 1
-        recalls = [
-            check_hits(
-                query(config, collection, vector),
-                [str(i) for i in truth],
-                config["query"]["topk"],
-            )
-            for vector, truth in zip(
-                fixture["queries"][:probe_count],
-                fixture["truth"][:probe_count],
-                strict=True,
-            )
-        ]
-        assert min(recalls) >= config["acceptance"]["minimum_recall"]
+        recall = verify_queries(
+            config, collection, fixture["queries"], fixture["truth"]
+        )
         probe_id = fixture["probe_id"]
         ids = [probe_id, fixture["new_id"]] if after_mixed else [probe_id]
         docs = collection.fetch(ids)
@@ -458,7 +464,7 @@ def verify(config, root, storage, after_mixed=True):
         collection.close()
     return {
         "rows": fixture["rows"],
-        "recall": float(np.mean(recalls)),
+        "recall": recall,
         "fields_and_vectors_verified": True,
         "new_vector_query_verified": after_mixed,
     }
@@ -486,15 +492,7 @@ def query_trials(config, root, storage, trial):
         # The corpus, projection and search parameters are identical in every
         # case. Check the complete fixed query set once per fresh process;
         # measured queries also validate their own results below.
-        for i, vector in enumerate(fixture["queries"]):
-            assert (
-                check_hits(
-                    query(config, collection, vector),
-                    [str(x) for x in fixture["truth"][i]],
-                    config["query"]["topk"],
-                )
-                >= config["acceptance"]["minimum_recall"]
-            )
+        verify_queries(config, collection, fixture["queries"], fixture["truth"])
         for distribution in config["query"]["distributions"]:
             weights = distributions[distribution]
             sequence = rng.choice(count, size=1024, p=weights / weights.sum()).tolist()
