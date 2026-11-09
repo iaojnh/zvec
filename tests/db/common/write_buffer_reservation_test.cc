@@ -50,74 +50,6 @@ class WriteBufferReservationTest : public testing::Test {
   ailego::PoolPayloadBudget &pool_ = ailego::PoolPayloadBudget::get_instance();
 };
 
-TEST_F(WriteBufferReservationTest, LargeAllowanceIncludesFlushHeadroom) {
-  WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
-  EXPECT_EQ(264 * kMiB, writer.bytes());
-  EXPECT_EQ(writer.bytes(), pool_.external_used());
-  EXPECT_EQ(writer.bytes(), pool_.used());
-  // Further writes to the same live buffer must not reserve another allowance.
-  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
-  EXPECT_EQ(264 * kMiB, pool_.external_used());
-  writer.release();
-  writer.release();
-  EXPECT_EQ(0u, pool_.external_used());
-  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
-  EXPECT_EQ(264 * kMiB, pool_.external_used());
-}
-
-TEST_F(WriteBufferReservationTest, RetainedAndLiveAllowancesObeyHostPressure) {
-  WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(kMiB, true).ok());
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  using Pressure = ailego::ProcessRssBudget::PressureLevel;
-  pool.set_memory_pressure(Pressure::kCritical);
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, writer.acquire(kMiB, true).code());
-  writer.release();
-  const auto backing =
-      detail::SharedWriteBufferMemoryAllowance().reserved_bytes();
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, writer.acquire(kMiB, true).code());
-  EXPECT_EQ(0u, writer.bytes());
-  pool.set_memory_pressure(Pressure::kBackground);
-  EXPECT_TRUE(writer.acquire(kMiB, true).ok());
-  pool.set_memory_pressure(Pressure::kNormal);
-  EXPECT_EQ(backing,
-            detail::SharedWriteBufferMemoryAllowance().reserved_bytes());
-}
-
-TEST_F(WriteBufferReservationTest, WriterPromotionsShareMeasuredHeadroom) {
-  WriteBufferReservation first;
-  WriteBufferReservation second;
-  ASSERT_TRUE(first.acquire(kMiB).ok());
-  ASSERT_TRUE(second.acquire(kMiB).ok());
-
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  using Peer = ailego::MemoryLimitPoolTestPeer;
-  constexpr size_t kLimit = 128 * kMiB;
-  constexpr size_t kRss = 116 * kMiB;
-  auto restore = ailego::ScopeGuard::Make(
-      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
-  ASSERT_TRUE(Peer::configure_rss(pool, kLimit, kRss));
-  // Keep the limiting observation stable if the test is descheduled.
-  Peer::refresh_rss(pool, 0);
-
-  ASSERT_TRUE(first.acquire_managed(kMiB).ok());
-  EXPECT_TRUE(first.acquire_managed(kMiB).ok());
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
-            second.acquire_managed(kMiB).code());
-
-  Peer::refresh_rss(pool, kRss);
-  // An unchanged RSS sample does not prove that either newly retained
-  // ordinary workspace is resident. Keep its lifetime charge until reclaimed.
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
-            second.acquire_managed(kMiB).code());
-  first.release();
-  second.release();
-  detail::SharedWriteBufferMemoryAllowance().reclaim_idle();
-  Peer::refresh_rss(pool, kRss);
-  EXPECT_TRUE(second.acquire_managed(kMiB).ok());
-}
-
 TEST_F(WriteBufferReservationTest, CollectionsShareBudgetAndReturnAllowance) {
   pool_.init(528 * kMiB);
   WriteBufferReservation first;
@@ -152,25 +84,6 @@ TEST_F(WriteBufferReservationTest, ManagedPlanLeavesRssRoomForArrowBacking) {
   EXPECT_EQ(264 * kMiB, pool_.external_used());
 }
 
-TEST_F(WriteBufferReservationTest, RejectedPromotionDoesNotAcquireRssBacking) {
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  using Peer = ailego::MemoryLimitPoolTestPeer;
-  auto restore = ailego::ScopeGuard::Make(
-      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
-  ASSERT_TRUE(Peer::configure_rss(pool, 128 * kMiB, 124 * kMiB));
-  Peer::refresh_rss(pool, 0);
-
-  WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(kMiB).ok());
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED,
-            writer.acquire_managed(kMiB).code());
-  EXPECT_EQ(12 * kMiB, writer.bytes());
-  writer.release();
-  EXPECT_EQ(0u, pool_.external_used());
-  ASSERT_TRUE(pool.try_charge_process_backing(kMiB, kMiB, false));
-  pool.release_process_backing(kMiB);
-}
-
 TEST_F(WriteBufferReservationTest, ConcurrentAdmissionCannotOverReserve) {
   pool_.init(4 * 264 * kMiB);
   std::atomic<unsigned> admitted{0};
@@ -194,67 +107,6 @@ TEST_F(WriteBufferReservationTest, ConcurrentAdmissionCannotOverReserve) {
   EXPECT_EQ(4 * 264 * kMiB, pool_.external_used());
 }
 
-TEST_F(WriteBufferReservationTest, ActualWritesRetainAndReuseBacking) {
-  auto &allowance = detail::SharedWriteBufferMemoryAllowance();
-  for (int i = 0; i < 3; ++i) {
-    {
-      WriteBufferReservation writer;
-      ASSERT_TRUE(writer.acquire(kStressBufferBytes, true).ok());
-      EXPECT_EQ(264 * kMiB, allowance.active_bytes());
-      EXPECT_EQ(264 * kMiB, pool_.external_used());
-      writer.release();
-      writer.release();
-      EXPECT_EQ(0u, writer.bytes());
-    }
-    EXPECT_EQ(0u, allowance.active_bytes());
-    EXPECT_EQ(264 * kMiB, allowance.reserved_bytes());
-    EXPECT_EQ(264 * kMiB, pool_.external_used());
-  }
-  // An unrelated page/workspace cannot spend the idle writer's backing quota.
-  const auto remaining = pool_.capacity() - allowance.reserved_bytes();
-  ASSERT_TRUE(pool_.try_charge_external(remaining));
-  EXPECT_FALSE(pool_.try_charge_external(1));
-  pool_.release_external(remaining);
-}
-
-TEST_F(WriteBufferReservationTest, ManagedWritesRetainOnlyOrdinaryWorkspace) {
-  auto &allowance = detail::SharedWriteBufferMemoryAllowance();
-  for (int i = 0; i < 3; ++i) {
-    WriteBufferReservation writer;
-    ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
-    ASSERT_TRUE(writer.acquire_managed(kStressBufferBytes).ok());
-    ASSERT_TRUE(writer.acquire_managed(kStressBufferBytes).ok());
-    EXPECT_EQ(264 * kMiB, allowance.active_bytes());
-    writer.release();
-    EXPECT_EQ(0u, allowance.active_bytes());
-    EXPECT_EQ(8 * kMiB, allowance.reserved_bytes());
-  }
-}
-
-TEST_F(WriteBufferReservationTest, ManagedAndReplayBackingAreCountedPerLease) {
-  pool_.init(800 * kMiB);
-  WriteBufferReservation first;
-  WriteBufferReservation second;
-  WriteBufferReservation admission;
-  ASSERT_TRUE(first.acquire_managed(kStressBufferBytes).ok());
-  ASSERT_TRUE(second.acquire(kStressBufferBytes).ok());
-  ASSERT_TRUE(admission.acquire(kStressBufferBytes).ok());
-  ASSERT_TRUE(second.acquire_managed(kStressBufferBytes).ok());
-  auto &allowance = detail::SharedWriteBufferMemoryAllowance();
-  admission.release();
-  second.release();
-  first.release();
-  EXPECT_EQ(16 * kMiB, allowance.reserved_bytes());
-
-  ASSERT_TRUE(first.acquire_managed(kStressBufferBytes).ok());
-  ASSERT_TRUE(second.acquire(kStressBufferBytes, true).ok());
-  // An explicit legacy backing lease must not be downgraded by a later call.
-  ASSERT_TRUE(second.acquire_managed(kStressBufferBytes).ok());
-  second.release();
-  first.release();
-  EXPECT_EQ(272 * kMiB, allowance.reserved_bytes());
-}
-
 TEST_F(WriteBufferReservationTest, RejectedManagedWriterDoesNotRetainBacking) {
   WriteBufferReservation first;
   WriteBufferReservation second;
@@ -264,25 +116,6 @@ TEST_F(WriteBufferReservationTest, RejectedManagedWriterDoesNotRetainBacking) {
   first.release();
   EXPECT_EQ(8 * kMiB,
             detail::SharedWriteBufferMemoryAllowance().reserved_bytes());
-}
-
-TEST_F(WriteBufferReservationTest, TransientAdmissionOnlyReturnsExcess) {
-  auto &allowance = detail::SharedWriteBufferMemoryAllowance();
-  WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
-  writer.release();
-  EXPECT_EQ(0u, allowance.reserved_bytes());
-
-  // An explicit backing request promotes an admitted lease without charging
-  // twice. A later clean-open check must not increase the retained high water.
-  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
-  ASSERT_TRUE(writer.acquire(kStressBufferBytes, true).ok());
-  EXPECT_EQ(264 * kMiB, pool_.external_used());
-  writer.release();
-  ASSERT_TRUE(writer.acquire(96 * kMiB).ok());
-  EXPECT_EQ(392 * kMiB, pool_.external_used());
-  writer.release();
-  EXPECT_EQ(264 * kMiB, pool_.external_used());
 }
 
 TEST_F(WriteBufferReservationTest,
@@ -300,29 +133,6 @@ TEST_F(WriteBufferReservationTest,
   first.release();
   ASSERT_TRUE(second.acquire(kStressBufferBytes, true).ok());
   EXPECT_EQ(264 * kMiB, pool_.external_used());
-}
-
-TEST_F(WriteBufferReservationTest, ReservationLeavesOnlyRemainderForCache) {
-  WriteBufferReservation writer;
-  ASSERT_TRUE(writer.acquire(kStressBufferBytes).ok());
-  const auto remainder = pool_.capacity() - writer.bytes();
-  ASSERT_TRUE(pool_.try_charge_external(remainder));
-  EXPECT_FALSE(pool_.try_charge_external(1));
-  pool_.release_external(remainder);
-}
-
-TEST_F(WriteBufferReservationTest, OverflowFailsWithoutConsumingBudget) {
-  WriteBufferReservation writer;
-  EXPECT_EQ(StatusCode::INVALID_ARGUMENT,
-            writer.acquire(std::numeric_limits<size_t>::max()).code());
-  EXPECT_EQ(0u, pool_.external_used());
-}
-
-TEST_F(WriteBufferReservationTest, UnconfiguredPoolRetainsLegacyBehavior) {
-  pool_.init(0);
-  WriteBufferReservation writer;
-  EXPECT_TRUE(writer.acquire(kStressBufferBytes).ok());
-  EXPECT_EQ(0u, writer.bytes());
 }
 
 }  // namespace

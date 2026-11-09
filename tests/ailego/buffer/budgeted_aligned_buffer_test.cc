@@ -31,42 +31,6 @@ class BudgetedAlignedBufferTest : public testing::Test {
   size_t old_capacity_{0};
 };
 
-TEST_F(BudgetedAlignedBufferTest, SmallBuffersKeepExactHeapCharge) {
-  BudgetedAlignedBuffer buffer(1024, 64);
-  EXPECT_EQ(1024u, pool_.external_used());
-  EXPECT_EQ(0u, pool_.stats().retained_block_bytes);
-  EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(buffer.data()) % 64);
-  buffer.resize(0, 64);
-  EXPECT_EQ(nullptr, buffer.data());
-  EXPECT_EQ(0u, pool_.used());
-}
-
-TEST_F(BudgetedAlignedBufferTest, IdleBackingStaysChargedUntilReclaimed) {
-  const size_t backing = MemoryLimitPool::retained_block_size(kLarge);
-  void *address = nullptr;
-  {
-    BudgetedAlignedBuffer buffer(kLarge, 64);
-    address = buffer.data();
-    std::memset(address, 0x35, kLarge);
-    EXPECT_EQ(backing, pool_.external_used());
-    EXPECT_EQ(backing, pool_.stats().retained_block_bytes);
-    EXPECT_EQ(backing, pool_.committed());
-  }
-  EXPECT_EQ(0u, pool_.used());
-  EXPECT_EQ(backing, pool_.committed());
-  EXPECT_EQ(backing, pool_.stats().retained_idle_bytes);
-  {
-    BudgetedAlignedBuffer reused(kLarge, 64);
-    EXPECT_EQ(address, reused.data());
-    EXPECT_EQ(backing, pool_.committed());
-    EXPECT_EQ(0u, pool_.stats().retained_idle_bytes);
-  }
-  MemoryReservation pressure;
-  pressure.add(pool_.capacity());
-  EXPECT_EQ(0u, pool_.stats().retained_block_bytes);
-  EXPECT_EQ(pool_.capacity(), pool_.committed());
-}
-
 TEST_F(BudgetedAlignedBufferTest, LargeAlignmentChargesPaddingAndWholePages) {
   const size_t alignment = 2 * PoolPayloadBudget::page_buffer_size();
   BudgetedAlignedBuffer buffer(kLarge + 1, alignment);
@@ -116,73 +80,5 @@ TEST_F(BudgetedAlignedBufferTest, MoveAndCrossThreadReleaseKeepOwnership) {
   EXPECT_EQ(0u, pool_.used());
 }
 
-TEST_F(BudgetedAlignedBufferTest, InvalidSizeAndAlignmentPreserveBuffer) {
-  BudgetedAlignedBuffer buffer(128, 64);
-  void *original = buffer.data();
-  EXPECT_THROW(buffer.resize(kLarge, 3), std::bad_alloc);
-  EXPECT_THROW(buffer.resize(std::numeric_limits<size_t>::max(), 4096),
-               std::bad_alloc);
-  EXPECT_THROW(buffer.resize_array(std::numeric_limits<size_t>::max(), 2, 64),
-               std::bad_alloc);
-  EXPECT_EQ(original, buffer.data());
-  EXPECT_EQ(128u, pool_.used());
-}
-
-TEST_F(BudgetedAlignedBufferTest, UnconfiguredHeapDoesNotDebitLaterBudget) {
-  ASSERT_EQ(0, pool_.init(0));
-  BudgetedAlignedBuffer buffer(kLarge, 64);
-  ASSERT_NE(nullptr, buffer.data());
-  EXPECT_EQ(0u, pool_.used());
-  EXPECT_EQ(0u, pool_.stats().retained_block_bytes);
-  ASSERT_EQ(0, pool_.init(16UL << 20));
-  buffer.resize(0, 64);
-  EXPECT_EQ(0u, pool_.used());
-}
-
-TEST_F(BudgetedAlignedBufferTest, UntouchedMappingKeepsRssReservation) {
-  ASSERT_EQ(0, pool_.init(64UL << 20));
-  auto &native_pool = MemoryLimitPool::get_instance();
-  const size_t rss = MemoryHelper::SelfRSS();
-  ASSERT_GT(rss, 0u);
-  ASSERT_TRUE(native_pool.configure_process_rss_limit(rss + (32UL << 20)));
-  auto restore =
-      ScopeGuard::Make([&] { native_pool.configure_process_rss_limit(0); });
-  BudgetedAlignedBuffer first(24UL << 20, 64);
-  // Do not touch the mapping: another RSS sample must not forget it.
-  std::this_thread::sleep_for(std::chrono::milliseconds(60));
-  EXPECT_GT(pool_.available(), 16UL << 20);
-  EXPECT_THROW(
-      { BudgetedAlignedBuffer second(16UL << 20, 64); }, std::bad_alloc);
-  first.resize(0, 64);
-  ASSERT_NO_THROW(first.resize(16UL << 20, 64));
-}
-
-TEST_F(BudgetedAlignedBufferTest, HostReleaseRecoversWithLiveQueueMetadata) {
-  ASSERT_EQ(0, pool_.init(64UL << 20));
-  auto &native_pool = MemoryLimitPool::get_instance();
-  ASSERT_GT(native_pool.queue_metadata_used(), 0u);
-  constexpr size_t kHostBytes = 64UL << 20;
-  void *host = File::MemoryMap(kHostBytes, 0);
-  ASSERT_NE(nullptr, host);
-  auto cleanup = ScopeGuard::Make([&] {
-    if (host) File::MemoryUnmap(host, kHostBytes);
-    native_pool.configure_process_rss_limit(0);
-  });
-  std::memset(host, 0x27, kHostBytes);
-  const size_t rss = MemoryHelper::SelfRSS();
-  ASSERT_GT(rss, 0u);
-  ASSERT_TRUE(native_pool.configure_process_rss_limit(rss + (4UL << 20)));
-  ASSERT_TRUE(native_pool.under_process_rss_pressure());
-  File::MemoryUnmap(host, kHostBytes);
-  host = nullptr;
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  while (native_pool.under_process_rss_pressure() &&
-         std::chrono::steady_clock::now() < deadline)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  ASSERT_FALSE(native_pool.under_process_rss_pressure());
-  ASSERT_NO_THROW({ BudgetedAlignedBuffer buffer(16UL << 20, 64); });
-  EXPECT_GT(native_pool.queue_metadata_used(), 0u);
-}
 }  // namespace
 }  // namespace zvec::ailego

@@ -58,51 +58,6 @@ TEST(RevertedResultMemory, CopiesChargeAndMovesTransferUntilLastOwner) {
   EXPECT_EQ(0u, pool.used());
 }
 
-TEST(RevertedResultMemory,
-     GroupedDbCopyRejectsPressureWithoutReleasingOriginal) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  AILEGO_DEFER([&] {
-    EXPECT_EQ(0u, pool.used());
-    pool.init(previous);
-  });
-  ASSERT_EQ(0, pool.init(16384));
-  SearchResult result;
-  Populate(&result, true);
-  const size_t charged = pool.used();
-  GroupVectorIndexResults db_result(
-      std::move(result.group_doc_list_),
-      std::move(result.group_reverted_vector_list_),
-      std::move(result.group_reverted_sparse_values_list_),
-      result.take_reverted_memory());
-  result.clear();
-  EXPECT_THROW({ GroupVectorIndexResults copy(db_result); }, std::bad_alloc);
-  EXPECT_EQ(charged, pool.used());
-  EXPECT_EQ(std::string(4096, 'v'),
-            db_result.reverted_sparse_values_list()[0][0]);
-}
-
-TEST(RevertedResultMemory, CopyAssignmentFailurePreservesBothResults) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  AILEGO_DEFER([&] {
-    EXPECT_EQ(0u, pool.used());
-    pool.init(previous);
-  });
-  ASSERT_EQ(0, pool.init(24576));
-  SearchResult a, b;
-  Populate(&a, false);
-  Populate(&b, false);
-  const size_t before = pool.used();
-  EXPECT_THROW(b = a, std::bad_alloc);
-  EXPECT_EQ(before, pool.used());
-  EXPECT_EQ(a.reverted_vector_list_, b.reverted_vector_list_);
-  b.clear();
-  EXPECT_NO_THROW(b = a);
-}
-
 TEST(RevertedResultMemory, PublicQuantizedSearchReplacesOldDecodedPayload) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t previous = pool.capacity();

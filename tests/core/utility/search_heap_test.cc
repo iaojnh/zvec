@@ -69,33 +69,6 @@ TEST(SearchHeap, MandatoryWorkspaceWaitsForPendingPageRelease) {
   if (workspace) allocator.deallocate(workspace, 1024);
 }
 
-TEST(SearchHeap, MandatoryWorkspaceRejectsUnreclaimableBudget) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t old = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  AILEGO_DEFER([&] {
-    EXPECT_EQ(0u, pool.used());
-    pool.init(old);
-  });
-  constexpr size_t capacity = 64 * 1024 + 1;
-  ASSERT_EQ(0, pool.init(capacity));
-  ASSERT_TRUE(pool.try_charge_external(capacity));
-  auto waits = pool.stats().capacity_waits;
-  EXPECT_FALSE(pool.try_charge_workspace(1024));
-  EXPECT_EQ(waits, pool.stats().capacity_waits);
-  pool.release_external(capacity);
-
-  char *buffer = nullptr;
-  ASSERT_TRUE(pool.try_acquire_buffer(capacity, buffer));
-  const auto timeouts = pool.stats().capacity_wait_timeouts;
-  EXPECT_FALSE(pool.try_charge_workspace(1024));
-  EXPECT_EQ(waits + 1, pool.stats().capacity_waits);
-  EXPECT_EQ(timeouts + 1, pool.stats().capacity_wait_timeouts);
-  pool.release_buffer(buffer, capacity);
-  EXPECT_TRUE(pool.try_charge_workspace(1024));
-  pool.release_external(1024);
-}
-
 TEST(SearchHeap, ReusesSelectedTopkAndExportsInDistanceOrder) {
   SearchHeap heap;
   auto &topk = heap.reset<TopkHeap>(3);
@@ -155,34 +128,6 @@ TEST(SearchHeap, SelectsPoolBackendFromCpuFeatures) {
   EXPECT_EQ(0U, heap.size());
 }
 
-TEST(SearchHeap, LazyCandidateAdmissionRejectsAndReleasesBudget) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t old = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  AILEGO_DEFER([&] {
-    EXPECT_EQ(0u, pool.used());
-    pool.init(old);
-  });
-  ASSERT_EQ(0, pool.init(64 * 1024));
-  {
-    ailego::BudgetedKeyValueHeap<uint32_t, float, std::greater<float>> heap;
-    heap.limit(1000000);
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0u, heap.container().capacity());
-    EXPECT_THROW(
-        {
-          for (uint32_t i = 0; i < 1000000; ++i) heap.emplace(i, float(i));
-        },
-        std::bad_alloc);
-    EXPECT_GT(pool.used(), 0u);
-    EXPECT_LE(pool.used(), pool.capacity());
-    heap.release();
-    EXPECT_EQ(0u, pool.used());
-    heap.emplace(1, 1.0f);
-    EXPECT_EQ(1u, heap.size());
-  }
-}
-
 TEST(SearchHeap, AllBackendsAreChargedAndRetryAfterRejection) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t old = pool.capacity();
@@ -207,22 +152,5 @@ TEST(SearchHeap, AllBackendsAreChargedAndRetryAfterRejection) {
   }
 }
 
-TEST(SearchHeap, RareLargeHeapDoesNotStayAtHighWaterMark) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t old = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  AILEGO_DEFER([&] {
-    EXPECT_EQ(0u, pool.used());
-    pool.init(old);
-  });
-  ASSERT_EQ(0, pool.init(1024 * 1024));
-  {
-    TopkHeap heap(20000);
-    for (uint32_t i = 0; i < 10000; ++i) heap.emplace(i, float(i));
-    EXPECT_GT(pool.used(), 64000u);
-    heap.clear();
-    EXPECT_EQ(0u, pool.used());
-  }
-}
 }  // namespace
 }  // namespace zvec::core

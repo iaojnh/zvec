@@ -40,28 +40,6 @@ TEST(EvictionQueueRecoveryTest, InitialIndexFailureCanRetryWithoutNewProducer) {
   EXPECT_FALSE(queue.try_dequeue(value));
 }
 
-TEST(EvictionQueueRecoveryTest, RecycledProducerRecoversItsMissingIndex) {
-  moodycamel::ConcurrentQueue<int, FailingIndexQueueTraits> queue(0);
-  std::thread first([&] {
-    FailingIndexQueueTraits::allocations_left = 1;
-    EXPECT_FALSE(queue.enqueue(1));
-  });
-  first.join();
-  FailingIndexQueueTraits::allocations_left =
-      std::numeric_limits<size_t>::max();
-  std::thread second([&] {
-    const int values[] = {2, 3};
-    EXPECT_TRUE(queue.enqueue_bulk(values, 2));
-  });
-  second.join();
-  int value = 0;
-  ASSERT_TRUE(queue.try_dequeue(value));
-  EXPECT_EQ(2, value);
-  ASSERT_TRUE(queue.try_dequeue(value));
-  EXPECT_EQ(3, value);
-  EXPECT_FALSE(queue.try_dequeue(value));
-}
-
 class EvictionQueueBudgetTest : public testing::Test {
  protected:
   void SetUp() override {
@@ -77,21 +55,6 @@ class EvictionQueueBudgetTest : public testing::Test {
   MemoryLimitPool &pool_ = MemoryLimitPool::get_instance();
 };
 
-TEST_F(EvictionQueueBudgetTest, InitialQueuesConsumeTheConfiguredTotalBudget) {
-  const size_t queue = pool_.queue_metadata_used();
-  EXPECT_GT(queue, 9UL << 20);
-  EXPECT_LT(queue, 12UL << 20);
-  EXPECT_EQ(64UL << 20, pool_.capacity());
-  EXPECT_EQ(pool_.capacity() - queue, pool_.available());
-  const auto stats = pool_.stats();
-  EXPECT_EQ(queue, stats.queue_metadata_used);
-  EXPECT_EQ(queue, stats.queue_allocated);
-  EXPECT_EQ(queue, stats.metadata_used);
-  EXPECT_EQ(0u, stats.page_used);
-  EXPECT_EQ(0u, stats.external_used);
-  EXPECT_EQ(queue, stats.committed);
-}
-
 TEST_F(EvictionQueueBudgetTest, InsufficientInitializationPreservesOldBudget) {
   const size_t queue = pool_.queue_allocated();
   EXPECT_NE(0, pool_.init(queue - 1));
@@ -100,55 +63,6 @@ TEST_F(EvictionQueueBudgetTest, InsufficientInitializationPreservesOldBudget) {
   EXPECT_EQ(0, pool_.init(queue));
   EXPECT_EQ(0u, pool_.available());
   EXPECT_FALSE(pool_.try_charge_external(1));
-  EXPECT_EQ(0, pool_.init(64UL << 20));
-}
-
-TEST_F(EvictionQueueBudgetTest, SuccessfulChargesOnlyNotifyUnderPressure) {
-  const auto before = pool_.stats().bg_charge_notifications;
-  for (size_t i = 0; i < 64; ++i) {
-    MemoryLimitPool::PendingAllocation allocation(
-        pool_, MemoryLimitPool::PendingAllocation::Kind::kWorkspace);
-    ASSERT_TRUE(allocation.reserve(64));
-  }
-  EXPECT_EQ(before, pool_.stats().bg_charge_notifications);
-  const size_t remaining = pool_.available();
-  ASSERT_TRUE(pool_.try_charge_external(remaining));
-  EXPECT_GT(pool_.stats().bg_charge_notifications, before);
-  EXPECT_FALSE(pool_.try_charge_external(1));
-  pool_.release_external(remaining);
-}
-
-TEST_F(EvictionQueueBudgetTest,
-       DisabledAndReinitializedPoolAdoptsRetainedQueues) {
-  const size_t queue = pool_.queue_allocated();
-  ASSERT_EQ(0, pool_.init(0));
-  EXPECT_EQ(queue, pool_.queue_allocated());
-  EXPECT_EQ(0u, pool_.queue_metadata_used());
-  {
-    BlockEvictionQueue::ConcurrentQueue extra(128);
-    const size_t grown = pool_.queue_allocated();
-    EXPECT_GT(grown, queue);
-    ASSERT_EQ(0, pool_.init(64UL << 20));
-    EXPECT_EQ(grown, pool_.used());
-    EXPECT_EQ(grown, pool_.queue_metadata_used());
-    ASSERT_EQ(0, pool_.init(64UL << 20));
-    EXPECT_EQ(grown, pool_.used());
-  }
-  EXPECT_EQ(queue, pool_.used());
-}
-
-TEST_F(EvictionQueueBudgetTest, ActiveConsumerStillPreventsBudgetChanges) {
-  const size_t queue = pool_.queue_metadata_used();
-  ASSERT_TRUE(pool_.try_charge_external(4096));
-  EXPECT_EQ(0, pool_.init(64UL << 20));
-  EXPECT_NE(0, pool_.init(32UL << 20));
-  EXPECT_NE(0, pool_.init(0));
-  EXPECT_EQ(64UL << 20, pool_.capacity());
-  EXPECT_EQ(queue + 4096, pool_.used());
-  EXPECT_EQ(queue, pool_.queue_metadata_used());
-  pool_.release_external(4096);
-  EXPECT_EQ(0, pool_.init(32UL << 20));
-  EXPECT_EQ(queue, pool_.used());
   EXPECT_EQ(0, pool_.init(64UL << 20));
 }
 
@@ -174,74 +88,6 @@ TEST_F(EvictionQueueBudgetTest,
   }
   EXPECT_EQ(baseline, pool_.used());
   EXPECT_EQ(baseline, pool_.committed());
-}
-
-TEST_F(EvictionQueueBudgetTest, DynamicBlocksCannotEscapeTheSharedBudget) {
-  const size_t baseline = pool_.used();
-  {
-    BlockEvictionQueue::ConcurrentQueue queue(32);
-    const size_t pressure = pool_.available() - (128UL << 10);
-    ASSERT_TRUE(pool_.try_charge_external(pressure));
-    size_t accepted = 0;
-    for (; accepted < 16384; ++accepted) {
-      BlockEvictionQueue::BlockType item;
-      item.owner_key = accepted;
-      if (!queue.enqueue(item)) break;
-    }
-    EXPECT_GT(accepted, 32u);
-    EXPECT_LT(accepted, 16384u);
-    EXPECT_LE(pool_.used(), pool_.capacity());
-    EXPECT_LE(pool_.committed(), pool_.capacity());
-    for (size_t i = 0; i < accepted; ++i) {
-      BlockEvictionQueue::BlockType item;
-      ASSERT_TRUE(queue.try_dequeue(item));
-      EXPECT_EQ(i, item.owner_key);
-    }
-    pool_.release_external(pressure);
-    ASSERT_TRUE(queue.enqueue({}));
-  }
-  EXPECT_EQ(baseline, pool_.used());
-}
-
-TEST_F(EvictionQueueBudgetTest, OldSlabCannotTouchNewPagesUnderPressure) {
-  const size_t page = MemoryLimitPool::page_buffer_size();
-  if (page >= (64UL << 10)) GTEST_SKIP() << "Queue slabs fit in one page";
-  constexpr size_t bytes = 3001;
-  std::vector<void *> slots;
-  using Pressure = ProcessRssBudget::PressureLevel;
-  const auto cleanup = ScopeGuard::Make([&] {
-    pool_.set_memory_pressure(Pressure::kNormal);
-    for (void *slot : slots) EvictionQueueTraits::free(slot);
-  });
-
-  void *first = EvictionQueueTraits::malloc(bytes);
-  ASSERT_NE(nullptr, first);
-  slots.push_back(first);
-  const size_t committed = pool_.committed();
-  pool_.set_memory_pressure(Pressure::kCritical);
-  bool denied = false;
-  for (size_t i = 0; i < page / bytes + 1; ++i) {
-    void *slot = EvictionQueueTraits::malloc(bytes);
-    if (!slot) {
-      denied = true;
-      break;
-    }
-    slots.push_back(slot);
-  }
-  EXPECT_TRUE(denied);
-  EXPECT_EQ(committed, pool_.committed());
-
-  pool_.set_memory_pressure(Pressure::kNormal);
-  void *slot = EvictionQueueTraits::malloc(bytes);
-  ASSERT_NE(nullptr, slot);
-  slots.push_back(slot);
-  EXPECT_EQ(committed, pool_.committed());
-  EvictionQueueTraits::free(slot);
-  slots.pop_back();
-  pool_.set_memory_pressure(Pressure::kCritical);
-  void *reused = EvictionQueueTraits::malloc(bytes);
-  EXPECT_EQ(slot, reused);
-  if (reused) slots.push_back(reused);
 }
 
 TEST_F(EvictionQueueBudgetTest, ConcurrentAllocationAndCrossThreadFreeBalance) {

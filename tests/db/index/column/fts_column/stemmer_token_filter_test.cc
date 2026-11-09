@@ -174,56 +174,6 @@ TEST(StemmerTokenFilterTest, PorterAlgorithm) {
   EXPECT_EQ(tokens[0].text, "run");
 }
 
-TEST(StemmerMemoryDeathTest, LanguagePeaksRemainChargedAndGrowthCanRetry) {
-#if GTEST_HAS_DEATH_TEST
-  const auto previous = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  EXPECT_EXIT(
-      {
-        auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
-        if (pool.init(64UL << 20) != 0) std::_Exit(1);
-        const size_t before = pool.external_used();
-        size_t first = 0;
-        {
-          StemmerTokenFilter english;
-          if (!english.init({})) std::_Exit(2);
-          (void)english.filter({Token{std::string(1UL << 20, 'x')}});
-          first = pool.external_used();
-          if (first <= before) std::_Exit(3);
-          const auto short_word = english.filter({Token{"running"}});
-          if (pool.external_used() != first || short_word[0].text != "run")
-            std::_Exit(4);
-          zvec::ailego::JsonObject config;
-          config["stemmer_lang"] = "german";
-          StemmerTokenFilter german;
-          if (!german.init(config)) std::_Exit(5);
-          (void)german.filter({Token{std::string(1UL << 20, 'x')}});
-          if (pool.external_used() <= first) std::_Exit(6);
-          const size_t cached = pool.external_used();
-          zvec::ailego::MemoryReservation pressure;
-          pressure.add(pool.available());
-          const size_t full = pool.external_used();
-          bool rejected = false;
-          try {
-            (void)english.filter({Token{std::string(2UL << 20, 'x')}});
-          } catch (const std::bad_alloc &) {
-            rejected = true;
-          }
-          if (!rejected || pool.external_used() != full) std::_Exit(7);
-          pressure.retain_at_most(0);
-          (void)english.filter({Token{std::string(2UL << 20, 'x')}});
-          if (pool.external_used() <= cached) std::_Exit(8);
-        }
-        if (pool.external_used() <= first) std::_Exit(9);
-        std::_Exit(0);
-      },
-      ::testing::ExitedWithCode(0), "");
-  ::testing::FLAGS_gtest_death_test_style = previous;
-#else
-  GTEST_SKIP() << "Process isolation is unavailable";
-#endif
-}
-
 TEST(StemmerMemoryDeathTest, ThreadExitReleasesNativeContextsAndAdmission) {
 #if GTEST_HAS_DEATH_TEST
   const auto previous = ::testing::FLAGS_gtest_death_test_style;

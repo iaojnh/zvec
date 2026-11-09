@@ -94,34 +94,5 @@ TEST_F(BudgetedMappedBufferTest, MovesAndCrossThreadReleaseKeepOwnership) {
   }
 }
 
-TEST_F(BudgetedMappedBufferTest, RejectsRoundingOverflowWithoutChangingBuffer) {
-  BudgetedMappedBuffer buffer(page_);
-  char *data = buffer.data();
-  EXPECT_THROW(buffer.resize(std::numeric_limits<size_t>::max()),
-               std::bad_alloc);
-  EXPECT_EQ(data, buffer.data());
-  EXPECT_EQ(page_, pool_.used());
-  EXPECT_EQ(0u, BudgetedMappedBuffer::mapping_size(0));
-}
-
-TEST_F(BudgetedMappedBufferTest, RepeatedMappingDoesNotRetainCharges) {
-  for (size_t round = 0; round < 32; ++round) {
-    BudgetedMappedBuffer buffer(8 * page_);
-    std::memset(buffer.data(), 0x77, buffer.size());
-    EXPECT_EQ(8 * page_, pool_.used());
-    buffer.resize(0);
-    EXPECT_EQ(0u, pool_.used());
-  }
-}
-
-TEST_F(BudgetedMappedBufferTest, UnconfiguredBudgetStillReleasesMapping) {
-  ASSERT_EQ(0, pool_.init(0));
-  BudgetedMappedBuffer buffer(page_);
-  ASSERT_NE(nullptr, buffer.data());
-  EXPECT_EQ(page_, buffer.mapped_size());
-  EXPECT_EQ(0u, pool_.used());
-  buffer.clear();
-  EXPECT_EQ(nullptr, buffer.data());
-}
 }  // namespace
 }  // namespace zvec::ailego

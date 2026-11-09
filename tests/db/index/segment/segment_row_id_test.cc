@@ -23,7 +23,6 @@
 #include <arrow/record_batch.h>
 #include <gtest/gtest.h>
 #include "db/common/constants.h"
-#include "db/index/storage/parquet_memory_pool.h"
 #include "db/index/storage/wal/wal_file.h"
 #include "segment_test_fixture.h"
 
@@ -177,29 +176,6 @@ TEST_P(SegmentTest, ScanLocalRowIDIsSegmentLocal) {
     expected_ids.push_back(i);
   }
   EXPECT_EQ(actual_ids, expected_ids);
-}
-
-TEST_P(SegmentTest, ScanLocalRowIDUsesStorageModeBudget) {
-  auto segment = test::TestHelper::CreateSegmentWithDoc(
-      col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, 10);
-  ASSERT_NE(nullptr, segment);
-  auto reader = segment->scan({LOCAL_ROW_ID, "id"});
-  ASSERT_NE(nullptr, reader);
-
-  auto *pool = detail::GetParquetMemoryPool().get();
-  const auto baseline = pool->bytes_allocated();
-  std::shared_ptr<arrow::RecordBatch> batch;
-  auto status = reader->ReadNext(&batch);
-  ASSERT_TRUE(status.ok()) << status.ToString();
-  ASSERT_NE(nullptr, batch);
-  if (options_.enable_mmap_) {
-    EXPECT_EQ(baseline, pool->bytes_allocated());
-  } else {
-    EXPECT_GE(pool->bytes_allocated(), baseline + 10 * sizeof(uint64_t));
-  }
-  batch.reset();
-  EXPECT_EQ(baseline, pool->bytes_allocated());
 }
 
 

@@ -339,7 +339,7 @@ if(NOT TARGET unittest)
     endif()
     add_custom_target(
         unittest
-        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -LE acceptance
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         --build-config $<CONFIGURATION>
         --parallel ${PARALLEL_JOBS}
       )
@@ -1185,16 +1185,6 @@ function(cc_test)
     message(FATAL_ERROR "No target name privated.")
   endif()
 
-  set(CC_ACCEPTANCE_TEST FALSE)
-  if(CC_ARGS_NAME IN_LIST ZVEC_ACCEPTANCE_TEST_TARGETS)
-    if(NOT ZVEC_BUILD_ACCEPTANCE_TESTS)
-      return()
-    endif()
-    set(CC_ACCEPTANCE_TEST TRUE)
-  elseif("ZVEC_ACCEPTANCE_TESTS" IN_LIST CC_ARGS_DEFS)
-    set(CC_ACCEPTANCE_TEST TRUE)
-  endif()
-
   file(GLOB CC_ARGS_SRCS ${CC_ARGS_SRCS})
   if(NOT CC_ARGS_SRCS)
     message(FATAL_ERROR "No source files found of ${CC_ARGS_NAME}.")
@@ -1242,11 +1232,7 @@ function(cc_test)
       DEPS "${CC_ARGS_DEPS}"
       "${CC_ARGS_UNPARSED_ARGUMENTS}"
     )
-  if(CC_ACCEPTANCE_TEST)
-    add_dependencies(acceptance.build ${CC_ARGS_NAME})
-  else()
-    add_dependencies(unittest.build ${CC_ARGS_NAME})
-  endif()
+  add_dependencies(unittest.build ${CC_ARGS_NAME})
   set(TEST_WORKING_DIR "${CMAKE_BINARY_DIR}/test_tmp/${CC_ARGS_NAME}")
   file(MAKE_DIRECTORY "${TEST_WORKING_DIR}")
   add_custom_target(
@@ -1260,10 +1246,6 @@ function(cc_test)
       COMMAND $<TARGET_FILE:${CC_ARGS_NAME}> "${CC_ARGS_ARGS}"
       WORKING_DIRECTORY ${TEST_WORKING_DIR}
     )
-  if(CC_ACCEPTANCE_TEST)
-    set_tests_properties(${CC_ARGS_NAME} PROPERTIES
-      LABELS "acceptance;buffer" RUN_SERIAL TRUE TIMEOUT 900)
-  endif()
 endfunction()
 
 ## Add existing test cases to a test suite
@@ -1272,9 +1254,7 @@ function(cc_test_suite _NAME)
     add_custom_target(unittest.${_NAME} COMMAND "")
   endif()
   foreach(TEST_TARGET ${ARGN})
-    if(TARGET unittest.${TEST_TARGET})
-      list(APPEND TEST_TARGETS unittest.${TEST_TARGET})
-    endif()
+    list(APPEND TEST_TARGETS unittest.${TEST_TARGET})
   endforeach()
   if(TEST_TARGETS)
     add_dependencies(unittest.${_NAME} ${TEST_TARGETS})

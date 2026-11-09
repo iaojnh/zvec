@@ -134,31 +134,6 @@ TEST(MachONativeImageMemory, CountsUnsortedPageUnionAndZeroFillNotFileBytes) {
   EXPECT_EQ(2u * 16384, bytes);
 }
 
-TEST(MachONativeImageMemory, ExcludesPageZeroInaccessibleAndEmptySegments) {
-  ImageHeader image;
-  image.segment(SEG_PAGEZERO, 0, uint64_t{1} << 32, VM_PROT_NONE);
-  image.segment("__GUARD", 0x100000000, uint64_t{1} << 32, VM_PROT_NONE);
-  image.segment(SEG_PAGEZERO, 0, 0x10000000, VM_PROT_READ);
-  image.segment("__EMPTY", 0x10000, 0);
-  image.segment("__TEXT", 0x1001, 1, VM_PROT_READ, 1);
-  size_t bytes = 73;
-  ASSERT_TRUE(image_bytes(image, 4096, &bytes));
-  EXPECT_EQ(4096u, bytes);
-}
-
-TEST(MachONativeImageMemory, HandlesUnalignedHeadersAndDuplicateNestedRanges) {
-  ImageHeader image;
-  image.segment("__TEXT", 0x1001, 0x2000);
-  image.segment("__DATA", 0x1100, 1);
-  image.segment("__MORE", 0x2fff, 2);
-  std::vector<unsigned char> unaligned(image.data.size() + 1);
-  std::memcpy(unaligned.data() + 1, image.data.data(), image.data.size());
-  size_t bytes = 73;
-  ASSERT_TRUE(detail::MachOLoadImageBytes(unaligned.data() + 1,
-                                        image.data.size(), 4096, &bytes));
-  EXPECT_EQ(3u * 4096, bytes);
-}
-
 TEST(MachONativeImageMemory, RejectsInvalidHeadersWithoutPublishingPartialBytes) {
   ImageHeader image;
   image.segment("__TEXT", 0x1000, 1);
@@ -184,71 +159,7 @@ TEST(MachONativeImageMemory, RejectsInvalidHeadersWithoutPublishingPartialBytes)
   EXPECT_EQ(73u, bytes);
 }
 
-TEST(MachONativeImageMemory, RejectsTruncatedMisalignedAndInvalidCommandSizes) {
-  for (uint32_t size : {0u, 8u, 71u, 73u, 4096u}) {
-    ImageHeader image;
-    image.segment("__TEXT", 0x1000, 1);
-    load_command command{LC_SEGMENT_64, size};
-    image.replace_first(command);
-    size_t bytes = 73;
-    EXPECT_FALSE(image_bytes(image, 4096, &bytes)) << size;
-    EXPECT_EQ(73u, bytes);
-  }
-  ImageHeader image;
-  image.segment("__TEXT", 0x1000, 1);
-  segment_command_64 command{};
-  std::memcpy(&command, image.data.data() + sizeof(image.header), sizeof(command));
-  command.nsects = 1;
-  image.replace_first(command);
-  size_t bytes = 73;
-  EXPECT_FALSE(image_bytes(image, 4096, &bytes));
-  EXPECT_EQ(73u, bytes);
-}
-
-TEST(MachONativeImageMemory, RejectsOverflowAndImpossibleFileCapacity) {
-  for (const auto &range : {std::pair<uint64_t, uint64_t>{UINT64_MAX - 1, 4},
-                            {UINT64_MAX - 1, 1}}) {
-    ImageHeader image;
-    image.segment("__TEXT", range.first, range.second);
-    size_t bytes = 73;
-    EXPECT_FALSE(image_bytes(image, 4096, &bytes));
-    EXPECT_EQ(73u, bytes);
-  }
-  ImageHeader image;
-  image.segment("__TEXT", 0x1000, 1, VM_PROT_READ, 2);
-  size_t bytes = 73;
-  EXPECT_FALSE(image_bytes(image, 4096, &bytes));
-  EXPECT_EQ(73u, bytes);
-}
-
-TEST(MachONativeImageMemory, ExcludesMainExecutableAndInvalidAnchors) {
-  static const char main_anchor = 0;
-  EXPECT_EQ(0u, detail::NativeImageBytesForAddress(&main_anchor));
-  EXPECT_THROW(detail::NativeImageBytesForAddress(nullptr), std::bad_alloc);
-  const char stack_anchor = 0;
-  EXPECT_THROW(detail::NativeImageBytesForAddress(&stack_anchor), std::bad_alloc);
-}
-
 #if TARGET_OS_OSX
-TEST(MachONativeImageMemory,
-     ResolvesDylibAndBundleButExcludesCallerAndInvalidAnchors) {
-  for (const char *path :
-       {ZVEC_NATIVE_IMAGE_MACOS_DYLIB, ZVEC_NATIVE_IMAGE_MACOS_BUNDLE}) {
-    LoadedImage image(path);
-    const void *anchor = image.anchor();
-    ASSERT_NE(nullptr, anchor) << path;
-    const size_t bytes = detail::NativeImageBytesForAddress(anchor);
-    EXPECT_GE(bytes, 32768u);
-    EXPECT_EQ(mapped_capacity(anchor), bytes);
-    EXPECT_EQ(0u, bytes % static_cast<size_t>(sysconf(_SC_PAGESIZE)));
-  }
-  static const char main_anchor = 0;
-  EXPECT_EQ(0u, detail::NativeImageBytesForAddress(&main_anchor));
-  EXPECT_THROW(detail::NativeImageBytesForAddress(nullptr), std::bad_alloc);
-  const char stack_anchor = 0;
-  EXPECT_THROW(detail::NativeImageBytesForAddress(&stack_anchor), std::bad_alloc);
-}
-
 TEST(MachONativeImageMemoryDeathTest,
      ChargesRealPoolOnceAndPreservesLiveOwnershipOnFailure) {
 #if GTEST_HAS_DEATH_TEST

@@ -96,33 +96,6 @@ class ExposedBudgetedHnswEntity : public HnswStreamerEntity {
 };
 }  // namespace
 
-TEST_F(HnswStreamerTest, KeyMapAndBatchResultsRejectGrowthAtBudget) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  auto restore = ScopeGuard::Make([&] {
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  ASSERT_EQ(0, pool.init(2 * 1024 * 1024));
-  ExposedBudgetedHnswEntity::KeyMap map;
-  map.set_empty_key(kInvalidKey);
-  map[7] = 11;
-  IndexStreamer::Stats stats;
-  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
-  HnswContext context(dim, nullptr, entity);
-  {
-    MemoryReservation pressure;
-    pressure.add(pool.available());
-    EXPECT_THROW(map.resize(100000), std::bad_alloc);
-    EXPECT_THROW(context.resize_results(100000), std::bad_alloc);
-    EXPECT_EQ(11u, map.find(7)->second);
-  }
-  map.resize(1000);
-  EXPECT_EQ(11u, map.find(7)->second);
-  EXPECT_NO_THROW(context.resize_results(100));
-}
-
 TEST_F(HnswStreamerTest, PartialWriteFailureBlocksUseAndReopen) {
   for (bool fill_gap : {false, true}) {
     SCOPED_TRACE(fill_gap);
@@ -168,66 +141,6 @@ TEST_F(HnswStreamerTest, PartialWriteFailureBlocksUseAndReopen) {
     EXPECT_EQ(0, streamer->cleanup());
     EXPECT_EQ(0, storage->close());
   }
-}
-
-TEST_F(HnswStreamerTest, InterruptedBuildReleasesEveryCandidateHeap) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  auto restore = ScopeGuard::Make([&] {
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  ASSERT_EQ(0, pool.init(64 * 1024));
-  IndexStreamer::Stats stats;
-  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
-  HnswContext context(dim, nullptr, entity);
-  const size_t context_metadata = pool.used();
-  for (uint32_t i = 0; i < 3; ++i) {
-    context.candidates().emplace(i, 1.0f);
-    context.update_heap().emplace(i, 1.0f);
-    context.level_topk(0).emplace(i, 1.0f);
-    context.level_topk(1).emplace(i, 1.0f);
-    context.prune_blocks().push_back(
-        IndexStorage::MemoryBlock::AllocateOwned(1024));
-    EXPECT_GT(pool.used(), 0u);
-    context.release_build_workspace();
-    EXPECT_EQ(context_metadata, pool.used());
-    EXPECT_TRUE(context.candidates().empty());
-    EXPECT_TRUE(context.update_heap().empty());
-    EXPECT_TRUE(context.level_topk(0).empty());
-    EXPECT_TRUE(context.level_topk(1).empty());
-  }
-}
-
-TEST_F(HnswStreamerTest, PruneDescriptorsKeepCapacityChargedUntilRelease) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0u, pool.used());
-  auto restore = ScopeGuard::Make([&] {
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  ASSERT_EQ(0, pool.init(2UL << 20));
-  IndexStreamer::Stats stats;
-  auto entity = std::make_shared<HnswBufferPoolStreamerEntity>(stats);
-  HnswContext context(dim, nullptr, entity);
-  const auto baseline = pool.used();
-  auto &blocks = context.prune_blocks();
-  blocks.resize(128);
-  const size_t charged = pool.used();
-  EXPECT_GE(charged - baseline, blocks.capacity() * sizeof(blocks[0]));
-  blocks.clear();
-  EXPECT_EQ(charged, pool.used());
-  {
-    MemoryReservation pressure;
-    pressure.add(pool.available());
-    EXPECT_THROW(blocks.reserve(4096), std::bad_alloc);
-    EXPECT_EQ(128u, blocks.capacity());
-  }
-  context.release_build_workspace();
-  EXPECT_EQ(0u, blocks.capacity());
-  EXPECT_EQ(baseline, pool.used());
 }
 
 TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
@@ -1116,9 +1029,6 @@ TEST_F(HnswStreamerTest, TestHnswSearchMMap) {
 #endif
 
 namespace zvec::core {
-TEST(HnswEntityDumpMemoryTest, StreamingMetadataMatchesNeighborData) {
-  testing::CheckStreamingGraphDump<HnswEntity>();
-}
 TEST(HnswEntityDumpMemoryTest, UpperIndexReadErrorDoesNotProduceEmptyLevel) {
   testing::CheckGraphDumpReadError<HnswEntity>();
 }

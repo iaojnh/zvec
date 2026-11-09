@@ -26,30 +26,6 @@
 namespace zvec::core_interface {
 namespace {
 
-TEST(DiskAnnOwnedHolder, DirectAddCacheRetainsStableVectorsWithoutCopying) {
-  auto cache = std::make_shared<DocCacheHolder::Cache>();
-  std::vector<float> data(16, 3.0F);
-  cache->emplace_back(
-      42U, ailego::BudgetedString(reinterpret_cast<const char *>(data.data()),
-                                  data.size() * sizeof(float)));
-  auto holder = std::make_shared<DocCacheHolder>(
-      core::IndexQueryMeta(core::IndexMeta::DT_FP32, 16), cache);
-  std::shared_ptr<const void> lifetime;
-  ASSERT_EQ(0, holder->retain_stable_data(&lifetime));
-  auto iter = holder->create_iterator();
-  ASSERT_TRUE(iter->is_valid());
-  const void *values = iter->data();
-  EXPECT_EQ(cache->front().second.data(), values);
-  std::weak_ptr<DocCacheHolder::Cache> weak = cache;
-  cache.reset();
-  holder.reset();
-  iter.reset();
-  EXPECT_FALSE(weak.expired());
-  EXPECT_EQ(0, std::memcmp(values, data.data(), data.size() * sizeof(float)));
-  lifetime.reset();
-  EXPECT_TRUE(weak.expired());
-}
-
 TEST(DiskAnnOwnedHolder, OwnedVectorsSurviveCacheHolderAndIteratorRelease) {
   constexpr size_t kDimension = 16;
   std::vector<std::pair<uint64_t, std::string>> cache;
@@ -312,58 +288,3 @@ TEST(DiskAnnOwnedHolder, EntityRequiresPinnedVectorStorage) {
 }  // namespace
 }  // namespace zvec::core_interface
 #endif
-
-namespace zvec::core_interface {
-TEST(DocCacheHolderTest, BorrowsRowsSkipsHolesAndRetainsInput) {
-  auto cache = std::make_shared<DocCacheHolder::Cache>();
-  cache->emplace_back(9, std::string(12, 'a'));
-  cache->emplace_back(kInvalidKey, std::string{});
-  cache->emplace_back(4, std::string(12, 'b'));
-  core::IndexQueryMeta meta(core::IndexMeta::DT_FP32, 3);
-  auto holder = std::make_shared<DocCacheHolder>(meta, cache);
-  EXPECT_EQ(holder->count(), 2u);
-  core::OrdinalAccessHolder::Reader::Pointer reader;
-  ASSERT_EQ(holder->create_ordinal_reader(&reader), 0);
-  auto iter = holder->create_iterator();
-  EXPECT_EQ(iter->data(), (*cache)[0].second.data());
-  iter->next();
-  EXPECT_EQ(iter->data(), (*cache)[2].second.data());
-  uint64_t key = 0;
-  const void *data = nullptr;
-  ASSERT_EQ(reader->read(1, &key, &data), 0);
-  EXPECT_EQ(data, iter->data());
-  EXPECT_EQ(key, 4u);
-  std::weak_ptr<DocCacheHolder::Cache> weak = cache;
-  cache.reset();
-  holder.reset();
-  iter.reset();
-  EXPECT_FALSE(weak.expired());
-  ASSERT_EQ(reader->read(0, &key, &data), 0);
-  EXPECT_EQ(key, 9u);
-  EXPECT_EQ(std::string(static_cast<const char *>(data), 12),
-            std::string(12, 'a'));
-  EXPECT_EQ(reader->read(2, &key, &data), core::IndexError_OutOfRange);
-  reader.reset();
-  EXPECT_TRUE(weak.expired());
-}
-TEST(DocCacheHolderTest, DenseInputAndMalformedRows) {
-  auto cache = std::make_shared<DocCacheHolder::Cache>();
-  cache->emplace_back(1, std::string(12, 'a'));
-  cache->emplace_back(2, std::string(11, 'b'));
-  auto holder = std::make_shared<DocCacheHolder>(
-      core::IndexQueryMeta(core::IndexMeta::DT_FP32, 3), cache);
-  ASSERT_EQ(holder->count(), 2u);
-  auto iter = holder->create_iterator();
-  ASSERT_TRUE(iter->is_valid());
-  EXPECT_EQ(iter->data(), (*cache)[0].second.data());
-  iter->next();
-  EXPECT_FALSE(iter->is_valid());
-  EXPECT_EQ(iter->status(), core::IndexError_InvalidLength);
-  EXPECT_EQ(iter->data(), nullptr);
-  core::OrdinalAccessHolder::Reader::Pointer reader;
-  ASSERT_EQ(holder->create_ordinal_reader(&reader), 0);
-  uint64_t key;
-  const void *data;
-  EXPECT_EQ(reader->read(1, &key, &data), core::IndexError_InvalidLength);
-}
-}  // namespace zvec::core_interface

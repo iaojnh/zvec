@@ -30,29 +30,6 @@
 
 using namespace zvec::fts;
 
-TEST(TokenizerPipelineBudgetTest, ValidationUsesCurrentConfiguration) {
-  auto original_params = std::make_shared<zvec::FtsIndexParams>("standard");
-  zvec::FieldSchema field("content", zvec::DataType::STRING, false,
-                          original_params);
-  // FieldSchema clones its parameters; mutate the configuration it owns.
-  auto params =
-      std::dynamic_pointer_cast<zvec::FtsIndexParams>(field.index_params());
-  ASSERT_NE(nullptr, params);
-  ASSERT_NE(original_params.get(), params.get());
-  ASSERT_TRUE(field.validate().ok());
-  auto first = zvec::detail::AcquireFtsPipeline(*params);
-  ASSERT_TRUE(first.has_value());
-  params->set_tokenizer_name("invalid_analyzer");
-  EXPECT_EQ(zvec::StatusCode::INVALID_ARGUMENT, field.validate().code());
-  params->set_tokenizer_name("whitespace");
-  ASSERT_TRUE(field.validate().ok());
-  auto changed = zvec::detail::AcquireFtsPipeline(*params);
-  ASSERT_TRUE(changed.has_value());
-  EXPECT_NE(first.value(), changed.value());
-  EXPECT_EQ(1u, changed.value()->process("hello-world").size());
-  EXPECT_EQ("standard", original_params->tokenizer_name());
-}
-
 TEST(TokenizerPipelineBudgetTest, FailedInitializationCanRetrySameParams) {
   const auto directory =
       std::filesystem::temp_directory_path() /

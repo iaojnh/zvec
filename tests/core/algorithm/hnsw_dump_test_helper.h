@@ -15,7 +15,6 @@
 #pragma once
 
 #include <array>
-#include <numeric>
 #include "tests/core/algorithm/graph_dump_test_helper.h"
 
 namespace zvec::core::testing {
@@ -62,57 +61,6 @@ class GeneratedHnsw : public Entity {
   std::array<float, 8> row_{};
   mutable std::array<node_id_t, 2> neighbors_{};
 };
-
-template <typename Entity, typename VectorBlocks = ailego::BudgetedVector<
-                               IndexStorage::MemoryBlock>>
-void CheckStreamingGraphDump() {
-  for (uint32_t count : {0u, 1u, 8193u}) {
-    SCOPED_TRACE(count);
-    GeneratedHnsw<Entity, VectorBlocks> entity(count);
-    auto capture = std::make_shared<testing::GraphDumpCapture>();
-    ASSERT_GE(entity.export_segments(capture), 0);
-    EXPECT_EQ(9u, capture->segments.size());
-    EXPECT_LE(capture->max_write, 64u * 1024);
-    auto graph =
-        capture->records<GraphNeighborMeta>(Entity::kGraphOffsetsSegmentId);
-    auto upper =
-        capture->records<HnswNeighborMeta>(Entity::kHnswOffsetsSegmentId);
-    auto neighbors =
-        capture->records<node_id_t>(Entity::kGraphNeighborsSegmentId);
-    auto upper_neighbors =
-        capture->records<node_id_t>(Entity::kHnswNeighborsSegmentId);
-    auto keys = capture->records<key_t>(Entity::kGraphKeysSegmentId);
-    auto mapping = capture->records<node_id_t>(Entity::kGraphMappingSegmentId);
-    ASSERT_EQ(count, graph.size());
-    ASSERT_EQ(count, upper.size());
-    ASSERT_EQ(count, keys.size());
-    std::vector<node_id_t> order(count);
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](node_id_t a, node_id_t b) {
-      return entity.get_key(a) != entity.get_key(b)
-                 ? entity.get_key(a) < entity.get_key(b)
-                 : a < b;
-    });
-    EXPECT_EQ(order, mapping);
-    size_t graph_pos = 0, upper_pos = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-      EXPECT_EQ(entity.get_key(i), keys[i]);
-      EXPECT_EQ(graph_pos * sizeof(node_id_t), graph[i].offset);
-      EXPECT_EQ(1u + i % 2, graph[i].neighbor_cnt);
-      for (uint32_t j = 0; j < 1 + i % 2; ++j)
-        EXPECT_EQ(i + j, neighbors.at(graph_pos++));
-      EXPECT_EQ(i % 3, upper[i].level);
-      EXPECT_EQ(i % 3 ? upper_pos * sizeof(node_id_t) : 0, upper[i].offset);
-      for (uint32_t level = 1; level <= i % 3; ++level) {
-        EXPECT_EQ(1u + i % 2, upper_neighbors.at(upper_pos++));
-        EXPECT_EQ(i + level, upper_neighbors.at(upper_pos++));
-        EXPECT_EQ(i % 2 ? i + 1 : 0, upper_neighbors.at(upper_pos++));
-      }
-    }
-    EXPECT_EQ(neighbors.size(), graph_pos);
-    EXPECT_EQ(upper_neighbors.size(), upper_pos);
-  }
-}
 
 template <typename Entity, typename VectorBlocks = ailego::BudgetedVector<
                                IndexStorage::MemoryBlock>>

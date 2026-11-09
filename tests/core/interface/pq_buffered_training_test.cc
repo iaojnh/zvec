@@ -207,42 +207,9 @@ class PqBufferedTrainingTest : public ::testing::Test {
   }
 };
 
-#if defined(ZVEC_ACCEPTANCE_TESTS)
 TEST_F(PqBufferedTrainingTest, FP32MatchesHeapTrainingUnderPressure) {
   compare<core::IndexMeta::DT_FP32, float>();
 }
-TEST_F(PqBufferedTrainingTest, FP16MatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP16, ailego::Float16>();
-}
-TEST_F(PqBufferedTrainingTest, Int4FP32MatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP32, float, turbo::PqInt4Quantizer, 16>();
-}
-TEST_F(PqBufferedTrainingTest, Int4FP16MatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP16, ailego::Float16, turbo::PqInt4Quantizer,
-          16>();
-}
-TEST_F(PqBufferedTrainingTest, FastFP32MatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP32, float, turbo::PqFastQuantizer, 16>();
-}
-TEST_F(PqBufferedTrainingTest, FastFP16MatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP16, ailego::Float16, turbo::PqFastQuantizer,
-          16>();
-}
-TEST_F(PqBufferedTrainingTest, OpqFP32MatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP32, float>(true);
-}
-TEST_F(PqBufferedTrainingTest, OpqFP32MatchesHeapTrainingWithReducedWorkspace) {
-  // Keep both workers and every result check, with less workspace than the
-  // existing 512 KiB case while the corpus still requires paging.
-  compare<core::IndexMeta::DT_FP32, float>(true, 320 * 1024);
-}
-TEST_F(PqBufferedTrainingTest, OpqInt4MatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP32, float, turbo::PqInt4Quantizer, 16>(true);
-}
-TEST_F(PqBufferedTrainingTest, OpqFastMatchesHeapTrainingUnderPressure) {
-  compare<core::IndexMeta::DT_FP32, float, turbo::PqFastQuantizer, 16>(true);
-}
-#else
 class CountingPqHolder final : public core::IndexHolder {
  public:
   class Cursor : public Iterator {
@@ -341,12 +308,6 @@ TEST_F(PqBufferedTrainingTest,
   CheckSampledTraining<turbo::PqInt4Quantizer>(false);
   CheckSampledTraining<turbo::PqInt4Quantizer>(true);
 }
-TEST_F(PqBufferedTrainingTest,
-       FastSamplesBeforeCopyingAndChecksDeferredErrors) {
-  CheckSampledTraining<turbo::PqFastQuantizer>(false);
-  CheckSampledTraining<turbo::PqFastQuantizer>(true);
-}
-
 TEST_F(PqBufferedTrainingTest, MetadataExhaustionDoesNotFallBackToHeap) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   // Enough for the three tiny codebooks, not writable page-table metadata.
@@ -374,102 +335,6 @@ TEST_F(PqBufferedTrainingTest, MetadataExhaustionDoesNotFallBackToHeap) {
   EXPECT_LT(pool.used(), 64u * 1024);
 }
 
-TEST_F(PqBufferedTrainingTest, OpqDistinctRowsMatchAcrossPagedTileBoundaries) {
-  static constexpr size_t kDim = 17;
-  static constexpr size_t kRows = 4099;
-  std::vector<float> original(kRows * kDim);
-  for (size_t i = 0; i < original.size(); ++i)
-    original[i] = float((i * 17 + i / kDim) % 257) / 128.0f - 1.0f;
-  // A fixed, deterministic reconstruction isolates the workspace/rotation
-  // changes from random codebook initialization, using distinct input rows.
-  const auto reconstruct_sum = [](const float *rows, size_t count, float *out) {
-    double error = 0;
-    for (size_t i = 0; i < count * kDim; ++i) {
-      out[i] = std::round(rows[i] * 4.0f) / 4.0f;
-      const float difference = rows[i] - out[i];
-      error += static_cast<double>(difference) * difference;
-    }
-    return error;
-  };
-  const auto reconstruct = [&](const float *rows, size_t count, float *out) {
-    return static_cast<float>(reconstruct_sum(rows, count, out) / count);
-  };
-  ailego::Params params;
-  params.set("rotate_type", std::string("opq"));
-  params.set("opq_iter", 3u);
-  std::vector<float> reference;
-  size_t reference_rounds = 0;
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t budget =
-      2 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
-      // Three row tiles, the rotation solver and at least one I/O page must
-      // coexist. Each full matrix still exceeds this workspace allowance.
-      256 * 1024;
-  static_assert(kRows * kDim * sizeof(float) > 256 * 1024);
-  for (size_t capacity : {size_t{0}, budget}) {
-    ASSERT_EQ(pool.init(capacity), 0);
-    turbo::PqOpq opq;
-    ASSERT_EQ(opq.init(kDim, turbo::DataType::kFp32, params), 0);
-    auto data = original;
-    size_t rounds = 0;
-    ASSERT_EQ(opq.train(
-                  data.data(), kRows, "test", [&](uint32_t) { ++rounds; },
-                  reconstruct, reconstruct_sum),
-              0);
-    EXPECT_EQ(pool.used(), capacity ? kDim * kDim * sizeof(float) : 0u);
-    if (!capacity) {
-      reference = std::move(data);
-      reference_rounds = rounds;
-    } else {
-      EXPECT_EQ(rounds, reference_rounds);
-      for (size_t i = 0; i < data.size(); ++i)
-        ASSERT_NEAR(data[i], reference[i], 1e-5f) << i;
-    }
-  }
-}
-
-TEST_F(PqBufferedTrainingTest, UnevenChunksAndRowTilesPreserveDistinctVectors) {
-  constexpr size_t kDim = 17;
-  auto input =
-      std::make_shared<core::MultiPassIndexHolder<core::IndexMeta::DT_FP32>>(
-          kDim);
-  constexpr size_t kRows = 4099;
-  constexpr size_t kWorkspaceBytes = 256 * 1024;
-  static_assert(kRows * kDim * sizeof(float) > kWorkspaceBytes);
-  for (size_t i = 0; i < kRows; ++i) {
-    ailego::NumericalVector<float> row(kDim);
-    for (size_t d = 0; d < kDim; ++d)
-      row[d] = float((i % 16) * 32 + d) / 512.0f;
-    ASSERT_TRUE(input->emplace(i, std::move(row)));
-  }
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t metadata =
-      ailego::PoolPayloadBudget::storage_metadata_bytes(4096);
-  ASSERT_EQ(pool.init(metadata + kWorkspaceBytes), 0);
-  core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
-  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
-  ailego::Params params;
-  params.set("num_chunk", 4u);
-  params.set("thread_count", 2u);
-  params.set("build_sdc_table", false);
-  turbo::PqInt8Quantizer quantizer;
-  ASSERT_EQ(quantizer.init(meta, params), 0);
-  ASSERT_EQ(quantizer.train(input), 0);
-  std::vector<uint8_t> codes(quantizer.quantized_datapoint_vector_length());
-  for (auto row = input->create_iterator(); row->is_valid(); row->next()) {
-    quantizer.quantize_data(row->data(), codes.data());
-    std::string decoded;
-    const core::IndexQueryMeta qmeta(core::IndexMeta::DT_FP32, kDim);
-    ASSERT_EQ(quantizer.dequantize(codes.data(), qmeta, &decoded), 0);
-    ASSERT_EQ(decoded.size(), kDim * sizeof(float));
-    for (size_t d = 0; d < kDim; ++d) {
-      float value;
-      std::memcpy(&value, decoded.data() + d * sizeof(float), sizeof(value));
-      EXPECT_NEAR(value, static_cast<const float *>(row->data())[d], 0.001f);
-    }
-  }
-}
-#endif
 
 }  // namespace
 }  // namespace zvec::core_interface

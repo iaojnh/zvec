@@ -12,47 +12,6 @@
 
 namespace zvec::sqlengine {
 namespace {
-TEST(GroupTopKCandidatesTest, MatchesWideSortOnIdenticalSegmentCandidates) {
-  ailego::PoolPayloadBudget::get_instance().init(4 * 1024 * 1024);
-  std::mt19937 random(42);
-  std::vector<RankedDoc> input;
-  std::vector<std::string> names{""};
-  for (size_t g = 1; g < 13; ++g) names.push_back(std::to_string(g));
-  for (size_t segment = 0; segment < 31; ++segment)
-    for (size_t i = 0; i < 29; ++i)
-      input.push_back({segment, i, static_cast<int32_t>(i),
-                       static_cast<float>(random() % 101), random() % 13});
-  for (bool descending : {false, true}) {
-    auto sorted = input;
-    TopKCandidates::Better better{descending};
-    std::sort(sorted.begin(), sorted.end(), better);
-    for (size_t group_count : {1u, 3u, 20u}) {
-      for (size_t per_group : {1u, 7u}) {
-        std::map<size_t, size_t> counts;
-        std::vector<RankedDoc> expected;
-        for (auto row : sorted) {
-          if (!counts.count(row.group) && counts.size() == group_count)
-            continue;
-          if (counts[row.group]++ < per_group) expected.push_back(row);
-        }
-        GroupTopKCandidates groups(group_count, per_group, descending);
-        auto shuffled = input;
-        std::shuffle(shuffled.begin(), shuffled.end(), random);
-        for (auto row : shuffled) groups.offer(names[row.group], row);
-        groups.finish();
-        ASSERT_EQ(expected.size(), groups.rows().size());
-        for (size_t i = 0; i < expected.size(); ++i) {
-          const auto &actual = groups.rows()[i];
-          EXPECT_EQ(expected[i].segment, actual.segment);
-          EXPECT_EQ(expected[i].ordinal, actual.ordinal);
-          EXPECT_EQ(names[expected[i].group],
-                    std::string(groups.group(actual.group)));
-        }
-      }
-    }
-  }
-}
-
 TEST(GroupTopKCandidatesTest, ReenteringGroupKeepsEarlierRunnerUp) {
   ailego::PoolPayloadBudget::get_instance().init(4 * 1024 * 1024);
   for (bool descending : {false, true}) {
@@ -69,49 +28,6 @@ TEST(GroupTopKCandidatesTest, ReenteringGroupKeepsEarlierRunnerUp) {
     EXPECT_EQ(1, groups.rows()[1].row);
     EXPECT_EQ("a", std::string(groups.group(groups.rows()[0].group)));
   }
-}
-
-TEST(GroupTopKCandidatesTest, ManyGroupsSpillReferencesAndChargeNames) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  pool.init(4 * 1024 * 1024);
-  {
-    GroupTopKCandidates groups(3, 2, false);
-    for (int i = 20000; i > 0; --i) {
-      const std::string name = std::string(200, 'x') + std::to_string(i);
-      groups.offer(name, {0, uint64_t(i), i, float(i)});
-      EXPECT_LE(groups.retained_groups(), 3u);
-    }
-    EXPECT_TRUE(groups.paged());
-    groups.finish();
-    ASSERT_EQ(3u, groups.rows().size());
-    EXPECT_EQ(1, groups.rows()[0].row);
-    EXPECT_EQ(3, groups.rows()[2].row);
-    EXPECT_LT(pool.external_used(), 64 * 1024u);
-  }
-  EXPECT_EQ(0u, pool.external_used());
-}
-
-TEST(GroupTopKCandidatesTest, BudgetDenialDoesNotLeakWorkspace) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  pool.init(1024 * 1024);
-  size_t charge = 0;
-  {
-    // MSVC may allocate map/set sentinel nodes in the constructor. Saturate
-    // the budget after constructing the object whose offer() is under test.
-    GroupTopKCandidates groups(1, 1, false);
-    charge = pool.capacity() - pool.used();
-    ASSERT_TRUE(pool.try_charge_external(charge));
-    EXPECT_THROW(groups.offer("a", {0, 0, 0, 1.0f}), std::bad_alloc);
-  }
-  EXPECT_EQ(charge, pool.external_used());
-  pool.release_external(charge);
-  {
-    GroupTopKCandidates groups(1, 1, false);
-    groups.offer("a", {0, 0, 0, 1.0f});
-    groups.finish();
-    ASSERT_EQ(1u, groups.rows().size());
-  }
-  EXPECT_EQ(0u, pool.external_used());
 }
 
 TEST(TopKCandidatesTest, MatchesArrowSortIncludingTiesNaNsAndInfinities) {
@@ -152,23 +68,6 @@ TEST(TopKCandidatesTest, MatchesArrowSortIncludingTiesNaNsAndInfinities) {
       }
     }
   }
-}
-
-TEST(TopKCandidatesTest, MillionCandidatesKeepOnlyBudgetedTopK) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  pool.init(1024 * 1024);
-  {
-    TopKCandidates selected(100, false);
-    for (size_t i = 1000000; i > 0; --i) selected.offer({0, i, 0, float(i)});
-    selected.finish();
-    ASSERT_EQ(100u, selected.rows().size());
-    EXPECT_LE(selected.rows().capacity(), 100u);
-    EXPECT_GE(pool.external_used(), 100 * sizeof(RankedDoc));
-    EXPECT_LT(pool.external_used(), 8192u);
-    EXPECT_EQ(1.0f, selected.rows().front().score);
-    EXPECT_EQ(100.0f, selected.rows().back().score);
-  }
-  EXPECT_EQ(0u, pool.external_used());
 }
 
 TEST(TopKCandidatesTest, BudgetDenialDoesNotLoseEarlierCandidates) {

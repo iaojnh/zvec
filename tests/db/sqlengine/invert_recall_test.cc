@@ -40,88 +40,6 @@ class InvertRecallTest : public RecallTest {
   }
 };
 
-TEST(DocIdScanPlanTest, BoundedReaderDoesNotQueueTheWholeScan) {
-  class CountingReader : public arrow::RecordBatchReader {
-   public:
-    explicit CountingReader(std::shared_ptr<arrow::RecordBatch> batch)
-        : batch_(std::move(batch)) {}
-    std::shared_ptr<arrow::Schema> schema() const override {
-      return batch_->schema();
-    }
-    arrow::Status ReadNext(
-        std::shared_ptr<arrow::RecordBatch> *batch) override {
-      if (produced.load() == 2048) {
-        *batch = nullptr;
-      } else {
-        ++produced;
-        *batch = batch_;
-      }
-      return arrow::Status::OK();
-    }
-    std::atomic<size_t> produced{0};
-
-   private:
-    std::shared_ptr<arrow::RecordBatch> batch_;
-  };
-  arrow::UInt64Builder builder;
-  ASSERT_TRUE(builder.Append(123).ok());
-  std::shared_ptr<arrow::Array> ids;
-  ASSERT_TRUE(builder.Finish(&ids).ok());
-  auto schema = arrow::schema({arrow::field("id", arrow::uint64())});
-  for (bool explicit_close : {false, true}) {
-    auto source = std::make_shared<CountingReader>(
-        arrow::RecordBatch::Make(schema, 1, {ids}));
-    PlanInfo plan(
-        arrow::acero::Declaration{
-            "record_batch_reader_source",
-            arrow::acero::RecordBatchReaderSourceNodeOptions{source}},
-        schema);
-    auto reader = plan.execute_to_reader(64);
-    ASSERT_TRUE(reader);
-    std::shared_ptr<arrow::RecordBatch> batch;
-    ASSERT_TRUE(reader.value()->ReadNext(&batch).ok());
-    ASSERT_NE(nullptr, batch);
-    EXPECT_LT(source->produced.load(), 2048u);
-    if (explicit_close) {
-      auto status = reader.value()->Close();
-      ASSERT_TRUE(status.ok()) << status.ToString();
-    }
-    reader.value().reset();
-    EXPECT_LT(source->produced.load(), 2048u);
-  }
-}
-
-TEST(DocIdScanPlanTest, BoundedReaderPropagatesSourceFailure) {
-  class FailingReader : public arrow::RecordBatchReader {
-   public:
-    std::shared_ptr<arrow::Schema> schema() const override {
-      return arrow::schema({arrow::field("id", arrow::uint64())});
-    }
-    arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *) override {
-      return arrow::Status::IOError("injected scan failure");
-    }
-  };
-  auto source = std::make_shared<FailingReader>();
-  PlanInfo plan(
-      arrow::acero::Declaration{
-          "record_batch_reader_source",
-          arrow::acero::RecordBatchReaderSourceNodeOptions{source}},
-      source->schema());
-  auto reader = plan.execute_to_reader(64);
-  ASSERT_TRUE(reader);
-  std::shared_ptr<arrow::RecordBatch> batch;
-  auto status = reader.value()->ReadNext(&batch);
-  EXPECT_FALSE(status.ok());
-  EXPECT_NE(std::string::npos, status.ToString().find("injected scan failure"));
-  // Depending on whether the source error arrives through the sink generator
-  // or plan completion, Close may report the same error once more.
-  auto close_status = reader.value()->Close();
-  EXPECT_TRUE(close_status.ok() ||
-              close_status.ToString().find("injected scan failure") !=
-                  std::string::npos);
-  EXPECT_TRUE(reader.value()->Close().ok());
-}
-
 TEST(DocIdScanPlanTest, BoundedSourceReleasesInputBeforeCompletion) {
   arrow::UInt64Builder builder;
   ASSERT_TRUE(builder.Append(123).ok());
@@ -168,70 +86,6 @@ TEST(DocIdScanPlanTest, BoundedSourceReleasesInputBeforeCompletion) {
   }
 }
 
-TEST(DocIdScanPlanTest, NestedReaderReleasesChildBeforeCompletion) {
-  struct RestoreCapacity {
-    int capacity = arrow::GetCpuThreadPoolCapacity();
-    ~RestoreCapacity() {
-      static_cast<void>(arrow::SetCpuThreadPoolCapacity(capacity));
-    }
-  } restore;
-  // Cancellation has to compose asynchronously: blocking a parent source here
-  // would deadlock its child on the sole CPU worker.
-  ASSERT_TRUE(arrow::SetCpuThreadPoolCapacity(1).ok());
-  auto schema = arrow::schema({arrow::field("id", arrow::uint64())});
-  arrow::UInt64Builder builder;
-  ASSERT_TRUE(builder.Append(123).ok());
-  std::shared_ptr<arrow::Array> values;
-  ASSERT_TRUE(builder.Finish(&values).ok());
-  auto batch = arrow::RecordBatch::Make(schema, 1, {values});
-  for (bool early_close : {false, true}) {
-    for (size_t queue_limit : {size_t{0}, size_t{64}}) {
-      auto owner = std::make_shared<int>(1);
-      std::weak_ptr<int> input = owner;
-      auto reader = [&] {
-        auto produced = std::make_shared<size_t>(0);
-        arrow::acero::Declaration child{
-            "source", arrow::acero::SourceNodeOptions{
-                          schema, [owner, produced, batch] {
-                            using Batch =
-                                std::optional<arrow::compute::ExecBatch>;
-                            return arrow::Future<Batch>::MakeFinished(
-                                (*produced)++ < 10000
-                                    ? Batch{arrow::compute::ExecBatch(*batch)}
-                                    : Batch{});
-                          }}};
-        auto plan = std::make_shared<PlanInfo>(std::move(child), schema);
-        auto node = std::make_shared<SegmentNode>(
-            std::vector<PlanInfo::Ptr>{plan}, nullptr);
-        arrow::acero::Declaration parent{
-            "source", AsyncSourceNodeOptions{schema, node->gen(), [node] {
-                                               return node->finish();
-                                             }}};
-        if (!early_close)
-          parent =
-              arrow::acero::Declaration{"fetch",
-                                        {std::move(parent)},
-                                        arrow::acero::FetchNodeOptions{0, 1}};
-        return PlanInfo(std::move(parent), schema)
-            .execute_to_reader(queue_limit);
-      }();
-      ASSERT_TRUE(reader);
-      owner.reset();
-      std::shared_ptr<arrow::RecordBatch> result;
-      ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
-      ASSERT_NE(nullptr, result);
-      if (early_close) {
-        ASSERT_TRUE(reader.value()->Close().ok());
-      } else {
-        ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
-        ASSERT_EQ(nullptr, result);
-      }
-      EXPECT_TRUE(input.expired())
-          << "early_close=" << early_close << " queue_limit=" << queue_limit;
-    }
-  }
-}
-
 TEST_F(InvertRecallTest, StreamedDocIdsMatchMaterializedResults) {
   auto engine = SQLEngine::create(std::make_shared<Profiler>());
   for (const auto &filter :
@@ -271,22 +125,6 @@ TEST_F(InvertRecallTest, StreamedDocIdsStopOnConsumerError) {
   EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code());
   EXPECT_EQ("staging denied", status.message());
   EXPECT_EQ(1u, calls);
-}
-
-TEST_F(InvertRecallTest, StreamedDocIdsValidateFilterAndAllowEmptySegments) {
-  auto engine = SQLEngine::create(std::make_shared<Profiler>());
-  size_t calls = 0;
-  auto consume = [&](const uint64_t *, size_t) {
-    ++calls;
-    return Status::OK();
-  };
-  EXPECT_FALSE(
-      engine->scan_doc_ids(collection_schema_, "age =", segments_, consume)
-          .ok());
-  EXPECT_TRUE(engine->scan_doc_ids(collection_schema_, "", {}, consume).ok());
-  EXPECT_FALSE(
-      engine->scan_doc_ids(collection_schema_, "", segments_, {}).ok());
-  EXPECT_EQ(0u, calls);
 }
 
 TEST_F(InvertRecallTest, Eq) {

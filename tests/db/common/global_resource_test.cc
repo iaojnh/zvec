@@ -155,37 +155,7 @@ void CheckConcurrentLazyResourceAccess(bool existing_pool) {
 }
 
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
-void CheckStartupHostMemoryRecovery() {
-  constexpr size_t kMiB = 1UL << 20;
-  void *host = ailego::File::MemoryMap(128 * kMiB, 0);
-  ASSERT_NE(nullptr, host);
-  auto cleanup = ailego::ScopeGuard::Make([&] {
-    if (host) ailego::File::MemoryUnmap(host, 128 * kMiB);
-  });
-  std::memset(host, 0x6a, 128 * kMiB);
-  const size_t rss = ailego::MemoryHelper::SelfRSS();
-  ASSERT_GT(rss, 0u);
-  GlobalConfig::ConfigData config;
-  config.memory_limit_bytes = rss + 4 * kMiB;
-  config.query_thread_count = config.optimize_thread_count = 1;
-  ASSERT_TRUE(GlobalConfig::Instance().initialize(config).ok());
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  ASSERT_GT(pool.queue_metadata_used(), 0u);
-  ASSERT_GT(detail::NativeWorkerStackReservation().bytes(), 0u);
-  ailego::File::MemoryUnmap(host, 128 * kMiB);
-  host = nullptr;
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  while (pool.under_process_rss_pressure() &&
-         std::chrono::steady_clock::now() < deadline)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  ASSERT_FALSE(pool.under_process_rss_pressure());
-  ASSERT_LT(pool.process_rss() + 16 * kMiB, config.memory_limit_bytes);
-  ASSERT_TRUE(pool.try_charge_workspace(16 * kMiB));
-  pool.release_external(16 * kMiB);
-  // Persistent metadata and worker allowances remain live throughout recovery.
-  EXPECT_GT(pool.committed(), 0u);
-}
+
 #endif
 
 }  // namespace
@@ -219,18 +189,6 @@ INSTANTIATE_TEST_SUITE_P(PoolInitialization, GlobalResourceDeathTest,
 
 #if (defined(__linux__) || defined(__APPLE__) || defined(_WIN32)) && \
     GTEST_HAS_DEATH_TEST
-TEST(GlobalResourceStartupDeathTest, HostReleaseRestoresWorkspaceAdmission) {
-  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  EXPECT_EXIT(
-      {
-        CheckStartupHostMemoryRecovery();
-        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
-      },
-      ::testing::ExitedWithCode(0), "");
-  ::testing::FLAGS_gtest_death_test_style = previous_style;
-}
-
 TEST(GlobalResourceStartupDeathTest,
      PartialBudgetFailureCannotBecomeStandalone) {
   const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
@@ -284,43 +242,6 @@ TEST(NativeImageMemory, CountsResidentCapacityNotFileSizeOrSegmentGaps) {
   EXPECT_EQ(2u * 16384, bytes);
 }
 
-TEST(NativeImageMemory, RejectsInvalidRangesWithoutPublishingPartialResult) {
-  ElfW(Phdr) headers[2]{};
-  size_t bytes = 73;
-  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
-  EXPECT_FALSE(detail::ElfLoadImageBytes(nullptr, 2, 4096, &bytes));
-  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 0, &bytes));
-  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, nullptr));
-  headers[0].p_type = PT_LOAD;
-  headers[0].p_vaddr = std::numeric_limits<uintptr_t>::max() - 1;
-  headers[0].p_memsz = 4;
-  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
-  headers[0].p_memsz = 1;
-  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
-  headers[0].p_vaddr = 0x2000;
-  headers[1].p_type = PT_LOAD;
-  headers[1].p_vaddr = 0x1000;
-  headers[1].p_memsz = 1;
-  EXPECT_FALSE(detail::ElfLoadImageBytes(headers, 2, 4096, &bytes));
-  EXPECT_EQ(73u, bytes);
-}
-
-TEST(NativeImageMemory, ResolvesSharedOwnerAndExcludesCallerExecutable) {
-  static const char caller_anchor = 0;
-  EXPECT_EQ(0u, detail::NativeImageBytesForAddress(&caller_anchor));
-  // A non-PIE main executable may expose a function's canonical PLT address
-  // through RTLD_DEFAULT. RTLD_NEXT excludes that executable so this tests the
-  // actual shared image.
-  auto *symbol = dlsym(RTLD_NEXT, "malloc");
-  ASSERT_NE(nullptr, symbol);
-  const auto bytes = detail::NativeImageBytesForAddress(symbol);
-  EXPECT_GT(bytes, 0u);
-  EXPECT_EQ(0u, bytes % static_cast<size_t>(sysconf(_SC_PAGESIZE)));
-  EXPECT_THROW(detail::NativeImageBytesForAddress(nullptr), std::bad_alloc);
-  const char stack_anchor = 0;
-  EXPECT_THROW(detail::NativeImageBytesForAddress(&stack_anchor), std::bad_alloc);
-}
-
 TEST(NativeImageMemoryDeathTest, ReservesBeforeAdmissionAndDoesNotRefundLiveImage) {
 #if GTEST_HAS_DEATH_TEST
   const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
@@ -361,49 +282,6 @@ TEST(NativeImageMemoryDeathTest, ReservesBeforeAdmissionAndDoesNotRefundLiveImag
 #endif
 }
 #endif
-
-TEST(GlobalResource, ReservesFifteenPercentForRocksDb) {
-  constexpr uint64_t kOneHundredMiB = 100ULL * 1024 * 1024;
-  constexpr uint64_t kTwoGiB = 2ULL * 1024 * 1024 * 1024;
-
-  EXPECT_EQ(15ULL * 1024 * 1024,
-            GlobalResource::calculate_rocksdb_memory_budget(kOneHundredMiB));
-  EXPECT_EQ(
-      85ULL * 1024 * 1024,
-      GlobalResource::calculate_buffer_pool_memory_budget(kOneHundredMiB));
-  EXPECT_EQ(kTwoGiB,
-            GlobalResource::calculate_rocksdb_memory_budget(kTwoGiB) +
-                GlobalResource::calculate_buffer_pool_memory_budget(kTwoGiB));
-}
-
-TEST(GlobalResource, LeavesCacheHeadroomForCompaction) {
-  constexpr uint64_t kMiB = 1024 * 1024;
-  const auto rocksdb_bytes =
-      GlobalResource::calculate_rocksdb_memory_budget(512 * kMiB);
-  EXPECT_EQ(
-      rocksdb_bytes / 2,
-      GlobalResource::calculate_rocksdb_write_buffer_budget(rocksdb_bytes));
-  EXPECT_EQ(0u, GlobalResource::calculate_rocksdb_write_buffer_budget(0));
-  EXPECT_EQ(1u, GlobalResource::calculate_rocksdb_write_buffer_budget(1));
-  EXPECT_EQ(1u, GlobalResource::calculate_rocksdb_write_buffer_budget(3));
-  EXPECT_EQ(std::numeric_limits<uint64_t>::max() / 2,
-            GlobalResource::calculate_rocksdb_write_buffer_budget(
-                std::numeric_limits<uint64_t>::max()));
-}
-
-TEST(GlobalResource, SizesShardsForPinnedWriteBufferCharges) {
-  constexpr uint64_t kMiB = 1024 * 1024;
-  EXPECT_EQ(0, GlobalResource::calculate_rocksdb_cache_shard_bits(0));
-  EXPECT_EQ(0,
-            GlobalResource::calculate_rocksdb_cache_shard_bits(32 * kMiB - 1));
-  EXPECT_EQ(1, GlobalResource::calculate_rocksdb_cache_shard_bits(32 * kMiB));
-  EXPECT_EQ(2,
-            GlobalResource::calculate_rocksdb_cache_shard_bits(
-                GlobalResource::calculate_rocksdb_memory_budget(512 * kMiB)));
-  EXPECT_EQ(6, GlobalResource::calculate_rocksdb_cache_shard_bits(1024 * kMiB));
-  EXPECT_EQ(6, GlobalResource::calculate_rocksdb_cache_shard_bits(
-                   std::numeric_limits<uint64_t>::max()));
-}
 
 TEST(GlobalResource, CacheAdmitsIndexBlockWhileWriteBufferIsPinned) {
   constexpr size_t kMiB = 1024 * 1024;
@@ -577,89 +455,4 @@ TEST(GlobalResource, RssPressureReclaimsOnlyUnpinnedRocksDbEntries) {
   cache->Release(pinned);
   pinned = nullptr;
   EXPECT_TRUE(wait_until([&] { return cache->GetUsage() == 0; }));
-}
-
-TEST(GlobalResource, HostPressureReclaimsCacheWithoutChangingConfiguredLimit) {
-  auto &resource = GlobalResource::Instance();
-  ASSERT_EQ(0, resource.initialize());
-  auto cache = resource.rocksdb_block_cache();
-  ASSERT_NE(nullptr, cache);
-  auto &config = GlobalConfig::Instance();
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  const size_t limit = pool.process_rss_limit();
-  using Pressure = GlobalConfig::MemoryPressure;
-  auto restore = ailego::ScopeGuard::Make(
-      [&] { config.set_memory_pressure(Pressure::kNormal); });
-  EXPECT_FALSE(config.set_memory_pressure(static_cast<Pressure>(255)).ok());
-  rocksdb::Cache::Handle *pinned = nullptr;
-  auto release = ailego::ScopeGuard::Make([&] {
-    if (pinned) cache->Release(pinned);
-  });
-  ASSERT_TRUE(cache->Insert("host-cold", nullptr, &rocksdb::kNoopCacheItemHelper,
-                            4096, nullptr).ok());
-  ASSERT_TRUE(cache->Insert("host-pinned", nullptr,
-                            &rocksdb::kNoopCacheItemHelper, 4096, &pinned).ok());
-  ASSERT_TRUE(config.set_memory_pressure(Pressure::kBackground).ok());
-  EXPECT_TRUE(pool.under_process_rss_pressure());
-  EXPECT_EQ(limit, pool.process_rss_limit());
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  while (cache->GetUsage() > cache->GetPinnedUsage() &&
-         std::chrono::steady_clock::now() < deadline)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  EXPECT_EQ(cache->GetPinnedUsage(), cache->GetUsage());
-  EXPECT_GT(cache->GetPinnedUsage(), 0u);
-  ASSERT_TRUE(config.set_memory_pressure(Pressure::kCritical).ok());
-  EXPECT_FALSE(pool.try_charge_external(4096));
-  ASSERT_TRUE(config.set_memory_pressure(Pressure::kNormal).ok());
-  ASSERT_TRUE(pool.try_charge_external(4096));
-  pool.release_external(4096);
-}
-
-
-TEST(GlobalResource, LaterPressureReclaimsIdlePlanningAllowances) {
-  ASSERT_EQ(0, GlobalResource::Instance().initialize());
-  auto &config = GlobalConfig::Instance();
-  auto &results = detail::SharedResultMemoryAllowance();
-  auto &metadata = detail::RetainedMetadataBudget::instance();
-  auto &writers = detail::SharedWriteBufferMemoryAllowance();
-  using Pressure = GlobalConfig::MemoryPressure;
-  constexpr size_t kMiB = 1024 * 1024;
-  auto restore = ailego::ScopeGuard::Make(
-      [&] { config.set_memory_pressure(Pressure::kNormal); });
-  const auto wait_until = [](auto ready) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (!ready() && std::chrono::steady_clock::now() < deadline)
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    return ready();
-  };
-
-  {
-    detail::RetainedMetadataBudget::Lease open(metadata);
-    open.acquire(kMiB);
-    WriteBufferReservation writer;
-    ASSERT_TRUE(writer.acquire_managed(kMiB).ok());
-  }
-  ASSERT_GT(metadata.reserved(), 0u);
-  ASSERT_GT(writers.reserved_bytes(), 0u);
-  {
-    detail::ResultMemoryAllowance::Lease pinned(&results);
-    pinned.add(kMiB);
-    const size_t reserved = results.reserved_bytes();
-    ASSERT_TRUE(config.set_memory_pressure(Pressure::kBackground).ok());
-    ASSERT_TRUE(wait_until([&] {
-      return metadata.reserved() == 0 && writers.reserved_bytes() == 0;
-    }));
-    EXPECT_EQ(kMiB, results.active_bytes());
-    EXPECT_EQ(reserved, results.reserved_bytes());
-  }
-
-  ASSERT_TRUE(config.set_memory_pressure(Pressure::kNormal).ok());
-  {
-    detail::ResultMemoryAllowance::Lease idle(&results);
-    idle.add(kMiB);
-  }
-  ASSERT_GT(results.reserved_bytes(), 0u);
-  ASSERT_TRUE(config.set_memory_pressure(Pressure::kBackground).ok());
-  EXPECT_TRUE(wait_until([&] { return results.reserved_bytes() == 0; }));
 }

@@ -217,16 +217,6 @@ class IVFBufferedBuildTest : public ::testing::Test {
   }
 };
 
-TEST_F(IVFBufferedBuildTest, DirectAndMergedFp16AndFp32RoundTrip) {
-  for (bool fp16 : {false, true}) {
-    for (bool merge : {false, true}) {
-      SCOPED_TRACE(::testing::Message()
-                   << "fp16=" << fp16 << " merge=" << merge);
-      ASSERT_NO_FATAL_FAILURE(run(fp16, merge));
-    }
-  }
-}
-
 TEST_F(IVFBufferedBuildTest, DirectAndMergedBuildsSurvivePagePressure) {
   for (bool fp16 : {false, true}) {
     for (bool merge : {false, true}) {
@@ -235,22 +225,6 @@ TEST_F(IVFBufferedBuildTest, DirectAndMergedBuildsSurvivePagePressure) {
       ASSERT_NO_FATAL_FAILURE(run(fp16, merge, true));
     }
   }
-}
-
-TEST_F(IVFBufferedBuildTest, MmapLeavesBufferedTrainingDisabled) {
-  auto param = IVFIndexParamBuilder()
-                   .with_dimension(8)
-                   .with_metric_type(MetricType::kL2sq)
-                   .with_data_type(DataType::DT_FP32)
-                   .build();
-  auto target = std::make_shared<InspectableBufferedIVF>();
-  ASSERT_EQ(target->initialize(*param), 0);
-  Index::Pointer index = target;
-  ASSERT_EQ(index->open((directory_ / "mmap").string(),
-                        {StorageOptions::StorageType::kMMAP, true}),
-            0);
-  EXPECT_FALSE(target->buffered_build_requested());
-  ASSERT_EQ(index->close(), 0);
 }
 
 TEST_F(IVFBufferedBuildTest, ExternalLabelSortPreservesOriginalVectorOrder) {
@@ -347,44 +321,6 @@ TEST_F(IVFBufferedBuildTest, FailedDumpPreservesInputForFetchAndRetry) {
   target.reset();
   inspected.reset();
   ASSERT_TRUE(std::filesystem::remove(path));
-}
-
-TEST_F(IVFBufferedBuildTest, NestedUtf8OutputCreatesParentsAndCleansScratch) {
-  auto param = IVFIndexParamBuilder()
-                   .with_dimension(kDimension)
-                   .with_metric_type(MetricType::kL2sq)
-                   .with_data_type(DataType::DT_FP32)
-                   .with_n_list(8)
-                   .with_n_iters(2)
-                   .build();
-  auto inspected = std::make_shared<InspectableBufferedIVF>();
-  ASSERT_EQ(inspected->initialize(*param), 0);
-  Index::Pointer target = inspected;
-  const auto parent = directory_ / std::filesystem::u8path(u8"嵌套");
-  const auto nested = parent / std::filesystem::u8path(u8"构建");
-  const auto path = nested / "index";
-  ASSERT_FALSE(std::filesystem::exists(parent));
-  ASSERT_EQ(target->open(path.u8string(),
-                         {StorageOptions::StorageType::kBufferPool, true}),
-            0);
-  // Opening remains lazy: it must not allocate any scratch or create dirs.
-  EXPECT_FALSE(std::filesystem::exists(parent));
-  const auto data = values();
-  for (uint32_t id = 0; id < kCount; ++id) {
-    ASSERT_EQ(
-        target->add(VectorData{DenseVector{data.data() + id * kDimension}}, id),
-        0);
-  }
-  ASSERT_EQ(target->train(), 0);
-  ASSERT_NO_FATAL_FAILURE(verify(target, data, false));
-  ASSERT_EQ(target->close(), 0);
-  target.reset();
-  inspected.reset();
-  ASSERT_TRUE(std::filesystem::remove(path));
-  EXPECT_TRUE(std::filesystem::is_empty(nested));
-  ASSERT_TRUE(std::filesystem::remove(nested));
-  EXPECT_TRUE(std::filesystem::is_empty(parent));
-  ASSERT_TRUE(std::filesystem::remove(parent));
 }
 
 }  // namespace

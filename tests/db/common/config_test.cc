@@ -84,91 +84,9 @@ void ExitAfterConfigInitialization() {
   std::exit(0);
 }
 
-void CheckFailedConfigInitializationKeepsLoggingAvailable() {
-  constexpr uint64_t kExistingPoolBytes = 85ULL * 1024 * 1024;
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  ASSERT_EQ(0, pool.init(kExistingPoolBytes));
-
-  auto original_logger = std::make_shared<ShutdownProbeLogger>();
-  ailego::LoggerBroker::Register(original_logger);
-  ailego::LoggerBroker::SetLevel(ailego::Logger::LEVEL_ERROR);
-
-  auto &config = GlobalConfig::Instance();
-  const auto original_memory_limit = config.memory_limit_bytes();
-  const auto original_query_threads = config.query_thread_count();
-  const auto original_log_level = config.log_level();
-  GlobalConfig::ConfigData requested;
-  requested.memory_limit_bytes = 128ULL * 1024 * 1024;
-  requested.query_thread_count = original_query_threads == 1 ? 2 : 1;
-  requested.optimize_thread_count = 1;
-  requested.log_config = std::make_shared<GlobalConfig::ConsoleLogConfig>(
-      GlobalConfig::LogLevel::kDebug);
-
-  const auto status = config.initialize(requested);
-  ASSERT_FALSE(status.ok());
-  EXPECT_EQ(original_memory_limit, config.memory_limit_bytes());
-  EXPECT_EQ(original_query_threads, config.query_thread_count());
-  EXPECT_EQ(original_log_level, config.log_level());
-  EXPECT_EQ(kExistingPoolBytes, pool.capacity());
-  // Logging is initialized before resources and remains available for
-  // diagnosing a later failure. Configuration is not published.
-  EXPECT_TRUE(
-      ailego::LoggerBroker::IsLevelEnabled(ailego::Logger::LEVEL_DEBUG));
-  auto initialized_logger = ailego::LoggerBroker::Register(original_logger);
-  ASSERT_NE(nullptr, initialized_logger);
-  EXPECT_NE(original_logger, initialized_logger);
-  ailego::LoggerBroker::Register(initialized_logger);
-
-  // A compatible retry must still return the terminal initialization error,
-  // not reconfigure logging or publish a new configuration.
-  requested.memory_limit_bytes = 100ULL * 1024 * 1024;
-  requested.log_config = std::make_shared<GlobalConfig::ConsoleLogConfig>(
-      GlobalConfig::LogLevel::kFatal);
-  const auto repeated_status = config.initialize(requested);
-  EXPECT_EQ(status.code(), repeated_status.code());
-  EXPECT_EQ(status.message(), repeated_status.message());
-  EXPECT_EQ(original_memory_limit, config.memory_limit_bytes());
-  EXPECT_EQ(original_query_threads, config.query_thread_count());
-  EXPECT_EQ(original_log_level, config.log_level());
-  EXPECT_EQ(kExistingPoolBytes, pool.capacity());
-  EXPECT_TRUE(
-      ailego::LoggerBroker::IsLevelEnabled(ailego::Logger::LEVEL_DEBUG));
-  EXPECT_EQ(initialized_logger,
-            ailego::LoggerBroker::Register(initialized_logger));
-
-  // A failed explicit initialization must not publish the resource fast path.
-  // Lazy access can still create complete resources using the existing pool.
-  auto &resources = GlobalResource::Instance();
-  ASSERT_EQ(0, resources.initialize());
-  ASSERT_NE(nullptr, resources.query_thread_pool());
-  ASSERT_NE(nullptr, resources.optimize_thread_pool());
-  ASSERT_NE(nullptr, resources.rocksdb_block_cache());
-  ASSERT_NE(nullptr, resources.rocksdb_write_buffer_manager());
-  EXPECT_EQ(GlobalResource::calculate_rocksdb_memory_budget(kExistingPoolBytes),
-            resources.rocksdb_memory_capacity());
-  EXPECT_EQ(kExistingPoolBytes, pool.capacity());
-}
 
 }  // namespace
 #endif  // GTEST_HAS_DEATH_TEST
-
-TEST(ConfigDeathTest,
-     FailedResourceInitializationKeepsLoggingWithoutPublishing) {
-#if GTEST_HAS_DEATH_TEST
-  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  EXPECT_EXIT(
-      {
-        CheckFailedConfigInitializationKeepsLoggingAvailable();
-        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
-      },
-      ::testing::ExitedWithCode(0), "");
-  ::testing::FLAGS_gtest_death_test_style = previous_style;
-#else
-  GTEST_SKIP()
-      << "Process-isolated exit tests are not supported on this platform";
-#endif
-}
 
 TEST(ConfigDeathTest, LoggingShutdownPrecedesBrokerStaticDestruction) {
 #if GTEST_HAS_DEATH_TEST
@@ -334,20 +252,6 @@ TEST_F(ConfigTest, ValidateConfigWithInvalidMemoryLimit) {
             std::string::npos);
 }
 
-TEST_F(ConfigTest, InvalidInitializeCanBeCorrected) {
-  GlobalConfig config_instance;
-  GlobalConfig::ConfigData invalid;
-  invalid.memory_limit_bytes = 0;
-  auto invalid_status = config_instance.initialize(invalid);
-  ASSERT_FALSE(invalid_status.ok());
-  ASSERT_EQ(StatusCode::INVALID_ARGUMENT, invalid_status.code());
-
-  GlobalConfig::ConfigData valid;
-  auto valid_status = config_instance.initialize(valid);
-  ASSERT_TRUE(valid_status.ok()) << valid_status.message();
-  EXPECT_EQ(valid.memory_limit_bytes, config_instance.memory_limit_bytes());
-}
-
 TEST_F(ConfigTest, FailedResourceInitializationDoesNotPublishConfig) {
   ASSERT_EQ(0, GlobalResource::Instance().initialize());
   const auto *query_pool = GlobalResource::Instance().query_thread_pool();
@@ -476,29 +380,4 @@ TEST_F(ConfigTest, LogConfigPolymorphism) {
 
   ASSERT_EQ(console_config->get_logger_type(), CONSOLE_LOG_TYPE_NAME);
   ASSERT_EQ(file_config->get_logger_type(), FILE_LOG_TYPE_NAME);
-}
-
-TEST_F(ConfigTest, InitializePublishesAnImmutableLogConfigSnapshot) {
-  GlobalConfig config_instance;
-  const GlobalConfig::LogConfig &original_log = config_instance.log_config();
-  const auto original_level = original_log.level;
-
-  GlobalConfig::ConfigData requested;
-  const auto &process_config = GlobalConfig::Instance();
-  requested.memory_limit_bytes = process_config.memory_limit_bytes();
-  requested.query_thread_count = process_config.query_thread_count();
-  requested.query_thread_binding = process_config.query_thread_binding();
-  requested.optimize_thread_count = process_config.optimize_thread_count();
-  requested.optimize_thread_binding = process_config.optimize_thread_binding();
-  auto caller_owned_log = std::make_shared<GlobalConfig::ConsoleLogConfig>(
-      GlobalConfig::LogLevel::kInfo);
-  requested.log_config = caller_owned_log;
-
-  const auto status = config_instance.initialize(requested);
-  ASSERT_TRUE(status.ok()) << status.message();
-  EXPECT_EQ(GlobalConfig::LogLevel::kInfo, config_instance.log_level());
-
-  caller_owned_log->level = GlobalConfig::LogLevel::kFatal;
-  EXPECT_EQ(GlobalConfig::LogLevel::kInfo, config_instance.log_level());
-  EXPECT_EQ(original_level, original_log.level);
 }

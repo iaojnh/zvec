@@ -2,9 +2,6 @@ include(${PROJECT_ROOT_DIR}/cmake/bazel.cmake)
 include(${PROJECT_ROOT_DIR}/cmake/option.cmake)
 
 function(db_test_force_load_core TARGET)
-  if(NOT TARGET ${TARGET})
-    return()
-  endif()
   # Include core registries and keep their RTTI in the test executable.
   if(MSVC)
     target_link_options(${TARGET} PRIVATE

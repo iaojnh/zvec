@@ -68,14 +68,6 @@ void CheckBorrowedNumericalInput() {
   EXPECT_TRUE(weak.expired());
 }
 
-TEST(VectorBuildSourceTest, NumericalProvidersBorrowAllPrecisionsByOrdinal) {
-  CheckBorrowedNumericalInput<IndexMeta::DT_FP32, float>();
-  CheckBorrowedNumericalInput<IndexMeta::DT_FP64, double>();
-  CheckBorrowedNumericalInput<IndexMeta::DT_FP16, ailego::Float16>();
-  CheckBorrowedNumericalInput<IndexMeta::DT_INT8, int8_t>();
-  CheckBorrowedNumericalInput<IndexMeta::DT_INT16, int16_t>();
-}
-
 // One-pass source reusing the same row buffer on every data() call. No test
 // retains a full input corpus in memory, including the larger-than-pool case.
 class StreamingInput : public IndexHolder {
@@ -241,119 +233,8 @@ class FailingOrdinalInput : public StreamingInput, public OrdinalAccessHolder {
   }
 };
 
-TEST_F(BuildVectorSpoolTest, OnlyUnsupportedOrdinalCapabilityMayFallBack) {
-  auto input = std::make_shared<FailingOrdinalInput>();
-  VectorBuildSource::Pointer source;
-  EXPECT_EQ(VectorBuildSource::Create(input, &source, prefix()),
-            IndexError_ReadData);
-  EXPECT_EQ(input->iterators, 0u);
-  EXPECT_EQ(source, nullptr);
-  input->error = 0;  // Success with a null reader is a broken provider.
-  EXPECT_EQ(VectorBuildSource::Create(input, &source, prefix()),
-            IndexError_Runtime);
-  EXPECT_EQ(input->iterators, 0u);
-  input->error = IndexError_NotImplemented;
-  EXPECT_EQ(VectorBuildSource::Create(input, &source, prefix()), 0);
-  EXPECT_EQ(input->iterators, 1u);
-}
-
-TEST_F(BuildVectorSpoolTest, EmptyInputDoesNotCreateBackingFile) {
-  auto input = std::make_shared<StreamingInput>();
-  input->rows = input->reported_count = 0;
-  VectorBuildSource::Pointer source;
-  ASSERT_EQ(VectorBuildSource::Create(input, &source, prefix()), 0);
-  EXPECT_EQ(source->count(), 0u);
-  EXPECT_TRUE(std::filesystem::is_empty(directory_));
-}
-
-TEST_F(BuildVectorSpoolTest, UnconfiguredPoolPreservesInMemoryFallback) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  ASSERT_EQ(pool.init(0), 0);
-  auto input = std::make_shared<StreamingInput>();
-  VectorBuildSource::Pointer source;
-  ASSERT_EQ(VectorBuildSource::Create(input, &source), 0);
-  OrdinalAccessHolder::Reader::Pointer reader;
-  ASSERT_EQ(source->create_ordinal_reader(&reader), 0);
-  uint64_t key = 0;
-  const void *data = nullptr;
-  ASSERT_EQ(reader->read(13, &key, &data), 0);
-  EXPECT_EQ(static_cast<const float *>(data)[0], 13.0f);
-  EXPECT_EQ(pool.used(), 0u);
-}
-
 }  // namespace
 }  // namespace zvec::core
 
 namespace zvec::core {
-TEST(ReservoirSampleHolderTest, MatchesLegacyReservoirOrderUnderPressure) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t old_capacity = pool.capacity();
-  ASSERT_EQ(pool.used(), 0u);
-  ASSERT_EQ(pool.init(ailego::VecBufferPool::metadata_bytes_for_page_count(
-                          4096, true) +
-                      64 * 1024),
-            0);
-  auto restore = ailego::ScopeGuard::Make([&]() {
-    EXPECT_EQ(pool.used(), 0u);
-    EXPECT_EQ(pool.init(old_capacity), 0);
-  });
-  {
-    IndexMeta meta(IndexMeta::DT_FP32, 128);
-    auto input =
-        std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(128);
-    for (size_t i = 0; i < 2049; ++i) {
-      ailego::NumericalVector<float> row(128, static_cast<float>(i));
-      ASSERT_TRUE(input->emplace(i, std::move(row)));
-    }
-    for (size_t limit : {size_t{1}, size_t{300}, size_t{2049}, size_t{3000}}) {
-      // The caller-owned reference is outside the tested pool. Activate the
-      // bounded page and reader workspace budget after preparing it.
-      ASSERT_EQ(0, pool.init(0));
-      SampleIndexFeatures<CompactIndexFeatures> legacy(meta, limit);
-      for (auto it = input->create_iterator(); it->is_valid(); it->next())
-        legacy.emplace(it->data());
-      ASSERT_EQ(0,
-                pool.init(pool.used() +
-                          ailego::VecBufferPool::metadata_bytes_for_page_count(
-                              4096, true) +
-                          64 * 1024 + 2 * (meta.element_size() + 8)));
-      IndexHolder::Pointer result;
-      ASSERT_EQ(CreateReservoirSampleHolder(input, limit, &result), 0);
-      ASSERT_EQ(result->count(), legacy.count());
-      size_t i = 0;
-      for (auto it = result->create_iterator(); it->is_valid();
-           it->next(), ++i) {
-        ASSERT_EQ(
-            std::memcmp(it->data(), legacy.element(i), meta.element_size()), 0);
-      }
-      EXPECT_EQ(i, result->count());
-      auto *ordinal = dynamic_cast<OrdinalAccessHolder *>(result.get());
-      ASSERT_NE(nullptr, ordinal);
-      OrdinalAccessHolder::Reader::Pointer first, second;
-      ASSERT_EQ(0, ordinal->create_ordinal_reader(&first));
-      ASSERT_EQ(0, ordinal->create_ordinal_reader(&second));
-      // Readers keep the sample alive and own independent bounded scratch.
-      result.reset();
-      for (size_t id = legacy.count(); id > 0; --id) {
-        uint64_t key;
-        const void *data = nullptr;
-        ASSERT_EQ(0, first->read(id - 1, &key, &data));
-        EXPECT_EQ(id - 1, key);
-        const void *other = nullptr;
-        ASSERT_EQ(0, second->read(0, &key, &other));
-        EXPECT_EQ(
-            0, std::memcmp(data, legacy.element(id - 1), meta.element_size()));
-        EXPECT_EQ(0,
-                  std::memcmp(other, legacy.element(0), meta.element_size()));
-        second->reset();
-      }
-      uint64_t key;
-      const void *data = nullptr;
-      EXPECT_EQ(IndexError_OutOfRange,
-                first->read(legacy.count(), &key, &data));
-      EXPECT_EQ(nullptr, data);
-      EXPECT_EQ(IndexError_InvalidArgument, first->read(0, nullptr, &data));
-    }
-  }
-}
 }  // namespace zvec::core

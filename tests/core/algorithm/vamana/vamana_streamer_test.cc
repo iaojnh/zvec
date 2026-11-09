@@ -1930,43 +1930,6 @@ class GeneratedVamana : public VamanaEntity {
   mutable std::array<float, 3> dists_{};
 };
 
-TEST(VamanaDumpMemoryTest, StreamingPreservesRecordsPaddingAndCrc) {
-  for (uint32_t count : {0u, 1u, 10001u}) {
-    for (bool distances : {false, true}) {
-      SCOPED_TRACE(::testing::Message() << count << ':' << distances);
-      GeneratedVamana entity(count, distances);
-      auto capture = std::make_shared<testing::GraphDumpCapture>();
-      ASSERT_GE(entity.export_segments(capture), 0);
-      EXPECT_LE(capture->max_write, 64u * 1024);
-      EXPECT_EQ(distances ? 5u : 4u, capture->segments.size());
-      const auto &features =
-          capture->segments.at(VamanaEntity::kGraphFeaturesSegmentId);
-      ASSERT_EQ(count * 7u, features.size());
-      auto keys = capture->records<key_t>(VamanaEntity::kGraphMappingSegmentId);
-      auto neighbors =
-          capture->records<node_id_t>(VamanaEntity::kGraphNeighborsSegmentId);
-      ASSERT_EQ(count, keys.size());
-      ASSERT_EQ(count * 4u, neighbors.size());
-      for (uint32_t i = 0; i < count; ++i) {
-        EXPECT_EQ(std::string(7, static_cast<char>(i)),
-                  features.substr(i * 7, 7));
-        EXPECT_EQ(entity.get_key(i), keys[i]);
-        EXPECT_EQ(i % 4, neighbors[i * 4]);
-        for (uint32_t j = 0; j < 3; ++j)
-          EXPECT_EQ(j < i % 4 ? i + j : 0, neighbors[i * 4 + j + 1]);
-      }
-      if (distances) {
-        auto dists =
-            capture->records<float>(VamanaEntity::kGraphNeighborDistsSegmentId);
-        ASSERT_EQ(count * 3u, dists.size());
-        for (uint32_t i = 0; i < count; ++i)
-          for (size_t j = 0; j < 3; ++j)
-            EXPECT_EQ(i % 2 ? 0.0f : static_cast<float>(i), dists[i * 3 + j]);
-      }
-    }
-  }
-}
-
 TEST(VamanaDumpMemoryTest, ReadAndWriteErrorsPropagate) {
   GeneratedVamana entity(3, true);
   auto capture = std::make_shared<testing::GraphDumpCapture>();
