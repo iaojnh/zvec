@@ -86,6 +86,13 @@ class Quantizer {
 
   virtual ~Quantizer() = default;
 
+  // Training workspace policy belongs to the index being built, not to
+  // other collections sharing its process-wide memory pool. This runtime
+  // policy does not change the serialized codebook or distance semantics.
+  void set_buffered_training(bool enabled) {
+    buffered_training_ = enabled;
+  }
+
   //! Initialize quantizer with index metadata and parameters
   virtual int init(const IndexMeta &meta, const ailego::Params &params) = 0;
 
@@ -296,6 +303,7 @@ class Quantizer {
 
   QuantizeType type_;
   uint32_t extra_meta_size_{0};
+  bool buffered_training_{true};
 };
 
 }  // namespace turbo

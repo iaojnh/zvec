@@ -21,6 +21,7 @@
 #include "algorithm/diskann/diskann_params.h"
 #include "utility/utility_params.h"
 #include "buffered_input.h"
+#include "turbo/quantizer/quantizer.h"
 #include "holder_builder.h"
 #endif
 
@@ -190,6 +191,10 @@ int DiskAnnIndex::open(const std::string &file_path,
       storage_options.type == StorageOptions::StorageType::kBufferPool);
   proxima_index_params_.set(core::PARAM_DISKANN_BUILDER_BUILD_STORAGE_PATH,
                             file_path_ + ".build");
+  if (storage_options.create_new && turbo_quantizer_) {
+    turbo_quantizer_->set_buffered_training(
+        storage_options.type == StorageOptions::StorageType::kBufferPool);
+  }
 
   if (!storage_options.create_new) {
     int ret = storage_->open(file_path_, false);

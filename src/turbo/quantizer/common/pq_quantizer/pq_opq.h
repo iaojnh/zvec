@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -24,6 +23,7 @@
 #include <vector>
 #include <turbo/preprocessor/opq_rotator/opq_rotator.h>
 #include <turbo/preprocessor/preprocessor.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/container/params.h>
 
 namespace zvec {
@@ -53,7 +53,8 @@ class PqOpq {
   //! The caller performs the final full PQ training after this returns.
   int train(void *data, size_t num, const char *name,
             const TrainCodebook &train_codebook, const Reconstruct &reconstruct,
-            const ReconstructSum &reconstruct_sum = {});
+            const ReconstructSum &reconstruct_sum = {},
+            bool buffered_training = true);
 
   using ReadRows = std::function<int(size_t, size_t, float *)>;
   using WriteRows = std::function<int(size_t, size_t, const float *)>;
@@ -64,7 +65,8 @@ class PqOpq {
                  const ReconstructSum &reconstruct);
 
   //! Returns input unchanged when disabled, otherwise rotates into buffer.
-  const void *apply(const void *input, ailego::BudgetedVector<float> *buffer) const;
+  const void *apply(const void *input,
+                    ailego::BudgetedVector<float> *buffer) const;
 
   //! These two operations require enabled() and non-overlapping buffers.
   void rotate(const float *input, float *output) const;

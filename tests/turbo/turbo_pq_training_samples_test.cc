@@ -17,7 +17,9 @@
 #include <cstring>
 #include <random>
 #include <type_traits>
+#include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "core/utility/prefix_index_holder.h"
 #include "quantizer/common/pq_training_samples.h"
 #include "quantizer/pq_int8_quantizer/pq_int8_quantizer.h"
@@ -307,6 +309,39 @@ TEST(PqTrainingSamples, ReadOnlyTrainingBorrowsForBothPrecisionsAndMetrics) {
       EXPECT_EQ(quantizer.calc_distance_dp_query(code.data(), lut.data()),
                 restored.calc_distance_dp_query(code.data(), lut.data()));
     }
+  }
+}
+
+TEST(PqTrainingSamples, DiskAnnStorageModeSelectsTrainingWithSharedBudget) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(32UL << 20));
+  AILEGO_DEFER([&] { EXPECT_EQ(0, pool.init(previous)); });
+  auto source = MakeSource<IndexMeta::DT_FP32>(512, 17);
+  for (bool buffered : {false, true}) {
+    auto stable = std::make_shared<StableHolder>(source);
+    IndexMeta meta(IndexMeta::DT_FP32, 17);
+    meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+    ailego::Params params;
+    params.set("num_chunk", uint32_t{4});
+    params.set("thread_count", uint32_t{1});
+    params.set("precompute_sdc", false);
+    params.set("buffered_training", buffered);
+    PqInt8Quantizer quantizer;
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    ASSERT_EQ(0, quantizer.train(stable));
+    EXPECT_EQ(buffered ? 0u : 1u, stable->retain_calls);
+    std::string blob;
+    ASSERT_EQ(0, quantizer.serialize(&blob));
+    PqInt8Quantizer reopened;
+    ASSERT_EQ(0, reopened.init(meta, params));
+    ASSERT_EQ(0, reopened.deserialize(blob));
+    auto row = source->create_iterator();
+    std::vector<uint8_t> first(quantizer.quantized_datapoint_vector_length());
+    auto second = first;
+    quantizer.quantize_data(row->data(), first.data());
+    reopened.quantize_data(row->data(), second.data());
+    EXPECT_EQ(first, second);
   }
 }
 
