@@ -605,6 +605,128 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
 #endif
 }
 
+ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sample() {
+#if defined(__APPLE__) && TARGET_OS_OSX
+  // Copy addresses and charged-page masks under short mapping locks. Native
+  // queries use values only, never descriptors that an allocator may retire.
+  // The budget token separately removes all retirement/cancellation credit.
+  const int saved_errno = errno;
+  auto restore_errno = ScopeGuard::Make([&] { errno = saved_errno; });
+  auto &pool = get_instance();
+  const size_t page = static_cast<size_t>(::getpagesize());
+  if (page < kMinimumPageBytes || page > kSlabBytes || kSlabBytes % page)
+    return {MemoryHelper::SelfRSS(), 0};
+  const size_t before = MemoryHelper::SelfRSS();
+  if (!before) return {};
+  std::array<int, kSlabBytes / kMinimumPageBytes> entries;
+  constexpr int present = VM_PAGE_QUERY_PAGE_PRESENT | VM_PAGE_QUERY_PAGE_DIRTY;
+  constexpr int excluded = VM_PAGE_QUERY_PAGE_EXTERNAL |
+      VM_PAGE_QUERY_PAGE_PAGED_OUT | VM_PAGE_QUERY_PAGE_FICTITIOUS |
+      VM_PAGE_QUERY_PAGE_REUSABLE;
+  const auto read_range = [&](uintptr_t address, size_t bytes,
+                              const std::array<bool, kMaxSlabDataPages + 1> *charged,
+                              size_t logical_page) {
+    if (address % page || bytes % page ||
+        bytes > std::numeric_limits<uintptr_t>::max() - address) return size_t{0};
+    size_t resident = 0;
+    for (size_t offset = 0; offset < bytes;) {
+      const size_t count = std::min((bytes - offset) / page, entries.size());
+      mach_vm_size_t returned = count;
+      if (::mach_vm_page_range_query(::mach_task_self(), address + offset,
+              count * page, reinterpret_cast<mach_vm_address_t>(entries.data()),
+              &returned) != KERN_SUCCESS || returned != count) return size_t{0};
+      for (size_t i = 0; i < count; ++i)
+        if ((!charged || (*charged)[(offset + i * page) / logical_page]) &&
+            (entries[i] & present) == present && !(entries[i] & excluded))
+          resident += page;
+      offset += count * page;
+    }
+    return resident;
+  };
+  size_t resident = 0;
+  uintptr_t cursor = 0;
+  size_t slabs_left = 0;
+  {
+    std::unique_lock<std::mutex> lock(pool.slab_mutex_, std::try_to_lock);
+    if (!lock) return {MemoryHelper::SelfRSS(), 0};
+    for (auto *slab = pool.slabs_; slab; slab = slab->next) ++slabs_left;
+  }
+  while (slabs_left-- != 0) {
+    uintptr_t address = 0;
+    size_t logical_page = 0, bytes = 0;
+    std::array<bool, kMaxSlabDataPages + 1> charged{};
+    {
+      std::unique_lock<std::mutex> lock(pool.slab_mutex_, std::try_to_lock);
+      if (!lock) return {MemoryHelper::SelfRSS(), 0};
+      ReclaimableSlab *next = nullptr;
+      for (auto *slab = pool.slabs_; slab; slab = slab->next) {
+        const auto base = reinterpret_cast<uintptr_t>(slab);
+        if (base >= cursor && (!next || base < reinterpret_cast<uintptr_t>(next)))
+          next = slab;
+      }
+      if (!next) break;
+      std::unique_lock<std::mutex> slab_lock(next->mutex, std::try_to_lock);
+      if (!slab_lock) return {MemoryHelper::SelfRSS(), 0};
+      address = reinterpret_cast<uintptr_t>(next);
+      logical_page = next->page_size;
+      if (logical_page < page || logical_page % page ||
+          address > std::numeric_limits<uintptr_t>::max() - kSlabBytes)
+        return {MemoryHelper::SelfRSS(), 0};
+      bytes = next->committed_pages ? kSlabBytes : logical_page;
+      charged[0] = true;
+      if (next->committed_pages) {
+        for (size_t i = 1; i < next->next_unused; ++i) charged[i] = true;
+        for (size_t i = 0; i < next->reclaimed_count; ++i)
+          charged[next->reclaimed_pages[i]] = false;
+      }
+      cursor = address + kSlabBytes;
+    }
+    resident += read_range(address, bytes, &charged, logical_page);
+  }
+  struct Range { uintptr_t address; size_t bytes; };
+  std::array<Range, 128> ranges;
+  cursor = 0;
+  size_t mappings_left = 0;
+  {
+    std::unique_lock<std::mutex> lock(pool.cache_mapping_mutex_, std::try_to_lock);
+    if (!lock) return {MemoryHelper::SelfRSS(), 0};
+    for (auto *mapping = pool.cache_mappings_; mapping;
+         mapping = mapping->mapped_next) ++mappings_left;
+  }
+  while (mappings_left != 0) {
+    size_t count = 0;
+    {
+      std::unique_lock<std::mutex> lock(pool.cache_mapping_mutex_, std::try_to_lock);
+      if (!lock) return {MemoryHelper::SelfRSS(), 0};
+      auto *mapping = pool.cache_mappings_;
+      while (mapping && reinterpret_cast<uintptr_t>(mapping->data) < cursor)
+        mapping = mapping->mapped_next;
+      for (size_t copied = 0;
+           mapping && mappings_left && copied < ranges.size();
+           ++copied, --mappings_left) {
+        const auto address = reinterpret_cast<uintptr_t>(mapping->data);
+        if (mapping->bytes > std::numeric_limits<uintptr_t>::max() - address)
+          return {MemoryHelper::SelfRSS(), 0};
+        if (count && ranges[count - 1].address + ranges[count - 1].bytes == address)
+          ranges[count - 1].bytes += mapping->bytes;
+        else ranges[count++] = {address, mapping->bytes};
+        cursor = address + mapping->bytes;
+        mapping = mapping->mapped_next;
+      }
+    }
+    if (!count) break;
+    for (size_t i = 0; i < count; ++i)
+      resident += read_range(ranges[i].address, ranges[i].bytes, nullptr, page);
+  }
+  const size_t rss = MemoryHelper::SelfRSS();
+  if (!rss) return {};
+  if (rss < before) resident -= std::min(resident, before - rss);
+  return {rss, std::min(resident, rss)};
+#else
+  return {MemoryHelper::SelfRSS(), 0};
+#endif
+}
+
 struct MemoryLimitPool::RetainedBlock {
   RetainedBlock *next{nullptr};
   size_t bytes{0};
@@ -1436,26 +1558,10 @@ bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
                                                   size_t permanent_backing) {
   auto resident_reader = &MemoryLimitPool::read_slab_resident_sample;
 #if defined(__APPLE__) && TARGET_OS_OSX
+  // Foreground budget refreshes remain cheap. The background worker publishes
+  // independently validated ownership proofs without holding this mutex.
   resident_reader = +[]() -> ProcessRssBudget::ResidentSample {
-    // Page-state queries are substantially more expensive than task RSS.
-    // Keep normal RSS/admission sampling responsive, but bound full slab
-    // scans. Between scans provide fresh RSS and no overlap credit, never a
-    // cached witness whose pages could already have been discarded.
-    static auto sampled_at = std::chrono::steady_clock::time_point{};
-    static uint64_t confirmed_generation = 0;
-    const auto now = std::chrono::steady_clock::now();
-    const auto &budget = MemoryLimitPool::get_instance().process_rss_;
-    const auto generation = budget.resident_release_generation();
-    // A corrective scan can precede conservative RSS-driven rejection.
-    // Unchanged pressure alone must not repeatedly scan the same retirement.
-    const bool confirm = budget.needs_resident_confirmation() &&
-                         generation != confirmed_generation;
-    if (!confirm && now - sampled_at < std::chrono::milliseconds(100))
-      return {MemoryHelper::SelfRSS(), 0};
-    const auto sample = MemoryLimitPool::read_slab_resident_sample();
-    sampled_at = std::chrono::steady_clock::now();
-    confirmed_generation = generation;
-    return sample;
+    return {MemoryHelper::SelfRSS(), 0};
   };
 #endif
   const bool configured = process_rss_.configure(
@@ -1629,6 +1735,26 @@ void MemoryLimitPool::background_evict_loop() {
   bool idle_progress = false;
   bool reclaim_to_low = false;
   auto last_process_reclaim = std::chrono::steady_clock::time_point{};
+#if defined(__APPLE__) && TARGET_OS_OSX
+  auto last_owned_sample = std::chrono::steady_clock::time_point{};
+  uint64_t confirmed_generation = 0;
+  const auto refresh_owned_sample = [&] {
+    const auto generation = process_rss_.resident_release_generation();
+    const bool confirm = process_rss_.needs_resident_confirmation() &&
+                         generation != confirmed_generation;
+    if (process_rss_.limit() &&
+        (confirm || std::chrono::steady_clock::now() - last_owned_sample >=
+                        milliseconds(100))) {
+      const auto token = process_rss_.begin_resident_sample();
+      if (token.configuration) {
+        const auto sample = read_background_resident_sample();
+        process_rss_.publish_resident_sample(token, sample);
+      }
+      last_owned_sample = std::chrono::steady_clock::now();
+      confirmed_generation = generation;
+    }
+  };
+#endif
   const auto page_admission_pressure = [this] {
     // Reserved headroom can block page admission below both general
     // watermarks. Keep the background queue progressing at that boundary,
@@ -1653,6 +1779,9 @@ void MemoryLimitPool::background_evict_loop() {
     const size_t requested =
         cache_reclaim_requested_.exchange(0, std::memory_order_relaxed);
     process_rss_.refresh(process_rss_.needs_resident_confirmation());
+#if defined(__APPLE__) && TARGET_OS_OSX
+    refresh_owned_sample();
+#endif
     if (requested && (used() > low_watermark() || process_rss_.pressure())) {
       reclaim_to_low = true;
       const size_t n = BlockEvictionQueue::get_instance()
@@ -1668,6 +1797,9 @@ void MemoryLimitPool::background_evict_loop() {
       // including when vector pages cannot make further reclamation progress.
       reclaim_process_cache();
       process_rss_.refresh(true);
+#if defined(__APPLE__) && TARGET_OS_OSX
+      refresh_owned_sample();
+#endif
       last_process_reclaim = now;
     }
     // Flush/compaction can retire many owners without reaching a watermark.
@@ -1718,6 +1850,9 @@ void MemoryLimitPool::background_evict_loop() {
       if (process_rss_.pressure()) {
         trim_idle_buffers();
         process_rss_.refresh(true);
+#if defined(__APPLE__) && TARGET_OS_OSX
+        refresh_owned_sample();
+#endif
       }
     }
     if (used_size_.load() <= low && !page_admission_pressure())

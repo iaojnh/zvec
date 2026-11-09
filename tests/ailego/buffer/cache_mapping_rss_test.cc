@@ -38,6 +38,9 @@ struct MemoryLimitPoolTestPeer {
   static ProcessRssBudget::ResidentSample sample() {
     return MemoryLimitPool::read_slab_resident_sample();
   }
+  static ProcessRssBudget::ResidentSample background_sample() {
+    return MemoryLimitPool::read_background_resident_sample();
+  }
   static ProcessRssBudget::ResidentSample sample_while_busy(
       MemoryLimitPool &pool) {
     std::lock_guard<std::mutex> lock(pool.cache_mapping_mutex_);
@@ -136,6 +139,8 @@ TEST_F(CacheMappingRssTest, NativeWitnessExcludesUntouchedAndIncludesIdleBacking
   std::memset(touched->data, 17, touched->bytes);
   const auto full = MemoryLimitPoolTestPeer::sample();
   EXPECT_EQ(8 * kMiB, full.owned_resident - empty.owned_resident);
+  EXPECT_EQ(full.owned_resident,
+            MemoryLimitPoolTestPeer::background_sample().owned_resident);
   EXPECT_LE(full.owned_resident, full.rss);
   touched.reset();
   EXPECT_EQ(full.owned_resident,
@@ -154,12 +159,28 @@ TEST_F(CacheMappingRssTest, BusyRegistrySuppliesNoStaleWitness) {
   EXPECT_EQ(0u, sample.owned_resident);
 }
 
+TEST_F(CacheMappingRssTest, BackgroundSnapshotHonorsSlabChargedPageMask) {
+  const size_t bytes = MemoryLimitPool::page_buffer_size();
+  char *touched = nullptr, *untouched = nullptr;
+  ASSERT_TRUE(pool_.try_acquire_buffer(bytes, touched));
+  ASSERT_TRUE(pool_.try_acquire_buffer(bytes, untouched));
+  std::memset(touched, 29, bytes);
+  const auto raw = MemoryLimitPoolTestPeer::sample();
+  const auto background = MemoryLimitPoolTestPeer::background_sample();
+  EXPECT_EQ(raw.owned_resident, background.owned_resident);
+  EXPECT_GT(background.owned_resident, 0u);
+  pool_.release_buffer(touched, bytes);
+  pool_.release_buffer(untouched, bytes);
+}
+
 TEST_F(CacheMappingRssTest, ConcurrentNativeSamplesKeepMappingLifetimesSafe) {
   std::atomic<bool> done{false};
   std::atomic<size_t> samples{0};
   std::thread sampler([&] {
     while (!done.load()) {
-      const auto sample = MemoryLimitPoolTestPeer::sample();
+      const auto sample = samples.load() % 2
+                              ? MemoryLimitPoolTestPeer::sample()
+                              : MemoryLimitPoolTestPeer::background_sample();
       EXPECT_LE(sample.owned_resident, sample.rss);
       ++samples;
       std::this_thread::sleep_for(std::chrono::microseconds(100));
