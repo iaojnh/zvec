@@ -93,8 +93,7 @@ def run(index, path, evidence, rows, dimension, budget_mib, build_workers):
             )
         ],
     )
-    options = zvec.CollectionOption.__new__(zvec.CollectionOption)
-    options.__setstate__((False, False, 1024**2))
+    options = zvec.CollectionOption(enable_mmap=False, max_buffer_size=1024**2)
     collection = zvec.create_and_open(path, schema, options)
     probes = {}
     rng = np.random.default_rng(2026)

@@ -63,6 +63,9 @@ allure-*
 # config
 doc/
 config/
-examples/python/
+examples/python/*
+!examples/python/ivf_memory_profile.py
+!examples/python/ivf_memory_profile.json
+!examples/python/ivf_memory_profile.md
 examples/c_api/
 logs/

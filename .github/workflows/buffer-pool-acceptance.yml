@@ -2,7 +2,13 @@ name: Buffer Pool Acceptance
 
 on:
   push:
-    branches: [test/buffer-pool-acceptance]
+    branches: [test/buffer-pool-acceptance, codex/ivf-release-profile]
+  workflow_dispatch:
+    inputs:
+      ivf_profile_only:
+        description: Run the public IVF profile with the existing candidate build
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -19,6 +25,7 @@ env:
 
 jobs:
   desktop:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Desktop compatibility (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -34,20 +41,24 @@ jobs:
       buffer_pool_acceptance: true
 
   windows:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Windows x64 and ARM64 compatibility
     uses: ./.github/workflows/05-windows-build.yml
     with:
       buffer_pool_acceptance: true
 
   android:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Android emulator and device ABI compatibility
     uses: ./.github/workflows/04-android-build.yml
 
   ios:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: iOS simulator and device SDK compatibility
     uses: ./.github/workflows/06-ios-build.yml
 
   musllinux:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Linux musl compatibility
     uses: ./.github/workflows/09-musllinux-build.yml
 
@@ -127,6 +138,7 @@ jobs:
           retention-days: 14
 
   build-memory:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Index build memory control (${{ matrix.index }}, 512 MiB)
     needs: build
     runs-on: ubuntu-24.04
@@ -187,6 +199,7 @@ jobs:
           retention-days: 14
 
   acceptance:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Acceptance (${{ matrix.shard }})
     needs: build
     runs-on: ubuntu-24.04
@@ -275,6 +288,7 @@ jobs:
           retention-days: 14
 
   io-backends:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Linux x64 shared paths (${{ matrix.backend }})
     needs: build
     runs-on: ubuntu-24.04
@@ -308,6 +322,7 @@ jobs:
           native-bin: ${{ github.workspace }}/candidate/bin
 
   public-suite:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Public API mutations, FTS, quantizers and recovery
     needs: [build, acceptance]
     runs-on: ubuntu-24.04
@@ -353,6 +368,7 @@ jobs:
           retention-days: 14
 
   baseline-build:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Build pinned pre-change baseline
     needs: public-suite
     runs-on: ubuntu-24.04
@@ -423,6 +439,7 @@ jobs:
           retention-days: 14
 
   linux-scale:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Linux scale (${{ matrix.scenario }})
     needs: [build, public-suite]
     runs-on: ubuntu-24.04
@@ -492,6 +509,7 @@ jobs:
           retention-days: 14
 
   soak:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: One-hour mixed lifecycle (${{ matrix.index }})
     needs: [build, linux-scale]
     runs-on: ubuntu-24.04
@@ -533,6 +551,7 @@ jobs:
           retention-days: 14
 
   external-limit:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: cgroup hard memory limit and no swap (${{ matrix.index }})
     needs: [build, linux-scale]
     runs-on: ubuntu-24.04
@@ -580,6 +599,7 @@ jobs:
           retention-days: 14
 
   production:
+    if: ${{ github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     name: Cohere 1M baseline and candidate (${{ matrix.index }}, ${{ matrix.storage }})
     needs: [build, build-memory, baseline-build, linux-scale, soak, external-limit, desktop, windows, android, ios, musllinux, io-backends]
     runs-on: ubuntu-24.04
@@ -674,9 +694,96 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  ivf-profile:
+    name: IVF public profile and QPS per RSS versus mmap
+    if: ${{ github.ref_name == 'codex/ivf-release-profile' || (github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: buffer-pool-candidate
+          path: candidate
+      - name: Verify and install the same candidate for both storage modes
+        run: |
+          cmp <(git rev-parse HEAD) candidate/commit.txt
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python -m pip install candidate/*.whl pytest pytest-xdist
+          python -m pytest -o addopts= -q python/tests/test_collection_options.py \
+            .github/scripts/test_buffer_pool_ivf_profile.py
+      - name: Build, continuously write and retrieve under the profile memory limit
+        env:
+          PROFILE_ROOT: ${{ runner.temp }}/ivf-profile
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          profile=examples/python/ivf_memory_profile.json
+          limit_mib=$(python -c 'import json; print(json.load(open("examples/python/ivf_memory_profile.json"))["system_limit_mib"])')
+          wheel=$(find candidate -maxdepth 1 -name '*.whl' -print -quit)
+          python_path=$(command -v python)
+          run_stage() {
+            local storage="$1" stage="$2" trial="$3"
+            # A fresh service must own its page-cache charges. Both modes start
+            # with cold OS caches, then perform the same measured warmup.
+            sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --unit="ivf-profile-$storage-$stage-$trial-${{ github.run_id }}-${{ github.run_attempt }}" \
+              --property="MemoryMax=${limit_mib}M" --property=MemorySwapMax=0 \
+              --property=LimitNOFILE=65536 \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              --setenv=OPENBLAS_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
+              "$python_path" .github/scripts/buffer_pool_system_limit.py \
+              "$((limit_mib * 1024 * 1024))" "evidence/$storage-$stage-$trial.cgroup.jsonl" \
+              "$python_path" -X faulthandler .github/scripts/buffer_pool_ivf_profile.py observe \
+              --profile "$profile" --root "$PROFILE_ROOT/$storage" --evidence evidence \
+              --wheel "$wheel" --storage "$storage" --stage "$stage" --trial "$trial" \
+              2>&1 | tee "evidence/$storage-$stage-$trial.log"
+          }
+          failed=0
+          for storage in buffer mmap; do
+            if run_stage "$storage" build 1 && run_stage "$storage" mixed 1 && run_stage "$storage" verify 1; then
+              :
+            else
+              failed=1
+            fi
+          done
+          if [[ "$failed" != 0 ]]; then exit 1; fi
+          # Alternate pair order to reduce runner drift; each trial uses a fresh
+          # process, identical data/recall settings and the same external limit.
+          trials=$(python -c 'import json; print(json.load(open("examples/python/ivf_memory_profile.json"))["query"]["trials"])')
+          for trial in $(seq 1 "$trials"); do
+            order='buffer mmap'
+            if (( trial % 2 == 0 )); then order='mmap buffer'; fi
+            for storage in $order; do run_stage "$storage" query "$trial"; done
+          done
+      - name: Export evidence and qualify only profiles meeting the IVF target
+        if: always()
+        run: |
+          mkdir -p profile-result
+          cp examples/python/ivf_memory_profile.py examples/python/ivf_memory_profile.json \
+            examples/python/ivf_memory_profile.md profile-result/
+          python .github/scripts/buffer_pool_ivf_profile.py export \
+            --profile examples/python/ivf_memory_profile.json --evidence evidence --output profile-result
+      - uses: ./.github/actions/upload-evidence
+        if: always()
+        with:
+          name: buffer-pool-ivf-profile
+          path: |
+            profile-result/
+            evidence/
+          if-no-files-found: error
+          retention-days: 14
+
   summary:
     name: Acceptance summary
-    if: always()
+    if: ${{ always() && github.ref_name != 'codex/ivf-release-profile' && !(github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     needs: [build, build-memory, acceptance, public-suite, baseline-build, desktop, windows, android, ios, musllinux, io-backends, linux-scale, soak, external-limit, production]
     runs-on: ubuntu-24.04
     env:

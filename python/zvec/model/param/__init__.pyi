@@ -119,7 +119,12 @@ class CollectionOption:
     """
 
     def __getstate__(self) -> tuple: ...
-    def __init__(self, read_only: bool = False, enable_mmap: bool = True) -> None:
+    def __init__(
+        self,
+        read_only: bool = False,
+        enable_mmap: bool = True,
+        max_buffer_size: int = ...,
+    ) -> None:
         """
         Constructs a CollectionOption instance.
 
@@ -128,6 +133,9 @@ class CollectionOption:
                 Defaults to False.
             enable_mmap (bool, optional): Enable memory-mapped I/O.
                 Defaults to True.
+            max_buffer_size (int, optional): Write buffer size in bytes, between
+                1 and 4294967295. Defaults to 64 MiB on desktop and 4 MiB on
+                mobile. Ignored for read-only opens.
         """
 
     def __repr__(self) -> str: ...
@@ -136,6 +144,8 @@ class CollectionOption:
     def enable_mmap(self) -> bool: ...
     @property
     def read_only(self) -> bool: ...
+    @property
+    def max_buffer_size(self) -> int: ...
 
 class DiskAnnIndexParam(VectorIndexParam):
     """

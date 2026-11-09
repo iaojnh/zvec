@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "name": "ivf-fp32-400k-768d-512m",
+  "platform": "linux-x86_64-glibc",
+  "system_limit_mib": 768,
+  "memory_limit_mb": 512,
+  "mmap_reference_memory_limit_mb": 768,
+  "query_threads": 1,
+  "optimize_threads": 4,
+  "max_buffer_size": 1048576,
+  "rows": 400000,
+  "dimension": 768,
+  "batch_size": 128,
+  "payload_bytes": 64,
+  "seed": 2026,
+  "index": {"n_list": 32, "n_iters": 5, "nprobe": 32, "metric": "L2"},
+  "query": {
+    "topk": 10,
+    "query_count": 16,
+    "warmup_queries": 16,
+    "trials": 3,
+    "minimum_seconds": 3.0,
+    "distributions": ["uniform", "hot_80_20", "zipf", "repeat_90_10"]
+  },
+  "mixed": {"minimum_seconds": 60.0, "batches": 12, "readers": 1},
+  "acceptance": {
+    "minimum_recall": 0.9,
+    "maximum_recall_difference": 0.01,
+    "minimum_qps_per_rss_ratio": 1.0,
+    "minimum_qps_ratio": 0.8,
+    "maximum_p99_ratio": 1.25,
+    "maximum_sampling_gap_seconds": 1.0
+  }
+}

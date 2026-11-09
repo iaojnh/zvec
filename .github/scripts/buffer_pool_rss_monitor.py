@@ -151,9 +151,10 @@ def observe(args):
 
 
 class ProcessRssMonitor:
-    def __init__(self, evidence, target_kib):
+    def __init__(self, evidence, target_kib, *, enforce_soft_limit=True):
         self.evidence = evidence
         self.target = target_kib
+        self.enforce_soft_limit = enforce_soft_limit
         self.process = None
         self.directory = None
 
@@ -208,7 +209,7 @@ class ProcessRssMonitor:
             )
             result = json.loads(self.output.read_text())
             print(json.dumps(result), file=self.evidence, flush=True)
-            if exception_type is None:
+            if exception_type is None and self.enforce_soft_limit:
                 validate_soft_rss(result)
         finally:
             self.directory.cleanup()

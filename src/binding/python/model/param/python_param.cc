@@ -14,6 +14,7 @@
 
 #include "python_param.h"
 #include <algorithm>
+#include <limits>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <zvec/core/interface/constants.h>
@@ -2090,14 +2091,26 @@ Attributes:
         Default is False.
     enable_mmap (bool): Whether to use memory-mapped I/O for data files.
         Default is True.
+    max_buffer_size (int): Write buffer size in bytes. Defaults to 64 MiB on
+        desktop platforms and 4 MiB on mobile. Ignored for read-only opens.
 
 Examples:
     >>> opt = CollectionOption(read_only=True, enable_mmap=False)
     >>> print(opt.read_only)
     True
 )pbdoc")
-      .def(py::init<bool, bool>(), py::arg("read_only") = false,
-           py::arg("enable_mmap") = true,
+      .def(py::init([](bool read_only, bool enable_mmap,
+                       uint64_t max_buffer_size) {
+             if (max_buffer_size == 0 ||
+                 max_buffer_size > (std::numeric_limits<uint32_t>::max)()) {
+               throw py::value_error(
+                   "max_buffer_size must be between 1 and 4294967295 bytes");
+             }
+             return CollectionOptions(read_only, enable_mmap,
+                                      static_cast<uint32_t>(max_buffer_size));
+           }),
+           py::arg("read_only") = false, py::arg("enable_mmap") = true,
+           py::arg("max_buffer_size") = DEFAULT_MAX_BUFFER_SIZE,
            R"pbdoc(
 Constructs a CollectionOption instance.
 
@@ -2106,6 +2119,10 @@ Args:
         Defaults to False.
     enable_mmap (bool, optional): Enable memory-mapped I/O.
         Defaults to True.
+    max_buffer_size (int, optional): Positive write buffer size in bytes, up
+        to 4294967295. Defaults to 64 MiB on desktop and 4 MiB on mobile.
+        Lower values reduce write/flush workspace requirements. Ignored for
+        read-only opens.
 )pbdoc")
       .def_property_readonly(
           "enable_mmap",
@@ -2113,12 +2130,17 @@ Args:
       .def_property_readonly(
           "read_only",
           [](const CollectionOptions &self) { return self.read_only_; })
+      .def_property_readonly(
+          "max_buffer_size",
+          [](const CollectionOptions &self) { return self.max_buffer_size_; })
       .def("__repr__",
            [](const CollectionOptions &self) -> std::string {
              return "{"
                     "\"enable_mmap\":" +
                     std::to_string(self.enable_mmap_) +
-                    ", \"read_only\":" + std::to_string(self.read_only_) + "}";
+                    ", \"read_only\":" + std::to_string(self.read_only_) +
+                    ", \"max_buffer_size\":" +
+                    std::to_string(self.max_buffer_size_) + "}";
            })
       .def(py::pickle(
           [](const CollectionOptions &self) {
