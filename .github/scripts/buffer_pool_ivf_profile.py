@@ -275,6 +275,55 @@ def evaluate(profile, evidence):
     }
 
 
+def markdown_report(result):
+    lines = [
+        "# IVF profile acceptance",
+        "",
+        "**PASS**" if result["passed"] else "**FAIL — no qualified profile generated**",
+        "",
+    ]
+    if "error" in result:
+        return "\n".join([*lines, result["error"], ""])
+    config = result["profile"]
+    lines += [
+        f"Candidate: `{result['source_commit']}`",
+        f"Profile: `{config['name']}`; external limit {config['system_limit_mib']} MiB, swap disabled.",
+        "",
+        "Ratio uses median per-trial QPS / time-weighted whole-process RSS MiB.",
+        "QPS and RSS columns show individual trial medians. All declared cases must pass.",
+        "",
+        "| Distribution | Buffer QPS | Buffer RSS MiB | mmap QPS | mmap RSS MiB | QPS/RSS ratio | Result |",
+        "|---|---:|---:|---:|---:|---:|---|",
+    ]
+    for case in result["comparisons"]:
+        buffer, mmap = case["buffer"], case["mmap"]
+        lines.append(
+            f"| {case['distribution']} | {buffer['qps']:.3f} | {buffer['average_rss_mib']:.1f} "
+            f"| {mmap['qps']:.3f} | {mmap['average_rss_mib']:.1f} "
+            f"| {case['qps_per_rss_ratio']:.3f} | {'PASS' if case['passed'] else 'FAIL'} |"
+        )
+    lines += [
+        "",
+        "| Distribution | Buffer recall | mmap recall | Buffer p99 ms | mmap p99 ms |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for case in result["comparisons"]:
+        buffer, mmap = case["buffer"], case["mmap"]
+        lines.append(
+            f"| {case['distribution']} | {buffer['recall']:.4f} | {mmap['recall']:.4f} "
+            f"| {buffer['p99_ms']:.3f} | {mmap['p99_ms']:.3f} |"
+        )
+    lines.append("")
+    for case in result["comparisons"]:
+        failed = [name for name, passed in case["checks"].items() if not passed]
+        if failed:
+            lines.append(
+                f"Failed checks for {case['distribution']}: {', '.join(failed)}."
+            )
+    lines += ["", "A PASS qualifies only this recorded workload and environment.", ""]
+    return "\n".join(lines)
+
+
 def export(args):
     args.output.mkdir(parents=True, exist_ok=True)
     qualified = args.output / "ivf-profile-qualified.json"
@@ -287,8 +336,26 @@ def export(args):
     (args.output / "ivf-profile-report.json").write_text(
         json.dumps(result, indent=2) + "\n"
     )
+    (args.output / "ivf-profile-report.md").write_text(markdown_report(result))
     if result["passed"]:
-        qualified.write_text(json.dumps(result, indent=2) + "\n")
+        qualification = {
+            key: result[key]
+            for key in (
+                "passed",
+                "source_commit",
+                "wheel_sha256",
+                "profile_sha256",
+                "environment",
+                "metric",
+                "comparisons",
+            )
+        }
+        # Keep controls at the top level so the exported profile can be passed
+        # directly to the public example's --profile argument.
+        qualified.write_text(
+            json.dumps({**result["profile"], "qualification": qualification}, indent=2)
+            + "\n"
+        )
     print(json.dumps(result, indent=2))
     return 0 if result["passed"] else 1
 

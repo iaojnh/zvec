@@ -82,7 +82,11 @@ inside the declared external limit.
 
 The `buffer-pool-ivf-profile` artifact always contains raw results, independent
 RSS samples, cgroup observations, this example, its configuration and
-`ivf-profile-report.json`. Only a fully passing run generates
+`ivf-profile-report.json` and a readable `ivf-profile-report.md`.
+Only a fully passing run generates
 `ivf-profile-qualified.json`. A failed or incomplete run is not a recommended
 deployment configuration. Changing the corpus, parameters or projection
 requires a new qualification run.
+The qualified JSON keeps controls at the top level and adds a `qualification`
+receipt. It can directly replace `ivf_memory_profile.json` in the example's
+`--profile` argument.

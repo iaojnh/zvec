@@ -240,9 +240,14 @@ def test_failed_export_removes_stale_qualified_profile(evidence, tmp_path):
     args = argparse.Namespace(profile=profile, evidence=root, output=output)
     assert export(args) == 0
     assert (output / "ivf-profile-qualified.json").exists()
+    saved = json.loads((output / "ivf-profile-qualified.json").read_text())
+    assert saved["rows"] == 400000
+    assert saved["max_buffer_size"] == 1024**2
+    assert saved["qualification"]["passed"] is True
     (root / "buffer-verify-1.json").unlink()
     assert export(args) == 1
     assert not (output / "ivf-profile-qualified.json").exists()
+    assert "FAIL" in (output / "ivf-profile-report.md").read_text()
     assert (
         json.loads((output / "ivf-profile-report.json").read_text())["passed"] is False
     )

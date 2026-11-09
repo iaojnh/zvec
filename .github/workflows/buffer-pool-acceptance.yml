@@ -83,6 +83,7 @@ jobs:
         env:
           CMAKE_GENERATOR: Ninja
           CMAKE_BUILD_PARALLEL_LEVEL: '2'
+          IVF_PROFILE_ONLY: ${{ github.ref_name == 'codex/ivf-release-profile' || (github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
         run: |
           export CMAKE_BUILD_PARALLEL_LEVEL=$(python - <<'PY'
           import os
@@ -103,7 +104,11 @@ jobs:
             -C cmake.define.BUILD_ZVEC_CORE_SHARED=OFF \
             -C cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
             -C cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
-          read -r -a targets <<< "$(python .github/scripts/buffer_pool_backend_tests.py --print-targets)"
+          if [[ "$IVF_PROFILE_ONLY" == true ]]; then
+            targets=(buffer_storage_write_test index_build_admission_test process_rss_budget_test pool_admission_test)
+          else
+            read -r -a targets <<< "$(python .github/scripts/buffer_pool_backend_tests.py --print-targets)"
+          fi
           # These targets are bundled and executed below. Desktop compatibility
           # jobs separately compile the full native test suite.
           cmake --build build --parallel "$CMAKE_BUILD_PARALLEL_LEVEL" --target "${targets[@]}"
@@ -715,9 +720,38 @@ jobs:
         run: |
           cmp <(git rev-parse HEAD) candidate/commit.txt
           (cd candidate && sha256sum -c SHA256SUMS)
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libaio1t64 liburing2
           python -m pip install candidate/*.whl pytest pytest-xdist
           python -m pytest -o addopts= -q python/tests/test_collection_options.py \
             .github/scripts/test_buffer_pool_ivf_profile.py
+      - name: Verify snapshot reuse, pressure reclamation and concurrent leases
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/candidate/lib
+        run: |
+          mkdir -p evidence
+          tar -xzf candidate/native-tests.tar.gz -C candidate
+          candidate/bin/buffer_storage_write_test --gtest_color=no \
+            --gtest_output=xml:evidence/snapshot-native.xml
+          candidate/bin/index_build_admission_test --gtest_color=no \
+            --gtest_filter='*/Ivf*' --gtest_output=xml:evidence/ivf-admission-native.xml
+          candidate/bin/process_rss_budget_test --gtest_color=no \
+            --gtest_output=xml:evidence/rss-native.xml
+          candidate/bin/pool_admission_test --gtest_color=no \
+            --gtest_output=xml:evidence/pool-native.xml
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, ".github/scripts")
+          from buffer_pool_backend_tests import verify_native_result
+          for target, name in [
+              ("buffer_storage_write_test", "snapshot-native.xml"),
+              ("index_build_admission_test", "ivf-admission-native.xml"),
+              ("process_rss_budget_test", "rss-native.xml"),
+              ("pool_admission_test", "pool-native.xml"),
+          ]:
+              verify_native_result(target, "", Path("evidence") / name)
+          PY
       - name: Build, continuously write and retrieve under the profile memory limit
         env:
           PROFILE_ROOT: ${{ runner.temp }}/ivf-profile
@@ -769,8 +803,11 @@ jobs:
           mkdir -p profile-result
           cp examples/python/ivf_memory_profile.py examples/python/ivf_memory_profile.json \
             examples/python/ivf_memory_profile.md profile-result/
+          check_rc=0
           python .github/scripts/buffer_pool_ivf_profile.py export \
-            --profile examples/python/ivf_memory_profile.json --evidence evidence --output profile-result
+            --profile examples/python/ivf_memory_profile.json --evidence evidence --output profile-result || check_rc=$?
+          cat profile-result/ivf-profile-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$check_rc"
       - uses: ./.github/actions/upload-evidence
         if: always()
         with:
