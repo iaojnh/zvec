@@ -28,6 +28,11 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 def observe(args):
     config = json.loads(args.profile.read_text())
+    target_mb = (
+        config["memory_limit_mb"]
+        if args.storage == "buffer"
+        else config["mmap_reference_memory_limit_mb"]
+    )
     result_path = args.evidence / f"{args.storage}-{args.stage}-{args.trial}.json"
     monitor_path = result_path.with_suffix(".monitor.jsonl")
     argv = [
@@ -50,9 +55,7 @@ def observe(args):
     try:
         with (
             monitor_path.open("x") as output,
-            ProcessRssMonitor(
-                output, config["memory_limit_mb"] * 1024, enforce_soft_limit=False
-            ),
+            ProcessRssMonitor(output, target_mb * 1024, enforce_soft_limit=False),
         ):
             sys.argv = argv
             runpy.run_path(argv[0], run_name="__main__")
@@ -103,6 +106,12 @@ def read_case(root, config, digest, storage, stage, trial):
     ]
     assert len(monitor) == 1 and monitor[0]["observer"] == "independent_process"
     assert monitor[0]["samples"] >= 2
+    target_mb = (
+        config["memory_limit_mb"]
+        if storage == "buffer"
+        else config["mmap_reference_memory_limit_mb"]
+    )
+    assert monitor[0]["target_rss_kib"] == target_mb * 1024
     assert (
         monitor[0]["sampling_max_gap_seconds"]
         <= config["acceptance"]["maximum_sampling_gap_seconds"]
@@ -149,6 +158,8 @@ def evaluate(profile, evidence):
             assert value["rows"] == (
                 config["rows"] if stage == "build" else expected_rows
             )
+            if stage == "build":
+                assert value["post_build_query_verified"] is True
             if stage == "mixed":
                 assert value["seconds"] >= config["mixed"]["minimum_seconds"]
                 assert (

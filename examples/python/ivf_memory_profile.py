@@ -146,11 +146,15 @@ def build(config, root, storage):
         "rows": config["rows"],
     }
     (root / "fixture.json").write_text(json.dumps(fixture))
+    # Check the build-to-query transition before this process can discard any
+    # retained allocator backing. Later stages also test a fresh process.
+    verify(config, root, storage, after_mixed=False)
     return {
         "rows": config["rows"],
         "input_vector_bytes": config["rows"] * config["dimension"] * 4,
         "insert_and_flush_seconds": build_started - inserted_at,
         "build_seconds": build_finished - build_started,
+        "post_build_query_verified": True,
     }
 
 
@@ -222,6 +226,7 @@ def mixed(config, root, storage):
             config["rows"] + config["mixed"]["batches"] * config["batch_size"]
         )
         assert collection.stats.doc_count == expected_rows
+        assert collection.stats.index_completeness["embedding"] == 1
         assert all(count > 0 for count in read_counts)
         new_id = str(config["rows"])
         assert (
@@ -233,7 +238,10 @@ def mixed(config, root, storage):
         stop.set()
         collection.close()
     fixture.update(
-        truth=best_ids.tolist(), distances=best_distances.tolist(), rows=expected_rows
+        last_cycle=cycles - 1,
+        truth=best_ids.tolist(),
+        distances=best_distances.tolist(),
+        rows=expected_rows,
     )
     (root / "fixture.json").write_text(json.dumps(fixture))
     elapsed = time.monotonic() - started
@@ -248,24 +256,40 @@ def mixed(config, root, storage):
     }
 
 
-def verify(config, root, storage):
+def verify(config, root, storage, after_mixed=True):
     fixture = json.loads((root / "fixture.json").read_text())
     collection = zvec.open(str(root / "collection"), option(config, storage, True))
     try:
         assert collection.stats.doc_count == fixture["rows"]
+        probe_count = len(fixture["queries"]) if after_mixed else 1
         recalls = [
             check_hits(
                 query(config, collection, vector),
                 [str(i) for i in truth],
                 config["query"]["topk"],
             )
-            for vector, truth in zip(fixture["queries"], fixture["truth"], strict=True)
+            for vector, truth in zip(
+                fixture["queries"][:probe_count],
+                fixture["truth"][:probe_count],
+                strict=True,
+            )
         ]
         assert min(recalls) >= config["acceptance"]["minimum_recall"]
-        ids = ["0", str(config["rows"])]
+        ids = ["0", str(config["rows"])] if after_mixed else ["0"]
         docs = collection.fetch(ids)
         assert set(docs) == set(ids)
         assert docs["0"].vector("embedding") == fixture["queries"][0]
+        assert docs["0"].field("payload") == "0:" + "p" * config["payload_bytes"]
+        if after_mixed:
+            new_id = str(config["rows"])
+            assert (
+                docs[new_id].field("payload")
+                == f"{fixture['last_cycle']}:" + "p" * config["payload_bytes"]
+            )
+            assert (
+                docs[new_id].vector("embedding")
+                == vectors(config, config["rows"], config["batch_size"])[0].tolist()
+            )
     finally:
         collection.close()
     return {

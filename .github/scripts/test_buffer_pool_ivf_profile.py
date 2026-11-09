@@ -78,6 +78,7 @@ def evidence(tmp_path):
                 "reader_queries": 12,
                 "reader_queries_during_writes": 12,
                 "fields_and_vectors_verified": True,
+                "post_build_query_verified": True,
                 "recall": 1.0,
             }
             if stage == "query":
@@ -110,6 +111,12 @@ def evidence(tmp_path):
                 json.dumps(
                     {
                         "observer": "independent_process",
+                        "target_rss_kib": config[
+                            "memory_limit_mb"
+                            if storage == "buffer"
+                            else "mmap_reference_memory_limit_mb"
+                        ]
+                        * 1024,
                         "samples": 9,
                         "sampling_max_gap_seconds": 0.5,
                     }
@@ -139,6 +146,16 @@ def test_complete_profile_uses_candidate_buffer_vs_candidate_mmap(evidence):
     result = evaluate(*evidence)
     assert result["passed"] is True
     assert all(case["qps_per_rss_ratio"] == 2 for case in result["comparisons"])
+
+
+def test_build_requires_same_process_query_before_restart(evidence):
+    profile, root = evidence
+    change(
+        root / "buffer-build-1.json",
+        lambda value: value.update(post_build_query_verified=False),
+    )
+    with pytest.raises(AssertionError):
+        evaluate(profile, root)
 
 
 @pytest.mark.parametrize(

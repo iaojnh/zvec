@@ -24,6 +24,8 @@ optimization workers. The mixed stage inserts 1,536 additional vectors, then
 updates those same IDs for at least 60 seconds while a reader runs. It flushes
 each batch, optimizes, checks the resulting count and verifies the last update.
 The fixed data size permits comparable query and ground-truth verification.
+The build stage also closes, reopens and queries before its process exits, so
+retained build-time heap memory is included in the transition check.
 
 ## Run the public example
 
