@@ -12,10 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "appendable_build_buffer_test_helper.h"
+#include "utility/appendable_build_buffer.h"
+#include <algorithm>
+#include <array>
+#include <gtest/gtest.h>
+#include <ailego/pattern/scope_guard.h>
+#include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
 namespace {
+class AppendableBuildBufferTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    previous_ = pool_.capacity();
+    ASSERT_EQ(0u, pool_.used());
+  }
+  void TearDown() override {
+    EXPECT_EQ(0u, pool_.used());
+    EXPECT_EQ(0, pool_.init(previous_));
+  }
+  ailego::PoolPayloadBudget &pool_ = ailego::PoolPayloadBudget::get_instance();
+  size_t previous_{0};
+};
+
+#if defined(ZVEC_ACCEPTANCE_TESTS)
+TEST_F(AppendableBuildBufferTest, ReportsWriteBudgetDenialAndRecovers) {
+  ASSERT_EQ(0, pool_.init(4 * 1024 * 1024));
+  AppendableBuildBuffer buffer;
+  ASSERT_EQ(0, buffer.init(1024 * 1024));
+  ASSERT_TRUE(buffer.paged());
+
+  auto &memory = ailego::MemoryLimitPool::get_instance();
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(memory.configure_process_rss_limit(0));
+  });
+  ASSERT_TRUE(memory.configure_process_rss_limit(1));
+  const size_t offset = buffer.size() - 1;
+  const char marker = 'm';
+  EXPECT_EQ(IndexError_NoMemory, buffer.write(offset, &marker, 1));
+
+  ASSERT_TRUE(memory.configure_process_rss_limit(0));
+  ASSERT_EQ(0, buffer.write(offset, &marker, 1));
+  char read_back = 0;
+  ASSERT_EQ(0, buffer.read(offset, &read_back, 1));
+  EXPECT_EQ(marker, read_back);
+}
+
+#else
 TEST_F(AppendableBuildBufferTest, GrowsAcrossChunksWithoutLosingEarlierData) {
   for (bool paged : {false, true}) {
     ASSERT_EQ(0, pool_.init(paged ? 4 * 1024 * 1024 : 0));
@@ -57,5 +100,7 @@ TEST_F(AppendableBuildBufferTest, FailedAdmissionDoesNotFallBackToHeap) {
   EXPECT_EQ(0u, buffer.size());
   EXPECT_EQ(0u, pool_.used());
 }
+#endif
+
 }  // namespace
 }  // namespace zvec::core
