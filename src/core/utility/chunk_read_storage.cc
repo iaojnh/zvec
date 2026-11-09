@@ -3,6 +3,7 @@
 #include "chunk_read_storage.h"
 
 #include <algorithm>
+#include <ailego/pattern/scope_guard.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -121,10 +122,23 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     std::unique_ptr<WorkspaceBuffer> workspace;
     ailego::BudgetedVector<size_t> pins;
   };
-  struct Lease : Segment::ScatterBlock::Workspace {
+  struct ReadSlot {
+    std::atomic<bool> busy{false};
+    Segment::ScatterBlock block;
+  };
+  struct Lease : Segment::ScatterBlock::Workspace, MemoryBlock::ScratchLease {
     Lease(std::shared_ptr<State> owner_arg, View *view_arg, Entry *single_arg)
         : owner(std::move(owner_arg)), view(view_arg), single(single_arg) {}
     ~Lease() override { reset(); }
+    void retain() noexcept override {
+      readers.fetch_add(1, std::memory_order_relaxed);
+    }
+    void release() noexcept override {
+      const size_t previous = readers.fetch_sub(1, std::memory_order_acq_rel);
+      assert(previous != 0);
+      if (previous == 1) reset();
+    }
+    bool reusable(size_t, size_t) const noexcept override { return false; }
     void reset() noexcept override {
       if (single) owner->unpin(*single, single_key);
       if (view) {
@@ -142,6 +156,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     View *view;
     Entry *single;
     size_t single_key{0};
+    std::atomic<size_t> readers{0};
   };
 
   ~State() override {
@@ -209,12 +224,14 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
                           sizeof(std::atomic<TableSegment *>))
       throw std::bad_alloc();
     metadata_charge = kMetadataReserve +
-        table_count * sizeof(std::atomic<TableSegment *>) + count * sizeof(View);
+        table_count * sizeof(std::atomic<TableSegment *>) +
+        count * (sizeof(View) + sizeof(ReadSlot) + sizeof(std::unique_ptr<ReadSlot>));
     metadata_owner = std::make_unique<MetadataCharge>(metadata_charge);
     table = std::make_unique<std::atomic<TableSegment *>[]>(table_count);
     for (size_t i = 0; i < table_count; ++i)
       table[i].store(nullptr, std::memory_order_relaxed);
     views.reserve(count);
+    read_slots.reserve(count);
     // Execution backing is independent of cache chunk size. Two I/O pages,
     // rather than two chunks, cover the aligned edges of any missing range.
     for (size_t i = 0; i < count; ++i) {
@@ -227,6 +244,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         workspace_bytes.fetch_add(view->workspace->bytes);
       }
       views.emplace_back(std::move(view));
+      read_slots.emplace_back(std::make_unique<ReadSlot>());
     }
     return true;
   }
@@ -614,6 +632,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   std::unique_ptr<std::atomic<TableSegment *>[]> table;
   std::unique_ptr<Layout> layouts;
   std::vector<std::unique_ptr<View>> views;
+  // Bounded, precharged descriptors. The slot is held only during read();
+  // returned MemoryBlocks independently retain reader leases and page pins.
+  std::vector<std::unique_ptr<ReadSlot>> read_slots;
   std::mutex table_mutex, wait_mutex;
   std::condition_variable changed;
   bool registered{false}, adaptive{false};
@@ -672,15 +693,45 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
   } catch (const std::bad_alloc &) { return IndexError_NoMemory; }
   size_t read(size_t offset, MemoryBlock &out, size_t len) override {
     out.reset();
-    ScatterBlock block;
+    State::ReadSlot *slot = nullptr;
+    for (auto &candidate : state_->read_slots) {
+      bool expected = false;
+      if (candidate->busy.compare_exchange_strong(expected, true,
+                                                   std::memory_order_acquire)) {
+        // Nested metadata/key reads commonly retain an earlier result. Keep
+        // its descriptor cached and try another idle slot before allocating.
+        if (candidate->block.workspace &&
+            candidate->block.workspace.use_count() != 1) {
+          candidate->busy.store(false, std::memory_order_release);
+          continue;
+        }
+        slot = candidate.get();
+        break;
+      }
+    }
+    ScatterBlock local;
+    auto &block = slot ? slot->block : local;
+    auto release_slot = ailego::ScopeGuard::Make([&] {
+      if (!slot) return;
+      block.spans.clear();
+      block.lease.reset();
+      block.fallback.reset();
+      block.size = 0;
+      // Descriptor ownership is not a reader. The last MemoryBlock copy
+      // releases its pins immediately, even when this slot caches the Lease.
+      if (block.workspace && block.workspace.use_count() == 1)
+        block.workspace->reset();
+      slot->busy.store(false, std::memory_order_release);
+    });
     const size_t got = read_scatter(offset, block, len);
     if (!got) return 0;
+    auto owner = std::static_pointer_cast<State::Lease>(block.lease);
     if (block.spans.size() == 1) {
-      out = MemoryBlock::MakeSharedView(
-          const_cast<uint8_t *>(block.spans.front().data), block.lease);
+      owner->retain();
+      out = MemoryBlock::MakeReusedScratch(
+          const_cast<uint8_t *>(block.spans.front().data), owner, false);
       return got;
     }
-    auto owner = std::static_pointer_cast<State::Lease>(block.lease);
     const size_t page = ailego::MemoryHelper::PageSize();
     if (!state_->ensure_workspace(*owner->view, got + 2 * page)) return 0;
     auto *destination = owner->view->workspace->data +
@@ -691,7 +742,8 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
       copied += span.size;
     }
     state_->copied.fetch_add(got, std::memory_order_relaxed);
-    out = MemoryBlock::MakeSharedView(destination, block.lease);
+    owner->retain();
+    out = MemoryBlock::MakeReusedScratch(destination, owner, false);
     return got;
   }
   size_t fetch(size_t offset, void *destination, size_t len) const override {
