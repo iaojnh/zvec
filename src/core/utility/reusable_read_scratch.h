@@ -24,7 +24,9 @@ class ReusableReadScratch {
   using Block = IndexStorage::MemoryBlock;
 
   ReusableReadScratch() : generation_(next_generation()) {}
-  ~ReusableReadScratch() { clear(); }
+  ~ReusableReadScratch() {
+    clear();
+  }
   ReusableReadScratch(const ReusableReadScratch &) = delete;
   ReusableReadScratch &operator=(const ReusableReadScratch &) = delete;
 
@@ -43,7 +45,7 @@ class ReusableReadScratch {
     for (const auto &hit : recent) {
       if (hit.generation == generation_) {
         return hit.entry->worker->acquire(hit.entry->worker, bytes, alignment,
-                                        deep_copy, allocate);
+                                          deep_copy, allocate);
       }
     }
 
@@ -70,11 +72,15 @@ class ReusableReadScratch {
     const bool first = metadata_.bytes() == 0;
     try {
       if (first) metadata_.add(sizeof(entries_));
-      auto worker = std::allocate_shared<Worker>(
-          ailego::BudgetedAllocator<Worker>{});
+      auto worker =
+          std::allocate_shared<Worker>(ailego::BudgetedAllocator<Worker>{});
       // Optional owner registration may allocate. Keep the required backing
-      // outside the worker until construction succeeds so refusal can return it.
-      worker->initialize(std::move(backing), bytes);
+      // outside the worker until construction succeeds so refusal can return
+      // it.
+      if (!worker->initialize(worker, backing, bytes, deep_copy)) {
+        if (first) metadata_.retain_at_most(0);
+        return backing;
+      }
       empty->thread = thread;
       empty->worker = std::move(worker);
       recent[next++ % recent.size()] = {generation_, empty};
@@ -83,8 +89,7 @@ class ReusableReadScratch {
       return backing;
     }
     lock.unlock();
-    return empty->worker->acquire(empty->worker, bytes, alignment, deep_copy,
-                                allocate);
+    return backing;
   } catch (const std::bad_alloc &) {
     // Idle cache backing is optional. Return it before retrying a required
     // allocation; never discard a buffer still referenced by a result.
@@ -107,7 +112,10 @@ class ReusableReadScratch {
   }
 
  private:
+  friend struct ReusableReadScratchTestPeer;
   class Worker : public ailego::EvictableBlockOwner {
+    friend struct ReusableReadScratchTestPeer;
+
    public:
     Worker() {
       first_.worker = this;
@@ -120,12 +128,18 @@ class ReusableReadScratch {
       ailego::BlockEvictionQueue::get_instance().set_invalid(this);
     }
 
-    void initialize(Block backing, size_t capacity) {
+    bool initialize(const std::shared_ptr<Worker> &self, Block &backing,
+                    size_t capacity, bool deep_copy) {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (!enqueue_locked()) return false;
       first_.backing = std::move(backing);
       first_.capacity = capacity;
       retained_ = capacity;
       allocated_ = 1;
+      // Protect the required first result before unlocking or publishing the
+      // worker. Pressure must not reclaim it and force another allocation.
+      backing = borrow(self, 0, deep_copy);
+      return true;
     }
 
     template <typename Allocate>
@@ -160,9 +174,8 @@ class ReusableReadScratch {
         return allocate();
       }
       const size_t index = first_slot(idle ? idle : empty);
-      const size_t previous = (allocated_ & (uint64_t{1} << index))
-                                  ? slot(index).capacity
-                                  : 0;
+      const size_t previous =
+          (allocated_ & (uint64_t{1} << index)) ? slot(index).capacity : 0;
       if (bytes > kMaxBytes - (retained_ - previous)) {
         lock.unlock();
         return allocate();
@@ -217,7 +230,8 @@ class ReusableReadScratch {
     }
 
     void eviction_requeue_failed(size_t, size_t version) override {
-      membership_.compare_exchange_strong(version, 0, std::memory_order_relaxed);
+      membership_.compare_exchange_strong(version, 0,
+                                          std::memory_order_relaxed);
     }
 
     size_t recover_eviction_queue() override {
@@ -236,7 +250,9 @@ class ReusableReadScratch {
       explicit AllocationScope(Worker *worker) : previous(allocating_) {
         allocating_ = worker;
       }
-      ~AllocationScope() { allocating_ = previous; }
+      ~AllocationScope() {
+        allocating_ = previous;
+      }
       Worker *previous;
     };
     inline static thread_local Worker *allocating_{nullptr};
@@ -244,7 +260,8 @@ class ReusableReadScratch {
     // Called with mutex_ held. A hot reuse only reads the existing membership;
     // insertion and its optional allocations happen once per retained cache.
     ailego_force_inline bool enqueue_locked() {
-      if (ailego_likely(membership_.load(std::memory_order_relaxed))) return true;
+      if (ailego_likely(membership_.load(std::memory_order_relaxed)))
+        return true;
       return enqueue_slow_locked();
     }
 
@@ -252,7 +269,8 @@ class ReusableReadScratch {
       auto &queue = ailego::BlockEvictionQueue::get_instance();
       const auto version = queue.next_version();
       membership_.store(version, std::memory_order_relaxed);
-      if (queue.add_single_block({version, version, this}, eviction_priority(0)))
+      if (queue.add_single_block({version, version, this},
+                                 eviction_priority(0)))
         return true;
       eviction_requeue_failed(version, version);
       return false;
@@ -261,7 +279,8 @@ class ReusableReadScratch {
     void requeue(size_t version) {
       if (membership_.load(std::memory_order_relaxed) != version) return;
       auto &queue = ailego::BlockEvictionQueue::get_instance();
-      if (!queue.add_single_block({version, version, this}, eviction_priority(0)))
+      if (!queue.add_single_block({version, version, this},
+                                  eviction_priority(0)))
         eviction_requeue_failed(version, version);
     }
 
@@ -359,14 +378,9 @@ class ReusableReadScratch {
                  bool deep_copy) {
       auto &cached = slot(index);
       assert(!cached.readers);
-      if (!enqueue_locked()) {
-        auto backing = std::move(cached.backing);
-        retained_ -= cached.capacity;
-        cached.capacity = 0;
-        allocated_ &= ~(uint64_t{1} << index);
-        discard_idle_locked();
-        return backing;
-      }
+      // Every cached allocation is enrolled before publication. A failed
+      // asynchronous requeue is handled by the last reader's release, so a
+      // cache hit needs no queue lookup or optional registration work.
       referenced_ = true;
       cached.readers = 1;
       busy_ |= uint64_t{1} << index;
