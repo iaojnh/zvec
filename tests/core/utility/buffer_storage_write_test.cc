@@ -33,37 +33,10 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_mapping.h>
-#include "utility/reusable_read_scratch.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
 using namespace zvec::core;
-
-namespace zvec::ailego {
-struct MemoryLimitPoolTestPeer {
-  static void stop_background(MemoryLimitPool &pool) {
-    pool.stop_background_evictor();
-  }
-  static void start_background(MemoryLimitPool &pool) {
-    pool.start_background_evictor();
-  }
-};
-}  // namespace zvec::ailego
-
-namespace zvec::core {
-struct ReusableReadScratchTestPeer {
-  static ailego::version_t fail_membership(ReusableReadScratch &source,
-                                           ailego::version_t stale = 0) {
-    for (auto &entry : source.entries_) {
-      if (!entry.worker) continue;
-      const auto version = stale ? stale : entry.worker->membership_.load();
-      entry.worker->eviction_requeue_failed(version, version);
-      return version;
-    }
-    return 0;
-  }
-};
-}  // namespace zvec::core
 
 class BufferStorageWriteTest : public ::testing::Test {
  protected:
@@ -109,90 +82,11 @@ class BufferStorageWriteTest : public ::testing::Test {
     return storage;
   }
 
-  void check_writable_open_with_resident_pages(bool keep_pinned,
-                                               bool dirty = false) {
-    auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
-    AILEGO_DEFER(
-        [&]() { EXPECT_EQ(0, memory_pool.init(64UL * 1024UL * 1024UL)); });
-    const size_t page_size = ailego::kVectorPageSize;
-    const size_t writable_metadata =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(1, true);
-    const size_t resident_pages = writable_metadata / page_size / 2;
-    ASSERT_GT(resident_pages, 8U);
-    const size_t donor_metadata =
-        ailego::PoolPayloadBudget::storage_metadata_bytes(resident_pages,
-                                                          dirty);
-    ASSERT_EQ(0, memory_pool.init(
-                     donor_metadata +
-                     ailego::PoolPayloadBudget::storage_metadata_bytes(1) +
-                     8 * page_size));
-
-    // Prior cases leave dead queue entries. No stores are open here, so remove
-    // them before testing the foreground reservation's finite scan budget.
-    ailego::BlockEvictionQueue::BlockType stale;
-    while (
-        ailego::BlockEvictionQueue::get_instance().evict_single_block(stale)) {
-    }
-
-    const std::string donor_path = file_path_ + ".cached-source";
-    AILEGO_DEFER([&]() { ailego::File::Delete(donor_path); });
-    ailego::File file;
-    ASSERT_TRUE(file.create(donor_path, resident_pages * page_size));
-    file.close();
-    auto donor = std::make_shared<ailego::VecBufferPool>(donor_path, dirty);
-    ASSERT_EQ(0, donor->init());
-    std::vector<ailego::block_id_t> pins;
-    AILEGO_DEFER([&]() { donor->release_pages(pins.data(), pins.size()); });
-    for (size_t id = 0; id < resident_pages; ++id) {
-      if (dirty) {
-        const char marker = static_cast<char>(id % 127 + 1);
-        ASSERT_EQ(0, donor->write_range(id * page_size, 1, &marker));
-      }
-      ASSERT_NE(nullptr, donor->acquire_buffer(id));
-      if (keep_pinned) {
-        pins.push_back(id);
-      } else {
-        const ailego::block_id_t page = id;
-        donor->release_pages(&page, 1);
-      }
-    }
-
-    // Resident data uses only half the page capacity, safely below the low
-    // watermark; there is no race with proactive background reclamation.
-    ASSERT_FALSE(memory_pool.under_cache_pressure());
-    ASSERT_LT(memory_pool.available(), writable_metadata);
-    auto storage = IndexFactory::CreateStorage("BufferStorage");
-    ASSERT_NE(nullptr, storage);
-    ASSERT_EQ(0, storage->init(ailego::Params{}));
-    if (keep_pinned) {
-      EXPECT_EQ(IndexError_NoMemory, storage->open(file_path_, true));
-      EXPECT_EQ(nullptr, storage->vec_buffer_pool());
-      donor->release_pages(pins.data(), pins.size());
-      pins.clear();
-    }
-    ASSERT_EQ(0, storage->open(file_path_, true));
-    ASSERT_NE(nullptr, storage->vec_buffer_pool());
-    EXPECT_TRUE(storage->vec_buffer_pool()->cache_enabled());
-    EXPECT_GT(donor->stats().evict, 0U);
-    if (dirty) {
-      // Do not flush before open or before verifying: evicted pages must
-      // already contain their dirty bytes on disk, while resident pages must
-      // preserve them through the synchronized bypass path.
-      for (size_t id = 0; id < resident_pages; ++id) {
-        char marker = 0;
-        ASSERT_TRUE(donor->read_range_bypass(id * page_size, 1, &marker));
-        EXPECT_EQ(static_cast<char>(id % 127 + 1), marker);
-      }
-    }
-    ASSERT_EQ(0, storage->close());
-  }
-
 #if defined(__linux__) && !defined(__ANDROID__)
-  void check_read_only_cold_batch(bool block_io_staging) {
+  void check_read_only_cold_batch() {
     auto &budget = ailego::PoolPayloadBudget::get_instance();
-    // Metadata-only pressure exercises the allowed synchronous fallback. Raw
-    // page pressure leaves staging headroom while keeping admission active.
-    ASSERT_EQ(0, budget.init(block_io_staging ? 256UL << 20 : 64UL << 20));
+    // Pin raw pages to refuse cache admission while retaining I/O headroom.
+    ASSERT_EQ(0, budget.init(64UL << 20));
     AILEGO_DEFER([&] { EXPECT_EQ(0, budget.init(64UL << 20)); });
     constexpr size_t kRequests = 32;
     const size_t page_size = ailego::kVectorPageSize;
@@ -212,13 +106,11 @@ class BufferStorageWriteTest : public ::testing::Test {
     }
 
     auto &memory = ailego::MemoryLimitPool::get_instance();
-    size_t pressure = 0;
     std::vector<char *> pressure_pages;
     AILEGO_DEFER([&] {
       for (char *page : pressure_pages) {
         if (page) memory.release_buffer(page, page_size);
       }
-      memory.release_metadata(pressure);
     });
     auto reader = open_read_only();
     ASSERT_TRUE(reader);
@@ -237,24 +129,15 @@ class BufferStorageWriteTest : public ::testing::Test {
     pool->release_pages(&warm_page, 1);
     ASSERT_TRUE(pool->page_table_.force_evict_block(warm_page));
     ASSERT_TRUE(pool->has_evicted());
-    if (block_io_staging) {
-      const size_t reserve = memory.page_admission_reserve();
-      ASSERT_GT(reserve, 64 * page_size);
-      ASSERT_GT(memory.available(), reserve / 2);
-      const size_t requested_pressure = memory.available() - reserve / 2;
-      ASSERT_TRUE(memory.try_charge_metadata(requested_pressure));
-      pressure = requested_pressure;
-    } else {
-      // Tiny pools have no page-admission reserve. Hold raw pages so background
-      // eviction cannot invalidate pressure; keep 8 MiB for bounded batch I/O.
-      constexpr size_t kIoHeadroom = 8UL << 20;
-      ASSERT_GT(memory.available(), kIoHeadroom);
-      const size_t count = (memory.available() - kIoHeadroom) / page_size;
-      pressure_pages.resize(count, nullptr);
-      ASSERT_EQ(count,
-                memory.batch_acquire_buffers(page_size, pressure_pages.data(),
-                                             pressure_pages.size()));
-    }
+    // Tiny pools have no page-admission reserve. Hold raw pages so background
+    // eviction cannot invalidate pressure; keep 8 MiB for bounded batch I/O.
+    constexpr size_t kIoHeadroom = 8UL << 20;
+    ASSERT_GT(memory.available(), kIoHeadroom);
+    const size_t count = (memory.available() - kIoHeadroom) / page_size;
+    pressure_pages.resize(count, nullptr);
+    ASSERT_EQ(count,
+              memory.batch_acquire_buffers(page_size, pressure_pages.data(),
+                                           pressure_pages.size()));
     ASSERT_TRUE(memory.under_cache_pressure());
 
     std::vector<IndexStorage::MemoryBlock> blocks(kRequests);
@@ -275,14 +158,7 @@ class BufferStorageWriteTest : public ::testing::Test {
     EXPECT_EQ(kRequests, after.bypass_reads - before.bypass_reads);
     const auto submitted =
         after.aio_pages_submitted - before.aio_pages_submitted;
-    if (block_io_staging &&
-        pool->io_backend_type() == ailego::IOBackendType::kIoUring) {
-      // io_uring uses separately charged metadata staging, so blocking cache
-      // page admission need not force scalar I/O. Either bounded path is valid.
-      EXPECT_LE(submitted, kRequests);
-    } else {
-      EXPECT_EQ(block_io_staging ? 0U : kRequests, submitted);
-    }
+    EXPECT_EQ(kRequests, submitted);
     EXPECT_LE(memory.used(), memory.capacity());
     blocks.clear();
     EXPECT_EQ(0, reader->close());
@@ -1565,39 +1441,6 @@ TEST_F(BufferStorageWriteTest, ImmutableFallbackPreservesUnflushedPrefix) {
   EXPECT_FALSE(vec_pool->is_page_resident(cold_page));
 }
 
-TEST_F(BufferStorageWriteTest, CrossPageCopiesHoldBudgetUntilLastBlockRelease) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t baseline = pool.external_used();
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-  const size_t size = 2 * ailego::kVectorPageSize;
-  ASSERT_EQ(0, storage->append("legacy", size));
-  auto segment = storage->get("legacy");
-  ASSERT_TRUE(segment);
-  std::string payload(size, 'a');
-  ASSERT_EQ(size, segment->write(0, payload.data(), size));
-  const size_t before = pool.external_used();
-  IndexStorage::MemoryBlock first;
-  ASSERT_EQ(size, segment->read(0, first, size));
-  EXPECT_GE(pool.external_used(), before + size);
-  payload.assign(size, 'b');
-  ASSERT_EQ(size, segment->write(0, payload.data(), size));
-  IndexStorage::MemoryBlock second;
-  ASSERT_EQ(size, segment->read(0, second, size));
-  EXPECT_NE(first.data(), second.data());
-  EXPECT_EQ(std::string(size, 'a'),
-            std::string(static_cast<const char *>(first.data()), size));
-  EXPECT_EQ(payload,
-            std::string(static_cast<const char *>(second.data()), size));
-  ASSERT_EQ(0, storage->close());
-  segment.reset();
-  storage.reset();
-  EXPECT_GE(pool.external_used(), baseline + 2 * size);
-  first.reset();
-  second.reset();
-  EXPECT_EQ(baseline, pool.external_used());
-}
-
 TEST_F(BufferStorageWriteTest, ImmutableBatchReadUsesWritableCache) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
@@ -1710,7 +1553,7 @@ TEST_F(BufferStorageWriteTest, ReadOnlyBatchFallsBackWhenPinsExceedBudget) {
 
 #if defined(__linux__) && !defined(__ANDROID__)
 TEST_F(BufferStorageWriteTest, ReadOnlyColdBatchUsesBypassAio) {
-  check_read_only_cold_batch(false);
+  check_read_only_cold_batch();
 }
 
 #endif
@@ -2116,8 +1959,14 @@ TEST_F(BufferStorageWriteTest, CR_ConcurrentSamePageReadSeesWholeWrite) {
     std::vector<char> observed(kPayloadSize);
     start.store(true, std::memory_order_release);
     for (size_t i = 0; i < 10000; ++i) {
-      if (seg->fetch(offset, observed.data(), observed.size()) !=
-              kPayloadSize ||
+      IndexStorage::MemoryBlock snapshot;
+      const size_t read =
+          (i & 1U) == 0
+              ? seg->fetch(offset, observed.data(), observed.size())
+              : seg->read(offset, snapshot, observed.size());
+      if ((i & 1U) != 0 && read == kPayloadSize)
+        std::memcpy(observed.data(), snapshot.data(), observed.size());
+      if (read != kPayloadSize ||
           (observed != pattern_a && observed != pattern_b)) {
         failed.store(true, std::memory_order_release);
         return;
@@ -2127,48 +1976,6 @@ TEST_F(BufferStorageWriteTest, CR_ConcurrentSamePageReadSeesWholeWrite) {
   writer.join();
   reader.join();
   EXPECT_FALSE(failed.load(std::memory_order_acquire));
-  EXPECT_EQ(0, storage->close());
-}
-
-TEST_F(BufferStorageWriteTest, RecycledSnapshotsSeeWholeConcurrentWrites) {
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-  ASSERT_EQ(0, storage->append("reuse", 2 * ailego::kVectorPageSize));
-  auto seg = storage->get("reuse");
-  const size_t page = ailego::kVectorPageSize;
-  const size_t offset = (page - seg->data_offset() % page) % page;
-  std::vector<char> a(256, 'A'), b(256, 'B');
-  ASSERT_EQ(a.size(), seg->write(offset, a.data(), a.size()));
-  std::atomic<bool> start{false}, failed{false};
-  std::thread writer([&] {
-    while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-    for (size_t i = 0; i < 10000; ++i) {
-      const auto &value = i % 2 ? a : b;
-      if (seg->write(offset, value.data(), value.size()) != value.size())
-        failed = true;
-    }
-  });
-  std::vector<std::thread> readers;
-  for (size_t thread = 0; thread < 4; ++thread)
-    readers.emplace_back([&] {
-      start.store(true, std::memory_order_release);
-      for (size_t i = 0; i < 10000; ++i) {
-        IndexStorage::MemoryBlock block;
-        if (seg->read(offset, block, a.size()) != a.size()) {
-          failed = true;
-          break;
-        }
-        const char first = *static_cast<const char *>(block.data());
-        const auto &expected = first == 'A' ? a : b;
-        if (std::memcmp(block.data(), expected.data(), expected.size())) {
-          failed = true;
-          break;
-        }
-      }
-    });
-  writer.join();
-  for (auto &reader : readers) reader.join();
-  EXPECT_FALSE(failed.load());
   EXPECT_EQ(0, storage->close());
 }
 

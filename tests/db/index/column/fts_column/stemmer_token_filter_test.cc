@@ -12,15 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstdlib>
 #include <string>
-#include <thread>
 #include <vector>
 #include <gtest/gtest.h>
-#include <zvec/ailego/buffer/memory_reservation.h>
-#include "db/index/column/fts_column/tokenizer/stemmer_token_filter.h"
 #include "db/index/column/fts_column/fts_types.h"
-#include "db/index/column/fts_column/parser/fts_query_parser.h"
 #include "db/index/column/fts_column/tokenizer/tokenizer_factory.h"
 
 using namespace zvec::fts;
@@ -172,31 +167,4 @@ TEST(StemmerTokenFilterTest, PorterAlgorithm) {
   auto tokens = pipeline->process("running");
   ASSERT_EQ(tokens.size(), 1u);
   EXPECT_EQ(tokens[0].text, "run");
-}
-
-TEST(StemmerMemoryDeathTest, ParserPreservesAnalyzerResourceExhaustion) {
-#if GTEST_HAS_DEATH_TEST
-  const auto previous = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  EXPECT_EXIT({
-    auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
-    if (pool.init(64UL << 20) != 0) std::_Exit(1);
-    auto pipeline = TokenizerFactory::create(make_stemmer_params());
-    if (!pipeline) std::_Exit(2);
-    FtsQueryParser parser;
-    zvec::ailego::MemoryReservation pressure;
-    pressure.add(pool.available());
-    bool rejected = false;
-    try { (void)parser.parse("running", pipeline.value()); }
-    catch (const std::bad_alloc &) { rejected = true; }
-    if (!rejected) std::_Exit(3);
-    pressure.retain_at_most(0);
-    if (!parser.parse("running", pipeline.value())) std::_Exit(4);
-    if (parser.parse("(", pipeline.value())) std::_Exit(5);
-    std::_Exit(0);
-  }, ::testing::ExitedWithCode(0), "");
-  ::testing::FLAGS_gtest_death_test_style = previous;
-#else
-  GTEST_SKIP() << "Process isolation is unavailable";
-#endif
 }

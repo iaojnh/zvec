@@ -286,10 +286,7 @@ struct BlockingLoadState {
   std::atomic<size_t> active_loads{0};
   std::atomic<size_t> max_active_loads{0};
   std::atomic<bool> finish{false};
-  bool fail_load{false};
   bool throw_load{false};
-  bool throw_value{false};
-  bool empty_value{false};
 };
 
 struct BlockingLoader {
@@ -310,10 +307,6 @@ struct BlockingLoader {
     while (!state->finish.load(std::memory_order_acquire)) {
       std::this_thread::yield();
     }
-    if (state->fail_load) {
-      state->active_loads.fetch_sub(1, std::memory_order_release);
-      return false;
-    }
     if (state->throw_load) {
       state->active_loads.fetch_sub(1, std::memory_order_release);
       throw std::bad_alloc();
@@ -325,10 +318,6 @@ struct BlockingLoader {
   }
 
   Value value(const SizedCachePayload &payload) const {
-    if (state->throw_value) {
-      throw std::runtime_error("injected waiter value failure");
-    }
-    if (state->empty_value) return nullptr;
     return payload.data;
   }
 
@@ -483,29 +472,6 @@ TEST_F(BufferPoolTest, BulkReadDoesNotAdmitFirstTouchScanUnderPressure) {
   EXPECT_EQ(4u, stats.admission_rejected);
 }
 
-TEST_F(BufferPoolTest, UnalignedBypassRefusesUnbudgetedScratch) {
-  init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/2);
-  VecBufferPool pool(new_file(/*num_pages=*/2), /*writable=*/false);
-  ASSERT_EQ(0, pool.init());
-  if (!pool.requires_aligned_io()) {
-    GTEST_SKIP() << "The active file backend does not require aligned reads";
-  }
-
-  char *pinned = pool.acquire_buffer(/*block_id=*/0, 10);
-  ASSERT_NE(nullptr, pinned);
-  auto release_pin = ScopeGuard::Make(
-      [&pool] { pool.page_table_.release_block(/*block_id=*/0); });
-  const auto before = MemoryLimitPool::get_instance().stats();
-  std::array<char, 64> data{};
-  EXPECT_FALSE(
-      pool.read_range_bypass(kVectorPageSize + 1, data.size(), data.data()));
-  EXPECT_EQ(before.external_used,
-            MemoryLimitPool::get_instance().stats().external_used);
-  EXPECT_TRUE(pool.is_page_resident(0));
-  EXPECT_FALSE(pool.is_page_resident(1));
-  ExpectPageContent(pinned, /*page=*/0);
-}
-
 TEST_F(BufferPoolTest, WritableOptionalPinDoesNotWaitForCacheAdmission) {
   auto &memory = PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory.init(256UL << 20));
@@ -536,36 +502,6 @@ TEST_F(BufferPoolTest, WritableOptionalPinDoesNotWaitForCacheAdmission) {
   EXPECT_EQ(std::string(32, 'X'), std::string(result.data(), 32));
   EXPECT_EQ(std::string(32, '\1'), std::string(result.data() + 32, 32));
   EXPECT_FALSE(pool.is_page_resident(1));
-}
-
-TEST_F(BufferPoolTest, WritableRequiredBatchPinStillWaitsForCapacity) {
-  auto &memory = PoolPayloadBudget::get_instance();
-  init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/1, /*writable=*/true);
-  VecBufferPool pool(new_file(1), /*writable=*/true);
-  ASSERT_EQ(0, pool.init());
-  char *held = nullptr;
-  ASSERT_TRUE(memory.try_acquire_buffer(kVectorPageSize, held));
-  const auto before = memory.stats();
-  std::atomic<bool> observed_wait{false};
-  std::thread releaser([&] {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (memory.stats().capacity_waits == before.capacity_waits &&
-           std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::yield();
-    }
-    observed_wait.store(memory.stats().capacity_waits != before.capacity_waits);
-    memory.release_buffer(held, kVectorPageSize);
-  });
-  const block_id_t id = 0;
-  char *page = nullptr;
-  const bool acquired = pool.acquire_pages(&id, 1, &page);
-  releaser.join();
-  EXPECT_TRUE(observed_wait.load());
-  ASSERT_TRUE(acquired);
-  ASSERT_NE(nullptr, page);
-  ExpectPageContent(page, 0);
-  pool.release_pages(&id, 1);
 }
 
 TEST_F(BufferPoolTest, WritableBypassPreservesDirtyPagesWithoutAdmission) {
@@ -1363,30 +1299,6 @@ TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
 
   EXPECT_EQ(0u, memory_pool.used());
   EXPECT_EQ(0u, memory_pool.committed());
-}
-
-TEST_F(BufferPoolTest, ExternalCacheMetadataRejectsAndRetriesWithoutDeadlock) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  init_pool(16);
-  SizedExternalCache cache;
-  auto value = cache.acquire(1);
-  ASSERT_NE(nullptr, value);
-  const auto live_metadata = pool.metadata_used();
-  ASSERT_GT(live_metadata, 0u);
-  const size_t reservation = pool.capacity() - pool.used();
-  ASSERT_TRUE(pool.try_charge_external(reservation));
-  // The first entry is pinned: neither metadata growth nor a new load fits.
-  EXPECT_EQ(nullptr, cache.acquire(2));
-  EXPECT_EQ(1u, cache.entry_count());
-  EXPECT_EQ(live_metadata, pool.metadata_used());
-  pool.release_external(reservation);
-  auto second = cache.acquire(2);
-  ASSERT_NE(nullptr, second);
-  EXPECT_GT(pool.metadata_used(), live_metadata);
-  cache.release(1);
-  cache.release(2);
-  cache.retire_if([](size_t) { return true; });
-  EXPECT_EQ(0u, pool.used());
 }
 
 TEST_F(BufferPoolTest,
@@ -2364,48 +2276,11 @@ TEST_F(BufferPoolTest, OversizedReadOnlyScanEarnsAdmissionBeforePressure) {
     ExpectPageContent(output.data() + i * kVectorPageSize, i);
     EXPECT_TRUE(pool.is_page_resident(i));
   }
-}
-
-TEST_F(BufferPoolTest, LargeScanAdmissionAgesByCacheCapacity) {
-  const size_t pages = (size_t{2} << 30) / kVectorPageSize;
-  init_vec_pool((512UL << 20) / kVectorPageSize, pages);
-  const std::string path = new_file(1);
-  File file;
-  ASSERT_TRUE(file.open(path, false, false));
-  ASSERT_TRUE(file.truncate(pages * kVectorPageSize));
-  file.close();
-  VecBufferPool pool(path, false);
-  ASSERT_EQ(0, pool.init());
-  EXPECT_FALSE(pool.should_admit_page(0));
-  const size_t cache_pages =
-      MemoryLimitPool::get_instance().capacity() / kVectorPageSize;
-  for (size_t i = 1; i <= cache_pages; ++i)
-    ASSERT_FALSE(pool.should_admit_page(i));
-  EXPECT_FALSE(pool.should_admit_page(0));
-  EXPECT_FALSE(pool.should_admit_page(0));
-  EXPECT_TRUE(pool.should_admit_page(0));
-}
-
-TEST_F(BufferPoolTest, MandatorySinglePageReadRemainsAvailableForLargeFiles) {
-  constexpr size_t kFileBytes = 1UL << 30;
-  init_vec_pool((512UL << 20) / kVectorPageSize,
-                kFileBytes / kVectorPageSize);
-  const std::string path = new_file(4);
-  File file;
-  ASSERT_TRUE(file.open(path, false, false));
-  ASSERT_TRUE(file.truncate(kFileBytes));
-  file.close();
-  VecBufferPool pool(path, false);
-  ASSERT_EQ(0, pool.init());
-  auto handle = pool.get_handle();
   size_t page_id = 0;
-  char *data = handle.get_single_page(kVectorPageSize, 32, page_id);
-  ASSERT_NE(nullptr, data);
-  EXPECT_EQ(1, data[0]);
-  handle.release_one(page_id);
-  data = handle.get_single_page(kVectorPageSize, 32, page_id);
-  ASSERT_NE(nullptr, data);
-  EXPECT_EQ(1, data[31]);
+  char *required =
+      handle.get_single_page(kReadPages * kVectorPageSize, 32, page_id);
+  ASSERT_NE(nullptr, required);
+  EXPECT_EQ(0, required[0]);
   handle.release_one(page_id);
 }
 

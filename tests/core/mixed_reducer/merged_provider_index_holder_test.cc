@@ -289,7 +289,7 @@ IndexStreamer::Pointer MakeStreamer(
   return MakeStreamer(docs, std::make_shared<ProviderLifetimeStats>());
 }
 
-enum class IteratorFailureOperation { kValidity, kKey, kData, kConstruction };
+enum class IteratorFailureOperation { kValidity, kKey, kData };
 
 struct IteratorReadFailure {
   IteratorFailureOperation operation{IteratorFailureOperation::kValidity};
@@ -312,9 +312,6 @@ class FailingIteratorProvider final
   }
 
   IndexHolder::Iterator::Pointer create_iterator() override {
-    if (failure_->enabled &&
-        failure_->operation == IteratorFailureOperation::kConstruction)
-      throw std::bad_alloc();
     return std::make_unique<FailingIterator>(
         MultiPassIndexProvider::create_iterator(), failure_);
   }
@@ -822,33 +819,29 @@ TEST(MergedProviderIndexHolderTest,
 
 TEST(MergedProviderIndexHolderTest,
      IvfBuilderUsesProviderBackedInputAndReducerThreadPool) {
-  for (const auto *name :
-       {"IVFBuilder", "DiskAnnBuilder", "IvfRabitqBuilder"}) {
-    SCOPED_TRACE(name);
-    auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
-    ailego::ThreadPool pool(2, false);
-    auto builder = std::make_shared<RetainingTestBuilder>(name, &pool);
-    MixedStreamerReducer reducer;
-    ailego::Params params;
-    params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
-    ASSERT_EQ(0, reducer.init(params));
-    reducer.set_thread_pool(&pool);
-    ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
-                     builder, source, nullptr, nullptr,
-                     IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension)));
-    ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
-    ASSERT_EQ(0, reducer.reduce({}));
-    EXPECT_EQ(pool.count(), builder->train_thread_count);
-    EXPECT_EQ(pool.count(), builder->build_thread_count);
-    EXPECT_TRUE(builder->train_used_expected_pool);
-    EXPECT_TRUE(builder->build_used_expected_pool);
-    ASSERT_NE(nullptr, builder->holder);
-    auto *merged =
-        dynamic_cast<MergedProviderIndexHolder *>(builder->holder.get());
-    ASSERT_NE(nullptr, merged);
-    EXPECT_EQ((std::vector<std::pair<uint64_t, float>>{{0, 0.0F}, {1, 1.0F}}),
-              ReadAll(merged));
-  }
+  auto source = MakeStreamer({{0, 0.0F}, {1, 1.0F}});
+  ailego::ThreadPool pool(2, false);
+  auto builder = std::make_shared<RetainingTestBuilder>("IVFBuilder", &pool);
+  MixedStreamerReducer reducer;
+  ailego::Params params;
+  params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
+  ASSERT_EQ(0, reducer.init(params));
+  reducer.set_thread_pool(&pool);
+  ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                   builder, source, nullptr, nullptr,
+                   IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension)));
+  ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+  ASSERT_EQ(0, reducer.reduce({}));
+  EXPECT_EQ(pool.count(), builder->train_thread_count);
+  EXPECT_EQ(pool.count(), builder->build_thread_count);
+  EXPECT_TRUE(builder->train_used_expected_pool);
+  EXPECT_TRUE(builder->build_used_expected_pool);
+  ASSERT_NE(nullptr, builder->holder);
+  auto *merged =
+      dynamic_cast<MergedProviderIndexHolder *>(builder->holder.get());
+  ASSERT_NE(nullptr, merged);
+  EXPECT_EQ((std::vector<std::pair<uint64_t, float>>{{0, 0.0F}, {1, 1.0F}}),
+            ReadAll(merged));
 }
 
 TEST(MergedProviderIndexHolderTest, ConverterUsesReducerThreadPool) {

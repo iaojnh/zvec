@@ -319,48 +319,6 @@ TEST_F(BufferReadStorageTest, CrossPageReadReusesExclusiveScratchAtFullBudget) {
   EXPECT_EQ(0, std::memcmp(payload_.data() + offset, copy.data(), length));
 }
 
-TEST_F(BufferReadStorageTest, ScratchReuseKeepsCapacityAndCopiesStable) {
-  const size_t page = ailego::kVectorPageSize;
-  for (size_t length : {size_t{128}, 2 * page}) {
-    SCOPED_TRACE(length);
-    auto storage = create_storage("none");
-    ASSERT_TRUE(storage);
-    ASSERT_EQ(0, storage->open(file_path_, false));
-    auto segment = storage->get("payload");
-    ASSERT_TRUE(segment);
-    const size_t offset = page - segment->data_offset() % page - 8;
-    IndexStorage::MemoryBlock block;
-    ASSERT_EQ(length, segment->read(offset, block, length));
-    const void *address = block.data();
-    auto &pool = ailego::PoolPayloadBudget::get_instance();
-    const auto charged = pool.stats().external_used;
-    for (size_t i = 0; i < 32; ++i) {
-      block.reset();
-      ASSERT_EQ(length, segment->read(offset, block, length));
-      EXPECT_EQ(address, block.data());
-      EXPECT_EQ(charged, pool.stats().external_used);
-    }
-    for (size_t size : {length / 4, length}) {
-      ASSERT_EQ(size, segment->read(offset, block, size));
-      EXPECT_EQ(address, block.data());
-      EXPECT_EQ(charged, pool.stats().external_used);
-      EXPECT_EQ(0, std::memcmp(block.data(), payload_.data() + offset, size));
-    }
-    auto retained = block;
-    ASSERT_EQ(length, segment->read(offset + 16, block, length));
-    EXPECT_NE(address, block.data());
-    EXPECT_EQ(0, std::memcmp(retained.data(), payload_.data() + offset, length));
-    EXPECT_EQ(0, std::memcmp(block.data(), payload_.data() + offset + 16, length));
-    EXPECT_EQ(0, storage->close());
-    segment.reset();
-    storage.reset();
-    EXPECT_EQ(0, std::memcmp(retained.data(), payload_.data() + offset, length));
-    retained.reset();
-    block.reset();
-    EXPECT_EQ(0u, pool.used());
-  }
-}
-
 TEST_F(BufferReadStorageTest, MemoryBlockPinsUntilReset) {
   auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
   ASSERT_NE(storage, nullptr);

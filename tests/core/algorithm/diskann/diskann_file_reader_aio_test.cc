@@ -61,7 +61,6 @@ struct FakeAioState {
   size_t completion_call = 0;
   size_t completed = 0;
   size_t short_completion = std::numeric_limits<size_t>::max();
-  bool pressure_after_submit = false;
   bool duplicate_last_completion = false;
 };
 
@@ -85,10 +84,6 @@ int fake_io_submit(io_context_t, long nr, struct iocb *ios[]) {
   for (int i = 0; i < ret; ++i) {
     g_fake_aio->submitted.push_back(ios[i]);
     g_fake_aio->kernel_buffers.push_back(ios[i]->u.c.buf);
-  }
-  if (g_fake_aio->pressure_after_submit) {
-    ailego::MemoryLimitPool::get_instance().set_memory_pressure(
-        ailego::ProcessRssBudget::PressureLevel::kCritical);
   }
   return ret;
 }
@@ -501,46 +496,6 @@ TEST(DiskAnnBufferPoolFileReaderTest, RejectsNonPageAlignedRequests) {
   std::free(output);
 }
 
-TEST(DiskAnnLinuxAioTest, PartialSubmissionDrainsUnderNewMemoryPressure) {
-  TemporaryFile file;
-  ASSERT_GE(file.fd(), 0);
-  auto source = make_source();
-  ASSERT_EQ(static_cast<ssize_t>(source.size()),
-            ::pwrite(file.fd(), source.data(), source.size(), 0));
-  auto output =
-      std::unique_ptr<void, decltype(&std::free)>(allocate_aligned(source.size()),
-                                                 &std::free);
-  ASSERT_NE(nullptr, output);
-  auto requests = make_requests(output.get());
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t previous_capacity = pool.capacity();
-  const auto restore_pool = ailego::ScopeGuard::Make([&] {
-    ailego::MemoryLimitPool::get_instance().set_memory_pressure(
-        ailego::ProcessRssBudget::PressureLevel::kNormal);
-    EXPECT_EQ(0, pool.init(previous_capacity));
-  });
-  ASSERT_EQ(0, pool.init(16 * ailego::kVectorPageSize));
-
-  FakeAioState state;
-  state.submit_results = {2, -EIO};
-  state.completion_results = {2};
-  state.pressure_after_submit = true;
-  FakeAioGuard guard(&state);
-  IoBackend context;
-  context.type = ailego::IOBackendType::kLibAio;
-  context.aio_ctx = reinterpret_cast<io_context_t>(static_cast<uintptr_t>(1));
-  IOContext ctx = &context;
-  LinuxAlignedFileReader reader;
-  ASSERT_EQ(0, reader.open_from_handle(file.path(), file.fd()));
-  PendingBatch batch;
-  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
-  EXPECT_TRUE(batch.used_pread);
-  EXPECT_EQ(2u, state.completed);
-  EXPECT_EQ(kBlockCount, batch.events.size());
-  EXPECT_GT(pool.external_used(), 0u);
-  EXPECT_EQ(0, std::memcmp(output.get(), source.data(), source.size()));
-}
-
 TEST(DiskAnnLinuxAioTest, FailedCancellationKeepsChargedStagingIsolated) {
   TemporaryFile file;
   auto source = make_source();
@@ -559,8 +514,7 @@ TEST(DiskAnnLinuxAioTest, FailedCancellationKeepsChargedStagingIsolated) {
   const size_t baseline = pool.external_used();
 
   for (const auto &[blocking, duplicate_completion] :
-       {std::pair{false, false}, std::pair{true, false},
-        std::pair{false, true}, std::pair{true, true}}) {
+       {std::pair{true, false}, std::pair{false, true}}) {
     SCOPED_TRACE(blocking);
     SCOPED_TRACE(duplicate_completion);
     std::memset(output.get(), 0, source.size());

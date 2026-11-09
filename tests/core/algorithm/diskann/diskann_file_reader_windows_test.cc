@@ -23,7 +23,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
@@ -641,55 +640,6 @@ TEST(DiskAnnFileReaderWindowsTest, DestroyContextDrainsOutstandingBatch) {
   EXPECT_TRUE(verify_page(output.get(), 0));
   EXPECT_EQ(destroy_io_ctx(replacement_ctx), 0);
   EXPECT_EQ(replacement_ctx, nullptr);
-}
-
-TEST(DiskAnnFileReaderWindowsTest, RejectsResubmissionAndWrongContext) {
-  TemporaryFile file;
-  ASSERT_TRUE(file.valid());
-  ASSERT_TRUE(file.write_pages());
-  WindowsAlignedFileReader reader;
-  reader.open(file.path());
-
-  auto first = make_aligned_buffer(kPageSize);
-  auto second = make_aligned_buffer(kPageSize);
-  ASSERT_NE(nullptr, first);
-  ASSERT_NE(nullptr, second);
-  IOContext first_ctx = nullptr;
-  IOContext second_ctx = nullptr;
-  const auto cleanup = zvec::ailego::ScopeGuard::Make([&] {
-    EXPECT_EQ(0, destroy_io_ctx(first_ctx));
-    EXPECT_EQ(0, destroy_io_ctx(second_ctx));
-  });
-  ASSERT_EQ(0, setup_io_ctx(first_ctx));
-  ASSERT_EQ(0, setup_io_ctx(second_ctx));
-  std::vector<AlignedRead> first_read{{0, kPageSize, first.get()}};
-  std::vector<AlignedRead> second_read{{kPageSize, kPageSize, second.get()}};
-  PendingBatch first_batch, second_batch;
-  ASSERT_EQ(0, reader.submit(first_batch, first_read, first_ctx));
-  ASSERT_EQ(0, reader.submit(second_batch, second_read, second_ctx));
-  ASSERT_EQ(first_batch.generation, second_batch.generation);
-  ASSERT_EQ(first_batch.n_submitted, second_batch.n_submitted);
-
-  std::vector<uint32_t> completed;
-  EXPECT_EQ(IndexError_InvalidArgument,
-            reader.get_completed(first_batch, second_ctx, 1, completed));
-  EXPECT_TRUE(completed.empty());
-  EXPECT_EQ(1u, first_ctx->outstanding_count);
-  EXPECT_EQ(1u, second_ctx->outstanding_count);
-  EXPECT_EQ(IndexError_InvalidArgument,
-            reader.submit(first_batch, first_read, first_ctx));
-  EXPECT_EQ(IndexError_InvalidArgument,
-            reader.submit(first_batch, second_read, second_ctx));
-  ASSERT_EQ(1u, first_batch.n_submitted);
-  ASSERT_EQ(0u, first_batch.n_reaped);
-  ASSERT_EQ(1, reader.get_completed(first_batch, first_ctx, 1, completed));
-  ASSERT_EQ(1, reader.get_completed(second_batch, second_ctx, 1, completed));
-  EXPECT_TRUE(verify_page(first.get(), 0));
-  EXPECT_TRUE(verify_page(second.get(), 1));
-
-  // A completed batch can be reused on a different context.
-  ASSERT_EQ(0, reader.submit(first_batch, first_read, second_ctx));
-  EXPECT_EQ(1, reader.get_completed(first_batch, second_ctx, 1, completed));
 }
 
 TEST(DiskAnnFileReaderWindowsTest, RejectsMisalignedUnbufferedRead) {

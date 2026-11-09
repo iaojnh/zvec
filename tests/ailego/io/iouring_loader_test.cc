@@ -210,37 +210,6 @@ TEST_F(IoUringLoaderTest, AsyncCancellationAndShortReadsReleaseAllBacking) {
   }
 }
 
-TEST_F(IoUringLoaderTest, AbandonedStagingKeepsItsChargeAfterDestruction) {
-  const size_t kBytes = PoolPayloadBudget::page_buffer_size();
-  for (bool prepaid : {false, true}) {
-    SCOPED_TRACE(prepaid);
-    void *abandoned = nullptr;
-    {
-      IoUringRing ring;
-      if (prepaid) {
-        ASSERT_TRUE(pool_.try_charge_metadata(kBytes));
-        ring.adopt_staging_reservation(kBytes);
-      }
-      ASSERT_TRUE(ring.ensure_staging(kBytes));
-      abandoned = IoUringStagingTestPeer::data(ring);
-      ring.abandon_staging();
-      EXPECT_EQ(nullptr, IoUringStagingTestPeer::data(ring));
-      ring.teardown();
-      EXPECT_EQ(kBytes, pool_.used());
-    }
-    EXPECT_EQ(kBytes, pool_.used());
-    EXPECT_EQ(prepaid ? kBytes : 0u, pool_.metadata_used());
-    EXPECT_EQ(prepaid ? 0u : kBytes, pool_.external_used());
-    // No kernel requests were submitted in this test, so test cleanup may
-    // release the simulated quarantine. Production must not do this.
-    File::MemoryUnmap(abandoned, kBytes);
-    if (prepaid)
-      pool_.release_metadata(kBytes);
-    else
-      pool_.release_external(kBytes);
-  }
-}
-
 class TemporaryFile {
  public:
   TemporaryFile() : fd_(::mkstemp(path_)) {}

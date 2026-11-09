@@ -13,7 +13,6 @@
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_streamer.h>
-#include "tests/core/algorithm/flat/flat_fault_storage.h"
 #include "tests/test_util.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 #include "algorithm/hnsw/hnsw_entity.h"
@@ -87,10 +86,6 @@ TEST_F(HnswStreamerTest, FailedVisitGrowthKeepsCapacityAndCanBeRetried) {
   filter.set_visited(999999);
   EXPECT_TRUE(filter.visited(999999));
 }
-
-namespace {
-
-}  // namespace
 
 TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
   IndexStreamer::Stats stats;

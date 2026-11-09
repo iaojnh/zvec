@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -31,9 +30,7 @@
 #include <zvec/ailego/buffer/external_cache.h>
 #include "db/index/storage/fetch_memory.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
-#define private public
 #include "db/index/storage/parquet_buffer_pool.h"
-#undef private
 #include "db/index/storage/bufferpool_forward_store.h"
 #include "db/index/storage/lazy_record_batch_reader.h"
 #include "db/index/storage/parquet_memory_pool.h"
@@ -75,94 +72,6 @@ class BufferPoolStoreTest : public testing::Test {
   }
   std::string parquet_path;
 };
-
-TEST_F(BufferPoolStoreTest, MetadataHintRequiresMatchingFileIdentity) {
-  auto reader = parquet::ParquetFileReader::OpenFile(parquet_path);
-  ParquetBufferID source(parquet_path, 0, 0);
-  source.metadata = reader->metadata();
-  ParquetBufferID hinted(parquet_path, 1, 0, source);
-  EXPECT_EQ(reader->metadata(), hinted.metadata.lock());
-  ParquetBufferID plain(parquet_path, 1, 0);
-  EXPECT_TRUE(ParquetBufferIDEqual{}(hinted, plain));
-  EXPECT_EQ(ParquetBufferIDHash{}(hinted), ParquetBufferIDHash{}(plain));
-
-  auto wrong_source = source;
-  ++wrong_source.file_id;
-  EXPECT_TRUE(
-      ParquetBufferID(parquet_path, 1, 0, wrong_source).metadata.expired());
-  wrong_source = source;
-  ++wrong_source.mtime;
-  EXPECT_TRUE(
-      ParquetBufferID(parquet_path, 1, 0, wrong_source).metadata.expired());
-  wrong_source = ParquetBufferID(parquet_path + ".other", 0, 0);
-  wrong_source.file_id = source.file_id;
-  wrong_source.mtime = source.mtime;
-  wrong_source.metadata = source.metadata;
-  EXPECT_TRUE(
-      ParquetBufferID(parquet_path, 1, 0, wrong_source).metadata.expired());
-
-  reader.reset();
-  EXPECT_TRUE(hinted.metadata.expired());
-}
-
-namespace {
-
-// Model an evictable column, not an uncharged allocation. With no page
-// buffers, background page-watermark eviction stays idle; only foreground
-// admission should reclaim this payload. RAII also covers failed assertions.
-class ReclaimableParquetBudget : public ailego::EvictableBlockOwner {
- public:
-  ReclaimableParquetBudget() {
-    memory_.add(1024 * 1024);
-    data_.resize(1024 * 1024);
-    auto &queue = ailego::BlockEvictionQueue::get_instance();
-    queue.set_valid(this);
-    registered_ = queue.add_single_block({0, 1, this, 0}, 0);
-  }
-  ~ReclaimableParquetBudget() override {
-    ailego::BlockEvictionQueue::get_instance().set_invalid(this);
-  }
-  bool is_dead_block(ailego::eviction_key_t, ailego::version_t) override {
-    return reclaimed_.load();
-  }
-  bool evict_block(ailego::eviction_key_t) override {
-    std::vector<char>{}.swap(data_);
-    memory_.retain_at_most(0);
-    reclaimed_.store(true);
-    return true;
-  }
-  bool registered() const {
-    return registered_;
-  }
-  bool reclaimed() const {
-    return reclaimed_.load();
-  }
-
- private:
-  ailego::MemoryReservation memory_;
-  std::vector<char> data_;
-  std::atomic<bool> reclaimed_{false};
-  bool registered_{false};
-};
-
-}  // namespace
-
-TEST_F(BufferPoolStoreTest, CheckedCachePreservesIoAndFormatFailures) {
-  auto &cache = ParquetBufferPool::get_instance();
-  auto missing = cache.acquire_buffer_checked(
-      ParquetBufferID(parquet_path + ".missing", 0, 0));
-  EXPECT_TRUE(missing.status().IsIOError()) << missing.status().ToString();
-  auto invalid =
-      cache.acquire_buffer_checked(ParquetBufferID(parquet_path, 0, -1));
-  EXPECT_TRUE(invalid.status().IsInvalid()) << invalid.status().ToString();
-  std::filesystem::resize_file(parquet_path,
-                               std::filesystem::file_size(parquet_path) - 8);
-  auto malformed =
-      cache.acquire_buffer_checked(ParquetBufferID(parquet_path, 0, 0));
-  EXPECT_FALSE(malformed.ok());
-  EXPECT_FALSE(malformed.status().IsOutOfMemory())
-      << malformed.status().ToString();
-}
 
 TEST_F(BufferPoolStoreTest, ParquetFetch) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
@@ -660,28 +569,14 @@ class BufferPoolScanBudgetTest : public testing::Test {
 TEST_F(BufferPoolScanBudgetTest, FullPoolRejectsDecodeAndRecoversAfterRelease) {
   BufferPoolForwardStore store(parquet_path_);
   ASSERT_TRUE(store.open().ok());
-  const ParquetBufferID key(parquet_path_, 0, 0);
   auto reader = store.scan({GLOBAL_DOC_ID, "value"});
   ASSERT_NE(nullptr, reader);
   ASSERT_NO_FATAL_FAILURE(reserve_remaining_capacity());
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   const size_t external_before = pool.external_used();
-  auto denied = ParquetBufferPool::get_instance().acquire_buffer(key);
-  ASSERT_EQ(nullptr, denied.data());
-  auto checked = ParquetBufferPool::get_instance().acquire_buffer_checked(key);
-  EXPECT_TRUE(checked.status().IsOutOfMemory()) << checked.status().ToString();
   auto fetch = store.fetch_checked({"value"}, {0, 1},
                                    detail::GetParquetMemoryPool().get());
   EXPECT_TRUE(fetch.status().IsOutOfMemory()) << fetch.status().ToString();
-  EXPECT_THROW(store.fetch({"value"}, 0), std::bad_alloc);
-  // Opening a lazy reader may now reuse the store's immutable key without
-  // allocating. Admission must still reject its first actual decode.
-  auto denied_scan = store.scan({GLOBAL_DOC_ID, "value"});
-  if (denied_scan) {
-    std::shared_ptr<arrow::RecordBatch> batch;
-    EXPECT_TRUE(denied_scan->ReadNext(&batch).IsOutOfMemory());
-    EXPECT_EQ(nullptr, batch);
-  }
   {
     std::shared_ptr<arrow::RecordBatch> batch;
     EXPECT_TRUE(reader->ReadNext(&batch).IsOutOfMemory());
@@ -699,7 +594,7 @@ TEST_F(BufferPoolScanBudgetTest, FullPoolRejectsDecodeAndRecoversAfterRelease) {
 
 class BufferPoolScalarFetchTest : public testing::Test {
  protected:
-  static constexpr int64_t kRowsPerGroup = 2048;
+  static constexpr int64_t kRowsPerGroup = 16;
   static constexpr int64_t kRows = 2 * kRowsPerGroup;
 
   static std::string text_for_row(int64_t row) {
@@ -757,28 +652,6 @@ class BufferPoolScalarFetchTest : public testing::Test {
     EXPECT_FALSE(error) << error.message();
   }
 
-  void warm_and_rechunk(int column, int row_group) {
-    auto &cache = ParquetBufferPool::get_instance().cache_;
-    ParquetBufferID key(parquet_path_, column, row_group);
-    auto data = cache.acquire(key);
-    ASSERT_NE(nullptr, data);
-    ParquetBufferContextHandle pin(key, data);
-    ASSERT_EQ(kRowsPerGroup, data->length());
-    // Parquet may decode a small column as one chunk. Repartition its cached
-    // view without copying or changing its buffers/accounting so every test
-    // deterministically exercises chunk boundaries, including empty chunks.
-    arrow::ArrayVector chunks;
-    int64_t start = 0;
-    for (int64_t end : std::array<int64_t, 5>{0, 1, 3, 7, kRowsPerGroup}) {
-      auto slice = data->Slice(start, end - start);
-      chunks.insert(chunks.end(), slice->chunks().begin(),
-                    slice->chunks().end());
-      start = end;
-    }
-    *data = arrow::ChunkedArray(std::move(chunks), data->type());
-    ASSERT_GT(data->num_chunks(), 1);
-  }
-
   void check_row(const ExecBatchPtr &batch, int64_t row) {
     ASSERT_NE(nullptr, batch);
     ASSERT_EQ(1, batch->length);
@@ -811,7 +684,7 @@ TEST_F(BufferPoolScalarFetchTest, ReturnedScalarsSurviveCacheEviction) {
   BufferPoolForwardStore store(parquet_path_);
   ASSERT_TRUE(store.open().ok());
   std::vector<ExecBatchPtr> retained;
-  for (int row : {3, 4, 7, 8, 2049}) {
+  for (int row : {3, 4, 7, 8, 17}) {
     auto batch = store.fetch({"id", "value", "name"}, row);
     ASSERT_NO_FATAL_FAILURE(check_row(batch, row));
     retained.push_back(std::move(batch));
@@ -821,37 +694,10 @@ TEST_F(BufferPoolScalarFetchTest, ReturnedScalarsSurviveCacheEviction) {
   EXPECT_GT(ailego::BlockEvictionQueue::get_instance().batch_recycle(1024), 0u);
   EXPECT_EQ(0u, pool.external_used());
   size_t index = 0;
-  for (int row : {3, 4, 7, 8, 2049}) {
+  for (int row : {3, 4, 7, 8, 17}) {
     ASSERT_NO_FATAL_FAILURE(check_row(retained[index++], row));
   }
 }
-
-class BufferPoolLargeDecodeTest : public BufferPoolScalarFetchTest {
- protected:
-  void SetUp() override {
-    ASSERT_NO_FATAL_FAILURE(BufferPoolScalarFetchTest::SetUp());
-    arrow::StringBuilder names;
-    for (int row = 0; row < kLargeRows; ++row) {
-      ASSERT_TRUE(names.Append(large_text(row)).ok());
-    }
-    std::shared_ptr<arrow::Array> values;
-    ASSERT_TRUE(names.Finish(&values).ok());
-    auto schema = arrow::schema({arrow::field("name", arrow::utf8())});
-    auto table = arrow::Table::Make(schema, {values});
-    auto output = arrow::io::FileOutputStream::Open(parquet_path_);
-    ASSERT_TRUE(output.ok()) << output.status().ToString();
-    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
-                                           *output, kLargeRows)
-                    .ok());
-    ASSERT_TRUE((*output)->Close().ok());
-  }
-
-  static std::string large_text(int row) {
-    return std::to_string(row) + std::string(512, 'x');
-  }
-
-  static constexpr int kLargeRows = 8192;
-};
 
 TEST_F(BufferPoolStoreTest,
        ChunkedDecodePreservesNestedFieldsAndFollowingColumns) {

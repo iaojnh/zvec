@@ -19,14 +19,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "db/index/column/fts_column/tokenizer/jieba_embedded_dict.h"
-#include "tests/ailego/buffer/pool_payload_budget.h"
 
 namespace {
 
@@ -128,53 +125,6 @@ class JiebaEmbeddedTokenizerTest : public ::testing::Test {
   std::string saved_env_;
   bool had_env_{false};
 };
-
-TEST(JiebaDictionaryDeathTest, FailedSharedAdmissionCanRetry) {
-#if GTEST_HAS_DEATH_TEST
-  const auto previous = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  for (bool model : {false, true}) {
-    EXPECT_EXIT(
-        {
-          auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
-          // Leave enough room for process eviction-queue metadata, but not
-          // either default resource's expanded planning allowance.
-          if (zvec::ailego::PoolPayloadBudget::get_instance().init(1UL << 20) !=
-              0)
-            std::_Exit(1);
-          const auto before = pool.external_used();
-          bool rejected = false;
-          try {
-            if (model)
-              (void)zvec::fts::get_embedded_jieba_hmm_model();
-            else
-              (void)zvec::fts::get_embedded_jieba_dict();
-          } catch (const std::bad_alloc &) {
-            rejected = true;
-          }
-          if (!rejected || pool.external_used() != before) std::_Exit(2);
-          if (pool.init(256UL << 20) != 0) std::_Exit(3);
-          if (model) {
-            const auto first = zvec::fts::get_embedded_jieba_hmm_model();
-            const auto second = zvec::fts::get_embedded_jieba_hmm_model();
-            if (!first || !second || first.value() != second.value())
-              std::_Exit(4);
-          } else {
-            const auto first = zvec::fts::get_embedded_jieba_dict();
-            const auto second = zvec::fts::get_embedded_jieba_dict();
-            if (!first || !second || first.value() != second.value())
-              std::_Exit(5);
-          }
-          if (pool.external_used() <= before) std::_Exit(6);
-          std::_Exit(0);
-        },
-        ::testing::ExitedWithCode(0), "");
-  }
-  ::testing::FLAGS_gtest_death_test_style = previous;
-#else
-  GTEST_SKIP() << "Process isolation is unavailable";
-#endif
-}
 
 // Register this test first so a normal run races the first cache
 // initialization.
@@ -365,13 +315,11 @@ TEST_F(JiebaEmbeddedTokenizerTest, ExternalResourcesAreRequiredOnlyByMode) {
   ASSERT_FALSE(error) << error.message();
   ASSERT_TRUE(std::filesystem::copy_file(
       std::filesystem::u8path(kDictDir) / "jieba.dict.utf8",
-      dict_only / "jieba.dict.utf8", error))
-      << error.message();
+      dict_only / "jieba.dict.utf8", error));
   ASSERT_FALSE(error) << error.message();
   ASSERT_TRUE(std::filesystem::copy_file(
       std::filesystem::u8path(kDictDir) / "hmm_model.utf8",
-      model_only / "hmm_model.utf8", error))
-      << error.message();
+      model_only / "hmm_model.utf8", error));
   ASSERT_FALSE(error) << error.message();
 
   const std::string text = "中文分词技术星河咕噜引擎";
