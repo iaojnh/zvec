@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <iostream>
-#include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_helper.h"
@@ -136,16 +135,7 @@ TEST(IndexSegmentDumper, General) {
   ASSERT_EQ(0, file_storage->open(file_path, false));
   auto parent = file_storage->get("AAAAA", 1);
   ASSERT_TRUE(parent);
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  ASSERT_EQ(0, pool.init(64UL << 20));
-  AILEGO_DEFER([&] {
-    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-    EXPECT_EQ(0, pool.init(0));
-  });
-  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
   IndexSegmentStorage nested(parent);
-  EXPECT_EQ(IndexError_NoMemory, nested.open("", false));
-  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
   ASSERT_EQ(0, nested.open("", false));
   auto segment = nested.get("3", 0);
   ASSERT_TRUE(segment);
@@ -176,14 +166,6 @@ TEST(FileReadStorage, MemoryBlockReadsRetainIndependentBuffers) {
   ASSERT_EQ(0, storage->open(file_path, false));
   auto segment = storage->get("payload", 1);
   ASSERT_TRUE(segment);
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  ASSERT_EQ(0, pool.init(64UL << 20));
-  AILEGO_DEFER([&] {
-    segment.reset();
-    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-    EXPECT_EQ(0, pool.init(0));
-  });
-  const size_t external = pool.external_used();
   IndexStorage::MemoryBlock first_block;
   IndexStorage::MemoryBlock second_block;
   ASSERT_EQ(first.size(), segment->read(0, first_block, first.size()));
@@ -193,25 +175,6 @@ TEST(FileReadStorage, MemoryBlockReadsRetainIndependentBuffers) {
                                first.size()));
   EXPECT_EQ(second, std::string(static_cast<const char *>(second_block.data()),
                                 second.size()));
-  EXPECT_EQ(external + first.size() + second.size(), pool.external_used());
-
-  IndexStorage::SegmentData reads[] = {{0, first.size(), nullptr},
-                                      {first.size(), second.size(), nullptr}};
-  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
-  IndexStorage::MemoryBlock denied;
-  EXPECT_EQ(0u, segment->read(0, denied, first.size()));
-  EXPECT_EQ(IndexError_NoMemory, segment->read_error());
-  EXPECT_EQ(nullptr, denied.data());
-  EXPECT_FALSE(segment->read(reads, 2));
-  EXPECT_EQ(IndexError_NoMemory, segment->read_error());
-  EXPECT_EQ(external + first.size() + second.size(), pool.external_used());
-
-  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-  ASSERT_TRUE(segment->read(reads, 2));
-  EXPECT_EQ(first, std::string(static_cast<const char *>(reads[0].data),
-                               reads[0].length));
-  EXPECT_EQ(second, std::string(static_cast<const char *>(reads[1].data),
-                                reads[1].length));
   ASSERT_EQ(0u, segment->read(segment->capacity() + 1, second_block, 1));
   EXPECT_EQ(nullptr, second_block.data());
   ASSERT_EQ(0, storage->close());

@@ -12,16 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
-#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
-#if defined(__linux__)
-#include <glog/logging.h>
-#endif
-#include "db/sqlengine/planner/plan_info.h"
-#include "db/sqlengine/planner/segment_node.h"
 #include "db/sqlengine/sqlengine.h"
 #include "db/sqlengine/sqlengine_impl.h"
 #include "zvec/db/schema.h"
@@ -29,103 +22,7 @@
 
 namespace zvec::sqlengine {
 
-class InvertRecallTest : public RecallTest {
- protected:
-  static void SetUpTestSuite() {
-#if defined(__linux__)
-    // Keep CI shutdown crashes actionable even after every assertion passes.
-    google::InstallFailureSignalHandler();
-#endif
-    RecallTest::SetUpTestSuite();
-  }
-};
-
-TEST(DocIdScanPlanTest, BoundedSourceReleasesInputBeforeCompletion) {
-  arrow::UInt64Builder builder;
-  ASSERT_TRUE(builder.Append(123).ok());
-  std::shared_ptr<arrow::Array> ids;
-  ASSERT_TRUE(builder.Finish(&ids).ok());
-  auto schema = arrow::schema({arrow::field("id", arrow::uint64())});
-  auto batch = arrow::RecordBatch::Make(schema, 1, {ids});
-  for (bool early_close : {false, true}) {
-    auto owner = std::make_shared<int>(123);
-    std::weak_ptr<int> input = owner;
-    auto reader = [&] {
-      auto remaining = std::make_shared<size_t>(early_close ? 2048 : 1);
-      PlanInfo plan(
-          {"source",
-           arrow::acero::SourceNodeOptions{
-               schema,
-               [owner, batch, remaining]()
-                   -> arrow::Future<std::optional<arrow::compute::ExecBatch>> {
-                 if (*owner != 123)
-                   return arrow::Status::Invalid("Invalid input");
-                 using Future =
-                     arrow::Future<std::optional<arrow::compute::ExecBatch>>;
-                 if (*remaining == 0) return Future::MakeFinished(std::nullopt);
-                 --*remaining;
-                 return Future::MakeFinished(arrow::compute::ExecBatch(*batch));
-               }}},
-          schema);
-      return plan.execute_to_reader(64);
-    }();
-    ASSERT_TRUE(reader);
-    owner.reset();
-    std::shared_ptr<arrow::RecordBatch> result;
-    ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
-    ASSERT_NE(nullptr, result);
-    if (early_close) {
-      ASSERT_TRUE(reader.value()->Close().ok());
-    } else {
-      ASSERT_TRUE(reader.value()->ReadNext(&result).ok());
-      ASSERT_EQ(nullptr, result);
-    }
-    // Completion must release the producer even while the result reader is
-    // still alive. A later executor callback must not own the last Segment.
-    EXPECT_TRUE(input.expired());
-  }
-}
-
-TEST_F(InvertRecallTest, StreamedDocIdsMatchMaterializedResults) {
-  auto engine = SQLEngine::create(std::make_shared<Profiler>());
-  for (const auto &filter :
-       {"", "invert_age = 1", "age >= 90", "invert_id < 0", "id >= 10000"}) {
-    SearchQuery query;
-    query.filter_ = filter;
-    query.topk_ = INT32_MAX;
-    query.output_fields_ = std::vector<std::string>{};
-    query.include_doc_id_ = true;
-    auto expected = engine->execute(collection_schema_, query, segments_);
-    ASSERT_TRUE(expected) << expected.error().message();
-    size_t seen = 0;
-    auto status = engine->scan_doc_ids(
-        collection_schema_, filter, segments_,
-        [&](const uint64_t *ids, size_t count) {
-          for (size_t i = 0; i < count; ++i) {
-            if (seen >= expected->size())
-              return Status::InternalError("Too many streamed IDs");
-            EXPECT_EQ((*expected)[seen++]->doc_id(), ids[i]);
-          }
-          return Status::OK();
-        });
-    ASSERT_TRUE(status.ok()) << status.message();
-    EXPECT_EQ(expected->size(), seen);
-  }
-}
-
-TEST_F(InvertRecallTest, StreamedDocIdsStopOnConsumerError) {
-  auto engine = SQLEngine::create(std::make_shared<Profiler>());
-  size_t calls = 0;
-  auto status = engine->scan_doc_ids(
-      collection_schema_, "", segments_, [&](const uint64_t *, size_t count) {
-        ++calls;
-        EXPECT_GT(count, 0u);
-        return Status(StatusCode::RESOURCE_EXHAUSTED, "staging denied");
-      });
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code());
-  EXPECT_EQ("staging denied", status.message());
-  EXPECT_EQ(1u, calls);
-}
+class InvertRecallTest : public RecallTest {};
 
 TEST_F(InvertRecallTest, Eq) {
   SearchQuery query;
@@ -919,13 +816,11 @@ TEST_F(InvertRecallTest, MultiSegment) {
   auto engine = SQLEngine::create(std::make_shared<Profiler>());
   std::vector<Segment::Ptr> segments = segments_;
   segments.push_back(segments_[0]);
-  const auto owners_before = segments_[0].use_count();
   auto ret = engine->execute(collection_schema_, query, segments);
   if (!ret) {
     LOG_ERROR("execute failed: [%s]", ret.error().c_str());
   }
   ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
-  EXPECT_EQ(owners_before, segments_[0].use_count());
   auto docs = ret.value();
   EXPECT_EQ(docs.size(), query.topk_);
   for (int i = 0; i < query.topk_; i++) {

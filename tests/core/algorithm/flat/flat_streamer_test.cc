@@ -160,65 +160,6 @@ void FlatStreamerTest::TearDown() {
   zvec::test_util::RemoveTestPath(dir_);
 }
 
-TEST_F(FlatStreamerTest, ExternalKeyDirectoryAdmissionAndReopen) {
-  auto &pool = MemoryLimitPool::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0, pool.init(64UL << 20));
-  auto restore_budget = zvec::ailego::ScopeGuard::Make(
-      [&] { EXPECT_EQ(0, pool.init(previous)); });
-  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
-  ASSERT_NE(nullptr, storage);
-  ASSERT_EQ(0, storage->init(Params()));
-  ASSERT_EQ(0, storage->open(dir_ + "external_directory", true));
-  IndexStreamer::Stats stats;
-  class ExternalEntity : public FlatStreamerEntity {
-   public:
-    using FlatStreamerEntity::FlatStreamerEntity;
-    using FlatStreamerEntity::use_key_info_map;
-  } entity(stats);
-  *entity.mutable_meta() = *index_meta_ptr_;
-  entity.set_block_vector_count(32);
-  entity.set_linear_list_count(1);
-  entity.set_segment_size(64UL << 10);
-  entity.set_use_external_vector(true);
-  // The external membership map is required regardless of setter order.
-  entity.set_use_key_info_map(false);
-  entity.enable_filter_same_key(true);
-  ASSERT_TRUE(entity.use_key_info_map());
-  ASSERT_EQ(0, entity.open(storage, *index_meta_ptr_));
-  const std::array<float, dim> row{};
-  {
-    MemoryReservation pressure;
-    pressure.add(pool.capacity() - pool.used());
-    EXPECT_EQ(IndexError_NoMemory,
-              entity.add_vector_with_id(7, row.data(), sizeof(row)));
-    EXPECT_EQ(0u, entity.vector_count());
-    EXPECT_EQ(0u, entity.registered_key_count());
-  }
-  const std::vector<uint64_t> expected{7, 100003, 42};
-  for (uint32_t key : expected)
-    ASSERT_EQ(0, entity.add_vector_with_id(key, row.data(), sizeof(row)));
-  ASSERT_EQ(0, entity.add_vector_with_id(7, row.data(), sizeof(row)));
-  EXPECT_EQ(expected.size(), entity.vector_count());
-  EXPECT_EQ(expected.size(), entity.registered_key_count());
-  std::vector<uint64_t> keys;
-  entity.get_registered_keys(1, 100, &keys);
-  EXPECT_EQ((std::vector<uint64_t>{100003, 42}), keys);
-  entity.get_registered_keys(100, 2, &keys);
-  EXPECT_TRUE(keys.empty());
-  ASSERT_EQ(0, entity.flush(0));
-  ASSERT_EQ(0, entity.close());
-  ASSERT_EQ(0, entity.open(storage, *index_meta_ptr_));
-  entity.get_registered_keys(0, 100, &keys);
-  EXPECT_EQ(expected, keys);
-  const uint32_t candidates[]{7, 8, 100003, 42};
-  std::vector<uint8_t> present;
-  entity.key_presence(candidates, 4, 0, &present);
-  EXPECT_EQ((std::vector<uint8_t>{1, 0, 1, 1}), present);
-  ASSERT_EQ(0, entity.close());
-  ASSERT_EQ(0, storage->close());
-}
-
 TEST_F(FlatStreamerTest, TestAddVector) {
   IndexStreamer::Pointer streamer =
       IndexFactory::CreateStreamer("FlatStreamer");

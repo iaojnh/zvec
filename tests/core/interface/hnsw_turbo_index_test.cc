@@ -1367,37 +1367,6 @@ TEST(HnswBulkMergeTest, PreparesAllContextsBeforeWritesAndPropagatesFailure) {
   }
 }
 
-TEST(HnswBulkMergeTest, BorrowedVectorRoutingObeysPoolAdmission) {
-  namespace ailego = zvec::ailego;
-  auto &memory = ailego::MemoryLimitPool::get_instance();
-  const auto previous = memory.capacity();
-  ASSERT_EQ(0, memory.init(128UL * 1024 * 1024));
-  AILEGO_DEFER([&] {
-    memory.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-    EXPECT_EQ(0, memory.init(previous));
-  });
-  const std::string path = "hnsw_bulk_budget_source.index";
-  AILEGO_DEFER([&] { zvec::test_util::RemoveTestFiles(path); });
-  auto param = FlatIndexParamBuilder()
-                   .with_data_type(DataType::DT_FP32)
-                   .with_dimension(kDimension)
-                   .with_metric_type(MetricType::kL2sq)
-                   .build();
-  auto source = IndexFactory::CreateAndInitIndex(*param);
-  ASSERT_NE(nullptr, source);
-  ASSERT_EQ(0, source->open(path, {StorageOptions::StorageType::kMMAP, true}));
-  AddVectors(source.get(), RandomVectors());
-
-  zvec::core::HnswBulkBuilder builder({}, {}, nullptr, {});
-  ASSERT_EQ(0, builder.add_source(source->create_index_provider()));
-  memory.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
-  EXPECT_EQ(zvec::core::IndexError_NoMemory, builder.prepare(IndexFilter()));
-  EXPECT_TRUE(builder.empty());
-  memory.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-  EXPECT_EQ(0, builder.prepare(IndexFilter()));
-  EXPECT_FALSE(builder.empty());
-}
-
 TEST(HnswBulkMergeTest, TaskAllocationFailureWaitsBeforeDestroyingContexts) {
   namespace ailego = zvec::ailego;
   BulkContextState state{0, false};

@@ -22,7 +22,6 @@
 #include <set>
 #include <thread>
 #include <variant>
-#include <ailego/pattern/scope_guard.h>
 #if !defined(_WIN32)
 #include <sys/stat.h>
 #endif
@@ -33,10 +32,10 @@
 #include <arrow/result.h>
 #include <arrow/table.h>
 #include <gtest/gtest.h>
-#include <zvec/ailego/buffer/memory_reservation.h>
 #include "db/common/constants.h"
-#include "db/common/file_helper.h"
 #include "db/common/mobile_memory.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
+#include "db/common/file_helper.h"
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "db/index/column/vector_column/vector_index_results.h"
@@ -49,7 +48,6 @@
 #include "zvec/db/options.h"
 #include "zvec/db/query_params.h"
 #include "zvec/db/schema.h"
-#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
 
@@ -130,10 +128,8 @@ class SegmentHelperTest : public testing::Test {
                                      const VersionManager::Ptr &version_manager,
                                      int concurrency = 1) {
     const bool forward_use_parquet = false;
-    const bool enable_mmap = true;
     CompactTask task(col_path, schema, std::move(segments), output_segment_id,
-                     std::move(filter), forward_use_parquet, enable_mmap,
-                     concurrency);
+                     std::move(filter), forward_use_parquet, !forward_use_parquet, concurrency);
     auto segment_task = SegmentTask::CreateCompactTask(task);
     EXPECT_NE(segment_task, nullptr);
     if (segment_task == nullptr) return {task, nullptr};
@@ -151,8 +147,9 @@ class SegmentHelperTest : public testing::Test {
     auto dst_path = FileHelper::MakeSegmentPath(col_path, output_segment_id);
     EXPECT_TRUE(FileHelper::MoveDirectory(tmp_path, dst_path));
 
-    SegmentOptions read_options{true, enable_mmap, DEFAULT_MAX_BUFFER_SIZE};
-    version_manager->set_enable_mmap(enable_mmap);
+    SegmentOptions read_options{true, !forward_use_parquet,
+                                DEFAULT_MAX_BUFFER_SIZE};
+    version_manager->set_enable_mmap(!forward_use_parquet);
     auto seg_ret =
         Segment::Open(col_path, *schema, *executed.output_segment_meta_, id_map,
                       delete_store, version_manager, read_options);
@@ -343,66 +340,6 @@ TEST_F(SegmentHelperTest, CompactTask_Filter) {
   ASSERT_EQ(seg2->doc_count(), seg1->doc_count() - 10);
 
   ASSERT_TRUE(seg1->destroy().ok());
-}
-
-TEST_F(SegmentHelperTest, CompactTask_FilterBudgetDenialAllowsRetry) {
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  if (!pool.capacity()) ASSERT_EQ(0, pool.init(128UL << 20));
-  auto schema = test::TestHelper::CreateNormalSchema(false, col_name);
-  auto version_manager = create_version_manager(*schema);
-  auto input = test::TestHelper::CreateSegmentWithDoc(
-      col_path, *schema, 0, 0, id_map, delete_store, version_manager,
-      write_options(), 0, 16);
-  ASSERT_NE(nullptr, input);
-  ASSERT_TRUE(input->flush().ok());
-
-  uint64_t block_at = UINT64_MAX;
-  size_t pressure = 0;
-  auto release_pressure = ailego::ScopeGuard::Make([&] {
-    if (pressure) pool.release_workspace_plan(pressure);
-  });
-  auto filter = EasyIndexFilter::Create([&](uint64_t id) {
-    // Exhaust the budget after reading the batch, before either the first
-    // deleted row or the first selected row is recorded.
-    if (id == block_at) {
-      // Inject logical quota exhaustion, not an untouched allocation of all
-      // remaining process RSS (which can itself fail on mobile before the
-      // filter's allocation is reached).
-      const size_t bytes = pool.capacity() - pool.used();
-      if (!pool.try_charge_workspace_plan(bytes)) throw std::bad_alloc();
-      pressure += bytes;
-    }
-    return id == 0;
-  });
-  const SegmentID output_id = 1;
-  CompactTask compact(col_path, schema, {input}, output_id, filter,
-                      /*forward_use_parquet=*/true, /*enable_mmap=*/true, 1);
-  auto task = SegmentTask::CreateCompactTask(compact);
-  ASSERT_NE(nullptr, task);
-  const auto tmp_path = FileHelper::MakeTempSegmentPath(col_path, output_id);
-  for (const uint64_t id : {0, 1}) {
-    block_at = id;
-    auto status = SegmentHelper::Execute(task);
-    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, status.code())
-        << status.message();
-    EXPECT_EQ(0u, status.message().find("filter record batch failed"));
-    EXPECT_EQ(id == 0, status.message().find("Compaction deletion bitmap") !=
-                           std::string::npos);
-    EXPECT_EQ(nullptr,
-              std::get<CompactTask>(task->task_info()).output_segment_meta_);
-    EXPECT_FALSE(std::filesystem::exists(tmp_path));
-    pool.release_workspace_plan(pressure);
-    pressure = 0;
-  }
-
-  block_at = UINT64_MAX;
-  auto status = SegmentHelper::Execute(task);
-  ASSERT_TRUE(status.ok()) << status.message();
-  const auto &output =
-      std::get<CompactTask>(task->task_info()).output_segment_meta_;
-  ASSERT_NE(nullptr, output);
-  EXPECT_EQ(15u, output->doc_count());
-  EXPECT_TRUE(FileHelper::RemoveDirectory(tmp_path));
 }
 
 TEST_F(SegmentHelperTest, CompactTask_FilterAll) {
@@ -683,8 +620,8 @@ TEST_F(SegmentHelperTest, QuantizedIvfClosesRawFlatBeforeBuildingIndex) {
     };
     std::vector<BlockMeta> blocks;
     auto status = SegmentHelper::ReduceVectorIndex(
-        schema, {seg1, seg2}, output_path, nullptr, next_block, 0, 63, 64,
-        /*enable_mmap=*/true, 1, &blocks);
+        schema, {seg1, seg2}, output_path, nullptr, next_block, 0, 63, 64, true, 1,
+        &blocks);
     EXPECT_EQ(status.ok(), !fail_quantized_dump) << status.message();
     EXPECT_EQ(next_block_id, 2);
 

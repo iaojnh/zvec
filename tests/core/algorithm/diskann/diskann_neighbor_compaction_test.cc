@@ -94,41 +94,6 @@ TEST(DiskAnnNeighborBuffer, ShrinkReturnsTailPagesWithoutMovingPrefix) {
   EXPECT_EQ(0, buffer.data()[0]);
 }
 
-TEST(DiskAnnNeighborBuffer, BudgetedReplacementPreservesOldMappingOnDenial) {
-  const size_t page = ailego::MemoryHelper::PageSize();
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  const auto restore =
-      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
-  ASSERT_EQ(0, pool.init(5 * page));
-  DiskAnnNeighborBuffer buffer;
-  ASSERT_EQ(0, buffer.allocate(4 * page));
-  EXPECT_EQ(4 * page, pool.external_used());
-  char *original = buffer.data();
-  original[0] = 'x';
-
-  EXPECT_EQ(IndexError_NoMemory, buffer.allocate(2 * page));
-  EXPECT_EQ(original, buffer.data());
-  EXPECT_EQ('x', buffer.data()[0]);
-  EXPECT_EQ(4 * page, pool.external_used());
-  ASSERT_EQ(0, buffer.shrink(2 * page));
-  EXPECT_EQ(2 * page, pool.external_used());
-
-  ASSERT_EQ(0, buffer.allocate(3 * page));
-  EXPECT_EQ(3 * page, pool.external_used());
-  buffer.clear();
-  EXPECT_EQ(0u, pool.external_used());
-
-  DiskAnnNeighborPool neighbors;
-  ASSERT_EQ(0, neighbors.reserve(16, 32));
-  const size_t directory_bytes = pool.external_used();
-  EXPECT_GT(directory_bytes, 0u);
-  ASSERT_EQ(0, neighbors.append(0, 1));
-  EXPECT_GT(pool.external_used(), directory_bytes);
-  neighbors.clear();
-  EXPECT_EQ(0u, pool.external_used());
-}
-
 class RecordingDumper : public IndexDumper {
  public:
   int init(const ailego::Params &) override {

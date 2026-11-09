@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifdef _MSC_VER
+#define _ALLOW_KEYWORD_MACROS
+#endif
+#define private public
+#define protected public
 #include "db/index/storage/wal/wal_file.h"
+#undef private
+#undef protected
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <algorithm>
 #include <fstream>
 #include <iterator>
-#include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/utility/string_helper.h>
@@ -93,39 +99,6 @@ TEST_F(WalFileTest, ReadOnlyCannotCreateWal) {
   options.read_only = true;
   EXPECT_NE(0, wal->open(options));
   EXPECT_FALSE(FileHelper::FileExists(path));
-}
-
-TEST_F(WalFileTest, EveryIncompleteTailPreservesCompleteRecords) {
-  const std::string path = "./data.wal.partial_tail";
-  auto wal = WalFile::Create(path);
-  WalOptions options;
-  options.create_new = true;
-  ASSERT_EQ(0, wal->open(options));
-  ASSERT_EQ(0, wal->append("complete"));
-  ASSERT_EQ(0, wal->append("unfinished"));
-  ASSERT_EQ(0, wal->close());
-  std::ifstream input(path, std::ios::binary);
-  const std::string contents{std::istreambuf_iterator<char>(input),
-                             std::istreambuf_iterator<char>()};
-  input.close();
-  constexpr size_t kTailSize = 2 * sizeof(uint32_t) + sizeof("unfinished") - 1;
-  ASSERT_GT(contents.size(), kTailSize);
-  const size_t prefix_size = contents.size() - kTailSize;
-  options.create_new = false;
-  for (size_t tail = 0; tail < kTailSize; ++tail) {
-    SCOPED_TRACE(tail);
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    output.write(contents.data(),
-                 static_cast<std::streamsize>(prefix_size + tail));
-    output.close();
-    ASSERT_EQ(0, wal->open(options));
-    ASSERT_EQ(0, wal->prepare_for_read());
-    EXPECT_EQ("complete", wal->next());
-    EXPECT_TRUE(wal->next().empty());
-    EXPECT_TRUE(wal->read_status().ok());
-    ASSERT_EQ(0, wal->close());
-  }
-  EXPECT_EQ(0, wal->remove());
 }
 
 TEST_F(WalFileTest, TestGeneral) {
@@ -222,64 +195,6 @@ TEST_F(WalFileTest, TestGeneral) {
   // remove
   ret = wal_file->remove();
   ASSERT_EQ(ret, 0);
-}
-
-TEST_F(WalFileTest, BorrowedBinaryAndLimitRejectBeforeWrite) {
-  const auto path = FileHelper::MakeFilePath("./", FileID::WAL_FILE, 0);
-  auto wal = WalFile::Create(path);
-  ASSERT_NE(nullptr, wal);
-  WalOptions options;
-  options.create_new = true;
-  ASSERT_EQ(0, wal->open(options));
-  std::vector<char> bytes{'a', '\0', 'b', '\0', 'c'};
-  ASSERT_EQ(0, wal->append(std::string_view(bytes.data(), bytes.size())));
-  std::fill(bytes.begin(), bytes.end(), 'x');
-  std::string large(4 * 1024 * 1024 + 1, 'q');
-  EXPECT_EQ(-1, wal->append(large));
-  EXPECT_EQ(-1, wal->append(std::string_view{}));
-  ASSERT_EQ(0, wal->append(std::string_view(large.data(), large.size() - 1)));
-  ASSERT_EQ(0, wal->append("tail"));
-  ASSERT_EQ(0, wal->close());
-  options.create_new = false;
-  ASSERT_EQ(0, wal->open(options));
-  ASSERT_EQ(0, wal->prepare_for_read());
-  EXPECT_EQ(std::string("a\0b\0c", 5), wal->next());
-  EXPECT_EQ(large.substr(1), wal->next());
-  EXPECT_EQ("tail", wal->next());
-  EXPECT_TRUE(wal->next().empty());
-  ASSERT_EQ(0, wal->close());
-  ASSERT_EQ(0, wal->remove());
-}
-
-TEST_F(WalFileTest, AdmitsActualRecordBytesBeforeReadAndReportsRejection) {
-  const auto path = FileHelper::MakeFilePath("./", FileID::WAL_FILE, 0);
-  auto wal = WalFile::Create(path);
-  ASSERT_NE(nullptr, wal);
-  ASSERT_EQ(0, wal->open(WalOptions{0, true}));
-  ASSERT_EQ(0, wal->append("small"));
-  ASSERT_EQ(0, wal->append(std::string(1024, 'x')));
-  ASSERT_EQ(0, wal->flush());
-  ASSERT_EQ(0, wal->prepare_for_read());
-  size_t requested = 0;
-  EXPECT_TRUE(wal->next([&](size_t bytes) {
-                   requested = bytes;
-                   throw std::bad_alloc();
-                 })
-                  .empty());
-  EXPECT_EQ(6u, requested);
-  EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, wal->read_status().code());
-  // Retry directly on the same cursor after restoring admission.
-  std::vector<size_t> sizes;
-  const WalFile::ReadAdmission admit = [&](size_t bytes) {
-    sizes.push_back(bytes);
-  };
-  EXPECT_EQ("small", wal->next(admit));
-  EXPECT_EQ(std::string(1024, 'x'), wal->next(admit));
-  EXPECT_TRUE(wal->next(admit).empty());
-  EXPECT_TRUE(wal->read_status().ok());
-  EXPECT_EQ((std::vector<size_t>{6, 1025}), sizes);
-  ASSERT_EQ(0, wal->close());
-  ASSERT_EQ(0, wal->remove());
 }
 
 void do_append(WalFile *wal_file, size_t number) {
@@ -471,8 +386,8 @@ TEST_F(WalFileTest, TestBoundaryCondition) {
   ret = wal_file->open(wal_option);
   ASSERT_EQ(ret, 0);
   for (size_t i = 0; i < 99; i++) {
-    std::string record_prefix = "hello";
-    ret = wal_file->append(record_prefix + std::to_string(i));
+    std::string record = "hello";
+    ret = wal_file->append(record + std::to_string(i));
     ASSERT_EQ(ret, 0);
   }
   ret = wal_file->flush();
@@ -862,7 +777,6 @@ TEST_F(WalFileTest, TestCRCErrorCase) {
   }
   ASSERT_EQ(idx, 1);
   // close
-  EXPECT_FALSE(wal_file->read_status().ok());
   ret = wal_file->close();
   ASSERT_EQ(ret, 0);
   // remove

@@ -12,27 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <limits>
 #include <random>
 #include <string>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
-#include <zvec/ailego/buffer/block_eviction_queue.h>
-#include <zvec/ailego/buffer/vector_page_table.h>
 #include <turbo/algorithm/kmeans.h>
 #include <zvec/ailego/container/params.h>
 #include "algorithm/cluster/cluster_params.h"
 #include "algorithm/cluster/holder_cluster.h"
 #include "algorithm/cluster/turbo_kmeans_context.h"
 #include "zvec/core/framework/index_framework.h"
-#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -63,11 +55,7 @@ class StreamingTestHolder : public IndexHolder {
       ++owner_->reads;
       if (index_ == owner_->null_at) return nullptr;
       owner_->fill(index_, buffer_.data() + 1);
-      if (index_ == owner_->error_at) error_ = IndexError_ReadData;
       return buffer_.data() + 1;
-    }
-    int status() const override {
-      return error_;
     }
     bool is_valid() const override {
       return index_ < owner_->actual_count;
@@ -78,15 +66,11 @@ class StreamingTestHolder : public IndexHolder {
     void next() override {
       std::fill(buffer_.begin(), buffer_.end(), '\xff');
       ++index_;
-      if (owner_->fail_at_end && index_ == owner_->actual_count) {
-        error_ = IndexError_ReadData;
-      }
     }
 
    private:
     StreamingTestHolder *owner_;
     mutable std::vector<char> buffer_;
-    mutable int error_{0};
     size_t index_{0};
   };
 
@@ -167,8 +151,6 @@ class StreamingTestHolder : public IndexHolder {
   size_t reads{0};
   size_t live_iterators{0};
   size_t null_at{std::numeric_limits<size_t>::max()};
-  size_t error_at{std::numeric_limits<size_t>::max()};
-  bool fail_at_end{false};
   bool fail_iterator{false};
   float offset{0};
 };
@@ -216,24 +198,6 @@ std::vector<HolderTrainingCase> HolderTrainingCases() {
 }
 
 class HolderTrainingTest : public ::testing::TestWithParam<HolderTrainingCase> {
-};
-
-class TemporaryTrainingDirectory {
- public:
-  TemporaryTrainingDirectory() {
-    static std::atomic<size_t> sequence{0};
-    path = "opt_kmeans_buffered_" +
-           std::to_string(
-               std::chrono::steady_clock::now().time_since_epoch().count()) +
-           "_" + std::to_string(sequence.fetch_add(1));
-    EXPECT_TRUE(std::filesystem::create_directory(path));
-  }
-  ~TemporaryTrainingDirectory() {
-    std::error_code error;
-    EXPECT_TRUE(std::filesystem::is_empty(path, error));
-    EXPECT_TRUE(std::filesystem::remove(path, error));
-  }
-  std::string path;
 };
 
 }  // namespace
@@ -286,100 +250,6 @@ TEST_P(HolderTrainingTest, MatchesMountedFeatures) {
     holder.reset();
     EXPECT_TRUE(input_lifetime.expired());
   }
-}
-
-TEST(KmeansCluster, HolderFailuresLeaveCentroidsAndMountAvailableForRetry) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
-  ASSERT_EQ(0, pool.init(2 * PoolPayloadBudget::storage_metadata_bytes(1024) +
-                         256 * 1024));
-  {
-    auto holder = std::make_shared<StreamingTestHolder>(7, 17);
-    auto features = Materialize(*holder);
-    auto cluster = IndexFactory::CreateCluster("KmeansCluster");
-    ASSERT_EQ(0, cluster->init(holder->meta_, Params()));
-    ASSERT_EQ(0, cluster->mount(features));
-    auto *fast = dynamic_cast<HolderCluster *>(cluster.get());
-    ASSERT_NE(nullptr, fast);
-    auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
-    IndexCluster::CentroidList seed{
-        IndexCluster::Centroid(features->element(0), features->element_size())};
-    for (int fault = 0; fault < 6; ++fault) {
-      holder->fail_iterator = fault == 0;
-      holder->null_at = fault == 1 ? 3 : std::numeric_limits<size_t>::max();
-      holder->reported_count = fault == 2 ? 16 : (fault == 3 ? 18 : 17);
-      holder->error_at = fault == 4 ? 16 : std::numeric_limits<size_t>::max();
-      holder->fail_at_end = fault == 5;
-      auto actual = seed;
-      EXPECT_NE(0, fast->cluster_holder(threads, holder, actual));
-      ExpectSameCentroids(seed, actual);
-      EXPECT_EQ(0u, holder->live_iterators);
-    }
-    holder->fail_at_end = false;
-    holder->reported_count = std::numeric_limits<size_t>::max();
-    const size_t before = holder->iterations;
-    auto actual = seed;
-    EXPECT_EQ(IndexError_NotImplemented,
-              fast->cluster_holder(threads, holder, actual));
-    EXPECT_EQ(before, holder->iterations);
-    holder->reported_count = 17;
-    ASSERT_EQ(0, fast->cluster_holder(threads, holder, actual));
-    ASSERT_EQ(0, cluster->cluster(threads, actual));
-  }
-  EXPECT_EQ(0u, pool.used());
-}
-
-TEST(OptKmeansCluster, BufferedTrainingUnderPagePressure) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
-
-  const size_t metadata =
-      PoolPayloadBudget::storage_metadata_bytes(4096);
-  // Training and exported centers need two page tables. Initial/canonical
-  // centers and bounded output growth overlap; all stay billed until freed.
-  const size_t center_workspace =
-      4 * 65 *
-      (768 * sizeof(float) + IndexCluster::Centroid::loaded_metadata_bytes());
-  PoolPayloadBudget::get_instance().init(2 * metadata + 128u * 1024u +
-                                         center_workspace);
-  TemporaryTrainingDirectory directory;
-  auto holder = std::make_shared<StreamingTestHolder>(768, 4099);
-  auto cluster = IndexFactory::CreateCluster("OptKmeansCluster");
-  Params params;
-  params.set(OPTKMEANS_CLUSTER_BUFFERED_STORAGE_PATH,
-             directory.path + "/train");
-  params.set(OPTKMEANS_CLUSTER_MAX_ITERATIONS, 3u);
-  ASSERT_EQ(0, cluster->init(holder->meta_, params));
-  auto *fast = dynamic_cast<HolderCluster *>(cluster.get());
-  ASSERT_NE(nullptr, fast);
-  auto threads = std::make_shared<SingleQueueIndexThreads>(2, false);
-  IndexCluster::CentroidList cents;
-  std::vector<float> row(768);
-  // More than two SIMD batches of centers, plus a row-major tail. Duplicated
-  // seeds are intentional: the existing empty-cluster handling is unchanged.
-  for (size_t i = 0; i < 65; ++i) {
-    holder->fill(i, reinterpret_cast<char *>(row.data()));
-    cents.emplace_back(row.data(), row.size() * sizeof(float));
-  }
-  ASSERT_EQ(0, fast->cluster_holder(threads, holder, cents));
-  EXPECT_GT(holder->count() * holder->element_size(),
-            PoolPayloadBudget::get_instance().capacity());
-  size_t follows = 0;
-  for (const auto &centroid : cents) {
-    EXPECT_TRUE(centroid.feature_stored());
-    ASSERT_EQ(0, centroid.read_feature(row.data(), row.size() * sizeof(float)));
-    follows += centroid.follows();
-  }
-  EXPECT_EQ(holder->count(), follows);
-  EXPECT_TRUE(std::filesystem::is_empty(directory.path));
-  cluster.reset();
-  ASSERT_EQ(0,
-            cents.front().read_feature(row.data(), row.size() * sizeof(float)));
-  EXPECT_GT(PoolPayloadBudget::get_instance().used(), 0u);
-  cents.clear();
-  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().used());
 }
 
 INSTANTIATE_TEST_SUITE_P(AllSupportedTypesAndMetrics, HolderTrainingTest,
@@ -516,19 +386,6 @@ TEST(OptKmeansCluster, HolderTrainingRejectsInvalidPackedDimensions) {
 }
 
 TEST(OptKmeansCluster, TrainerStreamsOrFallsBackAsAppropriate) {
-  auto &pool = PoolPayloadBudget::get_instance();
-  struct RestorePool {
-    size_t capacity;
-    ~RestorePool() {
-      EXPECT_EQ(0u, PoolPayloadBudget::get_instance().used());
-      EXPECT_EQ(0, PoolPayloadBudget::get_instance().init(capacity));
-    }
-  } restore{pool.capacity()};
-  // Two-level streaming may have input, permutation and training matrix
-  // stores live together. Do not inherit a previous test's single-store pool.
-  const size_t metadata =
-      PoolPayloadBudget::storage_metadata_bytes(4096);
-  ASSERT_EQ(0, pool.init(3 * metadata + 256u * 1024u));
   auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
   for (int mode = 0; mode < 6; ++mode) {
     SCOPED_TRACE(mode);

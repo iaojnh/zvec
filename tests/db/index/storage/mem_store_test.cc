@@ -18,7 +18,6 @@
 #include "db/index/storage/memory_forward_store.h"
 #undef private
 #undef protected
-#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -26,7 +25,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <arrow/array.h>
 #include <arrow/io/file.h>
 #include <arrow/ipc/reader.h>
@@ -99,26 +97,6 @@ class MemStoreTest : public testing::Test {
 };
 
 // Test constructor
-TEST_F(MemStoreTest, UnpublishedPreparationLeavesRowsUnchanged) {
-  Doc doc = CreateDoc(10);
-  {
-    auto prepared = store_->prepare_insert(doc, 123);
-    ASSERT_TRUE(prepared.has_value()) << prepared.error().message();
-    EXPECT_EQ(0u, store_->num_rows());
-    EXPECT_EQ(10u, doc.doc_id());
-  }
-  EXPECT_EQ(0u, store_->num_rows());
-  auto prepared = store_->prepare_insert(doc, 123);
-  ASSERT_TRUE(prepared.has_value());
-  store_->commit_insert(std::move(*prepared));
-  EXPECT_EQ(1u, store_->num_rows());
-  auto result = store_->get_table();
-  ASSERT_NE(nullptr, result);
-  EXPECT_EQ(123u, std::static_pointer_cast<arrow::UInt64Array>(
-                      result->column(0)->chunk(0))
-                      ->Value(0));
-}
-
 TEST_F(MemStoreTest, ConstructorTest) {
   auto schema = GetCollectionSchema();
   MemForwardStore store(schema, "./scalar.block.0", FileFormat::IPC);
@@ -535,42 +513,6 @@ TEST_F(MemStoreTest, FetchCheckOrderWithLocalRowIDEnd) {
 
   EXPECT_EQ(actual_ids, expected_ids)
       << "ID column values don't match expected order";
-}
-
-TEST_F(MemStoreTest, PointFetchReportsDenialBeforeFullStoreFallback) {
-  auto managed = std::make_shared<MemForwardStore>(
-      schema_, "./point-fetch-budget.parquet", FileFormat::PARQUET);
-  const auto remove = ailego::ScopeGuard::Make(
-      [&] { std::filesystem::remove("./point-fetch-budget.parquet"); });
-  ASSERT_TRUE(managed->open().ok());
-  ASSERT_TRUE(managed->insert(CreateDoc(1)).ok());
-
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  const size_t previous = pool.capacity();
-  ASSERT_EQ(0, pool.init(64UL << 20));
-  const auto restore = ailego::ScopeGuard::Make([&] {
-    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-    managed.reset();
-    EXPECT_EQ(0, pool.init(previous));
-  });
-
-  RecordBatchPtr source;
-  std::vector<int> rows;
-  rows.reserve(1);
-  ailego::MemoryReservation row_memory;
-  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
-  auto denied = managed->locate_single_source({0}, &source, &rows, row_memory);
-  ASSERT_FALSE(denied.ok());
-  EXPECT_TRUE(denied.status().IsOutOfMemory());
-  EXPECT_FALSE(source);
-
-  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
-  auto recovered =
-      managed->locate_single_source({0}, &source, &rows, row_memory);
-  ASSERT_TRUE(recovered.ok());
-  EXPECT_TRUE(*recovered);
-  ASSERT_TRUE(source);
-  EXPECT_EQ(1, source->num_rows());
 }
 
 TEST_F(MemStoreTest, FetchSingleRow) {

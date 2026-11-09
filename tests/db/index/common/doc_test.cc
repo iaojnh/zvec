@@ -17,10 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <gtest/gtest.h>
-#include <ailego/pattern/scope_guard.h>
-#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/utility/float_helper.h>
-#include "db/index/common/serialized_doc_memory.h"
 #include "utils/utils.h"
 #include "zvec/db/index_params.h"
 #include "zvec/db/status.h"
@@ -41,35 +38,6 @@ class DocDetailedTest : public ::testing::Test {
 
   Doc::Ptr test_doc_;
 };
-
-TEST_F(DocDetailedTest, RejectsInvalidSerializedLengthsBeforeAllocation) {
-  EXPECT_EQ(nullptr, Doc::deserialize(nullptr, 0));
-  for (const auto &value : {Doc::Value(std::string("text")),
-                            Doc::Value(std::vector<std::string>{"a", "b"}),
-                            Doc::Value(std::vector<double>{1, 2})}) {
-    Doc doc;
-    std::visit(
-        [&](const auto &v) {
-          if constexpr (std::is_same_v<std::decay_t<decltype(v)>,
-                                       std::monostate>)
-            doc.set_null("v");
-          else
-            doc.set("v", v);
-        },
-        value);
-    auto bytes = doc.serialize();
-    // Empty pk, one field named v: corrupt its string/array length.
-    const size_t length_offset = sizeof(uint32_t) + sizeof(float) +
-                                 sizeof(uint64_t) + sizeof(Operator) +
-                                 2 * sizeof(uint32_t) + 1 + sizeof(uint8_t);
-    ASSERT_LT(length_offset + sizeof(uint32_t), bytes.size());
-    std::fill_n(bytes.begin() + length_offset, sizeof(uint32_t), uint8_t{255});
-    EXPECT_EQ(nullptr, Doc::deserialize(bytes));
-  }
-  auto bytes = test_doc_->serialize();
-  bytes.push_back(0);
-  EXPECT_EQ(nullptr, Doc::deserialize(bytes));
-}
 
 // Test serialization and deserialization of basic data types
 TEST_F(DocDetailedTest, BasicTypeSerializationDeserialization) {

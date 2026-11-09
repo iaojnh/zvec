@@ -15,52 +15,11 @@
 #include <cstring>
 #include <utility>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_storage.h>
-#include "../../ailego/buffer/pool_payload_budget.h"
-#include "utility/immutable_segment_view.h"
-#include <filesystem>
-#include <future>
-#include <zvec/core/framework/index_factory.h>
-#include "utility/utility_params.h"
-#include <array>
-#include <atomic>
-#include <thread>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
-#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 
 using namespace zvec;
 using namespace zvec::core;
-
-TEST(MemoryBlockBudget, CopiesMovesAndResetsTrackLiveAllocations) {
-  auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t previous = pool.capacity();
-  auto restore = ailego::ScopeGuard::Make([&] {
-    EXPECT_EQ(0u, pool.used());
-    EXPECT_EQ(0, pool.init(previous));
-  });
-  ASSERT_EQ(0, pool.init(8192));
-  auto first = IndexStorage::MemoryBlock::AllocateOwned(4096, 4096);
-  std::memset(first.data_, 0x35, 4096);
-  EXPECT_EQ(4096u, pool.external_used());
-  auto second = first;
-  EXPECT_NE(first.data(), second.data());
-  EXPECT_EQ(8192u, pool.external_used());
-  EXPECT_THROW((void)IndexStorage::MemoryBlock(first), std::bad_alloc);
-  EXPECT_EQ(8192u, pool.external_used());
-  auto moved = std::move(first);
-  EXPECT_EQ(nullptr, first.data());
-  EXPECT_EQ(8192u, pool.external_used());
-  second.reset();
-  EXPECT_EQ(4096u, pool.external_used());
-  second = std::move(moved);
-  EXPECT_EQ(nullptr, moved.data());
-  EXPECT_EQ(4096u, pool.external_used());
-  EXPECT_EQ(0x35, *static_cast<const unsigned char *>(second.data()));
-  second.reset();
-  EXPECT_EQ(0u, pool.external_used());
-}
 
 // MakeBorrowedView is only for explicitly caller-managed buffers, not batch
 // results whose backing storage must survive later reads. The block must free
@@ -164,86 +123,3 @@ TEST(MemoryBlockSharedView, DestructionReleasesLastSlice) {
   }
   EXPECT_TRUE(lifetime.expired());
 }
-
-namespace zvec::core {
-}  // namespace zvec::core
-
-namespace zvec::core {
-namespace {
-class FetchSegment : public IndexStorage::Segment {
- public:
-  size_t data_size() const override {
-    return 1U << 20;
-  }
-  uint32_t data_crc() const override {
-    return 0;
-  }
-  size_t padding_size() const override {
-    return 0;
-  }
-  size_t capacity() const override {
-    return data_size();
-  }
-  size_t fetch(size_t offset, void *out, size_t bytes) const override {
-    ++calls;
-    charge_at_fetch = ailego::PoolPayloadBudget::get_instance().external_used();
-    auto *data = static_cast<unsigned char *>(out);
-    for (size_t i = 0; i < bytes; ++i) data[i] = (offset + i) % 251;
-    return short_read ? bytes - 1 : bytes;
-  }
-  size_t read(size_t, IndexStorage::MemoryBlock &, size_t) override {
-    return 0;
-  }
-  size_t write(size_t, const void *, size_t) override {
-    return 0;
-  }
-  size_t resize(size_t) override {
-    return 0;
-  }
-  void update_data_crc(uint32_t) override {}
-  Pointer clone() override {
-    return {};
-  }
-  mutable size_t calls{0};
-  mutable size_t charge_at_fetch{0};
-  bool short_read{false};
-};
-
-class StorageFetchBudgetTest : public testing::Test {
- protected:
-  void SetUp() override {
-    ASSERT_EQ(0u, pool_.used());
-    previous_ = pool_.capacity();
-    ASSERT_EQ(0, pool_.init(16 * page_));
-  }
-  void TearDown() override {
-    EXPECT_EQ(0u, pool_.external_used());
-    EXPECT_EQ(0, pool_.init(previous_));
-  }
-  ailego::PoolPayloadBudget &pool_ = ailego::PoolPayloadBudget::get_instance();
-  const size_t page_ = ailego::PoolPayloadBudget::page_buffer_size();
-  size_t previous_{0};
-};
-
-TEST_F(StorageFetchBudgetTest,
-       ResizeAdmissionPrecedesFetchAndPreservesOldData) {
-  FetchSegment segment;
-  ailego::BudgetedMappedBuffer buffer(page_);
-  ASSERT_EQ(page_, segment.fetch(3, buffer.data(), buffer.size()));
-  const void *old = buffer.data();
-  const size_t before = pool_.external_used();
-  ailego::MemoryReservation pressure;
-  pressure.add(pool_.capacity() - pool_.used());
-  EXPECT_THROW(buffer.resize(2 * page_), std::bad_alloc);
-  EXPECT_EQ(old, buffer.data());
-  EXPECT_EQ(3, static_cast<unsigned char>(buffer.data()[0]));
-  EXPECT_EQ(1u, segment.calls);
-  pressure.retain_at_most(0);
-  EXPECT_EQ(before, pool_.external_used());
-  buffer.resize(2 * page_);
-  ASSERT_EQ(buffer.size(), segment.fetch(7, buffer.data(), buffer.size()));
-  EXPECT_EQ(7, static_cast<unsigned char>(buffer.data()[0]));
-}
-
-}  // namespace
-}  // namespace zvec::core

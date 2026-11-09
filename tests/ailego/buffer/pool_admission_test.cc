@@ -17,6 +17,10 @@
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
+#if defined(__APPLE__)
+#include <sys/mman.h>
+#include <TargetConditionals.h>
+#endif
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <sys/mman.h>
 #include <ailego/io/iouring_loader.h>
@@ -123,6 +127,51 @@ class PoolAdmissionTest : public testing::Test {
   const size_t page_ = MemoryLimitPool::page_buffer_size();
   size_t baseline_{0};
 };
+
+#if defined(__APPLE__) && TARGET_OS_OSX
+TEST_F(PoolAdmissionTest, NativeResidencyWitnessTracksDiscardReuseAndBusySample) {
+  ASSERT_EQ(0, pool_.init(64UL << 20));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  const auto release = [this](char *data) {
+    pool_.release_buffer(data, page_);
+  };
+  const auto acquire = [&] {
+    char *data = nullptr;
+    pool_.try_acquire_buffer(page_, data);
+    return std::unique_ptr<char, decltype(release)>(data, release);
+  };
+  auto page = acquire();
+  auto neighbor = acquire();
+  auto untouched = acquire();
+  ASSERT_NE(nullptr, page);
+  ASSERT_NE(nullptr, neighbor);
+  ASSERT_NE(nullptr, untouched);
+  std::memset(page.get(), 7, page_);
+  std::memset(neighbor.get(), 11, page_);
+  const auto full = MemoryLimitPoolTestPeer::slab_resident_sample();
+  ASSERT_EQ(3 * page_, full.owned_resident);  // Header and both touched pages.
+  const auto busy = MemoryLimitPoolTestPeer::sample_with_slab_lock(pool_);
+  EXPECT_GT(busy.rss, 0u);
+  EXPECT_EQ(0u, busy.owned_resident);
+  char *address = page.get();
+  page.reset();
+  const size_t charge = pool_.capacity() - pool_.used();
+  ASSERT_TRUE(pool_.try_charge_external(charge));
+  char residency = 0;
+  EXPECT_EQ(0, ::mincore(address, page_, &residency));
+  EXPECT_EQ(0, residency & 1);
+  const auto discarded = MemoryLimitPoolTestPeer::slab_resident_sample();
+  EXPECT_EQ(page_, full.owned_resident - discarded.owned_resident);
+  EXPECT_EQ(11, neighbor.get()[page_ - 1]);
+  pool_.release_external(charge);
+  page.reset(acquire().release());
+  ASSERT_NE(nullptr, page);
+  std::memset(page.get(), 13, page_);
+  const auto reused = MemoryLimitPoolTestPeer::slab_resident_sample();
+  EXPECT_EQ(full.owned_resident, reused.owned_resident);
+  EXPECT_LE(reused.owned_resident, reused.rss);
+}
+#endif
 
 TEST_F(PoolAdmissionTest, FixedConsumersRejectPendingPageReservations) {
   // Plain function wrappers also work under ARM64 UBSan's indirect-call

@@ -37,11 +37,7 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
         continue()
     endif()
     set(TEST_LIBRARY zvec_common)
-    if(CC_TARGET STREQUAL "result_memory_allowance_test")
-        # This regression now exercises Arrow results and Doc conversion,
-        # which need the complete DB target and its transitive dependencies.
-        set(TEST_LIBRARY zvec)
-    elseif(CC_TARGET STREQUAL "native_image_memory_macos_test" OR
+    if(CC_TARGET STREQUAL "native_image_memory_macos_test" OR
            CC_TARGET STREQUAL "native_image_memory_windows_test")
         # Exercise the real reservation pool without unrelated DB components.
         set(TEST_LIBRARY zvec_ailego)

@@ -35,9 +35,4 @@ ZVEC_HELPER_DLL_EXPORT void zvec_test_dso_release_external(size_t bytes) {
   zvec::ailego::MemoryLimitPool::get_instance().release_external(bytes);
 }
 
-ZVEC_HELPER_DLL_EXPORT bool zvec_test_dso_rss_pressure() {
-  return zvec::ailego::MemoryLimitPool::get_instance()
-      .under_process_rss_pressure();
-}
-
 }  // extern "C"

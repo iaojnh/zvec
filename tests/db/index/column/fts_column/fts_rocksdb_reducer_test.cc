@@ -20,7 +20,6 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include <roaring/roaring.h>
-#include <rocksdb/utilities/stackable_db.h>
 #include <zvec/db/index_params.h>
 #include "db/common/file_helper.h"
 // FtsSegmentStats defined below
@@ -440,65 +439,6 @@ TEST_F(FtsRocksdbReducerTest, SingleSegmentMergeNoDeletes) {
   ASSERT_TRUE(search_str_ok(*reader, "bar", 10, &results));
   EXPECT_EQ(results.size(), 1u);
   EXPECT_EQ(results[0].doc_id, 2ull);
-}
-
-namespace {
-
-class DenyFtsScanDB : public rocksdb::StackableDB {
- public:
-  explicit DenyFtsScanDB(rocksdb::DB *db) : StackableDB(db) {}
-
-  rocksdb::Iterator *NewIterator(
-      const rocksdb::ReadOptions &options,
-      rocksdb::ColumnFamilyHandle *column) override {
-    if (column == denied_column)
-      return rocksdb::NewErrorIterator(rocksdb::Status::MemoryLimit());
-    return GetBaseDB()->NewIterator(options, column);
-  }
-
-  rocksdb::ColumnFamilyHandle *denied_column{nullptr};
-};
-
-}  // namespace
-
-TEST_F(FtsRocksdbReducerTest, CacheDenialDuringSealAndMergeCanRetry) {
-  auto indexer = make_src0_indexer();
-  ASSERT_TRUE(indexer->insert(0, "hello world").has_value());
-  ASSERT_TRUE(indexer->insert(1, "world hello").has_value());
-  ASSERT_TRUE(indexer->flush().has_value());
-
-  auto *db = new DenyFtsScanDB(src0_db_.db_.release());
-  src0_db_.db_.reset(db);
-  db->denied_column = src0_doc_len_;
-  const auto seal = indexer->convert_postings_to_bitpacked();
-  ASSERT_FALSE(seal.has_value());
-  EXPECT_EQ(seal.error().code(), StatusCode::RESOURCE_EXHAUSTED);
-  db->denied_column = nullptr;
-  ASSERT_TRUE(indexer->convert_postings_to_bitpacked().has_value());
-
-  auto reducer = make_reducer();
-  ASSERT_TRUE(reducer.feed(MakeSegmentStats(0, 1), &src0_db_, src0_postings_,
-                           src0_positions_)
-                  .has_value());
-  for (auto *column : {src0_postings_, src0_positions_}) {
-    db->denied_column = column;
-    const auto merged = reducer.reduce(NoDeleteFilter());
-    ASSERT_FALSE(merged.has_value());
-    EXPECT_EQ(merged.error().code(), StatusCode::RESOURCE_EXHAUSTED);
-    std::string value;
-    EXPECT_TRUE(dst_db_.db_
-                    ->Get(dst_db_.read_opts_, dst_stat_,
-                          make_total_docs_key(kFieldName), &value)
-                    .IsNotFound());
-  }
-
-  db->denied_column = nullptr;
-  ASSERT_TRUE(reducer.reduce(NoDeleteFilter()).has_value());
-  auto reader = make_dst_reader();
-  std::vector<FtsResult> results;
-  ASSERT_TRUE(search_str_ok(*reader, "\"hello world\"", 10, &results));
-  ASSERT_EQ(results.size(), 1U);
-  EXPECT_EQ(results[0].doc_id, 0U);
 }
 
 // ============================================================

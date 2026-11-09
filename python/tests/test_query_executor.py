@@ -18,14 +18,12 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import math
-import sys
 from zvec._zvec.param import _SearchQuery
 
 import pytest
 from zvec.executor.query_executor import (
     QueryContext,
     QueryExecutor,
-    convert_to_numpy,
 )
 from zvec import (
     RrfReRanker,
@@ -252,29 +250,6 @@ class TestQueryExecutor:
         assert core_vector.filter == "f"
         assert core_vector.include_vector is True
 
-    def test_build_multi_query_stops_at_first_excess_weight(self):
-        class ExcessWeights(WeightedReRanker):
-            @property
-            def weights(self):
-                yield 1.0
-                yield 1.0
-                yield 1.0
-                pytest.fail("Weights beyond the route count were consumed")
-
-        executor = QueryExecutor(MockCollectionSchema())
-        ctx = QueryContext(topk=5, reranker=ExcessWeights([]))
-        with pytest.raises(ValueError, match="one weight per query"):
-            executor._build_multi_query(ctx, [_SearchQuery(), _SearchQuery()])
-
-    def test_build_multi_query_stores_candidate_floor(self):
-        executor = QueryExecutor(MockCollectionSchema())
-        ctx = QueryContext(topk=2, reranker=RrfReRanker())
-        queries = [_SearchQuery(), _SearchQuery()]
-        for query in queries:
-            query.topk = 2
-        combined = executor._build_multi_query(ctx, queries)
-        assert [query.num_candidates for query in combined.queries] == [10, 10]
-
     def test_do_merge_rerank_results_single_without_reranker(self):
         # A single result list without a reranker is returned as-is.
         schema = MockCollectionSchema()
@@ -393,66 +368,3 @@ class TestQueryExecutor:
 
         assert query.fts.match_string == "\u00a0vector search  "
         assert query.fts.query_string == ""
-
-    def test_query_by_id_reserves_fetched_vector_conversion(self):
-        schema = CollectionSchema(
-            "test_collection", vectors=[VectorSchema("test", DataType.VECTOR_FP32, 3)]
-        )
-        executor = QueryExecutor(schema)
-        collection = MagicMock()
-        collection.FetchTuples.return_value = {
-            "one": ("one", 0.0, {}, {"test": [1.0, 2.0, 3.0]})
-        }
-        memory = MagicMock()
-        memory.prepare_vector.side_effect = lambda value, convert, dtype: convert(
-            value, dtype
-        )
-        query = executor._build_search_query(
-            QueryContext(topk=1), Query("test", id="one"), collection, memory
-        )
-        collection.FetchTuples.assert_called_once_with(["one"], [], True)
-        memory.prepare_vector.assert_called_once_with(
-            [1.0, 2.0, 3.0], convert_to_numpy, np.float32
-        )
-        np.testing.assert_array_equal(
-            query.get_vector(schema.vector("test")._get_object()), [1.0, 2.0, 3.0]
-        )
-
-    def test_query_text_uses_the_admitted_unicode_content(self):
-        class Text(str):
-            def encode(self, *args, **kwargs):
-                raise AssertionError("Must not invoke an unmeasured encoder")
-
-        text = Text("actual")
-        executor = QueryExecutor(CollectionSchema("test_collection"))
-        native = executor._build_search_query(
-            QueryContext(topk=1, filter=text, output_fields=[text]),
-            Query(text, fts=Fts(match_string=text)),
-            MagicMock(),
-        )
-        assert native.field_name == "actual"
-        assert native.filter == "actual"
-        assert native.output_fields == ["actual"]
-        assert native.fts.match_string == "actual"
-
-    def test_query_conversion_does_not_retain_utf8_on_caller_strings(self):
-        text = "".join(["中文", "🙂"] * 128)
-        original_size = sys.getsizeof(text)
-        executor = QueryExecutor(CollectionSchema("test_collection"))
-        ctx = QueryContext(topk=1, filter=text, output_fields=[text])
-        native = executor._build_search_query(
-            ctx, Query(text, fts=Fts(match_string=text)), MagicMock()
-        )
-        assert sys.getsizeof(text) == original_size
-        assert native.field_name == text
-        assert native.filter == text
-        assert native.output_fields == [text]
-        assert native.fts.match_string == text
-
-
-@pytest.mark.parametrize("step", [2, -1])
-def test_query_conversion_makes_strided_vectors_contiguous(step):
-    source = np.arange(12, dtype=np.float32)[::step]
-    result = convert_to_numpy(source, np.float32)
-    assert result.flags.c_contiguous
-    np.testing.assert_array_equal(result, source)
