@@ -42,7 +42,7 @@ class ZVEC_CORE_API ChunkReadStorage : public IndexStorage {
   struct State;
   class ReadSegment;
   std::shared_ptr<State> state_;
-  size_t chunk_bytes_{256UL << 10};
+  size_t chunk_bytes_{0};
   size_t cache_bytes_{std::numeric_limits<size_t>::max()};
   size_t max_read_bytes_{4UL << 20};
   size_t workspace_count_{8};

@@ -433,6 +433,7 @@ class IVFEntity {
   //! Members
   IndexMeta meta_{};
   mutable IVFReformerWrapper reformer_{};
+  mutable IndexStorage::Segment::ScatterBlock scatter_data_{};
   IVFDistanceCalculator::Pointer calculator_{};
   turbo::Quantizer::Pointer quantizer_{};
   // Legacy rows are already encoded. This helper only supplies distance

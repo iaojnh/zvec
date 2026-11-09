@@ -422,6 +422,17 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                                  ProcessRssBudget::MaterializationStamp stamp);
   void release_unmapped_cache(size_t bytes,
                               ProcessRssBudget::MaterializationStamp stamp);
+  // Variable-sized, page-aligned cache backing. Returning a buffer releases
+  // logical occupancy; idle backing remains committed until physically freed.
+  struct CacheBuffer {
+    uint8_t *data{nullptr};
+    size_t bytes{0};
+    CacheBuffer *next{nullptr};
+    ProcessRssBudget::MaterializationStamp stamp{};
+    ProcessRssBudget::MaterializationStamp creation{};
+  };
+  CacheBuffer *try_acquire_cache_buffer(size_t bytes);
+  void release_cache_buffer(CacheBuffer *buffer);
   void request_cache_reclaim(size_t bytes);
 
   void release_metadata(const size_t buffer_size);
@@ -635,6 +646,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool trim_idle_buffers();
   void reclaim_process_cache();
   size_t trim_retained_blocks(size_t bytes_needed);
+  size_t trim_cache_buffers(size_t bytes_needed);
   size_t pick_shard();
 
   // Reclaim in the background to keep eviction off foreground allocations.
@@ -719,6 +731,13 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<size_t> retained_block_bytes_{0};
   std::atomic<size_t> retained_idle_bytes_{0};
   std::atomic<uint64_t> retained_block_reuses_{0};
+
+  struct CacheBufferBin {
+    std::mutex mutex;
+    CacheBuffer *head{nullptr};
+  };
+  std::array<CacheBufferBin, 64> cache_buffer_bins_{};
+  std::atomic<size_t> cache_idle_bytes_{0};
 
   FreeShard free_shards_[kNumFreeShards];
   std::atomic<size_t> shard_seq_{0};

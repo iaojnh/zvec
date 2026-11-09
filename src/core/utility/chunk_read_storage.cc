@@ -86,12 +86,34 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     std::atomic<uint8_t> priority{0};
     std::atomic<uint32_t> requests{0};
     bool valid{false}, ever_loaded{false};
-    ailego::ProcessRssBudget::MaterializationStamp stamp{};
+    size_t offset{0}, bytes{0};
+    Pool::CacheBuffer *buffer{nullptr};
+    std::atomic<size_t> capacity{0};
   };
   static constexpr size_t kEntries = 256;
   struct TableSegment {
     MetadataCharge charge{sizeof(TableSegment), true};
     std::array<Entry, kEntries> entries;
+  };
+  struct Layout {
+    explicit Layout(size_t count)
+        : charge(sizeof(Layout) + count * sizeof(Entry)),
+          entries(new Entry[count]), size(count) {}
+    MetadataCharge charge;
+    std::unique_ptr<Entry[]> entries;
+    size_t size;
+    std::unique_ptr<Layout> next;
+    Entry *find(size_t offset) const {
+      size_t lo = 0, hi = size;
+      while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (entries[mid].offset <= offset) lo = mid + 1;
+        else hi = mid;
+      }
+      if (!lo) return nullptr;
+      auto *item = &entries[lo - 1];
+      return offset - item->offset < item->bytes ? item : nullptr;
+    }
   };
   struct View {
     std::atomic<bool> busy{false};
@@ -99,17 +121,22 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     std::unique_ptr<WorkspaceBuffer> workspace;
     ailego::BudgetedVector<size_t> pins;
   };
-  struct Lease {
+  struct Lease : Segment::ScatterBlock::Workspace {
     Lease(std::shared_ptr<State> owner_arg, View *view_arg, Entry *single_arg)
         : owner(std::move(owner_arg)), view(view_arg), single(single_arg) {}
-    ~Lease() {
+    ~Lease() override { reset(); }
+    void reset() noexcept override {
       if (single) owner->unpin(*single, single_key);
       if (view) {
-        for (size_t key : view->pins) owner->unpin(*owner->entry(key, false), key);
+        for (size_t key : view->pins)
+          owner->unpin(*reinterpret_cast<Entry *>(key), key);
         view->pins.clear();
         view->busy.store(false, std::memory_order_release);
         owner->changed.notify_one();
       }
+      single = nullptr;
+      view = nullptr;
+      owner.reset();
     }
     std::shared_ptr<State> owner;
     View *view;
@@ -119,6 +146,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
 
   ~State() override {
     if (registered) ailego::BlockEvictionQueue::get_instance().set_invalid(this);
+    for (auto *layout = layouts.get(); layout; layout = layout->next.get())
+      for (size_t i = 0; i < layout->size; ++i)
+        release_backing(layout->entries[i]);
     for (size_t i = 0; table && i < table_count; ++i) {
       auto *segment = table[i].load(std::memory_order_relaxed);
       if (!segment) continue;
@@ -136,7 +166,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     if (!meta_file.open(file_path, true, false)) return false;
     if (!data_file.open(file_path, true, direct)) {
       if (!direct || !data_file.open(file_path, true, false)) return false;
+      direct = false;
     }
+    // F_NOCACHE accepts unaligned requests on macOS, but page-aligned I/O
+    // also avoids its slower partial-page path. Logical chunk bounds remain
+    // independent of this physical prefix/suffix padding.
+    io_alignment = direct ? ailego::MemoryHelper::PageSize() : 1;
 #if !defined(_WIN32)
     struct stat a{}, b{};
     if (::fstat(meta_file.native_handle(), &a) ||
@@ -211,6 +246,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       if (!segment) {
         try { segment = new TableSegment(); }
         catch (const std::bad_alloc &) { return nullptr; }
+        for (size_t i = 0; i < kEntries; ++i) {
+          auto &item = segment->entries[i];
+          item.offset = (key / kEntries * kEntries + i) * chunk_bytes;
+          item.bytes = item.offset < file_size
+              ? std::min(chunk_bytes, file_size - item.offset) : 0;
+        }
         table_metadata.fetch_add(sizeof(TableSegment), std::memory_order_relaxed);
         slot.store(segment, std::memory_order_release);
       }
@@ -255,18 +296,19 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return nullptr;
   }
   bool release_backing(Entry &item) {
-    auto *data = item.data.load(std::memory_order_relaxed);
-    if (!data) return true;
-    if (!ailego::File::TryMemoryUnmap(data, chunk_bytes)) return false;
+    if (!item.buffer) return true;
+    const size_t bytes = item.capacity.load(std::memory_order_relaxed);
+    Pool::get_instance().release_cache_buffer(item.buffer);
+    item.buffer = nullptr;
     item.data.store(nullptr, std::memory_order_relaxed);
-    Pool::get_instance().release_unmapped_cache(chunk_bytes, item.stamp);
-    cache_bytes.fetch_sub(chunk_bytes, std::memory_order_relaxed);
+    item.capacity.store(0, std::memory_order_relaxed);
+    cache_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     return true;
   }
-  bool claim_capacity() {
+  bool claim_capacity(size_t count) {
     size_t bytes = cache_bytes.load(std::memory_order_relaxed);
-    while (bytes <= cache_limit && chunk_bytes <= cache_limit - bytes) {
-      if (cache_bytes.compare_exchange_weak(bytes, bytes + chunk_bytes,
+    while (bytes <= cache_limit && count <= cache_limit - bytes) {
+      if (cache_bytes.compare_exchange_weak(bytes, bytes + count,
                                              std::memory_order_relaxed))
         return true;
     }
@@ -281,8 +323,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     io_bytes.fetch_add(got, std::memory_order_relaxed);
     return got >= required;
   }
-  Entry *cached(size_t key) {
-    auto *item = entry(key, cache_limit != 0);
+  Entry *cached(Entry *item) {
+    const size_t key = reinterpret_cast<size_t>(item);
     if (!item) { misses.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     if (pin(*item, key)) return item;
     misses.fetch_add(1, std::memory_order_relaxed);
@@ -291,30 +333,28 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     if (!item->refs.compare_exchange_strong(expected, kLoading,
                                               std::memory_order_acq_rel))
       return nullptr;  // Another loader/evictor owns this residency cycle.
-    if (!claim_capacity()) {
+    const size_t physical = item->offset / io_alignment * io_alignment;
+    const size_t requested =
+        (item->offset + item->bytes - physical + io_alignment - 1) /
+        io_alignment * io_alignment;
+    const size_t capacity = AlignPage(requested);
+    if (!claim_capacity(capacity)) {
       item->refs.store(kUnloaded, std::memory_order_release);
       return nullptr;
     }
-    Pool::PendingAllocation pending(Pool::get_instance(),
-                                    Pool::PendingAllocation::Kind::kEvictableCache);
-    if (!pending.reserve(chunk_bytes)) {
-      cache_bytes.fetch_sub(chunk_bytes, std::memory_order_relaxed);
+    auto *buffer = Pool::get_instance().try_acquire_cache_buffer(capacity);
+    if (!buffer) {
+      cache_bytes.fetch_sub(capacity, std::memory_order_relaxed);
       item->refs.store(kUnloaded, std::memory_order_release);
-      if (requests != 0) Pool::get_instance().request_cache_reclaim(chunk_bytes);
+      if (requests != 0) Pool::get_instance().request_cache_reclaim(capacity);
       return nullptr;
     }
-    auto *data = static_cast<uint8_t *>(ailego::File::MemoryMap(chunk_bytes, 0));
-    if (!data) {
-      cache_bytes.fetch_sub(chunk_bytes, std::memory_order_relaxed);
-      item->refs.store(kUnloaded, std::memory_order_release);
-      return nullptr;
-    }
-    const auto stamp = pending.commit_mapping();
-    const size_t offset = key * chunk_bytes;
-    const bool valid = read_data(offset, chunk_bytes, data,
-                                  std::min(chunk_bytes, file_size - offset));
-    item->data.store(data, std::memory_order_relaxed);
-    item->stamp = stamp;
+    const bool valid = read_data(physical, requested, buffer->data,
+                                  item->offset + item->bytes - physical);
+    item->buffer = buffer;
+    item->capacity.store(capacity, std::memory_order_relaxed);
+    item->data.store(buffer->data + item->offset - physical,
+                      std::memory_order_relaxed);
     item->valid = valid;
     if (!valid && release_backing(*item)) {
       item->refs.store(kUnloaded, std::memory_order_release);
@@ -376,11 +416,20 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return true;
     } catch (const std::bad_alloc &) { return false; }
   }
-  std::shared_ptr<Lease> lease(View *view, Entry *single = nullptr,
+  std::shared_ptr<Lease> lease(Segment::ScatterBlock &out, View *view,
+                               Entry *single = nullptr,
                                size_t key = 0) {
     try {
-      auto result = std::allocate_shared<Lease>(
-          ailego::BudgetedAllocator<Lease>{}, shared_from_this(), view, single);
+      auto result = std::dynamic_pointer_cast<Lease>(out.workspace);
+      if (result) {
+        result->owner = shared_from_this();
+        result->view = view;
+        result->single = single;
+      } else {
+        result = std::allocate_shared<Lease>(
+            ailego::BudgetedAllocator<Lease>{}, shared_from_this(), view, single);
+        out.workspace = result;
+      }
       result->single_key = key;
       return result;
     } catch (...) {
@@ -389,18 +438,22 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       throw;
     }
   }
-  size_t scatter(size_t offset, size_t len, Segment::ScatterBlock &out) {
+  size_t scatter(size_t offset, size_t len, Segment::ScatterBlock &out,
+                 Layout *layout = nullptr) {
     out.reset();
     if (!len || offset > file_size || len > file_size - offset ||
         len > (adaptive ? (1UL << 30) : max_read_bytes)) return 0;
-    const size_t first = offset / chunk_bytes;
-    const size_t last = (offset + len - 1) / chunk_bytes;
-    const size_t count = last - first + 1;
-    if (count == 1) {
+    const auto locate = [&](size_t position) -> Entry * {
+      return layout ? layout->find(position)
+                    : entry(position / chunk_bytes, cache_limit != 0);
+    };
+    auto *first = locate(offset);
+    const bool single = first && len <= first->bytes - (offset - first->offset);
+    if (single) {
       if (auto *item = cached(first)) {
-        out.lease = lease(nullptr, item, first);
+        out.lease = lease(out, nullptr, item, reinterpret_cast<size_t>(item));
         out.spans.push_back({item->data.load(std::memory_order_relaxed) +
-                            offset % chunk_bytes, len});
+                            offset - item->offset, len});
         out.size = len;
         return len;
       }
@@ -408,39 +461,43 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     const size_t page = ailego::MemoryHelper::PageSize();
     auto *view = acquire_view(len + 2 * page);
     if (!view) return 0;
-    auto owner = lease(view);
+    auto owner = lease(out, view);
     out.lease = owner;
-    out.spans.reserve(count);
-    const size_t physical_base = offset / page * page;
-    size_t run_first = 0, run_count = 0;
+    out.spans.reserve(single ? 1 : len / chunk_bytes + 2);
+    const size_t physical_base = offset / io_alignment * io_alignment;
+    size_t run_first = 0, run_end = 0;
     const auto finish_run = [&]() {
-      if (!run_count) return true;
+      if (run_first == run_end) return true;
       if (!ensure_workspace(*view, len + 2 * page)) return false;
-      const size_t begin = std::max(run_first * chunk_bytes, offset);
-      const size_t end = std::min((run_first + run_count) * chunk_bytes, offset + len);
-      const size_t physical = begin / page * page;
-      const size_t requested = AlignPage(end - physical);
+      const size_t begin = run_first, end = run_end;
+      const size_t physical = begin / io_alignment * io_alignment;
+      const size_t requested = (end - physical + io_alignment - 1) /
+                               io_alignment * io_alignment;
       auto *destination = view->workspace->data + physical - physical_base;
       if (!read_data(physical, requested, destination, end - physical)) return false;
       out.spans.push_back({destination + begin - physical, end - begin});
-      run_count = 0;
+      run_first = run_end = 0;
       return true;
     };
-    for (size_t key = first; key <= last; ++key) {
-      Entry *item = count == 1 ? nullptr : cached(key);
+    for (size_t begin = offset; begin < offset + len;) {
+      Entry *source = locate(begin);
+      const size_t end = source
+          ? std::min(source->offset + source->bytes, offset + len)
+          : std::min((begin / chunk_bytes + 1) * chunk_bytes, offset + len);
+      Entry *item = single ? nullptr : cached(source);
       if (item) {
         // Record the pin before any descriptor growth or I/O can throw.
+        const size_t key = reinterpret_cast<size_t>(item);
         try { view->pins.push_back(key); }
         catch (...) { unpin(*item, key); throw; }
         if (!finish_run()) { out.reset(); return 0; }
-        const size_t begin = std::max(key * chunk_bytes, offset);
-        const size_t end = std::min((key + 1) * chunk_bytes, offset + len);
         out.spans.push_back({item->data.load(std::memory_order_relaxed) +
-                            begin - key * chunk_bytes, end - begin});
+                            begin - item->offset, end - begin});
       } else {
-        if (!run_count) run_first = key;
-        ++run_count;
+        if (run_first == run_end) run_first = begin;
+        run_end = end;
       }
+      begin = end;
     }
     if (!finish_run()) { out.reset(); return 0; }
     out.size = len;
@@ -449,23 +506,23 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
 
   bool is_dead_block(ailego::eviction_key_t key,
                      ailego::version_t generation) override {
-    auto *item = entry(key, false);
-    return generation != version || !item ||
+    if (generation != version) return true;
+    auto *item = reinterpret_cast<Entry *>(key);
+    return !item ||
            !item->queued.load(std::memory_order_relaxed);
   }
   uint8_t eviction_priority(ailego::eviction_key_t key) const override {
-    if (key >= chunks) return 0;
-    auto *segment = table[key / kEntries].load(std::memory_order_acquire);
-    return segment ? segment->entries[key % kEntries].priority.load(
-                         std::memory_order_relaxed) : 0;
+    auto *item = reinterpret_cast<Entry *>(key);
+    return item ? item->priority.load(std::memory_order_relaxed) : 0;
   }
-  size_t eviction_bytes(ailego::eviction_key_t) const override {
-    return chunk_bytes;
+  size_t eviction_bytes(ailego::eviction_key_t key) const override {
+    auto *item = reinterpret_cast<Entry *>(key);
+    return item ? item->capacity.load(std::memory_order_relaxed) : 0;
   }
   void eviction_requeue_failed(ailego::eviction_key_t key,
                                 ailego::version_t generation) override {
     if (generation != version) return;
-    if (auto *item = entry(key, false)) {
+    if (auto *item = reinterpret_cast<Entry *>(key)) {
       item->queued.store(false, std::memory_order_relaxed);
       recovery_needed.store(true, std::memory_order_release);
       // A failed queue allocation must not strand an idle mapping. Pinned
@@ -486,24 +543,29 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   size_t recover_eviction_queue() override {
     if (!recovery_needed.exchange(false, std::memory_order_acq_rel)) return 0;
     size_t recovered = 0;
+    const auto recover = [&](Entry &item) {
+      if (item.refs.load(std::memory_order_acquire) != 0) return;
+      bool expected = false;
+      if (item.queued.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
+        enqueue(item, reinterpret_cast<size_t>(&item));
+        ++recovered;
+      }
+    };
     for (size_t segment_id = 0; segment_id < table_count; ++segment_id) {
       auto *segment = table[segment_id].load(std::memory_order_acquire);
       if (!segment) continue;
       for (size_t i = 0; i < kEntries; ++i) {
-        auto &item = segment->entries[i];
-        if (item.refs.load(std::memory_order_acquire) != 0) continue;
-        bool expected = false;
-        if (item.queued.compare_exchange_strong(expected, true,
-                                                 std::memory_order_acq_rel)) {
-          enqueue(item, segment_id * kEntries + i);
-          ++recovered;
-        }
+        recover(segment->entries[i]);
       }
     }
+    std::lock_guard<std::mutex> lock(table_mutex);
+    for (auto *layout = layouts.get(); layout; layout = layout->next.get())
+      for (size_t i = 0; i < layout->size; ++i) recover(layout->entries[i]);
     return recovered;
   }
   bool evict_block(ailego::eviction_key_t key) override {
-    auto *item = entry(key, false);
+    auto *item = reinterpret_cast<Entry *>(key);
     if (!item) return false;
     int expected = 0;
     if (!item->refs.compare_exchange_strong(expected, kEvicting,
@@ -534,6 +596,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
 
   ailego::File data_file, meta_file;
   size_t file_size{0}, chunk_bytes{0}, max_read_bytes{0}, wait_ms{0};
+  size_t io_alignment{1};
   size_t index_offset{0}, metadata_charge{0}, cache_limit{0};
   size_t chunks{0}, table_count{0};
   uint32_t file_magic{0};
@@ -541,6 +604,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   IndexUnpacker::SegmentMap segments;
   std::unique_ptr<MetadataCharge> metadata_owner;
   std::unique_ptr<std::atomic<TableSegment *>[]> table;
+  std::unique_ptr<Layout> layouts;
   std::vector<std::unique_ptr<View>> views;
   std::mutex table_mutex, wait_mutex;
   std::condition_variable changed;
@@ -569,8 +633,34 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
   size_t read_scatter(size_t offset, ScatterBlock &out, size_t len) override {
     if (offset > capacity()) { out.reset(); return 0; }
     return state_->scatter(offset_ + offset,
-                            std::min(len, capacity() - offset), out);
+                            std::min(len, capacity() - offset), out, layout_);
   }
+  bool supports_read_chunks() const override { return true; }
+  int set_read_chunks(const ReadChunks &chunks) override try {
+    if (layout_) return IndexError_InvalidArgument;
+    if (chunks.size() > (std::numeric_limits<size_t>::max() - sizeof(State::Layout)) /
+                            sizeof(State::Entry))
+      return IndexError_NoMemory;
+    size_t end = 0;
+    for (const auto &chunk : chunks) {
+      if (!chunk.size || chunk.offset < end || chunk.offset > size_ ||
+          chunk.size > size_ - chunk.offset) return IndexError_InvalidArgument;
+      end = chunk.offset + chunk.size;
+    }
+    auto layout = std::make_unique<State::Layout>(chunks.size());
+    for (size_t i = 0; i < chunks.size(); ++i) {
+      layout->entries[i].offset = offset_ + chunks[i].offset;
+      layout->entries[i].bytes = chunks[i].size;
+    }
+    std::lock_guard<std::mutex> lock(state_->table_mutex);
+    const size_t charged = layout->charge.bytes;
+    auto *published = layout.get();
+    layout->next = std::move(state_->layouts);
+    state_->layouts = std::move(layout);
+    state_->table_metadata.fetch_add(charged);
+    layout_ = published;
+    return 0;
+  } catch (const std::bad_alloc &) { return IndexError_NoMemory; }
   size_t read(size_t offset, MemoryBlock &out, size_t len) override {
     out.reset();
     ScatterBlock block;
@@ -584,7 +674,8 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     auto owner = std::static_pointer_cast<State::Lease>(block.lease);
     const size_t page = ailego::MemoryHelper::PageSize();
     if (!state_->ensure_workspace(*owner->view, got + 2 * page)) return 0;
-    auto *destination = owner->view->workspace->data + (offset_ + offset) % page;
+    auto *destination = owner->view->workspace->data +
+                        (offset_ + offset) % state_->io_alignment;
     size_t copied = 0;
     for (const auto &span : block.spans) {
       std::memmove(destination + copied, span.data, span.size);
@@ -601,7 +692,7 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     while (done < len) {
       ScatterBlock block;
       const size_t count = std::min(len - done, state_->max_read_bytes);
-      if (state_->scatter(offset_ + offset + done, count, block) != count)
+      if (state_->scatter(offset_ + offset + done, count, block, layout_) != count)
         return done;
       size_t cursor = done;
       for (const auto &span : block.spans) {
@@ -623,9 +714,11 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
   std::shared_ptr<State> state_;
   size_t offset_, size_, padding_;
   uint32_t crc_;
+  State::Layout *layout_{nullptr};
 };
 
-ChunkReadStorage::ChunkReadStorage() = default;
+ChunkReadStorage::ChunkReadStorage()
+    : chunk_bytes_(ailego::MemoryHelper::PageSize()) {}
 ChunkReadStorage::~ChunkReadStorage() = default;
 int ChunkReadStorage::init(const ailego::Params &params) {
   params.get(CHUNK_READ_STORAGE_CHUNK_BYTES, &chunk_bytes_);
@@ -639,6 +732,7 @@ int ChunkReadStorage::init(const ailego::Params &params) {
   params.get(BUFFER_READ_STORAGE_FOOTER_OFFSET, &footer_offset_);
   params.get(BUFFER_READ_STORAGE_CHECKSUM_VALIDATION, &checksum_);
   const size_t page = ailego::MemoryHelper::PageSize();
+  if (!chunk_bytes_) chunk_bytes_ = page;
   if (chunk_bytes_ < page || chunk_bytes_ % page ||
       (chunk_bytes_ & (chunk_bytes_ - 1)) || workspace_count_ == 0 ||
       workspace_count_ > 1024 || max_read_bytes_ == 0 ||

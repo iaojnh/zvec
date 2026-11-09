@@ -24,6 +24,7 @@
 #include <ailego/utility/memory_helper.h>
 #include <ailego/utility/mobile_memory.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 
 #if defined(_WIN32)
@@ -1341,7 +1342,9 @@ size_t MemoryLimitPool::trim_free_buffers(size_t bytes_needed) {
     return 0;
   }
 
-  size_t released_bytes = trim_retained_blocks(bytes_needed);
+  size_t released_bytes = trim_cache_buffers(bytes_needed);
+  if (released_bytes < bytes_needed)
+    released_bytes += trim_retained_blocks(bytes_needed - released_bytes);
   size_t shard = pick_shard();
   while (released_bytes < bytes_needed) {
     char *buffer = pop_free_buffer(shard);
@@ -1363,7 +1366,8 @@ bool MemoryLimitPool::trim_idle_buffers() {
   // reserve, not the historical high-water allocation of a finished build.
   // The counters are only a hint: pop/unmap still obtains exclusive ownership
   // before discarding backing and refunding committed capacity.
-  size_t idle = retained_idle_bytes_.load(std::memory_order_relaxed);
+  size_t idle = retained_idle_bytes_.load(std::memory_order_relaxed) +
+                cache_idle_bytes_.load(std::memory_order_relaxed);
   for (const auto &shard : free_shards_) {
     idle += shard.count.load(std::memory_order_relaxed) * page_buffer_size();
   }
@@ -1454,6 +1458,8 @@ int MemoryLimitPool::init(size_t pool_size) {
       pool_size_.load(std::memory_order_relaxed) == pool_size) {
     return 0;
   }
+  // Idle cache descriptors are allocator metadata, not active owners.
+  trim_cache_buffers(std::numeric_limits<size_t>::max());
   const size_t used = used_size_.load(std::memory_order_relaxed);
   const size_t external = external_used_size_.load(std::memory_order_relaxed);
   const size_t metadata = metadata_used_size_.load(std::memory_order_relaxed);
@@ -2197,6 +2203,133 @@ void MemoryLimitPool::request_cache_reclaim(size_t bytes) {
          !cache_reclaim_requested_.compare_exchange_weak(
              previous, bytes, std::memory_order_relaxed)) {}
   bg_cv_.notify_one();
+}
+
+MemoryLimitPool::CacheBuffer *MemoryLimitPool::try_acquire_cache_buffer(
+    size_t bytes) {
+  const size_t page = page_buffer_size();
+  if (!bytes || bytes > std::numeric_limits<size_t>::max() - (page - 1))
+    return nullptr;
+  bytes = (bytes + page - 1) / page * page;
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  process_rss_.refresh();
+  const size_t used = this->used(), limit = high_watermark();
+  if (process_rss_.pressure() || workspace_waiting_size_.load() != 0 ||
+      used > limit || bytes > limit - used ||
+      sizeof(CacheBuffer) > limit - used - bytes || !try_reserve_used(bytes))
+    return nullptr;
+  auto &bin = cache_buffer_bins_[(bytes / page) % cache_buffer_bins_.size()];
+  {
+    std::lock_guard<std::mutex> lock(bin.mutex);
+    for (auto **link = &bin.head; *link; link = &(*link)->next) {
+      auto *buffer = *link;
+      if (buffer->bytes != bytes) continue;
+      if (!try_reserve_used(sizeof(CacheBuffer))) {
+        release_buffer(nullptr, bytes);
+        return nullptr;
+      }
+      if (!process_rss_.try_materialize_reusable(bytes, buffer->stamp)) {
+        release_buffer(nullptr, bytes + sizeof(CacheBuffer));
+        return nullptr;
+      }
+      *link = buffer->next;
+      buffer->next = nullptr;
+      cache_idle_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+      external_used_size_.fetch_add(bytes, std::memory_order_relaxed);
+      evictable_cache_size_.fetch_add(bytes, std::memory_order_relaxed);
+      metadata_used_size_.fetch_add(sizeof(CacheBuffer), std::memory_order_relaxed);
+      return buffer;
+    }
+  }
+  // Descriptor metadata is charged before allocation. Neither this path nor
+  // idle trimming walks cache owners or waits for cache replacement.
+  if (!try_charge_locked(sizeof(CacheBuffer), &metadata_used_size_,
+                          Backing::kPending)) {
+    release_buffer(nullptr, bytes);
+    return nullptr;
+  }
+  auto *buffer = new (std::nothrow) CacheBuffer();
+  if (!buffer) {
+    release_fixed(sizeof(CacheBuffer), &metadata_used_size_, Backing::kPending);
+    release_buffer(nullptr, bytes);
+    return nullptr;
+  }
+  process_rss_.finish_reservation(sizeof(CacheBuffer), true);
+  if (!try_reserve_committed(bytes, Backing::kPending)) {
+    // Optional admission may discard idle backing, never a pinned owner.
+    trim_free_buffers(bytes);
+    if (!try_reserve_committed(bytes, Backing::kPending)) {
+      delete buffer;
+      release_metadata(sizeof(CacheBuffer));
+      release_buffer(nullptr, bytes);
+      return nullptr;
+    }
+  }
+  buffer->data = static_cast<uint8_t *>(File::MemoryMap(bytes, 0));
+  if (!buffer->data) {
+    release_committed(bytes, Backing::kPending);
+    delete buffer;
+    release_metadata(sizeof(CacheBuffer));
+    release_buffer(nullptr, bytes);
+    return nullptr;
+  }
+  buffer->bytes = bytes;
+  buffer->stamp = process_rss_.finish_reservation(bytes, true);
+  buffer->creation = buffer->stamp;
+  external_used_size_.fetch_add(bytes, std::memory_order_relaxed);
+  evictable_cache_size_.fetch_add(bytes, std::memory_order_relaxed);
+  return buffer;
+}
+
+void MemoryLimitPool::release_cache_buffer(CacheBuffer *buffer) {
+  if (!buffer) return;
+  const size_t bytes = buffer->bytes;
+  auto &bin = cache_buffer_bins_[
+      (bytes / page_buffer_size()) % cache_buffer_bins_.size()];
+  // Publish reusable backing before making its logical capacity available.
+  {
+    std::lock_guard<std::mutex> lock(bin.mutex);
+    buffer->next = bin.head;
+    bin.head = buffer;
+    cache_idle_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+  evictable_cache_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  external_used_size_.fetch_sub(bytes, std::memory_order_relaxed);
+  metadata_used_size_.fetch_sub(sizeof(CacheBuffer), std::memory_order_relaxed);
+  release_buffer(nullptr, bytes + sizeof(CacheBuffer));
+  bg_cv_.notify_one();
+}
+
+size_t MemoryLimitPool::trim_cache_buffers(size_t bytes_needed) {
+  size_t released = 0;
+  for (auto &bin : cache_buffer_bins_) {
+    while (released < bytes_needed) {
+      CacheBuffer *buffer;
+      {
+        std::lock_guard<std::mutex> lock(bin.mutex);
+        buffer = bin.head;
+        if (!buffer) break;
+        bin.head = buffer->next;
+      }
+      if (!File::TryMemoryUnmap(buffer->data, buffer->bytes)) {
+        std::lock_guard<std::mutex> lock(bin.mutex);
+        buffer->next = bin.head;
+        bin.head = buffer;
+        break;
+      }
+      const size_t bytes = buffer->bytes;
+      release_committed(bytes, Backing::kLive,
+          ProcessRssBudget::MappingProjection::ForReuse(
+              bytes, buffer->stamp, buffer->creation));
+      cache_idle_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+      delete buffer;
+      // Idle descriptors have backing charges but no active logical owner.
+      release_committed(sizeof(CacheBuffer));
+      released += bytes;
+    }
+    if (released >= bytes_needed) break;
+  }
+  return released;
 }
 
 void MemoryLimitPool::release_metadata(const size_t buffer_size) {

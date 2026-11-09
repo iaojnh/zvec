@@ -477,6 +477,16 @@ class IndexStorage : public IndexModule {
       size_t size{0};
     };
 
+    struct ReadChunk {
+      size_t offset;
+      size_t size;
+    };
+    using ReadChunks = ailego::BudgetedVector<ReadChunk>;
+    // Immutable logical read ranges, relative to this segment. Backends that
+    // support them can cache the same units that the algorithm consumes.
+    virtual bool supports_read_chunks() const { return false; }
+    virtual int set_read_chunks(const ReadChunks &) { return 0; }
+
     //! A bounded-lifetime scatter read. Page-backed implementations may
     //! return independently pinned spans; contiguous backends use fallback.
     struct ScatterBlock {
