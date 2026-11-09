@@ -2335,6 +2335,98 @@ TEST_F(BufferPoolTest, BulkScratchShrinksToAvailableBudgetAndReleases) {
   }
 }
 
+TEST_F(BufferPoolTest, OversizedReadOnlyScanEarnsAdmissionBeforePressure) {
+  constexpr size_t kFileBytes = 1UL << 30;
+  constexpr size_t kCacheBytes = 512UL << 20;
+  constexpr size_t kReadPages = 64;
+  init_vec_pool(kCacheBytes / kVectorPageSize, kFileBytes / kVectorPageSize);
+  const std::string path = new_file(kReadPages);
+  File file;
+  ASSERT_TRUE(file.open(path, false, false));
+  ASSERT_TRUE(file.truncate(kFileBytes));
+  file.close();
+  VecBufferPool pool(path, false);
+  ASSERT_EQ(0, pool.init());
+  ASSERT_FALSE(MemoryLimitPool::get_instance().under_cache_pressure());
+  auto handle = pool.get_handle();
+  std::vector<char> output(kReadPages * kVectorPageSize);
+  ASSERT_TRUE(handle.read_range(0, output.size(), output.data()));
+  for (size_t i = 0; i < kReadPages; ++i) {
+    ExpectPageContent(output.data() + i * kVectorPageSize, i);
+    EXPECT_FALSE(pool.is_page_resident(i));
+  }
+  EXPECT_EQ(kReadPages, pool.stats().admission_rejected);
+  ASSERT_TRUE(handle.read_range(0, output.size(), output.data()));
+  for (size_t i = 0; i < kReadPages; ++i)
+    EXPECT_FALSE(pool.is_page_resident(i));
+  ASSERT_TRUE(handle.read_range(0, output.size(), output.data()));
+  for (size_t i = 0; i < kReadPages; ++i) {
+    ExpectPageContent(output.data() + i * kVectorPageSize, i);
+    EXPECT_TRUE(pool.is_page_resident(i));
+  }
+}
+
+TEST_F(BufferPoolTest, LargeScanAdmissionAgesByCacheCapacity) {
+  const size_t pages = (size_t{2} << 30) / kVectorPageSize;
+  init_vec_pool((512UL << 20) / kVectorPageSize, pages);
+  const std::string path = new_file(1);
+  File file;
+  ASSERT_TRUE(file.open(path, false, false));
+  ASSERT_TRUE(file.truncate(pages * kVectorPageSize));
+  file.close();
+  VecBufferPool pool(path, false);
+  ASSERT_EQ(0, pool.init());
+  EXPECT_FALSE(pool.should_admit_page(0));
+  const size_t cache_pages =
+      MemoryLimitPool::get_instance().capacity() / kVectorPageSize;
+  for (size_t i = 1; i <= cache_pages; ++i)
+    ASSERT_FALSE(pool.should_admit_page(i));
+  EXPECT_FALSE(pool.should_admit_page(0));
+  EXPECT_FALSE(pool.should_admit_page(0));
+  EXPECT_TRUE(pool.should_admit_page(0));
+}
+
+TEST_F(BufferPoolTest, MandatorySinglePageReadRemainsAvailableForLargeFiles) {
+  constexpr size_t kFileBytes = 1UL << 30;
+  init_vec_pool((512UL << 20) / kVectorPageSize,
+                kFileBytes / kVectorPageSize);
+  const std::string path = new_file(4);
+  File file;
+  ASSERT_TRUE(file.open(path, false, false));
+  ASSERT_TRUE(file.truncate(kFileBytes));
+  file.close();
+  VecBufferPool pool(path, false);
+  ASSERT_EQ(0, pool.init());
+  auto handle = pool.get_handle();
+  size_t page_id = 0;
+  char *data = handle.get_single_page(kVectorPageSize, 32, page_id);
+  ASSERT_NE(nullptr, data);
+  EXPECT_EQ(1, data[0]);
+  handle.release_one(page_id);
+  data = handle.get_single_page(kVectorPageSize, 32, page_id);
+  ASSERT_NE(nullptr, data);
+  EXPECT_EQ(1, data[31]);
+  handle.release_one(page_id);
+}
+
+TEST_F(BufferPoolTest, SparseCachedPagesPreserveUnalignedBulkReadBytes) {
+  constexpr size_t kPages = 128;
+  init_vec_pool(256, kPages);
+  VecBufferPool pool(new_file(kPages), false);
+  ASSERT_EQ(0, pool.init());
+  // Eight cold pages, then one cached page, repeated across the read range.
+  for (size_t i = 8; i < kPages; i += 9) {
+    char *data = pool.acquire_buffer(i, 0);
+    ASSERT_NE(nullptr, data);
+    pool.page_table_.release_block(i);
+  }
+  auto handle = pool.get_handle();
+  std::vector<char> output(kPages * kVectorPageSize - 19);
+  ASSERT_TRUE(handle.read_range(7, output.size(), output.data()));
+  for (size_t i = 0; i < output.size(); ++i)
+    ASSERT_EQ(static_cast<char>((i + 7) / kVectorPageSize), output[i]);
+}
+
 TEST_F(BufferPoolTest, ReadAndPrefetchRangesRejectOverflow) {
   init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2);
   std::string file = new_file(/*num_pages=*/2);

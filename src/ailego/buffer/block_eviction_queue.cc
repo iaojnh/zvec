@@ -34,6 +34,13 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+#endif
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <sys/auxv.h>
 #include <fcntl.h>
@@ -442,7 +449,8 @@ struct MemoryLimitPool::ReclaimableSlab {
 };
 
 ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
-#if defined(__linux__) && !defined(__ANDROID__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
   const int saved_errno = errno;
   auto restore_errno = ScopeGuard::Make([&] { errno = saved_errno; });
   auto &pool = get_instance();
@@ -466,19 +474,35 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
   }
 
   // The kernel page size also remains correct in logical-page-size tests.
+#if defined(__APPLE__) && TARGET_OS_OSX
+  const size_t native_page = static_cast<size_t>(::getpagesize());
+#else
   const size_t native_page = ::getauxval(AT_PAGESZ);
+#endif
   if (native_page < kMinimumPageBytes || native_page > kSlabBytes ||
       kSlabBytes % native_page != 0)
     return {MemoryHelper::SelfRSS(), 0};
+#if defined(__linux__)
   const int fd = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
   if (fd < 0) return {MemoryHelper::SelfRSS(), 0};
   auto close = ScopeGuard::Make([&] { ::close(fd); });
+#endif
   const size_t before = MemoryHelper::SelfRSS();
   if (!before) return {};
   size_t resident = 0;
+#if defined(__APPLE__) && TARGET_OS_OSX
+  std::array<int, kSlabBytes / kMinimumPageBytes> entries;
+  constexpr int kPrivatePresent =
+      VM_PAGE_QUERY_PAGE_PRESENT | VM_PAGE_QUERY_PAGE_DIRTY;
+  constexpr int kExcluded = VM_PAGE_QUERY_PAGE_EXTERNAL |
+                            VM_PAGE_QUERY_PAGE_PAGED_OUT |
+                            VM_PAGE_QUERY_PAGE_FICTITIOUS |
+                            VM_PAGE_QUERY_PAGE_REUSABLE;
+#else
   std::array<uint64_t, kSlabBytes / kMinimumPageBytes> entries;
   constexpr uint64_t kPrivatePresent =
       (uint64_t{1} << 63) | (uint64_t{1} << 56);
+#endif
   for (auto *slab = pool.slabs_; slab; slab = slab->next) {
     if (slab->page_size < native_page || slab->page_size % native_page != 0)
       return {MemoryHelper::SelfRSS(), 0};
@@ -491,6 +515,17 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
       for (size_t i = 0; i < slab->reclaimed_count; ++i)
         charged[slab->reclaimed_pages[i]] = false;
     }
+#if defined(__APPLE__) && TARGET_OS_OSX
+    // Query only our private anonymous slab mappings, while their backing
+    // cannot be discarded. A reserved or compressed page supplies no credit.
+    mach_vm_size_t returned = count;
+    if (::mach_vm_page_range_query(
+            ::mach_task_self(), reinterpret_cast<mach_vm_address_t>(slab),
+            count * native_page,
+            reinterpret_cast<mach_vm_address_t>(entries.data()),
+            &returned) != KERN_SUCCESS || returned != count)
+      return {MemoryHelper::SelfRSS(), 0};
+#else
     const uintptr_t index = reinterpret_cast<uintptr_t>(slab) / native_page;
     if (index > static_cast<uintptr_t>(std::numeric_limits<off_t>::max()) /
                     sizeof(uint64_t))
@@ -506,14 +541,17 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
       if (got <= 0) return {MemoryHelper::SelfRSS(), 0};
       done += static_cast<size_t>(got);
     }
-    // PFNs are deliberately unused. Unprivileged readers can see these
-    // status bits. Shared/zero pages and swapped/untouched pages give no
-    // credit; only private resident pages in our exact slab ranges do.
+#endif
+    // Only charged private resident pages in our exact slab ranges supply
+    // overlap credit. Reserved, discarded and swapped backing supplies none.
     for (size_t i = 0; i < count; ++i) {
       // THP can populate uncharged neighbors of a requested page. Their RSS
       // must not become overlap credit for a different, untouched owner.
-      if (charged[i * native_page / slab->page_size] &&
-          (entries[i] & kPrivatePresent) == kPrivatePresent)
+      bool present = (entries[i] & kPrivatePresent) == kPrivatePresent;
+#if defined(__APPLE__) && TARGET_OS_OSX
+      present = present && (entries[i] & kExcluded) == 0;
+#endif
+      if (charged[i * native_page / slab->page_size] && present)
         resident += native_page;
     }
   }
@@ -1345,9 +1383,25 @@ bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
 
 bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
                                                   size_t permanent_backing) {
+  auto resident_reader = &MemoryLimitPool::read_slab_resident_sample;
+#if defined(__APPLE__) && TARGET_OS_OSX
+  resident_reader = +[]() -> ProcessRssBudget::ResidentSample {
+    // Page-state queries are substantially more expensive than task RSS.
+    // Keep normal RSS/admission sampling responsive, but bound full slab
+    // scans. Between scans provide fresh RSS and no overlap credit, never a
+    // cached witness whose pages could already have been discarded.
+    static auto sampled_at = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - sampled_at < std::chrono::milliseconds(100))
+      return {MemoryHelper::SelfRSS(), 0};
+    const auto sample = MemoryLimitPool::read_slab_resident_sample();
+    sampled_at = std::chrono::steady_clock::now();
+    return sample;
+  };
+#endif
   const bool configured = process_rss_.configure(
       bytes, &MemoryHelper::SelfRSS, NativeApplicationMemoryReader(),
-      permanent_backing, &MemoryLimitPool::read_slab_resident_sample);
+      permanent_backing, resident_reader);
   bg_cv_.notify_one();
   return configured;
 }

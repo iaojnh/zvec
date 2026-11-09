@@ -11,6 +11,9 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -21,6 +24,13 @@ namespace zvec::ailego {
 struct MemoryLimitPoolTestPeer {
   static void stop_background(MemoryLimitPool &pool) {
     pool.stop_background_evictor();
+  }
+  static ProcessRssBudget::ResidentSample resident_sample() {
+    return MemoryLimitPool::read_slab_resident_sample();
+  }
+  static ProcessRssBudget::ResidentSample sample_while_busy(MemoryLimitPool &pool) {
+    std::lock_guard<std::mutex> lock(pool.slab_mutex_);
+    return resident_sample();
   }
 };
 namespace {
@@ -96,6 +106,47 @@ TEST_F(SlabBackingBudgetTest, IdlePageKeepsBackingChargeAndReusesIt) {
   EXPECT_EQ(baseline_ + 2 * page_size_, pool_.committed());
   EXPECT_EQ(reused + 1, pool_.stats().alloc_from_freelist);
 }
+
+#if defined(__APPLE__) && TARGET_OS_OSX
+TEST_F(SlabBackingBudgetTest, NativeResidencyWitnessTracksDiscardAndReuse) {
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  auto page = acquire();
+  auto neighbor = acquire();
+  auto untouched = acquire();
+  ASSERT_NE(nullptr, page);
+  ASSERT_NE(nullptr, neighbor);
+  ASSERT_NE(nullptr, untouched);
+  std::memset(page.get(), 7, page_size_);
+  std::memset(neighbor.get(), 11, page_size_);
+  const auto full = MemoryLimitPoolTestPeer::resident_sample();
+  ASSERT_EQ(3 * page_size_, full.owned_resident);  // Header and both pages.
+  char *address = page.get();
+  page.reset();
+  const size_t charge = pool_.capacity() - pool_.used();
+  ASSERT_TRUE(pool_.try_charge_external(charge));
+  expect_discarded(address);
+  const auto discarded = MemoryLimitPoolTestPeer::resident_sample();
+  EXPECT_EQ(page_size_, full.owned_resident - discarded.owned_resident);
+  EXPECT_EQ(11, neighbor.get()[page_size_ - 1]);
+  pool_.release_external(charge);
+  page = acquire();
+  ASSERT_NE(nullptr, page);
+  std::memset(page.get(), 13, page_size_);
+  const auto reused = MemoryLimitPoolTestPeer::resident_sample();
+  EXPECT_EQ(full.owned_resident, reused.owned_resident);
+  EXPECT_LE(reused.owned_resident, reused.rss);
+}
+
+TEST_F(SlabBackingBudgetTest, BusyNativeResidencySampleKeepsAdmissionConservative) {
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  auto page = acquire();
+  ASSERT_NE(nullptr, page);
+  std::memset(page.get(), 17, page_size_);
+  const auto sample = MemoryLimitPoolTestPeer::sample_while_busy(pool_);
+  EXPECT_GT(sample.rss, 0u);
+  EXPECT_EQ(0u, sample.owned_resident);
+}
+#endif
 
 TEST_F(SlabBackingBudgetTest,
        PressureDiscardsBackingWithoutChangingLiveNeighbor) {
