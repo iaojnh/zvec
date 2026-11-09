@@ -12,7 +12,7 @@ namespace core {
 // Read-only storage for immutable files. All payload capacity is charged to
 // MemoryLimitPool before allocation. Atomic chunk pins protect readers while
 // the process-wide BlockEvictionQueue controls cache residency.
-class ZVEC_CORE_API ChunkReadStorage : public IndexStorage {
+class ChunkReadStorage : public IndexStorage {
  public:
   struct Stats {
     uint64_t cache_hits{0}, cache_misses{0}, fills{0}, replacements{0};
