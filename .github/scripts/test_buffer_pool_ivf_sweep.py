@@ -123,3 +123,17 @@ def test_configure_rejects_undeclared_budget(evidence):  # noqa: F811
     profile, _ = evidence
     with pytest.raises(ValueError, match="undeclared"):
         selected_config(json.loads(profile.read_text()), 999)
+
+
+def test_failed_pressure_gate_prevents_recommending_a_performance_pass(sweep):
+    pressure = sweep.root / "buffer-pool-ivf-pressure-512m"
+    shutil.copytree(point_root(sweep, 512), pressure)
+    sweep.pressure_profile = sweep.profile
+    assert collect(sweep) == 0
+    path = pressure / "evidence/buffer-verify-1.json"
+    value = json.loads(path.read_text())
+    value["passed"] = False
+    value["error"] = "injected persistence failure"
+    path.write_text(json.dumps(value))
+    assert collect(sweep) == 1
+    assert not (sweep.output / "ivf-profile-qualified.json").exists()

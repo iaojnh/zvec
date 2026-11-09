@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: buffer-pool-acceptance-${{ github.ref }}
+  group: buffer-pool-acceptance-${{ github.ref }}-${{ (github.ref_name == 'codex/ivf-release-profile' || inputs.ivf_profile_only) && 'ivf' || 'full' }}
   cancel-in-progress: true
 
 env:
@@ -704,7 +704,7 @@ jobs:
     if: ${{ github.ref_name == 'codex/ivf-release-profile' || (github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     runs-on: ubuntu-24.04
     outputs:
-      memory_limits: ${{ steps.plan.outputs.memory_limits }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -715,23 +715,28 @@ jobs:
           import json
           import os
           from pathlib import Path
-          profile = json.loads(Path("examples/python/ivf_memory_profile.json").read_text())
+          profile = json.loads(Path("examples/python/ivf_cohere_profile.json").read_text())
           limits = profile["buffer_memory_limits_mb"]
           assert limits == sorted(set(limits)) and all(value > 0 for value in limits)
+          points = [dict(suite="cohere", memory_limit_mb=value,
+                         profile="examples/python/ivf_cohere_profile.json",
+                         artifact=f"buffer-pool-ivf-profile-{value}m") for value in limits]
+          points.append(dict(suite="pressure", memory_limit_mb=512,
+                             profile="examples/python/ivf_memory_profile.json",
+                             artifact="buffer-pool-ivf-pressure-512m"))
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write("memory_limits=" + json.dumps(limits) + "\n")
+              output.write("matrix=" + json.dumps(dict(include=points)) + "\n")
           PY
 
   ivf-profile:
-    name: IVF Buffer ${{ matrix.memory_limit_mb }} MiB versus ample mmap
+    name: IVF ${{ matrix.suite }} Buffer ${{ matrix.memory_limit_mb }} MiB
     if: ${{ github.ref_name == 'codex/ivf-release-profile' || (github.event_name == 'workflow_dispatch' && inputs.ivf_profile_only) }}
     needs: [build, ivf-profile-plan]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix:
-        memory_limit_mb: ${{ fromJSON(needs.ivf-profile-plan.outputs.memory_limits) }}
+      matrix: ${{ fromJSON(needs.ivf-profile-plan.outputs.matrix) }}
     env:
       PROFILE_FILE: ivf-selected/ivf_memory_profile.json
     steps:
@@ -751,9 +756,10 @@ jobs:
           (cd candidate && sha256sum -c SHA256SUMS)
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libaio1t64 liburing2
-          python -m pip install candidate/*.whl pytest pytest-xdist
+          python -m pip install candidate/*.whl pytest pytest-xdist pyarrow
           python -m pytest -o addopts= -q python/tests/test_collection_options.py \
-            .github/scripts/test_buffer_pool_ivf_profile.py .github/scripts/test_buffer_pool_ivf_sweep.py
+            .github/scripts/test_buffer_pool_ivf_profile.py .github/scripts/test_buffer_pool_ivf_sweep.py \
+            .github/scripts/test_buffer_pool_ivf_input.py
       - name: Verify snapshot reuse, pressure reclamation and concurrent leases
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/candidate/lib
@@ -784,8 +790,28 @@ jobs:
       - name: Select this declared memory point
         run: |
           python .github/scripts/buffer_pool_ivf_sweep.py configure \
-            --profile examples/python/ivf_memory_profile.json \
+            --profile '${{ matrix.profile }}' \
             --memory-limit-mb '${{ matrix.memory_limit_mb }}' --output "$PROFILE_FILE"
+      - name: Prepare versioned Cohere fixture with bounded build input
+        if: ${{ matrix.suite == 'cohere' }}
+        run: |
+          # This fresh test VM needs room for the binary input, two indexes
+          # and optimization scratch; unused SDKs are not part of this job.
+          if (( $(df --output=avail -k "$RUNNER_TEMP" | tail -1) < 26214400 )); then
+            sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          fi
+          uname -a > evidence/environment.txt
+          lscpu >> evidence/environment.txt
+          lsblk >> evidence/environment.txt
+          free -m >> evidence/environment.txt
+          df -h >> evidence/environment.txt
+          python examples/python/ivf_cohere_input.py --profile "$PROFILE_FILE" \
+            --source "$RUNNER_TEMP/cohere-parquet" --output "$RUNNER_TEMP/cohere-input" \
+            --download 2>&1 | tee evidence/input-preparation.log
+          cp "$RUNNER_TEMP/cohere-input/manifest.json" evidence/input-manifest.json
+          # Keep the small binary fixture, then remove only downloaded test
+          # inputs on this ephemeral runner to make room for both index copies.
+          rm -rf -- "$RUNNER_TEMP/cohere-parquet"
       - name: Build, continuously write and retrieve under the profile memory limit
         continue-on-error: true
         env:
@@ -794,6 +820,8 @@ jobs:
           set -euo pipefail
           mkdir -p evidence
           profile="$PROFILE_FILE"
+          input_args=()
+          if [[ '${{ matrix.suite }}' == cohere ]]; then input_args=(--input-dir "$RUNNER_TEMP/cohere-input"); fi
           limit_mib=$(python -c 'import json, os; print(json.load(open(os.environ["PROFILE_FILE"]))["system_limit_mib"])')
           wheel=$(find candidate -maxdepth 1 -name '*.whl' -print -quit)
           python_path=$(command -v python)
@@ -817,10 +845,13 @@ jobs:
               "$python_path" -X faulthandler .github/scripts/buffer_pool_ivf_profile.py observe \
               --profile "$profile" --root "$PROFILE_ROOT/$storage" --evidence evidence \
               --wheel "$wheel" --storage "$storage" --stage "$stage" --trial "$trial" \
+              "${input_args[@]}" \
               2>&1 | tee "evidence/$storage-$stage-$trial.log"
           }
           failed=0
-          for storage in buffer mmap; do
+          storages='buffer mmap'
+          if [[ '${{ matrix.suite }}' == pressure ]]; then storages=buffer; fi
+          for storage in $storages; do
             if run_stage "$storage" build 1 && run_stage "$storage" mixed 1 && run_stage "$storage" verify 1; then
               :
             else
@@ -828,6 +859,7 @@ jobs:
             fi
           done
           if [[ "$failed" != 0 ]]; then exit 1; fi
+          if [[ '${{ matrix.suite }}' == pressure ]]; then exit 0; fi
           # Alternate pair order to reduce runner drift; each trial uses a fresh
           # process and identical data/recall settings. mmap retains its ample
           # allowance; Buffer Pool uses this declared point's smaller envelope.
@@ -843,16 +875,23 @@ jobs:
         run: |
           mkdir -p profile-result
           cp examples/python/ivf_memory_profile.py examples/python/ivf_memory_profile.md profile-result/
-          if [[ -f "$PROFILE_FILE" ]]; then cp "$PROFILE_FILE" profile-result/; fi
+          cp examples/python/ivf_cohere_input.py examples/python/ivf_cohere_profile.md profile-result/
+          if [[ -f "$PROFILE_FILE" ]]; then cp "$PROFILE_FILE" profile-result/ivf_memory_profile.json; fi
+          if [[ '${{ matrix.suite }}' == cohere && -f "$PROFILE_FILE" ]]; then
+            cp "$PROFILE_FILE" profile-result/ivf_cohere_profile.json
+          fi
+          mode=export
+          report=ivf-profile-report
+          if [[ '${{ matrix.suite }}' == pressure ]]; then mode=pressure; report=ivf-pressure-report; fi
           check_rc=0
-          python .github/scripts/buffer_pool_ivf_profile.py export \
+          python .github/scripts/buffer_pool_ivf_profile.py "$mode" \
             --profile "$PROFILE_FILE" --evidence evidence --output profile-result || check_rc=$?
-          cat profile-result/ivf-profile-report.md >> "$GITHUB_STEP_SUMMARY"
+          cat "profile-result/$report.md" >> "$GITHUB_STEP_SUMMARY"
           exit "$check_rc"
       - uses: ./.github/actions/upload-evidence
         if: always()
         with:
-          name: buffer-pool-ivf-profile-${{ matrix.memory_limit_mb }}m
+          name: ${{ matrix.artifact }}
           path: |
             profile-result/
             evidence/
@@ -873,16 +912,19 @@ jobs:
           python-version: '3.10'
       - uses: actions/download-artifact@v8
         with:
-          pattern: buffer-pool-ivf-profile-*m
+          pattern: buffer-pool-ivf-*m
           path: sweep-points
       - name: Report every point and select only a qualified configuration
         run: |
           check_rc=0
           python .github/scripts/buffer_pool_ivf_sweep.py collect \
-            --profile examples/python/ivf_memory_profile.json --root sweep-points \
+            --profile examples/python/ivf_cohere_profile.json --root sweep-points \
+            --pressure-profile examples/python/ivf_memory_profile.json \
             --output ivf-sweep || check_rc=$?
           cat ivf-sweep/ivf-sweep-report.md >> "$GITHUB_STEP_SUMMARY"
           cp examples/python/ivf_memory_profile.py examples/python/ivf_memory_profile.md ivf-sweep/
+          cp examples/python/ivf_cohere_input.py examples/python/ivf_cohere_profile.md ivf-sweep/
+          cp examples/python/ivf_cohere_profile.json ivf-sweep/
           exit "$check_rc"
       - uses: ./.github/actions/upload-evidence
         if: always()

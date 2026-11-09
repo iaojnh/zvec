@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "name": "ivf-cohere-1000k-768d-2048m",
+  "platform": "ubuntu-24.04-x86_64-glibc",
+  "system_limit_mib": 2304,
+  "memory_limit_mb": 2048,
+  "buffer_memory_limits_mb": [512, 1024, 1536, 2048, 4096],
+  "buffer_system_headroom_mib": 256,
+  "mmap_reference_memory_limit_mb": 12288,
+  "mmap_reference_system_limit_mib": 12288,
+  "query_threads": 4,
+  "optimize_threads": 1,
+  "max_buffer_size": 1048576,
+  "rows": 1000000,
+  "dimension": 768,
+  "batch_size": 256,
+  "payload_bytes": 64,
+  "seed": 2026,
+  "dataset": {
+    "name": "cohere-medium-1m",
+    "files": {
+      "shuffle_train.parquet": {"size": 3134418448, "etag": "aa5dee664dc87b3e416c9863723a0ba4-374"},
+      "test.parquet": {"size": 3133165, "etag": "c63a0efd0e611d9f35345af1fc6f7966"},
+      "neighbors.parquet": {"size": 3704127, "etag": "d1aca052763a292b10e80bbda964f55d"}
+    }
+  },
+  "index": {"n_list": 1024, "n_iters": 5, "nprobe": 128, "metric": "COSINE"},
+  "query": {
+    "topk": 10,
+    "query_count": 200,
+    "warmup_queries": 16,
+    "trials": 3,
+    "minimum_seconds": 3.0,
+    "minimum_queries": 200,
+    "distributions": ["uniform", "hot_80_20", "zipf", "repeat_90_10"]
+  },
+  "mixed": {"minimum_seconds": 60.0, "cycles": 2, "batches": 8, "readers": 1},
+  "acceptance": {
+    "minimum_recall": 0.9,
+    "maximum_recall_difference": 0.01,
+    "minimum_qps_per_rss_ratio": 1.0,
+    "maximum_sampling_gap_seconds": 1.0
+  }
+}

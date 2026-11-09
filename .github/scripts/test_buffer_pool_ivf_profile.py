@@ -165,6 +165,34 @@ def test_build_requires_same_process_query_before_restart(evidence):
         evaluate(profile, root)
 
 
+def test_lifecycle_sampling_gap_is_recorded_without_claiming_a_continuous_rss_bound(
+    evidence,
+):
+    profile, root = evidence
+    change(
+        root / "buffer-build-1.monitor.jsonl",
+        lambda value: value.update(sampling_max_gap_seconds=2.0),
+    )
+    result = evaluate(profile, root)
+    assert result["passed"] is True
+    assert result["lifecycle"][0]["rss_observation"]["sampling_max_gap_seconds"] == 2.0
+
+
+def test_missing_query_window_samples_fail_even_if_aggregate_monitor_looks_healthy(
+    evidence,
+):
+    profile, root = evidence
+    path = root / "buffer-query-1.monitor.samples.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    path.write_text(
+        "\n".join(
+            json.dumps(row) for row in rows if row["monotonic_seconds"] not in (2, 2.5)
+        )
+    )
+    with pytest.raises(AssertionError, match="sampling stalled during queries"):
+        evaluate(profile, root)
+
+
 @pytest.mark.parametrize(
     "damage",
     [
@@ -290,6 +318,54 @@ def test_equal_qps_per_rss_does_not_meet_higher_than_mmap_target(evidence):
     assert not any(
         case["checks"]["qps_per_rss_higher_than_mmap"] for case in result["comparisons"]
     )
+
+
+@pytest.mark.parametrize(
+    "damage", ["mixed_dataset", "missing_dataset", "wrong_public_truth"]
+)
+def test_real_data_qualification_requires_matching_fixture_and_public_truth(
+    evidence, damage
+):
+    profile, root = evidence
+    config = json.loads(profile.read_text())
+    config["dataset"] = {"name": "fixture"}
+    profile.write_text(json.dumps(config))
+    digest = hashlib.sha256(profile.read_bytes()).hexdigest()
+    for path in root.glob("*.json"):
+        value = json.loads(path.read_text())
+        value.update(
+            profile=config,
+            profile_sha256=digest,
+            dataset_sha256="d" * 64,
+            public_truth_recall=1.0,
+        )
+        path.write_text(json.dumps(value))
+    path = root / "buffer-build-1.json"
+    if damage == "mixed_dataset":
+        change(path, lambda value: value.update(dataset_sha256="e" * 64))
+    elif damage == "missing_dataset":
+        change(path, lambda value: value.pop("dataset_sha256"))
+    else:
+        change(path, lambda value: value.update(public_truth_recall=0.5))
+    with pytest.raises(AssertionError):
+        evaluate(profile, root)
+
+
+def test_random_pressure_pass_cannot_export_a_performance_qualified_profile(
+    evidence, tmp_path
+):
+    profile, root = evidence
+    output = tmp_path / "pressure"
+    assert (
+        export(
+            argparse.Namespace(
+                command="pressure", profile=profile, evidence=root, output=output
+            )
+        )
+        == 0
+    )
+    assert (output / "ivf-pressure-report.json").exists()
+    assert not (output / "ivf-profile-qualified.json").exists()
 
 
 def test_failed_export_removes_stale_qualified_profile(evidence, tmp_path):

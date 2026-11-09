@@ -12,7 +12,13 @@ import hashlib
 import json
 from pathlib import Path
 
-from buffer_pool_ivf_profile import STAGES, evaluate, qualified_profile, read_case
+from buffer_pool_ivf_profile import (
+    STAGES,
+    evaluate,
+    pressure_evidence,
+    qualified_profile,
+    read_case,
+)
 
 
 def selected_config(template, budget):
@@ -21,9 +27,7 @@ def selected_config(template, budget):
         raise ValueError(f"undeclared Buffer Pool memory limit: {budget}")
     config["memory_limit_mb"] = budget
     config["system_limit_mib"] = budget + config["buffer_system_headroom_mib"]
-    config["name"] = (
-        f"ivf-fp32-{config['rows'] // 1000}k-{config['dimension']}d-{budget}m"
-    )
+    config["name"] = config["name"].rsplit("-", 1)[0] + f"-{budget}m"
     return config
 
 
@@ -61,6 +65,17 @@ def read_point(template, root, budget):
         config = json.loads(selected.read_text())
         if config != selected_config(template, budget):
             raise ValueError("sweep point configuration differs from declared controls")
+        if "dataset" in config:
+            manifest = root / "evidence/input-manifest.json"
+            contents = json.loads(manifest.read_text())
+            if (
+                contents["dataset"] != config["dataset"]["name"]
+                or contents["rows"] != config["rows"]
+            ):
+                raise ValueError("prepared dataset differs from sweep controls")
+            point["input_manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
         # A report proves this point reached export. A workload failure is a
         # useful negative measurement; an absent artifact is an incomplete run.
         json.loads(report.read_text())
@@ -68,6 +83,13 @@ def read_point(template, root, budget):
         digest = hashlib.sha256(selected.read_bytes()).hexdigest()
         point["buffer_lifecycle"] = lifecycle(root / "evidence", config, digest)
         point.update(evaluate(selected, root / "evidence"))
+        if (
+            "dataset" in config
+            and point["dataset_sha256"] != point["input_manifest_sha256"]
+        ):
+            point["passed"] = False
+            point["complete"] = False
+            raise ValueError("measured dataset differs from prepared input")
     except (AssertionError, KeyError, ValueError, OSError) as error:
         point["error"] = f"{type(error).__name__}: {error}"
     return point
@@ -104,6 +126,14 @@ def markdown(result):
     for point in result["points"]:
         if "error" in point:
             lines += ["", f"{point['memory_limit_mb']} MiB: {point['error']}"]
+    if result.get("pressure") is not None:
+        pressure = result["pressure"]
+        lines += [
+            "",
+            f"Random 400K lifecycle pressure test: {'PASS' if pressure['passed'] else 'FAIL'}.",
+        ]
+        if "error" in pressure:
+            lines.append(pressure["error"])
     if result["passed"]:
         lines += [
             "",
@@ -130,13 +160,30 @@ def collect(args):
         for point in points
         if "source_commit" in point
     }
+    pressure_profile = getattr(args, "pressure_profile", None)
+    pressure = None
+    if pressure_profile is not None:
+        try:
+            path = args.root / "buffer-pool-ivf-pressure-512m"
+            selected = path / "profile-result/ivf_memory_profile.json"
+            if json.loads(selected.read_text()) != json.loads(
+                pressure_profile.read_text()
+            ):
+                raise ValueError("pressure configuration mismatch")
+            pressure = pressure_evidence(selected, path / "evidence")
+            signatures.add((pressure["source_commit"], pressure["wheel_sha256"]))
+        except (AssertionError, KeyError, ValueError, OSError) as error:
+            pressure = {"passed": False, "error": str(error)}
     complete = all(point["complete"] for point in points) and len(signatures) <= 1
     result = {
-        "passed": complete and bool(qualified),
+        "passed": complete
+        and bool(qualified)
+        and (pressure is None or pressure["passed"]),
         "complete": complete,
         "mmap_reference_memory_limit_mb": template["mmap_reference_memory_limit_mb"],
         "buffer_system_headroom_mib": template["buffer_system_headroom_mib"],
         "points": points,
+        "pressure": pressure,
     }
     args.output.mkdir(parents=True, exist_ok=True)
     receipt = args.output / "ivf-profile-qualified.json"
@@ -166,6 +213,7 @@ def main():
     report.add_argument("--profile", type=Path, required=True)
     report.add_argument("--root", type=Path, required=True)
     report.add_argument("--output", type=Path, required=True)
+    report.add_argument("--pressure-profile", type=Path)
     args = parser.parse_args()
     return configure(args) if args.command == "configure" else collect(args)
 

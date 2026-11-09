@@ -67,5 +67,8 @@ examples/python/*
 !examples/python/ivf_memory_profile.py
 !examples/python/ivf_memory_profile.json
 !examples/python/ivf_memory_profile.md
+!examples/python/ivf_cohere_profile.json
+!examples/python/ivf_cohere_input.py
+!examples/python/ivf_cohere_profile.md
 examples/c_api/
 logs/

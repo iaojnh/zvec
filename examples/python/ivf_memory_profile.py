@@ -28,19 +28,80 @@ import numpy as np
 import zvec
 
 
+def input_config(config, directory):
+    if "dataset" not in config:
+        return config
+    if directory is None:
+        raise ValueError(
+            "Cohere requires --input-dir; prepare it with ivf_cohere_input.py"
+        )
+    path = directory / "manifest.json"
+    manifest = json.loads(path.read_text())
+    expected = {
+        "dataset": config["dataset"]["name"],
+        "rows": config["rows"],
+        "dimension": config["dimension"],
+        "query_count": config["query"]["query_count"],
+        "topk": config["query"]["topk"],
+        "normalized": True,
+    }
+    if any(manifest[key] != value for key, value in expected.items()):
+        raise ValueError("prepared input differs from the selected profile")
+    for name, info in manifest["files"].items():
+        if Path(name).name != name or (directory / name).stat().st_size != info["size"]:
+            raise ValueError("prepared input file is missing or truncated")
+    return {
+        **config,
+        "_input_directory": directory,
+        "_input_manifest": manifest,
+        "_dataset_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def document_ids(config, start, count):
+    if "dataset" in config:
+        if start < config["rows"]:
+            return np.fromfile(
+                config["_input_directory"] / "ids.i64",
+                dtype="<i8",
+                count=count,
+                offset=start * 8,
+            )
+        start = config["_input_manifest"]["new_id_start"] + start - config["rows"]
+    return np.arange(start, start + count, dtype=np.int64)
+
+
 def vectors(config, start, count):
     """Regenerate a bounded batch without retaining the corpus in Python."""
+    if "dataset" in config and start < config["rows"]:
+        values = np.fromfile(
+            config["_input_directory"] / "vectors.f32",
+            dtype="<f4",
+            count=count * config["dimension"],
+            offset=start * config["dimension"] * 4,
+        )
+        return values.reshape(count, config["dimension"])
     rng = np.random.default_rng(config["seed"] + start // config["batch_size"])
-    return rng.standard_normal((count, config["dimension"]), dtype=np.float32)
+    values = rng.standard_normal((count, config["dimension"]), dtype=np.float32)
+    if config.get("index", {}).get("metric") == "COSINE":
+        values /= np.linalg.norm(values, axis=1, keepdims=True)
+    return values
 
 
-def add_truth(queries, batch, start, best_ids, best_distances, topk):
+def add_truth(
+    queries, batch, start, best_ids, best_distances, topk, candidate_ids=None
+):
     distances = (
         np.sum(queries * queries, axis=1)[:, None]
         + np.sum(batch * batch, axis=1)[None, :]
         - 2 * queries @ batch.T
     )
-    ids = np.broadcast_to(np.arange(start, start + len(batch)), distances.shape)
+    ids = np.broadcast_to(
+        np.arange(start, start + len(batch))
+        if candidate_ids is None
+        else candidate_ids,
+        distances.shape,
+    )
     distances = np.concatenate((best_distances, distances), axis=1)
     ids = np.concatenate((best_ids, ids), axis=1)
     selected = np.argsort(distances, axis=1, kind="stable")[:, :topk]
@@ -87,12 +148,52 @@ def check_statuses(statuses, count):
 def documents(config, start, batch, cycle=0):
     return [
         zvec.Doc(
-            id=str(start + offset),
+            id=str(key),
             vectors={"embedding": vector.tolist()},
             fields={"payload": f"{cycle}:" + "p" * config["payload_bytes"]},
         )
-        for offset, vector in enumerate(batch)
+        for key, vector in zip(
+            document_ids(config, start, len(batch)), batch, strict=True
+        )
     ]
+
+
+def build_queries(config):
+    if "dataset" in config:
+        path = config["_input_directory"] / "queries.f32"
+        if (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            != config["_input_manifest"]["files"][path.name]["sha256"]
+        ):
+            raise ValueError("query fixture checksum mismatch")
+        return np.fromfile(path, dtype="<f4").reshape(
+            config["query"]["query_count"], config["dimension"]
+        )
+    return vectors(config, 0, config["batch_size"])[: config["query"]["query_count"]]
+
+
+def check_input_truth(config, hashes, best_ids):
+    if "dataset" not in config:
+        return None
+    manifest = config["_input_manifest"]
+    for name, value in hashes.items():
+        if value.hexdigest() != manifest["files"][name]["sha256"]:
+            raise ValueError(f"input checksum mismatch: {name}")
+    path = config["_input_directory"] / "neighbors.i64"
+    if (
+        hashlib.sha256(path.read_bytes()).hexdigest()
+        != manifest["files"][path.name]["sha256"]
+    ):
+        raise ValueError("ground truth checksum mismatch")
+    truth = np.fromfile(path, dtype="<i8").reshape(best_ids.shape)
+    recall = np.mean(
+        [len(set(a) & set(b)) / len(a) for a, b in zip(best_ids, truth, strict=True)]
+    )
+    if recall < 0.99:
+        raise AssertionError(
+            f"independent oracle differs from public Cohere truth: {recall}"
+        )
+    return float(recall)
 
 
 def build(config, root, storage):
@@ -106,14 +207,15 @@ def build(config, root, storage):
                 zvec.DataType.VECTOR_FP32,
                 dimension=config["dimension"],
                 index_param=zvec.IVFIndexParam(
-                    metric_type=zvec.MetricType.L2,
+                    metric_type=getattr(zvec.MetricType, settings["metric"]),
                     n_list=settings["n_list"],
                     n_iters=settings["n_iters"],
                 ),
             )
         ],
     )
-    queries = vectors(config, 0, config["batch_size"])[: config["query"]["query_count"]]
+    queries = build_queries(config)
+    hashes = {name: hashlib.sha256() for name in ("vectors.f32", "ids.i64")}
     best_ids = np.empty((len(queries), 0), dtype=np.int64)
     best_distances = np.empty((len(queries), 0), dtype=np.float32)
     collection = zvec.create_and_open(
@@ -126,7 +228,19 @@ def build(config, root, storage):
                 config, start, min(config["batch_size"], config["rows"] - start)
             )
             best_ids, best_distances = add_truth(
-                queries, batch, start, best_ids, best_distances, config["query"]["topk"]
+                queries,
+                batch,
+                start,
+                best_ids,
+                best_distances,
+                config["query"]["topk"],
+                document_ids(config, start, len(batch)),
+            )
+            hashes["vectors.f32"].update(batch.astype("<f4", copy=False).tobytes())
+            hashes["ids.i64"].update(
+                document_ids(config, start, len(batch))
+                .astype("<i8", copy=False)
+                .tobytes()
             )
             docs = documents(config, start, batch)
             check_statuses(collection.insert(docs), len(docs))
@@ -144,6 +258,8 @@ def build(config, root, storage):
         "truth": best_ids.tolist(),
         "distances": best_distances.tolist(),
         "rows": config["rows"],
+        "probe_id": str(document_ids(config, 0, 1)[0]),
+        "new_id": str(document_ids(config, config["rows"], 1)[0]),
     }
     (root / "fixture.json").write_text(json.dumps(fixture))
     # Check the build-to-query transition before this process can discard any
@@ -155,6 +271,7 @@ def build(config, root, storage):
         "insert_and_flush_seconds": build_started - inserted_at,
         "build_seconds": build_finished - build_started,
         "post_build_query_verified": True,
+        "public_truth_recall": check_input_truth(config, hashes, best_ids),
     }
 
 
@@ -168,7 +285,13 @@ def extended_truth(config, fixture):
         start = config["rows"] + i * config["batch_size"]
         batch = vectors(config, start, config["batch_size"])
         best_ids, best_distances = add_truth(
-            queries, batch, start, best_ids, best_distances, config["query"]["topk"]
+            queries,
+            batch,
+            start,
+            best_ids,
+            best_distances,
+            config["query"]["topk"],
+            document_ids(config, start, len(batch)),
         )
     return best_ids, best_distances
 
@@ -240,7 +363,7 @@ def mixed(config, root, storage):
         assert collection.stats.doc_count == expected_rows
         assert collection.stats.index_completeness["embedding"] == 1
         assert all(count > 0 for count in read_counts)
-        new_id = str(config["rows"])
+        new_id = fixture["new_id"]
         assert (
             collection.fetch([new_id])[new_id]
             .field("payload")
@@ -288,20 +411,28 @@ def verify(config, root, storage, after_mixed=True):
             )
         ]
         assert min(recalls) >= config["acceptance"]["minimum_recall"]
-        ids = ["0", str(config["rows"])] if after_mixed else ["0"]
+        probe_id = fixture["probe_id"]
+        ids = [probe_id, fixture["new_id"]] if after_mixed else [probe_id]
         docs = collection.fetch(ids)
         assert set(docs) == set(ids)
-        assert docs["0"].vector("embedding") == fixture["queries"][0]
-        assert docs["0"].field("payload") == "0:" + "p" * config["payload_bytes"]
+        np.testing.assert_allclose(
+            docs[probe_id].vector("embedding"),
+            vectors(config, 0, 1)[0],
+            rtol=1e-6,
+            atol=1e-7,
+        )
+        assert docs[probe_id].field("payload") == "0:" + "p" * config["payload_bytes"]
         if after_mixed:
-            new_id = str(config["rows"])
+            new_id = fixture["new_id"]
             assert (
                 docs[new_id].field("payload")
                 == f"{fixture['last_cycle']}:" + "p" * config["payload_bytes"]
             )
-            assert (
-                docs[new_id].vector("embedding")
-                == vectors(config, config["rows"], config["batch_size"])[0].tolist()
+            np.testing.assert_allclose(
+                docs[new_id].vector("embedding"),
+                vectors(config, config["rows"], config["batch_size"])[0],
+                rtol=1e-6,
+                atol=1e-7,
             )
     finally:
         collection.close()
@@ -318,9 +449,15 @@ def query_trials(config, root, storage, trial):
     cases = []
     rng = np.random.default_rng(config["seed"] + trial)
     count = len(fixture["queries"])
+    hot_count = max(1, count // 5)
     distributions = {
         "uniform": np.full(count, 1 / count),
-        "hot_80_20": np.asarray([0.8, *([0.2 / (count - 1)] * (count - 1))]),
+        "hot_80_20": np.concatenate(
+            (
+                np.full(hot_count, 0.8 / hot_count),
+                np.full(count - hot_count, 0.2 / (count - hot_count)),
+            )
+        ),
         "zipf": 1 / np.arange(1, count + 1, dtype=float),
         "repeat_90_10": np.asarray([0.9, *([0.1 / (count - 1)] * (count - 1))]),
     }
@@ -391,10 +528,10 @@ def main():
     )
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--trial", type=int, default=1)
+    parser.add_argument("--input-dir", type=Path)
     args = parser.parse_args()
     config = json.loads(args.profile.read_text())
     assert config["schema_version"] == 1
-    assert config["rows"] % config["batch_size"] == 0
     assert 2 <= config["query"]["query_count"] <= config["batch_size"]
     assert config["query"]["topk"] < config["rows"]
     assert config["mixed"]["cycles"] > 0
@@ -415,6 +552,8 @@ def main():
         "passed": False,
     }
     try:
+        runtime_config = input_config(config, args.input_dir)
+        result["dataset_sha256"] = runtime_config.get("_dataset_sha256")
         zvec.init(
             memory_limit_mb=config["memory_limit_mb"]
             if args.storage == "buffer"
@@ -424,9 +563,9 @@ def main():
             log_level=zvec.LogLevel.INFO,
         )
         if args.stage == "query":
-            details = query_trials(config, args.root, args.storage, args.trial)
+            details = query_trials(runtime_config, args.root, args.storage, args.trial)
         else:
-            details = globals()[args.stage](config, args.root, args.storage)
+            details = globals()[args.stage](runtime_config, args.root, args.storage)
         result.update(details, passed=True)
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
