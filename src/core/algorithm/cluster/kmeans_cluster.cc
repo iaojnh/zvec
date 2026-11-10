@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <atomic>
+#include <cmath>
+#include <cstring>
 #include <ailego/container/reservoir.h>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
@@ -222,6 +224,28 @@ class KmeansCentroidFeatures : public IndexFeatures {
   IndexMeta::DataType data_type_;
 };
 
+template <typename T>
+static void NormalizeCosineCentroid(void *data, size_t dimension) {
+  // Cosine stores unit coordinates followed by a float original-norm field.
+  // The mean of unit vectors is not itself unit length. Routing uses 1-dot,
+  // so normalize every updated centroid without including that metadata.
+  const size_t coordinates = dimension - sizeof(float) / sizeof(T);
+  auto *values = static_cast<T *>(data);
+  double squared_norm = 0;
+  for (size_t i = 0; i < coordinates; ++i) {
+    const double value = values[i];
+    squared_norm += value * value;
+  }
+  if (squared_norm > 0) {
+    const double inverse = 1.0 / std::sqrt(squared_norm);
+    for (size_t i = 0; i < coordinates; ++i) {
+      values[i] = static_cast<T>(double(values[i]) * inverse);
+    }
+  }
+  const float stored_norm = squared_norm > 0 ? 1.0f : 0.0f;
+  std::memcpy(values + coordinates, &stored_norm, sizeof(stored_norm));
+}
+
 static inline std::shared_ptr<VectorMean> NewVectorMean(const IndexMeta &meta) {
   switch (meta.data_type()) {
     case IndexMeta::DataType::DT_FP16:
@@ -416,6 +440,13 @@ static inline void PurgeCentroids(IndexCluster::CentroidList &cents,
 }
 
 int KmeansCluster::init(const IndexMeta &meta, const ailego::Params &params) {
+  if (meta.metric_name() == "Cosine" &&
+      (meta.data_type() == IndexMeta::DT_FP32 ||
+       meta.data_type() == IndexMeta::DT_FP16) &&
+      (meta.extra_meta_size() != 0 ||
+       meta.dimension() <= sizeof(float) / IndexMeta::UnitSizeof(meta.data_type()))) {
+    return IndexError_InvalidArgument;
+  }
   meta_ = meta;
   this->update_params(params);
 
@@ -1117,6 +1148,15 @@ void KmeansCluster::update_centroid_thread(
   centroid->set_score(cluster_score);
   centroid->set_follows(accum->count());
   accum->mean(centroid->mutable_buffer());
+  if (meta_.metric_name() == "Cosine") {
+    if (meta_.data_type() == IndexMeta::DT_FP32) {
+      NormalizeCosineCentroid<float>(centroid->mutable_buffer()->data(),
+                                      meta_.dimension());
+    } else if (meta_.data_type() == IndexMeta::DT_FP16) {
+      NormalizeCosineCentroid<ailego::Float16>(centroid->mutable_buffer()->data(),
+                                              meta_.dimension());
+    }
+  }
 } catch (const std::bad_alloc &) {
   workspace_error_.store(IndexError_NoMemory, std::memory_order_relaxed);
 } catch (const std::exception &) {

@@ -1433,6 +1433,40 @@ TEST_F(IVFBuilderTest, StableSourceKeepsOriginalAddressesAndBackingData) {
   EXPECT_FALSE(iter->is_valid());
 }
 
+TEST_F(IVFBuilderTest, DefaultCosineTrainingNormalizesCentroidForRouting) {
+  // Exercise the real builder default (generic Kmeans for turbo Cosine),
+  // including conversion of raw vectors with unequal original lengths.
+  auto meta = index_meta_;
+  meta.set_metric("Cosine", 0, Params());
+  meta.set_quantizer("Fp32Quantizer", 0, Params());
+  auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  ASSERT_EQ(0, quantizer->init(meta, Params()));
+  auto input = std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(
+      dimension_);
+  for (size_t i = 0; i < 20; ++i) {
+    NumericalVector<float> row(dimension_, 0.0f);
+    row[i % 2] = float(i + 1);
+    input->emplace(i, row);
+  }
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "1");
+  IVFBuilder builder;
+  ASSERT_EQ(0, builder.init(meta, params, quantizer));
+  ASSERT_EQ(0, builder.train(threads_, input));
+  auto index = builder.centroid_index();
+  ASSERT_EQ(1U, index->centroids_count());
+  auto context = index->create_context();
+  context->set_topk(1);
+  NumericalVector<float> query(dimension_, 0.0f);
+  query[0] = 1.0f;
+  IndexQueryMeta query_meta(IndexMeta::DT_FP32, dimension_);
+  ASSERT_EQ(0, index->search(query.data(), query_meta, 1, context));
+  ASSERT_EQ(1U, context->result().size());
+  EXPECT_NEAR(1.0f - std::sqrt(0.5f), context->result()[0].score(), 1e-5f);
+  ASSERT_EQ(0, builder.cleanup());
+}
+
 TEST_F(IVFBuilderTest, StableSourceSupportsTransformsAndRepeatedDumps) {
   // Raw postings, centroid conversion, legacy posting conversion, and the
   // automatic Cosine/IP centroid converters all retain the original data.
