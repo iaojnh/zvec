@@ -60,7 +60,9 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
 
   // Payload released by a successful eviction, when known by the owner.
   // Zero retains the existing page-sized fallback for legacy owners.
-  virtual size_t eviction_bytes(eviction_key_t /*owner_key*/) const { return 0; }
+  virtual size_t eviction_bytes(eviction_key_t /*owner_key*/) const {
+    return 0;
+  }
 
   //! Opportunistically reclaim an inactive costly payload. The queue owns
   //! the popped membership and requeues it when this returns false. Ordinary
@@ -211,8 +213,8 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
   size_t recover_owner_queues();
 
   size_t recycle_inactive(size_t max_attempts);
-  size_t batch_recycle_impl(size_t count, size_t scan_count,
-                            bool age_protected, size_t bytes = 0);
+  size_t batch_recycle_impl(size_t count, size_t scan_count, bool age_protected,
+                            size_t bytes = 0);
 
   BlockEvictionQueue() {
     for (size_t i = 0; i < kQueueCount; ++i) {
@@ -437,6 +439,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   };
   CacheBuffer *try_acquire_cache_buffer(size_t bytes);
   void release_cache_buffer(CacheBuffer *buffer);
+  // Reassigning an already charged mapping must preserve mandatory-workspace
+  // priority, just like acquiring one from the idle cache-buffer pool.
+  bool can_reuse_cache_backing() const {
+    return !process_rss_.pressure() &&
+           workspace_waiting_size_.load(std::memory_order_relaxed) == 0;
+  }
   void request_cache_reclaim(size_t bytes);
 
   void release_metadata(const size_t buffer_size);
@@ -580,10 +588,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     size_t slab_header_bytes{0};      // included in metadata_used and committed
     uint64_t alloc_from_freelist{0};  // acquisitions served from a shard
     uint64_t alloc_from_slab{0};      // cold page acquisitions from slabs
-    uint64_t slab_reclaimed_pages{0};  // pages decommitted under pressure
-    uint64_t bg_evict_rounds{0};       // background reclaim passes
+    uint64_t slab_reclaimed_pages{0};     // pages decommitted under pressure
+    uint64_t bg_evict_rounds{0};          // background reclaim passes
     uint64_t bg_charge_notifications{0};  // successful charges needing reclaim
-    uint64_t bg_evicted_buffers{0};    // buffers reclaimed by background thread
+    uint64_t bg_evicted_buffers{0};  // buffers reclaimed by background thread
     uint64_t bg_no_progress_sleeps{0};  // backoffs after zero-page reclaim
     uint64_t high_watermark_hits{0};  // foreground acquire hit the capacity cap
     uint64_t capacity_waits{0};       // waits for a released budget slot

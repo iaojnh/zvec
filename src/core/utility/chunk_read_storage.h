@@ -24,6 +24,7 @@ class ChunkReadStorage : public IndexStorage {
     uint64_t prefetch_depth{0}, prefetch_limit_bytes{0};
     uint64_t prefetch_pending_requests{0}, prefetch_pending_bytes{0};
     uint64_t prefetch_read_bytes{0}, prefetch_submit_batches{0};
+    uint64_t backing_reuses{0}, backing_reuse_scans{0};
   };
 
   ChunkReadStorage();

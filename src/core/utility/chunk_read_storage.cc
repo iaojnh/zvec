@@ -100,10 +100,14 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     std::atomic<bool> transient{false};
     bool valid{false}, ever_loaded{false}, filter_readmission{false};
     size_t offset{0}, bytes{0}, allocation_bytes{0};
+    size_t reuse_next{0};  // immutable capacity-class ring after layout setup
     Pool::CacheBuffer *buffer{nullptr};
     std::atomic<size_t> capacity{0};
   };
   static constexpr size_t kEntries = 256;
+  static constexpr size_t kReuseClasses =
+      std::numeric_limits<size_t>::digits * 4;
+  static constexpr size_t kNoEntry = std::numeric_limits<size_t>::max();
   struct TableSegment {
     MetadataCharge charge{sizeof(TableSegment), true};
     std::array<Entry, kEntries> entries;
@@ -112,12 +116,27 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     explicit Layout(size_t count)
         : charge(sizeof(Layout) + count * sizeof(Entry)),
           entries(new Entry[count]),
-          size(count) {}
+          size(count) {
+      reuse_clock.fill(kNoEntry);
+    }
     MetadataCharge charge;
     std::unique_ptr<Entry[]> entries;
     size_t size;
     size_t clock{0};  // advanced only under the storage's read-ahead mutex
+    std::array<size_t, kReuseClasses> reuse_clock;
+    std::array<size_t, kReuseClasses> reuse_count{};
     std::unique_ptr<Layout> next;
+    void add_reuse_entry(size_t index, size_t bucket) {
+      size_t &cursor = reuse_clock[bucket];
+      if (cursor == kNoEntry) {
+        cursor = index;
+        entries[index].reuse_next = index;
+      } else {
+        entries[index].reuse_next = entries[cursor].reuse_next;
+        entries[cursor].reuse_next = index;
+      }
+      ++reuse_count[bucket];
+    }
     Entry *find(size_t offset) const {
       size_t lo = 0, hi = size;
       while (lo < hi) {
@@ -430,26 +449,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
             item->requests.fetch_add(1, std::memory_order_relaxed);
         const bool transient =
             item->filter_readmission && item->ever_loaded && !requests;
-        if (!owner.claim_capacity(capacity)) {
-          item->refs.store(kUnloaded, std::memory_order_release);
-          break;
-        }
-        auto *buffer = Pool::get_instance().try_acquire_cache_buffer(capacity);
+        auto *buffer = owner.acquire_backing(*layout, capacity);
         if (!buffer) {
-          owner.reclaim_layout(*layout, capacity);
-          buffer = Pool::get_instance().try_acquire_cache_buffer(capacity);
-        }
-        // Large list reads need contiguous backing. Retire only unpinned cache
-        // entries, with bounded CLOCK work; never wait for another reader's
-        // pin.
-        for (size_t attempt = 0; !buffer && attempt < 4; ++attempt) {
-          Pool::get_instance().request_cache_reclaim(capacity);
-          ailego::BlockEvictionQueue::get_instance().reclaim_for_allocation(
-              capacity);
-          buffer = Pool::get_instance().try_acquire_cache_buffer(capacity);
-        }
-        if (!buffer) {
-          owner.cache_bytes.fetch_sub(capacity, std::memory_order_relaxed);
           item->refs.store(kUnloaded, std::memory_order_release);
           break;
         }
@@ -700,25 +701,86 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return false;
   }
   size_t cache_capacity(size_t requested) const {
-    // The pool reuses exact-sized mappings. Whole lists have many different
-    // lengths; a small set of capacity classes avoids remapping their pages on
-    // every replacement. Charge the padding, but never read it from the file.
-    constexpr size_t quantum = 4UL << 20;
-    if (adaptive && requested >= quantum &&
-        requested <= std::numeric_limits<size_t>::max() - (quantum - 1))
-      return (requested + quantum - 1) / quantum * quantum;
-    return AlignPage(requested);
+    // Four classes per doubling bound padding to 25%, independently of the
+    // index's longest list. Buffers and direct I/O remain whole-list sized.
+    if (!adaptive || requested < (4UL << 20)) return AlignPage(requested);
+    size_t base = 4UL << 20;
+    while (base <= requested / 2) base *= 2;
+    const size_t quantum = base / 4;
+    if (requested > std::numeric_limits<size_t>::max() - (quantum - 1))
+      return requested;  // callers already include physical page alignment
+    return (requested + quantum - 1) / quantum * quantum;
   }
-  size_t uniform_cache_capacity(size_t maximum) const {
-#if defined(__linux__) && !defined(__ANDROID__)
-    // Reuse whole-list buffers sized for this index's longest list, provided
-    // a full queue fits. Skewed/oversized lists keep the size-class fallback.
-    if (adaptive && read_ahead &&
-        maximum <= read_ahead->byte_limit / read_ahead->depth)
-      return maximum;
-#endif
-    (void)maximum;
-    return 0;
+  static size_t reuse_class(size_t capacity) {
+    if (capacity < (4UL << 20)) return 0;
+    size_t base = 4UL << 20, bucket = 1;
+    while (base <= capacity / 2) {
+      base *= 2;
+      bucket += 4;
+    }
+    return bucket + (capacity - base) / (base / 4);
+  }
+  Pool::CacheBuffer *reuse_backing(Layout &layout, size_t required) {
+    // Called under the read-ahead mutex. Transfer an unpinned, cold buffer
+    // without passing through the idle pool: its mapping, descriptor and
+    // global/local capacity charges remain live throughout the handoff.
+    if (!Pool::get_instance().can_reuse_cache_backing()) return nullptr;
+    const size_t bucket = reuse_class(required);
+    size_t &cursor = layout.reuse_clock[bucket];
+    const size_t attempts =
+        std::min<size_t>(1024, layout.reuse_count[bucket] * 3);
+    for (size_t i = 0; i < attempts; ++i) {
+      Entry &item = layout.entries[cursor];
+      cursor = item.reuse_next;
+      if (item.capacity.load(std::memory_order_relaxed) != required) continue;
+      int expected = 0;
+      if (!item.refs.compare_exchange_strong(expected, kEvicting,
+                                             std::memory_order_acq_rel))
+        continue;
+      if (item.capacity.load(std::memory_order_relaxed) != required ||
+          !item.buffer ||
+          item.referenced.exchange(false, std::memory_order_relaxed) ||
+          item.priority.exchange(0, std::memory_order_relaxed) != 0) {
+        item.refs.store(0, std::memory_order_release);
+        continue;
+      }
+      auto *buffer = item.buffer;
+      item.buffer = nullptr;
+      item.data.store(nullptr, std::memory_order_relaxed);
+      item.capacity.store(0, std::memory_order_relaxed);
+      item.requests.store(0, std::memory_order_relaxed);
+      item.queued.store(false, std::memory_order_relaxed);
+      item.refs.store(kUnloaded, std::memory_order_release);
+      trims.fetch_add(1, std::memory_order_relaxed);
+      backing_reuses.fetch_add(1, std::memory_order_relaxed);
+      backing_reuse_scans.fetch_add(i + 1, std::memory_order_relaxed);
+      return buffer;
+    }
+    backing_reuse_scans.fetch_add(attempts, std::memory_order_relaxed);
+    return nullptr;
+  }
+  Pool::CacheBuffer *acquire_backing(Layout &layout, size_t capacity) {
+    auto &pool = Pool::get_instance();
+    const bool claimed = claim_capacity(capacity);
+    if (claimed) {
+      if (auto *buffer = pool.try_acquire_cache_buffer(capacity)) return buffer;
+    }
+    // A transfer already owns one capacity charge; do not debit it twice.
+    if (auto *buffer = reuse_backing(layout, capacity)) {
+      if (claimed) cache_bytes.fetch_sub(capacity, std::memory_order_relaxed);
+      return buffer;
+    }
+    if (!claimed) return nullptr;
+    reclaim_layout(layout, capacity);
+    auto *buffer = pool.try_acquire_cache_buffer(capacity);
+    for (size_t attempt = 0; !buffer && attempt < 4; ++attempt) {
+      pool.request_cache_reclaim(capacity);
+      ailego::BlockEvictionQueue::get_instance().reclaim_for_allocation(
+          capacity);
+      buffer = pool.try_acquire_cache_buffer(capacity);
+    }
+    if (!buffer) cache_bytes.fetch_sub(capacity, std::memory_order_relaxed);
+    return buffer;
   }
   void reclaim_layout(Layout &layout, size_t required) {
     // A whole-chain allocation should replace cold posting payload before it
@@ -1086,6 +1148,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       prefetch_failed{0};
   std::atomic<uint64_t> prefetch_wait_ns{0}, prefetch_peak_requests{0},
       prefetch_peak_bytes{0};
+  std::atomic<uint64_t> backing_reuses{0}, backing_reuse_scans{0};
   std::atomic<size_t> prefetch_pending_requests{0}, prefetch_pending_bytes{0};
   std::atomic<uint64_t> prefetch_read_bytes{0}, prefetch_submit_batches{0};
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -1154,21 +1217,19 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
       end = chunk.offset + chunk.size;
     }
     auto layout = std::make_unique<State::Layout>(chunks.size());
-    size_t maximum = 0;
     for (size_t i = 0; i < chunks.size(); ++i) {
       layout->entries[i].offset = offset_ + chunks[i].offset;
       layout->entries[i].bytes = chunks[i].size;
       layout->entries[i].filter_readmission = true;
       const size_t prefix = layout->entries[i].offset % state_->io_alignment;
-      maximum = std::max(maximum, AlignPage(prefix + chunks[i].size));
-    }
-    const size_t allocation = state_->uniform_cache_capacity(maximum);
-    for (size_t i = 0; i < chunks.size(); ++i) {
+      const size_t allocation =
+          state_->cache_capacity(AlignPage(prefix + chunks[i].size));
       layout->entries[i].allocation_bytes = allocation;
+      layout->add_reuse_entry(i, State::reuse_class(allocation));
       // Large reusable list buffers stay in CLOCK until replacement. Sending
       // first-revisit reads to the generic idle pool immediately discards
       // their pages, defeating whole-list buffer reuse on the next query.
-      if (allocation >= (4UL << 20))
+      if (state_->adaptive && allocation >= (4UL << 20))
         layout->entries[i].filter_readmission = false;
     }
     std::lock_guard<std::mutex> lock(state_->table_mutex);
@@ -1430,6 +1491,8 @@ ChunkReadStorage::Stats ChunkReadStorage::stats() const {
   result.prefetch_pending_bytes = s.prefetch_pending_bytes.load();
   result.prefetch_read_bytes = s.prefetch_read_bytes.load();
   result.prefetch_submit_batches = s.prefetch_submit_batches.load();
+  result.backing_reuses = s.backing_reuses.load();
+  result.backing_reuse_scans = s.backing_reuse_scans.load();
 #if defined(__linux__) && !defined(__ANDROID__)
   if (s.read_ahead) {
     result.prefetch_depth = s.read_ahead->depth;
