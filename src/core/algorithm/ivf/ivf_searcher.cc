@@ -253,16 +253,21 @@ int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
       auto &heap = ctx->mutable_result_heap();
       heap.clear();
       const auto *keys = single_keys ? single_keys
-                                   : p_keys ? &(*p_keys)[base + q] : nullptr;
+                         : p_keys    ? &(*p_keys)[base + q]
+                                     : nullptr;
       if (keys) {
-        ret = entity->search_by_p_keys(one, *keys, filter, &heap,
-                                       &stats);
+        ret = entity->search_by_p_keys(one, *keys, filter, &heap, &stats);
         ivf_check_error_code(ret);
       } else if (brute) {
         ret = !filter.is_valid() ? entity->search(one, &heap, &stats)
                                  : entity->search(one, filter, &heap, &stats);
         ivf_check_error_code(ret);
       } else {
+        size_t hinted_scans = 0;
+        for (const auto &centroid : centroid_ctx->result(q)) {
+          if (hinted_scans >= ctx->max_scan_count()) break;
+          hinted_scans += entity->prefetch_list(centroid.key());
+        }
         size_t scans = 0;
         for (const auto &centroid : centroid_ctx->result(q)) {
           if (scans >= ctx->max_scan_count()) break;

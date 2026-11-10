@@ -20,9 +20,9 @@
 #include "algorithm/cluster/cluster_params.h"
 #include "algorithm/ivf/ivf_params.h"
 #include "algorithm/ivf/ivf_streamer.h"
+#include "utility/chunk_read_storage.h"
 #include "buffered_input.h"
 #include "holder_builder.h"
-#include "utility/chunk_read_storage.h"
 
 namespace zvec::core_interface {
 
@@ -204,6 +204,20 @@ int IVFIndex::open(const std::string &file_path,
       storage_params.set(core::CHUNK_READ_STORAGE_MAX_READ_BYTES,
                          size_t{1UL << 20});
       storage_params.set(core::CHUNK_READ_STORAGE_WORKSPACE_COUNT, size_t{64});
+      const size_t shared_budget =
+          ailego::MemoryLimitPool::get_instance().capacity();
+      size_t prefetch_depth = 12;
+      size_t prefetch_bytes =
+          shared_budget ? std::min<size_t>(768UL << 20, shared_budget / 4 * 3)
+                        : 768UL << 20;
+      proxima_index_params_.get(core::CHUNK_READ_STORAGE_PREFETCH_DEPTH,
+                                &prefetch_depth);
+      proxima_index_params_.get(core::CHUNK_READ_STORAGE_PREFETCH_BYTES,
+                                &prefetch_bytes);
+      storage_params.set(core::CHUNK_READ_STORAGE_PREFETCH_DEPTH,
+                         prefetch_depth);
+      storage_params.set(core::CHUNK_READ_STORAGE_PREFETCH_BYTES,
+                         prefetch_bytes);
       storage_ = core::IndexFactory::CreateStorage("ChunkReadStorage");
       if (storage_ == nullptr) {
         LOG_ERROR("Failed to create ChunkReadStorage for IVF");

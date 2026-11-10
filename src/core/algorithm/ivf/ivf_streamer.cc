@@ -229,7 +229,9 @@ int IVFStreamer::search_bf(const void *query, const IndexQueryMeta &qmeta,
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
-    const auto *keys = single_keys ? single_keys : p_keys ? &(*p_keys)[q] : nullptr;
+    const auto *keys = single_keys ? single_keys
+                       : p_keys    ? &(*p_keys)[q]
+                                   : nullptr;
     if (keys) {
       ret =
           entity->search_by_p_keys(query, *keys, filter, &heap, &context_stats);
@@ -315,6 +317,11 @@ int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
+    size_t hinted_scans = 0;
+    for (size_t i = 0;
+         i < centroids.size() && hinted_scans < ctx->max_scan_count(); ++i) {
+      hinted_scans += entity->prefetch_list(centroids[i].key());
+    }
     size_t total_scan_count = 0;
     for (size_t i = 0;
          i < centroids.size() && total_scan_count < ctx->max_scan_count();

@@ -936,15 +936,32 @@ int IVFEntity::load(const IndexStorage::Pointer &container) try {
       if (list->block_count !=
           (size_t(list->vector_count) + block_vecs - 1) / block_vecs)
         return IndexError_InvalidFormat;
+      if (meta_.major_order() == IndexMeta::MO_ROW) {
+        if (list->block_count) {
+          const size_t tail =
+              list->vector_count - (list->block_count - 1) * block_vecs;
+          const size_t bytes =
+              (list->block_count - 1) * block_size +
+              (packed_quantizer_
+                   ? block_size
+                   : ailego_align(tail * meta_.element_size(), 32));
+          if (list->offset > header_.inverted_body_size ||
+              bytes > header_.inverted_body_size - list->offset)
+            return IndexError_InvalidFormat;
+          chunks.push_back({list->offset, bytes});
+        }
+        continue;
+      }
       for (size_t i = 0; i < list->block_count; i += kBatchBlocks) {
         const size_t blocks = std::min(kBatchBlocks, list->block_count - i);
-        const size_t items = std::min(blocks * block_vecs,
-                                      list->vector_count - i * block_vecs);
+        const size_t items =
+            std::min(blocks * block_vecs, list->vector_count - i * block_vecs);
         const size_t tail = items - (blocks - 1) * block_vecs;
         const size_t offset = list->offset + i * block_size;
-        const size_t bytes = (blocks - 1) * block_size +
+        const size_t bytes =
+            (blocks - 1) * block_size +
             (packed_quantizer_ ? block_size
-                              : ailego_align(tail * meta_.element_size(), 32));
+                               : ailego_align(tail * meta_.element_size(), 32));
         if (offset > header_.inverted_body_size ||
             bytes > header_.inverted_body_size - offset)
           return IndexError_InvalidFormat;
@@ -966,6 +983,25 @@ int IVFEntity::load(const IndexStorage::Pointer &container) try {
   return 0;
 } catch (const std::bad_alloc &) {
   return IndexError_NoMemory;
+}
+
+size_t IVFEntity::prefetch_list(size_t inverted_list_id) const {
+  if (!inverted_->supports_read_chunks() ||
+      meta_.major_order() != IndexMeta::MO_ROW ||
+      inverted_list_id >= header_.inverted_list_count)
+    return 0;
+  IndexStorage::MemoryBlock meta;
+  const auto *list = inverted_list_meta(inverted_list_id, meta);
+  if (!list || !list->block_count) return 0;
+  const size_t tail =
+      list->vector_count - (list->block_count - 1) * header_.block_vector_count;
+  const size_t bytes =
+      (list->block_count - 1) * header_.block_size +
+      (packed_quantizer_ ? header_.block_size
+                         : ailego_align(tail * meta_.element_size(), 32));
+  inverted_->prefetch(list->offset, bytes,
+                      IndexStorage::Segment::CachePriority::kLow);
+  return list->vector_count;
 }
 
 int IVFEntity::search(size_t inverted_list_id, const void *query,
@@ -1001,6 +1037,26 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
   const int norm_ret =
       inverted_list_normalize_value(inverted_list_id, &norm_val);
   if (norm_ret != 0) return norm_ret;
+  IndexStorage::MemoryBlock list_data;
+  if (row_major && inverted_->supports_read_chunks() &&
+      list_meta->block_count) {
+    const size_t tail =
+        list_meta->vector_count - (list_meta->block_count - 1) * block_vecs;
+    const size_t bytes =
+        (list_meta->block_count - 1) * block_size +
+        (packed_quantizer_ ? block_size
+                           : ailego_align(tail * element_size, 32));
+    inverted_->prefetch(list_meta->offset, bytes,
+                        IndexStorage::Segment::CachePriority::kNormal);
+    // One lease holds the entire chain through all scoring batches, including
+    // transient reads that must not enter the long-lived cache.
+    try {
+      if (inverted_->read(list_meta->offset, list_data, bytes) != bytes)
+        list_data.reset();
+    } catch (const std::bad_alloc &) {
+      list_data.reset();  // a tight budget may still execute in batch scratch
+    }
+  }
   for (size_t i = 0; i < list_meta->block_count; i += batch_size) {
     const size_t blocks = std::min(batch_size, list_meta->block_count - i);
     //! Read keys
@@ -1013,8 +1069,8 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       return keys_->read_error();
     }
 
-    //! Read vectors after keys. A resident scatter read pins no pages while a
-    //! second segment is faulted into a small buffer pool.
+    //! Borrow a slice of the complete-chain lease. If whole-chain admission
+    //! failed, preserve the bounded batch-scatter execution path.
     const size_t off = list_meta->offset + i * block_size;
     if (items <= (blocks - 1) * block_vecs) {
       return IndexError_InvalidFormat;
@@ -1031,9 +1087,17 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
         std::min(serialized_bytes,
                  static_cast<size_t>(header_.inverted_body_size - off));
     auto &scatter_data = scatter_data_;
-    auto release_scatter = ailego::ScopeGuard::Make([&] { scatter_data.reset(); });
+    auto release_scatter =
+        ailego::ScopeGuard::Make([&] { scatter_data.reset(); });
     if (row_major) {
-      if (inverted_->read_scatter(off, scatter_data, size) != size) {
+      if (list_data.data()) {
+        scatter_data.reset();
+        scatter_data.spans.push_back(
+            {static_cast<const uint8_t *>(list_data.data()) + off -
+                 list_meta->offset,
+             size});
+        scatter_data.size = size;
+      } else if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);
         return inverted_->read_error();
       }
@@ -1143,6 +1207,24 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
   const int norm_ret =
       inverted_list_normalize_value(inverted_list_id, &norm_val);
   if (norm_ret != 0) return norm_ret;
+  IndexStorage::MemoryBlock list_data;
+  if (row_major && inverted_->supports_read_chunks() &&
+      list_meta->block_count) {
+    const size_t tail =
+        list_meta->vector_count - (list_meta->block_count - 1) * block_vecs;
+    const size_t bytes =
+        (list_meta->block_count - 1) * block_size +
+        (packed_quantizer_ ? block_size
+                           : ailego_align(tail * element_size, 32));
+    inverted_->prefetch(list_meta->offset, bytes,
+                        IndexStorage::Segment::CachePriority::kNormal);
+    try {
+      if (inverted_->read(list_meta->offset, list_data, bytes) != bytes)
+        list_data.reset();
+    } catch (const std::bad_alloc &) {
+      list_data.reset();
+    }
+  }
   for (size_t i = 0; i < list_meta->block_count; i += batch_size) {
     const size_t blocks = std::min(batch_size, list_meta->block_count - i);
     //! Read keys
@@ -1155,7 +1237,7 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       return keys_->read_error();
     }
 
-    //! Read vectors after keys so scatter-page pins cover computation only.
+    //! The whole-chain lease spans all batches; fallback pins only this batch.
     const size_t off = list_meta->offset + i * block_size;
     if (items <= (blocks - 1) * block_vecs) {
       return IndexError_InvalidFormat;
@@ -1172,9 +1254,17 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
         std::min(serialized_bytes,
                  static_cast<size_t>(header_.inverted_body_size - off));
     auto &scatter_data = scatter_data_;
-    auto release_scatter = ailego::ScopeGuard::Make([&] { scatter_data.reset(); });
+    auto release_scatter =
+        ailego::ScopeGuard::Make([&] { scatter_data.reset(); });
     if (row_major) {
-      if (inverted_->read_scatter(off, scatter_data, size) != size) {
+      if (list_data.data()) {
+        scatter_data.reset();
+        scatter_data.spans.push_back(
+            {static_cast<const uint8_t *>(list_data.data()) + off -
+                 list_meta->offset,
+             size});
+        scatter_data.size = size;
+      } else if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);
         return inverted_->read_error();
       }
