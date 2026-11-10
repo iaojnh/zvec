@@ -2271,6 +2271,13 @@ TEST_F(BufferStorageWriteTest,
 }
 
 TEST_F(BufferStorageWriteTest, CachedScalarScratchWorksAtFullBudget) {
+  // Keep the idle slot cached while verifying exact address/charge reuse.
+  // Pressure reclamation is exercised separately with the evictor running.
+  auto &actual_pool = ailego::MemoryLimitPool::get_instance();
+  ailego::MemoryLimitPoolTestPeer::stop_background(actual_pool);
+  AILEGO_DEFER([&] {
+    ailego::MemoryLimitPoolTestPeer::start_background(actual_pool);
+  });
   auto storage = open_writable();
   ASSERT_TRUE(storage);
   ASSERT_EQ(0, storage->append("reuse", 2 * ailego::kVectorPageSize));
@@ -2284,15 +2291,19 @@ TEST_F(BufferStorageWriteTest, CachedScalarScratchWorksAtFullBudget) {
   ASSERT_EQ(expected.size(),
             seg->read_borrowed_immutable(offset, pin, expected.size()));
   ASSERT_EQ(expected.size(), seg->read(offset, block, expected.size()));
+  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, block.type_);
   const void *address = block.data();
   block.reset();
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   {
     ailego::MemoryReservation remaining;
     remaining.add(pool.available());
+    ASSERT_EQ(0u, pool.available());
     const size_t used = pool.used();
     ASSERT_EQ(expected.size(), seg->read(offset, block, expected.size()));
     EXPECT_EQ(address, block.data());
+    EXPECT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, block.type_);
+    EXPECT_EQ(0, std::memcmp(block.data(), expected.data(), expected.size()));
     EXPECT_EQ(used, pool.used());
     EXPECT_LE(pool.used(), pool.capacity());
   }
