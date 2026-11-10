@@ -1046,7 +1046,7 @@ void CheckCosineTraining(IndexMeta::DataType type, bool seeded,
   meta.set_metric("Cosine", 0, Params());
   auto features = std::make_shared<CompactIndexFeatures>(meta);
   IndexCluster::CentroidList initial;
-  uint32_t norm_bits = 0x3f80fe00; // finite float; one FP16 word is a NaN
+  uint32_t norm_bits = 0x3f80fe00;  // finite float; one FP16 word is a NaN
   float awkward_norm;
   std::memcpy(&awkward_norm, &norm_bits, sizeof(awkward_norm));
   const float norms[] = {awkward_norm, 1.0f, 10000.0f};
@@ -1103,7 +1103,8 @@ void CheckCosineTraining(IndexMeta::DataType type, bool seeded,
 template <typename T>
 void CheckCosineContext() {
   using Context = TurboKmeansContext<T, true, true>;
-  constexpr size_t coordinates = 7, dim = coordinates + sizeof(float) / sizeof(T);
+  constexpr size_t coordinates = 7,
+                   dim = coordinates + sizeof(float) / sizeof(T);
   std::vector<T> data(Context::BatchCount * dim, static_cast<T>(0.0f));
   std::vector<T> query(2 * dim, static_cast<T>(0.0f));
   for (size_t i = 0; i < Context::BatchCount; ++i) {
@@ -1119,7 +1120,8 @@ void CheckCosineContext() {
       const float expected = i % coordinates == j ? -1.0f : 0.0f;
       EXPECT_FLOAT_EQ(expected, scores[j * Context::BatchCount + i]);
       float scalar;
-      Context::Distance(data.data() + i * dim, query.data() + j * dim, dim, &scalar);
+      Context::Distance(data.data() + i * dim, query.data() + j * dim, dim,
+                        &scalar);
       EXPECT_FLOAT_EQ(expected, scalar);
     }
   }

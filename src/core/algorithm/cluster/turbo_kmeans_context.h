@@ -79,9 +79,9 @@ class TurboKmeansContext
       // centroid represents a unit vector, including for FP16 where the float
       // tail occupies two half values and must never be interpreted as halves.
       const float centroid_norm = *norm > 0.0f ? 1.0f : 0.0f;
-      std::memcpy(reinterpret_cast<char *>(data) +
-                      vector_dimension(dim) * sizeof(T),
-                  &centroid_norm, sizeof(centroid_norm));
+      std::memcpy(
+          reinterpret_cast<char *>(data) + vector_dimension(dim) * sizeof(T),
+          &centroid_norm, sizeof(centroid_norm));
     }
   }
 

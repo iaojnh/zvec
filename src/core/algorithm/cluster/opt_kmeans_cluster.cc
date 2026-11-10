@@ -975,7 +975,7 @@ class NibbleKmeansAlgorithm : public OptKmeansAlgorithm {
 
   //! update centroids
   int update_centroids(IndexCluster::CentroidList &cents,
-                        const turbo::NibbleKmeans<T, IndexThreads> &algorithm);
+                       const turbo::NibbleKmeans<T, IndexThreads> &algorithm);
 };
 
 template <typename T>

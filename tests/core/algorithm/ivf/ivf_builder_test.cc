@@ -22,7 +22,6 @@
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
-#include "turbo/algorithm/kmeans.h"
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -30,6 +29,7 @@
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_provider.h>
 #include <zvec/core/framework/index_streamer.h>
+#include "turbo/algorithm/kmeans.h"
 #include "ivf_entity.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
@@ -1442,8 +1442,8 @@ TEST_F(IVFBuilderTest, DefaultCosineTrainingNormalizesCentroidForRouting) {
   auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
   ASSERT_NE(nullptr, quantizer);
   ASSERT_EQ(0, quantizer->init(meta, Params()));
-  auto input = std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(
-      dimension_);
+  auto input =
+      std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(dimension_);
   for (size_t i = 0; i < 20; ++i) {
     NumericalVector<float> row(dimension_, 0.0f);
     row[i % 2] = float(i + 1);

@@ -444,7 +444,8 @@ int KmeansCluster::init(const IndexMeta &meta, const ailego::Params &params) {
       (meta.data_type() == IndexMeta::DT_FP32 ||
        meta.data_type() == IndexMeta::DT_FP16) &&
       (meta.extra_meta_size() != 0 ||
-       meta.dimension() <= sizeof(float) / IndexMeta::UnitSizeof(meta.data_type()))) {
+       meta.dimension() <=
+           sizeof(float) / IndexMeta::UnitSizeof(meta.data_type()))) {
     return IndexError_InvalidArgument;
   }
   meta_ = meta;
@@ -1151,10 +1152,10 @@ void KmeansCluster::update_centroid_thread(
   if (meta_.metric_name() == "Cosine") {
     if (meta_.data_type() == IndexMeta::DT_FP32) {
       NormalizeCosineCentroid<float>(centroid->mutable_buffer()->data(),
-                                      meta_.dimension());
+                                     meta_.dimension());
     } else if (meta_.data_type() == IndexMeta::DT_FP16) {
-      NormalizeCosineCentroid<ailego::Float16>(centroid->mutable_buffer()->data(),
-                                              meta_.dimension());
+      NormalizeCosineCentroid<ailego::Float16>(
+          centroid->mutable_buffer()->data(), meta_.dimension());
     }
   }
 } catch (const std::bad_alloc &) {
