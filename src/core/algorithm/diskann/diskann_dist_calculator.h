@@ -24,6 +24,7 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_meta.h>
 #include "diskann_entity.h"
+#include "diskann_pq_read_batch.h"
 #include "diskann_visit_filter.h"
 
 namespace zvec {
@@ -287,41 +288,27 @@ class DistCalculator {
     auto release =
         ailego::ScopeGuard::Make([&]() { quant_code_blocks_.clear(); });
     quant_dp_list_.resize(n);
-    if (paged_quant_codes_) {
-      quant_code_blocks_.resize(n);
-      quant_code_reads_.clear();
-      quant_code_reads_.reserve(n);
-    }
     for (uint32_t i = 0; i < n; ++i) {
       if (ids[i] >= entity_->doc_cnt()) {
         error_code_ = IndexError_InvalidFormat;
         return;
       }
-      const size_t offset = static_cast<size_t>(ids[i]) * quant_code_size_;
-      if (paged_quant_codes_) {
-        quant_code_reads_.emplace_back(paged_quant_codes_.get(), offset,
-                                       quant_code_size_,
-                                       &quant_code_blocks_[i]);
-      } else {
+      if (!paged_quant_codes_) {
         if (!quant_codes_) {
           error_code_ = IndexError_NoReady;
           return;
         }
-        quant_dp_list_[i] = quant_codes_ + offset;
+        quant_dp_list_[i] =
+            quant_codes_ + static_cast<size_t>(ids[i]) * quant_code_size_;
       }
     }
     if (paged_quant_codes_) {
-      if (!paged_quant_codes_->read_borrowed_batch(quant_code_reads_.data(),
-                                                   n)) {
-        error_code_ = paged_quant_codes_->read_error();
+      const int ret = ReadPagedQuantizedCodes(
+          *paged_quant_codes_, ids, n, quant_code_size_, quant_code_blocks_,
+          quant_dp_list_);
+      if (ret) {
+        error_code_ = ret;
         return;
-      }
-      for (size_t i = 0; i < n; ++i) {
-        quant_dp_list_[i] = quant_code_blocks_[i].data();
-        if (!quant_dp_list_[i]) {
-          error_code_ = IndexError_ReadData;
-          return;
-        }
       }
     }
     quant_dist_impl_.batch(quant_dp_list_.data(), n, dists);
@@ -472,7 +459,6 @@ class DistCalculator {
 
   ailego::BudgetedVector<const void *> quant_dp_list_;
   ailego::BudgetedVector<IndexStorage::MemoryBlock> quant_code_blocks_;
-  ailego::BudgetedVector<IndexStorage::Segment::BorrowedRead> quant_code_reads_;
 };
 
 }  // namespace core

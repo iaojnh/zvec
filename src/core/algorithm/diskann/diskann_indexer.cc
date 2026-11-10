@@ -1427,7 +1427,15 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
       }
 
       io_timer.reset();
-      int submit_ret = reader_->submit(pending, frontier_read_reqs, io_ctx);
+      const bool copied_nodes =
+          buffer_backed_ &&
+          static_cast<BufferPoolAlignedFileReader *>(reader_.get())
+              ->try_submit_cached_nodes(pending, frontier_read_reqs, io_ctx,
+                                         frontier.data(), max_node_size_,
+                                         node_per_sector_);
+      int submit_ret = copied_nodes
+                           ? 0
+                           : reader_->submit(pending, frontier_read_reqs, io_ctx);
       stats.io_us += io_timer.micro_seconds();
       if (submit_ret != 0) {
         LOG_ERROR("cached_beam_search: submit failed, ret=%d", submit_ret);
