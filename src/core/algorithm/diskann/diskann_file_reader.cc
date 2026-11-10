@@ -939,6 +939,60 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
       return ret;
     }
 
+#if defined(__APPLE__)
+    // Darwin's native pages can contain several DiskANN sectors. submit()
+    // routes those sub-page requests here, including wholly resident batches.
+    // Borrow only during this call: search keeps its existing output lifetime
+    // and can reclaim graph pages before admitting PQ or result workspace.
+    // The 4 KiB Linux/Windows paths are intentionally unchanged.
+    if (ailego::kVectorPageSize > DiskAnnUtil::kSectorSize &&
+        !pool_->writable() && total_pages <= MAX_IO_DEPTH) {
+      std::array<ailego::block_id_t, MAX_IO_DEPTH> ids;
+      std::array<char *, MAX_IO_DEPTH> pages;
+      size_t count = 0;
+      auto release = ailego::ScopeGuard::Make(
+          [&] { pool_->release_pages(ids.data(), count); });
+      bool resident = true;
+      for (const auto &req : read_reqs) {
+        const size_t first = req.offset / ailego::kVectorPageSize;
+        const size_t last =
+            (req.offset + req.len - 1) / ailego::kVectorPageSize;
+        for (size_t id = first; id <= last; ++id) {
+          size_t index = 0;
+          while (index < count && ids[index] != id) ++index;
+          if (index != count) continue;
+          char *page = pool_->try_acquire_buffer(id);
+          if (!page) {
+            resident = false;
+            break;
+          }
+          ids[count] = id;
+          pages[count++] = page;
+        }
+        if (!resident) break;
+      }
+      if (resident) {
+        for (const auto &req : read_reqs) {
+          size_t offset = req.offset;
+          size_t left = req.len;
+          auto *destination = static_cast<char *>(req.buf);
+          while (left) {
+            const auto id = offset / ailego::kVectorPageSize;
+            const size_t within = offset % ailego::kVectorPageSize;
+            const size_t bytes =
+                std::min(left, ailego::kVectorPageSize - within);
+            const auto found = std::find(ids.begin(), ids.begin() + count, id);
+            std::memcpy(destination, pages[found - ids.begin()] + within, bytes);
+            offset += bytes;
+            destination += bytes;
+            left -= bytes;
+          }
+        }
+        return 0;
+      }
+    }
+#endif
+
     // At most one page entry, occurrence, admission slot and bypass request
     // per page occurrence. Admit the whole plan before allocating or pinning.
     ailego::MemoryReservation plan_memory;

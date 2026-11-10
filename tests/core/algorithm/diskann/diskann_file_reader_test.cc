@@ -228,6 +228,63 @@ TEST(DiskAnnFileReaderTest, BufferPoolReadsSectorSlicesFromNativePages) {
   reader.close();
 }
 
+TEST(DiskAnnFileReaderTest, CachedSectorBatchesKeepOrderAndReleasePins) {
+  namespace ailego = zvec::ailego;
+  const size_t page = ailego::kVectorPageSize;
+  const size_t sector = DiskAnnUtil::kSectorSize;
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  std::vector<uint8_t> source(8 * page);
+  for (size_t i = 0; i < source.size(); ++i)
+    source[i] = static_cast<uint8_t>((i / sector) * 17 + i % 251);
+  ASSERT_TRUE(file.write_all(source.data(), source.size()));
+  file.close();
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, budget.init(64UL << 20));
+  auto pool = std::make_shared<ailego::VecBufferPool>(file.path(), false);
+  ASSERT_EQ(0, pool->init());
+  for (ailego::block_id_t id = 0; id < 8; ++id) {
+    ASSERT_NE(nullptr, pool->acquire_buffer(id));
+    pool->release_pages(&id, 1);
+  }
+  BufferPoolAlignedFileReader reader(pool);
+  ASSERT_EQ(0, reader.open_from_pool(file.path()));
+  auto output = make_aligned_buffer(8 * page);
+  ASSERT_NE(nullptr, output);
+  std::vector<AlignedRead> requests{
+      {3 * page + sector, sector, output.get()},
+      {page - sector, 2 * sector,
+       static_cast<uint8_t *>(output.get()) + 2 * page},
+      {sector, sector, static_cast<uint8_t *>(output.get()) + 4 * page},
+      {3 * page + sector, sector,
+       static_cast<uint8_t *>(output.get()) + 6 * page}};
+  IOContext ctx{};
+  PendingBatch batch;
+  const auto before = pool->stats();
+  ASSERT_EQ(0, reader.submit(batch, requests, ctx));
+  std::vector<uint32_t> completed;
+  ASSERT_EQ(4, reader.get_completed(batch, ctx, 1, completed));
+  for (size_t i = 0; i < requests.size(); ++i) {
+    ASSERT_EQ(i, completed[i]);
+    EXPECT_EQ(0, std::memcmp(requests[i].buf,
+                            source.data() + requests[i].offset,
+                            requests[i].len));
+  }
+  EXPECT_EQ(before.miss, pool->stats().miss);
+  EXPECT_EQ(before.bypass_bytes, pool->stats().bypass_bytes);
+  EXPECT_EQ(nullptr, ctx);
+  // No page pin may escape the synchronous copy. Reclaim before checking the
+  // caller's retained bytes so both pin release and output lifetime matter.
+  for (size_t i = 0; i < 32; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(64);
+  EXPECT_FALSE(pool->is_page_resident(0));
+  EXPECT_FALSE(pool->is_page_resident(3));
+  for (const auto &request : requests)
+    EXPECT_EQ(0, std::memcmp(request.buf, source.data() + request.offset,
+                            request.len));
+  reader.close();
+}
+
 TEST(DiskAnnFileReaderTest,
      BufferPoolCacheAndBypassFollowOriginalFileAfterPathReplacement) {
   namespace ailego = zvec::ailego;
