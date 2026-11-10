@@ -92,8 +92,8 @@ class ScatterCursor {
   size_t span_offset_{0};
 };
 
-//! Whole-list direct IO leaves posting bytes cold in the CPU caches. Hint one
-//! scoring block without allocating or copying a second execution buffer.
+//! Mapped and leased posting rows can both be cold in the CPU caches. Hint
+//! one scoring block without allocating or copying an execution buffer.
 void prefetch_posting_block(const uint8_t *data, size_t size) {
   for (size_t offset = 0; offset < size; offset += AILEGO_CACHE_LINE_SIZE) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -1154,7 +1154,8 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       }
 
       if (row_major) {
-        if (list_data.data() && !packed_quantizer_) {
+        if (!packed_quantizer_ && scatter_data.spans.size() == 1 &&
+            (list_data.data() || inverted_->base_data())) {
           prefetch_posting_block(scatter_data.spans[0].data + block_offset,
                                  serialized_size);
         }
@@ -1303,7 +1304,8 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       }
       const size_t serialized_size = std::min(block_size, size - block_offset);
       if (row_major) {
-        if (list_data.data() && !packed_quantizer_) {
+        if (!packed_quantizer_ && scatter_data.spans.size() == 1 &&
+            (list_data.data() || inverted_->base_data())) {
           prefetch_posting_block(scatter_data.spans[0].data + block_offset,
                                  serialized_size);
         }
