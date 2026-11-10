@@ -1,0 +1,40 @@
+name: DiskANN Buffer Windows 4K paired validation
+on:
+  push:
+    branches: ['codex/diskann-buffer-node-pq-20261110']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  paired:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: candidate
+          submodules: recursive
+      - uses: actions/checkout@v7
+        with:
+          path: baseline
+          ref: b2d44c8a9c8a002d7e83174d1e47e9072261867a
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+      - name: Install build tools
+        run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build, verify, and compare native 4K Buffer reads
+        run: python candidate/.github/diskann-buffer-read-validation/run.py --baseline baseline --candidate candidate --output evidence --trials 12
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-buffer-windows-4k
+          path: |
+            evidence/*.json
+            evidence/*.log
+            evidence/*.xml
+          if-no-files-found: error
