@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -40,6 +41,28 @@
 namespace zvec {
 namespace core {
 namespace {
+
+TEST(DiskAnnPruneCandidates, BoundedWorkspaceMatchesMainSortedPrefix) {
+  constexpr size_t limit = 750;
+  constexpr diskann_id_t excluded = 13;
+  PruneCandidates complete;
+  PruneCandidates bounded;
+  for (uint32_t i = 0; i < 8192; ++i) {
+    const Neighbor candidate((i * 17) % 4096, float((i * 13) % 51));
+    if (candidate.id != excluded) complete.push_back(candidate);
+    CollectPruneCandidate(bounded, candidate, excluded, limit);
+  }
+  // main collects traversal history, removes the current node, sorts it and
+  // truncates it before occlusion. Bounded retention must preserve that input.
+  std::sort(complete.begin(), complete.end());
+  complete.resize(limit);
+  std::sort(bounded.begin(), bounded.end());
+  ASSERT_EQ(complete.size(), bounded.size());
+  for (size_t i = 0; i < complete.size(); ++i) {
+    EXPECT_EQ(complete[i].id, bounded[i].id);
+    EXPECT_FLOAT_EQ(complete[i].distance, bounded[i].distance);
+  }
+}
 
 TEST(DiskAnnNeighborBuffer, ShrinkReturnsTailPagesWithoutMovingPrefix) {
   const size_t page = ailego::MemoryHelper::PageSize();

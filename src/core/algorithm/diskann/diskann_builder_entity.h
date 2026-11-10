@@ -99,11 +99,6 @@ class DiskAnnBuilderEntity : public DiskAnnEntity {
   int prepare_codes(size_t bytes);
   int append_codes(const void *data, size_t bytes);
 
-  // Stage already-generated PQ codes in the shared pageable cache before
-  // workers start. If its metadata cannot fit, retain exact traversal.
-  int prepare_graph_quantization();
-  GraphQuantization graph_quantization() const override;
-
   // Graph construction is the only consumer of these vectors. PQ encoding
   // and dump read the retained source holder instead.
   void release_vectors();

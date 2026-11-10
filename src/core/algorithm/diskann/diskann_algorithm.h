@@ -34,13 +34,8 @@ class DiskAnnAlgorithm {
   }
 
  public:
-  int initialize_graph();
   int add_node(diskann_id_t id, DiskAnnContext *ctx);
   int prune_node(diskann_id_t id, DiskAnnContext *ctx);
-
-  // Run exclusively after final pruning, while build vectors are still live.
-  // Preserve a spanning tree and the degree bound; never re-prune afterwards.
-  int repair_connectivity(DiskAnnContext *ctx, size_t *added_edges = nullptr);
 
  private:
   struct PruneVectorCache {

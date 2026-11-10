@@ -1298,21 +1298,6 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
   candidates.reserve(ctx->list_size());
 
-  // Deleted/filtered vertices remain graph bridges, but must not consume the
-  // entire allowance for live candidates. Each discovered ID is visited once;
-  // compensate for filtered IDs within the document-count bound. The queue's
-  // BudgetedAllocator charges any additional workspace before allocating it.
-  const auto admit_candidate = [&](diskann_id_t id, float distance) {
-    bool filtered;
-    const int ret = is_filtered(ctx, id, &filtered);
-    if (ret != 0) return ret;
-    if (filtered && candidates.capacity() < doc_cnt_) {
-      candidates.reserve(candidates.capacity() + 1);
-    }
-    candidates.insert(Neighbor(id, distance));
-    return 0;
-  };
-
   ailego::BudgetedVector<diskann_id_t> unvisited_neighbors;
   ailego::BudgetedVector<float> neighbor_distances;
 
@@ -1332,8 +1317,7 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
   float dist;
   dc.quantized_dist(&best_medoid, 1, &dist);
   if (dc.error()) return dc.error_code();
-  const int entry_ret = admit_candidate(best_medoid, dist);
-  if (entry_ret != 0) return entry_ret;
+  candidates.insert(Neighbor(best_medoid, dist));
   visit_filter.set_visited(best_medoid);
 
   uint32_t num_ios = 0;
@@ -1472,9 +1456,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
       stats.cpu_us += cpu_timer.micro_seconds();
 
       for (size_t m = 0; m < unvisited_neighbors.size(); ++m) {
-        const int ret =
-            admit_candidate(unvisited_neighbors[m], neighbor_distances[m]);
-        if (ret != 0) return ret;
+        candidates.insert(
+            Neighbor(unvisited_neighbors[m], neighbor_distances[m]));
       }
     }
 
@@ -1526,9 +1509,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
           cpu_timer.reset();
           for (size_t m = 0; m < unvisited_neighbors.size(); ++m) {
-            const int ret =
-                admit_candidate(unvisited_neighbors[m], neighbor_distances[m]);
-            if (ret != 0) return ret;
+            candidates.insert(
+                Neighbor(unvisited_neighbors[m], neighbor_distances[m]));
           }
 
           stats.cpu_us += cpu_timer.micro_seconds();

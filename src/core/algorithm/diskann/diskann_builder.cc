@@ -819,31 +819,6 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   graph_holder.reset();
   LOG_INFO("Finished saving vector");
 
-  bool codes_generated = false;
-  // FP32 L2 buffered builds otherwise perform thousands of random full-vector
-  // reads for every insertion. Reuse this index's existing PQ model and codes
-  // for traversal, then refine its bounded candidate set with exact distances.
-  // Externally supplied data quantizers retain their original distance path.
-  if (entity_.buffered_build() && !data_quantizer_ &&
-      build_meta_.data_type() == IndexMeta::DT_FP32 &&
-      build_meta_.metric_name() == "SquaredEuclidean" &&
-      pq_chunk_num_ < build_meta_.element_size()) {
-    try {
-      ret = generate_quantized_data(threads);
-    } catch (const std::bad_alloc &) {
-      ret = IndexError_NoMemory;
-    }
-    if (ret != 0 && ret != IndexError_NoMemory) return ret;
-    codes_generated = ret == 0;
-    if (codes_generated) {
-      ret = entity_.prepare_graph_quantization();
-      if (ret != 0 && ret != IndexError_NoMemory) return ret;
-    }
-    LOG_INFO(
-        "DiskANN graph PQ guidance: %s",
-        entity_.graph_quantization().quantizer ? "enabled" : "exact fallback");
-  }
-
   LOG_INFO("Start to calculate entrypoint");
   ret = calculate_entry_point();
   if (ailego_unlikely(ret != 0)) {
@@ -854,18 +829,9 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   algo_ = std::make_unique<DiskAnnAlgorithm>(entity_, max_degree_,
                                              threads->count());
   AILEGO_DEFER([&] { algo_.reset(); });
-  ret = algo_->initialize_graph();
-  if (ret != 0) return ret;
-  // Revisit every node after the first round refines the seed graph. Early
-  // nodes must see later neighborhood improvements as well as their initial
-  // candidates. Worker groups join between passes, reusing the same budgeted
-  // graph storage.
-  for (unsigned pass = 0; pass < 2; ++pass) {
-    LOG_INFO("DiskANN graph build pass %u/2", pass + 1);
-    ret = build_internal(threads);
-    if (ret != 0) {
-      return ret;
-    }
+  ret = build_internal(threads);
+  if (ret != 0) {
+    return ret;
   }
 
   LOG_INFO("Start final cleanup..");
@@ -874,23 +840,6 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
     return ret;
   }
 
-  // Pruning can remove a vertex's last incoming edge or isolate a component.
-  // Repair only after all graph workers have joined; never prune the resulting
-  // protected tree again. A failed repair must not publish a built index.
-  {
-    DiskAnnContext context(
-        build_meta_, metric_,
-        std::shared_ptr<DiskAnnEntity>(&entity_, [](DiskAnnEntity *) {}),
-        data_quantizer_);
-    ret = context.init(DiskAnnContext::kBuilderContext, max_degree_,
-                       pq_chunk_num_, build_meta_.element_size(), false);
-    if (ret != 0) return ret;
-    context.set_list_size(list_size_);
-    size_t added_edges = 0;
-    ret = algo_->repair_connectivity(&context, &added_edges);
-    if (ret != 0) return ret;
-    LOG_INFO("DiskANN connectivity repair added %zu edges", added_edges);
-  }
   ret = entity_.compact_neighbors();
   if (ret != 0) return ret;
 
@@ -899,7 +848,7 @@ int DiskAnnBuilder::build(IndexThreads::Pointer threads,
   algo_.reset();
   entity_.release_vectors();
   LOG_INFO("Start to generate quantized data");
-  ret = codes_generated ? 0 : generate_quantized_data(threads);
+  ret = generate_quantized_data(threads);
   if (ailego_unlikely(ret != 0)) {
     return ret;
   }
