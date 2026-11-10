@@ -1,0 +1,45 @@
+name: DiskANN read path paired validation
+on:
+  push:
+    branches: ['test/diskann-read-validate-20261110']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  paired:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, windows-11-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: candidate
+          submodules: recursive
+      - uses: actions/checkout@v7
+        with:
+          path: baseline
+          ref: 4a0bc83f35acfc6d79a72b85dff1ddf8d8e6d4f8
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Install build tools
+        run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build, verify, and measure both variants
+        run: python candidate/.github/diskann-read-validation/run.py --baseline baseline --candidate candidate --output evidence --trials 5
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diskann-read-paired-${{ matrix.os }}
+          path: |
+            evidence/*.json
+            evidence/*.log
+            evidence/*.xml
+          if-no-files-found: error
