@@ -92,6 +92,18 @@ class ScatterCursor {
   size_t span_offset_{0};
 };
 
+//! Whole-list direct IO leaves posting bytes cold in the CPU caches. Hint one
+//! scoring block without allocating or copying a second execution buffer.
+void prefetch_posting_block(const uint8_t *data, size_t size) {
+  for (size_t offset = 0; offset < size; offset += AILEGO_CACHE_LINE_SIZE) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(data + offset, 0, 2);
+#else
+    ailego_prefetch(data + offset);
+#endif
+  }
+}
+
 //! Calculate a row-major IVF block directly from its resident page spans.
 //! Only a vector split by a page boundary is copied into scratch.
 template <typename Distance>
@@ -1142,6 +1154,10 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       }
 
       if (row_major) {
+        if (list_data.data() && !packed_quantizer_) {
+          prefetch_posting_block(scatter_data.spans[0].data + block_offset,
+                                 serialized_size);
+        }
         if (!calculate_row_major_block(&scatter_cursor, distance, vecs_count,
                                        element_size, serialized_size,
                                        scatter_vector_.data(), distances.data(),
@@ -1287,6 +1303,10 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       }
       const size_t serialized_size = std::min(block_size, size - block_offset);
       if (row_major) {
+        if (list_data.data() && !packed_quantizer_) {
+          prefetch_posting_block(scatter_data.spans[0].data + block_offset,
+                                 serialized_size);
+        }
         if (!calculate_row_major_block(&scatter_cursor, distance, vecs_count,
                                        element_size, serialized_size,
                                        scatter_vector_.data(), distances.data(),
