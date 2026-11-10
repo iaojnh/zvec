@@ -75,37 +75,27 @@ class DocIterator(Iterator[Doc], contextlib.AbstractContextManager["DocIterator"
         self._core_iterator = core_iterator
         self._schema = schema
         self._closed = False
-        self._pending = None
 
     def __next__(self) -> Doc:
         if self._closed:
             raise StopIteration
 
-        while True:
-            if self._pending is None:
-                try:
-                    self._pending = next(self._core_iterator)
-                except BaseException:
-                    self.close()
-                    raise
-
-            try:
-                py_doc = convert_to_py_doc(self._pending, self._schema)
-            except MemoryError:
-                # A caller can release earlier results and retry this row.
-                raise
-            except BaseException:
-                self.close()
-                raise
-            self._pending = None
-            if py_doc is not None:
-                return py_doc
+        try:
+            while True:
+                core_doc = next(self._core_iterator)
+                py_doc = convert_to_py_doc(core_doc, self._schema)
+                if py_doc is not None:
+                    return py_doc
+        except BaseException:
+            # StopIteration is a BaseException subclass, so this also covers
+            # normal exhaustion; always release the slot before propagating.
+            self.close()
+            raise
 
     def close(self):
         """Release the underlying iterator (idempotent)."""
         if not self._closed:
             self._closed = True
-            self._pending = None
             self._core_iterator.close()
 
     def __exit__(self, exc_type, exc_value, traceback):
