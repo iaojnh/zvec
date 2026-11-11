@@ -703,8 +703,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   size_t cache_capacity(size_t requested) const {
     // Four classes per doubling bound padding to 25%, independently of the
     // index's longest list. Buffers and direct I/O remain whole-list sized.
-    if (!adaptive || requested < (4UL << 20)) return AlignPage(requested);
-    size_t base = 4UL << 20;
+    const size_t smallest_class = 4 * ailego::MemoryHelper::PageSize();
+    if (!adaptive || requested < smallest_class) return AlignPage(requested);
+    size_t base = smallest_class;
     while (base <= requested / 2) base *= 2;
     const size_t quantum = base / 4;
     if (requested > std::numeric_limits<size_t>::max() - (quantum - 1))
@@ -712,8 +713,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return (requested + quantum - 1) / quantum * quantum;
   }
   static size_t reuse_class(size_t capacity) {
-    if (capacity < (4UL << 20)) return 0;
-    size_t base = 4UL << 20, bucket = 1;
+    const size_t page = ailego::MemoryHelper::PageSize();
+    if (capacity < 4 * page) return capacity / page;
+    size_t base = 4 * page, bucket = 4;
     while (base <= capacity / 2) {
       base *= 2;
       bucket += 4;
@@ -1226,10 +1228,11 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
           state_->cache_capacity(AlignPage(prefix + chunks[i].size));
       layout->entries[i].allocation_bytes = allocation;
       layout->add_reuse_entry(i, State::reuse_class(allocation));
-      // Large reusable list buffers stay in CLOCK until replacement. Sending
-      // first-revisit reads to the generic idle pool immediately discards
-      // their pages, defeating whole-list buffer reuse on the next query.
-      if (state_->adaptive && allocation >= (4UL << 20))
+      // Registered adaptive chunks reuse charged backing at every size. A
+      // first-revisit transient returns its mapping to the generic idle pool,
+      // where pressure may unmap it before another same-sized read arrives.
+      // Metadata pages retain their ordinary admission policy.
+      if (state_->adaptive)
         layout->entries[i].filter_readmission = false;
     }
     std::lock_guard<std::mutex> lock(state_->table_mutex);
