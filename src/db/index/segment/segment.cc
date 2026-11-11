@@ -2589,8 +2589,17 @@ TablePtr SegmentImpl::fetch_normal(
         auto scalar_result = flat_array->GetScalar(j);
         if (!scalar_result.ok()) continue;
         int output_row = output_to_result_index[j].first;
-        column_results[col_index][output_row] =
-            std::move(scalar_result.ValueOrDie());
+        auto &column = column_results[col_index];
+        if (output_row < 0 ||
+            static_cast<size_t>(output_row) >= column.size() ||
+            column[output_row]) {
+          LOG_ERROR(
+              "Invalid or duplicate forward result position: column %s, "
+              "row %d",
+              col.c_str(), output_row);
+          return nullptr;
+        }
+        column[output_row] = std::move(scalar_result.ValueOrDie());
       }
     }
   }
