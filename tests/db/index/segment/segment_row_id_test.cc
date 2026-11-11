@@ -340,4 +340,124 @@ TEST_P(SegmentTest, ReadOnlyIdentityDocIDsAfterWritableWalRecovery) {
   EXPECT_EQ(ids, (std::vector<int64_t>{100, -1}));
 }
 
+TEST_P(SegmentTest, BatchedFetchPreservesOrderAcrossForwardStores) {
+  CollectionSchema schema(col_name_);
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "id", DataType::INT32, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "name", DataType::STRING, true))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "binary", DataType::BINARY, true))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "values", DataType::ARRAY_INT32, true))
+                  .ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 100, 0);
+  ASSERT_NE(segment, nullptr);
+
+  const auto insert_rows = [&](int begin, int end) {
+    for (int i = begin; i < end; ++i) {
+      Doc doc;
+      doc.set_pk("fetch_" + std::to_string(i));
+      ASSERT_TRUE(doc.set<int32_t>("id", i));
+      if (i % 3 != 0) {
+        ASSERT_TRUE(doc.set<std::string>(
+            "name", i % 3 == 1 ? "" : "row_" + std::to_string(i)));
+      }
+      if (i % 4 != 0) {
+        ASSERT_TRUE(doc.set<std::string>("binary", std::string("a\0b", 3)));
+      }
+      if (i % 5 != 0) {
+        const std::vector<int32_t> values =
+            i % 5 == 1 ? std::vector<int32_t>{} : std::vector<int32_t>{i, -i};
+        ASSERT_TRUE(doc.set<std::vector<int32_t>>("values", values));
+      }
+      auto status = segment->insert(doc);
+      ASSERT_TRUE(status.ok()) << status.message();
+    }
+  };
+  const auto check_rows = [&](const std::vector<int> &rows) {
+    // Keep the synthetic row ID between real columns and revisit the same
+    // row across persisted blocks and the current in-memory store.
+    const std::vector<std::string> columns = {"values", "name", LOCAL_ROW_ID,
+                                              "id", "binary"};
+    auto table = segment->fetch(columns, rows);
+    ASSERT_NE(table, nullptr);
+    ASSERT_EQ(table->num_rows(), static_cast<int64_t>(rows.size()));
+    ASSERT_EQ(table->ColumnNames(), columns);
+    ASSERT_TRUE(table->ValidateFull().ok());
+    for (size_t j = 0; j < rows.size(); ++j) {
+      const int i = rows[j];
+      SCOPED_TRACE(j);
+      const auto expect_scalar =
+          [&](int column, const std::shared_ptr<arrow::Scalar> &expected) {
+            auto actual = table->column(column)->GetScalar(j);
+            ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+            EXPECT_TRUE(actual.ValueOrDie()->Equals(*expected));
+          };
+      expect_scalar(2, std::make_shared<arrow::UInt64Scalar>(i));
+      expect_scalar(3, std::make_shared<arrow::Int32Scalar>(i));
+      expect_scalar(1, i % 3 == 0
+                           ? arrow::MakeNullScalar(arrow::utf8())
+                           : std::make_shared<arrow::StringScalar>(
+                                 i % 3 == 1 ? "" : "row_" + std::to_string(i)));
+      expect_scalar(4, i % 4 == 0 ? arrow::MakeNullScalar(arrow::binary())
+                                  : std::make_shared<arrow::BinaryScalar>(
+                                        std::string("a\0b", 3)));
+      auto values = table->column(0)->GetScalar(j);
+      ASSERT_TRUE(values.ok());
+      if (i % 5 == 0) {
+        EXPECT_FALSE(values.ValueOrDie()->is_valid);
+      } else {
+        auto list =
+            std::dynamic_pointer_cast<arrow::ListScalar>(values.ValueOrDie());
+        ASSERT_NE(list, nullptr);
+        ASSERT_TRUE(list->is_valid);
+        auto numbers =
+            std::dynamic_pointer_cast<arrow::Int32Array>(list->value);
+        ASSERT_NE(numbers, nullptr);
+        if (i % 5 == 1) {
+          EXPECT_EQ(numbers->length(), 0);
+        } else {
+          ASSERT_EQ(numbers->length(), 2);
+          EXPECT_EQ(numbers->Value(0), i);
+          EXPECT_EQ(numbers->Value(1), -i);
+        }
+      }
+    }
+  };
+
+  ASSERT_NO_FATAL_FAILURE(insert_rows(0, 12));
+  ASSERT_NO_FATAL_FAILURE(check_rows({11, 0, 5, 1, 0, 10, 3, 6}));
+  ASSERT_TRUE(segment->flush().ok());
+  ASSERT_NO_FATAL_FAILURE(insert_rows(12, 24));
+  ASSERT_NO_FATAL_FAILURE(check_rows({23, 0, 12, 11, 3, 23, 6, 13}));
+  ASSERT_TRUE(segment->flush().ok());
+  ASSERT_NO_FATAL_FAILURE(insert_rows(24, 36));
+  const std::vector<int> rows = {35, 0, 12, 24, 11, 23, 6, 35, 1, 25, 13, 0};
+  ASSERT_NO_FATAL_FAILURE(check_rows(rows));
+  std::vector<int> repeated_rows;
+  for (int i = 0; i < 2048; ++i) {
+    repeated_rows.push_back((i * 17 + 35) % 36);
+  }
+  ASSERT_NO_FATAL_FAILURE(check_rows(repeated_rows));
+  ASSERT_NO_FATAL_FAILURE(check_rows({}));
+  ASSERT_TRUE(segment->flush().ok());
+  auto meta = segment->meta();
+  segment.reset();
+  auto opened = Segment::Open(col_path_, schema, *meta, id_map_, delete_store_,
+                              version_manager_, options_);
+  ASSERT_TRUE(opened) << opened.error().message();
+  segment = std::move(opened).value();
+  ASSERT_NO_FATAL_FAILURE(check_rows(rows));
+}
+
 INSTANTIATE_TEST_SUITE_P(MMapTest, SegmentTest, testing::Values(true, false));
