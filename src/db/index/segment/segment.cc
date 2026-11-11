@@ -2465,15 +2465,9 @@ TablePtr SegmentImpl::fetch_normal(
     const std::vector<std::string> &columns,
     const std::shared_ptr<arrow::Schema> &result_schema,
     const std::vector<int> &segment_doc_ids) const {
-  // Index by output position, not document ID: requests may be out of order
-  // and may contain the same document more than once.
-  std::vector<std::vector<std::shared_ptr<arrow::Scalar>>> column_results(
-      columns.size());
-  for (size_t i = 0; i < columns.size(); ++i) {
-    if (columns[i] != LOCAL_ROW_ID) {
-      column_results[i].resize(segment_doc_ids.size());
-    }
-  }
+  // Store scalars per column: column_index -> (output_row, scalar)
+  std::vector<std::vector<std::pair<int, std::shared_ptr<arrow::Scalar>>>>
+      column_results(columns.size());
 
   // Collect segment-local row IDs when LOCAL_ROW_ID is requested.
   std::vector<std::pair<int, uint64_t>> segment_row_id_values;
@@ -2589,17 +2583,8 @@ TablePtr SegmentImpl::fetch_normal(
         auto scalar_result = flat_array->GetScalar(j);
         if (!scalar_result.ok()) continue;
         int output_row = output_to_result_index[j].first;
-        auto &column = column_results[col_index];
-        if (output_row < 0 ||
-            static_cast<size_t>(output_row) >= column.size() ||
-            column[output_row]) {
-          LOG_ERROR(
-              "Invalid or duplicate forward result position: column %s, "
-              "row %d",
-              col.c_str(), output_row);
-          return nullptr;
-        }
-        column[output_row] = std::move(scalar_result.ValueOrDie());
+        column_results[col_index].emplace_back(
+            output_row, std::move(scalar_result.ValueOrDie()));
       }
     }
   }
@@ -2618,11 +2603,23 @@ TablePtr SegmentImpl::fetch_normal(
       continue;
     }
 
-    auto &ordered_scalars = column_results[col_index];
-    for (auto &scalar : ordered_scalars) {
-      if (!scalar) {
+    auto &result_vec = column_results[col_index];
+    std::sort(result_vec.begin(), result_vec.end());
+
+    std::vector<std::shared_ptr<arrow::Scalar>> ordered_scalars;
+    // Keep the first sorted candidate for each output position, including
+    // repeated positions, without restarting the search for every row.
+    auto it = result_vec.begin();
+    for (int i = 0; i < static_cast<int>(segment_doc_ids.size()); ++i) {
+      while (it != result_vec.end() && it->first < i) {
+        ++it;
+      }
+      if (it != result_vec.end() && it->first == i) {
+        ordered_scalars.push_back(it->second);
+      } else {
         auto field = result_schema->GetFieldByName(col);
-        scalar = arrow::MakeNullScalar(field ? field->type() : arrow::null());
+        ordered_scalars.push_back(
+            arrow::MakeNullScalar(field ? field->type() : arrow::null()));
       }
     }
 
