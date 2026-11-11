@@ -606,7 +606,8 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
 }
 
 ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sample() {
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
   // Copy addresses and charged-page masks under short mapping locks. Native
   // queries use values only, never descriptors that an allocator may retire.
   // The budget token separately removes all retirement/cancellation credit.
@@ -618,11 +619,20 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
     return {MemoryHelper::SelfRSS(), 0};
   const size_t before = MemoryHelper::SelfRSS();
   if (!before) return {};
+#if defined(__linux__)
+  const int fd = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return {MemoryHelper::SelfRSS(), 0};
+  auto close = ScopeGuard::Make([&] { ::close(fd); });
+  std::array<uint64_t, kSlabBytes / kMinimumPageBytes> entries;
+  constexpr uint64_t present = (uint64_t{1} << 63) | (uint64_t{1} << 56);
+  constexpr uint64_t excluded = 0;
+#else
   std::array<int, kSlabBytes / kMinimumPageBytes> entries;
   constexpr int present = VM_PAGE_QUERY_PAGE_PRESENT | VM_PAGE_QUERY_PAGE_DIRTY;
   constexpr int excluded = VM_PAGE_QUERY_PAGE_EXTERNAL |
       VM_PAGE_QUERY_PAGE_PAGED_OUT | VM_PAGE_QUERY_PAGE_FICTITIOUS |
       VM_PAGE_QUERY_PAGE_REUSABLE;
+#endif
   const auto read_range = [&](uintptr_t address, size_t bytes,
                               const std::array<bool, kMaxSlabDataPages + 1> *charged,
                               size_t logical_page) {
@@ -631,10 +641,27 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
     size_t resident = 0;
     for (size_t offset = 0; offset < bytes;) {
       const size_t count = std::min((bytes - offset) / page, entries.size());
+#if defined(__linux__)
+      const uintptr_t index = (address + offset) / page;
+      if (index > static_cast<uintptr_t>(std::numeric_limits<off_t>::max()) /
+                      sizeof(uint64_t)) return size_t{0};
+      const off_t position = static_cast<off_t>(index * sizeof(uint64_t));
+      const size_t requested = count * sizeof(uint64_t);
+      size_t done = 0;
+      while (done < requested) {
+        const ssize_t got = ::pread(fd,
+            reinterpret_cast<char *>(entries.data()) + done,
+            requested - done, position + static_cast<off_t>(done));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return size_t{0};
+        done += static_cast<size_t>(got);
+      }
+#else
       mach_vm_size_t returned = count;
       if (::mach_vm_page_range_query(::mach_task_self(), address + offset,
               count * page, reinterpret_cast<mach_vm_address_t>(entries.data()),
               &returned) != KERN_SUCCESS || returned != count) return size_t{0};
+#endif
       for (size_t i = 0; i < count; ++i)
         if ((!charged || (*charged)[(offset + i * page) / logical_page]) &&
             (entries[i] & present) == present && !(entries[i] & excluded))
@@ -1557,7 +1584,8 @@ bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
 bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
                                                   size_t permanent_backing) {
   auto resident_reader = &MemoryLimitPool::read_slab_resident_sample;
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
   // Foreground budget refreshes remain cheap. The background worker publishes
   // independently validated ownership proofs without holding this mutex.
   resident_reader = +[]() -> ProcessRssBudget::ResidentSample {
@@ -1735,7 +1763,16 @@ void MemoryLimitPool::background_evict_loop() {
   bool idle_progress = false;
   bool reclaim_to_low = false;
   auto last_process_reclaim = std::chrono::steady_clock::time_point{};
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+#if defined(__linux__)
+  // This proves overlap, rather than observing RSS or admitting allocations.
+  // Foreground RSS checks keep their 20 ms cadence; retirement-driven pressure
+  // still requests an immediate proof. Avoid page-table walks on a steady cache.
+  constexpr auto owned_sample_interval = milliseconds(1000);
+#else
+  constexpr auto owned_sample_interval = milliseconds(100);
+#endif
   auto last_owned_sample = std::chrono::steady_clock::time_point{};
   uint64_t confirmed_generation = 0;
   const auto refresh_owned_sample = [&] {
@@ -1744,7 +1781,7 @@ void MemoryLimitPool::background_evict_loop() {
                          generation != confirmed_generation;
     if (process_rss_.limit() &&
         (confirm || std::chrono::steady_clock::now() - last_owned_sample >=
-                        milliseconds(100))) {
+                        owned_sample_interval)) {
       const auto token = process_rss_.begin_resident_sample();
       if (token.configuration) {
         const auto sample = read_background_resident_sample();
@@ -1779,7 +1816,8 @@ void MemoryLimitPool::background_evict_loop() {
     const size_t requested =
         cache_reclaim_requested_.exchange(0, std::memory_order_relaxed);
     process_rss_.refresh(process_rss_.needs_resident_confirmation());
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
     refresh_owned_sample();
 #endif
     if (requested && (used() > low_watermark() || process_rss_.pressure())) {
@@ -1797,7 +1835,8 @@ void MemoryLimitPool::background_evict_loop() {
       // including when vector pages cannot make further reclamation progress.
       reclaim_process_cache();
       process_rss_.refresh(true);
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
       refresh_owned_sample();
 #endif
       last_process_reclaim = now;
@@ -1850,7 +1889,8 @@ void MemoryLimitPool::background_evict_loop() {
       if (process_rss_.pressure()) {
         trim_idle_buffers();
         process_rss_.refresh(true);
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
         refresh_owned_sample();
 #endif
       }

@@ -129,7 +129,8 @@ TEST_F(CacheMappingRssTest, IdleReuseRetainsRegistrationUntilSuccessfulUnmap) {
   EXPECT_EQ(1u, MemoryLimitPoolTestPeer::mappings(pool_));
 }
 
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
 TEST_F(CacheMappingRssTest, NativeWitnessExcludesUntouchedAndIncludesIdleBacking) {
   auto touched = acquire(8 * kMiB);
   auto untouched = acquire(8 * kMiB);
