@@ -54,7 +54,8 @@ class IVFEntity {
 
   // Queue one complete row-major posting list. Returns its scan count so the
   // caller can apply the same max_scan_count boundary as the scoring loop.
-  size_t prefetch_list(size_t inverted_list_id) const;
+  // accepted=false keeps this list in the caller's rolling lookahead plan.
+  size_t prefetch_list(size_t inverted_list_id, bool *accepted = nullptr) const;
 
   const turbo::Quantizer::Pointer &quantizer() const {
     return quantizer_;

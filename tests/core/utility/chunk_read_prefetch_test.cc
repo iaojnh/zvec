@@ -103,6 +103,56 @@ TEST_F(ChunkReadPrefetchTest, JoinsReadsAndBoundsCountAndBytes) {
   EXPECT_EQ(0u, stats.prefetch_pending_bytes);
 }
 
+TEST_F(ChunkReadPrefetchTest, FullQueueReportsBackpressureAndRefillsAfterConsume) {
+  size_t next = 0;
+  for (size_t current = 0; current < payload.size(); current += page) {
+    while (next < payload.size() && segment->try_prefetch(next, page))
+      next += page;
+    if (current == 0) {
+      EXPECT_EQ(3 * page, next);
+      EXPECT_FALSE(segment->try_prefetch(next, page));
+    }
+    IndexStorage::MemoryBlock block;
+    ASSERT_EQ(64u, segment->read(current + 17, block, 64));
+    EXPECT_EQ(0, std::memcmp(block.data(), payload.data() + current + 17, 64));
+  }
+  const auto stats = storage->stats();
+  EXPECT_EQ(payload.size(), next);
+  EXPECT_EQ(32u, stats.prefetch_submitted);
+  EXPECT_EQ(32u, stats.prefetch_consumed);
+  EXPECT_EQ(32u, stats.io_calls);
+  EXPECT_LE(stats.prefetch_peak_requests, 3u);
+  EXPECT_LE(stats.prefetch_peak_bytes, 6 * page);
+  EXPECT_EQ(0u, stats.prefetch_pending_requests);
+  EXPECT_EQ(0u, stats.prefetch_failed);
+}
+
+TEST_F(ChunkReadPrefetchTest, OversizedHintFallsBackWithoutBlockingNextChunk) {
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  ailego::Params params;
+  params.set(CHUNK_READ_STORAGE_ADAPTIVE, true);
+  params.set(CHUNK_READ_STORAGE_PREFETCH_BYTES, 2 * page);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(path, false));
+  segment = storage->get("payload");
+  IndexStorage::Segment::ReadChunks chunks;
+  chunks.push_back({0, 4 * page});
+  chunks.push_back({4 * page, page});
+  ASSERT_EQ(0, segment->set_read_chunks(chunks));
+  EXPECT_FALSE(segment->try_prefetch(0, 4 * page));
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(4 * page, segment->read(0, block, 4 * page));
+  EXPECT_EQ(0, std::memcmp(block.data(), payload.data(), 4 * page));
+  block.reset();
+  ASSERT_TRUE(segment->try_prefetch(4 * page, page));
+  ASSERT_EQ(page, segment->read(4 * page, block, page));
+  EXPECT_EQ(0, std::memcmp(block.data(), payload.data() + 4 * page, page));
+  EXPECT_EQ(1u, storage->stats().prefetch_submitted);
+  EXPECT_LE(storage->stats().prefetch_peak_bytes, 2 * page);
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+}
+
 TEST_F(ChunkReadPrefetchTest, EvictedOnceReadIsTransientThenAdmittedOnReuse) {
   IndexStorage::MemoryBlock block;
   ASSERT_EQ(64u, segment->read(17, block, 64));

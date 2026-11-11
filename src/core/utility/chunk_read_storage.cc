@@ -382,11 +382,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       owner.prefetch_peak_bytes.store(
           std::max<uint64_t>(owner.prefetch_peak_bytes.load(), bytes));
     }
-    void hint(size_t offset, size_t length, Layout *layout, bool retire_stale) {
+    bool hint(size_t offset, size_t length, Layout *layout, bool retire_stale) {
       std::lock_guard<std::mutex> lock(mutex);
       reap(false);
-      if (!ready) return;
-      for (size_t begin = offset; begin < offset + length;) {
+      if (!ready) return false;
+      size_t begin = offset;
+      for (; begin < offset + length;) {
         Entry *item = layout->find(begin);
         if (!item) break;
         const size_t end =
@@ -471,6 +472,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       // Low-priority hints collect the selected lists. The first demand or
       // normal-priority hint submits the whole prepared batch in one syscall.
       if (retire_stale) flush();
+      return begin == offset + length;
     }
     State &owner;
     std::unique_ptr<MetadataCharge> charge;
@@ -1194,16 +1196,21 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     return true;
   }
   void prefetch(size_t offset, size_t len, CachePriority priority) override {
+      (void)try_prefetch(offset, len, priority);
+    }
+    bool try_prefetch(size_t offset, size_t len, CachePriority priority) override {
+      if (offset > size_ || len > size_ - offset) return false;
 #if defined(__linux__) && !defined(__ANDROID__)
     if (layout_ && state_->read_ahead && state_->prefetch_enabled.load() &&
         offset <= size_ && len <= size_ - offset)
-      state_->read_ahead->hint(offset_ + offset, len, layout_,
-                               priority != CachePriority::kLow);
+        return state_->read_ahead->hint(offset_ + offset, len, layout_,
+                                       priority != CachePriority::kLow);
 #else
     (void)offset;
     (void)len;
     (void)priority;
 #endif
+      return true;
   }
   int set_read_chunks(const ReadChunks &chunks) override try {
     if (layout_) return IndexError_InvalidArgument;
