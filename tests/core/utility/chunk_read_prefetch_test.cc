@@ -103,6 +103,56 @@ TEST_F(ChunkReadPrefetchTest, JoinsReadsAndBoundsCountAndBytes) {
   EXPECT_EQ(0u, stats.prefetch_pending_bytes);
 }
 
+TEST_F(ChunkReadPrefetchTest, FullQueueReportsBackpressureAndRefillsAfterConsume) {
+  size_t next = 0;
+  for (size_t current = 0; current < payload.size(); current += page) {
+    while (next < payload.size() && segment->try_prefetch(next, page))
+      next += page;
+    if (current == 0) {
+      EXPECT_EQ(3 * page, next);
+      EXPECT_FALSE(segment->try_prefetch(next, page));
+    }
+    IndexStorage::MemoryBlock block;
+    ASSERT_EQ(64u, segment->read(current + 17, block, 64));
+    EXPECT_EQ(0, std::memcmp(block.data(), payload.data() + current + 17, 64));
+  }
+  const auto stats = storage->stats();
+  EXPECT_EQ(payload.size(), next);
+  EXPECT_EQ(32u, stats.prefetch_submitted);
+  EXPECT_EQ(32u, stats.prefetch_consumed);
+  EXPECT_EQ(32u, stats.io_calls);
+  EXPECT_LE(stats.prefetch_peak_requests, 3u);
+  EXPECT_LE(stats.prefetch_peak_bytes, 6 * page);
+  EXPECT_EQ(0u, stats.prefetch_pending_requests);
+  EXPECT_EQ(0u, stats.prefetch_failed);
+}
+
+TEST_F(ChunkReadPrefetchTest, OversizedHintFallsBackWithoutBlockingNextChunk) {
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  ailego::Params params;
+  params.set(CHUNK_READ_STORAGE_ADAPTIVE, true);
+  params.set(CHUNK_READ_STORAGE_PREFETCH_BYTES, 2 * page);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(path, false));
+  segment = storage->get("payload");
+  IndexStorage::Segment::ReadChunks chunks;
+  chunks.push_back({0, 4 * page});
+  chunks.push_back({4 * page, page});
+  ASSERT_EQ(0, segment->set_read_chunks(chunks));
+  EXPECT_FALSE(segment->try_prefetch(0, 4 * page));
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(4 * page, segment->read(0, block, 4 * page));
+  EXPECT_EQ(0, std::memcmp(block.data(), payload.data(), 4 * page));
+  block.reset();
+  ASSERT_TRUE(segment->try_prefetch(4 * page, page));
+  ASSERT_EQ(page, segment->read(4 * page, block, page));
+  EXPECT_EQ(0, std::memcmp(block.data(), payload.data() + 4 * page, page));
+  EXPECT_EQ(1u, storage->stats().prefetch_submitted);
+  EXPECT_LE(storage->stats().prefetch_peak_bytes, 2 * page);
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+}
+
 TEST_F(ChunkReadPrefetchTest, EvictedOnceReadIsTransientThenAdmittedOnReuse) {
   IndexStorage::MemoryBlock block;
   ASSERT_EQ(64u, segment->read(17, block, 64));
@@ -143,7 +193,7 @@ TEST_F(ChunkReadPrefetchTest, ByteLimitIncludesPhysicalAlignmentPadding) {
 }
 
 TEST_F(ChunkReadPrefetchTest,
-       WholeListLeaseRetainsTransientDataThroughAllBatches) {
+       SmallAdaptiveListRetainsBackingThroughAllBatchesAndReadmission) {
   segment.reset();
   ASSERT_EQ(0, storage->close());
   ailego::Params params;
@@ -169,10 +219,59 @@ TEST_F(ChunkReadPrefetchTest,
                              payload.data() + offset, page));
   }
   EXPECT_EQ(before.io_calls + 1, storage->stats().io_calls);
-  EXPECT_EQ(before.fills, storage->stats().fills);
+  EXPECT_EQ(before.fills + 1, storage->stats().fills);
   EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
   whole.reset();
-  EXPECT_EQ(0u, storage->stats().cache_bytes);
+  EXPECT_GT(storage->stats().cache_bytes, 0u);
+}
+
+TEST_F(ChunkReadPrefetchTest, DifferentSmallLengthsReuseResidentBacking) {
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  const size_t first = 17 * page, second = 19 * page;
+  payload.resize(2 * (first + second));
+  for (size_t i = 0; i < payload.size(); ++i) payload[i] = char(i % 251);
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_EQ(0, dumper->create(path));
+  ASSERT_EQ(payload.size(), dumper->write(payload.data(), payload.size()));
+  ASSERT_EQ(0, dumper->append("payload", payload.size(), 0, 0));
+  ASSERT_EQ(0, dumper->close());
+  ailego::Params params;
+  params.set(CHUNK_READ_STORAGE_ADAPTIVE, true);
+  params.set(CHUNK_READ_STORAGE_PREFETCH_BYTES, 128 * page);
+  params.set(CHUNK_READ_STORAGE_PREFETCH_DEPTH, size_t{2});
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(path, false));
+  segment = storage->get("payload");
+  IndexStorage::Segment::ReadChunks chunks;
+  chunks.push_back({0, first});
+  chunks.push_back({first, second});
+  chunks.push_back({first + second, first});
+  chunks.push_back({2 * first + second, second});
+  ASSERT_EQ(0, segment->set_read_chunks(chunks));
+  segment->prefetch(0, first + second);
+  IndexStorage::MemoryBlock a, b;
+  ASSERT_EQ(first, segment->read(0, a, first));
+  ASSERT_EQ(second, segment->read(first, b, second));
+  const void *pa = a.data(), *pb = b.data();
+  ASSERT_NE(pa, pb);
+  a.reset();
+  b.reset();
+  const size_t pressure = pool.capacity() - pool.used() - 2 * page;
+  ASSERT_TRUE(pool.try_charge_external(pressure));
+  auto refund = ailego::ScopeGuard::Make([&] { pool.release_external(pressure); });
+  const auto before = storage->stats();
+  segment->prefetch(first + second, first + second);
+  ASSERT_EQ(first, segment->read(first + second, a, first));
+  ASSERT_EQ(second, segment->read(2 * first + second, b, second));
+  EXPECT_TRUE(a.data() == pa || a.data() == pb);
+  EXPECT_TRUE(b.data() == pa || b.data() == pb);
+  EXPECT_NE(a.data(), b.data());
+  EXPECT_EQ(0, std::memcmp(a.data(), payload.data() + first + second, first));
+  EXPECT_EQ(0, std::memcmp(b.data(), payload.data() + 2 * first + second, second));
+  EXPECT_EQ(before.backing_reuses + 2, storage->stats().backing_reuses);
+  EXPECT_LE(storage->stats().backing_reuse_scans - before.backing_reuse_scans, 32u);
+  EXPECT_LE(pool.used(), pool.capacity());
 }
 
 TEST_F(ChunkReadPrefetchTest, FullBudgetUsesExistingSynchronousWorkspace) {

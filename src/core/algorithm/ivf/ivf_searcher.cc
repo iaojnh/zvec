@@ -263,14 +263,26 @@ int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
                                  : entity->search(one, filter, &heap, &stats);
         ivf_check_error_code(ret);
       } else {
-        size_t hinted_scans = 0;
-        for (const auto &centroid : centroid_ctx->result(q)) {
-          if (hinted_scans >= ctx->max_scan_count()) break;
-          hinted_scans += entity->prefetch_list(centroid.key());
-        }
-        size_t scans = 0;
-        for (const auto &centroid : centroid_ctx->result(q)) {
-          if (scans >= ctx->max_scan_count()) break;
+        const auto &centroids = centroid_ctx->result(q);
+        size_t hinted_scans = 0, next_hint = 0, scans = 0;
+        for (size_t i = 0;
+             i < centroids.size() && scans < ctx->max_scan_count(); ++i) {
+          // An oversized or unadmitted list can execute synchronously. Once
+          // consumed, skip it so it cannot block the remaining lookahead.
+          if (next_hint < i) {
+            next_hint = i;
+            hinted_scans = std::max(hinted_scans, scans);
+          }
+          while (next_hint < centroids.size() &&
+                 hinted_scans < ctx->max_scan_count()) {
+            bool accepted = false;
+            const size_t count =
+                entity->prefetch_list(centroids[next_hint].key(), &accepted);
+            if (!accepted) break;
+            hinted_scans += count;
+            ++next_hint;
+          }
+          const auto &centroid = centroids[i];
           uint32_t scanned = 0;
           ret = !filter.is_valid() ? entity->search(centroid.key(), one,
                                                     &scanned, &heap, &stats)

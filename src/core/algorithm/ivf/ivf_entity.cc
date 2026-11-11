@@ -997,7 +997,8 @@ int IVFEntity::load(const IndexStorage::Pointer &container) try {
   return IndexError_NoMemory;
 }
 
-size_t IVFEntity::prefetch_list(size_t inverted_list_id) const {
+size_t IVFEntity::prefetch_list(size_t inverted_list_id, bool *accepted) const {
+  if (accepted) *accepted = true;
   if (!inverted_->supports_read_chunks() ||
       meta_.major_order() != IndexMeta::MO_ROW ||
       inverted_list_id >= header_.inverted_list_count)
@@ -1011,8 +1012,13 @@ size_t IVFEntity::prefetch_list(size_t inverted_list_id) const {
       (list->block_count - 1) * header_.block_size +
       (packed_quantizer_ ? header_.block_size
                          : ailego_align(tail * meta_.element_size(), 32));
-  inverted_->prefetch(list->offset, bytes,
-                      IndexStorage::Segment::CachePriority::kLow);
+  if (accepted) {
+    *accepted = inverted_->try_prefetch(
+        list->offset, bytes, IndexStorage::Segment::CachePriority::kLow);
+  } else {
+    inverted_->prefetch(list->offset, bytes,
+                        IndexStorage::Segment::CachePriority::kLow);
+  }
   return list->vector_count;
 }
 

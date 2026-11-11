@@ -770,6 +770,16 @@ class IndexStorage : public IndexModule {
     virtual int write_error() const {
       return IndexError_WriteData;
     }
+
+    //! Best-effort lookahead with bounded-queue backpressure. False leaves the
+    //! range with the caller to retry after consuming an earlier read. Legacy
+    //! backends retain their prefetch behavior and never request a retry.
+    //! Appended so existing method slots remain stable.
+    virtual bool try_prefetch(size_t offset, size_t len,
+                              CachePriority priority = CachePriority::kLow) {
+      prefetch(offset, len, priority);
+      return true;
+    }
   };
 
   //! Destructor

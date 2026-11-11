@@ -317,15 +317,23 @@ int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
-    size_t hinted_scans = 0;
-    for (size_t i = 0;
-         i < centroids.size() && hinted_scans < ctx->max_scan_count(); ++i) {
-      hinted_scans += entity->prefetch_list(centroids[i].key());
-    }
-    size_t total_scan_count = 0;
+    size_t hinted_scans = 0, next_hint = 0, total_scan_count = 0;
     for (size_t i = 0;
          i < centroids.size() && total_scan_count < ctx->max_scan_count();
          ++i) {
+      if (next_hint < i) {
+        next_hint = i;
+        hinted_scans = std::max(hinted_scans, total_scan_count);
+      }
+      while (next_hint < centroids.size() &&
+             hinted_scans < ctx->max_scan_count()) {
+        bool accepted = false;
+        const size_t count =
+            entity->prefetch_list(centroids[next_hint].key(), &accepted);
+        if (!accepted) break;
+        hinted_scans += count;
+        ++next_hint;
+      }
       auto cid = centroids[i].key();
       uint32_t scan_count = 0;
       if (!filter.is_valid()) {

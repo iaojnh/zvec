@@ -382,11 +382,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       owner.prefetch_peak_bytes.store(
           std::max<uint64_t>(owner.prefetch_peak_bytes.load(), bytes));
     }
-    void hint(size_t offset, size_t length, Layout *layout, bool retire_stale) {
+    bool hint(size_t offset, size_t length, Layout *layout, bool retire_stale) {
       std::lock_guard<std::mutex> lock(mutex);
       reap(false);
-      if (!ready) return;
-      for (size_t begin = offset; begin < offset + length;) {
+      if (!ready) return false;
+      size_t begin = offset;
+      for (; begin < offset + length;) {
         Entry *item = layout->find(begin);
         if (!item) break;
         const size_t end =
@@ -471,6 +472,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       // Low-priority hints collect the selected lists. The first demand or
       // normal-priority hint submits the whole prepared batch in one syscall.
       if (retire_stale) flush();
+      return begin == offset + length;
     }
     State &owner;
     std::unique_ptr<MetadataCharge> charge;
@@ -703,8 +705,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   size_t cache_capacity(size_t requested) const {
     // Four classes per doubling bound padding to 25%, independently of the
     // index's longest list. Buffers and direct I/O remain whole-list sized.
-    if (!adaptive || requested < (4UL << 20)) return AlignPage(requested);
-    size_t base = 4UL << 20;
+    const size_t smallest_class = 4 * ailego::MemoryHelper::PageSize();
+    if (!adaptive || requested < smallest_class) return AlignPage(requested);
+    size_t base = smallest_class;
     while (base <= requested / 2) base *= 2;
     const size_t quantum = base / 4;
     if (requested > std::numeric_limits<size_t>::max() - (quantum - 1))
@@ -712,8 +715,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return (requested + quantum - 1) / quantum * quantum;
   }
   static size_t reuse_class(size_t capacity) {
-    if (capacity < (4UL << 20)) return 0;
-    size_t base = 4UL << 20, bucket = 1;
+    const size_t page = ailego::MemoryHelper::PageSize();
+    if (capacity < 4 * page) return capacity / page;
+    size_t base = 4 * page, bucket = 4;
     while (base <= capacity / 2) {
       base *= 2;
       bucket += 4;
@@ -1192,16 +1196,21 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     return true;
   }
   void prefetch(size_t offset, size_t len, CachePriority priority) override {
+      (void)try_prefetch(offset, len, priority);
+    }
+    bool try_prefetch(size_t offset, size_t len, CachePriority priority) override {
+      if (offset > size_ || len > size_ - offset) return false;
 #if defined(__linux__) && !defined(__ANDROID__)
     if (layout_ && state_->read_ahead && state_->prefetch_enabled.load() &&
         offset <= size_ && len <= size_ - offset)
-      state_->read_ahead->hint(offset_ + offset, len, layout_,
-                               priority != CachePriority::kLow);
+        return state_->read_ahead->hint(offset_ + offset, len, layout_,
+                                       priority != CachePriority::kLow);
 #else
     (void)offset;
     (void)len;
     (void)priority;
 #endif
+      return true;
   }
   int set_read_chunks(const ReadChunks &chunks) override try {
     if (layout_) return IndexError_InvalidArgument;
@@ -1226,10 +1235,11 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
           state_->cache_capacity(AlignPage(prefix + chunks[i].size));
       layout->entries[i].allocation_bytes = allocation;
       layout->add_reuse_entry(i, State::reuse_class(allocation));
-      // Large reusable list buffers stay in CLOCK until replacement. Sending
-      // first-revisit reads to the generic idle pool immediately discards
-      // their pages, defeating whole-list buffer reuse on the next query.
-      if (state_->adaptive && allocation >= (4UL << 20))
+      // Registered adaptive chunks reuse charged backing at every size. A
+      // first-revisit transient returns its mapping to the generic idle pool,
+      // where pressure may unmap it before another same-sized read arrives.
+      // Metadata pages retain their ordinary admission policy.
+      if (state_->adaptive)
         layout->entries[i].filter_readmission = false;
     }
     std::lock_guard<std::mutex> lock(state_->table_mutex);
