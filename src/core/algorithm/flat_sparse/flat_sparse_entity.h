@@ -14,8 +14,12 @@
 
 #pragma once
 
+#include <string_view>
 #include <unordered_map>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_framework.h>
+#include "utility/group_candidate_collector.h"
+#include "utility/sparse_utility.h"
 #include "flat_sparse_index_format.h"
 
 namespace zvec {
@@ -29,6 +33,9 @@ constexpr node_id_t kInvalidNodeId = static_cast<node_id_t>(-1);
 class FlatSparseEntity {
  public:
   typedef std::shared_ptr<FlatSparseEntity> Pointer;
+  struct ReadError {
+    int status;
+  };
 
   //! Constructor
   explicit FlatSparseEntity() = default;
@@ -41,8 +48,8 @@ class FlatSparseEntity {
   FlatSparseEntity &operator=(const FlatSparseEntity &) = delete;
 
   //! Search in linear list with filter
-  int search(const std::string &sparse_vector, const IndexFilter &filter,
-             IndexDocumentHeap *heap) const {
+  int search(std::string_view sparse_vector, const IndexFilter &filter,
+             IndexCandidateHeap *heap) const {
     for (node_id_t i = 0; i < doc_cnt(); i++) {
       uint64_t key = get_key(i);
       if (ailego_unlikely(key == kInvalidKey)) {
@@ -60,9 +67,9 @@ class FlatSparseEntity {
   }
 
   //! Search in linear list with filter and target pkeys
-  int search_p_keys(const std::string &sparse_vector,
+  int search_p_keys(std::string_view sparse_vector,
                     const std::vector<uint64_t> &p_keys,
-                    const IndexFilter &filter, IndexDocumentHeap *heap) const {
+                    const IndexFilter &filter, IndexCandidateHeap *heap) const {
     for (auto p_key : p_keys) {
       if (!filter.is_valid() || !filter(p_key)) {
         auto node_id = get_id(p_key);
@@ -77,10 +84,9 @@ class FlatSparseEntity {
   }
 
   //! Group search in linear list with filter
-  int search_group(
-      const std::string &sparse_vector, const IndexFilter &filter,
-      const std::function<std::string(uint64_t)> &group_by_func, uint32_t topk,
-      std::unordered_map<std::string, IndexDocumentHeap> *heap) const {
+  int search_group(std::string_view sparse_vector, const IndexFilter &filter,
+                   const std::function<std::string(uint64_t)> &group_by_func,
+                   uint32_t /*topk*/, GroupCandidateCollector *heap) const {
     for (node_id_t i = 0; i < doc_cnt(); i++) {
       uint64_t key = get_key(i);
       if (ailego_unlikely(key == kInvalidKey)) {
@@ -92,11 +98,8 @@ class FlatSparseEntity {
 
         std::string group_id = group_by_func(key);
 
-        auto &group_heap = (*heap)[group_id];
-        if (group_heap.empty()) {
-          group_heap.limit(topk);
-        }
-        group_heap.emplace(key, dist);
+        int ret = heap->add(group_id, key, dist);
+        if (ret != 0) return ret;
       }
     }
 
@@ -105,10 +108,10 @@ class FlatSparseEntity {
 
   //! Group search in linear list with filter and target pkeys
   int search_group_p_keys(
-      const std::string &sparse_vector, const std::vector<uint64_t> &p_keys,
+      std::string_view sparse_vector, const std::vector<uint64_t> &p_keys,
       const IndexFilter &filter,
-      const std::function<std::string(uint64_t)> &group_by_func, uint32_t topk,
-      std::unordered_map<std::string, IndexDocumentHeap> *heap) const {
+      const std::function<std::string(uint64_t)> &group_by_func,
+      uint32_t /*topk*/, GroupCandidateCollector *heap) const {
     for (auto p_key : p_keys) {
       if (!filter.is_valid() || !filter(p_key)) {
         auto node_id = get_id(p_key);
@@ -117,11 +120,8 @@ class FlatSparseEntity {
 
           std::string group_id = group_by_func(p_key);
 
-          auto &group_heap = (*heap)[group_id];
-          if (group_heap.empty()) {
-            group_heap.limit(topk);
-          }
-          group_heap.emplace(p_key, dist);
+          int ret = heap->add(group_id, p_key, dist);
+          if (ret != 0) return ret;
         }
       }
     }
@@ -129,18 +129,26 @@ class FlatSparseEntity {
     return 0;
   }
 
+  int decode_sparse_vector(uint64_t key, IndexSparseDocument &result) const
+      try {
+    IndexStorage::MemoryBlock block;
+    uint32_t length = 0;
+    int ret = get_sparse_vector_ptr_by_key(key, block, &length);
+    if (ret != 0) return ret;
+    if (!block.data() || length < 2 * sizeof(uint32_t))
+      return IndexError_ReadData;
+    SparseUtility::ReverseSparseFormat(block.data(), result,
+                                       sparse_unit_size());
+    return 0;
+  } catch (const ReadError &error) {
+    return error.status;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  }
+
   //! Get sparse vector by key
   int get_sparse_vector(uint64_t key, std::string *sparse_vector) const {
-    const void *sparse_vector_ptr;
-    uint32_t sparse_vector_len;
-    int ret = get_sparse_vector_ptr_by_key(key, &sparse_vector_ptr,
-                                           &sparse_vector_len);
-    if (ret != 0) {
-      return ret;
-    }
-    *sparse_vector = std::string(static_cast<const char *>(sparse_vector_ptr),
-                                 sparse_vector_len);
-    return 0;
+    return get_sparse_vector_by_key(key, sparse_vector);
   }
 
   //! Get sparse vector by node id
@@ -164,9 +172,15 @@ class FlatSparseEntity {
     if (ret != 0) {
       return ret;
     }
-    *sparse_vector =
-        std::string(static_cast<const char *>(sparse_vector_block.data()),
-                    sparse_vector_len);
+    if (!sparse_vector_len) {
+      sparse_vector->clear();
+      return 0;
+    }
+    if (ailego::MemoryLimitPool::get_instance().capacity() &&
+        sparse_vector_len > sparse_vector->capacity())
+      return IndexError_NoMemory;
+    sparse_vector->assign(static_cast<const char *>(sparse_vector_block.data()),
+                          sparse_vector_len);
     return 0;
   }
 
@@ -200,8 +214,8 @@ class FlatSparseEntity {
                                        sparse_vector_len_ptr);
   }
 
-  std::vector<uint64_t> get_keys() const {
-    std::vector<uint64_t> keys;
+  ailego::BudgetedVector<uint64_t> get_keys() const {
+    ailego::BudgetedVector<uint64_t> keys;
     node_id_t doc_total_cnt = doc_cnt();
     for (node_id_t node_id = 0; node_id < doc_total_cnt; ++node_id) {
       uint64_t key = get_key(node_id);
@@ -237,7 +251,7 @@ class FlatSparseEntity {
   }
 
 
-  virtual float get_search_distance(const std::string &vector,
+  virtual float get_search_distance(std::string_view vector,
                                     node_id_t target_node_id) const = 0;
   virtual size_t sparse_unit_size() const = 0;
 };

@@ -25,7 +25,9 @@
 #include <rocksdb/utilities/stackable_db.h>
 #include <zvec/db/index_params.h>
 #include "db/common/file_helper.h"
+#include "db/common/mobile_memory.h"
 #include "db/index/common/index_filter.h"
+#include "../../../../ailego/buffer/pool_payload_budget.h"
 // FtsQueryParams defined below
 #include "db/index/column/fts_column/fts_ast_rewriter.h"
 #include "db/index/column/fts_column/fts_indexer.h"
@@ -41,6 +43,20 @@ using namespace zvec;
 using namespace zvec::fts;
 
 namespace {
+
+class FtsBudgetEnvironment : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // Jieba's full dictionary needs a standalone budget in death-test
+      // parents and their re-executed children.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+};
+
+[[maybe_unused]] const auto *const kFtsBudgetEnvironment =
+    ::testing::AddGlobalTestEnvironment(new FtsBudgetEnvironment);
 
 // Build a transient FieldSchema for FTS unit tests.
 // When fts_params is provided, it is attached as the field's index_params

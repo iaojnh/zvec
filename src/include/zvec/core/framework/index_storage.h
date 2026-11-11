@@ -18,6 +18,8 @@
 #include <memory>
 #include <new>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/ailego/io/file.h>
@@ -40,12 +42,24 @@ class IndexStorage : public IndexModule {
   };
 
   struct MemoryBlock {
+    // A cached allocation may be recycled only after all MemoryBlock views
+    // release their leases. This is independent of shared_ptr::use_count():
+    // cache owners and weak-pointer promotions do not represent readers.
+    class ScratchLease {
+     public:
+      virtual ~ScratchLease() = default;
+      virtual void retain() noexcept = 0;
+      virtual void release() noexcept = 0;
+      virtual bool reusable(size_t bytes, size_t alignment) const noexcept = 0;
+    };
+
     enum MemoryBlockType {
       MBT_UNKNOWN = 0,
       MBT_MMAP = 1,
       MBT_BUFFERPOOL = 2,
       MBT_HEAP_SCRATCH = 3,
       MBT_SHARED_SCRATCH = 4,
+      MBT_REUSABLE_SCRATCH = 5,
     };
 
     MemoryBlock() = default;
@@ -72,7 +86,45 @@ class IndexStorage : public IndexModule {
       mb.type_ = MemoryBlockType::MBT_HEAP_SCRATCH;
       mb.data_ = owned;
       mb.scratch_size_ = size;
+      mb.scratch_capacity_ = size;
       return mb;
+    }
+
+    //! Reserve before allocating; the charge follows ownership, including
+    //! copies and blocks that outlive their storage. Zero alignment uses
+    //! malloc.
+    static MemoryBlock AllocateOwned(size_t size, size_t alignment = 0) {
+      MemoryBlock mb;
+      mb.type_ = MemoryBlockType::MBT_HEAP_SCRATCH;
+      if (!size) return mb;
+      mb.scratch_charge_.add_for_allocation(size, [&] {
+        mb.data_ = alignment ? ailego_aligned_malloc(size, alignment)
+                             : ailego_malloc(size);
+        if (!mb.data_) throw std::bad_alloc();
+      });
+      mb.scratch_size_ = size;
+      mb.scratch_capacity_ = size;
+      return mb;
+    }
+
+    // The caller has acquired one reader lease. Heap copies remain deep;
+    // mapping copies acquire leases. Moves transfer the existing lease.
+    static MemoryBlock MakeReusedScratch(
+        void *data, const std::shared_ptr<ScratchLease> &owner,
+        bool deep_copy) {
+      MemoryBlock mb;
+      mb.type_ = MBT_REUSABLE_SCRATCH;
+      mb.data_ = data;
+      mb.scratch_lease_ = owner;
+      mb.scratch_deep_copy_ = deep_copy;
+      return mb;
+    }
+
+    bool can_reuse_scratch(size_t bytes, size_t alignment) const noexcept {
+      if (scratch_lease_) return scratch_lease_->reusable(bytes, alignment);
+      return type_ == MBT_HEAP_SCRATCH && data_ && scratch_capacity_ >= bytes &&
+             (!alignment ||
+              reinterpret_cast<uintptr_t>(data_) % alignment == 0);
     }
 
     //! Build a non-owning view over caller-managed memory (e.g. a query-level
@@ -116,10 +168,18 @@ class IndexStorage : public IndexModule {
           // Heap blocks do not share ownership.
           deep_copy_from(rhs);
           break;
+        case MemoryBlockType::MBT_REUSABLE_SCRATCH:
         case MemoryBlockType::MBT_SHARED_SCRATCH:
+          if (rhs.scratch_deep_copy_) {
+            deep_copy_from(rhs);
+            break;
+          }
           type_ = rhs.type_;
           data_ = rhs.data_;
           scratch_owner_ = rhs.scratch_owner_;
+          scratch_size_ = rhs.scratch_size_;
+          scratch_lease_ = rhs.scratch_lease_;
+          if (scratch_lease_) scratch_lease_->retain();
           break;
         default:
           break;
@@ -145,14 +205,20 @@ class IndexStorage : public IndexModule {
           type_ = MemoryBlockType::MBT_HEAP_SCRATCH;
           data_ = rhs.data_;
           scratch_size_ = rhs.scratch_size_;
+          scratch_capacity_ = rhs.scratch_capacity_;
+          scratch_charge_ = std::move(rhs.scratch_charge_);
           rhs.data_ = nullptr;
           rhs.scratch_size_ = 0;
           rhs.type_ = MemoryBlockType::MBT_UNKNOWN;
           break;
+        case MemoryBlockType::MBT_REUSABLE_SCRATCH:
         case MemoryBlockType::MBT_SHARED_SCRATCH:
           type_ = rhs.type_;
           data_ = rhs.data_;
           scratch_owner_ = std::move(rhs.scratch_owner_);
+          scratch_size_ = rhs.scratch_size_;
+          scratch_lease_ = std::exchange(rhs.scratch_lease_, nullptr);
+          scratch_deep_copy_ = rhs.scratch_deep_copy_;
           rhs.data_ = nullptr;
           rhs.type_ = MemoryBlockType::MBT_UNKNOWN;
           break;
@@ -181,11 +247,20 @@ class IndexStorage : public IndexModule {
             release_current();
             deep_copy_from(rhs);
             break;
+          case MemoryBlockType::MBT_REUSABLE_SCRATCH:
           case MemoryBlockType::MBT_SHARED_SCRATCH:
+            if (rhs.scratch_deep_copy_) {
+              release_current();
+              deep_copy_from(rhs);
+              break;
+            }
             release_current();
             type_ = rhs.type_;
             data_ = rhs.data_;
             scratch_owner_ = rhs.scratch_owner_;
+            scratch_size_ = rhs.scratch_size_;
+            scratch_lease_ = rhs.scratch_lease_;
+            if (scratch_lease_) scratch_lease_->retain();
             break;
           default:
             release_current();
@@ -218,15 +293,21 @@ class IndexStorage : public IndexModule {
             type_ = MemoryBlockType::MBT_HEAP_SCRATCH;
             data_ = rhs.data_;
             scratch_size_ = rhs.scratch_size_;
+            scratch_capacity_ = rhs.scratch_capacity_;
+            scratch_charge_ = std::move(rhs.scratch_charge_);
             rhs.data_ = nullptr;
             rhs.scratch_size_ = 0;
             rhs.type_ = MemoryBlockType::MBT_UNKNOWN;
             break;
+          case MemoryBlockType::MBT_REUSABLE_SCRATCH:
           case MemoryBlockType::MBT_SHARED_SCRATCH:
             release_current();
             type_ = rhs.type_;
             data_ = rhs.data_;
             scratch_owner_ = std::move(rhs.scratch_owner_);
+            scratch_size_ = rhs.scratch_size_;
+            scratch_lease_ = std::exchange(rhs.scratch_lease_, nullptr);
+            scratch_deep_copy_ = rhs.scratch_deep_copy_;
             rhs.data_ = nullptr;
             rhs.type_ = MemoryBlockType::MBT_UNKNOWN;
             break;
@@ -249,6 +330,10 @@ class IndexStorage : public IndexModule {
           break;
         case MemoryBlockType::MBT_HEAP_SCRATCH:
           release_owned();
+          break;
+        case MemoryBlockType::MBT_REUSABLE_SCRATCH:
+        case MemoryBlockType::MBT_SHARED_SCRATCH:
+          if (scratch_lease_) scratch_lease_->release();
           break;
         default:
           break;
@@ -308,6 +393,7 @@ class IndexStorage : public IndexModule {
         data_ = nullptr;
       }
       scratch_size_ = 0;
+      scratch_charge_.retain_at_most(0);
     }
 
     //! Release the current representation and reset the block.
@@ -323,7 +409,11 @@ class IndexStorage : public IndexModule {
         case MemoryBlockType::MBT_HEAP_SCRATCH:
           release_owned();
           break;
+        case MemoryBlockType::MBT_REUSABLE_SCRATCH:
         case MemoryBlockType::MBT_SHARED_SCRATCH:
+          if (scratch_lease_) scratch_lease_->release();
+          scratch_lease_ = nullptr;
+          scratch_deep_copy_ = false;
           scratch_owner_.reset();
           break;
         default:
@@ -332,24 +422,22 @@ class IndexStorage : public IndexModule {
       data_ = nullptr;
       scratch_size_ = 0;
       type_ = MemoryBlockType::MBT_UNKNOWN;
+      scratch_capacity_ = 0;
+      scratch_deep_copy_ = false;
     }
 
     //! Deep-copy heap scratch ownership.
     void deep_copy_from(const MemoryBlock &rhs) {
-      type_ = MemoryBlockType::MBT_HEAP_SCRATCH;
-      scratch_size_ = rhs.scratch_size_;
-      if (scratch_size_ > 0 && rhs.data_) {
-        data_ = ailego_malloc(scratch_size_);
-        if (data_ == nullptr) {
-          scratch_size_ = 0;
-          type_ = MemoryBlockType::MBT_UNKNOWN;
-          throw std::bad_alloc();
-        }
-        std::memcpy(data_, rhs.data_, scratch_size_);
-      } else {
-        data_ = nullptr;
-      }
+      auto copy = AllocateOwned(rhs.data_ ? rhs.scratch_size_ : 0);
+      if (rhs.data_ && rhs.scratch_size_)
+        std::memcpy(copy.data_, rhs.data_, rhs.scratch_size_);
+      *this = std::move(copy);
     }
+
+    ailego::MemoryReservation scratch_charge_;
+    size_t scratch_capacity_{0};
+    std::shared_ptr<ScratchLease> scratch_lease_;
+    bool scratch_deep_copy_{false};
   };
 
   struct SegmentData {
@@ -389,23 +477,51 @@ class IndexStorage : public IndexModule {
       size_t size{0};
     };
 
+    struct ReadChunk {
+      size_t offset;
+      size_t size;
+    };
+    using ReadChunks = ailego::BudgetedVector<ReadChunk>;
+    // Immutable logical read ranges, relative to this segment. Backends that
+    // support them can cache the same units that the algorithm consumes.
+    virtual bool supports_read_chunks() const { return false; }
+    virtual int set_read_chunks(const ReadChunks &) { return 0; }
+
     //! A bounded-lifetime scatter read. Page-backed implementations may
     //! return independently pinned spans; contiguous backends use fallback.
     struct ScatterBlock {
+      using Spans = ailego::BudgetedVector<ReadSpan>;
+
+      // Backends may retain charged descriptors without retaining page pins.
+      // A separately copied lease must keep its pins until its last owner dies.
+      struct Workspace {
+        virtual ~Workspace() = default;
+        virtual void reset() noexcept = 0;
+      };
+
       ScatterBlock() = default;
       ScatterBlock(const ScatterBlock &) = delete;
       ScatterBlock &operator=(const ScatterBlock &) = delete;
       ScatterBlock(ScatterBlock &&) = default;
       ScatterBlock &operator=(ScatterBlock &&) = default;
 
-      std::vector<ReadSpan> spans{};
+      // Capacity remains charged across reset(), which retains it for reuse.
+      Spans spans{};
       std::shared_ptr<void> lease{};
       MemoryBlock fallback{};
       size_t size{0};
+      std::shared_ptr<Workspace> workspace{};
 
       void reset() {
         spans.clear();
         lease.reset();
+        if (workspace) {
+          if (workspace.use_count() == 1) {
+            workspace->reset();
+          } else {
+            workspace.reset();
+          }
+        }
         fallback.reset();
         size = 0;
       }
@@ -420,8 +536,8 @@ class IndexStorage : public IndexModule {
         }
       }
 
-      void reset_scattered(std::vector<ReadSpan> read_spans,
-                           std::shared_ptr<void> read_lease, size_t length) {
+      void reset_scattered(Spans read_spans, std::shared_ptr<void> read_lease,
+                           size_t length) {
         reset();
         spans = std::move(read_spans);
         lease = std::move(read_lease);
@@ -433,6 +549,7 @@ class IndexStorage : public IndexModule {
     //! segments owned by the same storage so backends can merge their page
     //! misses into one I/O submission.
     struct BorrowedRead {
+      BorrowedRead() = default;
       BorrowedRead(Segment *segment_arg, size_t offset_arg, size_t length_arg,
                    MemoryBlock *block_arg)
           : segment(segment_arg),
@@ -466,9 +583,16 @@ class IndexStorage : public IndexModule {
     //! Retrieve capacity of segment
     virtual size_t capacity() const = 0;
 
-    //! Fetch data from segment (with own buffer)
+    //! Copy into caller-owned memory. Dynamic destinations must be admitted
+    //! before allocation; fetch does not charge them again. Storage backends
+    //! are responsible for budgeting any intermediate buffers they allocate.
     virtual size_t fetch(size_t offset, void *buf, size_t len) const = 0;
 
+    //! Inspect immediately after a failed read/fetch on this thread. Backends
+    //! with only byte-count APIs may expose a more specific failure reason.
+    virtual int read_error() const {
+      return IndexError_ReadData;
+    }
     //! Read data from segment. Keep the block alive while using its data.
     //! Resetting or destroying the block releases owned buffers/cache pins;
     //! mmap and memory-backed views still require their segment to stay alive.
@@ -640,6 +764,21 @@ class IndexStorage : public IndexModule {
         data.reset_contiguous(std::move(block), read_size);
       }
       return read_size;
+    }
+
+    //! Inspect immediately after a failed write or write_batch on this thread.
+    virtual int write_error() const {
+      return IndexError_WriteData;
+    }
+
+    //! Best-effort lookahead with bounded-queue backpressure. False leaves the
+    //! range with the caller to retry after consuming an earlier read. Legacy
+    //! backends retain their prefetch behavior and never request a retry.
+    //! Appended so existing method slots remain stable.
+    virtual bool try_prefetch(size_t offset, size_t len,
+                              CachePriority priority = CachePriority::kLow) {
+      prefetch(offset, len, priority);
+      return true;
     }
   };
 

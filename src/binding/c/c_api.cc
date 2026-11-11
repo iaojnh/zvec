@@ -40,6 +40,12 @@
 #include <zvec/db/reranker.h>
 #include <zvec/db/schema.h>
 #include <zvec/db/stats.h>
+#include "c_input_memory.h"
+#include "c_memory.h"
+#include "db/collection_fetch_internal.h"
+#include "db/common/constants.h"
+#include "db/common/document_memory.h"
+#include "db/index/common/serialized_doc_memory.h"
 
 // Error checking macros - these preserve __LINE__ accuracy
 // Simplified macro for setting error with automatic file/line/function info
@@ -227,6 +233,22 @@ int zvec_get_version_patch(void) {
 // String management functions implementation
 // =============================================================================
 
+template <typename T>
+static auto allocate_c_result_header() {
+  return std::unique_ptr<T, decltype(&zvec_free)>(
+      static_cast<T *>(zvec::detail::AllocateCResult(sizeof(T))), &zvec_free);
+}
+
+static zvec_string_t *create_c_string(std::string_view value) {
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate string",
+      auto result = allocate_c_result_header<zvec_string_t>();
+      result->data = zvec::detail::CopyCResultString(value);
+      result->length = value.size();
+      result->capacity = value.size() + 1;
+      return result.release();)
+}
+
 zvec_string_t *zvec_string_create(const char *str) {
   if (!str) {
     SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
@@ -234,27 +256,7 @@ zvec_string_t *zvec_string_create(const char *str) {
     return nullptr;
   }
 
-  size_t len = strlen(str);
-  zvec_string_t *zstr = static_cast<zvec_string_t *>(malloc(sizeof(zvec_string_t)));
-  if (!zstr) {
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for zvec_string_t");
-    return nullptr;
-  }
-
-  char *data_buffer = static_cast<char *>(malloc(len + 1));
-  if (!data_buffer) {
-    free(zstr);
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for string data");
-    return nullptr;
-  }
-
-  memcpy(data_buffer, str, len + 1);
-  zstr->data = data_buffer;
-  zstr->length = len;
-  zstr->capacity = len + 1;
-  return zstr;
+  return create_c_string(str);
 }
 
 zvec_string_t *zvec_string_create_from_view(const zvec_string_view_t *view) {
@@ -264,28 +266,7 @@ zvec_string_t *zvec_string_create_from_view(const zvec_string_view_t *view) {
     return nullptr;
   }
 
-  zvec_string_t *zstr = static_cast<zvec_string_t *>(malloc(sizeof(zvec_string_t)));
-  if (!zstr) {
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for zvec_string_t");
-    return nullptr;
-  }
-
-  char *data_buffer = static_cast<char *>(malloc(view->length + 1));
-  if (!data_buffer) {
-    free(zstr);
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for string data");
-    return nullptr;
-  }
-
-  memcpy(data_buffer, view->data, view->length);
-  data_buffer[view->length] = '\0';
-  zstr->data = data_buffer;
-  zstr->length = view->length;
-  zstr->capacity = view->length + 1;
-
-  return zstr;
+  return create_c_string({view->data, view->length});
 }
 
 zvec_string_t *zvec_bin_create(const uint8_t *data, size_t length) {
@@ -295,28 +276,7 @@ zvec_string_t *zvec_bin_create(const uint8_t *data, size_t length) {
     return nullptr;
   }
 
-  zvec_string_t *zstr = static_cast<zvec_string_t *>(malloc(sizeof(zvec_string_t)));
-  if (!zstr) {
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for zvec_string_t");
-    return nullptr;
-  }
-
-  char *data_buffer = static_cast<char *>(malloc(length + 1));
-  if (!data_buffer) {
-    free(zstr);
-    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                   "Failed to allocate memory for binary data");
-    return nullptr;
-  }
-
-  memcpy(data_buffer, data, length);
-  data_buffer[length] = '\0';
-  zstr->data = data_buffer;
-  zstr->length = length;
-  zstr->capacity = length + 1;
-
-  return zstr;
+  return create_c_string({reinterpret_cast<const char *>(data), length});
 }
 
 zvec_string_t *zvec_string_copy(const zvec_string_t *str) {
@@ -678,6 +638,29 @@ uint32_t zvec_config_data_get_optimize_thread_count(
 // Initialization and cleanup interface implementation
 // =============================================================================
 
+zvec_error_code_t zvec_config_data_set_temporary_directory(
+    zvec_config_data_t *config, const char *directory) {
+  if (!config || !directory) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Config or directory is null");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to set temporary directory",
+      reinterpret_cast<zvec::GlobalConfig::ConfigData *>(config)
+          ->temporary_directory = directory;
+      return ZVEC_OK;)
+}
+
+const char *zvec_config_data_get_temporary_directory(
+    const zvec_config_data_t *config) {
+  if (!config) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Config pointer is null");
+    return nullptr;
+  }
+  return reinterpret_cast<const zvec::GlobalConfig::ConfigData *>(config)
+      ->temporary_directory.c_str();
+}
+
 zvec_error_code_t zvec_initialize(const zvec_config_data_t *config) {
   std::lock_guard<std::mutex> lock(g_init_mutex);
 
@@ -718,7 +701,7 @@ zvec_error_code_t zvec_shutdown(void) {
     SET_LAST_ERROR(ZVEC_ERROR_FAILED_PRECONDITION, "Library not initialized");
     return ZVEC_ERROR_FAILED_PRECONDITION;
   }
-  // We're do nothing here for now, 
+  // We're do nothing here for now,
   // but we might add zvec::GlobalConfig::Finalize in the future.
   ZVEC_TRY_RETURN_ERROR("Shutdown failed", g_initialized.store(false);
                         return ZVEC_OK;)
@@ -726,6 +709,27 @@ zvec_error_code_t zvec_shutdown(void) {
 
 bool zvec_is_initialized(void) {
   return g_initialized.load();
+}
+
+zvec_error_code_t zvec_set_memory_pressure(zvec_memory_pressure_t level) {
+  if (level < ZVEC_MEMORY_PRESSURE_NORMAL ||
+      level > ZVEC_MEMORY_PRESSURE_CRITICAL) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Invalid memory pressure level");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  if (!g_initialized.load()) {
+    SET_LAST_ERROR(ZVEC_ERROR_FAILED_PRECONDITION, "Library not initialized");
+    return ZVEC_ERROR_FAILED_PRECONDITION;
+  }
+  ZVEC_TRY_RETURN_ERROR(
+      "Memory pressure notification failed",
+      const auto status = zvec::GlobalConfig::Instance().set_memory_pressure(
+          static_cast<zvec::GlobalConfig::MemoryPressure>(level));
+      if (!status.ok()) {
+        SET_LAST_ERROR(ZVEC_ERROR_FAILED_PRECONDITION, status.message());
+        return ZVEC_ERROR_FAILED_PRECONDITION;
+      }
+      return ZVEC_OK;)
 }
 
 // =============================================================================
@@ -820,7 +824,7 @@ static zvec_error_code_t handle_expected_result(
  * @brief Copy a C++ string to C heap-allocated string
  * @param str String to copy
  * @return Newly allocated C string, or NULL on failure
- * @note Caller must free() the returned string
+ * @note Caller must zvec_free() the returned string
  */
 static char *copy_string(const std::string &str) {
   if (str.empty()) return nullptr;
@@ -832,57 +836,67 @@ static char *copy_string(const std::string &str) {
   return copy;
 }
 
-/**
- * @brief Free write results array returned by DML APIs
- * @param results Results array to free
- * @param result_count Number of results
- */
-static void free_write_results_internal(zvec_write_result_t *results,
-                                        size_t result_count) {
-  if (!results) {
-    return;
+// Allocate the C result array before mutating the collection. Keep native
+// statuses in its registered owner so publishing messages cannot fail due to
+// a new allocation or a pressure transition after the write.
+class CWriteResultBuffer {
+ public:
+  template <typename Input>
+  explicit CWriteResultBuffer(const std::vector<Input> &input) {
+    using zvec::detail::BindingMemoryBytes;
+    size_t key_bytes = 0;
+    for (const auto &item : input)
+      key_bytes = BindingMemoryBytes(2, key_size(item), key_bytes);
+    const size_t array_bytes =
+        BindingMemoryBytes(input.size(), sizeof(zvec_write_result_t));
+    const size_t overhead =
+        BindingMemoryBytes(1, array_bytes, sizeof(Owner) + 256);
+    zvec::detail::ResultMemoryAllowance::Lease admission(
+        &zvec::detail::SharedResultMemoryAllowance());
+    // Duplicate-key and missing-key statuses can include the full key.
+    admission.add(BindingMemoryBytes(input.size(), sizeof(zvec::Status) + 512,
+                                    BindingMemoryBytes(1, key_bytes, overhead)));
+    owner_ = std::make_shared<Owner>();
+    owner_->memory.absorb(admission);
+    results_.reset(static_cast<zvec_write_result_t *>(
+        zvec::detail::CResultAllocations::instance().allocate_owned(
+            array_bytes, owner_)));
   }
-  for (size_t i = 0; i < result_count; ++i) {
-    // pk is not stored (ordered style), only free message
-    if (results[i].message) {
-      free((void *)results[i].message);
-      results[i].message = nullptr;
+
+  void publish(zvec::WriteResults statuses, zvec_write_result_t **results,
+               size_t *count) {
+    using zvec::detail::BindingMemoryBytes;
+    owner_->statuses = std::move(statuses);
+    const auto &owned = owner_->statuses;
+    size_t bytes = BindingMemoryBytes(
+        owned.capacity(), sizeof(zvec::Status),
+        BindingMemoryBytes(owned.size(), sizeof(zvec_write_result_t),
+                           sizeof(Owner) + 256));
+    for (size_t i = 0; i < owned.size(); ++i) {
+      const auto &status = owned[i];
+      results_.get()[i] = {status_to_error_code(status),
+                          status.message().empty() ? nullptr : status.c_str()};
+      bytes = BindingMemoryBytes(1, status.message().capacity(), bytes);
     }
-  }
-  free(results);
-}
-
-// Helper function: convert per-doc statuses to C API write result array.
-static zvec_error_code_t build_write_results(
-    const std::vector<zvec::Status> &statuses, zvec_write_result_t **results,
-    size_t *result_count) {
-  if (!results || !result_count) {
-    return ZVEC_ERROR_INVALID_ARGUMENT;
+    owner_->memory.retain_at_most(bytes);
+    *count = owned.size();
+    if (!owned.empty()) *results = results_.release();
   }
 
-  *result_count = statuses.size();
-  if (*result_count == 0) {
-    *results = nullptr;
-    return ZVEC_OK;
-  }
+ private:
+  struct Owner {
+    zvec::detail::ResultMemoryAllowance::Lease memory{
+        &zvec::detail::SharedResultMemoryAllowance()};
+    zvec::WriteResults statuses;
+  };
 
-  *results = static_cast<zvec_write_result_t *>(
-      calloc(*result_count, sizeof(zvec_write_result_t)));
-  if (!*results) {
-    set_last_error("Failed to allocate memory for write results");
-    return ZVEC_ERROR_INTERNAL_ERROR;
-  }
+  static size_t key_size(const zvec::Doc &doc) { return doc.pk_ref().size(); }
+  static size_t key_size(const std::string &key) { return key.size(); }
 
-  // Use ordered style: result index corresponds to input index.
-  // No need to store pk in result, caller can access by index.
-  for (size_t i = 0; i < *result_count; ++i) {
-    const std::string message = statuses[i].message();
-    (*results)[i].message = copy_string(message);
-    (*results)[i].code = status_to_error_code(statuses[i]);
-  }
-
-  return ZVEC_OK;
-}
+  std::shared_ptr<Owner> owner_;
+  std::unique_ptr<zvec_write_result_t, decltype(&zvec_free)> results_{
+      nullptr, &zvec_free};
+};
 
 // =============================================================================
 // Type conversion helpers
@@ -909,7 +923,7 @@ static std::shared_ptr<zvec::IndexParams> convert_c_index_params_to_cpp(
  * @brief Allocate memory within the library
  * @param size Number of bytes to allocate
  * @return Pointer to allocated memory, or NULL on failure
- * 
+ *
  * @note Use zvec_malloc instead of malloc to ensure memory is managed
  *       consistently within the library. All memory allocated with zvec_malloc
  *       should be freed with zvec_free.
@@ -921,16 +935,14 @@ void* zvec_malloc(size_t size) {
 /**
  * @brief Free memory allocated by zvec_malloc
  * @param ptr Pointer to memory to free (can be NULL)
- * 
+ *
  * @note Use zvec_free instead of free to ensure memory is managed
  *       consistently within the library. This function should be used to free
  *       any memory allocated with zvec_malloc or returned by library functions
  *       that document they return library-allocated memory.
  */
 void zvec_free(void *ptr) {
-  if (ptr) {
-    free(ptr);
-  }
+  zvec::detail::FreeCResult(ptr);
 }
 
 /**
@@ -940,9 +952,9 @@ void zvec_free(void *ptr) {
 void zvec_free_string(zvec_string_t *str) {
   if (str) {
     if (str->data) {
-      free((void *)str->data);
+      zvec_free((void *)str->data);
     }
-    free(str);
+    zvec_free(str);
   }
 }
 
@@ -951,19 +963,24 @@ void zvec_free_string(zvec_string_t *str) {
  * @param count Number of strings in the array
  * @return New string array, or NULL on failure
  */
-zvec_string_array_t *zvec_string_array_create(size_t count) {
-  if (count > SIZE_MAX / sizeof(zvec_string_t)) return nullptr;
-  
-  zvec_string_array_t *array = (zvec_string_array_t *)malloc(sizeof(zvec_string_array_t));
-  if (!array) return nullptr;
+static zvec_string_array_t *create_c_string_array(size_t count) {
+  auto array = allocate_c_result_header<zvec_string_array_t>();
+  array->strings = static_cast<zvec_string_t *>(
+      zvec::detail::AllocateCResultArray(count, sizeof(zvec_string_t)));
   array->count = count;
-  array->strings = (zvec_string_t *)malloc(sizeof(zvec_string_t) * count);
-  if (!array->strings) {
-    free(array);
-    return nullptr;
-  }
-  memset(array->strings, 0, sizeof(zvec_string_t) * count);
-  return array;
+  return array.release();
+}
+
+zvec_string_array_t *zvec_string_array_create(size_t count) {
+  ZVEC_TRY_RETURN_NULL("Failed to allocate string array",
+                       return create_c_string_array(count);)
+}
+
+static void replace_c_array_string(zvec_string_t &slot, std::string_view value) {
+  // Copy before releasing the previous slot, including when value aliases it.
+  auto *data = zvec::detail::CopyCResultString(value);
+  zvec_free(const_cast<char *>(slot.data));
+  slot = {data, value.size(), value.size() + 1};
 }
 
 /**
@@ -977,12 +994,14 @@ zvec_string_array_t *zvec_string_array_create_from_strings(const char **strings,
   if (!strings || count == 0) {
     return nullptr;
   }
-  zvec_string_array_t *array = zvec_string_array_create(count);
-  if (!array) return nullptr;
-  for (size_t i = 0; i < count; ++i) {
-    zvec_string_array_add(array, i, strings[i]);
-  }
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to copy string array",
+      std::unique_ptr<zvec_string_array_t, decltype(&zvec_string_array_destroy)>
+          array(create_c_string_array(count), &zvec_string_array_destroy);
+      for (size_t i = 0; i < count; ++i) {
+        if (strings[i]) replace_c_array_string(array->strings[i], strings[i]);
+      }
+      return array.release();)
 }
 
 /**
@@ -995,13 +1014,14 @@ void zvec_string_array_add(zvec_string_array_t *array, size_t idx,
                            const char *str) {
   if (!array || !str) return;
   if (idx >= array->count) return;
-  size_t len = strlen(str);
-  char *buf = (char *)malloc(len + 1);
-  if (!buf) return;
-  memcpy(buf, str, len + 1);
-  array->strings[idx].data = buf;
-  array->strings[idx].length = len;
-  array->strings[idx].capacity = len + 1;
+  try {
+    replace_c_array_string(array->strings[idx], str);
+  } catch (const std::bad_alloc &) {
+    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
+                   "Failed to replace string array entry");
+  } catch (const std::exception &error) {
+    SET_LAST_ERROR(ZVEC_ERROR_INTERNAL_ERROR, error.what());
+  }
 }
 
 /**
@@ -1012,11 +1032,11 @@ void zvec_string_array_destroy(zvec_string_array_t *array) {
   if (!array) return;
   for (size_t i = 0; i < array->count; i++) {
     if (array->strings[i].data) {
-      free((void *)array->strings[i].data);
+      zvec_free((void *)array->strings[i].data);
     }
   }
-  free(array->strings);
-  free(array);
+  zvec_free(array->strings);
+  zvec_free(array);
 }
 
 
@@ -1027,20 +1047,14 @@ void zvec_string_array_destroy(zvec_string_array_t *array) {
  */
 // Byte array helper functions
 zvec_mutable_byte_array_t *zvec_byte_array_create(size_t capacity) {
-  zvec_mutable_byte_array_t *array =
-      (zvec_mutable_byte_array_t *)malloc(sizeof(zvec_mutable_byte_array_t));
-  if (!array) return nullptr;
-
-  array->data = (uint8_t *)malloc(capacity);
-  if (!array->data) {
-    free(array);
-    return nullptr;
-  }
-
-  array->length = 0;
-  array->capacity = capacity;
-  memset(array->data, 0, capacity);
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate byte array",
+      auto array = allocate_c_result_header<zvec_mutable_byte_array_t>();
+      array->data = static_cast<uint8_t *>(
+          zvec::detail::AllocateCResultArray(capacity, sizeof(uint8_t)));
+      array->length = 0;
+      array->capacity = capacity;
+      return array.release();)
 }
 
 /**
@@ -1050,9 +1064,9 @@ zvec_mutable_byte_array_t *zvec_byte_array_create(size_t capacity) {
 void zvec_byte_array_destroy(zvec_mutable_byte_array_t *array) {
   if (!array) return;
   if (array->data) {
-    free(array->data);
+    zvec_free(array->data);
   }
-  free(array);
+  zvec_free(array);
 }
 
 /**
@@ -1062,18 +1076,13 @@ void zvec_byte_array_destroy(zvec_mutable_byte_array_t *array) {
  */
 // Float array helper functions
 zvec_float_array_t *zvec_float_array_create(size_t count) {
-  zvec_float_array_t *array = (zvec_float_array_t *)malloc(sizeof(zvec_float_array_t));
-  if (!array) return nullptr;
-
-  array->data = (const float *)malloc(sizeof(float) * count);
-  if (!array->data) {
-    free(array);
-    return nullptr;
-  }
-
-  array->length = count;
-  memset((void *)array->data, 0, sizeof(float) * count);
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate float array",
+      auto array = allocate_c_result_header<zvec_float_array_t>();
+      array->data = static_cast<float *>(
+          zvec::detail::AllocateCResultArray(count, sizeof(float)));
+      array->length = count;
+      return array.release();)
 }
 
 /**
@@ -1083,33 +1092,28 @@ zvec_float_array_t *zvec_float_array_create(size_t count) {
 void zvec_float_array_destroy(zvec_float_array_t *array) {
   if (!array) return;
   if (array->data) {
-    free((void *)array->data);
+    zvec_free((void *)array->data);
   }
-  free(array);
+  zvec_free(array);
 }
 
 // Int64 array helper functions
 zvec_int64_array_t *zvec_int64_array_create(size_t count) {
-  zvec_int64_array_t *array = (zvec_int64_array_t *)malloc(sizeof(zvec_int64_array_t));
-  if (!array) return nullptr;
-
-  array->data = (const int64_t *)malloc(sizeof(int64_t) * count);
-  if (!array->data) {
-    free(array);
-    return nullptr;
-  }
-
-  array->length = count;
-  memset((void *)array->data, 0, sizeof(int64_t) * count);
-  return array;
+  ZVEC_TRY_RETURN_NULL(
+      "Failed to allocate int64 array",
+      auto array = allocate_c_result_header<zvec_int64_array_t>();
+      array->data = static_cast<int64_t *>(
+          zvec::detail::AllocateCResultArray(count, sizeof(int64_t)));
+      array->length = count;
+      return array.release();)
 }
 
 void zvec_int64_array_destroy(zvec_int64_array_t *array) {
   if (!array) return;
   if (array->data) {
-    free((void *)array->data);
+    zvec_free((void *)array->data);
   }
-  free(array);
+  zvec_free(array);
 }
 
 void zvec_free_str_array(char **array, size_t count) {
@@ -1118,16 +1122,16 @@ void zvec_free_str_array(char **array, size_t count) {
   // If count is 0, only free the string array itself, don't process internal
   // strings
   if (count == 0) {
-    free(array);
+    zvec_free(array);
     return;
   }
 
   for (size_t i = 0; i < count; ++i) {
     if (array[i]) {  // Only free when string pointer is not null
-      free(array[i]);
+      zvec_free(array[i]);
     }
   }
-  free(array);
+  zvec_free(array);
 }
 
 zvec_error_code_t zvec_get_last_error(char **error_msg) {
@@ -1142,14 +1146,14 @@ zvec_error_code_t zvec_get_last_error(char **error_msg) {
 
 void zvec_free_uint8_array(uint8_t *array) {
   if (array) {
-    free(array);
+    zvec_free(array);
   }
 }
 
 void zvec_free_field_schema(zvec_field_schema_t *field_schema) {
   if (field_schema) {
     // index_params is embedded, no need to free
-    free(field_schema);
+    zvec_free(field_schema);
   }
 }
 
@@ -2051,6 +2055,7 @@ zvec_error_code_t zvec_index_params_set_fts_params(
 zvec_error_code_t zvec_index_params_get_fts_params(
     const zvec_index_params_t *params, const char **out_tokenizer_name,
     zvec_string_array_t **out_filters, const char **out_extra_params) {
+  if (out_filters) *out_filters = nullptr;
   if (!params) {
     SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
                    "Invalid params or not FTS index type");
@@ -2070,17 +2075,15 @@ zvec_error_code_t zvec_index_params_get_fts_params(
     *out_extra_params = fts_params->extra_params().c_str();
   }
   if (out_filters) {
-    const auto &filters = fts_params->filters();
-    zvec_string_array_t *arr = zvec_string_array_create(filters.size());
-    if (!arr) {
-      SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                     "Failed to allocate filters string array");
-      return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-    }
-    for (size_t i = 0; i < filters.size(); ++i) {
-      zvec_string_array_add(arr, i, filters[i].c_str());
-    }
-    *out_filters = arr;
+    ZVEC_TRY_RETURN_ERROR(
+        "Failed to copy filters string array",
+        const auto &filters = fts_params->filters();
+        std::unique_ptr<zvec_string_array_t, decltype(&zvec_string_array_destroy)>
+            array(create_c_string_array(filters.size()), &zvec_string_array_destroy);
+        for (size_t i = 0; i < filters.size(); ++i)
+          replace_c_array_string(array->strings[i], filters[i]);
+        *out_filters = array.release();
+        return ZVEC_OK;)
   }
   return ZVEC_OK;
 }
@@ -2398,8 +2401,7 @@ const char *zvec_collection_schema_get_name(
     return nullptr;
   }
   auto *cpp_schema = reinterpret_cast<const zvec::CollectionSchema *>(schema);
-  // Use strdup to create a persistent copy since name() returns by value
-  return strdup(cpp_schema->name().c_str());
+  return cpp_schema->name_ref().c_str();
 }
 
 zvec_error_code_t zvec_collection_schema_set_name(zvec_collection_schema_t *schema,
@@ -2413,7 +2415,7 @@ zvec_error_code_t zvec_collection_schema_set_name(zvec_collection_schema_t *sche
   ZVEC_TRY_RETURN_ERROR(
       "Failed to set collection name",
       auto *cpp_schema = reinterpret_cast<zvec::CollectionSchema *>(schema);
-      cpp_schema->set_name(std::string(name)); 
+      cpp_schema->set_name(std::string(name));
       return ZVEC_OK;)
 }
 
@@ -2543,185 +2545,91 @@ zvec_field_schema_t *zvec_collection_schema_get_vector_field(
   return nullptr;
 }
 
+enum class SchemaFieldSubset { kAll, kForward, kIndexedForward, kVector };
+
+static const char *borrow_schema_field_name(zvec::FieldSchema *field) {
+  return field->name().c_str();
+}
+
+static zvec_field_schema_t *borrow_schema_field(zvec::FieldSchema *field) {
+  return reinterpret_cast<zvec_field_schema_t *>(field);
+}
+
+template <typename Item>
+static zvec_error_code_t copy_schema_field_pointers(
+    const zvec_collection_schema_t *schema, SchemaFieldSubset subset,
+    Item ***out, size_t *count, Item *(*borrow)(zvec::FieldSchema *)) {
+  if (out) *out = nullptr;
+  if (count) *count = 0;
+  if (!schema || !out || !count) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
+                   "Schema, output array, and count cannot be null");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to get schema fields",
+      const auto *cpp_schema =
+          reinterpret_cast<const zvec::CollectionSchema *>(schema);
+      const auto &fields = cpp_schema->fields_ref();
+      auto matches = [subset](const zvec::FieldSchema::Ptr &field) {
+        switch (subset) {
+          case SchemaFieldSubset::kAll: return true;
+          case SchemaFieldSubset::kForward: return !field->is_vector_field();
+          case SchemaFieldSubset::kIndexedForward:
+            return !field->is_vector_field() && field->index_params() != nullptr;
+          case SchemaFieldSubset::kVector: return field->is_vector_field();
+        }
+        return false;
+      };
+      const size_t size = std::count_if(fields.begin(), fields.end(), matches);
+      if (size == 0) return ZVEC_OK;
+      auto **items = static_cast<Item **>(
+          zvec::detail::AllocateCResultArray(size, sizeof(Item *)));
+      size_t i = 0;
+      for (const auto &field : fields)
+        if (matches(field)) items[i++] = borrow(field.get());
+      *out = items;
+      *count = size;
+      return ZVEC_OK;)
+}
+
 zvec_error_code_t zvec_collection_schema_get_forward_fields(
     const zvec_collection_schema_t *schema, zvec_field_schema_t ***fields,
     size_t *count) {
-  if (!schema || !fields || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, fields, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward fields",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto forward_fields = cpp_schema->forward_fields();
-
-      *count = forward_fields.size();
-      *fields = (zvec_field_schema_t **)zvec_malloc(*count * sizeof(zvec_field_schema_t *));
-      if (!*fields) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      for (size_t i = 0; i < *count; ++i) {
-        // Return non-owning pointers - caller should NOT free these
-        (*fields)[i] =
-            reinterpret_cast<zvec_field_schema_t *>(forward_fields[i].get());
-      } 
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kForward,
+                                    fields, count, borrow_schema_field);
 }
 
 zvec_error_code_t zvec_collection_schema_get_forward_fields_with_index(
     const zvec_collection_schema_t *schema, zvec_field_schema_t ***fields,
     size_t *count) {
-  if (!schema || !fields || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, fields, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward fields with index",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto fields_with_index = cpp_schema->forward_fields_with_index();
-
-      *count = fields_with_index.size();
-      *fields = (zvec_field_schema_t **)zvec_malloc(*count * sizeof(zvec_field_schema_t *));
-      if (!*fields) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      for (size_t i = 0; i < *count; ++i) {
-        // Return non-owning pointers - caller should NOT free these
-        (*fields)[i] =
-            reinterpret_cast<zvec_field_schema_t *>(fields_with_index[i].get());
-      } 
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kIndexedForward,
+                                    fields, count, borrow_schema_field);
 }
 
 zvec_error_code_t zvec_collection_schema_get_forward_field_names(
     const zvec_collection_schema_t *schema, const char ***names, size_t *count) {
-  if (!schema || !names || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, names, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward field names",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto forward_names = cpp_schema->forward_field_names();
-
-      *count = forward_names.size();
-      *names = (const char **)malloc(*count * sizeof(const char *));
-      if (!*names) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      // Copy strings - caller owns the memory and should free
-      for (size_t i = 0; i < *count; ++i) {
-        (*names)[i] = strdup(forward_names[i].c_str());
-      } 
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kForward,
+                                    names, count, borrow_schema_field_name);
 }
 
 zvec_error_code_t zvec_collection_schema_get_forward_field_names_with_index(
     const zvec_collection_schema_t *schema, const char ***names, size_t *count) {
-  if (!schema || !names || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, names, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get forward field names with index",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto forward_names_with_index =
-          cpp_schema->forward_field_names_with_index();
-
-      *count = forward_names_with_index.size();
-      *names = (const char **)malloc(*count * sizeof(const char *));
-      if (!*names) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      // Copy strings - caller owns the memory and should free
-      for (size_t i = 0; i < *count; ++i) {
-        (*names)[i] = strdup(forward_names_with_index[i].c_str());
-      } 
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kIndexedForward,
+                                    names, count, borrow_schema_field_name);
 }
 
 zvec_error_code_t zvec_collection_schema_get_all_field_names(
     const zvec_collection_schema_t *schema, const char ***names, size_t *count) {
-  if (!schema || !names || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, names, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get all field names",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto all_names = cpp_schema->all_field_names();
-
-      *count = all_names.size();
-      *names = (const char **)malloc(*count * sizeof(const char *));
-      if (!*names) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      // Copy strings - caller owns the memory and should free
-      for (size_t i = 0; i < *count;
-           ++i) { (*names)[i] = strdup(all_names[i].c_str()); 
-      } 
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kAll,
+                                    names, count, borrow_schema_field_name);
 }
 
 zvec_error_code_t zvec_collection_schema_get_vector_fields(
     const zvec_collection_schema_t *schema, zvec_field_schema_t ***fields,
     size_t *count) {
-  if (!schema || !fields || !count) {
-    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                   "Schema, fields, and count cannot be null");
-    return ZVEC_ERROR_INVALID_ARGUMENT;
-  }
-
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to get vector fields",
-      auto *cpp_schema =
-          reinterpret_cast<const zvec::CollectionSchema *>(schema);
-      auto vector_fields = cpp_schema->vector_fields();
-
-      *count = vector_fields.size();
-      *fields = (zvec_field_schema_t **)malloc(*count * sizeof(zvec_field_schema_t *));
-      if (!*fields) {
-        SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                       "Failed to allocate memory");
-        return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-      }
-
-      for (size_t i = 0; i < *count; ++i) {
-        // Return non-owning pointers - caller should NOT free these
-        (*fields)[i] =
-            reinterpret_cast<zvec_field_schema_t *>(vector_fields[i].get());
-      } 
-      return ZVEC_OK;)
+  return copy_schema_field_pointers(schema, SchemaFieldSubset::kVector,
+                                    fields, count, borrow_schema_field);
 }
 
 uint64_t zvec_collection_schema_get_max_doc_count_per_segment(
@@ -2742,7 +2650,7 @@ zvec_error_code_t zvec_collection_schema_set_max_doc_count_per_segment(
   ZVEC_TRY_RETURN_ERROR(
       "Failed to set max doc count per segment",
       auto *cpp_schema = reinterpret_cast<zvec::CollectionSchema *>(schema);
-      cpp_schema->set_max_doc_count_per_segment(max_doc_count); 
+      cpp_schema->set_max_doc_count_per_segment(max_doc_count);
       return ZVEC_OK;)
 }
 
@@ -2767,7 +2675,7 @@ zvec_error_code_t zvec_collection_schema_validate(
           *error_msg = zvec_string_create(status.message().c_str());
         }
         return handle_status(status);
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -2806,7 +2714,7 @@ zvec_error_code_t zvec_collection_schema_drop_index(zvec_collection_schema_t *sc
       if (!field) {
         SET_LAST_ERROR(ZVEC_ERROR_NOT_FOUND, "Field not found");
         return ZVEC_ERROR_NOT_FOUND;
-      } 
+      }
       const_cast<zvec::FieldSchema *>(field)
           ->set_index_params(nullptr);
       return ZVEC_OK;)
@@ -2970,16 +2878,113 @@ const char *zvec_metric_type_to_string(zvec_metric_type_t metric_type) {
 // Doc functions implementation
 // =============================================================================
 
+using zvec::detail::BindingMemoryBytes;
+using zvec::detail::CInput;
+using zvec::detail::CInputMutation;
+using zvec::detail::CStringStorage;
+
+template <typename Handle, typename T>
+static Handle *release_c_input(std::unique_ptr<CInput<T>> input) {
+  return reinterpret_cast<Handle *>(static_cast<T *>(input.release()));
+}
+
+template <typename T>
+static zvec_error_code_t set_c_input_string(T &input, std::string &slot,
+                                            std::string_view text) {
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy input string",
+      CInputMutation mutation(input, CStringStorage(text));
+      slot = std::string(text);
+      mutation.commit();
+      return ZVEC_OK;)
+}
+
+template <typename T>
+static zvec_error_code_t set_c_input_fields(
+    T &input, std::optional<std::vector<std::string>> &slot,
+    const char *const *fields, size_t count) {
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy output fields",
+      size_t bytes = BindingMemoryBytes(count, sizeof(std::string));
+      for (size_t i = 0; i < count; ++i) {
+        if (!fields[i]) {
+          SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Null output field");
+          return ZVEC_ERROR_INVALID_ARGUMENT;
+        }
+        bytes = BindingMemoryBytes(1, CStringStorage(fields[i]), bytes);
+      }
+      CInputMutation mutation(input, bytes);
+      std::vector<std::string> result;
+      result.reserve(count);
+      for (size_t i = 0; i < count; ++i) result.emplace_back(fields[i]);
+      slot = std::move(result);
+      mutation.commit();
+      return ZVEC_OK;)
+}
+
+template <typename T>
+static void clear_c_input_fields(
+    T &input, std::optional<std::vector<std::string>> &slot) {
+  slot.reset();
+  auto &owner = static_cast<CInput<T> &>(input);
+  owner.lease.retain_at_most(owner.bytes());
+}
+
+static zvec_error_code_t copy_c_output_field_pointers(
+    const std::optional<std::vector<std::string>> &source,
+    const char ***fields, size_t *count) {
+  *fields = nullptr;
+  *count = 0;
+  if (!source || source->empty()) return ZVEC_OK;
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy output field pointers",
+      auto *output = static_cast<const char **>(
+          zvec::detail::AllocateCResultArray(source->size(), sizeof(const char *)));
+      for (size_t i = 0; i < source->size(); ++i) output[i] = (*source)[i].c_str();
+      *fields = output;
+      *count = source->size();
+      return ZVEC_OK;)
+}
+
+template <typename T>
+static zvec_error_code_t set_c_query_vector(T &input, const void *data,
+                                            size_t size) {
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy query vector",
+      const std::string_view view(static_cast<const char *>(data), size);
+      CInputMutation mutation(input, CStringStorage(view));
+      input.target_.set_vector(std::string(view));
+      mutation.commit();
+      return ZVEC_OK;)
+}
+
+template <typename T>
+static zvec_error_code_t set_c_query_fts(T &input, const zvec_fts_t *fts) {
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy full-text query",
+      if (!fts) {
+        input.target_.clause_ = zvec::VectorClause{};
+        auto &owner = static_cast<CInput<T> &>(input);
+        owner.lease.retain_at_most(owner.bytes());
+        return ZVEC_OK;
+      }
+      const auto &payload = *reinterpret_cast<const zvec::FtsClause *>(fts);
+      CInputMutation mutation(input, zvec::detail::CFtsStorage(payload));
+      input.target_.clause_ = zvec::FtsClause(payload);
+      mutation.commit();
+      return ZVEC_OK;)
+}
+
 zvec_doc_t *zvec_doc_create(void) {
   ZVEC_TRY_RETURN_NULL("Failed to create document", {
-    auto *doc_ptr = new zvec::Doc();
-    return reinterpret_cast<zvec_doc_t *>(doc_ptr);
+    return release_c_input<zvec_doc_t>(
+        CInput<zvec::Doc>::make(CInput<zvec::Doc>::base_bytes));
   })
 }
 
 void zvec_doc_destroy(zvec_doc_t *doc) {
   if (doc) {
-    delete reinterpret_cast<zvec::Doc *>(doc);
+    CInput<zvec::Doc>::destroy(reinterpret_cast<zvec::Doc *>(doc));
   }
 }
 
@@ -2988,7 +2993,12 @@ void zvec_doc_clear(zvec_doc_t *doc) {
 
   ZVEC_TRY_BEGIN_VOID
   auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
-  doc_ptr->clear();
+  // Drop the old heap capacity as well as the visible values.
+  zvec::Doc empty;
+  empty.set_operator(doc_ptr->get_operator());
+  *doc_ptr = std::move(empty);
+  auto &owned = static_cast<CInput<zvec::Doc> &>(*doc_ptr);
+  owned.lease.retain_at_most(owned.bytes());
   ZVEC_CATCH_END_VOID
 }
 
@@ -2999,11 +3009,11 @@ void zvec_docs_free(zvec_doc_t **docs, size_t count) {
     zvec_doc_destroy(docs[i]);
   }
 
-  free(docs);
+  zvec_free(docs);
 }
 
-void zvec_write_results_free(zvec_write_result_t *results, size_t result_count) {
-  free_write_results_internal(results, result_count);
+void zvec_write_results_free(zvec_write_result_t *results, size_t /*result_count*/) {
+  zvec_free(results);
 }
 
 void zvec_doc_set_pk(zvec_doc_t *doc, const char *pk) {
@@ -3011,7 +3021,11 @@ void zvec_doc_set_pk(zvec_doc_t *doc, const char *pk) {
 
   ZVEC_TRY_BEGIN_VOID
   auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
+  CInputMutation mutation(*doc_ptr, CStringStorage(pk));
   doc_ptr->set_pk(std::string(pk));
+  mutation.commit();
+  } catch (const std::bad_alloc &) {
+    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED, "Document key budget exhausted");
   ZVEC_CATCH_END_VOID
 }
 
@@ -3050,7 +3064,10 @@ zvec_error_code_t zvec_doc_set_field_null(zvec_doc_t *doc, const char *field_nam
 
   ZVEC_TRY_RETURN_ERROR("Failed to set null field",
                         auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
+                        CInputMutation mutation(*doc_ptr,
+                            BindingMemoryBytes(2, std::strlen(field_name), 256));
                         doc_ptr->set_null(std::string(field_name));
+                        mutation.commit();
                         return ZVEC_OK;)
 }
 
@@ -3115,9 +3132,8 @@ std::pair<std::vector<uint32_t>, std::vector<T>> extract_sparse_vector(
   const uint32_t *data = static_cast<const uint32_t *>(value);
   uint32_t nnz = data[0];
 
-  size_t required_size =
-      sizeof(uint32_t) + nnz * (sizeof(uint32_t) + sizeof(T));
-  if (value_size < required_size) {
+  if (nnz > (value_size - sizeof(uint32_t)) /
+                (sizeof(uint32_t) + sizeof(T))) {
     if (error_code) {
       *error_code = ZVEC_ERROR_INVALID_ARGUMENT;
     }
@@ -3133,72 +3149,156 @@ std::pair<std::vector<uint32_t>, std::vector<T>> extract_sparse_vector(
   return std::make_pair(std::move(index_vec), std::move(value_vec));
 }
 
-// Helper function to extract string array from raw data (C-string array)
-std::vector<std::string> extract_string_array(const void *value,
-                                              size_t value_size) {
-  std::vector<std::string> string_array;
-  const char *data = static_cast<const char *>(value);
-  size_t pos = 0;
-
-  while (pos < value_size) {
-    size_t str_len = strlen(data + pos);
-    if (pos + str_len >= value_size) {
-      break;
-    }
-    string_array.emplace_back(data + pos, str_len);
-    pos += str_len + 1;
-  }
-  return string_array;
-}
-
-// Helper function to extract string array from zvec_string_t** array
-std::vector<std::string> extract_string_array_from_zvec(
-    zvec_string_t **zvec_strings, size_t count) {
-  std::vector<std::string> string_array;
-  string_array.reserve(count);
-
-  for (size_t i = 0; i < count; ++i) {
-    if (zvec_strings[i] && zvec_strings[i]->data) {
-      string_array.emplace_back(zvec_strings[i]->data, zvec_strings[i]->length);
+// Parse bounded packed arrays for both preflight and conversion.
+template <typename Visitor>
+static void visit_packed_strings(const char *data, size_t size, bool binary,
+                                  bool stop_at_empty, Visitor &&visit) {
+  while (size) {
+    size_t length;
+    size_t consumed;
+    if (binary) {
+      uint32_t encoded_length;
+      if (size < sizeof(encoded_length)) break;
+      std::memcpy(&encoded_length, data, sizeof(encoded_length));
+      data += sizeof(encoded_length);
+      size -= sizeof(encoded_length);
+      length = consumed = encoded_length;
+      if (length > size) break;
     } else {
-      string_array.emplace_back("", 0);
+      const auto *end = static_cast<const char *>(std::memchr(data, 0, size));
+      if (!end) {
+        if (!stop_at_empty) break;
+        length = consumed = size;
+      } else {
+        length = end - data;
+        if (stop_at_empty && !length) break;
+        consumed = length + 1;
+      }
     }
+    visit(data, length);
+    data += consumed;
+    size -= consumed;
   }
-
-  return string_array;
 }
 
-// Helper function to extract binary array from raw data
-std::vector<std::string> extract_binary_array(const void *value,
-                                              size_t value_size) {
-  std::vector<std::string> binary_array;
-  const char *data = static_cast<const char *>(value);
-  size_t pos = 0;
+static size_t packed_string_storage(const void *data, size_t size, bool binary,
+                                    bool stop_at_empty = false) {
+  size_t bytes = 0;
+  visit_packed_strings(static_cast<const char *>(data), size, binary,
+                       stop_at_empty, [&](const char *, size_t length) {
+    bytes = BindingMemoryBytes(1, length, BindingMemoryBytes(
+        1, bytes, 2 * sizeof(std::string) + 32));
+  });
+  return bytes;
+}
 
-  while (pos < value_size) {
-    if (pos + sizeof(uint32_t) > value_size) {
-      break;
-    }
-    uint32_t bin_len = *reinterpret_cast<const uint32_t *>(data + pos);
-    pos += sizeof(uint32_t);
+static std::vector<std::string> extract_packed_strings(
+    const void *data, size_t size, bool binary, bool stop_at_empty = false) {
+  std::vector<std::string> result;
+  visit_packed_strings(static_cast<const char *>(data), size, binary,
+                       stop_at_empty, [&](const char *text, size_t length) {
+    result.emplace_back(text, length);
+  });
+  return result;
+}
 
-    if (pos + bin_len > value_size) {
-      break;
+static size_t c_field_storage(zvec_data_type_t type, const void *data,
+                              size_t size) {
+  if (type == ZVEC_DATA_TYPE_ARRAY_BINARY)
+    return packed_string_storage(data, size, true);
+  if (type == ZVEC_DATA_TYPE_ARRAY_STRING) {
+    if (size % sizeof(void *) != 0)
+      return packed_string_storage(data, size, false);
+    const auto *strings = static_cast<zvec_string_t *const *>(data);
+    const size_t count = size / sizeof(void *);
+    size_t bytes = BindingMemoryBytes(count, sizeof(std::string) + 32);
+    for (size_t i = 0; i < count; ++i) {
+      if (strings[i] && strings[i]->data)
+        bytes = BindingMemoryBytes(1, strings[i]->length, bytes);
     }
-    binary_array.emplace_back(data + pos, bin_len);
-    pos += bin_len;
+    return bytes;
   }
-  return binary_array;
+  return BindingMemoryBytes(size, type == ZVEC_DATA_TYPE_VECTOR_INT4 ? 2 : 1);
+}
+
+static size_t c_field_storage(const zvec_doc_field_t &field) {
+  const auto &value = field.value;
+  switch (field.data_type) {
+    case ZVEC_DATA_TYPE_BINARY:
+    case ZVEC_DATA_TYPE_ARRAY_BOOL:
+      return value.binary_value.length;
+    case ZVEC_DATA_TYPE_STRING:
+      return value.string_value.length;
+    case ZVEC_DATA_TYPE_ARRAY_BINARY:
+      return packed_string_storage(value.binary_value.data,
+                                   value.binary_value.length, true);
+    case ZVEC_DATA_TYPE_ARRAY_STRING:
+      return packed_string_storage(value.string_value.data,
+                                   value.string_value.length, false, true);
+    case ZVEC_DATA_TYPE_VECTOR_INT4:
+    case ZVEC_DATA_TYPE_VECTOR_INT8:
+      return value.vector_value.length;
+    case ZVEC_DATA_TYPE_VECTOR_INT16:
+    case ZVEC_DATA_TYPE_VECTOR_FP16:
+    case ZVEC_DATA_TYPE_SPARSE_VECTOR_FP16:
+      return BindingMemoryBytes(value.vector_value.length, 2);
+    case ZVEC_DATA_TYPE_VECTOR_BINARY32:
+    case ZVEC_DATA_TYPE_VECTOR_FP32:
+    case ZVEC_DATA_TYPE_SPARSE_VECTOR_FP32:
+    case ZVEC_DATA_TYPE_ARRAY_INT32:
+    case ZVEC_DATA_TYPE_ARRAY_UINT32:
+    case ZVEC_DATA_TYPE_ARRAY_FLOAT:
+      return BindingMemoryBytes(value.vector_value.length, 4);
+    case ZVEC_DATA_TYPE_VECTOR_BINARY64:
+    case ZVEC_DATA_TYPE_VECTOR_FP64:
+    case ZVEC_DATA_TYPE_ARRAY_INT64:
+    case ZVEC_DATA_TYPE_ARRAY_UINT64:
+    case ZVEC_DATA_TYPE_ARRAY_DOUBLE:
+      return BindingMemoryBytes(value.vector_value.length, 8);
+    default:
+      return 0;
+  }
+}
+
+static std::vector<std::string> extract_string_array_from_zvec(
+    zvec_string_t *const *strings, size_t count) {
+  std::vector<std::string> result;
+  result.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    if (strings[i] && strings[i]->data)
+      result.emplace_back(strings[i]->data, strings[i]->length);
+    else
+      result.emplace_back();
+  }
+  return result;
+}
+
+static zvec::detail::ResultMemoryAllowance *collection_input_allowance(
+    const zvec::Collection &collection) {
+  const auto options = collection.options();
+  return options && !options->enable_mmap_
+             ? &zvec::detail::SharedResultMemoryAllowance() : nullptr;
 }
 
 static zvec::Result<std::vector<zvec::Doc>> convert_zvec_docs_to_internal(
-    const zvec_doc_t **zvec_docs, size_t doc_count) {
+    const zvec_doc_t **zvec_docs, size_t doc_count,
+    zvec::detail::ResultMemoryAllowance::Lease &memory) {
+  if (doc_count > zvec::kMaxWriteBatchSize)
+    return tl::make_unexpected(zvec::Status::InvalidArgument(
+        "Too many docs: exceeds max write batch size of ", zvec::kMaxWriteBatchSize));
+  memory.add(zvec::detail::BindingMemoryBytes(doc_count, sizeof(zvec::Doc) + 512));
+  size_t bytes = 0;
   for (size_t i = 0; i < doc_count; ++i) {
     if (!zvec_docs[i]) {
       return tl::make_unexpected(zvec::Status::InvalidArgument(
           "Invalid doc: document must not be null"));
     }
   }
+  for (size_t i = 0; i < doc_count; ++i)
+    bytes = zvec::detail::BindingMemoryBytes(1,
+        zvec::detail::DocumentMemoryAccess::copy_bytes(
+            *reinterpret_cast<const zvec::Doc *>(zvec_docs[i])), bytes);
+  memory.add(bytes);
   std::vector<zvec::Doc> docs;
   docs.reserve(doc_count);
 
@@ -3234,6 +3334,9 @@ zvec_error_code_t zvec_doc_add_field_by_value(zvec_doc_t *doc, const char *field
 
   ZVEC_TRY_RETURN_ERROR(
       "Failed to add field", auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
+      CInputMutation mutation(*doc_ptr, BindingMemoryBytes(
+          2, std::strlen(field_name),
+          BindingMemoryBytes(1, c_field_storage(data_type, value, value_size), 256)));
       std::string name(field_name); zvec_error_code_t error_code = ZVEC_OK;
 
       switch (data_type) {
@@ -3241,7 +3344,7 @@ zvec_error_code_t zvec_doc_add_field_by_value(zvec_doc_t *doc, const char *field
         case ZVEC_DATA_TYPE_BINARY:
         case ZVEC_DATA_TYPE_STRING: {
           std::string val(static_cast<const char *>(value), value_size);
-          doc_ptr->set(name, val);
+          doc_ptr->set(name, std::move(val));
           break;
         }
         case ZVEC_DATA_TYPE_BOOL: {
@@ -3428,7 +3531,7 @@ zvec_error_code_t zvec_doc_add_field_by_value(zvec_doc_t *doc, const char *field
 
         // Array types
         case ZVEC_DATA_TYPE_ARRAY_BINARY: {
-          auto binary_array = extract_binary_array(value, value_size);
+          auto binary_array = extract_packed_strings(value, value_size, true);
           doc_ptr->set(name, std::move(binary_array));
           break;
         }
@@ -3446,7 +3549,7 @@ zvec_error_code_t zvec_doc_add_field_by_value(zvec_doc_t *doc, const char *field
             doc_ptr->set(name, std::move(string_array));
           } else {
             // C-string array (null-terminated strings)
-            auto string_array = extract_string_array(value, value_size);
+            auto string_array = extract_packed_strings(value, value_size, false);
             doc_ptr->set(name, std::move(string_array));
           }
           break;
@@ -3526,6 +3629,7 @@ zvec_error_code_t zvec_doc_add_field_by_value(zvec_doc_t *doc, const char *field
           return ZVEC_ERROR_INVALID_ARGUMENT;
       }
 
+      mutation.commit();
       return ZVEC_OK;)
 }
 
@@ -3539,6 +3643,9 @@ zvec_error_code_t zvec_doc_add_field_by_struct(zvec_doc_t *doc,
   ZVEC_TRY_RETURN_ERROR(
       "Failed to add field", auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
 
+      CInputMutation mutation(*doc_ptr, BindingMemoryBytes(
+          2, field->name.length,
+          BindingMemoryBytes(1, c_field_storage(*field), 256)));
       std::string name(field->name.data, field->name.length);
 
       switch (field->data_type) {
@@ -3548,13 +3655,13 @@ zvec_error_code_t zvec_doc_add_field_by_struct(zvec_doc_t *doc,
           std::string val(
               reinterpret_cast<const char *>(field->value.binary_value.data),
               field->value.binary_value.length);
-          doc_ptr->set(name, val);
+          doc_ptr->set(name, std::move(val));
           break;
         }
         case ZVEC_DATA_TYPE_STRING: {
           std::string val(field->value.string_value.data,
                           field->value.string_value.length);
-          doc_ptr->set(name, val);
+          doc_ptr->set(name, std::move(val));
           break;
         }
         case ZVEC_DATA_TYPE_BOOL: {
@@ -3692,45 +3799,14 @@ zvec_error_code_t zvec_doc_add_field_by_struct(zvec_doc_t *doc,
         // Array types (in zvec_data_type_t order: BINARY, STRING, BOOL, INT32,
         // INT64, UINT32, UINT64, FLOAT, DOUBLE)
         case ZVEC_DATA_TYPE_ARRAY_BINARY: {
-          std::vector<std::string> array_values;
-          const uint8_t *data_ptr = field->value.binary_value.data;
-          size_t total_length = field->value.binary_value.length;
-          size_t offset = 0;
-
-          while (offset + sizeof(uint32_t) <= total_length) {
-            uint32_t elem_length =
-                *reinterpret_cast<const uint32_t *>(data_ptr + offset);
-            offset += sizeof(uint32_t);
-
-            if (offset + elem_length <= total_length) {
-              std::string elem(
-                  reinterpret_cast<const char *>(data_ptr + offset),
-                  elem_length);
-              array_values.push_back(elem);
-              offset += elem_length;
-            } else {
-              break;
-            }
-          }
-          doc_ptr->set(name, std::move(array_values));
+          const auto &value = field->value.binary_value;
+          doc_ptr->set(name, extract_packed_strings(value.data, value.length, true));
           break;
         }
         case ZVEC_DATA_TYPE_ARRAY_STRING: {
-          std::vector<std::string> array_values;
-          const char *data_ptr = field->value.string_value.data;
-          size_t total_length = field->value.string_value.length;
-          size_t offset = 0;
-
-          while (offset < total_length) {
-            size_t str_len = strlen(data_ptr + offset);
-            if (str_len > 0 && offset + str_len <= total_length) {
-              array_values.emplace_back(data_ptr + offset, str_len);
-              offset += str_len + 1;
-            } else {
-              break;
-            }
-          }
-          doc_ptr->set(name, std::move(array_values));
+          const auto &value = field->value.string_value;
+          doc_ptr->set(name, extract_packed_strings(value.data, value.length,
+                                                     false, true));
           break;
         }
         case ZVEC_DATA_TYPE_ARRAY_BOOL: {
@@ -3801,6 +3877,7 @@ zvec_error_code_t zvec_doc_add_field_by_struct(zvec_doc_t *doc,
           return ZVEC_ERROR_INVALID_ARGUMENT;
       }
 
+      mutation.commit();
       return ZVEC_OK;)
 }
 
@@ -3812,14 +3889,10 @@ const char *zvec_doc_get_pk_pointer(const zvec_doc_t *doc) {
 
 const char *zvec_doc_get_pk_copy(const zvec_doc_t *doc) {
   if (!doc) return nullptr;
-  auto doc_ptr = reinterpret_cast<const zvec::Doc *>(doc);
-  const std::string &pk = doc_ptr->pk_ref();
-  if (pk.empty()) return nullptr;
-
-  char *result = static_cast<char *>(malloc(pk.length() + 1));
-  if (!result) return nullptr;
-  strcpy(result, pk.c_str());
-  return result;
+  ZVEC_TRY_RETURN_NULL("Failed to copy primary key",
+      const auto &pk = reinterpret_cast<const zvec::Doc *>(doc)->pk_ref();
+      if (pk.empty()) return nullptr;
+      return zvec::detail::CopyCResultString(pk);)
 }
 
 uint64_t zvec_doc_get_doc_id(const zvec_doc_t *doc) {
@@ -3956,6 +4029,8 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
                                             const char *field_name,
                                             zvec_data_type_t field_type,
                                             void **value, size_t *value_size) {
+  if (value) *value = nullptr;
+  if (value_size) *value_size = 0;
   if (!doc || !field_name || !value || !value_size) {
     set_last_error("Invalid arguments: null pointer");
     return ZVEC_ERROR_INVALID_ARGUMENT;
@@ -3976,7 +4051,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         // Basic types - copy the actual values
         case ZVEC_DATA_TYPE_BOOL: {
           const bool val = doc_ptr->get_ref<bool>(field_name);
-          void *buffer = malloc(sizeof(bool));
+          void *buffer = zvec::detail::AllocateCResult(sizeof(bool));
           if (!buffer) {
             set_last_error("Memory allocation failed for bool");
             return ZVEC_ERROR_INTERNAL_ERROR;
@@ -3988,7 +4063,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         }
         case ZVEC_DATA_TYPE_INT32: {
           const int32_t val = doc_ptr->get_ref<int32_t>(field_name);
-          void *buffer = malloc(sizeof(int32_t));
+          void *buffer = zvec::detail::AllocateCResult(sizeof(int32_t));
           if (!buffer) {
             set_last_error("Memory allocation failed for int32");
             return ZVEC_ERROR_INTERNAL_ERROR;
@@ -4000,7 +4075,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         }
         case ZVEC_DATA_TYPE_INT64: {
           const int64_t val = doc_ptr->get_ref<int64_t>(field_name);
-          void *buffer = malloc(sizeof(int64_t));
+          void *buffer = zvec::detail::AllocateCResult(sizeof(int64_t));
           if (!buffer) {
             set_last_error("Memory allocation failed for int64");
             return ZVEC_ERROR_INTERNAL_ERROR;
@@ -4012,7 +4087,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         }
         case ZVEC_DATA_TYPE_UINT32: {
           const uint32_t val = doc_ptr->get_ref<uint32_t>(field_name);
-          void *buffer = malloc(sizeof(uint32_t));
+          void *buffer = zvec::detail::AllocateCResult(sizeof(uint32_t));
           if (!buffer) {
             set_last_error("Memory allocation failed for uint32");
             return ZVEC_ERROR_INTERNAL_ERROR;
@@ -4024,7 +4099,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         }
         case ZVEC_DATA_TYPE_UINT64: {
           const uint64_t val = doc_ptr->get_ref<uint64_t>(field_name);
-          void *buffer = malloc(sizeof(uint64_t));
+          void *buffer = zvec::detail::AllocateCResult(sizeof(uint64_t));
           if (!buffer) {
             set_last_error("Memory allocation failed for uint64");
             return ZVEC_ERROR_INTERNAL_ERROR;
@@ -4036,7 +4111,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         }
         case ZVEC_DATA_TYPE_FLOAT: {
           const float val = doc_ptr->get_ref<float>(field_name);
-          void *buffer = malloc(sizeof(float));
+          void *buffer = zvec::detail::AllocateCResult(sizeof(float));
           if (!buffer) {
             set_last_error("Memory allocation failed for float");
             return ZVEC_ERROR_INTERNAL_ERROR;
@@ -4048,7 +4123,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         }
         case ZVEC_DATA_TYPE_DOUBLE: {
           const double val = doc_ptr->get_ref<double>(field_name);
-          void *buffer = malloc(sizeof(double));
+          void *buffer = zvec::detail::AllocateCResult(sizeof(double));
           if (!buffer) {
             set_last_error("Memory allocation failed for double");
             return ZVEC_ERROR_INTERNAL_ERROR;
@@ -4063,13 +4138,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
         case ZVEC_DATA_TYPE_BINARY:
         case ZVEC_DATA_TYPE_STRING: {
           const std::string &val = doc_ptr->get_ref<std::string>(field_name);
-          void *buffer = malloc(val.length());
-          if (!buffer) {
-            set_last_error("Memory allocation failed for string/binary");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), val.length());
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), val.length());
           *value_size = val.length();
           break;
         }
@@ -4079,13 +4148,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<uint32_t> &val =
               doc_ptr->get_ref<std::vector<uint32_t>>(field_name);
           size_t total_size = val.size() * sizeof(uint32_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint32 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4093,13 +4156,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<uint64_t> &val =
               doc_ptr->get_ref<std::vector<uint64_t>>(field_name);
           size_t total_size = val.size() * sizeof(uint64_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint64 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4107,13 +4164,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<zvec::float16_t> &val =
               doc_ptr->get_ref<std::vector<zvec::float16_t>>(field_name);
           size_t total_size = val.size() * sizeof(zvec::float16_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for fp16 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4121,13 +4172,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<float> &val =
               doc_ptr->get_ref<std::vector<float>>(field_name);
           size_t total_size = val.size() * sizeof(float);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for fp32 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4135,13 +4180,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<double> &val =
               doc_ptr->get_ref<std::vector<double>>(field_name);
           size_t total_size = val.size() * sizeof(double);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for fp64 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4150,13 +4189,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<int8_t> &val =
               doc_ptr->get_ref<std::vector<int8_t>>(field_name);
           size_t total_size = val.size() * sizeof(int8_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int8 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4164,13 +4197,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const std::vector<int16_t> &val =
               doc_ptr->get_ref<std::vector<int16_t>>(field_name);
           size_t total_size = val.size() * sizeof(int16_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int16 vector");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-          memcpy(buffer, val.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(val.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4184,26 +4211,20 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           size_t nnz = sparse_vec.first.size();
           size_t total_size = sizeof(size_t) + nnz * (sizeof(uint32_t) +
                                                       sizeof(zvec::float16_t));
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for sparse vector FP16");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            *reinterpret_cast<size_t *>(ptr) = nnz;
+            ptr += sizeof(size_t);
 
-          char *ptr = static_cast<char *>(buffer);
-          *reinterpret_cast<size_t *>(ptr) = nnz;
-          ptr += sizeof(size_t);
-
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
-            ptr += sizeof(uint32_t);
-          }
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<zvec::float16_t *>(ptr) = sparse_vec.second[i];
-            ptr += sizeof(zvec::float16_t);
-          }
-
-          *value = buffer;
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
+              ptr += sizeof(uint32_t);
+            }
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<zvec::float16_t *>(ptr) = sparse_vec.second[i];
+              ptr += sizeof(zvec::float16_t);
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4215,26 +4236,20 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           size_t nnz = sparse_vec.first.size();
           size_t total_size =
               sizeof(size_t) + nnz * (sizeof(uint32_t) + sizeof(float));
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for sparse vector FP32");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            *reinterpret_cast<size_t *>(ptr) = nnz;
+            ptr += sizeof(size_t);
 
-          char *ptr = static_cast<char *>(buffer);
-          *reinterpret_cast<size_t *>(ptr) = nnz;
-          ptr += sizeof(size_t);
-
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
-            ptr += sizeof(uint32_t);
-          }
-          for (size_t i = 0; i < nnz; ++i) {
-            *reinterpret_cast<float *>(ptr) = sparse_vec.second[i];
-            ptr += sizeof(float);
-          }
-
-          *value = buffer;
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<uint32_t *>(ptr) = sparse_vec.first[i];
+              ptr += sizeof(uint32_t);
+            }
+            for (size_t i = 0; i < nnz; ++i) {
+              *reinterpret_cast<float *>(ptr) = sparse_vec.second[i];
+              ptr += sizeof(float);
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4249,19 +4264,13 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
             total_size += bin_val.length();
           }
 
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for binary array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          char *ptr = static_cast<char *>(buffer);
-          for (const auto &bin_val : array_vals) {
-            memcpy(ptr, bin_val.data(), bin_val.length());
-            ptr += bin_val.length();
-          }
-
-          *value = buffer;
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            for (const auto &bin_val : array_vals) {
+              memcpy(ptr, bin_val.data(), bin_val.length());
+              ptr += bin_val.length();
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4274,21 +4283,15 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
             total_size += str_val.length() + 1;  // +1 for null terminator
           }
 
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for string array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          char *ptr = static_cast<char *>(buffer);
-          for (const auto &str_val : array_vals) {
-            memcpy(ptr, str_val.c_str(), str_val.length());
-            ptr += str_val.length();
-            *ptr = '\0';
-            ptr++;
-          }
-
-          *value = buffer;
+          *value = zvec::detail::AllocateCResult(total_size, [&](void *buffer) {
+            char *ptr = static_cast<char *>(buffer);
+            for (const auto &str_val : array_vals) {
+              memcpy(ptr, str_val.c_str(), str_val.length());
+              ptr += str_val.length();
+              *ptr = '\0';
+              ptr++;
+            }
+          });
           *value_size = total_size;
           break;
         }
@@ -4296,22 +4299,16 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           using BoolArray = std::vector<bool>;
           const BoolArray &array_vals = doc_ptr->get_ref<BoolArray>(field_name);
           size_t byte_count = (array_vals.size() + 7) / 8;
-          void *buffer = malloc(byte_count);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for bool array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
+          *value = zvec::detail::AllocateCResult(byte_count, [&](void *buffer) {
+            uint8_t *bytes = static_cast<uint8_t *>(buffer);
+            memset(bytes, 0, byte_count);
 
-          uint8_t *bytes = static_cast<uint8_t *>(buffer);
-          memset(bytes, 0, byte_count);
-
-          for (size_t i = 0; i < array_vals.size(); ++i) {
-            if (array_vals[i]) {
-              bytes[i / 8] |= (1 << (i % 8));
+            for (size_t i = 0; i < array_vals.size(); ++i) {
+              if (array_vals[i]) {
+                bytes[i / 8] |= (1 << (i % 8));
+              }
             }
-          }
-
-          *value = buffer;
+          });
           *value_size = byte_count;
           break;
         }
@@ -4320,14 +4317,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const Int32Array &array_vals =
               doc_ptr->get_ref<Int32Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(int32_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int32 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4336,14 +4326,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const Int64Array &array_vals =
               doc_ptr->get_ref<Int64Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(int64_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for int64 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4352,14 +4335,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const UInt32Array &array_vals =
               doc_ptr->get_ref<UInt32Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(uint32_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint32 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4368,14 +4344,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const UInt64Array &array_vals =
               doc_ptr->get_ref<UInt64Array>(field_name);
           size_t total_size = array_vals.size() * sizeof(uint64_t);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for uint64 array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4384,14 +4353,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const FloatArray &array_vals =
               doc_ptr->get_ref<FloatArray>(field_name);
           size_t total_size = array_vals.size() * sizeof(float);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for float array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4400,14 +4362,7 @@ zvec_error_code_t zvec_doc_get_field_value_copy(const zvec_doc_t *doc,
           const DoubleArray &array_vals =
               doc_ptr->get_ref<DoubleArray>(field_name);
           size_t total_size = array_vals.size() * sizeof(double);
-          void *buffer = malloc(total_size);
-          if (!buffer) {
-            set_last_error("Memory allocation failed for double array");
-            return ZVEC_ERROR_INTERNAL_ERROR;
-          }
-
-          memcpy(buffer, array_vals.data(), total_size);
-          *value = buffer;
+          *value = zvec::detail::CopyCResultBuffer(array_vals.data(), total_size);
           *value_size = total_size;
           break;
         }
@@ -4622,6 +4577,8 @@ zvec_error_code_t zvec_doc_remove_field(zvec_doc_t *doc, const char *field_name)
   ZVEC_TRY_RETURN_ERROR("Failed to remove field",
                         auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
                         doc_ptr->remove(std::string(field_name));
+                        auto &owner = static_cast<CInput<zvec::Doc> &>(*doc_ptr);
+                        owner.lease.retain_at_most(owner.bytes());
                         return ZVEC_OK;)
 }
 
@@ -4664,46 +4621,35 @@ bool zvec_doc_is_field_null(const zvec_doc_t *doc, const char *field_name) {
 
 zvec_error_code_t zvec_doc_get_field_names(const zvec_doc_t *doc, char ***field_names,
                                        size_t *count) {
+  if (field_names) *field_names = nullptr;
+  if (count) *count = 0;
   if (!doc || !field_names || !count) {
     set_last_error("Invalid arguments");
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
-
   ZVEC_TRY_RETURN_ERROR(
       "Failed to get field names",
-      auto doc_ptr = reinterpret_cast<const zvec::Doc *>(doc);
-      std::vector<std::string> names = doc_ptr->field_names();
-
+      const auto *doc_ptr = reinterpret_cast<const zvec::Doc *>(doc);
+      zvec::detail::ResultMemoryAllowance::Lease workspace(
+          &zvec::detail::SharedResultMemoryAllowance());
+      workspace.add(zvec::detail::DocumentMemoryAccess::field_names_bytes(*doc_ptr));
+      auto names = doc_ptr->field_names();
+      if (names.empty()) return ZVEC_OK;
+      auto cleanup = [&names](char **ptr) { zvec_free_str_array(ptr, names.size()); };
+      std::unique_ptr<char *, decltype(cleanup)> converted(
+          static_cast<char **>(zvec::detail::AllocateCResultArray(
+              names.size(), sizeof(char *))), cleanup);
+      for (size_t i = 0; i < names.size(); ++i)
+        converted.get()[i] = zvec::detail::CopyCResultString(names[i]);
+      *field_names = converted.release();
       *count = names.size();
-      if (*count == 0) {
-        *field_names = nullptr;
-        return ZVEC_OK;
-      }
-
-          *field_names = static_cast<char **>(malloc(*count * sizeof(char *)));
-      if (!*field_names) {
-        set_last_error("Failed to allocate memory for field names");
-        return ZVEC_ERROR_INTERNAL_ERROR;
-      }
-
-      for (size_t i = 0; i < *count; ++i) {
-        (*field_names)[i] = copy_string(names[i]);
-        if (!(*field_names)[i]) {
-          for (size_t j = 0; j < i; ++j) {
-            free((*field_names)[j]);
-          }
-          free(*field_names);
-          *field_names = nullptr;
-          set_last_error("Failed to copy field name");
-          return ZVEC_ERROR_INTERNAL_ERROR;
-        }
-      }
-
       return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_doc_serialize(const zvec_doc_t *doc, uint8_t **data,
                                  size_t *size) {
+  if (data) *data = nullptr;
+  if (size) *size = 0;
   if (!doc || !data || !size) {
     set_last_error("Invalid arguments");
     return ZVEC_ERROR_INVALID_ARGUMENT;
@@ -4712,26 +4658,32 @@ zvec_error_code_t zvec_doc_serialize(const zvec_doc_t *doc, uint8_t **data,
   ZVEC_TRY_RETURN_ERROR(
       "Failed to serialize document",
       auto doc_ptr = reinterpret_cast<const zvec::Doc *>(doc);
-      std::vector<uint8_t> serialized_data = doc_ptr->serialize();
+      zvec::detail::ResultMemoryAllowance::Lease workspace(
+          &zvec::detail::SharedResultMemoryAllowance());
+      const auto serialized_data = [&] {
+        zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+        workspace.add_pending(
+            zvec::detail::BindingMemoryBytes(1, doc_ptr->serialized_size(), 64),
+            pending);
+        pending.start();
+        return doc_ptr->serialize();
+      }();
 
-      *size = serialized_data.size();
-      if (*size == 0) {
+      const size_t bytes = serialized_data.size();
+      if (bytes == 0) {
         *data = nullptr;
         return ZVEC_OK;
       }
 
-          *data = static_cast<uint8_t *>(malloc(*size));
-      if (!*data) {
-        set_last_error("Failed to allocate memory for serialized data");
-        return ZVEC_ERROR_INTERNAL_ERROR;
-      }
-
-      memcpy(*data, serialized_data.data(), *size);
+      *data = static_cast<uint8_t *>(
+          zvec::detail::CopyCResultBuffer(serialized_data.data(), bytes));
+      *size = bytes;
       return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_doc_deserialize(const uint8_t *data, size_t size,
                                    zvec_doc_t **doc) {
+  if (doc) *doc = nullptr;
   if (!data || !doc || size == 0) {
     set_last_error("Invalid arguments");
     return ZVEC_ERROR_INVALID_ARGUMENT;
@@ -4739,15 +4691,27 @@ zvec_error_code_t zvec_doc_deserialize(const uint8_t *data, size_t size,
 
   ZVEC_TRY_RETURN_ERROR(
       "Failed to deserialize document",
-      auto deserialized_doc = zvec::Doc::deserialize(data, size);
-      if (!deserialized_doc) {
+      size_t bytes = 0;
+      if (!zvec::detail::EstimateSerializedDocMemory(data, size, &bytes)) {
         set_last_error("Failed to deserialize document");
         return ZVEC_ERROR_INTERNAL_ERROR;
       }
-
-      // Create a new Doc by copying the deserialized content
-      auto *new_doc = new zvec::Doc(*deserialized_doc);
-      *doc = reinterpret_cast<zvec_doc_t *>(new_doc); 
+      using Lease = zvec::detail::ResultMemoryAllowance::Lease;
+      auto &allowance = zvec::detail::SharedResultMemoryAllowance();
+      Lease admission(&allowance);
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      admission.add_pending(
+          zvec::detail::BindingMemoryBytes(1, bytes, sizeof(zvec::Doc) + 128),
+          pending);
+      pending.start();
+      auto decoded = zvec::Doc::deserialize(data, size);
+      if (!decoded) {
+        set_last_error("Failed to deserialize document");
+        return ZVEC_ERROR_INTERNAL_ERROR;
+      }
+      auto result = std::make_unique<CInput<zvec::Doc>>(std::move(*decoded));
+      result->lease.absorb(admission);
+      *doc = release_c_input<zvec_doc_t>(std::move(result));
       return ZVEC_OK;)
 }
 
@@ -4756,11 +4720,23 @@ void zvec_doc_merge(zvec_doc_t *doc, const zvec_doc_t *other) {
     set_last_error("Document pointers are null");
     return;
   }
+  if (doc == other) return;
 
   ZVEC_TRY_BEGIN_VOID
   auto *doc_ptr = reinterpret_cast<zvec::Doc *>(doc);
-  auto *other_ptr = reinterpret_cast<const zvec::Doc *>(other);
-  doc_ptr->merge(*other_ptr);
+  const auto *other_ptr = reinterpret_cast<const zvec::Doc *>(other);
+  using zvec::detail::DocumentMemoryAccess;
+  CInputMutation mutation(*doc_ptr, BindingMemoryBytes(
+      1, DocumentMemoryAccess::copy_bytes(*doc_ptr),
+      DocumentMemoryAccess::copy_bytes(*other_ptr)));
+  // Prepare the merged payload before replacing the live C handle.
+  zvec::Doc merged(*doc_ptr);
+  merged.merge(*other_ptr);
+  *doc_ptr = std::move(merged);
+  mutation.commit();
+  } catch (const std::bad_alloc &) {
+    SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
+                   "Document merge budget exhausted");
   ZVEC_CATCH_END_VOID
 }
 
@@ -4786,8 +4762,11 @@ zvec_error_code_t zvec_doc_to_detail_string(const zvec_doc_t *doc, char **detail
   ZVEC_TRY_RETURN_ERROR(
       "Failed to get document detail string",
       auto doc_ptr = reinterpret_cast<const zvec::Doc *>(doc);
+      zvec::detail::ResultMemoryAllowance::Lease workspace(
+          &zvec::detail::SharedResultMemoryAllowance());
+      workspace.add(zvec::detail::BindingMemoryBytes(doc_ptr->serialized_size(), 32, 1024));
       std::string detail = doc_ptr->to_detail_string();
-      *detail_str = copy_string(detail);
+      *detail_str = zvec::detail::CopyCResultString(detail);
 
       if (!*detail_str && !detail.empty()) {
         set_last_error("Failed to copy detail string");
@@ -5573,16 +5552,16 @@ const char *zvec_query_params_fts_get_default_operator(
 
 zvec_vector_query_t *zvec_vector_query_create(void) {
   ZVEC_TRY_RETURN_NULL("Failed to create query object",
-                       auto *query = new zvec::SearchQuery();
+                       auto query = CInput<zvec::SearchQuery>::make(CInput<zvec::SearchQuery>::base_bytes);
                        query->topk_ = 10; query->include_doc_id_ = true;
                        query->include_vector_ = false;
-                       return reinterpret_cast<zvec_vector_query_t *>(query);)
+                       return release_c_input<zvec_vector_query_t>(std::move(query));)
   return nullptr;
 }
 
 void zvec_vector_query_destroy(zvec_vector_query_t *query) {
   if (query) {
-    delete reinterpret_cast<zvec::SearchQuery *>(query);
+    CInput<zvec::SearchQuery>::destroy(reinterpret_cast<zvec::SearchQuery *>(query));
   }
 }
 
@@ -5609,8 +5588,7 @@ zvec_error_code_t zvec_vector_query_set_field_name(zvec_vector_query_t *query,
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SearchQuery *>(query);
-  ptr->target_.field_name_ = field_name ? field_name : "";
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->target_.field_name_, field_name ? field_name : "");
 }
 
 const char *zvec_vector_query_get_field_name(const zvec_vector_query_t *query) {
@@ -5629,10 +5607,7 @@ zvec_error_code_t zvec_vector_query_set_query_vector(zvec_vector_query_t *query,
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SearchQuery *>(query);
-  // Copies into VectorClause (not VectorViewClause) because the C API does
-  // not require `data` to stay alive after this call returns.
-  ptr->target_.set_vector(std::string(static_cast<const char *>(data), size));
-  return ZVEC_OK;
+  return set_c_query_vector(*ptr, data, size);
 }
 
 zvec_error_code_t zvec_vector_query_set_filter(zvec_vector_query_t *query,
@@ -5642,8 +5617,7 @@ zvec_error_code_t zvec_vector_query_set_filter(zvec_vector_query_t *query,
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SearchQuery *>(query);
-  ptr->filter_ = filter ? filter : "";
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->filter_, filter ? filter : "");
 }
 
 const char *zvec_vector_query_get_filter(const zvec_vector_query_t *query) {
@@ -5695,16 +5669,10 @@ zvec_error_code_t zvec_vector_query_set_output_fields(zvec_vector_query_t *query
   }
   auto *ptr = reinterpret_cast<zvec::SearchQuery *>(query);
   if (!fields || count == 0) {
-    ptr->output_fields_ = std::nullopt;
-  } else {
-    std::vector<std::string> result;
-    result.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-      result.emplace_back(fields[i]);
-    }
-    ptr->output_fields_ = std::move(result);
+    clear_c_input_fields(*ptr, ptr->output_fields_);
+    return ZVEC_OK;
   }
-  return ZVEC_OK;
+  return set_c_input_fields(*ptr, ptr->output_fields_, fields, count);
 }
 
 zvec_error_code_t zvec_vector_query_get_output_fields(const zvec_vector_query_t *query,
@@ -5716,24 +5684,7 @@ zvec_error_code_t zvec_vector_query_get_output_fields(const zvec_vector_query_t 
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<const zvec::SearchQuery *>(query);
-
-  if (!ptr->output_fields_.has_value()) {
-    *fields = nullptr;
-    *count = 0;
-  } else {
-    const auto &output_fields = ptr->output_fields_.value();
-    *count = output_fields.size();
-    *fields = (const char **)malloc(*count * sizeof(const char *));
-    if (!*fields) {
-      SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                     "Failed to allocate memory");
-      return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-    }
-    for (size_t i = 0; i < *count; ++i) {
-      (*fields)[i] = strdup(output_fields[i].c_str());
-    }
-  }
-  return ZVEC_OK;
+  return copy_c_output_field_pointers(ptr->output_fields_, fields, count);
 }
 
 // =============================================================================
@@ -5981,14 +5932,14 @@ zvec_error_code_t zvec_vector_query_set_diskann_params(
 
 zvec_fts_t *zvec_fts_create(void) {
   ZVEC_TRY_RETURN_NULL("Failed to create Fts payload",
-                       auto *fts = new zvec::FtsClause();
-                       return reinterpret_cast<zvec_fts_t *>(fts);)
+                       auto fts = CInput<zvec::FtsClause>::make(CInput<zvec::FtsClause>::base_bytes);
+                       return release_c_input<zvec_fts_t>(std::move(fts));)
   return nullptr;
 }
 
 void zvec_fts_destroy(zvec_fts_t *fts) {
   if (fts) {
-    delete reinterpret_cast<zvec::FtsClause *>(fts);
+    CInput<zvec::FtsClause>::destroy(reinterpret_cast<zvec::FtsClause *>(fts));
   }
 }
 
@@ -5999,8 +5950,7 @@ zvec_error_code_t zvec_fts_set_query_string(zvec_fts_t *fts,
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::FtsClause *>(fts);
-  ptr->query_string_ = query_string ? query_string : "";
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->query_string_, query_string ? query_string : "");
 }
 
 zvec_error_code_t zvec_fts_set_match_string(zvec_fts_t *fts,
@@ -6010,8 +5960,7 @@ zvec_error_code_t zvec_fts_set_match_string(zvec_fts_t *fts,
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::FtsClause *>(fts);
-  ptr->match_string_ = match_string ? match_string : "";
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->match_string_, match_string ? match_string : "");
 }
 
 const char *zvec_fts_get_query_string(const zvec_fts_t *fts) {
@@ -6033,13 +5982,7 @@ zvec_error_code_t zvec_vector_query_set_fts(zvec_vector_query_t *query,
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *query_ptr = reinterpret_cast<zvec::SearchQuery *>(query);
-  if (!fts) {
-    // Clearing FTS resets the target to an empty vector clause.
-    query_ptr->target_.clause_ = zvec::VectorClause{};
-  } else {
-    query_ptr->target_.clause_ = *reinterpret_cast<const zvec::FtsClause *>(fts);
-  }
-  return ZVEC_OK;
+  return set_c_query_fts(*query_ptr, fts);
 }
 
 const zvec_fts_t *zvec_vector_query_get_fts(const zvec_vector_query_t *query) {
@@ -6058,15 +6001,15 @@ const zvec_fts_t *zvec_vector_query_get_fts(const zvec_vector_query_t *query) {
 zvec_group_by_vector_query_t *zvec_group_by_vector_query_create(void) {
   ZVEC_TRY_RETURN_NULL(
       "Failed to create GroupByVectorQuery",
-      auto *query = new zvec::GroupByVectorQuery();
+      auto query = CInput<zvec::GroupByVectorQuery>::make(CInput<zvec::GroupByVectorQuery>::base_bytes);
       query->group_count_ = 2; query->topk_per_group_ = 3;
-      return reinterpret_cast<zvec_group_by_vector_query_t *>(query);)
+      return release_c_input<zvec_group_by_vector_query_t>(std::move(query));)
   return nullptr;
 }
 
 void zvec_group_by_vector_query_destroy(zvec_group_by_vector_query_t *query) {
   if (query) {
-    delete reinterpret_cast<zvec::GroupByVectorQuery *>(query);
+    CInput<zvec::GroupByVectorQuery>::destroy(reinterpret_cast<zvec::GroupByVectorQuery *>(query));
   }
 }
 
@@ -6078,8 +6021,7 @@ zvec_error_code_t zvec_group_by_vector_query_set_field_name(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::GroupByVectorQuery *>(query);
-  ptr->target_.field_name_ = field_name ? field_name : "";
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->target_.field_name_, field_name ? field_name : "");
 }
 
 const char *zvec_group_by_vector_query_get_field_name(
@@ -6098,8 +6040,7 @@ zvec_error_code_t zvec_group_by_vector_query_set_group_by_field_name(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::GroupByVectorQuery *>(query);
-  ptr->group_by_field_name_ = field_name ? field_name : "";
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->group_by_field_name_, field_name ? field_name : "");
 }
 
 const char *zvec_group_by_vector_query_get_group_by_field_name(
@@ -6156,9 +6097,7 @@ zvec_error_code_t zvec_group_by_vector_query_set_query_vector(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::GroupByVectorQuery *>(query);
-  // Copies into VectorClause — see comment on zvec_vector_query_set_query_vector.
-  ptr->target_.set_vector(std::string(static_cast<const char *>(data), size));
-  return ZVEC_OK;
+  return set_c_query_vector(*ptr, data, size);
 }
 
 zvec_error_code_t zvec_group_by_vector_query_set_filter(
@@ -6169,8 +6108,7 @@ zvec_error_code_t zvec_group_by_vector_query_set_filter(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::GroupByVectorQuery *>(query);
-  ptr->filter_ = filter ? filter : "";
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->filter_, filter ? filter : "");
 }
 
 const char *zvec_group_by_vector_query_get_filter(
@@ -6208,16 +6146,10 @@ zvec_error_code_t zvec_group_by_vector_query_set_output_fields(
   }
   auto *ptr = reinterpret_cast<zvec::GroupByVectorQuery *>(query);
   if (!fields || count == 0) {
-    ptr->output_fields_ = std::nullopt;
-  } else {
-    std::vector<std::string> result;
-    result.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-      result.emplace_back(fields[i]);
-    }
-    ptr->output_fields_ = std::move(result);
+    clear_c_input_fields(*ptr, ptr->output_fields_);
+    return ZVEC_OK;
   }
-  return ZVEC_OK;
+  return set_c_input_fields(*ptr, ptr->output_fields_, fields, count);
 }
 
 zvec_error_code_t zvec_group_by_vector_query_get_output_fields(
@@ -6228,24 +6160,7 @@ zvec_error_code_t zvec_group_by_vector_query_get_output_fields(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<const zvec::GroupByVectorQuery *>(query);
-
-  if (!ptr->output_fields_.has_value()) {
-    *fields = nullptr;
-    *count = 0;
-  } else {
-    const auto &output_fields = ptr->output_fields_.value();
-    *count = output_fields.size();
-    *fields = (const char **)malloc(*count * sizeof(const char *));
-    if (!*fields) {
-      SET_LAST_ERROR(ZVEC_ERROR_RESOURCE_EXHAUSTED,
-                     "Failed to allocate memory");
-      return ZVEC_ERROR_RESOURCE_EXHAUSTED;
-    }
-    for (size_t i = 0; i < *count; ++i) {
-      (*fields)[i] = strdup(output_fields[i].c_str());
-    }
-  }
-  return ZVEC_OK;
+  return copy_c_output_field_pointers(ptr->output_fields_, fields, count);
 }
 
 zvec_error_code_t zvec_group_by_vector_query_set_query_params(
@@ -6379,6 +6294,8 @@ zvec_error_code_t zvec_multi_query_set_rerank_rrf(
   }
   auto *mq = reinterpret_cast<zvec::MultiQuery *>(query);
   mq->rerank = zvec::reranker::RrfParams{rank_constant};
+  auto &owner = static_cast<CInput<zvec::MultiQuery> &>(*mq);
+  owner.lease.retain_at_most(owner.bytes());
   return ZVEC_OK;
 }
 
@@ -6393,9 +6310,14 @@ zvec_error_code_t zvec_multi_query_set_rerank_weighted(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *mq = reinterpret_cast<zvec::MultiQuery *>(query);
-  mq->rerank = zvec::reranker::WeightedParams{
-      std::vector<double>(weights, weights + weight_count)};
-  return ZVEC_OK;
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy reranker weights",
+      CInputMutation mutation(*mq, BindingMemoryBytes(weight_count, sizeof(double)));
+      std::vector<double> copied;
+      if (weight_count) copied.assign(weights, weights + weight_count);
+      mq->rerank = zvec::reranker::WeightedParams{std::move(copied)};
+      mutation.commit();
+      return ZVEC_OK;)
 }
 
 // =============================================================================
@@ -6404,15 +6326,14 @@ zvec_error_code_t zvec_multi_query_set_rerank_weighted(
 
 zvec_multi_query_t *zvec_multi_query_create(void) {
   ZVEC_TRY_RETURN_NULL("Failed to create MultiVectorQuery",
-                       auto *query = new zvec::MultiQuery();
-                       return reinterpret_cast<zvec_multi_query_t *>(
-                           query);)
+                       auto query = CInput<zvec::MultiQuery>::make(CInput<zvec::MultiQuery>::base_bytes);
+                       return release_c_input<zvec_multi_query_t>(std::move(query));)
   return nullptr;
 }
 
 void zvec_multi_query_destroy(zvec_multi_query_t *query) {
   if (query) {
-    delete reinterpret_cast<zvec::MultiQuery *>(query);
+    CInput<zvec::MultiQuery>::destroy(reinterpret_cast<zvec::MultiQuery *>(query));
   }
 }
 
@@ -6427,9 +6348,19 @@ zvec_error_code_t zvec_multi_query_add_sub_query(
 
   auto *mvq = reinterpret_cast<zvec::MultiQuery *>(query);
   auto *sub = reinterpret_cast<const zvec::SubQuery *>(sub_query);
-  mvq->queries.push_back(*sub);
-
-  return ZVEC_OK;
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy subquery",
+      auto &queries = mvq->queries;
+      const size_t next_capacity = queries.size() == queries.capacity()
+          ? std::max(size_t{1}, BindingMemoryBytes(queries.capacity(), 2))
+          : 0;
+      CInputMutation mutation(*mvq, BindingMemoryBytes(
+          next_capacity, sizeof(zvec::SubQuery), zvec::detail::CInputPayload(*sub)));
+      zvec::SubQuery copy(*sub);
+      if (next_capacity) queries.reserve(next_capacity);
+      queries.push_back(std::move(copy));
+      mutation.commit();
+      return ZVEC_OK;)
 }
 
 size_t zvec_multi_query_get_sub_query_count(
@@ -6466,8 +6397,7 @@ zvec_error_code_t zvec_multi_query_set_filter(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *mvq = reinterpret_cast<zvec::MultiQuery *>(query);
-  mvq->filter = std::string(filter);
-  return ZVEC_OK;
+  return set_c_input_string(*mvq, mvq->filter, filter ? filter : "");
 }
 
 const char *zvec_multi_query_get_filter(
@@ -6505,19 +6435,7 @@ zvec_error_code_t zvec_multi_query_set_output_fields(
   }
 
   auto *mvq = reinterpret_cast<zvec::MultiQuery *>(query);
-  std::vector<std::string> field_vec;
-  field_vec.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    if (!fields[i]) {
-      SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                     "Null field name at index " + std::to_string(i));
-      return ZVEC_ERROR_INVALID_ARGUMENT;
-    }
-    field_vec.emplace_back(fields[i]);
-  }
-  mvq->output_fields = std::move(field_vec);
-
-  return ZVEC_OK;
+  return set_c_input_fields(*mvq, mvq->output_fields, fields, count);
 }
 
 zvec_error_code_t zvec_multi_query_get_output_fields(
@@ -6529,24 +6447,7 @@ zvec_error_code_t zvec_multi_query_get_output_fields(
   }
 
   auto *mvq = reinterpret_cast<zvec::MultiQuery *>(query);
-  if (!mvq->output_fields.has_value() || mvq->output_fields->empty()) {
-    *fields = nullptr;
-    *count = 0;
-    return ZVEC_OK;
-  }
-
-  const auto &field_vec = mvq->output_fields.value();
-  *count = field_vec.size();
-  *fields = static_cast<const char **>(malloc(*count * sizeof(const char *)));
-  if (!*fields) {
-    SET_LAST_ERROR(ZVEC_ERROR_INTERNAL_ERROR, "Failed to allocate memory");
-    return ZVEC_ERROR_INTERNAL_ERROR;
-  }
-  for (size_t i = 0; i < *count; ++i) {
-    (*fields)[i] = field_vec[i].c_str();
-  }
-
-  return ZVEC_OK;
+  return copy_c_output_field_pointers(mvq->output_fields, fields, count);
 }
 
 // =============================================================================
@@ -6555,16 +6456,15 @@ zvec_error_code_t zvec_multi_query_get_output_fields(
 
 zvec_sub_query_t *zvec_sub_query_create(void) {
   ZVEC_TRY_RETURN_NULL("Failed to create SubVectorQuery",
-                       auto *query = new zvec::SubQuery();
+                       auto query = CInput<zvec::SubQuery>::make(CInput<zvec::SubQuery>::base_bytes);
                        query->num_candidates_ = 10;
-                       return reinterpret_cast<zvec_sub_query_t *>(
-                           query);)
+                       return release_c_input<zvec_sub_query_t>(std::move(query));)
   return nullptr;
 }
 
 void zvec_sub_query_destroy(zvec_sub_query_t *query) {
   if (query) {
-    delete reinterpret_cast<zvec::SubQuery *>(query);
+    CInput<zvec::SubQuery>::destroy(reinterpret_cast<zvec::SubQuery *>(query));
   }
 }
 
@@ -6595,8 +6495,7 @@ zvec_error_code_t zvec_sub_query_set_field_name(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SubQuery *>(query);
-  ptr->target_.field_name_ = std::string(field_name);
-  return ZVEC_OK;
+  return set_c_input_string(*ptr, ptr->target_.field_name_, field_name ? field_name : "");
 }
 
 const char *zvec_sub_query_get_field_name(
@@ -6614,10 +6513,7 @@ zvec_error_code_t zvec_sub_query_set_query_vector(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SubQuery *>(query);
-  // Copies into VectorClause — see comment on zvec_vector_query_set_query_vector.
-  auto &payload = std::get<zvec::VectorClause>(ptr->target_.clause_);
-  payload.query_vector_.assign(static_cast<const char *>(data), size);
-  return ZVEC_OK;
+  return set_c_query_vector(*ptr, data, size);
 }
 
 zvec_error_code_t zvec_sub_query_set_sparse_vector(
@@ -6630,17 +6526,22 @@ zvec_error_code_t zvec_sub_query_set_sparse_vector(
   }
 
   auto *ptr = reinterpret_cast<zvec::SubQuery *>(query);
-  auto &payload = std::get<zvec::VectorClause>(ptr->target_.clause_);
-  if (count == 0) {
-    payload.sparse_indices_.clear();
-    payload.sparse_values_.clear();
-    return ZVEC_OK;
-  }
-  payload.sparse_indices_.assign(
-      reinterpret_cast<const char *>(indices), count * sizeof(uint32_t));
-  payload.sparse_values_.assign(
-      reinterpret_cast<const char *>(values), count * sizeof(float));
-  return ZVEC_OK;
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy sparse query",
+      const size_t index_bytes = BindingMemoryBytes(count, sizeof(uint32_t));
+      const size_t value_bytes = BindingMemoryBytes(count, sizeof(float));
+      CInputMutation mutation(*ptr,
+          count ? BindingMemoryBytes(1, index_bytes,
+                                      BindingMemoryBytes(1, value_bytes, 64)) : 0);
+      std::string index_data;
+      std::string value_data;
+      if (count) {
+        index_data.assign(reinterpret_cast<const char *>(indices), index_bytes);
+        value_data.assign(reinterpret_cast<const char *>(values), value_bytes);
+      }
+      ptr->target_.set_sparse_vector(std::move(index_data), std::move(value_data));
+      mutation.commit();
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_sub_query_set_sparse_indices(
@@ -6651,10 +6552,17 @@ zvec_error_code_t zvec_sub_query_set_sparse_indices(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SubQuery *>(query);
-  auto &payload = std::get<zvec::VectorClause>(ptr->target_.clause_);
-  payload.sparse_indices_.assign(
-      reinterpret_cast<const char *>(indices), count * sizeof(uint32_t));
-  return ZVEC_OK;
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy sparse query indices",
+      const size_t bytes = BindingMemoryBytes(count, sizeof(uint32_t));
+      std::string_view view;
+      if (bytes) view = std::string_view(reinterpret_cast<const char *>(indices), bytes);
+      CInputMutation mutation(*ptr, CStringStorage(view));
+      auto data = std::string(view);
+      if (!ptr->target_.get_vector_clause()) ptr->target_.clause_ = zvec::VectorClause{};
+      ptr->target_.get_vector_clause()->sparse_indices_ = std::move(data);
+      mutation.commit();
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_sub_query_set_sparse_values(
@@ -6665,10 +6573,17 @@ zvec_error_code_t zvec_sub_query_set_sparse_values(
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SubQuery *>(query);
-  auto &payload = std::get<zvec::VectorClause>(ptr->target_.clause_);
-  payload.sparse_values_.assign(
-      reinterpret_cast<const char *>(values), count * sizeof(float));
-  return ZVEC_OK;
+  ZVEC_TRY_RETURN_ERROR(
+      "Failed to copy sparse query values",
+      const size_t bytes = BindingMemoryBytes(count, sizeof(float));
+      std::string_view view;
+      if (bytes) view = std::string_view(reinterpret_cast<const char *>(values), bytes);
+      CInputMutation mutation(*ptr, CStringStorage(view));
+      auto data = std::string(view);
+      if (!ptr->target_.get_vector_clause()) ptr->target_.clause_ = zvec::VectorClause{};
+      ptr->target_.get_vector_clause()->sparse_values_ = std::move(data);
+      mutation.commit();
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_sub_query_set_hnsw_params(
@@ -6773,12 +6688,7 @@ zvec_error_code_t zvec_sub_query_set_fts(zvec_sub_query_t *query,
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
   auto *ptr = reinterpret_cast<zvec::SubQuery *>(query);
-  if (!fts) {
-    ptr->target_.clause_ = zvec::VectorClause{};
-  } else {
-    ptr->target_.clause_ = *reinterpret_cast<const zvec::FtsClause *>(fts);
-  }
-  return ZVEC_OK;
+  return set_c_query_fts(*ptr, fts);
 }
 
 // =============================================================================
@@ -6883,6 +6793,12 @@ zvec_error_code_t zvec_collection_add_column(zvec_collection_t *collection,
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      if (expression)
+        zvec::detail::ReserveCStrings(input_memory, pending, &expression, 1);
+      pending.start();
       // Deep copy the schema - caller retains ownership
       auto *cpp_schema =
           reinterpret_cast<const zvec::FieldSchema *>(field_schema);
@@ -6890,6 +6806,7 @@ zvec_error_code_t zvec_collection_add_column(zvec_collection_t *collection,
           std::make_shared<zvec::FieldSchema>(*cpp_schema);
 
       std::string expr = expression ? expression : "";
+      pending.finish();
       zvec::Status status = (*coll_ptr)->add_column(schema, expr);
 
       return handle_status(status);)
@@ -6971,7 +6888,9 @@ zvec_error_code_t zvec_collection_insert(zvec_collection_t *collection,
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count);
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count, input_memory);
       if (!converted_docs.has_value()) {
         return handle_status(converted_docs.error());
       }
@@ -7017,18 +6936,22 @@ zvec_error_code_t zvec_collection_insert_with_results(zvec_collection_t *collect
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count);
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count, input_memory);
       if (!converted_docs.has_value()) {
         return handle_status(converted_docs.error());
       }
       auto &internal_docs = converted_docs.value();
 
+      CWriteResultBuffer output(internal_docs);
       auto result = (*coll_ptr)->insert(internal_docs);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results, result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_update(zvec_collection_t *collection,
@@ -7050,7 +6973,9 @@ zvec_error_code_t zvec_collection_update(zvec_collection_t *collection,
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count);
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count, input_memory);
       if (!converted_docs.has_value()) {
         return handle_status(converted_docs.error());
       }
@@ -7093,18 +7018,22 @@ zvec_error_code_t zvec_collection_update_with_results(zvec_collection_t *collect
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count);
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count, input_memory);
       if (!converted_docs.has_value()) {
         return handle_status(converted_docs.error());
       }
       auto &internal_docs = converted_docs.value();
 
+      CWriteResultBuffer output(internal_docs);
       auto result = (*coll_ptr)->update(internal_docs);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results, result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_upsert(zvec_collection_t *collection,
@@ -7126,7 +7055,9 @@ zvec_error_code_t zvec_collection_upsert(zvec_collection_t *collection,
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count);
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count, input_memory);
       if (!converted_docs.has_value()) {
         return handle_status(converted_docs.error());
       }
@@ -7169,18 +7100,22 @@ zvec_error_code_t zvec_collection_upsert_with_results(zvec_collection_t *collect
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count);
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      auto converted_docs = convert_zvec_docs_to_internal(docs, doc_count, input_memory);
       if (!converted_docs.has_value()) {
         return handle_status(converted_docs.error());
       }
       auto &internal_docs = converted_docs.value();
 
+      CWriteResultBuffer output(internal_docs);
       auto result = (*coll_ptr)->upsert(internal_docs);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results, result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_delete(zvec_collection_t *collection,
@@ -7200,6 +7135,12 @@ zvec_error_code_t zvec_collection_delete(zvec_collection_t *collection,
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, pks, pk_count,
+                                   3 * sizeof(zvec::Status) + 512);
+      pending.start();
       std::vector<std::string> primary_keys; primary_keys.reserve(pk_count);
       for (size_t i = 0; i < pk_count; ++i) {
         if (pks[i]) {
@@ -7207,6 +7148,7 @@ zvec_error_code_t zvec_collection_delete(zvec_collection_t *collection,
         }
       }
 
+      pending.finish();
       auto result = (*coll_ptr)->delete_(primary_keys);
       zvec_error_code_t error_code = handle_expected_result(result);
 
@@ -7230,6 +7172,8 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
                                                   size_t pk_count,
                                                   zvec_write_result_t **results,
                                                   size_t *result_count) {
+  if (results) *results = nullptr;
+  if (result_count) *result_count = 0;
   if (!collection || !pks || pk_count == 0 || !results || !result_count) {
     set_last_error(
         "Invalid arguments: collection, pks, pk_count, results and "
@@ -7237,14 +7181,16 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
     return ZVEC_ERROR_INVALID_ARGUMENT;
   }
 
-  *results = nullptr;
-  *result_count = 0;
-
   ZVEC_TRY_RETURN_ERROR(
       "Exception in zvec_collection_delete_with_results",
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, pks, pk_count);
+      pending.start();
       std::vector<std::string> primary_keys; primary_keys.reserve(pk_count);
       for (size_t i = 0; i < pk_count; ++i) {
         if (pks[i]) {
@@ -7254,13 +7200,15 @@ zvec_error_code_t zvec_collection_delete_with_results(zvec_collection_t *collect
         }
       }
 
+      pending.finish();
+      CWriteResultBuffer output(primary_keys);
       auto result = (*coll_ptr)->delete_(primary_keys);
       zvec_error_code_t error_code = handle_expected_result(result);
 
       if (error_code != ZVEC_OK) { return error_code; }
 
-      return build_write_results(result.value(), results,
-                                  result_count);)
+      output.publish(std::move(result).value(), results, result_count);
+      return ZVEC_OK;)
 }
 
 zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection,
@@ -7275,9 +7223,17 @@ zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      auto status = (*coll_ptr)->delete_by_filter(filter); if (!status.ok()) {
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, &filter, 1);
+      pending.start();
+      const std::string expression(filter);
+      pending.finish();
+      auto status = (*coll_ptr)->delete_by_filter(expression);
+      if (!status.ok()) {
         return handle_status(status);
-      } 
+      }
       return ZVEC_OK;)
 }
 
@@ -7285,131 +7241,67 @@ zvec_error_code_t zvec_collection_delete_by_filter(zvec_collection_t *collection
 // Data query interface implementation
 // =============================================================================
 
-// Helper function to convert document results to C API format
+static zvec_doc_t *copy_result_document(
+    const zvec::Doc &doc, const zvec::CollectionSchema *fetch_schema = nullptr) {
+  size_t bytes = zvec::detail::DocumentMemoryAccess::copy_bytes(doc);
+  if (fetch_schema) {
+    for (const auto &field : fetch_schema->fields()) {
+      if (field && field->nullable() && !doc.has(field->name())) {
+        bytes = BindingMemoryBytes(
+            1, BindingMemoryBytes(1, field->name().size(), 256), bytes);
+      }
+    }
+  }
+  auto copy = CInput<zvec::Doc>::make(bytes, doc);
+  zvec::detail::DocumentMemoryAccess::retain(*copy, {});
+  if (fetch_schema) {
+    for (const auto &field : fetch_schema->fields()) {
+      if (field && field->nullable() && !doc.has(field->name())) {
+        copy->set_null(field->name());
+      }
+    }
+  }
+  return release_c_input<zvec_doc_t>(std::move(copy));
+}
+
 zvec_error_code_t convert_document_results(
     const std::vector<std::shared_ptr<zvec::Doc>> &query_results,
     zvec_doc_t ***results, size_t *result_count) {
+  *results = nullptr;
+  *result_count = 0;
+  if (query_results.empty()) return ZVEC_OK;
+  auto cleanup = [&query_results](zvec_doc_t **ptr) {
+    zvec_docs_free(ptr, query_results.size());
+  };
+  std::unique_ptr<zvec_doc_t *, decltype(cleanup)> converted(
+      static_cast<zvec_doc_t **>(zvec::detail::AllocateCResultArray(
+          query_results.size(), sizeof(zvec_doc_t *))), cleanup);
+  for (size_t i = 0; i < query_results.size(); ++i)
+    if (query_results[i]) converted.get()[i] = copy_result_document(*query_results[i]);
+  *results = converted.release();
   *result_count = query_results.size();
-  if (*result_count == 0) {
-    *results = nullptr;
-    return ZVEC_OK;
-  }
-  *results =
-      static_cast<zvec_doc_t **>(malloc(*result_count * sizeof(zvec_doc_t *)));
-
-  if (!*results) {
-    set_last_error("Failed to allocate memory for query results");
-    return ZVEC_ERROR_INTERNAL_ERROR;
-  }
-
-  for (size_t i = 0; i < *result_count; ++i) {
-    const auto &internal_doc = query_results[i];
-    // Create new document wrapper
-    zvec_doc_t *c_doc = zvec_doc_create();
-    if (!c_doc) {
-      // Clean up previously allocated documents
-      for (size_t j = 0; j < i; ++j) {
-        zvec_doc_destroy((*results)[j]);
-      }
-      free(*results);
-      *results = nullptr;
-      *result_count = 0;
-      set_last_error("Failed to create document wrapper");
-      return ZVEC_ERROR_INTERNAL_ERROR;
-    }
-
-    // Copy the C++ document to our wrapper
-    auto *doc_ptr = reinterpret_cast<zvec::Doc *>(c_doc);
-    *doc_ptr = *internal_doc;  // Copy assignment
-    (*results)[i] = c_doc;     // Store the pointer, not dereference
-  }
-
   return ZVEC_OK;
 }
 
-// Helper function to convert fetched document results to C API format
-static void normalize_nullable_fields_for_fetch(
-    const zvec::CollectionSchema &schema, zvec::DocPtrMap &doc_map) {
-  std::vector<std::string> nullable_fields;
-  nullable_fields.reserve(schema.fields().size());
-
-  for (const auto &field : schema.fields()) {
-    if (field && field->nullable()) {
-      nullable_fields.push_back(field->name());
-    }
-  }
-
-  if (nullable_fields.empty()) {
-    return;
-  }
-
-  for (auto &[_, doc_ptr] : doc_map) {
-    if (!doc_ptr) {
-      continue;
-    }
-
-    for (const auto &field_name : nullable_fields) {
-      if (!doc_ptr->has(field_name)) {
-        doc_ptr->set_null(field_name);
-      }
-    }
-  }
-}
-
-zvec_error_code_t convert_fetched_document_results(const zvec::DocPtrMap &doc_map,
-                                                zvec_doc_t ***results,
-                                                size_t *doc_count) {
-  // Calculate actual document count (some PKs might not exist)
-  size_t actual_count = 0;
-  for (const auto &[pk, doc_ptr] : doc_map) {
-    if (doc_ptr) {
-      actual_count++;
-    }
-  }
-
-  // Allocate memory for document pointers
-  *doc_count = actual_count;
-  if (*doc_count == 0) {
-    *results = nullptr;
-    return ZVEC_OK;
-  }
-
-  *results = static_cast<zvec_doc_t **>(malloc(*doc_count * sizeof(zvec_doc_t *)));
-  if (!*results) {
-    set_last_error("Failed to allocate memory for document pointers");
-    return ZVEC_ERROR_INTERNAL_ERROR;
-  }
-
-  // Convert C++ DocPtrMap to C zvec_doc_t pointer array
-  size_t index = 0;
-  for (const auto &[pk, doc_ptr] : doc_map) {
-    if (doc_ptr && index < *doc_count) {
-      // Create new document wrapper
-      zvec_doc_t *c_doc = zvec_doc_create();
-      if (!c_doc) {
-        // Clean up previously allocated documents
-        for (size_t j = 0; j < index; ++j) {
-          zvec_doc_destroy((*results)[j]);
-        }
-        free(*results);
-        *results = nullptr;
-        *doc_count = 0;
-        set_last_error("Failed to create document wrapper");
-        return ZVEC_ERROR_INTERNAL_ERROR;
-      }
-
-      // Copy the C++ document to our wrapper using copy assignment
-      auto *cpp_doc_ptr = reinterpret_cast<zvec::Doc *>(c_doc);
-      *cpp_doc_ptr = *doc_ptr;  // Copy assignment from shared_ptr
-
-      // Set the primary key explicitly
-      zvec_doc_set_pk(c_doc, pk.c_str());
-
-      (*results)[index] = c_doc;
-      ++index;
-    }
-  }
-
+zvec_error_code_t convert_fetched_document_results(
+    const zvec::internal::FetchResultSnapshot &snapshot, zvec_doc_t ***results,
+    size_t *doc_count) {
+  const auto &doc_map = snapshot.docs;
+  *results = nullptr;
+  *doc_count = 0;
+  size_t count = 0;
+  for (const auto &[pk, doc] : doc_map) if (doc) ++count;
+  if (count == 0) return ZVEC_OK;
+  auto cleanup = [count](zvec_doc_t **ptr) { zvec_docs_free(ptr, count); };
+  std::unique_ptr<zvec_doc_t *, decltype(cleanup)> converted(
+      static_cast<zvec_doc_t **>(zvec::detail::AllocateCResultArray(
+          count, sizeof(zvec_doc_t *))), cleanup);
+  size_t i = 0;
+  for (const auto &[pk, doc] : doc_map)
+    if (doc)
+      converted.get()[i++] = copy_result_document(*doc, snapshot.schema.get());
+  *results = converted.release();
+  *doc_count = count;
   return ZVEC_OK;
 }
 
@@ -7453,10 +7345,10 @@ zvec_error_code_t zvec_collection_query(const zvec_collection_t *collection,
 void zvec_group_results_free(zvec_group_result_t *results, size_t result_count) {
   if (!results) return;
   for (size_t i = 0; i < result_count; ++i) {
-    free(results[i].group_by_value);
+    zvec_free(results[i].group_by_value);
     zvec_docs_free(results[i].docs, results[i].doc_count);
   }
-  free(results);
+  zvec_free(results);
 }
 
 zvec_error_code_t zvec_collection_group_by_query(
@@ -7491,21 +7383,22 @@ zvec_error_code_t zvec_collection_group_by_query(
       };
       std::unique_ptr<zvec_group_result_t, decltype(cleanup)> converted(
           static_cast<zvec_group_result_t *>(
-              calloc(groups.size(), sizeof(zvec_group_result_t))), cleanup);
+              zvec::detail::AllocateCResultArray(groups.size(), sizeof(zvec_group_result_t))), cleanup);
       if (!converted) throw std::bad_alloc();
       for (size_t i = 0; i < groups.size(); ++i) {
         auto &group = groups[i];
         auto &out = converted.get()[i];
-        out.group_by_value = strdup(group.group_by_value_.c_str());
+        out.group_by_value = zvec::detail::CopyCResultString(group.group_by_value_);
         if (!out.group_by_value) throw std::bad_alloc();
         if (group.docs_.empty()) continue;
         out.docs = static_cast<zvec_doc_t **>(
-            calloc(group.docs_.size(), sizeof(zvec_doc_t *)));
+            zvec::detail::AllocateCResultArray(group.docs_.size(), sizeof(zvec_doc_t *)));
         if (!out.docs) throw std::bad_alloc();
         for (auto &doc : group.docs_) {
-          auto owned_doc = std::make_unique<zvec::Doc>(std::move(doc));
+          auto owned_doc = CInput<zvec::Doc>::make(
+              CInput<zvec::Doc>::base_bytes, std::move(doc));
           out.docs[out.doc_count++] =
-              reinterpret_cast<zvec_doc_t *>(owned_doc.release());
+              release_c_input<zvec_doc_t>(std::move(owned_doc));
         }
       }
       *results = converted.release();
@@ -7554,6 +7447,8 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
                                     size_t output_field_count,
                                     bool include_vector,
                                     zvec_doc_t ***results, size_t *doc_count) {
+  if (results) *results = nullptr;
+  if (doc_count) *doc_count = 0;
   if (!collection || !pks || !results || !doc_count) {
     set_last_error(
         "Invalid arguments: collection, pks, results and doc_count cannot "
@@ -7574,6 +7469,14 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
           reinterpret_cast<const std::shared_ptr<zvec::Collection> *>(
               collection);
 
+      zvec::detail::ResultMemoryAllowance::Lease input_memory(
+          collection_input_allowance(**coll_ptr));
+      zvec::detail::ResultMemoryAllowance::PendingCopy pending;
+      zvec::detail::ReserveCStrings(input_memory, pending, pks, pk_count);
+      if (output_fields)
+        zvec::detail::ReserveCStrings(input_memory, pending, output_fields,
+                                     output_field_count);
+      pending.start();
       // Convert C array to C++ vector
       std::vector<std::string> pk_vector; pk_vector.reserve(pk_count);
       for (size_t i = 0; i < pk_count; ++i) {
@@ -7601,37 +7504,39 @@ zvec_error_code_t zvec_collection_fetch(zvec_collection_t *collection,
         cpp_output_fields = std::move(fields);
       }
 
-      // Call C++ fetch method
-      auto result = (*coll_ptr)->fetch(pk_vector, cpp_output_fields, include_vector);
+      pending.finish();
+      auto result = zvec::internal::fetch_result_snapshot(
+          **coll_ptr, pk_vector, cpp_output_fields, include_vector);
       if (!result.has_value()) {
-        set_last_error("Failed to fetch documents: " +
-                        result.error().message());
-        return ZVEC_ERROR_INTERNAL_ERROR;
+        return handle_status(result.error());
       }
-
-      auto doc_map = result.value();
-      auto schema_result = (*coll_ptr)->schema();
-      if (schema_result.has_value()) {
-        normalize_nullable_fields_for_fetch(schema_result.value(), doc_map);
-      } 
-      return convert_fetched_document_results(doc_map, results, doc_count);)
+      return convert_fetched_document_results(*result, results, doc_count);)
 }
 
 // =============================================================================
 // Document Iterator Interface implementation
 // =============================================================================
 
+namespace {
+
+struct CDocIterator {
+  zvec::DocIterator::Ptr iterator;
+  zvec::Doc::Ptr pending;
+};
+
+}  // namespace
+
 zvec_iterator_options_t *zvec_iterator_options_create(void) {
   ZVEC_TRY_RETURN_NULL(
       "Failed to create zvec_iterator_options_t",
-      auto *options = new zvec::IteratorOptions();
-      return reinterpret_cast<zvec_iterator_options_t *>(options);)
+      auto options = CInput<zvec::IteratorOptions>::make(CInput<zvec::IteratorOptions>::base_bytes);
+      return release_c_input<zvec_iterator_options_t>(std::move(options));)
   return nullptr;
 }
 
 void zvec_iterator_options_destroy(zvec_iterator_options_t *options) {
   if (options) {
-    delete reinterpret_cast<zvec::IteratorOptions *>(options);
+    CInput<zvec::IteratorOptions>::destroy(reinterpret_cast<zvec::IteratorOptions *>(options));
   }
 }
 
@@ -7641,28 +7546,13 @@ zvec_error_code_t zvec_iterator_options_set_output_fields(
   ZVEC_CHECK_NOTNULL_ERRCODE(options, ZVEC_ERROR_INVALID_ARGUMENT,
                              "Iterator options pointer is null");
 
-  ZVEC_TRY_RETURN_ERROR(
-      "Failed to set output_fields",
-      auto *ptr = reinterpret_cast<zvec::IteratorOptions *>(options);
-      // NULL output_fields means "return all fields" (nullopt). A non-NULL
-      // array with count == 0 yields an empty selection (no scalar fields).
-      if (output_fields == nullptr) {
-        ptr->output_fields_ = std::nullopt;
-        return ZVEC_OK;
-      }
-      std::vector<std::string> fields;
-      fields.reserve(count);
-      for (size_t i = 0; i < count; ++i) {
-        if (output_fields[i]) {
-          fields.emplace_back(output_fields[i]);
-        } else {
-          SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT,
-                         "Null output_field at index " + std::to_string(i));
-          return ZVEC_ERROR_INVALID_ARGUMENT;
-        }
-      }
-      ptr->output_fields_ = std::move(fields);
-      return ZVEC_OK;)
+  auto *ptr = reinterpret_cast<zvec::IteratorOptions *>(options);
+  // Null selects all fields. A non-null array can select zero fields.
+  if (!output_fields) {
+    clear_c_input_fields(*ptr, ptr->output_fields_);
+    return ZVEC_OK;
+  }
+  return set_c_input_fields(*ptr, ptr->output_fields_, output_fields, count);
 }
 
 zvec_error_code_t zvec_iterator_options_set_include_vector(
@@ -7681,6 +7571,7 @@ zvec_error_code_t zvec_collection_create_iterator(
                              "Collection handle is null");
   ZVEC_CHECK_NOTNULL_ERRCODE(out_iter, ZVEC_ERROR_INVALID_ARGUMENT,
                              "out_iter pointer is null");
+  *out_iter = nullptr;
 
   ZVEC_TRY_RETURN_ERROR(
       "Exception in zvec_collection_create_iterator",
@@ -7689,12 +7580,12 @@ zvec_error_code_t zvec_collection_create_iterator(
       auto coll_ptr =
           reinterpret_cast<std::shared_ptr<zvec::Collection> *>(collection);
 
-      zvec::IteratorOptions iter_options;
-      if (options) {
-        iter_options =
-            *reinterpret_cast<const zvec::IteratorOptions *>(options);
-      }
+      const zvec::IteratorOptions defaults;
+      const auto &iter_options =
+          options ? *reinterpret_cast<const zvec::IteratorOptions *>(options)
+                  : defaults;
 
+      auto handle = std::make_unique<CDocIterator>();
       auto result = (*coll_ptr)->create_iterator(iter_options);
       if (!result.has_value()) {
         zvec_error_code_t code = status_to_error_code(result.error());
@@ -7703,8 +7594,8 @@ zvec_error_code_t zvec_collection_create_iterator(
         return code;
       }
 
-      *out_iter = reinterpret_cast<zvec_doc_iterator_t *>(
-          new std::shared_ptr<zvec::DocIterator>(std::move(result.value())));
+      handle->iterator = std::move(result.value());
+      *out_iter = reinterpret_cast<zvec_doc_iterator_t *>(handle.release());
       return ZVEC_OK;)
 }
 
@@ -7719,32 +7610,27 @@ zvec_error_code_t zvec_doc_iterator_next(zvec_doc_iterator_t *iter,
 
   ZVEC_TRY_RETURN_ERROR(
       "Exception in zvec_doc_iterator_next",
-      auto iter_ptr =
-          reinterpret_cast<std::shared_ptr<zvec::DocIterator> *>(iter);
-
-      auto result = (*iter_ptr)->next();
-      if (!result.has_value()) {
-        zvec_error_code_t code = status_to_error_code(result.error());
-        SET_LAST_ERROR(code,
-                       "Iterator next failed: " + result.error().message());
-        return code;
+      auto *handle = reinterpret_cast<CDocIterator *>(iter);
+      if (!handle->pending) {
+        auto result = handle->iterator->next();
+        if (!result.has_value()) {
+          zvec_error_code_t code = status_to_error_code(result.error());
+          SET_LAST_ERROR(code,
+                         "Iterator next failed: " + result.error().message());
+          return code;
+        }
+        handle->pending = std::move(result.value());
       }
 
-      // EOF: value() is nullptr → leave *out_doc = NULL, return OK.
-      auto doc = result.value();
-      if (doc == nullptr) {
-        return ZVEC_OK;
+      // A rejected C copy must not advance past a document the caller has
+      // never received. The native document keeps its result lease on retry.
+      if (handle->pending) {
+        *out_doc = copy_result_document(*handle->pending);
+        handle->pending.reset();
       }
-
-      // Copy into a heap Doc owned by the caller (freed via zvec_doc_destroy).
-      *out_doc = reinterpret_cast<zvec_doc_t *>(new zvec::Doc(*doc));
       return ZVEC_OK;)
 }
 
 void zvec_doc_iterator_close(zvec_doc_iterator_t *iter) {
-  if (iter) {
-    // Deleting the shared_ptr wrapper releases the DocIterator (whose
-    // destructor calls close() and releases segments/delete_store).
-    delete reinterpret_cast<std::shared_ptr<zvec::DocIterator> *>(iter);
-  }
+  delete reinterpret_cast<CDocIterator *>(iter);
 }

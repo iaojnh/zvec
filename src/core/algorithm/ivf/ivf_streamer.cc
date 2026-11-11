@@ -14,6 +14,7 @@
 #include "ivf_streamer.h"
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_segment_storage.h>
+#include "ailego/pattern/defer.h"
 #include "ivf_centroid_index.h"
 #include "ivf_index_provider.h"
 #include "ivf_params.h"
@@ -55,7 +56,7 @@ int IVFStreamer::cleanup() {
   return 0;
 }
 
-int IVFStreamer::open(IndexStorage::Pointer storage) {
+int IVFStreamer::open(IndexStorage::Pointer storage) try {
   if (!storage) {
     LOG_ERROR("Invalid storage");
     return IndexError_InvalidArgument;
@@ -66,6 +67,10 @@ int IVFStreamer::open(IndexStorage::Pointer storage) {
   }
 
   ailego::ElapsedTime timer;
+  bool loaded = false;
+  AILEGO_DEFER([&] {
+    if (!loaded) unload();
+  });
   int ret = IndexHelper::DeserializeFromStorage(storage.get(), &meta_);
   if (ret != 0) {
     LOG_ERROR("Failed to deserialize meta from storage");
@@ -129,11 +134,15 @@ int IVFStreamer::open(IndexStorage::Pointer storage) {
            entity_->vector_count(), entity_->inverted_list_count());
 
   searcher_state_ = STATE_LOADED;
+  loaded = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int IVFStreamer::unload() {
   magic_ = 0;
+  params_.erase(PARAM_IVF_SEARCHER_CONVERTER_REFORMER);
   centroid_index_.reset();
   entity_.reset();
   quantizer_.reset();
@@ -156,20 +165,34 @@ int IVFStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
   return search_bf(query, qmeta, count, context, nullptr);
 }
 
+int IVFStreamer::search_bf_by_keys_impl(const void *query,
+                                        const std::vector<uint64_t> &keys,
+                                        const IndexQueryMeta &qmeta,
+                                        Context::Pointer &context) const {
+  // The generic IndexRunner adapter copies keys into a batch. This search is
+  // synchronous, so borrow the caller-owned list through the complete scan.
+  return search_bf(query, qmeta, 1, context, nullptr, &keys);
+}
+
 int IVFStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
   if (count == 0 || count != p_keys.size()) {
+    if (context) context->reset();
     return IndexError_InvalidArgument;
   }
   return search_bf(query, qmeta, count, context, &p_keys);
 }
 
-int IVFStreamer::search_bf(
-    const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context,
-    const std::vector<std::vector<uint64_t>> *p_keys) const {
+int IVFStreamer::search_bf(const void *query, const IndexQueryMeta &qmeta,
+                           uint32_t count, Context::Pointer &context,
+                           const std::vector<std::vector<uint64_t>> *p_keys,
+                           const std::vector<uint64_t> *single_keys) const try {
+  bool completed = false;
+  AILEGO_DEFER([&] {
+    if (!completed && context) context->reset();
+  });
   if (searcher_state_ != STATE_LOADED) {
     return IndexError_Runtime;
   }
@@ -206,9 +229,12 @@ int IVFStreamer::search_bf(
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
-    if (p_keys) {
-      ret = entity->search_by_p_keys(query, (*p_keys)[q], filter, &heap,
-                                     &context_stats);
+    const auto *keys = single_keys ? single_keys
+                       : p_keys    ? &(*p_keys)[q]
+                                   : nullptr;
+    if (keys) {
+      ret =
+          entity->search_by_p_keys(query, *keys, filter, &heap, &context_stats);
     } else if (!filter.is_valid()) {
       ret = entity->search(query, &heap, &context_stats);
     } else {
@@ -217,17 +243,22 @@ int IVFStreamer::search_bf(
     ivf_check_with_msg(ret, "Failed to search in entity for %s",
                        IndexError::What(ret));
     heap.sort();  // sort the results
-    if (!p_keys && !filter.is_valid()) {
+    if (!keys && !filter.is_valid()) {
       // mapping the local id to key if query without filter
       ret = entity->retrieve_keys(&heap);
       ivf_check_error_code(ret);
     }
     entity->normalize(q, &heap);
-    ctx->topk_to_result(q);
+    ret = ctx->topk_to_result(q);
+    ivf_check_error_code(ret);
     query = static_cast<const char *>(query) + iv_qmeta.element_size();
   }
 
+  completed = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
@@ -236,12 +267,17 @@ int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 }
 
 int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                             uint32_t count, Context::Pointer &context) const {
-  if (searcher_state_ != STATE_LOADED) {
-    return IndexError_Runtime;
-  }
+                             uint32_t count, Context::Pointer &context) const
+    try {
+  if (searcher_state_ != STATE_LOADED) return IndexError_Runtime;
+  bool completed = false;
+  AILEGO_DEFER([&] {
+    if (!completed && context) context->reset();
+  });
   if (entity_->vector_count() <= bruteforce_threshold_) {
-    return this->search_bf_impl(query, qmeta, count, context);
+    const int ret = this->search_bf_impl(query, qmeta, count, context);
+    completed = ret == 0;
+    return ret;
   }
   if (!query || qmeta.element_size() != meta_.element_size() ||
       (quantizer_ && (qmeta.data_type() != meta_.data_type() ||
@@ -281,10 +317,23 @@ int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
-    size_t total_scan_count = 0;
+    size_t hinted_scans = 0, next_hint = 0, total_scan_count = 0;
     for (size_t i = 0;
          i < centroids.size() && total_scan_count < ctx->max_scan_count();
          ++i) {
+      if (next_hint < i) {
+        next_hint = i;
+        hinted_scans = std::max(hinted_scans, total_scan_count);
+      }
+      while (next_hint < centroids.size() &&
+             hinted_scans < ctx->max_scan_count()) {
+        bool accepted = false;
+        const size_t count =
+            entity->prefetch_list(centroids[next_hint].key(), &accepted);
+        if (!accepted) break;
+        hinted_scans += count;
+        ++next_hint;
+      }
       auto cid = centroids[i].key();
       uint32_t scan_count = 0;
       if (!filter.is_valid()) {
@@ -304,11 +353,16 @@ int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
       ivf_check_error_code(ret);
     }
     entity->normalize(q, &heap);
-    ctx->topk_to_result(q);
+    ret = ctx->topk_to_result(q);
+    ivf_check_error_code(ret);
     query = static_cast<const char *>(query) + iv_qmeta.element_size();
   }
 
+  completed = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  if (context) context->reset();
+  return IndexError_NoMemory;
 }
 
 const IndexSearcher::Stats &IVFStreamer::stats() const {

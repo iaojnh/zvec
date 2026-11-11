@@ -17,10 +17,20 @@
 #include <optional>
 #include <string>
 #include <vector>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 namespace zvec {
 
-const uint32_t DEFAULT_MAX_BUFFER_SIZE = 64 * 1024 * 1024;  // 64M
+// Four buffer-equivalents plus encoding headroom are reserved before writes.
+// Keep the mobile default compatible with its 64/128 MiB process budgets.
+const uint32_t MOBILE_DEFAULT_MAX_BUFFER_SIZE = 4 * 1024 * 1024;
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+const uint32_t DEFAULT_MAX_BUFFER_SIZE = MOBILE_DEFAULT_MAX_BUFFER_SIZE;
+#else
+const uint32_t DEFAULT_MAX_BUFFER_SIZE = 64 * 1024 * 1024;
+#endif
 
 struct CollectionOptions {
   // Pending WAL records require a writable open and close before read-only.

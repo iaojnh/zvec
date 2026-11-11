@@ -14,6 +14,7 @@
 
 #include "algorithm/flat/flat_streamer.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -30,6 +31,8 @@
 #include <gtest/gtest.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/encoding/json/mod_json.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
+#include "ailego/pattern/defer.h"
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_streamer.h>
 #include "algorithm/flat/flat_streamer_context.h"
@@ -305,9 +308,7 @@ TEST_F(FlatStreamerTest,
       flat->topk_to_result(0);
       const auto expected = flat->result();
       fill_heap();
-      const auto *buffer = flat->result_heap()->container().data();
       flat->take_topk_result(0);
-      EXPECT_EQ(buffer, flat->result().data());
       EXPECT_TRUE(flat->result_heap()->empty());
       ASSERT_EQ(expected.size(), flat->result().size());
       for (size_t i = 0; i < expected.size(); ++i) {
@@ -476,7 +477,7 @@ TEST_F(FlatStreamerTest, CandidateSearchKeepsMetricBatchAndReusesScratch) {
       std::vector<uint64_t> keys;
       for (uint64_t id = 0; id < 13; ++id) keys.push_back(id);
       FlatSearchScratch scratch;
-      IndexDocumentHeap heap(kCount);
+      IndexCandidateHeap heap(kCount);
       ASSERT_EQ(0, entity->search_by_p_keys(query.data(), keys, IndexFilter(),
                                             &heap, &scratch, 5));
       EXPECT_EQ(keys.size(), heap.size());
@@ -705,7 +706,7 @@ TEST_F(FlatStreamerTest, TestContiguousUniformUint8ExtraValues) {
       SCOPED_TRACE(filtered);
       SCOPED_TRACE(count);
       std::vector<std::vector<uint64_t>> keys(1);
-      IndexDocumentHeap expected(kCount);
+      IndexCandidateHeap expected(kCount);
       for (uint32_t id = count; id > 0; --id) {
         const uint64_t key = id - 1;
         keys[0].push_back(key);

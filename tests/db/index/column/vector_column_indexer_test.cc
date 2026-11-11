@@ -24,6 +24,7 @@
 #include "zvec/ailego/utility/float_helper.h"
 #include "zvec/db/doc.h"
 #include "zvec/db/index_params.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic push
@@ -31,7 +32,6 @@
 #endif
 
 using namespace zvec;
-
 
 TEST(VectorColumnIndexerTest, ReusedQueryParametersAndFlatFallback) {
   FieldSchema field("vector", DataType::VECTOR_FP32, 32, false,
@@ -2228,14 +2228,14 @@ TEST(VectorColumnIndexerTest, Failure) {
 
   // Test case 10: use_mmap = false
   {
-    zvec::ailego::MemoryLimitPool::get_instance().init(10 * 1024UL * 1024UL);
+    zvec::ailego::PoolPayloadBudget::get_instance().init(10 * 1024UL * 1024UL);
     auto indexer = std::make_shared<VectorColumnIndexer>(
         index_file_path,
         FieldSchema("test", DataType::VECTOR_FP32, 3, false,
                     std::make_shared<FlatIndexParams>(MetricType::IP)));
     ASSERT_TRUE(indexer);
     ASSERT_TRUE(
-        indexer->open(vector_column_params::ReadOptions{true, true, false})
+        indexer->open(vector_column_params::ReadOptions{false, true, false})
             .ok());
     // Insert some data first
     auto data = vector_column_params::VectorData{
@@ -2345,8 +2345,9 @@ TEST(VectorColumnIndexerTest, Failure) {
     // Fetch non-existent doc_id should fail
     auto fetch_result = indexer->fetch(99999);
     ASSERT_FALSE(fetch_result.has_value());
+    EXPECT_EQ(StatusCode::INTERNAL_ERROR, fetch_result.error().code());
     ASSERT_EQ(fetch_result.error().message(),
-              "Failed to fetch vector from index");
+              "Failed to fetch vector from index: No exist");
 
     indexer->destroy();
   }

@@ -27,6 +27,10 @@
 
 namespace zvec {
 
+namespace detail {
+struct DocumentMemoryAccess;
+}
+
 using float16_t = ailego::Float16;
 
 class ZVEC_API Doc {
@@ -260,6 +264,15 @@ class ZVEC_API Doc {
     fields_.erase(field_name);
   }
 
+  // Copy one present field without materializing unrelated values. Explicit
+  // nulls are copied; an absent field leaves the destination unchanged.
+  bool copy_field_from(const Doc &other, const std::string &field_name) {
+    auto it = other.fields_.find(field_name);
+    if (it == other.fields_.end()) return false;
+    fields_.insert_or_assign(it->first, it->second);
+    return true;
+  }
+
   Status validate_and_sanitize(const CollectionSchema::Ptr &schema,
                                bool is_update = false);
 
@@ -291,6 +304,9 @@ class ZVEC_API Doc {
  public:
   std::vector<uint8_t> serialize() const;
 
+  // Size of the existing WAL representation, without allocating a copy.
+  size_t serialized_size() const;
+
   static Doc::Ptr deserialize(const uint8_t *data, size_t size);
   static Doc::Ptr deserialize(const std::vector<uint8_t> &data) {
     return deserialize(data.data(), data.size());
@@ -321,6 +337,10 @@ class ZVEC_API Doc {
   struct ValueEqual;
 
  private:
+  friend struct detail::DocumentMemoryAccess;
+  // Keep admission through native result moves, including Docs stored by
+  // value in grouped results. Payload members are destroyed before this owner.
+  std::shared_ptr<void> memory_owner_;
   std::string pk_;
   float score_{0.0f};
   uint64_t doc_id_{0};

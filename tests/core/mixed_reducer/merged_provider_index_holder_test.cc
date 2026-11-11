@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -25,8 +26,10 @@
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
+#include "ailego/pattern/defer.h"
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "mixed_reducer/mixed_streamer_reducer.h"
+#include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec {
 namespace core {
@@ -1120,9 +1123,9 @@ TEST(MergedProviderIndexHolderTest, OrdinalReadsReleaseBlocksBeforeNextRead) {
 TEST(MergedProviderIndexHolderTest, OrdinalReadsDoNotAccumulatePagePins) {
   struct RestorePoolBudget {
     ~RestorePoolBudget() {
-      EXPECT_EQ(0, ailego::MemoryLimitPool::get_instance().init(capacity));
+      EXPECT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(capacity));
     }
-    const size_t capacity{ailego::MemoryLimitPool::get_instance().capacity()};
+    const size_t capacity{ailego::PoolPayloadBudget::get_instance().capacity()};
   } restore_budget;
   struct BackingFile {
     ~BackingFile() {
@@ -1132,9 +1135,12 @@ TEST(MergedProviderIndexHolderTest, OrdinalReadsDoNotAccumulatePagePins) {
   } backing;
   constexpr size_t kPageCount = 2;
   ASSERT_EQ(
-      0, ailego::MemoryLimitPool::get_instance().init(
+      0, ailego::PoolPayloadBudget::get_instance().init(
              kPageCount * ailego::kVectorPageSize +
-             ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount)));
+             ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount) +
+             // The holder's source directory, ordinal map and reader are
+             // mandatory workspace, not either of the two cached pages.
+             64 * 1024));
   {
     ailego::File file;
     ASSERT_TRUE(

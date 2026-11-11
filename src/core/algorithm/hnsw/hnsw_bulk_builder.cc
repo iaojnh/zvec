@@ -37,7 +37,7 @@ HnswBulkBuilder::~HnswBulkBuilder() {
   if (!packed_path_.empty()) ailego::File::Delete(packed_path_);
 }
 
-int HnswBulkBuilder::add_source(IndexProvider::Pointer provider) {
+int HnswBulkBuilder::add_source(IndexProvider::Pointer provider) try {
   // Establish capabilities before evaluating any filters. Each lifetime keeps
   // iterator addresses valid even after its provider has been released.
   auto *stable = dynamic_cast<StableVectorHolder *>(provider.get());
@@ -46,15 +46,18 @@ int HnswBulkBuilder::add_source(IndexProvider::Pointer provider) {
   int ret = stable->retain_stable_data(&lifetime);
   if (ret != 0) return ret;
   if (!lifetime) return IndexError_Runtime;
-  lifetimes_.emplace_back(std::move(lifetime));
-  providers_.emplace_back(std::move(provider));
+  sources_.push_back({std::move(lifetime), std::move(provider)});
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int HnswBulkBuilder::prepare(const IndexFilter &filter) {
+int HnswBulkBuilder::prepare(const IndexFilter &filter) try {
+  vectors_.clear();
   // Cache decisions once, using reduce()'s source-key offsets and dense IDs.
   uint64_t base = 0;
-  for (const auto &provider : providers_) {
+  for (const auto &source : sources_) {
+    const auto &provider = source.provider;
     if (provider->count() > std::numeric_limits<uint32_t>::max() - base) {
       return IndexError_Overflow;
     }
@@ -79,6 +82,8 @@ int HnswBulkBuilder::prepare(const IndexFilter &filter) {
     base += provider->count();
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int HnswBulkBuilder::build(const std::string &target_path,
@@ -123,7 +128,7 @@ int HnswBulkBuilder::build(const std::string &target_path,
   const uint32_t workers = std::min<uint32_t>(write_concurrency, pool->count());
   // clone() traverses the main entity's chunk containers. Finish every clone
   // before the first insertion can grow those containers on a worker thread.
-  std::vector<IndexStreamer::Context::Pointer> contexts(workers);
+  ailego::BudgetedVector<IndexStreamer::Context::Pointer> contexts(workers);
   for (auto &context : contexts) {
     context = build->create_context();
     if (!context) return IndexError_NoMemory;

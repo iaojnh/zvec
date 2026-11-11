@@ -210,9 +210,9 @@ class Heap : private TBase {
   }
 
   //! Limit the heap with max size
-  void limit(size_t max) {
+  void limit(size_t max, bool reserve = true) {
     limit_ = std::max<size_t>(max, 1u);
-    TBase::reserve(limit_);
+    if (reserve) TBase::reserve(limit_);
   }
 
   //! Unlimit the size of heap

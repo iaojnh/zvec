@@ -23,8 +23,11 @@ if(NOT _TURBO_TARGET_ARCH)
   endif()
 endif()
 
-if(NOT ANDROID AND AUTO_DETECT_ARCH AND
-   _TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
+# Runtime-dispatched x86 kernels need their own ISA flags even when the
+# package baseline is explicitly selected with AUTO_DETECT_ARCH=OFF. Otherwise
+# the AVX translation units contain no-op stubs that CPU dispatch can select.
+# The probes use the target compiler, including Android cross builds.
+if(_TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
   setup_compiler_march_for_x86(
     TURBO_MARCH_FLAG_SSE2
     TURBO_MARCH_FLAG_AVX2
@@ -93,8 +96,7 @@ file(GLOB_RECURSE ALL_SRCS *.cc *.c *.h)
 # set_source_files_properties is directory-scoped, so it must be called in the
 # same directory that adds the sources to a target (i.e. here, not in a
 # subdirectory).
-if(NOT ANDROID AND AUTO_DETECT_ARCH AND
-   _TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
+if(_TURBO_TARGET_ARCH MATCHES "^(x86|x64)$")
     # Compile sparse dispatch at the target baseline. Advertise the kernels
     # separately: compiling dispatch with the strongest ISA can emit illegal
     # instructions before the runtime CPU check on older machines.
@@ -222,7 +224,9 @@ cc_library(
     ${ZVEC_TURBO_LIBRARY_OPTIONS}
     SRCS ${ALL_SRCS}
     DEFS ${ZVEC_TURBO_DEFS}
-    LIBS zvec_ailego ${ZVEC_TURBO_RABITQ_LIBS}
+    # Standalone Turbo needs framework symbols, but zvec_core already packs
+    # them. Keep normal symbol resolution without force-loading a second copy.
+    LIBS zvec_ailego "$<LINK_ONLY:core_framework>" ${ZVEC_TURBO_RABITQ_LIBS}
     INCS ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/distance ${PROJECT_ROOT_DIR}/src/include
 )
 

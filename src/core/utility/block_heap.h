@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <utility>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/internal/platform.h>
 
 namespace zvec {
@@ -128,8 +129,12 @@ struct BlockHeap {
   }
 
  private:
-  std::vector<std::pair<uint32_t, float>> data_;
-  std::vector<std::pair<uint32_t, float>> tmp_;
+  std::vector<std::pair<uint32_t, float>,
+              ailego::BudgetedAllocator<std::pair<uint32_t, float>>>
+      data_;
+  std::vector<std::pair<uint32_t, float>,
+              ailego::BudgetedAllocator<std::pair<uint32_t, float>>>
+      tmp_;
   int32_t ef_{0};
   int32_t block_size_{0};
   size_t cur_{0};

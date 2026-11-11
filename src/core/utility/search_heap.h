@@ -21,7 +21,7 @@
 #include <utility>
 #include <variant>
 #include <ailego/internal/cpu_features.h>
-#include <zvec/ailego/container/heap.h>
+#include <zvec/ailego/buffer/budgeted_heap.h>
 #include "block_heap.h"
 #include "linear_pool.h"
 
@@ -32,7 +32,7 @@ namespace core {
 // selection and variant dispatch happen outside the candidate-expansion loop.
 class SearchHeap {
  public:
-  using TopkHeap = ailego::KeyValueHeap<uint32_t, float>;
+  using TopkHeap = ailego::BudgetedKeyValueHeap<uint32_t, float>;
 
   template <typename Heap>
   Heap &select() {

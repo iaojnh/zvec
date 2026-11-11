@@ -20,7 +20,10 @@
 #include <new>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_searcher.h>
 #include "ivf_entity.h"
 
@@ -70,8 +73,8 @@ class IVFIndexProvider : public IndexProvider {
   // provider destruction, or thread exit.
   const void *get_vector(uint64_t key) const override {
     try {
-      auto &buffer = thread_result_buffer();
       std::lock_guard<std::mutex> lock(*read_mutex_);
+      auto &buffer = thread_result_buffer();
       IndexStorage::MemoryBlock data;
       if (entity_->get_vector_by_key(key, data) != 0) {
         return nullptr;
@@ -83,17 +86,21 @@ class IVFIndexProvider : public IndexProvider {
   }
 
   //! Return independently owned bytes, including for decoded Turbo postings.
-  int get_vector(uint64_t key,
-                 IndexStorage::MemoryBlock &block) const override {
-    auto buffer = std::make_shared<std::string>();
+  int get_vector(uint64_t key, IndexStorage::MemoryBlock &block) const override
+      try {
+    block.reset();
+    auto buffer = std::make_shared<ailego::BudgetedStringWorkspace>();
     std::lock_guard<std::mutex> lock(*read_mutex_);
     IndexStorage::MemoryBlock data;
-    if (entity_->get_vector_by_key(key, data) != 0 ||
-        !CopyVector(entity_, data.data(), element_size(), buffer.get())) {
+    int ret = entity_->get_vector_by_key(key, data);
+    if (ret != 0) return ret;
+    if (!CopyVector(entity_, data.data(), element_size(), buffer.get()))
       return IndexError_ReadData;
-    }
-    block = IndexStorage::MemoryBlock::MakeSharedView(buffer->data(), buffer);
+    block =
+        IndexStorage::MemoryBlock::MakeSharedView(buffer->value.data(), buffer);
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   //! Retrieve the owner class
@@ -103,33 +110,60 @@ class IVFIndexProvider : public IndexProvider {
 
  private:
   struct ThreadResultBuffer {
+    std::thread::id thread;
+    ailego::BudgetedStringWorkspace data;
+  };
+  struct ThreadResultRef {
     std::weak_ptr<std::mutex> owner;
-    std::string data;
+    std::weak_ptr<ThreadResultBuffer> buffer;
+    ~ThreadResultRef() {
+      if (auto live = buffer.lock()) live->data = {};
+    }
   };
 
-  std::string &thread_result_buffer() const {
-    // Key by provider lifetime, not its address, and prune destroyed providers.
-    // A list keeps other providers' buffers stable when adding an entry.
-    static thread_local std::list<ThreadResultBuffer> buffers;
+  ailego::BudgetedStringWorkspace &thread_result_buffer() const {
+    // TLS only references the buffer; provider destruction releases all
+    // workers.
+    static thread_local std::list<ThreadResultRef> buffers;
     for (auto it = buffers.begin(); it != buffers.end();) {
       auto owner = it->owner.lock();
       if (!owner) {
         it = buffers.erase(it);
       } else if (owner == read_mutex_) {
-        return it->data;
+        if (auto buffer = it->buffer.lock()) return buffer->data;
+        it = buffers.erase(it);
       } else {
         ++it;
       }
     }
-    buffers.push_back({read_mutex_, {}});
-    return buffers.back().data;
+    const auto thread = std::this_thread::get_id();
+    std::shared_ptr<ThreadResultBuffer> buffer;
+    for (auto &slot : thread_buffers_) {
+      if (slot->thread == thread) {
+        buffer = slot;
+        break;
+      }
+    }
+    if (!buffer) {
+      buffer = std::make_shared<ThreadResultBuffer>();
+      buffer->thread = thread;
+      thread_buffers_.push_back(buffer);
+    }
+    buffers.emplace_back();
+    buffers.back().owner = read_mutex_;
+    buffers.back().buffer = buffer;
+    return buffer->data;
   }
 
   // Copy storage-owned and column-major scratch bytes before releasing the
   // shared read lock. Decoded bytes already belong to the output buffer.
   static const void *CopyVector(const IVFEntity::Pointer &entity,
                                 const void *data, size_t size,
-                                std::string *buffer) {
+                                ailego::BudgetedStringWorkspace *workspace) {
+    workspace->reserve(std::max(
+        size, entity->quantizer() ? entity->quantizer()->dim() * sizeof(float)
+                                  : size));
+    auto *buffer = &workspace->value;
     const void *decoded = DecodeVector(entity, data, buffer);
     if (!decoded) {
       return nullptr;
@@ -159,14 +193,17 @@ class IVFIndexProvider : public IndexProvider {
     if (entity->quantizer()->input_data_type() == turbo::DataType::kFp16 &&
         buffer->size() == dim * sizeof(float)) {
       // PQ reconstruction is FP32 even when its training input was FP16.
-      std::string half(dim * sizeof(ailego::Float16), '\0');
+      ailego::BudgetedStringWorkspace half_workspace;
+      half_workspace.reserve(dim * sizeof(ailego::Float16));
+      auto &half = half_workspace.value;
+      half.resize(dim * sizeof(ailego::Float16));
       for (size_t i = 0; i < dim; ++i) {
         float value;
         std::memcpy(&value, buffer->data() + i * sizeof(float), sizeof(value));
         ailego::Float16 encoded(value);
         std::memcpy(&half[i * sizeof(encoded)], &encoded, sizeof(encoded));
       }
-      *buffer = std::move(half);
+      buffer->assign(half);
     }
     return buffer->data();
   }
@@ -181,15 +218,9 @@ class IVFIndexProvider : public IndexProvider {
           element_size_(element_size) {
       std::lock_guard<std::mutex> lock(*read_mutex_);
       count_ = entity_->vector_count();
-      use_mapping_ = entity_->has_key_order_mapping();
-      if (!use_mapping_) {
-        // Fallback: compute sorting if mapping segment is unavailable
-        fallback_.resize(count_);
-        std::iota(fallback_.begin(), fallback_.end(), size_t(0));
-        std::sort(fallback_.begin(), fallback_.end(), [&](size_t a, size_t b) {
-          return entity_->get_key(a) < entity_->get_key(b);
-        });
-      }
+      // load() requires this segment. Do not turn a malformed/partially loaded
+      // entity into an O(N) heap sort and potentially dereference missing keys.
+      if (!entity_->has_key_order_mapping()) status_ = IndexError_InvalidFormat;
     }
 
     //! Retrieve pointer of data
@@ -197,7 +228,7 @@ class IVFIndexProvider : public IndexProvider {
     // stay immutable until next(); finish using them before
     // advancing/destroying the iterator. Other iterators and provider reads
     // cannot invalidate them.
-    const void *data() const override {
+    const void *data() const override try {
       std::lock_guard<std::mutex> lock(*read_mutex_);
       size_t local_id = current_local_id();
       if (local_id >= count_) {
@@ -212,14 +243,16 @@ class IVFIndexProvider : public IndexProvider {
         }
         vector_loaded_ = true;
       }
-      return vector_.data();
+      return vector_.value.data();
+    } catch (const std::bad_alloc &) {
+      status_ = IndexError_NoMemory;
+      return nullptr;
     }
 
     //! Test if the iterator is valid
     bool is_valid() const override {
       std::lock_guard<std::mutex> lock(*read_mutex_);
-      return status_ == 0 && pos_ < count_ &&
-             (!use_mapping_ || ensure_mapping_chunk());
+      return status_ == 0 && pos_ < count_ && ensure_mapping_chunk();
     }
 
     int status() const override {
@@ -247,7 +280,7 @@ class IVFIndexProvider : public IndexProvider {
       if (status_ == 0 && pos_ < count_) {
         ++pos_;
         vector_loaded_ = false;
-        vector_.clear();
+        vector_.value.clear();
       }
     }
 
@@ -289,9 +322,6 @@ class IVFIndexProvider : public IndexProvider {
       if (status_ != 0 || pos_ >= count_) {
         return count_;
       }
-      if (!use_mapping_) {
-        return fallback_[pos_];
-      }
       if (!ensure_mapping_chunk()) {
         return count_;
       }
@@ -303,19 +333,20 @@ class IVFIndexProvider : public IndexProvider {
     IVFEntity::Pointer entity_;
     std::shared_ptr<std::mutex> read_mutex_;
     size_t element_size_;
-    mutable std::string vector_;
+    mutable ailego::BudgetedStringWorkspace vector_;
     mutable bool vector_loaded_{false};
-    bool use_mapping_{false};
     mutable int status_{0};
-    mutable std::vector<uint32_t> mapping_chunk_;
+    mutable std::vector<uint32_t, ailego::BudgetedAllocator<uint32_t>>
+        mapping_chunk_;
     mutable size_t mapping_chunk_begin_{0};
-    std::vector<size_t> fallback_;  // used only if mapping_ unavailable
     size_t count_{0};
     size_t pos_{0};
   };
 
  private:
   //! Members
+  mutable ailego::BudgetedVector<std::shared_ptr<ThreadResultBuffer>>
+      thread_buffers_;
   IndexMeta meta_;
   IVFEntity::Pointer entity_;
   std::string owner_class_;

@@ -40,15 +40,8 @@
 static size_t get_field_count(zvec_collection_schema_t *schema) {
   const char **names = NULL;
   size_t count = 0;
-  zvec_error_code_t err =
-      zvec_collection_schema_get_all_field_names(schema, &names, &count);
-  if (err == ZVEC_OK && names) {
-    size_t i;
-    for (i = 0; i < count; i++) {
-      zvec_free((char *)names[i]);
-    }
-    zvec_free(names);
-  }
+  zvec_collection_schema_get_all_field_names(schema, &names, &count);
+  zvec_free(names);
   return count;
 }
 
@@ -268,6 +261,18 @@ void test_zvec_config() {
   zvec_config_data_t *config_data = zvec_config_data_create();
   TEST_ASSERT(config_data != NULL);
   if (config_data) {
+    TEST_ASSERT(
+        strcmp(zvec_config_data_get_temporary_directory(config_data), "") == 0);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(
+                    config_data, "host-cache") == ZVEC_OK);
+    TEST_ASSERT(strcmp(zvec_config_data_get_temporary_directory(config_data),
+                       "host-cache") == 0);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(config_data, NULL) ==
+                ZVEC_ERROR_INVALID_ARGUMENT);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(NULL, "") ==
+                ZVEC_ERROR_INVALID_ARGUMENT);
+    TEST_ASSERT(zvec_config_data_set_temporary_directory(config_data, "") ==
+                ZVEC_OK);
     // Test initial values
     TEST_ASSERT(zvec_config_data_get_log_type(config_data) ==
                 ZVEC_LOG_TYPE_CONSOLE);
@@ -355,6 +360,9 @@ void test_zvec_config() {
 void test_zvec_initialize() {
   TEST_START();
 
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_BACKGROUND) ==
+              ZVEC_ERROR_FAILED_PRECONDITION);
+
   zvec_config_data_t *config = zvec_config_data_create();
   TEST_ASSERT(config != NULL);
   if (config) {
@@ -363,6 +371,23 @@ void test_zvec_initialize() {
   zvec_error_code_t err = zvec_initialize(config);
   TEST_ASSERT(err == ZVEC_OK);
   TEST_ASSERT(zvec_is_initialized());
+  TEST_ASSERT(zvec_set_memory_pressure((zvec_memory_pressure_t)99) ==
+              ZVEC_ERROR_INVALID_ARGUMENT);
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_BACKGROUND) == ZVEC_OK);
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+  zvec_float_array_t *denied = zvec_float_array_create(4);
+  const bool rejected = denied == NULL;
+  zvec_error_details_t details = {0};
+  zvec_error_code_t detail_status = zvec_get_last_error_details(&details);
+  const zvec_error_code_t allocation_error = details.code;
+  TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+  if (denied) zvec_float_array_destroy(denied);
+  TEST_ASSERT(rejected);
+  TEST_ASSERT(detail_status == ZVEC_OK);
+  TEST_ASSERT(allocation_error == ZVEC_ERROR_RESOURCE_EXHAUSTED);
+  zvec_float_array_t *retried = zvec_float_array_create(4);
+  TEST_ASSERT(retried != NULL);
+  zvec_float_array_destroy(retried);
 
   TEST_END();
 }
@@ -416,7 +441,6 @@ void test_schema_basic_operations(void) {
   TEST_ASSERT(indexed_field != NULL);
   TEST_ASSERT(strcmp(zvec_field_schema_get_name(indexed_field), "id") == 0);
   // Clean up field names
-  for (size_t i = 0; i < field_count; i++) zvec_free((char *)field_names[i]);
   zvec_free(field_names);
 
   // Test 6: Adding multiple fields (use individual add_field calls)
@@ -842,14 +866,18 @@ void test_collection_schema_helpers(void) {
     // Test get_all_field_names
     const char **names = NULL;
     size_t name_count = 0;
+    TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_CRITICAL) == ZVEC_OK);
+    names = (const char **)1;
+    name_count = 123;
+    zvec_error_code_t denied =
+        zvec_collection_schema_get_all_field_names(schema, &names, &name_count);
+    TEST_ASSERT(zvec_set_memory_pressure(ZVEC_MEMORY_PRESSURE_NORMAL) == ZVEC_OK);
+    TEST_ASSERT(denied == ZVEC_ERROR_RESOURCE_EXHAUSTED);
+    TEST_ASSERT(names == NULL && name_count == 0);
     zvec_error_code_t err =
         zvec_collection_schema_get_all_field_names(schema, &names, &name_count);
     TEST_ASSERT(err == ZVEC_OK);
     TEST_ASSERT(name_count == 3);
-    // Free the strings (caller owns them)
-    for (size_t i = 0; i < name_count; i++) {
-      zvec_free((char *)names[i]);
-    }
     zvec_free(names);
 
     // Test get_forward_fields

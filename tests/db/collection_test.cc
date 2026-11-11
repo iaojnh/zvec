@@ -30,6 +30,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "../ailego/buffer/pool_payload_budget.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -69,7 +70,7 @@ std::string col_path = "test_collection";
 class CollectionTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    zvec::ailego::MemoryLimitPool::get_instance().init(2 * 1024ll * 1024ll *
+    zvec::ailego::PoolPayloadBudget::get_instance().init(2 * 1024ll * 1024ll *
                                                        1024ll);
     FileHelper::RemoveDirectory(col_path);
   }

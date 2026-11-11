@@ -16,9 +16,11 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <ailego/pattern/defer.h>
 #include <roaring.hh>
 #include <arrow/compute/api_vector.h>
 #include <arrow/type_fwd.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/config.h>
 #include <zvec/db/status.h>
@@ -34,11 +36,13 @@
 #include "db/index/column/fts_column/fts_rocksdb_reducer.h"
 #include "db/index/column/fts_column/fts_types.h"
 #include "db/index/column/inverted_column/inverted_indexer.h"
+#include "db/index/column/inverted_column/inverted_write_memory.h"
 #include "db/index/column/vector_column/engine_helper.hpp"
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/common/index_filter.h"
 #include "db/index/common/meta.h"
 #include "db/index/storage/forward_writer.h"
+#include "db/index/storage/parquet_memory_pool.h"
 #include "zvec/ailego/container/params.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_meta.h"
@@ -80,19 +84,56 @@ Status SegmentHelper::Execute(SegmentTask::Ptr &task) {
   return s;
 }
 
-class RowIdFilter : public IndexFilter {
+class SegmentHelper::CompactionDeleteRows : public IndexFilter {
  public:
-  // Copies the bitmap so callers can keep using it (e.g. share with FTS
-  // reduce).
-  explicit RowIdFilter(const roaring::Roaring &delete_row_id_bitmap)
-      : delete_row_id_bitmap_(delete_row_id_bitmap) {}
+  // Scan order is increasing, so only the current high-16-bit container can
+  // grow. Keep the previous containers charged while building the next one.
+  void add(uint32_t position) {
+    const uint32_t group = position >> 16;
+    if (group != group_) {
+      if (rows_ <= kArrayRows) {
+        active_.retain_at_most(kContainerOverhead +
+                               2 * sizeof(uint16_t) * admitted_rows_);
+      }
+      previous_.absorb(std::move(active_));
+      active_.add(kContainerOverhead);
+      group_ = group;
+      rows_ = 0;
+      admitted_rows_ = 0;
+    }
+    if (rows_ == admitted_rows_ && admitted_rows_ < kArrayRows) {
+      const uint32_t next = admitted_rows_ ? 2 * admitted_rows_ : 8;
+      // Charge both allocations during array growth and leave room for the
+      // eventual conversion from an array to a bitset.
+      active_.add_array(next - admitted_rows_, 4 * sizeof(uint16_t));
+      admitted_rows_ = next;
+    }
+    bitmap_.add(position);
+    if (++rows_ == kArrayRows + 1) {
+      active_.retain_at_most(kContainerOverhead + kBitsetBytes);
+    }
+  }
 
   bool is_filtered(uint64_t id) const override {
-    return delete_row_id_bitmap_.contains(id);
+    return id <= UINT32_MAX && bitmap_.contains(static_cast<uint32_t>(id));
+  }
+
+  const roaring::Roaring &bitmap() const {
+    return bitmap_;
   }
 
  private:
-  roaring::Roaring delete_row_id_bitmap_;
+  // CRoaring inserts into an array up to 4096 entries, then uses a 64K-bit
+  // bitset. The overhead includes container objects and directory growth.
+  static constexpr uint32_t kArrayRows = 4096;
+  static constexpr size_t kBitsetBytes = (1UL << 16) / 8;
+  static constexpr size_t kContainerOverhead = 256;
+  ailego::MemoryReservation previous_;
+  ailego::MemoryReservation active_;
+  roaring::Roaring bitmap_;
+  uint32_t group_ = UINT32_MAX;
+  uint32_t rows_ = 0;
+  uint32_t admitted_rows_ = 0;
 };
 
 Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
@@ -117,43 +158,45 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
     return Status::InternalError("Create directory failed: %s",
                                  output_segment_path.c_str());
   }
+  bool output_ready = false;
+  AILEGO_DEFER([&] {
+    if (!output_ready) FileHelper::RemoveDirectory(output_segment_path);
+  });
 
   std::function<BlockID()> block_id_generator =
       [block_id = BlockID{0}]() mutable { return block_id++; };
 
   // iterate every doc, build forward and invert indexer
-  roaring::Roaring delete_row_id_bitmap;
+  auto delete_rows = std::make_shared<CompactionDeleteRows>();
   uint64_t min_doc_id{std::numeric_limits<uint64_t>::max()};
   uint64_t max_doc_id{0};
   uint32_t doc_count{0};
   std::vector<BlockMeta> block_metas;
   Status s = ReduceScalar(schema, input_segments, output_segment_path, columns,
                           filter, task.forward_use_parquet_, block_id_generator,
-                          &delete_row_id_bitmap, &block_metas, &min_doc_id,
+                          delete_rows.get(), &block_metas, &min_doc_id,
                           &max_doc_id, &doc_count);
   CHECK_RETURN_STATUS(s);
 
   if (doc_count == 0) {
-    FileHelper::RemoveDirectory(output_segment_path);
     return Status::OK();
   }
 
   // An empty bitmap means forward rows were retained. Leave the filter null
   // so vector merging can skip delete checks and reuse compatible indexes.
-  std::shared_ptr<RowIdFilter> row_id_filter;
-  if (!delete_row_id_bitmap.isEmpty()) {
-    row_id_filter = std::make_shared<RowIdFilter>(delete_row_id_bitmap);
-  }
+  IndexFilter::Ptr row_id_filter =
+      delete_rows->bitmap().isEmpty() ? nullptr : delete_rows;
 
   s = ReduceVectorIndex(schema, input_segments, output_segment_path,
                         row_id_filter, block_id_generator, min_doc_id,
-                        max_doc_id, doc_count, task.concurrency_, &block_metas);
+                        max_doc_id, doc_count, task.enable_mmap_,
+                        task.concurrency_, &block_metas);
   CHECK_RETURN_STATUS(s);
 
   LOG_INFO("Compacted vector index");
 
   s = ReduceFts(schema, input_segments, output_segment_path,
-                delete_row_id_bitmap, block_id_generator, &block_metas);
+                delete_rows->bitmap(), block_id_generator, &block_metas);
   CHECK_RETURN_STATUS(s);
 
   LOG_INFO("Compacted fts index");
@@ -167,6 +210,7 @@ Status SegmentHelper::ExecuteCompactTask(CompactTask &task) {
   }
   new_segment_meta->set_indexed_vector_fields(indexed_vector_fields);
   task.output_segment_meta_ = new_segment_meta;
+  output_ready = true;
 
   return Status::OK();
 }
@@ -177,7 +221,7 @@ Status SegmentHelper::ReduceScalar(
     const std::string &output_segment_path,
     const std::vector<std::string> &columns, const IndexFilter::Ptr &filter,
     bool forward_use_parquet, std::function<BlockID()> &block_id_generator,
-    roaring::Roaring *delete_row_id_bitmap,
+    CompactionDeleteRows *delete_rows,
     std::vector<BlockMeta> *output_block_metas, uint64_t *min_doc_id,
     uint64_t *max_doc_id, uint32_t *doc_count) {
   // forward
@@ -220,6 +264,16 @@ Status SegmentHelper::ReduceScalar(
 
   uint32_t row_id_offset{0U};
   *doc_count = 0;
+  auto *pool = forward_use_parquet ? detail::GetParquetMemoryPool().get()
+                                   : arrow::default_memory_pool();
+  auto read_or_write_error = [](const char *operation,
+                               const arrow::Status &status) {
+    if (status.IsOutOfMemory()) {
+      return Status(StatusCode::RESOURCE_EXHAUSTED,
+                    std::string(operation) + status.message());
+    }
+    return Status::InternalError(operation, status.message());
+  };
 
   std::vector<std::string> all_reduce_columns{GLOBAL_DOC_ID, USER_ID};
   for (auto &column : columns) {
@@ -235,8 +289,7 @@ Status SegmentHelper::ReduceScalar(
     while (true) {
       auto batch = reader->Next();
       if (!batch.ok()) {
-        return Status::InternalError("reader next failed: ",
-                                     batch.status().message());
+        return read_or_write_error("reader next failed: ", batch.status());
       }
 
       auto batch_value = batch.ValueOrDie();
@@ -246,14 +299,16 @@ Status SegmentHelper::ReduceScalar(
       }
 
       if (batch_value->num_rows() == 0) continue;
+      if (batch_value->num_rows() > UINT32_MAX - row_id_offset) {
+        return Status::InvalidArgument("Too many rows in a compacted segment");
+      }
 
       std::shared_ptr<arrow::RecordBatch> filtered_batch;
       auto as =
           FilterRecordBatch(batch_value, filter, row_id_offset, &filtered_batch,
-                            delete_row_id_bitmap, min_doc_id, max_doc_id);
+                            delete_rows, min_doc_id, max_doc_id, pool);
       if (!as.ok()) {
-        return Status::InternalError("filter record batch failed: ",
-                                     as.message());
+        return read_or_write_error("filter record batch failed: ", as);
       }
 
       row_id_offset += batch_value->num_rows();
@@ -265,12 +320,13 @@ Status SegmentHelper::ReduceScalar(
       // forward
       as = forward_writer->insert_batch(filtered_batch);
       if (!as.ok()) {
-        return Status::InternalError("writer insert failed: ", as.message());
+        return read_or_write_error("writer insert failed: ", as);
       }
 
       // invert index
       if (invert_indexer) {
-        auto s = ReduceScalarIndex(invert_indexer, filtered_batch, *doc_count);
+        auto s = ReduceScalarIndex(invert_indexer, filtered_batch, *doc_count,
+                                   forward_use_parquet);
         CHECK_RETURN_STATUS(s);
       }
 
@@ -286,7 +342,7 @@ Status SegmentHelper::ReduceScalar(
   // flush forward
   auto as = forward_writer->finalize();
   if (!as.ok()) {
-    return Status::InternalError("writer finalize failed: ", as.message());
+    return read_or_write_error("writer finalize failed: ", as);
   }
 
   BlockMeta forward_meta;
@@ -320,7 +376,8 @@ Status SegmentHelper::ReduceScalar(
 
 Status SegmentHelper::ReduceScalarIndex(
     InvertedIndexer::Ptr invert_indexer,
-    const std::shared_ptr<arrow::RecordBatch> &batch, uint32_t doc_id_offset) {
+    const std::shared_ptr<arrow::RecordBatch> &batch, uint32_t doc_id_offset,
+    bool budgeted) try {
   auto a_schema = batch->schema();
   int num_columns = batch->num_columns();
 
@@ -481,6 +538,22 @@ Status SegmentHelper::ReduceScalarIndex(
 
           int32_t start_offset = typed_offsets->Value(j);
           int32_t end_offset = typed_offsets->Value(j + 1);
+          ailego::MemoryReservation workspace;
+          if (budgeted) {
+            const size_t count = end_offset - start_offset;
+            if (value_type_id == arrow::Type::BOOL) {
+              workspace.add((count + 7) / 8 * 3 + 64);
+            } else {
+              size_t bytes = detail::BindingMemoryBytes(count, sizeof(double));
+              if (value_type_id == arrow::Type::STRING) {
+                const auto &strings =
+                    static_cast<const arrow::StringArray &>(*value_array);
+                bytes = strings.value_offset(end_offset) -
+                        strings.value_offset(start_offset);
+              }
+              workspace.add(detail::InvertedArrayWriteBytes(count, bytes));
+            }
+          }
 
           switch (value_type_id) {
             case arrow::Type::BOOL: {
@@ -630,6 +703,9 @@ Status SegmentHelper::ReduceScalarIndex(
   }
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient inverted array compaction workspace budget");
 }
 
 Status SegmentHelper::ReduceVectorIndex(
@@ -637,7 +713,7 @@ Status SegmentHelper::ReduceVectorIndex(
     const std::vector<Segment::Ptr> &input_segments,
     const std::string &output_segment_path, const IndexFilter::Ptr &filter,
     std::function<BlockID()> &block_id_generator, uint64_t min_doc_id,
-    uint64_t max_doc_id, uint32_t doc_count, int concurrency,
+    uint64_t max_doc_id, uint32_t doc_count, bool enable_mmap, int concurrency,
     std::vector<BlockMeta> *output_block_metas) {
   Status s;
 
@@ -668,7 +744,7 @@ Status SegmentHelper::ReduceVectorIndex(
       s = MergeWithOptionalReuse(
           vector_index_path, *field,
           collect_merge_indexers(&Segment::get_vector_indexer), filter,
-          concurrency, nullptr);
+          enable_mmap, concurrency, nullptr);
       CHECK_RETURN_STATUS(s);
 
       BlockMeta new_block_meta;
@@ -695,7 +771,7 @@ Status SegmentHelper::ReduceVectorIndex(
       s = MergeWithOptionalReuse(
           vector_index_path, *field_without_quantize,
           collect_merge_indexers(&Segment::get_vector_indexer), filter,
-          concurrency,
+          enable_mmap, concurrency,
           vector_index_params->type() == IndexType::IVF ? nullptr
                                                         : &vector_indexer);
       CHECK_RETURN_STATUS(s);
@@ -741,8 +817,8 @@ Status SegmentHelper::ReduceVectorIndex(
               : collect_merge_indexers(&Segment::get_vector_indexer);
 
       s = MergeWithOptionalReuse(vector_quan_index_path, *field_for_quantize,
-                                 quant_merge_sources, filter, concurrency,
-                                 nullptr);
+                                 quant_merge_sources, filter, enable_mmap,
+                                 concurrency, nullptr);
       CHECK_RETURN_STATUS(s);
 
       if (vector_indexer != nullptr) {
@@ -808,11 +884,15 @@ bool CanReuseFirstIndexer(const std::vector<VectorColumnIndexer::Ptr> &indexers,
 Status SegmentHelper::MergeWithOptionalReuse(
     const std::string &output_index_path, const FieldSchema &index_field,
     std::vector<VectorColumnIndexer::Ptr> source_indexers,
-    const IndexFilter::Ptr &filter, int concurrency,
+    const IndexFilter::Ptr &filter, bool enable_mmap, int concurrency,
     VectorColumnIndexer::Ptr *merged_indexer) {
   vector_column_params::MergeOptions merge_options;
   if (concurrency == 0) {
     merge_options.pool = GlobalResource::Instance().optimize_thread_pool();
+    if (merge_options.pool == nullptr) {
+      return Status::InternalError(
+          "Optimize thread pool initialization failed");
+    }
     merge_options.write_concurrency =
         static_cast<uint32_t>(merge_options.pool->count());
   } else {
@@ -823,7 +903,12 @@ Status SegmentHelper::MergeWithOptionalReuse(
   bool reused_base_index = false;
   Status s;
 
-  if (CanReuseFirstIndexer(source_indexers, index_field, filter)) {
+  // BufferStorage currently treats opening an existing file as read-only.
+  // Until writable reopen is explicit in IndexStorage::open(), rebuilding a
+  // BufferStorage target is the only way to keep every build page charged to
+  // MemoryLimitPool without silently falling back to mmap.
+  if (enable_mmap &&
+      CanReuseFirstIndexer(source_indexers, index_field, filter)) {
     const auto &first_indexer = source_indexers.front();
     LOG_INFO(
         "Reusing first indexer as merge base. "
@@ -833,7 +918,8 @@ Status SegmentHelper::MergeWithOptionalReuse(
     if (FileHelper::CopyFile(first_indexer->index_file_path(),
                              output_index_path)) {
       // Open the copied file in-place (create_new=false).
-      s = vector_indexer->open(vector_column_params::ReadOptions{true, false});
+      s = vector_indexer->open(
+          vector_column_params::ReadOptions{enable_mmap, false});
       CHECK_RETURN_STATUS(s);
 
       source_indexers.erase(source_indexers.begin());
@@ -848,7 +934,8 @@ Status SegmentHelper::MergeWithOptionalReuse(
   }
 
   if (!reused_base_index) {
-    s = vector_indexer->open(vector_column_params::ReadOptions{true, true});
+    s = vector_indexer->open(
+        vector_column_params::ReadOptions{enable_mmap, true});
     CHECK_RETURN_STATUS(s);
 
     s = vector_indexer->merge(source_indexers, filter, merge_options);
@@ -948,8 +1035,8 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     const std::shared_ptr<arrow::RecordBatch> &batch,
     const IndexFilter::Ptr filter, uint32_t row_id_offset,
     std::shared_ptr<arrow::RecordBatch> *filterd,
-    roaring::Roaring *delete_row_id_bitmap, uint64_t *min_doc_id,
-    uint64_t *max_doc_id) {
+    CompactionDeleteRows *delete_rows, uint64_t *min_doc_id,
+    uint64_t *max_doc_id, arrow::MemoryPool *pool) {
   if (!filter) {
     *filterd = batch;
     for (int64_t i = 0; i < batch->num_rows(); ++i) {
@@ -966,7 +1053,7 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     return arrow::Status::OK();
   }
 
-  std::vector<uint64_t> selected_indices;
+  arrow::UInt64Builder builder(pool);
   for (int64_t i = 0; i < batch->num_rows(); ++i) {
     auto result = batch->column(0)->GetScalar(i);
     if (!result.ok()) {
@@ -975,33 +1062,38 @@ arrow::Status SegmentHelper::FilterRecordBatch(
     uint64_t doc_id =
         std::dynamic_pointer_cast<arrow::UInt64Scalar>(*result)->value;
     if (!filter->is_filtered(doc_id)) {
-      selected_indices.push_back(i);
+      ARROW_RETURN_NOT_OK(builder.Append(i));
       *min_doc_id = std::min(*min_doc_id, doc_id);
       *max_doc_id = std::max(*max_doc_id, doc_id);
     } else {
-      delete_row_id_bitmap->add(i + row_id_offset);
+      try {
+        delete_rows->add(i + row_id_offset);
+      } catch (const std::bad_alloc &) {
+        return arrow::Status::OutOfMemory(
+            "Compaction deletion bitmap exceeds budget");
+      }
     }
   }
 
-  if (selected_indices.empty()) {
+  if (builder.length() == 0) {
     return arrow::Status::OK();
   }
 
-  arrow::UInt64Builder builder;
-  ARROW_RETURN_NOT_OK(builder.AppendValues(selected_indices));
   std::shared_ptr<arrow::Array> selection_array;
   ARROW_RETURN_NOT_OK(builder.Finish(&selection_array));
 
   std::vector<std::shared_ptr<arrow::Array>> filtered_columns;
+  arrow::compute::ExecContext ctx(pool);
   for (int i = 0; i < batch->num_columns(); ++i) {
     arrow::Datum out;
     ARROW_ASSIGN_OR_RAISE(
-        out, arrow::compute::Take(batch->column(i), selection_array));
+        out, arrow::compute::Take(batch->column(i), selection_array,
+                                  arrow::compute::TakeOptions::Defaults(), &ctx));
     filtered_columns.push_back(out.make_array());
   }
 
   auto filtered_batch = arrow::RecordBatch::Make(
-      batch->schema(), static_cast<int64_t>(selected_indices.size()),
+      batch->schema(), selection_array->length(),
       filtered_columns);
 
   *filterd = filtered_batch;
@@ -1047,7 +1139,7 @@ Status SegmentHelper::ReduceFts(const CollectionSchema::Ptr &schema,
   auto dst_ctx = std::make_shared<RocksdbContext>();
   Status s = dst_ctx->create(
       RocksdbContext::Args{dst_fts_path, cf_names, nullptr, per_cf_merge_ops,
-                           /*enable_hash_skiplist=*/true});
+                           /*enable_prefix_extractor=*/true});
   if (!s.ok()) {
     LOG_ERROR("ReduceFts: create destination FTS RocksDB failed at [%s]: %s",
               dst_fts_path.c_str(), s.message().c_str());

@@ -17,14 +17,17 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rabitqlib/fastscan/data_layout.hpp>
 #include <rabitqlib/fastscan/query.hpp>
 #include "algorithm/hnsw_rabitq/rabitq_utils.h"
+#include "utility/utility_params.h"
 #include "zvec/ailego/container/params.h"
 #include "zvec/ailego/logger/logger.h"
 #include "zvec/ailego/utility/file_helper.h"
@@ -40,6 +43,7 @@
 #include "ivf_rabitq_util.h"
 #include "rabitq_converter.h"
 #include "rabitq_params.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace std;
 using namespace zvec::ailego;
@@ -400,6 +404,17 @@ TEST_F(IvfRabitqStreamerTest, TestRejectInvalidFormatMagicAndVersion) {
   IvfRabitqEntity invalid_version_entity;
   EXPECT_EQ(IndexError_InvalidFormat, invalid_version_entity.load(storage));
 
+  // A rejected load must release its partially constructed entity and storage
+  // ownership, and leave the same streamer ready to retry.
+  IvfRabitqStreamer streamer;
+  ASSERT_EQ(0, streamer.init(*index_meta_ptr_, params));
+  const auto owners = storage.use_count();
+  EXPECT_EQ(IndexError_InvalidFormat, streamer.open(storage));
+  EXPECT_EQ(owners, storage.use_count());
+  header->version = kIvfRabitqIndexVersion;
+  ASSERT_EQ(0, streamer.open(storage));
+  EXPECT_EQ(0, streamer.close());
+
   ASSERT_EQ(0, storage->close());
   IndexMemory::Instance()->remove(file_id);
 }
@@ -657,7 +672,7 @@ TEST_F(IvfRabitqStreamerTest, TestProbeCentroidsUseAssignmentMetric) {
   FillTestVector(71, &query_vec);
 
   uint32_t assigned = reformer->find_nearest_centroid(query_vec.data());
-  std::vector<uint32_t> probe_centroids;
+  ailego::BudgetedVector<uint32_t> probe_centroids;
   ASSERT_EQ(0, reformer->select_probe_centroids(query_vec.data(), 1,
                                                 &probe_centroids));
   ASSERT_EQ(1UL, probe_centroids.size());
@@ -709,7 +724,7 @@ TEST_F(IvfRabitqStreamerTest, TestCosineProbeCentroidsUseInnerProductMetric) {
   const float *query =
       reinterpret_cast<const float *>(transformed_query.data());
   uint32_t assigned = reformer->find_nearest_centroid(query);
-  std::vector<uint32_t> probe_centroids;
+  ailego::BudgetedVector<uint32_t> probe_centroids;
   ASSERT_EQ(0, reformer->select_probe_centroids(query, 1, &probe_centroids));
   ASSERT_EQ(1UL, probe_centroids.size());
   EXPECT_EQ(assigned, probe_centroids[0]);
@@ -737,7 +752,7 @@ TEST_F(IvfRabitqStreamerTest,
   IvfRabitqQueryState state;
   ASSERT_EQ(0, reformer->create_query_state(query.data(), &state));
 
-  std::vector<IvfRabitqProbeCentroid> probes;
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> probes;
   ASSERT_EQ(0,
             reformer->select_probe_centroids(query.data(), 3, &state, &probes));
   ASSERT_EQ(3UL, probes.size());
@@ -775,14 +790,14 @@ TEST_F(IvfRabitqStreamerTest,
     EXPECT_EQ(expected[i].second, probes[i].id);
   }
 
-  std::vector<uint32_t> legacy_ids;
+  ailego::BudgetedVector<uint32_t> legacy_ids;
   ASSERT_EQ(0, reformer->select_probe_centroids(query.data(), 3, &legacy_ids));
   ASSERT_EQ(probes.size(), legacy_ids.size());
   for (size_t i = 0; i < probes.size(); ++i) {
     EXPECT_EQ(probes[i].id, legacy_ids[i]);
   }
 
-  std::vector<IvfRabitqProbeCentroid> single_probe;
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> single_probe;
   ASSERT_EQ(0, reformer->select_probe_centroids(query.data(), 1, &state,
                                                 &single_probe));
   ASSERT_EQ(1UL, single_probe.size());
@@ -831,7 +846,7 @@ TEST_F(IvfRabitqStreamerTest, TestL2ProbeCarriesCoarseResidualNorm) {
   IvfRabitqQueryState state;
   ASSERT_EQ(0, reformer->create_query_state(query.data(), &state));
 
-  std::vector<IvfRabitqProbeCentroid> probes;
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> probes;
   ASSERT_EQ(0,
             reformer->select_probe_centroids(query.data(), 4, &state, &probes));
   ASSERT_EQ(4UL, probes.size());

@@ -18,6 +18,7 @@
 #include <string>
 #include <roaring/roaring.h>
 #include <rocksdb/slice.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include "db/common/rocksdb_context.h"
 #include "fts_doc_iterator.h"
 #include "../bm25_scorer.h"
@@ -96,6 +97,10 @@ class TermDocIterator : public DocIterator {
     return max_score_val_;
   }
 
+  void retain_workspace(ailego::MemoryReservation memory) {
+    workspace_ = std::move(memory);
+  }
+
   // Block-Max WAND support (only effective in BitPacked mode)
   BlockMaxInfo block_max_info_for(uint32_t target) const override;
 
@@ -107,6 +112,8 @@ class TermDocIterator : public DocIterator {
   uint32_t read_doc_len(uint32_t doc_id) const;
 
  private:
+  // Declared before owned storage; released after the bitmap and pins.
+  ailego::MemoryReservation workspace_;
   enum class Mode { ROARING, BITPACKED };
   Mode mode_;
 

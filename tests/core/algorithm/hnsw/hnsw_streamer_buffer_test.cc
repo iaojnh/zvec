@@ -13,6 +13,8 @@
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_streamer.h>
 #include "tests/test_util.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
+#include "algorithm/hnsw/hnsw_entity.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -25,7 +27,7 @@ using namespace std;
 
 constexpr size_t static dim = 16;
 
-class HnswStreamerTest : public testing::Test {
+class HnswStreamerTest : public ::testing::Test {
  protected:
   void SetUp() override;
   void TearDown() override;
@@ -90,6 +92,10 @@ TEST_F(HnswStreamerTest, LegacyReadsReleaseStorageBeforeThreadExit) {
     ASSERT_EQ(id, inserted);
   }
 
+  const node_id_t probe_ids[]{0, 1, 2};
+  zvec::ailego::BudgetedVector<const void *> probe_views;
+  EXPECT_FALSE(entity->try_get_resident_vectors(probe_ids, 3, probe_views));
+
   // Both legacy adapters used to retain owning MemoryBlocks in TLS. Exercise
   // both on this still-running thread, including the resident-page path.
   const auto *single = static_cast<const float *>(entity->get_vector(1));
@@ -138,7 +144,7 @@ TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {
     mutable std::vector<uint64_t> requested_keys;
   };
 
-  MemoryLimitPool::get_instance().init(64UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(64UL * 1024UL * 1024UL);
   auto storage = IndexFactory::CreateStorage("BufferStorage");
   ASSERT_NE(nullptr, storage);
   ASSERT_EQ(0, storage->init(Params()));
@@ -221,7 +227,7 @@ TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {
 }
 
 TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   constexpr uint32_t kDocCount = 128;
   const std::string path = dir_ + "SearchDispatch";
   Params params;
@@ -266,8 +272,26 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
   ASSERT_NE(nullptr, ctx);
   auto *hnsw_ctx = dynamic_cast<HnswContext *>(ctx.get());
   ASSERT_NE(nullptr, hnsw_ctx);
+  EXPECT_EQ(VisitFilter::EpochBitMap, hnsw_ctx->visit_filter().get_mode());
   ASSERT_NE(nullptr, dynamic_cast<const HnswBufferPoolStreamerEntity *>(
                          &hnsw_ctx->get_entity()));
+  const auto *buffer_entity = dynamic_cast<const HnswBufferPoolStreamerEntity *>(
+      &hnsw_ctx->get_entity());
+  ASSERT_NE(nullptr, buffer_entity);
+  node_id_t batch_ids[kDocCount];
+  for (node_id_t id = 0; id < kDocCount; ++id) batch_ids[id] = id;
+  zvec::ailego::BudgetedVector<BufferPoolMemoryBlock> warm_blocks;
+  ASSERT_EQ(0, buffer_entity->get_vector_typed(batch_ids, kDocCount, warm_blocks));
+  warm_blocks.clear();
+  zvec::ailego::BudgetedVector<const void *> batch_views;
+  ASSERT_TRUE(buffer_entity->try_get_resident_vectors(
+      batch_ids, kDocCount, batch_views));
+  for (node_id_t id = 0; id < kDocCount; ++id)
+    for (size_t j = 0; j < dim; ++j)
+      EXPECT_FLOAT_EQ(static_cast<float>(id),
+                      static_cast<const float *>(batch_views[id])[j]);
+  buffer_entity->resident_vector_batch().release();
+
   ctx->set_topk(3);
   for (size_t j = 0; j < dim; ++j) {
     vector[j] = 64.1f;
@@ -275,11 +299,25 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
 
   const bool expect_block =
       zvec::ailego::internal::CpuFeatures::static_flags_.AVX2;
-  for (const auto mode :
-       {VisitFilter::ByteMap, VisitFilter::BitMap, VisitFilter::BloomFilter}) {
+  for (const auto mode : {VisitFilter::ByteMap, VisitFilter::EpochBitMap,
+                          VisitFilter::BitMap, VisitFilter::BloomFilter}) {
     SCOPED_TRACE(static_cast<int>(mode));
     ASSERT_EQ(0,
               hnsw_ctx->visit_filter().init(mode, kDocCount, kDocCount, 1e-9f));
+    if (mode == VisitFilter::BitMap) {
+      auto &filter = hnsw_ctx->visit_filter();
+      filter.set_visited(17);
+      {
+        MemoryReservation pressure;
+        pressure.add(PoolPayloadBudget::get_instance().available());
+        EXPECT_FALSE(hnsw_ctx->check_need_adjuct_ctx(1000000));
+        EXPECT_FALSE(hnsw_ctx->check_need_adjuct_ctx(1000000));
+        EXPECT_TRUE(filter.visited(17));
+      }
+      ASSERT_TRUE(hnsw_ctx->check_need_adjuct_ctx(1000000));
+      filter.set_visited(999999);
+      EXPECT_TRUE(filter.visited(999999));
+    }
     // Use the same context for pool -> filtered heap -> pool, ensuring both
     // query-boundary dispatch and result export retain the chosen backend.
     for (int phase = 0; phase < 3; ++phase) {
@@ -316,7 +354,7 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
 }
 
 TEST_F(HnswStreamerTest, TestHnswSearch) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_TRUE(write_streamer != nullptr);
@@ -515,7 +553,7 @@ TEST_F(HnswStreamerTest, TestHnswSearch) {
 }
 
 TEST_F(HnswStreamerTest, TestHnswSearchBuffer) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_TRUE(write_streamer != nullptr);
@@ -639,7 +677,7 @@ TEST_F(HnswStreamerTest, TestHnswSearchBuffer) {
 }
 
 TEST_F(HnswStreamerTest, TestWideMConcurrentBuildBuffer) {
-  MemoryLimitPool::get_instance().init(512UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(512UL * 1024UL * 1024UL);
   auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_NE(nullptr, streamer);
 
@@ -713,7 +751,7 @@ TEST_F(HnswStreamerTest, TestWideMConcurrentBuildBuffer) {
 }
 
 TEST_F(HnswStreamerTest, TestHnswSearchBufferMMap) {
-  MemoryLimitPool::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
+  PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   IndexStreamer::Pointer write_streamer =
       IndexFactory::CreateStreamer("HnswStreamer");
   ASSERT_TRUE(write_streamer != nullptr);

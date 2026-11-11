@@ -14,9 +14,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <arrow/acero/api.h>
 #include <arrow/chunked_array.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/status.h>
 #include "db/index/column/inverted_column/inverted_search_result.h"
 #include "db/index/common/index_filter.h"
@@ -44,11 +46,18 @@ class DocFilter : public IndexFilter {
 
   bool is_filtered(uint64_t id) const override;
 
+  // IndexFilter callbacks cannot return errors. Recall checks this after
+  // workers finish, so a failed forward lookup never publishes partial hits.
+  Status status() const;
+
   //! When invert cardinality <= \p ratio * doc_count, extract the ids and
   //! clear invert_filter_ so the caller drives evaluation by ids instead of
   //! bitmap-checking. Ratio is per-caller (vector vs FTS use different
   //! GlobalConfig knobs) because per-candidate cost differs.
-  std::optional<std::vector<uint64_t>> get_bf_by_keys_and_update(float ratio);
+  //! The caller keeps keys_memory until the returned ids are released. If
+  //! admission fails, keep the bitmap filter and skip this optimization.
+  std::optional<std::vector<uint64_t>> get_bf_by_keys_and_update(
+      float ratio, ailego::MemoryReservation &keys_memory);
 
   bool empty() const;
 
@@ -69,6 +78,7 @@ class DocFilter : public IndexFilter {
   IndexFilter::Ptr invert_filter_{nullptr};
 
   std::shared_ptr<arrow::ChunkedArray> forward_bitmap_;
+  mutable std::atomic<StatusCode> error_{StatusCode::OK};
 };
 
 }  // namespace zvec::sqlengine

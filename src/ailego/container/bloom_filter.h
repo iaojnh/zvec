@@ -15,6 +15,8 @@
 #pragma once
 
 #include <cmath>
+#include <cstring>
+#include <memory>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/utility/type_helper.h>
 
@@ -105,7 +107,7 @@ struct BloomFilterCalculator {
 
 /*! Bloom Filter
  */
-template <size_t K>
+template <size_t K, typename Allocator = std::allocator<uint32_t>>
 class BloomFilter {
  public:
   //! Constructor
@@ -118,14 +120,16 @@ class BloomFilter {
       bits_count_ = BloomFilterCalculator::NumberOfBits(n, K, p);
       bits_count_ = ((bits_count_ + 31) >> 5) << 5;
       probability_ = BloomFilterCalculator::Probability(n, bits_count_, K);
-      bitset_ = new uint32_t[bits_count_ >> 5];
+      bitset_ = std::allocator_traits<Allocator>::allocate(allocator_,
+                                                           bits_count_ >> 5);
       memset(bitset_, 0, (bits_count_ >> 3));
     }
   }
 
   //! Constructor
   BloomFilter(BloomFilter &&rhs)
-      : bitset_(rhs.bitset_),
+      : allocator_(std::move(rhs.allocator_)),
+        bitset_(rhs.bitset_),
         bits_count_(rhs.bits_count_),
         capacity_(rhs.capacity_),
         count_(rhs.count_),
@@ -139,7 +143,9 @@ class BloomFilter {
 
   //! Destructor
   ~BloomFilter() {
-    delete[] bitset_;
+    if (bitset_)
+      std::allocator_traits<Allocator>::deallocate(allocator_, bitset_,
+                                                   bits_count_ >> 5);
   }
 
   //! Test if the filter is valid
@@ -152,17 +158,24 @@ class BloomFilter {
     if (n <= 0 || p <= 0.0 || p >= 1.0) {
       return false;
     }
-    delete[] bitset_;
-    capacity_ = n;
-    count_ = 0u;
-    bits_count_ = BloomFilterCalculator::NumberOfBits(n, K, p);
-    bits_count_ = ((bits_count_ + 31) >> 5) << 5;
-    probability_ = BloomFilterCalculator::Probability(n, bits_count_, K);
-    bitset_ = new (std::nothrow) uint32_t[bits_count_ >> 5];
-    if (!bitset_) {
+    const size_t bits =
+        (BloomFilterCalculator::NumberOfBits(n, K, p) + 31) / 32 * 32;
+    uint32_t *replacement = nullptr;
+    try {
+      replacement =
+          std::allocator_traits<Allocator>::allocate(allocator_, bits >> 5);
+    } catch (const std::bad_alloc &) {
       return false;
     }
-    memset(bitset_, 0, (bits_count_ >> 3));
+    memset(replacement, 0, bits >> 3);
+    if (bitset_)
+      std::allocator_traits<Allocator>::deallocate(allocator_, bitset_,
+                                                   bits_count_ >> 5);
+    bitset_ = replacement;
+    bits_count_ = bits;
+    capacity_ = n;
+    count_ = 0;
+    probability_ = BloomFilterCalculator::Probability(n, bits_count_, K);
     return true;
   }
 
@@ -263,6 +276,7 @@ class BloomFilter {
   }
 
  private:
+  Allocator allocator_{};
   uint32_t *bitset_{nullptr};
   size_t bits_count_{0u};
   size_t capacity_{0u};
@@ -272,8 +286,8 @@ class BloomFilter {
 
 /*! Bloom Filter (Special)
  */
-template <>
-struct BloomFilter<0> {};
+template <typename Allocator>
+struct BloomFilter<0, Allocator> {};
 
 }  // namespace ailego
 }  // namespace zvec

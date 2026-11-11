@@ -335,7 +335,7 @@ class TestQueryExecutor:
         executor = QueryExecutor(schema)
         ctx = QueryContext(topk=5)
         collection = MagicMock()
-        collection.Fetch.return_value = {}
+        collection.FetchTuples.return_value = {}
 
         with pytest.raises(ValueError, match="Document with id 'missing' not found"):
             executor._build_search_query(

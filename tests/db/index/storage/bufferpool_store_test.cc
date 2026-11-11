@@ -11,40 +11,65 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <thread>
 #include <arrow/api.h>
+#include <arrow/io/file.h>
 #include <arrow/result.h>
 #include <arrow/table.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/writer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/external_cache.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
+#include "db/index/storage/fetch_memory.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
+#include "db/index/storage/parquet_buffer_pool.h"
 #include "db/index/storage/bufferpool_forward_store.h"
+#include "db/index/storage/lazy_record_batch_reader.h"
+#include "db/index/storage/parquet_memory_pool.h"
+#include "db/index/storage/parquet_metadata_budget.h"
+#include "db/index/storage/store_helper.h"
 #include "utils/utils.h"
+#include "../../common/memory_budget_test_helper.h"
 
 using namespace zvec;
 
 class BufferPoolStoreTest : public testing::Test {
  protected:
   void SetUp() override {
+    ASSERT_TRUE(detail::MemoryBudgetTestPeer::reset_idle_allowances());
+    // The Parquet cache outlives individual tests. Reusing a file name is not
+    // a new cache identity on every platform, even after deleting the file.
+    // Include an invocation counter so --gtest_repeat is isolated as well.
+    static std::atomic<uint64_t> sequence{0};
+    parquet_path = "bufferpool_store_test_" +
+                   std::to_string(sequence.fetch_add(1)) + ".parquet";
     auto s = test::TestHelper::WriteTestFile(parquet_path, FileFormat::PARQUET);
     if (!s.ok()) {
       std::cout << "err: " << s.message() << std::endl;
       exit(1);
     }
-    zvec::ailego::MemoryLimitPool::get_instance().init(10 * 1024 * 1024);
+    ASSERT_EQ(0, zvec::ailego::PoolPayloadBudget::get_instance().init(
+                     10 * 1024 * 1024));
   }
 
   void TearDown() override {
+    EXPECT_TRUE(detail::MemoryBudgetTestPeer::reset_idle_allowances());
+    // Releasing the last Arrow view only makes a column evictable; deleting
+    // the backing file does not remove its process-wide cached payload.
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1024);
+    EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().external_used());
     if (std::filesystem::exists(parquet_path)) {
       std::filesystem::remove(parquet_path);
     }
   }
-  std::string parquet_path = "test.parquet";
+  std::string parquet_path;
 };
-
 
 TEST_F(BufferPoolStoreTest, ParquetFetch) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
@@ -53,7 +78,6 @@ TEST_F(BufferPoolStoreTest, ParquetFetch) {
   ASSERT_TRUE(table != nullptr);
   EXPECT_EQ(table->num_rows(), 3);
 }
-
 
 TEST_F(BufferPoolStoreTest, ParquetFetchWithSelectColumns) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
@@ -174,6 +198,26 @@ TEST_F(BufferPoolStoreTest, ParquetScan) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
   EXPECT_TRUE(store->open().ok());
   auto reader = store->scan({"id", "name", "score"});
+  ASSERT_NE(nullptr, reader);
+  {
+    auto &pool = ailego::PoolPayloadBudget::get_instance();
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.available());
+    const size_t before = pool.external_used();
+    auto denied = store->fetch_checked({"id"}, {0, 1},
+                                      detail::GetParquetMemoryPool().get());
+    EXPECT_TRUE(denied.status().IsOutOfMemory()) << denied.status().ToString();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    EXPECT_TRUE(reader->ReadNext(&batch).IsOutOfMemory());
+    EXPECT_EQ(nullptr, batch);
+    EXPECT_EQ(before, pool.external_used());
+  }
+  auto recovered = store->fetch_checked({"id"}, {0, 1},
+                                       detail::GetParquetMemoryPool().get());
+  ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
+  EXPECT_EQ(2, (*recovered)->num_rows());
+  reader = store->scan({"id", "name", "score"});
+  ASSERT_NE(nullptr, reader);
   int batch_count = 0;
   int total_rows = 0;
   while (true) {
@@ -274,6 +318,17 @@ TEST_F(BufferPoolStoreTest, ParquetFetchSingleRow) {
   ASSERT_TRUE(batch != nullptr);
   EXPECT_EQ(batch->length, 1);
   EXPECT_EQ(batch->values.size(), 3);
+
+  auto name = std::dynamic_pointer_cast<arrow::StringScalar>(
+      batch->values[1].scalar());
+  ASSERT_NE(nullptr, name);
+  ASSERT_NE(nullptr, name->value);
+  const auto expected_name = name->value->ToString();
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_GT(pool.external_used(), 0u);
+  EXPECT_GT(ailego::BlockEvictionQueue::get_instance().batch_recycle(1024), 0u);
+  EXPECT_EQ(0u, pool.external_used());
+  EXPECT_EQ(expected_name, name->value->ToString());
 
   auto id_scalar = batch->values[0].scalar();
   ASSERT_TRUE(id_scalar != nullptr);
@@ -438,4 +493,37 @@ TEST_F(BufferPoolStoreTest, PhysicSchema) {
   ASSERT_NE(store, nullptr);
   EXPECT_TRUE(store->open().ok());
   EXPECT_NE(store->physic_schema(), nullptr);
+}
+
+TEST_F(BufferPoolStoreTest,
+       ChunkedDecodePreservesNestedFieldsAndFollowingColumns) {
+  arrow::Int64Builder numbers;
+  arrow::StringBuilder labels;
+  ASSERT_TRUE(numbers.AppendValues({10, 20}).ok());
+  ASSERT_TRUE(labels.AppendValues({"first", "second"}).ok());
+  std::shared_ptr<arrow::Array> number_array, label_array;
+  ASSERT_TRUE(numbers.Finish(&number_array).ok());
+  ASSERT_TRUE(labels.Finish(&label_array).ok());
+  auto nested = arrow::StructArray::Make(
+      {number_array, label_array}, std::vector<std::string>{"number", "label"});
+  ASSERT_TRUE(nested.ok());
+  auto schema = arrow::schema({arrow::field("nested", (*nested)->type()),
+                               arrow::field("tail", arrow::int64())});
+  auto table = arrow::Table::Make(schema, {*nested, number_array});
+  auto output = arrow::io::FileOutputStream::Open(parquet_path);
+  ASSERT_TRUE(output.ok());
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
+                                         *output, 2)
+                  .ok());
+  ASSERT_TRUE((*output)->Close().ok());
+  BufferPoolForwardStore store(parquet_path);
+  ASSERT_TRUE(store.open().ok());
+  auto reader = store.scan({"nested", "tail"});
+  ASSERT_NE(nullptr, reader);
+  std::shared_ptr<arrow::RecordBatch> batch;
+  ASSERT_TRUE(reader->ReadNext(&batch).ok());
+  ASSERT_NE(nullptr, batch);
+  ASSERT_EQ(2, batch->num_columns());
+  EXPECT_TRUE(batch->column(0)->Equals(*nested));
+  EXPECT_TRUE(batch->column(1)->Equals(number_array));
 }

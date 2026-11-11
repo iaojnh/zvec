@@ -80,6 +80,19 @@ class IndexReformer : public IndexModule {
     return false;
   }
 
+  using SparseQueryBuffer = std::vector<char, ailego::BudgetedAllocator<char>>;
+
+  // Budget-aware batch conversion. The returned view may alias the original
+  // query when no conversion is needed, or the caller-owned workspace.
+  // Custom reformers must implement this before use with a bounded pool;
+  // falling back to an unaccounted full-batch string would break that budget.
+  virtual int transform_sparse_batch(const uint32_t *, const uint32_t *,
+                                     const void *, const IndexQueryMeta &,
+                                     uint32_t, SparseQueryBuffer *,
+                                     const void **, IndexQueryMeta *) const {
+    return IndexError_NotImplemented;
+  }
+
   virtual int revert(const void * /*in*/, const IndexQueryMeta & /*qmeta*/,
                      std::string * /*out*/) const {
     return IndexError_NotImplemented;

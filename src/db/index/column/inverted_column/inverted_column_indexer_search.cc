@@ -13,6 +13,7 @@
 // limitations under the License.
 
 
+#include <new>
 #include <optional>
 #include <ailego/pattern/defer.h>
 #include <zvec/ailego/pattern/expected.hpp>
@@ -21,6 +22,38 @@
 
 
 namespace zvec {
+namespace {
+
+InvertedSearchResult::Ptr FinishSearch(
+    InvertedSearchResult::Ptr result, const Result<roaring_bitmap_t *> &bitmap,
+    const InvertedColumnIndexer &indexer) {
+  if (bitmap) {
+    result->set_and_own_bitmap(bitmap.value());
+    return result;
+  }
+  if (bitmap.error().code() == StatusCode::RESOURCE_EXHAUSTED) {
+    // The scalar search interface returns a pointer. The query engine
+    // translates this allocation failure to RESOURCE_EXHAUSTED.
+    throw std::bad_alloc();
+  }
+  LOG_ERROR("%s: failed to search, code[%d]", indexer.id().c_str(),
+            static_cast<int>(bitmap.error().code()));
+  return nullptr;
+}
+
+}  // namespace
+
+
+Result<roaring_bitmap_t *> InvertedColumnIndexer::FinishPostingScan(
+    const rocksdb::Iterator &iterator, roaring_bitmap_t *bitmap) {
+  const auto status = iterator.status();
+  if (!status.ok()) {
+    roaring_bitmap_free(bitmap);
+    return tl::make_unexpected(ReadFailure(status));
+  }
+  roaring_bitmap_repair_after_lazy(bitmap);
+  return bitmap;
+}
 
 
 Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_eq(
@@ -34,7 +67,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_eq(
     LOG_ERROR(
         "Failed to retrieve data for term[%s] from %s, code[%d], reason[%s]",
         term.c_str(), id().c_str(), s.code(), s.ToString().c_str());
-    return tl::make_unexpected(Status::InternalError());
+    return tl::make_unexpected(ReadFailure(s));
   }
 
   roaring_bitmap_t *bitmap{nullptr};
@@ -58,16 +91,6 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_contain(
     return tl::make_unexpected(Status::InvalidArgument());
   }
 
-  // Shall we sort the terms here? Does it make any difference in performance?
-  std::vector<Slice> slice_terms(terms.begin(), terms.end());
-  std::vector<PinnableSlice> bitmap_slices;
-  bitmap_slices.resize(terms.size());
-  std::vector<rocksdb::Status> statuses;
-  statuses.resize(terms.size());
-  ctx_.db_->MultiGet(ctx_.read_opts_, cf_terms_, slice_terms.size(),
-                     slice_terms.data(), bitmap_slices.data(), statuses.data(),
-                     false);
-
   roaring_bitmap_t *bitmap{nullptr};
   Status s = Status::OK();
   AILEGO_DEFER([&]() {
@@ -76,37 +99,38 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_contain(
     }
   });
 
-  auto init_or_merge_at_i = [&](size_t i) {
+  auto init_or_merge = [&](const std::string &term, const PinnableSlice &raw) {
     if (bitmap == nullptr) {
-      s = InvertedIndexCodec::Deserialize(bitmap_slices[i].data(),
-                                          bitmap_slices[i].size(), &bitmap);
+      s = InvertedIndexCodec::Deserialize(raw.data(), raw.size(), &bitmap);
       if (!s.ok()) {
         LOG_ERROR("Failed to deserialize bitmap for term[%s] from %s",
-                  terms[i].c_str(), id().c_str());
+                  term.c_str(), id().c_str());
       }
       return;
     }
 
     if (is_any) {
-      s = InvertedIndexCodec::merge_or(bitmap_slices[i].data(),
-                                       bitmap_slices[i].size(), true, bitmap);
+      s = InvertedIndexCodec::merge_or(raw.data(), raw.size(), true, bitmap);
     } else {
-      s = InvertedIndexCodec::merge_and(bitmap_slices[i].data(),
-                                        bitmap_slices[i].size(), bitmap);
+      s = InvertedIndexCodec::merge_and(raw.data(), raw.size(), bitmap);
     }
     if (!s.ok()) {
-      LOG_ERROR("Failed to merge bitmap for term[%s] from %s", terms[i].c_str(),
+      LOG_ERROR("Failed to merge bitmap for term[%s] from %s", term.c_str(),
                 id().c_str());
     }
   };
 
-  for (size_t i = 0; i < terms.size(); i++) {
-    if (statuses[i].ok()) {
-      init_or_merge_at_i(i);
+  // Keep one encoded posting alive at a time, not all inputs plus the
+  // decoded accumulator. This also stops immediately on a missing ALL term.
+  for (const auto &term : terms) {
+    PinnableSlice raw;
+    const auto status = ctx_.db_->Get(ctx_.read_opts_, cf_terms_, term, &raw);
+    if (status.ok()) {
+      init_or_merge(term, raw);
       if (!s.ok()) {
         return tl::make_unexpected(s);
       }
-    } else if (statuses[i].code() == rocksdb::Status::kNotFound) {
+    } else if (status.IsNotFound()) {
       if (!is_any) {  // For contain_all, if any term is not found, return empty
         s = Status::NotFound();
         return nullptr;
@@ -114,9 +138,8 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_contain(
     } else {
       LOG_ERROR(
           "Failed to retrieve data for term[%s] from %s, code[%d], reason[%s]",
-          terms[i].c_str(), id().c_str(), statuses[i].code(),
-          statuses[i].ToString().c_str());
-      s = Status::InternalError();
+          term.c_str(), id().c_str(), status.code(), status.ToString().c_str());
+      s = ReadFailure(status);
       return tl::make_unexpected(s);
     }
   }
@@ -164,8 +187,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_ne(
         return tl::make_unexpected(s);
       }
     }
-    roaring_bitmap_repair_after_lazy(bitmap);
-    return bitmap;
+    return FinishPostingScan(*iter, bitmap);
   }
 }
 
@@ -240,7 +262,6 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_lt(
 
   rocksdb::Iterator *iter_point, *iter_range;
   iter_point = ctx_.db_->NewIterator(ctx_.read_opts_, cf_terms_);
-  iter_point->SeekToFirst();
   AILEGO_DEFER([&]() { delete iter_point; });
   if (sealed_ && cf_ranges_) {
     iter_range = ctx_.db_->NewIterator(ctx_.read_opts_, cf_ranges_);
@@ -257,6 +278,13 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_lt(
   bool lt;  // True if the current range or term is "less than" the search term
 
   // Process pre-aggregated range entries and merge matching bitmaps
+  if (iter_range) {
+    const auto range_status = iter_range->status();
+    if (!range_status.ok()) {
+      s = ReadFailure(range_status);
+      return tl::make_unexpected(s);
+    }
+  }
   if (iter_range && iter_range->Valid()) {
     std::optional<std::string> point_seek_start_pos;
     // 1. Merge ranges where the end boundary is less than the search term
@@ -280,6 +308,11 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_lt(
       }
       iter_range->Next();
     }
+    const auto range_status = iter_range->status();
+    if (!range_status.ok()) {
+      s = ReadFailure(range_status);
+      return tl::make_unexpected(s);
+    }
     // 2. Change the start position of the point iterator
     if (point_seek_start_pos) {
       iter_point->Seek(*point_seek_start_pos);
@@ -295,6 +328,8 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_lt(
     } else {
       iter_point->SeekToLast();
     }
+  } else {
+    iter_point->SeekToFirst();
   }
 
   // Process individual point entries
@@ -313,8 +348,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_lt(
     iter_point->Next();
   }
 
-  roaring_bitmap_repair_after_lazy(bitmap);
-  return bitmap;
+  return FinishPostingScan(*iter_point, bitmap);
 }
 
 
@@ -400,6 +434,11 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_gt(
       }
       iter_range->Next();
     }
+    const auto range_status = iter_range->status();
+    if (!range_status.ok()) {
+      s = ReadFailure(range_status);
+      return tl::make_unexpected(s);
+    }
   }
 
   // Process individual point entries
@@ -424,8 +463,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_gt(
     iter_point->Next();
   }
 
-  roaring_bitmap_repair_after_lazy(bitmap);
-  return bitmap;
+  return FinishPostingScan(*iter_point, bitmap);
 }
 
 
@@ -444,7 +482,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_array_len_eq(
     LOG_ERROR(
         "Failed to retrieve data for len[%u] from %s, code[%d], reason[%s]",
         len, id().c_str(), rs.code(), rs.ToString().c_str());
-    return tl::make_unexpected(Status::InternalError());
+    return tl::make_unexpected(ReadFailure(rs));
   }
 
   roaring_bitmap_t *bitmap{nullptr};
@@ -490,8 +528,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_array_len_ne(
       return tl::make_unexpected(s);
     }
   }
-  roaring_bitmap_repair_after_lazy(bitmap);
-  return bitmap;
+  return FinishPostingScan(*iter, bitmap);
 }
 
 
@@ -525,8 +562,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_array_len_lt(
       return tl::make_unexpected(s);
     }
   }
-  roaring_bitmap_repair_after_lazy(bitmap);
-  return bitmap;
+  return FinishPostingScan(*iter, bitmap);
 }
 
 
@@ -560,8 +596,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_array_len_gt(
       return tl::make_unexpected(s);
     }
   }
-  roaring_bitmap_repair_after_lazy(bitmap);
-  return bitmap;
+  return FinishPostingScan(*iter, bitmap);
 }
 
 
@@ -645,8 +680,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_prefix(
     iter->Next();
   }
 
-  roaring_bitmap_repair_after_lazy(bitmap);
-  return bitmap;
+  return FinishPostingScan(*iter, bitmap);
 }
 
 
@@ -684,8 +718,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_suffix(
     iter->Next();
   }
 
-  roaring_bitmap_repair_after_lazy(bitmap);
-  return bitmap;
+  return FinishPostingScan(*iter, bitmap);
 }
 
 
@@ -722,8 +755,7 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_non_null() const {
         return tl::make_unexpected(s);
       }
     }
-    roaring_bitmap_repair_after_lazy(bitmap);
-    return bitmap;
+    return FinishPostingScan(*iter, bitmap);
   }
 }
 
@@ -783,14 +815,7 @@ InvertedSearchResult::Ptr InvertedColumnIndexer::search(
       return nullptr;
   }
 
-  if (bitmap_res) {
-    search_res->set_and_own_bitmap(bitmap_res.value());
-    return search_res;
-  } else {
-    LOG_ERROR("%s: failed to search, code[%d]", id().c_str(),
-              static_cast<int>(bitmap_res.error().code()));
-    return nullptr;
-  }
+  return FinishSearch(std::move(search_res), bitmap_res, *this);
 }
 
 
@@ -823,14 +848,7 @@ InvertedSearchResult::Ptr InvertedColumnIndexer::multi_search(
       return nullptr;
   }
 
-  if (bitmap_res) {
-    search_res->set_and_own_bitmap(bitmap_res.value());
-    return search_res;
-  } else {
-    LOG_ERROR("%s: failed to search, code[%d]", id().c_str(),
-              static_cast<int>(bitmap_res.error().code()));
-    return nullptr;
-  }
+  return FinishSearch(std::move(search_res), bitmap_res, *this);
 }
 
 
@@ -875,42 +893,21 @@ InvertedSearchResult::Ptr InvertedColumnIndexer::search_array_len(
       return nullptr;
   }
 
-  if (bitmap_res) {
-    search_res->set_and_own_bitmap(bitmap_res.value());
-    return search_res;
-  } else {
-    LOG_ERROR("%s: failed to search, code[%d]", id().c_str(),
-              static_cast<int>(bitmap_res.error().code()));
-    return nullptr;
-  }
+  return FinishSearch(std::move(search_res), bitmap_res, *this);
 }
 
 
 InvertedSearchResult::Ptr InvertedColumnIndexer::search_null() const {
   auto search_res = std::make_shared<InvertedSearchResult>();
   auto bitmap_res = get_bitmap_null();
-  if (bitmap_res) {
-    search_res->set_and_own_bitmap(bitmap_res.value());
-    return search_res;
-  } else {
-    LOG_ERROR("%s: failed to search, code[%d]", id().c_str(),
-              static_cast<int>(bitmap_res.error().code()));
-    return nullptr;
-  }
+  return FinishSearch(std::move(search_res), bitmap_res, *this);
 }
 
 
 InvertedSearchResult::Ptr InvertedColumnIndexer::search_non_null() const {
   auto search_res = std::make_shared<InvertedSearchResult>();
   auto bitmap_res = get_bitmap_non_null();
-  if (bitmap_res) {
-    search_res->set_and_own_bitmap(bitmap_res.value());
-    return search_res;
-  } else {
-    LOG_ERROR("%s: failed to search, code[%d]", id().c_str(),
-              static_cast<int>(bitmap_res.error().code()));
-    return nullptr;
-  }
+  return FinishSearch(std::move(search_res), bitmap_res, *this);
 }
 
 

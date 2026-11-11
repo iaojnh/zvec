@@ -327,6 +327,10 @@ class ZVEC_API CollectionSchema {
     return name_;
   }
 
+  const std::string &name_ref() const {
+    return name_;
+  }
+
   void set_name(const std::string &name) {
     name_ = name;
   }
@@ -353,6 +357,10 @@ class ZVEC_API CollectionSchema {
   FieldSchema *get_vector_field(const std::string &column);
 
   FieldSchemaPtrList fields() const;
+
+  const FieldSchemaPtrList &fields_ref() const {
+    return fields_;
+  }
 
   FieldSchemaPtrList forward_fields() const;
 

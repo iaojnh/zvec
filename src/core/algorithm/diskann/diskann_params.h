@@ -26,6 +26,12 @@ inline const std::string PARAM_DISKANN_BUILDER_MEMORY_LIMIT(
     "zvec.diskann.builder.memory_limit");
 inline const std::string PARAM_DISKANN_BUILDER_MEMORY_BUDGET(
     "zvec.diskann.builder.memory_budget");
+// Internal build-storage selection; the public collection storage mode sets
+// these together. This is not a process RSS limit or a new user budget.
+inline const std::string PARAM_DISKANN_BUILDER_BUFFERED_BUILD(
+    "zvec.diskann.builder.buffered_build");
+inline const std::string PARAM_DISKANN_BUILDER_BUILD_STORAGE_PATH(
+    "zvec.diskann.builder.build_storage_path");
 inline const std::string PARAM_DISKANN_BUILDER_DISK_PQ_DIM(
     "zvec.diskann.builder.disk_pq_dim");
 inline const std::string PARAM_DISKANN_BUILDER_THREAD_COUNT(

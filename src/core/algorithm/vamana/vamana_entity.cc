@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "vamana_entity.h"
 #include <zvec/ailego/hash/crc32c.h>
+#include "utility/graph_segment_writer.h"
 
 namespace zvec {
 namespace core {
@@ -76,127 +77,77 @@ int64_t VamanaEntity::dump_header(const IndexDumper::Pointer &dumper,
   return dump_segment(dumper, kGraphHeaderSegmentId, &hd.graph, hd.graph.size);
 }
 
-int64_t VamanaEntity::dump_vectors(
-    const IndexDumper::Pointer &dumper,
-    const std::vector<node_id_t> &reorder_mapping) const {
-  size_t total_size = doc_cnt() * vector_size();
-  std::vector<uint8_t> buffer(total_size);
-
+int64_t VamanaEntity::dump_vectors(const IndexDumper::Pointer &dumper) const {
+  GraphSegmentWriter writer(dumper);
   for (node_id_t i = 0; i < doc_cnt(); ++i) {
-    node_id_t old_id = reorder_mapping[i];
-    const void *vec = get_vector(old_id);
-    if (vec == nullptr) {
-      LOG_ERROR("Get vector failed for node %u", old_id);
-      return IndexError_ReadData;
-    }
-    memcpy(buffer.data() + static_cast<size_t>(i) * vector_size(), vec,
-           vector_size());
+    IndexStorage::MemoryBlock block;
+    int ret = get_vector(i, block);
+    if (ret != 0) return ret;
+    if (!block.data()) return IndexError_ReadData;
+    ret = writer.write(block.data(), vector_size());
+    if (ret != 0) return ret;
   }
-
-  return dump_segment(dumper, kGraphFeaturesSegmentId, buffer.data(),
-                      total_size);
+  return writer.finish(kGraphFeaturesSegmentId);
 }
 
-int64_t VamanaEntity::dump_neighbors(
-    const IndexDumper::Pointer &dumper,
-    const std::vector<node_id_t> &reorder_mapping,
-    const std::vector<node_id_t> &neighbor_mapping) const {
-  size_t nbr_size = neighbors_size();
-  size_t total_size = doc_cnt() * nbr_size;
-  std::vector<uint8_t> buffer(total_size, 0);
-
+int64_t VamanaEntity::dump_neighbors(const IndexDumper::Pointer &dumper) const {
+  GraphSegmentWriter writer(dumper);
+  std::vector<node_id_t> row(static_cast<size_t>(max_degree()) + 1);
+  static_assert(sizeof(NeighborsHeader) == sizeof(node_id_t),
+                "Keep the on-disk neighbor header layout");
   for (node_id_t i = 0; i < doc_cnt(); ++i) {
-    node_id_t old_id = reorder_mapping[i];
-    const Neighbors nbrs = get_neighbors(old_id);
-
-    auto *hd = reinterpret_cast<NeighborsHeader *>(
-        buffer.data() + static_cast<size_t>(i) * nbr_size);
-    hd->neighbor_cnt = nbrs.size();
-    for (uint32_t j = 0; j < nbrs.size(); ++j) {
-      hd->neighbors[j] = neighbor_mapping[nbrs[j]];
-    }
+    const auto neighbors = get_neighbors(i);
+    if (neighbors.size() > max_degree() ||
+        (!neighbors.data && neighbors.size()))
+      return IndexError_InvalidFormat;
+    std::fill(row.begin(), row.end(), 0);
+    row[0] = neighbors.size();
+    for (size_t j = 0; j < neighbors.size(); ++j) row[j + 1] = neighbors[j];
+    int ret = writer.write(row.data(), row.size() * sizeof(node_id_t));
+    if (ret != 0) return ret;
   }
-
-  return dump_segment(dumper, kGraphNeighborsSegmentId, buffer.data(),
-                      total_size);
+  return writer.finish(kGraphNeighborsSegmentId);
 }
 
 int64_t VamanaEntity::dump_neighbor_dists(
-    const IndexDumper::Pointer &dumper,
-    const std::vector<node_id_t> &reorder_mapping) const {
-  if (!dist_storage_loaded()) {
-    // No distance data to dump — this is fine for read-only indices
-    return 0;
-  }
-
-  uint32_t max_deg = static_cast<uint32_t>(max_degree());
-  size_t dist_entry = max_deg * sizeof(dist_t);
-  size_t total_size = doc_cnt() * dist_entry;
-  std::vector<uint8_t> buffer(total_size, 0);
-
+    const IndexDumper::Pointer &dumper) const {
+  if (!dist_storage_loaded()) return 0;
+  GraphSegmentWriter writer(dumper);
+  const std::vector<dist_t> zeros(max_degree(), 0);
   for (node_id_t i = 0; i < doc_cnt(); ++i) {
-    node_id_t old_id = reorder_mapping[i];
-    const dist_t *dists = get_neighbor_dists(old_id);
-    if (dists != nullptr) {
-      memcpy(buffer.data() + static_cast<size_t>(i) * dist_entry, dists,
-             dist_entry);
-    }
+    const dist_t *distances = get_neighbor_dists(i);
+    int ret = writer.write(distances ? distances : zeros.data(),
+                           zeros.size() * sizeof(dist_t));
+    if (ret != 0) return ret;
   }
-
-  return dump_segment(dumper, kGraphNeighborDistsSegmentId, buffer.data(),
-                      total_size);
+  return writer.finish(kGraphNeighborDistsSegmentId);
 }
 
-int64_t VamanaEntity::dump_mapping_segment(const IndexDumper::Pointer &dumper,
-                                           const key_t *keys) const {
-  size_t total_size = doc_cnt() * sizeof(key_t);
-  return dump_segment(dumper, kGraphMappingSegmentId, keys, total_size);
-}
-
-void VamanaEntity::reshuffle_vectors(std::vector<node_id_t> *n2o_mapping,
-                                     std::vector<node_id_t> *o2n_mapping,
-                                     key_t *keys) const {
-  uint32_t count = doc_cnt();
-  n2o_mapping->resize(count);
-  o2n_mapping->resize(count);
-
-  // Simple identity mapping for now (can be optimized with BFS traversal)
-  for (uint32_t i = 0; i < count; ++i) {
-    (*n2o_mapping)[i] = i;
-    (*o2n_mapping)[i] = i;
-    keys[i] = get_key(i);
-  }
-}
-
-int64_t VamanaEntity::dump_segments(const IndexDumper::Pointer &dumper,
-                                    key_t *keys) const {
-  std::vector<node_id_t> n2o_mapping;
-  std::vector<node_id_t> o2n_mapping;
-  reshuffle_vectors(&n2o_mapping, &o2n_mapping, keys);
-
-  // Remap entry point
-  VamanaHeader dump_header_copy = header_;
-  if (dump_header_copy.graph.entry_point != kInvalidNodeId) {
-    dump_header_copy.graph.entry_point =
-        o2n_mapping[dump_header_copy.graph.entry_point];
-  }
-
-  int64_t hd_size = dump_header(dumper, dump_header_copy);
-  if (hd_size < 0) return hd_size;
-
-  int64_t vec_size = dump_vectors(dumper, n2o_mapping);
-  if (vec_size < 0) return vec_size;
-
-  int64_t nbr_size = dump_neighbors(dumper, n2o_mapping, o2n_mapping);
-  if (nbr_size < 0) return nbr_size;
-
-  int64_t map_size = dump_mapping_segment(dumper, keys);
-  if (map_size < 0) return map_size;
-
-  int64_t dist_size = dump_neighbor_dists(dumper, n2o_mapping);
-  if (dist_size < 0) return dist_size;
-
-  return hd_size + vec_size + nbr_size + map_size + dist_size;
+int64_t VamanaEntity::dump_segments(const IndexDumper::Pointer &dumper) const
+    try {
+  // Node order is already the persisted order. No identity permutations or
+  // corpus-sized key/vector/graph copies are necessary.
+  int64_t total = dump_header(dumper, header_);
+  if (total < 0) return total;
+  int64_t size = dump_vectors(dumper);
+  if (size < 0) return size;
+  total += size;
+  size = dump_neighbors(dumper);
+  if (size < 0) return size;
+  total += size;
+  size = DumpGraphRecords<key_t>(dumper, kGraphMappingSegmentId, doc_cnt(),
+                                 [&](size_t i, key_t *key) {
+                                   *key = get_key(i);
+                                   return 0;
+                                 });
+  if (size < 0) return size;
+  total += size;
+  size = dump_neighbor_dists(dumper);
+  return size < 0 ? size : total + size;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::exception &) {
+  return IndexError_Runtime;
 }
 
 }  // namespace core

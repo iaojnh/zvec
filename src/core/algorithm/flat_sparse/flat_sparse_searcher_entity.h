@@ -60,14 +60,16 @@ class FlatSparseSearcherEntity : public FlatSparseEntity {
     return sparse_unit_size_;
   }
 
-  float get_search_distance(const std::string &vector,
+  float get_search_distance(std::string_view vector,
                             node_id_t target_node_id) const override {
     float dist;
-    const void *target_vector;
+    IndexStorage::MemoryBlock target_vector;
     uint32_t target_vector_len;
-    get_sparse_vector_ptr_by_id(target_node_id, &target_vector,
-                                &target_vector_len);
-    search_sparse_distance_(vector.c_str(), target_vector, &dist);
+    const int ret = get_sparse_vector_ptr_by_id(target_node_id, target_vector,
+                                                &target_vector_len);
+    if (ret != 0 || !target_vector.data())
+      throw ReadError{ret != 0 ? ret : IndexError_ReadData};
+    search_sparse_distance_(vector.data(), target_vector.data(), &dist);
     return dist;
   }
 
@@ -79,6 +81,10 @@ class FlatSparseSearcherEntity : public FlatSparseEntity {
 
   int get_sparse_vector_ptr_by_id(node_id_t id, const void **sparse_vector,
                                   uint32_t *sparse_vector_len) const override;
+
+  int get_sparse_vector_ptr_by_id(node_id_t id,
+                                  IndexStorage::MemoryBlock &block,
+                                  uint32_t *length) const override;
 
  private:
   int load_container(const IndexStorage::Pointer &container);

@@ -54,7 +54,8 @@ class InvertedColumnIndexer {
 
   static Ptr CreateAndOpen(const std::string &collection_name,
                            const FieldSchema &field, RocksdbContext &context,
-                           bool read_only = false);
+                           bool read_only = false,
+                           Status *open_status = nullptr);
 
 
   virtual ~InvertedColumnIndexer();
@@ -236,6 +237,15 @@ class InvertedColumnIndexer {
 
 
   Status open();
+
+  static Status ReadFailure(const rocksdb::Status &status) {
+    const auto code = status.IsMemoryLimit() ? StatusCode::RESOURCE_EXHAUSTED
+                                             : StatusCode::INTERNAL_ERROR;
+    return Status(code, status.ToString());
+  }
+
+  static Result<roaring_bitmap_t *> FinishPostingScan(
+      const rocksdb::Iterator &iterator, roaring_bitmap_t *bitmap);
 
   inline std::string encode(const std::string &term) const {
     return InvertedIndexCodec::Encode(term, field_.element_data_type());

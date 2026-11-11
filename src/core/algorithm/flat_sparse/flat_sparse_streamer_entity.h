@@ -65,11 +65,11 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
   int dump(const IndexDumper::Pointer &dumper);
 
   //! Add sparse vector to linear index
-  int add(uint64_t key, const std::string &sparse_vector,
+  int add(uint64_t key, std::string_view sparse_vector,
           const uint32_t sparse_count);
 
   //! Add sparse vector to linear index with id
-  int add_vector_with_id(uint32_t id, const std::string &sparse_vector,
+  int add_vector_with_id(uint32_t id, std::string_view sparse_vector,
                          uint32_t sparse_count);
 
   //! Clone entity
@@ -97,9 +97,14 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
   }
 
   inline node_id_t get_id(uint64_t key) const override {
+    if (!use_id_map_) {
+      return key < doc_cnt() && get_key(static_cast<node_id_t>(key)) == key
+                 ? static_cast<node_id_t>(key)
+                 : kInvalidNodeId;
+    }
     keys_map_lock_->lock_shared();
     auto it = keys_map_->find(key);
-    node_id_t id = it == keys_map_->end() ? kInvalidNodeId : it->second;
+    const auto id = it == keys_map_->end() ? kInvalidNodeId : it->second;
     keys_map_lock_->unlock_shared();
     return id;
   }
@@ -112,14 +117,16 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
       const node_id_t id, IndexStorage::MemoryBlock &sparse_vector_block,
       uint32_t *sparse_vector_len) const override;
 
-  float get_search_distance(const std::string &vector,
+  float get_search_distance(std::string_view vector,
                             node_id_t target_node_id) const override {
     float dist;
-    const void *target_vector;
+    IndexStorage::MemoryBlock target_vector;
     uint32_t target_vector_len;
-    get_sparse_vector_ptr_by_id(target_node_id, &target_vector,
-                                &target_vector_len);
-    search_sparse_distance_(vector.c_str(), target_vector, &dist);
+    const int ret = get_sparse_vector_ptr_by_id(target_node_id, target_vector,
+                                                &target_vector_len);
+    if (ret != 0 || !target_vector.data())
+      throw ReadError{ret != 0 ? ret : IndexError_ReadData};
+    search_sparse_distance_(vector.data(), target_vector.data(), &dist);
     return dist;
   }
 
@@ -176,7 +183,7 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
     return streamer_meta_.offset_chunk_size / offset_size_per_node();
   }
 
-  int write_sparse_vector_to_chunk(const std::string &sparse_vector,
+  int write_sparse_vector_to_chunk(std::string_view sparse_vector,
                                    const uint32_t sparse_vector_len,
                                    uint32_t &sparse_data_chunk_index,
                                    uint32_t &sparse_data_chunk_offset);
@@ -207,28 +214,46 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
 
   int dump_index_meta(IndexDumper *dumper);
 
-  int dump_keys(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
-  int dump_mapping(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
   int dump_offset_data(IndexDumper *dumper);
+  int read_key(node_id_t id, uint64_t *key) const;
 
 
  private:
+  using KeyMap =
+      std::map<uint64_t, node_id_t, std::less<uint64_t>,
+               ailego::BudgetedAllocator<std::pair<const uint64_t, node_id_t>>>;
+  KeyMap::node_type prepare_key(uint64_t key, node_id_t id) {
+    if (!use_id_map_) return {};
+    std::shared_lock<ailego::SharedMutex> lock(*keys_map_lock_);
+    if (keys_map_->find(key) != keys_map_->end()) return {};
+    KeyMap pending;
+    pending.emplace(key, id);
+    return pending.extract(key);
+  }
+  void publish_key(uint64_t key, node_id_t id, KeyMap::node_type pending) {
+    if (!use_id_map_) return;
+    std::unique_lock<ailego::SharedMutex> lock(*keys_map_lock_);
+    if (pending)
+      keys_map_->insert(std::move(pending));
+    else
+      keys_map_->find(key)->second = id;
+  }
   FlatSparseStreamerEntity(
       IndexStreamer::Stats &stats, const FlatSparseMeta &meta,
       const FlatSparseStreamerMeta &streamer_meta,
       std::shared_ptr<ailego::SharedMutex> keys_map_lock,
-      std::shared_ptr<std::map<uint64_t, node_id_t>> keys_map,
-      std::vector<Chunk::Pointer> sparse_data_chunks,
-      std::vector<Chunk::Pointer> sparse_offset_chunks)
+      std::shared_ptr<KeyMap> keys_map,
+      ailego::BudgetedVector<Chunk::Pointer> sparse_data_chunks,
+      ailego::BudgetedVector<Chunk::Pointer> sparse_offset_chunks,
+      bool use_id_map)
       : stats_(stats),
         meta_(meta),
         streamer_meta_(streamer_meta),
         keys_map_lock_(keys_map_lock),
         keys_map_(keys_map),
         sparse_data_chunks_(std::move(sparse_data_chunks)),
-        sparse_offset_chunks_(std::move(sparse_offset_chunks)) {}
+        sparse_offset_chunks_(std::move(sparse_offset_chunks)),
+        use_id_map_(use_id_map) {}
 
  private:
   IndexStorage::Pointer storage_{};
@@ -246,19 +271,19 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
 
   // keys map
   mutable std::shared_ptr<ailego::SharedMutex> keys_map_lock_{};
-  std::shared_ptr<std::map<uint64_t, node_id_t>> keys_map_{};
+  std::shared_ptr<KeyMap> keys_map_{};
 
   // chunks
-  mutable std::vector<Chunk::Pointer> sparse_data_chunks_{};
-  mutable std::vector<Chunk::Pointer> sparse_offset_chunks_{};
+  mutable ailego::BudgetedVector<Chunk::Pointer> sparse_data_chunks_{};
+  mutable ailego::BudgetedVector<Chunk::Pointer> sparse_offset_chunks_{};
 
   // config
+  bool use_id_map_{true};
   uint32_t max_doc_cnt_{1 << 24U};  // 16 million
   uint32_t max_data_chunk_cnt_{
       1 << 10U};  // 1024, default single_data_chunk_size = 8M,
                   // default_total_max = 1024 * 8M = 8G
 
-  uint64_t dump_size_{0U};
   size_t sparse_unit_size_{0U};
 };
 

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <type_traits>
 #include <turbo/algorithm/kmeans.h>
 #include "quantizer/distance_quantizer.h"
@@ -24,7 +25,7 @@ namespace zvec::core {
 // Lloyd and K-MC2 access block layout only through the context. Keep blocks
 // row-major so Turbo can scan them without transposing inside the hot loop.
 // Centroid accumulation, convergence and spherical normalization stay intact.
-template <typename T, bool InnerProduct = false>
+template <typename T, bool InnerProduct = false, bool Cosine = false>
 class TurboKmeansContext
     : public std::conditional_t<InnerProduct,
                                 turbo::NumericalInnerProductKmeansContext<T>,
@@ -35,6 +36,8 @@ class TurboKmeansContext
                                   turbo::NumericalKmeansContext<T>>;
   using Base::Base;
   using Base::BatchCount;
+  static_assert(!Cosine || InnerProduct,
+                "Cosine training requires spherical inner-product updates");
 
   static void Distance(const T *m, const T *q, size_t dim, float *out) {
     *out = quantizer(dim)->calc_distance_dp_dp(m, q);
@@ -68,10 +71,34 @@ class TurboKmeansContext
     return std::sqrt(std::max(-score, 0.0f));
   }
 
+  static void Norm2(T *data, size_t dim, float *norm) {
+    Base::Norm2(data, vector_dimension(dim), norm);
+    if constexpr (Cosine) {
+      // CosineConverter stores the original datapoint norm after its unit
+      // coordinates. It is metadata, not a clustering coordinate. A learned
+      // centroid represents a unit vector, including for FP16 where the float
+      // tail occupies two half values and must never be interpreted as halves.
+      const float centroid_norm = *norm > 0.0f ? 1.0f : 0.0f;
+      std::memcpy(
+          reinterpret_cast<char *>(data) + vector_dimension(dim) * sizeof(T),
+          &centroid_norm, sizeof(centroid_norm));
+    }
+  }
+
  private:
+  static size_t vector_dimension(size_t dim) {
+    if constexpr (Cosine) {
+      constexpr size_t extra = sizeof(float) / sizeof(T);
+      ailego_check_with(dim > extra, "Cosine record has no vector coordinates");
+      return dim - extra;
+    }
+    return dim;
+  }
+
   static const turbo::Quantizer::Pointer &quantizer(size_t dim) {
     // Ailego contexts expose static distance callbacks. Each worker reuses
     // its quantizer for the current dimension, with no per-query encoding.
+    dim = vector_dimension(dim);
     thread_local turbo::Quantizer::Pointer cached;
     if (!cached || static_cast<size_t>(cached->dim()) != dim) {
       IndexMeta meta;

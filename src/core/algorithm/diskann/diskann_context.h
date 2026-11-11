@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_context.h>
 #include "utility/topk_result_builder.h"
 #include "diskann_dist_calculator.h"
@@ -153,6 +154,9 @@ class DiskAnnContext : public IndexContext,
   void set_fetch_vector(bool v) override {
     fetch_vector_ = v;
   }
+  bool fetch_vector() const override {
+    return fetch_vector_;
+  }
 
   //! Get topk
   inline uint32_t topk() const override {
@@ -167,7 +171,7 @@ class DiskAnnContext : public IndexContext,
     memcpy(query_, query, element_size_);
     memcpy(query_rotated_, query, element_size_);
 
-    dc_.reset_query(query);
+    dc_.reset_query(query_);
   }
 
   inline TopkHeap &topk_heap() {
@@ -190,6 +194,9 @@ class DiskAnnContext : public IndexContext,
     return sector_buffer_;
   }
 
+  // Called at query boundaries, before constructing any read destinations.
+  int ensure_sector_buffer(size_t sectors);
+
   inline size_t sector_buffer_size() const {
     return sector_buffer_size_;
   }
@@ -211,14 +218,23 @@ class DiskAnnContext : public IndexContext,
   }
 
   inline bool error() const {
-    return has_error_;
+    return error_code_ != 0;
   }
 
   inline void set_error(bool err) {
-    has_error_ = err;
+    error_code_ = err ? IndexError_ReadData : 0;
+  }
+
+  inline int error_code() const {
+    return error_code_;
+  }
+
+  inline void set_error_code(int code) {
+    error_code_ = code;
   }
 
   inline void clear() {
+    topk_heap_.release();
     for (auto &it : results_) {
       it.clear();
     }
@@ -230,7 +246,7 @@ class DiskAnnContext : public IndexContext,
     expanded_nodes_.clear();
     visit_filter_.clear();
     group_topk_heaps_.clear();
-    has_error_ = false;
+    error_code_ = 0;
   }
 
   //! Preserve query-time options when replacing an incompatible pooled
@@ -261,11 +277,11 @@ class DiskAnnContext : public IndexContext,
     return best_list_nodes_;
   }
 
-  std::vector<Neighbor> &expanded_nodes() {
+  PruneCandidates &expanded_nodes() {
     return expanded_nodes_;
   }
 
-  std::vector<float> &occlude_factor() {
+  std::vector<float, ailego::BudgetedAllocator<float>> &occlude_factor() {
     return occlude_factor_;
   }
 
@@ -275,6 +291,7 @@ class DiskAnnContext : public IndexContext,
 
   //! Reset context
   void reset() override {
+    clear();
     set_filter(nullptr);
     reset_threshold();
     set_fetch_vector(false);
@@ -282,7 +299,10 @@ class DiskAnnContext : public IndexContext,
     reset_group_by();
   }
 
-  inline std::map<std::string, TopkHeap> &group_topk_heaps() {
+  using GroupHeaps = std::map<
+      std::string, TopkHeap, std::less<std::string>,
+      ailego::BudgetedAllocator<std::pair<const std::string, TopkHeap>>>;
+  inline GroupHeaps &group_topk_heaps() {
     return group_topk_heaps_;
   }
 
@@ -333,11 +353,11 @@ class DiskAnnContext : public IndexContext,
 
  private:
   //! Hooks required by TopkResultBuilder.
-  std::vector<IndexDocumentList> &mutable_results() {
+  ailego::BudgetedVector<IndexDocumentList> &mutable_results() {
     return results_;
   }
 
-  std::vector<IndexGroupDocumentList> &mutable_group_results() {
+  ailego::BudgetedVector<IndexGroupDocumentList> &mutable_group_results() {
     return group_results_;
   }
 
@@ -347,10 +367,17 @@ class DiskAnnContext : public IndexContext,
 
   void emplace_result_doc(IndexDocumentList &docs, diskann_id_t id, float score,
                           const VectorInfo &info) {
+    diskann_key_t key;
+    const int ret = entity_->read_key(id, &key);
+    if (ret != 0) {
+      set_error_code(ret);
+      return;
+    }
     if (fetch_vector_) {
-      docs.emplace_back(entity_->get_key(id), score, id, info.vec_);
+      docs.emplace_back(key, score, id,
+                        std::shared_ptr<const VectorInfo::Payload>(info.vec_));
     } else {
-      docs.emplace_back(entity_->get_key(id), score, id);
+      docs.emplace_back(key, score, id);
     }
   }
 
@@ -376,29 +403,32 @@ class DiskAnnContext : public IndexContext,
 
   uint32_t group_topk_{0};
   uint32_t group_num_{0};
-  std::map<std::string, TopkHeap> group_topk_heaps_{};
+  GroupHeaps group_topk_heaps_{};
 
   IOContext io_ctx_{};
   SearchStats query_stats_;
 
+  ailego::BudgetedAlignedBuffer query_memory_;
   void *query_{nullptr};
   void *query_rotated_{nullptr};
   void *coord_buffer_{nullptr};
   void *sector_buffer_{nullptr};
   size_t sector_buffer_size_{0};
+  size_t sector_buffer_charge_{0};
+  bool io_initialized_{false};
 
-  std::vector<IndexDocumentList> results_{};
-  std::vector<IndexGroupDocumentList> group_results_{};
+  ailego::BudgetedVector<IndexDocumentList> results_{};
+  ailego::BudgetedVector<IndexGroupDocumentList> group_results_{};
 
   bool fetch_vector_{false};
-  bool has_error_{false};
+  int error_code_{0};
 
   NeighborPriorityQueue best_list_nodes_;
-  std::vector<Neighbor> expanded_nodes_;
-  std::vector<float> occlude_factor_;
+  PruneCandidates expanded_nodes_;
+  std::vector<float, ailego::BudgetedAllocator<float>> occlude_factor_;
 
   VisitFilter visit_filter_{};
-  uint32_t filter_mode_{VisitFilter::ByteMap};
+  uint32_t filter_mode_{VisitFilter::EpochBitMap};
   float negative_probility_{DiskAnnEntity::kDefaultBFNegativeProbility};
 };
 

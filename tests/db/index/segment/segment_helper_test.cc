@@ -33,6 +33,8 @@
 #include <arrow/table.h>
 #include <gtest/gtest.h>
 #include "db/common/constants.h"
+#include "db/common/mobile_memory.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 #include "db/common/file_helper.h"
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include "db/index/column/vector_column/vector_column_params.h"
@@ -48,6 +50,22 @@
 #include "zvec/db/schema.h"
 
 using namespace zvec;
+
+namespace {
+class SegmentHelperBudgetEnvironment : public testing::Environment {
+ public:
+  void SetUp() override {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // The merge-correctness cases keep ten segments and five vector stores
+      // per segment open together. Their non-evictable storage metadata alone
+      // exceeds the mobile startup default; use an explicit suite budget.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+};
+[[maybe_unused]] const auto *const kSegmentHelperBudgetEnvironment =
+    testing::AddGlobalTestEnvironment(new SegmentHelperBudgetEnvironment);
+}  // namespace
 
 class SegmentHelperTest : public testing::Test {
  protected:
@@ -111,7 +129,7 @@ class SegmentHelperTest : public testing::Test {
                                      int concurrency = 1) {
     const bool forward_use_parquet = false;
     CompactTask task(col_path, schema, std::move(segments), output_segment_id,
-                     std::move(filter), forward_use_parquet, concurrency);
+                     std::move(filter), forward_use_parquet, !forward_use_parquet, concurrency);
     auto segment_task = SegmentTask::CreateCompactTask(task);
     EXPECT_NE(segment_task, nullptr);
     if (segment_task == nullptr) return {task, nullptr};
@@ -602,7 +620,7 @@ TEST_F(SegmentHelperTest, QuantizedIvfClosesRawFlatBeforeBuildingIndex) {
     };
     std::vector<BlockMeta> blocks;
     auto status = SegmentHelper::ReduceVectorIndex(
-        schema, {seg1, seg2}, output_path, nullptr, next_block, 0, 63, 64, 1,
+        schema, {seg1, seg2}, output_path, nullptr, next_block, 0, 63, 64, true, 1,
         &blocks);
     EXPECT_EQ(status.ok(), !fail_quantized_dump) << status.message();
     EXPECT_EQ(next_block_id, 2);
