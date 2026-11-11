@@ -29,6 +29,7 @@
 #include <zvec/core/framework/index_framework.h>
 #include "hnsw_chunk.h"
 #include "hnsw_entity.h"
+#include "utility/resident_vector_batch.h"
 #include "hnsw_index_hash.h"
 #include "hnsw_params.h"
 
@@ -1037,6 +1038,36 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
         ids, count, vec_blocks);
   }
 
+  // Per-query clones own this scratch; mmap entities retain their layout.
+  ResidentVectorBatch &resident_vector_batch() const {
+    return resident_vector_batch_;
+  }
+
+  bool try_get_resident_vectors(
+      const node_id_t *ids, uint32_t count,
+      ailego::BudgetedVector<const void *> &views) const {
+    resident_vector_batch_.release();
+    if (!broker_ || !broker_->storage()) return false;
+    auto pool = broker_->storage()->vec_buffer_pool();
+    if (!pool || pool->writable() || !pool->cache_enabled()) return false;
+    const size_t bytes = vector_size();
+    return resident_vector_batch_.read_offsets(
+        *pool, ids, count, bytes,
+        [this, bytes](node_id_t id, size_t *absolute) {
+          if (id >= doc_cnt()) return false;
+          const auto loc = get_vector_chunk_loc(id);
+          if (loc.first >= node_chunks_.size()) return false;
+          const auto &chunk = node_chunks_[loc.first];
+          if (loc.second > chunk->data_size() ||
+              bytes > chunk->data_size() - loc.second ||
+              loc.second > (std::numeric_limits<size_t>::max)() -
+                               chunk->data_offset())
+            return false;
+          *absolute = chunk->data_offset() + loc.second;
+          return true;
+        }, views);
+  }
+
   int get_vector_for_prune(
       const node_id_t *ids, uint32_t count,
       ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks) const;
@@ -1044,6 +1075,9 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
   inline key_t get_key_typed(node_id_t id) const {
     return HnswStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(id);
   }
+ private:
+  mutable ResidentVectorBatch resident_vector_batch_;
+
 };
 
 //! Typed entity subclass for contiguous memory mode.

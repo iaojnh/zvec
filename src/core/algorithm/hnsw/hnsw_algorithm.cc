@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "hnsw_algorithm.h"
+#include <ailego/pattern/scope_guard.h>
 #include <mutex>
 #include <ailego/pattern/defer.h>
 
@@ -346,6 +347,11 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
                                   dist_t entry_dist, uint32_t prefetch_lines,
                                   uint32_t prefetch_offset) {
   using MemBlockType = typename EntityType::MemoryBlock;
+  auto &resident_batch = entity.resident_vector_batch();
+  auto release_resident =
+      ailego::ScopeGuard::Make([&] { resident_batch.release(); });
+  // Partial caches must not pay for an unsuccessful probe at every node.
+  size_t resident_probe_skip = 0;
 
   const uint32_t max_deg = entity.max_degree(0);
   visit.set_visited(entry_point);
@@ -387,16 +393,27 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
     if (unvisited_count == 0) continue;
 
     neighbor_vec_blocks.clear();
-    if (ailego_unlikely(entity.get_vector_typed(neighbor_ids.data(),
-                                                unvisited_count,
-                                                neighbor_vec_blocks) != 0)) {
-      break;
+    neighbor_vecs.resize(unvisited_count);
+    bool resident = false;
+    if (resident_probe_skip != 0) {
+      --resident_probe_skip;
+    } else {
+      resident = entity.try_get_resident_vectors(
+          neighbor_ids.data(), unvisited_count, neighbor_vecs);
+      if (!resident) resident_probe_skip = 15;
     }
-    for (uint32_t i = 0; i < unvisited_count; ++i) {
-      neighbor_vecs[i] = neighbor_vec_blocks[i].data();
-      if (has_extra_values) {
-        neighbor_extra_values[i] = ctx->get_extra_values(neighbor_vecs[i]);
+    if (!resident) {
+      if (ailego_unlikely(entity.get_vector_typed(neighbor_ids.data(),
+                                                  unvisited_count,
+                                                  neighbor_vec_blocks) != 0)) {
+        break;
       }
+      for (uint32_t i = 0; i < unvisited_count; ++i)
+        neighbor_vecs[i] = neighbor_vec_blocks[i].data();
+    }
+    if (has_extra_values) {
+      for (uint32_t i = 0; i < unvisited_count; ++i)
+        neighbor_extra_values[i] = ctx->get_extra_values(neighbor_vecs[i]);
     }
     const uint32_t po = std::min(prefetch_offset, unvisited_count);
     for (uint32_t i = 0; i < po; ++i) {
@@ -408,6 +425,8 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
     dc.batch_dist(neighbor_vecs.data(), unvisited_count, dists.data(),
                   has_extra_values ? neighbor_extra_values.data() : nullptr);
     if (ailego_unlikely(dc.error())) return;
+    // The queue can allocate; no resident pin may survive distance scoring.
+    resident_batch.release();
     pool.push_block(dists.data(), neighbor_ids.data(),
                     static_cast<int32_t>(unvisited_count));
   }
