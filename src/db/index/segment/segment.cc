@@ -2607,8 +2607,6 @@ TablePtr SegmentImpl::fetch_normal(
     std::sort(result_vec.begin(), result_vec.end());
 
     std::vector<std::shared_ptr<arrow::Scalar>> ordered_scalars;
-    // Keep the first sorted candidate for each output position, including
-    // repeated positions, without restarting the search for every row.
     auto it = result_vec.begin();
     for (int i = 0; i < static_cast<int>(segment_doc_ids.size()); ++i) {
       while (it != result_vec.end() && it->first < i) {
