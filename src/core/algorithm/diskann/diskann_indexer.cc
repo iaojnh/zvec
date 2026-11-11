@@ -1287,7 +1287,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
           : DiskAnnUtil::div_round_up(max_node_size_, DiskAnnUtil::kSectorSize);
 
   dc.bind_quantizer(quantizer_.get(), quant_codes_, quant_code_size_,
-                    paged_quant_codes_);
+                    paged_quant_codes_,
+                    storage_ ? storage_->vec_buffer_pool().get() : nullptr);
   if (dc.quantize_query(ctx->query_rotated()) != 0) return dc.error_code();
 
   ailego::ElapsedTime query_timer;
@@ -1604,7 +1605,8 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
     uint8_t *sector_buffer = reinterpret_cast<uint8_t *>(ctx->sector_buffer());
 
     dc.bind_quantizer(quantizer_.get(), quant_codes_, quant_code_size_,
-                      paged_quant_codes_);
+                      paged_quant_codes_,
+                    storage_ ? storage_->vec_buffer_pool().get() : nullptr);
     if (dc.quantize_query(ctx->query_rotated()) != 0) return dc.error_code();
 
     uint32_t num_ios = 0;

@@ -25,6 +25,7 @@
 #include <zvec/core/framework/index_meta.h>
 #include "diskann_entity.h"
 #include "diskann_pq_read_batch.h"
+#include "diskann_resident_pq_batch.h"
 #include "diskann_visit_filter.h"
 
 namespace zvec {
@@ -267,11 +268,22 @@ class DistCalculator {
   inline void bind_quantizer(
       const turbo::Quantizer *quantizer, const uint8_t *codes,
       uint32_t code_size,
-      IndexStorage::Segment::Pointer paged_codes = nullptr) {
+      IndexStorage::Segment::Pointer paged_codes = nullptr,
+      ailego::VecBufferPool *pool = nullptr) {
     quantizer_ = quantizer;
     quant_codes_ = codes;
     quant_code_size_ = code_size;
     paged_quant_codes_ = std::move(paged_codes);
+    resident_pq_pool_ = nullptr;
+    if (pool && !pool->writable() && paged_quant_codes_) {
+      auto &budget = ailego::MemoryLimitPool::get_instance();
+      const size_t capacity = budget.capacity();
+      const size_t limit = capacity - std::min(capacity, budget.page_admission_reserve());
+      const size_t fixed = budget.metadata_used();
+      // Avoid unsuccessful full-hit probes when PQ cannot fit in the pool.
+      if (limit > fixed && paged_quant_codes_->data_size() <= limit - fixed)
+        resident_pq_pool_ = pool;
+    }
   }
 
   int quantize_query(const void *query_rotated) try {
@@ -286,7 +298,10 @@ class DistCalculator {
 
   void quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) try {
     auto release =
-        ailego::ScopeGuard::Make([&]() { quant_code_blocks_.clear(); });
+        ailego::ScopeGuard::Make([&]() {
+          resident_pq_batch_.release();
+          quant_code_blocks_.clear();
+        });
     quant_dp_list_.resize(n);
     for (uint32_t i = 0; i < n; ++i) {
       if (ids[i] >= entity_->doc_cnt()) {
@@ -302,7 +317,10 @@ class DistCalculator {
             quant_codes_ + static_cast<size_t>(ids[i]) * quant_code_size_;
       }
     }
-    if (paged_quant_codes_) {
+    if (paged_quant_codes_ &&
+        !(resident_pq_pool_ && resident_pq_batch_.read(
+            *resident_pq_pool_, *paged_quant_codes_, ids, n, quant_code_size_,
+            quant_dp_list_))) {
       const int ret = ReadPagedQuantizedCodes(
           *paged_quant_codes_, ids, n, quant_code_size_, quant_code_blocks_,
           quant_dp_list_);
@@ -454,6 +472,8 @@ class DistCalculator {
   const uint8_t *quant_codes_{nullptr};
   IndexStorage::Segment::Pointer paged_quant_codes_;
   uint32_t quant_code_size_{0};
+  ailego::VecBufferPool *resident_pq_pool_{nullptr};
+  ResidentPqBatch resident_pq_batch_;
 
   turbo::DistanceImpl quant_dist_impl_{};
 
