@@ -38,6 +38,7 @@
 #include <zvec/db/reranker.h>
 #include <zvec/db/schema.h>
 #include <zvec/db/status.h>
+#include "db/collection_fetch_internal.h"
 #include "db/collection_query_internal.h"
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
@@ -2207,6 +2208,37 @@ Result<DocPtrMap> CollectionImpl::fetch(
   auto segments = get_all_segments();
 
   DocPtrMap results;
+  if (!include_vector && pks.size() > 1) {
+    std::vector<DocPtrMap::value_type *> entries;
+    entries.reserve(pks.size());
+    for (const auto &pk : pks) {
+      auto [entry, inserted] = results.emplace(pk, nullptr);
+      if (inserted) entries.push_back(&*entry);
+    }
+    // Reuse the caller's keys for the usual all-distinct batch. Rehashing
+    // results does not invalidate pointers to its entries.
+    std::vector<std::string> unique_keys;
+    const auto *lookup_keys = &pks;
+    if (entries.size() != pks.size()) {
+      unique_keys.reserve(entries.size());
+      for (const auto *entry : entries) unique_keys.push_back(entry->first);
+      lookup_keys = &unique_keys;
+    }
+    const auto doc_ids = detail::FetchPrimaryKeyIds(*id_map_, *lookup_keys);
+    for (size_t i = 0; i < entries.size(); ++i) {
+      const uint64_t doc_id = doc_ids[i];
+      if (doc_id == INVALID_DOC_ID || delete_store_->is_deleted(doc_id)) {
+        continue;
+      }
+      auto segment = local_segment_by_doc_id(doc_id, segments);
+      if (!segment) {
+        LOG_WARN("doc_id: %zu segment not found", (size_t)doc_id);
+        continue;
+      }
+      entries[i]->second = segment->fetch(doc_id, output_fields, false);
+    }
+    return results;
+  }
 
   for (auto &pk : pks) {
     uint64_t doc_id;
