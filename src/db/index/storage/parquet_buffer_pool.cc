@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "parquet_buffer_pool.h"
+#include <atomic>
 #include <arrow/array/array_binary.h>
 #include <arrow/io/file.h>
 #include <arrow/ipc/reader.h>
@@ -24,27 +25,96 @@
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace zvec {
 
-ParquetBufferID::ParquetBufferID(const std::string &filename, int column,
-                                 int row_group)
-    : filename(filename), column(column), row_group(row_group) {
-  const auto path = ailego::FileHelper::PathFromUtf8(filename);
+arrow::Result<std::shared_ptr<const ParquetFileContext>>
+ParquetFileContext::Make(
+    const std::string &filename,
+    std::shared_ptr<arrow::io::RandomAccessFile> opened_file) {
+  if (auto *mapped =
+          dynamic_cast<arrow::io::MemoryMappedFile *>(opened_file.get())) {
+    // Keep the existing pread-based cache loader without reopening a path
+    // that may now refer to another file.
 #if defined(_WIN32) || defined(_WIN64)
-  struct _stat64 file_stat;
-  if (!path.empty() && _wstat64(path.c_str(), &file_stat) == 0) {
+    int fd = _dup(mapped->file_descriptor());
+#else
+    int fd = fcntl(mapped->file_descriptor(), F_DUPFD_CLOEXEC, 0);
+#endif
+    if (fd < 0) {
+      return arrow::Status::IOError("Failed to duplicate opened parquet file: ",
+                                    filename);
+    }
+    auto readable = arrow::io::ReadableFile::Open(fd);
+    if (!readable.ok()) {
+#if defined(_WIN32) || defined(_WIN64)
+      _close(fd);
+#else
+      close(fd);
+#endif
+      return readable.status();
+    }
+    opened_file = std::move(readable).ValueOrDie();
+  }
+  return std::shared_ptr<const ParquetFileContext>(
+      std::make_shared<ParquetFileContext>(filename, std::move(opened_file)));
+}
+
+ParquetBufferID::ParquetBufferID(
+    const std::string &filename,
+    const std::shared_ptr<arrow::io::RandomAccessFile> &file, int column,
+    int row_group)
+    : filename(filename), column(column), row_group(row_group), input(file) {
+  int fd = -1;
+  if (auto *readable = dynamic_cast<arrow::io::ReadableFile *>(file.get())) {
+    fd = readable->file_descriptor();
+  } else if (auto *mapped =
+                 dynamic_cast<arrow::io::MemoryMappedFile *>(file.get())) {
+    fd = mapped->file_descriptor();
+  }
+  // Identify the opened file, so a pathname replacement cannot mix the
+  // cache identity with bytes from a different file.
+#if defined(_WIN32) || defined(_WIN64)
+  BY_HANDLE_FILE_INFORMATION info;
+  if (fd >= 0 && GetFileInformationByHandle(
+                     reinterpret_cast<HANDLE>(_get_osfhandle(fd)), &info)) {
+    file_id =
+        (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    device_id = info.dwVolumeSerialNumber;
+    mtime = static_cast<int64_t>(
+        (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+        info.ftLastWriteTime.dwLowDateTime);
+    return;
+  }
 #else
   struct stat file_stat;
-  if (stat(filename.c_str(), &file_stat) == 0) {
-#endif
+  if (fd >= 0 && fstat(fd, &file_stat) == 0) {
     file_id = file_stat.st_ino;
+    device_id = file_stat.st_dev;
+#if defined(__APPLE__)
+    mtime = static_cast<int64_t>(file_stat.st_mtimespec.tv_sec) * 1000000000 +
+            file_stat.st_mtimespec.tv_nsec;
+#else
+    mtime = static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000 +
+            file_stat.st_mtim.tv_nsec;
+#endif
+    return;
   }
-
-  std::error_code ec;
-  const auto ftime = std::filesystem::last_write_time(path, ec);
-  if (!ec) {
-    mtime = static_cast<int64_t>(ftime.time_since_epoch().count());
-  }
+#endif
+  // Backends without a local descriptor cannot safely share a pathname
+  // identity across opens. Isolate their caches for this open lifetime.
+  static std::atomic<uint64_t> next_generation{1};
+  generation = next_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 const std::string ParquetBufferID::to_string() const {
@@ -53,6 +123,8 @@ const std::string ParquetBufferID::to_string() const {
          ", column: " + std::to_string(column) +
          ", row_group: " + std::to_string(row_group);
   msg += ", mtime: " + std::to_string(mtime);
+  msg += ", device: " + std::to_string(device_id) +
+         ", generation: " + std::to_string(generation);
   msg += "]";
   return msg;
 }
@@ -76,15 +148,13 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
                                        size_t &size) {
   arrow::MemoryPool *mem_pool = arrow::default_memory_pool();
 
-  std::shared_ptr<arrow::io::RandomAccessFile> input;
+  auto input = buffer_id.input.lock();
   const auto &file_name = buffer_id.filename;
-  auto input_result = arrow::io::ReadableFile::Open(file_name);
-  if (!input_result.ok()) {
-    LOG_ERROR("Failed to open parquet file[%s]: %s", file_name.c_str(),
-              input_result.status().ToString().c_str());
+  if (!input) {
+    LOG_ERROR("Opened parquet file is no longer available: %s",
+              file_name.c_str());
     return false;
   }
-  input = *input_result;
 
   std::unique_ptr<parquet::arrow::FileReader> reader;
   auto reader_result = parquet::arrow::OpenFile(input, mem_pool);
@@ -137,15 +207,15 @@ ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
               buffer_id.to_string().c_str());
     return ParquetBufferContextHandle();
   }
-  return ParquetBufferContextHandle(buffer_id, arrow);
+  return ParquetBufferContextHandle(std::move(buffer_id), std::move(arrow));
 }
 
-void ParquetBufferPool::release(ParquetBufferID buffer_id) {
+void ParquetBufferPool::release(const ParquetBufferID &buffer_id) {
   cache_.release(buffer_id);
 }
 
 std::shared_ptr<arrow::ChunkedArray> ParquetBufferPool::retain(
-    ParquetBufferID buffer_id) {
+    const ParquetBufferID &buffer_id) {
   return cache_.retain(buffer_id);
 }
 

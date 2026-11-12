@@ -28,6 +28,9 @@
 
 namespace zvec {
 
+struct ParquetFileContext;
+class Doc;
+
 /// BufferPoolForwardStore implements a forward store that uses a buffer pool
 /// to efficiently manage data access from parquet files.
 class BufferPoolForwardStore
@@ -58,6 +61,12 @@ class BufferPoolForwardStore
   /// \return An ExecBatch containing the requested data or nullptr on failure
   ExecBatchPtr fetch(const std::vector<std::string> &columns,
                      int index) override;
+
+  // Optional primitive-row fast path. Unsupported layouts/types return nullptr
+  // so the caller can retain the existing scalar conversion path.
+  std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
+                                 const std::shared_ptr<arrow::Schema> &schema,
+                                 int index);
 
   /// Scan specified columns from the data source
   /// \param columns The list of column names to scan
@@ -110,6 +119,7 @@ class BufferPoolForwardStore
   // Parquet-specific members
   /// The RandomAccessFile for reading data
   std::shared_ptr<arrow::io::RandomAccessFile> file_;
+  std::shared_ptr<const ParquetFileContext> file_context_;
 
   /// The parquet file reader
   std::unique_ptr<parquet::arrow::FileReader> parquet_reader_;

@@ -80,15 +80,18 @@ class IPCRecordBatchReader : public arrow::RecordBatchReader {
 
 class ParquetRecordBatchReader : public arrow::RecordBatchReader {
  public:
-  ParquetRecordBatchReader(std::unique_ptr<parquet::arrow::FileReader> &reader,
-                           const std::vector<std::string> &columns,
-                           std::shared_ptr<arrow::Schema> schema,
-                           const std::string &file_path, bool with_cache = true)
+  ParquetRecordBatchReader(
+      std::unique_ptr<parquet::arrow::FileReader> &reader,
+      const std::vector<std::string> &columns,
+      std::shared_ptr<arrow::Schema> schema, const std::string &file_path,
+      bool with_cache = true,
+      std::shared_ptr<const ParquetFileContext> file_context = nullptr)
       : reader_(std::move(reader)),
         schema_(std::move(schema)),
         columns_(columns),
         file_path_(file_path),
-        with_cache_(with_cache) {
+        with_cache_(with_cache && file_context != nullptr),
+        file_context_(std::move(file_context)) {
     std::vector<std::shared_ptr<arrow::Field>> fields;
     for (const auto &col : columns) {
       int index = schema_->GetFieldIndex(col);
@@ -127,8 +130,9 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
     std::vector<std::shared_ptr<arrow::Array>> chunks(col_indices_.size());
     if (with_cache_) {
       for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
-        auto buffer_id =
-            ParquetBufferID(file_path_, col_indices_[col_idx], rg_id);
+        auto buffer_id = file_context_->buffer_id;
+        buffer_id.column = col_indices_[col_idx];
+        buffer_id.row_group = rg_id;
         auto buffer_handle =
             ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
         std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
@@ -180,6 +184,7 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   std::vector<int64_t> row_group_offsets_;
   std::vector<int64_t> row_group_row_nums_;
   bool with_cache_;
+  std::shared_ptr<const ParquetFileContext> file_context_;
 };
 
 
