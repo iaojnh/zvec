@@ -25,7 +25,7 @@ jobs:
           Write-Host "Download completed at $(Get-Date -Format o)"
           if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne "74E626EDE09B0BAA5011FC9E51B58627EA92C3FC0BAE5FD7DB34B490F335F651") { throw "Checksum mismatch" }
           Write-Host "Archive extraction started at $(Get-Date -Format o)"
-          tar -xf $archive -C $env:RUNNER_TEMP
+          python -c "import os,tarfile; p=os.path.join(os.environ['RUNNER_TEMP'],'sde.tar.xz'); t=tarfile.open(p,'r:xz'); t.extractall(os.environ['RUNNER_TEMP'],filter='data')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "Archive extraction finished at $(Get-Date -Format o)"
           $sde = Join-Path $env:RUNNER_TEMP "sde-external-10.13.1-2026-07-28-win\sde.exe"
