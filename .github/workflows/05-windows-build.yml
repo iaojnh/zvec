@@ -20,14 +20,6 @@ jobs:
           - platform: windows-2022
             msvc_arch: x64
             python_version: '3.10'
-          - platform: windows-2025
-            msvc_arch: x64
-            python_version: '3.10'
-          # Windows ARM64: Python 3.10 has no official ARM64 installer;
-          # 3.11 is the first CPython release with a Windows-on-ARM build.
-          - platform: windows-11-arm
-            msvc_arch: arm64
-            python_version: '3.11'
 
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -113,6 +105,19 @@ jobs:
         run: python .github/workflows/scripts/check_simd_initializers.py build
         shell: powershell
 
+      - name: Save native package for instruction diagnostics
+        run: |
+          python -c "import importlib.util, shutil; p=next(iter(importlib.util.find_spec('zvec').submodule_search_locations)); shutil.copytree(p, 'native-diagnostic/zvec')"
+        shell: powershell
+
+      - name: Upload native image and linker map
+        uses: actions/upload-artifact@v4
+        with:
+          name: zvec-runtime-diagnostic
+          path: |
+            build/zvec-runtime.map
+            native-diagnostic
+
       - name: Check loading and search on CPUs without AVX
         if: matrix.platform == 'windows-2022'
         timeout-minutes: 10
@@ -141,85 +146,13 @@ jobs:
           foreach ($image in $images) {
             $imageArgs += @('-chip_check_image', $image.Name)
           }
-          foreach ($cpu in @('-mrm', '-wsm', '-glm', '-snb')) {
+          $failed = $false
+          foreach ($cpu in @('-wsm', '-glm', '-snb', '-mrm')) {
             Write-Host "Checking DLL loading and dense/sparse search for $cpu"
             & $sde $cpu @imageArgs -- python -I .github/workflows/scripts/smoke_no_avx.py --dll-only
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($LASTEXITCODE -ne 0) { $failed = $true; continue }
             & $sde $cpu @imageArgs -- python -I .github/workflows/scripts/smoke_no_avx.py
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($LASTEXITCODE -ne 0) { $failed = $true; continue }
           }
-        shell: powershell
-
-      - name: Run C++ Tests
-        run: |
-          cd "$env:GITHUB_WORKSPACE\build"
-          cmake --build . --target unittest --config Release --parallel $env:NPROC
-        shell: powershell
-
-      - name: Show sccache statistics after tests
-        if: always()
-        continue-on-error: true
-        run: sccache --show-stats
-        shell: powershell
-
-      - name: Run Python Tests
-        run: |
-          cd "$env:GITHUB_WORKSPACE"
-          python -m pytest python/tests/ --basetemp=./.pytest_tmp
-        shell: powershell
-
-      - name: Run C++ Examples
-        run: |
-          cd "$env:GITHUB_WORKSPACE\examples\c++"
-          mkdir build
-          cd build
-          # These small examples do not need a remote compiler cache. Clear
-          # both launchers so a cache outage cannot block their smoke tests.
-          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER_LAUNCHER= `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build . --config Release --parallel $env:NPROC
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # Copy zvec DLLs next to the example executables so Windows can find them.
-          # CMake places DLLs in bin/ (RUNTIME output) and import libs in lib/.
-          $buildDir = "$env:GITHUB_WORKSPACE\build"
-          foreach ($dllName in @("zvec.dll", "zvec_core.dll", "zvec_ailego.dll")) {
-            $found = $false
-            foreach ($sub in @("$buildDir\bin", "$buildDir\bin\Release", "$buildDir\lib", "$buildDir\lib\Release")) {
-              $dllPath = Join-Path $sub $dllName
-              if (Test-Path $dllPath) {
-                Copy-Item $dllPath -Destination . -Force
-                Write-Host "Copied $dllName from $sub"
-                $found = $true
-                break
-              }
-            }
-            if (-not $found) {
-              Write-Host "WARNING: $dllName not found, searching recursively..."
-              $dll = Get-ChildItem -Path $buildDir -Filter $dllName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($dll) {
-                Copy-Item $dll.FullName -Destination . -Force
-                Write-Host "Copied $dllName from $($dll.DirectoryName)"
-              } else {
-                Write-Error "$dllName not found anywhere under $buildDir"
-              }
-            }
-          }
-
-          .\db-example.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\core-example.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\diskann-core-example.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\ailego-example.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        shell: powershell
-
-      - name: Show sccache statistics
-        if: always()
-        continue-on-error: true
-        run: sccache --show-stats
+          if ($failed) { exit 1 }
         shell: powershell

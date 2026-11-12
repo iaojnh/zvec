@@ -106,6 +106,7 @@ elseif (APPLE)
             -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/exports.mac
     )
 elseif (MSVC)
+    target_link_options(_zvec PRIVATE "/MAP:${CMAKE_BINARY_DIR}/zvec-runtime.map")
     set(_zvec_whole_archive_libs
             core_knn_flat_static
             core_knn_flat_sparse_static

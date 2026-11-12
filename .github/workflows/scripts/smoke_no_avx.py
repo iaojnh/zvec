@@ -20,6 +20,7 @@ def load_dll() -> None:
 
 def search() -> None:
     import zvec  # noqa: PLC0415
+    print("Stage: Python import succeeded", flush=True)
 
     schema = zvec.CollectionSchema(
         name="no_avx",
@@ -38,7 +39,9 @@ def search() -> None:
         ],
     )
     with tempfile.TemporaryDirectory() as tmp:
+        print("Stage: creating collection", flush=True)
         collection = zvec.create_and_open(str(Path(tmp) / "collection"), schema)
+        print("Stage: inserting documents", flush=True)
         collection.insert(
             [
                 zvec.Doc(
@@ -47,8 +50,10 @@ def search() -> None:
                 zvec.Doc(id="b", vectors={"dense": [0.0] * 16, "sparse": {3: 1.0}}),
             ]
         )
+        print("Stage: optimizing collection", flush=True)
         collection.optimize()
         for field, vector in [("dense", [1.0] * 16), ("sparse", {2: 1.0, 4: 2.0})]:
+            print(f"Stage: querying {field}", flush=True)
             result = collection.query(zvec.Query(field, vector=vector), topk=1)
             assert result[0].id == "a", result
         collection.close()
