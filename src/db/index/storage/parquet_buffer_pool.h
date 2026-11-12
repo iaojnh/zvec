@@ -135,6 +135,10 @@ class ParquetBufferContextHandle {
     return arrow_;
   }
 
+  // Returned arrays retain the cache pin through their buffers. Returns null
+  // when the shared scan lease budget is exhausted; the handle stays usable.
+  std::shared_ptr<arrow::ChunkedArray> borrow_for_scan() &&;
+
  private:
   ParquetBufferID buffer_id_;
   std::shared_ptr<arrow::ChunkedArray> arrow_{nullptr};

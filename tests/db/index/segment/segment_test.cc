@@ -2426,3 +2426,45 @@ TEST_P(SegmentTest, FetchSharedBlockAndCrossBlockRowsPreserveOrder) {
   check({12, 8, 15, 12});
   check({15, 0, 8, 3});
 }
+
+TEST_P(SegmentTest, SharedLayoutCrossBlockOwnsReorderedArraysAndLocalIDs) {
+  options_.max_buffer_size_ = 64 * 1024 * 1024;
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 8);
+  ASSERT_NE(segment, nullptr);
+  ASSERT_TRUE(segment->flush().ok());
+  ASSERT_TRUE(test::TestHelper::SegmentInsertDoc(segment, *schema_, 8, 16).ok());
+  const std::vector<int> rows{15, 0, 8, 3, 15, 0, 7, 9};
+  const std::vector<std::string> columns{"array_binary", LOCAL_ROW_ID, "name",
+                                         "id"};
+  auto check = [&]() {
+    auto result = segment->fetch(columns, rows);
+    EXPECT_NE(result, nullptr);
+    if (!result) return result;
+    EXPECT_TRUE(result->ValidateFull().ok());
+    for (size_t row = 0; row < rows.size(); ++row) {
+      auto point = segment->fetch(columns, std::vector<int>{rows[row]});
+      EXPECT_NE(point, nullptr);
+      if (!point) continue;
+      for (size_t col = 0; col < columns.size(); ++col) {
+        EXPECT_TRUE(result->column(col)->GetScalar(row).ValueOrDie()->Equals(
+            *point->column(col)->GetScalar(0).ValueOrDie()));
+      }
+    }
+    return result;
+  };
+  check();  // Mixed persisted and mutable blocks.
+  ASSERT_TRUE(segment->dump().ok());
+  auto retained = check();
+  ASSERT_NE(retained, nullptr);
+  segment.reset();
+  for (int i = 0; i < 4; ++i) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  }
+  ASSERT_TRUE(retained->ValidateFull().ok());
+  for (size_t row = 0; row < rows.size(); ++row) {
+    EXPECT_TRUE(retained->column(1)->GetScalar(row).ValueOrDie()->Equals(
+        arrow::UInt64Scalar(rows[row])));
+  }
+}

@@ -2748,6 +2748,103 @@ TablePtr SegmentImpl::fetch_shared_block(
   }
   if (!store) return nullptr;
 
+  if (std::any_of(segment_doc_ids.begin(), segment_doc_ids.end(),
+                  [&](int row) { return row < begin || row >= end; })) {
+    struct BlockRows {
+      BaseForwardStore::Ptr store;
+      std::vector<int> rows;
+      TablePtr table;
+    };
+    struct OutputRun {
+      BlockRows *group;
+      int64_t offset;
+      int64_t length;
+    };
+    // Allocate bookkeeping only for blocks touched by this request.
+    std::map<size_t, BlockRows> groups;
+    std::vector<OutputRun> runs;
+    runs.reserve(segment_doc_ids.size());
+    for (int row : segment_doc_ids) {
+      if (row < 0) return nullptr;
+      size_t index;
+      int64_t block_begin;
+      BaseForwardStore::Ptr selected;
+      if (row < persisted_rows) {
+        auto it = std::upper_bound(offsets.begin(), offsets.end(), row);
+        index = it - offsets.begin() - 1;
+        block_begin = offsets[index];
+        selected = persist_stores_[index];
+      } else {
+        if (!segment_meta_->has_writing_forward_block() || !memory_store_) {
+          return nullptr;
+        }
+        const auto &block = segment_meta_->writing_forward_block().value();
+        if (row >= persisted_rows + block.doc_count_) return nullptr;
+        for (const auto &column : stored_columns) {
+          if (!block.contain_column(column)) return nullptr;
+        }
+        index = blocks.size();
+        block_begin = persisted_rows;
+        selected = memory_store_;
+      }
+      auto &group = groups[index];
+      group.store = std::move(selected);
+      const int64_t offset = group.rows.size();
+      group.rows.push_back(static_cast<int>(row - block_begin));
+      if (!runs.empty() && runs.back().group == &group &&
+          runs.back().offset + runs.back().length == offset) {
+        ++runs.back().length;
+      } else {
+        runs.push_back({&group, offset, 1});
+      }
+    }
+    for (auto &entry : groups) {
+      auto &group = entry.second;
+      if (group.rows.empty()) continue;
+      if (!group.store) return nullptr;
+      group.table = group.store->fetch(stored_columns, group.rows);
+      if (!group.table ||
+          group.table->num_rows() != static_cast<int64_t>(group.rows.size()) ||
+          group.table->num_columns() !=
+              static_cast<int>(stored_columns.size())) {
+        return nullptr;
+      }
+      for (size_t i = 0; i < stored_columns.size(); ++i) {
+        const size_t output = i + (has_row_id && i >= row_id_column);
+        if (group.table->field(i)->name() != stored_columns[i] ||
+            !group.table->column(i)->type()->Equals(
+                result_schema->field(output)->type())) {
+          return nullptr;
+        }
+      }
+    }
+    std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays(columns.size());
+    for (size_t i = 0; i < stored_columns.size(); ++i) {
+      arrow::ArrayVector chunks;
+      chunks.reserve(runs.size());
+      for (const auto &run : runs) {
+        // Store gathers own their buffers. Slices keep that ownership and avoid
+        // the Array -> Scalar -> Array round trip in the general fallback.
+        auto slice = run.group->table->column(i)->Slice(run.offset, run.length);
+        chunks.insert(chunks.end(), slice->chunks().begin(),
+                      slice->chunks().end());
+      }
+      const size_t output = i + (has_row_id && i >= row_id_column);
+      arrays[output] = std::make_shared<arrow::ChunkedArray>(
+          std::move(chunks), result_schema->field(output)->type());
+    }
+    if (has_row_id) {
+      arrow::UInt64Builder builder;
+      if (!builder.Reserve(segment_doc_ids.size()).ok()) return nullptr;
+      for (int row : segment_doc_ids) builder.UnsafeAppend(row);
+      auto ids = builder.Finish();
+      if (!ids.ok()) return nullptr;
+      arrays[row_id_column] = std::make_shared<arrow::ChunkedArray>(*ids);
+    }
+    return arrow::Table::Make(result_schema, std::move(arrays),
+                              segment_doc_ids.size());
+  }
+
   std::vector<int> rows;
   rows.reserve(segment_doc_ids.size());
   for (int row : segment_doc_ids) {

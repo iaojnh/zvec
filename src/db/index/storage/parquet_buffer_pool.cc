@@ -14,7 +14,9 @@
 
 #include "parquet_buffer_pool.h"
 #include <atomic>
+#include <optional>
 #include <arrow/array/array_binary.h>
+#include <arrow/array/util.h>
 #include <arrow/io/file.h>
 #include <arrow/ipc/reader.h>
 #include <arrow/pretty_print.h>
@@ -141,6 +143,76 @@ ParquetBufferContextHandle::~ParquetBufferContextHandle() {
   if (arrow_) {
     ParquetBufferPool::get_instance().release(buffer_id_);
   }
+}
+
+namespace {
+// Bound outstanding borrowed scan buffers across readers. Leave most of the
+// managed pool available for loads; retained batches fall back to owned copies.
+std::atomic<size_t> scan_lease_bytes{0};
+
+bool ScanBufferBytes(const std::shared_ptr<arrow::ArrayData> &data,
+                     size_t limit, size_t *bytes) {
+  for (const auto &buffer : data->buffers) {
+    if (!buffer) continue;
+    const auto size = static_cast<size_t>(buffer->capacity());
+    if (size > limit - *bytes) return false;
+    *bytes += size;
+  }
+  for (const auto &child : data->child_data) {
+    if (!ScanBufferBytes(child, limit, bytes)) return false;
+  }
+  return !data->dictionary || ScanBufferBytes(data->dictionary, limit, bytes);
+}
+
+struct ScanBufferLease {
+  ~ScanBufferLease() {
+    // Publish budget availability only after releasing the cache pin.
+    handle.reset();
+    scan_lease_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+  }
+  std::optional<ParquetBufferContextHandle> handle;
+  size_t bytes{0};
+};
+
+std::shared_ptr<arrow::ArrayData> LeaseArrayData(
+    const std::shared_ptr<arrow::ArrayData> &source,
+    const std::shared_ptr<ScanBufferLease> &lease) {
+  auto data = source->Copy();
+  for (auto &buffer : data->buffers) {
+    if (buffer) buffer = std::shared_ptr<arrow::Buffer>(lease, buffer.get());
+  }
+  for (auto &child : data->child_data) child = LeaseArrayData(child, lease);
+  if (data->dictionary) {
+    data->dictionary = LeaseArrayData(data->dictionary, lease);
+  }
+  return data;
+}
+}  // namespace
+
+std::shared_ptr<arrow::ChunkedArray>
+ParquetBufferContextHandle::borrow_for_scan() && {
+  if (!arrow_) return nullptr;
+  const size_t limit = ailego::MemoryLimitPool::get_instance().capacity() / 8;
+  size_t bytes = 0;
+  for (const auto &chunk : arrow_->chunks()) {
+    if (!ScanBufferBytes(chunk->data(), limit, &bytes)) return nullptr;
+  }
+  auto lease = std::make_shared<ScanBufferLease>();
+  size_t used = scan_lease_bytes.load(std::memory_order_relaxed);
+  do {
+    if (used > limit || bytes > limit - used) return nullptr;
+  } while (!scan_lease_bytes.compare_exchange_weak(used, used + bytes,
+                                                   std::memory_order_relaxed));
+  lease->bytes = bytes;
+  lease->handle.emplace(std::move(*this));
+  const auto &source = lease->handle->data();
+  arrow::ArrayVector chunks;
+  chunks.reserve(source->num_chunks());
+  for (const auto &chunk : source->chunks()) {
+    chunks.push_back(arrow::MakeArray(LeaseArrayData(chunk->data(), lease)));
+  }
+  return std::make_shared<arrow::ChunkedArray>(std::move(chunks),
+                                               source->type());
 }
 
 bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,

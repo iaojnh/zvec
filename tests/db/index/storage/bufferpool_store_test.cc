@@ -28,6 +28,7 @@
 #include <zvec/db/doc.h>
 #include "db/index/storage/bufferpool_forward_store.h"
 #include "db/index/storage/parquet_buffer_pool.h"
+#include "db/index/storage/lazy_record_batch_reader.h"
 #include "db/index/storage/selected_rows_plan.h"
 #include "utils/utils.h"
 
@@ -1191,4 +1192,119 @@ TEST_F(BufferPoolStoreTest, NonLocalContextLoadsWithoutOpeningPath) {
   ASSERT_NE(handle.data(), nullptr);
   auto scalar = handle.data()->GetScalar(0).ValueOrDie();
   EXPECT_EQ(std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value, 400);
+}
+
+TEST_F(BufferPoolStoreTest,
+       ScanLeaseSurvivesReaderAndEvictionWithCopyFallback) {
+  arrow::StringBuilder builder;
+  for (int i = 0; i < 12; ++i) {
+    ASSERT_TRUE(builder.Append(std::string(65536, 'a' + i)).ok());
+  }
+  auto array = builder.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::utf8())}), {array});
+  const auto path = std::filesystem::absolute(parquet_path).string();
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*source, arrow::default_memory_pool(), out, 12)
+          .ok());
+  ASSERT_TRUE(out->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(path);
+  ASSERT_TRUE(store->open().ok());
+  auto input = arrow::io::ReadableFile::Open(path).ValueOrDie();
+  auto context = ParquetFileContext::Make(path, input).ValueOrDie();
+  std::weak_ptr<arrow::Buffer> cached;
+  const uint8_t *address;
+  {
+    auto handle =
+        ParquetBufferPool::get_instance().acquire_buffer(context->buffer_id);
+    ASSERT_NE(handle.data(), nullptr);
+    cached = handle.data()->chunk(0)->data()->buffers[2];
+    address = handle.data()->chunk(0)->data()->buffers[2]->data();
+  }
+  auto first_reader = store->scan({"value"});
+  auto second_reader = store->scan({"value"});
+  std::shared_ptr<arrow::RecordBatch> borrowed, copied;
+  ASSERT_TRUE(first_reader->ReadNext(&borrowed).ok());
+  ASSERT_TRUE(second_reader->ReadNext(&copied).ok());
+  ASSERT_NE(borrowed, nullptr);
+  ASSERT_NE(copied, nullptr);
+  // 3/4 MiB fits the 10 MiB pool's lease quota, but two retained batches do
+  // not.
+  EXPECT_EQ(borrowed->column(0)->data()->buffers[2]->data(), address);
+  EXPECT_NE(copied->column(0)->data()->buffers[2]->data(), address);
+  EXPECT_TRUE(borrowed->Equals(*copied));
+  first_reader.reset();
+  second_reader.reset();
+  store.reset();
+  for (int i = 0; i < 4; ++i) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  }
+  EXPECT_FALSE(cached.expired());
+  EXPECT_TRUE(borrowed->column(0)->Equals(array));
+  borrowed.reset();
+  for (int i = 0; i < 4; ++i) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  }
+  EXPECT_TRUE(cached.expired());
+  EXPECT_TRUE(copied->column(0)->Equals(array));
+  // Releasing the last batch makes the same quota available again.
+  auto handle =
+      ParquetBufferPool::get_instance().acquire_buffer(context->buffer_id);
+  auto leased = std::move(handle).borrow_for_scan();
+  ASSERT_NE(leased, nullptr);
+}
+
+TEST_F(BufferPoolStoreTest, ScanNullableNestedColumnsAndRepeatedEOF) {
+  arrow::StringBuilder names;
+  auto values = std::make_shared<arrow::Int32Builder>();
+  arrow::ListBuilder lists(arrow::default_memory_pool(), values);
+  for (int row = 0; row < 19; ++row) {
+    if (row % 3 == 0) {
+      ASSERT_TRUE(names.AppendNull().ok());
+      ASSERT_TRUE(lists.AppendNull().ok());
+    } else {
+      ASSERT_TRUE(names.Append(std::to_string(row)).ok());
+      ASSERT_TRUE(lists.Append().ok());
+      ASSERT_TRUE(values->Append(row).ok());
+      ASSERT_TRUE(values->AppendNull().ok());
+    }
+  }
+  auto text = names.Finish().ValueOrDie();
+  auto items = lists.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("text", arrow::utf8()),
+                     arrow::field("items", arrow::list(arrow::int32()))}),
+      {text, items});
+  auto out = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*source, arrow::default_memory_pool(), out, 7)
+          .ok());
+  ASSERT_TRUE(out->Close().ok());
+  for (bool cache : {false, true}) {
+    auto input = arrow::io::ReadableFile::Open(parquet_path).ValueOrDie();
+    auto context = ParquetFileContext::Make(parquet_path, input).ValueOrDie();
+    auto file_reader =
+        parquet::arrow::OpenFile(input, arrow::default_memory_pool())
+            .ValueOrDie();
+    file_reader->set_batch_size(3);
+    ParquetRecordBatchReader reader(file_reader, {"items", "text"},
+                                    source->schema(), parquet_path, cache,
+                                    context);
+    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ASSERT_TRUE(reader.ReadNext(&batch).ok());
+      if (!batch) break;
+      ASSERT_TRUE(batch->ValidateFull().ok());
+      batches.push_back(batch);
+    }
+    ASSERT_GE(batches.size(), 3u);
+    auto actual = arrow::Table::FromRecordBatches(batches).ValueOrDie();
+    EXPECT_TRUE(actual->column(0)->Equals(source->column(1)));
+    EXPECT_TRUE(actual->column(1)->Equals(source->column(0)));
+    batch = batches.front();
+    ASSERT_TRUE(reader.ReadNext(&batch).ok());
+    EXPECT_EQ(batch, nullptr);
+  }
 }
