@@ -47,3 +47,4 @@ jobs:
           $output | ForEach-Object { Write-Host $_ }
           if ($result -eq 0 -or "$output" -notmatch 'Executed instruction not valid') { throw "Negative control did not detect the known AVX initializer" }
           Write-Host "Negative control correctly rejected AVX initialization"
+          exit 0
