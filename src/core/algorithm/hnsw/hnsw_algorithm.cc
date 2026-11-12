@@ -16,6 +16,124 @@
 namespace zvec {
 namespace core {
 
+namespace {
+
+// Keep the legacy dual-heap traversal, batching, and filter call order. This
+// kernel only replaces visit-filter dispatch and mmap vector resolution; it is
+// never used for construction, upper levels, providers, or group-by queries.
+template <typename VisitType>
+void filtered_mmap_search_neighbors(const HnswMmapStreamerEntity &entity,
+                                    node_id_t *entry_point, dist_t *dist,
+                                    TopkHeap &topk, HnswContext *ctx,
+                                    VisitType visit) {
+  const uint32_t prefetch_offset = ctx->po();
+  const uint32_t prefetch_lines =
+      ctx->pl() > 0 ? ctx->pl() : (entity.vector_size() + 63) / 64;
+  const bool has_extra_values = ctx->has_extra_values();
+  uint32_t buf_capacity = entity.max_degree(0);
+  auto &scratch = ctx->filtered_mmap_search_scratch();
+  scratch.ensure_size(buf_capacity, has_extra_values);
+  auto &neighbor_ids = scratch.neighbor_ids;
+  auto &dists = scratch.dists;
+  auto &neighbor_vecs = scratch.neighbor_vecs;
+  auto &neighbor_extra_values = scratch.neighbor_extra_values;
+  auto &dc = ctx->dist_calculator();
+  auto &candidates = ctx->candidates();
+  auto filter = [&](node_id_t id) {
+    return ctx->filter()(entity.get_key_typed(id));
+  };
+
+  candidates.clear();
+  visit.clear();
+  visit.set_visited(*entry_point);
+  if (!filter(*entry_point)) {
+    topk.emplace(*entry_point, *dist);
+  }
+
+  candidates.emplace(*entry_point, *dist);
+  while (!candidates.empty() && !ctx->reach_scan_limit()) {
+    auto top = candidates.begin();
+    node_id_t main_node = top->first;
+    dist_t main_dist = top->second;
+
+    if (topk.full() && main_dist > topk[0].second) {
+      break;
+    }
+
+    candidates.pop();
+    const auto neighbors = entity.get_neighbors_typed(0, main_node);
+    ailego_prefetch(neighbors.data);
+    if (ailego_unlikely(ctx->debugging())) {
+      (*ctx->mutable_stats_get_neighbors())++;
+    }
+
+    if (neighbors.size() > buf_capacity) {
+      buf_capacity = neighbors.size();
+      scratch.ensure_size(buf_capacity, has_extra_values);
+    }
+
+    uint32_t size = 0;
+    for (uint32_t i = 0; i < neighbors.size(); ++i) {
+      node_id_t node = neighbors[i];
+      if (visit.visited(node)) {
+        if (ailego_unlikely(ctx->debugging())) {
+          (*ctx->mutable_stats_visit_dup_cnt())++;
+        }
+        continue;
+      }
+      visit.set_visited(node);
+      neighbor_ids[size++] = node;
+    }
+    if (size == 0) {
+      continue;
+    }
+
+    // Mmap records remain mapped for the query. Resolve directly into the
+    // distance kernel's pointer array, without an intermediate MemoryBlock
+    // array, and start the existing prefetches as pointers become available.
+    const uint32_t po = std::min(prefetch_offset, size);
+    for (uint32_t i = 0; i < size; ++i) {
+      neighbor_vecs[i] = entity.get_vector_ptr(neighbor_ids[i]);
+      if (has_extra_values) {
+        neighbor_extra_values[i] = ctx->get_extra_values(neighbor_vecs[i]);
+      }
+      if (i < po) {
+        const char *base = static_cast<const char *>(neighbor_vecs[i]);
+        for (uint32_t cl = 0; cl < prefetch_lines; ++cl) {
+          ailego_prefetch(base + cl * 64);
+        }
+      }
+    }
+    if (ailego_unlikely(ctx->debugging())) {
+      (*ctx->mutable_stats_get_vector())++;
+    }
+
+    // One batch per expanded node preserves compare_cnt_ and the existing
+    // scan-limit boundary as well as the distance kernel's input ordering.
+    dc.batch_dist(neighbor_vecs.data(), size, dists.data(),
+                  has_extra_values ? neighbor_extra_values.data() : nullptr);
+
+    for (uint32_t i = 0; i < size; ++i) {
+      node_id_t node = neighbor_ids[i];
+      dist_t cur_dist = dists[i];
+
+      if ((!topk.full()) || cur_dist < topk[0].second) {
+        candidates.emplace(node, cur_dist);
+        // Rejected results still navigate the graph and update the entry point.
+        if (cur_dist < *dist) {
+          *entry_point = node;
+          *dist = cur_dist;
+        }
+        if (!filter(node)) {
+          topk.emplace(node, cur_dist);
+        }
+      }
+    }
+  }
+}
+
+}  // namespace
+
 template <typename EntityType>
 int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
                                         HnswContext *ctx) {
@@ -91,7 +209,21 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
     if (ailego_unlikely(ret != 0)) return ret;
   } else {
     auto &topk = ctx->search_heap().reset<TopkHeap>(capacity);
-    search_neighbors(0, &entry_point, &dist, topk, ctx);
+    bool dispatched = false;
+    // An exact type check excludes contiguous/external entities even though
+    // they also use MmapMemoryBlock. All other query modes keep the fallback.
+    if constexpr (std::is_same_v<EntityType, HnswMmapStreamerEntity>) {
+      if (!ctx->group_by_search() && !ctx->dist_calculator().has_provider()) {
+        const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
+        dispatched = dispatch_visit_filter(ctx->visit_filter(), [&](auto visit) {
+          filtered_mmap_search_neighbors(entity, &entry_point, &dist, topk, ctx,
+                                         visit);
+        });
+      }
+    }
+    if (!dispatched) {
+      search_neighbors(0, &entry_point, &dist, topk, ctx);
+    }
   }
 
   if (ctx->group_by_search()) {
