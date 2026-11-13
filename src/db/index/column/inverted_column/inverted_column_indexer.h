@@ -16,6 +16,8 @@
 #pragma once
 
 
+#include <array>
+#include <mutex>
 #include <zvec/ailego/pattern/expected.hpp>
 #include <zvec/db/schema.h>
 #include "db/common/concurrent_roaring_bitmap.h"
@@ -247,6 +249,17 @@ class InvertedColumnIndexer {
 
   Status open();
 
+  struct CachedRangeResult {
+    std::string key;
+    InvertedSearchResult::SharedBitmap bitmap;
+    size_t bytes;
+    uint64_t last_use;
+  };
+  InvertedSearchResult::SharedBitmap find_range_result(
+      const std::string &key) const;
+  InvertedSearchResult::SharedBitmap retain_range_result(
+      const std::string &key, InvertedRangeCache::BitmapPtr &bitmap) const;
+
   void build_range_cache();
 
   RangeQueryPlan plan_range(const std::string &term, bool query_left,
@@ -453,6 +466,13 @@ class InvertedColumnIndexer {
   SegmentDocRangeStat::Ptr doc_range_stat_{nullptr};
   RangePrefixCacheOptions range_cache_options_{};
   std::unique_ptr<InvertedRangeCache> range_cache_;
+  mutable std::mutex range_result_mutex_;
+  mutable std::vector<CachedRangeResult> range_results_;
+  mutable size_t range_result_bytes_{0};
+  mutable uint64_t range_result_clock_{0};
+  mutable bool range_results_dropped_{false};
+  mutable std::array<uint64_t, 32> range_result_history_{};
+  mutable size_t range_result_history_cursor_{0};
 };
 
 

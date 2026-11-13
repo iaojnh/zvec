@@ -353,6 +353,122 @@ class InvertedRangeCacheTest : public testing::Test {
   size_t initial_external_bytes_{0};
 };
 
+TEST_F(InvertedRangeCacheTest, SharedResultsDetachForBooleanOperations) {
+  CreateWriter();
+  const auto values = RandomValues(12000, true);
+  Insert(values);
+  ASSERT_TRUE(column_->seal().ok());
+  ASSERT_TRUE(column_->search(RawInt32(-3000), CompareOp::GT));
+  auto left = column_->search(RawInt32(-3000), CompareOp::GT);
+  auto independent = column_->search(RawInt32(-3000), CompareOp::GT);
+  auto right = column_->search(RawInt32(3000), CompareOp::LT);
+  ASSERT_TRUE(left && independent && right);
+  const auto original_count = independent->count();
+  left->AND(*right);
+  EXPECT_LT(left->count(), original_count);
+  EXPECT_EQ(independent->count(), original_count);
+  left->OR(*column_->search(RawInt32(-3000), CompareOp::LE));
+  left->destroy_bitmap();
+  CheckNumeric(values, {-3000, 3000});
+  EXPECT_EQ(independent->count(), original_count);
+}
+
+TEST_F(InvertedRangeCacheTest, EvictedResultsKeepTheirOwnershipAndBudget) {
+  CreateWriter();
+  const auto values = RandomValues(12000, true);
+  Insert(values);
+  ASSERT_TRUE(column_->seal().ok());
+  std::vector<InvertedSearchResult::Ptr> retained;
+  for (int i = 0; i < 24; ++i) {
+    ASSERT_TRUE(column_->search(RawInt32(-5800 + i * 470), CompareOp::GT));
+    retained.push_back(
+        column_->search(RawInt32(-5800 + i * 470), CompareOp::GT));
+    ASSERT_TRUE(retained.back());
+  }
+  column_.reset();
+  EXPECT_GT(ailego::MemoryLimitPool::get_instance().external_used(),
+            initial_external_bytes_);
+  for (size_t i = 0; i < retained.size(); ++i) {
+    for (size_t id = 0; id < values.size(); ++id) {
+      ASSERT_EQ(retained[i]->contains(id),
+                values[id] && *values[id] > -5800 + int(i) * 470);
+    }
+  }
+  retained.clear();
+  EXPECT_EQ(ailego::MemoryLimitPool::get_instance().external_used(),
+            initial_external_bytes_);
+}
+
+TEST_F(InvertedRangeCacheTest, ConcurrentExactResultsRemainIndependent) {
+  CreateWriter();
+  const auto values = RandomValues(12000, true);
+  Insert(values);
+  ASSERT_TRUE(column_->seal().ok());
+  std::atomic<bool> start{false}, correct{true};
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 8; ++t) {
+    readers.emplace_back([&] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (int i = 0; i < 16; ++i) {
+        auto result = column_->search(RawInt32(-3000), CompareOp::GT);
+        if (!result) {
+          correct = false;
+          break;
+        }
+        for (size_t id = 0; id < values.size(); ++id) {
+          if (result->contains(id) != (values[id] && *values[id] > -3000)) {
+            correct = false;
+            break;
+          }
+        }
+        auto upper = column_->search(RawInt32(3000), CompareOp::LT);
+        if (!upper) {
+          correct = false;
+          break;
+        }
+        result->AND(*upper);
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto &reader : readers) reader.join();
+  EXPECT_TRUE(correct.load());
+  CheckNumeric(values, {-3000, 3000});
+}
+
+TEST_F(InvertedRangeCacheTest, ResultAdmissionFailurePreservesTheQuery) {
+  CreateWriter();
+  const auto values = RandomValues(12000, true);
+  Insert(values);
+  ASSERT_TRUE(column_->seal().ok());
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t bytes = pool.available();
+  ASSERT_TRUE(pool.try_charge_external(bytes));
+  auto release = std::shared_ptr<void>(nullptr, [bytes](void *) {
+    ailego::MemoryLimitPool::get_instance().release_external(bytes);
+  });
+  CheckNumeric(values, {-3000, 3000});
+}
+
+TEST_F(InvertedRangeCacheTest, ColdPredicatesAvoidRetainingFullResults) {
+  CreateWriter();
+  const auto values = RandomValues(12000, true);
+  Insert(values);
+  ASSERT_TRUE(column_->seal().ok());
+  const size_t prefix_bytes =
+      ailego::MemoryLimitPool::get_instance().external_used();
+  for (int i = 0; i < 32; ++i) {
+    auto result = column_->search(RawInt32(-5999 + i * 137), CompareOp::GT);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(ailego::MemoryLimitPool::get_instance().external_used(),
+              prefix_bytes);
+  }
+  auto reused = column_->search(RawInt32(-5999), CompareOp::GT);
+  ASSERT_TRUE(reused);
+  EXPECT_GT(ailego::MemoryLimitPool::get_instance().external_used(),
+            prefix_bytes);
+}
+
 TEST_F(InvertedRangeCacheTest, FreshSealAndReopenPreserveRangeSemantics) {
   CreateWriter();
   const auto values = RandomValues(12000, true);

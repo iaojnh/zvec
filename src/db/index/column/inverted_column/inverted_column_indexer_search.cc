@@ -13,14 +13,117 @@
 // limitations under the License.
 
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <functional>
 #include <optional>
 #include <ailego/pattern/defer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include "inverted_codec.h"
 #include "inverted_column_indexer.h"
 
 
 namespace zvec {
+
+
+InvertedSearchResult::SharedBitmap InvertedColumnIndexer::find_range_result(
+    const std::string &key) const {
+  std::lock_guard<std::mutex> lock(range_result_mutex_);
+  if (range_results_dropped_) {
+    return {};
+  }
+  for (auto &entry : range_results_) {
+    if (entry.key == key) {
+      entry.last_use = ++range_result_clock_;
+      return entry.bitmap;
+    }
+  }
+  return {};
+}
+
+
+InvertedSearchResult::SharedBitmap InvertedColumnIndexer::retain_range_result(
+    const std::string &key, InvertedRangeCache::BitmapPtr &bitmap) const {
+  constexpr size_t kMaxEntries = 8;
+  constexpr size_t kMaxBytes = 8 * 1024 * 1024;
+  const size_t prefix_bytes =
+      range_cache_ ? range_cache_->stats.accounted_bytes : 0;
+  const size_t budget =
+      range_cache_options_.max_bytes > prefix_bytes
+          ? std::min(kMaxBytes, range_cache_options_.max_bytes - prefix_bytes)
+          : 0;
+  if (budget == 0) {
+    return {};
+  }
+  // Admit a predicate after reuse. One-off thresholds keep the original
+  // ownership path and do not cause large bitmap admission/eviction churn.
+  // Fingerprints only guide admission; cache hits always compare the full key.
+  const uint64_t fingerprint = std::hash<std::string>{}(key) | uint64_t{1};
+  {
+    std::lock_guard<std::mutex> lock(range_result_mutex_);
+    if (range_results_dropped_) {
+      return {};
+    }
+    for (auto &entry : range_results_) {
+      if (entry.key == key) {
+        entry.last_use = ++range_result_clock_;
+        return entry.bitmap;
+      }
+    }
+    const bool reused =
+        std::find(range_result_history_.begin(), range_result_history_.end(),
+                  fingerprint) != range_result_history_.end();
+    range_result_history_[range_result_history_cursor_++ %
+                          range_result_history_.size()] = fingerprint;
+    if (!reused) {
+      return {};
+    }
+  }
+  // Full statistics enumerate every matching ID for min/max/sum. Admission
+  // instead uses container metadata, as the prefix-cache accounting does.
+  roaring_bitmap_shrink_to_fit(bitmap.get());
+  const size_t bytes = roaring_bitmap_portable_size_in_bytes(bitmap.get()) +
+                       sizeof(roaring_bitmap_t) +
+                       size_t(bitmap->high_low_container.size) * 256 +
+                       key.size() + 256;
+  if (bytes > budget ||
+      !ailego::MemoryLimitPool::get_instance().try_charge_external(bytes)) {
+    return {};
+  }
+  // The charge follows the bitmap through eviction and outstanding queries.
+  InvertedSearchResult::SharedBitmap shared(
+      bitmap.release(), [bytes](const roaring_bitmap_t *p) {
+        roaring_bitmap_free(const_cast<roaring_bitmap_t *>(p));
+        ailego::MemoryLimitPool::get_instance().release_external(bytes);
+      });
+  // Reclaim evicted payloads after releasing the cache mutex.
+  std::array<InvertedSearchResult::SharedBitmap, kMaxEntries> evicted;
+  size_t evicted_count = 0;
+  std::lock_guard<std::mutex> lock(range_result_mutex_);
+  if (range_results_dropped_) {
+    return shared;
+  }
+  for (auto &entry : range_results_) {
+    if (entry.key == key) {
+      entry.last_use = ++range_result_clock_;
+      return entry.bitmap;
+    }
+  }
+  while (!range_results_.empty() && (range_results_.size() >= kMaxEntries ||
+                                     range_result_bytes_ > budget - bytes)) {
+    auto oldest = std::min_element(
+        range_results_.begin(), range_results_.end(),
+        [](const auto &a, const auto &b) { return a.last_use < b.last_use; });
+    range_result_bytes_ -= oldest->bytes;
+    evicted[evicted_count++] = std::move(oldest->bitmap);
+    range_results_.erase(oldest);
+  }
+  range_results_.push_back({key, shared, bytes, ++range_result_clock_});
+  range_result_bytes_ += bytes;
+  return shared;
+}
 
 
 Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_eq(
@@ -711,6 +814,21 @@ InvertedSearchResult::Ptr InvertedColumnIndexer::search(
   }
 
   std::string encoded_value = encode(value);
+  const bool cache_range = sealed_ && read_only_ &&
+                           range_cache_options_.max_bytes != 0 &&
+                           encoded_value.size() <= 4096 &&
+                           (op == CompareOp::LT || op == CompareOp::LE ||
+                            op == CompareOp::GT || op == CompareOp::GE);
+  std::string cache_key;
+  if (cache_range) {
+    const uint32_t operation = static_cast<uint32_t>(op);
+    cache_key.assign(reinterpret_cast<const char *>(&operation),
+                     sizeof(operation));
+    cache_key += encoded_value;
+    if (auto cached = find_range_result(cache_key)) {
+      return std::make_shared<InvertedSearchResult>(std::move(cached));
+    }
+  }
   auto search_res = std::make_shared<InvertedSearchResult>();
   Result<roaring_bitmap_t *> bitmap_res;
 
@@ -758,7 +876,13 @@ InvertedSearchResult::Ptr InvertedColumnIndexer::search(
   }
 
   if (bitmap_res) {
-    search_res->set_and_own_bitmap(bitmap_res.value());
+    InvertedRangeCache::BitmapPtr bitmap(bitmap_res.value());
+    if (cache_range && bitmap) {
+      if (auto cached = retain_range_result(cache_key, bitmap)) {
+        return std::make_shared<InvertedSearchResult>(std::move(cached));
+      }
+    }
+    search_res->set_and_own_bitmap(bitmap.release());
     return search_res;
   } else {
     LOG_ERROR("%s: failed to search, code[%d]", id().c_str(),

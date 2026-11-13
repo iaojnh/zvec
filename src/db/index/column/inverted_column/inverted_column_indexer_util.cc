@@ -163,6 +163,12 @@ InvertedColumnIndexer::Ptr InvertedColumnIndexer::CreateAndOpen(
 
 
 Status InvertedColumnIndexer::drop_storage() {
+  {
+    std::lock_guard<std::mutex> lock(range_result_mutex_);
+    range_results_.clear();
+    range_result_bytes_ = 0;
+    range_results_dropped_ = true;
+  }
   Status s = Status::OK();
   rocksdb::Status rs;
   AILEGO_DEFER([&]() {
