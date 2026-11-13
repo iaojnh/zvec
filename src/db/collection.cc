@@ -2577,44 +2577,49 @@ Result<DocPtrMap> CollectionImpl::fetch_unsafe(
   if (pks.empty()) return results;
   auto segments = get_all_segments();
 
-  if (!options_.enable_mmap_ && pks.size() > 1) {
-    struct PendingFetch {
+  if ((!options_.enable_mmap_ || !include_vector) && pks.size() > 1) {
+    struct Batch {
       Segment::Ptr segment;
-      std::vector<uint64_t> doc_ids;
-      std::vector<const std::string *> pks;
+      std::vector<uint64_t> ids;
+      std::vector<Doc::Ptr *> output;
     };
-    // Limit both the routing state and intermediate Arrow results. Mmap and
-    // single-document fetch keep their existing fast paths.
+    // Keep routing and Arrow intermediates bounded in both storage modes.
     for (size_t begin = 0; begin < pks.size();
          begin += Segment::kMaxFetchBatchSize) {
       const size_t end =
           std::min(pks.size(), begin + Segment::kMaxFetchBatchSize);
-      std::unordered_map<SegmentID, PendingFetch> batches;
+      std::vector<std::string> keys;
+      std::vector<Doc::Ptr *> output;
+      keys.reserve(end - begin);
+      output.reserve(end - begin);
       for (size_t i = begin; i < end; ++i) {
-        const auto &pk = pks[i];
-        if (!results.emplace(pk, nullptr).second) {
-          continue;
-        }
-        uint64_t doc_id;
-        const auto found = id_map_->lookup(pk, &doc_id);
-        if (!found) return tl::make_unexpected(found.error());
-        if (!*found || delete_store_->is_deleted(doc_id)) {
-          continue;
-        }
-        auto segment = local_segment_by_doc_id(doc_id, segments);
-        if (!segment) {
-          continue;
-        }
-        auto &batch = batches[segment->id()];
-        batch.segment = std::move(segment);
-        batch.doc_ids.push_back(doc_id);
-        batch.pks.push_back(&pk);
+        auto [entry, inserted] = results.emplace(pks[i], nullptr);
+        if (!inserted) continue;
+        keys.push_back(pks[i]);
+        output.push_back(&entry->second);
       }
-      for (auto &[id, batch] : batches) {
-        auto docs = batch.segment->fetch_docs(batch.doc_ids, output_fields,
-                                              include_vector);
-        for (size_t i = 0; i < batch.pks.size(); ++i) {
-          results.at(*batch.pks[i]) = std::move(docs[i]);
+      auto ids = detail::FetchPrimaryKeyIdsChecked(*id_map_, keys);
+      if (!ids) return tl::make_unexpected(ids.error());
+      std::vector<Batch> batches;
+      std::unordered_map<Segment *, size_t> batch_index;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        const auto doc_id = (*ids)[i];
+        if (doc_id == INVALID_DOC_ID || delete_store_->is_deleted(doc_id))
+          continue;
+        auto segment = local_segment_by_doc_id(doc_id, segments);
+        if (!segment) continue;
+        auto [entry, inserted] =
+            batch_index.emplace(segment.get(), batches.size());
+        if (inserted) batches.push_back(Batch{segment, {}, {}});
+        auto &batch = batches[entry->second];
+        batch.ids.push_back(doc_id);
+        batch.output.push_back(output[i]);
+      }
+      for (auto &batch : batches) {
+        auto docs = batch.segment->fetch_batch(batch.ids, output_fields,
+                                               include_vector);
+        for (size_t i = 0; i < batch.ids.size(); ++i) {
+          *batch.output[i] = std::move(docs[i]);
         }
       }
     }
