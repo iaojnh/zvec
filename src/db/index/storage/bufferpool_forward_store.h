@@ -62,8 +62,8 @@ class BufferPoolForwardStore
   ExecBatchPtr fetch(const std::vector<std::string> &columns,
                      int index) override;
 
-  // Optional primitive-row fast path. Unsupported layouts/types return nullptr
-  // so the caller can retain the existing scalar conversion path.
+  // Optional scalar/array row fast path. Unsupported layouts/types return
+  // nullptr so the caller can retain the existing scalar conversion path.
   std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
                                  const std::shared_ptr<arrow::Schema> &schema,
                                  int index);

@@ -853,10 +853,124 @@ TEST_F(BufferPoolStoreTest,
   for (int row = 0; row < 6; ++row) check_doc(retained[row], row);
 }
 
-TEST_F(BufferPoolStoreTest, DirectDocDeclinesComplexTypesWithoutPinning) {
+namespace {
+
+template <typename BuilderType, typename ValueType>
+void CheckOwnedArrayDocs(const std::string &path,
+                         const std::vector<ValueType> &expected) {
   arrow::UInt64Builder ids;
   arrow::StringBuilder keys;
-  auto values = std::make_shared<arrow::Int32Builder>();
+  auto values = std::make_shared<BuilderType>();
+  arrow::ListBuilder lists(arrow::default_memory_pool(), values);
+  for (int row = 0; row < 6; ++row) {
+    ASSERT_TRUE(ids.Append(100 + row).ok());
+    ASSERT_TRUE(keys.Append("pk" + std::to_string(row)).ok());
+    if (row == 2) {
+      ASSERT_TRUE(lists.AppendNull().ok());
+      continue;
+    }
+    ASSERT_TRUE(lists.Append().ok());
+    if (row == 0 || row == 3) {
+      for (const auto &value : expected)
+        ASSERT_TRUE(values->Append(value).ok());
+    } else if (row == 5) {
+      ASSERT_TRUE(values->AppendNull().ok());
+    }
+  }
+  std::shared_ptr<arrow::Array> id_array, key_array, list_array;
+  ASSERT_TRUE(ids.Finish(&id_array).ok());
+  ASSERT_TRUE(keys.Finish(&key_array).ok());
+  ASSERT_TRUE(lists.Finish(&list_array).ok());
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                     arrow::field(USER_ID, arrow::utf8()),
+                     arrow::field("items", list_array->type())}),
+      {id_array, key_array, list_array});
+  auto out = arrow::io::FileOutputStream::Open(path);
+  ASSERT_TRUE(out.ok());
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*source, arrow::default_memory_pool(), *out, 2)
+          .ok());
+  ASSERT_TRUE((*out)->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> columns{GLOBAL_DOC_ID, USER_ID, "items"};
+  std::vector<Doc::Ptr> retained;
+  auto check_doc = [&](const Doc::Ptr &doc, int row) {
+    ASSERT_NE(doc, nullptr);
+    EXPECT_EQ(doc->doc_id(), 100 + row);
+    EXPECT_EQ(doc->pk_ref(), "pk" + std::to_string(row));
+    if (row == 2) {
+      EXPECT_FALSE(doc->has("items"));
+    } else {
+      auto got = doc->get<std::vector<ValueType>>("items");
+      ASSERT_TRUE(got.has_value());
+      EXPECT_EQ(got.value(),
+                (row == 0 || row == 3) ? expected : std::vector<ValueType>{});
+    }
+  };
+  for (int row = 0; row < 5; ++row) {
+    retained.push_back(store->fetch_doc(columns, source->schema(), row));
+    check_doc(retained.back(), row);
+  }
+  // Null child elements are outside zvec's array value contract. Preserve
+  // the existing Arrow scalar route rather than silently dropping a null.
+  EXPECT_EQ(store->fetch_doc(columns, source->schema(), 5), nullptr);
+  auto fallback = store->fetch(columns, 5);
+  ASSERT_NE(fallback, nullptr);
+  auto fallback_list = std::dynamic_pointer_cast<arrow::ListScalar>(
+      fallback->values[2].scalar());
+  ASSERT_NE(fallback_list, nullptr);
+  EXPECT_EQ(fallback_list->value->null_count(), 1);
+  auto file = arrow::io::ReadableFile::Open(path);
+  ASSERT_TRUE(file.ok());
+  auto context = ParquetFileContext::make(path, *file);
+  ASSERT_TRUE(context.ok());
+  std::weak_ptr<arrow::Buffer> cached_values;
+  {
+    auto key = (*context)->buffer_id;
+    key.column = 2;
+    auto handle =
+        ParquetBufferPool::get_instance().acquire_buffer(std::move(key));
+    ASSERT_NE(handle.data(), nullptr);
+    const auto &list =
+        static_cast<const arrow::ListArray &>(*handle.data()->chunk(0));
+    cached_values = list.values()->data()->buffers.back();
+  }
+  store.reset();
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  EXPECT_TRUE(cached_values.expired());
+  for (int row = 0; row < 5; ++row) check_doc(retained[row], row);
+}
+
+}  // namespace
+
+TEST_F(BufferPoolStoreTest, DirectDocOwnsAllSupportedArrayTypes) {
+  CheckOwnedArrayDocs<arrow::BooleanBuilder, bool>(parquet_path,
+                                                   {true, false, true});
+  CheckOwnedArrayDocs<arrow::Int32Builder, int32_t>(parquet_path, {-17, 0, 42});
+  CheckOwnedArrayDocs<arrow::Int64Builder, int64_t>(
+      parquet_path, {-(int64_t{1} << 40), 0, int64_t{1} << 40});
+  CheckOwnedArrayDocs<arrow::UInt32Builder, uint32_t>(parquet_path,
+                                                      {0, 4000000000u});
+  CheckOwnedArrayDocs<arrow::UInt64Builder, uint64_t>(parquet_path,
+                                                      {0, uint64_t{1} << 63});
+  CheckOwnedArrayDocs<arrow::FloatBuilder, float>(parquet_path,
+                                                  {-0.5f, 0, 1.25f});
+  CheckOwnedArrayDocs<arrow::DoubleBuilder, double>(parquet_path,
+                                                    {-0.125, 0, 1.5});
+  CheckOwnedArrayDocs<arrow::StringBuilder, std::string>(
+      parquet_path, {"", std::string("a\0b", 3), std::string(4096, 'x')});
+  CheckOwnedArrayDocs<arrow::BinaryBuilder, std::string>(
+      parquet_path, {"", std::string("\0\xff", 2), std::string(4096, '\xff')});
+}
+
+TEST_F(BufferPoolStoreTest,
+       DirectDocDeclinesUnsupportedArrayTypesWithoutPinning) {
+  arrow::UInt64Builder ids;
+  arrow::StringBuilder keys;
+  auto values = std::make_shared<arrow::Int16Builder>();
   arrow::ListBuilder lists(arrow::default_memory_pool(), values);
   ASSERT_TRUE(ids.Append(1).ok());
   ASSERT_TRUE(keys.Append("pk").ok());
@@ -891,7 +1005,7 @@ TEST_F(BufferPoolStoreTest, DirectDocDeclinesComplexTypesWithoutPinning) {
       std::dynamic_pointer_cast<arrow::ListScalar>(legacy->values[2].scalar());
   ASSERT_NE(scalar, nullptr);
   EXPECT_EQ(
-      std::static_pointer_cast<arrow::Int32Array>(scalar->value)->Value(0), 11);
+      std::static_pointer_cast<arrow::Int16Array>(scalar->value)->Value(0), 11);
 }
 
 TEST_F(BufferPoolStoreTest, SingleRowStringsDoNotRetainCachedColumnBuffers) {
