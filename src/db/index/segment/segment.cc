@@ -4587,6 +4587,11 @@ Status SegmentImpl::get_global_doc_ids(std::vector<int64_t> &doc_ids) const {
 
 
 Result<uint64_t> SegmentImpl::get_global_doc_id(uint32_t segment_doc_id) const {
+  // Open establishes this flag only after loading all IDs for a read-only
+  // segment. That mapping cannot grow or change while readers use it.
+  if (has_identity_doc_ids_ && segment_doc_id < doc_ids_.size()) {
+    return segment_doc_id;
+  }
   // Read-only lookup into doc_ids_.
   std::shared_lock<std::shared_mutex> lock(seg_mtx_);
   if (segment_doc_id >= doc_ids_.size()) {

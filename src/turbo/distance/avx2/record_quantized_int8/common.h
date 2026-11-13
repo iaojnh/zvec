@@ -26,8 +26,66 @@
 
 namespace zvec::turbo::avx2::internal {
 
+// For 16..64 signed codes, every partial sum and the final dot product fit
+// exactly in FP32. Keep the distance kernels' floating score epilogues intact.
+template <size_t Batch>
+inline void raw_inner_product_low_dim_batch(
+    const int8_t *query, const void *const *records,
+    std::array<const int8_t *, Batch> &prefetch_ptrs, size_t dim,
+    float *results) {
+  __m256i accs[Batch];
+  for (size_t i = 0; i < Batch; ++i) {
+    accs[i] = _mm256_setzero_si256();
+    if (prefetch_ptrs[i] != nullptr) {
+      ailego_prefetch(prefetch_ptrs[i]);
+      ailego_prefetch(prefetch_ptrs[i] + dim - 1);
+    }
+  }
+  auto accumulate = [&](const __m128i query_bytes, size_t offset) {
+    const __m256i q = _mm256_cvtepi8_epi16(query_bytes);
+    for (size_t i = 0; i < Batch; ++i) {
+      const auto *record = static_cast<const int8_t *>(records[i]);
+      const __m256i data = _mm256_cvtepi8_epi16(
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(record + offset)));
+      accs[i] = _mm256_add_epi32(accs[i], _mm256_madd_epi16(q, data));
+    }
+  };
+  size_t offset = 0;
+  for (; offset + 16 <= dim; offset += 16) {
+    accumulate(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(query + offset)),
+        offset);
+  }
+  if (offset < dim) {
+    // Reload only valid bytes; zero the already accumulated query prefix.
+    // Bare vectors ending at a page boundary need no padding or metadata.
+    const __m128i lanes =
+        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m128i mask = _mm_cmpgt_epi8(
+        lanes, _mm_set1_epi8(static_cast<char>(15 - (dim - offset))));
+    const __m128i q = _mm_and_si128(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(query + dim - 16)),
+        mask);
+    accumulate(q, dim - 16);
+  }
+  for (size_t i = 0; i < Batch; ++i) {
+    __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(accs[i]),
+                                _mm256_extracti128_si256(accs[i], 1));
+    sum = _mm_hadd_epi32(sum, sum);
+    sum = _mm_hadd_epi32(sum, sum);
+    results[i] = static_cast<float>(_mm_cvtsi128_si32(sum));
+  }
+}
+
 // Raw integer inner product of two int8 code arrays of length `dim`.
 inline float raw_inner_product(const int8_t *a, const int8_t *b, size_t dim) {
+  if (dim >= 16 && dim <= 64) {
+    const void *records[] = {a};
+    std::array<const int8_t *, 1> prefetch_ptrs{};
+    float result;
+    raw_inner_product_low_dim_batch(b, records, prefetch_ptrs, dim, &result);
+    return result;
+  }
   const __m256i ones = _mm256_set1_epi16(1);
   __m256i accumulator = _mm256_setzero_si256();
   size_t i = 0;
@@ -63,6 +121,10 @@ inline void raw_inner_product_batch_impl(
     const int8_t *query, const void *const *records,
     std::array<const int8_t *, dp_batch> &prefetch_ptrs, size_t dim,
     float *results) {
+  if (dim >= 16 && dim <= 64) {
+    return raw_inner_product_low_dim_batch(query, records, prefetch_ptrs, dim,
+                                           results);
+  }
   const __m256i ones = _mm256_set1_epi16(1);
   __m256i accs[dp_batch];
   for (size_t i = 0; i < dp_batch; ++i) {
@@ -109,6 +171,32 @@ inline void raw_inner_product_batch_impl(
 inline void raw_inner_product_batch(const void *const *vectors,
                                     const int8_t *query, size_t n, size_t dim,
                                     float *results) {
+  if (dim >= 16 && dim <= 64) {
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+      std::array<const int8_t *, 4> prefetch_ptrs{};
+      for (size_t j = 0; j < 4; ++j) {
+        // Keep the legacy lookahead of four records, independent of batching.
+        if (i + j + 4 < n) {
+          prefetch_ptrs[j] = static_cast<const int8_t *>(vectors[i + j + 4]);
+        }
+      }
+      raw_inner_product_batch_impl<4>(query, vectors + i, prefetch_ptrs, dim,
+                                      results + i);
+    }
+    if (i + 2 <= n) {
+      std::array<const int8_t *, 2> prefetch_ptrs{};
+      raw_inner_product_batch_impl<2>(query, vectors + i, prefetch_ptrs, dim,
+                                      results + i);
+      i += 2;
+    }
+    if (i < n) {
+      std::array<const int8_t *, 1> prefetch_ptrs{};
+      raw_inner_product_batch_impl<1>(query, vectors + i, prefetch_ptrs, dim,
+                                      results + i);
+    }
+    return;
+  }
   static constexpr size_t batch_size = 2;
   static constexpr size_t prefetch_step = 2;
   size_t i = 0;

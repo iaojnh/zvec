@@ -16,6 +16,7 @@
 #pragma once
 
 
+#include <new>
 #include <roaring/roaring.h>
 #include "db/common/constants.h"
 #include "db/index/column/common/index_results.h"
@@ -29,6 +30,7 @@ class InvertedSearchResult
       public std::enable_shared_from_this<InvertedSearchResult> {
  public:
   using Ptr = std::shared_ptr<InvertedSearchResult>;
+  using SharedBitmap = std::shared_ptr<const roaring_bitmap_t>;
 
 
   class Filter : public IndexFilter {
@@ -54,6 +56,10 @@ class InvertedSearchResult
 
 
   explicit InvertedSearchResult(roaring_bitmap_t *bitmap) : bitmap_(bitmap) {}
+
+  explicit InvertedSearchResult(SharedBitmap bitmap)
+      : bitmap_(const_cast<roaring_bitmap_t *>(bitmap.get())),
+        shared_bitmap_(std::move(bitmap)) {}
 
 
   ~InvertedSearchResult() override {
@@ -163,10 +169,11 @@ class InvertedSearchResult
 
 
   void destroy_bitmap() {
-    if (bitmap_) {
+    if (bitmap_ && !shared_bitmap_) {
       roaring_bitmap_free(bitmap_);
-      bitmap_ = nullptr;
     }
+    shared_bitmap_.reset();
+    bitmap_ = nullptr;
   }
 
 
@@ -176,6 +183,7 @@ class InvertedSearchResult
     if (!bitmap_ || !other.bitmap_) {
       destroy_bitmap();
     } else {
+      ensure_mutable();
       roaring_bitmap_and_inplace(bitmap_, other.bitmap_);
     }
   }
@@ -191,12 +199,25 @@ class InvertedSearchResult
       bitmap_ = roaring_bitmap_copy(other.bitmap_);
       return;
     }
+    ensure_mutable();
     roaring_bitmap_or_inplace(bitmap_, other.bitmap_);
   }
 
 
  private:
+  void ensure_mutable() {
+    if (shared_bitmap_) {
+      auto *copy = roaring_bitmap_copy(bitmap_);
+      if (!copy) {
+        throw std::bad_alloc();
+      }
+      shared_bitmap_.reset();
+      bitmap_ = copy;
+    }
+  }
+
   roaring_bitmap_t *bitmap_{nullptr};
+  SharedBitmap shared_bitmap_;
 };
 
 
