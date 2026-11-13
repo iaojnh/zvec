@@ -15,8 +15,11 @@
 #pragma once
 
 #include <sys/stat.h>
+#include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -195,11 +198,14 @@ class ParquetBufferPool {
       const ParquetBufferID &buffer_id);
 
   void retire_file(const ParquetBufferID &file) {
-    cache_.retire_if([&file](const ParquetBufferID &key) {
-      return key.filename() == file.filename() && key.file_id == file.file_id &&
-             key.mtime == file.mtime && key.device_id == file.device_id &&
-             key.generation == file.generation;
-    });
+    for (auto &shard : caches_) {
+      shard.cache.retire_if([&file](const ParquetBufferID &key) {
+        return key.filename() == file.filename() &&
+               key.file_id == file.file_id && key.mtime == file.mtime &&
+               key.device_id == file.device_id &&
+               key.generation == file.generation;
+      });
+    }
   }
 
   static ParquetBufferPool &get_instance() {
@@ -222,15 +228,36 @@ class ParquetBufferPool {
                             detail::ParquetBufferLoader, ParquetBufferIDHash,
                             ParquetBufferIDEqual, /*PayloadOwnsBudget=*/true>;
 
-  ParquetBufferPool()
-      : cache_(detail::ParquetBufferLoader{}, kMaxConcurrentLoads) {}
+  ParquetBufferPool() = default;
+
+  static constexpr size_t kCacheShards = 16;
+  struct alignas(AILEGO_CACHE_LINE_SIZE) CacheShard {
+    Cache cache;
+  };
+
+  class LoadSlot {
+   public:
+    explicit LoadSlot(ParquetBufferPool &pool);
+    ~LoadSlot();
+    LoadSlot(const LoadSlot &) = delete;
+    LoadSlot &operator=(const LoadSlot &) = delete;
+
+   private:
+    ParquetBufferPool &pool_;
+  };
+
+  Cache &cache_for(const ParquetBufferID &buffer_id);
 
   std::shared_ptr<arrow::ChunkedArray> retain(const ParquetBufferID &buffer_id);
 
   void release(const ParquetBufferID &buffer_id);
 
  private:
-  Cache cache_;
+  std::array<CacheShard, kCacheShards> caches_;
+  // Misses alone share the loader ceiling. Hot pins touch only their shard.
+  std::mutex load_mutex_;
+  std::condition_variable load_cv_;
+  size_t active_loads_{0};
 };
 
 }  // namespace zvec

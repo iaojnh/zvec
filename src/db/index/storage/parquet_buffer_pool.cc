@@ -442,12 +442,13 @@ ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
 
 ParquetBufferContextHandle ParquetBufferPool::try_acquire_buffer(
     const ParquetBufferID &buffer_id) {
-  auto arrow = cache_.retain(buffer_id);
+  auto &cache = cache_for(buffer_id);
+  auto arrow = cache.retain(buffer_id);
   if (!arrow) return {};
   try {
     return ParquetBufferContextHandle(buffer_id, std::move(arrow));
   } catch (...) {
-    cache_.release(buffer_id);
+    cache.release(buffer_id);
     throw;
   }
 }
@@ -455,7 +456,14 @@ ParquetBufferContextHandle ParquetBufferPool::try_acquire_buffer(
 arrow::Result<ParquetBufferContextHandle>
 ParquetBufferPool::acquire_buffer_checked(
     const ParquetBufferID &buffer_id) try {
-  auto arrow = cache_.acquire(buffer_id);
+  auto &cache = cache_for(buffer_id);
+  auto arrow = cache.retain(buffer_id);
+  if (!arrow) {
+    // Hold the shared load slot through decoding, charging and publication.
+    // acquire() rechecks the entry and coalesces concurrent loads of one key.
+    LoadSlot slot(*this);
+    arrow = cache.acquire(buffer_id);
+  }
   if (!arrow) {
     // This loader throws on read/format errors. An empty result can only be
     // the cache's admission refusal, before any payload is published.
@@ -466,7 +474,7 @@ ParquetBufferPool::acquire_buffer_checked(
   try {
     return ParquetBufferContextHandle(buffer_id, arrow);
   } catch (...) {
-    cache_.release(buffer_id);
+    cache.release(buffer_id);
     throw;
   }
 } catch (const ParquetLoadError &error) {
@@ -476,12 +484,37 @@ ParquetBufferPool::acquire_buffer_checked(
 }
 
 void ParquetBufferPool::release(const ParquetBufferID &buffer_id) {
-  cache_.release(buffer_id);
+  cache_for(buffer_id).release(buffer_id);
 }
 
 std::shared_ptr<arrow::ChunkedArray> ParquetBufferPool::retain(
     const ParquetBufferID &buffer_id) {
-  return cache_.retain(buffer_id);
+  return cache_for(buffer_id).retain(buffer_id);
+}
+
+ParquetBufferPool::Cache &ParquetBufferPool::cache_for(
+    const ParquetBufferID &buffer_id) {
+  // Stable identity components select the lock shard; the cache still checks
+  // the full key, including the pathname, for equality.
+  const uint64_t hash = buffer_id.file_id ^ buffer_id.generation ^
+                        (static_cast<uint64_t>(buffer_id.column) * 31) ^
+                        static_cast<uint64_t>(buffer_id.row_group);
+  return caches_[hash % kCacheShards].cache;
+}
+
+ParquetBufferPool::LoadSlot::LoadSlot(ParquetBufferPool &pool) : pool_(pool) {
+  std::unique_lock<std::mutex> lock(pool_.load_mutex_);
+  pool_.load_cv_.wait(
+      lock, [&] { return pool_.active_loads_ < kMaxConcurrentLoads; });
+  ++pool_.active_loads_;
+}
+
+ParquetBufferPool::LoadSlot::~LoadSlot() {
+  {
+    std::lock_guard<std::mutex> lock(pool_.load_mutex_);
+    --pool_.active_loads_;
+  }
+  pool_.load_cv_.notify_one();
 }
 
 }  // namespace zvec
