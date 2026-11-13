@@ -13,7 +13,15 @@
 // limitations under the License.
 
 #include "parquet_buffer_pool.h"
+#include <atomic>
 #include <limits>
+#if defined(_WIN32) || defined(_WIN64)
+#include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <unordered_set>
 #include <arrow/array/array_binary.h>
 #include <arrow/array/data.h>
@@ -201,6 +209,55 @@ ParquetBufferID::ParquetBufferID(const std::string &filename, int column,
   }
 }
 
+ParquetBufferID::ParquetBufferID(
+    const std::string &filename,
+    const std::shared_ptr<arrow::io::RandomAccessFile> &file, int column,
+    int row_group)
+    : ParquetBufferID(filename, column, row_group) {
+  input = file;
+  opened_file = true;
+  int fd = -1;
+  if (auto *readable = dynamic_cast<arrow::io::ReadableFile *>(file.get())) {
+    fd = readable->file_descriptor();
+  } else if (auto *mapped =
+                 dynamic_cast<arrow::io::MemoryMappedFile *>(file.get())) {
+    fd = mapped->file_descriptor();
+  }
+  // Identify the opened file, so a pathname replacement cannot mix the
+  // cache identity with bytes from a different file.
+#if defined(_WIN32) || defined(_WIN64)
+  BY_HANDLE_FILE_INFORMATION info;
+  if (fd >= 0 && GetFileInformationByHandle(
+                     reinterpret_cast<HANDLE>(_get_osfhandle(fd)), &info)) {
+    file_id =
+        (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    device_id = info.dwVolumeSerialNumber;
+    mtime = static_cast<int64_t>(
+        (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+        info.ftLastWriteTime.dwLowDateTime);
+    return;
+  }
+#else
+  struct stat file_stat;
+  if (fd >= 0 && fstat(fd, &file_stat) == 0) {
+    file_id = file_stat.st_ino;
+    device_id = file_stat.st_dev;
+#if defined(__APPLE__)
+    mtime = static_cast<int64_t>(file_stat.st_mtimespec.tv_sec) * 1000000000 +
+            file_stat.st_mtimespec.tv_nsec;
+#else
+    mtime = static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000 +
+            file_stat.st_mtim.tv_nsec;
+#endif
+    return;
+  }
+#endif
+  // Backends without a local descriptor cannot safely share a pathname
+  // identity across opens. Isolate their caches for this open lifetime.
+  static std::atomic<uint64_t> next_generation{1};
+  generation = next_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
 const std::string ParquetBufferID::to_string() const {
   std::string msg{"Buffer["};
   msg += "parquet: " + std::string(filename()) + "[" + std::to_string(file_id) +
@@ -264,16 +321,17 @@ arrow::Status detail::ParquetBufferLoader::load_checked(
   payload.memory_pool = GetParquetMemoryPool();
   arrow::MemoryPool *mem_pool = payload.memory_pool.get();
 
-  std::shared_ptr<arrow::io::RandomAccessFile> input;
+  auto input = buffer_id.input.lock();
   const auto file_name = buffer_id.filename();
-  auto input_result = arrow::io::ReadableFile::Open(
-      std::string(file_name.data(), file_name.size()), mem_pool);
-  if (!input_result.ok()) {
-    LOG_ERROR("Failed to open parquet file[%s]: %s", file_name.data(),
-              input_result.status().ToString().c_str());
-    return input_result.status();
+  if (!input) {
+    if (buffer_id.opened_file) {
+      return arrow::Status::Invalid(
+          "Opened parquet file is no longer available");
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        input, arrow::io::ReadableFile::Open(
+                   std::string(file_name.data(), file_name.size()), mem_pool));
   }
-  input = *input_result;
 
   std::unique_ptr<parquet::arrow::FileReader> reader;
   // Configure both the low-level Parquet reader and Arrow output builders;

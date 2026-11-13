@@ -160,8 +160,9 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
         // the legacy reader's cache behavior when no budgeted pool is supplied.
         std::shared_ptr<arrow::ChunkedArray> col_chunked_array;
         try {
-          auto buffer_id = ParquetBufferID(file_path_, col_indices_[col_idx],
-                                           rg_id, metadata_id_);
+          auto buffer_id = metadata_id_;
+          buffer_id.column = col_indices_[col_idx];
+          buffer_id.row_group = rg_id;
           auto &cache = ParquetBufferPool::get_instance();
           auto buffer_handle = memory_pool_
                                    ? cache.try_acquire_buffer(buffer_id)

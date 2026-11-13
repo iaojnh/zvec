@@ -56,8 +56,10 @@ class ParquetMemoryPool final : public arrow::MemoryPool {
 
   // A disengaged result requires the general reallocation path. This call
   // never allocates a replacement, even if budget configuration changes.
-  std::optional<arrow::Status> TryReallocateInPlace(
-      int64_t old_size, int64_t new_size, int64_t alignment, uint8_t **ptr);
+  std::optional<arrow::Status> try_reallocate_in_place(int64_t old_size,
+                                                       int64_t new_size,
+                                                       int64_t alignment,
+                                                       uint8_t **ptr);
 
   int64_t bytes_allocated() const override {
     return stats_.bytes_allocated();

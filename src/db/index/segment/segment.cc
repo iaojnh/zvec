@@ -403,6 +403,10 @@ class SegmentImpl : public Segment,
 
   // Require seg_mtx_; the public fetch() overloads take it before entering, so
   // a nested fetch never locks it twice.
+  Doc::Ptr fetch_direct_doc_unsafe(const std::vector<std::string> &columns,
+                                   const std::shared_ptr<arrow::Schema> &schema,
+                                   int row) const;
+
   Doc::Ptr fetch_doc_unsafe(
       uint64_t g_doc_id,
       const std::optional<std::vector<std::string>> &output_fields,
@@ -1250,6 +1254,30 @@ Doc::Ptr SegmentImpl::fetch(
   return fetch_doc_unsafe(g_doc_id, output_fields, include_vector);
 }
 
+Doc::Ptr SegmentImpl::fetch_direct_doc_unsafe(
+    const std::vector<std::string> &columns,
+    const std::shared_ptr<arrow::Schema> &schema, int row) const {
+  const auto &blocks = get_persist_block_metas(BlockType::SCALAR);
+  const auto &offsets = get_persist_block_offsets(BlockType::SCALAR);
+  if (row < 0 || blocks.empty() || blocks.size() != offsets.size() ||
+      blocks.size() != persist_stores_.size())
+    return nullptr;
+  int64_t rows = 0;
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    if (offsets[i] != rows) return nullptr;
+    for (const auto &column : columns) {
+      if (!blocks[i].contain_column(column)) return nullptr;
+    }
+    rows += blocks[i].doc_count_;
+  }
+  if (row >= rows) return nullptr;
+  const auto i = std::upper_bound(offsets.begin(), offsets.end(), row) -
+                 offsets.begin() - 1;
+  auto *store =
+      dynamic_cast<BufferPoolForwardStore *>(persist_stores_[i].get());
+  return store ? store->fetch_doc(columns, schema, row - offsets[i]) : nullptr;
+}
+
 Doc::Ptr SegmentImpl::fetch_doc_unsafe(
     uint64_t g_doc_id,
     const std::optional<std::vector<std::string>> &output_fields,
@@ -1299,6 +1327,13 @@ Doc::Ptr SegmentImpl::fetch_doc_unsafe(
     }
   }
   auto result_schema = std::make_shared<arrow::Schema>(fields);
+
+  if (!include_vector && !options_.enable_mmap_) {
+    if (auto doc = fetch_direct_doc_unsafe(forward_columns, result_schema,
+                                           segment_doc_id)) {
+      return doc;
+    }
+  }
 
   auto exec_batch = fetch_exec_unsafe(forward_columns, segment_doc_id);
   return materialize_doc_unsafe(g_doc_id, segment_doc_id, forward_columns,

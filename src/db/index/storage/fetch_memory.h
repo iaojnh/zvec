@@ -29,8 +29,8 @@ class FetchMemoryPool final : public arrow::MemoryPool {
     // A managed mapping can shrink in place even when the batch is full.
     // All other reallocations must leave room for a second buffer.
     if (auto *parquet = dynamic_cast<ParquetMemoryPool *>(parent_)) {
-      if (auto status =
-              parquet->TryReallocateInPlace(old_size, new_size, alignment, ptr)) {
+      if (auto status = parquet->try_reallocate_in_place(old_size, new_size,
+                                                         alignment, ptr)) {
         if (status->ok() && old_size != new_size) {
           stats_.DidReallocateBytes(old_size, new_size);
         }
