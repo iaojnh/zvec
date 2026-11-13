@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
 #include <iostream>
 #include <sstream>  // NOLINT(misc-include-cleaner): protects <sstream> from the private/public test macro below.
 #define private public
@@ -2295,3 +2296,48 @@ TEST_P(SegmentTest, DropColumn) {
 
 
 INSTANTIATE_TEST_SUITE_P(MMapTest, SegmentTest, testing::Values(true, false));
+
+TEST_P(SegmentTest, BufferedDirectDocFetchPreservesConcurrentReads) {
+  CollectionSchema schema(col_name_);
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "text", DataType::STRING, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "number", DataType::INT64, false))
+                  .ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 100, 8);
+  ASSERT_NE(segment, nullptr);
+  std::atomic<bool> correct{true};
+  auto check = [&]() {
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t)
+      readers.emplace_back([&, t]() {
+        for (int n = 0; n < 32; ++n) {
+          const int id = 100 + (n + t) % 8;
+          auto expected = test::TestHelper::CreateDoc(id, schema);
+          auto doc = segment->fetch(id, std::nullopt, false);
+          if (!doc || doc->pk_ref() != expected.pk_ref() ||
+              doc->doc_id() != static_cast<uint64_t>(id) ||
+              doc->get<std::string>("text") !=
+                  expected.get<std::string>("text") ||
+              doc->get<int64_t>("number") != expected.get<int64_t>("number"))
+            correct.store(false);
+        }
+      });
+    for (auto &reader : readers) reader.join();
+    EXPECT_TRUE(correct.load());
+  };
+  check();
+  ASSERT_TRUE(segment->dump().ok());
+  check();
+  auto projected = segment->fetch(
+      103, std::vector<std::string>{"text", "unknown", "text"}, false);
+  ASSERT_NE(projected, nullptr);
+  EXPECT_FALSE(projected->has("number"));
+  EXPECT_EQ(projected->get<std::string>("text"),
+            test::TestHelper::CreateDoc(103, schema).get<std::string>("text"));
+}

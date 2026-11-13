@@ -338,6 +338,10 @@ class SegmentImpl : public Segment,
 
   bool validate(const std::vector<std::string> &columns) const;
 
+  Doc::Ptr fetch_direct_doc_unsafe(const std::vector<std::string> &columns,
+                                   const std::shared_ptr<arrow::Schema> &schema,
+                                   int row) const;
+
   Status reopen_invert_indexer(bool read_only = false);
 
   // FTS helpers
@@ -1076,6 +1080,31 @@ Status SegmentImpl::Delete(uint64_t g_doc_id) {
 }
 
 
+Doc::Ptr SegmentImpl::fetch_direct_doc_unsafe(
+    const std::vector<std::string> &columns,
+    const std::shared_ptr<arrow::Schema> &schema, int row) const {
+  const auto &blocks = get_persist_block_metas(BlockType::SCALAR);
+  const auto &offsets = get_persist_block_offsets(BlockType::SCALAR);
+  if (row < 0 || blocks.empty() || blocks.size() != offsets.size() ||
+      blocks.size() != persist_stores_.size())
+    return nullptr;
+  int64_t rows = 0;
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    if (offsets[i] != rows) return nullptr;
+    for (const auto &column : columns) {
+      if (!blocks[i].contain_column(column)) return nullptr;
+    }
+    rows += blocks[i].doc_count_;
+  }
+  if (row >= rows) return nullptr;
+  const auto i = std::upper_bound(offsets.begin(), offsets.end(), row) -
+                 offsets.begin() - 1;
+  auto *store =
+      dynamic_cast<BufferPoolForwardStore *>(persist_stores_[i].get());
+  return store ? store->fetch_doc(columns, schema, row - offsets[i]) : nullptr;
+}
+
+
 Doc::Ptr SegmentImpl::fetch(
     uint64_t g_doc_id,
     const std::optional<std::vector<std::string>> &output_fields,
@@ -1143,6 +1172,13 @@ Doc::Ptr SegmentImpl::fetch(
     }
   }
   auto result_schema = std::make_shared<arrow::Schema>(fields);
+
+  if (!include_vector && !options_.enable_mmap_) {
+    if (auto doc = fetch_direct_doc_unsafe(forward_columns, result_schema,
+                                           segment_doc_id)) {
+      return doc;
+    }
+  }
 
   // fetch forward columns
   auto exec_batch = fetch_exec_unsafe(forward_columns, segment_doc_id);

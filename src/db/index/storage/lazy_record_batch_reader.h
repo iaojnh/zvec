@@ -14,7 +14,9 @@
 // limitations under the License.
 #pragma once
 
+#include <limits>
 #include <arrow/ipc/reader.h>
+#include <arrow/table.h>
 #include <parquet/arrow/reader.h>
 #include "db/common/constants.h"
 #include "parquet_buffer_pool.h"
@@ -80,15 +82,18 @@ class IPCRecordBatchReader : public arrow::RecordBatchReader {
 
 class ParquetRecordBatchReader : public arrow::RecordBatchReader {
  public:
-  ParquetRecordBatchReader(std::unique_ptr<parquet::arrow::FileReader> &reader,
-                           const std::vector<std::string> &columns,
-                           std::shared_ptr<arrow::Schema> schema,
-                           const std::string &file_path, bool with_cache = true)
+  ParquetRecordBatchReader(
+      std::unique_ptr<parquet::arrow::FileReader> &reader,
+      const std::vector<std::string> &columns,
+      std::shared_ptr<arrow::Schema> schema, const std::string &file_path,
+      bool with_cache = true,
+      std::shared_ptr<const ParquetFileContext> file_context = nullptr)
       : reader_(std::move(reader)),
         schema_(std::move(schema)),
         columns_(columns),
         file_path_(file_path),
-        with_cache_(with_cache) {
+        with_cache_(with_cache && file_context != nullptr),
+        file_context_(std::move(file_context)) {
     std::vector<std::shared_ptr<arrow::Field>> fields;
     for (const auto &col : columns) {
       int index = schema_->GetFieldIndex(col);
@@ -117,56 +122,59 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   }
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
-    if (current_row_group_ >= num_row_groups_) {
-      return arrow::Status::OK();
-    }
-
-    int64_t rg_id = current_row_group_;
-    int64_t num_rows_in_rg = row_group_row_nums_[rg_id];
-
-    std::vector<std::shared_ptr<arrow::Array>> chunks(col_indices_.size());
-    if (with_cache_) {
-      for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
-        auto buffer_id =
-            ParquetBufferID(file_path_, col_indices_[col_idx], rg_id);
-        auto buffer_handle =
-            ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
-        std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
-            buffer_handle.data();
-        if (col_chunked_array) {
-          std::shared_ptr<arrow::Array> concat;
-          auto concat_result = arrow::Concatenate(col_chunked_array->chunks(),
-                                                  arrow::default_memory_pool());
-          if (!concat_result.ok()) {
-            return concat_result.status();
+    *batch = nullptr;
+    while (true) {
+      if (active_reader_) {
+        ARROW_RETURN_NOT_OK(active_reader_->ReadNext(batch));
+        if (*batch) return arrow::Status::OK();
+        active_reader_.reset();
+      }
+      if (current_row_group_ >= num_row_groups_) return arrow::Status::OK();
+      const int rg_id = current_row_group_++;
+      std::vector<std::shared_ptr<arrow::ChunkedArray>> columns;
+      columns.reserve(col_indices_.size());
+      if (with_cache_) {
+        for (int index : col_indices_) {
+          auto buffer_id = file_context_->buffer_id;
+          buffer_id.column = index;
+          buffer_id.row_group = rg_id;
+          auto handle =
+              ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+          auto column = std::move(handle).borrow_for_scan();
+          if (!column) {
+            auto cached = handle.data();
+            if (cached) {
+              // Borrowing is bounded independently of result lifetime.
+              ARROW_ASSIGN_OR_RAISE(
+                  auto owned, arrow::Concatenate(cached->chunks(),
+                                                 arrow::default_memory_pool()));
+              column = std::make_shared<arrow::ChunkedArray>(std::move(owned));
+            } else {
+              // Other live batches may pin the cache. Read owned buffers rather
+              // than failing a scan or retaining unpinned cached memory.
+              ARROW_RETURN_NOT_OK(
+                  reader_->RowGroup(rg_id)->Column(index)->Read(&column));
+            }
           }
-          concat = concat_result.ValueOrDie();
-          chunks[col_idx] = concat;
+          columns.push_back(std::move(column));
         }
+      } else {
+        std::shared_ptr<arrow::Table> table;
+        ARROW_RETURN_NOT_OK(
+            reader_->RowGroup(rg_id)->ReadTable(col_indices_, &table));
+        columns = table->columns();
       }
-    } else {
-      std::shared_ptr<arrow::Table> rg_table;
-      ARROW_RETURN_NOT_OK(
-          reader_->RowGroup(rg_id)->ReadTable(col_indices_, &rg_table));
-      for (size_t i = 0; i < col_indices_.size(); ++i) {
-        std::shared_ptr<arrow::Array> concat;
-        auto concat_result = arrow::Concatenate(rg_table->column(i)->chunks(),
-                                                arrow::default_memory_pool());
-        if (!concat_result.ok()) {
-          return concat_result.status();
-        }
-        concat = concat_result.ValueOrDie();
-        chunks[i] = concat;
-      }
+      auto table = arrow::Table::Make(projected_schema_, std::move(columns),
+                                      row_group_row_nums_[rg_id]);
+      // Align chunk boundaries across columns without concatenating their data.
+      active_reader_ =
+          std::make_unique<arrow::TableBatchReader>(std::move(table));
+      active_reader_->set_chunksize(std::numeric_limits<int64_t>::max());
     }
-
-    *batch =
-        arrow::RecordBatch::Make(projected_schema_, num_rows_in_rg, chunks);
-    current_row_group_++;
-    return arrow::Status::OK();
   }
 
  private:
+  std::unique_ptr<arrow::TableBatchReader> active_reader_;
   std::unique_ptr<parquet::arrow::FileReader> reader_;
   std::shared_ptr<arrow::Schema> schema_;
   std::shared_ptr<arrow::Schema> projected_schema_;
@@ -180,6 +188,7 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   std::vector<int64_t> row_group_offsets_;
   std::vector<int64_t> row_group_row_nums_;
   bool with_cache_;
+  std::shared_ptr<const ParquetFileContext> file_context_;
 };
 
 
