@@ -243,7 +243,8 @@ static void NormalizeCosineCentroid(void *data, size_t dimension) {
     }
   }
   const float stored_norm = squared_norm > 0 ? 1.0f : 0.0f;
-  std::memcpy(values + coordinates, &stored_norm, sizeof(stored_norm));
+  auto *norm_bytes = reinterpret_cast<uint8_t *>(values + coordinates);
+  std::memcpy(norm_bytes, &stored_norm, sizeof(stored_norm));
 }
 
 static inline std::shared_ptr<VectorMean> NewVectorMean(const IndexMeta &meta) {
