@@ -163,7 +163,7 @@ int DiskAnnIndex::open(const std::string &file_path,
     }
     case StorageOptions::StorageType::kBufferPool: {
       storage_params.set(core::BUFFER_READ_STORAGE_WARMUP_MODE,
-                         core::BUFFER_READ_STORAGE_WARMUP_NONE);
+                         core::BUFFER_READ_STORAGE_WARMUP_AUTO);
       storage_ = core::IndexFactory::CreateStorage("BufferReadStorage");
       if (storage_ == nullptr) {
         LOG_ERROR("Failed to create BufferReadStorage");

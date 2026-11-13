@@ -501,6 +501,19 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     return (used >= capacity) ? 0 : (capacity - used);
   }
 
+  //! Optional preparation uses only unoccupied page/RSS headroom. The result
+  //! is an estimate; each subsequent allocation still needs normal admission.
+  size_t prefetch_available() {
+    if (workspace_waiting_size_.load(std::memory_order_relaxed) != 0) return 0;
+    process_rss_.refresh();
+    if (process_rss_.pressure()) return 0;
+    const size_t limit = page_admission_limit();
+    const size_t used = used_size_.load(std::memory_order_relaxed);
+    size_t bytes = used < limit ? limit - used : 0;
+    if (process_rss_.limit()) bytes = std::min(bytes, process_rss_.available());
+    return bytes;
+  }
+
   //! Headroom kept for shared non-page consumers (for example decoded
   //! Parquet columns). Tiny test/application pools retain their historical
   //! ability to use every page-sized byte.
@@ -743,6 +756,11 @@ class ZVEC_AILEGO_API MemoryLimitPool {
 
   std::mutex retained_mutex_;
   RetainedBlock *retained_free_{nullptr};
+  // Live and idle mappings remain charged until a successful unmap.
+  RetainedBlock *retained_mappings_{nullptr};
+  void register_retained_mapping(RetainedBlock *block);
+  // Caller holds retained_mutex_; failed unmaps retain registration/charges.
+  bool unmap_retained_mapping(RetainedBlock *block);
   std::atomic<size_t> retained_block_bytes_{0};
   std::atomic<size_t> retained_idle_bytes_{0};
   std::atomic<uint64_t> retained_block_reuses_{0};

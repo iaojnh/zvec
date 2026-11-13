@@ -49,6 +49,22 @@ class BudgetedMappedBuffer {
   // Replacement is charged while the old allocation is still live. Contents
   // are not preserved on success; allocation failure leaves the old buffer.
   void resize(size_t bytes) {
+    resize_impl(bytes, MemoryLimitPool::PendingAllocation::Kind::kWorkspace);
+  }
+
+  // Optional read-ahead must neither wait for nor evict mandatory consumers.
+  bool try_resize(size_t bytes) {
+    try {
+      resize_impl(bytes,
+                  MemoryLimitPool::PendingAllocation::Kind::kLockedExternal);
+      return true;
+    } catch (const std::bad_alloc &) {
+      return false;
+    }
+  }
+
+ private:
+  void resize_impl(size_t bytes, MemoryLimitPool::PendingAllocation::Kind kind) {
     if (bytes == size_) return;
     BudgetedMappedBuffer replacement;
     if (bytes) {
@@ -56,7 +72,7 @@ class BudgetedMappedBuffer {
       auto &pool = MemoryLimitPool::get_instance();
       const size_t charge = pool.capacity() ? replacement.mapped_size_ : 0;
       using Pending = MemoryLimitPool::PendingAllocation;
-      Pending pending(pool, Pending::Kind::kWorkspace);
+      Pending pending(pool, kind);
       if (!pending.reserve(charge)) throw std::bad_alloc();
       replacement.data_ =
           static_cast<char *>(File::MemoryMap(replacement.mapped_size_, 0));
@@ -67,6 +83,8 @@ class BudgetedMappedBuffer {
     }
     swap(replacement);
   }
+
+ public:
   void advise_huge_pages() const {
 #if defined(MADV_HUGEPAGE)
     if (data_) ::madvise(data_, mapped_size_, MADV_HUGEPAGE);

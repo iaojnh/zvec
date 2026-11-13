@@ -863,6 +863,12 @@ class IndexStorage : public IndexModule {
     return "";
   }
 
+  //! Allow an algorithm to prepare its immutable working set at load time.
+  //! Kept at the end of the vtable; explicit no-warmup storage remains lazy.
+  virtual bool automatic_warmup_enabled() const {
+    return false;
+  }
+
  protected:
   //! Separate dispatch keeps legacy open() overrides source-compatible.
   virtual int open_with_options(const std::string &, const OpenOptions &) {

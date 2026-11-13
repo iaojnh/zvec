@@ -71,6 +71,8 @@ inline const std::string BUFFER_READ_STORAGE_WARMUP_MODE =
     "proxima.buffer.read_storage.warmup_mode";
 inline const std::string BUFFER_READ_STORAGE_WARMUP_NONE = "none";
 inline const std::string BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL = "sequential";
+// Algorithm-selected preparation; opening storage does not scan the file.
+inline const std::string BUFFER_READ_STORAGE_WARMUP_AUTO = "auto";
 
 //! MMapFileStorage
 inline const std::string MMAPFILE_STORAGE_MEMORY_LOCKED =

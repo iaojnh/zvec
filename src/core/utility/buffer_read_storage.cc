@@ -617,7 +617,8 @@ class BufferReadStorage : public IndexStorage {
     params.get(BUFFER_READ_STORAGE_FOOTER_OFFSET, &footer_offset_);
     params.get(BUFFER_READ_STORAGE_WARMUP_MODE, &warmup_mode_);
     if (warmup_mode_ != BUFFER_READ_STORAGE_WARMUP_NONE &&
-        warmup_mode_ != BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL) {
+        warmup_mode_ != BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL &&
+        warmup_mode_ != BUFFER_READ_STORAGE_WARMUP_AUTO) {
       LOG_ERROR("Invalid BufferReadStorage warmup mode: %s",
                 warmup_mode_.c_str());
       return IndexError_InvalidArgument;
@@ -824,6 +825,10 @@ class BufferReadStorage : public IndexStorage {
   //! Path of the opened index file (diagnostics / backend consistency).
   std::string file_path() const override {
     return file_path_;
+  }
+
+  bool automatic_warmup_enabled() const override {
+    return warmup_mode_ == BUFFER_READ_STORAGE_WARMUP_AUTO;
   }
 
  private:

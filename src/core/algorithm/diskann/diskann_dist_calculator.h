@@ -274,16 +274,10 @@ class DistCalculator {
     quant_codes_ = codes;
     quant_code_size_ = code_size;
     paged_quant_codes_ = std::move(paged_codes);
-    resident_pq_pool_ = nullptr;
-    if (pool && !pool->writable() && paged_quant_codes_) {
-      auto &budget = ailego::MemoryLimitPool::get_instance();
-      const size_t capacity = budget.capacity();
-      const size_t limit = capacity - std::min(capacity, budget.page_admission_reserve());
-      const size_t fixed = budget.metadata_used();
-      // Avoid unsuccessful full-hit probes when PQ cannot fit in the pool.
-      if (limit > fixed && paged_quant_codes_->data_size() <= limit - fixed)
-        resident_pq_pool_ = pool;
-    }
+    // Batch the current neighbors even when the entire PQ segment cannot fit.
+    // The pool keeps admission, eviction and RSS control; insufficient batch
+    // capacity still falls back after releasing all acquired page pins.
+    paged_pq_pool_ = pool && !pool->writable() ? pool : nullptr;
   }
 
   int quantize_query(const void *query_rotated) try {
@@ -318,9 +312,9 @@ class DistCalculator {
       }
     }
     if (paged_quant_codes_ &&
-        !(resident_pq_pool_ && resident_pq_batch_.read(
-            *resident_pq_pool_, *paged_quant_codes_, ids, n, quant_code_size_,
-            quant_dp_list_))) {
+        !(paged_pq_pool_ && resident_pq_batch_.read(
+            *paged_pq_pool_, *paged_quant_codes_, ids, n, quant_code_size_,
+            quant_dp_list_, /*load_misses=*/true))) {
       const int ret = ReadPagedQuantizedCodes(
           *paged_quant_codes_, ids, n, quant_code_size_, quant_code_blocks_,
           quant_dp_list_);
@@ -472,7 +466,7 @@ class DistCalculator {
   const uint8_t *quant_codes_{nullptr};
   IndexStorage::Segment::Pointer paged_quant_codes_;
   uint32_t quant_code_size_{0};
-  ailego::VecBufferPool *resident_pq_pool_{nullptr};
+  ailego::VecBufferPool *paged_pq_pool_{nullptr};
   ResidentPqBatch resident_pq_batch_;
 
   turbo::DistanceImpl quant_dist_impl_{};

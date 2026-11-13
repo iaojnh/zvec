@@ -79,11 +79,12 @@ class DiskAnnPqPriorityTest : public testing::Test {
     ASSERT_EQ(0, dumper->close());
   }
 
-  void load(const char *type = "BufferReadStorage") {
+  void load(const char *type = "BufferReadStorage",
+            const std::string &warmup = BUFFER_READ_STORAGE_WARMUP_NONE) {
     storage_ = IndexFactory::CreateStorage(type);
     ASSERT_NE(nullptr, storage_);
     ailego::Params params;
-    params.set(BUFFER_READ_STORAGE_WARMUP_MODE, BUFFER_READ_STORAGE_WARMUP_NONE);
+    params.set(BUFFER_READ_STORAGE_WARMUP_MODE, warmup);
     ASSERT_EQ(0, storage_->init(params));
     ASSERT_EQ(0, storage_->open(path_, false));
     ASSERT_EQ(0, entity_.load(meta_, storage_));
@@ -118,6 +119,49 @@ TEST_F(DiskAnnPqPriorityTest, LoadingOnlySetsPriorityWithoutReadingPq) {
     EXPECT_FALSE(pool->is_page_resident(page));
   read_code();
   EXPECT_TRUE(pool->is_page_resident(first_pq_page()));
+}
+
+TEST_F(DiskAnnPqPriorityTest, AutoPreparationPopulatesOnlyPqAndRemainsEvictable) {
+  make_index();
+  load("BufferReadStorage", BUFFER_READ_STORAGE_WARMUP_AUTO);
+  auto pool = storage_->vec_buffer_pool();
+  EXPECT_FALSE(pool->is_page_resident(first_pq_page()));
+  entity_.prepare_pq();
+  const size_t last = (entity_.paged_pq_codes()->data_offset() +
+                       codes_.size() - 1) / ailego::kVectorPageSize;
+  for (size_t pg = first_pq_page(); pg <= last; ++pg)
+    EXPECT_TRUE(pool->is_page_resident(pg));
+  EXPECT_EQ(nullptr, entity_.pq_codes());
+  auto graph = entity_.get_vector_segment();
+  EXPECT_FALSE(pool->is_page_resident(
+      graph->data_offset() / ailego::kVectorPageSize + 1));
+  read_code(0);
+  read_code(codes_.size() / 64 - 1);
+  entity_.prepare_pq();
+  EXPECT_TRUE(pool->is_page_resident(last));
+  for (size_t i = 0; i < 64 && pool->is_page_resident(first_pq_page()); ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(64);
+  EXPECT_FALSE(pool->is_page_resident(first_pq_page()));
+  read_code();
+}
+
+TEST_F(DiskAnnPqPriorityTest, ExplicitNoneKeepsPreparationLazy) {
+  make_index();
+  load();
+  entity_.prepare_pq();
+  EXPECT_FALSE(storage_->vec_buffer_pool()->is_page_resident(first_pq_page()));
+  read_code();
+}
+
+TEST_F(DiskAnnPqPriorityTest, AutoSkipsPqLargerThanBudget) {
+  const size_t rows = (ailego::MemoryLimitPool::get_instance().capacity() +
+                       (1UL << 20) + 63) / 64;
+  make_index(rows);
+  load("BufferReadStorage", BUFFER_READ_STORAGE_WARMUP_AUTO);
+  entity_.prepare_pq();
+  EXPECT_FALSE(storage_->vec_buffer_pool()->is_page_resident(first_pq_page()));
+  read_code(0);
+  read_code(rows - 1);
 }
 
 TEST_F(DiskAnnPqPriorityTest, GraphPagesAreEvictedBeforePqPages) {

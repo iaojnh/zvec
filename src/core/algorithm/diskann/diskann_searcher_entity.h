@@ -39,6 +39,7 @@ class DiskAnnSearcherEntity : public DiskAnnEntity {
   void release_storage();
   int load(const IndexMeta &meta, IndexStorage::Pointer storage);
   int load_pq_segment();
+  void prepare_pq();
   int load_header_segment();
   int load_vector_segment();
   int load_key_segment();

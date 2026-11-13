@@ -23,9 +23,9 @@
 namespace zvec {
 namespace core {
 
-// An optional full-hit path for one vector distance batch. All scratch growth
-// precedes page acquisition. A miss releases every pin before the caller
-// enters the normal admission/bypass path, and no pin survives distance scoring.
+// A bounded read-only vector distance batch. By default it only pins resident
+// pages; PQ callers may populate misses together through the pool's batched IO.
+// Scratch growth precedes page acquisition and no pin survives distance scoring.
 class ResidentVectorBatch {
  public:
   ~ResidentVectorBatch() { release(); }
@@ -36,7 +36,8 @@ class ResidentVectorBatch {
   // Fixed-stride segment adapter used by DiskANN PQ codes.
   bool read(ailego::VecBufferPool &pool, const IndexStorage::Segment &segment,
             const uint32_t *ids, size_t count, size_t code_size,
-            ailego::BudgetedVector<const void *> &views) {
+            ailego::BudgetedVector<const void *> &views,
+            bool load_misses = false) {
     const size_t capacity = segment.capacity();
     const size_t base = segment.data_offset();
     if (!code_size || code_size > capacity ||
@@ -50,7 +51,7 @@ class ResidentVectorBatch {
           if (id > max_id) return false;
           *absolute = base + size_t{id} * code_size;
           return true;
-        }, views);
+        }, views, load_misses);
   }
 
   // Locate may span several segments in the same read-only storage. Returned
@@ -58,7 +59,8 @@ class ResidentVectorBatch {
   template <typename Locate>
   bool read_offsets(ailego::VecBufferPool &pool, const uint32_t *ids,
                     size_t count, size_t code_size, Locate locate,
-                    ailego::BudgetedVector<const void *> &views) {
+                    ailego::BudgetedVector<const void *> &views,
+                    bool load_misses = false) {
     release();
     const size_t page_size = ailego::kVectorPageSize;
     if (!count || count > kMaxCodes || !ids || !code_size ||
@@ -117,8 +119,11 @@ class ResidentVectorBatch {
     } catch (const std::bad_alloc &) {
       return false;
     }
-    if (!pool.try_acquire_resident_pages(page_ids_.data(), pages,
-                                          pages_.data()))
+    const bool acquired =
+        load_misses ? pool.acquire_pages(page_ids_.data(), pages, pages_.data())
+                    : pool.try_acquire_resident_pages(page_ids_.data(), pages,
+                                                     pages_.data());
+    if (!acquired)
       return false;
     pool_ = &pool;
     page_count_ = pages;

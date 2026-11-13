@@ -1,8 +1,10 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_dumper.h>
@@ -125,6 +127,97 @@ TEST_F(ResidentPqBatchTest, InvalidIdsAndLargeBatchesUseFallbackWithoutPins) {
   ids[0] = UINT32_MAX;
   EXPECT_FALSE(batch.read(*storage_->vec_buffer_pool(), *segment_, ids, 1, 384, views));
   EXPECT_FALSE(batch.read(*storage_->vec_buffer_pool(), *segment_, nullptr, 1, 384, views));
+}
+
+TEST_F(ResidentPqBatchTest, MixedColdBatchPreservesCrossingsDuplicatesAndOrder) {
+  const uint32_t warm_ids[]{0, 10};
+  warm(warm_ids, 2);
+  uint32_t ids[130];
+  for (size_t i = 0; i < 130; ++i) ids[i] = (i * 13) % 2048;
+  ids[129] = ids[0];
+  auto pool = storage_->vec_buffer_pool();
+  const auto misses = pool->stats().miss;
+  ResidentPqBatch batch;
+  ailego::BudgetedVector<const void *> views;
+  ASSERT_TRUE(batch.read(*pool, *segment_, ids, 130, 384, views,
+                         /*load_misses=*/true));
+  EXPECT_GT(pool->stats().miss, misses);
+  for (size_t i = 0; i < 130; ++i)
+    EXPECT_EQ(0, std::memcmp(views[i], codes_.data() + ids[i] * 384, 384));
+  batch.release();
+  const auto after_cold = pool->stats().miss;
+  ASSERT_TRUE(batch.read(*pool, *segment_, ids, 130, 384, views,
+                         /*load_misses=*/true));
+  EXPECT_EQ(after_cold, pool->stats().miss);
+  batch.release();
+  const size_t first = segment_->data_offset() / ailego::kVectorPageSize;
+  evict_page(first);
+  EXPECT_FALSE(pool->is_page_resident(first));
+}
+
+TEST_F(ResidentPqBatchTest, InvalidColdBatchDoesNotReadOrLeavePins) {
+  const uint32_t ids[]{0, UINT32_MAX};
+  auto pool = storage_->vec_buffer_pool();
+  const auto before = pool->stats().miss;
+  ResidentPqBatch batch;
+  ailego::BudgetedVector<const void *> views;
+  EXPECT_FALSE(batch.read(*pool, *segment_, ids, 2, 384, views,
+                          /*load_misses=*/true));
+  EXPECT_EQ(before, pool->stats().miss);
+}
+
+TEST_F(ResidentPqBatchTest, ConcurrentColdBatchesSharePagesWithoutChangingCodes) {
+  std::atomic<bool> start{false};
+  std::atomic<int> errors{0};
+  std::vector<std::thread> threads;
+  auto pool = storage_->vec_buffer_pool();
+  for (size_t worker = 0; worker < 4; ++worker) {
+    threads.emplace_back([&, worker] {
+      ResidentPqBatch batch;
+      ailego::BudgetedVector<const void *> views;
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (size_t pass = 0; pass < 8; ++pass) {
+        uint32_t ids[130];
+        for (size_t i = 0; i < 130; ++i)
+          ids[i] = (i * 13 + pass * 7 + worker) % 2048;
+        if (!batch.read(*pool, *segment_, ids, 130, 384, views,
+                         /*load_misses=*/true)) {
+          ++errors;
+          continue;
+        }
+        for (size_t i = 0; i < 130; ++i)
+          if (std::memcmp(views[i], codes_.data() + ids[i] * 384, 384) != 0)
+            ++errors;
+        batch.release();
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto &thread : threads) thread.join();
+  EXPECT_EQ(0, errors.load());
+}
+
+TEST_F(ResidentPqBatchTest, CapacityFailureReleasesPinsAndAllowsLaterReload) {
+  uint32_t ids[130];
+  for (size_t i = 0; i < 130; ++i) ids[i] = (i * 13) % 2048;
+  auto pool = storage_->vec_buffer_pool();
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  ResidentPqBatch batch;
+  ailego::BudgetedVector<const void *> views;
+  {
+    // Leave room for scratch and a few pages, but not every page in this
+    // batch. Optional population must release partial pins/load claims.
+    ASSERT_GT(budget.available(), 128UL << 10);
+    ailego::MemoryReservation other_workspace;
+    other_workspace.add(budget.available() - (128UL << 10));
+    EXPECT_FALSE(batch.read(*pool, *segment_, ids, 130, 384, views,
+                            /*load_misses=*/true));
+    EXPECT_LE(budget.used(), budget.capacity());
+  }
+  ASSERT_TRUE(batch.read(*pool, *segment_, ids, 130, 384, views,
+                         /*load_misses=*/true));
+  for (size_t i = 0; i < 130; ++i)
+    EXPECT_EQ(0, std::memcmp(views[i], codes_.data() + ids[i] * 384, 384));
 }
 }  // namespace
 }  // namespace zvec::core
