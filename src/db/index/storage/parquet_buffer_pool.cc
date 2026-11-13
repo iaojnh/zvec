@@ -76,7 +76,10 @@ ParquetBufferID::ParquetBufferID(
     const std::string &filename,
     const std::shared_ptr<arrow::io::RandomAccessFile> &file, int column,
     int row_group)
-    : filename(filename), column(column), row_group(row_group), input(file) {
+    : column(column),
+      row_group(row_group),
+      input(file),
+      filename_(std::make_shared<const std::string>(filename)) {
   int fd = -1;
   if (auto *readable = dynamic_cast<arrow::io::ReadableFile *>(file.get())) {
     fd = readable->file_descriptor();
@@ -121,8 +124,8 @@ ParquetBufferID::ParquetBufferID(
 
 const std::string ParquetBufferID::to_string() const {
   std::string msg{"Buffer["};
-  msg += "parquet: " + filename + "[" + std::to_string(file_id) + "]" +
-         ", column: " + std::to_string(column) +
+  msg += "parquet: " + std::string(filename()) + "[" + std::to_string(file_id) +
+         "]" + ", column: " + std::to_string(column) +
          ", row_group: " + std::to_string(row_group);
   msg += ", mtime: " + std::to_string(mtime);
   msg += ", device: " + std::to_string(device_id) +
@@ -221,17 +224,17 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
   arrow::MemoryPool *mem_pool = arrow::default_memory_pool();
 
   auto input = buffer_id.input.lock();
-  const auto &file_name = buffer_id.filename;
+  const auto file_name = buffer_id.filename();
   if (!input) {
     LOG_ERROR("Opened parquet file is no longer available: %s",
-              file_name.c_str());
+              file_name.data());
     return false;
   }
 
   std::unique_ptr<parquet::arrow::FileReader> reader;
   auto reader_result = parquet::arrow::OpenFile(input, mem_pool);
   if (!reader_result.ok()) {
-    LOG_ERROR("Failed to create parquet reader[%s]: %s", file_name.c_str(),
+    LOG_ERROR("Failed to create parquet reader[%s]: %s", file_name.data(),
               reader_result.status().ToString().c_str());
     return false;
   }
@@ -241,7 +244,7 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
   int column = buffer_id.column;
   auto s = reader->RowGroup(row_group)->Column(column)->Read(&payload.arrow);
   if (!s.ok()) {
-    LOG_ERROR("Failed to read parquet file[%s]: %s", file_name.c_str(),
+    LOG_ERROR("Failed to read parquet file[%s]: %s", file_name.data(),
               s.ToString().c_str());
     payload.arrow = nullptr;
     return false;
@@ -273,7 +276,14 @@ void detail::ParquetBufferLoader::clear(ParquetBufferPayload &payload) const {
 
 ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
     ParquetBufferID buffer_id) {
-  auto arrow = cache_.acquire(buffer_id);
+  auto &cache = cache_for(buffer_id);
+  auto arrow = cache.retain(buffer_id);
+  if (!arrow) {
+    // Hold the shared load slot through decoding, charging and publication.
+    // acquire() rechecks the entry and coalesces concurrent loads of one key.
+    LoadSlot slot(*this);
+    arrow = cache.acquire(buffer_id);
+  }
   if (!arrow) {
     LOG_ERROR("Failed to acquire parquet buffer: %s",
               buffer_id.to_string().c_str());
@@ -283,12 +293,38 @@ ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
 }
 
 void ParquetBufferPool::release(const ParquetBufferID &buffer_id) {
-  cache_.release(buffer_id);
+  cache_for(buffer_id).release(buffer_id);
 }
 
 std::shared_ptr<arrow::ChunkedArray> ParquetBufferPool::retain(
     const ParquetBufferID &buffer_id) {
-  return cache_.retain(buffer_id);
+  return cache_for(buffer_id).retain(buffer_id);
+}
+
+ParquetBufferPool::Cache &ParquetBufferPool::cache_for(
+    const ParquetBufferID &buffer_id) {
+  // Stable identity components select the lock shard; the cache still checks
+  // the full key, including the pathname, for equality.
+  const uint64_t hash = buffer_id.file_id ^ buffer_id.generation ^
+                        (static_cast<uint64_t>(buffer_id.column) * 31) ^
+                        static_cast<uint64_t>(buffer_id.row_group);
+  return caches_[hash % kCacheShards].cache;
+}
+
+ParquetBufferPool::LoadSlot::LoadSlot(ParquetBufferPool &pool) : pool_(pool) {
+  std::unique_lock<std::mutex> lock(pool_.load_mutex_);
+  pool_.load_cv_.wait(lock, [&] {
+    return pool_.active_loads_ < Cache::kDefaultMaxConcurrentLoads;
+  });
+  ++pool_.active_loads_;
+}
+
+ParquetBufferPool::LoadSlot::~LoadSlot() {
+  {
+    std::lock_guard<std::mutex> lock(pool_.load_mutex_);
+    --pool_.active_loads_;
+  }
+  pool_.load_cv_.notify_one();
 }
 
 }  // namespace zvec

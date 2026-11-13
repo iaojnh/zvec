@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <arrow/api.h>
 #include <arrow/io/file.h>
@@ -1370,6 +1374,136 @@ TEST_F(BufferPoolStoreTest,
       ParquetBufferPool::get_instance().acquire_buffer(context->buffer_id);
   auto leased = std::move(handle).borrow_for_scan();
   ASSERT_NE(leased, nullptr);
+}
+
+namespace {
+
+struct ColdReadBarrier {
+  void before_read() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!armed || released) return;
+    readers.insert(std::this_thread::get_id());
+    cv.notify_all();
+    cv.wait(lock, [&] { return released; });
+  }
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::set<std::thread::id> readers;
+  bool armed{false};
+  bool released{false};
+};
+
+class BlockingReadFile : public arrow::io::RandomAccessFile {
+ public:
+  BlockingReadFile(std::shared_ptr<arrow::io::RandomAccessFile> source,
+                   std::shared_ptr<ColdReadBarrier> barrier)
+      : source_(std::move(source)), barrier_(std::move(barrier)) {}
+  arrow::Status Close() override {
+    return source_->Close();
+  }
+  bool closed() const override {
+    return source_->closed();
+  }
+  arrow::Result<int64_t> Tell() const override {
+    return source_->Tell();
+  }
+  arrow::Status Seek(int64_t position) override {
+    return source_->Seek(position);
+  }
+  arrow::Result<int64_t> GetSize() override {
+    return source_->GetSize();
+  }
+  arrow::Result<int64_t> Read(int64_t bytes, void *out) override {
+    return source_->Read(bytes, out);
+  }
+  arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t bytes) override {
+    return source_->Read(bytes);
+  }
+  arrow::Result<int64_t> ReadAt(int64_t position, int64_t bytes,
+                                void *out) override {
+    barrier_->before_read();
+    return source_->ReadAt(position, bytes, out);
+  }
+  arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position,
+                                                       int64_t bytes) override {
+    barrier_->before_read();
+    return source_->ReadAt(position, bytes);
+  }
+
+ private:
+  std::shared_ptr<arrow::io::RandomAccessFile> source_;
+  std::shared_ptr<ColdReadBarrier> barrier_;
+};
+
+}  // namespace
+
+TEST_F(BufferPoolStoreTest,
+       ConcurrentColdLoadsStayBoundedWithoutBlockingHotPins) {
+  auto file = arrow::io::ReadableFile::Open(parquet_path);
+  ASSERT_TRUE(file.ok());
+  auto size = (*file)->GetSize();
+  ASSERT_TRUE(size.ok());
+  auto bytes = (*file)->Read(*size);
+  ASSERT_TRUE(bytes.ok());
+  auto barrier = std::make_shared<ColdReadBarrier>();
+  std::shared_ptr<arrow::io::RandomAccessFile> input =
+      std::make_shared<BlockingReadFile>(
+          std::make_shared<arrow::io::BufferReader>(*bytes), barrier);
+  auto &pool = ParquetBufferPool::get_instance();
+  ParquetBufferID hot_key("gate-hot", input, 0, 0);
+  auto warm = pool.acquire_buffer(hot_key);
+  ASSERT_NE(warm.borrowed_data(), nullptr);
+  std::vector<ParquetBufferID> keys;
+  for (int i = 0; i < 8; ++i)
+    keys.emplace_back("gate-cold-" + std::to_string(i), input, 0, 0);
+  barrier->armed = true;
+  std::atomic<int> ready{0};
+  std::atomic<bool> correct{true};
+  std::vector<std::thread> workers;
+  for (const auto &key : keys)
+    workers.emplace_back([&, key] {
+      ready.fetch_add(1);
+      try {
+        auto handle = pool.acquire_buffer(key);
+        const auto *column = handle.borrowed_data();
+        if (!column || !column->ValidateFull().ok()) correct.store(false);
+      } catch (...) {
+        correct.store(false);
+      }
+    });
+  while (ready.load() != 8) std::this_thread::yield();
+  std::unique_lock<std::mutex> lock(barrier->mutex);
+  const bool four_started =
+      barrier->cv.wait_for(lock, std::chrono::seconds(5),
+                           [&] { return barrier->readers.size() >= 4; });
+  std::atomic<bool> hot_done{false};
+  std::thread hot([&] {
+    try {
+      auto handle = pool.acquire_buffer(hot_key);
+      if (!handle.borrowed_data()) correct.store(false);
+    } catch (...) {
+      correct.store(false);
+    }
+    hot_done.store(true);
+    barrier->cv.notify_all();
+  });
+  const bool hot_unblocked = barrier->cv.wait_for(
+      lock, std::chrono::seconds(1), [&] { return hot_done.load(); });
+  const bool exceeded =
+      barrier->cv.wait_for(lock, std::chrono::milliseconds(100),
+                           [&] { return barrier->readers.size() > 4; });
+  const auto initial_readers = barrier->readers.size();
+  // Always unblock and join the workers before reporting an assertion failure.
+  barrier->released = true;
+  lock.unlock();
+  barrier->cv.notify_all();
+  hot.join();
+  for (auto &worker : workers) worker.join();
+  EXPECT_TRUE(four_started);
+  EXPECT_FALSE(exceeded);
+  EXPECT_EQ(initial_readers, 4u);
+  EXPECT_TRUE(hot_unblocked);
+  EXPECT_TRUE(correct.load());
 }
 
 TEST_F(BufferPoolStoreTest, ScanNullableNestedColumnsAndRepeatedEOF) {

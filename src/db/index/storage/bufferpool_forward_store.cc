@@ -704,7 +704,7 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
     key.row_group = group;
     auto handle =
         ParquetBufferPool::get_instance().acquire_buffer(std::move(key));
-    auto column = handle.data();
+    const auto *column = handle.borrowed_data();
     if (!column) return nullptr;
     int64_t row = local_row;
     const arrow::Array *array = nullptr;

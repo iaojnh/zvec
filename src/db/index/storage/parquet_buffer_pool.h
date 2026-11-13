@@ -15,9 +15,13 @@
 #pragma once
 
 #include <sys/stat.h>
+#include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <arrow/result.h>
@@ -34,7 +38,6 @@ class RandomAccessFile;
 namespace zvec {
 
 struct ParquetBufferID {
-  std::string filename;
   int column{0};
   int row_group{0};
   uint64_t file_id{0};
@@ -48,7 +51,15 @@ struct ParquetBufferID {
                   const std::shared_ptr<arrow::io::RandomAccessFile> &file,
                   int column, int row_group);
 
+  std::string_view filename() const noexcept {
+    return filename_ ? std::string_view(*filename_) : std::string_view("");
+  }
+
   const std::string to_string() const;
+
+ private:
+  // Key copies, including hot pins, share immutable path storage.
+  std::shared_ptr<const std::string> filename_;
 };
 
 struct ParquetFileContext {
@@ -79,7 +90,7 @@ struct ParquetBufferIDHash {
 
 struct ParquetBufferIDEqual {
   bool operator()(const ParquetBufferID &a, const ParquetBufferID &b) const {
-    if (a.filename != b.filename) {
+    if (a.filename() != b.filename()) {
       return false;
     }
     if (a.file_id != b.file_id) {
@@ -135,6 +146,12 @@ class ParquetBufferContextHandle {
     return arrow_;
   }
 
+  // Synchronous access only; this handle must retain its pin throughout use.
+  const arrow::ChunkedArray *borrowed_data() const & noexcept {
+    return arrow_.get();
+  }
+  const arrow::ChunkedArray *borrowed_data() const && = delete;
+
   // Returned arrays retain the cache pin through their buffers. Returns null
   // when the shared scan lease budget is exhausted; the handle stays usable.
   std::shared_ptr<arrow::ChunkedArray> borrow_for_scan() &&;
@@ -170,12 +187,34 @@ class ParquetBufferPool {
 
   ParquetBufferPool() = default;
 
+  static constexpr size_t kCacheShards = 16;
+  struct alignas(AILEGO_CACHE_LINE_SIZE) CacheShard {
+    Cache cache;
+  };
+
+  class LoadSlot {
+   public:
+    explicit LoadSlot(ParquetBufferPool &pool);
+    ~LoadSlot();
+    LoadSlot(const LoadSlot &) = delete;
+    LoadSlot &operator=(const LoadSlot &) = delete;
+
+   private:
+    ParquetBufferPool &pool_;
+  };
+
+  Cache &cache_for(const ParquetBufferID &buffer_id);
+
   std::shared_ptr<arrow::ChunkedArray> retain(const ParquetBufferID &buffer_id);
 
   void release(const ParquetBufferID &buffer_id);
 
  private:
-  Cache cache_;
+  std::array<CacheShard, kCacheShards> caches_;
+  // Misses alone share the loader ceiling. Hot pins touch only their shard.
+  std::mutex load_mutex_;
+  std::condition_variable load_cv_;
+  size_t active_loads_{0};
 };
 
 }  // namespace zvec
