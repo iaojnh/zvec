@@ -70,8 +70,8 @@ class BufferPoolForwardStore
   ExecBatchPtr fetch(const std::vector<std::string> &columns,
                      int index) override;
 
-  // Supported primitive fields are copied directly into an admitted Doc.
-  // Complex schemas retain the ordinary Arrow materialization path.
+  // Supported scalar and array fields are copied into an admitted Doc.
+  // Unsupported schemas retain the ordinary Arrow materialization path.
   std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
                                  const std::shared_ptr<arrow::Schema> &schema,
                                  int index);

@@ -113,6 +113,97 @@ void ReadDocField(const arrow::Array &array, int64_t row,
   }
 }
 
+bool SupportsDirectDocValues(arrow::Type::type type) {
+  switch (type) {
+    case arrow::Type::BOOL:
+    case arrow::Type::INT32:
+    case arrow::Type::INT64:
+    case arrow::Type::UINT32:
+    case arrow::Type::UINT64:
+    case arrow::Type::FLOAT:
+    case arrow::Type::DOUBLE:
+    case arrow::Type::STRING:
+    case arrow::Type::BINARY:
+      return true;
+    default:
+      return false;
+  }
+}
+
+template <typename ArrayType, typename ValueType>
+void ReadListDocField(const arrow::Array &child, int64_t offset, int64_t length,
+                      const std::string &name, Doc &doc) {
+  const auto &values = static_cast<const ArrayType &>(child);
+  std::vector<ValueType> owned;
+  owned.reserve(length);
+  for (int64_t i = offset; i < offset + length; ++i) {
+    if constexpr (std::is_same_v<ArrayType, arrow::StringArray> ||
+                  std::is_same_v<ArrayType, arrow::BinaryArray>) {
+      owned.emplace_back(values.GetView(i));
+    } else {
+      owned.emplace_back(values.Value(i));
+    }
+  }
+  doc.set(name, std::move(owned));
+}
+
+bool ReadListDocField(const arrow::ListArray &array, int64_t row,
+                      const std::string &name, Doc &doc) {
+  const auto &child = *array.values();
+  const int64_t offset = array.value_offset(row);
+  const int64_t length = array.value_length(row);
+  // zvec array fields do not support null elements. Keep Arrow's existing
+  // scalar fallback for externally supplied lists that contain them.
+  if (child.null_count() != 0) {
+    for (int64_t i = offset; i < offset + length; ++i) {
+      if (child.IsNull(i)) return false;
+    }
+  }
+  // Copy directly from the selected child range while the column is pinned.
+  // In particular, do not allocate a sliced Arrow array or ListScalar.
+  switch (child.type_id()) {
+    case arrow::Type::BOOL:
+      ReadListDocField<arrow::BooleanArray, bool>(child, offset, length, name,
+                                                  doc);
+      break;
+    case arrow::Type::INT32:
+      ReadListDocField<arrow::Int32Array, int32_t>(child, offset, length, name,
+                                                   doc);
+      break;
+    case arrow::Type::INT64:
+      ReadListDocField<arrow::Int64Array, int64_t>(child, offset, length, name,
+                                                   doc);
+      break;
+    case arrow::Type::UINT32:
+      ReadListDocField<arrow::UInt32Array, uint32_t>(child, offset, length,
+                                                     name, doc);
+      break;
+    case arrow::Type::UINT64:
+      ReadListDocField<arrow::UInt64Array, uint64_t>(child, offset, length,
+                                                     name, doc);
+      break;
+    case arrow::Type::FLOAT:
+      ReadListDocField<arrow::FloatArray, float>(child, offset, length, name,
+                                                 doc);
+      break;
+    case arrow::Type::DOUBLE:
+      ReadListDocField<arrow::DoubleArray, double>(child, offset, length, name,
+                                                   doc);
+      break;
+    case arrow::Type::STRING:
+      ReadListDocField<arrow::StringArray, std::string>(child, offset, length,
+                                                        name, doc);
+      break;
+    case arrow::Type::BINARY:
+      ReadListDocField<arrow::BinaryArray, std::string>(child, offset, length,
+                                                        name, doc);
+      break;
+    default:
+      return false;
+  }
+  return true;
+}
+
 template <typename ArrayType, typename BuilderType>
 arrow::Status AppendTypedRows(const arrow::ChunkedArray &column,
                               const detail::SelectedRowsPlan &plan,
@@ -604,24 +695,18 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
             physic_schema_->field(column)->type())) {
       return nullptr;
     }
-    const auto type = schema->field(i)->type()->id();
+    const auto &field_type = schema->field(i)->type();
+    const auto type = field_type->id();
     if ((i == 0 && type != arrow::Type::UINT64) ||
         (i == 1 && type != arrow::Type::STRING)) {
       return nullptr;
     }
-    switch (type) {
-      case arrow::Type::BOOL:
-      case arrow::Type::INT32:
-      case arrow::Type::INT64:
-      case arrow::Type::UINT32:
-      case arrow::Type::UINT64:
-      case arrow::Type::FLOAT:
-      case arrow::Type::DOUBLE:
-      case arrow::Type::STRING:
-      case arrow::Type::BINARY:
-        break;
-      default:
+    if (type == arrow::Type::LIST) {
+      const auto &list_type = static_cast<const arrow::ListType &>(*field_type);
+      if (!SupportsDirectDocValues(list_type.value_type()->id()))
         return nullptr;
+    } else if (!SupportsDirectDocValues(type)) {
+      return nullptr;
     }
     selected.push_back(column);
   }
@@ -705,6 +790,12 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
           break;
         case arrow::Type::BINARY:
           ReadDocField<arrow::BinaryArray>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::LIST:
+          if (!ReadListDocField(static_cast<const arrow::ListArray &>(*array),
+                                row, columns[i], *doc)) {
+            return nullptr;
+          }
           break;
         default:
           return nullptr;

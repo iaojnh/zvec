@@ -2483,6 +2483,10 @@ TEST_P(SegmentTest, BufferedDirectDocFetchPreservesConcurrentReads) {
                   .add_field(std::make_shared<FieldSchema>(
                       "number", DataType::INT64, false))
                   .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "items", DataType::ARRAY_INT32, false))
+                  .ok());
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
       options_, 100, 8);
@@ -2501,6 +2505,8 @@ TEST_P(SegmentTest, BufferedDirectDocFetchPreservesConcurrentReads) {
               doc->get<std::string>("text") !=
                   expected.get<std::string>("text") ||
               doc->get<int64_t>("number") != expected.get<int64_t>("number") ||
+              doc->get<std::vector<int32_t>>("items") !=
+                  expected.get<std::vector<int32_t>>("items") ||
               (!options_.enable_mmap_ &&
                !detail::DocumentMemoryAccess::budgeted(*doc)))
             correct.store(false);
