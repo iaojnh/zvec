@@ -16,6 +16,7 @@
 #pragma once
 
 
+#include <mutex>
 #include <zvec/ailego/pattern/expected.hpp>
 #include <zvec/db/schema.h>
 #include "db/common/concurrent_roaring_bitmap.h"
@@ -237,6 +238,26 @@ class InvertedColumnIndexer {
 
   Status open();
 
+  // Checkpoints contain unions of fixed ranges, never query results. They are
+  // built once after sealing; every search receives its own mutable bitmap.
+  struct RangeCache {
+    struct Range {
+      std::string key;
+      std::string begin;
+      std::string end;
+    };
+    struct Checkpoint {
+      size_t count;
+      std::shared_ptr<const roaring_bitmap_t> bitmap;
+    };
+    std::vector<Range> ranges;
+    std::vector<Checkpoint> checkpoints;
+  };
+
+  void initialize_range_cache() const;
+  Result<roaring_bitmap_t *> get_bitmap_lt_cached(const std::string &term,
+                                                  bool include_eq) const;
+
   inline std::string encode(const std::string &term) const {
     return InvertedIndexCodec::Encode(term, field_.element_data_type());
   }
@@ -429,6 +450,8 @@ class InvertedColumnIndexer {
   std::atomic<uint32_t> max_id_{0};
   ConcurrentRoaringBitmap32 null_bitmap_{};
   SegmentDocRangeStat::Ptr doc_range_stat_{nullptr};
+  mutable std::once_flag range_cache_once_;
+  mutable std::shared_ptr<const RangeCache> range_cache_;
 };
 
 
