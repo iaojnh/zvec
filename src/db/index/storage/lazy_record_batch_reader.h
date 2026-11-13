@@ -19,10 +19,11 @@
 #include <arrow/table.h>
 #include <parquet/arrow/reader.h>
 #include "db/common/constants.h"
-#include "parquet_buffer_pool.h"
 
 
 namespace zvec {
+
+struct ParquetFileContext;
 
 class IPCRecordBatchReader : public arrow::RecordBatchReader {
  public:
@@ -80,6 +81,7 @@ class IPCRecordBatchReader : public arrow::RecordBatchReader {
 };
 
 
+// Keep the BP reader implementation out of mmap's shared reader header.
 class ParquetRecordBatchReader : public arrow::RecordBatchReader {
  public:
   ParquetRecordBatchReader(
@@ -87,91 +89,15 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
       const std::vector<std::string> &columns,
       std::shared_ptr<arrow::Schema> schema, const std::string &file_path,
       bool with_cache = true,
-      std::shared_ptr<const ParquetFileContext> file_context = nullptr)
-      : reader_(std::move(reader)),
-        schema_(std::move(schema)),
-        columns_(columns),
-        file_path_(file_path),
-        with_cache_(with_cache && file_context != nullptr),
-        file_context_(std::move(file_context)) {
-    std::vector<std::shared_ptr<arrow::Field>> fields;
-    for (const auto &col : columns) {
-      int index = schema_->GetFieldIndex(col);
-      if (index != -1) {
-        fields.push_back(schema_->field(index));
-        col_indices_.push_back(index);
-      }
-    }
-    projected_schema_ = arrow::schema(fields);
+      std::shared_ptr<const ParquetFileContext> file_context = nullptr);
 
-    auto parquet_metadata = reader_->parquet_reader()->metadata();
-    total_rows_ = parquet_metadata->num_rows();
-    num_row_groups_ = parquet_metadata->num_row_groups();
-    int64_t offset = 0;
-    for (int64_t rg = 0; rg < num_row_groups_; ++rg) {
-      auto row_group_metadata = parquet_metadata->RowGroup(rg);
-      int64_t num_rows_in_group = row_group_metadata->num_rows();
-      row_group_row_nums_.push_back(num_rows_in_group);
-      row_group_offsets_.push_back(offset);
-      offset += num_rows_in_group;
-    }
-  }
+  ~ParquetRecordBatchReader() override;
 
   std::shared_ptr<arrow::Schema> schema() const override {
     return projected_schema_;
   }
 
-  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
-    *batch = nullptr;
-    while (true) {
-      if (active_reader_) {
-        ARROW_RETURN_NOT_OK(active_reader_->ReadNext(batch));
-        if (*batch) return arrow::Status::OK();
-        active_reader_.reset();
-      }
-      if (current_row_group_ >= num_row_groups_) return arrow::Status::OK();
-      const int rg_id = current_row_group_++;
-      std::vector<std::shared_ptr<arrow::ChunkedArray>> columns;
-      columns.reserve(col_indices_.size());
-      if (with_cache_) {
-        for (int index : col_indices_) {
-          auto buffer_id = file_context_->buffer_id;
-          buffer_id.column = index;
-          buffer_id.row_group = rg_id;
-          auto handle =
-              ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
-          auto column = std::move(handle).borrow_for_scan();
-          if (!column) {
-            auto cached = handle.data();
-            if (cached) {
-              // Borrowing is bounded independently of result lifetime.
-              ARROW_ASSIGN_OR_RAISE(
-                  auto owned, arrow::Concatenate(cached->chunks(),
-                                                 arrow::default_memory_pool()));
-              column = std::make_shared<arrow::ChunkedArray>(std::move(owned));
-            } else {
-              // Other live batches may pin the cache. Read owned buffers rather
-              // than failing a scan or retaining unpinned cached memory.
-              ARROW_RETURN_NOT_OK(
-                  reader_->RowGroup(rg_id)->Column(index)->Read(&column));
-            }
-          }
-          columns.push_back(std::move(column));
-        }
-      } else {
-        std::shared_ptr<arrow::Table> table;
-        ARROW_RETURN_NOT_OK(
-            reader_->RowGroup(rg_id)->ReadTable(col_indices_, &table));
-        columns = table->columns();
-      }
-      auto table = arrow::Table::Make(projected_schema_, std::move(columns),
-                                      row_group_row_nums_[rg_id]);
-      // Align chunk boundaries across columns without concatenating their data.
-      active_reader_ =
-          std::make_unique<arrow::TableBatchReader>(std::move(table));
-      active_reader_->set_chunksize(std::numeric_limits<int64_t>::max());
-    }
-  }
+  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override;
 
  private:
   std::unique_ptr<arrow::TableBatchReader> active_reader_;
