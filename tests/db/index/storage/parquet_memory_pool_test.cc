@@ -221,6 +221,39 @@ TEST_F(ParquetBudgetTest, SmallBuffersCanBeFreedByDifferentThreads) {
   EXPECT_EQ(0u, budget_.external_used());
 }
 
+TEST_F(ParquetBudgetTest, SmallAllocationsCanRaceLastSlotRelease) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  constexpr std::array<int64_t, 7> sizes{24, 160, 480, 992, 1990, 3990, 8000};
+  std::atomic<size_t> failures{0}, ready{0};
+  std::vector<std::thread> workers;
+  for (size_t worker = 0; worker < 8; ++worker) {
+    workers.emplace_back([&, worker] {
+      ++ready;
+      while (ready.load() != 8) std::this_thread::yield();
+      for (size_t i = 0; i < 2000; ++i) {
+        const auto size = sizes[i % sizes.size()];
+        uint8_t *buffer = nullptr;
+        if (!pool.Allocate(size, &buffer).ok()) {
+          ++failures;
+          continue;
+        }
+        const auto pattern = static_cast<uint8_t>(worker * 31 + i);
+        std::memset(buffer, pattern, size);
+        std::this_thread::yield();
+        for (int64_t byte = 0; byte < size; ++byte)
+          if (buffer[byte] != pattern) ++failures;
+        pool.Free(buffer, size);
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  EXPECT_EQ(0u, failures.load());
+  EXPECT_EQ(0, pool.bytes_allocated());
+  EXPECT_EQ(0u, pool.charged_bytes());
+  EXPECT_EQ(0u, budget_.external_used());
+}
+
 TEST_F(ParquetBudgetTest, RefusedSmallSlotDoesNotRetainBackingOrLoseCapacity) {
   auto &native = ailego::MemoryLimitPool::get_instance();
   using Pressure = ailego::ProcessRssBudget::PressureLevel;
