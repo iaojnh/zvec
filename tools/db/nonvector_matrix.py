@@ -264,6 +264,7 @@ def make_plans(args):
         no_retries=True, same_binary_both_modes=True,
         topology='segment-mib is the legacy write-buffer argument; seal-rows creates true segments; numeric segment directories with nonempty scalar blocks are audited separately.',
         pressure='Warmups do not guarantee residency under pressure; cache budgets are supported public configuration values, not an RSS bound.',
+        request_scheduler='global-prefix64-v1: minimum64 timed requests globally; every worker participates; histogram proves a deterministic complete prefix. Cold first-only requests retain worker-specific offsets.',
         matrix=selected, data=profiles()))
     print(json.dumps(dict(plan=str(root / (tag + '-plan.json')), processes=len(plan),
         scenario_profiles=sum(len(x['cases']) for x in selected))))
@@ -322,7 +323,14 @@ def summarize(args):
             if not valid_parent:
                 continue
             assert row['queries'] > 0 and row['elapsed_s'] > 0
-            row = {**row, 'writer_cycles_s': row['writer_cycles'] / row.get('writer_elapsed_s', row['elapsed_s'])}
+            scheduler=result.get('request_scheduler', 'per-worker64-legacy')
+            if scheduler=='global-prefix64-v1':
+                histogram=row['request_counts'];n=row['queries']
+                assert len(histogram)==64 and sum(histogram)==n
+                if not result['first_only']:
+                    assert n>=64 and histogram==[n//64+(q<n%64) for q in range(64)]
+            row = {**row, 'request_scheduler':scheduler,
+                   'writer_cycles_s': row['writer_cycles'] / row.get('writer_elapsed_s', row['elapsed_s'])}
             key = item['group'], row['case']
             values.setdefault(key, {}).setdefault(item['arm'], {})[item['repeat']] = {**row, 'process_exit_code': rec['exit_code']}
     summary = []
@@ -341,6 +349,7 @@ def summarize(args):
             pairs = sorted(arms['B'].keys() & arms['M'].keys())
             assert all((arms['B'][r]['request_fingerprint'], arms['B'][r]['expected_docs_per_cycle']) ==
                        (arms['M'][r]['request_fingerprint'], arms['M'][r]['expected_docs_per_cycle']) for r in pairs)
+            assert all(arms['B'][r]['request_scheduler']==arms['M'][r]['request_scheduler'] for r in pairs)
             logs = [math.log(arms['B'][r][metric] / arms['M'][r][metric]) * (-1 if cold else 1) for r in pairs]
             row.update(pairs=len(pairs), bp_mmap_speed=math.exp(statistics.mean(logs)),
                        parent_process_failure_pairs=sum(arms['B'][r]['process_exit_code'] != 0 or arms['M'][r]['process_exit_code'] != 0 for r in pairs))

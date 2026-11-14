@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -973,6 +974,7 @@ int main(int argc, char **argv) try {
       << ",\"arrow_cpu_capacity\":" << arrow::GetCpuThreadPoolCapacity()
       << ",\"arrow_io_capacity\":" << arrow::io::GetIOThreadPoolCapacity()
       << ",\"first_only\":" << first_only
+      << ",\"request_scheduler\":\"global-prefix64-v1\""
       << ",\"io_metric\":" << std::quoted(io_metric())
       << ",\"open_us\":" << open_us << ",\"cases\":[";
   bool first = true;
@@ -1026,6 +1028,8 @@ int main(int argc, char **argv) try {
     auto reads = disk_read();
     ProcessUsage cb{}, ca{};
     std::atomic<size_t> ready{0};
+    alignas(128) std::atomic<size_t> next_request{workers};
+    Clock::time_point started;
     std::atomic<bool> go{false}, stop_writer{false}, readers_done{false};
     std::atomic<size_t> overlap_cycles{0};
     std::exception_ptr writer_error;
@@ -1077,6 +1081,9 @@ int main(int argc, char **argv) try {
     std::vector<std::vector<double>> latencies(workers);
     std::vector<std::vector<Doc::Ptr>> cold_results(workers);
     std::vector<size_t> count(workers, 0), results(workers, 0);
+    std::vector<size_t> expected_results(workers, 0);
+    std::vector<std::array<size_t, 64>> request_counts(
+        workers, std::array<size_t, 64>{});
     std::vector<std::exception_ptr> errors(workers);
     for (size_t w = 0; w < workers; ++w)
       threads.emplace_back([&, w] {
@@ -1087,21 +1094,30 @@ int main(int argc, char **argv) try {
           ready.fetch_add(1);
           announced = true;
           while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
-          auto start = Clock::now();
-          do {
-            for (size_t i = 0; i < (first_only ? 1 : 64); ++i) {
-              auto t = Clock::now();
-              results[w] +=
-                  execute(*col, requests[(i + w * 17) % 64], full_timed,
-                          scratch, first_only ? &cold_results[w] : nullptr);
-              latencies[w].push_back(
-                  std::chrono::duration<double, std::micro>(Clock::now() - t)
-                      .count());
-              ++count[w];
-            }
-          } while (!first_pass &&
-                   std::chrono::duration<double>(Clock::now() - start).count() <
-                       minimum_seconds);
+          while (true) {
+            // Every worker executes its initial request. Remaining requests
+            // form one shared deterministic sequence, so even an overloaded
+            // run covers all64 variants without requiring 64 per worker.
+            const size_t ticket = first_only ? w * 17
+                                  : count[w] == 0 ? w
+                                                  : next_request.fetch_add(
+                                                        1, std::memory_order_relaxed);
+            if (!first_only && count[w] != 0 && ticket >= requests.size() &&
+                (first_pass || std::chrono::duration<double>(Clock::now() - started)
+                                       .count() >= minimum_seconds))
+              break;
+            const size_t index = ticket % requests.size();
+            auto t = Clock::now();
+            results[w] += execute(*col, requests[index], full_timed,
+                                  scratch, first_only ? &cold_results[w] : nullptr);
+            expected_results[w] += requests[index].wanted_count;
+            ++request_counts[w][index];
+            latencies[w].push_back(
+                std::chrono::duration<double, std::micro>(Clock::now() - t)
+                    .count());
+            ++count[w];
+            if (first_only) break;
+          }
         } catch (...) {
           errors[w] = std::current_exception();
           if (!announced) ready.fetch_add(1);
@@ -1109,17 +1125,17 @@ int main(int argc, char **argv) try {
       });
     while (ready.load() != workers) std::this_thread::yield();
     cb = process_usage();
-    auto start = Clock::now();
+    started = Clock::now();
     go.store(true, std::memory_order_release);
     for (auto &t : threads) t.join();
     const double elapsed =
-        std::chrono::duration<double>(Clock::now() - start).count();
+        std::chrono::duration<double>(Clock::now() - started).count();
     ca = process_usage();
     readers_done.store(true, std::memory_order_release);
     stop_writer.store(true, std::memory_order_release);
     if (writer.joinable()) writer.join();
     const double writer_elapsed =
-        std::chrono::duration<double>(Clock::now() - start).count();
+        std::chrono::duration<double>(Clock::now() - started).count();
     if (writer_error) std::rethrow_exception(writer_error);
     check(!mixed || overlap_cycles.load() > 0,
           "writer made progress during the read interval");
@@ -1129,14 +1145,22 @@ int main(int argc, char **argv) try {
     size_t total = std::accumulate(count.begin(), count.end(), size_t{});
     size_t expected_per_cycle = 0;
     for (auto &r : requests) expected_per_cycle += r.wanted_count;
+    std::array<size_t, 64> histogram{};
     for (size_t w = 0; w < workers; ++w) {
       if (first_only)
         check(count[w] == 1 && results[w] == requests[w * 17 % 64].wanted_count,
               "cold result count");
       else
-        check(count[w] % 64 == 0 &&
-                  results[w] == count[w] / 64 * expected_per_cycle,
-              "complete balanced cycles");
+        check(count[w] > 0 && results[w] == expected_results[w],
+              "every timed request returned its expected count");
+      for (size_t q = 0; q < histogram.size(); ++q)
+        histogram[q] += request_counts[w][q];
+    }
+    if (!first_only) {
+      check(total >= requests.size(), "complete timed request set");
+      for (size_t q = 0; q < histogram.size(); ++q)
+        check(histogram[q] == total / requests.size() + (q < total % requests.size()),
+              "balanced global request prefix");
     }
     if (first_only)
       for (size_t w = 0; w < workers; ++w)
@@ -1155,6 +1179,14 @@ int main(int argc, char **argv) try {
     out << "{\"case\":" << std::quoted(kind) << ",\"request_fingerprint\":"
         << std::quoted(std::to_string(request_fingerprint))
         << ",\"expected_docs_per_cycle\":" << expected_per_cycle
+        << ",\"timed_expected_docs\":"
+        << std::accumulate(expected_results.begin(), expected_results.end(), size_t{})
+        << ",\"request_counts\":[";
+    for (size_t q = 0; q < histogram.size(); ++q) {
+      if (q) out << ',';
+      out << histogram[q];
+    }
+    out << ']'
         << ",\"queries\":" << total << ",\"elapsed_s\":" << elapsed
         << ",\"qps\":" << total / elapsed << ",\"p50_us\":" << quantile(.5)
         << ",\"p95_us\":" << quantile(.95) << ",\"p99_us\":" << quantile(.99)
