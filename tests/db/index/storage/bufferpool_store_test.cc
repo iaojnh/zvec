@@ -1604,7 +1604,13 @@ TEST_F(BufferPoolStoreTest, WideDocAndManyGroupFetchKeepBudgetedOverflow) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
   ASSERT_TRUE(store->open().ok());
   const auto columns = source->ColumnNames();
-  auto doc = store->fetch_doc(columns, source->schema(), 7);
+  // Null list elements still select the existing scalar fallback. The wide
+  // direct-Doc projection exercises spill storage with supported fields.
+  EXPECT_EQ(nullptr, store->fetch_doc(columns, source->schema(), 7));
+  auto doc_columns = columns;
+  doc_columns.pop_back();
+  auto doc = store->fetch_doc(
+      doc_columns, arrow::schema(SelectFields(source->schema(), doc_columns)), 7);
   ASSERT_NE(doc, nullptr);
   // Prewarm every row group so the resident gather reaches all spill paths.
   std::vector<int> selected;
