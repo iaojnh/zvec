@@ -176,6 +176,90 @@ TEST_F(BufferPoolStoreTest, PathAndOpenedFileUseTheSameCacheIdentity) {
   EXPECT_NE(opened_key.mtime, refreshed.mtime);
 }
 
+TEST_F(BufferPoolStoreTest, ProjectedReadsRefreshIdentityBetweenRequests) {
+  const auto timestamp = std::filesystem::last_write_time(parquet_path);
+  const auto schema = arrow::schema(
+      {arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+       arrow::field(USER_ID, arrow::utf8()), arrow::field("text", arrow::utf8())});
+  auto write = [&](int version) {
+    arrow::UInt64Builder ids;
+    arrow::StringBuilder keys, text;
+    for (int row = 0; row < 4; ++row) {
+      ASSERT_TRUE(ids.Append(row).ok());
+      ASSERT_TRUE(keys.Append("key-" + std::to_string(row)).ok());
+      ASSERT_TRUE(text.Append(std::string(128, 'a' + version)).ok());
+    }
+    auto table = arrow::Table::Make(
+        schema, {ids.Finish().ValueOrDie(), keys.Finish().ValueOrDie(),
+                 text.Finish().ValueOrDie()});
+    auto file = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
+                                           file, 2)
+                    .ok());
+    ASSERT_TRUE(file->Close().ok());
+    std::filesystem::last_write_time(
+        parquet_path, timestamp + std::chrono::seconds(version + 1));
+  };
+  write(0);
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> columns{GLOBAL_DOC_ID, USER_ID, "text"};
+  std::vector<Doc::Ptr> retained;
+  for (int version = 0; version < 3; ++version) {
+    if (version) write(version);
+    const std::string expected(128, 'a' + version);
+    auto scalar = store->fetch(columns, 1);
+    ASSERT_NE(scalar, nullptr);
+    EXPECT_EQ(scalar->values[2].scalar()->ToString(), expected);
+    auto batch = store->fetch_checked(columns, {3, 0, 3}, nullptr);
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_TRUE((*batch)->ValidateFull().ok());
+    for (int row = 0; row < 3; ++row)
+      EXPECT_EQ((*batch)->column(2)->GetScalar(row).ValueOrDie()->ToString(),
+                expected);
+    auto doc = store->fetch_doc(columns, schema, 1);
+    ASSERT_NE(doc, nullptr);
+    EXPECT_EQ(doc->get<std::string>("text"), expected);
+    retained.push_back(std::move(doc));
+  }
+  store.reset();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  for (int version = 0; version < 3; ++version)
+    EXPECT_EQ(retained[version]->get<std::string>("text"),
+              std::string(128, 'a' + version));
+}
+
+TEST_F(BufferPoolStoreTest, ResidentGatherReleasesPinsOnAllocationRefusal) {
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> columns{"name", "id"};
+  auto expected = store->fetch_checked(columns, {1, 0, 1}, nullptr);
+  ASSERT_TRUE(expected.ok());
+  std::vector<BufferPoolForwardStore::FetchBlock> blocks{
+      {store.get(), {{0, 1}, {2, 1}}}, {store.get(), {{1, 0}}}};
+  const auto pool = detail::GetParquetMemoryPool();
+  {
+    detail::FetchMemoryPool refused(pool.get(), 0);
+    EXPECT_EQ(nullptr,
+              BufferPoolForwardStore::fetch_blocks(columns, blocks, 3, &refused));
+    EXPECT_TRUE(refused.exceeded());
+    EXPECT_EQ(refused.bytes_allocated(), 0);
+  }
+  auto result =
+      BufferPoolForwardStore::fetch_blocks(columns, blocks, 3, pool.get());
+  ASSERT_NE(result, nullptr);
+  ASSERT_TRUE(result->ValidateFull().ok());
+  EXPECT_TRUE(result->Equals(**expected));
+  expected = TablePtr{};
+  blocks.clear();
+  store.reset();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  EXPECT_EQ(0u, ailego::MemoryLimitPool::get_instance().evictable_cache_used());
+  EXPECT_TRUE(result->ValidateFull().ok());
+  result.reset();
+  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().external_used());
+}
+
 TEST_F(BufferPoolStoreTest, ClosingReaderRetiresPathAcquiredColumns) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
   ASSERT_TRUE(store->open().ok());

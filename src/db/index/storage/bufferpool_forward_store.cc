@@ -448,16 +448,23 @@ arrow::Status AppendTypedRows(const arrow::ChunkedArray &column,
                               const detail::SelectedRowsPlan &plan,
                               arrow::ArrayBuilder *builder) {
   auto &typed_builder = static_cast<BuilderType &>(*builder);
+  // Admit offsets/values and the bitmap once for the whole selection. Binary
+  // payload capacity was admitted by ReserveSelectedBytes before this call.
+  ARROW_RETURN_NOT_OK(typed_builder.Reserve(plan.size()));
   const bool no_null = column.null_count() == 0;
   return plan.visit<ArrayType>(
       column, [&](const ArrayType &array, int64_t row, int) {
-        if (!no_null && array.IsNull(row)) return typed_builder.AppendNull();
-        if constexpr (std::is_same_v<ArrayType, arrow::StringArray> ||
-                      std::is_same_v<ArrayType, arrow::BinaryArray>) {
-          return typed_builder.Append(array.GetView(row));
+        if (!no_null && array.IsNull(row)) {
+          typed_builder.UnsafeAppendNull();
         } else {
-          return typed_builder.Append(array.Value(row));
+          if constexpr (std::is_same_v<ArrayType, arrow::StringArray> ||
+                        std::is_same_v<ArrayType, arrow::BinaryArray>) {
+            typed_builder.UnsafeAppend(array.GetView(row));
+          } else {
+            typed_builder.UnsafeAppend(array.Value(row));
+          }
         }
+        return arrow::Status::OK();
       });
 }
 
@@ -828,6 +835,10 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
     }
   }
   if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
+  ailego::BudgetedVector<ParquetBufferID> identities;
+  identities.reserve(blocks.size());
+  for (const auto &block : blocks)
+    identities.push_back(block.store->metadata_id_.for_column(0, 0));
   detail::SelectedRowsPlan::Rows selected(row_count);
   int64_t offset = 0;
   for (const auto &[key, rows] : groups) {
@@ -843,23 +854,28 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
         blocks.front().store->physic_schema_->GetFieldByName(name);
     if (!field) return nullptr;
     arrow::ArrayVector chunks;
+    ailego::BudgetedVector<ParquetBufferContextHandle> pins;
+    pins.reserve(groups.size());
     for (const auto &[key, rows] : groups) {
       auto *store = blocks[key.first].store;
       const int column = store->physic_schema_->GetFieldIndex(name);
       if (column < 0 ||
           !store->physic_schema_->field(column)->type()->Equals(field->type()))
         return nullptr;
-      auto id = store->metadata_id_.for_column(column, key.second);
-      auto handle = ParquetBufferPool::get_instance().try_acquire_buffer(id);
-      auto borrowed = handle.data();
+      auto &id = identities[key.first];
+      id.column = column;
+      id.row_group = key.second;
+      pins.push_back(ParquetBufferPool::get_instance().try_acquire_buffer(id));
+      const auto *borrowed = pins.back().borrowed_data();
       if (!borrowed ||
           borrowed->length() != store->row_group_row_nums_[key.second])
         return nullptr;
       chunks.insert(chunks.end(), borrowed->chunks().begin(),
                     borrowed->chunks().end());
     }
-    // Only resident sources are pinned while this column is copied. A cache
-    // miss or allocation refusal selects the bounded per-block fallback.
+    // The request owns every pin through the synchronous gather. Borrow the
+    // arrays directly instead of cloning their entire Arrow metadata trees.
+    // Only the selected, budgeted copies escape; a miss keeps the fallback.
     const arrow::ChunkedArray source(std::move(chunks), field->type());
     auto builder = arrow::MakeBuilder(field->type(), pool);
     if (!builder.ok() || !(*builder)->Reserve(row_count).ok() ||
@@ -978,6 +994,10 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
   }
   bool needs_reordering = false;
 
+  // Refresh the opened descriptor once per request, then share that identity
+  // across columns/groups. Repeated fstat calls on every hot column dominated
+  // small projected reads. A subsequent request still detects in-place writes.
+  auto buffer_id = metadata_id_.for_column(0, 0);
   for (const auto &[rg_id, pairs] : rg_to_local) {
     detail::SelectedRowsPlan row_plan(pairs);
     for (size_t i = 0; i < col_indices.size(); ++i) {
@@ -990,7 +1010,8 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
               order[row.first] != static_cast<int64_t>(row.first);
         }
       }
-      auto buffer_id = metadata_id_.for_column(col_idx, rg_id);
+      buffer_id.column = col_idx;
+      buffer_id.row_group = rg_id;
       auto acquired =
           ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
       if (!acquired.ok()) {
@@ -1089,9 +1110,10 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   int64_t offset = get_row_group_offset(rg_id);
 
   std::vector<arrow::Datum> scalars;
+  auto buffer_id = metadata_id_.for_column(0, rg_id);
   for (size_t i = 0; i < col_indices.size(); ++i) {
     int col_idx = col_indices[i];
-    auto buffer_id = metadata_id_.for_column(col_idx, rg_id);
+    buffer_id.column = col_idx;
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
     if (!acquired.ok()) {
@@ -1200,8 +1222,9 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   source_rows.reserve(selected.size());
   detail::QueryResultEstimate estimate;
   estimate.add(sizeof(Doc) + 256);
+  auto key = metadata_id_.for_column(0, group);
   for (size_t i = 0; i < selected.size(); ++i) {
-    auto key = metadata_id_.for_column(selected[i], group);
+    key.column = selected[i];
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(key);
     if (!acquired.ok()) {

@@ -1629,32 +1629,28 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
                                           ? std::numeric_limits<int64_t>::max()
                                           : 4LL * 1024 * 1024);
     auto columns = doc_forward_columns(output_fields);
-    std::vector<std::shared_ptr<arrow::Field>> fields;
     std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays;
-    fields.reserve(columns.size());
-    arrays.reserve(columns.size());
-    for (const auto &column : columns) {
-      // Updated columns may have different physical block/row layouts. Fetch
-      // each column's row list independently, still batching each row group.
+    std::shared_ptr<arrow::Schema> result_schema;
+    {
+      // Route the row list once for the complete projection. The forward
+      // fetcher handles changed column layouts, and shares addressing and
+      // cache identity checks when the columns still occupy the same blocks.
       auto table =
-          fetch_unsafe({column}, segment_doc_ids, /*strict=*/true, &workspace);
-      if (!table || table->num_columns() != 1 ||
-          table->num_rows() != static_cast<int64_t>(segment_doc_ids.size())) {
-        if (!workspace.exceeded()) {
-          LOG_ERROR("Batch fetch failed for column: %s", column.c_str());
-        }
-        arrays.clear();
-        break;
+          fetch_unsafe(columns, segment_doc_ids, /*strict=*/true, &workspace);
+      if (table && table->num_columns() == static_cast<int>(columns.size()) &&
+          table->num_rows() == static_cast<int64_t>(segment_doc_ids.size())) {
+        result_schema = table->schema();
+        arrays = table->columns();
+      } else if (!workspace.exceeded()) {
+        LOG_ERROR("Batch forward fetch failed");
       }
-      fields.push_back(table->schema()->field(0));
-      arrays.push_back(table->column(0));
     }
     if (arrays.size() != columns.size()) {
       // Nested Arrow scalars can retain whole row groups while a batched
       // fetch spans groups. Release every intermediate before trying the
       // original one-document path, which needs fewer simultaneous pins.
       arrays.clear();
-      fields.clear();
+      result_schema.reset();
       if (workspace.exceeded() && end - begin > 1) {
         batch_rows = std::max<size_t>(1, (end - begin) / 2);
         continue;
@@ -1666,7 +1662,6 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       begin = end;
       continue;
     }
-    auto result_schema = std::make_shared<arrow::Schema>(std::move(fields));
     for (size_t row = 0; row < segment_doc_ids.size(); ++row) {
       std::vector<arrow::Datum> scalars;
       scalars.reserve(arrays.size());
