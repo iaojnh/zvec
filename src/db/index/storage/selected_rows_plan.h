@@ -34,6 +34,10 @@ class SelectedRowsPlan {
   explicit SelectedRowsPlan(const Rows &rows) : rows_(rows) {}
   SelectedRowsPlan(Rows &&) = delete;
 
+  size_t size() const noexcept {
+    return rows_.size();
+  }
+
   arrow::Status prepare(const arrow::ChunkedArray &column) {
     bool matches =
         ready_ &&

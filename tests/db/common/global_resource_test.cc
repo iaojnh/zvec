@@ -23,6 +23,7 @@
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
+#include <arrow/io/interfaces.h>
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
@@ -471,11 +472,14 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
             GlobalResource::Instance().optimize_thread_pool()->count());
   auto *arrow_pool = GlobalResource::Instance().arrow_query_thread_pool();
   ASSERT_NE(nullptr, arrow_pool);
-  EXPECT_EQ(expected_query_workers, arrow_pool->GetCapacity());
+  const auto expected_arrow_cpu_workers = arrow::GetCpuThreadPoolCapacity();
+  const auto expected_arrow_io_workers = arrow::io::GetIOThreadPoolCapacity();
+  EXPECT_EQ(expected_arrow_cpu_workers, arrow_pool->GetCapacity());
   EXPECT_NE(arrow::internal::GetCpuThreadPool(), arrow_pool);
   auto *io_pool = GlobalResource::Instance().arrow_io_thread_pool();
   ASSERT_NE(nullptr, io_pool);
-  EXPECT_EQ(expected_query_workers, io_pool->GetCapacity());
+  EXPECT_EQ(expected_arrow_io_workers, io_pool->GetCapacity());
+  EXPECT_NE(arrow::io::default_io_context().executor(), io_pool);
   EXPECT_NE(arrow_pool, io_pool);
   auto task =
       arrow_pool->Submit([arrow_pool] { return arrow_pool->OwnsThisThread(); });
@@ -494,7 +498,9 @@ TEST(GlobalResource, UsesEffectiveCountsAndDisablesBindingByDefault) {
 #if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
   const auto stack_bytes = detail::DefaultNativeWorkerStackBytes();
   const auto native_workers =
-      3 * expected_query_workers + expected_optimize_workers +
+      static_cast<size_t>(expected_query_workers) + expected_optimize_workers +
+      static_cast<size_t>(expected_arrow_cpu_workers) +
+      static_cast<size_t>(expected_arrow_io_workers) +
       detail::RocksDbBackgroundThreads(config.optimize_thread_count) + 2;
   EXPECT_GT(stack_bytes, 0u);
   EXPECT_EQ(native_workers * stack_bytes,

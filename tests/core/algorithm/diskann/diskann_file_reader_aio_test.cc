@@ -697,6 +697,90 @@ TEST(DiskAnnLinuxAioTest, PartialSubmissionDrainsUnderNewMemoryPressure) {
   EXPECT_EQ(0, std::memcmp(output.get(), source.data(), source.size()));
 }
 
+class DiskAnnLargeFileReuseTest : public testing::TestWithParam<bool> {
+ protected:
+  void check_working_set(bool previously_evicted) {
+    const size_t page_size = ailego::kVectorPageSize;
+    constexpr size_t file_bytes = 512UL << 20;
+    constexpr size_t budget_bytes = 256UL << 20;
+    TemporaryFile file;
+    ASSERT_GE(file.fd(), 0);
+    ASSERT_EQ(::ftruncate(file.fd(), file_bytes), 0);
+    const ailego::block_id_t ids[] = {3, 50, file_bytes / page_size - 13};
+    std::vector<char> page(page_size);
+    for (size_t id : ids) {
+      std::fill(page.begin(), page.end(), static_cast<char>(id % 127 + 1));
+      ASSERT_EQ(::pwrite(file.fd(), page.data(), page.size(), id * page_size),
+                static_cast<ssize_t>(page.size()));
+    }
+    ASSERT_EQ(::fsync(file.fd()), 0);
+    auto &memory = ailego::PoolPayloadBudget::get_instance();
+    ASSERT_EQ(memory.init(budget_bytes), 0);
+    ASSERT_GT(memory.page_admission_reserve(), 0u);
+    auto pool = std::make_shared<ailego::VecBufferPool>(file.path(), false);
+    ASSERT_EQ(pool->init(), 0);
+    ASSERT_GT(pool->file_size(), memory.capacity());
+    if (previously_evicted) {
+      ASSERT_NE(pool->acquire_buffer(0, 1), nullptr);
+      const ailego::block_id_t seed = 0;
+      pool->release_pages(&seed, 1);
+      pool->page_table_.force_evict_all_loaded();
+      ASSERT_TRUE(pool->has_evicted());
+    }
+    BufferPoolAlignedFileReader reader(pool);
+    reader.open(file.path());
+    void *output = nullptr;
+    ASSERT_EQ(::posix_memalign(&output, page_size, 3 * page_size), 0);
+    auto cleanup = ailego::ScopeGuard::Make([&] { std::free(output); });
+    IOContext ctx{};
+    auto io_cleanup = ailego::ScopeGuard::Make([&] {
+      reader.release_io_ctx(ctx);
+      pool->page_table_.force_evict_all_loaded();
+    });
+    std::vector<AlignedRead> requests;
+    for (size_t i = 0; i < 3; ++i)
+      requests.emplace_back(ids[i] * page_size, page_size,
+                            static_cast<char *>(output) + i * page_size);
+    for (int pass = 0; pass < (previously_evicted ? 1 : 2); ++pass) {
+      std::memset(output, 0, 3 * page_size);
+      if (GetParam()) {
+        PendingBatch batch;
+        ASSERT_EQ(reader.submit(batch, requests, ctx), 0);
+        size_t completed = 0;
+        while (completed < requests.size()) {
+          std::vector<uint32_t> ready;
+          const int count = reader.get_completed(batch, ctx, 1, ready);
+          ASSERT_GT(count, 0);
+          completed += ready.size();
+        }
+      } else {
+        ASSERT_EQ(reader.read(requests, ctx), 0);
+      }
+      for (size_t i = 0; i < 3; ++i) {
+        std::fill(page.begin(), page.end(),
+                  static_cast<char>(ids[i] % 127 + 1));
+        EXPECT_EQ(std::memcmp(static_cast<char *>(output) + i * page_size,
+                              page.data(), page_size),
+                  0);
+        EXPECT_EQ(pool->is_page_resident(ids[i]), !previously_evicted);
+      }
+      if (!previously_evicted) EXPECT_EQ(pool->stats().bypass_bytes, 0u);
+      EXPECT_LE(memory.used(), memory.capacity());
+    }
+  }
+};
+
+TEST_P(DiskAnnLargeFileReuseTest, RetainsSmallWorkingSetBeforeFirstEviction) {
+  check_working_set(false);
+}
+
+TEST_P(DiskAnnLargeFileReuseTest, KeepsFrequencyAdmissionAfterEviction) {
+  check_working_set(true);
+}
+
+INSTANTIATE_TEST_SUITE_P(ReadAndSubmit, DiskAnnLargeFileReuseTest,
+                         testing::Bool());
+
 TEST(DiskAnnLinuxAioTest, FailedCancellationKeepsChargedStagingIsolated) {
   TemporaryFile file;
   auto source = make_source();

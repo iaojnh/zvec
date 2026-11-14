@@ -15,6 +15,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <arrow/io/interfaces.h>
 #include <arrow/util/thread_pool.h>
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/cache.h>
@@ -196,17 +197,22 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
       return -1;
     }
 
+    // Query workers schedule segments; Arrow has its own CPU and I/O
+    // parallelism. Keep its capacities independent of query_thread_count.
+    const int arrow_cpu_workers = arrow::GetCpuThreadPoolCapacity();
+    const int arrow_io_workers = arrow::io::GetIOThreadPoolCapacity();
+
     if (!preserve_existing_pool) {
       // Locate the image with an anchor in a product translation unit so the
       // caller's main executable is not charged. Shared-library code, read-only
       // data, and BSS outlive collection.close; reserve them before publishing.
       static const char image_anchor = 0;
       detail::ReserveNativeImage(&image_anchor);
-      // Admit startup stacks before creating the two worker pools. The
-      // dedicated Arrow pools use the same query worker count.
+      // Admit the actual Arrow capacities before creating the private pools.
       detail::ReserveNativeWorkerStacks(
           query_workers, optimize_workers, optimize_thread_count,
-          2 * static_cast<size_t>(query_workers));
+          static_cast<size_t>(arrow_cpu_workers) +
+              static_cast<size_t>(arrow_io_workers));
     }
     auto query_thread_pool = std::make_unique<ailego::ThreadPool>(
         query_workers, query_thread_binding);
@@ -239,16 +245,16 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
 
     // MakeEternal supports singleton destruction late at process exit. Its
     // lazy workers are admitted above before any plan can start using them.
-    auto arrow_pool = arrow::internal::ThreadPool::MakeEternal(
-        static_cast<int>(query_thread_pool->count()));
+    auto arrow_pool =
+        arrow::internal::ThreadPool::MakeEternal(arrow_cpu_workers);
     if (!arrow_pool.ok()) {
       LOG_ERROR("Failed to create managed Arrow executor: %s",
                 arrow_pool.status().ToString().c_str());
       return -1;
     }
 
-    auto arrow_io_pool = arrow::internal::ThreadPool::MakeEternal(
-        static_cast<int>(query_thread_pool->count()));
+    auto arrow_io_pool =
+        arrow::internal::ThreadPool::MakeEternal(arrow_io_workers);
     if (!arrow_io_pool.ok()) {
       LOG_ERROR("Failed to create managed Arrow I/O executor: %s",
                 arrow_io_pool.status().ToString().c_str());
