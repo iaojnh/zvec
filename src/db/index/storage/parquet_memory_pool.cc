@@ -215,7 +215,14 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
   // or its free-list link until admission succeeds.
   ++chunk->live_slots;
   lock.unlock();
-  if (reused_chunk && !budget.try_materialize_retained_block(chunk)) {
+  bool admitted = !reused_chunk;
+  try {
+    if (reused_chunk) admitted = budget.try_materialize_retained_block(chunk);
+  } catch (...) {
+    release_small_chunk(chunk, nullptr);
+    throw;
+  }
+  if (!admitted) {
     release_small_chunk(chunk, nullptr);
     return arrow::Status::OutOfMemory(
         "Parquet small slot exceeds RSS headroom");

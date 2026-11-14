@@ -192,7 +192,8 @@ TEST_F(ParquetBudgetTest, SmallBuffersCanBeFreedByDifferentThreads) {
           ++failures;
           continue;
         }
-        std::memset(buffers[worker][i], worker + 1, size);
+        std::memset(buffers[worker][i],
+                    static_cast<uint8_t>(worker * count + i), size);
       }
     });
   }
@@ -205,8 +206,9 @@ TEST_F(ParquetBudgetTest, SmallBuffersCanBeFreedByDifferentThreads) {
         auto *buffer = buffers[owner][i];
         if (!buffer) continue;
         const auto size = sizes[i % sizes.size()];
+        const auto pattern = static_cast<uint8_t>(owner * count + i);
         for (int64_t byte = 0; byte < size; ++byte)
-          if (buffer[byte] != owner + 1) ++failures;
+          if (buffer[byte] != pattern) ++failures;
         pool.Free(buffer, size);
       }
     });
