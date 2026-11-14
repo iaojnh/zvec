@@ -56,12 +56,21 @@ def profiles():
     add('multi')
     add('mutated', mutated=1)
     add('mutated-optimized', mutated=1, optimize=1)
+    # The legacy --segment-mib argument controls the write buffer, hence the
+    # number of blocks within a segment. Iterator snapshots explicitly seal
+    # segments; never infer cross-segment coverage from buffer size alone.
+    add('scalar-cross', 'scalar', **{'seal-rows': 4096})
+    add('cross', **{'seal-rows': 4096})
+    add('cross-mutated', mutated=1, **{'seal-rows': 4096})
     for null in (0, 50, 100):
         add('wide-null' + str(null), 'wide', rows=8193,
             **{'payload-bytes': 128, 'array-elements': 8, 'null-percent': null})
     add('wide-single', 'wide', rows=8193,
         **{'payload-bytes': 128, 'array-elements': 8, 'null-percent': 50,
            'segment-mib': 128, 'optimize': 1})
+    add('wide-cross', 'wide', rows=8193,
+        **{'payload-bytes': 128, 'array-elements': 8, 'null-percent': 50,
+           'seal-rows': 2048})
     add('wide-mutated', 'wide', rows=10003, mutated=1,
         **{'payload-bytes': 256, 'array-elements': 3, 'null-percent': 50})
     add('empty-utf8', 'wide', rows=8193,
@@ -79,9 +88,17 @@ def profiles():
     add('wide-pressure', 'wide', rows=32768,
         **{'payload-bytes': 128, 'array-elements': 128, 'null-percent': 25,
            'segment-mib': 4})
+    add('cross-pressure', rows=131072,
+        **{'payload-bytes': 4096, 'array-elements': 16, 'null-percent': 0,
+           'segment-mib': 8, 'seal-rows': 8192})
     add('lifecycle-rich', rows=8193, **{'payload-bytes': 256, 'array-elements': 8})
     add('lifecycle-wide', 'wide', rows=8193,
         **{'payload-bytes': 128, 'array-elements': 8, 'null-percent': 50})
+    add('lifecycle-cross-rich', rows=8193,
+        **{'payload-bytes': 256, 'array-elements': 8, 'seal-rows': 2048})
+    add('lifecycle-cross-wide', 'wide', rows=8193,
+        **{'payload-bytes': 128, 'array-elements': 8, 'null-percent': 50,
+           'seal-rows': 2048})
     return out
 
 
@@ -101,62 +118,71 @@ def experiments():
             'nullable_filter', 'array_filter', 'array_all_filter', 'like_suffix', 'like_contains',
             'scan_payload_like', 'fts_term', 'fts_filter', 'fts_and', 'fts_or',
             'fts_phrase', 'fts_or_filter', 'scan_weight']
-    for data in ('scalar', 'single', 'multi', 'mutated', 'mutated-optimized'):
+    for data in ('scalar', 'single', 'multi', 'mutated', 'mutated-optimized',
+                 'scalar-cross', 'cross', 'cross-mutated'):
         for workers in (1, 4, 8, 16):
-            add(f'core-{data}-t{workers}', data, workers, scalar if data == 'scalar' else rich)
+            add(f'core-{data}-t{workers}', data, workers,
+                scalar if data in ('scalar', 'scalar-cross') else rich)
     wide = ['fetch1_all', 'fetch_all', 'fetch_projected', 'fetch_edges',
             'nullable_filter', 'array_filter', 'not_null', 'payload_eq_empty']
     for data in ('wide-null0', 'wide-null50', 'wide-null100', 'wide-single',
-                 'wide-mutated', 'empty-utf8', 'large-array', 'long-string'):
-        for workers in ((1, 4, 8, 16) if data in ('wide-null50', 'wide-single') else (1, 4)):
+                 'wide-mutated', 'empty-utf8', 'large-array', 'long-string', 'wide-cross'):
+        for workers in ((1, 4, 8, 16) if data in ('wide-null50', 'wide-single', 'wide-cross') else (1, 4)):
             add(f'shape-{data}-t{workers}', data, workers, wide)
     typed = ['i32_filter', 'i64_filter', 'u32_filter', 'u64_filter',
              'float_filter', 'double_filter', 'bool_filter', 'string_filter',
              'array_i64_filter', 'array_u32_filter', 'array_u64_filter',
              'array_float_filter', 'array_double_filter', 'array_bool_filter',
              'array_string_filter']
-    for data in ('wide-null0', 'wide-null50', 'wide-null100'):
+    for data in ('wide-null0', 'wide-null50', 'wide-null100', 'wide-cross'):
         for workers in (1, 4):
             add(f'typed-{data}-t{workers}', data, workers, typed)
     for fraction in (0, 1, 10, 50, 100):
-        for workers in (1, 4):
-            add(f'selectivity-{fraction}-t{workers}', 'wide-null50', workers,
-                ['range_select_ids', 'range_select_all', 'scan_select'],
-                **{'selectivity-percent': fraction})
+        for data, prefix in (('wide-null50', 'selectivity'), ('wide-cross', 'selectivity-cross')):
+            for workers in (1, 4):
+                add(f'{prefix}-{fraction}-t{workers}', data, workers,
+                    ['range_select_ids', 'range_select_all', 'scan_select'],
+                    **{'selectivity-percent': fraction})
     for topk in (1, 10, 100):
-        for data in ('single', 'multi'):
+        for data in ('single', 'multi', 'cross'):
             for workers in (1, 4):
                 add(f'topk-{data}-{topk}-t{workers}', data, workers,
                     ['fts_topk', 'fts_topk_filter'], topk=topk)
     for size in (1, 8, 32, 128, 512):
-        for workers in (1, 4):
-            add(f'batch-wide-{size}-t{workers}', 'wide-null50', workers,
-                ['fetch_all'], **{'fetch-size': size})
+        for data, prefix in (('wide-null50', 'batch-wide'), ('wide-cross', 'batch-wide-cross')):
+            for workers in (1, 4):
+                add(f'{prefix}-{size}-t{workers}', data, workers,
+                    ['fetch_all'], **{'fetch-size': size})
     for i, projection in enumerate(('none', 'key', 'payload', 'opt,tags,payload',
                                      'u32,u64,f32,bin,ai64,astr,abool,abin', 'all')):
-        for workers in (1, 4):
-            add(f'projection-{i}-t{workers}', 'wide-null50', workers,
-                ['fetch_projected'], projection=projection)
+        for data, prefix in (('wide-null50', 'projection'), ('wide-cross', 'projection-cross')):
+            for workers in (1, 4):
+                add(f'{prefix}-{i}-t{workers}', data, workers,
+                    ['fetch_projected'], projection=projection)
     pressure = ['fetch1_all', 'fetch32_null_array', 'fetch128_payload',
                 'range128_all', 'scan_payload_like', 'fts_filter']
-    for data in ('pressure', 'wide-pressure'):
-        for budget in (128, 256, 512):
+    for data in ('pressure', 'wide-pressure', 'cross-pressure'):
+        for budget in (128, 256, 512, 4096):
             for workers in (1, 4):
                 add(f'pressure-{data}-{budget}-t{workers}', data, workers,
                     pressure, budget=budget)
-        for workers in (8, 16):
-            add(f'pressure-{data}-256-t{workers}', data, workers,
-                ['fetch32_null_array', 'scan_payload_like', 'fts_filter'], budget=256)
-    for data in ('single', 'multi', 'wide-null50', 'large-array', 'long-string'):
+        for budget in (256, 4096):
+            for workers in (8, 16):
+                add(f'pressure-{data}-{budget}-t{workers}', data, workers,
+                    ['fetch32_null_array', 'scan_payload_like', 'fts_filter'], budget=budget)
+    for data in ('single', 'multi', 'wide-null50', 'large-array', 'long-string',
+                 'cross', 'wide-cross'):
         for workers in (1, 4):
             for case in ('fetch1_all', 'fetch32_null_array', 'scan_payload_like', 'fts_filter'):
                 add(f'cold-{data}-{case}-t{workers}', data, workers, [case], cache='cold')
-    for budget in (128, 512):
-        for workers in (1, 4):
-            for case in ('fetch32_null_array', 'scan_payload_like'):
-                add(f'cold-pressure-{budget}-{case}-t{workers}', 'pressure', workers,
-                    [case], cache='cold', budget=budget)
-    for data in ('lifecycle-rich', 'lifecycle-wide'):
+    for data in ('pressure', 'cross-pressure'):
+        for budget in (128, 512):
+            for workers in (1, 4):
+                for case in ('fetch32_null_array', 'scan_payload_like'):
+                    add(f'cold-{data}-{budget}-{case}-t{workers}', data, workers,
+                        [case], cache='cold', budget=budget)
+    for data in ('lifecycle-rich', 'lifecycle-wide',
+                 'lifecycle-cross-rich', 'lifecycle-cross-wide'):
         for maintenance in ('none', 'flush', 'optimize'):
             for workers in (1, 4):
                 for case in ('fetch32_null_array', 'fts_filter', 'array_filter'):
@@ -167,8 +193,10 @@ def experiments():
                 ['fetch32_null_array'], phase='lifecycle')
     for workers in (8, 16):
         for maintenance in ('none', 'optimize'):
-            add(f'mixed-rich-{maintenance}-t{workers}', 'lifecycle-rich', workers,
-                ['fetch32_null_array'], phase='mixed', maintenance=maintenance)
+            for data,prefix in (('lifecycle-rich', 'mixed-rich'),
+                                ('lifecycle-cross-rich', 'mixed-cross-rich')):
+                add(f'{prefix}-{maintenance}-t{workers}', data, workers,
+                    ['fetch32_null_array'], phase='mixed', maintenance=maintenance)
     assert len({x['group'] for x in out}) == len(out)
     return out
 
@@ -226,6 +254,7 @@ def make_plans(args):
                     configuration=spec, command=command(opts, mode, spec['phase'], path, output)))
     sha = hashlib.sha256(binary.read_bytes()).hexdigest()
     save(root / (tag + '-plan.json'), plan)
+    save(root / (tag + '-preparation-plan.json'), preparation)
     if not (root / 'preparation-plan.json').exists():
         save(root / 'preparation-plan.json', preparation)
     save(root / (tag + '-policy.json'), dict(binary=str(binary), binary_sha256=sha,
@@ -233,6 +262,8 @@ def make_plans(args):
         scenario_profiles=sum(len(x['cases']) for x in selected), experiments=len(selected),
         cache_cold='Fresh process and zero warmups; OS page-cache state not claimed cold.',
         no_retries=True, same_binary_both_modes=True,
+        topology='segment-mib is the legacy write-buffer argument; seal-rows creates true segments; numeric segment directories with nonempty scalar blocks are audited separately.',
+        pressure='Warmups do not guarantee residency under pressure; cache budgets are supported public configuration values, not an RSS bound.',
         matrix=selected, data=profiles()))
     print(json.dumps(dict(plan=str(root / (tag + '-plan.json')), processes=len(plan),
         scenario_profiles=sum(len(x['cases']) for x in selected))))
@@ -270,6 +301,13 @@ def summarize(args):
         valid_parent = not rec['exit_code'] and result.get('complete', False)
         if item['phase'] in ('mixed', 'lifecycle'):
             valid_parent = valid_parent and result.get('lifecycle', {}).get('validated', False)
+        if item['phase'] == 'mixed' and item['configuration']['options'].get('maintenance', 'none') != 'none':
+            # The serial writer may finish an operation after readers stop.
+            # Subtract its entire drain interval to get a conservative lower
+            # bound on maintenance time overlapping the readers.
+            overlaps = [x['maintenance_us'] - max(0, x['writer_elapsed_s'] - x['elapsed_s']) * 1e6
+                        for x in result.get('cases', [])]
+            valid_parent = valid_parent and bool(overlaps) and min(overlaps) > 1000
         if not valid_parent:
             failures.append({**rec, 'completed_cases': [x['case'] for x in result.get('cases', [])]})
         if path.exists():
