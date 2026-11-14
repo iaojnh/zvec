@@ -356,7 +356,9 @@ std::shared_ptr<arrow::ChunkedArray> ParquetBufferContextHandle::data() const {
 }
 
 namespace {
-constexpr int64_t kCachedStringChunkBytes = 4 * 1024 * 1024;
+// Keep hot cache values contiguous across scan batches, with a bounded copy
+// workspace. Tight budgets retain the original small decoded chunks.
+constexpr int64_t kCachedStringChunkBytes = 32 * 1024 * 1024;
 constexpr size_t kCoalesceHeadroom = 2 * kCachedStringChunkBytes;
 
 int64_t CachedStringChunkBytes(const arrow::Array &array) {

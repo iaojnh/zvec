@@ -1504,7 +1504,7 @@ TEST_F(BufferPoolStoreTest, CachedLargeRowGroupKeepsScanSlicesAlive) {
 TEST_F(BufferPoolStoreTest,
        CachedStringScanAvoidsTinyDecoderChunksWithHeadroom) {
   ASSERT_EQ(0,
-            ailego::PoolPayloadBudget::get_instance().init(64 * 1024 * 1024));
+            ailego::PoolPayloadBudget::get_instance().init(128 * 1024 * 1024));
   arrow::StringBuilder values;
   for (int row = 0; row < 10003; ++row) {
     ASSERT_TRUE((row % 7 == 0 ? values.AppendNull()
@@ -1538,7 +1538,10 @@ TEST_F(BufferPoolStoreTest,
   // The existing 10 MiB test above exercises the low-headroom fallback.
   // With room to coalesce, small decoder batches must not multiply the
   // number of kernel invocations in an otherwise cached scan.
-  EXPECT_LE(batches.size(), 5u);
+  ASSERT_EQ(batches.size(), 3u);
+  EXPECT_EQ(batches[0]->num_rows(), 4096);
+  EXPECT_EQ(batches[1]->num_rows(), 4096);
+  EXPECT_EQ(batches[2]->num_rows(), 1811);
   for (int i = 0; i < 4; ++i)
     ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
   auto actual = arrow::Table::FromRecordBatches(batches).ValueOrDie();
