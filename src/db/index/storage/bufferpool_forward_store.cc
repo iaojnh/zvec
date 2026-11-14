@@ -15,6 +15,7 @@
 #include "bufferpool_forward_store.h"
 #include <cstring>
 #include <limits>
+#include <map>
 #include <type_traits>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/compute/api.h>
@@ -52,15 +53,7 @@ ParquetRecordBatchReader::ParquetRecordBatchReader(
       file_path_(file_path),
       with_cache_(with_cache),
       stream_uncached_(stream_uncached) {
-  std::vector<std::shared_ptr<arrow::Field>> fields;
-  for (const auto &col : columns) {
-    int index = schema_->GetFieldIndex(col);
-    if (index != -1) {
-      fields.push_back(schema_->field(index));
-      col_indices_.push_back(index);
-    }
-  }
-  projected_schema_ = arrow::schema(fields);
+  project_columns();
 
   auto parquet_metadata = reader_->parquet_reader()->metadata();
   metadata_id_ = metadata_id.filename().empty()
@@ -77,6 +70,53 @@ ParquetRecordBatchReader::ParquetRecordBatchReader(
     row_group_offsets_.push_back(offset);
     offset += num_rows_in_group;
   }
+}
+
+ParquetRecordBatchReader::ParquetRecordBatchReader(
+    const std::vector<std::string> &columns,
+    std::shared_ptr<arrow::Schema> schema, const std::string &file_path,
+    std::shared_ptr<arrow::MemoryPool> memory_pool,
+    std::shared_ptr<arrow::io::RandomAccessFile> input,
+    std::shared_ptr<parquet::FileMetaData> metadata,
+    ParquetBufferID metadata_id, const std::vector<int64_t> &row_group_rows)
+    : memory_pool_(std::move(memory_pool)),
+      input_(std::move(input)),
+      metadata_(std::move(metadata)),
+      schema_(std::move(schema)),
+      columns_(columns),
+      file_path_(file_path),
+      metadata_id_(std::move(metadata_id)),
+      num_row_groups_(row_group_rows.size()),
+      row_group_row_nums_(row_group_rows),
+      with_cache_(true),
+      stream_uncached_(true) {
+  project_columns();
+}
+
+void ParquetRecordBatchReader::project_columns() {
+  std::vector<std::shared_ptr<arrow::Field>> fields;
+  for (const auto &col : columns_) {
+    int index = schema_->GetFieldIndex(col);
+    if (index != -1) {
+      fields.push_back(schema_->field(index));
+      col_indices_.push_back(index);
+    }
+  }
+  projected_schema_ = arrow::schema(fields);
+}
+
+arrow::Status ParquetRecordBatchReader::ensure_reader() {
+  if (reader_) return arrow::Status::OK();
+  parquet::ReaderProperties properties(memory_pool_.get());
+  properties.enable_buffered_stream();
+  properties.set_buffer_size(64 * 1024);
+  auto parquet_reader =
+      parquet::ParquetFileReader::Open(input_, properties, metadata_);
+  auto arrow_properties = detail::BudgetedParquetArrowProperties();
+  arrow_properties.set_batch_size(8192);
+  return parquet::arrow::FileReader::Make(memory_pool_.get(),
+                                          std::move(parquet_reader),
+                                          arrow_properties, &reader_);
 }
 
 ParquetRecordBatchReader::~ParquetRecordBatchReader() = default;
@@ -170,6 +210,7 @@ arrow::Status ParquetRecordBatchReader::read_row_group(
 
 arrow::Status ParquetRecordBatchReader::read_next_uncached(
     std::shared_ptr<arrow::RecordBatch> *batch) {
+  ARROW_RETURN_NOT_OK(ensure_reader());
   while (current_row_group_ < num_row_groups_) {
     if (!row_group_reader_) {
       const auto metadata = reader_->parquet_reader()->metadata();
@@ -587,6 +628,82 @@ int64_t BufferPoolForwardStore::get_row_group_offset(int rg_id) {
 }
 
 
+TablePtr BufferPoolForwardStore::fetch_blocks(
+    const std::vector<std::string> &columns,
+    const std::vector<FetchBlock> &blocks, int row_count,
+    arrow::MemoryPool *pool) try {
+  if (!pool) pool = detail::GetParquetMemoryPool().get();
+  if (columns.empty() || blocks.empty() || row_count <= 0) return nullptr;
+  using GroupKey = std::pair<size_t, int>;
+  using Entry = std::pair<const GroupKey, detail::SelectedRowsPlan::Rows>;
+  std::map<GroupKey, detail::SelectedRowsPlan::Rows, std::less<GroupKey>,
+           ailego::BudgetedAllocator<Entry>>
+      groups;
+  ailego::BudgetedVector<uint8_t> seen(row_count, 0);
+  size_t selected_rows = 0;
+  for (size_t block = 0; block < blocks.size(); ++block) {
+    const auto &request = blocks[block];
+    if (!request.store || !request.store->validate(columns)) return nullptr;
+    for (const auto &[output, row] : request.rows) {
+      if (output < 0 || output >= row_count || seen[output] || row < 0 ||
+          row >= request.store->num_rows_)
+        return nullptr;
+      seen[output] = true;
+      ++selected_rows;
+      const int rg = request.store->find_row_group_for_row(row);
+      groups[{block, rg}].emplace_back(
+          output, row - request.store->row_group_offsets_[rg]);
+    }
+  }
+  if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
+  detail::SelectedRowsPlan::Rows selected(row_count);
+  int64_t offset = 0;
+  for (const auto &[key, rows] : groups) {
+    for (const auto &[output, local] : rows)
+      selected[output] = {output, offset + local};
+    offset += blocks[key.first].store->row_group_row_nums_[key.second];
+  }
+  detail::SelectedRowsPlan plan(selected);
+  arrow::ArrayVector arrays;
+  arrow::FieldVector fields;
+  for (const auto &name : columns) {
+    const auto field =
+        blocks.front().store->physic_schema_->GetFieldByName(name);
+    if (!field) return nullptr;
+    arrow::ArrayVector chunks;
+    for (const auto &[key, rows] : groups) {
+      auto *store = blocks[key.first].store;
+      const int column = store->physic_schema_->GetFieldIndex(name);
+      if (column < 0 ||
+          !store->physic_schema_->field(column)->type()->Equals(field->type()))
+        return nullptr;
+      auto id = store->metadata_id_.for_column(column, key.second);
+      auto handle = ParquetBufferPool::get_instance().try_acquire_buffer(id);
+      auto borrowed = handle.data();
+      if (!borrowed ||
+          borrowed->length() != store->row_group_row_nums_[key.second])
+        return nullptr;
+      chunks.insert(chunks.end(), borrowed->chunks().begin(),
+                    borrowed->chunks().end());
+    }
+    // Only resident sources are pinned while this column is copied. A cache
+    // miss or allocation refusal selects the bounded per-block fallback.
+    const arrow::ChunkedArray source(std::move(chunks), field->type());
+    auto builder = arrow::MakeBuilder(field->type(), pool);
+    if (!builder.ok() || !(*builder)->Reserve(row_count).ok() ||
+        !AppendSelectedRows(source, plan, builder->get()).ok())
+      return nullptr;
+    auto result = (*builder)->Finish();
+    if (!result.ok()) return nullptr;
+    arrays.push_back(std::move(*result));
+    fields.push_back(field);
+  }
+  return arrow::Table::Make(arrow::schema(std::move(fields)), std::move(arrays),
+                            row_count);
+} catch (const std::bad_alloc &) {
+  return nullptr;
+}
+
 TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
                                        const std::vector<int> &indices) {
   return fetch(columns, indices, detail::GetParquetMemoryPool().get());
@@ -646,8 +763,9 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
 
   using RowGroupRows = ailego::BudgetedVector<std::pair<size_t, uint64_t>>;
   using RowGroupEntry = std::pair<const int, RowGroupRows>;
-  std::unordered_map<int, RowGroupRows, std::hash<int>, std::equal_to<int>,
-                     ailego::BudgetedAllocator<RowGroupEntry>>
+  // Preserve increasing query row order and avoid an extra gather copy.
+  std::map<int, RowGroupRows, std::less<int>,
+           ailego::BudgetedAllocator<RowGroupEntry>>
       rg_to_local;
   size_t output_row = 0;
   for (int global_row : indices) {
@@ -977,6 +1095,12 @@ RecordBatchReaderPtr BufferPoolForwardStore::scan(
   // Create a new parquet reader for scanning
   std::unique_ptr<parquet::arrow::FileReader> parquet_reader;
   auto memory_pool = detail::GetParquetMemoryPool();
+  if (columns.size() != 1 || columns.front() != GLOBAL_DOC_ID) {
+    return std::make_shared<ParquetRecordBatchReader>(
+        columns, physic_schema_, file_path_, std::move(memory_pool), file_,
+        parquet_reader_->parquet_reader()->metadata(), metadata_id_,
+        row_group_row_nums_);
+  }
   // A cache miss may fall back to streaming. Do not prefetch an entire column
   // chunk before returning its first batch.
   parquet::ReaderProperties read_properties(memory_pool.get());

@@ -763,7 +763,9 @@ TEST_F(BufferPoolStoreTest, BatchFetchNullableListsAcrossRowGroups) {
   }
   for (const std::vector<int> rows :
        {std::vector<int>{9, 0, 6, 3, 9, 4, 11, 1, 8},
-        std::vector<int>{1, 3, 1, 0}}) {
+        std::vector<int>{1, 3, 1, 0},
+        std::vector<int>{0, 1, 3, 4, 4, 7, 8, 10, 11},
+        std::vector<int>{11, 10, 8, 7, 4, 4, 3, 1, 0}}) {
     auto result = store->fetch(columns, rows);
     ASSERT_NE(result, nullptr);
     ASSERT_TRUE(result->ValidateFull().ok());

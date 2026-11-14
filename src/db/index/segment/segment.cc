@@ -3226,6 +3226,50 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
         runs.push_back({&group, offset, 1});
       }
     }
+    if (!options_.enable_mmap_ && groups.rbegin()->first < blocks.size()) {
+      std::vector<BufferPoolForwardStore::FetchBlock> requests;
+      requests.reserve(groups.size());
+      // Keep BP-only bookkeeping out of the group layout shared with mmap.
+      std::unordered_map<BlockRows *, size_t> request_indices;
+      request_indices.reserve(groups.size());
+      for (auto &[index, group] : groups) {
+        auto *buffered_store =
+            dynamic_cast<BufferPoolForwardStore *>(group.store.get());
+        if (!buffered_store) return TablePtr{};
+        request_indices.emplace(&group, requests.size());
+        requests.push_back({buffered_store, {}});
+        requests.back().rows.reserve(group.rows.size());
+      }
+      int output = 0;
+      for (const auto &run : runs) {
+        auto &selected = requests[request_indices.at(run.group)].rows;
+        for (int64_t row = 0; row < run.length; ++row) {
+          selected.emplace_back(output++, run.group->rows[run.offset + row]);
+        }
+      }
+      auto combined = BufferPoolForwardStore::fetch_blocks(
+          stored_columns, requests, segment_doc_ids.size(), memory_pool);
+      if (combined) {
+        std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays(
+            columns.size());
+        for (size_t i = 0; i < stored_columns.size(); ++i) {
+          const size_t output_column = i + (has_row_id && i >= row_id_column);
+          arrays[output_column] = combined->column(i);
+          if (!arrays[output_column]->type()->Equals(
+                  result_schema->field(output_column)->type()))
+            return TablePtr{};
+        }
+        if (has_row_id) {
+          arrow::UInt64Builder builder(memory_pool);
+          ARROW_RETURN_NOT_OK(builder.Reserve(segment_doc_ids.size()));
+          for (int row : segment_doc_ids) builder.UnsafeAppend(row);
+          ARROW_ASSIGN_OR_RAISE(auto ids, builder.Finish());
+          arrays[row_id_column] = std::make_shared<arrow::ChunkedArray>(ids);
+        }
+        return arrow::Table::Make(result_schema, std::move(arrays),
+                                  segment_doc_ids.size());
+      }
+    }
     for (auto &entry : groups) {
       auto &group = entry.second;
       if (group.rows.empty()) continue;
