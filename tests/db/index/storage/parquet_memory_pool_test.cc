@@ -47,8 +47,9 @@
 namespace zvec::ailego {
 struct MemoryLimitPoolTestPeer {
   static bool configure_rss(MemoryLimitPool &pool) {
-    return pool.process_rss_.configure(128UL * 1024 * 1024,
-                                       +[] { return 16UL * 1024 * 1024; });
+    return pool.process_rss_.configure(
+        size_t{128} * 1024 * 1024,
+        +[]() -> size_t { return size_t{16} * 1024 * 1024; });
   }
   static void refresh_rss(MemoryLimitPool &pool) {
     pool.process_rss_.refresh(true);
@@ -248,6 +249,104 @@ TEST_F(ParquetBudgetTest, RefusedSmallSlotDoesNotRetainBackingOrLoseCapacity) {
   first.reset();
   EXPECT_EQ(0u, pool.charged_bytes());
   EXPECT_EQ(0u, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, QueryAndCachePoolsShareTheirLifetimeOwner) {
+  auto cache = GetParquetMemoryPool();
+  auto query = GetParquetQueryMemoryPool();
+  EXPECT_NE(cache.get(), query.get());
+  EXPECT_FALSE(cache.owner_before(query));
+  EXPECT_FALSE(query.owner_before(cache));
+}
+
+TEST_F(ParquetBudgetTest, QueryMediumBuffersReuseAdmittedBacking) {
+  ASSERT_EQ(0, budget_.init(128 * 1024 * 1024));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true, true);
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  const auto before = native.stats().retained_block_reuses;
+  for (int i = 0; i < 3; ++i) {
+    auto buffer = arrow::AllocateBuffer(1024 * 1024, &pool).ValueOrDie();
+    std::memset(buffer->mutable_data(), i + 1, buffer->size());
+    EXPECT_GE(pool.charged_bytes(), static_cast<size_t>(buffer->size()));
+    EXPECT_LE(native.used(), native.capacity());
+  }
+  EXPECT_GT(native.stats().retained_block_reuses, before);
+  EXPECT_EQ(0, pool.num_mapped_allocations());
+  EXPECT_EQ(0u, pool.charged_bytes());
+}
+
+TEST_F(ParquetBudgetTest, TightQueryBudgetsKeepReclaimableMappings) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true, true);
+  auto buffer =
+      arrow::AllocateResizableBuffer(1024 * 1024, &pool).ValueOrDie();
+  EXPECT_EQ(1, pool.num_mapped_allocations());
+  const auto before = pool.charged_bytes();
+  ASSERT_TRUE(buffer->Resize(1024, true).ok());
+  EXPECT_LT(pool.charged_bytes(), before);
+  buffer.reset();
+  EXPECT_EQ(0u, pool.charged_bytes());
+}
+
+TEST_F(ParquetBudgetTest, ReusedQueryBufferShrinksWithoutAdditionalQuota) {
+  ASSERT_EQ(0, budget_.init(128 * 1024 * 1024));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true, true);
+  auto buffer =
+      arrow::AllocateResizableBuffer(1024 * 1024, &pool).ValueOrDie();
+  std::memset(buffer->mutable_data(), 37, buffer->size());
+  auto *original = buffer->data();
+  const auto charged = pool.charged_bytes();
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  const size_t remaining = native.capacity() - native.used();
+  ASSERT_TRUE(native.try_charge_external(remaining));
+  auto restore =
+      ailego::ScopeGuard::Make([&] { native.release_external(remaining); });
+  ASSERT_TRUE(buffer->Resize(1024, true).ok());
+  EXPECT_EQ(original, buffer->data());
+  EXPECT_EQ(37, buffer->data()[1023]);
+  EXPECT_EQ(charged, pool.charged_bytes());
+  EXPECT_EQ(1024, pool.bytes_allocated());
+}
+
+TEST_F(ParquetBudgetTest, LimitedHeadroomFallsBackToShrinkableMapping) {
+  ASSERT_EQ(0, budget_.init(128 * 1024 * 1024));
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  const size_t charge = native.capacity() - native.used() - 2 * 1024 * 1024;
+  ASSERT_TRUE(native.try_charge_external(charge));
+  auto restore =
+      ailego::ScopeGuard::Make([&] { native.release_external(charge); });
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true, true);
+  auto buffer =
+      arrow::AllocateResizableBuffer(1024 * 1024, &pool).ValueOrDie();
+  EXPECT_EQ(1, pool.num_mapped_allocations());
+  const auto before = pool.charged_bytes();
+  ASSERT_TRUE(buffer->Resize(1024, true).ok());
+  EXPECT_LT(pool.charged_bytes(), before);
+}
+
+TEST_F(ParquetBudgetTest, QueryReuseObeysRssPressureAndRecovers) {
+  ASSERT_EQ(0, budget_.init(128 * 1024 * 1024));
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  ASSERT_TRUE(ailego::MemoryLimitPoolTestPeer::configure_rss(native));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    native.set_memory_pressure(Pressure::kNormal);
+    EXPECT_TRUE(native.configure_process_rss_limit(0));
+  });
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true, true);
+  auto first =
+      arrow::AllocateResizableBuffer(1024 * 1024, &pool).ValueOrDie();
+  std::memset(first->mutable_data(), 19, first->size());
+  native.set_memory_pressure(Pressure::kCritical);
+  auto refused = arrow::AllocateBuffer(1024 * 1024, &pool);
+  EXPECT_TRUE(refused.status().IsOutOfMemory());
+  ASSERT_TRUE(first->Resize(1024, true).ok());
+  EXPECT_EQ(19, first->data()[1023]);
+  first.reset();
+  native.set_memory_pressure(Pressure::kNormal);
+  ailego::MemoryLimitPoolTestPeer::refresh_rss(native);
+  auto recovered = arrow::AllocateBuffer(1024 * 1024, &pool);
+  EXPECT_TRUE(recovered.ok()) << recovered.status().ToString();
 }
 
 }  // namespace

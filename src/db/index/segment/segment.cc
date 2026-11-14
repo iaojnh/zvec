@@ -75,7 +75,7 @@
 namespace zvec {
 
 arrow::MemoryPool *Segment::query_memory_pool() const {
-  return uses_buffer_storage() ? detail::GetParquetMemoryPool().get()
+  return uses_buffer_storage() ? detail::GetParquetQueryMemoryPool().get()
                                : arrow::default_memory_pool();
 }
 

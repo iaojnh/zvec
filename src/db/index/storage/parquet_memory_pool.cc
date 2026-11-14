@@ -41,6 +41,8 @@ namespace {
 
 constexpr int64_t kMinimumAlignment = 64;
 constexpr size_t kSmallChunkBytes = 64 * 1024;
+constexpr int64_t kReusableMediumBytes = 2 * 1024 * 1024;
+constexpr size_t kMediumReuseMinimumBudget = 128 * 1024 * 1024;
 
 arrow::Status RefusedBacking(const char *operation, size_t requested) {
   auto &budget = ailego::MemoryLimitPool::get_instance();
@@ -282,7 +284,15 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
   ARROW_RETURN_NOT_OK(ValidateRequest(size, alignment));
   alignment = std::max(alignment, kMinimumAlignment);
   auto &budget = ailego::MemoryLimitPool::get_instance();
-  if (size < kMappedAllocationThreshold) {
+  // Keep cold decoding and tight budgets on the original mapping path.
+  // Reused query buffers remain charged through the shared retained-block
+  // pool, including page rounding, refault admission and idle reclamation.
+  const bool reuse_medium =
+      reuse_medium_buffers_ && enforce_budget_ &&
+      size >= kMappedAllocationThreshold && size <= kReusableMediumBytes &&
+      budget.capacity() >= kMediumReuseMinimumBudget &&
+      budget.available() >= 4 * static_cast<size_t>(size);
+  if (size < kMappedAllocationThreshold || reuse_medium) {
     // Arrow requires a non-null data address even for empty binary/string
     // buffers. Let its allocator provide and own the zero-size sentinel.
     if (!enforce_budget_ || size == 0) {
@@ -359,6 +369,13 @@ std::optional<arrow::Status> ParquetMemoryPool::try_reallocate_in_place(
       reinterpret_cast<uintptr_t>(*ptr) % alignment == 0) {
     auto *header =
         reinterpret_cast<MappingHeader *>(*ptr - sizeof(MappingHeader));
+    if (reuse_medium_buffers_ && header->kind == BackingKind::Retained &&
+        header->charged >= static_cast<size_t>(kMappedAllocationThreshold)) {
+      // Keep the entire admitted backing until Free. A query shrink must
+      // still succeed when pressure prevents allocating a second buffer.
+      stats_.DidReallocateBytes(old_size, new_size);
+      return arrow::Status::OK();
+    }
     // An allocation made before budgeting was enabled needs fresh admission.
     if (header->kind == BackingKind::Mapping &&
         !(enforce_budget_ && budget.capacity() && !header->charged)) {
@@ -457,10 +474,26 @@ void ParquetMemoryPool::Free(uint8_t *buffer, int64_t size, int64_t alignment) {
   stats_.DidFreeBytes(size);
 }
 
+namespace {
+struct ParquetPools {
+  ParquetMemoryPool cache{arrow::default_memory_pool(), true};
+  ParquetMemoryPool query{arrow::default_memory_pool(), true, true};
+};
+
+const std::shared_ptr<ParquetPools> &SharedParquetPools() {
+  static const auto owner = std::make_shared<ParquetPools>();
+  return owner;
+}
+}  // namespace
+
 std::shared_ptr<ParquetMemoryPool> GetParquetMemoryPool() {
-  static auto pool = std::make_shared<ParquetMemoryPool>(
-      arrow::default_memory_pool(), /*enforce_budget=*/true);
-  return pool;
+  const auto &owner = SharedParquetPools();
+  return std::shared_ptr<ParquetMemoryPool>(owner, &owner->cache);
+}
+
+std::shared_ptr<ParquetMemoryPool> GetParquetQueryMemoryPool() {
+  const auto &owner = SharedParquetPools();
+  return std::shared_ptr<ParquetMemoryPool>(owner, &owner->query);
 }
 
 int64_t ParquetDecodeBatchRows(const parquet::FileMetaData &metadata,

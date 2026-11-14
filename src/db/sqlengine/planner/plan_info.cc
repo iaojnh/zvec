@@ -384,7 +384,7 @@ class BoundedPlanReader : public arrow::RecordBatchReader {
 Result<PlanStream> PlanInfo::execute_to_generator(size_t max_queued_bytes) {
   auto make = [&]() -> arrow::Result<PlanStream> {
     auto stream = std::make_shared<AsyncPlanStream>();
-    auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
+    auto *pool = budgeted_ ? detail::GetParquetQueryMemoryPool().get()
                            : arrow::default_memory_pool();
     ARROW_ASSIGN_OR_RAISE(auto options, QueryOptions(pool, budgeted_));
     ARROW_ASSIGN_OR_RAISE(auto source,
@@ -451,7 +451,7 @@ Status PlanInfo::project(const std::vector<std::string> &columns) {
 
 Result<std::unique_ptr<arrow::RecordBatchReader>> PlanInfo::execute_to_reader(
     size_t max_queued_bytes) {
-  auto *pool = budgeted_ ? detail::GetParquetMemoryPool().get()
+  auto *pool = budgeted_ ? detail::GetParquetQueryMemoryPool().get()
                          : arrow::default_memory_pool();
   if (budgeted_ && !max_queued_bytes) max_queued_bytes = 64 * 1024;
   // An unbudgeted parent reaching its limit must also await cancellation of

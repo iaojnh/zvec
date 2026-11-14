@@ -12,8 +12,9 @@
 namespace zvec::ailego {
 struct MemoryLimitPoolTestPeer {
   static bool configure_rss(MemoryLimitPool &pool) {
-    return pool.process_rss_.configure(128UL * 1024 * 1024,
-                                       +[] { return 16UL * 1024 * 1024; });
+    return pool.process_rss_.configure(
+        size_t{128} * 1024 * 1024,
+        +[]() -> size_t { return size_t{16} * 1024 * 1024; });
   }
 };
 }  // namespace zvec::ailego
