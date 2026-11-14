@@ -159,6 +159,74 @@ TEST_F(CacheMappingRssTest, IdleReuseRetainsRegistrationUntilSuccessfulUnmap) {
   EXPECT_EQ(1u, MemoryLimitPoolTestPeer::mappings(pool_));
 }
 
+TEST_F(CacheMappingRssTest, ReturningLargeMappingBoundsIdleBackingImmediately) {
+  // Background maintenance is stopped by the fixture. Returning an entire
+  // query working buffer must enforce the same reuse reserve as retained
+  // Arrow chunks, without waiting for the next background reclamation pass.
+  auto live = acquire(3 * kMiB);
+  auto burst = acquire(32 * kMiB);
+  ASSERT_NE(nullptr, live);
+  ASSERT_NE(nullptr, burst);
+  live->data[0] = 0x5a;
+  std::memset(burst->data, 0x17, burst->bytes);
+  const auto committed = pool_.committed();
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+  const auto resident = MemoryLimitPoolTestPeer::sample().owned_resident;
+#endif
+  burst.reset();
+  EXPECT_EQ(1u, MemoryLimitPoolTestPeer::mappings(pool_));
+  EXPECT_EQ(committed - 32 * kMiB - sizeof(MemoryLimitPool::CacheBuffer),
+            pool_.committed());
+  EXPECT_EQ(3 * kMiB, pool_.evictable_cache_used());
+  EXPECT_EQ(0x5a, live->data[0]);
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+  EXPECT_EQ(resident - 32 * kMiB,
+            MemoryLimitPoolTestPeer::sample().owned_resident);
+#endif
+
+  auto small = acquire();
+  ASSERT_NE(nullptr, small);
+  auto *address = small.get();
+  small.reset();
+  small = acquire();
+  EXPECT_EQ(address, small.get());
+  EXPECT_EQ(2u, MemoryLimitPoolTestPeer::mappings(pool_));
+}
+
+TEST_F(CacheMappingRssTest, ConcurrentReturnsShareOneIdleReserve) {
+  auto live = acquire(3 * kMiB);
+  ASSERT_NE(nullptr, live);
+  live->data[0] = 0x3a;
+  const auto baseline = pool_.committed();
+  std::atomic<size_t> ready{0};
+  std::atomic<bool> release{false};
+  std::vector<Buffer> buffers;
+  for (size_t i = 0; i < 8; ++i) {
+    buffers.push_back(acquire(8 * kMiB));
+    ASSERT_NE(nullptr, buffers.back());
+  }
+  std::vector<std::thread> workers;
+  for (auto &buffer : buffers) {
+    workers.emplace_back([&, buffer = std::move(buffer)]() mutable {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!release.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      buffer.reset();
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != workers.size())
+    std::this_thread::yield();
+  release.store(true, std::memory_order_release);
+  for (auto &worker : workers) worker.join();
+  EXPECT_LE(MemoryLimitPoolTestPeer::mappings(pool_), 2u);
+  EXPECT_LE(pool_.committed(),
+            baseline + 8 * kMiB + sizeof(MemoryLimitPool::CacheBuffer));
+  EXPECT_EQ(3 * kMiB, pool_.evictable_cache_used());
+  EXPECT_EQ(0x3a, live->data[0]);
+}
+
 #if (defined(__linux__) && !defined(__ANDROID__)) || \
     (defined(__APPLE__) && TARGET_OS_OSX)
 TEST_F(CacheMappingRssTest, NativeWitnessExcludesUntouchedAndIncludesIdleBacking) {
