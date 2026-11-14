@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <optional>
 #include <type_traits>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/compute/api.h>
@@ -854,7 +855,7 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
         blocks.front().store->physic_schema_->GetFieldByName(name);
     if (!field) return nullptr;
     arrow::ArrayVector chunks;
-    detail::RequestScratchArray<ParquetBufferContextHandle, 4> pins(
+    detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 4> pins(
         groups.size());
     size_t pin = 0;
     for (const auto &[key, rows] : groups) {
@@ -866,8 +867,8 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
       auto &id = identities[key.first];
       id.column = column;
       id.row_group = key.second;
-      pins[pin] = ParquetBufferPool::get_instance().try_acquire_buffer(id);
-      const auto *borrowed = pins[pin++].borrowed_data();
+      pins[pin].emplace(ParquetBufferPool::get_instance().try_acquire_buffer(id));
+      const auto *borrowed = pins[pin++]->borrowed_data();
       if (!borrowed ||
           borrowed->length() != store->row_group_row_nums_[key.second])
         return nullptr;
@@ -1216,7 +1217,7 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   }
   const int group = find_row_group_for_row(index);
   const int64_t local_row = index - get_row_group_offset(group);
-  detail::RequestScratchArray<ParquetBufferContextHandle, 16> pins(
+  detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 16> pins(
       selected.size());
   detail::RequestScratchArray<std::pair<const arrow::Array *, int64_t>, 16>
       source_rows(selected.size());
@@ -1232,8 +1233,8 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
       // the bounded scalar path if those columns cannot coexist in cache.
       return nullptr;
     }
-    pins[i] = std::move(acquired).ValueOrDie();
-    const auto *column = pins[i].borrowed_data();
+    pins[i].emplace(std::move(acquired).ValueOrDie());
+    const auto *column = pins[i]->borrowed_data();
     if (!column) return nullptr;
     int64_t row = local_row;
     const arrow::Array *array = nullptr;
