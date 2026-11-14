@@ -38,8 +38,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <psapi.h>
+// Windows declarations must precede the process-status API header.
+// clang-format off
 #include <windows.h>
+#include <psapi.h>
+// clang-format on
 #else
 #include <sys/resource.h>
 #include <unistd.h>
