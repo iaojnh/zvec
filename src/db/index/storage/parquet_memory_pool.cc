@@ -42,6 +42,20 @@ namespace {
 constexpr int64_t kMinimumAlignment = 64;
 constexpr size_t kSmallChunkBytes = 64 * 1024;
 
+arrow::Status RefusedBacking(const char *operation, size_t requested) {
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  // Preserve the refusal and report the allocator's final snapshot. Logical
+  // reservations, retained backing and sampled RSS can deny independently.
+  return arrow::Status::OutOfMemory(
+      operation, ": requested_bytes=", requested,
+      " backing_bytes=", budget.retained_block_size(requested),
+      " used=", budget.used(), " committed=", budget.committed(),
+      " capacity=", budget.capacity(), " metadata=", budget.metadata_used(),
+      " external=", budget.external_used(),
+      " evictable=", budget.evictable_cache_used(),
+      " rss=", budget.process_rss(), " rss_limit=", budget.process_rss_limit());
+}
+
 enum class BackingKind { Heap, Mapping, Retained, SmallChunk };
 
 using MappingProjection = ailego::ProcessRssBudget::MaterializationStamp;
@@ -155,7 +169,7 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
   if (alignment > kMinimumAlignment || needed > max_stride) {
     void *base = budget.acquire_retained_block(needed);
     if (!base) {
-      return arrow::Status::OutOfMemory("Cannot reserve Parquet backing");
+      return RefusedBacking("Cannot reserve Parquet backing", needed);
     }
     const auto start =
         reinterpret_cast<uintptr_t>(base) + sizeof(MappingHeader);
@@ -185,7 +199,7 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
     lock.unlock();
     void *base = budget.acquire_retained_block(payload);
     if (!base) {
-      return arrow::Status::OutOfMemory("Cannot reserve Parquet small chunk");
+      return RefusedBacking("Cannot reserve Parquet small chunk", payload);
     }
     chunk = new (base) SmallChunk{};
     chunk->stride = stride;

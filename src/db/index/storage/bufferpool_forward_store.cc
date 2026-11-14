@@ -25,6 +25,8 @@
 #include <arrow/result.h>
 #include <arrow/status.h>
 #include <parquet/arrow/reader.h>
+#include <parquet/column_reader.h>
+#include <parquet/exception.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/doc.h>
@@ -535,6 +537,75 @@ arrow::Status AppendSelectedRows(const arrow::ChunkedArray &column,
       });
 }
 
+arrow::Status AppendSelectedFlatBytes(
+    std::unique_ptr<parquet::ParquetFileReader> reader, int row_group, int leaf,
+    const SelectedRows &rows, arrow::MemoryPool *output_pool,
+    arrow::ArrayBuilder *output) try {
+  // A flat byte-array point read needs only the selected values, not an
+  // Arrow batch of all the preceding strings. Skip is record-aligned here
+  // because repeated/nested columns are excluded by the caller.
+  SelectedRows sorted;
+  sorted.reserve(rows.size());
+  for (size_t i = 0; i < rows.size(); ++i)
+    sorted.emplace_back(i, rows[i].second);
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto &left, const auto &right) {
+              return left.second < right.second;
+            });
+  SelectedRows restore(rows.size());
+  std::unique_ptr<arrow::ArrayBuilder> selected;
+  ARROW_RETURN_NOT_OK(
+      arrow::MakeBuilder(output_pool, output->type(), &selected));
+  ARROW_RETURN_NOT_OK(selected->Reserve(rows.size()));
+  auto *bytes = static_cast<arrow::BinaryBuilder *>(selected.get());
+  auto group = reader->RowGroup(row_group);
+  auto column =
+      std::static_pointer_cast<parquet::ByteArrayReader>(group->Column(leaf));
+  const int16_t max_definition = column->descr()->max_definition_level();
+  uint64_t cursor = 0;
+  size_t next = 0;
+  while (next < sorted.size()) {
+    const uint64_t row = sorted[next].second;
+    const uint64_t skip = row - cursor;
+    if (skip > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        column->Skip(static_cast<int64_t>(skip)) != static_cast<int64_t>(skip))
+      return arrow::Status::IndexError("Selected row exceeds Parquet column");
+    parquet::ByteArray value{};
+    int16_t definition = 0;
+    int64_t values_read = 0;
+    if (column->ReadBatch(1, &definition, nullptr, &value, &values_read) != 1)
+      return arrow::Status::IndexError("Selected row exceeds Parquet column");
+    const bool is_null = definition < max_definition;
+    if ((!is_null && values_read != 1) || (is_null && values_read != 0))
+      return arrow::Status::Invalid("Invalid Parquet byte-array definition");
+    if (!is_null &&
+        value.len > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+      return arrow::Status::CapacityError(
+          "Selected Parquet value exceeds Arrow binary limit");
+    do {
+      restore[sorted[next].first] = {sorted[next].first,
+                                     static_cast<uint64_t>(bytes->length())};
+      ARROW_RETURN_NOT_OK(
+          is_null ? bytes->AppendNull()
+                  : bytes->Append(value.ptr, static_cast<int32_t>(value.len)));
+      ++next;
+    } while (next < sorted.size() && sorted[next].second == row);
+    cursor = row + 1;
+  }
+  std::shared_ptr<arrow::Array> gathered;
+  ARROW_RETURN_NOT_OK(selected->Finish(&gathered));
+  // Decoder/dictionary backing must be gone before copying final output.
+  column.reset();
+  group.reset();
+  reader.reset();
+  detail::SelectedRowsPlan plan(restore);
+  return AppendSelectedRows(arrow::ChunkedArray(gathered), plan, output);
+} catch (const parquet::ParquetStatusException &error) {
+  return error.status();
+} catch (const parquet::ParquetException &error) {
+  return arrow::Status::IOError(error.what());
+}
+
 arrow::Status AppendStreamedSelectedRows(
     const std::shared_ptr<arrow::io::RandomAccessFile> &file,
     const std::shared_ptr<parquet::FileMetaData> &metadata, int row_group,
@@ -548,12 +619,22 @@ arrow::Status AppendStreamedSelectedRows(
   properties.set_buffer_size(64 * 1024);
   ARROW_ASSIGN_OR_RAISE(auto parquet_reader, detail::OpenBudgetedParquetReader(
                                                  file, properties, metadata));
+  const auto leaves = detail::ParquetLeafColumns(*metadata, {column});
+  if (leaves.empty()) return arrow::Status::Invalid("Invalid Parquet column");
+  const auto *descriptor = metadata->schema()->Column(leaves.front());
+  if (leaves.size() == 1 &&
+      descriptor->physical_type() == parquet::Type::BYTE_ARRAY &&
+      descriptor->max_repetition_level() == 0 &&
+      descriptor->max_definition_level() <= 1 &&
+      (output->type()->id() == arrow::Type::STRING ||
+       output->type()->id() == arrow::Type::BINARY)) {
+    return AppendSelectedFlatBytes(std::move(parquet_reader), row_group,
+                                   leaves.front(), rows, output_pool, output);
+  }
   std::unique_ptr<parquet::arrow::FileReader> reader;
   ARROW_RETURN_NOT_OK(parquet::arrow::FileReader::Make(
       decode_pool.get(), std::move(parquet_reader),
       detail::BudgetedParquetArrowProperties(), &reader));
-  const auto leaves = detail::ParquetLeafColumns(*metadata, {column});
-  if (leaves.empty()) return arrow::Status::Invalid("Invalid Parquet column");
   reader->set_batch_size(
       detail::ParquetDecodeBatchRows(*metadata, row_group, leaves));
   ARROW_ASSIGN_OR_RAISE(auto batches,
