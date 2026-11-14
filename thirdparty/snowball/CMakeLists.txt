@@ -48,24 +48,7 @@ if(CMAKE_CROSSCOMPILING)
   set(_snowball_compiler_dependency "${_snowball_compiler_exe}")
 else()
   if(NOT TARGET snowball_compiler)
-    add_executable(snowball_compiler EXCLUDE_FROM_ALL
-      ${_snowball_compiler_srcs}
-    )
-    target_include_directories(snowball_compiler PRIVATE
-      "${SNOWBALL_SOURCE_DIR}/compiler"
-    )
-    if(MSVC)
-      target_compile_definitions(snowball_compiler PRIVATE
-        _CRT_SECURE_NO_WARNINGS
-      )
-      # MSVC has no C99 mode: CMake's C_STANDARD 99 adds no /std option.
-      # Snowball uses C99 compound literals and bool, so select the supported
-      # C11 mode rather than compiling the generator as legacy C89.
-      set_target_properties(snowball_compiler PROPERTIES C_STANDARD 11)
-    else()
-      set_target_properties(snowball_compiler PROPERTIES C_STANDARD 99)
-    endif()
-    set_target_properties(snowball_compiler PROPERTIES C_STANDARD_REQUIRED ON)
+    add_subdirectory(compiler)
   endif()
 
   set(_snowball_compiler "$<TARGET_FILE:snowball_compiler>")
