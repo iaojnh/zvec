@@ -873,6 +873,19 @@ void BufferPoolAlignedFileReader::close() {
   pool_.reset();
 }
 
+// A large graph file can still have a small random-query working set. Use
+// initially spare cache headroom instead of requiring three disk observations
+// before retaining its pages. After any eviction, or under shared pressure,
+// preserve the existing frequency admission policy that protects reused pages.
+static bool admit_graph_page(ailego::VecBufferPool &pool,
+                             ailego::block_id_t page_id) {
+  if (!pool.writable() && !pool.has_evicted() &&
+      !ailego::MemoryLimitPool::get_instance().under_cache_pressure()) {
+    return true;
+  }
+  return pool.should_admit_page(page_id);
+}
+
 int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
                                       IOContext &ctx, bool /*async*/) {
   if (!pool_ || !opened_) {
@@ -1076,7 +1089,7 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
       if (page.cached_page != nullptr) {
         continue;
       }
-      if (pool_->should_admit_page(page.page_id)) {
+      if (admit_graph_page(*pool_, page.page_id)) {
         admitted_ids.push_back(page.page_id);
         admitted_indices.push_back(i);
       } else {
@@ -1472,7 +1485,7 @@ int BufferPoolAlignedFileReader::submit(PendingBatch &batch,
           plan->finish(i);
           continue;
         }
-        if (pool_->should_admit_page(page.id)) {
+        if (admit_graph_page(*pool_, page.id)) {
           const auto claim = pool_->claim_read_page(page.id, page.claimed);
           if (claim == ailego::VecBufferPool::ReadPageClaim::kJoin) {
             // Join the existing page load; do not issue duplicate disk I/O.
