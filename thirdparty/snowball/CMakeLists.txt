@@ -58,8 +58,14 @@ else()
       target_compile_definitions(snowball_compiler PRIVATE
         _CRT_SECURE_NO_WARNINGS
       )
+      # MSVC has no C99 mode: CMake's C_STANDARD 99 adds no /std option.
+      # Snowball uses C99 compound literals and bool, so select the supported
+      # C11 mode rather than compiling the generator as legacy C89.
+      set_target_properties(snowball_compiler PROPERTIES C_STANDARD 11)
+    else()
+      set_target_properties(snowball_compiler PROPERTIES C_STANDARD 99)
     endif()
-    set_target_properties(snowball_compiler PROPERTIES C_STANDARD 99)
+    set_target_properties(snowball_compiler PROPERTIES C_STANDARD_REQUIRED ON)
   endif()
 
   set(_snowball_compiler "$<TARGET_FILE:snowball_compiler>")
