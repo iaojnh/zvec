@@ -443,6 +443,7 @@ def run(
             primary.close()
 
     closed_rss = []
+    closed_workloads = []
     cycle = 0
     while cycle < ROUNDS or (
         soak_seconds
@@ -458,11 +459,11 @@ def run(
             finally:
                 writer.close()
         collection = zvec.open(path, options)
+        topk = 32 if cycle % 2 else 1
         try:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 tasks = [
-                    executor.submit(read, collection, topk=32 if cycle % 2 else 1)
-                    for _ in range(workers)
+                    executor.submit(read, collection, topk=topk) for _ in range(workers)
                 ]
                 results = [task.result() for task in tasks]
             del tasks
@@ -474,9 +475,10 @@ def run(
         if not vector_only:
             assert retained[str(PROBE_IDS[0])].field("payload") == "updated"
         del retained, collection
-        closed_rss.append((perf_counter(), observe("closed", cycle=cycle)))
+        closed_rss.append((perf_counter(), observe("closed", cycle=cycle, topk=topk)))
+        closed_workloads.append(topk)
 
-    metrics = stability(closed_rss, soak_seconds)
+    metrics = stability(closed_rss, soak_seconds, workloads=closed_workloads)
     observe(
         "complete",
         **metrics,

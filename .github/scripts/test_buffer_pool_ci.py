@@ -135,6 +135,38 @@ def test_hour_duration_and_slow_leak():
         stability([(t, rss + t * 10_000 / 3600) for t, rss in stable], 3600)
 
 
+def test_stability_compares_the_same_workload_without_hiding_growth():
+    workloads = [32 if i % 2 else 1 for i in range(36)]
+    samples = [
+        (i * 110, 400_000 + (320_000 if key == 1 else (i % 7) * 1000))
+        for i, key in enumerate(workloads)
+    ]
+    result = stability(samples, 3600, workloads=workloads)
+    assert set(result["workload_trends"]) == {"1", "32"}
+    assert result["steady_growth_kib"] <= POLICY["maximum_steady_growth_kib"]
+    for leaking in (1, 32):
+        leak = [
+            (t, rss + (i * 2000 if key == leaking else 0))
+            for i, ((t, rss), key) in enumerate(zip(samples, workloads, strict=True))
+        ]
+        with pytest.raises(AssertionError, match="steady RSS grew"):
+            stability(leak, 3600, workloads=workloads)
+    with pytest.raises(AssertionError, match="missing lifecycle workload labels"):
+        stability(samples, workloads=workloads[:-1])
+    with pytest.raises(AssertionError, match="unbalanced lifecycle workloads"):
+        stability(samples, workloads=[1] * 24 + [32] * 12)
+
+
+def test_workload_specific_hourly_leak_is_still_rejected():
+    workloads = [32 if i % 2 else 1 for i in range(37)]
+    samples = [
+        (i * 100, 100_000 + (100_000 + i * 100 * 10_000 / 3600 if key == 1 else 0))
+        for i, key in enumerate(workloads)
+    ]
+    with pytest.raises(AssertionError, match="RSS slope"):
+        stability(samples, 3600, workloads=workloads)
+
+
 @pytest.mark.parametrize("relative", ["/", "/system.slice/cohere.service"])
 def test_current_cgroup_resolves_root_and_systemd_services(tmp_path, relative):
     membership = tmp_path / "membership"

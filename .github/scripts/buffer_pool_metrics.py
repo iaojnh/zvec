@@ -143,12 +143,7 @@ def calibration(
     }
 
 
-def stability(samples, minimum_seconds=0):
-    assert len(samples) >= POLICY["minimum_lifecycle_rounds"], (
-        "not enough lifecycle rounds"
-    )
-    elapsed = samples[-1][0] - samples[0][0]
-    assert elapsed >= minimum_seconds, f"soak too short: {elapsed:.1f}s"
+def _steady_trend(samples):
     # Discard the first third only for the trend; the RSS ceiling includes it.
     steady = samples[len(samples) // 3 :]
     middle = len(steady) // 2
@@ -163,6 +158,35 @@ def stability(samples, minimum_seconds=0):
         if denominator
         else 0
     )
+    return {"steady_growth_kib": growth, "slope_kib_per_hour": slope}
+
+
+def stability(samples, minimum_seconds=0, workloads=None):
+    assert len(samples) >= POLICY["minimum_lifecycle_rounds"], (
+        "not enough lifecycle rounds"
+    )
+    elapsed = samples[-1][0] - samples[0][0]
+    assert elapsed >= minimum_seconds, f"soak too short: {elapsed:.1f}s"
+    trends = {"all": _steady_trend(samples)}
+    mixed_trend = trends["all"]
+    if workloads is not None:
+        assert len(workloads) == len(samples), "missing lifecycle workload labels"
+        groups = {}
+        for sample, workload in zip(samples, workloads, strict=True):
+            groups.setdefault(workload, []).append(sample)
+        assert 1 <= len(groups) <= 2, "unexpected lifecycle workloads"
+        counts = [len(group) for group in groups.values()]
+        assert max(counts) - min(counts) <= 1, "unbalanced lifecycle workloads"
+        assert min(counts) >= POLICY["minimum_lifecycle_rounds"] // len(groups), (
+            "not enough rounds per lifecycle workload"
+        )
+        # Top-k 1 and 32 exercise different query workspaces. Compare each
+        # workload with itself: medians across their two RSS levels can move
+        # merely because the middle pair straddles different allocator states.
+        # Apply the unchanged growth AND hourly slope gates to every workload.
+        trends = {str(key): _steady_trend(group) for key, group in groups.items()}
+    growth = max(trend["steady_growth_kib"] for trend in trends.values())
+    slope = max(trend["slope_kib_per_hour"] for trend in trends.values())
     assert growth <= POLICY["maximum_steady_growth_kib"], (
         f"steady RSS grew {growth:.0f} KiB"
     )
@@ -176,6 +200,8 @@ def stability(samples, minimum_seconds=0):
         "elapsed_seconds": elapsed,
         "steady_growth_kib": growth,
         "slope_kib_per_hour": slope,
+        "workload_trends": trends,
+        "mixed_workload_trend": mixed_trend,
     }
 
 

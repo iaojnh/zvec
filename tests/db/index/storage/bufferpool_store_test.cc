@@ -1882,12 +1882,19 @@ TEST_F(BufferPoolScalarFetchTest, ReturnedScalarsSurviveCacheEviction) {
   }
   auto &pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_GT(pool.external_used(), 0u);
+  const auto cached_bytes = pool.external_used();
   EXPECT_GT(ailego::BlockEvictionQueue::get_instance().batch_recycle(1024), 0u);
-  EXPECT_EQ(0u, pool.external_used());
+  // Selected string bytes are now owned by the managed Arrow pool. Their
+  // charge must survive with the result, without retaining whole columns.
+  EXPECT_GT(pool.external_used(), 0u);
+  EXPECT_LT(pool.external_used(), cached_bytes);
   size_t index = 0;
   for (int row : {3, 4, 7, 8, 2049}) {
     ASSERT_NO_FATAL_FAILURE(check_row(retained[index++], row));
   }
+  retained.clear();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(1024);
+  EXPECT_EQ(0u, pool.external_used());
 }
 
 TEST_F(BufferPoolScalarFetchTest, InvalidCachedColumnReturnsNull) {
@@ -1965,6 +1972,7 @@ TEST_F(BufferPoolLargeDecodeTest, RepeatedEvictionReleasesLargeMappings) {
   const auto mapped_before = pool->mapped_bytes();
   BufferPoolForwardStore store(parquet_path_);
   ASSERT_TRUE(store.open().ok());
+  const auto owned_before = pool->bytes_allocated();
   std::vector<ExecBatchPtr> retained;
   for (int row = 0; row < 12; ++row) {
     auto batch = store.fetch({"name"}, row);
@@ -1973,7 +1981,10 @@ TEST_F(BufferPoolLargeDecodeTest, RepeatedEvictionReleasesLargeMappings) {
     EXPECT_GT(pool->mapped_bytes(), mapped_before);
     ailego::BlockEvictionQueue::get_instance().batch_recycle(1024);
     EXPECT_EQ(mapped_before, pool->mapped_bytes());
-    EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().external_used());
+    // Keep the selected values budgeted, while rejecting retention of an
+    // entire 8192-row decoded column (over 4 MiB).
+    EXPECT_LE(pool->bytes_allocated() - owned_before,
+              static_cast<int64_t>(retained.size() * 1024));
   }
   for (size_t row = 0; row < retained.size(); ++row) {
     auto scalar = std::dynamic_pointer_cast<arrow::StringScalar>(
@@ -1981,6 +1992,10 @@ TEST_F(BufferPoolLargeDecodeTest, RepeatedEvictionReleasesLargeMappings) {
     ASSERT_NE(nullptr, scalar);
     EXPECT_EQ(large_text(static_cast<int>(row)), scalar->view());
   }
+  retained.clear();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(1024);
+  EXPECT_EQ(owned_before, pool->bytes_allocated());
+  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().external_used());
 }
 
 TEST_F(BufferPoolLargeDecodeTest, EscapedViewKeepsLargeMappingAlive) {
