@@ -364,6 +364,14 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
       has_vector && query_info->vector_cond_info()->is_reverse_sort();
   bool has_group_by = query_info->group_by() != nullptr;
 
+  // Segment-local optimization may add columns used only by that segment's
+  // filter. Keep the merge schema independent of those temporary columns.
+  std::vector<std::string> output_columns;
+  if (!has_vector && segments.size() > 1) {
+    output_columns = query_info->get_all_fetched_scalar_field_names();
+    if (has_fts) output_columns.push_back(FIELD_SCORE);
+  }
+
   // optimize plan by instrument query info condition, eg adjust invert cond
   Optimizer::Ptr optimizer =
       InvertCondOptimizer::CreateInvertCondOptimizer(schema_);
@@ -428,6 +436,10 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     }
     if (segments.size() == 1) {
       return seg_plan;
+    }
+    if (!has_vector) {
+      auto status = seg_plan.value()->project(output_columns);
+      if (!status.ok()) return tl::make_unexpected(status);
     }
     segment_plans[idx] = std::move(seg_plan.value());
   }
