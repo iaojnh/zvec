@@ -1370,7 +1370,14 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
     while (candidates.has_unexpanded_node() &&
            frontier.size() < effective_beam_width &&
            num_seen < effective_beam_width) {
-      auto neighbor = candidates.closest_unexpanded();
+      bool filtered = false;
+      const int filter_ret =
+          is_filtered(ctx, candidates.peek_closest_unexpanded().id, &filtered);
+      if (filter_ret != 0) return filter_ret;
+      // Deleted nodes remain traversable, but their expanded history must not
+      // fill the live beam and prevent reaching later eligible neighbors.
+      // The visit bitmap prevents re-enqueueing them after this bounded pop.
+      auto neighbor = candidates.closest_unexpanded(!filtered);
       num_seen++;
 
       auto iter = neighbor_cache_.find(neighbor.id);

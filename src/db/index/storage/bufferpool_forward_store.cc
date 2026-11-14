@@ -692,9 +692,7 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
     detail::SelectedRowsPlan row_plan(pairs);
     for (size_t i = 0; i < col_indices.size(); ++i) {
       int col_idx = col_indices[i];
-      auto buffer_id = metadata_id_;
-      buffer_id.column = col_idx;
-      buffer_id.row_group = rg_id;
+      auto buffer_id = metadata_id_.for_column(col_idx, rg_id);
       ARROW_ASSIGN_OR_RAISE(
           auto buffer_handle,
           ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id));
@@ -796,9 +794,7 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   std::vector<arrow::Datum> scalars;
   for (size_t i = 0; i < col_indices.size(); ++i) {
     int col_idx = col_indices[i];
-    auto buffer_id = metadata_id_;
-    buffer_id.column = col_idx;
-    buffer_id.row_group = rg_id;
+    auto buffer_id = metadata_id_.for_column(col_idx, rg_id);
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
     if (!acquired.ok()) {
@@ -888,9 +884,7 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   detail::QueryResultEstimate estimate;
   estimate.add(sizeof(Doc) + 256);
   for (size_t i = 0; i < selected.size(); ++i) {
-    auto key = metadata_id_;
-    key.column = selected[i];
-    key.row_group = group;
+    auto key = metadata_id_.for_column(selected[i], group);
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(key);
     if (!acquired.ok()) {

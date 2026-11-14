@@ -78,6 +78,42 @@ class BufferPoolStoreTest : public testing::Test {
   std::string parquet_path;
 };
 
+TEST_F(BufferPoolStoreTest, PathAndOpenedFileUseTheSameCacheIdentity) {
+  auto file = arrow::io::ReadableFile::Open(parquet_path);
+  ASSERT_TRUE(file.ok());
+  ParquetBufferID path_key(parquet_path, 0, 0);
+  ParquetBufferID opened_key(parquet_path, *file, 0, 0);
+  EXPECT_TRUE(ParquetBufferIDEqual{}(path_key, opened_key));
+  EXPECT_EQ(ParquetBufferIDHash{}(path_key), ParquetBufferIDHash{}(opened_key));
+
+  const auto original = std::filesystem::last_write_time(parquet_path);
+  std::filesystem::last_write_time(parquet_path,
+                                   original + std::chrono::seconds(2));
+  auto refreshed = opened_key.for_column(1, 2);
+  ParquetBufferID changed(parquet_path, 1, 2);
+  EXPECT_TRUE(ParquetBufferIDEqual{}(changed, refreshed));
+  EXPECT_NE(opened_key.mtime, refreshed.mtime);
+}
+
+TEST_F(BufferPoolStoreTest, ClosingReaderRetiresPathAcquiredColumns) {
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  std::shared_ptr<arrow::ChunkedArray> escaped;
+  {
+    auto handle = ParquetBufferPool::get_instance().acquire_buffer(
+        ParquetBufferID(parquet_path, 0, 0));
+    escaped = handle.data();
+    ASSERT_NE(nullptr, escaped);
+  }
+  const auto expected = escaped->GetScalar(0).ValueOrDie()->ToString();
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  store.reset();
+  EXPECT_GT(pool.external_used(), 0u);
+  EXPECT_EQ(expected, escaped->GetScalar(0).ValueOrDie()->ToString());
+  escaped.reset();
+  EXPECT_EQ(0u, pool.external_used());
+}
+
 namespace {
 
 struct ColdReadBarrier {

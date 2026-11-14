@@ -42,6 +42,53 @@ namespace zvec {
 
 namespace {
 
+#if defined(_WIN32) || defined(_WIN64)
+bool ReadFileIdentity(HANDLE handle, ParquetBufferID &id) {
+  BY_HANDLE_FILE_INFORMATION info;
+  if (!GetFileInformationByHandle(handle, &info)) return false;
+  id.file_id =
+      (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+  id.device_id = info.dwVolumeSerialNumber;
+  id.mtime = static_cast<int64_t>(
+      (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+      info.ftLastWriteTime.dwLowDateTime);
+  return true;
+}
+#else
+void ReadFileIdentity(const struct stat &info, ParquetBufferID &id) {
+  id.file_id = info.st_ino;
+  id.device_id = info.st_dev;
+#if defined(__APPLE__)
+  id.mtime = static_cast<int64_t>(info.st_mtimespec.tv_sec) * 1000000000 +
+             info.st_mtimespec.tv_nsec;
+#else
+  id.mtime = static_cast<int64_t>(info.st_mtim.tv_sec) * 1000000000 +
+             info.st_mtim.tv_nsec;
+#endif
+}
+#endif
+
+bool ReadOpenedFileIdentity(
+    const std::shared_ptr<arrow::io::RandomAccessFile> &file,
+    ParquetBufferID &id) {
+  int fd = -1;
+  if (auto *readable = dynamic_cast<arrow::io::ReadableFile *>(file.get())) {
+    fd = readable->file_descriptor();
+  } else if (auto *mapped =
+                 dynamic_cast<arrow::io::MemoryMappedFile *>(file.get())) {
+    fd = mapped->file_descriptor();
+  }
+#if defined(_WIN32) || defined(_WIN64)
+  return fd >= 0 &&
+         ReadFileIdentity(reinterpret_cast<HANDLE>(_get_osfhandle(fd)), id);
+#else
+  struct stat info;
+  if (fd < 0 || fstat(fd, &info) != 0) return false;
+  ReadFileIdentity(info, id);
+  return true;
+#endif
+}
+
 using BufferSet =
     std::unordered_set<const arrow::Buffer *, std::hash<const arrow::Buffer *>,
                        std::equal_to<const arrow::Buffer *>,
@@ -173,6 +220,23 @@ ParquetBufferID::ParquetBufferID(
                           ailego::CacheMetadataAllocator<Filename, true>{},
                           filename.data(), filename.size())) {
   const auto path = ailego::FileHelper::PathFromUtf8(filename);
+#if defined(_WIN32) || defined(_WIN64)
+  const HANDLE handle =
+      CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle != INVALID_HANDLE_VALUE) {
+    const bool identified = ReadFileIdentity(handle, *this);
+    CloseHandle(handle);
+    if (identified) return;
+  }
+#else
+  struct stat info;
+  if (stat(path.c_str(), &info) == 0) {
+    ReadFileIdentity(info, *this);
+    return;
+  }
+#endif
   bool has_stat_mtime = false;
   int64_t stat_mtime = 0;
 #if defined(_WIN32) || defined(_WIN64)
@@ -204,7 +268,9 @@ ParquetBufferID::ParquetBufferID(const std::string &filename, int column,
                           ? metadata_source.filename_
                           : nullptr) {
   if (this->filename() == metadata_source.filename() &&
-      file_id == metadata_source.file_id && mtime == metadata_source.mtime) {
+      file_id == metadata_source.file_id && mtime == metadata_source.mtime &&
+      device_id == metadata_source.device_id &&
+      generation == metadata_source.generation) {
     metadata = metadata_source.metadata;
   }
 }
@@ -216,46 +282,29 @@ ParquetBufferID::ParquetBufferID(
     : ParquetBufferID(filename, column, row_group) {
   input = file;
   opened_file = true;
-  int fd = -1;
-  if (auto *readable = dynamic_cast<arrow::io::ReadableFile *>(file.get())) {
-    fd = readable->file_descriptor();
-  } else if (auto *mapped =
-                 dynamic_cast<arrow::io::MemoryMappedFile *>(file.get())) {
-    fd = mapped->file_descriptor();
-  }
   // Identify the opened file, so a pathname replacement cannot mix the
   // cache identity with bytes from a different file.
-#if defined(_WIN32) || defined(_WIN64)
-  BY_HANDLE_FILE_INFORMATION info;
-  if (fd >= 0 && GetFileInformationByHandle(
-                     reinterpret_cast<HANDLE>(_get_osfhandle(fd)), &info)) {
-    file_id =
-        (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
-    device_id = info.dwVolumeSerialNumber;
-    mtime = static_cast<int64_t>(
-        (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
-        info.ftLastWriteTime.dwLowDateTime);
-    return;
-  }
-#else
-  struct stat file_stat;
-  if (fd >= 0 && fstat(fd, &file_stat) == 0) {
-    file_id = file_stat.st_ino;
-    device_id = file_stat.st_dev;
-#if defined(__APPLE__)
-    mtime = static_cast<int64_t>(file_stat.st_mtimespec.tv_sec) * 1000000000 +
-            file_stat.st_mtimespec.tv_nsec;
-#else
-    mtime = static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000 +
-            file_stat.st_mtim.tv_nsec;
-#endif
-    return;
-  }
-#endif
+  if (ReadOpenedFileIdentity(file, *this)) return;
   // Backends without a local descriptor cannot safely share a pathname
   // identity across opens. Isolate their caches for this open lifetime.
   static std::atomic<uint64_t> next_generation{1};
   generation = next_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+ParquetBufferID ParquetBufferID::for_column(int new_column,
+                                            int new_row_group) const {
+  auto result = *this;
+  result.column = new_column;
+  result.row_group = new_row_group;
+  if (opened_file) {
+    auto file = input.lock();
+    if (file && ReadOpenedFileIdentity(file, result) &&
+        (result.file_id != file_id || result.device_id != device_id ||
+         result.mtime != mtime)) {
+      result.metadata.reset();
+    }
+  }
+  return result;
 }
 
 const std::string ParquetBufferID::to_string() const {

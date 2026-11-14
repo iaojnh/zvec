@@ -276,10 +276,10 @@ int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
           while (next_hint < centroids.size() &&
                  hinted_scans < ctx->max_scan_count()) {
             bool accepted = false;
-            const size_t count =
+            const size_t hinted_count =
                 entity->prefetch_list(centroids[next_hint].key(), &accepted);
             if (!accepted) break;
-            hinted_scans += count;
+            hinted_scans += hinted_count;
             ++next_hint;
           }
           const auto &centroid = centroids[i];
