@@ -62,9 +62,9 @@ class BufferPoolForwardStore
     std::vector<std::pair<int, int>> rows;
   };
 
-  // Gather a request across blocks into owned arrays, with a bounded temporary
-  // cache lease per source column. Null requests the normal owned-copy
-  // fallback.
+  // Gather a request across blocks into owned arrays, holding only the current
+  // source group's cache pin while copying. Null requests the normal
+  // owned-copy fallback.
   static TablePtr fetch_blocks(const std::vector<std::string> &columns,
                                const std::vector<FetchBlock> &blocks,
                                int row_count);

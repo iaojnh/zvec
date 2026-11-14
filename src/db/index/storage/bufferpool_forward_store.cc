@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "bufferpool_forward_store.h"
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <type_traits>
@@ -24,6 +25,7 @@
 #include <arrow/result.h>
 #include <arrow/status.h>
 #include <arrow/util/byte_size.h>
+#include <arrow/util/thread_pool.h>
 #include <parquet/arrow/reader.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/doc.h>
@@ -144,13 +146,28 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
     // Align chunk boundaries across columns without concatenating their data.
     // A decoded row group can be much larger than an IPC batch. Bounded
     // zero-copy slices let Acero overlap source and filter work on warm scans.
-    // Keep narrow scans in a single batch to avoid extra scheduling overhead.
-    const bool wide =
+    bool split_batches =
         with_cache_ && arrow::util::TotalBufferSize(*table) > 4 * 1024 * 1024;
+    if (with_cache_ && !split_batches) {
+      // Short strings can have expensive predicates despite small buffers.
+      // Overlap their work when the executor is nearly idle. Concurrent scans
+      // already supply parallel work, so retain coarse batches under load.
+      const bool strings = std::any_of(
+          projected_schema_->fields().begin(),
+          projected_schema_->fields().end(), [](const auto &field) {
+            return field->type()->id() == arrow::Type::STRING ||
+                   field->type()->id() == arrow::Type::LARGE_STRING;
+          });
+      if (strings) {
+        auto *executor = arrow::internal::GetCpuThreadPool();
+        const int capacity = executor->GetCapacity();
+        split_batches = capacity > 1 && executor->GetNumTasks() <= 1;
+      }
+    }
     active_reader_ =
         std::make_unique<arrow::TableBatchReader>(std::move(table));
-    active_reader_->set_chunksize(wide ? 4096
-                                       : std::numeric_limits<int64_t>::max());
+    active_reader_->set_chunksize(
+        split_batches ? 4096 : std::numeric_limits<int64_t>::max());
   }
 }
 
@@ -526,21 +543,33 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
     }
   }
   if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
-  detail::SelectedRowsPlan::Rows selected(row_count);
-  int64_t offset = 0;
-  for (const auto &[key, rows] : groups) {
-    for (const auto &[output, local] : rows)
-      selected[output] = {output, offset + local};
-    offset += blocks[key.first].store->row_group_row_nums_[key.second];
+  std::vector<uint64_t> order(row_count);
+  uint64_t appended = 0;
+  bool needs_reordering = false;
+  for (const auto &group : groups) {
+    for (const auto &row : group.second) {
+      order[row.first] = appended;
+      needs_reordering |= static_cast<uint64_t>(row.first) != appended;
+      ++appended;
+    }
   }
-  detail::SelectedRowsPlan plan(selected);
+  detail::SelectedRowsPlan::Rows reordered;
+  if (needs_reordering) {
+    reordered.reserve(row_count);
+    for (int row = 0; row < row_count; ++row)
+      reordered.emplace_back(row, order[row]);
+  }
+  detail::SelectedRowsPlan reorder_plan(reordered);
   arrow::ArrayVector arrays;
   arrow::FieldVector fields;
+  arrays.reserve(columns.size());
+  fields.reserve(columns.size());
   for (const auto &name : columns) {
     const auto field =
         blocks.front().store->physic_schema_->GetFieldByName(name);
     if (!field) return nullptr;
-    arrow::ArrayVector chunks;
+    auto builder = arrow::MakeBuilder(field->type());
+    if (!builder.ok() || !(*builder)->Reserve(row_count).ok()) return nullptr;
     for (const auto &[key, rows] : groups) {
       auto *store = blocks[key.first].store;
       const int column = store->physic_schema_->GetFieldIndex(name);
@@ -552,22 +581,27 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
       id.row_group = key.second;
       auto handle =
           ParquetBufferPool::get_instance().acquire_buffer(std::move(id));
-      auto borrowed = std::move(handle).borrow_for_scan();
-      if (!borrowed ||
-          borrowed->length() != store->row_group_row_nums_[key.second])
+      auto column_data = handle.data();
+      if (!column_data ||
+          column_data->length() != store->row_group_row_nums_[key.second])
         return nullptr;
-      chunks.insert(chunks.end(), borrowed->chunks().begin(),
-                    borrowed->chunks().end());
+      // Fetch produces owned output. Pin only this source while copying its
+      // selected rows; borrowing every source as a scan unnecessarily consumes
+      // the scan lease quota and wraps metadata for rows that are never used.
+      detail::SelectedRowsPlan row_plan(rows);
+      if (!AppendSelectedRows(*column_data, row_plan, builder->get()).ok())
+        return nullptr;
     }
-    // Source pins live only until this column is copied. The shared lease
-    // limit leaves cache capacity for concurrent loads and scans.
-    const arrow::ChunkedArray source(std::move(chunks), field->type());
-    auto builder = arrow::MakeBuilder(field->type());
-    if (!builder.ok() || !(*builder)->Reserve(row_count).ok() ||
-        !AppendSelectedRows(source, plan, builder->get()).ok())
-      return nullptr;
     auto result = (*builder)->Finish();
     if (!result.ok()) return nullptr;
+    if (needs_reordering) {
+      const arrow::ChunkedArray copied(*result);
+      if (!(*builder)->Reserve(row_count).ok() ||
+          !AppendSelectedRows(copied, reorder_plan, builder->get()).ok())
+        return nullptr;
+      result = (*builder)->Finish();
+      if (!result.ok()) return nullptr;
+    }
     arrays.push_back(std::move(*result));
     fields.push_back(field);
   }

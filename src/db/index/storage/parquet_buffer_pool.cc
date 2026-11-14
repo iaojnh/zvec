@@ -14,7 +14,9 @@
 
 #include "parquet_buffer_pool.h"
 #include <atomic>
+#include <limits>
 #include <optional>
+#include <unordered_set>
 #include <arrow/array/array_binary.h>
 #include <arrow/array/util.h>
 #include <arrow/io/file.h>
@@ -190,6 +192,29 @@ std::shared_ptr<arrow::ArrayData> LeaseArrayData(
   }
   return data;
 }
+
+bool RetainParquetColumnBuffers(
+    const std::shared_ptr<arrow::ArrayData> &data,
+    detail::ParquetBufferPayload &payload, size_t &size,
+    std::unordered_set<const arrow::Buffer *> &seen) {
+  for (auto &buffer : data->buffers) {
+    if (!buffer) continue;
+    if (seen.insert(buffer.get()).second) {
+      const auto bytes = static_cast<size_t>(buffer->capacity());
+      if (bytes > (std::numeric_limits<size_t>::max)() - size) return false;
+      payload.arrow_refs.push_back(buffer);
+      size += bytes;
+    }
+    // Cache ownership belongs to arrow_refs, including nested values and
+    // dictionaries. Consumers either hold a pin or copy the selected data.
+    buffer = std::shared_ptr<arrow::Buffer>(buffer.get(), [](arrow::Buffer *) {});
+  }
+  for (const auto &child : data->child_data) {
+    if (!RetainParquetColumnBuffers(child, payload, size, seen)) return false;
+  }
+  return !data->dictionary ||
+         RetainParquetColumnBuffers(data->dictionary, payload, size, seen);
+}
 }  // namespace
 
 std::shared_ptr<arrow::ChunkedArray>
@@ -252,17 +277,11 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
 
   size = 0;
   payload.arrow_refs.clear();
+  std::unordered_set<const arrow::Buffer *> seen;
   for (auto &array : payload.arrow->chunks()) {
-    auto &buffers = array->data()->buffers;
-    for (size_t buf_idx = 0; buf_idx < buffers.size(); ++buf_idx) {
-      if (buffers[buf_idx] == nullptr) {
-        continue;
-      }
-      payload.arrow_refs.emplace_back(buffers[buf_idx]);
-      size += buffers[buf_idx]->capacity();
-      std::shared_ptr<arrow::Buffer> hijacked_buffer(buffers[buf_idx].get(),
-                                                     [](arrow::Buffer *) {});
-      buffers[buf_idx] = hijacked_buffer;
+    if (!RetainParquetColumnBuffers(array->data(), payload, size, seen)) {
+      LOG_ERROR("Parquet column buffer size overflow: %s", file_name.data());
+      return false;
     }
   }
 

@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -27,6 +28,8 @@
 #include <arrow/io/memory.h>
 #include <arrow/result.h>
 #include <arrow/table.h>
+#include <arrow/util/byte_size.h>
+#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
 #include <zvec/db/doc.h>
@@ -1376,6 +1379,167 @@ TEST_F(BufferPoolStoreTest,
       ParquetBufferPool::get_instance().acquire_buffer(context->buffer_id);
   auto leased = std::move(handle).borrow_for_scan();
   ASSERT_NE(leased, nullptr);
+}
+
+TEST_F(BufferPoolStoreTest, NarrowStringScanStreamsAndRetainsSlices) {
+  constexpr int64_t rows = 10003;
+  arrow::StringBuilder builder;
+  for (int64_t row = 0; row < rows; ++row) {
+    if (row % 7 == 0) {
+      ASSERT_TRUE(builder.AppendNull().ok());
+    } else {
+      ASSERT_TRUE(builder.Append("标签_" + std::to_string(row)).ok());
+    }
+  }
+  auto expected = builder.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::utf8())}), {expected});
+  const auto path = std::filesystem::absolute(parquet_path).string();
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(
+                  *source, arrow::default_memory_pool(), out, rows)
+                  .ok());
+  ASSERT_TRUE(out->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(path);
+  ASSERT_TRUE(store->open().ok());
+  auto reader = store->scan({"value"});
+  ASSERT_NE(reader, nullptr);
+  std::vector<std::shared_ptr<arrow::RecordBatch>> retained;
+  int64_t offset = 0;
+  while (true) {
+    std::shared_ptr<arrow::RecordBatch> batch;
+    ASSERT_TRUE(reader->ReadNext(&batch).ok());
+    if (!batch) break;
+    // Small strings still need several source batches so expensive text
+    // predicates can overlap work instead of serializing an entire row group.
+    if (arrow::GetCpuThreadPoolCapacity() > 1) {
+      EXPECT_LE(batch->num_rows(), 4096);
+    }
+    ASSERT_GT(batch->num_rows(), 0);
+    ASSERT_TRUE(batch->column(0)->Equals(
+        expected->Slice(offset, batch->num_rows())));
+    offset += batch->num_rows();
+    retained.push_back(std::move(batch));
+  }
+  EXPECT_EQ(offset, rows);
+  reader.reset();
+  store.reset();
+  for (int i = 0; i < 4; ++i) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  }
+  // Zero-copy source slices must keep the cache lease after their reader dies.
+  offset = 0;
+  for (const auto &batch : retained) {
+    EXPECT_TRUE(batch->column(0)->Equals(
+        expected->Slice(offset, batch->num_rows())));
+    offset += batch->num_rows();
+  }
+}
+
+TEST_F(BufferPoolStoreTest, ParquetCacheChargesAndOwnsArrayChildren) {
+  auto values = std::make_shared<arrow::StringBuilder>();
+  arrow::ListBuilder builder(arrow::default_memory_pool(), values);
+  for (int row = 0; row < 512; ++row) {
+    if (row % 7 == 0) {
+      ASSERT_TRUE(builder.AppendNull().ok());
+    } else {
+      ASSERT_TRUE(builder.Append().ok());
+      for (int item = 0; item < 32; ++item) {
+        if (item == 3) {
+          ASSERT_TRUE(values->AppendNull().ok());
+        } else {
+          ASSERT_TRUE(values->Append("标签_" + std::string(64, 'x')).ok());
+        }
+      }
+    }
+  }
+  auto array = builder.Finish().ValueOrDie();
+  auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("value", array->type())}), {array});
+  const auto path = std::filesystem::absolute(parquet_path).string();
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(
+                  *table, arrow::default_memory_pool(), out, 512)
+                  .ok());
+  ASSERT_TRUE(out->Close().ok());
+  auto input = arrow::io::ReadableFile::Open(path).ValueOrDie();
+  auto context = ParquetFileContext::make(path, input).ValueOrDie();
+  detail::ParquetBufferLoader loader;
+  detail::ParquetBufferPayload payload;
+  size_t charged = 0;
+  ASSERT_TRUE(loader.load(context->buffer_id, payload, charged));
+  ASSERT_NE(payload.arrow, nullptr);
+  EXPECT_GE(charged,
+            static_cast<size_t>(arrow::util::TotalBufferSize(*payload.arrow)));
+  auto child = payload.arrow->chunk(0)->data()->child_data.at(0);
+  const auto *value_buffer = child->buffers.at(2).get();
+  auto owned = std::find_if(payload.arrow_refs.begin(), payload.arrow_refs.end(),
+                            [value_buffer](const auto &buffer) {
+                              return buffer.get() == value_buffer;
+                            });
+  ASSERT_NE(owned, payload.arrow_refs.end());
+  std::weak_ptr<arrow::Buffer> original = *owned;
+  payload.arrow.reset();
+  EXPECT_FALSE(original.expired());
+  payload.arrow_refs.clear();
+  EXPECT_TRUE(original.expired());
+}
+
+TEST_F(BufferPoolStoreTest, FetchBlocksCopiesBeyondScanLeaseQuota) {
+  auto value = [](const std::string &prefix, int row) {
+    return "标签_" + prefix + "_" + std::to_string(row) + ":" +
+           std::string(32768, 'x');
+  };
+  auto write = [&](const std::string &path,
+                   const std::string &prefix) -> arrow::Status {
+    arrow::StringBuilder builder;
+    for (int row = 0; row < 64; ++row) {
+      if (row % 11 == 0) {
+        ARROW_RETURN_NOT_OK(builder.AppendNull());
+      } else {
+        ARROW_RETURN_NOT_OK(builder.Append(value(prefix, row)));
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(auto array, builder.Finish());
+    auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("value", arrow::utf8())}), {array});
+    ARROW_ASSIGN_OR_RAISE(auto out, arrow::io::FileOutputStream::Open(path));
+    ARROW_RETURN_NOT_OK(parquet::arrow::WriteTable(
+        *table, arrow::default_memory_pool(), out, 64));
+    return out->Close();
+  };
+  const auto other = parquet_path + ".large-copy.parquet";
+  struct Cleanup {
+    std::string path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove(path, ignored);
+    }
+  } cleanup{other};
+  ASSERT_TRUE(write(parquet_path, "A").ok());
+  ASSERT_TRUE(write(other, "B").ok());
+  auto first = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  auto second = std::make_shared<BufferPoolForwardStore>(other);
+  ASSERT_TRUE(first->open().ok());
+  ASSERT_TRUE(second->open().ok());
+  // Both 2 MiB columns fit in the 10 MiB cache, but neither fits its scan
+  // lease quota. A small owned Fetch result needs only a short-lived pin.
+  auto result = BufferPoolForwardStore::fetch_blocks(
+      {"value"}, {{first.get(), {{3, 0}, {0, 63}}},
+                  {second.get(), {{1, 7}, {2, 8}}}},
+      4);
+  ASSERT_NE(result, nullptr);
+  first.reset();
+  second.reset();
+  for (int i = 0; i < 4; ++i) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  }
+  auto returned =
+      std::static_pointer_cast<arrow::StringArray>(result->column(0)->chunk(0));
+  EXPECT_EQ(returned->GetString(0), value("A", 63));
+  EXPECT_EQ(returned->GetString(1), value("B", 7));
+  EXPECT_EQ(returned->GetString(2), value("B", 8));
+  EXPECT_TRUE(returned->IsNull(3));
 }
 
 namespace {
