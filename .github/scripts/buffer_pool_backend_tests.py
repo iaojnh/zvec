@@ -36,6 +36,7 @@ NATIVE_TARGETS = (
     "chunk_read_prefetch_test",
     "resident_vector_batch_test",
     "diskann_file_reader_aio_test",
+    "diskann_builder_entity_buffer_test",
     "diskann_filtered_beam_test",
     "diskann_pq_priority_test",
     "diskann_resident_pq_batch_test",
