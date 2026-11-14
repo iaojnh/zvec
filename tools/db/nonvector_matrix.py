@@ -140,18 +140,18 @@ def experiments():
     pressure = ['fetch1_all', 'fetch32_null_array', 'fetch128_payload',
                 'range128_all', 'scan_payload_like', 'fts_filter']
     for data in ('pressure', 'wide-pressure'):
-        for budget in (16, 32, 64):
+        for budget in (128, 256, 512):
             for workers in (1, 4):
                 add(f'pressure-{data}-{budget}-t{workers}', data, workers,
                     pressure, budget=budget)
         for workers in (8, 16):
-            add(f'pressure-{data}-32-t{workers}', data, workers,
-                ['fetch32_null_array', 'scan_payload_like', 'fts_filter'], budget=32)
+            add(f'pressure-{data}-256-t{workers}', data, workers,
+                ['fetch32_null_array', 'scan_payload_like', 'fts_filter'], budget=256)
     for data in ('single', 'multi', 'wide-null50', 'large-array', 'long-string'):
         for workers in (1, 4):
             for case in ('fetch1_all', 'fetch32_null_array', 'scan_payload_like', 'fts_filter'):
                 add(f'cold-{data}-{case}-t{workers}', data, workers, [case], cache='cold')
-    for budget in (16, 64):
+    for budget in (128, 512):
         for workers in (1, 4):
             for case in ('fetch32_null_array', 'scan_payload_like'):
                 add(f'cold-pressure-{budget}-{case}-t{workers}', 'pressure', workers,
