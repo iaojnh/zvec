@@ -227,6 +227,7 @@ class ParquetBufferPool {
   static constexpr size_t kMaxConcurrentLoads = 4;
 
   friend class ParquetBufferContextHandle;
+  friend struct ParquetBufferPoolTestPeer;
 
   using Cache =
       ailego::ExternalCache<ParquetBufferID, detail::ParquetBufferPayload,

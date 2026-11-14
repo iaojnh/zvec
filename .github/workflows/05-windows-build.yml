@@ -95,10 +95,10 @@ jobs:
           cmake -S tests/cmake/snowball_codegen -B snowball-smoke -G Ninja `
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item snowball-smoke/compile_commands.json ci-evidence/snowball-compile-commands.json
           cmake --build snowball-smoke --config Release --parallel $env:NPROC `
             2>&1 | Tee-Object -FilePath ci-evidence/snowball-build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Copy-Item snowball-smoke/compile_commands.json ci-evidence/snowball-compile-commands.json
           ctest --test-dir snowball-smoke -C Release --output-on-failure `
             --output-junit "$env:GITHUB_WORKSPACE/ci-evidence/snowball.xml"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

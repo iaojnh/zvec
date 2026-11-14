@@ -78,6 +78,87 @@ class BufferPoolStoreTest : public testing::Test {
   std::string parquet_path;
 };
 
+TEST_F(BufferPoolStoreTest, PointFetchStreamsWhenWholeColumnCannotFit) {
+  constexpr int rows = 8192;
+  const auto value = [](int row) {
+    return std::to_string(row) + std::string(2048, 'x');
+  };
+  {
+    arrow::StringBuilder strings;
+    arrow::Int64Builder numbers;
+    arrow::UInt64Builder doc_ids;
+    arrow::StringBuilder user_ids;
+    for (int row = 0; row < rows; ++row) {
+      ASSERT_TRUE(
+          (row % 11 ? strings.Append(value(row)) : strings.AppendNull()).ok());
+      ASSERT_TRUE(numbers.Append(row * 3).ok());
+      ASSERT_TRUE(doc_ids.Append(row).ok());
+      ASSERT_TRUE(user_ids.Append(std::to_string(row)).ok());
+    }
+    auto text = strings.Finish();
+    auto numeric = numbers.Finish();
+    auto doc_id = doc_ids.Finish();
+    auto user_id = user_ids.Finish();
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(numeric.ok());
+    ASSERT_TRUE(doc_id.ok());
+    ASSERT_TRUE(user_id.ok());
+    auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("wide", arrow::utf8()),
+                       arrow::field("number", arrow::int64()),
+                       arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                       arrow::field(USER_ID, arrow::utf8())}),
+        {*text, *numeric, *doc_id, *user_id});
+    auto output = arrow::io::FileOutputStream::Open(parquet_path);
+    ASSERT_TRUE(output.ok());
+    parquet::WriterProperties::Builder properties;
+    properties.disable_dictionary();
+    properties.data_pagesize(64 * 1024);
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
+                                           *output, rows, properties.build())
+                    .ok());
+    ASSERT_TRUE((*output)->Close().ok());
+  }
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> doc_columns{GLOBAL_DOC_ID, USER_ID, "wide"};
+  auto doc_schema = arrow::schema({arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                                   arrow::field(USER_ID, arrow::utf8()),
+                                   arrow::field("wide", arrow::utf8())});
+  // An optional all-column pin must yield instead of aborting a scalar read.
+  EXPECT_EQ(nullptr, store->fetch_doc(doc_columns, doc_schema, rows - 1));
+  auto single = store->fetch(doc_columns, rows - 1);
+  ASSERT_NE(nullptr, single);
+  ASSERT_EQ(3u, single->values.size());
+  EXPECT_EQ(value(rows - 1), single->values[2].scalar()->ToString());
+  // The decoded string column is larger than the fixture's 10 MiB pool.
+  // Preserve unsorted requests, duplicates, nulls and cross-column ordering.
+  const std::vector<int> selected{8191, 0, 4095, 4095, 256, 7000};
+  auto result = store->fetch_checked({"wide", "number"}, selected,
+                                     detail::GetParquetMemoryPool().get());
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(selected.size(), static_cast<size_t>((*result)->num_rows()));
+  for (size_t i = 0; i < selected.size(); ++i) {
+    auto text = (*result)->column(0)->GetScalar(i);
+    auto number = (*result)->column(1)->GetScalar(i);
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(number.ok());
+    EXPECT_EQ(selected[i] % 11 != 0, (*text)->is_valid);
+    if ((*text)->is_valid) EXPECT_EQ(value(selected[i]), (*text)->ToString());
+    EXPECT_EQ(selected[i] * 3,
+              std::static_pointer_cast<arrow::Int64Scalar>(*number)->value);
+  }
+  std::vector<int> all_rows(rows);
+  for (int row = 0; row < rows; ++row) all_rows[row] = row;
+  auto too_large = store->fetch_checked({"wide"}, all_rows,
+                                        detail::GetParquetMemoryPool().get());
+  ASSERT_FALSE(too_large.ok());
+  EXPECT_TRUE(too_large.status().IsOutOfMemory());
+  store.reset();
+  EXPECT_EQ(value(selected[0]),
+            (*result)->column(0)->GetScalar(0).ValueOrDie()->ToString());
+}
+
 TEST_F(BufferPoolStoreTest, PathAndOpenedFileUseTheSameCacheIdentity) {
   auto file = arrow::io::ReadableFile::Open(parquet_path);
   ASSERT_TRUE(file.ok());

@@ -535,6 +535,70 @@ arrow::Status AppendSelectedRows(const arrow::ChunkedArray &column,
       });
 }
 
+arrow::Status AppendStreamedSelectedRows(
+    const std::shared_ptr<arrow::io::RandomAccessFile> &file,
+    const std::shared_ptr<parquet::FileMetaData> &metadata, int row_group,
+    int column, const SelectedRows &rows, arrow::MemoryPool *output_pool,
+    arrow::ArrayBuilder *output) {
+  // Caching a complete column is optional. Keep only the selected values
+  // when that column cannot fit, using the same managed decode allocator.
+  auto decode_pool = detail::GetParquetMemoryPool();
+  parquet::ReaderProperties properties(decode_pool.get());
+  properties.enable_buffered_stream();
+  properties.set_buffer_size(64 * 1024);
+  ARROW_ASSIGN_OR_RAISE(auto parquet_reader, detail::OpenBudgetedParquetReader(
+                                                 file, properties, metadata));
+  std::unique_ptr<parquet::arrow::FileReader> reader;
+  ARROW_RETURN_NOT_OK(parquet::arrow::FileReader::Make(
+      decode_pool.get(), std::move(parquet_reader),
+      detail::BudgetedParquetArrowProperties(), &reader));
+  const auto leaves = detail::ParquetLeafColumns(*metadata, {column});
+  if (leaves.empty()) return arrow::Status::Invalid("Invalid Parquet column");
+  reader->set_batch_size(
+      detail::ParquetDecodeBatchRows(*metadata, row_group, leaves));
+  ARROW_ASSIGN_OR_RAISE(auto batches,
+                        reader->GetRecordBatchReader({row_group}, leaves));
+  std::unique_ptr<arrow::ArrayBuilder> selected;
+  ARROW_RETURN_NOT_OK(
+      arrow::MakeBuilder(output_pool, output->type(), &selected));
+  ARROW_RETURN_NOT_OK(selected->Reserve(rows.size()));
+  SelectedRows restore(rows.size());
+  size_t found = 0;
+  uint64_t offset = 0;
+  while (found < rows.size()) {
+    std::shared_ptr<arrow::RecordBatch> batch;
+    ARROW_RETURN_NOT_OK(batches->ReadNext(&batch));
+    if (!batch)
+      return arrow::Status::IndexError("Selected row exceeds Parquet column");
+    if (batch->num_columns() != 1)
+      return arrow::Status::Invalid("Expected one Parquet output column");
+    const uint64_t end = offset + static_cast<uint64_t>(batch->num_rows());
+    SelectedRows in_batch;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      if (rows[i].second >= offset && rows[i].second < end) {
+        restore[i] = {
+            i, static_cast<uint64_t>(selected->length()) + in_batch.size()};
+        in_batch.emplace_back(i, rows[i].second - offset);
+      }
+    }
+    if (!in_batch.empty()) {
+      detail::SelectedRowsPlan plan(in_batch);
+      ARROW_RETURN_NOT_OK(AppendSelectedRows(
+          arrow::ChunkedArray(batch->column(0)), plan, selected.get()));
+      found += in_batch.size();
+    }
+    offset = end;
+    // The next batch must not overlap the previous batch's output backing.
+  }
+  std::shared_ptr<arrow::Array> gathered;
+  ARROW_RETURN_NOT_OK(selected->Finish(&gathered));
+  batches.reset();
+  reader.reset();
+  // Restore request order, including duplicates, after physical-order reads.
+  detail::SelectedRowsPlan plan(restore);
+  return AppendSelectedRows(arrow::ChunkedArray(gathered), plan, output);
+}
+
 }  // namespace
 
 BufferPoolForwardStore::BufferPoolForwardStore(const std::string &uri)
@@ -837,10 +901,25 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
     detail::SelectedRowsPlan row_plan(pairs);
     for (size_t i = 0; i < col_indices.size(); ++i) {
       int col_idx = col_indices[i];
+      if (i == 0) {
+        int64_t appended = builders[i]->length();
+        for (const auto &row : pairs) {
+          order[row.first] = appended++;
+          needs_reordering |=
+              order[row.first] != static_cast<int64_t>(row.first);
+        }
+      }
       auto buffer_id = metadata_id_.for_column(col_idx, rg_id);
-      ARROW_ASSIGN_OR_RAISE(
-          auto buffer_handle,
-          ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id));
+      auto acquired =
+          ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
+      if (!acquired.ok()) {
+        if (!acquired.status().IsOutOfMemory()) return acquired.status();
+        ARROW_RETURN_NOT_OK(AppendStreamedSelectedRows(
+            file_, parquet_reader_->parquet_reader()->metadata(), rg_id,
+            col_idx, pairs, pool, builders[i].get()));
+        continue;
+      }
+      auto buffer_handle = std::move(acquired).ValueOrDie();
       const auto *col_chunked_array = buffer_handle.borrowed_data();
       if (!col_chunked_array) {
         LOG_ERROR(
@@ -858,14 +937,6 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
         return arrow::Status::Invalid("Parquet column has no chunks");
       }
 
-      if (i == 0) {
-        int64_t appended = builders[i]->length();
-        for (const auto &row : pairs) {
-          order[row.first] = appended++;
-          needs_reordering |=
-              order[row.first] != static_cast<int64_t>(row.first);
-        }
-      }
       ARROW_RETURN_NOT_OK(
           AppendSelectedRows(*col_chunked_array, row_plan, builders[i].get()));
     }
@@ -943,7 +1014,27 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
     if (!acquired.ok()) {
-      if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+      if (acquired.status().IsOutOfMemory()) {
+        scalars.clear();
+        auto fetched = fetch_checked(columns, {index},
+                                     detail::GetParquetMemoryPool().get());
+        if (!fetched.ok()) {
+          if (fetched.status().IsOutOfMemory()) throw std::bad_alloc();
+          LOG_ERROR("Failed to stream parquet scalar: %s",
+                    fetched.status().ToString().c_str());
+          return nullptr;
+        }
+        for (const auto &column : (*fetched)->columns()) {
+          auto scalar = detail::FetchScalarView(*column, 0);
+          if (!scalar.ok()) {
+            if (scalar.status().IsOutOfMemory()) throw std::bad_alloc();
+            return nullptr;
+          }
+          scalars.emplace_back(std::move(scalar).ValueOrDie());
+        }
+        return std::make_shared<arrow::compute::ExecBatch>(std::move(scalars),
+                                                           1);
+      }
       LOG_ERROR("Failed to acquire parquet scalar: %s",
                 acquired.status().ToString().c_str());
       return nullptr;
@@ -1033,7 +1124,8 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(key);
     if (!acquired.ok()) {
-      if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+      // This optional fast path pins all source columns together. Yield to
+      // the bounded scalar path if those columns cannot coexist in cache.
       return nullptr;
     }
     pins.push_back(std::move(acquired).ValueOrDie());
