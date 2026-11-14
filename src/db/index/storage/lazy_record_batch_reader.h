@@ -91,6 +91,13 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
       bool with_cache = true,
       std::shared_ptr<const ParquetFileContext> file_context = nullptr);
 
+  // Cached scans need no decoder until a cache admission fails.
+  ParquetRecordBatchReader(
+      const std::vector<std::string> &columns,
+      std::shared_ptr<arrow::Schema> schema,
+      std::shared_ptr<const ParquetFileContext> file_context,
+      const std::vector<int64_t> &row_group_rows);
+
   ~ParquetRecordBatchReader() override;
 
   std::shared_ptr<arrow::Schema> schema() const override {
@@ -100,6 +107,8 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override;
 
  private:
+  void project_columns();
+
   std::unique_ptr<arrow::TableBatchReader> active_reader_;
   std::unique_ptr<parquet::arrow::FileReader> reader_;
   std::shared_ptr<arrow::Schema> schema_;

@@ -14,6 +14,7 @@
 
 #include "bufferpool_forward_store.h"
 #include <limits>
+#include <map>
 #include <type_traits>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/compute/api.h>
@@ -44,15 +45,7 @@ ParquetRecordBatchReader::ParquetRecordBatchReader(
       file_path_(file_path),
       with_cache_(with_cache && file_context != nullptr),
       file_context_(std::move(file_context)) {
-  std::vector<std::shared_ptr<arrow::Field>> fields;
-  for (const auto &col : columns) {
-    int index = schema_->GetFieldIndex(col);
-    if (index != -1) {
-      fields.push_back(schema_->field(index));
-      col_indices_.push_back(index);
-    }
-  }
-  projected_schema_ = arrow::schema(fields);
+  project_columns();
 
   auto parquet_metadata = reader_->parquet_reader()->metadata();
   total_rows_ = parquet_metadata->num_rows();
@@ -65,6 +58,32 @@ ParquetRecordBatchReader::ParquetRecordBatchReader(
     row_group_offsets_.push_back(offset);
     offset += num_rows_in_group;
   }
+}
+
+ParquetRecordBatchReader::ParquetRecordBatchReader(
+    const std::vector<std::string> &columns,
+    std::shared_ptr<arrow::Schema> schema,
+    std::shared_ptr<const ParquetFileContext> file_context,
+    const std::vector<int64_t> &row_group_rows)
+    : schema_(std::move(schema)),
+      columns_(columns),
+      num_row_groups_(row_group_rows.size()),
+      row_group_row_nums_(row_group_rows),
+      with_cache_(true),
+      file_context_(std::move(file_context)) {
+  project_columns();
+}
+
+void ParquetRecordBatchReader::project_columns() {
+  std::vector<std::shared_ptr<arrow::Field>> fields;
+  for (const auto &col : columns_) {
+    int index = schema_->GetFieldIndex(col);
+    if (index != -1) {
+      fields.push_back(schema_->field(index));
+      col_indices_.push_back(index);
+    }
+  }
+  projected_schema_ = arrow::schema(fields);
 }
 
 ParquetRecordBatchReader::~ParquetRecordBatchReader() = default;
@@ -101,6 +120,12 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
           } else {
             // Other live batches may pin the cache. Read owned buffers rather
             // than failing a scan or retaining unpinned cached memory.
+            if (!reader_) {
+              auto parquet =
+                  parquet::ParquetFileReader::Open(file_context_->file);
+              ARROW_RETURN_NOT_OK(parquet::arrow::FileReader::Make(
+                  arrow::default_memory_pool(), std::move(parquet), &reader_));
+            }
             ARROW_RETURN_NOT_OK(
                 reader_->RowGroup(rg_id)->Column(index)->Read(&column));
           }
@@ -471,6 +496,78 @@ int64_t BufferPoolForwardStore::get_row_group_offset(int rg_id) {
 }
 
 
+TablePtr BufferPoolForwardStore::fetch_blocks(
+    const std::vector<std::string> &columns,
+    const std::vector<FetchBlock> &blocks, int row_count) {
+  if (columns.empty() || blocks.empty() || row_count <= 0) return nullptr;
+  using GroupKey = std::pair<size_t, int>;
+  std::map<GroupKey, detail::SelectedRowsPlan::Rows> groups;
+  std::vector<bool> seen(row_count, false);
+  size_t selected_rows = 0;
+  for (size_t block = 0; block < blocks.size(); ++block) {
+    const auto &request = blocks[block];
+    if (!request.store || !request.store->validate(columns)) return nullptr;
+    for (const auto &[output, row] : request.rows) {
+      if (output < 0 || output >= row_count || seen[output] || row < 0 ||
+          row >= request.store->num_rows_)
+        return nullptr;
+      seen[output] = true;
+      ++selected_rows;
+      const int rg = request.store->find_row_group_for_row(row);
+      groups[{block, rg}].emplace_back(
+          output, row - request.store->row_group_offsets_[rg]);
+    }
+  }
+  if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
+  detail::SelectedRowsPlan::Rows selected(row_count);
+  int64_t offset = 0;
+  for (const auto &[key, rows] : groups) {
+    for (const auto &[output, local] : rows)
+      selected[output] = {output, offset + local};
+    offset += blocks[key.first].store->row_group_row_nums_[key.second];
+  }
+  detail::SelectedRowsPlan plan(selected);
+  arrow::ArrayVector arrays;
+  arrow::FieldVector fields;
+  for (const auto &name : columns) {
+    const auto field =
+        blocks.front().store->physic_schema_->GetFieldByName(name);
+    if (!field) return nullptr;
+    arrow::ArrayVector chunks;
+    for (const auto &[key, rows] : groups) {
+      auto *store = blocks[key.first].store;
+      const int column = store->physic_schema_->GetFieldIndex(name);
+      if (column < 0 ||
+          !store->physic_schema_->field(column)->type()->Equals(field->type()))
+        return nullptr;
+      auto id = store->file_context_->buffer_id;
+      id.column = column;
+      id.row_group = key.second;
+      auto handle =
+          ParquetBufferPool::get_instance().acquire_buffer(std::move(id));
+      auto borrowed = std::move(handle).borrow_for_scan();
+      if (!borrowed ||
+          borrowed->length() != store->row_group_row_nums_[key.second])
+        return nullptr;
+      chunks.insert(chunks.end(), borrowed->chunks().begin(),
+                    borrowed->chunks().end());
+    }
+    // Source pins live only until this column is copied. The shared lease
+    // limit leaves cache capacity for concurrent loads and scans.
+    const arrow::ChunkedArray source(std::move(chunks), field->type());
+    auto builder = arrow::MakeBuilder(field->type());
+    if (!builder.ok() || !(*builder)->Reserve(row_count).ok() ||
+        !AppendSelectedRows(source, plan, builder->get()).ok())
+      return nullptr;
+    auto result = (*builder)->Finish();
+    if (!result.ok()) return nullptr;
+    arrays.push_back(std::move(*result));
+    fields.push_back(field);
+  }
+  return arrow::Table::Make(arrow::schema(std::move(fields)), std::move(arrays),
+                            row_count);
+}
+
 TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
                                        const std::vector<int> &indices) {
   if (!validate(columns)) {
@@ -508,7 +605,9 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
     }
   }
 
-  std::unordered_map<int, std::vector<std::pair<int, uint64_t>>> rg_to_local;
+  // Queries normally supply increasing row IDs. Visit row groups in that
+  // order so their gathered arrays do not need a second full copy to reorder.
+  std::map<int, std::vector<std::pair<int, uint64_t>>> rg_to_local;
   std::vector<std::pair<int, int64_t>>
       local_doc_id_pairs;  // (output_row, global_row)
 
@@ -865,19 +964,8 @@ RecordBatchReaderPtr BufferPoolForwardStore::scan(
     return nullptr;
   }
 
-  // Create a new parquet reader for scanning
-  std::unique_ptr<parquet::arrow::FileReader> parquet_reader;
-  auto parquet_file_reader = parquet::ParquetFileReader::Open(file_);
-  auto status = parquet::arrow::FileReader::Make(arrow::default_memory_pool(),
-                                                 std::move(parquet_file_reader),
-                                                 &parquet_reader);
-  if (!status.ok()) {
-    LOG_ERROR("Failed to create parquet reader: %s", status.message().c_str());
-    return nullptr;
-  }
-
   return std::make_shared<ParquetRecordBatchReader>(
-      parquet_reader, columns, physic_schema_, file_path_, true, file_context_);
+      columns, physic_schema_, file_context_, row_group_row_nums_);
 }
 
 }  // namespace zvec

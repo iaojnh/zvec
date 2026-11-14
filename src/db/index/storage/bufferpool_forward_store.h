@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
@@ -54,6 +55,19 @@ class BufferPoolForwardStore
   /// \return A table containing the requested data or nullptr on failure
   TablePtr fetch(const std::vector<std::string> &columns,
                  const std::vector<int> &indices) override;
+
+  struct FetchBlock {
+    BufferPoolForwardStore *store;
+    // (request output position, block-local row)
+    std::vector<std::pair<int, int>> rows;
+  };
+
+  // Gather a request across blocks into owned arrays, with a bounded temporary
+  // cache lease per source column. Null requests the normal owned-copy
+  // fallback.
+  static TablePtr fetch_blocks(const std::vector<std::string> &columns,
+                               const std::vector<FetchBlock> &blocks,
+                               int row_count);
 
   /// Fetch specific columns and row indices from the data source
   /// \param columns The list of column names to fetch
