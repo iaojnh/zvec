@@ -770,6 +770,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     CacheBuffer *head{nullptr};
   };
   std::array<CacheBufferBin, 64> cache_buffer_bins_{};
+  // Serialize the reserve check with return accounting: concurrent large
+  // returns must not all claim the same idle headroom. Acquisition stays
+  // sharded.
+  std::mutex cache_return_mutex_;
   std::atomic<size_t> cache_idle_bytes_{0};
 
   FreeShard free_shards_[kNumFreeShards];

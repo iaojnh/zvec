@@ -2653,19 +2653,46 @@ MemoryLimitPool::CacheBuffer *MemoryLimitPool::try_acquire_cache_buffer(
 void MemoryLimitPool::release_cache_buffer(CacheBuffer *buffer) {
   if (!buffer) return;
   const size_t bytes = buffer->bytes;
-  auto &bin = cache_buffer_bins_[
-      (bytes / page_buffer_size()) % cache_buffer_bins_.size()];
-  // Publish reusable backing before making its logical capacity available.
   {
-    std::lock_guard<std::mutex> lock(bin.mutex);
-    buffer->next = bin.head;
-    bin.head = buffer;
-    cache_idle_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> return_lock(cache_return_mutex_);
+    const size_t committed = committed_size_.load(std::memory_order_relaxed);
+    const size_t used = used_size_.load(std::memory_order_relaxed);
+    const size_t idle = committed > used ? committed - used : 0;
+    const size_t reserve =
+        process_rss_.pressure() ? 0 : reserve_margin(capacity());
+    // Match retained Arrow blocks and free pages: an entire released query
+    // mapping must not leave excess backing resident until paced maintenance
+    // catches up. The caller owns this mapping exclusively; live cache owners
+    // and escaped/pinned views cannot enter this path.
+    if ((idle > reserve || bytes > reserve - idle) &&
+        unmap_cache_mapping(buffer)) {
+      release_committed(bytes, Backing::kLive,
+                        ProcessRssBudget::MappingProjection::ForReuse(
+                            bytes, buffer->stamp, buffer->creation));
+      delete buffer;
+      release_committed(sizeof(CacheBuffer));
+    } else {
+      auto &bin = cache_buffer_bins_[(bytes / page_buffer_size()) %
+                                     cache_buffer_bins_.size()];
+      // Publish reusable backing before making its logical capacity available.
+      // A failed physical release keeps both the backing and its charge.
+      std::lock_guard<std::mutex> lock(bin.mutex);
+      buffer->next = bin.head;
+      bin.head = buffer;
+      cache_idle_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    evictable_cache_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    external_used_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    metadata_used_size_.fetch_sub(sizeof(CacheBuffer),
+                                  std::memory_order_relaxed);
+    const size_t previous_used = used_size_.fetch_sub(
+        bytes + sizeof(CacheBuffer), std::memory_order_relaxed);
+    (void)previous_used;
+    assert(previous_used >= bytes + sizeof(CacheBuffer));
   }
-  evictable_cache_size_.fetch_sub(bytes, std::memory_order_relaxed);
-  external_used_size_.fetch_sub(bytes, std::memory_order_relaxed);
-  metadata_used_size_.fetch_sub(sizeof(CacheBuffer), std::memory_order_relaxed);
-  release_buffer(nullptr, bytes + sizeof(CacheBuffer));
+  // Keep allocator-return locks out of the capacity-waiter notification path.
+  { std::lock_guard<std::mutex> lock(capacity_mutex_); }
+  capacity_cv_.notify_one();
   bg_cv_.notify_one();
 }
 
