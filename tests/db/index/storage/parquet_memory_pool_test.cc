@@ -35,6 +35,7 @@
 #include "db/index/storage/chunked_file_writer.h"
 #include "db/index/storage/fetch_memory.h"
 #include "db/index/storage/parquet_writer.h"
+#include "db/index/storage/request_scratch.h"
 #include "db/index/storage/store_helper.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 #if defined(_WIN32)
@@ -282,6 +283,44 @@ TEST_F(ParquetBudgetTest, RefusedSmallSlotDoesNotRetainBackingOrLoseCapacity) {
   first.reset();
   EXPECT_EQ(0u, pool.charged_bytes());
   EXPECT_EQ(0u, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, ScratchOverflowStillRequiresSharedQuota) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  const size_t remaining = native.capacity() - native.used();
+  ASSERT_TRUE(native.try_charge_external(remaining));
+  {
+    auto restore =
+        ailego::ScopeGuard::Make([&] { native.release_external(remaining); });
+    RequestScratchArray<int, 16> inline_values(16);
+    inline_values[15] = 42;
+    EXPECT_EQ(42, inline_values[15]);
+    EXPECT_THROW((RequestScratchArray<int, 16>(17)), std::bad_alloc);
+    EXPECT_EQ(native.capacity(), native.used());
+  }
+  {
+    RequestScratchArray<int, 16> large(128);
+    EXPECT_GT(native.external_used(), 0u);
+    large[127] = 37;
+    EXPECT_EQ(37, large[127]);
+  }
+  EXPECT_EQ(0u, native.external_used());
+}
+
+TEST_F(ParquetBudgetTest, ScratchReleasesOwnedPinsOnEarlyExit) {
+  for (size_t count : {2u, 17u}) {
+    auto owner = std::make_shared<int>(42);
+    std::weak_ptr<int> weak = owner;
+    auto read = [&] {
+      RequestScratchArray<std::shared_ptr<int>, 2> pins(count);
+      pins[0] = std::move(owner);
+      EXPECT_FALSE(weak.expired());
+      return false;  // Same lifetime boundary as a failed cache lookup.
+    };
+    EXPECT_FALSE(read());
+    EXPECT_TRUE(weak.expired());
+    EXPECT_EQ(0u, budget_.external_used());
+  }
 }
 
 TEST_F(ParquetBudgetTest, QueryAndCachePoolsShareTheirLifetimeOwner) {

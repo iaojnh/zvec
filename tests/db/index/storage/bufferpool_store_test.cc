@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <ailego/pattern/scope_guard.h>
 #include <arrow/api.h>
 #include <arrow/io/file.h>
 #include <arrow/result.h>
@@ -1017,6 +1018,48 @@ TEST_F(BufferPoolStoreTest, SelectedRowsPlanRechecksBoundsAfterLayoutChanges) {
   EXPECT_TRUE(invalid.prepare(full).IsIndexError());
 }
 
+TEST_F(BufferPoolStoreTest, SelectedRowsPlanReusesSpilledStorageUnderPressure) {
+  arrow::Int64Builder builder;
+  for (int row = 0; row < 160; ++row) ASSERT_TRUE(builder.Append(row).ok());
+  auto values = builder.Finish().ValueOrDie();
+  detail::SelectedRowsPlan::Rows rows;
+  for (size_t i = 0; i < 128; ++i) rows.emplace_back(i, (i * 37) % 160);
+  detail::SelectedRowsPlan plan(rows);
+  auto chunks = [&](int count) {
+    arrow::ArrayVector result;
+    for (int i = 0; i < count; ++i) {
+      const int begin = i * 160 / count, end = (i + 1) * 160 / count;
+      result.push_back(values->Slice(begin, end - begin));
+    }
+    return arrow::ChunkedArray(std::move(result));
+  };
+  auto check = [&](int count) {
+    auto column = chunks(count);
+    ASSERT_TRUE(plan.prepare(column).ok());
+    size_t visited = 0;
+    ASSERT_TRUE(plan.visit<arrow::Int64Array>(
+        column, [&](const arrow::Int64Array &array, int64_t row, int) {
+          EXPECT_EQ(rows[visited++].second, array.Value(row));
+          return arrow::Status::OK();
+        }).ok());
+    EXPECT_EQ(rows.size(), visited);
+  };
+  check(10);  // Spill both the offsets and selected positions.
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t remaining = pool.capacity() - pool.used();
+  ASSERT_TRUE(pool.try_charge_external(remaining));
+  {
+    auto restore =
+        ailego::ScopeGuard::Make([&] { pool.release_external(remaining); });
+    check(9);
+    check(2);
+    check(1);
+    check(10);
+    EXPECT_THROW(plan.prepare(chunks(12)), std::bad_alloc);
+  }
+  check(12);  // A failed resize must recover with a fresh layout.
+}
+
 TEST_F(BufferPoolStoreTest, SelectedRowsPlanHandlesEmptySelectionsAndColumns) {
   const detail::SelectedRowsPlan::Rows rows;
   detail::SelectedRowsPlan plan(rows);
@@ -1522,6 +1565,75 @@ TEST_F(BufferPoolStoreTest, DirectDocRetainsResultAdmissionAndOwnsFields) {
   store.reset();
   ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
   EXPECT_EQ(doc->get<std::string>("name"), name);
+}
+
+TEST_F(BufferPoolStoreTest, WideDocAndManyGroupFetchKeepBudgetedOverflow) {
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(128 * 1024 * 1024));
+  arrow::UInt64Builder ids;
+  arrow::StringBuilder keys;
+  arrow::Int64Builder numbers;
+  auto items = std::make_shared<arrow::Int64Builder>();
+  arrow::ListBuilder lists(arrow::default_memory_pool(), items);
+  for (int row = 0; row < 12; ++row) {
+    ASSERT_TRUE(ids.Append(100 + row).ok());
+    ASSERT_TRUE(keys.Append("key-" + std::to_string(row)).ok());
+    ASSERT_TRUE(numbers.Append(row * 17).ok());
+    if (row % 3 == 0) {
+      ASSERT_TRUE(lists.AppendNull().ok());
+    } else {
+      ASSERT_TRUE(lists.Append().ok());
+      ASSERT_TRUE(items->Append(row).ok());
+      ASSERT_TRUE(items->AppendNull().ok());
+    }
+  }
+  arrow::FieldVector fields{arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                             arrow::field(USER_ID, arrow::utf8())};
+  arrow::ArrayVector arrays{ids.Finish().ValueOrDie(), keys.Finish().ValueOrDie()};
+  auto numeric = numbers.Finish().ValueOrDie();
+  for (int column = 0; column < 20; ++column) {
+    fields.push_back(arrow::field("c" + std::to_string(column), arrow::int64()));
+    arrays.push_back(numeric);
+  }
+  fields.push_back(arrow::field("items", arrow::list(arrow::int64())));
+  arrays.push_back(lists.Finish().ValueOrDie());
+  auto source = arrow::Table::Make(arrow::schema(fields), arrays);
+  auto output = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*source, arrow::default_memory_pool(),
+                                         output, 1).ok());
+  ASSERT_TRUE(output->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const auto columns = source->ColumnNames();
+  auto doc = store->fetch_doc(columns, source->schema(), 7);
+  ASSERT_NE(doc, nullptr);
+  // Prewarm every row group so the resident gather reaches all spill paths.
+  std::vector<int> selected;
+  for (int row = 0; row < 12; ++row) {
+    ASSERT_NE(store->fetch(columns, row), nullptr);
+  }
+  for (int row = 0; row < 80; ++row) selected.push_back((row * 7) % 12);
+  BufferPoolForwardStore::FetchBlock block;
+  block.store = store.get();
+  for (size_t i = 0; i < selected.size(); ++i)
+    block.rows.emplace_back(i, selected[i]);
+  auto table = BufferPoolForwardStore::fetch_blocks(
+      columns, {block}, selected.size(), detail::GetParquetMemoryPool().get());
+  ASSERT_NE(table, nullptr);
+  ASSERT_TRUE(table->ValidateFull().ok());
+  for (size_t row = 0; row < selected.size(); ++row) {
+    for (int column = 0; column < source->num_columns(); ++column) {
+      auto actual = table->column(column)->GetScalar(row).ValueOrDie();
+      auto expected = source->column(column)->GetScalar(selected[row]).ValueOrDie();
+      EXPECT_TRUE(actual->Equals(*expected));
+    }
+  }
+  table.reset();
+  store.reset();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  EXPECT_EQ(107u, doc->doc_id());
+  EXPECT_EQ("key-7", doc->pk_ref());
+  for (int column = 0; column < 20; ++column)
+    EXPECT_EQ(119, doc->get<int64_t>("c" + std::to_string(column)));
 }
 
 TEST_F(BufferPoolStoreTest, OpenedFileKeysShareIdentityWithoutOwningFile) {
