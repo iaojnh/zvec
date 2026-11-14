@@ -180,10 +180,37 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
 
     // Slice existing chunks and retain their cache pins; concatenation made
     // a second, unbudgeted copy of every decoded row-group column.
+    auto table = arrow::Table::Make(projected_schema_, std::move(columns),
+                                    num_rows_in_rg);
+    // Wide cached row groups benefit from source/filter overlap. Preserve
+    // the existing narrow-scan and bounded cold-decoder batch sizes.
+    // This is a conservative batch-size heuristic, not a quota measurement.
+    // Count at most the threshold without allocating a buffer-deduplication
+    // set outside the managed memory pool.
+    const auto buffer_bytes = [](const auto &self, const arrow::ArrayData &data,
+                                 int64_t limit) -> int64_t {
+      int64_t bytes = 0;
+      for (const auto &buffer : data.buffers) {
+        if (buffer) bytes += std::min(buffer->size(), limit - bytes);
+      }
+      for (const auto &child : data.child_data) {
+        bytes += self(self, *child, limit - bytes);
+      }
+      if (data.dictionary) bytes += self(self, *data.dictionary, limit - bytes);
+      return bytes;
+    };
+    constexpr int64_t kWideBatchBytes = 4 * 1024 * 1024;
+    int64_t bytes = 0;
+    for (const auto &column : table->columns()) {
+      for (const auto &chunk : column->chunks()) {
+        bytes +=
+            buffer_bytes(buffer_bytes, *chunk->data(), kWideBatchBytes - bytes);
+      }
+    }
+    const bool wide = bytes >= kWideBatchBytes;
     cached_batches_ =
-        std::make_unique<arrow::TableBatchReader>(arrow::Table::Make(
-            projected_schema_, std::move(columns), num_rows_in_rg));
-    cached_batches_->set_chunksize(8192);
+        std::make_unique<arrow::TableBatchReader>(std::move(table));
+    cached_batches_->set_chunksize(wide ? 4096 : 8192);
     current_row_group_++;
   }
 } catch (const std::bad_alloc &) {

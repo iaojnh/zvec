@@ -2949,3 +2949,46 @@ TEST_F(BufferPoolStoreTest, OpenedFileKeysShareIdentityWithoutOwningFile) {
   first.reset();
   EXPECT_TRUE(lifetime.expired());
 }
+
+TEST_F(BufferPoolStoreTest, CachedLargeRowGroupKeepsScanSlicesAlive) {
+  arrow::StringBuilder values;
+  for (int row = 0; row < 10003; ++row) {
+    ASSERT_TRUE((row % 7 == 0 ? values.AppendNull()
+                              : values.Append(std::string(512, 'x') +
+                                              std::to_string(row)))
+                    .ok());
+  }
+  auto array = values.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::utf8())}), {array});
+  auto out = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*source, arrow::default_memory_pool(),
+                                         out, 10003)
+                  .ok());
+  ASSERT_TRUE(out->Close().ok());
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  {
+    auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+    ASSERT_TRUE(store->open().ok());
+    // Budgeted scans reuse resident columns; cold scans deliberately stream
+    // without admitting a whole row group into the point-read cache.
+    ASSERT_NE(store->fetch({"value"}, 1), nullptr);
+    auto reader = store->scan({"value"});
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ASSERT_TRUE(reader->ReadNext(&batch).ok());
+      if (!batch) break;
+      ASSERT_GT(batch->num_rows(), 0);
+      EXPECT_LE(batch->num_rows(), 4096);
+      batches.push_back(std::move(batch));
+    }
+    ASSERT_TRUE(reader->ReadNext(&batch).ok());
+    EXPECT_EQ(batch, nullptr);
+  }
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  // Budgeted decoding may already split a row group into finer chunks.
+  ASSERT_GE(batches.size(), 3u);
+  auto actual = arrow::Table::FromRecordBatches(batches).ValueOrDie();
+  EXPECT_TRUE(actual->Equals(*source));
+}

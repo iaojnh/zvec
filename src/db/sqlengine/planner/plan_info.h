@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 #include <arrow/acero/api.h>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/util/async_generator.h>
@@ -61,6 +62,8 @@ class PlanInfo {
 
   Result<std::unique_ptr<arrow::RecordBatchReader>> execute_to_reader(
       size_t max_queued_bytes = 0);
+
+  Status project(const std::vector<std::string> &columns);
 
   std::shared_ptr<arrow::Schema> schema() const {
     return schema_;

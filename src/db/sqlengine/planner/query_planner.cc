@@ -372,6 +372,21 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
       (segments.size() > 1 || has_group_by) && (has_vector || has_fts);
   auto output_query_info = (*query_infos)[0];
 
+  // Segment-local optimization may add columns used only by that segment's
+  // filter. Keep the merge schema independent of those temporary columns.
+  std::vector<std::string> output_columns;
+  // Rank-only topK plans already expose the same row-id/score schema and
+  // fetch projected fields after the global merge.
+  if (!has_vector && !merge_topk && segments.size() > 1) {
+    output_columns = query_info->get_all_fetched_scalar_field_names();
+    if (!has_fts && query_info->is_include_vector()) {
+      for (const auto &field : query_info->selected_vector_fields()) {
+        output_columns.push_back(field.field_name);
+      }
+    }
+    if (has_fts) output_columns.push_back(FIELD_SCORE);
+  }
+
   // optimize plan by instrument query info condition, eg adjust invert cond
   Optimizer::Ptr optimizer =
       InvertCondOptimizer::CreateInvertCondOptimizer(schema_);
@@ -438,6 +453,10 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     }
     if (segments.size() == 1 && !merge_topk) {
       return seg_plan;
+    }
+    if (!has_vector && !merge_topk) {
+      auto status = seg_plan.value()->project(output_columns);
+      if (!status.ok()) return tl::make_unexpected(status);
     }
     segment_plans[idx] = std::move(seg_plan.value());
   }
