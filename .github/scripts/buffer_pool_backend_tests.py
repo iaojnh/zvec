@@ -50,6 +50,7 @@ NATIVE_TARGETS = (
     "turbo_pq_training_samples_test",
     "pq_buffered_training_test",
     "bufferpool_store_test",
+    "bufferpool_point_read_test",
     "parquet_memory_pool_test",
     "ivf_buffered_build_test",
     "opt_kmeans_cluster_test",
