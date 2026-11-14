@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <tuple>
 #include <ailego/pattern/scope_guard.h>
@@ -9,6 +10,8 @@
 #include <zvec/core/framework/index_framework.h>
 #include "diskann_holder.h"
 #include "diskann_params.h"
+#include "diskann_searcher_entity.h"
+#include "diskann_util.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
@@ -71,6 +74,40 @@ TEST_P(DiskAnnFilteredBeamTest, DeletedCopiesLeaveRoomForTheLiveVector) {
   ASSERT_EQ(0, dumper->close());
   builder.reset();
   holder.reset();
+
+  // Duplicate vectors can form a disconnected component in an approximate
+  // graph. This is a traversal regression, so explicitly route every possible
+  // entrypoint through a chain longer than the beam to the eligible duplicate.
+  uint64_t vector_offset;
+  uint32_t node_size, nodes_per_sector;
+  {
+    auto source = IndexFactory::CreateStorage("FileReadStorage");
+    ASSERT_NE(nullptr, source);
+    ASSERT_EQ(0, source->open(path, false));
+    DiskAnnSearcherEntity entity;
+    ASSERT_EQ(0, entity.load(meta, source));
+    vector_offset = entity.get_vector_segment()->data_offset();
+    node_size = static_cast<uint32_t>(entity.max_node_size());
+    nodes_per_sector = static_cast<uint32_t>(entity.node_per_sector());
+    ASSERT_GT(nodes_per_sector, 0u);
+    for (auto entry : entity.entrypoints()) ASSERT_NE(target, entry);
+  }
+  {
+    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    for (uint32_t id = 0; id < count; ++id) {
+      const uint64_t sector = DiskAnnUtil::get_node_sector(
+          nodes_per_sector, node_size, DiskAnnUtil::kSectorSize, id);
+      const uint64_t offset =
+          vector_offset + sector * DiskAnnUtil::kSectorSize +
+          (id % nodes_per_sector) * node_size + meta.element_size();
+      const uint32_t links[] = {
+          1, id < count - copies || id == target ? count - copies : id + 1};
+      file.seekp(static_cast<std::streamoff>(offset));
+      file.write(reinterpret_cast<const char *>(links), sizeof(links));
+      ASSERT_TRUE(file.good());
+    }
+  }
 
   auto searcher = IndexFactory::CreateSearcher("DiskAnnSearcher");
   ASSERT_NE(searcher, nullptr);

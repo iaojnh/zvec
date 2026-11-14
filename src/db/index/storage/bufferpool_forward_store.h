@@ -23,6 +23,7 @@
 #include <arrow/ipc/reader.h>
 #include <arrow/util/async_generator.h>
 #include <parquet/arrow/reader.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/db/status.h>
 #include "base_forward_store.h"
 #include "parquet_buffer_pool.h"
@@ -54,6 +55,16 @@ class BufferPoolForwardStore
   /// \return A table containing the requested data or nullptr on failure
   TablePtr fetch(const std::vector<std::string> &columns,
                  const std::vector<int> &indices) override;
+
+  struct FetchBlock {
+    BufferPoolForwardStore *store;
+    ailego::BudgetedVector<std::pair<int, int>> rows;
+  };
+  // Resident source columns only. Output buffers use the caller's workspace;
+  // allocation refusal selects the normal bounded-copy fallback.
+  static TablePtr fetch_blocks(const std::vector<std::string> &columns,
+                               const std::vector<FetchBlock> &blocks,
+                               int row_count, arrow::MemoryPool *pool);
 
   TablePtr fetch(const std::vector<std::string> &columns,
                  const std::vector<int> &indices, arrow::MemoryPool *pool);

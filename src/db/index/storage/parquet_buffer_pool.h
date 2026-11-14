@@ -63,6 +63,11 @@ struct ParquetBufferID {
   ParquetBufferID(const std::string &filename, int column, int row_group,
                   const ParquetBufferID &metadata_source);
 
+  // Reuse the admitted filename owner, but refresh the opened file's identity.
+  // Path replacements must keep reading the original descriptor, while writes
+  // to that descriptor must not reuse a decoded column from an older version.
+  ParquetBufferID for_column(int column, int row_group) const;
+
   std::string_view filename() const noexcept {
     return filename_ ? std::string_view(filename_->data(), filename_->size())
                      : std::string_view("");

@@ -93,6 +93,15 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
 
   ~ParquetRecordBatchReader() override;
 
+  ParquetRecordBatchReader(const std::vector<std::string> &columns,
+                           std::shared_ptr<arrow::Schema> schema,
+                           const std::string &file_path,
+                           std::shared_ptr<arrow::MemoryPool> memory_pool,
+                           std::shared_ptr<arrow::io::RandomAccessFile> input,
+                           std::shared_ptr<parquet::FileMetaData> metadata,
+                           ParquetBufferID metadata_id,
+                           const std::vector<int64_t> &row_group_rows);
+
   std::shared_ptr<arrow::Schema> schema() const override {
     return projected_schema_;
   }
@@ -105,9 +114,14 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
 
   arrow::Status read_next_uncached(std::shared_ptr<arrow::RecordBatch> *batch);
 
+  void project_columns();
+  arrow::Status ensure_reader();
+
   // FileReader must outlive the batch reader (members are destroyed in reverse
   // order). The reader and its file remain alive even if the store is closed.
   std::shared_ptr<arrow::MemoryPool> memory_pool_;
+  std::shared_ptr<arrow::io::RandomAccessFile> input_;
+  std::shared_ptr<parquet::FileMetaData> metadata_;
   std::unique_ptr<parquet::arrow::FileReader> reader_;
   std::unique_ptr<arrow::RecordBatchReader> row_group_reader_;
   std::unique_ptr<arrow::TableBatchReader> cached_batches_;
