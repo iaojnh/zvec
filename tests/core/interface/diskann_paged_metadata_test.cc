@@ -17,11 +17,13 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <gtest/gtest.h>
 #if DISKANN_SUPPORTED
 #include "algorithm/diskann/diskann_dist_calculator.h"
 #include "algorithm/diskann/diskann_searcher_entity.h"
 #include "algorithm/diskann/diskann_util.h"
+#include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
 namespace {
@@ -79,9 +81,11 @@ class ObservedStorage : public IndexStorage {
       const std::string path = "diskann_paged_metadata_marker";
       {
         std::ofstream file(path, std::ios::binary);
-        file << std::string(4096, '\0');
+        file << std::string(ailego::kVectorPageSize, '\0');
       }
       pool_ = std::make_shared<ailego::VecBufferPool>(path);
+      if (pool_->init() != 0)
+        throw std::runtime_error("Failed to initialize observed page pool");
     }
   }
   ~ObservedStorage() override {
@@ -136,6 +140,7 @@ class ObservedStorage : public IndexStorage {
 };
 
 TEST(DiskAnnPagedMetadataTest, LazyReadsCloneLifetimeAndIoErrors) {
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(1UL << 20));
   constexpr size_t kDim = 8;
   constexpr uint32_t kChunks = 2;
   IndexMeta meta(IndexMeta::DT_FP32, kDim);

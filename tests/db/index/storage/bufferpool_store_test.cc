@@ -33,18 +33,17 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/external_cache.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
-#define private public
-#include "db/index/storage/parquet_buffer_pool.h"
-#undef private
 #include "db/common/query_result_memory.h"
 #include "db/index/storage/bufferpool_forward_store.h"
 #include "db/index/storage/fetch_memory.h"
 #include "db/index/storage/lazy_record_batch_reader.h"
+#include "db/index/storage/parquet_buffer_pool.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #include "db/index/storage/parquet_metadata_budget.h"
 #include "db/index/storage/selected_rows_plan.h"
 #include "db/index/storage/store_helper.h"
 #include "utils/utils.h"
+#include "parquet_buffer_pool_test_peer.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
 #include "../../common/memory_budget_test_helper.h"
 
@@ -52,10 +51,7 @@ using namespace zvec;
 
 namespace {
 size_t ParquetCacheEntryCount() {
-  size_t count = 0;
-  for (auto &shard : ParquetBufferPool::get_instance().caches_)
-    count += shard.cache.entry_count();
-  return count;
+  return ParquetBufferPoolTestPeer::entry_count();
 }
 }  // namespace
 
@@ -197,6 +193,87 @@ class BufferPoolStoreTest : public testing::Test {
   }
   std::string parquet_path;
 };
+
+TEST_F(BufferPoolStoreTest, PointFetchStreamsWhenWholeColumnCannotFit) {
+  constexpr int rows = 8192;
+  const auto value = [](int row) {
+    return std::to_string(row) + std::string(2048, 'x');
+  };
+  {
+    arrow::StringBuilder strings;
+    arrow::Int64Builder numbers;
+    arrow::UInt64Builder doc_ids;
+    arrow::StringBuilder user_ids;
+    for (int row = 0; row < rows; ++row) {
+      ASSERT_TRUE(
+          (row % 11 ? strings.Append(value(row)) : strings.AppendNull()).ok());
+      ASSERT_TRUE(numbers.Append(row * 3).ok());
+      ASSERT_TRUE(doc_ids.Append(row).ok());
+      ASSERT_TRUE(user_ids.Append(std::to_string(row)).ok());
+    }
+    auto text = strings.Finish();
+    auto numeric = numbers.Finish();
+    auto doc_id = doc_ids.Finish();
+    auto user_id = user_ids.Finish();
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(numeric.ok());
+    ASSERT_TRUE(doc_id.ok());
+    ASSERT_TRUE(user_id.ok());
+    auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("wide", arrow::utf8()),
+                       arrow::field("number", arrow::int64()),
+                       arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                       arrow::field(USER_ID, arrow::utf8())}),
+        {*text, *numeric, *doc_id, *user_id});
+    auto output = arrow::io::FileOutputStream::Open(parquet_path);
+    ASSERT_TRUE(output.ok());
+    parquet::WriterProperties::Builder properties;
+    properties.disable_dictionary();
+    properties.data_pagesize(64 * 1024);
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
+                                           *output, rows, properties.build())
+                    .ok());
+    ASSERT_TRUE((*output)->Close().ok());
+  }
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> doc_columns{GLOBAL_DOC_ID, USER_ID, "wide"};
+  auto doc_schema = arrow::schema({arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                                   arrow::field(USER_ID, arrow::utf8()),
+                                   arrow::field("wide", arrow::utf8())});
+  // An optional all-column pin must yield instead of aborting a scalar read.
+  EXPECT_EQ(nullptr, store->fetch_doc(doc_columns, doc_schema, rows - 1));
+  auto single = store->fetch(doc_columns, rows - 1);
+  ASSERT_NE(nullptr, single);
+  ASSERT_EQ(3u, single->values.size());
+  EXPECT_EQ(value(rows - 1), single->values[2].scalar()->ToString());
+  // The decoded string column is larger than the fixture's 10 MiB pool.
+  // Preserve unsorted requests, duplicates, nulls and cross-column ordering.
+  const std::vector<int> selected{8191, 0, 4095, 4095, 256, 7000};
+  auto result = store->fetch_checked({"wide", "number"}, selected,
+                                     detail::GetParquetMemoryPool().get());
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(selected.size(), static_cast<size_t>((*result)->num_rows()));
+  for (size_t i = 0; i < selected.size(); ++i) {
+    auto text = (*result)->column(0)->GetScalar(i);
+    auto number = (*result)->column(1)->GetScalar(i);
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(number.ok());
+    EXPECT_EQ(selected[i] % 11 != 0, (*text)->is_valid);
+    if ((*text)->is_valid) EXPECT_EQ(value(selected[i]), (*text)->ToString());
+    EXPECT_EQ(selected[i] * 3,
+              std::static_pointer_cast<arrow::Int64Scalar>(*number)->value);
+  }
+  std::vector<int> all_rows(rows);
+  for (int row = 0; row < rows; ++row) all_rows[row] = row;
+  auto too_large = store->fetch_checked({"wide"}, all_rows,
+                                        detail::GetParquetMemoryPool().get());
+  ASSERT_FALSE(too_large.ok());
+  EXPECT_TRUE(too_large.status().IsOutOfMemory());
+  store.reset();
+  EXPECT_EQ(value(selected[0]),
+            (*result)->column(0)->GetScalar(0).ValueOrDie()->ToString());
+}
 
 TEST_F(BufferPoolStoreTest, PathAndOpenedFileUseTheSameCacheIdentity) {
   auto file = arrow::io::ReadableFile::Open(parquet_path);
@@ -1826,7 +1903,7 @@ class BufferPoolScalarFetchTest : public testing::Test {
 
   void warm_and_rechunk(int column, int row_group) {
     ParquetBufferID key(parquet_path_, column, row_group);
-    auto &cache = ParquetBufferPool::get_instance().cache_for(key);
+    auto &cache = ParquetBufferPoolTestPeer::cache_for(key);
     auto data = cache.acquire(key);
     ASSERT_NE(nullptr, data);
     ParquetBufferContextHandle pin(key, data);
@@ -1937,7 +2014,7 @@ TEST_F(BufferPoolScalarFetchTest, InvalidCachedColumnReturnsNull) {
   BufferPoolForwardStore store(parquet_path_);
   ASSERT_TRUE(store.open().ok());
   ParquetBufferID key(parquet_path_, /*column=*/0, /*row_group=*/0);
-  auto data = ParquetBufferPool::get_instance().cache_for(key).acquire(key);
+  auto data = ParquetBufferPoolTestPeer::cache_for(key).acquire(key);
   ASSERT_NE(nullptr, data);
   ParquetBufferContextHandle pin(key, data);
   auto original = data->Slice(0, data->length());

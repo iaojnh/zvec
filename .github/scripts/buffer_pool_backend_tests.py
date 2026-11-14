@@ -39,6 +39,7 @@ NATIVE_TARGETS = (
     "diskann_builder_entity_buffer_test",
     "diskann_filtered_beam_test",
     "diskann_pq_priority_test",
+    "diskann_paged_metadata_test",
     "diskann_resident_pq_batch_test",
     "index_build_admission_test",
     "c_api_memory_budget_test",
