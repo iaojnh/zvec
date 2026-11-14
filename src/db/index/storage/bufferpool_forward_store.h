@@ -29,6 +29,8 @@
 
 namespace zvec {
 
+class Doc;
+
 /// BufferPoolForwardStore implements a forward store that uses a buffer pool
 /// to efficiently manage data access from parquet files.
 class BufferPoolForwardStore
@@ -67,6 +69,12 @@ class BufferPoolForwardStore
   /// \return An ExecBatch containing the requested data or nullptr on failure
   ExecBatchPtr fetch(const std::vector<std::string> &columns,
                      int index) override;
+
+  // Supported scalar and array fields are copied into an admitted Doc.
+  // Unsupported schemas retain the ordinary Arrow materialization path.
+  std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
+                                 const std::shared_ptr<arrow::Schema> &schema,
+                                 int index);
 
   /// Scan specified columns from the data source
   /// \param columns The list of column names to scan

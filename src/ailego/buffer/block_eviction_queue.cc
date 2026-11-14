@@ -449,6 +449,27 @@ struct MemoryLimitPool::ReclaimableSlab {
   ProcessRssBudget::MaterializationStamp header_projection{};
 };
 
+struct MemoryLimitPool::RetainedBlock {
+  RetainedBlock *next{nullptr};
+  // Mappings are page aligned/sized; the otherwise unused low bit records
+  // the logical owner without growing the existing 64-byte prefix.
+  size_t size_and_metadata;
+  ProcessRssBudget::MaterializationStamp projection;
+  ProcessRssBudget::MaterializationStamp creation;
+  RetainedBlock *mapped_prev{nullptr};
+  RetainedBlock *mapped_next{nullptr};
+
+  RetainedBlock(size_t bytes, bool metadata,
+                ProcessRssBudget::MaterializationStamp stamp)
+      : size_and_metadata(bytes | size_t{metadata}),
+        projection(stamp), creation(stamp) {}
+  size_t bytes() const { return size_and_metadata & ~size_t{1}; }
+  bool metadata() const { return (size_and_metadata & 1) != 0; }
+  void set_metadata(bool metadata) {
+    size_and_metadata = bytes() | size_t{metadata};
+  }
+};
+
 ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
 #if (defined(__linux__) && !defined(__ANDROID__)) || \
     (defined(__APPLE__) && TARGET_OS_OSX)
@@ -480,6 +501,11 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
     return {MemoryHelper::SelfRSS(), 0};
   auto unlock_cache = ScopeGuard::Make([&] {
     ::pthread_mutex_unlock(pool.cache_mapping_mutex_.native_handle());
+  });
+  if (::pthread_mutex_trylock(pool.retained_mutex_.native_handle()) != 0)
+    return {MemoryHelper::SelfRSS(), 0};
+  auto unlock_retained = ScopeGuard::Make([&] {
+    ::pthread_mutex_unlock(pool.retained_mutex_.native_handle());
   });
 
   // The kernel page size also remains correct in logical-page-size tests.
@@ -595,6 +621,23 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
       begin += count * native_page;
     }
   }
+  for (auto *block = pool.retained_mappings_; block;
+       block = block->mapped_next) {
+    uintptr_t begin = reinterpret_cast<uintptr_t>(block);
+    const size_t bytes = block->bytes();
+    if (begin % native_page || bytes % native_page ||
+        bytes > std::numeric_limits<uintptr_t>::max() - begin)
+      return {MemoryHelper::SelfRSS(), 0};
+    const uintptr_t end = begin + bytes;
+    while (begin < end) {
+      const size_t count =
+          std::min<size_t>((end - begin) / native_page, entries.size());
+      if (!read_entries(begin, count)) return {MemoryHelper::SelfRSS(), 0};
+      for (size_t i = 0; i < count; ++i)
+        if (private_present(i)) resident += native_page;
+      begin += count * native_page;
+    }
+  }
   const size_t rss = MemoryHelper::SelfRSS();
   if (!rss) return {};
   // Be conservative if unrelated process memory retired during this read.
@@ -606,7 +649,8 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
 }
 
 ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sample() {
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
   // Copy addresses and charged-page masks under short mapping locks. Native
   // queries use values only, never descriptors that an allocator may retire.
   // The budget token separately removes all retirement/cancellation credit.
@@ -618,11 +662,20 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
     return {MemoryHelper::SelfRSS(), 0};
   const size_t before = MemoryHelper::SelfRSS();
   if (!before) return {};
+#if defined(__linux__)
+  const int fd = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return {MemoryHelper::SelfRSS(), 0};
+  auto close = ScopeGuard::Make([&] { ::close(fd); });
+  std::array<uint64_t, kSlabBytes / kMinimumPageBytes> entries;
+  constexpr uint64_t present = (uint64_t{1} << 63) | (uint64_t{1} << 56);
+  constexpr uint64_t excluded = 0;
+#else
   std::array<int, kSlabBytes / kMinimumPageBytes> entries;
   constexpr int present = VM_PAGE_QUERY_PAGE_PRESENT | VM_PAGE_QUERY_PAGE_DIRTY;
   constexpr int excluded = VM_PAGE_QUERY_PAGE_EXTERNAL |
       VM_PAGE_QUERY_PAGE_PAGED_OUT | VM_PAGE_QUERY_PAGE_FICTITIOUS |
       VM_PAGE_QUERY_PAGE_REUSABLE;
+#endif
   const auto read_range = [&](uintptr_t address, size_t bytes,
                               const std::array<bool, kMaxSlabDataPages + 1> *charged,
                               size_t logical_page) {
@@ -631,10 +684,27 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
     size_t resident = 0;
     for (size_t offset = 0; offset < bytes;) {
       const size_t count = std::min((bytes - offset) / page, entries.size());
+#if defined(__linux__)
+      const uintptr_t index = (address + offset) / page;
+      if (index > static_cast<uintptr_t>(std::numeric_limits<off_t>::max()) /
+                      sizeof(uint64_t)) return size_t{0};
+      const off_t position = static_cast<off_t>(index * sizeof(uint64_t));
+      const size_t requested = count * sizeof(uint64_t);
+      size_t done = 0;
+      while (done < requested) {
+        const ssize_t got = ::pread(fd,
+            reinterpret_cast<char *>(entries.data()) + done,
+            requested - done, position + static_cast<off_t>(done));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return size_t{0};
+        done += static_cast<size_t>(got);
+      }
+#else
       mach_vm_size_t returned = count;
       if (::mach_vm_page_range_query(::mach_task_self(), address + offset,
               count * page, reinterpret_cast<mach_vm_address_t>(entries.data()),
               &returned) != KERN_SUCCESS || returned != count) return size_t{0};
+#endif
       for (size_t i = 0; i < count; ++i)
         if ((!charged || (*charged)[(offset + i * page) / logical_page]) &&
             (entries[i] & present) == present && !(entries[i] & excluded))
@@ -648,8 +718,8 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
   size_t slabs_left = 0;
   {
     std::unique_lock<std::mutex> lock(pool.slab_mutex_, std::try_to_lock);
-    if (!lock) return {MemoryHelper::SelfRSS(), 0};
-    for (auto *slab = pool.slabs_; slab; slab = slab->next) ++slabs_left;
+    if (lock)
+      for (auto *slab = pool.slabs_; slab; slab = slab->next) ++slabs_left;
   }
   while (slabs_left-- != 0) {
     uintptr_t address = 0;
@@ -657,7 +727,10 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
     std::array<bool, kMaxSlabDataPages + 1> charged{};
     {
       std::unique_lock<std::mutex> lock(pool.slab_mutex_, std::try_to_lock);
-      if (!lock) return {MemoryHelper::SelfRSS(), 0};
+      // Keep the independent ranges already witnessed. A busy allocator
+      // makes the remaining range unknown; it does not invalidate earlier
+      // proof. Publication still subtracts all concurrent retirements.
+      if (!lock) break;
       ReclaimableSlab *next = nullptr;
       for (auto *slab = pool.slabs_; slab; slab = slab->next) {
         const auto base = reinterpret_cast<uintptr_t>(slab);
@@ -666,8 +739,13 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
       }
       if (!next) break;
       std::unique_lock<std::mutex> slab_lock(next->mutex, std::try_to_lock);
-      if (!slab_lock) return {MemoryHelper::SelfRSS(), 0};
       address = reinterpret_cast<uintptr_t>(next);
+      if (!slab_lock) {
+        if (address > std::numeric_limits<uintptr_t>::max() - kSlabBytes)
+          return {MemoryHelper::SelfRSS(), 0};
+        cursor = address + kSlabBytes;
+        continue;
+      }
       logical_page = next->page_size;
       if (logical_page < page || logical_page % page ||
           address > std::numeric_limits<uintptr_t>::max() - kSlabBytes)
@@ -689,15 +767,15 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
   size_t mappings_left = 0;
   {
     std::unique_lock<std::mutex> lock(pool.cache_mapping_mutex_, std::try_to_lock);
-    if (!lock) return {MemoryHelper::SelfRSS(), 0};
-    for (auto *mapping = pool.cache_mappings_; mapping;
-         mapping = mapping->mapped_next) ++mappings_left;
+    if (lock)
+      for (auto *mapping = pool.cache_mappings_; mapping;
+           mapping = mapping->mapped_next) ++mappings_left;
   }
   while (mappings_left != 0) {
     size_t count = 0;
     {
       std::unique_lock<std::mutex> lock(pool.cache_mapping_mutex_, std::try_to_lock);
-      if (!lock) return {MemoryHelper::SelfRSS(), 0};
+      if (!lock) break;
       auto *mapping = pool.cache_mappings_;
       while (mapping && reinterpret_cast<uintptr_t>(mapping->data) < cursor)
         mapping = mapping->mapped_next;
@@ -718,6 +796,43 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
     for (size_t i = 0; i < count; ++i)
       resident += read_range(ranges[i].address, ranges[i].bytes, nullptr, page);
   }
+  // Retained metadata/workspace arrays use separate anonymous mappings.
+  // Snapshot their charged ranges too; counting only page slabs and cache
+  // chunks loses the stable metadata overlap after page-cache churn.
+  cursor = 0;
+  size_t retained_left = 0;
+  {
+    std::unique_lock<std::mutex> lock(pool.retained_mutex_, std::try_to_lock);
+    if (lock)
+      for (auto *block = pool.retained_mappings_; block;
+           block = block->mapped_next) ++retained_left;
+  }
+  while (retained_left != 0) {
+    size_t count = 0;
+    {
+      std::unique_lock<std::mutex> lock(pool.retained_mutex_, std::try_to_lock);
+      if (!lock) break;
+      auto *block = pool.retained_mappings_;
+      while (block && reinterpret_cast<uintptr_t>(block) < cursor)
+        block = block->mapped_next;
+      for (size_t copied = 0;
+           block && retained_left && copied < ranges.size();
+           ++copied, --retained_left) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(block);
+        const size_t bytes = block->bytes();
+        if (bytes > std::numeric_limits<uintptr_t>::max() - address)
+          return {MemoryHelper::SelfRSS(), 0};
+        if (count && ranges[count - 1].address + ranges[count - 1].bytes == address)
+          ranges[count - 1].bytes += bytes;
+        else ranges[count++] = {address, bytes};
+        cursor = address + bytes;
+        block = block->mapped_next;
+      }
+    }
+    if (!count) break;
+    for (size_t i = 0; i < count; ++i)
+      resident += read_range(ranges[i].address, ranges[i].bytes, nullptr, page);
+  }
   const size_t rss = MemoryHelper::SelfRSS();
   if (!rss) return {};
   if (rss < before) resident -= std::min(resident, before - rss);
@@ -727,13 +842,36 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
 #endif
 }
 
-struct MemoryLimitPool::RetainedBlock {
-  RetainedBlock *next{nullptr};
-  size_t bytes{0};
-  bool metadata{false};
-  ProcessRssBudget::MaterializationStamp projection{};
-  ProcessRssBudget::MaterializationStamp creation{};
-};
+void MemoryLimitPool::register_retained_mapping(RetainedBlock *block) {
+  std::lock_guard<std::mutex> lock(retained_mutex_);
+  auto *next = retained_mappings_;
+  RetainedBlock *previous = nullptr;
+  const uintptr_t address = reinterpret_cast<uintptr_t>(block);
+  while (next && reinterpret_cast<uintptr_t>(next) < address) {
+    previous = next;
+    next = next->mapped_next;
+  }
+  block->mapped_prev = previous;
+  block->mapped_next = next;
+  if (previous) previous->mapped_next = block;
+  else retained_mappings_ = block;
+  if (next) next->mapped_prev = block;
+}
+
+bool MemoryLimitPool::unmap_retained_mapping(RetainedBlock *block) {
+  auto *previous = block->mapped_prev;
+  auto *next = block->mapped_next;
+#if defined(_WIN32)
+  const bool unmapped = ::VirtualFree(block, 0, MEM_RELEASE) != 0;
+#else
+  const bool unmapped = ::munmap(block, block->bytes()) == 0;
+#endif
+  if (!unmapped) return false;
+  if (previous) previous->mapped_next = next;
+  else retained_mappings_ = next;
+  if (next) next->mapped_prev = previous;
+  return true;
+}
 
 size_t MemoryLimitPool::retained_block_size(size_t bytes) {
   const size_t page = page_buffer_size();
@@ -755,7 +893,7 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     std::lock_guard<std::mutex> lock(retained_mutex_);
     for (auto **link = &retained_free_; *link; link = &(*link)->next) {
       auto *block = *link;
-      if (block->bytes != charge) continue;
+      if (block->bytes() != charge) continue;
       // An idle mapping can contain pages that were never faulted in or were
       // reclaimed by the OS. Assigning a new owner can make them resident.
       // Backing is already charged, but a pending page may own the logical
@@ -767,7 +905,7 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
       }
       *link = block->next;
       block->next = nullptr;
-      block->metadata = metadata;
+      block->set_metadata(metadata);
       retained_idle_bytes_.fetch_sub(charge, std::memory_order_relaxed);
       counter->fetch_add(charge, std::memory_order_relaxed);
       retained_block_reuses_.fetch_add(1, std::memory_order_relaxed);
@@ -790,16 +928,16 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     return nullptr;
   }
   const auto projection = process_rss_.finish_reservation(charge, true);
-  auto *block = new (raw)
-      RetainedBlock{nullptr, charge, metadata, projection, projection};
+  auto *block = new (raw) RetainedBlock(charge, metadata, projection);
   retained_block_bytes_.fetch_add(charge, std::memory_order_relaxed);
+  register_retained_mapping(block);
   return reinterpret_cast<char *>(block) + kRetainedBlockHeaderBytes;
 }
 
 bool MemoryLimitPool::try_materialize_retained_block(void *data) {
   auto *block = reinterpret_cast<RetainedBlock *>(static_cast<char *>(data) -
                                                   kRetainedBlockHeaderBytes);
-  return process_rss_.try_materialize_reusable(block->bytes, block->projection);
+  return process_rss_.try_materialize_reusable(block->bytes(), block->projection);
 }
 
 void MemoryLimitPool::release_retained_block(void *data) {
@@ -808,11 +946,11 @@ void MemoryLimitPool::release_retained_block(void *data) {
                                                   kRetainedBlockHeaderBytes);
   {
     std::lock_guard<std::mutex> lock(retained_mutex_);
-    const size_t bytes = block->bytes;
+    const size_t bytes = block->bytes();
     const auto projection = ProcessRssBudget::MappingProjection::ForReuse(
         bytes, block->projection, block->creation);
     auto *counter =
-        block->metadata ? &metadata_used_size_ : &external_used_size_;
+        block->metadata() ? &metadata_used_size_ : &external_used_size_;
     // Retained mappings share the idle reserve with free data pages. Returning
     // a burst of Arrow chunks must not leave excess backing resident until
     // paced background maintenance catches up. The owner has relinquished
@@ -824,11 +962,7 @@ void MemoryLimitPool::release_retained_block(void *data) {
         process_rss_.pressure() ? 0 : reserve_margin(capacity());
     bool unmapped = false;
     if (idle > reserve || bytes > reserve - idle) {
-#if defined(_WIN32)
-      unmapped = ::VirtualFree(block, 0, MEM_RELEASE) != 0;
-#else
-      unmapped = ::munmap(block, bytes) == 0;
-#endif
+      unmapped = unmap_retained_mapping(block);
     }
     if (unmapped) {
       retained_block_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
@@ -853,14 +987,10 @@ size_t MemoryLimitPool::trim_retained_blocks(size_t bytes_needed) {
   while (retained_free_ && released < bytes_needed) {
     auto *block = retained_free_;
     auto *next = block->next;
-    const size_t bytes = block->bytes;
+    const size_t bytes = block->bytes();
     const auto projection = ProcessRssBudget::MappingProjection::ForReuse(
         bytes, block->projection, block->creation);
-#if defined(_WIN32)
-    const bool unmapped = ::VirtualFree(block, 0, MEM_RELEASE) != 0;
-#else
-    const bool unmapped = ::munmap(block, bytes) == 0;
-#endif
+    const bool unmapped = unmap_retained_mapping(block);
     if (!unmapped) {
       // A failed OS release must not create reusable budget.
       LOG_ERROR("MemoryLimitPool: failed to unmap retained backing block");
@@ -1557,7 +1687,8 @@ bool MemoryLimitPool::configure_process_rss_limit(size_t bytes) {
 bool MemoryLimitPool::configure_process_rss_limit(size_t bytes,
                                                   size_t permanent_backing) {
   auto resident_reader = &MemoryLimitPool::read_slab_resident_sample;
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
   // Foreground budget refreshes remain cheap. The background worker publishes
   // independently validated ownership proofs without holding this mutex.
   resident_reader = +[]() -> ProcessRssBudget::ResidentSample {
@@ -1735,7 +1866,16 @@ void MemoryLimitPool::background_evict_loop() {
   bool idle_progress = false;
   bool reclaim_to_low = false;
   auto last_process_reclaim = std::chrono::steady_clock::time_point{};
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+#if defined(__linux__)
+  // This proves overlap, rather than observing RSS or admitting allocations.
+  // Foreground RSS checks keep their 20 ms cadence; retirement-driven pressure
+  // still requests an immediate proof. Avoid page-table walks on a steady cache.
+  constexpr auto owned_sample_interval = milliseconds(1000);
+#else
+  constexpr auto owned_sample_interval = milliseconds(100);
+#endif
   auto last_owned_sample = std::chrono::steady_clock::time_point{};
   uint64_t confirmed_generation = 0;
   const auto refresh_owned_sample = [&] {
@@ -1744,7 +1884,7 @@ void MemoryLimitPool::background_evict_loop() {
                          generation != confirmed_generation;
     if (process_rss_.limit() &&
         (confirm || std::chrono::steady_clock::now() - last_owned_sample >=
-                        milliseconds(100))) {
+                        owned_sample_interval)) {
       const auto token = process_rss_.begin_resident_sample();
       if (token.configuration) {
         const auto sample = read_background_resident_sample();
@@ -1779,7 +1919,8 @@ void MemoryLimitPool::background_evict_loop() {
     const size_t requested =
         cache_reclaim_requested_.exchange(0, std::memory_order_relaxed);
     process_rss_.refresh(process_rss_.needs_resident_confirmation());
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
     refresh_owned_sample();
 #endif
     if (requested && (used() > low_watermark() || process_rss_.pressure())) {
@@ -1797,7 +1938,8 @@ void MemoryLimitPool::background_evict_loop() {
       // including when vector pages cannot make further reclamation progress.
       reclaim_process_cache();
       process_rss_.refresh(true);
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
       refresh_owned_sample();
 #endif
       last_process_reclaim = now;
@@ -1850,7 +1992,8 @@ void MemoryLimitPool::background_evict_loop() {
       if (process_rss_.pressure()) {
         trim_idle_buffers();
         process_rss_.refresh(true);
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
         refresh_owned_sample();
 #endif
       }

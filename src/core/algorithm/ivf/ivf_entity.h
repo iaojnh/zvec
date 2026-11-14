@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-#include <core/quantizer/quantizer_params.h>
 #include <string_view>
+#include <core/quantizer/quantizer_params.h>
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
@@ -51,6 +51,11 @@ class IVFEntity {
 
   //! Prepare the posting distance once per query, after centroid selection.
   int bind_query(const void *query, const IndexQueryMeta &qmeta);
+
+  // Queue one complete row-major posting list. Returns its scan count so the
+  // caller can apply the same max_scan_count boundary as the scoring loop.
+  // accepted=false keeps this list in the caller's rolling lookahead plan.
+  size_t prefetch_list(size_t inverted_list_id, bool *accepted = nullptr) const;
 
   const turbo::Quantizer::Pointer &quantizer() const {
     return quantizer_;

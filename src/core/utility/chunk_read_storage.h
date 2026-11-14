@@ -2,8 +2,8 @@
 // Licensed under the Apache License, Version 2.0.
 #pragma once
 
-#include <memory>
 #include <limits>
+#include <memory>
 #include <zvec/core/framework/index_storage.h>
 
 namespace zvec {
@@ -18,6 +18,13 @@ class ChunkReadStorage : public IndexStorage {
     uint64_t cache_hits{0}, cache_misses{0}, fills{0}, replacements{0};
     uint64_t io_calls{0}, io_bytes{0}, copied_bytes{0}, workspace_waits{0};
     uint64_t trims{0}, cache_bytes{0}, workspace_bytes{0}, metadata_bytes{0};
+    uint64_t prefetch_submitted{0}, prefetch_consumed{0}, prefetch_failed{0};
+    uint64_t prefetch_wait_ns{0}, prefetch_peak_requests{0},
+        prefetch_peak_bytes{0};
+    uint64_t prefetch_depth{0}, prefetch_limit_bytes{0};
+    uint64_t prefetch_pending_requests{0}, prefetch_pending_bytes{0};
+    uint64_t prefetch_read_bytes{0}, prefetch_submit_batches{0};
+    uint64_t backing_reuses{0}, backing_reuse_scans{0};
   };
 
   ChunkReadStorage();
@@ -37,6 +44,9 @@ class ChunkReadStorage : public IndexStorage {
   MemoryBlock::MemoryBlockType memory_block_type() const override;
   std::string file_path() const override;
   Stats stats() const;
+  // Disabling hints does not discard an already submitted read. Demand reads
+  // still join it, and teardown drains it before releasing any backing.
+  void enable_prefetch(bool enabled);
 
  private:
   struct State;
@@ -47,6 +57,7 @@ class ChunkReadStorage : public IndexStorage {
   size_t max_read_bytes_{4UL << 20};
   size_t workspace_count_{8};
   size_t wait_ms_{100};
+  size_t prefetch_depth_{0}, prefetch_bytes_{16UL << 20};
   int64_t header_offset_{0}, footer_offset_{0};
   bool checksum_{false}, direct_io_{true}, adaptive_{false};
 };
@@ -69,5 +80,12 @@ inline constexpr const char *CHUNK_READ_STORAGE_DIRECT_IO =
 // may grow a leased execution slot through normal workspace admission.
 inline constexpr const char *CHUNK_READ_STORAGE_ADAPTIVE =
     "proxima.chunk_read_storage.adaptive";
+// Linux direct I/O lookahead. Zero depth preserves synchronous operation.
+// Both limits apply across all readers sharing this storage, including
+// completed reads whose buffers have not yet been consumed.
+inline constexpr const char *CHUNK_READ_STORAGE_PREFETCH_DEPTH =
+    "proxima.chunk_read_storage.prefetch_depth";
+inline constexpr const char *CHUNK_READ_STORAGE_PREFETCH_BYTES =
+    "proxima.chunk_read_storage.prefetch_bytes";
 }  // namespace core
 }  // namespace zvec

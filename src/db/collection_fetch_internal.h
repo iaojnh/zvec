@@ -15,6 +15,7 @@
 #pragma once
 
 #include <zvec/db/collection.h>
+#include "db/common/constants.h"
 
 namespace arrow {
 class MemoryPool;
@@ -58,3 +59,42 @@ Result<FetchResultSnapshot> fetch_result_snapshot(
     bool prefer_columns = false);
 
 }  // namespace zvec::internal
+
+namespace zvec::detail {
+
+// Keep fetch's has()-based error semantics: a failed point read is a missing
+// result, not a failed fetch. A batch error can leave partially filled IDs, so
+// retry every key using the original point lookup instead of consuming them.
+template <typename Lookup>
+std::vector<uint64_t> FetchPrimaryKeyIds(const Lookup &lookup,
+                                         const std::vector<std::string> &keys) {
+  std::vector<uint64_t> ids;
+  if (keys.empty()) return ids;
+  if (keys.size() > 1 && lookup.multi_get(keys, &ids).ok()) return ids;
+
+  ids.resize(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    uint64_t id;
+    ids[i] = lookup.has(keys[i], &id) ? id : INVALID_DOC_ID;
+  }
+  return ids;
+}
+
+// Preserve explicit lookup errors in the budgeted integration API.
+template <typename Lookup>
+Result<std::vector<uint64_t>> FetchPrimaryKeyIdsChecked(
+    const Lookup &lookup, const std::vector<std::string> &keys) {
+  std::vector<uint64_t> ids;
+  if (keys.empty()) return ids;
+  if (keys.size() > 1 && lookup.multi_get(keys, &ids).ok()) return ids;
+  ids.resize(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    uint64_t id;
+    auto found = lookup.lookup(keys[i], &id);
+    if (!found) return tl::make_unexpected(found.error());
+    ids[i] = *found ? id : INVALID_DOC_ID;
+  }
+  return ids;
+}
+
+}  // namespace zvec::detail

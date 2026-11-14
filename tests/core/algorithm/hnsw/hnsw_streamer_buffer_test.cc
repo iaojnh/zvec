@@ -267,6 +267,10 @@ TEST_F(HnswStreamerTest, LegacyReadsReleaseStorageBeforeThreadExit) {
     ASSERT_EQ(id, inserted);
   }
 
+  const node_id_t probe_ids[]{0, 1, 2};
+  zvec::ailego::BudgetedVector<const void *> probe_views;
+  EXPECT_FALSE(entity->try_get_resident_vectors(probe_ids, 3, probe_views));
+
   // Both legacy adapters used to retain owning MemoryBlocks in TLS. Exercise
   // both on this still-running thread, including the resident-page path.
   const auto *single = static_cast<const float *>(entity->get_vector(1));
@@ -446,6 +450,23 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
   EXPECT_EQ(VisitFilter::EpochBitMap, hnsw_ctx->visit_filter().get_mode());
   ASSERT_NE(nullptr, dynamic_cast<const HnswBufferPoolStreamerEntity *>(
                          &hnsw_ctx->get_entity()));
+  const auto *buffer_entity = dynamic_cast<const HnswBufferPoolStreamerEntity *>(
+      &hnsw_ctx->get_entity());
+  ASSERT_NE(nullptr, buffer_entity);
+  node_id_t batch_ids[kDocCount];
+  for (node_id_t id = 0; id < kDocCount; ++id) batch_ids[id] = id;
+  zvec::ailego::BudgetedVector<BufferPoolMemoryBlock> warm_blocks;
+  ASSERT_EQ(0, buffer_entity->get_vector_typed(batch_ids, kDocCount, warm_blocks));
+  warm_blocks.clear();
+  zvec::ailego::BudgetedVector<const void *> batch_views;
+  ASSERT_TRUE(buffer_entity->try_get_resident_vectors(
+      batch_ids, kDocCount, batch_views));
+  for (node_id_t id = 0; id < kDocCount; ++id)
+    for (size_t j = 0; j < dim; ++j)
+      EXPECT_FLOAT_EQ(static_cast<float>(id),
+                      static_cast<const float *>(batch_views[id])[j]);
+  buffer_entity->resident_vector_batch().release();
+
   ctx->set_topk(3);
   for (size_t j = 0; j < dim; ++j) {
     vector[j] = 64.1f;

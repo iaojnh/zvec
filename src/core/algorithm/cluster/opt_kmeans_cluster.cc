@@ -975,7 +975,7 @@ class NibbleKmeansAlgorithm : public OptKmeansAlgorithm {
 
   //! update centroids
   int update_centroids(IndexCluster::CentroidList &cents,
-                        const turbo::NibbleKmeans<T, IndexThreads> &algorithm);
+                       const turbo::NibbleKmeans<T, IndexThreads> &algorithm);
 };
 
 template <typename T>
@@ -1477,6 +1477,26 @@ int OptKmeansCluster::mount(IndexFeatures::Pointer feats) {
 int OptKmeansCluster::init(const IndexMeta &meta,
                            const ailego::Params &params) {
   auto type = meta.data_type();
+
+  if (meta.metric_name() == "Cosine" &&
+      (type == IndexMeta::DT_FP32 || type == IndexMeta::DT_FP16)) {
+    // Cosine records contain unit coordinates followed by a float original
+    // norm. Train in the same direction-only geometry used by CosineMetric;
+    // ordinary L2 over the complete record also clusters by that norm tail.
+    const size_t extra = sizeof(float) / meta.unit_size();
+    if (meta.extra_meta_size() != 0 || meta.dimension() <= extra) {
+      LOG_ERROR("Cosine clustering requires coordinates and an appended norm");
+      return IndexError_InvalidArgument;
+    }
+    if (type == IndexMeta::DT_FP32) {
+      algorithm_ = std::make_shared<NumericalInnerProductKmeansAlgorithm<
+          float, TurboKmeansContext<float, true, true>>>();
+    } else {
+      algorithm_ = std::make_shared<NumericalInnerProductKmeansAlgorithm<
+          ailego::Float16, TurboKmeansContext<ailego::Float16, true, true>>>();
+    }
+    return algorithm_->init(meta, params);
+  }
 
   const bool inner_product = meta.metric_name() == "InnerProduct";
   if ((inner_product || meta.metric_name() == "SquaredEuclidean") &&

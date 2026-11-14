@@ -81,9 +81,6 @@ Prefer a visual tool? Try **[Zvec Studio](https://github.com/zvec-ai/zvec-studio
 
 **Linux · macOS · Windows · Android · iOS**
 
-For Android/iOS budget configuration and host pressure callbacks, see
-[Mobile memory budgets](docs/mobile-memory.md).
-
 Zvec supports all major platforms — from servers and desktops to mobile devices.<br>
 For more details, please see the [platform support documentation](https://zvec.org/en/docs/db/platforms/).
 

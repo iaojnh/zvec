@@ -14,11 +14,9 @@
 
 #include "diskann_algorithm.h"
 #include <algorithm>
-#include <random>
 #include <set>
 #include <ailego/pattern/defer.h>
 #include <zvec/core/framework/index_holder.h>
-#include "diskann_graph_connectivity.h"
 #include "diskann_util.h"
 
 namespace zvec {
@@ -44,34 +42,6 @@ DiskAnnAlgorithm::DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree,
       count /= 2;
     }
   }
-}
-
-int DiskAnnAlgorithm::initialize_graph() try {
-  const uint64_t count = entity_.doc_cnt();
-  if (count == 0) return 0;
-  if (count > kInvalidId || max_degree_ == 0) return IndexError_InvalidArgument;
-  const size_t degree = std::min<uint64_t>(max_degree_, count - 1);
-  ailego::BudgetedVector<diskann_id_t> neighbors;
-  neighbors.reserve(degree);
-  std::mt19937_64 random(0);
-  std::uniform_int_distribution<diskann_id_t> pick(
-      0, static_cast<diskann_id_t>(count - 1));
-  // Only one row is retained in workspace; buffered entities keep the graph
-  // itself pageable. Seed edges span the full corpus before insertion begins.
-  for (uint64_t id = 0; id < count; ++id) {
-    neighbors.clear();
-    while (neighbors.size() < degree) {
-      const auto neighbor = pick(random);
-      if (neighbor != id && std::find(neighbors.begin(), neighbors.end(),
-                                      neighbor) == neighbors.end())
-        neighbors.push_back(neighbor);
-    }
-    const int ret = entity_.set_neighbors(id, neighbors);
-    if (ret != 0) return ret;
-  }
-  return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
 }
 
 ailego::BudgetedVector<diskann_id_t> DiskAnnAlgorithm::get_init_ids(
@@ -164,88 +134,6 @@ int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) try {
   return IndexError_NoMemory;
 }
 
-int DiskAnnAlgorithm::repair_connectivity(DiskAnnContext *ctx,
-                                          size_t *added_edges) try {
-  if (added_edges) *added_edges = 0;
-  const uint64_t count = entity_.doc_cnt();
-  if (count == 0) return 0;
-  if (!ctx || count > kInvalidId || entity_.medoid() >= count ||
-      max_degree_ == 0 || ctx->list_size() == 0)
-    return IndexError_InvalidArgument;
-  AILEGO_DEFER([&] { ctx->clear(); });
-  DiskAnnGraphConnectivity reachable(entity_, max_degree_);
-  const auto medoid = static_cast<diskann_id_t>(entity_.medoid());
-  int ret = reachable.visit(medoid, medoid);
-  if (ret != 0) return ret;
-  if (reachable.reached() == count) return 0;
-
-  size_t fallback = 0;
-  size_t repaired = 0;
-  ailego::BudgetedVector<diskann_id_t> neighbors;
-  for (uint64_t next = 0; next < count; ++next) {
-    const auto target = static_cast<diskann_id_t>(next);
-    if (reachable.contains(target)) continue;
-    ctx->clear();
-    {
-      IndexStorage::MemoryBlock vector;
-      ret = entity_.read_vector(target, vector);
-      if (ret != 0) return ret;
-      if (!vector.data()) return IndexError_ReadData;
-      ctx->reset_query(vector.data());
-    }
-    ret = iterate_to_fixed_point(get_init_ids(ctx), target, ctx);
-    if (ret != 0) return ret;
-    auto &candidates = ctx->expanded_nodes();
-    std::sort(candidates.begin(), candidates.end());
-    diskann_id_t anchor = kInvalidId;
-    size_t slot = std::numeric_limits<size_t>::max();
-    for (const auto &candidate : candidates) {
-      ret = entity_.read_neighbors(candidate.id, &neighbors);
-      if (ret != 0) return ret;
-      slot = reachable.link_slot(candidate.id, neighbors);
-      if (slot != std::numeric_limits<size_t>::max()) {
-        anchor = candidate.id;
-        break;
-      }
-    }
-    // A finite beam may find only full tree rows. A tree on R reached nodes
-    // has R-1 protected edges, so some reached row has room when degree >= 1.
-    // Protected counts only grow; permanently skip exhausted fallback rows.
-    while (anchor == kInvalidId && fallback < reachable.reached()) {
-      const diskann_id_t candidate = reachable.at(fallback);
-      ret = entity_.read_neighbors(candidate, &neighbors);
-      if (ret != 0) return ret;
-      slot = reachable.link_slot(candidate, neighbors);
-      if (slot != std::numeric_limits<size_t>::max()) {
-        anchor = candidate;
-      } else {
-        ++fallback;
-      }
-    }
-    if (anchor == kInvalidId) return IndexError_Runtime;
-    if (slot == neighbors.size()) {
-      neighbors.push_back(target);
-    } else {
-      neighbors[slot] = target;
-    }
-    ret = entity_.set_neighbors(anchor, neighbors);
-    if (ret != 0) return ret;
-    ret = reachable.visit(target, anchor);
-    if (ret != 0) return ret;
-    ++repaired;
-  }
-
-  // Reuse the same admitted workspace for an independent final traversal.
-  reachable.reset();
-  ret = reachable.visit(medoid, medoid);
-  if (ret != 0) return ret;
-  if (reachable.reached() != count) return IndexError_Runtime;
-  if (added_edges) *added_edges = repaired;
-  return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
-}
-
 int DiskAnnAlgorithm::inter_insert(
     diskann_id_t id, ailego::BudgetedVector<diskann_id_t> &pruned_list,
     DiskAnnContext *ctx) {
@@ -332,29 +220,8 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
 
   best_list_nodes.reserve(ctx->list_size());
 
-  const auto guidance = entity_.graph_quantization();
-  bool quantized = guidance.quantizer != nullptr;
-  if (quantized) {
-    if ((!guidance.codes && !guidance.paged_codes) || guidance.code_size == 0)
-      return IndexError_NoReady;
-    dc.bind_quantizer(guidance.quantizer, guidance.codes, guidance.code_size,
-                      guidance.paged_codes);
-    const int ret = dc.quantize_query(ctx->query());
-    if (ret == IndexError_NoMemory) {
-      dc.clear();
-      quantized = false;
-    } else if (ret != 0) {
-      return ret;
-    }
-  }
-
   for (auto id : init_ids) {
-    float distance;
-    if (quantized) {
-      dc.quantized_dist(&id, 1, &distance);
-    } else {
-      distance = dc.dist(id);
-    }
+    const float distance = dc.dist(id);
     if (dc.error()) {
       return dc.error_code();
     }
@@ -388,26 +255,12 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
       }
     }
 
-    if (!quantized && !entity_.prefer_vector_batch()) {
+    if (!entity_.prefer_vector_batch()) {
       // Keep the in-memory builder's scalar fast path unchanged.
       for (diskann_id_t id : id_scratch) {
         const float distance = dc.dist(id);
         if (dc.error()) return dc.error_code();
         best_list_nodes.insert(Neighbor(id, distance));
-      }
-      continue;
-    }
-    if (quantized) {
-      for (size_t begin = 0; begin < id_scratch.size();
-           begin += DiskAnnEntity::kVectorReadBatchSize) {
-        const size_t count = std::min(DiskAnnEntity::kVectorReadBatchSize,
-                                      id_scratch.size() - begin);
-        std::array<dist_t, DiskAnnEntity::kVectorReadBatchSize> distances;
-        dc.quantized_dist(id_scratch.data() + begin,
-                          static_cast<uint32_t>(count), distances.data());
-        if (dc.error()) return dc.error_code();
-        for (size_t i = 0; i < count; ++i)
-          best_list_nodes.insert(Neighbor(id_scratch[begin + i], distances[i]));
       }
       continue;
     }
@@ -423,24 +276,6 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
           return 0;
         });
     if (ret) return ret;
-  }
-
-  // Approximate scores guide traversal only. Restore exact query distances
-  // and heap order before existing-neighbor union, robust pruning or repair.
-  if (quantized) {
-    for (size_t begin = 0; begin < expanded_nodes.size();
-         begin += DiskAnnEntity::kVectorReadBatchSize) {
-      const size_t count = std::min(DiskAnnEntity::kVectorReadBatchSize,
-                                    expanded_nodes.size() - begin);
-      std::array<diskann_id_t, DiskAnnEntity::kVectorReadBatchSize> ids;
-      std::array<dist_t, DiskAnnEntity::kVectorReadBatchSize> distances;
-      for (size_t i = 0; i < count; ++i) ids[i] = expanded_nodes[begin + i].id;
-      dc.dist_batch(ids.data(), count, distances.data());
-      if (dc.error()) return dc.error_code();
-      for (size_t i = 0; i < count; ++i)
-        expanded_nodes[begin + i].distance = distances[i];
-    }
-    std::make_heap(expanded_nodes.begin(), expanded_nodes.end());
   }
 
   return 0;
@@ -706,75 +541,6 @@ int DiskAnnAlgorithm::search_neighbor_and_prune(
   }
 
   auto &pool = ctx->expanded_nodes();
-  ailego::BudgetedVector<diskann_id_t> existing;
-  {
-    auto lock = lock_for(id);
-    ret = entity_.read_neighbors(id, &existing);
-  }
-  if (ret != 0) return ret;
-  auto &dc = ctx->dist_calculator();
-  const auto missing = [&](diskann_id_t neighbor) {
-    return neighbor != id && std::none_of(pool.begin(), pool.end(),
-                                          [neighbor](const auto &candidate) {
-                                            return candidate.id == neighbor;
-                                          });
-  };
-  if (!entity_.prefer_vector_batch()) {
-    for (const auto neighbor : existing) {
-      if (!missing(neighbor)) continue;
-      const float distance = dc.dist(neighbor);
-      if (dc.error()) return dc.error_code();
-      CollectPruneCandidate(pool, Neighbor(neighbor, distance), id,
-                            max_candidate_size_);
-    }
-  } else {
-    for (size_t begin = 0; begin < existing.size();
-         begin += DiskAnnEntity::kVectorReadBatchSize) {
-      const size_t size = std::min(DiskAnnEntity::kVectorReadBatchSize,
-                                   existing.size() - begin);
-      std::array<diskann_id_t, DiskAnnEntity::kVectorReadBatchSize> ids;
-      std::array<size_t, DiskAnnEntity::kVectorReadBatchSize> slots;
-      std::array<IndexStorage::MemoryBlock, DiskAnnEntity::kVectorReadBatchSize>
-          blocks;
-      slots.fill(slots.size());
-      size_t count = 0;
-      if (entity_.prefer_vector_batch()) {
-        for (size_t i = 0; i < size; ++i)
-          if (missing(existing[begin + i])) {
-            slots[i] = count;
-            ids[count++] = existing[begin + i];
-          }
-        int status = 0;
-        try {
-          status = entity_.read_vectors(ids.data(), blocks.data(), count);
-        } catch (const std::bad_alloc &) {
-          status = IndexError_NoMemory;
-        }
-        if (status == IndexError_NoMemory) {
-          for (auto &block : blocks) block.reset();
-        } else if (status)
-          return status;
-      }
-      for (size_t i = 0; i < size; ++i) {
-        const auto neighbor = existing[begin + i];
-        // Recheck against the evolving bounded pool. An earlier insertion may
-        // have removed a candidate, so the scalar read remains a rare fallback.
-        if (!missing(neighbor)) continue;
-        const float distance = slots[i] < count && blocks[slots[i]].data()
-                                   ? dc.dist(blocks[slots[i]].data())
-                                   : dc.dist(neighbor);
-        if (dc.error()) return dc.error_code();
-        try {
-          CollectPruneCandidate(pool, Neighbor(neighbor, distance), id,
-                                max_candidate_size_);
-        } catch (const std::bad_alloc &) {
-          for (auto &block : blocks) block.reset();
-          CollectPruneCandidate(pool, Neighbor(neighbor, distance), id,
-                                max_candidate_size_);
-        }
-      }
-    }
-  }
   pool.erase(std::remove_if(pool.begin(), pool.end(),
                             [id](const auto &node) { return node.id == id; }),
              pool.end());

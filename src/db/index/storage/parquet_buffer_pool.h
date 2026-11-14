@@ -15,8 +15,11 @@
 #pragma once
 
 #include <sys/stat.h>
+#include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,6 +30,9 @@
 namespace arrow {
 class Buffer;
 class ChunkedArray;
+namespace io {
+class RandomAccessFile;
+}
 }  // namespace arrow
 
 namespace parquet {
@@ -40,12 +46,19 @@ struct ParquetBufferID {
   int row_group{0};
   uint64_t file_id{0};
   int64_t mtime{0};
+  uint64_t device_id{0};
+  uint64_t generation{0};
+  bool opened_file{false};
+  std::weak_ptr<arrow::io::RandomAccessFile> input;
 
   // A reader may lend its already parsed footer to a cache miss. Cache keys
   // must not keep that footer alive after the owning reader is closed.
   std::weak_ptr<parquet::FileMetaData> metadata;
 
   ParquetBufferID() = default;
+  ParquetBufferID(const std::string &filename,
+                  const std::shared_ptr<arrow::io::RandomAccessFile> &file,
+                  int column, int row_group);
   ParquetBufferID(const std::string &filename, int column, int row_group);
   ParquetBufferID(const std::string &filename, int column, int row_group,
                   const ParquetBufferID &metadata_source);
@@ -80,6 +93,8 @@ struct ParquetBufferIDHash {
     };
     combine(std::hash<uint64_t>{}(buffer_id.file_id));
     combine(std::hash<int64_t>{}(buffer_id.mtime));
+    combine(std::hash<uint64_t>{}(buffer_id.device_id));
+    combine(std::hash<uint64_t>{}(buffer_id.generation));
     combine(std::hash<int>{}(buffer_id.column));
     combine(std::hash<int>{}(buffer_id.row_group));
     return hash;
@@ -94,6 +109,8 @@ struct ParquetBufferIDEqual {
     if (a.file_id != b.file_id) {
       return false;
     }
+    if (a.device_id != b.device_id || a.generation != b.generation)
+      return false;
     if (a.mtime != b.mtime) {
       return false;
     }
@@ -155,6 +172,13 @@ class ParquetBufferContextHandle {
   //! Return an Arrow view whose buffers retain the cache pin.
   std::shared_ptr<arrow::ChunkedArray> data() const;
 
+  // Only for synchronous reads completed before this handle is destroyed.
+  // Escaping arrays/scalars must continue using data() to retain their pin.
+  const arrow::ChunkedArray *borrowed_data() const & noexcept {
+    return arrow_.get();
+  }
+  const arrow::ChunkedArray *borrowed_data() const && = delete;
+
  private:
   ParquetBufferID buffer_id_;
   std::shared_ptr<arrow::ChunkedArray> arrow_{nullptr};
@@ -174,10 +198,14 @@ class ParquetBufferPool {
       const ParquetBufferID &buffer_id);
 
   void retire_file(const ParquetBufferID &file) {
-    cache_.retire_if([&file](const ParquetBufferID &key) {
-      return key.filename() == file.filename() && key.file_id == file.file_id &&
-             key.mtime == file.mtime;
-    });
+    for (auto &shard : caches_) {
+      shard.cache.retire_if([&file](const ParquetBufferID &key) {
+        return key.filename() == file.filename() &&
+               key.file_id == file.file_id && key.mtime == file.mtime &&
+               key.device_id == file.device_id &&
+               key.generation == file.generation;
+      });
+    }
   }
 
   static ParquetBufferPool &get_instance() {
@@ -200,15 +228,36 @@ class ParquetBufferPool {
                             detail::ParquetBufferLoader, ParquetBufferIDHash,
                             ParquetBufferIDEqual, /*PayloadOwnsBudget=*/true>;
 
-  ParquetBufferPool()
-      : cache_(detail::ParquetBufferLoader{}, kMaxConcurrentLoads) {}
+  ParquetBufferPool() = default;
+
+  static constexpr size_t kCacheShards = 16;
+  struct alignas(AILEGO_CACHE_LINE_SIZE) CacheShard {
+    Cache cache;
+  };
+
+  class LoadSlot {
+   public:
+    explicit LoadSlot(ParquetBufferPool &pool);
+    ~LoadSlot();
+    LoadSlot(const LoadSlot &) = delete;
+    LoadSlot &operator=(const LoadSlot &) = delete;
+
+   private:
+    ParquetBufferPool &pool_;
+  };
+
+  Cache &cache_for(const ParquetBufferID &buffer_id);
 
   std::shared_ptr<arrow::ChunkedArray> retain(const ParquetBufferID &buffer_id);
 
   void release(const ParquetBufferID &buffer_id);
 
  private:
-  Cache cache_;
+  std::array<CacheShard, kCacheShards> caches_;
+  // Misses alone share the loader ceiling. Hot pins touch only their shard.
+  std::mutex load_mutex_;
+  std::condition_variable load_cv_;
+  size_t active_loads_{0};
 };
 
 }  // namespace zvec

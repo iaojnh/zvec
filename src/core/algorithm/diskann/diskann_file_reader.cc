@@ -1237,6 +1237,88 @@ struct BufferReadBatch {
   }
 };
 
+bool BufferPoolAlignedFileReader::try_submit_cached_nodes(
+    PendingBatch &batch, const std::vector<AlignedRead> &requests,
+    IOContext &ctx, const uint32_t *node_ids, size_t node_size,
+    size_t nodes_per_sector) {
+  if (!pool_ || !opened_ || pool_->writable() || !pool_->cache_enabled() ||
+      requests.empty() || requests.size() > MAX_IO_DEPTH || !node_ids ||
+      !node_size || batch.has_async_requests())
+    return false;
+#if defined(__linux__) && !defined(__ANDROID__)
+  if (ctx && (ctx->aio_active || ctx->ring.has_pending_reads())) return false;
+#elif defined(_WIN32) || defined(_WIN64)
+  if (ctx && ctx->outstanding_count) return false;
+#endif
+  constexpr size_t sector = DiskAnnUtil::kSectorSize;
+  if (nodes_per_sector && nodes_per_sector > sector / node_size) return false;
+  const size_t page_size = ailego::kVectorPageSize;
+  // The search context supplies disjoint, ascending sector-buffer slots. Other
+  // destination layouts retain submit()'s existing overlap and I/O handling.
+  uintptr_t previous_end = 0;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const auto &request = requests[i];
+    const auto destination = reinterpret_cast<uintptr_t>(request.buf);
+    const size_t within =
+        nodes_per_sector ? (node_ids[i] % nodes_per_sector) * node_size : 0;
+    if (!destination || destination % sector || !request.len ||
+        request.offset % sector || request.len % sector ||
+        request.offset > pool_->file_size() ||
+        request.len > pool_->file_size() - request.offset ||
+        request.len > UINTPTR_MAX - destination ||
+        (i && destination < previous_end) || within > request.len ||
+        node_size > request.len - within)
+      return false;
+    previous_end = destination + request.len;
+  }
+  std::array<ailego::block_id_t, MAX_IO_DEPTH> ids;
+  std::array<char *, MAX_IO_DEPTH> pages;
+  size_t count = 0;
+  auto release = ailego::ScopeGuard::Make(
+      [&] { pool_->release_pages(ids.data(), count); });
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const size_t within =
+        nodes_per_sector ? (node_ids[i] % nodes_per_sector) * node_size : 0;
+    const uint64_t first = (requests[i].offset + within) / page_size;
+    const uint64_t last =
+        (requests[i].offset + within + node_size - 1) / page_size;
+    for (auto id = first; id <= last; ++id) {
+      size_t index = 0;
+      while (index < count && ids[index] != id) ++index;
+      if (index != count) continue;
+      if (count == MAX_IO_DEPTH) return false;
+      char *page = pool_->try_acquire_buffer(id);
+      if (!page) return false;
+      ids[count] = id;
+      pages[count++] = page;
+    }
+  }
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const size_t within =
+        nodes_per_sector ? (node_ids[i] % nodes_per_sector) * node_size : 0;
+    uint64_t source = requests[i].offset + within;
+    auto *destination = static_cast<char *>(requests[i].buf) + within;
+    size_t remaining = node_size;
+    while (remaining) {
+      const auto id = source / page_size;
+      const size_t offset = source % page_size;
+      const size_t bytes = std::min(remaining, page_size - offset);
+      const auto found = std::find(ids.begin(), ids.begin() + count, id);
+      std::memcpy(destination, pages[found - ids.begin()] + offset, bytes);
+      source += bytes;
+      destination += bytes;
+      remaining -= bytes;
+    }
+  }
+  // No graph pin may span the PQ/candidate allocations between submission and
+  // completion. The copied nodes have the same lifetime as the old sectors.
+  batch.buffer.reset();
+  batch.n_submitted = requests.size();
+  batch.n_reaped = 0;
+  batch.used_pread = true;
+  return true;
+}
+
 int BufferPoolAlignedFileReader::submit(PendingBatch &batch,
                                         std::vector<AlignedRead> &requests,
                                         IOContext &ctx) {

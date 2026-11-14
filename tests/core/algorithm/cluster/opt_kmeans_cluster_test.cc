@@ -1478,3 +1478,128 @@ TEST(OptKmeansCluster, DistanceQuantizerTracksTrainingDimension) {
   CheckQuantizerDimensionChanges<float>();
   CheckQuantizerDimensionChanges<Float16>();
 }
+
+namespace {
+template <typename T>
+void CheckCosineTraining(IndexMeta::DataType type, bool seeded,
+                         const char *name = "OptKmeansCluster") {
+  // Full 32-row blocks and both remainder paths. The same unit direction is
+  // repeated with unrelated original lengths: cosine must keep them together.
+  constexpr size_t coordinates = 37, centers = 35;
+  constexpr size_t dim = coordinates + sizeof(float) / sizeof(T);
+  IndexMeta meta(type, dim);
+  meta.set_metric("Cosine", 0, Params());
+  auto features = std::make_shared<CompactIndexFeatures>(meta);
+  IndexCluster::CentroidList initial;
+  uint32_t norm_bits = 0x3f80fe00;  // finite float; one FP16 word is a NaN
+  float awkward_norm;
+  std::memcpy(&awkward_norm, &norm_bits, sizeof(awkward_norm));
+  const float norms[] = {awkward_norm, 1.0f, 10000.0f};
+  for (size_t i = 0; i < centers * 3; ++i) {
+    std::vector<T> row(dim, static_cast<T>(0.0f));
+    row[i % centers] = static_cast<T>(1.0f);
+    std::memcpy(row.data() + coordinates, &norms[i / centers], sizeof(float));
+    features->emplace(row.data());
+    if (seeded && i < centers) {
+      initial.emplace_back(row.data(), row.size() * sizeof(T));
+    }
+  }
+  auto cluster = IndexFactory::CreateCluster(name);
+  ASSERT_NE(nullptr, cluster);
+  Params params;
+  params.set(GENERAL_CLUSTER_COUNT, uint32_t{centers});
+  params.set(OPTKMEANS_CLUSTER_MAX_ITERATIONS, 4U);
+  params.set(OPTKMEANS_CLUSTER_MARKOV_CHAIN_LENGTH, 1024U);
+  ASSERT_EQ(0, cluster->init(meta, params));
+  ASSERT_EQ(0, cluster->mount(features));
+  auto threads = std::make_shared<SingleQueueIndexThreads>(2U, false);
+  auto centroids = initial;
+  ASSERT_EQ(0, cluster->cluster(threads, centroids));
+  ASSERT_EQ(centers, centroids.size());
+  std::vector<uint32_t> labels;
+  ASSERT_EQ(0, cluster->label(threads, centroids, &labels));
+  ASSERT_EQ(centers * 3, labels.size());
+  for (size_t i = 0; i < labels.size(); ++i) {
+    EXPECT_EQ(labels[i % centers], labels[i]);
+    for (size_t j = 0; j < centers; ++j) {
+      if (i % centers != j) EXPECT_NE(labels[i], labels[j]);
+    }
+    float original_norm;
+    std::memcpy(&original_norm,
+                static_cast<const T *>(features->element(i)) + coordinates,
+                sizeof(original_norm));
+    EXPECT_FLOAT_EQ(norms[i / centers], original_norm);
+  }
+  for (const auto &centroid : centroids) {
+    std::vector<T> row(dim);
+    ASSERT_EQ(0, centroid.read_feature(row.data(), row.size() * sizeof(T)));
+    float squared_norm = 0;
+    for (size_t d = 0; d < coordinates; ++d) {
+      squared_norm += float(row[d]) * float(row[d]);
+    }
+    EXPECT_NEAR(1.0f, squared_norm, 1e-3f);
+    float stored_norm;
+    std::memcpy(&stored_norm, row.data() + coordinates, sizeof(stored_norm));
+    EXPECT_FLOAT_EQ(1.0f, stored_norm);
+    EXPECT_EQ(3U, centroid.follows());
+  }
+}
+
+template <typename T>
+void CheckCosineContext() {
+  using Context = TurboKmeansContext<T, true, true>;
+  constexpr size_t coordinates = 7,
+                   dim = coordinates + sizeof(float) / sizeof(T);
+  std::vector<T> data(Context::BatchCount * dim, static_cast<T>(0.0f));
+  std::vector<T> query(2 * dim, static_cast<T>(0.0f));
+  for (size_t i = 0; i < Context::BatchCount; ++i) {
+    data[i * dim + i % coordinates] = static_cast<T>(1.0f);
+    const float tail = 1000.0f + i;
+    std::memcpy(data.data() + i * dim + coordinates, &tail, sizeof(tail));
+  }
+  query[0] = query[dim + 1] = static_cast<T>(1.0f);
+  float scores[2 * Context::BatchCount];
+  Context::template BatchDistance<2>(data.data(), query.data(), dim, scores);
+  for (size_t j = 0; j < 2; ++j) {
+    for (size_t i = 0; i < Context::BatchCount; ++i) {
+      const float expected = i % coordinates == j ? -1.0f : 0.0f;
+      EXPECT_FLOAT_EQ(expected, scores[j * Context::BatchCount + i]);
+      float scalar;
+      Context::Distance(data.data() + i * dim, query.data() + j * dim, dim,
+                        &scalar);
+      EXPECT_FLOAT_EQ(expected, scalar);
+    }
+  }
+  EXPECT_FLOAT_EQ(1.0f, Context::Kmc2Norm(data.data(), dim));
+}
+}  // namespace
+
+TEST(OptKmeansCluster, CosineIgnoresOriginalNormAndNormalizesCentroids) {
+  CheckCosineTraining<float>(IndexMeta::DT_FP32, true);
+  CheckCosineTraining<Float16>(IndexMeta::DT_FP16, true);
+}
+
+TEST(OptKmeansCluster, CosineKmc2IgnoresOriginalNorm) {
+  CheckCosineTraining<float>(IndexMeta::DT_FP32, false);
+  CheckCosineTraining<Float16>(IndexMeta::DT_FP16, false);
+}
+
+TEST(OptKmeansCluster, CosineBatchStrideAndKmc2Norm) {
+  CheckCosineContext<float>();
+  CheckCosineContext<Float16>();
+}
+
+TEST(OptKmeansCluster, GenericCosineIgnoresOriginalNorm) {
+  CheckCosineTraining<float>(IndexMeta::DT_FP32, true, "KmeansCluster");
+  CheckCosineTraining<Float16>(IndexMeta::DT_FP16, true, "KmeansCluster");
+}
+
+TEST(OptKmeansCluster, CosineRejectsRecordsWithoutCoordinates) {
+  for (const auto type : {IndexMeta::DT_FP32, IndexMeta::DT_FP16}) {
+    IndexMeta meta(type, sizeof(float) / IndexMeta::UnitSizeof(type));
+    meta.set_metric("Cosine", 0, Params());
+    auto cluster = IndexFactory::CreateCluster("OptKmeansCluster");
+    ASSERT_NE(nullptr, cluster);
+    EXPECT_EQ(IndexError_InvalidArgument, cluster->init(meta, Params()));
+  }
+}

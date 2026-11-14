@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include "bufferpool_forward_store.h"
+#include <cstring>
+#include <limits>
+#include <type_traits>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/compute/api.h>
 #include <arrow/filesystem/api.h>
@@ -23,15 +26,448 @@
 #include <parquet/arrow/reader.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
+#include <zvec/db/doc.h>
+#include "db/common/query_result_memory.h"
 #include "db/index/storage/store_helper.h"
 #include "fetch_memory.h"
 #include "lazy_record_batch_reader.h"
 #include "parquet_buffer_pool.h"
 #include "parquet_memory_pool.h"
 #include "parquet_metadata_budget.h"
+#include "selected_rows_plan.h"
 
 
 namespace zvec {
+
+ParquetRecordBatchReader::ParquetRecordBatchReader(
+    std::unique_ptr<parquet::arrow::FileReader> &reader,
+    const std::vector<std::string> &columns,
+    std::shared_ptr<arrow::Schema> schema, const std::string &file_path,
+    bool with_cache, bool stream_uncached,
+    std::shared_ptr<arrow::MemoryPool> memory_pool, ParquetBufferID metadata_id)
+    : memory_pool_(std::move(memory_pool)),
+      reader_(std::move(reader)),
+      schema_(std::move(schema)),
+      columns_(columns),
+      file_path_(file_path),
+      with_cache_(with_cache),
+      stream_uncached_(stream_uncached) {
+  std::vector<std::shared_ptr<arrow::Field>> fields;
+  for (const auto &col : columns) {
+    int index = schema_->GetFieldIndex(col);
+    if (index != -1) {
+      fields.push_back(schema_->field(index));
+      col_indices_.push_back(index);
+    }
+  }
+  projected_schema_ = arrow::schema(fields);
+
+  auto parquet_metadata = reader_->parquet_reader()->metadata();
+  metadata_id_ = metadata_id.filename().empty()
+                     ? ParquetBufferID(file_path_, 0, 0)
+                     : std::move(metadata_id);
+  metadata_id_.metadata = parquet_metadata;
+  total_rows_ = parquet_metadata->num_rows();
+  num_row_groups_ = parquet_metadata->num_row_groups();
+  int64_t offset = 0;
+  for (int64_t rg = 0; rg < num_row_groups_; ++rg) {
+    auto row_group_metadata = parquet_metadata->RowGroup(rg);
+    int64_t num_rows_in_group = row_group_metadata->num_rows();
+    row_group_row_nums_.push_back(num_rows_in_group);
+    row_group_offsets_.push_back(offset);
+    offset += num_rows_in_group;
+  }
+}
+
+ParquetRecordBatchReader::~ParquetRecordBatchReader() = default;
+
+arrow::Status ParquetRecordBatchReader::ReadNext(
+    std::shared_ptr<arrow::RecordBatch> *batch) try {
+  *batch = nullptr;
+  while (true) {
+    if (cached_batches_) {
+      ARROW_RETURN_NOT_OK(cached_batches_->ReadNext(batch));
+      if (*batch) {
+        if ((*batch)->num_rows() != 0) return arrow::Status::OK();
+        continue;
+      }
+      cached_batches_.reset();
+    }
+    if (current_row_group_ >= num_row_groups_) {
+      return arrow::Status::OK();
+    }
+
+    if (!with_cache_) {
+      return stream_uncached_ ? read_next_uncached(batch)
+                              : read_row_group(batch);
+    }
+
+    int64_t rg_id = current_row_group_;
+    int64_t num_rows_in_rg = row_group_row_nums_[rg_id];
+
+    std::vector<std::shared_ptr<arrow::ChunkedArray>> columns(
+        col_indices_.size());
+    for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
+      // A one-pass scan must not fill the point-read cache with entire cold
+      // columns. Reuse resident columns without copying; on a miss, stream
+      // bounded batches through the same budgeted decoder instead. Preserve
+      // the legacy reader's cache behavior when no budgeted pool is supplied.
+      std::shared_ptr<arrow::ChunkedArray> col_chunked_array;
+      try {
+        auto buffer_id = metadata_id_;
+        buffer_id.column = col_indices_[col_idx];
+        buffer_id.row_group = rg_id;
+        auto &cache = ParquetBufferPool::get_instance();
+        auto buffer_handle = memory_pool_ ? cache.try_acquire_buffer(buffer_id)
+                                          : cache.acquire_buffer(buffer_id);
+        col_chunked_array = buffer_handle.data();
+      } catch (const std::bad_alloc &) {
+        // Cache keys and escaped-view metadata also require admission.
+        // A refusal follows the same bounded streaming path as a cold miss.
+      }
+      if (!col_chunked_array) {
+        // Cache residency is optional. Drop partial columns before reading
+        // the same row group in bounded batches, without publishing any rows
+        // twice or passing null columns to Arrow. Stay uncached for this scan
+        // to avoid repeatedly decoding columns that cannot fit in the pool.
+        columns.clear();
+        with_cache_ = false;
+        stream_uncached_ = true;
+        return read_next_uncached(batch);
+      }
+      columns[col_idx] = std::move(col_chunked_array);
+    }
+
+    // Slice existing chunks and retain their cache pins; concatenation made
+    // a second, unbudgeted copy of every decoded row-group column.
+    cached_batches_ =
+        std::make_unique<arrow::TableBatchReader>(arrow::Table::Make(
+            projected_schema_, std::move(columns), num_rows_in_rg));
+    cached_batches_->set_chunksize(8192);
+    current_row_group_++;
+  }
+} catch (const std::bad_alloc &) {
+  *batch = nullptr;
+  return arrow::Status::OutOfMemory("Parquet scan metadata budget exhausted");
+}
+
+arrow::Status ParquetRecordBatchReader::read_row_group(
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  std::shared_ptr<arrow::Table> table;
+  ARROW_RETURN_NOT_OK(reader_->RowGroup(static_cast<int>(current_row_group_))
+                          ->ReadTable(col_indices_, &table));
+  std::vector<std::shared_ptr<arrow::Array>> chunks(col_indices_.size());
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    ARROW_ASSIGN_OR_RAISE(chunks[i],
+                          arrow::Concatenate(table->column(i)->chunks(),
+                                             arrow::default_memory_pool()));
+  }
+  *batch = arrow::RecordBatch::Make(
+      projected_schema_, row_group_row_nums_[current_row_group_], chunks);
+  ++current_row_group_;
+  return arrow::Status::OK();
+}
+
+arrow::Status ParquetRecordBatchReader::read_next_uncached(
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  while (current_row_group_ < num_row_groups_) {
+    if (!row_group_reader_) {
+      const auto metadata = reader_->parquet_reader()->metadata();
+      const auto leaves = detail::ParquetLeafColumns(*metadata, col_indices_);
+      if (memory_pool_) {
+        reader_->set_batch_size(detail::ParquetDecodeBatchRows(
+            *metadata, static_cast<int>(current_row_group_), leaves));
+      }
+      ARROW_ASSIGN_OR_RAISE(
+          row_group_reader_,
+          reader_->GetRecordBatchReader({static_cast<int>(current_row_group_)},
+                                        leaves));
+    }
+    std::shared_ptr<arrow::RecordBatch> next;
+    ARROW_RETURN_NOT_OK(row_group_reader_->ReadNext(&next));
+    if (next) {
+      // Arrow deduplicates projected Parquet columns. Preserve the caller's
+      // order and duplicates, matching cached reads, without copying data.
+      std::vector<std::shared_ptr<arrow::Array>> columns;
+      columns.reserve(projected_schema_->num_fields());
+      for (const auto &field : projected_schema_->fields()) {
+        auto column = next->GetColumnByName(field->name());
+        if (!column) {
+          return arrow::Status::Invalid("Missing scanned column: ",
+                                        field->name());
+        }
+        columns.push_back(std::move(column));
+      }
+      *batch = arrow::RecordBatch::Make(projected_schema_, next->num_rows(),
+                                        std::move(columns));
+      return arrow::Status::OK();
+    }
+    row_group_reader_.reset();
+    ++current_row_group_;
+  }
+  return arrow::Status::OK();
+}
+
+namespace {
+
+template <typename ArrayType, typename ScalarType>
+std::shared_ptr<arrow::Scalar> ReadOwnedScalar(const arrow::Array &array,
+                                               int64_t row) {
+  const auto &values = static_cast<const ArrayType &>(array);
+  if (values.IsNull(row)) return arrow::MakeNullScalar(values.type());
+  if constexpr (std::is_same_v<ArrayType, arrow::StringArray> ||
+                std::is_same_v<ArrayType, arrow::BinaryArray>) {
+    // Own the selected bytes, so returning a scalar cannot keep an entire
+    // cached column alive after the buffer handle is released.
+    auto allocated = arrow::AllocateBuffer(
+        values.value_length(row), detail::GetParquetMemoryPool().get());
+    if (!allocated.ok()) {
+      if (allocated.status().IsOutOfMemory()) throw std::bad_alloc();
+      return nullptr;
+    }
+    std::shared_ptr<arrow::Buffer> buffer = std::move(*allocated);
+    const auto bytes = values.GetView(row);
+    if (!bytes.empty()) {
+      std::memcpy(buffer->mutable_data(), bytes.data(), bytes.size());
+    }
+    return std::make_shared<ScalarType>(std::move(buffer));
+  } else {
+    return std::make_shared<ScalarType>(values.Value(row));
+  }
+}
+
+std::shared_ptr<arrow::Scalar> ReadOwnedScalar(const arrow::Array &array,
+                                               int64_t row) {
+  switch (array.type_id()) {
+    case arrow::Type::BOOL:
+      return ReadOwnedScalar<arrow::BooleanArray, arrow::BooleanScalar>(array,
+                                                                        row);
+    case arrow::Type::INT32:
+      return ReadOwnedScalar<arrow::Int32Array, arrow::Int32Scalar>(array, row);
+    case arrow::Type::INT64:
+      return ReadOwnedScalar<arrow::Int64Array, arrow::Int64Scalar>(array, row);
+    case arrow::Type::UINT32:
+      return ReadOwnedScalar<arrow::UInt32Array, arrow::UInt32Scalar>(array,
+                                                                      row);
+    case arrow::Type::UINT64:
+      return ReadOwnedScalar<arrow::UInt64Array, arrow::UInt64Scalar>(array,
+                                                                      row);
+    case arrow::Type::FLOAT:
+      return ReadOwnedScalar<arrow::FloatArray, arrow::FloatScalar>(array, row);
+    case arrow::Type::DOUBLE:
+      return ReadOwnedScalar<arrow::DoubleArray, arrow::DoubleScalar>(array,
+                                                                      row);
+    case arrow::Type::STRING:
+      return ReadOwnedScalar<arrow::StringArray, arrow::StringScalar>(array,
+                                                                      row);
+    case arrow::Type::BINARY:
+      return ReadOwnedScalar<arrow::BinaryArray, arrow::BinaryScalar>(array,
+                                                                      row);
+    default:
+      return nullptr;
+  }
+}
+
+using SelectedRows = detail::SelectedRowsPlan::Rows;
+
+template <typename ArrayType>
+void ReadDocField(const arrow::Array &array, int64_t row,
+                  const std::string &name, Doc &doc) {
+  const auto &values = static_cast<const ArrayType &>(array);
+  if constexpr (std::is_same_v<ArrayType, arrow::StringArray> ||
+                std::is_same_v<ArrayType, arrow::BinaryArray>) {
+    doc.set(name, std::string(values.GetView(row)));
+  } else {
+    doc.set(name, values.Value(row));
+  }
+}
+
+bool SupportsDirectDocValues(arrow::Type::type type) {
+  switch (type) {
+    case arrow::Type::BOOL:
+    case arrow::Type::INT32:
+    case arrow::Type::INT64:
+    case arrow::Type::UINT32:
+    case arrow::Type::UINT64:
+    case arrow::Type::FLOAT:
+    case arrow::Type::DOUBLE:
+    case arrow::Type::STRING:
+    case arrow::Type::BINARY:
+      return true;
+    default:
+      return false;
+  }
+}
+
+template <typename ArrayType, typename ValueType>
+void ReadListDocField(const arrow::Array &child, int64_t offset, int64_t length,
+                      const std::string &name, Doc &doc) {
+  const auto &values = static_cast<const ArrayType &>(child);
+  std::vector<ValueType> owned;
+  owned.reserve(length);
+  for (int64_t i = offset; i < offset + length; ++i) {
+    if constexpr (std::is_same_v<ArrayType, arrow::StringArray> ||
+                  std::is_same_v<ArrayType, arrow::BinaryArray>) {
+      owned.emplace_back(values.GetView(i));
+    } else {
+      owned.emplace_back(values.Value(i));
+    }
+  }
+  doc.set(name, std::move(owned));
+}
+
+bool ReadListDocField(const arrow::ListArray &array, int64_t row,
+                      const std::string &name, Doc &doc) {
+  const auto &child = *array.values();
+  const int64_t offset = array.value_offset(row);
+  const int64_t length = array.value_length(row);
+  // zvec array fields do not support null elements. Keep Arrow's existing
+  // scalar fallback for externally supplied lists that contain them.
+  if (child.null_count() != 0) {
+    for (int64_t i = offset; i < offset + length; ++i) {
+      if (child.IsNull(i)) return false;
+    }
+  }
+  // Copy directly from the selected child range while the column is pinned.
+  // In particular, do not allocate a sliced Arrow array or ListScalar.
+  switch (child.type_id()) {
+    case arrow::Type::BOOL:
+      ReadListDocField<arrow::BooleanArray, bool>(child, offset, length, name,
+                                                  doc);
+      break;
+    case arrow::Type::INT32:
+      ReadListDocField<arrow::Int32Array, int32_t>(child, offset, length, name,
+                                                   doc);
+      break;
+    case arrow::Type::INT64:
+      ReadListDocField<arrow::Int64Array, int64_t>(child, offset, length, name,
+                                                   doc);
+      break;
+    case arrow::Type::UINT32:
+      ReadListDocField<arrow::UInt32Array, uint32_t>(child, offset, length,
+                                                     name, doc);
+      break;
+    case arrow::Type::UINT64:
+      ReadListDocField<arrow::UInt64Array, uint64_t>(child, offset, length,
+                                                     name, doc);
+      break;
+    case arrow::Type::FLOAT:
+      ReadListDocField<arrow::FloatArray, float>(child, offset, length, name,
+                                                 doc);
+      break;
+    case arrow::Type::DOUBLE:
+      ReadListDocField<arrow::DoubleArray, double>(child, offset, length, name,
+                                                   doc);
+      break;
+    case arrow::Type::STRING:
+      ReadListDocField<arrow::StringArray, std::string>(child, offset, length,
+                                                        name, doc);
+      break;
+    case arrow::Type::BINARY:
+      ReadListDocField<arrow::BinaryArray, std::string>(child, offset, length,
+                                                        name, doc);
+      break;
+    default:
+      return false;
+  }
+  return true;
+}
+
+template <typename ArrayType, typename BuilderType>
+arrow::Status AppendTypedRows(const arrow::ChunkedArray &column,
+                              const detail::SelectedRowsPlan &plan,
+                              arrow::ArrayBuilder *builder) {
+  auto &typed_builder = static_cast<BuilderType &>(*builder);
+  const bool no_null = column.null_count() == 0;
+  return plan.visit<ArrayType>(
+      column, [&](const ArrayType &array, int64_t row, int) {
+        if (!no_null && array.IsNull(row)) return typed_builder.AppendNull();
+        if constexpr (std::is_same_v<ArrayType, arrow::StringArray> ||
+                      std::is_same_v<ArrayType, arrow::BinaryArray>) {
+          return typed_builder.Append(array.GetView(row));
+        } else {
+          return typed_builder.Append(array.Value(row));
+        }
+      });
+}
+
+template <typename ArrayType, typename BuilderType>
+arrow::Status ReserveSelectedBytes(const arrow::ChunkedArray &column,
+                                   const detail::SelectedRowsPlan &plan,
+                                   arrow::ArrayBuilder *builder) {
+  int64_t bytes = 0;
+  const bool no_null = column.null_count() == 0;
+  ARROW_RETURN_NOT_OK(plan.visit<ArrayType>(column, [&](const ArrayType &array,
+                                                        int64_t row, int) {
+    if (no_null || !array.IsNull(row)) {
+      const int64_t length = array.value_length(row);
+      if (length > std::numeric_limits<int64_t>::max() - bytes) {
+        return arrow::Status::CapacityError("Selected strings are too large");
+      }
+      bytes += length;
+    }
+    return arrow::Status::OK();
+  }));
+  return static_cast<BuilderType &>(*builder).ReserveData(bytes);
+}
+
+arrow::Status AppendSelectedRows(const arrow::ChunkedArray &column,
+                                 detail::SelectedRowsPlan &plan,
+                                 arrow::ArrayBuilder *builder) {
+  ARROW_RETURN_NOT_OK(plan.prepare(column));
+  // Reserve selected bytes while the source column is pinned.
+  // Reserve(row_count) alone only reserves the string offsets and null bitmap.
+  if (column.type()->id() == arrow::Type::STRING) {
+    ARROW_RETURN_NOT_OK(
+        (ReserveSelectedBytes<arrow::StringArray, arrow::StringBuilder>(
+            column, plan, builder)));
+  } else if (column.type()->id() == arrow::Type::BINARY) {
+    ARROW_RETURN_NOT_OK(
+        (ReserveSelectedBytes<arrow::BinaryArray, arrow::BinaryBuilder>(
+            column, plan, builder)));
+  }
+  switch (column.type()->id()) {
+    case arrow::Type::BOOL:
+      return AppendTypedRows<arrow::BooleanArray, arrow::BooleanBuilder>(
+          column, plan, builder);
+    case arrow::Type::INT32:
+      return AppendTypedRows<arrow::Int32Array, arrow::Int32Builder>(
+          column, plan, builder);
+    case arrow::Type::INT64:
+      return AppendTypedRows<arrow::Int64Array, arrow::Int64Builder>(
+          column, plan, builder);
+    case arrow::Type::UINT32:
+      return AppendTypedRows<arrow::UInt32Array, arrow::UInt32Builder>(
+          column, plan, builder);
+    case arrow::Type::UINT64:
+      return AppendTypedRows<arrow::UInt64Array, arrow::UInt64Builder>(
+          column, plan, builder);
+    case arrow::Type::FLOAT:
+      return AppendTypedRows<arrow::FloatArray, arrow::FloatBuilder>(
+          column, plan, builder);
+    case arrow::Type::DOUBLE:
+      return AppendTypedRows<arrow::DoubleArray, arrow::DoubleBuilder>(
+          column, plan, builder);
+    case arrow::Type::STRING:
+      return AppendTypedRows<arrow::StringArray, arrow::StringBuilder>(
+          column, plan, builder);
+    case arrow::Type::BINARY:
+      return AppendTypedRows<arrow::BinaryArray, arrow::BinaryBuilder>(
+          column, plan, builder);
+    default:
+      break;
+  }
+  // Nested and other uncommon types keep Arrow's general append semantics.
+  ailego::BudgetedVector<arrow::ArraySpan> spans;
+  spans.reserve(column.num_chunks());
+  for (const auto &chunk : column.chunks()) spans.emplace_back(*chunk->data());
+  return plan.visit<arrow::Array>(
+      column, [&](const arrow::Array &, int64_t row, int chunk) {
+        return builder->AppendArraySlice(spans[chunk], row, 1);
+      });
+}
+
+}  // namespace
 
 BufferPoolForwardStore::BufferPoolForwardStore(const std::string &uri)
     : file_path_(uri) {}
@@ -77,7 +513,7 @@ Status BufferPoolForwardStore::open() try {
 }
 arrow::Status BufferPoolForwardStore::open_parquet(
     const std::shared_ptr<arrow::io::RandomAccessFile> &file) {
-  metadata_id_ = ParquetBufferID(file_path_, 0, 0);
+  metadata_id_ = ParquetBufferID(file_path_, file, 0, 0);
   auto memory_pool = detail::GetParquetMemoryPool();
   ARROW_ASSIGN_OR_RAISE(
       auto parquet_file_reader,
@@ -211,7 +647,8 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
   using RowGroupRows = ailego::BudgetedVector<std::pair<size_t, uint64_t>>;
   using RowGroupEntry = std::pair<const int, RowGroupRows>;
   std::unordered_map<int, RowGroupRows, std::hash<int>, std::equal_to<int>,
-                     ailego::BudgetedAllocator<RowGroupEntry>> rg_to_local;
+                     ailego::BudgetedAllocator<RowGroupEntry>>
+      rg_to_local;
   size_t output_row = 0;
   for (int global_row : indices) {
     if (global_row < 0 || global_row >= num_rows_) {
@@ -245,22 +682,23 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
   int64_t *order = nullptr;
   if (!col_indices.empty()) {
     ARROW_ASSIGN_OR_RAISE(
-        order_buffer, arrow::AllocateBuffer(indices.size() * sizeof(int64_t),
-                                            pool));
+        order_buffer,
+        arrow::AllocateBuffer(indices.size() * sizeof(int64_t), pool));
     order = reinterpret_cast<int64_t *>(order_buffer->mutable_data());
   }
   bool needs_reordering = false;
 
   for (const auto &[rg_id, pairs] : rg_to_local) {
+    detail::SelectedRowsPlan row_plan(pairs);
     for (size_t i = 0; i < col_indices.size(); ++i) {
       int col_idx = col_indices[i];
-      auto buffer_id =
-          ParquetBufferID(file_path_, col_idx, rg_id, metadata_id_);
+      auto buffer_id = metadata_id_;
+      buffer_id.column = col_idx;
+      buffer_id.row_group = rg_id;
       ARROW_ASSIGN_OR_RAISE(
           auto buffer_handle,
           ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id));
-      std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
-          buffer_handle.data();
+      const auto *col_chunked_array = buffer_handle.borrowed_data();
       if (!col_chunked_array) {
         LOG_ERROR(
             "Failed to pin parquet data for file: %s, column: %d, row_group: "
@@ -277,25 +715,26 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
         return arrow::Status::Invalid("Parquet column has no chunks");
       }
 
-      for (const auto &[tmp_output_row, local_idx] : pairs) {
-        if ((size_t)local_idx >= (size_t)col_chunked_array->length()) {
-          LOG_ERROR("Local index %ld out of bounds for array length %zu",
-                    static_cast<long>(local_idx),
-                    (size_t)col_chunked_array->length());
-          return arrow::Status::IndexError(
-              "Parquet row outside decoded column: ", local_idx);
-        }
-        if (i == 0) {
-          order[tmp_output_row] = builders[i]->length();
+      if (i == 0) {
+        int64_t appended = builders[i]->length();
+        for (const auto &row : pairs) {
+          order[row.first] = appended++;
           needs_reordering |=
-              order[tmp_output_row] != static_cast<int64_t>(tmp_output_row);
+              order[row.first] != static_cast<int64_t>(row.first);
         }
-        ARROW_RETURN_NOT_OK(detail::AppendFetchRow(
-            builders[i].get(), *col_chunked_array, local_idx));
       }
+      ARROW_RETURN_NOT_OK(
+          AppendSelectedRows(*col_chunked_array, row_plan, builders[i].get()));
     }
   }
 
+  SelectedRows reordered;
+  if (needs_reordering) {
+    reordered.reserve(indices.size());
+    for (size_t row = 0; row < indices.size(); ++row)
+      reordered.emplace_back(row, static_cast<uint64_t>(order[row]));
+  }
+  detail::SelectedRowsPlan reorder_plan(reordered);
   std::vector<std::shared_ptr<arrow::Array>> result_arrays(columns.size());
   for (size_t i = 0; i < builders.size(); ++i) {
     std::shared_ptr<arrow::Array> arr;
@@ -306,10 +745,9 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
       continue;
     }
     ARROW_RETURN_NOT_OK(builders[i]->Reserve(indices.size()));
-    for (size_t row = 0; row < indices.size(); ++row) {
-      ARROW_RETURN_NOT_OK(
-          builders[i]->AppendArraySlice(*arr->data(), order[row], 1));
-    }
+    const arrow::ChunkedArray gathered(arr);
+    ARROW_RETURN_NOT_OK(
+        AppendSelectedRows(gathered, reorder_plan, builders[i].get()));
     ARROW_RETURN_NOT_OK(builders[i]->Finish(&result_arrays[position]));
   }
 
@@ -358,7 +796,9 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   std::vector<arrow::Datum> scalars;
   for (size_t i = 0; i < col_indices.size(); ++i) {
     int col_idx = col_indices[i];
-    auto buffer_id = ParquetBufferID(file_path_, col_idx, rg_id, metadata_id_);
+    auto buffer_id = metadata_id_;
+    buffer_id.column = col_idx;
+    buffer_id.row_group = rg_id;
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
     if (!acquired.ok()) {
@@ -368,8 +808,7 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
       return nullptr;
     }
     auto buffer_handle = std::move(acquired).ValueOrDie();
-    std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
-        buffer_handle.data();
+    const auto *col_chunked_array = buffer_handle.borrowed_data();
 
     if (!col_chunked_array) {
       LOG_ERROR(
@@ -382,7 +821,18 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
     // Resolve the row within its chunk instead of copying the entire decoded
     // row-group column for every scalar fetch.
     const int64_t local_index = index - offset;
-    auto scalar_result = col_chunked_array->GetScalar(local_index);
+    std::shared_ptr<arrow::Scalar> owned;
+    int64_t row = local_index;
+    for (const auto &chunk : col_chunked_array->chunks()) {
+      if (row < chunk->length()) {
+        owned = ReadOwnedScalar(*chunk, row);
+        break;
+      }
+      row -= chunk->length();
+    }
+    auto scalar_result =
+        owned ? arrow::Result<std::shared_ptr<arrow::Scalar>>(std::move(owned))
+              : buffer_handle.data()->GetScalar(local_index);
     if (!scalar_result.ok()) {
       if (scalar_result.status().IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("Failed to get scalar for row %zu status: %s",
@@ -395,6 +845,133 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   }
 
   return std::make_shared<arrow::compute::ExecBatch>(std::move(scalars), 1);
+}
+
+std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
+    const std::vector<std::string> &columns,
+    const std::shared_ptr<arrow::Schema> &schema, int index) {
+  if (index < 0 || index >= num_rows_ || columns.size() < 2 || !schema ||
+      schema->num_fields() != static_cast<int>(columns.size()) ||
+      columns[0] != GLOBAL_DOC_ID || columns[1] != USER_ID) {
+    return nullptr;
+  }
+  ailego::BudgetedVector<int> selected;
+  selected.reserve(columns.size());
+  for (size_t i = 0; i < columns.size(); ++i) {
+    const int column = physic_schema_->GetFieldIndex(columns[i]);
+    if (column < 0 || schema->field(i)->name() != columns[i] ||
+        !schema->field(i)->type()->Equals(
+            physic_schema_->field(column)->type())) {
+      return nullptr;
+    }
+    const auto &field_type = schema->field(i)->type();
+    const auto type = field_type->id();
+    if ((i == 0 && type != arrow::Type::UINT64) ||
+        (i == 1 && type != arrow::Type::STRING)) {
+      return nullptr;
+    }
+    if (type == arrow::Type::LIST) {
+      const auto &list_type = static_cast<const arrow::ListType &>(*field_type);
+      if (!SupportsDirectDocValues(list_type.value_type()->id()))
+        return nullptr;
+    } else if (!SupportsDirectDocValues(type)) {
+      return nullptr;
+    }
+    selected.push_back(column);
+  }
+  const int group = find_row_group_for_row(index);
+  const int64_t local_row = index - get_row_group_offset(group);
+  ailego::BudgetedVector<ParquetBufferContextHandle> pins;
+  ailego::BudgetedVector<std::pair<const arrow::Array *, int64_t>> source_rows;
+  pins.reserve(selected.size());
+  source_rows.reserve(selected.size());
+  detail::QueryResultEstimate estimate;
+  estimate.add(sizeof(Doc) + 256);
+  for (size_t i = 0; i < selected.size(); ++i) {
+    auto key = metadata_id_;
+    key.column = selected[i];
+    key.row_group = group;
+    auto acquired =
+        ParquetBufferPool::get_instance().acquire_buffer_checked(key);
+    if (!acquired.ok()) {
+      if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+      return nullptr;
+    }
+    pins.push_back(std::move(acquired).ValueOrDie());
+    const auto *column = pins.back().borrowed_data();
+    if (!column) return nullptr;
+    int64_t row = local_row;
+    const arrow::Array *array = nullptr;
+    for (const auto &chunk : column->chunks()) {
+      if (row < chunk->length()) {
+        array = chunk.get();
+        break;
+      }
+      row -= chunk->length();
+    }
+    if (!array || (i < 2 && array->IsNull(row))) return nullptr;
+    estimate.add(192 + columns[i].size() * 2);
+    estimate.value(*array, row);
+    source_rows.emplace_back(array, row);
+  }
+  // Match Segment's result-copy admission before allocating any Doc fields.
+  auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+      &detail::SharedResultMemoryAllowance());
+  detail::ResultMemoryAllowance::PendingCopy pending;
+  memory->add_pending(estimate.bytes(), pending);
+  pending.start();
+  auto doc = detail::MakeQueryDocument(memory);
+  for (size_t i = 0; i < source_rows.size(); ++i) {
+    const auto [array, row] = source_rows[i];
+    if (array->IsNull(row)) continue;
+    if (i == 0) {
+      doc->set_doc_id(
+          static_cast<const arrow::UInt64Array *>(array)->Value(row));
+    } else if (i == 1) {
+      doc->set_pk(std::string(
+          static_cast<const arrow::StringArray *>(array)->GetView(row)));
+    } else {
+      // Copies become owned Doc values before this column's pin is released.
+      switch (array->type_id()) {
+        case arrow::Type::BOOL:
+          ReadDocField<arrow::BooleanArray>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::INT32:
+          ReadDocField<arrow::Int32Array>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::INT64:
+          ReadDocField<arrow::Int64Array>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::UINT32:
+          ReadDocField<arrow::UInt32Array>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::UINT64:
+          ReadDocField<arrow::UInt64Array>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::FLOAT:
+          ReadDocField<arrow::FloatArray>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::DOUBLE:
+          ReadDocField<arrow::DoubleArray>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::STRING:
+          ReadDocField<arrow::StringArray>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::BINARY:
+          ReadDocField<arrow::BinaryArray>(*array, row, columns[i], *doc);
+          break;
+        case arrow::Type::LIST:
+          if (!ReadListDocField(static_cast<const arrow::ListArray &>(*array),
+                                row, columns[i], *doc)) {
+            return nullptr;
+          }
+          break;
+        default:
+          return nullptr;
+      }
+    }
+  }
+  return doc;
 }
 
 RecordBatchReaderPtr BufferPoolForwardStore::scan(

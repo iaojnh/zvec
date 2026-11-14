@@ -146,16 +146,19 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
   // only owns the bytes and the indexer receives the ready-to-use quantizer.
   // The implementation is resolved from the meta buffer header, so any
   // supported quantize type (PQ today, others later) plugs in transparently.
-  DiskAnnSearcherEntity::QuantizerMetaBuffer quantizer_meta_buffer;
-  ret = entity_.read_pq_quantizer_meta_buffer(&quantizer_meta_buffer);
-  if (ret != 0) {
-    LOG_ERROR("Read quantizer meta buffer failed, ret=%d", ret);
-    return ret;
+  turbo::Quantizer::Pointer quantizer;
+  {
+    DiskAnnSearcherEntity::QuantizerMetaBuffer quantizer_meta_buffer;
+    ret = entity_.read_pq_quantizer_meta_buffer(&quantizer_meta_buffer);
+    if (ret != 0) {
+      LOG_ERROR("Read quantizer meta buffer failed, ret=%d", ret);
+      return ret;
+    }
+    quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
+        quantizer_meta_buffer.bytes, meta_,
+        static_cast<uint32_t>(entity_.pq_chunk_num()),
+        entity_.legacy_pq_layout());
   }
-  auto quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-      quantizer_meta_buffer.bytes, meta_,
-      static_cast<uint32_t>(entity_.pq_chunk_num()),
-      entity_.legacy_pq_layout());
   if (!quantizer) {
     return IndexError_NoExist;
   }
@@ -186,6 +189,7 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
     measure_ = measure_->query_metric();
   }
 
+  entity_.prepare_pq();
   stats_.set_loaded_costtime(ailego::Monotime::MilliSeconds() - start_time);
   stats_.set_loaded_count(entity_.doc_cnt());
   state_ = STATE_LOADED;

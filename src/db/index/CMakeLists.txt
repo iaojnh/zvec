@@ -1,8 +1,21 @@
 include(${PROJECT_ROOT_DIR}/cmake/bazel.cmake)
 include(${PROJECT_ROOT_DIR}/cmake/option.cmake)
 
-include(${PROJECT_ROOT_DIR}/cmake/fts_bitpacking.cmake)
-zvec_configure_fts_bitpacking()
+if(NOT ANDROID AND AUTO_DETECT_ARCH)
+    if (HOST_ARCH MATCHES "^(x86|x64)$")
+        setup_compiler_march_for_x86(INDEX_MARCH_FLAG_SSE INDEX_MARCH_FLAG_AVX2 INDEX_MARCH_FLAG_AVX512 INDEX_MARCH_FLAG_AVX512FP16)
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/column/fts_column/posting/bitpacked_simd_sse41.cc
+            PROPERTIES
+            COMPILE_FLAGS "${INDEX_MARCH_FLAG_SSE}"
+        )
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/column/fts_column/posting/bitpacked_simd_avx2.cc
+            PROPERTIES
+            COMPILE_FLAGS "${INDEX_MARCH_FLAG_AVX2}"
+        )
+    endif()
+endif()
 
 cc_library(
     NAME zvec_index STATIC STRICT

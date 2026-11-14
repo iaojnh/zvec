@@ -40,7 +40,6 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
   std::string vector_path;
   std::string graph_path;
   std::string code_path;
-  std::string graph_codes_path;
   IndexStorage::Pointer vector_storage;
   IndexStorage::Pointer graph_storage;
   IndexStorage::Segment::Pointer vectors;
@@ -49,8 +48,6 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
   IndexStorage::Segment::Pointer graph;
   IndexStorage::Segment::Pointer keys;
   mutable ailego::File codes;
-  IndexStorage::Pointer graph_codes_storage;
-  IndexStorage::Segment::Pointer graph_codes;
   bool vectors_sealed{false};
 
   int ensure_directory() {
@@ -66,14 +63,12 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
       std::string vectors_candidate = candidate + "/vectors";
       std::string graph_candidate = candidate + "/graph";
       std::string codes_candidate = candidate + "/codes";
-      std::string graph_codes_candidate = candidate + "/graph-codes";
       std::error_code error;
       if (std::filesystem::create_directory(candidate, error)) {
         directory = std::move(candidate);
         vector_path = std::move(vectors_candidate);
         graph_path = std::move(graph_candidate);
         code_path = std::move(codes_candidate);
-        graph_codes_path = std::move(graph_codes_candidate);
         return 0;
       }
       if (error && error != std::errc::file_exists) return IndexError_OpenFile;
@@ -91,15 +86,7 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
     if (!vector_path.empty()) ailego::File::Delete(vector_path);
   }
 
-  void release_graph_codes() {
-    graph_codes.reset();
-    if (graph_codes_storage) graph_codes_storage->close();
-    graph_codes_storage.reset();
-    if (!graph_codes_path.empty()) ailego::File::Delete(graph_codes_path);
-  }
-
   void clear_files() {
-    release_graph_codes();
     release_vectors();
     graph.reset();
     keys.reset();
@@ -117,7 +104,6 @@ struct DiskAnnBuilderEntity::BufferedBuildState {
     vector_path.clear();
     graph_path.clear();
     code_path.clear();
-    graph_codes_path.clear();
   }
 
   ~BufferedBuildState() {
@@ -213,7 +199,6 @@ void DiskAnnBuilderEntity::release_vectors() {
   ailego::BudgetedVector<const void *>().swap(vector_ptrs_);
   vector_lifetime_.reset();
   if (buffered_state_) {
-    buffered_state_->release_graph_codes();
     buffered_state_->release_vectors();
   }
 }
@@ -744,68 +729,6 @@ int DiskAnnBuilderEntity::append_codes(const void *data, size_t bytes) {
   }
   code_bytes_written_ += bytes;
   return 0;
-}
-
-int DiskAnnBuilderEntity::prepare_graph_quantization() try {
-  if (buffered_state_) buffered_state_->release_graph_codes();
-  if (!buffered_state_ || !pq_quantizer_ || doc_cnt() == 0 ||
-      pq_meta_.chunk_num == 0 ||
-      pq_meta_.chunk_num > std::numeric_limits<uint32_t>::max() ||
-      pq_quantizer_->quantized_datapoint_vector_length() != pq_meta_.chunk_num ||
-      doc_cnt() > std::numeric_limits<size_t>::max() / pq_meta_.chunk_num ||
-      code_bytes_ != doc_cnt() * pq_meta_.chunk_num ||
-      code_bytes_written_ != code_bytes_ || !buffered_state_->codes.is_valid())
-    return IndexError_NoReady;
-  auto &state = *buffered_state_;
-  // The code corpus can itself exceed available workspace. Its data pages
-  // must compete with vectors in the same cache, rather than remain pinned.
-  AILEGO_DEFER([&] {
-    if (!state.graph_codes) state.release_graph_codes();
-  });
-  state.graph_codes_storage = IndexFactory::CreateStorage("BufferStorage");
-  if (!state.graph_codes_storage) return IndexError_NoExist;
-  int ret = state.graph_codes_storage->init(ailego::Params());
-  if (ret != 0) return ret;
-  ret = state.graph_codes_storage->open(state.graph_codes_path, true);
-  if (ret != 0) return ret;
-  ret = state.graph_codes_storage->append("codes", code_bytes_);
-  if (ret != 0) return ret;
-  auto segment = state.graph_codes_storage->get("codes");
-  if (!segment) return IndexError_Runtime;
-  ailego::BudgetedVector<char> scratch(64 * 1024);
-  for (size_t offset = 0; offset < code_bytes_;) {
-    const size_t bytes = std::min(scratch.size(), code_bytes_ - offset);
-    if (buffered_state_->codes.read(static_cast<ssize_t>(offset),
-                                    scratch.data(), bytes) != bytes)
-      return IndexError_ReadData;
-    if (segment->write(offset, scratch.data(), bytes) != bytes)
-      return segment->write_error();
-    offset += bytes;
-  }
-  segment.reset();
-  ret = state.graph_codes_storage->flush();
-  if (ret != 0) return ret;
-  ret = state.graph_codes_storage->close();
-  if (ret != 0) return ret;
-  state.graph_codes_storage = IndexFactory::CreateStorage("BufferStorage");
-  if (!state.graph_codes_storage) return IndexError_NoExist;
-  ret = state.graph_codes_storage->init(ailego::Params());
-  if (ret != 0) return ret;
-  ret = state.graph_codes_storage->open(state.graph_codes_path, false);
-  if (ret != 0) return ret;
-  state.graph_codes = state.graph_codes_storage->get("codes");
-  if (!state.graph_codes) return IndexError_Runtime;
-  return 0;
-} catch (const std::bad_alloc &) {
-  return IndexError_NoMemory;
-}
-
-DiskAnnEntity::GraphQuantization DiskAnnBuilderEntity::graph_quantization()
-    const {
-  if (!buffered_state_ || !buffered_state_->graph_codes) return {};
-  return {pq_quantizer_.get(), nullptr,
-          static_cast<uint32_t>(pq_meta_.chunk_num),
-          buffered_state_->graph_codes};
 }
 
 int64_t DiskAnnBuilderEntity::dump_segment(const IndexDumper::Pointer &dumper,

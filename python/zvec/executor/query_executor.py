@@ -56,7 +56,7 @@ def _query_fields(values):
 
 def convert_to_numpy(vec: Union[list, np.ndarray], dtype: np.dtype) -> np.ndarray:
     if isinstance(vec, np.ndarray):
-        if vec.dtype == dtype and vec.ndim == 1 and vec.flags.c_contiguous:
+        if vec.dtype == dtype and vec.ndim == 1:
             return vec
         return np.asarray(vec, dtype=dtype).flatten()
 

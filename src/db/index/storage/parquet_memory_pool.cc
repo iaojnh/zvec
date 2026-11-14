@@ -86,9 +86,8 @@ arrow::Status MappingSize(int64_t size, int64_t alignment, size_t *out) {
   }
   const uint64_t limit = std::min<uint64_t>(
       std::numeric_limits<size_t>::max(), std::numeric_limits<int64_t>::max());
-  const uint64_t padding =
-      static_cast<uint64_t>(alignment - 1) + sizeof(MappingHeader) +
-      sizeof(MappingProjection);
+  const uint64_t padding = static_cast<uint64_t>(alignment - 1) +
+                           sizeof(MappingHeader) + sizeof(MappingProjection);
   if (padding > limit || static_cast<uint64_t>(size) > limit - padding ||
       static_cast<uint64_t>(size) + padding > limit - (page_size - 1)) {
     return arrow::Status::OutOfMemory("Parquet mapping size overflow");
@@ -195,7 +194,8 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
     chunk->next = small_chunks_[index];
     small_chunks_[index] = chunk;
   } else if (!budget.try_materialize_retained_block(chunk)) {
-    return arrow::Status::OutOfMemory("Parquet small slot exceeds RSS headroom");
+    return arrow::Status::OutOfMemory(
+        "Parquet small slot exceeds RSS headroom");
   }
   void *slot = chunk->free_head;
   if (slot) {
@@ -302,7 +302,7 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
   return arrow::Status::OK();
 }
 
-std::optional<arrow::Status> ParquetMemoryPool::TryReallocateInPlace(
+std::optional<arrow::Status> ParquetMemoryPool::try_reallocate_in_place(
     int64_t old_size, int64_t new_size, int64_t alignment, uint8_t **ptr) {
   if (ptr == nullptr || (old_size != 0 && *ptr == nullptr)) {
     return arrow::Status::Invalid("Null Parquet reallocation input");
@@ -358,7 +358,8 @@ std::optional<arrow::Status> ParquetMemoryPool::TryReallocateInPlace(
 
 arrow::Status ParquetMemoryPool::Reallocate(int64_t old_size, int64_t new_size,
                                             int64_t alignment, uint8_t **ptr) {
-  if (auto status = TryReallocateInPlace(old_size, new_size, alignment, ptr)) {
+  if (auto status =
+          try_reallocate_in_place(old_size, new_size, alignment, ptr)) {
     return *status;
   }
   alignment = std::max(alignment, kMinimumAlignment);

@@ -28,6 +28,7 @@
 #include <future>
 #include <limits>
 #include <new>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
@@ -1359,7 +1360,7 @@ TEST_F(BufferPoolTest, MetadataIsCountedAndReleasedWithPool) {
 TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
   constexpr size_t kOneSegmentPages = 16UL * 1024UL;
   const size_t page_table_bytes =
-      VectorPageTable::metadata_bytes_for_entries(kOneSegmentPages, false);
+      VectorPageTable::metadata_bytes_for_entries(kOneSegmentPages, false, true);
   const size_t read_only_bytes =
       VecBufferPool::metadata_bytes_for_page_count(kOneSegmentPages);
   const size_t writable_bytes = VecBufferPool::metadata_bytes_for_page_count(
@@ -1380,7 +1381,7 @@ TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
   VecBufferPool pool(file, /*writable=*/false);
   ASSERT_EQ(pool.init(), 0);
   const auto stats = pool.stats();
-  EXPECT_EQ(VectorPageTable::metadata_bytes_for_entries(1, false),
+  EXPECT_EQ(VectorPageTable::metadata_bytes_for_entries(1, false, true),
             stats.page_table_metadata_bytes);
   EXPECT_EQ(0u, stats.page_lock_metadata_bytes);
 }
@@ -1428,6 +1429,44 @@ TEST_F(BufferPoolTest, ReadOnlyPartialLastSegmentPreservesFinalPage) {
     const char expected = static_cast<char>((pages - 1) & 0xff);
     for (char value : output) EXPECT_EQ(expected, value);
   }
+}
+
+TEST_F(BufferPoolTest, ReadOnlyMetadataReloadKeepsOneLoadedLinkAcrossSegments) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(16UL << 20));
+  constexpr size_t count = 16384 + 3;
+  VectorPageTable table;
+  ASSERT_TRUE(table.init(count, false, true));
+  EXPECT_FALSE(table.extend(count + 1));
+  EXPECT_FALSE(table.init(count, false, false));
+  const size_t cold = table.metadata_bytes();
+  EXPECT_LT(cold, VectorPageTable::metadata_bytes_for_entries(count, false));
+  size_t flushes = 0;
+  table.set_flush_callback([&](block_id_t, char *, size_t, size_t) {
+    ++flushes;
+    return 0;
+  });
+  const block_id_t ids[]{0, 16383, 16384, count - 1};
+  for (size_t pass = 0; pass < 4; ++pass) {
+    for (auto id : ids) {
+      char *buffer = nullptr;
+      ASSERT_TRUE(MemoryLimitPool::get_instance().try_acquire_buffer(
+          kVectorPageSize, buffer));
+      std::memset(buffer, static_cast<int>(id & 255), kVectorPageSize);
+      ASSERT_EQ(buffer, table.set_block_acquired(id, buffer, id * kVectorPageSize));
+      EXPECT_TRUE(table.is_ever_loaded(id));
+      table.mark_dirty(id);
+      EXPECT_FALSE(table.is_block_dirty(id));
+      EXPECT_FALSE(table.try_mark_writeback_pending(id));
+      EXPECT_EQ(0, table.flush_block(id));
+      table.release_block(id);
+    }
+    const auto residents = table.resident_pages_by_priority();
+    EXPECT_EQ(4u, std::accumulate(residents.begin(), residents.end(), size_t{0}));
+    table.force_evict_all_loaded();
+    for (auto id : ids) EXPECT_FALSE(table.is_loaded(id));
+    EXPECT_FALSE(table.is_ever_loaded(1));
+  }
+  EXPECT_EQ(0u, flushes);
 }
 
 TEST_F(BufferPoolTest, EmptyPageTableChargesDirectoryOnFirstExtend) {
@@ -3405,6 +3444,131 @@ TEST_F(BufferPoolTest, BulkScratchShrinksToAvailableBudgetAndReleases) {
     EXPECT_EQ(before, budget.external_used());
     EXPECT_LE(budget.used(), budget.capacity());
   }
+}
+
+TEST_F(BufferPoolTest, OptionalPreparationIsSequentialCorrectAndIdempotent) {
+  init_vec_pool(/*capacity_pages=*/128, /*file_pages=*/32);
+  VecBufferPool pool(new_file(32), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  const auto prepared = pool.prepare_pages_if_fits(2, 16);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kComplete, prepared.status);
+  EXPECT_EQ(16u, prepared.pages_loaded);
+  EXPECT_EQ(16 * kVectorPageSize, prepared.bytes_read);
+  EXPECT_FALSE(pool.is_page_resident(0));
+  EXPECT_FALSE(pool.is_page_resident(18));
+  auto handle = pool.get_handle();
+  std::vector<char> page(kVectorPageSize);
+  for (size_t id = 2; id < 18; ++id) {
+    EXPECT_TRUE(pool.is_page_resident(id));
+    ASSERT_TRUE(handle.read_range(id * kVectorPageSize, page.size(), page.data()));
+    ExpectPageContent(page.data(), id);
+  }
+  const auto again = pool.prepare_pages_if_fits(2, 16);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kComplete, again.status);
+  EXPECT_EQ(0u, again.pages_loaded);
+  EXPECT_EQ(0u, again.bytes_read);
+}
+
+TEST_F(BufferPoolTest, OptionalPreparationSkipsWithoutEvictingResidentPages) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/64);
+  VecBufferPool pool(new_file(64), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  auto handle = pool.get_handle();
+  std::vector<char> data(kVectorPageSize);
+  ASSERT_TRUE(handle.read_range(0, data.size(), data.data()));
+  const auto evicted = pool.stats().evict;
+  const auto prepared = pool.prepare_pages_if_fits(1, 63);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kSkipped, prepared.status);
+  EXPECT_EQ(0u, prepared.bytes_read);
+  EXPECT_EQ(evicted, pool.stats().evict);
+  EXPECT_TRUE(pool.is_page_resident(0));
+  EXPECT_FALSE(pool.is_page_resident(1));
+}
+
+TEST_F(BufferPoolTest, OptionalPreparationRejectsWritableAndInvalidRanges) {
+  init_vec_pool(/*capacity_pages=*/128, /*file_pages=*/32, /*writable=*/true);
+  VecBufferPool writable(new_file(32), /*writable=*/true);
+  ASSERT_EQ(0, writable.init());
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kSkipped,
+            writable.prepare_pages_if_fits(0, 2).status);
+  VecBufferPool read_only(new_file(32), /*writable=*/false);
+  ASSERT_EQ(0, read_only.init());
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kSkipped,
+            read_only.prepare_pages_if_fits(31, 2).status);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kSkipped,
+            read_only.prepare_pages_if_fits(0, SIZE_MAX).status);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kSkipped,
+            read_only.prepare_pages_if_fits(SIZE_MAX, 1).status);
+}
+
+TEST_F(BufferPoolTest, ConcurrentOptionalPreparationsShareOneBudget) {
+  constexpr size_t pages = 1024;
+  const size_t metadata = VecBufferPool::metadata_bytes_for_page_count(pages);
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
+      (2 * pages + 64) * kVectorPageSize + 2 * metadata));
+  VecBufferPool a(new_file(pages), /*writable=*/false);
+  VecBufferPool b(new_file(pages), /*writable=*/false);
+  ASSERT_EQ(0, a.init());
+  ASSERT_EQ(0, b.init());
+  std::atomic<int> ready{0};
+  std::array<VecBufferPool::PrepareResult, 2> results;
+  auto run = [&](VecBufferPool &pool, size_t slot) {
+    ready.fetch_add(1);
+    while (ready.load() != 2) std::this_thread::yield();
+    results[slot] = pool.prepare_pages_if_fits(0, pages);
+  };
+  std::thread x(run, std::ref(a), 0), y(run, std::ref(b), 1);
+  x.join(); y.join();
+  EXPECT_EQ(pages, results[0].pages_loaded + results[1].pages_loaded);
+  EXPECT_EQ(1, int(results[0].status == VecBufferPool::PrepareStatus::kComplete) +
+                 int(results[1].status == VecBufferPool::PrepareStatus::kComplete));
+  EXPECT_EQ(0u, a.stats().evict + b.stats().evict);
+  EXPECT_LE(MemoryLimitPool::get_instance().used(),
+            MemoryLimitPool::get_instance().capacity());
+}
+
+TEST_F(BufferPoolTest, OptionalPreparationYieldsToProcessPressure) {
+  init_vec_pool(/*capacity_pages=*/128, /*file_pages=*/32);
+  VecBufferPool pool(new_file(32), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  auto &memory = MemoryLimitPool::get_instance();
+  ASSERT_TRUE(memory.configure_process_rss_limit(1UL << 30));
+  memory.set_memory_pressure(ProcessRssBudget::PressureLevel::kCritical);
+  const auto prepared = pool.prepare_pages_if_fits(0, 32);
+  memory.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  EXPECT_TRUE(memory.configure_process_rss_limit(0));
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kSkipped, prepared.status);
+  EXPECT_EQ(0u, prepared.bytes_read);
+}
+
+TEST_F(BufferPoolTest, OptionalPreparationPreservesAnotherReadersLoadClaim) {
+  init_vec_pool(/*capacity_pages=*/128, /*file_pages=*/32);
+  VecBufferPool pool(new_file(32), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  ASSERT_EQ(VectorPageTable::LoadClaimResult::kClaimed,
+            pool.page_table_.try_claim_block_load(0));
+  const auto prepared = pool.prepare_pages_if_fits(0, 16);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kPressure, prepared.status);
+  EXPECT_EQ(15u, prepared.pages_loaded);
+  EXPECT_TRUE(pool.page_table_.cancel_block_load(0));
+  const auto finished = pool.prepare_pages_if_fits(0, 16);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kComplete, finished.status);
+  EXPECT_EQ(1u, finished.pages_loaded);
+}
+
+TEST_F(BufferPoolTest, OptionalPreparationReportsReadFailureWithoutPublishing) {
+  init_vec_pool(/*capacity_pages=*/128, /*file_pages=*/32);
+  const std::string file = new_file(32);
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  FILE *truncated = std::fopen(file.c_str(), "wb");
+  ASSERT_NE(nullptr, truncated);
+  std::fclose(truncated);
+  const auto prepared = pool.prepare_pages_if_fits(0, 16);
+  EXPECT_EQ(VecBufferPool::PrepareStatus::kReadError, prepared.status);
+  EXPECT_EQ(0u, prepared.pages_loaded);
+  EXPECT_EQ(0u, prepared.bytes_read);
+  EXPECT_FALSE(pool.is_page_resident(0));
 }
 
 TEST_F(BufferPoolTest, ReadAndPrefetchRangesRejectOverflow) {

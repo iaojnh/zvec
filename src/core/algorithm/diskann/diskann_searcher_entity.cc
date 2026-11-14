@@ -15,6 +15,7 @@
 #include "diskann_searcher_entity.h"
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include "diskann_util.h"
 
 namespace zvec {
@@ -175,8 +176,25 @@ int DiskAnnSearcherEntity::load_pq_segment() {
       meta_header_.doc_cnt > pq_data_segment_->data_size() / pq_meta_.chunk_num)
     return IndexError_InvalidFormat;
   size_t code_bytes = meta_header_.doc_cnt * pq_meta_.chunk_num;
-  if (storage_->vec_buffer_pool()) {
+  if (auto pool = storage_->vec_buffer_pool()) {
     pq_codes_.reset();
+    if (!pool->writable()) {
+      // PQ is consulted for many more candidates than the graph is expanded.
+      // Prefer retaining its pages over graph pages, without prefetching or
+      // pinning them: a budget smaller than PQ must still support eviction.
+      const size_t offset = pq_data_segment_->data_offset();
+      if (offset > std::numeric_limits<size_t>::max() - code_bytes) {
+        return IndexError_InvalidFormat;
+      }
+      const size_t first_page = offset / ailego::kVectorPageSize;
+      const size_t last_page =
+          (offset + code_bytes - 1) / ailego::kVectorPageSize;
+      for (size_t page = first_page; page <= last_page; ++page) {
+        if (!pool->set_page_priority(page, ailego::VecBufferPool::kHighPriority)) {
+          return IndexError_InvalidFormat;
+        }
+      }
+    }
     return 0;
   }
 
@@ -190,6 +208,25 @@ int DiskAnnSearcherEntity::load_pq_segment() {
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
+}
+
+void DiskAnnSearcherEntity::prepare_pq() {
+  if (!storage_ || !storage_->automatic_warmup_enabled() ||
+      !pq_data_segment_ || pq_codes_.data()) return;
+  auto pool = storage_->vec_buffer_pool();
+  if (!pool || !pool->cache_enabled() || pool->writable()) return;
+  const size_t bytes = meta_header_.doc_cnt * pq_meta_.chunk_num;
+  if (!bytes) return;
+  const size_t offset = pq_data_segment_->data_offset();
+  const size_t first = offset / ailego::kVectorPageSize;
+  const size_t last = (offset + bytes - 1) / ailego::kVectorPageSize;
+  const auto start = ailego::Monotime::MilliSeconds();
+  const auto result = pool->prepare_pages_if_fits(first, last - first + 1);
+  LOG_INFO("DiskANN PQ preparation: status=%d pages=%zu/%zu read_bytes=%zu "
+           "elapsed_ms=%llu", static_cast<int>(result.status),
+           result.pages_loaded, last - first + 1, result.bytes_read,
+           static_cast<unsigned long long>(
+               ailego::Monotime::MilliSeconds() - start));
 }
 
 int DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer(

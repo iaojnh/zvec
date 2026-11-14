@@ -1287,7 +1287,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
           : DiskAnnUtil::div_round_up(max_node_size_, DiskAnnUtil::kSectorSize);
 
   dc.bind_quantizer(quantizer_.get(), quant_codes_, quant_code_size_,
-                    paged_quant_codes_);
+                    paged_quant_codes_,
+                    storage_ ? storage_->vec_buffer_pool().get() : nullptr);
   if (dc.quantize_query(ctx->query_rotated()) != 0) return dc.error_code();
 
   ailego::ElapsedTime query_timer;
@@ -1297,21 +1298,6 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
   NeighborPriorityQueue candidates;
 
   candidates.reserve(ctx->list_size());
-
-  // Deleted/filtered vertices remain graph bridges, but must not consume the
-  // entire allowance for live candidates. Each discovered ID is visited once;
-  // compensate for filtered IDs within the document-count bound. The queue's
-  // BudgetedAllocator charges any additional workspace before allocating it.
-  const auto admit_candidate = [&](diskann_id_t id, float distance) {
-    bool filtered;
-    const int ret = is_filtered(ctx, id, &filtered);
-    if (ret != 0) return ret;
-    if (filtered && candidates.capacity() < doc_cnt_) {
-      candidates.reserve(candidates.capacity() + 1);
-    }
-    candidates.insert(Neighbor(id, distance));
-    return 0;
-  };
 
   ailego::BudgetedVector<diskann_id_t> unvisited_neighbors;
   ailego::BudgetedVector<float> neighbor_distances;
@@ -1332,8 +1318,7 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
   float dist;
   dc.quantized_dist(&best_medoid, 1, &dist);
   if (dc.error()) return dc.error_code();
-  const int entry_ret = admit_candidate(best_medoid, dist);
-  if (entry_ret != 0) return entry_ret;
+  candidates.insert(Neighbor(best_medoid, dist));
   visit_filter.set_visited(best_medoid);
 
   uint32_t num_ios = 0;
@@ -1427,7 +1412,15 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
       }
 
       io_timer.reset();
-      int submit_ret = reader_->submit(pending, frontier_read_reqs, io_ctx);
+      const bool copied_nodes =
+          buffer_backed_ &&
+          static_cast<BufferPoolAlignedFileReader *>(reader_.get())
+              ->try_submit_cached_nodes(pending, frontier_read_reqs, io_ctx,
+                                         frontier.data(), max_node_size_,
+                                         node_per_sector_);
+      int submit_ret = copied_nodes
+                           ? 0
+                           : reader_->submit(pending, frontier_read_reqs, io_ctx);
       stats.io_us += io_timer.micro_seconds();
       if (submit_ret != 0) {
         LOG_ERROR("cached_beam_search: submit failed, ret=%d", submit_ret);
@@ -1464,9 +1457,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
       stats.cpu_us += cpu_timer.micro_seconds();
 
       for (size_t m = 0; m < unvisited_neighbors.size(); ++m) {
-        const int ret =
-            admit_candidate(unvisited_neighbors[m], neighbor_distances[m]);
-        if (ret != 0) return ret;
+        candidates.insert(
+            Neighbor(unvisited_neighbors[m], neighbor_distances[m]));
       }
     }
 
@@ -1518,9 +1510,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
           cpu_timer.reset();
           for (size_t m = 0; m < unvisited_neighbors.size(); ++m) {
-            const int ret =
-                admit_candidate(unvisited_neighbors[m], neighbor_distances[m]);
-            if (ret != 0) return ret;
+            candidates.insert(
+                Neighbor(unvisited_neighbors[m], neighbor_distances[m]));
           }
 
           stats.cpu_us += cpu_timer.micro_seconds();
@@ -1614,7 +1605,8 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
     uint8_t *sector_buffer = reinterpret_cast<uint8_t *>(ctx->sector_buffer());
 
     dc.bind_quantizer(quantizer_.get(), quant_codes_, quant_code_size_,
-                      paged_quant_codes_);
+                      paged_quant_codes_,
+                    storage_ ? storage_->vec_buffer_pool().get() : nullptr);
     if (dc.quantize_query(ctx->query_rotated()) != 0) return dc.error_code();
 
     uint32_t num_ios = 0;

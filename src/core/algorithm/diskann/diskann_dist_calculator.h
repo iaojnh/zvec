@@ -24,6 +24,8 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_meta.h>
 #include "diskann_entity.h"
+#include "diskann_pq_read_batch.h"
+#include "diskann_resident_pq_batch.h"
 #include "diskann_visit_filter.h"
 
 namespace zvec {
@@ -266,11 +268,16 @@ class DistCalculator {
   inline void bind_quantizer(
       const turbo::Quantizer *quantizer, const uint8_t *codes,
       uint32_t code_size,
-      IndexStorage::Segment::Pointer paged_codes = nullptr) {
+      IndexStorage::Segment::Pointer paged_codes = nullptr,
+      ailego::VecBufferPool *pool = nullptr) {
     quantizer_ = quantizer;
     quant_codes_ = codes;
     quant_code_size_ = code_size;
     paged_quant_codes_ = std::move(paged_codes);
+    // Batch the current neighbors even when the entire PQ segment cannot fit.
+    // The pool keeps admission, eviction and RSS control; insufficient batch
+    // capacity still falls back after releasing all acquired page pins.
+    paged_pq_pool_ = pool && !pool->writable() ? pool : nullptr;
   }
 
   int quantize_query(const void *query_rotated) try {
@@ -285,43 +292,35 @@ class DistCalculator {
 
   void quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) try {
     auto release =
-        ailego::ScopeGuard::Make([&]() { quant_code_blocks_.clear(); });
+        ailego::ScopeGuard::Make([&]() {
+          resident_pq_batch_.release();
+          quant_code_blocks_.clear();
+        });
     quant_dp_list_.resize(n);
-    if (paged_quant_codes_) {
-      quant_code_blocks_.resize(n);
-      quant_code_reads_.clear();
-      quant_code_reads_.reserve(n);
-    }
     for (uint32_t i = 0; i < n; ++i) {
       if (ids[i] >= entity_->doc_cnt()) {
         error_code_ = IndexError_InvalidFormat;
         return;
       }
-      const size_t offset = static_cast<size_t>(ids[i]) * quant_code_size_;
-      if (paged_quant_codes_) {
-        quant_code_reads_.emplace_back(paged_quant_codes_.get(), offset,
-                                       quant_code_size_,
-                                       &quant_code_blocks_[i]);
-      } else {
+      if (!paged_quant_codes_) {
         if (!quant_codes_) {
           error_code_ = IndexError_NoReady;
           return;
         }
-        quant_dp_list_[i] = quant_codes_ + offset;
+        quant_dp_list_[i] =
+            quant_codes_ + static_cast<size_t>(ids[i]) * quant_code_size_;
       }
     }
-    if (paged_quant_codes_) {
-      if (!paged_quant_codes_->read_borrowed_batch(quant_code_reads_.data(),
-                                                   n)) {
-        error_code_ = paged_quant_codes_->read_error();
+    if (paged_quant_codes_ &&
+        !(paged_pq_pool_ && resident_pq_batch_.read(
+            *paged_pq_pool_, *paged_quant_codes_, ids, n, quant_code_size_,
+            quant_dp_list_, /*load_misses=*/true))) {
+      const int ret = ReadPagedQuantizedCodes(
+          *paged_quant_codes_, ids, n, quant_code_size_, quant_code_blocks_,
+          quant_dp_list_);
+      if (ret) {
+        error_code_ = ret;
         return;
-      }
-      for (size_t i = 0; i < n; ++i) {
-        quant_dp_list_[i] = quant_code_blocks_[i].data();
-        if (!quant_dp_list_[i]) {
-          error_code_ = IndexError_ReadData;
-          return;
-        }
       }
     }
     quant_dist_impl_.batch(quant_dp_list_.data(), n, dists);
@@ -467,12 +466,13 @@ class DistCalculator {
   const uint8_t *quant_codes_{nullptr};
   IndexStorage::Segment::Pointer paged_quant_codes_;
   uint32_t quant_code_size_{0};
+  ailego::VecBufferPool *paged_pq_pool_{nullptr};
+  ResidentPqBatch resident_pq_batch_;
 
   turbo::DistanceImpl quant_dist_impl_{};
 
   ailego::BudgetedVector<const void *> quant_dp_list_;
   ailego::BudgetedVector<IndexStorage::MemoryBlock> quant_code_blocks_;
-  ailego::BudgetedVector<IndexStorage::Segment::BorrowedRead> quant_code_reads_;
 };
 
 }  // namespace core

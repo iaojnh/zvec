@@ -267,6 +267,13 @@ class BufferPoolAlignedFileReader : public AlignedFileReader {
            bool async = false) override;
   int submit(PendingBatch &batch, std::vector<AlignedRead> &read_reqs,
              IOContext &ctx) override;
+  // Copy only each requested node into its original sector-buffer position.
+  // Returns false without writing destinations when any source is not resident;
+  // the caller must then submit the complete sector reads normally.
+  bool try_submit_cached_nodes(PendingBatch &batch,
+                               const std::vector<AlignedRead> &read_reqs,
+                               IOContext &ctx, const uint32_t *node_ids,
+                               size_t node_size, size_t nodes_per_sector);
   int get_completed(PendingBatch &batch, IOContext &ctx, int min_completed,
                     std::vector<uint32_t> &completed_indices) override;
   void release_io_ctx(IOContext &ctx) override;
