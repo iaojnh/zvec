@@ -1508,6 +1508,68 @@ TEST_F(BufferPoolStoreTest,
   EXPECT_TRUE(correct.load());
 }
 
+TEST_F(BufferPoolStoreTest, CachedLargeRowGroupKeepsScanSlicesAlive) {
+  arrow::StringBuilder values;
+  for (int row = 0; row < 10003; ++row) {
+    ASSERT_TRUE((row % 7 == 0 ? values.AppendNull()
+                              : values.Append(std::string(512, 'x') +
+                                              std::to_string(row)))
+                    .ok());
+  }
+  auto array = values.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::utf8())}), {array});
+  auto out = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*source, arrow::default_memory_pool(),
+                                         out, 10003)
+                  .ok());
+  ASSERT_TRUE(out->Close().ok());
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  {
+    auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+    ASSERT_TRUE(store->open().ok());
+    auto reader = store->scan({"value"});
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ASSERT_TRUE(reader->ReadNext(&batch).ok());
+      if (!batch) break;
+      ASSERT_GT(batch->num_rows(), 0);
+      EXPECT_LE(batch->num_rows(), 4096);
+      batches.push_back(std::move(batch));
+    }
+    ASSERT_TRUE(reader->ReadNext(&batch).ok());
+    EXPECT_EQ(batch, nullptr);
+  }
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  ASSERT_EQ(batches.size(), 3u);
+  auto actual = arrow::Table::FromRecordBatches(batches).ValueOrDie();
+  EXPECT_TRUE(actual->Equals(*source));
+}
+
+TEST_F(BufferPoolStoreTest, NarrowCachedRowGroupStaysInOneScanBatch) {
+  arrow::Int32Builder values;
+  for (int row = 0; row < 10003; ++row) ASSERT_TRUE(values.Append(row).ok());
+  auto array = values.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::int32())}), {array});
+  auto out = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*source, arrow::default_memory_pool(),
+                                         out, 10003)
+                  .ok());
+  ASSERT_TRUE(out->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  auto reader = store->scan({"value"});
+  std::shared_ptr<arrow::RecordBatch> batch;
+  ASSERT_TRUE(reader->ReadNext(&batch).ok());
+  ASSERT_NE(batch, nullptr);
+  EXPECT_EQ(batch->num_rows(), 10003);
+  EXPECT_TRUE(batch->column(0)->Equals(array));
+  ASSERT_TRUE(reader->ReadNext(&batch).ok());
+  EXPECT_EQ(batch, nullptr);
+}
+
 TEST_F(BufferPoolStoreTest, ScanNullableNestedColumnsAndRepeatedEOF) {
   arrow::StringBuilder names;
   auto values = std::make_shared<arrow::Int32Builder>();

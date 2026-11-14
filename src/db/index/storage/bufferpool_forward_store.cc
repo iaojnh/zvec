@@ -23,6 +23,7 @@
 #include <arrow/ipc/writer.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
+#include <arrow/util/byte_size.h>
 #include <parquet/arrow/reader.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/db/doc.h>
@@ -141,9 +142,15 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
     auto table = arrow::Table::Make(projected_schema_, std::move(columns),
                                     row_group_row_nums_[rg_id]);
     // Align chunk boundaries across columns without concatenating their data.
+    // A decoded row group can be much larger than an IPC batch. Bounded
+    // zero-copy slices let Acero overlap source and filter work on warm scans.
+    // Keep narrow scans in a single batch to avoid extra scheduling overhead.
+    const bool wide =
+        with_cache_ && arrow::util::TotalBufferSize(*table) > 4 * 1024 * 1024;
     active_reader_ =
         std::make_unique<arrow::TableBatchReader>(std::move(table));
-    active_reader_->set_chunksize(std::numeric_limits<int64_t>::max());
+    active_reader_->set_chunksize(wide ? 4096
+                                       : std::numeric_limits<int64_t>::max());
   }
 }
 
