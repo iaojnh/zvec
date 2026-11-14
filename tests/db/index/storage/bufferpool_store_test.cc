@@ -1500,3 +1500,49 @@ TEST_F(BufferPoolStoreTest, CachedLargeRowGroupKeepsScanSlicesAlive) {
   auto actual = arrow::Table::FromRecordBatches(batches).ValueOrDie();
   EXPECT_TRUE(actual->Equals(*source));
 }
+
+TEST_F(BufferPoolStoreTest,
+       CachedStringScanAvoidsTinyDecoderChunksWithHeadroom) {
+  ASSERT_EQ(0,
+            ailego::PoolPayloadBudget::get_instance().init(64 * 1024 * 1024));
+  arrow::StringBuilder values;
+  for (int row = 0; row < 10003; ++row) {
+    ASSERT_TRUE((row % 7 == 0 ? values.AppendNull()
+                              : values.Append(std::string(512, 'x') +
+                                              std::to_string(row)))
+                    .ok());
+  }
+  auto array = values.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::utf8())}), {array});
+  auto out = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*source, arrow::default_memory_pool(),
+                                         out, 10003)
+                  .ok());
+  ASSERT_TRUE(out->Close().ok());
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  {
+    auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+    ASSERT_TRUE(store->open().ok());
+    ASSERT_NE(store->fetch({"value"}, 1), nullptr);
+    auto reader = store->scan({"value"});
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ASSERT_TRUE(reader->ReadNext(&batch).ok());
+      if (!batch) break;
+      EXPECT_GT(batch->num_rows(), 0);
+      EXPECT_LE(batch->num_rows(), 4096);
+      batches.push_back(std::move(batch));
+    }
+  }
+  // The existing 10 MiB test above exercises the low-headroom fallback.
+  // With room to coalesce, small decoder batches must not multiply the
+  // number of kernel invocations in an otherwise cached scan.
+  EXPECT_LE(batches.size(), 5u);
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  auto actual = arrow::Table::FromRecordBatches(batches).ValueOrDie();
+  EXPECT_TRUE(actual->Equals(*source));
+  EXPECT_LE(ailego::MemoryLimitPool::get_instance().stats().used,
+            ailego::MemoryLimitPool::get_instance().capacity());
+}
