@@ -86,19 +86,29 @@ TEST_F(BufferPoolStoreTest, PointFetchStreamsWhenWholeColumnCannotFit) {
   {
     arrow::StringBuilder strings;
     arrow::Int64Builder numbers;
+    arrow::UInt64Builder doc_ids;
+    arrow::StringBuilder user_ids;
     for (int row = 0; row < rows; ++row) {
       ASSERT_TRUE(
           (row % 11 ? strings.Append(value(row)) : strings.AppendNull()).ok());
       ASSERT_TRUE(numbers.Append(row * 3).ok());
+      ASSERT_TRUE(doc_ids.Append(row).ok());
+      ASSERT_TRUE(user_ids.Append(std::to_string(row)).ok());
     }
     auto text = strings.Finish();
     auto numeric = numbers.Finish();
+    auto doc_id = doc_ids.Finish();
+    auto user_id = user_ids.Finish();
     ASSERT_TRUE(text.ok());
     ASSERT_TRUE(numeric.ok());
+    ASSERT_TRUE(doc_id.ok());
+    ASSERT_TRUE(user_id.ok());
     auto table = arrow::Table::Make(
         arrow::schema({arrow::field("wide", arrow::utf8()),
-                       arrow::field("number", arrow::int64())}),
-        {*text, *numeric});
+                       arrow::field("number", arrow::int64()),
+                       arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                       arrow::field(USER_ID, arrow::utf8())}),
+        {*text, *numeric, *doc_id, *user_id});
     auto output = arrow::io::FileOutputStream::Open(parquet_path);
     ASSERT_TRUE(output.ok());
     parquet::WriterProperties::Builder properties;
@@ -111,6 +121,16 @@ TEST_F(BufferPoolStoreTest, PointFetchStreamsWhenWholeColumnCannotFit) {
   }
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
   ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> doc_columns{GLOBAL_DOC_ID, USER_ID, "wide"};
+  auto doc_schema = arrow::schema({arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                                   arrow::field(USER_ID, arrow::utf8()),
+                                   arrow::field("wide", arrow::utf8())});
+  // An optional all-column pin must yield instead of aborting a scalar read.
+  EXPECT_EQ(nullptr, store->fetch_doc(doc_columns, doc_schema, rows - 1));
+  auto single = store->fetch(doc_columns, rows - 1);
+  ASSERT_NE(nullptr, single);
+  ASSERT_EQ(3u, single->values.size());
+  EXPECT_EQ(value(rows - 1), single->values[2].scalar()->ToString());
   // The decoded string column is larger than the fixture's 10 MiB pool.
   // Preserve unsorted requests, duplicates, nulls and cross-column ordering.
   const std::vector<int> selected{8191, 0, 4095, 4095, 256, 7000};

@@ -40,7 +40,8 @@ class DiskAnnPqPriorityTest : public testing::Test {
     ASSERT_EQ(0, dumper->create(path_));
     auto append = [&](const std::string &name, const void *data, size_t size) {
       EXPECT_EQ(size, dumper->write(data, size));
-      const size_t padding = (4096 - size % 4096) % 4096;
+      const size_t page = ailego::kVectorPageSize;
+      const size_t padding = (page - size % page) % page;
       const std::string zeros(padding, '\0');
       EXPECT_EQ(padding, dumper->write(zeros.data(), padding));
       EXPECT_EQ(0, dumper->append(name, size, padding, 0));

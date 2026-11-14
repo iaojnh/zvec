@@ -987,7 +987,27 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
     if (!acquired.ok()) {
-      if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+      if (acquired.status().IsOutOfMemory()) {
+        scalars.clear();
+        auto fetched = fetch_checked(columns, {index},
+                                     detail::GetParquetMemoryPool().get());
+        if (!fetched.ok()) {
+          if (fetched.status().IsOutOfMemory()) throw std::bad_alloc();
+          LOG_ERROR("Failed to stream parquet scalar: %s",
+                    fetched.status().ToString().c_str());
+          return nullptr;
+        }
+        for (const auto &column : (*fetched)->columns()) {
+          auto scalar = detail::FetchScalarView(*column, 0);
+          if (!scalar.ok()) {
+            if (scalar.status().IsOutOfMemory()) throw std::bad_alloc();
+            return nullptr;
+          }
+          scalars.emplace_back(std::move(scalar).ValueOrDie());
+        }
+        return std::make_shared<arrow::compute::ExecBatch>(std::move(scalars),
+                                                           1);
+      }
       LOG_ERROR("Failed to acquire parquet scalar: %s",
                 acquired.status().ToString().c_str());
       return nullptr;
@@ -1077,7 +1097,8 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(key);
     if (!acquired.ok()) {
-      if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+      // This optional fast path pins all source columns together. Yield to
+      // the bounded scalar path if those columns cannot coexist in cache.
       return nullptr;
     }
     pins.push_back(std::move(acquired).ValueOrDie());
