@@ -369,6 +369,11 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
   std::vector<std::string> output_columns;
   if (!has_vector && segments.size() > 1) {
     output_columns = query_info->get_all_fetched_scalar_field_names();
+    if (!has_fts && query_info->is_include_vector()) {
+      for (const auto &field : query_info->selected_vector_fields()) {
+        output_columns.push_back(field.field_name);
+      }
+    }
     if (has_fts) output_columns.push_back(FIELD_SCORE);
   }
 
