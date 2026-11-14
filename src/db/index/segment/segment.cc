@@ -3181,7 +3181,6 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
       BaseForwardStore::Ptr store;
       std::vector<int> rows;
       TablePtr table;
-      size_t request_index = 0;
     };
     struct OutputRun {
       BlockRows *group;
@@ -3230,16 +3229,19 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
     if (!options_.enable_mmap_ && groups.rbegin()->first < blocks.size()) {
       std::vector<BufferPoolForwardStore::FetchBlock> requests;
       requests.reserve(groups.size());
+      // Keep BP-only bookkeeping out of the group layout shared with mmap.
+      std::unordered_map<BlockRows *, size_t> request_indices;
+      request_indices.reserve(groups.size());
       for (auto &[index, group] : groups) {
         auto *store = dynamic_cast<BufferPoolForwardStore *>(group.store.get());
         if (!store) return TablePtr{};
-        group.request_index = requests.size();
+        request_indices.emplace(&group, requests.size());
         requests.push_back({store, {}});
         requests.back().rows.reserve(group.rows.size());
       }
       int output = 0;
       for (const auto &run : runs) {
-        auto &selected = requests[run.group->request_index].rows;
+        auto &selected = requests[request_indices.at(run.group)].rows;
         for (int64_t row = 0; row < run.length; ++row) {
           selected.emplace_back(output++, run.group->rows[run.offset + row]);
         }
