@@ -15,6 +15,7 @@
 #include "db/index/storage/parquet_memory_pool.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include <limits>
 #include <system_error>
 #include <thread>
+#include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <arrow/api.h>
 #include <arrow/buffer.h>
@@ -41,6 +43,18 @@
 #endif
 #include <windows.h>
 #endif
+
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static bool configure_rss(MemoryLimitPool &pool) {
+    return pool.process_rss_.configure(128UL * 1024 * 1024,
+                                       +[] { return 16UL * 1024 * 1024; });
+  }
+  static void refresh_rss(MemoryLimitPool &pool) {
+    pool.process_rss_.refresh(true);
+  }
+};
+}  // namespace zvec::ailego
 
 
 namespace zvec {
@@ -160,6 +174,78 @@ TEST_F(ParquetBudgetTest,
   EXPECT_NE(nullptr, buffer);
   EXPECT_EQ(0u, budget_.external_used());
   pool.Free(buffer, 0);
+}
+
+TEST_F(ParquetBudgetTest, SmallBuffersCanBeFreedByDifferentThreads) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  constexpr size_t threads = 8, count = 112;
+  constexpr std::array<int64_t, 7> sizes{24, 160, 480, 992, 1990, 3990, 8000};
+  std::array<std::array<uint8_t *, count>, threads> buffers{};
+  std::atomic<size_t> failures{0};
+  std::vector<std::thread> workers;
+  for (size_t worker = 0; worker < threads; ++worker) {
+    workers.emplace_back([&, worker] {
+      for (size_t i = 0; i < count; ++i) {
+        const auto size = sizes[i % sizes.size()];
+        if (!pool.Allocate(size, &buffers[worker][i]).ok()) {
+          ++failures;
+          continue;
+        }
+        std::memset(buffers[worker][i], worker + 1, size);
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  workers.clear();
+  for (size_t worker = 0; worker < threads; ++worker) {
+    workers.emplace_back([&, worker] {
+      const size_t owner = (worker + 1) % threads;
+      for (size_t i = 0; i < count; ++i) {
+        auto *buffer = buffers[owner][i];
+        if (!buffer) continue;
+        const auto size = sizes[i % sizes.size()];
+        for (int64_t byte = 0; byte < size; ++byte)
+          if (buffer[byte] != owner + 1) ++failures;
+        pool.Free(buffer, size);
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  EXPECT_EQ(0u, failures.load());
+  EXPECT_EQ(0, pool.bytes_allocated());
+  EXPECT_EQ(0u, pool.charged_bytes());
+  EXPECT_EQ(0u, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, RefusedSmallSlotDoesNotRetainBackingOrLoseCapacity) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  ASSERT_TRUE(ailego::MemoryLimitPoolTestPeer::configure_rss(native));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    native.set_memory_pressure(Pressure::kNormal);
+    EXPECT_TRUE(native.configure_process_rss_limit(0));
+  });
+  ParquetMemoryPool pool(arrow::default_memory_pool(), true);
+  auto first = arrow::AllocateBuffer(64, &pool).ValueOrDie();
+  const auto charged = pool.charged_bytes();
+  native.set_memory_pressure(Pressure::kCritical);
+  for (int i = 0; i < 1024; ++i) {
+    uint8_t *refused = nullptr;
+    auto status = pool.Allocate(64, &refused);
+    EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+    if (status.ok()) pool.Free(refused, 64);
+  }
+  EXPECT_EQ(charged, pool.charged_bytes());
+  native.set_memory_pressure(Pressure::kNormal);
+  ailego::MemoryLimitPoolTestPeer::refresh_rss(native);
+  auto second = arrow::AllocateBuffer(64, &pool);
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  EXPECT_EQ(charged, pool.charged_bytes());
+  second = std::unique_ptr<arrow::Buffer>{};
+  first.reset();
+  EXPECT_EQ(0u, pool.charged_bytes());
+  EXPECT_EQ(0u, budget_.external_used());
 }
 
 }  // namespace

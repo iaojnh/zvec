@@ -148,7 +148,7 @@ struct alignas(64) ParquetMemoryPool::SmallChunk {
   void *free_head{nullptr};
   size_t stride{0};
   size_t next_slot{0};
-  size_t live_slots{0};
+  size_t live_slots{0};  // Includes allocations awaiting RSS admission.
 };
 
 arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
@@ -189,11 +189,12 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
   constexpr size_t payload =
       kSmallChunkBytes - ailego::MemoryLimitPool::kRetainedBlockHeaderBytes;
   const size_t slots = (payload - sizeof(SmallChunk)) / stride;
-  std::unique_lock<std::mutex> lock(small_mutex_);
+  std::unique_lock<std::mutex> lock(small_mutexes_[index]);
   auto *chunk = small_chunks_[index];
-  while (chunk && !chunk->free_head && chunk->next_slot == slots) {
+  while (chunk && chunk->live_slots == slots) {
     chunk = chunk->next;
   }
+  const bool reused_chunk = chunk != nullptr;
   if (!chunk) {
     // Admission may evict a cached Arrow array and reenter free_small().
     lock.unlock();
@@ -207,17 +208,26 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
     lock.lock();
     chunk->next = small_chunks_[index];
     small_chunks_[index] = chunk;
-  } else if (!budget.try_materialize_retained_block(chunk)) {
+  }
+  // Reserve a slot and keep the backing alive before dropping the directory
+  // lock. RSS admission can contend with other allocators, so it must not
+  // serialize allocations or frees in this size class. Do not touch the slot
+  // or its free-list link until admission succeeds.
+  ++chunk->live_slots;
+  lock.unlock();
+  if (reused_chunk && !budget.try_materialize_retained_block(chunk)) {
+    release_small_chunk(chunk, nullptr);
     return arrow::Status::OutOfMemory(
         "Parquet small slot exceeds RSS headroom");
   }
+  lock.lock();
   void *slot = chunk->free_head;
   if (slot) {
     chunk->free_head = *static_cast<void **>(slot);
   } else {
     slot = reinterpret_cast<char *>(chunk + 1) + chunk->next_slot++ * stride;
   }
-  ++chunk->live_slots;
+  lock.unlock();
   *out = static_cast<uint8_t *>(slot) + kMinimumAlignment;
   new (*out - sizeof(MappingHeader))
       MappingHeader{chunk, 0, 0, BackingKind::SmallChunk};
@@ -235,18 +245,24 @@ void ParquetMemoryPool::free_small(uint8_t *buffer) {
   }
   assert(header.kind == BackingKind::SmallChunk);
   auto *chunk = static_cast<SmallChunk *>(header.base);
-  std::unique_lock<std::mutex> lock(small_mutex_);
-  void *slot = buffer - kMinimumAlignment;
-  new (slot) void *(chunk->free_head);
-  chunk->free_head = slot;
-  if (--chunk->live_slots != 0) return;
+  release_small_chunk(chunk, buffer - kMinimumAlignment);
+}
+
+void ParquetMemoryPool::release_small_chunk(SmallChunk *chunk, void *slot) {
   size_t index = 0;
   for (size_t stride = 128; stride < chunk->stride; stride *= 2) ++index;
+  std::unique_lock<std::mutex> lock(small_mutexes_[index]);
+  if (slot) {
+    new (slot) void *(chunk->free_head);
+    chunk->free_head = slot;
+  }
+  assert(chunk->live_slots != 0);
+  if (--chunk->live_slots != 0) return;
   auto **link = &small_chunks_[index];
   while (*link != chunk) link = &(*link)->next;
   *link = chunk->next;
   lock.unlock();
-  budget.release_retained_block(chunk);
+  ailego::MemoryLimitPool::get_instance().release_retained_block(chunk);
   charged_bytes_.fetch_sub(kSmallChunkBytes, std::memory_order_relaxed);
   // The global pool keeps idle backing committed until reuse or unmapping.
 }

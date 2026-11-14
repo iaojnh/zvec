@@ -97,6 +97,7 @@ class ParquetMemoryPool final : public arrow::MemoryPool {
   static constexpr size_t kSmallClasses = 7;  // 128 through 8192 bytes
   arrow::Status allocate_small(int64_t size, int64_t alignment, uint8_t **out);
   void free_small(uint8_t *buffer);
+  void release_small_chunk(SmallChunk *chunk, void *slot);
 
   arrow::MemoryPool *small_pool_;
   const bool enforce_budget_;
@@ -105,7 +106,7 @@ class ParquetMemoryPool final : public arrow::MemoryPool {
   std::atomic<int64_t> num_mapped_allocations_{0};
   std::atomic<int64_t> total_mapped_bytes_allocated_{0};
   std::atomic<size_t> charged_bytes_{0};
-  std::mutex small_mutex_;
+  std::array<std::mutex, kSmallClasses> small_mutexes_;
   std::array<SmallChunk *, kSmallClasses> small_chunks_{};
 };
 
