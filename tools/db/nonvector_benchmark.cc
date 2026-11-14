@@ -34,16 +34,7 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-// Windows declarations must precede the process-status API header.
-// clang-format off
-#include <windows.h>
-#include <psapi.h>
-// clang-format on
-#else
+#if !defined(_WIN32)
 #include <sys/resource.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -61,6 +52,18 @@
 #include <zvec/db/query.h>
 #include <zvec/db/schema.h>
 #include "ailego/utility/memory_helper.h"
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+// Keep Windows' DELETE macro out of the SDK's Operator enum. Windows
+// declarations must also precede the process-status API header.
+// clang-format off
+#include <windows.h>
+#include <psapi.h>
+// clang-format on
+#endif
 
 using namespace zvec;
 using Clock = std::chrono::steady_clock;
