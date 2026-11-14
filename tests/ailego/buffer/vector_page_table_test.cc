@@ -2048,8 +2048,12 @@ TEST_F(BufferPoolTest, OptionalPreparationRejectsWritableAndInvalidRanges) {
 TEST_F(BufferPoolTest, ConcurrentOptionalPreparationsShareOneBudget) {
   constexpr size_t pages = 1024;
   const size_t metadata = VecBufferPool::metadata_bytes_for_page_count(pages);
+  // One file plus its temporary read buffer must fit below the background
+  // reclaim watermark. A second file plus scratch must still be refused.
+  // Otherwise a slow reader races normal background eviction, rather than
+  // testing the shared optional-preparation admission decision.
   ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
-      (2 * pages + 64) * kVectorPageSize + 2 * metadata));
+      (2 * pages + pages / 2 + 64) * kVectorPageSize + 2 * metadata));
   VecBufferPool a(new_file(pages), /*writable=*/false);
   VecBufferPool b(new_file(pages), /*writable=*/false);
   ASSERT_EQ(0, a.init());
