@@ -78,6 +78,67 @@ class BufferPoolStoreTest : public testing::Test {
   std::string parquet_path;
 };
 
+TEST_F(BufferPoolStoreTest, PointFetchStreamsWhenWholeColumnCannotFit) {
+  constexpr int rows = 8192;
+  const auto value = [](int row) {
+    return std::to_string(row) + std::string(2048, 'x');
+  };
+  {
+    arrow::StringBuilder strings;
+    arrow::Int64Builder numbers;
+    for (int row = 0; row < rows; ++row) {
+      ASSERT_TRUE(
+          (row % 11 ? strings.Append(value(row)) : strings.AppendNull()).ok());
+      ASSERT_TRUE(numbers.Append(row * 3).ok());
+    }
+    auto text = strings.Finish();
+    auto numeric = numbers.Finish();
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(numeric.ok());
+    auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("wide", arrow::utf8()),
+                       arrow::field("number", arrow::int64())}),
+        {*text, *numeric});
+    auto output = arrow::io::FileOutputStream::Open(parquet_path);
+    ASSERT_TRUE(output.ok());
+    parquet::WriterProperties::Builder properties;
+    properties.disable_dictionary();
+    properties.data_pagesize(64 * 1024);
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
+                                           *output, rows, properties.build())
+                    .ok());
+    ASSERT_TRUE((*output)->Close().ok());
+  }
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  // The decoded string column is larger than the fixture's 10 MiB pool.
+  // Preserve unsorted requests, duplicates, nulls and cross-column ordering.
+  const std::vector<int> selected{8191, 0, 4095, 4095, 256, 7000};
+  auto result = store->fetch_checked({"wide", "number"}, selected,
+                                     detail::GetParquetMemoryPool().get());
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(selected.size(), static_cast<size_t>((*result)->num_rows()));
+  for (size_t i = 0; i < selected.size(); ++i) {
+    auto text = (*result)->column(0)->GetScalar(i);
+    auto number = (*result)->column(1)->GetScalar(i);
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(number.ok());
+    EXPECT_EQ(selected[i] % 11 != 0, (*text)->is_valid);
+    if ((*text)->is_valid) EXPECT_EQ(value(selected[i]), (*text)->ToString());
+    EXPECT_EQ(selected[i] * 3,
+              std::static_pointer_cast<arrow::Int64Scalar>(*number)->value);
+  }
+  std::vector<int> all_rows(rows);
+  for (int row = 0; row < rows; ++row) all_rows[row] = row;
+  auto too_large = store->fetch_checked({"wide"}, all_rows,
+                                        detail::GetParquetMemoryPool().get());
+  ASSERT_FALSE(too_large.ok());
+  EXPECT_TRUE(too_large.status().IsOutOfMemory());
+  store.reset();
+  EXPECT_EQ(value(selected[0]),
+            (*result)->column(0)->GetScalar(0).ValueOrDie()->ToString());
+}
+
 TEST_F(BufferPoolStoreTest, PathAndOpenedFileUseTheSameCacheIdentity) {
   auto file = arrow::io::ReadableFile::Open(parquet_path);
   ASSERT_TRUE(file.ok());
