@@ -7626,6 +7626,12 @@ TEST_F(CollectionTest, FtsFilterKeepsMergeSchemaAcrossSegmentOptimizations) {
                         "content", DataType::STRING, false,
                         std::make_shared<FtsIndexParams>()))
                     .ok());
+    ASSERT_TRUE(schema
+                    ->add_field(std::make_shared<FieldSchema>(
+                        "vec", DataType::VECTOR_FP32, uint32_t{2}, false,
+                        std::make_shared<FlatIndexParams>(
+                            MetricType::IP, QuantizeType::UNDEFINED)))
+                    .ok());
     auto created = Collection::CreateAndOpen(col_path, *schema,
                                              CollectionOptions{false, mmap});
     ASSERT_TRUE(created.has_value()) << created.error().message();
@@ -7638,6 +7644,8 @@ TEST_F(CollectionTest, FtsFilterKeepsMergeSchemaAcrossSegmentOptimizations) {
         doc.set_pk(std::to_string(key));
         doc.set<int64_t>("key", key);
         doc.set<std::string>("content", "needle shared");
+        doc.set<std::vector<float>>(
+            "vec", {static_cast<float>(key), static_cast<float>(key) + 0.5f});
         docs.push_back(std::move(doc));
       }
       ASSERT_TRUE(col->insert(docs).has_value());
@@ -7668,6 +7676,21 @@ TEST_F(CollectionTest, FtsFilterKeepsMergeSchemaAcrossSegmentOptimizations) {
         EXPECT_FALSE(doc->has("key"));
         EXPECT_GT(doc->score(), 0);
       }
+    }
+    SearchQuery scalar;
+    scalar.filter_ = "key >= 500";
+    scalar.topk_ = 8;
+    scalar.include_vector_ = true;
+    scalar.output_fields_ = std::vector<std::string>{"vec"};
+    auto result = col->query(scalar);
+    ASSERT_TRUE(result.has_value()) << result.error().message();
+    ASSERT_EQ(result->size(), 8u);
+    for (const auto &doc : *result) {
+      const auto key = static_cast<float>(std::stoi(doc->pk()));
+      auto vector = doc->get<std::vector<float>>("vec");
+      ASSERT_TRUE(vector.has_value());
+      EXPECT_EQ(*vector, (std::vector<float>{key, key + 0.5f}));
+      EXPECT_FALSE(doc->has("key"));
     }
     ASSERT_TRUE(col->close().ok());
     col.reset();
