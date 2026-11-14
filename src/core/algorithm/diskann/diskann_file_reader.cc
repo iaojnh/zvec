@@ -1249,6 +1249,8 @@ bool BufferPoolAlignedFileReader::try_submit_cached_nodes(
   if (ctx && (ctx->aio_active || ctx->ring.has_pending_reads())) return false;
 #elif defined(_WIN32) || defined(_WIN64)
   if (ctx && ctx->outstanding_count) return false;
+#else
+  (void)ctx;
 #endif
   constexpr size_t sector = DiskAnnUtil::kSectorSize;
   if (nodes_per_sector && nodes_per_sector > sector / node_size) return false;
