@@ -375,7 +375,9 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
   // Segment-local optimization may add columns used only by that segment's
   // filter. Keep the merge schema independent of those temporary columns.
   std::vector<std::string> output_columns;
-  if (!has_vector && segments.size() > 1) {
+  // Rank-only topK plans already expose the same row-id/score schema and
+  // fetch projected fields after the global merge.
+  if (!has_vector && !merge_topk && segments.size() > 1) {
     output_columns = query_info->get_all_fetched_scalar_field_names();
     if (has_fts) output_columns.push_back(FIELD_SCORE);
   }
@@ -447,7 +449,7 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     if (segments.size() == 1 && !merge_topk) {
       return seg_plan;
     }
-    if (!has_vector) {
+    if (!has_vector && !merge_topk) {
       auto status = seg_plan.value()->project(output_columns);
       if (!status.ok()) return tl::make_unexpected(status);
     }
