@@ -37,8 +37,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <psapi.h>
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <sys/resource.h>
 #include <unistd.h>
@@ -1112,15 +1112,17 @@ int main(int argc, char **argv) try {
     auto start = Clock::now();
     go.store(true, std::memory_order_release);
     for (auto &t : threads) t.join();
+    const double elapsed =
+        std::chrono::duration<double>(Clock::now() - start).count();
+    ca = process_usage();
     readers_done.store(true, std::memory_order_release);
     stop_writer.store(true, std::memory_order_release);
     if (writer.joinable()) writer.join();
+    const double writer_elapsed =
+        std::chrono::duration<double>(Clock::now() - start).count();
     if (writer_error) std::rethrow_exception(writer_error);
     check(!mixed || overlap_cycles.load() > 0,
           "writer made progress during the read interval");
-    double elapsed =
-        std::chrono::duration<double>(Clock::now() - start).count();
-    ca = process_usage();
     for (auto &e : errors)
       if (e) std::rethrow_exception(e);
     auto after = pool.stats();
@@ -1158,6 +1160,7 @@ int main(int argc, char **argv) try {
         << ",\"p95_us\":" << quantile(.95) << ",\"p99_us\":" << quantile(.99)
         << ",\"first_request_us\":" << first_request
         << ",\"writer_cycles\":" << writer_cycles
+        << ",\"writer_elapsed_s\":" << writer_elapsed
         << ",\"maintenance_us\":" << maintenance_us
         << ",\"cpu_s\":" << ca.cpu_s - cb.cpu_s
         << ",\"rss_bytes\":" << ailego::MemoryHelper::SelfRSS()

@@ -284,7 +284,7 @@ def summarize(args):
             if not valid_parent:
                 continue
             assert row['queries'] > 0 and row['elapsed_s'] > 0
-            row = {**row, 'writer_cycles_s': row['writer_cycles'] / row['elapsed_s']}
+            row = {**row, 'writer_cycles_s': row['writer_cycles'] / row.get('writer_elapsed_s', row['elapsed_s'])}
             key = item['group'], row['case']
             values.setdefault(key, {}).setdefault(item['arm'], {})[item['repeat']] = {**row, 'process_exit_code': rec['exit_code']}
     summary = []
