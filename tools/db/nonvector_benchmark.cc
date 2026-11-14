@@ -1098,14 +1098,20 @@ int main(int argc, char **argv) try {
             // Every worker executes its initial request. Remaining requests
             // form one shared deterministic sequence, so even an overloaded
             // run covers all64 variants without requiring 64 per worker.
+            // Check the deadline before claiming a ticket. Every claimed
+            // timed request must run, even if its worker is descheduled at
+            // the deadline; otherwise the global prefix could have holes.
+            if (!first_only && count[w] != 0 &&
+                next_request.load(std::memory_order_relaxed) >= requests.size() &&
+                (first_pass ||
+                 std::chrono::duration<double>(Clock::now() - started).count() >=
+                     minimum_seconds))
+              break;
             const size_t ticket = first_only ? w * 17
                                   : count[w] == 0 ? w
                                                   : next_request.fetch_add(
                                                         1, std::memory_order_relaxed);
-            if (!first_only && count[w] != 0 && ticket >= requests.size() &&
-                (first_pass || std::chrono::duration<double>(Clock::now() - started)
-                                       .count() >= minimum_seconds))
-              break;
+            if (!first_only && first_pass && ticket >= requests.size()) break;
             const size_t index = ticket % requests.size();
             auto t = Clock::now();
             results[w] += execute(*col, requests[index], full_timed,
