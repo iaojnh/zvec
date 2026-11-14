@@ -38,8 +38,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <psapi.h>
+#include <windows.h>
 #else
 #include <sys/resource.h>
 #include <unistd.h>
@@ -1102,20 +1102,22 @@ int main(int argc, char **argv) try {
             // timed request must run, even if its worker is descheduled at
             // the deadline; otherwise the global prefix could have holes.
             if (!first_only && count[w] != 0 &&
-                next_request.load(std::memory_order_relaxed) >= requests.size() &&
+                next_request.load(std::memory_order_relaxed) >=
+                    requests.size() &&
                 (first_pass ||
-                 std::chrono::duration<double>(Clock::now() - started).count() >=
-                     minimum_seconds))
+                 std::chrono::duration<double>(Clock::now() - started)
+                         .count() >= minimum_seconds))
               break;
-            const size_t ticket = first_only ? w * 17
-                                  : count[w] == 0 ? w
-                                                  : next_request.fetch_add(
-                                                        1, std::memory_order_relaxed);
+            const size_t ticket =
+                first_only ? w * 17
+                : count[w] == 0
+                    ? w
+                    : next_request.fetch_add(1, std::memory_order_relaxed);
             if (!first_only && first_pass && ticket >= requests.size()) break;
             const size_t index = ticket % requests.size();
             auto t = Clock::now();
-            results[w] += execute(*col, requests[index], full_timed,
-                                  scratch, first_only ? &cold_results[w] : nullptr);
+            results[w] += execute(*col, requests[index], full_timed, scratch,
+                                  first_only ? &cold_results[w] : nullptr);
             expected_results[w] += requests[index].wanted_count;
             ++request_counts[w][index];
             latencies[w].push_back(
@@ -1165,7 +1167,8 @@ int main(int argc, char **argv) try {
     if (!first_only) {
       check(total >= requests.size(), "complete timed request set");
       for (size_t q = 0; q < histogram.size(); ++q)
-        check(histogram[q] == total / requests.size() + (q < total % requests.size()),
+        check(histogram[q] ==
+                  total / requests.size() + (q < total % requests.size()),
               "balanced global request prefix");
     }
     if (first_only)
@@ -1186,14 +1189,14 @@ int main(int argc, char **argv) try {
         << std::quoted(std::to_string(request_fingerprint))
         << ",\"expected_docs_per_cycle\":" << expected_per_cycle
         << ",\"timed_expected_docs\":"
-        << std::accumulate(expected_results.begin(), expected_results.end(), size_t{})
+        << std::accumulate(expected_results.begin(), expected_results.end(),
+                           size_t{})
         << ",\"request_counts\":[";
     for (size_t q = 0; q < histogram.size(); ++q) {
       if (q) out << ',';
       out << histogram[q];
     }
-    out << ']'
-        << ",\"queries\":" << total << ",\"elapsed_s\":" << elapsed
+    out << ']' << ",\"queries\":" << total << ",\"elapsed_s\":" << elapsed
         << ",\"qps\":" << total / elapsed << ",\"p50_us\":" << quantile(.5)
         << ",\"p95_us\":" << quantile(.95) << ",\"p99_us\":" << quantile(.99)
         << ",\"first_request_us\":" << first_request

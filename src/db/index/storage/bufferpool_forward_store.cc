@@ -152,12 +152,12 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
       // Short strings can have expensive predicates despite small buffers.
       // Overlap their work when the executor is nearly idle. Concurrent scans
       // already supply parallel work, so retain coarse batches under load.
-      const bool strings = std::any_of(
-          projected_schema_->fields().begin(),
-          projected_schema_->fields().end(), [](const auto &field) {
-            return field->type()->id() == arrow::Type::STRING ||
-                   field->type()->id() == arrow::Type::LARGE_STRING;
-          });
+      const bool strings =
+          std::any_of(projected_schema_->fields().begin(),
+                      projected_schema_->fields().end(), [](const auto &field) {
+                        return field->type()->id() == arrow::Type::STRING ||
+                               field->type()->id() == arrow::Type::LARGE_STRING;
+                      });
       if (strings) {
         auto *executor = arrow::internal::GetCpuThreadPool();
         const int capacity = executor->GetCapacity();

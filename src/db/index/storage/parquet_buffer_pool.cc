@@ -207,7 +207,8 @@ bool RetainParquetColumnBuffers(
     }
     // Cache ownership belongs to arrow_refs, including nested values and
     // dictionaries. Consumers either hold a pin or copy the selected data.
-    buffer = std::shared_ptr<arrow::Buffer>(buffer.get(), [](arrow::Buffer *) {});
+    buffer =
+        std::shared_ptr<arrow::Buffer>(buffer.get(), [](arrow::Buffer *) {});
   }
   for (const auto &child : data->child_data) {
     if (!RetainParquetColumnBuffers(child, payload, size, seen)) return false;
