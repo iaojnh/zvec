@@ -157,24 +157,36 @@ arrow::Status ParquetRecordBatchReader::ensure_reader() {
 ParquetRecordBatchReader::~ParquetRecordBatchReader() = default;
 
 arrow::Status ParquetRecordBatchReader::ReadNext(
-    std::shared_ptr<arrow::RecordBatch> *batch) try {
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, false).status();
+}
+
+arrow::Result<bool> ParquetRecordBatchReader::ReadNextResident(
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, true);
+}
+
+arrow::Result<bool> ParquetRecordBatchReader::read_next(
+    std::shared_ptr<arrow::RecordBatch> *batch, bool resident_only) try {
   *batch = nullptr;
   while (true) {
     if (cached_batches_) {
       ARROW_RETURN_NOT_OK(cached_batches_->ReadNext(batch));
       if (*batch) {
-        if ((*batch)->num_rows() != 0) return arrow::Status::OK();
+        if ((*batch)->num_rows() != 0) return true;
         continue;
       }
       cached_batches_.reset();
     }
     if (current_row_group_ >= num_row_groups_) {
-      return arrow::Status::OK();
+      return true;
     }
 
     if (!with_cache_) {
-      return stream_uncached_ ? read_next_uncached(batch)
-                              : read_row_group(batch);
+      if (resident_only) return false;
+      ARROW_RETURN_NOT_OK(stream_uncached_ ? read_next_uncached(batch)
+                                           : read_row_group(batch));
+      return true;
     }
 
     int64_t rg_id = current_row_group_;
@@ -191,10 +203,11 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         buffer_id.column = col_indices_[col_idx];
         buffer_id.row_group = rg_id;
         auto &cache = ParquetBufferPool::get_instance();
-        auto buffer_handle = memory_pool_ ? cache.try_acquire_buffer(buffer_id)
-                                          : cache.acquire_buffer(buffer_id);
+        auto buffer_handle = resident_only || memory_pool_
+                                 ? cache.try_acquire_buffer(buffer_id)
+                                 : cache.acquire_buffer(buffer_id);
         col_chunked_array = buffer_handle.data();
-        if (!col_chunked_array && memory_pool_) {
+        if (!col_chunked_array && memory_pool_ && !resident_only) {
           const auto metadata =
               metadata_ ? metadata_ : reader_->parquet_reader()->metadata();
           if (ScanCacheHasHeadroom(*metadata, static_cast<int>(rg_id),
@@ -212,6 +225,9 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         // A refusal follows the same bounded streaming path as a cold miss.
       }
       if (!col_chunked_array) {
+        // Do not advance the row group or switch to streaming on an optional
+        // cache-only miss. Normal ReadNext may admit or stream it later.
+        if (resident_only) return false;
         // Cache residency is optional. Drop partial columns before reading
         // the same row group in bounded batches, without publishing any rows
         // twice or passing null columns to Arrow. Stay uncached for this scan
@@ -219,7 +235,8 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         columns.clear();
         with_cache_ = false;
         stream_uncached_ = true;
-        return read_next_uncached(batch);
+        ARROW_RETURN_NOT_OK(read_next_uncached(batch));
+        return true;
       }
       columns[col_idx] = std::move(col_chunked_array);
     }

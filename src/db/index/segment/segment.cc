@@ -566,7 +566,7 @@ class SegmentImpl : public Segment,
   class CombinedRecordBatchReader;
 };
 
-class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
+class SegmentImpl::CombinedRecordBatchReader : public ResidentRecordBatchReader {
  public:
   CombinedRecordBatchReader(
       std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
@@ -579,7 +579,13 @@ class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override;
 
+  arrow::Result<bool> ReadNextResident(
+      std::shared_ptr<arrow::RecordBatch> *batch) override;
+
  private:
+  arrow::Result<bool> read_next(std::shared_ptr<arrow::RecordBatch> *batch,
+                                bool resident_only);
+
   std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers_;
   std::shared_ptr<arrow::Schema> projected_schema_;
   arrow::MemoryPool *pool_;
@@ -4119,10 +4125,27 @@ std::shared_ptr<arrow::Schema> SegmentImpl::CombinedRecordBatchReader::schema()
 
 arrow::Status SegmentImpl::CombinedRecordBatchReader::ReadNext(
     std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, false).status();
+}
+
+arrow::Result<bool> SegmentImpl::CombinedRecordBatchReader::ReadNextResident(
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, true);
+}
+
+arrow::Result<bool> SegmentImpl::CombinedRecordBatchReader::read_next(
+    std::shared_ptr<arrow::RecordBatch> *batch, bool resident_only) {
   *batch = nullptr;
   while (current_reader_index_ < readers_.size()) {
     std::shared_ptr<arrow::RecordBatch> input;
-    ARROW_RETURN_NOT_OK(readers_[current_reader_index_]->ReadNext(&input));
+    if (resident_only) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto ready, zvec::ReadNextResident(*readers_[current_reader_index_],
+                                             &input));
+      if (!ready) return false;
+    } else {
+      ARROW_RETURN_NOT_OK(readers_[current_reader_index_]->ReadNext(&input));
+    }
 
     if (emit_segment_row_id_ && input) {
       auto num_rows = input->num_rows();
@@ -4161,14 +4184,14 @@ arrow::Status SegmentImpl::CombinedRecordBatchReader::ReadNext(
 
     if (input) {
       *batch = std::move(input);
-      return arrow::Status::OK();
+      return true;
     }
 
     current_reader_index_++;
   }
 
   *batch = nullptr;
-  return arrow::Status::OK();
+  return true;
 }
 
 bool SegmentImpl::ready_for_dump_block() {

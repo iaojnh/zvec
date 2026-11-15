@@ -18,6 +18,7 @@
 #include "db/common/global_resource.h"
 #include "db/index/segment/filtering_reader.h"
 #include "db/index/storage/parquet_memory_pool.h"
+#include "db/index/storage/resident_record_batch_reader.h"
 #include "db/sqlengine/planner/segment_node.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
@@ -574,7 +575,7 @@ TEST(SegmentStreamTest, WideLikeReadAheadIsBoundedAndCancels) {
       auto schema = arrow::schema({arrow::field("payload", arrow::utf8())});
       auto batch =
           arrow::RecordBatch::Make(schema, batch_rows, {values.Finish().ValueOrDie()});
-      class Reader : public arrow::RecordBatchReader {
+      class Reader : public ResidentRecordBatchReader {
        public:
         Reader(std::shared_ptr<arrow::RecordBatch> batch,
                std::shared_ptr<std::atomic<int>> calls)
@@ -586,6 +587,11 @@ TEST(SegmentStreamTest, WideLikeReadAheadIsBoundedAndCancels) {
             std::shared_ptr<arrow::RecordBatch> *out) override {
           *out = calls_->fetch_add(1) < 200 ? batch_ : nullptr;
           return arrow::Status::OK();
+        }
+        arrow::Result<bool> ReadNextResident(
+            std::shared_ptr<arrow::RecordBatch> *out) override {
+          ARROW_RETURN_NOT_OK(ReadNext(out));
+          return true;
         }
 
        private:

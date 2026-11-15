@@ -1994,3 +1994,47 @@ TEST_F(BufferPoolStoreTest, RecordBatchCopyEstimatePreservesSlicedPayloadCharge)
   EXPECT_EQ(per_row * 5 + 17 + 23, detail::EstimateQueryResult(*batch));
   EXPECT_EQ(0u, detail::EstimateQueryResult(*batch->Slice(0, 0)));
 }
+
+TEST_F(BufferPoolStoreTest, ResidentScanMissDoesNotDecodeOrConsumeRows) {
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  auto cold = store->scan({"id", "name"});
+  ASSERT_NE(cold, nullptr);
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto before = pool.external_used();
+  std::shared_ptr<arrow::RecordBatch> batch;
+  auto miss = zvec::ReadNextResident(*cold, &batch);
+  ASSERT_TRUE(miss.ok());
+  EXPECT_FALSE(*miss);
+  EXPECT_EQ(batch, nullptr);
+  EXPECT_EQ(pool.external_used(), before);
+
+  ASSERT_TRUE(cold->ReadNext(&batch).ok());
+  ASSERT_NE(batch, nullptr);
+  ASSERT_GT(batch->num_rows(), 0);
+  ASSERT_TRUE(batch->ValidateFull().ok());
+  auto warm = store->scan({"id", "name"});
+  std::shared_ptr<arrow::RecordBatch> ready;
+  auto hit = zvec::ReadNextResident(*warm, &ready);
+  ASSERT_TRUE(hit.ok());
+  ASSERT_TRUE(*hit);
+  ASSERT_NE(ready, nullptr);
+  EXPECT_TRUE(ready->Equals(*batch));
+  // The next row group is still cold. A miss must preserve its position.
+  auto next_group = zvec::ReadNextResident(*warm, &ready);
+  ASSERT_TRUE(next_group.ok());
+  EXPECT_FALSE(*next_group);
+  EXPECT_EQ(ready, nullptr);
+  while (true) {
+    ASSERT_TRUE(cold->ReadNext(&batch).ok());
+    auto hit_or_end = zvec::ReadNextResident(*warm, &ready);
+    ASSERT_TRUE(hit_or_end.ok());
+    ASSERT_TRUE(*hit_or_end);
+    if (!batch) {
+      EXPECT_EQ(ready, nullptr);
+      break;
+    }
+    ASSERT_NE(ready, nullptr);
+    EXPECT_TRUE(ready->Equals(*batch));
+  }
+}
