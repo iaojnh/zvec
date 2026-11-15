@@ -670,9 +670,11 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           unpin(item, key);
           return nullptr;
         }
-        const auto sample =
-            record_hit ? hits.fetch_add(1, std::memory_order_relaxed) : 1;
-        if ((sample & 7) == 0) {
+        if (record_hit) {
+          hits.fetch_add(1, std::memory_order_relaxed);
+          // A hit represents an entire posting list, not an individual vector.
+          // Global every-eighth sampling aliases fixed list traversal orders
+          // and can leave seven hot lists unprotected on every repeated scan.
           item.referenced.store(true, std::memory_order_relaxed);
           item.priority.store(ailego::BlockEvictionQueue::kProtectedPriority,
                               std::memory_order_relaxed);
