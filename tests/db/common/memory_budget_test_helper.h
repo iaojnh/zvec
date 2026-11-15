@@ -19,6 +19,7 @@ class MemoryBudgetTestPeer {
     auto &writers = SharedWriteBufferMemoryAllowance();
     std::scoped_lock lock(results.materialization_mutex_, results.mutex_,
                           metadata.mutex_, writers.mutex_);
+    results.drain_releases();
     if (results.active_ || metadata.active_ || writers.active_ ||
         writers.active_backing_)
       return false;
