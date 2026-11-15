@@ -2489,8 +2489,11 @@ TEST_P(SegmentTest, BufferedDirectDocFetchPreservesConcurrentReads) {
                   .ok());
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
-      options_, 100, 8);
+      options_, 100, 4);
   ASSERT_NE(segment, nullptr);
+  ASSERT_TRUE(segment->flush().ok());
+  ASSERT_TRUE(
+      test::TestHelper::SegmentInsertDoc(segment, schema, 104, 108).ok());
   std::atomic<bool> correct{true};
   auto check = [&]() {
     std::vector<std::thread> readers;
@@ -2517,6 +2520,11 @@ TEST_P(SegmentTest, BufferedDirectDocFetchPreservesConcurrentReads) {
   };
   check();
   ASSERT_TRUE(segment->dump().ok());
+  size_t scalar_blocks = 0;
+  for (const auto &block : segment->meta()->persisted_blocks()) {
+    if (block.type() == BlockType::SCALAR) ++scalar_blocks;
+  }
+  ASSERT_GT(scalar_blocks, 1u);
   check();
   auto projected = segment->fetch(
       103, std::vector<std::string>{"text", "unknown", "text"}, false);

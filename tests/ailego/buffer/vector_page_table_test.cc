@@ -1157,6 +1157,28 @@ TEST_F(BufferPoolTest, RejectsReinitializationWhileMemoryIsActive) {
   EXPECT_EQ(8 * kVectorPageSize, memory_pool.capacity());
 }
 
+TEST_F(BufferPoolTest, AllocationReclaimKeepsUnneededCacheEntries) {
+  auto &memory_pool = PoolPayloadBudget::get_instance();
+  init_pool(/*capacity_pages=*/64);
+  SizedExternalCache cache;
+  // Stay below the background watermark and isolate foreground admission.
+  // Six pages of missing capacity can be satisfied by any one old entry.
+  for (size_t pages : {8u, 9u, 10u, 11u}) {
+    const size_t bytes = pages * kVectorPageSize;
+    auto value = cache.acquire(bytes);
+    ASSERT_NE(nullptr, value);
+    cache.release(bytes);
+  }
+  ASSERT_EQ(4u, cache.entry_count());
+  EXPECT_EQ(1u, BlockEvictionQueue::get_instance().reclaim_for_allocation(
+                    6 * kVectorPageSize));
+  EXPECT_EQ(3u, cache.entry_count());
+  auto value = cache.acquire(32 * kVectorPageSize);
+  ASSERT_NE(nullptr, value);
+  EXPECT_LE(memory_pool.committed(), memory_pool.capacity());
+  cache.release(32 * kVectorPageSize);
+}
+
 TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
   auto &memory_pool = PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory_pool.init(2 * kVectorPageSize));

@@ -1374,17 +1374,19 @@ Doc::Ptr SegmentImpl::fetch_direct_doc_unsafe(
   if (row < 0 || blocks.empty() || blocks.size() != offsets.size() ||
       blocks.size() != persist_stores_.size())
     return nullptr;
-  int64_t rows = 0;
-  for (size_t i = 0; i < blocks.size(); ++i) {
-    if (offsets[i] != rows) return nullptr;
-    for (const auto &column : columns) {
-      if (!blocks[i].contain_column(column)) return nullptr;
-    }
-    rows += blocks[i].doc_count_;
+  // calculate_block_offsets() builds cumulative scalar offsets. The size
+  // check above excludes layouts where blocks without the anchor column were
+  // skipped. A single-row Fetch only needs to validate its selected block.
+  const auto end = std::upper_bound(offsets.begin(), offsets.end(), row);
+  if (end == offsets.begin()) return nullptr;
+  const size_t i = end - offsets.begin() - 1;
+  if (static_cast<uint64_t>(row - offsets[i]) >= blocks[i].doc_count_)
+    return nullptr;
+  // Keep this metadata check: a dropped/re-added column can still be present
+  // in an old physical file while being absent from this block logically.
+  for (const auto &column : columns) {
+    if (!blocks[i].contain_column(column)) return nullptr;
   }
-  if (row >= rows) return nullptr;
-  const auto i = std::upper_bound(offsets.begin(), offsets.end(), row) -
-                 offsets.begin() - 1;
   auto *store =
       dynamic_cast<BufferPoolForwardStore *>(persist_stores_[i].get());
   return store ? store->fetch_doc(columns, schema, row - offsets[i]) : nullptr;
