@@ -90,6 +90,94 @@ class ParquetBudgetTest : public testing::Test {
   size_t previous_capacity_{0};
 };
 
+TEST_F(ParquetBudgetTest, FetchScratchRetainsChargeAndBoundsReallocation) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  ParquetMemoryPool backing(arrow::default_memory_pool(), true, true);
+  FetchMemoryPool bounded(&backing, 128 * 1024);
+  {
+    FetchScratchMemoryPool scratch(&bounded, true);
+    ASSERT_TRUE(scratch.enabled());
+    const auto allocations = backing.num_allocations();
+    const auto charged = budget_.external_used();
+    ASSERT_GE(charged, 64u * 1024);
+    {
+      std::vector<std::unique_ptr<arrow::Buffer>> buffers;
+      for (int i = 0; i < 32; ++i) {
+        auto buffer = arrow::AllocateBuffer(64, &scratch);
+        ASSERT_TRUE(buffer.ok());
+        EXPECT_EQ(0u, reinterpret_cast<uintptr_t>((*buffer)->data()) % 64);
+        std::memset((*buffer)->mutable_data(), i, 64);
+        buffers.push_back(std::move(*buffer));
+      }
+      auto growing = arrow::AllocateResizableBuffer(64, &scratch).ValueOrDie();
+      std::memset(growing->mutable_data(), 37, 64);
+      ASSERT_TRUE(growing->Resize(4096).ok());
+      EXPECT_EQ(37, growing->data()[63]);
+      ASSERT_TRUE(growing->Resize(128, true).ok());
+      EXPECT_EQ(37, growing->data()[63]);
+      EXPECT_EQ(allocations, backing.num_allocations());
+      EXPECT_EQ(charged, budget_.external_used());
+    }
+    EXPECT_EQ(0, scratch.bytes_allocated());
+    EXPECT_EQ(64 * 1024, bounded.bytes_allocated());
+    // Freed suballocations must not refund the still-owned backing or allow
+    // a direct allocation to exceed the batch's total retained working set.
+    auto refused = arrow::AllocateBuffer(96 * 1024, &scratch);
+    EXPECT_TRUE(refused.status().IsOutOfMemory());
+    EXPECT_TRUE(bounded.exceeded());
+    EXPECT_EQ(charged, budget_.external_used());
+  }
+  EXPECT_EQ(0, bounded.bytes_allocated());
+  EXPECT_EQ(0, backing.bytes_allocated());
+  EXPECT_EQ(0u, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, FetchScratchKeepsSmallAllocationUnderPressure) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  const size_t occupied = budget_.capacity() - 128 * 1024;
+  ASSERT_TRUE(budget_.try_charge_external(occupied));
+  auto release =
+      ailego::ScopeGuard::Make([&] { budget_.release_external(occupied); });
+  ParquetMemoryPool backing(arrow::default_memory_pool(), true, true);
+  FetchMemoryPool bounded(&backing, 128 * 1024);
+  FetchScratchMemoryPool scratch(&bounded, true);
+  EXPECT_FALSE(scratch.enabled());
+  auto small = arrow::AllocateBuffer(64, &bounded);
+  ASSERT_TRUE(small.ok()) << small.status().ToString();
+  EXPECT_LE(budget_.used(), budget_.capacity());
+  small = std::unique_ptr<arrow::Buffer>{};
+  EXPECT_EQ(occupied, budget_.external_used());
+}
+
+TEST_F(ParquetBudgetTest, FetchScratchConcurrentBatchesReleaseTheirBacking) {
+  ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
+  ParquetMemoryPool backing(arrow::default_memory_pool(), true, true);
+  std::atomic<size_t> failures{0};
+  std::vector<std::thread> threads;
+  for (size_t worker = 0; worker < 4; ++worker) {
+    threads.emplace_back([&, worker] {
+      for (int round = 0; round < 64; ++round) {
+        FetchMemoryPool bounded(&backing, 128 * 1024);
+        FetchScratchMemoryPool scratch(&bounded, true);
+        auto buffer = arrow::AllocateBuffer(4096, &scratch);
+        if (!buffer.ok()) {
+          ++failures;
+          continue;
+        }
+        std::memset((*buffer)->mutable_data(), worker + round, 4096);
+        std::this_thread::yield();
+        if ((*buffer)->data()[4095] != static_cast<uint8_t>(worker + round))
+          ++failures;
+        if (budget_.used() > budget_.capacity()) ++failures;
+      }
+    });
+  }
+  for (auto &thread : threads) thread.join();
+  EXPECT_EQ(0u, failures.load());
+  EXPECT_EQ(0, backing.bytes_allocated());
+  EXPECT_EQ(0u, budget_.external_used());
+}
+
 TEST_F(ParquetBudgetTest,
        RepeatedWriterBatchesDoNotAccumulateOneBufferedRowGroup) {
   ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
