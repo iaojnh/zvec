@@ -3254,17 +3254,17 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
           selected_rows[row] = {rows[row].output, rows[row].local};
         std::vector<BufferPoolForwardStore::FetchBlock> requests;
         requests.reserve(group_count);
-        for (size_t begin = 0; begin < rows.size();) {
-          const size_t index = rows[begin].block;
+        for (size_t group_begin = 0; group_begin < rows.size();) {
+          const size_t index = rows[group_begin].block;
           auto *buffered_store = dynamic_cast<BufferPoolForwardStore *>(
               persist_stores_[index].get());
           if (!buffered_store) return TablePtr{};
-          size_t end = begin + 1;
-          while (end < rows.size() && rows[end].block == index) ++end;
+          size_t group_end = group_begin + 1;
+          while (group_end < rows.size() && rows[group_end].block == index) ++group_end;
           requests.push_back(
               {buffered_store, {},
-               {selected_rows.data() + begin, end - begin}});
-          begin = end;
+               {selected_rows.data() + group_begin, group_end - group_begin}});
+          group_begin = group_end;
         }
         auto combined = BufferPoolForwardStore::fetch_blocks(
             stored_columns, requests, segment_doc_ids.size(), memory_pool);
