@@ -397,7 +397,8 @@ TEST(SegmentStreamTest,
   const auto capacity = pool.capacity();
   auto restore = ailego::ScopeGuard::Make([&] { pool.init(capacity); });
   pool.init(1024 * 1024);
-  auto *arrow_pool = detail::GetParquetMemoryPool().get();
+  // PlanInfo charges its output to the query pool, separate from column cache.
+  auto *arrow_pool = detail::GetParquetQueryMemoryPool().get();
   const auto baseline = arrow_pool->charged_bytes();
   auto schema = arrow::schema({arrow::field("row", arrow::int32())});
   arrow::Int32Builder builder;

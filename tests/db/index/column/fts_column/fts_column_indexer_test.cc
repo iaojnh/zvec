@@ -373,6 +373,28 @@ TEST_F(FtsColumnIndexerTest, SearchTopkLimitsResults) {
   EXPECT_LE(results.size(), 3u);
 }
 
+TEST_F(FtsColumnIndexerTest, SearchTopkAcrossInitialReserveKeepsRanking) {
+  auto indexer = make_indexer();
+  for (uint64_t doc_id = 0; doc_id < 192; ++doc_id) {
+    std::string text = "world";
+    for (uint64_t i = 0; i <= doc_id; ++i) text += " hello";
+    ASSERT_TRUE(indexer->insert(doc_id, text).has_value());
+  }
+  std::vector<FtsResult> all;
+  ASSERT_TRUE(search_ok(*indexer, "hello", 192, &all));
+  ASSERT_EQ(192u, all.size());
+  for (const uint32_t topk : {0u, 1u, 32u, 128u, 129u, 192u, 256u}) {
+    SCOPED_TRACE(topk);
+    std::vector<FtsResult> results;
+    ASSERT_TRUE(search_ok(*indexer, "hello", topk, &results));
+    ASSERT_EQ(std::min<size_t>(topk, all.size()), results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+      EXPECT_EQ(all[i].doc_id, results[i].doc_id);
+      EXPECT_FLOAT_EQ(all[i].score, results[i].score);
+    }
+  }
+}
+
 // ============================================================
 // search() - phrase query
 // ============================================================

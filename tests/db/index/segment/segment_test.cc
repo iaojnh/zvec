@@ -2535,6 +2535,69 @@ TEST_P(SegmentTest, BufferedDirectDocFetchPreservesConcurrentReads) {
             test::TestHelper::CreateDoc(103, schema).get<std::string>("text"));
 }
 
+TEST_P(SegmentTest,
+       BufferedDirectDocFetchPreservesConcurrentReadsAcrossBlocks) {
+  CollectionSchema schema(col_name_);
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "text", DataType::STRING, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "number", DataType::INT64, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "items", DataType::ARRAY_INT32, false))
+                  .ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 100, 4);
+  ASSERT_NE(segment, nullptr);
+  ASSERT_TRUE(segment->flush().ok());
+  ASSERT_TRUE(
+      test::TestHelper::SegmentInsertDoc(segment, schema, 104, 108).ok());
+  std::atomic<bool> correct{true};
+  auto check = [&]() {
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t)
+      readers.emplace_back([&, t]() {
+        for (int n = 0; n < 32; ++n) {
+          const int id = 100 + (n + t) % 8;
+          auto expected = test::TestHelper::CreateDoc(id, schema);
+          auto doc = segment->fetch(id, std::nullopt, false);
+          if (!doc || doc->pk_ref() != expected.pk_ref() ||
+              doc->doc_id() != static_cast<uint64_t>(id) ||
+              doc->get<std::string>("text") !=
+                  expected.get<std::string>("text") ||
+              doc->get<int64_t>("number") != expected.get<int64_t>("number") ||
+              doc->get<std::vector<int32_t>>("items") !=
+                  expected.get<std::vector<int32_t>>("items") ||
+              (!options_.enable_mmap_ &&
+               !detail::DocumentMemoryAccess::budgeted(*doc)))
+            correct.store(false);
+        }
+      });
+    for (auto &reader : readers) reader.join();
+    EXPECT_TRUE(correct.load());
+  };
+  check();
+  ASSERT_TRUE(segment->dump().ok());
+  size_t scalar_blocks = 0;
+  for (const auto &block : segment->meta()->persisted_blocks()) {
+    if (block.type() == BlockType::SCALAR) ++scalar_blocks;
+  }
+  ASSERT_GT(scalar_blocks, 1u);
+  check();
+  auto projected = segment->fetch(
+      103, std::vector<std::string>{"text", "unknown", "text"}, false);
+  ASSERT_NE(projected, nullptr);
+  EXPECT_FALSE(projected->has("number"));
+  EXPECT_EQ(projected->get<std::string>("text"),
+            test::TestHelper::CreateDoc(103, schema).get<std::string>("text"));
+}
+
+
 TEST_P(SegmentTest, FetchBatchPreservesMissingAndDuplicateGlobalIDs) {
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,

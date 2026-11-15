@@ -1246,9 +1246,15 @@ size_t BlockEvictionQueue::batch_recycle_impl(size_t count, size_t scan_count,
         valid_owners_.find(item.owner) != valid_owners_.end() &&
         !item.owner->is_dead_block(item.owner_key, item.version)) {
       const size_t payload = bytes ? item.owner->eviction_bytes(item.owner_key) : 0;
+      const size_t used_before = bytes ? pool.used() : 0;
       if (item.owner->evict_block(item.owner_key)) {
         ++evicted;
-        reclaimed += payload ? payload : MemoryLimitPool::page_buffer_size();
+        // Legacy owners do not report payload sizes. Count their actual
+        // release so a decoded column is not mistaken for a single page.
+        const size_t released =
+            bytes ? used_before - std::min(used_before, pool.used()) : 0;
+        reclaimed += std::max(
+            released, payload ? payload : MemoryLimitPool::page_buffer_size());
       }
     }
   }

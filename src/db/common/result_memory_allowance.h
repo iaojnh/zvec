@@ -177,6 +177,24 @@ class ResultMemoryAllowance {
       copy_bytes_ += std::exchange(other.copy_bytes_, 0);
     }
 
+    // Split an already-admitted copy batch into independent result owners.
+    // Only ownership moves: the global active and RSS debits stay in place.
+    // Allocate the destination only after admitting the source batch.
+    void transfer_copy_to(Lease &destination, size_t bytes) {
+      if (&destination == this || owner_ != destination.owner_ ||
+          backing_quantum_ != destination.backing_quantum_ ||
+          materialization_.owns_lock() ||
+          destination.materialization_.owns_lock() ||
+          native_bytes_ || copy_bytes_ != bytes_ || bytes > bytes_ ||
+          destination.bytes_ || destination.native_bytes_ ||
+          destination.copy_bytes_)
+        throw std::bad_alloc();
+      bytes_ -= bytes;
+      copy_bytes_ -= bytes;
+      destination.bytes_ = bytes;
+      destination.copy_bytes_ = bytes;
+    }
+
     size_t bytes() const noexcept {
       return bytes_;
     }

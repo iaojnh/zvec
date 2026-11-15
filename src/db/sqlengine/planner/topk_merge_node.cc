@@ -95,9 +95,10 @@ arrow::Status TopKMergeNode::prepare() {
         readers[i] = tl::make_unexpected(Status::InternalError(error.what()));
       }
     };
-    // Preserve per-segment search parallelism without launching every segment.
-    // A caller already on this pool must not block waiting for its own workers.
-    if (pool_->indexof_this() >= 0) {
+    // A single task has no parallel work to overlap; avoid a worker handoff
+    // and wait for every segment in a one-thread query configuration.
+    // A caller already on this pool must not wait for its own workers either.
+    if (count == 1 || pool_->indexof_this() >= 0) {
       for (size_t i = 0; i < count; ++i) start(i);
     } else {
       auto group = pool_->make_group();

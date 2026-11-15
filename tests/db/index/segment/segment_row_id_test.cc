@@ -230,7 +230,8 @@ TEST_P(SegmentTest, ScanLocalRowIDUsesStorageModeBudget) {
   auto reader = segment->scan({LOCAL_ROW_ID, "id"});
   ASSERT_NE(nullptr, reader);
 
-  auto *pool = detail::GetParquetMemoryPool().get();
+  // LOCAL_ROW_ID is synthesized by the query, outside the column cache.
+  auto *pool = detail::GetParquetQueryMemoryPool().get();
   const auto baseline = pool->bytes_allocated();
   std::shared_ptr<arrow::RecordBatch> batch;
   auto status = reader->ReadNext(&batch);
