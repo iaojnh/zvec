@@ -26,6 +26,7 @@
 #include <arrow/result.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/external_cache.h>
+#include "parquet_cache_mutex.h"
 
 namespace arrow {
 class Buffer;
@@ -232,7 +233,8 @@ class ParquetBufferPool {
   using Cache =
       ailego::ExternalCache<ParquetBufferID, detail::ParquetBufferPayload,
                             detail::ParquetBufferLoader, ParquetBufferIDHash,
-                            ParquetBufferIDEqual, /*PayloadOwnsBudget=*/true>;
+                            ParquetBufferIDEqual, /*PayloadOwnsBudget=*/true,
+                            detail::ParquetCacheMutex>;
 
   ParquetBufferPool() = default;
 

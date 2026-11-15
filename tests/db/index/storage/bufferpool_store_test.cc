@@ -1923,3 +1923,47 @@ TEST_F(BufferPoolStoreTest,
   auto resident = ParquetBufferPool::get_instance().try_acquire_buffer(id);
   EXPECT_NE(resident.borrowed_data(), nullptr);
 }
+
+TEST_F(BufferPoolStoreTest, ConcurrentDocReadersSurviveCacheRetirement) {
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> columns{GLOBAL_DOC_ID, USER_ID, "name"};
+  auto schema = arrow::schema(SelectFields(store->physic_schema(), columns));
+  auto expected = store->fetch_doc(columns, schema, 0);
+  ASSERT_NE(expected, nullptr);
+  const auto expected_name = expected->get<std::string>("name");
+  const size_t active_before = detail::SharedResultMemoryAllowance().active_bytes();
+  const ParquetBufferID file(parquet_path, 0, 0);
+  std::atomic<bool> start{false};
+  std::atomic<int> ready{0};
+  std::atomic<int> failures{0};
+  std::vector<std::thread> readers;
+  for (int thread = 0; thread < 8; ++thread) {
+    readers.emplace_back([&]() {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (int repeat = 0; repeat < 200; ++repeat) {
+        try {
+          auto doc = store->fetch_doc(columns, schema, 0);
+          if (!doc || doc->doc_id() != expected->doc_id() ||
+              doc->pk() != expected->pk() ||
+              doc->get<std::string>("name") != expected_name)
+            failures.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != 8) std::this_thread::yield();
+  start.store(true, std::memory_order_release);
+  // Retirement takes the writer lock while readers pin, copy and release.
+  // Existing pins and single-flight loads must remain valid through it.
+  for (int repeat = 0; repeat < 32; ++repeat)
+    ParquetBufferPool::get_instance().retire_file(file);
+  for (auto &reader : readers) reader.join();
+  EXPECT_EQ(0, failures.load());
+  EXPECT_EQ(active_before, detail::SharedResultMemoryAllowance().active_bytes());
+  store.reset();
+  EXPECT_EQ(expected_name, expected->get<std::string>("name"));
+}
