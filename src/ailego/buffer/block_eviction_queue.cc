@@ -2682,6 +2682,41 @@ bool MemoryLimitPool::unmap_cache_mapping(CacheBuffer *buffer) {
   return true;
 }
 
+MemoryLimitPool::WorkspaceBuffer *MemoryLimitPool::try_acquire_workspace_buffer(
+    size_t bytes) {
+  const size_t page = MemoryHelper::PageSize();
+  if (!bytes || bytes > std::numeric_limits<size_t>::max() - (page - 1))
+    return nullptr;
+  bytes = (bytes + page - 1) / page * page;
+  PendingAllocation pending(*this, PendingAllocation::Kind::kWorkspace);
+  if (!pending.reserve(bytes)) return nullptr;
+  PendingAllocation metadata(*this, PendingAllocation::Kind::kLockedMetadata);
+  if (!metadata.reserve(sizeof(WorkspaceBuffer))) return nullptr;
+  auto *buffer = new (std::nothrow) WorkspaceBuffer();
+  if (!buffer) return nullptr;
+  buffer->data = static_cast<uint8_t *>(File::MemoryMap(bytes, 0));
+  if (!buffer->data) {
+    delete buffer;
+    return nullptr;
+  }
+  buffer->bytes = bytes;
+  buffer->stamp = pending.commit_mapping();
+  metadata.commit();
+  // A mapping can witness residency only after its pending debit commits.
+  // The existing sampler counts private resident pages, not virtual capacity.
+  register_cache_mapping(buffer);
+  return buffer;
+}
+
+bool MemoryLimitPool::release_workspace_buffer(WorkspaceBuffer *buffer) {
+  if (!buffer) return true;
+  if (!unmap_cache_mapping(buffer)) return false;
+  release_unmapped_external(buffer->bytes, buffer->stamp);
+  delete buffer;
+  release_metadata(sizeof(WorkspaceBuffer));
+  return true;
+}
+
 MemoryLimitPool::CacheBuffer *MemoryLimitPool::try_acquire_cache_buffer(
     size_t bytes) {
   const size_t page = page_buffer_size();

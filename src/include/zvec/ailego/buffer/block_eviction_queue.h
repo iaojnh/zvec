@@ -439,6 +439,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   };
   CacheBuffer *try_acquire_cache_buffer(size_t bytes);
   void release_cache_buffer(CacheBuffer *buffer);
+  // Mandatory workspaces share the mapping-residency directory, but never
+  // optional-cache admission, idle reuse or evictable-cache accounting.
+  struct WorkspaceBuffer : CacheBuffer {};
+  WorkspaceBuffer *try_acquire_workspace_buffer(size_t bytes);
+  // Failed unmapping retains the descriptor, registration and backing debit.
+  bool release_workspace_buffer(WorkspaceBuffer *buffer);
   // Reassigning an already charged mapping must preserve mandatory-workspace
   // priority, just like acquiring one from the idle cache-buffer pool.
   bool can_reuse_cache_backing() const {

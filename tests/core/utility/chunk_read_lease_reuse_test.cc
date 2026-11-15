@@ -12,10 +12,18 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_factory.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 namespace zvec::ailego {
 struct MemoryLimitPoolTestPeer {
   static void stop_background(MemoryLimitPool &pool) {
     pool.stop_background_evictor();
+  }
+  static ProcessRssBudget::ResidentSample resident(bool background) {
+    return background ? MemoryLimitPool::read_background_resident_sample()
+                      : MemoryLimitPool::read_slab_resident_sample();
   }
 };
 }
@@ -133,5 +141,57 @@ TEST_F(ChunkReadLeaseReuseTest, ConcurrentReadersUseIndependentLeases) {
   for (auto &reader : readers) reader.join();
   EXPECT_TRUE(correct.load());
 }
+
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+TEST_F(ChunkReadLeaseReuseTest, WorkspaceWitnessFollowsEscapedReadAndUnmap) {
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  storage.reset();
+  storage = std::make_shared<ChunkReadStorage>();
+  ailego::Params params;
+  params.set(CHUNK_READ_STORAGE_CACHE_BYTES, size_t{0});
+  params.set(CHUNK_READ_STORAGE_MAX_READ_BYTES, 4 * page);
+  params.set(CHUNK_READ_STORAGE_WORKSPACE_COUNT, size_t{2});
+  params.set(CHUNK_READ_STORAGE_DIRECT_IO, false);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(path, false));
+  segment = storage->get("payload");
+  ASSERT_NE(nullptr, segment);
+  // Opening the storage can touch the first workspace while reading file
+  // metadata. Hold it busy so the measured read uses an untouched workspace.
+  IndexStorage::MemoryBlock preceding;
+  ASSERT_EQ(1u, segment->read(0, preceding, 1));
+  const auto before = ailego::MemoryLimitPoolTestPeer::resident(false);
+  const auto background_before =
+      ailego::MemoryLimitPoolTestPeer::resident(true);
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(4 * page, segment->read(0, block, 4 * page));
+  check(block, 0, 4 * page);
+  const auto touched = ailego::MemoryLimitPoolTestPeer::resident(false);
+  const auto background = ailego::MemoryLimitPoolTestPeer::resident(true);
+  EXPECT_GE(touched.owned_resident, before.owned_resident + 4 * page);
+  EXPECT_GE(background.owned_resident,
+            background_before.owned_resident + 4 * page);
+  EXPECT_EQ(0u, storage->stats().cache_bytes);
+  preceding.reset();
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  storage.reset();
+  // The escaped block still owns the workspace after its storage is closed.
+  check(block, 0, 4 * page);
+  EXPECT_GE(ailego::MemoryLimitPoolTestPeer::resident(false).owned_resident,
+            4 * page);
+  const size_t external = pool.external_used();
+  block.reset();
+  EXPECT_LT(pool.external_used(), external);
+  EXPECT_LE(ailego::MemoryLimitPoolTestPeer::resident(false).owned_resident +
+                4 * page,
+            touched.owned_resident);
+  EXPECT_LE(
+      ailego::MemoryLimitPoolTestPeer::resident(true).owned_resident + 4 * page,
+      background.owned_resident);
+}
+#endif
 }  // namespace
 }  // namespace zvec::core
