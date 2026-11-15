@@ -170,7 +170,7 @@ class BoundedSource : public arrow::acero::ExecNode {
   arrow::Future<arrow::ControlFlow<int>> consume(const Batch &next) try {
     if (!next || stopped()) return finish_deliveries();
     const bool legacy = plan_->query_context()->options().use_legacy_batching;
-    if (!legacy && parallel_wide_batch(*next)) return queue_delivery(*next);
+    if (!legacy && parallel_batch(*next)) return queue_delivery(*next);
     if (!deliveries_.empty()) {
       return drain_deliveries().Then([this, next]() { return consume(next); });
     }
@@ -226,9 +226,9 @@ class BoundedSource : public arrow::acero::ExecNode {
         [error](const arrow::Status &)
             -> arrow::Future<arrow::ControlFlow<int>> { return error; });
   }
-  bool parallel_wide_batch(const arrow::compute::ExecBatch &batch) {
-    // Cold decoding emits small batches. Pipeline only wide managed inputs,
-    // with spare capacity for the bounded window and its filtered output.
+  bool parallel_batch(const arrow::compute::ExecBatch &batch) {
+    // Keep cold/pressure reads serial. Ready managed batches can use the
+    // bounded delivery window, including small strings and nested lists.
     if (plan_->query_context()->memory_pool() !=
             detail::GetParquetQueryMemoryPool().get() ||
         plan_->query_context()->executor()->GetCapacity() <= 1 ||
@@ -237,12 +237,17 @@ class BoundedSource : public arrow::acero::ExecNode {
         batch.values.size() > 4)
       return false;
     size_t bytes = 0;
-    bool wide = false;
+    std::array<const arrow::ArrayData *, 8> pending{};
+    size_t count = 0, visited = 0;
     for (const auto &value : batch.values) {
-      if (!value.is_array()) continue;
-      const auto &array = *value.array();
-      if (!array.child_data.empty() || array.dictionary ||
-          array.buffers.size() > 3)
+      if (!value.is_array()) return false;
+      pending[count++] = value.array().get();
+    }
+    while (count) {
+      const auto &array = *pending[--count];
+      if (++visited > pending.size() || array.dictionary ||
+          array.buffers.size() > 3 ||
+          (!array.child_data.empty() && array.type->id() != arrow::Type::LIST))
         return false;
       for (const auto &buffer : array.buffers) {
         if (!buffer) continue;
@@ -250,15 +255,15 @@ class BoundedSource : public arrow::acero::ExecNode {
         if (size > std::numeric_limits<size_t>::max() - bytes) return false;
         bytes += size;
       }
-      const auto type = array.type->id();
-      if ((type == arrow::Type::STRING || type == arrow::Type::LARGE_STRING) &&
-          array.buffers.size() == 3 && array.buffers[2] &&
-          array.buffers[2]->size() >= 4 * 1024 * 1024)
-        wide = true;
+      for (const auto &child : array.child_data) {
+        if (!child || count == pending.size()) return false;
+        pending[count++] = child.get();
+      }
     }
     const size_t available =
         ailego::MemoryLimitPool::get_instance().prefetch_available();
-    if (!wide || bytes > available / (2 * kMaxDeliveries)) return false;
+    if (!visited || !available || bytes > available / (2 * kMaxDeliveries))
+      return false;
     if (!delivery_metadata_) {
       try {
         auto metadata = std::make_shared<ailego::MemoryReservation>();

@@ -172,9 +172,24 @@ TopKMergeNode::materialize() {
   const size_t count = std::min(kBatchRows, winners.size() - offset_);
   std::array<size_t, kBatchRows> order;
   std::iota(order.begin(), order.begin() + count, 0);
-  std::sort(order.begin(), order.begin() + count, [&](size_t a, size_t b) {
-    return winners[offset_ + a].segment < winners[offset_ + b].segment;
-  });
+  bool append_in_order = output_->fts_cond_info() &&
+                         segments_.front()->uses_buffer_storage();
+  if (append_in_order) {
+    bool ascending = true, descending = true;
+    for (size_t i = 1; i < count; ++i) {
+      const auto previous = winners[offset_ + i - 1].segment;
+      const auto current = winners[offset_ + i].segment;
+      ascending &= previous <= current;
+      descending &= previous >= current;
+    }
+    append_in_order = ascending || descending;
+  }
+  // Already grouped winners can be fetched in rank order without a second
+  // gather. Keep the bounded grouped-fetch/reorder path for interleaved ranks.
+  if (!append_in_order)
+    std::sort(order.begin(), order.begin() + count, [&](size_t a, size_t b) {
+      return winners[offset_ + a].segment < winners[offset_ + b].segment;
+    });
   std::array<uint32_t, kBatchRows> inverse;
   ailego::MemoryReservation batch_memory;
   ailego::MemoryReservation row_memory;
@@ -211,6 +226,11 @@ TopKMergeNode::materialize() {
   }
   ARROW_ASSIGN_OR_RAISE(auto table,
                         arrow::Table::FromRecordBatches(schema_, batches));
+  if (append_in_order) {
+    ARROW_ASSIGN_OR_RAISE(auto result, table->CombineChunksToBatch(memory_pool));
+    offset_ += count;
+    return result;
+  }
   arrow::UInt32Builder positions(memory_pool);
   ARROW_RETURN_NOT_OK(positions.AppendValues(inverse.data(), count));
   ARROW_ASSIGN_OR_RAISE(auto indices, positions.Finish());

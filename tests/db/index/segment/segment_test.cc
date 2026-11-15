@@ -2772,6 +2772,24 @@ TEST_P(SegmentTest, BufferedBatchFetchPreservesBlockOrderAndOwnership) {
     }
     retained = std::move(result);
   }
+  ASSERT_TRUE(segment->dump().ok());
+  std::vector<int> repeated_rows;
+  for (int row = 0; row < 70; ++row) repeated_rows.push_back(row * 7 % 20);
+  // Cover budgeted routing overflow and both cold and resident multi-block
+  // reads, retaining request order, duplicates and synthetic local IDs.
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    auto batch = segment->fetch(columns, repeated_rows);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_TRUE(batch->ValidateFull().ok());
+    ASSERT_EQ(batch->num_rows(), repeated_rows.size());
+    for (size_t row = 0; row < repeated_rows.size(); ++row) {
+      auto expected = segment->fetch(columns, repeated_rows[row]);
+      ASSERT_NE(expected, nullptr);
+      for (size_t col = 0; col < columns.size(); ++col)
+        EXPECT_TRUE(batch->column(col)->GetScalar(row).ValueOrDie()->Equals(
+            *expected->values[col].scalar()));
+    }
+  }
   segment.reset();
   for (int i = 0; i < 4; ++i) {
     ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);

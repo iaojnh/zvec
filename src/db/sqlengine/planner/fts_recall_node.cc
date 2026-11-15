@@ -19,6 +19,7 @@
 #include <zvec/db/config.h>
 #include "db/index/segment/segment_fetch_internal.h"
 #include "db/sqlengine/common/util.h"
+#include "db/sqlengine/planner/fts_rank_batch.h"
 
 namespace cp = arrow::compute;
 
@@ -50,7 +51,9 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
              -> arrow::Future<std::optional<cp::ExecBatch>> {
     auto &state = *state_ptr;
 
-    if (!state.iter_) {
+    const bool packed_rank =
+        self->rank_only_ && self->segment_->uses_buffer_storage();
+    if (!state.fts_result_) {
       auto fts_ret = self->prepare();
       if (!fts_ret) {
         if (fts_ret.error().code() == StatusCode::RESOURCE_EXHAUSTED) {
@@ -62,7 +65,33 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
                                           fts_ret.error().c_str()));
       }
       state.fts_result_ = fts_ret.value();
+      if (!packed_rank)
+        state.iter_ = state.fts_result_->create_iterator();
+    }
+
+    if (packed_rank && !state.iter_) {
+      if (state.rank_offset_ == state.fts_result_->count())
+        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+            std::nullopt);
+      // Optional coalescing must not require a new size class under pressure
+      // when the original builders could still reuse their prepaid slots.
+      if (ailego::MemoryLimitPool::get_instance().prefetch_available() >=
+          1024 * 1024) {
+        auto batch = MakeFtsRankBatch(
+            *state.fts_result_, state.rank_offset_, self->batch_size_,
+            self->schema_, self->segment_->query_memory_pool());
+        if (batch.ok()) {
+          state.rank_offset_ += (*batch)->num_rows();
+          return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+              cp::ExecBatch(**batch));
+        }
+        if (!batch.status().IsOutOfMemory())
+          return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+              batch.status());
+      }
+      // Once streaming fallback starts, keep its iterator for later batches.
       state.iter_ = state.fts_result_->create_iterator();
+      for (size_t i = 0; i < state.rank_offset_; ++i) state.iter_->next();
     }
 
     if (!state.iter_->valid()) {

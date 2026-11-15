@@ -3225,6 +3225,73 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
 
   if (std::any_of(segment_doc_ids.begin(), segment_doc_ids.end(),
                   [&](int row) { return row < begin || row >= end; })) {
+    if (!options_.enable_mmap_) {
+      try {
+        struct Row {
+          size_t block;
+          int output;
+          int local;
+        };
+        detail::RequestScratchArray<Row, 64> rows(segment_doc_ids.size());
+        for (size_t output = 0; output < segment_doc_ids.size(); ++output) {
+          const int row = segment_doc_ids[output];
+          // Buffered writing stores keep their existing bounded fallback.
+          if (row < 0 || row >= persisted_rows) return TablePtr{};
+          auto it = std::upper_bound(offsets.begin(), offsets.end(), row);
+          const size_t index = it - offsets.begin() - 1;
+          rows[output] = {index, static_cast<int>(output),
+                          static_cast<int>(row - offsets[index])};
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+          return a.block < b.block;
+        });
+        size_t group_count = 1;
+        for (size_t row = 1; row < rows.size(); ++row)
+          group_count += rows[row].block != rows[row - 1].block;
+        detail::RequestScratchArray<std::pair<int, int>, 64> selected_rows(
+            rows.size());
+        for (size_t row = 0; row < rows.size(); ++row)
+          selected_rows[row] = {rows[row].output, rows[row].local};
+        std::vector<BufferPoolForwardStore::FetchBlock> requests;
+        requests.reserve(group_count);
+        for (size_t group_begin = 0; group_begin < rows.size();) {
+          const size_t index = rows[group_begin].block;
+          auto *buffered_store = dynamic_cast<BufferPoolForwardStore *>(
+              persist_stores_[index].get());
+          if (!buffered_store) return TablePtr{};
+          size_t group_end = group_begin + 1;
+          while (group_end < rows.size() && rows[group_end].block == index) ++group_end;
+          requests.push_back(
+              {buffered_store, {},
+               {selected_rows.data() + group_begin, group_end - group_begin}});
+          group_begin = group_end;
+        }
+        auto combined = BufferPoolForwardStore::fetch_blocks(
+            stored_columns, requests, segment_doc_ids.size(), memory_pool);
+        if (combined) {
+          std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays(
+              columns.size());
+          for (size_t i = 0; i < stored_columns.size(); ++i) {
+            const size_t output_column = i + (has_row_id && i >= row_id_column);
+            arrays[output_column] = combined->column(i);
+            if (!arrays[output_column]->type()->Equals(
+                    result_schema->field(output_column)->type()))
+              return TablePtr{};
+          }
+          if (has_row_id) {
+            arrow::UInt64Builder builder(memory_pool);
+            ARROW_RETURN_NOT_OK(builder.Reserve(segment_doc_ids.size()));
+            for (int row : segment_doc_ids) builder.UnsafeAppend(row);
+            ARROW_ASSIGN_OR_RAISE(auto ids, builder.Finish());
+            arrays[row_id_column] = std::make_shared<arrow::ChunkedArray>(ids);
+          }
+          return arrow::Table::Make(result_schema, std::move(arrays),
+                                    segment_doc_ids.size());
+        }
+      } catch (const std::bad_alloc &) {
+        // Optional resident routing must yield to the original per-store path.
+      }
+    }
     struct BlockRows {
       BaseForwardStore::Ptr store;
       std::vector<int> rows;
@@ -3272,50 +3339,6 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
         ++runs.back().length;
       } else {
         runs.push_back({&group, offset, 1});
-      }
-    }
-    if (!options_.enable_mmap_ && groups.rbegin()->first < blocks.size()) {
-      std::vector<BufferPoolForwardStore::FetchBlock> requests;
-      requests.reserve(groups.size());
-      // Keep BP-only bookkeeping out of the group layout shared with mmap.
-      std::unordered_map<BlockRows *, size_t> request_indices;
-      request_indices.reserve(groups.size());
-      for (auto &[index, group] : groups) {
-        auto *buffered_store =
-            dynamic_cast<BufferPoolForwardStore *>(group.store.get());
-        if (!buffered_store) return TablePtr{};
-        request_indices.emplace(&group, requests.size());
-        requests.push_back({buffered_store, {}});
-        requests.back().rows.reserve(group.rows.size());
-      }
-      int output = 0;
-      for (const auto &run : runs) {
-        auto &selected = requests[request_indices.at(run.group)].rows;
-        for (int64_t row = 0; row < run.length; ++row) {
-          selected.emplace_back(output++, run.group->rows[run.offset + row]);
-        }
-      }
-      auto combined = BufferPoolForwardStore::fetch_blocks(
-          stored_columns, requests, segment_doc_ids.size(), memory_pool);
-      if (combined) {
-        std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays(
-            columns.size());
-        for (size_t i = 0; i < stored_columns.size(); ++i) {
-          const size_t output_column = i + (has_row_id && i >= row_id_column);
-          arrays[output_column] = combined->column(i);
-          if (!arrays[output_column]->type()->Equals(
-                  result_schema->field(output_column)->type()))
-            return TablePtr{};
-        }
-        if (has_row_id) {
-          arrow::UInt64Builder builder(memory_pool);
-          ARROW_RETURN_NOT_OK(builder.Reserve(segment_doc_ids.size()));
-          for (int row : segment_doc_ids) builder.UnsafeAppend(row);
-          ARROW_ASSIGN_OR_RAISE(auto ids, builder.Finish());
-          arrays[row_id_column] = std::make_shared<arrow::ChunkedArray>(ids);
-        }
-        return arrow::Table::Make(result_schema, std::move(arrays),
-                                  segment_doc_ids.size());
       }
     }
     for (auto &entry : groups) {

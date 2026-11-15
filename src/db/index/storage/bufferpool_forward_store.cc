@@ -857,25 +857,28 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
     arrow::MemoryPool *pool) try {
   if (!pool) pool = detail::GetParquetMemoryPool().get();
   if (columns.empty() || blocks.empty() || row_count <= 0) return nullptr;
-  using GroupKey = std::pair<size_t, int>;
-  using Entry = std::pair<const GroupKey, detail::SelectedRowsPlan::Rows>;
-  std::map<GroupKey, detail::SelectedRowsPlan::Rows, std::less<GroupKey>,
-           ailego::BudgetedAllocator<Entry>>
-      groups;
+  struct GatherRow {
+    size_t block;
+    int group;
+    int output;
+    int64_t local;
+  };
+  // One bounded routing buffer replaces a tree node and a growable vector
+  // for every touched row group. Larger requests retain budgeted overflow.
+  detail::RequestScratchArray<GatherRow, 64> groups(row_count);
   detail::RequestScratchArray<uint8_t, 64> seen(row_count);
   size_t selected_rows = 0;
   for (size_t block = 0; block < blocks.size(); ++block) {
     const auto &request = blocks[block];
     if (!request.store || !request.store->validate(columns)) return nullptr;
-    for (const auto &[output, row] : request.rows) {
+    for (const auto &[output, row] : request.selected_rows()) {
       if (output < 0 || output >= row_count || seen[output] || row < 0 ||
           row >= request.store->num_rows_)
         return nullptr;
       seen[output] = true;
-      ++selected_rows;
       const int rg = request.store->find_row_group_for_row(row);
-      groups[{block, rg}].emplace_back(
-          output, row - request.store->row_group_offsets_[rg]);
+      groups[selected_rows++] =
+          {block, rg, output, row - request.store->row_group_offsets_[rg]};
     }
   }
   if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
@@ -883,11 +886,23 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
   for (size_t i = 0; i < blocks.size(); ++i)
     identities[i] = blocks[i].store->metadata_id_.for_column(0, 0);
   detail::SelectedRowsPlan::Rows selected(row_count);
+  std::sort(groups.begin(), groups.end(), [](const auto &a, const auto &b) {
+    return a.block != b.block ? a.block < b.block : a.group < b.group;
+  });
   int64_t offset = 0;
-  for (const auto &[key, rows] : groups) {
-    for (const auto &[output, local] : rows)
-      selected[output] = {output, offset + local};
-    offset += blocks[key.first].store->row_group_row_nums_[key.second];
+  size_t group_count = 0;
+  for (size_t begin = 0; begin < groups.size();) {
+    const auto key = groups[begin];
+    size_t end = begin;
+    while (end < groups.size() && groups[end].block == key.block &&
+           groups[end].group == key.group) {
+      const auto &row = groups[end++];
+      selected[row.output] = {row.output, offset + row.local};
+    }
+    offset += blocks[key.block].store->row_group_row_nums_[key.group];
+    // Compact only the already consumed prefix; later routing rows stay live.
+    groups[group_count++] = key;
+    begin = end;
   }
   detail::SelectedRowsPlan plan(selected);
   arrow::ArrayVector arrays;
@@ -897,22 +912,24 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
         blocks.front().store->physic_schema_->GetFieldByName(name);
     if (!field) return nullptr;
     arrow::ArrayVector chunks;
+    chunks.reserve(group_count);
     detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 4> pins(
-        groups.size());
+        group_count);
     size_t pin = 0;
-    for (const auto &[key, rows] : groups) {
-      auto *store = blocks[key.first].store;
+    for (size_t group = 0; group < group_count; ++group) {
+      const auto &key = groups[group];
+      auto *store = blocks[key.block].store;
       const int column = store->physic_schema_->GetFieldIndex(name);
       if (column < 0 ||
           !store->physic_schema_->field(column)->type()->Equals(field->type()))
         return nullptr;
-      auto &id = identities[key.first];
+      auto &id = identities[key.block];
       id.column = column;
-      id.row_group = key.second;
+      id.row_group = key.group;
       pins[pin].emplace(ParquetBufferPool::get_instance().try_acquire_buffer(id));
       const auto *borrowed = pins[pin++]->borrowed_data();
       if (!borrowed ||
-          borrowed->length() != store->row_group_row_nums_[key.second])
+          borrowed->length() != store->row_group_row_nums_[key.group])
         return nullptr;
       chunks.insert(chunks.end(), borrowed->chunks().begin(),
                     borrowed->chunks().end());

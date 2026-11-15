@@ -2443,6 +2443,50 @@ TEST_F(BufferPoolStoreTest, BatchFetchNullableListsAcrossRowGroups) {
       }
     }
   }
+  // Exercise routing overflow and more than 64 distinct block/group keys,
+  // including repeated rows, binary bytes, null lists and null children.
+  std::vector<int> rows;
+  std::vector<BufferPoolForwardStore::FetchBlock> blocks(67);
+  for (auto &block : blocks) block.store = store.get();
+  for (int output = 0; output < 70; ++output) {
+    const int row = output * 7 % 12;
+    rows.push_back(row);
+    blocks[output % blocks.size()].rows.emplace_back(output, row);
+  }
+  const auto pool = detail::GetParquetMemoryPool();
+  auto expected = store->fetch_checked(scalar_columns, rows, pool.get());
+  ASSERT_TRUE(expected.ok()) << expected.status();
+  {
+    detail::FetchMemoryPool refused(pool.get(), 0);
+    EXPECT_EQ(nullptr, BufferPoolForwardStore::fetch_blocks(
+                           scalar_columns, blocks, rows.size(), &refused));
+    EXPECT_TRUE(refused.exceeded());
+    EXPECT_EQ(0, refused.bytes_allocated());
+  }
+  auto gathered = BufferPoolForwardStore::fetch_blocks(
+      scalar_columns, blocks, rows.size(), pool.get());
+  ASSERT_NE(gathered, nullptr);
+  EXPECT_TRUE(gathered->ValidateFull().ok());
+  EXPECT_TRUE(gathered->Equals(**expected));
+  using RowBuffer = ailego::BudgetedVector<std::pair<int, int>>;
+  std::vector<RowBuffer> row_owners;
+  row_owners.reserve(blocks.size());
+  for (auto &block : blocks) {
+    row_owners.push_back(std::move(block.rows));
+    const auto &owned = row_owners.back();
+    block.row_view = {owned.data(), owned.size()};
+  }
+  auto borrowed = BufferPoolForwardStore::fetch_blocks(
+      scalar_columns, blocks, rows.size(), pool.get());
+  ASSERT_NE(borrowed, nullptr);
+  EXPECT_TRUE(borrowed->Equals(**expected));
+  row_owners.clear();
+  store.reset();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  EXPECT_TRUE(gathered->ValidateFull().ok());
+  EXPECT_TRUE(gathered->Equals(**expected));
+  EXPECT_TRUE(borrowed->ValidateFull().ok());
+  EXPECT_TRUE(borrowed->Equals(**expected));
 }
 
 TEST_F(BufferPoolStoreTest, SelectedRowsPlanHandlesChangingColumnLayouts) {

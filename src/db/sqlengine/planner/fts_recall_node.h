@@ -47,6 +47,7 @@ class FtsRecallNode : public std::enable_shared_from_this<FtsRecallNode> {
   struct State {
     FtsIndexResults::Ptr fts_result_;
     IndexResults::IteratorUPtr iter_;
+    size_t rank_offset_{0};
   };
 
   Segment::Ptr segment_;

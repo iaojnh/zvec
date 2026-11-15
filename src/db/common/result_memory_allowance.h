@@ -31,6 +31,9 @@ class ResultMemoryAllowance {
     size_t bytes() const {
       return bytes_;
     }
+    bool covers(size_t bytes, size_t rss) const {
+      return bytes <= bytes_ && rss <= rss_bytes_;
+    }
     void acquire(size_t target, size_t rss_target, size_t materialization,
                  bool pending_copy) {
       auto &pool = ailego::MemoryLimitPool::get_instance();
@@ -184,10 +187,9 @@ class ResultMemoryAllowance {
       if (&destination == this || owner_ != destination.owner_ ||
           backing_quantum_ != destination.backing_quantum_ ||
           materialization_.owns_lock() ||
-          destination.materialization_.owns_lock() ||
-          native_bytes_ || copy_bytes_ != bytes_ || bytes > bytes_ ||
-          destination.bytes_ || destination.native_bytes_ ||
-          destination.copy_bytes_)
+          destination.materialization_.owns_lock() || native_bytes_ ||
+          copy_bytes_ != bytes_ || bytes > bytes_ || destination.bytes_ ||
+          destination.native_bytes_ || destination.copy_bytes_)
         throw std::bad_alloc();
       bytes_ -= bytes;
       copy_bytes_ -= bytes;
@@ -266,7 +268,7 @@ class ResultMemoryAllowance {
 
   bool acquire(size_t bytes, size_t backing_quantum, size_t materialization,
                PendingCopy *pending, size_t retained_copy) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     // Refund completed owners before admitting another result. Releases that
     // race this snapshot only leave a conservative overestimate until the
     // next admission or idle reclaim.
@@ -317,13 +319,31 @@ class ResultMemoryAllowance {
     if (pending &&
         materialization > std::numeric_limits<size_t>::max() - pending->bytes_)
       throw std::bad_alloc();
-    reservation_.acquire(target, rss_target, materialization,
-                         pending != nullptr);
-    if (pending) pending->bytes_ += materialization;
+    const bool covered = reservation_.covers(target, rss_target);
+    if (!covered)
+      reservation_.acquire(target, rss_target, materialization,
+                           pending != nullptr);
+    // Publish ownership before releasing this lock: concurrent idle reclaim
+    // must retain the quota backing this in-flight admission.
     active_ += bytes;
     if (!pending) native_active_ += bytes;
     copy_active_ += copy_growth;
     backing_quantum_ = std::max(backing_quantum_, backing_quantum);
+    if (covered && materialization) {
+      // Reusing prepaid quota needs no ledger growth. Keep RSS sampling and
+      // copy admission, which may contend with other allocators, outside the
+      // result-owner mutex. Failure refunds only this tentative owner.
+      lock.unlock();
+      try {
+        if (!pool.try_charge_process_backing(0, materialization,
+                                             pending != nullptr))
+          throw std::bad_alloc();
+      } catch (...) {
+        release_active(bytes, pending ? 0 : bytes, copy_growth);
+        throw;
+      }
+    }
+    if (pending) pending->bytes_ += materialization;
     return true;
   }
 
@@ -350,8 +370,7 @@ class ResultMemoryAllowance {
   // release_active's publication order. Incomplete concurrent publications
   // retain excess active quota instead of making admission optimistic.
   void drain_releases() const {
-    const size_t bytes =
-        released_bytes_.exchange(0, std::memory_order_acq_rel);
+    const size_t bytes = released_bytes_.exchange(0, std::memory_order_acq_rel);
     const size_t native =
         released_native_.exchange(0, std::memory_order_acq_rel);
     const size_t copy = released_copy_.exchange(0, std::memory_order_acq_rel);
