@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -52,19 +53,61 @@ struct ParquetBufferID {
   std::weak_ptr<arrow::io::RandomAccessFile> input;
 
   ParquetBufferID() = default;
+  ParquetBufferID(const ParquetBufferID &other) noexcept
+      : column(other.column),
+        row_group(other.row_group),
+        file_id(other.file_id),
+        device_id(other.device_id),
+        mtime(other.mtime),
+        generation(other.generation),
+        input(other.identity().input),
+        filename_(other.identity().filename_) {}
+  ParquetBufferID(ParquetBufferID &&) = default;
+  ParquetBufferID &operator=(const ParquetBufferID &other) noexcept {
+    if (this != &other) *this = ParquetBufferID(other);
+    return *this;
+  }
+  ParquetBufferID &operator=(ParquetBufferID &&) = default;
   ParquetBufferID(const std::string &filename,
                   const std::shared_ptr<arrow::io::RandomAccessFile> &file,
                   int column, int row_group);
 
   std::string_view filename() const noexcept {
-    return filename_ ? std::string_view(*filename_) : std::string_view("");
+    const auto &name = identity().filename_;
+    return name ? std::string_view(*name) : std::string_view("");
+  }
+
+  std::shared_ptr<arrow::io::RandomAccessFile> opened_file() const noexcept {
+    return identity().input.lock();
   }
 
   const std::string to_string() const;
 
  private:
+  friend class ParquetBufferPool;
+
+  const ParquetBufferID &identity() const noexcept {
+    return borrowed_identity_ ? *borrowed_identity_ : *this;
+  }
+
+  // Only the synchronous pool callback can create a borrowed lookup key.
+  // Any copy (including insertion into the cache) materializes ownership.
+  static ParquetBufferID borrowed(const ParquetBufferID &source, int column,
+                                  int row_group) noexcept {
+    ParquetBufferID key;
+    key.column = column;
+    key.row_group = row_group;
+    key.file_id = source.file_id;
+    key.device_id = source.device_id;
+    key.mtime = source.mtime;
+    key.generation = source.generation;
+    key.borrowed_identity_ = &source.identity();
+    return key;
+  }
+
   // Key copies, including hot pins, share immutable path storage.
   std::shared_ptr<const std::string> filename_;
+  const ParquetBufferID *borrowed_identity_{nullptr};
 };
 
 struct ParquetFileContext {
@@ -186,6 +229,37 @@ class ParquetBufferPool {
 
   ParquetBufferContextHandle acquire_buffer(ParquetBufferID buffer_id);
 
+  // The file context outlives this synchronous pin. Only owned values may
+  // escape the callback; asynchronous scans continue to use owning handles.
+  template <typename Read>
+  bool read_owned_column(const ParquetFileContext &context, int column,
+                         int row_group, Read &&read, int64_t row = -1) {
+    auto key = ParquetBufferID::borrowed(context.buffer_id, column, row_group);
+    auto &cache = cache_for(key);
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    if (row >= 0 && pool.committed() <= pool.capacity() / 2) {
+      auto copied = cache.read_if_cached(
+          key,
+          [&](const detail::ParquetBufferPayload &payload)
+              -> std::optional<bool> {
+            if (!payload.arrow || !small_owned_row(*payload.arrow, row))
+              return std::nullopt;
+            return std::forward<Read>(read)(*payload.arrow);
+          });
+      if (copied) return *copied;
+    }
+    auto value = cache.acquire(key);
+    if (!value) return false;
+    struct Pin {
+      Cache &cache;
+      const ParquetBufferID &key;
+      ~Pin() {
+        cache.release(key);
+      }
+    } pin{cache, key};
+    return std::forward<Read>(read)(*value);
+  }
+
   static ParquetBufferPool &get_instance() {
     static ParquetBufferPool instance;
     return instance;
@@ -223,6 +297,8 @@ class ParquetBufferPool {
   };
 
   Cache &cache_for(const ParquetBufferID &buffer_id);
+
+  static bool small_owned_row(const arrow::ChunkedArray &column, int64_t row);
 
   std::shared_ptr<arrow::ChunkedArray> retain(const ParquetBufferID &buffer_id);
 

@@ -292,7 +292,7 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
                                        size_t &size) {
   arrow::MemoryPool *mem_pool = arrow::default_memory_pool();
 
-  auto input = buffer_id.input.lock();
+  auto input = buffer_id.opened_file();
   const auto file_name = buffer_id.filename();
   if (!input) {
     LOG_ERROR("Opened parquet file is no longer available: %s",
@@ -353,6 +353,36 @@ ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
     return ParquetBufferContextHandle();
   }
   return ParquetBufferContextHandle(std::move(buffer_id), std::move(arrow));
+}
+
+bool ParquetBufferPool::small_owned_row(const arrow::ChunkedArray &column,
+                                        int64_t row) {
+  for (const auto &chunk : column.chunks()) {
+    if (row >= chunk->length()) {
+      row -= chunk->length();
+      continue;
+    }
+    if (chunk->IsNull(row)) return true;
+    switch (chunk->type_id()) {
+      case arrow::Type::BOOL:
+      case arrow::Type::INT32:
+      case arrow::Type::INT64:
+      case arrow::Type::UINT32:
+      case arrow::Type::UINT64:
+      case arrow::Type::FLOAT:
+      case arrow::Type::DOUBLE:
+        return true;
+      case arrow::Type::STRING:
+        return static_cast<const arrow::StringArray &>(*chunk).value_length(
+                   row) <= 4096;
+      case arrow::Type::BINARY:
+        return static_cast<const arrow::BinaryArray &>(*chunk).value_length(
+                   row) <= 4096;
+      default:
+        return false;
+    }
+  }
+  return false;
 }
 
 void ParquetBufferPool::release(const ParquetBufferID &buffer_id) {

@@ -929,73 +929,75 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   const int64_t local_row = index - get_row_group_offset(group);
   auto doc = std::make_shared<Doc>();
   for (size_t i = 0; i < selected.size(); ++i) {
-    auto key = file_context_->buffer_id;
-    key.column = selected[i];
-    key.row_group = group;
-    auto handle =
-        ParquetBufferPool::get_instance().acquire_buffer(std::move(key));
-    const auto *column = handle.borrowed_data();
-    if (!column) return nullptr;
-    int64_t row = local_row;
-    const arrow::Array *array = nullptr;
-    for (const auto &chunk : column->chunks()) {
-      if (row < chunk->length()) {
-        array = chunk.get();
-        break;
-      }
-      row -= chunk->length();
-    }
-    if (!array) return nullptr;
-    if (array->IsNull(row)) {
-      if (i < 2) return nullptr;
-      continue;
-    }
-    if (i == 0) {
-      doc->set_doc_id(
-          static_cast<const arrow::UInt64Array *>(array)->Value(row));
-    } else if (i == 1) {
-      doc->set_pk(std::string(
-          static_cast<const arrow::StringArray *>(array)->GetView(row)));
-    } else {
-      // Copies become owned Doc values before this column's pin is released.
-      switch (array->type_id()) {
-        case arrow::Type::BOOL:
-          ReadDocField<arrow::BooleanArray>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::INT32:
-          ReadDocField<arrow::Int32Array>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::INT64:
-          ReadDocField<arrow::Int64Array>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::UINT32:
-          ReadDocField<arrow::UInt32Array>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::UINT64:
-          ReadDocField<arrow::UInt64Array>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::FLOAT:
-          ReadDocField<arrow::FloatArray>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::DOUBLE:
-          ReadDocField<arrow::DoubleArray>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::STRING:
-          ReadDocField<arrow::StringArray>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::BINARY:
-          ReadDocField<arrow::BinaryArray>(*array, row, columns[i], *doc);
-          break;
-        case arrow::Type::LIST:
-          if (!ReadListDocField(static_cast<const arrow::ListArray &>(*array),
-                                row, columns[i], *doc)) {
-            return nullptr;
+    const bool read = ParquetBufferPool::get_instance().read_owned_column(
+        *file_context_, selected[i], group,
+        [&](const arrow::ChunkedArray &column_data) {
+          const auto *column = &column_data;
+          int64_t row = local_row;
+          const arrow::Array *array = nullptr;
+          for (const auto &chunk : column->chunks()) {
+            if (row < chunk->length()) {
+              array = chunk.get();
+              break;
+            }
+            row -= chunk->length();
           }
-          break;
-        default:
-          return nullptr;
-      }
-    }
+          if (!array) return false;
+          if (array->IsNull(row)) return i >= 2;
+          if (i == 0) {
+            doc->set_doc_id(
+                static_cast<const arrow::UInt64Array *>(array)->Value(row));
+          } else if (i == 1) {
+            doc->set_pk(std::string(
+                static_cast<const arrow::StringArray *>(array)->GetView(row)));
+          } else {
+            // Copies become owned Doc values before this column's pin is
+            // released.
+            switch (array->type_id()) {
+              case arrow::Type::BOOL:
+                ReadDocField<arrow::BooleanArray>(*array, row, columns[i],
+                                                  *doc);
+                break;
+              case arrow::Type::INT32:
+                ReadDocField<arrow::Int32Array>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::INT64:
+                ReadDocField<arrow::Int64Array>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::UINT32:
+                ReadDocField<arrow::UInt32Array>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::UINT64:
+                ReadDocField<arrow::UInt64Array>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::FLOAT:
+                ReadDocField<arrow::FloatArray>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::DOUBLE:
+                ReadDocField<arrow::DoubleArray>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::STRING:
+                ReadDocField<arrow::StringArray>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::BINARY:
+                ReadDocField<arrow::BinaryArray>(*array, row, columns[i], *doc);
+                break;
+              case arrow::Type::LIST:
+                if (!ReadListDocField(
+                        static_cast<const arrow::ListArray &>(*array), row,
+                        columns[i], *doc)) {
+                  return false;
+                }
+                break;
+              default:
+                return false;
+            }
+          }
+          return true;
+        },
+        schema->fields()[i]->type()->id() == arrow::Type::LIST ? -1
+                                                               : local_row);
+    if (!read) return nullptr;
   }
   return doc;
 }

@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <arrow/api.h>
 #include <arrow/io/file.h>
@@ -61,6 +62,32 @@ class BufferPoolStoreTest : public testing::Test {
   std::string parquet_path = "test.parquet";
 };
 
+
+TEST_F(BufferPoolStoreTest,
+       SynchronousReadReleasesPinOnExceptionWithoutRetainingFile) {
+  auto file = arrow::io::ReadableFile::Open(parquet_path).ValueOrDie();
+  auto context = ParquetFileContext::make(parquet_path, file).ValueOrDie();
+  std::weak_ptr<arrow::io::RandomAccessFile> opened_lifetime = file;
+  std::weak_ptr<arrow::Buffer> cached;
+  auto &pool = ParquetBufferPool::get_instance();
+  auto consume = [&](const arrow::ChunkedArray &column) -> bool {
+    cached = column.chunk(0)->data()->buffers.back();
+    throw std::runtime_error("consumer failed");
+  };
+  // First exercise a cold miss, then the cached shared-lock path.
+  for (int attempt = 0; attempt < 2; ++attempt)
+    EXPECT_THROW(pool.read_owned_column(*context, 0, 0, consume, 0),
+                 std::runtime_error);
+  ASSERT_FALSE(cached.expired());
+  context.reset();
+  file.reset();
+  EXPECT_TRUE(opened_lifetime.expired());
+  // Reclamation must work after the context used for the cold lookup is
+  // gone: published cache keys own their identity, and unwinding unpins it.
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  EXPECT_TRUE(cached.expired());
+}
 
 TEST_F(BufferPoolStoreTest, ConcurrentScansShareLeaseAfterParentIsReleased) {
   const std::string value(256 * 1024, 'x');
