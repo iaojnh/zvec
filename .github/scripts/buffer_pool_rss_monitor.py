@@ -11,9 +11,11 @@ import argparse
 import json
 import math
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -111,32 +113,115 @@ def validate_soft_rss(result):
     ), "RSS sampling stalled"
 
 
-def read_rss(pid):
-    if sys.platform == "linux":
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
-                return int(line.split()[1])
-        raise RuntimeError("workload has no readable RSS")
-    import psutil  # noqa: PLC0415
+class RssReader:
+    """Reuse the proc descriptor instead of allocating a new open each tick."""
 
-    return psutil.Process(pid).memory_info().rss // 1024
+    def __init__(self, pid):
+        self.pid = pid
+        self.fd = None
+        self.process = None
+
+    def __enter__(self):
+        if sys.platform == "linux":
+            self.fd = os.open(f"/proc/{self.pid}/status", os.O_RDONLY | os.O_CLOEXEC)
+        else:
+            import psutil  # noqa: PLC0415
+
+            self.process = psutil.Process(self.pid)
+        return self
+
+    def read(self):
+        if self.fd is None:
+            return self.process.memory_info().rss // 1024
+        data = os.pread(self.fd, 65536, 0)
+        start = data.find(b"\nVmRSS:")
+        if start >= 0:
+            end = data.find(b"\n", start + 1)
+            line = data[start + 1 : end]
+            return int(line.split()[1])
+        raise RuntimeError("workload has no readable RSS")
+
+    def __exit__(self, *_exception):
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+def read_rss(pid):
+    with RssReader(pid) as reader:
+        return reader.read()
+
+
+MAX_PENDING_RSS_SAMPLES = 256
+
+
+class RawRssSamples:
+    """Bound pending output and keep a slow filesystem off the sampling path."""
+
+    def __init__(self, output):
+        self.output = output
+        self.pending = queue.Queue(maxsize=MAX_PENDING_RSS_SAMPLES)
+        self.error = None
+        self.first_written = threading.Event()
+        self.worker = threading.Thread(target=self.write, daemon=True)
+
+    def __enter__(self):
+        self.worker.start()
+        return self
+
+    def write(self):
+        try:
+            while True:
+                sample = self.pending.get()
+                if sample is None:
+                    break
+                timestamp, rss = sample
+                print(
+                    json.dumps({"monotonic_seconds": timestamp, "rss_kib": rss}),
+                    file=self.output,
+                    flush=True,
+                )
+                self.first_written.set()
+        except BaseException as error:  # noqa: BLE001 - transport every thread failure
+            self.error = error
+
+    def add(self, timestamp, rss):
+        if self.error is not None:
+            raise RuntimeError("raw RSS trace writer failed") from self.error
+        try:
+            self.pending.put_nowait((timestamp, rss))
+        except queue.Full:
+            raise RuntimeError(
+                "raw RSS trace queue is full; observation incomplete"
+            ) from None
+
+    def __exit__(self, *_exception):
+        if self.worker.is_alive():
+            try:
+                self.pending.put(None, timeout=5)
+            except queue.Full:
+                raise RuntimeError("raw RSS trace writer did not drain") from None
+            self.worker.join(timeout=5)
+        if self.worker.is_alive():
+            raise RuntimeError("raw RSS trace writer did not stop")
+        if self.error is not None:
+            raise RuntimeError("raw RSS trace writer failed") from self.error
 
 
 def observe(args):
     trace = RssTrace(args.target_kib)
     recovery_start = None
     recovery = None
-    with args.samples.open("x") as output:
+    with (
+        args.samples.open("x") as output,
+        RssReader(args.pid) as reader,
+        RawRssSamples(output) as samples,
+    ):
         while True:
             now = time.monotonic()
-            rss = read_rss(args.pid)
+            rss = reader.read()
             trace.add(now, rss)
-            print(
-                json.dumps({"monotonic_seconds": now, "rss_kib": rss}),
-                file=output,
-                flush=True,
-            )
-            if not args.ready.exists():
+            samples.add(now, rss)
+            if samples.first_written.is_set() and not args.ready.exists():
                 args.ready.touch()
             if args.stop.exists():
                 if recovery_start is None:

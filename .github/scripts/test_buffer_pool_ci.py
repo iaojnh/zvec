@@ -6,16 +6,21 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import xml.etree.ElementTree as ET
+from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 
+import buffer_pool_rss_monitor as monitor
 import pytest
 from buffer_pool_backend_tests import (
     BACKENDS,
@@ -585,6 +590,159 @@ def test_rss_observer_is_an_independent_process(tmp_path):
     assert observed["observer"] == "independent_process"
     assert observed["samples"] >= 2
     validate_soft_rss(observed)
+
+
+def test_rss_observation_continues_while_raw_trace_write_stalls(tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        pid=os.getpid(),
+        target_kib=4 * 1024**2,
+        samples=tmp_path / "samples.jsonl",
+        ready=tmp_path / "ready",
+        stop=tmp_path / "stop",
+        output=tmp_path / "summary.json",
+    )
+    original_open = Path.open
+
+    class SlowTrace:
+        def __init__(self, output):
+            self.output = output
+            self.samples = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.output.__exit__(*exc)
+
+        def write(self, value):
+            if '"monotonic_seconds"' in value:
+                self.samples += 1
+                if self.samples == 2:
+                    time.sleep(1.2)
+            return self.output.write(value)
+
+        def flush(self):
+            self.output.flush()
+
+    def open_trace(path, *a, **kw):
+        output = original_open(path, *a, **kw)
+        mode = a[0] if a else kw.get("mode", "r")
+        return SlowTrace(output) if path == args.samples and mode == "x" else output
+
+    monkeypatch.setattr(Path, "open", open_trace)
+    monkeypatch.setitem(monitor.POLICY, "rss_sampling_interval_seconds", 0.01)
+    stop = threading.Timer(1.5, args.stop.touch)
+    stop.start()
+    try:
+        monitor.observe(args)
+    finally:
+        stop.join()
+    result = json.loads(args.output.read_text())
+    raw = [json.loads(line) for line in args.samples.read_text().splitlines()]
+    assert len(raw) == result["samples"]
+    assert all(
+        b["monotonic_seconds"] > a["monotonic_seconds"] for a, b in pairwise(raw)
+    )
+    validate_soft_rss(result)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="proc descriptor is Linux-specific")
+def test_rss_reader_reuses_one_proc_descriptor(monkeypatch):
+    original_open = os.open
+    opened = []
+
+    def counted_open(path, flags, *args, **kw):
+        fd = original_open(path, flags, *args, **kw)
+        if path == f"/proc/{os.getpid()}/status":
+            opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(monitor.os, "open", counted_open)
+    with monitor.RssReader(os.getpid()) as reader:
+        assert all(reader.read() > 0 for _ in range(8))
+    assert len(opened) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(opened[0])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="proc residency is Linux-specific")
+def test_rss_proc_descriptor_reads_fresh_residency():
+    with monitor.RssReader(os.getpid()) as reader:
+        before = reader.read()
+        backing = bytearray(8 * 1024**2)
+        for offset in range(0, len(backing), os.sysconf("SC_PAGE_SIZE")):
+            backing[offset] = 1
+        assert reader.read() >= before + 4 * 1024
+
+
+def test_rss_raw_trace_queue_overflow_fails_instead_of_dropping(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockedOutput(io.StringIO):
+        def write(self, value):
+            if '"monotonic_seconds"' in value:
+                started.set()
+                assert release.wait(timeout=2)
+            return super().write(value)
+
+    monkeypatch.setattr(monitor, "MAX_PENDING_RSS_SAMPLES", 1)
+    output = BlockedOutput()
+    with monitor.RawRssSamples(output) as samples:
+        try:
+            samples.add(1.0, 100)
+            assert started.wait(timeout=1)
+            samples.add(2.0, 100)
+            with pytest.raises(RuntimeError, match="queue is full"):
+                samples.add(3.0, 100)
+        finally:
+            release.set()
+    raw = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert [x["monotonic_seconds"] for x in raw] == [1.0, 2.0]
+
+
+def test_rss_raw_trace_writer_failure_is_propagated():
+    class FailedOutput(io.StringIO):
+        def write(self, _value):
+            raise OSError("injected trace write failure")
+
+    with (
+        pytest.raises(RuntimeError, match="trace writer failed"),
+        monitor.RawRssSamples(FailedOutput()) as samples,
+    ):
+        samples.add(1.0, 100)
+
+
+def test_rss_real_sampling_stall_remains_rejected(tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        pid=os.getpid(),
+        target_kib=4 * 1024**2,
+        samples=tmp_path / "samples.jsonl",
+        ready=tmp_path / "ready",
+        stop=tmp_path / "stop",
+        output=tmp_path / "summary.json",
+    )
+    original_read = monitor.RssReader.read
+    reads = 0
+
+    def stalled_read(reader):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            time.sleep(1.2)
+        return original_read(reader)
+
+    monkeypatch.setattr(monitor.RssReader, "read", stalled_read)
+    monkeypatch.setitem(monitor.POLICY, "rss_sampling_interval_seconds", 0.01)
+    stop = threading.Timer(1.5, args.stop.touch)
+    stop.start()
+    try:
+        monitor.observe(args)
+    finally:
+        stop.join()
+    result = json.loads(args.output.read_text())
+    with pytest.raises(AssertionError, match="sampling stalled"):
+        validate_soft_rss(result)
 
 
 @pytest.mark.parametrize("damage", ["backend", "missing_path", "empty", "failure"])
