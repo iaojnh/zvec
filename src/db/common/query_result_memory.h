@@ -76,14 +76,58 @@ class QueryResultEstimate {
 };
 
 inline size_t EstimateQueryResult(const arrow::RecordBatch &batch) {
+  if (batch.num_rows() == 0) return 0;
   QueryResultEstimate estimate;
   // Include shared ownership, growing DocPtrList capacity and hash buckets.
   estimate.add(sizeof(Doc) + 256, static_cast<size_t>(batch.num_rows()));
   for (int column = 0; column < batch.num_columns(); ++column) {
     estimate.add(192 + batch.schema()->field(column)->name().size() * 2,
                  static_cast<size_t>(batch.num_rows()));
+    const auto &array = *batch.column(column);
+    const auto type = array.type_id();
+    if (type == arrow::Type::STRING || type == arrow::Type::BINARY) {
+      if (array.null_count() == 0) {
+        const auto &binary = static_cast<const arrow::BinaryArray &>(array);
+        // Contiguous valid values telescope, including sliced arrays. Charge
+        // exactly the copied value bytes, without visiting every string.
+        estimate.add(static_cast<size_t>(
+            binary.value_offset(array.length()) - binary.value_offset(0)));
+        continue;
+      }
+    } else if (type == arrow::Type::LIST) {
+      const auto &list = static_cast<const arrow::ListArray &>(array);
+      bool fixed_elements = false;
+      switch (list.value_type()->id()) {
+        case arrow::Type::BOOL:
+        case arrow::Type::INT32:
+        case arrow::Type::INT64:
+        case arrow::Type::UINT32:
+        case arrow::Type::UINT64:
+        case arrow::Type::FLOAT:
+        case arrow::Type::DOUBLE:
+          fixed_elements = true;
+          break;
+        default:
+          break;
+      }
+      if (fixed_elements) {
+        // Preserve the list-container and per-element allowance, including
+        // null child slots. Fixed-width children have no extra payload to
+        // charge, so walking every element again adds no information.
+        for (int64_t row = 0; row < batch.num_rows(); ++row) {
+          if (list.IsNull(row)) continue;
+          estimate.add(64);
+          estimate.add(32, static_cast<size_t>(list.value_length(row)));
+        }
+        continue;
+      }
+    } else if (type != arrow::Type::STRUCT) {
+      // These values have no separate payload in Doc::Value. Their fixed
+      // charge above is unchanged; no per-row estimate walk is necessary.
+      continue;
+    }
     for (int64_t row = 0; row < batch.num_rows(); ++row)
-      estimate.value(*batch.column(column), row);
+      estimate.value(array, row);
   }
   return estimate.bytes();
 }

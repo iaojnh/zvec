@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -565,11 +566,12 @@ class SegmentImpl : public Segment,
   class CombinedRecordBatchReader;
 };
 
-class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
+class SegmentImpl::CombinedRecordBatchReader : public ResidentRecordBatchReader {
  public:
   CombinedRecordBatchReader(
       std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
-      const std::vector<std::string> &columns, arrow::MemoryPool *pool);
+      const std::vector<std::string> &columns, arrow::MemoryPool *pool,
+      bool budgeted);
 
   ~CombinedRecordBatchReader() override;
 
@@ -577,10 +579,17 @@ class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override;
 
+  arrow::Result<bool> ReadNextResident(
+      std::shared_ptr<arrow::RecordBatch> *batch) override;
+
  private:
+  arrow::Result<bool> read_next(std::shared_ptr<arrow::RecordBatch> *batch,
+                                bool resident_only);
+
   std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers_;
   std::shared_ptr<arrow::Schema> projected_schema_;
   arrow::MemoryPool *pool_;
+  bool budgeted_;
   bool emit_segment_row_id_ = false;
   size_t current_reader_index_;
   uint64_t next_segment_row_id_to_emit_;
@@ -1640,15 +1649,16 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       continue;
     }
 
-    // Sparse cross-block BP reads otherwise copy payloads into a gathered
-    // Arrow table and then into owned Docs. With at most two selected rows
-    // per block, use point materialization; denser batches retain shared pins
-    // and their ordinary gather path.
-    if (!options_.enable_mmap_ && !include_vector && segment_doc_ids.size() > 1) {
+    // Tiny per-segment BP batches and sparse cross-block reads otherwise
+    // gather an Arrow table only to copy it into owned Docs. Materialize
+    // directly for one/two rows, or at most two selected rows per block;
+    // denser batches retain shared pins and their ordinary gather path.
+    if (!options_.enable_mmap_ && !include_vector) {
       const auto &blocks = get_persist_block_metas(BlockType::SCALAR);
       const auto &offsets = get_persist_block_offsets(BlockType::SCALAR);
       bool cross_block = false;
-      if (!blocks.empty() && blocks.size() == offsets.size() &&
+      if (segment_doc_ids.size() > 2 && !blocks.empty() &&
+          blocks.size() == offsets.size() &&
           blocks.size() == persist_stores_.size()) {
         detail::RequestScratchArray<size_t, kMaxFetchBatchSize> row_blocks(
             segment_doc_ids.size());
@@ -1671,7 +1681,7 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
             cross_block = row_blocks[i] != row_blocks[i - 2];
         }
       }
-      if (cross_block) {
+      if (segment_doc_ids.size() <= 2 || cross_block) {
         try {
           FetchProjection direct_projection;
           if (build_fetch_projection(output_fields, direct_projection)) {
@@ -4068,7 +4078,8 @@ RecordBatchReaderPtr SegmentImpl::scan(
   }
 
   return std::make_shared<CombinedRecordBatchReader>(
-      std::move(merged_readers), columns, query_memory_pool());
+      std::move(merged_readers), columns, query_memory_pool(),
+      uses_buffer_storage());
 }
 
 
@@ -4078,9 +4089,11 @@ RecordBatchReaderPtr SegmentImpl::scan(
 
 SegmentImpl::CombinedRecordBatchReader::CombinedRecordBatchReader(
     std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
-    const std::vector<std::string> &columns, arrow::MemoryPool *pool)
+    const std::vector<std::string> &columns, arrow::MemoryPool *pool,
+    bool budgeted)
     : readers_(std::move(readers)),
       pool_(pool),
+      budgeted_(budgeted),
       current_reader_index_(0),
       next_segment_row_id_to_emit_(0) {
   if (!readers_.empty()) {
@@ -4113,21 +4126,54 @@ std::shared_ptr<arrow::Schema> SegmentImpl::CombinedRecordBatchReader::schema()
 
 arrow::Status SegmentImpl::CombinedRecordBatchReader::ReadNext(
     std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, false).status();
+}
+
+arrow::Result<bool> SegmentImpl::CombinedRecordBatchReader::ReadNextResident(
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, true);
+}
+
+arrow::Result<bool> SegmentImpl::CombinedRecordBatchReader::read_next(
+    std::shared_ptr<arrow::RecordBatch> *batch, bool resident_only) {
   *batch = nullptr;
   while (current_reader_index_ < readers_.size()) {
     std::shared_ptr<arrow::RecordBatch> input;
-    ARROW_RETURN_NOT_OK(readers_[current_reader_index_]->ReadNext(&input));
+    if (resident_only) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto ready, zvec::ReadNextResident(*readers_[current_reader_index_],
+                                             &input));
+      if (!ready) return false;
+    } else {
+      ARROW_RETURN_NOT_OK(readers_[current_reader_index_]->ReadNext(&input));
+    }
 
     if (emit_segment_row_id_ && input) {
       auto num_rows = input->num_rows();
-      arrow::UInt64Builder builder(pool_);
-      ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
-
-      for (int64_t i = 0; i < num_rows; ++i) {
-        builder.UnsafeAppend(next_segment_row_id_to_emit_ + i);
-      }
       std::shared_ptr<arrow::Array> segment_row_id_array;
-      ARROW_RETURN_NOT_OK(builder.Finish(&segment_row_id_array));
+      if (budgeted_) {
+        // Row IDs are dense and never null. Fill their admitted backing in
+        // bulk, without a per-row validity-bitmap update in the source task.
+        constexpr int64_t kRowIdBytes = sizeof(uint64_t);
+        if (num_rows > std::numeric_limits<int64_t>::max() / kRowIdBytes) {
+          return arrow::Status::CapacityError("Row ID array is too large");
+        }
+        ARROW_ASSIGN_OR_RAISE(
+            auto values, arrow::AllocateBuffer(num_rows * kRowIdBytes, pool_));
+        auto *ids = reinterpret_cast<uint64_t *>(values->mutable_data());
+        if (num_rows) {
+          std::iota(ids, ids + num_rows, next_segment_row_id_to_emit_);
+        }
+        segment_row_id_array = std::make_shared<arrow::UInt64Array>(
+            num_rows, std::move(values));
+      } else {
+        arrow::UInt64Builder builder(pool_);
+        ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
+        for (int64_t i = 0; i < num_rows; ++i) {
+          builder.UnsafeAppend(next_segment_row_id_to_emit_ + i);
+        }
+        ARROW_RETURN_NOT_OK(builder.Finish(&segment_row_id_array));
+      }
 
       ARROW_ASSIGN_OR_RAISE(
           input,
@@ -4139,14 +4185,14 @@ arrow::Status SegmentImpl::CombinedRecordBatchReader::ReadNext(
 
     if (input) {
       *batch = std::move(input);
-      return arrow::Status::OK();
+      return true;
     }
 
     current_reader_index_++;
   }
 
   *batch = nullptr;
-  return arrow::Status::OK();
+  return true;
 }
 
 bool SegmentImpl::ready_for_dump_block() {

@@ -3519,3 +3519,96 @@ TEST_F(BufferPoolStoreTest,
   EXPECT_EQ(100u, known->doc_id());
   EXPECT_EQ(known->get<std::string>("payload"), "payload-1");
 }
+
+TEST_F(BufferPoolStoreTest, RecordBatchCopyEstimatePreservesSlicedPayloadCharge) {
+  arrow::UInt64Builder ids;
+  arrow::StringBuilder names;
+  arrow::BinaryBuilder data;
+  for (uint64_t i = 0; i < 5; ++i) ASSERT_TRUE(ids.Append(i).ok());
+  for (const auto &value : {"outside", "a", "", "three", "tail"})
+    ASSERT_TRUE(names.Append(value).ok());
+  ASSERT_TRUE(data.Append("prefix").ok());
+  ASSERT_TRUE(data.Append("abc").ok());
+  ASSERT_TRUE(data.AppendNull().ok());
+  ASSERT_TRUE(data.Append("longtail").ok());
+  ASSERT_TRUE(data.Append("suffix").ok());
+  auto schema = arrow::schema({arrow::field("id", arrow::uint64()),
+                                arrow::field("name", arrow::utf8()),
+                                arrow::field("data", arrow::binary())});
+  auto batch = arrow::RecordBatch::Make(
+      schema, 5, {ids.Finish().ValueOrDie(), names.Finish().ValueOrDie(),
+                  data.Finish().ValueOrDie()});
+  ASSERT_TRUE(batch->ValidateFull().ok());
+  const size_t per_row = sizeof(Doc) + 256 + (192 + 2 * 2) +
+                         (192 + 4 * 2) + (192 + 4 * 2);
+  EXPECT_EQ(per_row * 3 + 6 + 11,
+            detail::EstimateQueryResult(*batch->Slice(1, 3)));
+  EXPECT_EQ(per_row * 5 + 17 + 23, detail::EstimateQueryResult(*batch));
+  EXPECT_EQ(0u, detail::EstimateQueryResult(*batch->Slice(0, 0)));
+}
+
+TEST_F(BufferPoolStoreTest, ResidentScanMissDoesNotDecodeOrConsumeRows) {
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  auto cold = store->scan({"id", "name"});
+  ASSERT_NE(cold, nullptr);
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto before = pool.external_used();
+  std::shared_ptr<arrow::RecordBatch> batch;
+  auto miss = zvec::ReadNextResident(*cold, &batch);
+  ASSERT_TRUE(miss.ok());
+  EXPECT_FALSE(*miss);
+  EXPECT_EQ(batch, nullptr);
+  EXPECT_EQ(pool.external_used(), before);
+
+  ASSERT_TRUE(cold->ReadNext(&batch).ok());
+  ASSERT_NE(batch, nullptr);
+  ASSERT_GT(batch->num_rows(), 0);
+  ASSERT_TRUE(batch->ValidateFull().ok());
+  auto warm = store->scan({"id", "name"});
+  std::shared_ptr<arrow::RecordBatch> ready;
+  auto hit = zvec::ReadNextResident(*warm, &ready);
+  ASSERT_TRUE(hit.ok());
+  ASSERT_TRUE(*hit);
+  ASSERT_NE(ready, nullptr);
+  EXPECT_TRUE(ready->Equals(*batch));
+  // The next row group is still cold. A miss must preserve its position.
+  auto next_group = zvec::ReadNextResident(*warm, &ready);
+  ASSERT_TRUE(next_group.ok());
+  EXPECT_FALSE(*next_group);
+  EXPECT_EQ(ready, nullptr);
+  while (true) {
+    ASSERT_TRUE(cold->ReadNext(&batch).ok());
+    auto hit_or_end = zvec::ReadNextResident(*warm, &ready);
+    ASSERT_TRUE(hit_or_end.ok());
+    ASSERT_TRUE(*hit_or_end);
+    if (!batch) {
+      EXPECT_EQ(ready, nullptr);
+      break;
+    }
+    ASSERT_NE(ready, nullptr);
+    EXPECT_TRUE(ready->Equals(*batch));
+  }
+}
+
+TEST_F(BufferPoolStoreTest, FixedListCopyEstimateKeepsNullAndSliceAllowances) {
+  auto values = std::make_shared<arrow::Int32Builder>();
+  arrow::ListBuilder lists(arrow::default_memory_pool(), values);
+  ASSERT_TRUE(lists.Append().ok());
+  ASSERT_TRUE(values->AppendValues(std::vector<int32_t>(512, 7)).ok());
+  ASSERT_TRUE(lists.AppendNull().ok());
+  ASSERT_TRUE(lists.Append().ok());
+  ASSERT_TRUE(values->Append(1).ok());
+  ASSERT_TRUE(values->AppendNull().ok());
+  ASSERT_TRUE(values->Append(-3).ok());
+  ASSERT_TRUE(lists.Append().ok());
+  auto array = lists.Finish().ValueOrDie();
+  auto batch = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("tags", array->type())}), 4, {array});
+  ASSERT_TRUE(batch->ValidateFull().ok());
+  const size_t per_row = sizeof(Doc) + 256 + 192 + 4 * 2;
+  EXPECT_EQ(per_row * 4 + 64 * 3 + 32 * 515,
+            detail::EstimateQueryResult(*batch));
+  EXPECT_EQ(per_row * 2 + 64 + 32 * 3,
+            detail::EstimateQueryResult(*batch->Slice(1, 2)));
+}

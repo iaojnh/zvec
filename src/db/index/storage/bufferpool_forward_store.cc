@@ -157,24 +157,36 @@ arrow::Status ParquetRecordBatchReader::ensure_reader() {
 ParquetRecordBatchReader::~ParquetRecordBatchReader() = default;
 
 arrow::Status ParquetRecordBatchReader::ReadNext(
-    std::shared_ptr<arrow::RecordBatch> *batch) try {
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, false).status();
+}
+
+arrow::Result<bool> ParquetRecordBatchReader::ReadNextResident(
+    std::shared_ptr<arrow::RecordBatch> *batch) {
+  return read_next(batch, true);
+}
+
+arrow::Result<bool> ParquetRecordBatchReader::read_next(
+    std::shared_ptr<arrow::RecordBatch> *batch, bool resident_only) try {
   *batch = nullptr;
   while (true) {
     if (cached_batches_) {
       ARROW_RETURN_NOT_OK(cached_batches_->ReadNext(batch));
       if (*batch) {
-        if ((*batch)->num_rows() != 0) return arrow::Status::OK();
+        if ((*batch)->num_rows() != 0) return true;
         continue;
       }
       cached_batches_.reset();
     }
     if (current_row_group_ >= num_row_groups_) {
-      return arrow::Status::OK();
+      return true;
     }
 
     if (!with_cache_) {
-      return stream_uncached_ ? read_next_uncached(batch)
-                              : read_row_group(batch);
+      if (resident_only) return false;
+      ARROW_RETURN_NOT_OK(stream_uncached_ ? read_next_uncached(batch)
+                                           : read_row_group(batch));
+      return true;
     }
 
     int64_t rg_id = current_row_group_;
@@ -191,10 +203,11 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         buffer_id.column = col_indices_[col_idx];
         buffer_id.row_group = rg_id;
         auto &cache = ParquetBufferPool::get_instance();
-        auto buffer_handle = memory_pool_ ? cache.try_acquire_buffer(buffer_id)
-                                          : cache.acquire_buffer(buffer_id);
+        auto buffer_handle = resident_only || memory_pool_
+                                 ? cache.try_acquire_buffer(buffer_id)
+                                 : cache.acquire_buffer(buffer_id);
         col_chunked_array = buffer_handle.data();
-        if (!col_chunked_array && memory_pool_) {
+        if (!col_chunked_array && memory_pool_ && !resident_only) {
           const auto metadata =
               metadata_ ? metadata_ : reader_->parquet_reader()->metadata();
           if (ScanCacheHasHeadroom(*metadata, static_cast<int>(rg_id),
@@ -212,6 +225,9 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         // A refusal follows the same bounded streaming path as a cold miss.
       }
       if (!col_chunked_array) {
+        // Do not advance the row group or switch to streaming on an optional
+        // cache-only miss. Normal ReadNext may admit or stream it later.
+        if (resident_only) return false;
         // Cache residency is optional. Drop partial columns before reading
         // the same row group in bounded batches, without publishing any rows
         // twice or passing null columns to Arrow. Stay uncached for this scan
@@ -219,7 +235,8 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         columns.clear();
         with_cache_ = false;
         stream_uncached_ = true;
-        return read_next_uncached(batch);
+        ARROW_RETURN_NOT_OK(read_next_uncached(batch));
+        return true;
       }
       columns[col_idx] = std::move(col_chunked_array);
     }
@@ -1017,22 +1034,37 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
            ailego::BudgetedAllocator<RowGroupEntry>>
       rg_to_local;
   size_t output_row = 0;
-  for (int global_row : indices) {
-    if (global_row < 0 || global_row >= num_rows_) {
-      LOG_ERROR("Invalid row index: %d, max: %lld", global_row,
-                static_cast<long long>(num_rows_));
-      return arrow::Status::IndexError("Invalid forward row: ", global_row);
+  if (indices.front() < 0 || indices.front() >= num_rows_)
+    return arrow::Status::IndexError("Invalid forward row: ", indices.front());
+  const int first_group = find_row_group_for_row(indices.front());
+  const int64_t first_offset = get_row_group_offset(first_group);
+  const int64_t first_end = first_offset + row_group_row_nums_[first_group];
+  const bool single_group = std::all_of(indices.begin(), indices.end(),
+      [&](int row) { return row >= first_offset && row < first_end; });
+  if (single_group && !col_indices.empty()) {
+    auto &rows = rg_to_local[first_group];
+    rows.reserve(indices.size());
+    for (int row : indices)
+      rows.emplace_back(output_row++, static_cast<uint64_t>(row - first_offset));
+  }
+  if (!single_group) {
+    for (int global_row : indices) {
+      if (global_row < 0 || global_row >= num_rows_) {
+        LOG_ERROR("Invalid row index: %d, max: %lld", global_row,
+                  static_cast<long long>(num_rows_));
+        return arrow::Status::IndexError("Invalid forward row: ", global_row);
+      }
+      if (col_indices.empty()) continue;
+      int rg_id = find_row_group_for_row(global_row);
+      int64_t offset = get_row_group_offset(rg_id);
+      if (offset == -1) {
+        LOG_ERROR("Failed to get row group offset for row: %d", global_row);
+        return arrow::Status::Invalid("Missing parquet row group for row: ",
+                                      global_row);
+      }
+      uint64_t local_in_rg = global_row - offset;
+      rg_to_local[rg_id].emplace_back(output_row++, local_in_rg);
     }
-    if (col_indices.empty()) continue;
-    int rg_id = find_row_group_for_row(global_row);
-    int64_t offset = get_row_group_offset(rg_id);
-    if (offset == -1) {
-      LOG_ERROR("Failed to get row group offset for row: %d", global_row);
-      return arrow::Status::Invalid("Missing parquet row group for row: ",
-                                    global_row);
-    }
-    uint64_t local_in_rg = global_row - offset;
-    rg_to_local[rg_id].emplace_back(output_row++, local_in_rg);
   }
 
   // Copy selected rows directly into budgeted builders. Keeping GetScalar

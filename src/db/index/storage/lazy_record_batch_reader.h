@@ -20,6 +20,7 @@
 #include "db/common/constants.h"
 #include "parquet_buffer_pool.h"
 #include "parquet_memory_pool.h"
+#include "resident_record_batch_reader.h"
 
 
 namespace zvec {
@@ -81,7 +82,7 @@ class IPCRecordBatchReader : public arrow::RecordBatchReader {
 
 
 // Keep the BP reader implementation out of mmap's shared reader header.
-class ParquetRecordBatchReader : public arrow::RecordBatchReader {
+class ParquetRecordBatchReader : public ResidentRecordBatchReader {
  public:
   ParquetRecordBatchReader(std::unique_ptr<parquet::arrow::FileReader> &reader,
                            const std::vector<std::string> &columns,
@@ -108,7 +109,12 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override;
 
+  arrow::Result<bool> ReadNextResident(
+      std::shared_ptr<arrow::RecordBatch> *batch) override;
+
  private:
+  arrow::Result<bool> read_next(std::shared_ptr<arrow::RecordBatch> *batch,
+                                bool resident_only);
   // Preserve the existing uncached mmap reader's row-group batch boundaries.
   arrow::Status read_row_group(std::shared_ptr<arrow::RecordBatch> *batch);
 

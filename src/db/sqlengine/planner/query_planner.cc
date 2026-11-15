@@ -18,6 +18,7 @@
 #include <vector>
 #include <arrow/acero/api.h>
 #include <arrow/compute/api.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/db/schema.h>
@@ -649,9 +650,38 @@ Result<PlanInfo::Ptr> QueryPlanner::invert_scan(
 
   auto topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, forward_filter != nullptr);
-  // Do not materialize topk rows of every forward field in one source pull.
-  // The shared Arrow allocator still enforces bytes, including oversized rows.
-  if (budgeted) batch_size = std::min(batch_size, 256);
+  if (budgeted) {
+    // Small fixed-width projections need not pay for a source/allocator
+    // handoff every 256 rows. Keep the original cap for variable user fields,
+    // large projections and pressure reads; all real buffers remain admitted.
+    bool narrow = !query_info->is_include_vector() &&
+                  query_info->get_all_fetched_scalar_field_names().size() <= 4;
+    for (const auto &name : query_info->get_all_fetched_scalar_field_names()) {
+      if (name == USER_ID || name == GLOBAL_DOC_ID || name == LOCAL_ROW_ID)
+        continue;
+      const auto *field = schema_->get_field(name);
+      if (!field) {
+        narrow = false;
+        break;
+      }
+      switch (field->data_type()) {
+        case DataType::BOOL:
+        case DataType::INT32:
+        case DataType::INT64:
+        case DataType::UINT32:
+        case DataType::UINT64:
+        case DataType::FLOAT:
+        case DataType::DOUBLE:
+          break;
+        default:
+          narrow = false;
+          break;
+      }
+    }
+    const bool headroom = ailego::MemoryLimitPool::get_instance()
+                              .prefetch_available() >= 128UL * 1024 * 1024;
+    batch_size = std::min(batch_size, narrow && headroom ? 4096 : 256);
+  }
   auto recall_node =
       std::make_shared<InvertRecallNode>(seg, query_info, batch_size);
 
