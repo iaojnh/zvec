@@ -995,12 +995,16 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
     return true;
   }
 
-  // Do not queue unloaded or transitioning entries.
-  if (expected < 0) {
+  // Clean-only reclaim can abandon its eviction transition when a writer has
+  // dirtied the page again. Keep the existing queue item reachable across
+  // that transition; otherwise the released dirty page can become stranded.
+  // Unloaded/loading entries have no published residency to retain.
+  if (expected < 0 && (expected != kEvictingRefCount ||
+                       !e.in_evict_queue.load(std::memory_order_relaxed))) {
     return false;
   }
 
-  // Move pinned pages to the tail without duplicating membership.
+  // Move pinned or temporarily evicting pages to the tail.
   BlockEvictionQueue::BlockType block;
   block.owner = this;
   block.owner_key = block_id;
