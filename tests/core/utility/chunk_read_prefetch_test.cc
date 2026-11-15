@@ -292,6 +292,46 @@ TEST_F(ChunkReadPrefetchTest, FullBudgetUsesExistingSynchronousWorkspace) {
   EXPECT_LE(pool.used(), pool.capacity());
 }
 
+TEST_F(ChunkReadPrefetchTest, EveryHotListSurvivesOnePassCacheChurn) {
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  ailego::Params params;
+  params.set(CHUNK_READ_STORAGE_ADAPTIVE, true);
+  // Eight repeatedly scanned lists and room for two cold lists, including
+  // each unaligned direct read's physical prefix. This is a unit fixture.
+  params.set(CHUNK_READ_STORAGE_CACHE_BYTES, 20 * page);
+  params.set(CHUNK_READ_STORAGE_PREFETCH_DEPTH, size_t{3});
+  params.set(CHUNK_READ_STORAGE_PREFETCH_BYTES, 6 * page);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(path, false));
+  segment = storage->get("payload");
+  IndexStorage::Segment::ReadChunks chunks;
+  for (size_t offset = 0; offset < payload.size(); offset += page)
+    chunks.push_back({offset, page});
+  ASSERT_EQ(0, segment->set_read_chunks(chunks));
+  const auto read_list = [&](size_t index) {
+    segment->prefetch(index * page, page);
+    IndexStorage::MemoryBlock block;
+    EXPECT_EQ(page, segment->read(index * page, block, page));
+    if (block.data())
+      EXPECT_EQ(0,
+                std::memcmp(block.data(), payload.data() + index * page, page));
+  };
+  for (size_t pass = 0; pass < 3; ++pass)
+    for (size_t hot = 0; hot < 8; ++hot) read_list(hot);
+  uint64_t hot_read_bytes = 0;
+  for (size_t cold = 8; cold < 32; ++cold) {
+    read_list(cold);
+    const auto before = storage->stats().io_bytes;
+    for (size_t hot = 0; hot < 8; ++hot) read_list(hot);
+    hot_read_bytes += storage->stats().io_bytes - before;
+  }
+  EXPECT_EQ(0u, hot_read_bytes);
+  EXPECT_LE(storage->stats().cache_bytes, 20 * page);
+  EXPECT_LE(pool.used(), pool.capacity());
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+}
+
 TEST_F(ChunkReadPrefetchTest, DifferentListLengthsShareChargedCapacityClasses) {
   segment.reset();
   ASSERT_EQ(0, storage->close());
