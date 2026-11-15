@@ -1633,6 +1633,8 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
                                       end - begin == 1
                                           ? std::numeric_limits<int64_t>::max()
                                           : 4LL * 1024 * 1024);
+    detail::FetchScratchMemoryPool scratch(
+        &workspace, !options_.enable_mmap_ && segment_doc_ids.size() > 1);
     auto columns = doc_forward_columns(output_fields);
     std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays;
     std::shared_ptr<arrow::Schema> result_schema;
@@ -1640,8 +1642,10 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       // Route the row list once for the complete projection. The forward
       // fetcher handles changed column layouts, and shares addressing and
       // cache identity checks when the columns still occupy the same blocks.
-      auto table =
-          fetch_unsafe(columns, segment_doc_ids, /*strict=*/true, &workspace);
+      auto table = fetch_unsafe(
+          columns, segment_doc_ids, /*strict=*/true,
+          scratch.enabled() ? &scratch
+                            : static_cast<arrow::MemoryPool *>(&workspace));
       if (table && table->num_columns() == static_cast<int>(columns.size()) &&
           table->num_rows() == static_cast<int64_t>(segment_doc_ids.size())) {
         result_schema = table->schema();
