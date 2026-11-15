@@ -43,6 +43,37 @@
 
 
 namespace zvec {
+namespace {
+
+bool ScanCacheHasHeadroom(const parquet::FileMetaData &metadata, int row_group,
+                          int column) {
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  // Optional cache preparation must leave room for the decoder and growth.
+  // Encoded sizes are only a hint (dictionaries can expand); every allocation
+  // still goes through normal admission, with streaming on an OOM refusal.
+  constexpr size_t kDecodeHeadroom = 2 * 1024 * 1024;
+  const size_t available = budget.prefetch_available();
+  if (available <= kDecodeHeadroom) return false;
+  size_t remaining = (available - kDecodeHeadroom) / 2;
+  const auto group = metadata.RowGroup(row_group);
+  const auto rows = group->num_rows();
+  if (rows < 0 || static_cast<uint64_t>(rows) > remaining / sizeof(int64_t))
+    return false;
+  remaining -= static_cast<size_t>(rows) * sizeof(int64_t);
+  const auto *schema = metadata.schema();
+  const auto *root = schema->group_node()->field(column).get();
+  bool found = false;
+  for (int leaf = 0; leaf < group->num_columns(); ++leaf) {
+    if (schema->GetColumnRoot(leaf) != root) continue;
+    found = true;
+    const auto bytes = group->ColumnChunk(leaf)->total_uncompressed_size();
+    if (bytes < 0 || static_cast<uint64_t>(bytes) > remaining) return false;
+    remaining -= static_cast<size_t>(bytes);
+  }
+  return found;
+}
+
+}  // namespace
 
 ParquetRecordBatchReader::ParquetRecordBatchReader(
     std::unique_ptr<parquet::arrow::FileReader> &reader,
@@ -152,10 +183,8 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
     std::vector<std::shared_ptr<arrow::ChunkedArray>> columns(
         col_indices_.size());
     for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
-      // A one-pass scan must not fill the point-read cache with entire cold
-      // columns. Reuse resident columns without copying; on a miss, stream
-      // bounded batches through the same budgeted decoder instead. Preserve
-      // the legacy reader's cache behavior when no budgeted pool is supplied.
+      // Reuse resident decoded columns, and admit cold columns only with
+      // spare budget. Tight budgets retain the bounded streaming path.
       std::shared_ptr<arrow::ChunkedArray> col_chunked_array;
       try {
         auto buffer_id = metadata_id_;
@@ -165,6 +194,19 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         auto buffer_handle = memory_pool_ ? cache.try_acquire_buffer(buffer_id)
                                           : cache.acquire_buffer(buffer_id);
         col_chunked_array = buffer_handle.data();
+        if (!col_chunked_array && memory_pool_) {
+          const auto metadata =
+              metadata_ ? metadata_ : reader_->parquet_reader()->metadata();
+          if (ScanCacheHasHeadroom(*metadata, static_cast<int>(rg_id),
+                                   col_indices_[col_idx])) {
+            auto loaded = cache.acquire_buffer_checked(buffer_id);
+            if (loaded.ok()) {
+              col_chunked_array = loaded->data();
+            } else if (!loaded.status().IsOutOfMemory()) {
+              return loaded.status();
+            }
+          }
+        }
       } catch (const std::bad_alloc &) {
         // Cache keys and escaped-view metadata also require admission.
         // A refusal follows the same bounded streaming path as a cold miss.
