@@ -1245,7 +1245,8 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
 
 std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
     const std::vector<std::string> &columns,
-    const std::shared_ptr<arrow::Schema> &schema, int index) {
+    const std::shared_ptr<arrow::Schema> &schema, int index,
+    std::optional<uint64_t> known_doc_id) {
   if (index < 0 || index >= num_rows_ || columns.size() < 2 || !schema ||
       schema->num_fields() != static_cast<int>(columns.size()) ||
       columns[0] != GLOBAL_DOC_ID || columns[1] != USER_ID) {
@@ -1284,6 +1285,12 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   estimate.add(sizeof(Doc) + 256);
   auto key = metadata_id_.for_column(0, group);
   for (size_t i = 0; i < selected.size(); ++i) {
+    if (i == 0 && known_doc_id) {
+      // Segment's locked row lookup already supplies this identity. Keep the
+      // same result-copy allowance while avoiding a second source-column pin.
+      estimate.add(192 + columns[i].size() * 2);
+      continue;
+    }
     key.column = selected[i];
     auto acquired =
         ParquetBufferPool::get_instance().acquire_buffer_checked(key);
@@ -1317,6 +1324,10 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   pending.start();
   auto doc = detail::MakeQueryDocument(memory);
   for (size_t i = 0; i < source_rows.size(); ++i) {
+    if (i == 0 && known_doc_id) {
+      doc->set_doc_id(*known_doc_id);
+      continue;
+    }
     const auto [array, row] = source_rows[i];
     if (array->IsNull(row)) continue;
     if (i == 0) {

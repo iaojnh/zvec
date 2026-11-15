@@ -427,7 +427,7 @@ class SegmentImpl : public Segment,
   // a nested fetch never locks it twice.
   Doc::Ptr fetch_direct_doc_unsafe(const std::vector<std::string> &columns,
                                    const std::shared_ptr<arrow::Schema> &schema,
-                                   int row) const;
+                                   int row, uint64_t g_doc_id) const;
 
   Doc::Ptr fetch_doc_unsafe(
       uint64_t g_doc_id,
@@ -1305,11 +1305,24 @@ bool SegmentImpl::build_fetch_projection(
     FetchProjection &projection) const {
   projection.columns = fetch_columns(output_fields);
   const auto &forward_columns = projection.columns;
+  // The default projection already owns generation-checked immutable fields.
+  // BP point reads can select those fields instead of recreating them on
+  // every call. Building the default itself takes the nullopt path below.
+  const auto complete = !options_.enable_mmap_ && output_fields.has_value()
+                            ? default_fetch_projection()
+                            : nullptr;
 
   // Build result schema
   std::vector<std::shared_ptr<arrow::Field>> fields;
   for (size_t i = 0; i < forward_columns.size(); ++i) {
     const auto &col = forward_columns[i];
+    if (complete) {
+      auto field = complete->schema->GetFieldByName(col);
+      if (field) {
+        fields.push_back(std::move(field));
+        continue;
+      }
+    }
     if (col == GLOBAL_DOC_ID) {
       fields.push_back(arrow::field(GLOBAL_DOC_ID, arrow::uint64()));
     } else if (col == USER_ID) {
@@ -1368,7 +1381,8 @@ Doc::Ptr SegmentImpl::fetch(
 
 Doc::Ptr SegmentImpl::fetch_direct_doc_unsafe(
     const std::vector<std::string> &columns,
-    const std::shared_ptr<arrow::Schema> &schema, int row) const {
+    const std::shared_ptr<arrow::Schema> &schema, int row,
+    uint64_t g_doc_id) const {
   const auto &blocks = get_persist_block_metas(BlockType::SCALAR);
   const auto &offsets = get_persist_block_offsets(BlockType::SCALAR);
   if (row < 0 || blocks.empty() || blocks.size() != offsets.size() ||
@@ -1389,7 +1403,8 @@ Doc::Ptr SegmentImpl::fetch_direct_doc_unsafe(
   }
   auto *store =
       dynamic_cast<BufferPoolForwardStore *>(persist_stores_[i].get());
-  return store ? store->fetch_doc(columns, schema, row - offsets[i]) : nullptr;
+  return store ? store->fetch_doc(columns, schema, row - offsets[i], g_doc_id)
+               : nullptr;
 }
 
 Doc::Ptr SegmentImpl::fetch_doc_unsafe(
@@ -1435,7 +1450,7 @@ Doc::Ptr SegmentImpl::fetch_doc_unsafe(
 
   if (!include_vector && !options_.enable_mmap_) {
     if (auto doc = fetch_direct_doc_unsafe(forward_columns, result_schema,
-                                           segment_doc_id)) {
+                                           segment_doc_id, g_doc_id)) {
       return doc;
     }
   }
