@@ -117,7 +117,13 @@ TEST_P(SegmentTest, General) {
     if (batch == nullptr) break;
 
     EXPECT_EQ(batch->num_columns(), 4);
-
+    ASSERT_TRUE(batch->ValidateFull().ok());
+    const auto &row_ids =
+        static_cast<const arrow::UInt64Array &>(*batch->column(0));
+    EXPECT_EQ(row_ids.null_count(), 0);
+    for (int64_t row = 0; row < batch->num_rows(); ++row) {
+      EXPECT_EQ(row_ids.Value(row), total_doc + row);
+    }
     total_doc += batch->num_rows();
   }
   EXPECT_EQ(total_doc, 25);

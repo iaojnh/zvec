@@ -1017,22 +1017,37 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
            ailego::BudgetedAllocator<RowGroupEntry>>
       rg_to_local;
   size_t output_row = 0;
-  for (int global_row : indices) {
-    if (global_row < 0 || global_row >= num_rows_) {
-      LOG_ERROR("Invalid row index: %d, max: %lld", global_row,
-                static_cast<long long>(num_rows_));
-      return arrow::Status::IndexError("Invalid forward row: ", global_row);
+  if (indices.front() < 0 || indices.front() >= num_rows_)
+    return arrow::Status::IndexError("Invalid forward row: ", indices.front());
+  const int first_group = find_row_group_for_row(indices.front());
+  const int64_t first_offset = get_row_group_offset(first_group);
+  const int64_t first_end = first_offset + row_group_row_nums_[first_group];
+  const bool single_group = std::all_of(indices.begin(), indices.end(),
+      [&](int row) { return row >= first_offset && row < first_end; });
+  if (single_group && !col_indices.empty()) {
+    auto &rows = rg_to_local[first_group];
+    rows.reserve(indices.size());
+    for (int row : indices)
+      rows.emplace_back(output_row++, static_cast<uint64_t>(row - first_offset));
+  }
+  if (!single_group) {
+    for (int global_row : indices) {
+      if (global_row < 0 || global_row >= num_rows_) {
+        LOG_ERROR("Invalid row index: %d, max: %lld", global_row,
+                  static_cast<long long>(num_rows_));
+        return arrow::Status::IndexError("Invalid forward row: ", global_row);
+      }
+      if (col_indices.empty()) continue;
+      int rg_id = find_row_group_for_row(global_row);
+      int64_t offset = get_row_group_offset(rg_id);
+      if (offset == -1) {
+        LOG_ERROR("Failed to get row group offset for row: %d", global_row);
+        return arrow::Status::Invalid("Missing parquet row group for row: ",
+                                      global_row);
+      }
+      uint64_t local_in_rg = global_row - offset;
+      rg_to_local[rg_id].emplace_back(output_row++, local_in_rg);
     }
-    if (col_indices.empty()) continue;
-    int rg_id = find_row_group_for_row(global_row);
-    int64_t offset = get_row_group_offset(rg_id);
-    if (offset == -1) {
-      LOG_ERROR("Failed to get row group offset for row: %d", global_row);
-      return arrow::Status::Invalid("Missing parquet row group for row: ",
-                                    global_row);
-    }
-    uint64_t local_in_rg = global_row - offset;
-    rg_to_local[rg_id].emplace_back(output_row++, local_in_rg);
   }
 
   // Copy selected rows directly into budgeted builders. Keeping GetScalar

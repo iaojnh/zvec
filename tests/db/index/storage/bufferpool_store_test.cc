@@ -1967,3 +1967,30 @@ TEST_F(BufferPoolStoreTest, ConcurrentDocReadersSurviveCacheRetirement) {
   store.reset();
   EXPECT_EQ(expected_name, expected->get<std::string>("name"));
 }
+
+TEST_F(BufferPoolStoreTest, RecordBatchCopyEstimatePreservesSlicedPayloadCharge) {
+  arrow::UInt64Builder ids;
+  arrow::StringBuilder names;
+  arrow::BinaryBuilder data;
+  for (uint64_t i = 0; i < 5; ++i) ASSERT_TRUE(ids.Append(i).ok());
+  for (const auto &value : {"outside", "a", "", "three", "tail"})
+    ASSERT_TRUE(names.Append(value).ok());
+  ASSERT_TRUE(data.Append("prefix").ok());
+  ASSERT_TRUE(data.Append("abc").ok());
+  ASSERT_TRUE(data.AppendNull().ok());
+  ASSERT_TRUE(data.Append("longtail").ok());
+  ASSERT_TRUE(data.Append("suffix").ok());
+  auto schema = arrow::schema({arrow::field("id", arrow::uint64()),
+                                arrow::field("name", arrow::utf8()),
+                                arrow::field("data", arrow::binary())});
+  auto batch = arrow::RecordBatch::Make(
+      schema, 5, {ids.Finish().ValueOrDie(), names.Finish().ValueOrDie(),
+                  data.Finish().ValueOrDie()});
+  ASSERT_TRUE(batch->ValidateFull().ok());
+  const size_t per_row = sizeof(Doc) + 256 + (192 + 2 * 2) +
+                         (192 + 4 * 2) + (192 + 4 * 2);
+  EXPECT_EQ(per_row * 3 + 6 + 11,
+            detail::EstimateQueryResult(*batch->Slice(1, 3)));
+  EXPECT_EQ(per_row * 5 + 17 + 23, detail::EstimateQueryResult(*batch));
+  EXPECT_EQ(0u, detail::EstimateQueryResult(*batch->Slice(0, 0)));
+}

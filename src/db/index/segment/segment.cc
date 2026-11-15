@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -569,7 +570,8 @@ class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
  public:
   CombinedRecordBatchReader(
       std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
-      const std::vector<std::string> &columns, arrow::MemoryPool *pool);
+      const std::vector<std::string> &columns, arrow::MemoryPool *pool,
+      bool budgeted);
 
   ~CombinedRecordBatchReader() override;
 
@@ -581,6 +583,7 @@ class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
   std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers_;
   std::shared_ptr<arrow::Schema> projected_schema_;
   arrow::MemoryPool *pool_;
+  bool budgeted_;
   bool emit_segment_row_id_ = false;
   size_t current_reader_index_;
   uint64_t next_segment_row_id_to_emit_;
@@ -4068,7 +4071,8 @@ RecordBatchReaderPtr SegmentImpl::scan(
   }
 
   return std::make_shared<CombinedRecordBatchReader>(
-      std::move(merged_readers), columns, query_memory_pool());
+      std::move(merged_readers), columns, query_memory_pool(),
+      uses_buffer_storage());
 }
 
 
@@ -4078,9 +4082,11 @@ RecordBatchReaderPtr SegmentImpl::scan(
 
 SegmentImpl::CombinedRecordBatchReader::CombinedRecordBatchReader(
     std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
-    const std::vector<std::string> &columns, arrow::MemoryPool *pool)
+    const std::vector<std::string> &columns, arrow::MemoryPool *pool,
+    bool budgeted)
     : readers_(std::move(readers)),
       pool_(pool),
+      budgeted_(budgeted),
       current_reader_index_(0),
       next_segment_row_id_to_emit_(0) {
   if (!readers_.empty()) {
@@ -4120,14 +4126,30 @@ arrow::Status SegmentImpl::CombinedRecordBatchReader::ReadNext(
 
     if (emit_segment_row_id_ && input) {
       auto num_rows = input->num_rows();
-      arrow::UInt64Builder builder(pool_);
-      ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
-
-      for (int64_t i = 0; i < num_rows; ++i) {
-        builder.UnsafeAppend(next_segment_row_id_to_emit_ + i);
-      }
       std::shared_ptr<arrow::Array> segment_row_id_array;
-      ARROW_RETURN_NOT_OK(builder.Finish(&segment_row_id_array));
+      if (budgeted_) {
+        // Row IDs are dense and never null. Fill their admitted backing in
+        // bulk, without a per-row validity-bitmap update in the source task.
+        constexpr int64_t kRowIdBytes = sizeof(uint64_t);
+        if (num_rows > std::numeric_limits<int64_t>::max() / kRowIdBytes) {
+          return arrow::Status::CapacityError("Row ID array is too large");
+        }
+        ARROW_ASSIGN_OR_RAISE(
+            auto values, arrow::AllocateBuffer(num_rows * kRowIdBytes, pool_));
+        auto *ids = reinterpret_cast<uint64_t *>(values->mutable_data());
+        if (num_rows) {
+          std::iota(ids, ids + num_rows, next_segment_row_id_to_emit_);
+        }
+        segment_row_id_array = std::make_shared<arrow::UInt64Array>(
+            num_rows, std::move(values));
+      } else {
+        arrow::UInt64Builder builder(pool_);
+        ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
+        for (int64_t i = 0; i < num_rows; ++i) {
+          builder.UnsafeAppend(next_segment_row_id_to_emit_ + i);
+        }
+        ARROW_RETURN_NOT_OK(builder.Finish(&segment_row_id_array));
+      }
 
       ARROW_ASSIGN_OR_RAISE(
           input,

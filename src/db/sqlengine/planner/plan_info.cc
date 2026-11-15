@@ -170,7 +170,14 @@ class BoundedSource : public arrow::acero::ExecNode {
   arrow::Future<arrow::ControlFlow<int>> consume(const Batch &next) try {
     if (!next || stopped()) return finish_deliveries();
     const bool legacy = plan_->query_context()->options().use_legacy_batching;
-    if (!legacy && parallel_batch(*next)) return queue_delivery(*next);
+    if (!legacy && parallel_batch(*next)) {
+      if (!deliveries_.empty() &&
+          (delivery_bytes_ >= delivery_window_bytes_ ||
+           next_delivery_bytes_ > delivery_window_bytes_ - delivery_bytes_)) {
+        return drain_deliveries().Then([this, next]() { return consume(next); });
+      }
+      return queue_delivery(*next);
+    }
     if (!deliveries_.empty()) {
       return drain_deliveries().Then([this, next]() { return consume(next); });
     }
@@ -202,6 +209,7 @@ class BoundedSource : public arrow::acero::ExecNode {
   arrow::Future<> drain_deliveries() {
     auto finished = arrow::AllFinished(deliveries_);
     deliveries_.clear();
+    delivery_bytes_ = 0;
     return finished;
   }
   arrow::Future<arrow::ControlFlow<int>> finish_deliveries() {
@@ -227,12 +235,12 @@ class BoundedSource : public arrow::acero::ExecNode {
             -> arrow::Future<arrow::ControlFlow<int>> { return error; });
   }
   bool parallel_batch(const arrow::compute::ExecBatch &batch) {
-    // Keep cold/pressure reads serial. Ready managed batches can use the
-    // bounded delivery window, including small strings and nested lists.
+    // Ready managed batches can use a bounded delivery window. Under pressure
+    // retain inline delivery; the shared allocator still governs every buffer.
     if (plan_->query_context()->memory_pool() !=
             detail::GetParquetQueryMemoryPool().get() ||
         plan_->query_context()->executor()->GetCapacity() <= 1 ||
-        batch.length < 1024 ||
+        batch.length <= 0 ||
         batch.length > arrow::acero::ExecPlan::kMaxBatchSize ||
         batch.values.size() > 4)
       return false;
@@ -260,10 +268,17 @@ class BoundedSource : public arrow::acero::ExecNode {
         pending[count++] = child.get();
       }
     }
+    // Tiny fixed-width batches cost less to deliver inline than to schedule.
+    // Small-row batches of large strings still have enough work to overlap.
+    if (batch.length < 1024 && bytes < 64 * 1024) return false;
     const size_t available =
         ailego::MemoryLimitPool::get_instance().prefetch_available();
-    if (!visited || !available || bytes > available / (2 * kMaxDeliveries))
-      return false;
+    if (!visited || !available || bytes > available / 2) return false;
+    // Count the complete backing conservatively, but bound the sum of queued
+    // batches instead of assuming 64 equally large backings. A large resident
+    // slice can then use a smaller window without losing all parallelism.
+    next_delivery_bytes_ = bytes;
+    delivery_window_bytes_ = available / 2;
     if (!delivery_metadata_) {
       try {
         auto metadata = std::make_shared<ailego::MemoryReservation>();
@@ -281,6 +296,7 @@ class BoundedSource : public arrow::acero::ExecNode {
       const arrow::compute::ExecBatch &batch) {
     auto done = arrow::Future<>::Make();
     deliveries_.push_back(done);
+    delivery_bytes_ += next_delivery_bytes_;
     const int index = count_++;
     auto submitted = arrow::Status::OK();
     try {
@@ -303,7 +319,8 @@ class BoundedSource : public arrow::acero::ExecNode {
       submitted = arrow::Status::OutOfMemory("Source task allocation");
     }
     if (!submitted.ok()) done.MarkFinished(submitted);
-    if (!submitted.ok() || deliveries_.size() == kMaxDeliveries) {
+    if (!submitted.ok() || deliveries_.size() == kMaxDeliveries ||
+        delivery_bytes_ >= delivery_window_bytes_) {
       // Overlap the next bounded reader group with this delivery window.
       // At most one read Future exists, and shutdown always awaits it.
       if (submitted.ok() && !stopped()) prefetched_ = pull();
@@ -337,6 +354,9 @@ class BoundedSource : public arrow::acero::ExecNode {
     return output_->InputReceived(this, std::move(batch));
   }
   static constexpr size_t kMaxDeliveries = 64;
+  size_t delivery_bytes_{0};
+  size_t next_delivery_bytes_{0};
+  size_t delivery_window_bytes_{0};
   arrow::Future<Batch> prefetched_;
   std::vector<arrow::Future<>> deliveries_;
   std::shared_ptr<ailego::MemoryReservation> delivery_metadata_;
@@ -409,10 +429,9 @@ arrow::Result<arrow::acero::Declaration> bound_sources(
               ARROW_RETURN_NOT_OK(input->reader->ReadNext(&batch));
               if (!batch) return BoundedSource::Batch{};
               const auto can_prepare = [](const arrow::RecordBatch &value) {
-                if (value.num_rows() < 1024 || value.num_columns() > 4)
+                if (value.num_rows() <= 0 || value.num_columns() > 4)
                   return false;
                 size_t bytes = 0;
-                bool wide = false;
                 for (const auto &array : value.columns()) {
                   if (array->data()->dictionary ||
                       !array->data()->child_data.empty())
@@ -424,29 +443,25 @@ arrow::Result<arrow::acero::Declaration> bound_sources(
                       return false;
                     bytes += size;
                   }
-                  const auto type = array->type_id();
-                  if ((type == arrow::Type::STRING ||
-                       type == arrow::Type::LARGE_STRING) &&
-                      array->data()->buffers[2] &&
-                      array->data()->buffers[2]->size() >= 4 * 1024 * 1024)
-                    wide = true;
                 }
-                return wide && bytes <= ailego::MemoryLimitPool::get_instance()
+                return bytes >= 64 * 1024 &&
+                       bytes <= ailego::MemoryLimitPool::get_instance()
                                                 .prefetch_available() /
-                                            32;
+                                            64;
               };
               if (managed && can_prepare(*batch)) {
                 try {
                   if (!input->metadata) {
                     auto metadata =
                         std::make_shared<ailego::MemoryReservation>();
-                    metadata->add_array(8, 2048);
-                    input->ready.reserve(7);
+                    metadata->add_array(16, 2048);
+                    input->ready.reserve(15);
                     input->metadata = std::move(metadata);
                   }
-                  // Amortize executor handoffs; no payload copying. Cold and
-                  // pressure reads retain one-at-a-time decoding.
-                  for (int i = 0; i < 7; ++i) {
+                  // Amortize executor handoffs without copying payloads.
+                  // The headroom check bounds this optional reader group;
+                  // actual decode allocations still require shared admission.
+                  for (int i = 0; i < 15; ++i) {
                     if (!can_prepare(*batch)) break;
                     std::shared_ptr<arrow::RecordBatch> next;
                     auto status = input->reader->ReadNext(&next);

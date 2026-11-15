@@ -76,14 +76,31 @@ class QueryResultEstimate {
 };
 
 inline size_t EstimateQueryResult(const arrow::RecordBatch &batch) {
+  if (batch.num_rows() == 0) return 0;
   QueryResultEstimate estimate;
   // Include shared ownership, growing DocPtrList capacity and hash buckets.
   estimate.add(sizeof(Doc) + 256, static_cast<size_t>(batch.num_rows()));
   for (int column = 0; column < batch.num_columns(); ++column) {
     estimate.add(192 + batch.schema()->field(column)->name().size() * 2,
                  static_cast<size_t>(batch.num_rows()));
+    const auto &array = *batch.column(column);
+    const auto type = array.type_id();
+    if (type == arrow::Type::STRING || type == arrow::Type::BINARY) {
+      if (array.null_count() == 0) {
+        const auto &binary = static_cast<const arrow::BinaryArray &>(array);
+        // Contiguous valid values telescope, including sliced arrays. Charge
+        // exactly the copied value bytes, without visiting every string.
+        estimate.add(static_cast<size_t>(
+            binary.value_offset(array.length()) - binary.value_offset(0)));
+        continue;
+      }
+    } else if (type != arrow::Type::LIST && type != arrow::Type::STRUCT) {
+      // These values have no separate payload in Doc::Value. Their fixed
+      // charge above is unchanged; no per-row estimate walk is necessary.
+      continue;
+    }
     for (int64_t row = 0; row < batch.num_rows(); ++row)
-      estimate.value(*batch.column(column), row);
+      estimate.value(array, row);
   }
   return estimate.bytes();
 }
