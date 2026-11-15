@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,6 +42,7 @@
 #include "db/common/document_memory.h"
 #include "db/common/query_result_memory.h"
 #include "db/index/storage/parquet_memory_pool.h"
+#include "db/index/storage/request_scratch.h"
 #if RABITQ_SUPPORTED
 #include "core/algorithm/hnsw_rabitq/rabitq_params.h"
 #endif
@@ -438,7 +440,8 @@ class SegmentImpl : public Segment,
       const std::vector<std::string> &forward_columns,
       const std::shared_ptr<arrow::Schema> &result_schema,
       const ExecBatchPtr &exec_batch, bool include_vector,
-      Status *read_status = nullptr);
+      Status *read_status = nullptr,
+      const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &admitted = {});
   TablePtr fetch_unsafe(const std::vector<std::string> &columns,
                         const std::vector<int> &segment_doc_ids,
                         bool strict = false,
@@ -1662,6 +1665,42 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       begin = end;
       continue;
     }
+    detail::ResultMemoryAllowance::Lease batch_memory(
+        options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+    detail::ResultMemoryAllowance::PendingCopy batch_pending;
+    std::optional<detail::RequestScratchArray<size_t, kMaxFetchBatchSize>>
+        row_bytes;
+    bool batch_admitted = false;
+    if (!options_.enable_mmap_ && segment_doc_ids.size() > 1) {
+      try {
+        row_bytes.emplace(segment_doc_ids.size());
+        detail::QueryResultEstimate fixed, total;
+        fixed.add(sizeof(Doc) + 256);
+        for (const auto &column : columns) fixed.add(192 + column.size() * 2);
+        for (size_t row = 0; row < segment_doc_ids.size(); ++row) {
+          detail::QueryResultEstimate estimate;
+          estimate.add(fixed.bytes());
+          for (const auto &array : arrays) {
+            int64_t local = static_cast<int64_t>(row);
+            for (const auto &chunk : array->chunks()) {
+              if (local < chunk->length()) {
+                estimate.value(*chunk, local);
+                break;
+              }
+              local -= chunk->length();
+            }
+          }
+          (*row_bytes)[row] = estimate.bytes();
+          total.add((*row_bytes)[row]);
+        }
+        batch_memory.add_pending(total.bytes(), batch_pending);
+        batch_admitted = batch_memory.bytes() != 0;
+      } catch (const std::bad_alloc &) {
+        // Keep the existing per-document path when a complete batch cannot
+        // be admitted. No partial batch charge survives a refused admission.
+      }
+    }
+    batch_pending.start();
     for (size_t row = 0; row < segment_doc_ids.size(); ++row) {
       std::vector<arrow::Datum> scalars;
       scalars.reserve(arrays.size());
@@ -1681,9 +1720,16 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       const size_t output = output_positions[row];
       auto batch =
           std::make_shared<arrow::compute::ExecBatch>(std::move(scalars), 1);
+      std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+      if (batch_admitted) {
+        memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+            &detail::SharedResultMemoryAllowance());
+        batch_memory.transfer_copy_to(*memory, (*row_bytes)[row]);
+      }
       docs[output] =
           materialize_doc_unsafe(g_doc_ids[output], segment_doc_ids[row],
-                                 columns, result_schema, batch, include_vector);
+                                 columns, result_schema, batch, include_vector,
+                                 nullptr, memory);
     }
     begin = end;
   }
@@ -1694,7 +1740,8 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
     uint64_t g_doc_id, int segment_doc_id,
     const std::vector<std::string> &forward_columns,
     const std::shared_ptr<arrow::Schema> &result_schema,
-    const ExecBatchPtr &exec_batch, bool include_vector, Status *read_status) {
+    const ExecBatchPtr &exec_batch, bool include_vector, Status *read_status,
+    const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &admitted) {
   if (!exec_batch) {
     LOG_ERROR("Fetch failed, doc_id: %zu", (size_t)g_doc_id);
     return nullptr;
@@ -1711,9 +1758,9 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
     return nullptr;
   }
 
-  std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  auto memory = admitted;
   detail::ResultMemoryAllowance::PendingCopy pending;
-  if (!options_.enable_mmap_) {
+  if (!options_.enable_mmap_ && !memory) {
     detail::QueryResultEstimate estimate;
     estimate.add(sizeof(Doc) + 256);
     for (size_t i = 0; i < forward_columns.size(); ++i) {

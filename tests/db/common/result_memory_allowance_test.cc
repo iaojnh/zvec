@@ -35,14 +35,15 @@ class ResultMemoryAllowanceTest : public testing::Test {
 
 TEST_F(ResultMemoryAllowanceTest, ReleasedQuotaIsAvailableToNextAdmission) {
   ResultMemoryAllowance allowance;
+  const size_t charge = ailego::MemoryLimitPool::get_instance().capacity() / 10;
   auto first = std::make_unique<ResultMemoryAllowance::Lease>(&allowance);
-  first->add(4 * 1024 * 1024);
+  first->add(charge);
   first.reset();
   // Each result fits; retaining both logical charges would exceed the
   // quarter-budget limit. Do not query statistics before the next admission.
   ResultMemoryAllowance::Lease next(&allowance);
-  EXPECT_NO_THROW(next.add(4 * 1024 * 1024));
-  EXPECT_EQ(4u * 1024 * 1024, allowance.active_bytes());
+  EXPECT_NO_THROW(next.add(charge));
+  EXPECT_EQ(charge, allowance.active_bytes());
 }
 
 TEST_F(ResultMemoryAllowanceTest, CopyRefundsAreVisibleToIdleReclaim) {
@@ -57,6 +58,87 @@ TEST_F(ResultMemoryAllowanceTest, CopyRefundsAreVisibleToIdleReclaim) {
   EXPECT_EQ(0u, allowance.active_bytes());
   EXPECT_EQ(0u, allowance.reserved_bytes());
   EXPECT_EQ(0u, pool_.external_used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, BatchCopiesRetainOnlyEachSurvivingOwner) {
+  ResultMemoryAllowance allowance;
+  std::vector<std::unique_ptr<ResultMemoryAllowance::Lease>> owners;
+  {
+    ResultMemoryAllowance::Lease batch(&allowance);
+    ResultMemoryAllowance::PendingCopy pending;
+    batch.add_pending(4 * 1024 * 1024, pending);
+    pending.start();
+    for (int i = 0; i < 4; ++i) {
+      auto owner = std::make_unique<ResultMemoryAllowance::Lease>(&allowance);
+      batch.transfer_copy_to(*owner, 1024 * 1024);
+      owners.push_back(std::move(owner));
+    }
+    EXPECT_EQ(0u, batch.bytes());
+    EXPECT_EQ(4u * 1024 * 1024, allowance.active_bytes());
+  }
+  std::thread release([&] {
+    for (size_t i = 0; i < 3; ++i) owners[i].reset();
+  });
+  release.join();
+  EXPECT_EQ(1024u * 1024, allowance.active_bytes());
+  allowance.reclaim_idle();
+  EXPECT_EQ(2u * 1024 * 1024, allowance.reserved_bytes());
+  owners.clear();
+  allowance.reclaim_idle();
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(0u, pool_.external_used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, CopyTransferNeedsNoAdditionalCapacity) {
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease batch(&allowance), owner(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  batch.add_pending(4096, pending);
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  const size_t remaining = native.capacity() - native.used();
+  ASSERT_TRUE(native.try_charge_external(remaining));
+  auto restore =
+      ailego::ScopeGuard::Make([&] { native.release_external(remaining); });
+  EXPECT_NO_THROW(batch.transfer_copy_to(owner, 1024));
+  EXPECT_EQ(3072u, batch.bytes());
+  EXPECT_EQ(1024u, owner.bytes());
+  EXPECT_EQ(4096u, allowance.active_bytes());
+  EXPECT_EQ(native.capacity(), native.used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, FailedCopyTransfersPreserveAllOwners) {
+  ResultMemoryAllowance allowance, other_allowance;
+  ResultMemoryAllowance::Lease batch(&allowance), destination(&allowance),
+      foreign(&other_allowance), native(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  batch.add_pending(4096, pending);
+  native.add(128);
+  EXPECT_THROW(batch.transfer_copy_to(foreign, 128), std::bad_alloc);
+  EXPECT_THROW(batch.transfer_copy_to(destination, 4097), std::bad_alloc);
+  EXPECT_THROW(batch.transfer_copy_to(batch, 128), std::bad_alloc);
+  EXPECT_THROW(native.transfer_copy_to(destination, 128), std::bad_alloc);
+  batch.transfer_copy_to(destination, 1024);
+  EXPECT_THROW(batch.transfer_copy_to(destination, 1024), std::bad_alloc);
+  EXPECT_EQ(3072u, batch.bytes());
+  EXPECT_EQ(1024u, destination.bytes());
+  EXPECT_EQ(4224u, allowance.active_bytes());
+  EXPECT_EQ(0u, other_allowance.active_bytes());
+}
+
+TEST_F(ResultMemoryAllowanceTest, FailedBatchAdmissionLeavesSplitQuotaUnused) {
+  ResultMemoryAllowance allowance;
+  ResultMemoryAllowance::Lease batch(&allowance), owner(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  const size_t oversized =
+      ailego::MemoryLimitPool::get_instance().capacity() / 8 + 1;
+  EXPECT_THROW(batch.add_pending(oversized, pending), std::bad_alloc);
+  EXPECT_EQ(0u, batch.bytes());
+  EXPECT_EQ(0u, allowance.active_bytes());
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+  EXPECT_THROW(batch.transfer_copy_to(owner, 128), std::bad_alloc);
+  // The ordinary per-owner path can still admit a smaller result.
+  EXPECT_NO_THROW(owner.add_pending(1024, pending));
+  EXPECT_EQ(1024u, allowance.active_bytes());
 }
 
 TEST_F(ResultMemoryAllowanceTest, CrossThreadDestructionPreservesPinnedQuota) {
