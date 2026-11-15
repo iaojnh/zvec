@@ -1680,8 +1680,8 @@ TEST_F(BufferPoolStoreTest, CachedLargeRowGroupKeepsScanSlicesAlive) {
   {
     auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
     ASSERT_TRUE(store->open().ok());
-    // Budgeted scans reuse resident columns; cold scans deliberately stream
-    // without admitting a whole row group into the point-read cache.
+    // Keep this column resident even when spare budget is too small to admit
+    // another full decoded row group.
     ASSERT_NE(store->fetch({"value"}, 1), nullptr);
     auto reader = store->scan({"value"});
     std::shared_ptr<arrow::RecordBatch> batch;
@@ -1704,7 +1704,7 @@ TEST_F(BufferPoolStoreTest, CachedLargeRowGroupKeepsScanSlicesAlive) {
 }
 
 TEST_F(BufferPoolStoreTest,
-       CachedStringScanAvoidsTinyDecoderChunksWithHeadroom) {
+       ColdStringScanPopulatesCacheAndReusesBuffersWithHeadroom) {
   ASSERT_EQ(0,
             ailego::PoolPayloadBudget::get_instance().init(128 * 1024 * 1024));
   arrow::StringBuilder values;
@@ -1726,7 +1726,11 @@ TEST_F(BufferPoolStoreTest,
   {
     auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
     ASSERT_TRUE(store->open().ok());
-    ASSERT_NE(store->fetch({"value"}, 1), nullptr);
+    const ParquetBufferID id(parquet_path, 0, 0);
+    {
+      auto cold = ParquetBufferPool::get_instance().try_acquire_buffer(id);
+      ASSERT_EQ(cold.borrowed_data(), nullptr);
+    }
     auto reader = store->scan({"value"});
     std::shared_ptr<arrow::RecordBatch> batch;
     while (true) {
@@ -1736,6 +1740,15 @@ TEST_F(BufferPoolStoreTest,
       EXPECT_LE(batch->num_rows(), 4096);
       batches.push_back(std::move(batch));
     }
+    auto resident = ParquetBufferPool::get_instance().try_acquire_buffer(id);
+    ASSERT_NE(resident.borrowed_data(), nullptr);
+    const auto *cached_bytes =
+        resident.borrowed_data()->chunk(0)->data()->buffers[2]->data();
+    auto repeated = store->scan({"value"});
+    std::shared_ptr<arrow::RecordBatch> first;
+    ASSERT_TRUE(repeated->ReadNext(&first).ok());
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(cached_bytes, first->column(0)->data()->buffers[2]->data());
   }
   // The existing 10 MiB test above exercises the low-headroom fallback.
   // With room to coalesce, small decoder batches must not multiply the
@@ -1750,4 +1763,62 @@ TEST_F(BufferPoolStoreTest,
   EXPECT_TRUE(actual->Equals(*source));
   EXPECT_LE(ailego::MemoryLimitPool::get_instance().stats().used,
             ailego::MemoryLimitPool::get_instance().capacity());
+}
+
+TEST_F(BufferPoolStoreTest,
+       ColdScanStreamsUnderPressureThenCachesAfterRelease) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, pool.init(128 * 1024 * 1024));
+  arrow::StringBuilder values;
+  constexpr int kRows = 8193;
+  for (int row = 0; row < kRows; ++row) {
+    ASSERT_TRUE(
+        values.Append(std::string(1024, 'x') + std::to_string(row)).ok());
+  }
+  auto array = values.Finish().ValueOrDie();
+  auto source = arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::utf8())}), {array});
+  auto out = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  parquet::WriterProperties::Builder properties;
+  properties.disable_dictionary();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*source, arrow::default_memory_pool(),
+                                         out, kRows, properties.build())
+                  .ok());
+  ASSERT_TRUE(out->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const ParquetBufferID id(parquet_path, 0, 0);
+  auto scan = [&] {
+    auto reader = store->scan({"value"});
+    int rows = 0, batches = 0;
+    while (true) {
+      std::shared_ptr<arrow::RecordBatch> batch;
+      const auto status = reader->ReadNext(&batch);
+      EXPECT_TRUE(status.ok()) << status.ToString();
+      if (!status.ok() || !batch) break;
+      const auto &strings =
+          static_cast<const arrow::StringArray &>(*batch->column(0));
+      for (int64_t i = 0; i < strings.length(); ++i, ++rows) {
+        EXPECT_EQ(
+            strings.GetView(i),
+            static_cast<const arrow::StringArray &>(*array).GetView(rows));
+      }
+      ++batches;
+      EXPECT_LE(pool.committed(), pool.capacity());
+    }
+    EXPECT_EQ(rows, kRows);
+    EXPECT_GT(batches, 1);
+  };
+  {
+    constexpr size_t kStreamingHeadroom = 4 * 1024 * 1024;
+    ASSERT_GT(pool.available(), kStreamingHeadroom);
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.available() - kStreamingHeadroom);
+    scan();
+    auto uncached = ParquetBufferPool::get_instance().try_acquire_buffer(id);
+    EXPECT_EQ(uncached.borrowed_data(), nullptr);
+  }
+  scan();
+  auto resident = ParquetBufferPool::get_instance().try_acquire_buffer(id);
+  EXPECT_NE(resident.borrowed_data(), nullptr);
 }
