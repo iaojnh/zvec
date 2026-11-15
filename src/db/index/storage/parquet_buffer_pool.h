@@ -18,6 +18,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +37,10 @@ class RandomAccessFile;
 }  // namespace arrow
 
 namespace zvec {
+
+namespace detail {
+struct ParquetScanBufferLease;
+}
 
 struct ParquetBufferID {
   int column{0};
@@ -73,6 +78,15 @@ struct ParquetFileContext {
 
   const std::shared_ptr<arrow::io::RandomAccessFile> file;
   const ParquetBufferID buffer_id;
+
+ private:
+  friend class ParquetBufferContextHandle;
+  // Weak references cannot extend a pin. A retained slice keeps the lease
+  // discoverable even after its original table and reader are destroyed.
+  mutable std::mutex scan_lease_mutex_;
+  mutable std::map<std::pair<int, int>,
+                   std::weak_ptr<detail::ParquetScanBufferLease>>
+      scan_leases_;
 };
 
 struct ParquetBufferIDHash {
@@ -155,6 +169,11 @@ class ParquetBufferContextHandle {
   // Returned arrays retain the cache pin through their buffers. Returns null
   // when the shared scan lease budget is exhausted; the handle stays usable.
   std::shared_ptr<arrow::ChunkedArray> borrow_for_scan() &&;
+
+  // Concurrent scans of this file share one budget reservation and cache pin
+  // per live column/row group. Owned-copy fallback keeps the same allowance.
+  std::shared_ptr<arrow::ChunkedArray> borrow_for_scan(
+      const ParquetFileContext &context) &&;
 
  private:
   ParquetBufferID buffer_id_;

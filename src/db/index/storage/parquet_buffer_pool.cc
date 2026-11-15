@@ -169,8 +169,11 @@ bool ScanBufferBytes(const std::shared_ptr<arrow::ArrayData> &data,
   return !data->dictionary || ScanBufferBytes(data->dictionary, limit, bytes);
 }
 
-struct ScanBufferLease {
-  ~ScanBufferLease() {
+}  // namespace
+
+namespace detail {
+struct ParquetScanBufferLease {
+  ~ParquetScanBufferLease() {
     // Publish budget availability only after releasing the cache pin.
     handle.reset();
     scan_lease_bytes.fetch_sub(bytes, std::memory_order_relaxed);
@@ -178,6 +181,10 @@ struct ScanBufferLease {
   std::optional<ParquetBufferContextHandle> handle;
   size_t bytes{0};
 };
+}  // namespace detail
+
+namespace {
+using ScanBufferLease = detail::ParquetScanBufferLease;
 
 std::shared_ptr<arrow::ArrayData> LeaseArrayData(
     const std::shared_ptr<arrow::ArrayData> &source,
@@ -191,6 +198,39 @@ std::shared_ptr<arrow::ArrayData> LeaseArrayData(
     data->dictionary = LeaseArrayData(data->dictionary, lease);
   }
   return data;
+}
+
+std::shared_ptr<ScanBufferLease> MakeScanLease(
+    ParquetBufferContextHandle &handle) {
+  const auto *source = handle.borrowed_data();
+  if (!source) return nullptr;
+  const size_t limit = ailego::MemoryLimitPool::get_instance().capacity() / 8;
+  size_t bytes = 0;
+  for (const auto &chunk : source->chunks()) {
+    if (!ScanBufferBytes(chunk->data(), limit, &bytes)) return nullptr;
+  }
+  auto lease = std::make_shared<ScanBufferLease>();
+  size_t used = scan_lease_bytes.load(std::memory_order_relaxed);
+  do {
+    if (used > limit || bytes > limit - used) return nullptr;
+  } while (!scan_lease_bytes.compare_exchange_weak(used, used + bytes,
+                                                   std::memory_order_relaxed));
+  lease->bytes = bytes;
+  lease->handle.emplace(std::move(handle));
+  return lease;
+}
+
+std::shared_ptr<arrow::ChunkedArray> MakeLeasedColumn(
+    const std::shared_ptr<ScanBufferLease> &lease) {
+  if (!lease) return nullptr;
+  const auto *source = lease->handle->borrowed_data();
+  arrow::ArrayVector chunks;
+  chunks.reserve(source->num_chunks());
+  for (const auto &chunk : source->chunks()) {
+    chunks.push_back(arrow::MakeArray(LeaseArrayData(chunk->data(), lease)));
+  }
+  return std::make_shared<arrow::ChunkedArray>(std::move(chunks),
+                                               source->type());
 }
 
 bool RetainParquetColumnBuffers(
@@ -220,28 +260,31 @@ bool RetainParquetColumnBuffers(
 
 std::shared_ptr<arrow::ChunkedArray>
 ParquetBufferContextHandle::borrow_for_scan() && {
+  return MakeLeasedColumn(MakeScanLease(*this));
+}
+
+std::shared_ptr<arrow::ChunkedArray>
+ParquetBufferContextHandle::borrow_for_scan(
+    const ParquetFileContext &context) && {
   if (!arrow_) return nullptr;
-  const size_t limit = ailego::MemoryLimitPool::get_instance().capacity() / 8;
-  size_t bytes = 0;
-  for (const auto &chunk : arrow_->chunks()) {
-    if (!ScanBufferBytes(chunk->data(), limit, &bytes)) return nullptr;
+  std::shared_ptr<ScanBufferLease> lease;
+  {
+    std::lock_guard<std::mutex> lock(context.scan_lease_mutex_);
+    auto &slot =
+        context.scan_leases_[{buffer_id_.column, buffer_id_.row_group}];
+    lease = slot.lock();
+    if (lease && !ParquetBufferIDEqual{}(lease->handle->buffer_id_, buffer_id_))
+      lease.reset();
+    if (!lease) {
+      lease = MakeScanLease(*this);
+      if (lease) slot = lease;
+    }
   }
-  auto lease = std::make_shared<ScanBufferLease>();
-  size_t used = scan_lease_bytes.load(std::memory_order_relaxed);
-  do {
-    if (used > limit || bytes > limit - used) return nullptr;
-  } while (!scan_lease_bytes.compare_exchange_weak(used, used + bytes,
-                                                   std::memory_order_relaxed));
-  lease->bytes = bytes;
-  lease->handle.emplace(std::move(*this));
-  const auto &source = lease->handle->data();
-  arrow::ArrayVector chunks;
-  chunks.reserve(source->num_chunks());
-  for (const auto &chunk : source->chunks()) {
-    chunks.push_back(arrow::MakeArray(LeaseArrayData(chunk->data(), lease)));
-  }
-  return std::make_shared<arrow::ChunkedArray>(std::move(chunks),
-                                               source->type());
+  if (!lease) return nullptr;
+  // A reused lease already owns its pin. Consume this redundant handle only
+  // after successful lookup; admission failure must leave it usable for copy.
+  ParquetBufferContextHandle redundant(std::move(*this));
+  return MakeLeasedColumn(lease);
 }
 
 bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,

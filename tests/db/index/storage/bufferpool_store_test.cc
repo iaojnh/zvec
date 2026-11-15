@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -60,6 +61,60 @@ class BufferPoolStoreTest : public testing::Test {
   std::string parquet_path = "test.parquet";
 };
 
+
+TEST_F(BufferPoolStoreTest, ConcurrentScansShareLeaseAfterParentIsReleased) {
+  const std::string value(256 * 1024, 'x');
+  arrow::StringBuilder values;
+  for (int row = 0; row < 4; ++row) ASSERT_TRUE(values.Append(value).ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(values.Finish(&array).ok());
+  auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("payload", arrow::utf8())}), {array});
+  auto out = arrow::io::FileOutputStream::Open(parquet_path);
+  ASSERT_TRUE(out.ok());
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out, 4)
+          .ok());
+  ASSERT_TRUE((*out)->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  auto reader = store->scan({"payload"});
+  std::shared_ptr<arrow::RecordBatch> batch;
+  ASSERT_TRUE(reader->ReadNext(&batch).ok());
+  ASSERT_NE(batch, nullptr);
+  // The whole column fits the scan allowance once, but not twice. Keep only
+  // a slice: releasing the original reader/table must not lose that lease.
+  auto retained = batch->column(0)->Slice(1, 1);
+  const auto *bytes = retained->data()->buffers[2]->data();
+  batch.reset();
+  reader.reset();
+  std::array<std::shared_ptr<arrow::Array>, 8> concurrent;
+  std::array<arrow::Status, 8> errors;
+  std::vector<std::thread> readers;
+  for (size_t i = 0; i < concurrent.size(); ++i) {
+    readers.emplace_back([&, i] {
+      auto scan = store->scan({"payload"});
+      std::shared_ptr<arrow::RecordBatch> current;
+      errors[i] = scan->ReadNext(&current);
+      if (errors[i].ok() && current)
+        concurrent[i] = current->column(0)->Slice(3, 1);
+    });
+  }
+  for (auto &thread : readers) thread.join();
+  store.reset();
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  for (size_t i = 0; i < concurrent.size(); ++i) {
+    ASSERT_TRUE(errors[i].ok());
+    ASSERT_NE(concurrent[i], nullptr);
+    EXPECT_EQ(concurrent[i]->data()->buffers[2]->data(), bytes);
+    EXPECT_EQ(
+        static_cast<const arrow::StringArray &>(*concurrent[i]).GetView(0),
+        value);
+  }
+  EXPECT_EQ(static_cast<const arrow::StringArray &>(*retained).GetView(0),
+            value);
+}
 
 TEST_F(BufferPoolStoreTest, ParquetFetch) {
   auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
@@ -1327,8 +1382,10 @@ TEST_F(BufferPoolStoreTest,
     ASSERT_TRUE(builder.Append(std::string(65536, 'a' + i)).ok());
   }
   auto array = builder.Finish().ValueOrDie();
-  auto source = arrow::Table::Make(
-      arrow::schema({arrow::field("value", arrow::utf8())}), {array});
+  auto source =
+      arrow::Table::Make(arrow::schema({arrow::field("value", arrow::utf8()),
+                                        arrow::field("other", arrow::utf8())}),
+                         {array, array});
   const auto path = std::filesystem::absolute(parquet_path).string();
   auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
   ASSERT_TRUE(
@@ -1341,6 +1398,7 @@ TEST_F(BufferPoolStoreTest,
   auto context = ParquetFileContext::make(path, input).ValueOrDie();
   std::weak_ptr<arrow::Buffer> cached;
   const uint8_t *address;
+  const uint8_t *other_address;
   {
     auto handle =
         ParquetBufferPool::get_instance().acquire_buffer(context->buffer_id);
@@ -1348,18 +1406,25 @@ TEST_F(BufferPoolStoreTest,
     cached = handle.data()->chunk(0)->data()->buffers[2];
     address = handle.data()->chunk(0)->data()->buffers[2]->data();
   }
+  {
+    auto key = context->buffer_id;
+    key.column = 1;
+    auto handle = ParquetBufferPool::get_instance().acquire_buffer(key);
+    ASSERT_NE(handle.data(), nullptr);
+    other_address = handle.data()->chunk(0)->data()->buffers[2]->data();
+  }
   auto first_reader = store->scan({"value"});
-  auto second_reader = store->scan({"value"});
+  auto second_reader = store->scan({"other"});
   std::shared_ptr<arrow::RecordBatch> borrowed, copied;
   ASSERT_TRUE(first_reader->ReadNext(&borrowed).ok());
   ASSERT_TRUE(second_reader->ReadNext(&copied).ok());
   ASSERT_NE(borrowed, nullptr);
   ASSERT_NE(copied, nullptr);
-  // 3/4 MiB fits the 10 MiB pool's lease quota, but two retained batches do
-  // not.
+  // One 3/4 MiB column fits the 10 MiB pool's lease quota, but two distinct
+  // columns do not. Sharing an existing column must not relax this limit.
   EXPECT_EQ(borrowed->column(0)->data()->buffers[2]->data(), address);
-  EXPECT_NE(copied->column(0)->data()->buffers[2]->data(), address);
-  EXPECT_TRUE(borrowed->Equals(*copied));
+  EXPECT_NE(copied->column(0)->data()->buffers[2]->data(), other_address);
+  EXPECT_TRUE(borrowed->column(0)->Equals(copied->column(0)));
   first_reader.reset();
   second_reader.reset();
   store.reset();
@@ -1396,8 +1461,8 @@ TEST_F(BufferPoolStoreTest, NarrowStringScanStreamsAndRetainsSlices) {
       arrow::schema({arrow::field("value", arrow::utf8())}), {expected});
   const auto path = std::filesystem::absolute(parquet_path).string();
   auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
-  ASSERT_TRUE(parquet::arrow::WriteTable(
-                  *source, arrow::default_memory_pool(), out, rows)
+  ASSERT_TRUE(parquet::arrow::WriteTable(*source, arrow::default_memory_pool(),
+                                         out, rows)
                   .ok());
   ASSERT_TRUE(out->Close().ok());
   auto store = std::make_shared<BufferPoolForwardStore>(path);
@@ -1416,8 +1481,8 @@ TEST_F(BufferPoolStoreTest, NarrowStringScanStreamsAndRetainsSlices) {
       EXPECT_LE(batch->num_rows(), 4096);
     }
     ASSERT_GT(batch->num_rows(), 0);
-    ASSERT_TRUE(batch->column(0)->Equals(
-        expected->Slice(offset, batch->num_rows())));
+    ASSERT_TRUE(
+        batch->column(0)->Equals(expected->Slice(offset, batch->num_rows())));
     offset += batch->num_rows();
     retained.push_back(std::move(batch));
   }
@@ -1430,8 +1495,8 @@ TEST_F(BufferPoolStoreTest, NarrowStringScanStreamsAndRetainsSlices) {
   // Zero-copy source slices must keep the cache lease after their reader dies.
   offset = 0;
   for (const auto &batch : retained) {
-    EXPECT_TRUE(batch->column(0)->Equals(
-        expected->Slice(offset, batch->num_rows())));
+    EXPECT_TRUE(
+        batch->column(0)->Equals(expected->Slice(offset, batch->num_rows())));
     offset += batch->num_rows();
   }
 }
@@ -1458,9 +1523,9 @@ TEST_F(BufferPoolStoreTest, ParquetCacheChargesAndOwnsArrayChildren) {
       arrow::schema({arrow::field("value", array->type())}), {array});
   const auto path = std::filesystem::absolute(parquet_path).string();
   auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
-  ASSERT_TRUE(parquet::arrow::WriteTable(
-                  *table, arrow::default_memory_pool(), out, 512)
-                  .ok());
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 512)
+          .ok());
   ASSERT_TRUE(out->Close().ok());
   auto input = arrow::io::ReadableFile::Open(path).ValueOrDie();
   auto context = ParquetFileContext::make(path, input).ValueOrDie();
@@ -1473,10 +1538,11 @@ TEST_F(BufferPoolStoreTest, ParquetCacheChargesAndOwnsArrayChildren) {
             static_cast<size_t>(arrow::util::TotalBufferSize(*payload.arrow)));
   auto child = payload.arrow->chunk(0)->data()->child_data.at(0);
   const auto *value_buffer = child->buffers.at(2).get();
-  auto owned = std::find_if(payload.arrow_refs.begin(), payload.arrow_refs.end(),
-                            [value_buffer](const auto &buffer) {
-                              return buffer.get() == value_buffer;
-                            });
+  auto owned =
+      std::find_if(payload.arrow_refs.begin(), payload.arrow_refs.end(),
+                   [value_buffer](const auto &buffer) {
+                     return buffer.get() == value_buffer;
+                   });
   ASSERT_NE(owned, payload.arrow_refs.end());
   std::weak_ptr<arrow::Buffer> original = *owned;
   payload.arrow.reset();
@@ -1525,9 +1591,8 @@ TEST_F(BufferPoolStoreTest, FetchBlocksCopiesBeyondScanLeaseQuota) {
   // Both 2 MiB columns fit in the 10 MiB cache, but neither fits its scan
   // lease quota. A small owned Fetch result needs only a short-lived pin.
   auto result = BufferPoolForwardStore::fetch_blocks(
-      {"value"}, {{first.get(), {{3, 0}, {0, 63}}},
-                  {second.get(), {{1, 7}, {2, 8}}}},
-      4);
+      {"value"},
+      {{first.get(), {{3, 0}, {0, 63}}}, {second.get(), {{1, 7}, {2, 8}}}}, 4);
   ASSERT_NE(result, nullptr);
   first.reset();
   second.reset();

@@ -111,7 +111,7 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
         buffer_id.row_group = rg_id;
         auto handle =
             ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
-        auto column = std::move(handle).borrow_for_scan();
+        auto column = std::move(handle).borrow_for_scan(*file_context_);
         if (!column) {
           auto cached = handle.data();
           if (cached) {
@@ -148,7 +148,9 @@ arrow::Status ParquetRecordBatchReader::ReadNext(
     // zero-copy slices let Acero overlap source and filter work on warm scans.
     bool split_batches =
         with_cache_ && arrow::util::TotalBufferSize(*table) > 4 * 1024 * 1024;
-    if (with_cache_ && !split_batches) {
+    // A table fitting in one batch cannot benefit from splitting. Avoid
+    // consulting the shared executor for these common small row groups.
+    if (with_cache_ && !split_batches && table->num_rows() > 4096) {
       // Short strings can have expensive predicates despite small buffers.
       // Overlap their work when the executor is nearly idle. Concurrent scans
       // already supply parallel work, so retain coarse batches under load.
@@ -839,8 +841,7 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
     buffer_id.row_group = rg_id;
     auto buffer_handle =
         ParquetBufferPool::get_instance().acquire_buffer(std::move(buffer_id));
-    std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
-        buffer_handle.data();
+    const auto *col_chunked_array = buffer_handle.borrowed_data();
 
     if (!col_chunked_array) {
       LOG_ERROR(
