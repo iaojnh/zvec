@@ -487,6 +487,169 @@ def experiments():
     return out
 
 
+def representative_experiments():
+    """Cover scenario and parameter boundaries without a Cartesian product."""
+    full = {x["group"]: x for x in experiments()}
+    names = [
+        "core-scalar-t1",
+        "core-scalar-t4",
+        "core-cross-t1",
+        "core-cross-t4",
+        "core-mutated-t4",
+        "core-mutated-optimized-t4",
+        "shape-wide-null50-t1",
+        "shape-wide-single-t4",
+        "shape-wide-mutated-t4",
+        "shape-wide-cross-t4",
+        "shape-empty-utf8-t1",
+        "shape-large-array-t4",
+        "shape-long-string-t1",
+        "typed-wide-null0-t1",
+        "typed-wide-null50-t4",
+        "typed-wide-null100-t1",
+        "typed-wide-cross-t4",
+        "selectivity-0-t1",
+        "selectivity-1-t4",
+        "selectivity-10-t1",
+        "selectivity-50-t4",
+        "selectivity-100-t1",
+        "selectivity-cross-50-t4",
+        "topk-cross-1-t1",
+        "topk-cross-10-t4",
+        "topk-cross-100-t4",
+        "batch-wide-cross-1-t1",
+        "batch-wide-cross-8-t4",
+        "batch-wide-cross-32-t4",
+        "batch-wide-cross-128-t4",
+        "batch-wide-cross-512-t1",
+        "projection-cross-0-t1",
+        "projection-cross-1-t4",
+        "projection-cross-2-t1",
+        "projection-cross-3-t4",
+        "projection-cross-4-t4",
+        "projection-cross-5-t1",
+        "pressure-pressure-128-t1",
+        "pressure-pressure-256-t1",
+        "pressure-pressure-512-t1",
+        "pressure-pressure-4096-t1",
+        "pressure-cross-pressure-128-t4",
+        "pressure-cross-pressure-4096-t4",
+        "pressure-wide-pressure-128-t4",
+        "pressure-wide-pressure-4096-t4",
+        "cold-cross-fetch32_null_array-t4",
+        "cold-wide-cross-fts_filter-t1",
+        "cold-long-string-scan_payload_like-t1",
+        "core-scalar-t8",
+        "core-scalar-t16",
+        "core-cross-t16",
+        "pressure-cross-pressure-4096-t16",
+    ]
+    for data, cases in (
+        ("lifecycle-rich", ["fetch32_null_array", "fts_filter", "array_filter"]),
+        ("lifecycle-wide", ["array_filter", "fetch32_null_array", "fts_filter"]),
+        ("lifecycle-cross-rich", ["fts_filter", "array_filter", "fetch32_null_array"]),
+        ("lifecycle-cross-wide", ["fetch32_null_array", "fts_filter", "array_filter"]),
+    ):
+        for index, case in enumerate(cases):
+            maintenance = ("none", "flush", "optimize")[index]
+            names.append(f"mixed-{data}-{maintenance}-{case}-t4")
+        names.append(f"lifecycle-{data}-t1")
+    names.append("mixed-lifecycle-cross-rich-none-fts_filter-t1")
+    out = []
+    for name in names:
+        spec = dict(full[name])
+        if name.startswith("pressure-"):
+            spec["cases"] = [
+                "fetch1_all",
+                "fetch32_null_array",
+                "scan_payload_like",
+                "fts_filter",
+            ]
+            if spec["workers"] == 16:
+                spec["cases"] = ["scan_payload_like"]
+            elif spec["budget"] in (256, 512):
+                spec["cases"] = ["fetch32_null_array"]
+        elif name in ("core-scalar-t8", "core-scalar-t16"):
+            spec["cases"] = ["fetch1_payload", "fetch32_contiguous"]
+        elif name == "core-cross-t16":
+            spec["cases"] = ["fetch32_null_array", "fts_filter"]
+        out.append(spec)
+    assert {case for x in out for case in x["cases"]} == {
+        case for x in full.values() for case in x["cases"]
+    }, "Representative tier must retain every query scenario"
+    for option in ("topk", "fetch-size", "projection", "selectivity-percent"):
+        assert {
+            x["options"][option] for x in full.values() if option in x["options"]
+        } == {x["options"][option] for x in out if option in x["options"]}, (
+            f"Representative tier must retain every {option} value"
+        )
+    for dimension in ("workers", "budget", "phase", "cache"):
+        assert {x[dimension] for x in full.values()} == {x[dimension] for x in out}
+    return out
+
+
+def reuse_completed(plan, args):
+    reused, reused_status, reused_hashes = [], [], {}
+    if args.reuse_status:
+        assert args.reuse_plan, "--reuse-status requires --reuse-plan"
+        previous_policy = json.loads(
+            args.reuse_plan.with_name(
+                args.reuse_plan.stem.removesuffix("-plan") + "-policy.json"
+            ).read_text()
+        )
+        binary = args.binary.resolve()
+        expected_hash = previous_policy.get("binary_sha256") or previous_policy.get(
+            "files", {}
+        ).get(str(binary))
+        assert expected_hash == hashlib.sha256(binary.read_bytes()).hexdigest(), (
+            "Reusing results requires the exact same binary"
+        )
+        old_plan = json.loads(args.reuse_plan.read_text())
+        completed = {
+            x["name"]: x
+            for x in json.loads(args.reuse_status.read_text())
+            if x["exit_code"] == 0
+        }
+
+        def comparable(item):
+            cmd = item["command"]
+            start = cmd.index("--rows")
+            opts = {cmd[i]: cmd[i + 1] for i in range(start, len(cmd), 2)}
+            opts.pop("--output")
+            opts.pop("--cases")
+            return cmd[:start], opts
+
+        pending = []
+        for item in plan:
+            previous = next(
+                (
+                    old
+                    for old in old_plan
+                    if old["name"] in completed
+                    and old["phase"] == item["phase"] == "query"
+                    and old["group"] == item["group"]
+                    and old["arm"] == item["arm"]
+                    and old["repeat"] == item["repeat"]
+                    and set(item["cases"]) <= set(old["cases"])
+                    and comparable(old) == comparable(item)
+                ),
+                None,
+            )
+            if previous:
+                cmd = previous["command"]
+                raw = Path(cmd[cmd.index("--output") + 1])
+                result = read_result(raw)
+                assert result["complete"], "Only complete results may be reused"
+                assert all(c["ids_validated"] for c in result["cases"])
+                reused.append(previous)
+                reused_status.append(completed[previous["name"]])
+                reused_hashes[str(raw)] = hashlib.sha256(raw.read_bytes()).hexdigest()
+            else:
+                pending.append(item)
+        plan = reused + pending
+    return plan, reused_status, reused_hashes
+
+
 def make_plans(args):
     root, binary = args.root.resolve(), args.binary.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -537,9 +700,12 @@ def make_plans(args):
                         ),
                     }
                 )
-    selected = [
-        x for x in experiments() if not args.groups or x["group"] in args.groups
-    ]
+    candidates = (
+        experiments()
+        if args.tier == "full" or args.groups
+        else representative_experiments()
+    )
+    selected = [x for x in candidates if not args.groups or x["group"] in args.groups]
     plan = []
     for repeat in range(1, args.rounds + 1):
         ordered = selected[repeat - 1 :] + selected[: repeat - 1]
@@ -579,8 +745,12 @@ def make_plans(args):
                         "command": command(opts, mode, spec["phase"], path, output),
                     }
                 )
+    plan, reused_status, reused_hashes = reuse_completed(plan, args)
     sha = hashlib.sha256(binary.read_bytes()).hexdigest()
     save(root / (tag + "-plan.json"), plan)
+    status_path = root / (tag + "-status.json")
+    assert not status_path.exists()
+    save(status_path, reused_status)
     save(root / (tag + "-preparation-plan.json"), preparation)
     if not (root / "preparation-plan.json").exists():
         save(root / "preparation-plan.json", preparation)
@@ -597,6 +767,9 @@ def make_plans(args):
             "cache_cold": "Fresh process and zero warmups; OS page-cache state not claimed cold.",
             "no_retries": True,
             "same_binary_both_modes": True,
+            "tier": args.tier,
+            "reused_completed_processes": len(reused_status),
+            "reused_raw_hashes": reused_hashes,
             "topology": "segment-mib is the legacy write-buffer argument; seal-rows creates true segments; numeric segment directories with nonempty scalar blocks are audited separately.",
             "pressure": "Warmups do not guarantee residency under pressure; cache budgets are supported public configuration values, not an RSS bound.",
             "request_scheduler": "global-prefix64-v1: minimum64 timed requests globally; every worker participates; histogram proves a deterministic complete prefix. Cold first-only requests retain worker-specific offsets.",
@@ -608,6 +781,7 @@ def make_plans(args):
         json.dumps(
             {
                 "plan": str(root / (tag + "-plan.json")),
+                "status": str(status_path),
                 "processes": len(plan),
                 "scenario_profiles": sum(len(x["cases"]) for x in selected),
             }
@@ -617,7 +791,9 @@ def make_plans(args):
 
 def run_plan(args):
     plan = json.loads(args.plan.read_text())
-    status = args.plan.with_name(args.plan.stem + "-status.json")
+    status = args.status or args.plan.with_name(
+        args.plan.stem.removesuffix("-plan") + "-status.json"
+    )
     records = json.loads(status.read_text()) if status.exists() else []
     assert [x["name"] for x in records] == [x["name"] for x in plan[: len(records)]]
     for item in plan[len(records) :]:
@@ -827,10 +1003,15 @@ if __name__ == "__main__":
     p.add_argument("--root", type=Path)
     p.add_argument("--binary", type=Path)
     p.add_argument("--tag", default="baseline")
-    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument(
+        "--tier", choices=["representative", "full"], default="representative"
+    )
+    p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--seconds", type=float, default=0.5)
     p.add_argument("--mixed-seconds", type=float, default=2)
     p.add_argument("--groups", nargs="*")
+    p.add_argument("--reuse-plan", type=Path)
+    p.add_argument("--reuse-status", type=Path)
     p.add_argument("--plan", type=Path)
     p.add_argument("--status", type=Path)
     args = p.parse_args()
