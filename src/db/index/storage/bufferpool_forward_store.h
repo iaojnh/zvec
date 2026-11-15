@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <arrow/util/span.h>
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
 #include <arrow/filesystem/filesystem.h>
@@ -59,6 +60,15 @@ class BufferPoolForwardStore
   struct FetchBlock {
     BufferPoolForwardStore *store;
     ailego::BudgetedVector<std::pair<int, int>> rows;
+    // Optional synchronous view into a caller-owned, batch-admitted row list.
+    // The caller keeps it alive until fetch_blocks returns; results own copies.
+    arrow::util::span<const std::pair<int, int>> row_view{};
+
+    arrow::util::span<const std::pair<int, int>> selected_rows() const {
+      return row_view.data() ? row_view
+                             : arrow::util::span<const std::pair<int, int>>{
+                                   rows.data(), rows.size()};
+    }
   };
   // Resident source columns only. Output buffers use the caller's workspace;
   // allocation refusal selects the normal bounded-copy fallback.

@@ -976,10 +976,25 @@ TEST_F(BufferPoolStoreTest, BatchFetchNullableListsAcrossRowGroups) {
   ASSERT_NE(gathered, nullptr);
   EXPECT_TRUE(gathered->ValidateFull().ok());
   EXPECT_TRUE(gathered->Equals(**expected));
+  using RowBuffer = ailego::BudgetedVector<std::pair<int, int>>;
+  std::vector<RowBuffer> row_owners;
+  row_owners.reserve(blocks.size());
+  for (auto &block : blocks) {
+    row_owners.push_back(std::move(block.rows));
+    const auto &owned = row_owners.back();
+    block.row_view = {owned.data(), owned.size()};
+  }
+  auto borrowed = BufferPoolForwardStore::fetch_blocks(
+      scalar_columns, blocks, rows.size(), pool.get());
+  ASSERT_NE(borrowed, nullptr);
+  EXPECT_TRUE(borrowed->Equals(**expected));
+  row_owners.clear();
   store.reset();
   ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
   EXPECT_TRUE(gathered->ValidateFull().ok());
   EXPECT_TRUE(gathered->Equals(**expected));
+  EXPECT_TRUE(borrowed->ValidateFull().ok());
+  EXPECT_TRUE(borrowed->Equals(**expected));
 }
 
 TEST_F(BufferPoolStoreTest, SelectedRowsPlanHandlesChangingColumnLayouts) {

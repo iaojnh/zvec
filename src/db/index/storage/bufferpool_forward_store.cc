@@ -871,7 +871,7 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
   for (size_t block = 0; block < blocks.size(); ++block) {
     const auto &request = blocks[block];
     if (!request.store || !request.store->validate(columns)) return nullptr;
-    for (const auto &[output, row] : request.rows) {
+    for (const auto &[output, row] : request.selected_rows()) {
       if (output < 0 || output >= row_count || seen[output] || row < 0 ||
           row >= request.store->num_rows_)
         return nullptr;
