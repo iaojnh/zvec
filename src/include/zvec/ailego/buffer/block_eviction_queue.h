@@ -616,11 +616,13 @@ class ZVEC_AILEGO_API MemoryLimitPool {
  private:
   friend struct EvictionQueueTraits;
   friend struct MemoryLimitPoolTestPeer;
+  friend struct QueueResidentSampleTestPeer;
   struct ReclaimableSlab;
   struct RetainedBlock;
   struct QueueAllocationHeader;
   struct QueueMappingHeader;
   struct QueueMemorySlab;
+  struct QueueResidentMapping;
   static ProcessRssBudget::ResidentSample read_slab_resident_sample();
   static ProcessRssBudget::ResidentSample read_background_resident_sample();
   enum class Backing { kLive, kPending, kPlan };
@@ -631,6 +633,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool drain_free_list();
   void *allocate_queue_memory(size_t bytes);
   void free_queue_memory(void *ptr);
+  void register_queue_mapping(QueueResidentMapping *mapping, void *data,
+                              size_t bytes);
+  bool unmap_queue_mapping(QueueResidentMapping *mapping);
   bool try_reserve_used(size_t bytes);
   bool try_reserve_page_used(size_t bytes, bool required = false);
   bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive,
@@ -749,6 +754,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::mutex queue_memory_mutex_;
   std::atomic<size_t> queue_allocated_size_{0};
   std::atomic<size_t> queue_charged_size_{0};
+  // All charged queue mappings, including full small-allocation slabs.
+  // Protected by queue_memory_mutex_; nodes live in their own mapping.
+  QueueResidentMapping *queue_mappings_{nullptr};
   // Only non-full slabs are linked here. Every slot retains its slab owner,
   // so a full slab can rejoin its size class on the first object release.
   std::array<QueueMemorySlab *, 4096 / alignof(std::max_align_t)>

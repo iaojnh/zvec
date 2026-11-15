@@ -181,7 +181,15 @@ struct alignas(std::max_align_t) MemoryLimitPool::QueueAllocationHeader {
   };
 };
 
+struct MemoryLimitPool::QueueResidentMapping {
+  QueueResidentMapping *previous{nullptr};
+  QueueResidentMapping *next{nullptr};
+  void *data{nullptr};
+  size_t bytes{0};
+};
+
 struct MemoryLimitPool::QueueMappingHeader {
+  QueueResidentMapping mapping;
   ProcessRssBudget::MaterializationStamp stamp{};
   QueueAllocationHeader allocation{};
 };
@@ -211,6 +219,7 @@ struct MemoryLimitPool::QueueMemorySlab {
     previous = next = nullptr;
   }
 
+  QueueResidentMapping mapping;
   QueueMemorySlab *previous{nullptr};
   QueueMemorySlab *next{nullptr};
   size_t slot_size;
@@ -227,6 +236,40 @@ void *EvictionQueueTraits::malloc(size_t bytes) {
 
 void EvictionQueueTraits::free(void *ptr) {
   MemoryLimitPool::get_instance().free_queue_memory(ptr);
+}
+
+void MemoryLimitPool::register_queue_mapping(QueueResidentMapping *mapping,
+                                            void *data, size_t bytes) {
+  mapping->data = data;
+  mapping->bytes = bytes;
+  auto *next = queue_mappings_;
+  QueueResidentMapping *previous = nullptr;
+  const auto address = reinterpret_cast<uintptr_t>(data);
+  while (next && reinterpret_cast<uintptr_t>(next->data) < address) {
+    previous = next;
+    next = next->next;
+  }
+  mapping->previous = previous;
+  mapping->next = next;
+  if (previous)
+    previous->next = mapping;
+  else
+    queue_mappings_ = mapping;
+  if (next) next->previous = mapping;
+}
+
+bool MemoryLimitPool::unmap_queue_mapping(QueueResidentMapping *mapping) {
+  auto *previous = mapping->previous;
+  auto *next = mapping->next;
+  // The directory node is inside this mapping. Save its links before unmap,
+  // and retain both registration and charge if the OS refuses the unmap.
+  if (!unmap_queue_memory(mapping->data, mapping->bytes)) return false;
+  if (previous)
+    previous->next = next;
+  else
+    queue_mappings_ = next;
+  if (next) next->previous = previous;
+  return true;
 }
 
 void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
@@ -305,6 +348,7 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
         slab->projection = ProcessRssBudget::MappingProjection::Full(
             region_bytes, process_rss_.finish_reservation(region_bytes, true));
       }
+      register_queue_mapping(&slab->mapping, raw, region_bytes);
       slab->link(queue_small_slabs_[index]);
       queue_allocated_size_.fetch_add(region_bytes, std::memory_order_relaxed);
     }
@@ -339,6 +383,7 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
   auto *mapping = new (raw) QueueMappingHeader{};
   if (charged)
     mapping->stamp = process_rss_.finish_reservation(region_bytes, true);
+  register_queue_mapping(&mapping->mapping, raw, region_bytes);
   auto *header = &mapping->allocation;
   header->bytes = region_bytes;
   header->owner = nullptr;
@@ -369,7 +414,7 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
     auto *next = slab->next;
     // Save links before unmapping; do not access any slab/header byte after
     // releasing the region. Other live neighbors always retain the charge.
-    if (!unmap_queue_memory(slab, bytes)) {
+    if (!unmap_queue_mapping(&slab->mapping)) {
       header->next_free = slab->free_head;
       slab->free_head = header;
       if (was_full) slab->link(queue_small_slabs_[index]);
@@ -389,7 +434,7 @@ void MemoryLimitPool::free_queue_memory(void *ptr) {
         offsetof(QueueMappingHeader, allocation));
     projection =
         ProcessRssBudget::MappingProjection::Full(bytes, mapping->stamp);
-    if (!unmap_queue_memory(mapping, bytes)) {
+    if (!unmap_queue_mapping(&mapping->mapping)) {
       LOG_ERROR("Failed to unmap queue allocation; backing remains charged");
       return;
     }
@@ -506,6 +551,11 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
     return {MemoryHelper::SelfRSS(), 0};
   auto unlock_retained = ScopeGuard::Make([&] {
     ::pthread_mutex_unlock(pool.retained_mutex_.native_handle());
+  });
+  if (::pthread_mutex_trylock(pool.queue_memory_mutex_.native_handle()) != 0)
+    return {MemoryHelper::SelfRSS(), 0};
+  auto unlock_queue = ScopeGuard::Make([&] {
+    ::pthread_mutex_unlock(pool.queue_memory_mutex_.native_handle());
   });
 
   // The kernel page size also remains correct in logical-page-size tests.
@@ -625,6 +675,24 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
        block = block->mapped_next) {
     uintptr_t begin = reinterpret_cast<uintptr_t>(block);
     const size_t bytes = block->bytes();
+    if (begin % native_page || bytes % native_page ||
+        bytes > std::numeric_limits<uintptr_t>::max() - begin)
+      return {MemoryHelper::SelfRSS(), 0};
+    const uintptr_t end = begin + bytes;
+    while (begin < end) {
+      const size_t count =
+          std::min<size_t>((end - begin) / native_page, entries.size());
+      if (!read_entries(begin, count)) return {MemoryHelper::SelfRSS(), 0};
+      for (size_t i = 0; i < count; ++i)
+        if (private_present(i)) resident += native_page;
+      begin += count * native_page;
+    }
+  }
+  // Queue blocks and producer metadata are charged anonymous mappings too.
+  // Their private resident pages can witness overlap; untouched slots cannot.
+  for (auto *mapping = pool.queue_mappings_; mapping; mapping = mapping->next) {
+    uintptr_t begin = reinterpret_cast<uintptr_t>(mapping->data);
+    const size_t bytes = mapping->bytes;
     if (begin % native_page || bytes % native_page ||
         bytes > std::numeric_limits<uintptr_t>::max() - begin)
       return {MemoryHelper::SelfRSS(), 0};
@@ -827,6 +895,43 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_background_resident_sampl
         else ranges[count++] = {address, bytes};
         cursor = address + bytes;
         block = block->mapped_next;
+      }
+    }
+    if (!count) break;
+    for (size_t i = 0; i < count; ++i)
+      resident += read_range(ranges[i].address, ranges[i].bytes, nullptr, page);
+  }
+  cursor = 0;
+  size_t queue_left = 0;
+  {
+    std::unique_lock<std::mutex> lock(pool.queue_memory_mutex_,
+                                     std::try_to_lock);
+    if (lock)
+      for (auto *mapping = pool.queue_mappings_; mapping;
+           mapping = mapping->next)
+        ++queue_left;
+  }
+  while (queue_left != 0) {
+    size_t count = 0;
+    {
+      std::unique_lock<std::mutex> lock(pool.queue_memory_mutex_,
+                                       std::try_to_lock);
+      if (!lock) break;
+      auto *mapping = pool.queue_mappings_;
+      while (mapping && reinterpret_cast<uintptr_t>(mapping->data) < cursor)
+        mapping = mapping->next;
+      for (size_t copied = 0; mapping && queue_left && copied < ranges.size();
+           ++copied, --queue_left) {
+        const auto address = reinterpret_cast<uintptr_t>(mapping->data);
+        if (mapping->bytes > std::numeric_limits<uintptr_t>::max() - address)
+          return {MemoryHelper::SelfRSS(), 0};
+        if (count &&
+            ranges[count - 1].address + ranges[count - 1].bytes == address)
+          ranges[count - 1].bytes += mapping->bytes;
+        else
+          ranges[count++] = {address, mapping->bytes};
+        cursor = address + mapping->bytes;
+        mapping = mapping->next;
       }
     }
     if (!count) break;
