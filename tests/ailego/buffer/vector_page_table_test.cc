@@ -62,6 +62,21 @@ using namespace zvec::ailego;
 
 namespace zvec::ailego {
 
+// Model clean-only reclaim's transition before it checks for a concurrent
+// rewrite, without sleeps or changing production thread scheduling.
+struct VectorPageTableTestPeer {
+  static bool begin_clean_reclaim(VectorPageTable &table, block_id_t id) {
+    int released = 0;
+    return table.entry_at(id).ref_count.compare_exchange_strong(
+        released, VectorPageTable::kEvictingRefCount);
+  }
+
+  static void abort_clean_reclaim(VectorPageTable &table, block_id_t id) {
+    table.entry_at(id).ref_count.store(0, std::memory_order_release);
+  }
+};
+
+
 struct VecBufferPoolTestPeer {
   static bool has_writeback_worker(const VecBufferPool &pool) {
     return pool.writeback_thread_.joinable();
@@ -4241,4 +4256,53 @@ TEST_F(BufferPoolTest, RequiredCrossPageWriteWaitsPastFirstIdleInterval) {
     EXPECT_TRUE(std::all_of(last.begin(), last.end(),
                             [](char byte) { return byte == 'X'; }));
   }
+}
+
+TEST_F(BufferPoolTest, AbortedCleanReclaimKeepsDirtyPageInEvictionQueue) {
+  init_table_pool(/*capacity_pages=*/16, /*entry_num=*/1);
+  auto &queue = BlockEvictionQueue::get_instance();
+  BlockEvictionQueue::BlockType stale;
+  while (queue.evict_single_block(stale)) {
+  }
+
+  size_t persisted = 0;
+  VectorPageTable table;
+  ASSERT_TRUE(table.init(/*entry_num=*/1));
+  char *buffer = nullptr;
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
+  std::memset(buffer, 0x5a, kVectorPageSize);
+  ASSERT_EQ(buffer, table.set_block_acquired(0, buffer, 0));
+  table.mark_dirty(0);
+  table.release_block(0);
+  table.set_flush_callback(
+      [&](block_id_t id, char *data, size_t size, size_t offset) {
+        EXPECT_EQ(0u, id);
+        EXPECT_EQ(0u, offset);
+        EXPECT_EQ(kVectorPageSize, size);
+        EXPECT_EQ(0x5a, static_cast<unsigned char>(data[0]));
+        EXPECT_EQ(0x5a, static_cast<unsigned char>(data[size - 1]));
+        ++persisted;
+        return 0;
+      });
+
+  ASSERT_TRUE(VectorPageTableTestPeer::begin_clean_reclaim(table, 0));
+  bool transitioning = true;
+  auto restore = ScopeGuard::Make([&] {
+    if (transitioning) VectorPageTableTestPeer::abort_clean_reclaim(table, 0);
+  });
+  // Foreground reclaim consumes the queue item while writeback owns the
+  // transition. A concurrent rewrite makes clean-only reclaim abandon it.
+  EXPECT_EQ(0u, queue.batch_recycle(1));
+  EXPECT_TRUE(table.is_loaded(0));
+  EXPECT_TRUE(table.is_block_dirty(0));
+  VectorPageTableTestPeer::abort_clean_reclaim(table, 0);
+  transitioning = false;
+
+  // The released page must remain reachable, persist its bytes, and refund
+  // its payload through ordinary reclaim without an explicit force-evict.
+  EXPECT_EQ(1u, queue.batch_recycle(1));
+  EXPECT_EQ(1u, persisted);
+  EXPECT_FALSE(table.is_loaded(0));
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
 }

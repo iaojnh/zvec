@@ -420,6 +420,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
                                            bool read_only = false);
 
  private:
+  friend struct VectorPageTableTestPeer;
+
   // Release/acquire publication makes initialized segment slots visible.
   std::atomic<size_t> entry_num_{0};
   std::atomic<size_t> segment_count_{0};
