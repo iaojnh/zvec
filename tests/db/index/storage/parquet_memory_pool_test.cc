@@ -142,10 +142,10 @@ TEST_F(ParquetBudgetTest, FetchScratchKeepsSmallAllocationUnderPressure) {
   FetchMemoryPool bounded(&backing, 128 * 1024);
   FetchScratchMemoryPool scratch(&bounded, true);
   EXPECT_FALSE(scratch.enabled());
-  auto small = arrow::AllocateBuffer(64, &bounded);
-  ASSERT_TRUE(small.ok()) << small.status().ToString();
+  auto small_buffer = arrow::AllocateBuffer(64, &bounded);
+  ASSERT_TRUE(small_buffer.ok()) << small_buffer.status().ToString();
   EXPECT_LE(budget_.used(), budget_.capacity());
-  small = std::unique_ptr<arrow::Buffer>{};
+  small_buffer = std::unique_ptr<arrow::Buffer>{};
   EXPECT_EQ(occupied, budget_.external_used());
 }
 
