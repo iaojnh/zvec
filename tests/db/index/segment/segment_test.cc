@@ -2752,6 +2752,16 @@ TEST_P(SegmentTest, BufferedBatchFetchPreservesBlockOrderAndOwnership) {
   ASSERT_TRUE(segment->dump().ok());
   for (int i = 0; i < 4; ++i)
     ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  // A multi-segment request can leave only one or two rows in this segment.
+  // Keep nulls, duplicate/missing IDs, and owned binary/list values intact.
+  for (const auto &small :
+       {std::vector<uint64_t>{100}, std::vector<uint64_t>{100, 101},
+        std::vector<uint64_t>{101, 100}, std::vector<uint64_t>{100, 100},
+        std::vector<uint64_t>{119, 119}, std::vector<uint64_t>{100, 119},
+        std::vector<uint64_t>{119, 999999}}) {
+    doc_ids = small;
+    check_docs(segment->fetch_docs(doc_ids, doc_columns, false));
+  }
   // At most two selected rows per persisted block exercises direct Doc
   // materialization, including duplicates, nulls and the missing-ID hole.
   doc_ids = {119, 100, 108, 100, 999999, 115};

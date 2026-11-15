@@ -1649,15 +1649,16 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       continue;
     }
 
-    // Sparse cross-block BP reads otherwise copy payloads into a gathered
-    // Arrow table and then into owned Docs. With at most two selected rows
-    // per block, use point materialization; denser batches retain shared pins
-    // and their ordinary gather path.
-    if (!options_.enable_mmap_ && !include_vector && segment_doc_ids.size() > 1) {
+    // Tiny per-segment BP batches and sparse cross-block reads otherwise
+    // gather an Arrow table only to copy it into owned Docs. Materialize
+    // directly for one/two rows, or at most two selected rows per block;
+    // denser batches retain shared pins and their ordinary gather path.
+    if (!options_.enable_mmap_ && !include_vector) {
       const auto &blocks = get_persist_block_metas(BlockType::SCALAR);
       const auto &offsets = get_persist_block_offsets(BlockType::SCALAR);
       bool cross_block = false;
-      if (!blocks.empty() && blocks.size() == offsets.size() &&
+      if (segment_doc_ids.size() > 2 && !blocks.empty() &&
+          blocks.size() == offsets.size() &&
           blocks.size() == persist_stores_.size()) {
         detail::RequestScratchArray<size_t, kMaxFetchBatchSize> row_blocks(
             segment_doc_ids.size());
@@ -1680,7 +1681,7 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
             cross_block = row_blocks[i] != row_blocks[i - 2];
         }
       }
-      if (cross_block) {
+      if (segment_doc_ids.size() <= 2 || cross_block) {
         try {
           FetchProjection direct_projection;
           if (build_fetch_projection(output_fields, direct_projection)) {
