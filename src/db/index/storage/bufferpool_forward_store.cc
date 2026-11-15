@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <optional>
 #include <type_traits>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/compute/api.h>
@@ -37,6 +38,7 @@
 #include "parquet_buffer_pool.h"
 #include "parquet_memory_pool.h"
 #include "parquet_metadata_budget.h"
+#include "request_scratch.h"
 #include "selected_rows_plan.h"
 
 
@@ -535,9 +537,9 @@ arrow::Status AppendSelectedRows(const arrow::ChunkedArray &column,
       break;
   }
   // Nested and other uncommon types keep Arrow's general append semantics.
-  ailego::BudgetedVector<arrow::ArraySpan> spans;
-  spans.reserve(column.num_chunks());
-  for (const auto &chunk : column.chunks()) spans.emplace_back(*chunk->data());
+  detail::RequestScratchArray<arrow::ArraySpan, 4> spans(column.num_chunks());
+  for (int i = 0; i < column.num_chunks(); ++i)
+    spans[i] = arrow::ArraySpan(*column.chunk(i)->data());
   return plan.visit<arrow::Array>(
       column, [&](const arrow::Array &, int64_t row, int chunk) {
         return builder->AppendArraySlice(spans[chunk], row, 1);
@@ -818,7 +820,7 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
   std::map<GroupKey, detail::SelectedRowsPlan::Rows, std::less<GroupKey>,
            ailego::BudgetedAllocator<Entry>>
       groups;
-  ailego::BudgetedVector<uint8_t> seen(row_count, 0);
+  detail::RequestScratchArray<uint8_t, 64> seen(row_count);
   size_t selected_rows = 0;
   for (size_t block = 0; block < blocks.size(); ++block) {
     const auto &request = blocks[block];
@@ -835,10 +837,9 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
     }
   }
   if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
-  ailego::BudgetedVector<ParquetBufferID> identities;
-  identities.reserve(blocks.size());
-  for (const auto &block : blocks)
-    identities.push_back(block.store->metadata_id_.for_column(0, 0));
+  detail::RequestScratchArray<ParquetBufferID, 4> identities(blocks.size());
+  for (size_t i = 0; i < blocks.size(); ++i)
+    identities[i] = blocks[i].store->metadata_id_.for_column(0, 0);
   detail::SelectedRowsPlan::Rows selected(row_count);
   int64_t offset = 0;
   for (const auto &[key, rows] : groups) {
@@ -854,8 +855,9 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
         blocks.front().store->physic_schema_->GetFieldByName(name);
     if (!field) return nullptr;
     arrow::ArrayVector chunks;
-    ailego::BudgetedVector<ParquetBufferContextHandle> pins;
-    pins.reserve(groups.size());
+    detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 4> pins(
+        groups.size());
+    size_t pin = 0;
     for (const auto &[key, rows] : groups) {
       auto *store = blocks[key.first].store;
       const int column = store->physic_schema_->GetFieldIndex(name);
@@ -865,8 +867,8 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
       auto &id = identities[key.first];
       id.column = column;
       id.row_group = key.second;
-      pins.push_back(ParquetBufferPool::get_instance().try_acquire_buffer(id));
-      const auto *borrowed = pins.back().borrowed_data();
+      pins[pin].emplace(ParquetBufferPool::get_instance().try_acquire_buffer(id));
+      const auto *borrowed = pins[pin++]->borrowed_data();
       if (!borrowed ||
           borrowed->length() != store->row_group_row_nums_[key.second])
         return nullptr;
@@ -1190,8 +1192,7 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
       columns[0] != GLOBAL_DOC_ID || columns[1] != USER_ID) {
     return nullptr;
   }
-  ailego::BudgetedVector<int> selected;
-  selected.reserve(columns.size());
+  detail::RequestScratchArray<int, 16> selected(columns.size());
   for (size_t i = 0; i < columns.size(); ++i) {
     const int column = physic_schema_->GetFieldIndex(columns[i]);
     if (column < 0 || schema->field(i)->name() != columns[i] ||
@@ -1212,14 +1213,14 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
     } else if (!SupportsDirectDocValues(type)) {
       return nullptr;
     }
-    selected.push_back(column);
+    selected[i] = column;
   }
   const int group = find_row_group_for_row(index);
   const int64_t local_row = index - get_row_group_offset(group);
-  ailego::BudgetedVector<ParquetBufferContextHandle> pins;
-  ailego::BudgetedVector<std::pair<const arrow::Array *, int64_t>> source_rows;
-  pins.reserve(selected.size());
-  source_rows.reserve(selected.size());
+  detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 16> pins(
+      selected.size());
+  detail::RequestScratchArray<std::pair<const arrow::Array *, int64_t>, 16>
+      source_rows(selected.size());
   detail::QueryResultEstimate estimate;
   estimate.add(sizeof(Doc) + 256);
   auto key = metadata_id_.for_column(0, group);
@@ -1232,8 +1233,8 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
       // the bounded scalar path if those columns cannot coexist in cache.
       return nullptr;
     }
-    pins.push_back(std::move(acquired).ValueOrDie());
-    const auto *column = pins.back().borrowed_data();
+    pins[i].emplace(std::move(acquired).ValueOrDie());
+    const auto *column = pins[i]->borrowed_data();
     if (!column) return nullptr;
     int64_t row = local_row;
     const arrow::Array *array = nullptr;
@@ -1247,7 +1248,7 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
     if (!array || (i < 2 && array->IsNull(row))) return nullptr;
     estimate.add(192 + columns[i].size() * 2);
     estimate.value(*array, row);
-    source_rows.emplace_back(array, row);
+    source_rows[i] = {array, row};
   }
   // Match Segment's result-copy admission before allocating any Doc fields.
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(

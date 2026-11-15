@@ -41,8 +41,10 @@ class ParquetMemoryPool final : public arrow::MemoryPool {
 
   explicit ParquetMemoryPool(
       arrow::MemoryPool *small_pool = arrow::default_memory_pool(),
-      bool enforce_budget = false)
-      : small_pool_(small_pool), enforce_budget_(enforce_budget) {}
+      bool enforce_budget = false, bool reuse_medium_buffers = false)
+      : small_pool_(small_pool),
+        enforce_budget_(enforce_budget),
+        reuse_medium_buffers_(reuse_medium_buffers) {}
 
   using arrow::MemoryPool::Allocate;
   using arrow::MemoryPool::Free;
@@ -97,21 +99,27 @@ class ParquetMemoryPool final : public arrow::MemoryPool {
   static constexpr size_t kSmallClasses = 7;  // 128 through 8192 bytes
   arrow::Status allocate_small(int64_t size, int64_t alignment, uint8_t **out);
   void free_small(uint8_t *buffer);
+  void release_small_chunk(SmallChunk *chunk, void *slot);
 
   arrow::MemoryPool *small_pool_;
   const bool enforce_budget_;
+  const bool reuse_medium_buffers_;
   arrow::internal::MemoryPoolStats stats_;
   std::atomic<int64_t> mapped_bytes_{0};
   std::atomic<int64_t> num_mapped_allocations_{0};
   std::atomic<int64_t> total_mapped_bytes_allocated_{0};
   std::atomic<size_t> charged_bytes_{0};
-  std::mutex small_mutex_;
+  std::array<std::mutex, kSmallClasses> small_mutexes_;
   std::array<SmallChunk *, kSmallClasses> small_chunks_{};
 };
 
 // Cached Arrow buffers retain this owner because Arrow stores a raw pool
 // pointer. Do not replace the shared owner with a loader-local pool.
 std::shared_ptr<ParquetMemoryPool> GetParquetMemoryPool();
+
+// Query temporaries may reuse medium backing with ample budget headroom.
+// Both pools share an owner so existing cache/reader owners retain them.
+std::shared_ptr<ParquetMemoryPool> GetParquetQueryMemoryPool();
 
 // ColumnChunkReader accepts top-level fields, but the streaming reader takes
 // physical leaf indices. Expand nested fields without dropping their children.

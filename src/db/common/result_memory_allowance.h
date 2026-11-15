@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <limits>
 #include <memory>
@@ -205,10 +206,12 @@ class ResultMemoryAllowance {
 
   size_t active_bytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    drain_releases();
     return active_;
   }
   size_t reserved_bytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    drain_releases();
     return reservation_.bytes();
   }
 
@@ -217,6 +220,7 @@ class ResultMemoryAllowance {
     // cache reclamation to make progress.
     std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
     if (!lock) return;
+    drain_releases();
     // Reclaim unused high water even while a small result is alive. Otherwise
     // that result can pin a previous large request's entire planning allowance
     // and prevent mandatory index metadata from being admitted.
@@ -245,6 +249,10 @@ class ResultMemoryAllowance {
   bool acquire(size_t bytes, size_t backing_quantum, size_t materialization,
                PendingCopy *pending, size_t retained_copy) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Refund completed owners before admitting another result. Releases that
+    // race this snapshot only leave a conservative overestimate until the
+    // next admission or idle reclaim.
+    drain_releases();
     auto &pool = ailego::MemoryLimitPool::get_instance();
     const size_t capacity = pool.capacity();
     if (!capacity) return false;
@@ -302,28 +310,49 @@ class ResultMemoryAllowance {
   }
 
   void release_active(size_t bytes, size_t native, size_t copy) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    assert(active_ >= bytes);
-    active_ -= bytes;
-    assert(native_active_ >= native);
-    native_active_ -= native;
-    assert(copy_active_ >= copy);
-    copy_active_ -= copy;
+    // Retained high water does not shrink on ordinary destruction. Publish
+    // refunds without contending with admissions or other result destructors.
+    // Publish native/copy refunds first: draining active bytes first under
+    // mutex_ must never leave an already-refunded owner in those subcounts.
+    if (native) released_native_.fetch_add(native, std::memory_order_relaxed);
+    if (copy) released_copy_.fetch_add(copy, std::memory_order_relaxed);
+    released_bytes_.fetch_add(bytes, std::memory_order_release);
     // Normally keep the high water for reuse. Under process pressure an
     // entirely idle result allowance must yield to mandatory I/O and decode.
     // Retained heap pages still count in the process's measured RSS.
     auto &pool = ailego::MemoryLimitPool::get_instance();
-    if (!active_ && !copy_active_ && pool.process_rss_limit() &&
-        pool.under_process_rss_pressure())
-      reservation_.retain_at_most(0);
+    if (pool.process_rss_limit() && pool.under_process_rss_pressure()) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      drain_releases();
+      if (!active_ && !copy_active_) reservation_.retain_at_most(0);
+    }
+  }
+
+  // Requires mutex_. Reading active refunds before the subcounts pairs with
+  // release_active's publication order. Incomplete concurrent publications
+  // retain excess active quota instead of making admission optimistic.
+  void drain_releases() const {
+    const size_t bytes =
+        released_bytes_.exchange(0, std::memory_order_acq_rel);
+    const size_t native =
+        released_native_.exchange(0, std::memory_order_acq_rel);
+    const size_t copy = released_copy_.exchange(0, std::memory_order_acq_rel);
+    assert(active_ >= bytes && native_active_ >= native &&
+           copy_active_ >= copy);
+    active_ -= bytes;
+    native_active_ -= native;
+    copy_active_ -= copy;
   }
 
   mutable std::mutex mutex_;
   std::mutex materialization_mutex_;
   BackingReservation reservation_;
-  size_t active_{0};
-  size_t native_active_{0};
-  size_t copy_active_{0};
+  mutable size_t active_{0};
+  mutable size_t native_active_{0};
+  mutable size_t copy_active_{0};
+  mutable std::atomic<size_t> released_bytes_{0};
+  mutable std::atomic<size_t> released_native_{0};
+  mutable std::atomic<size_t> released_copy_{0};
   size_t backing_quantum_{1};
 };
 

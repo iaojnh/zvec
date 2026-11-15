@@ -41,6 +41,8 @@ namespace {
 
 constexpr int64_t kMinimumAlignment = 64;
 constexpr size_t kSmallChunkBytes = 64 * 1024;
+constexpr int64_t kReusableMediumBytes = 2 * 1024 * 1024;
+constexpr size_t kMediumReuseMinimumBudget = 128 * 1024 * 1024;
 
 arrow::Status RefusedBacking(const char *operation, size_t requested) {
   auto &budget = ailego::MemoryLimitPool::get_instance();
@@ -148,7 +150,7 @@ struct alignas(64) ParquetMemoryPool::SmallChunk {
   void *free_head{nullptr};
   size_t stride{0};
   size_t next_slot{0};
-  size_t live_slots{0};
+  size_t live_slots{0};  // Includes allocations awaiting RSS admission.
 };
 
 arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
@@ -189,11 +191,12 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
   constexpr size_t payload =
       kSmallChunkBytes - ailego::MemoryLimitPool::kRetainedBlockHeaderBytes;
   const size_t slots = (payload - sizeof(SmallChunk)) / stride;
-  std::unique_lock<std::mutex> lock(small_mutex_);
+  std::unique_lock<std::mutex> lock(small_mutexes_[index]);
   auto *chunk = small_chunks_[index];
-  while (chunk && !chunk->free_head && chunk->next_slot == slots) {
+  while (chunk && chunk->live_slots == slots) {
     chunk = chunk->next;
   }
+  const bool reused_chunk = chunk != nullptr;
   if (!chunk) {
     // Admission may evict a cached Arrow array and reenter free_small().
     lock.unlock();
@@ -207,17 +210,33 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
     lock.lock();
     chunk->next = small_chunks_[index];
     small_chunks_[index] = chunk;
-  } else if (!budget.try_materialize_retained_block(chunk)) {
+  }
+  // Reserve a slot and keep the backing alive before dropping the directory
+  // lock. RSS admission can contend with other allocators, so it must not
+  // serialize allocations or frees in this size class. Do not touch the slot
+  // or its free-list link until admission succeeds.
+  ++chunk->live_slots;
+  lock.unlock();
+  bool admitted = !reused_chunk;
+  try {
+    if (reused_chunk) admitted = budget.try_materialize_retained_block(chunk);
+  } catch (...) {
+    release_small_chunk(chunk, nullptr);
+    throw;
+  }
+  if (!admitted) {
+    release_small_chunk(chunk, nullptr);
     return arrow::Status::OutOfMemory(
         "Parquet small slot exceeds RSS headroom");
   }
+  lock.lock();
   void *slot = chunk->free_head;
   if (slot) {
     chunk->free_head = *static_cast<void **>(slot);
   } else {
     slot = reinterpret_cast<char *>(chunk + 1) + chunk->next_slot++ * stride;
   }
-  ++chunk->live_slots;
+  lock.unlock();
   *out = static_cast<uint8_t *>(slot) + kMinimumAlignment;
   new (*out - sizeof(MappingHeader))
       MappingHeader{chunk, 0, 0, BackingKind::SmallChunk};
@@ -235,18 +254,24 @@ void ParquetMemoryPool::free_small(uint8_t *buffer) {
   }
   assert(header.kind == BackingKind::SmallChunk);
   auto *chunk = static_cast<SmallChunk *>(header.base);
-  std::unique_lock<std::mutex> lock(small_mutex_);
-  void *slot = buffer - kMinimumAlignment;
-  new (slot) void *(chunk->free_head);
-  chunk->free_head = slot;
-  if (--chunk->live_slots != 0) return;
+  release_small_chunk(chunk, buffer - kMinimumAlignment);
+}
+
+void ParquetMemoryPool::release_small_chunk(SmallChunk *chunk, void *slot) {
   size_t index = 0;
   for (size_t stride = 128; stride < chunk->stride; stride *= 2) ++index;
+  std::unique_lock<std::mutex> lock(small_mutexes_[index]);
+  if (slot) {
+    new (slot) void *(chunk->free_head);
+    chunk->free_head = slot;
+  }
+  assert(chunk->live_slots != 0);
+  if (--chunk->live_slots != 0) return;
   auto **link = &small_chunks_[index];
   while (*link != chunk) link = &(*link)->next;
   *link = chunk->next;
   lock.unlock();
-  budget.release_retained_block(chunk);
+  ailego::MemoryLimitPool::get_instance().release_retained_block(chunk);
   charged_bytes_.fetch_sub(kSmallChunkBytes, std::memory_order_relaxed);
   // The global pool keeps idle backing committed until reuse or unmapping.
 }
@@ -259,7 +284,15 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
   ARROW_RETURN_NOT_OK(ValidateRequest(size, alignment));
   alignment = std::max(alignment, kMinimumAlignment);
   auto &budget = ailego::MemoryLimitPool::get_instance();
-  if (size < kMappedAllocationThreshold) {
+  // Keep cold decoding and tight budgets on the original mapping path.
+  // Reused query buffers remain charged through the shared retained-block
+  // pool, including page rounding, refault admission and idle reclamation.
+  const bool reuse_medium =
+      reuse_medium_buffers_ && enforce_budget_ &&
+      size >= kMappedAllocationThreshold && size <= kReusableMediumBytes &&
+      budget.capacity() >= kMediumReuseMinimumBudget &&
+      budget.available() >= 4 * static_cast<size_t>(size);
+  if (size < kMappedAllocationThreshold || reuse_medium) {
     // Arrow requires a non-null data address even for empty binary/string
     // buffers. Let its allocator provide and own the zero-size sentinel.
     if (!enforce_budget_ || size == 0) {
@@ -336,6 +369,13 @@ std::optional<arrow::Status> ParquetMemoryPool::try_reallocate_in_place(
       reinterpret_cast<uintptr_t>(*ptr) % alignment == 0) {
     auto *header =
         reinterpret_cast<MappingHeader *>(*ptr - sizeof(MappingHeader));
+    if (reuse_medium_buffers_ && header->kind == BackingKind::Retained &&
+        header->charged >= static_cast<size_t>(kMappedAllocationThreshold)) {
+      // Keep the entire admitted backing until Free. A query shrink must
+      // still succeed when pressure prevents allocating a second buffer.
+      stats_.DidReallocateBytes(old_size, new_size);
+      return arrow::Status::OK();
+    }
     // An allocation made before budgeting was enabled needs fresh admission.
     if (header->kind == BackingKind::Mapping &&
         !(enforce_budget_ && budget.capacity() && !header->charged)) {
@@ -434,10 +474,26 @@ void ParquetMemoryPool::Free(uint8_t *buffer, int64_t size, int64_t alignment) {
   stats_.DidFreeBytes(size);
 }
 
+namespace {
+struct ParquetPools {
+  ParquetMemoryPool cache{arrow::default_memory_pool(), true};
+  ParquetMemoryPool query{arrow::default_memory_pool(), true, true};
+};
+
+const std::shared_ptr<ParquetPools> &SharedParquetPools() {
+  static const auto owner = std::make_shared<ParquetPools>();
+  return owner;
+}
+}  // namespace
+
 std::shared_ptr<ParquetMemoryPool> GetParquetMemoryPool() {
-  static auto pool = std::make_shared<ParquetMemoryPool>(
-      arrow::default_memory_pool(), /*enforce_budget=*/true);
-  return pool;
+  const auto &owner = SharedParquetPools();
+  return std::shared_ptr<ParquetMemoryPool>(owner, &owner->cache);
+}
+
+std::shared_ptr<ParquetMemoryPool> GetParquetQueryMemoryPool() {
+  const auto &owner = SharedParquetPools();
+  return std::shared_ptr<ParquetMemoryPool>(owner, &owner->query);
 }
 
 int64_t ParquetDecodeBatchRows(const parquet::FileMetaData &metadata,
