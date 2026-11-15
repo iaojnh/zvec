@@ -2038,3 +2038,25 @@ TEST_F(BufferPoolStoreTest, ResidentScanMissDoesNotDecodeOrConsumeRows) {
     EXPECT_TRUE(ready->Equals(*batch));
   }
 }
+
+TEST_F(BufferPoolStoreTest, FixedListCopyEstimateKeepsNullAndSliceAllowances) {
+  auto values = std::make_shared<arrow::Int32Builder>();
+  arrow::ListBuilder lists(arrow::default_memory_pool(), values);
+  ASSERT_TRUE(lists.Append().ok());
+  ASSERT_TRUE(values->AppendValues(std::vector<int32_t>(512, 7)).ok());
+  ASSERT_TRUE(lists.AppendNull().ok());
+  ASSERT_TRUE(lists.Append().ok());
+  ASSERT_TRUE(values->Append(1).ok());
+  ASSERT_TRUE(values->AppendNull().ok());
+  ASSERT_TRUE(values->Append(-3).ok());
+  ASSERT_TRUE(lists.Append().ok());
+  auto array = lists.Finish().ValueOrDie();
+  auto batch = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("tags", array->type())}), 4, {array});
+  ASSERT_TRUE(batch->ValidateFull().ok());
+  const size_t per_row = sizeof(Doc) + 256 + 192 + 4 * 2;
+  EXPECT_EQ(per_row * 4 + 64 * 3 + 32 * 515,
+            detail::EstimateQueryResult(*batch));
+  EXPECT_EQ(per_row * 2 + 64 + 32 * 3,
+            detail::EstimateQueryResult(*batch->Slice(1, 2)));
+}

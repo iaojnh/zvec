@@ -94,7 +94,34 @@ inline size_t EstimateQueryResult(const arrow::RecordBatch &batch) {
             binary.value_offset(array.length()) - binary.value_offset(0)));
         continue;
       }
-    } else if (type != arrow::Type::LIST && type != arrow::Type::STRUCT) {
+    } else if (type == arrow::Type::LIST) {
+      const auto &list = static_cast<const arrow::ListArray &>(array);
+      bool fixed_elements = false;
+      switch (list.value_type()->id()) {
+        case arrow::Type::BOOL:
+        case arrow::Type::INT32:
+        case arrow::Type::INT64:
+        case arrow::Type::UINT32:
+        case arrow::Type::UINT64:
+        case arrow::Type::FLOAT:
+        case arrow::Type::DOUBLE:
+          fixed_elements = true;
+          break;
+        default:
+          break;
+      }
+      if (fixed_elements) {
+        // Preserve the list-container and per-element allowance, including
+        // null child slots. Fixed-width children have no extra payload to
+        // charge, so walking every element again adds no information.
+        for (int64_t row = 0; row < batch.num_rows(); ++row) {
+          if (list.IsNull(row)) continue;
+          estimate.add(64);
+          estimate.add(32, static_cast<size_t>(list.value_length(row)));
+        }
+        continue;
+      }
+    } else if (type != arrow::Type::STRUCT) {
       // These values have no separate payload in Doc::Value. Their fixed
       // charge above is unchanged; no per-row estimate walk is necessary.
       continue;
