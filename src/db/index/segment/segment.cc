@@ -1640,6 +1640,64 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       continue;
     }
 
+    // Sparse cross-block BP reads otherwise copy payloads into a gathered
+    // Arrow table and then into owned Docs. With at most two selected rows
+    // per block, use point materialization; denser batches retain shared pins
+    // and their ordinary gather path.
+    if (!options_.enable_mmap_ && !include_vector && segment_doc_ids.size() > 1) {
+      const auto &blocks = get_persist_block_metas(BlockType::SCALAR);
+      const auto &offsets = get_persist_block_offsets(BlockType::SCALAR);
+      bool cross_block = false;
+      if (!blocks.empty() && blocks.size() == offsets.size() &&
+          blocks.size() == persist_stores_.size()) {
+        detail::RequestScratchArray<size_t, kMaxFetchBatchSize> row_blocks(
+            segment_doc_ids.size());
+        const int64_t persisted_end = offsets.back() + blocks.back().doc_count_;
+        bool persisted = true;
+        for (size_t i = 0; i < segment_doc_ids.size(); ++i) {
+          const int row = segment_doc_ids[i];
+          if (row < 0 || row < offsets.front() || row >= persisted_end) {
+            persisted = false;
+            break;
+          }
+          row_blocks[i] =
+              std::upper_bound(offsets.begin(), offsets.end(), row) -
+              offsets.begin() - 1;
+        }
+        if (persisted) {
+          std::sort(row_blocks.begin(), row_blocks.end());
+          cross_block = row_blocks[0] != row_blocks[row_blocks.size() - 1];
+          for (size_t i = 2; cross_block && i < row_blocks.size(); ++i)
+            cross_block = row_blocks[i] != row_blocks[i - 2];
+        }
+      }
+      if (cross_block) {
+        try {
+          FetchProjection direct_projection;
+          if (build_fetch_projection(output_fields, direct_projection)) {
+            std::vector<Doc::Ptr> direct_docs;
+            direct_docs.reserve(segment_doc_ids.size());
+            for (size_t row = 0; row < segment_doc_ids.size(); ++row) {
+              auto doc = fetch_direct_doc_unsafe(
+                  direct_projection.columns, direct_projection.schema,
+                  segment_doc_ids[row], g_doc_ids[output_positions[row]]);
+              if (!doc) break;
+              direct_docs.push_back(std::move(doc));
+            }
+            if (direct_docs.size() == segment_doc_ids.size()) {
+              for (size_t row = 0; row < direct_docs.size(); ++row)
+                docs[output_positions[row]] = std::move(direct_docs[row]);
+              begin = end;
+              continue;
+            }
+          }
+        } catch (const std::bad_alloc &) {
+          // Release every provisional Doc and its admission before the
+          // existing bounded gather/fallback path retries the batch.
+        }
+      }
+    }
+
     // Bound all temporary result arrays across columns, including the copy
     // during reordering. Actual allocations still go through the shared pool.
     // A single oversized document cannot be split; shared admission remains

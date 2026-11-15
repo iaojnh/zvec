@@ -2685,6 +2685,41 @@ TEST_P(SegmentTest, BufferedBatchFetchPreservesBlockOrderAndOwnership) {
   }
   const std::vector<std::string> columns{"items", LOCAL_ROW_ID,  USER_ID,
                                          "bytes", GLOBAL_DOC_ID, "text"};
+  // Exercise the Doc API as well as the Arrow-table API. The request spans
+  // blocks, preserves duplicate/missing IDs, and crosses the batch boundary.
+  std::vector<uint64_t> doc_ids;
+  for (int row = 0; row < 70; ++row) doc_ids.push_back(100 + row * 7 % 20);
+  doc_ids.insert(doc_ids.begin() + 4, 999999);
+  auto check_docs = [&](const std::vector<Doc::Ptr> &docs) {
+    ASSERT_EQ(docs.size(), doc_ids.size());
+    for (size_t i = 0; i < docs.size(); ++i) {
+      if (doc_ids[i] == 999999) {
+        EXPECT_EQ(docs[i], nullptr);
+        continue;
+      }
+      ASSERT_NE(docs[i], nullptr);
+      const int row = static_cast<int>(doc_ids[i] - 100);
+      EXPECT_EQ(docs[i]->doc_id(), doc_ids[i]);
+      EXPECT_EQ(docs[i]->pk(), "row-" + std::to_string(row));
+      EXPECT_EQ(docs[i]->get<std::string>("bytes"),
+                std::string("\0\xff", 2) + std::string(row * 19, 'a' + row));
+      if (row % 3 == 0) {
+        EXPECT_FALSE(docs[i]->get<std::string>("text").has_value());
+        EXPECT_FALSE(docs[i]->get<std::vector<int32_t>>("items").has_value());
+      } else {
+        EXPECT_EQ(docs[i]->get<std::string>("text"),
+                  std::string(row * 37, 'a' + row));
+        EXPECT_EQ(docs[i]->get<std::vector<int32_t>>("items"),
+                  (std::vector<int32_t>{row, -row}));
+      }
+      if (!options_.enable_mmap_)
+        EXPECT_TRUE(detail::DocumentMemoryAccess::budgeted(*docs[i]));
+    }
+  };
+  const std::vector<std::string> doc_columns{"text", "items", "bytes"};
+  // The mutable tail keeps the ordinary bounded fallback.
+  check_docs(segment->fetch_docs(doc_ids, doc_columns, false));
+  std::vector<Doc::Ptr> retained_docs;
   TablePtr retained;
   for (const std::vector<int> rows :
        {std::vector<int>{0, 2, 7, 8, 9, 14, 15, 16, 19},
@@ -2709,6 +2744,15 @@ TEST_P(SegmentTest, BufferedBatchFetchPreservesBlockOrderAndOwnership) {
     retained = std::move(result);
   }
   ASSERT_TRUE(segment->dump().ok());
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  // At most two selected rows per persisted block exercises direct Doc
+  // materialization, including duplicates, nulls and the missing-ID hole.
+  doc_ids = {119, 100, 108, 100, 999999, 115};
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    retained_docs = segment->fetch_docs(doc_ids, doc_columns, false);
+    check_docs(retained_docs);
+  }
   std::vector<int> repeated_rows;
   for (int row = 0; row < 70; ++row) repeated_rows.push_back(row * 7 % 20);
   // Cover budgeted routing overflow and both cold and resident multi-block
@@ -2730,6 +2774,7 @@ TEST_P(SegmentTest, BufferedBatchFetchPreservesBlockOrderAndOwnership) {
   for (int i = 0; i < 4; ++i) {
     ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
   }
+  check_docs(retained_docs);
   ASSERT_TRUE(retained->ValidateFull().ok());
   const std::vector<int> rows{7, 2, 0, 7};
   for (size_t row = 0; row < rows.size(); ++row) {
