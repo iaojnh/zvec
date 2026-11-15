@@ -16,11 +16,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 #include <arrow/array.h>
 #include <arrow/chunked_array.h>
 #include <arrow/status.h>
+#include "request_scratch.h"
 
 namespace zvec::detail {
 
@@ -33,24 +35,33 @@ class SelectedRowsPlan {
   explicit SelectedRowsPlan(const Rows &rows) : rows_(rows) {}
   SelectedRowsPlan(Rows &&) = delete;
 
+  size_t size() const noexcept {
+    return rows_.size();
+  }
+
   arrow::Status prepare(const arrow::ChunkedArray &column) {
     bool matches =
         ready_ &&
-        offsets_.size() == static_cast<size_t>(column.num_chunks()) + 1 &&
-        offsets_.back() == column.length();
+        offset_count_ == static_cast<size_t>(column.num_chunks()) + 1 &&
+        (*offsets_)[offset_count_ - 1] == column.length();
     for (int i = 0; matches && i < column.num_chunks(); ++i) {
-      matches = offsets_[i + 1] - offsets_[i] == column.chunk(i)->length();
+      matches =
+          (*offsets_)[i + 1] - (*offsets_)[i] == column.chunk(i)->length();
     }
     if (matches) return arrow::Status::OK();
 
     ready_ = false;
-    offsets_.resize(column.num_chunks() + 1);
-    offsets_[0] = 0;
+    offset_count_ = static_cast<size_t>(column.num_chunks()) + 1;
+    if (!offsets_ || offsets_->size() < offset_count_)
+      offsets_.emplace(offset_count_);
+    auto &offsets = *offsets_;
+    offsets[0] = 0;
     for (int i = 0; i < column.num_chunks(); ++i) {
-      offsets_[i + 1] = offsets_[i] + column.chunk(i)->length();
+      offsets[i + 1] = offsets[i] + column.chunk(i)->length();
     }
-    positions_.clear();
-    if (column.num_chunks() != 1) positions_.reserve(rows_.size());
+    if (column.num_chunks() != 1 && !positions_)
+      positions_.emplace(rows_.size());
+    size_t position = 0;
     for (const auto &row : rows_) {
       if (row.second >= static_cast<uint64_t>(column.length())) {
         return arrow::Status::IndexError("Selected row exceeds cached column");
@@ -58,9 +69,10 @@ class SelectedRowsPlan {
       if (column.num_chunks() != 1) {
         const int64_t index = static_cast<int64_t>(row.second);
         const int chunk =
-            std::upper_bound(offsets_.begin(), offsets_.end(), index) -
-            offsets_.begin() - 1;
-        positions_.push_back({chunk, index - offsets_[chunk]});
+            std::upper_bound(offsets.begin(), offsets.begin() + offset_count_,
+                             index) -
+            offsets.begin() - 1;
+        (*positions_)[position++] = {chunk, index - offsets[chunk]};
       }
     }
     ready_ = true;
@@ -82,7 +94,7 @@ class SelectedRowsPlan {
     } else {
       int last_chunk = -1;
       const ArrayType *array = nullptr;
-      for (const auto &position : positions_) {
+      for (const auto &position : *positions_) {
         if (position.chunk != last_chunk) {
           array = static_cast<const ArrayType *>(
               column.chunk(position.chunk).get());
@@ -101,8 +113,9 @@ class SelectedRowsPlan {
   };
 
   const Rows &rows_;
-  std::vector<int64_t> offsets_;
-  std::vector<Position> positions_;
+  std::optional<RequestScratchArray<int64_t, 8>> offsets_;
+  std::optional<RequestScratchArray<Position, 64>> positions_;
+  size_t offset_count_{0};
   bool ready_ = false;
 };
 

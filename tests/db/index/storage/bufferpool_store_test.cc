@@ -290,6 +290,26 @@ TEST_F(BufferPoolStoreTest, BatchFetchNullableListsAcrossRowGroups) {
       }
     }
   }
+  // Exercise the resident routing spill with duplicate rows and more than
+  // 64 distinct block/row-group keys; the expected gather also checks NULLs.
+  std::vector<int> rows;
+  std::vector<BufferPoolForwardStore::FetchBlock> blocks(67);
+  for (auto &block : blocks) block.store = store.get();
+  for (int output = 0; output < 70; ++output) {
+    const int row = output * 7 % 12;
+    rows.push_back(row);
+    blocks[output % blocks.size()].rows.emplace_back(output, row);
+  }
+  auto expected = store->fetch(scalar_columns, rows);
+  ASSERT_NE(expected, nullptr);
+  auto gathered =
+      BufferPoolForwardStore::fetch_blocks(scalar_columns, blocks, rows.size());
+  ASSERT_NE(gathered, nullptr);
+  EXPECT_TRUE(gathered->ValidateFull().ok());
+  EXPECT_TRUE(gathered->Equals(*expected));
+  store.reset();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  EXPECT_TRUE(gathered->Equals(*expected));
 }
 
 TEST_F(BufferPoolStoreTest, SelectedRowsPlanHandlesChangingColumnLayouts) {
@@ -1897,4 +1917,54 @@ TEST_F(BufferPoolStoreTest, ScanNullableNestedColumnsAndRepeatedEOF) {
     ASSERT_TRUE(reader.ReadNext(&batch).ok());
     EXPECT_EQ(batch, nullptr);
   }
+}
+
+TEST_F(BufferPoolStoreTest, ResidentPinDoesNotDecodeColdColumns) {
+  auto opened = arrow::io::ReadableFile::Open(parquet_path);
+  ASSERT_TRUE(opened.ok());
+  auto context = ParquetFileContext::make(parquet_path, *opened);
+  ASSERT_TRUE(context.ok());
+  auto id = (*context)->buffer_id;
+  id.column = 0;
+  auto &cache = ParquetBufferPool::get_instance();
+  const auto before = ailego::MemoryLimitPool::get_instance().used();
+  auto cold = cache.try_acquire_buffer(id);
+  EXPECT_EQ(nullptr, cold.borrowed_data());
+  EXPECT_EQ(before, ailego::MemoryLimitPool::get_instance().used());
+  auto loaded = cache.acquire_buffer(id);
+  ASSERT_NE(nullptr, loaded.borrowed_data());
+  auto warm = cache.try_acquire_buffer(id);
+  EXPECT_EQ(loaded.borrowed_data(), warm.borrowed_data());
+}
+
+TEST_F(BufferPoolStoreTest, ConcurrentDocReadersSurviveCacheReclamation) {
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> columns{GLOBAL_DOC_ID, USER_ID, "name"};
+  auto schema = arrow::schema(SelectFields(store->physic_schema(), columns));
+  auto expected = store->fetch_doc(columns, schema, 0);
+  ASSERT_NE(expected, nullptr);
+  const auto expected_name = expected->get<std::string>("name");
+  std::atomic<bool> start{false};
+  std::atomic<int> failures{0};
+  std::vector<std::thread> readers;
+  for (int thread = 0; thread < 8; ++thread) {
+    readers.emplace_back([&]() {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (int repeat = 0; repeat < 200; ++repeat) {
+        auto doc = store->fetch_doc(columns, schema, 0);
+        if (!doc || doc->doc_id() != expected->doc_id() ||
+            doc->pk() != expected->pk() ||
+            doc->get<std::string>("name") != expected_name)
+          failures.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (int repeat = 0; repeat < 32; ++repeat)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  for (auto &reader : readers) reader.join();
+  EXPECT_EQ(0, failures.load());
+  store.reset();
+  EXPECT_EQ(expected_name, expected->get<std::string>("name"));
 }

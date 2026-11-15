@@ -32,7 +32,7 @@ namespace zvec {
 namespace ailego {
 
 template <typename Key, typename Payload, typename Loader, typename Hash,
-          typename Equal>
+          typename Equal, typename Mutex = std::shared_mutex>
 class ExternalCache : public EvictableBlockOwner {
  public:
   using Value = typename Loader::Value;
@@ -53,7 +53,7 @@ class ExternalCache : public EvictableBlockOwner {
 
   ~ExternalCache() override {
     BlockEvictionQueue::get_instance().set_invalid(this);
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<Mutex> lock(mutex_);
     for (auto &item : table_) {
       Entry &entry = item.second;
       if (entry.size != 0) {
@@ -71,7 +71,7 @@ class ExternalCache : public EvictableBlockOwner {
 
   Value acquire(const Key &key) {
     {
-      std::shared_lock<std::shared_mutex> lock(mutex_);
+      std::shared_lock<Mutex> lock(mutex_);
       auto iter = table_.find(key);
       if (iter != table_.end()) {
         Value value = acquire_loaded(iter->second);
@@ -82,7 +82,7 @@ class ExternalCache : public EvictableBlockOwner {
     }
 
     // Join an in-flight load before attempting reclamation.
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<Mutex> lock(mutex_);
     auto iter = table_.find(key);
     if (iter != table_.end()) {
       Value value = acquire_loaded(iter->second);
@@ -218,7 +218,7 @@ class ExternalCache : public EvictableBlockOwner {
 
   //! Number of live or in-flight cache entries.
   size_t entry_count() {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<Mutex> lock(mutex_);
     return table_.size();
   }
 
@@ -227,7 +227,7 @@ class ExternalCache : public EvictableBlockOwner {
   // can decline the fast path by returning nullopt.
   template <typename Read>
   std::optional<bool> read_if_cached(const Key &key, Read &&read) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<Mutex> lock(mutex_);
     auto iter = table_.find(key);
     if (iter == table_.end() || iter->second.loading ||
         iter->second.ref_count.load(std::memory_order_acquire) < 0)
@@ -237,7 +237,7 @@ class ExternalCache : public EvictableBlockOwner {
   }
 
   Value retain(const Key &key) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<Mutex> lock(mutex_);
     auto iter = table_.find(key);
     if (iter == table_.end()) {
       return Value{};
@@ -246,7 +246,7 @@ class ExternalCache : public EvictableBlockOwner {
   }
 
   void release(const Key &key) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<Mutex> lock(mutex_);
     auto iter = table_.find(key);
     if (iter == table_.end()) {
       return;
@@ -276,7 +276,7 @@ class ExternalCache : public EvictableBlockOwner {
   }
 
   bool is_dead_block(eviction_key_t owner_key, version_t version) override {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<Mutex> lock(mutex_);
     auto key_iter = owner_keys_.find(owner_key);
     if (key_iter == owner_keys_.end()) {
       return true;
@@ -300,7 +300,7 @@ class ExternalCache : public EvictableBlockOwner {
   }
 
   bool evict_block(eviction_key_t owner_key) override {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<Mutex> lock(mutex_);
     auto key_iter = owner_keys_.find(owner_key);
     if (key_iter == owner_keys_.end()) {
       return false;
@@ -344,7 +344,7 @@ class ExternalCache : public EvictableBlockOwner {
 
   void eviction_requeue_failed(eviction_key_t owner_key,
                                version_t version) override {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<Mutex> lock(mutex_);
     auto key_iter = owner_keys_.find(owner_key);
     if (key_iter == owner_keys_.end()) {
       return;
@@ -426,8 +426,7 @@ class ExternalCache : public EvictableBlockOwner {
     }
   }
 
-  Value wait_for_loading(const Key &key,
-                         std::unique_lock<std::shared_mutex> &lock) {
+  Value wait_for_loading(const Key &key, std::unique_lock<Mutex> &lock) {
     auto iter = table_.find(key);
     assert(iter != table_.end() && iter->second.loading);
     std::shared_ptr<LoadState> load_state = iter->second.load_state;
@@ -441,7 +440,7 @@ class ExternalCache : public EvictableBlockOwner {
 
   //! Complete a failed load and remove its unpublished placeholder.
   void finish_loading(const Key &key) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<Mutex> lock(mutex_);
     auto iter = table_.find(key);
     if (iter == table_.end()) {
       if (active_loads_ != 0) {
@@ -455,7 +454,7 @@ class ExternalCache : public EvictableBlockOwner {
   }
 
   void finish_loading_locked(typename Table::iterator iter,
-                             std::unique_lock<std::shared_mutex> &lock) {
+                             std::unique_lock<Mutex> &lock) {
     Entry &entry = iter->second;
     assert(entry.loading);
     std::shared_ptr<LoadState> load_state = entry.load_state;
@@ -508,7 +507,7 @@ class ExternalCache : public EvictableBlockOwner {
   eviction_key_t next_owner_key_{1};
   size_t active_loads_{0};
   const size_t max_concurrent_loads_;
-  std::shared_mutex mutex_;
+  Mutex mutex_;
   std::condition_variable_any loader_slot_cv_;
 };
 

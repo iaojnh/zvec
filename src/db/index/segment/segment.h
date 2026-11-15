@@ -65,6 +65,7 @@ class Segment {
 
   virtual SegmentMeta::Ptr meta() const = 0;
 
+
   // Doc-id bounds for routing, read under the shared segment lock. Concurrent
   // callers must use this instead of min/max_doc_id() off meta(), which
   // Insert/flush() mutate.
@@ -225,6 +226,10 @@ class Segment {
   virtual void remove_writing_forward_block() = 0;
 
   virtual Status destroy() = 0;
+
+  virtual bool uses_buffer_storage() const {
+    return false;
+  }
 };
 
 }  // namespace zvec

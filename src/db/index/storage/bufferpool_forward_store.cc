@@ -32,6 +32,7 @@
 #include "db/index/storage/store_helper.h"
 #include "lazy_record_batch_reader.h"
 #include "parquet_buffer_pool.h"
+#include "request_scratch.h"
 #include "selected_rows_plan.h"
 
 
@@ -525,6 +526,108 @@ int64_t BufferPoolForwardStore::get_row_group_offset(int rg_id) {
 TablePtr BufferPoolForwardStore::fetch_blocks(
     const std::vector<std::string> &columns,
     const std::vector<FetchBlock> &blocks, int row_count) {
+  auto resident = [&]() -> TablePtr {
+    if (columns.empty() || blocks.empty() || row_count <= 0) return nullptr;
+    struct GatherRow {
+      size_t block;
+      int group;
+      int output;
+      int64_t local;
+    };
+    // One bounded routing buffer replaces a tree node and a growable vector
+    // for every touched row group. Larger requests retain ordinary overflow.
+    detail::RequestScratchArray<GatherRow, 64> groups(row_count);
+    detail::RequestScratchArray<uint8_t, 64> seen(row_count);
+    size_t selected_rows = 0;
+    for (size_t block = 0; block < blocks.size(); ++block) {
+      const auto &request = blocks[block];
+      if (!request.store || !request.store->validate(columns)) return nullptr;
+      for (const auto &[output, row] : request.rows) {
+        if (output < 0 || output >= row_count || seen[output] || row < 0 ||
+            row >= request.store->num_rows_)
+          return nullptr;
+        seen[output] = true;
+        const int rg = request.store->find_row_group_for_row(row);
+        groups[selected_rows++] = {block, rg, output,
+                                   row - request.store->row_group_offsets_[rg]};
+      }
+    }
+    if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
+    detail::RequestScratchArray<ParquetBufferID, 4> identities(blocks.size());
+    for (size_t i = 0; i < blocks.size(); ++i)
+      identities[i] = blocks[i].store->file_context_->buffer_id;
+    detail::SelectedRowsPlan::Rows selected(row_count);
+    std::sort(groups.begin(), groups.end(), [](const auto &a, const auto &b) {
+      return a.block != b.block ? a.block < b.block : a.group < b.group;
+    });
+    int64_t offset = 0;
+    size_t group_count = 0;
+    for (size_t begin = 0; begin < groups.size();) {
+      const auto key = groups[begin];
+      size_t end = begin;
+      while (end < groups.size() && groups[end].block == key.block &&
+             groups[end].group == key.group) {
+        const auto &row = groups[end++];
+        selected[row.output] = {row.output, offset + row.local};
+      }
+      offset += blocks[key.block].store->row_group_row_nums_[key.group];
+      // Compact only the already consumed prefix; later routing rows stay live.
+      groups[group_count++] = key;
+      begin = end;
+    }
+    detail::SelectedRowsPlan plan(selected);
+    arrow::ArrayVector arrays;
+    arrow::FieldVector fields;
+    for (const auto &name : columns) {
+      const auto field =
+          blocks.front().store->physic_schema_->GetFieldByName(name);
+      if (!field) return nullptr;
+      arrow::ArrayVector chunks;
+      chunks.reserve(group_count);
+      detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 4>
+          pins(group_count);
+      size_t pin = 0;
+      for (size_t group = 0; group < group_count; ++group) {
+        const auto &key = groups[group];
+        auto *store = blocks[key.block].store;
+        const int column = store->physic_schema_->GetFieldIndex(name);
+        if (column < 0 || !store->physic_schema_->field(column)->type()->Equals(
+                              field->type()))
+          return nullptr;
+        auto &id = identities[key.block];
+        id.column = column;
+        id.row_group = key.group;
+        pins[pin].emplace(
+            ParquetBufferPool::get_instance().try_acquire_buffer(id));
+        const auto *borrowed = pins[pin++]->borrowed_data();
+        if (!borrowed ||
+            borrowed->length() != store->row_group_row_nums_[key.group])
+          return nullptr;
+        chunks.insert(chunks.end(), borrowed->chunks().begin(),
+                      borrowed->chunks().end());
+      }
+      // The request owns every pin through the synchronous gather. Borrow the
+      // arrays directly instead of cloning their entire Arrow metadata trees.
+      // Only the selected, owned copies escape; a miss keeps the fallback.
+      const arrow::ChunkedArray source(std::move(chunks), field->type());
+      auto builder = arrow::MakeBuilder(field->type());
+      if (!builder.ok() || !(*builder)->Reserve(row_count).ok() ||
+          !AppendSelectedRows(source, plan, builder->get()).ok())
+        return nullptr;
+      auto result = (*builder)->Finish();
+      if (!result.ok()) return nullptr;
+      arrays.push_back(std::move(*result));
+      fields.push_back(field);
+    }
+    return arrow::Table::Make(arrow::schema(std::move(fields)),
+                              std::move(arrays), row_count);
+  };
+  try {
+    if (auto result = resident()) return result;
+  } catch (const std::bad_alloc &) {
+    // The original gather may fit when speculative routing cannot.
+  }
+
   if (columns.empty() || blocks.empty() || row_count <= 0) return nullptr;
   using GroupKey = std::pair<size_t, int>;
   std::map<GroupKey, detail::SelectedRowsPlan::Rows> groups;
@@ -895,7 +998,8 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
 
 std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
     const std::vector<std::string> &columns,
-    const std::shared_ptr<arrow::Schema> &schema, int index) {
+    const std::shared_ptr<arrow::Schema> &schema, int index,
+    std::optional<uint64_t> known_doc_id) {
   if (index < 0 || index >= num_rows_ || columns.size() < 2 || !schema ||
       schema->num_fields() != static_cast<int>(columns.size()) ||
       columns[0] != GLOBAL_DOC_ID || columns[1] != USER_ID) {
@@ -929,6 +1033,10 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   const int64_t local_row = index - get_row_group_offset(group);
   auto doc = std::make_shared<Doc>();
   for (size_t i = 0; i < selected.size(); ++i) {
+    if (i == 0 && known_doc_id) {
+      doc->set_doc_id(*known_doc_id);
+      continue;
+    }
     const bool read = ParquetBufferPool::get_instance().read_owned_column(
         *file_context_, selected[i], group,
         [&](const arrow::ChunkedArray &column_data) {

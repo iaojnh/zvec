@@ -14,6 +14,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -78,9 +79,10 @@ class BufferPoolForwardStore
 
   // Optional scalar/array row fast path. Unsupported layouts/types return
   // nullptr so the caller can retain the existing scalar conversion path.
-  std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
-                                 const std::shared_ptr<arrow::Schema> &schema,
-                                 int index);
+  std::shared_ptr<Doc> fetch_doc(
+      const std::vector<std::string> &columns,
+      const std::shared_ptr<arrow::Schema> &schema, int index,
+      std::optional<uint64_t> known_doc_id = std::nullopt);
 
   /// Scan specified columns from the data source
   /// \param columns The list of column names to scan

@@ -28,6 +28,7 @@
 #include <vector>
 #include <arrow/result.h>
 #include <zvec/ailego/buffer/external_cache.h>
+#include "parquet_cache_mutex.h"
 
 namespace arrow {
 class Buffer;
@@ -229,6 +230,9 @@ class ParquetBufferPool {
 
   ParquetBufferContextHandle acquire_buffer(ParquetBufferID buffer_id);
 
+  // A resident-only pin never starts decoding or cache admission.
+  ParquetBufferContextHandle try_acquire_buffer(ParquetBufferID buffer_id);
+
   // The file context outlives this synchronous pin. Only owned values may
   // escape the callback; asynchronous scans continue to use owning handles.
   template <typename Read>
@@ -276,7 +280,7 @@ class ParquetBufferPool {
   using Cache =
       ailego::ExternalCache<ParquetBufferID, detail::ParquetBufferPayload,
                             detail::ParquetBufferLoader, ParquetBufferIDHash,
-                            ParquetBufferIDEqual>;
+                            ParquetBufferIDEqual, detail::ParquetCacheMutex>;
 
   ParquetBufferPool() = default;
 

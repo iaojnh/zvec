@@ -18,6 +18,7 @@
 #include <optional>
 #include <unordered_set>
 #include <arrow/array/array_binary.h>
+#include <arrow/array/concatenate.h>
 #include <arrow/array/util.h>
 #include <arrow/io/file.h>
 #include <arrow/ipc/reader.h>
@@ -293,6 +294,107 @@ ParquetBufferContextHandle::borrow_for_scan(
   return MakeLeasedColumn(lease);
 }
 
+namespace {
+// Keep hot cache values contiguous across scan batches, with a bounded copy
+// workspace. Tight budgets retain the original small decoded chunks.
+constexpr int64_t kCachedStringChunkBytes = 32 * 1024 * 1024;
+constexpr size_t kCoalesceHeadroom = 2 * kCachedStringChunkBytes;
+
+int64_t CachedStringChunkBytes(const arrow::Array &array) {
+  int64_t bytes = 0;
+  for (const auto &buffer : array.data()->buffers) {
+    if (buffer) {
+      bytes += std::min(buffer->size(), kCachedStringChunkBytes + 1 - bytes);
+      if (bytes > kCachedStringChunkBytes) break;
+    }
+  }
+  return bytes;
+}
+
+arrow::Result<std::shared_ptr<arrow::ChunkedArray>> CoalesceCachedStringChunks(
+    std::shared_ptr<arrow::ChunkedArray> column,
+    arrow::MemoryPool *memory_pool) {
+  const auto id = column->type()->id();
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  if ((id != arrow::Type::STRING && id != arrow::Type::LARGE_STRING) ||
+      column->num_chunks() < 2 || budget.available() < kCoalesceHeadroom)
+    return column;
+
+  bool mergeable = false;
+  auto previous = CachedStringChunkBytes(*column->chunk(0));
+  for (int i = 1; i < column->num_chunks(); ++i) {
+    const auto bytes = CachedStringChunkBytes(*column->chunk(i));
+    if (previous + bytes <= kCachedStringChunkBytes) {
+      mergeable = true;
+      break;
+    }
+    previous = bytes;
+  }
+  if (!mergeable) return column;
+
+  const auto type = column->type();
+  const size_t count = static_cast<size_t>(column->num_chunks());
+  // Standard Arrow containers keep their normal allocator. Admit temporary
+  // pointer vectors and one extra Array wrapper before allocating them.
+  arrow::ArrayVector chunks, output, group;
+  try {
+    chunks = column->chunks();
+    output.reserve(count);
+    group.reserve(count);
+  } catch (const std::bad_alloc &) {
+    return column;
+  }
+  column.reset();
+
+  for (size_t begin = 0; begin < count;) {
+    if (budget.available() < kCoalesceHeadroom) {
+      for (size_t i = begin; i < count; ++i)
+        output.push_back(std::move(chunks[i]));
+      break;
+    }
+    size_t end = begin;
+    int64_t bytes = 0;
+    while (end < count) {
+      const auto next = CachedStringChunkBytes(*chunks[end]);
+      if (end != begin && bytes + next > kCachedStringChunkBytes) break;
+      bytes += next;
+      ++end;
+      if (bytes >= kCachedStringChunkBytes) break;
+    }
+    if (end == begin + 1) {
+      output.push_back(std::move(chunks[begin]));
+      begin = end;
+      continue;
+    }
+    group.clear();
+    for (size_t i = begin; i < end; ++i) group.push_back(std::move(chunks[i]));
+    auto joined = [&]() -> arrow::Result<std::shared_ptr<arrow::Array>> {
+      try {
+        return arrow::Concatenate(group, memory_pool);
+      } catch (const std::bad_alloc &) {
+        return arrow::Status::OutOfMemory("Optional cached string coalescing");
+      }
+    }();
+    if (!joined.ok()) {
+      if (!joined.status().IsOutOfMemory()) return joined.status();
+      // Coalescing is optional. Under concurrent pressure publish the valid
+      // decoded chunks, including any prefix that was already coalesced.
+      for (auto &chunk : group) output.push_back(std::move(chunk));
+      for (size_t i = end; i < count; ++i)
+        output.push_back(std::move(chunks[i]));
+      break;
+    }
+    output.push_back(std::move(joined).ValueOrDie());
+    // Release this source group before allocating the next destination. Data
+    // copy workspace stays bounded by one group and uses the ordinary Arrow
+    // pool.
+    group.clear();
+    begin = end;
+  }
+  return arrow::ChunkedArray::Make(std::move(output), type);
+}
+}  // namespace
+
 bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
                                        ParquetBufferPayload &payload,
                                        size_t &size) {
@@ -325,6 +427,10 @@ bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
     return false;
   }
 
+  auto coalesced =
+      CoalesceCachedStringChunks(std::move(payload.arrow), mem_pool);
+  if (!coalesced.ok()) return false;
+  payload.arrow = std::move(coalesced).ValueOrDie();
   size = 0;
   payload.arrow_refs.clear();
   std::unordered_set<const arrow::Buffer *> seen;
@@ -359,6 +465,12 @@ ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
     return ParquetBufferContextHandle();
   }
   return ParquetBufferContextHandle(std::move(buffer_id), std::move(arrow));
+}
+
+ParquetBufferContextHandle ParquetBufferPool::try_acquire_buffer(
+    ParquetBufferID buffer_id) {
+  auto value = cache_for(buffer_id).retain(buffer_id);
+  return ParquetBufferContextHandle(std::move(buffer_id), std::move(value));
 }
 
 bool ParquetBufferPool::small_owned_row(const arrow::ChunkedArray &column,

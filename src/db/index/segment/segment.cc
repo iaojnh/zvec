@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -133,6 +134,10 @@ class SegmentImpl : public Segment,
   uint64_t doc_count_snapshot() const override;
 
   SegmentMeta::Ptr meta() const override;
+
+  bool uses_buffer_storage() const override {
+    return !options_.enable_mmap_;
+  }
 
   uint64_t doc_count(const IndexFilter::Ptr filter = nullptr) override;
 
@@ -471,7 +476,7 @@ class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
  public:
   CombinedRecordBatchReader(
       std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
-      const std::vector<std::string> &columns);
+      const std::vector<std::string> &columns, bool buffered);
 
   ~CombinedRecordBatchReader() override;
 
@@ -483,6 +488,7 @@ class SegmentImpl::CombinedRecordBatchReader : public arrow::RecordBatchReader {
   std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers_;
   std::shared_ptr<arrow::Schema> projected_schema_;
   bool emit_segment_row_id_ = false;
+  bool buffered_;
   size_t current_reader_index_;
   uint64_t next_segment_row_id_to_emit_;
   int segment_row_id_output_col_index_ = -1;
@@ -1107,7 +1113,9 @@ Doc::Ptr SegmentImpl::fetch_direct_doc_unsafe(
   }
   auto *store =
       dynamic_cast<BufferPoolForwardStore *>(persist_stores_[i].get());
-  return store ? store->fetch_doc(columns, schema, row - offsets[i]) : nullptr;
+  return store ? store->fetch_doc(columns, schema, row - offsets[i],
+                                  doc_ids_[row])
+               : nullptr;
 }
 
 
@@ -3135,8 +3143,8 @@ RecordBatchReaderPtr SegmentImpl::scan(
     }
   }
 
-  return std::make_shared<CombinedRecordBatchReader>(std::move(merged_readers),
-                                                     columns);
+  return std::make_shared<CombinedRecordBatchReader>(
+      std::move(merged_readers), columns, !options_.enable_mmap_);
 }
 
 
@@ -3146,8 +3154,9 @@ RecordBatchReaderPtr SegmentImpl::scan(
 
 SegmentImpl::CombinedRecordBatchReader::CombinedRecordBatchReader(
     std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
-    const std::vector<std::string> &columns)
+    const std::vector<std::string> &columns, bool buffered)
     : readers_(std::move(readers)),
+      buffered_(buffered),
       current_reader_index_(0),
       next_segment_row_id_to_emit_(0) {
   if (!readers_.empty()) {
@@ -3189,14 +3198,26 @@ arrow::Status SegmentImpl::CombinedRecordBatchReader::ReadNext(
 
     if (emit_segment_row_id_ && *batch) {
       auto num_rows = (*batch)->num_rows();
-      arrow::UInt64Builder builder;
-      ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
-
-      for (int64_t i = 0; i < num_rows; ++i) {
-        builder.UnsafeAppend(next_segment_row_id_to_emit_++);
-      }
       std::shared_ptr<arrow::Array> segment_row_id_array;
-      ARROW_RETURN_NOT_OK(builder.Finish(&segment_row_id_array));
+      if (buffered_) {
+        constexpr int64_t kRowIdBytes = sizeof(uint64_t);
+        if (num_rows > std::numeric_limits<int64_t>::max() / kRowIdBytes)
+          return arrow::Status::CapacityError("Row ID array is too large");
+        ARROW_ASSIGN_OR_RAISE(auto values,
+                              arrow::AllocateBuffer(num_rows * kRowIdBytes));
+        auto *ids = reinterpret_cast<uint64_t *>(values->mutable_data());
+        if (num_rows)
+          std::iota(ids, ids + num_rows, next_segment_row_id_to_emit_);
+        segment_row_id_array =
+            std::make_shared<arrow::UInt64Array>(num_rows, std::move(values));
+        next_segment_row_id_to_emit_ += num_rows;
+      } else {
+        arrow::UInt64Builder builder;
+        ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
+        for (int64_t i = 0; i < num_rows; ++i)
+          builder.UnsafeAppend(next_segment_row_id_to_emit_++);
+        ARROW_RETURN_NOT_OK(builder.Finish(&segment_row_id_array));
+      }
 
       auto result =
           (*batch)->AddColumn(segment_row_id_output_col_index_,
