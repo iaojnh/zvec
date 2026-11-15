@@ -951,6 +951,35 @@ TEST_F(BufferPoolStoreTest, BatchFetchNullableListsAcrossRowGroups) {
       }
     }
   }
+  // Exercise routing overflow and more than 64 distinct block/group keys,
+  // including repeated rows, binary bytes, null lists and null children.
+  std::vector<int> rows;
+  std::vector<BufferPoolForwardStore::FetchBlock> blocks(67);
+  for (auto &block : blocks) block.store = store.get();
+  for (int output = 0; output < 70; ++output) {
+    const int row = output * 7 % 12;
+    rows.push_back(row);
+    blocks[output % blocks.size()].rows.emplace_back(output, row);
+  }
+  const auto pool = detail::GetParquetMemoryPool();
+  auto expected = store->fetch_checked(scalar_columns, rows, pool.get());
+  ASSERT_TRUE(expected.ok()) << expected.status();
+  {
+    detail::FetchMemoryPool refused(pool.get(), 0);
+    EXPECT_EQ(nullptr, BufferPoolForwardStore::fetch_blocks(
+                           scalar_columns, blocks, rows.size(), &refused));
+    EXPECT_TRUE(refused.exceeded());
+    EXPECT_EQ(0, refused.bytes_allocated());
+  }
+  auto gathered = BufferPoolForwardStore::fetch_blocks(
+      scalar_columns, blocks, rows.size(), pool.get());
+  ASSERT_NE(gathered, nullptr);
+  EXPECT_TRUE(gathered->ValidateFull().ok());
+  EXPECT_TRUE(gathered->Equals(**expected));
+  store.reset();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  EXPECT_TRUE(gathered->ValidateFull().ok());
+  EXPECT_TRUE(gathered->Equals(**expected));
 }
 
 TEST_F(BufferPoolStoreTest, SelectedRowsPlanHandlesChangingColumnLayouts) {
