@@ -46,6 +46,55 @@ TEST_F(ResultMemoryAllowanceTest, ReleasedQuotaIsAvailableToNextAdmission) {
   EXPECT_EQ(charge, allowance.active_bytes());
 }
 
+TEST_F(ResultMemoryAllowanceTest, CoveredCopyKeepsAdmissionWhenCapacityIsFull) {
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease warm(&allowance);
+    ResultMemoryAllowance::PendingCopy pending;
+    warm.add_pending(64 * 1024, pending);
+    pending.start();
+  }
+  const auto reserved = allowance.reserved_bytes();
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  const size_t occupied = native.capacity() - native.used();
+  ASSERT_TRUE(native.try_charge_external(occupied));
+  auto release =
+      ailego::ScopeGuard::Make([&] { native.release_external(occupied); });
+  ResultMemoryAllowance::Lease copy(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  EXPECT_NO_THROW(copy.add_pending(1024, pending));
+  pending.start();
+  EXPECT_EQ(1024u, allowance.active_bytes());
+  EXPECT_EQ(reserved, allowance.reserved_bytes());
+  EXPECT_EQ(native.capacity(), native.used());
+}
+
+TEST_F(ResultMemoryAllowanceTest, CoveredCopyStillRejectsRssPressure) {
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  ASSERT_TRUE(ailego::MemoryLimitPoolTestPeer::configure_rss(native));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    native.set_memory_pressure(Pressure::kNormal);
+    EXPECT_TRUE(native.configure_process_rss_limit(0));
+  });
+  ResultMemoryAllowance allowance;
+  {
+    ResultMemoryAllowance::Lease warm(&allowance);
+    ResultMemoryAllowance::PendingCopy pending;
+    warm.add_pending(64 * 1024, pending);
+    pending.start();
+  }
+  ASSERT_GE(allowance.reserved_bytes(), 128u * 1024);
+  native.set_memory_pressure(Pressure::kCritical);
+  ResultMemoryAllowance::Lease refused(&allowance);
+  ResultMemoryAllowance::PendingCopy pending;
+  EXPECT_THROW(refused.add_pending(1024, pending), std::bad_alloc);
+  EXPECT_EQ(0u, refused.bytes());
+  EXPECT_EQ(0u, allowance.active_bytes());
+  allowance.reclaim_idle();
+  EXPECT_EQ(0u, allowance.reserved_bytes());
+}
+
 TEST_F(ResultMemoryAllowanceTest, CopyRefundsAreVisibleToIdleReclaim) {
   ResultMemoryAllowance allowance;
   {
