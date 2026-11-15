@@ -109,7 +109,7 @@ TEST_F(BufferPoolStoreTest, ConcurrentScansShareLeaseAfterParentIsReleased) {
   std::shared_ptr<arrow::RecordBatch> batch;
   ASSERT_TRUE(reader->ReadNext(&batch).ok());
   ASSERT_NE(batch, nullptr);
-  // The whole column fits the scan allowance once, but not twice. Keep only
+  // The column fits the allowance, but eight separate leases do not. Keep only
   // a slice: releasing the original reader/table must not lose that lease.
   auto retained = batch->column(0)->Slice(1, 1);
   const auto *bytes = retained->data()->buffers[2]->data();
@@ -1404,9 +1404,11 @@ TEST_F(BufferPoolStoreTest, NonLocalContextLoadsWithoutOpeningPath) {
 
 TEST_F(BufferPoolStoreTest,
        ScanLeaseSurvivesReaderAndEvictionWithCopyFallback) {
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
   arrow::StringBuilder builder;
   for (int i = 0; i < 12; ++i) {
-    ASSERT_TRUE(builder.Append(std::string(65536, 'a' + i)).ok());
+    ASSERT_TRUE(builder.Append(std::string(131072, 'a' + i)).ok());
   }
   auto array = builder.Finish().ValueOrDie();
   auto source =
@@ -1447,8 +1449,8 @@ TEST_F(BufferPoolStoreTest,
   ASSERT_TRUE(second_reader->ReadNext(&copied).ok());
   ASSERT_NE(borrowed, nullptr);
   ASSERT_NE(copied, nullptr);
-  // One 3/4 MiB column fits the 10 MiB pool's lease quota, but two distinct
-  // columns do not. Sharing an existing column must not relax this limit.
+  // Idle headroom admits one 1.5 MiB column in the 10 MiB pool, but two
+  // distinct columns exceed the quarter-pool bound and still require copying.
   EXPECT_EQ(borrowed->column(0)->data()->buffers[2]->data(), address);
   EXPECT_NE(copied->column(0)->data()->buffers[2]->data(), other_address);
   EXPECT_TRUE(borrowed->column(0)->Equals(copied->column(0)));
@@ -1471,6 +1473,23 @@ TEST_F(BufferPoolStoreTest,
       ParquetBufferPool::get_instance().acquire_buffer(context->buffer_id);
   auto leased = std::move(handle).borrow_for_scan();
   ASSERT_NE(leased, nullptr);
+  leased.reset();
+  auto &memory = ailego::MemoryLimitPool::get_instance();
+  constexpr size_t pressure_bytes = 4UL << 20;
+  ASSERT_TRUE(memory.try_charge_external(pressure_bytes));
+  struct ReleaseCharge {
+    ailego::MemoryLimitPool &pool;
+    size_t bytes;
+    ~ReleaseCharge() {
+      pool.release_external(bytes);
+    }
+  } release{memory, pressure_bytes};
+  ASSERT_GT(memory.used(), memory.capacity() / 2);
+  // Under live memory pressure the historical eighth-pool bound is restored.
+  auto pressured =
+      ParquetBufferPool::get_instance().acquire_buffer(context->buffer_id);
+  ASSERT_NE(pressured.borrowed_data(), nullptr);
+  EXPECT_EQ(std::move(pressured).borrow_for_scan(), nullptr);
 }
 
 TEST_F(BufferPoolStoreTest, NarrowStringScanStreamsAndRetainsSlices) {
