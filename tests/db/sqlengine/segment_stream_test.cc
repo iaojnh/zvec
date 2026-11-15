@@ -6,6 +6,7 @@
 #include <thread>
 #include <utility>
 #include <arrow/api.h>
+#include <arrow/compute/api.h>
 #include <arrow/compute/initialize.h>
 #include <arrow/io/api.h>
 #include <arrow/util/thread_pool.h>
@@ -491,6 +492,67 @@ TEST(SegmentStreamTest, IteratorFilterDeniesUnfundedArrowOutput) {
   EXPECT_GE(arrow_pool->charged_bytes(), baseline + 16383 * sizeof(uint64_t));
   output.reset();
   EXPECT_EQ(baseline, arrow_pool->charged_bytes());
+}
+
+TEST(SegmentStreamTest, WideLikeReadAheadIsBoundedAndCancels) {
+  ASSERT_TRUE(arrow::compute::Initialize().ok());
+  ASSERT_EQ(0, ailego::MemoryLimitPool::get_instance().init(2048UL << 20));
+  auto calls = std::make_shared<std::atomic<int>>(0);
+  std::weak_ptr<arrow::RecordBatchReader> weak;
+  {
+    arrow::StringBuilder values(detail::GetParquetQueryMemoryPool().get());
+    for (int i = 0; i < 2048; ++i) {
+      ASSERT_TRUE(
+          values.Append((i == 0 ? "hit" : "xxx") + std::string(4093, 'x'))
+              .ok());
+    }
+    auto schema = arrow::schema({arrow::field("payload", arrow::utf8())});
+    auto batch =
+        arrow::RecordBatch::Make(schema, 2048, {values.Finish().ValueOrDie()});
+    class Reader : public arrow::RecordBatchReader {
+     public:
+      Reader(std::shared_ptr<arrow::RecordBatch> batch,
+             std::shared_ptr<std::atomic<int>> calls)
+          : batch_(std::move(batch)), calls_(std::move(calls)) {}
+      std::shared_ptr<arrow::Schema> schema() const override {
+        return batch_->schema();
+      }
+      arrow::Status ReadNext(
+          std::shared_ptr<arrow::RecordBatch> *out) override {
+        *out = calls_->fetch_add(1) < 200 ? batch_ : nullptr;
+        return arrow::Status::OK();
+      }
+
+     private:
+      std::shared_ptr<arrow::RecordBatch> batch_;
+      std::shared_ptr<std::atomic<int>> calls_;
+    };
+    auto reader = std::make_shared<Reader>(batch, calls);
+    weak = reader;
+    auto predicate = arrow::compute::call(
+        "starts_with", {arrow::compute::field_ref("payload")},
+        arrow::compute::MatchSubstringOptions("hit"));
+    PlanInfo plan(
+        arrow::acero::Declaration::Sequence(
+            {{"record_batch_reader_source",
+              arrow::acero::RecordBatchReaderSourceNodeOptions{reader}},
+             {"filter", arrow::acero::FilterNodeOptions{predicate}}}),
+        schema, true);
+    auto output = plan.execute_to_reader(4096);
+    ASSERT_TRUE(output);
+    std::shared_ptr<arrow::RecordBatch> first;
+    ASSERT_TRUE((*output)->ReadNext(&first).ok());
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->num_rows(), 1);
+    EXPECT_TRUE((*output)->Close().ok());
+    // Delivery window, buffered group and at most one in-flight reader group.
+    EXPECT_LE(calls->load(), 80);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!weak.expired() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(weak.expired());
 }
 }  // namespace
 }  // namespace zvec::sqlengine
