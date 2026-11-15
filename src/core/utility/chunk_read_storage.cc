@@ -69,21 +69,18 @@ struct MetadataCharge {
   size_t bytes;
 };
 struct WorkspaceBuffer {
-  explicit WorkspaceBuffer(size_t count) : bytes(AlignPage(count)) {
-    Pool::PendingAllocation pending(Pool::get_instance(),
-                                    Pool::PendingAllocation::Kind::kWorkspace);
-    if (!pending.reserve(bytes)) throw std::bad_alloc();
-    data = static_cast<uint8_t *>(ailego::File::MemoryMap(bytes, 0));
-    if (!data) throw std::bad_alloc();
-    stamp = pending.commit_mapping();
+  explicit WorkspaceBuffer(size_t count) {
+    mapping = Pool::get_instance().try_acquire_workspace_buffer(count);
+    if (!mapping) throw std::bad_alloc();
+    data = mapping->data;
+    bytes = mapping->bytes;
   }
   ~WorkspaceBuffer() {
-    if (data && ailego::File::TryMemoryUnmap(data, bytes))
-      Pool::get_instance().release_unmapped_external(bytes, stamp);
+    Pool::get_instance().release_workspace_buffer(mapping);
   }
   uint8_t *data{nullptr};
   size_t bytes;
-  ailego::ProcessRssBudget::MaterializationStamp stamp{};
+  Pool::WorkspaceBuffer *mapping{nullptr};
 };
 }  // namespace
 

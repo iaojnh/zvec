@@ -3,9 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 
@@ -17,6 +19,17 @@ namespace zvec::ailego {
 struct MemoryLimitPoolTestPeer {
   static void stop_background(MemoryLimitPool &pool) {
     pool.stop_background_evictor();
+  }
+  static void start_background(MemoryLimitPool &pool) {
+    pool.start_background_evictor();
+  }
+  static size_t waiting(MemoryLimitPool &pool) {
+    return pool.workspace_waiting_size_.load();
+  }
+  static bool configure_reader(MemoryLimitPool &pool, size_t limit,
+                               ProcessRssBudget::Reader reader,
+                               ProcessRssBudget::ResidentReader resident) {
+    return pool.process_rss_.configure(limit, reader, nullptr, 0, resident);
   }
   static size_t mappings(MemoryLimitPool &pool) {
     std::lock_guard<std::mutex> lock(pool.cache_mapping_mutex_);
@@ -142,6 +155,94 @@ class CacheMappingRssTest : public testing::Test {
   MemoryLimitPool &pool_ = MemoryLimitPool::get_instance();
 };
 
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+size_t ReadSyntheticRss() {
+  return sampled_rss;
+}
+enum class WaitingProof { kTouched, kUntouched, kAtLimit, kPending };
+
+class WorkspaceWaiterRssTest : public CacheMappingRssTest {
+ protected:
+  void check_waiter(WaitingProof mode) {
+    auto *old = pool_.try_acquire_workspace_buffer(4 * kMiB);
+    ASSERT_NE(nullptr, old);
+    MemoryLimitPool::WorkspaceBuffer *replacement = nullptr;
+    std::future<bool> waiting;
+    std::promise<void> first_reclaim, resume;
+    auto resumed = resume.get_future().share();
+    std::atomic<bool> first{true};
+    bool released = false;
+    size_t pending = 0;
+    const size_t request =
+        mode == WaitingProof::kPending ? 15 * kMiB / 4 : 2 * kMiB;
+    auto cleanup = ScopeGuard::Make([&] {
+      if (!released) resume.set_value();
+      if (waiting.valid() && waiting.get()) pool_.release_external(request);
+      MemoryLimitPoolTestPeer::stop_background(pool_);
+      pool_.set_process_rss_reclaimer({});
+      if (pending) pool_.finish_process_backing(pending, false);
+      EXPECT_TRUE(pool_.configure_process_rss_limit(0));
+      EXPECT_TRUE(pool_.release_workspace_buffer(replacement));
+      EXPECT_TRUE(pool_.release_workspace_buffer(old));
+    });
+    std::memset(old->data, 0x51, old->bytes);
+    // Model an unchanged high process RSS while using real private-page
+    // ownership scans. Four MiB of measured headroom is below hysteresis,
+    // but is enough for the mandatory request after a fresh mapping proof.
+    sampled_rss = 124 * kMiB;
+    sampled_resident = 0;
+    ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_reader(
+        pool_, 128 * kMiB, ReadSyntheticRss, ReadResident));
+    pool_.set_process_rss_reclaimer([&] {
+      if (first.exchange(false)) {
+        first_reclaim.set_value();
+        resumed.wait();
+      }
+    });
+    MemoryLimitPoolTestPeer::start_background(pool_);
+    first_reclaim.get_future().wait();
+    ASSERT_TRUE(pool_.release_workspace_buffer(old));
+    old = nullptr;
+    replacement = pool_.try_acquire_workspace_buffer(3 * kMiB);
+    ASSERT_NE(nullptr, replacement);
+    if (mode != WaitingProof::kUntouched)
+      std::memset(replacement->data, 0x53, replacement->bytes);
+    if (mode == WaitingProof::kAtLimit) sampled_rss = 128 * kMiB;
+    if (mode == WaitingProof::kPending) {
+      ASSERT_TRUE(pool_.try_reserve_process_backing(kMiB / 2));
+      pending = kMiB / 2;
+    }
+    waiting = std::async(std::launch::async,
+                         [&] { return pool_.try_charge_workspace(request); });
+    while (MemoryLimitPoolTestPeer::waiting(pool_) == 0 &&
+           waiting.wait_for(std::chrono::milliseconds(0)) !=
+               std::future_status::ready)
+      std::this_thread::yield();
+    // The first periodic scan has already completed. Resume the same pass
+    // only after the consumer has actually entered mandatory admission.
+    released = true;
+    resume.set_value();
+    const bool admitted = waiting.get();
+    EXPECT_EQ(mode == WaitingProof::kTouched, admitted);
+    if (admitted) pool_.release_external(request);
+  }
+};
+
+TEST_F(WorkspaceWaiterRssTest, FreshProofUnblocksTouchedMandatoryReplacement) {
+  check_waiter(WaitingProof::kTouched);
+}
+TEST_F(WorkspaceWaiterRssTest, UntouchedReplacementStillCannotCoverAdmission) {
+  check_waiter(WaitingProof::kUntouched);
+}
+TEST_F(WorkspaceWaiterRssTest, ActualRssLimitStillRejectsMandatoryAdmission) {
+  check_waiter(WaitingProof::kAtLimit);
+}
+TEST_F(WorkspaceWaiterRssTest, PendingAllocationStillKeepsItsFullDebit) {
+  check_waiter(WaitingProof::kPending);
+}
+#endif
+
 TEST_F(CacheMappingRssTest, IdleReuseRetainsRegistrationUntilSuccessfulUnmap) {
   auto first = acquire();
   auto second = acquire(2 * kMiB);
@@ -247,6 +348,103 @@ TEST_F(CacheMappingRssTest, NativeWitnessExcludesUntouchedAndIncludesIdleBacking
   EXPECT_EQ(8 * kMiB, MemoryLimitPoolTestPeer::trim(pool_, 8 * kMiB));
   EXPECT_EQ(empty.owned_resident,
             MemoryLimitPoolTestPeer::sample().owned_resident);
+}
+
+TEST_F(CacheMappingRssTest, MandatoryWorkspaceWitnessCountsOnlyTouchedPages) {
+  constexpr size_t bytes = 4 * kMiB;
+  const auto initial = MemoryLimitPoolTestPeer::sample();
+  auto *workspace = pool_.try_acquire_workspace_buffer(bytes);
+  ASSERT_NE(nullptr, workspace);
+  auto release = ScopeGuard::Make([&] {
+    if (workspace) EXPECT_TRUE(pool_.release_workspace_buffer(workspace));
+  });
+  const auto untouched = MemoryLimitPoolTestPeer::sample();
+  const auto background_untouched =
+      MemoryLimitPoolTestPeer::background_sample();
+  EXPECT_EQ(0u, pool_.evictable_cache_used());
+  EXPECT_LT(untouched.owned_resident, initial.owned_resident + bytes / 2);
+  std::memset(workspace->data, 0x37, bytes / 2);
+  EXPECT_EQ(untouched.owned_resident + bytes / 2,
+            MemoryLimitPoolTestPeer::sample().owned_resident);
+  EXPECT_EQ(background_untouched.owned_resident + bytes / 2,
+            MemoryLimitPoolTestPeer::background_sample().owned_resident);
+  const size_t external = pool_.external_used();
+  EXPECT_EQ(1u, MemoryLimitPoolTestPeer::mappings(pool_));
+  ASSERT_TRUE(pool_.release_workspace_buffer(workspace));
+  workspace = nullptr;
+  EXPECT_EQ(external - bytes, pool_.external_used());
+  EXPECT_EQ(0u, MemoryLimitPoolTestPeer::mappings(pool_));
+  EXPECT_EQ(untouched.owned_resident,
+            MemoryLimitPoolTestPeer::sample().owned_resident);
+  EXPECT_EQ(background_untouched.owned_resident,
+            MemoryLimitPoolTestPeer::background_sample().owned_resident);
+}
+
+TEST_F(CacheMappingRssTest, FailedWorkspaceUnmapRetainsRegistrationAndDebits) {
+  auto *workspace = pool_.try_acquire_workspace_buffer(4 * kMiB);
+  ASSERT_NE(nullptr, workspace);
+  auto release = ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool_.release_workspace_buffer(workspace)); });
+  std::memset(workspace->data, 0x3b, workspace->bytes);
+  const size_t committed = pool_.committed();
+  const size_t external = pool_.external_used();
+  const size_t metadata = pool_.metadata_used();
+  auto *address = workspace->data;
+  // An unaligned base is rejected by the native unmapping API. Restore it
+  // before sampling; the descriptor and debit must survive that failure.
+  workspace->data = address + 1;
+  const bool released = pool_.release_workspace_buffer(workspace);
+  workspace->data = address;
+  EXPECT_FALSE(released);
+  EXPECT_EQ(committed, pool_.committed());
+  EXPECT_EQ(external, pool_.external_used());
+  EXPECT_EQ(metadata, pool_.metadata_used());
+  EXPECT_EQ(1u, MemoryLimitPoolTestPeer::mappings(pool_));
+  EXPECT_GE(MemoryLimitPoolTestPeer::sample().owned_resident, workspace->bytes);
+  EXPECT_GE(MemoryLimitPoolTestPeer::background_sample().owned_resident,
+            workspace->bytes);
+}
+
+TEST_F(CacheMappingRssTest, BusyWorkspaceDirectorySuppliesNoStaleWitness) {
+  const auto initial = MemoryLimitPoolTestPeer::background_sample();
+  auto *workspace = pool_.try_acquire_workspace_buffer(2 * kMiB);
+  ASSERT_NE(nullptr, workspace);
+  auto release = ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool_.release_workspace_buffer(workspace)); });
+  std::memset(workspace->data, 0x47, workspace->bytes);
+  EXPECT_EQ(0u,
+            MemoryLimitPoolTestPeer::sample_while_busy(pool_).owned_resident);
+  EXPECT_LT(MemoryLimitPoolTestPeer::background_while_registry_busy(pool_)
+                .owned_resident,
+            initial.owned_resident + workspace->bytes);
+}
+
+TEST_F(CacheMappingRssTest,
+       ConcurrentWorkspaceSamplesKeepMappingLifetimesSafe) {
+  std::atomic<bool> done{false};
+  std::atomic<size_t> samples{0};
+  std::thread sampler([&] {
+    while (!done.load()) {
+      const auto sample = samples.load() % 2
+                              ? MemoryLimitPoolTestPeer::sample()
+                              : MemoryLimitPoolTestPeer::background_sample();
+      EXPECT_LE(sample.owned_resident, sample.rss);
+      ++samples;
+      std::this_thread::yield();
+    }
+  });
+  while (!samples.load()) std::this_thread::yield();
+  for (size_t i = 0; i < 256; ++i) {
+    auto *workspace = pool_.try_acquire_workspace_buffer(16UL << 10);
+    EXPECT_NE(nullptr, workspace);
+    if (!workspace) break;
+    std::memset(workspace->data, static_cast<int>(i), workspace->bytes);
+    EXPECT_TRUE(pool_.release_workspace_buffer(workspace));
+  }
+  done = true;
+  sampler.join();
+  EXPECT_GT(samples.load(), 0u);
+  EXPECT_EQ(0u, MemoryLimitPoolTestPeer::mappings(pool_));
 }
 
 TEST_F(CacheMappingRssTest, RetainedMetadataWitnessTracksTouchReuseAndUnmap) {

@@ -3417,3 +3417,105 @@ TEST_F(BufferPoolStoreTest,
   EXPECT_LE(ailego::MemoryLimitPool::get_instance().stats().used,
             ailego::MemoryLimitPool::get_instance().capacity());
 }
+
+
+TEST_F(BufferPoolStoreTest, ConcurrentDocReadersSurviveCacheRetirement) {
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> columns{GLOBAL_DOC_ID, USER_ID, "name"};
+  auto schema = arrow::schema(SelectFields(store->physic_schema(), columns));
+  auto expected = store->fetch_doc(columns, schema, 0);
+  ASSERT_NE(expected, nullptr);
+  const auto expected_name = expected->get<std::string>("name");
+  const size_t active_before = detail::SharedResultMemoryAllowance().active_bytes();
+  const ParquetBufferID file(parquet_path, 0, 0);
+  std::atomic<bool> start{false};
+  std::atomic<int> ready{0};
+  std::atomic<int> failures{0};
+  std::vector<std::thread> readers;
+  for (int thread = 0; thread < 8; ++thread) {
+    readers.emplace_back([&]() {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (int repeat = 0; repeat < 200; ++repeat) {
+        try {
+          auto doc = store->fetch_doc(columns, schema, 0);
+          if (!doc || doc->doc_id() != expected->doc_id() ||
+              doc->pk() != expected->pk() ||
+              doc->get<std::string>("name") != expected_name)
+            failures.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != 8) std::this_thread::yield();
+  start.store(true, std::memory_order_release);
+  // Retirement takes the writer lock while readers pin, copy and release.
+  // Existing pins and single-flight loads must remain valid through it.
+  for (int repeat = 0; repeat < 32; ++repeat)
+    ParquetBufferPool::get_instance().retire_file(file);
+  for (auto &reader : readers) reader.join();
+  EXPECT_EQ(0, failures.load());
+  EXPECT_EQ(active_before, detail::SharedResultMemoryAllowance().active_bytes());
+  store.reset();
+  EXPECT_EQ(expected_name, expected->get<std::string>("name"));
+}
+
+TEST_F(BufferPoolStoreTest,
+       KnownGlobalDocIdAvoidsColumnPinAndKeepsResultCharge) {
+  const std::vector<uint64_t> doc_ids{0, 100, 1000};
+  arrow::UInt64Builder ids;
+  arrow::StringBuilder keys, payloads;
+  for (int row = 0; row < 3; ++row) {
+    ASSERT_TRUE(ids.Append(doc_ids[row]).ok());
+    ASSERT_TRUE(keys.Append("key-" + std::to_string(row)).ok());
+    ASSERT_TRUE((row == 2 ? payloads.AppendNull()
+                          : payloads.Append("payload-" + std::to_string(row)))
+                    .ok());
+  }
+  auto schema = arrow::schema({arrow::field(GLOBAL_DOC_ID, arrow::uint64()),
+                                arrow::field(USER_ID, arrow::utf8()),
+                                arrow::field("payload", arrow::utf8())});
+  auto table = arrow::Table::Make(
+      schema, {ids.Finish().ValueOrDie(), keys.Finish().ValueOrDie(),
+               payloads.Finish().ValueOrDie()});
+  auto file = arrow::io::FileOutputStream::Open(parquet_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
+                                         file, 3).ok());
+  ASSERT_TRUE(file->Close().ok());
+  auto store = std::make_shared<BufferPoolForwardStore>(parquet_path);
+  ASSERT_TRUE(store->open().ok());
+  const std::vector<std::string> columns{GLOBAL_DOC_ID, USER_ID, "payload"};
+  auto &allowance = detail::SharedResultMemoryAllowance();
+  const auto before = allowance.active_bytes();
+  auto known = store->fetch_doc(columns, schema, 1, doc_ids[1]);
+  ASSERT_NE(known, nullptr);
+  const auto known_charge = allowance.active_bytes() - before;
+  EXPECT_GT(known_charge, 0u);
+  auto zero = store->fetch_doc(columns, schema, 0, doc_ids[0]);
+  auto nullable = store->fetch_doc(columns, schema, 2, doc_ids[2]);
+  ASSERT_NE(zero, nullptr);
+  ASSERT_NE(nullable, nullptr);
+  EXPECT_EQ(0u, zero->doc_id());
+  EXPECT_EQ(1000u, nullable->doc_id());
+  EXPECT_FALSE(nullable->has("payload"));
+  {
+    auto unused = ParquetBufferPool::get_instance().try_acquire_buffer(
+        ParquetBufferID(parquet_path, 0, 0));
+    EXPECT_EQ(nullptr, unused.borrowed_data());
+  }
+  const auto before_ordinary = allowance.active_bytes();
+  auto ordinary = store->fetch_doc(columns, schema, 1);
+  ASSERT_NE(ordinary, nullptr);
+  EXPECT_EQ(known_charge, allowance.active_bytes() - before_ordinary);
+  EXPECT_EQ(ordinary->doc_id(), known->doc_id());
+  EXPECT_EQ(ordinary->pk(), known->pk());
+  EXPECT_EQ(ordinary->get<std::string>("payload"),
+            known->get<std::string>("payload"));
+  store.reset();
+  ailego::BlockEvictionQueue::get_instance().batch_recycle(4096);
+  EXPECT_EQ(100u, known->doc_id());
+  EXPECT_EQ(known->get<std::string>("payload"), "payload-1");
+}

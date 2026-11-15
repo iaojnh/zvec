@@ -14,6 +14,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <arrow/util/span.h>
@@ -93,9 +94,12 @@ class BufferPoolForwardStore
 
   // Supported scalar and array fields are copied into an admitted Doc.
   // Unsupported schemas retain the ordinary Arrow materialization path.
+  // Only a caller with a validated row mapping may supply known_doc_id.
   std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
                                  const std::shared_ptr<arrow::Schema> &schema,
-                                 int index);
+                                 int index,
+                                 std::optional<uint64_t> known_doc_id =
+                                     std::nullopt);
 
   /// Scan specified columns from the data source
   /// \param columns The list of column names to scan
