@@ -1,0 +1,62 @@
+name: PR904 Windows ARM64 toolchain probe
+
+on:
+  push:
+    branches: [codex/pr904-ci-probe-20261116]
+
+permissions:
+  contents: read
+
+jobs:
+  snowball-baseline:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          architecture: arm64
+      - name: Prepare unchanged main code generator
+        shell: powershell
+        run: |
+          git submodule update --init thirdparty/snowball/snowball-3.1.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $probe = Join-Path $env:RUNNER_TEMP 'snowball-probe'
+          New-Item -ItemType Directory -Force $probe | Out-Null
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(SnowballBaselineProbe C)
+          set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+          set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+          file(TO_CMAKE_PATH "$ENV{GITHUB_WORKSPACE}" ZVEC_ROOT)
+          add_subdirectory("${ZVEC_ROOT}/thirdparty/snowball" "${CMAKE_BINARY_DIR}/snowball")
+          '@ | Set-Content (Join-Path $probe 'CMakeLists.txt') -Encoding ascii
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: arm64
+      - name: Current MSVC with unchanged main sources
+        continue-on-error: true
+        shell: powershell
+        run: |
+          where.exe cl
+          $probe = Join-Path $env:RUNNER_TEMP 'snowball-probe'
+          cmake -S $probe -B "$probe/current" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "$probe/current" --target snowball_codegen --parallel 4
+          exit $LASTEXITCODE
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: arm64
+          toolset: '14.44'
+      - name: Stable installed MSVC with identical main sources
+        shell: powershell
+        run: |
+          where.exe cl
+          $probe = Join-Path $env:RUNNER_TEMP 'snowball-probe'
+          cmake -S $probe -B "$probe/stable" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "$probe/stable" --target snowball_codegen --parallel 4
+          exit $LASTEXITCODE
