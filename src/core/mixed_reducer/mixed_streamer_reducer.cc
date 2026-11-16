@@ -726,7 +726,8 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) try {
 
   auto holder = std::make_shared<MergedProviderIndexHolder>(
       original_query_meta_, std::move(sources), std::move(source_memory),
-      ailego::MemoryLimitPool::get_instance().capacity() != 0 &&
+      params_.get_as_bool(PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS) &&
+          ailego::MemoryLimitPool::get_instance().capacity() != 0 &&
           (target_builder_->name() == "IVFBuilder" ||
            target_builder_->name() == "DiskAnnBuilder" ||
            target_builder_->name() == "IvfRabitqBuilder"));

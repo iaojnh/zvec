@@ -1731,6 +1731,13 @@ int Index::merge(const std::vector<Index::Pointer> &indexes,
                      true);
   reducer_params.set(core::PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS,
                      effective_write_concurrency);
+  // Only buffered storage needs a pageable rebuild copy. Keep mmap's
+  // existing borrowing and graph construction paths.
+  reducer_params.set(
+      core::PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS,
+      storage_ && (storage_->name() == "BufferStorage" ||
+                   storage_->name() == "ChunkReadStorage" ||
+                   storage_->name() == "BufferReadStorage"));
   if (reducer->init(reducer_params) != 0) {
     LOG_ERROR("Failed to init reducer");
     return core::IndexError_Runtime;

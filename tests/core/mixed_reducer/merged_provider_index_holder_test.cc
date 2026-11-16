@@ -14,6 +14,7 @@
 
 #include "mixed_reducer/merged_provider_index_holder.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -1951,33 +1952,118 @@ TEST(MergedProviderIndexHolderTest, PageableSpoolDoesNotFallbackWhenBudgetFull) 
 TEST(MergedProviderIndexHolderTest, BudgetedReducerSelectsSpoolForRebuilds) {
   RestoreSpoolTestBudget restore;
   ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
-  for (const auto *name : {"IVFBuilder", "DiskAnnBuilder", "IvfRabitqBuilder"}) {
-    auto reads = std::make_shared<size_t>(0);
-    auto lifetime = std::make_shared<ProviderLifetimeStats>();
-    auto source = std::make_shared<TestStreamer>(
-        [reads](size_t) { return std::make_shared<GeneratedSpoolProvider>(reads); },
-        lifetime, GeneratedSpoolProvider::kColumns);
-    ailego::ThreadPool pool(1, false);
-    auto builder = std::make_shared<RetainingTestBuilder>(name, &pool);
-    MixedStreamerReducer reducer;
-    ailego::Params params;
-    params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
-    ASSERT_EQ(0, reducer.init(params));
-    reducer.set_thread_pool(&pool);
-    ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
-                     builder, source, nullptr, nullptr,
-                     IndexQueryMeta(IndexMeta::DataType::DT_FP32,
-                                    GeneratedSpoolProvider::kColumns)));
-    ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
-    ASSERT_EQ(0, reducer.reduce({}));
-    auto *merged = dynamic_cast<MergedProviderIndexHolder *>(builder->holder.get());
-    ASSERT_NE(nullptr, merged);
-    const auto first = ReadAll(merged);
-    ASSERT_EQ(GeneratedSpoolProvider::kRows, first.size());
-    const size_t first_pass_reads = *reads;
-    EXPECT_EQ(first, ReadAll(merged));
-    EXPECT_EQ(first_pass_reads, *reads);
-    EXPECT_EQ(0u, lifetime->live_count);
+  for (bool enable_spool : {false, true}) {
+    for (const auto *name : {"IVFBuilder", "DiskAnnBuilder", "IvfRabitqBuilder"}) {
+      auto reads = std::make_shared<size_t>(0);
+      auto lifetime = std::make_shared<ProviderLifetimeStats>();
+      auto source = std::make_shared<TestStreamer>(
+          [reads](size_t) { return std::make_shared<GeneratedSpoolProvider>(reads); },
+          lifetime, GeneratedSpoolProvider::kColumns);
+      ailego::ThreadPool pool(1, false);
+      auto builder = std::make_shared<RetainingTestBuilder>(name, &pool);
+      MixedStreamerReducer reducer;
+      ailego::Params params;
+      params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
+      params.set(PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS, enable_spool);
+      ASSERT_EQ(0, reducer.init(params));
+      reducer.set_thread_pool(&pool);
+      ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                       builder, source, nullptr, nullptr,
+                       IndexQueryMeta(IndexMeta::DataType::DT_FP32,
+                                      GeneratedSpoolProvider::kColumns)));
+      ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+      ASSERT_EQ(0, reducer.reduce({}));
+      auto *merged =
+          dynamic_cast<MergedProviderIndexHolder *>(builder->holder.get());
+      ASSERT_NE(nullptr, merged);
+      const auto first = ReadAll(merged);
+      ASSERT_EQ(GeneratedSpoolProvider::kRows, first.size());
+      const size_t first_pass_reads = *reads;
+      EXPECT_EQ(first, ReadAll(merged));
+      EXPECT_EQ(first_pass_reads +
+                    (enable_spool ? 0 : GeneratedSpoolProvider::kRows), *reads);
+      EXPECT_EQ(0u, lifetime->live_count);
+    }
+  }
+}
+
+class StableSpoolRowsProvider final : public IndexProvider,
+                                      public StableVectorHolder {
+ public:
+  using Rows = std::array<std::array<float, kDimension>, 2>;
+  StableSpoolRowsProvider()
+      : rows_(std::make_shared<Rows>(Rows{{{{10.0F, 10.5F}},
+                                          {{11.0F, 11.5F}}}})) {}
+  class RowIterator final : public IndexHolder::Iterator {
+   public:
+    explicit RowIterator(std::shared_ptr<Rows> rows) : rows_(std::move(rows)) {}
+    const void *data() const override { return (*rows_)[ordinal_].data(); }
+    bool is_valid() const override { return ordinal_ < rows_->size(); }
+    uint64_t key() const override { return ordinal_; }
+    void next() override { ++ordinal_; }
+   private:
+    std::shared_ptr<Rows> rows_;
+    size_t ordinal_{0};
+  };
+  IndexHolder::Iterator::Pointer create_iterator() override {
+    return std::make_unique<RowIterator>(rows_);
+  }
+  size_t count() const override { return rows_->size(); }
+  size_t dimension() const override { return kDimension; }
+  IndexMeta::DataType data_type() const override { return IndexMeta::DT_FP32; }
+  size_t element_size() const override { return kDimension * sizeof(float); }
+  const void *get_vector(uint64_t key) const override {
+    return key < rows_->size() ? (*rows_)[key].data() : nullptr;
+  }
+  int retain_stable_data(std::shared_ptr<const void> *lifetime) override {
+    if (!lifetime) return IndexError_InvalidArgument;
+    *lifetime = rows_;
+    return 0;
+  }
+  const std::string &owner_class() const override {
+    static const std::string name{"StableSpoolRowsProvider"};
+    return name;
+  }
+ private:
+  std::shared_ptr<Rows> rows_;
+};
+
+class StableSpoolRowsStreamer final : public IndexStreamer {
+ public:
+  int open(IndexStorage::Pointer) override { return 0; }
+  int flush(uint64_t) override { return 0; }
+  int close() override { return 0; }
+  int cleanup() override { return 0; }
+  const Stats &stats() const override { return stats_; }
+  const IndexMeta &meta() const override { return meta_; }
+  IndexProvider::Pointer create_provider() const override { return provider_; }
+ private:
+  Stats stats_;
+  IndexMeta meta_{IndexMeta::DT_FP32, kDimension};
+  std::shared_ptr<StableSpoolRowsProvider> provider_{
+      std::make_shared<StableSpoolRowsProvider>()};
+};
+
+TEST(MergedProviderIndexHolderTest, PageableSpoolDeclinesStableSourcePointers) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  auto source = MakeSource(std::make_shared<StableSpoolRowsStreamer>());
+  const std::vector<std::pair<uint64_t, float>> expected{{0, 10.0F}, {1, 11.0F}};
+  {
+    MergedProviderIndexHolder borrowed(source.provider_meta, {source});
+    ASSERT_EQ(0, borrowed.init({}));
+    std::shared_ptr<const void> lifetime;
+    ASSERT_EQ(0, borrowed.retain_stable_data(&lifetime));
+    ASSERT_NE(nullptr, lifetime);
+    EXPECT_EQ(expected, ReadAll(&borrowed));
+  }
+  {
+    MergedProviderIndexHolder spooled(source.provider_meta, {source}, {}, true);
+    ASSERT_EQ(0, spooled.init({}));
+    std::shared_ptr<const void> lifetime;
+    ASSERT_EQ(IndexError_NotImplemented, spooled.retain_stable_data(&lifetime));
+    EXPECT_EQ(nullptr, lifetime);
+    EXPECT_EQ(expected, ReadAll(&spooled));
   }
 }
 

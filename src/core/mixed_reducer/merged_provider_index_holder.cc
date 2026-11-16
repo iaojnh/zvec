@@ -507,6 +507,9 @@ int MergedProviderIndexHolder::retain_stable_data(
     std::shared_ptr<const void> *lifetime) {
   if (!lifetime || !initialized_) return IndexError_InvalidArgument;
   if (status() != 0) return status();
+  // Spool iterators reuse one row. Retaining source owners cannot extend
+  // the lifetime of the bytes returned by these iterators.
+  if (spool_vectors_) return IndexError_NotImplemented;
   for (const auto &source : sources_) {
     if (source.need_revert) return IndexError_NotImplemented;
   }
