@@ -43,7 +43,14 @@ struct MemoryLimitPoolTestPeer {
   }
   static bool configure_rss(MemoryLimitPool &pool, size_t limit, size_t rss) {
     rss_sample = rss;
-    return pool.process_rss_.configure(limit, +[] { return rss_sample; });
+    // Synthetic initial RSS includes the already-live fixture backing.
+    // State ownership explicitly; a raw process read is no residency proof.
+    rss_owned = pool.committed();
+    return pool.process_rss_.configure(
+        limit, +[] { return rss_sample; }, nullptr, 0,
+        +[]() -> ProcessRssBudget::ResidentSample {
+          return {rss_sample, rss_owned};
+        });
   }
   static void sample_rss(MemoryLimitPool &pool, size_t rss) {
     rss_sample = rss;
@@ -52,6 +59,11 @@ struct MemoryLimitPoolTestPeer {
   static size_t rss_available(MemoryLimitPool &pool) {
     return pool.process_rss_.available();
   }
+  static bool confirm_rss(MemoryLimitPool &pool, size_t owned) {
+    return pool.process_rss_.publish_resident_sample(
+        pool.process_rss_.begin_resident_sample(), {rss_sample, owned});
+  }
+
   static ProcessRssBudget::ResidentSample slab_resident_sample() {
     return MemoryLimitPool::read_slab_resident_sample();
   }
@@ -62,6 +74,9 @@ struct MemoryLimitPoolTestPeer {
   }
   static void refresh_rss(MemoryLimitPool &pool) {
     pool.process_rss_.refresh(true);
+    const auto token = pool.process_rss_.begin_resident_sample();
+    EXPECT_TRUE(pool.process_rss_.publish_resident_sample(
+        token, pool.read_slab_resident_sample()));
   }
   static size_t trim_retained(MemoryLimitPool &pool, size_t bytes) {
     return pool.trim_retained_blocks(bytes);
@@ -70,6 +85,7 @@ struct MemoryLimitPoolTestPeer {
     return pool.trim_free_buffers(bytes);
   }
   inline static size_t rss_sample = 0;
+  inline static size_t rss_owned = 0;
 };
 
 namespace {
@@ -487,6 +503,8 @@ TEST_F(PoolAdmissionTest, FailedWorkspaceAllocationRestoresRssHeadroom) {
       pool_, current_rss + headroom, initial_rss));
   MemoryReservation resident;
   resident.add(resident_bytes);
+  // This synthetic owner has now been touched, unlike pending workspace.
+  MemoryLimitPoolTestPeer::rss_owned += resident_bytes;
   MemoryLimitPoolTestPeer::sample_rss(pool_, current_rss);
   const size_t used = pool_.used();
   const size_t committed = pool_.committed();
@@ -526,8 +544,15 @@ TEST_F(PoolAdmissionTest, UnmappedWorkspacePreservesOtherResidentBacking) {
   const size_t bytes = 2 * page_;
   for (int attempt = 0; attempt < 4; ++attempt) {
     BudgetedMappedBuffer mapping(bytes);
-    EXPECT_EQ(headroom - bytes, MemoryLimitPoolTestPeer::rss_available(pool_));
+    EXPECT_EQ(headroom - bytes - sizeof(MemoryLimitPool::WorkspaceBuffer), MemoryLimitPoolTestPeer::rss_available(pool_));
+    const size_t before_clear = MemoryLimitPoolTestPeer::rss_available(pool_);
     mapping.clear();
+    // Payload unmap refunds its pages immediately. The small heap descriptor
+    // can remain resident until a new successful observation.
+    EXPECT_GE(MemoryLimitPoolTestPeer::rss_available(pool_),
+              before_clear + bytes -
+                  2 * sizeof(MemoryLimitPool::WorkspaceBuffer));
+    MemoryLimitPoolTestPeer::sample_rss(pool_, rss);
     EXPECT_EQ(headroom, MemoryLimitPoolTestPeer::rss_available(pool_));
   }
   EXPECT_EQ(resident.bytes(), pool_.external_used());
@@ -619,6 +644,8 @@ TEST_F(PoolAdmissionTest, RealPageReplacementPreservesMeasuredRssHeadroom) {
   const size_t allowance =
       std::max(64 * kMiB, 2 * ProcessRssBudget::headroom(rss + 128 * kMiB));
   ASSERT_TRUE(pool_.configure_process_rss_limit(rss + allowance));
+  MemoryLimitPoolTestPeer::refresh_rss(pool_);
+  const size_t initial_room = MemoryLimitPoolTestPeer::rss_available(pool_);
   for (size_t i = 0; i < 8 * kMiB / page_; ++i) {
     char *page = nullptr;
     ASSERT_TRUE(pool_.try_acquire_buffer(page_, page));
@@ -642,7 +669,7 @@ TEST_F(PoolAdmissionTest, RealPageReplacementPreservesMeasuredRssHeadroom) {
     }
     MemoryLimitPoolTestPeer::refresh_rss(pool_);
     EXPECT_GE(MemoryLimitPoolTestPeer::rss_available(pool_),
-              allowance - 10 * kMiB);
+              initial_room - std::min(initial_room, 10 * kMiB));
   }
 }
 #endif
@@ -682,7 +709,7 @@ TEST_F(PoolAdmissionTest, RetainedBackingReuseObeysMeasuredHeadroom) {
   ASSERT_EQ(page_, pool_.stats().retained_idle_bytes);
 
   const size_t limit = baseline_ + 256 * page_;
-  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, limit, limit - 1));
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, limit, limit + 1));
   block = pool_.acquire_retained_block(request);
   EXPECT_EQ(nullptr, block);
   if (block) pool_.release_retained_block(block);
@@ -850,6 +877,9 @@ TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
   const size_t limit = baseline_ + 256 * page_;
   ASSERT_TRUE(
       MemoryLimitPoolTestPeer::configure_rss(pool_, limit, limit - 4 * page_));
+  // A raw RSS observation alone cannot establish overlap with the queue's
+  // existing backing. Supply that witness before testing the remaining room.
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::confirm_rss(pool_, baseline_));
   ASSERT_TRUE(pool_.under_process_rss_pressure());
   const auto timeout = std::chrono::milliseconds(1);
   char *buffer = nullptr;

@@ -88,6 +88,7 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
 };
 
 class ZVEC_AILEGO_API BlockEvictionQueue {
+  friend struct BlockEvictionQueueTestPeer;
  public:
   static constexpr size_t kQueueCount = 3;
   static constexpr uint8_t kProbationPriority = 0;
@@ -220,9 +221,6 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
     for (size_t i = 0; i < kQueueCount; ++i) {
       evict_queues_.push_back(ConcurrentQueue(kEvictQueueCapacity));
     }
-    for (size_t i = 0; i < kQueueCount; ++i) {
-      cleanup_consumers_[i].emplace(evict_queues_[i]);
-    }
   }
 
   // Foreground one-page reclaim should not pay for protected aging. Larger
@@ -243,9 +241,9 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
   std::atomic<uint64_t> inactive_evictions_{0};
   std::mutex cleanup_mutex_;
   uint64_t cleanup_generation_seen_{0};
-  std::array<size_t, kQueueCount> cleanup_scan_remaining_{};
-  std::array<std::optional<ConcurrentQueue::consumer_token_t>, kQueueCount>
-      cleanup_consumers_{};
+  bool cleanup_in_progress_{false};
+  std::array<ConcurrentQueue::producer_scan_token_t, kQueueCount>
+      cleanup_scans_{};
   size_t cleanup_next_queue_{0};
 };
 
@@ -277,8 +275,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
 
   // Enabled by the DB process budget, not by standalone page-pool users.
   bool configure_process_rss_limit(size_t bytes);
-  // On initial setup only, permanent_backing is already charged to the pool
-  // and its owners never release it. It stays included in measured RSS.
+  // On initial setup only, permanent_backing is an external lifetime
+  // allowance for native images/stacks outside the residency directory.
+  // Its owners never release it; measured process RSS still includes it.
+  // Registered queue/slab/cache/workspace mappings cannot be excluded.
+  // Its exclusion survives RSS disable/re-enable; native capacity changes
+  // are rejected afterward, while init() with the same capacity is a no-op.
   bool configure_process_rss_limit(size_t bytes, size_t permanent_backing);
   // Queues host pressure; reclamation runs on existing maintenance.
   void set_memory_pressure(ProcessRssBudget::PressureLevel level);
@@ -409,8 +411,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   //! committed(). Only successful unmapping refunds their backing budget.
   void *acquire_retained_block(size_t bytes, bool metadata = false);
   // For a retained block shared by multiple allocations. The owner must
-  // keep the block alive and serialize calls that use the same block.
-  bool try_materialize_retained_block(void *data);
+  // keep the block alive. Required waits must release the allocator mutex;
+  // current-observation projections are serialized by the RSS budget mutex.
+  bool try_materialize_retained_block(void *data, bool required = false);
   void release_retained_block(void *data);
   static size_t retained_block_size(size_t bytes);
   static constexpr size_t kRetainedBlockHeaderBytes = 64;
@@ -442,7 +445,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   // Mandatory workspaces share the mapping-residency directory, but never
   // optional-cache admission, idle reuse or evictable-cache accounting.
   struct WorkspaceBuffer : CacheBuffer {};
-  WorkspaceBuffer *try_acquire_workspace_buffer(size_t bytes);
+  WorkspaceBuffer *try_acquire_workspace_buffer(size_t bytes,
+                                                bool required = true);
   // Failed unmapping retains the descriptor, registration and backing debit.
   bool release_workspace_buffer(WorkspaceBuffer *buffer);
   // Reassigning an already charged mapping must preserve mandatory-workspace
@@ -676,12 +680,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   char *pop_free_buffer(size_t start_shard);
   char *pop_reusable_buffer(size_t start_shard, size_t bytes);
   void push_free_buffer(char *buffer, size_t shard);
-  char *acquire_slab_buffer();
+  char *acquire_slab_buffer(size_t *reserved_pages = nullptr);
   bool reclaim_slab_buffer(char *buffer);
   bool release_all_slabs_locked();
   size_t trim_free_buffers(size_t bytes_needed);
   bool trim_idle_buffers();
-  void reclaim_process_cache();
+  bool reclaim_process_cache();
   size_t trim_retained_blocks(size_t bytes_needed);
   size_t trim_cache_buffers(size_t bytes_needed);
   void register_cache_mapping(CacheBuffer *buffer);
@@ -692,6 +696,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   void start_background_evictor();
   void stop_background_evictor();
   void background_evict_loop();
+  bool refresh_residency_on_background_thread();
   // Keep a small absolute reserve without shrinking a fitting working set.
   size_t reserve_margin(size_t capacity) const {
     size_t m = capacity / 64;      // ~1.5% of the pool
@@ -737,6 +742,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   // init() may publish capacity while monitoring reads it.
   std::atomic<size_t> pool_size_{0};
   std::atomic<bool> initialized_{false};
+  // Keep init() calls serialized while joining maintenance without blocking
+  // allocations performed by an in-flight process-cache reclaimer.
+  std::mutex initialization_mutex_;
   // Serialize reinitialization with reservations, but not releases.
   mutable std::shared_mutex lifecycle_mutex_;
   // Includes pending page reservations, not just materialized allocations.
@@ -816,6 +824,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::condition_variable capacity_cv_;
 
   std::thread bg_thread_;
+  std::mutex bg_identity_mutex_;
+  std::thread::id bg_identity_{};
   std::atomic<bool> bg_running_{false};
   std::mutex bg_mutex_;
   std::condition_variable bg_cv_;

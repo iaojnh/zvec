@@ -20,11 +20,13 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <system_error>
 #include <thread>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
+#include <ailego/utility/memory_helper.h>
 #include <arrow/api.h>
 #include <arrow/buffer.h>
 #include <gtest/gtest.h>
@@ -38,6 +40,9 @@
 #include "db/index/storage/request_scratch.h"
 #include "db/index/storage/store_helper.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -48,6 +53,32 @@
 namespace zvec::ailego {
 
 struct MemoryLimitPoolTestPeer {
+  static void stop_background(MemoryLimitPool &pool) {
+    pool.stop_background_evictor();
+  }
+  static void start_background(MemoryLimitPool &pool) {
+    pool.start_background_evictor();
+  }
+  static bool prove(MemoryLimitPool &pool) {
+    const auto token = pool.process_rss_.begin_resident_sample();
+    return pool.process_rss_.publish_resident_sample(
+        token, MemoryLimitPool::read_background_resident_sample());
+  }
+  static size_t room(MemoryLimitPool &pool) {
+    return pool.process_rss_.available();
+  }
+  static bool hold_registry_until_waiter(MemoryLimitPool &pool,
+                                         std::promise<void> &ready,
+                                         std::atomic<bool> &stop) {
+    std::lock_guard<std::mutex> lock(pool.cache_mapping_mutex_);
+    ready.set_value();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!stop.load() && !pool.workspace_waiting_size_.load() &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    return pool.workspace_waiting_size_.load() != 0;
+  }
   static bool configure_rss(MemoryLimitPool &pool) {
     return pool.process_rss_.configure(
         size_t{128} * 1024 * 1024,
@@ -55,7 +86,12 @@ struct MemoryLimitPoolTestPeer {
   }
   static bool configure_rss(MemoryLimitPool &pool, size_t limit) {
     pool.stop_background_evictor();
-    return pool.process_rss_.configure(limit, +[] { return rss; });
+    // This controlled sample includes the fixture backing that predates the
+    // new small-slot chunk; declare it explicitly instead of inferring it.
+    initial_owned = pool.committed();
+    return pool.process_rss_.configure(
+        limit, +[] { return rss; }, nullptr, 0,
+        +[]() -> ProcessRssBudget::ResidentSample { return {rss, initial_owned}; });
   }
   static void refresh_rss(MemoryLimitPool &pool) {
     pool.process_rss_.refresh(true);
@@ -63,6 +99,7 @@ struct MemoryLimitPoolTestPeer {
   static size_t rss_available(MemoryLimitPool &pool) {
     return pool.process_rss_.available();
   }
+  inline static size_t initial_owned = 0;
   static constexpr size_t rss = 32 * 1024 * 1024;
 };
 
@@ -355,6 +392,56 @@ class ParquetBudgetTest : public testing::Test {
       ailego::PoolPayloadBudget::get_instance();
   size_t previous_capacity_{0};
 };
+
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+TEST_F(ParquetBudgetTest, RequiredSmallSlotWaitsForOwnershipConfirmation) {
+  ASSERT_EQ(0, budget_.init(256UL << 20));
+  auto &native = ailego::MemoryLimitPool::get_instance();
+  ailego::MemoryLimitPoolTestPeer::stop_background(native);
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(native.configure_process_rss_limit(0));
+    ailego::MemoryLimitPoolTestPeer::start_background(native);
+  });
+  ParquetMemoryPool allocator(arrow::default_memory_pool(), true, true);
+  uint8_t *first = nullptr, *second = nullptr;
+  ASSERT_TRUE(allocator.Allocate(1024, 64, &first).ok());
+  auto release = ailego::ScopeGuard::Make([&] {
+    if (second) allocator.Free(second, 1024, 64);
+    allocator.Free(first, 1024, 64);
+  });
+  std::memset(first, 0x55, 1024);
+  auto *workspace = native.try_acquire_workspace_buffer(64UL << 20);
+  ASSERT_NE(nullptr, workspace);
+  auto unmap = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(native.release_workspace_buffer(workspace)); });
+  std::memset(workspace->data, 0x66, workspace->bytes);
+  ASSERT_TRUE(native.configure_process_rss_limit(
+      ailego::MemoryHelper::SelfRSS() + (32UL << 20)));
+  ASSERT_TRUE(ailego::MemoryLimitPoolTestPeer::prove(native));
+  ailego::MemoryLimitPoolTestPeer::refresh_rss(native);
+  ASSERT_EQ(0u, ailego::MemoryLimitPoolTestPeer::room(native));
+  std::promise<void> ready;
+  std::atomic<bool> stop{false}, waited{false};
+  std::thread holder([&] {
+    waited = ailego::MemoryLimitPoolTestPeer::hold_registry_until_waiter(
+        native, ready, stop);
+  });
+  auto join = ailego::ScopeGuard::Make([&] {
+    stop = true;
+    if (holder.joinable()) holder.join();
+  });
+  ready.get_future().wait();
+  ailego::MemoryLimitPoolTestPeer::start_background(native);
+  const auto status = allocator.Allocate(1024, 64, &second);
+  stop = true;
+  holder.join();
+  ASSERT_TRUE(status.ok()) << status;
+  EXPECT_TRUE(waited);
+  EXPECT_EQ(0x55, first[0]);
+  EXPECT_EQ(0x66, workspace->data[0]);
+}
+#endif
 
 TEST_F(ParquetBudgetTest, FetchScratchRetainsChargeAndBoundsReallocation) {
   ASSERT_EQ(0, budget_.init(8 * 1024 * 1024));
@@ -858,7 +945,8 @@ TEST_F(ParquetBudgetTest,
   EXPECT_EQ(17, buffer[kThreshold - 1]);
   ASSERT_TRUE(pool.Reallocate(kThreshold, 2 * kThreshold, &buffer).ok());
   EXPECT_EQ(17, buffer[kThreshold - 1]);
-  EXPECT_EQ(pool.mapped_bytes(), budget_.external_used());
+  ASSERT_GE(pool.mapped_bytes(), 0);
+  EXPECT_EQ(static_cast<size_t>(pool.mapped_bytes()), budget_.external_used());
   ASSERT_TRUE(pool.Reallocate(2 * kThreshold, 1024, &buffer).ok());
   EXPECT_EQ(17, buffer[1023]);
   ASSERT_TRUE(pool.Reallocate(1024, 0, &buffer).ok());
@@ -884,7 +972,8 @@ TEST_F(ParquetBudgetTest, MappedShrinkNeedsNoOverlapBudget) {
   EXPECT_EQ(1, pool.num_mapped_allocations());
   EXPECT_EQ(2 * kThreshold, pool.max_memory());
   EXPECT_LT(pool.mapped_bytes(), mapped);
-  EXPECT_EQ(pool.mapped_bytes(), pool.charged_bytes());
+  ASSERT_GE(pool.mapped_bytes(), 0);
+  EXPECT_EQ(static_cast<size_t>(pool.mapped_bytes()), pool.charged_bytes());
   EXPECT_EQ(remaining + pool.charged_bytes(), budget_.external_used());
   EXPECT_EQ(pool.charged_bytes() + remaining, budget_.committed());
   pool.Free(buffer, kThreshold);
@@ -929,8 +1018,9 @@ TEST_F(ParquetBudgetTest, MappedShrinkWithinPageRetainsBackingCharge) {
   ASSERT_TRUE(pool.Reallocate(kThreshold + 100, kThreshold + 99, &buffer).ok());
   EXPECT_EQ(original, buffer);
   EXPECT_EQ(mapped, pool.mapped_bytes());
-  EXPECT_EQ(mapped, pool.charged_bytes());
-  EXPECT_EQ(mapped, budget_.external_used());
+  ASSERT_GE(mapped, 0);
+  EXPECT_EQ(static_cast<size_t>(mapped), pool.charged_bytes());
+  EXPECT_EQ(static_cast<size_t>(mapped), budget_.external_used());
   EXPECT_EQ(kThreshold + 99, pool.bytes_allocated());
   pool.Free(buffer, kThreshold + 99);
   EXPECT_EQ(0u, budget_.external_used());
@@ -979,7 +1069,8 @@ TEST_F(ParquetBudgetTest, MappedShrinkAdmitsPreBudgetAllocation) {
   ASSERT_TRUE(pool.Reallocate(2 * kThreshold, kThreshold, &buffer).ok());
   EXPECT_NE(original, buffer);
   EXPECT_EQ(47, buffer[kThreshold - 1]);
-  EXPECT_EQ(pool.mapped_bytes(), pool.charged_bytes());
+  ASSERT_GE(pool.mapped_bytes(), 0);
+  EXPECT_EQ(static_cast<size_t>(pool.mapped_bytes()), pool.charged_bytes());
   EXPECT_EQ(pool.charged_bytes(), budget_.external_used());
   pool.Free(buffer, kThreshold);
   EXPECT_EQ(0u, budget_.used());

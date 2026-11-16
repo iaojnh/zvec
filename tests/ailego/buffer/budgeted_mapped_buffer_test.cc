@@ -25,6 +25,7 @@ class BudgetedMappedBufferTest : public testing::Test {
   PoolPayloadBudget &pool_ = PoolPayloadBudget::get_instance();
   const size_t page_ = PoolPayloadBudget::page_buffer_size();
   size_t old_capacity_{0};
+  const size_t descriptor_ = sizeof(MemoryLimitPool::WorkspaceBuffer);
 };
 
 TEST_F(BudgetedMappedBufferTest, ChargesRoundedMappingAndReleasesOnClear) {
@@ -47,20 +48,22 @@ TEST_F(BudgetedMappedBufferTest, ChargesRoundedMappingAndReleasesOnClear) {
 }
 
 TEST_F(BudgetedMappedBufferTest, FailedGrowthPreservesOldMappingAndCanRetry) {
-  ASSERT_EQ(0, pool_.init(3 * page_));
+  // Keep the original three-page payload budget; both live mappings also
+  // pay their registered descriptors during replacement.
+  ASSERT_EQ(0, pool_.init(3 * page_ + 2 * descriptor_));
   BudgetedMappedBuffer buffer(page_);
   buffer.resize(2 * page_);
   char *old = buffer.data();
   std::memset(old, 0x6b, buffer.size());
   EXPECT_THROW(buffer.resize(3 * page_), std::bad_alloc);
   EXPECT_EQ(old, buffer.data());
-  EXPECT_EQ(2 * page_, pool_.used());
+  EXPECT_EQ(2 * page_ + descriptor_, pool_.used());
   EXPECT_EQ(0x6b, buffer.data()[page_]);
   EXPECT_NO_THROW(buffer.resize(2 * page_));
   EXPECT_EQ(old, buffer.data());
   buffer.clear();
   ASSERT_NO_THROW(buffer.resize(3 * page_));
-  EXPECT_EQ(3 * page_, pool_.used());
+  EXPECT_EQ(3 * page_ + descriptor_, pool_.used());
 }
 
 TEST_F(BudgetedMappedBufferTest, MoveAssignmentReleasesDestinationOnly) {
@@ -75,11 +78,11 @@ TEST_F(BudgetedMappedBufferTest, MoveAssignmentReleasesDestinationOnly) {
   EXPECT_EQ(0u, source.mapped_size());
   EXPECT_EQ(data, destination.data());
   EXPECT_EQ('x', destination.data()[0]);
-  EXPECT_EQ(2 * page_, pool_.used());
+  EXPECT_EQ(2 * page_ + descriptor_, pool_.used());
   BudgetedMappedBuffer moved(std::move(destination));
   EXPECT_EQ(nullptr, destination.data());
   EXPECT_EQ(data, moved.data());
-  EXPECT_EQ(2 * page_, pool_.used());
+  EXPECT_EQ(2 * page_ + descriptor_, pool_.used());
 }
 
 TEST_F(BudgetedMappedBufferTest, ChargeFollowsCrossThreadOwnership) {
@@ -100,7 +103,7 @@ TEST_F(BudgetedMappedBufferTest, RejectsRoundingOverflowWithoutChangingBuffer) {
   EXPECT_THROW(buffer.resize(std::numeric_limits<size_t>::max()),
                std::bad_alloc);
   EXPECT_EQ(data, buffer.data());
-  EXPECT_EQ(page_, pool_.used());
+  EXPECT_EQ(page_ + descriptor_, pool_.used());
   EXPECT_EQ(0u, BudgetedMappedBuffer::mapping_size(0));
 }
 
@@ -108,7 +111,7 @@ TEST_F(BudgetedMappedBufferTest, RepeatedMappingDoesNotRetainCharges) {
   for (size_t round = 0; round < 32; ++round) {
     BudgetedMappedBuffer buffer(8 * page_);
     std::memset(buffer.data(), 0x77, buffer.size());
-    EXPECT_EQ(8 * page_, pool_.used());
+    EXPECT_EQ(8 * page_ + descriptor_, pool_.used());
     buffer.resize(0);
     EXPECT_EQ(0u, pool_.used());
   }

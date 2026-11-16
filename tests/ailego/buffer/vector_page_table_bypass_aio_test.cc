@@ -183,8 +183,7 @@ class BypassAioTest : public ::testing::Test {
                                  mode == FakeAio::Mode::DUPLICATE ||
                                  mode == FakeAio::Mode::REJECTED_RING;
     EXPECT_EQ(retried_destroy ? 2u : 1u, fake_.destroy_calls);
-    if (mode == FakeAio::Mode::SUCCESS)
-      EXPECT_EQ(4u, pool.stats().aio_pages_submitted);
+    if (mode == FakeAio::Mode::SUCCESS) { EXPECT_EQ(4u, pool.stats().aio_pages_submitted); }
   }
 
   FakeAio fake_;

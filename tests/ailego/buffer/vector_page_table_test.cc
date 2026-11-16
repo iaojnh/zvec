@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -64,6 +65,15 @@ namespace zvec::ailego {
 
 // Model clean-only reclaim's transition before it checks for a concurrent
 // rewrite, without sleeps or changing production thread scheduling.
+// Isolate weighted-entry quotas from unrelated empty producer metadata left
+// by preceding concurrency tests. Producer traversal bounds are tested
+// separately by CleanupVisitsEveryProducerWithoutRepeatingLiveItems.
+struct BlockEvictionQueueTestPeer {
+  static std::unique_ptr<BlockEvictionQueue> make() {
+    return std::unique_ptr<BlockEvictionQueue>(new BlockEvictionQueue());
+  }
+};
+
 struct VectorPageTableTestPeer {
   static bool begin_clean_reclaim(VectorPageTable &table, block_id_t id) {
     int released = 0;
@@ -215,7 +225,7 @@ class BufferPoolTest : public ::testing::Test {
            kVectorPageSize;
   }
   void init_vec_pool(size_t capacity_pages, size_t file_pages,
-                     bool writable = false) {
+                     bool writable = false, size_t workspace_metadata = 0) {
     size_t metadata =
         VecBufferPool::metadata_bytes_for_page_count(file_pages, writable);
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -224,7 +234,8 @@ class BufferPoolTest : public ::testing::Test {
 #endif
     ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
                      capacity_pages * kVectorPageSize +
-                     slab_headers_for_pages(capacity_pages) + metadata));
+                     slab_headers_for_pages(capacity_pages) + metadata +
+                     workspace_metadata));
   }
   void init_table_pool(size_t capacity_pages, size_t entry_num) {
     ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
@@ -738,7 +749,8 @@ TEST_F(BufferPoolTest,
 }
 
 TEST_F(BufferPoolTest, WritableBypassPreservesDirtyPagesWithoutAdmission) {
-  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true);
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true,
+                sizeof(MemoryLimitPool::WorkspaceBuffer));
   VecBufferPool pool(new_file(/*num_pages=*/2), /*writable=*/true);
   ASSERT_EQ(0, pool.init());
   char *page = pool.acquire_buffer(0, 0);
@@ -2210,7 +2222,8 @@ TEST_F(BufferPoolTest, RetirementCleanupIsBoundedAndPreservesLiveMembership) {
 }
 
 TEST_F(BufferPoolTest, RetirementCleanupFavorsProbationWithoutStarvingOtherTiers) {
-  auto &queue = BlockEvictionQueue::get_instance();
+  auto isolated_queue = BlockEvictionQueueTestPeer::make();
+  auto &queue = *isolated_queue;
   constexpr size_t kEntries = 512;
   for (size_t priority = 0; priority < BlockEvictionQueue::kQueueCount;
        ++priority) {
@@ -2228,10 +2241,11 @@ TEST_F(BufferPoolTest, RetirementCleanupFavorsProbationWithoutStarvingOtherTiers
 }
 
 TEST_F(BufferPoolTest, RetirementCleanupSpendsUnusedSharesOnNonemptyTiers) {
-  auto &queue = BlockEvictionQueue::get_instance();
   for (size_t priority = 0; priority < BlockEvictionQueue::kQueueCount;
        ++priority) {
     SCOPED_TRACE(priority);
+    auto isolated_queue = BlockEvictionQueueTestPeer::make();
+    auto &queue = *isolated_queue;
     for (size_t entry = 0; entry < 256; ++entry)
       ASSERT_TRUE(queue.add_single_block({}, static_cast<int>(priority)));
     queue.request_dead_entry_cleanup();
@@ -2245,7 +2259,8 @@ TEST_F(BufferPoolTest, RetirementCleanupSpendsUnusedSharesOnNonemptyTiers) {
 }
 
 TEST_F(BufferPoolTest, RetirementCleanupRotatesSingleEntryBudgets) {
-  auto &queue = BlockEvictionQueue::get_instance();
+  auto isolated_queue = BlockEvictionQueueTestPeer::make();
+  auto &queue = *isolated_queue;
   for (size_t priority = 0; priority < BlockEvictionQueue::kQueueCount;
        ++priority) {
     for (size_t entry = 0; entry < 4; ++entry)
