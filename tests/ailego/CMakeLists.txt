@@ -8,8 +8,6 @@ file(GLOB_RECURSE ALL_TEST_SRCS *_test.cc)
 # component DSO embed zvec_ailego's static archive.  The storage layer relies
 # on shared capacity/accounting state across those images.
 if(WIN32 AND TARGET zvec_ailego_shared)
-  # Windows DLLs do not coalesce independent static-library copies. Exercise
-  # the supported SDK boundary: host and plugin import the same ailego DLL.
   cc_library(
     NAME cross_dso_buffer_pool_probe SHARED EXCLUDE STRICT
     SRCS buffer/cross_dso_buffer_pool_probe.cc
@@ -23,13 +21,18 @@ elseif(NOT WIN32 AND NOT IOS AND NOT ANDROID)
   )
 endif()
 
+if(TARGET cross_dso_buffer_pool_probe AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Check shared state even when component methods bind to their own image.
+  target_link_options(cross_dso_buffer_pool_probe PRIVATE
+    "-Wl,-Bsymbolic-functions")
+endif()
+
 foreach(CC_SRCS ${ALL_TEST_SRCS})
   get_filename_component(CC_TARGET ${CC_SRCS} NAME_WE)
   # io_uring is only enabled on Linux. Do not create an empty test binary on
   # other platforms: mobile CI intentionally rejects zero-test suites.
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-     (CC_TARGET STREQUAL "iouring_loader_test" OR CC_TARGET STREQUAL
-      "vector_page_table_bypass_aio_test"))
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CC_TARGET STREQUAL
+     "iouring_loader_test")
     continue()
   endif()
   set(CC_TEST_LIBS zvec_ailego)
@@ -47,5 +50,9 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
     LIBS ${CC_TEST_LIBS}
     SRCS ${CC_SRCS}
   )
+  if(CC_TARGET STREQUAL "cross_dso_buffer_pool_test" AND
+     CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(${CC_TARGET} PRIVATE "-Wl,--export-dynamic")
+  endif()
   cc_test_suite(zvec_ailego ${CC_TARGET})
 endforeach()

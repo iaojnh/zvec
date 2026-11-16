@@ -151,7 +151,7 @@ class BufferPoolTest : public ::testing::Test {
            kVectorPageSize;
   }
   void init_vec_pool(size_t capacity_pages, size_t file_pages,
-                     bool writable = false) {
+                     bool writable = false, size_t workspace_metadata = 0) {
     size_t metadata =
         VecBufferPool::metadata_bytes_for_page_count(file_pages, writable);
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -160,7 +160,8 @@ class BufferPoolTest : public ::testing::Test {
 #endif
     ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
                      capacity_pages * kVectorPageSize +
-                     slab_headers_for_pages(capacity_pages) + metadata));
+                     slab_headers_for_pages(capacity_pages) + metadata +
+                     workspace_metadata));
   }
   void init_table_pool(size_t capacity_pages, size_t entry_num) {
     ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
@@ -415,7 +416,8 @@ TEST_F(BufferPoolTest, BulkReadDoesNotAdmitFirstTouchScanUnderPressure) {
 }
 
 TEST_F(BufferPoolTest, WritableBypassPreservesDirtyPagesWithoutAdmission) {
-  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true);
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true,
+                sizeof(MemoryLimitPool::WorkspaceBuffer));
   VecBufferPool pool(new_file(/*num_pages=*/2), /*writable=*/true);
   ASSERT_EQ(0, pool.init());
   char *page = pool.acquire_buffer(0, 0);

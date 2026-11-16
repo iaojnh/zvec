@@ -53,6 +53,10 @@ struct MemoryLimitPoolTestPeer {
     rss_sample = rss;
     pool.process_rss_.refresh(true);
   }
+  static bool confirm_rss(MemoryLimitPool &pool, size_t owned) {
+    return pool.process_rss_.publish_resident_sample(
+        pool.process_rss_.begin_resident_sample(), {rss_sample, owned});
+  }
 
   static ProcessRssBudget::ResidentSample slab_resident_sample() {
     return MemoryLimitPool::read_slab_resident_sample();
@@ -281,6 +285,9 @@ TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
   const size_t limit = baseline_ + 256 * page_;
   ASSERT_TRUE(
       MemoryLimitPoolTestPeer::configure_rss(pool_, limit, limit - 4 * page_));
+  // A raw RSS observation alone cannot establish overlap with the queue's
+  // existing backing. Supply that witness before testing the remaining room.
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::confirm_rss(pool_, baseline_));
   ASSERT_TRUE(pool_.under_process_rss_pressure());
   const auto timeout = std::chrono::milliseconds(1);
   char *buffer = nullptr;

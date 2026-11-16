@@ -219,7 +219,9 @@ arrow::Status ParquetMemoryPool::allocate_small(int64_t size, int64_t alignment,
   lock.unlock();
   bool admitted = !reused_chunk;
   try {
-    if (reused_chunk) admitted = budget.try_materialize_retained_block(chunk);
+    if (reused_chunk)
+      admitted =
+          budget.try_materialize_retained_block(chunk, /*required=*/true);
   } catch (...) {
     release_small_chunk(chunk, nullptr);
     throw;

@@ -38,6 +38,8 @@ class ResidentSamplePublishTest : public testing::Test {
     ASSERT_TRUE(budget.try_acquire(256 * kMiB));
     rss = 320 * kMiB;
     budget.refresh(true);
+    ASSERT_TRUE(budget.publish_resident_sample(budget.begin_resident_sample(),
+                                               {rss, 256 * kMiB}));
     ASSERT_TRUE(budget.try_acquire(32 * kMiB));  // Untouched owner.
     budget.release(128 * kMiB);
     ASSERT_TRUE(budget.try_acquire(128 * kMiB));
