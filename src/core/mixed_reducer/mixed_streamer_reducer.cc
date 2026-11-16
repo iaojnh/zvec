@@ -725,7 +725,11 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) try {
   }
 
   auto holder = std::make_shared<MergedProviderIndexHolder>(
-      original_query_meta_, std::move(sources), std::move(source_memory));
+      original_query_meta_, std::move(sources), std::move(source_memory),
+      ailego::MemoryLimitPool::get_instance().capacity() != 0 &&
+          (target_builder_->name() == "IVFBuilder" ||
+           target_builder_->name() == "DiskAnnBuilder" ||
+           target_builder_->name() == "IvfRabitqBuilder"));
   int ret = holder->init(filter, stop_flag_);
   if (ret != 0) {
     LOG_ERROR("Failed to initialize merged provider holder, ret=%d", ret);

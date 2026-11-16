@@ -228,6 +228,8 @@ class MergedProviderIndexHolder::Iterator final : public IndexHolder::Iterator {
 
 struct MergedProviderIndexHolder::OrdinalMap {
   PagedBuildBuffer keys;
+  PagedBuildBuffer vectors;
+  bool spooled{false};
   ailego::BudgetedVector<size_t> source_ends;
 };
 
@@ -285,7 +287,33 @@ int MergedProviderIndexHolder::prepare_ordinal_map() {
   if (total != count()) return fail(IndexError_Mismatch);
   ret = flush();
   if (ret != 0) return fail(ret);
-  // Publish only after the entire map is valid. Readers never mutate it.
+  if (spool_vectors_) {
+    // Source postings may be transposed and ordered differently from keys.
+    // Reading them by key on every build pass repeatedly reads whole spans.
+    // Decode once using the ordinary iterator, preserving its filter/error
+    // contract, and keep the sole rebuild copy in the existing pageable pool.
+    if (!ailego::MemoryLimitPool::get_instance().capacity())
+      return fail(IndexError_InvalidArgument);
+    if (count() > std::numeric_limits<size_t>::max() / element_size())
+      return fail(IndexError_Overflow);
+    ret = map->vectors.init(count() * element_size());
+    if (ret != 0) return fail(ret);
+    Iterator iter(this);
+    size_t ordinal = 0;
+    for (; iter.is_valid(); iter.next(), ++ordinal) {
+      if (ordinal >= count()) return fail(IndexError_Mismatch);
+      const void *data = iter.data();
+      if (iter.status() != 0) return fail(iter.status());
+      if (!data) return fail(IndexError_ReadData);
+      ret = map->vectors.write(ordinal * element_size(), data, element_size());
+      if (ret != 0) return fail(ret);
+    }
+    if (iter.status() != 0) return fail(iter.status());
+    if (ordinal != count()) return fail(IndexError_Mismatch);
+    map->spooled = true;
+  }
+  // Publish only after the entire map and optional spool are valid.
+  // Readers never mutate either one.
   ordinal_map_ = std::move(map);
   return 0;
 }
@@ -302,7 +330,8 @@ class MergedProviderIndexHolder::OrdinalReader final
 
   int read(size_t ordinal, uint64_t *key, const void **data) override {
     // The previous vector is only valid until this call, including failed
-    // reads. Release its page pin or owned scratch before requesting another.
+    // reads. Release source pins/owned blocks before requesting another;
+    // spooled readers reuse their own single, charged row workspace.
     block_ = {};
     if (data) {
       *data = nullptr;
@@ -318,6 +347,21 @@ class MergedProviderIndexHolder::OrdinalReader final
     }
     if (owner_->canceled()) {
       return fail(IndexError_Canceled);
+    }
+    if (map_->spooled) {
+      try {
+        scratch_.reserve(owner_->element_size());
+        scratch_.value.resize(owner_->element_size());
+        const int ret = map_->vectors.read(
+            ordinal * owner_->element_size(), scratch_.value.data(),
+            owner_->element_size());
+        if (ret != 0) return fail(ret);
+        *key = ordinal;
+        *data = scratch_.value.data();
+        return 0;
+      } catch (const std::bad_alloc &) {
+        return fail(IndexError_NoMemory);
+      }
     }
     const size_t source_index =
         std::upper_bound(map_->source_ends.begin(), map_->source_ends.end(),
@@ -362,11 +406,15 @@ class MergedProviderIndexHolder::OrdinalReader final
     // MemoryBlock can reference a handle owned by the provider.
     block_ = {};
     provider_.reset();
+    std::string().swap(scratch_.value);
+    scratch_.memory.retain_at_most(0);
   }
 
  private:
   int fail(int status) {
     block_ = {};
+    std::string().swap(scratch_.value);
+    scratch_.memory.retain_at_most(0);
     owner_->set_status(status);
     return status;
   }
@@ -375,7 +423,49 @@ class MergedProviderIndexHolder::OrdinalReader final
   std::shared_ptr<const OrdinalMap> map_;
   IndexProvider::Pointer provider_{};
   IndexStorage::MemoryBlock block_{};
+  ailego::BudgetedStringWorkspace scratch_;
   size_t source_index_{0};
+};
+
+class MergedProviderIndexHolder::SpoolIterator final
+    : public IndexHolder::Iterator {
+ public:
+  explicit SpoolIterator(MergedProviderIndexHolder *owner)
+      : owner_(owner), reader_(owner) {}
+
+  const void *data() const override {
+    prepare();
+    return data_;
+  }
+  uint64_t key() const override {
+    prepare();
+    return key_;
+  }
+  bool is_valid() const override {
+    return ordinal_ < owner_->count() && status() == 0;
+  }
+  int status() const override {
+    return owner_->status();
+  }
+  void next() override {
+    if (!is_valid()) return;
+    ++ordinal_;
+    prepared_ = false;
+    data_ = nullptr;
+  }
+
+ private:
+  void prepare() const {
+    if (prepared_ || !is_valid()) return;
+    prepared_ = true;
+    if (reader_.read(ordinal_, &key_, &data_) != 0) data_ = nullptr;
+  }
+  MergedProviderIndexHolder *owner_;
+  mutable OrdinalReader reader_;
+  size_t ordinal_{0};
+  mutable bool prepared_{false};
+  mutable uint64_t key_{std::numeric_limits<uint64_t>::max()};
+  mutable const void *data_{nullptr};
 };
 
 int MergedProviderIndexHolder::create_ordinal_reader(
@@ -386,9 +476,10 @@ int MergedProviderIndexHolder::create_ordinal_reader(
   if (status() != 0) {
     return status();
   }
-  // Reverted/converted vectors still use the materialized builder path.
+  // Borrowed reverted vectors still use the materialized builder path.
+  // A spool has already decoded them through the ordinary iterator.
   for (const auto &source : sources_) {
-    if (source.need_revert) {
+    if (source.need_revert && !spool_vectors_) {
       return IndexError_NotImplemented;
     }
   }
@@ -450,8 +541,9 @@ int MergedProviderIndexHolder::retain_stable_data(
 
 MergedProviderIndexHolder::MergedProviderIndexHolder(
     IndexQueryMeta output_meta, std::vector<Source> sources,
-    ailego::MemoryReservation source_memory)
-    : output_meta_(output_meta), source_memory_(std::move(source_memory)) {
+    ailego::MemoryReservation source_memory, bool spool_vectors)
+    : output_meta_(output_meta), source_memory_(std::move(source_memory)),
+      spool_vectors_(spool_vectors) {
   // Reducers reserve before constructing the directory; direct callers hand
   // over a caller-owned vector, whose capacity becomes ours at this boundary.
   if (!source_memory_.bytes())
@@ -629,6 +721,13 @@ IndexHolder::Iterator::Pointer
 MergedProviderIndexHolder::create_iterator() try {
   if (!initialized_ || this->status() != 0) {
     return IndexHolder::Iterator::Pointer();
+  }
+  if (spool_vectors_) {
+    if (prepare_ordinal_map() != 0) return nullptr;
+    auto result = IndexHolder::Iterator::Pointer(
+        new (std::nothrow) SpoolIterator(this));
+    if (!result) set_status(IndexError_NoMemory);
+    return result;
   }
   auto result =
       IndexHolder::Iterator::Pointer(new (std::nothrow) Iterator(this));
