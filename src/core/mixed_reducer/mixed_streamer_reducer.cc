@@ -699,10 +699,17 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) try {
                           sizeof(MergedProviderIndexHolder::Source));
   std::vector<MergedProviderIndexHolder::Source> sources;
   sources.reserve(streamers_.size());
+  bool has_nonflat_source = false;
 
   for (size_t i = 0; i < streamers_.size(); ++i) {
     MergedProviderIndexHolder::Source source;
     source.owner = streamers_[i];
+    // Flat providers already expose row-wise vectors. An additional snapshot
+    // gives them no posting-read benefit and would retain another page table
+    // alongside the builder's mandatory scratch under the same fixed budget.
+    const auto &name = streamers_[i]->name();
+    has_nonflat_source |= name != "FlatStreamer" && name != "FlatStreamer16" &&
+                          name != "FlatStreamer32" && name != "LinearStreamer";
     source.reformer = source_streamers_reformers_[i];
     source.quantizer = source_streamers_quantizers_[i];
     const auto &meta = streamers_[i]->meta();
@@ -727,6 +734,7 @@ int MixedStreamerReducer::reduce_with_builder(const IndexFilter &filter) try {
   auto holder = std::make_shared<MergedProviderIndexHolder>(
       original_query_meta_, std::move(sources), std::move(source_memory),
       params_.get_as_bool(PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS) &&
+          has_nonflat_source &&
           ailego::MemoryLimitPool::get_instance().capacity() != 0 &&
           (target_builder_->name() == "IVFBuilder" ||
            target_builder_->name() == "DiskAnnBuilder" ||

@@ -296,7 +296,9 @@ int MergedProviderIndexHolder::prepare_ordinal_map() {
       return fail(IndexError_InvalidArgument);
     if (count() > std::numeric_limits<size_t>::max() / element_size())
       return fail(IndexError_Overflow);
-    ret = map->vectors.init(count() * element_size());
+    // Tiny snapshots do not justify a writable page table. Use the existing
+    // bounded, precharged inline path; larger snapshots remain pageable.
+    ret = map->vectors.init(count() * element_size(), 64 * 1024);
     if (ret != 0) return fail(ret);
     Iterator iter(this);
     size_t ordinal = 0;
