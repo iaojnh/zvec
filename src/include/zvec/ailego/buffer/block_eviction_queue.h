@@ -88,6 +88,7 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
 };
 
 class ZVEC_AILEGO_API BlockEvictionQueue {
+  friend struct BlockEvictionQueueTestPeer;
  public:
   static constexpr size_t kQueueCount = 3;
   static constexpr uint8_t kProbationPriority = 0;

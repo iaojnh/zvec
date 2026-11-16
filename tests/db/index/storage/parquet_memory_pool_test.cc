@@ -338,7 +338,8 @@ TEST_F(ParquetBudgetTest,
   EXPECT_EQ(17, buffer[kThreshold - 1]);
   ASSERT_TRUE(pool.Reallocate(kThreshold, 2 * kThreshold, &buffer).ok());
   EXPECT_EQ(17, buffer[kThreshold - 1]);
-  EXPECT_EQ(pool.mapped_bytes(), budget_.external_used());
+  ASSERT_GE(pool.mapped_bytes(), 0);
+  EXPECT_EQ(static_cast<size_t>(pool.mapped_bytes()), budget_.external_used());
   ASSERT_TRUE(pool.Reallocate(2 * kThreshold, 1024, &buffer).ok());
   EXPECT_EQ(17, buffer[1023]);
   ASSERT_TRUE(pool.Reallocate(1024, 0, &buffer).ok());

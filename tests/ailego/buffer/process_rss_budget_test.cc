@@ -463,10 +463,10 @@ TEST_F(ResidentSamplePublishTest, PressureChangesExpireInFlightProofs) {
       const size_t room = budget.available();
       EXPECT_EQ(from == to, budget.publish_resident_sample(
                                 token, {sampled_rss.load(), 256 * kMiB}));
-      if (from != to) EXPECT_EQ(room, budget.available());
+      if (from != to) { EXPECT_EQ(room, budget.available()); }
       EXPECT_TRUE(budget.publish_resident_sample(
           budget.begin_resident_sample(), {sampled_rss.load(), 256 * kMiB}));
-      if (to == Pressure::kCritical) EXPECT_EQ(0u, budget.available());
+      if (to == Pressure::kCritical) { EXPECT_EQ(0u, budget.available()); }
     }
   }
   budget.set_external_pressure(Pressure::kNormal);
@@ -503,7 +503,7 @@ TEST_F(ResidentSamplePublishTest, FailedReadsExpirePreFailureProofs) {
     const auto token = budget.begin_resident_sample();
     sampled_rss = 0;
     for (int i = 0; i < failures; ++i) budget.refresh(true);
-    if (failures == 3) EXPECT_EQ(0u, budget.available());
+    if (failures == 3) { EXPECT_EQ(0u, budget.available()); }
     sampled_rss = 320 * kMiB;
     const auto paused_room = budget.available();
     EXPECT_FALSE(budget.publish_resident_sample(

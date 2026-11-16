@@ -43,9 +43,10 @@ struct MemoryLimitPoolTestPeer {
     for (auto *mapping = pool.cache_mappings_; mapping;
          mapping = mapping->mapped_next) {
       EXPECT_EQ(previous, mapping->mapped_prev);
-      if (previous)
+      if (previous) {
         EXPECT_LT(reinterpret_cast<uintptr_t>(previous->data),
                   reinterpret_cast<uintptr_t>(mapping->data));
+      }
       previous = mapping;
       ++count;
     }
@@ -413,7 +414,7 @@ TEST_F(CacheMappingRssTest, MandatoryAllocatorsProgressAfterProofExpiry) {
       } else if (allocator == 4) {
         RetainedBlockAllocator<uint64_t> small;
         auto *first = small.allocate(8);
-        auto cleanup = ScopeGuard::Make([&] { small.deallocate(first, 8); });
+        auto release_first = ScopeGuard::Make([&] { small.deallocate(first, 8); });
         first[0] = 73;
         auto *second = small.allocate(8);
         small.deallocate(second, 8);
@@ -725,7 +726,7 @@ TEST_F(CacheMappingRssTest, WorkspaceTouchAndUnmapFailurePreserveAccounting) {
   auto *workspace = pool_.try_acquire_workspace_buffer(bytes);
   ASSERT_NE(nullptr, workspace);
   auto release = ScopeGuard::Make([&] {
-    if (workspace) EXPECT_TRUE(pool_.release_workspace_buffer(workspace));
+    if (workspace) { EXPECT_TRUE(pool_.release_workspace_buffer(workspace)); }
   });
   const auto untouched = MemoryLimitPoolTestPeer::sample();
   std::memset(workspace->data, 0x37, bytes / 2);
