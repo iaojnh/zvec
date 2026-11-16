@@ -2067,6 +2067,33 @@ TEST(MergedProviderIndexHolderTest, PageableSpoolDeclinesStableSourcePointers) {
   }
 }
 
+
+TEST(MergedProviderIndexHolderTest, TinySpoolUsesChargedBoundedInlineStorage) {
+  RestoreSpoolTestBudget restore;
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, pool.init(128UL << 10));
+  MergedProviderIndexHolder holder(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension),
+      {MakeSource(MakeStreamer({{7, 10.0F}, {19, 11.0F}}))}, {}, true);
+  ASSERT_EQ(0, holder.init({}));
+  const size_t metadata = pool.metadata_used();
+  const size_t external = pool.external_used();
+  OrdinalAccessHolder::Reader::Pointer reader;
+  ASSERT_EQ(0, holder.create_ordinal_reader(&reader));
+  // A few bytes of vectors must not allocate a writable file page table.
+  // The bounded inline copy is still admitted and charged before allocation.
+  EXPECT_EQ(metadata, pool.metadata_used());
+  EXPECT_GE(pool.external_used(),
+            external + holder.count() * holder.element_size());
+  uint64_t key = 99;
+  const void *data = nullptr;
+  ASSERT_EQ(0, reader->read(1, &key, &data));
+  EXPECT_EQ(1u, key);
+  ASSERT_NE(nullptr, data);
+  EXPECT_FLOAT_EQ(11.0F, static_cast<const float *>(data)[0]);
+  EXPECT_LE(pool.used(), pool.capacity());
+}
+
 }  // namespace
 }  // namespace core
 }  // namespace zvec
