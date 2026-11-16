@@ -1811,9 +1811,9 @@ TEST(MergedProviderIndexHolderTest, PageableSpoolReadsSourceOnceAcrossPasses) {
       if (holder.create_ordinal_reader(&local) != 0) return false;
       for (size_t i = 0; i < 128; ++i) {
         const size_t ordinal = (i * 61 + worker) % holder.count();
-        uint64_t key = 0;
+        uint64_t local_key = 0;
         const void *data = nullptr;
-        if (local->read(ordinal, &key, &data) != 0 || key != ordinal ||
+        if (local->read(ordinal, &local_key, &data) != 0 || local_key != ordinal ||
             !data || static_cast<const float *>(data)[0] !=
                          static_cast<float>(ordinal * 3 + 7)) return false;
       }
