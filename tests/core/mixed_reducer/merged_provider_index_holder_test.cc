@@ -1473,6 +1473,281 @@ TEST(MergedProviderIndexHolderTest, RejectsProviderMetaChangeBetweenPasses) {
 }
 
 
+struct RestoreSpoolTestBudget {
+  ~RestoreSpoolTestBudget() {
+    EXPECT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(capacity));
+  }
+  const size_t capacity{ailego::PoolPayloadBudget::get_instance().capacity()};
+};
+
+// Generate a transient row without keeping a full source payload in memory.
+class GeneratedSpoolProvider final : public IndexProvider {
+ public:
+  static constexpr size_t kRows = 8192;
+  static constexpr size_t kColumns = 256;
+  explicit GeneratedSpoolProvider(std::shared_ptr<size_t> reads)
+      : reads_(std::move(reads)) {}
+  class Iterator final : public IndexHolder::Iterator {
+   public:
+    explicit Iterator(std::shared_ptr<size_t> reads) : reads_(std::move(reads)) {}
+    const void *data() const override {
+      ++*reads_;
+      for (size_t i = 0; i < kColumns; ++i)
+        row_[i] = static_cast<float>(ordinal_ * 3 + 7 + i);
+      return row_;
+    }
+    bool is_valid() const override { return ordinal_ < kRows; }
+    uint64_t key() const override { return ordinal_ * 3 + 7; }
+    void next() override { ++ordinal_; }
+   private:
+    std::shared_ptr<size_t> reads_;
+    size_t ordinal_{0};
+    mutable float row_[kColumns]{};
+  };
+  IndexHolder::Iterator::Pointer create_iterator() override {
+    return std::make_unique<Iterator>(reads_);
+  }
+  size_t count() const override { return kRows; }
+  size_t dimension() const override { return kColumns; }
+  IndexMeta::DataType data_type() const override {
+    return IndexMeta::DataType::DT_FP32;
+  }
+  size_t element_size() const override { return kColumns * sizeof(float); }
+  const void *get_vector(uint64_t) const override {
+    ADD_FAILURE() << "Spooled readers must not return to the source by key";
+    return nullptr;
+  }
+  const std::string &owner_class() const override {
+    static const std::string name{"GeneratedSpoolProvider"};
+    return name;
+  }
+ private:
+  std::shared_ptr<size_t> reads_;
+};
+
+TEST(MergedProviderIndexHolderTest, PageableSpoolReadsSourceOnceAcrossPasses) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  auto reads = std::make_shared<size_t>(0);
+  auto lifetime = std::make_shared<ProviderLifetimeStats>();
+  auto streamer = std::make_shared<TestStreamer>(
+      [reads](size_t) { return std::make_shared<GeneratedSpoolProvider>(reads); },
+      lifetime, GeneratedSpoolProvider::kColumns);
+  auto source = MakeSource(streamer);
+  source.provider_meta = IndexQueryMeta(IndexMeta::DataType::DT_FP32,
+                                        GeneratedSpoolProvider::kColumns);
+  MergedProviderIndexHolder holder(
+      source.provider_meta, {source}, {}, true);
+  ASSERT_EQ(0, holder.init({}));
+  const size_t planned_reads = *reads;
+  // The 8MiB payload exceeds the 2MiB page/workspace budget. The source
+  // generator owns just one transient row; the snapshot must be pageable.
+  static_assert(GeneratedSpoolProvider::kRows *
+                    GeneratedSpoolProvider::kColumns * sizeof(float) > (2UL << 20));
+  for (size_t pass = 0; pass < 3; ++pass) {
+    auto iter = holder.create_iterator();
+    ASSERT_NE(nullptr, iter);
+    size_t ordinal = 0;
+    for (; iter->is_valid(); iter->next(), ++ordinal) {
+      EXPECT_EQ(ordinal, iter->key());
+      const auto *row = static_cast<const float *>(iter->data());
+      ASSERT_NE(nullptr, row);
+      EXPECT_FLOAT_EQ(float(ordinal * 3 + 7), row[0]);
+      EXPECT_FLOAT_EQ(float(ordinal * 3 + 7 + 255), row[255]);
+    }
+    ASSERT_EQ(0, iter->status());
+    EXPECT_EQ(GeneratedSpoolProvider::kRows, ordinal);
+    EXPECT_EQ(planned_reads + GeneratedSpoolProvider::kRows, *reads);
+    EXPECT_EQ(0u, lifetime->live_count);
+  }
+  OrdinalAccessHolder::Reader::Pointer reader, second;
+  ASSERT_EQ(0, holder.create_ordinal_reader(&reader));
+  ASSERT_EQ(0, holder.create_ordinal_reader(&second));
+  uint64_t key = 99;
+  const void *first = nullptr, *other = nullptr;
+  ASSERT_EQ(0, reader->read(7000, &key, &first));
+  EXPECT_EQ(7000u, key);
+  ASSERT_EQ(0, second->read(2, &key, &other));
+  EXPECT_FLOAT_EQ(21007.0F, static_cast<const float *>(first)[0]);
+  EXPECT_FLOAT_EQ(13.0F, static_cast<const float *>(other)[0]);
+  EXPECT_EQ(planned_reads + GeneratedSpoolProvider::kRows, *reads);
+  std::vector<std::future<bool>> workers;
+  for (size_t worker = 0; worker < 4; ++worker) {
+    workers.emplace_back(std::async(std::launch::async, [&, worker] {
+      OrdinalAccessHolder::Reader::Pointer local;
+      if (holder.create_ordinal_reader(&local) != 0) return false;
+      for (size_t i = 0; i < 128; ++i) {
+        const size_t ordinal = (i * 61 + worker) % holder.count();
+        uint64_t key = 0;
+        const void *data = nullptr;
+        if (local->read(ordinal, &key, &data) != 0 || key != ordinal ||
+            !data || static_cast<const float *>(data)[0] !=
+                         static_cast<float>(ordinal * 3 + 7)) return false;
+      }
+      return true;
+    }));
+  }
+  for (auto &worker : workers) EXPECT_TRUE(worker.get());
+  EXPECT_EQ(planned_reads + GeneratedSpoolProvider::kRows, *reads);
+  reader->reset();
+  ASSERT_EQ(0, reader->read(0, &key, &first));
+  EXPECT_FLOAT_EQ(7.0F, static_cast<const float *>(first)[0]);
+  EXPECT_EQ(IndexError_OutOfRange,
+            reader->read(GeneratedSpoolProvider::kRows, &key, &first));
+  EXPECT_EQ(nullptr, first);
+  EXPECT_LE(ailego::MemoryLimitPool::get_instance().used(),
+            ailego::MemoryLimitPool::get_instance().capacity());
+}
+
+TEST(MergedProviderIndexHolderTest, PageableSpoolKeepsFilterAndDenseOrdinalKeys) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  size_t filter_calls = 0;
+  IndexFilter filter;
+  filter.set([&](uint64_t key) { ++filter_calls; return key == 19 || key == 2; });
+  MergedProviderIndexHolder holder(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension),
+      {MakeSource(MakeStreamer({{7, 10.0F}, {19, 11.0F}})),
+       MakeSource(MakeStreamer({{0, 12.0F}})),
+       MakeSource(MakeStreamer({{8, 20.0F}, {99, 21.0F}}))}, {}, true);
+  ASSERT_EQ(0, holder.init(filter));
+  const std::vector<std::pair<uint64_t, float>> expected{
+      {0, 10.0F}, {1, 20.0F}, {2, 21.0F}};
+  EXPECT_EQ(expected, ReadAll(&holder));
+  EXPECT_EQ(expected, ReadAll(&holder));
+  EXPECT_EQ(5u, filter_calls);
+}
+
+TEST(MergedProviderIndexHolderTest, PageableSpoolRejectsSourceReadFailures) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  for (auto operation : {IteratorFailureOperation::kValidity,
+                         IteratorFailureOperation::kKey,
+                         IteratorFailureOperation::kData}) {
+    for (size_t failed_ordinal : {0u, 2u}) {
+      auto failure = std::make_shared<IteratorReadFailure>();
+      failure->operation = operation;
+      failure->ordinal = failed_ordinal;
+      failure->enabled = false;
+      MergedProviderIndexHolder holder(
+          IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension),
+          {MakeSource(MakeFailingIteratorStreamer(failure, 3))}, {}, true);
+      ASSERT_EQ(0, holder.init({}));
+      failure->enabled = true;
+      OrdinalAccessHolder::Reader::Pointer reader;
+      EXPECT_EQ(IndexError_ReadData, holder.create_ordinal_reader(&reader));
+      EXPECT_EQ(nullptr, reader);
+      EXPECT_EQ(IndexError_ReadData, holder.status());
+    }
+  }
+}
+
+TEST(MergedProviderIndexHolderTest, PageableSpoolHonorsCancellationAndEmptyInput) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  std::atomic<bool> stop{false};
+  MergedProviderIndexHolder holder(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension),
+      {MakeSource(MakeStreamer({{9, 10.0F}}))}, {}, true);
+  ASSERT_EQ(0, holder.init({}, &stop));
+  OrdinalAccessHolder::Reader::Pointer reader;
+  ASSERT_EQ(0, holder.create_ordinal_reader(&reader));
+  stop.store(true);
+  uint64_t key = 0;
+  const void *data = nullptr;
+  EXPECT_EQ(IndexError_Canceled, reader->read(0, &key, &data));
+  EXPECT_EQ(nullptr, data);
+  EXPECT_EQ(IndexError_Canceled, holder.status());
+  holder.set_stop_flag(nullptr);
+  MergedProviderIndexHolder empty(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension), {}, {}, true);
+  ASSERT_EQ(0, empty.init({}));
+  auto iter = empty.create_iterator();
+  ASSERT_NE(nullptr, iter);
+  EXPECT_FALSE(iter->is_valid());
+  EXPECT_EQ(0, iter->status());
+}
+
+TEST(MergedProviderIndexHolderTest, PageableSpoolDecodesAndRejectsDecodeFailure) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  for (bool fail : {false, true}) {
+    auto source = MakeSource(MakeStreamer({{0, 0.0F}, {1, 1.0F}}));
+    auto reformer = std::make_shared<ReadFailureReformer>();
+    source.reformer = reformer;
+    source.need_revert = true;
+    MergedProviderIndexHolder holder(source.provider_meta, {source}, {}, true);
+    ASSERT_EQ(0, holder.init({}));
+    reformer->fail = fail;
+    reformer->failed_value = 1.0F;
+    OrdinalAccessHolder::Reader::Pointer reader;
+    if (fail) {
+      EXPECT_EQ(IndexError_ReadData, holder.create_ordinal_reader(&reader));
+      EXPECT_EQ(nullptr, reader);
+      EXPECT_EQ(IndexError_ReadData, holder.status());
+    } else {
+      ASSERT_EQ(0, holder.create_ordinal_reader(&reader));
+      const void *data = nullptr;
+      uint64_t key = 99;
+      ASSERT_EQ(0, reader->read(1, &key, &data));
+      EXPECT_EQ(1u, key);
+      EXPECT_FLOAT_EQ(1.0F, static_cast<const float *>(data)[0]);
+      EXPECT_EQ((std::vector<std::pair<uint64_t, float>>{{0, 0.0F}, {1, 1.0F}}),
+                ReadAll(&holder));
+    }
+  }
+}
+
+TEST(MergedProviderIndexHolderTest, PageableSpoolDoesNotFallbackWhenBudgetFull) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  MergedProviderIndexHolder holder(
+      IndexQueryMeta(IndexMeta::DataType::DT_FP32, kDimension),
+      {MakeSource(MakeStreamer({{0, 0.0F}, {1, 1.0F}}))}, {}, true);
+  ASSERT_EQ(0, holder.init({}));
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t filler = pool.capacity() - pool.used();
+  ASSERT_TRUE(pool.try_charge_workspace(filler));
+  AILEGO_DEFER([&]() { pool.release_external(filler); });
+  OrdinalAccessHolder::Reader::Pointer reader;
+  EXPECT_EQ(IndexError_NoMemory, holder.create_ordinal_reader(&reader));
+  EXPECT_EQ(nullptr, reader);
+  EXPECT_EQ(IndexError_NoMemory, holder.status());
+}
+
+TEST(MergedProviderIndexHolderTest, BudgetedReducerSelectsSpoolForRebuilds) {
+  RestoreSpoolTestBudget restore;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  for (const auto *name : {"IVFBuilder", "DiskAnnBuilder", "IvfRabitqBuilder"}) {
+    auto reads = std::make_shared<size_t>(0);
+    auto lifetime = std::make_shared<ProviderLifetimeStats>();
+    auto source = std::make_shared<TestStreamer>(
+        [reads](size_t) { return std::make_shared<GeneratedSpoolProvider>(reads); },
+        lifetime, GeneratedSpoolProvider::kColumns);
+    ailego::ThreadPool pool(1, false);
+    auto builder = std::make_shared<RetainingTestBuilder>(name, &pool);
+    MixedStreamerReducer reducer;
+    ailego::Params params;
+    params.set(PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS, 1);
+    ASSERT_EQ(0, reducer.init(params));
+    reducer.set_thread_pool(&pool);
+    ASSERT_EQ(0, reducer.set_target_streamer_wiht_info(
+                     builder, source, nullptr, nullptr,
+                     IndexQueryMeta(IndexMeta::DataType::DT_FP32,
+                                    GeneratedSpoolProvider::kColumns)));
+    ASSERT_EQ(0, reducer.feed_streamer_with_reformer(source, nullptr));
+    ASSERT_EQ(0, reducer.reduce({}));
+    auto *merged = dynamic_cast<MergedProviderIndexHolder *>(builder->holder.get());
+    ASSERT_NE(nullptr, merged);
+    const auto first = ReadAll(merged);
+    ASSERT_EQ(GeneratedSpoolProvider::kRows, first.size());
+    const size_t first_pass_reads = *reads;
+    EXPECT_EQ(first, ReadAll(merged));
+    EXPECT_EQ(first_pass_reads, *reads);
+    EXPECT_EQ(0u, lifetime->live_count);
+  }
+}
+
 }  // namespace
 }  // namespace core
 }  // namespace zvec
