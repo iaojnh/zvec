@@ -113,12 +113,8 @@ size_t PrepareReadScratch(BudgetedMappedBuffer &scratch, size_t pages) {
                      std::max(size_t{1}, budget.available() / kVectorPageSize));
   while (pages != 0) {
     if (scratch.size() >= pages * kVectorPageSize) return pages;
-    try {
-      scratch.resize(pages * kVectorPageSize);
-      return pages;
-    } catch (const std::bad_alloc &) {
-      pages /= 2;
-    }
+    if (scratch.resize(pages * kVectorPageSize) == 0) return pages;
+    pages /= 2;
   }
   const auto stats = budget.stats();
   LOG_ERROR(
@@ -138,6 +134,10 @@ void VecBufferPool::PageLockDeleter::operator()(
 }
 
 VecBufferPool::~VecBufferPool() {
+  // Retire and wait for in-flight eviction callbacks before teardown. A
+  // callback can retain a page after force_evict_all_loaded() skips its
+  // evicting state, leaking that page when the table is destroyed.
+  BlockEvictionQueue::get_instance().set_invalid(&page_table_);
   // Finish queued writes before page buffers, latches, and descriptors go
   // away. The synchronous pass below catches any prior writeback error.
   stop_writeback();

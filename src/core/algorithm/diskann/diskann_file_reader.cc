@@ -401,11 +401,12 @@ static bool prepare_libaio_staging(IoBackend &ctx, const AlignedRead *reads,
     if (!reads[i].buf || !reads[i].len ||
         reads[i].len > (std::numeric_limits<size_t>::max)()) return false;
     const size_t slot = Buffer::mapping_size(static_cast<size_t>(reads[i].len));
-    if (slot > (std::numeric_limits<size_t>::max)() - bytes) return false;
+    if (!slot || slot > (std::numeric_limits<size_t>::max)() - bytes)
+      return false;
     bytes += slot;
   }
   if (!ctx.aio_staging) ctx.aio_staging = std::make_unique<Buffer>();
-  if (ctx.aio_staging->size() < bytes) ctx.aio_staging->resize(bytes);
+  if (ctx.aio_staging->size() < bytes) ctx.aio_staging->resize_or_throw(bytes);
   return true;
 } catch (const std::bad_alloc &) {
   return false;

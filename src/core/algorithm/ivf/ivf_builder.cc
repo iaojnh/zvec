@@ -911,7 +911,7 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
   // A single vector larger than the budget is still allowed to make progress.
   const size_t window_size = std::min(
       holder->count(), std::max<size_t>(1, kLabelMemoryBudget / elem_size));
-  vectors.resize(window_size * elem_size);
+  vectors.resize_or_throw(window_size * elem_size);
   size_t window_count = 0;
   size_t batch_start = 0;
   for (; iter && iter->is_valid(); iter->next()) {

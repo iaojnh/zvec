@@ -68,7 +68,7 @@ TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
 }
 
 TEST_F(HnswStreamerTest, LegacyReadsReleaseStorageBeforeThreadExit) {
-  auto &memory_pool = MemoryLimitPool::get_instance();
+  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
   memory_pool.init(64UL * 1024 * 1024);
   const auto initial_pages = memory_pool.stats().page_used;
   auto storage = IndexFactory::CreateStorage("BufferStorage");

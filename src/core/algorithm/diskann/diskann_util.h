@@ -304,7 +304,7 @@ class DiskAnnUtil {
       return IndexError_Unsupported;
     }
 
-    centroids->resize(pivot_bytes);
+    centroids->resize_or_throw(pivot_bytes);
     char *dest = centroids->data();
     for (size_t m = 0; m < chunk_num; ++m) {
       const size_t start = offsets[m];

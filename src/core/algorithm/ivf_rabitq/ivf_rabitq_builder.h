@@ -18,6 +18,7 @@
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_meta.h>
+#include <zvec/core/interface/constants.h>
 #include "utility/paged_build_buffer.h"
 #include "ivf_rabitq_index_format.h"
 
@@ -70,8 +71,8 @@ class IvfRabitqBuilder : public IndexBuilder {
   ailego::Params params_;
 
   // IVF RaBitQ parameters
-  uint32_t nlist_{1024};
-  uint32_t total_bits_{7};
+  uint32_t nlist_{core_interface::kDefaultIvfRabitqNumLists};
+  uint32_t total_bits_{core_interface::kDefaultRabitqTotalBits};
   uint32_t sample_count_{0};
   uint32_t thread_count_{0};
   std::string metric_name_;

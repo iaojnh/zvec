@@ -781,8 +781,7 @@ void File::MemoryUnmap(void *addr, size_t len) {
 bool File::TryMemoryUnmap(void *addr, size_t /*len*/) {
   MEMORY_BASIC_INFORMATION mbi{};
   if (!addr || !::VirtualQuery(addr, &mbi, sizeof(mbi))) return false;
-  if (mbi.Type == MEM_MAPPED)
-    return ::UnmapViewOfFile(mbi.AllocationBase) != 0;
+  if (mbi.Type == MEM_MAPPED) return ::UnmapViewOfFile(mbi.AllocationBase) != 0;
   return ::VirtualFree(mbi.AllocationBase, 0, MEM_RELEASE) != 0;
 }
 

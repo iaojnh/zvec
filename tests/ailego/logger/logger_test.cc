@@ -17,7 +17,7 @@
 #include <zvec/ailego/parallel/thread_pool.h>
 
 #if defined(_WIN32)
-#include <Windows.h>
+#include <windows.h>
 #endif
 
 using namespace zvec;
@@ -87,8 +87,8 @@ TEST(Logger, FollowsRedirectedStandardHandles) {
   ASSERT_NE(logger, nullptr);
 
   for (int level : {Logger::LEVEL_INFO, Logger::LEVEL_WARN}) {
-    const DWORD device = level <= Logger::LEVEL_INFO ? STD_OUTPUT_HANDLE
-                                                   : STD_ERROR_HANDLE;
+    const DWORD device =
+        level <= Logger::LEVEL_INFO ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
     const HANDLE original = GetStdHandle(device);
     // Replace the process handle without touching this CRT's stdout/stderr,
     // as happens when an embedding host redirects through a different CRT.

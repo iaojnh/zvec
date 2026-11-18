@@ -57,6 +57,43 @@
 #include <unistd.h>
 #endif
 
+namespace zvec::ailego {
+struct QueueResidentSampleTestPeer {
+  static void stop_background() {
+    MemoryLimitPool::get_instance().stop_background_evictor();
+  }
+  static bool init_background_pool(size_t bytes) {
+    auto &pool = MemoryLimitPool::get_instance();
+    std::promise<bool> prepared;
+    auto ready = prepared.get_future();
+    std::promise<void> start;
+    // Warm the actual maintenance thread while the pool is disabled. A
+    // temporary producer cannot prepay this thread's hash-table growth.
+    std::thread worker([&pool, prepared = std::move(prepared),
+                        go = start.get_future()]() mutable {
+      auto &queue = BlockEvictionQueue::get_instance();
+      bool ok = true;
+      for (size_t i = 0; i < BlockEvictionQueue::kQueueCount; ++i) {
+        if (!queue.add_single_block({}, static_cast<int>(i))) ok = false;
+      }
+      prepared.set_value(ok);
+      go.wait();
+      pool.background_evict_loop();
+    });
+    // init() includes all warmed queue metadata in the native budget. Replace
+    // its idle worker before any page owner is created, preserving this
+    // prepared thread's producer identities for the real reclaim loop.
+    const bool ok =
+        ready.get() && PoolPayloadBudget::get_instance().init(bytes) == 0;
+    pool.stop_background_evictor();
+    pool.bg_running_.store(ok);
+    pool.bg_thread_ = std::move(worker);
+    start.set_value();
+    return ok;
+  }
+};
+}  // namespace zvec::ailego
+
 using namespace zvec::ailego;
 
 namespace zvec::ailego {
@@ -162,6 +199,11 @@ class BufferPoolTest : public ::testing::Test {
                      capacity_pages * kVectorPageSize +
                      slab_headers_for_pages(capacity_pages) + metadata +
                      workspace_metadata));
+  }
+  void init_background_vec_pool(size_t capacity_pages, size_t file_pages) {
+    ASSERT_TRUE(QueueResidentSampleTestPeer::init_background_pool(
+        capacity_pages * kVectorPageSize + kVectorPageSize +
+        VecBufferPool::metadata_bytes_for_page_count(file_pages, false)));
   }
   void init_table_pool(size_t capacity_pages, size_t entry_num) {
     ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
@@ -470,6 +512,45 @@ TEST_F(BufferPoolTest, WritableBypassJoinsConcurrentLoadBeforeReading) {
   EXPECT_TRUE(read_ok);
   EXPECT_EQ('Y', result);
   pool.page_table_.release_block(0);
+}
+
+TEST_F(BufferPoolTest, ShortReadDoesNotEvictHotPageOnFirstTouch) {
+  constexpr size_t kFilePages = 3;
+  constexpr size_t kCapacity = 256UL * 1024UL * 1024UL;
+  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, memory_pool.init(kCapacity));
+  std::string file = new_file(kFilePages);
+
+  size_t charged_metadata = 0;
+  {
+    VecBufferPool pool(file, /*writable=*/false);
+    ASSERT_EQ(pool.init(), 0);
+    auto handle = pool.get_handle();
+
+    const size_t reserve = memory_pool.page_admission_reserve();
+    ASSERT_EQ(MemoryLimitPool::get_instance().capacity() / 16, reserve);
+    ASSERT_LT(memory_pool.used() + kVectorPageSize, kCapacity - reserve);
+    charged_metadata =
+        kCapacity - reserve - memory_pool.used() - 2 * kVectorPageSize;
+    ASSERT_TRUE(memory_pool.try_charge_metadata(charged_metadata));
+
+    char *hot = pool.acquire_buffer(/*block_id=*/0, 10);
+    ASSERT_NE(nullptr, hot);
+    pool.page_table_.release_block(/*block_id=*/0);
+
+    std::vector<char> data(2 * kVectorPageSize);
+    ASSERT_TRUE(handle.read_range(kVectorPageSize, data.size(), data.data()));
+    ExpectPageContent(data.data(), /*page=*/1);
+    ExpectPageContent(data.data() + kVectorPageSize, /*page=*/2);
+
+    EXPECT_TRUE(pool.is_page_resident(0));
+    EXPECT_FALSE(pool.is_page_resident(1));
+    EXPECT_FALSE(pool.is_page_resident(2));
+    const auto stats = pool.stats();
+    EXPECT_EQ(2u, stats.admission_rejected);
+    EXPECT_EQ(2u, stats.bypass_reads);
+  }
+  memory_pool.release_metadata(charged_metadata);
 }
 
 TEST_F(BufferPoolTest, BypassRecheckRecognizesResidencyActivity) {
@@ -901,6 +982,59 @@ TEST_F(BufferPoolTest, RecoversDirtyPageAfterQueueRegistrationFailure) {
   EXPECT_EQ(2u, flush_attempts);
   EXPECT_FALSE(table.is_loaded(/*block_id=*/0));
   EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
+}
+
+TEST_F(BufferPoolTest, DestructionWaitsForInFlightEvictionBeforeFreeingPages) {
+  init_vec_pool(/*capacity_pages=*/512, /*file_pages=*/1, /*writable=*/true);
+  QueueResidentSampleTestPeer::stop_background();
+  auto pool = std::make_unique<VecBufferPool>(new_file(1), /*writable=*/true);
+  ASSERT_EQ(0, pool->init());
+  // Exercise a synchronous flush inside eviction, with its owner still held.
+  pool->page_table_.set_writeback_callback({});
+  const block_id_t page_id = 0;
+  char *page = nullptr;
+  ASSERT_TRUE(pool->acquire_pages(&page_id, 1, &page));
+  pool->page_table_.mark_dirty(page_id);
+  pool->release_pages(&page_id, 1);
+
+  std::promise<void> eviction_entered;
+  auto entered = eviction_entered.get_future();
+  std::promise<void> finish_eviction;
+  auto finish = finish_eviction.get_future();
+  std::atomic<bool> first_flush{true};
+  pool->page_table_.set_flush_callback([&](block_id_t, char *, size_t, size_t) {
+    if (first_flush.exchange(false)) {
+      eviction_entered.set_value();
+      finish.wait();
+    }
+    // Failed eviction retains the page, so teardown must still free it.
+    return -1;
+  });
+  auto eviction = std::async(std::launch::async, [] {
+    return BlockEvictionQueue::get_instance().batch_recycle(1);
+  });
+  const auto ready = entered.wait_for(std::chrono::seconds(5));
+  if (ready != std::future_status::ready) {
+    finish_eviction.set_value();
+    eviction.wait();
+    FAIL() << "eviction did not reach the flush callback";
+  }
+
+  std::promise<void> destruction_started;
+  auto started = destruction_started.get_future();
+  auto destruction = std::async(std::launch::async, [&] {
+    destruction_started.set_value();
+    pool.reset();
+  });
+  started.wait();
+  EXPECT_EQ(std::future_status::timeout,
+            destruction.wait_for(std::chrono::milliseconds(100)));
+  finish_eviction.set_value();
+  EXPECT_EQ(0u, eviction.get());
+  destruction.get();
+
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
+  EXPECT_EQ(0, PoolPayloadBudget::get_instance().init(0));
 }
 
 TEST_F(BufferPoolTest, MetadataIsCountedAndReleasedWithPool) {
@@ -1497,11 +1631,10 @@ TEST_F(BufferPoolTest, BatchRecycleBoundsStaleQueueScanning) {
   }
 
   EXPECT_EQ(0u, queue.batch_recycle(1));
-  // A one-item reclaim has 20 attempts shared across priority tiers. An
-  // occupied tier must not consume the other tiers' fair scan allowance.
-  constexpr size_t kPerTierAttempts = 20 / BlockEvictionQueue::kQueueCount;
-  EXPECT_EQ(kPerTierAttempts, owner.dead_checks);
-  EXPECT_EQ(64u - kPerTierAttempts, queue.stats().approximate_queue_sizes[0]);
+  // A one-item reclaim has 20 attempts split across the occupied tiers.
+  constexpr size_t kAttempts = 20;
+  EXPECT_EQ(kAttempts, owner.dead_checks);
+  EXPECT_EQ(64u - kAttempts, queue.stats().approximate_queue_sizes[0]);
   while (queue.evict_single_block(discarded)) {
   }
   owner.dead_checks = 0;
@@ -1513,6 +1646,8 @@ TEST_F(BufferPoolTest, BatchRecycleBoundsStaleQueueScanning) {
     }
   }
   EXPECT_EQ(0u, queue.batch_recycle(1));
+  constexpr size_t kPerTierAttempts =
+      kAttempts / BlockEvictionQueue::kQueueCount;
   EXPECT_EQ(kPerTierAttempts * BlockEvictionQueue::kQueueCount,
             owner.dead_checks);
   for (auto remaining : queue.stats().approximate_queue_sizes) {
@@ -1703,10 +1838,20 @@ TEST_F(BufferPoolTest, DominantProtectedQueueReceivesAgingSamples) {
   }
 
   const uint64_t aging_before = queue.stats().protected_aging_dequeues;
-  // A reclaim batch samples the protected queue at most once; scalar queue
-  // inspection deliberately stays strict-priority and pays no aging cost.
+  // Small explicit batches keep their default policy, while a caller can
+  // enable one protected sample independently of its reclaim budget.
+  (void)queue.batch_recycle(/*count=*/1);
+  EXPECT_EQ(aging_before, queue.stats().protected_aging_dequeues);
+  (void)queue.batch_recycle(/*count=*/0, /*age_protected=*/true);
+  EXPECT_EQ(aging_before, queue.stats().protected_aging_dequeues);
+  (void)queue.batch_recycle(/*count=*/1, /*age_protected=*/true);
+  EXPECT_EQ(aging_before + 1, queue.stats().protected_aging_dequeues);
+  (void)queue.batch_recycle(/*count=*/7, /*age_protected=*/true);
+  EXPECT_EQ(aging_before + 2, queue.stats().protected_aging_dequeues);
+  (void)queue.batch_recycle(/*count=*/8, /*age_protected=*/false);
+  EXPECT_EQ(aging_before + 2, queue.stats().protected_aging_dequeues);
   (void)queue.batch_recycle(/*count=*/8);
-  EXPECT_GT(queue.stats().protected_aging_dequeues, aging_before);
+  EXPECT_EQ(aging_before + 3, queue.stats().protected_aging_dequeues);
 
   while (queue.evict_single_block(item)) {
   }
@@ -1943,7 +2088,8 @@ TEST_F(BufferPoolTest, ReusedPageSurvivesContinuousColdStream) {
   }
   ASSERT_EQ(1u, queue.batch_recycle(1));
   ASSERT_TRUE(handle.read_range(0, kVectorPageSize, data.data()));
-  ASSERT_TRUE(MemoryLimitPool::get_instance().under_cache_pressure());
+  ASSERT_TRUE(
+      ::zvec::ailego::PoolPayloadBudget::get_instance().under_cache_pressure());
   // Cover the thread-local sampling phase before testing retention. The hot
   // page remains unpinned during every eviction in the cold stream.
   for (size_t i = 0; i < 16; ++i) {
@@ -2315,6 +2461,9 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
 
 TEST_F(BufferPoolTest, BatchMissesRemainProbationUntilLaterReuse) {
   init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/4);
+  // Check miss/reuse priorities with foreground eviction. Background reclaim
+  // could evict the populated miss before acquire_pages obtains its pin.
+  QueueResidentSampleTestPeer::stop_background();
   std::string file = new_file(/*num_pages=*/4);
 
   VecBufferPool pool(file, /*writable=*/false);
@@ -2332,8 +2481,8 @@ TEST_F(BufferPoolTest, BatchMissesRemainProbationUntilLaterReuse) {
   char *pages[1] = {};
 
   ASSERT_TRUE(handle.acquire_pages(page_ids, 1, pages));
-  // Retain the initial miss pin so background aging cannot race with either
-  // the probation assertion or the later sampled reuse promotion.
+  // Retain the initial miss pin through the probation assertion and the
+  // later sampled reuse promotion.
   auto release_pin = ScopeGuard::Make(
       [&handle, &page_ids] { handle.release_pages(page_ids, 1); });
   ASSERT_TRUE(PoolPayloadBudget::get_instance().under_cache_pressure());
@@ -2476,6 +2625,77 @@ TEST_F(BufferPoolTest, BackgroundReclaimsToLowWatermark) {
   }
   EXPECT_LE(mp.stats().page_used, low + kVectorPageSize);
   EXPECT_GT(mp.stats().bg_evicted_buffers, 0u);
+}
+
+TEST_F(BufferPoolTest, BackgroundReclaimPreservesTinyWorkingSet) {
+  constexpr size_t kCapacityPages = 3;
+  init_background_vec_pool(kCapacityPages, /*file_pages=*/kCapacityPages);
+  std::string file = new_file(kCapacityPages);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  const uint64_t evicted_before = memory_pool.stats().bg_evicted_buffers;
+
+  // The first two pages are released before the third allocation triggers
+  // reclaim. A fixed 64-page batch would evict both (and possibly the third),
+  // although freeing one page is enough to reach the 2.25-page low watermark.
+  std::vector<char> data(kVectorPageSize);
+  for (size_t page = 0; page < kCapacityPages; ++page) {
+    ASSERT_TRUE(handle.read_range(page * kVectorPageSize, kVectorPageSize,
+                                  data.data()));
+    ExpectPageContent(data.data(), page);
+  }
+
+  // Observe completion of the batch, not just its first buffer release.
+  for (int i = 0;
+       i < 200 && memory_pool.stats().bg_evicted_buffers == evicted_before;
+       ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const auto stats = memory_pool.stats();
+  EXPECT_EQ(1u, stats.bg_evicted_buffers - evicted_before);
+  EXPECT_EQ(2 * kVectorPageSize, stats.page_used);
+}
+
+TEST_F(BufferPoolTest, SmallBackgroundReclaimAgesDominantProtectedQueue) {
+  constexpr size_t kProtectedPages = 12;
+  constexpr size_t kFilePages = kProtectedPages + 1;
+  init_background_vec_pool(/*capacity_pages=*/16, /*file_pages=*/kFilePages);
+  std::string file = new_file(kFilePages);
+
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(pool.init(), 0);
+  auto handle = pool.get_handle();
+  std::vector<char> data(kVectorPageSize);
+  // Fill exactly to the low watermark with protected pages. Set priorities
+  // before loading so their queue entries already have the right priority.
+  for (size_t page = 0; page < kProtectedPages; ++page) {
+    ASSERT_TRUE(pool.set_page_priority(page, VecBufferPool::kNormalPriority));
+    ASSERT_TRUE(handle.read_range(page * kVectorPageSize, kVectorPageSize,
+                                  data.data()));
+  }
+
+  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &queue = BlockEvictionQueue::get_instance();
+  const uint64_t aging_before = queue.stats().protected_aging_dequeues;
+  const uint64_t evicted_before = memory_pool.stats().bg_evicted_buffers;
+  // One probation page exceeds the low watermark by exactly one page.
+  ASSERT_TRUE(handle.read_range(kProtectedPages * kVectorPageSize,
+                                kVectorPageSize, data.data()));
+  ExpectPageContent(data.data(), kProtectedPages);
+  for (int i = 0;
+       i < 200 && memory_pool.stats().bg_evicted_buffers == evicted_before;
+       ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  EXPECT_EQ(aging_before + 1, queue.stats().protected_aging_dequeues);
+  EXPECT_EQ(1u, pool.stats().priority_demotions[VecBufferPool::kLowPriority]);
+  const auto stats = memory_pool.stats();
+  EXPECT_EQ(1u, stats.bg_evicted_buffers - evicted_before);
+  EXPECT_EQ(kProtectedPages * kVectorPageSize, stats.page_used);
 }
 
 TEST_F(BufferPoolTest, BackgroundBacksOffWhenAllPagesArePinned) {

@@ -906,7 +906,9 @@ int FlatContiguousStreamerEntity::build_contiguous_memory() try {
       ailego::MemoryHelper::AlignHugePageSize(data_size);
   auto storage = std::allocate_shared<ContiguousStorage>(
       ailego::BudgetedAllocator<ContiguousStorage>{});
-  storage->vector_memory.resize(allocation_size);
+  if (storage->vector_memory.resize(allocation_size) != 0) {
+    return IndexError_NoMemory;
+  }
   storage->vector_memory.advise_huge_pages();
   char *raw = storage->vector_memory.data();
   storage->vector_stride = stride;
@@ -920,9 +922,11 @@ int FlatContiguousStreamerEntity::build_contiguous_memory() try {
   for (uint32_t id = 0; id < count; ++id) {
     IndexStorage::MemoryBlock block;
     uint64_t vector_key = kInvalidKey;
-    int ret = 0;
+    int ret = get_key(id, &vector_key);
+    if (ret != 0) {
+      return ret == IndexError_NoMemory ? ret : IndexError_ReadData;
+    }
     if (use_key_info_map()) {
-      vector_key = key(id);
       // Deleted rows are absent from the rebuilt key map. Keep an invalid
       // key slot for its established filtering statistics, without reading it.
       if (vector_key == kInvalidKey) {
@@ -936,13 +940,10 @@ int FlatContiguousStreamerEntity::build_contiguous_memory() try {
       }
     } else {
       ret = get_vector_by_position(id, block);
-      if (ret == 0) {
-        ret = get_key_by_position(id, &vector_key);
-      }
     }
     if (ret != 0 || block.data() == nullptr) {
       LOG_ERROR("Failed to load Flat vector into contiguous memory, id=%u", id);
-      return IndexError_ReadData;
+      return ret == IndexError_NoMemory ? ret : IndexError_ReadData;
     }
     std::memcpy(raw + position * stride, block.data(), vector_size);
     storage->position_to_key[position++] = vector_key;

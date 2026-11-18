@@ -256,10 +256,22 @@ class FlatStreamerEntity {
     int status;
   };
 
+  //! Read a key without conflating a missing slot with a storage read error.
+  //! A valid positional hole returns success with kInvalidKey.
+  inline int get_key(uint32_t id, uint64_t *out) const {
+    if (!out) {
+      return IndexError_InvalidArgument;
+    }
+    if (id >= vector_count()) {
+      return IndexError_OutOfRange;
+    }
+    return get_key_by_position(id, out);
+  }
+
   inline uint64_t key(uint32_t id) const {
     uint64_t result = kInvalidKey;
     if (id >= vector_count()) return kInvalidKey;
-    const int ret = get_key_by_position(id, &result);
+    const int ret = get_key(id, &result);
     if (ret != 0)
       throw ReadError{ret == IndexError_NoMemory ? ret : IndexError_ReadData};
     return result;

@@ -1156,7 +1156,7 @@ TEST_F(BufferPoolStoreTest, SelectedRowsPlanReusesSpilledStorageUnderPressure) {
     check(2);
     check(1);
     check(10);
-    EXPECT_THROW(plan.prepare(chunks(12)), std::bad_alloc);
+    EXPECT_THROW((void)plan.prepare(chunks(12)), std::bad_alloc);
   }
   check(12);  // A failed resize must recover with a fresh layout.
 }

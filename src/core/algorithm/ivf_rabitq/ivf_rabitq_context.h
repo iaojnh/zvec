@@ -23,6 +23,7 @@
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
+#include <zvec/core/interface/constants.h>
 #include "utility/group_key.h"
 #include "zvec/ailego/container/params.h"
 #include "zvec/core/framework/index_context.h"
@@ -381,7 +382,7 @@ class IvfRabitqContext : public IndexContext {
   std::unique_ptr<GroupSearchState> group_state_;
 
   uint32_t topk_{10};
-  uint32_t nprobe_{10};
+  uint32_t nprobe_{core_interface::kDefaultIvfRabitqNumProbes};
   uint32_t max_scan_count_{0};
   float scan_ratio_{kDefaultIvfRabitqScanRatio};
   uint32_t bruteforce_threshold_{kDefaultIvfRabitqBruteForceThreshold};

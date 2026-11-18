@@ -461,7 +461,7 @@ class BufferedVectorReader : public DiskAnnEntity::VectorReader {
     metadata.add(sizeof(Backing) + 64);
     backing_ = std::make_shared<Backing>();
     backing_->memory.swap(metadata);
-    backing_->data.resize(count * stride_);
+    backing_->data.resize_or_throw(count * stride_);
     ailego::ReserveVectorCapacity(requests_, request_memory_, count);
     ailego::ReserveVectorCapacity(completed_, request_memory_, count);
     requests_.clear();

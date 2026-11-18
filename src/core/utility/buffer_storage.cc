@@ -521,7 +521,7 @@ class BufferStorage : public IndexStorage {
                    total_pages);
       while (bypass_batch_pages != 0) {
         try {
-          scratch.bypass_page.resize(bypass_batch_pages *
+          scratch.bypass_page.resize_or_throw(bypass_batch_pages *
                                      ailego::kVectorPageSize);
           break;
         } catch (const std::bad_alloc &) {

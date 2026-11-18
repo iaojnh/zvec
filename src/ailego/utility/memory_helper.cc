@@ -16,8 +16,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -29,8 +29,8 @@
 #include <psapi.h>
 #else
 #if defined(__linux__) || defined(__linux)
-#include <fcntl.h>
 #include <sys/resource.h>
+#include <fcntl.h>
 #elif defined(__APPLE__) && defined(__MACH__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -95,7 +95,7 @@ size_t MemoryHelper::SelfRSS() {
 }
 
 size_t MemoryHelper::SelfPeakRSS() {
-  struct rusage usage{};
+  struct rusage usage {};
   if (getrusage(RUSAGE_SELF, &usage) != 0 || usage.ru_maxrss < 0 ||
       static_cast<unsigned long>(usage.ru_maxrss) >
           std::numeric_limits<size_t>::max() / 1024) {
@@ -251,7 +251,7 @@ size_t MemoryHelper::ContainerAwareTotalRamSize() {
 
 #elif defined(__APPLE__) && defined(__MACH__)
 bool MemoryHelper::SelfUsage(size_t *vsz, size_t *rss) {
-  struct mach_task_basic_info info{};
+  struct mach_task_basic_info info {};
   mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
 
   if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info,
@@ -265,7 +265,7 @@ bool MemoryHelper::SelfUsage(size_t *vsz, size_t *rss) {
 }
 
 size_t MemoryHelper::SelfRSS() {
-  struct mach_task_basic_info info{};
+  struct mach_task_basic_info info {};
   mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
 
   if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info,
@@ -277,7 +277,7 @@ size_t MemoryHelper::SelfRSS() {
 }
 
 size_t MemoryHelper::SelfPeakRSS() {
-  struct mach_task_basic_info info{};
+  struct mach_task_basic_info info {};
   mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
 
   if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info,

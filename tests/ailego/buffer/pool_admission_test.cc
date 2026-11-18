@@ -127,6 +127,7 @@ class PoolAdmissionTest : public testing::Test {
 TEST_F(PoolAdmissionTest, NativeResidencyWitnessTracksDiscardReuseAndBusySample) {
   ASSERT_EQ(0, pool_.init(64UL << 20));
   MemoryLimitPoolTestPeer::stop_background(pool_);
+  const auto baseline = MemoryLimitPoolTestPeer::slab_resident_sample();
   const auto release = [this](char *data) {
     pool_.release_buffer(data, page_);
   };
@@ -144,7 +145,9 @@ TEST_F(PoolAdmissionTest, NativeResidencyWitnessTracksDiscardReuseAndBusySample)
   std::memset(page.get(), 7, page_);
   std::memset(neighbor.get(), 11, page_);
   const auto full = MemoryLimitPoolTestPeer::slab_resident_sample();
-  ASSERT_EQ(3 * page_, full.owned_resident);  // Header and both touched pages.
+  // Queue backing is already resident. Only the slab header and both touched
+  // data pages increase the witness.
+  ASSERT_EQ(baseline.owned_resident + 3 * page_, full.owned_resident);
   const auto busy = MemoryLimitPoolTestPeer::sample_with_slab_lock(pool_);
   EXPECT_GT(busy.rss, 0u);
   EXPECT_EQ(0u, busy.owned_resident);

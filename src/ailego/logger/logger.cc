@@ -20,7 +20,7 @@
 #include <zvec/ailego/utility/time_helper.h>
 
 #if defined(_WIN32)
-#include <Windows.h>
+#include <windows.h>
 #endif
 
 namespace zvec {
@@ -65,7 +65,7 @@ struct ConsoleLogger : public Logger {
     // A cached handle may then refer to an unrelated index file. Resolve the
     // process standard handle for each message instead of using that cache.
     HANDLE output = GetStdHandle(level <= LEVEL_INFO ? STD_OUTPUT_HANDLE
-                                                   : STD_ERROR_HANDLE);
+                                                     : STD_ERROR_HANDLE);
     if (output == nullptr || output == INVALID_HANDLE_VALUE) {
       return;
     }

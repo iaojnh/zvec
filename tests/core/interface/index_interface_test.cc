@@ -4898,7 +4898,7 @@ TEST(IndexInterface, IsDirty) {
 TEST(IndexInterface, IsDirtyBufferPool) {
   constexpr uint32_t kDimension = 16;
   const std::string index_name{"test_is_dirty_bp.index"};
-  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  auto &pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
   const size_t previous_capacity = pool.capacity();
   ASSERT_EQ(0, pool.init(64UL * 1024UL * 1024UL));
   auto restore = zvec::ailego::ScopeGuard::Make(

@@ -393,9 +393,8 @@ TEST(ProcessRssLedgerModelTest, NewObservationsExpireOldResidencyCredit) {
       model.objects[0].resident = 0;
       if (balanced_host_growth) model.host += 16 * kUnit;
       model.budget.refresh(true);
-      if (observer == 1) {
+      if (observer == 1)
         EXPECT_FALSE(model.budget.publish_resident_sample(stale, earlier));
-      }
       const size_t reserve =
           observer == 2 ? 16 * kUnit + ProcessRssBudget::headroom(kLimit) : 0;
       const size_t upper = model.rss() + model.backing() + reserve;

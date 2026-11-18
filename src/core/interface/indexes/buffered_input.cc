@@ -256,7 +256,7 @@ class BufferedInput::Reader : public core::OrdinalAccessHolder::Reader {
     if (!s.prepared) return core::IndexError_NoReady;
     if (ordinal >= s.ordinals.size()) return core::IndexError_OutOfRange;
     try {
-      row_.resize(owner_->element_size());
+      row_.resize_or_throw(owner_->element_size());
       const auto &entry = s.ordinals[ordinal];
       int ret = s.read(entry.second, row_.data());
       if (ret != 0) return ret;

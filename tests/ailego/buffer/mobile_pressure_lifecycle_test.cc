@@ -127,18 +127,18 @@ TEST_F(MobilePressureLifecycle, BackgroundReclaimsPagesAndPreservesPins) {
 TEST_F(MobilePressureLifecycle, CriticalDeniesGrowthAndNormalAllowsRetry) {
   {
     BudgetedMappedBuffer retained;
-    retained.resize(4UL << 20);
+    retained.resize_or_throw(4UL << 20);
     std::memset(retained.data(), 7, retained.size());
     pool_.set_memory_pressure(Pressure::kCritical);
     EXPECT_FALSE(pool_.try_charge_external(1UL << 20));
     BudgetedMappedBuffer growth;
-    EXPECT_THROW(growth.resize(8UL << 20), std::bad_alloc);
+    EXPECT_THROW(growth.resize_or_throw(8UL << 20), std::bad_alloc);
     EXPECT_EQ(7, retained.data()[0]);
     emit("critical_denied");
     pool_.set_memory_pressure(Pressure::kNormal);
     ASSERT_TRUE(pool_.try_charge_external(1UL << 20));
     pool_.release_external(1UL << 20);
-    ASSERT_NO_THROW(growth.resize(8UL << 20));
+    ASSERT_NO_THROW(growth.resize_or_throw(8UL << 20));
     std::memset(growth.data(), 9, growth.size());
     EXPECT_EQ(9, growth.data()[growth.size() - 1]);
     emit("normal_retry");

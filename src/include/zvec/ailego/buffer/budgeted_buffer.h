@@ -27,7 +27,7 @@ inline void ReserveStringCapacity(std::string &value, MemoryReservation &memory,
   MemoryReservation replacement_memory;
   std::string replacement;
   replacement_memory.add_for_allocation((bytes + 1) * 2,
-                                         [&] { replacement.reserve(bytes); });
+                                        [&] { replacement.reserve(bytes); });
   replacement.assign(value);
   const size_t actual = replacement.capacity() + 1;
   if (actual > replacement_memory.bytes())
@@ -47,7 +47,7 @@ inline void ReserveVectorCapacity(std::vector<T> &value,
   MemoryReservation replacement_memory;
   std::vector<T> replacement;
   replacement_memory.add_for_allocation(count * sizeof(T),
-                                         [&] { replacement.reserve(count); });
+                                        [&] { replacement.reserve(count); });
   const size_t actual = replacement.capacity() * sizeof(T);
   if (actual > replacement_memory.bytes())
     replacement_memory.add(actual - replacement_memory.bytes());

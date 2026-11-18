@@ -1351,7 +1351,8 @@ int IVFEntity::search_by_keys(const std::vector<uint64_t> &keys,
   if (!query_distance_.valid() && packed_query_.empty()) {
     return IndexError_InvalidArgument;
   }
-  ailego::BudgetedVector<float> distances(header_.block_vector_count);
+  scatter_distances_.resize(header_.block_vector_count);
+  auto &distances = scatter_distances_;
   // Consecutive candidates in the same packed block reuse its distance scan.
   uint64_t cached_block = std::numeric_limits<uint64_t>::max();
   for (uint64_t key : keys) {

@@ -304,6 +304,10 @@ IoUringRing::SetupResult IoUringRing::map_control_regions(
   const size_t sq_charge = BudgetedMappedBuffer::mapping_size(sq_ring_size_);
   const size_t sqes_charge = BudgetedMappedBuffer::mapping_size(sqes_size_);
   const size_t cq_charge = BudgetedMappedBuffer::mapping_size(cq_ring_size_);
+  if (!sq_charge || !sqes_charge || !cq_charge ||
+      sqes_charge > std::numeric_limits<size_t>::max() - sq_charge ||
+      cq_charge > std::numeric_limits<size_t>::max() - sq_charge - sqes_charge)
+    return SetupResult::kNoMemory;
   size_t pending = sq_charge + sqes_charge + cq_charge;
   if (!pool.try_reserve_process_backing(pending))
     return SetupResult::kNoMemory;
@@ -422,11 +426,9 @@ void IoUringRing::teardown() {
 
 bool IoUringRing::ensure_staging(size_t bytes) {
   if (async_reads_) return false;
-  try {
-    bytes = BudgetedMappedBuffer::mapping_size(bytes);
-  } catch (const std::bad_alloc &) {
-    return false;
-  }
+  const size_t mapped_bytes = BudgetedMappedBuffer::mapping_size(bytes);
+  if (bytes != 0 && mapped_bytes == 0) return false;
+  bytes = mapped_bytes;
   auto &pool = MemoryLimitPool::get_instance();
   if (prepaid_staging_bytes_ && pool.under_process_rss_pressure()) {
     // The synchronous path can use its existing cached page. Drop the

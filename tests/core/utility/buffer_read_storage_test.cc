@@ -177,8 +177,32 @@ TEST_F(BufferReadStorageTest, RejectsUnknownWarmupMode) {
   EXPECT_EQ(IndexError_InvalidArgument, storage->init(params));
 }
 
+TEST_F(BufferReadStorageTest, PoolSmallerThanOnePageFallsBackToBypass) {
+  const size_t kTooSmall = ailego::kVectorPageSize - 1;
+  ASSERT_EQ(0,
+            ::zvec::ailego::PoolPayloadBudget::get_instance().init(kTooSmall));
+
+  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
+  ASSERT_NE(storage, nullptr);
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  EXPECT_EQ(
+      0u,
+      ::zvec::ailego::PoolPayloadBudget::get_instance().stats().metadata_used);
+  ASSERT_NE(nullptr, storage->vec_buffer_pool());
+  EXPECT_FALSE(storage->vec_buffer_pool()->cache_enabled());
+  EXPECT_GE(storage->vec_buffer_pool()->file_descriptor(), 0);
+
+  auto segment = storage->get("payload");
+  ASSERT_NE(segment, nullptr);
+  std::string actual(payload_.size(), '\0');
+  ASSERT_EQ(actual.size(), segment->fetch(0, actual.data(), actual.size()));
+  EXPECT_EQ(payload_, actual);
+  EXPECT_EQ(
+      0u, ::zvec::ailego::PoolPayloadBudget::get_instance().stats().page_used);
+}
+
 TEST_F(BufferReadStorageTest, PoolWithoutRoomForMetadataFallsBackToBypass) {
-  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(
+  ASSERT_EQ(0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(
                    ailego::kVectorPageSize));
 
   auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
