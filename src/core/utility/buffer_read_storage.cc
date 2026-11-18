@@ -241,8 +241,8 @@ class BufferReadStorage : public IndexStorage {
     //! Return independently pinned resident pages without copying. Cold or
     //! partially resident ranges retain the existing contiguous fallback so
     //! cache admission and bypass behavior remain unchanged.
-    size_t read_scatter(size_t offset, ScatterBlock &data, size_t len) override
-        try {
+    size_t read_scatter(size_t offset, ScatterBlock &data,
+                        size_t len) override {
       thread_read_error() = IndexError_ReadData;
       data.reset();
       len = clamp_length(&offset, len);
@@ -265,39 +265,38 @@ class BufferReadStorage : public IndexStorage {
         return read_size;
       }
 
-      auto *lease = dynamic_cast<BufferPageLease *>(data.workspace.get());
-      if (!lease || !lease->matches(handle_.get())) {
-        data.workspace = std::allocate_shared<BufferPageLease>(
-            ailego::BudgetedAllocator<BufferPageLease>{}, handle_);
-        lease = static_cast<BufferPageLease *>(data.workspace.get());
-      }
-      lease->prepare(first_page, page_count);
-      data.spans.resize(page_count);
-      if (lease->acquire(handle_)) {
-        const size_t range_end = abs_offset + len;
-        for (size_t i = 0; i < page_count; ++i) {
-          const size_t page_begin = (first_page + i) * ailego::kVectorPageSize;
-          const size_t span_begin = std::max(abs_offset, page_begin);
-          const size_t span_end =
-              std::min(range_end, page_begin + ailego::kVectorPageSize);
-          data.spans[i] = {reinterpret_cast<const uint8_t *>(lease->page(i)) +
-                               (span_begin - page_begin),
-                           span_end - span_begin};
+      try {
+        auto *lease = dynamic_cast<BufferPageLease *>(data.workspace.get());
+        if (!lease || !lease->matches(handle_.get())) {
+          data.workspace = std::allocate_shared<BufferPageLease>(
+              ailego::BudgetedAllocator<BufferPageLease>{}, handle_);
+          lease = static_cast<BufferPageLease *>(data.workspace.get());
         }
-        data.lease = data.workspace;
-        data.size = len;
-        return len;
+        lease->prepare(first_page, page_count);
+        data.spans.resize(page_count);
+        if (lease->acquire(handle_)) {
+          const size_t range_end = abs_offset + len;
+          for (size_t i = 0; i < page_count; ++i) {
+            const size_t page_begin =
+                (first_page + i) * ailego::kVectorPageSize;
+            const size_t span_begin = std::max(abs_offset, page_begin);
+            const size_t span_end =
+                std::min(range_end, page_begin + ailego::kVectorPageSize);
+            data.spans[i] = {reinterpret_cast<const uint8_t *>(lease->page(i)) +
+                                 (span_begin - page_begin),
+                             span_end - span_begin};
+          }
+          data.lease = data.workspace;
+          data.size = len;
+          return len;
+        }
+      } catch (const std::bad_alloc &) {
+        // The contiguous fallback can succeed even when probe metadata is
+        // denied. Its own read path reports any allocation failure.
       }
-      // Release probe descriptors before admitting the contiguous fallback.
       data.workspace.reset();
       data.spans = ScatterBlock::Spans{};
       return IndexStorage::Segment::read_scatter(offset, data, len);
-    } catch (const std::bad_alloc &) {
-      data.reset();
-      data.workspace.reset();
-      data.spans = ScatterBlock::Spans{};
-      thread_read_error() = IndexError_NoMemory;
-      return 0;
     }
 
     //! Read scattered data (stable until this thread's next pointer read)
@@ -542,6 +541,7 @@ class BufferReadStorage : public IndexStorage {
         data.scratch_size_ = len;
         return len;
       }
+      data.reset();
       static constexpr size_t kAlign = 4096UL;
       if (ailego_unlikely(len >
                           std::numeric_limits<size_t>::max() - (kAlign - 1))) {

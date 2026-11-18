@@ -93,7 +93,9 @@ class MMapFileReadStorage : public IndexStorage {
         }
         len = region_size_ - offset;
       }
-      data.reset((void *)(data_ptr_ + offset));
+      data = len ? MemoryBlock::MakeMappedView(
+                       const_cast<uint8_t *>(data_ptr_ + offset), file_ptr_)
+                 : MemoryBlock{};
       return len;
     }
 
@@ -176,42 +178,51 @@ class MMapFileReadStorage : public IndexStorage {
 
   //! Load a index file into container
   int open(const std::string &path, bool) override try {
-    file_path_ = path;
-    file_ptr_ = std::make_shared<ailego::MMapFile>();
-    if (!file_ptr_) {
-      LOG_ERROR("Failed to create mmap file object, %s",
-                ailego::FileHelper::GetLastErrorString().c_str());
-      return IndexError_NoMemory;
-    }
+    std::string candidate_path = path;
+    auto mapping = std::make_shared<ailego::MMapFile>();
 
     ailego::File file;
     if (!file.open(path, true, false) ||
-        !file_ptr_->open(file, true, memory_shared_)) {
+        !mapping->open(file, true, memory_shared_)) {
       LOG_ERROR("Failed to open file %s, %s", path.c_str(),
                 ailego::FileHelper::GetLastErrorString().c_str());
       return IndexError_OpenFile;
     }
 
-    index_offset_ =
-        (header_offset_ >= 0 ? 0 : file_ptr_->size()) + header_offset_;
-    size_t end_offset =
-        (footer_offset_ > 0 ? 0 : file_ptr_->size()) + footer_offset_;
-    size_t size = end_offset > index_offset_ ? end_offset - index_offset_ : 0;
-    if (memory_locked_ && !file_ptr_->lock()) {
-      LOG_WARN("Failed to lock pages with size %zu, %s", file_ptr_->size(),
+    const size_t file_size = mapping->size();
+    const auto resolve = [file_size](int64_t offset, bool from_end,
+                                     size_t &out) {
+      if (offset > 0 || (offset == 0 && !from_end)) {
+        if (static_cast<uint64_t>(offset) > file_size) return false;
+        out = static_cast<size_t>(offset);
+      } else {
+        const uint64_t distance = offset == 0 ? 0 : uint64_t(-(offset + 1)) + 1;
+        if (distance > file_size) return false;
+        out = file_size - static_cast<size_t>(distance);
+      }
+      return true;
+    };
+    size_t index_offset = 0, end_offset = 0;
+    if (!resolve(header_offset_, false, index_offset) ||
+        !resolve(footer_offset_, true, end_offset) ||
+        index_offset >= end_offset)
+      return IndexError_InvalidArgument;
+    const size_t size = end_offset - index_offset;
+    if (memory_locked_ && !mapping->lock()) {
+      LOG_WARN("Failed to lock pages with size %zu, %s", mapping->size(),
                ailego::FileHelper::GetLastErrorString().c_str());
     }
     if (memory_warmup_ && !checksum_validation_) {
       ailego::File::MemoryWarmup(
-          static_cast<char *>(file_ptr_->region()) + index_offset_, size);
+          static_cast<char *>(mapping->region()) + index_offset, size);
     }
 
     ailego::BudgetedAlignedBuffer checksum_scratch;
-    auto read_data = [this, &file, &checksum_scratch, end_offset](
-                         size_t offset, const void **data, size_t len) {
-      const size_t off = offset + index_offset_;
-      if (off > end_offset) return size_t{0};
-      len = std::min(len, end_offset - off);
+    auto read_data = [this, &file, &mapping, &checksum_scratch, index_offset,
+                      size](size_t offset, const void **data, size_t len) {
+      if (offset > size) return size_t{0};
+      const size_t off = index_offset + offset;
+      len = std::min(len, size - offset);
       if (checksum_validation_ && len) {
         // Validate through positioned reads so a full checksum does not
         // fault the entire file mapping into the process working set.
@@ -220,7 +231,7 @@ class MMapFileReadStorage : public IndexStorage {
         *data = checksum_scratch.data();
         return file.read(off, checksum_scratch.data(), len);
       }
-      *data = static_cast<const uint8_t *>(file_ptr_->region()) + off;
+      *data = static_cast<const uint8_t *>(mapping->region()) + off;
       return len;
     };
 
@@ -229,19 +240,18 @@ class MMapFileReadStorage : public IndexStorage {
       LOG_ERROR("Failed to unpack file: %s", path.c_str());
       return IndexError_UnpackIndex;
     }
+    file_path_.swap(candidate_path);
+    file_ptr_ = std::move(mapping);
+    index_offset_ = index_offset;
     segments_ = std::move(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
     return 0;
   } catch (const std::bad_alloc &) {
-    close();
     return IndexError_NoMemory;
   }
 
   int close() override {
-    if (file_ptr_) {
-      file_ptr_->close();
-    }
-    file_ptr_ = nullptr;
+    file_ptr_.reset();
     segments_.clear();
     return 0;
   }

@@ -972,11 +972,11 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     if (row_major) {
       if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);
-        return IndexError_ReadData;
+        return inverted_->read_error();
       }
     } else if (inverted_->read(off, data, size) != size) {
       LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
-      return IndexError_ReadData;
+      return inverted_->read_error();
     }
     ScatterCursor scatter_cursor(scatter_data);
 
@@ -1115,11 +1115,11 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     if (row_major) {
       if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);
-        return IndexError_ReadData;
+        return inverted_->read_error();
       }
     } else if (inverted_->read(off, data, size) != size) {
       LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
-      return IndexError_ReadData;
+      return inverted_->read_error();
     }
     ScatterCursor scatter_cursor(scatter_data);
 

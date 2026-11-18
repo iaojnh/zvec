@@ -127,6 +127,14 @@ class IndexStorage : public IndexModule {
               reinterpret_cast<uintptr_t>(data_) % alignment == 0);
     }
 
+    //! Keep a read-only file mapping alive while this view is retained.
+    static MemoryBlock MakeMappedView(void *data,
+                                      const std::shared_ptr<void> &owner) {
+      MemoryBlock block(data);
+      block.scratch_owner_ = owner;
+      return block;
+    }
+
     //! Build a non-owning view over caller-managed memory (e.g. a query-level
     //! scratch arena). The block frees and pins nothing on destruction, so the
     //! backing buffer must outlive every copy of this block. Uses the MMAP
@@ -153,6 +161,7 @@ class IndexStorage : public IndexModule {
       switch (rhs.type_) {
         case MemoryBlockType::MBT_MMAP:
           this->reset(rhs.data_);
+          scratch_owner_ = rhs.scratch_owner_;
           break;
         case MemoryBlockType::MBT_BUFFERPOOL:
           if (rhs.buffer_pool_handle_owner_) {
@@ -189,7 +198,7 @@ class IndexStorage : public IndexModule {
     MemoryBlock(MemoryBlock &&rhs) noexcept {
       switch (rhs.type_) {
         case MemoryBlockType::MBT_MMAP:
-          this->reset(rhs.data_);
+          move_mapped_from(rhs);
           break;
         case MemoryBlockType::MBT_BUFFERPOOL:
           type_ = MemoryBlockType::MBT_BUFFERPOOL;
@@ -232,6 +241,7 @@ class IndexStorage : public IndexModule {
         switch (rhs.type_) {
           case MemoryBlockType::MBT_MMAP:
             this->reset(rhs.data_);
+            scratch_owner_ = rhs.scratch_owner_;
             break;
           case MemoryBlockType::MBT_BUFFERPOOL:
             if (rhs.buffer_pool_handle_owner_) {
@@ -274,7 +284,8 @@ class IndexStorage : public IndexModule {
       if (this != &rhs) {
         switch (rhs.type_) {
           case MemoryBlockType::MBT_MMAP:
-            this->reset(rhs.data_);
+            release_current();
+            move_mapped_from(rhs);
             break;
           case MemoryBlockType::MBT_BUFFERPOOL:
             release_current();
@@ -399,6 +410,9 @@ class IndexStorage : public IndexModule {
     //! Release the current representation and reset the block.
     void release_current() {
       switch (type_) {
+        case MemoryBlockType::MBT_MMAP:
+          scratch_owner_.reset();
+          break;
         case MemoryBlockType::MBT_BUFFERPOOL:
           if (buffer_pool_handle_) {
             buffer_pool_handle_->release_one(buffer_block_id_);
@@ -424,6 +438,13 @@ class IndexStorage : public IndexModule {
       type_ = MemoryBlockType::MBT_UNKNOWN;
       scratch_capacity_ = 0;
       scratch_deep_copy_ = false;
+    }
+
+    void move_mapped_from(MemoryBlock &rhs) noexcept {
+      type_ = MBT_MMAP;
+      data_ = std::exchange(rhs.data_, nullptr);
+      scratch_owner_ = std::move(rhs.scratch_owner_);
+      rhs.type_ = MBT_UNKNOWN;
     }
 
     //! Deep-copy heap scratch ownership.
@@ -486,7 +507,73 @@ class IndexStorage : public IndexModule {
     //! A bounded-lifetime scatter read. Page-backed implementations may
     //! return independently pinned spans; contiguous backends use fallback.
     struct ScatterBlock {
-      using Spans = ailego::BudgetedVector<ReadSpan>;
+      // The contiguous fallback needs only one inline descriptor. Charge
+      // additional descriptors only for a genuinely scattered result.
+      class Spans {
+       public:
+        Spans() = default;
+        Spans(Spans &&rhs) noexcept
+            : first_(rhs.first_),
+              overflow_(std::move(rhs.overflow_)),
+              size_(std::exchange(rhs.size_, 0)) {}
+        Spans &operator=(Spans &&rhs) noexcept {
+          if (this != &rhs) {
+            first_ = rhs.first_;
+            overflow_ = std::move(rhs.overflow_);
+            size_ = std::exchange(rhs.size_, 0);
+          }
+          return *this;
+        }
+        void clear() noexcept {
+          overflow_.clear();
+          size_ = 0;
+        }
+        void reserve(size_t count) {
+          if (count > 1) overflow_.reserve(count);
+        }
+        void resize(size_t count) {
+          if (count > 1) {
+            overflow_.resize(count);
+            if (size_ == 1) overflow_.front() = first_;
+          } else {
+            if (count == 1 && size_ != 1)
+              first_ = size_ > 1 ? overflow_.front() : ReadSpan{};
+            overflow_.clear();
+          }
+          size_ = count;
+        }
+        void push_back(ReadSpan span) {
+          const size_t index = size_;
+          resize(size_ + 1);
+          (*this)[index] = span;
+        }
+        size_t size() const noexcept {
+          return size_;
+        }
+        bool empty() const noexcept {
+          return size() == 0;
+        }
+        const ReadSpan *begin() const noexcept {
+          return size_ > 1 ? overflow_.data() : &first_;
+        }
+        const ReadSpan *end() const noexcept {
+          return begin() + size();
+        }
+        ReadSpan &operator[](size_t index) {
+          return size_ > 1 ? overflow_[index] : first_;
+        }
+        const ReadSpan &operator[](size_t index) const {
+          return begin()[index];
+        }
+        const ReadSpan &front() const {
+          return *begin();
+        }
+
+       private:
+        ReadSpan first_{};
+        ailego::BudgetedVector<ReadSpan> overflow_{};
+        size_t size_{0};
+      };
 
       // Backends may retain charged descriptors without retaining page pins.
       // A separately copied lease must keep its pins until its last owner dies.
@@ -586,7 +673,7 @@ class IndexStorage : public IndexModule {
 
     //! Read data from segment. Keep the block alive while using its data.
     //! Resetting or destroying the block releases owned buffers/cache pins;
-    //! mmap and memory-backed views still require their segment to stay alive.
+    //! Borrowed mmap views require their source to stay alive.
     virtual size_t read(size_t offset, MemoryBlock &data, size_t len) = 0;
 
     //! Read bytes that the caller guarantees will never be modified after

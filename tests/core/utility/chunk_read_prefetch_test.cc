@@ -13,14 +13,15 @@
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <unistd.h>
+#include <ailego/io/libaio_loader.h>
 
 namespace zvec::ailego {
 struct MemoryLimitPoolTestPeer {
   static void stop_background(MemoryLimitPool &pool) {
     pool.stop_background_evictor();
   }
-  static void set_workspace_waiting(MemoryLimitPool &pool, size_t bytes) {
-    pool.workspace_waiting_size_.store(bytes, std::memory_order_relaxed);
+  static void set_workspace_waiting(MemoryLimitPool &pool, bool waiting) {
+    pool.mandatory_waiters_.store(waiting ? 1 : 0, std::memory_order_relaxed);
   }
 };
 }  // namespace zvec::ailego
@@ -82,6 +83,31 @@ class ChunkReadPrefetchTest : public testing::Test {
   std::shared_ptr<ChunkReadStorage> storage;
   IndexStorage::Segment::Pointer segment;
 };
+
+TEST_F(ChunkReadPrefetchTest, FailedAioTeardownQuarantinesAndAllowsDemandRead) {
+  auto &aio = LibAioLoader::Instance();
+  const auto getevents = aio.io_getevents;
+  const auto destroy = aio.io_destroy;
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    aio.io_getevents = getevents;
+    aio.io_destroy = destroy;
+  });
+  using Priority = IndexStorage::Segment::CachePriority;
+  ASSERT_TRUE(segment->try_prefetch(0, page, Priority::kNormal));
+  ASSERT_EQ(1u, storage->stats().prefetch_submitted);
+  const auto backing = pool.evictable_cache_used();
+  aio.io_getevents =
+      +[](io_context_t, long, long, io_event *, timespec *) { return -EIO; };
+  aio.io_destroy = +[](io_context_t) { return -EIO; };
+
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(64u, segment->read(17, block, 64));
+  EXPECT_EQ(0, std::memcmp(payload.data() + 17, block.data(), 64));
+  EXPECT_EQ(1u, storage->stats().prefetch_failed);
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+  EXPECT_FALSE(segment->try_prefetch(page, page, Priority::kNormal));
+  EXPECT_GE(pool.evictable_cache_used(), backing);
+}
 
 TEST_F(ChunkReadPrefetchTest, JoinsReadsAndBoundsCountAndBytes) {
   segment->prefetch(0, payload.size());
@@ -482,9 +508,10 @@ TEST_F(ChunkReadPrefetchTest, CacheHandoffYieldsToWaitingWorkspace) {
   ASSERT_TRUE(pool.try_charge_external(pressure));
   auto refund =
       ailego::ScopeGuard::Make([&] { pool.release_external(pressure); });
-  ailego::MemoryLimitPoolTestPeer::set_workspace_waiting(pool, page);
-  auto clear_waiter = ailego::ScopeGuard::Make(
-      [&] { ailego::MemoryLimitPoolTestPeer::set_workspace_waiting(pool, 0); });
+  ailego::MemoryLimitPoolTestPeer::set_workspace_waiting(pool, true);
+  auto clear_waiter = ailego::ScopeGuard::Make([&] {
+    ailego::MemoryLimitPoolTestPeer::set_workspace_waiting(pool, false);
+  });
   segment->prefetch(2 * list_bytes, list_bytes);
   EXPECT_EQ(0u, storage->stats().backing_reuses);
   EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);

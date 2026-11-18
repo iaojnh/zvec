@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <mutex>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_mapping.h>
@@ -165,6 +166,10 @@ class MMapFileStorage : public IndexStorage {
 
   //! Open storage
   int open(const std::string &path, bool create_if_missing) override {
+    if (is_dirty()) {
+      const int ret = flush_index();
+      if (ret != 0) return ret;
+    }
     if (!ailego::File::IsExist(path) && create_if_missing) {
       size_t last_slash = path.rfind('/');
       if (last_slash != std::string::npos) {
@@ -226,15 +231,14 @@ class MMapFileStorage : public IndexStorage {
 
  protected:
   //! Initialize index version segment
-  int init_version_segment() {
+  int init_version_segment(IndexMapping &mapping) {
     size_t data_size = std::strlen(IndexVersion::Details());
-    int error_code =
-        this->append_segment(INDEX_VERSION_SEGMENT_NAME, data_size);
+    int error_code = mapping.append(INDEX_VERSION_SEGMENT_NAME, data_size);
     if (error_code != 0) {
       return error_code;
     }
 
-    IndexMapping::Segment *segment = get_segment(INDEX_VERSION_SEGMENT_NAME);
+    auto *segment = mapping.map(INDEX_VERSION_SEGMENT_NAME, false, false);
     if (!segment) {
       return IndexError_MMapFile;
     }
@@ -242,7 +246,6 @@ class MMapFileStorage : public IndexStorage {
     size_t capacity = static_cast<size_t>(meta->padding_size + meta->data_size);
     memcpy(segment->data(), IndexVersion::Details(), data_size);
     segment->set_dirty();
-    set_as_dirty();
     meta->data_crc = ailego::Crc32c::Hash(segment->data(), data_size, 0);
     meta->data_size = data_size;
     meta->padding_size = capacity - data_size;
@@ -251,23 +254,22 @@ class MMapFileStorage : public IndexStorage {
 
   //! Initialize index file
   int init_index(const std::string &path) {
-    int error_code = mapping_.create(path, segment_meta_capacity_);
-    if (error_code != 0) {
-      return error_code;
-    }
+    IndexMapping mapping;
+    int ret = mapping.create(path, segment_meta_capacity_, /*exclusive=*/true);
+    if (ret != 0) return ret;
 
-    // Add index version
-    error_code = this->init_version_segment();
-    if (error_code != 0) {
-      return error_code;
-    }
-
-    // Refresh mapping
-    this->refresh_index(0);
-
-    // Close mapping
-    mapping_.close();
-    return 0;
+    bool ready = false;
+    const auto cleanup = ailego::ScopeGuard::Make([&] {
+      mapping.close();
+      if (!ready && !ailego::File::Delete(path))
+        LOG_ERROR("Failed to remove incomplete index %s", path.c_str());
+    });
+    ret = init_version_segment(mapping);
+    if (ret != 0) return ret;
+    mapping.refresh(0);
+    ret = mapping.flush();
+    ready = ret == 0;
+    return ret;
   }
 
   bool is_huge_page() const override {

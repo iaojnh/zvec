@@ -224,8 +224,13 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         }
       if (context &&
           LibAioLoader::Instance().destroy_budgeted(context, ring_memory)) {
-        LOG_ERROR("%s", "ChunkReadStorage: failed to destroy idle AIO context");
+        // An unconfirmed kernel owner keeps both ring and destination charges.
+        if (ring_charge) ring_charge->bytes = 0;
+        LOG_ERROR("%s", "ChunkReadStorage: failed to destroy AIO context");
+        return;
       }
+      for (auto *buffer : quarantined)
+        if (buffer) Pool::get_instance().release_cache_buffer(buffer);
     }
     void cancel(Slot &slot) {
       assert(!slot.submitted);
@@ -249,7 +254,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       } while (submitted == -EINTR);
       if (submitted > 0) {
         for (int i = 0; i < submitted; ++i)
-          static_cast<Slot *>(controls[i]->data)->submitted = true;
+          slots[reinterpret_cast<uintptr_t>(controls[i]->data)].submitted =
+              true;
         inflight += submitted;
         owner.io_calls.fetch_add(submitted, std::memory_order_relaxed);
         owner.prefetch_submitted.fetch_add(submitted,
@@ -259,7 +265,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         // No kernel ownership for these requests: publish failed reads and
         // let demand retry synchronously. Partial submissions stay queued.
         for (size_t i = 0; i < count; ++i)
-          finish(*static_cast<Slot *>(controls[i]->data), -1);
+          finish(slots[reinterpret_cast<uintptr_t>(controls[i]->data)], -1);
       }
     }
     void reap(bool wait) {
@@ -272,30 +278,63 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
             context, wait ? 1 : 0, static_cast<long>(inflight), events.data(),
             wait ? nullptr : &timeout);
       } while (count == -EINTR);
-      if (count < 0) {
-        // A successful destroy waits for all submitted operations. Never
-        // publish or free a destination while the kernel can still write it.
-        const int destroyed =
-            LibAioLoader::Instance().destroy_budgeted(context, ring_memory);
-        if (destroyed) {
-          LOG_ERROR(
-              "ChunkReadStorage: AIO completion failed (%d), teardown failed "
-              "(%d)",
-              count, destroyed);
-          std::terminate();
-        }
-        ready = false;
-        for (auto &slot : slots)
-          if (slot.item && !slot.done) finish(slot, -1);
+      if (count < 0 || static_cast<size_t>(count) > inflight ||
+          (wait && count == 0)) {
+        fail_pending_reads(count);
         return;
       }
+      std::array<bool, 64> seen{};
       for (int i = 0; i < count; ++i) {
-        auto *slot = static_cast<Slot *>(events[i].data);
-        finish(*slot, events[i].res2 ? -1 : static_cast<long>(events[i].res));
+        const auto id = reinterpret_cast<uintptr_t>(events[i].data);
+        if (id >= depth || seen[id] || !slots[id].submitted ||
+            events[i].obj != &slots[id].control) {
+          fail_pending_reads(-EIO);
+          return;
+        }
+        seen[id] = true;
+      }
+      for (int i = 0; i < count; ++i) {
+        auto &slot = slots[reinterpret_cast<uintptr_t>(events[i].data)];
+        finish(slot, events[i].res2 ? -1 : static_cast<long>(events[i].res));
+      }
+    }
+
+    void fail_pending_reads(int result) {
+      ready = false;
+      const int destroyed =
+          LibAioLoader::Instance().destroy_budgeted(context, ring_memory);
+      if (destroyed == 0) {
+        ring_charge.reset();
+      } else {
+        LOG_ERROR(
+            "ChunkReadStorage: AIO completion failed (%d), teardown "
+            "failed (%d)",
+            result, destroyed);
+      }
+      for (size_t i = 0; i < depth; ++i) {
+        auto &slot = slots[i];
+        if (!slot.item) continue;
+        if (!slot.done) {
+          if (destroyed && slot.submitted) {
+            // Leave kernel destinations charged and out of the allocator.
+            // Demand can retry in separate storage and this queue stays
+            // disabled.
+            auto &item = *slot.item;
+            quarantined[i] = std::exchange(item.buffer, nullptr);
+            item.data.store(nullptr, std::memory_order_relaxed);
+            const size_t capacity = item.capacity.exchange(0);
+            owner.cache_bytes.fetch_sub(capacity, std::memory_order_relaxed);
+          }
+          finish(slot, -1);
+        }
+        release(slot);
       }
     }
     void finish(Slot &slot, long got) {
-      if (slot.submitted) --inflight;
+      if (slot.submitted) {
+        --inflight;
+        slot.submitted = false;
+      }
       Entry &item = *slot.item;
       if (got > 0) {
         owner.io_bytes.fetch_add(got, std::memory_order_relaxed);
@@ -337,6 +376,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         while (!slot.done) {
           flush();
           if (!slot.done) reap(true);
+          if (!slot.item) return nullptr;
         }
         owner.prefetch_wait_ns.fetch_add(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -450,7 +490,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         free->required = required;
         io_prep_pread(&free->control, owner.data_file.native_handle(),
                       buffer->data, requested, physical);
-        free->control.data = free;
+        free->control.data = reinterpret_cast<void *>(free - slots.data());
         account_slot(capacity);
         begin = end;
       }
@@ -467,6 +507,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     LibAioLoader::RingMemory ring_memory{};
     bool ready{false};
     std::array<Slot, 64> slots{};
+    std::array<Pool::CacheBuffer *, 64> quarantined{};
     std::mutex mutex;
   };
 #endif

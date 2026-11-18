@@ -176,6 +176,113 @@ TEST_F(BufferStorageWriteTest, ExplicitOpenRequiresImplementationSupport) {
   EXPECT_FALSE(ailego::File::IsExist(file_path_));
 }
 
+TEST_F(BufferStorageWriteTest, CreateBudgetDenialLeavesPathRetryable) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  for (const char *type : {"BufferStorage", "MMapFileStorage"}) {
+    SCOPED_TRACE(type);
+    ailego::File::Delete(file_path_);
+    auto storage = IndexFactory::CreateStorage(type);
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(ailego::Params{}));
+    const size_t held = pool.available();
+    ASSERT_TRUE(pool.try_charge_metadata(held));
+    const int denied = storage->open(file_path_, true);
+    pool.release_metadata(held);
+    EXPECT_EQ(IndexError_NoMemory, denied);
+    EXPECT_FALSE(ailego::File::IsExist(file_path_));
+    ASSERT_EQ(0, storage->open(file_path_, true));
+    EXPECT_TRUE(storage->has("IndexVersion"));
+    EXPECT_EQ(0, storage->close());
+  }
+}
+
+TEST_F(BufferStorageWriteTest, FirstMappedAppendBudgetDenialIsAtomic) {
+  IndexMapping mapping;
+  ASSERT_EQ(0, mapping.create(file_path_, 4096));
+  const size_t initial_size = mapping.index_size();
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto available = pool.available();
+  int ret = IndexError_NoMemory;
+  for (size_t room = 0; room < 1024; room += 8) {
+    ASSERT_GT(available, room);
+    const size_t held = available - room;
+    ASSERT_TRUE(pool.try_charge_metadata(held));
+    ret = mapping.append("first", ailego::kVectorPageSize);
+    pool.release_metadata(held);
+    if (ret == 0) break;
+    ASSERT_EQ(IndexError_NoMemory, ret);
+    EXPECT_EQ(initial_size, mapping.index_size());
+    EXPECT_EQ(0u, mapping.footer().segment_count);
+    EXPECT_FALSE(mapping.has("first"));
+  }
+  ASSERT_EQ(0, ret);
+  EXPECT_EQ(initial_size + ailego::kVectorPageSize, mapping.index_size());
+  EXPECT_EQ(1u, mapping.footer().segment_count);
+  ASSERT_EQ(0, mapping.flush());
+  ASSERT_EQ(0, mapping.open(file_path_, false, false));
+  EXPECT_EQ(1u, mapping.footer().segment_count);
+  EXPECT_TRUE(mapping.has("first"));
+}
+
+TEST_F(BufferStorageWriteTest, MappedChainSplitCanRetryAfterBudgetDenial) {
+  IndexMapping mapping;
+  ASSERT_EQ(0, mapping.create(file_path_, 4096));
+  const auto initial_offset = mapping.index_size();
+  const std::string first(mapping.footer().segments_meta_size -
+                              sizeof(IndexFormat::SegmentMeta) - 2,
+                          'a');
+  ASSERT_EQ(0, mapping.append(first, ailego::kVectorPageSize));
+  const auto existing_size = mapping.index_size();
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_GT(pool.available(), 1024u);
+  const size_t held = pool.available() - 1024;
+  ASSERT_TRUE(pool.try_charge_metadata(held));
+  const int denied = mapping.append("second", ailego::kVectorPageSize);
+  pool.release_metadata(held);
+  EXPECT_EQ(IndexError_NoMemory, denied);
+  EXPECT_TRUE(mapping.has(first));
+  EXPECT_FALSE(mapping.has("second"));
+  EXPECT_EQ(existing_size, mapping.index_size());
+  EXPECT_EQ(0u, mapping.footer().next_meta_header_offset);
+
+  ASSERT_EQ(0, mapping.append("second", ailego::kVectorPageSize));
+  EXPECT_EQ(existing_size + initial_offset + ailego::kVectorPageSize,
+            mapping.index_size());
+  ASSERT_EQ(0, mapping.flush());
+  ASSERT_EQ(0, mapping.open(file_path_, false, false));
+  EXPECT_TRUE(mapping.has(first));
+  EXPECT_TRUE(mapping.has("second"));
+}
+
+TEST_F(BufferStorageWriteTest, ReopenPublishesDirectoryWithItsOwnFile) {
+  auto storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->append("original", 8));
+  auto original = storage->get("original");
+  ASSERT_NE(nullptr, original);
+  ASSERT_EQ(4u, original->write(0, "data", 4));
+  const std::string other_path = file_path_ + ".other";
+  AILEGO_DEFER([&] { ailego::File::Delete(other_path); });
+  {
+    ailego::File malformed;
+    ASSERT_TRUE(malformed.create(other_path, 0));
+  }
+  EXPECT_NE(0, storage->open(other_path, true));
+  EXPECT_EQ(file_path_, storage->file_path());
+  EXPECT_TRUE(storage->has("original"));
+  std::array<char, 4> output{};
+  ASSERT_EQ(output.size(), original->fetch(0, output.data(), output.size()));
+  EXPECT_EQ("data", std::string(output.data(), output.size()));
+
+  ASSERT_TRUE(ailego::File::Delete(other_path));
+  original.reset();
+  ASSERT_EQ(0, storage->open(other_path, true));
+  EXPECT_EQ(other_path, storage->file_path());
+  EXPECT_FALSE(storage->has("original"));
+  EXPECT_TRUE(storage->has("IndexVersion"));
+  EXPECT_EQ(0, storage->close());
+}
+
 TEST_F(BufferStorageWriteTest, WritableReopenNeedsCacheAndAllowsRetry) {
   {
     auto storage = open_writable();

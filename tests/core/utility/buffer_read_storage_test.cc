@@ -168,6 +168,33 @@ TEST_F(BufferReadStorageTest, ColdScatterReadKeepsContiguousFallback) {
   EXPECT_EQ(0, std::memcmp(payload_.data(), block.spans[0].data, length));
 }
 
+TEST_F(BufferReadStorageTest, MappedScatterAtFullBudgetRetainsMapping) {
+  auto storage = IndexFactory::CreateStorage("MMapFileReadStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(ailego::Params{}));
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  auto segment = storage->get("payload");
+  ASSERT_NE(nullptr, segment);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t held = pool.available();
+  ASSERT_TRUE(pool.try_charge_metadata(held));
+  AILEGO_DEFER([&] { pool.release_metadata(held); });
+
+  IndexStorage::Segment::ScatterBlock scatter;
+  ASSERT_EQ(payload_.size(),
+            segment->read_scatter(0, scatter, payload_.size()));
+  ASSERT_EQ(1u, scatter.spans.size());
+  auto copy = scatter.fallback;
+  IndexStorage::MemoryBlock moved = std::move(copy);
+  ASSERT_EQ(0, storage->close());
+  segment.reset();
+  storage.reset();
+  EXPECT_EQ(0, std::memcmp(payload_.data(), scatter.spans.front().data,
+                           payload_.size()));
+  scatter.reset();
+  EXPECT_EQ(0, std::memcmp(payload_.data(), moved.data(), payload_.size()));
+}
+
 TEST_F(BufferReadStorageTest, RejectsUnknownWarmupMode) {
   auto storage = IndexFactory::CreateStorage("BufferReadStorage");
   ASSERT_NE(storage, nullptr);

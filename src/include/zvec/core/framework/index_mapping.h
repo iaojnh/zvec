@@ -111,6 +111,7 @@ class IndexMapping {
 
   //! Create a index file
   int create(const std::string &path, size_t segs_size);
+  int create(const std::string &path, size_t segs_size, bool exclusive);
 
   //! Close the index
   void close();
@@ -179,7 +180,6 @@ class IndexMapping {
   bool ishugetlbfs(const std::string &path) const;
 
   int init_meta_section();
-  int init_hugepage_meta_section();
 
  public:
   //! Disable them
@@ -188,6 +188,9 @@ class IndexMapping {
 
  private:
   void swap(IndexMapping &rhs) noexcept;
+  int open_mapping(const std::string &path, bool cow, bool full_mode);
+  int init_meta_section(bool exclusive);
+  size_t meta_mapping_length() const;
   struct MetaMapping {
     IndexFormat::MetaHeader *header;
     size_t length;

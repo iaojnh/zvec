@@ -206,6 +206,15 @@ bool File::create(const char *path, size_t len, bool direct) {
   return true;
 }
 
+bool File::create_exclusive(const char *path) {
+  ailego_false_if_false(!is_valid() && path);
+  const int fd = OpenSafely(path, O_RDWR | O_CREAT | O_EXCL);
+  ailego_false_if_lt_zero(fd);
+  native_handle_ = fd;
+  read_only_ = false;
+  return true;
+}
+
 bool File::open(const char *path, bool rdonly, bool direct) {
   ailego_false_if_false(native_handle_ == File::InvalidHandle && path);
 
@@ -504,6 +513,20 @@ bool File::create(const char *path, size_t len, bool direct) {
 
   read_only_ = false;
   native_handle_ = file_handle;
+  return true;
+}
+
+bool File::create_exclusive(const char *path) {
+  ailego_false_if_false(!is_valid() && path);
+  const std::wstring wpath = FileHelper::Utf8ToWide(path);
+  ailego_false_if_false(Utf8PathOk(path, wpath));
+  HANDLE handle =
+      ::CreateFileW(wpath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ailego_false_if_false(handle != INVALID_HANDLE_VALUE);
+  native_handle_ = handle;
+  read_only_ = false;
   return true;
 }
 

@@ -113,6 +113,9 @@ class LazyMap {
   float max_load_factor() const {
     return map_ ? map_->max_load_factor() : 1.0f;
   }
+  void initialize() {
+    ensure();
+  }
   void reset() noexcept {
     map_.reset();
   }

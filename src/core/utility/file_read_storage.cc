@@ -115,13 +115,20 @@ class FileReadStorage : public IndexStorage {
         thread_read_error() = IndexError_NoMemory;
         return 0;
       }
-      return file_ptr_->read(data_offset_ + offset,
-                             const_cast<void *>(data.data()), len);
+      const size_t got = file_ptr_->read(data_offset_ + offset,
+                                         const_cast<void *>(data.data()), len);
+      if (got) {
+        data.scratch_size_ = got;
+      } else {
+        data.reset();
+      }
+      return got;
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
       thread_read_error() = IndexError_ReadData;
+      if (!iovec || !count) return false;
       size_t total = 0;
       for (size_t i = 0; i < count; ++i) {
         const auto &item = iovec[i];
@@ -247,7 +254,9 @@ class FileReadStorage : public IndexStorage {
         }
         len = region_size_ - offset;
       }
-      data.reset((void *)(data_ + offset));
+      data = len ? MemoryBlock::MakeMappedView(
+                       const_cast<char *>(data_ + offset), shared_from_this())
+                 : MemoryBlock{};
       return len;
     }
 

@@ -161,30 +161,30 @@ class MemoryReadStorage : public IndexStorage {
 
   //! Load a index file into container
   int open(const std::string &path, bool) override try {
-    rope_ = IndexMemory::Instance()->open(path);
-    if (!rope_) {
+    auto rope = IndexMemory::Instance()->open(path);
+    if (!rope) {
       LOG_ERROR("Failed to open memory rope %s", path.c_str());
       return IndexError_NoExist;
     }
-    if (rope_->empty()) {
+    if (rope->empty()) {
       LOG_ERROR("The memory rope %s is empty.", path.c_str());
       return IndexError_NoExist;
     }
 
-    auto read_data = [this](size_t offset, const void **data, size_t len) {
-      return (*this->rope_)[0].read(offset, data, len);
+    auto read_data = [&rope](size_t offset, const void **data, size_t len) {
+      return (*rope)[0].read(offset, data, len);
     };
 
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, (*rope_)[0].size(), checksum_validation_)) {
+    if (!unpacker.unpack(read_data, (*rope)[0].size(), checksum_validation_)) {
       LOG_ERROR("Failed to unpack memory block: %s", path.c_str());
       return IndexError_UnpackIndex;
     }
+    rope_ = std::move(rope);
     segments_ = std::move(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
     return 0;
   } catch (const std::bad_alloc &) {
-    close();
     return IndexError_NoMemory;
   }
 
