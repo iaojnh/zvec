@@ -413,6 +413,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   //! Active blocks count toward used(); idle blocks still count toward
   //! committed(). Only successful unmapping refunds their backing budget.
   void *acquire_retained_block(size_t bytes, bool metadata = false);
+  // Optional preparation: no waiting or owner-reclamation callbacks.
+  void *try_acquire_retained_block(size_t bytes, bool metadata = false);
   // For a retained block shared by multiple allocations. The owner must
   // keep the block alive. Required waits must release the allocator mutex;
   // current-observation projections are serialized by the RSS budget mutex.
@@ -670,6 +672,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     size_t native_bytes;
     size_t rss_bytes;
   };
+  void *acquire_retained_block_impl(size_t bytes, bool metadata, bool required);
   size_t native_available() const;
   size_t admission_shortfall(AdmissionRequest request) const;
   template <typename Admit>

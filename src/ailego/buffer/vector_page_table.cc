@@ -2104,10 +2104,11 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
     // F_NOCACHE (macOS) and ordinary file handles do not impose O_DIRECT's
     // alignment restriction. They can copy even partial pages straight out.
     const bool needs_alignment = requires_aligned_io();
-    const bool direct_destination =
+    bool direct_destination =
         !needs_alignment ||
         (within_page == 0 && copy_size == kVectorPageSize &&
          reinterpret_cast<uintptr_t>(buffer + copied) % kVectorPageSize == 0);
+    int read_fd = fd_;
     bool claimed = false;
     if (writable_) {
       // Bypassing admission must not bypass unflushed data. Reuse resident
@@ -2115,9 +2116,11 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
       // writer/eviction cannot leave us observing stale file contents.
       char *resident = nullptr;
       while ((resident = page_table_.acquire_block(page_id)) == nullptr) {
-        if (!direct_destination && PrepareReadScratch(scratch, 1) == 0) {
-          allocation_failed = true;
-          return false;
+        if (!direct_destination && !scratch.try_resize(kVectorPageSize)) {
+          // The caller already owns its destination. A buffered descriptor
+          // needs no bounce page; retain the same load claim/dirty-page rules.
+          direct_destination = true;
+          read_fd = meta_fd_;
         }
         const auto claim = page_table_.try_claim_block_load(page_id);
         if (claim == VectorPageTable::LoadClaimResult::kClaimed) {
@@ -2140,9 +2143,9 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
       }
     }
     if (!writable_ && !direct_destination &&
-        PrepareReadScratch(scratch, 1) == 0) {
-      allocation_failed = true;
-      return false;
+        !scratch.try_resize(kVectorPageSize)) {
+      direct_destination = true;
+      read_fd = meta_fd_;
     }
     char *page = direct_destination ? buffer + copied : scratch.data();
     const size_t available = file_size_ - page_offset;
@@ -2154,7 +2157,7 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
 
     ++io_requests;
     const ssize_t read_bytes = zvec_pread(
-        fd_, page, read_size, direct_destination ? absolute : page_offset);
+        read_fd, page, read_size, direct_destination ? absolute : page_offset);
     if (claimed) {
       (void)page_table_.cancel_block_load(page_id);
     }

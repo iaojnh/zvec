@@ -136,6 +136,20 @@ class BudgetedAlignedBuffer {
     }
   }
   void resize(size_t bytes, size_t alignment) {
+    resize_impl(bytes, alignment, true);
+  }
+  // Optional preparation must not wait or evict; refusal preserves backing.
+  bool try_resize(size_t bytes, size_t alignment) {
+    try {
+      resize_impl(bytes, alignment, false);
+      return true;
+    } catch (const std::bad_alloc &) {
+      return false;
+    }
+  }
+
+ private:
+  void resize_impl(size_t bytes, size_t alignment, bool required) {
     if (bytes == size_ && alignment == alignment_) return;
     if (alignment < alignof(void *) || (alignment & (alignment - 1)))
       throw std::bad_alloc();
@@ -152,23 +166,29 @@ class BudgetedAlignedBuffer {
         if (bytes > std::numeric_limits<size_t>::max() - padding)
           throw std::bad_alloc();
         replacement.retained_base_ =
-            pool.acquire_retained_block(bytes + padding);
+            required ? pool.acquire_retained_block(bytes + padding)
+                     : pool.try_acquire_retained_block(bytes + padding);
         if (!replacement.retained_base_) throw std::bad_alloc();
         const auto address =
             reinterpret_cast<uintptr_t>(replacement.retained_base_);
         replacement.data_ = reinterpret_cast<void *>(
             (address + alignment - 1) & ~(uintptr_t{alignment} - 1));
       } else {
-        replacement.memory_.add_for_allocation(bytes, [&] {
-          replacement.data_ =
-              ::operator new(bytes, std::align_val_t{alignment});
-        });
+        replacement.memory_.add_for_allocation(
+            bytes,
+            [&] {
+              replacement.data_ =
+                  ::operator new(bytes, std::align_val_t{alignment});
+            },
+            required);
       }
       replacement.size_ = bytes;
       replacement.alignment_ = alignment;
     }
     swap(replacement);
   }
+
+ public:
   void resize_array(size_t count, size_t width, size_t alignment) {
     if (width && count > std::numeric_limits<size_t>::max() / width)
       throw std::bad_alloc();

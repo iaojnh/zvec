@@ -71,9 +71,9 @@ class ReusableReadScratch {
     Block backing = allocate();
     const bool first = metadata_.bytes() == 0;
     try {
-      if (first) metadata_.add(sizeof(entries_));
-      auto worker =
-          std::allocate_shared<Worker>(ailego::BudgetedAllocator<Worker>{});
+      if (first && !metadata_.try_add(sizeof(entries_))) return backing;
+      auto worker = std::allocate_shared<Worker>(
+          ailego::OptionalBudgetedAllocator<Worker>{});
       // Optional owner registration may allocate. Keep the required backing
       // outside the worker until construction succeeds so refusal can return
       // it.
@@ -193,7 +193,7 @@ class ReusableReadScratch {
       if (index && !overflow_) {
         try {
           overflow_ = std::allocate_shared<Overflow>(
-              ailego::BudgetedAllocator<Overflow>{}, this);
+              ailego::OptionalBudgetedAllocator<Overflow>{}, this);
         } catch (const std::bad_alloc &) {
           // Required data already fits; optional pooling must not reject it.
           return replacement;

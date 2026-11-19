@@ -45,6 +45,13 @@ class BudgetedAllocator {
     return ptr && (reinterpret_cast<const Header *>(ptr) - 1)->charged != 0;
   }
   T *allocate(size_t n) {
+    return allocate_with_kind(
+        n, MemoryLimitPool::PendingAllocation::Kind::kWorkspace);
+  }
+
+ protected:
+  T *allocate_with_kind(size_t n,
+                        MemoryLimitPool::PendingAllocation::Kind kind) {
     if (n > max_size()) throw std::bad_alloc();
     // Count T slots even when T itself is a pointer.
     // NOLINTNEXTLINE(bugprone-sizeof-expression)
@@ -52,13 +59,15 @@ class BudgetedAllocator {
     auto &pool = MemoryLimitPool::get_instance();
     const size_t charge = pool.capacity() ? bytes : 0;
     using Pending = MemoryLimitPool::PendingAllocation;
-    Pending pending(pool, Pending::Kind::kWorkspace);
+    Pending pending(pool, kind);
     if (!pending.reserve(charge)) throw std::bad_alloc();
     void *raw = ::operator new(bytes, std::align_val_t{alignof(Header)});
     const auto creation = pending.commit();
     auto *header = new (raw) Header{charge, creation};
     return reinterpret_cast<T *>(header + 1);
   }
+
+ public:
   void deallocate(T *ptr, size_t) noexcept {
     if (!ptr) return;
     auto *header = reinterpret_cast<Header *>(ptr) - 1;
@@ -77,6 +86,24 @@ class BudgetedAllocator {
   template <typename U>
   bool operator!=(const BudgetedAllocator<U> &) const {
     return false;
+  }
+};
+
+// Optional acceleration metadata must neither wait nor evict consumers that
+// the scalar operation does not need. Reuse the same header and release path.
+template <typename T>
+class OptionalBudgetedAllocator : public BudgetedAllocator<T> {
+ public:
+  OptionalBudgetedAllocator() = default;
+  template <typename U>
+  OptionalBudgetedAllocator(const OptionalBudgetedAllocator<U> &) {}
+  template <typename U>
+  struct rebind {
+    using other = OptionalBudgetedAllocator<U>;
+  };
+  T *allocate(size_t n) {
+    return this->allocate_with_kind(
+        n, MemoryLimitPool::PendingAllocation::Kind::kLockedExternal);
   }
 };
 }  // namespace zvec::ailego

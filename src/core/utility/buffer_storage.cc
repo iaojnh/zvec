@@ -299,12 +299,36 @@ class BufferStorage : public IndexStorage {
       return read_borrowed_batch_impl(reads, count, /*immutable=*/true);
     }
 
+    static void reset_batch_outputs(BorrowedRead *reads, size_t count) {
+      for (size_t i = 0; reads && i < count; ++i) {
+        if (reads[i].block) reads[i].block->reset();
+      }
+    }
+
+    bool scalar_borrowed_batch(BorrowedRead *reads, size_t count,
+                               bool immutable) {
+      buffer_storage_read_error = IndexError_ReadData;
+      return immutable
+                 ? IndexStorage::Segment::read_borrowed_batch_immutable(reads,
+                                                                        count)
+                 : IndexStorage::Segment::read_borrowed_batch(reads, count);
+    }
+
     bool try_read_resident_immutable(BorrowedRead *reads, size_t count) {
       // The common DiskANN batch fits in bounded stack scratch. Retain the
       // unique source pins until every output has acquired its own pin, so
       // duplicate pages and aliased output blocks remain safe.
       static constexpr size_t kResidentBatch = 32;
-      if (count > kResidentBatch) return false;
+      if (count > kResidentBatch) {
+        for (size_t begin = 0; begin < count; begin += kResidentBatch) {
+          if (!try_read_resident_immutable(
+                  reads + begin, std::min(kResidentBatch, count - begin))) {
+            reset_batch_outputs(reads, count);
+            return false;
+          }
+        }
+        return true;
+      }
       std::array<ailego::block_id_t, kResidentBatch> ids;
       std::array<char *, kResidentBatch> pages;
       std::array<size_t, kResidentBatch> indices, offsets;
@@ -313,11 +337,8 @@ class BufferStorage : public IndexStorage {
           [&] { owner_->buffer_pool_->release_pages(ids.data(), pinned); });
       for (size_t i = 0; i < count; ++i) {
         const auto &request = reads[i];
-        auto *segment = dynamic_cast<WrappedSegment *>(request.segment);
-        if (!segment || segment->owner_ != owner_ || !request.block ||
-            request.offset > segment->data_size() ||
-            request.length > segment->data_size() - request.offset)
-          return false;
+        // The batch entry point validated every local request before probing.
+        auto *segment = static_cast<WrappedSegment *>(request.segment);
         indices[i] = kResidentBatch;
         if (!request.length) continue;
         const size_t start = segment->data_offset();
@@ -359,17 +380,37 @@ class BufferStorage : public IndexStorage {
       }
       if (reads == nullptr || owner_->buffer_pool_handle_ == nullptr ||
           owner_->buffer_pool_ == nullptr) {
+        reset_batch_outputs(reads, count);
         return false;
+      }
+
+      // Validate before any optional allocation or partially published hit
+      // batch. Scalar zero-length reads clamp offsets, so a memory-pressure
+      // fallback must not accidentally accept an invalid local request.
+      bool local_batch = true;
+      for (size_t i = 0; i < count; ++i) {
+        const auto &request = reads[i];
+        if (!request.segment || !request.block) {
+          reset_batch_outputs(reads, count);
+          return false;
+        }
+        auto *segment = dynamic_cast<WrappedSegment *>(request.segment);
+        if (!segment || segment->owner_ != owner_) {
+          local_batch = false;
+          continue;
+        }
+        const size_t size = segment->data_size();
+        if (request.offset > size || request.length > size - request.offset) {
+          reset_batch_outputs(reads, count);
+          return false;
+        }
       }
 
       // Mutable reads still publish owned snapshots, not writable page pins.
       const bool mutable_snapshot =
           owner_->buffer_pool_->writable() && !immutable;
-      if (!owner_->cache_enabled_) {
-        return immutable
-                   ? IndexStorage::Segment::read_borrowed_batch_immutable(reads,
-                                                                          count)
-                   : IndexStorage::Segment::read_borrowed_batch(reads, count);
+      if (!local_batch || !owner_->cache_enabled_) {
+        return scalar_borrowed_batch(reads, count, immutable);
       }
 
       if ((immutable || !owner_->buffer_pool_->writable()) &&
@@ -409,14 +450,17 @@ class BufferStorage : public IndexStorage {
       };
       using BatchArena = ailego::BudgetedAlignedBuffer;
       struct BatchScratch {
-        std::vector<BatchState, ailego::BudgetedAllocator<BatchState>> states;
+        std::vector<BatchState, ailego::OptionalBudgetedAllocator<BatchState>>
+            states;
         std::vector<ailego::block_id_t,
-                    ailego::BudgetedAllocator<ailego::block_id_t>>
+                    ailego::OptionalBudgetedAllocator<ailego::block_id_t>>
             page_ids, unique_page_ids, admitted_ids;
-        std::vector<char *, ailego::BudgetedAllocator<char *>> pages,
+        std::vector<char *, ailego::OptionalBudgetedAllocator<char *>> pages,
             admitted_pages;
-        std::vector<PageUse, ailego::BudgetedAllocator<PageUse>> page_uses;
-        std::vector<size_t, ailego::BudgetedAllocator<size_t>> admitted_indices;
+        std::vector<PageUse, ailego::OptionalBudgetedAllocator<PageUse>>
+            page_uses;
+        std::vector<size_t, ailego::OptionalBudgetedAllocator<size_t>>
+            admitted_indices;
         std::shared_ptr<BatchArena> arena;
         // O_DIRECT must read into this already-reserved page buffer without
         // allocating another bounce page after the cache has been pinned.
@@ -474,21 +518,7 @@ class BufferStorage : public IndexStorage {
       size_t copy_upper_bound = 0;
       for (size_t i = 0; i < count; ++i) {
         BorrowedRead &request = reads[i];
-        auto *segment = dynamic_cast<WrappedSegment *>(request.segment);
-        if (segment == nullptr || segment->owner_ != owner_ ||
-            request.block == nullptr) {
-          cleanup_owned();
-          return immutable
-                     ? IndexStorage::Segment::read_borrowed_batch_immutable(
-                           reads, count)
-                     : IndexStorage::Segment::read_borrowed_batch(reads, count);
-        }
-
-        const size_t data_size = segment->data_size();
-        if (request.offset > data_size ||
-            request.length > data_size - request.offset) {
-          return fail();
-        }
+        auto *segment = static_cast<WrappedSegment *>(request.segment);
 
         BatchState state;
         state.request = &request;
@@ -529,12 +559,13 @@ class BufferStorage : public IndexStorage {
         }
       }
 
-      // Reserve bounded fallback space before pinning pages. Otherwise a
-      // large batch can pin the entire budget and prevent its own fallback.
+      // Reserve fallback results before output pins can consume the budget.
+      // This is optional: a refusal must return to scalar reads immediately.
       if (copy_upper_bound && copy_upper_bound <= kMaxArenaBytes) {
         scratch.arena = std::allocate_shared<BatchArena>(
-            ailego::BudgetedAllocator<BatchArena>{}, copy_upper_bound,
-            kArenaAlign);
+            ailego::OptionalBudgetedAllocator<BatchArena>{});
+        if (!scratch.arena->try_resize(copy_upper_bound, kArenaAlign))
+          throw std::bad_alloc();
       }
       // Reserve before pinning any cache page, including the bounded cold-read
       // batch. Writable paths still use synchronized scalar bypass reads.
@@ -545,8 +576,8 @@ class BufferStorage : public IndexStorage {
                        : kBypassBatchPages,
                    total_pages);
       while (bypass_batch_pages != 0) {
-        if (scratch.bypass_page.resize(bypass_batch_pages *
-                                       ailego::kVectorPageSize) == 0)
+        if (scratch.bypass_page.try_resize(bypass_batch_pages *
+                                           ailego::kVectorPageSize))
           break;
         // Preserve the one-page fallback when a larger I/O window does not fit.
         if (bypass_batch_pages == 1) throw std::bad_alloc();
@@ -692,26 +723,19 @@ class BufferStorage : public IndexStorage {
                                 scratch.pages[unique_index] +
                                     state.abs_offset % ailego::kVectorPageSize);
       }
-      const bool release_copy_pages =
-          total != 0 &&
-          (!batch_arena || !scratch.arena || scratch.arena.use_count() != 1 ||
-           scratch.arena->size() < total);
+      const bool release_copy_pages = total != 0 && !scratch.arena;
       if (release_copy_pages) {
-        // The <=2 MiB arena was prepaid before admission. Larger snapshots
-        // (or a small arena selected from a larger mixed batch) were not:
-        // keeping their sources pinned here can block their own allocation.
+        // Unreserved copies must not compete with their own source pins.
         release_pages();
       }
       std::shared_ptr<BatchArena> arena_owner;
       if (batch_arena && total != 0) {
-        if (!scratch.arena || scratch.arena.use_count() != 1) {
-          scratch.arena = std::allocate_shared<BatchArena>(
-              ailego::BudgetedAllocator<BatchArena>{});
-        }
-        if (scratch.arena->size() < total) {
-          scratch.arena->resize(total, kArenaAlign);
-        }
         arena_owner = scratch.arena;
+        if (!arena_owner) {
+          arena_owner = std::allocate_shared<BatchArena>(
+              ailego::OptionalBudgetedAllocator<BatchArena>{}, total,
+              kArenaAlign);
+        }
         size_t off = 0;
         for (BatchState &state : scratch.states) {
           if (!state.copy_result) {
@@ -797,7 +821,10 @@ class BufferStorage : public IndexStorage {
             end_byte = std::max(end_byte, use.source_offset + use.length);
             ++use_end;
           }
-          const char *source = scratch.pages[unique_index];
+          // Pins protect lifetime, not concurrent writes. Mutable snapshots
+          // must copy even resident bytes through the page-locked read path.
+          const char *source =
+              mutable_snapshot ? nullptr : scratch.pages[unique_index];
           if (source == nullptr) {
             const size_t page_offset =
                 scratch.unique_page_ids[unique_index] * ailego::kVectorPageSize;
@@ -851,18 +878,11 @@ class BufferStorage : public IndexStorage {
       release_pages();
       return true;
     } catch (const std::bad_alloc &) {
-      buffer_storage_read_error = IndexError_NoMemory;
-      for (size_t i = 0; reads && i < count; ++i) {
-        if (reads[i].block) reads[i].block->reset();
-      }
-      if (!immutable && owner_->buffer_pool_ != nullptr &&
-          owner_->buffer_pool_->writable()) {
-        // Batch descriptors are optional. Their pins and allocations have
-        // already unwound, so retain the original scalar snapshot fallback.
-        buffer_storage_read_error = IndexError_ReadData;
-        return IndexStorage::Segment::read_borrowed_batch(reads, count);
-      }
-      return false;
+      // Optional batch state has unwound, including every source/output pin.
+      // All access modes retain their scalar path; it reports NoMemory only
+      // when the actual read cannot fit either.
+      reset_batch_outputs(reads, count);
+      return scalar_borrowed_batch(reads, count, immutable);
     }
 
     int write_error() const override {

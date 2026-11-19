@@ -505,14 +505,16 @@ TEST_F(BufferPoolTest, ShortReadDoesNotEvictHotPageOnFirstTouch) {
 
     const size_t reserve = memory_pool.page_admission_reserve();
     ASSERT_EQ(MemoryLimitPool::get_instance().capacity() / 16, reserve);
-    ASSERT_LT(memory_pool.used() + kVectorPageSize, kCapacity - reserve);
-    charged_metadata =
-        kCapacity - reserve - memory_pool.used() - 2 * kVectorPageSize;
-    ASSERT_TRUE(memory_pool.try_charge_metadata(charged_metadata));
-
     char *hot = pool.acquire_buffer(/*block_id=*/0, 10);
     ASSERT_NE(nullptr, hot);
-    pool.page_table_.release_block(/*block_id=*/0);
+    auto release_pin = ScopeGuard::Make(
+        [&] { pool.page_table_.release_block(/*block_id=*/0); });
+    // Isolate foreground first-touch admission from background reclamation.
+    // Use the actual shared quota, including retained allocator metadata.
+    auto &native = MemoryLimitPool::get_instance();
+    ASSERT_GE(native.available(), reserve);
+    charged_metadata = native.available() - reserve;
+    ASSERT_TRUE(memory_pool.try_charge_metadata(charged_metadata));
 
     std::vector<char> data(2 * kVectorPageSize);
     ASSERT_TRUE(handle.read_range(kVectorPageSize, data.size(), data.data()));

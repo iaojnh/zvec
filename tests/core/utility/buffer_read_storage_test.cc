@@ -272,11 +272,6 @@ TEST_F(BufferReadStorageTest, CachePressureFallsBackToOwnedRead) {
   AILEGO_DEFER([&] { pool.release_external(external_charge); });
 
   IndexStorage::MemoryBlock block;
-  if (storage->vec_buffer_pool()->requires_aligned_io()) {
-    EXPECT_EQ(0u, segment->read(0, block, 64));
-    EXPECT_EQ(nullptr, block.data());
-    return;
-  }
   ASSERT_EQ(64u, segment->read(0, block, 64));
   EXPECT_EQ(0, std::memcmp(payload_.data(), block.data(), 64));
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, block.type_);

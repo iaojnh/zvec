@@ -84,6 +84,28 @@ class BufferStorageWriteTest : public ::testing::Test {
 
   void check_shared_cache_reserve(size_t capacity);
 
+  struct WorkspacePressure {
+    explicit WorkspacePressure(size_t remaining) {
+      auto &pool = ailego::MemoryLimitPool::get_instance();
+      const size_t before = pool.used();
+      char *sample = allocator.allocate(1);
+      const size_t header = pool.used() - before - 1;
+      allocator.deallocate(sample, 1);
+      if (pool.available() < header + remaining) throw std::bad_alloc();
+      bytes = pool.available() - header - remaining;
+      data = allocator.allocate(bytes);
+      std::memset(data, 'p', bytes);
+    }
+    ~WorkspacePressure() {
+      allocator.deallocate(data, bytes);
+    }
+    WorkspacePressure(const WorkspacePressure &) = delete;
+    WorkspacePressure &operator=(const WorkspacePressure &) = delete;
+    ailego::BudgetedAllocator<char> allocator;
+    char *data{nullptr};
+    size_t bytes{0};
+  };
+
   std::string file_path_;
 };
 
@@ -1586,6 +1608,118 @@ TEST_F(BufferStorageWriteTest, ReadOnlyBatchFallsBackWhenPinsExceedBudget) {
   EXPECT_EQ(0, storage->close());
 }
 
+TEST_F(BufferStorageWriteTest, BatchReadsPreserveScalarAdmissionUnderPressure) {
+  const size_t page = ailego::kVectorPageSize;
+  std::vector<char> payload(4 * page, 'v');
+  {
+    auto storage = open_writable();
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->append("batch_admission", payload.size()));
+    auto segment = storage->get("batch_admission");
+    ASSERT_EQ(payload.size(),
+              segment->write(0, payload.data(), payload.size()));
+    ASSERT_EQ(0, storage->close());
+  }
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  for (bool writable : {false, true}) {
+    for (bool immutable : {false, true}) {
+      if (writable && !immutable) continue;  // mutable reads need copy budget
+      for (size_t remaining : {size_t{0}, 2 * page}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "writable=" << writable << " immutable=" << immutable
+                     << " remaining=" << remaining);
+        auto storage = writable ? open_writable() : open_read_only();
+        ASSERT_TRUE(storage);
+        auto segment = storage->get("batch_admission");
+        ASSERT_TRUE(segment);
+        const size_t first = (page - segment->data_offset() % page) % page;
+        IndexStorage::MemoryBlock guard;
+        ASSERT_EQ(16U, segment->read_borrowed_immutable(first, guard, 16));
+        ASSERT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, guard.type_);
+        std::vector<IndexStorage::MemoryBlock> blocks(1025);
+        std::vector<IndexStorage::Segment::BorrowedRead> reads;
+        for (auto &block : blocks)
+          reads.emplace_back(segment.get(), first, 16, &block);
+        if (remaining) reads.back().offset += page;
+        WorkspacePressure pressure(remaining);
+        ASSERT_EQ(remaining, pool.available());
+        const auto before = pool.stats();
+        auto batch = [&](size_t count) {
+          return immutable ? segment->read_borrowed_batch_immutable(
+                                 reads.data(), count)
+                           : segment->read_borrowed_batch(reads.data(), count);
+        };
+        // Cross the stack fast-path boundary, then reject the optional heap
+        // descriptors for a mixed hot/cold batch that fits via scalar reads.
+        for (size_t count : {size_t{32}, size_t{33}, reads.size()}) {
+          ASSERT_TRUE(batch(count));
+          for (size_t i = 0; i < count; ++i) {
+            ASSERT_NE(nullptr, blocks[i].data());
+            EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
+                                     blocks[i].data(), reads[i].length));
+            blocks[i].reset();
+          }
+        }
+        ASSERT_TRUE(
+            immutable
+                ? segment->IndexStorage::Segment::read_borrowed_batch_immutable(
+                      reads.data(), reads.size())
+                : segment->IndexStorage::Segment::read_borrowed_batch(
+                      reads.data(), reads.size()));
+        for (auto &block : blocks) block.reset();
+        if (remaining) {
+          // The descriptors fit but the worst-case result arena does not.
+          // Its optional reservation must also fall back without waiting.
+          reads.resize(33);
+          for (auto &read : reads) read.length = page / 2;
+          reads.back().offset = first + 2 * page;
+          ASSERT_TRUE(batch(reads.size()));
+          for (size_t i = 0; i < reads.size(); ++i) {
+            ASSERT_NE(nullptr, blocks[i].data());
+            EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
+                                     blocks[i].data(), reads[i].length));
+            blocks[i].reset();
+          }
+        }
+        // Empty inputs must not allocate; invalid empty offsets must not be
+        // accepted merely because a scalar read would clamp them to EOF.
+        for (auto &read : reads) read.length = 0;
+        ASSERT_TRUE(batch(reads.size()));
+        reads.back().offset = segment->data_size() + 1;
+        EXPECT_FALSE(batch(reads.size()));
+        for (auto &block : blocks) EXPECT_EQ(nullptr, block.data());
+        EXPECT_EQ(before.capacity_waits, pool.stats().capacity_waits);
+      }
+    }
+  }
+}
+
+TEST_F(BufferStorageWriteTest, SnapshotDoesNotWaitForOptionalScratchMetadata) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("scratch_admission", ailego::kVectorPageSize));
+  auto segment = storage->get("scratch_admission");
+  ASSERT_TRUE(segment);
+  const std::string payload(128, 's');
+  ASSERT_EQ(payload.size(), segment->write(0, payload.data(), payload.size()));
+  IndexStorage::MemoryBlock guard;
+  ASSERT_EQ(payload.size(),
+            segment->read_borrowed_immutable(0, guard, payload.size()));
+  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, guard.type_);
+  WorkspacePressure pressure(256);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto before = pool.stats();
+  IndexStorage::MemoryBlock result;
+  ASSERT_EQ(payload.size(), segment->read(0, result, payload.size()));
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, result.type_);
+  EXPECT_EQ(0, std::memcmp(payload.data(), result.data(), payload.size()));
+  IndexStorage::Segment::BorrowedRead invalid = {
+      segment.get(), segment->data_size() + 1, 0, &result};
+  EXPECT_FALSE(segment->read_borrowed_batch(&invalid, 1));
+  EXPECT_EQ(nullptr, result.data());
+  EXPECT_EQ(before.capacity_waits, pool.stats().capacity_waits);
+}
+
 void BufferStorageWriteTest::check_shared_cache_reserve(size_t capacity) {
   auto &memory_pool = ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory_pool.init(capacity));
@@ -1898,7 +2032,7 @@ TEST_F(BufferStorageWriteTest, CR_ConcurrentSamePageReadSeesWholeWrite) {
   auto seg = storage->get("seg1");
   ASSERT_TRUE(seg);
 
-  constexpr size_t kPayloadSize = 256;
+  const size_t kPayloadSize = ailego::kVectorPageSize / 2;
   const size_t page_offset = seg->data_offset() % ailego::kVectorPageSize;
   const size_t offset = page_offset + kPayloadSize <= ailego::kVectorPageSize
                             ? 0
@@ -1909,12 +2043,13 @@ TEST_F(BufferStorageWriteTest, CR_ConcurrentSamePageReadSeesWholeWrite) {
             seg->write(offset, pattern_a.data(), pattern_a.size()));
 
   std::atomic<bool> start{false};
+  std::atomic<bool> done{false};
   std::atomic<bool> failed{false};
   std::thread writer([&] {
     while (!start.load(std::memory_order_acquire)) {
       std::this_thread::yield();
     }
-    for (size_t i = 0; i < 10000; ++i) {
+    for (size_t i = 0; !done.load(std::memory_order_acquire); ++i) {
       const auto &pattern = (i & 1U) == 0 ? pattern_b : pattern_a;
       if (seg->write(offset, pattern.data(), pattern.size()) != kPayloadSize) {
         failed.store(true, std::memory_order_release);
@@ -1923,14 +2058,22 @@ TEST_F(BufferStorageWriteTest, CR_ConcurrentSamePageReadSeesWholeWrite) {
     }
   });
   std::thread reader([&] {
+    AILEGO_DEFER([&] { done.store(true, std::memory_order_release); });
     std::vector<char> observed(kPayloadSize);
     start.store(true, std::memory_order_release);
     for (size_t i = 0; i < 10000; ++i) {
       IndexStorage::MemoryBlock snapshot;
-      const size_t read =
-          (i & 1U) == 0 ? seg->fetch(offset, observed.data(), observed.size())
-                        : seg->read(offset, snapshot, observed.size());
-      if ((i & 1U) != 0 && read == kPayloadSize)
+      size_t read = 0;
+      if (i % 3 == 0) {
+        read = seg->fetch(offset, observed.data(), observed.size());
+      } else if (i % 3 == 1) {
+        read = seg->read(offset, snapshot, observed.size());
+      } else {
+        IndexStorage::Segment::BorrowedRead request = {
+            seg.get(), offset, observed.size(), &snapshot};
+        if (seg->read_borrowed_batch(&request, 1)) read = observed.size();
+      }
+      if (i % 3 != 0 && read == kPayloadSize)
         std::memcpy(observed.data(), snapshot.data(), observed.size());
       if (read != kPayloadSize ||
           (observed != pattern_a && observed != pattern_b)) {

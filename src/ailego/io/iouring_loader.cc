@@ -75,7 +75,6 @@ int IoUringRing::submit_reads(int fd, const IoUringRead *reads, size_t count) {
     for (size_t i = 0; i < count; ++i) {
       const auto &read = reads[i];
       if (!read.buf || !read.len || read.offset % 512 || read.len % 512 ||
-          reinterpret_cast<uintptr_t>(read.buf) % 512 ||
           read.len > std::numeric_limits<uint32_t>::max() ||
           read.expected_len > read.len)
         return -1;
@@ -538,8 +537,7 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
           is_write ? write_reqs[req_idx].buf : read_reqs[req_idx].buf;
       if (buf == nullptr || len == 0 || expected_len > len ||
           len > std::numeric_limits<uint32_t>::max() || offset % 512 != 0 ||
-          len % 512 != 0 ||
-          (!is_write && reinterpret_cast<uintptr_t>(buf) % 512 != 0)) {
+          len % 512 != 0) {
         return -1;
       }
       const size_t aligned_len =
@@ -642,9 +640,7 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
       }
 
       const unsigned to_submit = static_cast<unsigned>(n_ops - submitted);
-      const int ret = static_cast<int>(syscall(
-          __NR_io_uring_enter, ring_fd_, to_submit, 1u, IORING_ENTER_GETEVENTS,
-          static_cast<void *>(nullptr), static_cast<size_t>(0)));
+      const int ret = enter(to_submit, 1u, IORING_ENTER_GETEVENTS);
       if (ret >= 0) {
         if (static_cast<unsigned>(ret) > to_submit) return quarantine();
         submitted += static_cast<size_t>(ret);
@@ -669,9 +665,7 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
         if (completed >= submitted) {
           break;
         }
-        const int wait_ret = static_cast<int>(syscall(
-            __NR_io_uring_enter, ring_fd_, 0u, 1u, IORING_ENTER_GETEVENTS,
-            static_cast<void *>(nullptr), static_cast<size_t>(0)));
+        const int wait_ret = enter(0u, 1u, IORING_ENTER_GETEVENTS);
         if (wait_ret >= 0 || errno == EINTR) {
           continue;
         }

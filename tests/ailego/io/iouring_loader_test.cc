@@ -30,6 +30,47 @@
 
 namespace zvec {
 namespace ailego {
+
+// Stack-owned control fields exercise staging on hosts without io_uring.
+// Submissions still use real positioned reads into the ring-owned mapping.
+class IoUringStagingTestPeer {
+ public:
+  void attach(IoUringRing &ring, int fd) {
+    active_ = this;
+    ring.ring_fd_ = ::dup(fd);
+    ring.sq_head_ = &submitted_;
+    ring.sq_tail_ = &tail_;
+    ring.sq_ring_mask_ = &mask_;
+    ring.sq_array_ = indices_.data();
+    ring.sqes_ = requests_.data();
+    ring.cq_head_ = &completed_;
+    ring.cq_tail_ = &available_;
+    ring.cq_ring_mask_ = &mask_;
+    ring.cqes_ = events_.data();
+    ring.sq_entries_ = ring.cq_entries_ = indices_.size();
+    ring.enter_override_ = enter;
+    for (size_t i = 0; i < indices_.size(); ++i) indices_[i] = i;
+  }
+
+ private:
+  static int enter(int, unsigned count, unsigned, unsigned) {
+    for (unsigned i = 0; i < count; ++i) {
+      auto &request =
+          active_->requests_[active_->submitted_++ & active_->mask_];
+      auto &event = active_->events_[active_->available_++ & active_->mask_];
+      event.user_data = request.user_data;
+      event.res = ::pread(request.fd, reinterpret_cast<void *>(request.addr),
+                          request.len, request.off);
+    }
+    return static_cast<int>(count);
+  }
+  inline static thread_local IoUringStagingTestPeer *active_{nullptr};
+  unsigned submitted_{0}, tail_{0}, completed_{0}, available_{0}, mask_{7};
+  std::array<unsigned, 8> indices_{};
+  std::array<io_uring_sqe, 8> requests_{};
+  std::array<io_uring_cqe, 8> events_{};
+};
+
 namespace {
 
 constexpr size_t kBlockSize = 512;
@@ -94,49 +135,89 @@ TEST_F(IoUringLoaderTest, ReadsBatchAndZeroPadsExpectedShortRead) {
   ASSERT_EQ(::pwrite(file.fd(), source.data(), source.size(), 0),
             static_cast<ssize_t>(source.size()));
 
-  void *output = allocate_aligned(2 * kBlockSize);
-  ASSERT_NE(output, nullptr);
-  std::vector<IoUringRead> requests;
-  requests.emplace_back(/*offset=*/0, kBlockSize, output);
-  requests.emplace_back(kBlockSize, kBlockSize,
-                        static_cast<uint8_t *>(output) + kBlockSize, kTailSize);
-
-  for (bool asynchronous : {false, true}) {
-    SCOPED_TRACE(asynchronous);
-    std::memset(output, 0xac, 2 * kBlockSize);
-    if (!asynchronous) {
-      ASSERT_EQ(0, ring.execute(file.fd(), requests));
-    } else {
-      ASSERT_EQ(0,
-                ring.submit_reads(file.fd(), requests.data(), requests.size()));
-      std::array<bool, 2> seen{};
-      size_t total = 0;
-      while (total < requests.size()) {
-        std::array<uint32_t, 2> completed{};
-        const int count =
-            ring.get_completed_reads(1, completed.data(), completed.size());
-        ASSERT_GT(count, 0);
-        for (int i = 0; i < count; ++i) {
-          const size_t id = completed[i];
-          ASSERT_LT(id, requests.size());
-          ASSERT_FALSE(seen[id]);
-          seen[id] = true;
-          const size_t bytes = id == 0 ? kBlockSize : kTailSize;
-          EXPECT_EQ(
-              0, std::memcmp(static_cast<uint8_t *>(output) + id * kBlockSize,
-                             source.data() + id * kBlockSize, bytes));
+  void *backing = allocate_aligned(3 * kBlockSize);
+  ASSERT_NE(backing, nullptr);
+  for (size_t bias : {size_t{0}, size_t{1}}) {
+    auto *output = static_cast<uint8_t *>(backing) + bias;
+    std::vector<IoUringRead> requests;
+    requests.emplace_back(/*offset=*/0, kBlockSize, output);
+    requests.emplace_back(kBlockSize, kBlockSize, output + kBlockSize,
+                          kTailSize);
+    for (bool asynchronous : {false, true}) {
+      SCOPED_TRACE(asynchronous);
+      std::memset(output, 0xac, 2 * kBlockSize);
+      if (!asynchronous) {
+        ASSERT_EQ(0, ring.execute(file.fd(), requests));
+      } else {
+        ASSERT_EQ(
+            0, ring.submit_reads(file.fd(), requests.data(), requests.size()));
+        std::array<bool, 2> seen{};
+        size_t total = 0;
+        while (total < requests.size()) {
+          std::array<uint32_t, 2> completed{};
+          const int count =
+              ring.get_completed_reads(1, completed.data(), completed.size());
+          ASSERT_GT(count, 0);
+          for (int i = 0; i < count; ++i) {
+            const size_t id = completed[i];
+            ASSERT_LT(id, requests.size());
+            ASSERT_FALSE(seen[id]);
+            seen[id] = true;
+            const size_t bytes = id == 0 ? kBlockSize : kTailSize;
+            EXPECT_EQ(
+                0, std::memcmp(static_cast<uint8_t *>(output) + id * kBlockSize,
+                               source.data() + id * kBlockSize, bytes));
+          }
+          total += count;
         }
-        total += count;
       }
+      EXPECT_EQ(0u, pool_.used());
+      EXPECT_EQ(std::memcmp(output, source.data(), kBlockSize), 0);
+      const auto *tail = static_cast<const uint8_t *>(output) + kBlockSize;
+      EXPECT_EQ(std::memcmp(tail, source.data() + kBlockSize, kTailSize), 0);
+      EXPECT_TRUE(std::all_of(tail + kTailSize, tail + kBlockSize,
+                              [](uint8_t value) { return value == 0; }));
     }
-    EXPECT_EQ(0u, pool_.used());
-    EXPECT_EQ(std::memcmp(output, source.data(), kBlockSize), 0);
-    const auto *tail = static_cast<const uint8_t *>(output) + kBlockSize;
-    EXPECT_EQ(std::memcmp(tail, source.data() + kBlockSize, kTailSize), 0);
-    EXPECT_TRUE(std::all_of(tail + kTailSize, tail + kBlockSize,
-                            [](uint8_t value) { return value == 0; }));
   }
-  std::free(output);
+  std::free(backing);
+}
+
+TEST_F(IoUringLoaderTest,
+       StagingAcceptsUnalignedDestinationsWithoutNativeRing) {
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  constexpr size_t tail = 123;
+  std::vector<uint8_t> source(kBlockSize + tail, 0x6d);
+  ASSERT_EQ(static_cast<ssize_t>(source.size()),
+            ::pwrite(file.fd(), source.data(), source.size(), 0));
+  IoUringStagingTestPeer peer;
+  IoUringRing ring;
+  peer.attach(ring, file.fd());
+  void *backing = allocate_aligned(3 * kBlockSize);
+  ASSERT_NE(nullptr, backing);
+  std::unique_ptr<void, decltype(&std::free)> cleanup(backing, std::free);
+  for (bool asynchronous : {true, false}) {
+    for (size_t bias : {size_t{0}, size_t{1}}) {
+      SCOPED_TRACE(::testing::Message() << asynchronous << ":" << bias);
+      auto *output = static_cast<uint8_t *>(backing) + bias;
+      std::memset(output, 0xac, 2 * kBlockSize);
+      const IoUringRead reads[] = {
+          {0, kBlockSize, output},
+          {kBlockSize, kBlockSize, output + kBlockSize, tail},
+      };
+      if (asynchronous) {
+        ASSERT_EQ(0, ring.submit_reads(file.fd(), reads, 2));
+        uint32_t completed[2]{};
+        ASSERT_EQ(2, ring.get_completed_reads(2, completed, 2));
+      } else {
+        ASSERT_EQ(0, ring.execute(file.fd(), reads, 2));
+      }
+      EXPECT_EQ(0, std::memcmp(output, source.data(), source.size()));
+      EXPECT_TRUE(std::all_of(output + source.size(), output + 2 * kBlockSize,
+                              [](uint8_t value) { return value == 0; }));
+      EXPECT_EQ(0u, pool_.used());
+    }
+  }
 }
 
 TEST_F(IoUringLoaderTest, WritesScatteredBatch) {

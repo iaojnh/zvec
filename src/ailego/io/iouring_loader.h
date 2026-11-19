@@ -42,7 +42,8 @@ namespace ailego {
 // Generic aligned read request shared by DiskANN and Buffer Storage.
 // expected_len may be smaller than len for the final page of a file: the
 // kernel still receives an O_DIRECT-aligned length, while execute() accepts
-// the expected short read and zero-fills the rest of the destination.
+// the expected short read and zero-fills the rest of the destination. The
+// destination needs no I/O alignment: the kernel only sees ring-owned staging.
 struct IoUringRead {
   uint64_t offset{0};
   uint64_t len{0};
@@ -59,7 +60,6 @@ struct IoUringRead {
         expected_len(expected_len == 0 ? len : expected_len) {
     assert(static_cast<size_t>(offset) % 512 == 0);
     assert(static_cast<size_t>(len) % 512 == 0);
-    assert(reinterpret_cast<size_t>(buf) % 512 == 0);
     assert(this->expected_len <= len);
   }
 };

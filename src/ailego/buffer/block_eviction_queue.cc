@@ -1015,6 +1015,15 @@ size_t MemoryLimitPool::retained_block_size(size_t bytes) {
 }
 
 void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
+  return acquire_retained_block_impl(bytes, metadata, true);
+}
+
+void *MemoryLimitPool::try_acquire_retained_block(size_t bytes, bool metadata) {
+  return acquire_retained_block_impl(bytes, metadata, false);
+}
+
+void *MemoryLimitPool::acquire_retained_block_impl(size_t bytes, bool metadata,
+                                                   bool required) {
   static_assert(sizeof(RetainedBlock) <= kRetainedBlockHeaderBytes,
                 "retained block header must fit its reserved prefix");
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
@@ -1045,7 +1054,9 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     }
   }
   // No allocator lock may be held across eviction or writeback callbacks.
-  if (!try_charge_fixed_with_wait(charge, counter, Backing::kPending))
+  if (!(required
+            ? try_charge_fixed_with_wait(charge, counter, Backing::kPending)
+            : try_charge_locked(charge, counter, Backing::kPending)))
     return nullptr;
 #if defined(_WIN32)
   void *raw =
