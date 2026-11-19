@@ -36,6 +36,7 @@
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/external_cache.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
@@ -201,6 +202,74 @@ class BufferPoolTest : public ::testing::Test {
   }
   std::vector<std::string> files_;
 };
+
+TEST_F(BufferPoolTest, OptionalReadScratchYieldsToPinnedBudget) {
+  constexpr size_t kFilePages = 1033;
+  const size_t page = kVectorPageSize;
+  init_vec_pool(16, kFilePages, false, 16 * page);
+  QueueResidentSampleTestPeer::stop_background();
+  auto &budget = MemoryLimitPool::get_instance();
+  auto pool = std::make_shared<VecBufferPool>(new_file(kFilePages), false);
+  ASSERT_EQ(0, pool->init());
+  VecBufferPoolHandle handle(pool);
+  std::array<block_id_t, 8> ids{0, 1, 2, 3, 4, 5, 6, 7};
+  std::array<char *, 8> pins{};
+  ASSERT_TRUE(handle.acquire_pages(ids.data(), ids.size(), pins.data()));
+  auto release =
+      ScopeGuard::Make([&] { handle.release_pages(ids.data(), ids.size()); });
+
+  // Small real heap allocations consume the remaining native quota without
+  // leaving a reclaimable cache owner or a synthetic accounting-only charge.
+  std::array<BudgetedAlignedBuffer, 32> pressure;
+  for (auto &buffer : pressure) {
+    const size_t bytes = std::min(budget.available(), size_t{128} << 10);
+    buffer.resize(bytes, AILEGO_CACHE_LINE_SIZE);
+    if (bytes) std::memset(buffer.data(), 'p', bytes);
+  }
+  ASSERT_EQ(0u, budget.available());
+  std::vector<char> output(kFilePages * page + page);
+  auto *aligned = reinterpret_cast<char *>(
+      (reinterpret_cast<uintptr_t>(output.data()) + page - 1) & ~(page - 1));
+  struct Read {
+    size_t offset, length, bias;
+  };
+  const Read reads[] = {
+      {8 * page + 1, 4 * page, 1},
+      {8 * page, 4 * page, 0},
+      {9 * page - 3, 9, 1},
+      // Cross the 1024-page bulk-run boundary and finish at EOF.
+      {8 * page + 1, (kFilePages - 8) * page - 1, 1},
+      {kFilePages * page - 3, 3, 1},
+      {kFilePages * page, 0, 0},
+  };
+  const auto before = budget.stats();
+  for (const auto &read : reads) {
+    SCOPED_TRACE(::testing::Message() << read.offset << ':' << read.length);
+    const auto started = std::chrono::steady_clock::now();
+    bool allocation_failed = true;
+    ASSERT_TRUE(handle.read_range(read.offset, read.length, aligned + read.bias,
+                                  allocation_failed));
+    EXPECT_FALSE(allocation_failed);
+    if (read.offset == reads[0].offset && read.length == reads[0].length)
+      RecordProperty("cold_read_ms",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started)
+                         .count());
+    // Check before the larger cases so the unfixed implementation fails on
+    // the first 4-page reproduction instead of waiting for a whole file scan.
+    ASSERT_EQ(before.capacity_waits, budget.stats().capacity_waits);
+    for (size_t i = 0; i < read.length; ++i)
+      ASSERT_EQ(static_cast<char>(((read.offset + i) / page) & 0xff),
+                aligned[read.bias + i]);
+  }
+  EXPECT_FALSE(handle.read_range(kFilePages * page + 1, 1, aligned));
+  pool->warmup();
+  pool->prefetch_pages(8, 4, VecBufferPool::kLowPriority);
+  EXPECT_EQ(before.capacity_waits, budget.stats().capacity_waits);
+  for (size_t i = 0; i < pins.size(); ++i) ExpectPageContent(pins[i], ids[i]);
+  for (size_t i = 8; i < kFilePages; ++i)
+    EXPECT_FALSE(pool->is_page_resident(i));
+}
 
 struct SizedCachePayload {
   std::shared_ptr<std::vector<char>> data;

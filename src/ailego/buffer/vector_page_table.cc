@@ -105,7 +105,8 @@ void ReleaseWritableMapping(void *data, size_t bytes,
 }
 
 // One per-operation buffer, shared across its chunks, not retained in TLS.
-// Shrink the batch under pressure. Even the smallest buffer must be admitted.
+// This is acceleration scratch: demand can bypass and hints can stop. Never
+// wait for it or reclaim a live owner merely to prepare a larger I/O.
 size_t PrepareReadScratch(BudgetedMappedBuffer &scratch, size_t pages) {
   auto &budget = MemoryLimitPool::get_instance();
   if (budget.capacity() && scratch.size() < pages * kVectorPageSize)
@@ -113,12 +114,12 @@ size_t PrepareReadScratch(BudgetedMappedBuffer &scratch, size_t pages) {
                      std::max(size_t{1}, budget.available() / kVectorPageSize));
   while (pages != 0) {
     if (scratch.size() >= pages * kVectorPageSize) return pages;
-    if (scratch.resize(pages * kVectorPageSize) == 0) return pages;
+    if (scratch.try_resize(pages * kVectorPageSize)) return pages;
     pages /= 2;
   }
   const auto stats = budget.stats();
-  LOG_ERROR(
-      "Read alignment workspace unavailable: capacity=%zu used=%zu "
+  LOG_DEBUG(
+      "Optional read workspace unavailable: capacity=%zu used=%zu "
       "committed=%zu external=%zu metadata=%zu free_buffers=%zu",
       budget.capacity(), stats.used, stats.committed, stats.external_used,
       stats.metadata_used, stats.free_buffers);
@@ -2087,6 +2088,7 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
   }
 
   BudgetedMappedBuffer scratch;
+  bool scratch_denied = false;
 
   size_t copied = 0;
   size_t io_requests = 0;
@@ -2116,11 +2118,13 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
       // writer/eviction cannot leave us observing stale file contents.
       char *resident = nullptr;
       while ((resident = page_table_.acquire_block(page_id)) == nullptr) {
-        if (!direct_destination && !scratch.try_resize(kVectorPageSize)) {
+        if (!direct_destination &&
+            (scratch_denied || !scratch.try_resize(kVectorPageSize))) {
           // The caller already owns its destination. A buffered descriptor
           // needs no bounce page; retain the same load claim/dirty-page rules.
           direct_destination = true;
           read_fd = meta_fd_;
+          scratch_denied = true;
         }
         const auto claim = page_table_.try_claim_block_load(page_id);
         if (claim == VectorPageTable::LoadClaimResult::kClaimed) {
@@ -2143,9 +2147,10 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
       }
     }
     if (!writable_ && !direct_destination &&
-        !scratch.try_resize(kVectorPageSize)) {
+        (scratch_denied || !scratch.try_resize(kVectorPageSize))) {
       direct_destination = true;
       read_fd = meta_fd_;
+      scratch_denied = true;
     }
     char *page = direct_destination ? buffer + copied : scratch.data();
     const size_t available = file_size_ - page_offset;
@@ -2745,28 +2750,26 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
         run_file_off == file_offset + dst_cursor && run_bytes <= remaining &&
         reinterpret_cast<uintptr_t>(out + dst_cursor) % kVectorPageSize == 0;
     if (!direct_destination) {
-      run_pages = PrepareReadScratch(scratch, run_pages);
+      const size_t prepared = PrepareReadScratch(scratch, run_pages);
+      if (prepared == 0) {
+        // The caller already owns its output. Complete this whole cold run
+        // through bypass instead of retrying scratch/admission on every page.
+        const size_t begin = file_offset + dst_cursor;
+        const size_t bytes =
+            std::min(remaining, run_bytes - (begin - run_file_off));
+        if (!pool_.read_range_bypass(begin, bytes, out + dst_cursor,
+                                     allocation_failed))
+          return false;
+        dst_cursor += bytes;
+        remaining -= bytes;
+        pg = run_end - 1;
+        continue;
+      }
+      run_pages = prepared;
       run_end = run_start + run_pages;
       run_bytes = run_pages * kVectorPageSize;
     }
     char *bulk_buf = direct_destination ? out + dst_cursor : scratch.data();
-    if (!direct_destination && run_pages == 0) {
-      page = pool_.acquire_buffer(static_cast<block_id_t>(pg), 50);
-      size_t page_start = pg * kVectorPageSize;
-      size_t intra_offset = (pg == first_page) ? (file_offset - page_start) : 0;
-      size_t chunk = std::min(kVectorPageSize - intra_offset, remaining);
-      if (page != nullptr) {
-        std::memcpy(out + dst_cursor, page + intra_offset, chunk);
-        pool_.page_table_.release_block(static_cast<block_id_t>(pg));
-      } else if (!pool_.read_range_bypass(page_start + intra_offset, chunk,
-                                          out + dst_cursor,
-                                          allocation_failed)) {
-        return false;
-      }
-      dst_cursor += chunk;
-      remaining -= chunk;
-      continue;
-    }
 
     ssize_t got = zvec_pread(pool_.fd_, bulk_buf, run_bytes, run_file_off);
     // read_range validated file_offset + len against file_size_ above.

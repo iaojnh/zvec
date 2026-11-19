@@ -208,7 +208,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       // setup_budgeted admits the kernel mapping to the RSS budget. Charge
       // its actual size to the managed budget too, before any submission.
       try {
-        ring_charge = std::make_unique<MetadataCharge>(ring_memory.bytes);
+        ring_charge = std::make_unique<MetadataCharge>(ring_memory.bytes, true);
       } catch (const std::bad_alloc &) {
         aio.destroy_budgeted(context, ring_memory);
         return;
@@ -612,7 +612,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
 #if defined(__linux__) && !defined(__ANDROID__)
     if (prefetch_depth && prefetch_bytes && direct) {
       try {
-        auto charge = std::make_unique<MetadataCharge>(sizeof(ReadAhead));
+        auto charge = std::make_unique<MetadataCharge>(sizeof(ReadAhead), true);
         auto queue = std::make_unique<ReadAhead>(
             *this, std::move(charge), prefetch_depth, prefetch_bytes);
         if (queue->ready) read_ahead = std::move(queue);

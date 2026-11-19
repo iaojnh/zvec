@@ -44,7 +44,7 @@ struct IoUringRing::AsyncReads {
     size_t offset;
     bool seen{false};
   };
-  BudgetedVector<Slot> slots;
+  std::vector<Slot, OptionalBudgetedAllocator<Slot>> slots;
   size_t submitted{0};
   size_t completed{0};
 };
@@ -67,8 +67,10 @@ int IoUringRing::submit_reads(int fd, const IoUringRead *reads, size_t count) {
     return -1;
   try {
     MemoryReservation memory;
-    memory.add(sizeof(AsyncReads));
-    auto state = std::make_unique<AsyncReads>();
+    std::unique_ptr<AsyncReads> state;
+    memory.add_for_allocation(
+        sizeof(AsyncReads), [&] { state = std::make_unique<AsyncReads>(); },
+        /*required=*/false);
     state->memory.swap(memory);
     state->slots.reserve(count);
     size_t bytes = 0;
@@ -449,7 +451,9 @@ bool IoUringRing::ensure_staging(size_t bytes) {
   const size_t charge = prepaid_staging_bytes_ || !pool.capacity() ? 0 : bytes;
   // Keep the old allocation charged until the replacement actually exists.
   using Pending = MemoryLimitPool::PendingAllocation;
-  Pending pending(pool, Pending::Kind::kWorkspace);
+  // Staging only accelerates the caller's existing read/write buffers. Denial
+  // must reach synchronous fallback without waiting or evicting data owners.
+  Pending pending(pool, Pending::Kind::kLockedExternal);
   if (!pending.reserve(charge)) return false;
   if (prepaid_staging_bytes_ && !pool.try_reserve_materialization(bytes))
     return false;

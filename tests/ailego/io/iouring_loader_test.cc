@@ -23,8 +23,10 @@
 #include <cstring>
 #include <vector>
 #include <ailego/io/iouring_loader.h>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include "../buffer/pool_payload_budget.h"
 
@@ -218,6 +220,41 @@ TEST_F(IoUringLoaderTest,
       EXPECT_EQ(0u, pool_.used());
     }
   }
+
+  auto &budget = MemoryLimitPool::get_instance();
+  std::array<char *, 2> pins{};
+  for (auto &pin : pins)
+    ASSERT_TRUE(budget.try_acquire_buffer(kVectorPageSize, pin));
+  auto release = ScopeGuard::Make([&] {
+    for (char *pin : pins) budget.release_buffer(pin, kVectorPageSize);
+  });
+  for (size_t remaining : {size_t{0}, size_t{1024}}) {
+    SCOPED_TRACE(remaining);
+    ASSERT_GE(budget.available(), remaining);
+    std::array<BudgetedAlignedBuffer, 32> pressure;
+    for (auto &buffer : pressure) {
+      const size_t bytes =
+          std::min(budget.available() - remaining, size_t{128} << 10);
+      buffer.resize(bytes, AILEGO_CACHE_LINE_SIZE);
+      if (bytes) std::memset(buffer.data(), 'p', bytes);
+    }
+    ASSERT_EQ(remaining, budget.available());
+    const auto before = budget.stats();
+    auto *output = static_cast<uint8_t *>(backing) + 1;
+    std::memset(output, 0xac, 2 * kBlockSize);
+    const IoUringRead read{0, kBlockSize, output};
+    EXPECT_EQ(-1, ring.execute(file.fd(), &read, 1));
+    EXPECT_EQ(-1, ring.submit_reads(file.fd(), &read, 1));
+    EXPECT_FALSE(ring.has_pending_reads());
+    EXPECT_TRUE(ring.is_valid());
+    EXPECT_EQ(before.capacity_waits, budget.stats().capacity_waits);
+    EXPECT_TRUE(std::all_of(output, output + 2 * kBlockSize,
+                            [](uint8_t value) { return value == 0xac; }));
+    EXPECT_EQ(before.used, budget.used());
+  }
+  const IoUringRead retry{0, kBlockSize, backing};
+  ASSERT_EQ(0, ring.execute(file.fd(), &retry, 1));
+  EXPECT_EQ(0, std::memcmp(backing, source.data(), kBlockSize));
 }
 
 TEST_F(IoUringLoaderTest, WritesScatteredBatch) {
