@@ -15,6 +15,7 @@
 
 #include <limits>
 #include <new>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_module.h>
 #include <zvec/core/framework/index_storage.h>
@@ -201,19 +202,31 @@ class IndexSegmentStorage : public IndexStorage {
       return IndexError_NoReady;
     }
 
-    IndexStorage::MemoryBlock metadata;
+    // Metadata can exceed the parent's bounded query read window. Own its
+    // temporary backing independently, then stream through fetch(). Neither
+    // a parser failure nor a refused allocation replaces the old directory.
+    ailego::BudgetedMappedBuffer metadata;
+    const size_t total = parent_->data_size();
     int read_error = IndexError_ReadData;
-    auto read_data = [this, &metadata, &read_error](
+    auto read_data = [this, &metadata, &read_error, total](
                          size_t offset, const void **data, size_t len) {
-      metadata.reset();
-      const auto size = parent_->read(offset, metadata, len);
+      if (offset > total || len > total - offset) return size_t{0};
+      if (metadata.size() < len) {
+        // Unpacker has finished consuming the previous callback's bytes.
+        metadata.clear();
+        if (metadata.resize(len) != 0) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
+        }
+      }
+      const auto size = parent_->fetch(offset, metadata.data(), len);
       if (size < len) read_error = parent_->read_error();
       *data = metadata.data();
       return size;
     };
 
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, parent_->data_size(), false)) {
+    if (!unpacker.unpack(read_data, total, false)) {
       if (read_error == IndexError_NoMemory) return read_error;
       LOG_ERROR("Failed to unpack segment data");
       return IndexError_UnpackIndex;

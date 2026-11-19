@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <iostream>
+#include <limits>
 #include <gtest/gtest.h>
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_helper.h"
@@ -58,5 +59,15 @@ TEST(MemoryDumper, General) {
 
     std::string hello = "Hello world!!! #" + std::to_string(i);
     EXPECT_EQ(hello, std::string((const char *)data.data(), seg->data_size()));
+    // Copy reads must honor the segment's nonzero offset within the rope,
+    // including a subrange and an end-of-segment request.
+    std::string copied(hello.size(), '\0');
+    ASSERT_EQ(copied.size(), seg->fetch(0, copied.data(), copied.size()));
+    EXPECT_EQ(hello, copied);
+    ASSERT_EQ(copied.size() - 2, seg->fetch(2, copied.data(), copied.size()));
+    EXPECT_EQ(hello.substr(2), copied.substr(0, hello.size() - 2));
+    EXPECT_EQ(0u, seg->fetch(hello.size(), copied.data(), copied.size()));
+    EXPECT_EQ(0u, seg->fetch(std::numeric_limits<size_t>::max(), copied.data(),
+                             copied.size()));
   }
 }

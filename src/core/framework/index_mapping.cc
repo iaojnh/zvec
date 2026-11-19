@@ -574,6 +574,9 @@ int IndexMapping::init_index_mapping_admitted(
   if (header_addr_map_.find(current_header_start_offset_) !=
       header_addr_map_.end())
     return IndexError_InvalidValue;
+  // Both open and create enter here. A lazy directory may allocate its map
+  // object/sentinel even when the node has already been admitted.
+  header_addr_map_.initialize();
   // The managed header already has a pending reservation for the whole view.
   // MAP_POPULATE would run the separate optional prefault admission again.
   int opts = ailego::File::MMAP_SHARED;
@@ -591,11 +594,22 @@ int IndexMapping::init_index_mapping_admitted(
     return IndexError_MMapFile;
   }
 
+  // Keep the mapping independently owned until its directory entry exists.
+  // A failed insertion must release the view as well as its committed charge.
+  MetaMapping mapping = pending_node.mapped();
+  mapping.header = reinterpret_cast<IndexFormat::MetaHeader *>(start);
+  mapping.projection = mapping_memory.commit_mapping();
+  bool registered = false;
+  const auto rollback = ailego::ScopeGuard::Make([&] {
+    if (!registered) release_meta_mapping(mapping);
+  });
+  pending_node.mapped() = mapping;
+  if (!header_addr_map_.insert(std::move(pending_node)).inserted)
+    return IndexError_InvalidValue;
+  registered = true;
+  header_ = mapping.header;
+
   // Unpack header
-  header_ = reinterpret_cast<IndexFormat::MetaHeader *>(start);
-  pending_node.mapped().header = header_;
-  pending_node.mapped().projection = mapping_memory.commit_mapping();
-  header_addr_map_.insert(std::move(pending_node));
   if (header_->meta_header_size != sizeof(IndexFormat::MetaHeader)) {
     return IndexError_InvalidLength;
   }

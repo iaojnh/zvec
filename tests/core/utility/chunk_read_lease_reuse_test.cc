@@ -11,6 +11,8 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_factory.h>
+#include <zvec/core/framework/index_mapping.h>
+#include <zvec/core/framework/index_memory.h>
 #include <zvec/core/framework/index_segment_storage.h>
 #include "utility/utility_params.h"
 
@@ -228,6 +230,46 @@ TEST_F(ChunkReadLeaseReuseTest, WorkspaceWitnessFollowsEscapedReadAndUnmap) {
 
 class MetadataAdmissionTest : public testing::Test {
  protected:
+  // Inject a failed metadata read while all successful reads still use the
+  // real backing storage. Returned child segments clone that real backing.
+  class FailingParent : public IndexStorage::Segment {
+   public:
+    explicit FailingParent(Pointer parent) : parent_(std::move(parent)) {}
+    size_t data_size() const override {
+      return parent_->data_size();
+    }
+    size_t padding_size() const override {
+      return parent_->padding_size();
+    }
+    size_t capacity() const override {
+      return parent_->capacity();
+    }
+    uint32_t data_crc() const override {
+      return parent_->data_crc();
+    }
+    size_t fetch(size_t offset, void *data, size_t size) const override {
+      return calls++ == fail_at ? 0 : parent_->fetch(offset, data, size);
+    }
+    size_t read(size_t offset, IndexStorage::MemoryBlock &data,
+                size_t size) override {
+      return calls++ == fail_at ? 0 : parent_->read(offset, data, size);
+    }
+    size_t write(size_t, const void *, size_t) override {
+      return 0;
+    }
+    size_t resize(size_t) override {
+      return capacity();
+    }
+    void update_data_crc(uint32_t) override {}
+    Pointer clone() override {
+      return parent_->clone();
+    }
+    mutable size_t calls{0};
+    size_t fail_at{std::numeric_limits<size_t>::max()};
+
+   private:
+    Pointer parent_;
+  };
   class Pressure {
    public:
     explicit Pressure(size_t remaining) {
@@ -260,7 +302,10 @@ class MetadataAdmissionTest : public testing::Test {
         std::numeric_limits<size_t>::max());
     EXPECT_EQ(0u, pool.external_used());
     EXPECT_EQ(0, pool.init(0));
-    for (const auto &file : files) std::remove(file.c_str());
+    for (const auto &file : files) {
+      IndexMemory::Instance()->remove(file);
+      std::remove(file.c_str());
+    }
   }
   void make_file(size_t count, size_t name_bytes, std::string &path,
                  std::vector<std::string> &names) {
@@ -277,6 +322,34 @@ class MetadataAdmissionTest : public testing::Test {
       ASSERT_EQ(0, dumper->append(names.back(), 1, 0, 0));
     }
     ASSERT_EQ(0, dumper->close());
+  }
+  void make_nested_file(size_t count, size_t name_bytes, std::string &path,
+                        std::vector<std::string> &names) {
+    path = "metadata-admission-" + std::to_string(files.size()) + ".bin";
+    files.push_back(path);
+    auto dumper = IndexFactory::CreateDumper("FileDumper");
+    ASSERT_TRUE(dumper);
+    ASSERT_EQ(0, dumper->create(path));
+    auto middle = std::make_shared<IndexSegmentDumper>(dumper, "nested");
+    auto leaf = std::make_shared<IndexSegmentDumper>(middle, "nested");
+    names.clear();
+    for (size_t i = 0; i < count; ++i) {
+      names.push_back(std::to_string(i) + '-' + std::string(name_bytes, 'n'));
+      const char value = 'v';
+      ASSERT_EQ(1u, leaf->write(&value, 1));
+      ASSERT_EQ(0, leaf->append(names.back(), 1, 0, 0));
+    }
+    ASSERT_EQ(0, leaf->close());
+    ASSERT_EQ(0, middle->close());
+    ASSERT_EQ(0, dumper->close());
+    // The same package also exercises the in-memory parent implementation.
+    ailego::File file;
+    ASSERT_TRUE(file.open(path, true, false));
+    std::string image(file.size(), '\0');
+    ASSERT_EQ(image.size(), file.read(0, image.data(), image.size()));
+    auto rope = IndexMemory::Instance()->create(path);
+    ASSERT_TRUE(rope);
+    ASSERT_EQ(image.size(), rope->append(0).append(image.data(), image.size()));
   }
   IndexStorage::Pointer create(const char *backend, bool alone = false,
                                size_t query_bytes = 64UL << 10) {
@@ -440,6 +513,160 @@ TEST_F(MetadataAdmissionTest,
   IndexUnpacker retry;
   ASSERT_TRUE(retry.unpack(read_image, image.size(), false));
   EXPECT_EQ(version_size, retry.version().size());
+}
+
+TEST_F(MetadataAdmissionTest, NestedDirectoryAdmissionRollbackAndRetry) {
+  for (const auto shape :
+       {std::pair<size_t, size_t>{300, 8}, {3, 80UL << 10}, {1, 300UL << 10}}) {
+    std::string path;
+    std::vector<std::string> names;
+    make_nested_file(shape.first, shape.second, path, names);
+    for (const char *backend :
+         {"ChunkReadStorage", "FileReadStorage", "BufferReadStorage",
+          "MMapFileReadStorage", "MemoryReadStorage"}) {
+      SCOPED_TRACE(::testing::Message()
+                   << backend << ':' << shape.first << ':' << shape.second);
+      const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+      auto storage = create(backend, false, page);
+      ASSERT_TRUE(storage);
+      ASSERT_EQ(0, storage->open(path, false));
+      IndexSegmentStorage middle(storage->get("nested", 1));
+      ASSERT_EQ(0, middle.open("", false));
+      auto parent = std::make_shared<FailingParent>(middle.get("nested", 1));
+      IndexSegmentStorage leaf(parent);
+      ASSERT_EQ(0, leaf.open("", false));
+      EXPECT_EQ(shape.first + 1, leaf.get_all().size());
+      check(leaf, names.back());
+      const size_t directory_bytes = pool.external_used();
+      for (size_t remaining : {size_t{0}, page}) {
+        SCOPED_TRACE(remaining);
+        {
+          Pressure pressure(remaining);
+          const auto used = pool.external_used();
+          EXPECT_EQ(IndexError_NoMemory, leaf.open("", false));
+          EXPECT_EQ(used, pool.external_used());
+          EXPECT_TRUE(leaf.has(names.back()));
+        }
+        EXPECT_EQ(directory_bytes, pool.external_used());
+        check(leaf, names.front());
+        ASSERT_EQ(0, leaf.open("", false));
+      }
+      // Header, footer, directory and version reads can fail after different
+      // amounts of allocation. None may publish a partial replacement.
+      for (size_t fail_at = 0; fail_at < 4; ++fail_at) {
+        SCOPED_TRACE(fail_at);
+        parent->calls = 0;
+        parent->fail_at = fail_at;
+        const auto used = pool.external_used();
+        EXPECT_EQ(IndexError_UnpackIndex, leaf.open("", false));
+        EXPECT_EQ(used, pool.external_used());
+        EXPECT_TRUE(leaf.has(names.back()));
+        parent->fail_at = std::numeric_limits<size_t>::max();
+        check(leaf, names.back());
+        ASSERT_EQ(0, leaf.open("", false));
+      }
+      auto retained = leaf.get(names.back(), 1);
+      ASSERT_TRUE(retained);
+      EXPECT_EQ(0, leaf.close());
+      EXPECT_EQ(0, middle.close());
+      EXPECT_EQ(0, storage->close());
+      char value = 0;
+      ASSERT_EQ(1u, retained->fetch(0, &value, 1));
+      EXPECT_EQ('v', value);
+    }
+  }
+}
+
+TEST_F(MetadataAdmissionTest, MappingAllocationBoundariesRollBackAndRetry) {
+  const std::string small = "metadata-mapping-small.bin";
+  const std::string large = "metadata-mapping-large.bin";
+  files.push_back(small);
+  files.push_back(large);
+  size_t mapping_bytes = 0;
+  for (bool many : {false, true}) {
+    IndexMapping mapping;
+    ASSERT_EQ(0, mapping.create(many ? large : small, 4096));
+    mapping_bytes = mapping.header().content_offset;
+    const size_t count = many ? 24 : 1;
+    for (size_t i = 0; i < count; ++i) {
+      const std::string name =
+          many ? std::to_string(i) + std::string(1000, 'n') : "old";
+      ASSERT_EQ(0, mapping.append(name, 1));
+    }
+    mapping.refresh(0);
+    ASSERT_EQ(0, mapping.flush());
+  }
+  // Reproduce the exact late registration boundary without relying on a
+  // platform-specific node size. This mirrors the private mapping value.
+  struct Record {
+    IndexFormat::MetaHeader *header;
+    size_t length, charge;
+    ailego::ProcessRssBudget::MaterializationStamp projection{};
+  };
+  using HeaderMap =
+      std::map<uint64_t, Record, std::less<uint64_t>,
+               ailego::BudgetedAllocator<std::pair<const uint64_t, Record>>>;
+  size_t node_bytes = 0;
+  {
+    HeaderMap pending;
+    const auto before = pool.used();
+    pending.emplace(0, Record{});
+    node_bytes = pool.used() - before;
+  }
+  size_t required_bytes = 0;
+  {
+    IndexMapping mapping;
+    const auto before = pool.external_used();
+    ASSERT_EQ(0, mapping.open(large, true, false));
+    required_bytes = pool.external_used() - before;
+  }
+  std::vector<size_t> remaining{0,
+                                mapping_bytes - 1,
+                                mapping_bytes + node_bytes,
+                                required_bytes - 1,
+                                required_bytes,
+                                required_bytes + 512};
+  // Walk the directory/node allocations at every metadata-chain boundary.
+  // The 32-byte step is smaller than a managed map/node allocation.
+  for (size_t base = mapping_bytes; base <= required_bytes;
+       base += mapping_bytes) {
+    for (size_t extra = 0; extra <= 4096; extra += 32)
+      remaining.push_back(base + extra);
+  }
+  bool saw_denial = false, saw_success = false;
+  for (bool cow : {false, true}) {
+    for (size_t available : remaining) {
+      SCOPED_TRACE(::testing::Message() << cow << ':' << available);
+      IndexMapping published;
+      ASSERT_EQ(0, published.open(small, cow, !cow));
+      const auto old_size = published.index_size();
+      const auto old_magic = published.magic();
+      {
+        Pressure pressure(available);
+        const auto used = pool.external_used();
+        const int ret = published.open(large, cow, !cow);
+        if (ret == IndexError_NoMemory) {
+          saw_denial = true;
+          ASSERT_EQ(used, pool.external_used());
+          EXPECT_TRUE(published.has("old"));
+          EXPECT_EQ(old_size, published.index_size());
+          EXPECT_EQ(old_magic, published.magic());
+        } else {
+          ASSERT_EQ(0, ret);
+          saw_success = true;
+          EXPECT_EQ(24u, published.segment_count());
+        }
+      }
+      // Every refused partial candidate must be retryable after real pressure
+      // is removed, including failure after mapping an earlier chain.
+      ASSERT_EQ(0, published.open(large, cow, !cow));
+      EXPECT_EQ(24u, published.segment_count());
+      published.close();
+      EXPECT_EQ(0u, pool.external_used());
+    }
+  }
+  EXPECT_TRUE(saw_denial);
+  EXPECT_TRUE(saw_success);
 }
 }  // namespace
 }  // namespace zvec::core
