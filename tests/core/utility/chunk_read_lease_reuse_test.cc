@@ -247,12 +247,17 @@ class MetadataAdmissionTest : public testing::Test {
     uint32_t data_crc() const override {
       return parent_->data_crc();
     }
+    int read_error() const override {
+      return failed_ ? IndexError_ReadData : parent_->read_error();
+    }
     size_t fetch(size_t offset, void *data, size_t size) const override {
-      return calls++ == fail_at ? 0 : parent_->fetch(offset, data, size);
+      failed_ = calls++ >= fail_at;
+      return failed_ ? 0 : parent_->fetch(offset, data, size);
     }
     size_t read(size_t offset, IndexStorage::MemoryBlock &data,
                 size_t size) override {
-      return calls++ == fail_at ? 0 : parent_->read(offset, data, size);
+      failed_ = calls++ >= fail_at;
+      return failed_ ? 0 : parent_->read(offset, data, size);
     }
     size_t write(size_t, const void *, size_t) override {
       return 0;
@@ -269,6 +274,7 @@ class MetadataAdmissionTest : public testing::Test {
 
    private:
     Pointer parent_;
+    mutable bool failed_{false};
   };
   class Pressure {
    public:
@@ -551,9 +557,12 @@ TEST_F(MetadataAdmissionTest, NestedDirectoryAdmissionRollbackAndRetry) {
         check(leaf, names.front());
         ASSERT_EQ(0, leaf.open("", false));
       }
-      // Header, footer, directory and version reads can fail after different
-      // amounts of allocation. None may publish a partial replacement.
-      for (size_t fail_at = 0; fail_at < 4; ++fail_at) {
+      // Cover every read attempt, including any bounded-read fallback.
+      // A persistent I/O failure must not publish a partial replacement.
+      parent->calls = 0;
+      ASSERT_EQ(0, leaf.open("", false));
+      const size_t attempts = parent->calls;
+      for (size_t fail_at = 0; fail_at < attempts; ++fail_at) {
         SCOPED_TRACE(fail_at);
         parent->calls = 0;
         parent->fail_at = fail_at;
@@ -573,6 +582,38 @@ TEST_F(MetadataAdmissionTest, NestedDirectoryAdmissionRollbackAndRetry) {
       char value = 0;
       ASSERT_EQ(1u, retained->fetch(0, &value, 1));
       EXPECT_EQ('v', value);
+    }
+  }
+}
+
+TEST_F(MetadataAdmissionTest, NestedDirectReadsPreserveTightAdmission) {
+  const struct Shape {
+    size_t count, name_bytes, quota;
+  } shapes[] = {{1, 3, 1024}, {3, 80UL << 10, 320UL << 10}};
+  for (const auto &shape : shapes) {
+    std::string path;
+    std::vector<std::string> names;
+    make_nested_file(shape.count, shape.name_bytes, path, names);
+    for (const char *backend : {"MMapFileReadStorage", "MemoryReadStorage"}) {
+      SCOPED_TRACE(::testing::Message() << backend << ':' << shape.quota);
+      auto storage = create(backend);
+      ASSERT_TRUE(storage);
+      ASSERT_EQ(0, storage->open(path, false));
+      IndexSegmentStorage middle(storage->get("nested", 1));
+      ASSERT_EQ(0, middle.open("", false));
+      IndexSegmentStorage leaf(middle.get("nested", 1));
+      for (size_t attempt = 0; attempt < 2; ++attempt) {
+        {
+          // The directory fits, but a mandatory page/directory copy does not.
+          // Verify both the first publication and a transactional reopen.
+          Pressure pressure(shape.quota);
+          ASSERT_EQ(shape.quota, pool.available());
+          ASSERT_EQ(0, leaf.open("", false));
+          EXPECT_TRUE(leaf.has(names.back()));
+        }
+        check(leaf, names.front());
+        check(leaf, names.back());
+      }
     }
   }
 }

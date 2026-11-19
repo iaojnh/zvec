@@ -202,26 +202,35 @@ class IndexSegmentStorage : public IndexStorage {
       return IndexError_NoReady;
     }
 
-    // Metadata can exceed the parent's bounded query read window. Own its
-    // temporary backing independently, then stream through fetch(). Neither
-    // a parser failure nor a refused allocation replaces the old directory.
-    ailego::BudgetedMappedBuffer metadata;
+    // Preserve direct views and already-funded parent workspaces. Only a
+    // parent that cannot serve the validated range needs a streamed copy.
+    IndexStorage::MemoryBlock metadata;
+    ailego::BudgetedMappedBuffer fallback;
     const size_t total = parent_->data_size();
     int read_error = IndexError_ReadData;
-    auto read_data = [this, &metadata, &read_error, total](
+    auto read_data = [this, &metadata, &fallback, &read_error, total](
                          size_t offset, const void **data, size_t len) {
+      // Unpacker has finished consuming the previous callback's bytes.
+      metadata.reset();
+      fallback.clear();
       if (offset > total || len > total - offset) return size_t{0};
-      if (metadata.size() < len) {
-        // Unpacker has finished consuming the previous callback's bytes.
-        metadata.clear();
-        if (metadata.resize(len) != 0) {
-          read_error = IndexError_NoMemory;
-          return size_t{0};
-        }
+      const auto direct_size = parent_->read(offset, metadata, len);
+      if (direct_size == len) {
+        *data = metadata.data();
+        return direct_size;
       }
-      const auto size = parent_->fetch(offset, metadata.data(), len);
+      read_error = parent_->read_error();
+      // Release partial buffers/pins before admitting a fallback. An explicit
+      // allocation refusal is final; do not repeat its admission/wait cycle.
+      metadata.reset();
+      if (read_error == IndexError_NoMemory) return size_t{0};
+      if (fallback.resize(len) != 0) {
+        read_error = IndexError_NoMemory;
+        return size_t{0};
+      }
+      const auto size = parent_->fetch(offset, fallback.data(), len);
       if (size < len) read_error = parent_->read_error();
-      *data = metadata.data();
+      *data = fallback.data();
       return size;
     };
 
