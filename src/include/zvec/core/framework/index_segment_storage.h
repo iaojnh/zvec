@@ -13,6 +13,8 @@
 // limitations under the License.
 #pragma once
 
+#include <limits>
+#include <new>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_module.h>
 #include <zvec/core/framework/index_storage.h>
@@ -94,15 +96,21 @@ class IndexSegmentStorage : public IndexStorage {
     bool supports_read_chunks() const override {
       return parent_->supports_read_chunks();
     }
-    int set_read_chunks(const ReadChunks &chunks) override {
+    int set_read_chunks(const ReadChunks &chunks) override try {
+      for (const auto &chunk : chunks) {
+        if (chunk.offset > data_size_ ||
+            chunk.size > data_size_ - chunk.offset ||
+            chunk.offset > std::numeric_limits<size_t>::max() - data_offset_)
+          return IndexError_InvalidArgument;
+      }
       ReadChunks translated;
       translated.reserve(chunks.size());
       for (const auto &chunk : chunks) {
-        if (chunk.offset > data_size_ || chunk.size > data_size_ - chunk.offset)
-          return IndexError_InvalidArgument;
         translated.push_back({data_offset_ + chunk.offset, chunk.size});
       }
       return parent_->set_read_chunks(translated);
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
     }
 
     size_t read_scatter(size_t offset, ScatterBlock &data,

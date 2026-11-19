@@ -17,7 +17,10 @@ class ChunkReadStorage : public IndexStorage {
   struct Stats {
     uint64_t cache_hits{0}, cache_misses{0}, fills{0}, replacements{0};
     uint64_t io_calls{0}, io_bytes{0}, copied_bytes{0}, workspace_waits{0};
-    uint64_t trims{0}, cache_bytes{0}, workspace_bytes{0}, metadata_bytes{0};
+    uint64_t trims{0}, cache_bytes{0}, workspace_bytes{0};
+    // Logical metadata objects/content. Allocator/control overhead is also
+    // admitted and charged by MemoryLimitPool, independently of this counter.
+    uint64_t metadata_bytes{0};
     uint64_t prefetch_submitted{0}, prefetch_consumed{0}, prefetch_failed{0};
     uint64_t prefetch_wait_ns{0}, prefetch_peak_requests{0},
         prefetch_peak_bytes{0};

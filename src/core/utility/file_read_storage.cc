@@ -333,25 +333,38 @@ class FileReadStorage : public IndexStorage {
 
   //! Load a index file into container
   int open(const std::string &path, bool) override try {
+    std::string candidate_path = path;
     auto file_ptr = FileReadStorage::OpenFile(path, enable_direct_io_);
     if (!file_ptr) {
       return IndexError_OpenFile;
     }
 
-    index_offset_ =
-        (header_offset_ >= 0 ? 0 : file_ptr->size()) + header_offset_;
-    size_t end_offset =
-        (footer_offset_ > 0 ? 0 : file_ptr->size()) + footer_offset_;
-    size_t size = end_offset > index_offset_ ? end_offset - index_offset_ : 0;
+    const size_t file_size = file_ptr->size();
+    const auto resolve = [file_size](int64_t offset, bool from_end,
+                                     size_t &out) {
+      if (offset > 0 || (offset == 0 && !from_end)) {
+        if (static_cast<uint64_t>(offset) > file_size) return false;
+        out = static_cast<size_t>(offset);
+      } else {
+        const uint64_t distance = offset == 0 ? 0 : uint64_t(-(offset + 1)) + 1;
+        if (distance > file_size) return false;
+        out = file_size - static_cast<size_t>(distance);
+      }
+      return true;
+    };
+    size_t candidate_offset = 0, end_offset = 0;
+    if (!resolve(header_offset_, false, candidate_offset) ||
+        !resolve(footer_offset_, true, end_offset) ||
+        candidate_offset >= end_offset)
+      return IndexError_InvalidArgument;
+    const size_t size = end_offset - candidate_offset;
     ailego::BudgetedAlignedBuffer scratch;
-    auto read_data = [this, &file_ptr, &scratch, end_offset](
+    auto read_data = [&file_ptr, &scratch, candidate_offset, size](
                          size_t offset, const void **data, size_t len) {
-      const size_t off = index_offset_ + offset;
-      if (off >= end_offset) return size_t{0};
-      len = std::min(len, end_offset - off);
+      if (offset > size || len > size - offset) return size_t{0};
       if (len > scratch.size()) scratch.resize(len, AILEGO_CACHE_LINE_SIZE);
       *data = scratch.data();
-      return file_ptr->read(off, scratch.data(), len);
+      return file_ptr->read(candidate_offset + offset, scratch.data(), len);
     };
 
     IndexUnpacker unpacker;
@@ -359,13 +372,14 @@ class FileReadStorage : public IndexStorage {
       LOG_ERROR("Failed to unpack file: %s", path.c_str());
       return IndexError_UnpackIndex;
     }
-    segments_ = std::move(*unpacker.mutable_segments());
+    // All allocations/validation finish before replacing published state.
+    segments_.swap(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
-    file_path_ = path;
-    file_ptr_ = alone_file_handle_ ? nullptr : file_ptr;
+    index_offset_ = candidate_offset;
+    file_path_.swap(candidate_path);
+    file_ptr_ = alone_file_handle_ ? nullptr : std::move(file_ptr);
     return 0;
   } catch (const std::bad_alloc &) {
-    close();
     return IndexError_NoMemory;
   }
 

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <utility>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
@@ -36,12 +37,38 @@
 namespace zvec {
 namespace core {
 namespace {
-constexpr size_t kMetadataReserve = 128UL << 10;
 constexpr int kUnloaded = std::numeric_limits<int>::min();
 constexpr int kLoading = kUnloaded + 1;
 constexpr int kEvicting = std::numeric_limits<int>::min() / 2;
 using Pool = ailego::MemoryLimitPool;
 thread_local int chunk_read_error = IndexError_ReadData;
+
+template <typename T>
+struct MetadataDeleter {
+  void operator()(T *data) const noexcept {
+    if (!data) return;
+    data->~T();
+    ailego::BudgetedAllocator<T>{}.deallocate(data, 1);
+  }
+};
+template <typename T>
+using MetadataPointer = std::unique_ptr<T, MetadataDeleter<T>>;
+
+// Admit real object backing, including the allocation header. Optional
+// metadata uses the same ownership/release path without waiting or reclaiming.
+template <typename T, typename Allocator = ailego::BudgetedAllocator<T>,
+          typename... Args>
+MetadataPointer<T> MakeMetadata(Args &&...args) {
+  Allocator allocator;
+  T *data = allocator.allocate(1);
+  try {
+    new (data) T(std::forward<Args>(args)...);
+  } catch (...) {
+    allocator.deallocate(data, 1);
+    throw;
+  }
+  return MetadataPointer<T>(data);
+}
 
 size_t AlignPage(size_t size) {
   const size_t page = ailego::MemoryHelper::PageSize();
@@ -94,23 +121,18 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       std::numeric_limits<size_t>::digits * 4;
   static constexpr size_t kNoEntry = std::numeric_limits<size_t>::max();
   struct TableSegment {
-    MetadataCharge charge{sizeof(TableSegment), true};
     std::array<Entry, kEntries> entries;
   };
   struct Layout {
-    explicit Layout(size_t count)
-        : charge(sizeof(Layout) + count * sizeof(Entry)),
-          entries(new Entry[count]),
-          size(count) {
+    explicit Layout(size_t count) : entries(count), size(count) {
       reuse_clock.fill(kNoEntry);
     }
-    MetadataCharge charge;
-    std::unique_ptr<Entry[]> entries;
+    ailego::BudgetedVector<Entry> entries;
     size_t size;
     size_t clock{0};  // advanced only under the storage's read-ahead mutex
     std::array<size_t, kReuseClasses> reuse_clock;
     std::array<size_t, kReuseClasses> reuse_count{};
-    std::unique_ptr<Layout> next;
+    MetadataPointer<Layout> next;
     void add_reuse_entry(size_t index, size_t bucket) {
       size_t &cursor = reuse_clock[bucket];
       if (cursor == kNoEntry) {
@@ -122,7 +144,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       }
       ++reuse_count[bucket];
     }
-    Entry *find(size_t offset) const {
+    Entry *find(size_t offset) {
       size_t lo = 0, hi = size;
       while (lo < hi) {
         const size_t mid = lo + (hi - lo) / 2;
@@ -195,12 +217,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       size_t bytes{0}, required{0};
       bool done{false}, submitted{false}, resident{false};
     };
-    ReadAhead(State &state, std::unique_ptr<MetadataCharge> reservation,
-              size_t count, size_t limit)
-        : owner(state),
-          charge(std::move(reservation)),
-          depth(count),
-          byte_limit(limit) {
+    ReadAhead(State &state, size_t count, size_t limit)
+        : owner(state), depth(count), byte_limit(limit) {
       auto &aio = LibAioLoader::Instance();
       if (!aio.load() || aio.setup_budgeted(static_cast<int>(depth), context,
                                             ring_memory) != 0)
@@ -208,7 +226,10 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       // setup_budgeted admits the kernel mapping to the RSS budget. Charge
       // its actual size to the managed budget too, before any submission.
       try {
-        ring_charge = std::make_unique<MetadataCharge>(ring_memory.bytes, true);
+        ring_charge =
+            MakeMetadata<MetadataCharge,
+                         ailego::OptionalBudgetedAllocator<MetadataCharge>>(
+                ring_memory.bytes, true);
       } catch (const std::bad_alloc &) {
         aio.destroy_budgeted(context, ring_memory);
         return;
@@ -500,8 +521,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return begin == offset + length;
     }
     State &owner;
-    std::unique_ptr<MetadataCharge> charge;
-    std::unique_ptr<MetadataCharge> ring_charge;
+    MetadataPointer<MetadataCharge> ring_charge;
     size_t depth, byte_limit, occupied{0}, inflight{0}, bytes{0};
     io_context_t context{nullptr};
     LibAioLoader::RingMemory ring_memory{};
@@ -521,14 +541,14 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     for (auto *layout = layouts.get(); layout; layout = layout->next.get())
       for (size_t i = 0; i < layout->size; ++i)
         release_backing(layout->entries[i]);
-    for (size_t i = 0; table && i < table_count; ++i) {
+    for (size_t i = 0; i < table.size(); ++i) {
       auto *segment = table[i].load(std::memory_order_relaxed);
       if (!segment) continue;
       for (auto &item : segment->entries) {
         assert(item.refs.load(std::memory_order_relaxed) <= 0);
         release_backing(item);
       }
-      delete segment;
+      MetadataDeleter<TableSegment>{}(segment);
     }
   }
 
@@ -581,15 +601,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     max_read_bytes = AlignPage(max_read);
     chunks = file_size / chunk + (file_size % chunk != 0);
     table_count = chunks / kEntries + (chunks % kEntries != 0);
-    if (table_count > (std::numeric_limits<size_t>::max() - kMetadataReserve) /
-                          sizeof(std::atomic<TableSegment *>))
-      throw std::bad_alloc();
-    metadata_charge = kMetadataReserve +
-                      table_count * sizeof(std::atomic<TableSegment *>) +
-                      count * (sizeof(View) + sizeof(ReadSlot) +
-                               sizeof(std::unique_ptr<ReadSlot>));
-    metadata_owner = std::make_unique<MetadataCharge>(metadata_charge);
-    table = std::make_unique<std::atomic<TableSegment *>[]>(table_count);
+    ailego::BudgetedVector<std::atomic<TableSegment *>> directory(table_count);
+    table.swap(directory);
     for (size_t i = 0; i < table_count; ++i)
       table[i].store(nullptr, std::memory_order_relaxed);
     views.reserve(count);
@@ -597,7 +610,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     // Execution backing is independent of cache chunk size. Two I/O pages,
     // rather than two chunks, cover the aligned edges of any missing range.
     for (size_t i = 0; i < count; ++i) {
-      auto view = std::make_unique<View>();
+      auto view = MakeMetadata<View>();
       view->pins.reserve(max_read_bytes / chunk + 3);
       if (!adaptive || i < 4) {
         const size_t bytes =
@@ -607,14 +620,21 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         workspace_bytes.fetch_add(view->workspace.mapped_size());
       }
       views.emplace_back(std::move(view));
-      read_slots.emplace_back(std::make_unique<ReadSlot>());
+      read_slots.emplace_back(MakeMetadata<ReadSlot>());
     }
+    // Diagnostic payload sizes only. Admission is performed by each owning
+    // allocator, rather than by an estimated directory/state allowance.
+    metadata_charge =
+        sizeof(State) + table.size() * sizeof(std::atomic<TableSegment *>) +
+        views.capacity() * sizeof(MetadataPointer<View>) +
+        read_slots.capacity() * sizeof(MetadataPointer<ReadSlot>) +
+        count * (sizeof(View) + sizeof(ReadSlot));
 #if defined(__linux__) && !defined(__ANDROID__)
     if (prefetch_depth && prefetch_bytes && direct) {
       try {
-        auto charge = std::make_unique<MetadataCharge>(sizeof(ReadAhead), true);
-        auto queue = std::make_unique<ReadAhead>(
-            *this, std::move(charge), prefetch_depth, prefetch_bytes);
+        auto queue = MakeMetadata<ReadAhead,
+                                  ailego::OptionalBudgetedAllocator<ReadAhead>>(
+            *this, prefetch_depth, prefetch_bytes);
         if (queue->ready) read_ahead = std::move(queue);
       } catch (const std::bad_alloc &) {
       }  // optional lookahead; demand still works
@@ -640,7 +660,10 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       segment = slot.load(std::memory_order_relaxed);
       if (!segment) {
         try {
-          segment = new TableSegment();
+          segment =
+              MakeMetadata<TableSegment,
+                           ailego::OptionalBudgetedAllocator<TableSegment>>()
+                  .release();
         } catch (const std::bad_alloc &) {
           return nullptr;
         }
@@ -1165,15 +1188,14 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   size_t index_offset{0}, metadata_charge{0}, cache_limit{0};
   size_t chunks{0}, table_count{0};
   uint32_t file_magic{0};
-  std::string path;
+  ailego::BudgetedString path;
   IndexUnpacker::SegmentMap segments;
-  std::unique_ptr<MetadataCharge> metadata_owner;
-  std::unique_ptr<std::atomic<TableSegment *>[]> table;
-  std::unique_ptr<Layout> layouts;
-  std::vector<std::unique_ptr<View>> views;
+  ailego::BudgetedVector<std::atomic<TableSegment *>> table;
+  MetadataPointer<Layout> layouts;
+  ailego::BudgetedVector<MetadataPointer<View>> views;
   // Bounded, precharged descriptors. The slot is held only during read();
   // returned MemoryBlocks independently retain reader leases and page pins.
-  std::vector<std::unique_ptr<ReadSlot>> read_slots;
+  ailego::BudgetedVector<MetadataPointer<ReadSlot>> read_slots;
   std::mutex table_mutex, wait_mutex;
   std::condition_variable changed;
   bool registered{false}, adaptive{false};
@@ -1192,7 +1214,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   std::atomic<size_t> prefetch_pending_requests{0}, prefetch_pending_bytes{0};
   std::atomic<uint64_t> prefetch_read_bytes{0}, prefetch_submit_batches{0};
 #if defined(__linux__) && !defined(__ANDROID__)
-  std::unique_ptr<ReadAhead> read_ahead;
+  MetadataPointer<ReadAhead> read_ahead;
 #endif
 };
 
@@ -1266,7 +1288,7 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
         return IndexError_InvalidArgument;
       end = chunk.offset + chunk.size;
     }
-    auto layout = std::make_unique<State::Layout>(chunks.size());
+    auto layout = MakeMetadata<State::Layout>(chunks.size());
     for (size_t i = 0; i < chunks.size(); ++i) {
       layout->entries[i].offset = offset_ + chunks[i].offset;
       layout->entries[i].bytes = chunks[i].size;
@@ -1283,7 +1305,8 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
       if (state_->adaptive) layout->entries[i].filter_readmission = false;
     }
     std::lock_guard<std::mutex> lock(state_->table_mutex);
-    const size_t charged = layout->charge.bytes;
+    const size_t charged =
+        sizeof(State::Layout) + layout->entries.size() * sizeof(State::Entry);
     auto *published = layout.get();
     layout->next = std::move(state_->layouts);
     state_->layouts = std::move(layout);
@@ -1381,7 +1404,8 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
   }
   void update_data_crc(uint32_t) override {}
   Pointer clone() override {
-    return std::make_shared<ReadSegment>(*this);
+    return std::allocate_shared<ReadSegment>(
+        ailego::BudgetedAllocator<ReadSegment>{}, *this);
   }
 
  private:
@@ -1420,7 +1444,8 @@ int ChunkReadStorage::init(const ailego::Params &params) {
 }
 int ChunkReadStorage::open(const std::string &path, bool) {
   try {
-    auto candidate = std::make_shared<State>();
+    auto candidate =
+        std::allocate_shared<State>(ailego::BudgetedAllocator<State>{});
     if (!candidate->initialize(
             path, chunk_bytes_, cache_bytes_, max_read_bytes_, workspace_count_,
             wait_ms_, direct_io_, adaptive_, prefetch_depth_, prefetch_bytes_))
@@ -1432,37 +1457,46 @@ int ChunkReadStorage::open(const std::string &path, bool) {
         candidate->index_offset >= end)
       return IndexError_InvalidArgument;
     const size_t container_size = end - candidate->index_offset;
-    auto &view = *candidate->views.front();
-    bool workspace_denied = false;
-    auto read = [&](size_t offset, const void **data, size_t length) {
-      if (offset > container_size || length > container_size - offset)
-        return size_t{0};
-      if (!candidate->ensure_workspace(view, length)) {
-        workspace_denied = true;
-        return size_t{0};
+    // Parsing has its own temporary backing. A valid metadata directory can
+    // exceed the query read window; only the shared budget limits its size.
+    {
+      ailego::BudgetedMappedBuffer metadata;
+      bool metadata_denied = false;
+      auto read = [&](size_t offset, const void **data, size_t length) {
+        if (offset > container_size || length > container_size - offset)
+          return size_t{0};
+        if (metadata.size() < length) {
+          // The previous callback's bytes are no longer borrowed by unpacker.
+          metadata.clear();
+          if (metadata.resize(length) != 0) {
+            metadata_denied = true;
+            return size_t{0};
+          }
+        }
+        *data = metadata.data();
+        return candidate->meta_file.read(
+            static_cast<ssize_t>(candidate->index_offset + offset),
+            metadata.data(), length);
+      };
+      IndexUnpacker unpacker;
+      if (!unpacker.unpack(read, container_size, checksum_))
+        return metadata_denied ? IndexError_NoMemory : IndexError_UnpackIndex;
+      for (const auto &item : unpacker.segments()) {
+        const auto &meta = item.second;
+        if (meta.data_offset() > container_size ||
+            meta.data_size() > container_size - meta.data_offset() ||
+            meta.padding_size() >
+                container_size - meta.data_offset() - meta.data_size())
+          return IndexError_InvalidLength;
+        candidate->metadata_charge +=
+            sizeof(IndexUnpacker::SegmentMap::value_type) + item.first.size() +
+            1;
       }
-      *data = view.workspace.data();
-      return candidate->meta_file.read(
-          static_cast<ssize_t>(candidate->index_offset + offset),
-          view.workspace.data(), length);
-    };
-    IndexUnpacker unpacker;
-    if (!unpacker.unpack(read, container_size, checksum_))
-      return workspace_denied ? IndexError_NoMemory : IndexError_UnpackIndex;
-    size_t estimated = 0;
-    for (const auto &item : unpacker.segments()) {
-      const auto &meta = item.second;
-      if (meta.data_offset() > container_size ||
-          meta.data_size() > container_size - meta.data_offset() ||
-          meta.padding_size() >
-              container_size - meta.data_offset() - meta.data_size())
-        return IndexError_InvalidLength;
-      estimated += 512 + item.first.size();
-      if (estimated > kMetadataReserve) return IndexError_NoMemory;
-    }
-    candidate->segments = std::move(*unpacker.mutable_segments());
-    candidate->file_magic = unpacker.magic();
-    candidate->path = path;
+      candidate->segments = std::move(*unpacker.mutable_segments());
+      candidate->file_magic = unpacker.magic();
+    }  // Release parse-only buffers before publishing/registering the state.
+    candidate->path.assign(path.data(), path.size());
+    candidate->metadata_charge += path.size() + 1;
     candidate->start();
     state_ = std::move(candidate);
     return 0;
@@ -1496,15 +1530,19 @@ IndexStorage::Segment::Pointer ChunkReadStorage::get(const std::string &id,
   auto it = state_->segments.find(id);
   return it == state_->segments.end()
              ? Segment::Pointer{}
-             : std::make_shared<ReadSegment>(state_, it->second);
+             : std::allocate_shared<ReadSegment>(
+                   ailego::BudgetedAllocator<ReadSegment>{}, state_,
+                   it->second);
 }
 std::map<std::string, IndexStorage::Segment::Pointer>
 ChunkReadStorage::get_all() const {
   std::map<std::string, Segment::Pointer> result;
   if (state_)
     for (const auto &item : state_->segments)
-      result.emplace(std::string(item.first.data(), item.first.size()),
-                     std::make_shared<ReadSegment>(state_, item.second));
+      result.emplace(
+          std::string(item.first.data(), item.first.size()),
+          std::allocate_shared<ReadSegment>(
+              ailego::BudgetedAllocator<ReadSegment>{}, state_, item.second));
   return result;
 }
 bool ChunkReadStorage::has(const std::string &id) const {
@@ -1518,7 +1556,8 @@ IndexStorage::MemoryBlock::MemoryBlockType ChunkReadStorage::memory_block_type()
   return MemoryBlock::MBT_SHARED_SCRATCH;
 }
 std::string ChunkReadStorage::file_path() const {
-  return state_ ? state_->path : std::string{};
+  return state_ ? std::string(state_->path.data(), state_->path.size())
+                : std::string{};
 }
 void ChunkReadStorage::enable_prefetch(bool enabled) {
   if (state_) state_->prefetch_enabled.store(enabled);
@@ -1556,7 +1595,7 @@ ChunkReadStorage::Stats ChunkReadStorage::stats() const {
     result.prefetch_depth = s.read_ahead->depth;
     result.prefetch_limit_bytes = s.read_ahead->byte_limit;
     result.metadata_bytes +=
-        s.read_ahead->charge->bytes +
+        sizeof(State::ReadAhead) +
         (s.read_ahead->ring_charge ? s.read_ahead->ring_charge->bytes : 0);
   }
 #endif

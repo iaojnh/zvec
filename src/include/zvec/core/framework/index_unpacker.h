@@ -82,6 +82,7 @@ class IndexUnpacker {
   //! Reset the unpacker
   void reset() {
     segments_.clear();
+    version_ = ailego::BudgetedStringBuffer{};
   }
 
   //! Retrieve segments of index package
@@ -106,7 +107,7 @@ class IndexUnpacker {
 
   //! Retrieve version information
   const std::string &version() const {
-    return version_;
+    return version_.data;
   }
 
   //! Retrieve mutable segments of index package
@@ -288,7 +289,9 @@ class IndexUnpacker {
             segment.data_crc()) {
       return false;
     }
-    version_.assign(reinterpret_cast<const char *>(data), segment.data_size());
+    version_.reserve(segment.data_size());
+    version_.data.assign(reinterpret_cast<const char *>(data),
+                         segment.data_size());
     return true;
   }
 
@@ -327,7 +330,7 @@ class IndexUnpacker {
  private:
   IndexFormat::MetaHeader header_{};
   IndexFormat::MetaFooter footer_{};
-  std::string version_{};
+  ailego::BudgetedStringBuffer version_{};
   SegmentMap segments_{};
   uint64_t current_header_start_offset_{0u};
 };
