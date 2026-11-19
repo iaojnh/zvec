@@ -433,11 +433,9 @@ class BufferStorage : public IndexStorage {
 
       auto cleanup_owned = [&]() {
         // Arena slices share their backing owner; individual snapshots
-        // release their own heap allocation or mapped backing.
+        // and staged zero-copy results release their own backing or pin.
         for (BatchState &state : scratch.states) {
-          if (!batch_arena && state.owned != nullptr) {
-            state.owned_block.reset();
-          }
+          state.owned_block.reset();
           state.owned = nullptr;
         }
       };
@@ -677,6 +675,31 @@ class BufferStorage : public IndexStorage {
         total += aligned;
       }
       batch_arena = total <= kMaxArenaBytes;
+
+      // Stage zero-copy output pins separately from temporary source pins.
+      // Those output pins are part of the result's unavoidable footprint;
+      // copy-only sources must remain evictable while admitting snapshots.
+      for (BatchState &state : scratch.states) {
+        if (state.copy_result || state.page_count == 0) continue;
+        const size_t unique_index =
+            unique_index_for(scratch.page_ids[state.first_page_index]);
+        owner_->buffer_pool_handle_->acquire_one(
+            scratch.unique_page_ids[unique_index]);
+        state.owned_block.reset(owner_->buffer_pool_handle_.get(),
+                                scratch.unique_page_ids[unique_index],
+                                scratch.pages[unique_index] +
+                                    state.abs_offset % ailego::kVectorPageSize);
+      }
+      const bool release_copy_pages =
+          total != 0 &&
+          (!batch_arena || !scratch.arena || scratch.arena.use_count() != 1 ||
+           scratch.arena->size() < total);
+      if (release_copy_pages) {
+        // The <=2 MiB arena was prepaid before admission. Larger snapshots
+        // (or a small arena selected from a larger mixed batch) were not:
+        // keeping their sources pinned here can block their own allocation.
+        release_pages();
+      }
       std::shared_ptr<BatchArena> arena_owner;
       if (batch_arena && total != 0) {
         if (!scratch.arena || scratch.arena.use_count() != 1) {
@@ -712,6 +735,15 @@ class BufferStorage : public IndexStorage {
           if (state.owned == nullptr) {
             return fail();
           }
+        }
+      }
+      if (release_copy_pages) {
+        // Allocation may have evicted source pages. Reuse surviving hits;
+        // the bounded bypass buffer handles every other page without
+        // admitting it again or allocating another result buffer.
+        for (size_t i = 0; i < scratch.unique_page_ids.size(); ++i) {
+          scratch.pages[i] = owner_->buffer_pool_->try_acquire_buffer(
+              scratch.unique_page_ids[i]);
         }
       }
 
@@ -806,16 +838,7 @@ class BufferStorage : public IndexStorage {
           continue;
         }
         if (!state.copy_result) {
-          const size_t unique_index =
-              unique_index_for(scratch.page_ids[state.first_page_index]);
-          const size_t offset_in_page =
-              state.abs_offset % ailego::kVectorPageSize;
-          owner_->buffer_pool_handle_->acquire_one(
-              scratch.unique_page_ids[unique_index]);
-          state.request->block->reset(
-              owner_->buffer_pool_handle_.get(),
-              scratch.unique_page_ids[unique_index],
-              scratch.pages[unique_index] + offset_in_page);
+          *state.request->block = std::move(state.owned_block);
           continue;
         }
         *state.request->block =

@@ -2360,6 +2360,116 @@ TEST_F(BufferStorageWriteTest, OversizedBatchScratchKeepsOwnedFallback) {
   EXPECT_EQ(0, std::memcmp(payload.data(), copy.data(), length));
 }
 
+TEST_F(BufferStorageWriteTest, OversizedBatchCopiesFitTightBudget) {
+  constexpr size_t kMiB = 1UL << 20;
+  constexpr size_t kCopyBytes = 3 * kMiB;
+  const size_t page_size = ailego::kVectorPageSize;
+  size_t writable_metadata = 0;
+  std::vector<char> payload(kCopyBytes + 2 * page_size);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<char>((i * 31 + 7) % 251);
+  }
+  {
+    auto storage = open_writable();
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->append("large", payload.size()));
+    auto segment = storage->get("large");
+    ASSERT_TRUE(segment);
+    ASSERT_EQ(payload.size(),
+              segment->write(0, payload.data(), payload.size()));
+    const size_t file_pages =
+        (storage->vec_buffer_pool()->file_size() + page_size - 1) / page_size;
+    writable_metadata =
+        ailego::PoolPayloadBudget::storage_metadata_bytes(file_pages);
+    ASSERT_EQ(0, storage->close());
+  }
+
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  // Queue bookkeeping is additional to this page/workspace budget. The
+  // results fit, but retaining all their source pages as well does not.
+  ASSERT_EQ(0, budget.init(6 * kMiB));
+  AILEGO_DEFER([&] { EXPECT_EQ(0, budget.init(64 * kMiB)); });
+  for (bool writable : {false, true}) {
+    for (bool immutable : {false, true}) {
+      for (size_t copies : {size_t{1}, size_t{3}}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "writable=" << writable << " immutable=" << immutable
+                     << " copies=" << copies);
+        auto check = [&](bool batch) {
+          SCOPED_TRACE(batch ? "batch" : "scalar control");
+          // Writable stores have additional fixed metadata and writeback
+          // staging. Pay for those separately so the copied results fit.
+          ASSERT_EQ(0,
+                    budget.init(6 * kMiB + (writable ? writable_metadata : 0)));
+          auto storage = writable ? open_writable() : open_read_only();
+          ASSERT_TRUE(storage);
+          auto segment = storage->get("large");
+          ASSERT_TRUE(segment);
+          const size_t first =
+              (page_size - segment->data_offset() % page_size) % page_size;
+          const size_t large_offset = first + page_size;
+          if (writable) {
+            // Keep a dirty source page: releasing copy-only pins must still
+            // read current cached bytes rather than stale on-disk bytes.
+            const size_t changed = large_offset + kMiB + 17;
+            payload[changed] ^= 1;
+            ASSERT_EQ(1U, segment->write(changed, &payload[changed], 1));
+          }
+          IndexStorage::MemoryBlock blocks[4];
+          IndexStorage::Segment::BorrowedRead reads[4] = {
+              {segment.get(), first, 128, &blocks[0]},
+          };
+          for (size_t i = 0; i < copies; ++i) {
+            reads[i + 1] = {segment.get(),
+                            large_offset + i * (kCopyBytes / copies),
+                            kCopyBytes / copies, &blocks[i + 1]};
+          }
+          if (batch) {
+            ASSERT_TRUE(
+                immutable
+                    ? segment->read_borrowed_batch_immutable(reads, copies + 1)
+                    : segment->read_borrowed_batch(reads, copies + 1));
+          } else {
+            for (size_t i = 0; i <= copies; ++i) {
+              ASSERT_EQ(reads[i].length,
+                        immutable
+                            ? segment->read_borrowed_immutable(
+                                  reads[i].offset, blocks[i], reads[i].length)
+                            : segment->read_borrowed(reads[i].offset, blocks[i],
+                                                     reads[i].length));
+            }
+          }
+          for (size_t i = 0; i <= copies; ++i) {
+            ASSERT_NE(nullptr, blocks[i].data());
+            EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
+                                     blocks[i].data(), reads[i].length));
+          }
+          if (immutable || !writable) {
+            EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL,
+                      blocks[0].type_);
+          }
+          // Only the copied results promise ownership beyond close.
+          blocks[0].reset();
+          segment.reset();
+          ASSERT_EQ(0, storage->close());
+          storage.reset();
+          for (size_t i = 1; i <= copies; ++i) {
+            EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
+                                     blocks[i].data(), reads[i].length));
+          }
+        };
+        // Separate opens give both implementations a cold-cache starting
+        // point. Ordinary writable scalar reads also require the whole source
+        // range in cache; only the other scalar paths support this budget.
+        if (immutable || !writable) {
+          ASSERT_NO_FATAL_FAILURE(check(false));
+        }
+        ASSERT_NO_FATAL_FAILURE(check(true));
+      }
+    }
+  }
+}
+
 TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveReadingThreadExit) {
   const size_t page_size = ailego::kVectorPageSize;
   std::vector<char> payload(3 * page_size, 't');
