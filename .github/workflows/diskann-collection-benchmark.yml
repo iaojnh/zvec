@@ -80,6 +80,12 @@ jobs:
         run: >-
           python benchmarks/diskann-collection-e2e/run.py --python-sdk
           --data benchmark-data --output benchmark-results --label ${{ matrix.label }}
+      - name: Measure DiskANN QPS and read IOPS under the same Linux query windows
+        if: runner.os == 'Linux'
+        run: >-
+          python benchmarks/diskann-collection-e2e/linux_io_sweep.py
+          --data benchmark-data --collection benchmark-results/diskann
+          --output benchmark-results/io-sweep --label ${{ matrix.label }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -70,6 +70,12 @@ def summarize(input_dir):
         )
         yield "| " + " | ".join(columns) + " |"
 
+    for label in ("linux-x86_64", "linux-arm64"):
+        path = input_dir / f"collection-e2e-result-{label}" / "io-sweep" / "io-sweep.md"
+        if path.is_file():
+            yield ""
+            yield path.read_text(encoding="utf-8").rstrip()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

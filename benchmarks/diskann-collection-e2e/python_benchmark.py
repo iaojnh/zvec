@@ -83,7 +83,7 @@ def build(data, path, index):
     return dict(vectors=len(base), index_complete=True, write_ms=write_ms, optimize_ms=optimize_ms)
 
 
-def query(data, path, index):
+def query(data, path, index, linux_block_io=False):
     with (data / "base.fbin").open("rb") as stream:
         count, dimension = matrix_shape(stream)
     matrix = read_matrix(data / "queries.fbin", "<f4", 20_000)
@@ -129,17 +129,26 @@ def query(data, path, index):
         peak = after_warmup
         latencies = []
         correct = 0
+        if linux_block_io:
+            from linux_io_sweep import QueryBlockIO
+
+            block_io = QueryBlockIO(Path(path))
+            before_io = block_io.snapshot()
+            window_start = perf_counter_ns()
         for _ in range(PASSES):
             for row in held_out:
                 correct += evaluate(row, param, latencies)
                 if row % 50 == 0:
                     peak = max(peak, process.memory_info().rss)
+        if linux_block_io:
+            window_ns = perf_counter_ns() - window_start
+            io_result = block_io.result(before_io, window_ns, len(latencies))
         after_query = process.memory_info().rss
     finally:
         collection.close()
 
     latencies.sort()
-    return dict(
+    result = dict(
         vectors=count,
         dimension=dimension,
         queries_per_pass=len(held_out),
@@ -158,6 +167,9 @@ def query(data, path, index):
         sampled_peak_query_rss_bytes=max(peak, after_query),
         query_rss_delta_bytes=after_query - baseline,
     )
+    if linux_block_io:
+        result["linux_block_io"] = io_result
+    return result
 
 
 def main():
@@ -166,12 +178,17 @@ def main():
     parser.add_argument("index", choices=["hnsw", "diskann"])
     parser.add_argument("data", type=Path)
     parser.add_argument("collection")
+    parser.add_argument("--linux-block-io", action="store_true")
     args = parser.parse_args()
+    if args.linux_block_io and (args.phase, args.index) != ("query", "diskann"):
+        parser.error("--linux-block-io applies to the DiskANN query phase")
     if version("zvec") != "0.8.1":
         raise RuntimeError("This benchmark requires the Zvec 0.8.1 wheel")
     zvec.init(query_threads=1, optimize_threads=2)
-    measure = build if args.phase == "build" else query
-    result = measure(args.data, args.collection, args.index)
+    if args.phase == "build":
+        result = build(args.data, args.collection, args.index)
+    else:
+        result = query(args.data, args.collection, args.index, args.linux_block_io)
     result.update(phase=args.phase, index=args.index)
     print("ZVEC_COLLECTION_BENCH_RESULT " + json.dumps(result), flush=True)
 
