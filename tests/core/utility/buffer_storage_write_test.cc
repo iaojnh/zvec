@@ -2415,22 +2415,33 @@ TEST_F(BufferStorageWriteTest, OversizedBatchCopiesFitTightBudget) {
             payload[changed] ^= 1;
             ASSERT_EQ(1U, segment->write(changed, &payload[changed], 1));
           }
-          IndexStorage::MemoryBlock blocks[4];
-          IndexStorage::Segment::BorrowedRead reads[4] = {
-              {segment.get(), first, 128, &blocks[0]},
+          IndexStorage::MemoryBlock blocks[7];
+          IndexStorage::Segment::BorrowedRead reads[7];
+          size_t read_count = 0;
+          auto append_read = [&](size_t offset, size_t length) {
+            reads[read_count] = {segment.get(), offset, length,
+                                 &blocks[read_count]};
+            if (batch && length == 0) {
+              // Empty outputs must clear a previous view, including at EOF.
+              blocks[read_count].reset(payload.data());
+            }
+            ++read_count;
           };
+          append_read(0, 0);
+          append_read(first, 128);
           for (size_t i = 0; i < copies; ++i) {
-            reads[i + 1] = {segment.get(),
-                            large_offset + i * (kCopyBytes / copies),
-                            kCopyBytes / copies, &blocks[i + 1]};
+            const size_t offset = large_offset + i * (kCopyBytes / copies);
+            append_read(offset, kCopyBytes / copies);
+            if (i == 0) append_read(offset, 0);
           }
+          append_read(segment->data_size(), 0);
           if (batch) {
             ASSERT_TRUE(
                 immutable
-                    ? segment->read_borrowed_batch_immutable(reads, copies + 1)
-                    : segment->read_borrowed_batch(reads, copies + 1));
+                    ? segment->read_borrowed_batch_immutable(reads, read_count)
+                    : segment->read_borrowed_batch(reads, read_count));
           } else {
-            for (size_t i = 0; i <= copies; ++i) {
+            for (size_t i = 0; i < read_count; ++i) {
               ASSERT_EQ(reads[i].length,
                         immutable
                             ? segment->read_borrowed_immutable(
@@ -2439,21 +2450,26 @@ TEST_F(BufferStorageWriteTest, OversizedBatchCopiesFitTightBudget) {
                                                      reads[i].length));
             }
           }
-          for (size_t i = 0; i <= copies; ++i) {
+          for (size_t i = 0; i < read_count; ++i) {
+            if (reads[i].length == 0) {
+              EXPECT_EQ(nullptr, blocks[i].data());
+              continue;
+            }
             ASSERT_NE(nullptr, blocks[i].data());
             EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
                                      blocks[i].data(), reads[i].length));
           }
           if (immutable || !writable) {
             EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL,
-                      blocks[0].type_);
+                      blocks[1].type_);
           }
           // Only the copied results promise ownership beyond close.
-          blocks[0].reset();
+          blocks[1].reset();
           segment.reset();
           ASSERT_EQ(0, storage->close());
           storage.reset();
-          for (size_t i = 1; i <= copies; ++i) {
+          for (size_t i = 0; i < read_count; ++i) {
+            if (i == 1 || reads[i].length == 0) continue;
             EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
                                      blocks[i].data(), reads[i].length));
           }

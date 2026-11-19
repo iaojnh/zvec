@@ -644,10 +644,12 @@ class BufferStorage : public IndexStorage {
         return static_cast<size_t>(it - scratch.unique_page_ids.begin());
       };
 
-      // Mutable values always own a snapshot. Immutable single-page values
-      // retain a zero-copy pin when resident; other values need a copy.
+      // Nonempty mutable values always own a snapshot. Empty requests have no
+      // backing to allocate. Immutable single-page values retain a zero-copy
+      // pin when resident; other values need a copy.
       for (BatchState &state : scratch.states) {
-        state.copy_result = mutable_snapshot || state.page_count > 1;
+        state.copy_result =
+            state.page_count != 0 && (mutable_snapshot || state.page_count > 1);
         for (size_t j = 0; j < state.page_count && !state.copy_result; ++j) {
           const size_t unique_index =
               unique_index_for(scratch.page_ids[state.first_page_index + j]);
