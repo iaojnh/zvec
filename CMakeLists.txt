@@ -136,6 +136,7 @@ option(BUILD_PYTHON_BINDINGS "Build Python bindings using pybind11" OFF)
 option(BUILD_C_BINDINGS "Build C bindings" ON)
 option(BUILD_TOOLS "Build tools" ON)
 option(BUILD_CPP_EXAMPLES "Build C++ examples" OFF)
+option(BUILD_COLLECTION_BENCHMARK "Build the public Collection API benchmark" OFF)
 
 message(STATUS "BUILD_ZVEC_SHARED:${BUILD_ZVEC_SHARED}")
 message(STATUS "BUILD_ZVEC_AILEGO_SHARED:${BUILD_ZVEC_AILEGO_SHARED}")
@@ -253,6 +254,10 @@ message(STATUS "USE_OSS_MIRROR:${USE_OSS_MIRROR}")
 
 cc_directory(thirdparty)
 cc_directories(src)
+
+if(BUILD_COLLECTION_BENCHMARK)
+  add_subdirectory(benchmarks/diskann-collection-e2e)
+endif()
 
 if(BUILD_CPP_EXAMPLES)
   add_subdirectory(examples/c++ EXCLUDE_FROM_ALL)

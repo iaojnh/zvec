@@ -1,0 +1,242 @@
+name: DiskANN Collection Benchmark
+
+on:
+  push:
+    branches: [codex/diskann-collection-e2e-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diskann-collection-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '3'
+
+jobs:
+  dataset:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy h5py
+      - name: Prepare SIFT-100K and exact neighbors
+        env:
+          OPENBLAS_NUM_THREADS: '2'
+        run: python scripts/prepare_diskann_platform_data.py --output benchmark-data
+      - uses: actions/upload-artifact@v7
+        with:
+          name: collection-e2e-dataset
+          path: benchmark-data/
+          if-no-files-found: error
+          retention-days: 14
+
+  desktop:
+    needs: dataset
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-24.04
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+          - label: windows-x86_64
+            runner: windows-2025
+            msvc: x64
+          - label: windows-arm64
+            runner: windows-11-arm
+            msvc: arm64
+          - label: macos-x86_64
+            runner: macos-15-intel
+          - label: macos-arm64
+            runner: macos-15
+    name: Collection benchmark (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.msvc }}
+      - name: Install build tools
+        run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Configure the public C++ SDK and benchmark
+        shell: bash
+        run: >-
+          cmake -S . -B build-benchmark -G Ninja
+          -DCMAKE_BUILD_TYPE=Release -DBUILD_COLLECTION_BENCHMARK=ON
+          -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_C_BINDINGS=OFF
+          -DBUILD_ZVEC_SHARED=ON -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF
+      - run: cmake --build build-benchmark --target zvec_collection_benchmark
+      - uses: actions/download-artifact@v8
+        with:
+          name: collection-e2e-dataset
+          path: benchmark-data
+      - name: Run Collection benchmark
+        shell: bash
+        env:
+          BENCH_LABEL: ${{ matrix.label }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+        run: |
+          binary=build-benchmark/bin/zvec_collection_benchmark
+          if [[ "$RUNNER_OS_NAME" == Windows ]]; then binary="$binary.exe"; fi
+          python benchmarks/diskann-collection-e2e/run.py --binary "$binary" \
+            --data benchmark-data --output benchmark-results --label "$BENCH_LABEL"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: collection-e2e-result-${{ matrix.label }}
+          path: benchmark-results/
+          retention-days: 30
+
+  android:
+    name: Collection benchmark (Android x86_64 emulator)
+    needs: dataset
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      NDK_VERSION: '26.1.10909125'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install build tools and NDK
+        run: |
+          python -m pip install cmake==3.30.0 ninja==1.11.1
+          sdkmanager --install "ndk;$NDK_VERSION" "platforms;android-34"
+      - name: Build benchmark with the Android static SDK
+        run: |
+          cmake -S . -B build-benchmark -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=x86_64 -DANDROID_NATIVE_API_LEVEL=34 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_COLLECTION_BENCHMARK=ON \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_C_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF \
+            -DENABLE_NATIVE=OFF -DAUTO_DETECT_ARCH=OFF
+          cmake --build build-benchmark --target zvec_collection_benchmark
+      - uses: actions/download-artifact@v8
+        with:
+          name: collection-e2e-dataset
+          path: benchmark-data
+      - name: Enable KVM
+        run: sudo chmod 666 /dev/kvm
+      - name: Run Collection benchmark on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          ram-size: 4096M
+          heap-size: 1024M
+          disable-animations: true
+          script: >-
+            python benchmarks/diskann-collection-e2e/run.py
+            --binary build-benchmark/bin/zvec_collection_benchmark
+            --data benchmark-data --output benchmark-results
+            --label android-x86_64-emulator --transport android
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: collection-e2e-result-android-x86_64-emulator
+          path: benchmark-results/
+          retention-days: 30
+
+  ios:
+    name: Collection benchmark (iOS ARM64 simulator)
+    needs: dataset
+    runs-on: macos-15
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install build tools
+        run: python -m pip install cmake==3.30.0 ninja==1.11.1
+      - name: Build benchmark with the iOS static SDK
+        run: |
+          cmake -S . -B build-benchmark -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DIOS=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_COLLECTION_BENCHMARK=ON \
+            -DBUILD_TOOLS=OFF -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_C_BINDINGS=OFF \
+            -DBUILD_ZVEC_SHARED=OFF -DBUILD_ZVEC_CORE_SHARED=OFF -DBUILD_ZVEC_AILEGO_SHARED=OFF
+          cmake --build build-benchmark --target zvec_collection_benchmark
+      - uses: actions/download-artifact@v8
+        with:
+          name: collection-e2e-dataset
+          path: benchmark-data
+      - name: Boot an iPhone simulator
+        run: |
+          device=$(xcrun simctl list devices available -j | python -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          print(next(d["udid"] for runtime, devices in data["devices"].items()
+                     if "iOS" in runtime for d in devices if "iPhone" in d["name"]))')
+          echo "BENCH_DEVICE=$device" >> "$GITHUB_ENV"
+          xcrun simctl bootstatus "$device" -b
+      - name: Run Collection benchmark on simulator
+        run: |
+          python benchmarks/diskann-collection-e2e/run.py \
+            --binary build-benchmark/bin/zvec_collection_benchmark.app \
+            --data benchmark-data --output benchmark-results \
+            --label ios-arm64-simulator --transport ios --device "$BENCH_DEVICE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: collection-e2e-result-ios-arm64-simulator
+          path: benchmark-results/
+          retention-days: 30
+      - name: Shutdown simulator
+        if: always() && env.BENCH_DEVICE != ''
+        run: xcrun simctl shutdown "$BENCH_DEVICE"
+
+  summary:
+    if: always()
+    needs: [dataset, desktop, android, ios]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: collection-e2e-result-*
+          path: all-results
+      - name: Summarize comparable Collection runs
+        run: |
+          python benchmarks/diskann-collection-e2e/summarize.py all-results comparison.md
+          cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: collection-e2e-summary
+          path: comparison.md
+          if-no-files-found: error
+          retention-days: 30
