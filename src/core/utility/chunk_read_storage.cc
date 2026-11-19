@@ -937,7 +937,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     fills.fetch_add(1, std::memory_order_relaxed);
     return item;
   }
-  View *acquire_view(size_t bytes) {
+  View *acquire_view(size_t bytes, bool funded_only = false) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     for (;;) {
@@ -955,13 +955,23 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           fallback_size = size;
         }
       }
-      if (auto *candidate = fit ? fit : fallback) {
+      if (auto *candidate = fit ? fit : (funded_only ? nullptr : fallback)) {
         bool expected = false;
         if (candidate->busy.compare_exchange_strong(expected, true,
-                                                    std::memory_order_acquire))
+                                                    std::memory_order_acquire)) {
+          // Capacity may have changed before the lease was acquired. An
+          // optional copy may use only backing that is still funded now.
+          if (funded_only && candidate->workspace.mapped_size() < bytes) {
+            candidate->busy.store(false, std::memory_order_release);
+            changed.notify_one();
+            return nullptr;
+          }
           return candidate;
+        }
+        if (funded_only) return nullptr;
         continue;
       }
+      if (funded_only) return nullptr;
       workspace_waits.fetch_add(1, std::memory_order_relaxed);
       std::unique_lock<std::mutex> lock(wait_mutex);
       if (std::chrono::steady_clock::now() >= deadline) return nullptr;
@@ -1003,6 +1013,130 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       if (single) unpin(*single, key);
       throw;
     }
+  }
+  // Copied results need one descriptor and their destination workspace,
+  // not a retained pin/descriptor for every source chunk. Admit the destination
+  // before touching cache sources, then release each source after copying it.
+  size_t contiguous(size_t offset, size_t len, Segment::ScatterBlock &out,
+                    Layout *layout, bool populate) try {
+    out.reset();
+    if (!len || offset > file_size || len > file_size - offset ||
+        len > (adaptive ? (1UL << 30) : max_read_bytes))
+      return 0;
+    const auto locate = [&](size_t position) -> Entry * {
+      return layout ? layout->find(position)
+                    : entry(position / chunk_bytes,
+                            populate && cache_limit != 0);
+    };
+    const auto source = [&](Entry *item) -> Entry * {
+      if (populate) return cached(item);
+      // Parsing may borrow an already-funded cache hit, but must not add
+      // optional cache mappings/tables before its directory is admitted.
+      if (item && pin(*item, reinterpret_cast<size_t>(item))) return item;
+      return nullptr;
+    };
+    // Only the single-chunk fast path can return cache backing directly.
+    // Defer optional table creation for copied results until after destination
+    // admission, just like optional payload cache population below.
+    auto *first = layout ? layout->find(offset)
+                         : entry(offset / chunk_bytes, false);
+    const bool single =
+        first ? len <= first->bytes - (offset - first->offset)
+              : !layout && len <= chunk_bytes - offset % chunk_bytes;
+    const size_t page = ailego::MemoryHelper::PageSize();
+    // A funded parsing destination also needs its lease admitted before a
+    // single cache chunk is pinned. Otherwise that pin could prevent reclaim
+    // for the lease itself at zero available budget.
+    auto *view = single && !populate ? acquire_view(len + 2 * page, true)
+                                    : nullptr;
+    if (single && !view) {
+      if (!first && populate && cache_limit != 0)
+        first = entry(offset / chunk_bytes, true);
+      if (auto *item = source(first)) {
+        out.lease = lease(out, nullptr, item, reinterpret_cast<size_t>(item));
+        out.spans.push_back(
+            {item->data.load(std::memory_order_relaxed) + offset - item->offset,
+             len});
+        out.size = len;
+        return len;
+      }
+    }
+    if (!view) view = acquire_view(len + 2 * page);
+    if (!view) {
+      chunk_read_error = IndexError_NoMemory;
+      return 0;
+    }
+    out.lease = lease(out, view);
+    if (!ensure_workspace(*view, len + 2 * page)) {
+      chunk_read_error = IndexError_NoMemory;
+      out.reset();
+      return 0;
+    }
+    const size_t base =
+        populate ? offset / io_alignment * io_alignment : offset;
+    auto *destination = reinterpret_cast<uint8_t *>(view->workspace.data());
+    size_t run_first = offset, run_end = offset;
+    const auto finish_run = [&]() {
+      if (run_first == run_end) return true;
+      const size_t physical = run_first / io_alignment * io_alignment;
+      // An interior unaligned direct read could overwrite bytes already
+      // copied from a cache hit. Use the exact buffered range in that case;
+      // metadata reads also use the same buffered handle as top-level open.
+      const bool buffered =
+          !populate || (run_first > offset && physical != run_first);
+      bool ok;
+      if (buffered) {
+        const size_t requested = run_end - run_first;
+        const size_t got = meta_file.read(
+            static_cast<ssize_t>(run_first),
+            destination + run_first - base, requested);
+        io_calls.fetch_add(1, std::memory_order_relaxed);
+        io_bytes.fetch_add(got, std::memory_order_relaxed);
+        ok = got == requested;
+      } else {
+        const size_t requested = (run_end - physical + io_alignment - 1) /
+                                 io_alignment * io_alignment;
+        ok = read_data(physical, requested, destination + physical - base,
+                       run_end - physical);
+      }
+      run_first = run_end;
+      return ok;
+    };
+    for (size_t begin = offset; begin < offset + len;) {
+      auto *chunk = single ? first : locate(begin);
+      const size_t end =
+          chunk ? std::min(chunk->offset + chunk->bytes, offset + len)
+                : std::min((begin / chunk_bytes + 1) * chunk_bytes, offset + len);
+      auto *item = single && populate ? nullptr : source(chunk);
+      if (item) {
+        const auto release = ailego::ScopeGuard::Make(
+            [&] { unpin(*item, reinterpret_cast<size_t>(item)); });
+        if (!finish_run()) {
+          out.reset();
+          return 0;
+        }
+        std::memcpy(destination + begin - base,
+                    item->data.load(std::memory_order_relaxed) + begin -
+                        item->offset,
+                    end - begin);
+        copied.fetch_add(end - begin, std::memory_order_relaxed);
+        run_first = run_end = end;
+      } else {
+        run_end = end;
+      }
+      begin = end;
+    }
+    if (!finish_run()) {
+      out.reset();
+      return 0;
+    }
+    out.spans.push_back({destination + offset - base, len});
+    out.size = len;
+    return len;
+  } catch (const std::bad_alloc &) {
+    out.reset();
+    chunk_read_error = IndexError_NoMemory;
+    return 0;
   }
   size_t scatter(size_t offset, size_t len, Segment::ScatterBlock &out,
                  Layout *layout = nullptr) try {
@@ -1320,7 +1454,18 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     return IndexError_NoMemory;
   }
   size_t read(size_t offset, MemoryBlock &out, size_t len) override {
+    return read_contiguous(offset, out, len, /*populate=*/true);
+  }
+  size_t read_for_parsing(size_t offset, MemoryBlock &out,
+                          size_t len) override {
+    return read_contiguous(offset, out, len, /*populate=*/false);
+  }
+  size_t read_contiguous(size_t offset, MemoryBlock &out, size_t len,
+                         bool populate) {
+    chunk_read_error = IndexError_ReadData;
     out.reset();
+    if (offset > capacity()) return 0;
+    len = std::min(len, capacity() - offset);
     State::ReadSlot *slot = nullptr;
     for (auto &candidate : state_->read_slots) {
       bool expected = false;
@@ -1351,30 +1496,13 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
         block.workspace->reset();
       slot->busy.store(false, std::memory_order_release);
     });
-    const size_t got = read_scatter(offset, block, len);
+    const size_t got =
+        state_->contiguous(offset_ + offset, len, block, layout_, populate);
     if (!got) return 0;
     auto owner = std::static_pointer_cast<State::Lease>(block.lease);
-    if (block.spans.size() == 1) {
-      owner->retain();
-      out = MemoryBlock::MakeReusedScratch(
-          const_cast<uint8_t *>(block.spans.front().data), owner, false);
-      return got;
-    }
-    const size_t page = ailego::MemoryHelper::PageSize();
-    if (!state_->ensure_workspace(*owner->view, got + 2 * page)) {
-      chunk_read_error = IndexError_NoMemory;
-      return 0;
-    }
-    auto *destination = owner->view->workspace.data() +
-                        (offset_ + offset) % state_->io_alignment;
-    size_t copied = 0;
-    for (const auto &span : block.spans) {
-      std::memmove(destination + copied, span.data, span.size);
-      copied += span.size;
-    }
-    state_->copied.fetch_add(got, std::memory_order_relaxed);
     owner->retain();
-    out = MemoryBlock::MakeReusedScratch(destination, owner, false);
+    out = MemoryBlock::MakeReusedScratch(
+        const_cast<uint8_t *>(block.spans.front().data), owner, false);
     return got;
   }
   size_t fetch(size_t offset, void *destination, size_t len) const override {
