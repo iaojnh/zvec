@@ -259,6 +259,11 @@ class MetadataAdmissionTest : public testing::Test {
       failed_ = calls++ >= fail_at;
       return failed_ ? 0 : parent_->read(offset, data, size);
     }
+    size_t read_for_parsing(size_t offset, IndexStorage::MemoryBlock &data,
+                            size_t size) override {
+      failed_ = calls++ >= fail_at;
+      return failed_ ? 0 : parent_->read_for_parsing(offset, data, size);
+    }
     size_t write(size_t, const void *, size_t) override {
       return 0;
     }
@@ -330,12 +335,17 @@ class MetadataAdmissionTest : public testing::Test {
     ASSERT_EQ(0, dumper->close());
   }
   void make_nested_file(size_t count, size_t name_bytes, std::string &path,
-                        std::vector<std::string> &names) {
+                        std::vector<std::string> &names, size_t prefix = 0) {
     path = "metadata-admission-" + std::to_string(files.size()) + ".bin";
     files.push_back(path);
     auto dumper = IndexFactory::CreateDumper("FileDumper");
     ASSERT_TRUE(dumper);
     ASSERT_EQ(0, dumper->create(path));
+    if (prefix) {
+      const std::string padding(prefix, 'p');
+      ASSERT_EQ(prefix, dumper->write(padding.data(), prefix));
+      ASSERT_EQ(0, dumper->append("prefix", prefix, 0, 0));
+    }
     auto middle = std::make_shared<IndexSegmentDumper>(dumper, "nested");
     auto leaf = std::make_shared<IndexSegmentDumper>(middle, "nested");
     names.clear();
@@ -617,6 +627,103 @@ TEST_F(MetadataAdmissionTest, NestedDirectReadsPreserveTightAdmission) {
     }
   }
 }
+
+TEST_F(MetadataAdmissionTest, CrossPageParserPreservesFetchAdmission) {
+  const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+  std::string path;
+  std::vector<std::string> names;
+  // The leaf header crosses a page; all package/version bytes are produced
+  // by the real dumpers. A long name makes later directory admission tight.
+  make_nested_file(1, 300UL << 10, path, names,
+                   page - 16 - 2 * sizeof(IndexFormat::MetaHeader));
+  auto trial = [&](size_t quota, bool parser) {
+    auto storage = create("BufferReadStorage");
+    EXPECT_EQ(0, storage->open(path, false));
+    IndexSegmentStorage middle(storage->get("nested", 1));
+    EXPECT_EQ(0, middle.open("", false));
+    auto parent = middle.get("nested", 1);
+    int result = IndexError_NoMemory;
+    try {
+      Pressure pressure(quota);
+      EXPECT_EQ(quota, pool.available());
+      if (parser) {
+        IndexSegmentStorage leaf(parent);
+        result = leaf.open("", false);
+        if (result == 0) EXPECT_TRUE(leaf.has(names.back()));
+      } else {
+        // Reference the earlier streamed-copy success contract, without
+        // assuming allocator headers, native page size or version length.
+        ailego::BudgetedMappedBuffer copy;
+        IndexUnpacker reference;
+        const auto fetch = [&](size_t offset, const void **data, size_t len) {
+          if (copy.size() < len && copy.resize(len) != 0) return size_t{0};
+          *data = copy.data();
+          return parent->fetch(offset, copy.data(), len);
+        };
+        if (reference.unpack(fetch, parent->data_size(), false)) {
+          EXPECT_NE(reference.segments().end(),
+                    reference.segments().find(names.back()));
+          result = 0;
+        }
+      }
+    } catch (const std::bad_alloc &) {
+    }
+    return result;
+  };
+  // Initialize shared registries equally, then find the real reference
+  // boundary. Every trial constructs a fresh parent and releases it fully.
+  size_t low = 1, high = 2UL << 20;
+  ASSERT_EQ(0, trial(high, false));
+  while (low < high) {
+    const size_t quota = low + (high - low) / 2;
+    if (trial(quota, false) == 0)
+      high = quota;
+    else
+      low = quota + 1;
+  }
+  ASSERT_EQ(0, trial(low, false));
+  EXPECT_EQ(0, trial(low, true));
+}
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(MetadataAdmissionTest, ReadAheadPreservesDirectoryAdmission) {
+  std::string path;
+  std::vector<std::string> names;
+  make_file(1, 300UL << 10, path, names);
+  size_t depth = 0;
+  auto trial = [&](size_t quota, bool prefetch) {
+    auto storage = std::make_shared<ChunkReadStorage>();
+    ailego::Params params;
+    params.set(CHUNK_READ_STORAGE_MAX_READ_BYTES,
+               ailego::MemoryLimitPool::page_buffer_size());
+    params.set(CHUNK_READ_STORAGE_WORKSPACE_COUNT, size_t{1});
+    params.set(CHUNK_READ_STORAGE_CACHE_BYTES, size_t{0});
+    params.set(CHUNK_READ_STORAGE_DIRECT_IO, true);
+    params.set(CHUNK_READ_STORAGE_PREFETCH_DEPTH, prefetch ? size_t{3} : 0);
+    EXPECT_EQ(0, storage->init(params));
+    Pressure pressure(quota);
+    EXPECT_EQ(quota, pool.available());
+    const int ret = storage->open(path, false);
+    depth = storage->stats().prefetch_depth;
+    if (ret == 0) EXPECT_TRUE(storage->has(names.back()));
+    return ret;
+  };
+  size_t low = 1, high = 2UL << 20;
+  ASSERT_EQ(0, trial(high, true));
+  if (!depth) GTEST_SKIP() << "Native direct AIO unavailable";
+  while (low < high) {
+    const size_t quota = low + (high - low) / 2;
+    if (trial(quota, false) == 0)
+      high = quota;
+    else
+      low = quota + 1;
+  }
+  ASSERT_EQ(0, trial(low, false));
+  // An optional read-ahead queue must not shrink the directory's success
+  // budget. Admit it only once all mandatory open work has completed.
+  EXPECT_EQ(0, trial(low, true));
+}
+#endif
 
 TEST_F(MetadataAdmissionTest, MappingAllocationBoundariesRollBackAndRetry) {
   const std::string small = "metadata-mapping-small.bin";

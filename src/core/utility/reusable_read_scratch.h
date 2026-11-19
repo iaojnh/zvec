@@ -32,7 +32,7 @@ class ReusableReadScratch {
 
   template <typename Allocate>
   Block acquire(size_t bytes, size_t alignment, bool deep_copy,
-                Allocate allocate) try {
+                Allocate allocate, bool populate = true) try {
     if (bytes > kMaxBytes) return allocate();
     struct Recent {
       uint64_t generation{0};
@@ -45,7 +45,7 @@ class ReusableReadScratch {
     for (const auto &hit : recent) {
       if (hit.generation == generation_) {
         return hit.entry->worker->acquire(hit.entry->worker, bytes, alignment,
-                                          deep_copy, allocate);
+                                          deep_copy, allocate, populate);
       }
     }
 
@@ -57,11 +57,11 @@ class ReusableReadScratch {
         recent[next++ % recent.size()] = {generation_, &entry};
         lock.unlock();
         return entry.worker->acquire(entry.worker, bytes, alignment, deep_copy,
-                                     allocate);
+                                     allocate, populate);
       }
       if (!entry.worker && !empty) empty = &entry;
     }
-    if (!empty) {
+    if (!empty || !populate) {
       lock.unlock();
       return allocate();
     }
@@ -144,7 +144,8 @@ class ReusableReadScratch {
 
     template <typename Allocate>
     Block acquire(const std::shared_ptr<Worker> &self, size_t bytes,
-                  size_t alignment, bool deep_copy, Allocate allocate) {
+                  size_t alignment, bool deep_copy, Allocate allocate,
+                  bool populate) {
       std::unique_lock<std::mutex> lock(mutex_);
       uint64_t idle = allocated_ & ~busy_;
       while (idle) {
@@ -154,6 +155,13 @@ class ReusableReadScratch {
           return borrow(self, index, deep_copy);
         }
         idle &= idle - 1;
+      }
+
+      // Parsing may reuse a funded slot, but must not retain a replacement
+      // or grow cache metadata before admitting the rest of its directory.
+      if (!populate) {
+        lock.unlock();
+        return allocate();
       }
 
       // Shared mapped results can outlive their source for a long time. Keep

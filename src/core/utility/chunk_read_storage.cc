@@ -554,7 +554,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
 
   bool initialize(const std::string &file_path, size_t chunk, size_t cache,
                   size_t max_read, size_t count, size_t wait, bool direct,
-                  bool adapt, size_t prefetch_depth, size_t prefetch_bytes) {
+                  bool adapt) {
     if (!meta_file.open(file_path, true, false)) return false;
     if (!data_file.open(file_path, true, direct)) {
       if (!direct || !data_file.open(file_path, true, false)) return false;
@@ -629,13 +629,23 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         views.capacity() * sizeof(MetadataPointer<View>) +
         read_slots.capacity() * sizeof(MetadataPointer<ReadSlot>) +
         count * (sizeof(View) + sizeof(ReadSlot));
+    return true;
+  }
+  void start(size_t prefetch_depth, size_t prefetch_bytes) {
+    auto &queue = ailego::BlockEvictionQueue::get_instance();
+    version = queue.next_version();
+    queue.set_valid(this);
+    registered = true;
+    // Register the mandatory owner and finish parsing/path admission before
+    // allocating optional read-ahead resources. Otherwise a queue that fits
+    // here can make a later required directory allocation fail.
 #if defined(__linux__) && !defined(__ANDROID__)
-    if (prefetch_depth && prefetch_bytes && direct) {
+    if (prefetch_depth && prefetch_bytes && io_alignment > 1) {
       try {
-        auto queue = MakeMetadata<ReadAhead,
-                                  ailego::OptionalBudgetedAllocator<ReadAhead>>(
+        auto lookahead = MakeMetadata<
+            ReadAhead, ailego::OptionalBudgetedAllocator<ReadAhead>>(
             *this, prefetch_depth, prefetch_bytes);
-        if (queue->ready) read_ahead = std::move(queue);
+        if (lookahead->ready) read_ahead = std::move(lookahead);
       } catch (const std::bad_alloc &) {
       }  // optional lookahead; demand still works
     }
@@ -643,13 +653,6 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     (void)prefetch_depth;
     (void)prefetch_bytes;
 #endif
-    return true;
-  }
-  void start() {
-    auto &queue = ailego::BlockEvictionQueue::get_instance();
-    version = queue.next_version();
-    queue.set_valid(this);
-    registered = true;
   }
   Entry *entry(size_t key, bool create) {
     if (key >= chunks) return nullptr;
@@ -1448,7 +1451,7 @@ int ChunkReadStorage::open(const std::string &path, bool) {
         std::allocate_shared<State>(ailego::BudgetedAllocator<State>{});
     if (!candidate->initialize(
             path, chunk_bytes_, cache_bytes_, max_read_bytes_, workspace_count_,
-            wait_ms_, direct_io_, adaptive_, prefetch_depth_, prefetch_bytes_))
+            wait_ms_, direct_io_, adaptive_))
       return IndexError_OpenFile;
     size_t end = 0;
     if (!ResolveOffset(candidate->file_size, header_offset_, false,
@@ -1497,7 +1500,7 @@ int ChunkReadStorage::open(const std::string &path, bool) {
     }  // Release parse-only buffers before publishing/registering the state.
     candidate->path.assign(path.data(), path.size());
     candidate->metadata_charge += path.size() + 1;
-    candidate->start();
+    candidate->start(prefetch_depth_, prefetch_bytes_);
     state_ = std::move(candidate);
     return 0;
   } catch (const std::bad_alloc &) {

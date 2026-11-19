@@ -236,6 +236,20 @@ class BufferStorage : public IndexStorage {
                                /*immutable=*/true);
     }
 
+    size_t read_for_parsing(size_t offset, MemoryBlock &data,
+                            size_t len) override {
+      buffer_storage_read_error = IndexError_ReadData;
+      if (!owner_->buffer_pool_handle_) return 0;
+      len = clamp_length(&offset, len);
+      if (len == 0) {
+        data.reset();
+        return 0;
+      }
+      return read_memory_block(absolute_offset(offset), data, len,
+                               /*borrow_handle=*/false, /*immutable=*/false,
+                               /*populate=*/false);
+    }
+
     //! Borrowed read: the caller keeps the Segment alive until block release.
     size_t read_borrowed(size_t offset, MemoryBlock &data,
                          size_t len) override {
@@ -1121,7 +1135,8 @@ class BufferStorage : public IndexStorage {
     }
 
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
-                             bool borrow_handle, bool immutable) const try {
+                             bool borrow_handle, bool immutable,
+                             bool populate = true) const try {
       buffer_storage_read_error = IndexError_ReadData;
       const bool can_pin = owner_->cache_enabled_ &&
                            (immutable || !owner_->buffer_pool_->writable());
@@ -1170,7 +1185,7 @@ class BufferStorage : public IndexStorage {
         };
         owned = owner_->cache_enabled_
                     ? owner_->read_scratch_.acquire(alloc_size, alignment, true,
-                                                    allocate)
+                                                    allocate, populate)
                     : allocate();
       }
       auto *tmp = static_cast<char *>(reuse ? data.data_ : owned.data_);

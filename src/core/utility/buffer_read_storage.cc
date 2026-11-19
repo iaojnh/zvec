@@ -220,6 +220,18 @@ class BufferReadStorage : public IndexStorage {
                                /*borrow_handle=*/false);
     }
 
+    size_t read_for_parsing(size_t offset, MemoryBlock &data,
+                            size_t len) override {
+      thread_read_error() = IndexError_ReadData;
+      len = clamp_length(&offset, len);
+      if (len == 0) {
+        data.reset();
+        return 0;
+      }
+      return read_memory_block(data_offset_ + offset, data, len,
+                               /*borrow_handle=*/false, /*populate=*/false);
+    }
+
     //! Borrowed read; the caller keeps this Segment alive until block release.
     size_t read_borrowed(size_t offset, MemoryBlock &data,
                          size_t len) override {
@@ -508,7 +520,7 @@ class BufferReadStorage : public IndexStorage {
     }
 
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
-                             bool borrow_handle) const {
+                             bool borrow_handle, bool populate = true) const {
       const size_t offset_in_page = abs_offset % ailego::kVectorPageSize;
       bool force_bypass = !cache_enabled_;
       if (cache_enabled_ && len <= ailego::kVectorPageSize - offset_in_page) {
@@ -525,11 +537,11 @@ class BufferReadStorage : public IndexStorage {
         force_bypass = true;
       }
       // Copy cross-page and bypass reads into owned memory.
-      return read_owned(abs_offset, data, len, force_bypass);
+      return read_owned(abs_offset, data, len, force_bypass, populate);
     }
 
     size_t read_owned(size_t abs_offset, MemoryBlock &data, size_t len,
-                      bool force_bypass) const try {
+                      bool force_bypass, bool populate) const try {
       // Heap scratch is exclusive (copies are deep copies). Reusing it does
       // not alter an independently retained block or require another charge.
       if (data.can_reuse_scratch(len, 4096UL)) {
@@ -569,7 +581,7 @@ class BufferReadStorage : public IndexStorage {
           cache_enabled_
               ? read_scratch_.acquire(alloc_size, kAlign,
                                       alloc_size < 2 * ailego::kVectorPageSize,
-                                      allocate)
+                                      allocate, populate)
               : allocate();
       auto *tmp = static_cast<char *>(owned.data_);
       if (!read_bytes(abs_offset, len, tmp, force_bypass)) {

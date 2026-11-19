@@ -129,6 +129,16 @@ class IndexSegmentStorage : public IndexStorage {
       return parent_->read(data_offset_ + offset, data, len);
     }
 
+    size_t read_for_parsing(size_t offset, MemoryBlock &data,
+                            size_t len) override {
+      if (offset > region_size_) {
+        data.reset();
+        return 0;
+      }
+      return parent_->read_for_parsing(data_offset_ + offset, data,
+                                       std::min(len, region_size_ - offset));
+    }
+
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
       for (SegmentData *it = iovec, *end = iovec + count; it != end; ++it) {
@@ -214,7 +224,7 @@ class IndexSegmentStorage : public IndexStorage {
       metadata.reset();
       fallback.clear();
       if (offset > total || len > total - offset) return size_t{0};
-      const auto direct_size = parent_->read(offset, metadata, len);
+      const auto direct_size = parent_->read_for_parsing(offset, metadata, len);
       if (direct_size == len) {
         *data = metadata.data();
         return direct_size;

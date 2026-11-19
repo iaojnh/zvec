@@ -873,6 +873,15 @@ class IndexStorage : public IndexModule {
       prefetch(offset, len, priority);
       return true;
     }
+
+    //! A parser retains each result only until its next read. Reuse existing
+    //! views/backing, but do not populate optional result caches: their
+    //! bookkeeping would compete with the parser's later required directory
+    //! allocations. Backends without such caches keep their normal read.
+    virtual size_t read_for_parsing(size_t offset, MemoryBlock &data,
+                                    size_t len) {
+      return read(offset, data, len);
+    }
   };
 
   //! Destructor
