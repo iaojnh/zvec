@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from statistics import median
 
 
 PLATFORMS = (
@@ -15,6 +16,29 @@ PLATFORMS = (
 
 def format_pair(hnsw, diskann, field, divisor=1, decimals=2):
     return " / ".join(f"{row[field] / divisor:.{decimals}f}" for row in (hnsw, diskann))
+
+
+def observed_io_row(label, trials):
+    windows = [trial.get("storage_observation") for trial in trials]
+    if not windows or not all(window and trial.get("query_window_ns")
+                              for trial, window in zip(trials, windows)):
+        return None
+    seconds = sum(window.get("counter_window_ns", trial["query_window_ns"])
+                  for trial, window in zip(trials, windows)) / 1e9
+    queries = sum(trial["queries_per_pass"] * trial["passes"] for trial in trials)
+
+    def rate(key, divisor):
+        values = [window.get(key) for window in windows]
+        return f"{sum(values) / divisor:.1f}" if all(value is not None for value in values) else "—"
+
+    columns = [
+        label, windows[0]["scope"], f"{queries / seconds:.1f}",
+        f"{median(trial['p95_ms'] for trial in trials):.3f}",
+        rate("device_read_ios", seconds), rate("process_logical_read_ios", seconds),
+        rate("process_storage_read_bytes", seconds * 4096),
+        rate("process_storage_read_bytes", queries * 1024), windows[0]["cache_policy"],
+    ]
+    return "| " + " | ".join(columns) + " |"
 
 
 def summarize(input_dir):
@@ -34,6 +58,7 @@ def summarize(input_dir):
     yield "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
 
     fixtures = None
+    io_rows = []
     for label in PLATFORMS:
         path = input_dir / f"collection-e2e-result-{label}" / "summary.json"
         if not path.is_file():
@@ -56,6 +81,10 @@ def summarize(input_dir):
             yield f"| {label} | {report['sdk']} | Recall check failed | — | — | — | — | — | — |"
             continue
 
+        if row := observed_io_row(label, report.get("query_trials", {}).get("diskann", [])):
+            io_rows.append(row)
+        elif label not in ("linux-x86_64", "linux-arm64") and report.get("storage_observation_requested"):
+            io_rows.append(f"| {label} | Incomplete | — | — | — | — | — | — | — |")
         hnsw, diskann = (report["query_medians"][name] for name in ("hnsw", "diskann"))
         columns = (
             label,
@@ -75,6 +104,19 @@ def summarize(input_dir):
         if path.is_file():
             yield ""
             yield path.read_text(encoding="utf-8").rstrip()
+
+    if io_rows:
+        yield ""
+        yield "## DiskANN query-window storage observations"
+        yield ""
+        yield ("Device read IOPS include activity from other processes. Process 4 KiB equivalents/s "
+               "divide OS-accounted process storage bytes by 4 KiB and elapsed seconds. "
+               "A dash means unavailable.")
+        yield ""
+        yield ("| Platform | Device scope | Paired QPS | Median P95 (ms) | Device read IOPS | "
+               "Process logical reads/s | Process 4 KiB equivalents/s | Process storage KiB/query | Cache policy |")
+        yield "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        yield from io_rows
 
 
 def main():

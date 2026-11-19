@@ -4,8 +4,10 @@ import argparse
 from importlib.metadata import version
 import json
 import math
+import os
 from pathlib import Path
 import struct
+import sys
 from time import perf_counter_ns
 
 import numpy as np
@@ -83,7 +85,7 @@ def build(data, path, index):
     return dict(vectors=len(base), index_complete=True, write_ms=write_ms, optimize_ms=optimize_ms)
 
 
-def query(data, path, index, linux_block_io=False):
+def query(data, path, index, linux_block_io=False, observe_storage=False):
     with (data / "base.fbin").open("rb") as stream:
         count, dimension = matrix_shape(stream)
     matrix = read_matrix(data / "queries.fbin", "<f4", 20_000)
@@ -129,20 +131,28 @@ def query(data, path, index, linux_block_io=False):
         peak = after_warmup
         latencies = []
         correct = 0
+        if observe_storage:
+            from storage_observation import desktop_observation, desktop_snapshot
+
+            io_start = desktop_snapshot(os.getpid())
         if linux_block_io:
             from linux_io_sweep import QueryBlockIO
 
             block_io = QueryBlockIO(Path(path))
             before_io = block_io.snapshot()
+        if linux_block_io or observe_storage:
             window_start = perf_counter_ns()
         for _ in range(PASSES):
             for row in held_out:
                 correct += evaluate(row, param, latencies)
                 if row % 50 == 0:
                     peak = max(peak, process.memory_info().rss)
-        if linux_block_io:
+        if linux_block_io or observe_storage:
             window_ns = perf_counter_ns() - window_start
+        if linux_block_io:
             io_result = block_io.result(before_io, window_ns, len(latencies))
+        if observe_storage:
+            observation = desktop_observation(io_start, desktop_snapshot(os.getpid()))
         after_query = process.memory_info().rss
     finally:
         collection.close()
@@ -169,6 +179,9 @@ def query(data, path, index, linux_block_io=False):
     )
     if linux_block_io:
         result["linux_block_io"] = io_result
+    if observe_storage:
+        result["query_window_ns"] = window_ns
+        result["storage_observation"] = observation
     return result
 
 
@@ -179,16 +192,21 @@ def main():
     parser.add_argument("data", type=Path)
     parser.add_argument("collection")
     parser.add_argument("--linux-block-io", action="store_true")
+    parser.add_argument("--observe-storage", action="store_true")
     args = parser.parse_args()
     if args.linux_block_io and (args.phase, args.index) != ("query", "diskann"):
         parser.error("--linux-block-io applies to the DiskANN query phase")
+    if args.observe_storage and (sys.platform not in ("darwin", "win32")
+                                 or (args.phase, args.index) != ("query", "diskann")
+                                 or args.linux_block_io):
+        parser.error("--observe-storage applies to macOS and Windows DiskANN queries")
     if version("zvec") != "0.8.1":
         raise RuntimeError("This benchmark requires the Zvec 0.8.1 wheel")
     zvec.init(query_threads=1, optimize_threads=2)
     if args.phase == "build":
         result = build(args.data, args.collection, args.index)
     else:
-        result = query(args.data, args.collection, args.index, args.linux_block_io)
+        result = query(args.data, args.collection, args.index, args.linux_block_io, args.observe_storage)
     result.update(phase=args.phase, index=args.index)
     print("ZVEC_COLLECTION_BENCH_RESULT " + json.dumps(result), flush=True)
 

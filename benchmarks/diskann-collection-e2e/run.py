@@ -69,7 +69,7 @@ def result_rows(text):
     ]
 
 
-def run_phase(transport, launch, output, phase, index, trial=None):
+def run_phase(transport, launch, output, phase, index, trial=None, observe_storage=False):
     tag = f"{index}-{phase}" if trial is None else f"{index}-{phase}-{trial}"
     launcher, data, collections = launch
     command = [*launcher, phase, index, str(data), str(Path(collections) / index)]
@@ -78,18 +78,29 @@ def run_phase(transport, launch, output, phase, index, trial=None):
         ios_result = Path(collections) / f"{tag}.result"
         command.append(str(ios_result))
     elif transport == "android":
-        command = [*command[:2], shlex.join(command[2:])]
+        env = ["env", "ZVEC_BENCH_QUERY_IO=1"] if observe_storage else []
+        command = [*command[:2], shlex.join([*env, *command[2:]])]
+    elif observe_storage:
+        command.append("--observe-storage")
     log = output / f"{tag}.log"
     print(f"Running {tag}", flush=True)
+    ios_observation = None
     with log.open("w", encoding="utf-8") as stream:
-        status = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=3600)
+        if ios_result and observe_storage:
+            from storage_observation import run_ios_observed
+
+            returncode, ios_observation = run_ios_observed(
+                command, os.environ, stream, ios_result.with_suffix(".io"), ios_result
+            )
+        else:
+            returncode = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=3600).returncode
     log_text = log.read_text(encoding="utf-8", errors="replace")
     rows = result_rows(log_text)
     launch_race = (
-        transport == "ios" and status.returncode == 3
+        transport == "ios" and returncode == 3
         and "FBSOpenApplicationServiceErrorDomain" in log_text
     )
-    if ios_result and (status.returncode == 0 or launch_race) and (launch_race or not rows):
+    if ios_result and (returncode == 0 or launch_race) and (launch_race or not rows):
         deadline = time.monotonic() + 15
         while not ios_result.is_file() and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -100,12 +111,14 @@ def run_phase(transport, launch, output, phase, index, trial=None):
                 stream.write(f"\nRecovered simulator result\n{recovered}")
         else:
             launch_race = False
-    if (status.returncode and not launch_race) or len(rows) != 1:
+    if (returncode and not launch_race) or len(rows) != 1:
         print(log_text[-6000:], flush=True)
-        raise RuntimeError(f"{tag}: code={status.returncode}, results={len(rows)}. See {log}.")
+        raise RuntimeError(f"{tag}: code={returncode}, results={len(rows)}. See {log}.")
     row = rows[0]
     if row["index"] != index or row["phase"] != phase:
         raise RuntimeError(f"Unexpected result for {tag}")
+    if ios_observation is not None:
+        row["storage_observation"] = ios_observation
     (output / f"{tag}.json").write_text(json.dumps(row, indent=2) + "\n")
     print(json.dumps(row, separators=(",", ":")), flush=True)
     return row
@@ -121,10 +134,12 @@ def measure(args, launch, output, dataset):
         raise RuntimeError("A build did not verify the dataset and complete index")
 
     queries = {index: [] for index in INDEXES}
+    observe = args.observe_storage and (args.transport != "native" or sys.platform in ("darwin", "win32"))
     for trial in range(1, args.trials + 1):
         order = INDEXES if trial % 2 else tuple(reversed(INDEXES))
         for index in order:
-            row = run_phase(args.transport, launch, output, "query", index, trial)
+            row = run_phase(args.transport, launch, output, "query", index, trial,
+                            observe_storage=observe and index == "diskann")
             if (row["vectors"] != dataset["vectors"] or row["dimension"] != dataset["dimension"]
                     or row["queries_per_pass"] != dataset["evaluation_queries"]):
                 raise RuntimeError(f"{index} queried the wrong dataset")
@@ -143,6 +158,8 @@ def main():
     parser.add_argument("--transport", choices=["native", "android", "ios"], default="native")
     parser.add_argument("--device", help="Simulator UDID when --transport=ios")
     parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--observe-storage", action="store_true",
+                        help="Collect paired I/O observations during non-Linux DiskANN queries")
     args = parser.parse_args()
     if args.trials < 1 or args.trials % 2 == 0:
         parser.error("--trials must be a positive odd number")
@@ -150,6 +167,8 @@ def main():
         parser.error("--transport=ios requires --device")
     if args.python_sdk and args.transport != "native":
         parser.error("--python-sdk requires native transport")
+    if args.observe_storage and args.transport == "native" and not args.python_sdk:
+        parser.error("Native storage observation requires --python-sdk")
 
     binary = args.binary.resolve(strict=True) if args.binary else None
     dataset_dir = args.data.resolve(strict=True)
@@ -180,6 +199,7 @@ def main():
         "version": "v0.8.1",
         "measurement": "Public Collection API; serial calls with one query thread",
         "sdk": "Python wheel" if args.python_sdk else "C++",
+        "storage_observation_requested": args.observe_storage,
         "label": args.label,
         "transport": args.transport,
         "coordinator_platform": platform.platform(),

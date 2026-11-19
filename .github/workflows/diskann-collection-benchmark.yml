@@ -78,7 +78,7 @@ jobs:
           path: benchmark-data
       - name: Run Collection benchmark
         run: >-
-          python benchmarks/diskann-collection-e2e/run.py --python-sdk
+          python benchmarks/diskann-collection-e2e/run.py --python-sdk --observe-storage
           --data benchmark-data --output benchmark-results --label ${{ matrix.label }}
       - name: Measure DiskANN QPS and read IOPS under the same Linux query windows
         if: runner.os == 'Linux'
@@ -147,7 +147,7 @@ jobs:
             python benchmarks/diskann-collection-e2e/run.py
             --binary build-benchmark/bin/zvec_collection_benchmark
             --data benchmark-data --output benchmark-results
-            --label android-x86_64-emulator --transport android
+            --label android-x86_64-emulator --transport android --observe-storage
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -168,7 +168,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install build tools
-        run: python -m pip install cmake==3.30.0 ninja==1.11.1
+        run: python -m pip install cmake==3.30.0 ninja==1.11.1 psutil==7.2.2
       - name: Build benchmark with the iOS static SDK
         run: |
           cmake -S . -B build-benchmark -G Ninja \
@@ -197,7 +197,7 @@ jobs:
           python benchmarks/diskann-collection-e2e/run.py \
             --binary build-benchmark/bin/zvec_collection_benchmark.app \
             --data benchmark-data --output benchmark-results \
-            --label ios-arm64-simulator --transport ios --device "$BENCH_DEVICE"
+            --label ios-arm64-simulator --transport ios --device "$BENCH_DEVICE" --observe-storage
       - uses: actions/upload-artifact@v7
         if: always()
         with:

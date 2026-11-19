@@ -4,15 +4,18 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -23,8 +26,13 @@
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/task_info.h>
+#include <unistd.h>
 #else
 #include <unistd.h>
+#endif
+#if defined(__ANDROID__)
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #endif
 
 #include <zvec/db/collection.h>
@@ -191,6 +199,86 @@ double Quantile(const std::vector<double> &sorted, double percentile) {
   return sorted[static_cast<size_t>(std::ceil(percentile * sorted.size())) - 1];
 }
 
+#if defined(__APPLE__)
+void ObserveSimulatorBoundary(const std::filesystem::path &control, const char *point) {
+  const auto temporary = control / (std::string(point) + ".tmp");
+  {
+    std::ofstream marker(temporary);
+    marker << getpid() << '\n';
+    marker.close();
+    if (!marker) throw std::runtime_error("Could not write simulator I/O marker");
+  }
+  std::filesystem::rename(temporary, control / point);
+  const auto resume = control / (std::string(point) + ".go");
+  const auto deadline = Clock::now() + std::chrono::seconds(30);
+  while (!std::filesystem::exists(resume)) {
+    if (Clock::now() >= deadline) {
+      throw std::runtime_error("Simulator I/O observer did not acknowledge query boundary");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+#endif
+
+#if defined(__ANDROID__)
+struct AndroidReadCounters {
+  std::optional<uint64_t> read_ios;
+  std::optional<uint64_t> device_bytes;
+  std::optional<uint64_t> process_bytes;
+};
+
+std::string AndroidDevice(const std::string &collection) {
+  struct stat info {};
+  if (stat(collection.c_str(), &info) != 0) {
+    throw std::runtime_error("Could not identify the Android collection device");
+  }
+  return std::to_string(major(info.st_dev)) + ":" + std::to_string(minor(info.st_dev));
+}
+
+AndroidReadCounters ReadAndroidCounters(const std::string &device) {
+  AndroidReadCounters result;
+  uint64_t reads, merges, sectors;
+  std::ifstream disk("/sys/dev/block/" + device + "/stat");
+  if (disk >> reads >> merges >> sectors) {
+    result.read_ios = reads;
+    result.device_bytes = sectors * 512;
+  } else {
+    std::ifstream devices("/proc/diskstats");
+    for (std::string line; std::getline(devices, line);) {
+      std::istringstream row(line);
+      unsigned major_id, minor_id;
+      std::string name;
+      if (row >> major_id >> minor_id >> name >> reads >> merges >> sectors) {
+        if (std::to_string(major_id) + ":" + std::to_string(minor_id) == device) {
+          result.read_ios = reads;
+          result.device_bytes = sectors * 512;
+          break;
+        }
+      }
+    }
+  }
+  std::ifstream process("/proc/self/io");
+  std::string key;
+  uint64_t count;
+  while (process >> key >> count) {
+    if (key == "read_bytes:") {
+      result.process_bytes = count;
+      break;
+    }
+  }
+  return result;
+}
+
+void WriteDifference(std::ostream &out, std::optional<uint64_t> before,
+                     std::optional<uint64_t> after) {
+  if (before && after && *after >= *before) {
+    out << *after - *before;
+  } else {
+    out << "null";
+  }
+}
+#endif
+
 void Query(const std::filesystem::path &data, const std::string &path, bool diskann,
            std::ostream &result) {
   const auto base_rows = ReadDocCount(data / "base.fbin");
@@ -268,6 +356,18 @@ void Query(const std::filesystem::path &data, const std::string &path, bool disk
   latencies.reserve((queries.rows - kCalibration) * kPasses);
   size_t correct = 0;
   double elapsed = 0;
+#if defined(__ANDROID__)
+  const bool observe = diskann && std::getenv("ZVEC_BENCH_QUERY_IO");
+  const auto device = observe ? AndroidDevice(path) : std::string{};
+  const auto before_io = observe ? ReadAndroidCounters(device) : AndroidReadCounters{};
+#elif defined(__APPLE__)
+  const char *control = diskann ? std::getenv("ZVEC_BENCH_IO_CONTROL") : nullptr;
+  const bool observe = control != nullptr;
+  if (observe) ObserveSimulatorBoundary(control, "before");
+#else
+  const bool observe = false;
+#endif
+  const auto query_begin = Clock::now();
   for (uint32_t pass = 0; pass < kPasses; ++pass) {
     for (uint32_t i = kCalibration; i < queries.rows; ++i) {
       double latency;
@@ -277,6 +377,13 @@ void Query(const std::filesystem::path &data, const std::string &path, bool disk
       if (i % 50 == 0) sampled_peak = std::max(sampled_peak, ProcessRss());
     }
   }
+  const auto query_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - query_begin).count();
+#if defined(__ANDROID__)
+  const auto after_io = observe ? ReadAndroidCounters(device) : AndroidReadCounters{};
+#elif defined(__APPLE__)
+  if (observe) ObserveSimulatorBoundary(control, "after");
+#endif
   const auto after_query = ProcessRss();
   sampled_peak = std::max(sampled_peak, after_query);
   const auto recall = static_cast<double>(correct) / (kTopK * latencies.size());
@@ -296,7 +403,21 @@ void Query(const std::filesystem::path &data, const std::string &path, bool disk
             << ",\"after_query_rss_bytes\":" << after_query
             << ",\"sampled_peak_query_rss_bytes\":" << sampled_peak
             << ",\"query_rss_delta_bytes\":"
-            << static_cast<int64_t>(after_query) - static_cast<int64_t>(baseline) << "}\n";
+            << static_cast<int64_t>(after_query) - static_cast<int64_t>(baseline);
+  if (observe) {
+    result << ",\"query_window_ns\":" << query_ns;
+#if defined(__ANDROID__)
+    result << ",\"storage_observation\":{\"scope\":\"Android guest device " << device
+           << "\",\"cache_policy\":\"buffered DiskANN pread\",\"device_read_ios\":";
+    WriteDifference(result, before_io.read_ios, after_io.read_ios);
+    result << ",\"device_read_bytes\":";
+    WriteDifference(result, before_io.device_bytes, after_io.device_bytes);
+    result << ",\"process_storage_read_bytes\":";
+    WriteDifference(result, before_io.process_bytes, after_io.process_bytes);
+    result << "}";
+#endif
+  }
+  result << "}\n";
 }
 
 }  // namespace
