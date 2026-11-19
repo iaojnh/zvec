@@ -12,6 +12,7 @@ import shlex
 import shutil
 from statistics import median
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -26,7 +27,11 @@ IOS_BUNDLE = "com.zvec.zvec_collection_benchmark"
 @contextmanager
 def prepare_transport(args, binary, dataset_dir, output):
     if args.transport == "native":
-        yield [str(binary)], str(dataset_dir), str(output)
+        if args.python_sdk:
+            command = [sys.executable, str(Path(__file__).with_name("python_benchmark.py").resolve())]
+        else:
+            command = [str(binary)]
+        yield command, str(dataset_dir), str(output)
         return
     if args.transport == "android":
         remote = f"/data/local/tmp/zvec-collection-{uuid.uuid4().hex}"
@@ -129,7 +134,9 @@ def measure(args, launch, output, dataset):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
+    sdk = parser.add_mutually_exclusive_group(required=True)
+    sdk.add_argument("--binary", type=Path, help="Native C++ benchmark executable or iOS app")
+    sdk.add_argument("--python-sdk", action="store_true", help="Run against the installed Zvec wheel")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--label", default=f"{platform.system().lower()}-{platform.machine().lower()}")
@@ -141,8 +148,10 @@ def main():
         parser.error("--trials must be a positive odd number")
     if args.transport == "ios" and not args.device:
         parser.error("--transport=ios requires --device")
+    if args.python_sdk and args.transport != "native":
+        parser.error("--python-sdk requires native transport")
 
-    binary = args.binary.resolve(strict=True)
+    binary = args.binary.resolve(strict=True) if args.binary else None
     dataset_dir = args.data.resolve(strict=True)
     dataset = json.loads((dataset_dir / "dataset.json").read_text(encoding="utf-8"))
     for name in FIXTURE_FILES:
@@ -169,7 +178,8 @@ def main():
     )
     report = {
         "version": "v0.8.1",
-        "measurement": "C++ public Collection API; serial calls with one query thread",
+        "measurement": "Public Collection API; serial calls with one query thread",
+        "sdk": "Python wheel" if args.python_sdk else "C++",
         "label": args.label,
         "transport": args.transport,
         "coordinator_platform": platform.platform(),

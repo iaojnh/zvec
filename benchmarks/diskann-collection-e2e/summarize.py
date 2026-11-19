@@ -28,16 +28,16 @@ def summarize(input_dir):
     )
     yield ""
     yield (
-        "| Platform | Baseline RSS (MB) | Post-query RSS (MB) | Query increment (MB) | "
+        "| Platform | SDK | Baseline RSS (MB) | Post-query RSS (MB) | Query increment (MB) | "
         "DiskANN saves (MB) | Recall@10 (%) | P95 (ms) | QPS |"
     )
-    yield "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    yield "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
 
     fixtures = None
     for label in PLATFORMS:
         path = input_dir / f"collection-e2e-result-{label}" / "summary.json"
         if not path.is_file():
-            yield f"| {label} | No result | — | — | — | — | — | — |"
+            yield f"| {label} | — | No result | — | — | — | — | — | — |"
             continue
         report = json.loads(path.read_text(encoding="utf-8"))
         revision = os.environ.get("GITHUB_SHA")
@@ -53,12 +53,13 @@ def summarize(input_dir):
         elif fixtures != dataset["sha256"]:
             raise ValueError(f"Dataset checksums differ across platforms: {path}")
         if not report["comparable_recall"]:
-            yield f"| {label} | Recall check failed | — | — | — | — | — | — |"
+            yield f"| {label} | {report['sdk']} | Recall check failed | — | — | — | — | — | — |"
             continue
 
         hnsw, diskann = (report["query_medians"][name] for name in ("hnsw", "diskann"))
         columns = (
             label,
+            report["sdk"],
             format_pair(hnsw, diskann, "baseline_rss_bytes", 1e6),
             format_pair(hnsw, diskann, "after_query_rss_bytes", 1e6),
             format_pair(hnsw, diskann, "query_rss_delta_bytes", 1e6),
