@@ -1,6 +1,7 @@
 """Execute one Collection benchmark phase against the installed Python wheel."""
 
 import argparse
+from contextlib import ExitStack
 from importlib.metadata import version
 import json
 import math
@@ -85,7 +86,7 @@ def build(data, path, index):
     return dict(vectors=len(base), index_complete=True, write_ms=write_ms, optimize_ms=optimize_ms)
 
 
-def query(data, path, index, linux_block_io=False, observe_storage=False):
+def query(data, path, index, linux_block_io=False, observe_storage=False, cold_storage=False):
     with (data / "base.fbin").open("rb") as stream:
         count, dimension = matrix_shape(stream)
     matrix = read_matrix(data / "queries.fbin", "<f4", 20_000)
@@ -114,7 +115,8 @@ def query(data, path, index, linux_block_io=False, observe_storage=False):
             raise RuntimeError("Invalid top-k result")
         return len(ids & neighbors[row])
 
-    try:
+    with ExitStack() as resources:
+        resources.callback(collection.close)
         check_collection(collection, index, count)
         for budget in BUDGETS:
             param = query_param(budget)
@@ -125,8 +127,15 @@ def query(data, path, index, linux_block_io=False, observe_storage=False):
             raise RuntimeError("Could not reach 95% calibration recall")
 
         held_out = range(CALIBRATION, len(matrix))
-        for row in held_out:
-            evaluate(row, param)
+        if cold_storage:
+            from storage_observation import apple_index_cache, process_disk_bytes
+
+            evict = resources.enter_context(apple_index_cache(Path(path)))
+            cold_reads = []
+            pid = os.getpid()
+        else:
+            for row in held_out:
+                evaluate(row, param)
         after_warmup = process.memory_info().rss
         peak = after_warmup
         latencies = []
@@ -144,7 +153,15 @@ def query(data, path, index, linux_block_io=False, observe_storage=False):
             window_start = perf_counter_ns()
         for _ in range(PASSES):
             for row in held_out:
+                if cold_storage:
+                    evict()
+                    storage_before = process_disk_bytes(pid)
                 correct += evaluate(row, param, latencies)
+                if cold_storage:
+                    storage_after = process_disk_bytes(pid)
+                    if storage_before is None or storage_after is None or storage_after <= storage_before:
+                        raise RuntimeError(f"Cold query {row} has no accounted process storage reads")
+                    cold_reads.append(storage_after - storage_before)
                 if row % 50 == 0:
                     peak = max(peak, process.memory_info().rss)
         if linux_block_io or observe_storage:
@@ -154,8 +171,6 @@ def query(data, path, index, linux_block_io=False, observe_storage=False):
         if observe_storage:
             observation = desktop_observation(io_start, desktop_snapshot(os.getpid()))
         after_query = process.memory_info().rss
-    finally:
-        collection.close()
 
     latencies.sort()
     result = dict(
@@ -182,6 +197,13 @@ def query(data, path, index, linux_block_io=False, observe_storage=False):
     if observe_storage:
         result["query_window_ns"] = window_ns
         result["storage_observation"] = observation
+    if cold_storage:
+        result["cold_storage"] = dict(
+            verified_queries=len(cold_reads),
+            query_ns=sum(latencies),
+            storage_read_bytes=sum(cold_reads),
+            min_storage_read_bytes=min(cold_reads),
+        )
     return result
 
 
@@ -193,6 +215,7 @@ def main():
     parser.add_argument("collection")
     parser.add_argument("--linux-block-io", action="store_true")
     parser.add_argument("--observe-storage", action="store_true")
+    parser.add_argument("--cold-storage", action="store_true")
     args = parser.parse_args()
     if args.linux_block_io and (args.phase, args.index) != ("query", "diskann"):
         parser.error("--linux-block-io applies to the DiskANN query phase")
@@ -200,13 +223,18 @@ def main():
                                  or (args.phase, args.index) != ("query", "diskann")
                                  or args.linux_block_io):
         parser.error("--observe-storage applies to macOS and Windows DiskANN queries")
+    if args.cold_storage and (sys.platform != "darwin" or not args.observe_storage):
+        parser.error("--cold-storage requires a macOS DiskANN query with --observe-storage")
     if version("zvec") != "0.8.1":
         raise RuntimeError("This benchmark requires the Zvec 0.8.1 wheel")
     zvec.init(query_threads=1, optimize_threads=2)
     if args.phase == "build":
         result = build(args.data, args.collection, args.index)
     else:
-        result = query(args.data, args.collection, args.index, args.linux_block_io, args.observe_storage)
+        result = query(
+            args.data, args.collection, args.index,
+            args.linux_block_io, args.observe_storage, args.cold_storage,
+        )
     result.update(phase=args.phase, index=args.index)
     print("ZVEC_COLLECTION_BENCH_RESULT " + json.dumps(result), flush=True)
 

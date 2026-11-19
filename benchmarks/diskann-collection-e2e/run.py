@@ -69,8 +69,10 @@ def result_rows(text):
     ]
 
 
-def run_phase(transport, launch, output, phase, index, trial=None, observe_storage=False):
-    tag = f"{index}-{phase}" if trial is None else f"{index}-{phase}-{trial}"
+def run_phase(transport, launch, output, phase, index, trial=None, observe_storage=False, cold_storage=False):
+    tag = f"{index}-cold-{phase}" if cold_storage else f"{index}-{phase}"
+    if trial is not None:
+        tag += f"-{trial}"
     launcher, data, collections = launch
     command = [*launcher, phase, index, str(data), str(Path(collections) / index)]
     ios_result = None
@@ -79,9 +81,13 @@ def run_phase(transport, launch, output, phase, index, trial=None, observe_stora
         command.append(str(ios_result))
     elif transport == "android":
         env = ["env", "ZVEC_BENCH_QUERY_IO=1"] if observe_storage else []
+        if cold_storage:
+            env.append("ZVEC_BENCH_COLD_STORAGE=1")
         command = [*command[:2], shlex.join([*env, *command[2:]])]
     elif observe_storage:
         command.append("--observe-storage")
+        if cold_storage:
+            command.append("--cold-storage")
     log = output / f"{tag}.log"
     print(f"Running {tag}", flush=True)
     ios_observation = None
@@ -89,8 +95,11 @@ def run_phase(transport, launch, output, phase, index, trial=None, observe_stora
         if ios_result and observe_storage:
             from storage_observation import run_ios_observed
 
+            env = dict(os.environ)
+            if cold_storage:
+                env["SIMCTL_CHILD_ZVEC_BENCH_COLD_STORAGE"] = "1"
             returncode, ios_observation = run_ios_observed(
-                command, os.environ, stream, ios_result.with_suffix(".io"), ios_result
+                command, env, stream, ios_result.with_suffix(".io"), ios_result
             )
         else:
             returncode = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=3600).returncode
@@ -119,6 +128,15 @@ def run_phase(transport, launch, output, phase, index, trial=None, observe_stora
         raise RuntimeError(f"Unexpected result for {tag}")
     if ios_observation is not None:
         row["storage_observation"] = ios_observation
+    if cold_storage:
+        cold = row.get("cold_storage", {})
+        expected = row["queries_per_pass"] * row["passes"]
+        if transport == "ios" and ios_observation is not None:
+            cold["storage_read_bytes"] = ios_observation.get("process_storage_read_bytes")
+        if (cold.get("verified_queries") != expected or (cold.get("query_ns") or 0) <= 0
+                or (cold.get("storage_read_bytes") or 0) <= 0
+                or row.get("recall_at_10", 0) < 0.93):
+            raise RuntimeError(f"Cold queries were not verified for {tag}. See {log}.")
     (output / f"{tag}.json").write_text(json.dumps(row, indent=2) + "\n")
     print(json.dumps(row, separators=(",", ":")), flush=True)
     return row
@@ -160,6 +178,8 @@ def main():
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--observe-storage", action="store_true",
                         help="Collect paired I/O observations during non-Linux DiskANN queries")
+    parser.add_argument("--cold-storage", action="store_true",
+                        help="Repeat DiskANN queries after evicting index-file pages before each query")
     args = parser.parse_args()
     if args.trials < 1 or args.trials % 2 == 0:
         parser.error("--trials must be a positive odd number")
@@ -169,6 +189,9 @@ def main():
         parser.error("--python-sdk requires native transport")
     if args.observe_storage and args.transport == "native" and not args.python_sdk:
         parser.error("Native storage observation requires --python-sdk")
+    if args.cold_storage and (not args.observe_storage
+                              or (args.transport == "native" and sys.platform != "darwin")):
+        parser.error("--cold-storage requires --observe-storage on macOS, Android, or iOS")
 
     binary = args.binary.resolve(strict=True) if args.binary else None
     dataset_dir = args.data.resolve(strict=True)
@@ -179,8 +202,22 @@ def main():
                 raise ValueError(f"Dataset checksum mismatch: {name}")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    cold_trials = []
+    cold_error = None
     with prepare_transport(args, binary, dataset_dir, output) as launch:
         builds, queries = measure(args, launch, output, dataset)
+        if args.cold_storage:
+            try:
+                for trial in range(1, args.trials + 1):
+                    row = run_phase(args.transport, launch, output, "query", "diskann", trial,
+                                    observe_storage=True, cold_storage=True)
+                    if (row["vectors"] != dataset["vectors"] or row["dimension"] != dataset["dimension"]
+                            or row["budget"] != queries["diskann"][0]["budget"]
+                            or row["queries_per_pass"] != dataset["evaluation_queries"]):
+                        raise RuntimeError("Cold query benchmark changed the workload")
+                    cold_trials.append(row)
+            except (RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
+                cold_error = str(error)
 
     medians = {
         index: {
@@ -200,6 +237,9 @@ def main():
         "measurement": "Public Collection API; serial calls with one query thread",
         "sdk": "Python wheel" if args.python_sdk else "C++",
         "storage_observation_requested": args.observe_storage,
+        "cold_storage_requested": args.cold_storage,
+        "cold_storage_trials": cold_trials,
+        "cold_storage_error": cold_error,
         "label": args.label,
         "transport": args.transport,
         "coordinator_platform": platform.platform(),
@@ -216,6 +256,8 @@ def main():
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     if not comparable:
         raise RuntimeError("Recall comparability gate did not pass; raw results retained")
+    if cold_error is not None:
+        raise RuntimeError(cold_error)
 
 
 if __name__ == "__main__":

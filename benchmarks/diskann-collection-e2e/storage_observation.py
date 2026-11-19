@@ -1,7 +1,9 @@
 """Observe query-window storage activity outside the Linux IOPS sweep."""
 
 import ctypes
+from contextlib import ExitStack, contextmanager
 from functools import cache
+import mmap
 from pathlib import Path
 import subprocess
 import sys
@@ -24,6 +26,49 @@ def process_disk_bytes(pid):
         return None
     # rusage_info_v4 has a 16-byte UUID and 16 uint64 fields before diskio_bytesread.
     return ctypes.c_uint64.from_buffer(data, 16 + 16 * 8).value
+
+
+@contextmanager
+def apple_index_cache(collection):
+    """Expose verified per-file eviction without touching the mapped index bytes."""
+    files = sorted(collection.rglob("embedding.index.*.proxima"))
+    if not files:
+        raise ValueError(f"No persisted embedding index in {collection}")
+    lib = ctypes.CDLL(None, use_errno=True)
+    lib.mmap.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int64
+    ]
+    lib.mmap.restype = ctypes.c_void_p
+    lib.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    lib.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+    invalidate_and_sync = 0x02 | 0x10  # Darwin MS_INVALIDATE | MS_SYNC
+
+    with ExitStack() as resources:
+        mappings = []
+        for file in files:
+            size = file.stat().st_size
+            with file.open("rb") as stream:
+                addr = lib.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, stream.fileno(), 0)
+            if addr == ctypes.c_void_p(-1).value:
+                raise OSError(ctypes.get_errno(), f"mmap {file}")
+            resources.callback(lib.munmap, addr, size)
+            pages = (size + mmap.PAGESIZE - 1) // mmap.PAGESIZE
+            mappings.append((file, addr, size, (ctypes.c_ubyte * pages)()))
+
+        def evict():
+            for file, addr, size, residency in mappings:
+                for _ in range(8):
+                    if lib.msync(addr, size, invalidate_and_sync):
+                        raise OSError(ctypes.get_errno(), f"msync {file}")
+                    if lib.mincore(addr, size, residency):
+                        raise OSError(ctypes.get_errno(), f"mincore {file}")
+                    if not any(page & 1 for page in residency):
+                        break
+                else:
+                    raise RuntimeError(f"Index file pages remained resident before query: {file}")
+
+        yield evict
 
 
 def desktop_snapshot(pid):

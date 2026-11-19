@@ -41,6 +41,19 @@ def observed_io_row(label, trials):
     return "| " + " | ".join(columns) + " |"
 
 
+def cold_storage_row(label, trials):
+    measurements = [trial["cold_storage"] for trial in trials]
+    queries = sum(item["verified_queries"] for item in measurements)
+    seconds = sum(item["query_ns"] for item in measurements) / 1e9
+    read_bytes = sum(item["storage_read_bytes"] for item in measurements)
+    p95 = median(trial["p95_ms"] for trial in trials)
+    recall = median(trial["recall_at_10"] for trial in trials)
+    equivalents = (f"{read_bytes / 4096 / seconds:.1f}"
+                   if all("min_storage_read_bytes" in item for item in measurements) else "—")
+    return (f"| {label} | {queries:,} | {queries / seconds:.1f} | {p95:.3f} | {recall:.2%} | "
+            f"{read_bytes / queries / 1024:.1f} | {equivalents} |")
+
+
 def summarize(input_dir):
     yield "## Zvec Collection API benchmark"
     yield ""
@@ -59,6 +72,7 @@ def summarize(input_dir):
 
     fixtures = None
     io_rows = []
+    cold_rows = []
     for label in PLATFORMS:
         path = input_dir / f"collection-e2e-result-{label}" / "summary.json"
         if not path.is_file():
@@ -81,6 +95,11 @@ def summarize(input_dir):
             yield f"| {label} | {report['sdk']} | Recall check failed | — | — | — | — | — | — |"
             continue
 
+        if report.get("cold_storage_requested"):
+            cold_rows.append(
+                f"| {label} | Unverified | — | — | — | — | — |"
+                if report.get("cold_storage_error") else cold_storage_row(label, report["cold_storage_trials"])
+            )
         if row := observed_io_row(label, report.get("query_trials", {}).get("diskann", [])):
             io_rows.append(row)
         elif label not in ("linux-x86_64", "linux-arm64") and report.get("storage_observation_requested"):
@@ -117,6 +136,22 @@ def summarize(input_dir):
                "Process logical reads/s | Process 4 KiB equivalents/s | Process storage KiB/query | Cache policy |")
         yield "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
         yield from io_rows
+
+    if cold_rows:
+        yield ""
+        yield "## DiskANN queries with verified index-page eviction"
+        yield ""
+        yield ("The persisted index files have zero resident pages immediately before each timed query. "
+               "QPS and P95 time only Collection queries. The Android emulator verifies its guest page cache. "
+               "Buffered reads can refill that cache within a query.")
+        yield ""
+        yield ("macOS and Android count process storage bytes across each query. "
+               "The iOS simulator reports host-accounted process bytes across the complete observed phase.")
+        yield ""
+        yield ("| Platform | Verified queries | Query QPS | Median P95 (ms) | Recall@10 | "
+               "Process storage KiB/query | Process 4 KiB equivalents/s |")
+        yield "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+        yield from cold_rows
 
 
 def main():

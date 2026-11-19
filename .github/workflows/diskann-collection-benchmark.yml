@@ -79,6 +79,7 @@ jobs:
       - name: Run Collection benchmark
         run: >-
           python benchmarks/diskann-collection-e2e/run.py --python-sdk --observe-storage
+          ${{ runner.os == 'macOS' && '--cold-storage' || '' }}
           --data benchmark-data --output benchmark-results --label ${{ matrix.label }}
       - name: Measure DiskANN QPS and read IOPS under the same Linux query windows
         if: runner.os == 'Linux'
@@ -147,7 +148,7 @@ jobs:
             python benchmarks/diskann-collection-e2e/run.py
             --binary build-benchmark/bin/zvec_collection_benchmark
             --data benchmark-data --output benchmark-results
-            --label android-x86_64-emulator --transport android --observe-storage
+            --label android-x86_64-emulator --transport android --observe-storage --cold-storage
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -197,7 +198,7 @@ jobs:
           python benchmarks/diskann-collection-e2e/run.py \
             --binary build-benchmark/bin/zvec_collection_benchmark.app \
             --data benchmark-data --output benchmark-results \
-            --label ios-arm64-simulator --transport ios --device "$BENCH_DEVICE" --observe-storage
+            --label ios-arm64-simulator --transport ios --device "$BENCH_DEVICE" --observe-storage --cold-storage
       - uses: actions/upload-artifact@v7
         if: always()
         with:

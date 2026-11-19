@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -33,6 +35,10 @@
 #if defined(__ANDROID__)
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#endif
+#if defined(__ANDROID__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
 #endif
 
 #include <zvec/db/collection.h>
@@ -199,6 +205,70 @@ double Quantile(const std::vector<double> &sorted, double percentile) {
   return sorted[static_cast<size_t>(std::ceil(percentile * sorted.size())) - 1];
 }
 
+#if defined(__ANDROID__) || defined(__APPLE__)
+class IndexCacheMapping {
+ public:
+  explicit IndexCacheMapping(const std::filesystem::path &file)
+      : path_(file.string()),
+        bytes_(std::filesystem::file_size(file)),
+        residency_((bytes_ + getpagesize() - 1) / getpagesize()) {
+    fd_ = open(path_.c_str(), O_RDONLY);
+    if (fd_ == -1) Fail(errno, "open");
+#if defined(__ANDROID__)
+    // DONTNEED only removes clean pages.
+    if (fsync(fd_) != 0) {
+      const int error = errno;
+      close(fd_);
+      Fail(error, "fsync");
+    }
+#endif
+    address_ = mmap(nullptr, bytes_, PROT_READ, MAP_SHARED, fd_, 0);
+    if (address_ == MAP_FAILED) {
+      const int error = errno;
+      close(fd_);
+      Fail(error, "mmap");
+    }
+  }
+
+  ~IndexCacheMapping() {
+    munmap(address_, bytes_);
+    close(fd_);
+  }
+
+  IndexCacheMapping(const IndexCacheMapping &) = delete;
+  IndexCacheMapping &operator=(const IndexCacheMapping &) = delete;
+
+  void Evict() {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+#if defined(__ANDROID__)
+      const int error = posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+      if (error) Fail(error, "posix_fadvise");
+      auto *pages = residency_.data();
+#else
+      if (msync(address_, bytes_, MS_INVALIDATE | MS_SYNC) != 0) Fail(errno, "msync");
+      auto *pages = reinterpret_cast<char *>(residency_.data());
+#endif
+      if (mincore(address_, bytes_, pages) != 0) Fail(errno, "mincore");
+      if (std::none_of(residency_.begin(), residency_.end(), [](auto page) { return page & 1; })) {
+        return;
+      }
+    }
+    throw std::runtime_error("Index file pages remained resident before query: " + path_);
+  }
+
+ private:
+  [[noreturn]] void Fail(int error, const char *operation) const {
+    throw std::system_error(error, std::generic_category(), operation + (" " + path_));
+  }
+
+  std::string path_;
+  size_t bytes_;
+  std::vector<unsigned char> residency_;
+  int fd_;
+  void *address_;
+};
+#endif
+
 #if defined(__APPLE__)
 void ObserveSimulatorBoundary(const std::filesystem::path &control, const char *point) {
   const auto temporary = control / (std::string(point) + ".tmp");
@@ -226,6 +296,16 @@ struct AndroidReadCounters {
   std::optional<uint64_t> device_bytes;
   std::optional<uint64_t> process_bytes;
 };
+
+std::optional<uint64_t> AndroidProcessReadBytes() {
+  std::ifstream process("/proc/self/io");
+  std::string key;
+  uint64_t count;
+  while (process >> key >> count) {
+    if (key == "read_bytes:") return count;
+  }
+  return std::nullopt;
+}
 
 std::string AndroidDevice(const std::string &collection) {
   struct stat info {};
@@ -257,15 +337,7 @@ AndroidReadCounters ReadAndroidCounters(const std::string &device) {
       }
     }
   }
-  std::ifstream process("/proc/self/io");
-  std::string key;
-  uint64_t count;
-  while (process >> key >> count) {
-    if (key == "read_bytes:") {
-      result.process_bytes = count;
-      break;
-    }
-  }
+  result.process_bytes = AndroidProcessReadBytes();
   return result;
 }
 
@@ -281,6 +353,16 @@ void WriteDifference(std::ostream &out, std::optional<uint64_t> before,
 
 void Query(const std::filesystem::path &data, const std::string &path, bool diskann,
            std::ostream &result) {
+#if defined(__ANDROID__) || defined(__APPLE__)
+  const bool cold = diskann && std::getenv("ZVEC_BENCH_COLD_STORAGE");
+  std::vector<std::unique_ptr<IndexCacheMapping>> cache_mappings;
+#else
+  const bool cold = false;
+#endif
+#if defined(__ANDROID__)
+  uint64_t cold_storage_bytes = 0;
+  uint64_t cold_min_bytes = UINT64_MAX;
+#endif
   const auto base_rows = ReadDocCount(data / "base.fbin");
   const auto queries = ReadMatrix<float>(data / "queries.fbin", 20'000);
   const auto truth = ReadMatrix<uint32_t>(data / "neighbors.ibin", 20'000);
@@ -349,7 +431,21 @@ void Query(const std::filesystem::path &data, const std::string &path, bool disk
   }
   if (!budget) throw std::runtime_error("Could not reach 95% calibration recall");
 
-  for (uint32_t i = kCalibration; i < queries.rows; ++i) eval(i, nullptr);
+  if (!cold) {
+    for (uint32_t i = kCalibration; i < queries.rows; ++i) eval(i, nullptr);
+  }
+#if defined(__ANDROID__) || defined(__APPLE__)
+  if (cold) {
+    for (const auto &file : std::filesystem::recursive_directory_iterator(path)) {
+      const auto name = file.path().filename().string();
+      if (file.is_regular_file() && name.rfind("embedding.index.", 0) == 0 &&
+          file.path().extension() == ".proxima") {
+        cache_mappings.push_back(std::make_unique<IndexCacheMapping>(file.path()));
+      }
+    }
+    if (cache_mappings.empty()) throw std::runtime_error("No persisted DiskANN index files found");
+  }
+#endif
   const auto after_warmup = ProcessRss();
   auto sampled_peak = after_warmup;
   std::vector<double> latencies;
@@ -370,8 +466,25 @@ void Query(const std::filesystem::path &data, const std::string &path, bool disk
   const auto query_begin = Clock::now();
   for (uint32_t pass = 0; pass < kPasses; ++pass) {
     for (uint32_t i = kCalibration; i < queries.rows; ++i) {
+#if defined(__ANDROID__) || defined(__APPLE__)
+      for (const auto &mapping : cache_mappings) mapping->Evict();
+#endif
+#if defined(__ANDROID__)
+      const auto cold_before = cold ? AndroidProcessReadBytes() : std::nullopt;
+#endif
       double latency;
       correct += eval(i, &latency);
+#if defined(__ANDROID__)
+      if (cold) {
+        const auto cold_after = AndroidProcessReadBytes();
+        if (!cold_before || !cold_after || *cold_after <= *cold_before) {
+          throw std::runtime_error("Cold query has no accounted Android storage reads");
+        }
+        const auto bytes = *cold_after - *cold_before;
+        cold_storage_bytes += bytes;
+        cold_min_bytes = std::min(cold_min_bytes, bytes);
+      }
+#endif
       latencies.push_back(latency);
       elapsed += latency;
       if (i % 50 == 0) sampled_peak = std::max(sampled_peak, ProcessRss());
@@ -416,6 +529,15 @@ void Query(const std::filesystem::path &data, const std::string &path, bool disk
     WriteDifference(result, before_io.process_bytes, after_io.process_bytes);
     result << "}";
 #endif
+  }
+  if (cold) {
+    result << ",\"cold_storage\":{\"verified_queries\":" << latencies.size()
+           << ",\"query_ns\":" << static_cast<uint64_t>(elapsed * 1e6);
+#if defined(__ANDROID__)
+    result << ",\"storage_read_bytes\":" << cold_storage_bytes
+           << ",\"min_storage_read_bytes\":" << cold_min_bytes;
+#endif
+    result << "}";
   }
   result << "}\n";
 }
