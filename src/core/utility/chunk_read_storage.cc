@@ -185,6 +185,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     bool reusable(size_t, size_t) const noexcept override {
       return false;
     }
+    bool release_for_parsing_retry() noexcept override {
+      // Only source cache pins can make the streamed path cheaper. Execution
+      // workspaces remain funded so a failed reopen preserves later reads.
+      return readers.load(std::memory_order_acquire) == 1 && single &&
+             single->refs.load(std::memory_order_acquire) == 1;
+    }
     void reset() noexcept override {
       if (single) owner->unpin(*single, single_key);
       if (view) {
@@ -1052,8 +1058,17 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     if (single && !view) {
       if (!first && populate && cache_limit != 0)
         first = entry(offset / chunk_bytes, true);
+      // Parsing needs its descriptor even on the borrowed-cache path. Admit
+      // it before pinning, so a cache hit cannot block its own allocation.
+      auto prepared = populate ? nullptr : lease(out, nullptr);
       if (auto *item = source(first)) {
-        out.lease = lease(out, nullptr, item, reinterpret_cast<size_t>(item));
+        if (prepared) {
+          prepared->single = item;
+          prepared->single_key = reinterpret_cast<size_t>(item);
+          out.lease = std::move(prepared);
+        } else {
+          out.lease = lease(out, nullptr, item, reinterpret_cast<size_t>(item));
+        }
         out.spans.push_back(
             {item->data.load(std::memory_order_relaxed) + offset - item->offset,
              len});

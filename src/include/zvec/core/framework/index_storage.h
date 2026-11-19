@@ -51,6 +51,11 @@ class IndexStorage : public IndexModule {
       virtual void retain() noexcept = 0;
       virtual void release() noexcept = 0;
       virtual bool reusable(size_t bytes, size_t alignment) const noexcept = 0;
+      // The parser has stopped consuming this input. Cache-backed leases may
+      // allow retry after releasing this reader; execution workspaces remain.
+      virtual bool release_for_parsing_retry() noexcept {
+        return false;
+      }
     };
 
     enum MemoryBlockType {
@@ -125,6 +130,14 @@ class IndexStorage : public IndexModule {
       return type_ == MBT_HEAP_SCRATCH && data_ && scratch_capacity_ >= bytes &&
              (!alignment ||
               reinterpret_cast<uintptr_t>(data_) % alignment == 0);
+    }
+
+    bool release_for_parsing_retry() noexcept {
+      if (type_ != MBT_BUFFERPOOL &&
+          !(scratch_lease_ && scratch_lease_->release_for_parsing_retry()))
+        return false;
+      reset();
+      return true;
     }
 
     //! Keep a read-only file mapping alive while this view is retained.

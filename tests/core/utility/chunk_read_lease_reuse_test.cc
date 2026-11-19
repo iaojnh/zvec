@@ -287,6 +287,8 @@ class MetadataAdmissionTest : public testing::Test {
       return failed_ ? IndexError_ReadData : parent_->read_error();
     }
     size_t fetch(size_t offset, void *data, size_t size) const override {
+      if (offset == 0 && size == sizeof(IndexFormat::MetaHeader))
+        ++fetched_headers;
       failed_ = calls++ >= fail_at;
       return failed_ ? 0 : parent_->fetch(offset, data, size);
     }
@@ -297,8 +299,17 @@ class MetadataAdmissionTest : public testing::Test {
     }
     size_t read_for_parsing(size_t offset, IndexStorage::MemoryBlock &data,
                             size_t size) override {
+      if (offset == 0 && size == sizeof(IndexFormat::MetaHeader))
+        ++parsed_headers;
       failed_ = calls++ >= fail_at;
-      return failed_ ? 0 : parent_->read_for_parsing(offset, data, size);
+      const size_t got =
+          failed_ ? 0 : parent_->read_for_parsing(offset, data, size);
+      if (retain_input && got > ailego::MemoryLimitPool::page_buffer_size()) {
+        escaped = data;
+        escaped_offset = offset;
+        escaped_size = got;
+      }
+      return got;
     }
     size_t write(size_t, const void *, size_t) override {
       return 0;
@@ -310,8 +321,11 @@ class MetadataAdmissionTest : public testing::Test {
     Pointer clone() override {
       return parent_->clone();
     }
-    mutable size_t calls{0};
+    mutable size_t calls{0}, parsed_headers{0}, fetched_headers{0};
     size_t fail_at{std::numeric_limits<size_t>::max()};
+    bool retain_input{false};
+    IndexStorage::MemoryBlock escaped;
+    size_t escaped_offset{0}, escaped_size{0};
 
    private:
     Pointer parent_;
@@ -394,7 +408,9 @@ class MetadataAdmissionTest : public testing::Test {
       ASSERT_EQ(0, leaf->append(names.back(), 1, 0, 0));
     }
     ASSERT_EQ(0, leaf->close());
-    if (twice) ASSERT_EQ(0, middle->close());
+    if (twice) {
+      ASSERT_EQ(0, middle->close());
+    }
     ASSERT_EQ(0, dumper->close());
     if (!mirror_memory) return;
     // The same package also exercises the in-memory parent implementation.
@@ -728,32 +744,46 @@ TEST_F(MetadataAdmissionTest, ChunkParserPreservesSuccessfulBudgets) {
   ASSERT_EQ(0, pool.init(128UL << 20));
   ailego::MemoryLimitPoolTestPeer::stop_background(pool);
   const size_t page = ailego::MemoryLimitPool::page_buffer_size();
-  const struct Shape {
+  struct Shape {
     bool adaptive, warm, funded;
     size_t window, cache, count, name_bytes;
     size_t chunk_bytes{0};
-  } shapes[] = {
-      {true, false, false, page, 0, 1, 32UL << 20},
-      {true, false, false, page, 8UL << 20, 1, 2UL << 20},
-      {true, true, false, page, 8UL << 20, 1, 2UL << 20},
-      {false, false, false, 8UL << 20, 8UL << 20, 1, 2UL << 20},
-      {false, true, false, 8UL << 20, 8UL << 20, 1, 2UL << 20},
-      {true, false, false, page, 8UL << 20, 512, 4096},
-      {true, false, true, page, 0, 1, 2UL << 20},
-      {false, true, false, 8UL << 20, 8UL << 20, 1, 2UL << 20,
-       4UL << 20}};
+    bool descriptor{false}, held{false}, empty{false}, busy{false};
+  };
+  std::vector<Shape> shapes;
+  for (bool adaptive : {false, true})
+    for (bool warm : {false, true})
+      for (size_t window : {page, size_t{8UL << 20}})
+        for (size_t chunk : {page, size_t{4UL << 20}})
+          shapes.push_back({adaptive, warm, false, window, 8UL << 20, 1,
+                            2UL << 20, chunk});
+  shapes.push_back({true, false, false, page, 0, 1, 32UL << 20});
+  shapes.push_back({true, false, false, page, 8UL << 20, 512, 4096});
+  shapes.push_back({true, false, true, page, 0, 1, 2UL << 20});
+  const Shape cached{true, true, false, page, 8UL << 20, 1, 2UL << 20,
+                     4UL << 20};
+  shapes.push_back(cached);
+  shapes.back().descriptor = true;
+  shapes.push_back(cached);
+  shapes.back().held = true;
+  shapes.push_back({true, false, false, page, 0, 1, 2UL << 20});
+  shapes.back().empty = true;
+  shapes.push_back(cached);
+  shapes.back().window = 8UL << 20;
+  shapes.back().busy = true;
   for (const auto &shape : shapes) {
     SCOPED_TRACE(::testing::Message()
                  << shape.adaptive << ':' << shape.warm << ':' << shape.funded
                  << ':' << shape.window << ':' << shape.cache << ':'
                  << shape.count << ':' << shape.name_bytes << ':'
-                 << shape.chunk_bytes);
+                 << shape.chunk_bytes << ':' << shape.descriptor << ':'
+                 << shape.held << ':' << shape.empty << ':' << shape.busy);
     std::string path;
     std::vector<std::string> names;
     // One level keeps all cold/warm preparation explicit, before pressure.
-    make_nested_file(shape.count, shape.name_bytes, path, names, 0, false,
-                     false);
-    auto trial = [&](size_t quota, bool parser) {
+    make_nested_file(shape.count, shape.name_bytes, path, names,
+                     shape.busy ? 8UL << 20 : 0, false, false);
+    auto trial = [&](size_t quota, bool parser, bool expect_retry = false) {
       auto storage = std::make_shared<ChunkReadStorage>();
       ailego::Params params;
       params.set(CHUNK_READ_STORAGE_ADAPTIVE, shape.adaptive);
@@ -766,6 +796,14 @@ TEST_F(MetadataAdmissionTest, ChunkParserPreservesSuccessfulBudgets) {
       EXPECT_EQ(0, storage->init(params));
       EXPECT_EQ(0, storage->open(path, false));
       auto parent = storage->get("nested", 1);
+      IndexStorage::MemoryBlock held;
+      if (shape.busy) {
+        auto prefix = storage->get("prefix", 1);
+        EXPECT_EQ(5UL << 20, prefix->read(0, held, 5UL << 20));
+        auto &queue = ailego::BlockEvictionQueue::get_instance();
+        for (size_t i = 0; i < 64 && storage->stats().cache_bytes; ++i)
+          queue.reclaim_for_allocation(8UL << 20);
+      }
       if (shape.warm) {
         std::string data(parent->data_size(), '\0');
         EXPECT_EQ(data.size(), parent->fetch(0, data.data(), data.size()));
@@ -775,6 +813,20 @@ TEST_F(MetadataAdmissionTest, ChunkParserPreservesSuccessfulBudgets) {
         EXPECT_EQ(parent->data_size(),
                   parent->read(0, data, parent->data_size()));
       }
+      if (shape.descriptor || shape.held || shape.empty) {
+        IndexStorage::MemoryBlock data;
+        EXPECT_EQ(32u, parent->read(0, data, 32));
+        if (shape.held) held = std::move(data);
+      }
+      if (shape.empty) {
+        Pressure pressure(0);
+        IndexStorage::MemoryBlock data;
+        EXPECT_EQ(0u, parent->read(0, data, parent->data_size()));
+        EXPECT_EQ(IndexError_NoMemory, parent->read_error());
+        EXPECT_EQ(0u, storage->stats().workspace_bytes);
+      }
+      auto observed = std::make_shared<FailingParent>(parent);
+      parent = observed;
       const auto workspace = storage->stats().workspace_bytes;
       int result = IndexError_NoMemory;
       {
@@ -784,7 +836,9 @@ TEST_F(MetadataAdmissionTest, ChunkParserPreservesSuccessfulBudgets) {
           if (parser) {
             IndexSegmentStorage nested(parent);
             result = nested.open("", false);
-            if (result == 0) EXPECT_TRUE(nested.has(names.back()));
+            if (result == 0) {
+              EXPECT_TRUE(nested.has(names.back()));
+            }
           } else {
             ailego::BudgetedMappedBuffer copy;
             IndexUnpacker reference;
@@ -802,15 +856,44 @@ TEST_F(MetadataAdmissionTest, ChunkParserPreservesSuccessfulBudgets) {
         } catch (const std::bad_alloc &) {
         }
       }
-      if (shape.funded) EXPECT_EQ(workspace, storage->stats().workspace_bytes);
+      if (shape.funded) {
+        EXPECT_EQ(workspace, storage->stats().workspace_bytes);
+      }
+      // A failed private allocation may restart once with an owned input.
+      // Read failures and a failed copy attempt must never loop again.
+      EXPECT_LE(observed->parsed_headers, 1u);
+      EXPECT_LE(observed->fetched_headers, 1u);
+      if (parser && !shape.warm && quota == 0) {
+        EXPECT_EQ(0u, observed->fetched_headers);
+      }
+      if (parser && shape.held && quota == page) {
+        EXPECT_EQ(0u, observed->fetched_headers);
+      }
+      if (expect_retry) {
+        EXPECT_EQ(1u, observed->fetched_headers);
+      }
+      if (shape.busy) {
+        EXPECT_EQ('p', *static_cast<const char *>(held.data()));
+      }
       return result;
     };
-    if (shape.funded) {
+    if (shape.empty) {
+      // A denied growth released the old workspace. The reference must now
+      // rebuild its small fetch window as well as the directory input.
+      const size_t quota = 2 * names.back().size() + 4 * page + 2048;
+      ASSERT_EQ(0, trial(quota, false));
+      EXPECT_EQ(0, trial(quota, true));
+      continue;
+    }
+    if (shape.funded || shape.held) {
       // Only the private directory fits. Reusing its funded input succeeds;
       // unconditionally making another copy would reject the same operation.
       const size_t quota = names.back().size() + 8 * page;
       EXPECT_EQ(IndexError_NoMemory, trial(quota, false));
       EXPECT_EQ(0, trial(quota, true));
+      if (shape.held) {
+        EXPECT_EQ(IndexError_NoMemory, trial(page, true));
+      }
       continue;
     }
     size_t low = 1, high = 2 * shape.count * (shape.name_bytes + 256) +
@@ -824,14 +907,66 @@ TEST_F(MetadataAdmissionTest, ChunkParserPreservesSuccessfulBudgets) {
         low = quota + 1;
     }
     ASSERT_EQ(0, trial(low, false));
-    EXPECT_EQ(0, trial(low, true));
-    // A funded destination and reclaimable warm sources can also admit the
-    // directory with zero initially available bytes. Cold/small workspaces
-    // still report a real refusal, then succeed again after pressure lifts.
-    EXPECT_EQ(shape.warm && !shape.adaptive ? 0 : IndexError_NoMemory,
-              trial(0, true));
+    const bool retry = shape.adaptive && shape.warm &&
+                       shape.window == page && shape.chunk_bytes > page;
+    EXPECT_EQ(0, trial(low, true, retry));
+    // Zero available quota may still succeed by reusing/retiring funded input.
+    // Preserve the established large-window warm-cache successes; cold
+    // input has no backing to reclaim and must report a real refusal.
+    const int zero = trial(0, true);
+    EXPECT_TRUE(zero == 0 || zero == IndexError_NoMemory);
+    if (!shape.warm) {
+      EXPECT_EQ(IndexError_NoMemory, zero);
+    } else if (!shape.adaptive && shape.window > page) {
+      EXPECT_EQ(0, zero);
+    }
     EXPECT_EQ(0u, pool.external_used());
     EXPECT_EQ(0, trial(high, true));
+  }
+}
+
+TEST_F(MetadataAdmissionTest, ParserRetryPreservesEscapedInput) {
+  const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+  std::string path;
+  std::vector<std::string> names;
+  make_nested_file(1, 2UL << 20, path, names, 0, false, false);
+  for (bool funded : {false, true}) {
+    SCOPED_TRACE(funded);
+    auto storage = std::make_shared<ChunkReadStorage>();
+    ailego::Params params;
+    params.set(CHUNK_READ_STORAGE_ADAPTIVE, !funded);
+    params.set(CHUNK_READ_STORAGE_MAX_READ_BYTES,
+               funded ? 8UL << 20 : page);
+    params.set(CHUNK_READ_STORAGE_CHUNK_BYTES, 4UL << 20);
+    params.set(CHUNK_READ_STORAGE_CACHE_BYTES, 8UL << 20);
+    params.set(CHUNK_READ_STORAGE_WORKSPACE_COUNT, size_t{1});
+    params.set(CHUNK_READ_STORAGE_DIRECT_IO, false);
+    ASSERT_EQ(0, storage->init(params));
+    ASSERT_EQ(0, storage->open(path, false));
+    auto parent = storage->get("nested", 1);
+    std::string image(parent->data_size(), '\0');
+    ASSERT_EQ(image.size(), parent->fetch(0, image.data(), image.size()));
+    auto observed = std::make_shared<FailingParent>(parent);
+    observed->retain_input = true;
+    const auto workspace = storage->stats().workspace_bytes;
+    {
+      Pressure pressure(page);
+      IndexSegmentStorage nested(observed);
+      EXPECT_EQ(IndexError_NoMemory, nested.open("", false));
+      EXPECT_FALSE(nested.has(names.back()));
+    }
+    // The same input lease has an escaped reader. A failed private allocation
+    // must not unmap its workspace or unlock its actual cache backing.
+    ASSERT_GT(observed->escaped_size, page);
+    EXPECT_EQ(0u, observed->fetched_headers);
+    EXPECT_EQ(workspace, storage->stats().workspace_bytes);
+    auto retained = std::move(observed->escaped);
+    const size_t offset = observed->escaped_offset, size = observed->escaped_size;
+    observed.reset();
+    parent.reset();
+    ASSERT_EQ(0, storage->close());
+    storage.reset();
+    EXPECT_EQ(0, std::memcmp(retained.data(), image.data() + offset, size));
   }
 }
 

@@ -212,47 +212,64 @@ class IndexSegmentStorage : public IndexStorage {
       return IndexError_NoReady;
     }
 
-    // Preserve direct views and already-funded parent workspaces. Only a
-    // parent that cannot serve the validated range needs a streamed copy.
-    IndexStorage::MemoryBlock metadata;
-    ailego::BudgetedMappedBuffer fallback;
-    const size_t total = parent_->data_size();
-    int read_error = IndexError_ReadData;
-    auto read_data = [this, &metadata, &fallback, &read_error, total](
-                         size_t offset, const void **data, size_t len) {
-      // Unpacker has finished consuming the previous callback's bytes.
-      metadata.reset();
-      fallback.clear();
-      if (offset > total || len > total - offset) return size_t{0};
-      const auto direct_size = parent_->read_for_parsing(offset, metadata, len);
-      if (direct_size == len) {
-        *data = metadata.data();
-        return direct_size;
-      }
-      read_error = parent_->read_error();
-      // Release partial buffers/pins before admitting a fallback. An explicit
-      // allocation refusal is final; do not repeat its admission/wait cycle.
-      metadata.reset();
-      if (read_error == IndexError_NoMemory) return size_t{0};
-      if (fallback.resize(len) != 0) {
-        read_error = IndexError_NoMemory;
-        return size_t{0};
-      }
-      const auto size = parent_->fetch(offset, fallback.data(), len);
-      if (size < len) read_error = parent_->read_error();
-      *data = fallback.data();
-      return size;
-    };
+    // First preserve direct views and already-funded parent workspaces.
+    // If private directory allocation fails while the input retains backing,
+    // drop the whole unpublished attempt before one streamed-copy retry.
+    // The copy can reclaim its source; an unconditional copy rejects valid
+    // borrowed reads when another reader still needs that cache backing.
+    bool streamed = false;
+    for (;;) {
+      IndexStorage::MemoryBlock metadata;
+      ailego::BudgetedMappedBuffer fallback;
+      IndexUnpacker unpacker;
+      const size_t total = parent_->data_size();
+      int read_error = IndexError_ReadData;
+      auto read_data = [this, &metadata, &fallback, &read_error, total, streamed](
+                           size_t offset, const void **data, size_t len) {
+        // Unpacker has finished consuming the previous callback's bytes.
+        metadata.reset();
+        fallback.clear();
+        if (offset > total || len > total - offset) return size_t{0};
+        if (!streamed) {
+          const auto direct_size =
+              parent_->read_for_parsing(offset, metadata, len);
+          if (direct_size == len) {
+            *data = metadata.data();
+            return direct_size;
+          }
+          read_error = parent_->read_error();
+          // An explicit read allocation refusal is final. Retry below is
+          // only for a later private allocation blocked by retained input.
+          metadata.reset();
+          if (read_error == IndexError_NoMemory) return size_t{0};
+        }
+        if (fallback.resize(len) != 0) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
+        }
+        const auto size = parent_->fetch(offset, fallback.data(), len);
+        if (size < len) read_error = parent_->read_error();
+        *data = fallback.data();
+        return size;
+      };
 
-    IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, total, false)) {
-      if (read_error == IndexError_NoMemory) return read_error;
-      LOG_ERROR("Failed to unpack segment data");
-      return IndexError_UnpackIndex;
+      try {
+        if (!unpacker.unpack(read_data, total, false)) {
+          if (read_error == IndexError_NoMemory) return read_error;
+          LOG_ERROR("Failed to unpack segment data");
+          return IndexError_UnpackIndex;
+        }
+        segments_ = std::move(*unpacker.mutable_segments());
+        magic_ = unpacker.magic();
+        return 0;
+      } catch (const std::bad_alloc &) {
+        if (streamed || !metadata.release_for_parsing_retry())
+          return IndexError_NoMemory;
+      }
+      // Input is retired. Leave this iteration to destroy all partial private
+      // metadata and fallback backing before the next attempt allocates.
+      streamed = true;
     }
-    segments_ = std::move(*unpacker.mutable_segments());
-    magic_ = unpacker.magic();
-    return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
