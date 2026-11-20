@@ -684,13 +684,34 @@ TEST_F(MetadataAdmissionTest, NestedDirectReadsPreserveTightAdmission) {
       ASSERT_EQ(0, storage->open(path, false));
       IndexSegmentStorage middle(storage->get("nested", 1));
       ASSERT_EQ(0, middle.open("", false));
-      IndexSegmentStorage leaf(middle.get("nested", 1));
+      auto parent = middle.get("nested", 1);
+      ASSERT_NE(nullptr, parent);
+      size_t quota = shape.quota;
+      {
+        const size_t used = pool.used();
+        IndexSegmentStorage reference(parent);
+        ASSERT_EQ(0, reference.open("", false));
+        const size_t directory_bytes = pool.used() - used;
+        auto version = reference.get("IndexVersion", 1);
+        ASSERT_NE(nullptr, version);
+        // The compiler description varies by toolchain. Fund the peak
+        // string reservation on top of the directory's actual charge.
+        quota =
+            std::max(quota, directory_bytes + 2 * (version->data_size() + 1));
+        // The small package must still open without allocating a page.
+        // The large package must open without copying its serialized directory.
+        ASSERT_LT(quota, shape.count == 1 ? pool.page_buffer_size()
+                                          : directory_bytes +
+                                                shape.count * shape.name_bytes);
+      }
+      SCOPED_TRACE(quota);
+      IndexSegmentStorage leaf(parent);
       for (size_t attempt = 0; attempt < 2; ++attempt) {
         {
           // The directory fits, but a mandatory page/directory copy does not.
           // Verify both the first publication and a transactional reopen.
-          Pressure pressure(shape.quota);
-          ASSERT_EQ(shape.quota, pool.available());
+          Pressure pressure(quota);
+          ASSERT_EQ(quota, pool.available());
           ASSERT_EQ(0, leaf.open("", false));
           EXPECT_TRUE(leaf.has(names.back()));
         }
