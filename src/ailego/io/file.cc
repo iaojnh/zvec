@@ -775,19 +775,22 @@ void *File::MemoryMap(NativeHandle handle, ssize_t off, size_t len, int opts) {
   LARGE_INTEGER max_size;
   max_size.QuadPart = off + len;
 
-  HANDLE file_mapping = CreateFileMapping(
-      handle, nullptr,
-      ((opts & File::MMAP_READONLY) ? PAGE_READONLY : PAGE_READWRITE),
-      max_size.HighPart, max_size.LowPart, nullptr);
-  ailego_null_if_false(file_mapping != nullptr);
-
+  DWORD protection = PAGE_READONLY;
   DWORD desired_access = FILE_MAP_READ;
   if (!(opts & File::MMAP_READONLY)) {
-    desired_access |= FILE_MAP_WRITE;
+    if (opts & File::MMAP_SHARED) {
+      protection = PAGE_READWRITE;
+      desired_access = FILE_MAP_WRITE;
+    } else {
+      // A writable private view needs only read access to the backing file.
+      protection = PAGE_WRITECOPY;
+      desired_access = FILE_MAP_COPY;
+    }
   }
-  if (!(opts & File::MMAP_SHARED)) {
-    desired_access |= FILE_MAP_COPY;
-  }
+  HANDLE file_mapping =
+      CreateFileMapping(handle, nullptr, protection, max_size.HighPart,
+                        max_size.LowPart, nullptr);
+  ailego_null_if_false(file_mapping != nullptr);
 
   LARGE_INTEGER view_offset;
   view_offset.QuadPart = aligned_off;
