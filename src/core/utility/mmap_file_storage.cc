@@ -115,7 +115,7 @@ class MMapFileStorage : public IndexStorage {
 
     //! Write data into the storage with offset
     size_t write(size_t offset, const void *data, size_t len) override {
-      if (offset > capacity_ || len > capacity_ - offset || (len && !data))
+      if (!len || !data || offset > capacity_ || len > capacity_ - offset)
         return 0;
       std::shared_lock directory(owner_->directory_mutex);
       if (owner_->retired) return 0;
@@ -127,7 +127,7 @@ class MMapFileStorage : public IndexStorage {
         meta->padding_size = capacity_ - data_tail;
       }
       owner_->dirty.store(true, std::memory_order_relaxed);
-      if (len) memmove((uint8_t *)segment_->data() + offset, data, len);
+      memmove((uint8_t *)segment_->data() + offset, data, len);
       segment_->set_dirty();
       return len;
     }

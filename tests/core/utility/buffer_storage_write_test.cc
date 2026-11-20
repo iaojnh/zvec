@@ -152,6 +152,51 @@ TEST_F(BufferStorageWriteTest, FailedCloseCanRetryMetadataAndCheckpoint) {
   EXPECT_EQ("saved", std::string(payload, sizeof(payload)));
 }
 
+TEST_F(BufferStorageWriteTest, ShortWritePublishesProgressBeforeReopen) {
+  const size_t page = ailego::kVectorPageSize;
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("data", 2 * page));
+  auto segment = storage->get("data");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(1u, segment->write(0, "a", 1));
+  ASSERT_EQ(0, storage->flush());
+
+  IndexStorage::MemoryBlock pin;
+  ASSERT_EQ(1u, segment->read_borrowed_immutable(0, pin, 1));
+  size_t written;
+  {
+    auto &budget = ailego::MemoryLimitPool::get_instance();
+    AILEGO_DEFER([&] {
+      budget.set_memory_pressure(
+          ailego::ProcessRssBudget::PressureLevel::kNormal);
+    });
+    budget.set_memory_pressure(
+        ailego::ProcessRssBudget::PressureLevel::kCritical);
+    written = segment->write(page - 1, "BC", 2);
+    EXPECT_EQ(IndexError_NoMemory, segment->write_error());
+  }
+  ASSERT_EQ(1u, written);
+  EXPECT_EQ(page, segment->data_size());
+  EXPECT_TRUE(storage->is_dirty());
+  pin.reset();
+  ASSERT_EQ(0, storage->open(file_path_, true));
+  auto current = storage->get("data");
+  ASSERT_TRUE(current);
+  ASSERT_EQ(page, current->data_size());
+  char payload[2];
+  ASSERT_EQ(1u, current->fetch(page - 1, payload, 2));
+  EXPECT_EQ('B', payload[0]);
+  ASSERT_EQ(1u, current->write(page, "C", 1));
+  ASSERT_EQ(0, storage->close());
+  auto reader = open_read_only();
+  ASSERT_TRUE(reader);
+  auto saved = reader->get("data");
+  ASSERT_TRUE(saved);
+  ASSERT_EQ(2u, saved->fetch(page - 1, payload, 2));
+  EXPECT_EQ("BC", std::string(payload, 2));
+}
+
 TEST_F(BufferStorageWriteTest, QuarantinedCloseReportsErrorAndReleasesFile) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
@@ -696,18 +741,23 @@ TEST_F(BufferStorageWriteTest, WriteExceedsCapacity) {
 
 // Test: Write with zero length (edge case)
 TEST_F(BufferStorageWriteTest, WriteZeroLength) {
-  auto storage = open_writable();
-  ASSERT_TRUE(storage);
-
-  ASSERT_EQ(0, storage->append("seg1", 4096));
-  auto seg = storage->get("seg1");
-  ASSERT_TRUE(seg);
-
-  // Writing zero bytes should succeed (no-op but valid)
-  EXPECT_EQ(0u, seg->write(0, "x", 0));
-  EXPECT_EQ(0u, seg->data_size());
-
-  EXPECT_EQ(0, storage->close());
+  for (const char *backend : {"BufferStorage", "MMapFileStorage"}) {
+    SCOPED_TRACE(backend);
+    ailego::File::Delete(file_path_);
+    auto storage = IndexFactory::CreateStorage(backend);
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->open(file_path_, true));
+    ASSERT_EQ(0, storage->append("seg1", 4096));
+    auto seg = storage->get("seg1");
+    ASSERT_TRUE(seg);
+    ASSERT_EQ(0, storage->flush());
+    EXPECT_EQ(0u, seg->write(4095, nullptr, 0));
+    IndexStorage::SegmentData empty(4095, 0, nullptr);
+    EXPECT_TRUE(seg->write_batch(&empty, 1));
+    EXPECT_EQ(0u, seg->data_size());
+    EXPECT_FALSE(storage->is_dirty());
+    EXPECT_EQ(0, storage->close());
+  }
 }
 
 // ===== Persistence Tests =====

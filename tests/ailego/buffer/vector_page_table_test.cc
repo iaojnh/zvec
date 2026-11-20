@@ -1220,6 +1220,38 @@ TEST_F(BufferPoolTest, FailedPageTableExtendLeavesStateUnchanged) {
   EXPECT_EQ(metadata_before, PoolPayloadBudget::get_instance().metadata_used());
 }
 
+TEST_F(BufferPoolTest, ConcurrentExtendsPublishReadableFileSize) {
+  constexpr size_t pages = 64;
+  init_vec_pool(4, pages, true);
+  VecBufferPool pool(new_file(1), true);
+  ASSERT_EQ(0, pool.init());
+  std::atomic<unsigned> ready{0};
+  std::atomic<bool> ok{true};
+  auto grow = [&](size_t first) {
+    ready.fetch_add(1);
+    while (ready.load() != 2) std::this_thread::yield();
+    for (size_t i = first; i <= pages; i += 2) {
+      if (!pool.extend_file(i * kVectorPageSize)) {
+        ok.store(false);
+        break;
+      }
+      char byte;
+      const size_t extent = pool.file_size();
+      if (extent < i * kVectorPageSize ||
+          pool.get_meta(extent - 1, 1, &byte) != 0) {
+        ok.store(false);
+        break;
+      }
+    }
+  };
+  std::thread odd(grow, 3);
+  grow(2);
+  odd.join();
+  EXPECT_TRUE(ok.load());
+  EXPECT_EQ(pages * kVectorPageSize, pool.file_size());
+  EXPECT_EQ(pages, pool.page_table_.entry_num());
+}
+
 TEST_F(BufferPoolTest, FailedFileExtendDoesNotGrowBackingFile) {
   constexpr size_t kSecondSegmentEntry = 16UL * 1024UL + 1;
   init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/1, /*writable=*/true);

@@ -924,19 +924,20 @@ class BufferStorageFile
       }
       const size_t abs_offset = data_offset() + offset;
       // Publish data_size only after the page bytes are visible to readers.
+      size_t written;
       const auto status = owner_->buffer_pool_handle_->write_range_status(
-          abs_offset, len, static_cast<const char *>(data));
+          abs_offset, len, static_cast<const char *>(data), written);
+      if (written) {
+        entry_.extend(offset + written);
+        owner_->set_as_dirty();
+      }
       if (status != ailego::PageWriteStatus::kOk) {
         if (status == ailego::PageWriteStatus::kNoMemory)
           buffer_storage_write_error = IndexError_NoMemory;
         LOG_ERROR("write() page-cache write_range failed at abs_offset=%zu",
                   abs_offset);
-        return 0;
       }
-      entry_.extend(offset + len);
-      // Fixed-size rewrites are dirty even when data_size is unchanged.
-      owner_->set_as_dirty();
-      return len;
+      return written;
     }
 
     bool write_batch(const SegmentData *writes, size_t count) override {
@@ -980,14 +981,13 @@ class BufferStorageFile
         has_data = true;
       }
 
-      if (has_data) {
-        const auto status = owner_->buffer_pool_handle_->write_fragments_status(
-            fragments.data(), count);
-        if (status != ailego::PageWriteStatus::kOk) {
-          if (status == ailego::PageWriteStatus::kNoMemory)
-            buffer_storage_write_error = IndexError_NoMemory;
-          return false;
-        }
+      if (!has_data) return true;
+      const auto status = owner_->buffer_pool_handle_->write_fragments_status(
+          fragments.data(), count);
+      if (status != ailego::PageWriteStatus::kOk) {
+        if (status == ailego::PageWriteStatus::kNoMemory)
+          buffer_storage_write_error = IndexError_NoMemory;
+        return false;
       }
       entry_.extend(write_end);
       owner_->set_as_dirty();

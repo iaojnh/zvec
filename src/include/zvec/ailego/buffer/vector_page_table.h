@@ -792,7 +792,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   }
 
   size_t file_size() const {
-    return file_size_;
+    return file_size_.load(std::memory_order_acquire);
   }
 
   //! The backing file remains available when the budget cannot fit a cache.
@@ -877,12 +877,16 @@ class ZVEC_AILEGO_API VecBufferPool {
  private:
   friend class VecBufferPoolHandle;
   friend struct VecBufferPoolTestPeer;
+  bool contains_range(size_t offset, size_t length) const {
+    const size_t extent = file_size();
+    return offset <= extent && length <= extent - offset;
+  }
   bool read_range_bypass(size_t file_offset, size_t length, char *buffer,
                          bool &allocation_failed);
   char *acquire_buffer(block_id_t page_id, int retry, bool record_reuse,
                        bool *allocation_failed);
   PageWriteStatus write_range_status(size_t file_offset, size_t length,
-                                     const char *src);
+                                     const char *src, size_t &written);
   PageWriteStatus write_fragments_status(
       const VecBufferWriteFragment *fragments, size_t count);
   bool acquire_pages_impl(const block_id_t *page_ids, size_t count,
@@ -909,7 +913,8 @@ class ZVEC_AILEGO_API VecBufferPool {
 
   int fd_;       // page-data channel: O_DIRECT or F_NOCACHE when supported
   int meta_fd_;  // metadata channel: always buffered IO
-  size_t file_size_;
+  std::mutex extend_mutex_;
+  std::atomic<size_t> file_size_{0};
   size_t initial_file_size_;  // file size at open time; pages beyond this
                               // are created by extend_file and can skip
                               // pread on first load (content is zeros).
@@ -1027,6 +1032,9 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
   int write_range(size_t file_offset, size_t len, const char *src);
   PageWriteStatus write_range_status(size_t file_offset, size_t len,
                                      const char *src);
+  // A later page can fail admission after an earlier page has been modified.
+  PageWriteStatus write_range_status(size_t file_offset, size_t len,
+                                     const char *src, size_t &written);
 
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
   PageWriteStatus write_fragments_status(
