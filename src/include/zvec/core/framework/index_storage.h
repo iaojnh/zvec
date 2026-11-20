@@ -661,10 +661,10 @@ class IndexStorage : public IndexModule {
             length(length_arg),
             block(block_arg) {}
 
-      Segment *segment;
-      size_t offset;
-      size_t length;
-      MemoryBlock *block;
+      Segment *segment{nullptr};
+      size_t offset{0};
+      size_t length{0};
+      MemoryBlock *block{nullptr};
     };
 
     //! Destructor
@@ -726,31 +726,7 @@ class IndexStorage : public IndexModule {
     //! scalar reads; page-backed implementations may override this to batch
     //! misses while keeping each returned MemoryBlock pinned independently.
     virtual bool read_borrowed_batch(BorrowedRead *reads, size_t count) {
-      if (count == 0) {
-        return true;
-      }
-      if (reads == nullptr) {
-        return false;
-      }
-      for (size_t i = 0; i < count; ++i) {
-        if (reads[i].segment == nullptr || reads[i].block == nullptr) {
-          return false;
-        }
-      }
-      for (size_t i = 0; i < count; ++i) {
-        reads[i].block->reset();
-      }
-      for (size_t i = 0; i < count; ++i) {
-        BorrowedRead &request = reads[i];
-        if (request.segment->read_borrowed(request.offset, *request.block,
-                                           request.length) != request.length) {
-          for (size_t j = 0; j < count; ++j) {
-            reads[j].block->reset();
-          }
-          return false;
-        }
-      }
-      return true;
+      return read_scalar_batch(reads, count, /*immutable=*/false);
     }
 
     virtual bool read(SegmentData *, size_t) {
@@ -824,32 +800,7 @@ class IndexStorage : public IndexModule {
     //! after publication.
     virtual bool read_borrowed_batch_immutable(BorrowedRead *reads,
                                                size_t count) {
-      if (count == 0) {
-        return true;
-      }
-      if (reads == nullptr) {
-        return false;
-      }
-      for (size_t i = 0; i < count; ++i) {
-        if (reads[i].segment == nullptr || reads[i].block == nullptr) {
-          return false;
-        }
-      }
-      for (size_t i = 0; i < count; ++i) {
-        reads[i].block->reset();
-      }
-      for (size_t i = 0; i < count; ++i) {
-        BorrowedRead &request = reads[i];
-        if (request.segment->read_borrowed_immutable(
-                request.offset, *request.block, request.length) !=
-            request.length) {
-          for (size_t j = 0; j < count; ++j) {
-            reads[j].block->reset();
-          }
-          return false;
-        }
-      }
-      return true;
+      return read_scalar_batch(reads, count, /*immutable=*/true);
     }
 
     //! Read a logical range as one or more stable spans. The returned pointers
@@ -945,6 +896,39 @@ class IndexStorage : public IndexModule {
     // These hooks are appended to preserve existing virtual method slots.
     virtual void begin_parsing() {}
     virtual void end_parsing() noexcept {}
+
+   protected:
+    static void reset_batch_outputs(BorrowedRead *reads, size_t count) {
+      if (!reads) return;
+      for (size_t i = 0; i < count; ++i) {
+        if (reads[i].block) reads[i].block->reset();
+      }
+    }
+
+   private:
+    static bool read_scalar_batch(BorrowedRead *reads, size_t count,
+                                  bool immutable) try {
+      if (!reads) return count == 0;
+      reset_batch_outputs(reads, count);
+      for (size_t i = 0; i < count; ++i) {
+        if (!reads[i].segment || !reads[i].block) return false;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        const auto &r = reads[i];
+        const size_t n =
+            immutable ? r.segment->read_borrowed_immutable(r.offset, *r.block,
+                                                           r.length)
+                      : r.segment->read_borrowed(r.offset, *r.block, r.length);
+        if (n != r.length) {
+          reset_batch_outputs(reads, count);
+          return false;
+        }
+      }
+      return true;
+    } catch (...) {
+      reset_batch_outputs(reads, count);
+      throw;
+    }
   };
 
   //! Destructor

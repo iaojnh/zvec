@@ -307,12 +307,6 @@ class BufferStorageFile
       return read_borrowed_batch_impl(reads, count, /*immutable=*/true);
     }
 
-    static void reset_batch_outputs(BorrowedRead *reads, size_t count) {
-      for (size_t i = 0; reads && i < count; ++i) {
-        if (reads[i].block) reads[i].block->reset();
-      }
-    }
-
     bool scalar_borrowed_batch(BorrowedRead *reads, size_t count,
                                bool immutable) {
       buffer_storage_read_error = IndexError_ReadData;
@@ -477,11 +471,7 @@ class BufferStorageFile
       // Descriptors scale with request count and touched pages. Own and
       // charge them per operation, rather than retaining each thread's peak.
       BatchScratch scratch;
-      for (size_t i = 0; i < count; ++i) {
-        if (reads[i].block != nullptr) {
-          reads[i].block->reset();
-        }
-      }
+      reset_batch_outputs(reads, count);
 
       auto cleanup_owned = [&]() {
         // Arena slices share their backing owner; individual snapshots
@@ -514,11 +504,7 @@ class BufferStorageFile
       auto fail = [&]() {
         cleanup_owned();
         release_pages();
-        for (size_t i = 0; i < count; ++i) {
-          if (reads[i].block != nullptr) {
-            reads[i].block->reset();
-          }
-        }
+        reset_batch_outputs(reads, count);
         return false;
       };
 

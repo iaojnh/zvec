@@ -1469,6 +1469,97 @@ TEST_F(BufferStorageWriteTest, IndependentHandlesShareSegmentCapacity) {
   EXPECT_EQ(capacity, writer->data_size() + writer->padding_size());
 }
 
+TEST_F(BufferStorageWriteTest, CopyOnWriteDirectoryGrowthHonorsFlushMode) {
+  for (bool persist : {false, true}) {
+    SCOPED_TRACE(persist);
+    ailego::File::Delete(file_path_);
+    auto writer = IndexFactory::CreateStorage("MMapFileStorage");
+    ASSERT_TRUE(writer);
+    ailego::Params params;
+    params.set("proxima.mmap_file.storage.segment_meta_capacity", 1u);
+    ASSERT_EQ(0, writer->init(params));
+    ASSERT_EQ(0, writer->open(file_path_, true));
+    ASSERT_EQ(0, writer->close());
+    ailego::File disk;
+    ASSERT_TRUE(disk.open(file_path_, true, false));
+    const size_t original_size = disk.size();
+    params.set("proxima.mmap_file.storage.copy_on_write", true);
+    params.set("proxima.mmap_file.storage.force_flush", persist);
+    ASSERT_EQ(0, writer->init(params));
+    ASSERT_EQ(0, writer->open(file_path_, false));
+    const std::string prefix(ailego::kVectorPageSize / 2, 'd');
+    for (int i = 0; i < 3; ++i) {
+      const auto id = prefix + std::to_string(i);
+      ASSERT_EQ(0, writer->append(id, 16));
+      auto segment = writer->get(id);
+      ASSERT_TRUE(segment);
+      const char value = static_cast<char>('a' + i);
+      ASSERT_EQ(1u, segment->write(0, &value, 1));
+    }
+    EXPECT_EQ(original_size, disk.size());
+    writer->refresh(91);
+    ASSERT_EQ(0, writer->flush());
+    EXPECT_FALSE(writer->is_dirty());
+    if (!persist) EXPECT_EQ(original_size, disk.size());
+    auto reader = open_read_only();
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(persist ? 91u : 0u, reader->check_point());
+    for (int i = 0; i < 3; ++i) {
+      const auto id = prefix + std::to_string(i);
+      auto segment = writer->get(id);
+      ASSERT_TRUE(segment);
+      char value;
+      ASSERT_EQ(1u, segment->fetch(0, &value, 1));
+      EXPECT_EQ('a' + i, value);
+      EXPECT_EQ(persist, reader->has(id));
+      if (persist) {
+        auto saved = reader->get(id);
+        ASSERT_TRUE(saved);
+        ASSERT_EQ(1u, saved->fetch(0, &value, 1));
+        EXPECT_EQ('a' + i, value);
+      }
+    }
+    ASSERT_EQ(0, writer->close());
+  }
+}
+
+TEST_F(BufferStorageWriteTest, InvalidBorrowedBatchReleasesPreviousViews) {
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->open(file_path_, true));
+  ASSERT_EQ(0, storage->append("data", 16));
+  auto segment = storage->get("data");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(2u, segment->write(0, "ab", 2));
+
+  using Request = IndexStorage::Segment::BorrowedRead;
+  for (bool immutable : {false, true}) {
+    SCOPED_TRACE(immutable);
+    auto batch = [&](Request *reads, size_t count) {
+      return immutable ? segment->read_borrowed_batch_immutable(reads, count)
+                       : segment->read_borrowed_batch(reads, count);
+    };
+    for (bool missing_segment : {false, true}) {
+      SCOPED_TRACE(missing_segment);
+      IndexStorage::MemoryBlock first, last;
+      Request valid[] = {{segment.get(), 0, 1, &first},
+                         {segment.get(), 1, 1, &last}};
+      ASSERT_TRUE(batch(valid, 2));
+      ASSERT_NE(nullptr, first.data());
+      ASSERT_NE(nullptr, last.data());
+      Request invalid[] = {valid[0],
+                           {missing_segment ? nullptr : segment.get(), 0, 1,
+                            missing_segment ? &first : nullptr},
+                           valid[1]};
+      EXPECT_FALSE(batch(invalid, 3));
+      EXPECT_EQ(nullptr, first.data());
+      EXPECT_EQ(nullptr, last.data());
+      EXPECT_FALSE(first.scratch_owner_);
+      EXPECT_FALSE(last.scratch_owner_);
+    }
+  }
+}
+
 TEST_F(BufferStorageWriteTest, MappedViewsKeepFileAcrossPrivateReopen) {
   auto storage = IndexFactory::CreateStorage("MMapFileStorage");
   ASSERT_TRUE(storage);

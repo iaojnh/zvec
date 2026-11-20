@@ -210,9 +210,10 @@ class IndexMapping {
       std::map<std::string_view, SegmentInfo, std::less<>,
                ailego::BudgetedAllocator<
                    std::pair<const std::string_view, SegmentInfo>>>;
-  int init_index_mapping_admitted(
-      size_t len, HeaderMap::node_type node,
-      ailego::MemoryLimitPool::PendingAllocation &memory);
+  int map_meta_directory(size_t len, HeaderMap::node_type node,
+                         ailego::MemoryLimitPool::PendingAllocation &memory,
+                         bool anonymous);
+  int unpack_meta_directory(size_t len, uint64_t file_size);
   static void release_meta_mapping(const MetaMapping &mapping);
   //! Members
   uint32_t segment_ids_offset_{0};
