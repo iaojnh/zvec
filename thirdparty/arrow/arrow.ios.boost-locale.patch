@@ -1,0 +1,13 @@
+--- a/cpp/cmake_modules/ThirdpartyToolchain.cmake
++++ b/cpp/cmake_modules/ThirdpartyToolchain.cmake
+@@ -1048,2 +1048,6 @@
+ function(build_boost)
++  if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    set(boost_locale_patch_args PATCH_COMMAND patch -p1 -i
++        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../../boost-locale-ios.patch")
++  endif()
+   list(APPEND CMAKE_MESSAGE_INDENT "Boost: ")
+@@ -1053,2 +1057,3 @@
+                        ${FC_DECLARE_COMMON_OPTIONS} OVERRIDE_FIND_PACKAGE
++                       ${boost_locale_patch_args}
+                        URL ${BOOST_SOURCE_URL}

@@ -1144,15 +1144,22 @@ TEST_F(ParserOwnershipTest, PrefetchPinsYieldWithoutInvalidatingReaders) {
     const std::string name(large_directory ? 2UL << 20 : page, 'n');
     package(path, name, 8 * page - sizeof(IndexFormat::MetaHeader),
             large_directory ? 1 : 2UL << 20);
+    auto params = chunk_params(page);
+    params.set(CHUNK_READ_STORAGE_PREFETCH_DEPTH, size_t{2});
+    params.set(CHUNK_READ_STORAGE_PREFETCH_BYTES, 8UL << 20);
+    params.set(CHUNK_READ_STORAGE_DIRECT_IO, true);
+    {
+      ChunkReadStorage probe;
+      ASSERT_EQ(0, probe.init(params));
+      ASSERT_EQ(0, probe.open(path, false));
+      if (probe.stats().prefetch_depth == 0)
+        GTEST_SKIP() << "Native direct AIO unavailable on this filesystem";
+    }
     for (bool busy : {false, true}) {
       for (bool warm : {false, true}) {
         SCOPED_TRACE(::testing::Message() << busy << ':' << warm);
         auto trial = [&](size_t quota, int mode, bool external = false) {
           auto storage = std::make_shared<ChunkReadStorage>();
-          auto params = chunk_params(page);
-          params.set(CHUNK_READ_STORAGE_PREFETCH_DEPTH, size_t{2});
-          params.set(CHUNK_READ_STORAGE_PREFETCH_BYTES, 8UL << 20);
-          params.set(CHUNK_READ_STORAGE_DIRECT_IO, true);
           EXPECT_EQ(0, storage->init(params));
           EXPECT_EQ(0, storage->open(path, false));
           EXPECT_GT(storage->stats().prefetch_depth, 0u);

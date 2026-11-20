@@ -539,8 +539,6 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   }
   ailego::Params storage_params;
   // storage_params.set("proxima.mmap_file.storage.memory_warmup", true);
-  // storage_params.set("proxima.mmap_file.storage.segment_meta_capacity",
-  // 1024);
 
   storage_params.set(core::MMAPFILE_STORAGE_COPY_ON_WRITE,
                      storage_options.copy_on_write);
@@ -553,6 +551,10 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
 
   switch (storage_options.type) {
     case StorageOptions::StorageType::kMMAP: {
+      // Each vector index has a small set of named segments. Grow its directory
+      // on demand so opening many collection blocks fits the shared budget.
+      storage_params.set(core::MMAPFILE_STORAGE_SEGMENT_META_CAPACITY,
+                         uint32_t{4096});
       const char *storage_name =
           storage_options.read_only ? "MMapFileReadStorage" : "MMapFileStorage";
       storage_ = core::IndexFactory::CreateStorage(storage_name);

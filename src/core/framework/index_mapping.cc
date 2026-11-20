@@ -47,7 +47,7 @@ static inline size_t CalcPageAlignedSize(size_t size, bool huge_size) {
 static bool WritePadding(ailego::File &file, size_t size) {
   constexpr char padding[4096]{};
   while (size) {
-    const size_t bytes = std::min(size, sizeof(padding));
+    const size_t bytes = (std::min)(size, sizeof(padding));
     if (file.write(padding, bytes) != bytes) return false;
     size -= bytes;
   }
@@ -285,7 +285,7 @@ void IndexMapping::close() {
 
 void IndexMapping::refresh(uint64_t check_point) {
   if (!footer_) return;
-  check_point_ = std::max(check_point_, check_point);
+  check_point_ = (std::max)(check_point_, check_point);
   for (auto item : header_addr_map_) {
     auto header = item.second.header;
     auto footer = reinterpret_cast<IndexFormat::MetaFooter *>(
@@ -715,7 +715,7 @@ int IndexMapping::unpack_meta_directory(size_t len, uint64_t file_size) {
     return IndexError_InvalidLength;
   }
 
-  check_point_ = std::max(check_point_, uint64_t{footer_->check_point});
+  check_point_ = (std::max)(check_point_, uint64_t{footer_->check_point});
 
   // if (header_->version == IndexFormat::COMPATIBLE_FORMAT_VERSION_0X0002) {
   //   header_->version = IndexFormat::CURRENT_FORMAT_VERSION;

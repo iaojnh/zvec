@@ -1160,7 +1160,8 @@ TEST(IndexInterface, IvfBufferPoolSearchAfterOpenThreadExits) {
 #if DISKANN_SUPPORTED
 TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
   constexpr uint32_t kDimension = 64;
-  constexpr uint32_t kDocCount = 512;
+  // Both key tables exceed the smallest cache budget.
+  constexpr uint32_t kDocCount = 4096;
   constexpr size_t kFullBudget = 8UL * 1024UL * 1024UL;
   const std::string index_name{"test_diskann_buffer_budgets.index"};
   auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
