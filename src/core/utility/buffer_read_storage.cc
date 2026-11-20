@@ -207,6 +207,20 @@ class BufferReadStorage : public IndexStorage {
       return 0;
     }
 
+    size_t fetch_for_parsing(size_t offset, void *buf,
+                             size_t len) const override try {
+      thread_read_error() = IndexError_ReadData;
+      len = clamp_length(&offset, len);
+      if (!len) return 0;
+      return read_bytes(data_offset_ + offset, len, static_cast<char *>(buf),
+                        /*force_bypass=*/true)
+                 ? len
+                 : 0;
+    } catch (const std::bad_alloc &) {
+      thread_read_error() = IndexError_NoMemory;
+      return 0;
+    }
+
     //! Read data from segment (stable until this thread's next pointer read)
     //! Read data from segment into a MemoryBlock
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {

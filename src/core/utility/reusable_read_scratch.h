@@ -357,6 +357,12 @@ class ReusableReadScratch {
         std::lock_guard<std::mutex> lock(worker->mutex_);
         return readers == 1 && fits(bytes, alignment);
       }
+      bool release_for_parsing_retry() noexcept override {
+        std::lock_guard<std::mutex> lock(worker->mutex_);
+        // Resetting the sole reader makes this optional snapshot reclaimable.
+        // The worker owns eviction; never retire a caller's alias here.
+        return readers == 1;
+      }
       bool fits(size_t bytes, size_t alignment) const {
         return capacity >= bytes &&
                (!alignment ||

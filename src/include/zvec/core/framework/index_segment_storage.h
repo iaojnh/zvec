@@ -90,6 +90,13 @@ class IndexSegmentStorage : public IndexStorage {
       return parent_->fetch(data_offset_ + offset, buf, len);
     }
 
+    size_t fetch_for_parsing(size_t offset, void *buf,
+                             size_t len) const override {
+      if (offset > region_size_) return 0;
+      len = std::min(len, region_size_ - offset);
+      return parent_->fetch_for_parsing(data_offset_ + offset, buf, len);
+    }
+
     int read_error() const override {
       return parent_->read_error();
     }
@@ -224,8 +231,9 @@ class IndexSegmentStorage : public IndexStorage {
       IndexUnpacker unpacker;
       const size_t total = parent_->data_size();
       int read_error = IndexError_ReadData;
-      auto read_data = [this, &metadata, &fallback, &read_error, total, streamed](
-                           size_t offset, const void **data, size_t len) {
+      auto read_data = [this, &metadata, &fallback, &read_error, total,
+                        streamed](size_t offset, const void **data,
+                                  size_t len) {
         // Unpacker has finished consuming the previous callback's bytes.
         metadata.reset();
         fallback.clear();
@@ -247,7 +255,8 @@ class IndexSegmentStorage : public IndexStorage {
           read_error = IndexError_NoMemory;
           return size_t{0};
         }
-        const auto size = parent_->fetch(offset, fallback.data(), len);
+        const auto size =
+            parent_->fetch_for_parsing(offset, fallback.data(), len);
         if (size < len) read_error = parent_->read_error();
         *data = fallback.data();
         return size;

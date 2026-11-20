@@ -423,6 +423,24 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       }
       return nullptr;
     }
+    // Metadata admission must not compete with this segment's optional hint
+    // pins, including hints beyond the first header. Complete kernel writes
+    // before releasing their pins; real demand readers retain their own pins.
+    void yield_for_parsing(size_t offset, size_t length) {
+      std::lock_guard<std::mutex> lock(mutex);
+      for (size_t i = 0; i < depth; ++i) {
+        auto &slot = slots[i];
+        if (!slot.item || slot.item->offset >= offset + length ||
+            slot.item->offset + slot.item->bytes <= offset)
+          continue;
+        while (!slot.done) {
+          flush();
+          if (!slot.done) reap(true);
+          if (!slot.item) break;
+        }
+        if (slot.item) release(slot);
+      }
+    }
     void account_slot(size_t requested) {
       ++occupied;
       bytes += requested;
@@ -648,9 +666,10 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
 #if defined(__linux__) && !defined(__ANDROID__)
     if (prefetch_depth && prefetch_bytes && io_alignment > 1) {
       try {
-        auto lookahead = MakeMetadata<
-            ReadAhead, ailego::OptionalBudgetedAllocator<ReadAhead>>(
-            *this, prefetch_depth, prefetch_bytes);
+        auto lookahead =
+            MakeMetadata<ReadAhead,
+                         ailego::OptionalBudgetedAllocator<ReadAhead>>(
+                *this, prefetch_depth, prefetch_bytes);
         if (lookahead->ready) read_ahead = std::move(lookahead);
       } catch (const std::bad_alloc &) {
       }  // optional lookahead; demand still works
@@ -963,8 +982,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       }
       if (auto *candidate = fit ? fit : (funded_only ? nullptr : fallback)) {
         bool expected = false;
-        if (candidate->busy.compare_exchange_strong(expected, true,
-                                                    std::memory_order_acquire)) {
+        if (candidate->busy.compare_exchange_strong(
+                expected, true, std::memory_order_acquire)) {
           // Capacity may have changed before the lease was acquired. An
           // optional copy may use only backing that is still funded now.
           if (funded_only && candidate->workspace.mapped_size() < bytes) {
@@ -1030,22 +1049,28 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         len > (adaptive ? (1UL << 30) : max_read_bytes))
       return 0;
     const auto locate = [&](size_t position) -> Entry * {
-      return layout ? layout->find(position)
-                    : entry(position / chunk_bytes,
-                            populate && cache_limit != 0);
+      return layout
+                 ? layout->find(position)
+                 : entry(position / chunk_bytes, populate && cache_limit != 0);
     };
     const auto source = [&](Entry *item) -> Entry * {
       if (populate) return cached(item);
-      // Parsing may borrow an already-funded cache hit, but must not add
-      // optional cache mappings/tables before its directory is admitted.
+        // Parsing may borrow an already-funded cache hit, but must not add
+        // optional cache mappings/tables before its directory is admitted.
+#if defined(__linux__) && !defined(__ANDROID__)
+      if (item && read_ahead &&
+          prefetch_pending_requests.load(std::memory_order_acquire)) {
+        if (auto *ready = read_ahead->take(item)) return ready;
+      }
+#endif
       if (item && pin(*item, reinterpret_cast<size_t>(item))) return item;
       return nullptr;
     };
     // Only the single-chunk fast path can return cache backing directly.
     // Defer optional table creation for copied results until after destination
     // admission, just like optional payload cache population below.
-    auto *first = layout ? layout->find(offset)
-                         : entry(offset / chunk_bytes, false);
+    auto *first =
+        layout ? layout->find(offset) : entry(offset / chunk_bytes, false);
     const bool single =
         first ? len <= first->bytes - (offset - first->offset)
               : !layout && len <= chunk_bytes - offset % chunk_bytes;
@@ -1053,37 +1078,43 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     // A funded parsing destination also needs its lease admitted before a
     // single cache chunk is pinned. Otherwise that pin could prevent reclaim
     // for the lease itself at zero available budget.
-    auto *view = single && !populate ? acquire_view(len + 2 * page, true)
-                                    : nullptr;
+    auto *view =
+        single && !populate ? acquire_view(len + 2 * page, true) : nullptr;
     if (single && !view) {
       if (!first && populate && cache_limit != 0)
         first = entry(offset / chunk_bytes, true);
-      // Parsing needs its descriptor even on the borrowed-cache path. Admit
-      // it before pinning, so a cache hit cannot block its own allocation.
-      auto prepared = populate ? nullptr : lease(out, nullptr);
       if (auto *item = source(first)) {
-        if (prepared) {
-          prepared->single = item;
-          prepared->single_key = reinterpret_cast<size_t>(item);
-          out.lease = std::move(prepared);
-        } else {
+        try {
+          // Protect the usable input while admitting its descriptor. If this
+          // representation cannot fit, lease() releases the pin before we
+          // consider another representation.
           out.lease = lease(out, nullptr, item, reinterpret_cast<size_t>(item));
+          out.spans.push_back({item->data.load(std::memory_order_relaxed) +
+                                   offset - item->offset,
+                               len});
+          out.size = len;
+          return len;
+        } catch (const std::bad_alloc &) {
+          if (populate) throw;
+          out.reset();
         }
-        out.spans.push_back(
-            {item->data.load(std::memory_order_relaxed) + offset - item->offset,
-             len});
-        out.size = len;
-        return len;
       }
     }
     if (!view) view = acquire_view(len + 2 * page);
     if (!view) {
-      chunk_read_error = IndexError_NoMemory;
+      // A busy query workspace is a representation constraint, not a refusal
+      // of the parser's caller-owned destination.
+      chunk_read_error = populate ? IndexError_NoMemory : IndexError_ReadData;
+      return 0;
+    }
+    if (!populate && !view->workspace.mapped_size()) {
+      view->busy.store(false, std::memory_order_release);
+      changed.notify_one();
       return 0;
     }
     out.lease = lease(out, view);
     if (!ensure_workspace(*view, len + 2 * page)) {
-      chunk_read_error = IndexError_NoMemory;
+      chunk_read_error = populate ? IndexError_NoMemory : IndexError_ReadData;
       out.reset();
       return 0;
     }
@@ -1102,9 +1133,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       bool ok;
       if (buffered) {
         const size_t requested = run_end - run_first;
-        const size_t got = meta_file.read(
-            static_cast<ssize_t>(run_first),
-            destination + run_first - base, requested);
+        const size_t got =
+            meta_file.read(static_cast<ssize_t>(run_first),
+                           destination + run_first - base, requested);
         io_calls.fetch_add(1, std::memory_order_relaxed);
         io_bytes.fetch_add(got, std::memory_order_relaxed);
         ok = got == requested;
@@ -1120,8 +1151,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     for (size_t begin = offset; begin < offset + len;) {
       auto *chunk = single ? first : locate(begin);
       const size_t end =
-          chunk ? std::min(chunk->offset + chunk->bytes, offset + len)
-                : std::min((begin / chunk_bytes + 1) * chunk_bytes, offset + len);
+          chunk
+              ? std::min(chunk->offset + chunk->bytes, offset + len)
+              : std::min((begin / chunk_bytes + 1) * chunk_bytes, offset + len);
       auto *item = single && populate ? nullptr : source(chunk);
       if (item) {
         const auto release = ailego::ScopeGuard::Make(
@@ -1130,10 +1162,10 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           out.reset();
           return 0;
         }
-        std::memcpy(destination + begin - base,
-                    item->data.load(std::memory_order_relaxed) + begin -
-                        item->offset,
-                    end - begin);
+        std::memcpy(
+            destination + begin - base,
+            item->data.load(std::memory_order_relaxed) + begin - item->offset,
+            end - begin);
         copied.fetch_add(end - begin, std::memory_order_relaxed);
         run_first = run_end = end;
       } else {
@@ -1150,7 +1182,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return len;
   } catch (const std::bad_alloc &) {
     out.reset();
-    chunk_read_error = IndexError_NoMemory;
+    chunk_read_error = populate ? IndexError_NoMemory : IndexError_ReadData;
     return 0;
   }
   size_t scatter(size_t offset, size_t len, Segment::ScatterBlock &out,
@@ -1473,6 +1505,12 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
   }
   size_t read_for_parsing(size_t offset, MemoryBlock &out,
                           size_t len) override {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (len && offset < capacity() && state_->read_ahead &&
+        state_->prefetch_pending_requests.load(std::memory_order_acquire)) {
+      state_->read_ahead->yield_for_parsing(offset_, capacity());
+    }
+#endif
     return read_contiguous(offset, out, len, /*populate=*/false);
   }
   size_t read_contiguous(size_t offset, MemoryBlock &out, size_t len,
@@ -1518,6 +1556,18 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     owner->retain();
     out = MemoryBlock::MakeReusedScratch(
         const_cast<uint8_t *>(block.spans.front().data), owner, false);
+    return got;
+  }
+  size_t fetch_for_parsing(size_t offset, void *destination,
+                           size_t len) const override {
+    chunk_read_error = IndexError_ReadData;
+    if (offset > capacity() || !destination) return 0;
+    len = std::min(len, capacity() - offset);
+    if (!len) return 0;
+    const size_t got = state_->meta_file.read(
+        static_cast<ssize_t>(offset_ + offset), destination, len);
+    state_->io_calls.fetch_add(1, std::memory_order_relaxed);
+    state_->io_bytes.fetch_add(got, std::memory_order_relaxed);
     return got;
   }
   size_t fetch(size_t offset, void *destination, size_t len) const override {
@@ -1592,9 +1642,9 @@ int ChunkReadStorage::open(const std::string &path, bool) {
   try {
     auto candidate =
         std::allocate_shared<State>(ailego::BudgetedAllocator<State>{});
-    if (!candidate->initialize(
-            path, chunk_bytes_, cache_bytes_, max_read_bytes_, workspace_count_,
-            wait_ms_, direct_io_, adaptive_))
+    if (!candidate->initialize(path, chunk_bytes_, cache_bytes_,
+                               max_read_bytes_, workspace_count_, wait_ms_,
+                               direct_io_, adaptive_))
       return IndexError_OpenFile;
     size_t end = 0;
     if (!ResolveOffset(candidate->file_size, header_offset_, false,

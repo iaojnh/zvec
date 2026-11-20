@@ -895,6 +895,14 @@ class IndexStorage : public IndexModule {
                                     size_t len) {
       return read(offset, data, len);
     }
+
+    //! Fill an admitted metadata destination without populating optional query
+    //! caches or requiring a query workspace. Backends with such intermediate
+    //! storage override this; ordinary direct copies can use fetch unchanged.
+    virtual size_t fetch_for_parsing(size_t offset, void *buf,
+                                     size_t len) const {
+      return fetch(offset, buf, len);
+    }
   };
 
   //! Destructor

@@ -201,6 +201,19 @@ class BufferStorage : public IndexStorage {
       return len;
     }
 
+    size_t fetch_for_parsing(size_t offset, void *buf,
+                             size_t len) const override {
+      buffer_storage_read_error = IndexError_ReadData;
+      if (!owner_->buffer_pool_handle_) return 0;
+      len = clamp_length(&offset, len);
+      if (!len) return 0;
+      // Bypass still observes resident dirty pages and their synchronization.
+      return owner_->read_bypass(absolute_offset(offset), len,
+                                 static_cast<char *>(buf))
+                 ? len
+                 : 0;
+    }
+
     //! Read data from segment
     //! Read data into a bounded-lifetime block.
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
