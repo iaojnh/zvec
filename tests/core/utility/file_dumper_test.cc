@@ -13,6 +13,10 @@
 // limitations under the License.
 #include <iostream>
 #include <ailego/pattern/scope_guard.h>
+#include <ailego/utility/memory_helper.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include <gtest/gtest.h>
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_helper.h"
@@ -235,3 +239,72 @@ TEST(FileReadStorage, IndependentReadersKeepTheValidatedFile) {
   expect_data(clone, "first");
   expect_data(clone->clone(), "first");
 }
+
+TEST(FileReadStorage, LargeOwnedCopiesFitAnExactNativeBudget) {
+  constexpr size_t bytes = (2UL << 20) + 7;
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto previous = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto restore =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
+  ASSERT_GE(pool.available(), 2 * bytes);
+  const size_t padding = pool.available() - 2 * bytes;
+  ASSERT_TRUE(pool.try_charge_external(padding));
+  auto release =
+      ailego::ScopeGuard::Make([&] { pool.release_external(padding); });
+
+  using Block = IndexStorage::MemoryBlock;
+  auto first = Block::AllocateOwned(bytes);
+  std::memset(first.data_, 0x5a, bytes);
+  Block second = first;
+  EXPECT_NE(first.data(), second.data());
+  EXPECT_EQ(0u, pool.available());
+  Block assigned;
+  assigned = std::move(first);
+  Block moved(std::move(second));
+  EXPECT_EQ(0, std::memcmp(assigned.data(), moved.data(), bytes));
+  moved.reset();
+  EXPECT_EQ(bytes, pool.available());
+  assigned.reset();
+  EXPECT_EQ(2 * bytes, pool.available());
+}
+
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+TEST(FileReadStorage, ResidentReadIsCountedOnceAgainstRssLimit) {
+  constexpr size_t bytes = 16UL << 20;
+  const std::string path = "file_read_resident.idx";
+  auto cleanup = ailego::ScopeGuard::Make([&] { ailego::File::Delete(path); });
+  const std::string payload(bytes, 'q');
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_TRUE(dumper);
+  ASSERT_EQ(0, dumper->create(path));
+  ASSERT_EQ(bytes, dumper->write(payload.data(), bytes));
+  ASSERT_EQ(0, dumper->append("payload", bytes, 0, 0));
+  ASSERT_EQ(0, dumper->close());
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto previous = pool.capacity();
+  const auto previous_limit = pool.process_rss_limit();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0, pool.init(previous));
+    EXPECT_TRUE(pool.configure_process_rss_limit(previous_limit));
+  });
+  auto storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->open(path, false));
+  auto segment = storage->get("payload", 1);
+  ASSERT_TRUE(segment);
+  IndexStorage::MemoryBlock held;
+  ASSERT_EQ(bytes, segment->read(0, held, bytes));
+  const size_t baseline = ailego::MemoryHelper::SelfRSS();
+  ASSERT_NE(0u, baseline);
+  // There is room for one more result, but not for counting the first twice.
+  ASSERT_TRUE(pool.configure_process_rss_limit(baseline + bytes + bytes / 2));
+  IndexStorage::MemoryBlock second;
+  ASSERT_EQ(bytes, segment->read(0, second, bytes));
+  EXPECT_EQ(0, std::memcmp(held.data(), payload.data(), bytes));
+  EXPECT_EQ(0, std::memcmp(second.data(), payload.data(), bytes));
+}
+#endif

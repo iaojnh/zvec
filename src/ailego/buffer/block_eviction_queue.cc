@@ -181,15 +181,8 @@ struct alignas(std::max_align_t) MemoryLimitPool::QueueAllocationHeader {
   };
 };
 
-struct MemoryLimitPool::QueueResidentMapping {
-  QueueResidentMapping *previous{nullptr};
-  QueueResidentMapping *next{nullptr};
-  void *data{nullptr};
-  size_t bytes{0};
-};
-
 struct MemoryLimitPool::QueueMappingHeader {
-  QueueResidentMapping mapping;
+  ResidentRange mapping;
   ProcessRssBudget::MaterializationStamp stamp{};
   QueueAllocationHeader allocation{};
 };
@@ -219,7 +212,7 @@ struct MemoryLimitPool::QueueMemorySlab {
     previous = next = nullptr;
   }
 
-  QueueResidentMapping mapping;
+  ResidentRange mapping;
   QueueMemorySlab *previous{nullptr};
   QueueMemorySlab *next{nullptr};
   size_t slot_size;
@@ -238,37 +231,81 @@ void EvictionQueueTraits::free(void *ptr) {
   MemoryLimitPool::get_instance().free_queue_memory(ptr);
 }
 
-void MemoryLimitPool::register_queue_mapping(QueueResidentMapping *mapping,
-                                             void *data, size_t bytes) {
+void MemoryLimitPool::register_resident_range(ResidentRange *mapping,
+                                              void *data, size_t bytes) {
   mapping->data = data;
   mapping->bytes = bytes;
-  auto *next = queue_mappings_;
-  QueueResidentMapping *previous = nullptr;
+  auto *next = resident_ranges_;
+  ResidentRange *previous = nullptr;
   const auto address = reinterpret_cast<uintptr_t>(data);
   while (next && reinterpret_cast<uintptr_t>(next->data) < address) {
     previous = next;
     next = next->next;
   }
-  mapping->previous = previous;
-  mapping->next = next;
-  if (previous)
-    previous->next = mapping;
-  else
-    queue_mappings_ = mapping;
-  if (next) next->previous = mapping;
+  link_resident_neighbors(previous, next, mapping);
 }
 
-bool MemoryLimitPool::unmap_queue_mapping(QueueResidentMapping *mapping) {
+// The caller holds queue_memory_mutex_. Queue mapping nodes can already be
+// unmapped here, so update only the two live neighbors and the new node.
+void MemoryLimitPool::link_resident_neighbors(ResidentRange *previous,
+                                              ResidentRange *next,
+                                              ResidentRange *replacement) {
+  if (replacement) {
+    replacement->previous = previous;
+    replacement->next = next;
+  }
+  if (previous)
+    previous->next = replacement ? replacement : next;
+  else
+    resident_ranges_ = replacement ? replacement : next;
+  if (next) next->previous = replacement ? replacement : previous;
+}
+
+void MemoryLimitPool::HeapResidentRange::register_pages(void *data,
+                                                        size_t bytes) {
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+  // End pages may also contain another allocator client. Only wholly owned
+  // pages are eligible for the existing private-residency sample.
+  const size_t page = static_cast<size_t>(::getpagesize());
+  const auto address = reinterpret_cast<uintptr_t>(data);
+  const size_t skip = (page - address % page) % page;
+  if (bytes <= skip) return;
+  const size_t interior = (bytes - skip) / page * page;
+  if (!interior) return;
+  auto &pool = get_instance();
+  std::lock_guard<std::mutex> lock(pool.queue_memory_mutex_);
+  pool.register_resident_range(&range_, static_cast<char *>(data) + skip,
+                               interior);
+#else
+  (void)data;
+  (void)bytes;
+#endif
+}
+
+void MemoryLimitPool::HeapResidentRange::unlink() noexcept {
+  auto &pool = get_instance();
+  std::lock_guard<std::mutex> lock(pool.queue_memory_mutex_);
+  pool.link_resident_neighbors(range_.previous, range_.next, nullptr);
+  range_ = {};
+}
+
+void MemoryLimitPool::HeapResidentRange::replace(
+    HeapResidentRange &other) noexcept {
+  auto &pool = get_instance();
+  std::lock_guard<std::mutex> lock(pool.queue_memory_mutex_);
+  range_ = other.range_;
+  pool.link_resident_neighbors(range_.previous, range_.next, &range_);
+  other.range_ = {};
+}
+
+bool MemoryLimitPool::unmap_queue_mapping(ResidentRange *mapping) {
   auto *previous = mapping->previous;
   auto *next = mapping->next;
   // The directory node is inside this mapping. Save its links before unmap,
   // and retain both registration and charge if the OS refuses the unmap.
   if (!unmap_queue_memory(mapping->data, mapping->bytes)) return false;
-  if (previous)
-    previous->next = next;
-  else
-    queue_mappings_ = next;
-  if (next) next->previous = previous;
+  link_resident_neighbors(previous, next, nullptr);
   return true;
 }
 
@@ -348,7 +385,7 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
         slab->projection = ProcessRssBudget::MappingProjection::Full(
             region_bytes, process_rss_.finish_reservation(region_bytes, true));
       }
-      register_queue_mapping(&slab->mapping, raw, region_bytes);
+      register_resident_range(&slab->mapping, raw, region_bytes);
       slab->link(queue_small_slabs_[index]);
       queue_allocated_size_.fetch_add(region_bytes, std::memory_order_relaxed);
     }
@@ -383,7 +420,7 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
   auto *mapping = new (raw) QueueMappingHeader{};
   if (charged)
     mapping->stamp = process_rss_.finish_reservation(region_bytes, true);
-  register_queue_mapping(&mapping->mapping, raw, region_bytes);
+  register_resident_range(&mapping->mapping, raw, region_bytes);
   auto *header = &mapping->allocation;
   header->bytes = region_bytes;
   header->owner = nullptr;
@@ -692,9 +729,10 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
       begin += count * native_page;
     }
   }
-  // Queue blocks and producer metadata are charged anonymous mappings too.
-  // Their private resident pages can witness overlap; untouched slots cannot.
-  for (auto *mapping = pool.queue_mappings_; mapping; mapping = mapping->next) {
+  // Count only private, present pages in queue mappings and charged heap
+  // ranges.
+  for (auto *mapping = pool.resident_ranges_; mapping;
+       mapping = mapping->next) {
     uintptr_t begin = reinterpret_cast<uintptr_t>(mapping->data);
     const size_t bytes = mapping->bytes;
     if (begin % native_page || bytes % native_page ||
@@ -925,26 +963,26 @@ MemoryLimitPool::read_background_resident_sample() {
       resident += read_range(ranges[i].address, ranges[i].bytes, nullptr, page);
   }
   cursor = 0;
-  size_t queue_left = 0;
+  size_t ranges_left = 0;
   {
     std::unique_lock<std::mutex> lock(pool.queue_memory_mutex_,
                                       std::try_to_lock);
     if (lock)
-      for (auto *mapping = pool.queue_mappings_; mapping;
+      for (auto *mapping = pool.resident_ranges_; mapping;
            mapping = mapping->next)
-        ++queue_left;
+        ++ranges_left;
   }
-  while (queue_left != 0) {
+  while (ranges_left != 0) {
     size_t count = 0;
     {
       std::unique_lock<std::mutex> lock(pool.queue_memory_mutex_,
                                         std::try_to_lock);
       if (!lock) break;
-      auto *mapping = pool.queue_mappings_;
+      auto *mapping = pool.resident_ranges_;
       while (mapping && reinterpret_cast<uintptr_t>(mapping->data) < cursor)
         mapping = mapping->next;
-      for (size_t copied = 0; mapping && queue_left && copied < ranges.size();
-           ++copied, --queue_left) {
+      for (size_t copied = 0; mapping && ranges_left && copied < ranges.size();
+           ++copied, --ranges_left) {
         const auto address = reinterpret_cast<uintptr_t>(mapping->data);
         if (mapping->bytes > std::numeric_limits<uintptr_t>::max() - address)
           return {MemoryHelper::SelfRSS(), 0};

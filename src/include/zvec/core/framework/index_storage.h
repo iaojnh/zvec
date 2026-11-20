@@ -107,6 +107,7 @@ class IndexStorage : public IndexModule {
                              : ailego_malloc(size);
         if (!mb.data_) throw std::bad_alloc();
       });
+      mb.resident_range_.observe(mb.data_, mb.scratch_charge_.bytes());
       mb.scratch_size_ = size;
       mb.scratch_capacity_ = size;
       return mb;
@@ -231,6 +232,7 @@ class IndexStorage : public IndexModule {
           data_ = rhs.data_;
           scratch_size_ = rhs.scratch_size_;
           scratch_capacity_ = rhs.scratch_capacity_;
+          resident_range_.take(rhs.resident_range_);
           scratch_charge_ = std::move(rhs.scratch_charge_);
           rhs.data_ = nullptr;
           rhs.scratch_size_ = 0;
@@ -321,6 +323,7 @@ class IndexStorage : public IndexModule {
             data_ = rhs.data_;
             scratch_size_ = rhs.scratch_size_;
             scratch_capacity_ = rhs.scratch_capacity_;
+            resident_range_.take(rhs.resident_range_);
             scratch_charge_ = std::move(rhs.scratch_charge_);
             rhs.data_ = nullptr;
             rhs.scratch_size_ = 0;
@@ -415,6 +418,7 @@ class IndexStorage : public IndexModule {
 
    private:
     void release_owned() {
+      resident_range_.reset();
       if (data_) {
         ailego_free(data_);
         data_ = nullptr;
@@ -471,6 +475,7 @@ class IndexStorage : public IndexModule {
       *this = std::move(copy);
     }
 
+    ailego::MemoryLimitPool::HeapResidentRange resident_range_;
     ailego::MemoryReservation scratch_charge_;
     size_t scratch_capacity_{0};
     std::shared_ptr<ScratchLease> scratch_lease_;

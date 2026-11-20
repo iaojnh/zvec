@@ -248,7 +248,46 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
 };
 
 class ZVEC_AILEGO_API MemoryLimitPool {
+  struct ResidentRange {
+    ResidentRange *previous{nullptr};
+    ResidentRange *next{nullptr};
+    void *data{nullptr};
+    size_t bytes{0};
+  };
+
  public:
+  // An intrusive record avoids charging another allocation for observing a
+  // heap payload. Its owner must unregister it before releasing the backing.
+  class HeapResidentRange {
+   public:
+    HeapResidentRange() = default;
+    HeapResidentRange(const HeapResidentRange &) = delete;
+    HeapResidentRange &operator=(const HeapResidentRange &) = delete;
+    ~HeapResidentRange() {
+      reset();
+    }
+
+    void observe(void *data, size_t charged_bytes) {
+      // Smaller allocations cannot contain an entire native page.
+      reset();
+      if (data && charged_bytes >= 4096) register_pages(data, charged_bytes);
+    }
+    void reset() noexcept {
+      if (range_.data) unlink();
+    }
+    void take(HeapResidentRange &other) noexcept {
+      if (this == &other) return;
+      reset();
+      if (other.range_.data) replace(other);
+    }
+
+   private:
+    void register_pages(void *data, size_t bytes);
+    void unlink() noexcept;
+    void replace(HeapResidentRange &other) noexcept;
+    ResidentRange range_;
+  };
+
   static MemoryLimitPool &get_instance() {
     // Retain process-wide state while any loaded image may reference it.
     static std::atomic<MemoryLimitPool *> instance{nullptr};
@@ -637,7 +676,6 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   struct QueueAllocationHeader;
   struct QueueMappingHeader;
   struct QueueMemorySlab;
-  struct QueueResidentMapping;
   static ProcessRssBudget::ResidentSample read_slab_resident_sample();
   static ProcessRssBudget::ResidentSample read_background_resident_sample();
   enum class Backing { kLive, kPending, kPlan };
@@ -648,9 +686,11 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   bool drain_free_list();
   void *allocate_queue_memory(size_t bytes);
   void free_queue_memory(void *ptr);
-  void register_queue_mapping(QueueResidentMapping *mapping, void *data,
-                              size_t bytes);
-  bool unmap_queue_mapping(QueueResidentMapping *mapping);
+  void register_resident_range(ResidentRange *mapping, void *data,
+                               size_t bytes);
+  void link_resident_neighbors(ResidentRange *previous, ResidentRange *next,
+                               ResidentRange *replacement);
+  bool unmap_queue_mapping(ResidentRange *mapping);
   bool try_reserve_used(size_t bytes);
   bool try_reserve_page_used(size_t bytes, bool required = false);
   bool try_reserve_committed(size_t bytes, Backing backing = Backing::kLive,
@@ -793,8 +833,9 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<size_t> queue_allocated_size_{0};
   std::atomic<size_t> queue_charged_size_{0};
   // All charged queue mappings, including full small-allocation slabs.
-  // Protected by queue_memory_mutex_; nodes live in their own mapping.
-  QueueResidentMapping *queue_mappings_{nullptr};
+  // Protected by queue_memory_mutex_. Queue mappings and heap owners
+  // contain their own registry nodes.
+  ResidentRange *resident_ranges_{nullptr};
   // Only non-full slabs are linked here. Every slot retains its slab owner,
   // so a full slab can rejoin its size class on the first object release.
   std::array<QueueMemorySlab *, 4096 / alignof(std::max_align_t)>
