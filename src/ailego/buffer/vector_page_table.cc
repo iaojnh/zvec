@@ -1415,9 +1415,9 @@ void VecBufferPool::drain_writeback() {
 }
 
 void VecBufferPool::writeback_loop() {
-  std::vector<block_id_t> page_ids;
-  page_ids.reserve(kBlockingAioBatchSize);
+  std::array<block_id_t, kBlockingAioBatchSize> page_ids;
   while (true) {
+    size_t count = 0;
     {
       std::unique_lock<std::mutex> lock(writeback_mutex_);
       writeback_cv_.wait(lock, [this] {
@@ -1429,38 +1429,38 @@ void VecBufferPool::writeback_loop() {
         }
         continue;
       }
-      page_ids.clear();
-      while (!writeback_queue_.empty() &&
-             page_ids.size() < kBlockingAioBatchSize) {
-        page_ids.push_back(writeback_queue_.front());
+      while (!writeback_queue_.empty() && count < page_ids.size()) {
+        page_ids[count++] = writeback_queue_.front();
         writeback_queue_.pop_front();
       }
-      writeback_inflight_ += page_ids.size();
+      writeback_inflight_ += count;
     }
 
     try {
       std::lock_guard<std::mutex> flush_lock(writeback_flush_mutex_);
-      flush_writeback_batch(page_ids, writeback_staging_);
+      // The pending bit admits each page only once until this batch drains.
+      std::sort(page_ids.begin(), page_ids.begin() + count);
+      flush_writeback_batch(page_ids.data(), count, writeback_staging_);
     } catch (...) {
-      writeback_failures_.fetch_add(page_ids.size(), std::memory_order_relaxed);
+      writeback_failures_.fetch_add(count, std::memory_order_relaxed);
       int expected = 0;
       (void)writeback_error_.compare_exchange_strong(
           expected, EIO, std::memory_order_release, std::memory_order_relaxed);
       LOG_ERROR("VecBufferPool writeback threw: file[%s], pages[%zu]",
-                file_name_.c_str(), page_ids.size());
+                file_name_.c_str(), count);
     }
 
-    for (block_id_t page_id : page_ids) {
-      page_table_.clear_writeback_pending(page_id);
+    for (size_t i = 0; i < count; ++i) {
+      page_table_.clear_writeback_pending(page_ids[i]);
     }
-    writeback_pending_.fetch_sub(page_ids.size(), std::memory_order_relaxed);
-    for (block_id_t page_id : page_ids) {
-      (void)page_table_.reclaim_clean_block(page_id);
+    writeback_pending_.fetch_sub(count, std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
+      (void)page_table_.reclaim_clean_block(page_ids[i]);
     }
 
     {
       std::lock_guard<std::mutex> lock(writeback_mutex_);
-      writeback_inflight_ -= page_ids.size();
+      writeback_inflight_ -= count;
       if (writeback_queue_.empty() && writeback_inflight_ == 0) {
         writeback_drained_cv_.notify_all();
       }
@@ -1475,20 +1475,18 @@ void VecBufferPool::writeback_loop() {
   }
 }
 
-bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
-                                          char *staging) {
+bool VecBufferPool::flush_writeback_batch(const block_id_t *page_ids,
+                                          size_t count, char *staging) {
   if (writeback_quarantined()) return false;
-  if (page_ids.empty()) {
+  if (count == 0) {
     return true;
   }
-  std::sort(page_ids.begin(), page_ids.end());
-  page_ids.erase(std::unique(page_ids.begin(), page_ids.end()), page_ids.end());
 
 #if defined(__linux__) && !defined(__ANDROID__)
   if (writeback_io_uring_ && writeback_io_uring_->is_valid()) {
     bool all_ok = true;
     size_t pos = 0;
-    while (pos < page_ids.size()) {
+    while (pos < count) {
       std::array<block_id_t, kBlockingAioBatchSize> selected_pages{};
       std::array<char *, kBlockingAioBatchSize> buffers{};
       std::array<size_t, kBlockingAioBatchSize> locked_stripes{};
@@ -1496,7 +1494,7 @@ bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
           locks;
       size_t selected = 0;
 
-      while (pos < page_ids.size() && selected < kBlockingAioBatchSize) {
+      while (pos < count && selected < kBlockingAioBatchSize) {
         const block_id_t page_id = page_ids[pos];
         if (!page_table_.is_block_dirty(page_id)) {
           ++pos;
@@ -1625,10 +1623,10 @@ bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
   std::array<std::shared_lock<std::shared_mutex>, kBlockingAioBatchSize> locks;
 
   size_t pos = 0;
-  while (pos < page_ids.size()) {
+  while (pos < count) {
     const block_id_t run_start = page_ids[pos];
     size_t run_count = 0;
-    while (pos + run_count < page_ids.size() && run_count < run_limit &&
+    while (pos + run_count < count && run_count < run_limit &&
            page_ids[pos + run_count] == run_start + run_count) {
       const block_id_t page_id = page_ids[pos + run_count];
       if (!page_table_.is_block_dirty(page_id)) {
@@ -2470,21 +2468,21 @@ int VecBufferPool::flush_all() {
   int rc = 0;
   size_t total_dirty = 0;
   size_t failed_batches = 0;
-  std::vector<block_id_t> dirty_pages;
-  dirty_pages.reserve(kBlockingAioBatchSize);
+  std::array<block_id_t, kBlockingAioBatchSize> dirty_pages;
+  size_t count = 0;
   for (size_t page_id = 0; page_id < total; ++page_id) {
     if (page_table_.is_block_dirty(page_id)) {
-      dirty_pages.push_back(page_id);
+      dirty_pages[count++] = page_id;
     }
-    if (dirty_pages.size() == kBlockingAioBatchSize ||
-        (page_id + 1 == total && !dirty_pages.empty())) {
-      total_dirty += dirty_pages.size();
-      if (!flush_writeback_batch(dirty_pages, writeback_staging_)) {
+    if (count == dirty_pages.size() || (page_id + 1 == total && count != 0)) {
+      total_dirty += count;
+      if (!flush_writeback_batch(dirty_pages.data(), count,
+                                 writeback_staging_)) {
         rc = -1;
         ++failed_batches;
         if (writeback_quarantined()) break;
       }
-      dirty_pages.clear();
+      count = 0;
     }
   }
 

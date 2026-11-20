@@ -20,6 +20,7 @@
 #include <numeric>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
@@ -34,6 +35,17 @@
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_mapping.h>
 #include "../../ailego/buffer/pool_payload_budget.h"
+
+namespace zvec::ailego {
+struct VecBufferPoolTestPeer {
+  static void quarantine_writeback(VecBufferPool &pool) {
+    pool.writeback_error_.store(VecBufferPool::kWritebackQuarantined);
+  }
+  static int exchange_metadata_fd(VecBufferPool &pool, int fd) {
+    return std::exchange(pool.meta_fd_, fd);
+  }
+};
+}  // namespace zvec::ailego
 
 using namespace zvec;
 using namespace zvec::core;
@@ -108,6 +120,97 @@ class BufferStorageWriteTest : public ::testing::Test {
 
   std::string file_path_;
 };
+
+TEST_F(BufferStorageWriteTest, FailedCloseCanRetryMetadataAndCheckpoint) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("data", 16));
+  auto segment = storage->get("data");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(5u, segment->write(0, "saved", 5));
+  storage->refresh(123);
+  {
+    auto pool = storage->vec_buffer_pool();
+    const int fd =
+        ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, -1);
+    AILEGO_DEFER([&] {
+      ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, fd);
+    });
+    EXPECT_NE(0, storage->close());
+    EXPECT_TRUE(storage->has("data"));
+    EXPECT_EQ(file_path_, storage->file_path());
+  }
+  ASSERT_EQ(0, storage->close());
+  auto reader = open_read_only();
+  ASSERT_TRUE(reader);
+  ASSERT_EQ(123u, reader->check_point());
+  segment = reader->get("data");
+  ASSERT_TRUE(segment);
+  char payload[5];
+  ASSERT_EQ(sizeof(payload), segment->fetch(0, payload, sizeof(payload)));
+  EXPECT_EQ("saved", std::string(payload, sizeof(payload)));
+}
+
+TEST_F(BufferStorageWriteTest, QuarantinedCloseReportsErrorAndReleasesFile) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  storage->refresh(123);
+  ailego::VecBufferPoolTestPeer::quarantine_writeback(
+      *storage->vec_buffer_pool());
+  EXPECT_NE(0, storage->close());
+  EXPECT_TRUE(storage->file_path().empty());
+  EXPECT_EQ(0, storage->close());
+}
+
+TEST_F(BufferStorageWriteTest, MappedCloseHonorsCopyOnWritePersistenceMode) {
+  auto store = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_TRUE(store);
+  ASSERT_EQ(0, store->open(file_path_, true));
+  ASSERT_EQ(0, store->append("data", 16));
+  auto segment = store->get("data");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(4u, segment->write(0, "base", 4));
+  segment.reset();
+  ASSERT_EQ(0, store->close());
+
+  for (const bool force_flush : {false, true}) {
+    ailego::Params params;
+    params.set("proxima.mmap_file.storage.copy_on_write", true);
+    params.set("proxima.mmap_file.storage.force_flush", force_flush);
+    ASSERT_EQ(0, store->init(params));
+    ASSERT_EQ(0, store->open(file_path_, false));
+    segment = store->get("data");
+    ASSERT_TRUE(segment);
+    ASSERT_EQ(4u, segment->write(0, "next", 4));
+    store->refresh(321);
+    segment.reset();
+    ASSERT_EQ(0, store->close());
+    ASSERT_EQ(0, store->close());
+    auto reader = open_read_only();
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(force_flush ? 321u : 0u, reader->check_point());
+    segment = reader->get("data");
+    ASSERT_TRUE(segment);
+    char payload[4];
+    ASSERT_EQ(sizeof(payload), segment->fetch(0, payload, sizeof(payload)));
+    EXPECT_EQ(force_flush ? "next" : "base",
+              std::string(payload, sizeof(payload)));
+    segment.reset();
+  }
+  // A checksum-only edit still changes the directory's own checksum.
+  ASSERT_EQ(0, store->open(file_path_, false));
+  segment = store->get("data");
+  ASSERT_TRUE(segment);
+  const uint32_t crc = ailego::Crc32c::Hash("next", 4, 0);
+  segment->update_data_crc(crc);
+  segment.reset();
+  ASSERT_EQ(0, store->close());
+  auto reader = open_read_only();
+  ASSERT_TRUE(reader);
+  segment = reader->get("data");
+  ASSERT_TRUE(segment);
+  EXPECT_EQ(crc, segment->data_crc());
+}
 
 TEST_F(BufferStorageWriteTest, WritableReopenWithoutCreationPersistsChanges) {
   {

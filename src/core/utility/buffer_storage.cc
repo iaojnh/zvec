@@ -1791,6 +1791,11 @@ class BufferStorage : public IndexStorage {
     // the page table reset under it, dropping the modification).
     AllShardsExclusiveLatch latch(mapping_shards_);
     const int ret = flush_index_locked();
+    // A retry needs the dirty directory and checkpoint even when all data
+    // pages have already been written successfully.
+    if (ret != 0 && !corrupted_.load(std::memory_order_acquire) &&
+        !buffer_pool_->writeback_quarantined())
+      return ret;
     read_scratch_.clear();
     file_name_.clear();
     segments_.reset();

@@ -800,6 +800,11 @@ class ZVEC_AILEGO_API VecBufferPool {
     return initialized_;
   }
 
+  // The kernel could not confirm completion. This pool cannot retry writes.
+  bool writeback_quarantined() const {
+    return writeback_error() == kWritebackQuarantined;
+  }
+
   //! Borrow the page-data descriptor (a CRT descriptor on Windows). The pool
   //! owns it: callers must not close it or change its flags, and must retain
   //! the pool until they have captured their own handle to the same file.
@@ -893,15 +898,14 @@ class ZVEC_AILEGO_API VecBufferPool {
   void stop_writeback();
   void drain_writeback();
   void writeback_loop();
-  bool flush_writeback_batch(std::vector<block_id_t> &page_ids, char *staging);
+  // The caller supplies sorted, distinct page IDs.
+  bool flush_writeback_batch(const block_id_t *page_ids, size_t count,
+                             char *staging);
   int writeback_error() const {
     return writeback_error_.load(std::memory_order_acquire);
   }
   // Ordinary failures store a positive errno and can be retried.
   static constexpr int kWritebackQuarantined = -1;
-  bool writeback_quarantined() const {
-    return writeback_error() == kWritebackQuarantined;
-  }
 
   int fd_;       // page-data channel: O_DIRECT or F_NOCACHE when supported
   int meta_fd_;  // metadata channel: always buffered IO

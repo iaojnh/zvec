@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <algorithm>
 #include <mutex>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/core/framework/index_error.h>
@@ -66,34 +67,26 @@ class MMapFileStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (ailego_unlikely(offset + len > segment_->meta()->data_size)) {
-        auto meta = segment_->meta();
-        if (offset > meta->data_size) {
-          offset = meta->data_size;
-        }
-        len = meta->data_size - offset;
-      }
+      const size_t size = data_size();
+      if (offset >= size || !len) return 0;
+      len = std::min(len, size - offset);
       memmove(buf, (const uint8_t *)segment_->data() + offset, len);
       return len;
     }
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > segment_->meta()->data_size)) {
-        auto meta = segment_->meta();
-        if (offset > meta->data_size) {
-          offset = meta->data_size;
-        }
-        len = meta->data_size - offset;
-      }
+      const size_t size = data_size();
+      offset = std::min(offset, size);
+      len = std::min(len, size - offset);
       data.reset((uint8_t *)segment_->data() + offset);
       return len;
     }
 
     //! Write data into the storage with offset
     size_t write(size_t offset, const void *data, size_t len) override {
-      size_t data_tail = offset + len;
-      ailego_zero_if_false(data_tail <= capacity_);
+      if (offset > capacity_ || len > capacity_ - offset) return 0;
+      const size_t data_tail = offset + len;
       auto meta = segment_->meta();
       if (data_tail > meta->data_size) {
         meta->data_size = data_tail;
@@ -122,6 +115,7 @@ class MMapFileStorage : public IndexStorage {
     //! Update crc of data
     void update_data_crc(uint32_t crc) override {
       segment_->meta()->data_crc = crc;
+      owner_->set_as_dirty();
     }
 
     //! Clone the segment
@@ -160,8 +154,7 @@ class MMapFileStorage : public IndexStorage {
 
   //! Cleanup storage
   int cleanup() override {
-    this->close_index();
-    return 0;
+    return close_index();
   }
 
   //! Open storage
@@ -191,8 +184,7 @@ class MMapFileStorage : public IndexStorage {
 
   //! Close storage
   int close() override {
-    this->close_index();
-    return 0;
+    return close_index();
   }
 
   //! Append a segment into storage
@@ -301,12 +293,15 @@ class MMapFileStorage : public IndexStorage {
   }
 
   //! Close index storage
-  void close_index() {
-    if (index_dirty_) {
-      this->refresh_index(0);
+  int close_index() {
+    if (is_dirty() && (!copy_on_write_ || force_flush_)) {
+      const int ret = flush_index();
+      if (ret != 0) return ret;
     }
     std::lock_guard<std::mutex> latch(mapping_mutex_);
     mapping_.close();
+    index_dirty_ = false;
+    return 0;
   }
 
   //! Append a segment into storage
