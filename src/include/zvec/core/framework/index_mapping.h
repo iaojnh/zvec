@@ -41,8 +41,7 @@ class IndexMapping {
     //! Flush the segment
     bool flush() const {
       ailego_false_if_false(this->meta_ && this->data_);
-      return ailego::File::MemoryFlush(
-          this->data_, this->meta_->data_size + this->meta_->padding_size);
+      return ailego::File::MemoryFlush(data_, mapping_size_);
     }
 
     //! Retrieve mapping address of the segment
@@ -69,8 +68,9 @@ class IndexMapping {
     friend class IndexMapping;
 
     //! Set the mapping address of the segment
-    void set_data(void *addr) {
+    void set_data(void *addr, size_t size) {
       data_ = addr;
+      mapping_size_ = size;
     }
 
     //! Clear the dirty flag
@@ -82,6 +82,7 @@ class IndexMapping {
     //! Members
     IndexFormat::SegmentMeta *meta_{nullptr};
     void *data_{nullptr};
+    size_t mapping_size_{0};
     mutable bool dirty_{false};
   };
 
@@ -118,6 +119,10 @@ class IndexMapping {
 
   //! Refresh meta information (checksum, update time, etc.)
   void refresh(uint64_t check_point);
+
+  uint64_t check_point() const {
+    return check_point_;
+  }
 
   //! Append a segment into index
   int append(const std::string &id, size_t size);
@@ -217,6 +222,7 @@ class IndexMapping {
   IndexFormat::MetaFooter *footer_{nullptr};
   ailego::LazyMap<SegmentMap> segments_{};
   size_t index_size_{0u};
+  uint64_t check_point_{0};
   ailego::File file_{};
   std::string path_;
   bool copy_on_write_{false};

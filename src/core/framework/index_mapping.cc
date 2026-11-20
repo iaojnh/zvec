@@ -200,7 +200,7 @@ int IndexMapping::init_meta_section(bool exclusive) {
   IndexFormat::SetupMetaFooter(&meta_footer);
   meta_footer.segments_meta_size = segments_meta_size;
   meta_footer.total_size = len;
-  IndexFormat::UpdateMetaFooter(&meta_footer, 0);
+  IndexFormat::UpdateMetaFooter(&meta_footer, check_point_);
 
   if (huge_page_) {
     const int opts = ailego::File::MMAP_SHARED | ailego::File::MMAP_HUGE_PAGE;
@@ -240,6 +240,7 @@ void IndexMapping::swap(IndexMapping &rhs) noexcept {
   swap(footer_, rhs.footer_);
   swap(segments_, rhs.segments_);
   swap(index_size_, rhs.index_size_);
+  swap(check_point_, rhs.check_point_);
   swap(file_, rhs.file_);
   swap(path_, rhs.path_);
   swap(copy_on_write_, rhs.copy_on_write_);
@@ -273,6 +274,7 @@ void IndexMapping::close() {
   header_addr_map_.clear();
   footer_ = nullptr;
   index_size_ = 0u;
+  check_point_ = 0;
   segments_.clear();
   current_header_start_offset_ = 0;
   seg_meta_capacity_ = 0;
@@ -284,7 +286,8 @@ void IndexMapping::close() {
 }
 
 void IndexMapping::refresh(uint64_t check_point) {
-  // support add_with_id
+  if (!footer_) return;
+  check_point_ = std::max(check_point_, check_point);
   for (auto item : header_addr_map_) {
     auto header = item.second.header;
     auto footer = reinterpret_cast<IndexFormat::MetaFooter *>(
@@ -294,7 +297,7 @@ void IndexMapping::refresh(uint64_t check_point) {
         (header->meta_footer_offset - footer->segments_meta_size));
     footer->segments_meta_crc =
         ailego::Crc32c::Hash(segment_start, footer->segments_meta_size, 0);
-    IndexFormat::UpdateMetaFooter(footer, check_point);
+    IndexFormat::UpdateMetaFooter(footer, check_point_);
   }
   header_dirty_ = true;
 }
@@ -455,7 +458,7 @@ IndexMapping::Segment *IndexMapping::map(const std::string &id, bool warmup,
       LOG_ERROR("Map segment failed, segment id %s", id.c_str());
       return nullptr;
     }
-    item->set_data(addr);
+    item->set_data(addr, mapping_size);
 
     // Lock memory
     if (locked) {
@@ -476,9 +479,8 @@ void IndexMapping::unmap(const std::string &id) {
     Segment *item = &segment_info.segment;
 
     if (item->data()) {
-      ailego::File::MemoryUnmap(
-          item->data(), item->meta()->data_size + item->meta()->padding_size);
-      item->set_data(nullptr);
+      ailego::File::MemoryUnmap(item->data(), item->mapping_size_);
+      item->set_data(nullptr, 0);
     }
   }
 }
@@ -489,9 +491,8 @@ void IndexMapping::unmap_all() {
     Segment *item = &segment_info.segment;
 
     if (item->data()) {
-      ailego::File::MemoryUnmap(
-          item->data(), item->meta()->data_size + item->meta()->padding_size);
-      item->set_data(nullptr);
+      ailego::File::MemoryUnmap(item->data(), item->mapping_size_);
+      item->set_data(nullptr, 0);
     }
   }
 }
@@ -510,7 +511,7 @@ int IndexMapping::flush() {
       continue;
     }
 
-    size_t segment_size = item->meta()->data_size + item->meta()->padding_size;
+    const size_t segment_size = item->mapping_size_;
     if (full_mode_ && copy_on_write_) {
       size_t off = segment_info.segment_header_start_offset +
                    segment_info.segment_header->content_offset +
@@ -535,10 +536,9 @@ int IndexMapping::flush() {
     for (auto item : header_addr_map_) {
       auto header_start_offset = item.first;
       auto header = item.second.header;
-      if (file_.write(header_start_offset, header, header->content_offset) !=
-          header->content_offset) {
-        LOG_ERROR("Failed to write segment, size %zu, %s",
-                  (size_t)header->content_offset,
+      if (file_.write(header_start_offset, header, item.second.length) !=
+          item.second.length) {
+        LOG_ERROR("Failed to write segment, size %zu, %s", item.second.length,
                   ailego::FileHelper::GetLastErrorString().c_str());
         return IndexError_WriteData;
       }
@@ -705,6 +705,8 @@ int IndexMapping::init_index_mapping_admitted(
       segment_ids_offset_) {
     return IndexError_InvalidLength;
   }
+
+  check_point_ = std::max(check_point_, uint64_t{footer_->check_point});
 
   // if (header_->version == IndexFormat::COMPATIBLE_FORMAT_VERSION_0X0002) {
   //   header_->version = IndexFormat::CURRENT_FORMAT_VERSION;

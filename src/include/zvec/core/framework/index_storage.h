@@ -144,7 +144,7 @@ class IndexStorage : public IndexModule {
       return true;
     }
 
-    //! Keep a read-only file mapping alive while this view is retained.
+    //! Keep the file mapping alive while this view is retained.
     static MemoryBlock MakeMappedView(void *data,
                                       const std::shared_ptr<void> &owner) {
       MemoryBlock block(data);

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
@@ -26,6 +29,26 @@ namespace core {
 /*! MMap File Storage
  */
 class MMapFileStorage : public IndexStorage {
+  struct OpenFile {
+    IndexMapping mapping;
+    // Directory operations exclude writes. Independent segments can write in
+    // parallel.
+    std::shared_mutex directory_mutex;
+    std::array<std::mutex, 32> segment_mutexes;
+    std::atomic<bool> dirty{false};
+    bool retired{false};
+    bool persist_on_close{true};
+
+    bool is_dirty() const {
+      return dirty.load(std::memory_order_relaxed) || mapping.is_header_dirty();
+    }
+
+    int flush() {
+      if (dirty.exchange(false, std::memory_order_relaxed)) mapping.refresh(0);
+      return mapping.flush();
+    }
+  };
+
  public:
   /*! Index Storage Segment
    */
@@ -36,9 +59,11 @@ class MMapFileStorage : public IndexStorage {
     typedef std::shared_ptr<Segment> Pointer;
 
     //! Constructor
-    Segment(MMapFileStorage *owner, IndexMapping::Segment *segment)
+    Segment(std::shared_ptr<OpenFile> owner, IndexMapping::Segment *segment,
+            std::mutex &mutex)
         : segment_(segment),
-          owner_(owner),
+          owner_(std::move(owner)),
+          mutex_(mutex),
           capacity_(static_cast<size_t>(segment->meta()->data_size +
                                         segment->meta()->padding_size)) {}
 
@@ -47,16 +72,19 @@ class MMapFileStorage : public IndexStorage {
 
     //! Retrieve size of data
     size_t data_size() const override {
+      std::lock_guard lock(mutex_);
       return static_cast<size_t>(segment_->meta()->data_size);
     }
 
     //! Retrieve crc of data
     uint32_t data_crc() const override {
+      std::lock_guard lock(mutex_);
       return segment_->meta()->data_crc;
     }
 
     //! Retrieve size of padding
     size_t padding_size() const override {
+      std::lock_guard lock(mutex_);
       return static_cast<size_t>(segment_->meta()->padding_size);
     }
 
@@ -67,7 +95,8 @@ class MMapFileStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      const size_t size = data_size();
+      std::lock_guard lock(mutex_);
+      const size_t size = segment_->meta()->data_size;
       if (offset >= size || !len) return 0;
       len = std::min(len, size - offset);
       memmove(buf, (const uint8_t *)segment_->data() + offset, len);
@@ -79,27 +108,35 @@ class MMapFileStorage : public IndexStorage {
       const size_t size = data_size();
       offset = std::min(offset, size);
       len = std::min(len, size - offset);
-      data.reset((uint8_t *)segment_->data() + offset);
+      data = MemoryBlock::MakeMappedView((uint8_t *)segment_->data() + offset,
+                                         owner_);
       return len;
     }
 
     //! Write data into the storage with offset
     size_t write(size_t offset, const void *data, size_t len) override {
-      if (offset > capacity_ || len > capacity_ - offset) return 0;
+      if (offset > capacity_ || len > capacity_ - offset || (len && !data))
+        return 0;
+      std::shared_lock directory(owner_->directory_mutex);
+      if (owner_->retired) return 0;
+      std::lock_guard lock(mutex_);
       const size_t data_tail = offset + len;
       auto meta = segment_->meta();
       if (data_tail > meta->data_size) {
         meta->data_size = data_tail;
         meta->padding_size = capacity_ - data_tail;
       }
-      owner_->set_as_dirty();
-      memmove((uint8_t *)segment_->data() + offset, data, len);
+      owner_->dirty.store(true, std::memory_order_relaxed);
+      if (len) memmove((uint8_t *)segment_->data() + offset, data, len);
       segment_->set_dirty();
       return len;
     }
 
     //! Resize size of data
     size_t resize(size_t size) override {
+      std::shared_lock directory(owner_->directory_mutex);
+      std::lock_guard lock(mutex_);
+      if (owner_->retired) return segment_->meta()->data_size;
       auto meta = segment_->meta();
       if (meta->data_size != size) {
         if (size > capacity_) {
@@ -107,15 +144,18 @@ class MMapFileStorage : public IndexStorage {
         }
         meta->data_size = size;
         meta->padding_size = capacity_ - size;
-        owner_->set_as_dirty();
+        owner_->dirty.store(true, std::memory_order_relaxed);
       }
       return size;
     }
 
     //! Update crc of data
     void update_data_crc(uint32_t crc) override {
+      std::shared_lock directory(owner_->directory_mutex);
+      if (owner_->retired) return;
+      std::lock_guard lock(mutex_);
       segment_->meta()->data_crc = crc;
-      owner_->set_as_dirty();
+      owner_->dirty.store(true, std::memory_order_relaxed);
     }
 
     //! Clone the segment
@@ -130,17 +170,19 @@ class MMapFileStorage : public IndexStorage {
 
    private:
     IndexMapping::Segment *segment_{};
-    MMapFileStorage *owner_{nullptr};
+    std::shared_ptr<OpenFile> owner_;
+    std::mutex &mutex_;
     size_t capacity_{};
   };
 
   //! Destructor
   ~MMapFileStorage() override {
-    this->cleanup();
+    close_index(/*disposing=*/true);
   }
 
   //! Initialize storage
   int init(const ailego::Params &params) override {
+    std::lock_guard lock(lifecycle_mutex_);
     uint32_t val = params.get_as_uint32(MMAPFILE_STORAGE_SEGMENT_META_CAPACITY);
     if (val != 0) {
       segment_meta_capacity_ = val;
@@ -158,10 +200,16 @@ class MMapFileStorage : public IndexStorage {
   }
 
   //! Open storage
-  int open(const std::string &path, bool create_if_missing) override {
-    if (is_dirty()) {
-      const int ret = flush_index();
-      if (ret != 0) return ret;
+  int open(const std::string &path, bool create_if_missing) override try {
+    std::lock_guard lock(lifecycle_mutex_);
+    auto previous = file_;
+    std::unique_lock<std::shared_mutex> writers;
+    if (previous) {
+      writers = std::unique_lock(previous->directory_mutex);
+      if (previous->persist_on_close && previous->is_dirty()) {
+        const int ret = previous->flush();
+        if (ret != 0) return ret;
+      }
     }
     if (!ailego::File::IsExist(path) && create_if_missing) {
       size_t last_slash = path.rfind('/');
@@ -174,12 +222,24 @@ class MMapFileStorage : public IndexStorage {
         return error_code;
       }
     }
-    return mapping_.open(path, copy_on_write_, force_flush_);
+    auto next =
+        std::allocate_shared<OpenFile>(ailego::BudgetedAllocator<OpenFile>{});
+    const int ret = next->mapping.open(path, copy_on_write_, force_flush_);
+    if (ret != 0) return ret;
+    next->persist_on_close = !copy_on_write_ || force_flush_;
+    if (previous) previous->retired = true;
+    file_ = std::move(next);
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   //! Flush storage
   int flush() override {
-    return this->flush_index();
+    std::lock_guard lock(lifecycle_mutex_);
+    if (!file_) return 0;
+    std::unique_lock directory(file_->directory_mutex);
+    return file_->flush();
   }
 
   //! Close storage
@@ -189,36 +249,49 @@ class MMapFileStorage : public IndexStorage {
 
   //! Append a segment into storage
   int append(const std::string &id, size_t size) override {
-    return this->append_segment(id, size);
+    std::lock_guard lock(lifecycle_mutex_);
+    if (!file_) return IndexError_Runtime;
+    std::unique_lock directory(file_->directory_mutex);
+    return file_->mapping.append(id, size);
   }
 
   //! Refresh meta information (checksum, update time, etc.)
   void refresh(uint64_t chkp) override {
-    this->refresh_index(chkp);
+    std::lock_guard lock(lifecycle_mutex_);
+    if (!file_) return;
+    std::unique_lock directory(file_->directory_mutex);
+    file_->mapping.refresh(chkp);
+    file_->dirty.store(false, std::memory_order_relaxed);
   }
 
   //! Retrieve check point of storage
   uint64_t check_point() const override {
-    return mapping_.footer().check_point;
+    std::lock_guard lock(lifecycle_mutex_);
+    return file_ ? file_->mapping.check_point() : 0;
   }
 
   //! Retrieve a segment by id
   IndexStorage::Segment::Pointer get(const std::string &id, int) override {
-    IndexMapping::Segment *segment = this->get_segment(id);
-    if (!segment) {
-      return MMapFileStorage::Segment::Pointer();
-    }
-    return std::make_shared<MMapFileStorage::Segment>(this, segment);
+    std::lock_guard lock(lifecycle_mutex_);
+    if (!file_) return {};
+    std::unique_lock directory(file_->directory_mutex);
+    auto segment = file_->mapping.map(id, memory_warmup_, memory_locked_);
+    if (!segment) return {};
+    auto &mutex = file_->segment_mutexes[std::hash<std::string>{}(id) %
+                                         file_->segment_mutexes.size()];
+    return std::make_shared<Segment>(file_, segment, mutex);
   }
 
   //! Test if it a segment exists
   bool has(const std::string &id) const override {
-    return this->has_segment(id);
+    std::lock_guard lock(lifecycle_mutex_);
+    return file_ && file_->mapping.has(id);
   }
 
   //! Retrieve magic number of index
   uint32_t magic() const override {
-    return mapping_.magic();
+    std::lock_guard lock(lifecycle_mutex_);
+    return file_ ? file_->mapping.magic() : 0;
   }
 
  protected:
@@ -265,61 +338,28 @@ class MMapFileStorage : public IndexStorage {
   }
 
   bool is_huge_page() const override {
-    return mapping_.huge_page();
+    std::lock_guard lock(lifecycle_mutex_);
+    return file_ && file_->mapping.huge_page();
   }
 
   bool is_dirty() const override {
-    return index_dirty_ || mapping_.is_header_dirty();
+    std::lock_guard lock(lifecycle_mutex_);
+    return file_ && file_->is_dirty();
   }
 
-  //! Set the index file as dirty
-  void set_as_dirty() {
-    index_dirty_ = true;
-  }
-
-  //! Refresh meta information (checksum, update time, etc.)
-  void refresh_index(uint64_t chkp) {
-    mapping_.refresh(chkp);
-    index_dirty_ = false;
-  }
-
-  //! Flush index storage
-  int flush_index() {
-    if (index_dirty_) {
-      this->refresh_index(0);
+  int close_index(bool disposing = false) {
+    std::lock_guard lock(lifecycle_mutex_);
+    auto previous = file_;
+    if (!previous) return 0;
+    std::unique_lock directory(previous->directory_mutex);
+    int ret = 0;
+    if (previous->persist_on_close && previous->is_dirty()) {
+      ret = previous->flush();
+      if (ret != 0 && !disposing) return ret;
     }
-    std::lock_guard<std::mutex> latch(mapping_mutex_);
-    return mapping_.flush();
-  }
-
-  //! Close index storage
-  int close_index() {
-    if (is_dirty() && (!copy_on_write_ || force_flush_)) {
-      const int ret = flush_index();
-      if (ret != 0) return ret;
-    }
-    std::lock_guard<std::mutex> latch(mapping_mutex_);
-    mapping_.close();
-    index_dirty_ = false;
-    return 0;
-  }
-
-  //! Append a segment into storage
-  int append_segment(const std::string &id, size_t size) {
-    std::lock_guard<std::mutex> latch(mapping_mutex_);
-    return mapping_.append(id, size);
-  }
-
-  //! Test if a segment exists
-  bool has_segment(const std::string &id) const {
-    std::lock_guard<std::mutex> latch(mapping_mutex_);
-    return mapping_.has(id);
-  }
-
-  //! Get a segment from storage
-  IndexMapping::Segment *get_segment(const std::string &id) {
-    std::lock_guard<std::mutex> latch(mapping_mutex_);
-    return mapping_.map(id, memory_warmup_, memory_locked_);
+    previous->retired = true;
+    file_.reset();
+    return ret;
   }
 
  private:
@@ -328,9 +368,8 @@ class MMapFileStorage : public IndexStorage {
   bool force_flush_{false};
   bool memory_locked_{false};
   bool memory_warmup_{false};
-  bool index_dirty_{false};
-  mutable IndexMapping mapping_{};
-  mutable std::mutex mapping_mutex_{};
+  std::shared_ptr<OpenFile> file_;
+  mutable std::mutex lifecycle_mutex_;
 };
 
 INDEX_FACTORY_REGISTER_STORAGE(MMapFileStorage);

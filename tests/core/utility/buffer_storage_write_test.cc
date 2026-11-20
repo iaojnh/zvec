@@ -137,6 +137,7 @@ TEST_F(BufferStorageWriteTest, FailedCloseCanRetryMetadataAndCheckpoint) {
       ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, fd);
     });
     EXPECT_NE(0, storage->close());
+    EXPECT_EQ(0u, storage->check_point());
     EXPECT_TRUE(storage->has("data"));
     EXPECT_EQ(file_path_, storage->file_path());
   }
@@ -1242,6 +1243,230 @@ TEST_F(BufferStorageWriteTest, RefreshCheckpoint) {
   EXPECT_GE(storage->check_point(), 100u);
 
   EXPECT_EQ(0, storage->close());
+}
+
+TEST_F(BufferStorageWriteTest, CheckpointSurvivesDirectorySplitAndLateRefresh) {
+  for (const auto *backend : {"BufferStorage", "MMapFileStorage"}) {
+    SCOPED_TRACE(backend);
+    ailego::File::Delete(file_path_);
+    auto storage = IndexFactory::CreateStorage(backend);
+    ASSERT_TRUE(storage);
+    ailego::Params params;
+    params.set("proxima.mmap_file.storage.segment_meta_capacity", 4096u);
+    ASSERT_EQ(0, storage->init(params));
+    ASSERT_EQ(0, storage->open(file_path_, true));
+    storage->refresh(51);
+    ASSERT_EQ(0, storage->flush());
+    ASSERT_EQ(51u, storage->check_point());
+    IndexFormat::MetaHeader header;
+    ailego::File f;
+    ASSERT_TRUE(f.open(file_path_, true, false));
+    ASSERT_EQ(sizeof(header), f.read(0, &header, sizeof(header)));
+    f.close();
+    const size_t name_size = header.meta_footer_offset / 2;
+    for (char c : {'a', 'b'}) {
+      ASSERT_EQ(0, storage->append(std::string(name_size, c), 8));
+    }
+    EXPECT_EQ(51u, storage->check_point());
+    ASSERT_EQ(0, storage->close());
+    auto reader = open_read_only();
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(51u, reader->check_point());
+    ASSERT_EQ(0, reader->close());
+
+    // Older writers could leave a zero checkpoint in the newly linked footer.
+    ASSERT_TRUE(f.open(file_path_, false, false));
+    IndexFormat::MetaFooter footer;
+    ASSERT_EQ(sizeof(footer),
+              f.read(header.meta_footer_offset, &footer, sizeof(footer)));
+    const auto next = footer.next_meta_header_offset;
+    ASSERT_NE(0u, next);
+    ASSERT_EQ(sizeof(header), f.read(next, &header, sizeof(header)));
+    const auto tail = next + header.meta_footer_offset;
+    ASSERT_EQ(sizeof(footer), f.read(tail, &footer, sizeof(footer)));
+    ASSERT_EQ(0u, footer.next_meta_header_offset);
+    footer.check_point = 0;
+    IndexFormat::UpdateMetaFooter(&footer, 0);
+    ASSERT_EQ(sizeof(footer), f.write(tail, &footer, sizeof(footer)));
+    f.close();
+    ASSERT_EQ(0, storage->open(file_path_, true));
+    ASSERT_EQ(51u, storage->check_point());
+    storage->refresh(37);
+    ASSERT_EQ(0, storage->flush());
+    EXPECT_EQ(51u, storage->check_point());
+    ASSERT_EQ(0, storage->close());
+  }
+}
+
+TEST_F(BufferStorageWriteTest, ReadOnlyHandlesPreservePublishedMetadata) {
+  auto writer = open_writable();
+  ASSERT_TRUE(writer);
+  ASSERT_EQ(0, writer->append("data", 16));
+  auto initial = writer->get("data");
+  ASSERT_TRUE(initial);
+  ASSERT_EQ(4u, initial->write(0, "data", 4));
+  initial->update_data_crc(27);
+  ASSERT_EQ(0, writer->close());
+  auto reader = open_read_only();
+  ASSERT_TRUE(reader);
+  auto first = reader->get("data");
+  auto second = reader->get("data");
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  first->resize(1);
+  first->update_data_crc(19);
+  reader->refresh(42);
+  EXPECT_EQ(4u, second->data_size());
+  EXPECT_EQ(27u, second->data_crc());
+  EXPECT_FALSE(reader->is_dirty());
+}
+
+TEST_F(BufferStorageWriteTest, RetainedSegmentsKeepTheirOriginalFile) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("same", 16));
+  auto original = storage->get("same");
+  ASSERT_TRUE(original);
+  ASSERT_EQ(3u, original->write(0, "old", 3));
+  const std::string next_path = file_path_ + ".next";
+  ailego::File::Delete(next_path);
+  AILEGO_DEFER([&] { ailego::File::Delete(next_path); });
+
+  ASSERT_EQ(IndexError_OpenFile, storage->open(next_path, false));
+  ASSERT_EQ(1u, original->write(3, "!", 1));
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  auto reader = storage->get("same");
+  ASSERT_TRUE(reader);
+  IndexStorage::MemoryBlock borrowed;
+  ASSERT_EQ(4u, reader->read_borrowed_immutable(0, borrowed, 4));
+  ASSERT_EQ(0, storage->open(next_path, true));
+  ASSERT_EQ(0, storage->append("same", 16));
+  auto current = storage->get("same");
+  ASSERT_TRUE(current);
+  ASSERT_EQ(3u, current->write(0, "new", 3));
+  EXPECT_EQ(0u, original->write(0, "bad", 3));
+  EXPECT_EQ(4u, original->resize(1));
+  ASSERT_EQ(0, storage->close());
+  storage.reset();
+
+  char data[5]{};
+  ASSERT_EQ(4u, original->fetch(0, data, sizeof(data)));
+  EXPECT_STREQ("old!", data);
+  EXPECT_EQ("old!", std::string(static_cast<const char *>(borrowed.data_), 4));
+  borrowed.reset();
+  ASSERT_EQ(3u, current->fetch(0, data, sizeof(data)));
+  EXPECT_EQ("new", std::string(data, 3));
+}
+
+TEST_F(BufferStorageWriteTest, SameFileReopenPreservesAcceptedWrites) {
+  for (const char *backend : {"BufferStorage", "MMapFileStorage"}) {
+    SCOPED_TRACE(backend);
+    ailego::File::Delete(file_path_);
+    auto storage = IndexFactory::CreateStorage(backend);
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->open(file_path_, true));
+    constexpr size_t count = 1000;
+    ASSERT_EQ(0, storage->append("data", count));
+    auto old = storage->get("data");
+    ASSERT_TRUE(old);
+    ASSERT_EQ(1u, old->write(0, "x", 1));
+    std::atomic<bool> start{false};
+    size_t accepted = 1;
+    std::thread writer([&] {
+      while (!start.load()) std::this_thread::yield();
+      while (accepted < count && old->write(accepted, "x", 1) == 1) ++accepted;
+    });
+    start.store(true);
+    const int ret = storage->open(file_path_, true);
+    writer.join();
+    ASSERT_EQ(0, ret);
+    auto current = storage->get("data");
+    ASSERT_TRUE(current);
+    ASSERT_EQ(accepted, current->data_size());
+    std::string result(accepted, ' ');
+    ASSERT_EQ(accepted, current->fetch(0, result.data(), result.size()));
+    EXPECT_EQ(std::string(accepted, 'x'), result);
+  }
+}
+
+TEST_F(BufferStorageWriteTest, IndependentHandlesShareSegmentCapacity) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("data", 4096));
+  auto writer = storage->get("data");
+  ASSERT_TRUE(writer);
+  const size_t capacity = writer->capacity();
+  std::atomic<bool> start{false};
+  std::thread worker([&] {
+    while (!start.load()) std::this_thread::yield();
+    for (int i = 0; i < 10000; ++i) {
+      writer->resize(capacity);
+      writer->resize(1);
+    }
+  });
+  start.store(true);
+  bool consistent = true;
+  for (int i = 0; i < 10000; ++i) {
+    auto other = storage->get("data");
+    if (!other || other->capacity() != capacity) {
+      consistent = false;
+      break;
+    }
+    other->resize(capacity / 2);
+  }
+  worker.join();
+  EXPECT_TRUE(consistent);
+  EXPECT_EQ(capacity, writer->data_size() + writer->padding_size());
+}
+
+TEST_F(BufferStorageWriteTest, MappedViewsKeepFileAcrossPrivateReopen) {
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->open(file_path_, true));
+  ASSERT_EQ(0, storage->append("data", 16));
+  auto segment = storage->get("data");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(4u, segment->write(0, "base", 4));
+  ASSERT_EQ(0, storage->close());
+  ailego::Params params;
+  params.set("proxima.mmap_file.storage.copy_on_write", true);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  segment = storage->get("data");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(4u, segment->write(0, "copy", 4));
+  ASSERT_EQ(0, storage->append("temporary", 16));
+  IndexStorage::MemoryBlock view;
+  ASSERT_EQ(4u, segment->read(0, view, 4));
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  EXPECT_FALSE(storage->has("temporary"));
+  ASSERT_EQ(0u, segment->write(0, "late", 4));
+  segment = storage->get("data");
+  ASSERT_TRUE(segment);
+  char data[4];
+  ASSERT_EQ(sizeof(data), segment->fetch(0, data, sizeof(data)));
+  EXPECT_EQ("base", std::string(data, sizeof(data)));
+  segment.reset();
+  storage.reset();
+  EXPECT_EQ("copy", std::string(static_cast<const char *>(view.data()), 4));
+}
+
+TEST_F(BufferStorageWriteTest, OpensAllDirectoriesCreatedByMappedWriter) {
+  auto writer = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_TRUE(writer);
+  ailego::Params params;
+  params.set("proxima.mmap_file.storage.segment_meta_capacity", 1u);
+  ASSERT_EQ(0, writer->init(params));
+  ASSERT_EQ(0, writer->open(file_path_, true));
+  const std::string prefix(ailego::kVectorPageSize / 2, 's');
+  for (size_t i = 0; i < 1025; ++i)
+    ASSERT_EQ(0, writer->append(prefix + std::to_string(i), 1)) << i;
+  writer->refresh(71);
+  ASSERT_EQ(0, writer->close());
+  auto reader = open_read_only();
+  ASSERT_TRUE(reader);
+  EXPECT_TRUE(reader->has(prefix + "1024"));
+  EXPECT_EQ(71u, reader->check_point());
 }
 
 // ===== Duplicate / Error Handling =====
