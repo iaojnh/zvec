@@ -117,26 +117,28 @@ class IndexUnpacker {
 
   //! Unpack index data
   template <typename TFunc>
-  bool unpack(TFunc read_data, size_t total, bool checksum) {
+  bool unpack(TFunc read_data, size_t total, bool checksum,
+              bool report_errors = true) {
     static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
                                                 const void **, size_t>::value,
                   "Invocable function type");
 
     while (true) {
       if (!this->unpack_header(read_data)) {
-        LOG_ERROR("Failed to unpack index header");
+        if (report_errors) LOG_ERROR("Failed to unpack index header");
         return false;
       }
       if (!this->unpack_footer(read_data, total)) {
-        LOG_ERROR("Failed to unpack index footer");
+        if (report_errors) LOG_ERROR("Failed to unpack index footer");
         return false;
       }
       if (!this->unpack_segments(read_data, total)) {
-        LOG_ERROR("Failed to unpack index segments' meta");
+        if (report_errors) LOG_ERROR("Failed to unpack index segments' meta");
         return false;
       }
       if (checksum && !this->validate_checksum(read_data)) {
-        LOG_ERROR("Failed to validate checksum of index content");
+        if (report_errors)
+          LOG_ERROR("Failed to validate checksum of index content");
         return false;
       }
       if (footer_.next_meta_header_offset == 0) {
@@ -146,7 +148,7 @@ class IndexUnpacker {
     }
 
     if (!this->unpack_version(read_data)) {
-      LOG_ERROR("Failed to unpack index version");
+      if (report_errors) LOG_ERROR("Failed to unpack index version");
       return false;
     }
     return true;

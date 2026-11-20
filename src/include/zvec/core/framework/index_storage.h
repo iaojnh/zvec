@@ -133,7 +133,10 @@ class IndexStorage : public IndexModule {
     }
 
     bool release_for_parsing_retry() noexcept {
-      if (type_ != MBT_BUFFERPOOL &&
+      const bool sole_temporary =
+          type_ == MBT_HEAP_SCRATCH ||
+          (type_ == MBT_SHARED_SCRATCH && scratch_owner_.use_count() == 1);
+      if (!sole_temporary && type_ != MBT_BUFFERPOOL &&
           !(scratch_lease_ && scratch_lease_->release_for_parsing_retry()))
         return false;
       reset();
@@ -902,6 +905,29 @@ class IndexStorage : public IndexModule {
     virtual size_t fetch_for_parsing(size_t offset, void *buf,
                                      size_t len) const {
       return fetch(offset, buf, len);
+    }
+
+    // Parsing considers these finite input representations independently.
+    // Legacy backends retain their original read under kBorrow; backends with
+    // permanent workspaces explicitly implement kReuse and kGrow. kOwned is
+    // filled through fetch_for_parsing after the parser admits its destination.
+    enum class ParsingReadStrategy { kReuse, kBorrow, kGrow, kOwned };
+
+    // Unsupported means that this representation is unavailable, rather than
+    // an I/O failure. A refused allocation may advance to another strategy;
+    // actual read/format errors terminate the parse.
+    virtual size_t read_for_parsing_with_strategy(size_t offset,
+                                                  MemoryBlock &data, size_t len,
+                                                  ParsingReadStrategy strategy,
+                                                  int &error) {
+      if (strategy != ParsingReadStrategy::kBorrow) {
+        data.reset();
+        error = IndexError_Unsupported;
+        return 0;
+      }
+      const size_t got = read_for_parsing(offset, data, len);
+      error = got == len ? 0 : read_error();
+      return got;
     }
   };
 

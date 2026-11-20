@@ -1042,12 +1042,16 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   // Copied results need one descriptor and their destination workspace,
   // not a retained pin/descriptor for every source chunk. Admit the destination
   // before touching cache sources, then release each source after copying it.
-  size_t contiguous(size_t offset, size_t len, Segment::ScatterBlock &out,
-                    Layout *layout, bool populate) try {
+  size_t contiguous(
+      size_t offset, size_t len, Segment::ScatterBlock &out, Layout *layout,
+      bool populate,
+      const Segment::ParsingReadStrategy *strategy = nullptr) try {
     out.reset();
-    if (!len || offset > file_size || len > file_size - offset ||
-        len > (adaptive ? (1UL << 30) : max_read_bytes))
+    if (!len || offset > file_size || len > file_size - offset) return 0;
+    if (len > (adaptive ? (1UL << 30) : max_read_bytes)) {
+      if (strategy) chunk_read_error = IndexError_Unsupported;
       return 0;
+    }
     const auto locate = [&](size_t position) -> Entry * {
       return layout
                  ? layout->find(position)
@@ -1078,16 +1082,24 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     // A funded parsing destination also needs its lease admitted before a
     // single cache chunk is pinned. Otherwise that pin could prevent reclaim
     // for the lease itself at zero available budget.
-    auto *view =
-        single && !populate ? acquire_view(len + 2 * page, true) : nullptr;
-    if (single && !view) {
+    using Strategy = Segment::ParsingReadStrategy;
+    View *view = nullptr;
+    if (strategy) {
+      if (*strategy == Strategy::kReuse)
+        view = acquire_view(len + 2 * page, true);
+      else if (*strategy == Strategy::kGrow)
+        view = acquire_view(len + 2 * page);
+    } else if (single && !populate) {
+      view = acquire_view(len + 2 * page, true);
+    }
+    const bool borrow = !strategy || *strategy == Strategy::kBorrow;
+    if (single && !view && borrow) {
       if (!first && populate && cache_limit != 0)
         first = entry(offset / chunk_bytes, true);
       if (auto *item = source(first)) {
         try {
-          // Protect the usable input while admitting its descriptor. If this
-          // representation cannot fit, lease() releases the pin before we
-          // consider another representation.
+          // Protect the usable input while admitting its descriptor. lease()
+          // releases the pin if admission fails, before another strategy runs.
           out.lease = lease(out, nullptr, item, reinterpret_cast<size_t>(item));
           out.spans.push_back({item->data.load(std::memory_order_relaxed) +
                                    offset - item->offset,
@@ -1095,26 +1107,41 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           out.size = len;
           return len;
         } catch (const std::bad_alloc &) {
-          if (populate) throw;
+          if (populate || strategy) throw;
           out.reset();
         }
       }
     }
-    if (!view) view = acquire_view(len + 2 * page);
-    if (!view) {
-      // A busy query workspace is a representation constraint, not a refusal
-      // of the parser's caller-owned destination.
-      chunk_read_error = populate ? IndexError_NoMemory : IndexError_ReadData;
+    if (strategy &&
+        (*strategy == Strategy::kBorrow || *strategy == Strategy::kOwned)) {
+      chunk_read_error = IndexError_Unsupported;
       return 0;
     }
-    if (!populate && !view->workspace.mapped_size()) {
+    if (!view && !strategy) view = acquire_view(len + 2 * page);
+    if (!view) {
+      chunk_read_error = strategy   ? IndexError_Unsupported
+                         : populate ? IndexError_NoMemory
+                                    : IndexError_ReadData;
+      return 0;
+    }
+    // A parsing copy can reuse/replace funded backing, but must not create an
+    // optional padded query workspace when an exact owned input is cheaper.
+    // Every funded view has at least three native pages. Growing it therefore
+    // costs less than a separate exact input beside the old mapping. If its
+    // private directory later fails, an owned copy cannot improve that peak.
+    if (!populate && (!view->workspace.mapped_size() ||
+                      (strategy && !adaptive &&
+                       view->workspace.mapped_size() < len + 2 * page))) {
       view->busy.store(false, std::memory_order_release);
       changed.notify_one();
+      chunk_read_error =
+          strategy ? IndexError_Unsupported : IndexError_ReadData;
       return 0;
     }
     out.lease = lease(out, view);
     if (!ensure_workspace(*view, len + 2 * page)) {
-      chunk_read_error = populate ? IndexError_NoMemory : IndexError_ReadData;
+      chunk_read_error =
+          populate || strategy ? IndexError_NoMemory : IndexError_ReadData;
       out.reset();
       return 0;
     }
@@ -1182,7 +1209,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return len;
   } catch (const std::bad_alloc &) {
     out.reset();
-    chunk_read_error = populate ? IndexError_NoMemory : IndexError_ReadData;
+    chunk_read_error =
+        populate || strategy ? IndexError_NoMemory : IndexError_ReadData;
     return 0;
   }
   size_t scatter(size_t offset, size_t len, Segment::ScatterBlock &out,
@@ -1513,8 +1541,22 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
 #endif
     return read_contiguous(offset, out, len, /*populate=*/false);
   }
+  size_t read_for_parsing_with_strategy(size_t offset, MemoryBlock &out,
+                                        size_t len,
+                                        ParsingReadStrategy strategy,
+                                        int &error) override {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (len && offset < capacity() && state_->read_ahead &&
+        state_->prefetch_pending_requests.load(std::memory_order_acquire))
+      state_->read_ahead->yield_for_parsing(offset_, capacity());
+#endif
+    const size_t got = read_contiguous(offset, out, len, false, &strategy);
+    error = got == len ? 0 : chunk_read_error;
+    return got;
+  }
   size_t read_contiguous(size_t offset, MemoryBlock &out, size_t len,
-                         bool populate) {
+                         bool populate,
+                         const ParsingReadStrategy *strategy = nullptr) {
     chunk_read_error = IndexError_ReadData;
     out.reset();
     if (offset > capacity()) return 0;
@@ -1549,8 +1591,8 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
         block.workspace->reset();
       slot->busy.store(false, std::memory_order_release);
     });
-    const size_t got =
-        state_->contiguous(offset_ + offset, len, block, layout_, populate);
+    const size_t got = state_->contiguous(offset_ + offset, len, block, layout_,
+                                          populate, strategy);
     if (!got) return 0;
     auto owner = std::static_pointer_cast<State::Lease>(block.lease);
     owner->retain();

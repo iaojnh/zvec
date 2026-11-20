@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/core/framework/index_storage.h>
 
 using namespace zvec;
@@ -122,4 +123,47 @@ TEST(MemoryBlockSharedView, DestructionReleasesLastSlice) {
     EXPECT_FALSE(lifetime.expired());
   }
   EXPECT_TRUE(lifetime.expired());
+}
+
+TEST(MemoryBlockSharedView, ParsingRetryPreservesIndependentOwners) {
+  using Block = IndexStorage::MemoryBlock;
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(32UL << 20));
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  {
+    auto heap = Block::AllocateOwned(128);
+    std::memset(const_cast<void *>(heap.data()), 0x5A, 128);
+    auto heap_copy = heap;
+    const auto both = pool.external_used();
+    EXPECT_TRUE(heap.release_for_parsing_retry());
+    EXPECT_LT(pool.external_used(), both);
+    EXPECT_EQ(nullptr, heap.data());
+    ASSERT_NE(nullptr, heap_copy.data());
+    EXPECT_EQ(0x5A, *static_cast<const char *>(heap_copy.data()));
+
+    auto arena = std::allocate_shared<ailego::BudgetedMappedBuffer>(
+        ailego::BudgetedAllocator<ailego::BudgetedMappedBuffer>{});
+    ASSERT_EQ(0, arena->resize(2 * pool.page_buffer_size()));
+    std::memset(arena->data(), 0x6B, arena->size());
+    std::weak_ptr<ailego::BudgetedMappedBuffer> lifetime = arena;
+    auto view = Block::MakeSharedView(arena->data(), arena);
+    auto alias = view;
+    arena.reset();
+    const auto live = pool.external_used();
+    EXPECT_FALSE(view.release_for_parsing_retry());
+    EXPECT_EQ(live, pool.external_used());
+    EXPECT_EQ(0x6B, *static_cast<const char *>(alias.data()));
+    alias.reset();
+    EXPECT_TRUE(view.release_for_parsing_retry());
+    EXPECT_TRUE(lifetime.expired());
+    EXPECT_LT(pool.external_used(), live);
+
+    char caller_data = 'v';
+    auto borrowed = Block::MakeBorrowedView(&caller_data);
+    EXPECT_FALSE(borrowed.release_for_parsing_retry());
+    EXPECT_EQ(&caller_data, borrowed.data());
+    EXPECT_EQ('v', caller_data);
+  }
+  EXPECT_EQ(0u, pool.external_used());
+  EXPECT_EQ(0, pool.init(0));
 }

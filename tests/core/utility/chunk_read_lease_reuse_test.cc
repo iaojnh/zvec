@@ -1,5 +1,6 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -318,6 +319,31 @@ class MetadataAdmissionTest : public testing::Test {
       }
       return got;
     }
+    size_t read_for_parsing_with_strategy(size_t offset,
+                                          IndexStorage::MemoryBlock &data,
+                                          size_t size,
+                                          ParsingReadStrategy strategy,
+                                          int &error) override {
+      ++strategy_reads[static_cast<size_t>(strategy)];
+      if (offset == 0 && size == sizeof(IndexFormat::MetaHeader)) {
+        ++parsed_headers;
+        ++strategy_headers[static_cast<size_t>(strategy)];
+      }
+      failed_ = calls++ >= fail_at;
+      if (failed_) {
+        data.reset();
+        error = IndexError_ReadData;
+        return 0;
+      }
+      const size_t got = parent_->read_for_parsing_with_strategy(
+          offset, data, size, strategy, error);
+      if (retain_input && got > ailego::MemoryLimitPool::page_buffer_size()) {
+        escaped = data;
+        escaped_offset = offset;
+        escaped_size = got;
+      }
+      return got;
+    }
     size_t write(size_t, const void *, size_t) override {
       return 0;
     }
@@ -329,6 +355,7 @@ class MetadataAdmissionTest : public testing::Test {
       return parent_->clone();
     }
     mutable size_t calls{0}, parsed_headers{0}, fetched_headers{0};
+    std::array<size_t, 4> strategy_headers{}, strategy_reads{};
     size_t fail_at{std::numeric_limits<size_t>::max()};
     bool retain_input{false};
     IndexStorage::MemoryBlock escaped;
@@ -867,18 +894,16 @@ TEST_F(MetadataAdmissionTest, ChunkParserPreservesSuccessfulBudgets) {
       if (shape.funded) {
         EXPECT_EQ(workspace, storage->stats().workspace_bytes);
       }
-      // A failed private allocation may restart once with an owned input.
-      // Read failures and a failed copy attempt must never loop again.
-      EXPECT_LE(observed->parsed_headers, 1u);
-      EXPECT_LE(observed->fetched_headers, 1u);
-      if (parser && !shape.warm && quota == 0) {
-        EXPECT_EQ(0u, observed->fetched_headers);
-      }
+      // Each callback probes each strategy once; a private restart excludes
+      // its failed strategy. Four whole attempts bound all header probes.
+      EXPECT_LE(observed->parsed_headers, 12u);
+      for (auto count : observed->strategy_headers) EXPECT_LE(count, 4u);
+      EXPECT_LE(observed->fetched_headers, 4u);
       if (parser && shape.held && quota == page) {
         EXPECT_EQ(0u, observed->fetched_headers);
       }
       if (expect_retry) {
-        EXPECT_EQ(1u, observed->fetched_headers);
+        EXPECT_GT(observed->strategy_reads[2], 0u);
       }
       if (shape.busy) {
         EXPECT_EQ('p', *static_cast<const char *>(held.data()));
@@ -1159,6 +1184,24 @@ class ParserOwnershipTest : public MetadataAdmissionTest {
       return IndexError_NoMemory;
     }
   }
+  int reference_borrow(const IndexStorage::Segment::Pointer &parent) {
+    IndexStorage::Segment::ScatterBlock input;
+    IndexUnpacker unpacker;
+    try {
+      const auto read = [&](size_t offset, const void **data, size_t len) {
+        input.reset();
+        const size_t got = parent->read_scatter(offset, input, len);
+        if (got != len || input.spans.size() != 1) return size_t{0};
+        *data = input.spans.front().data;
+        return got;
+      };
+      return unpacker.unpack(read, parent->data_size(), false)
+                 ? 0
+                 : IndexError_NoMemory;
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    }
+  }
   int parse(const IndexStorage::Segment::Pointer &parent,
             const std::string &name) {
     IndexSegmentStorage nested(parent);
@@ -1187,6 +1230,14 @@ class ParserOwnershipTest : public MetadataAdmissionTest {
     }
     int read_error() const override {
       return IndexError_ReadData;
+    }
+    size_t read_for_parsing_with_strategy(size_t,
+                                          IndexStorage::MemoryBlock &out,
+                                          size_t, ParsingReadStrategy,
+                                          int &error) override {
+      out.reset();
+      error = IndexError_Unsupported;
+      return 0;
     }
   };
 };
@@ -1280,7 +1331,7 @@ TEST_F(ParserOwnershipTest, DescriptorAdmissionPreservesOnlyAvailableInput) {
   std::string path;
   const std::string name(512, 'n');
   package(path, name, 8 * page - h, page - h - v);
-  auto trial = [&](bool prefund_descriptor) {
+  auto trial = [&](int mode) {
     auto storage = std::make_shared<ChunkReadStorage>();
     EXPECT_EQ(0, storage->init(chunk_params(page)));
     EXPECT_EQ(0, storage->open(path, false));
@@ -1301,7 +1352,7 @@ TEST_F(ParserOwnershipTest, DescriptorAdmissionPreservesOnlyAvailableInput) {
     EXPECT_EQ(parent->data_size(),
               parent->read_scatter(0, warm, parent->data_size()));
     warm.reset();
-    if (prefund_descriptor) {
+    if (mode == 1) {
       // Touch only the already-hot unrelated chunk. Fund the descriptor but
       // leave every execution workspace busy and the source entry cold.
       IndexStorage::MemoryBlock descriptor;
@@ -1311,21 +1362,21 @@ TEST_F(ParserOwnershipTest, DescriptorAdmissionPreservesOnlyAvailableInput) {
     int result;
     {
       Pressure pressure(0);
-      result = parse(parent, name);
-      std::printf(
-          "LEASE prefunded_descriptor=%d result=%d cache=%llu->%llu io=%llu\n",
-          prefund_descriptor, result, static_cast<unsigned long long>(cache),
-          static_cast<unsigned long long>(storage->stats().cache_bytes),
-          static_cast<unsigned long long>(storage->stats().io_calls));
+      result = mode == 2 ? reference_borrow(parent) : parse(parent, name);
+      std::printf("LEASE mode=%d result=%d cache=%llu->%llu io=%llu\n", mode,
+                  result, static_cast<unsigned long long>(cache),
+                  static_cast<unsigned long long>(storage->stats().cache_bytes),
+                  static_cast<unsigned long long>(storage->stats().io_calls));
     }
     EXPECT_FALSE(busy.spans.empty());
     if (!busy.spans.empty()) EXPECT_EQ('p', busy.spans.front().data[0]);
     return result;
   };
-  const int candidate = trial(false), control = trial(true);
+  const int candidate = trial(0), control = trial(1), borrowed = trial(2);
   RecordProperty("candidate", candidate);
   EXPECT_EQ(0, candidate);
   EXPECT_EQ(0, control);
+  EXPECT_EQ(0, borrowed);
 }
 TEST_F(ParserOwnershipTest, ReusedWorkerInputAllowsRequiredDirectory) {
   const size_t page = ailego::MemoryLimitPool::page_buffer_size();
@@ -1581,5 +1632,309 @@ TEST_F(ParserOwnershipTest, PrefetchPinsYieldWithoutInvalidatingReaders) {
 
 #endif
 
+}  // namespace
+}  // namespace zvec::core
+
+namespace zvec::core {
+namespace {
+class IndependentParserAdmissionTest : public ParserOwnershipTest {
+ protected:
+  enum class Reference { kReuse, kBorrow, kGrow, kOwned, kCandidate };
+  struct Shape {
+    bool warm{true}, adaptive{true};
+    size_t chunk{4UL << 20}, cache{8UL << 20};
+    bool busy{false}, funded{false}, empty{false}, alias{false};
+    bool prefetch{false}, directory_hint{false};
+    size_t name_bytes{64UL << 10};
+    Reference witness{Reference::kGrow};
+  };
+
+  // This oracle never calls open() or the production strategy selector.
+  // Its four fixed plans use the established scatter/legacy read/caller-copy
+  // APIs. Workspace plans evict idle sources before each read, so a warm loan
+  // cannot hide a cheaper funded-workspace path. All trials start afresh.
+  int fixed_parse(Reference plan, const IndexStorage::Segment::Pointer &parent,
+                  ChunkReadStorage *chunk, bool may_grow, size_t hint_offset,
+                  bool pending) {
+    using Block = IndexStorage::MemoryBlock;
+    IndexStorage::Segment::ScatterBlock scatter;
+    Block loan;
+    ailego::BudgetedMappedBuffer copy;
+    IndexUnpacker unpacker;
+    const size_t initial_workspace = chunk ? chunk->stats().workspace_bytes : 0;
+    const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+    try {
+      if (plan == Reference::kOwned && pending) {
+        // Retire the already-funded hint before admitting copied input. This
+        // ordinary demand read transfers only the hint pin, then drops it.
+        char byte;
+        if (parent->fetch(hint_offset, &byte, 1) != 1)
+          return IndexError_NoMemory;
+      }
+      const auto read = [&](size_t offset, const void **data, size_t len) {
+        scatter.reset();
+        loan.reset();
+        copy.clear();
+        if (plan == Reference::kBorrow) {
+          const size_t got = parent->read_scatter(offset, scatter, len);
+          if (got != len || scatter.spans.size() != 1) return size_t{0};
+          *data = scatter.spans.front().data;
+          return got;
+        }
+        if (plan == Reference::kReuse || plan == Reference::kGrow) {
+          if (!chunk || initial_workspace == 0 ||
+              (plan == Reference::kGrow && !may_grow))
+            return size_t{0};
+          if (plan == Reference::kReuse && len + 2 * page > initial_workspace)
+            return size_t{0};
+          auto &queue = ailego::BlockEvictionQueue::get_instance();
+          for (size_t i = 0; i < 64 && chunk->stats().cache_bytes; ++i)
+            queue.reclaim_for_allocation(8UL << 20);
+          const size_t got = parent->read_for_parsing(offset, loan, len);
+          if (got == len) *data = loan.data();
+          return got;
+        }
+        if (copy.resize(len) != 0) return size_t{0};
+        *data = copy.data();
+        return parent->fetch_for_parsing(offset, copy.data(), len);
+      };
+      return unpacker.unpack(read, parent->data_size(), false)
+                 ? 0
+                 : IndexError_NoMemory;
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    }
+  }
+
+  int trial(const Shape &shape, const std::string &path,
+            const std::string &name, size_t quota, Reference plan) {
+    const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+    auto storage = std::make_shared<ChunkReadStorage>();
+    auto params = chunk_params(page);
+    params.set(CHUNK_READ_STORAGE_CHUNK_BYTES, shape.chunk);
+    params.set(CHUNK_READ_STORAGE_CACHE_BYTES, shape.cache);
+    params.set(CHUNK_READ_STORAGE_ADAPTIVE, shape.adaptive);
+    if (shape.prefetch) {
+      params.set(CHUNK_READ_STORAGE_PREFETCH_DEPTH, size_t{2});
+      params.set(CHUNK_READ_STORAGE_PREFETCH_BYTES, 8UL << 20);
+      params.set(CHUNK_READ_STORAGE_DIRECT_IO, true);
+    }
+    EXPECT_EQ(0, storage->init(params));
+    EXPECT_EQ(0, storage->open(path, false));
+    auto parent = storage->get("nested", 1);
+    IndexStorage::MemoryBlock occupied, prepared;
+    IndexStorage::Segment::ScatterBlock alias;
+    if (shape.funded) {
+      EXPECT_EQ(parent->data_size(),
+                parent->read(0, prepared, parent->data_size()));
+      prepared.reset();
+    }
+    std::string image(parent->data_size(), '\0');
+    // Inspect the canonical real file without warming query caches.
+    ailego::File file;
+    EXPECT_TRUE(file.open(path, true, false));
+    EXPECT_EQ(image.size(),
+              file.read(parent->data_offset(), image.data(), image.size()));
+    IndexFormat::MetaFooter footer;
+    std::memcpy(&footer, image.data() + image.size() - sizeof(footer),
+                sizeof(footer));
+    const size_t begin = shape.directory_hint ? image.size() - sizeof(footer) -
+                                                    footer.segments_meta_size
+                                              : 0;
+    if (shape.prefetch) {
+      EXPECT_GT(storage->stats().prefetch_depth, 0u);
+      EXPECT_EQ(0, parent->set_read_chunks(
+                       {{begin, shape.directory_hint ? footer.segments_meta_size
+                                                     : image.size()}}));
+    }
+    if (shape.warm || shape.alias) {
+      EXPECT_EQ(image.size(), parent->fetch(0, image.data(), image.size()));
+    }
+    if (shape.alias) {
+      EXPECT_EQ(parent->data_size(),
+                parent->read_scatter(0, alias, parent->data_size()));
+    }
+    // Cache the same descriptor in every trial, without retaining a reader.
+    EXPECT_EQ(16u, parent->read(0, prepared, 16));
+    prepared.reset();
+    if (shape.busy) {
+      EXPECT_EQ(2 * page,
+                storage->get("prefix", 1)->read(0, occupied, 2 * page));
+    }
+    if (shape.empty) {
+      Pressure pressure(0);
+      EXPECT_EQ(0u, parent->read(0, prepared, parent->data_size()));
+      EXPECT_EQ(0u, storage->stats().workspace_bytes);
+    }
+    if (shape.prefetch) {
+      EXPECT_TRUE(parent->try_prefetch(
+          begin,
+          shape.directory_hint ? footer.segments_meta_size : image.size(),
+          IndexStorage::Segment::CachePriority::kNormal));
+    }
+    int result;
+    {
+      Pressure pressure(quota);
+      EXPECT_EQ(quota, pool.available());
+      result = plan == Reference::kCandidate
+                   ? parse(parent, name)
+                   : fixed_parse(plan, parent, storage.get(), shape.adaptive,
+                                 begin, shape.prefetch);
+      if (occupied.data()) {
+        EXPECT_EQ('p', *static_cast<const char *>(occupied.data()));
+      }
+      if (!alias.spans.empty()) {
+        EXPECT_EQ(0, std::memcmp(alias.spans.front().data, image.data(),
+                                 image.size()));
+      }
+    }
+    return result;
+  }
+
+  void compare(const Shape &shape, size_t index) {
+    const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+    std::string path;
+    const std::string name(shape.name_bytes, 'n');
+    package(path, name, 8 * page - sizeof(IndexFormat::MetaHeader), 1);
+    size_t low = 0, high = 2 * name.size() + 8 * page + 4096;
+    ASSERT_EQ(0, trial(shape, path, name, high, shape.witness));
+    while (low < high) {
+      const size_t quota = low + (high - low) / 2;
+      if (trial(shape, path, name, quota, shape.witness) == 0)
+        high = quota;
+      else
+        low = quota + 1;
+    }
+    RecordProperty("boundary_" + std::to_string(index), std::to_string(low));
+    // Check both sides of the independently discovered byte boundary, then
+    // the neighboring page boundary where workspace padding changes peaks.
+    std::vector<size_t> quotas{low, low + 1, low + page};
+    if (low) quotas.push_back(low - 1);
+    for (const size_t quota : quotas) {
+      SCOPED_TRACE(::testing::Message() << index << ':' << quota);
+      bool possible = false;
+      for (auto plan : {Reference::kReuse, Reference::kBorrow, Reference::kGrow,
+                        Reference::kOwned}) {
+        const int result = trial(shape, path, name, quota, plan);
+        RecordProperty("plan_" + std::to_string(index) + '_' +
+                           std::to_string(quota) + '_' +
+                           std::to_string(static_cast<int>(plan)),
+                       result);
+        possible |= result == 0;
+      }
+      const int actual = trial(shape, path, name, quota, Reference::kCandidate);
+      if (possible)
+        EXPECT_EQ(0, actual);
+      else
+        EXPECT_TRUE(actual == 0 || actual == IndexError_NoMemory);
+    }
+  }
+};
+
+TEST_F(IndependentParserAdmissionTest, ReadAndFormatErrorsStopImmediately) {
+  const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+  for (bool io_failure : {false, true}) {
+    SCOPED_TRACE(io_failure);
+    std::string path;
+    package(path, "child", 0, 1);
+    auto storage = std::make_shared<ChunkReadStorage>();
+    ASSERT_EQ(0, storage->init(chunk_params(page)));
+    ASSERT_EQ(0, storage->open(path, false));
+    auto parent = storage->get("nested", 1);
+    if (!io_failure) {
+      ailego::File file;
+      ASSERT_TRUE(file.open(path, false, false));
+      IndexFormat::MetaHeader header;
+      ASSERT_EQ(sizeof(header),
+                file.read(parent->data_offset(), &header, sizeof(header)));
+      header.header_crc ^= 1;
+      ASSERT_EQ(sizeof(header),
+                file.write(parent->data_offset(), &header, sizeof(header)));
+    }
+    auto observed = std::make_shared<FailingParent>(parent);
+    if (io_failure) observed->fail_at = 0;
+    IndexSegmentStorage nested(observed);
+    EXPECT_EQ(IndexError_UnpackIndex, nested.open("", false));
+    EXPECT_EQ(1u, observed->calls);
+    EXPECT_EQ(0u, observed->fetched_headers);
+    EXPECT_FALSE(nested.has("child"));
+  }
+}
+
+TEST_F(IndependentParserAdmissionTest,
+       InputAllocationRefusalReachesOwnedInput) {
+  class RefusedInput : public FailingParent {
+   public:
+    using FailingParent::FailingParent;
+    size_t read_for_parsing_with_strategy(size_t offset,
+                                          IndexStorage::MemoryBlock &out,
+                                          size_t len,
+                                          ParsingReadStrategy strategy,
+                                          int &) override {
+      ++strategy_reads[static_cast<size_t>(strategy)];
+      if (offset == 0 && len == sizeof(IndexFormat::MetaHeader))
+        ++strategy_headers[static_cast<size_t>(strategy)];
+      out.reset();
+      throw std::bad_alloc();
+    }
+  };
+  std::string path;
+  package(path, "child", 0, 1);
+  auto storage = std::make_shared<ChunkReadStorage>();
+  ASSERT_EQ(0, storage->init(chunk_params(pool.page_buffer_size())));
+  ASSERT_EQ(0, storage->open(path, false));
+  auto parent = std::make_shared<RefusedInput>(storage->get("nested", 1));
+  EXPECT_EQ(0, parse(parent, "child"));
+  EXPECT_EQ(1u, parent->fetched_headers);
+  for (size_t i = 0; i < 3; ++i) EXPECT_EQ(1u, parent->strategy_headers[i]);
+}
+
+TEST_F(IndependentParserAdmissionTest, FourPlansCoverBudgetBoundaries) {
+  const size_t page = ailego::MemoryLimitPool::page_buffer_size();
+  std::vector<Shape> shapes(8);
+  shapes[0].name_bytes = 2UL << 20;  // Previously missed one-page interval.
+  shapes[1].warm = false;
+  shapes[1].chunk = page;
+  shapes[2].adaptive = false;
+  shapes[2].witness = Reference::kOwned;
+  shapes[3].warm = false;
+  shapes[3].cache = 0;
+  shapes[3].funded = true;
+  shapes[3].witness = Reference::kReuse;
+  shapes[4].chunk = page;
+  shapes[4].busy = true;
+  shapes[4].witness = Reference::kOwned;
+  shapes[5].warm = false;
+  shapes[5].cache = 0;
+  shapes[5].busy = true;
+  shapes[5].witness = Reference::kOwned;
+  shapes[6].warm = false;
+  shapes[6].cache = 0;
+  shapes[6].empty = true;
+  shapes[6].witness = Reference::kOwned;
+  shapes[7].alias = true;
+  shapes[7].witness = Reference::kBorrow;
+  for (size_t i = 0; i < shapes.size(); ++i) {
+    SCOPED_TRACE(i);
+    compare(shapes[i], i);
+  }
+}
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(IndependentParserAdmissionTest, FourPlansCoverPrefetchedInput) {
+  for (bool warm : {false, true}) {
+    for (bool busy : {false, true}) {
+      Shape shape;
+      shape.name_bytes = 2UL << 20;
+      shape.warm = warm;
+      shape.prefetch = true;
+      shape.busy = busy;
+      shape.directory_hint = busy;
+      shape.witness = busy ? Reference::kOwned : Reference::kGrow;
+      compare(shape, 8 + warm * 2 + busy);
+    }
+  }
+}
+#endif
 }  // namespace
 }  // namespace zvec::core

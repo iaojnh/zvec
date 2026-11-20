@@ -101,6 +101,20 @@ class IndexSegmentStorage : public IndexStorage {
       return parent_->read_error();
     }
 
+    size_t read_for_parsing_with_strategy(size_t offset, MemoryBlock &data,
+                                          size_t len,
+                                          ParsingReadStrategy strategy,
+                                          int &error) override {
+      if (offset > region_size_) {
+        data.reset();
+        error = IndexError_ReadData;
+        return 0;
+      }
+      return parent_->read_for_parsing_with_strategy(
+          data_offset_ + offset, data, std::min(len, region_size_ - offset),
+          strategy, error);
+    }
+
     bool supports_read_chunks() const override {
       return parent_->supports_read_chunks();
     }
@@ -219,51 +233,64 @@ class IndexSegmentStorage : public IndexStorage {
       return IndexError_NoReady;
     }
 
-    // First preserve direct views and already-funded parent workspaces.
-    // If private directory allocation fails while the input retains backing,
-    // drop the whole unpublished attempt before one streamed-copy retry.
-    // The copy can reclaim its source; an unconditional copy rejects valid
-    // borrowed reads when another reader still needs that cache backing.
-    bool streamed = false;
-    for (;;) {
+    using Strategy = IndexStorage::Segment::ParsingReadStrategy;
+    constexpr Strategy strategies[] = {Strategy::kReuse, Strategy::kBorrow,
+                                       Strategy::kGrow, Strategy::kOwned};
+    unsigned excluded = 0;
+    // Select per callback: a copied header can precede a borrowed directory.
+    // On private refusal retire only a releasable input and exclude its failed
+    // strategy. Each restart excludes a new strategy, so there are at most
+    // four whole attempts and four representation probes per callback.
+    for (size_t attempt = 0; attempt < 4; ++attempt) {
       IndexStorage::MemoryBlock metadata;
       ailego::BudgetedMappedBuffer fallback;
       IndexUnpacker unpacker;
       const size_t total = parent_->data_size();
       int read_error = IndexError_ReadData;
-      auto read_data = [this, &metadata, &fallback, &read_error, total,
-                        streamed](size_t offset, const void **data,
-                                  size_t len) {
-        // Unpacker has finished consuming the previous callback's bytes.
+      Strategy active = Strategy::kOwned;
+      auto read_data = [&, this](size_t offset, const void **data, size_t len) {
         metadata.reset();
         fallback.clear();
         if (offset > total || len > total - offset) return size_t{0};
-        if (!streamed) {
-          const auto direct_size =
-              parent_->read_for_parsing(offset, metadata, len);
-          if (direct_size == len) {
-            *data = metadata.data();
-            return direct_size;
+        for (const auto strategy : strategies) {
+          if (excluded & (1u << static_cast<unsigned>(strategy))) continue;
+          if (strategy != Strategy::kOwned) {
+            size_t got = 0;
+            try {
+              got = parent_->read_for_parsing_with_strategy(
+                  offset, metadata, len, strategy, read_error);
+            } catch (const std::bad_alloc &) {
+              read_error = IndexError_NoMemory;
+            }
+            if (got == len) {
+              read_error = 0;
+              active = strategy;
+              *data = metadata.data();
+              return got;
+            }
+            metadata.reset();
+            if (read_error != IndexError_Unsupported &&
+                read_error != IndexError_NoMemory)
+              return size_t{0};
+            continue;
           }
-          read_error = parent_->read_error();
-          // An explicit read allocation refusal is final. Retry below is
-          // only for a later private allocation blocked by retained input.
-          metadata.reset();
-          if (read_error == IndexError_NoMemory) return size_t{0};
+          if (fallback.resize(len) != 0) {
+            read_error = IndexError_NoMemory;
+            return size_t{0};
+          }
+          active = strategy;
+          const size_t got =
+              parent_->fetch_for_parsing(offset, fallback.data(), len);
+          read_error = got == len ? 0 : parent_->read_error();
+          *data = fallback.data();
+          return got;
         }
-        if (fallback.resize(len) != 0) {
-          read_error = IndexError_NoMemory;
-          return size_t{0};
-        }
-        const auto size =
-            parent_->fetch_for_parsing(offset, fallback.data(), len);
-        if (size < len) read_error = parent_->read_error();
-        *data = fallback.data();
-        return size;
+        read_error = IndexError_NoMemory;
+        return size_t{0};
       };
-
       try {
-        if (!unpacker.unpack(read_data, total, false)) {
+        if (!unpacker.unpack(read_data, total, false,
+                             /*report_errors=*/false)) {
           if (read_error == IndexError_NoMemory) return read_error;
           LOG_ERROR("Failed to unpack segment data");
           return IndexError_UnpackIndex;
@@ -272,13 +299,15 @@ class IndexSegmentStorage : public IndexStorage {
         magic_ = unpacker.magic();
         return 0;
       } catch (const std::bad_alloc &) {
-        if (streamed || !metadata.release_for_parsing_retry())
+        // Permanent execution workspaces and escaped inputs cannot be made
+        // cheaper by another copy. Their owners keep the final veto.
+        if (active == Strategy::kOwned || !metadata.release_for_parsing_retry())
           return IndexError_NoMemory;
+        excluded |= 1u << static_cast<unsigned>(active);
       }
-      // Input is retired. Leave this iteration to destroy all partial private
-      // metadata and fallback backing before the next attempt allocates.
-      streamed = true;
+      // Destroy all unpublished private state before the next attempt.
     }
+    return IndexError_NoMemory;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
