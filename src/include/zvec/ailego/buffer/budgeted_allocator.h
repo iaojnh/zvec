@@ -98,6 +98,8 @@ class OptionalBudgetedAllocator : public BudgetedAllocator<T> {
   template <typename U>
   OptionalBudgetedAllocator(const OptionalBudgetedAllocator<U> &) {}
   template <typename U>
+  // The allocator protocol requires this name to preserve optional admission.
+  // NOLINTNEXTLINE(readability-identifier-naming)
   struct rebind {
     using other = OptionalBudgetedAllocator<U>;
   };
