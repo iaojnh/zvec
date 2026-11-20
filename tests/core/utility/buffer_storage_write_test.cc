@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <numeric>
@@ -131,8 +132,19 @@ TEST_F(BufferStorageWriteTest, FailedCloseCanRetryMetadataAndCheckpoint) {
   storage->refresh(123);
   {
     auto pool = storage->vec_buffer_pool();
+    // A valid read-only descriptor makes the metadata write fail on every
+    // platform. An invalid descriptor terminates the process in the MSVC CRT.
+    auto *read_only = std::fopen(file_path_.c_str(), "rb");
+    ASSERT_NE(nullptr, read_only);
+    AILEGO_DEFER([&] { std::fclose(read_only); });
+#ifdef _WIN32
+    const int read_fd = _fileno(read_only);
+#else
+    const int read_fd = fileno(read_only);
+#endif
+    ASSERT_GE(read_fd, 0);
     const int fd =
-        ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, -1);
+        ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, read_fd);
     AILEGO_DEFER([&] {
       ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, fd);
     });

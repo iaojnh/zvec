@@ -17,7 +17,9 @@
 #include <zvec/core/framework/index_segment_storage.h>
 #include "utility/utility_params.h"
 
-#if defined(__APPLE__)
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <ailego/io/libaio_loader.h>
+#elif defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
 
@@ -1884,6 +1886,7 @@ TEST_F(ParserPrimitiveAdmissionTest,
 #if defined(__linux__) && !defined(__ANDROID__)
 TEST_F(ParserPrimitiveAdmissionTest,
        ResidentHintAddedAfterLoanDoesNotChangeAdmission) {
+  if (!LibAioLoader::Instance().load()) GTEST_SKIP() << "libaio unavailable";
   class LateHint : public FailingParent {
    public:
     LateHint(Pointer parent, int phase)
@@ -1943,6 +1946,7 @@ TEST_F(ParserPrimitiveAdmissionTest,
   }
 }
 TEST_F(ParserPrimitiveAdmissionTest, ParsingScopeBalancesNestedAndFailedOpens) {
+  if (!LibAioLoader::Instance().load()) GTEST_SKIP() << "libaio unavailable";
   const size_t page = pool.page_buffer_size();
   for (bool warm : {false, true}) {
     for (int failure : {0, 1, 2, 3}) {
