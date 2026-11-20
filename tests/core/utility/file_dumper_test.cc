@@ -282,6 +282,42 @@ TEST(FileReadStorage, MemoryBlockReadsRetainIndependentBuffers) {
   std::remove(file_path.c_str());
 }
 
+TEST(FileReadStorage, EmptyMappedSegmentsSurviveCloseAtAnyAlignment) {
+  const std::string path = "file_read_empty_segment.idx";
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { std::remove(path.c_str()); });
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_TRUE(dumper);
+  ASSERT_EQ(0, dumper->create(path));
+  ASSERT_EQ(0, dumper->append("unaligned", 0, 0, 0));
+  const size_t page = ailego::MemoryHelper::PageSize();
+  const std::string padding(page - dumper->size() % page, 'x');
+  ASSERT_EQ(padding.size(), dumper->write(padding.data(), padding.size()));
+  ASSERT_EQ(0, dumper->append("padding", padding.size(), 0, 0));
+  ASSERT_EQ(0, dumper->append("aligned", 0, 0, 0));
+  ASSERT_EQ(0, dumper->close());
+
+  auto storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_TRUE(storage);
+  for (const char *name : {"unaligned", "aligned"}) {
+    SCOPED_TRACE(name);
+    ASSERT_EQ(0, storage->open(path, false));
+    ASSERT_TRUE(storage->has(name));
+    auto segment = storage->get(name, 0);
+    ASSERT_TRUE(segment);
+    EXPECT_EQ(0u, segment->capacity());
+    auto clone = segment->clone();
+    ASSERT_TRUE(clone);
+    ASSERT_EQ(0, storage->close());
+    segment.reset();
+    IndexStorage::MemoryBlock block;
+    EXPECT_EQ(0u, clone->read(0, block, 1));
+    EXPECT_EQ(nullptr, block.data());
+    IndexStorage::SegmentData range(0, 0);
+    EXPECT_TRUE(clone->read(&range, 1));
+  }
+}
+
 TEST(FileReadStorage, IndependentReadersKeepTheValidatedFile) {
   const std::string path = "file_read_generation.idx";
   const std::string moved = path + ".old";

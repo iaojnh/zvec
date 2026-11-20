@@ -211,15 +211,15 @@ class FileReadStorage : public IndexStorage {
     MMapSegment(const FileReadStorage &container,
                 const IndexUnpacker::SegmentMeta &segment,
                 const std::shared_ptr<ailego::File> &file_ptr, size_t offset,
-                const void *data, std::function<void()> &&cb)
+                const void *data = nullptr, std::function<void()> cb = {})
         : Segment(container, segment, file_ptr, offset),
           data_(static_cast<const char *>(data)),
           cleanup_(std::move(cb)) {
-      ailego_assert_with(data_, "Null Pointer");
+      ailego_assert_with(data_ || !region_size_, "Missing segment mapping");
     }
 
     ~MMapSegment() override {
-      cleanup_();
+      if (cleanup_) cleanup_();
     }
 
     //! Fetch data from segment (with own buffer)
@@ -253,7 +253,7 @@ class FileReadStorage : public IndexStorage {
       for (auto *it = iovec, *end = iovec + count; it != end; ++it) {
         if (it->offset > region_size_ || it->length > region_size_ - it->offset)
           return false;
-        it->data = data_ + it->offset;
+        it->data = data_ ? data_ + it->offset : nullptr;
       }
       return true;
     }
@@ -479,10 +479,15 @@ class FileReadStorage : public IndexStorage {
       return IndexStorage::Segment::Pointer();
     }
 
+    size_t size = segment.data_size() + segment.padding_size();
+    if (!size) {
+      // An empty extent has a directory entry but no bytes to map.
+      return std::make_shared<typename T::MMapSegment>(
+          *(static_cast<const T *>(this)), segment, file_ptr, index_offset_);
+    }
     int opt = memory_locked_ ? ailego::File::MMAP_LOCKED : 0;
     opt |= memory_warmup_ ? ailego::File::MMAP_WARMUP : 0;
     opt |= memory_shared_ ? ailego::File::MMAP_SHARED : 0;
-    size_t size = segment.data_size() + segment.padding_size();
     size_t segment_offset = index_offset_ + segment.data_offset();
     size_t offset = segment_offset / ailego::MemoryHelper::PageSize() *
                     ailego::MemoryHelper::PageSize();
