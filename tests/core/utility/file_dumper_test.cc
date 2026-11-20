@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_helper.h"
+#include "zvec/core/framework/index_packer.h"
 #include "zvec/core/framework/index_segment_storage.h"
 
 using namespace zvec;
@@ -150,8 +151,100 @@ TEST(IndexSegmentDumper, General) {
   EXPECT_EQ("A: Hello world!!! #3",
             std::string(static_cast<const char *>(block.data()),
                         segment->data_size()));
+
+  const auto last = segment->capacity() - 1;
+  char tail[2] = {};
+  EXPECT_EQ(1u, segment->fetch(last, tail, sizeof(tail)));
+  EXPECT_EQ('3', tail[0]);
+  EXPECT_EQ(1u, segment->read(last, block, sizeof(tail)));
+  EXPECT_EQ(0u, segment->read(last + 1, block, 1));
+  EXPECT_EQ(nullptr, block.data());
+  IndexStorage::SegmentData ranges[] = {{last, 1}, {last, 2}};
+  EXPECT_FALSE(segment->read(ranges, 2));
+  EXPECT_EQ(last, ranges[0].offset);
+  EXPECT_EQ(nullptr, ranges[0].data);
+  ranges[1] = {0, 2};
+  ASSERT_TRUE(segment->read(ranges, 2));
+  EXPECT_EQ("A:", std::string(static_cast<const char *>(ranges[1].data), 2));
+  EXPECT_EQ(last, ranges[0].offset);
+  EXPECT_EQ(0u, ranges[1].offset);
+
+  // File handle duplication can fail independently of opening the directory.
+  struct Parent : IndexSegmentStorage::Segment {
+    explicit Parent(const IndexStorage::Segment::Pointer &source)
+        : IndexSegmentStorage::Segment(source, 0, source->data_size(), 0, 0) {}
+    IndexStorage::Segment::Pointer clone() override {
+      return refuse_clone ? nullptr : shared_from_this();
+    }
+    bool read(IndexStorage::SegmentData *, size_t) override {
+      throw std::bad_alloc();
+    }
+    bool refuse_clone{false};
+  };
+  auto controlled = std::make_shared<Parent>(parent);
+  IndexSegmentStorage controlled_storage(controlled);
+  ASSERT_EQ(0, controlled_storage.open("", false));
+  auto child = controlled_storage.get("3", 0);
+  ASSERT_TRUE(child);
+  EXPECT_THROW(child->read(ranges, 2), std::bad_alloc);
+  EXPECT_EQ(last, ranges[0].offset);
+  EXPECT_EQ(0u, ranges[1].offset);
+  controlled->refuse_clone = true;
+  EXPECT_FALSE(child->clone());
+  EXPECT_FALSE(controlled_storage.get("3", 0));
+  EXPECT_TRUE(controlled_storage.get_all().empty());
 }
 
+
+TEST(IndexUnpacker, ReadsChainedPackagesAtByteOffsetsAndResets) {
+  auto package = [](const std::string &id) {
+    std::string bytes;
+    auto write = [&](const void *data, size_t len) {
+      bytes.append(static_cast<const char *>(data), len);
+      return len;
+    };
+    IndexPacker packer;
+    EXPECT_TRUE(packer.setup(write));
+    EXPECT_EQ(id.size(), packer.pack(write, id.data(), id.size()));
+    std::vector<IndexPacker::SegmentMeta> segments{{id, id.size(), 0, 0}};
+    EXPECT_TRUE(packer.finish(write, segments));
+    return bytes;
+  };
+  auto first = package("first");
+  const auto second = package("second");
+  IndexFormat::MetaHeader header;
+  IndexFormat::MetaFooter footer;
+  const size_t footer_offset = first.size() - sizeof(footer);
+  std::memcpy(&header, first.data(), sizeof(header));
+  header.meta_footer_offset = static_cast<uint32_t>(footer_offset);
+  IndexFormat::UpdateMetaHeader(&header);
+  std::memcpy(first.data(), &header, sizeof(header));
+  std::memcpy(&footer, first.data() + footer_offset, sizeof(footer));
+  footer.next_meta_header_offset = first.size() + 1;
+  IndexFormat::UpdateMetaFooter(&footer, 0);
+  std::memcpy(first.data() + footer_offset, &footer, sizeof(footer));
+  // Every pointer into the first package is unaligned, and the second package
+  // has an end-relative footer inside a chain.
+  std::string bytes = " " + first + " " + second;
+  IndexUnpacker unpacker;
+  auto unpack = [&](size_t start, size_t length) {
+    return unpacker.unpack(
+        [&](size_t offset, const void **data, size_t size) {
+          if (offset > length || size > length - offset) return size_t{0};
+          *data = bytes.data() + start + offset;
+          return size;
+        },
+        length, true);
+  };
+  ASSERT_TRUE(unpack(1, bytes.size() - 1));
+  const auto it = unpacker.segments().find("second");
+  ASSERT_NE(unpacker.segments().end(), it);
+  const auto &entry = it->second;
+  EXPECT_EQ("second", bytes.substr(1 + entry.data_offset(), entry.data_size()));
+  unpacker.reset();
+  ASSERT_TRUE(unpack(2 + first.size(), second.size()));
+  EXPECT_EQ(unpacker.segments().end(), unpacker.segments().find("first"));
+}
 
 TEST(FileReadStorage, MemoryBlockReadsRetainIndependentBuffers) {
   const std::string file_path = "file_read_storage_memory_block_test";

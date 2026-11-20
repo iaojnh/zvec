@@ -81,6 +81,9 @@ class IndexUnpacker {
 
   //! Reset the unpacker
   void reset() {
+    header_ = {};
+    footer_ = {};
+    current_header_start_offset_ = 0;
     segments_.clear();
     version_ = ailego::BudgetedStringBuffer{};
   }
@@ -124,7 +127,9 @@ class IndexUnpacker {
                   "Invocable function type");
 
     while (true) {
-      if (!this->unpack_header(read_data)) {
+      if (current_header_start_offset_ > total ||
+          sizeof(header_) > total - current_header_start_offset_ ||
+          !this->unpack_header(read_data)) {
         if (report_errors) LOG_ERROR("Failed to unpack index header");
         return false;
       }
@@ -144,6 +149,10 @@ class IndexUnpacker {
       if (footer_.next_meta_header_offset == 0) {
         break;
       }
+      if (footer_.next_meta_header_offset <
+              current_header_start_offset_ + footer_.total_size ||
+          footer_.next_meta_header_offset >= total)
+        return false;
       current_header_start_offset_ = footer_.next_meta_header_offset;
     }
 
@@ -187,12 +196,8 @@ class IndexUnpacker {
       return false;
     }
 
-    size_t footer_offset = ((int32_t)header_.meta_footer_offset < 0)
-                               ? total + (int32_t)header_.meta_footer_offset
-                               : header_.meta_footer_offset;
-    if (footer_offset + sizeof(footer_) > total) {
-      return false;
-    }
+    size_t footer_offset = 0;
+    if (!resolve_footer_offset(total, &footer_offset)) return false;
 
     const void *data = nullptr;
     if (read_data(current_header_start_offset_ + footer_offset, &data,
@@ -201,9 +206,14 @@ class IndexUnpacker {
     }
 
     memcpy(&footer_, data, sizeof(footer_));
-    if (footer_.content_size + footer_.content_padding_size +
-            header_.content_offset >
-        footer_.total_size) {
+    if (footer_.total_size > total - current_header_start_offset_ ||
+        footer_offset + sizeof(footer_) > footer_.total_size ||
+        header_.content_offset < sizeof(header_) ||
+        header_.content_offset > footer_.total_size ||
+        footer_.content_size > footer_.total_size - header_.content_offset ||
+        footer_.content_padding_size > footer_.total_size -
+                                           header_.content_offset -
+                                           footer_.content_size) {
       return false;
     }
     if (ailego::Crc32c::Hash(&footer_, sizeof(footer_), footer_.footer_crc) !=
@@ -220,17 +230,22 @@ class IndexUnpacker {
     static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
                                                 const void **, size_t>::value,
                   "Invocable function type");
-    if (sizeof(IndexFormat::SegmentMeta) * footer_.segment_count >
-        footer_.segments_meta_size) {
+    using Entry = IndexFormat::SegmentMeta;
+    if (footer_.segment_count > footer_.segments_meta_size / sizeof(Entry))
       return false;
-    }
-    size_t offset = ((int32_t)header_.meta_footer_offset < 0)
-                        ? total + (int32_t)header_.meta_footer_offset
-                        : header_.meta_footer_offset;
-    if (offset < footer_.segments_meta_size || offset > total) {
+    size_t offset = 0;
+    if (!resolve_footer_offset(total, &offset) ||
+        footer_.segments_meta_size > offset - sizeof(header_))
       return false;
-    }
+    const size_t footer_end = offset + sizeof(footer_);
     offset -= footer_.segments_meta_size;
+    // Packed files place the directory after the payload. Writable files
+    // reserve the directory before it. Neither layout permits overlap.
+    const uint64_t payload_extent =
+        footer_.content_size + footer_.content_padding_size;
+    if (header_.content_offset < footer_end &&
+        header_.content_offset + payload_extent > offset)
+      return false;
 
     const void *data = nullptr;
     if (read_data(current_header_start_offset_ + offset, &data,
@@ -243,28 +258,30 @@ class IndexUnpacker {
     }
 
     for (size_t i = 0; i < footer_.segment_count;) {
-      const auto *seg = static_cast<const IndexFormat::SegmentMeta *>(data) + i;
-      if (seg->segment_id_offset >= footer_.segments_meta_size) {
+      // A package embedded in another segment can start at any byte offset.
+      // Decode the entry before interpreting its fields.
+      Entry entry;
+      const auto *bytes = static_cast<const char *>(data);
+      std::memcpy(&entry, bytes + i * sizeof(entry), sizeof(entry));
+      if (entry.segment_id_offset < sizeof(Entry) * footer_.segment_count ||
+          entry.segment_id_offset >= footer_.segments_meta_size ||
+          entry.data_index > footer_.content_size ||
+          entry.data_size > footer_.content_size - entry.data_index ||
+          entry.padding_size >
+              payload_extent - entry.data_index - entry.data_size) {
         return false;
       }
-      if (seg->data_index > footer_.content_size) {
-        return false;
-      }
-      if (seg->data_index + seg->data_size > footer_.content_size) {
-        return false;
-      }
-      const char *name =
-          reinterpret_cast<const char *>(data) + seg->segment_id_offset;
+      const char *name = bytes + entry.segment_id_offset;
       const size_t max_length =
-          footer_.segments_meta_size - seg->segment_id_offset;
+          footer_.segments_meta_size - entry.segment_id_offset;
       const size_t length = ::strnlen(name, max_length);
       if (length == max_length) return false;
       try {
         segments_.emplace(
             ailego::BudgetedString(name, length),
-            SegmentMeta(seg->data_index + header_.content_offset +
+            SegmentMeta(entry.data_index + header_.content_offset +
                             current_header_start_offset_,
-                        seg->data_size, seg->padding_size, seg->data_crc));
+                        entry.data_size, entry.padding_size, entry.data_crc));
         ++i;
       } catch (const std::bad_alloc &) {
         // Keep the already-required directory prefix. Change only this
@@ -334,7 +351,7 @@ class IndexUnpacker {
     const void *data = nullptr;
     uint32_t checksum = 0u;
     size_t total = footer_.content_size;
-    size_t offset = sizeof(header_);
+    size_t offset = header_.content_offset;
 
     while (total >= block_size) {
       if (read_data(current_header_start_offset_ + offset, &data, block_size) !=
@@ -354,6 +371,21 @@ class IndexUnpacker {
   }
 
  private:
+  bool resolve_footer_offset(size_t total, size_t *offset) const {
+    if (current_header_start_offset_ > total) return false;
+    const size_t remaining = total - current_header_start_offset_;
+    const int64_t encoded = static_cast<int32_t>(header_.meta_footer_offset);
+    if (encoded < 0) {
+      const size_t distance = static_cast<size_t>(-encoded);
+      if (distance > remaining) return false;
+      *offset = remaining - distance;
+    } else {
+      *offset = static_cast<size_t>(encoded);
+    }
+    return *offset >= sizeof(header_) && *offset <= remaining &&
+           sizeof(footer_) <= remaining - *offset;
+  }
+
   // Existing three-argument readers retain their throwing allocation
   // behavior. A parser explicitly opts into per-input recovery in unpack(),
   // with a fourth callback argument requesting a cheaper representation.

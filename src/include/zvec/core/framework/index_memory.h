@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <algorithm>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -65,13 +66,8 @@ class IndexMemory {
 
     //! Write data into the block
     size_t write(size_t off, const void *data, size_t len) {
-      size_t region_size = buffer_.size();
-      if (off + len > region_size) {
-        if (off > region_size) {
-          off = region_size;
-        }
-        len = region_size - off;
-      }
+      if (off >= buffer_.size() || !len) return 0;
+      len = std::min(len, buffer_.size() - off);
       std::copy(reinterpret_cast<const uint8_t *>(data),
                 reinterpret_cast<const uint8_t *>(data) + len,
                 buffer_.data() + off);
@@ -90,14 +86,13 @@ class IndexMemory {
 
     //! Read data from the storage (Zero-copy)
     size_t read(size_t off, const void **data, size_t len) {
-      size_t region_size = buffer_.size();
-      if (off + len > region_size) {
-        if (off > region_size) {
-          off = region_size;
-        }
-        len = region_size - off;
+      if (buffer_.empty()) {
+        *data = nullptr;
+        return 0;
       }
+      off = std::min(off, buffer_.size());
       *data = buffer_.data() + off;
+      len = std::min(len, buffer_.size() - off);
       return len;
     }
 

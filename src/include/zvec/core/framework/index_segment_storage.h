@@ -15,6 +15,7 @@
 
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_module.h>
 #include <zvec/core/framework/index_parsing_input.h>
@@ -45,12 +46,9 @@ class IndexSegmentStorage : public IndexStorage {
     //! Constructor
     Segment(const IndexStorage::Segment::Pointer &parent,
             const IndexUnpacker::SegmentMeta &segment)
-        : data_offset_(segment.data_offset()),
-          data_size_(segment.data_size()),
-          padding_size_(segment.padding_size()),
-          region_size_(segment.data_size() + segment.padding_size()),
-          data_crc_(segment.data_crc()),
-          parent_(parent->clone()) {}
+        : Segment(parent ? parent->clone() : nullptr, segment.data_offset(),
+                  segment.data_size(), segment.padding_size(),
+                  segment.data_crc()) {}
 
     //! Constructor (for clone)
     Segment(const IndexStorage::Segment::Pointer &cloned_parent,
@@ -61,7 +59,10 @@ class IndexSegmentStorage : public IndexStorage {
           padding_size_(padding_size),
           region_size_(data_size + padding_size),
           data_crc_(data_crc),
-          parent_(cloned_parent) {}
+          parent_(cloned_parent) {
+      if (!parent_)
+        throw std::runtime_error("Nested segment has no backing reader");
+    }
 
     //! Destructor
     ~Segment() override = default;
@@ -87,7 +88,9 @@ class IndexSegmentStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      return parent_->fetch(data_offset_ + offset, buf, len);
+      if (offset >= region_size_ || !len) return 0;
+      return parent_->fetch(data_offset_ + offset, buf,
+                            std::min(len, region_size_ - offset));
     }
 
     size_t fetch_for_parsing(size_t offset, void *buf,
@@ -154,7 +157,12 @@ class IndexSegmentStorage : public IndexStorage {
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      return parent_->read(data_offset_ + offset, data, len);
+      if (offset >= region_size_ || !len) {
+        data.reset();
+        return 0;
+      }
+      return parent_->read(data_offset_ + offset, data,
+                           std::min(len, region_size_ - offset));
     }
 
     size_t read_for_parsing(size_t offset, MemoryBlock &data,
@@ -169,14 +177,25 @@ class IndexSegmentStorage : public IndexStorage {
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
-      for (SegmentData *it = iovec, *end = iovec + count; it != end; ++it) {
-        it->offset += data_offset_;
+      if (!count) return true;
+      if (!iovec) return false;
+      for (size_t i = 0; i < count; ++i) {
+        if (iovec[i].offset > region_size_ ||
+            iovec[i].length > region_size_ - iovec[i].offset)
+          return false;
       }
-      bool success = parent_->read(iovec, count);
-      for (SegmentData *it = iovec, *end = iovec + count; it != end; ++it) {
-        it->offset -= data_offset_;
-      }
-      return success;
+      // Parent readers use these same descriptors for the result pointers.
+      // Restore caller-relative offsets even if a backend throws.
+      struct RestoreOffsets {
+        SegmentData *items;
+        size_t count, base;
+        ~RestoreOffsets() {
+          for (size_t i = 0; i < count; ++i) items[i].offset -= base;
+        }
+      };
+      for (size_t i = 0; i < count; ++i) iovec[i].offset += data_offset_;
+      RestoreOffsets restore{iovec, count, data_offset_};
+      return parent_->read(iovec, count);
     }
 
     size_t write(size_t, const void *, size_t) override {
@@ -199,8 +218,10 @@ class IndexSegmentStorage : public IndexStorage {
     //! Clone the segment (each clone gets an independent parent buffer
     //! for thread safety — concurrent reads require separate buffers).
     IndexStorage::Segment::Pointer clone() override {
-      return std::make_shared<Segment>(parent_->clone(), data_offset_,
-                                       data_size_, padding_size_, data_crc_);
+      auto parent = parent_->clone();
+      if (!parent) return nullptr;
+      return std::make_shared<Segment>(parent, data_offset_, data_size_,
+                                       padding_size_, data_crc_);
     }
 
    private:
@@ -343,7 +364,7 @@ class IndexSegmentStorage : public IndexStorage {
     if (it == segments_.end()) {
       return IndexStorage::Segment::Pointer();
     }
-    return std::make_shared<IndexSegmentStorage::Segment>(parent_, it->second);
+    return make_segment(it->second);
   }
 
   //! Test if it a segment exists
@@ -357,8 +378,9 @@ class IndexSegmentStorage : public IndexStorage {
     std::map<std::string, IndexStorage::Segment::Pointer> result;
     if (parent_) {
       for (const auto &it : segments_) {
-        result.emplace(it.first, std::make_shared<IndexSegmentStorage::Segment>(
-                                     parent_, it.second));
+        auto segment = make_segment(it.second);
+        if (!segment) return {};
+        result.emplace(it.first, std::move(segment));
       }
     }
     return result;
@@ -393,6 +415,15 @@ class IndexSegmentStorage : public IndexStorage {
   }
 
  private:
+  IndexStorage::Segment::Pointer make_segment(
+      const IndexUnpacker::SegmentMeta &meta) const {
+    auto parent = parent_->clone();
+    if (!parent) return nullptr;
+    return std::make_shared<Segment>(parent, meta.data_offset(),
+                                     meta.data_size(), meta.padding_size(),
+                                     meta.data_crc());
+  }
+
   uint32_t magic_{0};
   IndexUnpacker::SegmentMap segments_{};
   IndexStorage::Segment::Pointer parent_{};
