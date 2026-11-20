@@ -164,6 +164,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     std::atomic<size_t> capacity{0};
     ailego::BudgetedMappedBuffer workspace;
     ailego::BudgetedVector<size_t> pins;
+    size_t parsing_floor{0};  // accessed only while busy is held
   };
   struct ReadSlot {
     std::atomic<bool> busy{false};
@@ -187,10 +188,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return false;
     }
     bool release_for_parsing_retry() noexcept override {
-      // Only source cache pins can make the streamed path cheaper. Execution
-      // workspaces remain funded so a failed reopen preserves later reads.
-      return readers.load(std::memory_order_acquire) == 1 && single &&
-             single->refs.load(std::memory_order_acquire) == 1;
+      // Retire the sole parser's lease, keeping execution workspace backing
+      // funded. A temporary descriptor can cost more than a small owned input.
+      // Source-cache loans also require the parser to hold the only real pin.
+      return readers.load(std::memory_order_acquire) == 1 &&
+             (view ||
+              (single && single->refs.load(std::memory_order_acquire) == 1));
     }
     void reset() noexcept override {
       if (single) owner->unpin(*single, single_key);
@@ -1021,12 +1024,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       changed.wait_for(lock, std::chrono::milliseconds(1));
     }
   }
-  bool ensure_workspace(View &view, size_t bytes) {
+  bool replace_workspace(View &view, size_t bytes) {
     const size_t old_bytes = view.workspace.mapped_size();
-    if (old_bytes >= bytes) return true;
-    if (!adaptive) return false;
-    // This slot belongs to the current reader. Release the old mapping before
-    // admitting growth so the two workspaces do not compete for the budget.
     view.capacity.store(0, std::memory_order_relaxed);
     workspace_bytes.fetch_sub(old_bytes, std::memory_order_relaxed);
     view.workspace.clear();
@@ -1035,6 +1034,39 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     view.capacity.store(new_bytes, std::memory_order_relaxed);
     workspace_bytes.fetch_add(new_bytes, std::memory_order_relaxed);
     return true;
+  }
+  bool ensure_workspace(View &view, size_t bytes, bool parsing = false) {
+    const size_t old_bytes = view.workspace.mapped_size();
+    // Ordinary queries adopt their workspace capacity. Parsing growth is
+    // temporary and must not displace a later input or its private directory.
+    if (!parsing) view.parsing_floor = 0;
+    if (old_bytes >= bytes) return true;
+    if (!adaptive) return false;
+    if (parsing && !view.parsing_floor) view.parsing_floor = old_bytes;
+    return replace_workspace(view, bytes);
+  }
+  bool trim_parsing_workspace(View &view, size_t bytes) {
+    if (!view.parsing_floor) return true;
+    const size_t target = std::max(view.parsing_floor, AlignPage(bytes));
+    if (view.workspace.mapped_size() <= target) return true;
+    return replace_workspace(view, target);
+  }
+  void retire_parsing_growth() noexcept {
+    for (auto &view : views) {
+      bool idle = false;
+      if (!view->busy.compare_exchange_strong(idle, true,
+                                              std::memory_order_acquire))
+        continue;
+      // A real escaped reader keeps its view busy. Only idle parser growth
+      // is retired; query backing and all live inputs remain untouched.
+      if (view->parsing_floor) {
+        const size_t floor = std::exchange(view->parsing_floor, 0);
+        if (view->workspace.mapped_size() != floor)
+          replace_workspace(*view, floor);
+      }
+      view->busy.store(false, std::memory_order_release);
+    }
+    changed.notify_all();
   }
   std::shared_ptr<Lease> lease(Segment::ScatterBlock &out, View *view,
                                Entry *single = nullptr, size_t key = 0) {
@@ -1147,7 +1179,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     // optional query workspace when an exact owned input is cheaper.
     // Every funded view has at least three native pages. Growing it therefore
     // costs less than a separate exact input beside the old mapping. If its
-    // private directory later fails, an owned copy cannot improve that peak.
+    // private directory later fails, an owned copy cannot improve that input's
+    // peak. Later callbacks retire excess parsing growth independently.
     if (!populate &&
         (!view->workspace.mapped_size() ||
          (strategy && !adaptive && view->workspace.mapped_size() < required))) {
@@ -1157,8 +1190,16 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           strategy ? IndexError_Unsupported : IndexError_ReadData;
       return 0;
     }
+    // Return a previous parser input's excess growth before admitting the
+    // next descriptor. This also works at zero currently available budget.
+    if (!populate && !trim_parsing_workspace(*view, required)) {
+      view->busy.store(false, std::memory_order_release);
+      changed.notify_one();
+      chunk_read_error = IndexError_NoMemory;
+      return 0;
+    }
     out.lease = lease(out, view);
-    if (!ensure_workspace(*view, required)) {
+    if (!ensure_workspace(*view, required, !populate)) {
       chunk_read_error =
           populate || strategy ? IndexError_NoMemory : IndexError_ReadData;
       out.reset();
@@ -1569,6 +1610,7 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
 #if defined(__linux__) && !defined(__ANDROID__)
     if (state_->read_ahead) state_->read_ahead->end_parsing();
 #endif
+    state_->retire_parsing_growth();
   }
   size_t read_for_parsing_with_strategy(size_t offset, MemoryBlock &out,
                                         size_t len,
@@ -1590,6 +1632,9 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     out.reset();
     if (offset > capacity()) return 0;
     len = std::min(len, capacity() - offset);
+    // Previous parsing growth may sit in a different idle view from the one
+    // selected for this input. Retire it source-wide before input admission.
+    if (!populate) state_->retire_parsing_growth();
     State::ReadSlot *slot = nullptr;
     for (auto &candidate : state_->read_slots) {
       bool expected = false;
@@ -1597,8 +1642,13 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
                                                   std::memory_order_acquire)) {
         // Nested metadata/key reads commonly retain an earlier result. Keep
         // its descriptor cached and try another idle slot before allocating.
-        if (candidate->block.workspace &&
-            candidate->block.workspace.use_count() != 1) {
+        // Parsing may reuse a funded descriptor, but must not populate this
+        // optional cache. Otherwise a first header leaves its descriptor
+        // charged while a later directory needs the same budget. A local
+        // descriptor follows only the returned input and can retire on retry.
+        if ((!populate && !candidate->block.workspace) ||
+            (candidate->block.workspace &&
+             candidate->block.workspace.use_count() != 1)) {
           candidate->busy.store(false, std::memory_order_release);
           continue;
         }

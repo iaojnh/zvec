@@ -2510,6 +2510,168 @@ TEST_F(ParserPrimitiveAdmissionTest, MovedInputCanBeReusedIndependently) {
     EXPECT_EQ(0x5a, *static_cast<unsigned char *>(assigned.data()));
   }
 }
+TEST_F(ParserPrimitiveAdmissionTest,
+       ColdParserDescriptorsPreserveOwnedInputAdmission) {
+  const size_t page = pool.page_buffer_size();
+  struct Shape {
+    bool adaptive, prepared, cache, busy;
+    size_t workers{1};
+  };
+  const Shape shapes[] = {
+      {false, false, false, false},   {true, false, false, false},
+      {false, true, false, false},    {true, true, false, false},
+      {false, false, true, false},    {true, false, true, false},
+      {false, false, false, true},    {true, false, true, true},
+      {true, false, false, false, 2}, {true, false, false, false, 4},
+      {true, false, true, true, 2},   {true, true, true, true, 4}};
+  // An explicit short version and the normal generated version exercise
+  // small private peaks on both sides of the first descriptor's charge.
+  for (const std::string name : {"IndexVersion", "a"}) {
+    std::string path;
+    package(path, name, 8 * page, 1);
+    for (const auto &shape : shapes) {
+      const auto trial = [&](size_t quota, bool owned) {
+        auto storage = std::make_shared<ChunkReadStorage>();
+        auto params = chunk_params(page);
+        params.set(CHUNK_READ_STORAGE_ADAPTIVE, shape.adaptive);
+        params.set(CHUNK_READ_STORAGE_WORKSPACE_COUNT, shape.workers);
+        if (!shape.cache) params.set(CHUNK_READ_STORAGE_CACHE_BYTES, size_t{0});
+        EXPECT_EQ(0, storage->init(params));
+        EXPECT_EQ(0, storage->open(path, false));
+        auto parent = storage->get("nested", 1);
+        if (shape.cache) {
+          std::string image(parent->data_size(), '\0');
+          EXPECT_EQ(image.size(), parent->fetch(0, image.data(), image.size()));
+        }
+        IndexStorage::MemoryBlock prepared, occupied;
+        if (shape.prepared) {
+          EXPECT_EQ(16u, parent->read(0, prepared, 16));
+          prepared.reset();
+        }
+        if (shape.busy)
+          EXPECT_EQ(page, storage->get("prefix", 1)->read(0, occupied, page));
+        const size_t workspace = storage->stats().workspace_bytes;
+        int result;
+        {
+          Pressure pressure(quota);
+          const size_t used = pool.used();
+          // The independent plan uses an exact heap copy and the real
+          // buffered file, without read leases or the strategy selector.
+          result = owned ? copied(parent, false) : parse(parent, name);
+          EXPECT_LE(pool.used(), used);
+        }
+        EXPECT_EQ(workspace, storage->stats().workspace_bytes);
+        if (occupied.data())
+          EXPECT_EQ('p', *static_cast<const char *>(occupied.data()));
+        EXPECT_EQ(0, parse(parent, name));
+        return result;
+      };
+      size_t low = 0, high = 8192;
+      ASSERT_EQ(0, trial(high, true));
+      while (low < high) {
+        const size_t quota = low + (high - low) / 2;
+        if (trial(quota, true) == 0)
+          high = quota;
+        else
+          low = quota + 1;
+      }
+      std::vector<size_t> quotas{0, low, low + 1};
+      if (low) quotas.push_back(low - 1);
+      for (const size_t quota : quotas) {
+        SCOPED_TRACE(::testing::Message()
+                     << name << ':' << shape.adaptive << ':' << shape.prepared
+                     << ':' << shape.cache << ':' << shape.busy << ':'
+                     << shape.workers << ':' << quota);
+        const int reference = trial(quota, true);
+        const int actual = trial(quota, false);
+        if (reference == 0)
+          EXPECT_EQ(0, actual);
+        else
+          EXPECT_TRUE(actual == 0 || actual == IndexError_NoMemory);
+      }
+    }
+  }
+}
+TEST_F(ParserPrimitiveAdmissionTest,
+       ParsingGrowthDoesNotCompeteWithLaterInputs) {
+  const size_t page = pool.page_buffer_size();
+  for (const size_t name_bytes : {8 * page, 64 * page}) {
+    for (const size_t version_bytes : {2 * page, 4 * page, 16 * page}) {
+      const std::string name(name_bytes, 'n'), version(version_bytes, 'v');
+      const std::string path =
+          "parser-growth-" + std::to_string(files.size()) + ".bin";
+      files.push_back(path);
+      auto file = IndexFactory::CreateDumper("FileDumper");
+      ASSERT_EQ(0, file->create(path));
+      const std::string prefix(8 * page, 'p');
+      ASSERT_EQ(prefix.size(), file->write(prefix.data(), prefix.size()));
+      ASSERT_EQ(0, file->append("prefix", prefix.size(), 0, 0));
+      auto nested = std::make_shared<IndexSegmentDumper>(file, "nested");
+      const char value = 'v';
+      ASSERT_EQ(1u, nested->write(&value, 1));
+      ASSERT_EQ(0, nested->append(name, 1, 0, 0));
+      ASSERT_EQ(version.size(), nested->write(version.data(), version.size()));
+      ASSERT_EQ(0, nested->append("IndexVersion", version.size(), 0, 0));
+      ASSERT_EQ(0, nested->close());
+      ASSERT_EQ(0, file->close());
+      nested.reset();
+      file.reset();
+      for (const size_t workers : {size_t{1}, size_t{2}, size_t{4}}) {
+        for (const bool adaptive : {false, true}) {
+          const auto trial = [&](size_t quota, bool owned) {
+            auto storage = std::make_shared<ChunkReadStorage>();
+            auto params = chunk_params(page);
+            params.set(CHUNK_READ_STORAGE_CACHE_BYTES, size_t{0});
+            params.set(CHUNK_READ_STORAGE_ADAPTIVE, adaptive);
+            params.set(CHUNK_READ_STORAGE_WORKSPACE_COUNT, workers);
+            EXPECT_EQ(0, storage->init(params));
+            EXPECT_EQ(0, storage->open(path, false));
+            auto parent = storage->get("nested", 1);
+            const size_t workspace = storage->stats().workspace_bytes;
+            int result;
+            {
+              Pressure pressure(quota);
+              const size_t used = pool.used();
+              result = owned ? copied(parent, false) : parse(parent, name);
+              EXPECT_LE(pool.used(), used);
+              EXPECT_EQ(workspace, storage->stats().workspace_bytes);
+            }
+            // Failed/successful parsing must preserve the funded execution
+            // capacity, including when growth itself was refused partway.
+            IndexStorage::MemoryBlock data;
+            EXPECT_EQ(page, storage->get("prefix", 1)->read(0, data, page));
+            if (data.data())
+              EXPECT_EQ('p', *static_cast<const char *>(data.data()));
+            data.reset();
+            EXPECT_EQ(0, parse(parent, name));
+            EXPECT_EQ(workspace, storage->stats().workspace_bytes);
+            return result;
+          };
+          size_t low = 0, high = 4 * (name.size() + version.size());
+          ASSERT_EQ(0, trial(high, true));
+          while (low < high) {
+            const size_t quota = low + (high - low) / 2;
+            if (trial(quota, true) == 0)
+              high = quota;
+            else
+              low = quota + 1;
+          }
+          for (const size_t quota : {size_t{0}, low - 1, low, low + 1}) {
+            SCOPED_TRACE(::testing::Message()
+                         << name_bytes << ':' << version_bytes << ':'
+                         << adaptive << ':' << workers << ':' << quota);
+            const int reference = trial(quota, true);
+            const int actual = trial(quota, false);
+            if (reference == 0)
+              EXPECT_EQ(0, actual);
+            else
+              EXPECT_TRUE(actual == 0 || actual == IndexError_NoMemory);
+          }
+        }
+      }
+    }
+  }
+}
 #if defined(__linux__) && !defined(__ANDROID__)
 TEST_F(ParserPrimitiveAdmissionTest,
        ResidentHintAddedAfterLoanDoesNotChangeAdmission) {
