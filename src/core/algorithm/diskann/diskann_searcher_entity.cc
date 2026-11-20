@@ -136,8 +136,6 @@ int DiskAnnSearcherEntity::load(const IndexMeta &meta,
 }
 
 int DiskAnnSearcherEntity::load_pq_segment() {
-  IndexStorage::MemoryBlock data;
-
   // load pq meta
   pq_meta_segment_ = storage_->get(DiskAnnEntity::kDiskAnnPqMetaSegmentId);
   if (!pq_meta_segment_) {
@@ -146,22 +144,16 @@ int DiskAnnSearcherEntity::load_pq_segment() {
     return IndexError_InvalidFormat;
   }
 
-  size_t read_size;
-  size_t offset = 0;
-
-  // 1. read pq meta
-  read_size = pq_meta_segment_->read(offset, data, sizeof(DiskAnnPqMeta));
-  if (read_size != sizeof(DiskAnnPqMeta)) {
+  DiskAnnPqMeta pq_meta;
+  const size_t read_size =
+      pq_meta_segment_->fetch(0, &pq_meta, sizeof(pq_meta));
+  if (read_size != sizeof(pq_meta)) {
     LOG_ERROR("Read segment %s failed, expect: %zu, actual: %zu",
-              DiskAnnEntity::kDiskAnnPqMetaSegmentId.c_str(),
-              sizeof(DiskAnnPqMeta), read_size);
-
-    return IndexError_ReadData;
+              DiskAnnEntity::kDiskAnnPqMetaSegmentId.c_str(), sizeof(pq_meta),
+              read_size);
+    return pq_meta_segment_->read_error();
   }
-
-  memcpy(reinterpret_cast<uint8_t *>(&pq_meta_), data.data(),
-         sizeof(DiskAnnPqMeta));
-  offset += read_size;
+  pq_meta_ = pq_meta;
 
   int ret =
       DiskAnnUtil::normalize_pq_meta(meta_, &pq_meta_, &legacy_pq_layout_);
@@ -222,21 +214,18 @@ int DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer(
 }
 
 int DiskAnnSearcherEntity::load_header_segment() {
-  IndexStorage::MemoryBlock data;
   meta_segment_ = storage_->get(kDiskAnnMetaSegmentId);
   if (!meta_segment_ ||
       meta_segment_->data_size() < sizeof(DiskAnnMetaHeader)) {
     LOG_ERROR("Miss or invalid segment %s", kDiskAnnMetaSegmentId.c_str());
     return IndexError_InvalidFormat;
   }
-  if (meta_segment_->read(0, data, sizeof(DiskAnnMetaHeader)) !=
-      sizeof(DiskAnnMetaHeader)) {
+  DiskAnnMetaHeader header;
+  if (meta_segment_->fetch(0, &header, sizeof(header)) != sizeof(header)) {
     LOG_ERROR("Read segment %s failed", kDiskAnnMetaSegmentId.c_str());
-    return IndexError_ReadData;
+    return meta_segment_->read_error();
   }
-  memcpy(reinterpret_cast<uint8_t *>(&meta_header_), data.data(),
-         sizeof(DiskAnnMetaHeader));
-
+  meta_header_ = header;
   return 0;
 }
 

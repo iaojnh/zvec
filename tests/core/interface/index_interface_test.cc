@@ -1245,9 +1245,10 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
     ASSERT_EQ(0, index->close());
   }
 
-  // Cover both bypass-only thresholds, then actual cache pressure and a pool
-  // large enough for the entire index. Every mode reads the same built file.
-  for (size_t budget : {page_size - 1, metadata_bytes + page_size - 1,
+  // Exercise the 4 KiB scratch boundary even on hosts with larger pages,
+  // then the cache-admission threshold, cache pressure, and a full cache.
+  const size_t subpage_budget = std::min<size_t>(page_size, 4096) - 1;
+  for (size_t budget : {subpage_budget, metadata_bytes + page_size - 1,
                         metadata_bytes + 4 * page_size, kFullBudget}) {
     SCOPED_TRACE(budget);
     ASSERT_EQ(0u, memory_pool.used());
