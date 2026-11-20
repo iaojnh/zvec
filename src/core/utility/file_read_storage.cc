@@ -46,13 +46,8 @@ class FileReadStorage : public IndexStorage {
           padding_size_(segment.padding_size()),
           region_size_(segment.data_size() + segment.padding_size()),
           data_crc_(segment.data_crc()),
-          enable_direct_io_(container.enable_direct_io_),
           alone_file_handle_(container.alone_file_handle_),
-          file_ptr_(file_ptr) {
-      if (alone_file_handle_) {
-        file_path_ = container.file_path_;
-      }
-    }
+          file_ptr_(file_ptr) {}
 
     //! Constructor
     Segment(const Segment &rhs, const std::shared_ptr<ailego::File> &file_ptr)
@@ -61,8 +56,8 @@ class FileReadStorage : public IndexStorage {
           padding_size_(rhs.padding_size_),
           region_size_(rhs.region_size_),
           data_crc_(rhs.data_crc_),
-          file_ptr_(file_ptr),
-          file_path_(rhs.file_path_) {}
+          alone_file_handle_(rhs.alone_file_handle_),
+          file_ptr_(file_ptr) {}
 
     //! Destructor
     ~Segment() override = default;
@@ -183,9 +178,7 @@ class FileReadStorage : public IndexStorage {
     //! Clone the segment
     template <typename T>
     inline IndexStorage::Segment::Pointer clone_segment() {
-      auto file_ptr = alone_file_handle_ ? FileReadStorage::OpenFile(
-                                               file_path_, enable_direct_io_)
-                                         : file_ptr_;
+      auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
       if (file_ptr) {
         return std::make_shared<typename T::Segment>(
             *(static_cast<typename T::Segment *>(this)), file_ptr);
@@ -204,11 +197,9 @@ class FileReadStorage : public IndexStorage {
     size_t padding_size_{0u};
     size_t region_size_{0u};
     uint32_t data_crc_{0u};
-    bool enable_direct_io_{false};
     bool alone_file_handle_{false};
     ailego::BudgetedAlignedBuffer buffer_{};
     std::shared_ptr<ailego::File> file_ptr_{};
-    std::string file_path_{};
   };
 
   /*! MMapFile Storage Segment
@@ -386,7 +377,7 @@ class FileReadStorage : public IndexStorage {
     magic_ = unpacker.magic();
     index_offset_ = candidate_offset;
     file_path_.swap(candidate_path);
-    file_ptr_ = alone_file_handle_ ? nullptr : std::move(file_ptr);
+    file_ptr_ = std::move(file_ptr);
     return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
@@ -408,20 +399,7 @@ class FileReadStorage : public IndexStorage {
   //! Retrieve all segments
   std::map<std::string, IndexStorage::Segment::Pointer> get_all()
       const override {
-    std::map<std::string, IndexStorage::Segment::Pointer> result;
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
-    if (file_ptr) {
-      for (const auto &it : segments_) {
-        result.emplace(it.first,
-                       std::make_shared<FileReadStorage::Segment>(
-                           *(static_cast<const FileReadStorage *>(this)),
-                           it.second, file_ptr, index_offset_));
-      }
-    }
-    return result;
+    return get_all_segments<FileReadStorage>();
   }
 
   //! Test if it a segment exists
@@ -436,6 +414,10 @@ class FileReadStorage : public IndexStorage {
 
   //! Retrieve file ptr if has
   std::shared_ptr<ailego::File> file() const override {
+#if defined(_WIN32) || defined(_WIN64)
+    // Windows DiskANN requires exclusive control over all buffered handles.
+    if (alone_file_handle_) return nullptr;
+#endif
     return file_ptr_;
   }
 
@@ -444,6 +426,15 @@ class FileReadStorage : public IndexStorage {
   }
 
  protected:
+  // Derive readers from the file that supplied the segment directory. Its
+  // pathname may already name the next index generation.
+  static std::shared_ptr<ailego::File> ReadHandle(
+      const std::shared_ptr<ailego::File> &source, bool independent) {
+    if (!source || !independent) return source;
+    auto file = std::make_shared<ailego::File>();
+    return file->duplicate(*source) ? file : nullptr;
+  }
+
   //! Open a index file
   static inline std::shared_ptr<ailego::File> OpenFile(const std::string &path,
                                                        bool direct_io) {
@@ -469,10 +460,7 @@ class FileReadStorage : public IndexStorage {
     if (it == segments_.end()) {
       return IndexStorage::Segment::Pointer();
     }
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
+    auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
     if (!file_ptr) {
       return IndexStorage::Segment::Pointer();
     }
@@ -489,10 +477,7 @@ class FileReadStorage : public IndexStorage {
       return IndexStorage::Segment::Pointer();
     }
     const auto &segment = it->second;
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
+    auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
     if (!file_ptr) {
       return IndexStorage::Segment::Pointer();
     }
@@ -527,10 +512,7 @@ class FileReadStorage : public IndexStorage {
   inline std::map<std::string, IndexStorage::Segment::Pointer>
   get_all_segments() const {
     std::map<std::string, IndexStorage::Segment::Pointer> result;
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
+    auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
     if (file_ptr) {
       for (const auto &it : segments_) {
         result.emplace(it.first, std::make_shared<typename T::Segment>(

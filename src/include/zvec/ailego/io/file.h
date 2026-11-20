@@ -93,6 +93,10 @@ class ZVEC_AILEGO_API File {
   //! Open a local file
   bool open(const char *path, bool rdonly, bool direct);
 
+  //! Duplicate an open handle for positioned I/O. The handles may share a
+  //! file position and have independent lifetimes.
+  bool duplicate(const File &source);
+
   //! Close the local file
   void close();
 

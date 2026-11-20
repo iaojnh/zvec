@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <iostream>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_helper.h"
@@ -182,4 +183,55 @@ TEST(FileReadStorage, MemoryBlockReadsRetainIndependentBuffers) {
   EXPECT_EQ(first, std::string(static_cast<const char *>(first_block.data()),
                                first.size()));
   std::remove(file_path.c_str());
+}
+
+TEST(FileReadStorage, IndependentReadersKeepTheValidatedFile) {
+  const std::string path = "file_read_generation.idx";
+  const std::string moved = path + ".old";
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    ailego::File::Delete(path);
+    ailego::File::Delete(moved);
+  });
+  auto write_package = [&](const std::string &bytes) {
+    auto dumper = IndexFactory::CreateDumper("FileDumper");
+    ASSERT_TRUE(dumper);
+    ASSERT_EQ(0, dumper->create(path));
+    ASSERT_EQ(bytes.size(), dumper->write(bytes.data(), bytes.size()));
+    ASSERT_EQ(0, dumper->append("data", bytes.size(), 0, 0));
+    ASSERT_EQ(0, dumper->close());
+  };
+  auto expect_data = [](const IndexStorage::Segment::Pointer &segment,
+                        const std::string &expected) {
+    ASSERT_TRUE(segment);
+    IndexStorage::MemoryBlock block;
+    ASSERT_EQ(expected.size(), segment->read(0, block, expected.size()));
+    ASSERT_NE(nullptr, block.data());
+    EXPECT_EQ(expected, std::string(static_cast<const char *>(block.data()),
+                                    expected.size()));
+  };
+
+  ASSERT_NO_FATAL_FAILURE(write_package("first"));
+  auto storage = IndexFactory::CreateStorage("FileReadStorage");
+  ASSERT_TRUE(storage);
+  ailego::Params params;
+  params.set("proxima.file.read_storage.alone_file_handle", true);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(path, false));
+  auto reader = storage->get("data", 1);
+  ASSERT_TRUE(reader);
+  ASSERT_TRUE(ailego::File::Rename(path, moved));
+  EXPECT_EQ(IndexError_OpenFile, storage->open(path, false));
+  expect_data(storage->get("data", 1), "first");
+  ASSERT_NO_FATAL_FAILURE(write_package("later"));
+  expect_data(storage->get("data", 0), "first");
+  auto all = storage->get_all();
+  ASSERT_EQ(1u, all.count("data"));
+  expect_data(all.at("data"), "first");
+  ASSERT_EQ(0, storage->open(path, false));
+  expect_data(storage->get("data", 1), "later");
+  ASSERT_EQ(0, storage->close());
+  auto clone = reader->clone();
+  ASSERT_TRUE(clone);
+  expect_data(clone, "first");
+  expect_data(clone->clone(), "first");
 }

@@ -208,9 +208,7 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
       ret = static_cast<LinuxAlignedFileReader *>(reader_.get())
                 ->open_from_handle(file_path, cached_file->native_handle());
     } else {
-      // Preserve support for FileReadStorage's alone_file_handle mode. Its
-      // Segment abstraction does not expose a descriptor, so retain the
-      // origin/main ordering and bind the path before releasing the storage.
+      // Some storage backends expose only a path.
       reader_->open(file_path);
     }
 #endif

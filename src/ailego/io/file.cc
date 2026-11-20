@@ -243,6 +243,18 @@ bool File::open(const char *path, bool rdonly, bool direct) {
   return true;
 }
 
+bool File::duplicate(const File &source) {
+  if (is_valid() || !source.is_valid()) return false;
+  int fd;
+  do {
+    fd = ::fcntl(source.native_handle_, F_DUPFD_CLOEXEC, 0);
+  } while (fd == -1 && errno == EINTR);
+  if (fd == -1) return false;
+  native_handle_ = fd;
+  read_only_ = source.read_only_;
+  return true;
+}
+
 void File::close() {
   ailego_return_if_false(native_handle_ != File::InvalidHandle);
   CloseSafely(native_handle_);
@@ -551,6 +563,19 @@ bool File::open(const char *path, bool rdonly, bool direct) {
 
   read_only_ = rdonly;
   native_handle_ = file_handle;
+  return true;
+}
+
+bool File::duplicate(const File &source) {
+  if (is_valid() || !source.is_valid()) return false;
+  HANDLE handle;
+  if (!::DuplicateHandle(::GetCurrentProcess(), source.native_handle_,
+                         ::GetCurrentProcess(), &handle, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+    return false;
+  }
+  native_handle_ = handle;
+  read_only_ = source.read_only_;
   return true;
 }
 
