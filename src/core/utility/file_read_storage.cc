@@ -28,7 +28,7 @@ class FileReadStorage : public IndexStorage {
  public:
   /*! File Storage Segment
    */
-  class Segment : public IndexStorage::Segment {
+  class Segment : public IndexStorage::MetadataSegment {
    public:
     //! Index Storage Pointer
     typedef std::shared_ptr<Segment> Pointer;
@@ -44,7 +44,8 @@ class FileReadStorage : public IndexStorage {
           data_crc_(segment.data_crc()),
           enable_direct_io_(container.enable_direct_io_),
           alone_file_handle_(container.alone_file_handle_),
-          file_ptr_(file_ptr) {
+          file_ptr_(file_ptr),
+          metadata_file_(container.metadata_file_) {
       if (alone_file_handle_) {
         file_path_ = container.file_path_;
       }
@@ -57,7 +58,10 @@ class FileReadStorage : public IndexStorage {
           padding_size_(rhs.padding_size_),
           region_size_(rhs.region_size_),
           data_crc_(rhs.data_crc_),
+          enable_direct_io_(rhs.enable_direct_io_),
+          alone_file_handle_(rhs.alone_file_handle_),
           file_ptr_(file_ptr),
+          metadata_file_(rhs.metadata_file_),
           file_path_(rhs.file_path_) {}
 
     //! Destructor
@@ -96,6 +100,17 @@ class FileReadStorage : public IndexStorage {
         len = region_size_ - offset;
       }
       return file_ptr_->read(data_offset_ + offset, buf, len);
+    }
+
+    size_t fetch_metadata(size_t offset, void *buf, size_t len) const override {
+      if (!metadata_file_) {
+        return fetch(offset, buf, len);
+      }
+      if (offset > data_size_ || len > data_size_ - offset) {
+        return 0;
+      }
+      // Metadata records need not meet the platform's direct-I/O alignment.
+      return metadata_file_->read(data_offset_ + offset, buf, len);
     }
 
     //! Read data from segment
@@ -179,6 +194,7 @@ class FileReadStorage : public IndexStorage {
     bool alone_file_handle_{false};
     std::vector<uint8_t> buffer_{};
     std::shared_ptr<ailego::File> file_ptr_{};
+    std::shared_ptr<ailego::File> metadata_file_{};
     std::string file_path_{};
   };
 
@@ -200,6 +216,10 @@ class FileReadStorage : public IndexStorage {
 
     ~MMapSegment() override {
       cleanup_();
+    }
+
+    const void *metadata_view() const override {
+      return data_;
     }
 
     //! Fetch data from segment (with own buffer)
@@ -298,46 +318,59 @@ class FileReadStorage : public IndexStorage {
   }
 
   //! Load a index file into container
-  int open(const std::string &path, bool) override {
-    auto file_ptr = FileReadStorage::OpenFile(path, enable_direct_io_);
-    if (!file_ptr) {
+  int open(const std::string &path, bool) override try {
+    auto file = OpenFile(path, false);
+    if (!file) {
       return IndexError_OpenFile;
     }
-
-    index_offset_ =
-        (header_offset_ >= 0 ? 0 : file_ptr->size()) + header_offset_;
-    size_t end_offset =
-        (footer_offset_ > 0 ? 0 : file_ptr->size()) + footer_offset_;
-    size_t size = end_offset > index_offset_ ? end_offset - index_offset_ : 0;
-    auto read_data = [this, &file_ptr, end_offset](
-                         size_t offset, const void **data, size_t len) {
-      buffer_.reserve(len);
-      *data = buffer_.data();
-      size_t off = index_offset_ + offset;
-      if (off + len > end_offset) {
-        if (off > end_offset) {
-          off = end_offset;
-        }
-        len = end_offset - off;
-      }
-      return file_ptr->read(off, (void *)*data, len);
-    };
-
-    IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, size, checksum_validation_)) {
-      LOG_ERROR("Failed to unpack file: %s", path.c_str());
-      return IndexError_UnpackIndex;
+    const size_t file_size = file->size();
+    size_t start;
+    size_t end;
+    if (!index_metadata::ResolveContainerOffset(file_size, header_offset_,
+                                                false, &start) ||
+        !index_metadata::ResolveContainerOffset(file_size, footer_offset_, true,
+                                                &end) ||
+        start >= end) {
+      return IndexError_InvalidArgument;
     }
-    segments_ = std::move(*unpacker.mutable_segments());
-    magic_ = unpacker.magic();
+    IndexUnpacker unpacker;
+    int ret = unpacker.unpack_fetch(
+        [&](size_t offset, void *data, size_t len) {
+          return file->read(start + offset, data, len);
+        },
+        end - start, checksum_validation_);
+    if (ret != 0) {
+      LOG_ERROR("Failed to unpack file: %s", path.c_str());
+      return ret;
+    }
+
+    std::shared_ptr<ailego::File> direct_file;
+    if (enable_direct_io_ && !alone_file_handle_) {
+      direct_file = OpenFile(path, true);
+      if (!direct_file) {
+        return IndexError_OpenFile;
+      }
+    }
     file_path_ = path;
-    file_ptr_ = alone_file_handle_ ? nullptr : file_ptr;
+    segments_.swap(*unpacker.mutable_segments());
+    index_offset_ = start;
+    magic_ = unpacker.magic();
+    metadata_file_ = enable_direct_io_ ? file : nullptr;
+    file_ptr_ = alone_file_handle_
+                    ? nullptr
+                    : (direct_file ? std::move(direct_file) : std::move(file));
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   int close() override {
-    file_ptr_ = nullptr;
+    file_ptr_.reset();
+    metadata_file_.reset();
+    file_path_.clear();
     segments_.clear();
+    magic_ = 0;
+    index_offset_ = 0;
     return 0;
   }
 
@@ -492,9 +525,9 @@ class FileReadStorage : public IndexStorage {
   int64_t header_offset_{0};
   int64_t footer_offset_{0};
   size_t index_offset_{0};
-  std::vector<uint8_t> buffer_{};
   std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
   std::shared_ptr<ailego::File> file_ptr_{nullptr};
+  std::shared_ptr<ailego::File> metadata_file_{};
   std::string file_path_{};
 };
 

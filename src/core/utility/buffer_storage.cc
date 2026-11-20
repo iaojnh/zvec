@@ -29,6 +29,7 @@
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_mapping.h>
+#include <zvec/core/framework/index_metadata.h>
 #include <zvec/core/framework/index_version.h>
 #include "utility_params.h"
 
@@ -90,7 +91,7 @@ class BufferStorage : public IndexStorage {
  public:
   /*! Index Storage Segment
    */
-  class WrappedSegment : public IndexStorage::Segment,
+  class WrappedSegment : public IndexStorage::MetadataSegment,
                          public std::enable_shared_from_this<Segment> {
    public:
     //! Constructor.  See segment_info_ for the pointer-stability contract.
@@ -158,6 +159,22 @@ class BufferStorage : public IndexStorage {
         return 0;
       }
       return len;
+    }
+
+    size_t fetch_metadata(size_t offset, void *buf, size_t len) const override {
+      const size_t size = data_size();
+      if (!owner_->buffer_pool_handle_ || offset > size ||
+          len > size - offset) {
+        return 0;
+      }
+      if (owner_->buffer_pool_->writable()) {
+        // The current bytes may still be dirty in the writable page cache.
+        return fetch(offset, buf, len);
+      }
+      return owner_->buffer_pool_handle_->get_meta(
+                 absolute_offset(offset), len, static_cast<char *>(buf)) == 0
+                 ? len
+                 : 0;
     }
 
     //! Read data from segment
@@ -1023,15 +1040,63 @@ class BufferStorage : public IndexStorage {
     }
 
     try {
-      // Capture both owners before replacing the published state. In
-      // particular, a failed reopen must not change existing segments' pool.
-      auto candidate_pool =
+      if (path == file_name_) {
+        const int ret = flush_index();
+        if (ret != 0) {
+          return ret;
+        }
+      }
+      BufferStorage candidate;
+      candidate.file_name_ = path;
+      candidate.buffer_pool_ =
           std::make_shared<ailego::VecBufferPool>(path, writable);
-      auto candidate_handle =
-          std::make_shared<ailego::VecBufferPoolHandle>(candidate_pool);
-      file_name_ = path;
-      buffer_pool_ = std::move(candidate_pool);
-      buffer_pool_handle_ = std::move(candidate_handle);
+      candidate.buffer_pool_handle_ =
+          std::make_shared<ailego::VecBufferPoolHandle>(candidate.buffer_pool_);
+      int ret = candidate.parse_to_mapping();
+      if (ret != 0) {
+        return ret;
+      }
+
+      const size_t file_size = candidate.buffer_pool_->file_size();
+      const size_t page_count =
+          file_size == 0 ? 0 : (file_size - 1) / ailego::kVectorPageSize + 1;
+      const size_t metadata_bytes =
+          ailego::VecBufferPool::metadata_bytes_for_page_count(page_count,
+                                                               writable);
+      const size_t available =
+          ailego::MemoryLimitPool::get_instance().available();
+      const bool cache_can_fit =
+          metadata_bytes != std::numeric_limits<size_t>::max() &&
+          metadata_bytes <= available &&
+          ailego::kVectorPageSize <= available - metadata_bytes;
+      candidate.cache_enabled_ =
+          cache_can_fit && candidate.buffer_pool_->init() == 0;
+      if (!candidate.cache_enabled_) {
+        if (writable) {
+          return IndexError_NoMemory;
+        }
+        LOG_INFO(
+            "Read-only BufferStorage opened in bypass-only mode: file=%s "
+            "available=%zu metadata=%zu page_size=%zu",
+            path.c_str(), available, metadata_bytes, ailego::kVectorPageSize);
+      }
+
+      AllShardsExclusiveLatch latch(mapping_shards_);
+      ret = flush_index_locked();
+      if (ret != 0) {
+        return ret;
+      }
+      file_name_.swap(candidate.file_name_);
+      segments_.swap(candidate.segments_);
+      meta_chains_.swap(candidate.meta_chains_);
+      buffer_pool_.swap(candidate.buffer_pool_);
+      buffer_pool_handle_.swap(candidate.buffer_pool_handle_);
+      std::swap(cache_enabled_, candidate.cache_enabled_);
+      corrupted_.store(false, std::memory_order_relaxed);
+      LOG_INFO("BufferStorage opened: file=%s, writable=%d, segment_count=%zu",
+               file_name_.c_str(), static_cast<int>(writable),
+               segments_.size());
+      return 0;
     } catch (const std::bad_alloc &) {
       LOG_ERROR("Out of memory opening BufferStorage: %s", path.c_str());
       return IndexError_NoMemory;
@@ -1040,229 +1105,82 @@ class BufferStorage : public IndexStorage {
                 error.what());
       return IndexError_OpenFile;
     }
-    int ret = parse_to_mapping();
-    if (ret != 0) {
-      this->close_index();
-      return ret;
-    }
-    const size_t file_size = buffer_pool_->file_size();
-    const size_t page_count =
-        file_size == 0 ? 0 : (file_size - 1) / ailego::kVectorPageSize + 1;
-    const size_t metadata_bytes =
-        ailego::VecBufferPool::metadata_bytes_for_page_count(page_count,
-                                                             writable);
-    const size_t available =
-        ailego::MemoryLimitPool::get_instance().available();
-    const bool cache_can_fit =
-        metadata_bytes != std::numeric_limits<size_t>::max() &&
-        metadata_bytes <= available &&
-        ailego::kVectorPageSize <= available - metadata_bytes;
-    ret = cache_can_fit ? buffer_pool_->init() : -1;
-    if (ret != 0 && writable) {
-      this->close_index();
-      return IndexError_NoMemory;
-    }
-    cache_enabled_ = ret == 0;
-    if (!cache_enabled_) {
-      LOG_INFO(
-          "Read-only BufferStorage opened in bypass-only mode: file=%s "
-          "available=%zu metadata=%zu page_size=%zu",
-          path.c_str(), available, metadata_bytes, ailego::kVectorPageSize);
-    }
-    LOG_INFO("BufferStorage opened: file=%s, writable=%d, segment_count=%zu",
-             file_name_.c_str(), static_cast<int>(writable), segments_.size());
-    return 0;
-  }
-
-  // Called from single-threaded open or under AllShardsExclusiveLatch.
-  int parse_header(size_t offset, IndexFormat::MetaHeader *out) {
-    constexpr size_t kHeaderSize = sizeof(IndexFormat::MetaHeader);
-    if (buffer_pool_handle_->get_meta(offset, kHeaderSize,
-                                      reinterpret_cast<char *>(out)) != 0) {
-      LOG_ERROR("Get segment header failed.");
-      return IndexError_Runtime;
-    }
-    if (out->meta_header_size != kHeaderSize) {
-      LOG_ERROR("Header meta size is invalid.");
-      return IndexError_InvalidLength;
-    }
-    if (ailego::Crc32c::Hash(out, kHeaderSize, out->header_crc) !=
-        out->header_crc) {
-      LOG_ERROR("Header meta checksum is invalid.");
-      return IndexError_InvalidChecksum;
-    }
-    return 0;
-  }
-
-  int parse_footer(size_t offset, IndexFormat::MetaFooter *footer) {
-    if (buffer_pool_handle_->get_meta(offset, sizeof(*footer),
-                                      reinterpret_cast<char *>(footer)) != 0) {
-      LOG_ERROR("Get segment footer failed.");
-      return IndexError_Runtime;
-    }
-    if (offset < static_cast<size_t>(footer->segments_meta_size)) {
-      LOG_ERROR("Footer meta size is invalid.");
-      return IndexError_InvalidLength;
-    }
-    if (ailego::Crc32c::Hash(footer, sizeof(*footer), footer->footer_crc) !=
-        footer->footer_crc) {
-      LOG_ERROR("Footer meta checksum is invalid.");
-      return IndexError_InvalidChecksum;
-    }
-    return 0;
-  }
-
-  int parse_segment(size_t offset, uint64_t header_start_offset,
-                    IndexFormat::MetaHeader *chain_header,
-                    const IndexFormat::MetaFooter &footer,
-                    uint32_t &out_segment_ids_offset,
-                    std::unique_ptr<char[]> &segment_buffer) {
-    segment_buffer = std::make_unique<char[]>(footer.segments_meta_size);
-    if (buffer_pool_handle_->get_meta(offset, footer.segments_meta_size,
-                                      segment_buffer.get()) != 0) {
-      LOG_ERROR("Get segment meta failed.");
-      return IndexError_Runtime;
-    }
-    if (ailego::Crc32c::Hash(segment_buffer.get(), footer.segments_meta_size,
-                             0u) != footer.segments_meta_crc) {
-      LOG_ERROR("Index segments meta checksum is invalid.");
-      return IndexError_InvalidChecksum;
-    }
-    if (sizeof(IndexFormat::SegmentMeta) * footer.segment_count >
-        footer.segments_meta_size) {
-      return IndexError_InvalidLength;
-    }
-    IndexFormat::SegmentMeta *segment_start =
-        reinterpret_cast<IndexFormat::SegmentMeta *>(segment_buffer.get());
-    uint32_t segment_ids_offset = footer.segments_meta_size;
-    for (IndexFormat::SegmentMeta *iter = segment_start,
-                                  *end = segment_start + footer.segment_count;
-         iter != end; ++iter) {
-      if (iter->segment_id_offset >= footer.segments_meta_size) {
-        return IndexError_InvalidValue;
-      }
-      if (iter->data_index > footer.content_size) {
-        return IndexError_InvalidValue;
-      }
-      if (iter->data_index + iter->data_size > footer.content_size) {
-        return IndexError_InvalidLength;
-      }
-
-      if (iter->segment_id_offset < segment_ids_offset) {
-        segment_ids_offset = iter->segment_id_offset;
-      }
-      // Bound ID parsing to the metadata buffer.
-      const char *seg_name_start =
-          reinterpret_cast<const char *>(segment_start) +
-          iter->segment_id_offset;
-      const size_t seg_name_max =
-          footer.segments_meta_size - iter->segment_id_offset;
-      const size_t seg_name_len = ::strnlen(seg_name_start, seg_name_max);
-      if (seg_name_len == seg_name_max) {
-        LOG_ERROR("ParseSegment: segment_id missing NUL terminator, file[%s]",
-                  file_name_.c_str());
-        return IndexError_InvalidValue;
-      }
-      const std::string seg_name(seg_name_start, seg_name_len);
-      // Update in place so existing WrappedSegment pointers remain valid.
-      segments_[seg_name] = IndexMapping::SegmentInfo{
-          IndexMapping::Segment{iter}, header_start_offset, chain_header};
-    }
-    out_segment_ids_offset = segment_ids_offset;
-    return 0;
   }
 
   int parse_to_mapping() {
-    uint64_t header_start_offset = 0;
-    while (true) {
-      int ret;
-      auto header = std::make_unique<IndexFormat::MetaHeader>();
-      IndexFormat::MetaHeader *chain_header = header.get();
-      ret = parse_header(header_start_offset, chain_header);
-      if (ret != 0) {
-        LOG_ERROR("Failed to parse header, errno %d, %s", ret,
-                  IndexError::What(ret));
-        return ret;
-      }
-
-      switch (chain_header->version) {
-        case IndexFormat::FORMAT_VERSION:
-          break;
-        default:
-          LOG_ERROR("Unsupported index version: %u", chain_header->version);
-          return IndexError_Unsupported;
-      }
-
-      // Unpack footer
-      if (chain_header->meta_footer_size != sizeof(IndexFormat::MetaFooter)) {
+    const size_t total = buffer_pool_->file_size();
+    size_t start = 0;
+    do {
+      if (sizeof(IndexFormat::MetaHeader) > total - start) {
         return IndexError_InvalidLength;
       }
-      if ((int32_t)chain_header->meta_footer_offset < 0) {
+      auto header = std::make_unique<IndexFormat::MetaHeader>();
+      if (buffer_pool_handle_->get_meta(
+              start, sizeof(*header), reinterpret_cast<char *>(header.get())) !=
+          0) {
+        return IndexError_ReadData;
+      }
+      size_t footer_offset;
+      int ret =
+          index_metadata::FooterOffset(*header, total - start, &footer_offset);
+      if (ret != 0) {
+        return ret;
+      }
+      if (header->version != IndexFormat::FORMAT_VERSION ||
+          static_cast<int32_t>(header->meta_footer_offset) < 0) {
         return IndexError_Unsupported;
       }
-      uint64_t footer_offset =
-          chain_header->meta_footer_offset + header_start_offset;
-      // Reject uint64 wrap-around and offsets past file_size.
-      if (footer_offset < header_start_offset ||
-          footer_offset + sizeof(IndexFormat::MetaFooter) >
-              buffer_pool_->file_size()) {
-        LOG_ERROR("ParseToMapping: invalid footer_offset=%" PRIu64
-                  " (header=%" PRIu64 ", file_size=%zu), file[%s]",
-                  footer_offset, header_start_offset, buffer_pool_->file_size(),
-                  file_name_.c_str());
-        return IndexError_InvalidValue;
+      IndexFormat::MetaFooter footer;
+      if (buffer_pool_handle_->get_meta(start + footer_offset, sizeof(footer),
+                                        reinterpret_cast<char *>(&footer)) !=
+          0) {
+        return IndexError_ReadData;
       }
-      IndexFormat::MetaFooter footer{};
-      ret = parse_footer(footer_offset, &footer);
+      ret = index_metadata::CheckFooter(*header, footer, footer_offset,
+                                        total - start);
       if (ret != 0) {
-        LOG_ERROR("Failed to parse footer, errno %d, %s", ret,
-                  IndexError::What(ret));
+        return ret;
+      }
+      size_t next;
+      ret = index_metadata::NextSection(footer, start, total, &next);
+      if (ret != 0) {
         return ret;
       }
 
-      // Unpack segment table
-      const uint64_t segment_start_offset =
-          footer_offset - footer.segments_meta_size;
-      uint32_t segment_ids_offset = footer.segments_meta_size;
-      std::unique_ptr<char[]> segment_buffer;
-      ret =
-          parse_segment(segment_start_offset, header_start_offset, chain_header,
-                        footer, segment_ids_offset, segment_buffer);
+      const size_t table_offset =
+          start + footer_offset - footer.segments_meta_size;
+      auto table = index_metadata::AllocateBuffer(footer.segments_meta_size);
+      if (buffer_pool_handle_->get_meta(table_offset, footer.segments_meta_size,
+                                        table.get()) != 0) {
+        return IndexError_ReadData;
+      }
+      ret = index_metadata::CheckTable(footer, table.get());
       if (ret != 0) {
-        LOG_ERROR("Failed to parse segment, errno %d, %s", ret,
-                  IndexError::What(ret));
         return ret;
       }
 
-      // Own all state referenced by this metadata chain in one object.
-      meta_chains_.push_back({std::move(header), std::move(segment_buffer),
-                              header_start_offset, segment_ids_offset, footer});
-
-      if (footer.next_meta_header_offset == 0) {
-        break;
+      uint32_t ids_offset = footer.segments_meta_size;
+      auto *records = reinterpret_cast<IndexFormat::SegmentMeta *>(table.get());
+      for (size_t i = 0; i < footer.segment_count; ++i) {
+        std::string_view id;
+        ret = index_metadata::SegmentId(footer, table.get(), records[i], &id);
+        if (ret != 0) {
+          return ret;
+        }
+        ids_offset = std::min(ids_offset, records[i].segment_id_offset);
+        if (!segments_
+                 .try_emplace(std::string(id),
+                              IndexMapping::SegmentInfo{
+                                  IndexMapping::Segment{records + i}, start,
+                                  header.get()})
+                 .second) {
+          return IndexError_Duplicate;
+        }
       }
-      // Reject invalid links before following the metadata chain.
-      const uint64_t next_off = footer.next_meta_header_offset;
-      if (next_off <= header_start_offset ||
-          next_off + sizeof(IndexFormat::MetaHeader) >
-              buffer_pool_->file_size()) {
-        LOG_ERROR("ParseToMapping: invalid next_meta_header_offset=%" PRIu64
-                  " (current=%" PRIu64 ", file_size=%zu), file[%s]",
-                  next_off, header_start_offset, buffer_pool_->file_size(),
-                  file_name_.c_str());
-        return IndexError_InvalidValue;
-      }
-      // Bound corrupted metadata chains.
-      constexpr size_t kMaxChains = 1024;
-      if (meta_chains_.size() >= kMaxChains) {
-        LOG_ERROR(
-            "ParseToMapping: chain count exceeds limit %zu, file[%s] may "
-            "be corrupted",
-            kMaxChains, file_name_.c_str());
-        return IndexError_InvalidLength;
-      }
-      header_start_offset = next_off;
-    }
+      meta_chains_.push_back(
+          {std::move(header), std::move(table), start, ids_offset, footer});
+      start = next;
+    } while (start != 0);
     return 0;
   }
 
@@ -1616,7 +1534,7 @@ class BufferStorage : public IndexStorage {
                                 sizeof(IndexFormat::MetaFooter)),
           static_cast<uint32_t>(new_meta_total));
 
-      auto new_meta_buf = std::make_unique<char[]>(new_segments_meta_size);
+      index_metadata::Buffer new_meta_buf(new char[new_segments_meta_size]);
       std::memset(new_meta_buf.get(), 0, new_segments_meta_size);
 
       IndexFormat::MetaFooter new_footer;
@@ -1858,7 +1776,7 @@ class BufferStorage : public IndexStorage {
   struct MetaChain {
     // Pointees stay stable across vector moves and are referenced by segments_.
     std::unique_ptr<IndexFormat::MetaHeader> header;
-    std::unique_ptr<char[]> segment_meta;
+    index_metadata::Buffer segment_meta;
     uint64_t header_start_offset;
     // Lowest ID-string offset; detects metadata exhaustion.
     uint32_t segment_ids_offset;

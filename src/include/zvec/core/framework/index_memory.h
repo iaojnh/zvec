@@ -78,6 +78,11 @@ class IndexMemory {
       return len;
     }
 
+    //! Backing bytes, valid while the block remains alive and unchanged.
+    const uint8_t *data() const {
+      return buffer_.data();
+    }
+
     //! Fetch data from the storage (with own buffer)
     size_t fetch(size_t off, void *buf, size_t len) const {
       size_t region_size = buffer_.size();
@@ -87,7 +92,7 @@ class IndexMemory {
         }
         len = region_size - off;
       }
-      std::copy(buffer_.data(), buffer_.data() + len,
+      std::copy(buffer_.data() + off, buffer_.data() + off + len,
                 reinterpret_cast<uint8_t *>(buf));
       return len;
     }

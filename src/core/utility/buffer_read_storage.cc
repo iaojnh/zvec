@@ -34,30 +34,6 @@ namespace core {
 
 namespace {
 
-bool ResolveContainerOffset(size_t file_size, int64_t configured_offset,
-                            bool zero_from_end, size_t *resolved_offset) {
-  const bool absolute =
-      configured_offset > 0 || (configured_offset == 0 && !zero_from_end);
-  if (absolute) {
-    const uint64_t value = static_cast<uint64_t>(configured_offset);
-    if (value > file_size) {
-      return false;
-    }
-    *resolved_offset = static_cast<size_t>(value);
-    return true;
-  }
-
-  const uint64_t distance =
-      configured_offset == 0
-          ? 0
-          : static_cast<uint64_t>(-(configured_offset + 1)) + 1;
-  if (distance > file_size) {
-    return false;
-  }
-  *resolved_offset = file_size - static_cast<size_t>(distance);
-  return true;
-}
-
 class BufferPageLease {
  public:
   BufferPageLease(std::shared_ptr<ailego::VecBufferPoolHandle> handle,
@@ -87,7 +63,7 @@ class BufferReadStorage : public IndexStorage {
   /*! Read-only segment. Resident single-page reads pin cache pages; other
    * reads use thread-local or owned scratch buffers.
    */
-  class Segment : public IndexStorage::Segment {
+  class Segment : public IndexStorage::MetadataSegment {
    public:
     //! Constructor
     Segment(const std::shared_ptr<ailego::VecBufferPoolHandle> &handle,
@@ -159,6 +135,14 @@ class BufferReadStorage : public IndexStorage {
         return 0;
       }
       return len;
+    }
+
+    size_t fetch_metadata(size_t offset, void *buf, size_t len) const override {
+      len = clamp_length(&offset, len);
+      return handle_->get_meta(data_offset_ + offset, len,
+                               static_cast<char *>(buf)) == 0
+                 ? len
+                 : 0;
     }
 
     //! Read data from segment (stable until this thread's next pointer read)
@@ -507,11 +491,12 @@ class BufferReadStorage : public IndexStorage {
           ailego::VecBufferPool::metadata_bytes_for_page_count(page_count);
       size_t candidate_index_offset = 0;
       size_t end_offset = 0;
-      if (!ResolveContainerOffset(file_size, header_offset_,
-                                  /*zero_from_end=*/false,
-                                  &candidate_index_offset) ||
-          !ResolveContainerOffset(file_size, footer_offset_,
-                                  /*zero_from_end=*/true, &end_offset) ||
+      if (!index_metadata::ResolveContainerOffset(file_size, header_offset_,
+                                                  /*zero_from_end=*/false,
+                                                  &candidate_index_offset) ||
+          !index_metadata::ResolveContainerOffset(file_size, footer_offset_,
+                                                  /*zero_from_end=*/true,
+                                                  &end_offset) ||
           candidate_index_offset >= end_offset) {
         LOG_ERROR(
             "Invalid BufferReadStorage container offsets: path=%s "
@@ -522,52 +507,21 @@ class BufferReadStorage : public IndexStorage {
       }
       const size_t container_size = end_offset - candidate_index_offset;
 
-      // IndexUnpacker requires a stable pointer until its next callback.
-      std::vector<uint8_t> scratch;
-      auto read_data = [&candidate_handle, &scratch, candidate_index_offset,
-                        container_size](size_t offset, const void **data,
-                                        size_t len) -> size_t {
-        if (offset > container_size) {
-          offset = container_size;
-          len = 0;
-        } else {
-          len = std::min(len, container_size - offset);
-        }
-        scratch.resize(len);
-        *data = scratch.data();
-        if (len == 0) {
-          return 0;
-        }
-        const size_t file_offset = candidate_index_offset + offset;
-        if (candidate_handle->get_meta(
-                file_offset, len, reinterpret_cast<char *>(scratch.data())) !=
-            0) {
-          return 0;
-        }
-        return len;
-      };
-
       IndexUnpacker unpacker;
-      if (!unpacker.unpack(read_data, container_size, checksum_validation_)) {
+      int ret = unpacker.unpack_fetch(
+          [&](size_t offset, void *data, size_t len) {
+            return candidate_handle->get_meta(candidate_index_offset + offset,
+                                              len,
+                                              static_cast<char *>(data)) == 0
+                       ? len
+                       : 0;
+          },
+          container_size, checksum_validation_);
+      if (ret != 0) {
         LOG_ERROR("Failed to unpack file: %s", path.c_str());
-        return IndexError_UnpackIndex;
+        return ret;
       }
       auto candidate_segments = std::move(*unpacker.mutable_segments());
-      for (const auto &item : candidate_segments) {
-        const auto &segment = item.second;
-        const size_t segment_offset = segment.data_offset();
-        if (segment_offset > container_size ||
-            segment.data_size() > container_size - segment_offset ||
-            segment.padding_size() >
-                container_size - segment_offset - segment.data_size()) {
-          LOG_ERROR(
-              "Invalid BufferReadStorage segment bounds: path=%s id=%s "
-              "container_size=%zu offset=%zu data_size=%zu padding_size=%zu",
-              path.c_str(), item.first.c_str(), container_size, segment_offset,
-              segment.data_size(), segment.padding_size());
-          return IndexError_InvalidLength;
-        }
-      }
       const uint32_t candidate_magic = unpacker.magic();
 
       // Fall back to bypass-only mode when metadata plus one page cannot fit.

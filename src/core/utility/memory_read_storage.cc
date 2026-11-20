@@ -28,7 +28,7 @@ class MemoryReadStorage : public IndexStorage {
  public:
   /*! Memory Storage Segment
    */
-  class Segment : public IndexStorage::Segment,
+  class Segment : public IndexStorage::MetadataSegment,
                   public std::enable_shared_from_this<Segment> {
    public:
     //! Index Storage Pointer
@@ -65,6 +65,10 @@ class MemoryReadStorage : public IndexStorage {
 
     size_t capacity() const override {
       return region_size_;
+    }
+
+    const void *metadata_view() const override {
+      return static_cast<const uint8_t *>(block_->data()) + data_offset_;
     }
 
     //! Fetch data from segment (with own buffer)
@@ -160,35 +164,34 @@ class MemoryReadStorage : public IndexStorage {
   }
 
   //! Load a index file into container
-  int open(const std::string &path, bool) override {
-    rope_ = IndexMemory::Instance()->open(path);
-    if (!rope_) {
-      LOG_ERROR("Failed to open memory rope %s", path.c_str());
-      return IndexError_NoExist;
-    }
-    if (rope_->empty()) {
-      LOG_ERROR("The memory rope %s is empty.", path.c_str());
+  int open(const std::string &path, bool) override try {
+    auto rope = IndexMemory::Instance()->open(path);
+    if (!rope || rope->empty()) {
+      LOG_ERROR("Missing or empty memory rope: %s", path.c_str());
       return IndexError_NoExist;
     }
 
-    auto read_data = [this](size_t offset, const void **data, size_t len) {
-      return (*this->rope_)[0].read(offset, data, len);
-    };
-
+    auto &block = (*rope)[0];
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, (*rope_)[0].size(), checksum_validation_)) {
+    int ret =
+        unpacker.unpack_view(block.data(), block.size(), checksum_validation_);
+    if (ret != 0) {
       LOG_ERROR("Failed to unpack memory block: %s", path.c_str());
-      return IndexError_UnpackIndex;
+      return ret;
     }
-    segments_ = std::move(*unpacker.mutable_segments());
+    segments_.swap(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
+    rope_ = std::move(rope);
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   //! Unload all indexes
   int close() override {
-    rope_ = nullptr;
+    rope_.reset();
     segments_.clear();
+    magic_ = 0;
     return 0;
   }
 

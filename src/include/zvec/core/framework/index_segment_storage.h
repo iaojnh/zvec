@@ -30,7 +30,7 @@ class IndexSegmentStorage : public IndexStorage {
 
   /*! Index Container Segment
    */
-  class Segment : public IndexStorage::Segment,
+  class Segment : public IndexStorage::MetadataSegment,
                   public std::enable_shared_from_this<Segment> {
    public:
     //! Index Container Pointer
@@ -85,6 +85,22 @@ class IndexSegmentStorage : public IndexStorage {
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
       return parent_->fetch(data_offset_ + offset, buf, len);
+    }
+
+    const void *metadata_view() const override {
+      const auto *parent = dynamic_cast<const MetadataSegment *>(parent_.get());
+      const auto *data =
+          parent ? static_cast<const char *>(parent->metadata_view()) : nullptr;
+      return data ? data + data_offset_ : nullptr;
+    }
+
+    size_t fetch_metadata(size_t offset, void *buf, size_t len) const override {
+      if (offset > data_size_ || len > data_size_ - offset) {
+        return 0;
+      }
+      const auto *parent = dynamic_cast<const MetadataSegment *>(parent_.get());
+      return parent ? parent->fetch_metadata(data_offset_ + offset, buf, len)
+                    : parent_->fetch(data_offset_ + offset, buf, len);
     }
 
     //! Read data from segment
@@ -165,20 +181,23 @@ class IndexSegmentStorage : public IndexStorage {
       return IndexError_NoReady;
     }
 
-    MemoryBlock block;
-    auto read_data = [this, &block](size_t offset, const void **data,
-                                    size_t len) {
-      size_t size = this->parent_->read(offset, block, len);
-      *data = block.data();
-      return size;
-    };
-
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, parent_->data_size(), false)) {
+    const size_t size = parent_->data_size();
+    const auto *parent = dynamic_cast<const MetadataSegment *>(parent_.get());
+    const void *view = parent ? parent->metadata_view() : nullptr;
+    int ret =
+        view ? unpacker.unpack_view(view, size, false)
+             : unpacker.unpack_fetch(
+                   [&](size_t offset, void *data, size_t len) {
+                     return parent ? parent->fetch_metadata(offset, data, len)
+                                   : parent_->fetch(offset, data, len);
+                   },
+                   size, false);
+    if (ret != 0) {
       LOG_ERROR("Failed to unpack segment data");
-      return IndexError_UnpackIndex;
+      return ret;
     }
-    segments_ = std::move(*unpacker.mutable_segments());
+    segments_.swap(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
     return 0;
   }
@@ -215,8 +234,9 @@ class IndexSegmentStorage : public IndexStorage {
 
   //! Unload all indexes
   int close() override {
-    parent_ = nullptr;
+    parent_.reset();
     segments_.clear();
+    magic_ = 0;
     return 0;
   }
 

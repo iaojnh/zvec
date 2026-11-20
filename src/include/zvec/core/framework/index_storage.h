@@ -646,6 +646,20 @@ class IndexStorage : public IndexModule {
   //! Destructor
   ~IndexStorage() override = default;
 
+  //! Optional metadata access for built-in segment backends.
+  struct MetadataSegment : Segment {
+    // Stable while the caller keeps the segment alive. No query scratch or
+    // page-cache pins may back this view.
+    virtual const void *metadata_view() const {
+      return nullptr;
+    }
+
+    // Copy into parser-owned scratch without allocating query scratch.
+    virtual size_t fetch_metadata(size_t offset, void *buf, size_t len) const {
+      return fetch(offset, buf, len);
+    }
+  };
+
   //! Initialize storage
   virtual int init(const ailego::Params &params) = 0;
 
