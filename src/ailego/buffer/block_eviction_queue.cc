@@ -261,10 +261,10 @@ void MemoryLimitPool::link_resident_neighbors(ResidentRange *previous,
   if (next) next->previous = replacement ? replacement : previous;
 }
 
-void MemoryLimitPool::HeapResidentRange::register_pages(void *data,
-                                                        size_t bytes) {
 #if (defined(__linux__) && !defined(__ANDROID__)) || \
     (defined(__APPLE__) && TARGET_OS_OSX)
+void MemoryLimitPool::HeapResidentRange::register_pages(void *data,
+                                                        size_t bytes) {
   // End pages may also contain another allocator client. Only wholly owned
   // pages are eligible for the existing private-residency sample.
   const size_t page = static_cast<size_t>(::getpagesize());
@@ -277,10 +277,6 @@ void MemoryLimitPool::HeapResidentRange::register_pages(void *data,
   std::lock_guard<std::mutex> lock(pool.queue_memory_mutex_);
   pool.register_resident_range(&range_, static_cast<char *>(data) + skip,
                                interior);
-#else
-  (void)data;
-  (void)bytes;
-#endif
 }
 
 void MemoryLimitPool::HeapResidentRange::unlink() noexcept {
@@ -298,6 +294,7 @@ void MemoryLimitPool::HeapResidentRange::replace(
   pool.link_resident_neighbors(range_.previous, range_.next, &range_);
   other.range_ = {};
 }
+#endif
 
 bool MemoryLimitPool::unmap_queue_mapping(ResidentRange *mapping) {
   auto *previous = mapping->previous;

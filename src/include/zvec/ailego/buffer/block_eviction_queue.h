@@ -258,11 +258,13 @@ class ZVEC_AILEGO_API MemoryLimitPool {
  public:
   // An intrusive record avoids charging another allocation for observing a
   // heap payload. Its owner must unregister it before releasing the backing.
-  class HeapResidentRange {
+  class ZVEC_AILEGO_API HeapResidentRange {
    public:
     HeapResidentRange() = default;
     HeapResidentRange(const HeapResidentRange &) = delete;
     HeapResidentRange &operator=(const HeapResidentRange &) = delete;
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
     ~HeapResidentRange() {
       reset();
     }
@@ -286,6 +288,11 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     void unlink() noexcept;
     void replace(HeapResidentRange &other) noexcept;
     ResidentRange range_;
+#else
+    void observe(void *, size_t) noexcept {}
+    void reset() noexcept {}
+    void take(HeapResidentRange &) noexcept {}
+#endif
   };
 
   static MemoryLimitPool &get_instance() {
