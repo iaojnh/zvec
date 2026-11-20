@@ -2448,6 +2448,68 @@ TEST_F(ParserPrimitiveAdmissionTest,
   }
   check(*storage, names.front());
 }
+TEST_F(ParserPrimitiveAdmissionTest, SameLengthParsingInputRetainsBacking) {
+  const size_t page = pool.page_buffer_size();
+  for (size_t bytes : {size_t{1}, page - 1, page, page + 1}) {
+    IndexParsingInput input;
+    ASSERT_TRUE(input.prepare(bytes));
+    auto *data = static_cast<unsigned char *>(input.data());
+    data[0] = 0x5a;
+    const size_t used = pool.used();
+    ASSERT_TRUE(input.prepare(bytes));
+    EXPECT_EQ(data, input.data());
+    EXPECT_EQ(0x5a, *static_cast<unsigned char *>(input.data()));
+    EXPECT_EQ(used, pool.used());
+  }
+}
+
+TEST_F(ParserPrimitiveAdmissionTest, ReusedInputStillShrinksAndRetriesExactly) {
+  const size_t page = pool.page_buffer_size();
+  IndexParsingInput input;
+  ASSERT_TRUE(input.prepare(8 * page));
+  ASSERT_TRUE(input.prepare(8 * page));
+  {
+    Pressure pressure(0);
+    const size_t used = pool.used();
+    ASSERT_TRUE(input.prepare(page - 1));
+    EXPECT_GE(used - pool.used(), 7 * page);
+  }
+  ASSERT_TRUE(input.prepare(page + 1));
+  ASSERT_TRUE(input.prepare(page + 1));
+  {
+    Pressure pressure(0);
+    const size_t used = pool.used();
+    ASSERT_TRUE(input.prepare(page + 1, true));
+    EXPECT_GE(used - pool.used(), page);
+    EXPECT_FALSE(input.prepare(page + 1, true));
+  }
+}
+TEST_F(ParserPrimitiveAdmissionTest, MovedInputCanBeReusedIndependently) {
+  const size_t page = pool.page_buffer_size();
+  ailego::BudgetedMappedBuffer funded;
+  ASSERT_EQ(0, funded.resize(2 * page));
+  for (int kind : {0, 1, 2}) {
+    const size_t bytes = kind == 0 ? page - 1 : page + 1;
+    IndexParsingInput source(kind == 2 ? funded.data() : nullptr,
+                             kind == 2 ? funded.mapped_size() : 0);
+    ASSERT_TRUE(source.prepare(bytes));
+    *static_cast<unsigned char *>(source.data()) = 0x5a;
+    IndexParsingInput moved(std::move(source));
+    EXPECT_EQ(nullptr, source.data());
+    ASSERT_TRUE(source.prepare(bytes));
+    EXPECT_NE(source.data(), moved.data());
+    *static_cast<unsigned char *>(source.data()) = 0x33;
+    EXPECT_EQ(0x5a, *static_cast<unsigned char *>(moved.data()));
+    IndexParsingInput assigned;
+    ASSERT_TRUE(assigned.prepare(bytes));
+    assigned = std::move(moved);
+    EXPECT_EQ(nullptr, moved.data());
+    ASSERT_TRUE(moved.prepare(bytes));
+    EXPECT_NE(moved.data(), assigned.data());
+    *static_cast<unsigned char *>(moved.data()) = 0x66;
+    EXPECT_EQ(0x5a, *static_cast<unsigned char *>(assigned.data()));
+  }
+}
 #if defined(__linux__) && !defined(__ANDROID__)
 TEST_F(ParserPrimitiveAdmissionTest,
        ResidentHintAddedAfterLoanDoesNotChangeAdmission) {
