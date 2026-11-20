@@ -2198,7 +2198,8 @@ TEST_F(BufferStorageWriteTest, ParserReadsReuseButDoNotPopulateScratch) {
     ASSERT_EQ(0, storage->append("parser", 2 * page));
     auto segment = storage->get("parser");
     const std::string payload(2 * page, 'p');
-    ASSERT_EQ(payload.size(), segment->write(0, payload.data(), payload.size()));
+    ASSERT_EQ(payload.size(),
+              segment->write(0, payload.data(), payload.size()));
     ASSERT_EQ(0, storage->close());
   }
   for (const char *backend : {"BufferReadStorage", "BufferStorage"}) {
