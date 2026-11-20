@@ -76,34 +76,32 @@ class MMapFileReadStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
-      }
+      if (offset >= region_size_ || len == 0) return 0;
+      len = std::min(len, region_size_ - offset);
       memcpy(buf, data_ptr_ + offset, len);
       return len;
     }
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
+      if (offset >= region_size_ || len == 0) {
+        data.reset();
+        return 0;
       }
-      data = len ? MemoryBlock::MakeMappedView(
-                       const_cast<uint8_t *>(data_ptr_ + offset), file_ptr_)
-                 : MemoryBlock{};
+      len = std::min(len, region_size_ - offset);
+      data = MemoryBlock::MakeMappedView(
+          const_cast<uint8_t *>(data_ptr_ + offset), file_ptr_);
       return len;
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
+      if (count == 0) return true;
+      if (!iovec) return false;
       for (auto *end = iovec + count; iovec != end; ++iovec) {
-        ailego_false_if_false(iovec->offset + iovec->length <= region_size_);
+        if (iovec->offset > region_size_ ||
+            iovec->length > region_size_ - iovec->offset)
+          return false;
         iovec->data = data_ptr_ + iovec->offset;
       }
       return true;

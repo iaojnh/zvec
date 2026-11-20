@@ -42,7 +42,6 @@ class MemoryReadStorage : public IndexStorage {
           padding_size_(segment.padding_size()),
           region_size_(segment.data_size() + segment.padding_size()),
           data_crc_(segment.data_crc()),
-          block_(&(*rope)[0]),
           rope_(rope) {}
 
     //! Destructor
@@ -71,28 +70,36 @@ class MemoryReadStorage : public IndexStorage {
     size_t fetch(size_t offset, void *buf, size_t len) const override {
       if (offset >= region_size_ || len == 0) return 0;
       len = std::min(len, region_size_ - offset);
-      return block_->fetch(data_offset_ + offset, buf, len);
+      return (*rope_)[0].fetch(data_offset_ + offset, buf, len);
     }
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
+      if (offset >= region_size_ || len == 0) {
+        data.reset();
+        return 0;
       }
+      len = std::min(len, region_size_ - offset);
       const void *data_ptr = nullptr;
-      size_t return_value = block_->read(data_offset_ + offset, &data_ptr, len);
-      data.reset((void *)data_ptr);
-      return return_value;
+      const size_t got =
+          (*rope_)[0].read(data_offset_ + offset, &data_ptr, len);
+      data =
+          got ? MemoryBlock::MakeMappedView(const_cast<void *>(data_ptr), rope_)
+              : MemoryBlock{};
+      return got;
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
+      if (count == 0) return true;
+      if (!iovec) return false;
       for (auto *end = iovec + count; iovec != end; ++iovec) {
-        ailego_false_if_false(iovec->offset + iovec->length <= region_size_);
-        block_->read(data_offset_ + iovec->offset, &iovec->data, iovec->length);
+        if (iovec->offset > region_size_ ||
+            iovec->length > region_size_ - iovec->offset)
+          return false;
+        if ((*rope_)[0].read(data_offset_ + iovec->offset, &iovec->data,
+                             iovec->length) != iovec->length)
+          return false;
       }
       return true;
     }
@@ -120,7 +127,6 @@ class MemoryReadStorage : public IndexStorage {
     size_t padding_size_{0u};
     size_t region_size_{0u};
     uint32_t data_crc_{0u};
-    IndexMemory::Block *block_{nullptr};
     IndexMemory::Rope::Pointer rope_{};
   };
 
