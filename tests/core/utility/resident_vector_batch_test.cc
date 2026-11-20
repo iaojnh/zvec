@@ -106,34 +106,28 @@ TEST_F(ResidentVectorBatchTest,
     EXPECT_EQ(0, std::memcmp(expected(next[i]), views[i], kBytes));
 }
 
-TEST_F(ResidentVectorBatchTest, MissingPageRollsBackPinsAndNeverReadsDisk) {
-  const uint32_t first[]{0};
-  warm(first, 1);
-  const uint32_t ids[]{0, 250};
+TEST_F(ResidentVectorBatchTest, FailedProbeReleasesPinsWithoutReadingDisk) {
+  const uint32_t first = 0;
   auto pool = storage_->vec_buffer_pool();
   const auto page = segments_[0]->data_offset() / ailego::kVectorPageSize;
-  const auto before = ailego::MemoryLimitPool::get_instance().stats().page_used;
   ResidentVectorBatch batch;
   ailego::BudgetedVector<const void *> views;
-  EXPECT_FALSE(read(batch, ids, 2, views));
-  EXPECT_EQ(before, ailego::MemoryLimitPool::get_instance().stats().page_used);
-  evict(page);
-  EXPECT_FALSE(pool->is_page_resident(page));
-  // The original read still works after the failed resident-only probe.
-  warm(ids, 2);
-  ASSERT_TRUE(read(batch, ids, 2, views));
+  for (uint32_t unavailable : {250u, 500u}) {  // Cold page, invalid location.
+    SCOPED_TRACE(unavailable);
+    warm(&first, 1);
+    const auto before =
+        ailego::MemoryLimitPool::get_instance().stats().page_used;
+    const uint32_t ids[]{first, unavailable};
+    EXPECT_FALSE(read(batch, ids, 2, views));
+    EXPECT_EQ(before,
+              ailego::MemoryLimitPool::get_instance().stats().page_used);
+    evict(page);
+    EXPECT_FALSE(pool->is_page_resident(page));
+  }
+  const uint32_t valid[]{first, 250};
+  warm(valid, 2);
+  ASSERT_TRUE(read(batch, valid, 2, views));
   EXPECT_EQ(0, std::memcmp(expected(250), views[1], kBytes));
-}
-
-TEST_F(ResidentVectorBatchTest, InvalidLocationRetainsNoPages) {
-  const uint32_t ids[]{0, 500};
-  warm(ids, 1);
-  ResidentVectorBatch batch;
-  ailego::BudgetedVector<const void *> views;
-  EXPECT_FALSE(read(batch, ids, 2, views));
-  const auto page = segments_[0]->data_offset() / ailego::kVectorPageSize;
-  evict(page);
-  EXPECT_FALSE(storage_->vec_buffer_pool()->is_page_resident(page));
 }
 
 TEST_F(ResidentVectorBatchTest,

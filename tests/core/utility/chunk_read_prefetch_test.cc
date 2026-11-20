@@ -109,26 +109,6 @@ TEST_F(ChunkReadPrefetchTest, FailedAioTeardownQuarantinesAndAllowsDemandRead) {
   EXPECT_GE(pool.evictable_cache_used(), backing);
 }
 
-TEST_F(ChunkReadPrefetchTest, JoinsReadsAndBoundsCountAndBytes) {
-  segment->prefetch(0, payload.size());
-  for (size_t i = 0; i < payload.size(); i += page) {
-    segment->prefetch(i, payload.size() - i);
-    IndexStorage::MemoryBlock block;
-    ASSERT_EQ(64u, segment->read(i + 17, block, 64));
-    ASSERT_EQ(0, std::memcmp(block.data(), payload.data() + i + 17, 64));
-  }
-  const auto stats = storage->stats();
-  EXPECT_EQ(32u, stats.io_calls);
-  EXPECT_EQ(32u, stats.prefetch_submitted);
-  EXPECT_EQ(32u, stats.prefetch_consumed);
-  EXPECT_EQ(0u, stats.prefetch_failed);
-  EXPECT_LE(stats.prefetch_peak_requests, 3u);
-  EXPECT_LE(stats.prefetch_peak_bytes, 6 * page);
-  EXPECT_GT(stats.prefetch_peak_requests, 1u);
-  EXPECT_EQ(0u, stats.prefetch_pending_requests);
-  EXPECT_EQ(0u, stats.prefetch_pending_bytes);
-}
-
 TEST_F(ChunkReadPrefetchTest,
        FullQueueReportsBackpressureAndRefillsAfterConsume) {
   size_t next = 0;
@@ -138,6 +118,7 @@ TEST_F(ChunkReadPrefetchTest,
     if (current == 0) {
       EXPECT_EQ(3 * page, next);
       EXPECT_FALSE(segment->try_prefetch(next, page));
+      segment->prefetch(0, next);
     }
     IndexStorage::MemoryBlock block;
     ASSERT_EQ(64u, segment->read(current + 17, block, 64));
@@ -148,9 +129,11 @@ TEST_F(ChunkReadPrefetchTest,
   EXPECT_EQ(32u, stats.prefetch_submitted);
   EXPECT_EQ(32u, stats.prefetch_consumed);
   EXPECT_EQ(32u, stats.io_calls);
+  EXPECT_GT(stats.prefetch_peak_requests, 1u);
   EXPECT_LE(stats.prefetch_peak_requests, 3u);
   EXPECT_LE(stats.prefetch_peak_bytes, 6 * page);
   EXPECT_EQ(0u, stats.prefetch_pending_requests);
+  EXPECT_EQ(0u, stats.prefetch_pending_bytes);
   EXPECT_EQ(0u, stats.prefetch_failed);
 }
 

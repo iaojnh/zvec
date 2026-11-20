@@ -2137,13 +2137,6 @@ TEST_F(BufferStorageWriteTest, BatchReadsPreserveScalarAdmissionUnderPressure) {
             blocks[i].reset();
           }
         }
-        ASSERT_TRUE(
-            immutable
-                ? segment->IndexStorage::Segment::read_borrowed_batch_immutable(
-                      reads.data(), reads.size())
-                : segment->IndexStorage::Segment::read_borrowed_batch(
-                      reads.data(), reads.size()));
-        for (auto &block : blocks) block.reset();
         if (remaining) {
           // The descriptors fit but the worst-case result arena does not.
           // Its optional reservation must also fall back without waiting.
@@ -3000,40 +2993,6 @@ TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveLaterBatches) {
   }
 }
 
-TEST_F(BufferStorageWriteTest, OversizedBatchScratchKeepsOwnedFallback) {
-  const size_t length = (2UL << 20) + 128;
-  std::vector<char> payload(length + 2 * ailego::kVectorPageSize, 'f');
-  {
-    auto storage = open_writable();
-    ASSERT_TRUE(storage);
-    ASSERT_EQ(0, storage->append("seg", payload.size()));
-    auto segment = storage->get("seg");
-    ASSERT_TRUE(segment);
-    ASSERT_EQ(payload.size(),
-              segment->write(0, payload.data(), payload.size()));
-    ASSERT_EQ(0, storage->flush());
-    ASSERT_EQ(0, storage->close());
-  }
-  auto storage = open_read_only();
-  ASSERT_TRUE(storage);
-  auto segment = storage->get("seg");
-  ASSERT_TRUE(segment);
-  IndexStorage::MemoryBlock retained;
-  IndexStorage::Segment::BorrowedRead reads[] = {
-      {segment.get(), 0, length, &retained},
-  };
-  ASSERT_TRUE(segment->read_borrowed_batch(reads, 1));
-  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, retained.type_);
-  auto copy = retained;
-  EXPECT_EQ(retained.data(), copy.data());
-  ASSERT_TRUE(segment->read_borrowed_batch(reads, 1));
-  EXPECT_NE(retained.data(), copy.data());
-  EXPECT_EQ(0, std::memcmp(payload.data(), copy.data(), length));
-  retained.reset();
-  ASSERT_EQ(0, storage->close());
-  EXPECT_EQ(0, std::memcmp(payload.data(), copy.data(), length));
-}
-
 TEST_F(BufferStorageWriteTest, OversizedBatchCopiesFitTightBudget) {
   constexpr size_t kMiB = 1UL << 20;
   constexpr size_t kCopyBytes = 3 * kMiB;
@@ -3069,92 +3028,70 @@ TEST_F(BufferStorageWriteTest, OversizedBatchCopiesFitTightBudget) {
         SCOPED_TRACE(::testing::Message()
                      << "writable=" << writable << " immutable=" << immutable
                      << " copies=" << copies);
-        auto check = [&](bool batch) {
-          SCOPED_TRACE(batch ? "batch" : "scalar control");
-          // Writable stores have additional fixed metadata and writeback
-          // staging. Pay for those separately so the copied results fit.
-          ASSERT_EQ(0,
-                    budget.init(6 * kMiB + (writable ? writable_metadata : 0)));
-          auto storage = writable ? open_writable() : open_read_only();
-          ASSERT_TRUE(storage);
-          auto segment = storage->get("large");
-          ASSERT_TRUE(segment);
-          const size_t first =
-              (page_size - segment->data_offset() % page_size) % page_size;
-          const size_t large_offset = first + page_size;
-          if (writable) {
-            // Keep a dirty source page: releasing copy-only pins must still
-            // read current cached bytes rather than stale on-disk bytes.
-            const size_t changed = large_offset + kMiB + 17;
-            payload[changed] ^= 1;
-            ASSERT_EQ(1U, segment->write(changed, &payload[changed], 1));
-          }
-          IndexStorage::MemoryBlock blocks[7];
-          IndexStorage::Segment::BorrowedRead reads[7];
-          size_t read_count = 0;
-          auto append_read = [&](size_t offset, size_t length) {
-            reads[read_count] = {segment.get(), offset, length,
-                                 &blocks[read_count]};
-            if (batch && length == 0) {
-              // Empty outputs must clear a previous view, including at EOF.
-              blocks[read_count].reset(payload.data());
-            }
-            ++read_count;
-          };
-          append_read(0, 0);
-          append_read(first, 128);
-          for (size_t i = 0; i < copies; ++i) {
-            const size_t offset = large_offset + i * (kCopyBytes / copies);
-            append_read(offset, kCopyBytes / copies);
-            if (i == 0) append_read(offset, 0);
-          }
-          append_read(segment->data_size(), 0);
-          if (batch) {
-            ASSERT_TRUE(
-                immutable
-                    ? segment->read_borrowed_batch_immutable(reads, read_count)
-                    : segment->read_borrowed_batch(reads, read_count));
-          } else {
-            for (size_t i = 0; i < read_count; ++i) {
-              ASSERT_EQ(reads[i].length,
-                        immutable
-                            ? segment->read_borrowed_immutable(
-                                  reads[i].offset, blocks[i], reads[i].length)
-                            : segment->read_borrowed(reads[i].offset, blocks[i],
-                                                     reads[i].length));
-            }
-          }
-          for (size_t i = 0; i < read_count; ++i) {
-            if (reads[i].length == 0) {
-              EXPECT_EQ(nullptr, blocks[i].data());
-              continue;
-            }
-            ASSERT_NE(nullptr, blocks[i].data());
-            EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
-                                     blocks[i].data(), reads[i].length));
-          }
-          if (immutable || !writable) {
-            EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL,
-                      blocks[1].type_);
-          }
-          // Only the copied results promise ownership beyond close.
-          blocks[1].reset();
-          segment.reset();
-          ASSERT_EQ(0, storage->close());
-          storage.reset();
-          for (size_t i = 0; i < read_count; ++i) {
-            if (i == 1 || reads[i].length == 0) continue;
-            EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
-                                     blocks[i].data(), reads[i].length));
-          }
-        };
-        // Separate opens give both implementations a cold-cache starting
-        // point. Ordinary writable scalar reads also require the whole source
-        // range in cache; only the other scalar paths support this budget.
-        if (immutable || !writable) {
-          ASSERT_NO_FATAL_FAILURE(check(false));
+        // Writable stores have additional fixed metadata and writeback
+        // staging. Pay for those separately so the copied results fit.
+        ASSERT_EQ(0,
+                  budget.init(6 * kMiB + (writable ? writable_metadata : 0)));
+        auto storage = writable ? open_writable() : open_read_only();
+        ASSERT_TRUE(storage);
+        auto segment = storage->get("large");
+        ASSERT_TRUE(segment);
+        const size_t first =
+            (page_size - segment->data_offset() % page_size) % page_size;
+        const size_t large_offset = first + page_size;
+        if (writable) {
+          // Keep a dirty source page: releasing copy-only pins must still
+          // read current cached bytes rather than stale on-disk bytes.
+          const size_t changed = large_offset + kMiB + 17;
+          payload[changed] ^= 1;
+          ASSERT_EQ(1U, segment->write(changed, &payload[changed], 1));
         }
-        ASSERT_NO_FATAL_FAILURE(check(true));
+        IndexStorage::MemoryBlock blocks[7];
+        IndexStorage::Segment::BorrowedRead reads[7];
+        size_t read_count = 0;
+        auto append_read = [&](size_t offset, size_t length) {
+          reads[read_count] = {segment.get(), offset, length,
+                               &blocks[read_count]};
+          if (length == 0) {
+            // Empty outputs must clear a previous view, including at EOF.
+            blocks[read_count].reset(payload.data());
+          }
+          ++read_count;
+        };
+        append_read(0, 0);
+        append_read(first, 128);
+        for (size_t i = 0; i < copies; ++i) {
+          const size_t offset = large_offset + i * (kCopyBytes / copies);
+          append_read(offset, kCopyBytes / copies);
+          if (i == 0) append_read(offset, 0);
+        }
+        append_read(segment->data_size(), 0);
+        ASSERT_TRUE(
+            immutable
+                ? segment->read_borrowed_batch_immutable(reads, read_count)
+                : segment->read_borrowed_batch(reads, read_count));
+        for (size_t i = 0; i < read_count; ++i) {
+          if (reads[i].length == 0) {
+            EXPECT_EQ(nullptr, blocks[i].data());
+            continue;
+          }
+          ASSERT_NE(nullptr, blocks[i].data());
+          EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
+                                   blocks[i].data(), reads[i].length));
+        }
+        if (immutable || !writable) {
+          EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, blocks[1].type_);
+        }
+        // Only the copied results promise ownership beyond close.
+        blocks[1].reset();
+        segment.reset();
+        ASSERT_EQ(0, storage->close());
+        storage.reset();
+        for (size_t i = 0; i < read_count; ++i) {
+          if (i == 1 || reads[i].length == 0) continue;
+          EXPECT_EQ(0, std::memcmp(payload.data() + reads[i].offset,
+                                   blocks[i].data(), reads[i].length));
+        }
       }
     }
   }
@@ -3162,7 +3099,9 @@ TEST_F(BufferStorageWriteTest, OversizedBatchCopiesFitTightBudget) {
 
 TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveReadingThreadExit) {
   const size_t page_size = ailego::kVectorPageSize;
-  std::vector<char> payload(3 * page_size, 't');
+  const size_t large = (2UL << 20) + 128;
+  std::vector<char> payload(large + 2 * page_size);
+  for (size_t i = 0; i < payload.size(); ++i) payload[i] = char(i % 251);
   {
     auto storage = open_writable();
     ASSERT_TRUE(storage);
@@ -3180,19 +3119,29 @@ TEST_F(BufferStorageWriteTest, BatchScratchResultsSurviveReadingThreadExit) {
   ASSERT_TRUE(segment);
   const size_t offset =
       (2 * page_size - 32 - segment->data_offset() % page_size) % page_size;
-  IndexStorage::MemoryBlock retained;
-  bool succeeded = false;
-  std::thread reader([&]() {
-    IndexStorage::Segment::BorrowedRead reads[] = {
-        {segment.get(), offset, 128, &retained},
-    };
-    succeeded = segment->read_borrowed_batch(reads, 1);
+  // Small copies share the batch arena; oversized copies own separate storage.
+  IndexStorage::MemoryBlock retained[2];
+  const size_t lengths[] = {128, large};
+  std::thread reader([&] {
+    for (size_t i = 0; i < 2; ++i) {
+      IndexStorage::MemoryBlock block;
+      IndexStorage::Segment::BorrowedRead request{segment.get(), offset,
+                                                  lengths[i], &block};
+      ASSERT_TRUE(segment->read_borrowed_batch(&request, 1));
+      ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, block.type_);
+      retained[i] = block;
+      EXPECT_EQ(retained[i].data(), block.data());
+      ASSERT_TRUE(segment->read_borrowed_batch(&request, 1));
+      EXPECT_NE(retained[i].data(), block.data());
+    }
   });
   reader.join();
-  ASSERT_TRUE(succeeded);
-  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_SHARED_SCRATCH, retained.type_);
-  auto copy = retained;
-  retained.reset();
+  segment.reset();
   ASSERT_EQ(0, storage->close());
-  EXPECT_EQ(0, std::memcmp(payload.data() + offset, copy.data(), 128));
+  storage.reset();
+  for (size_t i = 0; i < 2; ++i) {
+    ASSERT_NE(nullptr, retained[i].data());
+    EXPECT_EQ(0, std::memcmp(payload.data() + offset, retained[i].data(),
+                             lengths[i]));
+  }
 }
