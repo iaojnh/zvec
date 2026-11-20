@@ -1488,6 +1488,14 @@ TEST_F(BufferStorageWriteTest, MappedViewsKeepFileAcrossPrivateReopen) {
   ASSERT_EQ(0, storage->append("temporary", 16));
   IndexStorage::MemoryBlock view;
   ASSERT_EQ(4u, segment->read(0, view, 4));
+  IndexStorage::MemoryBlock empty = view;
+  EXPECT_EQ(0u, segment->read(0, empty, 0));
+  EXPECT_EQ(nullptr, empty.data());
+  EXPECT_FALSE(empty.scratch_owner_);
+  empty = view;
+  EXPECT_EQ(0u, segment->read(segment->data_size(), empty, 1));
+  EXPECT_EQ(nullptr, empty.data());
+  EXPECT_FALSE(empty.scratch_owner_);
   ASSERT_EQ(0, storage->open(file_path_, false));
   EXPECT_FALSE(storage->has("temporary"));
   ASSERT_EQ(0u, segment->write(0, "late", 4));

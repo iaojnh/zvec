@@ -106,7 +106,10 @@ class MMapFileStorage : public IndexStorage {
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
       const size_t size = data_size();
-      offset = std::min(offset, size);
+      if (offset >= size || len == 0) {
+        data.reset();
+        return 0;
+      }
       len = std::min(len, size - offset);
       data = MemoryBlock::MakeMappedView((uint8_t *)segment_->data() + offset,
                                          owner_);
