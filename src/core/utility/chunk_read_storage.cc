@@ -17,6 +17,7 @@
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_unpacker.h>
 #include "ailego/utility/memory_helper.h"
 #include "utility_params.h"
@@ -428,6 +429,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     // before releasing their pins; real demand readers retain their own pins.
     void yield_for_parsing(size_t offset, size_t length) {
       std::lock_guard<std::mutex> lock(mutex);
+      yield_for_parsing_locked(offset, length);
+    }
+    void yield_for_parsing_locked(size_t offset, size_t length) {
       for (size_t i = 0; i < depth; ++i) {
         auto &slot = slots[i];
         if (!slot.item || slot.item->offset >= offset + length ||
@@ -440,6 +444,19 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         }
         if (slot.item) release(slot);
       }
+    }
+    void begin_parsing() {
+      std::lock_guard<std::mutex> lock(mutex);
+      ++parsers;
+      // No new hints can enter until the last parser exits. Retire completed
+      // and in-flight optional slots across this source, including other
+      // segments; demand readers keep their independent pins.
+      yield_for_parsing_locked(0, owner.file_size);
+    }
+    void end_parsing() noexcept {
+      std::lock_guard<std::mutex> lock(mutex);
+      assert(parsers != 0);
+      --parsers;
     }
     void account_slot(size_t requested) {
       ++occupied;
@@ -454,6 +471,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     }
     bool hint(size_t offset, size_t length, Layout *layout, bool retire_stale) {
       std::lock_guard<std::mutex> lock(mutex);
+      if (parsers) return false;
       reap(false);
       if (!ready) return false;
       size_t begin = offset;
@@ -546,7 +564,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     }
     State &owner;
     MetadataPointer<MetadataCharge> ring_charge;
-    size_t depth, byte_limit, occupied{0}, inflight{0}, bytes{0};
+    size_t depth, byte_limit, occupied{0}, inflight{0}, bytes{0}, parsers{0};
     io_context_t context{nullptr};
     LibAioLoader::RingMemory ring_memory{};
     bool ready{false};
@@ -1048,7 +1066,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       const Segment::ParsingReadStrategy *strategy = nullptr) try {
     out.reset();
     if (!len || offset > file_size || len > file_size - offset) return 0;
-    if (len > (adaptive ? (1UL << 30) : max_read_bytes)) {
+    if (populate && len > (adaptive ? (1UL << 30) : max_read_bytes)) {
       if (strategy) chunk_read_error = IndexError_Unsupported;
       return 0;
     }
@@ -1079,6 +1097,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         first ? len <= first->bytes - (offset - first->offset)
               : !layout && len <= chunk_bytes - offset % chunk_bytes;
     const size_t page = ailego::MemoryHelper::PageSize();
+    const size_t required = len + (populate ? 2 * page : 0);
     // A funded parsing destination also needs its lease admitted before a
     // single cache chunk is pinned. Otherwise that pin could prevent reclaim
     // for the lease itself at zero available budget.
@@ -1086,11 +1105,11 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     View *view = nullptr;
     if (strategy) {
       if (*strategy == Strategy::kReuse)
-        view = acquire_view(len + 2 * page, true);
+        view = acquire_view(required, true);
       else if (*strategy == Strategy::kGrow)
-        view = acquire_view(len + 2 * page);
+        view = acquire_view(required);
     } else if (single && !populate) {
-      view = acquire_view(len + 2 * page, true);
+      view = acquire_view(required, true);
     }
     const bool borrow = !strategy || *strategy == Strategy::kBorrow;
     if (single && !view && borrow) {
@@ -1117,7 +1136,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       chunk_read_error = IndexError_Unsupported;
       return 0;
     }
-    if (!view && !strategy) view = acquire_view(len + 2 * page);
+    if (!view && !strategy) view = acquire_view(required);
     if (!view) {
       chunk_read_error = strategy   ? IndexError_Unsupported
                          : populate ? IndexError_NoMemory
@@ -1125,13 +1144,13 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return 0;
     }
     // A parsing copy can reuse/replace funded backing, but must not create an
-    // optional padded query workspace when an exact owned input is cheaper.
+    // optional query workspace when an exact owned input is cheaper.
     // Every funded view has at least three native pages. Growing it therefore
     // costs less than a separate exact input beside the old mapping. If its
     // private directory later fails, an owned copy cannot improve that peak.
-    if (!populate && (!view->workspace.mapped_size() ||
-                      (strategy && !adaptive &&
-                       view->workspace.mapped_size() < len + 2 * page))) {
+    if (!populate &&
+        (!view->workspace.mapped_size() ||
+         (strategy && !adaptive && view->workspace.mapped_size() < required))) {
       view->busy.store(false, std::memory_order_release);
       changed.notify_one();
       chunk_read_error =
@@ -1139,7 +1158,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return 0;
     }
     out.lease = lease(out, view);
-    if (!ensure_workspace(*view, len + 2 * page)) {
+    if (!ensure_workspace(*view, required)) {
       chunk_read_error =
           populate || strategy ? IndexError_NoMemory : IndexError_ReadData;
       out.reset();
@@ -1541,6 +1560,16 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
 #endif
     return read_contiguous(offset, out, len, /*populate=*/false);
   }
+  void begin_parsing() override {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (state_->read_ahead) state_->read_ahead->begin_parsing();
+#endif
+  }
+  void end_parsing() noexcept override {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (state_->read_ahead) state_->read_ahead->end_parsing();
+#endif
+  }
   size_t read_for_parsing_with_strategy(size_t offset, MemoryBlock &out,
                                         size_t len,
                                         ParsingReadStrategy strategy,
@@ -1695,21 +1724,21 @@ int ChunkReadStorage::open(const std::string &path, bool) {
         candidate->index_offset >= end)
       return IndexError_InvalidArgument;
     const size_t container_size = end - candidate->index_offset;
-    // Parsing has its own temporary backing. A valid metadata directory can
-    // exceed the query read window; only the shared budget limits its size.
+    // The unpublished state has an exclusive funded workspace. Reuse its
+    // actual capacity, then fall back to temporary input without changing the
+    // configured query workspace/window just to parse a large directory.
     {
-      ailego::BudgetedMappedBuffer metadata;
-      bool metadata_denied = false;
-      auto read = [&](size_t offset, const void **data, size_t length) {
+      auto &workspace = candidate->views.front()->workspace;
+      IndexParsingInput metadata(workspace.data(), workspace.mapped_size());
+      int read_error = IndexError_ReadData;
+      auto read = [&](size_t offset, const void **data, size_t length,
+                      bool retry = false) {
+        read_error = IndexError_ReadData;
         if (offset > container_size || length > container_size - offset)
           return size_t{0};
-        if (metadata.size() < length) {
-          // The previous callback's bytes are no longer borrowed by unpacker.
-          metadata.clear();
-          if (metadata.resize(length) != 0) {
-            metadata_denied = true;
-            return size_t{0};
-          }
+        if (!metadata.prepare(length, retry)) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
         }
         *data = metadata.data();
         return candidate->meta_file.read(
@@ -1717,8 +1746,10 @@ int ChunkReadStorage::open(const std::string &path, bool) {
             metadata.data(), length);
       };
       IndexUnpacker unpacker;
-      if (!unpacker.unpack(read, container_size, checksum_))
-        return metadata_denied ? IndexError_NoMemory : IndexError_UnpackIndex;
+      if (!unpacker.unpack(read, container_size, checksum_,
+                           /*report_errors=*/false, /*retry_private=*/true))
+        return read_error == IndexError_NoMemory ? read_error
+                                                 : IndexError_UnpackIndex;
       for (const auto &item : unpacker.segments()) {
         const auto &meta = item.second;
         if (meta.data_offset() > container_size ||

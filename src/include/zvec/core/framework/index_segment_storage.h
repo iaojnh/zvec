@@ -15,9 +15,9 @@
 
 #include <limits>
 #include <new>
-#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_module.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/framework/index_unpacker.h>
 
@@ -113,6 +113,13 @@ class IndexSegmentStorage : public IndexStorage {
       return parent_->read_for_parsing_with_strategy(
           data_offset_ + offset, data, std::min(len, region_size_ - offset),
           strategy, error);
+    }
+
+    void begin_parsing() override {
+      parent_->begin_parsing();
+    }
+    void end_parsing() noexcept override {
+      parent_->end_parsing();
     }
 
     bool supports_read_chunks() const override {
@@ -234,80 +241,95 @@ class IndexSegmentStorage : public IndexStorage {
     }
 
     using Strategy = IndexStorage::Segment::ParsingReadStrategy;
+    struct ParsingScope {
+      explicit ParsingScope(IndexStorage::Segment &source_arg)
+          : source(source_arg) {
+        source.begin_parsing();
+      }
+      ~ParsingScope() {
+        source.end_parsing();
+      }
+      IndexStorage::Segment &source;
+    } parsing_scope(*parent_);
     constexpr Strategy strategies[] = {Strategy::kReuse, Strategy::kBorrow,
                                        Strategy::kGrow, Strategy::kOwned};
     unsigned excluded = 0;
-    // Select per callback: a copied header can precede a borrowed directory.
-    // On private refusal retire only a releasable input and exclude its failed
-    // strategy. Each restart excludes a new strategy, so there are at most
-    // four whole attempts and four representation probes per callback.
-    for (size_t attempt = 0; attempt < 4; ++attempt) {
-      IndexStorage::MemoryBlock metadata;
-      ailego::BudgetedMappedBuffer fallback;
-      IndexUnpacker unpacker;
-      const size_t total = parent_->data_size();
-      int read_error = IndexError_ReadData;
-      Strategy active = Strategy::kOwned;
-      auto read_data = [&, this](size_t offset, const void **data, size_t len) {
-        metadata.reset();
-        fallback.clear();
-        if (offset > total || len > total - offset) return size_t{0};
-        for (const auto strategy : strategies) {
-          if (excluded & (1u << static_cast<unsigned>(strategy))) continue;
-          if (strategy != Strategy::kOwned) {
-            size_t got = 0;
-            try {
-              got = parent_->read_for_parsing_with_strategy(
-                  offset, metadata, len, strategy, read_error);
-            } catch (const std::bad_alloc &) {
-              read_error = IndexError_NoMemory;
-            }
-            if (got == len) {
-              read_error = 0;
-              active = strategy;
-              *data = metadata.data();
-              return got;
-            }
-            metadata.reset();
-            if (read_error != IndexError_Unsupported &&
-                read_error != IndexError_NoMemory)
-              return size_t{0};
-            continue;
-          }
-          if (fallback.resize(len) != 0) {
-            read_error = IndexError_NoMemory;
-            return size_t{0};
-          }
-          active = strategy;
-          const size_t got =
-              parent_->fetch_for_parsing(offset, fallback.data(), len);
-          read_error = got == len ? 0 : parent_->read_error();
-          *data = fallback.data();
-          return got;
-        }
+    // Each callback owns its retry state. A refused directory entry retries
+    // only its input, preserving the required private prefix and leaving later
+    // directories free to borrow. Three exclusions and one owned-kind switch
+    // bound each input to five successful representations, without replaying
+    // preceding headers/directories or allocating a retry history.
+    IndexStorage::MemoryBlock metadata;
+    IndexParsingInput fallback;
+    IndexUnpacker unpacker;
+    const size_t total = parent_->data_size();
+    int read_error = IndexError_ReadData;
+    Strategy active = Strategy::kOwned;
+    auto read_owned = [&](size_t offset, const void **data, size_t len,
+                          bool retry) {
+      if (!fallback.prepare(len, retry)) {
         read_error = IndexError_NoMemory;
         return size_t{0};
-      };
-      try {
-        if (!unpacker.unpack(read_data, total, false,
-                             /*report_errors=*/false)) {
-          if (read_error == IndexError_NoMemory) return read_error;
-          LOG_ERROR("Failed to unpack segment data");
-          return IndexError_UnpackIndex;
+      }
+      active = Strategy::kOwned;
+      const size_t got =
+          parent_->fetch_for_parsing(offset, fallback.data(), len);
+      read_error = got == len ? 0 : parent_->read_error();
+      *data = fallback.data();
+      return got;
+    };
+    auto read_data = [&, this](size_t offset, const void **data, size_t len,
+                               bool retry = false) {
+      if (!retry) {
+        excluded = 0;
+      } else if (active == Strategy::kOwned) {
+        return read_owned(offset, data, len, true);
+      } else {
+        if (!metadata.release_for_parsing_retry()) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
         }
-        segments_ = std::move(*unpacker.mutable_segments());
-        magic_ = unpacker.magic();
-        return 0;
-      } catch (const std::bad_alloc &) {
-        // Permanent execution workspaces and escaped inputs cannot be made
-        // cheaper by another copy. Their owners keep the final veto.
-        if (active == Strategy::kOwned || !metadata.release_for_parsing_retry())
-          return IndexError_NoMemory;
         excluded |= 1u << static_cast<unsigned>(active);
       }
-      // Destroy all unpublished private state before the next attempt.
+      metadata.reset();
+      fallback.clear();
+      if (offset > total || len > total - offset) return size_t{0};
+      for (const auto strategy : strategies) {
+        if (excluded & (1u << static_cast<unsigned>(strategy))) continue;
+        if (strategy != Strategy::kOwned) {
+          size_t got = 0;
+          try {
+            got = parent_->read_for_parsing_with_strategy(offset, metadata, len,
+                                                          strategy, read_error);
+          } catch (const std::bad_alloc &) {
+            read_error = IndexError_NoMemory;
+          }
+          if (got == len) {
+            read_error = 0;
+            active = strategy;
+            *data = metadata.data();
+            return got;
+          }
+          metadata.reset();
+          if (read_error != IndexError_Unsupported &&
+              read_error != IndexError_NoMemory)
+            return size_t{0};
+          continue;
+        }
+        return read_owned(offset, data, len, false);
+      }
+      read_error = IndexError_NoMemory;
+      return size_t{0};
+    };
+    if (!unpacker.unpack(read_data, total, false,
+                         /*report_errors=*/false, /*retry_private=*/true)) {
+      if (read_error == IndexError_NoMemory) return read_error;
+      LOG_ERROR("Failed to unpack segment data");
+      return IndexError_UnpackIndex;
     }
-    return IndexError_NoMemory;
+    segments_ = std::move(*unpacker.mutable_segments());
+    magic_ = unpacker.magic();
+    return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }

@@ -927,8 +927,19 @@ class IndexStorage : public IndexModule {
       }
       const size_t got = read_for_parsing(offset, data, len);
       error = got == len ? 0 : read_error();
+      // The legacy byte-count API cannot distinguish a declined view from
+      // an I/O error. Preserve its caller-copy fallback; explicit strategy
+      // implementations report actual I/O failures without this ambiguity.
+      if (got != len && error == IndexError_ReadData)
+        error = IndexError_Unsupported;
       return got;
     }
+
+    // A parsing scope lets optional acceleration yield before required input
+    // and directory admission. Wrappers forward both calls to their source.
+    // These hooks are appended to preserve existing virtual method slots.
+    virtual void begin_parsing() {}
+    virtual void end_parsing() noexcept {}
   };
 
   //! Destructor

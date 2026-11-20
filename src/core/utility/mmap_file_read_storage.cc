@@ -16,6 +16,7 @@
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_format.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_unpacker.h>
 #include "utility_params.h"
 
@@ -217,26 +218,37 @@ class MMapFileReadStorage : public IndexStorage {
           static_cast<char *>(mapping->region()) + index_offset, size);
     }
 
-    ailego::BudgetedAlignedBuffer checksum_scratch;
-    auto read_data = [this, &file, &mapping, &checksum_scratch, index_offset,
-                      size](size_t offset, const void **data, size_t len) {
+    IndexParsingInput checksum_scratch;
+    int read_error = IndexError_ReadData;
+    auto read_data = [this, &file, &mapping, &checksum_scratch, &read_error,
+                      index_offset, size](size_t offset, const void **data,
+                                          size_t len, bool retry = false) {
+      read_error = IndexError_ReadData;
       if (offset > size) return size_t{0};
       const size_t off = index_offset + offset;
       len = std::min(len, size - offset);
-      if (checksum_validation_ && len) {
+      if (checksum_validation_) {
         // Validate through positioned reads so a full checksum does not
         // fault the entire file mapping into the process working set.
-        if (len > checksum_scratch.size())
-          checksum_scratch.resize(len, AILEGO_CACHE_LINE_SIZE);
+        if (!checksum_scratch.prepare(len, retry)) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
+        }
         *data = checksum_scratch.data();
         return file.read(off, checksum_scratch.data(), len);
+      }
+      if (retry) {
+        read_error = IndexError_NoMemory;
+        return size_t{0};
       }
       *data = static_cast<const uint8_t *>(mapping->region()) + off;
       return len;
     };
 
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, size, checksum_validation_)) {
+    if (!unpacker.unpack(read_data, size, checksum_validation_,
+                         /*report_errors=*/false, /*retry_private=*/true)) {
+      if (read_error == IndexError_NoMemory) return read_error;
       LOG_ERROR("Failed to unpack file: %s", path.c_str());
       return IndexError_UnpackIndex;
     }

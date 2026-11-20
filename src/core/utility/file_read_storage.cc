@@ -19,6 +19,7 @@
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_unpacker.h>
 #include "utility_params.h"
 
@@ -358,17 +359,25 @@ class FileReadStorage : public IndexStorage {
         candidate_offset >= end_offset)
       return IndexError_InvalidArgument;
     const size_t size = end_offset - candidate_offset;
-    ailego::BudgetedAlignedBuffer scratch;
-    auto read_data = [&file_ptr, &scratch, candidate_offset, size](
-                         size_t offset, const void **data, size_t len) {
+    IndexParsingInput scratch;
+    int read_error = IndexError_ReadData;
+    auto read_data = [&file_ptr, &scratch, &read_error, candidate_offset, size](
+                         size_t offset, const void **data, size_t len,
+                         bool retry = false) {
+      read_error = IndexError_ReadData;
       if (offset > size || len > size - offset) return size_t{0};
-      if (len > scratch.size()) scratch.resize(len, AILEGO_CACHE_LINE_SIZE);
+      if (!scratch.prepare(len, retry)) {
+        read_error = IndexError_NoMemory;
+        return size_t{0};
+      }
       *data = scratch.data();
       return file_ptr->read(candidate_offset + offset, scratch.data(), len);
     };
 
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, size, checksum_validation_)) {
+    if (!unpacker.unpack(read_data, size, checksum_validation_,
+                         /*report_errors=*/false, /*retry_private=*/true)) {
+      if (read_error == IndexError_NoMemory) return read_error;
       LOG_ERROR("Failed to unpack file: %s", path.c_str());
       return IndexError_UnpackIndex;
     }

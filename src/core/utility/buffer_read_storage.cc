@@ -30,6 +30,7 @@
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_format.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_unpacker.h>
 #include "reusable_read_scratch.h"
 #include "utility_params.h"
@@ -703,17 +704,23 @@ class BufferReadStorage : public IndexStorage {
       const size_t container_size = end_offset - candidate_index_offset;
 
       // IndexUnpacker requires a stable pointer until its next callback.
-      ailego::BudgetedAlignedBuffer scratch;
-      auto read_data = [&candidate_handle, &scratch, candidate_index_offset,
-                        container_size](size_t offset, const void **data,
-                                        size_t len) -> size_t {
+      IndexParsingInput scratch;
+      int read_error = IndexError_ReadData;
+      auto read_data = [&candidate_handle, &scratch, &read_error,
+                        candidate_index_offset, container_size](
+                           size_t offset, const void **data, size_t len,
+                           bool retry = false) -> size_t {
+        read_error = IndexError_ReadData;
         if (offset > container_size) {
           offset = container_size;
           len = 0;
         } else {
           len = std::min(len, container_size - offset);
         }
-        if (scratch.size() < len) scratch.resize(len, AILEGO_CACHE_LINE_SIZE);
+        if (!scratch.prepare(len, retry)) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
+        }
         *data = scratch.data();
         if (len == 0) {
           return 0;
@@ -728,7 +735,9 @@ class BufferReadStorage : public IndexStorage {
       };
 
       IndexUnpacker unpacker;
-      if (!unpacker.unpack(read_data, container_size, checksum_validation_)) {
+      if (!unpacker.unpack(read_data, container_size, checksum_validation_,
+                           /*report_errors=*/false, /*retry_private=*/true)) {
+        if (read_error == IndexError_NoMemory) return read_error;
         LOG_ERROR("Failed to unpack file: %s", path.c_str());
         return IndexError_UnpackIndex;
       }
@@ -749,6 +758,10 @@ class BufferReadStorage : public IndexStorage {
         }
       }
       const uint32_t candidate_magic = unpacker.magic();
+      // Parsing is finished. Its input and version are not required by the
+      // published directory and must not force a cache that fits into bypass.
+      scratch.clear();
+      unpacker.reset();
 
       // Fall back to bypass-only mode when metadata plus one page cannot fit.
       bool candidate_cache_enabled = false;

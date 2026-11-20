@@ -118,7 +118,7 @@ class IndexUnpacker {
   //! Unpack index data
   template <typename TFunc>
   bool unpack(TFunc read_data, size_t total, bool checksum,
-              bool report_errors = true) {
+              bool report_errors = true, bool retry_private = false) {
     static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
                                                 const void **, size_t>::value,
                   "Invocable function type");
@@ -132,7 +132,7 @@ class IndexUnpacker {
         if (report_errors) LOG_ERROR("Failed to unpack index footer");
         return false;
       }
-      if (!this->unpack_segments(read_data, total)) {
+      if (!this->unpack_segments(read_data, total, retry_private)) {
         if (report_errors) LOG_ERROR("Failed to unpack index segments' meta");
         return false;
       }
@@ -147,7 +147,7 @@ class IndexUnpacker {
       current_header_start_offset_ = footer_.next_meta_header_offset;
     }
 
-    if (!this->unpack_version(read_data)) {
+    if (!this->unpack_version(read_data, retry_private)) {
       if (report_errors) LOG_ERROR("Failed to unpack index version");
       return false;
     }
@@ -215,7 +215,8 @@ class IndexUnpacker {
 
   //! Unpack segments' meta
   template <typename TFunc>
-  bool unpack_segments(TFunc read_data, size_t total) {
+  bool unpack_segments(TFunc read_data, size_t total,
+                       bool retry_private = false) {
     static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
                                                 const void **, size_t>::value,
                   "Invocable function type");
@@ -241,8 +242,8 @@ class IndexUnpacker {
       return false;
     }
 
-    IndexFormat::SegmentMeta *seg = (IndexFormat::SegmentMeta *)data;
-    for (size_t i = 0; i < footer_.segment_count; ++i, ++seg) {
+    for (size_t i = 0; i < footer_.segment_count;) {
+      const auto *seg = static_cast<const IndexFormat::SegmentMeta *>(data) + i;
       if (seg->segment_id_offset >= footer_.segments_meta_size) {
         return false;
       }
@@ -258,18 +259,30 @@ class IndexUnpacker {
           footer_.segments_meta_size - seg->segment_id_offset;
       const size_t length = ::strnlen(name, max_length);
       if (length == max_length) return false;
-      segments_.emplace(
-          ailego::BudgetedString(name, length),
-          SegmentMeta(seg->data_index + header_.content_offset +
-                          current_header_start_offset_,
-                      seg->data_size, seg->padding_size, seg->data_crc));
+      try {
+        segments_.emplace(
+            ailego::BudgetedString(name, length),
+            SegmentMeta(seg->data_index + header_.content_offset +
+                            current_header_start_offset_,
+                        seg->data_size, seg->padding_size, seg->data_crc));
+        ++i;
+      } catch (const std::bad_alloc &) {
+        // Keep the already-required directory prefix. Change only this
+        // input's representation, then rebuild all pointers into its bytes.
+        if (!retry_input(read_data, retry_private,
+                         current_header_start_offset_ + offset, &data,
+                         footer_.segments_meta_size) ||
+            ailego::Crc32c::Hash(data, footer_.segments_meta_size, 0u) !=
+                footer_.segments_meta_crc)
+          return false;
+      }
     }
     return true;
   }
 
   //! Unpack index version
   template <typename TFunc>
-  bool unpack_version(TFunc read_data) {
+  bool unpack_version(TFunc read_data, bool retry_private = false) {
     static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
                                                 const void **, size_t>::value,
                   "Invocable function type");
@@ -291,10 +304,21 @@ class IndexUnpacker {
             segment.data_crc()) {
       return false;
     }
-    version_.reserve(segment.data_size());
-    version_.data.assign(reinterpret_cast<const char *>(data),
-                         segment.data_size());
-    return true;
+    for (;;) {
+      try {
+        version_.reserve(segment.data_size());
+        version_.data.assign(reinterpret_cast<const char *>(data),
+                             segment.data_size());
+        return true;
+      } catch (const std::bad_alloc &) {
+        if (!retry_input(read_data, retry_private, segment.data_offset(), &data,
+                         segment.data_size()) ||
+            (segment.data_crc() != 0u &&
+             ailego::Crc32c::Hash(data, segment.data_size(), 0u) !=
+                 segment.data_crc()))
+          return false;
+      }
+    }
   }
 
   //! Validate checksum of content
@@ -330,6 +354,20 @@ class IndexUnpacker {
   }
 
  private:
+  // Existing three-argument readers retain their throwing allocation
+  // behavior. A parser explicitly opts into per-input recovery in unpack(),
+  // with a fourth callback argument requesting a cheaper representation.
+  template <typename TFunc>
+  static bool retry_input(TFunc &read_data, bool enabled, size_t offset,
+                          const void **data, size_t len) {
+    if constexpr (ailego::IsInvocableWithResult<size_t, TFunc, size_t,
+                                                const void **, size_t,
+                                                bool>::value) {
+      if (enabled) return read_data(offset, data, len, true) == len;
+    }
+    throw;
+  }
+
   IndexFormat::MetaHeader header_{};
   IndexFormat::MetaFooter footer_{};
   ailego::BudgetedStringBuffer version_{};
