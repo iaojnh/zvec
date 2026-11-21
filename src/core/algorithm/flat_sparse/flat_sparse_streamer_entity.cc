@@ -1071,13 +1071,16 @@ const void *FlatSparseStreamerEntity::get_sparse_vector_data(
 int FlatSparseStreamerEntity::get_sparse_vector_data(
     uint32_t chunk_index, uint64_t offset, uint32_t length,
     IndexStorage::MemoryBlock &block) const {
+  block.reset();
   auto size = sparse_data_chunks_[chunk_index]->read(offset, block, length);
   if (size != length) {
     LOG_ERROR(
         "read sparse vector data failed: chunk_index=%u, offset=%zu, "
         "length=%u, size=%zu",
         chunk_index, (size_t)offset, length, size);
-    return IndexError_ReadData;
+    const int error = sparse_data_chunks_[chunk_index]->read_error();
+    block.reset();
+    return error;
   }
   return 0;
 }

@@ -15,6 +15,7 @@
 #include "diskann_streamer.h"
 #include <limits>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include "diskann_context.h"
 #include "diskann_index_provider.h"
 #include "diskann_indexer.h"
@@ -105,7 +106,7 @@ int DiskAnnStreamer::cleanup() {
   return 0;
 }
 
-int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
+int DiskAnnStreamer::open(IndexStorage::Pointer storage) try {
   LOG_INFO("DiskAnnStreamer::load Begin");
 
   if (!storage) {
@@ -127,6 +128,9 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
     stats_.clear();
   }
 
+  const auto rollback = ailego::ScopeGuard::Make([&] {
+    if (state_ != STATE_LOADED) unload();
+  });
   auto start_time = ailego::Monotime::MilliSeconds();
 
   int ret = IndexHelper::DeserializeFromStorage(storage.get(), &meta_);
@@ -141,22 +145,11 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
     return ret;
   }
 
-  // Construct the quantizer from the persisted meta buffer here; the entity
-  // only owns the bytes and the indexer receives the ready-to-use quantizer.
-  // The implementation is resolved from the meta buffer header, so any
-  // supported quantize type (PQ today, others later) plugs in transparently.
-  std::string quantizer_meta_buffer;
-  ret = entity_.read_pq_quantizer_meta_buffer(&quantizer_meta_buffer);
+  turbo::Quantizer::Pointer quantizer;
+  ret = entity_.load_quantizer(quantizer);
   if (ret != 0) {
-    LOG_ERROR("Read quantizer meta buffer failed, ret=%d", ret);
+    LOG_ERROR("Load DiskAnn quantizer failed, ret=%d", ret);
     return ret;
-  }
-  auto quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-      quantizer_meta_buffer, meta_,
-      static_cast<uint32_t>(entity_.pq_chunk_num()),
-      entity_.legacy_pq_layout());
-  if (!quantizer) {
-    return IndexError_NoExist;
   }
 
   diskann_indexer_ = std::make_shared<DiskAnnIndexer>(meta_);
@@ -194,6 +187,8 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
   LOG_INFO("DiskAnnStreamer::load Done");
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnStreamer::unload() {
@@ -251,7 +246,7 @@ int DiskAnnStreamer::ensure_compatible_context(ContextPointer &context,
 
 int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                                  uint32_t count,
-                                 Context::Pointer &context) const {
+                                 Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Open DiskAnnStreamer before searching");
     return IndexError_NoReady;
@@ -281,6 +276,13 @@ int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
     return IndexError_InvalidArgument;
   }
 
+  ailego::ProcessRssReservation result_memory;
+  bool success = false;
+  const auto finish = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().clear();
+    ctx->group_topk_heaps().clear();
+    if (!success) ctx->clear();
+  });
   ctx->clear();
   ctx->resize_results(count);
 
@@ -296,12 +298,15 @@ int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
       return IndexError_Runtime;
     }
 
-    ctx->topk_to_result(i);
+    ctx->knn_to_result(i, result_memory);
 
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
 
+  success = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnStreamer::search_bf_impl(const void *query,
@@ -484,15 +489,16 @@ int DiskAnnStreamer::get_vector_by_id(const uint32_t id,
     return ret;
   }
 
-  void *owned = ailego_malloc(fetch_vector_buffer_.size());
-  if (!owned) {
-    LOG_ERROR("Failed to allocate fetched vector buffer");
+  try {
+    using Payload = IndexDocument::VectorPayload;
+    auto owner = std::allocate_shared<Payload>(
+        ailego::BudgetedAllocator<Payload, true>{}, fetch_vector_buffer_.data(),
+        fetch_vector_buffer_.size(), /*process_rss=*/true);
+    block = IndexStorage::MemoryBlock::MakeSharedView(owner->data.data(), owner);
+    return 0;
+  } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
-  std::memcpy(owned, fetch_vector_buffer_.data(), fetch_vector_buffer_.size());
-  block =
-      IndexStorage::MemoryBlock::MakeOwned(owned, fetch_vector_buffer_.size());
-  return 0;
 }
 
 IndexSearcher::Provider::Pointer DiskAnnStreamer::create_provider() const {

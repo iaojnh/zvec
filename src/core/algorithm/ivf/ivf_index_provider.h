@@ -83,17 +83,21 @@ class IVFIndexProvider : public IndexProvider {
   }
 
   //! Return independently owned bytes, including for decoded Turbo postings.
-  int get_vector(uint64_t key,
-                 IndexStorage::MemoryBlock &block) const override {
+  int get_vector(uint64_t key, IndexStorage::MemoryBlock &block) const override
+      try {
+    block.reset();
     auto buffer = std::make_shared<std::string>();
     std::lock_guard<std::mutex> lock(*read_mutex_);
     IndexStorage::MemoryBlock data;
-    if (entity_->get_vector_by_key(key, data) != 0 ||
-        !CopyVector(entity_, data.data(), element_size(), buffer.get())) {
+    const int ret = entity_->get_vector_by_key(key, data);
+    if (ret != 0) return ret;
+    if (!CopyVector(entity_, data.data(), element_size(), buffer.get())) {
       return IndexError_ReadData;
     }
     block = IndexStorage::MemoryBlock::MakeSharedView(buffer->data(), buffer);
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   //! Retrieve the owner class
@@ -125,8 +129,8 @@ class IVFIndexProvider : public IndexProvider {
     return buffers.back().data;
   }
 
-  // Copy storage-owned and column-major scratch bytes before releasing the
-  // shared read lock. Decoded bytes already belong to the output buffer.
+  // Copy storage-owned bytes before releasing the shared read lock. Decoded
+  // bytes already belong to the output buffer.
   static const void *CopyVector(const IVFEntity::Pointer &entity,
                                 const void *data, size_t size,
                                 std::string *buffer) {
@@ -199,20 +203,26 @@ class IVFIndexProvider : public IndexProvider {
     // cannot invalidate them.
     const void *data() const override {
       std::lock_guard<std::mutex> lock(*read_mutex_);
-      size_t local_id = current_local_id();
-      if (local_id >= count_) {
-        return nullptr;
-      }
-      if (!vector_loaded_) {
-        IndexStorage::MemoryBlock data;
-        if (entity_->get_vector(local_id, data) != 0 ||
-            !CopyVector(entity_, data.data(), element_size_, &vector_)) {
-          status_ = IndexError_ReadData;
+      try {
+        const size_t local_id = current_local_id();
+        if (local_id >= count_) {
           return nullptr;
         }
-        vector_loaded_ = true;
+        if (!vector_loaded_) {
+          IndexStorage::MemoryBlock data;
+          status_ = entity_->get_vector(local_id, data);
+          if (status_ != 0) return nullptr;
+          if (!CopyVector(entity_, data.data(), element_size_, &vector_)) {
+            status_ = IndexError_ReadData;
+            return nullptr;
+          }
+          vector_loaded_ = true;
+        }
+        return vector_.data();
+      } catch (const std::bad_alloc &) {
+        status_ = IndexError_NoMemory;
+        return nullptr;
       }
-      return vector_.data();
     }
 
     //! Test if the iterator is valid

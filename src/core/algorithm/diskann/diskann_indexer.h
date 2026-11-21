@@ -37,7 +37,7 @@ class DiskAnnIndexer {
  public:
   //! Initialize with the loaded entity and the quantizer constructed by
   //! the searcher/streamer (see
-  //! DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer).
+  //! DiskAnnSearcherEntity::load_quantizer).
   //! Any turbo::Quantizer works here; PQ is just the current default.
   int init(DiskAnnSearcherEntity &entity, turbo::Quantizer::Pointer quantizer);
 
@@ -111,6 +111,7 @@ class DiskAnnIndexer {
   uint64_t index_segment_offset_{0};
   uint64_t sector_num_per_node_{0};
 
+  ailego::ProcessRssAlignedBuffer centroid_memory_;
   void *centroid_data_{nullptr};
   size_t centroid_stride_{0};
 

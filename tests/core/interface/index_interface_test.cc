@@ -1160,7 +1160,8 @@ TEST(IndexInterface, IvfBufferPoolSearchAfterOpenThreadExits) {
 #if DISKANN_SUPPORTED
 TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
   constexpr uint32_t kDimension = 64;
-  constexpr uint32_t kDocCount = 512;
+  // Both key tables exceed the smallest cache budget.
+  constexpr uint32_t kDocCount = 4096;
   constexpr size_t kFullBudget = 8UL * 1024UL * 1024UL;
   const std::string index_name{"test_diskann_buffer_budgets.index"};
   auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
@@ -1244,18 +1245,42 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
     ASSERT_EQ(0, index->close());
   }
 
-  // Cover both bypass-only thresholds, then actual cache pressure and a pool
-  // large enough for the entire index. Every mode reads the same built file.
-  for (size_t budget : {page_size - 1, metadata_bytes + page_size - 1,
+  // Exercise the 4 KiB scratch boundary even on hosts with larger pages,
+  // then the cache-admission threshold, cache pressure, and a full cache.
+  const size_t subpage_budget = std::min<size_t>(page_size, 4096) - 1;
+  for (size_t budget : {subpage_budget, metadata_bytes + page_size - 1,
                         metadata_bytes + 4 * page_size, kFullBudget}) {
     SCOPED_TRACE(budget);
     ASSERT_EQ(0u, memory_pool.used());
     ASSERT_EQ(0, memory_pool.init(budget));
     auto index = IndexFactory::CreateAndInitIndex(*param);
     ASSERT_NE(nullptr, index);
-    ASSERT_EQ(0,
-              index->open(index_name, {StorageOptions::StorageType::kBufferPool,
-                                       false, true}));
+    auto &rss_pool = zvec::ailego::MemoryLimitPool::get_instance();
+    const auto restore_rss = zvec::ailego::ScopeGuard::Make(
+        [&] { EXPECT_TRUE(rss_pool.configure_process_rss_limit(0)); });
+    const StorageOptions options{StorageOptions::StorageType::kBufferPool,
+                                 false, true};
+    if (budget == subpage_budget) {
+      // The actual RSS sample exceeds this limit. Keep the cache budget
+      // unchanged when retrying with process headroom.
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(1));
+      const size_t rss = rss_pool.process_rss();
+      ASSERT_GT(rss, rss_pool.process_rss_limit());
+      ASSERT_EQ(zvec::core::IndexError_NoMemory,
+                index->open(index_name, options));
+      ASSERT_EQ(0u, memory_pool.used());
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+    }
+    ASSERT_EQ(0, index->open(index_name, options));
+    {
+      VectorDataBuffer fetched;
+      ASSERT_EQ(0, index->fetch(kDocCount - 1, &fetched));
+      const auto &buffer = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+      ASSERT_EQ(kDimension * sizeof(float), buffer.data.size());
+      EXPECT_EQ(0, std::memcmp(buffer.data.data(),
+                               values.data() + (kDocCount - 1) * kDimension,
+                               buffer.data.size()));
+    }
     const bool cache_enabled = budget >= metadata_bytes + page_size;
     EXPECT_EQ(cache_enabled ? metadata_bytes : 0u, memory_pool.metadata_used());
     for (size_t repeat = 0; repeat < 2; ++repeat) {
@@ -1271,11 +1296,195 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
         }
       }
     }
+    if (budget == subpage_budget) {
+      const VectorData input{DenseVector{values.data()}};
+      const size_t rss = rss_pool.process_rss();
+      // A warm query and fetch need only their incremental working set.
+      // Exercise them with limited process headroom and the same page cap.
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (16UL << 20)));
+      Result tight;
+      ASSERT_NO_FATAL_FAILURE(query(index, 0, &tight));
+      EXPECT_EQ(baseline[0], tight);
+      {
+        VectorDataBuffer tight_fetch;
+        ASSERT_EQ(0, index->fetch(kDocCount - 1, &tight_fetch));
+        const auto &bytes =
+            std::get<DenseVectorBuffer>(tight_fetch.vector_buffer).data;
+        ASSERT_EQ(kDimension * sizeof(float), bytes.size());
+        EXPECT_EQ(0, std::memcmp(bytes.data(),
+                                 values.data() + (kDocCount - 1) * kDimension,
+                                 bytes.size()));
+      }
+
+      // Fetching vectors applies only to hits within the radius.
+      std::array<float, kDimension> origin{};
+      SearchResult out_of_radius;
+      query_param->radius = 1e-6f;
+      ASSERT_EQ(0, index->search(VectorData{DenseVector{origin.data()}},
+                                 query_param, &out_of_radius));
+      EXPECT_TRUE(out_of_radius.doc_list_.empty());
+      query_param->radius = 0.0f;
+
+      SearchResult held;
+      ASSERT_EQ(0, index->search(input, query_param, &held));
+      ASSERT_EQ(10u, held.doc_list_.size());
+      const std::string first_vector = held.doc_list_.front().vector_string();
+      ASSERT_EQ(kDimension * sizeof(float), first_vector.size());
+      const size_t cache_used = memory_pool.used();
+
+      Result retried;
+      for (bool deny_during_search : {false, true}) {
+        SCOPED_TRACE(deny_during_search);
+        auto deny = [&] {
+          EXPECT_TRUE(rss_pool.configure_process_rss_limit(1));
+          EXPECT_GT(rss_pool.process_rss(), rss_pool.process_rss_limit());
+        };
+        int candidates = 0;
+        if (deny_during_search) {
+          // Let the query produce one candidate before refusing new backing.
+          query_param->filter = std::make_shared<IndexFilter>();
+          query_param->filter->set([&](uint64_t) {
+            if (++candidates == 2) deny();
+            return false;
+          });
+        } else {
+          deny();
+        }
+        SearchResult rejected;
+        EXPECT_EQ(zvec::core::IndexError_NoMemory,
+                  index->search(input, query_param, &rejected));
+        if (deny_during_search) {
+          EXPECT_EQ(2, candidates);
+        }
+        query_param->filter.reset();
+        EXPECT_TRUE(rejected.doc_list_.empty());
+        EXPECT_EQ(first_vector, held.doc_list_.front().vector_string());
+        EXPECT_LE(memory_pool.used(), cache_used);
+        ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+        ASSERT_NO_FATAL_FAILURE(query(index, 0, &retried));
+        EXPECT_EQ(baseline[0], retried);
+      }
+
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(1));
+      ASSERT_GT(rss_pool.process_rss(), rss_pool.process_rss_limit());
+      EXPECT_EQ(zvec::core::IndexError_NoReady, index->open(index_name, options));
+      ASSERT_EQ(0, index->close());
+      EXPECT_EQ(0u, memory_pool.used());
+      EXPECT_EQ(zvec::core::IndexError_NoMemory, index->open(index_name, options));
+      EXPECT_EQ(0u, memory_pool.used());
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+      ASSERT_EQ(0, index->open(index_name, options));
+      ASSERT_NO_FATAL_FAILURE(query(index, 0, &retried));
+      EXPECT_EQ(baseline[0], retried);
+    }
     ASSERT_EQ(0, index->close());
     index.reset();
     EXPECT_EQ(0u, memory_pool.metadata_used());
     EXPECT_EQ(0u, memory_pool.stats().page_used);
     EXPECT_EQ(0u, memory_pool.used());
+  }
+}
+
+TEST(IndexInterface, DiskAnnFp16ReturnsOwnedRevertedVectors) {
+  // The FP32 transform allowance alone exceeds the small page cache.
+  constexpr uint32_t kDimension = 576;
+  constexpr uint32_t kDocs = 4096;
+  const std::string name{"test_diskann_fp16_results.index"};
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &rss_pool = zvec::ailego::MemoryLimitPool::get_instance();
+  const size_t previous_capacity = pool.capacity();
+  const size_t previous_rss_limit = rss_pool.process_rss_limit();
+  auto restore = zvec::ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(rss_pool.configure_process_rss_limit(previous_rss_limit));
+    zvec::test_util::RemoveTestFiles(name + "*");
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous_capacity));
+  });
+  ASSERT_EQ(0, pool.init(8UL << 20));
+  auto param = DiskAnnIndexParamBuilder()
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_dimension(kDimension)
+                   .with_quantizer_param(QuantizerParam(QuantizerType::kFP16))
+                   .with_max_degree(24)
+                   .with_list_size(64)
+                   .with_pq_chunk_num(8)
+                   .build();
+  std::vector<float> values(kDocs * kDimension);
+  std::mt19937 random(317);
+  std::uniform_real_distribution<float> uniform(-2.0f, 2.0f);
+  for (float &value : values) value = uniform(random);
+  {
+    auto index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, index);
+    ASSERT_EQ(0, index->open(name, {StorageOptions::StorageType::kMMAP, true}));
+    for (uint32_t id = 0; id < kDocs; ++id) {
+      ASSERT_EQ(0, index->add(VectorData{DenseVector{
+                                  values.data() + id * kDimension}}, id));
+    }
+    ASSERT_EQ(0, index->train());
+    ASSERT_EQ(0, index->close());
+  }
+  ASSERT_EQ(0, pool.init(4095));
+  auto query = std::make_shared<DiskAnnQueryParam>();
+  query->topk = 10;
+  query->list_size = 64;
+  query->fetch_vector = true;
+  const VectorData input{DenseVector{values.data()}};
+  for (auto storage : {StorageOptions::StorageType::kMMAP,
+                       StorageOptions::StorageType::kBufferPool}) {
+    auto index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, index);
+    ASSERT_EQ(0, index->open(name, {storage, false, true}));
+    SearchResult graph;
+    query->is_linear = false;
+    ASSERT_EQ(0, index->search(input, query, &graph));
+    ASSERT_FALSE(graph.doc_list_.empty());
+    ASSERT_FALSE(graph.reverted_vector_list_.empty());
+    const uint32_t id = graph.doc_list_.front().key();
+    VectorDataBuffer fetched;
+    ASSERT_EQ(0, index->fetch(id, &fetched));
+    EXPECT_EQ(graph.reverted_vector_list_.front(),
+              std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+    SearchResult linear;
+    query->is_linear = true;
+    ASSERT_EQ(0, index->search(input, query, &linear));
+    query->is_linear = false;
+    ASSERT_TRUE(rss_pool.configure_process_rss_limit(1));
+    ASSERT_GT(rss_pool.process_rss(), rss_pool.process_rss_limit());
+    SearchResult refused;
+    EXPECT_EQ(zvec::core::IndexError_NoMemory,
+              index->search(input, query, &refused));
+    EXPECT_TRUE(refused.doc_list_.empty());
+    EXPECT_TRUE(refused.reverted_vector_list_.empty());
+    VectorDataBuffer refused_fetch;
+    EXPECT_EQ(zvec::core::IndexError_NoMemory, index->fetch(id, &refused_fetch));
+    EXPECT_TRUE(std::get<DenseVectorBuffer>(refused_fetch.vector_buffer)
+                    .data.empty());
+    ASSERT_TRUE(rss_pool.configure_process_rss_limit(previous_rss_limit));
+    ASSERT_EQ(0, index->search(input, query, &refused));
+    EXPECT_EQ(graph.reverted_vector_list_, refused.reverted_vector_list_);
+    ASSERT_EQ(0, index->fetch(id, &refused_fetch));
+    EXPECT_EQ(graph.reverted_vector_list_.front(),
+              std::get<DenseVectorBuffer>(refused_fetch.vector_buffer).data);
+    ASSERT_EQ(0, index->close());
+    for (const auto *result : {&graph, &linear}) {
+      ASSERT_EQ(10u, result->doc_list_.size());
+      ASSERT_EQ(result->doc_list_.size(), result->reverted_vector_list_.size());
+      for (size_t i = 0; i < result->doc_list_.size(); ++i) {
+        const auto &doc = result->doc_list_[i];
+        ASSERT_LT(doc.key(), kDocs);
+        ASSERT_EQ(kDimension * sizeof(uint16_t), doc.vector_string().size());
+        const auto &reverted = result->reverted_vector_list_[i];
+        std::array<float, kDimension> decoded{};
+        ASSERT_EQ(sizeof(decoded), reverted.size());
+        std::memcpy(decoded.data(), reverted.data(), sizeof(decoded));
+        for (size_t dim = 0; dim < kDimension; ++dim) {
+          EXPECT_NEAR(values[doc.key() * kDimension + dim], decoded[dim],
+                      0.001f);
+        }
+      }
+    }
   }
 }
 #endif  // DISKANN_SUPPORTED

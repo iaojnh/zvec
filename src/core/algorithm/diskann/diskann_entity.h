@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <memory>
 #include <utility>
 #include <zvec/core/framework/index_framework.h>
 
@@ -29,11 +30,14 @@ constexpr diskann_key_t kInvalidKey = static_cast<diskann_key_t>(-1);
 struct VectorInfo {
   float dist_;
   std::string vec_;
+  std::shared_ptr<const IndexDocument::VectorPayload> shared_vec_;
 
   VectorInfo() = default;
   VectorInfo(float dist, const std::string &vec) : dist_{dist}, vec_{vec} {}
   VectorInfo(float dist, std::string &&vec)
       : dist_{dist}, vec_{std::move(vec)} {}
+  VectorInfo(float dist, std::shared_ptr<const IndexDocument::VectorPayload> vec)
+      : dist_{dist}, shared_vec_{std::move(vec)} {}
 };
 
 /*! Key Value Vecotr Heap Comparer
