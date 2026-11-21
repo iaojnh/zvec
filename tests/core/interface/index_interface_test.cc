@@ -1385,6 +1385,86 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
   }
 }
 
+TEST(IndexInterface, DiskAnnFp16QueryFitsTightRssLimit) {
+  class PreparedIndex : public DiskAnnIndex {
+   public:
+    using Index::_prepare_dense_query;
+    using Index::init;
+  };
+  constexpr uint32_t kDimension = 32768;
+  constexpr size_t kOutputBytes = kDimension * sizeof(uint16_t);
+  constexpr size_t kOutputAllowance = 2 * (kOutputBytes + 1);
+  constexpr size_t kInputAllowance = 2 * (kDimension * sizeof(float) + 1);
+  constexpr size_t kRoom = (kOutputAllowance + kInputAllowance) / 2;
+  std::vector<float> input(kDimension, 0.5f);
+  const VectorData query{DenseVector{input.data()}};
+  auto param = DiskAnnIndexParamBuilder()
+                   .with_dimension(kDimension)
+                   .with_metric_type(MetricType::kL2sq)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_quantizer_param(QuantizerParam(QuantizerType::kFP16))
+                   .build();
+  PreparedIndex index;
+  ASSERT_EQ(0, index.init(*param));
+  auto reformer = zvec::core::IndexFactory::CreateReformer("HalfFloatReformer");
+  ASSERT_NE(nullptr, reformer);
+  ASSERT_EQ(0, reformer->init(zvec::ailego::Params{}));
+
+  auto &rss = zvec::ailego::MemoryLimitPool::get_instance();
+  const size_t previous = rss.process_rss_limit();
+  auto restore = zvec::ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(rss.configure_process_rss_limit(previous)); });
+  ASSERT_TRUE(rss.configure_process_rss_limit(size_t{1} << 40));
+
+  const zvec::core::IndexQueryMeta original(DataType::DT_FP32, kDimension);
+  zvec::core::IndexQueryMeta encoded;
+  std::string expected;
+  ASSERT_EQ(0, reformer->transform(input.data(), original, &expected, &encoded));
+  ASSERT_EQ(kOutputBytes, expected.size());
+  {
+    // Warm the converter, allocator and RSS sampler before measuring.
+    std::string warm;
+    const void *data = nullptr;
+    ASSERT_EQ(0, index._prepare_dense_query(query, &warm, &data, &encoded));
+    ASSERT_EQ(expected, warm);
+  }
+  size_t low = rss.process_rss();
+  size_t high = low + (64UL << 20);
+  while (low < high) {
+    const size_t mid = low + (high - low) / 2;
+    ASSERT_TRUE(rss.configure_process_rss_limit(mid));
+    if (rss.materialization_allowed(kRoom)) {
+      high = mid;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  // Verify that a real allocation and conversion can fit in this window
+  // and that the previous FP32-sized reservation would be denied.
+  ASSERT_TRUE(rss.configure_process_rss_limit(low));
+  ASSERT_FALSE(rss.materialization_allowed(kInputAllowance));
+  {
+    zvec::ailego::ProcessRssReservation reservation;
+    std::string reference;
+    ASSERT_NO_THROW(reservation.allocate(kOutputAllowance, [&] {
+      reference.reserve(kOutputBytes);
+      return reference.capacity() + 1;
+    }));
+    ASSERT_EQ(0,
+              reformer->transform(input.data(), original, &reference, &encoded));
+    ASSERT_EQ(expected, reference);
+  }
+  ASSERT_TRUE(rss.configure_process_rss_limit(low));
+  ASSERT_TRUE(rss.materialization_allowed(kOutputAllowance));
+  ASSERT_FALSE(rss.materialization_allowed(kInputAllowance));
+  std::string transformed;
+  const void *data = nullptr;
+  ASSERT_EQ(0, index._prepare_dense_query(query, &transformed, &data, &encoded));
+  EXPECT_EQ(transformed.data(), data);
+  EXPECT_EQ(expected, transformed);
+}
+
 TEST(IndexInterface, DiskAnnFp16ReturnsOwnedRevertedVectors) {
   // The FP32 transform allowance alone exceeds the small page cache.
   constexpr uint32_t kDimension = 576;
@@ -1446,6 +1526,31 @@ TEST(IndexInterface, DiskAnnFp16ReturnsOwnedRevertedVectors) {
     ASSERT_EQ(0, index->fetch(id, &fetched));
     EXPECT_EQ(graph.reverted_vector_list_.front(),
               std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+    ASSERT_TRUE(rss_pool.configure_process_rss_limit(size_t{1} << 40));
+    const size_t rss = rss_pool.process_rss();
+    ASSERT_GT(rss, 0u);
+    ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (16UL << 20)));
+    const VectorData other{DenseVector{values.data() + kDimension}};
+    SearchResult reused;
+    ASSERT_EQ(0, index->search(input, query, &reused));
+    ASSERT_EQ(0, index->search(other, query, &reused));
+    ASSERT_EQ(10u, reused.doc_list_.size());
+    ASSERT_NE(id, reused.doc_list_.front().key());
+    EXPECT_EQ(reused.doc_list_.size(), reused.reverted_vector_list_.size());
+    VectorDataBuffer other_fetched;
+    ASSERT_EQ(0, index->fetch(reused.doc_list_.front().key(), &other_fetched));
+    ASSERT_FALSE(reused.reverted_vector_list_.empty());
+    EXPECT_EQ(std::get<DenseVectorBuffer>(other_fetched.vector_buffer).data,
+              reused.reverted_vector_list_.front());
+
+    query->radius = 1e-6f;
+    std::array<float, kDimension> zero{};
+    ASSERT_EQ(0, index->search(VectorData{DenseVector{zero.data()}}, query,
+                               &reused));
+    EXPECT_TRUE(reused.doc_list_.empty());
+    EXPECT_TRUE(reused.reverted_vector_list_.empty());
+    query->radius = 0;
+
     SearchResult linear;
     query->is_linear = true;
     ASSERT_EQ(0, index->search(input, query, &linear));
@@ -1457,6 +1562,13 @@ TEST(IndexInterface, DiskAnnFp16ReturnsOwnedRevertedVectors) {
               index->search(input, query, &refused));
     EXPECT_TRUE(refused.doc_list_.empty());
     EXPECT_TRUE(refused.reverted_vector_list_.empty());
+    EXPECT_EQ(zvec::core::IndexError_NoMemory,
+              index->search(other, query, &graph));
+    ASSERT_FALSE(graph.doc_list_.empty());
+    ASSERT_FALSE(graph.reverted_vector_list_.empty());
+    EXPECT_EQ(id, graph.doc_list_.front().key());
+    EXPECT_EQ(std::get<DenseVectorBuffer>(fetched.vector_buffer).data,
+              graph.reverted_vector_list_.front());
     VectorDataBuffer refused_fetch;
     EXPECT_EQ(zvec::core::IndexError_NoMemory, index->fetch(id, &refused_fetch));
     EXPECT_TRUE(std::get<DenseVectorBuffer>(refused_fetch.vector_buffer)

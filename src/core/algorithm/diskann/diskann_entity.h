@@ -36,7 +36,8 @@ struct VectorInfo {
   VectorInfo(float dist, const std::string &vec) : dist_{dist}, vec_{vec} {}
   VectorInfo(float dist, std::string &&vec)
       : dist_{dist}, vec_{std::move(vec)} {}
-  VectorInfo(float dist, std::shared_ptr<const IndexDocument::VectorPayload> vec)
+  VectorInfo(float dist,
+             std::shared_ptr<const IndexDocument::VectorPayload> vec)
       : dist_{dist}, shared_vec_{std::move(vec)} {}
 };
 
