@@ -703,8 +703,8 @@ int DiskAnnIndexer::cache_bfs_levels(uint64_t num_nodes_to_cache,
       }
 
       int read_error = 0;
-      const auto read_status =
-          read_nodes(nodes_to_read, coord_buffers, neighbor_buffers, read_error);
+      const auto read_status = read_nodes(nodes_to_read, coord_buffers,
+                                          neighbor_buffers, read_error);
       if (read_error == IndexError_NoMemory) return read_error;
 
       for (size_t i = 0; i < read_status.size(); i++) {
