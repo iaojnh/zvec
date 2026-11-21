@@ -187,11 +187,11 @@ class DiskAnnContext : public IndexContext,
   }
 
   inline void *sector_buffer() {
-    return sector_buffer_;
+    return sector_buffer_.data();
   }
 
   inline size_t sector_buffer_size() const {
-    return sector_buffer_size_;
+    return sector_buffer_.size();
   }
 
   inline IOContext &io_ctx() {
@@ -384,8 +384,8 @@ class DiskAnnContext : public IndexContext,
   void *query_{nullptr};
   void *query_rotated_{nullptr};
   void *coord_buffer_{nullptr};
-  void *sector_buffer_{nullptr};
-  size_t sector_buffer_size_{0};
+  ailego::ProcessRssAlignedBuffer query_memory_;
+  ailego::ProcessRssAlignedBuffer sector_buffer_;
 
   std::vector<IndexDocumentList> results_{};
   std::vector<IndexGroupDocumentList> group_results_{};

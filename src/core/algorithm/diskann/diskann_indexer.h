@@ -111,6 +111,7 @@ class DiskAnnIndexer {
   uint64_t index_segment_offset_{0};
   uint64_t sector_num_per_node_{0};
 
+  ailego::ProcessRssAlignedBuffer centroid_memory_;
   void *centroid_data_{nullptr};
   size_t centroid_stride_{0};
 

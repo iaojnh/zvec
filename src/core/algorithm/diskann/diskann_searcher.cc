@@ -103,7 +103,7 @@ int DiskAnnSearcher::cleanup() {
 }
 
 int DiskAnnSearcher::load(IndexStorage::Pointer storage,
-                          IndexMetric::Pointer measure) {
+                          IndexMetric::Pointer measure) try {
   LOG_INFO("DiskAnnSearcher::load Begin");
 
   if (!storage) {
@@ -184,6 +184,8 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
   LOG_INFO("DiskAnnSearcher::load Done");
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::unload() {

@@ -383,8 +383,12 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   }
   void release_heap_process_backing(
       size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
-    process_rss_.release_heap(
+    release_heap_process_backing(
         bytes, ProcessRssBudget::HeapProjection::Full(bytes, stamp));
+  }
+  void release_heap_process_backing(
+      size_t bytes, ProcessRssBudget::HeapProjection projection) {
+    process_rss_.release_heap(bytes, projection);
     { std::lock_guard<std::mutex> lock(capacity_mutex_); }
     capacity_cv_.notify_all();
   }
@@ -436,6 +440,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
       kLockedExternal,
       // Optional, globally evictable mappings. Admission never walks owners.
       kEvictableCache,
+      // Private backing belongs to process RSS, independently of page capacity.
+      kProcessRss,
     };
 
     PendingAllocation(MemoryLimitPool &pool, Kind kind);

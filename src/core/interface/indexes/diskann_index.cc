@@ -186,11 +186,15 @@ int DiskAnnIndex::open(const std::string &file_path,
     if (ret != 0) {
       LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
                 core::IndexError::What(ret));
-      return core::IndexError_Runtime;
+      storage_.reset();
+      return ret;
     }
-    if (streamer_ == nullptr || streamer_->open(storage_) != 0) {
+    ret = streamer_ ? streamer_->open(storage_) : core::IndexError_NoReady;
+    if (ret != 0) {
       LOG_ERROR("Failed to open streamer, path: %s", file_path_.c_str());
-      return core::IndexError_Runtime;
+      storage_->close();
+      storage_.reset();
+      return ret;
     }
     is_trained_ = true;
   }

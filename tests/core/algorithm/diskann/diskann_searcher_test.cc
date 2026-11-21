@@ -304,8 +304,9 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
     zvec::turbo::Quantizer::Pointer quantizer;
     {
       const auto restore = ScopeGuard::Make(
-          [&] { pool.set_memory_pressure(Pressure::kNormal); });
-      pool.set_memory_pressure(Pressure::kCritical);
+          [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
+      ASSERT_TRUE(pool.configure_process_rss_limit(1));
+      ASSERT_GT(pool.process_rss(), pool.process_rss_limit());
       EXPECT_EQ(IndexError_NoMemory, entity.load_quantizer(quantizer));
       EXPECT_EQ(nullptr, quantizer);
     }

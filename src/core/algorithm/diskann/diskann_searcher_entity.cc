@@ -22,39 +22,6 @@ namespace core {
 
 namespace {
 
-// These resident buffers share the process RSS limit with the page cache.
-// Their lifetime is independent of the capacity configured for native I/O.
-class ProcessHeapReservation {
- public:
-  ProcessHeapReservation() = default;
-  ProcessHeapReservation(const ProcessHeapReservation &) = delete;
-  ProcessHeapReservation &operator=(const ProcessHeapReservation &) = delete;
-  ~ProcessHeapReservation() {
-    if (bytes_) {
-      ailego::MemoryLimitPool::get_instance().release_heap_process_backing(
-          bytes_, stamp_);
-    }
-  }
-
-  template <typename Allocate>
-  void allocate(size_t pending, Allocate &&allocate) {
-    auto &pool = ailego::MemoryLimitPool::get_instance();
-    if (!pool.try_reserve_process_backing(pending)) throw std::bad_alloc();
-    const auto refund = ailego::ScopeGuard::Make([&] {
-      if (pending) pool.finish_process_backing(pending, false);
-    });
-    const size_t bytes = allocate();
-    if (bytes > pending) throw std::bad_alloc();
-    stamp_ = pool.finish_process_backing(bytes, true);
-    bytes_ = bytes;
-    pending -= bytes;
-  }
-
- private:
-  size_t bytes_{0};
-  ailego::ProcessRssBudget::MaterializationStamp stamp_{};
-};
-
 template <typename T>
 int LoadTable(const IndexStorage::Segment &segment, size_t offset,
               uint64_t count, std::shared_ptr<const std::vector<T>> *out) {
@@ -64,7 +31,7 @@ int LoadTable(const IndexStorage::Segment &segment, size_t offset,
   if (count > std::vector<T>().max_size()) return IndexError_InvalidLength;
   const size_t bytes = static_cast<size_t>(count) * sizeof(T);
   struct Table {
-    ProcessHeapReservation memory;
+    ailego::ProcessRssReservation memory;
     std::vector<T> values;
     ailego::MemoryLimitPool::HeapResidentRange resident;
   };
@@ -238,6 +205,7 @@ int DiskAnnSearcherEntity::load_pq_segment() {
 
 int DiskAnnSearcherEntity::load_quantizer(
     turbo::Quantizer::Pointer &quantizer) const {
+  quantizer.reset();
   if (!pq_meta_segment_) return IndexError_InvalidArgument;
 
   const uint64_t declared_size = pq_meta_.quantizer_meta_buffer_size;
@@ -247,7 +215,7 @@ int DiskAnnSearcherEntity::load_quantizer(
     return IndexError_ReadData;
   }
   const size_t size = static_cast<size_t>(declared_size);
-  ProcessHeapReservation memory;
+  ailego::ProcessRssReservation memory;
   std::string buffer;
   ailego::MemoryLimitPool::HeapResidentRange resident;
   if (size > buffer.max_size() ||
@@ -267,9 +235,8 @@ int DiskAnnSearcherEntity::load_quantizer(
       LOG_ERROR("Failed to fetch DiskAnn PQ quantizer metadata");
       return pq_meta_segment_->read_error();
     }
-    quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-        buffer, meta_, pq_meta_.chunk_num, legacy_pq_layout_);
-    return quantizer ? 0 : IndexError_NoExist;
+    return DiskAnnUtil::create_quantizer_from_meta_buffer(
+        buffer, meta_, pq_meta_.chunk_num, legacy_pq_layout_, quantizer);
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }

@@ -1255,9 +1255,32 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
     ASSERT_EQ(0, memory_pool.init(budget));
     auto index = IndexFactory::CreateAndInitIndex(*param);
     ASSERT_NE(nullptr, index);
-    ASSERT_EQ(0,
-              index->open(index_name, {StorageOptions::StorageType::kBufferPool,
-                                       false, true}));
+    auto &rss_pool = zvec::ailego::MemoryLimitPool::get_instance();
+    const auto restore_rss = zvec::ailego::ScopeGuard::Make(
+        [&] { EXPECT_TRUE(rss_pool.configure_process_rss_limit(0)); });
+    const StorageOptions options{StorageOptions::StorageType::kBufferPool,
+                                 false, true};
+    if (budget == subpage_budget) {
+      // The actual RSS sample exceeds this limit. Keep the cache budget
+      // unchanged when retrying with process headroom.
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(1));
+      const size_t rss = rss_pool.process_rss();
+      ASSERT_GT(rss, rss_pool.process_rss_limit());
+      ASSERT_EQ(zvec::core::IndexError_NoMemory,
+                index->open(index_name, options));
+      ASSERT_EQ(0u, memory_pool.used());
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+    }
+    ASSERT_EQ(0, index->open(index_name, options));
+    {
+      VectorDataBuffer fetched;
+      ASSERT_EQ(0, index->fetch(kDocCount - 1, &fetched));
+      const auto &buffer = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+      ASSERT_EQ(kDimension * sizeof(float), buffer.data.size());
+      EXPECT_EQ(0, std::memcmp(buffer.data.data(),
+                               values.data() + (kDocCount - 1) * kDimension,
+                               buffer.data.size()));
+    }
     const bool cache_enabled = budget >= metadata_bytes + page_size;
     EXPECT_EQ(cache_enabled ? metadata_bytes : 0u, memory_pool.metadata_used());
     for (size_t repeat = 0; repeat < 2; ++repeat) {

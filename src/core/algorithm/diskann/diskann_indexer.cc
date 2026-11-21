@@ -65,14 +65,11 @@ DiskAnnIndexer::DiskAnnIndexer(const IndexMeta &meta) {
 
 DiskAnnIndexer::~DiskAnnIndexer() {
   destroy_io_ctx(init_ctx_);
-  if (centroid_data_) {
-    DiskAnnUtil::free_aligned(centroid_data_);
-  }
   reset_cache_storage();
 }
 
 int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
-                         turbo::Quantizer::Pointer quantizer) {
+                         turbo::Quantizer::Pointer quantizer) try {
   auto storage = entity.get_storage();
   auto vector_segment = entity.get_vector_segment();
   if (!storage || !vector_segment) {
@@ -274,12 +271,8 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
   max_degree_ = static_cast<uint32_t>(stored_max_degree);
 
   centroid_stride_ = DiskAnnUtil::round_up(meta_.element_size(), 32);
-  DiskAnnUtil::alloc_aligned(&centroid_data_,
-                             entrypoints_.size() * centroid_stride_, 32);
-  if (centroid_data_ == nullptr) {
-    LOG_ERROR("Failed to allocate entrypoint vector buffer");
-    return IndexError_NoMemory;
-  }
+  centroid_memory_.resize_array(entrypoints_.size(), centroid_stride_, 32);
+  centroid_data_ = centroid_memory_.data();
 
   ret = use_medroids_data_as_centroids();
   if (ret != 0) {
@@ -287,6 +280,8 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnIndexer::use_medroids_data_as_centroids() {
@@ -339,26 +334,22 @@ std::vector<bool> DiskAnnIndexer::read_nodes(
   std::vector<AlignedRead> read_reqs;
   read_reqs.reserve(node_ids.size());
 
-  uint8_t *buf = nullptr;
-  auto sector_num =
+  const size_t sectors_per_node =
       node_per_sector_ > 0
           ? 1
           : DiskAnnUtil::div_round_up(max_node_size_, DiskAnnUtil::kSectorSize);
-  DiskAnnUtil::alloc_aligned(
-      (void **)&buf, node_ids.size() * sector_num * DiskAnnUtil::kSectorSize,
-      DiskAnnUtil::kSectorSize);
-  if (buf == nullptr) {
-    LOG_ERROR("read_nodes: failed to allocate aligned read buffer");
-    std::fill(retval.begin(), retval.end(), false);
-    return retval;
-  }
+  ailego::ProcessRssAlignedBuffer scratch;
+  scratch.resize_array(node_ids.size(),
+                       sectors_per_node * DiskAnnUtil::kSectorSize,
+                       DiskAnnUtil::kSectorSize);
+  auto *buf = static_cast<uint8_t *>(scratch.data());
 
   for (size_t i = 0; i < node_ids.size(); ++i) {
     auto node_id = node_ids[i];
 
     AlignedRead read;
-    read.len = sector_num * DiskAnnUtil::kSectorSize;
-    read.buf = buf + i * sector_num * DiskAnnUtil::kSectorSize;
+    read.len = sectors_per_node * DiskAnnUtil::kSectorSize;
+    read.buf = buf + i * sectors_per_node * DiskAnnUtil::kSectorSize;
     read.offset =
         index_segment_offset_ +
         DiskAnnUtil::get_node_sector(node_per_sector_, max_node_size_,
@@ -373,7 +364,6 @@ std::vector<bool> DiskAnnIndexer::read_nodes(
     for (size_t i = 0; i < retval.size(); i++) {
       retval[i] = false;
     }
-    DiskAnnUtil::free_aligned(buf);
     return retval;
   }
 
@@ -406,7 +396,6 @@ std::vector<bool> DiskAnnIndexer::read_nodes(
     }
   }
 
-  DiskAnnUtil::free_aligned(buf);
 
   return retval;
 }

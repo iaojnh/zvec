@@ -6,6 +6,7 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
@@ -15,6 +16,8 @@ namespace zvec::ailego {
 
 template <typename T>
 using BudgetedVector = std::vector<T, BudgetedAllocator<T>>;
+template <typename T>
+using ProcessRssVector = std::vector<T, BudgetedAllocator<T, true>>;
 using BudgetedString =
     std::basic_string<char, std::char_traits<char>, BudgetedAllocator<char>>;
 
@@ -107,28 +110,29 @@ struct BudgetedStringWorkspace {
 
 // Non-pageable aligned workspace. Replacement is admitted before allocation,
 // while the old allocation is still charged. Failure preserves the old buffer.
-class BudgetedAlignedBuffer {
+template <bool ProcessRss>
+class BasicAlignedBuffer {
  public:
   // Small workspaces stay on the heap; large opt-in buffers use page-rounded
   // backing whose idle lifetime and committed charge are controlled by the
   // pool.
   static constexpr size_t kRetainedThreshold = 256UL << 10;
 
-  BudgetedAlignedBuffer() = default;
-  BudgetedAlignedBuffer(size_t bytes, size_t alignment) {
+  BasicAlignedBuffer() = default;
+  BasicAlignedBuffer(size_t bytes, size_t alignment) {
     resize(bytes, alignment);
   }
-  BudgetedAlignedBuffer(const BudgetedAlignedBuffer &) = delete;
-  BudgetedAlignedBuffer &operator=(const BudgetedAlignedBuffer &) = delete;
-  BudgetedAlignedBuffer(BudgetedAlignedBuffer &&rhs) noexcept {
+  BasicAlignedBuffer(const BasicAlignedBuffer &) = delete;
+  BasicAlignedBuffer &operator=(const BasicAlignedBuffer &) = delete;
+  BasicAlignedBuffer(BasicAlignedBuffer &&rhs) noexcept {
     swap(rhs);
   }
-  BudgetedAlignedBuffer &operator=(BudgetedAlignedBuffer &&rhs) noexcept {
-    BudgetedAlignedBuffer replacement(std::move(rhs));
+  BasicAlignedBuffer &operator=(BasicAlignedBuffer &&rhs) noexcept {
+    BasicAlignedBuffer replacement(std::move(rhs));
     swap(replacement);
     return *this;
   }
-  ~BudgetedAlignedBuffer() {
+  ~BasicAlignedBuffer() {
     if (retained_base_) {
       MemoryLimitPool::get_instance().release_retained_block(retained_base_);
     } else if (data_) {
@@ -153,10 +157,16 @@ class BudgetedAlignedBuffer {
     if (bytes == size_ && alignment == alignment_) return;
     if (alignment < alignof(void *) || (alignment & (alignment - 1)))
       throw std::bad_alloc();
-    BudgetedAlignedBuffer replacement;
+    BasicAlignedBuffer replacement;
     if (bytes) {
       auto &pool = MemoryLimitPool::get_instance();
-      if (bytes >= kRetainedThreshold && pool.capacity()) {
+      if constexpr (ProcessRss) {
+        replacement.memory_.allocate(bytes, [&] {
+          replacement.data_ =
+              ::operator new(bytes, std::align_val_t{alignment});
+          return bytes;
+        });
+      } else if (bytes >= kRetainedThreshold && pool.capacity()) {
         // Retained blocks provide 64-byte alignment. Larger alignments need
         // room for an interior pointer; release the original base below.
         const size_t padding =
@@ -200,7 +210,7 @@ class BudgetedAlignedBuffer {
   size_t size() const {
     return size_;
   }
-  void swap(BudgetedAlignedBuffer &rhs) noexcept {
+  void swap(BasicAlignedBuffer &rhs) noexcept {
     memory_.swap(rhs.memory_);
     std::swap(data_, rhs.data_);
     std::swap(retained_base_, rhs.retained_base_);
@@ -209,10 +219,13 @@ class BudgetedAlignedBuffer {
   }
 
  private:
-  MemoryReservation memory_;
+  std::conditional_t<ProcessRss, ProcessRssReservation, MemoryReservation>
+      memory_;
   void *data_{nullptr};
   void *retained_base_{nullptr};
   size_t size_{0};
   size_t alignment_{alignof(void *)};
 };
+using BudgetedAlignedBuffer = BasicAlignedBuffer<false>;
+using ProcessRssAlignedBuffer = BasicAlignedBuffer<true>;
 }  // namespace zvec::ailego

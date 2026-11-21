@@ -106,7 +106,7 @@ int DiskAnnStreamer::cleanup() {
   return 0;
 }
 
-int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
+int DiskAnnStreamer::open(IndexStorage::Pointer storage) try {
   LOG_INFO("DiskAnnStreamer::load Begin");
 
   if (!storage) {
@@ -187,6 +187,8 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
   LOG_INFO("DiskAnnStreamer::load Done");
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnStreamer::unload() {

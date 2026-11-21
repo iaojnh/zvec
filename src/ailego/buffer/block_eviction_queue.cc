@@ -24,6 +24,7 @@
 #include <ailego/utility/memory_helper.h>
 #include <ailego/utility/mobile_memory.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/process_rss_allocation.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 
@@ -2460,6 +2461,11 @@ bool MemoryLimitPool::try_charge_locked(size_t bytes,
   return true;
 }
 
+bool &ProcessRssAllocationScope::state() {
+  static thread_local bool active = false;
+  return active;
+}
+
 MemoryLimitPool::PendingAllocation::PendingAllocation(MemoryLimitPool &pool,
                                                       Kind kind)
     : pool_(pool),
@@ -2469,6 +2475,10 @@ MemoryLimitPool::PendingAllocation::PendingAllocation(MemoryLimitPool &pool,
                    : &pool.external_used_size_) {}
 
 MemoryLimitPool::PendingAllocation::~PendingAllocation() {
+  if (kind_ == Kind::kProcessRss) {
+    if (bytes_) pool_.finish_process_backing(bytes_, false);
+    return;
+  }
   if (bytes_ && kind_ == Kind::kEvictableCache)
     pool_.evictable_cache_size_.fetch_sub(bytes_, std::memory_order_relaxed);
   if (bytes_) pool_.release_fixed(bytes_, counter_, Backing::kPending);
@@ -2480,6 +2490,9 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(pool_.lifecycle_mutex_);
   bool reserved = false;
   switch (kind_) {
+    case Kind::kProcessRss:
+      reserved = pool_.try_reserve_process_backing(bytes);
+      break;
     case Kind::kExternal:
       reserved = pool_.try_charge_fixed(bytes, counter_, Backing::kPending);
       break;
