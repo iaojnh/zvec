@@ -14,7 +14,6 @@
 
 #include <cstring>
 #include <vector>
-#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/io/file.h>
@@ -334,27 +333,6 @@ TEST(File, MemoryMap) {
   EXPECT_TRUE(addr != nullptr);
   File::MemoryUnmap(addr, map_size);
 #endif
-}
-
-TEST(File, WritablePrivateMappingOfReadOnlyHandle) {
-  const char *path = "file_map_private_testing.tmp";
-  const auto cleanup = ScopeGuard::Make([&] { File::Delete(path); });
-  const size_t page = MemoryHelper::PageSize();
-  File file;
-  ASSERT_TRUE(file.create(path, 2 * page));
-  ASSERT_EQ(1u, file.write(page, "A", 1));
-  file.close();
-  ASSERT_TRUE(file.open(path, true));
-  auto *view =
-      static_cast<char *>(File::MemoryMap(file.native_handle(), page, page, 0));
-  ASSERT_NE(nullptr, view);
-  EXPECT_EQ('A', view[0]);
-  view[0] = 'B';
-  EXPECT_EQ('B', view[0]);
-  ASSERT_TRUE(File::TryMemoryUnmap(view, page));
-  char byte;
-  ASSERT_EQ(1u, file.read(page, &byte, 1));
-  EXPECT_EQ('A', byte);
 }
 
 TEST(File, Append) {

@@ -14,9 +14,6 @@
 #pragma once
 
 #include <map>
-#include <string_view>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
-#include <zvec/ailego/container/lazy_map.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_format.h>
@@ -41,7 +38,8 @@ class IndexMapping {
     //! Flush the segment
     bool flush() const {
       ailego_false_if_false(this->meta_ && this->data_);
-      return ailego::File::MemoryFlush(data_, mapping_size_);
+      return ailego::File::MemoryFlush(
+          this->data_, this->meta_->data_size + this->meta_->padding_size);
     }
 
     //! Retrieve mapping address of the segment
@@ -68,9 +66,8 @@ class IndexMapping {
     friend class IndexMapping;
 
     //! Set the mapping address of the segment
-    void set_data(void *addr, size_t size) {
+    void set_data(void *addr) {
       data_ = addr;
-      mapping_size_ = size;
     }
 
     //! Clear the dirty flag
@@ -82,7 +79,6 @@ class IndexMapping {
     //! Members
     IndexFormat::SegmentMeta *meta_{nullptr};
     void *data_{nullptr};
-    size_t mapping_size_{0};
     mutable bool dirty_{false};
   };
 
@@ -95,16 +91,33 @@ class IndexMapping {
   //! Constructor
   IndexMapping() = default;
 
-  IndexMapping(IndexMapping &&rhs) noexcept {
-    swap(rhs);
+  //! Constructor
+  IndexMapping(IndexMapping &&rhs)
+      : segment_ids_offset_(rhs.segment_ids_offset_),
+        segment_start_(rhs.segment_start_),
+        header_(rhs.header_),
+        footer_(rhs.footer_),
+        segments_(std::move(rhs.segments_)),
+        file_(std::move(rhs.file_)) {
+    rhs.segment_ids_offset_ = 0;
+    rhs.segment_start_ = nullptr;
+    rhs.header_ = nullptr;
+    rhs.footer_ = nullptr;
   }
-  IndexMapping &operator=(IndexMapping &&rhs) noexcept {
-    IndexMapping replacement(std::move(rhs));
-    swap(replacement);
+
+  //! Assignment
+  IndexMapping &operator=(IndexMapping &&rhs) {
+    segment_ids_offset_ = rhs.segment_ids_offset_;
+    segment_start_ = rhs.segment_start_;
+    header_ = rhs.header_;
+    footer_ = rhs.footer_;
+    segments_ = std::move(rhs.segments_);
+    file_ = std::move(rhs.file_);
+    rhs.segment_ids_offset_ = 0;
+    rhs.segment_start_ = nullptr;
+    rhs.header_ = nullptr;
+    rhs.footer_ = nullptr;
     return *this;
-  }
-  ~IndexMapping() {
-    close();
   }
 
   //! Open a index file
@@ -112,17 +125,12 @@ class IndexMapping {
 
   //! Create a index file
   int create(const std::string &path, size_t segs_size);
-  int create(const std::string &path, size_t segs_size, bool exclusive);
 
   //! Close the index
   void close();
 
   //! Refresh meta information (checksum, update time, etc.)
   void refresh(uint64_t check_point);
-
-  uint64_t check_point() const {
-    return check_point_;
-  }
 
   //! Append a segment into index
   int append(const std::string &id, size_t size);
@@ -185,6 +193,7 @@ class IndexMapping {
   bool ishugetlbfs(const std::string &path) const;
 
   int init_meta_section();
+  int init_hugepage_meta_section();
 
  public:
   //! Disable them
@@ -192,38 +201,14 @@ class IndexMapping {
   IndexMapping &operator=(const IndexMapping &) = delete;
 
  private:
-  void swap(IndexMapping &rhs) noexcept;
-  int open_mapping(const std::string &path, bool cow, bool full_mode);
-  int init_meta_section(bool exclusive);
-  size_t meta_mapping_length() const;
-  struct MetaMapping {
-    IndexFormat::MetaHeader *header;
-    size_t length;
-    size_t charge;
-    ailego::ProcessRssBudget::MaterializationStamp projection{};
-  };
-  using HeaderMap = std::map<
-      uint64_t, MetaMapping, std::less<uint64_t>,
-      ailego::BudgetedAllocator<std::pair<const uint64_t, MetaMapping>>>;
-  // Names borrow NUL-terminated bytes in the owned metadata mappings.
-  using SegmentMap =
-      std::map<std::string_view, SegmentInfo, std::less<>,
-               ailego::BudgetedAllocator<
-                   std::pair<const std::string_view, SegmentInfo>>>;
-  int map_meta_directory(size_t len, HeaderMap::node_type node,
-                         ailego::MemoryLimitPool::PendingAllocation &memory,
-                         bool anonymous);
-  int unpack_meta_directory(size_t len, uint64_t file_size);
-  static void release_meta_mapping(const MetaMapping &mapping);
   //! Members
   uint32_t segment_ids_offset_{0};
   IndexFormat::SegmentMeta *segment_start_{nullptr};
   IndexFormat::MetaHeader *header_{nullptr};
-  ailego::LazyMap<HeaderMap> header_addr_map_{};
+  std::map<uint64_t, IndexFormat::MetaHeader *> header_addr_map_{};
   IndexFormat::MetaFooter *footer_{nullptr};
-  ailego::LazyMap<SegmentMap> segments_{};
+  std::map<std::string, SegmentInfo> segments_{};
   size_t index_size_{0u};
-  uint64_t check_point_{0};
   ailego::File file_{};
   std::string path_;
   bool copy_on_write_{false};

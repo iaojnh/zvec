@@ -32,17 +32,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.11'
-
-      - name: Install CMake
-        run: |
-          # CMake 4.5 rejects the header source group in Boost.Locale 1.88.
-          python -m pip install cmake==4.4.5
-          cmake --version
-
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:

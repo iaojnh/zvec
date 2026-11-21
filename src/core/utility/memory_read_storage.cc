@@ -42,6 +42,7 @@ class MemoryReadStorage : public IndexStorage {
           padding_size_(segment.padding_size()),
           region_size_(segment.data_size() + segment.padding_size()),
           data_crc_(segment.data_crc()),
+          block_(&(*rope)[0]),
           rope_(rope) {}
 
     //! Destructor
@@ -68,38 +69,34 @@ class MemoryReadStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (offset >= region_size_ || len == 0) return 0;
-      len = std::min(len, region_size_ - offset);
-      return (*rope_)[0].fetch(data_offset_ + offset, buf, len);
+      if (ailego_unlikely(offset + len > region_size_)) {
+        if (offset > region_size_) {
+          offset = region_size_;
+        }
+        len = region_size_ - offset;
+      }
+      return block_->fetch(data_offset_ + offset, buf, len);
     }
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (offset >= region_size_ || len == 0) {
-        data.reset();
-        return 0;
+      if (ailego_unlikely(offset + len > region_size_)) {
+        if (offset > region_size_) {
+          offset = region_size_;
+        }
+        len = region_size_ - offset;
       }
-      len = std::min(len, region_size_ - offset);
       const void *data_ptr = nullptr;
-      const size_t got =
-          (*rope_)[0].read(data_offset_ + offset, &data_ptr, len);
-      data =
-          got ? MemoryBlock::MakeMappedView(const_cast<void *>(data_ptr), rope_)
-              : MemoryBlock{};
-      return got;
+      size_t return_value = block_->read(data_offset_ + offset, &data_ptr, len);
+      data.reset((void *)data_ptr);
+      return return_value;
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
-      if (count == 0) return true;
-      if (!iovec) return false;
       for (auto *end = iovec + count; iovec != end; ++iovec) {
-        if (iovec->offset > region_size_ ||
-            iovec->length > region_size_ - iovec->offset)
-          return false;
-        if ((*rope_)[0].read(data_offset_ + iovec->offset, &iovec->data,
-                             iovec->length) != iovec->length)
-          return false;
+        ailego_false_if_false(iovec->offset + iovec->length <= region_size_);
+        block_->read(data_offset_ + iovec->offset, &iovec->data, iovec->length);
       }
       return true;
     }
@@ -127,6 +124,7 @@ class MemoryReadStorage : public IndexStorage {
     size_t padding_size_{0u};
     size_t region_size_{0u};
     uint32_t data_crc_{0u};
+    IndexMemory::Block *block_{nullptr};
     IndexMemory::Rope::Pointer rope_{};
   };
 
@@ -162,32 +160,29 @@ class MemoryReadStorage : public IndexStorage {
   }
 
   //! Load a index file into container
-  int open(const std::string &path, bool) override try {
-    auto rope = IndexMemory::Instance()->open(path);
-    if (!rope) {
+  int open(const std::string &path, bool) override {
+    rope_ = IndexMemory::Instance()->open(path);
+    if (!rope_) {
       LOG_ERROR("Failed to open memory rope %s", path.c_str());
       return IndexError_NoExist;
     }
-    if (rope->empty()) {
+    if (rope_->empty()) {
       LOG_ERROR("The memory rope %s is empty.", path.c_str());
       return IndexError_NoExist;
     }
 
-    auto read_data = [&rope](size_t offset, const void **data, size_t len) {
-      return (*rope)[0].read(offset, data, len);
+    auto read_data = [this](size_t offset, const void **data, size_t len) {
+      return (*this->rope_)[0].read(offset, data, len);
     };
 
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, (*rope)[0].size(), checksum_validation_)) {
+    if (!unpacker.unpack(read_data, (*rope_)[0].size(), checksum_validation_)) {
       LOG_ERROR("Failed to unpack memory block: %s", path.c_str());
       return IndexError_UnpackIndex;
     }
-    rope_ = std::move(rope);
     segments_ = std::move(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
     return 0;
-  } catch (const std::bad_alloc &) {
-    return IndexError_NoMemory;
   }
 
   //! Unload all indexes
@@ -234,7 +229,7 @@ class MemoryReadStorage : public IndexStorage {
  private:
   bool checksum_validation_{false};
   uint32_t magic_{0};
-  IndexUnpacker::SegmentMap segments_{};
+  std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
   IndexMemory::Rope::Pointer rope_{};
 };
 

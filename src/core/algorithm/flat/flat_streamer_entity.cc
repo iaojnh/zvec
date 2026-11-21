@@ -333,8 +333,7 @@ int FlatStreamerEntity::add(uint64_t key, const void *vec, size_t size) {
   }
 
   IndexStorage::MemoryBlock head_block;
-  const int head_ret = this->get_head_block(head_block);
-  if (head_ret != 0) return head_ret;
+  this->get_head_block(head_block);
   BlockLocation block;
   {
     const BlockLocation *bl =
@@ -698,7 +697,6 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone() const {
 
 int FlatStreamerEntity::get_vector_by_position(
     uint32_t id, IndexStorage::MemoryBlock &block) const {
-  block.reset();
   if (id >= withid_key_info_map_.size()) {
     return -1;
   }
@@ -709,9 +707,7 @@ int FlatStreamerEntity::get_vector_by_position(
           index_meta_.element_size()) {
     LOG_ERROR("Failed to read vector by position, id=%u size=%u", id,
               index_meta_.element_size());
-    const int error = segment ? segment->read_error() : IndexError_ReadData;
-    block.reset();
-    return error;
+    return -1;
   }
   return 0;
 }
@@ -989,7 +985,6 @@ const void *FlatStreamerEntity::get_vector_by_key(uint64_t key) const {
 
 int FlatStreamerEntity::get_vector_by_key(
     const uint64_t key, IndexStorage::MemoryBlock &block) const {
-  block.reset();
   if (use_external_vector_) return IndexError_Unsupported;
   VectorLocation loc{};
   key_info_map_lock_->lock_shared();
@@ -1011,21 +1006,17 @@ int FlatStreamerEntity::get_vector_by_key(
   key_info_map_lock_->unlock_shared();
 
   auto segment = this->get_segment(loc.segment_id);
-  if (!segment ||
-      segment->read(loc.offset, block, index_meta_.element_size()) !=
-          index_meta_.element_size()) {
+  if (segment->read(loc.offset, block, index_meta_.element_size()) !=
+      index_meta_.element_size()) {
     LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-    const int error = segment ? segment->read_error() : IndexError_ReadData;
-    block.reset();
-    return error;
+    return -1;
   }
   return 0;
 }
 
 int FlatStreamerEntity::get_vectors_by_key(
     const uint64_t *keys, uint32_t count,
-    std::vector<IndexStorage::MemoryBlock> &blocks) const try {
-  blocks.clear();
+    std::vector<IndexStorage::MemoryBlock> &blocks) const {
   if (use_external_vector_) return IndexError_Unsupported;
   std::vector<VectorLocation> locations(count);
   key_info_map_lock_->lock_shared();
@@ -1076,15 +1067,10 @@ int FlatStreamerEntity::get_vectors_by_key(
         segment->read(loc.offset, blocks[i], index_meta_.element_size()) !=
             index_meta_.element_size()) {
       LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-      const int error = segment ? segment->read_error() : IndexError_ReadData;
-      blocks.clear();
-      return error;
+      return -1;
     }
   }
   return 0;
-} catch (const std::bad_alloc &) {
-  blocks.clear();
-  return IndexError_NoMemory;
 }
 
 int FlatStreamerEntity::retain_stable_data(
@@ -1568,12 +1554,15 @@ int FlatStreamerEntity::alloc_block(const BlockLocation &next,
 int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
                                      const void *data, size_t size) {
   IndexStorage::MemoryBlock block_header_block;
-  const int header_ret = this->get_block_header(block, block_header_block);
-  if (header_ret != 0) return header_ret;
-  BlockHeader hd = *static_cast<const BlockHeader *>(block_header_block.data());
-  block_header_block.reset();
+  this->get_block_header(block, block_header_block);
+  const BlockHeader *header =
+      reinterpret_cast<const BlockHeader *>(block_header_block.data());
+  if (ailego_unlikely(header == nullptr)) {
+    LOG_ERROR("Failed to get header");
+    return IndexError_ReadData;
+  }
 
-  if (hd.vector_count == block_vector_count()) {
+  if (header->vector_count == block_vector_count()) {
     return IndexError_IndexFull;
   }
 
@@ -1582,25 +1571,26 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
     return IndexError_WriteData;
   }
 
-  const size_t vector_off =
-      get_block_vector_offset(block.block_index, hd.vector_count);
-  const size_t key_off =
-      get_block_key_offset(block.block_index, hd.vector_count);
+  size_t vector_off =
+      get_block_vector_offset(block.block_index, header->vector_count);
   if (!use_external_vector_ && segment->write(vector_off, data, size) != size) {
     LOG_ERROR("Failed to write vector, off=%zu size=%zu", vector_off, size);
-    return segment->write_error();
-  }
-  if (segment->write(key_off, &key, sizeof(key)) != sizeof(key)) {
-    LOG_ERROR("Failed to write key, off=%zu", key_off);
-    return segment->write_error();
+    return IndexError_WriteData;
   }
 
-  // Publish the count only after the vector and key have been written.
-  ++hd.vector_count;
-  const size_t hd_off = get_block_header_offset(block.block_index);
+  size_t key_off =
+      get_block_key_offset(block.block_index, header->vector_count);
+  if (segment->write(key_off, &key, sizeof(key)) != sizeof(key)) {
+    LOG_ERROR("Failed to write key, off=%zu", key_off);
+    return IndexError_WriteData;
+  }
+
+  BlockHeader hd = *header;
+  hd.vector_count += 1;
+  size_t hd_off = get_block_header_offset(block.block_index);
   if (segment->write(hd_off, &hd, sizeof(hd)) != sizeof(hd)) {
     LOG_ERROR("Failed to write block header, off=%zu", hd_off);
-    return segment->write_error();
+    return IndexError_WriteData;
   }
 
   VectorLocation loc(block.segment_id, false, vector_off);
@@ -1643,8 +1633,7 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
   meta_dirty_ = true;
   if (id >= vector_count()) {
     IndexStorage::MemoryBlock head_block;
-    const int head_ret = this->get_head_block(head_block);
-    if (head_ret != 0) return head_ret;
+    this->get_head_block(head_block);
     BlockLocation block =
         *reinterpret_cast<const BlockLocation *>(head_block.data());
     // Release buffer-pool pin before any alloc_block() call that may trigger

@@ -13,7 +13,6 @@
 // limitations under the License.
 #pragma once
 
-#include <shared_mutex>
 #include <ailego/parallel/lock.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_provider.h>
@@ -250,8 +249,6 @@ class HnswStreamer : public IndexStreamer {
 
   //! Bind the distance functions and inline record layout used for search
   void bind_search_dist_space(HnswContext *ctx) const;
-  std::shared_lock<std::shared_mutex> lock_buffered_reads() const;
-  std::unique_lock<std::shared_mutex> lock_buffered_writes();
 
  private:
   enum State { STATE_INIT = 0, STATE_INITED = 1, STATE_OPENED = 2 };
@@ -326,9 +323,6 @@ class HnswStreamer : public IndexStreamer {
 
   //! avoid add vector while dumping index
   ailego::SharedMutex shared_mutex_{};
-  // Buffered graph updates can be rolled back. Keep readers and other
-  // writers out until the insert commits or the old graph is restored.
-  mutable std::shared_mutex buffered_graph_mutex_;
 };
 
 }  // namespace core

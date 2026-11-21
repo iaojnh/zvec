@@ -29,11 +29,10 @@ endif()
 
 foreach(CC_SRCS ${ALL_TEST_SRCS})
   get_filename_component(CC_TARGET ${CC_SRCS} NAME_WE)
-  # These tests require Linux io_uring or libaio. Do not register Linux-only
-  # targets elsewhere: mobile CI intentionally rejects zero-test suites.
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-     (CC_TARGET STREQUAL "iouring_loader_test" OR CC_TARGET STREQUAL
-      "vector_page_table_bypass_aio_test"))
+  # io_uring is only enabled on Linux. Do not create an empty test binary on
+  # other platforms: mobile CI intentionally rejects zero-test suites.
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CC_TARGET STREQUAL
+     "iouring_loader_test")
     continue()
   endif()
   set(CC_TEST_LIBS zvec_ailego)

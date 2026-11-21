@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstddef>
 #include <ailego/utility/memory_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_helper.h>
-#include <zvec/core/framework/index_parsing_input.h>
 
 namespace zvec {
 namespace core {
@@ -78,25 +76,13 @@ int IndexHelper::DeserializeFromStorage(IndexStorage *storage,
     return IndexError_NoExist;
   }
 
-  const uint32_t crc = segment->data_crc();
-  const size_t len = segment->data_size();
-  // The serialized header alone is over 4 KiB. A small metadata record can
-  // still be parsed when the storage cannot allocate a page-aligned view.
-  alignas(std::max_align_t) char local[8192];
-  IndexParsingInput input(local, sizeof(local));
+  uint32_t crc = segment->data_crc();
+  size_t len = segment->data_size();
   IndexStorage::MemoryBlock block;
-  const void *data;
-  if (segment->read_for_parsing(0, block, len) == len) {
-    data = block.data();
-  } else {
-    const int error = segment->read_error();
-    if (error != IndexError_NoMemory) return error;
-    block.reset();
-    if (!input.prepare(len)) return IndexError_NoMemory;
-    if (segment->fetch_for_parsing(0, input.data(), len) != len)
-      return segment->read_error();
-    data = input.data();
+  if (segment->read(0, block, len) != len) {
+    return IndexError_ReadData;
   }
+  const void *data = block.data();
   if (crc != 0u && ailego::Crc32c::Hash(data, len, 0u) != crc) {
     return IndexError_InvalidChecksum;
   }

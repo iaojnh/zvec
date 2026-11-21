@@ -13,7 +13,6 @@
 // limitations under the License.
 #pragma once
 
-#include <algorithm>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -66,8 +65,13 @@ class IndexMemory {
 
     //! Write data into the block
     size_t write(size_t off, const void *data, size_t len) {
-      if (off >= buffer_.size() || !len) return 0;
-      len = std::min(len, buffer_.size() - off);
+      size_t region_size = buffer_.size();
+      if (off + len > region_size) {
+        if (off > region_size) {
+          off = region_size;
+        }
+        len = region_size - off;
+      }
       std::copy(reinterpret_cast<const uint8_t *>(data),
                 reinterpret_cast<const uint8_t *>(data) + len,
                 buffer_.data() + off);
@@ -76,23 +80,28 @@ class IndexMemory {
 
     //! Fetch data from the storage (with own buffer)
     size_t fetch(size_t off, void *buf, size_t len) const {
-      const size_t region_size = buffer_.size();
-      if (off >= region_size || len == 0) return 0;
-      len = std::min(len, region_size - off);
-      std::copy(buffer_.data() + off, buffer_.data() + off + len,
+      size_t region_size = buffer_.size();
+      if (off + len > region_size) {
+        if (off > region_size) {
+          off = region_size;
+        }
+        len = region_size - off;
+      }
+      std::copy(buffer_.data(), buffer_.data() + len,
                 reinterpret_cast<uint8_t *>(buf));
       return len;
     }
 
     //! Read data from the storage (Zero-copy)
     size_t read(size_t off, const void **data, size_t len) {
-      if (buffer_.empty()) {
-        *data = nullptr;
-        return 0;
+      size_t region_size = buffer_.size();
+      if (off + len > region_size) {
+        if (off > region_size) {
+          off = region_size;
+        }
+        len = region_size - off;
       }
-      off = std::min(off, buffer_.size());
       *data = buffer_.data() + off;
-      len = std::min(len, buffer_.size() - off);
       return len;
     }
 

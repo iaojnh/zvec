@@ -152,8 +152,8 @@ struct Neighbors {
   Neighbors(uint32_t cnt_in, const node_id_t *data_in)
       : cnt{cnt_in}, data{data_in} {}
 
-  Neighbors(IndexStorage::MemoryBlock mem_block)
-      : neighbor_block{std::move(mem_block)} {
+  Neighbors(const IndexStorage::MemoryBlock &mem_block)
+      : neighbor_block{mem_block} {
     auto hd = reinterpret_cast<const NeighborsHeader *>(neighbor_block.data());
     cnt = hd->neighbor_cnt;
     data = hd->neighbors;
@@ -502,10 +502,9 @@ class HnswEntity {
 
   //! Append neighbor_id to node id neighbors on level, size is the current
   //! neighbors size. Notice: the caller must be ensure the neighbors not full
-  virtual int add_neighbor(level_t /*level*/, node_id_t /*id*/,
-                           uint32_t /*size*/, node_id_t /*neighbor_id*/) {
+  virtual void add_neighbor(level_t /*level*/, node_id_t /*id*/,
+                            uint32_t /*size*/, node_id_t /*neighbor_id*/) {
     LOG_ERROR("Add neighbor not implemented");
-    return IndexError_NotImplemented;
   }
 
   //! Update entry point and max level

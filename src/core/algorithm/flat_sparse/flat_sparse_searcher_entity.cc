@@ -85,7 +85,7 @@ int FlatSparseSearcherEntity::load_container(
   if (ailego_unlikely(segment->read(0, data, sizeof(meta_)) != sizeof(meta_))) {
     LOG_ERROR("Failed to read meta segment %s",
               PARAM_FLAT_SPARSE_META_SEG_ID.c_str());
-    return segment->read_error();
+    return IndexError_ReadData;
   }
   meta_ = *(reinterpret_cast<const decltype(meta_) *>(data.data()));
 
@@ -149,14 +149,13 @@ int FlatSparseSearcherEntity::get_sparse_vector_ptr_by_id(
                           offset_chunk_offset, offset_info,
                           offset_size_per_node()) != offset_size_per_node())) {
     LOG_ERROR("Read offset info failed, offset=%u", offset_chunk_offset);
-    return sparse_offset_chunk_->read_error();
+    return IndexError_ReadData;
   };
 
   // sparse offset
   uint64_t sparse_offset = *(uint64_t *)offset_info.data();
   uint32_t sparse_vector_len =
       *(uint32_t *)((uint8_t *)offset_info.data() + sizeof(uint64_t));
-  offset_info.reset();
 
   if (sparse_vector_len > 0) {
     const void *sparse_data =

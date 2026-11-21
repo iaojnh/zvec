@@ -19,7 +19,6 @@
 #include <string>
 #include <vector>
 #include <turbo/quantizer/quantizer.h>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_framework.h>
 #include "diskann_entity.h"
@@ -249,9 +248,10 @@ class DiskAnnUtil {
   //! Leading chunks carry any remainder dimensions, matching legacy chunking.
   //! Both sides work in squared euclidean space, and the
   //! writers of this layout always persisted a zero mean.
-  static int legacy_pq_codebook_to_centroids(
-      const std::string &meta_buffer, const IndexMeta &quantizer_meta,
-      uint32_t chunk_num, ailego::ProcessRssVector<char> *centroids) try {
+  static int legacy_pq_codebook_to_centroids(const std::string &meta_buffer,
+                                             const IndexMeta &quantizer_meta,
+                                             uint32_t chunk_num,
+                                             std::string *centroids) {
     constexpr size_t kClusterNum = 256;
 
     const size_t dim = quantizer_meta.dimension();
@@ -281,7 +281,7 @@ class DiskAnnUtil {
     const char *mean = pivots + pivot_bytes;
     // Copied out instead of cast in place: the offsets are not guaranteed to be
     // aligned inside the buffer.
-    ailego::ProcessRssVector<uint32_t> offsets(offset_count, 0);
+    std::vector<uint32_t> offsets(offset_count, 0);
     std::memcpy(offsets.data(), mean + mean_bytes, offset_bytes);
     for (size_t m = 0; m <= chunk_num; ++m) {
       if (offsets[m] != m * sub_dim + std::min(m, remainder)) {
@@ -315,8 +315,6 @@ class DiskAnnUtil {
     }
 
     return 0;
-  } catch (const std::bad_alloc &) {
-    return IndexError_NoMemory;
   }
 
   //! Construct the quantizer persisted in `meta_buffer`, picking the
@@ -325,44 +323,47 @@ class DiskAnnUtil {
   //! `index_meta` before deserialize(), so the metric policy comes from the
   //! meta instead of the default-constructed one. The layout comes from the
   //! DiskAnn header; legacy codebooks are adopted after repacking.
-  static int create_quantizer_from_meta_buffer(
+  static turbo::Quantizer::Pointer create_quantizer_from_meta_buffer(
       std::string &meta_buffer, const IndexMeta &index_meta, uint32_t chunk_num,
-      bool legacy, turbo::Quantizer::Pointer &result) try {
+      bool legacy) {
     const char *name = legacy ? "PqInt8Quantizer"
                               : quantizer_name_from_meta_buffer(meta_buffer);
-    if (!name) return IndexError_InvalidFormat;
+    if (name == nullptr) {
+      LOG_ERROR("Unsupported or corrupted quantizer meta buffer");
+      return turbo::Quantizer::Pointer();
+    }
     auto quantizer = IndexFactory::CreateQuantizer(name);
-    if (!quantizer) return IndexError_NoExist;
+    if (!quantizer) {
+      LOG_ERROR("Create quantizer %s failed", name);
+      return turbo::Quantizer::Pointer();
+    }
     IndexMeta init_meta;
-    int ret = quantizer_init_meta(index_meta, &init_meta);
-    if (ret != 0) return ret;
-
+    if (quantizer_init_meta(index_meta, &init_meta) != 0) {
+      return turbo::Quantizer::Pointer();
+    }
     ailego::Params params;
     params.set("num_chunk", chunk_num);
-    params.set(turbo::kQuantizerProcessRssWorkspace, true);
-    ret = quantizer->init(init_meta, params);
-    if (ret != 0) {
-      LOG_ERROR("DiskAnn quantizer %s initialization failed, ret=%d", name,
-                ret);
-      return ret;
+    if (quantizer->init(init_meta, params) != 0) {
+      LOG_ERROR("Quantizer %s init failed", name);
+      return turbo::Quantizer::Pointer();
     }
     if (legacy) {
-      ailego::ProcessRssVector<char> centroids;
-      ret = legacy_pq_codebook_to_centroids(meta_buffer, init_meta, chunk_num,
-                                            &centroids);
-      if (ret != 0) return ret;
-      ret = quantizer->import_codebook(centroids.data(), centroids.size());
-    } else {
-      ret = quantizer->deserialize(meta_buffer);
+      std::string centroids;
+      if (legacy_pq_codebook_to_centroids(meta_buffer, init_meta, chunk_num,
+                                          &centroids) != 0) {
+        return turbo::Quantizer::Pointer();
+      }
+      if (quantizer->import_codebook(centroids.data(), centroids.size()) != 0) {
+        LOG_ERROR("Quantizer %s legacy codebook import failed", name);
+        return turbo::Quantizer::Pointer();
+      }
+      return quantizer;
     }
-    if (ret != 0) {
-      LOG_ERROR("DiskAnn quantizer %s load failed, ret=%d", name, ret);
-      return ret;
+    if (quantizer->deserialize(meta_buffer) != 0) {
+      LOG_ERROR("Quantizer %s deserialize failed", name);
+      return turbo::Quantizer::Pointer();
     }
-    result = std::move(quantizer);
-    return 0;
-  } catch (const std::bad_alloc &) {
-    return IndexError_NoMemory;
+    return quantizer;
   }
 };
 

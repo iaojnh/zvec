@@ -161,10 +161,8 @@ int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size,
 int ChunkBroker::close() {
   // A loaded, unmodified index must not acquire a new timestamp on close.
   // Storage can still be dirty for a newly created index with no vectors.
-  const int ret = stg_ && (dirty_ || stg_->is_dirty()) ? flush(0UL) : 0;
-  if (ret != 0) return ret;
+  int ret = stg_ && (dirty_ || stg_->is_dirty()) ? flush(0UL) : 0;
 
-  chunk_meta_segment_.reset();
   stg_.reset();
   check_crc_ = false;
   dirty_ = false;
@@ -182,7 +180,6 @@ int ChunkBroker::flush(uint64_t checkpoint) {
       chunk_meta_segment_->write(0UL, &chunk_meta_, sizeof(HnswChunkMeta));
   if (ailego_unlikely(size != sizeof(HnswChunkMeta))) {
     LOG_ERROR("Storage write data failed, wsize=%zu", size);
-    return chunk_meta_segment_->write_error();
   }
 
   stg_->refresh(checkpoint);
@@ -206,23 +203,20 @@ std::pair<int, Chunk::Pointer> ChunkBroker::alloc_chunk(int type,
     return std::make_pair(IndexError_Uninitialized, chunk);
   }
 
-  size = (size + page_mask_) & (~page_mask_);
-  // A previous attempt can have allocated the segment before failing to
-  // publish its metadata or obtain a wrapper.
+  //! check exist a empty chunk with the same name
   chunk = get_chunk(type, seq_id);
   if (chunk) {
-    if (ailego_unlikely(chunk->capacity() != size ||
-                        chunk->data_size() != 0UL)) {
+    if (ailego_unlikely(chunk->capacity() == size &&
+                        chunk->data_size() == 0UL)) {
       LOG_ERROR("Exist invalid chunk size %zu, expect size %zu",
                 chunk->capacity(), size);
       chunk.reset();
       return std::make_pair(IndexError_Runtime, chunk);
     }
-    if (chunk_meta_segment_->write(0, &chunk_meta_, sizeof(chunk_meta_)) !=
-        sizeof(chunk_meta_))
-      return {chunk_meta_segment_->write_error(), nullptr};
     return std::make_pair(0, chunk);
   }
+  //! align to page size
+  size = (size + page_mask_) & (~page_mask_);
   if (ailego_unlikely(chunk_meta_.total_size + size >= max_chunks_size_)) {
     LOG_ERROR("No space to new a chunk, curIndexSize=%zu allocSize=%zu",
               (size_t)chunk_meta_.total_size, size);
@@ -242,7 +236,6 @@ std::pair<int, Chunk::Pointer> ChunkBroker::alloc_chunk(int type,
   size = chunk_meta_segment_->write(0UL, &chunk_meta_, sizeof(HnswChunkMeta));
   if (ailego_unlikely(size != sizeof(HnswChunkMeta))) {
     LOG_ERROR("Storage append segment failed, wsize=%zu", size);
-    return {chunk_meta_segment_->write_error(), nullptr};
   }
 
   chunk = get_chunk(type, seq_id);

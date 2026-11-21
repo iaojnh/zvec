@@ -62,7 +62,7 @@ class PqOpq {
   //! Retains the existing rotator blob format; disabled OPQ has an empty blob.
   int serialize(std::string *out) const;
   int deserialize(uint8_t rotate_type, uint32_t dim, const void *data,
-                  size_t len, bool process_rss = false);
+                  size_t len);
 
  private:
   void rotate_batch(const float *input, size_t num, float *output) const;
@@ -76,11 +76,11 @@ class PqOpq {
 //! Reconstruct packed fp32 training vectors from a PQ codebook. chunk_dim(m)
 //! supports both uniform blocks and PQ-int8's unequal blocks. Centroid pointers
 //! must already be refreshed by the quantizer after training its codebook.
-template <size_t NumCentroids, typename CentroidPointers, typename ChunkDim>
-float pq_reconstruct_batch(const float *rotated, size_t num, size_t dim,
-                           const CentroidPointers &centroid_ptrs,
-                           const BatchDistanceFunc &l2_batch,
-                           ChunkDim chunk_dim, float *x_hat) {
+template <size_t NumCentroids, typename ChunkDim>
+float pq_reconstruct_batch(
+    const float *rotated, size_t num, size_t dim,
+    const std::vector<std::vector<const void *>> &centroid_ptrs,
+    const BatchDistanceFunc &l2_batch, ChunkDim chunk_dim, float *x_hat) {
   float dists[NumCentroids];
   double sum_err = 0.0;
   for (size_t i = 0; i < num; ++i) {

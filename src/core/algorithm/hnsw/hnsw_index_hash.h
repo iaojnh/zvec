@@ -60,14 +60,15 @@ class HnswIndexHashMap {
       return nullptr;
     }
 
-    template <typename Write>
-    int update(const_iterator it, const Item &value, Write &&write) {
-      const size_t offset = reinterpret_cast<const uint8_t *>(it) -
-                            reinterpret_cast<const uint8_t *>(items_);
-      auto *mirror = const_cast<iterator>(it);
-      const int ret = write(*chunk_, offset, &value, sizeof(value), mirror);
-      if (ret == 0) *mirror = value;
-      return ret;
+    bool update(const_iterator it) {
+      uint32_t offset = reinterpret_cast<const uint8_t *>(it) -
+                        reinterpret_cast<const uint8_t *>(&items_[0]);
+      if (ailego_unlikely(chunk_->write(offset, it, sizeof(Item)) !=
+                          sizeof(Item))) {
+        LOG_ERROR("Chunk write failed");
+        return false;
+      }
+      return true;
     }
 
    private:
@@ -137,54 +138,50 @@ class HnswIndexHashMap {
   }
 
   bool insert(key_type key, val_type val) {
-    return insert_with(key, val,
-                       [](Chunk &chunk, size_t offset, const void *data,
-                          size_t len, void *) {
-                         return chunk.write(offset, data, len) == len
-                                    ? 0
-                                    : chunk.write_error();
-                       }) == 0;
-  }
-
-  template <typename Write>
-  int insert_with(key_type key, val_type val, Write &&write) {
     auto idx = key >> mask_bits_;
     if (idx >= slots_.size()) {
       if (ailego_unlikely(idx >= slots_.capacity())) {
-        return IndexError_IndexFull;
+        return false;
       }
       for (auto i = slots_.size(); i <= idx; ++i) {
-        const int ret = alloc_slot(i);
-        if (ret != 0) return ret;
+        if (ailego_unlikely(!alloc_slot(i))) {
+          return false;
+        }
       }
     }
     auto it = slots_[idx].find(key, slot_items_, slot_loc_mask_);
     if (ailego_unlikely(it == nullptr)) {
-      return IndexError_IndexFull;
+      return false;
     }
-    return slots_[idx].update(it, Item{key, val}, std::forward<Write>(write));
+
+    //! TODO: write memory is ok?
+    const_cast<iterator>(it)->first = key;
+    const_cast<iterator>(it)->second = val;
+
+    return slots_[idx].update(it);
   }
 
  private:
-  int alloc_slot(size_t idx) {
+  bool alloc_slot(size_t idx) {
     ailego_assert_with(idx == slots_.size(), "invalid idx");
 
     size_t size = slot_items_ * sizeof(Item);
-    // Allocate the in-memory mirror before publishing a persistent chunk.
-    std::vector<char> local_buf(size, 0);
     auto p =
         broker_->alloc_chunk(ChunkBroker::CHUNK_TYPE_NEIGHBOR_INDEX, idx, size);
     if (ailego_unlikely(p.first != 0)) {
       LOG_ERROR("Alloc data chunk failed");
-      return p.first;
+      return false;
     }
     Chunk::Pointer chunk = p.second;
     if (ailego_unlikely(chunk->resize(size) != size)) {
       LOG_ERROR("Chunk resize failed, size=%zu", size);
-      return IndexError_WriteData;
+      return false;
     }
+    //! Use a local zero-initialized buffer; new chunks contain all zeros,
+    //! so no buffer-pool read is needed and no ref_count is pinned.
+    std::vector<char> local_buf(size, 0);
     slots_.emplace_back(std::move(chunk), std::move(local_buf));
-    return 0;
+    return true;
   }
 
   int load() {

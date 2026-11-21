@@ -479,7 +479,7 @@ class FlatStreamerEntity {
     if (hd_segment->read(0, header_block, sizeof(BlockLocation)) !=
         sizeof(BlockLocation)) {
       LOG_ERROR("Failed to read head block location");
-      return hd_segment->read_error();
+      return -1;
     }
     return 0;
   }
@@ -494,7 +494,7 @@ class FlatStreamerEntity {
     if (segment->read(off, header_block, sizeof(BlockHeader)) !=
         sizeof(BlockHeader)) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
-      return segment->read_error();
+      return -1;
     }
     return 0;
   }

@@ -32,22 +32,6 @@ class MemoryReservation {
   void add(size_t bytes) {
     add(bytes, 0);
   }
-  // Optional bookkeeping for backing that already exists. No allocation or
-  // materialization is performed here, and refusal must not wait.
-  bool try_add(size_t bytes) {
-    auto &pool = MemoryLimitPool::get_instance();
-    if (!bytes || !pool.capacity()) return true;
-    using Pending = MemoryLimitPool::PendingAllocation;
-    Pending pending(pool, Pending::Kind::kLockedExternal);
-    if (bytes > std::numeric_limits<size_t>::max() - bytes_ ||
-        !pending.reserve(bytes))
-      return false;
-    // The backing predates this reservation. Do not claim a fresh-allocation
-    // residency witness when this bookkeeping charge is eventually released.
-    pending.commit();
-    bytes_ += bytes;
-    return true;
-  }
   void add(size_t bytes, size_t materialization) {
     if (!bytes && !materialization) return;
     auto &pool = MemoryLimitPool::get_instance();
@@ -67,15 +51,10 @@ class MemoryReservation {
   // allocation into this owner's lifetime accounting.
   template <typename Allocate>
   void add_for_allocation(size_t bytes, Allocate allocate) {
-    add_for_allocation(bytes, std::move(allocate), true);
-  }
-  template <typename Allocate>
-  void add_for_allocation(size_t bytes, Allocate allocate, bool required) {
     auto &pool = MemoryLimitPool::get_instance();
     const size_t charge = pool.capacity() ? bytes : 0;
     using Pending = MemoryLimitPool::PendingAllocation;
-    Pending pending(pool, required ? Pending::Kind::kWorkspace
-                                   : Pending::Kind::kLockedExternal);
+    Pending pending(pool, Pending::Kind::kWorkspace);
     if (charge > std::numeric_limits<size_t>::max() - bytes_ ||
         !pending.reserve(charge))
       throw std::bad_alloc();

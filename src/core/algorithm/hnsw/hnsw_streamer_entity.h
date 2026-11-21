@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -23,7 +22,6 @@
 #include <sys/mman.h>
 #endif
 #include <ailego/parallel/lock.h>
-#include <ailego/pattern/scope_guard.h>
 #include <sparsehash/dense_hash_map>
 #include <sparsehash/dense_hash_set>
 #include <zvec/ailego/container/heap.h>
@@ -88,24 +86,14 @@ class HnswStreamerEntity : public HnswEntity {
   //! Add vector and id to hnsw entity
   int add_vector_with_id(level_t level, node_id_t id, const void *vec) override;
 
-  // BufferStorage inserts can fail after writing more than one graph record.
-  // Run the graph update before publishing the vector and roll back all writes
-  // on error.
-  int insert_buffered(level_t level, key_t key, const void *vec,
-                      bool explicit_id,
-                      const std::function<int(node_id_t)> &add_to_graph);
-  int mutation_error() const {
-    return mutation_error_;
-  }
-
   int update_neighbors(
       level_t level, node_id_t id,
       const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
-  int add_neighbor(level_t level, node_id_t id, uint32_t size,
-                   node_id_t neighbor_id) override;
+  void add_neighbor(level_t level, node_id_t id, uint32_t size,
+                    node_id_t neighbor_id) override;
 
   //! Dump index by dumper
   int dump(const IndexDumper::Pointer &dumper) override;
@@ -410,13 +398,6 @@ class HnswStreamerEntity : public HnswEntity {
     return level * upper_neighbor_size_;
   }
 
-  struct InsertUndo;
-  void remember_size(Chunk &chunk);
-  int write_with_undo(Chunk &chunk, const IndexStorage::SegmentData *writes,
-                      size_t count, void *mirror = nullptr);
-
-  int write_node_data(Chunk &chunk, size_t offset, const void *vec, key_t key);
-
   //! Add upper neighbor header and reserve space for upper neighbor
   int add_upper_neighbor(level_t level, node_id_t id) {
     if (level == 0) {
@@ -464,16 +445,8 @@ class HnswStreamerEntity : public HnswEntity {
     meta.bits.level = level;
     meta.bits.index = (chunk_index << upper_neighbor_mask_bits_) |
                       (chunk_offset / upper_neighbor_size_);
-    remember_size(*chunk);
-    const size_t zero_start = chunk_offset;
-    chunk_offset += neighbors_size;
-
-    // A short write can advance data_size into this slot. Keep the next
-    // allocation aligned to a complete upper-neighbor record on failure.
-    bool published = false;
-    const auto restore = ailego::ScopeGuard::Make([&] {
-      if (!published) chunk->resize(zero_start);
-    });
+    size_t zero_start = chunk_offset;
+    chunk_offset += upper_neighbor_size_ * level;
 
     // IMPORTANT: order matters here.
     // 1) resize so the chunk's data_size covers the new region.
@@ -498,19 +471,14 @@ class HnswStreamerEntity : public HnswEntity {
     if (ailego_unlikely(chunk->write(zero_start, zeros.data(),
                                      neighbors_size) != neighbors_size)) {
       LOG_ERROR("Chunk write zeros failed");
-      return chunk->write_error();
+      return IndexError_Runtime;
     }
 
-    const int ret = upper_neighbor_index_->insert_with(
-        id, meta.data,
-        [this](Chunk &index, size_t offset, const void *data, size_t length,
-               void *mirror) {
-          const IndexStorage::SegmentData write{offset, length, data};
-          return write_with_undo(index, &write, 1, mirror);
-        });
-    if (ailego_unlikely(ret != 0)) return ret;
+    if (ailego_unlikely(!upper_neighbor_index_->insert(id, meta.data))) {
+      LOG_ERROR("HashMap insert value failed");
+      return IndexError_Runtime;
+    }
 
-    published = true;
     return 0;
   }
 
@@ -648,8 +616,6 @@ class HnswStreamerEntity : public HnswEntity {
   static constexpr uint64_t kUpperHashMemoryInflateRatio = 2.0f;
 
  protected:
-  InsertUndo *insert_undo_{nullptr};
-  int mutation_error_{0};
   IndexStreamer::Stats &stats_;
   std::mutex mutex_{};
   //! Guards upper_neighbor_index_ and upper_neighbor_chunks_ against

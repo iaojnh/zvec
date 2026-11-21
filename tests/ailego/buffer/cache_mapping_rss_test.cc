@@ -365,33 +365,6 @@ TEST_F(CacheMappingRssTest, QueueSlotsSpendTheirExistingMappingReservation) {
 
 #if (defined(__linux__) && !defined(__ANDROID__)) || \
     (defined(__APPLE__) && TARGET_OS_OSX)
-TEST_F(CacheMappingRssTest, HeapWitnessFollowsOnlyWholeLivePages) {
-  const size_t page = MemoryHelper::PageSize();
-  const size_t bytes = 4 * page;
-  MemoryReservation charge;
-  void *allocation = nullptr;
-  charge.add_for_allocation(bytes, [&] {
-    allocation = ailego_aligned_malloc(bytes, page);
-    if (!allocation) throw std::bad_alloc();
-  });
-  auto cleanup = ScopeGuard::Make([&] { ailego_aligned_free(allocation); });
-  std::memset(allocation, 0x51, bytes);
-  const auto sample = [] {
-    return MemoryLimitPoolTestPeer::sample(true).owned_resident;
-  };
-  const size_t initial = sample();
-  MemoryLimitPool::HeapResidentRange first;
-  MemoryLimitPool::HeapResidentRange second;
-  // Both end pages contain bytes outside the observed range.
-  first.observe(static_cast<char *>(allocation) + 1, bytes - 2);
-  EXPECT_EQ(initial + 2 * page, sample());
-  second.take(first);
-  first.reset();
-  EXPECT_EQ(initial + 2 * page, sample());
-  second.reset();
-  EXPECT_EQ(initial, sample());
-}
-
 TEST_F(CacheMappingRssTest, PermanentNativeAllowanceKeepsQueueBackingCharged) {
   ASSERT_EXIT(
       ([] {

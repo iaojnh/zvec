@@ -78,16 +78,13 @@ const void *VamanaStreamerEntity::get_extra_values(node_id_t id) const {
 
 int VamanaStreamerEntity::get_vector(const node_id_t id,
                                      IndexStorage::MemoryBlock &block) const {
-  block.reset();
   auto loc = get_vector_chunk_loc(id);
   if (ailego_unlikely(loc.first >= node_chunks_.size()))
     return IndexError_NoExist;
   size_t ret = node_chunks_[loc.first]->read(loc.second, block, vector_size());
   if (ailego_unlikely(ret != vector_size())) {
     LOG_ERROR("Read vector failed, ret=%zu", ret);
-    const int error = node_chunks_[loc.first]->read_error();
-    block.reset();
-    return error;
+    return IndexError_ReadData;
   }
   return 0;
 }
@@ -110,20 +107,13 @@ int VamanaStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
 
 int VamanaStreamerEntity::get_vector(
     const node_id_t *ids, uint32_t count,
-    std::vector<IndexStorage::MemoryBlock> &vec_blocks) const try {
-  vec_blocks.clear();
+    std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
   for (uint32_t i = 0; i < count; ++i) {
     int ret = get_vector(ids[i], vec_blocks[i]);
-    if (ailego_unlikely(ret != 0)) {
-      vec_blocks.clear();
-      return ret;
-    }
+    if (ailego_unlikely(ret != 0)) return ret;
   }
   return 0;
-} catch (const std::bad_alloc &) {
-  vec_blocks.clear();
-  return IndexError_NoMemory;
 }
 
 const Neighbors VamanaStreamerEntity::get_neighbors(node_id_t id) const {

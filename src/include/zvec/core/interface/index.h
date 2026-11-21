@@ -254,8 +254,8 @@ class ZVEC_CORE_API Index {
   }
 
  protected:
-  bool init_context(int *status = nullptr);
-  core::IndexContext::Pointer &acquire_context(int *status = nullptr);
+  bool init_context();
+  core::IndexContext::Pointer &acquire_context();
 
  protected:
   bool is_trained_{false};
