@@ -1366,9 +1366,13 @@ void DiskAnnRssAdmissionFixture::verify_refine_admission_and_retry() {
     ASSERT_EQ(10u, result.doc_list_.size());
     const uint64_t previous = result.doc_list_.front().key();
 
-    // Each thread creates its own DiskANN query context. Both ID entry points
-    // must preserve an existing output when that first allocation is refused.
-    std::thread cold_ids([&] {
+    // Cover both a cold context and recreation after switching indexes on
+    // the same worker. In BP the latter reuses the existing index/thread slot.
+    std::thread query_ids([&] {
+      auto other_index = open(storage);
+      ASSERT_NE(nullptr, other_index);
+      const auto close_other =
+          ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, other_index->close()); });
       const auto restore = ailego::ScopeGuard::Make(
           [&] { EXPECT_TRUE(rss.configure_process_rss_limit(kHighLimit)); });
       std::array<int64_t, 10> ids;
@@ -1379,23 +1383,32 @@ void DiskAnnRssAdmissionFixture::verify_refine_admission_and_retry() {
       const auto original_scores = scores;
       auto graph_query = param_for_query();
       graph_query->fetch_vector = false;
-      ASSERT_TRUE(rss.configure_process_rss_limit(1));
-      ASSERT_GT(rss.process_rss(), rss.process_rss_limit());
-      for (const auto &params : {graph_query, query}) {
-        EXPECT_EQ(core::IndexError_NoMemory, index->search_internal_ids(
-                                                input, params, ids.data(),
-                                                scores.data()));
-        EXPECT_EQ(original_ids, ids);
-        EXPECT_EQ(original_scores, scores);
-      }
-      ASSERT_TRUE(rss.configure_process_rss_limit(kHighLimit));
-      for (const auto &params : {graph_query, query}) {
-        ASSERT_EQ(0, index->search_internal_ids(input, params, ids.data(),
-                                               scores.data()));
-        EXPECT_EQ(static_cast<int64_t>(previous), ids.front());
+      for (bool switch_index : {false, true}) {
+        SCOPED_TRACE(switch_index ? "retained slot" : "cold context");
+        if (switch_index) {
+          ASSERT_EQ(0, other_index->search_internal_ids(
+                           input, graph_query, ids.data(), scores.data()));
+        }
+        ids = original_ids;
+        scores = original_scores;
+        ASSERT_TRUE(rss.configure_process_rss_limit(1));
+        ASSERT_GT(rss.process_rss(), rss.process_rss_limit());
+        for (const auto &params : {graph_query, query}) {
+          EXPECT_EQ(core::IndexError_NoMemory, index->search_internal_ids(
+                                                  input, params, ids.data(),
+                                                  scores.data()));
+          EXPECT_EQ(original_ids, ids);
+          EXPECT_EQ(original_scores, scores);
+        }
+        ASSERT_TRUE(rss.configure_process_rss_limit(kHighLimit));
+        for (const auto &params : {graph_query, query}) {
+          ASSERT_EQ(0, index->search_internal_ids(input, params, ids.data(),
+                                                 scores.data()));
+          EXPECT_EQ(static_cast<int64_t>(previous), ids.front());
+        }
       }
     });
-    cold_ids.join();
+    query_ids.join();
 
     ASSERT_TRUE(rss.configure_process_rss_limit(1));
     ASSERT_GT(rss.process_rss(), rss.process_rss_limit());

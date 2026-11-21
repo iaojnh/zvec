@@ -1505,7 +1505,6 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   std::atomic<uint64_t> hits{0}, misses{0}, fills{0}, replacements{0};
   std::atomic<uint64_t> io_calls{0}, io_bytes{0}, copied{0}, workspace_waits{0};
   std::atomic<uint64_t> trims{0};
-  std::atomic<bool> prefetch_enabled{true};
   std::atomic<uint64_t> prefetch_submitted{0}, prefetch_consumed{0},
       prefetch_failed{0};
   std::atomic<uint64_t> prefetch_wait_ns{0}, prefetch_peak_requests{0},
@@ -1614,8 +1613,7 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
                     CachePriority priority) override {
     if (offset > size_ || len > size_ - offset) return false;
 #if defined(__linux__) && !defined(__ANDROID__)
-    if (layout_ && state_->read_ahead && state_->prefetch_enabled.load() &&
-        offset <= size_ && len <= size_ - offset)
+    if (layout_ && state_->read_ahead)
       return state_->read_ahead->hint(offset_ + offset, len, layout_,
                                       priority != CachePriority::kLow);
 #else
@@ -1978,9 +1976,6 @@ IndexStorage::MemoryBlock::MemoryBlockType ChunkReadStorage::memory_block_type()
 std::string ChunkReadStorage::file_path() const {
   return state_ ? std::string(state_->path.data(), state_->path.size())
                 : std::string{};
-}
-void ChunkReadStorage::enable_prefetch(bool enabled) {
-  if (state_) state_->prefetch_enabled.store(enabled);
 }
 ChunkReadStorage::Stats ChunkReadStorage::stats() const {
   Stats result;

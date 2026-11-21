@@ -47,9 +47,6 @@ class ChunkReadStorage : public IndexStorage {
   MemoryBlock::MemoryBlockType memory_block_type() const override;
   std::string file_path() const override;
   Stats stats() const;
-  // Disabling hints does not discard an already submitted read. Demand reads
-  // still join it, and teardown drains it before releasing any backing.
-  void enable_prefetch(bool enabled);
 
  private:
   struct State;
