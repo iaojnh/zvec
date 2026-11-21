@@ -428,7 +428,6 @@ class IVFEntity {
   IndexStorage::Segment::Pointer mapping_{};
   IndexStorage::Segment::Pointer features_{};
   IndexStorage::Segment::Pointer integer_quantizer_params_{};
-  mutable std::string vector_{};  // temporary buffer for colomn major order
   //! Temporary buffer for one row-major vector split across storage pages.
   mutable std::vector<uint8_t> scatter_vector_{};
   mutable std::vector<float> scatter_distances_{};

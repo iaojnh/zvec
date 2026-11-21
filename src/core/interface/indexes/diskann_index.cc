@@ -137,9 +137,20 @@ int DiskAnnIndex::create_and_init_streamer(const BaseIndexParam &param) {
 
 int DiskAnnIndex::open(const std::string &file_path,
                        StorageOptions storage_options) {
+  if (is_open_) {
+    LOG_ERROR("Close DiskAnn index before opening another index");
+    return core::IndexError_NoReady;
+  }
   if (storage_options.read_only && storage_options.create_new) {
     LOG_ERROR("Cannot create storage for a read-only index");
     return core::IndexError_Runtime;
+  }
+  // Index::close() cleans up the streamer but leaves the closed storage
+  // handle here. Restore the streamer's configuration before retrying open.
+  if (storage_ && streamer_) {
+    const auto &meta = converter_ ? converter_->meta() : proxima_index_meta_;
+    const int ret = streamer_->init(meta, proxima_index_params_);
+    if (ret != 0) return ret;
   }
   ailego::Params storage_params;
   file_path_ = file_path;
@@ -186,11 +197,15 @@ int DiskAnnIndex::open(const std::string &file_path,
     if (ret != 0) {
       LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
                 core::IndexError::What(ret));
-      return core::IndexError_Runtime;
+      storage_.reset();
+      return ret;
     }
-    if (streamer_ == nullptr || streamer_->open(storage_) != 0) {
+    ret = streamer_ ? streamer_->open(storage_) : core::IndexError_NoReady;
+    if (ret != 0) {
       LOG_ERROR("Failed to open streamer, path: %s", file_path_.c_str());
-      return core::IndexError_Runtime;
+      storage_->close();
+      storage_.reset();
+      return ret;
     }
     is_trained_ = true;
   }
@@ -327,7 +342,7 @@ int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
 int DiskAnnIndex::_prepare_for_search(
     const VectorData & /*query*/,
     const BaseIndexQueryParam::Pointer &search_param,
-    core::IndexContext::Pointer &context) {
+    core::IndexContext::Pointer &context) try {
   const auto &diskann_search_param =
       std::dynamic_pointer_cast<DiskAnnQueryParam>(search_param);
   if (diskann_search_param == nullptr) {
@@ -362,6 +377,8 @@ int DiskAnnIndex::_prepare_for_search(
   context->update(params);
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,

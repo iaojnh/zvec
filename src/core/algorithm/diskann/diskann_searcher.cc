@@ -15,6 +15,7 @@
 #include "diskann_searcher.h"
 #include <limits>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include "diskann_context.h"
 #include "diskann_indexer.h"
 #include "diskann_params.h"
@@ -102,7 +103,7 @@ int DiskAnnSearcher::cleanup() {
 }
 
 int DiskAnnSearcher::load(IndexStorage::Pointer storage,
-                          IndexMetric::Pointer measure) {
+                          IndexMetric::Pointer measure) try {
   LOG_INFO("DiskAnnSearcher::load Begin");
 
   if (!storage) {
@@ -120,6 +121,9 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
   meta_.clear();
   stats_.clear();
 
+  const auto rollback = ailego::ScopeGuard::Make([&] {
+    if (state_ != STATE_LOADED) unload();
+  });
   auto start_time = ailego::Monotime::MilliSeconds();
 
   int ret = IndexHelper::DeserializeFromStorage(storage.get(), &meta_);
@@ -134,22 +138,11 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
     return ret;
   }
 
-  // Construct the quantizer from the persisted meta buffer here; the entity
-  // only owns the bytes and the indexer receives the ready-to-use quantizer.
-  // The implementation is resolved from the meta buffer header, so any
-  // supported quantize type (PQ today, others later) plugs in transparently.
-  std::string quantizer_meta_buffer;
-  ret = entity_.read_pq_quantizer_meta_buffer(&quantizer_meta_buffer);
+  turbo::Quantizer::Pointer quantizer;
+  ret = entity_.load_quantizer(quantizer);
   if (ret != 0) {
-    LOG_ERROR("Read quantizer meta buffer failed, ret=%d", ret);
+    LOG_ERROR("Load DiskAnn quantizer failed, ret=%d", ret);
     return ret;
-  }
-  auto quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-      quantizer_meta_buffer, meta_,
-      static_cast<uint32_t>(entity_.pq_chunk_num()),
-      entity_.legacy_pq_layout());
-  if (!quantizer) {
-    return IndexError_NoExist;
   }
 
   diskann_indexer_ = std::make_shared<DiskAnnIndexer>(meta_);
@@ -191,6 +184,8 @@ int DiskAnnSearcher::load(IndexStorage::Pointer storage,
   LOG_INFO("DiskAnnSearcher::load Done");
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::unload() {
@@ -219,15 +214,15 @@ int DiskAnnSearcher::update_context(DiskAnnContext *ctx) const {
 }
 
 int DiskAnnSearcher::ensure_compatible_context(ContextPointer &context,
-                                               DiskAnnContext *&ctx) const {
+                                               DiskAnnContext *&ctx) const try {
   if (ctx->magic() == magic_) {
     return 0;
   }
 
-  auto replacement = create_context();
-  if (!replacement) {
-    LOG_ERROR("Failed to recreate context for current searcher");
-    return IndexError_Runtime;
+  ContextPointer replacement;
+  const int ret = create_search_context(replacement);
+  if (ret != 0) {
+    return ret == IndexError_NoMemory ? ret : IndexError_Runtime;
   }
   auto *replacement_ctx = dynamic_cast<DiskAnnContext *>(replacement.get());
   if (!replacement_ctx) {
@@ -238,11 +233,13 @@ int DiskAnnSearcher::ensure_compatible_context(ContextPointer &context,
   context = std::move(replacement);
   ctx = replacement_ctx;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
                                  uint32_t count,
-                                 Context::Pointer &context) const {
+                                 Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -272,6 +269,13 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
     return IndexError_InvalidArgument;
   }
 
+  ailego::ProcessRssReservation result_memory;
+  bool success = false;
+  const auto finish = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().clear();
+    ctx->group_topk_heaps().clear();
+    if (!success) ctx->clear();
+  });
   ctx->clear();
   ctx->resize_results(count);
 
@@ -287,17 +291,20 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
       return IndexError_Runtime;
     }
 
-    ctx->topk_to_result(i);
+    ctx->knn_to_result(i, result_memory);
 
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
 
+  success = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::search_bf_impl(const void *query,
                                     const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const {
+                                    Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -327,6 +334,13 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
     return IndexError_InvalidArgument;
   }
 
+  ailego::ProcessRssReservation result_memory;
+  bool success = false;
+  const auto finish = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().clear();
+    ctx->group_topk_heaps().clear();
+    if (!success) ctx->clear();
+  });
   ctx->clear();
   ctx->resize_results(count);
 
@@ -338,7 +352,7 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
       return ret;
     }
 
-    ctx->topk_to_result(i);
+    ctx->knn_to_result(i, result_memory);
 
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
@@ -346,14 +360,16 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
   if (ailego_unlikely(ctx->error())) {
     return IndexError_Runtime;
   }
-
+  success = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -388,6 +404,13 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
     return IndexError_InvalidArgument;
   }
 
+  ailego::ProcessRssReservation result_memory;
+  bool success = false;
+  const auto finish = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().clear();
+    ctx->group_topk_heaps().clear();
+    if (!success) ctx->clear();
+  });
   ctx->clear();
   ctx->resize_results(count);
 
@@ -399,7 +422,7 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
       return ret;
     }
 
-    ctx->topk_to_result(i);
+    ctx->knn_to_result(i, result_memory);
 
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
@@ -407,8 +430,10 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
   if (ailego_unlikely(ctx->error())) {
     return IndexError_Runtime;
   }
-
+  success = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::get_vector(uint64_t key, Context::Pointer &context,
@@ -441,36 +466,36 @@ int DiskAnnSearcher::get_vector(uint64_t key, Context::Pointer &context,
 }
 
 IndexSearcher::Context::Pointer DiskAnnSearcher::create_context() const {
+  ContextPointer context;
+  create_search_context(context);
+  return context;
+}
+
+int DiskAnnSearcher::create_search_context(ContextPointer &context) const try {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Load DiskAnnSearcher before creating a context");
-    return Context::Pointer();
+    return IndexError_NoReady;
   }
-  const DiskAnnEntity::Pointer search_ctx_entity = entity_.clone();
-  if (!search_ctx_entity) {
+  const auto entity = entity_.clone();
+  if (!entity) {
     LOG_ERROR("Failed to create search context entity");
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
 
-  DiskAnnContext *ctx = new (std::nothrow)
-      DiskAnnContext(meta_, measure_, search_ctx_entity, data_quantizer_);
-  if (ctx == nullptr) {
-    LOG_ERROR("Failed to allocate DiskAnn Context");
-    return Context::Pointer();
-  }
-  if (ailego_unlikely(ctx->init(
-          DiskAnnContext::kSearcherContext, search_ctx_entity->max_degree(),
-          search_ctx_entity->pq_chunk_num(), meta_.element_size(),
-          diskann_indexer_->requires_io_context())) != 0) {
-    LOG_ERROR("Init DiskAnn Context failed");
-    delete ctx;
+  auto candidate = std::make_unique<DiskAnnContext>(meta_, measure_, entity,
+                                                    data_quantizer_);
+  const int ret =
+      candidate->init(DiskAnnContext::kSearcherContext, entity->max_degree(),
+                      entity->pq_chunk_num(), meta_.element_size(),
+                      diskann_indexer_->requires_io_context());
+  if (ret != 0) return ret;
 
-    return Context::Pointer();
-  }
-
-  ctx->set_list_size(list_size_);
-  ctx->set_magic(magic_);
-
-  return Context::Pointer(ctx);
+  candidate->set_list_size(list_size_);
+  candidate->set_magic(magic_);
+  context = std::move(candidate);
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_SEARCHER(DiskAnnSearcher);

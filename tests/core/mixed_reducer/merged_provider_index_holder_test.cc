@@ -29,6 +29,14 @@
 #include "mixed_reducer/mixed_streamer_reducer.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
+namespace zvec::ailego {
+struct MemoryLimitPoolTestPeer {
+  static void stop_background(MemoryLimitPool &pool) {
+    pool.stop_background_evictor();
+  }
+};
+}  // namespace zvec::ailego
+
 namespace zvec {
 namespace core {
 namespace {
@@ -1138,6 +1146,10 @@ TEST(MergedProviderIndexHolderTest, OrdinalReadsDoNotAccumulatePagePins) {
       0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(
              kPageCount * ailego::kVectorPageSize +
              ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount)));
+  // With room for one data page, let the reader reclaim the previous page
+  // synchronously after it releases its pin.
+  ailego::MemoryLimitPoolTestPeer::stop_background(
+      ailego::MemoryLimitPool::get_instance());
   {
     ailego::File file;
     ASSERT_TRUE(
