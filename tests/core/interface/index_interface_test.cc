@@ -1365,6 +1365,38 @@ void DiskAnnRssAdmissionFixture::verify_refine_admission_and_retry() {
     ASSERT_EQ(0, index->search(input, query, &result));
     ASSERT_EQ(10u, result.doc_list_.size());
     const uint64_t previous = result.doc_list_.front().key();
+
+    // Each thread creates its own DiskANN query context. Both ID entry points
+    // must preserve an existing output when that first allocation is refused.
+    std::thread cold_ids([&] {
+      const auto restore = ailego::ScopeGuard::Make(
+          [&] { EXPECT_TRUE(rss.configure_process_rss_limit(kHighLimit)); });
+      std::array<int64_t, 10> ids;
+      ids.fill(-42);
+      const auto original_ids = ids;
+      std::array<float, 10> scores;
+      scores.fill(-42.0f);
+      const auto original_scores = scores;
+      auto graph_query = param_for_query();
+      graph_query->fetch_vector = false;
+      ASSERT_TRUE(rss.configure_process_rss_limit(1));
+      ASSERT_GT(rss.process_rss(), rss.process_rss_limit());
+      for (const auto &params : {graph_query, query}) {
+        EXPECT_EQ(core::IndexError_NoMemory, index->search_internal_ids(
+                                                input, params, ids.data(),
+                                                scores.data()));
+        EXPECT_EQ(original_ids, ids);
+        EXPECT_EQ(original_scores, scores);
+      }
+      ASSERT_TRUE(rss.configure_process_rss_limit(kHighLimit));
+      for (const auto &params : {graph_query, query}) {
+        ASSERT_EQ(0, index->search_internal_ids(input, params, ids.data(),
+                                               scores.data()));
+        EXPECT_EQ(static_cast<int64_t>(previous), ids.front());
+      }
+    });
+    cold_ids.join();
+
     ASSERT_TRUE(rss.configure_process_rss_limit(1));
     ASSERT_GT(rss.process_rss(), rss.process_rss_limit());
     const int ret = index->search(input, query, &result);
@@ -1419,7 +1451,26 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
           0, index->add(
                  VectorData{DenseVector{values.data() + id * kDimension}}, id));
     }
-    ASSERT_EQ(0, index->train());
+    auto first_query = std::make_shared<DiskAnnQueryParam>();
+    first_query->topk = 1;
+    const VectorData input{DenseVector{values.data()}};
+    SearchResult result;
+    result.doc_list_.emplace_back(123456, 0.0f);
+    {
+      auto &rss = zvec::ailego::MemoryLimitPool::get_instance();
+      const size_t saved_limit = rss.process_rss_limit();
+      const auto restore = zvec::ailego::ScopeGuard::Make(
+          [&] { EXPECT_TRUE(rss.configure_process_rss_limit(saved_limit)); });
+      ASSERT_TRUE(rss.configure_process_rss_limit(1));
+      ASSERT_GT(rss.process_rss(), rss.process_rss_limit());
+      EXPECT_EQ(zvec::core::IndexError_NoMemory,
+                index->search(input, first_query, &result));
+      ASSERT_EQ(1u, result.doc_list_.size());
+      EXPECT_EQ(123456u, result.doc_list_.front().key());
+    }
+    ASSERT_EQ(0, index->search(input, first_query, &result));
+    ASSERT_EQ(1u, result.doc_list_.size());
+    EXPECT_EQ(0u, result.doc_list_.front().key());
     ASSERT_EQ(0, index->close());
   }
 

@@ -3,7 +3,6 @@
 #pragma once
 
 #include <memory>
-#include <stdexcept>
 #include <utility>
 
 namespace zvec::ailego {
@@ -70,11 +69,6 @@ class LazyMap {
   template <typename Key>
   const_iterator find(const Key &key) const {
     return map_ ? map_->find(key) : const_iterator{};
-  }
-  template <typename Key>
-  auto &at(const Key &key) {
-    if (!map_) throw std::out_of_range("Empty lazy map");
-    return map_->at(key);
   }
   template <typename Key>
   auto &operator[](Key &&key) {

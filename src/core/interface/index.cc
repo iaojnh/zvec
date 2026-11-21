@@ -252,9 +252,24 @@ bool Index::init_context(int *status) {
   return true;
 }
 
-core::IndexContext::Pointer &Index::acquire_context(int *status) {
-  init_context(status);
-  return context_list[context_index_];
+core::IndexContext::Pointer &Index::acquire_context() {
+  return acquire_query_context().first;
+}
+
+std::pair<core::IndexContext::Pointer &, int> Index::acquire_query_context() {
+  int status = 0;
+  if (!init_context(&status) && status != core::IndexError_NoMemory) {
+    status = core::IndexError_Runtime;
+  }
+  return {context_list[context_index_], status};
+}
+
+int Index::ensure_trained_for_query() {
+  if (is_trained_) return 0;
+  const int status = train();
+  if (status == 0 || status == core::IndexError_NoMemory) return status;
+  LOG_ERROR("Failed to train index before querying");
+  return core::IndexError_Runtime;
 }
 
 int Index::train() {
@@ -828,19 +843,11 @@ int Index::search(const VectorData &vector_data,
     return core::IndexError_Unsupported;
   }
 
-  if (!is_trained_ && this->train() != 0) {
-    LOG_ERROR("Failed to train index");
-    return core::IndexError_Runtime;
-  }
+  const int train_status = ensure_trained_for_query();
+  if (train_status != 0) return train_status;
 
-  int context_status = 0;
-  auto &context = acquire_context(&context_status);
-  if (!context) {
-    LOG_ERROR("Failed to acquire context");
-    return context_status == core::IndexError_NoMemory
-               ? context_status
-               : core::IndexError_Runtime;
-  }
+  auto [context, context_status] = acquire_query_context();
+  if (context_status != 0) return context_status;
 
   int prepare_ret = _prepare_for_search(vector_data, search_param, context);
   if (prepare_ret != 0) {
@@ -1222,13 +1229,11 @@ int Index::_refine_dense_candidates(
     LOG_ERROR("Reference index must be open and dense");
     return core::IndexError_Runtime;
   }
-  if (!is_trained_ && this->train() != 0) {
-    LOG_ERROR("Failed to train reference index");
-    return core::IndexError_Runtime;
-  }
+  const int train_status = ensure_trained_for_query();
+  if (train_status != 0) return train_status;
 
-  auto &context = acquire_context();
-  if (!context) return core::IndexError_Runtime;
+  auto [context, context_status] = acquire_query_context();
+  if (context_status != 0) return context_status;
   context->set_topk(search_param->topk);
   context->set_fetch_vector(search_param->fetch_vector);
   if (search_param->filter && search_param->filter->is_valid()) {

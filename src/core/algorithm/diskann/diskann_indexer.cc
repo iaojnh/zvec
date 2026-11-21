@@ -121,6 +121,7 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
   }
 
   auto pool = storage->vec_buffer_pool();
+  const bool uses_buffer_pool = static_cast<bool>(pool);
   auto cached_file = storage->file();
 #if defined(_WIN32) || defined(_WIN64)
   // Windows DiskAnn must be able to close the single buffered handle before
@@ -163,7 +164,7 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
 
   const auto file_path = storage->file_path();
   int ret = 0;
-  if (pool) {
+  if (uses_buffer_pool) {
     if (ailego::kVectorPageSize < DiskAnnUtil::kSectorSize ||
         ailego::kVectorPageSize % DiskAnnUtil::kSectorSize != 0) {
       LOG_ERROR(
@@ -219,36 +220,6 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
       LOG_ERROR("Failed to capture DiskAnn index file, ret=%d", ret);
       return ret;
     }
-
-    ret = storage->cleanup();
-#if !defined(_WIN32) && !defined(_WIN64)
-    entity.release_storage();
-    vector_segment.reset();
-#endif
-    storage.reset();
-    if (ret != 0) {
-      reader_->close();
-      LOG_ERROR("Failed to release DiskAnn index storage, ret=%d", ret);
-      return ret;
-    }
-
-#if defined(_WIN32) || defined(_WIN64)
-    // Windows cannot keep an ordinary buffered alias to this file object beside
-    // DiskAnn's unbuffered handles without a severe random-read regression. The
-    // preflight check above avoids consuming the storage on an ordinary
-    // ownership error. Check again after cleanup so an unexpected remaining
-    // owner cannot make the successful load retain a buffered handle.
-    if (cached_file.use_count() != 1) {
-      reader_->close();
-      LOG_ERROR(
-          "DiskAnn on Windows cannot load while the caller retains the "
-          "FileReadStorage file or one of its segments");
-      return IndexError_InvalidArgument;
-    }
-#endif
-    // Releasing the last internal reference closes the buffered source handle.
-    // POSIX caller-owned aliases remain valid; Windows has rejected them above.
-    cached_file.reset();
   }
 
   if (reader_->requires_io_context()) {
@@ -285,6 +256,29 @@ int DiskAnnIndexer::init(DiskAnnSearcherEntity &entity,
     return ret;
   }
 
+  // Entrypoint reads use the captured reader. Retire the source storage only
+  // after the required reads succeed, so a failed load can retry that file.
+  if (uses_buffer_pool) return 0;
+  ret = storage->cleanup();
+#if !defined(_WIN32) && !defined(_WIN64)
+  entity.release_storage();
+  vector_segment.reset();
+#endif
+  if (ret != 0) {
+    reader_->close();
+    LOG_ERROR("Failed to release DiskAnn index storage, ret=%d", ret);
+    return ret;
+  }
+#if defined(_WIN32) || defined(_WIN64)
+  // Check the buffered handle once more before returning a usable index.
+  if (cached_file.use_count() != 1) {
+    reader_->close();
+    LOG_ERROR(
+        "DiskAnn on Windows cannot load while the caller retains the "
+        "FileReadStorage file or one of its segments");
+    return IndexError_InvalidArgument;
+  }
+#endif
   return 0;
 } catch (const std::bad_alloc &) {
   return IndexError_NoMemory;
@@ -303,7 +297,7 @@ int DiskAnnIndexer::use_medroids_data_as_centroids() {
 
   int io_error = 0;
   auto read_status =
-      read_nodes(entrypoints_, entrypoint_buffers, neighbor_buffers, &io_error);
+      read_nodes(entrypoints_, entrypoint_buffers, neighbor_buffers, io_error);
   if (std::find(read_status.begin(), read_status.end(), false) !=
       read_status.end()) {
     LOG_ERROR("Failed to read one or more entrypoint vectors");
@@ -325,8 +319,8 @@ std::vector<bool> DiskAnnIndexer::read_nodes(
     const std::vector<diskann_id_t> &node_ids,
     std::vector<void *> &coord_buffers,
     std::vector<std::pair<uint32_t, diskann_id_t *>> &neighbor_buffers,
-    int *io_error) {
-  if (io_error) *io_error = 0;
+    int &io_error) {
+  io_error = 0;
   std::vector<bool> retval(node_ids.size(), true);
   if (coord_buffers.size() != node_ids.size() ||
       neighbor_buffers.size() != node_ids.size()) {
@@ -370,7 +364,7 @@ std::vector<bool> DiskAnnIndexer::read_nodes(
   int read_ret = reader_->read(read_reqs, init_ctx_);
   if (read_ret != 0) {
     LOG_ERROR("read_nodes: reader_->read failed, ret=%d", read_ret);
-    if (io_error) *io_error = read_ret;
+    io_error = read_ret;
     for (size_t i = 0; i < retval.size(); i++) {
       retval[i] = false;
     }
@@ -441,13 +435,7 @@ uint32_t DiskAnnIndexer::effective_cache_node_count(
 
 int DiskAnnIndexer::prepare_cache_storage(size_t capacity,
                                           CacheLoadState &state) {
-  reset_cache_storage();
-  state = {};
   state.capacity = capacity;
-
-  if (capacity == 0) {
-    return 0;
-  }
 
   const uint64_t neighbor_entries_per_node_u64 =
       static_cast<uint64_t>(max_degree_) + 1;
@@ -468,7 +456,6 @@ int DiskAnnIndexer::prepare_cache_storage(size_t capacity,
   if (element_size == 0 || meta_.unit_size() == 0 ||
       capacity > std::numeric_limits<size_t>::max() / element_size) {
     LOG_ERROR("DiskANN node cache coordinate byte size overflow");
-    reset_cache_storage();
     return IndexError_InvalidArgument;
   }
   const size_t coord_cache_bytes = capacity * element_size;
@@ -478,8 +465,6 @@ int DiskAnnIndexer::prepare_cache_storage(size_t capacity,
     neighbor_cache_buffer_.resize(capacity * neighbor_entries_per_node, 0);
   } catch (const std::exception &e) {
     LOG_ERROR("Failed to allocate DiskANN node cache storage: %s", e.what());
-    reset_cache_storage();
-    state = {};
     return IndexError_NoMemory;
   }
 
@@ -487,7 +472,6 @@ int DiskAnnIndexer::prepare_cache_storage(size_t capacity,
                              8 * meta_.unit_size());
   if (coord_cache_buf_ == nullptr) {
     LOG_ERROR("Failed to allocate coordinate cache buffer");
-    reset_cache_storage();
     return IndexError_NoMemory;
   }
   return 0;
@@ -539,8 +523,10 @@ int DiskAnnIndexer::load_cache_list(CacheLoadState &state) {
           neighbor_cache_buffer_.data() + slot_idx * neighbor_entries_per_node);
     }
 
+    int read_error = 0;
     const auto read_status =
-        read_nodes(nodes_to_read, coord_buffers, neighbor_buffers);
+        read_nodes(nodes_to_read, coord_buffers, neighbor_buffers, read_error);
+    if (read_error == IndexError_NoMemory) return read_error;
     for (size_t i = 0; i < read_status.size(); ++i) {
       if (read_status[i]) {
         const size_t slot_idx = pending_slots[start_idx + i];
@@ -578,7 +564,6 @@ int DiskAnnIndexer::load_cache_list(CacheLoadState &state) {
     }
   } catch (const std::exception &e) {
     LOG_ERROR("Failed to publish DiskANN node cache: %s", e.what());
-    reset_cache_storage();
     return IndexError_NoMemory;
   }
 
@@ -594,12 +579,26 @@ int DiskAnnIndexer::load_cache_list(CacheLoadState &state) {
 }
 
 int DiskAnnIndexer::configure_cache(uint32_t cache_node_num) {
+  reset_cache_storage();
   cache_node_num = effective_cache_node_count(cache_node_num);
-  if (cache_node_num == 0) {
-    reset_cache_storage();
+  if (cache_node_num == 0) return 0;
+
+  int ret;
+  try {
+    ret = build_node_cache(cache_node_num);
+  } catch (const std::bad_alloc &) {
+    ret = IndexError_NoMemory;
+  }
+  if (ret == 0) return 0;
+  reset_cache_storage();
+  if (ret == IndexError_NoMemory) {
+    LOG_WARN("Skipping optional DiskANN node cache after allocation failure");
     return 0;
   }
+  return ret;
+}
 
+int DiskAnnIndexer::build_node_cache(uint32_t cache_node_num) {
   CacheLoadState state;
   int ret = prepare_cache_storage(cache_node_num, state);
   if (ret != 0) {
@@ -610,7 +609,6 @@ int DiskAnnIndexer::configure_cache(uint32_t cache_node_num) {
   LOG_INFO("Caching %u nodes around medoid(s)", cache_node_num);
   ret = cache_bfs_levels(cache_node_num, state);
   if (ret != 0) {
-    reset_cache_storage();
     return ret;
   }
   ret = load_cache_list(state);
@@ -704,8 +702,10 @@ int DiskAnnIndexer::cache_bfs_levels(uint64_t num_nodes_to_cache,
                                           slot_idx * neighbor_entries_per_node);
       }
 
+      int read_error = 0;
       const auto read_status =
-          read_nodes(nodes_to_read, coord_buffers, neighbor_buffers);
+          read_nodes(nodes_to_read, coord_buffers, neighbor_buffers, read_error);
+      if (read_error == IndexError_NoMemory) return read_error;
 
       for (size_t i = 0; i < read_status.size(); i++) {
         if (!read_status[i]) {
