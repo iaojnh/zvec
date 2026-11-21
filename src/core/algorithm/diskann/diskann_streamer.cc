@@ -223,7 +223,7 @@ int DiskAnnStreamer::update_context(DiskAnnContext *ctx) const {
 }
 
 int DiskAnnStreamer::ensure_compatible_context(ContextPointer &context,
-                                               DiskAnnContext *&ctx) const {
+                                               DiskAnnContext *&ctx) const try {
   if (ctx->magic() == magic_) {
     return 0;
   }
@@ -240,6 +240,8 @@ int DiskAnnStreamer::ensure_compatible_context(ContextPointer &context,
   context = std::move(replacement);
   ctx = replacement_ctx;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
@@ -492,6 +494,7 @@ int DiskAnnStreamer::get_vector_by_id(const uint32_t id,
   std::lock_guard<std::mutex> lock(fetch_mutex_);
   if (!fetch_ctx_) {
     const DiskAnnEntity::Pointer fetch_entity = entity_.clone();
+    if (!fetch_entity) return IndexError_NoMemory;
     int status = 0;
     fetch_ctx_ = DiskAnnContext::create_fetch_context(meta_, measure_,
                                                       fetch_entity, &status);
@@ -549,7 +552,7 @@ int DiskAnnStreamer::create_context_with_status(ContextPointer &context) const
   const auto entity = entity_.clone();
   if (!entity) {
     LOG_ERROR("Failed to create search context entity");
-    return IndexError_Runtime;
+    return IndexError_NoMemory;
   }
 
   auto candidate = std::make_unique<DiskAnnContext>(meta_, measure_, entity,
