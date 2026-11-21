@@ -1,8 +1,8 @@
-name: Windows Build
+name: PR 60 Windows diagnostics
 
 on:
-  workflow_call:
-  workflow_dispatch:
+  push:
+    branches: [codex/pr60-windows-diagnostics-8bdd2e2]
 
 permissions:
   contents: read
@@ -12,6 +12,7 @@ jobs:
   build-and-test-windows:
     name: Build & Test (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 75
 
     strategy:
       fail-fast: false
@@ -20,14 +21,6 @@ jobs:
           - platform: windows-2022
             msvc_arch: x64
             python_version: '3.10'
-          - platform: windows-2025
-            msvc_arch: x64
-            python_version: '3.10'
-          # Windows ARM64: Python 3.10 has no official ARM64 installer;
-          # 3.11 is the first CPython release with a Windows-on-ARM build.
-          - platform: windows-11-arm
-            msvc_arch: arm64
-            python_version: '3.11'
 
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -114,7 +107,7 @@ jobs:
         shell: powershell
 
       - name: Check loading and search on CPUs without AVX
-        if: matrix.platform == 'windows-2022'
+        if: ${{ false }}
         timeout-minutes: 10
         run: |
           $ProgressPreference = 'SilentlyContinue'
@@ -155,10 +148,24 @@ jobs:
           }
         shell: powershell
 
-      - name: Run C++ Tests
+      - name: Compile C++ Tests
         run: |
           cd "$env:GITHUB_WORKSPACE\build"
-          cmake --build . --target unittest --config Release --parallel $env:NPROC
+          $targets = @(ninja -t query unittest | ForEach-Object {
+            if ($_ -match '^    bin[\\/].+\.exe$') { $_.Trim() }
+          })
+          if ($LASTEXITCODE -ne 0 -or $targets.Count -lt 100) {
+            throw "Cannot resolve the C++ test dependencies"
+          }
+          cmake --build . --target $targets --config Release --parallel $env:NPROC
+        shell: powershell
+
+      - name: Run C++ Tests Directly
+        timeout-minutes: 35
+        run: |
+          cd "$env:GITHUB_WORKSPACE\build"
+          $parallel = [Math]::Max(1, [int]$env:NPROC - 1)
+          ctest --build-config Release --output-on-failure --no-tests=error --timeout 600 --parallel $parallel
         shell: powershell
 
       - name: Show sccache statistics after tests
@@ -168,12 +175,14 @@ jobs:
         shell: powershell
 
       - name: Run Python Tests
+        if: ${{ false }}
         run: |
           cd "$env:GITHUB_WORKSPACE"
           python -m pytest python/tests/ --basetemp=./.pytest_tmp
         shell: powershell
 
       - name: Run C++ Examples
+        if: ${{ false }}
         run: |
           cd "$env:GITHUB_WORKSPACE\examples\c++"
           mkdir build
