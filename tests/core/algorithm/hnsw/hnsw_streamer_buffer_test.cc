@@ -2,6 +2,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
 #include <algorithm/hnsw/hnsw_algorithm.h>
@@ -118,6 +119,175 @@ TEST_F(HnswStreamerTest, LegacyReadsReleaseStorageBeforeThreadExit) {
   }
   retained.reset();
   EXPECT_EQ(initial_pages, memory_pool.stats().page_used);
+}
+
+TEST_F(HnswStreamerTest, ShortAppendKeepsNodeOffsetForRetry) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  const std::string path = dir_ + "ShortAppend";
+  ASSERT_EQ(0, storage->open(path, true));
+
+  const size_t vector_size = 2 * kVectorPageSize;
+  IndexStreamer::Stats stats;
+  HnswBufferPoolStreamerEntity entity(stats);
+  entity.set_vector_size(vector_size);
+  entity.set_l0_neighbor_cnt(2);
+  entity.set_upper_neighbor_cnt(2);
+  entity.set_scaling_factor(5);
+  ASSERT_EQ(0, entity.init(4));
+  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+  std::vector<char> vector(vector_size, 'a');
+  node_id_t id;
+  ASSERT_EQ(0, entity.add_vector(0, 100, vector.data(), &id));
+  ASSERT_EQ(0u, id);
+
+  auto nodes = storage->get(
+      ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_NODE, 0));
+  ASSERT_NE(nullptr, nodes);
+  const size_t record_end = nodes->data_size();
+  ASSERT_EQ(entity.node_size(), record_end);
+  const size_t next_offset = nodes->data_offset() + record_end;
+  auto pages = storage->vec_buffer_pool()->get_handle();
+  size_t page_id;
+  ASSERT_NE(nullptr, pages.get_single_page(next_offset, 1, page_id));
+  {
+    auto &pool = MemoryLimitPool::get_instance();
+    using Pressure = ProcessRssBudget::PressureLevel;
+    const auto restore = ScopeGuard::Make([&] {
+      pool.set_memory_pressure(Pressure::kNormal);
+      pages.release_one(page_id);
+    });
+    pool.set_memory_pressure(Pressure::kCritical);
+    vector.assign(vector_size, 'b');
+    EXPECT_EQ(IndexError_NoMemory,
+              entity.add_vector(0, 101, vector.data(), &id));
+    EXPECT_EQ(record_end, nodes->data_size());
+    EXPECT_EQ(1u, entity.doc_cnt());
+  }
+  ASSERT_EQ(0, entity.add_vector(0, 101, vector.data(), &id));
+  EXPECT_EQ(1u, id);
+  ASSERT_EQ(0, entity.close());
+  ASSERT_EQ(0, storage->close());
+  nodes.reset();
+
+  ASSERT_EQ(0, storage->open(path, false));
+  nodes = storage->get(
+      ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_NODE, 0));
+  ASSERT_NE(nullptr, nodes);
+  EXPECT_EQ(2 * record_end, nodes->data_size());
+  std::vector<char> actual(vector_size);
+  ASSERT_EQ(vector_size,
+            nodes->fetch(record_end, actual.data(), actual.size()));
+  EXPECT_EQ(vector, actual);
+}
+
+TEST_F(HnswStreamerTest, FailedInsertRestoresReverseEdgesAndKey) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_EQ(0, storage->init(Params()));
+  const std::string path = dir_ + "FailedInsert";
+  ASSERT_EQ(0, storage->open(path, true));
+
+  IndexStreamer::Stats stats;
+  HnswBufferPoolStreamerEntity entity(stats);
+  const auto init_entity = [&] {
+    entity.set_vector_size(1024);
+    entity.set_chunk_size(4 * kVectorPageSize);
+    entity.set_l0_neighbor_cnt(4);
+    entity.set_upper_neighbor_cnt(4);
+    entity.set_scaling_factor(5);
+    entity.set_filter_same_key(true);
+    entity.set_use_key_info_map(true);
+    return entity.init(256);
+  };
+  ASSERT_EQ(0, init_entity());
+  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+  const auto add_first = [&](node_id_t id) {
+    entity.update_ep_and_level(id, 0);
+    return 0;
+  };
+  std::vector<char> vector(1024, 'a');
+  ASSERT_EQ(0, entity.insert_buffered(0, 100, vector.data(), false, add_first));
+  ASSERT_EQ(0, entity.insert_buffered(0, 101, vector.data(), false,
+                                      [](node_id_t) { return 0; }));
+  ASSERT_EQ(0, entity.add_neighbor(0, 0, 0, 1));
+  ASSERT_EQ(0, entity.add_neighbor(0, 1, 0, 0));
+  auto nodes = storage->get(
+      ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_NODE, 0));
+  ASSERT_TRUE(nodes);
+  const size_t size = nodes->data_size();
+
+  for (const node_id_t requested_id : {kInvalidNodeId, 128u, 1u}) {
+    SCOPED_TRACE(requested_id);
+    const bool explicit_id = requested_id != kInvalidNodeId;
+    const node_id_t expected_id = explicit_id ? requested_id : 2;
+    const uint64_t key = explicit_id ? expected_id : 102;
+    const std::vector<char> new_vector(1024, 'b');
+    auto &pool = MemoryLimitPool::get_instance();
+    using Pressure = ProcessRssBudget::PressureLevel;
+    const auto restore =
+        ScopeGuard::Make([&] { pool.set_memory_pressure(Pressure::kNormal); });
+    ASSERT_EQ(
+        IndexError_NoMemory,
+        entity.insert_buffered(
+            1, key, new_vector.data(), explicit_id, [&](node_id_t id) -> int {
+              EXPECT_EQ(expected_id, id);
+              for (node_id_t old : {0u, 1u}) {
+                const int ret = entity.add_neighbor(0, old, 1, id);
+                if (ret != 0) {
+                  ADD_FAILURE() << IndexError::What(ret);
+                  return ret;
+                }
+              }
+              const int ret = entity.update_neighbors(1, id, {{0, 0}});
+              if (ret != 0) {
+                ADD_FAILURE() << IndexError::What(ret);
+                return ret;
+              }
+              pool.set_memory_pressure(Pressure::kCritical);
+              return IndexError_NoMemory;
+            }));
+    pool.set_memory_pressure(Pressure::kNormal);
+    EXPECT_EQ(2u, entity.doc_cnt());
+    EXPECT_EQ(size, nodes->data_size());
+    EXPECT_EQ(kInvalidNodeId, entity.get_id(key));
+    EXPECT_EQ(1u, entity.get_id(101));
+    IndexStorage::MemoryBlock previous_vector;
+    ASSERT_EQ(0, entity.get_vector(1, previous_vector));
+    EXPECT_EQ(
+        0, std::memcmp(vector.data(), previous_vector.data(), vector.size()));
+    const auto first = entity.get_neighbors(0, 0);
+    const auto second = entity.get_neighbors(0, 1);
+    ASSERT_EQ(1u, first.size());
+    ASSERT_EQ(1u, second.size());
+    EXPECT_EQ(1u, first[0]);
+    EXPECT_EQ(0u, second[0]);
+  }
+  ASSERT_EQ(0, entity.insert_buffered(
+                   1, 102, vector.data(), false, [&](node_id_t id) -> int {
+                     if (id != 2) return IndexError_Runtime;
+                     const int ret = entity.add_neighbor(0, 0, 1, id);
+                     if (ret != 0) return ret;
+                     entity.update_ep_and_level(id, 1);
+                     return 0;
+                   }));
+  EXPECT_EQ(2u, entity.get_id(102));
+  EXPECT_EQ(3u, entity.doc_cnt());
+  ASSERT_EQ(0, entity.close());
+  ASSERT_EQ(0, storage->close());
+  ASSERT_EQ(0, storage->open(path, false));
+  ASSERT_EQ(0, init_entity());
+  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+  EXPECT_EQ(3u, entity.doc_cnt());
+  EXPECT_EQ(2u, entity.entry_point());
+  EXPECT_EQ(2u, entity.get_id(102));
+  const auto first = entity.get_neighbors(0, 0);
+  ASSERT_EQ(2u, first.size());
+  EXPECT_EQ(2u, first[1]);
+  EXPECT_EQ(0u, entity.get_neighbors(1, 2).size());
+  ASSERT_EQ(0, entity.close());
 }
 
 TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {

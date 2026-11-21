@@ -217,6 +217,30 @@ TEST_F(SharedMemoryBudgetTest, DisabledBudgetKeepsOrdinaryAllocationAvailable) {
   EXPECT_EQ(17u, values.back());
 }
 
+TEST_F(SharedMemoryBudgetTest, ProcessRssAllocationKeepsItsOriginalOwner) {
+  const auto restore = ScopeGuard::Make(
+      [&] { EXPECT_TRUE(pool_.configure_process_rss_limit(0)); });
+  BudgetedVector<char> values;
+  {
+    const ProcessRssAllocationScope process_budget;
+    values.reserve(pool_.capacity() + 1);
+    values.resize(32);
+    EXPECT_EQ(0u, pool_.external_used());
+    const ProcessRssAllocationScope native_budget(false);
+    BudgetedVector<char> native(32);
+    EXPECT_GT(pool_.external_used(), 0u);
+  }
+  EXPECT_EQ(0u, pool_.external_used());
+  ASSERT_TRUE(pool_.configure_process_rss_limit(1));
+  EXPECT_THROW(values.reserve(values.capacity() + 1), std::bad_alloc);
+  // Release the original process-owned allocation outside its allocation scope.
+  BudgetedVector<char>().swap(values);
+  EXPECT_EQ(0u, pool_.external_used());
+  const ProcessRssAllocationScope process_budget;
+  EXPECT_THROW(values.resize(1), std::bad_alloc);
+  EXPECT_TRUE(values.empty());
+}
+
 TEST_F(SharedMemoryBudgetTest, AlignedWorkspaceMoveAndRefusalPreservePayload) {
   BudgetedAlignedBuffer bytes(513, 64);
   ASSERT_NE(nullptr, bytes.data());

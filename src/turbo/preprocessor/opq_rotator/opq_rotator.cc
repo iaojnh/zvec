@@ -62,8 +62,10 @@ OpqRotator::Pointer OpqRotator::create(int dim, uint64_t seed) {
   return r;
 }
 
-OpqRotator::Pointer OpqRotator::from_serialized(const void *data, size_t len) {
+OpqRotator::Pointer OpqRotator::from_serialized(const void *data, size_t len,
+                                                bool process_rss) {
   Pointer r(new OpqRotator());
+  r->process_rss_ = process_rss;
   if (r->deserialize(data, len) != 0) return nullptr;
   return r;
 }
@@ -168,7 +170,8 @@ int OpqRotator::deserialize(const void *data, size_t len) {
   if (hdr.payload_size != expected_bytes) return kErrInvalidArgument;
 
   // Copy before committing so a malformed blob never half-updates the object.
-  std::vector<float> new_matrix(elements);
+  const ailego::ProcessRssAllocationScope matrix_budget(process_rss_);
+  Matrix new_matrix(elements);
   std::memcpy(new_matrix.data(),
               reinterpret_cast<const char *>(data) + sizeof(RotatorSerHeader),
               expected_bytes);
