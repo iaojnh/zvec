@@ -301,12 +301,13 @@ int DiskAnnIndexer::use_medroids_data_as_centroids() {
     entrypoint_buffers[i] = entrypoint_data + i * centroid_stride_;
   }
 
+  int io_error = 0;
   auto read_status =
-      read_nodes(entrypoints_, entrypoint_buffers, neighbor_buffers);
+      read_nodes(entrypoints_, entrypoint_buffers, neighbor_buffers, &io_error);
   if (std::find(read_status.begin(), read_status.end(), false) !=
       read_status.end()) {
     LOG_ERROR("Failed to read one or more entrypoint vectors");
-    return IndexError_ReadData;
+    return io_error == IndexError_NoMemory ? io_error : IndexError_ReadData;
   }
 
   return 0;
@@ -323,7 +324,9 @@ diskann_id_t DiskAnnIndexer::get_id(diskann_key_t key) const {
 std::vector<bool> DiskAnnIndexer::read_nodes(
     const std::vector<diskann_id_t> &node_ids,
     std::vector<void *> &coord_buffers,
-    std::vector<std::pair<uint32_t, diskann_id_t *>> &neighbor_buffers) {
+    std::vector<std::pair<uint32_t, diskann_id_t *>> &neighbor_buffers,
+    int *io_error) {
+  if (io_error) *io_error = 0;
   std::vector<bool> retval(node_ids.size(), true);
   if (coord_buffers.size() != node_ids.size() ||
       neighbor_buffers.size() != node_ids.size()) {
@@ -367,6 +370,7 @@ std::vector<bool> DiskAnnIndexer::read_nodes(
   int read_ret = reader_->read(read_reqs, init_ctx_);
   if (read_ret != 0) {
     LOG_ERROR("read_nodes: reader_->read failed, ret=%d", read_ret);
+    if (io_error) *io_error = read_ret;
     for (size_t i = 0; i < retval.size(); i++) {
       retval[i] = false;
     }
