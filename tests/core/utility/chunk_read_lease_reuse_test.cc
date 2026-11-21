@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_factory.h>
+#include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_mapping.h>
 #include <zvec/core/framework/index_memory.h>
 #include <zvec/core/framework/index_segment_storage.h>
@@ -81,6 +82,41 @@ class ChunkReadLeaseReuseTest : public testing::Test {
   std::shared_ptr<ChunkReadStorage> storage;
   IndexStorage::Segment::Pointer segment;
 };
+
+TEST_F(ChunkReadLeaseReuseTest, MetadataUsesCallerBufferWhenWorkspaceIsBusy) {
+  const std::string index_path = std::string(path) + ".meta";
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { ailego::File::Delete(index_path); });
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(nullptr, dumper);
+  ASSERT_EQ(0, dumper->create(index_path));
+  IndexMeta expected;
+  expected.set_trainer("metadata_trainer", 0, ailego::Params());
+  ASSERT_EQ(0, IndexHelper::SerializeToDumper(expected, dumper.get()));
+  ASSERT_EQ(0, dumper->close());
+
+  ChunkReadStorage reader;
+  ailego::Params params;
+  params.set(CHUNK_READ_STORAGE_WORKSPACE_COUNT, size_t{1});
+  params.set(CHUNK_READ_STORAGE_MAX_READ_BYTES, 4 * page);
+  params.set(CHUNK_READ_STORAGE_CACHE_BYTES, size_t{0});
+  params.set(CHUNK_READ_STORAGE_WAIT_MS, size_t{0});
+  params.set(CHUNK_READ_STORAGE_DIRECT_IO, false);
+  ASSERT_EQ(0, reader.init(params));
+  ASSERT_EQ(0, reader.open(index_path, false));
+  auto metadata = reader.get("IndexMeta");
+  ASSERT_NE(nullptr, metadata);
+
+  IndexStorage::MemoryBlock held, rejected;
+  ASSERT_EQ(metadata->data_size(),
+            metadata->read(0, held, metadata->data_size()));
+  EXPECT_EQ(0u, metadata->read_for_parsing(0, rejected, metadata->data_size()));
+  EXPECT_EQ(IndexError_NoMemory, metadata->read_error());
+  IndexMeta actual;
+  ASSERT_EQ(0, IndexHelper::DeserializeFromStorage(&reader, &actual));
+  EXPECT_EQ(expected.trainer_name(), actual.trainer_name());
+}
+
 TEST_F(ChunkReadLeaseReuseTest, WarmHitReusesChargedDescriptorAtFullBudget) {
   IndexStorage::MemoryBlock block, other;
   ASSERT_EQ(64u, segment->read(32, block, 64));
