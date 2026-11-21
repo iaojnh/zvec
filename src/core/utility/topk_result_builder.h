@@ -19,6 +19,8 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/internal/platform.h>
 
 namespace zvec {
@@ -52,6 +54,10 @@ class TopkResultBuilder {
 
   //! Dispatch to single or group result construction.
   inline void topk_to_result(uint32_t idx) {
+    auto release = ailego::ScopeGuard::Make([&] {
+      derived().topk_heap().release();
+      derived().group_topk_heaps().clear();
+    });
     if (derived().group_by_search()) {
       topk_to_group_result(idx);
     } else {
@@ -71,15 +77,22 @@ class TopkResultBuilder {
     uint32_t size =
         std::min(derived().topk(), static_cast<uint32_t>(heap.size()));
     heap.sort();
+    uint32_t accepted = 0;
+    while (accepted < size && !(derived().result_score(heap[accepted].second) >
+                                derived().threshold()))
+      ++accepted;
+    size = accepted;
     results[idx].clear();
+    // Reserve only accepted results; output owns each payload reservation.
+    results[idx].reserve(size);
 
     for (uint32_t i = 0; i < size; ++i) {
-      float score = derived().result_score(heap[i].second);
+      float score = derived().result_score(heap.mutable_at(i).second);
       if (score > derived().threshold()) {
         break;
       }
       derived().emplace_result_doc(results[idx], heap[i].first, score,
-                                   heap[i].second);
+                                   heap.mutable_at(i).second);
     }
   }
 
@@ -91,45 +104,42 @@ class TopkResultBuilder {
     auto &group_heaps = derived().group_topk_heaps();
     group_results[idx].clear();
 
-    std::vector<std::pair<std::string, HeapT>> group_topk_list;
-    std::vector<std::pair<std::string, float>> best_score_in_groups;
+    using Entry = typename std::decay_t<decltype(group_heaps)>::value_type;
+    std::vector<Entry *, ailego::BudgetedAllocator<Entry *>> group_topk_list;
     for (auto &entry : group_heaps) {
-      HeapT &heap = entry.second;
-      heap.sort();
-      if (heap.size() > 0) {
-        best_score_in_groups.emplace_back(
-            entry.first, derived().result_score(heap[0].second));
-      }
+      entry.second.sort();
+      if (!entry.second.empty()) group_topk_list.push_back(&entry);
     }
-
-    std::sort(best_score_in_groups.begin(), best_score_in_groups.end(),
-              [](const std::pair<std::string, float> &a,
-                 const std::pair<std::string, float> &b) {
-                return a.second < b.second;
+    std::sort(group_topk_list.begin(), group_topk_list.end(),
+              [&](const Entry *a, const Entry *b) {
+                return derived().result_score(a->second[0].second) <
+                       derived().result_score(b->second[0].second);
               });
-
-    // truncate to group num
-    for (uint32_t i = 0;
-         i < derived().group_num() && i < best_score_in_groups.size(); ++i) {
-      const std::string &group_id = best_score_in_groups[i].first;
-      group_topk_list.emplace_back(group_id, group_heaps[group_id]);
-    }
-
+    if (group_topk_list.size() > derived().group_num())
+      group_topk_list.resize(derived().group_num());
     group_results[idx].resize(group_topk_list.size());
     for (uint32_t i = 0; i < group_topk_list.size(); ++i) {
-      const std::string &group_id = group_topk_list[i].first;
+      const std::string &group_id = group_topk_list[i]->first;
       group_results[idx][i].set_group_id(group_id);
 
-      HeapT &heap = group_topk_list[i].second;
+      HeapT &heap = group_topk_list[i]->second;
       uint32_t size =
           std::min(derived().group_topk(), static_cast<uint32_t>(heap.size()));
+      uint32_t accepted = 0;
+      while (accepted < size &&
+             !(derived().result_score(heap[accepted].second) >
+               derived().threshold()))
+        ++accepted;
+      size = accepted;
+      group_results[idx][i].mutable_docs()->reserve(size);
       for (uint32_t j = 0; j < size; ++j) {
-        float score = derived().result_score(heap[j].second);
+        float score = derived().result_score(heap.mutable_at(j).second);
         if (score > derived().threshold()) {
           break;
         }
         derived().emplace_result_doc(*group_results[idx][i].mutable_docs(),
-                                     heap[j].first, score, heap[j].second);
+                                     heap[j].first, score,
+                                     heap.mutable_at(j).second);
       }
     }
   }

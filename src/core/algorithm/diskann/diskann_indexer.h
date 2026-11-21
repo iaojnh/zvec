@@ -57,6 +57,8 @@ class DiskAnnIndexer {
 
   int get_vector(diskann_id_t id, IndexContext::Pointer &context,
                  std::string &vector);
+  int get_vector(diskann_id_t id, IndexContext::Pointer &context,
+                 ailego::BudgetedString &vector);
 
   bool requires_io_context() const {
     return reader_ && reader_->requires_io_context();
@@ -64,22 +66,42 @@ class DiskAnnIndexer {
 
   diskann_key_t get_key(diskann_id_t id) const;
   diskann_id_t get_id(diskann_key_t key) const;
-
-  //! Copy element_size() bytes from src into a new vector value string
-  std::string make_vector_copy(const void *src) const {
-    return std::string(static_cast<const char *>(src), meta_.element_size());
+  int find_id(diskann_key_t key, diskann_id_t *id) const {
+    return entity_->find_id(key, id);
   }
 
-  std::vector<bool> read_nodes(
-      const std::vector<diskann_id_t> &node_ids,
-      std::vector<void *> &coord_buffers,
-      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers);
+  void emplace_candidate(DiskAnnContext *ctx, TopkHeap &heap, diskann_id_t id,
+                         float distance, const void *src) const {
+    if (!AcceptsCandidate(heap, distance)) return;
+    heap.emplace(id, VectorInfo(distance, ctx->fetch_vector() ? src : nullptr,
+                                meta_.element_size()));
+  }
+
+  ailego::BudgetedVector<bool> read_nodes(
+      const ailego::BudgetedVector<diskann_id_t> &node_ids,
+      ailego::BudgetedVector<void *> &coord_buffers,
+      ailego::BudgetedVector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers);
 
  protected:
   int use_medroids_data_as_centroids();
   void populate_group_topk_heaps(DiskAnnContext *ctx);
 
  private:
+  template <typename Buffer>
+  int read_vector(diskann_id_t id, DiskAnnContext *ctx, Buffer &vector);
+  int finish_group_candidates(DiskAnnContext *ctx,
+                              class GroupCandidateCollector &groups);
+
+  int is_filtered(DiskAnnContext *ctx, diskann_id_t id, bool *filtered) const {
+    *filtered = false;
+    if (!ctx->filter().is_valid()) return 0;
+    diskann_key_t key;
+    const int ret = entity_->read_key(id, &key);
+    if (ret != 0) return ret;
+    *filtered = ctx->filter()(key);
+    return 0;
+  }
+
   struct CacheSlot {
     diskann_id_t id{0};
     uint32_t neighbor_count{0};
@@ -111,16 +133,19 @@ class DiskAnnIndexer {
   uint64_t index_segment_offset_{0};
   uint64_t sector_num_per_node_{0};
 
+  ailego::BudgetedAlignedBuffer centroid_memory_;
   void *centroid_data_{nullptr};
   size_t centroid_stride_{0};
 
   diskann_id_t medoid_;
-  std::vector<diskann_id_t> entrypoints_;
+  ailego::BudgetedVector<diskann_id_t> entrypoints_;
 
   std::shared_ptr<AlignedFileReader> reader_{nullptr};
+  bool buffer_backed_{false};
 
   turbo::Quantizer::Pointer quantizer_;
   const uint8_t *quant_codes_{nullptr};
+  IndexStorage::Segment::Pointer paged_quant_codes_;
 
   IOContext init_ctx_{};
 

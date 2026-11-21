@@ -85,6 +85,14 @@ class FlatStreamer : public IndexStreamer {
                      uint32_t count, Context::UPointer &context) const override;
 
   //! Linear search by primary keys
+  int search_bf_by_keys_impl(const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const override {
+    return search_bf_by_key_rows(query, &keys, qmeta, 1, context);
+  }
+
+  //! Linear search by primary keys
   int search_bf_by_p_keys_impl(const void *query,
                                const std::vector<std::vector<uint64_t>> &p_keys,
                                const IndexQueryMeta &qmeta,
@@ -167,8 +175,20 @@ class FlatStreamer : public IndexStreamer {
   }
 
   int get_vector_by_key(const uint64_t key,
-                        IndexStorage::MemoryBlock &block) const override {
-    return entity_->get_vector_by_key(key, block);
+                        IndexStorage::MemoryBlock &block) const override try {
+    int ret = entity_->get_vector_by_key(key, block);
+    if (ret != 0) return ret;
+    if (block.type_ == IndexStorage::MemoryBlock::MBT_MMAP) {
+      auto owned =
+          IndexStorage::MemoryBlock::AllocateOwned(meta_.element_size());
+      std::memcpy(const_cast<void *>(owned.data()), block.data(),
+                  meta_.element_size());
+      block = std::move(owned);
+    }
+    return 0;
+  } catch (const std::bad_alloc &) {
+    block.reset();
+    return IndexError_NoMemory;
   }
   const void *get_vector_by_id(uint32_t id) const override {
     return get_vector_by_key(id);
@@ -189,9 +209,18 @@ class FlatStreamer : public IndexStreamer {
   }
 
  private:
+  // Borrow one or more existing key vectors for this synchronous call.
+  int search_bf_by_key_rows(const void *query,
+                            const std::vector<uint64_t> *p_keys,
+                            const IndexQueryMeta &qmeta, uint32_t count,
+                            Context::Pointer &context) const;
+  int group_by_search_key_rows(const void *query,
+                               const std::vector<uint64_t> *p_keys,
+                               const IndexQueryMeta &qmeta, uint32_t count,
+                               Context::Pointer &context) const;
   int search_external(const void *query, const IndexQueryMeta &qmeta,
                       uint32_t count,
-                      const std::vector<std::vector<uint64_t>> *keys,
+                      const std::vector<uint64_t> *keys,
                       Context::Pointer &context) const;
 
   //! Constants

@@ -62,7 +62,9 @@ class IDMap {
 
   void remove(const std::string &key);
 
-  bool has(const std::string &key, uint64_t *doc_id = nullptr) const;
+  // Return false only for a confirmed missing key. Cache admission and I/O
+  // failures must reach readers and writers before they act on the lookup.
+  Result<bool> lookup(const std::string &key, uint64_t *doc_id = nullptr) const;
 
   Status multi_get(const std::vector<std::string> &keys,
                    std::vector<uint64_t> *doc_ids) const;

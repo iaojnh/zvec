@@ -4,6 +4,11 @@ file(GLOB_RECURSE ALL_TEST_SRCS *_test.cc)
 
 foreach(CC_SRCS ${ALL_TEST_SRCS})
   get_filename_component(CC_TARGET ${CC_SRCS} NAME_WE)
+  if(NOT RABITQ_SUPPORTED AND CC_TARGET STREQUAL "hnsw_rabitq_index_test")
+    # This source contains only RaBitQ tests. Do not register an empty binary
+    # on unsupported targets such as Android x86_64.
+    continue()
+  endif()
   cc_gtest(
       NAME ${CC_TARGET}
       STRICT

@@ -48,6 +48,8 @@ TEST_P(VisitFilterDispatchTest, ConcreteViewSharesStateWithLegacyAccessors) {
               (std::is_same_v<View, VisitFilterView<VisitBitMap>>));
     EXPECT_EQ(GetParam() == VisitFilter::ByteMap,
               (std::is_same_v<View, VisitFilterView<VisitByteMap>>));
+    EXPECT_EQ(GetParam() == VisitFilter::EpochBitMap,
+              (std::is_same_v<View, VisitFilterView<VisitEpochBitMap>>));
     ++calls;
 
     EXPECT_TRUE(visit.visited(3));
@@ -94,7 +96,8 @@ TEST_P(VisitFilterDispatchTest, AcceptsMoveOnlyGenericCallback) {
 INSTANTIATE_TEST_SUITE_P(Modes, VisitFilterDispatchTest,
                          testing::Values(VisitFilter::BloomFilter,
                                          VisitFilter::BitMap,
-                                         VisitFilter::ByteMap));
+                                         VisitFilter::ByteMap,
+                                         VisitFilter::EpochBitMap));
 
 TEST(VisitFilterDispatch, RejectsUninitializedFilterWithoutInvokingCallback) {
   VisitFilter filter;

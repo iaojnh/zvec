@@ -1,0 +1,142 @@
+// Copyright 2025-present the zvec project
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include <limits>
+#include <memory>
+#include <arrow/api.h>
+#include <zvec/db/doc.h>
+#include "document_memory.h"
+#include "result_memory_allowance.h"
+
+namespace zvec::detail {
+
+// Arrow buffers are already managed. This separate allowance covers the
+// ordinary-heap Doc copies, field containers and result-vector capacity.
+// Keep its backing high water across calls, as with Python fetch results.
+class QueryResultEstimate {
+ public:
+  void add(size_t bytes, size_t count = 1) {
+    if (count && bytes > (std::numeric_limits<size_t>::max() - bytes_) / count)
+      throw std::bad_alloc();
+    bytes_ += bytes * count;
+  }
+  void value(const arrow::Array &array, int64_t row) {
+    if (array.IsNull(row)) return;
+    switch (array.type_id()) {
+      case arrow::Type::STRING:
+      case arrow::Type::BINARY: {
+        const auto &binary = static_cast<const arrow::BinaryArray &>(array);
+        add(static_cast<size_t>(binary.value_length(row)));
+        break;
+      }
+      case arrow::Type::LIST: {
+        const auto &list = static_cast<const arrow::ListArray &>(array);
+        add(64);
+        add(32, static_cast<size_t>(list.value_length(row)));
+        const auto end = list.value_offset(row) + list.value_length(row);
+        for (auto i = list.value_offset(row); i < end; ++i)
+          value(*list.values(), i);
+        break;
+      }
+      case arrow::Type::STRUCT: {
+        const auto &fields = static_cast<const arrow::StructArray &>(array);
+        for (const auto &field : fields.fields()) value(*field, row);
+        break;
+      }
+      default:
+        break;  // Fixed-width scalars live inside Doc::Value.
+    }
+  }
+  void value(const arrow::Scalar &scalar) {
+    if (!scalar.is_valid) return;
+    switch (scalar.type->id()) {
+      case arrow::Type::STRING:
+      case arrow::Type::BINARY:
+        add(static_cast<const arrow::BaseBinaryScalar &>(scalar).view().size());
+        break;
+      case arrow::Type::LIST: {
+        const auto &array =
+            *static_cast<const arrow::ListScalar &>(scalar).value;
+        add(64);
+        add(32, static_cast<size_t>(array.length()));
+        for (int64_t i = 0; i < array.length(); ++i) value(array, i);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  size_t bytes() const {
+    return bytes_;
+  }
+
+ private:
+  size_t bytes_{0};
+};
+
+inline size_t EstimateQueryResult(const arrow::RecordBatch &batch) {
+  if (batch.num_rows() == 0) return 0;
+  QueryResultEstimate estimate;
+  // Include shared ownership, growing DocPtrList capacity and hash buckets.
+  estimate.add(sizeof(Doc) + 256, static_cast<size_t>(batch.num_rows()));
+  for (int column = 0; column < batch.num_columns(); ++column) {
+    estimate.add(192 + batch.schema()->field(column)->name().size() * 2,
+                 static_cast<size_t>(batch.num_rows()));
+    const auto &array = *batch.column(column);
+    const auto type = array.type_id();
+    if (type == arrow::Type::STRING || type == arrow::Type::BINARY) {
+      if (array.null_count() == 0) {
+        const auto &binary = static_cast<const arrow::BinaryArray &>(array);
+        // Contiguous valid values telescope, including sliced arrays. Charge
+        // exactly the copied value bytes, without visiting every string.
+        estimate.add(static_cast<size_t>(
+            binary.value_offset(array.length()) - binary.value_offset(0)));
+        continue;
+      }
+    } else if (type == arrow::Type::LIST) {
+      const auto &list = static_cast<const arrow::ListArray &>(array);
+      bool fixed_elements = false;
+      switch (list.value_type()->id()) {
+        case arrow::Type::BOOL:
+        case arrow::Type::INT32:
+        case arrow::Type::INT64:
+        case arrow::Type::UINT32:
+        case arrow::Type::UINT64:
+        case arrow::Type::FLOAT:
+        case arrow::Type::DOUBLE:
+          fixed_elements = true;
+          break;
+        default:
+          break;
+      }
+      if (fixed_elements) {
+        // Preserve the list-container and per-element allowance, including
+        // null child slots. Fixed-width children have no extra payload to
+        // charge, so walking every element again adds no information.
+        for (int64_t row = 0; row < batch.num_rows(); ++row) {
+          if (list.IsNull(row)) continue;
+          estimate.add(64);
+          estimate.add(32, static_cast<size_t>(list.value_length(row)));
+        }
+        continue;
+      }
+    } else if (type != arrow::Type::STRUCT) {
+      // These values have no separate payload in Doc::Value. Their fixed
+      // charge above is unchanged; no per-row estimate walk is necessary.
+      continue;
+    }
+    for (int64_t row = 0; row < batch.num_rows(); ++row)
+      estimate.value(array, row);
+  }
+  return estimate.bytes();
+}
+
+inline Doc::Ptr MakeQueryDocument(
+    const std::shared_ptr<ResultMemoryAllowance::Lease> &memory) {
+  auto doc = std::make_shared<Doc>();
+  if (memory && memory->enabled()) DocumentMemoryAccess::retain(*doc, memory);
+  return doc;
+}
+
+}  // namespace zvec::detail

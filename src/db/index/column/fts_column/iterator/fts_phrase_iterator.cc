@@ -54,8 +54,8 @@ bool PhraseDocIterator::matches() {
     return cached_matches_result_;
   }
   // Phase 2: verify position adjacency (deferred IO)
-  cached_matches_doc_id_ = cached_doc_id_;
   cached_matches_result_ = verify_phrase_positions(cached_doc_id_);
+  cached_matches_doc_id_ = cached_doc_id_;
   return cached_matches_result_;
 }
 
@@ -123,12 +123,18 @@ bool PhraseDocIterator::verify_phrase_positions(uint32_t doc_id) const {
   ctx_->db_->MultiGet(ctx_->read_opts_, unique_size, cfs.data(),
                       key_slices.data(), values.data(), statuses.data());
 
+  for (const auto &status : statuses) {
+    if (!status.ok() && !status.IsNotFound())
+      throw FtsReadError(FtsReadFailure(status, "Read FTS phrase positions"));
+  }
+
   // Decode every position list once. A missing entry means this doc cannot
   // be a phrase match — this happens for docs filtered through the conjunction
   // without a position-CF entry, so we do NOT log here.
-  std::vector<std::vector<uint32_t>> positions_cache(unique_size);
+  std::vector<Positions, ailego::BudgetedAllocator<Positions>> positions_cache(
+      unique_size);
   for (size_t u = 0; u < unique_size; ++u) {
-    if (!statuses[u].ok() || values[u].size() == 0) {
+    if (statuses[u].IsNotFound() || values[u].empty()) {
       return false;
     }
     positions_cache[u] = decode_positions(values[u]);
@@ -180,9 +186,9 @@ bool PhraseDocIterator::verify_phrase_positions(uint32_t doc_id) const {
   return false;
 }
 
-std::vector<uint32_t> PhraseDocIterator::decode_positions(
+PhraseDocIterator::Positions PhraseDocIterator::decode_positions(
     const rocksdb::Slice &data) {
-  std::vector<uint32_t> positions;
+  Positions positions;
   size_t index = 0;
   uint32_t current_position = 0;
   const char *bytes = data.data();

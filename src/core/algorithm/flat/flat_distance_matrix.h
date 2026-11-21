@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #pragma once
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "turbo/quantizer/quantizer.h"
 #include "flat_utility.h"
 
@@ -32,8 +33,14 @@ inline void QuantizedFlatMatrixDistance(const turbo::Quantizer &quantizer,
     return;
   }
   const size_t dim = quantizer.quantized_datapoint_vector_length() / sizeof(T);
-  thread_local std::vector<T> rows, query;
-  thread_local std::vector<const void *> pointers;
+  // These buffers outlive the search context. Keep their admission for the
+  // entire thread-local lifetime, including replacement allocation overlap.
+  thread_local ailego::BudgetedVector<T> rows, query;
+  thread_local ailego::BudgetedVector<const void *> pointers;
+  if ((dim && rows_count > rows.max_size() / dim) || dim > query.max_size() ||
+      rows_count > pointers.max_size()) {
+    throw std::bad_alloc();
+  }
   rows.resize(rows_count * dim);
   query.resize(dim);
   pointers.resize(rows_count);

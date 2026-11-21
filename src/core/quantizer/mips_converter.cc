@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <turbo/norm/norm2_matrix.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/ailego/utility/type_helper.h>
@@ -136,7 +137,7 @@ class MipsConverterHolder : public IndexHolder {
       }
     }
 
-    std::vector<float> buffer_{};
+    ailego::BudgetedVector<float> buffer_{};
     uint32_t m_value_{0u};
     float u_value_{0.0f};
     float l2_norm_{0.0f};
@@ -274,7 +275,7 @@ class MipsConverterForcedHalfHolder : public IndexHolder {
       }
     }
 
-    std::vector<ailego::Float16> buffer_{};
+    ailego::BudgetedVector<ailego::Float16> buffer_{};
     uint32_t m_value_{0u};
     float u_value_{0.0f};
     float l2_norm_{0.0f};
@@ -415,7 +416,7 @@ class MipsConverterHalfHolder : public IndexHolder {
       }
     }
 
-    std::vector<ailego::Float16> buffer_{};
+    ailego::BudgetedVector<ailego::Float16> buffer_{};
     uint32_t m_value_{0u};
     float u_value_{0.0f};
     float l2_norm_{0.0f};

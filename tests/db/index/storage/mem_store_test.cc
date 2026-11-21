@@ -808,9 +808,9 @@ TEST_F(MemStoreTest, ThreadSafety) {
 
   for (int t = 0; t < num_threads; ++t) {
     futures.push_back(
-        std::async(std::launch::async, [this, t, inserts_per_thread]() {
-          for (int i = 0; i < inserts_per_thread; ++i) {
-            uint64_t doc_id = t * inserts_per_thread + i;
+        std::async(std::launch::async, [this, t, count = inserts_per_thread]() {
+          for (int i = 0; i < count; ++i) {
+            uint64_t doc_id = t * count + i;
             store_->insert(CreateDoc(doc_id));
           }
         }));

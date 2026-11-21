@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "hnsw_rabitq_algorithm.h"
 #include <chrono>
+#include <mutex>
 #include "hnsw_rabitq_entity.h"
 
 namespace zvec {
@@ -23,12 +24,16 @@ HnswRabitqAlgorithm::HnswRabitqAlgorithm(HnswRabitqEntity &entity)
       mt_(std::chrono::system_clock::now().time_since_epoch().count()),
       lock_pool_(kLockCnt) {}
 
-int HnswRabitqAlgorithm::cleanup() {
+int HnswRabitqAlgorithm::cleanup() try {
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
-                                  HnswRabitqContext *ctx) {
+                                  HnswRabitqContext *ctx) try {
   spin_lock_.lock();
 
   // std::cout << "id: " << id << ", level: " << level << std::endl;
@@ -42,13 +47,14 @@ int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
   }
   spin_lock_.unlock();
 
+  std::unique_lock<decltype(mutex_)> level_lock(mutex_, std::defer_lock);
   if (ailego_unlikely(level > cur_max_level)) {
-    mutex_.lock();
+    level_lock.lock();
     // re-check max level
     cur_max_level = entity_.cur_max_level();
     entry_point = entity_.entry_point();
     if (level <= cur_max_level) {
-      mutex_.unlock();
+      level_lock.unlock();
     }
   }
 
@@ -74,10 +80,15 @@ int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
     spin_lock_.lock();
     entity_.update_ep_and_level(id, level);
     spin_lock_.unlock();
-    mutex_.unlock();
+    level_lock.unlock();
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  ctx->release_build_workspace();
+  return IndexError_NoMemory;
 }
 
 //! select_entry_point on hnsw level, ef = 1
@@ -97,7 +108,7 @@ void HnswRabitqAlgorithm::select_entry_point(level_t level,
       break;
     }
 
-    std::vector<IndexStorage::MemoryBlock> neighbor_vec_blocks;
+    IndexProvider::VectorBlocks neighbor_vec_blocks;
     int ret = dc.get_vectors(&neighbors[0], size, neighbor_vec_blocks);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
@@ -208,7 +219,7 @@ void HnswRabitqAlgorithm::search_neighbors(level_t level,
       continue;
     }
 
-    std::vector<IndexStorage::MemoryBlock> neighbor_vec_blocks;
+    IndexProvider::VectorBlocks neighbor_vec_blocks;
     int ret = dc.get_vectors(neighbor_ids.data(), size, neighbor_vec_blocks);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
@@ -263,7 +274,8 @@ void HnswRabitqAlgorithm::update_neighbors(HnswRabitqAddDistCalculator &dc,
   uint32_t max_neighbor_cnt = entity_.neighbor_cnt(level);
   if (topk_heap.size() <= static_cast<size_t>(entity_.prune_cnt())) {
     if (topk_heap.size() <= static_cast<size_t>(max_neighbor_cnt)) {
-      entity_.update_neighbors(level, id, topk_heap.container());
+      CheckGraphStorage(
+          entity_.update_neighbors(level, id, topk_heap.container()));
       return;
     }
   }
@@ -292,7 +304,7 @@ void HnswRabitqAlgorithm::update_neighbors(HnswRabitqAddDistCalculator &dc,
   }
 
   topk_heap.truncate(cur_size);
-  entity_.update_neighbors(level, id, topk_heap.container());
+  CheckGraphStorage(entity_.update_neighbors(level, id, topk_heap.container()));
 
   return;
 }
@@ -305,7 +317,7 @@ size_t HnswRabitqAlgorithm::prune_neighbors(HnswRabitqAddDistCalculator &dc,
     candidate_ids[i] = topk_heap[i].first;
   }
 
-  std::vector<IndexStorage::MemoryBlock> candidate_blocks;
+  IndexProvider::VectorBlocks candidate_blocks;
   int ret = dc.get_vectors(candidate_ids.data(),
                            static_cast<uint32_t>(candidate_ids.size()),
                            candidate_blocks);
@@ -375,13 +387,14 @@ void HnswRabitqAlgorithm::reverse_update_neighbors(
   const size_t max_neighbor_cnt = entity_.neighbor_cnt(level);
 
   uint32_t lock_idx = id & kLockMask;
-  lock_pool_[lock_idx].lock();
+  std::unique_lock<std::remove_reference_t<decltype(lock_pool_[lock_idx])>>
+      node_lock(lock_pool_[lock_idx]);
   const Neighbors neighbors = entity_.get_neighbors(level, id);
   size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {
     entity_.add_neighbor(level, id, size, link_id);
-    lock_pool_[lock_idx].unlock();
+    node_lock.unlock();
     return;
   }
 
@@ -392,7 +405,7 @@ void HnswRabitqAlgorithm::reverse_update_neighbors(
     neighbor_ids[i] = neighbors[i];
   }
   IndexStorage::MemoryBlock center_block;
-  std::vector<IndexStorage::MemoryBlock> neighbor_blocks;
+  IndexProvider::VectorBlocks neighbor_blocks;
   int ret = dc.get_vector(id, center_block);
   if (ailego_likely(ret == 0)) {
     ret = dc.get_vectors(neighbor_ids.data(),
@@ -418,9 +431,10 @@ void HnswRabitqAlgorithm::reverse_update_neighbors(
   size_t cur_size = prune_neighbors(dc, update_heap, max_neighbor_cnt);
 
   update_heap.truncate(cur_size);
-  entity_.update_neighbors(level, id, update_heap.container());
+  CheckGraphStorage(
+      entity_.update_neighbors(level, id, update_heap.container()));
 
-  lock_pool_[lock_idx].unlock();
+  node_lock.unlock();
 
   update_heap.clear();
 

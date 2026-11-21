@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "python_config.h"
+#include <limits>
 #include <pybind11/stl.h>
 #include <zvec/ailego/io/io_backend.h>
 
@@ -85,9 +86,13 @@ void ZVecPyConfig::Initialize(pybind11::module_ &m) {
     GlobalConfig::ConfigData data;
     // config memory_limit_mb
     if (has_key(config_dict, "memory_limit_mb")) {
-      auto mb = get_if<int64_t>(config_dict, "memory_limit_mb").value();
+      const auto mb = get_if<int64_t>(config_dict, "memory_limit_mb").value();
       if (mb <= 0) throw py::value_error("memory_limit_mb must be positive");
-      data.memory_limit_bytes = static_cast<uint64_t>(mb) * 1024 * 1024;
+      constexpr uint64_t kMiB = uint64_t{1} << 20;
+      if (static_cast<uint64_t>(mb) >
+          (std::numeric_limits<uint64_t>::max)() / kMiB)
+        throw py::value_error("memory_limit_mb exceeds the supported range");
+      data.memory_limit_bytes = static_cast<uint64_t>(mb) * kMiB;
     }
 
     // config log

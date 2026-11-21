@@ -22,6 +22,7 @@
 #include "db/common/constants.h"
 #include "db/common/typedef.h"
 #include "db/common/utils.h"
+#include "db/index/column/fts_column/fts_pipeline.h"
 #include "db/index/common/identifier_validation.h"
 #include "db/index/common/type_helper.h"
 
@@ -56,7 +57,32 @@ std::unordered_set<IndexType> support_dense_vector_index = {
 std::unordered_set<IndexType> support_sparse_vector_index = {IndexType::FLAT,
                                                              IndexType::HNSW};
 
+static Status validate_fts_index_params(const FieldSchema &field) {
+  auto params = std::dynamic_pointer_cast<FtsIndexParams>(field.index_params());
+  if (!params) {
+    return Status::InvalidArgument(
+        "Invalid schema: FTS index requires FtsIndexParams, but field[",
+        field.name(), "] has incompatible index params");
+  }
+
+  // Reuse the validated analyzer for opening/querying. Constructing and
+  // discarding a full Jieba dictionary here doubles loader work and leaves
+  // allocator backing behind before the actual indexer opens.
+  auto pipeline = detail::AcquireFtsPipeline(*params);
+  if (!pipeline.has_value()) {
+    if (pipeline.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return pipeline.error();
+    return Status::InvalidArgument(
+        "Invalid schema: invalid FTS index params for field[", field.name(),
+        "]: ", pipeline.error().message());
+  }
+  return Status::OK();
+}
+
 static Status validate_index_params(const FieldSchema &field) {
+  if (field.index_params()->type() == IndexType::FTS) {
+    return validate_fts_index_params(field);
+  }
   auto status = field.index_params()->validate();
   if (!status.ok()) {
     return Status(status.code(), "Invalid schema for field[" + field.name() +
@@ -252,13 +278,6 @@ Status FieldSchema::validate() const {
         return Status::InvalidArgument("Invalid schema for field[", name_,
                                        "]: FTS requires STRING data_type; got ",
                                        DataTypeCodeBook::AsString(data_type_));
-      }
-      if (index_params_->type() == IndexType::FTS) {
-        if (!dynamic_cast<const FtsIndexParams *>(index_params_.get())) {
-          return Status::InvalidArgument(
-              "Invalid schema for field[", name_,
-              "]: FTS index requires FtsIndexParams");
-        }
       }
       auto params_status = validate_index_params(*this);
       CHECK_RETURN_STATUS(params_status);

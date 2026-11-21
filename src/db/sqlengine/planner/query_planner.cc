@@ -18,6 +18,7 @@
 #include <vector>
 #include <arrow/acero/api.h>
 #include <arrow/compute/api.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/db/schema.h>
@@ -35,6 +36,7 @@
 #include "db/sqlengine/planner/ops/fetch_vector_op.h"
 #include "db/sqlengine/planner/plan_info.h"
 #include "db/sqlengine/planner/segment_node.h"
+#include "db/sqlengine/planner/topk_merge_node.h"
 #include "db/sqlengine/planner/vector_recall_node.h"
 #include "optimizer.h"
 
@@ -347,6 +349,10 @@ Result<PlanInfo::Ptr> QueryPlanner::make_plan(
 Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     const std::vector<Segment::Ptr> &segments, const std::string & /*trace_id*/,
     std::vector<sqlengine::QueryInfo::Ptr> *query_infos) {
+  const bool budgeted = std::any_of(
+      segments.begin(), segments.end(),
+      [](const auto &segment) { return segment->uses_buffer_storage(); });
+
   const std::string &table_name = schema_->name();
   if (segments.empty()) {
     LOG_ERROR("Segment not found [%s]", table_name.c_str());
@@ -363,6 +369,24 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
   bool vector_is_reverse =
       has_vector && query_info->vector_cond_info()->is_reverse_sort();
   bool has_group_by = query_info->group_by() != nullptr;
+  const bool merge_topk =
+      (segments.size() > 1 || has_group_by) && (has_vector || has_fts);
+  auto output_query_info = (*query_infos)[0];
+
+  // Segment-local optimization may add columns used only by that segment's
+  // filter. Keep the merge schema independent of those temporary columns.
+  std::vector<std::string> output_columns;
+  // Rank-only topK plans already expose the same row-id/score schema and
+  // fetch projected fields after the global merge.
+  if (!has_vector && !merge_topk && segments.size() > 1) {
+    output_columns = query_info->get_all_fetched_scalar_field_names();
+    if (!has_fts && query_info->is_include_vector()) {
+      for (const auto &field : query_info->selected_vector_fields()) {
+        output_columns.push_back(field.field_name);
+      }
+    }
+    if (has_fts) output_columns.push_back(FIELD_SCORE);
+  }
 
   // optimize plan by instrument query info condition, eg adjust invert cond
   Optimizer::Ptr optimizer =
@@ -411,10 +435,12 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     Result<PlanInfo::Ptr> seg_plan;
     if (segment_query_info->vector_cond_info()) {
       seg_plan = vector_scan(segment, std::move(segment_query_info),
-                             std::move(forward_filter), single_stage_search);
+                             std::move(forward_filter), single_stage_search,
+                             merge_topk);
     } else if (segment_query_info->fts_cond_info()) {
-      seg_plan = fts_scan(segment, std::move(segment_query_info),
-                          std::move(forward_filter), single_stage_search);
+      seg_plan =
+          fts_scan(segment, std::move(segment_query_info),
+                   std::move(forward_filter), single_stage_search, merge_topk);
     } else if (segment_query_info->invert_cond()) {
       seg_plan = invert_scan(segment, std::move(segment_query_info),
                              std::move(forward_filter));
@@ -426,19 +452,44 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
       LOG_ERROR("Make plan failed: %s", seg_plan.error().c_str());
       return seg_plan;
     }
-    if (segments.size() == 1) {
+    if (segments.size() == 1 && !merge_topk) {
       return seg_plan;
+    }
+    if (!has_vector && !merge_topk) {
+      auto status = seg_plan.value()->project(output_columns);
+      if (!status.ok()) return tl::make_unexpected(status);
     }
     segment_plans[idx] = std::move(seg_plan.value());
   }
 
   // multi segment logic
   ailego::ThreadPool *pool = GlobalResource::Instance().query_thread_pool();
+  if (pool == nullptr) {
+    return tl::make_unexpected(
+        Status::InternalError("Query thread pool initialization failed"));
+  }
+  if (merge_topk) {
+    try {
+      auto merge = std::make_shared<TopKMergeNode>(
+          std::move(segment_plans), segments, std::move(output_query_info),
+          has_fts || vector_is_reverse, pool);
+      ac::Declaration node{"source",
+                           ac::SourceNodeOptions{merge->schema(), merge->gen(),
+                                                 cp::Ordering::Implicit()}};
+      return std::make_shared<PlanInfo>(std::move(node), merge->schema(),
+                                        budgeted);
+    } catch (const std::bad_alloc &) {
+      return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                        "Cannot allocate global topK plan"));
+    } catch (const std::exception &error) {
+      return tl::make_unexpected(Status::InternalError(error.what()));
+    }
+  }
   auto recall_node =
       std::make_shared<SegmentNode>(std::move(segment_plans), pool);
   auto source_node_options =
-      arrow::acero::SourceNodeOptions{recall_node->schema(), recall_node->gen(),
-                                      arrow::compute::Ordering::Implicit()};
+      AsyncSourceNodeOptions{recall_node->schema(), recall_node->gen(),
+                             [recall_node] { return recall_node->finish(); }};
   ac::Declaration node{"source", source_node_options};
 
   if (has_vector) {
@@ -463,12 +514,15 @@ Result<PlanInfo::Ptr> QueryPlanner::make_physical_plan(
     node = ac::Declaration{
         "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
   }
-  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema());
+  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema(),
+                                    budgeted);
 }
 
 Result<PlanInfo::Ptr> QueryPlanner::forward_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto reader = seg->scan(query_info->get_all_fetched_scalar_field_names());
   auto schema = reader->schema();
   ac::Declaration node{
@@ -529,7 +583,8 @@ Result<PlanInfo::Ptr> QueryPlanner::forward_scan(
   node = ac::Declaration{"fetch",
                          {std::move(node)},
                          ac::FetchNodeOptions{0, query_info->query_topn()}};
-  return std::make_shared<PlanInfo>(std::move(node), std::move(schema));
+  return std::make_shared<PlanInfo>(std::move(node), std::move(schema),
+                                    budgeted);
 }
 
 DocFilter::Ptr QueryPlanner::build_doc_filter(
@@ -561,15 +616,19 @@ DocFilter::Ptr QueryPlanner::build_doc_filter(
 Result<PlanInfo::Ptr> QueryPlanner::vector_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter,
-    bool single_stage_search) {
+    bool single_stage_search, bool rank_only) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto doc_filter =
       build_doc_filter(seg, query_info, forward_filter, single_stage_search);
 
   int topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, false);
+  if (rank_only)
+    batch_size = query_info->group_by() ? 1024 : std::min(batch_size, 1024);
   auto recall_node = std::make_shared<VectorRecallNode>(
       std::move(seg), std::move(query_info), std::move(doc_filter), batch_size,
-      single_stage_search);
+      single_stage_search, rank_only);
 
   auto source_node_options =
       arrow::acero::SourceNodeOptions{recall_node->schema(), recall_node->gen(),
@@ -580,14 +639,49 @@ Result<PlanInfo::Ptr> QueryPlanner::vector_scan(
     node = ac::Declaration{
         "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
   }
-  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema());
+  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema(),
+                                    budgeted);
 }
 
 Result<PlanInfo::Ptr> QueryPlanner::invert_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, forward_filter != nullptr);
+  if (budgeted) {
+    // Small fixed-width projections need not pay for a source/allocator
+    // handoff every 256 rows. Keep the original cap for variable user fields,
+    // large projections and pressure reads; all real buffers remain admitted.
+    bool narrow = !query_info->is_include_vector() &&
+                  query_info->get_all_fetched_scalar_field_names().size() <= 4;
+    for (const auto &name : query_info->get_all_fetched_scalar_field_names()) {
+      if (name == USER_ID || name == GLOBAL_DOC_ID || name == LOCAL_ROW_ID)
+        continue;
+      const auto *field = schema_->get_field(name);
+      if (!field) {
+        narrow = false;
+        break;
+      }
+      switch (field->data_type()) {
+        case DataType::BOOL:
+        case DataType::INT32:
+        case DataType::INT64:
+        case DataType::UINT32:
+        case DataType::UINT64:
+        case DataType::FLOAT:
+        case DataType::DOUBLE:
+          break;
+        default:
+          narrow = false;
+          break;
+      }
+    }
+    const bool headroom = ailego::MemoryLimitPool::get_instance()
+                              .prefetch_available() >= 128UL * 1024 * 1024;
+    batch_size = std::min(batch_size, narrow && headroom ? 4096 : 256);
+  }
   auto recall_node =
       std::make_shared<InvertRecallNode>(seg, query_info, batch_size);
 
@@ -638,20 +732,25 @@ Result<PlanInfo::Ptr> QueryPlanner::invert_scan(
 
   node = ac::Declaration{
       "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
-  return std::make_shared<PlanInfo>(std::move(node), std::move(schema));
+  return std::make_shared<PlanInfo>(std::move(node), std::move(schema),
+                                    budgeted);
 }
 
 Result<PlanInfo::Ptr> QueryPlanner::fts_scan(
     Segment::Ptr seg, QueryInfo::Ptr query_info,
     std::unique_ptr<arrow::compute::Expression> forward_filter,
-    bool single_stage_search) {
+    bool single_stage_search, bool rank_only) {
+  const bool budgeted = seg->uses_buffer_storage();
+
   auto doc_filter =
       build_doc_filter(seg, query_info, forward_filter, single_stage_search);
 
   auto topn = query_info->query_topn();
   int batch_size = get_batch_size(*query_info, false);
+  if (rank_only) batch_size = std::min(batch_size, 1024);
   auto recall_node = std::make_shared<FtsRecallNode>(
-      std::move(seg), std::move(query_info), std::move(doc_filter), batch_size);
+      std::move(seg), std::move(query_info), std::move(doc_filter), batch_size,
+      rank_only);
 
   auto source_node_options =
       arrow::acero::SourceNodeOptions{recall_node->schema(), recall_node->gen(),
@@ -660,7 +759,8 @@ Result<PlanInfo::Ptr> QueryPlanner::fts_scan(
 
   node = ac::Declaration{
       "fetch", {std::move(node)}, ac::FetchNodeOptions{0, topn}};
-  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema());
+  return std::make_shared<PlanInfo>(std::move(node), recall_node->schema(),
+                                    budgeted);
 }
 
 int QueryPlanner::get_batch_size(const QueryInfo &info, bool has_later_filter) {

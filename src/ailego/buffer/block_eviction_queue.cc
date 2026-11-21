@@ -2620,9 +2620,10 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
     const size_t native_room = native_available();
     const size_t rss_room = process_rss_.available();
     capacity_waits_.fetch_add(1, std::memory_order_relaxed);
+    bool progress;
     {
       std::unique_lock<std::mutex> lock(capacity_mutex_);
-      const bool progress = capacity_cv_.wait_until(
+      progress = capacity_cv_.wait_until(
           lock, std::min(deadline, Clock::now() + milliseconds(100)),
           [this, native_room, rss_room, request] {
             return (request.native_bytes && native_available() > native_room) ||
@@ -2632,10 +2633,10 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
         capacity_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
     }
     if (admit()) return true;
-    // Empty queues are conclusive only when no pending proof or registered
-    // process-cache reclaimer can restore admission. All three mandatory
-    // entry points use the same recovery rule and the same deadline.
-    if (!process_rss_.has_resident_uncertainty() && !has_reclaimer) {
+    // Live owners can release a large reservation in several steps. Keep
+    // waiting within the deadline while capacity is making progress even
+    // when no eviction or residency work remains.
+    if (!progress && !process_rss_.has_resident_uncertainty() && !has_reclaimer) {
       const auto queues = BlockEvictionQueue::get_instance().stats();
       if (std::all_of(queues.approximate_queue_sizes.begin(),
                       queues.approximate_queue_sizes.end(),

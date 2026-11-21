@@ -41,7 +41,7 @@ int HnswRabitqContext::init(ContextType type) {
 
   switch (type) {
     case kBuilderContext:
-      ret = visit_filter_.init(VisitFilter::ByteMap, entity_->doc_cnt(),
+      ret = visit_filter_.init(VisitFilter::EpochBitMap, entity_->doc_cnt(),
                                max_scan_num_, negative_probability_);
       if (ret != 0) {
         LOG_ERROR("Create filter failed,  mode %d", filter_mode_);
@@ -78,7 +78,7 @@ int HnswRabitqContext::init(ContextType type) {
       update_heap_.limit(entity_->l0_neighbor_cnt() + 1);
       candidates_.limit(max_scan_num_);
 
-      check_need_adjuct_ctx();
+      if (!check_need_adjuct_ctx()) return IndexError_NoMemory;
       break;
 
     default:
@@ -91,7 +91,8 @@ int HnswRabitqContext::init(ContextType type) {
 
 int HnswRabitqContext::update(const ailego::Params &params) {
   auto update_visit_filter_param = [&]() {
-    bool need_update = false;
+    bool need_update =
+        visit_filter_.get_mode() != static_cast<int>(filter_mode_);
     std::string p;
     switch (type_) {
       case kSearcherContext:
@@ -108,7 +109,7 @@ int HnswRabitqContext::update(const ailego::Params &params) {
       if (bf_enabled ^ (filter_mode_ == VisitFilter::BloomFilter)) {
         need_update = true;
         filter_mode_ =
-            bf_enabled ? VisitFilter::BloomFilter : VisitFilter::ByteMap;
+            bf_enabled ? VisitFilter::BloomFilter : VisitFilter::EpochBitMap;
       }
     }
 
@@ -128,7 +129,6 @@ int HnswRabitqContext::update(const ailego::Params &params) {
       need_update = true;
     }
     if (need_update) {
-      visit_filter_.destroy();
       int max_doc_cnt = 0;
       if (type_ == kSearcherContext) {
         max_doc_cnt = entity_->doc_cnt();

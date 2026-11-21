@@ -20,8 +20,8 @@ namespace zvec {
 
 FilteringReader::FilteringReader(
     std::shared_ptr<arrow::RecordBatchReader> inner_reader,
-    const IndexFilter::Ptr &filter)
-    : inner_reader_(std::move(inner_reader)), filter_(filter) {
+    const IndexFilter::Ptr &filter, arrow::MemoryPool *pool)
+    : inner_reader_(std::move(inner_reader)), filter_(filter), pool_(pool) {
   // `filter` must be non-null: callers that have nothing to filter read
   // the inner reader directly instead of wrapping it.
   const auto &s = *inner_reader_->schema();
@@ -36,22 +36,24 @@ FilteringReader::FilteringReader(
 
 arrow::Status FilteringReader::ReadNext(
     std::shared_ptr<arrow::RecordBatch> *batch) {
+  *batch = nullptr;
   // The delete-key column was resolved and validated at construction.
   if (!schema_error_.ok()) {
     return schema_error_;
   }
 
   while (true) {
-    ARROW_RETURN_NOT_OK(inner_reader_->ReadNext(batch));
-    if (!*batch) {
+    std::shared_ptr<arrow::RecordBatch> input;
+    ARROW_RETURN_NOT_OK(inner_reader_->ReadNext(&input));
+    if (!input) {
       return arrow::Status::OK();
     }
     auto *gdoc_array = static_cast<const arrow::UInt64Array *>(
-        (*batch)->column(gdoc_col_).get());
+        input->column(gdoc_col_).get());
 
     // Build filter mask: true = keep, false = skip (deleted)
-    arrow::BooleanBuilder mask_builder;
-    int64_t num_rows = (*batch)->num_rows();
+    arrow::BooleanBuilder mask_builder(pool_);
+    int64_t num_rows = input->num_rows();
     ARROW_RETURN_NOT_OK(mask_builder.Reserve(num_rows));
 
     bool has_filtered = false;
@@ -63,23 +65,24 @@ arrow::Status FilteringReader::ReadNext(
     }
 
     if (!has_filtered) {
+      *batch = std::move(input);
       return arrow::Status::OK();
     }
 
     std::shared_ptr<arrow::Array> mask_array;
     ARROW_RETURN_NOT_OK(mask_builder.Finish(&mask_array));
 
-    arrow::Datum result;
+    arrow::compute::ExecContext ctx(pool_);
     ARROW_ASSIGN_OR_RAISE(
-        result,
-        arrow::compute::Filter(arrow::Datum(*batch), arrow::Datum(mask_array)));
-
-    *batch = result.record_batch();
+        auto result,
+        arrow::compute::Filter(arrow::Datum(input), arrow::Datum(mask_array),
+                               arrow::compute::FilterOptions::Defaults(), &ctx));
 
     // All rows filtered out: continue to the next batch.
-    if ((*batch)->num_rows() == 0) {
+    if (result.record_batch()->num_rows() == 0) {
       continue;
     }
+    *batch = result.record_batch();
 
     return arrow::Status::OK();
   }

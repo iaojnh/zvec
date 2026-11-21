@@ -45,7 +45,8 @@ std::string TokenizerPipelineManager::make_key(const FtsIndexParams &params) {
 // ============================================================
 
 TokenizerPipelinePtr TokenizerPipelineManager::acquire(
-    const FtsIndexParams &params) {
+    const FtsIndexParams &params, Status *status) {
+  if (status) *status = Status::OK();
   const std::string key = make_key(params);
 
   // Fast path: pipeline already exists.
@@ -65,6 +66,7 @@ TokenizerPipelinePtr TokenizerPipelineManager::acquire(
   // acquire/release calls during the (potentially expensive) construction.
   auto pipeline_result = TokenizerFactory::create(params);
   if (!pipeline_result.has_value()) {
+    if (status) *status = pipeline_result.error();
     LOG_ERROR(
         "TokenizerPipelineManager: failed to create pipeline for "
         "tokenizer[%s] key[%s]: %s",

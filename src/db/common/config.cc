@@ -12,12 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <exception>
+#include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/utility/file_helper.h>
 #include <zvec/db/config.h>
 #include <zvec/db/status.h>
 #include "db/common/constants.h"
 #include "db/common/global_resource.h"
+#include "db/common/mobile_memory.h"
 #include "cgroup_util.h"
 #include "global_resource.h"
 #include "glogger.h"
@@ -30,9 +37,16 @@ static void ExitLogHandler() {
   LogUtil::Shutdown();
 }
 
+static uint64_t MaximumMemoryLimit() {
+  return std::min<uint64_t>(CgroupUtil::get_memory_limit(),
+                            (std::numeric_limits<size_t>::max)());
+}
+
 GlobalConfig::ConfigData::ConfigData()
-    : memory_limit_bytes(CgroupUtil::get_memory_limit() *
-                         DEFAULT_MEMORY_LIMIT_RATIO),
+    : memory_limit_bytes(
+          detail::kMobileMemoryPolicy
+              ? detail::MobileDefaultMemoryLimit(MaximumMemoryLimit())
+              : MaximumMemoryLimit() * DEFAULT_MEMORY_LIMIT_RATIO),
       log_config(std::make_shared<ConsoleLogConfig>()),
       query_thread_count(CgroupUtil::get_cpu_limit()),
       query_thread_binding(false),
@@ -43,14 +57,28 @@ GlobalConfig::ConfigData::ConfigData()
       optimize_thread_binding(false) {}
 
 Status GlobalConfig::validate(const ConfigData &config) const {
-  if (config.memory_limit_bytes < MIN_MEMORY_LIMIT_BYTES) {
+  if (!config.temporary_directory.empty()) {
+    std::error_code error;
+    if (config.temporary_directory.find('\0') != std::string::npos ||
+        !std::filesystem::is_directory(
+            ailego::FileHelper::PathFromUtf8(config.temporary_directory),
+            error) ||
+        error) {
+      return Status::InvalidArgument(
+          "temporary_directory must name an existing directory");
+    }
+  }
+  const uint64_t minimum = detail::kMobileMemoryPolicy
+                               ? detail::kMobileMinimumMemoryLimit
+                               : MIN_MEMORY_LIMIT_BYTES;
+  if (config.memory_limit_bytes < minimum) {
     return Status::InvalidArgument("memory_limit_bytes must be greater than ",
-                                   MIN_MEMORY_LIMIT_BYTES);
+                                   minimum);
   }
 
-  if (config.memory_limit_bytes > CgroupUtil::get_memory_limit()) {
+  if (config.memory_limit_bytes > MaximumMemoryLimit()) {
     return Status::InvalidArgument("memory_limit_bytes must be less than ",
-                                   CgroupUtil::get_memory_limit());
+                                   MaximumMemoryLimit());
   }
 
   // Validate query thread count
@@ -86,9 +114,17 @@ Status GlobalConfig::validate(const ConfigData &config) const {
   }
 
   // Validate log configuration
-  if (config.log_config->get_logger_type() == FILE_LOG_TYPE_NAME) {
+  if (!config.log_config) {
+    return Status::InvalidArgument("log_config cannot be null");
+  }
+  const std::string logger_type = config.log_config->get_logger_type();
+  if (logger_type == FILE_LOG_TYPE_NAME) {
     auto log_config =
         std::dynamic_pointer_cast<FileLogConfig>(config.log_config);
+    if (!log_config) {
+      return Status::InvalidArgument(
+          "AppendLogger configuration must use FileLogConfig");
+    }
 
     // Validate file log specific configurations
     if (log_config->dir.empty()) {
@@ -111,38 +147,156 @@ Status GlobalConfig::validate(const ConfigData &config) const {
       return Status::InvalidArgument(
           "log_overdue_days must be greater than 0 when set to FileLogger");
     }
+  } else if (logger_type == CONSOLE_LOG_TYPE_NAME) {
+    if (!std::dynamic_pointer_cast<ConsoleLogConfig>(config.log_config)) {
+      return Status::InvalidArgument(
+          "ConsoleLogger configuration must use ConsoleLogConfig");
+    }
+  } else {
+    return Status::InvalidArgument("unsupported logger type: ", logger_type);
   }
 
   return Status::OK();
 }
 
 Status GlobalConfig::initialize(const ConfigData &config) {
-  // Use atomic compare-exchange to ensure only one initialization
-  bool expected = false;
-  if (!initialized_.compare_exchange_strong(expected, true)) {
-    return Status::OK();
+  {
+    std::unique_lock<std::mutex> lock(initialization_mutex_);
+    initialization_cv_.wait(lock, [this] {
+      return initialization_state_ != InitializationState::kInitializing;
+    });
+    if (initialization_state_ == InitializationState::kInitialized ||
+        initialization_state_ == InitializationState::kFailed) {
+      return initialization_status_;
+    }
+    initialization_state_ = InitializationState::kInitializing;
   }
 
-  auto s = validate(config);
-  CHECK_RETURN_STATUS(s);
+  Status result;
+  bool validation_failed = false;
+  try {
+    result = validate(config);
+    validation_failed = !result.ok();
 
-  config_ = config;
+    ConfigData effective_config;
+    std::shared_ptr<const ConfigData> published_config;
+    if (result.ok()) {
+      // Prepare a complete snapshot locally, but do not publish it until all
+      // side-effecting initialization stages have succeeded.
+      effective_config = config;
+      // The public ConfigData remains mutable to preserve API compatibility.
+      // Clone the built-in logger configurations so caller-side mutations
+      // after Initialize() cannot silently modify the published snapshot.
+      if (auto file = std::dynamic_pointer_cast<FileLogConfig>(
+              effective_config.log_config)) {
+        effective_config.log_config = std::make_shared<FileLogConfig>(*file);
+      } else if (auto console = std::dynamic_pointer_cast<ConsoleLogConfig>(
+                     effective_config.log_config)) {
+        effective_config.log_config =
+            std::make_shared<ConsoleLogConfig>(*console);
+      }
+      // Allocate the immutable publication object before logs, thread pools or
+      // the memory pool are changed. The final atomic store cannot fail.
+      published_config = std::make_shared<const ConfigData>(effective_config);
+    }
 
-  s = LogUtil::Init(log_dir(), log_file_basename(), int(log_level()),
-                    log_type(), log_file_size(), log_overdue_days());
-  CHECK_RETURN_STATUS(s);
+    if (result.ok()) {
+      const auto *file_config = dynamic_cast<const FileLogConfig *>(
+          effective_config.log_config.get());
+      static const std::string empty;
+      result = LogUtil::Init(file_config ? file_config->dir : empty,
+                             file_config ? file_config->basename : empty,
+                             int(effective_config.log_config->level),
+                             effective_config.log_config->get_logger_type(),
+                             file_config ? file_config->file_size : 0,
+                             file_config ? file_config->overdue_days : 0);
+    }
 
-  if (std::atexit(ExitLogHandler) != 0) {
-    std::cerr << "Failed to register exit handler" << std::endl;
-    return Status::InternalError("Failed to register exit handler");
+    if (result.ok()) {
+      // Initialize the logger before its exit callback and create global
+      // resources afterwards, so normal shutdown releases resources before
+      // clearing the still-live logger state.
+      static const bool exit_handler_registered =
+          std::atexit(ExitLogHandler) == 0;
+      if (!exit_handler_registered) {
+        std::cerr << "Failed to register exit handler" << std::endl;
+        result = Status::InternalError("Failed to register exit handler");
+      }
+    }
+
+    if (result.ok()) {
+      if (!ailego::FileHelper::SetTemporaryDirectory(
+              effective_config.temporary_directory)) {
+        result =
+            Status::InvalidArgument("Failed to configure temporary_directory: ",
+                                    ailego::FileHelper::GetLastErrorString());
+      }
+    }
+
+    if (result.ok()) {
+      const int resource_result = GlobalResource::Instance().initialize(
+          effective_config.memory_limit_bytes,
+          effective_config.query_thread_count,
+          effective_config.query_thread_binding,
+          effective_config.optimize_thread_count,
+          effective_config.optimize_thread_binding);
+      if (resource_result != 0) {
+        // Keep the initialized logger available for diagnostics, but do not
+        // publish configuration when resource initialization fails.
+        result = Status::InternalError(
+            "Failed to initialize the process-wide global resources");
+      }
+    }
+
+    if (result.ok()) {
+      auto old_config = config_snapshot();
+      if (old_config->log_config != published_config->log_config) {
+        retained_log_config_ = old_config->log_config;
+      }
+      std::atomic_store_explicit(&config_, std::move(published_config),
+                                 std::memory_order_release);
+    }
+  } catch (const std::exception &e) {
+    result = Status::InternalError(
+        "Global configuration initialization threw: ", e.what());
+  } catch (...) {
+    result = Status::InternalError(
+        "Global configuration initialization threw an unknown exception");
   }
 
-  GlobalResource::Instance().initialize();
-  return Status::OK();
+  {
+    std::lock_guard<std::mutex> lock(initialization_mutex_);
+    initialization_status_ = result;
+    // Invalid input has no side effects and may be corrected by a later call.
+    // A later failure may already have registered the harmless process-exit
+    // callback, so retain and replay that terminal error rather than retrying
+    // a one-time process initialization with ambiguous ownership.
+    initialization_state_ =
+        validation_failed ? InitializationState::kUninitialized
+                          : (result.ok() ? InitializationState::kInitialized
+                                         : InitializationState::kFailed);
+  }
+  initialization_cv_.notify_all();
+  return result;
 }
 
 uint64_t GlobalConfig::memory_limit_bytes() const noexcept {
-  return config_.memory_limit_bytes;
+  return config_snapshot()->memory_limit_bytes;
+}
+
+Status GlobalConfig::set_memory_pressure(MemoryPressure level) {
+  using Pressure = ailego::ProcessRssBudget::PressureLevel;
+  Pressure pressure;
+  switch (level) {
+    case MemoryPressure::kNormal: pressure = Pressure::kNormal; break;
+    case MemoryPressure::kBackground: pressure = Pressure::kBackground; break;
+    case MemoryPressure::kCritical: pressure = Pressure::kCritical; break;
+    default: return Status::InvalidArgument("Invalid memory pressure level");
+  }
+  if (!GlobalResource::Instance().initialized())
+    return Status::FailedPrecondition("Global resources are not initialized");
+  ailego::MemoryLimitPool::get_instance().set_memory_pressure(pressure);
+  return Status::OK();
 }
 
 FACTORY_REGISTER_LOGGER(AppendLogger);

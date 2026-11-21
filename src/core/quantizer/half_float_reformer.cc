@@ -198,7 +198,7 @@ class HalfFloatSparseReformer : public IndexReformer {
             reinterpret_cast<uint16_t *>(&(*out)[0]));
 
         *ometa = qmeta;
-        ometa->set_data_type(IndexMeta::DataType::DT_FP16);
+        ometa->set_meta(IndexMeta::DataType::DT_FP16, qmeta.dimension());
 
         break;
 
@@ -225,6 +225,38 @@ class HalfFloatSparseReformer : public IndexReformer {
 
     return this->transform((uint32_t)sparse_count_total, sparse_indices,
                            sparse_query, qmeta, out, ometa);
+  }
+
+  int transform_sparse_batch(const uint32_t *counts, const uint32_t *,
+                             const void *query, const IndexQueryMeta &meta,
+                             uint32_t count, SparseQueryBuffer *workspace,
+                             const void **output,
+                             IndexQueryMeta *converted) const override {
+    if (!counts || !workspace || !output || !converted)
+      return IndexError_InvalidArgument;
+    size_t total = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      if (counts[i] > UINT32_MAX - total) return IndexError_OutOfRange;
+      total += counts[i];
+    }
+    if (total && !query) return IndexError_InvalidArgument;
+    *converted = meta;
+    if (meta.data_type() == IndexMeta::DT_FP16) {
+      *output = query;
+      return 0;
+    }
+    if (meta.data_type() != IndexMeta::DT_FP32 ||
+        meta.unit_size() != sizeof(float))
+      return IndexError_Unsupported;
+    if (total > SIZE_MAX / sizeof(float)) return IndexError_OutOfRange;
+    workspace->resize(total * sizeof(ailego::Float16));
+    if (total)
+      ailego::FloatHelper::ToFP16(
+          static_cast<const float *>(query), total,
+          reinterpret_cast<uint16_t *>(workspace->data()));
+    converted->set_meta(IndexMeta::DT_FP16, meta.dimension());
+    *output = workspace->data();
+    return 0;
   }
 
   bool need_revert() const override {

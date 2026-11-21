@@ -20,11 +20,68 @@
 #include <random>
 #include <unordered_map>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_holder.h>
 #include "core/utility/stable_vector_holder.h"
 
 namespace zvec::turbo {
+
+template <class WriteSample>
+inline bool CollectPqTrainingSamplesTo(const core::IndexHolder::Pointer &holder,
+                                       size_t limit, size_t vec_bytes,
+                                       WriteSample write_sample) {
+  if (!holder || !limit || !vec_bytes) return false;
+  if (vec_bytes > holder->element_size()) return false;
+  const size_t input_count = holder->count();
+  const size_t num = std::min(input_count, limit);
+  if (!num || num > std::numeric_limits<size_t>::max() / vec_bytes)
+    return false;
+  // Perform the same seeded partial Fisher-Yates shuffle on row ordinals,
+  // then stream only selected rows into their original training slots. The
+  // sparse permutation and data buffer are bounded by the training limit.
+  using Selection = std::pair<size_t, size_t>;
+  std::vector<Selection, ailego::BudgetedAllocator<Selection>> selected;
+  if (input_count > num) {
+    selected.reserve(num);
+    std::unordered_map<
+        size_t, size_t, std::hash<size_t>, std::equal_to<size_t>,
+        ailego::BudgetedAllocator<std::pair<const size_t, size_t>>>
+        permutation;
+    permutation.reserve(num);
+    auto at = [&](size_t position) {
+      auto entry = permutation.find(position);
+      return entry == permutation.end() ? position : entry->second;
+    };
+    std::mt19937 rng(42);
+    for (size_t i = 0; i < num; ++i) {
+      std::uniform_int_distribution<size_t> dist(i, input_count - 1);
+      size_t j = dist(rng);
+      selected.emplace_back(at(j), i);
+      if (i != j) permutation[j] = at(i);
+      permutation.erase(i);
+    }
+    std::sort(selected.begin(), selected.end());
+  }
+  auto iter = holder->create_iterator();
+  if (!iter) return false;
+  size_t row = 0, copied = 0;
+  for (; iter->is_valid(); iter->next(), ++row) {
+    if (iter->status() != 0) return false;
+    if (row >= input_count) return false;
+    if (!selected.empty() && (copied == num || selected[copied].first != row))
+      continue;
+    const void *data = iter->data();
+    if (!data || iter->status() != 0) return false;
+    size_t slot = selected.empty() ? row : selected[copied].second;
+    if (!write_sample(slot, data)) return false;
+    ++copied;
+  }
+  if (iter->status() != 0 || row != input_count || copied != num) return false;
+  iter.reset();
+  return true;
+}
+
 
 // Shared selection and traversal for copied bytes and borrowed pointers.
 // Leave output unchanged on read failure, including sticky iterator errors.

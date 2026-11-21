@@ -116,7 +116,7 @@ class ZVEC_API Collection {
   // Resolve internal numeric IDs against the same read-only collection
   // snapshot. Result positions are preserved; -1, deleted, or unknown IDs
   // resolve to nullopt.
-  virtual Result<std::vector<std::optional<std::string>>> resolve_internal_ids(
+  virtual Result<ResolvedIdsResult> resolve_internal_ids(
       const std::vector<int64_t> &ids) const = 0;
 
   virtual Result<GroupResults> group_by_query(

@@ -76,17 +76,19 @@ class IvfRabitqReformer {
   //! batch_data: output batch-packed data
   //! ex_data: output extra-bit data for each vector
   int quantize_batch(const float *rotated_data, uint32_t centroid_id,
-                     size_t num_points, char *batch_data, char *ex_data) const;
+                     size_t num_points, char *batch_data, char *ex_data,
+                     ailego::MemoryReservation *workspace = nullptr) const;
 
   //! Find nearest centroid for a vector (using original centroids, brute-force)
   uint32_t find_nearest_centroid(const float *vector) const;
+  int find_nearest_centroid(const float *vector, uint32_t *centroid) const;
 
   //! Select top-n probe centroids using the same metric as build assignment.
   int select_probe_centroids(const float *query, size_t nprobe,
-                             std::vector<uint32_t> *centroids) const;
+                             ailego::BudgetedVector<uint32_t> *centroids) const;
   int select_probe_centroids(
       const float *query, size_t nprobe, IvfRabitqQueryState *state,
-      std::vector<IvfRabitqProbeCentroid> *centroids) const;
+      ailego::BudgetedVector<IvfRabitqProbeCentroid> *centroids) const;
 
   //! Accessors
   size_t num_clusters() const;

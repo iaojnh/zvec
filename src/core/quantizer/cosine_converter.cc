@@ -14,6 +14,7 @@
 #include <iterator>
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <turbo/norm/norm2_matrix.h>
 #include <turbo/norm/normalizer.h>
 #include <turbo/quantizer/entropy_integer_quantizer/integer_quantizer.h>
@@ -112,7 +113,7 @@ class CosineConverterHolder : public IndexHolder {
 
    private:
     //! Encode the data by quantizer
-    void convert_record() {
+    void convert_record() try {
       if (!this->is_valid()) {
         return;
       }
@@ -188,13 +189,17 @@ class CosineConverterHolder : public IndexHolder {
                    &norm, NORM_SIZE);
         }
       }
+    } catch (const std::bad_alloc &) {
+      status_ = IndexError_NoMemory;
+    } catch (const std::runtime_error &) {
+      status_ = IndexError_ReadData;
     }
 
     //! Members
     const CosineConverterHolder *owner_{nullptr};
-    std::string buffer_{};
-    std::string normalize_buffer_{};
-    std::vector<float> rotate_buffer_;
+    ailego::BudgetedString buffer_{};
+    ailego::BudgetedString normalize_buffer_{};
+    ailego::BudgetedVector<float> rotate_buffer_;
     IndexHolder::Iterator::Pointer front_iter_{};
     int status_{0};
     size_t dimension_{0u};

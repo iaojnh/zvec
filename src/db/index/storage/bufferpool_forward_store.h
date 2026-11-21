@@ -14,8 +14,10 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+#include <arrow/util/span.h>
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
 #include <arrow/filesystem/filesystem.h>
@@ -23,10 +25,14 @@
 #include <arrow/ipc/reader.h>
 #include <arrow/util/async_generator.h>
 #include <parquet/arrow/reader.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/db/status.h>
 #include "base_forward_store.h"
+#include "parquet_buffer_pool.h"
 
 namespace zvec {
+
+class Doc;
 
 /// BufferPoolForwardStore implements a forward store that uses a buffer pool
 /// to efficiently manage data access from parquet files.
@@ -41,7 +47,7 @@ class BufferPoolForwardStore
   /// \param uri The URI of the file to be accessed
   explicit BufferPoolForwardStore(const std::string &uri);
 
-  virtual ~BufferPoolForwardStore() = default;
+  virtual ~BufferPoolForwardStore();
 
   Status open() override;
 
@@ -52,12 +58,48 @@ class BufferPoolForwardStore
   TablePtr fetch(const std::vector<std::string> &columns,
                  const std::vector<int> &indices) override;
 
+  struct FetchBlock {
+    BufferPoolForwardStore *store;
+    ailego::BudgetedVector<std::pair<int, int>> rows;
+    // Optional synchronous view into a caller-owned, batch-admitted row list.
+    // The caller keeps it alive until fetch_blocks returns; results own copies.
+    arrow::util::span<const std::pair<int, int>> row_view{};
+
+    arrow::util::span<const std::pair<int, int>> selected_rows() const {
+      return row_view.data() ? row_view
+                             : arrow::util::span<const std::pair<int, int>>{
+                                   rows.data(), rows.size()};
+    }
+  };
+  // Resident source columns only. Output buffers use the caller's workspace;
+  // allocation refusal selects the normal bounded-copy fallback.
+  static TablePtr fetch_blocks(const std::vector<std::string> &columns,
+                               const std::vector<FetchBlock> &blocks,
+                               int row_count, arrow::MemoryPool *pool);
+
+  TablePtr fetch(const std::vector<std::string> &columns,
+                 const std::vector<int> &indices, arrow::MemoryPool *pool);
+
+  // Preserve allocation, I/O and format failures for status-aware callers.
+  arrow::Result<TablePtr> fetch_checked(const std::vector<std::string> &columns,
+                                        const std::vector<int> &indices,
+                                        arrow::MemoryPool *pool);
+
   /// Fetch specific columns and row indices from the data source
   /// \param columns The list of column names to fetch
   /// \param index The row index to fetch
   /// \return An ExecBatch containing the requested data or nullptr on failure
   ExecBatchPtr fetch(const std::vector<std::string> &columns,
                      int index) override;
+
+  // Supported scalar and array fields are copied into an admitted Doc.
+  // Unsupported schemas retain the ordinary Arrow materialization path.
+  // Only a caller with a validated row mapping may supply known_doc_id.
+  std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
+                                 const std::shared_ptr<arrow::Schema> &schema,
+                                 int index,
+                                 std::optional<uint64_t> known_doc_id =
+                                     std::nullopt);
 
   /// Scan specified columns from the data source
   /// \param columns The list of column names to scan
@@ -113,6 +155,7 @@ class BufferPoolForwardStore
 
   /// The parquet file reader
   std::unique_ptr<parquet::arrow::FileReader> parquet_reader_;
+  ParquetBufferID metadata_id_;
 
   /// Number of row groups in the file
   int64_t num_row_groups_ = 0;

@@ -13,9 +13,16 @@
 // limitations under the License.
 
 #include "fts_utils.h"
+#include <rocksdb/status.h>
 #include <zvec/ailego/logger/logger.h>
 
 namespace zvec::fts {
+
+Status FtsReadFailure(const rocksdb::Status &status, const char *operation) {
+  const auto code = status.IsMemoryLimit() ? StatusCode::RESOURCE_EXHAUSTED
+                                           : StatusCode::INTERNAL_ERROR;
+  return Status(code, std::string(operation) + ": " + status.ToString());
+}
 
 bool parse_doc_term_key(const std::string &key, std::string *term_out,
                         uint32_t *doc_id_out) {

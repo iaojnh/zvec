@@ -73,7 +73,7 @@ Status InvertedColumnIndexer::open() {
       }
     } else if (s.code() != rocksdb::Status::kNotFound) {
       LOG_ERROR("Failed to retrieve cdf from %s", id().c_str());
-      return Status::InternalError();
+      return ReadFailure(s);
     }
   }
 
@@ -97,7 +97,7 @@ Status InvertedColumnIndexer::open() {
     }
   } else if (s.code() != rocksdb::Status::kNotFound) {
     LOG_ERROR("Failed to retrieve max id from %s", id().c_str());
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 
   // Get null bitmap if exists
@@ -109,7 +109,7 @@ Status InvertedColumnIndexer::open() {
     }
   } else if (s.code() != rocksdb::Status::kNotFound) {
     LOG_ERROR("Failed to retrieve null bitmap from %s", id().c_str());
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 
   // Get indexer state
@@ -121,7 +121,7 @@ Status InvertedColumnIndexer::open() {
     sealed_ = false;
   } else {
     LOG_ERROR("Failed to retrieve indexer state from %s", id().c_str());
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 
   LOG_INFO("Opened %s", id().c_str());
@@ -131,11 +131,13 @@ Status InvertedColumnIndexer::open() {
 
 InvertedColumnIndexer::Ptr InvertedColumnIndexer::CreateAndOpen(
     const std::string &collection_name, const FieldSchema &field,
-    RocksdbContext &context, bool read_only) {
+    RocksdbContext &context, bool read_only, Status *open_status) {
   auto ptr =
       new InvertedColumnIndexer(collection_name, field, context, read_only);
   auto indexer = std::shared_ptr<InvertedColumnIndexer>(ptr);
-  if (indexer->open().ok()) {
+  const auto status = indexer->open();
+  if (open_status) *open_status = status;
+  if (status.ok()) {
     return indexer;
   } else {
     return nullptr;
@@ -166,7 +168,7 @@ Status InvertedColumnIndexer::drop_storage() {
     if (s = ctx_.drop_cf(cf_name_ranges()); !s.ok()) {
       return s;
     }
-    rs = ctx_.db_->Delete(ctx_.write_opts_, cf_cdf_, field_.name());
+    rs = ctx_.remove(cf_cdf_, field_.name());
     if (!rs.ok()) {
       LOG_ERROR("Failed to delete cdf of %s", id().c_str());
       s = Status::InternalError();
@@ -179,21 +181,21 @@ Status InvertedColumnIndexer::drop_storage() {
     }
   }
 
-  rs = ctx_.db_->Delete(ctx_.write_opts_, key_max_id());
+  rs = ctx_.remove(key_max_id());
   if (!rs.ok()) {
     LOG_ERROR("Failed to delete max_id of %s", id().c_str());
     s = Status::InternalError();
     return s;
   }
 
-  rs = ctx_.db_->Delete(ctx_.write_opts_, key_null());
+  rs = ctx_.remove(key_null());
   if (!rs.ok()) {
     LOG_ERROR("Failed to delete null bitmap of %s", id().c_str());
     s = Status::InternalError();
     return s;
   }
 
-  rs = ctx_.db_->Delete(ctx_.write_opts_, key_sealed());
+  rs = ctx_.remove(key_sealed());
   if (!rs.ok()) {
     LOG_ERROR("Failed to delete indexer state of %s", id().c_str());
     s = Status::InternalError();

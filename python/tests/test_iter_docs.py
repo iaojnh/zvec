@@ -280,3 +280,27 @@ def test_iter_docs_is_generator(iter_collection):
     assert len(got) == 5
     with pytest.raises(StopIteration):
         next(gen)
+
+
+def test_iter_docs_retries_same_row_after_python_memory_error(
+    iter_collection, monkeypatch
+):
+    from zvec.model import collection as collection_module
+
+    iter_collection.insert(_make_docs(3))
+    iter_collection.flush()
+    convert = collection_module.convert_to_py_doc
+    rejected = []
+
+    def reject_once(core_doc, schema):
+        if not rejected:
+            rejected.append(core_doc.pk())
+            raise MemoryError("result memory exhausted")
+        return convert(core_doc, schema)
+
+    monkeypatch.setattr(collection_module, "convert_to_py_doc", reject_once)
+    with iter_collection.iter_docs() as iterator:
+        with pytest.raises(MemoryError, match="result memory exhausted"):
+            next(iterator)
+        assert next(iterator).id == rejected[0]
+        assert len(list(iterator)) == 2

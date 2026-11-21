@@ -14,9 +14,11 @@
 
 #include "ivf_rabitq_reformer.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -28,9 +30,12 @@
 #include <rabitqlib/fastscan/estimator.hpp>
 #include <rabitqlib/fastscan/query.hpp>
 #include <rabitqlib/utils/space.hpp>
+#include <zvec/ailego/hash/crc32c.h>
 #include <zvec/ailego/logger/logger.h>
+#include "algorithm/hnsw_rabitq/paged_rabitq_rotator.h"
 #include "algorithm/hnsw_rabitq/rabitq_utils.h"
 #include "core/algorithm/cluster/linear_seeker.h"
+#include "utility/immutable_segment_view.h"
 #include "zvec/core/framework/index_error.h"
 #include "zvec/core/framework/index_factory.h"
 #include "zvec/core/framework/index_features.h"
@@ -110,18 +115,17 @@ struct IvfRabitqReformer::Impl {
   bool is_loaded{false};
 
   // Original centroids: num_clusters * dimension (for nearest centroid search)
-  std::vector<float> centroids;
+  ImmutableSegmentView centroids;
   // Rotated centroids: num_clusters * padded_dim (for quantization)
-  std::vector<float> rotated_centroids;
-  // Squared norms of original centroids, used to derive residual norms from
-  // coarse InnerProduct scores.
-  std::vector<float> centroid_norm_sqs;
+  ImmutableSegmentView rotated_centroids;
+  ImmutableSegmentView converter_data;
 
   rabitqlib::RotatorType rotator_type{rabitqlib::RotatorType::FhtKacRotator};
   std::unique_ptr<rabitqlib::Rotator<float>> rotator;
 
   // Precomputed configs for quantization
-  rabitqlib::quant::RabitqConfig query_config;
+  mutable std::atomic<bool> build_config_ready{false};
+  mutable std::mutex build_config_mutex;
   rabitqlib::quant::RabitqConfig build_config;
   rabitqlib::MetricType metric_type{rabitqlib::METRIC_L2};
 
@@ -181,7 +185,7 @@ int IvfRabitqReformer::init(const std::string &metric_name) {
   return 0;
 }
 
-int IvfRabitqReformer::load(IndexStorage::Pointer storage) {
+int IvfRabitqReformer::load(IndexStorage::Pointer storage) try {
   if (!storage) {
     LOG_ERROR("Invalid storage for load");
     return IndexError_InvalidArgument;
@@ -216,53 +220,31 @@ int IvfRabitqReformer::load(IndexStorage::Pointer storage) {
       static_cast<rabitqlib::RotatorType>(header.rotator_type);
   offset += sizeof(header);
 
-  // Read rotated centroids
-  size = segment->read(offset, block, layout.rotated_centroids_size);
-  if (size != layout.rotated_centroids_size) {
-    LOG_ERROR("Failed to read rotated centroids");
-    return IndexError_InvalidFormat;
-  }
-  impl_->rotated_centroids.resize(header.num_clusters * header.padded_dim);
-  memcpy(impl_->rotated_centroids.data(), block.data(),
-         layout.rotated_centroids_size);
-  offset += size;
+  ret = impl_->converter_data.load(storage, RABITQ_CONVERTER_SEG_ID, 0,
+                                   segment->data_size());
+  if (ret != 0) return ret;
+  ret = impl_->rotated_centroids.load(storage, RABITQ_CONVERTER_SEG_ID, offset,
+                                      layout.rotated_centroids_size);
+  if (ret != 0) return ret;
+  offset += layout.rotated_centroids_size;
+  ret = impl_->centroids.load(storage, RABITQ_CONVERTER_SEG_ID, offset,
+                              layout.centroids_size);
+  if (ret != 0) return ret;
+  offset += layout.centroids_size;
 
-  // Read original centroids
-  size = segment->read(offset, block, layout.centroids_size);
-  if (size != layout.centroids_size) {
-    LOG_ERROR("Failed to read centroids");
-    return IndexError_InvalidFormat;
-  }
-  impl_->centroids.resize(header.num_clusters * header.dim);
-  memcpy(impl_->centroids.data(), block.data(), layout.centroids_size);
-  offset += size;
-  impl_->centroid_norm_sqs.resize(header.num_clusters);
-  for (size_t i = 0; i < header.num_clusters; ++i) {
-    const float *centroid = impl_->centroids.data() + i * header.dim;
-    impl_->centroid_norm_sqs[i] =
-        std::inner_product(centroid, centroid + header.dim, centroid, 0.0f);
-  }
+  ret = MakeRabitqRotator(impl_->dimension, impl_->rotator_type,
+                          impl_->padded_dim, &impl_->rotator, false);
+  if (ret != 0) return ret;
+  ret = LoadRabitqRotator(
+      impl_->rotator.get(), [&](size_t pos, void *out, size_t bytes) {
+        return segment->fetch(offset + pos, out, bytes) == bytes
+                   ? 0
+                   : IndexError_ReadData;
+      });
+  if (ret != 0) return ret;
+  offset += layout.rotator_size;
 
-  // Read rotator
-  size = segment->read(offset, block, layout.rotator_size);
-  if (size != layout.rotator_size) {
-    LOG_ERROR("Failed to read rotator");
-    return IndexError_InvalidFormat;
-  }
-  impl_->rotator.reset(rabitqlib::choose_rotator<float>(
-      impl_->dimension, impl_->rotator_type, impl_->padded_dim));
-  if (!impl_->rotator) {
-    LOG_ERROR("Failed to create IVF RaBitQ rotator");
-    return IndexError_InvalidFormat;
-  }
-  impl_->rotator->load(reinterpret_cast<const char *>(block.data()));
-  offset += size;
-
-  // Precompute configs
-  impl_->query_config = rabitqlib::quant::faster_config(
-      impl_->padded_dim, rabitqlib::SplitSingleQuery<float>::kNumBits);
-  impl_->build_config =
-      rabitqlib::quant::faster_config(impl_->padded_dim, impl_->ex_bits + 1);
+  impl_->build_config_ready.store(false);
 
   // Initialize LinearSeeker for SIMD-optimized centroid search
   IndexMeta centroid_meta;
@@ -275,20 +257,17 @@ int IvfRabitqReformer::load(IndexStorage::Pointer storage) {
                                : "InnerProduct",
                            0, ailego::Params());
 
-  impl_->centroid_features = std::make_shared<CoherentIndexFeatures>();
-  impl_->centroid_features->mount(centroid_meta, impl_->centroids.data(),
-                                  impl_->centroids.size() * sizeof(float));
-
-  impl_->centroid_seeker = std::make_shared<LinearSeeker>();
-  ret = impl_->centroid_seeker->init(centroid_meta);
-  if (ret != 0) {
-    LOG_ERROR("Failed to init centroid seeker, ret=%d", ret);
-    return ret;
-  }
-  ret = impl_->centroid_seeker->mount(impl_->centroid_features);
-  if (ret != 0) {
-    LOG_ERROR("Failed to mount centroid features, ret=%d", ret);
-    return ret;
+  impl_->centroid_features.reset();
+  impl_->centroid_seeker.reset();
+  if (impl_->centroids.data()) {
+    impl_->centroid_features = std::make_shared<CoherentIndexFeatures>();
+    impl_->centroid_features->mount(centroid_meta, impl_->centroids.data(),
+                                    impl_->centroids.size());
+    impl_->centroid_seeker = std::make_shared<LinearSeeker>();
+    ret = impl_->centroid_seeker->init(centroid_meta);
+    if (ret != 0) return ret;
+    ret = impl_->centroid_seeker->mount(impl_->centroid_features);
+    if (ret != 0) return ret;
   }
   impl_->centroid_metric =
       IndexFactory::CreateMetric(centroid_meta.metric_name());
@@ -317,6 +296,10 @@ int IvfRabitqReformer::load(IndexStorage::Pointer storage) {
       impl_->dimension, impl_->padded_dim, impl_->ex_bits, impl_->num_clusters,
       static_cast<int>(impl_->rotator_type));
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
 int IvfRabitqReformer::dump(const IndexStorage::Pointer &storage) {
@@ -332,13 +315,7 @@ int IvfRabitqReformer::dump(const IndexStorage::Pointer &storage) {
 
   auto align_size = [](size_t s) -> size_t { return (s + 0x1F) & (~0x1F); };
 
-  size_t header_size = sizeof(RabitqConverterHeader);
-  size_t rotated_centroids_size =
-      impl_->rotated_centroids.size() * sizeof(float);
-  size_t centroids_size = impl_->centroids.size() * sizeof(float);
-  size_t rotator_size = impl_->rotator->dump_bytes();
-  size_t data_size =
-      header_size + rotated_centroids_size + centroids_size + rotator_size;
+  const size_t data_size = impl_->converter_data.size();
   size_t total_size = align_size(data_size);
 
   int ret = storage->append(RABITQ_CONVERTER_SEG_ID, total_size);
@@ -354,45 +331,12 @@ int IvfRabitqReformer::dump(const IndexStorage::Pointer &storage) {
     return IndexError_ReadData;
   }
 
-  size_t offset = 0;
-
-  RabitqConverterHeader header;
-  header.dim = static_cast<uint32_t>(impl_->dimension);
-  header.padded_dim = static_cast<uint32_t>(impl_->padded_dim);
-  header.num_clusters = static_cast<uint32_t>(impl_->num_clusters);
-  header.ex_bits = static_cast<uint8_t>(impl_->ex_bits);
-  header.rotator_type = static_cast<uint8_t>(impl_->rotator_type);
-  header.rotator_size = static_cast<uint32_t>(rotator_size);
-
-  size_t written = segment->write(offset, &header, header_size);
-  if (written != header_size) {
-    LOG_ERROR("Failed to write header");
-    return IndexError_WriteData;
-  }
-  offset += header_size;
-
-  written = segment->write(offset, impl_->rotated_centroids.data(),
-                           rotated_centroids_size);
-  if (written != rotated_centroids_size) {
-    LOG_ERROR("Failed to write rotated centroids");
-    return IndexError_WriteData;
-  }
-  offset += rotated_centroids_size;
-
-  written = segment->write(offset, impl_->centroids.data(), centroids_size);
-  if (written != centroids_size) {
-    LOG_ERROR("Failed to write centroids");
-    return IndexError_WriteData;
-  }
-  offset += centroids_size;
-
-  std::vector<char> buffer(rotator_size);
-  impl_->rotator->save(buffer.data());
-  written = segment->write(offset, buffer.data(), rotator_size);
-  if (written != rotator_size) {
-    LOG_ERROR("Failed to write rotator data");
-    return IndexError_WriteData;
-  }
+  ret = impl_->converter_data.copy_to([&](size_t offset, const void *data,
+                                          size_t bytes) {
+    return segment->write(offset, data, bytes) == bytes ? 0
+                                                        : IndexError_WriteData;
+  });
+  if (ret != 0) return ret;
 
   LOG_INFO("IvfRabitqReformer dumped to storage: %zu bytes", data_size);
   return 0;
@@ -409,21 +353,24 @@ int IvfRabitqReformer::dump(const IndexDumper::Pointer &dumper) {
     return IndexError_NoReady;
   }
 
-  size_t dumped_size = 0;
-  int ret = dump_rabitq_centroids(
-      dumper, impl_->dimension, impl_->padded_dim, impl_->ex_bits,
-      impl_->num_clusters, impl_->rotator_type, impl_->rotated_centroids,
-      impl_->centroids, impl_->rotator, &dumped_size);
-  if (ret != 0) {
-    return ret;
-  }
-
-  LOG_INFO("IvfRabitqReformer dump completed: %zu bytes", dumped_size);
-  return 0;
+  uint32_t crc = 0;
+  int ret = impl_->converter_data.copy_to(
+      [&](size_t, const void *data, size_t bytes) {
+        crc = ailego::Crc32c::Hash(data, bytes, crc);
+        return dumper->write(data, bytes) == bytes ? 0 : IndexError_WriteData;
+      });
+  if (ret != 0) return ret;
+  const size_t bytes = impl_->converter_data.size();
+  const size_t padding = (32 - bytes % 32) % 32;
+  const char zeros[32]{};
+  if (padding && dumper->write(zeros, padding) != padding)
+    return IndexError_WriteData;
+  return dumper->append(RABITQ_CONVERTER_SEG_ID, bytes, padding, crc);
 }
 
 int IvfRabitqReformer::create_query_state(const float *query,
-                                          IvfRabitqQueryState *state) const {
+                                          IvfRabitqQueryState *state) const
+    try {
   if (!impl_->is_loaded) {
     LOG_ERROR("Reformer not loaded yet");
     return IndexError_NoReady;
@@ -445,7 +392,8 @@ int IvfRabitqReformer::create_query_state(const float *query,
       std::static_pointer_cast<rabitqlib::SplitBatchQuery<float>>(
           state->batch_query);
   if (!batch_query) {
-    batch_query = std::make_shared<rabitqlib::SplitBatchQuery<float>>();
+    batch_query = std::allocate_shared<rabitqlib::SplitBatchQuery<float>>(
+        ailego::BudgetedAllocator<rabitqlib::SplitBatchQuery<float>>{});
   }
   batch_query->reset(state->rotated_query.data(), impl_->padded_dim,
                      impl_->ex_bits, state->lut_scratch.data(),
@@ -453,6 +401,10 @@ int IvfRabitqReformer::create_query_state(const float *query,
   state->batch_query = std::move(batch_query);
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
 int IvfRabitqReformer::prepare_for_cluster(
@@ -489,8 +441,13 @@ int IvfRabitqReformer::prepare_for_cluster(uint32_t centroid_id,
     return IndexError_OutOfRange;
   }
 
-  const float *centroid =
-      impl_->rotated_centroids.data() + centroid_id * impl_->padded_dim;
+  IndexStorage::MemoryBlock guard;
+  const void *data = nullptr;
+  int ret = impl_->rotated_centroids.view(
+      centroid_id * impl_->padded_dim * sizeof(float),
+      impl_->padded_dim * sizeof(float), &guard, &data);
+  if (ret != 0) return ret;
+  const auto *centroid = static_cast<const float *>(data);
   IvfRabitqProbeCentroid probe;
   probe.id = centroid_id;
   probe.residual_norm =
@@ -504,17 +461,23 @@ int IvfRabitqReformer::prepare_for_cluster(uint32_t centroid_id,
   return prepare_for_cluster(probe, state);
 }
 
-int IvfRabitqReformer::rotate_vector(const float *input, float *output) const {
+int IvfRabitqReformer::rotate_vector(const float *input, float *output) const
+    try {
   if (!impl_->is_loaded || !impl_->rotator) {
     return IndexError_NoReady;
   }
   impl_->rotator->rotate(input, output);
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
-int IvfRabitqReformer::quantize_batch(const float *rotated_data,
-                                      uint32_t centroid_id, size_t num_points,
-                                      char *batch_data, char *ex_data) const {
+int IvfRabitqReformer::quantize_batch(
+    const float *rotated_data, uint32_t centroid_id, size_t num_points,
+    char *batch_data, char *ex_data, ailego::MemoryReservation *workspace) const
+    try {
   if (!impl_->is_loaded) {
     return IndexError_NoReady;
   }
@@ -524,8 +487,33 @@ int IvfRabitqReformer::quantize_batch(const float *rotated_data,
     return IndexError_OutOfRange;
   }
 
-  const float *rotated_centroid =
-      impl_->rotated_centroids.data() + (centroid_id * impl_->padded_dim);
+  if (!impl_->build_config_ready.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(impl_->build_config_mutex);
+    if (!impl_->build_config_ready.load(std::memory_order_relaxed)) {
+      // RaBitQ 0.1 samples a 100 x dim double matrix plus normalization
+      // temporaries and a growing rescale heap. Reserve their peak together.
+      ailego::MemoryReservation config_memory;
+      if (impl_->ex_bits) config_memory.add_array(impl_->padded_dim, 2048);
+      impl_->build_config = rabitqlib::quant::faster_config(impl_->padded_dim,
+                                                            impl_->ex_bits + 1);
+      impl_->build_config_ready.store(true, std::memory_order_release);
+    }
+  }
+  // One batch's compact codes plus sequential per-row Eigen/code scratch.
+  // A worker retains this reservation across batches; no distance-loop charge.
+  ailego::MemoryReservation local_workspace;
+  if (!workspace) workspace = &local_workspace;
+  if (impl_->padded_dim > SIZE_MAX / 128) return IndexError_Overflow;
+  const size_t bytes = impl_->padded_dim * 128;
+  if (bytes > workspace->bytes()) workspace->add(bytes - workspace->bytes());
+
+  IndexStorage::MemoryBlock guard;
+  const void *data = nullptr;
+  int ret = impl_->rotated_centroids.view(
+      centroid_id * impl_->padded_dim * sizeof(float),
+      impl_->padded_dim * sizeof(float), &guard, &data);
+  if (ret != 0) return ret;
+  const auto *rotated_centroid = static_cast<const float *>(data);
 
   rabitqlib::quant::quantize_split_batch(
       rotated_data, rotated_centroid, num_points, impl_->padded_dim,
@@ -533,25 +521,45 @@ int IvfRabitqReformer::quantize_batch(const float *rotated_data,
       impl_->build_config);
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
 uint32_t IvfRabitqReformer::find_nearest_centroid(const float *vector) const {
-  if (!impl_->is_loaded || impl_->num_clusters == 0) {
-    return 0;
-  }
+  uint32_t centroid = 0;
+  return find_nearest_centroid(vector, &centroid) == 0 ? centroid : 0;
+}
 
-  Seeker::Document doc;
-  int ret = impl_->centroid_seeker->seek(
-      vector, impl_->dimension * sizeof(float), &doc);
-  if (ret != 0) {
-    LOG_ERROR("Failed to seek nearest centroid, ret=%d", ret);
+int IvfRabitqReformer::find_nearest_centroid(const float *vector,
+                                             uint32_t *centroid) const try {
+  if (!centroid || !vector) return IndexError_InvalidArgument;
+  if (!impl_->is_loaded || impl_->num_clusters == 0) return IndexError_NoReady;
+  // Keep the direct training lookup allocation-free. Only Buffer-backed
+  // centers need the bounded, guarded scan used by probe selection.
+  if (impl_->centroid_seeker) {
+    Seeker::Document doc;
+    int ret = impl_->centroid_seeker->seek(
+        vector, impl_->dimension * sizeof(float), &doc);
+    if (ret != 0) return ret;
+    *centroid = doc.index;
     return 0;
   }
-  return doc.index;
+  ailego::BudgetedVector<uint32_t> probes;
+  int ret = select_probe_centroids(vector, 1, &probes);
+  if (ret != 0) return ret;
+  *centroid = probes.front();
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
 int IvfRabitqReformer::select_probe_centroids(
-    const float *query, size_t nprobe, std::vector<uint32_t> *centroids) const {
+    const float *query, size_t nprobe,
+    ailego::BudgetedVector<uint32_t> *centroids) const try {
   if (!centroids) {
     return IndexError_InvalidArgument;
   }
@@ -560,7 +568,7 @@ int IvfRabitqReformer::select_probe_centroids(
     state.query_norm_sq =
         std::inner_product(query, query + impl_->dimension, query, 0.0f);
   }
-  std::vector<IvfRabitqProbeCentroid> probes;
+  ailego::BudgetedVector<IvfRabitqProbeCentroid> probes;
   int ret = select_probe_centroids(query, nprobe, &state, &probes);
   if (ret != 0) {
     return ret;
@@ -571,11 +579,15 @@ int IvfRabitqReformer::select_probe_centroids(
     centroids->push_back(probe.id);
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
 int IvfRabitqReformer::select_probe_centroids(
     const float *query, size_t nprobe, IvfRabitqQueryState *state,
-    std::vector<IvfRabitqProbeCentroid> *centroids) const {
+    ailego::BudgetedVector<IvfRabitqProbeCentroid> *centroids) const try {
   if (!impl_->is_loaded || impl_->num_clusters == 0) {
     return IndexError_NoReady;
   }
@@ -595,7 +607,7 @@ int IvfRabitqReformer::select_probe_centroids(
   if (probe_count == 0) {
     return 0;
   }
-  if (probe_count == 1) {
+  if (probe_count == 1 && impl_->centroid_seeker) {
     Seeker::Document doc;
     int ret = impl_->centroid_seeker->seek(
         query, impl_->dimension * sizeof(float), &doc);
@@ -609,9 +621,12 @@ int IvfRabitqReformer::select_probe_centroids(
       probe.residual_norm = std::sqrt(std::max(doc.score, 0.0f));
     } else {
       probe.inner_product = -doc.score;
-      const float residual_norm_sq = state->query_norm_sq +
-                                     impl_->centroid_norm_sqs[doc.index] -
-                                     2.0f * probe.inner_product;
+      const auto *row = static_cast<const float *>(impl_->centroids.data()) +
+                        doc.index * impl_->dimension;
+      const float norm =
+          std::inner_product(row, row + impl_->dimension, row, 0.0f);
+      const float residual_norm_sq =
+          state->query_norm_sq + norm - 2.0f * probe.inner_product;
       probe.residual_norm = std::sqrt(std::max(residual_norm_sq, 0.0f));
     }
     centroids->push_back(probe);
@@ -621,16 +636,8 @@ int IvfRabitqReformer::select_probe_centroids(
   struct CentroidDist {
     uint32_t id;
     float dist;
+    float norm;
   };
-
-  std::vector<CentroidDist> centroid_dists(impl_->num_clusters);
-  for (size_t i = 0; i < impl_->num_clusters; ++i) {
-    float score = 0.0f;
-    impl_->centroid_distance_func(impl_->centroid_features->element(i), query,
-                                  impl_->dimension, &score);
-    centroid_dists[i].id = static_cast<uint32_t>(i);
-    centroid_dists[i].dist = score;
-  }
 
   auto compare_dist = [](const CentroidDist &a, const CentroidDist &b) {
     if (a.dist == b.dist) {
@@ -638,12 +645,43 @@ int IvfRabitqReformer::select_probe_centroids(
     }
     return a.dist < b.dist;
   };
-  auto top_end = centroid_dists.begin() + probe_count;
-  if (top_end != centroid_dists.end()) {
-    std::nth_element(centroid_dists.begin(), top_end, centroid_dists.end(),
+  // Keep only nprobe candidates. Buffer-backed centers are visited in bounded
+  // tiles; neither the center matrix nor an O(nlist) score array is pinned.
+  ailego::BudgetedVector<CentroidDist> centroid_dists;
+  centroid_dists.reserve(probe_count);
+  const size_t row_bytes = impl_->dimension * sizeof(float);
+  const size_t tile_rows = std::max<size_t>(1, 64 * 1024 / row_bytes);
+  for (size_t first = 0; first < impl_->num_clusters; first += tile_rows) {
+    const size_t count = std::min(tile_rows, impl_->num_clusters - first);
+    IndexStorage::MemoryBlock guard;
+    const void *data = nullptr;
+    int ret = impl_->centroids.view(first * row_bytes, count * row_bytes,
+                                    &guard, &data);
+    if (ret != 0) return ret;
+    const auto *rows = static_cast<const float *>(data);
+    for (size_t j = 0; j < count; ++j) {
+      const auto *row = rows + j * impl_->dimension;
+      CentroidDist candidate{static_cast<uint32_t>(first + j), 0.0f, 0.0f};
+      impl_->centroid_distance_func(row, query, impl_->dimension,
+                                    &candidate.dist);
+      if (centroid_dists.size() == probe_count &&
+          !compare_dist(candidate, centroid_dists.front()))
+        continue;
+      if (impl_->metric_type == rabitqlib::METRIC_IP)
+        candidate.norm =
+            std::inner_product(row, row + impl_->dimension, row, 0.0f);
+      if (centroid_dists.size() == probe_count) {
+        std::pop_heap(centroid_dists.begin(), centroid_dists.end(),
+                      compare_dist);
+        centroid_dists.back() = candidate;
+      } else {
+        centroid_dists.push_back(candidate);
+      }
+      std::push_heap(centroid_dists.begin(), centroid_dists.end(),
                      compare_dist);
+    }
   }
-  std::sort(centroid_dists.begin(), top_end, compare_dist);
+  std::sort_heap(centroid_dists.begin(), centroid_dists.end(), compare_dist);
 
   centroids->reserve(probe_count);
   for (size_t i = 0; i < probe_count; ++i) {
@@ -655,13 +693,17 @@ int IvfRabitqReformer::select_probe_centroids(
     } else {
       probe.inner_product = -centroid_dists[i].dist;
       const float residual_norm_sq = state->query_norm_sq +
-                                     impl_->centroid_norm_sqs[centroid_id] -
+                                     centroid_dists[i].norm -
                                      2.0f * probe.inner_product;
       probe.residual_norm = std::sqrt(std::max(residual_norm_sq, 0.0f));
     }
     centroids->push_back(probe);
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
 }  // namespace core

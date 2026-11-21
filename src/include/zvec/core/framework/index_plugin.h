@@ -73,7 +73,7 @@ class IndexPlugin {
 class IndexPluginBroker {
  public:
   //! Constructor
-  IndexPluginBroker() : plugins_() {}
+  IndexPluginBroker() = default;
 
   //! Constructor
   IndexPluginBroker(IndexPluginBroker &&broker)

@@ -60,9 +60,9 @@ class InlineVectorHnswEntity final : public HnswEntity {
     return 0;
   }
 
-  int get_vector(
-      const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const override {
+  int get_vector(const node_id_t *ids, uint32_t count,
+                 ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks)
+      const override {
     vec_blocks.resize(count);
     for (uint32_t i = 0; i < count; ++i) {
       int ret = get_vector(ids[i], vec_blocks[i]);

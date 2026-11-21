@@ -16,8 +16,9 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <numeric>
-#include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_meta.h>
 
 namespace zvec {
@@ -45,12 +46,15 @@ bool sort_and_find_duplicates(uint32_t *indices, char *values, size_t n,
   if (n <= 1) {
     return false;
   }
-  std::vector<size_t> perm(n);
+  if (value_byte_size &&
+      n > (std::numeric_limits<size_t>::max)() / value_byte_size)
+    throw std::bad_alloc();
+  ailego::BudgetedVector<size_t> perm(n);
   std::iota(perm.begin(), perm.end(), size_t{0});
   std::sort(perm.begin(), perm.end(),
             [&](size_t a, size_t b) { return indices[a] < indices[b]; });
-  std::vector<uint32_t> sorted_indices(n);
-  std::vector<char> sorted_values(n * value_byte_size);
+  ailego::BudgetedVector<uint32_t> sorted_indices(n);
+  ailego::BudgetedVector<char> sorted_values(n * value_byte_size);
   for (size_t i = 0; i < n; ++i) {
     sorted_indices[i] = indices[perm[i]];
     std::memcpy(sorted_values.data() + i * value_byte_size,

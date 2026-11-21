@@ -24,59 +24,37 @@ namespace zvec::fts {
 // BM25Scorer implementation
 // ============================================================
 
-int BM25Scorer::load_segment_stats(const std::string &field_name,
-                                   RocksdbContext *ctx,
-                                   rocksdb::ColumnFamilyHandle *stat_cf) {
+Status BM25Scorer::load_segment_stats(
+    const std::string &field_name, RocksdbContext *ctx,
+    rocksdb::ColumnFamilyHandle *stat_cf) {
   if (!ctx || !stat_cf) {
-    LOG_WARN("BM25Scorer::load_segment_stats: null ctx/stat_cf for field[%s]",
-             field_name.c_str());
-    return -1;
+    return Status::NotFound("Missing FTS segment statistics column family");
   }
 
-  // Read total_docs
-  std::string total_docs_value;
-  auto ret = ctx->db_->Get(ctx->read_opts_, stat_cf,
-                           make_total_docs_key(field_name), &total_docs_value);
-  if (!ret.ok()) {
-    LOG_DEBUG(
-        "BM25Scorer::load_segment_stats: failed to read total_docs. "
-        "field[%s]",
-        field_name.c_str());
-    return -1;
-  }
-  if (total_docs_value.size() < sizeof(uint64_t)) {
-    LOG_ERROR(
-        "BM25Scorer::load_segment_stats: total_docs value too small. "
-        "field[%s] value_size[%zu]",
-        field_name.c_str(), total_docs_value.size());
-    return -1;
-  }
-  uint64_t total_docs = decode_uint64_value(total_docs_value.data());
-  stats_.total_docs.store(total_docs, std::memory_order_release);
+  const auto read_stat = [&](const std::string &key) -> Result<uint64_t> {
+    std::string value;
+    const auto status = ctx->db_->Get(ctx->read_opts_, stat_cf, key, &value);
+    if (status.IsNotFound()) {
+      return tl::make_unexpected(
+          Status::NotFound("Missing FTS statistic ", key));
+    }
+    if (!status.ok()) {
+      return tl::make_unexpected(
+          FtsReadFailure(status, "Read FTS segment statistic"));
+    }
+    if (value.size() < sizeof(uint64_t)) {
+      return tl::make_unexpected(
+          Status::InternalError("Invalid FTS statistic ", key));
+    }
+    return decode_uint64_value(value.data());
+  };
 
-  // Read total_tokens
-  std::string total_tokens_value;
-  auto status =
-      ctx->db_->Get(ctx->read_opts_, stat_cf, make_total_tokens_key(field_name),
-                    &total_tokens_value);
-  if (!status.ok()) {
-    LOG_DEBUG(
-        "BM25Scorer::load_segment_stats: failed to read total_tokens. "
-        "field[%s]",
-        field_name.c_str());
-    return -1;
-  }
-  if (total_tokens_value.size() < sizeof(uint64_t)) {
-    LOG_ERROR(
-        "BM25Scorer::load_segment_stats: total_tokens value too small. "
-        "field[%s] value_size[%zu]",
-        field_name.c_str(), total_tokens_value.size());
-    return -1;
-  }
-  uint64_t total_tokens = decode_uint64_value(total_tokens_value.data());
-  stats_.total_tokens.store(total_tokens, std::memory_order_release);
-
-  return 0;
+  const auto docs = read_stat(make_total_docs_key(field_name));
+  if (!docs) return docs.error();
+  const auto tokens = read_stat(make_total_tokens_key(field_name));
+  if (!tokens) return tokens.error();
+  update_stats(*docs, *tokens);
+  return Status::OK();
 }
 
 float BM25Scorer::idf(uint64_t term_doc_freq) const {
@@ -184,8 +162,11 @@ uint32_t WandOptimizer::read_max_tf(const std::string &term) const {
     return 1;
   }
   std::string max_tf_value;
-  if (!ctx_->db_->Get(ctx_->read_opts_, max_tf_cf_, term, &max_tf_value).ok() ||
-      max_tf_value.size() < sizeof(uint32_t)) {
+  const auto status =
+      ctx_->db_->Get(ctx_->read_opts_, max_tf_cf_, term, &max_tf_value);
+  if (!status.ok() && !status.IsNotFound())
+    throw FtsReadError(FtsReadFailure(status, "Read FTS maximum term frequency"));
+  if (max_tf_value.size() < sizeof(uint32_t)) {
     return 1;  // Default max term frequency is 1
   }
   uint32_t max_tf = 0;

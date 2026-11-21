@@ -14,6 +14,7 @@
 #pragma once
 
 #include <turbo/quantizer/distance.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_framework.h>
 
@@ -78,7 +79,7 @@ class IVFDistanceCalculator {
   IndexMetric::Pointer metric_ptr_{};
   IndexMetric::MatrixDistance row_distance_{nullptr};
   IndexMetric::MatrixDistance distance_xx1{nullptr};
-  std::vector<IndexMetric::MatrixDistance> distances_{};
+  ailego::BudgetedVector<IndexMetric::MatrixDistance> distances_{};
 
   size_t element_size_{0};
   size_t dimension_{0};

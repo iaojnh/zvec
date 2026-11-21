@@ -81,13 +81,12 @@ int FlatSparseSearcherEntity::load_container(
               PARAM_FLAT_SPARSE_META_SEG_ID.c_str());
     return IndexError_InvalidFormat;
   }
-  IndexStorage::MemoryBlock data;
-  if (ailego_unlikely(segment->read(0, data, sizeof(meta_)) != sizeof(meta_))) {
+  if (ailego_unlikely(segment->fetch(0, &meta_, sizeof(meta_)) !=
+                      sizeof(meta_))) {
     LOG_ERROR("Failed to read meta segment %s",
               PARAM_FLAT_SPARSE_META_SEG_ID.c_str());
     return IndexError_ReadData;
   }
-  meta_ = *(reinterpret_cast<const decltype(meta_) *>(data.data()));
 
   // keys segment
   keys_chunk_ = container->get(PARAM_FLAT_SPARSE_DUMP_KEYS_SEG_ID);
@@ -142,20 +141,20 @@ FlatSparseSearcherEntity::Pointer FlatSparseSearcherEntity::clone() const {
 int FlatSparseSearcherEntity::get_sparse_vector_ptr_by_id(
     node_id_t id, const void **sparse_vector_ptr,
     uint32_t *sparse_vector_len_ptr) const {
-  uint32_t offset_chunk_offset = id * offset_size_per_node();
-
-  IndexStorage::MemoryBlock offset_info;
-  if (ailego_unlikely(sparse_offset_chunk_->read(
-                          offset_chunk_offset, offset_info,
-                          offset_size_per_node()) != offset_size_per_node())) {
-    LOG_ERROR("Read offset info failed, offset=%u", offset_chunk_offset);
+  *sparse_vector_ptr = nullptr;
+  *sparse_vector_len_ptr = 0;
+  if (id >= doc_cnt()) return IndexError_OutOfRange;
+  const size_t offset_chunk_offset =
+      static_cast<size_t>(id) * offset_size_per_node();
+  alignas(uint64_t) char offset_info[sizeof(uint64_t) + sizeof(uint32_t)];
+  if (sparse_offset_chunk_->fetch(offset_chunk_offset, offset_info,
+                                  sizeof(offset_info)) != sizeof(offset_info))
     return IndexError_ReadData;
-  };
 
   // sparse offset
-  uint64_t sparse_offset = *(uint64_t *)offset_info.data();
+  uint64_t sparse_offset = *(uint64_t *)offset_info;
   uint32_t sparse_vector_len =
-      *(uint32_t *)((uint8_t *)offset_info.data() + sizeof(uint64_t));
+      *(uint32_t *)((uint8_t *)offset_info + sizeof(uint64_t));
 
   if (sparse_vector_len > 0) {
     const void *sparse_data =
@@ -173,12 +172,30 @@ int FlatSparseSearcherEntity::get_sparse_vector_ptr_by_id(
   return 0;
 }
 
+int FlatSparseSearcherEntity::get_sparse_vector_ptr_by_id(
+    node_id_t id, IndexStorage::MemoryBlock &block, uint32_t *length) const {
+  block.reset();
+  *length = 0;
+  if (id >= doc_cnt()) return IndexError_OutOfRange;
+  // Copy the small offset record so only the vector data needs a live pin.
+  char record[sizeof(uint64_t) + sizeof(uint32_t)];
+  if (sparse_offset_chunk_->fetch(static_cast<size_t>(id) * sizeof(record),
+                                  record, sizeof(record)) != sizeof(record))
+    return IndexError_ReadData;
+  uint64_t offset;
+  std::memcpy(&offset, record, sizeof(offset));
+  std::memcpy(length, record + sizeof(offset), sizeof(*length));
+  if (!*length) return 0;
+  if (sparse_data_chunk_->read(offset, block, *length) != *length)
+    return IndexError_ReadData;
+  return 0;
+}
+
 const void *FlatSparseSearcherEntity::get_sparse_vector_data(
     uint64_t offset, uint32_t length) const {
-  // Keep the legacy pointer valid until the next call on this thread.
   static thread_local LegacyReadBuffer buffer;
-  IndexStorage::MemoryBlock data;
-  auto size = sparse_data_chunk_->read(offset, data, length);
+  IndexStorage::MemoryBlock block;
+  auto size = sparse_data_chunk_->read(offset, block, length);
   if (size != length) {
     LOG_ERROR(
         "read sparse vector data failed: offset=%zu, "
@@ -186,7 +203,7 @@ const void *FlatSparseSearcherEntity::get_sparse_vector_data(
         (size_t)offset, length, size);
     return nullptr;
   }
-  return buffer.assign(data, length);
+  return buffer.assign(block, length);
 }
 
 
@@ -199,25 +216,24 @@ node_id_t FlatSparseSearcherEntity::get_id(uint64_t key) const {
   //! Do binary search
   node_id_t start = 0UL;
   node_id_t end = doc_cnt();
-  IndexStorage::MemoryBlock data;
   node_id_t idx = 0u;
   while (start < end) {
     idx = start + (end - start) / 2;
-    if (ailego_unlikely(mapping_chunk_->read(idx * sizeof(node_id_t), data,
-                                             sizeof(node_id_t)) !=
-                        sizeof(node_id_t))) {
+    node_id_t local_id;
+    if (ailego_unlikely(
+            mapping_chunk_->fetch(static_cast<size_t>(idx) * sizeof(node_id_t),
+                                  &local_id,
+                                  sizeof(local_id)) != sizeof(node_id_t))) {
       LOG_ERROR("Read key from segment failed");
-      return kInvalidNodeId;
+      throw ReadError{IndexError_ReadData};
     }
-    IndexStorage::MemoryBlock key_block;
-    node_id_t local_id = *reinterpret_cast<const node_id_t *>(data.data());
-    if (ailego_unlikely(keys_chunk_->read(local_id * sizeof(uint64_t),
-                                          key_block, sizeof(uint64_t)) !=
-                        sizeof(uint64_t))) {
+    uint64_t mkey;
+    if (ailego_unlikely(
+            keys_chunk_->fetch(static_cast<size_t>(local_id) * sizeof(uint64_t),
+                               &mkey, sizeof(mkey)) != sizeof(uint64_t))) {
       LOG_ERROR("Read key from segment failed");
-      return kInvalidNodeId;
+      throw ReadError{IndexError_ReadData};
     }
-    const auto mkey = *static_cast<const uint64_t *>(key_block.data());
     if (mkey < key) {
       start = idx + 1;
     } else if (mkey > key) {
@@ -230,14 +246,15 @@ node_id_t FlatSparseSearcherEntity::get_id(uint64_t key) const {
 }
 
 uint64_t FlatSparseSearcherEntity::get_key(node_id_t id) const {
-  IndexStorage::MemoryBlock key;
+  if (id >= doc_cnt()) return kInvalidKey;
+  uint64_t key;
   if (ailego_unlikely(
-          keys_chunk_->read(id * sizeof(uint64_t), key, sizeof(uint64_t)) !=
-          sizeof(uint64_t))) {
+          keys_chunk_->fetch(static_cast<size_t>(id) * sizeof(uint64_t), &key,
+                             sizeof(key)) != sizeof(uint64_t))) {
     LOG_ERROR("Read key from segment failed");
-    return kInvalidKey;
+    throw ReadError{IndexError_ReadData};
   }
-  return *(reinterpret_cast<const uint64_t *>(key.data()));
+  return key;
 }
 
 }  // namespace core

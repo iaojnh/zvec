@@ -18,10 +18,11 @@
 #include <vector>
 #include <arrow/api.h>
 #include <arrow/ipc/reader.h>
+#include "db/index/storage/resident_record_batch_reader.h"
 
 namespace zvec {
 
-class ColumnMergingReader : public arrow::RecordBatchReader {
+class ColumnMergingReader : public ResidentRecordBatchReader {
  public:
   static std::shared_ptr<ColumnMergingReader> Make(
       const std::shared_ptr<arrow::Schema> &target_schema,
@@ -39,7 +40,12 @@ class ColumnMergingReader : public arrow::RecordBatchReader {
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *out) override;
 
+  arrow::Result<bool> ReadNextResident(
+      std::shared_ptr<arrow::RecordBatch> *out) override;
+
  private:
+  arrow::Result<bool> read_next(std::shared_ptr<arrow::RecordBatch> *out,
+                                bool resident_only);
   std::shared_ptr<arrow::Schema> target_schema_;
   std::vector<std::shared_ptr<arrow::ipc::RecordBatchReader>> input_readers_;
 

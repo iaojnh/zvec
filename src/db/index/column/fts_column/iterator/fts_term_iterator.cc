@@ -177,8 +177,10 @@ uint32_t TermDocIterator::read_term_freq(uint32_t doc_id) const {
   }
   const std::string key = fts::make_doc_term_key(term_, doc_id);
   std::string value;
-  if (!ctx_->db_->Get(ctx_->read_opts_, term_freq_cf_, key, &value).ok() ||
-      value.size() < sizeof(uint32_t)) {
+  const auto status = ctx_->db_->Get(ctx_->read_opts_, term_freq_cf_, key, &value);
+  if (!status.ok() && !status.IsNotFound())
+    throw FtsReadError(FtsReadFailure(status, "Read FTS term frequency"));
+  if (value.size() < sizeof(uint32_t)) {
     return 1;  // Default term frequency is 1
   }
   uint32_t tf = 0;
@@ -194,8 +196,11 @@ uint32_t TermDocIterator::read_doc_len(uint32_t doc_id) const {
   std::memcpy(doc_id_key.data(), &doc_id, sizeof(uint32_t));
 
   std::string value;
-  if (!ctx_->db_->Get(ctx_->read_opts_, doc_len_cf_, doc_id_key, &value).ok() ||
-      value.size() < sizeof(uint32_t)) {
+  const auto status =
+      ctx_->db_->Get(ctx_->read_opts_, doc_len_cf_, doc_id_key, &value);
+  if (!status.ok() && !status.IsNotFound())
+    throw FtsReadError(FtsReadFailure(status, "Read FTS document length"));
+  if (value.size() < sizeof(uint32_t)) {
     return 1;  // Default document length is 1
   }
   uint32_t doc_len = 0;

@@ -121,8 +121,8 @@ DistanceImpl Fp32Quantizer::distance(const void *query,
   }
 
   // The query is assumed to be already quantized — copy it directly.
-  std::string quantized_query(static_cast<const char *>(query),
-                              qmeta.element_size());
+  ailego::BudgetedString quantized_query(static_cast<const char *>(query),
+                                         qmeta.element_size());
   return DistanceImpl(dp_query_func_, dp_query_batch_func_,
                       std::move(quantized_query), original_dim_);
 }
@@ -168,7 +168,7 @@ void Fp32Quantizer::calc_distance_dp_query_batch(const void *const *dp_list,
 
 float Fp32Quantizer::calc_distance_dp_query_unquantized(
     const void *dp, const void *query) const {
-  std::string buf(quantized_length(), '\0');
+  ailego::BudgetedString buf(quantized_length(), '\0');
   quantize_one(query, &buf[0]);
   return calc_distance_dp_query(dp, buf.data());
 }
@@ -176,7 +176,7 @@ float Fp32Quantizer::calc_distance_dp_query_unquantized(
 void Fp32Quantizer::calc_distance_dp_query_batch_unquantized(
     const void *const *dp_list, int dp_num, const void *query,
     float *dist_list) const {
-  std::string buf(quantized_length(), '\0');
+  ailego::BudgetedString buf(quantized_length(), '\0');
   quantize_one(query, &buf[0]);
   calc_distance_dp_query_batch(dp_list, dp_num, buf.data(), dist_list);
 }

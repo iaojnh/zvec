@@ -32,7 +32,8 @@ VamanaStreamer::~VamanaStreamer() {
   }
 }
 
-int VamanaStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
+int VamanaStreamer::init(const IndexMeta &imeta,
+                         const ailego::Params &params) try {
   meta_ = imeta;
   meta_.set_streamer("VamanaStreamer", VamanaEntity::kRevision, params);
 
@@ -120,9 +121,13 @@ int VamanaStreamer::init(const IndexMeta &imeta, const ailego::Params &params) {
 
   state_ = STATE_INITED;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::cleanup() {
+int VamanaStreamer::cleanup() try {
   if (state_ == STATE_OPENED) {
     this->close();
   }
@@ -155,9 +160,13 @@ int VamanaStreamer::cleanup() {
   build_finalized_.store(false);
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::setup_entity() {
+int VamanaStreamer::setup_entity() try {
   entity_->set_use_key_info_map(use_id_map_);
   entity_->set_vector_size(meta_.element_size());
   entity_->set_chunk_size(chunk_size_);
@@ -177,9 +186,13 @@ int VamanaStreamer::setup_entity() {
     LOG_ERROR("Vamana entity init failed: %s", IndexError::What(ret));
   }
   return ret;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::open(IndexStorage::Pointer stg) {
+int VamanaStreamer::open(IndexStorage::Pointer stg) try {
   LOG_INFO("VamanaStreamer open");
 
   if (ailego_unlikely(state_ != STATE_INITED)) {
@@ -345,9 +358,13 @@ int VamanaStreamer::open(IndexStorage::Pointer stg) {
   magic_ = IndexContext::GenerateMagic();
 
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::close() {
+int VamanaStreamer::close() try {
   LOG_INFO("VamanaStreamer close");
 
   stats_.clear();
@@ -360,17 +377,27 @@ int VamanaStreamer::close() {
   if (ret != 0) return ret;
   state_ = STATE_INITED;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::flush(uint64_t checkpoint) {
+int VamanaStreamer::flush(uint64_t checkpoint) try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   LOG_INFO("VamanaStreamer flush checkpoint=%zu", (size_t)checkpoint);
 
   meta_.set_metric(metric_->name(), 0, metric_->params());
   entity_->set_index_meta(meta_);
   return entity_->flush(checkpoint);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::dump(const IndexDumper::Pointer &dumper) {
+int VamanaStreamer::dump(const IndexDumper::Pointer &dumper) try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   LOG_INFO("VamanaStreamer dump");
 
   shared_mutex_.lock();
@@ -388,6 +415,10 @@ int VamanaStreamer::dump(const IndexDumper::Pointer &dumper) {
   }
 
   return entity_->dump(dumper);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 void VamanaStreamer::merge_trained_meta(const IndexMeta &trained_meta) {
@@ -435,7 +466,8 @@ void VamanaStreamer::update_entry_point_to_medoid() {
   }
 }
 
-int VamanaStreamer::finalize_build() {
+int VamanaStreamer::finalize_build() try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   if (!two_pass_build_enabled_) {
     return 0;
   }
@@ -443,9 +475,13 @@ int VamanaStreamer::finalize_build() {
   shared_mutex_.lock();
   AILEGO_DEFER([&]() { shared_mutex_.unlock(); });
   return finalize_build_locked();
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::finalize_build_locked() {
+int VamanaStreamer::finalize_build_locked() try {
   if (!two_pass_build_enabled_ || build_finalized_.load()) {
     return 0;
   }
@@ -480,10 +516,15 @@ int VamanaStreamer::finalize_build_locked() {
     return ret;
   }
 
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   ctx->update_dist_calculator_distance(add_distance_, add_batch_distance_);
 
   LOG_INFO("Vamana two-pass second graph pass: alpha=%.2f", alpha_);
+  bool refined = false;
+  AILEGO_DEFER([&] {
+    if (!refined) entity_->mark_failed_build();
+  });
   ret = alg_->refine_graph(ctx.get(), alpha_);
   if (ret != 0) return ret;
   if (ctx->error()) {
@@ -494,7 +535,12 @@ int VamanaStreamer::finalize_build_locked() {
   stats_.mutable_attributes()->set("vamana_build_pass_count", uint32_t{2});
   build_finalized_.store(true);
   magic_ = IndexContext::GenerateMagic();
+  refined = true;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 IndexStreamer::Context::Pointer VamanaStreamer::create_context() const {
@@ -530,7 +576,10 @@ IndexStreamer::Context::Pointer VamanaStreamer::create_context() const {
     return Context::Pointer();
   }
 
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt())) {
+    delete ctx;
+    return Context::Pointer();
+  }
 
   return Context::Pointer(ctx);
 }
@@ -547,7 +596,7 @@ IndexProvider::Pointer VamanaStreamer::create_provider() const {
       new VamanaIndexProvider(meta_, entity, "VamanaStreamer"));
 }
 
-int VamanaStreamer::update_context(VamanaContext *ctx) const {
+int VamanaStreamer::update_context(VamanaContext *ctx) const try {
   const VamanaEntity::Pointer entity = entity_->clone();
   if (!entity) {
     LOG_ERROR("Failed to clone search context entity");
@@ -559,11 +608,16 @@ int VamanaStreamer::update_context(VamanaContext *ctx) const {
   ctx->set_bruteforce_threshold(bruteforce_threshold_);
   return ctx->update_context(VamanaContext::kStreamerContext, meta_, metric_,
                              entity, magic_);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::add_impl(uint64_t pkey, const void *query,
                              const IndexQueryMeta &qmeta,
-                             Context::Pointer &context) {
+                             Context::Pointer &context) try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -597,7 +651,8 @@ int VamanaStreamer::add_impl(uint64_t pkey, const void *query,
 
   ctx->clear();
   ctx->update_dist_calculator_distance(add_distance_, add_batch_distance_);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
 
   if (metric_->support_train()) {
     const std::lock_guard<std::mutex> lk(mutex_);
@@ -617,6 +672,10 @@ int VamanaStreamer::add_impl(uint64_t pkey, const void *query,
     return ret;
   }
 
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) entity_->mark_failed_build();
+  });
   ret = alg_->add_node(id, ctx);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Vamana streamer add node failed");
@@ -631,12 +690,18 @@ int VamanaStreamer::add_impl(uint64_t pkey, const void *query,
   (*stats_.mutable_added_count())++;
   build_finalized_.store(false);
 
+  complete = true;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::add_with_id_impl(uint32_t id, const void *query,
                                      const IndexQueryMeta &qmeta,
-                                     Context::Pointer &context) {
+                                     Context::Pointer &context) try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -670,7 +735,8 @@ int VamanaStreamer::add_with_id_impl(uint32_t id, const void *query,
 
   ctx->clear();
   ctx->update_dist_calculator_distance(add_distance_, add_batch_distance_);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
 
   if (metric_->support_train()) {
     const std::lock_guard<std::mutex> lk(mutex_);
@@ -689,6 +755,10 @@ int VamanaStreamer::add_with_id_impl(uint32_t id, const void *query,
     return ret;
   }
 
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) entity_->mark_failed_build();
+  });
   ret = alg_->add_node(id, ctx);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Vamana streamer add node failed");
@@ -703,17 +773,28 @@ int VamanaStreamer::add_with_id_impl(uint32_t id, const void *query,
   (*stats_.mutable_added_count())++;
   build_finalized_.store(false);
 
+  complete = true;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                                Context::Pointer &context) const {
+                                Context::Pointer &context) const try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   return search_impl(query, qmeta, 1, context);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
-                                uint32_t count,
-                                Context::Pointer &context) const {
+                                uint32_t count, Context::Pointer &context) const
+    try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -736,7 +817,8 @@ int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   ctx->update_dist_calculator_distance(search_distance_,
                                        search_batch_distance_);
   ctx->resize_results(count);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   ctx->prepare_query_prefetch();
 
   for (size_t q = 0; q < count; ++q) {
@@ -752,13 +834,15 @@ int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-int VamanaStreamer::search_candidates_impl(const void *query,
-                                           const IndexQueryMeta &qmeta,
-                                           std::vector<uint64_t> &keys,
-                                           Context::Pointer &context,
-                                           std::vector<float> *scores) const {
+int VamanaStreamer::search_candidates_impl(
+    const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
+    Context::Pointer &context, std::vector<float> *scores) const try {
   keys.clear();
   if (scores) scores->clear();
   int ret = check_params(query, qmeta);
@@ -786,7 +870,8 @@ int VamanaStreamer::search_candidates_impl(const void *query,
   ctx->clear();
   ctx->update_dist_calculator_distance(search_distance_,
                                        search_batch_distance_);
-  ctx->check_need_adjuct_ctx(entity_->doc_cnt());
+  if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt()))
+    return IndexError_NoMemory;
   ctx->prepare_query_prefetch();
   ctx->reset_query(query);
   ret = alg_->search(ctx);
@@ -802,6 +887,10 @@ int VamanaStreamer::search_candidates_impl(const void *query,
     return IndexError_Runtime;
   }
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 void VamanaStreamer::print_debug_info() {
@@ -826,13 +915,19 @@ void VamanaStreamer::print_debug_info() {
 
 int VamanaStreamer::search_bf_impl(const void *query,
                                    const IndexQueryMeta &qmeta,
-                                   Context::Pointer &context) const {
+                                   Context::Pointer &context) const try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   return search_bf_impl(query, qmeta, 1, context);
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_bf_impl(const void *query,
                                    const IndexQueryMeta &qmeta, uint32_t count,
-                                   Context::Pointer &context) const {
+                                   Context::Pointer &context) const try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -870,12 +965,17 @@ int VamanaStreamer::search_bf_impl(const void *query,
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int VamanaStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
+  if (entity_ && entity_->failed_build()) return IndexError_NoReady;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) return ret;
 
@@ -915,6 +1015,10 @@ int VamanaStreamer::search_bf_by_p_keys_impl(
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_STREAMER(VamanaStreamer);

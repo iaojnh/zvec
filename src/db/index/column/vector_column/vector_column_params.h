@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
 #include <functional>
 #include <memory>
 #include <variant>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/interface/index_param.h>
@@ -44,9 +44,7 @@ struct VectorData {
 
 
 // VectorData with memory management
-struct DenseVectorBuffer {
-  std::string data;  // use string to manage memory
-};
+using DenseVectorBuffer = ailego::BudgetedStringBuffer;
 
 struct SparseVectorBuffer {
   std::string indices;  // uint32_t
@@ -106,6 +104,8 @@ struct QueryParams {
   std::shared_ptr<RefinerParam> refiner_param{nullptr};
 
   ailego::Params extra_params{};
+  // Call-scoped view into a block's translated keys; not retained by search.
+  const std::vector<uint64_t> *bf_pks_view{nullptr};
 };
 }  // namespace vector_column_params
 }  // namespace zvec

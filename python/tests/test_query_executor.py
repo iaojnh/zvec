@@ -22,6 +22,7 @@ from zvec._zvec.param import _SearchQuery
 
 import pytest
 from zvec.executor.query_executor import (
+    convert_to_numpy,
     QueryContext,
     QueryExecutor,
 )
@@ -335,7 +336,7 @@ class TestQueryExecutor:
         executor = QueryExecutor(schema)
         ctx = QueryContext(topk=5)
         collection = MagicMock()
-        collection.Fetch.return_value = {}
+        collection.FetchTuples.return_value = {}
 
         with pytest.raises(ValueError, match="Document with id 'missing' not found"):
             executor._build_search_query(
@@ -368,3 +369,11 @@ class TestQueryExecutor:
 
         assert query.fts.match_string == "\u00a0vector search  "
         assert query.fts.query_string == ""
+
+
+@pytest.mark.parametrize("step", [2, -1])
+def test_query_conversion_makes_strided_vectors_contiguous(step):
+    source = np.arange(12, dtype=np.float32)[::step]
+    result = convert_to_numpy(source, np.float32)
+    assert result.flags.c_contiguous
+    np.testing.assert_array_equal(result, source)

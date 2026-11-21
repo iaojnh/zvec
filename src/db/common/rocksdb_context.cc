@@ -14,16 +14,64 @@
 
 
 #include "rocksdb_context.h"
+#include <algorithm>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/memtablerep.h>
 #include <rocksdb/slice_transform.h>
-#include <rocksdb/statistics.h>
 #include <rocksdb/table.h>
 #include <rocksdb/utilities/checkpoint.h>
+#include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/logger/logger.h>
+#include <zvec/db/config.h>
+#include "db/common/global_resource.h"
+#include "db/common/native_worker_memory.h"
+#include "db/common/rocksdb_block_cache.h"
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+#include "db/common/rocksdb_memtable_factory.h"
+#endif
 
 
 namespace zvec {
+
+namespace {
+constexpr size_t kRocksDbInstanceMetadata = 256 * 1024;
+constexpr size_t kRocksDbColumnMetadata = 64 * 1024;
+
+Result<std::unique_ptr<detail::RetainedMetadataBudget::Lease>>
+ReserveRocksMetadata(size_t columns) try {
+  if (GlobalResource::Instance().initialize() != 0)
+    return tl::make_unexpected(
+        Status::InternalError("Memory budget initialization failed"));
+  auto lease = std::make_unique<detail::RetainedMetadataBudget::Lease>(
+      detail::RetainedMetadataBudget::instance());
+  if (columns >
+      (std::numeric_limits<size_t>::max() - kRocksDbInstanceMetadata) /
+          kRocksDbColumnMetadata)
+    throw std::bad_alloc();
+  lease->acquire(kRocksDbInstanceMetadata + columns * kRocksDbColumnMetadata);
+  return lease;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient RocksDB metadata budget"));
+}
+}  // namespace
+
+rocksdb::Status RocksdbContext::finish_write(rocksdb::Status status) {
+  if (!status.ok()) return status;
+  const auto &manager = create_opts_.write_buffer_manager;
+  if (!manager || !manager->ShouldFlush()) return status;
+  // A single atomic batch can exceed WBM's threshold. RocksDB 8.1 schedules
+  // pressure flushes only on the *next* write to that DB. With shared WBM,
+  // the next write may instead target IDMap/scalar/FTS in another DB, which
+  // cannot flush this one's memtables and can stall indefinitely. Flush the
+  // producing DB now, without an intervening stats/metadata Put. All its CFs
+  // participate, including cross-CF batches. Keep allow_stall and the budget.
+  std::lock_guard<std::mutex> lock(mutex_);
+  rocksdb::FlushOptions options;
+  options.wait = true;
+  options.allow_write_stall = true;
+  return db_->Flush(options, cf_handles_);
+}
 
 
 Status RocksdbContext::create(
@@ -35,7 +83,7 @@ Status RocksdbContext::create(
 
 Status RocksdbContext::create(Args args) {
   per_cf_merge_ops_ = std::move(args.per_cf_merge_ops);
-  enable_hash_skiplist_ = args.enable_hash_skiplist;
+  enable_prefix_extractor_ = args.enable_prefix_extractor;
 
   std::lock_guard<std::mutex> lock(mutex_);
 
@@ -49,7 +97,14 @@ Status RocksdbContext::create(Args args) {
   }
 
   create_opts_.create_if_missing = true;
-  prepare_options(std::move(args.merge_op));
+  size_t column_family_count = args.column_names.size();
+  if (std::find(args.column_names.begin(), args.column_names.end(),
+                rocksdb::kDefaultColumnFamilyName) == args.column_names.end()) {
+    ++column_family_count;
+  }
+  auto metadata = ReserveRocksMetadata(column_family_count);
+  if (!metadata) return metadata.error();
+  auto cache_activity = prepare_options(std::move(args.merge_op), true);
 
   rocksdb::DB *db;
   rocksdb::Status s = rocksdb::DB::Open(create_opts_, args.db_path, &db);
@@ -90,6 +145,8 @@ Status RocksdbContext::create(Args args) {
   }
 
   read_only_ = false;
+  cache_activity_ = std::move(cache_activity);
+  metadata_memory_ = std::move(*metadata);
   write_opts_.disableWAL = true;
   LOG_DEBUG("Created RocksDB[%s] with Args", args.db_path.c_str());
   return Status::OK();
@@ -111,7 +168,7 @@ Status RocksdbContext::open(const std::string &db_path, bool read_only,
 
 Status RocksdbContext::open(Args args, bool read_only) {
   per_cf_merge_ops_ = std::move(args.per_cf_merge_ops);
-  enable_hash_skiplist_ = args.enable_hash_skiplist;
+  enable_prefix_extractor_ = args.enable_prefix_extractor;
 
   std::lock_guard<std::mutex> lock(mutex_);
 
@@ -125,7 +182,9 @@ Status RocksdbContext::open(Args args, bool read_only) {
   }
 
   create_opts_.create_if_missing = false;
-  prepare_options(std::move(args.merge_op));
+  auto metadata = ReserveRocksMetadata(1);
+  if (!metadata) return metadata.error();
+  auto cache_activity = prepare_options(std::move(args.merge_op), !read_only);
 
   rocksdb::Status s;
   std::vector<std::string> existing_cf_names{};
@@ -137,6 +196,18 @@ Status RocksdbContext::open(Args args, bool read_only) {
               args.db_path.c_str(), s.code(), s.ToString().c_str());
     return Status::InternalError("Failed to list RocksDB column families: ",
                                  s.ToString());
+  }
+  try {
+    if (existing_cf_names.size() > 1) {
+      if (existing_cf_names.size() - 1 >
+          std::numeric_limits<size_t>::max() / kRocksDbColumnMetadata)
+        throw std::bad_alloc();
+      (*metadata)->acquire((existing_cf_names.size() - 1) *
+                           kRocksDbColumnMetadata);
+    }
+  } catch (const std::bad_alloc &) {
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Insufficient RocksDB column-family metadata budget");
   }
 
   auto make_cf_options = [&](const std::string &cf_name) {
@@ -197,6 +268,8 @@ Status RocksdbContext::open(Args args, bool read_only) {
 
   db_.reset(db);
   read_only_ = read_only;
+  cache_activity_ = std::move(cache_activity);
+  metadata_memory_ = std::move(*metadata);
   write_opts_.disableWAL = true;
   LOG_DEBUG("Opened RocksDB[%s] with Args", args.db_path.c_str());
   return Status::OK();
@@ -239,10 +312,27 @@ Status RocksdbContext::validate_and_set_db_path(const std::string &db_path,
 }
 
 
-void RocksdbContext::prepare_options(
-    std::shared_ptr<rocksdb::MergeOperator> merge_op) {
-  // Increase parallelism with default thread count (typically 16)
-  create_opts_.IncreaseParallelism();
+std::shared_ptr<void> RocksdbContext::prepare_options(
+    std::shared_ptr<rocksdb::MergeOperator> merge_op, bool writable) {
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
+  // Buffered file writes already use the OS cache. Avoid another growable
+  // malloc-backed copy whose freed buffers can remain resident after build.
+  // A zero capacity selects RocksDB's direct-to-file buffered-I/O path; direct
+  // I/O still requires its nonzero aligned buffer. Read-only opens stay as-is.
+  if (writable && !create_opts_.use_direct_io_for_flush_and_compaction) {
+    create_opts_.writable_file_max_buffer_size = 0;
+  }
+#else
+  (void)writable;
+#endif
+  // Background compaction is part of the configured optimize concurrency,
+  // not an independent fixed pool of 16 workers. Each worker can retain
+  // ordinary-heap merge/filter workspaces outside the cache/WBM. Keep two
+  // low-priority workers for flush/compaction progress and the historical
+  // upper bound; this does not change foreground query concurrency.
+  const auto background_threads = detail::RocksDbBackgroundThreads(
+      GlobalConfig::Instance().optimize_thread_count());
+  create_opts_.IncreaseParallelism(static_cast<int>(background_threads));
 
   // Optimize for level-based compaction style with default setting
   create_opts_.OptimizeLevelStyleCompaction();
@@ -267,25 +357,75 @@ void RocksdbContext::prepare_options(
 
   // Turn on bloom filters
   table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
+  // Full-SST filters retain one hash per key while building, and loading a
+  // filter reads the entire block. Bound both workspaces with partitions;
+  // large FTS tables must not leave SST-sized temporary heaps behind when
+  // vector training starts filling the shared page cache.
+  table_options.index_type =
+      rocksdb::BlockBasedTableOptions::kTwoLevelIndexSearch;
+  table_options.partition_filters = true;
+  table_options.metadata_block_size = 4096;
+  table_options.cache_usage_options
+      .options_overrides[rocksdb::CacheEntryRole::kFilterConstruction]
+      .charged = rocksdb::CacheEntryRoleOptions::Decision::kEnabled;
 
   // Merge operator
   if (merge_op) {
     create_opts_.merge_operator = merge_op;
-    create_opts_.max_successive_merges = 100;
     create_opts_.write_buffer_size = 8 << 20;
   }
+  // FTS installs its merge operator per column family, not on create_opts_.
+  // Apply the same operand-chain limit before any CF options are copied.
+  // Otherwise hot terms accumulate unbounded MergeHelper arrays at flush.
+  const bool has_merge_operator =
+      merge_op ||
+      std::any_of(per_cf_merge_ops_.begin(), per_cf_merge_ops_.end(),
+                  [](const auto &entry) { return entry.second != nullptr; });
+  if (has_merge_operator) {
+    create_opts_.max_successive_merges = 100;
+    // RocksDB's eager merge issues Get while inserting into the memtable;
+    // it must use the serialized insertion path, including grouped writers.
+    create_opts_.allow_concurrent_memtable_write = false;
+  }
 
-  // Create default cache
-  table_options.block_cache = nullptr;
+  // All RocksDB-backed features (ID map, scalar inverted indexes and FTS)
+  // share one process-wide strict-capacity cache. Index and filter blocks must
+  // enter the same cache instead of remaining resident in each table reader.
+  table_options.block_cache = GlobalResource::Instance().rocksdb_block_cache();
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.cache_index_and_filter_blocks_with_high_priority = true;
+  table_options.pin_l0_filter_and_index_blocks_in_cache = false;
+  if (!table_options.block_cache) {
+    // Resource initialization failure must not silently fall back to one
+    // implicit default cache per RocksDB instance.
+    table_options.no_block_cache = true;
+  }
 
   auto table_factory = NewBlockBasedTableFactory(table_options);
   create_opts_.table_factory.reset(table_factory);
 
-  // Enable statistics
-  create_opts_.statistics = rocksdb::CreateDBStatistics();
+  // zvec does not consume RocksDB's optional ticker/histogram statistics.
+  // Each instance eagerly allocates per-core histogram arrays, independently
+  // of the shared block cache/WBM; tiny collections can therefore consume
+  // megabytes each. Keep the default (disabled). Cache/WBM usage and DB
+  // properties remain available without this optional statistics object.
+  create_opts_.statistics.reset();
 
-  // Disable external write buffer manager, let RocksDB manage it
-  create_opts_.write_buffer_manager = nullptr;
+  // Memtables from every DB and column family share the same limit. The write
+  // buffer manager charges their arenas to the shared cache, so block pages
+  // are evicted as writes grow and writes stall if flushing cannot keep up.
+  create_opts_.write_buffer_manager =
+      GlobalResource::Instance().rocksdb_write_buffer_manager();
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+  // malloc can retain freed MemTable blocks around unrelated live objects.
+  // Keep SkipList semantics and WBM accounting, but tie the large backing to
+  // a MemTable-owned mapping. Flush does not release pinned iterators' data;
+  // destruction unmaps it before returning the corresponding WBM charge.
+  if (create_opts_.write_buffer_manager) {
+    create_opts_.memtable_factory = std::make_shared<RocksdbMemtableFactory>(
+        create_opts_.write_buffer_manager);
+  }
+#endif
 
   // Reduce preallocation size for manifest file to 512KB to save disk space
   create_opts_.manifest_preallocation_size = 512 * 1024;
@@ -293,17 +433,15 @@ void RocksdbContext::prepare_options(
   // Disable direct reads (use buffered I/O instead)
   create_opts_.use_direct_reads = false;
 
-  // Hash skip list memtable for prefix-based lookups
-  if (enable_hash_skiplist_) {
+  if (enable_prefix_extractor_) {
     create_opts_.prefix_extractor.reset(rocksdb::NewCappedPrefixTransform(8));
-    create_opts_.memtable_factory.reset(rocksdb::NewHashSkipListRepFactory(
-        1000000,  // bucket_count
-        4,        // skiplist_height
-        4         // skiplist_branching_factor
-        ));
-    create_opts_.allow_concurrent_memtable_write = false;
     read_opts_.total_order_seek = true;
+    // FTS sealing and flush use total-order iterators. HashSkipList builds
+    // another complete ordered list in an untracked Arena for each such
+    // iterator. Keep the default ordered SkipList, whose nodes are already
+    // covered by WBM, rather than allocating a second copy at flush time.
   }
+  return RocksdbBlockCache::AcquireContext(table_options.block_cache);
 }
 
 
@@ -328,6 +466,8 @@ Status RocksdbContext::close() {
   if (auto s = db_->Close(); s.ok()) {
     LOG_DEBUG("Closed RocksDB[%s]", db_path_.c_str());
     db_.reset();
+    cache_activity_.reset();
+    metadata_memory_.reset();
     return Status::OK();
   } else {
     LOG_ERROR("Failed to close RocksDB[%s], code[%d], reason[%s]",
@@ -427,6 +567,15 @@ Status RocksdbContext::create_cf(const std::string &cf_name) {
 
   rocksdb::ColumnFamilyHandle *cf_handle{nullptr};
   rocksdb::ColumnFamilyOptions cf_options(create_opts_);
+  const size_t previous_bytes = metadata_memory_->bytes();
+  try {
+    metadata_memory_->acquire(kRocksDbColumnMetadata);
+    cf_handles_.reserve(cf_handles_.size() + 1);
+  } catch (const std::bad_alloc &) {
+    metadata_memory_->retain_at_most(previous_bytes);
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Insufficient RocksDB column-family metadata budget");
+  }
   // Apply per-CF merge operator if one was registered for this CF name
   auto it = per_cf_merge_ops_.find(cf_name);
   if (it != per_cf_merge_ops_.end() && it->second) {
@@ -442,6 +591,7 @@ Status RocksdbContext::create_cf(const std::string &cf_name) {
     LOG_ERROR("Failed to create cf[%s] in RocksDB[%s], code[%d], reason[%s]",
               cf_name.c_str(), db_path_.c_str(), s.code(),
               s.ToString().c_str());
+    metadata_memory_->retain_at_most(previous_bytes);
     return Status::InternalError();
   }
 }
@@ -469,6 +619,9 @@ Status RocksdbContext::drop_cf(const std::string &cf_name) {
   if (s.ok()) {
     delete *it;
     cf_handles_.erase(it);
+    if (metadata_memory_->bytes() >= kRocksDbColumnMetadata)
+      metadata_memory_->retain_at_most(metadata_memory_->bytes() -
+                                       kRocksDbColumnMetadata);
     LOG_DEBUG("Dropped cf[%s] in RocksDB[%s]", cf_name.c_str(),
               db_path_.c_str());
     return Status::OK();

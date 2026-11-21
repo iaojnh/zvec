@@ -507,3 +507,56 @@ TEST_F(ColumnMergingReaderTest, ZeroRowBatches) {
   ASSERT_OK(merging_reader->ReadNext(&result_batch));
   EXPECT_EQ(result_batch, nullptr);
 }
+
+TEST_F(ColumnMergingReaderTest, ResidentMissKeepsAlreadyReadChildRows) {
+  class Reader : public ResidentRecordBatchReader {
+   public:
+    Reader(std::shared_ptr<arrow::RecordBatch> batch, bool resident)
+        : schema_(batch->schema()), batch_(std::move(batch)),
+          resident_(resident) {}
+    std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
+    arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *out) override {
+      ++reads;
+      *out = std::move(batch_);
+      return arrow::Status::OK();
+    }
+    arrow::Result<bool> ReadNextResident(
+        std::shared_ptr<arrow::RecordBatch> *out) override {
+      *out = nullptr;
+      if (!batch_) return true;
+      if (!resident_) return false;
+      ARROW_RETURN_NOT_OK(ReadNext(out));
+      return true;
+    }
+    int reads{0};
+   private:
+    std::shared_ptr<arrow::Schema> schema_;
+    std::shared_ptr<arrow::RecordBatch> batch_;
+    bool resident_;
+  };
+  auto left_batch = MakeInt32RecordBatch("left", {1, 2}).ValueOrDie();
+  auto right_batch = MakeInt32RecordBatch("right", {3, 4}).ValueOrDie();
+  auto left = std::make_shared<Reader>(left_batch, true);
+  auto right = std::make_shared<Reader>(right_batch, false);
+  auto schema = arrow::schema({left_batch->schema()->field(0),
+                                right_batch->schema()->field(0)});
+  auto merged = ColumnMergingReader::Make(schema, {left, right});
+  std::shared_ptr<arrow::RecordBatch> batch;
+  auto miss = merged->ReadNextResident(&batch);
+  ASSERT_TRUE(miss.ok());
+  EXPECT_FALSE(*miss);
+  EXPECT_EQ(batch, nullptr);
+  EXPECT_EQ(left->reads, 1);
+  EXPECT_EQ(right->reads, 0);
+  ASSERT_TRUE(merged->ReadNext(&batch).ok());
+  ASSERT_NE(batch, nullptr);
+  EXPECT_TRUE(batch->ValidateFull().ok());
+  EXPECT_TRUE(batch->column(0)->Equals(left_batch->column(0)));
+  EXPECT_TRUE(batch->column(1)->Equals(right_batch->column(0)));
+  EXPECT_EQ(left->reads, 1);
+  EXPECT_EQ(right->reads, 1);
+  auto eof = merged->ReadNextResident(&batch);
+  ASSERT_TRUE(eof.ok());
+  EXPECT_TRUE(*eof);
+  EXPECT_EQ(batch, nullptr);
+}

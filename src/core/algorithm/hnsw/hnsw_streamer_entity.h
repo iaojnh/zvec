@@ -13,11 +13,12 @@
 // limitations under the License.
 
 #pragma once
-
+#include <atomic>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #endif
@@ -28,6 +29,7 @@
 #include <zvec/core/framework/index_framework.h>
 #include "hnsw_chunk.h"
 #include "hnsw_entity.h"
+#include "utility/resident_vector_batch.h"
 #include "hnsw_index_hash.h"
 #include "hnsw_params.h"
 
@@ -50,6 +52,19 @@ class HnswStreamerEntity : public HnswEntity {
   //! return 0 on success, or errCode in failure
   int cleanup() override;
 
+  bool failed_build() const {
+    return failed_build_.load();
+  }
+  void mark_failed_build() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mark_failed_build_unlocked();
+  }
+  void mark_failed_build_unlocked() {
+    failed_build_.store(true);
+    mutable_header()->graph.options |= kGraphBuildFailed;
+    broker_->mark_dirty();
+  }
+
   //! Make a copy of streamer entity, to support thread-safe operation.
   //! The segment in container cannot be read concurrenly
   const HnswEntity::Pointer clone() const override;
@@ -70,9 +85,9 @@ class HnswStreamerEntity : public HnswEntity {
   int get_vector_borrowed(const node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
 
-  int get_vector(
-      const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const override;
+  int get_vector(const node_id_t *ids, uint32_t count,
+                 ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks)
+      const override;
 
   //! Get the node id's neighbors on graph level
   //! Note: the neighbors cannot be modified, using the following
@@ -86,9 +101,8 @@ class HnswStreamerEntity : public HnswEntity {
   //! Add vector and id to hnsw entity
   int add_vector_with_id(level_t level, node_id_t id, const void *vec) override;
 
-  int update_neighbors(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+  int update_neighbors(level_t level, node_id_t id,
+                       const TopkHeap::Container &neighbors) override;
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
@@ -224,8 +238,9 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! Typed batch get_vector: fills vector<MemBlock> without runtime branching
   template <typename MemBlock>
-  inline int get_vector_typed(const node_id_t *ids, uint32_t count,
-                              std::vector<MemBlock> &vec_blocks) const;
+  inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      ailego::BudgetedVector<MemBlock> &vec_blocks) const;
 
   //! Typed get_key: reads key using typed MemBlock
   template <typename MemBlock>
@@ -259,7 +274,9 @@ class HnswStreamerEntity : public HnswEntity {
 
  protected:
   template <class Key, class T>
-  using HashMap = google::dense_hash_map<Key, T, std::hash<Key>>;
+  using HashMap = google::dense_hash_map<
+      Key, T, std::hash<Key>, std::equal_to<Key>,
+      ailego::BudgetedAllocator<std::pair<const Key, T>>>;
   template <class Key, class T>
   using HashMapPointer = std::shared_ptr<HashMap<Key, T>>;
 
@@ -281,11 +298,11 @@ class HnswStreamerEntity : public HnswEntity {
       const std::shared_ptr<std::shared_mutex> &upper_neighbor_rw_mutex,
       std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
       const HashMapPointer<key_t, node_id_t> &keys_map, bool use_key_info_map,
-      std::vector<Chunk::Pointer> &&node_chunks,
-      std::vector<Chunk::Pointer> &&upper_neighbor_chunks,
+      ailego::BudgetedVector<Chunk::Pointer> &&node_chunks,
+      ailego::BudgetedVector<Chunk::Pointer> &&upper_neighbor_chunks,
       const ChunkBroker::Pointer &broker,
-      std::shared_ptr<std::vector<const uint8_t *>> node_bases,
-      std::shared_ptr<std::vector<const uint8_t *>> upper_bases)
+      std::shared_ptr<ailego::BudgetedVector<const uint8_t *>> node_bases,
+      std::shared_ptr<ailego::BudgetedVector<const uint8_t *>> upper_bases)
       : stats_(stats),
         upper_neighbor_rw_mutex_(upper_neighbor_rw_mutex),
         chunk_size_(chunk_size),
@@ -318,7 +335,7 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! Called only in searching procedure per context, so no need to lock
   void sync_chunks(ChunkBroker::ChunkType type, size_t idx,
-                   std::vector<Chunk::Pointer> *chunks) const {
+                   ailego::BudgetedVector<Chunk::Pointer> *chunks) const {
     if (ailego_likely(idx < chunks->size())) {
       return;
     }
@@ -467,7 +484,7 @@ class HnswStreamerEntity : public HnswEntity {
 
     // Use std::vector instead of a VLA: VLAs are a GNU extension and may
     // produce different codegen / be rejected under clang/MSVC.
-    std::vector<char> zeros(neighbors_size, 0);
+    ailego::BudgetedVector<char> zeros(neighbors_size, 0);
     if (ailego_unlikely(chunk->write(zero_start, zeros.data(),
                                      neighbors_size) != neighbors_size)) {
       LOG_ERROR("Chunk write zeros failed");
@@ -617,6 +634,7 @@ class HnswStreamerEntity : public HnswEntity {
 
  protected:
   IndexStreamer::Stats &stats_;
+  std::atomic<bool> failed_build_{false};
   std::mutex mutex_{};
   //! Guards upper_neighbor_index_ and upper_neighbor_chunks_ against
   //! concurrent reads (find) and writes (insert/emplace_back).
@@ -645,7 +663,7 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! the chunks will be changed in searcher, so need mutable
   //! data chunk include: vector, key, level 0 neighbors
-  mutable std::vector<Chunk::Pointer> node_chunks_{};
+  mutable ailego::BudgetedVector<Chunk::Pointer> node_chunks_{};
 
   //! Flat cache of base_data() pointers for node_chunks_ and
   //! upper_neighbor_chunks_. Non-empty only when the storage backend
@@ -659,11 +677,12 @@ class HnswStreamerEntity : public HnswEntity {
   //! (hub-node chunks near the HNSW entry point) are promoted to L1/L2
   //! by all search threads collectively, instead of each clone warming
   //! its own private 250 KB copy in L3.
-  mutable std::shared_ptr<std::vector<const uint8_t *>> node_chunk_bases_{};
+  mutable std::shared_ptr<ailego::BudgetedVector<const uint8_t *>>
+      node_chunk_bases_{};
 
   //! upper neighbor chunk inlude: UpperNeighborHeader + (1~level) neighbors
-  mutable std::vector<Chunk::Pointer> upper_neighbor_chunks_{};
-  mutable std::shared_ptr<std::vector<const uint8_t *>>
+  mutable ailego::BudgetedVector<Chunk::Pointer> upper_neighbor_chunks_{};
+  mutable std::shared_ptr<ailego::BudgetedVector<const uint8_t *>>
       upper_neighbor_chunk_bases_{};
 
   ChunkBroker::Pointer broker_{};  // chunk broker
@@ -697,7 +716,7 @@ HnswStreamerEntity::get_neighbors_typed<MmapMemoryBlock>(level_t level,
   size_t ret = chunk->read(offset, ptr, nbr_size);
   if (ailego_unlikely(ret != nbr_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<MmapMemoryBlock>();
+    throw GraphStorageError{chunk->read_error()};
   }
   MmapMemoryBlock block(const_cast<void *>(ptr.data()));
   return NeighborsT<MmapMemoryBlock>(std::move(block));
@@ -729,7 +748,7 @@ HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
   size_t ret = chunk->read_borrowed(offset, mem_block, nbr_size);
   if (ailego_unlikely(ret != nbr_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<BufferPoolMemoryBlock>();
+    throw GraphStorageError{chunk->read_error()};
   }
   return NeighborsT<BufferPoolMemoryBlock>(std::move(mem_block));
 }
@@ -738,7 +757,7 @@ HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
 template <>
 inline int HnswStreamerEntity::get_vector_typed<MmapMemoryBlock>(
     const node_id_t *ids, uint32_t count,
-    std::vector<MmapMemoryBlock> &vec_blocks) const {
+    ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
@@ -751,7 +770,7 @@ inline int HnswStreamerEntity::get_vector_typed<MmapMemoryBlock>(
     if (ailego_unlikely(ret != read_size)) {
       LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
                 loc.second, read_size, ret);
-      return IndexError_ReadData;
+      return node_chunks_[loc.first]->read_error();
     }
     vec_blocks[i].reset(const_cast<void *>(ptr.data()));
   }
@@ -762,7 +781,7 @@ inline int HnswStreamerEntity::get_vector_typed<MmapMemoryBlock>(
 template <>
 inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
     const node_id_t *ids, uint32_t count,
-    std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
+    ailego::BudgetedVector<BufferPoolMemoryBlock> &vec_blocks) const {
   vec_blocks.resize(count);
   if (count == 0) {
     return 0;
@@ -788,32 +807,33 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
       if (ailego_unlikely(ret != read_size)) {
         LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
                   loc.second, read_size, ret);
-        return IndexError_ReadData;
+        return node_chunks_[loc.first]->read_error();
       }
       vec_blocks[i] = std::move(mem_block);
     }
     return 0;
   }
 
-  // Reuse request storage on each query thread. HNSW node ids span many
+  // Keep common request batches on the stack. HNSW node ids span many
   // storage chunks, so the batch deliberately crosses Segment boundaries;
   // BufferStorage can then deduplicate all page misses in one AIO submission.
-  static thread_local std::vector<IndexStorage::Segment::BorrowedRead>
-      batch_reads;
-  batch_reads.clear();
-  batch_reads.reserve(count);
+  constexpr size_t kInlineReads = 128;
+  IndexStorage::Segment::BorrowedRead inline_reads[kInlineReads];
+  ailego::BudgetedVector<IndexStorage::Segment::BorrowedRead> overflow_reads;
+  if (count > kInlineReads) overflow_reads.resize(count);
+  auto *batch_reads =
+      count > kInlineReads ? overflow_reads.data() : inline_reads;
   const size_t read_size = vector_size();
   for (auto i = 0U; i < count; ++i) {
     auto loc = get_vector_chunk_loc(ids[i]);
     ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
     ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
                        "invalid chunk offset");
-    batch_reads.emplace_back(node_chunks_[loc.first].get(), loc.second,
-                             read_size, &vec_blocks[i]);
+    batch_reads[i] = IndexStorage::Segment::BorrowedRead(
+        node_chunks_[loc.first].get(), loc.second, read_size, &vec_blocks[i]);
   }
-  if (ailego_unlikely(
-          !batch_reads.front().segment->read_borrowed_batch_immutable(
-              batch_reads.data(), batch_reads.size()))) {
+  if (ailego_unlikely(!batch_reads[0].segment->read_borrowed_batch_immutable(
+          batch_reads, count))) {
     LOG_ERROR("Batch read vectors failed, count=%u, read size=%zu", count,
               read_size);
     return IndexError_ReadData;
@@ -873,6 +893,12 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
 
   using HnswStreamerEntity::HnswStreamerEntity;
 
+  int cleanup() override {
+    decltype(node_chunk_bases_)().swap(node_chunk_bases_);
+    decltype(upper_neighbor_chunk_bases_)().swap(upper_neighbor_chunk_bases_);
+    return HnswStreamerEntity::cleanup();
+  }
+
   HnswStorageMode storage_mode() const override {
     return HnswStorageMode::kMmap;
   }
@@ -908,7 +934,7 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
 
   ailego_force_inline int get_vector_typed(
       const node_id_t *ids, uint32_t count,
-      std::vector<MmapMemoryBlock> &vec_blocks) const {
+      ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
     vec_blocks.resize(count);
     for (auto i = 0U; i < count; ++i) {
       uint32_t chunk_idx = ids[i] >> node_index_mask_bits_;
@@ -979,8 +1005,8 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
     }
   }
 
-  mutable std::vector<const char *> node_chunk_bases_{};
-  mutable std::vector<const char *> upper_neighbor_chunk_bases_{};
+  mutable ailego::BudgetedVector<const char *> node_chunk_bases_{};
+  mutable ailego::BudgetedVector<const char *> upper_neighbor_chunk_bases_{};
 };
 
 //! Typed entity subclass for buffer pool mode.
@@ -1007,18 +1033,51 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
 
   inline int get_vector_typed(
       const node_id_t *ids, uint32_t count,
-      std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
+      ailego::BudgetedVector<BufferPoolMemoryBlock> &vec_blocks) const {
     return HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
         ids, count, vec_blocks);
   }
 
+  // Per-query clones own this scratch; mmap entities retain their layout.
+  ResidentVectorBatch &resident_vector_batch() const {
+    return resident_vector_batch_;
+  }
+
+  bool try_get_resident_vectors(
+      const node_id_t *ids, uint32_t count,
+      ailego::BudgetedVector<const void *> &views) const {
+    resident_vector_batch_.release();
+    if (!broker_ || !broker_->storage()) return false;
+    auto pool = broker_->storage()->vec_buffer_pool();
+    if (!pool || pool->writable() || !pool->cache_enabled()) return false;
+    const size_t bytes = vector_size();
+    return resident_vector_batch_.read_offsets(
+        *pool, ids, count, bytes,
+        [this, bytes](node_id_t id, size_t *absolute) {
+          if (id >= doc_cnt()) return false;
+          const auto loc = get_vector_chunk_loc(id);
+          if (loc.first >= node_chunks_.size()) return false;
+          const auto &chunk = node_chunks_[loc.first];
+          if (loc.second > chunk->data_size() ||
+              bytes > chunk->data_size() - loc.second ||
+              loc.second > (std::numeric_limits<size_t>::max)() -
+                               chunk->data_offset())
+            return false;
+          *absolute = chunk->data_offset() + loc.second;
+          return true;
+        }, views);
+  }
+
   int get_vector_for_prune(
       const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const;
+      ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks) const;
 
   inline key_t get_key_typed(node_id_t id) const {
     return HnswStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(id);
   }
+ private:
+  mutable ResidentVectorBatch resident_vector_batch_;
+
 };
 
 //! Typed entity subclass for contiguous memory mode.
@@ -1041,6 +1100,11 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
 
   ~HnswContiguousStreamerEntity() override = default;
 
+  int cleanup() override {
+    degrade_to_mmap();
+    return HnswMmapStreamerEntity::cleanup();
+  }
+
   //! Build contiguous memory from chunks after open.
   //! Must be called after the entity is fully opened and all chunks are loaded.
   int build_contiguous_memory();
@@ -1054,7 +1118,7 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
     graph_base_ = nullptr;
     upper_neighbor_memory_.reset();
     upper_neighbor_base_ = nullptr;
-    upper_chunk_offsets_.clear();
+    decltype(upper_chunk_offsets_)().swap(upper_chunk_offsets_);
     LOG_INFO("HNSW contiguous entity degraded to mmap mode for insertion");
   }
 
@@ -1104,7 +1168,7 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
 
   ailego_force_inline int get_vector_typed(
       const node_id_t *ids, uint32_t count,
-      std::vector<MmapMemoryBlock> &vec_blocks) const {
+      ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
     if (ailego_likely(vector_base_ != nullptr)) {
       vec_blocks.resize(count);
       for (auto i = 0U; i < count; ++i) {
@@ -1141,22 +1205,6 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
   }
 
  protected:
-  //! Custom deleter for contiguous memory (munmap / _aligned_free / free)
-  //! Used by shared_ptr to properly release mmap'd memory.
-  struct ContiguousDeleter {
-    size_t size;
-    void operator()(char *ptr) const {
-      if (!ptr) return;
-#if defined(__linux__) || defined(__APPLE__)
-      ::munmap(ptr, size);
-#elif defined(_WIN32)
-      ::_aligned_free(ptr);
-#else
-      std::free(ptr);
-#endif
-    }
-  };
-
   //! Flat vector array: vectors stored densely (stride = vector_size).
   std::shared_ptr<char> vector_memory_{};
   char *vector_base_{nullptr};
@@ -1171,11 +1219,10 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
   char *upper_neighbor_base_{nullptr};
 
   //! Cumulative offsets for each upper neighbor chunk in contiguous memory
-  std::vector<size_t> upper_chunk_offsets_{};
+  ailego::BudgetedVector<size_t> upper_chunk_offsets_{};
 
  private:
-  //! Allocate contiguous memory with hugepage/THP support
-  static char *allocate_contiguous(size_t size);
+  static std::shared_ptr<char> allocate_budgeted_contiguous(size_t size);
 };
 
 //! Typed entity subclass that reads vectors from an external vector source.
@@ -1212,8 +1259,9 @@ class HnswExternalStreamerEntity : public HnswMmapStreamerEntity {
   //! Typed batch get_vector: zero-copy view into the external vector source.
   //! Hides HnswMmapStreamerEntity::get_vector_typed (non-virtual, used by the
   //! template algorithm via static_cast).
-  inline int get_vector_typed(const node_id_t *ids, uint32_t count,
-                              std::vector<MmapMemoryBlock> &vec_blocks) const {
+  inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      ailego::BudgetedVector<MmapMemoryBlock> &vec_blocks) const {
     if (ailego_unlikely(vec_src_ == nullptr)) {
       return IndexError_Runtime;
     }
@@ -1259,9 +1307,9 @@ class HnswExternalStreamerEntity : public HnswMmapStreamerEntity {
     return get_vector(id, block);
   }
 
-  int get_vector(
-      const node_id_t *ids, uint32_t count,
-      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const override {
+  int get_vector(const node_id_t *ids, uint32_t count,
+                 ailego::BudgetedVector<IndexStorage::MemoryBlock> &vec_blocks)
+      const override {
     if (ailego_unlikely(vec_src_ == nullptr)) {
       return IndexError_Runtime;
     }

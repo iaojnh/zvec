@@ -236,8 +236,9 @@ Status FtsIndexParams::validate() const {
 
 namespace detail {
 struct FtsState {
-  std::once_flag once;
+  std::mutex mutex;
   std::shared_ptr<fts::TokenizerPipeline> pipeline;
+  fts::FtsIndexParams params;
   bool created{false};
 };
 
@@ -270,8 +271,8 @@ FtsIndexParams::FtsIndexParams(FtsIndexParams &&other) noexcept
 
 FtsIndexParams::~FtsIndexParams() {
   if (state_ && state_->created) {
-    auto internal = to_internal(*this);
-    fts::TokenizerPipelineManager::Instance().release(internal);
+    // Setters may have changed the public configuration since acquisition.
+    fts::TokenizerPipelineManager::Instance().release(state_->params);
   }
 }
 
@@ -291,16 +292,24 @@ Result<std::shared_ptr<fts::TokenizerPipeline>> AcquireFtsPipeline(
     state_uptr = std::make_unique<FtsState>();
   }
   auto &st = *state_uptr;
-  std::call_once(st.once, [&]() {
-    auto internal = to_internal(params);
-    st.pipeline = fts::TokenizerPipelineManager::Instance().acquire(internal);
-    if (st.pipeline) {
-      st.created = true;
-    }
-  });
+  // Cache successful initialization only. A transient budget rejection must
+  // be retryable with the same params after other consumers release memory.
+  std::lock_guard<std::mutex> lock(st.mutex);
+  auto internal = to_internal(params);
+  if (st.created && (st.params.tokenizer_name != internal.tokenizer_name ||
+                     st.params.filters != internal.filters ||
+                     st.params.extra_params != internal.extra_params)) {
+    fts::TokenizerPipelineManager::Instance().release(st.params);
+    st.pipeline.reset();
+    st.created = false;
+  }
   if (!st.pipeline) {
-    return tl::make_unexpected(
-        Status::InternalError("Failed to create tokenizer pipeline"));
+    Status status;
+    st.pipeline =
+        fts::TokenizerPipelineManager::Instance().acquire(internal, &status);
+    if (!st.pipeline) return tl::make_unexpected(status);
+    st.params = std::move(internal);
+    st.created = true;
   }
   return st.pipeline;
 }

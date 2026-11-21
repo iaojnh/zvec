@@ -93,10 +93,16 @@ class DeleteStore : public std::enable_shared_from_this<DeleteStore> {
     return status;
   }
 
-  void mark_deleted(uint64_t doc_id) {
-    bitmap_.add(doc_id);
+  Status prepare_mark_deleted(uint64_t doc_id) {
+    return bitmap_.prepare_add(doc_id);
+  }
+
+  Status mark_deleted(uint64_t doc_id) {
+    auto status = bitmap_.add(doc_id);
+    if (!status.ok()) return status;
     empty_.store(false, std::memory_order_relaxed);
     modified_since_last_flush_ = true;
+    return Status::OK();
   }
 
   bool is_deleted(uint64_t doc_id) const {

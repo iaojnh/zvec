@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -64,6 +65,11 @@ class Segment {
   virtual SegmentID id() const = 0;
 
   virtual SegmentMeta::Ptr meta() const = 0;
+
+  virtual bool uses_buffer_storage() const {
+    return false;
+  }
+  arrow::MemoryPool *query_memory_pool() const;
 
   // Doc-id bounds for routing, read under the shared segment lock. Concurrent
   // callers must use this instead of min/max_doc_id() off meta(), which
@@ -167,6 +173,21 @@ class Segment {
                              &output_fields = std::nullopt,
                          bool include_vector = true) = 0;
 
+  // Bound intermediate forward tables independently of the caller's PK count.
+  static constexpr size_t kMaxFetchBatchSize = 256;
+
+  virtual std::vector<Doc::Ptr> fetch_docs(
+      const std::vector<uint64_t> &g_doc_ids,
+      const std::optional<std::vector<std::string>> &output_fields,
+      bool include_vector) {
+    std::vector<Doc::Ptr> docs;
+    docs.reserve(g_doc_ids.size());
+    for (uint64_t doc_id : g_doc_ids) {
+      docs.push_back(fetch(doc_id, output_fields, include_vector));
+    }
+    return docs;
+  }
+
   virtual TablePtr fetch(const std::vector<std::string> &columns,
                          const std::vector<int> &segment_doc_ids) const = 0;
 
@@ -217,6 +238,11 @@ class Segment {
   // ---- Persistence and lifecycle -----------------------------------------
   virtual Status flush() = 0;
 
+  // Persist for shutdown without allocating readers for the completed blocks.
+  virtual Status flush_for_close() {
+    return flush();
+  }
+
   virtual Status dump() = 0;
 
   // Drops the writing forward block under the exclusive segment lock. Callers
@@ -225,6 +251,20 @@ class Segment {
   virtual void remove_writing_forward_block() = 0;
 
   virtual Status destroy() = 0;
+
+  // Results correspond to input global IDs, including duplicates and missing
+  // rows. Implementations may retain the single-row path for other layouts.
+  virtual DocPtrList fetch_batch(const std::vector<uint64_t> &doc_ids,
+                                 const std::optional<std::vector<std::string>>
+                                     &output_fields = std::nullopt,
+                                 bool include_vector = true) {
+    DocPtrList docs;
+    docs.reserve(doc_ids.size());
+    for (auto id : doc_ids) {
+      docs.push_back(fetch(id, output_fields, include_vector));
+    }
+    return docs;
+  }
 };
 
 }  // namespace zvec
