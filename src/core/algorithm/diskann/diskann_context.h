@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <algorithm>
 #include <zvec/core/framework/index_context.h>
 #include "utility/topk_result_builder.h"
 #include "diskann_dist_calculator.h"
@@ -62,7 +63,8 @@ class DiskAnnContext : public IndexContext,
   //! Create a lightweight context for reading vectors by id.
   static Pointer create_fetch_context(const IndexMeta &meta,
                                       const IndexMetric::Pointer &measure,
-                                      const DiskAnnEntity::Pointer &entity);
+                                      const DiskAnnEntity::Pointer &entity,
+                                      int *status = nullptr);
 
  public:
   //! Init
@@ -142,8 +144,8 @@ class DiskAnnContext : public IndexContext,
  public:
   //! Set topk of search result
   void set_topk(uint32_t val) override {
+    topk_heap_.limit(val, false);
     topk_ = val;
-    topk_heap_.limit(val);
   }
 
   void set_list_size(uint32_t list_size) {
@@ -152,6 +154,10 @@ class DiskAnnContext : public IndexContext,
 
   void set_fetch_vector(bool v) override {
     fetch_vector_ = v;
+  }
+
+  bool fetch_vector() const override {
+    return fetch_vector_;
   }
 
   //! Get topk
@@ -186,12 +192,14 @@ class DiskAnnContext : public IndexContext,
     return coord_buffer_;
   }
 
+  int ensure_sector_buffer(size_t sectors);
+
   inline void *sector_buffer() {
-    return sector_buffer_;
+    return sector_buffer_.data();
   }
 
   inline size_t sector_buffer_size() const {
-    return sector_buffer_size_;
+    return sector_buffer_.size();
   }
 
   inline IOContext &io_ctx() {
@@ -240,7 +248,7 @@ class DiskAnnContext : public IndexContext,
     copy_common_query_options_from(rhs);
     topk_ = rhs.topk_;
     topk_heap_.clear();
-    topk_heap_.limit(topk_);
+    topk_heap_.limit(topk_, false);
     group_num_ = rhs.group_num_;
     group_topk_ = rhs.group_topk_;
     group_topk_heaps_.clear();
@@ -308,7 +316,7 @@ class DiskAnnContext : public IndexContext,
 
     topk_ = group_topk_ * group_num_;
 
-    topk_heap_.limit(topk_);
+    topk_heap_.limit(topk_, false);
 
     group_topk_heaps_.clear();
   }
@@ -317,6 +325,20 @@ class DiskAnnContext : public IndexContext,
   // by TopkResultBuilder via the hooks below (result_score,
   // emplace_result_doc).
   using TopkResultBuilder<DiskAnnContext, TopkHeap>::topk_to_result;
+
+  void knn_to_result(uint32_t idx, ailego::ProcessRssReservation &memory) {
+    if (!group_by_search() && topk_heap_.size() > results_[idx].capacity()) {
+      auto &docs = results_[idx];
+      const size_t size = std::min<size_t>(topk_, topk_heap_.size());
+      if (size > docs.capacity()) {
+        memory.allocate(size * sizeof(IndexDocument), [&] {
+          docs.reserve(size);
+          return docs.capacity() * sizeof(IndexDocument);
+        });
+      }
+    }
+    topk_to_result(idx);
+  }
 
   void set_to_result(uint32_t idx, const std::vector<diskann_id_t> &result_ids,
                      const std::vector<float> &result_dists) {
@@ -347,10 +369,11 @@ class DiskAnnContext : public IndexContext,
 
   void emplace_result_doc(IndexDocumentList &docs, diskann_id_t id, float score,
                           const VectorInfo &info) {
-    if (fetch_vector_) {
-      docs.emplace_back(entity_->get_key(id), score, id, info.vec_);
+    const auto key = entity_->get_key(id);
+    if (fetch_vector_ && info.vec_) {
+      docs.emplace_back(key, score, id, info.vec_);
     } else {
-      docs.emplace_back(entity_->get_key(id), score, id);
+      docs.emplace_back(key, score, id);
     }
   }
 
@@ -369,7 +392,6 @@ class DiskAnnContext : public IndexContext,
   bool debug_mode_{false};
   uint32_t pq_chunk_num_{0};
   uint32_t element_size_{0};
-  uint32_t element_rotated_size_{0};
   uint32_t list_size_{0};
 
   TopkHeap topk_heap_{};
@@ -384,8 +406,8 @@ class DiskAnnContext : public IndexContext,
   void *query_{nullptr};
   void *query_rotated_{nullptr};
   void *coord_buffer_{nullptr};
-  void *sector_buffer_{nullptr};
-  size_t sector_buffer_size_{0};
+  ailego::ProcessRssAlignedBuffer query_memory_;
+  ailego::ProcessRssAlignedBuffer sector_buffer_;
 
   std::vector<IndexDocumentList> results_{};
   std::vector<IndexGroupDocumentList> group_results_{};

@@ -53,7 +53,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) {
   size_t read_size = header_seg->read(0, hdr_block, sizeof(IvfRabitqHeader));
   if (read_size != sizeof(IvfRabitqHeader)) {
     LOG_ERROR("Failed to read IvfRabitqHeader");
-    return IndexError_InvalidFormat;
+    return header_seg->read_error();
   }
   memcpy(&header_, hdr_block.data(), sizeof(IvfRabitqHeader));
   int ret = validate_header();
@@ -79,7 +79,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) {
   read_size = cluster_meta_seg->read(0, meta_block, meta_size);
   if (read_size != meta_size) {
     LOG_ERROR("Failed to read cluster metas");
-    return IndexError_InvalidFormat;
+    return cluster_meta_seg->read_error();
   }
   cluster_metas_.resize(header_.cluster_count);
   memcpy(cluster_metas_.data(), meta_block.data(), meta_size);
@@ -101,7 +101,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) {
   if (read_size != batch_data_size) {
     LOG_ERROR("Failed to read batch data: got %zu, expected %zu", read_size,
               batch_data_size);
-    return IndexError_InvalidFormat;
+    return batch_seg->read_error();
   }
   batch_data_ = reinterpret_cast<const char *>(batch_data_block_.data());
 
@@ -123,7 +123,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) {
     read_size = ex_seg->read(0, ex_data_block_, ex_data_size);
     if (read_size != ex_data_size) {
       LOG_ERROR("Failed to read ex data");
-      return IndexError_InvalidFormat;
+      return ex_seg->read_error();
     }
     ex_data_ = reinterpret_cast<const char *>(ex_data_block_.data());
   }
@@ -144,7 +144,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) {
   read_size = keys_seg->read(0, keys_block_, keys_size);
   if (read_size != keys_size) {
     LOG_ERROR("Failed to read keys");
-    return IndexError_InvalidFormat;
+    return keys_seg->read_error();
   }
   keys_ = reinterpret_cast<const uint64_t *>(keys_block_.data());
 
