@@ -69,6 +69,8 @@ class HnswStreamerEntity : public HnswEntity {
   int get_vector(const node_id_t id,
                  IndexStorage::MemoryBlock &block) const override;
 
+  int get_vector_snapshot(node_id_t id, IndexStorage::MemoryBlock &block) const;
+
   int get_vector_borrowed(const node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
 
@@ -413,10 +415,13 @@ class HnswStreamerEntity : public HnswEntity {
   struct InsertUndo;
   void remember_size(Chunk &chunk);
   int capture_write_undo(Chunk &chunk, const IndexStorage::SegmentData *writes,
-                         size_t count, void *mirror = nullptr);
+                         size_t count, void *mirror = nullptr,
+                         bool streamed_vector = false);
   int write_with_undo(Chunk &chunk, const IndexStorage::SegmentData *writes,
                       size_t count, void *mirror = nullptr);
 
+  int read_vector(node_id_t id, IndexStorage::MemoryBlock &block,
+                  bool immutable) const;
   int write_node_data(Chunk &chunk, size_t offset, const void *vec, key_t key);
 
   //! Add upper neighbor header and reserve space for upper neighbor

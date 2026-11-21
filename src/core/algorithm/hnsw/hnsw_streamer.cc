@@ -965,6 +965,51 @@ std::unique_lock<std::shared_mutex> HnswStreamer::lock_buffered_writes() {
   return lock;
 }
 
+const void *HnswStreamer::get_vector(uint64_t key) const {
+  const auto guard = lock_buffered_reads();
+  if (!entity_ || entity_->mutation_error() != 0) return nullptr;
+  return entity_->get_vector_by_key(key);
+}
+
+int HnswStreamer::get_vector(uint64_t key,
+                             IndexStorage::MemoryBlock &block) const {
+  const auto guard = lock_buffered_reads();
+  const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
+  if (error != 0) {
+    block.reset();
+    return error;
+  }
+  if (!guard.owns_lock() || read_only_) {
+    return entity_->get_vector_by_key(key, block);
+  }
+  const auto id = entity_->get_id(key);
+  if (id == kInvalidNodeId) {
+    block.reset();
+    return IndexError_InvalidArgument;
+  }
+  return entity_->get_vector_snapshot(id, block);
+}
+
+const void *HnswStreamer::get_vector_by_id(uint32_t id) const {
+  const auto guard = lock_buffered_reads();
+  if (!entity_ || entity_->mutation_error() != 0) return nullptr;
+  return entity_->get_vector(id);
+}
+
+int HnswStreamer::get_vector_by_id(uint32_t id,
+                                   IndexStorage::MemoryBlock &block) const {
+  const auto guard = lock_buffered_reads();
+  const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
+  if (error != 0) {
+    block.reset();
+    return error;
+  }
+  // The caller can retain the block after the read lock is released.
+  return guard.owns_lock() && !read_only_
+             ? entity_->get_vector_snapshot(id, block)
+             : entity_->get_vector(id, block);
+}
+
 //! Add a vector with id into index
 int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
                                    const IndexQueryMeta &qmeta,

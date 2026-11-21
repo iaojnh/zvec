@@ -177,24 +177,16 @@ class HnswStreamer : public IndexStreamer {
                                ContextPointer &context) const override;
 
   //! Fetch vector by key
-  const void *get_vector(uint64_t key) const override {
-    return entity_->get_vector_by_key(key);
-  }
+  const void *get_vector(uint64_t key) const override;
 
   int get_vector(const uint64_t key,
-                 IndexStorage::MemoryBlock &block) const override {
-    return entity_->get_vector_by_key(key, block);
-  }
+                 IndexStorage::MemoryBlock &block) const override;
 
   //! Fetch vector by id
-  const void *get_vector_by_id(uint32_t id) const override {
-    return entity_->get_vector(id);
-  }
+  const void *get_vector_by_id(uint32_t id) const override;
 
   int get_vector_by_id(const uint32_t id,
-                       IndexStorage::MemoryBlock &block) const override {
-    return entity_->get_vector(id, block);
-  }
+                       IndexStorage::MemoryBlock &block) const override;
 
   //! Open index from file path
   int open(IndexStorage::Pointer stg) override;

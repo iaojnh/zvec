@@ -62,7 +62,7 @@ void HnswStreamerEntity::remember_size(Chunk &chunk) {
 
 int HnswStreamerEntity::capture_write_undo(
     Chunk &chunk, const IndexStorage::SegmentData *writes, size_t count,
-    void *mirror) {
+    void *mirror, bool streamed_vector) {
   if (insert_undo_) {
     const auto &sizes = insert_undo_->sizes;
     const auto known = std::find_if(
@@ -79,8 +79,13 @@ int HnswStreamerEntity::capture_write_undo(
       const auto &write = writes[i];
       if (!write.length || write.offset >= previous_size) continue;
       const size_t len = std::min(write.length, previous_size - write.offset);
-      InsertUndo::Write saved{&chunk, write.offset, mirror,
-                              ailego::BudgetedVector<char>(len)};
+      InsertUndo::Write saved{&chunk, write.offset, mirror, {}};
+      {
+        // Retaining the previous wide vector must leave cache pages available
+        // for the streaming write and rollback. RSS still admits its copy.
+        const ailego::ProcessRssAllocationScope rss(streamed_vector && i == 0);
+        saved.bytes.resize(len);
+      }
       if (mirror) {
         std::memcpy(saved.bytes.data(), mirror, len);
       } else if (chunk.fetch_for_parsing(write.offset, saved.bytes.data(),
@@ -454,6 +459,17 @@ int HnswStreamerEntity::get_vector(const node_id_t *ids, uint32_t count,
 
 int HnswStreamerEntity::get_vector(const node_id_t id,
                                    IndexStorage::MemoryBlock &block) const {
+  return read_vector(id, block, /*immutable=*/true);
+}
+
+int HnswStreamerEntity::get_vector_snapshot(
+    node_id_t id, IndexStorage::MemoryBlock &block) const {
+  return read_vector(id, block, /*immutable=*/false);
+}
+
+int HnswStreamerEntity::read_vector(node_id_t id,
+                                    IndexStorage::MemoryBlock &block,
+                                    bool immutable) const {
   auto loc = get_vector_chunk_loc(id);
   ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
 
@@ -468,12 +484,14 @@ int HnswStreamerEntity::get_vector(const node_id_t id,
   ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
                      "invalid chunk offset");
   size_t read_size = vector_size();
-  size_t ret =
-      node_chunks_[loc.first]->read_immutable(loc.second, block, read_size);
+  auto &chunk = *node_chunks_[loc.first];
+  const size_t ret = immutable
+                         ? chunk.read_immutable(loc.second, block, read_size)
+                         : chunk.read(loc.second, block, read_size);
   if (ailego_unlikely(ret != read_size)) {
     LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
               loc.second, read_size, ret);
-    const int error = node_chunks_[loc.first]->read_error();
+    const int error = chunk.read_error();
     block.reset();
     return error;
   }
@@ -901,7 +919,8 @@ int HnswStreamerEntity::write_node_data(Chunk &chunk, size_t offset,
 
     // A cross-page vector can be streamed with one cache pin at a time.
     // Capture the original record first and keep the key and count ordered.
-    const int ret = capture_write_undo(chunk, writes, count);
+    const int ret = capture_write_undo(chunk, writes, count, nullptr,
+                                       /*streamed_vector=*/true);
     if (ret != 0) return ret;
     if (chunk.write(offset, vec, vector_size()) != vector_size()) {
       return chunk.write_error();

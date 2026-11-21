@@ -188,6 +188,12 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
     ASSERT_EQ(0, streamer->add_with_id_impl(1, vector.data(), meta, context));
     ASSERT_EQ(2u, index.get_doc_count());
 
+    core::IndexStorage::MemoryBlock fetched;
+    ASSERT_EQ(0, streamer->get_vector_by_id(1, fetched));
+    vector.fill(1.5f);
+    ASSERT_EQ(0, streamer->add_with_id_impl(1, vector.data(), meta, context));
+    EXPECT_FLOAT_EQ(1.0f, static_cast<const float *>(fetched.data())[0]);
+
     // Fail while searching for neighbors, after the overwrite has saved
     // node 1's previous bytes. The quarantined pool also refuses restoration.
     bool injected = false;
@@ -202,6 +208,10 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
     ASSERT_TRUE(injected);
     ASSERT_EQ(nullptr, index.create_index_provider());
     EXPECT_EQ(std::numeric_limits<uint32_t>::max(), index.get_doc_count());
+    EXPECT_EQ(core::IndexError_WriteData,
+              streamer->get_vector_by_id(1, fetched));
+    EXPECT_EQ(nullptr, fetched.data());
+    EXPECT_EQ(nullptr, streamer->get_vector_by_id(1));
   });
   worker.join();
 }
