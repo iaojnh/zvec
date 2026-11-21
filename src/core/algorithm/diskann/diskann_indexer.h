@@ -37,7 +37,7 @@ class DiskAnnIndexer {
  public:
   //! Initialize with the loaded entity and the quantizer constructed by
   //! the searcher/streamer (see
-  //! DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer).
+  //! DiskAnnSearcherEntity::load_quantizer).
   //! Any turbo::Quantizer works here; PQ is just the current default.
   int init(DiskAnnSearcherEntity &entity, turbo::Quantizer::Pointer quantizer);
 
@@ -65,15 +65,17 @@ class DiskAnnIndexer {
   diskann_key_t get_key(diskann_id_t id) const;
   diskann_id_t get_id(diskann_key_t key) const;
 
-  //! Copy element_size() bytes from src into a new vector value string
-  std::string make_vector_copy(const void *src) const {
-    return std::string(static_cast<const char *>(src), meta_.element_size());
+  VectorInfo make_candidate(DiskAnnContext *ctx, float distance,
+                            const void *src) const {
+    return VectorInfo(distance, ctx->fetch_vector() ? src : nullptr,
+                      meta_.element_size());
   }
 
   std::vector<bool> read_nodes(
       const std::vector<diskann_id_t> &node_ids,
       std::vector<void *> &coord_buffers,
-      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers);
+      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers,
+      int &io_error);
 
  protected:
   int use_medroids_data_as_centroids();
@@ -92,6 +94,7 @@ class DiskAnnIndexer {
   };
 
   uint32_t effective_cache_node_count(uint32_t requested_nodes) const;
+  int build_node_cache(uint32_t cache_node_num);
   int prepare_cache_storage(size_t capacity, CacheLoadState &state);
   int load_cache_list(CacheLoadState &state);
   int cache_bfs_levels(uint64_t num_nodes_to_cache, CacheLoadState &state);
@@ -111,6 +114,7 @@ class DiskAnnIndexer {
   uint64_t index_segment_offset_{0};
   uint64_t sector_num_per_node_{0};
 
+  ailego::ProcessRssAlignedBuffer centroid_memory_;
   void *centroid_data_{nullptr};
   size_t centroid_stride_{0};
 

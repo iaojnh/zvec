@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <zvec/core/framework/index_context.h>
@@ -254,8 +255,12 @@ class ZVEC_CORE_API Index {
   }
 
  protected:
-  bool init_context();
+  bool init_context(int *status = nullptr);
   core::IndexContext::Pointer &acquire_context();
+
+ private:
+  std::pair<core::IndexContext::Pointer &, int> acquire_query_context();
+  int ensure_trained_for_query();
 
  protected:
   bool is_trained_{false};

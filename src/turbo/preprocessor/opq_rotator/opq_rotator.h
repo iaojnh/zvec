@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 // Rooted at src/ so this header stays includable from the PQ quantizer headers,
 // which are themselves included from outside the turbo include root.
 #include <turbo/preprocessor/preprocessor.h>
@@ -39,7 +40,8 @@ class OpqRotator : public Preprocessor {
 
   //! Restore a saved matrix without generating a random one first.
   //! Returns nullptr if the serialized rotator is invalid.
-  static Pointer from_serialized(const void *data, size_t len);
+  static Pointer from_serialized(const void *data, size_t len,
+                                 bool process_rss = false);
 
   //! \p x      original-space training matrix, num x dim, packed.
   //! \p x_hat  codebook reconstruction of the same vectors in the ROTATED
@@ -79,7 +81,9 @@ class OpqRotator : public Preprocessor {
 
   //! Rotation matrix R, row-major dim x dim: apply() = R * in,
   //! apply_inverse() = R^T * in.
-  std::vector<float> matrix_;
+  using Matrix = std::vector<float, ailego::ScopedRssAllocator<float>>;
+  Matrix matrix_;
+  bool process_rss_{false};
 
   RotatorKernels kernels_{};
 };
