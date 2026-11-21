@@ -74,7 +74,8 @@ class DiskAnnIndexer {
   std::vector<bool> read_nodes(
       const std::vector<diskann_id_t> &node_ids,
       std::vector<void *> &coord_buffers,
-      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers);
+      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers,
+      int *io_error = nullptr);
 
  protected:
   int use_medroids_data_as_centroids();

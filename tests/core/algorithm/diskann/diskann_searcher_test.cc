@@ -56,6 +56,10 @@ class DiskAnnCacheTestPeer {
     streamer->diskann_indexer_->reader_ = std::move(reader);
   }
 
+  static int load_entrypoints(DiskAnnSearcher *searcher) {
+    return searcher->diskann_indexer_->use_medroids_data_as_centroids();
+  }
+
   static int configure_cache(DiskAnnSearcher *searcher,
                              uint32_t cache_node_num) {
     return searcher->diskann_indexer_->configure_cache(cache_node_num);
@@ -1437,9 +1441,10 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   DiskAnnCacheTestPeer::set_reader(diskann_searcher, original_reader);
 
   using Phase = FailingAlignedFileReader::Phase;
-  auto fail_read = [&](Phase phase, const auto &operation) {
-    auto failing = std::make_shared<FailingAlignedFileReader>(
-        original_reader, IndexError_NoMemory, phase);
+  auto fail_read = [&](Phase phase, const auto &operation,
+                       int error = IndexError_NoMemory) {
+    auto failing = std::make_shared<FailingAlignedFileReader>(original_reader,
+                                                              error, phase);
     DiskAnnCacheTestPeer::set_reader(diskann_searcher, failing);
     const auto restore = ScopeGuard::Make([&] {
       DiskAnnCacheTestPeer::set_reader(diskann_searcher, original_reader);
@@ -1529,6 +1534,22 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   ASSERT_EQ(0, searcher->search_impl(vec.data(), qmeta, cached_ctx));
   EXPECT_NE(old_context, cached_ctx.get());
   EXPECT_EQ(1u, cached_ctx->result().size());
+
+  auto load_entrypoints = [&] {
+    return DiskAnnCacheTestPeer::load_entrypoints(diskann_searcher);
+  };
+  EXPECT_EQ(IndexError_NoMemory, fail_read(Phase::kRead, load_entrypoints));
+  EXPECT_EQ(IndexError_ReadData,
+            fail_read(Phase::kRead, load_entrypoints, IndexError_ReadData));
+  ASSERT_EQ(0, load_entrypoints());
+
+  auto preload_cache = [&] {
+    return DiskAnnCacheTestPeer::configure_cache(diskann_searcher, 1);
+  };
+  EXPECT_EQ(0, fail_read(Phase::kRead, preload_cache));
+  EXPECT_EQ(0u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
+  ASSERT_EQ(0, preload_cache());
+  EXPECT_EQ(1u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
 }
 
 TEST_F(DiskAnnSearcherTest, TestFp16Entrypoint) {
