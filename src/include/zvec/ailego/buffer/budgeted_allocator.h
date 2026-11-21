@@ -114,6 +114,8 @@ class ScopedRssAllocator : public BudgetedAllocator<T> {
   template <typename U>
   ScopedRssAllocator(const ScopedRssAllocator<U> &) {}
   template <typename U>
+  // The allocator protocol requires this spelling.
+  // NOLINTNEXTLINE(readability-identifier-naming)
   struct rebind {
     using other = ScopedRssAllocator<U>;
   };

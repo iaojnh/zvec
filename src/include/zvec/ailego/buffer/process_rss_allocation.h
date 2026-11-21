@@ -53,17 +53,6 @@ class ProcessRssReservation {
     }
   }
 
-  void add_array(size_t count, size_t width) {
-    if (width && count > std::numeric_limits<size_t>::max() / width)
-      throw std::bad_alloc();
-    const size_t bytes = count * width;
-    auto &pool = MemoryLimitPool::get_instance();
-    if (bytes > std::numeric_limits<size_t>::max() - bytes_ ||
-        !pool.try_charge_process_backing(bytes, 0, false))
-      throw std::bad_alloc();
-    bytes_ += bytes;
-  }
-
   template <typename Allocate>
   void allocate(size_t limit, Allocate &&allocate) {
     using Pending = MemoryLimitPool::PendingAllocation;

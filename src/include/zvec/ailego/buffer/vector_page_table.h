@@ -707,13 +707,6 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Pin scattered pages; roll back all pins on failure.
   bool acquire_pages(const block_id_t *page_ids, size_t count, char **pages);
 
-  // Optional read-only cache installation for an external asynchronous read.
-  // A claimed buffer is charged and not visible until complete_read_page().
-  enum class ReadPageClaim { kClaimed, kJoin, kBypass };
-  ReadPageClaim claim_read_page(block_id_t page_id, char *&buffer);
-  void complete_read_page(block_id_t page_id, char *buffer, const char *data);
-  void cancel_read_page(block_id_t page_id, char *buffer);
-
   //! Release one pin per page id acquired by acquire_pages().
   void release_pages(const block_id_t *page_ids, size_t count);
 
@@ -821,24 +814,6 @@ class ZVEC_AILEGO_API VecBufferPool {
 
   //! Sequentially preload pages into the pool until pool is full.
   void warmup();
-
-  enum class PrepareStatus {
-    kSkipped,
-    kComplete,
-    kPressure,
-    kBusy,
-    kReadError
-  };
-  struct PrepareResult {
-    PrepareStatus status{PrepareStatus::kSkipped};
-    size_t pages_loaded{0};
-    size_t bytes_read{0};
-  };
-  //! Prepare an immutable range only if all missing pages plus scratch fit.
-  //! Never reclaim other pages or wait for space. Concurrent preparations
-  //! serialize opportunistically; foreground reads keep their normal policy.
-  PrepareResult prepare_pages_if_fits(block_id_t first_page, size_t page_count,
-                                      uint8_t priority = kHighPriority);
 
   void prefetch_pages(block_id_t first_page, size_t page_count,
                       uint8_t priority = kLowPriority);
