@@ -465,7 +465,9 @@ int HnswStreamerEntity::get_vector(const node_id_t id,
   if (ailego_unlikely(ret != read_size)) {
     LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
               loc.second, read_size, ret);
-    return IndexError_ReadData;
+    const int error = node_chunks_[loc.first]->read_error();
+    block.reset();
+    return error;
   }
   return 0;
 }
@@ -489,40 +491,29 @@ int HnswStreamerEntity::get_vector_borrowed(
   if (ailego_unlikely(ret != read_size)) {
     LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
               loc.second, read_size, ret);
-    return IndexError_ReadData;
+    const int error = node_chunks_[loc.first]->read_error();
+    block.reset();
+    return error;
   }
   return 0;
 }
 
 int HnswStreamerEntity::get_vector(
     const node_id_t *ids, uint32_t count,
-    std::vector<IndexStorage::MemoryBlock> &vec_blocks) const {
+    std::vector<IndexStorage::MemoryBlock> &vec_blocks) const try {
+  vec_blocks.clear();
   vec_blocks.resize(count);
   for (auto i = 0U; i < count; ++i) {
-    auto loc = get_vector_chunk_loc(ids[i]);
-    ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
-
-    // Fast path: mmap backend.
-    // Bounds-check guards against new chunks added after clone() was taken.
-    if (node_chunk_bases_ && loc.first < node_chunk_bases_->size() &&
-        (*node_chunk_bases_)[loc.first]) {
-      vec_blocks[i].reset(
-          (void *)((*node_chunk_bases_)[loc.first] + loc.second));
-      continue;
-    }
-
-    ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
-                       "invalid chunk offset");
-    size_t read_size = vector_size();
-    size_t ret = node_chunks_[loc.first]->read_immutable(
-        loc.second, vec_blocks[i], read_size);
-    if (ailego_unlikely(ret != read_size)) {
-      LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
-                loc.second, read_size, ret);
-      return IndexError_ReadData;
+    const int ret = get_vector(ids[i], vec_blocks[i]);
+    if (ret != 0) {
+      vec_blocks.clear();
+      return ret;
     }
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  vec_blocks.clear();
+  return IndexError_NoMemory;
 }
 
 int HnswBufferPoolStreamerEntity::get_vector_for_prune(

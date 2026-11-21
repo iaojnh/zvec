@@ -675,14 +675,14 @@ int Index::close() {
   }
 
   if (!is_read_only_ && !pending_quantizer_training_) {
-    if (ailego_unlikely(flush() != 0)) {
-      LOG_ERROR("Failed to cleanup streamer");
-      return core::IndexError_Runtime;
+    if (const int ret = flush(); ailego_unlikely(ret != 0)) {
+      LOG_ERROR("Failed to flush index before close");
+      return ret;
     }
   }
-  if (ailego_unlikely(streamer_->cleanup() != 0)) {
+  if (const int ret = streamer_->cleanup(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to cleanup streamer");
-    return core::IndexError_Runtime;
+    return ret;
   }
   // Contexts are cached per index type in thread-local storage. IVF contexts
   // own cloned storage segments, so leaving the current thread's context in
@@ -692,9 +692,9 @@ int Index::close() {
     context_list[context_index_].reset();
     context_index_ = std::numeric_limits<size_t>::max();
   }
-  if (ailego_unlikely(storage_->close() != 0)) {
+  if (const int ret = storage_->close(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to close storage");
-    return core::IndexError_Runtime;
+    return ret;
   }
   is_open_ = false;
   return 0;
@@ -711,13 +711,13 @@ int Index::flush() {
     LOG_ERROR("Cannot flush read-only index");
     return core::IndexError_Runtime;
   }
-  if (ailego_unlikely(streamer_->flush(0) != 0)) {
+  if (const int ret = streamer_->flush(0); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush streamer");
-    return core::IndexError_Runtime;
+    return ret;
   }
-  if (ailego_unlikely(storage_->flush() != 0)) {
+  if (const int ret = storage_->flush(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush storage");
-    return core::IndexError_Runtime;
+    return ret;
   }
   return 0;
 }

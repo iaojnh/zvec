@@ -365,7 +365,8 @@ int HnswStreamer::init(
 
 int HnswStreamer::cleanup() {
   if (state_ == STATE_OPENED) {
-    this->close();
+    const int ret = this->close();
+    if (ret != 0) return ret;
   }
 
   LOG_INFO("HnswStreamer cleanup");

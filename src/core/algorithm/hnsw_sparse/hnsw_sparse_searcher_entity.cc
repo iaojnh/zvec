@@ -124,10 +124,13 @@ const void *HnswSparseSearcherEntity::get_vector_meta(node_id_t id) const {
 
 int HnswSparseSearcherEntity::get_vector_meta(
     const node_id_t id, IndexStorage::MemoryBlock &block) const {
+  block.reset();
   const size_t size = sparse_meta_size();
   if (sparse_vector_meta_->read(size * id, block, size) != size) {
     LOG_ERROR("Read vector from segment failed");
-    return IndexError_ReadData;
+    const int error = sparse_vector_meta_->read_error();
+    block.reset();
+    return error;
   }
   return 0;
 }
