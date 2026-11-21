@@ -26,6 +26,11 @@
 namespace zvec {
 namespace turbo {
 
+// Disk-backed indexes can own algorithm state under process RSS without
+// spending the file cache's separate capacity.
+inline constexpr char kQuantizerProcessRssWorkspace[] =
+    "zvec.turbo.process_rss_workspace";
+
 using namespace zvec::core;
 
 //! Optional physical storage precision, encoded as an integer

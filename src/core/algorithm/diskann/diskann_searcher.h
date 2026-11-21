@@ -149,6 +149,7 @@ class DiskAnnSearcher : public IndexSearcher {
   int update_context(DiskAnnContext *ctx) const;
   int ensure_compatible_context(ContextPointer &context,
                                 DiskAnnContext *&ctx) const;
+  int create_search_context(ContextPointer &context) const;
 
  private:
   enum State { STATE_INIT = 0, STATE_INITED = 1, STATE_LOADED = 2 };

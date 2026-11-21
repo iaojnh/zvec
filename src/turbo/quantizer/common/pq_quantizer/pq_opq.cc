@@ -90,15 +90,15 @@ int PqOpq::serialize(std::string *out) const {
   return enabled() ? preprocessor_->serialize(out) : 0;
 }
 
-int PqOpq::deserialize(uint8_t type, uint32_t dim, const void *data,
-                       size_t len) {
+int PqOpq::deserialize(uint8_t type, uint32_t dim, const void *data, size_t len,
+                       bool process_rss) {
   if (type == 0) {
     preprocessor_.reset();
     return 0;
   }
   if (type != static_cast<uint8_t>(RotateType::kOpq)) return kErrUnsupported;
   if (len == 0) return kErrInvalidArgument;
-  preprocessor_ = OpqRotator::from_serialized(data, len);
+  preprocessor_ = OpqRotator::from_serialized(data, len, process_rss);
   if (!preprocessor_ || preprocessor_->in_dim() != static_cast<int>(dim)) {
     preprocessor_.reset();
     return kErrInvalidArgument;
