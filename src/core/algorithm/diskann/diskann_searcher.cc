@@ -302,7 +302,7 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
 
 int DiskAnnSearcher::search_bf_impl(const void *query,
                                     const IndexQueryMeta &qmeta, uint32_t count,
-                                    Context::Pointer &context) const {
+                                    Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -332,6 +332,13 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
     return IndexError_InvalidArgument;
   }
 
+  ailego::ProcessRssReservation result_memory;
+  bool success = false;
+  const auto finish = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().clear();
+    ctx->group_topk_heaps().clear();
+    if (!success) ctx->clear();
+  });
   ctx->clear();
   ctx->resize_results(count);
 
@@ -343,7 +350,7 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
       return ret;
     }
 
-    ctx->topk_to_result(i);
+    ctx->knn_to_result(i, result_memory);
 
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
@@ -351,14 +358,16 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
   if (ailego_unlikely(ctx->error())) {
     return IndexError_Runtime;
   }
-
+  success = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
-    Context::Pointer &context) const {
+    Context::Pointer &context) const try {
   if (ailego_unlikely(state_ != STATE_LOADED)) {
     LOG_ERROR("Load DiskAnnSearcher before searching");
     return IndexError_NoReady;
@@ -393,6 +402,13 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
     return IndexError_InvalidArgument;
   }
 
+  ailego::ProcessRssReservation result_memory;
+  bool success = false;
+  const auto finish = ailego::ScopeGuard::Make([&] {
+    ctx->topk_heap().clear();
+    ctx->group_topk_heaps().clear();
+    if (!success) ctx->clear();
+  });
   ctx->clear();
   ctx->resize_results(count);
 
@@ -404,7 +420,7 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
       return ret;
     }
 
-    ctx->topk_to_result(i);
+    ctx->knn_to_result(i, result_memory);
 
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
@@ -412,8 +428,10 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
   if (ailego_unlikely(ctx->error())) {
     return IndexError_Runtime;
   }
-
+  success = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::get_vector(uint64_t key, Context::Pointer &context,

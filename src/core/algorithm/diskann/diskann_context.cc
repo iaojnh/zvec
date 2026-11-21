@@ -31,18 +31,20 @@ DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
 
 DiskAnnContext::Pointer DiskAnnContext::create_fetch_context(
     const IndexMeta &meta, const IndexMetric::Pointer &measure,
-    const DiskAnnEntity::Pointer &entity) {
+    const DiskAnnEntity::Pointer &entity, int *status) try {
   if (!measure || !entity) {
+    if (status) *status = IndexError_InvalidArgument;
     return nullptr;
   }
 
-  Pointer context(new (std::nothrow) DiskAnnContext(meta, measure, entity));
-  if (!context ||
-      context->init(kFetchContext, entity->max_degree(), entity->pq_chunk_num(),
-                    meta.element_size()) != 0) {
-    return nullptr;
-  }
-  return context;
+  auto context = std::make_unique<DiskAnnContext>(meta, measure, entity);
+  const int ret = context->init(kFetchContext, entity->max_degree(),
+                                entity->pq_chunk_num(), meta.element_size());
+  if (status) *status = ret;
+  return ret == 0 ? std::move(context) : nullptr;
+} catch (const std::bad_alloc &) {
+  if (status) *status = IndexError_NoMemory;
+  return nullptr;
 }
 
 int DiskAnnContext::resize_fetch_sector_buffer(
@@ -64,13 +66,20 @@ int DiskAnnContext::resize_fetch_sector_buffer(
     return IndexError_InvalidArgument;
   }
 
-  try {
-    sector_buffer_.resize_array(sector_num_per_node, DiskAnnUtil::kSectorSize,
+  return ensure_sector_buffer(static_cast<size_t>(sector_num_per_node));
+}
+
+int DiskAnnContext::ensure_sector_buffer(size_t sectors) try {
+  if (sectors == 0 || sectors > DiskAnnUtil::kMaxSectorReadNum) {
+    return IndexError_InvalidArgument;
+  }
+  if (sector_buffer_.size() < sectors * DiskAnnUtil::kSectorSize) {
+    sector_buffer_.resize_array(sectors, DiskAnnUtil::kSectorSize,
                                 DiskAnnUtil::kSectorSize);
-  } catch (const std::bad_alloc &) {
-    return IndexError_NoMemory;
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
@@ -116,10 +125,6 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
         LOG_ERROR("Create filter failed,  mode %d", filter_mode_);
         return ret;
       }
-
-      sector_buffer_.resize_array(DiskAnnUtil::kMaxSectorReadNum,
-                                  DiskAnnUtil::kSectorSize,
-                                  DiskAnnUtil::kSectorSize);
 
       if (setup_io_context) {
         ret = setup_io_ctx(io_ctx_);

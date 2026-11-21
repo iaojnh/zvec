@@ -63,7 +63,8 @@ class DiskAnnContext : public IndexContext,
   //! Create a lightweight context for reading vectors by id.
   static Pointer create_fetch_context(const IndexMeta &meta,
                                       const IndexMetric::Pointer &measure,
-                                      const DiskAnnEntity::Pointer &entity);
+                                      const DiskAnnEntity::Pointer &entity,
+                                      int *status = nullptr);
 
  public:
   //! Init
@@ -143,8 +144,8 @@ class DiskAnnContext : public IndexContext,
  public:
   //! Set topk of search result
   void set_topk(uint32_t val) override {
+    topk_heap_.limit(val, false);
     topk_ = val;
-    topk_heap_.limit(val);
   }
 
   void set_list_size(uint32_t list_size) {
@@ -190,6 +191,8 @@ class DiskAnnContext : public IndexContext,
   inline void *coord_buffer() {
     return coord_buffer_;
   }
+
+  int ensure_sector_buffer(size_t sectors);
 
   inline void *sector_buffer() {
     return sector_buffer_.data();
@@ -245,7 +248,7 @@ class DiskAnnContext : public IndexContext,
     copy_common_query_options_from(rhs);
     topk_ = rhs.topk_;
     topk_heap_.clear();
-    topk_heap_.limit(topk_);
+    topk_heap_.limit(topk_, false);
     group_num_ = rhs.group_num_;
     group_topk_ = rhs.group_topk_;
     group_topk_heaps_.clear();
@@ -313,7 +316,7 @@ class DiskAnnContext : public IndexContext,
 
     topk_ = group_topk_ * group_num_;
 
-    topk_heap_.limit(topk_);
+    topk_heap_.limit(topk_, false);
 
     group_topk_heaps_.clear();
   }
@@ -367,9 +370,7 @@ class DiskAnnContext : public IndexContext,
   void emplace_result_doc(IndexDocumentList &docs, diskann_id_t id, float score,
                           const VectorInfo &info) {
     const auto key = entity_->get_key(id);
-    if (fetch_vector_ && info.shared_vec_) {
-      docs.emplace_back(key, score, id, info.shared_vec_);
-    } else if (fetch_vector_) {
+    if (fetch_vector_ && info.vec_) {
       docs.emplace_back(key, score, id, info.vec_);
     } else {
       docs.emplace_back(key, score, id);
@@ -391,7 +392,6 @@ class DiskAnnContext : public IndexContext,
   bool debug_mode_{false};
   uint32_t pq_chunk_num_{0};
   uint32_t element_size_{0};
-  uint32_t element_rotated_size_{0};
   uint32_t list_size_{0};
 
   TopkHeap topk_heap_{};
