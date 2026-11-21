@@ -537,10 +537,11 @@ class BufferReadStorage : public IndexStorage {
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
                              bool borrow_handle, bool populate = true) const {
       const size_t offset_in_page = abs_offset % ailego::kVectorPageSize;
-      bool force_bypass = !cache_enabled_;
+      bool force_bypass = !populate || !cache_enabled_;
       if (cache_enabled_ && len <= ailego::kVectorPageSize - offset_in_page) {
         size_t page_id = 0;
-        char *raw = handle_->get_single_page(abs_offset, len, page_id);
+        char *raw =
+            handle_->get_single_page(abs_offset, len, page_id, populate);
         if (raw != nullptr) {
           if (borrow_handle) {
             data.reset(handle_.get(), page_id, raw);

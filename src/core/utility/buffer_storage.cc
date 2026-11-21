@@ -995,6 +995,20 @@ class BufferStorageFile
       return status == ailego::PageWriteStatus::kOk;
     }
 
+    bool restore(size_t offset, const void *data, size_t len) override {
+      std::shared_lock<std::shared_mutex> latch(
+          owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
+      if (owner_->retired_ || offset > capacity() || len > capacity() - offset)
+        return false;
+      if (!owner_->buffer_pool_->restore_range(
+              absolute_offset(offset), len, static_cast<const char *>(data))) {
+        owner_->corrupted_.store(true, std::memory_order_release);
+        return false;
+      }
+      owner_->set_as_dirty();
+      return true;
+    }
+
     //! Resize size of data.  See write() for the locking contract.
     size_t resize(size_t size) override {
       std::shared_lock<std::shared_mutex> latch(
@@ -1090,12 +1104,12 @@ class BufferStorageFile
       buffer_storage_read_error = IndexError_ReadData;
       const bool can_pin = owner_->cache_enabled_ &&
                            (immutable || !owner_->buffer_pool_->writable());
-      bool force_bypass = !owner_->cache_enabled_;
+      bool force_bypass = !populate || !owner_->cache_enabled_;
       const size_t offset_in_page = abs_offset % ailego::kVectorPageSize;
       if (can_pin && len <= ailego::kVectorPageSize - offset_in_page) {
         size_t page_id = 0;
-        char *raw = owner_->buffer_pool_handle_->get_single_page(abs_offset,
-                                                                 len, page_id);
+        char *raw = owner_->buffer_pool_handle_->get_single_page(
+            abs_offset, len, page_id, populate);
         if (raw != nullptr) {
           if (borrow_handle) {
             data.reset(owner_->buffer_pool_handle_.get(), page_id, raw);

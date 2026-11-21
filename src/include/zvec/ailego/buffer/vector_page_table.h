@@ -776,6 +776,9 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Write metadata without cache admission.
   int write_meta(size_t offset, size_t length, const char *buffer);
 
+  //! Restore bytes captured before a failed mutation without page admission.
+  bool restore_range(size_t offset, size_t length, const char *buffer);
+
   //! Iterate all entries and persist any dirty blocks to disk. Safe to call
   //! repeatedly; no-op in read-only mode.
   int flush_all();
@@ -1003,6 +1006,8 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
   typedef std::shared_ptr<VecBufferPoolHandle> Pointer;
 
   char *get_single_page(size_t file_offset, size_t len, size_t &out_page_id);
+  char *get_single_page(size_t file_offset, size_t len, size_t &out_page_id,
+                        bool populate);
 
   bool try_acquire_resident_pages(const block_id_t *page_ids, size_t count,
                                   char **pages);

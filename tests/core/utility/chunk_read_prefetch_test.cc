@@ -111,6 +111,26 @@ TEST_F(ChunkReadPrefetchTest, FailedAioTeardownQuarantinesAndAllowsDemandRead) {
   EXPECT_EQ(metadata, storage->stats().metadata_bytes);
 }
 
+TEST_F(ChunkReadPrefetchTest, ReplacingLayoutReleasesStagedOverlappingHints) {
+  using Priority = IndexStorage::Segment::CachePriority;
+  ASSERT_TRUE(segment->try_prefetch(0, 3 * page, Priority::kLow));
+  ASSERT_EQ(3u, storage->stats().prefetch_pending_requests);
+  const auto original = storage->stats().metadata_bytes;
+  segment.reset();
+  EXPECT_EQ(original, storage->stats().metadata_bytes);
+
+  segment = storage->get("payload");
+  ASSERT_NE(nullptr, segment);
+  ASSERT_EQ(0, segment->set_read_chunks(
+                   {{0, page + 1}, {page + 1, page - 1}, {2 * page, page}}));
+  ASSERT_TRUE(segment->try_prefetch(0, 3 * page, Priority::kNormal));
+  EXPECT_LT(storage->stats().metadata_bytes, original);
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(3 * page, segment->read(0, block, 3 * page));
+  EXPECT_EQ(0, std::memcmp(payload.data(), block.data(), 3 * page));
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+}
+
 TEST_F(ChunkReadPrefetchTest, ConcurrentStatsSurviveAioTeardown) {
   auto &aio = LibAioLoader::Instance();
   const auto getevents = aio.io_getevents;

@@ -35,12 +35,16 @@
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_mapping.h>
+#include "utility/utility_params.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::ailego {
 struct VecBufferPoolTestPeer {
   static void quarantine_writeback(VecBufferPool &pool) {
     pool.writeback_error_.store(VecBufferPool::kWritebackQuarantined);
+  }
+  static bool evict_clean(VecBufferPool &pool, block_id_t id) {
+    return pool.page_table_.reclaim_clean_block(id);
   }
   static int exchange_metadata_fd(VecBufferPool &pool, int fd) {
     return std::exchange(pool.meta_fd_, fd);
@@ -2295,6 +2299,104 @@ TEST_F(BufferStorageWriteTest, SnapshotDoesNotWaitForOptionalScratchMetadata) {
   EXPECT_FALSE(segment->read_borrowed_batch(&invalid, 1));
   EXPECT_EQ(nullptr, result.data());
   EXPECT_EQ(before.capacity_waits, pool.stats().capacity_waits);
+}
+
+TEST_F(BufferStorageWriteTest,
+       RollbackRestoresColdAndDirtyPagesWithoutAdmission) {
+  const size_t page = ailego::kVectorPageSize;
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("rollback", 2 * page));
+  auto segment = storage->get("rollback");
+  ASSERT_TRUE(segment);
+  std::string expected(2 * page, 'a');
+  ASSERT_EQ(expected.size(),
+            segment->write(0, expected.data(), expected.size()));
+  ASSERT_EQ(0, storage->flush());
+
+  auto pages = storage->vec_buffer_pool();
+  ASSERT_TRUE(pages);
+  const size_t cold = segment->data_offset() / page;
+  const size_t resident = cold + 1;
+  const char dirty = 'd';
+  ASSERT_EQ(1u, segment->write(page + 2, &dirty, 1));
+  expected[page + 2] = dirty;
+  (void)ailego::VecBufferPoolTestPeer::evict_clean(*pages, cold);
+  ASSERT_FALSE(pages->is_page_resident(cold));
+
+  {
+    auto handle = pages->get_handle();
+    size_t id;
+    ASSERT_NE(nullptr,
+              handle.get_single_page(segment->data_offset() + page, 1, id));
+    ASSERT_EQ(resident, id);
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    using Pressure = ailego::ProcessRssBudget::PressureLevel;
+    AILEGO_DEFER([&] {
+      pool.set_memory_pressure(Pressure::kNormal);
+      handle.release_one(id);
+    });
+    pool.set_memory_pressure(Pressure::kCritical);
+    const std::array<char, 4> before{{'w', 'x', 'y', 'z'}};
+    ASSERT_TRUE(segment->restore(page - 2, before.data(), before.size()));
+    expected.replace(page - 2, before.size(), before.data(), before.size());
+    EXPECT_FALSE(pages->is_page_resident(cold));
+  }
+  ASSERT_EQ(0, storage->close());
+  segment.reset();
+  pages.reset();
+  ASSERT_EQ(0, storage->open(file_path_, {false, true}));
+  segment = storage->get("rollback");
+  ASSERT_TRUE(segment);
+  std::string actual(expected.size(), '\0');
+  ASSERT_EQ(actual.size(),
+            segment->fetch_for_parsing(0, actual.data(), actual.size()));
+  EXPECT_EQ(expected, actual);
+}
+
+TEST_F(BufferStorageWriteTest, ParsingLeavesColdPagesUnpopulated) {
+  const size_t page = ailego::kVectorPageSize;
+  const std::string payload(3 * page, 'p');
+  {
+    auto storage = open_writable();
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->append("parser", payload.size()));
+    auto segment = storage->get("parser");
+    ASSERT_TRUE(segment);
+    ASSERT_EQ(payload.size(),
+              segment->write(0, payload.data(), payload.size()));
+    ASSERT_EQ(0, storage->close());
+  }
+  for (const char *backend : {"BufferReadStorage", "BufferStorage"}) {
+    SCOPED_TRACE(backend);
+    auto storage = IndexFactory::CreateStorage(backend);
+    ailego::Params params;
+    params.set(BUFFER_READ_STORAGE_WARMUP_MODE,
+               BUFFER_READ_STORAGE_WARMUP_NONE);
+    ASSERT_EQ(0, storage->init(params));
+    const int ret = std::strcmp(backend, "BufferReadStorage") == 0
+                        ? storage->open(file_path_, false)
+                        : storage->open(file_path_, {false, true});
+    ASSERT_EQ(0, ret);
+    auto segment = storage->get("parser");
+    ASSERT_TRUE(segment);
+    const auto pages = storage->vec_buffer_pool();
+    ASSERT_TRUE(pages);
+    const size_t first = segment->data_offset() / page;
+    for (const size_t offset : {size_t{0}, page - 1}) {
+      IndexStorage::MemoryBlock result;
+      ASSERT_EQ(64u, segment->read_for_parsing(offset, result, 64));
+      EXPECT_EQ(0, std::memcmp(result.data(), payload.data() + offset, 64));
+      EXPECT_FALSE(pages->is_page_resident(first));
+      EXPECT_FALSE(pages->is_page_resident(first + 1));
+    }
+    IndexStorage::MemoryBlock query;
+    ASSERT_EQ(1u, segment->read(0, query, 1));
+    EXPECT_TRUE(pages->is_page_resident(first));
+    IndexStorage::MemoryBlock parsing;
+    ASSERT_EQ(1u, segment->read_for_parsing(0, parsing, 1));
+    EXPECT_EQ(query.data(), parsing.data());
+  }
 }
 
 TEST_F(BufferStorageWriteTest, ParserReadsReuseButDoNotPopulateScratch) {

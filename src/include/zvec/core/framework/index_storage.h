@@ -916,6 +916,11 @@ class IndexStorage : public IndexModule {
     virtual void begin_parsing() {}
     virtual void end_parsing() noexcept {}
 
+    //! Restore an earlier snapshot after a failed compound mutation.
+    virtual bool restore(size_t offset, const void *data, size_t len) {
+      return write(offset, data, len) == len;
+    }
+
    protected:
     static void reset_batch_outputs(BorrowedRead *reads, size_t count) {
       if (!reads) return;

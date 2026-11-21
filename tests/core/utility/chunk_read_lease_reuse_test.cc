@@ -220,6 +220,57 @@ TEST_F(ChunkReadLeaseReuseTest, IdenticalLayoutsShareMetadataAndCachedData) {
   check(retained, page + 16, 64);
 }
 
+TEST_F(ChunkReadLeaseReuseTest, DistinctLayoutsRetireAfterLastReader) {
+  const auto baseline = storage->stats();
+  for (size_t i = 0; i < 64; ++i) {
+    auto registered = storage->get("payload");
+    ASSERT_NE(nullptr, registered);
+    ASSERT_EQ(0, registered->set_read_chunks({{i, page}}));
+    IndexStorage::MemoryBlock retained;
+    ASSERT_EQ(64u, registered->read(i, retained, 64));
+    auto clone = registered->clone();
+    registered.reset();
+    EXPECT_GT(storage->stats().metadata_bytes, baseline.metadata_bytes);
+    clone.reset();
+    check(retained, i, 64);
+    EXPECT_GT(storage->stats().metadata_bytes, baseline.metadata_bytes);
+    retained.reset();
+    EXPECT_EQ(baseline.metadata_bytes, storage->stats().metadata_bytes);
+    EXPECT_EQ(baseline.cache_bytes, storage->stats().cache_bytes);
+  }
+}
+
+TEST_F(ChunkReadLeaseReuseTest, FailedWorkspaceGrowthKeepsFundedReads) {
+  segment.reset();
+  ASSERT_EQ(0, storage->close());
+  ailego::Params params;
+  params.set(CHUNK_READ_STORAGE_CHUNK_BYTES, page);
+  params.set(CHUNK_READ_STORAGE_MAX_READ_BYTES, page);
+  params.set(CHUNK_READ_STORAGE_WORKSPACE_COUNT, size_t{1});
+  params.set(CHUNK_READ_STORAGE_CACHE_BYTES, size_t{0});
+  params.set(CHUNK_READ_STORAGE_ADAPTIVE, true);
+  params.set(CHUNK_READ_STORAGE_DIRECT_IO, false);
+  ASSERT_EQ(0, storage->init(params));
+  ASSERT_EQ(0, storage->open(path, false));
+  segment = storage->get("payload");
+  ASSERT_NE(nullptr, segment);
+
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(64u, segment->read(0, block, 64));
+  block.reset();
+  const size_t baseline = storage->stats().workspace_bytes;
+  ASSERT_GT(pool.available(), 1024u);
+  const size_t charge = pool.available() - 1024;
+  ASSERT_TRUE(pool.try_charge_external(charge));
+  const auto refund =
+      ailego::ScopeGuard::Make([&] { pool.release_external(charge); });
+  EXPECT_EQ(0u, segment->read(0, block, 4 * page));
+  EXPECT_EQ(IndexError_NoMemory, segment->read_error());
+  EXPECT_EQ(baseline, storage->stats().workspace_bytes);
+  ASSERT_EQ(64u, segment->read(page, block, 64));
+  check(block, page, 64);
+}
+
 TEST_F(ChunkReadLeaseReuseTest, ConcurrentReadersUseIndependentLeases) {
   std::atomic<bool> correct{true};
   std::vector<std::thread> readers;

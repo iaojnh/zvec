@@ -2425,6 +2425,47 @@ PageWriteStatus VecBufferPool::write_fragments_status(
   return PageWriteStatus::kOk;
 }
 
+bool VecBufferPool::restore_range(size_t offset, size_t length,
+                                  const char *buffer) {
+  if (!writable_ || writeback_quarantined() || (length && !buffer) ||
+      !contains_range(offset, length))
+    return false;
+
+  while (length) {
+    const size_t intra = offset % kVectorPageSize;
+    const size_t bytes = std::min(length, kVectorPageSize - intra);
+    const block_id_t id = offset / kVectorPageSize;
+    for (;;) {
+      if (char *resident = page_table_.acquire_block(id)) {
+        {
+          std::unique_lock<std::shared_mutex> lock(
+              block_mutexes_[id % block_mutex_count_]);
+          std::memcpy(resident + intra, buffer, bytes);
+          page_table_.mark_dirty(id);
+        }
+        page_table_.release_block(id);
+        break;
+      }
+      // Exclude a concurrent load or writeback until the restored bytes are
+      // visible from disk. The buffered descriptor needs no bounce mapping.
+      const auto claim = page_table_.try_claim_block_load(id);
+      if (claim == VectorPageTable::LoadClaimResult::kClaimed) {
+        const int ret = write_meta(offset, bytes, buffer);
+        page_table_.cancel_block_load(id);
+        if (ret != 0) return false;
+        break;
+      }
+      if (claim != VectorPageTable::LoadClaimResult::kResident &&
+          !page_table_.wait_for_block_transition(id))
+        return false;
+    }
+    buffer += bytes;
+    offset += bytes;
+    length -= bytes;
+  }
+  return true;
+}
+
 int VecBufferPool::write_meta(size_t offset, size_t length,
                               const char *buffer) {
   if (writeback_quarantined()) return -1;
@@ -2566,6 +2607,11 @@ bool VecBufferPool::extend_file(size_t new_size) {
 
 char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
                                            size_t &out_page_id) {
+  return get_single_page(file_offset, len, out_page_id, /*populate=*/true);
+}
+
+char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
+                                           size_t &out_page_id, bool populate) {
   const size_t extent = pool_.file_size();
   if (file_offset >= extent || len > extent - file_offset) {
     return nullptr;
@@ -2576,7 +2622,9 @@ char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
   // Writable pinning is optional: the storage caller can copy dirty resident
   // bytes or read disk through its synchronized bypass. Do not wait for the
   // writeback budget merely to obtain a zero-copy cache hit.
-  char *page = pool_.acquire_buffer(first_page, pool_.writable_ ? 0 : 50);
+  char *page = populate
+                   ? pool_.acquire_buffer(first_page, pool_.writable_ ? 0 : 50)
+                   : pool_.try_acquire_buffer(first_page);
   if (!page) {
     LOG_DEBUG(
         "VecBufferPoolHandle::get_single_page: acquire_buffer failed, "
