@@ -1165,9 +1165,10 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   auto *diskann_search_context =
       dynamic_cast<DiskAnnContext *>(linear_ctx.get());
   ASSERT_NE(diskann_search_context, nullptr);
-  EXPECT_EQ(static_cast<size_t>(DiskAnnUtil::kMaxSectorReadNum) *
-                DiskAnnUtil::kSectorSize,
-            diskann_search_context->sector_buffer_size());
+  EXPECT_EQ(0u, diskann_search_context->sector_buffer_size());
+  auto *graph_context = dynamic_cast<DiskAnnContext *>(knn_ctx.get());
+  ASSERT_NE(graph_context, nullptr);
+  EXPECT_EQ(0u, graph_context->sector_buffer_size());
   knn_ctx->set_fetch_vector(true);
 
   for (size_t i = 0; i < doc_cnt; i += doc_cnt / 10) {
@@ -1179,6 +1180,9 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
     std::memcpy(&vector_value, vec_value.data(), sizeof(vector_value));
     ASSERT_EQ(vector_value, i);
   }
+
+  EXPECT_EQ(expected_fetch_buffer_size(*diskann_search_context),
+            diskann_search_context->sector_buffer_size());
 
   size_t topk = 200;
   linear_ctx->set_topk(topk);
@@ -1212,6 +1216,10 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
                                       expected_vector));
     ASSERT_EQ(vector_string, expected_vector);
   }
+
+  // A list size of 500 uses the maximum adaptive beam of 32 nodes.
+  EXPECT_EQ(32u * expected_fetch_buffer_size(*graph_context),
+            graph_context->sector_buffer_size());
 
   std::string missing_vector;
   EXPECT_EQ(IndexError_NoExist,

@@ -342,7 +342,7 @@ int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
 int DiskAnnIndex::_prepare_for_search(
     const VectorData & /*query*/,
     const BaseIndexQueryParam::Pointer &search_param,
-    core::IndexContext::Pointer &context) {
+    core::IndexContext::Pointer &context) try {
   const auto &diskann_search_param =
       std::dynamic_pointer_cast<DiskAnnQueryParam>(search_param);
   if (diskann_search_param == nullptr) {
@@ -377,6 +377,8 @@ int DiskAnnIndex::_prepare_for_search(
   context->update(params);
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,

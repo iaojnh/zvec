@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <utility>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_framework.h>
 
 namespace zvec {
@@ -28,16 +29,17 @@ constexpr diskann_id_t kInvalidId = static_cast<diskann_id_t>(-1);
 constexpr diskann_key_t kInvalidKey = static_cast<diskann_key_t>(-1);
 
 struct VectorInfo {
+  using Payload = IndexDocument::VectorPayload;
   float dist_;
-  std::string vec_;
-  std::shared_ptr<const IndexDocument::VectorPayload> shared_vec_;
+  std::shared_ptr<const Payload> vec_;
 
   VectorInfo() = default;
-  VectorInfo(float dist, const std::string &vec) : dist_{dist}, vec_{vec} {}
-  VectorInfo(float dist, std::string &&vec)
-      : dist_{dist}, vec_{std::move(vec)} {}
-  VectorInfo(float dist, std::shared_ptr<const IndexDocument::VectorPayload> vec)
-      : dist_{dist}, shared_vec_{std::move(vec)} {}
+  VectorInfo(float distance, const void *src, size_t size) : dist_{distance} {
+    if (src) {
+      vec_ = std::allocate_shared<Payload>(
+          ailego::BudgetedAllocator<Payload, true>{}, src, size);
+    }
+  }
 };
 
 /*! Key Value Vecotr Heap Comparer
@@ -55,8 +57,13 @@ struct KeyValueVectorHeapComparer {
 
 /*! Key Value Vector Heap
  */
-using TopkHeap = ailego::Heap<std::pair<diskann_id_t, VectorInfo>,
-                              KeyValueVectorHeapComparer>;
+using RankedVector = std::pair<diskann_id_t, VectorInfo>;
+using TopkHeap = ailego::Heap<RankedVector, KeyValueVectorHeapComparer,
+                              ailego::ProcessRssVector<RankedVector>>;
+
+inline bool AcceptsCandidate(const TopkHeap &heap, float distance) {
+  return !heap.full() || distance < heap.front().second.dist_;
+}
 
 struct DiskAnnMetaHeader {
  public:

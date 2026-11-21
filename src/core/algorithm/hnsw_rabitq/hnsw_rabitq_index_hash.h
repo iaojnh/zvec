@@ -22,7 +22,7 @@ namespace core {
 template <class Key, class Val, Val EmptyVal = 0U,
           typename =
               typename std::enable_if<std::is_integral<Key>::value>::type>
-class HnswIndexHashMap {
+class HnswRabitqIndexHashMap {
   using key_type = Key;
   using val_type = Val;
 

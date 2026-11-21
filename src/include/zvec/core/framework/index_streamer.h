@@ -76,6 +76,12 @@ class IndexStreamer : public IndexRunner {
 
   //! Retrieve meta of index
   virtual const IndexMeta &meta() const = 0;
+
+  //! Create a context and preserve the reason for a refused allocation.
+  virtual int create_context_with_status(Context::Pointer &context) const {
+    context = create_context();
+    return context ? 0 : IndexError_Runtime;
+  }
 };
 
 }  // namespace core
