@@ -75,7 +75,7 @@ class DiskAnnIndexer {
       const std::vector<diskann_id_t> &node_ids,
       std::vector<void *> &coord_buffers,
       std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers,
-      int *io_error = nullptr);
+      int &io_error);
 
  protected:
   int use_medroids_data_as_centroids();
@@ -94,6 +94,7 @@ class DiskAnnIndexer {
   };
 
   uint32_t effective_cache_node_count(uint32_t requested_nodes) const;
+  int build_node_cache(uint32_t cache_node_num);
   int prepare_cache_storage(size_t capacity, CacheLoadState &state);
   int load_cache_list(CacheLoadState &state);
   int cache_bfs_levels(uint64_t num_nodes_to_cache, CacheLoadState &state);

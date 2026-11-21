@@ -107,6 +107,62 @@ constexpr size_t static dim = 64;
 
 namespace {
 
+class RefuseLateAllocationStorage final : public IndexStorage {
+ public:
+  explicit RefuseLateAllocationStorage(Pointer storage)
+      : storage_(std::move(storage)) {}
+
+  int init(const Params &params) override {
+    return storage_->init(params);
+  }
+  int cleanup() override {
+    return storage_->cleanup();
+  }
+  int open(const std::string &path, bool create) override {
+    return storage_->open(path, create);
+  }
+  int flush() override {
+    return storage_->flush();
+  }
+  int close() override {
+    return storage_->close();
+  }
+  int append(const std::string &id, size_t size) override {
+    return storage_->append(id, size);
+  }
+  void refresh(uint64_t checkpoint) override {
+    storage_->refresh(checkpoint);
+  }
+  uint64_t check_point() const override {
+    return storage_->check_point();
+  }
+  Segment::Pointer get(const std::string &id, int level) override {
+    return storage_->get(id, level);
+  }
+  bool has(const std::string &id) const override {
+    return storage_->has(id);
+  }
+  uint32_t magic() const override {
+    return storage_->magic();
+  }
+  std::shared_ptr<File> file() const override {
+    return storage_->file();
+  }
+  std::string file_path() const override {
+    if (refuse_next_open_) {
+      refuse_next_open_ = false;
+      auto &rss = MemoryLimitPool::get_instance();
+      EXPECT_TRUE(rss.configure_process_rss_limit(1));
+      EXPECT_GT(rss.process_rss(), rss.process_rss_limit());
+    }
+    return storage_->file_path();
+  }
+
+ private:
+  Pointer storage_;
+  mutable bool refuse_next_open_{true};
+};
+
 class CountingAlignedFileReader final : public AlignedFileReader {
  public:
   explicit CountingAlignedFileReader(std::shared_ptr<AlignedFileReader> reader)
@@ -741,7 +797,17 @@ TEST_F(DiskAnnSearcherTest, TestNodeCache) {
 
   auto storage = IndexFactory::CreateStorage("FileReadStorage");
   ASSERT_EQ(0, storage->open(path, false));
-  ASSERT_EQ(0, searcher->load(storage, IndexMetric::Pointer()));
+  auto late_failure = std::make_shared<RefuseLateAllocationStorage>(storage);
+  {
+    auto &rss = MemoryLimitPool::get_instance();
+    const size_t saved_limit = rss.process_rss_limit();
+    const auto restore = ScopeGuard::Make(
+        [&] { EXPECT_TRUE(rss.configure_process_rss_limit(saved_limit)); });
+    EXPECT_EQ(IndexError_NoMemory,
+              searcher->load(late_failure, IndexMetric::Pointer()));
+    EXPECT_NE(nullptr, storage->file());
+  }
+  ASSERT_EQ(0, searcher->load(late_failure, IndexMetric::Pointer()));
 
   // Count all reads made by a second cache build. BFS-expanded nodes are
   // written directly into their final cache slots, so every selected node is
@@ -1548,6 +1614,18 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   };
   EXPECT_EQ(0, fail_read(Phase::kRead, preload_cache));
   EXPECT_EQ(0u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
+  {
+    const auto restore = ScopeGuard::Make([&] {
+      EXPECT_TRUE(budget.configure_process_rss_limit(previous_limit));
+    });
+    ASSERT_TRUE(budget.configure_process_rss_limit(1));
+    ASSERT_GT(budget.process_rss(), budget.process_rss_limit());
+    EXPECT_NO_THROW(EXPECT_EQ(0, preload_cache()));
+    EXPECT_EQ(0u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
+    EXPECT_EQ(0u, DiskAnnCacheTestPeer::neighbor_cache_size(diskann_searcher));
+  }
+  ASSERT_EQ(0, fetch());
+  EXPECT_EQ(expected_vector, vector_after_failure);
   ASSERT_EQ(0, preload_cache());
   EXPECT_EQ(1u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
 }
