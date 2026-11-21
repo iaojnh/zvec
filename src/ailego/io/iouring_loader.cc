@@ -78,6 +78,7 @@ int IoUringRing::submit_reads(int fd, const IoUringRead *reads, size_t count) {
       const auto &read = reads[i];
       if (!read.buf || !read.len || read.offset % 512 || read.len % 512 ||
           read.len > std::numeric_limits<uint32_t>::max() ||
+          read.len > SIZE_MAX - (kIoUringStagingAlign - 1) ||
           read.expected_len > read.len)
         return -1;
       const size_t size =
@@ -218,9 +219,25 @@ IoUringRing::~IoUringRing() {
 }
 
 void IoUringRing::adopt_staging_reservation(size_t bytes) {
-  assert(staging_ == nullptr && staging_charge_ == 0 &&
-         prepaid_staging_bytes_ == 0);
+  assert(staging_ == nullptr && prepaid_staging_bytes_ == 0);
   prepaid_staging_bytes_ = bytes;
+}
+
+void IoUringRing::release_staging_charge(
+    size_t bytes, StagingCharge charge,
+    ProcessRssBudget::MaterializationStamp projection) {
+  auto &pool = MemoryLimitPool::get_instance();
+  switch (charge) {
+    case StagingCharge::kManaged:
+      pool.release_unmapped_external(bytes, projection);
+      break;
+    case StagingCharge::kProcess:
+      pool.release_unmapped_process_backing(bytes, projection);
+      break;
+    case StagingCharge::kPrepaid:
+      pool.release_materialization(bytes, projection);
+      break;
+  }
 }
 
 bool IoUringRing::release_staging() {
@@ -229,15 +246,9 @@ bool IoUringRing::release_staging() {
     LOG_ERROR("io_uring staging unmap failed; size=%zu", staging_size_);
     return false;
   }
-  auto &pool = MemoryLimitPool::get_instance();
-  if (staging_charge_) {
-    pool.release_unmapped_external(staging_charge_, staging_projection_);
-  } else if (prepaid_staging_bytes_) {
-    pool.release_materialization(staging_size_, staging_projection_);
-  }
+  release_staging_charge(staging_size_, staging_charge_, staging_projection_);
   staging_ = nullptr;
   staging_size_ = 0;
-  staging_charge_ = 0;
   staging_projection_ = {};
   return true;
 }
@@ -445,40 +456,48 @@ bool IoUringRing::ensure_staging(size_t bytes) {
     if (bytes > prepaid_staging_bytes_) return false;
     bytes = prepaid_staging_bytes_;
   }
-  // The prepaid workspace may be first used long after the pool opened.
-  // Respect current RSS pressure before mapping it. Writeback can fall back
-  // to pwrite using the existing cached page if staging is denied.
-  const size_t charge = prepaid_staging_bytes_ || !pool.capacity() ? 0 : bytes;
-  // Keep the old allocation charged until the replacement actually exists.
+  // Staging is optional and cannot wait for eviction. Without a native
+  // page pool it still consumes process RSS, just like the control rings.
   using Pending = MemoryLimitPool::PendingAllocation;
-  // Staging only accelerates the caller's existing read/write buffers. Denial
-  // must reach synchronous fallback without waiting or evicting data owners.
   Pending pending(pool, Pending::Kind::kLockedExternal);
-  if (!pending.reserve(charge)) return false;
-  if (prepaid_staging_bytes_ && !pool.try_reserve_materialization(bytes))
+  StagingCharge charge = StagingCharge::kManaged;
+  if (prepaid_staging_bytes_) {
+    charge = StagingCharge::kPrepaid;
+    if (!pool.try_reserve_materialization(bytes)) return false;
+  } else if (!pool.capacity()) {
+    charge = StagingCharge::kProcess;
+    if (!pool.try_reserve_process_backing(bytes)) return false;
+  } else if (!pending.reserve(bytes)) {
     return false;
-  // Anonymous mappings are page-aligned, satisfying the I/O alignment. They
-  // bypass malloc arenas, so release_staging() really returns physical pages.
+  }
+
+  // Keep the old mapping and its reservation until the replacement exists.
   void *ptr = File::MemoryMap(bytes, 0);
-  const auto prepaid_projection =
-      prepaid_staging_bytes_
-          ? pool.finish_materialization(bytes, ptr != nullptr)
-          : ProcessRssBudget::MaterializationStamp{};
+  ProcessRssBudget::MaterializationStamp projection;
+  switch (charge) {
+    case StagingCharge::kManaged:
+      if (ptr) projection = pending.commit_mapping();
+      break;
+    case StagingCharge::kProcess:
+      projection = pool.finish_process_backing(bytes, ptr != nullptr);
+      break;
+    case StagingCharge::kPrepaid:
+      projection = pool.finish_materialization(bytes, ptr != nullptr);
+      break;
+  }
   if (!ptr) {
     LOG_WARN("io_uring staging mapping failed; size=%zu", bytes);
     return false;
   }
   if (!release_staging()) {
-    if (!File::TryMemoryUnmap(ptr, bytes)) {
+    if (File::TryMemoryUnmap(ptr, bytes)) {
+      release_staging_charge(bytes, charge, projection);
+    } else {
       LOG_ERROR("io_uring replacement staging unmap failed; size=%zu", bytes);
-      pending.commit();
-    } else if (prepaid_staging_bytes_) {
-      pool.release_materialization(bytes, prepaid_projection);
     }
     return false;
   }
-  staging_projection_ =
-      prepaid_staging_bytes_ ? prepaid_projection : pending.commit_mapping();
+  staging_projection_ = projection;
   staging_ = static_cast<char *>(ptr);
   staging_size_ = bytes;
   staging_charge_ = charge;

@@ -41,14 +41,15 @@ class ResidentVectorBatch {
             const uint32_t *ids, size_t count, size_t code_size,
             ailego::BudgetedVector<const void *> &views,
             bool load_misses = false) {
-    const size_t capacity = segment.capacity();
+    const size_t size = segment.data_size();
     const size_t base = segment.data_offset();
-    if (!code_size || code_size > capacity ||
-        base > (std::numeric_limits<size_t>::max)() - capacity) {
+    if (!code_size || code_size > size ||
+        base > (std::numeric_limits<size_t>::max)() - size) {
+      views.clear();
       release();
       return false;
     }
-    const size_t max_id = (capacity - code_size) / code_size;
+    const size_t max_id = (size - code_size) / code_size;
     return read_offsets(
         pool, ids, count, code_size,
         [=](uint32_t id, size_t *absolute) {
@@ -66,6 +67,7 @@ class ResidentVectorBatch {
                     size_t count, size_t code_size, Locate locate,
                     ailego::BudgetedVector<const void *> &views,
                     bool load_misses = false) {
+    views.clear();
     release();
     const size_t page_size = ailego::kVectorPageSize;
     if (!count || count > kMaxCodes || !ids || !code_size ||
@@ -76,7 +78,7 @@ class ResidentVectorBatch {
     try {
       if (page_ids_.size() < count * 2) page_ids_.resize(count * 2);
       if (pages_.size() < count * 2) pages_.resize(count * 2);
-      views.resize(count);
+      views.reserve(count);
     } catch (const std::bad_alloc &) {
       return false;
     }
@@ -135,14 +137,14 @@ class ResidentVectorBatch {
       const auto &code = codes[i];
       const char *first = pages_[code.first] + code.within;
       if (code.first == code.last) {
-        views[i] = first;
+        views.push_back(first);
       } else {
         auto *destination = crossing_codes_.data() + copied;
         const size_t first_size = page_size - code.within;
         std::memcpy(destination, first, first_size);
         std::memcpy(destination + first_size, pages_[code.last],
                     code_size - first_size);
-        views[i] = destination;
+        views.push_back(destination);
         copied += code_size;
       }
     }

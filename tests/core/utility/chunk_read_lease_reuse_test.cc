@@ -193,6 +193,33 @@ TEST_F(ChunkReadLeaseReuseTest, CopiedResultsReleaseOnlySourcePins) {
   storage.reset();
   check(retained, 0, 300);
 }
+TEST_F(ChunkReadLeaseReuseTest, IdenticalLayoutsShareMetadataAndCachedData) {
+  const IndexStorage::Segment::ReadChunks chunks{
+      {0, page}, {page + 16, 2 * page}, {5 * page, page}};
+  ASSERT_EQ(0, segment->set_read_chunks(chunks));
+  IndexStorage::MemoryBlock retained;
+  ASSERT_EQ(64u, segment->read(page + 16, retained, 64));
+  const auto before = storage->stats();
+  for (size_t i = 0; i < 16; ++i) {
+    auto reopened = storage->get("payload");
+    ASSERT_NE(nullptr, reopened);
+    ASSERT_EQ(0, reopened->set_read_chunks(chunks));
+    IndexStorage::MemoryBlock alias;
+    ASSERT_EQ(64u, reopened->read(page + 16, alias, 64));
+    EXPECT_EQ(retained.data(), alias.data());
+    check(alias, page + 16, 64);
+  }
+  const auto after = storage->stats();
+  EXPECT_EQ(before.metadata_bytes, after.metadata_bytes);
+  EXPECT_EQ(before.cache_bytes, after.cache_bytes);
+
+  auto distinct = storage->get("payload");
+  ASSERT_NE(nullptr, distinct);
+  ASSERT_EQ(0, distinct->set_read_chunks({{page + 16, page}}));
+  EXPECT_GT(storage->stats().metadata_bytes, after.metadata_bytes);
+  check(retained, page + 16, 64);
+}
+
 TEST_F(ChunkReadLeaseReuseTest, ConcurrentReadersUseIndependentLeases) {
   std::atomic<bool> correct{true};
   std::vector<std::thread> readers;

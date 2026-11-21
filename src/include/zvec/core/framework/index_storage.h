@@ -102,6 +102,7 @@ class IndexStorage : public IndexModule {
       MemoryBlock mb;
       mb.type_ = MemoryBlockType::MBT_HEAP_SCRATCH;
       if (!size) return mb;
+      mb.scratch_alignment_ = alignment;
       mb.scratch_charge_.add_for_allocation(size, [&] {
         mb.data_ = alignment ? ailego_aligned_malloc(size, alignment)
                              : ailego_malloc(size);
@@ -116,13 +117,14 @@ class IndexStorage : public IndexModule {
     // The caller has acquired one reader lease. Heap copies remain deep;
     // mapping copies acquire leases. Moves transfer the existing lease.
     static MemoryBlock MakeReusedScratch(
-        void *data, const std::shared_ptr<ScratchLease> &owner,
-        bool deep_copy) {
+        void *data, const std::shared_ptr<ScratchLease> &owner, bool deep_copy,
+        size_t alignment = 0) {
       MemoryBlock mb;
       mb.type_ = MBT_REUSABLE_SCRATCH;
       mb.data_ = data;
       mb.scratch_lease_ = owner;
       mb.scratch_deep_copy_ = deep_copy;
+      mb.scratch_alignment_ = alignment;
       return mb;
     }
 
@@ -204,6 +206,7 @@ class IndexStorage : public IndexModule {
           data_ = rhs.data_;
           scratch_owner_ = rhs.scratch_owner_;
           scratch_size_ = rhs.scratch_size_;
+          scratch_alignment_ = rhs.scratch_alignment_;
           scratch_lease_ = rhs.scratch_lease_;
           if (scratch_lease_) scratch_lease_->retain();
           break;
@@ -232,6 +235,7 @@ class IndexStorage : public IndexModule {
           data_ = rhs.data_;
           scratch_size_ = rhs.scratch_size_;
           scratch_capacity_ = rhs.scratch_capacity_;
+          scratch_alignment_ = rhs.scratch_alignment_;
           resident_range_.take(rhs.resident_range_);
           scratch_charge_ = std::move(rhs.scratch_charge_);
           rhs.data_ = nullptr;
@@ -246,6 +250,7 @@ class IndexStorage : public IndexModule {
           scratch_size_ = rhs.scratch_size_;
           scratch_lease_ = std::exchange(rhs.scratch_lease_, nullptr);
           scratch_deep_copy_ = rhs.scratch_deep_copy_;
+          scratch_alignment_ = rhs.scratch_alignment_;
           rhs.data_ = nullptr;
           rhs.type_ = MemoryBlockType::MBT_UNKNOWN;
           break;
@@ -272,13 +277,11 @@ class IndexStorage : public IndexModule {
             buffer_pool_handle_->acquire_one(buffer_block_id_);
             break;
           case MemoryBlockType::MBT_HEAP_SCRATCH:
-            release_current();
             deep_copy_from(rhs);
             break;
           case MemoryBlockType::MBT_REUSABLE_SCRATCH:
           case MemoryBlockType::MBT_SHARED_SCRATCH:
             if (rhs.scratch_deep_copy_) {
-              release_current();
               deep_copy_from(rhs);
               break;
             }
@@ -287,6 +290,7 @@ class IndexStorage : public IndexModule {
             data_ = rhs.data_;
             scratch_owner_ = rhs.scratch_owner_;
             scratch_size_ = rhs.scratch_size_;
+            scratch_alignment_ = rhs.scratch_alignment_;
             scratch_lease_ = rhs.scratch_lease_;
             if (scratch_lease_) scratch_lease_->retain();
             break;
@@ -323,6 +327,7 @@ class IndexStorage : public IndexModule {
             data_ = rhs.data_;
             scratch_size_ = rhs.scratch_size_;
             scratch_capacity_ = rhs.scratch_capacity_;
+            scratch_alignment_ = rhs.scratch_alignment_;
             resident_range_.take(rhs.resident_range_);
             scratch_charge_ = std::move(rhs.scratch_charge_);
             rhs.data_ = nullptr;
@@ -338,6 +343,7 @@ class IndexStorage : public IndexModule {
             scratch_size_ = rhs.scratch_size_;
             scratch_lease_ = std::exchange(rhs.scratch_lease_, nullptr);
             scratch_deep_copy_ = rhs.scratch_deep_copy_;
+            scratch_alignment_ = rhs.scratch_alignment_;
             rhs.data_ = nullptr;
             rhs.type_ = MemoryBlockType::MBT_UNKNOWN;
             break;
@@ -420,7 +426,11 @@ class IndexStorage : public IndexModule {
     void release_owned() {
       resident_range_.reset();
       if (data_) {
-        ailego_free(data_);
+        if (scratch_alignment_) {
+          ailego_aligned_free(data_);
+        } else {
+          ailego_free(data_);
+        }
         data_ = nullptr;
       }
       scratch_size_ = 0;
@@ -457,6 +467,7 @@ class IndexStorage : public IndexModule {
       scratch_size_ = 0;
       type_ = MemoryBlockType::MBT_UNKNOWN;
       scratch_capacity_ = 0;
+      scratch_alignment_ = 0;
       scratch_deep_copy_ = false;
     }
 
@@ -469,15 +480,23 @@ class IndexStorage : public IndexModule {
 
     //! Deep-copy heap scratch ownership.
     void deep_copy_from(const MemoryBlock &rhs) {
-      auto copy = AllocateOwned(rhs.data_ ? rhs.scratch_size_ : 0);
-      if (rhs.data_ && rhs.scratch_size_)
-        std::memcpy(copy.data_, rhs.data_, rhs.scratch_size_);
+      const size_t size = rhs.data_ ? rhs.scratch_size_ : 0;
+      if (size && type_ == MBT_HEAP_SCRATCH &&
+          scratch_alignment_ >= rhs.scratch_alignment_ &&
+          can_reuse_scratch(size, rhs.scratch_alignment_)) {
+        std::memmove(data_, rhs.data_, size);
+        scratch_size_ = size;
+        return;
+      }
+      auto copy = AllocateOwned(size, rhs.scratch_alignment_);
+      if (size) std::memcpy(copy.data_, rhs.data_, size);
       *this = std::move(copy);
     }
 
     ailego::MemoryLimitPool::HeapResidentRange resident_range_;
     ailego::MemoryReservation scratch_charge_;
     size_t scratch_capacity_{0};
+    size_t scratch_alignment_{0};
     std::shared_ptr<ScratchLease> scratch_lease_;
     bool scratch_deep_copy_{false};
   };

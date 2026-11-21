@@ -25,7 +25,7 @@ class ResidentVectorBatchTest : public testing::Test {
     ASSERT_EQ(0, dumper->create(path_));
     const std::string prefix(32, '\0');
     ASSERT_EQ(prefix.size(), dumper->write(prefix.data(), prefix.size()));
-    ASSERT_EQ(0, dumper->append("prefix", prefix.size(), 0, 0));
+    ASSERT_EQ(0, dumper->append("prefix", 16, 16, 0));
     for (size_t chunk = 0; chunk < 2; ++chunk) {
       payload_[chunk].resize(kRows * kStride);
       for (size_t i = 0; i < payload_[chunk].size(); ++i)
@@ -119,6 +119,7 @@ TEST_F(ResidentVectorBatchTest, FailedProbeReleasesPinsWithoutReadingDisk) {
         ailego::MemoryLimitPool::get_instance().stats().page_used;
     const uint32_t ids[]{first, unavailable};
     EXPECT_FALSE(read(batch, ids, 2, views));
+    EXPECT_TRUE(views.empty());
     EXPECT_EQ(before,
               ailego::MemoryLimitPool::get_instance().stats().page_used);
     evict(page);
@@ -155,6 +156,27 @@ TEST_F(ResidentVectorBatchTest,
   ASSERT_TRUE(read(batch, ids, 2, views));
   for (size_t i = 0; i < 2; ++i)
     EXPECT_EQ(0, std::memcmp(expected(ids[i]), views[i], kBytes));
+}
+
+TEST_F(ResidentVectorBatchTest, FixedStrideRejectsPaddingAndClearsViews) {
+  auto prefix = storage_->get("prefix");
+  ASSERT_NE(nullptr, prefix);
+  ASSERT_EQ(16u, prefix->data_size());
+  ASSERT_EQ(32u, prefix->capacity());
+  IndexStorage::MemoryBlock warmed;
+  ASSERT_EQ(16u, prefix->read_borrowed(0, warmed, 16));
+
+  auto pool = storage_->vec_buffer_pool();
+  ResidentVectorBatch batch;
+  ailego::BudgetedVector<const void *> views;
+  const uint32_t valid = 0;
+  ASSERT_TRUE(batch.read(*pool, *prefix, &valid, 1, 16, views));
+  ASSERT_EQ(1u, views.size());
+  const uint32_t in_padding = 1;
+  EXPECT_FALSE(batch.read(*pool, *prefix, &in_padding, 1, 16, views));
+  EXPECT_TRUE(views.empty());
+  ASSERT_TRUE(batch.read(*pool, *prefix, &valid, 1, 16, views));
+  EXPECT_EQ(warmed.data(), views.front());
 }
 
 TEST_F(ResidentVectorBatchTest, UnsupportedWidthFallsBackBeforeAcquiringPages) {

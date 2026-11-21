@@ -15,6 +15,7 @@
 #include <cstring>
 #include <utility>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/core/framework/index_storage.h>
@@ -166,4 +167,45 @@ TEST(MemoryBlockSharedView, ParsingRetryPreservesIndependentOwners) {
   }
   EXPECT_EQ(0u, pool.external_used());
   EXPECT_EQ(0, pool.init(0));
+}
+
+TEST(MemoryBlockOwned, ExplicitAlignmentSurvivesCopiesAndMoves) {
+  using Block = IndexStorage::MemoryBlock;
+  constexpr size_t alignment = 4096;
+  constexpr size_t bytes = 257;
+  auto source = Block::AllocateOwned(bytes, alignment);
+  std::memset(const_cast<void *>(source.data()), 's', bytes);
+  auto copy = source;
+  EXPECT_NE(source.data(), copy.data());
+  EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(copy.data()) % alignment);
+  EXPECT_EQ(0, std::memcmp(source.data(), copy.data(), bytes));
+
+  Block moved;
+  moved = std::move(copy);
+  EXPECT_EQ(nullptr, copy.data());
+  EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(moved.data()) % alignment);
+  moved.reset();
+  source.reset();
+}
+
+TEST(MemoryBlockOwned, CopyAssignmentPreservesDestinationOnDenial) {
+  using Block = IndexStorage::MemoryBlock;
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(0, pool.init(32UL << 20));
+  const auto cleanup = ailego::ScopeGuard::Make([&] { pool.init(0); });
+  auto previous = Block::AllocateOwned(32);
+  auto fits = Block::AllocateOwned(16);
+  auto larger = Block::AllocateOwned(64);
+  std::memset(const_cast<void *>(fits.data()), 'f', 16);
+  const void *original = previous.data();
+
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kNormal);
+  });
+  pool.set_memory_pressure(ailego::ProcessRssBudget::PressureLevel::kCritical);
+  EXPECT_NO_THROW(previous = fits);
+  EXPECT_THROW(previous = larger, std::bad_alloc);
+  EXPECT_EQ(original, previous.data());
+  ASSERT_NE(nullptr, previous.data());
+  EXPECT_EQ(0, std::memcmp(previous.data(), fits.data(), 16));
 }

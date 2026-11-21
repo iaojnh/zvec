@@ -308,6 +308,34 @@ TEST_F(IoUringLoaderTest, StalledSubmissionDrainsAcceptedReadsBeforeRetry) {
   EXPECT_EQ(source, output);
 }
 
+TEST_F(IoUringLoaderTest, StandaloneStagingHonorsProcessPressure) {
+  ASSERT_EQ(0, pool_.init(0));
+  auto &budget = MemoryLimitPool::get_instance();
+  using Pressure = ProcessRssBudget::PressureLevel;
+  const auto restore =
+      ScopeGuard::Make([&] { budget.set_memory_pressure(Pressure::kNormal); });
+
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  std::array<char, kBlockSize> source;
+  source.fill('r');
+  ASSERT_EQ(static_cast<ssize_t>(source.size()),
+            ::pwrite(file.fd(), source.data(), source.size(), 0));
+  IoUringStagingTestPeer peer;
+  IoUringRing ring;
+  peer.attach(ring, file.fd());
+  std::array<char, kBlockSize> output{};
+  const IoUringRead read{0, output.size(), output.data()};
+
+  budget.set_memory_pressure(Pressure::kCritical);
+  EXPECT_EQ(-1, ring.execute(file.fd(), &read, 1));
+  EXPECT_EQ(0, output.front());
+  budget.set_memory_pressure(Pressure::kNormal);
+  ASSERT_EQ(0, ring.execute(file.fd(), &read, 1));
+  EXPECT_EQ(source, output);
+  EXPECT_EQ(0u, pool_.used());
+}
+
 TEST_F(IoUringLoaderTest, WritesScatteredBatch) {
   IoUringRing ring;
   if (!ring.setup(/*entries=*/8)) {

@@ -123,7 +123,6 @@ class IoUringRing {
     staging_ = nullptr;
     staging_size_ = 0;
     // The allocation has not been freed. Leave its charge quarantined too.
-    staging_charge_ = 0;
     staging_projection_ = {};
     prepaid_staging_bytes_ = 0;
   }
@@ -162,6 +161,10 @@ class IoUringRing {
  private:
   friend class IoUringStagingTestPeer;
   SetupResult map_control_regions(const io_uring_params &params);
+  enum class StagingCharge { kManaged, kProcess, kPrepaid };
+  static void release_staging_charge(
+      size_t bytes, StagingCharge charge,
+      ProcessRssBudget::MaterializationStamp projection);
   bool release_staging();
   int execute_impl(int fd, const IoUringRead *read_reqs,
                    const IoUringWrite *write_reqs, size_t count);
@@ -209,7 +212,7 @@ class IoUringRing {
   // io_uring teardown (see abandon_staging()).
   char *staging_{nullptr};
   size_t staging_size_{0};
-  size_t staging_charge_{0};
+  StagingCharge staging_charge_{StagingCharge::kManaged};
   ProcessRssBudget::MaterializationStamp staging_projection_{};
   size_t prepaid_staging_bytes_{0};
 

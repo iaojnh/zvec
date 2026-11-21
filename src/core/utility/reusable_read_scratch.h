@@ -77,7 +77,7 @@ class ReusableReadScratch {
       // Optional owner registration may allocate. Keep the required backing
       // outside the worker until construction succeeds so refusal can return
       // it.
-      if (!worker->initialize(worker, backing, bytes, deep_copy)) {
+      if (!worker->initialize(worker, backing, bytes, alignment, deep_copy)) {
         if (first) metadata_.retain_at_most(0);
         return backing;
       }
@@ -129,7 +129,7 @@ class ReusableReadScratch {
     }
 
     bool initialize(const std::shared_ptr<Worker> &self, Block &backing,
-                    size_t capacity, bool deep_copy) {
+                    size_t capacity, size_t alignment, bool deep_copy) {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!enqueue_locked()) return false;
       first_.backing = std::move(backing);
@@ -138,7 +138,7 @@ class ReusableReadScratch {
       allocated_ = 1;
       // Protect the required first result before unlocking or publishing the
       // worker. Pressure must not reclaim it and force another allocation.
-      backing = borrow(self, 0, deep_copy);
+      backing = borrow(self, 0, alignment, deep_copy);
       return true;
     }
 
@@ -152,7 +152,7 @@ class ReusableReadScratch {
         const size_t index = first_slot(idle);
         auto &cached = slot(index);
         if (cached.fits(bytes, alignment)) {
-          return borrow(self, index, deep_copy);
+          return borrow(self, index, alignment, deep_copy);
         }
         idle &= idle - 1;
       }
@@ -212,7 +212,7 @@ class ReusableReadScratch {
       cached.backing = std::move(replacement);
       cached.capacity = bytes;
       allocated_ |= uint64_t{1} << index;
-      return borrow(self, index, deep_copy);
+      return borrow(self, index, alignment, deep_copy);
     }
 
     void discard_idle() {
@@ -389,7 +389,7 @@ class ReusableReadScratch {
       return static_cast<size_t>(ailego_ctz64(mask));
     }
     Block borrow(const std::shared_ptr<Worker> &self, size_t index,
-                 bool deep_copy) {
+                 size_t alignment, bool deep_copy) {
       auto &cached = slot(index);
       assert(!cached.readers);
       // Every cached allocation is enrolled before publication. A failed
@@ -402,7 +402,8 @@ class ReusableReadScratch {
       // cross-thread destruction without allocating a control block per read.
       return Block::MakeReusedScratch(
           const_cast<void *>(cached.backing.data()),
-          std::shared_ptr<Block::ScratchLease>(self, &cached), deep_copy);
+          std::shared_ptr<Block::ScratchLease>(self, &cached), deep_copy,
+          alignment);
     }
     mutable std::mutex mutex_;
     std::atomic<ailego::version_t> membership_{0};

@@ -145,6 +145,15 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       }
       ++reuse_count[bucket];
     }
+    bool matches(size_t base, const Segment::ReadChunks &chunks) const {
+      if (chunks.size() != size) return false;
+      for (size_t i = 0; i < size; ++i) {
+        if (entries[i].offset != base + chunks[i].offset ||
+            entries[i].bytes != chunks[i].size)
+          return false;
+      }
+      return true;
+    }
     Entry *find(size_t offset) {
       size_t lo = 0, hi = size;
       while (lo < hi) {
@@ -586,9 +595,11 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
 #endif
     if (registered)
       ailego::BlockEvictionQueue::get_instance().set_invalid(this);
-    for (auto *layout = layouts.get(); layout; layout = layout->next.get())
-      for (size_t i = 0; i < layout->size; ++i)
-        release_backing(layout->entries[i]);
+    while (layouts) {
+      auto layout = std::move(layouts);
+      layouts = std::move(layout->next);
+      for (auto &entry : layout->entries) release_backing(entry);
+    }
     for (size_t i = 0; i < table.size(); ++i) {
       auto *segment = table[i].load(std::memory_order_relaxed);
       if (!segment) continue;
@@ -1457,6 +1468,15 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return true;
   }
 
+  // Protected by table_mutex. Published layouts and their CLOCK keys are
+  // stable for the lifetime of the open file.
+  Layout *find_layout(size_t base, const Segment::ReadChunks &chunks) {
+    for (auto *layout = layouts.get(); layout; layout = layout->next.get()) {
+      if (layout->matches(base, chunks)) return layout;
+    }
+    return nullptr;
+  }
+
   ailego::File data_file, meta_file;
   size_t file_size{0}, chunk_bytes{0}, max_read_bytes{0}, wait_ms{0};
   size_t io_alignment{1};
@@ -1563,6 +1583,13 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
         return IndexError_InvalidArgument;
       end = chunk.offset + chunk.size;
     }
+    {
+      std::lock_guard<std::mutex> lock(state_->table_mutex);
+      if (auto *published = state_->find_layout(offset_, chunks)) {
+        layout_ = published;
+        return 0;
+      }
+    }
     auto layout = MakeMetadata<State::Layout>(chunks.size());
     for (size_t i = 0; i < chunks.size(); ++i) {
       layout->entries[i].offset = offset_ + chunks[i].offset;
@@ -1580,6 +1607,12 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
       if (state_->adaptive) layout->entries[i].filter_readmission = false;
     }
     std::lock_guard<std::mutex> lock(state_->table_mutex);
+    // Allocation can reclaim and must run outside table_mutex. Another
+    // segment may have published the same layout in the meantime.
+    if (auto *published = state_->find_layout(offset_, chunks)) {
+      layout_ = published;
+      return 0;
+    }
     const size_t charged =
         sizeof(State::Layout) + layout->entries.size() * sizeof(State::Entry);
     auto *published = layout.get();
