@@ -65,9 +65,10 @@ class DiskAnnIndexer {
   diskann_key_t get_key(diskann_id_t id) const;
   diskann_id_t get_id(diskann_key_t key) const;
 
-  //! Copy element_size() bytes from src into a new vector value string
-  std::string make_vector_copy(const void *src) const {
-    return std::string(static_cast<const char *>(src), meta_.element_size());
+  VectorInfo make_candidate(DiskAnnContext *ctx, float distance,
+                            const void *src) const {
+    return VectorInfo(distance, ctx->fetch_vector() ? src : nullptr,
+                      meta_.element_size());
   }
 
   std::vector<bool> read_nodes(

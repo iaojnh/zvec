@@ -120,6 +120,7 @@ class DiskAnnStreamer : public IndexStreamer {
 
   //! Create a searcher context
   ContextPointer create_context() const override;
+  int create_context_with_status(ContextPointer &context) const override;
 
   //! Create a vector iterator backed by the aligned DiskAnn file reader.
   //! Used by the merge code path (``MixedStreamerReducer``) to walk every

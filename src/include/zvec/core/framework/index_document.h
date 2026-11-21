@@ -73,41 +73,26 @@ class IndexDocument {
   // Immutable after publication. Candidate heaps and returned documents share
   // one payload and one reservation, including copies retained by the caller.
   struct VectorPayload {
-    VectorPayload(const void *src, size_t size, bool process_rss = false) {
-      if (size == SIZE_MAX) throw std::bad_alloc();
-      if (process_rss) {
-        if (size <= data.capacity()) {
-          data.assign(static_cast<const char *>(src), size);
-        } else {
-          if (size >= SIZE_MAX / 2) throw std::bad_alloc();
-          rss_memory_.allocate(2 * (size + 1), [&] {
-            data.assign(static_cast<const char *>(src), size);
-            return data.capacity() + 1;
-          });
-        }
+    VectorPayload(const void *src, size_t size) {
+      if (size <= data.capacity()) {
+        data.assign(static_cast<const char *>(src), size);
         return;
       }
-      auto &pool = ailego::MemoryLimitPool::get_instance();
-      charge_ = pool.capacity() ? size + 1 : 0;
-      using Pending = ailego::MemoryLimitPool::PendingAllocation;
-      Pending pending(pool, Pending::Kind::kWorkspace);
-      if (!pending.reserve(charge_)) throw std::bad_alloc();
-      data.assign(static_cast<const char *>(src), size);
-      pending.commit();
-    }
-    ~VectorPayload() {
-      // Release the backing string before making its budget available again.
-      std::string().swap(data);
-      if (charge_)
-        ailego::MemoryLimitPool::get_instance().release_external(charge_);
+      if (size >= SIZE_MAX / 2) throw std::bad_alloc();
+      rss_memory_.allocate(2 * (size + 1), [&] {
+        data.assign(static_cast<const char *>(src), size);
+        return data.capacity() + 1;
+      });
     }
     VectorPayload(const VectorPayload &) = delete;
     VectorPayload &operator=(const VectorPayload &) = delete;
-    std::string data;
 
    private:
+    // The string must be destroyed before its reservation is released.
     ailego::ProcessRssReservation rss_memory_;
-    size_t charge_{0};
+
+   public:
+    std::string data;
   };
 
   //! Constructor
@@ -149,10 +134,7 @@ class IndexDocument {
 
   IndexDocument(uint64_t k, float v, uint32_t i,
                 std::shared_ptr<const VectorPayload> payload)
-      : key_(k),
-        score_(v),
-        index_(i),
-        vector_payload_(std::move(payload)) {}
+      : key_(k), score_(v), index_(i), vector_payload_(std::move(payload)) {}
 
   //! Constructor
   IndexDocument(uint64_t k, float v, uint32_t i, std::string vector_string,
