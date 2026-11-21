@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/core/framework/index_storage.h>
@@ -105,6 +106,13 @@ class IndexDocument {
         index_(i),
         vector_string_(std::move(vector_string)) {}
 
+  IndexDocument(uint64_t k, float v, uint32_t i,
+                std::shared_ptr<const std::string> vector_string)
+      : key_(k),
+        score_(v),
+        index_(i),
+        shared_vector_string_(std::move(vector_string)) {}
+
   //! Constructor
   IndexDocument(uint64_t k, float v, uint32_t i, std::string vector_string,
                 IndexSparseDocument sparse_doc)
@@ -134,6 +142,7 @@ class IndexDocument {
         index_(rhs.index_),
         vector_(rhs.vector_),
         vector_string_(std::move(rhs.vector_string_)),
+        shared_vector_string_(rhs.shared_vector_string_),
         sparse_doc_{rhs.sparse_doc_} {
     if (rhs.has_vec_mem_block_) {
       vec_mem_block_ = rhs.vec_mem_block_;
@@ -150,6 +159,7 @@ class IndexDocument {
       index_ = rhs.index_;
       vector_ = rhs.vector_;
       vector_string_ = rhs.vector_string_;
+      shared_vector_string_ = rhs.shared_vector_string_;
       if (rhs.has_vec_mem_block_) {
         vec_mem_block_ = rhs.vec_mem_block_;
         has_vec_mem_block_ = true;
@@ -195,7 +205,7 @@ class IndexDocument {
 
   //! Retrieve vec string
   const std::string &vector_string() const {
-    return vector_string_;
+    return shared_vector_string_ ? *shared_vector_string_ : vector_string_;
   }
 
   //! Retrieve vec
@@ -240,6 +250,7 @@ class IndexDocument {
   uint32_t index_{0u};
   const void *vector_{nullptr};
   std::string vector_string_{};
+  std::shared_ptr<const std::string> shared_vector_string_;
   bool has_vec_mem_block_{false};
   mutable IndexStorage::MemoryBlock vec_mem_block_{};
   IndexSparseDocument sparse_doc_{};

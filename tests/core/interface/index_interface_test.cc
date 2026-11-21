@@ -1160,7 +1160,8 @@ TEST(IndexInterface, IvfBufferPoolSearchAfterOpenThreadExits) {
 #if DISKANN_SUPPORTED
 TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
   constexpr uint32_t kDimension = 64;
-  constexpr uint32_t kDocCount = 512;
+  // Both key tables exceed the smallest cache budget.
+  constexpr uint32_t kDocCount = 4096;
   constexpr size_t kFullBudget = 8UL * 1024UL * 1024UL;
   const std::string index_name{"test_diskann_buffer_budgets.index"};
   auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
@@ -1244,18 +1245,42 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
     ASSERT_EQ(0, index->close());
   }
 
-  // Cover both bypass-only thresholds, then actual cache pressure and a pool
-  // large enough for the entire index. Every mode reads the same built file.
-  for (size_t budget : {page_size - 1, metadata_bytes + page_size - 1,
+  // Exercise the 4 KiB scratch boundary even on hosts with larger pages,
+  // then the cache-admission threshold, cache pressure, and a full cache.
+  const size_t subpage_budget = std::min<size_t>(page_size, 4096) - 1;
+  for (size_t budget : {subpage_budget, metadata_bytes + page_size - 1,
                         metadata_bytes + 4 * page_size, kFullBudget}) {
     SCOPED_TRACE(budget);
     ASSERT_EQ(0u, memory_pool.used());
     ASSERT_EQ(0, memory_pool.init(budget));
     auto index = IndexFactory::CreateAndInitIndex(*param);
     ASSERT_NE(nullptr, index);
-    ASSERT_EQ(0,
-              index->open(index_name, {StorageOptions::StorageType::kBufferPool,
-                                       false, true}));
+    auto &rss_pool = zvec::ailego::MemoryLimitPool::get_instance();
+    const auto restore_rss = zvec::ailego::ScopeGuard::Make(
+        [&] { EXPECT_TRUE(rss_pool.configure_process_rss_limit(0)); });
+    const StorageOptions options{StorageOptions::StorageType::kBufferPool,
+                                 false, true};
+    if (budget == subpage_budget) {
+      // The actual RSS sample exceeds this limit. Keep the cache budget
+      // unchanged when retrying with process headroom.
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(1));
+      const size_t rss = rss_pool.process_rss();
+      ASSERT_GT(rss, rss_pool.process_rss_limit());
+      ASSERT_EQ(zvec::core::IndexError_NoMemory,
+                index->open(index_name, options));
+      ASSERT_EQ(0u, memory_pool.used());
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+    }
+    ASSERT_EQ(0, index->open(index_name, options));
+    {
+      VectorDataBuffer fetched;
+      ASSERT_EQ(0, index->fetch(kDocCount - 1, &fetched));
+      const auto &buffer = std::get<DenseVectorBuffer>(fetched.vector_buffer);
+      ASSERT_EQ(kDimension * sizeof(float), buffer.data.size());
+      EXPECT_EQ(0, std::memcmp(buffer.data.data(),
+                               values.data() + (kDocCount - 1) * kDimension,
+                               buffer.data.size()));
+    }
     const bool cache_enabled = budget >= metadata_bytes + page_size;
     EXPECT_EQ(cache_enabled ? metadata_bytes : 0u, memory_pool.metadata_used());
     for (size_t repeat = 0; repeat < 2; ++repeat) {
@@ -1270,6 +1295,61 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
           EXPECT_EQ(0u, memory_pool.stats().page_used);
         }
       }
+    }
+    if (budget == subpage_budget) {
+      const VectorData input{DenseVector{values.data()}};
+      SearchResult held;
+      ASSERT_EQ(0, index->search(input, query_param, &held));
+      ASSERT_EQ(10u, held.doc_list_.size());
+      const std::string first_vector = held.doc_list_.front().vector_string();
+      ASSERT_EQ(kDimension * sizeof(float), first_vector.size());
+      const size_t cache_used = memory_pool.used();
+
+      const size_t rss = rss_pool.process_rss();
+      Result retried;
+      for (bool deny_during_search : {false, true}) {
+        SCOPED_TRACE(deny_during_search);
+        auto deny = [&] {
+          EXPECT_TRUE(rss_pool.configure_process_rss_limit(1));
+          EXPECT_GT(rss_pool.process_rss(), rss_pool.process_rss_limit());
+        };
+        int candidates = 0;
+        if (deny_during_search) {
+          // Let the query produce one candidate before refusing new backing.
+          query_param->filter = std::make_shared<IndexFilter>();
+          query_param->filter->set([&](uint64_t) {
+            if (++candidates == 2) deny();
+            return false;
+          });
+        } else {
+          deny();
+        }
+        SearchResult rejected;
+        EXPECT_EQ(zvec::core::IndexError_NoMemory,
+                  index->search(input, query_param, &rejected));
+        if (deny_during_search) {
+          EXPECT_EQ(2, candidates);
+        }
+        query_param->filter.reset();
+        EXPECT_TRUE(rejected.doc_list_.empty());
+        EXPECT_EQ(first_vector, held.doc_list_.front().vector_string());
+        EXPECT_LE(memory_pool.used(), cache_used);
+        ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+        ASSERT_NO_FATAL_FAILURE(query(index, 0, &retried));
+        EXPECT_EQ(baseline[0], retried);
+      }
+
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(1));
+      ASSERT_GT(rss_pool.process_rss(), rss_pool.process_rss_limit());
+      EXPECT_EQ(zvec::core::IndexError_NoReady, index->open(index_name, options));
+      ASSERT_EQ(0, index->close());
+      EXPECT_EQ(0u, memory_pool.used());
+      EXPECT_EQ(zvec::core::IndexError_NoMemory, index->open(index_name, options));
+      EXPECT_EQ(0u, memory_pool.used());
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+      ASSERT_EQ(0, index->open(index_name, options));
+      ASSERT_NO_FATAL_FAILURE(query(index, 0, &retried));
+      EXPECT_EQ(baseline[0], retried);
     }
     ASSERT_EQ(0, index->close());
     index.reset();

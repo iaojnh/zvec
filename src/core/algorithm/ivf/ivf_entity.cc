@@ -86,7 +86,7 @@ class ScatterCursor {
     }
   }
 
-  const std::vector<IndexStorage::Segment::ReadSpan> &spans_;
+  const IndexStorage::Segment::ScatterBlock::Spans &spans_;
   size_t span_index_{0};
   size_t span_offset_{0};
 };
@@ -972,11 +972,11 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     if (row_major) {
       if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);
-        return IndexError_ReadData;
+        return inverted_->read_error();
       }
     } else if (inverted_->read(off, data, size) != size) {
       LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
-      return IndexError_ReadData;
+      return inverted_->read_error();
     }
     ScatterCursor scatter_cursor(scatter_data);
 
@@ -1115,11 +1115,11 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
     if (row_major) {
       if (inverted_->read_scatter(off, scatter_data, size) != size) {
         LOG_ERROR("Failed to scatter-read block, off=%zu, size=%zu", off, size);
-        return IndexError_ReadData;
+        return inverted_->read_error();
       }
     } else if (inverted_->read(off, data, size) != size) {
       LOG_ERROR("Failed to read block, off=%zu, size=%zu", off, size);
-      return IndexError_ReadData;
+      return inverted_->read_error();
     }
     ScatterCursor scatter_cursor(scatter_data);
 
@@ -1348,22 +1348,26 @@ int IVFEntity::key_normalize_value(uint32_t id, float *value) const {
 }
 
 int IVFEntity::get_vector(size_t id, IndexStorage::MemoryBlock &block) const {
+  block.reset();
+  if (id >= vector_count()) return IndexError_InvalidArgument;
   if (features_) {
     size_t element_size = features_->data_size() / vector_count();
     size_t off = id * element_size;
     if (features_->read(off, block, element_size) != element_size) {
       LOG_ERROR("Failed to read segment, off=%zu size=%zu", off, element_size);
-      return IndexError_Runtime;
+      const int error = features_->read_error();
+      block.reset();
+      return error;
     }
     return 0;
   }
-
 
   return read_posting_vector(id, block);
 }
 
 int IVFEntity::read_posting_vector(size_t id,
-                                   IndexStorage::MemoryBlock &block) const {
+                                   IndexStorage::MemoryBlock &block) const try {
+  block.reset();
   if (id >= vector_count()) {
     return IndexError_InvalidArgument;
   }
@@ -1371,39 +1375,48 @@ int IVFEntity::read_posting_vector(size_t id,
   size_t size = sizeof(InvertedVecLocation);
   if (offsets_->read(id * size, data_block, size) != size) {
     LOG_ERROR("Failed to read offsets segment, id=%zu", id);
-    return IndexError_ReadData;
+    return offsets_->read_error();
   }
   const auto loc = *static_cast<const InvertedVecLocation *>(data_block.data());
   data_block.reset();
   if (loc.column_major) {
-    vector_.resize(meta_.element_size());
-    auto unit_size = IndexMeta::AlignSizeof(meta_.data_type());
+    const size_t unit_size = IndexMeta::AlignSizeof(meta_.data_type());
+    if (!unit_size || !meta_.element_size() ||
+        meta_.element_size() % unit_size != 0)
+      return IndexError_InvalidFormat;
     size_t cols = meta_.element_size() / unit_size;
     size_t step = block_vector_count() * unit_size;
     size_t rd_size = step * (cols - 1) + unit_size;
-    IndexStorage::MemoryBlock vector_block;
-    if (inverted_->read(loc.offset, vector_block, rd_size) != rd_size) {
+    auto output =
+        IndexStorage::MemoryBlock::AllocateOwned(meta_.element_size());
+    IndexStorage::Segment::ScatterBlock source;
+    if (inverted_->read_scatter(loc.offset, source, rd_size) != rd_size) {
       LOG_ERROR("Failed to read data, off=%zu size=%zu",
                 static_cast<size_t>(loc.offset), rd_size);
-      return IndexError_ReadData;
+      return inverted_->read_error();
     }
+    ScatterCursor cursor(source);
+    auto *dst = static_cast<char *>(const_cast<void *>(output.data()));
     for (size_t c = 0; c < cols; ++c) {
-      vector_.replace(
-          c * unit_size, unit_size,
-          reinterpret_cast<const char *>(vector_block.data()) + c * step,
-          unit_size);
+      if (!cursor.copy(dst + c * unit_size, unit_size) ||
+          (c + 1 != cols && !cursor.skip(step - unit_size)))
+        return IndexError_ReadData;
     }
-    block.reset(vector_.data());
+    block = std::move(output);
     return 0;
   } else {
     if (inverted_->read(loc.offset, block, meta_.element_size()) !=
         meta_.element_size()) {
       LOG_ERROR("Failed to read data, off=%zu size=%u",
                 static_cast<size_t>(loc.offset), meta_.element_size());
-      return IndexError_ReadData;
+      const int error = inverted_->read_error();
+      block.reset();
+      return error;
     }
     return 0;
   }
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 uint32_t IVFEntity::key_to_id(uint64_t key) const {
@@ -1426,17 +1439,18 @@ int IVFEntity::key_to_id(uint64_t key, uint32_t *id) const {
     if (ailego_unlikely(mapping_->read(idx * sizeof(uint32_t), data,
                                        sizeof(uint32_t)) != sizeof(uint32_t))) {
       LOG_ERROR("Failed to read mapping segment, idx=%u", idx);
-      return IndexError_ReadData;
+      return mapping_->read_error();
     }
     IndexStorage::MemoryBlock key_block;
     uint32_t local_id = *reinterpret_cast<const uint32_t *>(data.data());
+    data.reset();
     if (local_id >= vector_count()) {
       return IndexError_InvalidFormat;
     }
     if (ailego_unlikely(keys_->read(local_id * sizeof(uint64_t), key_block,
                                     sizeof(uint64_t)) != sizeof(uint64_t))) {
       LOG_ERROR("Read key from segment failed");
-      return IndexError_ReadData;
+      return keys_->read_error();
     }
     const auto mkey = *static_cast<const uint64_t *>(key_block.data());
     if (mkey < key) {
@@ -1453,7 +1467,10 @@ int IVFEntity::key_to_id(uint64_t key, uint32_t *id) const {
 
 int IVFEntity::get_vector_by_key(uint64_t key,
                                  IndexStorage::MemoryBlock &block) const {
-  uint32_t id = this->key_to_id(key);
+  block.reset();
+  uint32_t id;
+  const int ret = key_to_id(key, &id);
+  if (ret != 0) return ret;
   if (id != std::numeric_limits<uint32_t>::max()) {
     return get_vector(id, block);
   } else {

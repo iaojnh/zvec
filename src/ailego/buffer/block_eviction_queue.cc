@@ -24,6 +24,7 @@
 #include <ailego/utility/memory_helper.h>
 #include <ailego/utility/mobile_memory.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/process_rss_allocation.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 
@@ -181,15 +182,8 @@ struct alignas(std::max_align_t) MemoryLimitPool::QueueAllocationHeader {
   };
 };
 
-struct MemoryLimitPool::QueueResidentMapping {
-  QueueResidentMapping *previous{nullptr};
-  QueueResidentMapping *next{nullptr};
-  void *data{nullptr};
-  size_t bytes{0};
-};
-
 struct MemoryLimitPool::QueueMappingHeader {
-  QueueResidentMapping mapping;
+  ResidentRange mapping;
   ProcessRssBudget::MaterializationStamp stamp{};
   QueueAllocationHeader allocation{};
 };
@@ -219,7 +213,7 @@ struct MemoryLimitPool::QueueMemorySlab {
     previous = next = nullptr;
   }
 
-  QueueResidentMapping mapping;
+  ResidentRange mapping;
   QueueMemorySlab *previous{nullptr};
   QueueMemorySlab *next{nullptr};
   size_t slot_size;
@@ -238,37 +232,78 @@ void EvictionQueueTraits::free(void *ptr) {
   MemoryLimitPool::get_instance().free_queue_memory(ptr);
 }
 
-void MemoryLimitPool::register_queue_mapping(QueueResidentMapping *mapping,
-                                             void *data, size_t bytes) {
+void MemoryLimitPool::register_resident_range(ResidentRange *mapping,
+                                              void *data, size_t bytes) {
   mapping->data = data;
   mapping->bytes = bytes;
-  auto *next = queue_mappings_;
-  QueueResidentMapping *previous = nullptr;
+  auto *next = resident_ranges_;
+  ResidentRange *previous = nullptr;
   const auto address = reinterpret_cast<uintptr_t>(data);
   while (next && reinterpret_cast<uintptr_t>(next->data) < address) {
     previous = next;
     next = next->next;
   }
-  mapping->previous = previous;
-  mapping->next = next;
-  if (previous)
-    previous->next = mapping;
-  else
-    queue_mappings_ = mapping;
-  if (next) next->previous = mapping;
+  link_resident_neighbors(previous, next, mapping);
 }
 
-bool MemoryLimitPool::unmap_queue_mapping(QueueResidentMapping *mapping) {
+// The caller holds queue_memory_mutex_. Queue mapping nodes can already be
+// unmapped here, so update only the two live neighbors and the new node.
+void MemoryLimitPool::link_resident_neighbors(ResidentRange *previous,
+                                              ResidentRange *next,
+                                              ResidentRange *replacement) {
+  if (replacement) {
+    replacement->previous = previous;
+    replacement->next = next;
+  }
+  if (previous)
+    previous->next = replacement ? replacement : next;
+  else
+    resident_ranges_ = replacement ? replacement : next;
+  if (next) next->previous = replacement ? replacement : previous;
+}
+
+#if (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && TARGET_OS_OSX)
+void MemoryLimitPool::HeapResidentRange::register_pages(void *data,
+                                                        size_t bytes) {
+  // End pages may also contain another allocator client. Only wholly owned
+  // pages are eligible for the existing private-residency sample.
+  const size_t page = static_cast<size_t>(::getpagesize());
+  const auto address = reinterpret_cast<uintptr_t>(data);
+  const size_t skip = (page - address % page) % page;
+  if (bytes <= skip) return;
+  const size_t interior = (bytes - skip) / page * page;
+  if (!interior) return;
+  auto &pool = get_instance();
+  std::lock_guard<std::mutex> lock(pool.queue_memory_mutex_);
+  pool.register_resident_range(&range_, static_cast<char *>(data) + skip,
+                               interior);
+}
+
+void MemoryLimitPool::HeapResidentRange::unlink() noexcept {
+  auto &pool = get_instance();
+  std::lock_guard<std::mutex> lock(pool.queue_memory_mutex_);
+  pool.link_resident_neighbors(range_.previous, range_.next, nullptr);
+  range_ = {};
+}
+
+void MemoryLimitPool::HeapResidentRange::replace(
+    HeapResidentRange &other) noexcept {
+  auto &pool = get_instance();
+  std::lock_guard<std::mutex> lock(pool.queue_memory_mutex_);
+  range_ = other.range_;
+  pool.link_resident_neighbors(range_.previous, range_.next, &range_);
+  other.range_ = {};
+}
+#endif
+
+bool MemoryLimitPool::unmap_queue_mapping(ResidentRange *mapping) {
   auto *previous = mapping->previous;
   auto *next = mapping->next;
   // The directory node is inside this mapping. Save its links before unmap,
   // and retain both registration and charge if the OS refuses the unmap.
   if (!unmap_queue_memory(mapping->data, mapping->bytes)) return false;
-  if (previous)
-    previous->next = next;
-  else
-    queue_mappings_ = next;
-  if (next) next->previous = previous;
+  link_resident_neighbors(previous, next, nullptr);
   return true;
 }
 
@@ -348,7 +383,7 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
         slab->projection = ProcessRssBudget::MappingProjection::Full(
             region_bytes, process_rss_.finish_reservation(region_bytes, true));
       }
-      register_queue_mapping(&slab->mapping, raw, region_bytes);
+      register_resident_range(&slab->mapping, raw, region_bytes);
       slab->link(queue_small_slabs_[index]);
       queue_allocated_size_.fetch_add(region_bytes, std::memory_order_relaxed);
     }
@@ -383,7 +418,7 @@ void *MemoryLimitPool::allocate_queue_memory(size_t bytes) {
   auto *mapping = new (raw) QueueMappingHeader{};
   if (charged)
     mapping->stamp = process_rss_.finish_reservation(region_bytes, true);
-  register_queue_mapping(&mapping->mapping, raw, region_bytes);
+  register_resident_range(&mapping->mapping, raw, region_bytes);
   auto *header = &mapping->allocation;
   header->bytes = region_bytes;
   header->owner = nullptr;
@@ -692,9 +727,10 @@ ProcessRssBudget::ResidentSample MemoryLimitPool::read_slab_resident_sample() {
       begin += count * native_page;
     }
   }
-  // Queue blocks and producer metadata are charged anonymous mappings too.
-  // Their private resident pages can witness overlap; untouched slots cannot.
-  for (auto *mapping = pool.queue_mappings_; mapping; mapping = mapping->next) {
+  // Count only private, present pages in queue mappings and charged heap
+  // ranges.
+  for (auto *mapping = pool.resident_ranges_; mapping;
+       mapping = mapping->next) {
     uintptr_t begin = reinterpret_cast<uintptr_t>(mapping->data);
     const size_t bytes = mapping->bytes;
     if (begin % native_page || bytes % native_page ||
@@ -925,26 +961,26 @@ MemoryLimitPool::read_background_resident_sample() {
       resident += read_range(ranges[i].address, ranges[i].bytes, nullptr, page);
   }
   cursor = 0;
-  size_t queue_left = 0;
+  size_t ranges_left = 0;
   {
     std::unique_lock<std::mutex> lock(pool.queue_memory_mutex_,
                                       std::try_to_lock);
     if (lock)
-      for (auto *mapping = pool.queue_mappings_; mapping;
+      for (auto *mapping = pool.resident_ranges_; mapping;
            mapping = mapping->next)
-        ++queue_left;
+        ++ranges_left;
   }
-  while (queue_left != 0) {
+  while (ranges_left != 0) {
     size_t count = 0;
     {
       std::unique_lock<std::mutex> lock(pool.queue_memory_mutex_,
                                         std::try_to_lock);
       if (!lock) break;
-      auto *mapping = pool.queue_mappings_;
+      auto *mapping = pool.resident_ranges_;
       while (mapping && reinterpret_cast<uintptr_t>(mapping->data) < cursor)
         mapping = mapping->next;
-      for (size_t copied = 0; mapping && queue_left && copied < ranges.size();
-           ++copied, --queue_left) {
+      for (size_t copied = 0; mapping && ranges_left && copied < ranges.size();
+           ++copied, --ranges_left) {
         const auto address = reinterpret_cast<uintptr_t>(mapping->data);
         if (mapping->bytes > std::numeric_limits<uintptr_t>::max() - address)
           return {MemoryHelper::SelfRSS(), 0};
@@ -1015,6 +1051,15 @@ size_t MemoryLimitPool::retained_block_size(size_t bytes) {
 }
 
 void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
+  return acquire_retained_block_impl(bytes, metadata, true);
+}
+
+void *MemoryLimitPool::try_acquire_retained_block(size_t bytes, bool metadata) {
+  return acquire_retained_block_impl(bytes, metadata, false);
+}
+
+void *MemoryLimitPool::acquire_retained_block_impl(size_t bytes, bool metadata,
+                                                   bool required) {
   static_assert(sizeof(RetainedBlock) <= kRetainedBlockHeaderBytes,
                 "retained block header must fit its reserved prefix");
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
@@ -1045,7 +1090,9 @@ void *MemoryLimitPool::acquire_retained_block(size_t bytes, bool metadata) {
     }
   }
   // No allocator lock may be held across eviction or writeback callbacks.
-  if (!try_charge_fixed_with_wait(charge, counter, Backing::kPending))
+  if (!(required
+            ? try_charge_fixed_with_wait(charge, counter, Backing::kPending)
+            : try_charge_locked(charge, counter, Backing::kPending)))
     return nullptr;
 #if defined(_WIN32)
   void *raw =
@@ -2414,6 +2461,11 @@ bool MemoryLimitPool::try_charge_locked(size_t bytes,
   return true;
 }
 
+bool &ProcessRssAllocationScope::state() {
+  static thread_local bool active = false;
+  return active;
+}
+
 MemoryLimitPool::PendingAllocation::PendingAllocation(MemoryLimitPool &pool,
                                                       Kind kind)
     : pool_(pool),
@@ -2423,6 +2475,10 @@ MemoryLimitPool::PendingAllocation::PendingAllocation(MemoryLimitPool &pool,
                    : &pool.external_used_size_) {}
 
 MemoryLimitPool::PendingAllocation::~PendingAllocation() {
+  if (kind_ == Kind::kProcessRss) {
+    if (bytes_) pool_.finish_process_backing(bytes_, false);
+    return;
+  }
   if (bytes_ && kind_ == Kind::kEvictableCache)
     pool_.evictable_cache_size_.fetch_sub(bytes_, std::memory_order_relaxed);
   if (bytes_) pool_.release_fixed(bytes_, counter_, Backing::kPending);
@@ -2434,6 +2490,9 @@ bool MemoryLimitPool::PendingAllocation::reserve(size_t bytes) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(pool_.lifecycle_mutex_);
   bool reserved = false;
   switch (kind_) {
+    case Kind::kProcessRss:
+      reserved = pool_.try_reserve_process_backing(bytes);
+      break;
     case Kind::kExternal:
       reserved = pool_.try_charge_fixed(bytes, counter_, Backing::kPending);
       break;
@@ -2620,9 +2679,10 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
     const size_t native_room = native_available();
     const size_t rss_room = process_rss_.available();
     capacity_waits_.fetch_add(1, std::memory_order_relaxed);
+    bool progress;
     {
       std::unique_lock<std::mutex> lock(capacity_mutex_);
-      const bool progress = capacity_cv_.wait_until(
+      progress = capacity_cv_.wait_until(
           lock, std::min(deadline, Clock::now() + milliseconds(100)),
           [this, native_room, rss_room, request] {
             return (request.native_bytes && native_available() > native_room) ||
@@ -2632,10 +2692,11 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
         capacity_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
     }
     if (admit()) return true;
-    // Empty queues are conclusive only when no pending proof or registered
-    // process-cache reclaimer can restore admission. All three mandatory
-    // entry points use the same recovery rule and the same deadline.
-    if (!process_rss_.has_resident_uncertainty() && !has_reclaimer) {
+    // Live owners can release a large reservation in several steps. Keep
+    // waiting within the deadline while capacity is making progress even
+    // when no eviction or residency work remains.
+    if (!progress && !process_rss_.has_resident_uncertainty() &&
+        !has_reclaimer) {
       const auto queues = BlockEvictionQueue::get_instance().stats();
       if (std::all_of(queues.approximate_queue_sizes.begin(),
                       queues.approximate_queue_sizes.end(),

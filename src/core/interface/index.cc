@@ -539,8 +539,6 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   }
   ailego::Params storage_params;
   // storage_params.set("proxima.mmap_file.storage.memory_warmup", true);
-  // storage_params.set("proxima.mmap_file.storage.segment_meta_capacity",
-  // 1024);
 
   storage_params.set(core::MMAPFILE_STORAGE_COPY_ON_WRITE,
                      storage_options.copy_on_write);
@@ -553,6 +551,10 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
 
   switch (storage_options.type) {
     case StorageOptions::StorageType::kMMAP: {
+      // Each vector index has a small set of named segments. Grow its directory
+      // on demand so opening many collection blocks fits the shared budget.
+      storage_params.set(core::MMAPFILE_STORAGE_SEGMENT_META_CAPACITY,
+                         uint32_t{4096});
       const char *storage_name =
           storage_options.read_only ? "MMapFileReadStorage" : "MMapFileStorage";
       storage_ = core::IndexFactory::CreateStorage(storage_name);
@@ -673,14 +675,14 @@ int Index::close() {
   }
 
   if (!is_read_only_ && !pending_quantizer_training_) {
-    if (ailego_unlikely(flush() != 0)) {
-      LOG_ERROR("Failed to cleanup streamer");
-      return core::IndexError_Runtime;
+    if (const int ret = flush(); ailego_unlikely(ret != 0)) {
+      LOG_ERROR("Failed to flush index before close");
+      return ret;
     }
   }
-  if (ailego_unlikely(streamer_->cleanup() != 0)) {
+  if (const int ret = streamer_->cleanup(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to cleanup streamer");
-    return core::IndexError_Runtime;
+    return ret;
   }
   // Contexts are cached per index type in thread-local storage. IVF contexts
   // own cloned storage segments, so leaving the current thread's context in
@@ -690,9 +692,9 @@ int Index::close() {
     context_list[context_index_].reset();
     context_index_ = std::numeric_limits<size_t>::max();
   }
-  if (ailego_unlikely(storage_->close() != 0)) {
+  if (const int ret = storage_->close(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to close storage");
-    return core::IndexError_Runtime;
+    return ret;
   }
   is_open_ = false;
   return 0;
@@ -709,13 +711,13 @@ int Index::flush() {
     LOG_ERROR("Cannot flush read-only index");
     return core::IndexError_Runtime;
   }
-  if (ailego_unlikely(streamer_->flush(0) != 0)) {
+  if (const int ret = streamer_->flush(0); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush streamer");
-    return core::IndexError_Runtime;
+    return ret;
   }
-  if (ailego_unlikely(storage_->flush() != 0)) {
+  if (const int ret = storage_->flush(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush storage");
-    return core::IndexError_Runtime;
+    return ret;
   }
   return 0;
 }
@@ -1116,9 +1118,10 @@ int Index::_execute_dense_search(
     return streamer_->search_candidates_impl(vector, new_meta, *candidate_keys,
                                              context);
   } else {
-    if (streamer_->search_impl(vector, new_meta, 1, context) != 0) {
+    const int ret = streamer_->search_impl(vector, new_meta, 1, context);
+    if (ret != 0) {
       LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
+      return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
     }
   }
 
