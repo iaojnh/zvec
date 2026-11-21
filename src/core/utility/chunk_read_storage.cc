@@ -244,6 +244,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         aio.destroy_budgeted(context, ring_memory);
         return;
       }
+      ring_bytes.store(ring_memory.bytes, std::memory_order_relaxed);
       ready = true;
     }
     ~ReadAhead() {
@@ -336,6 +337,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           LibAioLoader::Instance().destroy_budgeted(context, ring_memory);
       if (destroyed == 0) {
         ring_charge.reset();
+        ring_bytes.store(0, std::memory_order_relaxed);
       } else {
         LOG_ERROR(
             "ChunkReadStorage: AIO completion failed (%d), teardown "
@@ -567,6 +569,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     }
     State &owner;
     MetadataPointer<MetadataCharge> ring_charge;
+    std::atomic<size_t> ring_bytes{0};
     size_t depth, byte_limit, occupied{0}, inflight{0}, bytes{0}, parsers{0};
     io_context_t context{nullptr};
     LibAioLoader::RingMemory ring_memory{};
@@ -1915,7 +1918,7 @@ ChunkReadStorage::Stats ChunkReadStorage::stats() const {
     result.prefetch_limit_bytes = s.read_ahead->byte_limit;
     result.metadata_bytes +=
         sizeof(State::ReadAhead) +
-        (s.read_ahead->ring_charge ? s.read_ahead->ring_charge->bytes : 0);
+        s.read_ahead->ring_bytes.load(std::memory_order_relaxed);
   }
 #endif
   return result;

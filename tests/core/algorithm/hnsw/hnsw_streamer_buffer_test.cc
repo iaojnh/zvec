@@ -2,6 +2,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
 #include <algorithm/hnsw/hnsw_algorithm.h>
@@ -118,6 +119,68 @@ TEST_F(HnswStreamerTest, LegacyReadsReleaseStorageBeforeThreadExit) {
   }
   retained.reset();
   EXPECT_EQ(initial_pages, memory_pool.stats().page_used);
+}
+
+TEST_F(HnswStreamerTest, ShortAppendKeepsNodeOffsetForRetry) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  const std::string path = dir_ + "ShortAppend";
+  ASSERT_EQ(0, storage->open(path, true));
+
+  const size_t vector_size = 2 * kVectorPageSize;
+  IndexStreamer::Stats stats;
+  HnswBufferPoolStreamerEntity entity(stats);
+  entity.set_vector_size(vector_size);
+  entity.set_l0_neighbor_cnt(2);
+  entity.set_upper_neighbor_cnt(2);
+  entity.set_scaling_factor(5);
+  ASSERT_EQ(0, entity.init(4));
+  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+  std::vector<char> vector(vector_size, 'a');
+  node_id_t id;
+  ASSERT_EQ(0, entity.add_vector(0, 100, vector.data(), &id));
+  ASSERT_EQ(0u, id);
+
+  auto nodes = storage->get(
+      ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_NODE, 0));
+  ASSERT_NE(nullptr, nodes);
+  const size_t record_end = nodes->data_size();
+  ASSERT_EQ(entity.node_size(), record_end);
+  const size_t next_offset = nodes->data_offset() + record_end;
+  auto pages = storage->vec_buffer_pool()->get_handle();
+  size_t page_id;
+  ASSERT_NE(nullptr, pages.get_single_page(next_offset, 1, page_id));
+  {
+    auto &pool = MemoryLimitPool::get_instance();
+    using Pressure = ProcessRssBudget::PressureLevel;
+    const auto restore = ScopeGuard::Make([&] {
+      pool.set_memory_pressure(Pressure::kNormal);
+      pages.release_one(page_id);
+    });
+    pool.set_memory_pressure(Pressure::kCritical);
+    vector.assign(vector_size, 'b');
+    EXPECT_EQ(IndexError_NoMemory,
+              entity.add_vector(0, 101, vector.data(), &id));
+    EXPECT_EQ(record_end, nodes->data_size());
+    EXPECT_EQ(1u, entity.doc_cnt());
+  }
+  ASSERT_EQ(0, entity.add_vector(0, 101, vector.data(), &id));
+  EXPECT_EQ(1u, id);
+  ASSERT_EQ(0, entity.close());
+  ASSERT_EQ(0, storage->close());
+  nodes.reset();
+
+  ASSERT_EQ(0, storage->open(path, false));
+  nodes = storage->get(
+      ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_NODE, 0));
+  ASSERT_NE(nullptr, nodes);
+  EXPECT_EQ(2 * record_end, nodes->data_size());
+  std::vector<char> actual(vector_size);
+  ASSERT_EQ(vector_size,
+            nodes->fetch(record_end, actual.data(), actual.size()));
+  EXPECT_EQ(vector, actual);
 }
 
 TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {

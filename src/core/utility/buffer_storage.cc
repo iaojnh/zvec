@@ -948,8 +948,8 @@ class BufferStorageFile
       const size_t data_base = data_offset();
       std::array<ailego::VecBufferWriteFragment, kMaxCoalescedWrites>
           fragments{};
+      size_t write_begin = capacity();
       size_t write_end = 0;
-      bool has_data = false;
       for (size_t i = 0; i < count; ++i) {
         const auto &write = writes[i];
         if (ailego_unlikely(write.offset > capacity() ||
@@ -963,21 +963,36 @@ class BufferStorageFile
         const size_t abs_offset = data_base + write.offset;
         fragments[i] = {abs_offset, write.length,
                         static_cast<const char *>(write.data)};
+        write_begin = std::min(write_begin, write.offset);
         write_end = std::max(write_end, write.offset + write.length);
-        has_data = true;
       }
 
-      if (!has_data) return true;
-      const auto status = owner_->buffer_pool_handle_->write_fragments_status(
-          fragments.data(), count);
-      if (status != ailego::PageWriteStatus::kOk) {
-        if (status == ailego::PageWriteStatus::kNoMemory)
-          buffer_storage_write_error = IndexError_NoMemory;
-        return false;
+      if (write_end == 0) return true;
+      auto &pool = *owner_->buffer_pool_handle_;
+      auto status = pool.write_fragments_status(fragments.data(), count);
+      if (status == ailego::PageWriteStatus::kOk) {
+        entry_.extend(write_end);
+        owner_->set_as_dirty();
+        return true;
       }
-      entry_.extend(write_end);
-      owner_->set_as_dirty();
-      return true;
+
+      if (status == ailego::PageWriteStatus::kNoMemory &&
+          (data_base + write_begin) / ailego::kVectorPageSize !=
+              (data_base + write_end - 1) / ailego::kVectorPageSize) {
+        // Admission failed before modifying any bytes. Retry ordered writes
+        // without pinning pages from earlier fragments. Keep each fragment
+        // intact, including a publication field that straddles two pages.
+        for (size_t i = 0; i < count; ++i) {
+          if (!fragments[i].length) continue;
+          status = pool.write_fragments_status(&fragments[i], 1);
+          if (status != ailego::PageWriteStatus::kOk) break;
+          entry_.extend(writes[i].offset + writes[i].length);
+          owner_->set_as_dirty();
+        }
+      }
+      if (status == ailego::PageWriteStatus::kNoMemory)
+        buffer_storage_write_error = IndexError_NoMemory;
+      return status == ailego::PageWriteStatus::kOk;
     }
 
     //! Resize size of data.  See write() for the locking contract.

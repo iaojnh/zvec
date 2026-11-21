@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -54,19 +55,41 @@ class IoUringStagingTestPeer {
     for (size_t i = 0; i < indices_.size(); ++i) indices_[i] = i;
   }
 
+  void stall_after_first_submission() {
+    stall_submission_ = true;
+  }
+
+  void resume_submissions() {
+    stall_submission_ = false;
+  }
+
  private:
   static int enter(int, unsigned count, unsigned, unsigned) {
+    auto &peer = *active_;
+    if (peer.stall_submission_) {
+      if (count == 0) {
+        peer.available_ = peer.submitted_;
+        return 0;
+      }
+      if (peer.submitted_ != 0) {
+        errno = EAGAIN;
+        return -1;
+      }
+      count = 1;
+    }
     for (unsigned i = 0; i < count; ++i) {
-      auto &request =
-          active_->requests_[active_->submitted_++ & active_->mask_];
-      auto &event = active_->events_[active_->available_++ & active_->mask_];
+      const unsigned slot = peer.submitted_++ & peer.mask_;
+      const auto &request = peer.requests_[slot];
+      auto &event = peer.events_[slot];
       event.user_data = request.user_data;
       event.res = ::pread(request.fd, reinterpret_cast<void *>(request.addr),
                           request.len, request.off);
     }
+    if (!peer.stall_submission_) peer.available_ = peer.submitted_;
     return static_cast<int>(count);
   }
   inline static thread_local IoUringStagingTestPeer *active_{nullptr};
+  bool stall_submission_{false};
   unsigned submitted_{0}, tail_{0}, completed_{0}, available_{0}, mask_{7};
   std::array<unsigned, 8> indices_{};
   std::array<io_uring_sqe, 8> requests_{};
@@ -255,6 +278,34 @@ TEST_F(IoUringLoaderTest,
   const IoUringRead retry{0, kBlockSize, backing};
   ASSERT_EQ(0, ring.execute(file.fd(), &retry, 1));
   EXPECT_EQ(0, std::memcmp(backing, source.data(), kBlockSize));
+}
+
+TEST_F(IoUringLoaderTest, StalledSubmissionDrainsAcceptedReadsBeforeRetry) {
+  TemporaryFile file;
+  ASSERT_GE(file.fd(), 0);
+  std::array<char, 2 * kBlockSize> source;
+  source.fill('x');
+  ASSERT_EQ(static_cast<ssize_t>(source.size()),
+            ::pwrite(file.fd(), source.data(), source.size(), 0));
+  IoUringStagingTestPeer peer;
+  IoUringRing ring;
+  peer.attach(ring, file.fd());
+  peer.stall_after_first_submission();
+
+  std::array<char, 2 * kBlockSize> output{};
+  const IoUringRead reads[] = {
+      {0, kBlockSize, output.data()},
+      {kBlockSize, kBlockSize, output.data() + kBlockSize},
+  };
+  ASSERT_EQ(-1, ring.execute(file.fd(), reads, 2));
+  EXPECT_EQ('x', output.front());
+  EXPECT_EQ(0, output.back());
+  EXPECT_TRUE(ring.is_valid());
+  EXPECT_EQ(0u, pool_.used());
+
+  peer.resume_submissions();
+  ASSERT_EQ(0, ring.execute(file.fd(), reads, 2));
+  EXPECT_EQ(source, output);
 }
 
 TEST_F(IoUringLoaderTest, WritesScatteredBatch) {

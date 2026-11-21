@@ -96,6 +96,7 @@ TEST_F(ChunkReadPrefetchTest, FailedAioTeardownQuarantinesAndAllowsDemandRead) {
   ASSERT_TRUE(segment->try_prefetch(0, page, Priority::kNormal));
   ASSERT_EQ(1u, storage->stats().prefetch_submitted);
   const auto backing = pool.evictable_cache_used();
+  const auto metadata = storage->stats().metadata_bytes;
   aio.io_getevents =
       +[](io_context_t, long, long, io_event *, timespec *) { return -EIO; };
   aio.io_destroy = +[](io_context_t) { return -EIO; };
@@ -107,6 +108,41 @@ TEST_F(ChunkReadPrefetchTest, FailedAioTeardownQuarantinesAndAllowsDemandRead) {
   EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
   EXPECT_FALSE(segment->try_prefetch(page, page, Priority::kNormal));
   EXPECT_GE(pool.evictable_cache_used(), backing);
+  EXPECT_EQ(metadata, storage->stats().metadata_bytes);
+}
+
+TEST_F(ChunkReadPrefetchTest, ConcurrentStatsSurviveAioTeardown) {
+  auto &aio = LibAioLoader::Instance();
+  const auto getevents = aio.io_getevents;
+  const auto restore =
+      ailego::ScopeGuard::Make([&] { aio.io_getevents = getevents; });
+  ASSERT_TRUE(segment->try_prefetch(
+      0, page, IndexStorage::Segment::CachePriority::kNormal));
+  ASSERT_EQ(1u, storage->stats().prefetch_submitted);
+  const size_t before = storage->stats().metadata_bytes;
+  aio.io_getevents =
+      +[](io_context_t, long, long, io_event *, timespec *) { return -EIO; };
+
+  std::atomic<size_t> samples{0};
+  std::atomic<bool> stop{false};
+  std::thread observer([&] {
+    while (!stop.load()) {
+      EXPECT_LE(storage->stats().metadata_bytes, before);
+      ++samples;
+    }
+  });
+  while (samples.load() == 0) std::this_thread::yield();
+  IndexStorage::MemoryBlock block;
+  const size_t read = segment->read(17, block, 64);
+  stop.store(true);
+  observer.join();
+
+  ASSERT_EQ(64u, read);
+  EXPECT_EQ(0, std::memcmp(payload.data() + 17, block.data(), 64));
+  const auto stats = storage->stats();
+  EXPECT_LT(stats.metadata_bytes, before);
+  EXPECT_EQ(1u, stats.prefetch_failed);
+  EXPECT_EQ(0u, stats.prefetch_pending_requests);
 }
 
 TEST_F(ChunkReadPrefetchTest,

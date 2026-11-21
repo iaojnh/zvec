@@ -650,11 +650,10 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
         submitted += static_cast<size_t>(ret);
         continue;
       }
-      if (errno == EINTR ||
-          ((errno == EAGAIN || errno == EBUSY) && completed < submitted)) {
-        continue;
-      }
+      if (errno == EINTR) continue;
 
+      // If submitting the suffix stalls, drain accepted operations without
+      // asking the kernel to submit that same suffix again.
       LOG_WARN(
           "io_uring_enter failed; errno=%d, %s, submitted=%zu/%zu, "
           "completed=%zu. draining before falling back to p%s",

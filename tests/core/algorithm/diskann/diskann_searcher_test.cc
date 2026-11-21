@@ -22,6 +22,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/container/vector.h>
@@ -283,6 +284,40 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   ASSERT_EQ(0, builder->dump(dumper));
   ASSERT_EQ(0, dumper->close());
 
+  // Resident tables and quantizer input must honor process pressure even
+  // with no native cache configured. A rejected load can be retried.
+  {
+    auto storage = IndexFactory::CreateStorage("FileReadStorage");
+    ASSERT_NE(storage, nullptr);
+    ASSERT_EQ(0, storage->open(path, false));
+    auto &pool = MemoryLimitPool::get_instance();
+    using Pressure = ProcessRssBudget::PressureLevel;
+    DiskAnnSearcherEntity entity;
+    {
+      const auto restore = ScopeGuard::Make(
+          [&] { pool.set_memory_pressure(Pressure::kNormal); });
+      pool.set_memory_pressure(Pressure::kCritical);
+      EXPECT_EQ(IndexError_NoMemory, entity.load(*_index_meta_ptr, storage));
+      EXPECT_EQ(nullptr, entity.pq_codes());
+    }
+    ASSERT_EQ(0, entity.load(*_index_meta_ptr, storage));
+    zvec::turbo::Quantizer::Pointer quantizer;
+    {
+      const auto restore = ScopeGuard::Make(
+          [&] { pool.set_memory_pressure(Pressure::kNormal); });
+      pool.set_memory_pressure(Pressure::kCritical);
+      EXPECT_EQ(IndexError_NoMemory, entity.load_quantizer(quantizer));
+      EXPECT_EQ(nullptr, quantizer);
+    }
+    ASSERT_EQ(0, entity.load_quantizer(quantizer));
+    EXPECT_NE(nullptr, quantizer);
+    const auto clone = entity.clone();
+    ASSERT_NE(nullptr, clone);
+    entity.clear();
+    EXPECT_EQ(1u, clone->get_key(1));
+    EXPECT_EQ(1u, clone->get_id(1));
+  }
+
   // A fetch context now allocates only the sectors required for one node, so
   // the on-disk packing fields must be mutually consistent. Otherwise a
   // forged nodes-per-sector value can put the computed node offset beyond
@@ -301,15 +336,8 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
     malformed_entity.set_node_layout(max_node_size,
                                      expected_node_per_sector + 1);
 
-    // The indexer now receives an externally built quantizer, exactly like the
-    // searcher does; the layout checks below still run before it is used.
-    std::string quantizer_meta_buffer;
-    ASSERT_EQ(0, malformed_entity.read_pq_quantizer_meta_buffer(
-                     &quantizer_meta_buffer));
-    auto pq_quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-        quantizer_meta_buffer, *_index_meta_ptr,
-        static_cast<uint32_t>(malformed_entity.pq_chunk_num()),
-        malformed_entity.legacy_pq_layout());
+    zvec::turbo::Quantizer::Pointer pq_quantizer;
+    ASSERT_EQ(0, malformed_entity.load_quantizer(pq_quantizer));
     ASSERT_NE(pq_quantizer, nullptr);
 
     DiskAnnIndexer malformed_indexer(*_index_meta_ptr);

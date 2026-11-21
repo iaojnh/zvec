@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #endif
 #include <ailego/parallel/lock.h>
+#include <ailego/pattern/scope_guard.h>
 #include <sparsehash/dense_hash_map>
 #include <sparsehash/dense_hash_set>
 #include <zvec/ailego/container/heap.h>
@@ -92,8 +93,8 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! Append neighbor_id to node id neighbors on level
   //! Notice: the caller must be ensure the neighbors not full
-  void add_neighbor(level_t level, node_id_t id, uint32_t size,
-                    node_id_t neighbor_id) override;
+  int add_neighbor(level_t level, node_id_t id, uint32_t size,
+                   node_id_t neighbor_id) override;
 
   //! Dump index by dumper
   int dump(const IndexDumper::Pointer &dumper) override;
@@ -398,6 +399,8 @@ class HnswStreamerEntity : public HnswEntity {
     return level * upper_neighbor_size_;
   }
 
+  int write_node_data(Chunk &chunk, size_t offset, const void *vec, key_t key);
+
   //! Add upper neighbor header and reserve space for upper neighbor
   int add_upper_neighbor(level_t level, node_id_t id) {
     if (level == 0) {
@@ -445,8 +448,15 @@ class HnswStreamerEntity : public HnswEntity {
     meta.bits.level = level;
     meta.bits.index = (chunk_index << upper_neighbor_mask_bits_) |
                       (chunk_offset / upper_neighbor_size_);
-    size_t zero_start = chunk_offset;
-    chunk_offset += upper_neighbor_size_ * level;
+    const size_t zero_start = chunk_offset;
+    chunk_offset += neighbors_size;
+
+    // A short write can advance data_size into this slot. Keep the next
+    // allocation aligned to a complete upper-neighbor record on failure.
+    bool published = false;
+    const auto restore = ailego::ScopeGuard::Make([&] {
+      if (!published) chunk->resize(zero_start);
+    });
 
     // IMPORTANT: order matters here.
     // 1) resize so the chunk's data_size covers the new region.
@@ -471,7 +481,7 @@ class HnswStreamerEntity : public HnswEntity {
     if (ailego_unlikely(chunk->write(zero_start, zeros.data(),
                                      neighbors_size) != neighbors_size)) {
       LOG_ERROR("Chunk write zeros failed");
-      return IndexError_Runtime;
+      return chunk->write_error();
     }
 
     if (ailego_unlikely(!upper_neighbor_index_->insert(id, meta.data))) {
@@ -479,6 +489,7 @@ class HnswStreamerEntity : public HnswEntity {
       return IndexError_Runtime;
     }
 
+    published = true;
     return 0;
   }
 

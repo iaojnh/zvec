@@ -381,6 +381,13 @@ class ZVEC_AILEGO_API MemoryLimitPool {
       size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
     process_rss_.release_unmapped(bytes, stamp);
   }
+  void release_heap_process_backing(
+      size_t bytes, ProcessRssBudget::MaterializationStamp stamp) {
+    process_rss_.release_heap(
+        bytes, ProcessRssBudget::HeapProjection::Full(bytes, stamp));
+    { std::lock_guard<std::mutex> lock(capacity_mutex_); }
+    capacity_cv_.notify_all();
+  }
 
   bool try_acquire_buffer(const size_t buffer_size, char *&buffer);
   bool try_acquire_buffer(size_t buffer_size, char *&buffer, bool required);

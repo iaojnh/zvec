@@ -15,6 +15,7 @@
 #include "diskann_streamer.h"
 #include <limits>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include "diskann_context.h"
 #include "diskann_index_provider.h"
 #include "diskann_indexer.h"
@@ -127,6 +128,9 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
     stats_.clear();
   }
 
+  const auto rollback = ailego::ScopeGuard::Make([&] {
+    if (state_ != STATE_LOADED) unload();
+  });
   auto start_time = ailego::Monotime::MilliSeconds();
 
   int ret = IndexHelper::DeserializeFromStorage(storage.get(), &meta_);
@@ -141,22 +145,11 @@ int DiskAnnStreamer::open(IndexStorage::Pointer storage) {
     return ret;
   }
 
-  // Construct the quantizer from the persisted meta buffer here; the entity
-  // only owns the bytes and the indexer receives the ready-to-use quantizer.
-  // The implementation is resolved from the meta buffer header, so any
-  // supported quantize type (PQ today, others later) plugs in transparently.
-  std::string quantizer_meta_buffer;
-  ret = entity_.read_pq_quantizer_meta_buffer(&quantizer_meta_buffer);
+  turbo::Quantizer::Pointer quantizer;
+  ret = entity_.load_quantizer(quantizer);
   if (ret != 0) {
-    LOG_ERROR("Read quantizer meta buffer failed, ret=%d", ret);
+    LOG_ERROR("Load DiskAnn quantizer failed, ret=%d", ret);
     return ret;
-  }
-  auto quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-      quantizer_meta_buffer, meta_,
-      static_cast<uint32_t>(entity_.pq_chunk_num()),
-      entity_.legacy_pq_layout());
-  if (!quantizer) {
-    return IndexError_NoExist;
   }
 
   diskann_indexer_ = std::make_shared<DiskAnnIndexer>(meta_);

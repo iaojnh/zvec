@@ -725,6 +725,101 @@ TEST_F(BufferStorageWriteTest, WriteBatchSamePagePersists) {
   EXPECT_EQ(0, storage->close());
 }
 
+TEST_F(BufferStorageWriteTest, CrossPageBatchSucceedsWithOneReclaimablePage) {
+  const size_t page = ailego::kVectorPageSize;
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("batch", 2 * page));
+  auto segment = storage->get("batch");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(2 * page, segment->resize(2 * page));
+  const size_t count_offset = (page - segment->data_offset() % page) % page;
+  const size_t payload_offset = count_offset + page;
+  const uint32_t count = 1;
+  const uint32_t payload = 0x12345678u;
+  uint32_t actual = 0;
+  ASSERT_EQ(sizeof(actual),
+            segment->fetch(payload_offset, &actual, sizeof(actual)));
+  ASSERT_EQ(0, storage->flush());
+
+  const IndexStorage::SegmentData writes[] = {
+      {payload_offset, sizeof(payload), &payload},
+      {count_offset, sizeof(count), &count},
+  };
+  {
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    const size_t available = pool.available();
+    ASSERT_GT(available, 1024u);
+    const size_t held = available - 1024;
+    ASSERT_TRUE(pool.try_charge_metadata_without_reclaim(held));
+    AILEGO_DEFER([&] { pool.release_metadata(held); });
+    const ailego::VecBufferWriteFragment fragments[] = {
+        {segment->data_offset() + payload_offset, sizeof(payload),
+         reinterpret_cast<const char *>(&payload)},
+        {segment->data_offset() + count_offset, sizeof(count),
+         reinterpret_cast<const char *>(&count)},
+    };
+    EXPECT_EQ(ailego::PageWriteStatus::kNoMemory,
+              storage->vec_buffer_pool()->get_handle().write_fragments_status(
+                  fragments, 2));
+    ASSERT_TRUE(segment->write_batch(writes, 2));
+  }
+
+  ASSERT_EQ(0, storage->close());
+  storage = open_read_only();
+  ASSERT_TRUE(storage);
+  segment = storage->get("batch");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(sizeof(actual),
+            segment->fetch(count_offset, &actual, sizeof(actual)));
+  EXPECT_EQ(count, actual);
+  ASSERT_EQ(sizeof(actual),
+            segment->fetch(payload_offset, &actual, sizeof(actual)));
+  EXPECT_EQ(payload, actual);
+}
+
+TEST_F(BufferStorageWriteTest,
+       BatchStopsBeforePublishingCountOnPayloadFailure) {
+  const size_t page = ailego::kVectorPageSize;
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("batch", 2 * page));
+  auto segment = storage->get("batch");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(2 * page, segment->resize(2 * page));
+  const size_t boundary = page - segment->data_offset() % page;
+  const size_t count_offset = boundary - sizeof(uint32_t);
+  const size_t payload_offset = boundary;
+  const uint32_t count = 1;
+  const uint32_t payload = 0x12345678u;
+  const IndexStorage::SegmentData writes[] = {
+      {payload_offset, sizeof(payload), &payload},
+      {count_offset, sizeof(count), &count},
+  };
+  IndexStorage::MemoryBlock pin;
+  ASSERT_EQ(sizeof(count),
+            segment->read_borrowed_immutable(count_offset, pin, sizeof(count)));
+  ASSERT_EQ(0, storage->flush());
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  {
+    AILEGO_DEFER([&] {
+      pool.set_memory_pressure(
+          ailego::ProcessRssBudget::PressureLevel::kNormal);
+    });
+    pool.set_memory_pressure(
+        ailego::ProcessRssBudget::PressureLevel::kCritical);
+    EXPECT_FALSE(segment->write_batch(writes, 2));
+    EXPECT_EQ(IndexError_NoMemory, segment->write_error());
+    EXPECT_FALSE(storage->is_dirty());
+    uint32_t actual = 0;
+    std::memcpy(&actual, pin.data(), sizeof(actual));
+    EXPECT_EQ(0u, actual);
+  }
+  pin.reset();
+  ASSERT_TRUE(segment->write_batch(writes, 2));
+  EXPECT_TRUE(storage->is_dirty());
+}
+
 // ===== Boundary / Error Tests =====
 
 // Test: Write exceeding segment capacity returns 0

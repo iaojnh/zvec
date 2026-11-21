@@ -37,7 +37,7 @@ class DiskAnnIndexer {
  public:
   //! Initialize with the loaded entity and the quantizer constructed by
   //! the searcher/streamer (see
-  //! DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer).
+  //! DiskAnnSearcherEntity::load_quantizer).
   //! Any turbo::Quantizer works here; PQ is just the current default.
   int init(DiskAnnSearcherEntity &entity, turbo::Quantizer::Pointer quantizer);
 

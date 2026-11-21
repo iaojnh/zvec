@@ -238,21 +238,22 @@ int HnswStreamerEntity::cleanup() {
 int HnswStreamerEntity::update_neighbors(
     level_t level, node_id_t id,
     const std::vector<std::pair<node_id_t, dist_t>> &neighbors) {
-  std::vector<char> buffer(neighbor_size_);
-  NeighborsHeader *hd = reinterpret_cast<NeighborsHeader *>(buffer.data());
-  hd->neighbor_cnt = neighbors.size();
-  size_t i = 0;
-  for (; i < neighbors.size(); ++i) {
-    hd->neighbors[i] = neighbors[i].first;
+  std::vector<node_id_t> payload;
+  payload.reserve(neighbors.size());
+  for (const auto &neighbor : neighbors) {
+    payload.push_back(neighbor.first);
   }
 
-  auto loc = get_neighbor_chunk_loc(level, id);
-  size_t size = reinterpret_cast<char *>(&hd->neighbors[i]) - buffer.data();
-  size_t ret = loc.first->write(loc.second, hd, size);
-  if (ailego_unlikely(ret != size)) {
-    LOG_ERROR("Write neighbor header failed, ret=%zu", ret);
-
-    return IndexError_Runtime;
+  const auto loc = get_neighbor_chunk_loc(level, id);
+  const uint32_t count = static_cast<uint32_t>(payload.size());
+  const IndexStorage::SegmentData writes[] = {
+      {loc.second + sizeof(NeighborsHeader), payload.size() * sizeof(node_id_t),
+       payload.data()},
+      {loc.second, sizeof(count), &count},
+  };
+  if (ailego_unlikely(!loc.first->write_batch(writes, 2))) {
+    LOG_ERROR("Write neighbor list failed");
+    return loc.first->write_error();
   }
 
   return 0;
@@ -284,7 +285,7 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
         LOG_ERROR("Read neighbor header failed, ret=%zu", size);
         return Neighbors();
       }
-      return Neighbors(neighbor_block);
+      return Neighbors(std::move(neighbor_block));
     }
   } else {
     auto p = get_upper_neighbor_chunk_loc(level, id);
@@ -306,11 +307,11 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
         LOG_ERROR("Read neighbor header failed, ret=%zu", size);
         return Neighbors();
       }
-      return Neighbors(neighbor_block);
+      return Neighbors(std::move(neighbor_block));
     }
   }
 
-  return Neighbors(neighbor_block);
+  return Neighbors(std::move(neighbor_block));
 }
 
 //! Get vector data by key
@@ -448,7 +449,7 @@ int HnswBufferPoolStreamerEntity::get_vector_for_prune(
               batch_reads.data(), batch_reads.size()))) {
     LOG_ERROR("Batch read prune vectors failed, count=%u, read size=%zu", count,
               read_size);
-    return IndexError_ReadData;
+    return batch_reads.front().segment->read_error();
   }
   return 0;
 }
@@ -481,8 +482,8 @@ key_t HnswStreamerEntity::get_key(node_id_t id) const {
   }
 }
 
-void HnswStreamerEntity::add_neighbor(level_t level, node_id_t id,
-                                      uint32_t size, node_id_t neighbor_id) {
+int HnswStreamerEntity::add_neighbor(level_t level, node_id_t id, uint32_t size,
+                                     node_id_t neighbor_id) {
   auto loc = get_neighbor_chunk_loc(level, id);
   size_t offset =
       loc.second + sizeof(NeighborsHeader) + size * sizeof(node_id_t);
@@ -496,9 +497,10 @@ void HnswStreamerEntity::add_neighbor(level_t level, node_id_t id,
   writes[1] = {loc.second, sizeof(neighbors), &neighbors};
   if (ailego_unlikely(!loc.first->write_batch(writes, 2))) {
     LOG_ERROR("Append neighbor failed");
+    return loc.first->write_error();
   }
 
-  return;
+  return 0;
 }
 
 int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
@@ -772,6 +774,16 @@ int HnswStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
   return 0;
 }
 
+int HnswStreamerEntity::write_node_data(Chunk &chunk, size_t offset,
+                                        const void *vec, key_t key) {
+  if (chunk.write(offset, vec, vector_size()) != vector_size() ||
+      chunk.write(offset + vector_size(), &key, sizeof(key)) != sizeof(key)) {
+    LOG_ERROR("Write node data failed");
+    return chunk.write_error();
+  }
+  return 0;
+}
+
 int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
                                    node_id_t *id) {
   Chunk::Pointer node_chunk;
@@ -810,28 +822,22 @@ int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
     chunk_offset = node_chunk->data_size();
   }
 
-  size_t size = node_chunk->write(chunk_offset, vec, vector_size());
-  if (ailego_unlikely(size != vector_size())) {
-    LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
-  }
-  size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
-  if (ailego_unlikely(size != sizeof(key_t))) {
-    LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
-  }
-  //! level 0 neighbors is inited to zero by default
+  bool record_stored = false;
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    if (!record_stored) node_chunk->resize(chunk_offset);
+  });
+  int ret = write_node_data(*node_chunk, chunk_offset, vec, key);
+  if (ailego_unlikely(ret != 0)) return ret;
 
-  int ret = add_upper_neighbor(level, local_id);
-  if (ret != 0) {
-    return ret;
-  }
-
-  chunk_offset += node_size();
-  if (ailego_unlikely(node_chunk->resize(chunk_offset) != chunk_offset)) {
-    LOG_ERROR("Chunk resize to %zu failed", chunk_offset);
+  const size_t record_end = chunk_offset + node_size();
+  if (ailego_unlikely(node_chunk->resize(record_end) != record_end)) {
+    LOG_ERROR("Chunk resize to %zu failed", record_end);
     return IndexError_Runtime;
   }
+  ret = add_upper_neighbor(level, local_id);
+  if (ailego_unlikely(ret != 0)) return ret;
+  record_stored = true;
+
   if (filter_same_key_ || get_vector_enabled_) {
     if (use_key_info_map_) {
       keys_map_lock_->lock();
@@ -891,16 +897,20 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
       LOG_ERROR("func_get_node_chunk_and_offset failed");
       return ret;
     }
-    size_t size = node_chunk->write(chunk_offset + vector_size(), &kInvalidKey,
-                                    sizeof(key_t));
-    if (ailego_unlikely(size != sizeof(key_t))) {
+    const size_t previous_size = node_chunk->data_size();
+    const size_t size = node_chunk->write(chunk_offset + vector_size(),
+                                          &kInvalidKey, sizeof(kInvalidKey));
+    if (ailego_unlikely(size != sizeof(kInvalidKey))) {
+      const int error = node_chunk->write_error();
+      node_chunk->resize(previous_size);
       LOG_ERROR("Chunk write key failed, ret=%zu", size);
-      return IndexError_WriteData;
+      return error;
     }
 
-    chunk_offset += node_size();
-    if (ailego_unlikely(node_chunk->resize(chunk_offset) != chunk_offset)) {
-      LOG_ERROR("Chunk resize to %zu failed", chunk_offset);
+    const size_t record_end = chunk_offset + node_size();
+    if (ailego_unlikely(node_chunk->resize(record_end) != record_end)) {
+      node_chunk->resize(previous_size);
+      LOG_ERROR("Chunk resize to %zu failed", record_end);
       return IndexError_Runtime;
     }
   }
@@ -910,32 +920,26 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
     return ret;
   }
 
-  size_t size = node_chunk->write(chunk_offset, vec, vector_size());
-  if (ailego_unlikely(size != vector_size())) {
-    LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
-  }
+  const size_t previous_size = node_chunk->data_size();
+  bool record_stored = false;
+  const auto restore = ailego::ScopeGuard::Make([&] {
+    if (!record_stored) node_chunk->resize(previous_size);
+  });
+  int ret = write_node_data(*node_chunk, chunk_offset, vec, key);
+  if (ailego_unlikely(ret != 0)) return ret;
 
-  size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
-  if (ailego_unlikely(size != sizeof(key_t))) {
-    LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
-  }
-  //! level 0 neighbors is inited to zero by default
-
-  int ret = add_upper_neighbor(level, id);
-  if (ret != 0) {
-    return ret;
-  }
-
-  if (*mutable_doc_cnt() <= id) {
-    *mutable_doc_cnt() = id + 1;
-    chunk_offset += node_size();
-    if (ailego_unlikely(node_chunk->resize(chunk_offset) != chunk_offset)) {
-      LOG_ERROR("Chunk resize to %zu failed", chunk_offset);
+  const bool grows = doc_cnt() <= id;
+  if (grows) {
+    const size_t record_end = chunk_offset + node_size();
+    if (ailego_unlikely(node_chunk->resize(record_end) != record_end)) {
+      LOG_ERROR("Chunk resize to %zu failed", record_end);
       return IndexError_Runtime;
     }
   }
+  ret = add_upper_neighbor(level, id);
+  if (ailego_unlikely(ret != 0)) return ret;
+  if (grows) *mutable_doc_cnt() = id + 1;
+  record_stored = true;
 
   if (filter_same_key_ || get_vector_enabled_) {
     if (use_key_info_map_) {
