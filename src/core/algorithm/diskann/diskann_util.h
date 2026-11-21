@@ -364,16 +364,6 @@ class DiskAnnUtil {
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
-
-  static turbo::Quantizer::Pointer create_quantizer_from_meta_buffer(
-      std::string &meta_buffer, const IndexMeta &index_meta, uint32_t chunk_num,
-      bool legacy) {
-    turbo::Quantizer::Pointer quantizer;
-    if (create_quantizer_from_meta_buffer(meta_buffer, index_meta, chunk_num,
-                                          legacy, quantizer) != 0)
-      return nullptr;
-    return quantizer;
-  }
 };
 
 //! Neighbor

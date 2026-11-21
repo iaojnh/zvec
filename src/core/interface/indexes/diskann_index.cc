@@ -137,9 +137,20 @@ int DiskAnnIndex::create_and_init_streamer(const BaseIndexParam &param) {
 
 int DiskAnnIndex::open(const std::string &file_path,
                        StorageOptions storage_options) {
+  if (is_open_) {
+    LOG_ERROR("Close DiskAnn index before opening another index");
+    return core::IndexError_NoReady;
+  }
   if (storage_options.read_only && storage_options.create_new) {
     LOG_ERROR("Cannot create storage for a read-only index");
     return core::IndexError_Runtime;
+  }
+  // Index::close() cleans up the streamer but leaves the closed storage
+  // handle here. Restore the streamer's configuration before retrying open.
+  if (storage_ && streamer_) {
+    const auto &meta = converter_ ? converter_->meta() : proxima_index_meta_;
+    const int ret = streamer_->init(meta, proxima_index_params_);
+    if (ret != 0) return ret;
   }
   ailego::Params storage_params;
   file_path_ = file_path;

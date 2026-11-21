@@ -1296,6 +1296,61 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
         }
       }
     }
+    if (budget == subpage_budget) {
+      const VectorData input{DenseVector{values.data()}};
+      SearchResult held;
+      ASSERT_EQ(0, index->search(input, query_param, &held));
+      ASSERT_EQ(10u, held.doc_list_.size());
+      const std::string first_vector = held.doc_list_.front().vector_string();
+      ASSERT_EQ(kDimension * sizeof(float), first_vector.size());
+      const size_t cache_used = memory_pool.used();
+
+      const size_t rss = rss_pool.process_rss();
+      Result retried;
+      for (bool deny_during_search : {false, true}) {
+        SCOPED_TRACE(deny_during_search);
+        auto deny = [&] {
+          EXPECT_TRUE(rss_pool.configure_process_rss_limit(1));
+          EXPECT_GT(rss_pool.process_rss(), rss_pool.process_rss_limit());
+        };
+        int candidates = 0;
+        if (deny_during_search) {
+          // Let the query produce one candidate before refusing new backing.
+          query_param->filter = std::make_shared<IndexFilter>();
+          query_param->filter->set([&](uint64_t) {
+            if (++candidates == 2) deny();
+            return false;
+          });
+        } else {
+          deny();
+        }
+        SearchResult rejected;
+        EXPECT_EQ(zvec::core::IndexError_NoMemory,
+                  index->search(input, query_param, &rejected));
+        if (deny_during_search) {
+          EXPECT_EQ(2, candidates);
+        }
+        query_param->filter.reset();
+        EXPECT_TRUE(rejected.doc_list_.empty());
+        EXPECT_EQ(first_vector, held.doc_list_.front().vector_string());
+        EXPECT_LE(memory_pool.used(), cache_used);
+        ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+        ASSERT_NO_FATAL_FAILURE(query(index, 0, &retried));
+        EXPECT_EQ(baseline[0], retried);
+      }
+
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(1));
+      ASSERT_GT(rss_pool.process_rss(), rss_pool.process_rss_limit());
+      EXPECT_EQ(zvec::core::IndexError_NoReady, index->open(index_name, options));
+      ASSERT_EQ(0, index->close());
+      EXPECT_EQ(0u, memory_pool.used());
+      EXPECT_EQ(zvec::core::IndexError_NoMemory, index->open(index_name, options));
+      EXPECT_EQ(0u, memory_pool.used());
+      ASSERT_TRUE(rss_pool.configure_process_rss_limit(rss + (256UL << 20)));
+      ASSERT_EQ(0, index->open(index_name, options));
+      ASSERT_NO_FATAL_FAILURE(query(index, 0, &retried));
+      EXPECT_EQ(baseline[0], retried);
+    }
     ASSERT_EQ(0, index->close());
     index.reset();
     EXPECT_EQ(0u, memory_pool.metadata_used());

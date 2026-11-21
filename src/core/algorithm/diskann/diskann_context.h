@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <algorithm>
 #include <zvec/core/framework/index_context.h>
 #include "utility/topk_result_builder.h"
 #include "diskann_dist_calculator.h"
@@ -152,6 +153,10 @@ class DiskAnnContext : public IndexContext,
 
   void set_fetch_vector(bool v) override {
     fetch_vector_ = v;
+  }
+
+  bool fetch_vector() const override {
+    return fetch_vector_;
   }
 
   //! Get topk
@@ -318,6 +323,24 @@ class DiskAnnContext : public IndexContext,
   // emplace_result_doc).
   using TopkResultBuilder<DiskAnnContext, TopkHeap>::topk_to_result;
 
+  void knn_to_result(uint32_t idx, ailego::ProcessRssReservation &memory) {
+    if (!group_by_search() && topk_heap_.size() > results_[idx].capacity()) {
+      auto &docs = results_[idx];
+      const size_t accepted = std::count_if(
+          topk_heap_.begin(), topk_heap_.end(), [&](const auto &entry) {
+            return !(entry.second.dist_ > threshold());
+          });
+      const size_t size = std::min<size_t>(topk_, accepted);
+      if (size > docs.capacity()) {
+        memory.allocate(size * sizeof(IndexDocument), [&] {
+          docs.reserve(size);
+          return docs.capacity() * sizeof(IndexDocument);
+        });
+      }
+    }
+    topk_to_result(idx);
+  }
+
   void set_to_result(uint32_t idx, const std::vector<diskann_id_t> &result_ids,
                      const std::vector<float> &result_dists) {
     if (result_ids.size() != result_dists.size()) {
@@ -347,10 +370,13 @@ class DiskAnnContext : public IndexContext,
 
   void emplace_result_doc(IndexDocumentList &docs, diskann_id_t id, float score,
                           const VectorInfo &info) {
-    if (fetch_vector_) {
-      docs.emplace_back(entity_->get_key(id), score, id, info.vec_);
+    const auto key = entity_->get_key(id);
+    if (fetch_vector_ && info.shared_vec_) {
+      docs.emplace_back(key, score, id, info.shared_vec_);
+    } else if (fetch_vector_) {
+      docs.emplace_back(key, score, id, info.vec_);
     } else {
-      docs.emplace_back(entity_->get_key(id), score, id);
+      docs.emplace_back(key, score, id);
     }
   }
 

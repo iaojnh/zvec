@@ -1118,9 +1118,10 @@ int Index::_execute_dense_search(
     return streamer_->search_candidates_impl(vector, new_meta, *candidate_keys,
                                              context);
   } else {
-    if (streamer_->search_impl(vector, new_meta, 1, context) != 0) {
+    const int ret = streamer_->search_impl(vector, new_meta, 1, context);
+    if (ret != 0) {
       LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
+      return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
     }
   }
 

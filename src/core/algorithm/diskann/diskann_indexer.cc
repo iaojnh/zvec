@@ -31,6 +31,26 @@ namespace core {
 
 namespace {
 
+struct SearchVector {
+  SearchVector(const void *src, size_t size) {
+    const char *data = static_cast<const char *>(src);
+    if (size <= bytes.capacity()) {
+      bytes.assign(data, size);
+      return;
+    }
+    if (size >= std::numeric_limits<size_t>::max() / 2) throw std::bad_alloc();
+    memory.allocate(2 * (size + 1), [&] {
+      bytes.assign(data, size);
+      return bytes.capacity() + 1;
+    });
+  }
+
+  // Keep the reservation until both the heap and returned results release
+  // the string. The string is destroyed before the reservation.
+  ailego::ProcessRssReservation memory;
+  std::string bytes;
+};
+
 // DiskAnnContext instances are pooled above the indexer and can therefore
 // outlive the reader that prepared their lazy Windows file handle. Keep that
 // handle across all I/O batches in one logical operation, then release it on
@@ -1204,7 +1224,7 @@ int DiskAnnIndexer::cached_beam_search(DiskAnnContext *ctx) {
   // for all requests, so the caller can safely reuse or destroy this context.
   IOContext &io_ctx = ctx->io_ctx();
   destroy_io_ctx(io_ctx);
-  if (setup_io_ctx(io_ctx) != 0) {
+  if (requires_io_context() && setup_io_ctx(io_ctx) != 0) {
     LOG_ERROR("cached_beam_search: failed to recreate I/O context");
   }
   ctx->set_error(true);
@@ -1219,6 +1239,18 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
   topk_heap.clear();
 
+  auto add_result = [&](diskann_id_t id, float distance, const void *coords) {
+    if (topk_heap.full() && !(distance < topk_heap.front().second.dist_)) return;
+    std::shared_ptr<const std::string> vector;
+    if (ctx->fetch_vector()) {
+      auto payload = std::allocate_shared<SearchVector>(
+          ailego::BudgetedAllocator<SearchVector, true>{}, coords,
+          meta_.element_size());
+      vector = std::shared_ptr<const std::string>(payload, &payload->bytes);
+    }
+    topk_heap.emplace(id, VectorInfo(distance, std::move(vector)));
+  };
+
   IOContext &io_ctx = ctx->io_ctx();
 
   uint8_t *sector_buffer = reinterpret_cast<uint8_t *>(ctx->sector_buffer());
@@ -1228,16 +1260,25 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
           ? 1
           : DiskAnnUtil::div_round_up(max_node_size_, DiskAnnUtil::kSectorSize);
 
-  dc.bind_quantizer(quantizer_.get(), quant_codes_, quant_code_size_);
-  dc.quantize_query(ctx->query_rotated());
-
   ailego::ElapsedTime query_timer;
   ailego::ElapsedTime io_timer;
   ailego::ElapsedTime cpu_timer;
 
+  ailego::ProcessRssReservation candidate_memory;
   NeighborPriorityQueue candidates;
+  const size_t list_size = ctx->list_size();
+  if (list_size >= std::numeric_limits<size_t>::max() / sizeof(Neighbor)) {
+    throw std::bad_alloc();
+  }
+  const size_t candidate_count = list_size + 1;
+  const size_t candidate_bytes = candidate_count * sizeof(Neighbor);
+  candidate_memory.allocate(candidate_bytes, [&] {
+    candidates.reserve(list_size);
+    return candidate_bytes;
+  });
 
-  candidates.reserve(ctx->list_size());
+  dc.bind_quantizer(quantizer_.get(), quant_codes_, quant_code_size_);
+  dc.quantize_query(ctx->query_rotated());
 
   diskann_id_t best_medoid = entrypoints_.front();
   float best_dist = (std::numeric_limits<float>::max)();
@@ -1268,19 +1309,30 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
   uint32_t effective_beam_width = std::min(
       std::max(8u, std::min(ctx->list_size() / 5, 32u)), max_beam_width);
 
-  std::vector<diskann_id_t> frontier;
-  frontier.reserve(2 * effective_beam_width);
+  ailego::ProcessRssVector<diskann_id_t> frontier;
+  frontier.reserve(effective_beam_width);
 
-  std::vector<std::pair<diskann_id_t, uint8_t *>> frontier_neighbors;
-  frontier_neighbors.reserve(2 * effective_beam_width);
+  ailego::ProcessRssVector<std::pair<diskann_id_t, uint8_t *>> frontier_neighbors;
+  frontier_neighbors.reserve(effective_beam_width);
 
-  std::vector<AlignedRead> frontier_read_reqs;
-  frontier_read_reqs.reserve(2 * effective_beam_width);
-
-  std::vector<std::tuple<diskann_id_t, uint32_t, diskann_id_t *>>
+  ailego::ProcessRssVector<std::tuple<diskann_id_t, uint32_t, diskann_id_t *>>
       cached_neighbors;
-  cached_neighbors.reserve(2 * effective_beam_width);
+  cached_neighbors.reserve(effective_beam_width);
 
+  // The reader API takes standard vectors. Admit their backing before
+  // allocating it, and reuse the completion buffer for every batch.
+  ailego::ProcessRssReservation io_memory;
+  std::vector<AlignedRead> frontier_read_reqs;
+  std::vector<uint32_t> completed;
+  const size_t io_bytes = effective_beam_width *
+                          (sizeof(AlignedRead) + sizeof(uint32_t));
+  io_memory.allocate(io_bytes, [&] {
+    frontier_read_reqs.reserve(effective_beam_width);
+    completed.reserve(effective_beam_width);
+    return frontier_read_reqs.capacity() * sizeof(AlignedRead) +
+           completed.capacity() * sizeof(uint32_t);
+  });
+  ailego::ProcessRssVector<float> distances;
   PendingBatch pending;
 
   while (candidates.has_unexpanded_node() && num_ios < io_limit_) {
@@ -1354,9 +1406,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
       if (!ctx->filter().is_valid() ||
           !ctx->filter()(get_key(std::get<0>(cached_neighbor)))) {
-        topk_heap.emplace(std::get<0>(cached_neighbor),
-                          VectorInfo(cur_expanded_dist,
-                                     make_vector_copy(node_fp_coords_copy)));
+        add_result(std::get<0>(cached_neighbor), cur_expanded_dist,
+                   node_fp_coords_copy);
       }
 
       uint32_t neighbor_num = std::get<1>(cached_neighbor);
@@ -1364,7 +1415,7 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
       cpu_timer.reset();
 
-      std::vector<float> distances(neighbor_num);
+      distances.resize(neighbor_num);
       dc.quantized_dist(node_neighbors, neighbor_num, distances.data());
 
       stats.dist_num += neighbor_num;
@@ -1381,7 +1432,6 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
     }
 
     if (!frontier.empty()) {
-      std::vector<uint32_t> completed;
       while (pending.n_reaped < pending.n_submitted) {
         completed.clear();
         io_timer.reset();
@@ -1408,16 +1458,15 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
           if (!ctx->filter().is_valid() ||
               !ctx->filter()(get_key(frontier_neighbor.first))) {
-            topk_heap.emplace(frontier_neighbor.first,
-                              VectorInfo(cur_expanded_dist,
-                                         make_vector_copy(node_fp_coords)));
+            add_result(frontier_neighbor.first, cur_expanded_dist,
+                       node_fp_coords);
           }
 
           diskann_id_t *node_neighbors =
               reinterpret_cast<diskann_id_t *>(node_buf + 1);
 
           cpu_timer.reset();
-          std::vector<float> distances(neighbor_num);
+          distances.resize(neighbor_num);
           dc.quantized_dist(node_neighbors, neighbor_num, distances.data());
 
           stats.dist_num += neighbor_num;
