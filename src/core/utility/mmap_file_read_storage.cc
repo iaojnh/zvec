@@ -27,7 +27,7 @@ class MMapFileReadStorage : public IndexStorage {
  public:
   /*! MMap File Storage Segment
    */
-  class Segment : public IndexStorage::Segment,
+  class Segment : public IndexStorage::MetadataSegment,
                   public std::enable_shared_from_this<Segment> {
    public:
     //! Index Storage Pointer
@@ -70,6 +70,10 @@ class MMapFileReadStorage : public IndexStorage {
     //! Retrieve offset of data
     size_t data_offset() const override {
       return data_offset_;
+    }
+
+    const void *metadata_view() const override {
+      return data_ptr_;
     }
 
     //! Fetch data from segment (with own buffer)
@@ -174,64 +178,56 @@ class MMapFileReadStorage : public IndexStorage {
   }
 
   //! Load a index file into container
-  int open(const std::string &path, bool) override {
-    file_path_ = path;
-    file_ptr_ = std::make_shared<ailego::MMapFile>();
-    if (!file_ptr_) {
-      LOG_ERROR("Failed to create mmap file object, %s",
-                ailego::FileHelper::GetLastErrorString().c_str());
-      return IndexError_NoMemory;
-    }
-
-    if (!file_ptr_->open(path.c_str(), true, memory_shared_)) {
+  int open(const std::string &path, bool) override try {
+    auto file = std::make_shared<ailego::MMapFile>();
+    if (!file->open(path.c_str(), true, memory_shared_)) {
       LOG_ERROR("Failed to open file %s, %s", path.c_str(),
                 ailego::FileHelper::GetLastErrorString().c_str());
       return IndexError_OpenFile;
     }
+    const size_t file_size = file->size();
+    size_t start;
+    size_t end;
+    if (!index_metadata::ResolveContainerOffset(file_size, header_offset_,
+                                                false, &start) ||
+        !index_metadata::ResolveContainerOffset(file_size, footer_offset_, true,
+                                                &end) ||
+        start >= end) {
+      return IndexError_InvalidArgument;
+    }
 
-    index_offset_ =
-        (header_offset_ >= 0 ? 0 : file_ptr_->size()) + header_offset_;
-    size_t end_offset =
-        (footer_offset_ > 0 ? 0 : file_ptr_->size()) + footer_offset_;
-    size_t size = end_offset > index_offset_ ? end_offset - index_offset_ : 0;
-    if (memory_locked_ && !file_ptr_->lock()) {
-      LOG_WARN("Failed to lock pages with size %zu, %s", file_ptr_->size(),
+    const auto *data = static_cast<const char *>(file->region()) + start;
+    IndexUnpacker unpacker;
+    int ret = unpacker.unpack_view(data, end - start, checksum_validation_);
+    if (ret != 0) {
+      LOG_ERROR("Failed to unpack file: %s", path.c_str());
+      return ret;
+    }
+    if (memory_locked_ && !file->lock()) {
+      LOG_WARN("Failed to lock pages with size %zu, %s", file_size,
                ailego::FileHelper::GetLastErrorString().c_str());
     }
     if (memory_warmup_ && !checksum_validation_) {
-      ailego::File::MemoryWarmup(
-          static_cast<char *>(file_ptr_->region()) + index_offset_, size);
+      ailego::File::MemoryWarmup(static_cast<char *>(file->region()) + start,
+                                 end - start);
     }
 
-    auto read_data = [this, end_offset](size_t offset, const void **data,
-                                        size_t len) {
-      size_t off = offset + index_offset_;
-      if (off + len > end_offset) {
-        if (off > end_offset) {
-          off = end_offset;
-        }
-        len = end_offset - off;
-      }
-      *data = (uint8_t *)file_ptr_->region() + off;
-      return len;
-    };
-
-    IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, size, checksum_validation_)) {
-      LOG_ERROR("Failed to unpack file: %s", path.c_str());
-      return IndexError_UnpackIndex;
-    }
-    segments_ = std::move(*unpacker.mutable_segments());
+    file_path_ = path;
+    segments_.swap(*unpacker.mutable_segments());
+    index_offset_ = start;
     magic_ = unpacker.magic();
+    file_ptr_ = std::move(file);
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   int close() override {
-    if (file_ptr_) {
-      file_ptr_->close();
-    }
-    file_ptr_ = nullptr;
+    file_ptr_.reset();
+    file_path_.clear();
     segments_.clear();
+    index_offset_ = 0;
+    magic_ = 0;
     return 0;
   }
 

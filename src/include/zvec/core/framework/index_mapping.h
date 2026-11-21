@@ -91,33 +91,20 @@ class IndexMapping {
   //! Constructor
   IndexMapping() = default;
 
-  //! Constructor
-  IndexMapping(IndexMapping &&rhs)
-      : segment_ids_offset_(rhs.segment_ids_offset_),
-        segment_start_(rhs.segment_start_),
-        header_(rhs.header_),
-        footer_(rhs.footer_),
-        segments_(std::move(rhs.segments_)),
-        file_(std::move(rhs.file_)) {
-    rhs.segment_ids_offset_ = 0;
-    rhs.segment_start_ = nullptr;
-    rhs.header_ = nullptr;
-    rhs.footer_ = nullptr;
+  IndexMapping(IndexMapping &&rhs) {
+    swap(rhs);
   }
 
-  //! Assignment
   IndexMapping &operator=(IndexMapping &&rhs) {
-    segment_ids_offset_ = rhs.segment_ids_offset_;
-    segment_start_ = rhs.segment_start_;
-    header_ = rhs.header_;
-    footer_ = rhs.footer_;
-    segments_ = std::move(rhs.segments_);
-    file_ = std::move(rhs.file_);
-    rhs.segment_ids_offset_ = 0;
-    rhs.segment_start_ = nullptr;
-    rhs.header_ = nullptr;
-    rhs.footer_ = nullptr;
+    if (this != &rhs) {
+      close();
+      swap(rhs);
+    }
     return *this;
+  }
+
+  ~IndexMapping() {
+    close();
   }
 
   //! Open a index file
@@ -201,11 +188,17 @@ class IndexMapping {
   IndexMapping &operator=(const IndexMapping &) = delete;
 
  private:
+  void swap(IndexMapping &rhs) noexcept;
+
   //! Members
   uint32_t segment_ids_offset_{0};
   IndexFormat::SegmentMeta *segment_start_{nullptr};
   IndexFormat::MetaHeader *header_{nullptr};
-  std::map<uint64_t, IndexFormat::MetaHeader *> header_addr_map_{};
+  struct MetaMapping {
+    IndexFormat::MetaHeader *header;
+    size_t length;
+  };
+  std::map<uint64_t, MetaMapping> header_addr_map_{};
   IndexFormat::MetaFooter *footer_{nullptr};
   std::map<std::string, SegmentInfo> segments_{};
   size_t index_size_{0u};

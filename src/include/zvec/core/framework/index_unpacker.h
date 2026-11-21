@@ -14,11 +14,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <map>
-#include <zvec/ailego/logger/logger.h>
-#include <zvec/ailego/utility/type_helper.h>
-#include <zvec/core/framework/index_error.h>
-#include <zvec/core/framework/index_format.h>
+#include <memory>
+#include <new>
+#include <zvec/core/framework/index_metadata.h>
 
 namespace zvec {
 namespace core {
@@ -67,7 +67,7 @@ class IndexUnpacker {
 
   //! Reset the unpacker
   void reset() {
-    segments_.clear();
+    *this = IndexUnpacker();
   }
 
   //! Retrieve segments of index package
@@ -100,217 +100,167 @@ class IndexUnpacker {
     return &segments_;
   }
 
-  //! Unpack index data
-  template <typename TFunc>
-  bool unpack(TFunc read_data, size_t total, bool checksum) {
-    static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
-                                                const void **, size_t>::value,
-                  "Invocable function type");
-
-    while (true) {
-      if (!this->unpack_header(read_data)) {
-        LOG_ERROR("Failed to unpack index header");
-        return false;
-      }
-      if (!this->unpack_footer(read_data, total)) {
-        LOG_ERROR("Failed to unpack index footer");
-        return false;
-      }
-      if (!this->unpack_segments(read_data, total)) {
-        LOG_ERROR("Failed to unpack index segments' meta");
-        return false;
-      }
-      if (checksum && !this->validate_checksum(read_data)) {
-        LOG_ERROR("Failed to validate checksum of index content");
-        return false;
-      }
-      if (footer_.next_meta_header_offset == 0) {
-        break;
-      }
-      current_header_start_offset_ = footer_.next_meta_header_offset;
-    }
-
-    if (!this->unpack_version(read_data)) {
-      LOG_ERROR("Failed to unpack index version");
-      return false;
-    }
-    return true;
+  //! Parse a stable view held by the caller for the duration of the call.
+  int unpack_view(const void *data, size_t total, bool checksum) {
+    return unpack_from(
+        [data](size_t offset, const void **out, size_t size) {
+          *out = static_cast<const char *>(data) + offset;
+          return size;
+        },
+        total, checksum);
   }
 
-  //! Unpack index header
-  template <typename TFunc>
-  bool unpack_header(TFunc read_data) {
-    static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
-                                                const void **, size_t>::value,
-                  "Invocable function type");
-    const void *data = nullptr;
-    if (read_data(current_header_start_offset_, &data, sizeof(header_)) !=
-        sizeof(header_)) {
-      return false;
-    }
-
-    memcpy(&header_, data, sizeof(header_));
-    if (header_.meta_header_size != sizeof(header_)) {
-      return false;
-    }
-    if (ailego::Crc32c::Hash(&header_, sizeof(header_), header_.header_crc) !=
-        header_.header_crc) {
-      return false;
-    }
-    return true;
+  //! Parse using a positional reader that copies into caller-owned memory.
+  template <typename Fetch>
+  int unpack_fetch(Fetch fetch, size_t total, bool checksum) {
+    index_metadata::Buffer scratch;
+    size_t capacity = 0;
+    return unpack_from(
+        [&](size_t offset, const void **out, size_t size) {
+          if (size > capacity) {
+            // All previous views have been consumed. Release the old charge
+            // before reserving a larger buffer.
+            scratch.reset();
+            scratch = index_metadata::AllocateBuffer(size);
+            capacity = size;
+          }
+          *out = scratch.get();
+          return fetch(offset, scratch.get(), size);
+        },
+        total, checksum);
   }
 
-  //! Unpack index footer
-  template <typename TFunc>
-  bool unpack_footer(TFunc read_data, size_t total) {
-    static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
-                                                const void **, size_t>::value,
-                  "Invocable function type");
-    if (header_.meta_footer_size != sizeof(footer_)) {
-      return false;
-    }
-
-    size_t footer_offset = ((int32_t)header_.meta_footer_offset < 0)
-                               ? total + (int32_t)header_.meta_footer_offset
-                               : header_.meta_footer_offset;
-    if (footer_offset + sizeof(footer_) > total) {
-      return false;
-    }
-
-    const void *data = nullptr;
-    if (read_data(current_header_start_offset_ + footer_offset, &data,
-                  sizeof(footer_)) != sizeof(footer_)) {
-      return false;
-    }
-
-    memcpy(&footer_, data, sizeof(footer_));
-    if (footer_.content_size + footer_.content_padding_size +
-            header_.content_offset >
-        footer_.total_size) {
-      return false;
-    }
-    if (ailego::Crc32c::Hash(&footer_, sizeof(footer_), footer_.footer_crc) !=
-        footer_.footer_crc) {
-      return false;
-    }
-    return true;
-  }
-
-  //! Unpack segments' meta
-  template <typename TFunc>
-  bool unpack_segments(TFunc read_data, size_t total) {
-    static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
-                                                const void **, size_t>::value,
-                  "Invocable function type");
-    if (sizeof(IndexFormat::SegmentMeta) * footer_.segment_count >
-        footer_.segments_meta_size) {
-      return false;
-    }
-    size_t offset = ((int32_t)header_.meta_footer_offset < 0)
-                        ? total + (int32_t)header_.meta_footer_offset
-                        : header_.meta_footer_offset;
-    if (offset < footer_.segments_meta_size || offset > total) {
-      return false;
-    }
-    offset -= footer_.segments_meta_size;
-
-    const void *data = nullptr;
-    if (read_data(current_header_start_offset_ + offset, &data,
-                  footer_.segments_meta_size) != footer_.segments_meta_size) {
-      return false;
-    }
-    if (ailego::Crc32c::Hash(data, footer_.segments_meta_size, 0u) !=
-        footer_.segments_meta_crc) {
-      return false;
-    }
-
-    IndexFormat::SegmentMeta *seg = (IndexFormat::SegmentMeta *)data;
-    for (size_t i = 0; i < footer_.segment_count; ++i, ++seg) {
-      if (seg->segment_id_offset > footer_.segments_meta_size) {
-        return false;
-      }
-      if (seg->data_index > footer_.content_size) {
-        return false;
-      }
-      if (seg->data_index + seg->data_size > footer_.content_size) {
-        return false;
-      }
-      segments_.emplace(
-          std::string(reinterpret_cast<const char *>(data) +
-                      seg->segment_id_offset),
-          SegmentMeta(seg->data_index + header_.content_offset +
-                          current_header_start_offset_,
-                      seg->data_size, seg->padding_size, seg->data_crc));
-    }
-    return true;
-  }
-
-  //! Unpack index version
-  template <typename TFunc>
-  bool unpack_version(TFunc read_data) {
-    static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
-                                                const void **, size_t>::value,
-                  "Invocable function type");
-
-    auto it = segments_.find("IndexVersion");
-    if (it == segments_.end()) {
-      return false;
-    }
-
-    const SegmentMeta &segment = it->second;
-    const void *data = nullptr;
-
-    if (read_data(0 + segment.data_offset(), &data, segment.data_size()) !=
-        segment.data_size()) {
-      return false;
-    }
-    if (segment.data_crc() != 0u &&
-        ailego::Crc32c::Hash(data, segment.data_size(), 0u) !=
-            segment.data_crc()) {
-      return false;
-    }
-    version_.assign(reinterpret_cast<const char *>(data), segment.data_size());
-    return true;
-  }
-
-  //! Validate checksum of content
-  template <typename TFunc>
-  bool validate_checksum(TFunc read_data) const {
-    static_assert(ailego::IsInvocableWithResult<size_t, TFunc, size_t,
-                                                const void **, size_t>::value,
-                  "Invocable function type");
-    if (footer_.content_crc == 0) {
-      return true;
-    }
-    const size_t block_size = 4096u;
-    const void *data = nullptr;
-    uint32_t checksum = 0u;
-    size_t total = footer_.content_size;
-    size_t offset = sizeof(header_);
-
-    while (total >= block_size) {
-      if (read_data(current_header_start_offset_ + offset, &data, block_size) !=
-          block_size) {
-        return false;
-      }
-      checksum = ailego::Crc32c::Hash(data, block_size, checksum);
-      total -= block_size;
-      offset += block_size;
-    }
-    if (read_data(current_header_start_offset_ + offset, &data, total) !=
-        total) {
-      return false;
-    }
-    checksum = ailego::Crc32c::Hash(data, total, checksum);
-    return (checksum == footer_.content_crc);
+  //! Parse with a view valid until the next invocation of the reader.
+  template <typename Read>
+  bool unpack(Read read, size_t total, bool checksum) {
+    return unpack_from(read, total, checksum) == 0;
   }
 
  private:
+  template <typename Read>
+  int unpack_from(const Read &read, size_t total, bool checksum) try {
+    IndexUnpacker candidate;
+    int ret = candidate.parse(read, total, checksum);
+    if (ret == 0) {
+      *this = std::move(candidate);
+    }
+    return ret;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  }
+
+  template <typename Read>
+  int parse(const Read &read, size_t total, bool checksum) {
+    size_t start = 0;
+    do {
+      const size_t remaining = total - start;
+      const void *data = nullptr;
+      if (sizeof(header_) > remaining) {
+        return IndexError_InvalidLength;
+      }
+      if (read(start, &data, sizeof(header_)) != sizeof(header_) || !data) {
+        return IndexError_ReadData;
+      }
+      std::memcpy(&header_, data, sizeof(header_));
+
+      size_t footer_offset;
+      int ret =
+          index_metadata::FooterOffset(header_, remaining, &footer_offset);
+      if (ret != 0) {
+        return ret;
+      }
+      if (read(start + footer_offset, &data, sizeof(footer_)) !=
+              sizeof(footer_) ||
+          !data) {
+        return IndexError_ReadData;
+      }
+      std::memcpy(&footer_, data, sizeof(footer_));
+      ret = index_metadata::CheckFooter(header_, footer_, footer_offset,
+                                        remaining);
+      if (ret != 0) {
+        return ret;
+      }
+      size_t next;
+      ret = index_metadata::NextSection(footer_, start, total, &next);
+      if (ret != 0) {
+        return ret;
+      }
+
+      const size_t table_offset =
+          start + footer_offset - footer_.segments_meta_size;
+      if (footer_.segments_meta_size != 0 &&
+          (read(table_offset, &data, footer_.segments_meta_size) !=
+               footer_.segments_meta_size ||
+           !data)) {
+        return IndexError_ReadData;
+      }
+      ret = index_metadata::CheckTable(footer_, data);
+      if (ret != 0) {
+        return ret;
+      }
+      const auto *table = static_cast<const char *>(data);
+      const size_t content_offset = start + header_.content_offset;
+      for (size_t i = 0; i < footer_.segment_count; ++i) {
+        IndexFormat::SegmentMeta segment;
+        std::memcpy(&segment, table + i * sizeof(segment), sizeof(segment));
+        std::string_view id;
+        ret = index_metadata::SegmentId(footer_, table, segment, &id);
+        if (ret != 0) {
+          return ret;
+        }
+        if (!segments_
+                 .try_emplace(
+                     std::string(id), content_offset + segment.data_index,
+                     segment.data_size, segment.padding_size, segment.data_crc)
+                 .second) {
+          return IndexError_Duplicate;
+        }
+      }
+      if (checksum && footer_.content_crc != 0) {
+        uint32_t crc = 0;
+        for (size_t done = 0; done < footer_.content_size;) {
+          const size_t len =
+              std::min<size_t>(4096, footer_.content_size - done);
+          if (read(content_offset + done, &data, len) != len || !data) {
+            return IndexError_ReadData;
+          }
+          crc = ailego::Crc32c::Hash(data, len, crc);
+          done += len;
+        }
+        if (crc != footer_.content_crc) {
+          return IndexError_InvalidChecksum;
+        }
+      }
+      start = next;
+    } while (start != 0);
+
+    auto version = segments_.find("IndexVersion");
+    if (version == segments_.end()) {
+      return IndexError_UnpackIndex;
+    }
+    const SegmentMeta &segment = version->second;
+    if (segment.data_size() == 0) {
+      return segment.data_crc() == 0 ? 0 : IndexError_InvalidChecksum;
+    }
+    const void *data = nullptr;
+    if (read(segment.data_offset(), &data, segment.data_size()) !=
+            segment.data_size() ||
+        !data) {
+      return IndexError_ReadData;
+    }
+    if (segment.data_crc() != 0 &&
+        ailego::Crc32c::Hash(data, segment.data_size(), 0u) !=
+            segment.data_crc()) {
+      return IndexError_InvalidChecksum;
+    }
+    version_.assign(static_cast<const char *>(data), segment.data_size());
+    return 0;
+  }
+
   IndexFormat::MetaHeader header_{};
   IndexFormat::MetaFooter footer_{};
   std::string version_{};
   std::map<std::string, SegmentMeta> segments_{};
-  uint64_t current_header_start_offset_{0u};
 };
 
 }  // namespace core

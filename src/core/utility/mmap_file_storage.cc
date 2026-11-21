@@ -27,7 +27,7 @@ class MMapFileStorage : public IndexStorage {
  public:
   /*! Index Storage Segment
    */
-  class Segment : public IndexStorage::Segment,
+  class Segment : public IndexStorage::MetadataSegment,
                   public std::enable_shared_from_this<Segment> {
    public:
     //! Index Storage Pointer
@@ -61,6 +61,10 @@ class MMapFileStorage : public IndexStorage {
     //! Retrieve capacity of segment
     size_t capacity() const override {
       return capacity_;
+    }
+
+    const void *metadata_view() const override {
+      return segment_->data();
     }
 
     //! Fetch data from segment (with own buffer)
@@ -176,6 +180,13 @@ class MMapFileStorage : public IndexStorage {
         return error_code;
       }
     }
+    if (mapping_.is_header_dirty() || index_dirty_) {
+      const int ret = flush_index();
+      if (ret != 0) {
+        return ret;
+      }
+    }
+    std::lock_guard<std::mutex> latch(mapping_mutex_);
     return mapping_.open(path, copy_on_write_, force_flush_);
   }
 
@@ -225,49 +236,33 @@ class MMapFileStorage : public IndexStorage {
   }
 
  protected:
-  //! Initialize index version segment
-  int init_version_segment() {
-    size_t data_size = std::strlen(IndexVersion::Details());
-    int error_code =
-        this->append_segment(INDEX_VERSION_SEGMENT_NAME, data_size);
-    if (error_code != 0) {
-      return error_code;
+  //! Initialize a new file before publishing it as this storage's mapping.
+  int init_index(const std::string &path) try {
+    IndexMapping mapping;
+    int ret = mapping.create(path, segment_meta_capacity_);
+    if (ret != 0) {
+      return ret;
     }
 
-    IndexMapping::Segment *segment = get_segment(INDEX_VERSION_SEGMENT_NAME);
+    const size_t size = std::strlen(IndexVersion::Details());
+    ret = mapping.append(INDEX_VERSION_SEGMENT_NAME, size);
+    if (ret != 0) {
+      return ret;
+    }
+    auto *segment = mapping.map(INDEX_VERSION_SEGMENT_NAME, false, false);
     if (!segment) {
       return IndexError_MMapFile;
     }
-    auto meta = segment->meta();
-    size_t capacity = static_cast<size_t>(meta->padding_size + meta->data_size);
-    memcpy(segment->data(), IndexVersion::Details(), data_size);
+    auto *meta = segment->meta();
+    std::memcpy(segment->data(), IndexVersion::Details(), size);
+    meta->data_crc = ailego::Crc32c::Hash(segment->data(), size, 0);
+    meta->padding_size -= size;
+    meta->data_size = size;
     segment->set_dirty();
-    set_as_dirty();
-    meta->data_crc = ailego::Crc32c::Hash(segment->data(), data_size, 0);
-    meta->data_size = data_size;
-    meta->padding_size = capacity - data_size;
-    return 0;
-  }
-
-  //! Initialize index file
-  int init_index(const std::string &path) {
-    int error_code = mapping_.create(path, segment_meta_capacity_);
-    if (error_code != 0) {
-      return error_code;
-    }
-
-    // Add index version
-    error_code = this->init_version_segment();
-    if (error_code != 0) {
-      return error_code;
-    }
-
-    // Refresh mapping
-    this->refresh_index(0);
-
-    // Close mapping
-    mapping_.close();
-    return 0;
+    mapping.refresh(0);
+    return mapping.flush();
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   bool is_huge_page() const override {
