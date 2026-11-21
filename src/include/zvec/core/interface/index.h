@@ -165,6 +165,7 @@ class ZVEC_CORE_API Index {
 
   bool is_dirty() const;
 
+  //! Returns UINT32_MAX when the document count is unavailable.
   uint32_t get_doc_count() const;
 
   core::IndexStreamer::Pointer index_searcher();

@@ -58,6 +58,14 @@
 #pragma GCC diagnostic ignored "-Wunused-result"
 #endif
 
+namespace zvec::ailego {
+struct VecBufferPoolTestPeer {
+  static void quarantine_writeback(VecBufferPool &pool) {
+    pool.writeback_error_.store(VecBufferPool::kWritebackQuarantined);
+  }
+};
+}  // namespace zvec::ailego
+
 using namespace zvec::core_interface;
 
 namespace {
@@ -81,6 +89,12 @@ class TestableIVFIndex : public IVFIndex {
 
 class TestableHNSWIndex : public HNSWIndex {
  public:
+  using Index::init;
+
+  zvec::ailego::VecBufferPool::Pointer buffer_pool() const {
+    return storage_->vec_buffer_pool();
+  }
+
   int get_coarse_search_topk(const BaseIndexQueryParam::Pointer &param) {
     return _get_coarse_search_topk(param);
   }
@@ -135,6 +149,62 @@ class CountingHNSWIndex : public HNSWIndex {
 };
 
 }  // namespace
+
+TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
+  using namespace zvec;
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  const size_t saved_capacity = budget.capacity();
+  ASSERT_EQ(0, budget.init(64UL << 20));
+  const auto restore_budget =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, budget.init(saved_capacity)); });
+
+  const std::string path = "hnsw_failed_rollback.index";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  // The terminal write failure prevents a normal close. Keep its cached
+  // interface context on a worker so thread exit drops all remaining pins.
+  std::thread worker([&] {
+    constexpr uint32_t kDim = 16;
+    const auto param = HNSWIndexParamBuilder()
+                           .with_dimension(kDim)
+                           .with_metric_type(MetricType::kL2sq)
+                           .with_data_type(DataType::DT_FP32)
+                           .build();
+    TestableHNSWIndex index;
+    ASSERT_EQ(0, index.init(*param));
+    ASSERT_EQ(0,
+              index.open(path, {StorageOptions::StorageType::kBufferPool, true}));
+    auto pool = index.buffer_pool();
+    ASSERT_NE(nullptr, pool);
+    auto streamer = index.index_searcher();
+    auto context = streamer->create_context();
+    ASSERT_NE(nullptr, context);
+
+    std::array<float, kDim> vector{};
+    core::IndexQueryMeta meta(core::IndexMeta::DT_FP32, kDim);
+    ASSERT_EQ(0, streamer->add_with_id_impl(0, vector.data(), meta, context));
+    vector.fill(1.0f);
+    ASSERT_EQ(0, streamer->add_with_id_impl(1, vector.data(), meta, context));
+    ASSERT_EQ(2u, index.get_doc_count());
+
+    // Fail while searching for neighbors, after the overwrite has saved
+    // node 1's previous bytes. The quarantined pool also refuses restoration.
+    bool injected = false;
+    context->set_filter([&](uint64_t) -> bool {
+      injected = true;
+      ailego::VecBufferPoolTestPeer::quarantine_writeback(*pool);
+      throw std::bad_alloc();
+    });
+    vector.fill(2.0f);
+    ASSERT_EQ(core::IndexError_WriteData,
+              streamer->add_with_id_impl(1, vector.data(), meta, context));
+    ASSERT_TRUE(injected);
+    ASSERT_EQ(nullptr, index.create_index_provider());
+    EXPECT_EQ(std::numeric_limits<uint32_t>::max(), index.get_doc_count());
+  });
+  worker.join();
+}
 
 TEST(IndexInterface, GraphRefineKeepsLegacyDefaultCandidateCount) {
   constexpr uint32_t kTopk = 10;

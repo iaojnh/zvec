@@ -494,6 +494,11 @@ class HnswContext : public IndexContext {
     return group_topk_heaps_;
   }
 
+  void clear_insert_heaps() noexcept {
+    for (auto &heap : level_topks_) heap.clear();
+    update_heap_.clear();
+  }
+
   inline TopkHeap &level_topk(int level) {
     if (ailego_unlikely(level_topks_.size() <= static_cast<size_t>(level))) {
       int cur_level = level_topks_.size();

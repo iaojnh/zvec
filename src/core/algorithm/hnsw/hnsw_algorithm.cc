@@ -20,6 +20,8 @@ namespace core {
 template <typename EntityType>
 int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
                                         HnswContext *ctx) {
+  const auto clear_heaps =
+      ailego::ScopeGuard::Make([ctx] { ctx->clear_insert_heaps(); });
   spin_lock_.lock();
 
   auto cur_max_level = entity_.cur_max_level();
@@ -63,7 +65,6 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
   for (cur_level = 0; cur_level <= level; ++cur_level) {
     const int ret =
         add_neighbors(id, cur_level, ctx->level_topk(cur_level), ctx);
-    ctx->level_topk(cur_level).clear();
     if (ailego_unlikely(ret != 0)) return ret;
   }
 

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <future>
 #include <string>
 #include <type_traits>
@@ -288,6 +289,105 @@ TEST_F(HnswStreamerTest, FailedInsertRestoresReverseEdgesAndKey) {
   EXPECT_EQ(2u, first[1]);
   EXPECT_EQ(0u, entity.get_neighbors(1, 2).size());
   ASSERT_EQ(0, entity.close());
+}
+
+TEST_F(HnswStreamerTest, RetriedInsertUsesFreshNeighborsAtEveryLevel) {
+  class FailReverseLinkEntity : public HnswBufferPoolStreamerEntity {
+   public:
+    using HnswBufferPoolStreamerEntity::HnswBufferPoolStreamerEntity;
+
+    int add_neighbor(level_t level, node_id_t id, uint32_t size,
+                     node_id_t neighbor) override {
+      if (level == 0 && writes_until_failure && --writes_until_failure == 0) {
+        return IndexError_NoMemory;
+      }
+      return HnswBufferPoolStreamerEntity::add_neighbor(level, id, size,
+                                                       neighbor);
+    }
+
+    uint32_t writes_until_failure{0};
+  };
+
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  ASSERT_EQ(0, storage->open(dir_ + "RetryNeighbors", true));
+
+  IndexStreamer::Stats stats;
+  FailReverseLinkEntity entity(stats);
+  entity.set_vector_size(dim * sizeof(float));
+  entity.set_l0_neighbor_cnt(8);
+  entity.set_upper_neighbor_cnt(8);
+  entity.set_prune_cnt(8);
+  entity.set_ef_construction(8);
+  entity.set_scaling_factor(5);
+  ASSERT_EQ(0, entity.init(8));
+  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+
+  constexpr node_id_t kNewId = 3;
+  NumericalVector<float> vector(dim);
+  for (node_id_t id = 0; id < kNewId; ++id) {
+    std::fill_n(vector.data(), dim, static_cast<float>(id));
+    node_id_t inserted;
+    ASSERT_EQ(0, entity.add_vector(1, 100 + id, vector.data(), &inserted));
+    ASSERT_EQ(id, inserted);
+  }
+  for (level_t level : {0, 1}) {
+    for (node_id_t id = 0; id < kNewId; ++id) {
+      std::vector<std::pair<node_id_t, dist_t>> neighbors;
+      for (node_id_t other = 0; other < kNewId; ++other) {
+        if (other != id) neighbors.emplace_back(other, 0.0f);
+      }
+      ASSERT_EQ(0, entity.update_neighbors(level, id, neighbors));
+    }
+  }
+  entity.update_ep_and_level(0, 1);
+
+  auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
+  ASSERT_NE(nullptr, metric);
+  ASSERT_EQ(0, metric->init(*index_meta_ptr_, Params()));
+  HnswContext context(dim, metric, entity.clone());
+  context.set_min_scan_limit(8);
+  context.set_max_scan_limit(8);
+  ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
+  HnswAlgorithm<HnswBufferPoolStreamerEntity> algorithm(entity);
+  std::fill_n(vector.data(), dim, 1.25f);
+  const auto insert = [&] {
+    context.clear();
+    context.reset_query(vector.data(), *index_meta_ptr_);
+    return entity.insert_buffered(
+        1, 100 + kNewId, vector.data(), false,
+        [&](node_id_t id) { return algorithm.add_node(id, 1, &context); });
+  };
+
+  // Fail the second level-0 reverse write, after the first one changed the
+  // graph and both construction heaps were populated.
+  entity.writes_until_failure = 2;
+  ASSERT_EQ(IndexError_NoMemory, insert());
+  EXPECT_EQ(kNewId, entity.doc_cnt());
+  for (level_t level : {0, 1}) {
+    for (node_id_t id = 0; id < kNewId; ++id) {
+      SCOPED_TRACE(id);
+      const auto edges = entity.get_neighbors(level, id);
+      ASSERT_EQ(2u, edges.size());
+      for (size_t i = 0; i < edges.size(); ++i) {
+        EXPECT_LT(edges[i], kNewId);
+      }
+    }
+  }
+
+  ASSERT_EQ(0, insert());
+  EXPECT_EQ(kNewId + 1, entity.doc_cnt());
+  for (level_t level : {0, 1}) {
+    SCOPED_TRACE(level);
+    const auto edges = entity.get_neighbors(level, kNewId);
+    std::vector<node_id_t> actual;
+    for (size_t i = 0; i < edges.size(); ++i) actual.push_back(edges[i]);
+    std::sort(actual.begin(), actual.end());
+    EXPECT_EQ((std::vector<node_id_t>{0, 1, 2}), actual);
+  }
+  EXPECT_EQ(0, entity.close());
 }
 
 TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {

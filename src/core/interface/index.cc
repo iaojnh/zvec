@@ -288,13 +288,14 @@ bool Index::is_trained() const {
 
 uint32_t Index::get_doc_count() const {
   if (pending_quantizer_training_) return 0;
-  if (streamer_ == nullptr) {
-    return -1;
-  }
+  constexpr auto unavailable = std::numeric_limits<uint32_t>::max();
+  if (!streamer_) return unavailable;
   if (is_sparse_) {
-    return streamer_->create_sparse_provider()->count();
+    const auto provider = streamer_->create_sparse_provider();
+    return provider ? provider->count() : unavailable;
   }
-  return streamer_->create_provider()->count();
+  const auto provider = streamer_->create_provider();
+  return provider ? provider->count() : unavailable;
 }
 
 core::IndexStreamer::Pointer Index::index_searcher() {
