@@ -184,6 +184,105 @@ TEST_F(HnswStreamerTest, ShortAppendKeepsNodeOffsetForRetry) {
   EXPECT_EQ(vector, actual);
 }
 
+TEST_F(HnswStreamerTest, FailedFirstInsertLeavesAnOpenableEmptyIndex) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  const auto path = dir_ + "EmptyRollback";
+  ASSERT_EQ(0, storage->open(path, true));
+
+  const auto init_entity = [](HnswBufferPoolStreamerEntity &entity) {
+    entity.set_vector_size(1024);
+    entity.set_l0_neighbor_cnt(4);
+    entity.set_upper_neighbor_cnt(4);
+    entity.set_scaling_factor(5);
+    return entity.init(8);
+  };
+  IndexStreamer::Stats stats;
+  const std::vector<char> vector(1024, 'a');
+  {
+    HnswBufferPoolStreamerEntity entity(stats);
+    ASSERT_EQ(0, init_entity(entity));
+    ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+    ASSERT_EQ(
+        IndexError_NoMemory,
+        entity.insert_buffered(0, 100, vector.data(), false,
+                               [](node_id_t) { return IndexError_NoMemory; }));
+    auto nodes = storage->get(
+        ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_NODE, 0));
+    ASSERT_TRUE(nodes);
+    EXPECT_EQ(0u, nodes->data_size());
+    ASSERT_EQ(0, entity.close());
+  }
+  ASSERT_EQ(0, storage->close());
+  ASSERT_EQ(0, storage->open(path, IndexStorage::OpenOptions{false, false}));
+
+  HnswBufferPoolStreamerEntity reopened(stats);
+  ASSERT_EQ(0, init_entity(reopened));
+  ASSERT_EQ(0, reopened.open(storage, 8UL << 20, false));
+  EXPECT_EQ(0u, reopened.doc_cnt());
+  EXPECT_EQ(kInvalidNodeId, reopened.entry_point());
+  ASSERT_EQ(0, reopened.insert_buffered(0, 100, vector.data(), false,
+                                        [&](node_id_t id) {
+                                          reopened.update_ep_and_level(id, 0);
+                                          return 0;
+                                        }));
+  EXPECT_EQ(0u, reopened.entry_point());
+  EXPECT_EQ(1u, reopened.doc_cnt());
+  ASSERT_EQ(0, reopened.close());
+  ASSERT_EQ(0, storage->close());
+}
+
+TEST_F(HnswStreamerTest, BufferedInsertStreamsVectorWithLimitedCache) {
+  constexpr size_t vector_bytes = 65536 * sizeof(float);
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  const auto path = dir_ + "WideBufferedInsert";
+  ASSERT_EQ(0, storage->open(path, true));
+
+  IndexStreamer::Stats stats;
+  HnswBufferPoolStreamerEntity entity(stats);
+  entity.set_vector_size(vector_bytes);
+  entity.set_chunk_size(512UL << 10);
+  entity.set_l0_neighbor_cnt(4);
+  entity.set_upper_neighbor_cnt(4);
+  entity.set_scaling_factor(5);
+  ASSERT_EQ(0, entity.init(8));
+  ASSERT_EQ(0, entity.open(storage, 32UL << 20, false));
+  ASSERT_EQ(0, storage->flush());
+
+  const std::vector<char> vector(vector_bytes, 'b');
+  {
+    auto &pool = MemoryLimitPool::get_instance();
+    const size_t headroom = (64UL << 10) + 6 * kVectorPageSize;
+    ASSERT_LT(headroom, vector_bytes);
+    const size_t available = pool.available();
+    ASSERT_GT(available, headroom);
+    const size_t held = available - headroom;
+    ASSERT_TRUE(pool.try_charge_external(held));
+    const auto release = ScopeGuard::Make([&] { pool.release_external(held); });
+    ASSERT_EQ(0, entity.insert_buffered(0, 100, vector.data(), false,
+                                        [&](node_id_t id) {
+                                          entity.update_ep_and_level(id, 0);
+                                          return 0;
+                                        }));
+    EXPECT_EQ(1u, entity.doc_cnt());
+  }
+  ASSERT_EQ(0, entity.close());
+  ASSERT_EQ(0, storage->close());
+  ASSERT_EQ(0, storage->open(path, false));
+  auto nodes = storage->get(
+      ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_NODE, 0));
+  ASSERT_TRUE(nodes);
+  std::vector<char> actual(vector_bytes);
+  ASSERT_EQ(vector_bytes, nodes->fetch(0, actual.data(), actual.size()));
+  EXPECT_EQ(vector, actual);
+  ASSERT_EQ(0, storage->close());
+}
+
 TEST_F(HnswStreamerTest, FailedInsertRestoresReverseEdgesAndKey) {
   ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
   auto storage = IndexFactory::CreateStorage("BufferStorage");

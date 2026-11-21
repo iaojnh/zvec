@@ -60,9 +60,9 @@ void HnswStreamerEntity::remember_size(Chunk &chunk) {
   }
 }
 
-int HnswStreamerEntity::write_with_undo(Chunk &chunk,
-                                        const IndexStorage::SegmentData *writes,
-                                        size_t count, void *mirror) {
+int HnswStreamerEntity::capture_write_undo(
+    Chunk &chunk, const IndexStorage::SegmentData *writes, size_t count,
+    void *mirror) {
   if (insert_undo_) {
     const auto &sizes = insert_undo_->sizes;
     const auto known = std::find_if(
@@ -91,6 +91,14 @@ int HnswStreamerEntity::write_with_undo(Chunk &chunk,
     }
     captured = true;
   }
+  return 0;
+}
+
+int HnswStreamerEntity::write_with_undo(Chunk &chunk,
+                                        const IndexStorage::SegmentData *writes,
+                                        size_t count, void *mirror) {
+  const int ret = capture_write_undo(chunk, writes, count, mirror);
+  if (ret != 0) return ret;
   return chunk.write_batch(writes, count) ? 0 : chunk.write_error();
 }
 
@@ -617,11 +625,17 @@ int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   node_chunks_.resize(broker_->get_chunk_cnt(ChunkBroker::CHUNK_TYPE_NODE));
   node_chunk_bases_ = std::make_shared<std::vector<const uint8_t *>>(
       node_chunks_.size(), nullptr);
+  const bool has_entry_point = entry_point() != kInvalidNodeId;
   for (auto seq = 0UL; seq < node_chunks_.size(); ++seq) {
     node_chunks_[seq] = broker_->get_chunk(ChunkBroker::CHUNK_TYPE_NODE, seq);
     if (!node_chunks_[seq]) {
       LOG_ERROR("Missing hnsw streamer data chunk %zu th of %zu", seq,
                 node_chunks_.size());
+      return IndexError_InvalidFormat;
+    }
+    // A failed first insertion can leave an allocated but empty node chunk.
+    if (!has_entry_point && node_chunks_[seq]->data_size() != 0) {
+      LOG_WARN("HNSW index has node data without an entry point");
       return IndexError_InvalidFormat;
     }
     (*node_chunk_bases_)[seq] = node_chunks_[seq]->base_data();
@@ -865,12 +879,6 @@ int HnswStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
              hd->doc_cnt());
     return IndexError_InvalidFormat;
   }
-  if (hd->entry_point() == kInvalidNodeId &&
-      broker_->get_chunk_cnt(ChunkBroker::CHUNK_TYPE_NODE) > 0) {
-    LOG_WARN("The index is broken, maybe it haven't flush");
-    return IndexError_InvalidFormat;
-  }
-
   return 0;
 }
 
@@ -884,7 +892,21 @@ int HnswStreamerEntity::write_node_data(Chunk &chunk, size_t offset,
         {offset + vector_size(), sizeof(key), &key},
         {offset + vector_size() + sizeof(key), sizeof(zero), &zero},
     };
-    return write_with_undo(chunk, writes, append ? 3 : 2);
+    const size_t count = append ? 3 : 2;
+    const size_t page_offset =
+        (chunk.data_offset() + offset) % ailego::kVectorPageSize;
+    if (vector_size() <= ailego::kVectorPageSize - page_offset) {
+      return write_with_undo(chunk, writes, count);
+    }
+
+    // A cross-page vector can be streamed with one cache pin at a time.
+    // Capture the original record first and keep the key and count ordered.
+    const int ret = capture_write_undo(chunk, writes, count);
+    if (ret != 0) return ret;
+    if (chunk.write(offset, vec, vector_size()) != vector_size()) {
+      return chunk.write_error();
+    }
+    return chunk.write_batch(writes + 1, count - 1) ? 0 : chunk.write_error();
   }
   if (chunk.write(offset, vec, vector_size()) != vector_size() ||
       chunk.write(offset + vector_size(), &key, sizeof(key)) != sizeof(key)) {

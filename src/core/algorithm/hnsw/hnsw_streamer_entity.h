@@ -412,6 +412,8 @@ class HnswStreamerEntity : public HnswEntity {
 
   struct InsertUndo;
   void remember_size(Chunk &chunk);
+  int capture_write_undo(Chunk &chunk, const IndexStorage::SegmentData *writes,
+                         size_t count, void *mirror = nullptr);
   int write_with_undo(Chunk &chunk, const IndexStorage::SegmentData *writes,
                       size_t count, void *mirror = nullptr);
 
