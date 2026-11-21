@@ -214,15 +214,15 @@ int DiskAnnSearcher::update_context(DiskAnnContext *ctx) const {
 }
 
 int DiskAnnSearcher::ensure_compatible_context(ContextPointer &context,
-                                               DiskAnnContext *&ctx) const {
+                                               DiskAnnContext *&ctx) const try {
   if (ctx->magic() == magic_) {
     return 0;
   }
 
-  auto replacement = create_context();
-  if (!replacement) {
-    LOG_ERROR("Failed to recreate context for current searcher");
-    return IndexError_Runtime;
+  ContextPointer replacement;
+  const int ret = create_search_context(replacement);
+  if (ret != 0) {
+    return ret == IndexError_NoMemory ? ret : IndexError_Runtime;
   }
   auto *replacement_ctx = dynamic_cast<DiskAnnContext *>(replacement.get());
   if (!replacement_ctx) {
@@ -233,6 +233,8 @@ int DiskAnnSearcher::ensure_compatible_context(ContextPointer &context,
   context = std::move(replacement);
   ctx = replacement_ctx;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
@@ -464,36 +466,36 @@ int DiskAnnSearcher::get_vector(uint64_t key, Context::Pointer &context,
 }
 
 IndexSearcher::Context::Pointer DiskAnnSearcher::create_context() const {
+  ContextPointer context;
+  create_search_context(context);
+  return context;
+}
+
+int DiskAnnSearcher::create_search_context(ContextPointer &context) const try {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Load DiskAnnSearcher before creating a context");
-    return Context::Pointer();
+    return IndexError_NoReady;
   }
-  const DiskAnnEntity::Pointer search_ctx_entity = entity_.clone();
-  if (!search_ctx_entity) {
+  const auto entity = entity_.clone();
+  if (!entity) {
     LOG_ERROR("Failed to create search context entity");
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
 
-  DiskAnnContext *ctx = new (std::nothrow)
-      DiskAnnContext(meta_, measure_, search_ctx_entity, data_quantizer_);
-  if (ctx == nullptr) {
-    LOG_ERROR("Failed to allocate DiskAnn Context");
-    return Context::Pointer();
-  }
-  if (ailego_unlikely(ctx->init(
-          DiskAnnContext::kSearcherContext, search_ctx_entity->max_degree(),
-          search_ctx_entity->pq_chunk_num(), meta_.element_size(),
-          diskann_indexer_->requires_io_context())) != 0) {
-    LOG_ERROR("Init DiskAnn Context failed");
-    delete ctx;
+  auto candidate = std::make_unique<DiskAnnContext>(meta_, measure_, entity,
+                                                    data_quantizer_);
+  const int ret =
+      candidate->init(DiskAnnContext::kSearcherContext, entity->max_degree(),
+                      entity->pq_chunk_num(), meta_.element_size(),
+                      diskann_indexer_->requires_io_context());
+  if (ret != 0) return ret;
 
-    return Context::Pointer();
-  }
-
-  ctx->set_list_size(list_size_);
-  ctx->set_magic(magic_);
-
-  return Context::Pointer(ctx);
+  candidate->set_list_size(list_size_);
+  candidate->set_magic(magic_);
+  context = std::move(candidate);
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 INDEX_FACTORY_REGISTER_SEARCHER(DiskAnnSearcher);
