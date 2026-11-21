@@ -35,6 +35,25 @@ class HnswContext : public IndexContext {
     kStreamerContext = 3
   };
 
+  //! Scratch for filtered level-0 mmap queries. Only the storage is reused:
+  //! every active entry is overwritten before use, including after an index
+  //! switch. Raw vector pointers do not pin pages or own mapped records.
+  struct FilteredMmapSearchScratch {
+    void ensure_size(size_t size, bool has_extra_values) {
+      if (neighbor_ids.size() < size) neighbor_ids.resize(size);
+      if (dists.size() < size) dists.resize(size);
+      if (neighbor_vecs.size() < size) neighbor_vecs.resize(size);
+      if (has_extra_values && neighbor_extra_values.size() < size) {
+        neighbor_extra_values.resize(size);
+      }
+    }
+
+    std::vector<node_id_t> neighbor_ids;
+    std::vector<dist_t> dists;
+    std::vector<const void *> neighbor_vecs;
+    std::vector<const void *> neighbor_extra_values;
+  };
+
   //! Construct
   HnswContext(size_t dimension, const IndexMetric::Pointer &metric,
               const HnswEntity::Pointer &entity);
@@ -405,6 +424,10 @@ class HnswContext : public IndexContext {
     return candidates_;
   }
 
+  inline FilteredMmapSearchScratch &filtered_mmap_search_scratch() {
+    return filtered_mmap_search_scratch_;
+  }
+
   inline void set_max_scan_num(uint32_t max_scan_num) {
     max_scan_num_ = max_scan_num;
   }
@@ -688,6 +711,7 @@ class HnswContext : public IndexContext {
   std::vector<TopkHeap> level_topks_{};
   CandidateHeap candidates_{};
   VisitFilter visit_filter_{};
+  FilteredMmapSearchScratch filtered_mmap_search_scratch_{};
   uint32_t bruteforce_threshold_{};
   bool fetch_vector_{false};
 
