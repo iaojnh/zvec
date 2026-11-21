@@ -235,7 +235,7 @@ TEST_F(HnswStreamerTest, FailedFirstInsertLeavesAnOpenableEmptyIndex) {
 }
 
 TEST_F(HnswStreamerTest, BufferedWideVectorWriteAndRollbackWithLimitedCache) {
-  constexpr size_t vector_bytes = 65536 * sizeof(float);
+  static constexpr size_t vector_bytes = 65536 * sizeof(float);
   ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
   auto storage = IndexFactory::CreateStorage("BufferStorage");
   ASSERT_TRUE(storage);
