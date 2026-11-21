@@ -1221,13 +1221,14 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
 
   auto add_result = [&](diskann_id_t id, float distance, const void *coords) {
     if (!ctx->group_by_search() && distance > ctx->threshold()) return;
-    if (topk_heap.full() && !(distance < topk_heap.front().second.dist_)) return;
+    if (topk_heap.full() && !(distance < topk_heap.front().second.dist_))
+      return;
     using Payload = IndexDocument::VectorPayload;
     std::shared_ptr<const Payload> vector;
     if (ctx->fetch_vector()) {
       vector = std::allocate_shared<Payload>(
-          ailego::BudgetedAllocator<Payload, true>{}, coords, meta_.element_size(),
-          /*process_rss=*/true);
+          ailego::BudgetedAllocator<Payload, true>{}, coords,
+          meta_.element_size());
     }
     topk_heap.emplace(id, VectorInfo(distance, std::move(vector)));
   };
@@ -1293,7 +1294,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
   ailego::ProcessRssVector<diskann_id_t> frontier;
   frontier.reserve(effective_beam_width);
 
-  ailego::ProcessRssVector<std::pair<diskann_id_t, uint8_t *>> frontier_neighbors;
+  ailego::ProcessRssVector<std::pair<diskann_id_t, uint8_t *>>
+      frontier_neighbors;
   frontier_neighbors.reserve(effective_beam_width);
 
   ailego::ProcessRssVector<std::tuple<diskann_id_t, uint32_t, diskann_id_t *>>
@@ -1305,8 +1307,8 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
   ailego::ProcessRssReservation io_memory;
   std::vector<AlignedRead> frontier_read_reqs;
   std::vector<uint32_t> completed;
-  const size_t io_bytes = effective_beam_width *
-                          (sizeof(AlignedRead) + sizeof(uint32_t));
+  const size_t io_bytes =
+      effective_beam_width * (sizeof(AlignedRead) + sizeof(uint32_t));
   io_memory.allocate(io_bytes, [&] {
     frontier_read_reqs.reserve(effective_beam_width);
     completed.reserve(effective_beam_width);

@@ -844,10 +844,21 @@ int Index::search(const VectorData &vector_data,
     return ret;
   }
 
+  // DiskANN owns fetched and decoded vectors. Publish them with their
+  // documents only after the whole query succeeds.
+  SearchResult pending;
+  auto *const output = result;
+  if (param_.index_type == IndexType::kDiskAnn) result = &pending;
+
   // dense supports refiner, but sparse doesn't
   int ret = 0;
   if (search_param->refiner_param == nullptr) {
-    ret = _dense_search(vector_data, search_param, result, context);
+    try {
+      ret = _dense_search(vector_data, search_param, result, context);
+    } catch (const std::bad_alloc &) {
+      if (result == output) throw;
+      ret = core::IndexError_NoMemory;
+    }
   } else {
     auto &reference_index = search_param->refiner_param->reference_index;
     if (reference_index == nullptr) {
@@ -909,6 +920,7 @@ int Index::search(const VectorData &vector_data,
   if (context) {
     context->reset();
   }
+  if (ret == 0 && result != output) *output = std::move(pending);
   return ret;
 }
 
@@ -1105,7 +1117,12 @@ int Index::_prepare_dense_query(const VectorData &vector_data,
     size_t bytes = std::max<size_t>(input_vector_meta_.element_size(),
                                     streamer_vector_meta_.element_size());
     if (turbo_quantizer_) {
-      bytes = std::max(bytes, turbo_quantizer_->quantized_query_vector_length());
+      bytes =
+          std::max(bytes, turbo_quantizer_->quantized_query_vector_length());
+    } else if (input_vector_meta_.data_type() == DataType::DT_FP32 &&
+               proxima_index_meta_.reformer_name() == "HalfFloatReformer") {
+      // The reformer writes directly to the FP16 output.
+      bytes = streamer_vector_meta_.element_size();
     }
     const int ret = reserve_rss_string(query_memory, *query_storage, bytes);
     if (ret != 0) return ret;
@@ -1247,8 +1264,7 @@ int Index::_collect_dense_result(
     // RSS after this operation. Admit their in-flight backing independently
     // of the storage page budget before publishing any result.
     try {
-      reverted_memory.add_array(context->result().size(),
-                                2 * bytes + overhead);
+      reverted_memory.add_array(context->result().size(), 2 * bytes + overhead);
     } catch (const std::bad_alloc &) {
       return core::IndexError_NoMemory;
     }

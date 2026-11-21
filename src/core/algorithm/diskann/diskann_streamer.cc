@@ -493,8 +493,9 @@ int DiskAnnStreamer::get_vector_by_id(const uint32_t id,
     using Payload = IndexDocument::VectorPayload;
     auto owner = std::allocate_shared<Payload>(
         ailego::BudgetedAllocator<Payload, true>{}, fetch_vector_buffer_.data(),
-        fetch_vector_buffer_.size(), /*process_rss=*/true);
-    block = IndexStorage::MemoryBlock::MakeSharedView(owner->data.data(), owner);
+        fetch_vector_buffer_.size());
+    block =
+        IndexStorage::MemoryBlock::MakeSharedView(owner->data.data(), owner);
     return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;

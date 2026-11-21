@@ -391,7 +391,6 @@ class DiskAnnContext : public IndexContext,
   bool debug_mode_{false};
   uint32_t pq_chunk_num_{0};
   uint32_t element_size_{0};
-  uint32_t element_rotated_size_{0};
   uint32_t list_size_{0};
 
   TopkHeap topk_heap_{};
