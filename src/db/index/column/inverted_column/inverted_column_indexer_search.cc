@@ -13,6 +13,8 @@
 // limitations under the License.
 
 
+#include <algorithm>
+#include <cstring>
 #include <optional>
 #include <ailego/pattern/defer.h>
 #include <zvec/ailego/pattern/expected.hpp>
@@ -21,6 +23,185 @@
 
 
 namespace zvec {
+
+
+void InvertedColumnIndexer::initialize_range_cache() const {
+  std::call_once(range_cache_once_, [&]() {
+    // Bound retained bitmap payload plus per-container and range metadata.
+    // Large indexes or unusual range layouts retain the existing search path.
+    constexpr size_t kMaxBytes = 32 * 1024 * 1024;
+    constexpr size_t kStride = 64;
+    constexpr size_t kMaxRanges = 4096;
+    if ((uint64_t(max_id_) / 65536 + 1) * (8192 + 64) > kMaxBytes) {
+      return;
+    }
+    auto cache = std::make_shared<RangeCache>();
+    std::unique_ptr<rocksdb::Iterator> iter(
+        ctx_.db_->NewIterator(ctx_.read_opts_, cf_ranges_));
+    std::unique_ptr<roaring_bitmap_t, decltype(&roaring_bitmap_free)> prefix(
+        roaring_bitmap_create(), roaring_bitmap_free);
+    if (!prefix) {
+      return;
+    }
+    size_t bytes = 0;
+    uint64_t expected_count = 0;
+    auto save_checkpoint = [&]() {
+      roaring_bitmap_repair_after_lazy(prefix.get());
+      // Subtracting complete ranges is valid only when their document sets
+      // are disjoint. Fall back if a malformed or multiply indexed scalar
+      // column contains the same document in different ranges.
+      if (roaring_bitmap_get_cardinality(prefix.get()) != expected_count) {
+        return false;
+      }
+      roaring_statistics_t stats;
+      roaring_bitmap_statistics(prefix.get(), &stats);
+      bytes += roaring_bitmap_size_in_bytes(prefix.get()) +
+               size_t(stats.n_containers) * 64 + sizeof(RangeCache::Checkpoint);
+      if (bytes > kMaxBytes) {
+        return false;
+      }
+      auto *copy = roaring_bitmap_copy(prefix.get());
+      if (!copy) {
+        return false;
+      }
+      cache->checkpoints.push_back(
+          {cache->ranges.size(), std::shared_ptr<const roaring_bitmap_t>(
+                                     copy, [](const roaring_bitmap_t *p) {
+                                       roaring_bitmap_free(
+                                           const_cast<roaring_bitmap_t *>(p));
+                                     })});
+      return true;
+    };
+    if (!save_checkpoint()) {
+      return;
+    }
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      const auto key = iter->key();
+      if (cache->ranges.size() == kMaxRanges || key.size() < 9) {
+        return;
+      }
+      uint64_t begin_size;
+      std::memcpy(&begin_size, key.data() + key.size() - 8, 8);
+      if (begin_size > key.size() - 9) {
+        return;
+      }
+      RangeCache::Range range{key.ToString(),
+                              std::string(key.data(), begin_size),
+                              std::string(key.data() + begin_size + 1,
+                                          key.size() - begin_size - 9)};
+      if (range.begin > range.end ||
+          (!cache->ranges.empty() && cache->ranges.back().end >= range.begin)) {
+        return;
+      }
+      bytes += 2 * (range.key.size() + range.begin.size() + range.end.size() +
+                    sizeof(RangeCache::Range));
+      if (bytes > kMaxBytes) {
+        return;
+      }
+      roaring_bitmap_t *part = nullptr;
+      if (!InvertedIndexCodec::Deserialize(iter->value().data(),
+                                           iter->value().size(), &part)
+               .ok()) {
+        return;
+      }
+      expected_count += roaring_bitmap_get_cardinality(part);
+      roaring_bitmap_lazy_or_inplace(prefix.get(), part, true);
+      roaring_bitmap_free(part);
+      cache->ranges.emplace_back(std::move(range));
+      if (cache->ranges.size() % kStride == 0 && !save_checkpoint()) {
+        return;
+      }
+    }
+    if (!iter->status().ok() || cache->ranges.empty()) {
+      return;
+    }
+    if (cache->checkpoints.back().count != cache->ranges.size() &&
+        !save_checkpoint()) {
+      return;
+    }
+    range_cache_ = std::move(cache);
+  });
+}
+
+
+Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_lt_cached(
+    const std::string &term, bool include_eq) const {
+  const auto &cache = *range_cache_;
+  // Only complete ranges are covered by a checkpoint. The boundary range is
+  // still evaluated using its original term postings, including < versus <=.
+  auto boundary = std::partition_point(
+      cache.ranges.begin(), cache.ranges.end(),
+      [&](const RangeCache::Range &r) {
+        return cmp_lt(r.end.data(), r.end.size(), term.data(), term.size(),
+                      include_eq);
+      });
+  const size_t count = boundary - cache.ranges.begin();
+  auto checkpoint = std::lower_bound(
+      cache.checkpoints.begin(), cache.checkpoints.end(), count,
+      [](const RangeCache::Checkpoint &p, size_t n) { return p.count < n; });
+  if (checkpoint != cache.checkpoints.begin() &&
+      (checkpoint == cache.checkpoints.end() ||
+       count - (checkpoint - 1)->count <= checkpoint->count - count)) {
+    --checkpoint;
+  }
+  std::unique_ptr<roaring_bitmap_t, decltype(&roaring_bitmap_free)> bitmap(
+      roaring_bitmap_copy(checkpoint->bitmap.get()), roaring_bitmap_free);
+  if (!bitmap) {
+    return tl::make_unexpected(Status::InternalError());
+  }
+  std::unique_ptr<rocksdb::Iterator> iter(
+      ctx_.db_->NewIterator(ctx_.read_opts_, cf_ranges_));
+  const size_t first = std::min(count, checkpoint->count);
+  const size_t last = std::max(count, checkpoint->count);
+  if (first < last) {
+    iter->Seek(cache.ranges[first].key);
+  }
+  for (size_t i = first; i < last; ++i, iter->Next()) {
+    if (!iter->Valid() || iter->key() != cache.ranges[i].key) {
+      return tl::make_unexpected(Status::InternalError());
+    }
+    if (checkpoint->count <= count) {
+      auto s = InvertedIndexCodec::merge_or(
+          iter->value().data(), iter->value().size(), true, bitmap.get());
+      if (!s.ok()) {
+        return tl::make_unexpected(s);
+      }
+    } else {
+      // Scalar ranges are disjoint. Removing complete ranges from the next
+      // checkpoint gives the same prefix as adding them to the previous one.
+      roaring_bitmap_t *remove = nullptr;
+      auto s = InvertedIndexCodec::Deserialize(iter->value().data(),
+                                               iter->value().size(), &remove);
+      if (!s.ok()) {
+        return tl::make_unexpected(s);
+      }
+      roaring_bitmap_andnot_inplace(bitmap.get(), remove);
+      roaring_bitmap_free(remove);
+    }
+  }
+  if (!iter->status().ok()) {
+    return tl::make_unexpected(Status::InternalError());
+  }
+  if (boundary != cache.ranges.end()) {
+    iter.reset(ctx_.db_->NewIterator(ctx_.read_opts_, cf_terms_));
+    for (iter->Seek(boundary->begin); iter->Valid(); iter->Next()) {
+      if (!cmp_lt(iter->key().data(), iter->key().size(), term.data(),
+                  term.size(), include_eq)) {
+        break;
+      }
+      auto s = InvertedIndexCodec::merge_or(
+          iter->value().data(), iter->value().size(), true, bitmap.get());
+      if (!s.ok()) {
+        return tl::make_unexpected(s);
+      }
+    }
+    if (!iter->status().ok()) {
+      return tl::make_unexpected(Status::InternalError());
+    }
+  }
+  roaring_bitmap_repair_after_lazy(bitmap.get());
+  return bitmap.release();
+}
 
 
 Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_eq(
@@ -224,6 +405,13 @@ Result<roaring_bitmap_t *> InvertedColumnIndexer::get_bitmap_lt(
                 term.c_str(), id().c_str());
     }
     return ret;
+  }
+
+  if (sealed_ && cf_ranges_) {
+    initialize_range_cache();
+    if (range_cache_) {
+      return get_bitmap_lt_cached(term, include_eq);
+    }
   }
 
   Status s = Status::OK();
