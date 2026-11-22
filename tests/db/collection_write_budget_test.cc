@@ -9,6 +9,7 @@
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <random>
 #include <string>
 #include <thread>
 #include <ailego/io/file_lock.h>
@@ -1022,9 +1023,15 @@ TEST_F(CollectionWriteBudgetTest, FailedColumnChangeKeepsPriorIndexAndSchema) {
   }
   original_rows->clear();
 
+  // A process can exit after building a checkpoint and before publishing its
+  // manifest. Recovery must not claim that stale path for the next attempt.
+  const auto interrupted_index =
+      FileHelper::MakeInvertIndexPath(collection_path, 0, 4);
+  ASSERT_TRUE(std::filesystem::create_directory(interrupted_index));
   const auto retried =
       recovered.value()->alter_column("value", "renamed", nullptr, {2});
   ASSERT_TRUE(retried.ok()) << retried.message();
+  EXPECT_FALSE(std::filesystem::exists(interrupted_index));
   ASSERT_TRUE(recovered.value()->close().ok());
   auto final = Collection::Open(collection_path, {true, false, kMiB});
   ASSERT_TRUE(final.has_value()) << final.error().message();
@@ -1034,6 +1041,58 @@ TEST_F(CollectionWriteBudgetTest, FailedColumnChangeKeepsPriorIndexAndSchema) {
     ASSERT_NE(nullptr, changed_rows->at(key));
     EXPECT_EQ(7, changed_rows->at(key)->get<int32_t>("renamed"));
   }
+}
+
+TEST_F(CollectionWriteBudgetTest, IteratorRetriesDecoderAfterAcceptedRows) {
+  const auto collection_path = path("iterator_decode_retry");
+  auto writer = Collection::CreateAndOpen(collection_path, schema(),
+                                          {false, false, 4 * kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  std::mt19937 random(201);
+  for (size_t start : {0u, 4u}) {
+    std::vector<Doc> rows(4);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      rows[i].set_pk("row" + std::to_string(start + i));
+      std::string payload(128 * 1024, 'x');
+      for (auto &ch : payload) ch = static_cast<char>('A' + random() % 26);
+      rows[i].set("payload", std::move(payload));
+    }
+    auto inserted = writer.value()->insert(rows);
+    ASSERT_TRUE(inserted.has_value()) << inserted.error().message();
+    for (const auto &status : *inserted)
+      ASSERT_TRUE(status.ok()) << status.message();
+    ASSERT_TRUE(writer.value()->flush().ok());
+  }
+  ASSERT_TRUE(writer.value()->close().ok());
+  auto reader = Collection::Open(collection_path, {true, false, 4 * kMiB});
+  ASSERT_TRUE(reader.has_value()) << reader.error().message();
+  auto iterator = reader.value()->create_iterator({});
+  ASSERT_TRUE(iterator.has_value()) << iterator.error().message();
+  for (size_t i = 0; i < 4; ++i) {
+    auto next = iterator.value()->next();
+    ASSERT_TRUE(next.has_value() && *next);
+    EXPECT_EQ("row" + std::to_string(i), (*next)->pk_ref());
+  }
+
+  auto &memory = ailego::MemoryLimitPool::get_instance();
+  {
+    size_t charge = memory.capacity() - 16 * 1024;
+    while (charge > kMiB && !memory.try_charge_external(charge))
+      charge -= 16 * 1024;
+    ASSERT_GT(charge, kMiB);
+    AILEGO_DEFER([&] { memory.release_external(charge); });
+    auto denied = iterator.value()->next();
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  }
+  for (size_t i = 4; i < 8; ++i) {
+    auto next = iterator.value()->next();
+    ASSERT_TRUE(next.has_value() && *next);
+    EXPECT_EQ("row" + std::to_string(i), (*next)->pk_ref());
+  }
+  auto end = iterator.value()->next();
+  ASSERT_TRUE(end.has_value());
+  EXPECT_EQ(nullptr, *end);
 }
 
 TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {

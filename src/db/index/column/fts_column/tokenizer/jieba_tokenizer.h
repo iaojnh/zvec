@@ -48,6 +48,7 @@ class JiebaTokenizer : public Tokenizer {
   // embedded defaults when no external directory is configured.
   // Stop-word filtering belongs to a TokenFilter, not here.
   Status init(const ailego::JsonObject &config) override;
+  static Status validate_config(const ailego::JsonObject &config);
 
   std::vector<Token> tokenize(const std::string &text) const override;
 
@@ -65,6 +66,15 @@ class JiebaTokenizer : public Tokenizer {
 
  private:
   enum class CutMode { kSearch, kMix, kFull, kHmm };
+  struct Config {
+    CutMode mode{CutMode::kSearch};
+    std::string mode_name;
+    std::string dict_dir;
+    std::string dict_path;
+    std::string model_path;
+    std::string user_dict_path;
+  };
+  static Result<Config> parse_config(const ailego::JsonObject &config);
 
   // Release segmenters first (they hold raw pointers into dict_trie_ /
   // hmm_model_), then release the underlying dict/model.

@@ -17,6 +17,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <zvec/db/doc.h>
@@ -205,6 +208,27 @@ struct GroupResult : ResultMemoryOwner {
 
 using GroupResults = std::vector<GroupResult>;
 
+// Preserve the two public fields of each result for structured bindings.
+template <
+    size_t I, typename Result,
+    std::enable_if_t<
+        std::is_same_v<std::remove_cv_t<std::remove_reference_t<Result>>,
+                       InternalIdsQueryResult> ||
+            std::is_same_v<std::remove_cv_t<std::remove_reference_t<Result>>,
+                           GroupResult>,
+        int> = 0>
+decltype(auto) get(Result &&result) {
+  using Type = std::remove_cv_t<std::remove_reference_t<Result>>;
+  if constexpr (std::is_same_v<Type, InternalIdsQueryResult>) {
+    return std::get<I>(std::forward_as_tuple(
+        std::forward<Result>(result).ids, std::forward<Result>(result).scores));
+  } else {
+    return std::get<I>(
+        std::forward_as_tuple(std::forward<Result>(result).group_by_value_,
+                              std::forward<Result>(result).docs_));
+  }
+}
+
 //! Multi query structure for combining multiple sub-queries
 //! (vector, full-text, etc.) with optional re-ranking of results.
 struct SubQuery {
@@ -228,3 +252,22 @@ struct MultiQuery {
 
 
 }  // namespace zvec
+
+namespace std {
+
+template <>
+struct tuple_size<zvec::InternalIdsQueryResult> : integral_constant<size_t, 2> {
+};
+
+template <size_t I>
+struct tuple_element<I, zvec::InternalIdsQueryResult>
+    : tuple_element<I, tuple<vector<int64_t>, vector<float>>> {};
+
+template <>
+struct tuple_size<zvec::GroupResult> : integral_constant<size_t, 2> {};
+
+template <size_t I>
+struct tuple_element<I, zvec::GroupResult>
+    : tuple_element<I, tuple<string, vector<zvec::Doc>>> {};
+
+}  // namespace std

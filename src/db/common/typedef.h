@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <utility>
 #include <zvec/ailego/logger/logger.h>
 #include "error_code.h"
 
@@ -172,15 +173,20 @@ using idx_t = uint64_t;
         Status::InvalidArgument("collection is already closed."));           \
   }
 
-#define CHECK_RETURN_STATUS(status) \
-  if (!status.ok()) {               \
-    return status;                  \
-  }
+#define CHECK_RETURN_STATUS(expression)                              \
+  do {                                                               \
+    auto &&checked_status = (expression);                            \
+    if (!checked_status.ok())                                        \
+      return std::forward<decltype(checked_status)>(checked_status); \
+  } while (false)
 
-#define CHECK_RETURN_STATUS_EXPECTED(status) \
-  if (!status.ok()) {                        \
-    return tl::make_unexpected(status);      \
-  }
+#define CHECK_RETURN_STATUS_EXPECTED(expression)                   \
+  do {                                                             \
+    auto &&checked_status = (expression);                          \
+    if (!checked_status.ok())                                      \
+      return tl::make_unexpected(                                  \
+          std::forward<decltype(checked_status)>(checked_status)); \
+  } while (false)
 
 #define CHECK_COLLECTION_READONLY_RETURN_STATUS \
   CHECK_READONLY_RETURN_STATUS(Collection)

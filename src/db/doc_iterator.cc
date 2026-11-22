@@ -228,18 +228,33 @@ Result<Doc::Ptr> DocIterator::next() try {
             impl_->error = rs;
             return tl::make_unexpected(rs);
           }
+          impl_->replay_rows = impl_->accepted_rows;
         }
         std::shared_ptr<arrow::RecordBatch> batch;
         auto status = impl_->current_reader->ReadNext(&batch);
         if (!status.ok()) {
+          if (status.IsOutOfMemory()) {
+            // A decoder, row-ID builder, or filter may have consumed input
+            // before refusing. Reopen the immutable snapshot and skip only
+            // rows from batches we successfully accepted.
+            impl_->current_reader.reset();
+            return tl::make_unexpected(
+                Status(StatusCode::RESOURCE_EXHAUSTED, status.ToString()));
+          }
           impl_->error =
-              status.IsOutOfMemory()
-                  ? Status(StatusCode::RESOURCE_EXHAUSTED, status.ToString())
-                  : Status::InternalError("ReadNext failed: ",
-                                          status.ToString());
+              Status::InternalError("ReadNext failed: ", status.ToString());
           return tl::make_unexpected(impl_->error);
         }
         if (batch && batch->num_rows() > 0) {
+          if (impl_->replay_rows >= batch->num_rows()) {
+            impl_->replay_rows -= batch->num_rows();
+            continue;
+          }
+          if (impl_->replay_rows != 0) {
+            batch = batch->Slice(impl_->replay_rows);
+            impl_->replay_rows = 0;
+          }
+          impl_->accepted_rows += batch->num_rows();
           impl_->current_batch = std::move(batch);
           impl_->batch_offset = 0;
           loaded = true;
@@ -247,8 +262,14 @@ Result<Doc::Ptr> DocIterator::next() try {
         }
         if (!batch) {
           // EOF for this segment: release the reader and advance.
+          if (impl_->replay_rows != 0) {
+            impl_->error =
+                Status::InternalError("Iterator snapshot changed on retry");
+            return tl::make_unexpected(impl_->error);
+          }
           impl_->current_reader.reset();
           impl_->current_segment_index++;
+          impl_->accepted_rows = 0;
         }
       }
       if (!loaded) {
@@ -279,9 +300,10 @@ Result<Doc::Ptr> DocIterator::next() try {
   return std::move(impl_->batch_docs[impl_->current_row++]);
 } catch (const std::bad_alloc &) {
   impl_->batch_docs.clear();
-  impl_->error = Status(StatusCode::RESOURCE_EXHAUSTED,
-                        "Insufficient memory budget during iteration");
-  return tl::make_unexpected(impl_->error);
+  impl_->current_reader.reset();
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient memory budget during iteration"));
 }
 
 }  // namespace zvec

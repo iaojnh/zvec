@@ -53,7 +53,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) try {
   size_t read_size = header_seg->read(0, hdr_block, sizeof(IvfRabitqHeader));
   if (read_size != sizeof(IvfRabitqHeader)) {
     LOG_ERROR("Failed to read IvfRabitqHeader");
-    return IndexError_InvalidFormat;
+    return header_seg->read_error();
   }
   memcpy(&header_, hdr_block.data(), sizeof(IvfRabitqHeader));
   int ret = validate_header();
@@ -79,7 +79,7 @@ int IvfRabitqEntity::load(IndexStorage::Pointer storage) try {
   read_size = cluster_meta_seg->read(0, meta_block, meta_size);
   if (read_size != meta_size) {
     LOG_ERROR("Failed to read cluster metas");
-    return IndexError_InvalidFormat;
+    return cluster_meta_seg->read_error();
   }
   cluster_metas_.resize(header_.cluster_count);
   memcpy(cluster_metas_.data(), meta_block.data(), meta_size);

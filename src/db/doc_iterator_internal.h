@@ -58,6 +58,10 @@ struct DocIterator::Impl {
 
   // Traversal state.
   size_t current_segment_index{0};
+  // Count accepted source rows, so a fresh decoder can resume after an
+  // allocation failure at any layer of the current segment reader.
+  int64_t accepted_rows{0};
+  int64_t replay_rows{0};
   // Column indices resolved once per segment reader by
   // resolve_reader_columns.
   int uid_col{-1};
@@ -71,8 +75,8 @@ struct DocIterator::Impl {
   int64_t batch_offset{0};  // first row of the next window in current_batch
   std::vector<Doc::Ptr> batch_docs;
   size_t current_row{0};
-  // First failure; sticky so a caller ignoring it cannot keep iterating
-  // over a partially filled window.
+  // Irrecoverable failures are sticky. Memory refusal leaves a retryable
+  // cursor at its last accepted batch or materialization window.
   Status error{Status::OK()};
 
   // Reader for the current segment only (opened lazily, at most one open).

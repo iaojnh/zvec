@@ -420,6 +420,7 @@ class SegmentImpl : public Segment,
 
   BlockID allocate_block_id();
   BlockID allocate_column_block(BlockType type);
+  std::string column_artifact_path(BlockType type, BlockID block) const;
   void remove_column_artifact(BlockType type, BlockID block) const noexcept;
 
   bool validate(const std::vector<std::string> &columns) const;
@@ -580,6 +581,7 @@ class SegmentImpl : public Segment,
   struct ColumnChange {
     SegmentMeta::Ptr original;
     std::vector<std::pair<BlockType, BlockID>> created;
+    std::vector<std::pair<BlockType, BlockID>> stale;
   };
   std::unique_ptr<ColumnChange> column_change_;
 
@@ -4420,19 +4422,33 @@ Result<Segment::Ptr> SegmentImpl::stage_column_change() const try {
 }
 
 BlockID SegmentImpl::allocate_column_block(BlockType type) {
-  const auto block = allocate_block_id();
-  if (column_change_) column_change_->created.emplace_back(type, block);
+  auto block = allocate_block_id();
+  if (!column_change_) return block;
+  // Recovery resumes its allocator from the last manifest. A previous
+  // unpublished attempt can still own files at the next block IDs.
+  while (
+      ailego::FileHelper::IsExist(column_artifact_path(type, block).c_str())) {
+    column_change_->stale.emplace_back(type, block);
+    block = allocate_block_id();
+  }
+  column_change_->created.emplace_back(type, block);
   return block;
+}
+
+std::string SegmentImpl::column_artifact_path(BlockType type,
+                                              BlockID block) const {
+  if (type == BlockType::SCALAR)
+    return FileHelper::MakeForwardBlockPath(path_, id(), block,
+                                            !options_.enable_mmap_);
+  return FileHelper::MakeInvertIndexPath(path_, id(), block);
 }
 
 void SegmentImpl::remove_column_artifact(BlockType type,
                                          BlockID block) const noexcept try {
   if (type == BlockType::SCALAR) {
-    (void)FileHelper::RemoveFile(FileHelper::MakeForwardBlockPath(
-        path_, id(), block, !options_.enable_mmap_));
+    (void)FileHelper::RemoveFile(column_artifact_path(type, block));
   } else if (type == BlockType::SCALAR_INDEX) {
-    (void)FileHelper::RemoveDirectory(
-        FileHelper::MakeInvertIndexPath(path_, id(), block));
+    (void)FileHelper::RemoveDirectory(column_artifact_path(type, block));
   }
 } catch (...) {
   LOG_WARN("Could not remove unused column block %u in segment %u", block,
@@ -4452,6 +4468,9 @@ void SegmentImpl::commit_column_change() noexcept {
     remove_unused(block.type(), block.id());
   }
   for (const auto &[type, block] : column_change_->created) {
+    remove_unused(type, block);
+  }
+  for (const auto &[type, block] : column_change_->stale) {
     remove_unused(type, block);
   }
   column_change_.reset();

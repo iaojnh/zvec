@@ -147,10 +147,12 @@ class FlatSearcherContext : public IndexSearcher::Context {
     auto group_topk_list = SelectGroupHeaps(group_topk_heaps_, group_num());
 
     group_results_[idx].resize(group_topk_list.size());
-    auto provider = fetch_vector_ ? owner_->create_provider() : nullptr;
+    int provider_status = 0;
+    auto provider =
+        fetch_vector_ ? owner_->create_provider(provider_status) : nullptr;
     if (fetch_vector_ && !provider)
-      throw typename FlatSearcher<BATCH_SIZE>::MetadataReadError{
-          IndexError_ReadData};
+      throw
+          typename FlatSearcher<BATCH_SIZE>::MetadataReadError{provider_status};
 
     for (uint32_t i = 0; i < group_topk_list.size(); ++i) {
       const std::string &group_id = group_topk_list[i]->first;
@@ -1261,8 +1263,9 @@ int FlatSearcherContext<BATCH_SIZE>::group_by_search_impl(
     return this->group_by()(key);
   };
 
-  auto provider = owner_->create_provider();
-  if (!provider) return IndexError_ReadData;
+  int provider_status = 0;
+  auto provider = owner_->create_provider(provider_status);
+  if (!provider) return provider_status;
 
   for (size_t q = 0; q < count; ++q) {
     this->group_topk_heaps().clear();
@@ -1300,8 +1303,9 @@ template <size_t BATCH_SIZE>
 int FlatSearcherContext<BATCH_SIZE>::search_bf_by_key_rows(
     const void *query, const std::vector<uint64_t> *p_keys,
     const IndexQueryMeta &qmeta, uint32_t count) {
-  auto provider = owner_->create_provider();
-  if (!provider) return IndexError_ReadData;
+  int provider_status = 0;
+  auto provider = owner_->create_provider(provider_status);
+  if (!provider) return provider_status;
   if (this->group_by_search()) {
     this->resize_group_results(count);
     if (!this->group_by().is_valid()) {

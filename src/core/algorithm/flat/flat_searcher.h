@@ -145,6 +145,7 @@ class FlatSearcher : public IndexSearcher {
 
   //! Create a searcher provider
   IndexProvider::Pointer create_provider() const override;
+  IndexProvider::Pointer create_provider(int &status) const;
 
   //! Retrieve magic number
   uint32_t magic() const {
@@ -239,14 +240,11 @@ class FlatSearcher : public IndexSearcher {
   }
 
   int get_vector(key_t key, IndexStorage::MemoryBlock &block) const override {
-    if (!container_) {
-      block.reset();
-      return IndexError_NoReady;
-    }
-    auto provider = this->create_provider();
+    int status = 0;
+    auto provider = this->create_provider(status);
     if (!provider) {
       block.reset();
-      return IndexError_NoReady;
+      return status;
     }
     return provider->get_vector(key, block);
   }

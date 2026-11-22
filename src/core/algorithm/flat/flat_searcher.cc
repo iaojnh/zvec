@@ -23,21 +23,34 @@ namespace zvec {
 namespace core {
 
 template <size_t BATCH_SIZE>
-IndexProvider::Pointer FlatSearcher<BATCH_SIZE>::create_provider() const try {
+IndexProvider::Pointer FlatSearcher<BATCH_SIZE>::create_provider() const {
+  int status = 0;
+  return create_provider(status);
+}
+
+template <size_t BATCH_SIZE>
+IndexProvider::Pointer FlatSearcher<BATCH_SIZE>::create_provider(
+    int &status) const try {
   std::lock_guard<std::mutex> lock(mapping_mutex_);
 
-  if (!container_) return nullptr;
+  status = 0;
+  if (!container_) {
+    status = IndexError_NoReady;
+    return nullptr;
+  }
   if (!mapping_loaded_) {
     auto mapping_segment = container_->get(FLAT_SEGMENT_MAPPING_SEG_ID);
     if (!mapping_segment) {
       LOG_ERROR("Failed to fetch segment %s",
                 FLAT_SEGMENT_MAPPING_SEG_ID.c_str());
+      status = IndexError_NoExist;
       return nullptr;
     }
 
     if (mapping_segment->data_size() % sizeof(uint32_t) != 0) {
       LOG_ERROR("Invalid data size %zu of mapping segment",
                 mapping_segment->data_size());
+      status = IndexError_InvalidLength;
       return nullptr;
     }
 
@@ -46,20 +59,22 @@ IndexProvider::Pointer FlatSearcher<BATCH_SIZE>::create_provider() const try {
         features_segment_->data_size()) {
       LOG_ERROR("Invalid data size %zd of mapping segment",
                 features_segment_->data_size());
+      status = IndexError_Mismatch;
       return nullptr;
     }
 
-    if (mapping_.load(container_, FLAT_SEGMENT_MAPPING_SEG_ID, 0,
-                      mapping_segment->data_size()) != 0) {
+    status = mapping_.load(container_, FLAT_SEGMENT_MAPPING_SEG_ID, 0,
+                           mapping_segment->data_size());
+    if (status != 0) {
       LOG_ERROR("Failed to read data (%zu bytes) from mapping segment",
                 mapping_segment->data_size());
       return nullptr;
     }
     mapping_loaded_ = true;
   }
-  return IndexProvider::Pointer(new (std::nothrow)
-                                    FlatSearcherProvider<BATCH_SIZE>(this));
+  return IndexProvider::Pointer(new FlatSearcherProvider<BATCH_SIZE>(this));
 } catch (const std::bad_alloc &) {
+  status = IndexError_NoMemory;
   return nullptr;
 }
 

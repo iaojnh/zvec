@@ -150,7 +150,7 @@ int RabitqReformer::load(IndexStorage::Pointer storage) {
   size_t size = segment->read(offset, block, sizeof(header));
   if (size != sizeof(header)) {
     LOG_ERROR("Failed to read header");
-    return IndexError_InvalidFormat;
+    return segment->read_error();
   }
   memcpy(static_cast<void *>(&header), block.data(), sizeof(header));
   impl_->dimension = header.dim;
@@ -198,7 +198,7 @@ int RabitqReformer::load(IndexStorage::Pointer storage) {
       impl_->rotator.get(), [&](size_t pos, void *out, size_t bytes) {
         return segment->fetch(offset + pos, out, bytes) == bytes
                    ? 0
-                   : IndexError_ReadData;
+                   : segment->read_error();
       });
   if (ret != 0) return ret;
 

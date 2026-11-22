@@ -57,7 +57,8 @@ std::unordered_set<IndexType> support_dense_vector_index = {
 std::unordered_set<IndexType> support_sparse_vector_index = {IndexType::FLAT,
                                                              IndexType::HNSW};
 
-static Status validate_fts_index_params(const FieldSchema &field) {
+static Status validate_fts_index_params(const FieldSchema &field,
+                                        bool build_pipeline = true) {
   auto params = std::dynamic_pointer_cast<FtsIndexParams>(field.index_params());
   if (!params) {
     return Status::InvalidArgument(
@@ -68,15 +69,19 @@ static Status validate_fts_index_params(const FieldSchema &field) {
   // Reuse the validated analyzer for opening/querying. Constructing and
   // discarding a full Jieba dictionary here doubles loader work and leaves
   // allocator backing behind before the actual indexer opens.
-  auto pipeline = detail::AcquireFtsPipeline(*params);
-  if (!pipeline.has_value()) {
-    if (pipeline.error().code() == StatusCode::RESOURCE_EXHAUSTED)
-      return pipeline.error();
-    return Status::InvalidArgument(
-        "Invalid schema: invalid FTS index params for field[", field.name(),
-        "]: ", pipeline.error().message());
+  Status status;
+  if (build_pipeline) {
+    auto pipeline = detail::AcquireFtsPipeline(*params);
+    if (pipeline) return Status::OK();
+    status = std::move(pipeline.error());
+  } else {
+    status = detail::ValidateFtsConfiguration(*params);
+    if (status.ok()) return status;
   }
-  return Status::OK();
+  if (status.code() == StatusCode::RESOURCE_EXHAUSTED) return status;
+  return Status::InvalidArgument(
+      "Invalid schema: invalid FTS index params for field[", field.name(),
+      "]: ", status.message());
 }
 
 static Status validate_index_params(const FieldSchema &field) {
@@ -195,9 +200,7 @@ Status FieldSchema::validate_structure() const {
         }
       }
 
-      if (index_params_->type() != IndexType::FTS) {
-        CHECK_RETURN_STATUS(validate_index_params(*this));
-      }
+      CHECK_RETURN_STATUS(validate_index_params(*this));
 
       const auto flat_data_type = vector_index_params->flat_data_type();
       if (is_sparse && flat_data_type != DataType::UNDEFINED &&
@@ -286,8 +289,11 @@ Status FieldSchema::validate_structure() const {
                                        "]: FTS requires STRING data_type; got ",
                                        DataTypeCodeBook::AsString(data_type_));
       }
-      auto params_status = validate_index_params(*this);
-      CHECK_RETURN_STATUS(params_status);
+      if (index_params_->type() == IndexType::FTS) {
+        CHECK_RETURN_STATUS(validate_fts_index_params(*this, false));
+      } else {
+        CHECK_RETURN_STATUS(validate_index_params(*this));
+      }
     }
   }
   return Status::OK();

@@ -284,6 +284,10 @@ FtsIndexParams::~FtsIndexParams() {
 
 namespace detail {
 
+Status ValidateFtsConfiguration(const FtsIndexParams &params) {
+  return fts::TokenizerFactory::validate(to_internal(params));
+}
+
 Result<std::shared_ptr<fts::TokenizerPipeline>> AcquireFtsPipeline(
     FtsIndexParams &params) {
   auto &state_uptr = FtsPipelineHelper::state(params);

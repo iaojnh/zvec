@@ -204,7 +204,7 @@ int IvfRabitqReformer::load(IndexStorage::Pointer storage) try {
   size_t size = segment->read(offset, block, sizeof(header));
   if (size != sizeof(header)) {
     LOG_ERROR("Failed to read header");
-    return IndexError_InvalidFormat;
+    return segment->read_error();
   }
   memcpy(static_cast<void *>(&header), block.data(), sizeof(header));
   ReformerLayout layout;
